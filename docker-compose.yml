@@ -91,15 +91,19 @@ services:
   # populates ./agents/claude and ./agents/opencode and adds build: blocks.
   # -------------------------------------------------------------------------
   claude-agent:
-    # TODO Phase 3: add build: ./agents/claude once the directory exists.
+    build:
+      context: ./agents/claude
     image: harness-claude-agent:latest
     networks:
       - harness-net
     profiles:
       - agent
+    # No restart policy: agents are ephemeral, launched per-invocation by
+    # Phase 4's `harness` script via `docker run`.
 
   opencode-agent:
-    # TODO Phase 3: add build: ./agents/opencode once the directory exists.
+    build:
+      context: ./agents/opencode
     image: harness-opencode-agent:latest
     networks:
       - harness-net

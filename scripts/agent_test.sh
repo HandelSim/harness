@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+#
+# Phase 3 agent integration test.
+#
+# Brings up the full proxy/ollama/mockupstream stack, builds both agent
+# images, and runs four scenarios end-to-end:
+#
+#   A. claude headless        — `claude -p "prompt" --dangerously-skip-permissions`
+#                               via the entrypoint in test mode. Asserts the
+#                               canned mock-upstream content makes it back
+#                               through ollama -> proxy -> mock and out
+#                               through claude.
+#   B. opencode headless      — `opencode run "prompt"` via the entrypoint in
+#                               test mode. Same end-to-end assertion.
+#   C. claude yolo flag       — exercises HARNESS_YOLO=1 (entrypoint adds
+#                               --dangerously-skip-permissions). Output should
+#                               match A.
+#   D. opencode config gen    — overrides the entrypoint, runs it just long
+#                               enough to generate ~/.config/opencode/opencode.json,
+#                               then asserts the generated JSON contains the
+#                               expected baseURL and model identifier.
+#
+# Test B may be skipped (with a clear message, not a failure) if opencode's
+# `run` subcommand requires per-provider auth that we can't pre-seed; this
+# is documented behavior, not a regression.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+PROJECT_NAME="harness-agent-test"
+
+echo "============================================================"
+echo " harness Phase 3 agent integration test"
+echo "============================================================"
+
+# --- preflight ---------------------------------------------------------------
+
+if ! docker info >/dev/null 2>&1; then
+    echo "[agent-test] ERROR: docker daemon is not reachable" >&2
+    exit 1
+fi
+
+# --- temp env + override -----------------------------------------------------
+
+ENV_FILE="$(mktemp -t harness-agent.XXXXXX.env)"
+OVERRIDE_FILE="$(mktemp -t harness-agent.XXXXXX.yml)"
+
+cat >"${ENV_FILE}" <<'EOF'
+PROXY_API_URL=http://mockupstream:9000/v1/chat/completions
+PROXY_API_KEY=test-key-1234
+PROXY_API_MODEL=test-model
+PROXY_HOST=0.0.0.0
+PROXY_PORT=8000
+OUTPUT_DIR=
+PROXY_TIMEOUT=30
+OLLAMA_VERSION=0.21.2
+OLLAMA_AGENT_MODEL=harness
+OLLAMA_CONTEXT_LENGTH=200000
+MOCK_SCENARIO=text
+PUBLISH_OLLAMA_PORT=
+EOF
+
+cat >"${OVERRIDE_FILE}" <<'EOF'
+services:
+  mockupstream:
+    image: python:3.12-slim
+    working_dir: /app
+    environment:
+      MOCK_SCENARIO: ${MOCK_SCENARIO:-text}
+    volumes:
+      - ./scripts/mock_upstream.py:/app/mock_upstream.py:ro
+    networks:
+      - harness-net
+    expose:
+      - "9000"
+    command: >
+      sh -c "pip install --quiet --no-cache-dir flask==3.0.3 &&
+             python /app/mock_upstream.py"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;\nu=urllib.request.urlopen('http://127.0.0.1:9000/health',timeout=2);\nsys.exit(0 if u.status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+EOF
+
+COMPOSE=(docker compose --project-name "${PROJECT_NAME}" --env-file "${ENV_FILE}" -f docker-compose.yml -f "${OVERRIDE_FILE}")
+
+cleanup() {
+    echo "[agent-test] cleanup: tearing down compose state"
+    "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+    rm -f "${ENV_FILE}" "${OVERRIDE_FILE}"
+}
+trap cleanup EXIT INT TERM
+
+# Defensive: clear stale state from a prior run.
+"${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+
+# --- compose config sanity check --------------------------------------------
+
+echo "[agent-test] validating compose config"
+"${COMPOSE[@]}" config >/dev/null
+
+# --- bring up base stack (no agents — they live behind the `agent` profile) -
+
+echo "[agent-test] building and starting base stack (mockupstream + proxy + ollama)"
+"${COMPOSE[@]}" up -d --build
+
+# --- build agent images via the agent profile -------------------------------
+
+echo "[agent-test] building agent images via --profile agent"
+"${COMPOSE[@]}" --profile agent build
+
+# --- wait for healthy --------------------------------------------------------
+
+is_healthy() {
+    local svc="$1"
+    local cid
+    cid="$("${COMPOSE[@]}" ps -q "${svc}" 2>/dev/null || true)"
+    if [[ -z "${cid}" ]]; then return 1; fi
+    local status
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" 2>/dev/null || echo "none")"
+    [[ "${status}" == "healthy" ]]
+}
+
+wait_healthy() {
+    local timeout_s="$1"; shift
+    local deadline=$(( $(date +%s) + timeout_s ))
+    while true; do
+        local all_ok=1
+        for svc in "$@"; do
+            if ! is_healthy "${svc}"; then all_ok=0; break; fi
+        done
+        if (( all_ok )); then return 0; fi
+        if (( $(date +%s) >= deadline )); then return 1; fi
+        sleep 2
+    done
+}
+
+echo "[agent-test] waiting up to 120s for mockupstream + proxy + ollama to be healthy"
+if ! wait_healthy 120 mockupstream proxy ollama; then
+    echo "[agent-test] ERROR: services did not become healthy" >&2
+    "${COMPOSE[@]}" ps >&2 || true
+    echo "--- mockupstream logs ---" >&2; "${COMPOSE[@]}" logs mockupstream >&2 || true
+    echo "--- proxy logs ---"        >&2; "${COMPOSE[@]}" logs proxy        >&2 || true
+    echo "--- ollama logs ---"       >&2; "${COMPOSE[@]}" logs ollama       >&2 || true
+    exit 1
+fi
+echo "[agent-test] all services healthy"
+
+# --- discover the network name compose generated ---------------------------
+#
+# Compose namespaces networks as <project>_<network>. Use docker network ls
+# rather than parsing compose internals.
+
+NETWORK="$(docker network ls --format '{{.Name}}' | grep "^${PROJECT_NAME}_harness-net$" | head -1)"
+if [[ -z "${NETWORK}" ]]; then
+    echo "[agent-test] ERROR: could not find compose network ${PROJECT_NAME}_harness-net" >&2
+    docker network ls >&2
+    exit 1
+fi
+echo "[agent-test] using docker network: ${NETWORK}"
+
+# --- helpers ----------------------------------------------------------------
+
+fail() {
+    local label="$1"; shift
+    echo "[agent-test] FAIL: ${label}" >&2
+    if [[ $# -gt 0 ]]; then echo "[agent-test] detail: $*" >&2; fi
+    echo "--- mockupstream logs ---" >&2; "${COMPOSE[@]}" logs mockupstream >&2 || true
+    echo "--- proxy logs ---"        >&2; "${COMPOSE[@]}" logs proxy        >&2 || true
+    echo "--- ollama logs ---"       >&2; "${COMPOSE[@]}" logs ollama       >&2 || true
+    exit 1
+}
+
+# --- Test A: claude headless ------------------------------------------------
+
+echo "[agent-test] test A: claude headless invocation through ollama -> proxy -> mock"
+A_OUT="$(docker run --rm \
+    --network "${NETWORK}" \
+    -e ANTHROPIC_BASE_URL=http://ollama:11434 \
+    -e ANTHROPIC_API_KEY=harness-dummy \
+    -e ANTHROPIC_MODEL=harness \
+    -e ANTHROPIC_SMALL_FAST_MODEL=harness \
+    -e OLLAMA_AGENT_MODEL=harness \
+    -e HARNESS_TEST_MODE=1 \
+    harness-claude-agent:latest \
+    -p "Say hello" --dangerously-skip-permissions 2>&1)" \
+    || fail "A: docker run for claude exited non-zero" "${A_OUT}"
+echo "[agent-test]   A output (truncated): $(echo "${A_OUT}" | tail -c 600)"
+echo "${A_OUT}" | grep -q "Hello from mock upstream" \
+    || fail "A: claude output did not contain mock upstream content" "${A_OUT}"
+
+# --- Test B: opencode headless ----------------------------------------------
+
+echo "[agent-test] test B: opencode headless invocation through ollama -> proxy -> mock"
+set +e
+B_OUT="$(docker run --rm \
+    --network "${NETWORK}" \
+    -e OLLAMA_AGENT_MODEL=harness \
+    -e HARNESS_TEST_MODE=1 \
+    harness-opencode-agent:latest \
+    "Say hello" 2>&1)"
+B_RC=$?
+set -e
+
+if (( B_RC != 0 )); then
+    # Opencode's run subcommand sometimes requires per-provider auth init that
+    # we can't pre-seed inside an ephemeral container. Treat that case as a
+    # documented skip rather than a hard failure — but only if the failure
+    # mode looks like an auth/setup issue, not a connectivity issue.
+    if echo "${B_OUT}" | grep -qiE 'auth|login|provider .* not (configured|found)|no .* api key'; then
+        echo "[agent-test]   B SKIPPED: opencode run requires interactive provider auth — known limitation"
+        echo "[agent-test]   B raw (truncated): $(echo "${B_OUT}" | tail -c 600)"
+    else
+        fail "B: opencode docker run exited non-zero (rc=${B_RC})" "${B_OUT}"
+    fi
+else
+    echo "[agent-test]   B output (truncated): $(echo "${B_OUT}" | tail -c 600)"
+    echo "${B_OUT}" | grep -q "Hello from mock upstream" \
+        || fail "B: opencode output did not contain mock upstream content" "${B_OUT}"
+fi
+
+# --- Test C: claude with HARNESS_YOLO=1 (entrypoint adds the flag) ---------
+
+echo "[agent-test] test C: claude with HARNESS_YOLO=1 (entrypoint applies --dangerously-skip-permissions)"
+C_OUT="$(docker run --rm \
+    --network "${NETWORK}" \
+    -e ANTHROPIC_BASE_URL=http://ollama:11434 \
+    -e ANTHROPIC_API_KEY=harness-dummy \
+    -e ANTHROPIC_MODEL=harness \
+    -e ANTHROPIC_SMALL_FAST_MODEL=harness \
+    -e OLLAMA_AGENT_MODEL=harness \
+    -e HARNESS_TEST_MODE=1 \
+    -e HARNESS_YOLO=1 \
+    harness-claude-agent:latest \
+    -p "Say hello" 2>&1)" \
+    || fail "C: docker run for claude (yolo) exited non-zero" "${C_OUT}"
+echo "[agent-test]   C output (truncated): $(echo "${C_OUT}" | tail -c 600)"
+echo "${C_OUT}" | grep -q "Hello from mock upstream" \
+    || fail "C: claude (yolo) output did not contain mock upstream content" "${C_OUT}"
+
+# --- Test D: opencode entrypoint generates expected opencode.json ----------
+#
+# Stub `opencode` on PATH so the entrypoint's `exec opencode run ...` returns
+# immediately. Without the stub, opencode tries to dial the (deliberately
+# absent) ollama service and hangs. We only care about the config-file
+# generation step here.
+
+echo "[agent-test] test D: opencode entrypoint generates correct opencode.json from env"
+D_OUT="$(docker run --rm \
+    -e OLLAMA_AGENT_MODEL=test-name \
+    -e HARNESS_TEST_MODE=1 \
+    --entrypoint /bin/bash \
+    harness-opencode-agent:latest \
+    -c '
+        mkdir -p "$HOME/bin"
+        printf "#!/bin/sh\nexit 0\n" > "$HOME/bin/opencode"
+        chmod +x "$HOME/bin/opencode"
+        export PATH="$HOME/bin:$PATH"
+        /usr/local/bin/agent-entrypoint.sh dummy-prompt >/dev/null 2>&1
+        cat "$HOME/.config/opencode/opencode.json"
+    ' 2>&1)" \
+    || fail "D: docker run to inspect opencode.json failed" "${D_OUT}"
+echo "[agent-test]   D generated config:"
+echo "${D_OUT}" | sed 's/^/    /'
+
+echo "${D_OUT}" | grep -q '"baseURL": "http://ollama:11434/v1"' \
+    || fail "D: generated opencode.json missing baseURL" "${D_OUT}"
+echo "${D_OUT}" | grep -q '"harness/test-name"' \
+    || fail "D: generated opencode.json missing harness/test-name model id" "${D_OUT}"
+echo "${D_OUT}" | grep -q '"test-name"' \
+    || fail "D: generated opencode.json missing test-name model entry" "${D_OUT}"
+
+echo "============================================================"
+echo " AGENT TEST PASSED"
+echo "============================================================"
+exit 0

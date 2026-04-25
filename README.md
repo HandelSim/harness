@@ -16,14 +16,21 @@ zip distribution (built in Phase 4); this repo is for development.
 
 ```
 harness/
-├── docker-compose.yml      services: ollama, proxy, agents
-├── .env.example            documented env variables (copy to ../.env)
-├── ollama/                 custom ollama image + entrypoint that registers
-│                           the stub model with RemoteHost set to the proxy
-├── proxy/                  the translating proxy (Phase 1: mock; Phase 2: real)
-├── agents/                 agent images (populated in Phase 3)
+├── harness                  management CLI (Phase 4)
+├── install.sh               bootstrap installer (Phase 4; also bundled in zip)
+├── zip-readme.md            README that ships in the distribution zip
+├── docker-compose.yml       services: ollama, proxy, agents
+├── .env.example             documented env variables (copy to ../.env)
+├── ollama/                  custom ollama image + entrypoint that registers
+│                            the stub model with RemoteHost set to the proxy
+├── proxy/                   the translating proxy
+├── agents/                  agent images (claude, opencode)
 └── scripts/
-    └── derisk_test.sh      end-to-end test of the curl→ollama→proxy round trip
+    ├── derisk_test.sh       Phase 1 end-to-end smoke
+    ├── proxy_test.sh        Phase 2 proxy translation tests
+    ├── agent_test.sh        Phase 3 end-to-end via both agents
+    ├── harness_test.sh      Phase 4 management script tests
+    └── build_zip.sh         produces dist/harness-distribution.zip
 ```
 
 ## Local development
@@ -54,8 +61,25 @@ returned to the caller. It tears everything down on exit.
 
 ## End-user installation
 
-End users do not clone this repo. They install via the zip distribution
-produced in Phase 4 (separate README ships in that zip).
+End users do not clone this repo. They install via the distribution zip,
+which ships `install.sh`, a pre-filled `.env`, and a quick-start README.
+See `zip-readme.md` for the user-facing instructions.
+
+To build the distribution zip from the current repo state:
+
+```
+$ bash scripts/build_zip.sh
+# -> dist/harness-distribution.zip
+```
+
+## Tests
+
+```
+$ bash scripts/derisk_test.sh    # ollama RemoteHost forwarding
+$ bash scripts/proxy_test.sh     # proxy translation
+$ bash scripts/agent_test.sh     # end-to-end via both agents
+$ bash scripts/harness_test.sh   # management script subcommands
+```
 
 ## Project phases
 
