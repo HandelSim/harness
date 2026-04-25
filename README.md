@@ -25,13 +25,55 @@ harness/
 │                            the stub model with RemoteHost set to the proxy
 ├── proxy/                   the translating proxy
 ├── agents/                  agent images (claude, opencode)
+├── mcp-registry/            vetted MCP service definitions (Phase 6)
 └── scripts/
     ├── derisk_test.sh       Phase 1 end-to-end smoke
     ├── proxy_test.sh        Phase 2 proxy translation tests
     ├── agent_test.sh        Phase 3 end-to-end via both agents
     ├── harness_test.sh      Phase 4 management script tests
+    ├── persistence_test.sh  Phase 6 persistent home + skel-seed test
+    ├── mcp_test.sh          Phase 6 MCP enable/disable lifecycle test
     └── build_zip.sh         produces dist/harness-distribution.zip
 ```
+
+## Persistent agent homes
+
+The agent containers' entire `/home/harness` is bind-mounted from
+`<install-root>/agent/<tool>/`. Anything a user installs inside an agent
+(`pipx install graphifyy`, `pip install --user requests`, custom dotfiles)
+survives container rebuilds. The image's build-time home contents are
+snapshotted into `/etc/skel/harness/`, and the entrypoint copies them into
+an empty bind mount on first run, marking with
+`~/.harness-home-initialized` so subsequent runs skip the seed.
+
+## MCP registry
+
+Long-running MCP servers — Serena, etc. — are described by a small set of
+files under `mcp-registry/<name>/`:
+
+- `compose.yml` — partial compose snippet defining the service. References
+  the `harness_harness-net` network as external so it merges cleanly with
+  the main `docker-compose.yml`. Lives behind the `mcp` profile so
+  `docker compose up` without the profile leaves it alone.
+- `client-config.json` — the entry that gets merged into the agent's MCP
+  config. Uses the `{"mcpServers": {"<name>": {...}}}` shape.
+- `README.md` — what the service does, what it mounts, security notes.
+
+Users enable a registry entry with `harness mcp enable <name>`. The
+`harness` script copies the entry to `<install-root>/mcp/<name>/` (the
+"active tree"), discovers it on subsequent `harness start` invocations,
+and writes the merged client config into each agent's home dir before
+launch. `harness mcp disable <name>` reverses the activation but keeps
+`<install-root>/mcp/<name>/data/` intact.
+
+To contribute a new registry entry:
+
+1. Create `mcp-registry/<name>/` with the three required files.
+2. Make sure the compose snippet uses `profiles: [mcp]` and joins the
+   `harness-net` network.
+3. Document any optional env vars in `README.md` and add them to
+   `.env.example` if they have a default that users should know about.
+4. Test locally with `HARNESS_REGISTRY_DIR=$(pwd)/mcp-registry harness mcp enable <name>`.
 
 ## Local development
 
@@ -75,10 +117,13 @@ $ bash scripts/build_zip.sh
 ## Tests
 
 ```
-$ bash scripts/derisk_test.sh    # ollama RemoteHost forwarding
-$ bash scripts/proxy_test.sh     # proxy translation
-$ bash scripts/agent_test.sh     # end-to-end via both agents
-$ bash scripts/harness_test.sh   # management script subcommands
+$ bash scripts/derisk_test.sh        # ollama RemoteHost forwarding
+$ bash scripts/proxy_test.sh         # proxy translation
+$ bash scripts/agent_test.sh         # end-to-end via both agents
+$ bash scripts/harness_test.sh       # management script subcommands
+$ bash scripts/persistence_test.sh   # persistent home + skel seed
+$ bash scripts/mcp_test.sh           # MCP enable/disable lifecycle
+$ bash scripts/full_pipeline_test.sh # full install + run pipeline
 ```
 
 ## Project phases
@@ -87,3 +132,4 @@ $ bash scripts/harness_test.sh   # management script subcommands
 - **Phase 2** — real translating proxy
 - **Phase 3** — agent containers (claude-code, opencode)
 - **Phase 4** — `harness` management script + `install.sh` + zip
+- **Phase 6** — persistent agent homes + MCP server registry

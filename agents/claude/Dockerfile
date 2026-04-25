@@ -19,6 +19,14 @@ FROM node:20-bookworm-slim
 #   procps         — `ps`, used by tmux/claude diagnostics
 #   gosu           — used by the entrypoint to drop from root to the harness
 #                    user after remapping uid/gid to match the host caller
+#   jq             — used by the harness script to merge MCP client configs;
+#                    the harness script itself runs on the host but the
+#                    in-container `claude mcp` workflow uses jq too
+#   python3 + pipx — let users `pipx install <thing>` inside the agent and
+#                    have it land under ~/.local/ (which is bind-mounted out
+#                    via the persistent home). pip alone wouldn't isolate
+#                    competing dep sets; pipx solves that for skill-style
+#                    installers (graphify, etc.). venv backs pipx.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tmux \
@@ -27,6 +35,11 @@ RUN apt-get update \
         ca-certificates \
         procps \
         gosu \
+        jq \
+        python3 \
+        python3-pip \
+        python3-venv \
+        pipx \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin claude-code to the version verified against this harness. Bump
@@ -54,6 +67,20 @@ RUN userdel --remove node 2>/dev/null || true \
 
 COPY entrypoint.sh /usr/local/bin/agent-entrypoint.sh
 RUN chmod +x /usr/local/bin/agent-entrypoint.sh
+
+# Persistent home: snapshot the build-time /home/harness/ contents into
+# /etc/skel/harness/ so the entrypoint can seed an empty bind mount on first
+# run. This MUST be the last step that touches /home/harness — anything we
+# add to the home dir after this point won't make it into the skeleton and
+# therefore won't be visible on a freshly-mounted persistent home.
+RUN mkdir -p /etc/skel/harness \
+    && cp -a /home/harness/. /etc/skel/harness/ 2>/dev/null || true \
+    && chown -R harness:harness /etc/skel/harness
+
+# Surface user-installed binaries (pipx, pip --user) on PATH. /home/harness
+# is shadowed by the bind mount at runtime; this PATH entry resolves once
+# the skel-seeded ~/.local/bin appears at runtime.
+ENV PATH="/home/harness/.local/bin:${PATH}"
 
 WORKDIR /workspace
 USER harness

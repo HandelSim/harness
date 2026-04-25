@@ -7,8 +7,11 @@
 
 FROM node:20-bookworm-slim
 
-# Runtime deps — same set as the claude agent. gosu lets the entrypoint
-# drop privileges from root to harness after remapping uid/gid.
+# Runtime deps — same set as the claude agent (see that Dockerfile for the
+# rationale). pipx + python3 are added so users can install skill-style tools
+# inside the agent and have them survive across container rebuilds via the
+# persistent home bind mount. jq is used by the harness script's MCP-config
+# merger and is handy for in-container shell work.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tmux \
@@ -17,6 +20,11 @@ RUN apt-get update \
         ca-certificates \
         procps \
         gosu \
+        jq \
+        python3 \
+        python3-pip \
+        python3-venv \
+        pipx \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin opencode + the openai-compatible AI SDK adapter that opencode loads
@@ -39,6 +47,15 @@ RUN userdel --remove node 2>/dev/null || true \
 
 COPY entrypoint.sh /usr/local/bin/agent-entrypoint.sh
 RUN chmod +x /usr/local/bin/agent-entrypoint.sh
+
+# Persistent home: snapshot the build-time /home/harness/ contents into
+# /etc/skel/harness/ so the entrypoint can seed an empty bind mount on first
+# run. See the claude Dockerfile for the full rationale.
+RUN mkdir -p /etc/skel/harness \
+    && cp -a /home/harness/. /etc/skel/harness/ 2>/dev/null || true \
+    && chown -R harness:harness /etc/skel/harness
+
+ENV PATH="/home/harness/.local/bin:${PATH}"
 
 WORKDIR /workspace
 USER harness

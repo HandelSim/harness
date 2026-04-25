@@ -37,6 +37,18 @@ if [[ "$(id -u)" == "0" && -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
     exec gosu harness "$0" "$@"
 fi
 
+# --- skel seed --------------------------------------------------------------
+#
+# See claude entrypoint.sh for the rationale. Summary: with the persistent
+# home bind mount, /home/harness/ is shadowed; this restores the build-time
+# skeleton once on first run, marked by ~/.harness-home-initialized.
+if [[ ! -f "${HOME}/.harness-home-initialized" ]]; then
+    if [[ -d /etc/skel/harness ]]; then
+        cp -an /etc/skel/harness/. "${HOME}/" 2>/dev/null || true
+    fi
+    touch "${HOME}/.harness-home-initialized" 2>/dev/null || true
+fi
+
 MODEL_NAME="${OLLAMA_AGENT_MODEL:-harness}"
 OLLAMA_URL="http://ollama:11434/v1"
 
@@ -48,6 +60,7 @@ echo "   model:   harness/${MODEL_NAME}"
 echo "   ollama:  ${OLLAMA_URL}"
 echo "   yolo:    ${HARNESS_YOLO:-0}"
 echo "   test:    ${HARNESS_TEST_MODE:-0}"
+echo "   print:   ${HARNESS_PRINT_MODE:-0}"
 echo "============================================================"
 
 # --- generate opencode.json -------------------------------------------------
@@ -92,6 +105,40 @@ cat > "${CONFIG_FILE}" <<EOF
 }
 EOF
 
+# --- MCP server config merge ------------------------------------------------
+#
+# The harness script writes ~/.harness-mcp-servers.json in claude's shape:
+#   {"mcpServers": {"<name>": {"type": "sse", "url": "..."}}}
+# Opencode expects an `mcp` top-level block with a different per-entry shape:
+#   {"mcp": {"<name>": {"type": "remote", "url": "..."}}} for HTTP/SSE
+#   {"mcp": {"<name>": {"type": "local", "command": [...]}}} for stdio
+# Translate each registry entry inline so the host harness script can stay
+# agent-agnostic. If jq is missing or the file is malformed, we just skip
+# (the agent still starts; the user will see an empty MCP list).
+if [[ -f "${HOME}/.harness-mcp-servers.json" ]] && command -v jq >/dev/null 2>&1; then
+    merged=$(jq -s '
+        .[0] as $cfg
+        | .[1] as $harness
+        | ($harness.mcpServers // {}) as $servers
+        | $servers
+        | to_entries
+        | map(
+            .value as $v
+            | if ($v.command // null) != null then
+                  {key: .key, value: {type: "local", command: ([$v.command] + ($v.args // []))}}
+              else
+                  {key: .key, value: {type: "remote", url: ($v.url // "")}}
+              end
+          )
+        | from_entries
+        | . as $opencode_mcp
+        | $cfg | .mcp = ((.mcp // {}) + $opencode_mcp)
+    ' "${CONFIG_FILE}" "${HOME}/.harness-mcp-servers.json" 2>/dev/null || true)
+    if [[ -n "${merged}" ]]; then
+        printf '%s\n' "${merged}" > "${CONFIG_FILE}"
+    fi
+fi
+
 # Best-effort: silence opencode's update check if it honors this var.
 export OPENCODE_DISABLE_AUTOUPDATE=1
 
@@ -102,10 +149,26 @@ if [[ "${HARNESS_YOLO:-0}" == "1" ]]; then
     opencode_args+=(--agent yolo)
 fi
 
-# --- test mode: non-interactive `opencode run` ------------------------------
+# --- test/print mode: non-interactive `opencode run` -----------------------
+#
+# Both HARNESS_TEST_MODE and HARNESS_PRINT_MODE bypass tmux. Test mode is set
+# by scripts/agent_test.sh; print mode is set by `harness claude/opencode -p`.
+#
+# Opencode does not expose a `-p` flag — the harness script forwards `-p` /
+# `--print` verbatim alongside the prompt, and we strip it here before
+# handing the rest to `opencode run`.
 
-if [[ "${HARNESS_TEST_MODE:-0}" == "1" ]]; then
-    exec opencode run "${opencode_args[@]}" "$@"
+if [[ "${HARNESS_TEST_MODE:-0}" == "1" || "${HARNESS_PRINT_MODE:-0}" == "1" ]]; then
+    forwarded_args=()
+    seen_p=0
+    for arg in "$@"; do
+        if [[ "$seen_p" == "0" && ("$arg" == "-p" || "$arg" == "--print") ]]; then
+            seen_p=1
+            continue
+        fi
+        forwarded_args+=("$arg")
+    done
+    exec opencode run "${opencode_args[@]}" "${forwarded_args[@]}"
 fi
 
 # --- normal mode: wrap interactive opencode in a detached tmux session ------

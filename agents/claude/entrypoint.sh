@@ -17,6 +17,10 @@
 #   HARNESS_YOLO=1              — adds --dangerously-skip-permissions
 #   HARNESS_TEST_MODE=1         — bypass tmux, exec claude directly (for
 #                                 scripts/agent_test.sh)
+#   HARNESS_PRINT_MODE=1        — same effect as HARNESS_TEST_MODE: bypass
+#                                 tmux and exec claude directly. Used by
+#                                 `harness claude -p ...` for headless
+#                                 single-shot invocations from the host.
 #   HARNESS_AGENT_ARGS          — currently unused; any extras come in via "$@"
 #
 # Normal mode wraps claude in a detached tmux session named `harness-agent`
@@ -51,6 +55,22 @@ if [[ "$(id -u)" == "0" && -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
     exec gosu harness "$0" "$@"
 fi
 
+# --- skel seed --------------------------------------------------------------
+#
+# The harness script bind-mounts <install-root>/agent/claude over
+# /home/harness, so on first run the home dir is empty (or only contains the
+# user's bring-along files). Restore the build-time skeleton (~/.bashrc,
+# pipx's data dir layout, etc.) once, marked by ~/.harness-home-initialized.
+# `cp -an` is "archive + no-clobber" so any file the user already placed in
+# the bind mount wins. Failures on individual files (perms quirks) shouldn't
+# abort the agent — hence the `|| true`.
+if [[ ! -f "${HOME}/.harness-home-initialized" ]]; then
+    if [[ -d /etc/skel/harness ]]; then
+        cp -an /etc/skel/harness/. "${HOME}/" 2>/dev/null || true
+    fi
+    touch "${HOME}/.harness-home-initialized" 2>/dev/null || true
+fi
+
 # --- env validation ---------------------------------------------------------
 
 if [[ -z "${ANTHROPIC_BASE_URL:-}" ]]; then
@@ -71,6 +91,31 @@ export DISABLE_AUTOUPDATER=1
 # exists so claude-code doesn't error trying to read its config dir.
 mkdir -p "${HOME}/.claude"
 
+# --- MCP server config merge ------------------------------------------------
+#
+# The harness script writes the merged set of registry MCP entries to
+# ~/.harness-mcp-servers.json (in claude's `{"mcpServers": {...}}` shape) so
+# we can fold them into ~/.claude.json without duplicating per-MCP knowledge
+# in the host script. We re-merge on every container start so disabling an
+# MCP via `harness mcp disable` propagates immediately on the next agent
+# launch. User-added entries in ~/.claude.json's mcpServers block are
+# preserved (only keys that the harness owns are overwritten).
+if [[ -f "${HOME}/.harness-mcp-servers.json" ]] && command -v jq >/dev/null 2>&1; then
+    claude_config="${HOME}/.claude.json"
+    if [[ ! -f "${claude_config}" ]]; then
+        echo "{}" > "${claude_config}"
+    fi
+    merged=$(jq -s '
+        .[0] as $existing
+        | .[1] as $harness
+        | $existing
+        | .mcpServers = ((.mcpServers // {}) + ($harness.mcpServers // {}))
+    ' "${claude_config}" "${HOME}/.harness-mcp-servers.json" 2>/dev/null || true)
+    if [[ -n "${merged}" ]]; then
+        printf '%s\n' "${merged}" > "${claude_config}"
+    fi
+fi
+
 # --- banner -----------------------------------------------------------------
 
 echo "============================================================"
@@ -79,6 +124,7 @@ echo "   model:    ${OLLAMA_AGENT_MODEL:-<unset>}"
 echo "   base_url: ${ANTHROPIC_BASE_URL}"
 echo "   yolo:     ${HARNESS_YOLO:-0}"
 echo "   test:     ${HARNESS_TEST_MODE:-0}"
+echo "   print:    ${HARNESS_PRINT_MODE:-0}"
 echo "============================================================"
 
 # --- argv assembly ----------------------------------------------------------
@@ -90,9 +136,15 @@ fi
 # Append everything the caller passed verbatim.
 claude_args+=("$@")
 
-# --- test mode: exec claude directly, no tmux -------------------------------
+# --- test/print mode: exec claude directly, no tmux -------------------------
+#
+# Both HARNESS_TEST_MODE and HARNESS_PRINT_MODE bypass tmux. Test mode is set
+# by scripts/agent_test.sh; print mode is set by `harness claude -p ...` so
+# stdout from claude propagates straight back to the invoking shell.
+# claude's own `-p` flag is part of "$@" already (the harness script forwards
+# it verbatim) so we don't add it here.
 
-if [[ "${HARNESS_TEST_MODE:-0}" == "1" ]]; then
+if [[ "${HARNESS_TEST_MODE:-0}" == "1" || "${HARNESS_PRINT_MODE:-0}" == "1" ]]; then
     exec claude "${claude_args[@]}"
 fi
 

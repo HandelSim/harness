@@ -9,11 +9,13 @@
 #     harness/                # the git clone — this script lives here
 #       harness               # this file
 #       docker-compose.yml
+#       mcp-registry/         # vetted MCP definitions (compose snippets + client cfg)
 #       ...
 #     .env                    # consumed by docker compose --env-file
 #     output/                 # bind-mounted into the proxy
-#     agent/claude/           # bind-mounted to the claude container's ~/.claude
-#     agent/opencode/         # bind-mounted to opencode's config dir
+#     agent/claude/           # bind-mounted as the claude container's /home/harness
+#     agent/opencode/         # bind-mounted as the opencode container's /home/harness
+#     mcp/<name>/             # active MCP services, copied from the registry on enable
 #     ollama-data/            # bind-mounted to ollama's blob store
 #
 # This script is symlinked into ~/.local/bin/harness by install.sh; we use
@@ -36,6 +38,12 @@ clone_dir=$(dirname "$real_self")
 install_root="${HARNESS_INSTALL_ROOT:-$(dirname "$clone_dir")}"
 env_file="$install_root/.env"
 runtime_override="$install_root/.harness-runtime.yml"
+
+# Tests can substitute their own registry by overriding HARNESS_REGISTRY_DIR.
+# Defaults to the repo's bundled mcp-registry/ folder so users see the
+# vetted set out-of-the-box.
+registry_dir="${HARNESS_REGISTRY_DIR:-$clone_dir/mcp-registry}"
+mcp_active_dir="$install_root/mcp"
 
 # Project name is fixed by spec but overridable for tests so harness_test.sh
 # can run without colliding with a real harness instance on the same daemon.
@@ -77,7 +85,34 @@ ensure_dirs() {
         "$install_root/output" \
         "$install_root/agent/claude" \
         "$install_root/agent/opencode" \
-        "$install_root/ollama-data"
+        "$install_root/ollama-data" \
+        "$mcp_active_dir"
+}
+
+# Echo the -f arguments for every active MCP compose snippet, one per line
+# (no nesting; each line is a flag and a value as a single token pair). The
+# caller splices the result into the docker compose argv.
+mcp_compose_files() {
+    if [[ ! -d "$mcp_active_dir" ]]; then
+        return 0
+    fi
+    local mcp_dir
+    for mcp_dir in "$mcp_active_dir"/*/; do
+        [[ -f "$mcp_dir/compose.yml" ]] || continue
+        printf '%s\n' "-f" "$mcp_dir/compose.yml"
+    done
+}
+
+# True if any MCP is currently enabled (active compose file present).
+any_mcp_active() {
+    if [[ ! -d "$mcp_active_dir" ]]; then
+        return 1
+    fi
+    local mcp_dir
+    for mcp_dir in "$mcp_active_dir"/*/; do
+        [[ -f "$mcp_dir/compose.yml" ]] && return 0
+    done
+    return 1
 }
 
 # Generate the runtime override file in-place. PUBLISH_OLLAMA_PORT, when
@@ -97,7 +132,10 @@ EOF
     fi
 }
 
-# Wrap docker compose with all the args we always pass.
+# Wrap docker compose with all the args we always pass. INSTALL_ROOT is
+# exported so MCP compose snippets can reference it via ${INSTALL_ROOT} for
+# absolute volume paths — relative paths in -f-included files have
+# inconsistent resolution semantics across docker compose versions.
 compose() {
     write_runtime_override
     local args=(
@@ -111,7 +149,16 @@ compose() {
     if [[ -f "$runtime_override" ]]; then
         args+=(-f "$runtime_override")
     fi
-    docker "${args[@]}" "$@"
+
+    # Splice in any active MCP compose snippets. Each one assumes the
+    # external network harness_harness-net is reachable; it is iff this
+    # project's compose has already been brought up (see cmd_start).
+    local mcp_arg
+    while IFS= read -r mcp_arg; do
+        [[ -n "$mcp_arg" ]] && args+=("$mcp_arg")
+    done < <(mcp_compose_files)
+
+    INSTALL_ROOT="$install_root" docker "${args[@]}" "$@"
 }
 
 # Best-effort check: are ollama and proxy both running for this project?
@@ -164,10 +211,21 @@ commands:
   list                  list running harness agent containers
   attach [name]         re-attach to a running agent (picker if no name)
   stop   [name]         stop a running agent (picker if no name)
+  mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
+  doctor                run runtime diagnostics (read-only)
   help                  show this help
 
 agent flags:
   --yolo                pass auto-approve / skip-permissions to the agent
+  -p, --print "PROMPT"  headless single-shot invocation (no tmux); for claude
+                        forwards its native -p flag, for opencode invokes
+                        `opencode run` inside the container
+
+'harness mcp' subcommands:
+  mcp list                          list registry entries and their enable state
+  mcp enable <name> [--force]       activate a registry MCP for this install
+  mcp disable <name> [--force]      deactivate; data dir is preserved
+  mcp install-custom <path>         copy a user-supplied MCP definition into mcp/
 
 notes:
   - 'harness down' stops services but leaves agent containers alone. Stop
@@ -175,6 +233,7 @@ notes:
   - agent containers are named harness-<tool>-<hash> where the hash is
     derived from the working directory; relaunching from the same directory
     refuses to start a second copy and points you at 'harness attach'.
+  - 'harness doctor' is diagnostic-only and never modifies state.
 EOF
 }
 
@@ -185,7 +244,15 @@ cmd_start() {
     # state. The 2>/dev/null || true handles a fresh install where there's
     # nothing to stop.
     compose down 2>/dev/null || true
-    compose up -d --build
+
+    # Active MCPs sit behind the `mcp` profile so they're only brought up
+    # when something has been `harness mcp enable`d. Without --profile they
+    # are silently ignored even though the -f file is on the compose argv.
+    if any_mcp_active; then
+        compose --profile mcp up -d --build
+    else
+        compose up -d --build
+    fi
 }
 
 cmd_down() {
@@ -208,24 +275,106 @@ cmd_logs() {
     compose logs -f "$@"
 }
 
+# Resolve per-tool image/config-dir/config-target for both run paths.
+# Echoes three tab-separated fields on stdout: image, agent_config_dir,
+# agent_config_target.
+#
+# The mount target is /home/harness for both tools — a full home rather
+# than a per-CLI subdirectory — so things the user installs inside the
+# agent (`pipx install graphifyy`, `pip install --user ...`) survive
+# container restarts. Build-time skel content is restored on first run by
+# the entrypoint via /etc/skel/harness/.
+agent_runtime_paths() {
+    local tool="$1"
+    case "$tool" in
+        claude)
+            printf 'harness-claude-agent:latest\t%s\t%s\n' \
+                "$install_root/agent/claude" "/home/harness"
+            ;;
+        opencode)
+            printf 'harness-opencode-agent:latest\t%s\t%s\n' \
+                "$install_root/agent/opencode" "/home/harness"
+            ;;
+        *)
+            err "unknown tool '$tool'"
+            exit 1
+            ;;
+    esac
+}
+
+# Write the merged MCP client config to <install-root>/agent/<tool>/.harness-mcp-servers.json
+# so the entrypoint picks it up at startup. The harness emits a single
+# claude-style shape — `{"mcpServers": {"<name>": {...}}}` — and the per-
+# tool entrypoint translates to opencode's `mcp` block when needed. We
+# rewrite this file on every agent launch so disabling an MCP propagates
+# without leaving stale entries.
+#
+# When no MCPs are active, the file is removed so the entrypoint's "merge
+# if file exists" path becomes a no-op. Without this, a previously enabled
+# MCP would linger forever in the agent's config.
+write_agent_mcp_config() {
+    local tool="$1"
+    local out_file="$install_root/agent/$tool/.harness-mcp-servers.json"
+
+    # Collect every active MCP's client-config.json. If jq is unavailable on
+    # the host or no entries exist, skip the merge entirely and clean up any
+    # stale side file.
+    local entries=()
+    if [[ -d "$mcp_active_dir" ]]; then
+        local mcp_dir
+        for mcp_dir in "$mcp_active_dir"/*/; do
+            [[ -f "$mcp_dir/client-config.json" ]] || continue
+            entries+=("$mcp_dir/client-config.json")
+        done
+    fi
+
+    if (( ${#entries[@]} == 0 )) || ! command -v jq >/dev/null 2>&1; then
+        rm -f "$out_file" 2>/dev/null || true
+        return 0
+    fi
+
+    # Reduce each {"mcpServers": {...}} into a single combined object.
+    # Later entries win on key collision (predictable, alphabetic order).
+    mkdir -p "$(dirname "$out_file")"
+    if ! jq -s 'reduce .[] as $i ({"mcpServers": {}}; .mcpServers += ($i.mcpServers // {}))' \
+        "${entries[@]}" >"$out_file" 2>/dev/null
+    then
+        # Bad json in one of the entries — don't let it stop the agent.
+        rm -f "$out_file" 2>/dev/null || true
+        err "warning: failed to merge MCP client configs; agent will start without MCP"
+    fi
+}
+
 # Run an agent (claude or opencode) in the current directory.
 #
 # The container is started detached, with /workspace bind-mounted to $PWD
 # and the agent's config dir bind-mounted from <install-root>/agent/<tool>.
 # We then poll for the tmux session to become ready and exec into it.
+#
+# With -p / --print as the FIRST harness-level flag, we bypass tmux and run
+# the agent in the foreground for single-shot scripted use.
 run_agent() {
     local tool="$1"; shift
 
-    # Parse --yolo from anywhere in the args. Everything else is passed
-    # through verbatim to the agent CLI inside the container.
+    # Parse --yolo and -p/--print. --yolo can appear anywhere; -p / --print
+    # is preserved in pass_args (claude consumes it as its own headless flag;
+    # opencode's entrypoint detects it and switches to `opencode run`).
     local yolo=0
+    local print_mode=0
     local pass_args=()
     for arg in "$@"; do
-        if [[ "$arg" == "--yolo" ]]; then
-            yolo=1
-        else
-            pass_args+=("$arg")
-        fi
+        case "$arg" in
+            --yolo)
+                yolo=1
+                ;;
+            -p|--print)
+                print_mode=1
+                pass_args+=("$arg")
+                ;;
+            *)
+                pass_args+=("$arg")
+                ;;
+        esac
     done
 
     require_docker
@@ -234,6 +383,70 @@ run_agent() {
 
     local mount_path
     mount_path=$(realpath "$PWD")
+
+    # Resolve per-tool paths.
+    local image agent_config_dir agent_config_target
+    IFS=$'\t' read -r image agent_config_dir agent_config_target < <(agent_runtime_paths "$tool")
+    mkdir -p "$agent_config_dir"
+
+    # Refresh the MCP side file before launch so the entrypoint sees the
+    # current set of enabled MCPs. Done after mkdir so the dir exists.
+    write_agent_mcp_config "$tool"
+
+    # Verify the image exists. We don't auto-build agents on first run
+    # because that's the job of `harness start`, which builds them via the
+    # `agent` profile.
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        err "image $image not found; run 'harness start' to build it"
+        exit 1
+    fi
+
+    local network="${project_name}_harness-net"
+
+    if (( print_mode )); then
+        run_agent_print "$tool" "$yolo" "$mount_path" "$image" \
+            "$agent_config_dir" "$agent_config_target" "$network" \
+            "${pass_args[@]}"
+    else
+        run_agent_interactive "$tool" "$yolo" "$mount_path" "$image" \
+            "$agent_config_dir" "$agent_config_target" "$network" \
+            "${pass_args[@]}"
+    fi
+}
+
+# Common -e flags shared between print and interactive launchers. Echoes
+# one flag per line so the caller can splice them into a docker_args array.
+agent_common_env() {
+    local tool="$1"
+    local yolo="$2"
+    printf -- '-e\nHOST_UID=%s\n' "$(id -u)"
+    printf -- '-e\nHOST_GID=%s\n' "$(id -g)"
+    printf -- '-e\nHARNESS_YOLO=%s\n' "$yolo"
+    printf -- '-e\nOLLAMA_AGENT_MODEL=%s\n' "$agent_model"
+    if [[ "$tool" == "claude" ]]; then
+        printf -- '-e\nANTHROPIC_BASE_URL=http://ollama:11434\n'
+        printf -- '-e\nANTHROPIC_API_KEY=harness-dummy\n'
+        printf -- '-e\nANTHROPIC_MODEL=%s\n' "$agent_model"
+        printf -- '-e\nANTHROPIC_SMALL_FAST_MODEL=%s\n' "$agent_model"
+    fi
+}
+
+# Build the env-flag array from agent_common_env's newline-delimited output.
+collect_agent_env() {
+    local tool="$1" yolo="$2"
+    local -a out=()
+    while IFS= read -r line; do
+        out+=("$line")
+    done < <(agent_common_env "$tool" "$yolo")
+    printf '%s\0' "${out[@]}"
+}
+
+run_agent_interactive() {
+    local tool="$1" yolo="$2" mount_path="$3" image="$4"
+    local agent_config_dir="$5" agent_config_target="$6" network="$7"
+    shift 7
+    local pass_args=("$@")
+
     local cname
     cname=$(agent_container_name "$tool" "$mount_path")
 
@@ -248,35 +461,6 @@ run_agent() {
     # that exited but wasn't removed). Ignore errors.
     docker rm "$cname" >/dev/null 2>&1 || true
 
-    local agent_config_dir agent_config_target image
-    case "$tool" in
-        claude)
-            agent_config_dir="$install_root/agent/claude"
-            agent_config_target="/home/harness/.claude"
-            image="harness-claude-agent:latest"
-            ;;
-        opencode)
-            agent_config_dir="$install_root/agent/opencode"
-            agent_config_target="/home/harness/.config/opencode"
-            image="harness-opencode-agent:latest"
-            ;;
-        *)
-            err "unknown tool '$tool'"
-            exit 1
-            ;;
-    esac
-    mkdir -p "$agent_config_dir"
-
-    # Verify the image exists. We don't auto-build agents on first run
-    # because that's the job of `harness start`, which builds them via the
-    # `agent` profile.
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
-        err "image $image not found; run 'harness start' to build it"
-        exit 1
-    fi
-
-    local network="${project_name}_harness-net"
-
     # --user 0:0 overrides the image's USER harness directive so the
     # entrypoint can remap the harness uid/gid to the host caller before
     # gosu-dropping back to harness. Without this, the container runs as
@@ -287,30 +471,22 @@ run_agent() {
         --name "$cname"
         --user 0:0
         --network "$network"
-        -e "HOST_UID=$(id -u)"
-        -e "HOST_GID=$(id -g)"
-        -e "HARNESS_YOLO=$yolo"
-        -e "OLLAMA_AGENT_MODEL=$agent_model"
+    )
+
+    local env_line
+    while IFS= read -r -d '' env_line; do
+        docker_args+=("$env_line")
+    done < <(collect_agent_env "$tool" "$yolo")
+
+    docker_args+=(
         -v "$mount_path:/workspace"
         -v "$agent_config_dir:$agent_config_target"
         -w /workspace
         --label "harness.agent=true"
         --label "harness.tool=$tool"
         --label "harness.mount=$mount_path"
+        "$image"
     )
-
-    case "$tool" in
-        claude)
-            docker_args+=(
-                -e "ANTHROPIC_BASE_URL=http://ollama:11434"
-                -e "ANTHROPIC_API_KEY=harness-dummy"
-                -e "ANTHROPIC_MODEL=$agent_model"
-                -e "ANTHROPIC_SMALL_FAST_MODEL=$agent_model"
-            )
-            ;;
-    esac
-
-    docker_args+=("$image")
     if (( ${#pass_args[@]} > 0 )); then
         docker_args+=("${pass_args[@]}")
     fi
@@ -319,10 +495,14 @@ run_agent() {
     cid=$(docker "${docker_args[@]}")
 
     # Poll for tmux readiness. The entrypoint takes a moment to start the
-    # session; without this wait, exec races and fails.
+    # session; without this wait, exec races and fails. tmux is owned by
+    # the harness user inside the container (the entrypoint does
+    # `exec gosu harness ...` after the UID remap), so we exec as harness
+    # rather than the container's default root — root's tmux client looks
+    # at /tmp/tmux-0/default, which doesn't exist.
     local tries=40   # 40 * 0.5s = 20s ceiling
     while (( tries > 0 )); do
-        if docker exec "$cid" tmux has-session -t harness-agent 2>/dev/null; then
+        if docker exec --user harness "$cid" tmux has-session -t harness-agent 2>/dev/null; then
             break
         fi
         if [[ -z "$(docker ps -q -f "id=$cid" 2>/dev/null)" ]]; then
@@ -338,7 +518,49 @@ run_agent() {
         exit 1
     fi
 
-    exec docker exec -it "$cid" tmux attach -t harness-agent
+    exec docker exec -it --user harness "$cid" tmux attach -t harness-agent
+}
+
+# Headless single-shot agent invocation. No tmux, no detach, no labels (so
+# it doesn't appear in `harness list`). Container is auto-removed on exit.
+# stdin handling: -it if running on a TTY, -i otherwise — claude needs the
+# TTY for some output formats but pipe-based callers shouldn't get a TTY.
+run_agent_print() {
+    local tool="$1" yolo="$2" mount_path="$3" image="$4"
+    local agent_config_dir="$5" agent_config_target="$6" network="$7"
+    shift 7
+    local pass_args=("$@")
+
+    local tty_flag
+    if [[ -t 0 ]]; then
+        tty_flag="-it"
+    else
+        tty_flag="-i"
+    fi
+
+    local docker_args=(
+        run --rm "$tty_flag"
+        --user 0:0
+        --network "$network"
+    )
+
+    local env_line
+    while IFS= read -r -d '' env_line; do
+        docker_args+=("$env_line")
+    done < <(collect_agent_env "$tool" "$yolo")
+
+    docker_args+=(
+        -e "HARNESS_PRINT_MODE=1"
+        -v "$mount_path:/workspace"
+        -v "$agent_config_dir:$agent_config_target"
+        -w /workspace
+        "$image"
+    )
+    if (( ${#pass_args[@]} > 0 )); then
+        docker_args+=("${pass_args[@]}")
+    fi
+
+    exec docker "${docker_args[@]}"
 }
 
 cmd_list() {
@@ -426,7 +648,9 @@ cmd_attach() {
         err "no running container named '$target'"
         exit 1
     fi
-    exec docker exec -it "$target" tmux attach -t harness-agent
+    # tmux is owned by the harness user inside the container; see the
+    # explanation in run_agent_interactive.
+    exec docker exec -it --user harness "$target" tmux attach -t harness-agent
 }
 
 cmd_stop() {
@@ -454,6 +678,702 @@ cmd_stop() {
     echo "stopped: $target"
 }
 
+# --- mcp --------------------------------------------------------------------
+#
+# Long-running MCP services (Serena and friends) live in two parallel trees:
+#
+#   <repo>/mcp-registry/<name>/        # vetted definitions, source of truth
+#   <install-root>/mcp/<name>/         # active copies; presence == enabled
+#
+# Enabling copies the registry entry into the active tree (preserving the
+# upstream by-value, so the user can edit their copy without diverging the
+# repo). Disabling removes everything except the optional `data/` dir,
+# which holds per-MCP persistent state (indices, caches).
+
+# Echo the registry entry directories that exist (one path per line). Names
+# starting with `_` are reserved for fixtures (test entries) and excluded
+# from the user-facing list view, but still resolvable by `enable`/`disable`
+# for tests that target them by name.
+list_registry_entries() {
+    if [[ ! -d "$registry_dir" ]]; then
+        return 0
+    fi
+    local d
+    for d in "$registry_dir"/*/; do
+        [[ -d "$d" ]] || continue
+        printf '%s\n' "${d%/}"
+    done
+}
+
+# Echo the active MCP entry directories that exist (one path per line).
+list_active_entries() {
+    if [[ ! -d "$mcp_active_dir" ]]; then
+        return 0
+    fi
+    local d
+    for d in "$mcp_active_dir"/*/; do
+        [[ -d "$d" ]] || continue
+        printf '%s\n' "${d%/}"
+    done
+}
+
+# Best-effort runtime status for a single MCP service: parses
+# `docker compose ps` to find a container whose service name matches the
+# active entry. Container-name matching is brittle by design — MCP composes
+# don't have a uniform service name — so we report the first active service
+# we find inside the snippet.
+mcp_runtime_status() {
+    local name="$1"
+    local compose_file="$mcp_active_dir/$name/compose.yml"
+    [[ -f "$compose_file" ]] || { printf -- '-'; return; }
+    if ! docker info >/dev/null 2>&1; then
+        printf -- 'docker-down'; return
+    fi
+    # Pull the first service name out of the compose snippet. Naive YAML —
+    # the snippet shape is constrained (we control the registry) so this is
+    # deliberately not a full parser.
+    local svc
+    svc=$(awk '
+        /^services:/ { in_svc=1; next }
+        in_svc && /^[A-Za-z]/ { in_svc=0 }
+        in_svc && /^  [A-Za-z][A-Za-z0-9_-]*:/ {
+            sub(/:.*$/, "")
+            sub(/^[[:space:]]+/, "")
+            print
+            exit
+        }
+    ' "$compose_file")
+    if [[ -z "$svc" ]]; then
+        printf 'unknown'
+        return
+    fi
+    local cid
+    cid=$(compose ps -q "$svc" 2>/dev/null || true)
+    if [[ -z "$cid" ]]; then
+        printf 'stopped'
+        return
+    fi
+    local running health
+    running=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || echo "")
+    health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo "")
+    if [[ "$running" != "true" ]]; then
+        printf 'stopped'
+        return
+    fi
+    case "$health" in
+        healthy)   printf 'running (healthy)' ;;
+        unhealthy) printf 'running (unhealthy)' ;;
+        starting)  printf 'starting' ;;
+        none|"")   printf 'running' ;;
+        *)         printf 'running (%s)' "$health" ;;
+    esac
+}
+
+cmd_mcp_help() {
+    cat <<'EOF'
+harness mcp — manage long-running MCP services.
+
+usage:
+  harness mcp <subcommand> [args...]
+
+subcommands:
+  list                       show registry entries and their enable state
+  enable <name> [--force]    copy a registry entry into the active tree
+  disable <name> [--force]   remove an active entry; data/ is preserved
+  install-custom <path>      install a user-supplied MCP definition
+
+After enable/disable, run 'harness start' (or 'harness upgrade') to
+materialize the change in the running compose stack.
+EOF
+}
+
+cmd_mcp_list() {
+    local printed_header=0
+    local seen_names=()
+
+    # Walk the registry first (canonical order) and decorate with active state.
+    while IFS= read -r entry_dir; do
+        [[ -n "$entry_dir" ]] || continue
+        local name
+        name=$(basename "$entry_dir")
+        # Hide reserved test fixture names from user output.
+        [[ "$name" =~ ^_ ]] && continue
+        if (( printed_header == 0 )); then
+            printf '%-20s %-9s %s\n' "NAME" "ENABLED" "STATUS"
+            printed_header=1
+        fi
+        local enabled status
+        if [[ -d "$mcp_active_dir/$name" ]]; then
+            enabled="yes"
+            status=$(mcp_runtime_status "$name")
+        else
+            enabled="no"
+            status="-"
+        fi
+        printf '%-20s %-9s %s\n' "$name" "$enabled" "$status"
+        seen_names+=("$name")
+    done < <(list_registry_entries)
+
+    # Surface anything in the active tree that doesn't have a registry entry
+    # (custom installs, locally-edited copies). These print after the registry
+    # entries with a marker so the source is obvious.
+    while IFS= read -r entry_dir; do
+        [[ -n "$entry_dir" ]] || continue
+        local name
+        name=$(basename "$entry_dir")
+        [[ "$name" =~ ^_ ]] && continue
+        local already=0 s
+        for s in "${seen_names[@]}"; do
+            if [[ "$s" == "$name" ]]; then already=1; break; fi
+        done
+        (( already )) && continue
+        if (( printed_header == 0 )); then
+            printf '%-20s %-9s %s\n' "NAME" "ENABLED" "STATUS"
+            printed_header=1
+        fi
+        local status
+        status=$(mcp_runtime_status "$name")
+        printf '%-20s %-9s %s\n' "${name} (custom)" "yes" "$status"
+    done < <(list_active_entries)
+
+    if (( printed_header == 0 )); then
+        echo "no MCP entries (registry: $registry_dir)"
+    fi
+}
+
+# Names of available registry entries, comma-separated, for error messages.
+mcp_registry_names_csv() {
+    local out=""
+    while IFS= read -r entry_dir; do
+        [[ -n "$entry_dir" ]] || continue
+        local name
+        name=$(basename "$entry_dir")
+        [[ "$name" =~ ^_ ]] && continue
+        if [[ -z "$out" ]]; then
+            out="$name"
+        else
+            out="$out, $name"
+        fi
+    done < <(list_registry_entries)
+    printf '%s' "${out:-(none)}"
+}
+
+cmd_mcp_enable() {
+    local force=0 name=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --force) force=1 ;;
+            -*)      err "unknown flag '$1'"; exit 1 ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    err "unexpected extra argument '$1'"
+                    exit 1
+                fi
+                ;;
+        esac
+        shift
+    done
+    if [[ -z "$name" ]]; then
+        err "usage: harness mcp enable <name> [--force]"
+        exit 1
+    fi
+
+    local src="$registry_dir/$name"
+    if [[ ! -d "$src" ]]; then
+        err "unknown MCP '$name'; available: $(mcp_registry_names_csv)"
+        exit 1
+    fi
+    if [[ ! -f "$src/compose.yml" ]]; then
+        err "registry entry '$name' is missing compose.yml"
+        exit 1
+    fi
+
+    local dest="$mcp_active_dir/$name"
+    if [[ -d "$dest" ]] && (( ! force )); then
+        err "$name is already enabled (use --force to overwrite)"
+        exit 1
+    fi
+
+    mkdir -p "$mcp_active_dir"
+    if (( force )); then
+        # Wipe everything except data/ so persistent state survives a force-
+        # reinstall. This mirrors the disable semantics: data is sacred.
+        if [[ -d "$dest" ]]; then
+            local f
+            for f in "$dest"/*; do
+                [[ -e "$f" ]] || continue
+                if [[ "$(basename "$f")" == "data" ]]; then
+                    continue
+                fi
+                rm -rf "$f"
+            done
+        fi
+    fi
+    mkdir -p "$dest"
+    # Copy each top-level file from the registry entry. Subdirs (rare) are
+    # recursed too. data/ in the registry entry would be unusual but if it
+    # exists we copy it on first enable only.
+    local f
+    for f in "$src"/* "$src"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        cp -a "$f" "$dest/"
+    done
+
+    # Pre-create the data dir so the compose volume mount has a valid host
+    # target on first start (otherwise docker creates it as root).
+    mkdir -p "$dest/data"
+
+    cat <<EOF
+enabled: $name (from $src)
+data: $dest/data
+next:
+  run 'harness start' (or 'harness upgrade') to bring up the service.
+  agents launched after that will see this MCP in their config.
+EOF
+}
+
+cmd_mcp_disable() {
+    local force=0 name=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --force) force=1 ;;
+            -*)      err "unknown flag '$1'"; exit 1 ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    err "unexpected extra argument '$1'"
+                    exit 1
+                fi
+                ;;
+        esac
+        shift
+    done
+    if [[ -z "$name" ]]; then
+        err "usage: harness mcp disable <name> [--force]"
+        exit 1
+    fi
+
+    local dest="$mcp_active_dir/$name"
+    if [[ ! -d "$dest" ]]; then
+        err "$name is not enabled"
+        exit 1
+    fi
+
+    if (( ! force )); then
+        # Defaults to NO so a stray Enter doesn't drop services.
+        local ans
+        printf 'this will stop and remove the active config for %s. ' "$name" >&2
+        printf 'data dir at %s/data will be preserved. continue? [y/N]: ' "$dest" >&2
+        if [[ -t 0 ]]; then
+            read -r ans </dev/tty
+        else
+            err "non-interactive shell; pass --force to confirm"
+            exit 1
+        fi
+        case "${ans:-}" in
+            y|Y|yes|YES) ;;
+            *) echo "aborted." >&2; exit 0 ;;
+        esac
+    fi
+
+    # Stop and remove the MCP's containers if running. We enumerate the
+    # services declared in the snippet (config --services), then `rm -sf`
+    # each via the full project compose so other MCPs and the core
+    # services aren't disturbed. --profile mcp is required because the
+    # snippet's services are gated behind it; without the flag compose
+    # filters them out of its view.
+    if [[ -f "$dest/compose.yml" ]] && docker info >/dev/null 2>&1; then
+        local svc
+        while IFS= read -r svc; do
+            [[ -z "$svc" ]] && continue
+            compose --profile mcp rm -sf "$svc" 2>/dev/null || true
+        done < <(docker compose -f "$dest/compose.yml" --profile mcp config --services 2>/dev/null || true)
+    fi
+
+    # Remove everything in the active dir except data/. data is the user's
+    # to clean up explicitly with rm -rf.
+    local f
+    for f in "$dest"/* "$dest"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        if [[ "$(basename "$f")" == "data" ]]; then
+            continue
+        fi
+        rm -rf "$f"
+    done
+    # If only data/ remains, leave the parent dir; if the entry had no data
+    # subdir at all, remove the now-empty parent.
+    if [[ ! -d "$dest/data" ]]; then
+        rmdir "$dest" 2>/dev/null || true
+    fi
+
+    echo "disabled: $name"
+    if [[ -d "$dest/data" ]]; then
+        echo "data preserved at: $dest/data"
+    fi
+}
+
+cmd_mcp_install_custom() {
+    local src="${1:-}"
+    if [[ -z "$src" ]]; then
+        err "usage: harness mcp install-custom <path>"
+        exit 1
+    fi
+    if [[ ! -d "$src" ]]; then
+        err "$src is not a directory"
+        exit 1
+    fi
+    if [[ ! -f "$src/compose.yml" ]]; then
+        err "$src is missing compose.yml"
+        exit 1
+    fi
+    local name
+    name=$(basename "$(realpath "$src")")
+    local dest="$mcp_active_dir/$name"
+    if [[ -d "$dest" ]]; then
+        err "$name is already installed (remove $dest first or use a different basename)"
+        exit 1
+    fi
+    mkdir -p "$mcp_active_dir"
+    cp -a "$src" "$dest"
+    mkdir -p "$dest/data"
+    echo "installed custom MCP: $name (from $src)"
+    echo "next: run 'harness start' to bring it up"
+}
+
+cmd_mcp() {
+    local sub="${1:-help}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    case "$sub" in
+        help|-h|--help) cmd_mcp_help ;;
+        list)           cmd_mcp_list ;;
+        enable)         cmd_mcp_enable "$@" ;;
+        disable)        cmd_mcp_disable "$@" ;;
+        install-custom) cmd_mcp_install_custom "$@" ;;
+        *)
+            err "unknown mcp subcommand '$sub'"
+            cmd_mcp_help >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- doctor -----------------------------------------------------------------
+#
+# Read-only runtime diagnostics. Each section runs a fixed set of checks;
+# every check prints one line: <symbol> <name> <detail>. A summary footer
+# reports counts. Exit 0 if zero errors, 1 otherwise. Warnings don't fail.
+#
+# Implementation notes:
+#   - Each check is wrapped to never abort doctor (e.g. via `|| true`).
+#   - Runtime probes that exec into containers are bounded with `timeout 3`
+#     so a slow / hung container can't stall the whole report.
+#   - Output is plain text + one ANSI color per status. No box-drawing.
+
+declare -i doctor_errors=0
+declare -i doctor_warnings=0
+
+doctor_section() {
+    printf '\n[%s]\n' "$1"
+}
+
+doctor_check() {
+    local status="$1" name="$2" detail="${3:-}"
+    local symbol color
+    case "$status" in
+        ok)   symbol='✓'; color='\033[0;32m' ;;
+        fail) symbol='✗'; color='\033[0;31m'; doctor_errors=$((doctor_errors+1)) ;;
+        warn) symbol='⚠'; color='\033[0;33m'; doctor_warnings=$((doctor_warnings+1)) ;;
+        skip) symbol='–'; color='\033[0;90m' ;;
+        *)    symbol='?'; color='' ;;
+    esac
+    printf '  %b%s%b %-22s %s\n' "$color" "$symbol" '\033[0m' "$name" "$detail"
+}
+
+# Redact a secret to "abcd...wxyz" (first 4 + last 4) when long enough,
+# else "***". For empty or short values returns "***".
+doctor_redact() {
+    local v="${1:-}"
+    if [[ -z "$v" ]]; then
+        printf '***'
+        return
+    fi
+    if (( ${#v} >= 12 )); then
+        printf '%s...%s' "${v:0:4}" "${v: -4}"
+    else
+        printf '***'
+    fi
+}
+
+# Fetch the Health.Status string from a compose service (empty string if
+# the service or container can't be inspected). Never aborts on failure.
+doctor_health_of() {
+    local svc="$1"
+    local cid
+    cid=$(compose ps -q "$svc" 2>/dev/null || true)
+    if [[ -z "$cid" ]]; then
+        printf 'absent'
+        return
+    fi
+    docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || printf 'unknown'
+}
+
+cmd_doctor() {
+    doctor_errors=0
+    doctor_warnings=0
+
+    # ---------------- [deps] ----------------
+    doctor_section deps
+    if docker info >/dev/null 2>&1; then
+        doctor_check ok "docker daemon" "reachable"
+    else
+        doctor_check fail "docker daemon" "not reachable; is the daemon running?"
+    fi
+
+    if docker compose version >/dev/null 2>&1; then
+        local v
+        v=$(docker compose version 2>/dev/null | head -1)
+        doctor_check ok "docker compose" "${v}"
+    else
+        doctor_check fail "docker compose" "v2 not available"
+    fi
+
+    if command -v git >/dev/null 2>&1; then
+        local gv
+        gv=$(git --version 2>/dev/null | head -1)
+        doctor_check ok "git" "${gv}"
+    else
+        doctor_check fail "git" "not found on PATH"
+    fi
+
+    # ---------------- [install] -------------
+    doctor_section install
+    doctor_check ok "install root" "$install_root"
+
+    if [[ -d "$clone_dir/.git" ]]; then
+        local commit branch dirty_count detail
+        commit=$(git -C "$clone_dir" describe --always 2>/dev/null || echo "?")
+        branch=$(git -C "$clone_dir" branch --show-current 2>/dev/null || echo "?")
+        dirty_count=$(git -C "$clone_dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$dirty_count" == "0" ]]; then
+            detail="${commit} on ${branch} (clean)"
+        else
+            detail="${commit} on ${branch} (${dirty_count} dirty)"
+        fi
+        doctor_check ok "clone" "$detail"
+    else
+        doctor_check fail "clone" "$clone_dir is not a git repo"
+    fi
+
+    local local_bin="$HOME/.local/bin/harness"
+    if [[ -L "$local_bin" ]]; then
+        local target
+        target=$(readlink -f "$local_bin" 2>/dev/null || true)
+        if [[ "$target" == "$real_self" ]]; then
+            doctor_check ok "harness symlink" "$local_bin -> $real_self"
+        else
+            doctor_check warn "harness symlink" "points to ${target:-?} (expected $real_self)"
+        fi
+    else
+        doctor_check warn "harness symlink" "$local_bin missing; reinstall to add"
+    fi
+
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*)
+            doctor_check ok "PATH" "\$HOME/.local/bin present"
+            ;;
+        *)
+            doctor_check warn "PATH" "\$HOME/.local/bin not in PATH"
+            ;;
+    esac
+
+    # ---------------- [config] --------------
+    doctor_section config
+    if [[ ! -f "$env_file" ]]; then
+        doctor_check fail ".env" "$env_file missing"
+    elif [[ ! -r "$env_file" ]]; then
+        doctor_check fail ".env" "$env_file not readable"
+    else
+        doctor_check ok ".env" "$env_file"
+
+        if [[ -n "${PROXY_API_URL:-}" ]]; then
+            doctor_check ok "PROXY_API_URL" "$PROXY_API_URL"
+        else
+            doctor_check fail "PROXY_API_URL" "unset"
+        fi
+
+        if [[ -n "${PROXY_API_KEY:-}" ]]; then
+            doctor_check ok "PROXY_API_KEY" "$(doctor_redact "$PROXY_API_KEY")"
+        else
+            doctor_check fail "PROXY_API_KEY" "unset"
+        fi
+
+        if [[ -n "${PROXY_API_MODEL:-}" ]]; then
+            doctor_check ok "PROXY_API_MODEL" "$PROXY_API_MODEL"
+        else
+            doctor_check fail "PROXY_API_MODEL" "unset"
+        fi
+
+        if [[ -n "${OLLAMA_VERSION:-}" ]]; then
+            doctor_check ok "OLLAMA_VERSION" "$OLLAMA_VERSION"
+        else
+            doctor_check fail "OLLAMA_VERSION" "unset"
+        fi
+
+        doctor_check ok "OLLAMA_AGENT_MODEL" "$agent_model"
+    fi
+
+    # ---------------- [storage] -------------
+    doctor_section storage
+    local d
+    for d in output agent/claude agent/opencode ollama-data; do
+        local path="$install_root/$d"
+        if [[ -d "$path" && -w "$path" ]]; then
+            doctor_check ok "$d" "writable"
+        elif [[ -d "$path" ]]; then
+            doctor_check fail "$d" "exists but not writable"
+        else
+            doctor_check fail "$d" "missing ($path)"
+        fi
+    done
+    # mcp/ is only required if any MCPs have been enabled. If the dir
+    # exists but is empty, that's fine — it's auto-created by ensure_dirs.
+    if [[ -d "$mcp_active_dir" ]]; then
+        if any_mcp_active; then
+            if [[ -w "$mcp_active_dir" ]]; then
+                doctor_check ok "mcp" "writable; $(list_active_entries | wc -l | tr -d ' ') entries"
+            else
+                doctor_check fail "mcp" "exists but not writable ($mcp_active_dir)"
+            fi
+        else
+            doctor_check ok "mcp" "no entries enabled"
+        fi
+    else
+        doctor_check ok "mcp" "no entries enabled"
+    fi
+
+    # ---------------- [runtime] -------------
+    doctor_section runtime
+    local network="${project_name}_harness-net"
+    local network_ok=0
+    if docker network inspect "$network" >/dev/null 2>&1; then
+        doctor_check ok "network" "$network"
+        network_ok=1
+    else
+        doctor_check warn "network" "$network not present (services not running)"
+    fi
+
+    if (( network_ok )); then
+        local ollama_status proxy_status
+        ollama_status=$(doctor_health_of ollama)
+        proxy_status=$(doctor_health_of proxy)
+
+        case "$ollama_status" in
+            healthy)        doctor_check ok   "ollama" "healthy" ;;
+            absent)         doctor_check warn "ollama" "no container for project ($project_name)" ;;
+            none)           doctor_check warn "ollama" "running but no healthcheck reported" ;;
+            *)              doctor_check warn "ollama" "$ollama_status" ;;
+        esac
+
+        case "$proxy_status" in
+            healthy)        doctor_check ok   "proxy" "healthy" ;;
+            absent)         doctor_check warn "proxy" "no container for project ($project_name)" ;;
+            none)           doctor_check warn "proxy" "running but no healthcheck reported" ;;
+            *)              doctor_check warn "proxy" "$proxy_status" ;;
+        esac
+
+        # Stub model + proxy /health probes only meaningful if ollama is up.
+        if [[ "$ollama_status" == "healthy" ]]; then
+            local ollama_cid
+            ollama_cid=$(compose ps -q ollama 2>/dev/null || true)
+            if [[ -n "$ollama_cid" ]]; then
+                local show_out
+                show_out=$(timeout 3 docker exec "$ollama_cid" \
+                    curl -sf -X POST -H 'Content-Type: application/json' \
+                    -d "{\"name\":\"${agent_model}\"}" \
+                    http://127.0.0.1:11434/api/show 2>/dev/null || true)
+                if [[ -n "$show_out" ]] && grep -qi 'remote_host' <<<"$show_out"; then
+                    doctor_check ok   "stub model" "$agent_model registered with remote_host"
+                else
+                    doctor_check warn "stub model" "$agent_model not registered yet"
+                fi
+
+                if timeout 3 docker exec "$ollama_cid" \
+                    curl -sf "http://proxy:${PROXY_PORT:-8000}/health" >/dev/null 2>&1; then
+                    doctor_check ok   "proxy /health" "reachable from ollama"
+                else
+                    doctor_check warn "proxy /health" "not reachable from ollama"
+                fi
+            else
+                doctor_check skip "stub model" "ollama container id not found"
+                doctor_check skip "proxy /health" "ollama container id not found"
+            fi
+        else
+            doctor_check skip "stub model" "ollama not healthy"
+            doctor_check skip "proxy /health" "ollama not healthy"
+        fi
+    else
+        doctor_check skip "ollama" "services not running"
+        doctor_check skip "proxy" "services not running"
+        doctor_check skip "stub model" "services not running"
+        doctor_check skip "proxy /health" "services not running"
+    fi
+
+    # ---------------- [images] --------------
+    doctor_section images
+    local img
+    for img in \
+        "harness-ollama:${OLLAMA_VERSION:-0.21.2}" \
+        "harness-proxy:latest" \
+        "harness-claude-agent:latest" \
+        "harness-opencode-agent:latest"
+    do
+        if docker image inspect "$img" >/dev/null 2>&1; then
+            doctor_check ok "$(printf '%s' "$img" | cut -d: -f1)" "$img present"
+        else
+            doctor_check warn "$(printf '%s' "$img" | cut -d: -f1)" "$img missing — run 'harness start' to build"
+        fi
+    done
+
+    # ---------------- [mcp] -----------------
+    #
+    # Only emitted when at least one MCP has been enabled — otherwise the
+    # section would be noise. For each active entry we report runtime
+    # status (parsed via mcp_runtime_status). Health-status warn vs. ok is
+    # decided by the string returned: containing "(healthy)" is ok,
+    # everything else is warn so a misbehaving MCP doesn't fail doctor
+    # outright (the harness is still usable without that MCP).
+    if any_mcp_active; then
+        doctor_section mcp
+        local entry_dir name status
+        while IFS= read -r entry_dir; do
+            [[ -n "$entry_dir" ]] || continue
+            name=$(basename "$entry_dir")
+            status=$(mcp_runtime_status "$name")
+            case "$status" in
+                *"(healthy)"|"running") doctor_check ok   "$name" "$status" ;;
+                stopped)                doctor_check warn "$name" "stopped" ;;
+                *)                      doctor_check warn "$name" "$status" ;;
+            esac
+        done < <(list_active_entries)
+    fi
+
+    # ---------------- [agents] --------------
+    doctor_section agents
+    local running
+    running=$(docker ps --filter "label=harness.agent=true" --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
+    doctor_check ok "running" "${running} agent container(s)"
+
+    # ---------------- summary ---------------
+    printf '\n%d errors, %d warnings\n' "$doctor_errors" "$doctor_warnings"
+    if (( doctor_errors > 0 )); then
+        return 1
+    fi
+    return 0
+}
+
 # --- dispatch ---------------------------------------------------------------
 
 main() {
@@ -472,6 +1392,8 @@ main() {
         list)           cmd_list ;;
         attach)         cmd_attach "$@" ;;
         stop)           cmd_stop "$@" ;;
+        mcp)            cmd_mcp "$@" ;;
+        doctor)         cmd_doctor ;;
         *)
             err "unknown command '$cmd'"
             cmd_help >&2

@@ -51,10 +51,36 @@ After install, the layout is:
 ├── README.md              this file
 ├── harness/               the cloned repo (managed by 'harness update')
 ├── output/                proxy debug dumps (only used if OUTPUT_DIR is set)
-├── agent/claude/          persists ~/.claude across container rebuilds
-├── agent/opencode/        persists ~/.config/opencode across rebuilds
+├── agent/claude/          full /home/harness for the claude agent container
+├── agent/opencode/        full /home/harness for the opencode agent container
+├── mcp/<name>/            active MCP services (one dir per enabled service)
 └── ollama-data/           persists ollama model blobs
 ```
+
+The `agent/<tool>/` dirs are the agent containers' entire `/home/harness`,
+so anything you `pipx install` or `pip install --user` inside an agent
+survives container rebuilds. The first time an agent starts against an
+empty home, the build-time skeleton (shells dotfiles, etc.) is restored
+from `/etc/skel/harness/` inside the image.
+
+## Adding MCP servers (Serena and friends)
+
+Long-running MCP servers (semantic code analysis, etc.) live in a registry
+under `harness/mcp-registry/`. Bring one online with:
+
+```
+harness mcp enable serena
+harness start
+```
+
+Agents launched after that automatically see the MCP in their config.
+First `start` after enabling builds the upstream image, which can take
+several minutes; subsequent starts are fast. Disable with
+`harness mcp disable serena` (the data dir at `mcp/serena/data/` is
+preserved across enable/disable cycles).
+
+See `harness mcp` for all subcommands and `harness/mcp-registry/<name>/README.md`
+for the security tradeoffs of each registry entry.
 
 ## Common commands
 
@@ -68,6 +94,7 @@ After install, the layout is:
 | `harness attach`   | re-attach to a running agent (picker if ambiguous)    |
 | `harness stop`     | stop a running agent (picker if ambiguous)            |
 | `harness logs`     | follow service logs                                   |
+| `harness mcp list` | list available + enabled MCP services                 |
 
 Pass `--yolo` to `harness claude` or `harness opencode` for skip-permissions
 mode.

@@ -1,0 +1,76 @@
+# Serena MCP — semantic code analysis service.
+#
+# Brought up by `harness start` whenever Serena is enabled
+# (<install-root>/mcp/serena/compose.yml present). Reach it from agents at
+# http://serena:9121/sse on the harness-net network.
+#
+# This snippet is merged with harness/docker-compose.yml via additional
+# `-f` args. Everything here either references the main compose file
+# (network) or expands env vars the harness script exports at compose time.
+#
+# Build context: pulled directly from upstream's git repo. The first
+# `harness start` after enabling Serena therefore builds the image (~5–10
+# minutes; ~2GB result). Subsequent starts reuse the cached image.
+
+services:
+  serena:
+    # Pinned to a specific upstream tag. Bump deliberately when re-testing
+    # against newer versions. The image tag is local-only; we don't push.
+    image: harness-serena:v0.1
+    build:
+      context: https://github.com/oraios/serena.git#main
+      dockerfile: docker/Dockerfile
+    container_name: harness-serena
+    networks:
+      - harness-net
+    profiles:
+      - mcp
+    environment:
+      SERENA_DOCKER: "1"
+      # Bind the SSE listener on all in-container interfaces so agents on
+      # harness-net can reach it. Matches the --host 0.0.0.0 in `command`.
+      SERENA_HOST: 0.0.0.0
+      SERENA_PORT: "9121"
+    volumes:
+      # The user's project root, read-only. Serena indexes code from here
+      # but cannot modify it — edits flow through the agent (which has
+      # write access to its own CWD via /workspace). HARNESS_PROJECTS_ROOT
+      # defaults to the host's $HOME, which exposes everything; users who
+      # want a tighter scope set it to a single tree in .env.
+      - ${HARNESS_PROJECTS_ROOT:-/home}:/workspaces:ro
+      # Persistent index/config dir. Survives `harness mcp disable` so the
+      # next enable picks up where Serena left off.
+      - ${INSTALL_ROOT}/mcp/serena/data:/workspaces/serena/config
+    # SERENA_DASHBOARD_PORT optionally publishes the Serena dashboard on the
+    # host. Empty (default) keeps it internal-only. The `${VAR:+:24282}`
+    # construct elides the colon when the var is empty so the ports list
+    # stays valid YAML in either configuration.
+    ports:
+      - "${SERENA_DASHBOARD_PORT:-}${SERENA_DASHBOARD_PORT:+:24282}"
+    command:
+      - "uv"
+      - "run"
+      - "--directory"
+      - "."
+      - "serena-mcp-server"
+      - "--transport"
+      - "sse"
+      - "--port"
+      - "9121"
+      - "--host"
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9121/sse -m 2 -N -o /dev/null & sleep 1; kill $$! 2>/dev/null; exit 0"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+networks:
+  # Same network the main docker-compose.yml declares. With matching short
+  # name and no `external: true`, compose merges the two declarations into
+  # a single project-namespaced network (`<project>_harness-net`) on the
+  # first `up` and reuses it on subsequent ones. This keeps the fixture
+  # portable across project names.
+  harness-net:

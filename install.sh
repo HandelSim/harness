@@ -17,7 +17,11 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/HandelSim/harness"
+# The default points at the public GitHub remote. scripts/full_pipeline_test.sh
+# overrides this via HARNESS_REPO_URL=<local-path> so the pipeline test can
+# clone the working tree under test without needing a network round-trip.
+# `git clone` accepts a local directory as a URL, so any path on disk works.
+REPO_URL="${HARNESS_REPO_URL:-https://github.com/HandelSim/harness}"
 CLONE_DIR="harness"
 PROGRAM_NAME="harness"
 LOCAL_BIN="$HOME/.local/bin"
