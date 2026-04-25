@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
-# Phase 1 de-risk test.
+# Phase 1 de-risk test (updated for Phase 2).
 #
-# Brings up ollama + the mock proxy, then asserts that a chat request to
-# ollama is forwarded to the proxy via RemoteHost and the proxy's response
-# round-trips back to the caller. If anything fails, dumps logs and exits 1.
-# Always tears down compose state on exit (success or failure).
+# Brings up ollama + the (real) proxy + a mock upstream API, then asserts
+# that a chat request to ollama is forwarded through to the upstream and the
+# response round-trips back to the caller. If anything fails, dumps logs and
+# exits 1. Always tears down compose state on exit (success or failure).
+#
+# This stays the project's simplest smoke test. It uses the same mock upstream
+# as scripts/proxy_test.sh so it doesn't depend on real upstream credentials.
 
 set -euo pipefail
 
@@ -13,9 +16,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+PROJECT_NAME="harness-derisk"
+
 echo "============================================================"
-echo " harness Phase 1 de-risk test"
-echo "   verifies: curl -> ollama -> proxy -> ollama -> curl"
+echo " harness Phase 1 de-risk test (Phase 2-aware)"
+echo "   verifies: curl -> ollama -> proxy -> mock upstream -> back"
 echo "============================================================"
 
 # --- preflight ---------------------------------------------------------------
@@ -29,18 +34,20 @@ fi
 
 ENV_FILE="$(mktemp -t harness-derisk.XXXXXX.env)"
 cat >"${ENV_FILE}" <<'EOF'
-PROXY_API_URL=http://placeholder
-PROXY_API_KEY=placeholder
-PROXY_API_MODEL=placeholder
+PROXY_API_URL=http://mockupstream:9000/v1/chat/completions
+PROXY_API_KEY=test-key-1234
+PROXY_API_MODEL=test-model
 PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
+PROXY_TIMEOUT=30
 OLLAMA_VERSION=0.21.2
 OLLAMA_AGENT_MODEL=harness
 OLLAMA_CONTEXT_LENGTH=200000
+MOCK_SCENARIO=text
 EOF
 
-# Override that publishes ollama's port to the host so this script can curl it.
+# Override that publishes ollama's port to the host and adds the mock upstream.
 # The base compose file keeps ollama internal-only by default.
 OVERRIDE_FILE="$(mktemp -t harness-derisk.XXXXXX.yml)"
 cat >"${OVERRIDE_FILE}" <<'EOF'
@@ -48,9 +55,29 @@ services:
   ollama:
     ports:
       - "11434:11434"
+  mockupstream:
+    image: python:3.12-slim
+    working_dir: /app
+    environment:
+      MOCK_SCENARIO: ${MOCK_SCENARIO:-text}
+    volumes:
+      - ./scripts/mock_upstream.py:/app/mock_upstream.py:ro
+    networks:
+      - harness-net
+    expose:
+      - "9000"
+    command: >
+      sh -c "pip install --quiet --no-cache-dir flask==3.0.3 &&
+             python /app/mock_upstream.py"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;\nu=urllib.request.urlopen('http://127.0.0.1:9000/health',timeout=2);\nsys.exit(0 if u.status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
 EOF
 
-COMPOSE=(docker compose --env-file "${ENV_FILE}" -f docker-compose.yml -f "${OVERRIDE_FILE}")
+COMPOSE=(docker compose --project-name "${PROJECT_NAME}" --env-file "${ENV_FILE}" -f docker-compose.yml -f "${OVERRIDE_FILE}")
 
 cleanup() {
     echo "[derisk] cleanup: tearing down compose state"
@@ -64,12 +91,12 @@ trap cleanup EXIT INT TERM
 
 # --- bring up ----------------------------------------------------------------
 
-echo "[derisk] building and starting ollama + proxy"
+echo "[derisk] building and starting ollama + proxy + mockupstream"
 "${COMPOSE[@]}" up -d --build
 
 # --- wait for healthy --------------------------------------------------------
 
-echo "[derisk] waiting up to 90s for both services to become healthy"
+echo "[derisk] waiting up to 120s for all services to become healthy"
 
 is_healthy() {
     local svc="$1"
@@ -83,16 +110,17 @@ is_healthy() {
     [[ "${status}" == "healthy" ]]
 }
 
-deadline=$(( $(date +%s) + 90 ))
+deadline=$(( $(date +%s) + 120 ))
 while true; do
-    if is_healthy proxy && is_healthy ollama; then
-        echo "[derisk] both services healthy"
+    if is_healthy mockupstream && is_healthy proxy && is_healthy ollama; then
+        echo "[derisk] all three services healthy"
         break
     fi
     if (( $(date +%s) >= deadline )); then
-        echo "[derisk] ERROR: services did not become healthy within 90s" >&2
-        echo "--- ollama logs ---"; "${COMPOSE[@]}" logs ollama || true
-        echo "--- proxy logs ---";  "${COMPOSE[@]}" logs proxy  || true
+        echo "[derisk] ERROR: services did not become healthy within 120s" >&2
+        echo "--- mockupstream logs ---"; "${COMPOSE[@]}" logs mockupstream || true
+        echo "--- proxy logs ---";        "${COMPOSE[@]}" logs proxy        || true
+        echo "--- ollama logs ---";       "${COMPOSE[@]}" logs ollama       || true
         exit 1
     fi
     sleep 2
@@ -108,8 +136,9 @@ fail() {
     if [[ $# -gt 0 ]]; then
         echo "[derisk] detail: $*" >&2
     fi
-    echo "--- ollama logs ---" >&2; "${COMPOSE[@]}" logs ollama >&2 || true
-    echo "--- proxy logs ---"  >&2; "${COMPOSE[@]}" logs proxy  >&2 || true
+    echo "--- mockupstream logs ---" >&2; "${COMPOSE[@]}" logs mockupstream >&2 || true
+    echo "--- proxy logs ---"        >&2; "${COMPOSE[@]}" logs proxy        >&2 || true
+    echo "--- ollama logs ---"       >&2; "${COMPOSE[@]}" logs ollama       >&2 || true
     exit 1
 }
 
@@ -143,14 +172,14 @@ CHAT_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
     -d '{"model":"harness","messages":[{"role":"user","content":"test"}],"stream":false}')" \
     || fail "D: /api/chat (stream=false) request failed"
 echo "[derisk]   /api/chat (stream=false): ${CHAT_BODY}"
-echo "${CHAT_BODY}" | grep -q "MOCK PROXY: phase 1 de-risk test passed" \
-    || fail "D: chat response did not contain mock proxy text" "${CHAT_BODY}"
+echo "${CHAT_BODY}" | grep -q "Hello from mock upstream" \
+    || fail "D: chat response did not contain mock upstream text" "${CHAT_BODY}"
 
-# Test E — proxy received the forward.
-echo "[derisk] test E: proxy logged the forwarded request"
-PROXY_LOGS="$("${COMPOSE[@]}" logs proxy 2>&1 || true)"
-echo "${PROXY_LOGS}" | grep -q "mock-proxy" \
-    || fail "E: proxy logs did not show a forwarded request" "${PROXY_LOGS}"
+# Test E — proxy actually forwarded to the upstream.
+echo "[derisk] test E: mock upstream logged the forwarded request"
+MOCK_LOGS="$("${COMPOSE[@]}" logs mockupstream 2>&1 || true)"
+echo "${MOCK_LOGS}" | grep -q "mock-upstream" \
+    || fail "E: mock upstream logs did not show a forwarded request" "${MOCK_LOGS}"
 
 # Test F — streaming forward.
 echo "[derisk] test F: end-to-end forward (stream=true)"
@@ -159,8 +188,8 @@ STREAM_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
     -d '{"model":"harness","messages":[{"role":"user","content":"test"}],"stream":true}')" \
     || fail "F: /api/chat (stream=true) request failed"
 echo "[derisk]   /api/chat (stream=true): ${STREAM_BODY}"
-echo "${STREAM_BODY}" | grep -q "MOCK PROXY: phase 1 de-risk test passed" \
-    || fail "F: streaming chat response did not contain mock proxy text" "${STREAM_BODY}"
+echo "${STREAM_BODY}" | grep -q "Hello from mock upstream" \
+    || fail "F: streaming chat response did not contain mock upstream text" "${STREAM_BODY}"
 
 echo "============================================================"
 echo " DERISK TEST PASSED"
