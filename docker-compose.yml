@@ -1,0 +1,107 @@
+# harness — service composition.
+#
+# All services share a single user-defined bridge network (`harness-net`) so
+# they reach each other by service name. The hostname `proxy` in particular
+# is load-bearing: ollama's OLLAMA_REMOTES allowlist matches on the literal
+# hostname from the RemoteHost URL, so renaming the proxy service requires
+# updating OLLAMA_REMOTES to match.
+#
+# The .env file lives at the install root (one directory above this file).
+# Invoke with: docker compose --env-file ../.env up
+
+networks:
+  harness-net:
+    driver: bridge
+
+services:
+  # -------------------------------------------------------------------------
+  # ollama — runs the engine and registers a stub model whose RemoteHost
+  # points at the proxy service. The custom Dockerfile + entrypoint handle
+  # the registration on container start.
+  # -------------------------------------------------------------------------
+  ollama:
+    build:
+      context: ./ollama
+      args:
+        OLLAMA_VERSION: ${OLLAMA_VERSION:-0.21.2}
+    image: harness-ollama:${OLLAMA_VERSION:-0.21.2}
+    environment:
+      # Bind to all interfaces inside the container so other services on
+      # harness-net can reach ollama at http://ollama:11434.
+      OLLAMA_HOST: 0.0.0.0:11434
+      # CRITICAL: must match the literal hostname in the RemoteHost URL.
+      # Ollama uses slices.Contains for matching — exact string, no DNS.
+      OLLAMA_REMOTES: proxy
+      OLLAMA_AGENT_MODEL: ${OLLAMA_AGENT_MODEL:-harness}
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-200000}
+      # The entrypoint reads PROXY_PORT to build the RemoteHost URL.
+      PROXY_PORT: ${PROXY_PORT:-8000}
+    volumes:
+      # Persist the blob store across container rebuilds. The relative path
+      # resolves against this compose file, putting it at install-root/ollama-data.
+      - ../ollama-data:/root/.ollama
+    networks:
+      - harness-net
+    # Always expose internally. Other services on harness-net reach ollama
+    # at http://ollama:11434 via this exposure, no host port required.
+    expose:
+      - "11434"
+    depends_on:
+      proxy:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:11434/api/tags"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # proxy — Phase 1: a mock that returns a hardcoded valid ChatResponse line.
+  # Phase 2 replaces proxy.py with the real translating proxy.
+  # -------------------------------------------------------------------------
+  proxy:
+    build: ./proxy
+    image: harness-proxy:latest
+    environment:
+      PROXY_API_URL: ${PROXY_API_URL:-}
+      PROXY_API_KEY: ${PROXY_API_KEY:-}
+      PROXY_API_MODEL: ${PROXY_API_MODEL:-}
+      PROXY_HOST: ${PROXY_HOST:-0.0.0.0}
+      PROXY_PORT: ${PROXY_PORT:-8000}
+      OUTPUT_DIR: ${OUTPUT_DIR:-/output}
+    volumes:
+      # Phase 2's proxy will write per-request debug files here. The mock
+      # doesn't use it, but mounting now keeps the compose file stable.
+      - ../output:/output
+    networks:
+      - harness-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${PROXY_PORT:-8000}/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # -------------------------------------------------------------------------
+  # Agent service stubs. Excluded from default compose operations via the
+  # `agent` profile so docker compose up doesn't try to start them. Phase 3
+  # populates ./agents/claude and ./agents/opencode and adds build: blocks.
+  # -------------------------------------------------------------------------
+  claude-agent:
+    # TODO Phase 3: add build: ./agents/claude once the directory exists.
+    image: harness-claude-agent:latest
+    networks:
+      - harness-net
+    profiles:
+      - agent
+
+  opencode-agent:
+    # TODO Phase 3: add build: ./agents/opencode once the directory exists.
+    image: harness-opencode-agent:latest
+    networks:
+      - harness-net
+    profiles:
+      - agent

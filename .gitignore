@@ -1,0 +1,17 @@
+# Defensive — the real .env lives at the install root (one dir above the clone).
+# This prevents accidental commits if anyone creates one inside the clone.
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+
+# Runtime artifacts that belong at the install root, never inside the clone
+output/
+agent/
+ollama-data/
