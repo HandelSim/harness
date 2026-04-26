@@ -129,7 +129,6 @@ git clone --depth=1 "${REPO_ROOT}" "${TEST_INSTALL}" >/dev/null 2>&1
 if command -v rsync >/dev/null 2>&1; then
     rsync -a --delete \
         --exclude='.git/' \
-        --exclude='dist/' \
         --exclude='__pycache__/' \
         --exclude='*.pyc' \
         --exclude='.env' \

@@ -14,12 +14,13 @@ harness supports Windows via Git Bash. PowerShell and cmd are not supported.
 2. Install Git for Windows. Default options are fine; do NOT need to change `core.autocrlf` settings.
 3. Open Git Bash. Confirm `docker info` runs successfully (Docker Desktop must be running).
 4. cd to a working directory under `/c/Users/<you>/`.
-5. Download and extract the harness distribution zip there.
-6. Run `bash harness-install.sh` and follow prompts.
-7. Edit `<install-root>/.env` and set required values (especially `PROXY_API_KEY`).
-8. Open a new Git Bash session if PATH was modified by the installer.
-9. Run `harness preflight` to validate configuration.
-10. Run `harness start`.
+5. Clone the harness repo: `git clone https://github.com/HandelSim/harness`
+6. `cd harness`
+7. Run `bash harness-install.sh` and follow prompts.
+8. Edit `<install-root>/.env` and set required values (especially `PROXY_API_KEY`).
+9. Open a new Git Bash session if PATH was modified by the installer.
+10. Run `harness preflight` to validate configuration.
+11. Run `harness start`.
 
 ## How harness handles line endings on Windows
 

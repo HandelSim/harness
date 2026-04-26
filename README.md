@@ -9,16 +9,31 @@ requests to a translating proxy that calls the upstream API.
 agent container ──► ollama ──(RemoteHost forward)──► proxy ──► upstream API
 ```
 
-This repo is the source for the harness runtime. End users install via a
-zip distribution (built in Phase 4); this repo is for development.
+This repo is the source for the harness runtime AND the install. Users
+clone the repo and run `harness-install.sh` from inside the clone; the
+clone IS the install root.
+
+## Installation
+
+```
+git clone https://github.com/HandelSim/harness
+cd harness
+bash harness-install.sh
+```
+
+(On Windows, use Git Bash. See [docs/WINDOWS.md](docs/WINDOWS.md) for
+Windows-specific setup.)
+
+The installer creates a working install in the cloned directory. State,
+config, and runtime files all live inside the clone (gitignored). To
+uninstall, remove the directory and the wrapper at `~/.local/bin/harness`.
 
 ## Repo structure
 
 ```
 harness/
-├── harness                  management CLI (Phase 4)
-├── harness-install.sh       bootstrap installer (Phase 4; also bundled in zip)
-├── zip-readme.md            README that ships in the distribution zip
+├── harness                  management CLI
+├── harness-install.sh       bootstrap installer (run once after cloning)
 ├── docker-compose.yml       services: ollama, proxy, agents
 ├── .env.example             documented env variables (copy to ./.env at the install root)
 ├── ollama/                  custom ollama image + entrypoint that registers
@@ -37,10 +52,9 @@ harness/
     ├── full_pipeline_test.sh end-to-end install → run → tmux drive
     ├── integration_test.sh  Phase 7b: end-to-end Serena MCP + Graphify skill (HARNESS_RUN_SLOW=1)
     ├── lib/                 sourceable test toolkits (tui_driver, test_helpers, net_helpers)
-    ├── fixtures/
-    │   ├── responses/       mock_upstream fixture dispatch table (Phase 7a)
-    │   └── test-project/    small Python calculator package used by integration_test.sh
-    └── build_zip.sh         produces dist/harness-distribution.zip
+    └── fixtures/
+        ├── responses/       mock_upstream fixture dispatch table (Phase 7a)
+        └── test-project/    small Python calculator package used by integration_test.sh
 ```
 
 ## Persistent agent homes
@@ -213,9 +227,12 @@ returned to the caller. It tears everything down on exit.
 
 ## End-user installation
 
-End users do not clone this repo. They install via the distribution zip,
-which ships `harness-install.sh`, a pre-filled `.env`, and a quick-start README.
-See `zip-readme.md` for the user-facing instructions.
+End users clone the repo (`git clone https://github.com/HandelSim/harness`)
+and run `bash harness-install.sh` from inside the clone. The installer
+seeds `.env` from `.env.example` and `.harness-allowlist` from
+`.harness-allowlist.example`, then installs a `harness` wrapper at
+`~/.local/bin/harness` (a real script, not a symlink — works on Windows
+without Developer Mode).
 
 The installer runs a **preflight check** before any prompts (git, docker,
 docker compose v2, daemon reachability, disk space, write access). On
@@ -230,13 +247,6 @@ alignment) — run it after editing `.env` to catch issues before
 harness runs on Windows via Git Bash (Git for Windows + Docker Desktop).
 PowerShell and cmd are not supported. See `docs/WINDOWS.md` for setup,
 limitations, and troubleshooting.
-
-To build the distribution zip from the current repo state:
-
-```
-$ bash scripts/build_zip.sh
-# -> dist/harness-distribution.zip
-```
 
 ## Updating
 
@@ -429,7 +439,7 @@ a non-trivial multi-module symbol graph to chew on.
 - **Phase 1** — repo skeleton, ollama service, mock proxy, de-risk test
 - **Phase 2** — real translating proxy
 - **Phase 3** — agent containers (claude-code, opencode)
-- **Phase 4** — `harness` management script + `harness-install.sh` + zip
+- **Phase 4** — `harness` management script + `harness-install.sh` (clone-based install)
 - **Phase 6** — persistent agent homes + MCP server registry
 - **Phase 7a** — MCP lifecycle granularity (install/enable/disable/up/down/logs/status), TUI test toolkit, fixture-dispatch mock upstream
 - **Phase B1** — universal egress firewall (per-container iptables/ipset, allowlist seeded from `.harness-allowlist`)

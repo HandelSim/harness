@@ -14,7 +14,6 @@
 # Phase 4 commit message. They are NOT covered here.
 #
 # Other smoke checks:
-#   - build_zip.sh produces a valid distribution zip
 #   - harness-install.sh's PATH-rcfile append is idempotent
 #
 # A separate compose project name (HARNESS_PROJECT_NAME=harness-mgmt-test)
@@ -371,25 +370,6 @@ cleanup_mcp_dirs
 trap cleanup EXIT INT TERM
 
 echo "[harness-test] T5b OK"
-
-# --- Test 6: build_zip.sh produces a valid zip ------------------------------
-
-echo "[harness-test] T6: build_zip.sh"
-bash "${REPO_ROOT}/scripts/build_zip.sh" >/dev/null
-zip_path="${REPO_ROOT}/dist/harness-distribution.zip"
-if [[ ! -f "${zip_path}" ]]; then
-    echo "[harness-test] T6 FAIL: zip not produced at ${zip_path}" >&2
-    exit 1
-fi
-zip_listing=$(unzip -l "${zip_path}")
-for f in harness-install.sh .env README.md; do
-    if ! grep -q "${f}" <<<"${zip_listing}"; then
-        echo "[harness-test] T6 FAIL: zip missing ${f}" >&2
-        echo "${zip_listing}" >&2
-        exit 1
-    fi
-done
-echo "[harness-test] T6 OK"
 
 # --- Test 7: harness-install.sh PATH append is idempotent ------------------
 #

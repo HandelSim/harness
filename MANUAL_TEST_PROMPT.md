@@ -547,9 +547,10 @@ was clear.
 ### Scenario W: Windows installation flow (Windows machines only)
 
 1. Open Git Bash on Windows.
-2. cd to a fresh directory under `C:\Users\<you>\test-harness\`.
-3. Extract the distribution zip into this directory.
-4. Run `bash harness-install.sh`. Verify:
+2. cd to a fresh parent directory under `C:\Users\<you>\test-harness\`.
+3. Clone the repo: `git clone https://github.com/HandelSim/harness`
+4. `cd harness`
+5. Run `bash harness-install.sh`. Verify:
    - Preflight checks run before any prompts (git, docker, compose v2,
      daemon reachability, disk space, write access).
    - All preflight checks pass (or any failures are clearly described).
@@ -557,15 +558,15 @@ was clear.
      "Docker Desktop is not running. Starting it now..." message).
    - The wrapper script lands at `~/.local/bin/harness` (file, not symlink —
      `ls -la ~/.local/bin/harness` should NOT show `->`).
-5. Edit `.env` with real or test values for the `PROXY_API_*` vars.
-6. Run `harness preflight`. Verify:
+6. Edit `.env` with real or test values for the `PROXY_API_*` vars.
+7. Run `harness preflight`. Verify:
    - All checks reported clearly with ✓/✗/⚠ markers.
    - Configuration issues identified by name (e.g. "PROXY_API_URL is empty").
    - PROXY_API_URL hostname is checked against the allowlist.
-7. Run `harness start`. Verify it completes without errors.
-8. Run `harness claude -p "say hello"`. Verify response.
-9. Stop the stack with `harness down`.
-10. Verify uninstall: `rm -rf <install-root> && rm ~/.local/bin/harness`.
+8. Run `harness start`. Verify it completes without errors.
+9. Run `harness claude -p "say hello"`. Verify response.
+10. Stop the stack with `harness down`.
+11. Verify uninstall: `rm -rf <install-root> && rm ~/.local/bin/harness`.
 
 Report any line-ending issues (`\r: command not found`), bind-mount path
 warnings, or other Windows-specific friction.

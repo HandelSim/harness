@@ -224,7 +224,7 @@ Steps:
   2. Refuse if $install_root already exists.
   3. Clone $REPO_URL into $install_root
   4. Create runtime state directories under $install_root/state/
-  5. Seed .env (from your zip-edited .env if present in $cwd, else from .env.example).
+  5. Seed .env (from a pre-edited .env in $cwd if present, else from .env.example).
   6. Seed .harness-allowlist from .harness-allowlist.example (if not present).
   7. Optionally install a 'harness' wrapper into $LOCAL_BIN and update PATH.
 
@@ -237,8 +237,8 @@ preflight
 # --- CWD cleanliness check --------------------------------------------------
 #
 # Allow harness-install.sh, .env, README files, hidden dotfiles, and .git to
-# coexist (zip extracts the first three; .git would mean someone unzipped
-# into a repo). Anything else is suspicious — warn the user but don't block.
+# coexist (a user may pre-place a .env, or be running from inside a clone).
+# Anything else is suspicious — warn the user but don't block.
 
 allow_re='^(harness-install\.sh|\.env|README\.md|README\.txt|quickstart\.md|\..*)$'
 unexpected=$(ls -A . | grep -Ev "$allow_re" || true)
@@ -321,7 +321,7 @@ ok "created state/output, state/agent/{claude,opencode}, state/ollama-data, stat
 # Three cases, in priority order:
 #   1. $install_root/.env already exists (unusual; clone shouldn't ship .env)
 #      → leave it alone.
-#   2. $cwd/.env exists (user pre-filled the zip-shipped .env)
+#   2. $cwd/.env exists (user pre-placed an edited .env in cwd)
 #      → move it into the clone and remove the source so the layout is clean.
 #   3. Neither → seed from .env.example inside the clone.
 #

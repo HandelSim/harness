@@ -9,8 +9,7 @@
 # and the .harness-runtime.yml compose override.
 state/
 
-# Distribution zip output (built by scripts/build_zip.sh)
-dist/
+# harness is distributed via direct git clone — no zip build artifact.
 
 # Python / editor / OS
 __pycache__/

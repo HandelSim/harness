@@ -4,13 +4,14 @@
 #
 # This is the most comprehensive automated test we ship. It:
 #
-#   1. builds dist/harness-distribution.zip from the current tree,
-#   2. extracts it into a clean tmpdir as a "fresh install",
-#   3. runs harness-install.sh non-interactively (cloning the local repo,
+#   1. stages harness-install.sh into a clean tmpdir as a "fresh install"
+#      surface (mirroring what a user gets from a manual download of the
+#      installer),
+#   2. runs harness-install.sh non-interactively (cloning the local repo,
 #      not GitHub — via HARNESS_REPO_URL),
-#   4. exercises every major harness subcommand with a mock upstream,
-#   5. drives a real tmux-wrapped agent session via send-keys / capture-pane,
-#   6. tears everything down on exit.
+#   3. exercises every major harness subcommand with a mock upstream,
+#   4. drives a real tmux-wrapped agent session via send-keys / capture-pane,
+#   5. tears everything down on exit.
 #
 # What this test does NOT cover (covered instead by MANUAL_TEST_PROMPT.md):
 #
@@ -46,10 +47,6 @@ echo "============================================================"
 
 if ! docker info >/dev/null 2>&1; then
     echo "[pipeline] ERROR: docker daemon not reachable" >&2
-    exit 1
-fi
-if ! command -v unzip >/dev/null 2>&1; then
-    echo "[pipeline] ERROR: 'unzip' is required but not on PATH" >&2
     exit 1
 fi
 
@@ -141,21 +138,16 @@ docker compose --project-name "${PROJECT_NAME}" \
     down -v --remove-orphans >/dev/null 2>&1 || true
 docker rm -f "${MOCK_NAME}" "${TMUX_AGENT_NAME}" >/dev/null 2>&1 || true
 
-# --- T0: build the zip -----------------------------------------------------
+# --- T0: stage installer ---------------------------------------------------
 
-echo "[pipeline] T0: build_zip.sh"
-bash "${REPO_ROOT}/scripts/build_zip.sh" >/dev/null
-ZIP="${REPO_ROOT}/dist/harness-distribution.zip"
-if [[ ! -f "${ZIP}" ]]; then
-    echo "[pipeline] T0 FAIL: zip not produced at ${ZIP}" >&2
-    exit 1
-fi
-echo "[pipeline] T0 OK: ${ZIP}"
+echo "[pipeline] T0: stage harness-install.sh into a fresh tmpdir"
+cp "${REPO_ROOT}/harness-install.sh" "${TEST_ROOT}/harness-install.sh"
+chmod +x "${TEST_ROOT}/harness-install.sh"
+echo "[pipeline] T0 OK: ${TEST_ROOT}/harness-install.sh"
 
 # --- T1: install flow -------------------------------------------------------
 
-echo "[pipeline] T1: extract zip + run harness-install.sh"
-( cd "${TEST_ROOT}" && unzip -q "${ZIP}" )
+echo "[pipeline] T1: run harness-install.sh from staged dir"
 
 # Pre-fill .env so harness-install.sh's "edit .env" prompt is unnecessary. Values
 # point PROXY_API_URL at the mockupstream sidecar we'll bring up later.
@@ -191,7 +183,6 @@ EOF
 if command -v rsync >/dev/null 2>&1; then
     rsync -a --delete \
         --exclude='.git/' \
-        --exclude='dist/' \
         --exclude='__pycache__/' \
         --exclude='*.pyc' \
         --exclude='.env' \
@@ -201,7 +192,7 @@ if command -v rsync >/dev/null 2>&1; then
         "${REPO_ROOT}/" "${TEST_ROOT}/harness/"
 else
     # Fallback: tar-pipe (preserves modes; excludes via tar-style globs).
-    ( cd "${REPO_ROOT}" && tar --exclude='.git' --exclude='dist' \
+    ( cd "${REPO_ROOT}" && tar --exclude='.git' \
         --exclude='__pycache__' --exclude='*.pyc' \
         --exclude='./.env' --exclude='./.harness-allowlist' \
         --exclude='./.harness-net-overrides.json' \
@@ -214,7 +205,7 @@ echo "[pipeline] T1 OK"
 # --- T2: install verification ---------------------------------------------
 
 echo "[pipeline] T2: install layout"
-[[ -L "${FAKE_HOME}/.local/bin/harness" ]]              || { echo "[pipeline] T2 FAIL: harness symlink missing" >&2; exit 1; }
+[[ -x "${FAKE_HOME}/.local/bin/harness" ]]              || { echo "[pipeline] T2 FAIL: harness wrapper missing or not executable" >&2; exit 1; }
 [[ -d "${TEST_ROOT}/harness/.git" ]]                    || { echo "[pipeline] T2 FAIL: clone is not a git repo" >&2; exit 1; }
 [[ -d "${TEST_ROOT}/harness/state/output" ]]            || { echo "[pipeline] T2 FAIL: state/output/ missing" >&2; exit 1; }
 [[ -d "${TEST_ROOT}/harness/state/agent/claude" ]]      || { echo "[pipeline] T2 FAIL: state/agent/claude/ missing" >&2; exit 1; }
