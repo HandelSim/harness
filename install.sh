@@ -118,6 +118,12 @@ mkdir -p "$cwd/output" "$cwd/agent/claude" "$cwd/agent/opencode" "$cwd/ollama-da
 ok "created output/, agent/claude/, agent/opencode/, ollama-data/"
 
 # --- .env handling ----------------------------------------------------------
+#
+# B3-MANAGED: env-vars — <install-root>/.env. Seeded from .env.example on a
+# fresh install (this block); thereafter user-owned. `harness upgrade` runs
+# the `env_vars` manifest action (envfile_merge) to surface new variables
+# added to .env.example without touching existing user values. See
+# scripts/upgrade-manifest.json and scripts/lib/upgrade_actions.sh.
 
 title "configuring .env"
 if [[ -f "$cwd/.env" ]]; then
@@ -126,6 +132,29 @@ else
     cp "$cwd/$CLONE_DIR/.env.example" "$cwd/.env"
     ok "copied .env.example to .env"
     warn "edit .env and fill in PROXY_API_KEY (and any other blank required values)"
+fi
+
+# --- firewall allowlist -----------------------------------------------------
+#
+# Every harness container reads its egress allowlist from
+# <install-root>/.harness-allowlist. Seed from the bundled example on a
+# fresh install. Idempotent: existing user customizations are never touched.
+#
+# B3-MANAGED: allowlist-hosts — <install-root>/.harness-allowlist. Seeded
+# from .harness-allowlist.example on a fresh install (this block).
+# `harness upgrade` runs the `allowlist_hosts` manifest action
+# (linefile_merge) to append new hostnames added upstream without modifying
+# user entries or annotations.
+
+title "configuring firewall allowlist"
+if [[ -f "$cwd/.harness-allowlist" ]]; then
+    ok ".harness-allowlist already present; left untouched"
+elif [[ -f "$cwd/$CLONE_DIR/.harness-allowlist.example" ]]; then
+    cp "$cwd/$CLONE_DIR/.harness-allowlist.example" "$cwd/.harness-allowlist"
+    ok "copied .harness-allowlist.example to .harness-allowlist"
+    warn "edit .harness-allowlist and add your upstream LLM API hostname (must match PROXY_API_URL)"
+else
+    warn "no .harness-allowlist.example bundled; create $cwd/.harness-allowlist before 'harness start'"
 fi
 
 # --- PATH setup -------------------------------------------------------------

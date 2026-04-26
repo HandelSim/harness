@@ -1,0 +1,19 @@
+{
+  "name": "serena read symbol body",
+  "match": "\\bread (the )?(symbol|function body|implementation)\\b|\\bshow me (the )?(body|implementation)\\b",
+  "response": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "Reading the symbol body via Serena.\n\n```json\n{\"name\":\"mcp__serena__find_symbol\",\"arguments\":{\"name_path\":\"main\",\"include_body\":true}}\n```\n"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 65,
+      "completion_tokens": 19,
+      "total_tokens": 84
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "description": "Harness upgrade manifest. Each entry describes how a file harness manages outside the repo (in <install-root>/) is brought forward when 'harness upgrade' runs. The runner sources scripts/lib/upgrade_actions.sh, dispatches each entry to the right action function, and aggregates results. See agents/claude/Dockerfile, agents/claude/entrypoint.sh, install.sh, and harness's cmd_mcp_install for B3-MANAGED comments that anchor each entry. Files intentionally NOT covered: .harness-net-overrides.json (user-managed via 'harness net open/close'), agent/<tool>/.harness-mcp-servers.json (regenerated each agent launch), agent/claude/.claude/settings.json (auto-augmented by the claude entrypoint each launch), .harness-runtime.yml (regenerated each compose invocation), output/ (proxy debug dumps, never managed), ollama-data/ (model blobs, never managed).",
+  "actions": [
+    {
+      "id": "env_vars",
+      "type": "envfile_merge",
+      "source": ".env.example",
+      "target_relative": ".env",
+      "description": "Merge new env vars from .env.example into user's .env (preserves existing values, surfaces preceding comment context)"
+    },
+    {
+      "id": "allowlist_hosts",
+      "type": "linefile_merge",
+      "source": ".harness-allowlist.example",
+      "target_relative": ".harness-allowlist",
+      "description": "Add new firewall hostnames to user's allowlist (preserves existing entries and inline annotations such as # git-push)"
+    },
+    {
+      "id": "ccstatusline_default_config",
+      "type": "json_merge",
+      "source": "agents/claude/defaults/ccstatusline-settings.json",
+      "target_relative": "agent/claude/.config/ccstatusline/settings.json",
+      "strategy": "add_missing_keys",
+      "description": "Add new ccstatusline keys (preserves user widget customization; arrays are user-wins)"
+    }
+  ],
+  "registry_actions": [
+    {
+      "id": "mcp_serena",
+      "type": "directory_overwrite",
+      "source": "mcp-registry/serena",
+      "target_relative": "mcp/serena",
+      "preserve": ["harness-meta.json", "data/", "data"],
+      "condition": "installed",
+      "description": "Update Serena MCP definition (preserves enable state in harness-meta.json and indexed code in data/)"
+    }
+  ]
+}

@@ -21,7 +21,9 @@ services:
   # -------------------------------------------------------------------------
   ollama:
     build:
-      context: ./ollama
+      # Repo root context so the Dockerfile can COPY firewall/ scripts.
+      context: .
+      dockerfile: ollama/Dockerfile
       args:
         OLLAMA_VERSION: ${OLLAMA_VERSION:-0.21.2}
     image: harness-ollama:${OLLAMA_VERSION:-0.21.2}
@@ -40,6 +42,12 @@ services:
       # Persist the blob store across container rebuilds. The relative path
       # resolves against this compose file, putting it at install-root/ollama-data.
       - ../ollama-data:/root/.ollama
+      # Universal egress firewall reads its allowlist from this path.
+      - ${HARNESS_ALLOWLIST_PATH:-../.harness-allowlist}:/etc/harness/allowlist:ro
+    # init-firewall.sh requires NET_ADMIN and NET_RAW to manage iptables/ipset.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     networks:
       - harness-net
     # Always expose internally. Other services on harness-net reach ollama
@@ -62,7 +70,10 @@ services:
   # Phase 2 replaces proxy.py with the real translating proxy.
   # -------------------------------------------------------------------------
   proxy:
-    build: ./proxy
+    build:
+      # Repo root context so the Dockerfile can COPY firewall/ scripts.
+      context: .
+      dockerfile: proxy/Dockerfile
     image: harness-proxy:latest
     environment:
       PROXY_API_URL: ${PROXY_API_URL:-}
@@ -75,6 +86,12 @@ services:
       # Phase 2's proxy will write per-request debug files here. The mock
       # doesn't use it, but mounting now keeps the compose file stable.
       - ../output:/output
+      # Universal egress firewall reads its allowlist from this path.
+      - ${HARNESS_ALLOWLIST_PATH:-../.harness-allowlist}:/etc/harness/allowlist:ro
+    # init-firewall.sh requires NET_ADMIN and NET_RAW to manage iptables/ipset.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     networks:
       - harness-net
     restart: unless-stopped
@@ -92,8 +109,20 @@ services:
   # -------------------------------------------------------------------------
   claude-agent:
     build:
-      context: ./agents/claude
+      # Repo root context so the Dockerfile can COPY firewall/ scripts.
+      context: .
+      dockerfile: agents/claude/Dockerfile
     image: harness-claude-agent:latest
+    # Agents are launched ephemerally via `harness claude` (docker run), but
+    # we still declare cap_add + the allowlist mount here so that
+    # `docker compose up claude-agent` works for debugging and so the runtime
+    # contract is documented in one place. The harness CLI applies the same
+    # set on its docker run call (see harness:cmd_claude).
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ${HARNESS_ALLOWLIST_PATH:-../.harness-allowlist}:/etc/harness/allowlist:ro
     networks:
       - harness-net
     profiles:
@@ -103,8 +132,15 @@ services:
 
   opencode-agent:
     build:
-      context: ./agents/opencode
+      # Repo root context so the Dockerfile can COPY firewall/ scripts.
+      context: .
+      dockerfile: agents/opencode/Dockerfile
     image: harness-opencode-agent:latest
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ${HARNESS_ALLOWLIST_PATH:-../.harness-allowlist}:/etc/harness/allowlist:ro
     networks:
       - harness-net
     profiles:

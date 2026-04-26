@@ -1,0 +1,19 @@
+{
+  "name": "simple text greeting",
+  "match": "\\b(say hello|hi|hello)\\b",
+  "response": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "Hello from mock upstream"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 42,
+      "completion_tokens": 7,
+      "total_tokens": 49
+    }
+  }
+}

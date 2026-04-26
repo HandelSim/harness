@@ -292,14 +292,14 @@ This scenario exercises the MCP registry with the heavyweight Serena
 service. It is not in CI because the build is slow; treat it as a
 release-time validation.
 
-1. Enable Serena and bring services up:
+1. Install Serena and bring services up:
    ```
-   harness mcp enable serena
+   harness mcp install serena
    harness start
    ```
    Expected: a long build (~5–10 minutes the first time) followed by
-   `harness mcp list` showing serena as `enabled / running`. If the
-   build fails, capture the log; that's a Serena-side issue worth
+   `harness mcp list` showing serena with state `installed-enabled`. If
+   the build fails, capture the log; that's a Serena-side issue worth
    reporting upstream.
 2. (Optional) Set `HARNESS_PROJECTS_ROOT` in `<install-root>/.env` to a
    single project directory you want Serena to index, then re-run
@@ -323,24 +323,211 @@ release-time validation.
    (symbol names, locations). If claude says it doesn't have an MCP
    tool available, drop into a shell and run `claude mcp list` —
    `serena` should be present.
-5. Disable and verify cleanup preserves the data dir:
+5. Toggle disable / enable without uninstalling. Disable just flips the
+   enabled flag — the entry stays installed and `mcp up` can still bring
+   it back manually:
    ```
-   harness mcp disable serena --force
+   harness mcp disable serena
+   harness mcp status serena      # state: installed-disabled, enabled: false
+   harness mcp up serena          # manually start, even though disabled
+   harness mcp down serena
+   harness mcp enable serena      # back to installed-enabled
+   ```
+6. Uninstall and verify cleanup preserves the data dir:
+   ```
+   harness mcp uninstall serena --force
    ls <install-root>/mcp/serena/
    ```
-   Only `data/` should remain. `compose.yml` and `client-config.json`
-   are gone.
-6. Re-enable and verify the persistent index is reused:
+   Only `data/` should remain. `compose.yml`, `client-config.json`, and
+   `harness-meta.json` are gone.
+7. Re-install and verify the persistent index is reused:
    ```
-   harness mcp enable serena
+   harness mcp install serena
    harness start
    ```
-   First start after re-enable should be fast (image cached). The
+   First start after re-install should be fast (image cached). The
    data dir is still there.
 
 Report the latency of the first build, the latency of subsequent starts,
 the quality of Serena's responses inside claude, and whether the
-disable/re-enable cycle preserved data.
+uninstall/re-install cycle preserved data.
+
+## Scenario L: Network firewall + bypass controls
+
+This scenario validates the universal egress firewall and the user-facing
+controls added in Phase B2.
+
+1. Inspect the seed allowlist:
+   ```
+   harness net list
+   ```
+   Expected: a table with at least DNS-related defaults and any hosts
+   shipped in `.harness-allowlist.example`. **`api.anthropic.com` should
+   NOT appear** — the cosmetic warning at agent startup is intentional.
+
+2. Run `harness doctor`. Confirm the `[network]` section reports:
+   - the allowlist path,
+   - a host count,
+   - whether the host derived from `PROXY_API_URL` is in the allowlist
+     (it should be, modulo edge cases like CDN-fronted upstreams).
+
+3. Add a host with the round-trip:
+   ```
+   harness net allow github.com --git-push
+   harness net list             # github.com appears with mode 'push'
+   harness net deny github.com
+   harness net list             # github.com gone
+   ```
+   Try an invalid host — the script should refuse and exit non-zero:
+   ```
+   harness net allow 'no spaces allowed.com'
+   harness net allow 'https://github.com'
+   ```
+
+4. Verify the per-launch bypass:
+   ```
+   mkdir -p /tmp/harness-manual-L && cd /tmp/harness-manual-L
+   harness claude --net -p "Use bash to run: curl -sS -o /dev/null -w '%{http_code}\n' https://example.com"
+   ```
+   Expected: stderr from `harness` itself includes a loud `--net` warning;
+   the curl returns `200` (or any 2xx/3xx, just not a connection refused).
+   Without `--net`, the same request would fail unless `example.com` is on
+   the allowlist.
+
+5. Service-level open/close:
+   ```
+   harness net open proxy            # type the phrase when prompted
+   harness net status                # 'proxy' listed under open services
+   harness restart
+   harness doctor                    # [network] reports proxy as overridden
+   harness net close proxy
+   harness restart
+   ```
+   The phrase prompt must reject anything other than the literal
+   `I understand the risks`.
+
+Report:
+- whether the listing/round-trip is intuitive,
+- whether the typed-phrase guard works as advertised,
+- whether `--net`'s stderr warning is loud enough that you'd notice it,
+- any hosts you had to add to make daily work usable (worth feeding back
+  into the seed allowlist).
+
+## Scenario M: Status line customization
+
+1. Launch claude in any working directory:
+   ```
+   harness claude
+   ```
+   The bottom status line should show the model name, the current
+   directory (with home abbreviated), the git branch (if any), and a
+   context-bar progress indicator.
+
+2. Exit the agent. Run:
+   ```
+   harness claude-statusline-config
+   ```
+   The ccstatusline TUI should appear. Make a visible change (e.g.,
+   recolor a widget) and save/quit.
+
+3. Re-launch `harness claude` and confirm the change is reflected. Also
+   confirm:
+   ```
+   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/agent/claude/.config/ccstatusline/settings.json"
+   ```
+   exists. Settings persist across container rebuilds (bind-mounted home).
+
+Report whether the configurator launched cleanly without requiring
+ollama/proxy services, and whether your edits stuck.
+
+## Scenario K2: MCP lifecycle deprecation aliases
+
+For backward compatibility with Phase 6 muscle memory, the old verbs
+still work but emit a `DEPRECATED` warning. Verify them quickly:
+
+1. Pick any registry MCP that's currently `available`:
+   ```
+   harness mcp enable <name>
+   ```
+   Expected: stderr line starting with `DEPRECATED:`, then a normal
+   install. `harness mcp list` should show `installed-enabled`.
+2. Tear it down with the Phase 6 form:
+   ```
+   harness mcp disable <name> --force
+   ```
+   Expected: another `DEPRECATED:` warning, then a normal uninstall.
+
+If either alias fails or stops emitting the warning, that's a regression
+worth flagging.
+
+## Scenario N: Upgrade flow against a synthetic version transition
+
+This scenario validates that `harness upgrade` propagates new env variables
+introduced in a newer version of the repo into the user's existing `.env`
+without touching their values. Adapt the same pattern to other config
+files if you want to be thorough.
+
+1. Snapshot your current `.env`:
+   ```
+   cp <install-root>/.env <install-root>/.env.before-upgrade
+   diff -q <install-root>/.env <install-root>/.env.before-upgrade   # should match
+   ```
+
+2. Inside the harness clone, edit `.env.example` to introduce a new
+   variable. Pick a name unlikely to collide with anything real:
+   ```
+   cd <install-root>/harness
+   printf '\n# Demo: Phase B3 manual test variable.\nHARNESS_TEST_NEW_VAR=test_default\n' >> .env.example
+   git add .env.example
+   git commit -m 'manual test: new env var (will revert)'
+   ```
+
+3. Preview the upgrade. With `--check` no files should change:
+   ```
+   harness upgrade --check
+   ```
+   Expected: the preview lists `env_vars`, and the `[env_vars] envfile_merge`
+   line reports it would add `HARNESS_TEST_NEW_VAR`. Re-run `diff -q` from
+   step 1 to confirm `.env` is byte-identical.
+
+4. Apply the upgrade non-interactively (skip the daemon dance):
+   ```
+   harness upgrade --no-prompt --no-restart
+   ```
+   Expected output: `Upgrade summary:` with `[env_vars] envfile_merge: 1
+   change(s)`.
+
+5. Verify `.env` now contains the new variable with the default and a
+   marker comment, but every prior value is unchanged:
+   ```
+   grep HARNESS_TEST_NEW_VAR <install-root>/.env       # → HARNESS_TEST_NEW_VAR=test_default
+   grep 'Added by harness upgrade' <install-root>/.env # → marker comment present
+   diff <install-root>/.env.before-upgrade <install-root>/.env | head -40
+   ```
+   The diff should show only insertions (no deletions or in-place edits).
+
+6. Customize the new variable, then re-run upgrade — your value must win:
+   ```
+   sed -i 's|HARNESS_TEST_NEW_VAR=test_default|HARNESS_TEST_NEW_VAR=custom_value|' \
+       <install-root>/.env
+   harness upgrade --no-prompt --no-restart
+   grep HARNESS_TEST_NEW_VAR <install-root>/.env       # → still custom_value
+   ```
+   Expected: the second run reports `[env_vars] envfile_merge: 0 change(s)`
+   and your `custom_value` is preserved.
+
+7. Cleanup:
+   ```
+   cd <install-root>/harness
+   git reset --hard HEAD~1                                              # drop the demo commit
+   sed -i '/^HARNESS_TEST_NEW_VAR=/d' <install-root>/.env
+   sed -i '/Added by harness upgrade/d' <install-root>/.env
+   rm <install-root>/.env.before-upgrade
+   ```
+
+Report whether the dry-run preview matched the apply-mode result, whether
+existing values were preserved on both runs, and whether the marker comment
+was clear.
 
 ## Final report
 

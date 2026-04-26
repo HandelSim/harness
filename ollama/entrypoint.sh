@@ -10,6 +10,16 @@
 
 set -euo pipefail
 
+# Bring up the egress firewall before doing anything network-touching.
+# `ollama serve` and the /api/create + /api/tags probes that follow all
+# go out via the rules this lays down. Runs as root (the ollama image's
+# default user).
+if [[ -x /usr/local/bin/init-firewall.sh ]]; then
+    /usr/local/bin/init-firewall.sh
+else
+    echo "[entrypoint] WARN: init-firewall.sh missing; running without firewall" >&2
+fi
+
 MODEL_NAME="${OLLAMA_AGENT_MODEL:-harness}"
 CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-200000}"
 PROXY_PORT="${PROXY_PORT:-8000}"

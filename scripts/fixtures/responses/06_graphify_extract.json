@@ -1,0 +1,19 @@
+{
+  "name": "graphify extract from URL",
+  "match": "\\bgraphify\\b|\\bextract\\b.*\\bfrom\\b.*\\b(url|page|website|http)\\b",
+  "response": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "I'll extract that with Graphify.\n\n```json\n{\"name\":\"mcp__graphify__extract\",\"arguments\":{\"url\":\"https://example.com\",\"selector\":\"article\"}}\n```\n"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 75,
+      "completion_tokens": 21,
+      "total_tokens": 96
+    }
+  }
+}

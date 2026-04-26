@@ -26,6 +26,18 @@ set -euo pipefail
 # harness via gosu. Without --user (test mode), id -u is non-zero and this
 # block is skipped.
 if [[ "$(id -u)" == "0" && -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+    # --- firewall (root-side) -------------------------------------------------
+    #
+    # Lay down the egress firewall before dropping privileges. iptables/ipset
+    # require NET_ADMIN/NET_RAW which gosu does NOT preserve when stepping
+    # down to a non-zero uid. See agents/claude/entrypoint.sh for the full
+    # rationale.
+    if [[ -x /usr/local/bin/init-firewall.sh ]]; then
+        /usr/local/bin/init-firewall.sh
+    else
+        echo "[agent-entrypoint] WARN: init-firewall.sh missing; running without firewall" >&2
+    fi
+
     current_uid=$(id -u harness 2>/dev/null || echo "")
     current_gid=$(id -g harness 2>/dev/null || echo "")
     if [[ "${current_uid}" != "${HOST_UID}" || "${current_gid}" != "${HOST_GID}" ]]; then
@@ -35,6 +47,16 @@ if [[ "$(id -u)" == "0" && -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
         chown -R "${HOST_UID}:${HOST_GID}" /home/harness 2>/dev/null || true
     fi
     exec gosu harness "$0" "$@"
+fi
+
+# --- git credentials (user-side) --------------------------------------------
+#
+# Runs after the gosu drop so `git config --global` writes to
+# /home/harness/.gitconfig (not /root/.gitconfig). See claude entrypoint
+# for the rationale.
+if [[ -x /usr/local/bin/configure-git-credentials.sh ]]; then
+    /usr/local/bin/configure-git-credentials.sh /etc/harness/allowlist \
+        || echo "[agent-entrypoint] WARN: configure-git-credentials.sh failed; git push protection may be incomplete" >&2
 fi
 
 # --- skel seed --------------------------------------------------------------
@@ -68,6 +90,11 @@ echo "============================================================"
 CONFIG_DIR="${HOME}/.config/opencode"
 CONFIG_FILE="${CONFIG_DIR}/opencode.json"
 mkdir -p "${CONFIG_DIR}"
+
+# Co-author attribution: as of opencode 1.14.x, opencode does not add a
+# "Co-Authored-By" trailer to git commits the way claude-code does, so there
+# is no equivalent setting to mirror `includeCoAuthoredBy: false` here. If
+# upstream adds one in a future version, gate it through this entrypoint.
 
 # Heredoc with single-quoted EOF token would inhibit substitution; we want
 # substitution for ${MODEL_NAME} and ${OLLAMA_URL}, so we leave EOF unquoted

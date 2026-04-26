@@ -8,7 +8,12 @@
 #   ANTHROPIC_API_KEY /
 #   ANTHROPIC_AUTH_TOKEN        — at least one is required by claude-code, even
 #                                 a dummy value. Filled with a placeholder if
-#                                 absent.
+#                                 absent. AUTH_TOKEN is preferred over API_KEY
+#                                 for the dummy: setting AUTH_TOKEN causes
+#                                 claude-code's startup connectivity probe to
+#                                 api.anthropic.com to be skipped, which
+#                                 matters because our default firewall does
+#                                 not allowlist api.anthropic.com.
 #   ANTHROPIC_MODEL,
 #   ANTHROPIC_SMALL_FAST_MODEL  — set by the caller to the stub model name so
 #                                 every claude-code request lands on our proxy.
@@ -42,6 +47,19 @@ set -euo pipefail
 # mode), it runs as harness directly — id -u is non-zero, this block is
 # skipped, and execution continues as before.
 if [[ "$(id -u)" == "0" && -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+    # --- firewall (root-side) -------------------------------------------------
+    #
+    # Lay down the egress firewall before dropping privileges. iptables/ipset
+    # require NET_ADMIN/NET_RAW which gosu does NOT preserve when stepping
+    # down to a non-zero uid. Done unconditionally before the uid remap so a
+    # missing HARNESS_TEST_MODE / HARNESS_PRINT_MODE container still gets
+    # locked down.
+    if [[ -x /usr/local/bin/init-firewall.sh ]]; then
+        /usr/local/bin/init-firewall.sh
+    else
+        echo "[agent-entrypoint] WARN: init-firewall.sh missing; running without firewall" >&2
+    fi
+
     current_uid=$(id -u harness 2>/dev/null || echo "")
     current_gid=$(id -g harness 2>/dev/null || echo "")
     if [[ "${current_uid}" != "${HOST_UID}" || "${current_gid}" != "${HOST_GID}" ]]; then
@@ -53,6 +71,26 @@ if [[ "$(id -u)" == "0" && -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
         chown -R "${HOST_UID}:${HOST_GID}" /home/harness 2>/dev/null || true
     fi
     exec gosu harness "$0" "$@"
+fi
+
+# --- firewall (no-remap path) ----------------------------------------------
+#
+# When the container is started without --user 0:0 (e.g. agent_test.sh in
+# test mode), we land here directly as harness. The firewall would still be
+# desirable, but iptables needs NET_ADMIN — which the harness user does not
+# have. So we only run it on the root branch above; in test mode the test
+# scripts opt out of the firewall via their own startup paths.
+
+# --- git credentials (user-side) --------------------------------------------
+#
+# Runs after the gosu drop so `git config --global` writes to
+# /home/harness/.gitconfig (not /root/.gitconfig). Best-effort: a missing
+# allowlist is unusual — the firewall would have already failed — but we
+# don't want to make the agent itself unstartable on credential setup
+# hiccups.
+if [[ -x /usr/local/bin/configure-git-credentials.sh ]]; then
+    /usr/local/bin/configure-git-credentials.sh /etc/harness/allowlist \
+        || echo "[agent-entrypoint] WARN: configure-git-credentials.sh failed; git push protection may be incomplete" >&2
 fi
 
 # --- skel seed --------------------------------------------------------------
@@ -81,7 +119,13 @@ fi
 
 if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
     echo "[harness-claude] WARN: no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN set; using dummy"
-    export ANTHROPIC_API_KEY="harness-dummy"
+    # ANTHROPIC_AUTH_TOKEN (not API_KEY) — claude-code's startup preflight only
+    # skips the api.anthropic.com /api/hello + /v1/oauth/hello probe when one
+    # of: AUTH_TOKEN, apiKeyHelper, CLAUDE_CODE_USE_BEDROCK/VERTEX/etc, or
+    # API_KEY routed through `en8()` is set. Plain ANTHROPIC_API_KEY does NOT
+    # take that path here, so the probe runs and hard-exits behind our
+    # default firewall (api.anthropic.com is not allowlisted by design).
+    export ANTHROPIC_AUTH_TOKEN="harness-dummy"
 fi
 
 # Suppress claude-code's auto-update phone-home. Respected by claude-code.
@@ -90,6 +134,49 @@ export DISABLE_AUTOUPDATER=1
 # Phase 4 may bind-mount ~/.claude empty (or not at all). Make sure the dir
 # exists so claude-code doesn't error trying to read its config dir.
 mkdir -p "${HOME}/.claude"
+
+# Suppress the "Co-Authored-By: Claude" trailer that claude-code adds to
+# git commits by default. The harness threat model includes "no accidental
+# attribution leakage to commits the user pushes from a host shell"; the
+# block on `git push` from inside the agent (configure-git-credentials.sh)
+# makes that less load-bearing, but the trailer would still show up if the
+# user later pushed a branch the agent committed onto. Left enabled, the
+# trailer is a quiet ergonomic surprise; turning it off is the conservative
+# default. Users can re-enable it by editing ~/.claude/settings.json.
+#
+# Only seed the file if it doesn't exist — preserve any user customizations
+# from previous runs. jq merge would be safer but we want zero deps on the
+# claude settings format, which has changed shape across versions.
+if [[ ! -f "${HOME}/.claude/settings.json" ]]; then
+    cat > "${HOME}/.claude/settings.json" <<'EOF'
+{
+  "includeCoAuthoredBy": false
+}
+EOF
+fi
+
+# B3-MANAGED: claude-statusline — wire up ccstatusline as the claude
+# statusLine command. The image pre-installs ccstatusline globally; we just
+# need claude to invoke it. Idempotent: if the user has already configured a
+# statusLine block (e.g. via /statusline), preserve it. We only stamp our
+# default into the file when no statusLine key is present at all.
+if command -v jq >/dev/null 2>&1 && [[ -f "${HOME}/.claude/settings.json" ]]; then
+    has_status=$(jq 'has("statusLine")' "${HOME}/.claude/settings.json" 2>/dev/null || echo "false")
+    if [[ "$has_status" != "true" ]]; then
+        tmp_settings="${HOME}/.claude/settings.json.tmp.$$"
+        if jq '. + {
+            "statusLine": {
+                "type": "command",
+                "command": "ccstatusline",
+                "padding": 0
+            }
+        }' "${HOME}/.claude/settings.json" >"$tmp_settings" 2>/dev/null; then
+            mv "$tmp_settings" "${HOME}/.claude/settings.json"
+        else
+            rm -f "$tmp_settings" 2>/dev/null || true
+        fi
+    fi
+fi
 
 # --- MCP server config merge ------------------------------------------------
 #

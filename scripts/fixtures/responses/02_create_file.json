@@ -1,0 +1,19 @@
+{
+  "name": "create file via Write tool",
+  "match": "\\bcreate (a |the )?file\\b|\\bwrite (a |the )?file\\b",
+  "response": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "I'll create the file for you.\n\n```json\n{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/workspace/hello.txt\",\"content\":\"hello from mock upstream\\n\"}}\n```\n"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 60,
+      "completion_tokens": 22,
+      "total_tokens": 82
+    }
+  }
+}

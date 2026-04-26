@@ -30,6 +30,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck source=lib/tui_driver.sh
+source "${SCRIPT_DIR}/lib/tui_driver.sh"
+
 PROJECT_NAME="harness-pipeline-test"
 NETWORK="${PROJECT_NAME}_harness-net"
 MOCK_NAME="harness-pipeline-test-mockupstream"
@@ -55,6 +58,14 @@ fi
 TEST_ROOT="$(mktemp -d -t harness-pipeline-root.XXXXXX)"
 FAKE_HOME="$(mktemp -d -t harness-pipeline-home.XXXXXX)"
 TEST_WORKSPACE="$(mktemp -d -t harness-pipeline-ws.XXXXXX)"
+
+# Pre-seed the firewall allowlist at the install root so docker compose's
+# bind-mount resolves on the very first cleanup-pass `compose down` (run
+# before T1 / install.sh has had a chance to seed it). After T1, install.sh
+# will see this file already present and leave it alone — we don't depend on
+# install.sh's seeding step for this test (a separate test could).
+cp "${REPO_ROOT}/.harness-allowlist.example" "${TEST_ROOT}/.harness-allowlist"
+export HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist"
 
 cleanup() {
     local rc=$?
@@ -410,26 +421,36 @@ fi
 # We can't directly drive `harness claude` because it execs into
 # `docker exec -it tmux attach`, which would block this script. Instead we
 # reproduce the docker run command (matching what run_agent_interactive
-# would issue) but skip the attach step. Then we drive tmux via send-keys
+# would issue) but skip the attach step. Then we drive tmux via the
+# tui_driver.sh toolkit (hex-0d Enter, ANSI stripping, busy→idle detection)
 # and verify the response in capture-pane.
 #
 # We use a fixed container name (TMUX_AGENT_NAME) instead of the hash-based
 # name so the trap can clean up unconditionally.
 
-echo "[pipeline] T11: tmux send-keys / capture-pane"
+echo "[pipeline] T11: tmux send-keys / capture-pane (via tui_driver.sh)"
+# The full agent entrypoint (root branch) runs init-firewall.sh before gosu —
+# we must mirror what run_agent_interactive does in the harness CLI:
+#   --cap-add NET_ADMIN --cap-add NET_RAW
+#   -v <install-root>/.harness-allowlist:/etc/harness/allowlist:ro
+# install.sh has already seeded ${TEST_ROOT}/.harness-allowlist from the
+# bundled .harness-allowlist.example (T1).
 docker run -d \
     --name "${TMUX_AGENT_NAME}" \
     --network "${NETWORK}" \
     --user 0:0 \
+    --cap-add NET_ADMIN \
+    --cap-add NET_RAW \
     -e "HOST_UID=$(id -u)" \
     -e "HOST_GID=$(id -g)" \
     -e "OLLAMA_AGENT_MODEL=harness" \
     -e "ANTHROPIC_BASE_URL=http://ollama:11434" \
-    -e "ANTHROPIC_API_KEY=harness-dummy" \
+    -e "ANTHROPIC_AUTH_TOKEN=harness-dummy" \
     -e "ANTHROPIC_MODEL=harness" \
     -e "ANTHROPIC_SMALL_FAST_MODEL=harness" \
     -v "${TEST_WORKSPACE}:/workspace" \
     -v "${TEST_ROOT}/agent/claude:/home/harness" \
+    -v "${TEST_ROOT}/.harness-allowlist:/etc/harness/allowlist:ro" \
     -w /workspace \
     --label "harness.agent=true" \
     --label "harness.tool=claude" \
@@ -439,7 +460,8 @@ docker run -d \
 
 # Phase 1: tmux session must exist. tmux is owned by the harness user in
 # the container (entrypoint exec's gosu harness after the UID remap), so
-# we exec as harness rather than root.
+# we exec as harness rather than root. tui_driver wraps that — but here we
+# need a one-shot has-session probe with a deadline, so we spell it out.
 deadline=$(( $(date +%s) + 30 ))
 while true; do
     if docker exec --user harness "${TMUX_AGENT_NAME}" tmux has-session -t harness-agent 2>/dev/null; then
@@ -458,87 +480,81 @@ while true; do
     sleep 1
 done
 
-# Phase 2: wait for claude's first-run theme picker to render. claude-code
-# v2.x walks first-time users through a series of prompts before showing the
-# main input. We watch for the theme picker text and then drive each prompt
-# with send-keys. The state is persisted in agent/claude/ so subsequent runs
-# in production skip these dialogs; the pipeline test mounts a fresh
-# agent/claude/ so we always hit them.
-
-wait_for_pane_match() {
-    local pattern="$1" timeout_s="$2"
-    local deadline=$(( $(date +%s) + timeout_s ))
-    while (( $(date +%s) < deadline )); do
-        local pane
-        pane=$(docker exec --user harness "${TMUX_AGENT_NAME}" \
-            tmux capture-pane -t harness-agent -p 2>/dev/null || true)
-        if grep -qE "${pattern}" <<<"${pane}"; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
+# Helper: dump the cleaned pane on failure so we can diagnose without
+# re-capturing. `tui_capture_clean` uses -J (join wrapped lines) and ANSI-
+# strips, so the output is regex-friendly.
+t11_dump_pane() {
+    {
+        echo "--- pane (ANSI stripped, joined) ---"
+        tui_capture_clean "${TMUX_AGENT_NAME}" harness-agent || true
+        echo "--- container logs (last 50) ---"
+        docker logs "${TMUX_AGENT_NAME}" 2>&1 | tail -50 || true
+    } >&2
 }
 
-if ! wait_for_pane_match 'Choose the text style|Dark mode' 30; then
+# Phase 2: walk claude's first-run dialogs (theme → API-key → security
+# notes → workspace-trust). The state is persisted in agent/claude/ so
+# subsequent runs in production skip these; the pipeline test mounts a
+# fresh agent/claude/ so we always hit them.
+
+if ! tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent 'Choose the text style|Dark mode' 30; then
     echo "[pipeline] T11 FAIL: theme picker did not appear in 30s" >&2
-    docker exec --user harness "${TMUX_AGENT_NAME}" tmux capture-pane -t harness-agent -p >&2 2>/dev/null || true
-    docker logs "${TMUX_AGENT_NAME}" >&2 2>&1 | tail -50 || true
+    t11_dump_pane
     exit 1
+fi
+tui_send_key "${TMUX_AGENT_NAME}" harness-agent Enter
+
+# After theme select, claude shows either:
+#   (a) "Detected a custom API key" dialog — only when ANTHROPIC_API_KEY is set
+#   (b) Security notes screen (older builds) or workspace-trust (newer)
+# The harness now sets ANTHROPIC_AUTH_TOKEN (not API_KEY) so claude can skip
+# its api.anthropic.com preflight probe behind our default firewall, which
+# means path (a) is no longer expected. Keep the branch optional in case a
+# future caller still passes API_KEY.
+if tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent 'Detected a custom API key|API_KEY' 5; then
+    # "1" picks "Yes". send-text avoids tmux interpreting "1" as a key name.
+    tui_send_text "${TMUX_AGENT_NAME}" harness-agent "1"
+    sleep 0.1
+    tui_send_key "${TMUX_AGENT_NAME}" harness-agent Enter
 fi
 
-# Walk the standard first-run dialogs:
-#   1) theme picker (default = Dark mode)
-#   2) "use this API key?" — pick "1. Yes" rather than the default "No"
-#   3) security notes — Press Enter
-#   4) workspace trust — default "Yes, I trust this folder"
-
-docker exec --user harness "${TMUX_AGENT_NAME}" tmux send-keys -t harness-agent Enter
-if ! wait_for_pane_match 'Detected a custom API key|API_KEY' 20; then
-    echo "[pipeline] T11 FAIL: API key dialog did not follow theme select" >&2
-    docker exec --user harness "${TMUX_AGENT_NAME}" tmux capture-pane -t harness-agent -p >&2 2>/dev/null || true
+# Wait for Security notes (older builds) or workspace-trust (newer builds —
+# Security notes screen was removed). Dismiss Security notes if present, then
+# always Enter through workspace-trust.
+if ! tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent \
+        'Security notes|Press Enter|Accessing workspace|trust this folder' 20; then
+    echo "[pipeline] T11 FAIL: neither Security notes nor workspace-trust dialog appeared" >&2
+    t11_dump_pane
     exit 1
 fi
-docker exec --user harness "${TMUX_AGENT_NAME}" tmux send-keys -t harness-agent "1" Enter
-if ! wait_for_pane_match 'Security notes|Press Enter' 20; then
-    echo "[pipeline] T11 FAIL: security notes did not follow API-key Yes" >&2
-    docker exec --user harness "${TMUX_AGENT_NAME}" tmux capture-pane -t harness-agent -p >&2 2>/dev/null || true
-    exit 1
+__t11_pane=$(tui_capture_clean "${TMUX_AGENT_NAME}" harness-agent || true)
+if grep -qE 'Security notes' <<<"${__t11_pane}"; then
+    tui_send_key "${TMUX_AGENT_NAME}" harness-agent Enter
+    if ! tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent 'Accessing workspace|trust this folder' 20; then
+        echo "[pipeline] T11 FAIL: workspace-trust dialog did not follow security notes" >&2
+        t11_dump_pane
+        exit 1
+    fi
 fi
-docker exec --user harness "${TMUX_AGENT_NAME}" tmux send-keys -t harness-agent Enter
-if ! wait_for_pane_match 'Accessing workspace|trust this folder' 20; then
-    echo "[pipeline] T11 FAIL: workspace-trust dialog did not follow security notes" >&2
-    docker exec --user harness "${TMUX_AGENT_NAME}" tmux capture-pane -t harness-agent -p >&2 2>/dev/null || true
-    exit 1
-fi
-docker exec --user harness "${TMUX_AGENT_NAME}" tmux send-keys -t harness-agent Enter
+tui_send_key "${TMUX_AGENT_NAME}" harness-agent Enter
 
 # Phase 3: wait for the main prompt to render, then send the actual user
-# prompt. The main prompt has a distinctive '❯ ' indicator and a "Welcome"
-# panel.
-if ! wait_for_pane_match 'Welcome|shortcuts|Tips for getting started' 30; then
+# prompt and let tui_wait_agent_done handle the busy→idle transition.
+if ! tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent 'Welcome|shortcuts|Tips for getting started' 30; then
     echo "[pipeline] T11 FAIL: main prompt did not render after dialogs" >&2
-    docker exec --user harness "${TMUX_AGENT_NAME}" tmux capture-pane -t harness-agent -p >&2 2>/dev/null || true
+    t11_dump_pane
     exit 1
 fi
-docker exec --user harness "${TMUX_AGENT_NAME}" tmux send-keys -t harness-agent "say hello" Enter
 
-# Phase 4: poll the pane for the mock response. Cap at 60s.
-deadline=$(( $(date +%s) + 60 ))
-saw_response=0
-while (( $(date +%s) < deadline )); do
-    pane=$(docker exec --user harness "${TMUX_AGENT_NAME}" tmux capture-pane -t harness-agent -p 2>/dev/null || true)
-    if grep -q "Hello from mock upstream" <<<"${pane}"; then
-        saw_response=1
-        break
-    fi
-    sleep 2
-done
-if (( ! saw_response )); then
+if ! tui_prompt_and_wait "${TMUX_AGENT_NAME}" harness-agent 'say hello' 90; then
+    echo "[pipeline] T11 FAIL: agent did not finish processing 'say hello'" >&2
+    t11_dump_pane
+    exit 1
+fi
+
+# Phase 4: assert the mock response landed in the pane.
+if ! tui_assert_response_contains "${TMUX_AGENT_NAME}" harness-agent 'Hello from mock upstream'; then
     echo "[pipeline] T11 FAIL: did not see mock-upstream response in pane" >&2
-    pane=$(docker exec "${TMUX_AGENT_NAME}" tmux capture-pane -t harness-agent -p 2>/dev/null || true)
-    echo "--- final pane ---" >&2
-    echo "${pane}" >&2
     docker logs "${TMUX_AGENT_NAME}" 2>&1 | tail -50 >&2 || true
     exit 1
 fi
@@ -600,7 +616,7 @@ echo "[pipeline] T15 OK"
 # cleanup.  Same shape as scripts/mcp_test.sh but folded into the end-to-
 # end flow so we exercise the integration with services already running.
 
-echo "[pipeline] T16: MCP enable + start + disable cycle"
+echo "[pipeline] T16: MCP install + start + uninstall cycle"
 T16_REG="${TEST_ROOT}/t16-registry"
 mkdir -p "${T16_REG}/_pipe_mcp"
 cat >"${T16_REG}/_pipe_mcp/compose.yml" <<EOF
@@ -632,13 +648,17 @@ t16_call() {
         "${FAKE_HOME}/.local/bin/harness" "$@"
 }
 
-t16_call mcp enable _pipe_mcp >"${TEST_ROOT}/t16-enable.log" 2>&1 || {
-    echo "[pipeline] T16 FAIL: mcp enable failed" >&2
-    cat "${TEST_ROOT}/t16-enable.log" >&2
+t16_call mcp install _pipe_mcp >"${TEST_ROOT}/t16-install.log" 2>&1 || {
+    echo "[pipeline] T16 FAIL: mcp install failed" >&2
+    cat "${TEST_ROOT}/t16-install.log" >&2
     exit 1
 }
 if [[ ! -f "${TEST_ROOT}/mcp/_pipe_mcp/compose.yml" ]]; then
-    echo "[pipeline] T16 FAIL: enable did not copy compose.yml into install root" >&2
+    echo "[pipeline] T16 FAIL: install did not copy compose.yml into install root" >&2
+    exit 1
+fi
+if [[ ! -f "${TEST_ROOT}/mcp/_pipe_mcp/harness-meta.json" ]]; then
+    echo "[pipeline] T16 FAIL: install did not write harness-meta.json" >&2
     exit 1
 fi
 
@@ -672,18 +692,18 @@ if ! grep -Eq '\[mcp\]' <<<"${doc_mcp_out}"; then
     exit 1
 fi
 
-t16_call mcp disable _pipe_mcp --force >"${TEST_ROOT}/t16-disable.log" 2>&1 || {
-    echo "[pipeline] T16 FAIL: mcp disable failed" >&2
-    cat "${TEST_ROOT}/t16-disable.log" >&2
+t16_call mcp uninstall _pipe_mcp --force >"${TEST_ROOT}/t16-uninstall.log" 2>&1 || {
+    echo "[pipeline] T16 FAIL: mcp uninstall failed" >&2
+    cat "${TEST_ROOT}/t16-uninstall.log" >&2
     exit 1
 }
 if [[ -f "${TEST_ROOT}/mcp/_pipe_mcp/compose.yml" ]]; then
-    echo "[pipeline] T16 FAIL: compose.yml still present after disable" >&2
+    echo "[pipeline] T16 FAIL: compose.yml still present after uninstall" >&2
     exit 1
 fi
 # data/ should remain.
 if [[ ! -d "${TEST_ROOT}/mcp/_pipe_mcp/data" ]]; then
-    echo "[pipeline] T16 FAIL: data/ removed by disable (should be preserved)" >&2
+    echo "[pipeline] T16 FAIL: data/ removed by uninstall (should be preserved)" >&2
     exit 1
 fi
 

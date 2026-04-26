@@ -25,6 +25,15 @@ services:
       - harness-net
     profiles:
       - mcp
+    # NET_ADMIN/NET_RAW are reserved for the universal harness firewall.
+    # Serena's upstream image does not currently bake in init-firewall.sh,
+    # so the firewall is not actively applied inside this container — but
+    # we declare the capabilities and the allowlist mount uniformly so a
+    # future entrypoint override (Phase B2) can switch it on without
+    # changing the compose surface.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     environment:
       SERENA_DOCKER: "1"
       # Bind the SSE listener on all in-container interfaces so agents on
@@ -41,6 +50,10 @@ services:
       # Persistent index/config dir. Survives `harness mcp disable` so the
       # next enable picks up where Serena left off.
       - ${INSTALL_ROOT}/mcp/serena/data:/workspaces/serena/config
+      # Universal egress firewall allowlist. Same path/policy as harness's
+      # own services — see the cap_add note above for why this is mounted
+      # even when the firewall is not actively applied.
+      - ${HARNESS_ALLOWLIST_PATH:-${INSTALL_ROOT}/.harness-allowlist}:/etc/harness/allowlist:ro
     # SERENA_DASHBOARD_PORT optionally publishes the Serena dashboard on the
     # host. Empty (default) keeps it internal-only. The `${VAR:+:24282}`
     # construct elides the colon when the var is empty so the ports list

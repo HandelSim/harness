@@ -1,0 +1,48 @@
+# harness allowlist
+#
+# One host per line. Blank lines and lines starting with `#` are comments.
+# Inline `# git-push` annotation on a host enables `git push` to that host
+# (the firewall will configure the `store` credential helper for it). Without
+# the annotation, `git pull` works but `git push` fails — the default for new
+# installs.
+#
+# This file is read by every harness container at startup. Hosts here are
+# resolved to IPs and added to an ipset; any other outbound traffic is
+# rejected with icmp-admin-prohibited.
+#
+# To edit: `harness net` (B2) or edit `<install-root>/.harness-allowlist`
+# directly and `harness restart` to reload.
+
+# === Package registries ===
+pypi.org
+files.pythonhosted.org
+registry.npmjs.org
+
+# === GitHub ===
+# github.com is pull-only by default. Add `# git-push` after the host name to
+# enable push (you'll still need credentials in $HOME/.git-credentials).
+github.com
+api.github.com
+codeload.github.com
+raw.githubusercontent.com
+objects.githubusercontent.com
+
+# === Claude Code connectivity probe (NOT enabled by default) ===
+# Note: claude-code probes api.anthropic.com on startup and prints the cosmetic
+# warning "Unable to connect to Anthropic services" if the probe is blocked.
+# The warning is purely cosmetic — chat traffic flows through ollama via
+# ANTHROPIC_BASE_URL and never touches Anthropic. We deliberately leave the
+# probe blocked so that the harness keeps zero outbound traffic to Anthropic.
+# Uncomment the following line to silence the warning if you find it noisy:
+#   api.anthropic.com
+
+# === ADD YOUR UPSTREAM LLM API HOSTNAME HERE ===
+# The hostname must match the host portion of PROXY_API_URL — the firewall
+# will refuse to start if PROXY_API_URL points at a host that isn't on this
+# list. Uncomment whichever you use, or add your own.
+# api.openai.com
+# generativelanguage.googleapis.com
+
+# === ADD YOUR SELF-HOSTED GIT REMOTES HERE (with `# git-push` if needed) ===
+# my-gitlab.example.com   # git-push
+# git.internal.corp       # git-push

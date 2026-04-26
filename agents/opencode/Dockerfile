@@ -7,11 +7,15 @@
 
 FROM node:20-bookworm-slim
 
+# Build context is the repo root (see docker-compose.yml). All COPYs below
+# use repo-root-relative paths.
+
 # Runtime deps — same set as the claude agent (see that Dockerfile for the
 # rationale). pipx + python3 are added so users can install skill-style tools
 # inside the agent and have them survive across container rebuilds via the
 # persistent home bind mount. jq is used by the harness script's MCP-config
-# merger and is handy for in-container shell work.
+# merger and by /usr/local/bin/init-firewall.sh. iptables/ipset/dnsutils/
+# iproute2 are required by init-firewall.sh.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tmux \
@@ -25,6 +29,10 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         pipx \
+        iptables \
+        ipset \
+        dnsutils \
+        iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin opencode + the openai-compatible AI SDK adapter that opencode loads
@@ -45,8 +53,19 @@ RUN userdel --remove node 2>/dev/null || true \
     && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash harness \
     && chown -R harness:harness /home/harness
 
-COPY entrypoint.sh /usr/local/bin/agent-entrypoint.sh
+# Universal egress firewall + git push blocker. See agents/claude/Dockerfile
+# for the run-as-root vs run-as-harness rationale.
+COPY firewall/init-firewall.sh /usr/local/bin/init-firewall.sh
+COPY firewall/configure-git-credentials.sh /usr/local/bin/configure-git-credentials.sh
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/configure-git-credentials.sh
+
+COPY agents/opencode/entrypoint.sh /usr/local/bin/agent-entrypoint.sh
 RUN chmod +x /usr/local/bin/agent-entrypoint.sh
+
+# Block interactive credential prompts from git. See claude Dockerfile for
+# the rationale.
+ENV GIT_TERMINAL_PROMPT=0
+ENV GIT_ASKPASS=/bin/false
 
 # Persistent home: snapshot the build-time /home/harness/ contents into
 # /etc/skel/harness/ so the entrypoint can seed an empty bind mount on first

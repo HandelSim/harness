@@ -1,0 +1,19 @@
+{
+  "name": "list files via Bash ls",
+  "match": "\\blist (files|the files|directory|the directory)\\b|\\bwhat'?s in (this|the) (dir|directory|folder)\\b",
+  "response": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "Let me list the files.\n\n```json\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls -la\",\"description\":\"List directory contents\"}}\n```\n"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 55,
+      "completion_tokens": 18,
+      "total_tokens": 73
+    }
+  }
+}

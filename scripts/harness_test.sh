@@ -98,6 +98,22 @@ OLLAMA_CONTEXT_LENGTH=200000
 PUBLISH_OLLAMA_PORT=
 EOF
 
+# Firewall allowlist for the test stack. placeholder.invalid is included so
+# init-firewall.sh's PROXY_API_URL guardrail accepts it (the host won't
+# resolve, which the firewall logs WARN about, but the guardrail's allowlist-
+# membership check is satisfied).
+cat >"${TEST_ROOT}/.harness-allowlist" <<'EOF'
+github.com
+api.github.com
+codeload.github.com
+raw.githubusercontent.com
+objects.githubusercontent.com
+pypi.org
+files.pythonhosted.org
+registry.npmjs.org
+placeholder.invalid
+EOF
+
 # Convenience: every invocation in this test file shares the same env vars.
 # HARNESS_INSTALL_ROOT pins the install root explicitly. The symlink at
 # ${TEST_ROOT}/harness would otherwise cause the script's realpath/dirname
@@ -105,6 +121,7 @@ EOF
 HARNESS_BIN="${TEST_ROOT}/harness/harness"
 export HARNESS_PROJECT_NAME="${PROJECT_NAME}"
 export HARNESS_INSTALL_ROOT="${TEST_ROOT}"
+export HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist"
 
 # Defensive: clear stale state.
 docker compose --project-name "${PROJECT_NAME}" \
@@ -191,7 +208,7 @@ echo "[harness-test] T4 OK"
 
 echo "[harness-test] T5: harness help mentions all subcommands"
 help_out=$("${HARNESS_BIN}" help)
-for cmd in start down update upgrade logs claude opencode list attach stop mcp doctor; do
+for cmd in start down restart update upgrade logs claude opencode list attach stop net mcp doctor claude-statusline-config; do
     if ! grep -q "$cmd" <<<"${help_out}"; then
         echo "[harness-test] T5 FAIL: help text missing '${cmd}'" >&2
         exit 1
@@ -206,6 +223,11 @@ echo "[harness-test] T5 OK"
 # scripts/mcp_test.sh. We override HARNESS_REGISTRY_DIR with an empty dir
 # to assert the empty-registry path, then point it at a tmp registry to
 # verify the populated path.
+#
+# Phase 7a: install/uninstall/enable/disable verbs were re-cut. The Phase 6
+# `enable`/`disable --force` aliases still work but emit a deprecation
+# warning to stderr. We exercise both the new and the deprecated paths so a
+# regression in either surfaces here.
 
 echo "[harness-test] T5b: harness mcp subcommands"
 
@@ -238,34 +260,112 @@ if ! grep -qi 'no MCP entries' <<<"${empty_list}"; then
     exit 1
 fi
 
-# 5b.2: populated registry — foo appears as enabled=no.
+# 5b.2: populated registry — foo appears with state=available.
 pop_list=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp list)
-if ! grep -Eq 'foo[[:space:]]+no' <<<"${pop_list}"; then
-    echo "[harness-test] T5b FAIL: populated registry should list foo enabled=no" >&2
+if ! grep -Eq 'foo[[:space:]]+available' <<<"${pop_list}"; then
+    echo "[harness-test] T5b FAIL: populated registry should list foo as available" >&2
     echo "${pop_list}" >&2
     exit 1
 fi
 
-# 5b.3: enable unknown errors with available list.
+# 5b.3: install unknown errors with available list.
 set +e
-unk_out=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp enable nope 2>&1)
+unk_out=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp install nope 2>&1)
 unk_rc=$?
 set -e
 if (( unk_rc == 0 )); then
-    echo "[harness-test] T5b FAIL: enable nope unexpectedly succeeded" >&2
+    echo "[harness-test] T5b FAIL: install nope unexpectedly succeeded" >&2
     exit 1
 fi
 if ! grep -qi 'unknown MCP' <<<"${unk_out}"; then
-    echo "[harness-test] T5b FAIL: enable error doesn't mention 'unknown MCP'" >&2
+    echo "[harness-test] T5b FAIL: install error doesn't mention 'unknown MCP'" >&2
     echo "${unk_out}" >&2
     exit 1
 fi
 
-# 5b.4: enable + disable round-trip on the host fs (no docker).
+# 5b.4: install + uninstall round-trip on the host fs (no docker).
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp install foo >/dev/null
+[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+    || { echo "[harness-test] T5b FAIL: foo not installed to active tree" >&2; exit 1; }
+[[ -f "${TEST_ROOT}/mcp/foo/harness-meta.json" ]] \
+    || { echo "[harness-test] T5b FAIL: harness-meta.json not written on install" >&2; exit 1; }
+# After install, list should show installed-enabled.
+inst_list=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp list)
+if ! grep -Eq 'foo[[:space:]]+installed-enabled' <<<"${inst_list}"; then
+    echo "[harness-test] T5b FAIL: list did not show foo as installed-enabled" >&2
+    echo "${inst_list}" >&2
+    exit 1
+fi
+# disable (state-flag flip; data and config preserved)
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp disable foo >/dev/null
+[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+    || { echo "[harness-test] T5b FAIL: disable removed compose.yml (should be preserved)" >&2; exit 1; }
+dis_list=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp list)
+if ! grep -Eq 'foo[[:space:]]+installed-disabled' <<<"${dis_list}"; then
+    echo "[harness-test] T5b FAIL: list did not show foo as installed-disabled" >&2
+    echo "${dis_list}" >&2
+    exit 1
+fi
+# re-enable
 HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp enable foo >/dev/null
-[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] || { echo "[harness-test] T5b FAIL: foo not enabled to active tree" >&2; exit 1; }
-HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp disable foo --force >/dev/null
-[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] && { echo "[harness-test] T5b FAIL: disable did not remove compose.yml" >&2; exit 1; }
+re_list=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp list)
+if ! grep -Eq 'foo[[:space:]]+installed-enabled' <<<"${re_list}"; then
+    echo "[harness-test] T5b FAIL: re-enable did not restore installed-enabled" >&2
+    echo "${re_list}" >&2
+    exit 1
+fi
+# uninstall
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp uninstall foo --force >/dev/null
+[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+    && { echo "[harness-test] T5b FAIL: uninstall did not remove compose.yml" >&2; exit 1; }
+
+# 5b.5: deprecation alias — Phase 6 'enable <name>' for not-yet-installed
+# is forwarded to install. Verify it works AND emits a deprecation warning.
+set +e
+dep_out=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp enable foo 2>&1)
+dep_rc=$?
+set -e
+if (( dep_rc != 0 )); then
+    echo "[harness-test] T5b FAIL: deprecated enable forward exited ${dep_rc}" >&2
+    echo "${dep_out}" >&2
+    exit 1
+fi
+if ! grep -qi 'DEPRECATED' <<<"${dep_out}"; then
+    echo "[harness-test] T5b FAIL: Phase 6 enable alias did not warn 'DEPRECATED'" >&2
+    echo "${dep_out}" >&2
+    exit 1
+fi
+[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+    || { echo "[harness-test] T5b FAIL: deprecated enable did not install" >&2; exit 1; }
+
+# 5b.6: deprecation alias — Phase 6 'disable <name> --force' is forwarded
+# to uninstall --force. Verify warning + effect.
+set +e
+dep_dis_out=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp disable foo --force 2>&1)
+dep_dis_rc=$?
+set -e
+if (( dep_dis_rc != 0 )); then
+    echo "[harness-test] T5b FAIL: deprecated disable --force exited ${dep_dis_rc}" >&2
+    echo "${dep_dis_out}" >&2
+    exit 1
+fi
+if ! grep -qi 'DEPRECATED' <<<"${dep_dis_out}"; then
+    echo "[harness-test] T5b FAIL: Phase 6 'disable --force' did not warn 'DEPRECATED'" >&2
+    echo "${dep_dis_out}" >&2
+    exit 1
+fi
+[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+    && { echo "[harness-test] T5b FAIL: deprecated disable --force did not uninstall" >&2; exit 1; }
+
+# 5b.7: status reports state correctly.
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp install foo >/dev/null
+status_out=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp status foo 2>&1)
+if ! grep -Eq 'state:[[:space:]]+installed-enabled' <<<"${status_out}"; then
+    echo "[harness-test] T5b FAIL: status did not report installed-enabled" >&2
+    echo "${status_out}" >&2
+    exit 1
+fi
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp uninstall foo --force >/dev/null
 
 cleanup_mcp_dirs
 trap cleanup EXIT INT TERM
@@ -482,6 +582,274 @@ if grep -Eqi 'unknown command|invalid option|usage:' <<<"${p_out}"; then
     exit 1
 fi
 echo "[harness-test] T10 OK"
+
+# --- Test 11: harness net allow / deny / list / status ----------------------
+#
+# Non-interactive subcommands of `harness net` round-trip the allowlist file.
+# `open` / `close` need a TTY for the confirmation phrase, so we exercise
+# them via the helper library directly in a separate test below.
+
+echo "[harness-test] T11: harness net allow/deny/list/status"
+
+# T11.1: status shows the test allowlist.
+status_out=$("${HARNESS_BIN}" net status 2>&1)
+if ! grep -q 'allowlist:' <<<"${status_out}"; then
+    echo "[harness-test] T11 FAIL: net status missing allowlist section" >&2
+    echo "${status_out}" >&2; exit 1
+fi
+if ! grep -Eq 'overrides:' <<<"${status_out}"; then
+    echo "[harness-test] T11 FAIL: net status missing overrides section" >&2
+    echo "${status_out}" >&2; exit 1
+fi
+
+# T11.2: allow a host, then list shows it.
+"${HARNESS_BIN}" net allow new-host.example.com >/dev/null
+list_out=$("${HARNESS_BIN}" net list)
+if ! grep -q 'new-host.example.com' <<<"${list_out}"; then
+    echo "[harness-test] T11 FAIL: allow did not add new-host.example.com" >&2
+    echo "${list_out}" >&2; exit 1
+fi
+
+# T11.3: --git-push annotates a host as push-enabled.
+"${HARNESS_BIN}" net allow my-gitlab.example.com --git-push >/dev/null
+push_out=$("${HARNESS_BIN}" net list)
+if ! grep -Eq 'my-gitlab\.example\.com[[:space:]]+push' <<<"${push_out}"; then
+    echo "[harness-test] T11 FAIL: --git-push did not annotate host as push" >&2
+    echo "${push_out}" >&2; exit 1
+fi
+
+# T11.4: deny removes a host.
+"${HARNESS_BIN}" net deny new-host.example.com >/dev/null
+denied_out=$("${HARNESS_BIN}" net list)
+if grep -q 'new-host.example.com' <<<"${denied_out}"; then
+    echo "[harness-test] T11 FAIL: deny did not remove new-host.example.com" >&2
+    echo "${denied_out}" >&2; exit 1
+fi
+
+# T11.5: invalid host is rejected.
+set +e
+inv_out=$("${HARNESS_BIN}" net allow 'BAD HOST' 2>&1)
+inv_rc=$?
+set -e
+if (( inv_rc == 0 )); then
+    echo "[harness-test] T11 FAIL: net allow with invalid host succeeded" >&2; exit 1
+fi
+if ! grep -qi 'invalid host' <<<"${inv_out}"; then
+    echo "[harness-test] T11 FAIL: net allow invalid host: missing error message" >&2
+    echo "${inv_out}" >&2; exit 1
+fi
+
+# Clean up the test additions so subsequent tests start from the seed
+# allowlist.
+"${HARNESS_BIN}" net deny my-gitlab.example.com >/dev/null 2>&1 || true
+echo "[harness-test] T11 OK"
+
+# --- Test 12: harness restart -----------------------------------------------
+#
+# restart = down + start, so we just verify it leaves services healthy.
+
+echo "[harness-test] T12: harness restart"
+"${HARNESS_BIN}" restart >/dev/null
+deadline=$(( $(date +%s) + 60 ))
+while true; do
+    proxy_id=$(docker compose --project-name "${PROJECT_NAME}" \
+        -f "${REPO_ROOT}/docker-compose.yml" \
+        ps -q proxy 2>/dev/null || true)
+    if [[ -n "${proxy_id}" ]]; then
+        proxy_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
+        if [[ "${proxy_status}" == "healthy" ]]; then break; fi
+    fi
+    if (( $(date +%s) >= deadline )); then
+        echo "[harness-test] T12 FAIL: services not healthy after restart" >&2; exit 1
+    fi
+    sleep 2
+done
+echo "[harness-test] T12 OK"
+
+# --- Test 13: claude-statusline-config dispatches -----------------------------
+#
+# Like T10, we just want to prove the dispatcher routes the verb to the
+# right command — building/running the configurator interactively isn't
+# something we can do in a non-TTY test. We verify it appears in `harness
+# help` and that the help-only path doesn't error.
+
+echo "[harness-test] T13: claude-statusline-config in help"
+help_out=$("${HARNESS_BIN}" help)
+if ! grep -q 'claude-statusline-config' <<<"${help_out}"; then
+    echo "[harness-test] T13 FAIL: help text missing claude-statusline-config" >&2
+    exit 1
+fi
+echo "[harness-test] T13 OK"
+
+# --- Test 14: harness help mentions new B2 commands -------------------------
+
+echo "[harness-test] T14: help mentions B2 verbs (restart, net, --net)"
+for tok in restart 'net <subcmd>' '--net'; do
+    if ! grep -qF -- "$tok" <<<"${help_out}"; then
+        echo "[harness-test] T14 FAIL: help missing '$tok'" >&2
+        exit 1
+    fi
+done
+echo "[harness-test] T14 OK"
+
+# --- Test 15: doctor [network] section --------------------------------------
+
+echo "[harness-test] T15: doctor [network] section"
+set +e
+doctor_net_out=$("${HARNESS_BIN}" doctor 2>&1)
+set -e
+if ! grep -q '\[network\]' <<<"${doctor_net_out}"; then
+    echo "[harness-test] T15 FAIL: doctor missing [network] section" >&2
+    echo "${doctor_net_out}" >&2; exit 1
+fi
+if ! grep -q 'allowlist' <<<"${doctor_net_out}"; then
+    echo "[harness-test] T15 FAIL: doctor [network] missing allowlist line" >&2
+    exit 1
+fi
+echo "[harness-test] T15 OK"
+
+# --- Test 16: harness upgrade --check (no changes) -------------------------
+#
+# Builds a tiny synthetic install root in a separate tmpdir, points the
+# harness binary at it, and runs `harness upgrade --check`. Verifies:
+#   - non-interactive: exits 0 with no prompt
+#   - prints the "Upgrade actions to apply" preview
+#   - mtimes of install-root files do not change
+
+echo "[harness-test] T16: harness upgrade --check"
+UPG_ROOT="$(mktemp -d -t harness-upg-check.XXXXXX)"
+cleanup_upg() {
+    if [[ -n "${UPG_ROOT:-}" && -d "${UPG_ROOT}" ]]; then
+        rm -rf "${UPG_ROOT}"
+    fi
+}
+trap 'cleanup_upg; restore_agent_image; cleanup' EXIT INT TERM
+
+ln -s "${REPO_ROOT}" "${UPG_ROOT}/harness"
+# Pre-fill .env with a subset of vars so envfile_merge has something to
+# add. .harness-allowlist with a subset so linefile_merge has something to
+# add. ccstatusline target absent so json_merge reports "create from source".
+cat >"${UPG_ROOT}/.env" <<'EOF'
+PROXY_API_URL=https://placeholder.invalid/v1/chat/completions
+PROXY_API_KEY=test-key
+PROXY_API_MODEL=test-model
+EOF
+cat >"${UPG_ROOT}/.harness-allowlist" <<'EOF'
+github.com
+api.github.com
+placeholder.invalid
+EOF
+
+env_mt_before=$(stat -c '%Y' "${UPG_ROOT}/.env")
+allow_mt_before=$(stat -c '%Y' "${UPG_ROOT}/.harness-allowlist")
+
+set +e
+upg_out=$(HARNESS_INSTALL_ROOT="${UPG_ROOT}" HARNESS_PROJECT_NAME="harness-upg-check" \
+    "${UPG_ROOT}/harness/harness" upgrade --check 2>&1)
+upg_rc=$?
+set -e
+if (( upg_rc != 0 )); then
+    echo "[harness-test] T16 FAIL: upgrade --check exited rc=${upg_rc}" >&2
+    echo "${upg_out}" >&2; exit 1
+fi
+if ! grep -q 'Upgrade actions to apply:' <<<"${upg_out}"; then
+    echo "[harness-test] T16 FAIL: --check did not print preview" >&2
+    echo "${upg_out}" >&2; exit 1
+fi
+if ! grep -q 'env_vars' <<<"${upg_out}"; then
+    echo "[harness-test] T16 FAIL: --check did not list env_vars action" >&2
+    echo "${upg_out}" >&2; exit 1
+fi
+if ! grep -q 'no changes will be made' <<<"${upg_out}"; then
+    echo "[harness-test] T16 FAIL: --check did not announce dry-run" >&2
+    echo "${upg_out}" >&2; exit 1
+fi
+env_mt_after=$(stat -c '%Y' "${UPG_ROOT}/.env")
+allow_mt_after=$(stat -c '%Y' "${UPG_ROOT}/.harness-allowlist")
+[[ "${env_mt_before}" == "${env_mt_after}" ]] \
+    || { echo "[harness-test] T16 FAIL: --check modified .env mtime" >&2; exit 1; }
+[[ "${allow_mt_before}" == "${allow_mt_after}" ]] \
+    || { echo "[harness-test] T16 FAIL: --check modified allowlist mtime" >&2; exit 1; }
+[[ ! -f "${UPG_ROOT}/agent/claude/.config/ccstatusline/settings.json" ]] \
+    || { echo "[harness-test] T16 FAIL: --check created ccstatusline settings file" >&2; exit 1; }
+echo "[harness-test] T16 OK"
+
+# --- Test 17: harness upgrade --no-prompt --no-restart -------------------
+#
+# Apply the same upgrade in apply mode, but skip the down/start cycle so we
+# don't disturb T15's running services. Verify the install root files
+# actually picked up the new vars/hosts/keys.
+
+echo "[harness-test] T17: harness upgrade --no-prompt --no-restart"
+set +e
+upg_apply_out=$(HARNESS_INSTALL_ROOT="${UPG_ROOT}" HARNESS_PROJECT_NAME="harness-upg-check" \
+    HARNESS_UPGRADE_SKIP_PULL=1 \
+    "${UPG_ROOT}/harness/harness" upgrade --no-prompt --no-restart 2>&1)
+upg_apply_rc=$?
+set -e
+if (( upg_apply_rc != 0 )); then
+    echo "[harness-test] T17 FAIL: apply rc=${upg_apply_rc}" >&2
+    echo "${upg_apply_out}" >&2; exit 1
+fi
+# .env should now have at least one of the new vars from .env.example.
+if ! grep -q '^OLLAMA_VERSION=' "${UPG_ROOT}/.env"; then
+    echo "[harness-test] T17 FAIL: OLLAMA_VERSION not added to .env after upgrade" >&2
+    cat "${UPG_ROOT}/.env" >&2; exit 1
+fi
+# .env existing values must be preserved.
+if ! grep -q '^PROXY_API_KEY=test-key$' "${UPG_ROOT}/.env"; then
+    echo "[harness-test] T17 FAIL: PROXY_API_KEY user value not preserved" >&2
+    cat "${UPG_ROOT}/.env" >&2; exit 1
+fi
+# .harness-allowlist should now have pypi.org (a new entry from the example).
+if ! grep -q '^pypi.org$' "${UPG_ROOT}/.harness-allowlist"; then
+    echo "[harness-test] T17 FAIL: pypi.org not added to allowlist after upgrade" >&2
+    cat "${UPG_ROOT}/.harness-allowlist" >&2; exit 1
+fi
+# ccstatusline target was absent → should now exist.
+if [[ ! -f "${UPG_ROOT}/agent/claude/.config/ccstatusline/settings.json" ]]; then
+    echo "[harness-test] T17 FAIL: ccstatusline settings file not created" >&2
+    exit 1
+fi
+# Idempotent: re-running adds nothing.
+upg_redo_out=$(HARNESS_INSTALL_ROOT="${UPG_ROOT}" HARNESS_PROJECT_NAME="harness-upg-check" \
+    HARNESS_UPGRADE_SKIP_PULL=1 \
+    "${UPG_ROOT}/harness/harness" upgrade --no-prompt --no-restart 2>&1)
+if grep -Eq 'envfile_merge: [1-9][0-9]* change' <<<"${upg_redo_out}"; then
+    echo "[harness-test] T17 FAIL: idempotent upgrade reported envfile changes on second run" >&2
+    echo "${upg_redo_out}" >&2; exit 1
+fi
+cleanup_upg
+trap 'restore_agent_image; cleanup' EXIT INT TERM
+echo "[harness-test] T17 OK"
+
+# --- Test 18: harness upgrade non-interactive without --no-prompt --------
+#
+# Non-interactive shells without --no-prompt MUST refuse rather than hang.
+
+echo "[harness-test] T18: harness upgrade rejects non-interactive without --no-prompt"
+UPG18_ROOT="$(mktemp -d -t harness-upg18.XXXXXX)"
+ln -s "${REPO_ROOT}" "${UPG18_ROOT}/harness"
+echo "PROXY_API_URL=https://placeholder.invalid/v1" >"${UPG18_ROOT}/.env"
+echo "github.com" >"${UPG18_ROOT}/.harness-allowlist"
+set +e
+upg18_out=$(HARNESS_INSTALL_ROOT="${UPG18_ROOT}" HARNESS_PROJECT_NAME="harness-upg18" \
+    HARNESS_UPGRADE_SKIP_PULL=1 \
+    "${UPG18_ROOT}/harness/harness" upgrade --no-restart </dev/null 2>&1)
+upg18_rc=$?
+set -e
+if (( upg18_rc == 0 )); then
+    echo "[harness-test] T18 FAIL: non-interactive upgrade without --no-prompt unexpectedly succeeded" >&2
+    echo "${upg18_out}" >&2
+    rm -rf "${UPG18_ROOT}"; exit 1
+fi
+if ! grep -qi 'non-interactive' <<<"${upg18_out}"; then
+    echo "[harness-test] T18 FAIL: error message did not flag non-interactive shell" >&2
+    echo "${upg18_out}" >&2
+    rm -rf "${UPG18_ROOT}"; exit 1
+fi
+rm -rf "${UPG18_ROOT}"
+echo "[harness-test] T18 OK"
 
 echo "============================================================"
 echo " HARNESS TEST PASSED"

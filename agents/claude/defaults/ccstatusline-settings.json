@@ -1,0 +1,16 @@
+{
+  "version": 3,
+  "lines": [
+    [
+      {"id": "1", "type": "model", "color": "cyan"},
+      {"id": "2", "type": "separator"},
+      {"id": "3", "type": "current-working-dir", "color": "blue", "metadata": {"abbreviateHome": "true", "segments": "3"}},
+      {"id": "4", "type": "separator"},
+      {"id": "5", "type": "git-branch", "color": "magenta", "metadata": {"hideNoGit": "true"}},
+      {"id": "6", "type": "separator"},
+      {"id": "7", "type": "context-bar", "color": "blue", "metadata": {"display": "progress-short"}}
+    ],
+    [],
+    []
+  ]
+}
