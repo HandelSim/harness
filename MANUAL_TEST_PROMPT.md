@@ -447,7 +447,7 @@ Report:
 3. Re-launch `harness claude` and confirm the change is reflected. Also
    confirm:
    ```
-   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/agent/claude/.config/ccstatusline/settings.json"
+   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/state/agent/claude/.config/ccstatusline/settings.json"
    ```
    exists. Settings persist across container rebuilds (bind-mounted home).
 
@@ -487,10 +487,11 @@ files if you want to be thorough.
    diff -q <install-root>/.env <install-root>/.env.before-upgrade   # should match
    ```
 
-2. Inside the harness clone, edit `.env.example` to introduce a new
-   variable. Pick a name unlikely to collide with anything real:
+2. Inside the harness clone (the install root IS the clone), edit
+   `.env.example` to introduce a new variable. Pick a name unlikely to
+   collide with anything real:
    ```
-   cd <install-root>/harness
+   cd <install-root>
    printf '\n# Demo: Phase B3 manual test variable.\nHARNESS_TEST_NEW_VAR=test_default\n' >> .env.example
    git add .env.example
    git commit -m 'manual test: new env var (will revert)'
@@ -532,7 +533,7 @@ files if you want to be thorough.
 
 7. Cleanup:
    ```
-   cd <install-root>/harness
+   cd <install-root>
    git reset --hard HEAD~1                                              # drop the demo commit
    sed -i '/^HARNESS_TEST_NEW_VAR=/d' <install-root>/.env
    sed -i '/Added by harness upgrade/d' <install-root>/.env

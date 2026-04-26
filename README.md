@@ -20,7 +20,7 @@ harness/
 ├── harness-install.sh       bootstrap installer (Phase 4; also bundled in zip)
 ├── zip-readme.md            README that ships in the distribution zip
 ├── docker-compose.yml       services: ollama, proxy, agents
-├── .env.example             documented env variables (copy to ../.env)
+├── .env.example             documented env variables (copy to ./.env at the install root)
 ├── ollama/                  custom ollama image + entrypoint that registers
 │                            the stub model with RemoteHost set to the proxy
 ├── proxy/                   the translating proxy
@@ -250,9 +250,12 @@ $ harness upgrade --no-restart    # apply without down/start (e.g. CI)
 ### How the manifest works
 
 The manifest at `scripts/upgrade-manifest.json` is the contract between the
-repo and your install root. Every file harness manages outside the clone has
-a corresponding entry, and every `B3-MANAGED:` comment in the codebase has a
-matching manifest entry (see audit step in Phase B3 docs).
+upstream repo and your local install root. Since B4 the install root IS the
+clone, so "managed files" means files harness writes inside the clone that
+aren't tracked git content (`.env`, `.harness-allowlist`, `state/mcp/<name>/`,
+the ccstatusline config under `state/agent/claude/`). Every `B3-MANAGED:`
+comment in the codebase has a matching manifest entry (see audit step in
+Phase B3 docs).
 
 Action types:
 
@@ -288,6 +291,20 @@ Files purely user-managed (not in the manifest):
 - `.harness-net-overrides.json` — controlled by `harness net open/close`
 - `state/output/` — proxy debug dumps
 - `state/ollama-data/` — model blobs
+- **User-installed skills and `pipx` packages** under `state/agent/<tool>/`
+  (e.g., `state/agent/claude/.local/bin/graphify`, `state/agent/claude/.claude/skills/graphify/`).
+  These live entirely inside the bind-mounted agent home and are never
+  touched by upgrade actions. The skel-seed step in the agent entrypoint
+  only runs once per home (gated by `~/.harness-home-initialized`), so
+  reinstalling the image during `harness upgrade` does not re-seed over
+  user files.
+- **User-added MCPs** dropped manually under `state/mcp/<name>/` (i.e. an
+  MCP that did not come from the registry). The `directory_overwrite`
+  action only fires for entries that have a corresponding source under
+  `mcp-registry/<name>/`; with no source present the user dir is left
+  alone. Discovery is directory-driven — `harness mcp list` and the
+  compose merge scan `state/mcp/*/` regardless of registry origin, so a
+  custom MCP shows up alongside the registry-installed ones.
 
 To force a full reset of a harness-managed file (and lose customizations):
 delete the file in your install root, then run `harness upgrade`. The

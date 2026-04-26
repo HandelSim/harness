@@ -484,10 +484,10 @@ flags:
   --no-restart    apply upgrade actions but skip the down/start cycle.
 
 The set of upgrade actions is driven by scripts/upgrade-manifest.json. Each
-action describes how a file harness manages outside the repo (in your
-install root) is brought forward when the repo changes — env vars, firewall
-hostnames, ccstatusline keys, MCP registry definitions. User-set values
-are NEVER overwritten.
+action describes how a file harness manages inside the install root (which
+is the same directory as the clone, post-B4) is brought forward when the
+repo changes — env vars, firewall hostnames, ccstatusline keys, MCP
+registry definitions. User-set values are NEVER overwritten.
 EOF
                 return 0
                 ;;

@@ -36,12 +36,19 @@ because the upstream serena image bakes its own install at
 If you want Serena to only see specific projects, set
 `HARNESS_PROJECTS_ROOT` in `<install-root>/.env` to that subtree.
 
-## Optional env vars
+## Env vars consumed
 
-| Variable                | Default      | Effect                                               |
-| ----------------------- | ------------ | ---------------------------------------------------- |
-| `HARNESS_PROJECTS_ROOT` | host `/home` | Host path mounted read-only at `/workspaces/projects/` |
-| `SERENA_DASHBOARD_PORT` | unset        | Documents the host port at which to browse Serena's dashboard. Publishing requires a manual `docker run -p` or your own compose override mapping to `harness-serena:24282`; the static compose snippet keeps it internal-only because compose can't conditionally include a `ports:` entry. |
+Serena has no REQUIRED env vars — it starts with sensible defaults. The
+two OPTIONAL vars below are also documented at the top of `.env.example`
+with the same `OPTIONAL for Serena` prefix.
+
+| Variable                | Status                              | Default      | Effect                                               |
+| ----------------------- | ----------------------------------- | ------------ | ---------------------------------------------------- |
+| `HARNESS_PROJECTS_ROOT` | OPTIONAL for Serena (recommended)   | host `/home` | Host path mounted read-only at `/workspaces/projects/`. Narrow this to a subtree to limit Serena's read scope. |
+| `SERENA_DASHBOARD_PORT` | OPTIONAL for Serena                 | unset        | Documents the host port at which to browse Serena's dashboard. Publishing requires a manual `docker run -p` or your own compose override mapping to `harness-serena:24282`; the static compose snippet keeps it internal-only because compose can't conditionally include a `ports:` entry. |
+
+Leaving either blank is fine — Serena still functions; just with the
+default broader mount and an internal-only dashboard.
 
 ## Disable
 

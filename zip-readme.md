@@ -38,10 +38,30 @@ configured upstream.
 ## Updating
 
 - `harness update` — `git pull --ff-only` in the clone (no rebuild)
-- `harness upgrade` — pull, rebuild images, restart services
+- `harness upgrade` — pull, rebuild images, run upgrade actions, restart
 
 `harness update` refuses to run over local modifications to the clone;
 revert or stash them first.
+
+`harness upgrade` is conservative about your customizations:
+
+- Your `.env` values, `.harness-allowlist` entries, and ccstatusline
+  customizations are preserved; new keys/hosts are appended with a
+  `# Added by harness upgrade on YYYY-MM-DD` marker comment.
+- Skills and packages you `pipx install` inside an agent (e.g.
+  `graphify`) live under `state/agent/<tool>/.local/` and survive
+  upgrades and image rebuilds — the home is bind-mounted and the
+  skel-seed step only fires once per home.
+- MCPs installed from the registry are refreshed in place but their
+  per-install `harness-meta.json` (the enabled flag) and `data/` index
+  state are preserved.
+- MCPs you dropped manually under `state/mcp/<name>/` (no registry
+  source) are left untouched, and `harness mcp list` continues to
+  discover them.
+
+`harness upgrade --check` previews actions without touching anything;
+`--no-prompt` skips the [Y/n] confirmation; `--no-restart` skips the
+final `down + start`.
 
 ## Where state lives
 
