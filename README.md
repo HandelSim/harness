@@ -17,7 +17,7 @@ zip distribution (built in Phase 4); this repo is for development.
 ```
 harness/
 ├── harness                  management CLI (Phase 4)
-├── install.sh               bootstrap installer (Phase 4; also bundled in zip)
+├── harness-install.sh       bootstrap installer (Phase 4; also bundled in zip)
 ├── zip-readme.md            README that ships in the distribution zip
 ├── docker-compose.yml       services: ollama, proxy, agents
 ├── .env.example             documented env variables (copy to ../.env)
@@ -35,8 +35,11 @@ harness/
     ├── mcp_test.sh          MCP install/enable/disable/uninstall lifecycle test
     ├── firewall_test.sh     Phase B1/B2 universal egress firewall + bypass
     ├── full_pipeline_test.sh end-to-end install → run → tmux drive
+    ├── integration_test.sh  Phase 7b: end-to-end Serena MCP + Graphify skill (HARNESS_RUN_SLOW=1)
     ├── lib/                 sourceable test toolkits (tui_driver, test_helpers, net_helpers)
-    ├── fixtures/responses/  mock_upstream fixture dispatch table (Phase 7a)
+    ├── fixtures/
+    │   ├── responses/       mock_upstream fixture dispatch table (Phase 7a)
+    │   └── test-project/    small Python calculator package used by integration_test.sh
     └── build_zip.sh         produces dist/harness-distribution.zip
 ```
 
@@ -115,7 +118,7 @@ egress except to:
 
 The image built from `firewall/init-firewall.sh` runs as a privileged
 init-container per service (`NET_ADMIN`, `NET_RAW`). The seed allowlist
-ships as `.harness-allowlist.example`; `install.sh` copies it to
+ships as `.harness-allowlist.example`; `harness-install.sh` copies it to
 `<install-root>/.harness-allowlist` on first run.
 
 ### `harness net` — managing the allowlist + bypass overrides
@@ -169,7 +172,7 @@ live inside it; user config and `state/` are gitignored:
 ```
 <install-root>/                 the git clone (e.g. ~/harness/)
 ├── .git/                       managed by `harness update` / `harness upgrade`
-├── install.sh, harness, docker-compose.yml, ...   tracked code
+├── harness-install.sh, harness, docker-compose.yml, ...   tracked code
 ├── .env                        your config (gitignored)
 ├── .harness-allowlist          egress allowlist (gitignored)
 ├── .harness-net-overrides.json firewall overrides (gitignored)
@@ -211,7 +214,7 @@ returned to the caller. It tears everything down on exit.
 ## End-user installation
 
 End users do not clone this repo. They install via the distribution zip,
-which ships `install.sh`, a pre-filled `.env`, and a quick-start README.
+which ships `harness-install.sh`, a pre-filled `.env`, and a quick-start README.
 See `zip-readme.md` for the user-facing instructions.
 
 To build the distribution zip from the current repo state:
@@ -320,7 +323,44 @@ $ bash scripts/mcp_test.sh           # MCP install/enable/disable/uninstall life
 $ bash scripts/firewall_test.sh      # universal egress firewall + bypass overrides
 $ bash scripts/upgrade_test.sh       # upgrade actions library + synthetic version transition
 $ bash scripts/full_pipeline_test.sh # full install + run pipeline (drives a TUI via lib/tui_driver.sh)
+$ HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh  # Phase 7b: end-to-end Serena + Graphify (slow, ~10-15 min)
 ```
+
+### Phase 7b integration test
+
+`scripts/integration_test.sh` is the canonical regression test for the two
+flagship integrations: Serena (Pattern A — HTTP MCP server) and Graphify
+(Pattern B — pipx-installed skill CLI). It is gated behind
+`HARNESS_RUN_SLOW=1` because the first run pulls/builds the ~2 GB Serena
+image, so the default test suite stays fast.
+
+The test exercises four phases against a clean install in a temp directory:
+
+1. **Stack setup** — `harness start`, build agent images, attach a
+   mockupstream sidecar to `harness-net`, run `harness claude -p "say hello"`
+   end-to-end through the proxy.
+2. **Serena (HTTP MCP)** — install → restart → reach on tcp://serena:9121
+   from the proxy → trigger an agent launch and verify
+   `state/agent/claude/.harness-mcp-servers.json` has the merged entry →
+   confirm `/workspaces/projects/test-project/` is visible inside the serena container
+   → drive a TUI claude that asks serena to find the `Calculator` symbol →
+   `mcp down/up`, `mcp disable/enable`, `mcp uninstall --force`.
+3. **Graphify (skill)** — launch a long-lived agent container with the same
+   firewall + UID-remap entrypoint as the real harness → `pipx install
+   graphifyy` → confirm the binary is visible from the host bind mount →
+   `graphify install` registers `~/.claude/skills/graphify/SKILL.md` →
+   `graphify update .` on the test-project fixture writes `graphify-out/graph.json`
+   containing `Calculator` and `ScientificCalculator` → assert the output
+   files are owned by the host UID (not container uid 1000) → tear the
+   container down and confirm a fresh container can still call graphify
+   from the persistent home.
+4. **Cross-test invariants** — `harness doctor` returns 0 and the state
+   directory layout is intact.
+
+The fixture project at `scripts/fixtures/test-project/` is a small Python
+calculator package (Calculator, ScientificCalculator, ExpressionParser, an
+exception hierarchy, and pytest tests) that gives both Serena and Graphify
+a non-trivial multi-module symbol graph to chew on.
 
 ### Test toolkits
 
@@ -334,6 +374,10 @@ $ bash scripts/full_pipeline_test.sh # full install + run pipeline (drives a TUI
 - `test_helpers.sh` — common setup: `require_docker`, `test_section`,
   `test_generate_env`, `test_generate_mockupstream_override` (mounts the
   fixture-dispatch directory), `test_wait_for_healthy`, `test_cleanup`.
+  `integration_test.sh` adds two helpers used when the harness compose
+  owns the network: `test_start_mockupstream` (one-shot `docker run` of
+  the mock joined to `<project>_harness-net` with the alias `mockupstream`)
+  and `test_wait_for_container_healthy` for non-compose containers.
 
 ### Mock-upstream fixture dispatch
 
@@ -354,7 +398,7 @@ $ bash scripts/full_pipeline_test.sh # full install + run pipeline (drives a TUI
 - **Phase 1** — repo skeleton, ollama service, mock proxy, de-risk test
 - **Phase 2** — real translating proxy
 - **Phase 3** — agent containers (claude-code, opencode)
-- **Phase 4** — `harness` management script + `install.sh` + zip
+- **Phase 4** — `harness` management script + `harness-install.sh` + zip
 - **Phase 6** — persistent agent homes + MCP server registry
 - **Phase 7a** — MCP lifecycle granularity (install/enable/disable/up/down/logs/status), TUI test toolkit, fixture-dispatch mock upstream
 - **Phase B1** — universal egress firewall (per-container iptables/ipset, allowlist seeded from `.harness-allowlist`)

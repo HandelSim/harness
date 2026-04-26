@@ -247,6 +247,13 @@ message is the thing we're testing here.
 
 ## Scenario J: Skill persistence
 
+> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh`
+> covers Phases 3.1–3.11 of this scenario non-interactively (pipx install of
+> graphifyy, host-bind-mount visibility, `graphify install` skill registration,
+> `graphify update .` against the test-project fixture, file-ownership UID match,
+> and persistence across a fresh container). Run that first; the steps below
+> add interactive coverage and exercise additional pipx packages.
+
 This scenario validates that things installed inside an agent survive
 container restarts and full service rebuilds. Persistence is implemented
 by bind-mounting `<install-root>/state/agent/<tool>/` as the agent's whole
@@ -287,6 +294,13 @@ Report whether each step passed cleanly, and the contents of the marker
 check in step 6.
 
 ## Scenario K: Serena MCP
+
+> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh`
+> covers Phase 2: install → restart → reachability on tcp://serena:9121 →
+> agent MCP-config side-file merge → workspace mount visibility → TUI
+> tool-call rendering → down/up cycle → disable/enable → uninstall. Run
+> that first; the steps below add interactive coverage against a real
+> upstream and your own project.
 
 This scenario exercises the MCP registry with the heavyweight Serena
 service. It is not in CI because the build is slow; treat it as a

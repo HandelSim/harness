@@ -537,7 +537,7 @@ upgrade_json_merge() {
 #
 # Refresh a managed directory from <source>, leaving any path inside
 # <preserve> untouched. Files in target that don't exist in source are not
-# removed. Initial install is install.sh's job — if target is missing this
+# removed. Initial install is harness-install.sh's job — if target is missing this
 # function errors.
 #
 # Output: {"action":"directory_overwrite","files_updated":[...],"files_preserved":[...],"target":"..."}

@@ -18,8 +18,10 @@ services:
     # against newer versions. The image tag is local-only; we don't push.
     image: harness-serena:v0.1
     build:
+      # Upstream historically lived at docker/Dockerfile; current main has
+      # the Dockerfile at the repo root.
       context: https://github.com/oraios/serena.git#main
-      dockerfile: docker/Dockerfile
+      dockerfile: Dockerfile
     container_name: harness-serena
     networks:
       - harness-net
@@ -46,26 +48,39 @@ services:
       # write access to its own CWD via /workspace). HARNESS_PROJECTS_ROOT
       # defaults to the host's $HOME, which exposes everything; users who
       # want a tighter scope set it to a single tree in .env.
-      - ${HARNESS_PROJECTS_ROOT:-/home}:/workspaces:ro
-      # Persistent index/config dir. Survives `harness mcp disable` so the
-      # next enable picks up where Serena left off.
-      - ${INSTALL_ROOT}/state/mcp/serena/data:/workspaces/serena/config
+      #
+      # Mounted at /workspaces/projects/ (NOT /workspaces) because the
+      # upstream serena image bakes its own install at /workspaces/serena/
+      # — mounting directly at /workspaces shadows the image content and
+      # leaves the container with no serena code to run. Per upstream
+      # DOCKER.md, projects activate via /workspaces/projects/<name>.
+      - ${HARNESS_PROJECTS_ROOT:-/home}:/workspaces/projects:ro
+      # Per-install index cache. Mounted at a path the image leaves
+      # writable (NOT /workspaces/serena/config — that holds the seeded
+      # serena_config.yml, and a bind mount would shadow it with an empty
+      # directory and break startup). The dashboard's `~/.serena/` is
+      # what holds project-list state across restarts.
+      - ${INSTALL_ROOT}/state/mcp/serena/data:/root/.serena
       # Universal egress firewall allowlist. Same path/policy as harness's
       # own services — see the cap_add note above for why this is mounted
       # even when the firewall is not actively applied.
       - ${HARNESS_ALLOWLIST_PATH:-${INSTALL_ROOT}/.harness-allowlist}:/etc/harness/allowlist:ro
-    # SERENA_DASHBOARD_PORT optionally publishes the Serena dashboard on the
-    # host. Empty (default) keeps it internal-only. The `${VAR:+:24282}`
-    # construct elides the colon when the var is empty so the ports list
-    # stays valid YAML in either configuration.
-    ports:
-      - "${SERENA_DASHBOARD_PORT:-}${SERENA_DASHBOARD_PORT:+:24282}"
+    # The Serena dashboard listens on 24282 inside the container; other
+    # services on harness-net can reach it via this `expose`. To publish
+    # it to a host port, set SERENA_DASHBOARD_PORT in .env and add a
+    # `ports: ["${SERENA_DASHBOARD_PORT}:24282"]` block via a local
+    # docker-compose override — a static conditional `ports:` entry can't
+    # be expressed here (compose treats an empty string as `invalid proto`).
+    # Use the installed `serena` CLI directly. The image entrypoint
+    # already activates /workspaces/serena/.venv before exec'ing $@, so
+    # `serena` resolves on PATH. Upstream's compose.yaml uses the stale
+    # `uv run --directory . serena-mcp-server` form, which (a) re-resolves
+    # the venv on every start and (b) calls a binary name that no longer
+    # exists in current main — the entrypoint was renamed to the
+    # `start-mcp-server` subcommand.
     command:
-      - "uv"
-      - "run"
-      - "--directory"
-      - "."
-      - "serena-mcp-server"
+      - "serena"
+      - "start-mcp-server"
       - "--transport"
       - "sse"
       - "--port"

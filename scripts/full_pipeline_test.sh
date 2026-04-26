@@ -6,8 +6,8 @@
 #
 #   1. builds dist/harness-distribution.zip from the current tree,
 #   2. extracts it into a clean tmpdir as a "fresh install",
-#   3. runs install.sh non-interactively (cloning the local repo, not
-#      GitHub — via HARNESS_REPO_URL),
+#   3. runs harness-install.sh non-interactively (cloning the local repo,
+#      not GitHub — via HARNESS_REPO_URL),
 #   4. exercises every major harness subcommand with a mock upstream,
 #   5. drives a real tmux-wrapped agent session via send-keys / capture-pane,
 #   6. tears everything down on exit.
@@ -61,10 +61,11 @@ TEST_WORKSPACE="$(mktemp -d -t harness-pipeline-ws.XXXXXX)"
 
 # Pre-seed the firewall allowlist at a stable path so docker compose's
 # bind-mount resolves on the very first cleanup-pass `compose down` (run
-# before T1 / install.sh has had a chance to lay down the install root).
-# We point HARNESS_ALLOWLIST_PATH at TEST_ROOT/.harness-allowlist so the
-# compose mount works regardless of whether install.sh has run yet — the
-# real install.sh will seed its own copy at <install-root>/.harness-allowlist
+# before T1 / harness-install.sh has had a chance to lay down the install
+# root). We point HARNESS_ALLOWLIST_PATH at TEST_ROOT/.harness-allowlist so
+# the compose mount works regardless of whether harness-install.sh has run
+# yet — the real harness-install.sh will seed its own copy at
+# <install-root>/.harness-allowlist
 # from the example, but we don't depend on that step here.
 cp "${REPO_ROOT}/.harness-allowlist.example" "${TEST_ROOT}/.harness-allowlist"
 export HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist"
@@ -153,10 +154,10 @@ echo "[pipeline] T0 OK: ${ZIP}"
 
 # --- T1: install flow -------------------------------------------------------
 
-echo "[pipeline] T1: extract zip + run install.sh"
+echo "[pipeline] T1: extract zip + run harness-install.sh"
 ( cd "${TEST_ROOT}" && unzip -q "${ZIP}" )
 
-# Pre-fill .env so install.sh's "edit .env" prompt is unnecessary. Values
+# Pre-fill .env so harness-install.sh's "edit .env" prompt is unnecessary. Values
 # point PROXY_API_URL at the mockupstream sidecar we'll bring up later.
 cat >"${TEST_ROOT}/.env" <<EOF
 PROXY_API_URL=http://mockupstream:9000/v1/chat/completions
@@ -173,19 +174,20 @@ PUBLISH_OLLAMA_PORT=
 MOCK_SCENARIO=text
 EOF
 
-# install.sh prompts: continue? [y/N], add to PATH? [Y/n]. Send y, y.
-# install.sh installs into $(pwd) — must cd into TEST_ROOT first.
+# harness-install.sh prompts: continue? [y/N], add to PATH? [Y/n]. Send y, y.
+# harness-install.sh installs into $(pwd) — must cd into TEST_ROOT first.
 (
     cd "${TEST_ROOT}"
     HOME="${FAKE_HOME}" HARNESS_REPO_URL="${REPO_ROOT}" \
-        bash "${TEST_ROOT}/install.sh" <<<$'y\ny\n' >"${TEST_ROOT}/install.log" 2>&1
+        bash "${TEST_ROOT}/harness-install.sh" <<<$'y\ny\n' >"${TEST_ROOT}/install.log" 2>&1
 )
 
-# install.sh clones HEAD of the local repo, but the pipeline test is meant
-# to validate the *current working tree* — including uncommitted changes
-# (e.g. the harness script with new subcommands the test exercises). Overlay
-# the working tree onto the clone, preserving the .git directory created by
-# install.sh so subsequent commands like `harness update` still work.
+# harness-install.sh clones HEAD of the local repo, but the pipeline test is
+# meant to validate the *current working tree* — including uncommitted
+# changes (e.g. the harness script with new subcommands the test exercises).
+# Overlay the working tree onto the clone, preserving the .git directory
+# created by harness-install.sh so subsequent commands like `harness update`
+# still work.
 if command -v rsync >/dev/null 2>&1; then
     rsync -a --delete \
         --exclude='.git/' \
@@ -443,7 +445,7 @@ echo "[pipeline] T11: tmux send-keys / capture-pane (via tui_driver.sh)"
 # we must mirror what run_agent_interactive does in the harness CLI:
 #   --cap-add NET_ADMIN --cap-add NET_RAW
 #   -v <install-root>/.harness-allowlist:/etc/harness/allowlist:ro
-# install.sh has already seeded ${TEST_ROOT}/.harness-allowlist from the
+# harness-install.sh has already seeded ${TEST_ROOT}/.harness-allowlist from the
 # bundled .harness-allowlist.example (T1).
 docker run -d \
     --name "${TMUX_AGENT_NAME}" \

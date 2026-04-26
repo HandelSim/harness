@@ -15,7 +15,7 @@
 #
 # Other smoke checks:
 #   - build_zip.sh produces a valid distribution zip
-#   - install.sh's PATH-rcfile append is idempotent
+#   - harness-install.sh's PATH-rcfile append is idempotent
 #
 # A separate compose project name (HARNESS_PROJECT_NAME=harness-mgmt-test)
 # is used so this test never collides with a real harness instance the
@@ -382,7 +382,7 @@ if [[ ! -f "${zip_path}" ]]; then
     exit 1
 fi
 zip_listing=$(unzip -l "${zip_path}")
-for f in install.sh .env README.md; do
+for f in harness-install.sh .env README.md; do
     if ! grep -q "${f}" <<<"${zip_listing}"; then
         echo "[harness-test] T6 FAIL: zip missing ${f}" >&2
         echo "${zip_listing}" >&2
@@ -391,20 +391,20 @@ for f in install.sh .env README.md; do
 done
 echo "[harness-test] T6 OK"
 
-# --- Test 7: install.sh PATH append is idempotent ---------------------------
+# --- Test 7: harness-install.sh PATH append is idempotent ------------------
 #
-# Synthesize the exact append-to-rcfile branch from install.sh: if grep finds
-# an existing .local/bin reference we leave the file alone. We test it by
-# simulating two install runs into a fake HOME.
+# Synthesize the exact append-to-rcfile branch from harness-install.sh: if
+# grep finds an existing .local/bin reference we leave the file alone. We
+# test it by simulating two install runs into a fake HOME.
 
-echo "[harness-test] T7: install.sh PATH-append idempotency"
+echo "[harness-test] T7: harness-install.sh PATH-append idempotency"
 fake_home=$(mktemp -d -t harness-fake-home.XXXXXX)
 trap 'rm -rf "${fake_home}"' RETURN || true
 
 rcfile="${fake_home}/.bashrc"
 touch "${rcfile}"
 
-# Emulate the install.sh append logic directly.
+# Emulate the harness-install.sh append logic directly.
 append_path() {
     if grep -q '\.local/bin' "${rcfile}"; then
         return 0

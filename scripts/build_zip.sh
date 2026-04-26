@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # build_zip.sh — produce dist/harness-distribution.zip from the current
-# repo state. The zip ships three files: install.sh, .env (a copy of
-# .env.example), and README.md (the zip-specific readme).
+# repo state. The zip ships three files: harness-install.sh, .env (a copy
+# of .env.example), and README.md (the zip-specific readme).
 
 set -euo pipefail
 
@@ -16,11 +16,11 @@ rm -f "$out_zip"
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 
-cp "$repo_root/install.sh"     "$staging/install.sh"
-cp "$repo_root/.env.example"   "$staging/.env"
-cp "$repo_root/zip-readme.md"  "$staging/README.md"
+cp "$repo_root/harness-install.sh" "$staging/harness-install.sh"
+cp "$repo_root/.env.example"       "$staging/.env"
+cp "$repo_root/zip-readme.md"      "$staging/README.md"
 
-(cd "$staging" && zip -q "$out_zip" install.sh .env README.md)
+(cd "$staging" && zip -q "$out_zip" harness-install.sh .env README.md)
 
 echo "built: $out_zip"
 echo "contents:"

@@ -7,7 +7,7 @@ configured upstream.
 
 ## What's in this zip
 
-- `install.sh` — one-shot installer
+- `harness-install.sh` — one-shot installer
 - `.env` — config file you fill in before running anything
 - `README.md` — this file
 
@@ -18,7 +18,7 @@ configured upstream.
    self-contained install root (clone, config, and runtime state all
    inside it).
 2. Edit `.env` and fill in `PROXY_API_KEY` plus any other blank required values.
-3. Run: `bash install.sh`
+3. Run: `bash harness-install.sh`
 4. Follow the prompts. The installer clones the harness repo into `./harness/`
    (which IS the install root), moves your edited `.env` into it, and
    (with your permission) symlinks the `harness` command into
@@ -46,12 +46,12 @@ revert or stash them first.
 ## Where state lives
 
 After install, the layout is a single self-contained folder — `harness/`
-inside whatever directory you ran `install.sh` from:
+inside whatever directory you ran `harness-install.sh` from:
 
 ```
 harness/                             the install root (also a git clone)
 ├── .git/                            managed by 'harness update' / 'harness upgrade'
-├── install.sh, harness, docker-compose.yml, ...   tracked code
+├── harness-install.sh, harness, docker-compose.yml, ...   tracked code
 ├── .env                             your config (gitignored)
 ├── .harness-allowlist               egress allowlist (gitignored; managed by 'harness net')
 ├── .harness-net-overrides.json      per-service firewall opt-outs (gitignored)
@@ -166,7 +166,7 @@ rm -rf <install-root>
 rm ~/.local/bin/harness
 ```
 
-`<install-root>` is the `harness/` folder created by `install.sh`. That
+`<install-root>` is the `harness/` folder created by `harness-install.sh`. That
 single folder holds everything (clone, config, state), so removing it
 removes the install completely. The PATH line in your `~/.bashrc` /
 `~/.zshrc` / `~/.profile` is harmless if `~/.local/bin` is empty; remove

@@ -23,11 +23,15 @@ will find Serena listed in their MCP servers and can call its tools.
 ## What it can see
 
 Serena mounts `${HARNESS_PROJECTS_ROOT:-/home}` from the host **read-only**
-at `/workspaces` inside the container. It cannot modify files — edits
-still flow through the agent, which has write access to its own working
-directory via the normal `/workspace` mount. This is a deliberate security
-tradeoff: Serena gets broad read access in exchange for being unable to
-corrupt your code.
+at `/workspaces/projects/` inside the container. It cannot modify files —
+edits still flow through the agent, which has write access to its own
+working directory via the normal `/workspace` mount. This is a deliberate
+security tradeoff: Serena gets broad read access in exchange for being
+unable to corrupt your code.
+
+The mount lives under `/workspaces/projects/` (not `/workspaces` itself)
+because the upstream serena image bakes its own install at
+`/workspaces/serena/`; a flat mount at `/workspaces` would shadow it.
 
 If you want Serena to only see specific projects, set
 `HARNESS_PROJECTS_ROOT` in `<install-root>/.env` to that subtree.
@@ -36,8 +40,8 @@ If you want Serena to only see specific projects, set
 
 | Variable                | Default      | Effect                                               |
 | ----------------------- | ------------ | ---------------------------------------------------- |
-| `HARNESS_PROJECTS_ROOT` | host `/home` | Host path mounted read-only at `/workspaces`         |
-| `SERENA_DASHBOARD_PORT` | unset        | If set, publishes Serena's dashboard on this host port |
+| `HARNESS_PROJECTS_ROOT` | host `/home` | Host path mounted read-only at `/workspaces/projects/` |
+| `SERENA_DASHBOARD_PORT` | unset        | Documents the host port at which to browse Serena's dashboard. Publishing requires a manual `docker run -p` or your own compose override mapping to `harness-serena:24282`; the static compose snippet keeps it internal-only because compose can't conditionally include a `ports:` entry. |
 
 ## Disable
 

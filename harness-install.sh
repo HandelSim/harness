@@ -10,7 +10,7 @@
 # Layout produced:
 #   <cwd>/harness/                        the install root (also the git clone)
 #     .git/                                managed by 'harness update'
-#     install.sh, harness, docker-compose.yml, ...   (code; tracked)
+#     harness-install.sh, harness, docker-compose.yml, ...   (code; tracked)
 #     .env                                 your config (gitignored)
 #     .harness-allowlist                   egress allowlist (gitignored)
 #     state/                               runtime state (gitignored)
@@ -81,11 +81,11 @@ EOF
 
 # --- CWD cleanliness check --------------------------------------------------
 #
-# Allow install.sh, .env, README files, hidden dotfiles, and .git to coexist
-# (zip extracts the first three; .git would mean someone unzipped into a repo).
-# Anything else is suspicious — warn the user but don't block.
+# Allow harness-install.sh, .env, README files, hidden dotfiles, and .git to
+# coexist (zip extracts the first three; .git would mean someone unzipped
+# into a repo). Anything else is suspicious — warn the user but don't block.
 
-allow_re='^(install\.sh|\.env|README\.md|README\.txt|quickstart\.md|\..*)$'
+allow_re='^(harness-install\.sh|\.env|README\.md|README\.txt|quickstart\.md|\..*)$'
 unexpected=$(ls -A . | grep -Ev "$allow_re" || true)
 if [[ -n "$unexpected" ]]; then
     warn "current directory has unexpected entries:"
@@ -122,7 +122,7 @@ if docker compose version >/dev/null 2>&1; then ok "docker compose found ($(dock
 title "cloning repo"
 
 if [[ -e "$install_root" ]]; then
-    fail "$install_root already exists; remove it or run install.sh in a clean directory"
+    fail "$install_root already exists; remove it or run harness-install.sh in a clean directory"
 fi
 git clone "$REPO_URL" "$install_root"
 ok "cloned into $install_root"

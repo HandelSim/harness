@@ -140,6 +140,71 @@ EOF
     done
 }
 
+# --- standalone mockupstream sidecar (integration_test.sh) ------------------
+
+# Start a mockupstream sidecar attached to an existing harness compose
+# network. Used by scripts/integration_test.sh, which brings the harness
+# stack up via the real `harness start` (so docker-compose owns the network)
+# and then needs to splice an in-network mock for the proxy to forward to.
+#
+# This mirrors test_generate_mockupstream_override but as a one-shot
+# `docker run` because no compose project owns the mock here. The container
+# joins the network with the alias `mockupstream` so PROXY_API_URL=
+# http://mockupstream:9000/... resolves the same way it would in
+# full_pipeline_test.sh.
+#
+# Args: <project_name>
+# Requires: REPO_ROOT in scope, plus the network
+# `<project_name>_harness-net` already created by `harness start`.
+test_start_mockupstream() {
+    local project="$1"
+    local network="${project}_harness-net"
+    local cname="${project}-mockupstream-1"
+    local fixtures_dir="$REPO_ROOT/scripts/fixtures/responses"
+
+    # Defensive: drop a stale container with the same name so the run -d
+    # below doesn't fail with "container name already in use".
+    docker rm -f "$cname" >/dev/null 2>&1 || true
+
+    docker run -d \
+        --name "$cname" \
+        --network "$network" \
+        --network-alias mockupstream \
+        -e "MOCK_FIXTURES_DIR=/fixtures" \
+        -v "$REPO_ROOT/scripts/mock_upstream.py:/app/mock_upstream.py:ro" \
+        -v "$fixtures_dir:/fixtures:ro" \
+        --health-cmd "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/health',timeout=2).status==200 else 1)\"" \
+        --health-interval 5s \
+        --health-timeout 3s \
+        --health-retries 12 \
+        --health-start-period 20s \
+        python:3.12-slim \
+        sh -c "pip install --quiet --no-cache-dir flask==3.0.3 && python /app/mock_upstream.py" \
+        >/dev/null
+}
+
+# Wait for a standalone container (non-compose) to report Health.Status ==
+# healthy. Used together with test_start_mockupstream where compose ps
+# wouldn't see the container.
+#
+# Args: <container_name> [<timeout=60>]
+test_wait_for_container_healthy() {
+    local cname="$1"
+    local timeout_s="${2:-60}"
+    local deadline=$(( $(date +%s) + timeout_s ))
+    while (( $(date +%s) < deadline )); do
+        local status
+        status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cname" 2>/dev/null || echo "none")
+        if [[ "$status" == "healthy" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "[test-helpers] timeout waiting for container $cname to become healthy" >&2
+    docker logs "$cname" 2>&1 | tail -30 >&2 || true
+    return 1
+}
+
 # --- waiters ----------------------------------------------------------------
 
 # Return 0 iff the named compose service has Health.Status == healthy.

@@ -420,13 +420,23 @@ cmd_start() {
     # actually go down on `harness start`.
     compose down --remove-orphans 2>/dev/null || true
 
+    # HARNESS_NO_BUILD=1 skips the --build flag — useful when all needed
+    # images already exist locally and re-running buildkit (which can pull
+    # the build context from git for some MCPs, e.g. Serena) is wasteful
+    # or impossible due to disk pressure. CI/integration tests pre-warm
+    # the heavy images and then set this for the actual harness start.
+    local build_flag=(--build)
+    if [[ "${HARNESS_NO_BUILD:-0}" == "1" ]]; then
+        build_flag=()
+    fi
+
     # Active MCPs sit behind the `mcp` profile so they're only brought up
     # when something has been `harness mcp enable`d. Without --profile they
     # are silently ignored even though the -f file is on the compose argv.
     if any_mcp_active; then
-        compose --profile mcp up -d --build
+        compose --profile mcp up -d "${build_flag[@]}"
     else
-        compose up -d --build
+        compose up -d "${build_flag[@]}"
     fi
 }
 
