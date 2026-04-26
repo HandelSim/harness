@@ -71,6 +71,151 @@ class TestExtractToolCall(unittest.TestCase):
         self.assertIn("```json", clean)
 
 
+class TestExtractToolCallScanner(unittest.TestCase):
+    """Tests for the balanced-brace tool call extraction logic.
+
+    The scanner replaced a regex that broke when an LLM emitted a tool
+    call whose arguments contained nested code fences (e.g., writing a
+    README with embedded ```json examples). These tests cover the failure
+    modes that motivated the rewrite plus a few belt-and-braces cases.
+    """
+
+    def test_simple_tool_call(self):
+        response = '''Here's the call:
+```json
+{"name": "Read", "arguments": {"path": "foo.txt"}}
+```
+That's it.'''
+        payload, text = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['name'], 'Read')
+        self.assertEqual(payload['arguments'], {'path': 'foo.txt'})
+        self.assertNotIn('```json', text)
+
+    def test_no_tool_call(self):
+        response = "Just a plain text response with no tool call."
+        payload, text = proxy.extract_tool_call_and_text(response)
+        self.assertIsNone(payload)
+        self.assertEqual(text, response)
+
+    def test_tool_call_with_embedded_code_fences_in_arguments(self):
+        """Scenario 1: agent writing a markdown file with code fences inside.
+        The outer tool-call JSON has a string value containing backticks and
+        nested ```json``` blocks. The regex-based extractor would mismatch on
+        the inner closing ```. The scanner must navigate past these correctly."""
+        response = '''I'll write the README:
+```json
+{
+  "name": "Write",
+  "arguments": {
+    "file_path": "README.md",
+    "content": "# Project\\n\\nExample config:\\n\\n```json\\n{\\"key\\": \\"value\\"}\\n```\\n\\nMore docs follow."
+  }
+}
+```
+Done.'''
+        payload, text = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload, "Failed to extract tool call with embedded fences")
+        self.assertEqual(payload['name'], 'Write')
+        self.assertEqual(payload['arguments']['file_path'], 'README.md')
+        self.assertIn('```json', payload['arguments']['content'])
+        self.assertIn('"key"', payload['arguments']['content'])
+
+    def test_tool_call_with_braces_in_string_values(self):
+        response = '''```json
+{"name": "Run", "arguments": {"cmd": "echo {hello} and }nested{ braces"}}
+```'''
+        payload, _ = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['arguments']['cmd'], 'echo {hello} and }nested{ braces')
+
+    def test_two_blocks_first_invalid(self):
+        """Scenario 2: upstream shows a bad example then the real call.
+        The scanner must skip the malformed first block and find the second."""
+        response = '''Let me consider:
+```json
+{this is not valid json}
+```
+But the real call is:
+```json
+{"name": "Read", "arguments": {"path": "foo.txt"}}
+```'''
+        payload, _ = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['name'], 'Read')
+
+    def test_two_blocks_first_lacks_required_keys(self):
+        """First block parses but isn't a tool call. Scanner should skip it."""
+        response = '''```json
+{"foo": "bar"}
+```
+Now the actual call:
+```json
+{"name": "Read", "arguments": {"path": "foo.txt"}}
+```'''
+        payload, _ = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['name'], 'Read')
+
+    def test_first_valid_block_wins(self):
+        """If the first block IS a valid tool call, use it (don't keep searching)."""
+        response = '''```json
+{"name": "First", "arguments": {}}
+```
+And here's another for some reason:
+```json
+{"name": "Second", "arguments": {}}
+```'''
+        payload, _ = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['name'], 'First')
+
+    def test_escaped_quotes_in_arguments(self):
+        response = '''```json
+{"name": "Echo", "arguments": {"text": "She said \\"hi\\" to him"}}
+```'''
+        payload, _ = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['arguments']['text'], 'She said "hi" to him')
+
+    def test_nested_objects_in_arguments(self):
+        response = '''```json
+{"name": "Configure", "arguments": {"settings": {"foo": {"bar": 1, "baz": [1, 2, 3]}}, "enabled": true}}
+```'''
+        payload, _ = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['arguments']['settings']['foo']['bar'], 1)
+        self.assertEqual(payload['arguments']['enabled'], True)
+
+    def test_no_closing_fence_but_valid_json(self):
+        """Malformed wrapper (no closing ```) but the JSON itself is complete."""
+        response = '''```json
+{"name": "Read", "arguments": {"path": "foo.txt"}}'''
+        payload, _ = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['name'], 'Read')
+
+    def test_truncated_json(self):
+        """JSON object opens but never closes (depth never returns to 0)."""
+        response = '''```json
+{"name": "Read", "arguments": {"path":'''
+        payload, text = proxy.extract_tool_call_and_text(response)
+        self.assertIsNone(payload)
+        self.assertEqual(text, response)
+
+    def test_clean_text_strips_block(self):
+        response = '''Before block.
+```json
+{"name": "Read", "arguments": {"path": "foo.txt"}}
+```
+After block.'''
+        payload, clean = proxy.extract_tool_call_and_text(response)
+        self.assertIsNotNone(payload)
+        self.assertNotIn('```json', clean)
+        self.assertIn('Before block.', clean)
+        self.assertIn('After block.', clean)
+
+
 class TestTranslateHistory(unittest.TestCase):
     def test_empty_returns_empty(self):
         self.assertEqual(proxy.translate_history_and_apply_prompt([], ""), [])

@@ -17,7 +17,6 @@ Environment variables (see README / .env.example):
 import datetime
 import json
 import os
-import re
 import sys
 import traceback
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -165,22 +164,112 @@ You may explain your reasoning before or after the JSON block. If the task is fu
 """
 
 
+def _scan_balanced_json(text, start):
+    """Scan from `start` for a complete JSON object, tracking string
+    boundaries and brace depth. Returns (json_str, position_after_json)
+    or (None, start) if no complete object found.
+
+    String content (between unescaped double quotes) is opaque — braces
+    and backticks inside strings do NOT count as structural. Backslash
+    escapes within strings are honored. This lets the scanner walk past
+    LLM-emitted tool-call arguments whose strings contain markdown code
+    fences or embedded JSON examples.
+    """
+    if start >= len(text) or text[start] != '{':
+        return None, start
+
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if escape_next:
+            escape_next = False
+            continue
+
+        if in_string:
+            if ch == '\\':
+                escape_next = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1], i + 1
+
+    return None, start
+
+
 def extract_tool_call_and_text(response_text):
-    """Extracts JSON tool payload and cleanly removes it from the conversational text."""
-    match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-    payload = None
-    clean_text = response_text
+    """Extract a tool-call JSON payload from the response.
 
-    if match:
-        raw_json_string = match.group(1).strip()
+    Searches for ```json ... ``` blocks and uses balanced-brace scanning
+    (not regex) to locate the JSON object boundaries. The regex this
+    replaces failed when JSON string values contained backticks or nested
+    code fences — the lazy match terminated on the first inner ``` instead
+    of the outer one, truncating the JSON.
+
+    If multiple ```json blocks exist, returns the first one that parses
+    to a valid {name, arguments} payload.
+
+    Returns (payload, clean_text). payload is None when no valid tool call
+    was found, in which case clean_text equals response_text.
+    """
+    pos = 0
+
+    while True:
+        fence_start = response_text.find('```json', pos)
+        if fence_start == -1:
+            break
+
+        body_start = fence_start + len('```json')
+        while body_start < len(response_text) and response_text[body_start] in ' \t\n\r':
+            body_start += 1
+
+        json_str, after_json = _scan_balanced_json(response_text, body_start)
+
+        if json_str is None:
+            pos = body_start
+            continue
+
+        rest_start = after_json
+        while rest_start < len(response_text) and response_text[rest_start] in ' \t\n\r':
+            rest_start += 1
+
+        closing_fence_pos = response_text.find('```', rest_start)
+        if closing_fence_pos == -1:
+            block_end = after_json
+        else:
+            block_end = closing_fence_pos + 3
+
         try:
-            payload = json.loads(raw_json_string)
-            if "name" in payload and "arguments" in payload:
-                clean_text = response_text.replace(match.group(0), "").strip()
+            candidate = json.loads(json_str)
         except json.JSONDecodeError:
-            payload = None
+            pos = after_json
+            continue
 
-    return payload, clean_text
+        if not isinstance(candidate, dict):
+            pos = after_json
+            continue
+        if 'name' not in candidate or 'arguments' not in candidate:
+            pos = after_json
+            continue
+
+        block = response_text[fence_start:block_end]
+        clean_text = response_text.replace(block, '', 1).strip()
+
+        return candidate, clean_text
+
+    return None, response_text
 
 
 # ---------------------------------------------------------------------------
