@@ -59,11 +59,13 @@ TEST_ROOT="$(mktemp -d -t harness-pipeline-root.XXXXXX)"
 FAKE_HOME="$(mktemp -d -t harness-pipeline-home.XXXXXX)"
 TEST_WORKSPACE="$(mktemp -d -t harness-pipeline-ws.XXXXXX)"
 
-# Pre-seed the firewall allowlist at the install root so docker compose's
+# Pre-seed the firewall allowlist at a stable path so docker compose's
 # bind-mount resolves on the very first cleanup-pass `compose down` (run
-# before T1 / install.sh has had a chance to seed it). After T1, install.sh
-# will see this file already present and leave it alone — we don't depend on
-# install.sh's seeding step for this test (a separate test could).
+# before T1 / install.sh has had a chance to lay down the install root).
+# We point HARNESS_ALLOWLIST_PATH at TEST_ROOT/.harness-allowlist so the
+# compose mount works regardless of whether install.sh has run yet — the
+# real install.sh will seed its own copy at <install-root>/.harness-allowlist
+# from the example, but we don't depend on that step here.
 cp "${REPO_ROOT}/.harness-allowlist.example" "${TEST_ROOT}/.harness-allowlist"
 export HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist"
 
@@ -190,11 +192,18 @@ if command -v rsync >/dev/null 2>&1; then
         --exclude='dist/' \
         --exclude='__pycache__/' \
         --exclude='*.pyc' \
+        --exclude='.env' \
+        --exclude='.harness-allowlist' \
+        --exclude='.harness-net-overrides.json' \
+        --exclude='state/' \
         "${REPO_ROOT}/" "${TEST_ROOT}/harness/"
 else
     # Fallback: tar-pipe (preserves modes; excludes via tar-style globs).
     ( cd "${REPO_ROOT}" && tar --exclude='.git' --exclude='dist' \
-        --exclude='__pycache__' --exclude='*.pyc' -cf - . ) \
+        --exclude='__pycache__' --exclude='*.pyc' \
+        --exclude='./.env' --exclude='./.harness-allowlist' \
+        --exclude='./.harness-net-overrides.json' \
+        --exclude='./state' -cf - . ) \
         | ( cd "${TEST_ROOT}/harness" && tar -xf - )
 fi
 
@@ -203,13 +212,14 @@ echo "[pipeline] T1 OK"
 # --- T2: install verification ---------------------------------------------
 
 echo "[pipeline] T2: install layout"
-[[ -L "${FAKE_HOME}/.local/bin/harness" ]]      || { echo "[pipeline] T2 FAIL: harness symlink missing" >&2; exit 1; }
-[[ -d "${TEST_ROOT}/harness/.git" ]]            || { echo "[pipeline] T2 FAIL: clone is not a git repo" >&2; exit 1; }
-[[ -d "${TEST_ROOT}/output" ]]                  || { echo "[pipeline] T2 FAIL: output/ missing" >&2; exit 1; }
-[[ -d "${TEST_ROOT}/agent/claude" ]]            || { echo "[pipeline] T2 FAIL: agent/claude/ missing" >&2; exit 1; }
-[[ -d "${TEST_ROOT}/agent/opencode" ]]          || { echo "[pipeline] T2 FAIL: agent/opencode/ missing" >&2; exit 1; }
-[[ -d "${TEST_ROOT}/ollama-data" ]]             || { echo "[pipeline] T2 FAIL: ollama-data/ missing" >&2; exit 1; }
-[[ -f "${TEST_ROOT}/.env" ]]                    || { echo "[pipeline] T2 FAIL: .env missing" >&2; exit 1; }
+[[ -L "${FAKE_HOME}/.local/bin/harness" ]]              || { echo "[pipeline] T2 FAIL: harness symlink missing" >&2; exit 1; }
+[[ -d "${TEST_ROOT}/harness/.git" ]]                    || { echo "[pipeline] T2 FAIL: clone is not a git repo" >&2; exit 1; }
+[[ -d "${TEST_ROOT}/harness/state/output" ]]            || { echo "[pipeline] T2 FAIL: state/output/ missing" >&2; exit 1; }
+[[ -d "${TEST_ROOT}/harness/state/agent/claude" ]]      || { echo "[pipeline] T2 FAIL: state/agent/claude/ missing" >&2; exit 1; }
+[[ -d "${TEST_ROOT}/harness/state/agent/opencode" ]]    || { echo "[pipeline] T2 FAIL: state/agent/opencode/ missing" >&2; exit 1; }
+[[ -d "${TEST_ROOT}/harness/state/ollama-data" ]]       || { echo "[pipeline] T2 FAIL: state/ollama-data/ missing" >&2; exit 1; }
+[[ -f "${TEST_ROOT}/harness/.env" ]]                    || { echo "[pipeline] T2 FAIL: .env missing in clone" >&2; exit 1; }
+[[ -f "${TEST_ROOT}/harness/.harness-allowlist" ]]      || { echo "[pipeline] T2 FAIL: .harness-allowlist missing in clone" >&2; exit 1; }
 echo "[pipeline] T2 OK"
 
 # --- T3: harness help -------------------------------------------------------
@@ -284,8 +294,8 @@ if ! wait_healthy_compose proxy 90; then echo "[pipeline] T5 FAIL proxy" >&2; ex
 # pipeline test needs both images present for T9–T11.
 echo "[pipeline] T5: building agent images (compose --profile agent build)"
 docker compose --project-name "${PROJECT_NAME}" \
-    --env-file "${TEST_ROOT}/.env" \
-    -f "${REPO_ROOT}/docker-compose.yml" \
+    --env-file "${TEST_ROOT}/harness/.env" \
+    -f "${TEST_ROOT}/harness/docker-compose.yml" \
     --profile agent build >"${TEST_ROOT}/agent-build.log" 2>&1
 
 echo "[pipeline] T5 OK"
@@ -449,7 +459,7 @@ docker run -d \
     -e "ANTHROPIC_MODEL=harness" \
     -e "ANTHROPIC_SMALL_FAST_MODEL=harness" \
     -v "${TEST_WORKSPACE}:/workspace" \
-    -v "${TEST_ROOT}/agent/claude:/home/harness" \
+    -v "${TEST_ROOT}/harness/state/agent/claude:/home/harness" \
     -v "${TEST_ROOT}/.harness-allowlist:/etc/harness/allowlist:ro" \
     -w /workspace \
     --label "harness.agent=true" \
@@ -590,10 +600,10 @@ echo "[pipeline] T11 OK"
 # same code path a second time and must not regress.
 
 echo "[pipeline] T15: persistent home marker + idempotent re-seed"
-marker="${TEST_ROOT}/agent/claude/.harness-home-initialized"
+marker="${TEST_ROOT}/harness/state/agent/claude/.harness-home-initialized"
 if [[ ! -f "${marker}" ]]; then
     echo "[pipeline] T15 FAIL: skel-seed marker missing at ${marker}" >&2
-    ls -la "${TEST_ROOT}/agent/claude" >&2 || true
+    ls -la "${TEST_ROOT}/harness/state/agent/claude" >&2 || true
     exit 1
 fi
 cd "${TEST_WORKSPACE}"
@@ -653,11 +663,11 @@ t16_call mcp install _pipe_mcp >"${TEST_ROOT}/t16-install.log" 2>&1 || {
     cat "${TEST_ROOT}/t16-install.log" >&2
     exit 1
 }
-if [[ ! -f "${TEST_ROOT}/mcp/_pipe_mcp/compose.yml" ]]; then
+if [[ ! -f "${TEST_ROOT}/harness/state/mcp/_pipe_mcp/compose.yml" ]]; then
     echo "[pipeline] T16 FAIL: install did not copy compose.yml into install root" >&2
     exit 1
 fi
-if [[ ! -f "${TEST_ROOT}/mcp/_pipe_mcp/harness-meta.json" ]]; then
+if [[ ! -f "${TEST_ROOT}/harness/state/mcp/_pipe_mcp/harness-meta.json" ]]; then
     echo "[pipeline] T16 FAIL: install did not write harness-meta.json" >&2
     exit 1
 fi
@@ -697,12 +707,12 @@ t16_call mcp uninstall _pipe_mcp --force >"${TEST_ROOT}/t16-uninstall.log" 2>&1 
     cat "${TEST_ROOT}/t16-uninstall.log" >&2
     exit 1
 }
-if [[ -f "${TEST_ROOT}/mcp/_pipe_mcp/compose.yml" ]]; then
+if [[ -f "${TEST_ROOT}/harness/state/mcp/_pipe_mcp/compose.yml" ]]; then
     echo "[pipeline] T16 FAIL: compose.yml still present after uninstall" >&2
     exit 1
 fi
 # data/ should remain.
-if [[ ! -d "${TEST_ROOT}/mcp/_pipe_mcp/data" ]]; then
+if [[ ! -d "${TEST_ROOT}/harness/state/mcp/_pipe_mcp/data" ]]; then
     echo "[pipeline] T16 FAIL: data/ removed by uninstall (should be preserved)" >&2
     exit 1
 fi

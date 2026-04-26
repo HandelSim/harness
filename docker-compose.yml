@@ -6,8 +6,9 @@
 # hostname from the RemoteHost URL, so renaming the proxy service requires
 # updating OLLAMA_REMOTES to match.
 #
-# The .env file lives at the install root (one directory above this file).
-# Invoke with: docker compose --env-file ../.env up
+# The .env file lives at the install root (the same directory as this file —
+# the install root IS the git clone). Runtime state (volume contents) lives
+# under ./state/. Invoke with: docker compose --env-file ./.env up
 
 networks:
   harness-net:
@@ -40,10 +41,10 @@ services:
       PROXY_PORT: ${PROXY_PORT:-8000}
     volumes:
       # Persist the blob store across container rebuilds. The relative path
-      # resolves against this compose file, putting it at install-root/ollama-data.
-      - ../ollama-data:/root/.ollama
+      # resolves against this compose file, putting it at <install-root>/state/ollama-data.
+      - ./state/ollama-data:/root/.ollama
       # Universal egress firewall reads its allowlist from this path.
-      - ${HARNESS_ALLOWLIST_PATH:-../.harness-allowlist}:/etc/harness/allowlist:ro
+      - ${HARNESS_ALLOWLIST_PATH:-./.harness-allowlist}:/etc/harness/allowlist:ro
     # init-firewall.sh requires NET_ADMIN and NET_RAW to manage iptables/ipset.
     cap_add:
       - NET_ADMIN
@@ -85,9 +86,9 @@ services:
     volumes:
       # Phase 2's proxy will write per-request debug files here. The mock
       # doesn't use it, but mounting now keeps the compose file stable.
-      - ../output:/output
+      - ./state/output:/output
       # Universal egress firewall reads its allowlist from this path.
-      - ${HARNESS_ALLOWLIST_PATH:-../.harness-allowlist}:/etc/harness/allowlist:ro
+      - ${HARNESS_ALLOWLIST_PATH:-./.harness-allowlist}:/etc/harness/allowlist:ro
     # init-firewall.sh requires NET_ADMIN and NET_RAW to manage iptables/ipset.
     cap_add:
       - NET_ADMIN
@@ -122,7 +123,7 @@ services:
       - NET_ADMIN
       - NET_RAW
     volumes:
-      - ${HARNESS_ALLOWLIST_PATH:-../.harness-allowlist}:/etc/harness/allowlist:ro
+      - ${HARNESS_ALLOWLIST_PATH:-./.harness-allowlist}:/etc/harness/allowlist:ro
     networks:
       - harness-net
     profiles:
@@ -140,7 +141,7 @@ services:
       - NET_ADMIN
       - NET_RAW
     volumes:
-      - ${HARNESS_ALLOWLIST_PATH:-../.harness-allowlist}:/etc/harness/allowlist:ro
+      - ${HARNESS_ALLOWLIST_PATH:-./.harness-allowlist}:/etc/harness/allowlist:ro
     networks:
       - harness-net
     profiles:

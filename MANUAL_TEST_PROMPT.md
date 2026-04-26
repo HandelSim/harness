@@ -249,7 +249,7 @@ message is the thing we're testing here.
 
 This scenario validates that things installed inside an agent survive
 container restarts and full service rebuilds. Persistence is implemented
-by bind-mounting `<install-root>/agent/<tool>/` as the agent's whole
+by bind-mounting `<install-root>/state/agent/<tool>/` as the agent's whole
 `/home/harness` and seeding the build-time skeleton from `/etc/skel/harness/`
 on first run.
 
@@ -270,7 +270,7 @@ on first run.
 3. Exit the agent (`/exit`) and verify on the host that the file
    appeared in the mount:
    ```
-   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/agent/claude/.local/bin"
+   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/state/agent/claude/.local/bin"
    ```
 4. Re-launch: `harness claude`. Inside the TUI, `! which graphify` should
    still resolve. (No re-install required — the binary was on disk all
@@ -280,7 +280,7 @@ on first run.
    from outside the container lifecycle.
 6. Verify the marker file exists:
    ```
-   ls -la <install-root>/agent/claude/.harness-home-initialized
+   ls -la <install-root>/state/agent/claude/.harness-home-initialized
    ```
 
 Report whether each step passed cleanly, and the contents of the marker
@@ -336,7 +336,7 @@ release-time validation.
 6. Uninstall and verify cleanup preserves the data dir:
    ```
    harness mcp uninstall serena --force
-   ls <install-root>/mcp/serena/
+   ls <install-root>/state/mcp/serena/
    ```
    Only `data/` should remain. `compose.yml`, `client-config.json`, and
    `harness-meta.json` are gone.

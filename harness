@@ -2,42 +2,52 @@
 #
 # harness — management entrypoint for the harness runtime.
 #
-# Layout assumed at runtime (the install root is one directory above this
-# script's clone):
+# Layout assumed at runtime (the install root IS the git clone — they are
+# the same directory):
 #
-#   <install-root>/
-#     harness/                # the git clone — this script lives here
-#       harness               # this file
-#       docker-compose.yml
-#       mcp-registry/         # vetted MCP definitions (compose snippets + client cfg)
-#       ...
-#     .env                    # consumed by docker compose --env-file
-#     output/                 # bind-mounted into the proxy
-#     agent/claude/           # bind-mounted as the claude container's /home/harness
-#     agent/opencode/         # bind-mounted as the opencode container's /home/harness
-#     mcp/<name>/             # active MCP services, copied from the registry on enable
-#     ollama-data/            # bind-mounted to ollama's blob store
+#   <install-root>/                       # also the git clone
+#     .git/                                # managed by 'harness update'
+#     harness                              # this file (tracked)
+#     docker-compose.yml                   # tracked
+#     mcp-registry/                        # vetted MCP definitions (tracked)
+#     ...
+#     .env                                 # gitignored — user config
+#     .harness-allowlist                   # gitignored — egress allowlist
+#     state/                               # gitignored — runtime state
+#       output/                            # bind-mounted into the proxy
+#       agent/claude/                      # claude container's /home/harness
+#       agent/opencode/                    # opencode container's /home/harness
+#       mcp/<name>/                        # active MCP services
+#       ollama-data/                       # ollama's blob store
 #
 # This script is symlinked into ~/.local/bin/harness by install.sh; we use
-# realpath on $0 to resolve the script's true location independent of how it
-# was invoked. The clone dir is the parent of the script; the install root
-# is the parent of the clone.
+# realpath on $0 to resolve the script's true location independent of how
+# it was invoked. The script's parent directory is both the clone and the
+# install root.
 
 set -euo pipefail
 
 # --- self-locate ------------------------------------------------------------
 #
 # In production we resolve $0 through any symlinks (~/.local/bin/harness ->
-# <install-root>/harness/harness) to find the clone, then take its parent
-# as the install root. Tests can override the install root via
-# HARNESS_INSTALL_ROOT — useful when the test layout uses symlinks that
-# would otherwise collapse the dirname walk into the real repo path.
+# <install-root>/harness) to find the install root, which is also the git
+# clone. Tests can override via HARNESS_INSTALL_ROOT — useful when the test
+# layout uses symlinks that would otherwise collapse dirname into the real
+# repo path.
 
 real_self=$(realpath "$0")
+# clone_dir is where the code lives (this script + docker-compose.yml + scripts/).
+# install_root is where the user config (.env, .harness-allowlist) and runtime
+# state (state/) live. In production these are the same directory: install.sh
+# clones the repo and that clone IS the install root. Tests can override
+# HARNESS_INSTALL_ROOT to point at a tmpdir while keeping clone_dir resolved
+# to the real repo (via the script's realpath); without HARNESS_INSTALL_ROOT,
+# install_root falls back to clone_dir and the layout is single-folder.
 clone_dir=$(dirname "$real_self")
-install_root="${HARNESS_INSTALL_ROOT:-$(dirname "$clone_dir")}"
+install_root="${HARNESS_INSTALL_ROOT:-$clone_dir}"
+state_root="$install_root/state"
 env_file="$install_root/.env"
-runtime_override="$install_root/.harness-runtime.yml"
+runtime_override="$state_root/.harness-runtime.yml"
 
 # Universal egress firewall allowlist. Bind-mounted into every harness
 # container at /etc/harness/allowlist. install.sh seeds this from
@@ -56,7 +66,7 @@ net_overrides_path="${HARNESS_NET_OVERRIDES_PATH:-$install_root/.harness-net-ove
 # Defaults to the repo's bundled mcp-registry/ folder so users see the
 # vetted set out-of-the-box.
 registry_dir="${HARNESS_REGISTRY_DIR:-$clone_dir/mcp-registry}"
-mcp_active_dir="$install_root/mcp"
+mcp_active_dir="$state_root/mcp"
 
 # Project name is fixed by spec but overridable for tests so harness_test.sh
 # can run without colliding with a real harness instance on the same daemon.
@@ -119,10 +129,10 @@ require_docker() {
 # Create the install-root persistent directories if they don't exist.
 ensure_dirs() {
     mkdir -p \
-        "$install_root/output" \
-        "$install_root/agent/claude" \
-        "$install_root/agent/opencode" \
-        "$install_root/ollama-data" \
+        "$state_root/output" \
+        "$state_root/agent/claude" \
+        "$state_root/agent/opencode" \
+        "$state_root/ollama-data" \
         "$mcp_active_dir"
 }
 
@@ -267,6 +277,7 @@ write_runtime_override() {
         rm -f "$runtime_override"
         return 0
     fi
+    mkdir -p "$(dirname "$runtime_override")"
     {
         echo "# Generated by harness; do not edit. Regenerated on every invocation."
         echo "services:"
@@ -718,11 +729,11 @@ agent_runtime_paths() {
     case "$tool" in
         claude)
             printf 'harness-claude-agent:latest\t%s\t%s\n' \
-                "$install_root/agent/claude" "/home/harness"
+                "$state_root/agent/claude" "/home/harness"
             ;;
         opencode)
             printf 'harness-opencode-agent:latest\t%s\t%s\n' \
-                "$install_root/agent/opencode" "/home/harness"
+                "$state_root/agent/opencode" "/home/harness"
             ;;
         *)
             err "unknown tool '$tool'"
@@ -731,7 +742,7 @@ agent_runtime_paths() {
     esac
 }
 
-# Write the merged MCP client config to <install-root>/agent/<tool>/.harness-mcp-servers.json
+# Write the merged MCP client config to <install-root>/state/agent/<tool>/.harness-mcp-servers.json
 # so the entrypoint picks it up at startup. The harness emits a single
 # claude-style shape — `{"mcpServers": {"<name>": {...}}}` — and the per-
 # tool entrypoint translates to opencode's `mcp` block when needed. We
@@ -743,7 +754,7 @@ agent_runtime_paths() {
 # MCP would linger forever in the agent's config.
 write_agent_mcp_config() {
     local tool="$1"
-    local out_file="$install_root/agent/$tool/.harness-mcp-servers.json"
+    local out_file="$state_root/agent/$tool/.harness-mcp-servers.json"
 
     # Collect every installed-and-enabled MCP's client-config.json. Disabled
     # MCPs are skipped so toggling enabled=false hides the entry from agents
@@ -780,7 +791,7 @@ write_agent_mcp_config() {
 # Run an agent (claude or opencode) in the current directory.
 #
 # The container is started detached, with /workspace bind-mounted to $PWD
-# and the agent's config dir bind-mounted from <install-root>/agent/<tool>.
+# and the agent's config dir bind-mounted from <install-root>/state/agent/<tool>.
 # We then poll for the tmux session to become ready and exec into it.
 #
 # With -p / --print as the FIRST harness-level flag, we bypass tmux and run
@@ -1145,8 +1156,8 @@ cmd_stop() {
 #
 # Long-running MCP services (Serena and friends) live in two parallel trees:
 #
-#   <repo>/mcp-registry/<name>/        # vetted definitions, source of truth
-#   <install-root>/mcp/<name>/         # active copies; presence == enabled
+#   <repo>/mcp-registry/<name>/                # vetted definitions, source of truth
+#   <install-root>/state/mcp/<name>/           # active copies; presence == enabled
 #
 # Enabling copies the registry entry into the active tree (preserving the
 # upstream by-value, so the user can edit their copy without diverging the
@@ -1361,7 +1372,7 @@ mcp_services_of() {
 
 # install: registry -> active tree. Default state is enabled.
 #
-# B3-MANAGED: mcp-active-tree — <install-root>/mcp/<name>/. Created by this
+# B3-MANAGED: mcp-active-tree — <install-root>/state/mcp/<name>/. Created by this
 # function from mcp-registry/<name>/. `harness upgrade` runs a per-MCP
 # `directory_overwrite` registry action (gated on `condition: installed`)
 # that refreshes compose.yml, client-config.json, README.md, etc., while
@@ -2178,7 +2189,7 @@ cmd_claude_statusline_config() {
         echo "harness: building $image (one-time)..."
         compose --profile agent build claude-agent
     fi
-    local agent_config_dir="$install_root/agent/claude"
+    local agent_config_dir="$state_root/agent/claude"
     mkdir -p "$agent_config_dir"
 
     local tty_flag="-it"
@@ -2452,13 +2463,13 @@ cmd_doctor() {
     doctor_section storage
     local d
     for d in output agent/claude agent/opencode ollama-data; do
-        local path="$install_root/$d"
+        local path="$state_root/$d"
         if [[ -d "$path" && -w "$path" ]]; then
-            doctor_check ok "$d" "writable"
+            doctor_check ok "state/$d" "writable"
         elif [[ -d "$path" ]]; then
-            doctor_check fail "$d" "exists but not writable"
+            doctor_check fail "state/$d" "exists but not writable"
         else
-            doctor_check fail "$d" "missing ($path)"
+            doctor_check fail "state/$d" "missing ($path)"
         fi
     done
     # mcp/ is only required if any MCPs have been enabled. If the dir

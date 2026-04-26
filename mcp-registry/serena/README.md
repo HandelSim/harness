@@ -14,8 +14,8 @@ harness start
 
 The first `start` after enabling builds Serena from upstream source
 (roughly 5–10 minutes; ~2GB image). Subsequent starts reuse the cached
-image, and the data dir at `<install-root>/mcp/serena/data/` persists
-across rebuilds.
+image, and the data dir at `<install-root>/state/mcp/serena/data/`
+persists across rebuilds.
 
 Once it's up, agents launched with `harness claude` or `harness opencode`
 will find Serena listed in their MCP servers and can call its tools.
@@ -46,9 +46,9 @@ harness mcp disable serena
 ```
 
 This stops the service and removes the registry-installed config files
-under `<install-root>/mcp/serena/`, but **leaves
-`<install-root>/mcp/serena/data/` intact** so a future re-enable picks up
-the existing index.
+under `<install-root>/state/mcp/serena/`, but **leaves
+`<install-root>/state/mcp/serena/data/` intact** so a future re-enable
+picks up the existing index.
 
 ## Upstream
 

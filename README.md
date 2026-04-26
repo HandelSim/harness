@@ -43,7 +43,7 @@ harness/
 ## Persistent agent homes
 
 The agent containers' entire `/home/harness` is bind-mounted from
-`<install-root>/agent/<tool>/`. Anything a user installs inside an agent
+`<install-root>/state/agent/<tool>/`. Anything a user installs inside an agent
 (`pipx install graphifyy`, `pip install --user requests`, custom dotfiles)
 survives container rebuilds. The image's build-time home contents are
 snapshotted into `/etc/skel/harness/`, and the entrypoint copies them into
@@ -72,7 +72,7 @@ lifecycle. The state diagram is:
 available ──install──► installed-enabled ⇄ disable / enable ⇄ installed-disabled ──uninstall──► available
 ```
 
-Per-install state lives in `<install-root>/mcp/<name>/harness-meta.json`
+Per-install state lives in `<install-root>/state/mcp/<name>/harness-meta.json`
 (`{"enabled": true|false}`).
 
 | Verb                                  | What it does                                                                 |
@@ -161,18 +161,39 @@ recommendation block with the matching `harness net allow` commands. The
 allowlist is **never** modified automatically — the user copy-pastes what
 they actually want.
 
-## Local development
+## Layout
 
-The `.env` file lives at the install root, one directory above the clone:
+The clone IS the install root. Code, user config, and runtime state all
+live inside it; user config and `state/` are gitignored:
 
 ```
-$ cp .env.example ../.env
-$ $EDITOR ../.env       # fill in PROXY_API_URL / PROXY_API_KEY / PROXY_API_MODEL
-$ docker compose --env-file ../.env up --build
+<install-root>/                 the git clone (e.g. ~/harness/)
+├── .git/                       managed by `harness update` / `harness upgrade`
+├── install.sh, harness, docker-compose.yml, ...   tracked code
+├── .env                        your config (gitignored)
+├── .harness-allowlist          egress allowlist (gitignored)
+├── .harness-net-overrides.json firewall overrides (gitignored)
+└── state/                      runtime state (gitignored)
+    ├── output/                 proxy debug dumps
+    ├── agent/{claude,opencode}/ persistent /home/harness for each agent
+    ├── ollama-data/            ollama model blobs
+    └── mcp/<name>/             active MCP services (compose.yml + data)
+```
+
+To uninstall: `rm -rf <install-root> && rm ~/.local/bin/harness`.
+
+## Local development
+
+The `.env` file lives inside the clone:
+
+```
+$ cp .env.example .env
+$ $EDITOR .env          # fill in PROXY_API_URL / PROXY_API_KEY / PROXY_API_MODEL
+$ docker compose --env-file .env up --build
 ```
 
 To expose ollama on the host (useful for poking at it from outside the docker
-network), set `PUBLISH_OLLAMA_PORT=11434` in `../.env`.
+network), set `PUBLISH_OLLAMA_PORT=11434` in `.env`.
 
 ## De-risk test
 
@@ -253,17 +274,17 @@ Files harness manages (covered by the manifest):
 - `.env` — env vars merged in (preserves your values)
 - `.harness-allowlist` — new hosts appended (preserves your entries and
   any `# git-push` annotations)
-- `agent/claude/.config/ccstatusline/settings.json` — new widgets/keys
+- `state/agent/claude/.config/ccstatusline/settings.json` — new widgets/keys
   added (preserves layout and user widget customizations)
-- `mcp/<name>/` — definition files (`compose.yml`, `client-config.json`,
+- `state/mcp/<name>/` — definition files (`compose.yml`, `client-config.json`,
   `README.md`) updated (preserves `harness-meta.json` enable state and
   `data/` indexed state)
 
 Files purely user-managed (not in the manifest):
 
 - `.harness-net-overrides.json` — controlled by `harness net open/close`
-- `output/` — proxy debug dumps
-- `ollama-data/` — model blobs
+- `state/output/` — proxy debug dumps
+- `state/ollama-data/` — model blobs
 
 To force a full reset of a harness-managed file (and lose customizations):
 delete the file in your install root, then run `harness upgrade`. The
@@ -285,7 +306,7 @@ harness claude-statusline-config
 
 This launches an ephemeral claude container (no ollama/proxy required)
 attached to the persistent agent home; the ccstatusline TUI writes its
-edits straight to `<install-root>/agent/claude/.config/ccstatusline/settings.json`.
+edits straight to `<install-root>/state/agent/claude/.config/ccstatusline/settings.json`.
 
 ## Tests
 

@@ -95,7 +95,7 @@ fi
 
 # --- skel seed --------------------------------------------------------------
 #
-# The harness script bind-mounts <install-root>/agent/claude over
+# The harness script bind-mounts <install-root>/state/agent/claude over
 # /home/harness, so on first run the home dir is empty (or only contains the
 # user's bring-along files). Restore the build-time skeleton (~/.bashrc,
 # pipx's data dir layout, etc.) once, marked by ~/.harness-home-initialized.

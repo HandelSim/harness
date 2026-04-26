@@ -224,20 +224,20 @@ echo "[mcp] T3: harness mcp install _test_mcp"
 harness_call mcp install _test_mcp >"${TEST_ROOT}/install.log" 2>&1
 echo "  | $(grep -E '^(installed|state)' "${TEST_ROOT}/install.log" || true)"
 
-if [[ ! -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/compose.yml" ]]; then
+if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" ]]; then
     echo "[mcp] T3 FAIL: compose.yml not copied" >&2
     cat "${TEST_ROOT}/install.log" >&2
     exit 1
 fi
-if [[ ! -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/client-config.json" ]]; then
+if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/client-config.json" ]]; then
     echo "[mcp] T3 FAIL: client-config.json not copied" >&2
     exit 1
 fi
-if [[ ! -d "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/data" ]]; then
+if [[ ! -d "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/data" ]]; then
     echo "[mcp] T3 FAIL: data/ not pre-created" >&2
     exit 1
 fi
-if [[ ! -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/harness-meta.json" ]]; then
+if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/harness-meta.json" ]]; then
     echo "[mcp] T3 FAIL: harness-meta.json not written on install" >&2
     exit 1
 fi
@@ -273,7 +273,7 @@ mcp_cid=""
 while true; do
     mcp_cid=$(docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
-        -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/compose.yml" \
+        -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" \
         ps -q test_mcp 2>/dev/null || true)
     if [[ -n "${mcp_cid}" ]]; then
         status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${mcp_cid}" 2>/dev/null || echo "none")
@@ -285,7 +285,7 @@ while true; do
         echo "[mcp] T5 FAIL: test_mcp not healthy in 60s" >&2
         docker compose --project-name "${PROJECT_NAME}" \
             -f "${REPO_ROOT}/docker-compose.yml" \
-            -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/compose.yml" ps >&2 || true
+            -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" ps >&2 || true
         docker logs "${mcp_cid}" 2>&1 | tail -30 >&2 || true
         exit 1
     fi
@@ -306,7 +306,7 @@ echo "[mcp] T5 OK"
 echo "[mcp] T6: services up after start"
 ollama_cid=$(docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
-    -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/compose.yml" \
+    -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" \
     ps -q ollama 2>/dev/null || true)
 if [[ -z "${ollama_cid}" ]]; then
     echo "[mcp] T6 FAIL: ollama container not present (unrelated regression?)" >&2
@@ -335,7 +335,7 @@ echo "[mcp] T6 OK"
 # run_agent, calls write_agent_mcp_config, then errors on the image.
 
 echo "[mcp] T7: merged client config side file"
-mkdir -p "${FAKE_INSTALL_ROOT}/agent/claude"
+mkdir -p "${FAKE_INSTALL_ROOT}/state/agent/claude"
 # Stash any real claude image so we can deterministically hit the
 # image-not-found path.
 stash_tag=""
@@ -359,7 +359,7 @@ set -e
 restore_image
 trap cleanup EXIT INT TERM
 
-side_file="${FAKE_INSTALL_ROOT}/agent/claude/.harness-mcp-servers.json"
+side_file="${FAKE_INSTALL_ROOT}/state/agent/claude/.harness-mcp-servers.json"
 if [[ ! -f "${side_file}" ]]; then
     echo "[mcp] T7 FAIL: ${side_file} not written" >&2
     exit 1
@@ -404,13 +404,13 @@ if ! grep -q "^disabled: _test_mcp" <<<"${disable_out}"; then
     echo "[mcp] T9 FAIL: expected 'disabled: _test_mcp' message" >&2
     exit 1
 fi
-if [[ ! -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/compose.yml" ]]; then
+if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" ]]; then
     echo "[mcp] T9 FAIL: compose.yml unexpectedly removed by state-flag disable" >&2
     exit 1
 fi
-if ! grep -q '"enabled": false' "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/harness-meta.json"; then
+if ! grep -q '"enabled": false' "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/harness-meta.json"; then
     echo "[mcp] T9 FAIL: harness-meta.json should report enabled=false" >&2
-    cat "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/harness-meta.json" >&2
+    cat "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/harness-meta.json" >&2
     exit 1
 fi
 # status should now say installed-disabled.
@@ -466,7 +466,7 @@ while true; do
 done
 # Even though container is up, enabled flag should still be false (mcp up
 # does not flip it).
-if ! grep -q '"enabled": false' "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/harness-meta.json"; then
+if ! grep -q '"enabled": false' "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/harness-meta.json"; then
     echo "[mcp] T11 FAIL: 'mcp up' must not flip enabled flag" >&2
     exit 1
 fi
@@ -501,7 +501,7 @@ if ! grep -q "^enabled: _test_mcp" <<<"${enable_out}"; then
     echo "[mcp] T13 FAIL: expected 'enabled: _test_mcp' message" >&2
     exit 1
 fi
-if ! grep -q '"enabled": true' "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/harness-meta.json"; then
+if ! grep -q '"enabled": true' "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/harness-meta.json"; then
     echo "[mcp] T13 FAIL: harness-meta.json should report enabled=true" >&2
     exit 1
 fi
@@ -511,20 +511,20 @@ echo "[mcp] T13 OK"
 
 echo "[mcp] T14: harness mcp uninstall _test_mcp --force"
 # Drop a marker into data/ so we can prove preservation.
-echo "data marker" >"${FAKE_INSTALL_ROOT}/mcp/_test_mcp/data/marker.txt"
+echo "data marker" >"${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/data/marker.txt"
 
 harness_call mcp uninstall _test_mcp --force >"${TEST_ROOT}/uninstall.log" 2>&1
 echo "  | $(grep -E '^uninstalled|^data preserved' "${TEST_ROOT}/uninstall.log" || true)"
 
-if [[ -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/compose.yml" ]]; then
+if [[ -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" ]]; then
     echo "[mcp] T14 FAIL: compose.yml still present after uninstall" >&2
     exit 1
 fi
-if [[ -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/harness-meta.json" ]]; then
+if [[ -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/harness-meta.json" ]]; then
     echo "[mcp] T14 FAIL: harness-meta.json still present after uninstall" >&2
     exit 1
 fi
-if [[ ! -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/data/marker.txt" ]]; then
+if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/data/marker.txt" ]]; then
     echo "[mcp] T14 FAIL: data/marker.txt was removed by uninstall" >&2
     exit 1
 fi
@@ -550,7 +550,7 @@ if ! grep -q 'DEPRECATED' <<<"${dep_out}"; then
     echo "[mcp] T15 FAIL: deprecation warning missing from stderr" >&2
     exit 1
 fi
-if [[ -f "${FAKE_INSTALL_ROOT}/mcp/_test_mcp/compose.yml" ]]; then
+if [[ -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" ]]; then
     echo "[mcp] T15 FAIL: deprecation alias did not perform uninstall" >&2
     exit 1
 fi

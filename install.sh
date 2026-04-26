@@ -2,18 +2,26 @@
 #
 # harness installer.
 #
-# Run from the directory you want to install into. The current working
-# directory becomes the "install root" — the script clones the harness
-# repo as ./harness/, creates the persistent dirs alongside it, and
-# (optionally) symlinks the management script into ~/.local/bin.
+# Run from the directory in which you want the install to live. The script
+# clones the harness repo as ./harness/ — and that directory IS the install
+# root. Code, user config (.env, .harness-allowlist), and runtime state
+# (state/) all live inside the clone; runtime state is gitignored.
 #
 # Layout produced:
-#   <cwd>/
-#     install.sh               (this file)
-#     .env                     (kept if present, else copied from .env.example)
-#     README.md                (kept if shipped in zip)
-#     harness/                 (the clone)
-#     output/, agent/{claude,opencode}/, ollama-data/
+#   <cwd>/harness/                        the install root (also the git clone)
+#     .git/                                managed by 'harness update'
+#     install.sh, harness, docker-compose.yml, ...   (code; tracked)
+#     .env                                 your config (gitignored)
+#     .harness-allowlist                   egress allowlist (gitignored)
+#     state/                               runtime state (gitignored)
+#       output/                            proxy debug dumps
+#       agent/{claude,opencode}/           persistent agent /home/harness
+#       ollama-data/                       ollama model blobs
+#       mcp/<name>/                        active MCP services
+#
+# To uninstall later:
+#   rm -rf <install-root>
+#   rm ~/.local/bin/harness
 
 set -euo pipefail
 
@@ -45,21 +53,29 @@ fail()  { printf '%sx%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; exit 1; }
 title() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 
 cwd=$(pwd)
+install_root="$cwd/$CLONE_DIR"
 
 # --- intent -----------------------------------------------------------------
 
 cat <<EOF
 ${C_BOLD}harness installer${C_RESET}
 
-This will install the harness runtime into:
-  $cwd
+This will install the harness runtime into a single self-contained folder:
+  $install_root
+
+That folder is both the git clone and the install root — code, user config,
+and runtime state all live inside it. To uninstall later:
+  rm -rf $install_root
+  rm $LOCAL_BIN/$PROGRAM_NAME
 
 Steps:
   1. Verify git, docker, and 'docker compose' are available.
-  2. Clone $REPO_URL into ./harness
-  3. Create persistent directories: output/, agent/claude/, agent/opencode/, ollama-data/
-  4. Set up your .env (copied from .env.example if not already present)
-  5. Optionally symlink the harness command into $LOCAL_BIN and update PATH.
+  2. Refuse if $install_root already exists.
+  3. Clone $REPO_URL into $install_root
+  4. Create runtime state directories under $install_root/state/
+  5. Seed .env (from your zip-edited .env if present in $cwd, else from .env.example).
+  6. Seed .harness-allowlist from .harness-allowlist.example (if not present).
+  7. Optionally symlink the harness command into $LOCAL_BIN and update PATH.
 
 EOF
 
@@ -105,33 +121,50 @@ if docker compose version >/dev/null 2>&1; then ok "docker compose found ($(dock
 
 title "cloning repo"
 
-if [[ -e "$cwd/$CLONE_DIR" ]]; then
-    fail "$cwd/$CLONE_DIR already exists; remove it or run install.sh in a clean directory"
+if [[ -e "$install_root" ]]; then
+    fail "$install_root already exists; remove it or run install.sh in a clean directory"
 fi
-git clone "$REPO_URL" "$cwd/$CLONE_DIR"
-ok "cloned into $cwd/$CLONE_DIR"
+git clone "$REPO_URL" "$install_root"
+ok "cloned into $install_root"
 
-# --- persistent dirs --------------------------------------------------------
+# --- runtime state dirs -----------------------------------------------------
+#
+# Everything under state/ is gitignored. .gitignore already excludes state/
+# so these dirs never show up in `git status` inside the clone.
 
-title "creating persistent directories"
-mkdir -p "$cwd/output" "$cwd/agent/claude" "$cwd/agent/opencode" "$cwd/ollama-data"
-ok "created output/, agent/claude/, agent/opencode/, ollama-data/"
+title "creating runtime state directories"
+mkdir -p "$install_root/state/output" \
+         "$install_root/state/agent/claude" \
+         "$install_root/state/agent/opencode" \
+         "$install_root/state/ollama-data" \
+         "$install_root/state/mcp"
+ok "created state/output, state/agent/{claude,opencode}, state/ollama-data, state/mcp"
 
 # --- .env handling ----------------------------------------------------------
 #
-# B3-MANAGED: env-vars — <install-root>/.env. Seeded from .env.example on a
-# fresh install (this block); thereafter user-owned. `harness upgrade` runs
-# the `env_vars` manifest action (envfile_merge) to surface new variables
-# added to .env.example without touching existing user values. See
+# Three cases, in priority order:
+#   1. $install_root/.env already exists (unusual; clone shouldn't ship .env)
+#      → leave it alone.
+#   2. $cwd/.env exists (user pre-filled the zip-shipped .env)
+#      → move it into the clone and remove the source so the layout is clean.
+#   3. Neither → seed from .env.example inside the clone.
+#
+# B3-MANAGED: env-vars — <install-root>/.env. `harness upgrade` runs the
+# `env_vars` manifest action (envfile_merge) to surface new variables added
+# to .env.example without touching existing user values. See
 # scripts/upgrade-manifest.json and scripts/lib/upgrade_actions.sh.
 
 title "configuring .env"
-if [[ -f "$cwd/.env" ]]; then
-    ok ".env already present; left untouched"
+if [[ -f "$install_root/.env" ]]; then
+    ok "$install_root/.env already present; left untouched"
+elif [[ -f "$cwd/.env" ]]; then
+    cp "$cwd/.env" "$install_root/.env"
+    ok "moved your pre-filled .env into $install_root/.env"
+    rm -f "$cwd/.env"
 else
-    cp "$cwd/$CLONE_DIR/.env.example" "$cwd/.env"
-    ok "copied .env.example to .env"
-    warn "edit .env and fill in PROXY_API_KEY (and any other blank required values)"
+    cp "$install_root/.env.example" "$install_root/.env"
+    ok "seeded $install_root/.env from .env.example"
+    warn "edit $install_root/.env and fill in PROXY_API_KEY (and any other blank required values)"
 fi
 
 # --- firewall allowlist -----------------------------------------------------
@@ -140,21 +173,19 @@ fi
 # <install-root>/.harness-allowlist. Seed from the bundled example on a
 # fresh install. Idempotent: existing user customizations are never touched.
 #
-# B3-MANAGED: allowlist-hosts — <install-root>/.harness-allowlist. Seeded
-# from .harness-allowlist.example on a fresh install (this block).
-# `harness upgrade` runs the `allowlist_hosts` manifest action
-# (linefile_merge) to append new hostnames added upstream without modifying
-# user entries or annotations.
+# B3-MANAGED: allowlist-hosts — <install-root>/.harness-allowlist. `harness
+# upgrade` runs the `allowlist_hosts` manifest action (linefile_merge) to
+# append new hostnames added upstream without modifying user entries.
 
 title "configuring firewall allowlist"
-if [[ -f "$cwd/.harness-allowlist" ]]; then
+if [[ -f "$install_root/.harness-allowlist" ]]; then
     ok ".harness-allowlist already present; left untouched"
-elif [[ -f "$cwd/$CLONE_DIR/.harness-allowlist.example" ]]; then
-    cp "$cwd/$CLONE_DIR/.harness-allowlist.example" "$cwd/.harness-allowlist"
-    ok "copied .harness-allowlist.example to .harness-allowlist"
-    warn "edit .harness-allowlist and add your upstream LLM API hostname (must match PROXY_API_URL)"
+elif [[ -f "$install_root/.harness-allowlist.example" ]]; then
+    cp "$install_root/.harness-allowlist.example" "$install_root/.harness-allowlist"
+    ok "seeded $install_root/.harness-allowlist from .harness-allowlist.example"
+    warn "edit $install_root/.harness-allowlist and add your upstream LLM API hostname (must match PROXY_API_URL)"
 else
-    warn "no .harness-allowlist.example bundled; create $cwd/.harness-allowlist before 'harness start'"
+    warn "no .harness-allowlist.example bundled; create $install_root/.harness-allowlist before 'harness start'"
 fi
 
 # --- PATH setup -------------------------------------------------------------
@@ -162,8 +193,8 @@ fi
 if (( want_path )); then
     title "setting up PATH"
     mkdir -p "$LOCAL_BIN"
-    ln -sf "$cwd/$CLONE_DIR/$PROGRAM_NAME" "$LOCAL_BIN/$PROGRAM_NAME"
-    ok "symlinked $LOCAL_BIN/$PROGRAM_NAME -> $cwd/$CLONE_DIR/$PROGRAM_NAME"
+    ln -sf "$install_root/$PROGRAM_NAME" "$LOCAL_BIN/$PROGRAM_NAME"
+    ok "symlinked $LOCAL_BIN/$PROGRAM_NAME -> $install_root/$PROGRAM_NAME"
 
     # Detect whether ~/.local/bin is already on PATH. case-style match against
     # the literal expanded directory.
@@ -212,10 +243,16 @@ cat <<EOF
 
 ${C_BOLD}install complete${C_RESET}
 
+install root: $install_root
+
 next steps:
-  1. edit ${cwd}/.env and fill in any blank required values (especially PROXY_API_KEY)
+  1. edit ${install_root}/.env and fill in any blank required values (especially PROXY_API_KEY)
   2. run: harness start
   3. cd into a project directory and run: harness claude
+
+To uninstall later:
+  rm -rf $install_root
+  rm $LOCAL_BIN/$PROGRAM_NAME
 
 If PATH was just modified, open a new terminal first.
 EOF

@@ -285,9 +285,9 @@ fi
 
 # 5b.4: install + uninstall round-trip on the host fs (no docker).
 HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp install foo >/dev/null
-[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+[[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
     || { echo "[harness-test] T5b FAIL: foo not installed to active tree" >&2; exit 1; }
-[[ -f "${TEST_ROOT}/mcp/foo/harness-meta.json" ]] \
+[[ -f "${TEST_ROOT}/state/mcp/foo/harness-meta.json" ]] \
     || { echo "[harness-test] T5b FAIL: harness-meta.json not written on install" >&2; exit 1; }
 # After install, list should show installed-enabled.
 inst_list=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp list)
@@ -298,7 +298,7 @@ if ! grep -Eq 'foo[[:space:]]+installed-enabled' <<<"${inst_list}"; then
 fi
 # disable (state-flag flip; data and config preserved)
 HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp disable foo >/dev/null
-[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+[[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
     || { echo "[harness-test] T5b FAIL: disable removed compose.yml (should be preserved)" >&2; exit 1; }
 dis_list=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp list)
 if ! grep -Eq 'foo[[:space:]]+installed-disabled' <<<"${dis_list}"; then
@@ -316,7 +316,7 @@ if ! grep -Eq 'foo[[:space:]]+installed-enabled' <<<"${re_list}"; then
 fi
 # uninstall
 HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp uninstall foo --force >/dev/null
-[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+[[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
     && { echo "[harness-test] T5b FAIL: uninstall did not remove compose.yml" >&2; exit 1; }
 
 # 5b.5: deprecation alias — Phase 6 'enable <name>' for not-yet-installed
@@ -335,7 +335,7 @@ if ! grep -qi 'DEPRECATED' <<<"${dep_out}"; then
     echo "${dep_out}" >&2
     exit 1
 fi
-[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+[[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
     || { echo "[harness-test] T5b FAIL: deprecated enable did not install" >&2; exit 1; }
 
 # 5b.6: deprecation alias — Phase 6 'disable <name> --force' is forwarded
@@ -354,7 +354,7 @@ if ! grep -qi 'DEPRECATED' <<<"${dep_dis_out}"; then
     echo "${dep_dis_out}" >&2
     exit 1
 fi
-[[ -f "${TEST_ROOT}/mcp/foo/compose.yml" ]] \
+[[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
     && { echo "[harness-test] T5b FAIL: deprecated disable --force did not uninstall" >&2; exit 1; }
 
 # 5b.7: status reports state correctly.
@@ -770,7 +770,7 @@ allow_mt_after=$(stat -c '%Y' "${UPG_ROOT}/.harness-allowlist")
     || { echo "[harness-test] T16 FAIL: --check modified .env mtime" >&2; exit 1; }
 [[ "${allow_mt_before}" == "${allow_mt_after}" ]] \
     || { echo "[harness-test] T16 FAIL: --check modified allowlist mtime" >&2; exit 1; }
-[[ ! -f "${UPG_ROOT}/agent/claude/.config/ccstatusline/settings.json" ]] \
+[[ ! -f "${UPG_ROOT}/state/agent/claude/.config/ccstatusline/settings.json" ]] \
     || { echo "[harness-test] T16 FAIL: --check created ccstatusline settings file" >&2; exit 1; }
 echo "[harness-test] T16 OK"
 
@@ -807,7 +807,7 @@ if ! grep -q '^pypi.org$' "${UPG_ROOT}/.harness-allowlist"; then
     cat "${UPG_ROOT}/.harness-allowlist" >&2; exit 1
 fi
 # ccstatusline target was absent → should now exist.
-if [[ ! -f "${UPG_ROOT}/agent/claude/.config/ccstatusline/settings.json" ]]; then
+if [[ ! -f "${UPG_ROOT}/state/agent/claude/.config/ccstatusline/settings.json" ]]; then
     echo "[harness-test] T17 FAIL: ccstatusline settings file not created" >&2
     exit 1
 fi

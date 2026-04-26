@@ -13,12 +13,15 @@ configured upstream.
 
 ## Quick start
 
-1. (Optional) Move this folder somewhere permanent. The installer creates
-   persistent state alongside it (model blobs, agent config, debug dumps).
+1. Move this folder to wherever you want the install to live. The
+   installer creates a `harness/` subfolder there which becomes the
+   self-contained install root (clone, config, and runtime state all
+   inside it).
 2. Edit `.env` and fill in `PROXY_API_KEY` plus any other blank required values.
 3. Run: `bash install.sh`
 4. Follow the prompts. The installer clones the harness repo into `./harness/`
-   and (with your permission) symlinks the `harness` command into
+   (which IS the install root), moves your edited `.env` into it, and
+   (with your permission) symlinks the `harness` command into
    `~/.local/bin/`.
 5. Open a new terminal if the installer modified your shell's PATH.
 6. Run: `harness start`
@@ -42,33 +45,34 @@ revert or stash them first.
 
 ## Where state lives
 
-After install, the layout is:
+After install, the layout is a single self-contained folder — `harness/`
+inside whatever directory you ran `install.sh` from:
 
 ```
-<this dir>/
-├── install.sh                       this installer
-├── .env                             your config (never commit this)
-├── .harness-allowlist               egress allowlist (managed by 'harness net')
-├── .harness-net-overrides.json      per-service firewall opt-outs (managed by 'harness net open/close')
-├── README.md                        this file
-├── harness/                         the cloned repo (managed by 'harness update')
-├── output/                          proxy debug dumps (only used if OUTPUT_DIR is set)
-├── agent/claude/                    full /home/harness for the claude agent container
-├── agent/opencode/                  full /home/harness for the opencode agent container
-├── mcp/<name>/                      active MCP services (one dir per installed service; harness-meta.json holds enabled flag)
-└── ollama-data/                     persists ollama model blobs
+harness/                             the install root (also a git clone)
+├── .git/                            managed by 'harness update' / 'harness upgrade'
+├── install.sh, harness, docker-compose.yml, ...   tracked code
+├── .env                             your config (gitignored)
+├── .harness-allowlist               egress allowlist (gitignored; managed by 'harness net')
+├── .harness-net-overrides.json      per-service firewall opt-outs (gitignored)
+└── state/                           runtime state (gitignored)
+    ├── output/                      proxy debug dumps (only used if OUTPUT_DIR is set)
+    ├── agent/claude/                full /home/harness for the claude agent container
+    ├── agent/opencode/              full /home/harness for the opencode agent container
+    ├── mcp/<name>/                  active MCP services (one dir per installed service; harness-meta.json holds enabled flag)
+    └── ollama-data/                 persists ollama model blobs
 ```
 
-The `agent/<tool>/` dirs are the agent containers' entire `/home/harness`,
-so anything you `pipx install` or `pip install --user` inside an agent
-survives container rebuilds. The first time an agent starts against an
-empty home, the build-time skeleton (shells dotfiles, etc.) is restored
-from `/etc/skel/harness/` inside the image.
+The `state/agent/<tool>/` dirs are the agent containers' entire
+`/home/harness`, so anything you `pipx install` or `pip install --user`
+inside an agent survives container rebuilds. The first time an agent
+starts against an empty home, the build-time skeleton (shells dotfiles,
+etc.) is restored from `/etc/skel/harness/` inside the image.
 
 ## Adding MCP servers (Serena and friends)
 
 Long-running MCP servers (semantic code analysis, etc.) live in a registry
-under `harness/mcp-registry/`. Bring one online with:
+under `mcp-registry/` inside the install root. Bring one online with:
 
 ```
 harness mcp install serena
@@ -98,8 +102,8 @@ The Phase 6 forms — `mcp enable <not-yet-installed>` and
 `mcp disable <name> --force` — still work but emit a `DEPRECATED` warning
 and forward to `install` / `uninstall --force`.
 
-See `harness mcp` for all subcommands and `harness/mcp-registry/<name>/README.md`
-for the security tradeoffs of each registry entry.
+See `harness mcp` for all subcommands and `mcp-registry/<name>/README.md`
+inside the install root for the security tradeoffs of each registry entry.
 
 ## Common commands
 
@@ -158,9 +162,12 @@ its upstream services. The allowlist is never modified automatically.
 ## Uninstall
 
 ```
-rm -rf <this dir>
+rm -rf <install-root>
 rm ~/.local/bin/harness
 ```
 
-The PATH line in your `~/.bashrc` / `~/.zshrc` / `~/.profile` is harmless
-if `~/.local/bin` is empty; remove it manually if you want.
+`<install-root>` is the `harness/` folder created by `install.sh`. That
+single folder holds everything (clone, config, state), so removing it
+removes the install completely. The PATH line in your `~/.bashrc` /
+`~/.zshrc` / `~/.profile` is harmless if `~/.local/bin` is empty; remove
+it manually if you want.

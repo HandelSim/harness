@@ -1,7 +1,7 @@
 # Serena MCP — semantic code analysis service.
 #
 # Brought up by `harness start` whenever Serena is enabled
-# (<install-root>/mcp/serena/compose.yml present). Reach it from agents at
+# (<install-root>/state/mcp/serena/compose.yml present). Reach it from agents at
 # http://serena:9121/sse on the harness-net network.
 #
 # This snippet is merged with harness/docker-compose.yml via additional
@@ -49,7 +49,7 @@ services:
       - ${HARNESS_PROJECTS_ROOT:-/home}:/workspaces:ro
       # Persistent index/config dir. Survives `harness mcp disable` so the
       # next enable picks up where Serena left off.
-      - ${INSTALL_ROOT}/mcp/serena/data:/workspaces/serena/config
+      - ${INSTALL_ROOT}/state/mcp/serena/data:/workspaces/serena/config
       # Universal egress firewall allowlist. Same path/policy as harness's
       # own services — see the cap_add note above for why this is mounted
       # even when the firewall is not actively applied.
