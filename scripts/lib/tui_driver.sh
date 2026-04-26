@@ -22,6 +22,16 @@
 # All log lines from the toolkit go to stderr so callers can capture
 # function output cleanly.
 
+# Cross-platform helpers (harness_docker). Sourced defensively so this file
+# can be loaded standalone — most callers also load it via test_helpers.sh
+# or directly, but neither path guarantees platform.sh is already in scope.
+# shellcheck disable=SC1091
+if ! declare -F harness_docker >/dev/null 2>&1; then
+    _td_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    source "${_td_dir}/platform.sh"
+    unset _td_dir
+fi
+
 # --- low-level ----------------------------------------------------------------
 
 # Strip ANSI escape sequences from text on stdin.
@@ -52,7 +62,7 @@ tui_strip_ansi() {
 # linebreaks introduced by terminal width.
 tui_capture_clean() {
     local container="$1" session="$2"
-    docker exec --user harness "$container" \
+    harness_docker exec --user harness "$container" \
         tmux capture-pane -t "$session" -p -J 2>/dev/null \
         | tui_strip_ansi
 }
@@ -65,11 +75,11 @@ tui_send_key() {
     case "$key" in
         Enter|enter|RET|return)
             # Hex 0d (CR). The keyword form is the known footgun.
-            docker exec --user harness "$container" \
+            harness_docker exec --user harness "$container" \
                 tmux send-keys -t "$session" -H 0d
             ;;
         *)
-            docker exec --user harness "$container" \
+            harness_docker exec --user harness "$container" \
                 tmux send-keys -t "$session" "$key"
             ;;
     esac
@@ -81,7 +91,7 @@ tui_send_key() {
 # Args: <container> <session> <text>
 tui_send_text() {
     local container="$1" session="$2" text="$3"
-    docker exec --user harness "$container" \
+    harness_docker exec --user harness "$container" \
         tmux send-keys -t "$session" -l "$text"
 }
 
@@ -104,13 +114,13 @@ tui_paste() {
     local tmp="/tmp/tui_paste_$$_$RANDOM"
     # Stream the text into a file inside the container.
     printf '%s' "$text" \
-        | docker exec -i --user harness "$container" \
+        | harness_docker exec -i --user harness "$container" \
             bash -c "cat > '$tmp'"
-    docker exec --user harness "$container" \
+    harness_docker exec --user harness "$container" \
         tmux load-buffer "$tmp" 2>/dev/null || true
-    docker exec --user harness "$container" \
+    harness_docker exec --user harness "$container" \
         tmux paste-buffer -t "$session" 2>/dev/null || true
-    docker exec --user harness "$container" \
+    harness_docker exec --user harness "$container" \
         rm -f "$tmp" 2>/dev/null || true
 }
 
@@ -118,7 +128,7 @@ tui_paste() {
 # Args: <container> <session>
 tui_kill_session() {
     local container="$1" session="$2"
-    docker exec --user harness "$container" \
+    harness_docker exec --user harness "$container" \
         tmux kill-session -t "$session" 2>/dev/null || true
 }
 

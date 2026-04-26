@@ -1023,12 +1023,21 @@ run_agent_interactive() {
         docker_args+=("$env_line")
     done < <(collect_agent_env "$tool" "$yolo" "$net_open")
 
+    # Normalize host bind-mount sources for Windows Docker Desktop.
+    # On Linux/macOS these are passthrough; on Windows they're rewritten
+    # to C:/Users/... form which Docker Desktop's WSL2 backend mounts
+    # reliably (raw /tmp/... or /c/Users/... paths sometimes mount empty).
+    local mp_host acd_host alp_host
+    mp_host=$(harness_docker_path "$mount_path")
+    acd_host=$(harness_docker_path "$agent_config_dir")
+    alp_host=$(harness_docker_path "$allowlist_path")
+
     docker_args+=(
-        -v "$mount_path:/workspace"
-        -v "$agent_config_dir:$agent_config_target"
+        -v "$mp_host:/workspace"
+        -v "$acd_host:$agent_config_target"
         # Universal firewall allowlist, read-only. The init script aborts the
         # container if this is missing.
-        -v "$allowlist_path:/etc/harness/allowlist:ro"
+        -v "$alp_host:/etc/harness/allowlist:ro"
         -w /workspace
         --label "harness.agent=true"
         --label "harness.tool=$tool"
@@ -1040,7 +1049,7 @@ run_agent_interactive() {
     fi
 
     local cid
-    cid=$(docker "${docker_args[@]}")
+    cid=$(harness_docker "${docker_args[@]}")
 
     # Poll for tmux readiness. The entrypoint takes a moment to start the
     # session; without this wait, exec races and fails. tmux is owned by
@@ -1050,7 +1059,7 @@ run_agent_interactive() {
     # at /tmp/tmux-0/default, which doesn't exist.
     local tries=40   # 40 * 0.5s = 20s ceiling
     while (( tries > 0 )); do
-        if docker exec --user harness "$cid" tmux has-session -t harness-agent 2>/dev/null; then
+        if harness_docker exec --user harness "$cid" tmux has-session -t harness-agent 2>/dev/null; then
             break
         fi
         if [[ -z "$(docker ps -q -f "id=$cid" 2>/dev/null)" ]]; then
@@ -1066,7 +1075,7 @@ run_agent_interactive() {
         exit 1
     fi
 
-    exec docker exec -it --user harness "$cid" tmux attach -t harness-agent
+    harness_docker_exec exec -it --user harness "$cid" tmux attach -t harness-agent
 }
 
 # Headless single-shot agent invocation. No tmux, no detach, no labels (so
@@ -1100,11 +1109,17 @@ run_agent_print() {
         docker_args+=("$env_line")
     done < <(collect_agent_env "$tool" "$yolo" "$net_open")
 
+    # See run_agent_interactive for the harness_docker_path rationale.
+    local mp_host acd_host alp_host
+    mp_host=$(harness_docker_path "$mount_path")
+    acd_host=$(harness_docker_path "$agent_config_dir")
+    alp_host=$(harness_docker_path "$allowlist_path")
+
     docker_args+=(
         -e "HARNESS_PRINT_MODE=1"
-        -v "$mount_path:/workspace"
-        -v "$agent_config_dir:$agent_config_target"
-        -v "$allowlist_path:/etc/harness/allowlist:ro"
+        -v "$mp_host:/workspace"
+        -v "$acd_host:$agent_config_target"
+        -v "$alp_host:/etc/harness/allowlist:ro"
         -w /workspace
         "$image"
     )
@@ -1112,7 +1127,7 @@ run_agent_print() {
         docker_args+=("${pass_args[@]}")
     fi
 
-    exec docker "${docker_args[@]}"
+    harness_docker_exec "${docker_args[@]}"
 }
 
 cmd_list() {
@@ -1202,7 +1217,7 @@ cmd_attach() {
     fi
     # tmux is owned by the harness user inside the container; see the
     # explanation in run_agent_interactive.
-    exec docker exec -it --user harness "$target" tmux attach -t harness-agent
+    harness_docker_exec exec -it --user harness "$target" tmux attach -t harness-agent
 }
 
 cmd_stop() {
@@ -2284,7 +2299,11 @@ cmd_claude_statusline_config() {
         network="bridge"
     fi
 
-    exec docker run --rm "$tty_flag" \
+    local acd_host alp_host
+    acd_host=$(harness_docker_path "$agent_config_dir")
+    alp_host=$(harness_docker_path "$allowlist_path")
+
+    harness_docker_exec run --rm "$tty_flag" \
         --user 0:0 \
         --network "$network" \
         --cap-add NET_ADMIN \
@@ -2292,8 +2311,8 @@ cmd_claude_statusline_config() {
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
         -e "HARNESS_PRINT_MODE=1" \
-        -v "$agent_config_dir:/home/harness" \
-        -v "$allowlist_path:/etc/harness/allowlist:ro" \
+        -v "$acd_host:/home/harness" \
+        -v "$alp_host:/etc/harness/allowlist:ro" \
         --entrypoint /bin/bash \
         "$image" \
         -c '
@@ -2602,7 +2621,7 @@ cmd_doctor() {
             ollama_cid=$(compose ps -q ollama 2>/dev/null || true)
             if [[ -n "$ollama_cid" ]]; then
                 local show_out
-                show_out=$(timeout 3 docker exec "$ollama_cid" \
+                show_out=$(timeout 3 harness_docker exec "$ollama_cid" \
                     curl -sf -X POST -H 'Content-Type: application/json' \
                     -d "{\"name\":\"${agent_model}\"}" \
                     http://127.0.0.1:11434/api/show 2>/dev/null || true)
@@ -2612,7 +2631,7 @@ cmd_doctor() {
                     doctor_check warn "stub model" "$agent_model not registered yet"
                 fi
 
-                if timeout 3 docker exec "$ollama_cid" \
+                if timeout 3 harness_docker exec "$ollama_cid" \
                     curl -sf "http://proxy:${PROXY_PORT:-8000}/health" >/dev/null 2>&1; then
                     doctor_check ok   "proxy /health" "reachable from ollama"
                 else

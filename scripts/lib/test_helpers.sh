@@ -19,6 +19,12 @@
 
 # REPO_ROOT must be set by the caller (every test script already computes it).
 
+# Pull in cross-platform helpers (harness_docker, harness_docker_path,
+# harness_detect_os) so individual test scripts don't have to source it
+# themselves. test_helpers.sh is the universal entry-point for tests.
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
 # --- preflight --------------------------------------------------------------
 
 # Verify docker daemon is reachable. Exits 1 with a clear message if not.
@@ -166,13 +172,17 @@ test_start_mockupstream() {
     # below doesn't fail with "container name already in use".
     docker rm -f "$cname" >/dev/null 2>&1 || true
 
-    docker run -d \
+    local mock_py_host fixtures_host
+    mock_py_host=$(harness_docker_path "$REPO_ROOT/scripts/mock_upstream.py")
+    fixtures_host=$(harness_docker_path "$fixtures_dir")
+
+    harness_docker run -d \
         --name "$cname" \
         --network "$network" \
         --network-alias mockupstream \
         -e "MOCK_FIXTURES_DIR=/fixtures" \
-        -v "$REPO_ROOT/scripts/mock_upstream.py:/app/mock_upstream.py:ro" \
-        -v "$fixtures_dir:/fixtures:ro" \
+        -v "$mock_py_host:/app/mock_upstream.py:ro" \
+        -v "$fixtures_host:/fixtures:ro" \
         --health-cmd "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/health',timeout=2).status==200 else 1)\"" \
         --health-interval 5s \
         --health-timeout 3s \

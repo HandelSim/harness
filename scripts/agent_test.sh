@@ -30,6 +30,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# Cross-platform helpers (harness_docker, harness_docker_path).
+# shellcheck source=lib/platform.sh
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
 PROJECT_NAME="harness-agent-test"
 
 echo "============================================================"
@@ -100,7 +104,11 @@ pypi.org
 files.pythonhosted.org
 registry.npmjs.org
 EOF
-export HARNESS_ALLOWLIST_PATH="${ALLOWLIST_FILE}"
+# Convert host path for Docker Desktop's WSL2 backend (Windows). On Linux
+# this is a passthrough; on Windows it rewrites /tmp/... to C:/Users/.../
+# so the bind mount actually exposes the file inside the container.
+ALLOWLIST_FILE_HOST="$(harness_docker_path "${ALLOWLIST_FILE}")"
+export HARNESS_ALLOWLIST_PATH="${ALLOWLIST_FILE_HOST}"
 
 COMPOSE=(docker compose --project-name "${PROJECT_NAME}" --env-file "${ENV_FILE}" -f docker-compose.yml -f "${OVERRIDE_FILE}")
 
@@ -194,7 +202,7 @@ fail() {
 # --- Test A: claude headless ------------------------------------------------
 
 echo "[agent-test] test A: claude headless invocation through ollama -> proxy -> mock"
-A_OUT="$(docker run --rm \
+A_OUT="$(harness_docker run --rm \
     --network "${NETWORK}" \
     -e ANTHROPIC_BASE_URL=http://ollama:11434 \
     -e ANTHROPIC_AUTH_TOKEN=harness-dummy \
@@ -202,7 +210,7 @@ A_OUT="$(docker run --rm \
     -e ANTHROPIC_SMALL_FAST_MODEL=harness \
     -e OLLAMA_AGENT_MODEL=harness \
     -e HARNESS_TEST_MODE=1 \
-    -v "${ALLOWLIST_FILE}:/etc/harness/allowlist:ro" \
+    -v "${ALLOWLIST_FILE_HOST}:/etc/harness/allowlist:ro" \
     harness-claude-agent:latest \
     -p "Say hello" --dangerously-skip-permissions 2>&1)" \
     || fail "A: docker run for claude exited non-zero" "${A_OUT}"
@@ -214,11 +222,11 @@ echo "${A_OUT}" | grep -q "Hello from mock upstream" \
 
 echo "[agent-test] test B: opencode headless invocation through ollama -> proxy -> mock"
 set +e
-B_OUT="$(docker run --rm \
+B_OUT="$(harness_docker run --rm \
     --network "${NETWORK}" \
     -e OLLAMA_AGENT_MODEL=harness \
     -e HARNESS_TEST_MODE=1 \
-    -v "${ALLOWLIST_FILE}:/etc/harness/allowlist:ro" \
+    -v "${ALLOWLIST_FILE_HOST}:/etc/harness/allowlist:ro" \
     harness-opencode-agent:latest \
     "Say hello" 2>&1)"
 B_RC=$?
@@ -244,7 +252,7 @@ fi
 # --- Test C: claude with HARNESS_YOLO=1 (entrypoint adds the flag) ---------
 
 echo "[agent-test] test C: claude with HARNESS_YOLO=1 (entrypoint applies --dangerously-skip-permissions)"
-C_OUT="$(docker run --rm \
+C_OUT="$(harness_docker run --rm \
     --network "${NETWORK}" \
     -e ANTHROPIC_BASE_URL=http://ollama:11434 \
     -e ANTHROPIC_AUTH_TOKEN=harness-dummy \
@@ -253,7 +261,7 @@ C_OUT="$(docker run --rm \
     -e OLLAMA_AGENT_MODEL=harness \
     -e HARNESS_TEST_MODE=1 \
     -e HARNESS_YOLO=1 \
-    -v "${ALLOWLIST_FILE}:/etc/harness/allowlist:ro" \
+    -v "${ALLOWLIST_FILE_HOST}:/etc/harness/allowlist:ro" \
     harness-claude-agent:latest \
     -p "Say hello" 2>&1)" \
     || fail "C: docker run for claude (yolo) exited non-zero" "${C_OUT}"
@@ -269,7 +277,7 @@ echo "${C_OUT}" | grep -q "Hello from mock upstream" \
 # generation step here.
 
 echo "[agent-test] test D: opencode entrypoint generates correct opencode.json from env"
-D_OUT="$(docker run --rm \
+D_OUT="$(harness_docker run --rm \
     -e OLLAMA_AGENT_MODEL=test-name \
     -e HARNESS_TEST_MODE=1 \
     --entrypoint /bin/bash \

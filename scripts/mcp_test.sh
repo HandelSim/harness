@@ -21,6 +21,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Cross-platform helpers (harness_docker, harness_docker_path).
+# shellcheck source=lib/platform.sh
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
 PROJECT_NAME="harness-mcp-test"
 
 echo "============================================================"
@@ -70,7 +74,7 @@ cleanup() {
 
     if [[ -d "${TEST_ROOT}" ]]; then
         if ! rm -rf "${TEST_ROOT}" 2>/dev/null; then
-            docker run --rm -v "${TEST_ROOT}:/target" --user 0:0 alpine \
+            harness_docker run --rm -v "$(harness_docker_path "${TEST_ROOT}"):/target" --user 0:0 alpine \
                 sh -c 'rm -rf /target/* /target/.[!.]* 2>/dev/null || true' \
                 >/dev/null 2>&1 || true
             rm -rf "${TEST_ROOT}" 2>/dev/null || true
@@ -110,7 +114,10 @@ files.pythonhosted.org
 registry.npmjs.org
 placeholder.invalid
 EOF
-export HARNESS_ALLOWLIST_PATH="${ALLOWLIST_FILE}"
+# Convert host path for Docker Desktop's WSL2 backend (Windows). On Linux
+# this is a passthrough; on Windows /tmp/... and /c/... are rewritten to
+# C:/... so the bind mount actually exposes the file inside the container.
+export HARNESS_ALLOWLIST_PATH="$(harness_docker_path "${ALLOWLIST_FILE}")"
 
 # --- fake MCP fixture -------------------------------------------------------
 #

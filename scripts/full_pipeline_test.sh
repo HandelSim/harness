@@ -31,6 +31,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Cross-platform helpers (harness_docker, harness_docker_path).
+# shellcheck source=lib/platform.sh
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
 # shellcheck source=lib/tui_driver.sh
 source "${SCRIPT_DIR}/lib/tui_driver.sh"
 
@@ -116,7 +120,7 @@ cleanup() {
     for d in "${TEST_ROOT}" "${FAKE_HOME}" "${TEST_WORKSPACE}"; do
         if [[ -d "$d" ]]; then
             if ! rm -rf "$d" 2>/dev/null; then
-                docker run --rm -v "$d:/target" --user 0:0 alpine \
+                harness_docker run --rm -v "$(harness_docker_path "$d"):/target" --user 0:0 alpine \
                     sh -c 'rm -rf /target/* /target/.[!.]* 2>/dev/null || true' \
                     >/dev/null 2>&1 || true
                 rm -rf "$d" 2>/dev/null || true
@@ -300,12 +304,13 @@ echo "[pipeline] T5 OK"
 # `docker run -d` it with --network and --network-alias.
 
 echo "[pipeline] T6: launch mockupstream on ${NETWORK}"
-docker run -d \
+mock_py_host=$(harness_docker_path "${REPO_ROOT}/scripts/mock_upstream.py")
+harness_docker run -d \
     --name "${MOCK_NAME}" \
     --network "${NETWORK}" \
     --network-alias mockupstream \
     -e MOCK_SCENARIO=text \
-    -v "${REPO_ROOT}/scripts/mock_upstream.py:/app/mock_upstream.py:ro" \
+    -v "${mock_py_host}:/app/mock_upstream.py:ro" \
     -w /app \
     python:3.12-slim \
     sh -c 'pip install --quiet --no-cache-dir flask==3.0.3 && python /app/mock_upstream.py' \
@@ -318,7 +323,7 @@ ollama_cid=$(docker compose --project-name "${PROJECT_NAME}" \
     ps -q ollama)
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    if docker exec "${ollama_cid}" curl -sf http://mockupstream:9000/health >/dev/null 2>&1; then
+    if harness_docker exec "${ollama_cid}" curl -sf http://mockupstream:9000/health >/dev/null 2>&1; then
         break
     fi
     if (( $(date +%s) >= deadline )); then
@@ -438,7 +443,10 @@ echo "[pipeline] T11: tmux send-keys / capture-pane (via tui_driver.sh)"
 #   -v <install-root>/.harness-allowlist:/etc/harness/allowlist:ro
 # harness-install.sh has already seeded ${TEST_ROOT}/.harness-allowlist from the
 # bundled .harness-allowlist.example (T1).
-docker run -d \
+workspace_host=$(harness_docker_path "${TEST_WORKSPACE}")
+agent_home_host=$(harness_docker_path "${TEST_ROOT}/harness/state/agent/claude")
+allowlist_host=$(harness_docker_path "${TEST_ROOT}/.harness-allowlist")
+harness_docker run -d \
     --name "${TMUX_AGENT_NAME}" \
     --network "${NETWORK}" \
     --user 0:0 \
@@ -451,9 +459,9 @@ docker run -d \
     -e "ANTHROPIC_AUTH_TOKEN=harness-dummy" \
     -e "ANTHROPIC_MODEL=harness" \
     -e "ANTHROPIC_SMALL_FAST_MODEL=harness" \
-    -v "${TEST_WORKSPACE}:/workspace" \
-    -v "${TEST_ROOT}/harness/state/agent/claude:/home/harness" \
-    -v "${TEST_ROOT}/.harness-allowlist:/etc/harness/allowlist:ro" \
+    -v "${workspace_host}:/workspace" \
+    -v "${agent_home_host}:/home/harness" \
+    -v "${allowlist_host}:/etc/harness/allowlist:ro" \
     -w /workspace \
     --label "harness.agent=true" \
     --label "harness.tool=claude" \
@@ -467,7 +475,7 @@ docker run -d \
 # need a one-shot has-session probe with a deadline, so we spell it out.
 deadline=$(( $(date +%s) + 30 ))
 while true; do
-    if docker exec --user harness "${TMUX_AGENT_NAME}" tmux has-session -t harness-agent 2>/dev/null; then
+    if harness_docker exec --user harness "${TMUX_AGENT_NAME}" tmux has-session -t harness-agent 2>/dev/null; then
         break
     fi
     if [[ -z "$(docker ps -q -f "name=^${TMUX_AGENT_NAME}$" 2>/dev/null)" ]]; then
@@ -728,6 +736,13 @@ echo "[pipeline] T16 OK"
 # --- T13: harness down ------------------------------------------------------
 
 echo "[pipeline] T13: harness down"
+# Tear down the manually-started mockupstream sidecar first. It joined
+# harness-net via `docker run -d --network` but compose has no record of
+# it, so `compose down` would fail to remove the network ("active
+# endpoints"). On Linux this used to succeed silently because the
+# orphan didn't gate exit code; on Windows Docker Desktop the whole
+# `compose down` returns non-zero when the network removal errors.
+docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
 harness_call down >/dev/null
 
 remaining=$(docker compose --project-name "${PROJECT_NAME}" \

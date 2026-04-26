@@ -75,7 +75,12 @@ test_generate_env "$ENV_POS"
 test_generate_mockupstream_override "$OVERRIDE_POS"
 test_generate_allowlist "$ALLOW_POS"
 
-export HARNESS_ALLOWLIST_PATH="$ALLOW_POS"
+# Convert host path to a form Docker Desktop's WSL2 backend mounts reliably.
+# On Linux this is a passthrough; on Windows /tmp/... is rewritten to
+# C:/Users/<u>/AppData/Local/Temp/... — without this rewrite the bind
+# mount silently produces an empty /etc/harness/allowlist inside the
+# container, which the firewall init script treats as fatal.
+export HARNESS_ALLOWLIST_PATH="$(harness_docker_path "$ALLOW_POS")"
 
 cleanup_pos() {
     test_cleanup "$PROJECT_POS" "$ENV_POS" "$OVERRIDE_POS" "$ALLOW_POS"
@@ -119,26 +124,26 @@ assert_firewall_in() {
     echo "[fw] checking $svc ($cid)"
 
     # Allowlist must be bind-mounted.
-    if ! docker exec "$cid" test -f /etc/harness/allowlist; then
+    if ! harness_docker exec "$cid" test -f /etc/harness/allowlist; then
         echo "[fw] FAIL: $svc has no /etc/harness/allowlist" >&2
         exit 1
     fi
 
     # iptables default OUTPUT policy must be DROP.
     local pol
-    pol=$(docker exec "$cid" iptables -S OUTPUT 2>/dev/null | head -n 1 || true)
+    pol=$(harness_docker exec "$cid" iptables -S OUTPUT 2>/dev/null | head -n 1 || true)
     if ! grep -q '^-P OUTPUT DROP' <<<"$pol"; then
         echo "[fw] FAIL: $svc OUTPUT policy is not DROP (got: $pol)" >&2
-        docker exec "$cid" iptables -S OUTPUT >&2 || true
+        harness_docker exec "$cid" iptables -S OUTPUT >&2 || true
         exit 1
     fi
 
     # ipset must exist and contain at least one entry (allowlist hosts resolved).
     local ipset_count
-    ipset_count=$(docker exec "$cid" sh -c 'ipset list allowed-domains 2>/dev/null | awk "/^Number of entries:/ {print \$4}"' || true)
+    ipset_count=$(harness_docker exec "$cid" sh -c 'ipset list allowed-domains 2>/dev/null | awk "/^Number of entries:/ {print \$4}"' || true)
     if [[ -z "$ipset_count" ]]; then
         echo "[fw] FAIL: $svc has no 'allowed-domains' ipset" >&2
-        docker exec "$cid" ipset list >&2 || true
+        harness_docker exec "$cid" ipset list >&2 || true
         exit 1
     fi
     if (( ipset_count < 1 )); then
@@ -150,7 +155,7 @@ assert_firewall_in() {
     # Negative: example.com must NOT be reachable from inside the container.
     # Use a 5s connect timeout so the failure is fast. We expect rc != 0.
     set +e
-    docker exec "$cid" curl --connect-timeout 5 -s -o /dev/null https://example.com
+    harness_docker exec "$cid" curl --connect-timeout 5 -s -o /dev/null https://example.com
     local curl_rc=$?
     set -e
     if (( curl_rc == 0 )); then
@@ -191,7 +196,8 @@ test_generate_mockupstream_override "$OVERRIDE_NEG"
 # Allowlist deliberately omits blocked.example.com.
 test_generate_allowlist "$ALLOW_NEG"
 
-export HARNESS_ALLOWLIST_PATH="$ALLOW_NEG"
+# See Phase 1 setup for the harness_docker_path rationale.
+export HARNESS_ALLOWLIST_PATH="$(harness_docker_path "$ALLOW_NEG")"
 
 cleanup_neg() {
     test_cleanup "$PROJECT_NEG" "$ENV_NEG" "$OVERRIDE_NEG" "$ALLOW_NEG"
@@ -284,7 +290,8 @@ services:
       HARNESS_FIREWALL_DISABLED: "1"
 EOF
 test_generate_allowlist "$ALLOW_BYP"
-export HARNESS_ALLOWLIST_PATH="$ALLOW_BYP"
+# See Phase 1 setup for the harness_docker_path rationale.
+export HARNESS_ALLOWLIST_PATH="$(harness_docker_path "$ALLOW_BYP")"
 
 cleanup_byp() {
     test_cleanup "$PROJECT_BYP" "$ENV_BYP" "$OVERRIDE_BYP" "$ALLOW_BYP" "$BYPASS_ENV_FILE"
@@ -322,7 +329,7 @@ fi
 
 # Inside proxy, OUTPUT policy must NOT be DROP (we never applied rules).
 proxy_cid=$("${COMPOSE_BYP[@]}" ps -q proxy)
-pol=$(docker exec "$proxy_cid" iptables -S OUTPUT 2>/dev/null | head -n 1 || true)
+pol=$(harness_docker exec "$proxy_cid" iptables -S OUTPUT 2>/dev/null | head -n 1 || true)
 if grep -q '^-P OUTPUT DROP' <<<"$pol"; then
     echo "[fw] FAIL: proxy OUTPUT policy is DROP despite bypass (got: $pol)" >&2
     exit 1
@@ -331,7 +338,7 @@ echo "[fw]   proxy OUTPUT policy: $pol (expected ACCEPT)"
 
 # example.com must be reachable from inside proxy (firewall is off).
 set +e
-docker exec "$proxy_cid" curl --connect-timeout 5 -s -o /dev/null https://example.com
+harness_docker exec "$proxy_cid" curl --connect-timeout 5 -s -o /dev/null https://example.com
 curl_rc=$?
 set -e
 # The host network may or may not be allowed to dial out — accept any non-
@@ -352,10 +359,10 @@ fi
 # Other services (ollama) must STILL have the firewall applied — bypass is
 # per-service via the env var, not project-wide.
 ollama_cid=$("${COMPOSE_BYP[@]}" ps -q ollama)
-opol=$(docker exec "$ollama_cid" iptables -S OUTPUT 2>/dev/null | head -n 1 || true)
+opol=$(harness_docker exec "$ollama_cid" iptables -S OUTPUT 2>/dev/null | head -n 1 || true)
 if ! grep -q '^-P OUTPUT DROP' <<<"$opol"; then
     echo "[fw] FAIL: ollama OUTPUT policy is NOT DROP (bypass leaked across services?)" >&2
-    docker exec "$ollama_cid" iptables -S OUTPUT >&2 || true
+    harness_docker exec "$ollama_cid" iptables -S OUTPUT >&2 || true
     exit 1
 fi
 echo "[fw]   ollama OUTPUT policy: $opol (firewall still applied — good)"

@@ -498,11 +498,19 @@ upgrade_json_merge() {
     # path-set. A path is "added" if it exists in merged but not in target.
     # Each path is rendered as a jq-style accessor (`.foo.bar[3]`) for
     # human readability in the summary.
+    #
+    # Use a real temp file rather than process substitution: native Windows
+    # jq.exe cannot read MSYS-style /proc/<pid>/fd/<n> paths produced by
+    # bash's <(...) syntax. The temp-file form works on every platform.
+    local merged_tmp
+    merged_tmp="$target.merged.$$"
+    printf '%s\n' "$merged" >"$merged_tmp"
     local added_paths
-    added_paths=$(jq --slurpfile m <(printf '%s\n' "$merged") '
+    added_paths=$(jq --slurpfile m "$merged_tmp" '
         def fmt: map(if type == "number" then "[\(.)]" else "." + . end) | join("");
         ($m[0] | [paths]) - [paths] | map(fmt)
     ' "$target" 2>/dev/null || echo '[]')
+    rm -f "$merged_tmp"
 
     if [[ "$added_paths" == "[]" || -z "$added_paths" ]]; then
         printf '{"action":"json_merge","added_paths":[],"target":%s}\n' \

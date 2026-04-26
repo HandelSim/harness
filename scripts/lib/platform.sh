@@ -75,6 +75,80 @@ harness_normalize_path() {
     echo "$p"
 }
 
+# === Docker invocation wrappers ===
+#
+# Git Bash on Windows (MSYS) auto-translates UNIX-style paths in arguments
+# when calling native Windows binaries like docker.exe. That is fine for
+# host paths (/c/Users/foo becomes C:\Users\foo, which docker can mount)
+# but breaks for *container-internal* arguments like `--entrypoint /bin/bash`
+# (which gets mangled to C:/Program Files/Git/usr/bin/bash, a path that
+# doesn't exist inside the container).
+#
+# harness_docker wraps the docker call with MSYS_NO_PATHCONV=1 on Windows
+# so that no path translation happens. Use this any time docker args
+# include an in-container UNIX path. On Linux/macOS this is a transparent
+# passthrough.
+#
+# Usage: harness_docker [docker-args...]
+# Example: harness_docker run --rm --entrypoint /bin/bash my-image -c 'echo hi'
+harness_docker() {
+    if [[ "$(harness_detect_os)" == "windows" ]]; then
+        MSYS_NO_PATHCONV=1 docker "$@"
+    else
+        docker "$@"
+    fi
+}
+
+# Same as harness_docker but `exec`s into the docker process instead of
+# returning. Use this in the final exec sites of the harness CLI
+# (run_agent_print's foreground launch, attach paths, etc.) so that
+# signals and exit codes flow through cleanly. `exec harness_docker ...`
+# does not work because `exec` requires an external program, not a shell
+# function — calling this helper instead preserves exec semantics by
+# wrapping `env MSYS_NO_PATHCONV=1 docker` into the exec'd process on
+# Windows.
+harness_docker_exec() {
+    if [[ "$(harness_detect_os)" == "windows" ]]; then
+        exec env MSYS_NO_PATHCONV=1 docker "$@"
+    else
+        exec docker "$@"
+    fi
+}
+
+# Convert a host path to a form Docker Desktop accepts reliably for bind
+# mounts. On Linux/macOS this is a passthrough.
+#
+# On Windows: Docker Desktop's WSL2 backend handles `C:/Users/...` and
+# `/c/Users/...` for paths under the user profile, but `/tmp/...` (a
+# Git Bash MSYS-only mount that points at C:\Users\<u>\AppData\Local\Temp)
+# is not visible from outside Git Bash and bind mounts of those paths
+# silently produce empty mounts. cygpath -m resolves any of those to the
+# canonical mixed (forward-slash) Windows form.
+#
+# Args: <path>
+# Echoes the converted path on stdout.
+harness_docker_path() {
+    local p="$1"
+    if [[ "$(harness_detect_os)" != "windows" ]]; then
+        echo "$p"
+        return 0
+    fi
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$p"
+        return $?
+    fi
+    # Fallback when cygpath is unavailable: normalize /c/Users/... → C:/Users/...
+    local abs
+    abs=$(harness_realpath "$p" 2>/dev/null || echo "$p")
+    if [[ "$abs" =~ ^/([a-zA-Z])/(.*)$ ]]; then
+        local drive="${BASH_REMATCH[1]^^}"
+        local rest="${BASH_REMATCH[2]}"
+        echo "${drive}:/${rest}"
+    else
+        echo "$abs"
+    fi
+}
+
 # === Docker checks ===
 
 # Is the docker daemon running and accepting connections?

@@ -28,6 +28,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Cross-platform helpers (harness_docker, harness_docker_path).
+# shellcheck source=lib/platform.sh
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
 PROJECT_NAME="harness-persist-test"
 
 echo "============================================================"
@@ -62,7 +66,7 @@ cleanup() {
     # privileged docker rm -rf as a fallback.
     if [[ -d "${TEST_ROOT}" ]]; then
         if ! rm -rf "${TEST_ROOT}" 2>/dev/null; then
-            docker run --rm -v "${TEST_ROOT}:/target" --user 0:0 alpine \
+            harness_docker run --rm -v "$(harness_docker_path "${TEST_ROOT}"):/target" --user 0:0 alpine \
                 sh -c 'rm -rf /target/* /target/.[!.]* 2>/dev/null || true' \
                 >/dev/null 2>&1 || true
             rm -rf "${TEST_ROOT}" 2>/dev/null || true
@@ -105,9 +109,11 @@ fi
 # requires ANTHROPIC_BASE_URL. Bypassing keeps the test focused.
 run_in_agent() {
     local cmd="$1"
-    docker run --rm \
+    local agent_home_host
+    agent_home_host=$(harness_docker_path "${AGENT_HOME}")
+    harness_docker run --rm \
         --label "harness-persist-test=1" \
-        -v "${AGENT_HOME}:/home/harness" \
+        -v "${agent_home_host}:/home/harness" \
         --entrypoint /bin/bash \
         --user harness \
         -e HOME=/home/harness \
@@ -251,9 +257,10 @@ fi
 echo "[persist] T4: ccstatusline default seed"
 T4_HOME="${TEST_ROOT}/agent/claude-t4"
 mkdir -p "${T4_HOME}"
-docker run --rm \
+T4_HOME_HOST=$(harness_docker_path "${T4_HOME}")
+harness_docker run --rm \
     --label "harness-persist-test=1" \
-    -v "${T4_HOME}:/home/harness" \
+    -v "${T4_HOME_HOST}:/home/harness" \
     --entrypoint /bin/bash \
     --user harness \
     -e HOME=/home/harness \
@@ -285,9 +292,9 @@ fi
 # the marker preserved (cp -an should not clobber).
 cp "${settings_json}" "${settings_json}.bak"
 echo '{"version": 3, "lines": [[{"id":"x","type":"separator"}],[],[]], "_user_marker": true}' >"${settings_json}"
-docker run --rm \
+harness_docker run --rm \
     --label "harness-persist-test=1" \
-    -v "${T4_HOME}:/home/harness" \
+    -v "${T4_HOME_HOST}:/home/harness" \
     --entrypoint /bin/bash \
     --user harness \
     -e HOME=/home/harness \
@@ -322,9 +329,10 @@ echo "[persist] T4 OK"
 echo "[persist] T5: claude settings.json statusLine block"
 T5_HOME="${TEST_ROOT}/agent/claude-t5"
 mkdir -p "${T5_HOME}"
-docker run --rm \
+T5_HOME_HOST=$(harness_docker_path "${T5_HOME}")
+harness_docker run --rm \
     --label "harness-persist-test=1" \
-    -v "${T5_HOME}:/home/harness" \
+    -v "${T5_HOME_HOST}:/home/harness" \
     --entrypoint /bin/bash \
     --user harness \
     -e HOME=/home/harness \

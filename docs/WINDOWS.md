@@ -22,6 +22,64 @@ harness supports Windows via Git Bash. PowerShell and cmd are not supported.
 10. Run `harness preflight` to validate configuration.
 11. Run `harness start`.
 
+## How harness handles paths on Windows
+
+Git Bash on Windows uses MSYS, which auto-converts UNIX-style paths in
+arguments when calling native Windows binaries like `docker.exe`. This is
+useful for host-side paths (`/c/Users/foo/file` → `C:\Users\foo\file` so
+Docker can find them) but breaks for *container-internal* arguments like
+`--entrypoint /bin/bash` (which gets mangled to
+`C:/Program Files/Git/usr/bin/bash`, a host path that has nothing to do
+with the container).
+
+harness handles this in two ways, both via helpers in
+`scripts/lib/platform.sh`:
+
+1. **`harness_docker` wraps `docker` invocations with `MSYS_NO_PATHCONV=1`
+   on Windows.** This tells MSYS to skip path translation for that one
+   call, so container-internal paths like `/bin/bash`, `/etc/harness/allowlist`,
+   or `/workspace` reach Docker untouched. On Linux/macOS the wrapper is
+   a transparent passthrough — same call, no env var.
+
+2. **`harness_docker_path` normalizes host paths for bind-mount sources.**
+   Docker Desktop's WSL2 backend reliably handles `C:/Users/...` form
+   paths. Raw `/tmp/...` (a Git Bash MSYS-only mount) is not visible
+   from outside Git Bash and bind mounts of those paths silently produce
+   empty mounts. The helper uses `cygpath -m` to convert any host path
+   to the canonical mixed-form Windows path. On Linux/macOS it's a
+   passthrough.
+
+Inside the harness CLI and test scripts, `-v "$src:/dst"` is always
+written `-v "$(harness_docker_path $src):/dst"` so the host side is
+normalized; the container side is left alone (and `harness_docker` keeps
+MSYS from rewriting it).
+
+A third helper, `harness_docker_exec`, exists for sites that previously
+called `exec docker ...` (run_agent_print, attach paths, the
+ccstatusline configurator). It preserves exec semantics while applying
+the Windows env-var wrap, since shell functions cannot themselves be
+exec'd.
+
+## jq compatibility
+
+The harness upgrade machinery uses `jq` to merge JSON config files
+(envfile_merge, json_merge). Earlier versions used bash process
+substitution — `<(printf '%s\n' "$merged")` — to feed jq the in-memory
+merged result, but the **Windows-native `jq.exe`** (e.g., from
+Chocolatey, Scoop, or downloaded direct from github.com/jqlang) cannot
+read the MSYS-style `/proc/<pid>/fd/<n>` paths that `<(...)` produces.
+The MSYS-native jq (installed via `pacman -S jq` in Git Bash) handles
+them correctly, but most users only have the native jq.exe installed.
+
+Phase 12 refactored every such site to use a real temp file instead.
+The temp-file form works on every platform with no jq variant
+distinction. If you encounter a jq error involving `/proc/...` paths in
+older harness versions, the workaround is:
+
+```bash
+pacman -S jq    # install MSYS-native jq into Git Bash
+```
+
 ## How harness handles line endings on Windows
 
 The repo includes a `.gitattributes` file that forces LF line endings on shell scripts and config files, regardless of your `core.autocrlf` setting. You don't need to change git config.
