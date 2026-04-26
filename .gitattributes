@@ -1,0 +1,38 @@
+# Repo-level line-ending control.
+# All shell scripts and config files must use LF line endings regardless of
+# the user's git core.autocrlf setting. Required for bash scripts to be
+# runnable on Windows via Git Bash.
+
+# Default: text files normalized to LF in the repo, kept as LF on checkout
+* text eol=lf
+
+# Shell scripts: explicitly LF, no exceptions
+*.sh text eol=lf
+*.bash text eol=lf
+
+# The harness management script (no extension)
+harness text eol=lf
+
+# Configuration files
+*.example text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+.env.example text eol=lf
+.harness-allowlist.example text eol=lf
+
+# YAML / JSON / Markdown — LF
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# Python source — LF (also for Linux container build)
+*.py text eol=lf
+
+# Dockerfiles — LF
+Dockerfile text eol=lf
+
+# Binary files — never touch
+*.png binary
+*.jpg binary
+*.zip binary
