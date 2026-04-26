@@ -18,6 +18,8 @@ __pycache__/
 .DS_Store
 *.swp
 *.swo
+# Windows / Git Bash crash dumps
+*.stackdump
 
 # Local Claude Code state (lock files for skill scheduling, etc.)
 .claude/

@@ -21,11 +21,13 @@ configured upstream.
 3. Run: `bash harness-install.sh`
 4. Follow the prompts. The installer clones the harness repo into `./harness/`
    (which IS the install root), moves your edited `.env` into it, and
-   (with your permission) symlinks the `harness` command into
-   `~/.local/bin/`.
+   (with your permission) installs a `harness` wrapper script into
+   `~/.local/bin/`. (Wrapper, not symlink — works on Windows without
+   Developer Mode.)
 5. Open a new terminal if the installer modified your shell's PATH.
-6. Run: `harness start`
-7. `cd` into any project directory and run: `harness claude` (or
+6. Run: `harness preflight` to validate your config.
+7. Run: `harness start`
+8. `cd` into any project directory and run: `harness claude` (or
    `harness opencode`).
 
 ## Requirements
@@ -34,6 +36,21 @@ configured upstream.
 - `docker` (engine running)
 - `docker compose` v2 (the `docker compose` subcommand, not the legacy
   `docker-compose` binary)
+- Linux or Windows. On Windows, Git Bash + Docker Desktop are required
+  (PowerShell and cmd are not supported). See `docs/WINDOWS.md` after
+  install for setup details.
+
+## Preflight
+
+After install, validate your configuration before bringing services up:
+
+```
+harness preflight
+```
+
+This checks the docker daemon, .env required vars, and that
+`PROXY_API_URL`'s hostname is in `.harness-allowlist`. On Windows / macOS
+the preflight can auto-start Docker Desktop if it isn't running.
 
 ## Updating
 

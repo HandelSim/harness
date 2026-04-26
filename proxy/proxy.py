@@ -116,6 +116,10 @@ def format_tools_to_text(tools_array):
 
 
 def build_cooperative_prompt_user(original_content, tools_text):
+    # Marker delimiters around the user content rather than bare quotes —
+    # if the user's prompt itself contains quotation marks (or code that
+    # uses them), bare quotes confuse the model about where the original
+    # request ends. The <<<BEGIN/END_USER_REQUEST>>> markers are unambiguous.
     return f"""You are a helpful and intelligent AI assistant.
 
 ### Tool Usage Instructions
@@ -132,7 +136,9 @@ You may explain your thought process before or after the JSON block. If NO tools
 {tools_text}
 
 ### User Request
-"{original_content}"
+<<<BEGIN_USER_REQUEST>>>
+{original_content}
+<<<END_USER_REQUEST>>>
 """
 
 
@@ -153,7 +159,9 @@ You may explain your reasoning before or after the JSON block. If the task is fu
 {tools_text}
 
 ### Latest System Observation
-"{original_content}"
+<<<BEGIN_OBSERVATION>>>
+{original_content}
+<<<END_OBSERVATION>>>
 """
 
 
@@ -197,7 +205,14 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
         content = msg.get("content", "") or ""
 
         if role == "system":
-            messages.append({"role": "system", "content": content})
+            # Coalesce consecutive system messages into one. Some clients
+            # (and our own injection paths) emit multiple system blocks back-
+            # to-back; the upstream API treats those as separate turns and
+            # may give them less weight than a single combined block.
+            if messages and messages[-1]["role"] == "system":
+                messages[-1]["content"] += f"\n\n{content}"
+            else:
+                messages.append({"role": "system", "content": content})
 
         elif role == "user":
             if messages and messages[-1]["role"] == "user":

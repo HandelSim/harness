@@ -217,6 +217,20 @@ End users do not clone this repo. They install via the distribution zip,
 which ships `harness-install.sh`, a pre-filled `.env`, and a quick-start README.
 See `zip-readme.md` for the user-facing instructions.
 
+The installer runs a **preflight check** before any prompts (git, docker,
+docker compose v2, daemon reachability, disk space, write access). On
+Windows and macOS, the preflight will attempt to auto-start Docker Desktop
+if it isn't running. After install, `harness preflight` re-runs a similar
+set of checks plus configuration validation (.env, allowlist, hostname
+alignment) — run it after editing `.env` to catch issues before
+`harness start`.
+
+### Windows
+
+harness runs on Windows via Git Bash (Git for Windows + Docker Desktop).
+PowerShell and cmd are not supported. See `docs/WINDOWS.md` for setup,
+limitations, and troubleshooting.
+
 To build the distribution zip from the current repo state:
 
 ```

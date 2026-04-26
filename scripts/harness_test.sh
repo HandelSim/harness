@@ -851,6 +851,192 @@ fi
 rm -rf "${UPG18_ROOT}"
 echo "[harness-test] T18 OK"
 
+# --- Test 19: platform.sh helpers (sourced) --------------------------------
+
+echo "[harness-test] T19: platform.sh helpers"
+
+# Source the library directly. All helpers are pure functions that touch
+# the filesystem / docker daemon at most read-only.
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
+# OS detection returns a known value.
+os=$(harness_detect_os)
+case "${os}" in
+    linux|macos|windows|unknown) ;;
+    *)
+        echo "[harness-test] T19 FAIL: harness_detect_os returned unexpected value: ${os}" >&2
+        exit 1
+        ;;
+esac
+
+# realpath resolves an existing file.
+tmpfile=$(mktemp)
+resolved=$(harness_realpath "${tmpfile}")
+if [[ -z "${resolved}" ]]; then
+    echo "[harness-test] T19 FAIL: harness_realpath returned empty" >&2
+    rm -f "${tmpfile}"; exit 1
+fi
+rm -f "${tmpfile}"
+
+# normalize_path collapses double slashes and converts backslashes.
+norm=$(harness_normalize_path "/foo//bar")
+if [[ "${norm}" != "/foo/bar" ]]; then
+    echo "[harness-test] T19 FAIL: normalize_path didn't collapse double slash: ${norm}" >&2
+    exit 1
+fi
+norm_bs=$(harness_normalize_path 'C:\Users\foo')
+if [[ "${norm_bs}" != "C:/Users/foo" ]]; then
+    echo "[harness-test] T19 FAIL: normalize_path didn't convert backslash: ${norm_bs}" >&2
+    exit 1
+fi
+
+# docker_running reflects actual state — we already know the daemon is up
+# from the preflight at the top of this test file.
+if ! harness_docker_running; then
+    echo "[harness-test] T19 FAIL: harness_docker_running false but daemon is up" >&2
+    exit 1
+fi
+
+# check_command finds bash.
+if ! harness_check_command bash "bash shell" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: harness_check_command bash failed" >&2
+    exit 1
+fi
+
+# check_command rejects a nonsense binary.
+if harness_check_command __nonexistent_cmd_xyz__ "fake binary" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: harness_check_command should reject fake command" >&2
+    exit 1
+fi
+
+# check_env_var: required-and-empty fails, optional-and-empty passes.
+unset _HARNESS_TEST_VAR_PROBE
+if harness_check_env_var _HARNESS_TEST_VAR_PROBE true "test" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: required-empty env var should have failed" >&2
+    exit 1
+fi
+if ! harness_check_env_var _HARNESS_TEST_VAR_PROBE false "test" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: optional-empty env var should have passed" >&2
+    exit 1
+fi
+export _HARNESS_TEST_VAR_PROBE=value
+if ! harness_check_env_var _HARNESS_TEST_VAR_PROBE true "test" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: set required env var should have passed" >&2
+    exit 1
+fi
+unset _HARNESS_TEST_VAR_PROBE
+
+# check_file_exists distinguishes required vs optional and present vs absent.
+exist_tmp=$(mktemp)
+if ! harness_check_file_exists "${exist_tmp}" true "exists" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: required-existing file should have passed" >&2
+    rm -f "${exist_tmp}"; exit 1
+fi
+rm -f "${exist_tmp}"
+if harness_check_file_exists "${exist_tmp}" true "absent" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: required-missing file should have failed" >&2
+    exit 1
+fi
+if ! harness_check_file_exists "${exist_tmp}" false "absent-optional" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: optional-missing file should have passed" >&2
+    exit 1
+fi
+
+# check_dir_writable on a known-writable temp dir.
+tmpdir=$(mktemp -d)
+if ! harness_check_dir_writable "${tmpdir}" true "writable" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: writable dir should have passed" >&2
+    rmdir "${tmpdir}"; exit 1
+fi
+rmdir "${tmpdir}"
+
+# check_disk_space — passing 0 MB always succeeds.
+if ! harness_check_disk_space "${REPO_ROOT}" 0 "any disk space" 2>/dev/null; then
+    echo "[harness-test] T19 FAIL: 0MB requirement should always pass" >&2
+    exit 1
+fi
+echo "[harness-test] T19 OK"
+
+# --- Test 20: harness preflight command ------------------------------------
+#
+# Smoke the command end-to-end against the test install root. .env and
+# allowlist are seeded with placeholder-but-non-empty values so all
+# required-vars checks pass; the daemon is up; we expect rc=0.
+
+echo "[harness-test] T20: harness preflight (config valid)"
+set +e
+preflight_out=$("${HARNESS_BIN}" preflight 2>&1)
+preflight_rc=$?
+set -e
+if (( preflight_rc != 0 )); then
+    echo "[harness-test] T20 FAIL: preflight rc=${preflight_rc} with valid config" >&2
+    echo "${preflight_out}" >&2; exit 1
+fi
+if ! grep -q 'all checks passed' <<<"${preflight_out}"; then
+    echo "[harness-test] T20 FAIL: preflight didn't print 'all checks passed'" >&2
+    echo "${preflight_out}" >&2; exit 1
+fi
+for needle in 'PROXY_API_URL is set' 'PROXY_API_KEY is set' 'PROXY_API_MODEL is set' 'docker daemon'; do
+    if ! grep -q "${needle}" <<<"${preflight_out}"; then
+        echo "[harness-test] T20 FAIL: preflight missing line: ${needle}" >&2
+        echo "${preflight_out}" >&2; exit 1
+    fi
+done
+echo "[harness-test] T20 OK"
+
+# --- Test 21: harness preflight catches missing config ---------------------
+#
+# Move the .env aside so preflight reports it missing and returns 1.
+
+echo "[harness-test] T21: harness preflight detects missing .env"
+mv "${TEST_ROOT}/.env" "${TEST_ROOT}/.env.stash"
+set +e
+pf_miss_out=$("${HARNESS_BIN}" preflight 2>&1)
+pf_miss_rc=$?
+set -e
+mv "${TEST_ROOT}/.env.stash" "${TEST_ROOT}/.env"
+if (( pf_miss_rc == 0 )); then
+    echo "[harness-test] T21 FAIL: preflight unexpectedly passed with missing .env" >&2
+    echo "${pf_miss_out}" >&2; exit 1
+fi
+if ! grep -q '\.env config file' <<<"${pf_miss_out}"; then
+    echo "[harness-test] T21 FAIL: preflight didn't mention .env" >&2
+    echo "${pf_miss_out}" >&2; exit 1
+fi
+if ! grep -q '✗' <<<"${pf_miss_out}"; then
+    echo "[harness-test] T21 FAIL: preflight missing failure marker" >&2
+    echo "${pf_miss_out}" >&2; exit 1
+fi
+echo "[harness-test] T21 OK"
+
+# --- Test 22: harness preflight catches allowlist hostname mismatch --------
+#
+# Edit .env so PROXY_API_URL points at a host that's not in the allowlist.
+# Preflight should report the mismatch and suggest `harness net allow`.
+
+echo "[harness-test] T22: harness preflight detects allowlist mismatch"
+cp "${TEST_ROOT}/.env" "${TEST_ROOT}/.env.stash22"
+sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=https://not-in-allowlist.example.org/v1|' "${TEST_ROOT}/.env"
+set +e
+pf_mm_out=$("${HARNESS_BIN}" preflight 2>&1)
+pf_mm_rc=$?
+set -e
+mv "${TEST_ROOT}/.env.stash22" "${TEST_ROOT}/.env"
+if (( pf_mm_rc == 0 )); then
+    echo "[harness-test] T22 FAIL: preflight unexpectedly passed with bad hostname" >&2
+    echo "${pf_mm_out}" >&2; exit 1
+fi
+if ! grep -q 'not-in-allowlist.example.org' <<<"${pf_mm_out}"; then
+    echo "[harness-test] T22 FAIL: preflight didn't flag the bad hostname" >&2
+    echo "${pf_mm_out}" >&2; exit 1
+fi
+if ! grep -q 'harness net allow' <<<"${pf_mm_out}"; then
+    echo "[harness-test] T22 FAIL: preflight didn't suggest 'net allow' fix" >&2
+    echo "${pf_mm_out}" >&2; exit 1
+fi
+echo "[harness-test] T22 OK"
+
 echo "============================================================"
 echo " HARNESS TEST PASSED"
 echo "============================================================"

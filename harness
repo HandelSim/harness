@@ -29,13 +29,30 @@ set -euo pipefail
 
 # --- self-locate ------------------------------------------------------------
 #
-# In production we resolve $0 through any symlinks (~/.local/bin/harness ->
-# <install-root>/harness) to find the install root, which is also the git
-# clone. Tests can override via HARNESS_INSTALL_ROOT — useful when the test
-# layout uses symlinks that would otherwise collapse dirname into the real
-# repo path.
+# In production we resolve $0 through any wrapper or symlink
+# (~/.local/bin/harness -> <install-root>/harness) to find the install root,
+# which is also the git clone. The wrapper script installed by harness-
+# install.sh exec's into this script, so $0 here resolves to the real
+# install-root path. Tests can override via HARNESS_INSTALL_ROOT — useful
+# when the test layout uses symlinks that would otherwise collapse dirname
+# into the real repo path.
+#
+# We use a portable resolver here rather than depending on `realpath` so
+# the script also works on Windows Git Bash and on minimal images where
+# realpath isn't installed. The full equivalent lives in
+# scripts/lib/platform.sh:harness_realpath; the helper sourced below.
 
-real_self=$(realpath "$0")
+_self_path() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$1"
+    elif command -v readlink >/dev/null 2>&1 && readlink -f "$1" >/dev/null 2>&1; then
+        readlink -f "$1"
+    else
+        cd "$(dirname "$1")" && echo "$(pwd -P)/$(basename "$1")"
+    fi
+}
+
+real_self=$(_self_path "$0")
 # clone_dir is where the code lives (this script + docker-compose.yml + scripts/).
 # install_root is where the user config (.env, .harness-allowlist) and runtime
 # state (state/) live. In production these are the same directory: install.sh
@@ -44,6 +61,14 @@ real_self=$(realpath "$0")
 # to the real repo (via the script's realpath); without HARNESS_INSTALL_ROOT,
 # install_root falls back to clone_dir and the layout is single-folder.
 clone_dir=$(dirname "$real_self")
+
+# Source the cross-platform helper library so the rest of the script can
+# call harness_detect_os, harness_require_docker, etc. The library is
+# installed alongside this script in scripts/lib/platform.sh.
+if [[ -f "$clone_dir/scripts/lib/platform.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$clone_dir/scripts/lib/platform.sh"
+fi
 install_root="${HARNESS_INSTALL_ROOT:-$clone_dir}"
 state_root="$install_root/state"
 env_file="$install_root/.env"
@@ -118,10 +143,50 @@ err() {
     echo "harness: $*" >&2
 }
 
-# Fail with require_docker if the daemon isn't reachable.
+# Ensure the docker daemon is reachable; auto-start Docker Desktop on
+# Windows / macOS if we can. Hard exit with a helpful message otherwise.
+# Delegates to platform.sh:harness_require_docker when the library is
+# available; falls back to the original probe-only check if not.
 require_docker() {
+    if declare -f harness_require_docker >/dev/null 2>&1; then
+        harness_require_docker
+        return 0
+    fi
     if ! docker info >/dev/null 2>&1; then
         err "docker daemon is not reachable; is it running?"
+        exit 1
+    fi
+}
+
+# Validate runtime configuration (.env presence, required vars) before
+# bringing services up. Lightweight subset of `harness preflight` so users
+# get a clear error before docker compose churns through a build/up cycle
+# that's destined to fail in the proxy container.
+require_runtime_config() {
+    if [[ ! -f "$env_file" ]]; then
+        err "missing $env_file"
+        err "run 'harness preflight' for details, or recreate from .env.example:"
+        err "  cp $clone_dir/.env.example $env_file"
+        exit 1
+    fi
+
+    local missing=()
+    local v
+    for v in PROXY_API_URL PROXY_API_KEY PROXY_API_MODEL; do
+        local val="${!v:-}"
+        if [[ -z "$val" ]]; then
+            missing+=("$v")
+        fi
+    done
+    if (( ${#missing[@]} > 0 )); then
+        err "required value(s) empty in $env_file: ${missing[*]}"
+        err "edit $env_file and set them, then re-run. See 'harness preflight' for details."
+        exit 1
+    fi
+
+    if [[ ! -f "$allowlist_path" ]]; then
+        err "missing firewall allowlist at $allowlist_path"
+        err "seed it from .harness-allowlist.example, or run 'harness preflight'"
         exit 1
     fi
 }
@@ -377,6 +442,8 @@ commands:
                         overrides (see 'harness net')
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
   doctor                run runtime diagnostics (read-only)
+  preflight             validate config (.env, allowlist, docker daemon)
+                        before running 'harness start'
   help                  show this help
 
 agent flags:
@@ -410,6 +477,7 @@ EOF
 }
 
 cmd_start() {
+    require_runtime_config
     require_docker
     ensure_dirs
     # Stop anything still running from a prior session so up brings a clean
@@ -2630,6 +2698,125 @@ cmd_doctor() {
     return 0
 }
 
+# --- preflight --------------------------------------------------------------
+#
+# Validate the install root before `harness start` would otherwise fail
+# midway with cryptic errors. Reports each check with ✓/✗/⚠ on stderr,
+# returns non-zero if any required check failed. Doctor is the diagnostic
+# for a *running* stack; preflight is for the static state on disk plus
+# the docker daemon.
+
+cmd_preflight() {
+    local errors=0
+    echo "[harness] preflight..."
+
+    # Daemon (with auto-start attempt on Win/Mac via platform.sh)
+    if declare -f harness_docker_running >/dev/null 2>&1 && harness_docker_running; then
+        echo "  ✓ docker daemon"
+    elif declare -f harness_docker_running >/dev/null 2>&1; then
+        echo "  - docker daemon not running; attempting auto-start..."
+        if harness_start_docker_desktop; then
+            echo "  ✓ docker daemon (started)"
+        else
+            echo "  ✗ docker daemon not available"
+            errors=$((errors+1))
+        fi
+    else
+        if docker info >/dev/null 2>&1; then
+            echo "  ✓ docker daemon"
+        else
+            echo "  ✗ docker daemon not running"
+            errors=$((errors+1))
+        fi
+    fi
+
+    # Configuration files
+    if declare -f harness_check_file_exists >/dev/null 2>&1; then
+        harness_check_file_exists "$env_file" true ".env config file" || errors=$((errors+1))
+        harness_check_file_exists "$allowlist_path" true "firewall allowlist" || errors=$((errors+1))
+    else
+        [[ -f "$env_file" ]] || { echo "  ✗ .env not found at $env_file"; errors=$((errors+1)); }
+        [[ -f "$allowlist_path" ]] || { echo "  ✗ allowlist not found at $allowlist_path"; errors=$((errors+1)); }
+    fi
+
+    # Required env vars (parsed from .env, not the live shell — env vars
+    # are only sourced if the file exists, but this also works as a sanity
+    # check when the file is malformed and source would silently no-op).
+    if [[ -f "$env_file" ]]; then
+        local proxy_url proxy_key proxy_model
+        proxy_url=$(grep -E '^PROXY_API_URL=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+        proxy_key=$(grep -E '^PROXY_API_KEY=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+        proxy_model=$(grep -E '^PROXY_API_MODEL=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+
+        if [[ -z "$proxy_url" ]]; then
+            echo "  ✗ PROXY_API_URL is empty in $env_file (required: upstream API base URL)"
+            errors=$((errors+1))
+        else
+            echo "  ✓ PROXY_API_URL is set"
+        fi
+        if [[ -z "$proxy_key" ]]; then
+            echo "  ✗ PROXY_API_KEY is empty in $env_file (required: upstream API bearer token)"
+            errors=$((errors+1))
+        else
+            echo "  ✓ PROXY_API_KEY is set"
+        fi
+        if [[ -z "$proxy_model" ]]; then
+            echo "  ✗ PROXY_API_MODEL is empty in $env_file (required: upstream model identifier)"
+            errors=$((errors+1))
+        else
+            echo "  ✓ PROXY_API_MODEL is set"
+        fi
+
+        # PROXY_API_URL hostname must be in the allowlist or container egress
+        # will be blocked by the firewall.
+        if [[ -n "$proxy_url" && -f "$allowlist_path" ]]; then
+            local proxy_host
+            proxy_host=$(echo "$proxy_url" | awk -F[/:] '{print $4}')
+            if [[ -n "$proxy_host" ]]; then
+                if ! grep -qE "^[[:space:]]*${proxy_host}([[:space:]]|#|\$)" "$allowlist_path"; then
+                    echo "  ✗ PROXY_API_URL hostname '$proxy_host' is NOT in $allowlist_path"
+                    echo "    Add it with:  harness net allow $proxy_host"
+                    errors=$((errors+1))
+                else
+                    echo "  ✓ PROXY_API_URL hostname is in allowlist"
+                fi
+            fi
+        fi
+    fi
+
+    # State dirs (optional — created on demand by ensure_dirs)
+    if declare -f harness_check_dir_writable >/dev/null 2>&1; then
+        harness_check_dir_writable "$state_root/output" false "output dir" || true
+        harness_check_dir_writable "$state_root/agent/claude" false "claude agent home" || true
+        harness_check_dir_writable "$state_root/agent/opencode" false "opencode agent home" || true
+        harness_check_dir_writable "$state_root/ollama-data" false "ollama data dir" || true
+    fi
+
+    # Compose project + service status — informational; doesn't gate exit.
+    # Wrapped in an explicit subshell that swallows pipefail because
+    # `docker compose ps <service>` errors if the project has no compose
+    # file context (e.g., running preflight against a never-started
+    # install).
+    if docker info >/dev/null 2>&1; then
+        local proxy_status=""
+        proxy_status=$( { docker compose --project-name "$project_name" ps proxy --format '{{.Status}}' 2>/dev/null || true; } | head -1 )
+        if [[ -n "$proxy_status" ]]; then
+            echo "  ⓘ proxy: $proxy_status"
+        else
+            echo "  ⓘ proxy: not running (run 'harness start')"
+        fi
+    fi
+
+    if (( errors > 0 )); then
+        echo
+        echo "[harness] preflight: $errors error(s). Resolve issues above before running 'harness start'."
+        return 1
+    fi
+
+    echo "[harness] preflight: all checks passed"
+    return 0
+}
+
 # --- dispatch ---------------------------------------------------------------
 
 main() {
@@ -2653,6 +2840,7 @@ main() {
         net)                        cmd_net "$@" ;;
         mcp)                        cmd_mcp "$@" ;;
         doctor)                     cmd_doctor ;;
+        preflight)                  cmd_preflight ;;
         *)
             err "unknown command '$cmd'"
             cmd_help >&2

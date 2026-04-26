@@ -117,6 +117,44 @@ class TestTranslateHistory(unittest.TestCase):
         self.assertIn('"arguments":', content)
         self.assertIn("Atlanta", content)
 
+    def test_user_request_uses_marker_delimiters(self):
+        """Verify the wrapper uses <<<BEGIN_USER_REQUEST>>> markers, not bare quotes."""
+        result = proxy.build_cooperative_prompt_user("hello", "some tools")
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>", result)
+        self.assertIn("<<<END_USER_REQUEST>>>", result)
+        # Explicitly NOT the old quote pattern around content
+        self.assertNotIn('"hello"', result)
+
+    def test_user_request_with_complex_content_preserved(self):
+        """User content with quotes, code fences, and newlines passes through cleanly."""
+        complex_content = '''Please review:
+```python
+print("hello")
+```
+And answer "what does this do?"'''
+        result = proxy.build_cooperative_prompt_user(complex_content, "tools")
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>", result)
+        self.assertIn(complex_content, result)
+        self.assertIn("<<<END_USER_REQUEST>>>", result)
+        self.assertEqual(result.count("<<<BEGIN_USER_REQUEST>>>"), 1)
+        self.assertEqual(result.count("<<<END_USER_REQUEST>>>"), 1)
+
+    def test_consecutive_system_messages_are_coalesced(self):
+        """Multiple system messages in input → one coalesced system message in output."""
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "Be concise."},
+            {"role": "system", "content": "Do not use emojis."},
+            {"role": "user", "content": "Hello"},
+        ]
+        result = proxy.translate_history_and_apply_prompt(messages, "")
+        system_msgs = [m for m in result if m["role"] == "system"]
+        self.assertEqual(len(system_msgs), 1, f"Expected 1 system message, got {len(system_msgs)}")
+        sys_content = system_msgs[0]["content"]
+        self.assertIn("helpful assistant", sys_content)
+        self.assertIn("Be concise", sys_content)
+        self.assertIn("Do not use emojis", sys_content)
+
     def test_tool_message_uses_tool_name_and_folds_into_user(self):
         msgs = [
             {"role": "user", "content": "weather?"},

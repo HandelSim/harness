@@ -55,6 +55,157 @@ title() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 cwd=$(pwd)
 install_root="$cwd/$CLONE_DIR"
 
+# --- inline platform fallbacks (pre-clone) ----------------------------------
+#
+# install.sh runs BEFORE the clone, so scripts/lib/platform.sh from the
+# repo isn't yet available. We inline the minimum subset of helpers needed
+# in the early phases (OS detection, docker check, Docker Desktop start).
+# After the clone we source the full library for the rest of the script.
+
+_inline_detect_os() {
+    case "$(uname -s)" in
+        Linux*) echo "linux";;
+        Darwin*) echo "macos";;
+        MINGW*|MSYS*|CYGWIN*) echo "windows";;
+        *) echo "unknown";;
+    esac
+}
+
+_inline_docker_running() { docker info >/dev/null 2>&1; }
+
+_inline_start_docker() {
+    local timeout=90
+    local os
+    os=$(_inline_detect_os)
+
+    case "$os" in
+        windows)
+            local exe="/c/Program Files/Docker/Docker/Docker Desktop.exe"
+            if [[ ! -f "$exe" ]]; then
+                echo "  Docker Desktop not found at expected path: $exe" >&2
+                echo "  Please start Docker Desktop manually." >&2
+                return 1
+            fi
+            echo "  Docker Desktop is not running. Starting it now (typically 30-60 seconds)..." >&2
+            "$exe" >/dev/null 2>&1 &
+            ;;
+        macos)
+            echo "  Docker Desktop is not running. Starting it now (typically 30-60 seconds)..." >&2
+            if ! open -a Docker >/dev/null 2>&1; then
+                echo "  Failed to launch Docker Desktop. Please start it manually." >&2
+                return 1
+            fi
+            ;;
+        linux)
+            echo "  Docker daemon not running on Linux. Start it with one of:" >&2
+            echo "    sudo systemctl start docker" >&2
+            echo "    sudo service docker start" >&2
+            return 1
+            ;;
+        *)
+            echo "  Unknown OS; cannot auto-start Docker. Please start it manually." >&2
+            return 1
+            ;;
+    esac
+
+    local elapsed=0
+    while (( elapsed < timeout )); do
+        if _inline_docker_running; then
+            echo "  Docker is now running." >&2
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+        if (( elapsed % 10 == 0 )); then
+            echo "    ...still waiting (${elapsed}s elapsed, ${timeout}s timeout)" >&2
+        fi
+    done
+
+    echo "  Docker did not become available within ${timeout}s." >&2
+    return 1
+}
+
+_inline_check_command() {
+    local cmd="$1" desc="${2:-$1}"
+    if command -v "$cmd" >/dev/null 2>&1; then
+        echo "  ✓ $desc"
+        return 0
+    fi
+    echo "  ✗ $desc — '$cmd' not found in PATH"
+    return 1
+}
+
+# --- preflight --------------------------------------------------------------
+#
+# Validates that the host can run the installer at all. Failures are listed
+# up front, before any prompting, so the user can fix them in one pass
+# instead of fixing-rerun-fixing.
+
+preflight() {
+    local errors=0
+    echo
+    title "preflight checks"
+
+    _inline_check_command git "git" || errors=$((errors+1))
+    _inline_check_command docker "docker" || errors=$((errors+1))
+
+    if ! docker compose version >/dev/null 2>&1; then
+        echo "  ✗ docker compose v2 — 'docker compose' subcommand not available"
+        echo "    (you may have docker, but need compose v2 specifically)"
+        errors=$((errors+1))
+    else
+        echo "  ✓ docker compose v2"
+    fi
+
+    # Docker daemon (with auto-start attempt on Win/Mac)
+    if _inline_docker_running; then
+        echo "  ✓ docker daemon"
+    else
+        echo "  - docker daemon not running; attempting auto-start..."
+        if _inline_start_docker; then
+            echo "  ✓ docker daemon (started)"
+        else
+            echo "  ✗ docker daemon not running"
+            errors=$((errors+1))
+        fi
+    fi
+
+    # Disk space (5GB recommended for fresh install + image pulls)
+    local available_mb
+    available_mb=$(df -m "$cwd" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [[ -n "$available_mb" ]]; then
+        if (( available_mb >= 5120 )); then
+            echo "  ✓ disk space (${available_mb}M available, 5120M recommended)"
+        else
+            echo "  ⚠ disk space — only ${available_mb}M available; ollama/serena images need ~5GB total"
+            # warning, not error
+        fi
+    fi
+
+    # Write access to CWD
+    if [[ ! -w "$cwd" ]]; then
+        echo "  ✗ CWD ($cwd) is not writable"
+        errors=$((errors+1))
+    else
+        echo "  ✓ write access to $cwd"
+    fi
+
+    # Existing harness/ in CWD
+    if [[ -d "$cwd/$CLONE_DIR" ]]; then
+        echo "  ✗ ./$CLONE_DIR/ already exists; remove it or run install in a different parent directory"
+        errors=$((errors+1))
+    fi
+
+    if (( errors > 0 )); then
+        echo
+        echo "[install] $errors check(s) failed. Resolve the issues above and re-run."
+        exit 1
+    fi
+
+    echo "  all checks passed"
+    echo
+}
+
 # --- intent -----------------------------------------------------------------
 
 cat <<EOF
@@ -69,15 +220,19 @@ and runtime state all live inside it. To uninstall later:
   rm $LOCAL_BIN/$PROGRAM_NAME
 
 Steps:
-  1. Verify git, docker, and 'docker compose' are available.
+  1. Run preflight checks (git, docker, disk space, write access).
   2. Refuse if $install_root already exists.
   3. Clone $REPO_URL into $install_root
   4. Create runtime state directories under $install_root/state/
   5. Seed .env (from your zip-edited .env if present in $cwd, else from .env.example).
   6. Seed .harness-allowlist from .harness-allowlist.example (if not present).
-  7. Optionally symlink the harness command into $LOCAL_BIN and update PATH.
+  7. Optionally install a 'harness' wrapper into $LOCAL_BIN and update PATH.
 
 EOF
+
+# --- preflight (fail fast, before any prompts) ------------------------------
+
+preflight
 
 # --- CWD cleanliness check --------------------------------------------------
 #
@@ -109,14 +264,6 @@ case "${path_ans:-}" in
     *) want_path=1 ;;
 esac
 
-# --- prereq checks ----------------------------------------------------------
-
-title "checking prerequisites"
-
-if command -v git >/dev/null 2>&1; then ok "git found ($(git --version | head -1))"; else fail "git is required but not found"; fi
-if command -v docker >/dev/null 2>&1; then ok "docker found ($(docker --version | head -1))"; else fail "docker is required but not found"; fi
-if docker compose version >/dev/null 2>&1; then ok "docker compose found ($(docker compose version | head -1))"; else fail "docker compose v2 is required but not found"; fi
-
 # --- clone ------------------------------------------------------------------
 
 title "cloning repo"
@@ -126,6 +273,35 @@ if [[ -e "$install_root" ]]; then
 fi
 git clone "$REPO_URL" "$install_root"
 ok "cloned into $install_root"
+
+# --- post-clone: source full platform.sh ------------------------------------
+#
+# After the clone, the full helper library is on disk. Source it so anything
+# below this point can use the canonical helpers instead of the inline
+# fallbacks. Failure to find it indicates a broken clone — abort.
+
+if [[ ! -f "$install_root/scripts/lib/platform.sh" ]]; then
+    fail "internal: $install_root/scripts/lib/platform.sh missing after clone"
+fi
+# shellcheck disable=SC1091
+source "$install_root/scripts/lib/platform.sh"
+
+# --- defense-in-depth: dos2unix on Windows ----------------------------------
+#
+# .gitattributes already forces LF on shell scripts, so this is belt-and-
+# braces in case a user's git was configured to ignore .gitattributes or
+# the clone path went through a tool that re-wrote line endings.
+
+if [[ "$(harness_detect_os)" == "windows" ]]; then
+    if command -v dos2unix >/dev/null 2>&1; then
+        title "normalizing line endings on Windows"
+        find "$install_root" -type f \( -name "*.sh" -o -name "harness" -o -name "harness-install.sh" \) \
+            -exec dos2unix -q {} + 2>/dev/null || true
+        ok "ran dos2unix on shell scripts"
+    else
+        warn "dos2unix not available; relying on .gitattributes"
+    fi
+fi
 
 # --- runtime state dirs -----------------------------------------------------
 #
@@ -189,12 +365,25 @@ else
 fi
 
 # --- PATH setup -------------------------------------------------------------
+#
+# We install a wrapper script (not a symlink) at ~/.local/bin/harness. On
+# Windows, creating symlinks requires Developer Mode or admin privileges;
+# wrappers work everywhere with no special permission. The wrapper exec's
+# the real harness script so $0 still resolves to the install root.
 
 if (( want_path )); then
     title "setting up PATH"
     mkdir -p "$LOCAL_BIN"
-    ln -sf "$install_root/$PROGRAM_NAME" "$LOCAL_BIN/$PROGRAM_NAME"
-    ok "symlinked $LOCAL_BIN/$PROGRAM_NAME -> $install_root/$PROGRAM_NAME"
+    wrapper="$LOCAL_BIN/$PROGRAM_NAME"
+    target_harness="$install_root/$PROGRAM_NAME"
+
+    cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+# harness wrapper — calls the real harness script in the install root.
+exec "$target_harness" "\$@"
+EOF
+    chmod +x "$wrapper"
+    ok "wrapper installed at $wrapper -> $target_harness"
 
     # Detect whether ~/.local/bin is already on PATH. case-style match against
     # the literal expanded directory.
@@ -247,8 +436,10 @@ install root: $install_root
 
 next steps:
   1. edit ${install_root}/.env and fill in any blank required values (especially PROXY_API_KEY)
-  2. run: harness start
-  3. cd into a project directory and run: harness claude
+  2. ${want_path:+(open a new Git Bash session if you opted into PATH integration)}
+  3. run: harness preflight     (validates configuration before starting)
+  4. run: harness start          (brings up the stack)
+  5. cd into a project directory and run: harness claude
 
 To uninstall later:
   rm -rf $install_root

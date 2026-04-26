@@ -544,6 +544,32 @@ Report whether the dry-run preview matched the apply-mode result, whether
 existing values were preserved on both runs, and whether the marker comment
 was clear.
 
+### Scenario W: Windows installation flow (Windows machines only)
+
+1. Open Git Bash on Windows.
+2. cd to a fresh directory under `C:\Users\<you>\test-harness\`.
+3. Extract the distribution zip into this directory.
+4. Run `bash harness-install.sh`. Verify:
+   - Preflight checks run before any prompts (git, docker, compose v2,
+     daemon reachability, disk space, write access).
+   - All preflight checks pass (or any failures are clearly described).
+   - Docker Desktop auto-starts if it wasn't running (look for the
+     "Docker Desktop is not running. Starting it now..." message).
+   - The wrapper script lands at `~/.local/bin/harness` (file, not symlink —
+     `ls -la ~/.local/bin/harness` should NOT show `->`).
+5. Edit `.env` with real or test values for the `PROXY_API_*` vars.
+6. Run `harness preflight`. Verify:
+   - All checks reported clearly with ✓/✗/⚠ markers.
+   - Configuration issues identified by name (e.g. "PROXY_API_URL is empty").
+   - PROXY_API_URL hostname is checked against the allowlist.
+7. Run `harness start`. Verify it completes without errors.
+8. Run `harness claude -p "say hello"`. Verify response.
+9. Stop the stack with `harness down`.
+10. Verify uninstall: `rm -rf <install-root> && rm ~/.local/bin/harness`.
+
+Report any line-ending issues (`\r: command not found`), bind-mount path
+warnings, or other Windows-specific friction.
+
 ## Final report
 
 Summarize at the end:
