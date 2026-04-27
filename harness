@@ -383,10 +383,21 @@ compose() {
     # the serena bind-mount always has a non-empty source.
     local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
 
+    # MSYS_NO_PATHCONV=1 on Windows so absolute-path env values from .env
+    # (e.g. OUTPUT_DIR=/output) don't get translated to Git Bash root
+    # prefixes (e.g. C:/Program Files/Git/output) when compose forwards
+    # them into the proxy container. Without this, the proxy reads the
+    # mangled value and writes debug dumps to the wrong path. On
+    # Linux/macOS this prefix is a no-op.
+    local docker_cmd=(docker)
+    if [[ "$(harness_detect_os)" == "windows" ]]; then
+        docker_cmd=(env MSYS_NO_PATHCONV=1 docker)
+    fi
+
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
-        docker "${args[@]}" "$@"
+        "${docker_cmd[@]}" "${args[@]}" "$@"
 }
 
 # Best-effort check: are ollama and proxy both running for this project?
@@ -502,10 +513,11 @@ commands:
   down                  stop the ollama + proxy services (does NOT touch agents)
   restart               down + start (preserves per-invocation state)
   update                git pull --ff-only in the clone
-  upgrade [flags]       pull + apply manifest-driven upgrade actions + restart
+  upgrade [flags]       pull + apply manifest + rebuild images + restart
                         flags: --check (dry-run preview, no pull),
                                --no-prompt (skip apply confirmation),
-                               --no-restart (apply without down/start)
+                               --no-restart (apply without build/down/start),
+                               --rebuild (compose build --no-cache; slower)
   logs [service ...]    follow compose logs (no args = all services)
   claude  [args]        launch a claude-code agent in the current directory
   opencode [args]       launch an opencode agent in the current directory
@@ -661,30 +673,39 @@ cmd_upgrade() {
     local check_only=0
     local no_prompt=0
     local no_restart=0
+    local rebuild=0
 
     while (( $# > 0 )); do
         case "$1" in
             --check) check_only=1 ;;
             --no-prompt) no_prompt=1 ;;
             --no-restart) no_restart=1 ;;
+            --rebuild) rebuild=1 ;;
             -h|--help)
                 cat <<'EOF'
-harness upgrade — pull latest code, apply upgrade actions, restart services.
+harness upgrade — pull latest code, apply upgrade actions, rebuild images,
+                  restart services.
 
 usage:
-  harness upgrade [--check] [--no-prompt] [--no-restart]
+  harness upgrade [--check] [--no-prompt] [--no-restart] [--rebuild]
 
 flags:
   --check         preview the upgrade actions in dry-run mode without
                   performing 'git pull' or any file modifications.
   --no-prompt     skip the interactive "apply?" prompt (CI / automation).
-  --no-restart    apply upgrade actions but skip the down/start cycle.
+  --no-restart    apply upgrade actions but skip the build/down/start cycle.
+  --rebuild       force a clean rebuild (compose build --no-cache). Slower
+                  but bypasses any cache-poisoning from earlier failed
+                  builds.
 
 The set of upgrade actions is driven by scripts/upgrade-manifest.json. Each
 action describes how a file harness manages inside the install root (which
 is the same directory as the clone, post-B4) is brought forward when the
 repo changes — env vars, firewall hostnames, ccstatusline keys, MCP
 registry definitions. User-set values are NEVER overwritten.
+
+Image rebuild is run between manifest-apply and start so image-level
+changes (Dockerfile, proxy.py, agent entrypoint) take effect on upgrade.
 EOF
                 return 0
                 ;;
@@ -764,6 +785,22 @@ EOF
 
     if (( ! no_restart )); then
         cmd_down --remove-orphans 2>/dev/null || true
+
+        # Rebuild images so image-level changes (Dockerfile, proxy.py, agent
+        # entrypoint) take effect. Without this, the existing local images
+        # are reused and the user runs stale containers without realizing.
+        # --rebuild adds --no-cache for a force-rebuild; otherwise BuildKit
+        # uses its layer cache and only changed layers are re-run.
+        local build_args=()
+        if (( rebuild )); then
+            build_args+=(--no-cache)
+        fi
+        echo "[harness] rebuilding container images..."
+        if ! compose build "${build_args[@]}"; then
+            err "compose build failed; aborting upgrade"
+            return 1
+        fi
+
         cmd_start
     fi
 }
