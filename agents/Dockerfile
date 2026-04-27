@@ -27,6 +27,10 @@ FROM node:20-bookworm-slim
 #                    via the persistent home). pipx solves competing dep
 #                    sets for skill-style installers (graphify, etc.)
 #   iptables, ipset, dnsutils, iproute2 — required by init-firewall.sh
+#   locales        — without it the container LANG defaults to POSIX, which
+#                    makes claude-code/opencode fall back to ASCII underscores
+#                    instead of Unicode box-drawing/indicator glyphs in the
+#                    TUI. Generated to C.UTF-8 below.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tmux \
@@ -44,7 +48,17 @@ RUN apt-get update \
         ipset \
         dnsutils \
         iproute2 \
+        locales \
     && rm -rf /var/lib/apt/lists/*
+
+# Generate C.UTF-8 and export LANG/LC_ALL so every process inside the
+# container (entrypoint, gosu-launched harness user, tmux session, agent
+# CLIs) sees a UTF-8 locale. Use C.UTF-8 (not en_US.UTF-8) for portability:
+# no English-specific assumptions, just ASCII-compatible bytes plus UTF-8.
+RUN sed -i 's/^# *\(C.UTF-8\)/\1/' /etc/locale.gen \
+    && locale-gen C.UTF-8
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
 # Both agent CLIs at pinned versions. Bumping requires editing this file.
 ARG CLAUDE_CODE_VERSION=2.1.120

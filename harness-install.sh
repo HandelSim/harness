@@ -24,7 +24,31 @@
 #   rm -rf <install-root>
 #   rm ~/.local/bin/harness
 
-set -euo pipefail
+# Detect whether we were sourced (so the PATH update inside this script
+# takes effect in the caller's shell) vs executed as a subprocess. Behavior
+# differs:
+#   - sourced:  do NOT enable `set -e`; it would terminate the user's
+#               interactive shell on any non-zero command in the rest of
+#               the script. Use `return` to leave the script.
+#   - executed: enable strict mode for installer safety; use `exit` normally.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    HARNESS_INSTALL_SOURCED=1
+else
+    HARNESS_INSTALL_SOURCED=0
+    set -euo pipefail
+fi
+
+# Helper: exit if executed, return if sourced. Without this, `source
+# harness-install.sh` (which the README recommends so PATH updates land in
+# the parent shell) would kill the calling shell on the first `exit`.
+exit_or_return() {
+    local code="${1:-0}"
+    if (( HARNESS_INSTALL_SOURCED )); then
+        return "$code"
+    else
+        exit "$code"
+    fi
+}
 
 # The default points at the public GitHub remote. scripts/full_pipeline_test.sh
 # overrides this via HARNESS_REPO_URL=<local-path> so the pipeline test can
@@ -50,7 +74,7 @@ fi
 
 ok()    { printf '%s✓%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
 warn()  { printf '%s!%s %s\n'  "$C_YELLOW" "$C_RESET" "$*"; }
-fail()  { printf '%sx%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; exit 1; }
+fail()  { printf '%sx%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; exit_or_return 1; }
 title() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 
 cwd=$(pwd)
@@ -200,7 +224,7 @@ preflight() {
     if (( errors > 0 )); then
         echo
         echo "[install] $errors check(s) failed. Resolve the issues above and re-run."
-        exit 1
+        exit_or_return 1
     fi
 
     echo "  all checks passed"
@@ -235,28 +259,12 @@ EOF
 
 preflight
 
-# --- CWD cleanliness check --------------------------------------------------
-#
-# Allow harness-install.sh, .env, README files, hidden dotfiles, and .git to
-# coexist (a user may pre-place a .env, or be running from inside a clone).
-# Anything else is suspicious — warn the user but don't block.
-
-allow_re='^(harness-install\.sh|\.env|README\.md|README\.txt|quickstart\.md|\..*)$'
-unexpected=$(ls -A . | grep -Ev "$allow_re" || true)
-if [[ -n "$unexpected" ]]; then
-    warn "current directory has unexpected entries:"
-    while IFS= read -r line; do
-        printf '    %s\n' "$line"
-    done <<<"$unexpected"
-    echo
-fi
-
 # --- prompts ----------------------------------------------------------------
 
 read -rp "continue? [y/N]: " ans
 case "${ans:-}" in
     y|Y|yes|YES) ;;
-    *) echo "aborted."; exit 0 ;;
+    *) echo "aborted."; exit_or_return 0 ;;
 esac
 
 read -rp "add 'harness' to PATH (recommended)? [Y/n]: " path_ans
@@ -464,24 +472,30 @@ Next:
 Available agents:
   harness claude
   harness opencode
-
-Auto-installed MCPs:
 EOF
 
-mcp_count=0
-if [[ -d "$install_root/state/mcp" ]]; then
-    for mcp_dir in "$install_root"/state/mcp/*/; do
-        [[ -f "$mcp_dir/harness-meta.json" ]] || continue
-        mcp_name=$(jq -r '.name // empty' "$mcp_dir/harness-meta.json" 2>/dev/null || true)
-        [[ -n "$mcp_name" ]] || mcp_name=$(basename "$mcp_dir")
-        mcp_enabled=$(jq -r '.enabled // empty' "$mcp_dir/harness-meta.json" 2>/dev/null || echo "?")
-        echo "  - $mcp_name (enabled: $mcp_enabled)"
+# Show what MCPs are present in the bundled registry, since none are
+# auto-installed by this script. Earlier the message said "Auto-installed
+# MCPs:" with a list pulled from state/mcp, which was always "(none)" on
+# a fresh install — misleading to users who took it as a status report
+# rather than an empty-by-design state.
+echo
+echo "MCPs available to install:"
+if [[ -d "$install_root/mcp-registry" ]]; then
+    mcp_count=0
+    for mcp_dir in "$install_root"/mcp-registry/*/; do
+        [[ -d "$mcp_dir" ]] || continue
+        name=$(basename "$mcp_dir")
+        echo "  - $name"
         mcp_count=$((mcp_count + 1))
     done
+    if (( mcp_count == 0 )); then
+        echo "  (none in registry)"
+    fi
 fi
-if (( mcp_count == 0 )); then
-    echo "  (none)"
-fi
+echo
+echo "To install one: harness mcp install <name>"
+echo "(see 'harness mcp list --available' for descriptions)"
 
 cat <<EOF
 
@@ -495,6 +509,10 @@ Manage MCPs:
 Need a shell inside an agent container (for installing skills, debugging)?
   harness shell
 
+If 'harness start' fails after configuration:
+  harness preflight                   # validates .env and allowlist
+  docker logs harness-proxy-1         # see what the proxy says
+
 Found a bug or have an improvement to suggest, however small?
   https://github.com/HandelSim/harness/issues
 
@@ -503,4 +521,4 @@ Uninstall harness:
   rm "\$HOME/.local/bin/harness"
 EOF
 
-exit 0
+exit_or_return 0
