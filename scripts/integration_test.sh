@@ -96,16 +96,21 @@ cleanup() {
     docker rm -f harness-serena >/dev/null 2>&1 || true
 
     # ollama-data may contain root-owned blobs; wipe via privileged docker run.
-    for d in "${TEST_ROOT}" "${FAKE_HOME}"; do
-        if [[ -d "$d" ]]; then
-            if ! rm -rf "$d" 2>/dev/null; then
-                docker run --rm -v "$d:/target" --user 0:0 alpine \
-                    sh -c 'rm -rf /target/* /target/.[!.]* 2>/dev/null || true' \
-                    >/dev/null 2>&1 || true
-                rm -rf "$d" 2>/dev/null || true
+    # HARNESS_INTEGRATION_KEEP=1 preserves TEST_ROOT/FAKE_HOME for postmortem.
+    if [[ "${HARNESS_INTEGRATION_KEEP:-0}" == "1" ]]; then
+        echo "[integration] HARNESS_INTEGRATION_KEEP=1: leaving TEST_ROOT=${TEST_ROOT} FAKE_HOME=${FAKE_HOME}"
+    else
+        for d in "${TEST_ROOT}" "${FAKE_HOME}"; do
+            if [[ -d "$d" ]]; then
+                if ! rm -rf "$d" 2>/dev/null; then
+                    docker run --rm -v "$d:/target" --user 0:0 alpine \
+                        sh -c 'rm -rf /target/* /target/.[!.]* 2>/dev/null || true' \
+                        >/dev/null 2>&1 || true
+                    rm -rf "$d" 2>/dev/null || true
+                fi
             fi
-        fi
-    done
+        done
+    fi
     exit "${rc}"
 }
 trap cleanup EXIT INT TERM
@@ -126,6 +131,9 @@ echo "[integration] cloning repo into ${TEST_INSTALL}"
 # are exercised — git clone of a worktree doesn't pick those up, so we
 # overlay after.
 git clone --depth=1 "${REPO_ROOT}" "${TEST_INSTALL}" >/dev/null 2>&1
+# Overlay the working tree on top of the clone so uncommitted changes are
+# exercised. rsync is the cleanest tool for this but isn't shipped with Git
+# Bash on Windows; fall back to tar-pipe, which is on every supported host.
 if command -v rsync >/dev/null 2>&1; then
     rsync -a --delete \
         --exclude='.git/' \
@@ -136,6 +144,16 @@ if command -v rsync >/dev/null 2>&1; then
         --exclude='.harness-net-overrides.json' \
         --exclude='state/' \
         "${REPO_ROOT}/" "${TEST_INSTALL}/" >/dev/null
+else
+    tar -C "${REPO_ROOT}" \
+        --exclude='./.git' \
+        --exclude='./__pycache__' \
+        --exclude='*.pyc' \
+        --exclude='./.env' \
+        --exclude='./.harness-allowlist' \
+        --exclude='./.harness-net-overrides.json' \
+        --exclude='./state' \
+        -cf - . | tar -C "${TEST_INSTALL}" -xf -
 fi
 
 # Ensure all the runtime state dirs the harness expects exist.
@@ -275,13 +293,18 @@ phase_2_serena() {
     fi
 
     echo "[integration] Phase 2.2: harness restart (HARNESS_NO_BUILD=1, image already built)"
+    # The mockupstream sidecar joined harness-net via plain `docker run`, so
+    # compose doesn't manage it. `harness restart` calls `compose down`, which
+    # tries to remove the network and fails with "has active endpoints" while
+    # mockupstream is still attached. Stop it first; Phase 2.2.1 re-launches.
+    docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
     if ! HARNESS_NO_BUILD=1 harness_call restart >"${TEST_ROOT}/serena-restart.log" 2>&1; then
         echo "[integration] Phase 2.2 FAIL: harness restart failed" >&2
         tail -120 "${TEST_ROOT}/serena-restart.log" >&2
         return 1
     fi
 
-    echo "[integration] Phase 2.2.1: re-launching mockupstream (compose down removed our sidecar)"
+    echo "[integration] Phase 2.2.1: re-launching mockupstream"
     test_start_mockupstream "${PROJECT_NAME}"
     test_wait_for_container_healthy "${MOCK_NAME}" 90
 
@@ -296,7 +319,7 @@ phase_2_serena() {
         echo "[integration] Phase 2.3 FAIL: cannot find proxy container id" >&2
         return 1
     fi
-    if ! docker exec "${proxy_cid}" timeout 5 bash -c "echo > /dev/tcp/serena/9121" 2>/dev/null; then
+    if ! harness_docker exec "${proxy_cid}" timeout 5 bash -c "echo > /dev/tcp/serena/9121" 2>/dev/null; then
         echo "[integration] Phase 2.3 FAIL: serena unreachable from proxy at tcp://serena:9121" >&2
         # Same env contract as the build call above — required because this
         # invocation also pulls in the serena compose snippet.
@@ -335,9 +358,9 @@ phase_2_serena() {
     # Projects live under /workspaces/projects/<host-relative-path>. The
     # workspace dir under TEST_ROOT was bind-mounted via HARNESS_PROJECTS_ROOT,
     # so test-project/ ends up at /workspaces/projects/test-project/.
-    if ! docker exec harness-serena ls /workspaces/projects/test-project/src/calculator/core.py >/dev/null 2>&1; then
+    if ! harness_docker exec harness-serena ls /workspaces/projects/test-project/src/calculator/core.py >/dev/null 2>&1; then
         echo "[integration] Phase 2.5 FAIL: serena cannot see test project files" >&2
-        docker exec harness-serena ls /workspaces/projects 2>&1 | head -20 >&2 || true
+        harness_docker exec harness-serena ls /workspaces/projects 2>&1 | head -20 >&2 || true
         return 1
     fi
     echo "[integration] Phase 2.5: serena sees test project files"
@@ -349,7 +372,7 @@ phase_2_serena() {
     harness_call mcp down serena >/dev/null
     harness_call mcp up serena >/dev/null
     test_wait_for_healthy "${PROJECT_NAME}" serena 120
-    if ! docker exec "${proxy_cid}" timeout 5 bash -c "echo > /dev/tcp/serena/9121" 2>/dev/null; then
+    if ! harness_docker exec "${proxy_cid}" timeout 5 bash -c "echo > /dev/tcp/serena/9121" 2>/dev/null; then
         echo "[integration] Phase 2.7 FAIL: serena unreachable after down/up cycle" >&2
         return 1
     fi
@@ -394,7 +417,13 @@ phase_2_serena() {
 # "Calculator" — the mock returns a fixture containing both).
 phase_2_tui_test() {
     docker rm -f "${TUI_AGENT_NAME}" >/dev/null 2>&1 || true
-    docker run -d \
+    # Bind-mount sources go through harness_docker_path so /tmp/... (which
+    # Docker Desktop's WSL2 backend can't resolve) becomes C:/Users/.../Temp/.
+    local mnt_workspace mnt_home mnt_allowlist
+    mnt_workspace=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
+    mnt_home=$(harness_docker_path "${TEST_INSTALL}/state/agent/home")
+    mnt_allowlist=$(harness_docker_path "${TEST_INSTALL}/.harness-allowlist")
+    harness_docker run -d \
         --name "${TUI_AGENT_NAME}" \
         --network "${NETWORK}" \
         --user 0:0 \
@@ -407,9 +436,9 @@ phase_2_tui_test() {
         -e "ANTHROPIC_AUTH_TOKEN=harness-dummy" \
         -e "ANTHROPIC_MODEL=harness" \
         -e "ANTHROPIC_SMALL_FAST_MODEL=harness" \
-        -v "${TEST_WORKSPACE}/test-project:/workspace" \
-        -v "${TEST_INSTALL}/state/agent/home:/home/harness" \
-        -v "${TEST_INSTALL}/.harness-allowlist:/etc/harness/allowlist:ro" \
+        -v "${mnt_workspace}:/workspace" \
+        -v "${mnt_home}:/home/harness" \
+        -v "${mnt_allowlist}:/etc/harness/allowlist:ro" \
         -w /workspace \
         --label "harness.agent=true" \
         --label "harness.project=${PROJECT_NAME}" \
@@ -422,7 +451,7 @@ phase_2_tui_test() {
     # Wait for tmux session to come up.
     local deadline=$(( $(date +%s) + 60 ))
     while true; do
-        if docker exec --user harness "${TUI_AGENT_NAME}" \
+        if harness_docker exec --user harness "${TUI_AGENT_NAME}" \
                 tmux has-session -t harness-agent 2>/dev/null; then
             break
         fi
@@ -517,8 +546,12 @@ phase_3_graphify() {
     #   3. (as root) seeds /home/harness from /etc/skel/harness on first
     #      run, mirroring the agent entrypoint's skel-seed step.
     #   4. exec gosu harness sleep — keeps the container alive so we can
-    #      docker exec into it for pipx install + graphify runs.
-    docker run -d \
+    #      harness_docker exec into it for pipx install + graphify runs.
+    local mnt_workspace mnt_home mnt_allowlist
+    mnt_workspace=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
+    mnt_home=$(harness_docker_path "${TEST_INSTALL}/state/agent/home")
+    mnt_allowlist=$(harness_docker_path "${TEST_INSTALL}/.harness-allowlist")
+    harness_docker run -d \
         --name "${GRAPHIFY_AGENT_NAME}" \
         --network "${NETWORK}" \
         --user 0:0 \
@@ -526,9 +559,9 @@ phase_3_graphify() {
         --cap-add NET_RAW \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
-        -v "${TEST_WORKSPACE}/test-project:/workspace" \
-        -v "${TEST_INSTALL}/state/agent/home:/home/harness" \
-        -v "${TEST_INSTALL}/.harness-allowlist:/etc/harness/allowlist:ro" \
+        -v "${mnt_workspace}:/workspace" \
+        -v "${mnt_home}:/home/harness" \
+        -v "${mnt_allowlist}:/etc/harness/allowlist:ro" \
         -w /workspace \
         --label "harness.agent=true" \
         --label "harness.project=${PROJECT_NAME}" \
@@ -565,12 +598,12 @@ phase_3_graphify() {
         docker logs "${GRAPHIFY_AGENT_NAME}" 2>&1 | tail -30 >&2
         return 1
     fi
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             id harness >/dev/null 2>&1; then
         echo "[integration] Phase 3.1 FAIL: harness user not ready inside container" >&2
         return 1
     fi
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             which pipx >/dev/null 2>&1; then
         echo "[integration] Phase 3.1 FAIL: pipx not available in agent image" >&2
         return 1
@@ -578,16 +611,16 @@ phase_3_graphify() {
     echo "[integration] Phase 3.1: agent container ready, pipx available"
 
     echo "[integration] Phase 3.2: pipx install graphifyy"
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             pipx install graphifyy >"${TEST_ROOT}/pipx-install.log" 2>&1; then
         echo "[integration] Phase 3.2 FAIL: pipx install graphifyy failed" >&2
         cat "${TEST_ROOT}/pipx-install.log" >&2
         return 1
     fi
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             test -x /home/harness/.local/bin/graphify; then
         echo "[integration] Phase 3.2 FAIL: graphify binary not at expected path" >&2
-        docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+        harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             ls -la /home/harness/.local/bin/ >&2 2>/dev/null || true
         return 1
     fi
@@ -610,23 +643,23 @@ phase_3_graphify() {
     echo "[integration] Phase 3.3: install persists to host bind mount"
 
     echo "[integration] Phase 3.4: graphify install (skill registration)"
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             /home/harness/.local/bin/graphify install \
             >"${TEST_ROOT}/graphify-install.log" 2>&1; then
         echo "[integration] Phase 3.4 FAIL: 'graphify install' returned non-zero" >&2
         cat "${TEST_ROOT}/graphify-install.log" >&2
         return 1
     fi
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             test -f /home/harness/.claude/skills/graphify/SKILL.md; then
         echo "[integration] Phase 3.4 FAIL: SKILL.md not at expected path after install" >&2
-        docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+        harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             find /home/harness/.claude -type f >&2 2>/dev/null || true
         return 1
     fi
     echo "[integration] Phase 3.4: SKILL.md registered at ~/.claude/skills/graphify/SKILL.md"
 
-    if docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             grep -q "graphify" /home/harness/.claude/CLAUDE.md 2>/dev/null; then
         echo "[integration] Phase 3.4: CLAUDE.md registration confirmed"
     else
@@ -634,7 +667,7 @@ phase_3_graphify() {
     fi
 
     echo "[integration] Phase 3.5: graphify --help (CLI smoke)"
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             /home/harness/.local/bin/graphify --help >/dev/null 2>&1; then
         echo "[integration] Phase 3.5 FAIL: graphify --help fails" >&2
         return 1
@@ -646,7 +679,7 @@ phase_3_graphify() {
     # code files and (re)builds graph.json/graph.html/GRAPH_REPORT.md without
     # any LLM call. The bare `graphify .` form would error with
     # "unknown command '.'".
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             timeout 180 bash -c "cd /workspace && /home/harness/.local/bin/graphify update ." \
             >"${TEST_ROOT}/graphify-run.log" 2>&1; then
         echo "[integration] Phase 3.6 FAIL: 'graphify update .' on test project failed" >&2
@@ -659,7 +692,7 @@ phase_3_graphify() {
     local out_dir="${TEST_WORKSPACE}/test-project/graphify-out"
     if [[ ! -d "${out_dir}" ]]; then
         echo "[integration] Phase 3.7 FAIL: graphify-out/ not created at ${out_dir}" >&2
-        docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+        harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             ls -la /workspace/ >&2 2>/dev/null || true
         return 1
     fi
@@ -703,7 +736,11 @@ phase_3_graphify() {
 
     echo "[integration] Phase 3.11: persistence — fresh container, graphify still works"
     docker rm -f "${GRAPHIFY_AGENT_NAME}" >/dev/null 2>&1 || true
-    docker run -d \
+    local mnt_workspace2 mnt_home2 mnt_allowlist2
+    mnt_workspace2=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
+    mnt_home2=$(harness_docker_path "${TEST_INSTALL}/state/agent/home")
+    mnt_allowlist2=$(harness_docker_path "${TEST_INSTALL}/.harness-allowlist")
+    harness_docker run -d \
         --name "${GRAPHIFY_AGENT_NAME_2}" \
         --network "${NETWORK}" \
         --user 0:0 \
@@ -711,9 +748,9 @@ phase_3_graphify() {
         --cap-add NET_RAW \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
-        -v "${TEST_WORKSPACE}/test-project:/workspace" \
-        -v "${TEST_INSTALL}/state/agent/home:/home/harness" \
-        -v "${TEST_INSTALL}/.harness-allowlist:/etc/harness/allowlist:ro" \
+        -v "${mnt_workspace2}:/workspace" \
+        -v "${mnt_home2}:/home/harness" \
+        -v "${mnt_allowlist2}:/etc/harness/allowlist:ro" \
         -w /workspace \
         --label "harness.agent=true" \
         --label "harness.project=${PROJECT_NAME}" \
@@ -731,12 +768,12 @@ phase_3_graphify() {
         ' \
         >/dev/null
     sleep 5
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME_2}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME_2}" \
             /home/harness/.local/bin/graphify --help >/dev/null 2>&1; then
         echo "[integration] Phase 3.11 FAIL: graphify not callable in fresh container" >&2
         return 1
     fi
-    if ! docker exec --user harness "${GRAPHIFY_AGENT_NAME_2}" \
+    if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME_2}" \
             test -f /home/harness/.claude/skills/graphify/SKILL.md; then
         echo "[integration] Phase 3.11 FAIL: SKILL.md not in fresh container" >&2
         return 1
@@ -759,8 +796,9 @@ phase_4_cross_invariants() {
     echo "[integration] Phase 4.1: doctor reports green"
 
     echo "[integration] Phase 4.2: state directory layout intact"
+    # Phase 13a unified claude and opencode into a single agent/home tree.
     local d
-    for d in output agent/claude agent/opencode ollama-data mcp; do
+    for d in output agent/home ollama-data mcp; do
         if [[ ! -d "${TEST_INSTALL}/state/${d}" ]]; then
             echo "[integration] Phase 4.2 FAIL: missing ${TEST_INSTALL}/state/${d}" >&2
             return 1

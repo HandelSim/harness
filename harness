@@ -1611,11 +1611,21 @@ mcp_registry_names_csv() {
 
 # Echo the service names declared in an MCP's compose snippet, one per line.
 # Empty output means we couldn't enumerate (missing file or compose error).
+#
+# MCP compose snippets reference ${INSTALL_ROOT}, ${HARNESS_ALLOWLIST_PATH},
+# and ${HARNESS_PROJECTS_ROOT} in volume specs. Without those exported,
+# compose interpolates them to empty and rejects the file as invalid, so
+# `config --services` returns empty and callers conclude "no services".
+# Mirror the env contract the `compose` wrapper sets.
 mcp_services_of() {
     local name="$1"
     local compose_file="$mcp_active_dir/$name/compose.yml"
     [[ -f "$compose_file" ]] || return 0
-    docker compose -f "$compose_file" --profile mcp config --services 2>/dev/null || true
+    local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
+    INSTALL_ROOT="$install_root" \
+        HARNESS_ALLOWLIST_PATH="$allowlist_path" \
+        HARNESS_PROJECTS_ROOT="$projects_root" \
+        docker compose -f "$compose_file" --profile mcp config --services 2>/dev/null || true
 }
 
 # install: registry -> active tree. Default state is enabled.
@@ -1923,8 +1933,10 @@ cmd_mcp_up() {
     fi
     args+=(--profile mcp up -d)
     args+=("${svc_list[@]}")
+    local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
+        HARNESS_PROJECTS_ROOT="$projects_root" \
         docker "${args[@]}"
     echo "up: $name"
 }
@@ -1972,8 +1984,10 @@ cmd_mcp_down() {
     done < <(mcp_compose_files)
     args+=(--profile mcp rm -sf)
     args+=("${svc_list[@]}")
+    local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
+        HARNESS_PROJECTS_ROOT="$projects_root" \
         docker "${args[@]}" 2>/dev/null || true
     echo "down: $name"
 }
@@ -2020,8 +2034,10 @@ cmd_mcp_logs() {
     done < <(mcp_compose_files)
     args+=(--profile mcp logs -f)
     args+=("${svc_list[@]}")
+    local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
+        HARNESS_PROJECTS_ROOT="$projects_root" \
         exec docker "${args[@]}"
 }
 
