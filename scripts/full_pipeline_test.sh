@@ -222,7 +222,7 @@ echo "[pipeline] T2 OK"
 
 echo "[pipeline] T3: harness help"
 help_out=$(harness_call help)
-for cmd in start down claude opencode doctor list attach stop; do
+for cmd in start down claude opencode doctor list stop; do
     if ! grep -q "\b${cmd}\b" <<<"${help_out}"; then
         echo "[pipeline] T3 FAIL: help text missing '${cmd}'" >&2
         echo "${help_out}" >&2

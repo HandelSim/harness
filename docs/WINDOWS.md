@@ -119,7 +119,7 @@ displays correctly.
 
 - PowerShell and cmd are not supported. All harness commands must be run from Git Bash.
 - File ownership tests (the `--user` flag, `chown` behavior) are non-meaningful on Windows because NTFS doesn't have POSIX UIDs. Files created in mounted volumes are owned by your Windows user automatically; the harness UID-remap logic that's necessary on Linux has no effect on Windows.
-- Tmux is required for interactive agent TUIs. It ships with Git for Windows by default; verify with `which tmux`.
+- Tmux is no longer required at runtime (Phase 18 dropped the wrapping). It still ships with Git for Windows; the test toolkit uses it internally for programmatic TUI input/output.
 
 ## Troubleshooting
 

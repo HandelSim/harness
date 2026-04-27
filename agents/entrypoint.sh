@@ -14,10 +14,18 @@
 # Common harness-level controls:
 #   HARNESS_YOLO=1              — claude: --dangerously-skip-permissions
 #                                 opencode: --agent yolo
-#   HARNESS_TEST_MODE=1         — bypass tmux, exec the CLI directly
-#   HARNESS_PRINT_MODE=1        — bypass tmux for `harness <agent> -p ...`
+#   HARNESS_PRINT_MODE=1        — `harness <agent> -p ...` headless single-shot
+#   HARNESS_HOST_CWD=<path>     — host CWD; entrypoint symlinks it to /workspace
+#                                 so PWD inside the container reflects the host
+#                                 path (e.g. /c/Users/you/projects/myapp)
 #   HARNESS_FIREWALL_DISABLED=1 — skip init-firewall.sh entirely
 #                                 (--net flag or `harness net open`)
+#
+# tmux: Phase 3-17 wrapped agents in a detached tmux session to support
+# reattach. Phase 18 dropped that — the foreground exec model is simpler and
+# fixes scroll-behavior issues in claude-code's TUI. The tmux_wrap helper
+# below is preserved as dead code in case the reattach use case becomes
+# important later.
 
 set -euo pipefail
 
@@ -94,6 +102,29 @@ if [[ ! -f "${HOME}/.harness-home-initialized" ]]; then
         cp -an /etc/skel/harness/. "${HOME}/" 2>/dev/null || true
     fi
     touch "${HOME}/.harness-home-initialized" 2>/dev/null || true
+fi
+
+# --- host CWD symlink -------------------------------------------------------
+#
+# Symlink the host launch CWD path to /workspace so `pwd` inside the
+# container reflects the host path (e.g. /c/Users/you/projects/myapp).
+# Both /workspace and the host path resolve to the same files via the
+# symlink, but readers of $PWD see the meaningful host path —
+# claude-code's statusline picks it up, and the user isn't confused
+# when working with multiple projects.
+#
+# Failures (parent dir creation, ln -snf, cd) are non-fatal — the agent
+# still works at /workspace if anything below misbehaves on a quirky
+# host path.
+if [[ -n "${HARNESS_HOST_CWD:-}" && "${HARNESS_HOST_CWD}" != "/workspace" ]]; then
+    parent=$(dirname "$HARNESS_HOST_CWD")
+    if [[ "$parent" != "/" && "$parent" != "." ]]; then
+        mkdir -p "$parent" 2>/dev/null || true
+    fi
+    ln -snf /workspace "$HARNESS_HOST_CWD" 2>/dev/null || true
+    if [[ -L "$HARNESS_HOST_CWD" ]]; then
+        cd "$HARNESS_HOST_CWD" || cd /workspace
+    fi
 fi
 
 # --- mode dispatch ----------------------------------------------------------
@@ -248,10 +279,13 @@ merge_opencode_mcp_servers() {
     fi
 }
 
-# Run the wrapped command in a detached tmux session named harness-agent so
-# the host can `docker exec` in and reattach. The session exits when the
-# wrapped command exits (with a 30s linger so a just-too-late attach can see
-# the exit code).
+# DEAD CODE — kept for potential future revert. Phase 18 dropped tmux from
+# agent launch because the detached-session model caused scroll-behavior
+# issues in claude-code's TUI without delivering on the theoretical reattach
+# use case (which was rarely needed in practice). The agent CLI is now the
+# container's foreground process via `exec`, so the user's terminal connects
+# directly to its PTY. If reattach ever becomes important, this helper is
+# intact and run_claude/run_opencode can be reverted to call it.
 tmux_wrap() {
     local inner=""
     inner=$(printf '%q' "$1"); shift
@@ -294,7 +328,6 @@ run_claude() {
     echo "   model:    ${OLLAMA_AGENT_MODEL:-<unset>}"
     echo "   base_url: ${ANTHROPIC_BASE_URL}"
     echo "   yolo:     ${HARNESS_YOLO:-0}"
-    echo "   test:     ${HARNESS_TEST_MODE:-0}"
     echo "   print:    ${HARNESS_PRINT_MODE:-0}"
     echo "============================================================"
 
@@ -304,10 +337,10 @@ run_claude() {
     fi
     args+=("$@")
 
-    if [[ "${HARNESS_TEST_MODE:-0}" == "1" || "${HARNESS_PRINT_MODE:-0}" == "1" ]]; then
-        exec claude "${args[@]}"
-    fi
-    tmux_wrap claude "${args[@]}"
+    # Always foreground exec — no tmux. The container's PID 1 becomes claude
+    # itself, so the user's terminal connects directly to its PTY and the
+    # container exits when claude exits.
+    exec claude "${args[@]}"
 }
 
 # --- mode: opencode --------------------------------------------------------
@@ -323,7 +356,6 @@ run_opencode() {
     echo "   model:   harness/${OLLAMA_AGENT_MODEL:-harness}"
     echo "   ollama:  http://ollama:11434/v1"
     echo "   yolo:    ${HARNESS_YOLO:-0}"
-    echo "   test:    ${HARNESS_TEST_MODE:-0}"
     echo "   print:   ${HARNESS_PRINT_MODE:-0}"
     echo "============================================================"
 
@@ -332,7 +364,7 @@ run_opencode() {
         args+=(--agent yolo)
     fi
 
-    if [[ "${HARNESS_TEST_MODE:-0}" == "1" || "${HARNESS_PRINT_MODE:-0}" == "1" ]]; then
+    if [[ "${HARNESS_PRINT_MODE:-0}" == "1" ]]; then
         # opencode has no `-p` flag — strip a leading -p / --print if the
         # harness forwarded it, hand the rest to `opencode run`.
         local op_args=()
@@ -347,7 +379,9 @@ run_opencode() {
         done
         exec opencode run "${args[@]}" "${op_args[@]}"
     fi
-    tmux_wrap opencode "${args[@]}" "$@"
+
+    # Always foreground exec — no tmux. See run_claude for rationale.
+    exec opencode "${args[@]}" "$@"
 }
 
 # --- mode: shell -----------------------------------------------------------
