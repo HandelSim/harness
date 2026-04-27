@@ -48,7 +48,11 @@ harness claude -p "What is 2+2? Reply with just the number."
 - rough latency (count seconds with a stopwatch; first-token vs. completion)
 - whether the response is sensible
 
-## Scenario B: Claude TUI session and detach/reattach
+## Scenario B: Claude TUI session
+
+> Phase 18 dropped the tmux-detached-session model — the agent CLI now runs
+> as the container's foreground process. There is no detach/reattach; exit
+> the agent (`/exit` or Ctrl-D) and the container exits cleanly.
 
 In one terminal:
 
@@ -61,23 +65,18 @@ Inside the TUI, send the prompt:
 
 > List the files in this directory and tell me one observation about it.
 
-Wait for the response. Then:
+Wait for the response. Then send a follow-up prompt that requires the
+prior context:
 
-1. Press `Ctrl-b d` to detach from tmux. You should land back at your host
-   shell. Verify with `harness list` — the agent should still appear.
-2. Run `harness attach`. Verify the picker appears (or auto-attaches if only
-   one agent), and that you reconnect to the same session with full
-   scrollback intact.
-3. Inside the TUI, send a follow-up prompt that requires the prior context:
+> What was the file you found most interesting and why?
 
-   > What was the file you found most interesting and why?
+Verify the agent answers based on the earlier listing.
 
-   Verify the agent answers based on the earlier listing.
-4. Detach again with `Ctrl-b d`. Run `harness stop` and confirm the agent
-   is terminated.
+Exit the agent with `/exit`. Confirm with `harness list` that no agents
+remain.
 
-Report the response quality, whether scrollback survived detach/reattach,
-and whether the picker behaved sensibly.
+Report the response quality and whether mouse-scroll behaves correctly
+(scrolls the conversation, not the prompt history).
 
 ## Scenario C: Opencode equivalent of A and B
 
@@ -94,8 +93,8 @@ mkdir -p /tmp/harness-manual-C && cd /tmp/harness-manual-C
 harness opencode
 ```
 
-Same shape as Scenario B: send a prompt, detach with `Ctrl-b d`, reattach
-via `harness attach`, send a follow-up, then `harness stop`.
+Same shape as Scenario B: send a prompt, send a follow-up that requires
+prior context, then exit the agent.
 
 Note any opencode-specific behaviors (different keybindings, different
 status indicators, slower or faster response). Some opencode versions
@@ -154,8 +153,7 @@ In each TUI, send a unique prompt that mentions a unique landmark
 about Lake Baikal" in the other). Verify outputs do not cross-contaminate
 — the Fuji terminal must not produce Baikal text and vice versa.
 
-Detach both, then `harness stop` each by name (use names from
-`harness list`).
+Exit both agents (`/exit`).
 
 Report whether the two agents coexisted cleanly, whether `harness list`
 distinguished them, and whether outputs stayed in their respective
@@ -163,8 +161,8 @@ sessions.
 
 ## Scenario F: Stop with picker
 
-Bring up at least two agents (e.g. repeat Scenario E setup). Detach from
-both so you're back at the host shell. Run:
+Bring up at least two agents in two separate terminals (e.g. repeat
+Scenario E setup, leaving both running). In a third terminal:
 
 ```
 harness stop
@@ -210,7 +208,7 @@ Send a prompt that produces a long response:
 
 When you see text actively streaming into the pane, press `Ctrl-C`. The
 TUI should remain alive (claude itself handles the SIGINT and prompts you
-again; tmux is unaffected).
+again).
 
 Verify by sending a follow-up:
 
@@ -218,12 +216,9 @@ Verify by sending a follow-up:
 
 Expected: a normal response. The session is still healthy.
 
-Detach with `Ctrl-b d`, reattach with `harness attach`, and verify the
-scrollback shows both the interrupted essay and the follow-up exchange.
-Then `harness stop`.
+Exit the agent (`/exit`).
 
-Report whether interrupt + follow-up worked cleanly, and whether
-scrollback survived the round trip.
+Report whether interrupt + follow-up worked cleanly.
 
 ## Scenario I: Configuration failure mode
 

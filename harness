@@ -516,7 +516,6 @@ commands:
                         run the ccstatusline configurator inside an ephemeral
                         agent container (no ollama/proxy needed)
   list                  list running harness agent containers
-  attach [name]         re-attach to a running agent (picker if no name)
   stop   [name]         stop a running agent (picker if no name)
   net <subcmd>          manage the egress allowlist + per-service firewall
                         overrides (see 'harness net')
@@ -530,7 +529,7 @@ agent flags:
   --yolo                pass auto-approve / skip-permissions to the agent
   --net                 disable the per-container firewall for THIS launch
                         only (full outbound network). Audit-logged on stderr.
-  -p, --print "PROMPT"  headless single-shot invocation (no tmux); for claude
+  -p, --print "PROMPT"  headless single-shot invocation; for claude
                         forwards its native -p flag, for opencode invokes
                         `opencode run` inside the container
 
@@ -555,11 +554,11 @@ agent flags:
   net close <service>               re-enable firewall for one service
 
 notes:
-  - 'harness down' stops services but leaves agent containers alone. Stop
-    individual agents with 'harness stop'.
+  - 'harness down' stops labeled agent containers, then services and
+    network. Stop individual agents with 'harness stop'.
   - agent containers are named harness-<tool>-<hash> where the hash is
     derived from the working directory; relaunching from the same directory
-    refuses to start a second copy and points you at 'harness attach'.
+    refuses to start a second copy if one is already running.
   - 'harness doctor' is diagnostic-only and never modifies state.
 EOF
 }
@@ -982,12 +981,15 @@ write_agent_mcp_config() {
 
 # Run an agent (claude or opencode) in the current directory.
 #
-# The container is started detached, with /workspace bind-mounted to $PWD
-# and the shared agent home bind-mounted from <install-root>/state/agent/home.
-# We then poll for the tmux session to become ready and exec into it.
+# Phase 18 dropped the tmux-detached-session model; the agent CLI is now the
+# container's foreground process. /workspace is bind-mounted to $PWD and the
+# shared agent home is bind-mounted from <install-root>/state/agent/home;
+# the entrypoint also symlinks $PWD inside the container so `pwd` reflects
+# the host path.
 #
-# With -p / --print as the FIRST harness-level flag, we bypass tmux and run
-# the agent in the foreground for single-shot scripted use.
+# -p / --print uses the same foreground path with HARNESS_PRINT_MODE=1 set
+# (which makes opencode use `opencode run` and skips claude's first-run
+# dialogs).
 run_agent() {
     local tool="$1"; shift
 
@@ -1073,10 +1075,16 @@ agent_common_env() {
     local tool="$1"
     local yolo="$2"
     local net_open="${3:-0}"
+    local mount_path="${4:-}"
     printf -- '-e\nHOST_UID=%s\n' "$(id -u)"
     printf -- '-e\nHOST_GID=%s\n' "$(id -g)"
     printf -- '-e\nHARNESS_YOLO=%s\n' "$yolo"
     printf -- '-e\nOLLAMA_AGENT_MODEL=%s\n' "$agent_model"
+    # The entrypoint symlinks this path to /workspace so `pwd` inside the
+    # container reflects the host path the user launched from.
+    if [[ -n "$mount_path" ]]; then
+        printf -- '-e\nHARNESS_HOST_CWD=%s\n' "$mount_path"
+    fi
     if [[ "$net_open" == "1" ]]; then
         # Honored by firewall/init-firewall.sh — full opt-out. Setting it to
         # "0" explicitly when not opted-in is intentional: a stale value in
@@ -1096,11 +1104,11 @@ agent_common_env() {
 
 # Build the env-flag array from agent_common_env's newline-delimited output.
 collect_agent_env() {
-    local tool="$1" yolo="$2" net_open="${3:-0}"
+    local tool="$1" yolo="$2" net_open="${3:-0}" mount_path="${4:-}"
     local -a out=()
     while IFS= read -r line; do
         out+=("$line")
-    done < <(agent_common_env "$tool" "$yolo" "$net_open")
+    done < <(agent_common_env "$tool" "$yolo" "$net_open" "$mount_path")
     printf '%s\0' "${out[@]}"
 }
 
@@ -1113,10 +1121,12 @@ run_agent_interactive() {
     local cname
     cname=$(agent_container_name "$tool" "$mount_path")
 
-    # Already running for this dir+tool? Tell the user to attach instead.
+    # Already running for this dir+tool? Refuse — there's no reattach now,
+    # so a duplicate would either compete for the TTY or just die in the
+    # background. Stop the existing one first.
     if [[ -n "$(docker ps -q -f "name=^${cname}$" 2>/dev/null)" ]]; then
         err "$tool agent already running here ($cname)"
-        err "use 'harness attach' to reconnect"
+        err "stop it first with 'harness stop $cname' (or 'harness stop' for a picker)"
         exit 1
     fi
 
@@ -1129,8 +1139,15 @@ run_agent_interactive() {
     # gosu-dropping back to harness. Without this, the container runs as
     # harness uid 1000 directly and the remap block is bypassed (matching
     # the test-mode path used by full_pipeline_test.sh).
+    #
+    # --rm + -it: the agent CLI is the container's foreground process. The
+    # user's terminal connects directly to its PTY; container exits when
+    # the agent exits, and Docker removes it.
+    local tty_flag="-it"
+    [[ -t 0 ]] || tty_flag="-i"
+
     local docker_args=(
-        run -d
+        run --rm "$tty_flag"
         --name "$cname"
         --user 0:0
         --network "$network"
@@ -1143,7 +1160,7 @@ run_agent_interactive() {
     local env_line
     while IFS= read -r -d '' env_line; do
         docker_args+=("$env_line")
-    done < <(collect_agent_env "$tool" "$yolo" "$net_open")
+    done < <(collect_agent_env "$tool" "$yolo" "$net_open" "$mount_path")
 
     # Normalize host bind-mount sources for Windows Docker Desktop.
     # On Linux/macOS these are passthrough; on Windows they're rewritten
@@ -1172,34 +1189,7 @@ run_agent_interactive() {
         docker_args+=("${pass_args[@]}")
     fi
 
-    local cid
-    cid=$(harness_docker "${docker_args[@]}")
-
-    # Poll for tmux readiness. The entrypoint takes a moment to start the
-    # session; without this wait, exec races and fails. tmux is owned by
-    # the harness user inside the container (the entrypoint does
-    # `exec gosu harness ...` after the UID remap), so we exec as harness
-    # rather than the container's default root — root's tmux client looks
-    # at /tmp/tmux-0/default, which doesn't exist.
-    local tries=40   # 40 * 0.5s = 20s ceiling
-    while (( tries > 0 )); do
-        if harness_docker exec --user harness "$cid" tmux has-session -t harness-agent 2>/dev/null; then
-            break
-        fi
-        if [[ -z "$(docker ps -q -f "id=$cid" 2>/dev/null)" ]]; then
-            err "agent container exited before tmux session started"
-            docker logs "$cname" 2>&1 | tail -30 >&2 || true
-            exit 1
-        fi
-        sleep 0.5
-        tries=$(( tries - 1 ))
-    done
-    if (( tries == 0 )); then
-        err "tmux session not ready after 20s; check 'docker logs $cname'"
-        exit 1
-    fi
-
-    harness_docker_exec exec -it --user harness "$cid" tmux attach -t harness-agent
+    harness_docker_exec "${docker_args[@]}"
 }
 
 # Headless single-shot agent invocation. No tmux, no detach, no labels (so
@@ -1231,7 +1221,7 @@ run_agent_print() {
     local env_line
     while IFS= read -r -d '' env_line; do
         docker_args+=("$env_line")
-    done < <(collect_agent_env "$tool" "$yolo" "$net_open")
+    done < <(collect_agent_env "$tool" "$yolo" "$net_open" "$mount_path")
 
     # See run_agent_interactive for the harness_docker_path rationale.
     local mp_host ah_host alp_host
@@ -1303,6 +1293,7 @@ cmd_shell() {
         --cap-add NET_RAW \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
+        -e "HARNESS_HOST_CWD=$mount_path" \
         -v "$mp_host:/workspace" \
         -v "$ah_host:/home/harness" \
         -v "$alp_host:/etc/harness/allowlist:ro" \
@@ -1358,47 +1349,6 @@ pick_agent() {
         exit 1
     fi
     printf '%s\n' "${names[$((choice - 1))]}"
-}
-
-cmd_attach() {
-    require_docker
-    local target="${1:-}"
-
-    if [[ -z "$target" ]]; then
-        local mount_path
-        mount_path=$(realpath "$PWD")
-        # First try to find agents whose mount matches PWD.
-        local here
-        here=$(docker ps \
-            --filter "label=harness.agent=true" \
-            --filter "label=harness.mount=$mount_path" \
-            --format '{{.Names}}\t{{.Label "harness.tool"}}\t{{.Label "harness.mount"}}')
-        local count=0
-        if [[ -n "$here" ]]; then
-            count=$(printf '%s\n' "$here" | wc -l)
-        fi
-        if (( count == 1 )); then
-            target=$(printf '%s' "$here" | cut -f1)
-        elif (( count > 1 )); then
-            target=$(pick_agent "$here")
-        else
-            local all
-            all=$(list_agents_raw)
-            if [[ -z "$all" ]]; then
-                err "no harness agents running"
-                exit 1
-            fi
-            target=$(pick_agent "$all")
-        fi
-    fi
-
-    if [[ -z "$(docker ps -q -f "name=^${target}$" 2>/dev/null)" ]]; then
-        err "no running container named '$target'"
-        exit 1
-    fi
-    # tmux is owned by the harness user inside the container; see the
-    # explanation in run_agent_interactive.
-    harness_docker_exec exec -it --user harness "$target" tmux attach -t harness-agent
 }
 
 cmd_stop() {
@@ -3091,7 +3041,6 @@ main() {
         shell)                      cmd_shell "$@" ;;
         claude-statusline-config)   cmd_claude_statusline_config "$@" ;;
         list)                       cmd_list ;;
-        attach)                     cmd_attach "$@" ;;
         stop)                       cmd_stop "$@" ;;
         net)                        cmd_net "$@" ;;
         mcp)                        cmd_mcp "$@" ;;

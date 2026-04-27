@@ -8,8 +8,8 @@
 #   - logs       (follows service logs, killed by timeout)
 #   - down       (tears services down)
 #
-# Interactive subcommands (claude, opencode, attach with picker, stop with
-# picker) require a TTY and live upstream — those are validated by
+# Interactive subcommands (claude, opencode, stop with picker) require a
+# TTY and live upstream — those are validated by
 # scripts/full_pipeline_test.sh (T9/T10/T11) and by the manual smoke checks
 # documented in MANUAL_TEST_PROMPT.md. They are NOT covered here.
 #
@@ -207,7 +207,7 @@ echo "[harness-test] T4 OK"
 
 echo "[harness-test] T5: harness help mentions all subcommands"
 help_out=$("${HARNESS_BIN}" help)
-for cmd in start down restart update upgrade logs claude opencode list attach stop net mcp doctor claude-statusline-config; do
+for cmd in start down restart update upgrade logs claude opencode list stop net mcp doctor claude-statusline-config; do
     if ! grep -q "$cmd" <<<"${help_out}"; then
         echo "[harness-test] T5 FAIL: help text missing '${cmd}'" >&2
         exit 1
