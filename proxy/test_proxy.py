@@ -22,7 +22,7 @@ class TestFormatTools(unittest.TestCase):
     def test_empty_array_returns_no_tools(self):
         self.assertEqual(proxy.format_tools_to_text([]), "No tools available.")
 
-    def test_required_and_optional_labels(self):
+    def test_top_level_schema_emitted(self):
         tools = [{
             "type": "function",
             "function": {
@@ -40,10 +40,98 @@ class TestFormatTools(unittest.TestCase):
         }]
         out = proxy.format_tools_to_text(tools)
         self.assertIn("get_weather", out)
-        self.assertIn("**REQUIRED**", out)
-        self.assertIn("Optional", out)
-        self.assertIn("`city`", out)
-        self.assertIn("`units`", out)
+        self.assertIn("city", out)
+        self.assertIn("units", out)
+        # JSON Schema's own required-array marks the required field.
+        self.assertIn('"required"', out)
+        self.assertIn('"city"', out)
+
+    def test_tool_call_emits_id_field(self):
+        """Tool calls in NDJSON output must include an 'id' field that downstream
+        Anthropic-compatible agents (claude-code) require for tool_use blocks."""
+        chunks = list(proxy.generate_ndjson(
+            model_name="test-model",
+            clean_text="",
+            tool_call_payload={"name": "Bash", "arguments": {"command": "ls"}},
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        ))
+        found_tc = False
+        for chunk_str in chunks:
+            chunk = json.loads(chunk_str)
+            msg = chunk.get("message", {})
+            tcs = msg.get("tool_calls")
+            if tcs:
+                found_tc = True
+                self.assertEqual(len(tcs), 1)
+                tc = tcs[0]
+                self.assertIn("id", tc, "tool_call must have 'id' field")
+                self.assertTrue(
+                    tc["id"].startswith("toolu_"),
+                    f"id should start with 'toolu_', got: {tc['id']}",
+                )
+                self.assertEqual(tc["function"]["name"], "Bash")
+        self.assertTrue(found_tc, "expected at least one chunk with tool_calls")
+
+    def test_tool_call_ids_are_unique(self):
+        """Two separate tool calls should get different ids."""
+        payload = {"name": "Bash", "arguments": {"command": "ls"}}
+        chunks1 = list(proxy.generate_ndjson("m", "", payload, {}))
+        chunks2 = list(proxy.generate_ndjson("m", "", payload, {}))
+
+        def get_id(chunks):
+            for c in chunks:
+                msg = json.loads(c).get("message", {})
+                tcs = msg.get("tool_calls")
+                if tcs:
+                    return tcs[0].get("id")
+            return None
+
+        id1 = get_id(chunks1)
+        id2 = get_id(chunks2)
+        self.assertIsNotNone(id1)
+        self.assertIsNotNone(id2)
+        self.assertNotEqual(id1, id2, "two tool calls should have unique ids")
+
+    def test_format_tools_includes_nested_schema(self):
+        """Tools with nested object/array parameters must have full schema in
+        the formatted output, not just top-level field names."""
+        tools = [{
+            "function": {
+                "name": "todowrite",
+                "description": "Write a todo list",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "description": "The updated todo list",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {"type": "string", "description": "Brief description"},
+                                    "status": {"type": "string", "description": "Current status"},
+                                    "priority": {"type": "string", "description": "Priority level"},
+                                },
+                                "required": ["content", "status", "priority"],
+                            },
+                        },
+                    },
+                    "required": ["todos"],
+                },
+            },
+        }]
+        text = proxy.format_tools_to_text(tools)
+        self.assertIn("todowrite", text)
+        self.assertIn("todos", text)
+        self.assertIn("content", text, "nested 'content' field missing from formatted tools")
+        self.assertIn("status", text, "nested 'status' field missing from formatted tools")
+        self.assertIn("priority", text, "nested 'priority' field missing from formatted tools")
+        self.assertIn("required", text, "nested required marker missing")
+
+    def test_format_tools_handles_empty_tools(self):
+        """Empty tools list returns the 'No tools available' message."""
+        self.assertEqual(proxy.format_tools_to_text([]), "No tools available.")
+        self.assertEqual(proxy.format_tools_to_text(None), "No tools available.")
 
 
 class TestExtractToolCall(unittest.TestCase):

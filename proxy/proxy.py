@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import traceback
+import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
@@ -84,6 +85,13 @@ def save_debug_file(req_id: str, stage_prefix: str, stage_name: str, payload: An
 # ---------------------------------------------------------------------------
 
 def format_tools_to_text(tools_array):
+    # Emit the full JSON Schema for each tool's parameters rather than a
+    # one-level summary. The earlier flattened format dropped nested
+    # object/array structure (e.g., opencode's `todowrite` with an array of
+    # {content, status, priority} objects), so the upstream LLM had no idea
+    # what fields to populate inside each item. JSON Schema is the lingua
+    # franca here — Claude and other capable models read it natively. Token
+    # cost goes up a few KB per request; correctness wins.
     if not tools_array:
         return "No tools available."
     schema_text = ""
@@ -91,26 +99,13 @@ def format_tools_to_text(tools_array):
         func = tool.get("function", {}) if "function" in tool else tool
         name = func.get("name", "unknown_tool")
         desc = func.get("description", "No description provided.")
-        schema_text += f"Tool Name: `{name}`\nDescription: {desc}\nParameters:\n"
-
         parameters = func.get("parameters", {})
-        properties = parameters.get("properties", {})
-        required_fields = parameters.get("required", [])
-
-        if not properties:
-            schema_text += "- None\n"
-        else:
-            for param_name, param_details in properties.items():
-                param_type = param_details.get("type", "string")
-                param_desc = param_details.get("description", "")
-
-                if param_name in required_fields:
-                    req_label = "**REQUIRED**"
-                else:
-                    req_label = "Optional"
-
-                schema_text += f"- `{param_name}` ({param_type}) [{req_label}]: {param_desc}\n"
-        schema_text += "\n"
+        schema_text += f"Tool Name: `{name}`\n"
+        schema_text += f"Description: {desc}\n"
+        schema_text += "Parameters (JSON Schema):\n"
+        schema_text += "```json\n"
+        schema_text += json.dumps(parameters, indent=2)
+        schema_text += "\n```\n\n"
     return schema_text.strip()
 
 
@@ -395,10 +390,19 @@ def generate_ndjson(
     if clean_text:
         yield json.dumps(make_chunk(model_name, content=clean_text)) + "\n"
     if tool_call_payload:
-        tc = [{"function": {
-            "name": tool_call_payload["name"],
-            "arguments": tool_call_payload["arguments"],
-        }}]
+        # An `id` is required so claude-code can later reference the
+        # tool_use block in conversation history. Without it the
+        # Anthropic-compatible upstream rejects the next turn with
+        # "tool_use block missing required 'id' field". The toolu_<24hex>
+        # format mirrors what real Anthropic returns.
+        tool_call_id = f"toolu_{uuid.uuid4().hex[:24]}"
+        tc = [{
+            "id": tool_call_id,
+            "function": {
+                "name": tool_call_payload["name"],
+                "arguments": tool_call_payload["arguments"],
+            },
+        }]
         yield json.dumps(make_chunk(model_name, tool_calls=tc)) + "\n"
     done_reason = "tool_calls" if tool_call_payload else "stop"
     yield json.dumps(make_chunk(model_name, done=True, done_reason=done_reason, usage=usage)) + "\n"

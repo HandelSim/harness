@@ -589,16 +589,58 @@ cmd_start() {
     # Active MCPs sit behind the `mcp` profile so they're only brought up
     # when something has been `harness mcp enable`d. Without --profile they
     # are silently ignored even though the -f file is on the compose argv.
+    local up_rc=0
     if any_mcp_active; then
-        compose --profile mcp up -d "${build_flag[@]}"
+        compose --profile mcp up -d "${build_flag[@]}" || up_rc=$?
     else
-        compose up -d "${build_flag[@]}"
+        compose up -d "${build_flag[@]}" || up_rc=$?
+    fi
+
+    # When compose fails (typically a service container failing its
+    # healthcheck), print actionable diagnostics. Without this hint the
+    # user sees only "dependency failed to start: container ... is
+    # unhealthy" with no guidance on how to look inside.
+    if (( up_rc != 0 )); then
+        echo
+        echo "[harness] start failed (exit $up_rc). Common causes:"
+        echo "  - PROXY_API_URL or PROXY_API_KEY missing/wrong in .env"
+        echo "  - Upstream API hostname not in .harness-allowlist"
+        echo "  - Stale Docker resources (try: harness down)"
+        echo
+        echo "To diagnose, run:"
+        echo "  harness preflight                   # validates configuration"
+        echo "  docker logs harness-proxy-1         # what the proxy printed on startup"
+        echo "  docker logs harness-ollama-1        # what ollama printed on startup"
+        return $up_rc
     fi
 }
 
 cmd_down() {
     require_docker
-    compose down
+
+    # Stop any agent containers attached to this project's network. They were
+    # started by `harness claude`/`opencode` via direct docker run (not
+    # compose), so compose doesn't know about them — but they hold the
+    # network in use, blocking compose's network teardown and forcing the
+    # user to clean up by hand.
+    local agent_cids
+    agent_cids=$(docker ps -q \
+        --filter "label=harness.project=$project_name" \
+        --filter "label=harness.agent=true" 2>/dev/null)
+    if [[ -n "$agent_cids" ]]; then
+        local agent_names
+        agent_names=$(docker ps \
+            --filter "label=harness.project=$project_name" \
+            --filter "label=harness.agent=true" \
+            --format '{{.Names}}' | tr '\n' ' ')
+        echo "[harness] stopping agent containers: $agent_names"
+        # shellcheck disable=SC2086
+        docker stop $agent_cids >/dev/null 2>&1 || true
+        # shellcheck disable=SC2086
+        docker rm -f $agent_cids >/dev/null 2>&1 || true
+    fi
+
+    compose down "$@"
 }
 
 # Restart core services. Convenience for the common "I edited .env or
@@ -1120,6 +1162,7 @@ run_agent_interactive() {
         -v "$alp_host:/etc/harness/allowlist:ro"
         -w /workspace
         --label "harness.agent=true"
+        --label "harness.project=$project_name"
         --label "harness.tool=$tool"
         --label "harness.mount=$mount_path"
         "$image"

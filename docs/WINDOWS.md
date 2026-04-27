@@ -94,6 +94,22 @@ git reset --hard
 
 This re-checks-out files with the .gitattributes rules applied. Should not be needed in practice.
 
+## Terminal font for Unicode rendering
+
+Claude-code and opencode use Unicode box-drawing and indicator characters
+in their TUI. Git Bash's default font (Lucida Console) has limited Unicode
+coverage. If you see underscores instead of box characters or icons, switch
+to a font with broader Unicode coverage:
+
+1. Right-click the MinTTY title bar
+2. Options → Text → Font → Select
+3. Pick "Cascadia Code", "Cascadia Mono", or "DejaVu Sans Mono"
+4. Apply
+
+The locale inside agent containers is set to C.UTF-8, so the rendering
+capability is there — only the host terminal font choice limits what
+displays correctly.
+
 ## Performance notes
 
 - Bind mounts to NTFS are slower than to Linux ext4. For performance-sensitive workloads, consider running harness inside WSL2 — but that's beyond the scope of this guide.
