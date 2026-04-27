@@ -53,7 +53,7 @@ class TestFormatTools(unittest.TestCase):
         chunks = list(proxy.generate_ndjson(
             model_name="test-model",
             clean_text="",
-            tool_call_payload={"name": "Bash", "arguments": {"command": "ls"}},
+            tool_call_payloads=[{"name": "Bash", "arguments": {"command": "ls"}}],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         ))
         found_tc = False
@@ -75,9 +75,9 @@ class TestFormatTools(unittest.TestCase):
 
     def test_tool_call_ids_are_unique(self):
         """Two separate tool calls should get different ids."""
-        payload = {"name": "Bash", "arguments": {"command": "ls"}}
-        chunks1 = list(proxy.generate_ndjson("m", "", payload, {}))
-        chunks2 = list(proxy.generate_ndjson("m", "", payload, {}))
+        payloads = [{"name": "Bash", "arguments": {"command": "ls"}}]
+        chunks1 = list(proxy.generate_ndjson("m", "", payloads, {}))
+        chunks2 = list(proxy.generate_ndjson("m", "", payloads, {}))
 
         def get_id(chunks):
             for c in chunks:
@@ -136,26 +136,26 @@ class TestFormatTools(unittest.TestCase):
 
 
 class TestExtractToolCall(unittest.TestCase):
-    def test_no_block_returns_none(self):
+    def test_no_block_returns_empty_list(self):
         text = "Just a normal answer with no JSON block."
-        payload, clean = proxy.extract_tool_call_and_text(text)
-        self.assertIsNone(payload)
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(payloads, [])
         self.assertEqual(clean, text)
 
     def test_valid_block_extracted_and_removed(self):
         text = 'Here is a tool call:\n```json\n{"name": "get_weather", "arguments": {"city": "Atlanta"}}\n```\nDone.'
-        payload, clean = proxy.extract_tool_call_and_text(text)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload["name"], "get_weather")
-        self.assertEqual(payload["arguments"], {"city": "Atlanta"})
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["name"], "get_weather")
+        self.assertEqual(payloads[0]["arguments"], {"city": "Atlanta"})
         self.assertNotIn("```json", clean)
         self.assertIn("Here is a tool call:", clean)
         self.assertIn("Done.", clean)
 
-    def test_malformed_json_returns_none(self):
+    def test_malformed_json_returns_empty_list(self):
         text = "```json\n{not valid json}\n```"
-        payload, clean = proxy.extract_tool_call_and_text(text)
-        self.assertIsNone(payload)
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(payloads, [])
         # The block isn't stripped on malformed JSON.
         self.assertIn("```json", clean)
 
@@ -175,16 +175,16 @@ class TestExtractToolCallScanner(unittest.TestCase):
 {"name": "Read", "arguments": {"path": "foo.txt"}}
 ```
 That's it.'''
-        payload, text = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload['name'], 'Read')
-        self.assertEqual(payload['arguments'], {'path': 'foo.txt'})
+        payloads, text = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]['name'], 'Read')
+        self.assertEqual(payloads[0]['arguments'], {'path': 'foo.txt'})
         self.assertNotIn('```json', text)
 
     def test_no_tool_call(self):
         response = "Just a plain text response with no tool call."
-        payload, text = proxy.extract_tool_call_and_text(response)
-        self.assertIsNone(payload)
+        payloads, text = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(payloads, [])
         self.assertEqual(text, response)
 
     def test_tool_call_with_embedded_code_fences_in_arguments(self):
@@ -203,20 +203,20 @@ That's it.'''
 }
 ```
 Done.'''
-        payload, text = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload, "Failed to extract tool call with embedded fences")
-        self.assertEqual(payload['name'], 'Write')
-        self.assertEqual(payload['arguments']['file_path'], 'README.md')
-        self.assertIn('```json', payload['arguments']['content'])
-        self.assertIn('"key"', payload['arguments']['content'])
+        payloads, text = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1, "Failed to extract tool call with embedded fences")
+        self.assertEqual(payloads[0]['name'], 'Write')
+        self.assertEqual(payloads[0]['arguments']['file_path'], 'README.md')
+        self.assertIn('```json', payloads[0]['arguments']['content'])
+        self.assertIn('"key"', payloads[0]['arguments']['content'])
 
     def test_tool_call_with_braces_in_string_values(self):
         response = '''```json
 {"name": "Run", "arguments": {"cmd": "echo {hello} and }nested{ braces"}}
 ```'''
-        payload, _ = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload['arguments']['cmd'], 'echo {hello} and }nested{ braces')
+        payloads, _ = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]['arguments']['cmd'], 'echo {hello} and }nested{ braces')
 
     def test_two_blocks_first_invalid(self):
         """Scenario 2: upstream shows a bad example then the real call.
@@ -229,9 +229,9 @@ But the real call is:
 ```json
 {"name": "Read", "arguments": {"path": "foo.txt"}}
 ```'''
-        payload, _ = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload['name'], 'Read')
+        payloads, _ = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]['name'], 'Read')
 
     def test_two_blocks_first_lacks_required_keys(self):
         """First block parses but isn't a tool call. Scanner should skip it."""
@@ -242,54 +242,55 @@ Now the actual call:
 ```json
 {"name": "Read", "arguments": {"path": "foo.txt"}}
 ```'''
-        payload, _ = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload['name'], 'Read')
+        payloads, _ = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]['name'], 'Read')
 
-    def test_first_valid_block_wins(self):
-        """If the first block IS a valid tool call, use it (don't keep searching)."""
+    def test_two_valid_blocks_both_extracted(self):
+        """If two valid blocks appear, both are extracted in order."""
         response = '''```json
 {"name": "First", "arguments": {}}
 ```
-And here's another for some reason:
+And here's another:
 ```json
 {"name": "Second", "arguments": {}}
 ```'''
-        payload, _ = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload['name'], 'First')
+        payloads, _ = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]['name'], 'First')
+        self.assertEqual(payloads[1]['name'], 'Second')
 
     def test_escaped_quotes_in_arguments(self):
         response = '''```json
 {"name": "Echo", "arguments": {"text": "She said \\"hi\\" to him"}}
 ```'''
-        payload, _ = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload['arguments']['text'], 'She said "hi" to him')
+        payloads, _ = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]['arguments']['text'], 'She said "hi" to him')
 
     def test_nested_objects_in_arguments(self):
         response = '''```json
 {"name": "Configure", "arguments": {"settings": {"foo": {"bar": 1, "baz": [1, 2, 3]}}, "enabled": true}}
 ```'''
-        payload, _ = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload['arguments']['settings']['foo']['bar'], 1)
-        self.assertEqual(payload['arguments']['enabled'], True)
+        payloads, _ = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]['arguments']['settings']['foo']['bar'], 1)
+        self.assertEqual(payloads[0]['arguments']['enabled'], True)
 
     def test_no_closing_fence_but_valid_json(self):
         """Malformed wrapper (no closing ```) but the JSON itself is complete."""
         response = '''```json
 {"name": "Read", "arguments": {"path": "foo.txt"}}'''
-        payload, _ = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload['name'], 'Read')
+        payloads, _ = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]['name'], 'Read')
 
     def test_truncated_json(self):
         """JSON object opens but never closes (depth never returns to 0)."""
         response = '''```json
 {"name": "Read", "arguments": {"path":'''
-        payload, text = proxy.extract_tool_call_and_text(response)
-        self.assertIsNone(payload)
+        payloads, text = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(payloads, [])
         self.assertEqual(text, response)
 
     def test_clean_text_strips_block(self):
@@ -298,11 +299,93 @@ And here's another for some reason:
 {"name": "Read", "arguments": {"path": "foo.txt"}}
 ```
 After block.'''
-        payload, clean = proxy.extract_tool_call_and_text(response)
-        self.assertIsNotNone(payload)
+        payloads, clean = proxy.extract_tool_calls_and_text(response)
+        self.assertEqual(len(payloads), 1)
         self.assertNotIn('```json', clean)
         self.assertIn('Before block.', clean)
         self.assertIn('After block.', clean)
+
+    def test_extract_multiple_tool_calls_in_order(self):
+        """When the response has multiple ```json blocks, all are extracted
+        in their order of appearance."""
+        text = (
+            "I'll read both files.\n\n"
+            "```json\n"
+            '{"name": "Read", "arguments": {"file_path": "/a.py"}}\n'
+            "```\n\n"
+            "```json\n"
+            '{"name": "Read", "arguments": {"file_path": "/b.py"}}\n'
+            "```\n\n"
+            "After that, I'll summarize."
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["arguments"]["file_path"], "/a.py")
+        self.assertEqual(payloads[1]["arguments"]["file_path"], "/b.py")
+        # Clean text has both blocks removed but preserves the surrounding text
+        self.assertIn("I'll read both files", clean)
+        self.assertIn("After that, I'll summarize", clean)
+        self.assertNotIn("```json", clean)
+        self.assertNotIn("/a.py", clean)
+        self.assertNotIn("/b.py", clean)
+
+    def test_extract_no_tool_calls_returns_empty_list(self):
+        """Plain text response (no tool calls) returns empty list, not None."""
+        text = "Hello! How can I help you today?"
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(payloads, [])
+        self.assertEqual(clean, text)
+
+    def test_extract_invalid_json_block_left_in_text(self):
+        """A ```json block with invalid JSON or wrong shape stays in the text."""
+        text = (
+            "Here's a JSON example I'm describing:\n"
+            "```json\n"
+            '{"this is": "not a tool call"}\n'
+            "```\n"
+            "And here's a real one:\n"
+            "```json\n"
+            '{"name": "Read", "arguments": {"file_path": "/x.py"}}\n'
+            "```"
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["name"], "Read")
+        # The invalid block stays in clean text (it's just text, not a tool call)
+        self.assertIn("not a tool call", clean)
+
+    def test_generate_ndjson_emits_multiple_tool_calls(self):
+        """Multiple tool calls produce a single tool_calls array in one chunk,
+        each with a unique id."""
+        payloads = [
+            {"name": "Read", "arguments": {"file_path": "/a.py"}},
+            {"name": "Read", "arguments": {"file_path": "/b.py"}},
+            {"name": "Bash", "arguments": {"command": "ls"}},
+        ]
+        chunks = list(proxy.generate_ndjson("test-model", "", payloads, {}))
+
+        # Find the chunk with tool_calls
+        found_tc_chunk = None
+        for chunk_str in chunks:
+            chunk = json.loads(chunk_str)
+            msg = chunk.get("message", {})
+            tcs = msg.get("tool_calls")
+            if tcs:
+                found_tc_chunk = tcs
+
+        self.assertIsNotNone(found_tc_chunk)
+        self.assertEqual(len(found_tc_chunk), 3)
+
+        # Each call has its own unique id
+        ids = [tc["id"] for tc in found_tc_chunk]
+        self.assertEqual(len(set(ids)), 3, "ids should be unique")
+        for tc_id in ids:
+            self.assertTrue(tc_id.startswith("toolu_"))
+
+        # Order preserved
+        self.assertEqual(found_tc_chunk[0]["function"]["arguments"]["file_path"], "/a.py")
+        self.assertEqual(found_tc_chunk[1]["function"]["arguments"]["file_path"], "/b.py")
+        self.assertEqual(found_tc_chunk[2]["function"]["name"], "Bash")
 
 
 class TestTranslateHistory(unittest.TestCase):
