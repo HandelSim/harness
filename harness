@@ -349,10 +349,13 @@ write_runtime_override() {
     } >"$runtime_override"
 }
 
-# Wrap docker compose with all the args we always pass. INSTALL_ROOT is
-# exported so MCP compose snippets can reference it via ${INSTALL_ROOT} for
-# absolute volume paths — relative paths in -f-included files have
-# inconsistent resolution semantics across docker compose versions.
+# Wrap docker compose with all the args we always pass. INSTALL_ROOT,
+# HARNESS_ALLOWLIST_PATH, and HARNESS_PROJECTS_ROOT are exported so MCP
+# compose snippets can reference them via plain ${VAR} (no defaults). The
+# fallback for HARNESS_PROJECTS_ROOT is computed here in bash rather than
+# in YAML because docker compose's interpolation parser doesn't reliably
+# resolve nested defaults like ${A:-${B}} — keeping compose snippets to
+# single-level ${VAR} references avoids that whole class of bug.
 compose() {
     write_runtime_override
     local args=(
@@ -375,8 +378,14 @@ compose() {
         [[ -n "$mcp_arg" ]] && args+=("$mcp_arg")
     done < <(mcp_compose_files)
 
+    # HARNESS_PROJECTS_ROOT may be set in .env (which compose reads via
+    # --env-file) or absent. If absent, fall back to the host's $HOME so
+    # the serena bind-mount always has a non-empty source.
+    local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
+
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
+        HARNESS_PROJECTS_ROOT="$projects_root" \
         docker "${args[@]}" "$@"
 }
 

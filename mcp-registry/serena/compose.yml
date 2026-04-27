@@ -54,7 +54,7 @@ services:
       # — mounting directly at /workspaces shadows the image content and
       # leaves the container with no serena code to run. Per upstream
       # DOCKER.md, projects activate via /workspaces/projects/<name>.
-      - ${HARNESS_PROJECTS_ROOT:-/home}:/workspaces/projects:ro
+      - ${HARNESS_PROJECTS_ROOT}:/workspaces/projects:ro
       # Per-install index cache. Mounted at a path the image leaves
       # writable (NOT /workspaces/serena/config — that holds the seeded
       # serena_config.yml, and a bind mount would shadow it with an empty
@@ -64,7 +64,13 @@ services:
       # Universal egress firewall allowlist. Same path/policy as harness's
       # own services — see the cap_add note above for why this is mounted
       # even when the firewall is not actively applied.
-      - ${HARNESS_ALLOWLIST_PATH:-${INSTALL_ROOT}/.harness-allowlist}:/etc/harness/allowlist:ro
+      #
+      # All three of HARNESS_PROJECTS_ROOT / INSTALL_ROOT / HARNESS_ALLOWLIST_PATH
+      # are resolved in the harness `compose()` wrapper before invoking
+      # docker. Keeping these as plain ${VAR} references (no nested defaults
+      # like ${A:-${B}}) avoids docker compose's interpolation parser
+      # tripping on multi-level expansion.
+      - ${HARNESS_ALLOWLIST_PATH}:/etc/harness/allowlist:ro
     # The Serena dashboard listens on 24282 inside the container; other
     # services on harness-net can reach it via this `expose`. To publish
     # it to a host port, set SERENA_DASHBOARD_PORT in .env and add a
