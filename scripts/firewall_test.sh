@@ -109,10 +109,9 @@ if ! test_wait_for_healthy "$PROJECT_POS" mockupstream proxy ollama 180; then
     exit 1
 fi
 
-# Per-service assertions. The agent containers (claude-agent / opencode-agent)
-# in compose.yml are stub services — they exit immediately because they have
-# no `command` and no agent invocation — so we only assert against the long-
-# running services here.
+# Per-service assertions. The unified `agent` service in compose.yml is a
+# stub for build/debug — it exits immediately because it has no agent
+# invocation — so we only assert against the long-running services here.
 assert_firewall_in() {
     local svc="$1"
     local cid

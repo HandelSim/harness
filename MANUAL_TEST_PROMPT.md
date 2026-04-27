@@ -277,7 +277,7 @@ on first run.
 3. Exit the agent (`/exit`) and verify on the host that the file
    appeared in the mount:
    ```
-   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/state/agent/claude/.local/bin"
+   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/state/agent/home/.local/bin"
    ```
 4. Re-launch: `harness claude`. Inside the TUI, `! which graphify` should
    still resolve. (No re-install required — the binary was on disk all
@@ -287,7 +287,7 @@ on first run.
    from outside the container lifecycle.
 6. Verify the marker file exists:
    ```
-   ls -la <install-root>/state/agent/claude/.harness-home-initialized
+   ls -la <install-root>/state/agent/home/.harness-home-initialized
    ```
 
 Report whether each step passed cleanly, and the contents of the marker
@@ -447,7 +447,7 @@ Report:
 3. Re-launch `harness claude` and confirm the change is reflected. Also
    confirm:
    ```
-   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/state/agent/claude/.config/ccstatusline/settings.json"
+   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/state/agent/home/.config/ccstatusline/settings.json"
    ```
    exists. Settings persist across container rebuilds (bind-mounted home).
 

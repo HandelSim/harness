@@ -15,8 +15,8 @@
 #     .harness-allowlist                   # gitignored — egress allowlist
 #     state/                               # gitignored — runtime state
 #       output/                            # bind-mounted into the proxy
-#       agent/claude/                      # claude container's /home/harness
-#       agent/opencode/                    # opencode container's /home/harness
+#       agent/home/                        # shared agent /home/harness
+#                                            (claude, opencode, shell)
 #       mcp/<name>/                        # active MCP services
 #       ollama-data/                       # ollama's blob store
 #
@@ -195,8 +195,7 @@ require_runtime_config() {
 ensure_dirs() {
     mkdir -p \
         "$state_root/output" \
-        "$state_root/agent/claude" \
-        "$state_root/agent/opencode" \
+        "$state_root/agent/home" \
         "$state_root/ollama-data" \
         "$mcp_active_dir"
 }
@@ -411,6 +410,75 @@ agent_container_name() {
     printf 'harness-%s-%s' "$tool" "$hash"
 }
 
+# Pre-launch check: if the firewall is currently disabled (either via --net
+# for this invocation or via persistent `harness net open <service>` state),
+# print a loud warning and prompt the user before continuing.
+#
+# Args: <agent_net_open_int> <tool>
+# Returns: 0 to proceed, 1 to abort.
+#
+# HARNESS_NET_CONFIRM=1 short-circuits the prompt (used by tests and by
+# users who've decided they don't want to be re-prompted every launch).
+warn_if_firewall_open() {
+    local agent_net_open="${1:-0}"
+    local tool="${2:-agent}"
+
+    local warn_messages=()
+    if (( agent_net_open )); then
+        warn_messages+=("This agent is being launched with --net (firewall DISABLED for this invocation).")
+    fi
+    if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
+        local opened
+        opened=$(jq -r '
+            (.services // {})
+            | to_entries[]?
+            | select(.value.firewall_disabled == true)
+            | .key
+        ' "$net_overrides_path" 2>/dev/null || true)
+        if [[ -n "$opened" ]]; then
+            local list
+            list=$(printf '%s' "$opened" | tr '\n' ' ' | sed 's/ *$//')
+            warn_messages+=("These services are running with firewall DISABLED: $list")
+        fi
+    fi
+
+    if (( ${#warn_messages[@]} == 0 )); then
+        return 0
+    fi
+
+    echo >&2
+    echo "WARNING: NETWORK FIREWALL IS DISABLED" >&2
+    local msg
+    for msg in "${warn_messages[@]}"; do
+        echo "  ! $msg" >&2
+    done
+    echo >&2
+    echo "Network egress from these contexts is NOT filtered by the harness allowlist." >&2
+    echo >&2
+
+    if [[ "${HARNESS_NET_CONFIRM:-0}" == "1" ]]; then
+        echo "  (auto-confirmed via HARNESS_NET_CONFIRM=1)" >&2
+        return 0
+    fi
+
+    if [[ ! -e /dev/tty ]]; then
+        err "non-interactive shell without /dev/tty; refusing to launch $tool"
+        err "set HARNESS_NET_CONFIRM=1 to skip this prompt in automation"
+        return 1
+    fi
+
+    local ans
+    printf 'Continue starting %s? [y/N]: ' "$tool" >&2
+    if ! IFS= read -r ans </dev/tty; then
+        err "no input received; aborting"
+        return 1
+    fi
+    case "${ans:-}" in
+        y|Y|yes|YES) return 0 ;;
+        *) err "aborted by user"; return 1 ;;
+    esac
+}
+
 # --- subcommands ------------------------------------------------------------
 
 cmd_help() {
@@ -432,9 +500,12 @@ commands:
   logs [service ...]    follow compose logs (no args = all services)
   claude  [args]        launch a claude-code agent in the current directory
   opencode [args]       launch an opencode agent in the current directory
+  shell                 drop into a bash shell inside the agent container
+                        (for installing skills, debugging — shares the home
+                        directory with claude/opencode launches)
   claude-statusline-config
                         run the ccstatusline configurator inside an ephemeral
-                        claude container (no ollama/proxy needed)
+                        agent container (no ollama/proxy needed)
   list                  list running harness agent containers
   attach [name]         re-attach to a running agent (picker if no name)
   stop   [name]         stop a running agent (picker if no name)
@@ -793,46 +864,30 @@ cmd_logs() {
     compose logs -f "$@"
 }
 
-# Resolve per-tool image/config-dir/config-target for both run paths.
-# Echoes three tab-separated fields on stdout: image, agent_config_dir,
-# agent_config_target.
+# Single shared agent image and home directory.
 #
-# The mount target is /home/harness for both tools — a full home rather
-# than a per-CLI subdirectory — so things the user installs inside the
-# agent (`pipx install graphifyy`, `pip install --user ...`) survive
-# container restarts. Build-time skel content is restored on first run by
-# the entrypoint via /etc/skel/harness/.
-agent_runtime_paths() {
-    local tool="$1"
-    case "$tool" in
-        claude)
-            printf 'harness-claude-agent:latest\t%s\t%s\n' \
-                "$state_root/agent/claude" "/home/harness"
-            ;;
-        opencode)
-            printf 'harness-opencode-agent:latest\t%s\t%s\n' \
-                "$state_root/agent/opencode" "/home/harness"
-            ;;
-        *)
-            err "unknown tool '$tool'"
-            exit 1
-            ;;
-    esac
-}
+# After the unification (Phase 13a), claude and opencode share both the
+# image and the persistent home. The entrypoint dispatches on a mode arg
+# (claude/opencode/shell) so user-installed skills and tools (pipx,
+# pip --user, ~/.gitconfig, etc.) are visible across all modes. Build-time
+# skel content is restored on first run by the entrypoint via
+# /etc/skel/harness/.
+agent_image() { printf 'harness-agent:latest'; }
+agent_home_dir() { printf '%s' "$state_root/agent/home"; }
 
-# Write the merged MCP client config to <install-root>/state/agent/<tool>/.harness-mcp-servers.json
-# so the entrypoint picks it up at startup. The harness emits a single
-# claude-style shape — `{"mcpServers": {"<name>": {...}}}` — and the per-
-# tool entrypoint translates to opencode's `mcp` block when needed. We
-# rewrite this file on every agent launch so disabling an MCP propagates
-# without leaving stale entries.
+# Write the merged MCP client config to <install-root>/state/agent/home/
+# .harness-mcp-servers.json so the entrypoint picks it up at startup. The
+# harness emits a single claude-style shape —
+# `{"mcpServers": {"<name>": {...}}}` — and the entrypoint translates to
+# opencode's `mcp` block when needed. We rewrite this file on every agent
+# launch so disabling an MCP propagates without leaving stale entries.
 #
 # When no MCPs are active, the file is removed so the entrypoint's "merge
 # if file exists" path becomes a no-op. Without this, a previously enabled
 # MCP would linger forever in the agent's config.
 write_agent_mcp_config() {
-    local tool="$1"
-    local out_file="$state_root/agent/$tool/.harness-mcp-servers.json"
+    local out_file
+    out_file="$(agent_home_dir)/.harness-mcp-servers.json"
 
     # Collect every installed-and-enabled MCP's client-config.json. Disabled
     # MCPs are skipped so toggling enabled=false hides the entry from agents
@@ -869,7 +924,7 @@ write_agent_mcp_config() {
 # Run an agent (claude or opencode) in the current directory.
 #
 # The container is started detached, with /workspace bind-mounted to $PWD
-# and the agent's config dir bind-mounted from <install-root>/state/agent/<tool>.
+# and the shared agent home bind-mounted from <install-root>/state/agent/home.
 # We then poll for the tmux session to become ready and exec into it.
 #
 # With -p / --print as the FIRST harness-level flag, we bypass tmux and run
@@ -912,36 +967,44 @@ run_agent() {
     ensure_services_up
     ensure_dirs
 
+    # Pre-launch: prompt user if any firewall is currently open. Skipped via
+    # HARNESS_NET_CONFIRM=1 (set by tests). --net is part of the prompt
+    # decision; we pass the flag in.
+    warn_if_firewall_open "$net_open" "$tool" || exit 1
+
     local mount_path
     mount_path=$(realpath "$PWD")
 
-    # Resolve per-tool paths.
-    local image agent_config_dir agent_config_target
-    IFS=$'\t' read -r image agent_config_dir agent_config_target < <(agent_runtime_paths "$tool")
-    mkdir -p "$agent_config_dir"
+    # Resolve unified image + shared home.
+    local image agent_home
+    image=$(agent_image)
+    agent_home=$(agent_home_dir)
+    mkdir -p "$agent_home"
 
     # Refresh the MCP side file before launch so the entrypoint sees the
     # current set of enabled MCPs. Done after mkdir so the dir exists.
-    write_agent_mcp_config "$tool"
+    write_agent_mcp_config
 
-    # Verify the image exists. We don't auto-build agents on first run
-    # because that's the job of `harness start`, which builds them via the
-    # `agent` profile.
+    # Build image on demand if missing — different from the per-tool
+    # behavior pre-13a where `harness start` was the only build path.
+    # `harness <tool>` is the natural first command users try; auto-build
+    # avoids the "no, you have to run start first" dance.
     if ! docker image inspect "$image" >/dev/null 2>&1; then
-        err "image $image not found; run 'harness start' to build it"
-        exit 1
+        echo "harness: building $image (one-time)..."
+        compose --profile agent build agent || {
+            err "agent image build failed; cannot launch $tool"
+            exit 1
+        }
     fi
 
     local network="${project_name}_harness-net"
 
     if (( print_mode )); then
         run_agent_print "$tool" "$yolo" "$net_open" "$mount_path" "$image" \
-            "$agent_config_dir" "$agent_config_target" "$network" \
-            "${pass_args[@]}"
+            "$agent_home" "$network" "${pass_args[@]}"
     else
         run_agent_interactive "$tool" "$yolo" "$net_open" "$mount_path" "$image" \
-            "$agent_config_dir" "$agent_config_target" "$network" \
-            "${pass_args[@]}"
+            "$agent_home" "$network" "${pass_args[@]}"
     fi
 }
 
@@ -984,8 +1047,8 @@ collect_agent_env() {
 
 run_agent_interactive() {
     local tool="$1" yolo="$2" net_open="$3" mount_path="$4" image="$5"
-    local agent_config_dir="$6" agent_config_target="$7" network="$8"
-    shift 8
+    local agent_home="$6" network="$7"
+    shift 7
     local pass_args=("$@")
 
     local cname
@@ -1027,14 +1090,14 @@ run_agent_interactive() {
     # On Linux/macOS these are passthrough; on Windows they're rewritten
     # to C:/Users/... form which Docker Desktop's WSL2 backend mounts
     # reliably (raw /tmp/... or /c/Users/... paths sometimes mount empty).
-    local mp_host acd_host alp_host
+    local mp_host ah_host alp_host
     mp_host=$(harness_docker_path "$mount_path")
-    acd_host=$(harness_docker_path "$agent_config_dir")
+    ah_host=$(harness_docker_path "$agent_home")
     alp_host=$(harness_docker_path "$allowlist_path")
 
     docker_args+=(
         -v "$mp_host:/workspace"
-        -v "$acd_host:$agent_config_target"
+        -v "$ah_host:/home/harness"
         # Universal firewall allowlist, read-only. The init script aborts the
         # container if this is missing.
         -v "$alp_host:/etc/harness/allowlist:ro"
@@ -1043,6 +1106,7 @@ run_agent_interactive() {
         --label "harness.tool=$tool"
         --label "harness.mount=$mount_path"
         "$image"
+        "$tool"
     )
     if (( ${#pass_args[@]} > 0 )); then
         docker_args+=("${pass_args[@]}")
@@ -1084,8 +1148,8 @@ run_agent_interactive() {
 # TTY for some output formats but pipe-based callers shouldn't get a TTY.
 run_agent_print() {
     local tool="$1" yolo="$2" net_open="$3" mount_path="$4" image="$5"
-    local agent_config_dir="$6" agent_config_target="$7" network="$8"
-    shift 8
+    local agent_home="$6" network="$7"
+    shift 7
     local pass_args=("$@")
 
     local tty_flag
@@ -1110,24 +1174,81 @@ run_agent_print() {
     done < <(collect_agent_env "$tool" "$yolo" "$net_open")
 
     # See run_agent_interactive for the harness_docker_path rationale.
-    local mp_host acd_host alp_host
+    local mp_host ah_host alp_host
     mp_host=$(harness_docker_path "$mount_path")
-    acd_host=$(harness_docker_path "$agent_config_dir")
+    ah_host=$(harness_docker_path "$agent_home")
     alp_host=$(harness_docker_path "$allowlist_path")
 
     docker_args+=(
         -e "HARNESS_PRINT_MODE=1"
         -v "$mp_host:/workspace"
-        -v "$acd_host:$agent_config_target"
+        -v "$ah_host:/home/harness"
         -v "$alp_host:/etc/harness/allowlist:ro"
         -w /workspace
         "$image"
+        "$tool"
     )
     if (( ${#pass_args[@]} > 0 )); then
         docker_args+=("${pass_args[@]}")
     fi
 
     harness_docker_exec "${docker_args[@]}"
+}
+
+# Drop into an interactive bash shell inside the unified agent container.
+# Uses the same shared home as `harness claude` / `harness opencode`, so any
+# install (pipx, pip --user, etc.) the user does in here is visible to the
+# agent commands later. Useful for installing skill-style tools (graphify),
+# poking around, debugging.
+cmd_shell() {
+    require_docker
+    ensure_dirs
+
+    local image
+    image=$(agent_image)
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "harness: building $image (one-time)..."
+        compose --profile agent build agent || {
+            err "agent image build failed; cannot launch shell"
+            exit 1
+        }
+    fi
+
+    local agent_home
+    agent_home=$(agent_home_dir)
+    mkdir -p "$agent_home"
+
+    local mount_path
+    mount_path=$(realpath "$PWD")
+
+    local network="${project_name}_harness-net"
+    if ! docker network inspect "$network" >/dev/null 2>&1; then
+        # Network doesn't exist (services never started). Use the default
+        # bridge — the shell doesn't need to talk to ollama or the proxy.
+        network="bridge"
+    fi
+
+    local tty_flag="-it"
+    [[ -t 0 ]] || tty_flag="-i"
+
+    local mp_host ah_host alp_host
+    mp_host=$(harness_docker_path "$mount_path")
+    ah_host=$(harness_docker_path "$agent_home")
+    alp_host=$(harness_docker_path "$allowlist_path")
+
+    harness_docker_exec run --rm "$tty_flag" \
+        --user 0:0 \
+        --network "$network" \
+        --cap-add NET_ADMIN \
+        --cap-add NET_RAW \
+        -e "HOST_UID=$(id -u)" \
+        -e "HOST_GID=$(id -g)" \
+        -v "$mp_host:/workspace" \
+        -v "$ah_host:/home/harness" \
+        -v "$alp_host:/etc/harness/allowlist:ro" \
+        -w /workspace \
+        "$image" \
+        shell
 }
 
 cmd_list() {
@@ -1996,12 +2117,25 @@ cmd_mcp() {
 # user is reminded to run `harness restart` to materialize the change in
 # running containers.
 
-# Names of the core services any of which can be opened/closed. MCP services
-# aren't in this list because they each have their own short-lived container
-# and the overrides file is keyed by docker-compose service name; if a future
-# MCP needs an opt-out we'd add it here.
+# Names of services that can be opened/closed. We enumerate via
+# `compose --profile mcp config --services` so installed MCP services
+# (which carry the `mcp` profile) show up alongside core services.
+# `agent` is included even though agents launch ephemerally — opening
+# the firewall for the `agent` service propagates onto every subsequent
+# `harness <agent>` launch via the runtime override file.
 net_known_services() {
-    printf '%s\n' proxy ollama claude-agent opencode-agent
+    if ! command -v docker >/dev/null 2>&1; then
+        printf '%s\n' proxy ollama agent
+        return 0
+    fi
+    local svcs
+    svcs=$(compose --profile mcp config --services 2>/dev/null || true)
+    if [[ -z "$svcs" ]]; then
+        # Compose not configured / fallback to the static core list.
+        printf '%s\n' proxy ollama agent
+        return 0
+    fi
+    printf '%s\n' "$svcs"
 }
 
 cmd_net_help() {
@@ -2025,11 +2159,11 @@ subcommands:
                                 <service>. Restores the universal firewall.
 
 services that accept open/close:
-  proxy, ollama, claude-agent, opencode-agent
+  proxy, ollama, agent, plus any installed MCP service.
 
 After any mutation, run `harness restart` to apply the change to running
-containers. (`net open` only takes effect on the next start of that
-container; `net allow/deny` is read at every container boot.)
+containers. Both `net open/close` and `net allow/deny` take effect on the
+next start of affected containers.
 EOF
 }
 
@@ -2274,15 +2408,17 @@ cmd_net() {
 cmd_claude_statusline_config() {
     require_docker
     ensure_dirs
-    local image="harness-claude-agent:latest"
+    local image
+    image=$(agent_image)
     if ! docker image inspect "$image" >/dev/null 2>&1; then
         # Build the image without starting the rest of the stack. We use
         # `docker compose build` so the agent profile/path resolution matches
         # `harness start` exactly.
         echo "harness: building $image (one-time)..."
-        compose --profile agent build claude-agent
+        compose --profile agent build agent
     fi
-    local agent_config_dir="$state_root/agent/claude"
+    local agent_config_dir
+    agent_config_dir=$(agent_home_dir)
     mkdir -p "$agent_config_dir"
 
     local tty_flag="-it"
@@ -2559,7 +2695,7 @@ cmd_doctor() {
     # ---------------- [storage] -------------
     doctor_section storage
     local d
-    for d in output agent/claude agent/opencode ollama-data; do
+    for d in output agent/home ollama-data; do
         local path="$state_root/$d"
         if [[ -d "$path" && -w "$path" ]]; then
             doctor_check ok "state/$d" "writable"
@@ -2658,8 +2794,7 @@ cmd_doctor() {
     for img in \
         "harness-ollama:${OLLAMA_VERSION:-0.21.2}" \
         "harness-proxy:latest" \
-        "harness-claude-agent:latest" \
-        "harness-opencode-agent:latest"
+        "harness-agent:latest"
     do
         if docker image inspect "$img" >/dev/null 2>&1; then
             doctor_check ok "$(printf '%s' "$img" | cut -d: -f1)" "$img present"
@@ -2806,8 +2941,7 @@ cmd_preflight() {
     # State dirs (optional — created on demand by ensure_dirs)
     if declare -f harness_check_dir_writable >/dev/null 2>&1; then
         harness_check_dir_writable "$state_root/output" false "output dir" || true
-        harness_check_dir_writable "$state_root/agent/claude" false "claude agent home" || true
-        harness_check_dir_writable "$state_root/agent/opencode" false "opencode agent home" || true
+        harness_check_dir_writable "$state_root/agent/home" false "agent home" || true
         harness_check_dir_writable "$state_root/ollama-data" false "ollama data dir" || true
     fi
 
@@ -2852,6 +2986,7 @@ main() {
         logs)                       cmd_logs "$@" ;;
         claude)                     run_agent claude   "$@" ;;
         opencode)                   run_agent opencode "$@" ;;
+        shell)                      cmd_shell "$@" ;;
         claude-statusline-config)   cmd_claude_statusline_config "$@" ;;
         list)                       cmd_list ;;
         attach)                     cmd_attach "$@" ;;

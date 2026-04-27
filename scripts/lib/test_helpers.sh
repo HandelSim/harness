@@ -25,6 +25,11 @@
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/lib/platform.sh"
 
+# `harness <agent>` will prompt the user before launching when the firewall
+# is open. Tests bypass that prompt unconditionally — they don't have a TTY
+# and they're not running real agents anyway.
+export HARNESS_NET_CONFIRM=1
+
 # --- preflight --------------------------------------------------------------
 
 # Verify docker daemon is reachable. Exits 1 with a clear message if not.

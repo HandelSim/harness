@@ -7,7 +7,7 @@
 # Test scenarios:
 #
 #   T1. First-run skel seed: starting a fresh container against an empty
-#       agent/claude/ dir populates it with the build-time skeleton
+#       agent/home/ dir populates it with the build-time skeleton
 #       (e.g. .bashrc, the marker file).
 #   T2. Marker file pins idempotency: a second container with the same
 #       mount does NOT overwrite anything; user files added between runs
@@ -48,7 +48,7 @@ fi
 # --- staging area -----------------------------------------------------------
 
 TEST_ROOT="$(mktemp -d -t harness-persist-test.XXXXXX)"
-AGENT_HOME="${TEST_ROOT}/agent/claude"
+AGENT_HOME="${TEST_ROOT}/agent/home"
 mkdir -p "${AGENT_HOME}"
 
 cleanup() {
@@ -82,14 +82,14 @@ trap cleanup EXIT INT TERM
 # runs first in CI and primes the image cache. If the image isn't there
 # (running this test in isolation), build it via compose --profile agent.
 
-if ! docker image inspect harness-claude-agent:latest >/dev/null 2>&1; then
-    echo "[persist] building harness-claude-agent (image not cached)"
+if ! docker image inspect harness-agent:latest >/dev/null 2>&1; then
+    echo "[persist] building harness-agent (image not cached)"
     # Build context only — we don't need ollama/proxy services for this
     # test, so we skip --env-file and the up dance.
     docker compose \
         --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
-        --profile agent build claude-agent >"${TEST_ROOT}/build.log" 2>&1 \
+        --profile agent build agent >"${TEST_ROOT}/build.log" 2>&1 \
         || { echo "[persist] FAIL: build failed; see ${TEST_ROOT}/build.log" >&2; tail -30 "${TEST_ROOT}/build.log" >&2; exit 1; }
 fi
 
@@ -118,7 +118,7 @@ run_in_agent() {
         --user harness \
         -e HOME=/home/harness \
         -e PATH="/home/harness/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-        harness-claude-agent:latest \
+        harness-agent:latest \
         -c "
             set -e
             # Inline skel-seed: same logic as the entrypoint.
@@ -255,7 +255,7 @@ fi
 # We use a fresh agent home so the seed actually fires for this test.
 
 echo "[persist] T4: ccstatusline default seed"
-T4_HOME="${TEST_ROOT}/agent/claude-t4"
+T4_HOME="${TEST_ROOT}/agent/home-t4"
 mkdir -p "${T4_HOME}"
 T4_HOME_HOST=$(harness_docker_path "${T4_HOME}")
 harness_docker run --rm \
@@ -264,7 +264,7 @@ harness_docker run --rm \
     --entrypoint /bin/bash \
     --user harness \
     -e HOME=/home/harness \
-    harness-claude-agent:latest \
+    harness-agent:latest \
     -c '
         set -e
         if [[ ! -f $HOME/.harness-home-initialized ]]; then
@@ -298,7 +298,7 @@ harness_docker run --rm \
     --entrypoint /bin/bash \
     --user harness \
     -e HOME=/home/harness \
-    harness-claude-agent:latest \
+    harness-agent:latest \
     -c '
         set -e
         if [[ ! -f $HOME/.harness-home-initialized ]]; then
@@ -327,7 +327,7 @@ echo "[persist] T4 OK"
 # free of network/ollama dependencies.
 
 echo "[persist] T5: claude settings.json statusLine block"
-T5_HOME="${TEST_ROOT}/agent/claude-t5"
+T5_HOME="${TEST_ROOT}/agent/home-t5"
 mkdir -p "${T5_HOME}"
 T5_HOME_HOST=$(harness_docker_path "${T5_HOME}")
 harness_docker run --rm \
@@ -336,7 +336,7 @@ harness_docker run --rm \
     --entrypoint /bin/bash \
     --user harness \
     -e HOME=/home/harness \
-    harness-claude-agent:latest \
+    harness-agent:latest \
     -c '
         set -e
         cp -an /etc/skel/harness/. $HOME/ 2>/dev/null || true

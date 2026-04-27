@@ -180,7 +180,7 @@ netlib_remove_host() {
 #
 #   {
 #     "services": {
-#       "claude-agent": {"firewall_disabled": true, "reason": "..."},
+#       "agent": {"firewall_disabled": true, "reason": "..."},
 #       "ollama": {"firewall_disabled": true}
 #     }
 #   }

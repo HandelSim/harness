@@ -15,7 +15,8 @@
 #     .harness-allowlist                   egress allowlist (gitignored)
 #     state/                               runtime state (gitignored)
 #       output/                            proxy debug dumps
-#       agent/{claude,opencode}/           persistent agent /home/harness
+#       agent/home/                        shared agent /home/harness
+#                                          (claude, opencode, shell)
 #       ollama-data/                       ollama model blobs
 #       mcp/<name>/                        active MCP services
 #
@@ -310,11 +311,10 @@ fi
 
 title "creating runtime state directories"
 mkdir -p "$install_root/state/output" \
-         "$install_root/state/agent/claude" \
-         "$install_root/state/agent/opencode" \
+         "$install_root/state/agent/home" \
          "$install_root/state/ollama-data" \
          "$install_root/state/mcp"
-ok "created state/output, state/agent/{claude,opencode}, state/ollama-data, state/mcp"
+ok "created state/output, state/agent/home, state/ollama-data, state/mcp"
 
 # --- .env handling ----------------------------------------------------------
 #

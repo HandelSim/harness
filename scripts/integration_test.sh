@@ -141,8 +141,7 @@ fi
 # Ensure all the runtime state dirs the harness expects exist.
 mkdir -p \
     "${TEST_INSTALL}/state/output" \
-    "${TEST_INSTALL}/state/agent/claude" \
-    "${TEST_INSTALL}/state/agent/opencode" \
+    "${TEST_INSTALL}/state/agent/home" \
     "${TEST_INSTALL}/state/ollama-data" \
     "${TEST_INSTALL}/state/mcp"
 
@@ -308,7 +307,7 @@ phase_2_serena() {
         bash -c "HOME='${FAKE_HOME}' HARNESS_PROJECT_NAME='${PROJECT_NAME}' '${TEST_INSTALL}/harness' claude -p \"say hello\" >/dev/null 2>&1 < /dev/null"
     cd "${REPO_ROOT}"
     set -e
-    local mcp_side_file="${TEST_INSTALL}/state/agent/claude/.harness-mcp-servers.json"
+    local mcp_side_file="${TEST_INSTALL}/state/agent/home/.harness-mcp-servers.json"
     if [[ ! -f "${mcp_side_file}" ]]; then
         echo "[integration] Phase 2.4 FAIL: side file missing at ${mcp_side_file}" >&2
         return 1
@@ -397,14 +396,15 @@ phase_2_tui_test() {
         -e "ANTHROPIC_MODEL=harness" \
         -e "ANTHROPIC_SMALL_FAST_MODEL=harness" \
         -v "${TEST_WORKSPACE}/test-project:/workspace" \
-        -v "${TEST_INSTALL}/state/agent/claude:/home/harness" \
+        -v "${TEST_INSTALL}/state/agent/home:/home/harness" \
         -v "${TEST_INSTALL}/.harness-allowlist:/etc/harness/allowlist:ro" \
         -w /workspace \
         --label "harness.agent=true" \
         --label "harness.project=${PROJECT_NAME}" \
         --label "harness.tool=claude" \
         --label "harness.mount=${TEST_WORKSPACE}/test-project" \
-        harness-claude-agent:latest \
+        harness-agent:latest \
+        claude \
         >/dev/null
 
     # Wait for tmux session to come up.
@@ -515,13 +515,13 @@ phase_3_graphify() {
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
         -v "${TEST_WORKSPACE}/test-project:/workspace" \
-        -v "${TEST_INSTALL}/state/agent/claude:/home/harness" \
+        -v "${TEST_INSTALL}/state/agent/home:/home/harness" \
         -v "${TEST_INSTALL}/.harness-allowlist:/etc/harness/allowlist:ro" \
         -w /workspace \
         --label "harness.agent=true" \
         --label "harness.project=${PROJECT_NAME}" \
         --entrypoint /bin/bash \
-        harness-claude-agent:latest \
+        harness-agent:latest \
         -c '
             set -e
             /usr/local/bin/init-firewall.sh
@@ -587,12 +587,12 @@ phase_3_graphify() {
     # would follow the dangling-on-host link and report missing. Test for
     # the symlink itself and for the venv directory underneath — both
     # together prove the bind-mount captured the install.
-    local host_bin="${TEST_INSTALL}/state/agent/claude/.local/bin/graphify"
-    local host_venv="${TEST_INSTALL}/state/agent/claude/.local/pipx/venvs/graphifyy"
+    local host_bin="${TEST_INSTALL}/state/agent/home/.local/bin/graphify"
+    local host_venv="${TEST_INSTALL}/state/agent/home/.local/pipx/venvs/graphifyy"
     if [[ ! -L "${host_bin}" || ! -d "${host_venv}" ]]; then
         echo "[integration] Phase 3.3 FAIL: graphify not visible on host bind mount" >&2
-        ls -la "${TEST_INSTALL}/state/agent/claude/.local/bin/" >&2 2>/dev/null || true
-        ls -la "${TEST_INSTALL}/state/agent/claude/.local/pipx/venvs/" >&2 2>/dev/null || true
+        ls -la "${TEST_INSTALL}/state/agent/home/.local/bin/" >&2 2>/dev/null || true
+        ls -la "${TEST_INSTALL}/state/agent/home/.local/pipx/venvs/" >&2 2>/dev/null || true
         return 1
     fi
     echo "[integration] Phase 3.3: install persists to host bind mount"
@@ -700,13 +700,13 @@ phase_3_graphify() {
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
         -v "${TEST_WORKSPACE}/test-project:/workspace" \
-        -v "${TEST_INSTALL}/state/agent/claude:/home/harness" \
+        -v "${TEST_INSTALL}/state/agent/home:/home/harness" \
         -v "${TEST_INSTALL}/.harness-allowlist:/etc/harness/allowlist:ro" \
         -w /workspace \
         --label "harness.agent=true" \
         --label "harness.project=${PROJECT_NAME}" \
         --entrypoint /bin/bash \
-        harness-claude-agent:latest \
+        harness-agent:latest \
         -c '
             set -e
             /usr/local/bin/init-firewall.sh

@@ -104,21 +104,22 @@ services:
       start_period: 5s
 
   # -------------------------------------------------------------------------
-  # Agent service stubs. Excluded from default compose operations via the
-  # `agent` profile so docker compose up doesn't try to start them. Phase 3
-  # populates ./agents/claude and ./agents/opencode and adds build: blocks.
+  # Unified agent service. Excluded from default compose operations via the
+  # `agent` profile so `docker compose up` doesn't try to start it. The
+  # entrypoint dispatches on a mode arg (claude / opencode / shell) so a
+  # single image and a single bind-mounted home backs all agent invocations.
   # -------------------------------------------------------------------------
-  claude-agent:
+  agent:
     build:
       # Repo root context so the Dockerfile can COPY firewall/ scripts.
       context: .
-      dockerfile: agents/claude/Dockerfile
-    image: harness-claude-agent:latest
-    # Agents are launched ephemerally via `harness claude` (docker run), but
+      dockerfile: agents/Dockerfile
+    image: harness-agent:latest
+    # Agents are launched ephemerally via `harness <mode>` (docker run), but
     # we still declare cap_add + the allowlist mount here so that
-    # `docker compose up claude-agent` works for debugging and so the runtime
+    # `docker compose up agent` works for debugging and so the runtime
     # contract is documented in one place. The harness CLI applies the same
-    # set on its docker run call (see harness:cmd_claude).
+    # set on its docker run call.
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -129,20 +130,4 @@ services:
     profiles:
       - agent
     # No restart policy: agents are ephemeral, launched per-invocation by
-    # Phase 4's `harness` script via `docker run`.
-
-  opencode-agent:
-    build:
-      # Repo root context so the Dockerfile can COPY firewall/ scripts.
-      context: .
-      dockerfile: agents/opencode/Dockerfile
-    image: harness-opencode-agent:latest
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    volumes:
-      - ${HARNESS_ALLOWLIST_PATH:-./.harness-allowlist}:/etc/harness/allowlist:ro
-    networks:
-      - harness-net
-    profiles:
-      - agent
+    # the `harness` script via `docker run`.

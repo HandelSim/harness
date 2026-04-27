@@ -211,8 +211,8 @@ A_OUT="$(harness_docker run --rm \
     -e OLLAMA_AGENT_MODEL=harness \
     -e HARNESS_TEST_MODE=1 \
     -v "${ALLOWLIST_FILE_HOST}:/etc/harness/allowlist:ro" \
-    harness-claude-agent:latest \
-    -p "Say hello" --dangerously-skip-permissions 2>&1)" \
+    harness-agent:latest \
+    claude -p "Say hello" --dangerously-skip-permissions 2>&1)" \
     || fail "A: docker run for claude exited non-zero" "${A_OUT}"
 echo "[agent-test]   A output (truncated): $(echo "${A_OUT}" | tail -c 600)"
 echo "${A_OUT}" | grep -q "Hello from mock upstream" \
@@ -227,8 +227,8 @@ B_OUT="$(harness_docker run --rm \
     -e OLLAMA_AGENT_MODEL=harness \
     -e HARNESS_TEST_MODE=1 \
     -v "${ALLOWLIST_FILE_HOST}:/etc/harness/allowlist:ro" \
-    harness-opencode-agent:latest \
-    "Say hello" 2>&1)"
+    harness-agent:latest \
+    opencode "Say hello" 2>&1)"
 B_RC=$?
 set -e
 
@@ -262,8 +262,8 @@ C_OUT="$(harness_docker run --rm \
     -e HARNESS_TEST_MODE=1 \
     -e HARNESS_YOLO=1 \
     -v "${ALLOWLIST_FILE_HOST}:/etc/harness/allowlist:ro" \
-    harness-claude-agent:latest \
-    -p "Say hello" 2>&1)" \
+    harness-agent:latest \
+    claude -p "Say hello" 2>&1)" \
     || fail "C: docker run for claude (yolo) exited non-zero" "${C_OUT}"
 echo "[agent-test]   C output (truncated): $(echo "${C_OUT}" | tail -c 600)"
 echo "${C_OUT}" | grep -q "Hello from mock upstream" \
@@ -281,13 +281,13 @@ D_OUT="$(harness_docker run --rm \
     -e OLLAMA_AGENT_MODEL=test-name \
     -e HARNESS_TEST_MODE=1 \
     --entrypoint /bin/bash \
-    harness-opencode-agent:latest \
+    harness-agent:latest \
     -c '
         mkdir -p "$HOME/bin"
         printf "#!/bin/sh\nexit 0\n" > "$HOME/bin/opencode"
         chmod +x "$HOME/bin/opencode"
         export PATH="$HOME/bin:$PATH"
-        /usr/local/bin/agent-entrypoint.sh dummy-prompt >/dev/null 2>&1
+        /usr/local/bin/agent-entrypoint.sh opencode dummy-prompt >/dev/null 2>&1
         cat "$HOME/.config/opencode/opencode.json"
     ' 2>&1)" \
     || fail "D: docker run to inspect opencode.json failed" "${D_OUT}"

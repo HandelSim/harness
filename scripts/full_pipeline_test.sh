@@ -212,8 +212,7 @@ echo "[pipeline] T2: install layout"
 [[ -x "${FAKE_HOME}/.local/bin/harness" ]]              || { echo "[pipeline] T2 FAIL: harness wrapper missing or not executable" >&2; exit 1; }
 [[ -d "${TEST_ROOT}/harness/.git" ]]                    || { echo "[pipeline] T2 FAIL: clone is not a git repo" >&2; exit 1; }
 [[ -d "${TEST_ROOT}/harness/state/output" ]]            || { echo "[pipeline] T2 FAIL: state/output/ missing" >&2; exit 1; }
-[[ -d "${TEST_ROOT}/harness/state/agent/claude" ]]      || { echo "[pipeline] T2 FAIL: state/agent/claude/ missing" >&2; exit 1; }
-[[ -d "${TEST_ROOT}/harness/state/agent/opencode" ]]    || { echo "[pipeline] T2 FAIL: state/agent/opencode/ missing" >&2; exit 1; }
+[[ -d "${TEST_ROOT}/harness/state/agent/home" ]]        || { echo "[pipeline] T2 FAIL: state/agent/home/ missing" >&2; exit 1; }
 [[ -d "${TEST_ROOT}/harness/state/ollama-data" ]]       || { echo "[pipeline] T2 FAIL: state/ollama-data/ missing" >&2; exit 1; }
 [[ -f "${TEST_ROOT}/harness/.env" ]]                    || { echo "[pipeline] T2 FAIL: .env missing in clone" >&2; exit 1; }
 [[ -f "${TEST_ROOT}/harness/.harness-allowlist" ]]      || { echo "[pipeline] T2 FAIL: .harness-allowlist missing in clone" >&2; exit 1; }
@@ -444,7 +443,7 @@ echo "[pipeline] T11: tmux send-keys / capture-pane (via tui_driver.sh)"
 # harness-install.sh has already seeded ${TEST_ROOT}/.harness-allowlist from the
 # bundled .harness-allowlist.example (T1).
 workspace_host=$(harness_docker_path "${TEST_WORKSPACE}")
-agent_home_host=$(harness_docker_path "${TEST_ROOT}/harness/state/agent/claude")
+agent_home_host=$(harness_docker_path "${TEST_ROOT}/harness/state/agent/home")
 allowlist_host=$(harness_docker_path "${TEST_ROOT}/.harness-allowlist")
 harness_docker run -d \
     --name "${TMUX_AGENT_NAME}" \
@@ -466,7 +465,8 @@ harness_docker run -d \
     --label "harness.agent=true" \
     --label "harness.tool=claude" \
     --label "harness.mount=${TEST_WORKSPACE}" \
-    harness-claude-agent:latest \
+    harness-agent:latest \
+    claude \
     >/dev/null
 
 # Phase 1: tmux session must exist. tmux is owned by the harness user in
@@ -601,10 +601,10 @@ echo "[pipeline] T11 OK"
 # same code path a second time and must not regress.
 
 echo "[pipeline] T15: persistent home marker + idempotent re-seed"
-marker="${TEST_ROOT}/harness/state/agent/claude/.harness-home-initialized"
+marker="${TEST_ROOT}/harness/state/agent/home/.harness-home-initialized"
 if [[ ! -f "${marker}" ]]; then
     echo "[pipeline] T15 FAIL: skel-seed marker missing at ${marker}" >&2
-    ls -la "${TEST_ROOT}/harness/state/agent/claude" >&2 || true
+    ls -la "${TEST_ROOT}/harness/state/agent/home" >&2 || true
     exit 1
 fi
 cd "${TEST_WORKSPACE}"

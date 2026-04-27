@@ -342,18 +342,18 @@ echo "[mcp] T6 OK"
 # run_agent, calls write_agent_mcp_config, then errors on the image.
 
 echo "[mcp] T7: merged client config side file"
-mkdir -p "${FAKE_INSTALL_ROOT}/state/agent/claude"
+mkdir -p "${FAKE_INSTALL_ROOT}/state/agent/home"
 # Stash any real claude image so we can deterministically hit the
 # image-not-found path.
 stash_tag=""
-if docker image inspect harness-claude-agent:latest >/dev/null 2>&1; then
-    stash_tag="harness-claude-agent:mcp-test-stash-$$"
-    docker tag harness-claude-agent:latest "${stash_tag}" >/dev/null
-    docker rmi harness-claude-agent:latest >/dev/null 2>&1 || true
+if docker image inspect harness-agent:latest >/dev/null 2>&1; then
+    stash_tag="harness-agent:mcp-test-stash-$$"
+    docker tag harness-agent:latest "${stash_tag}" >/dev/null
+    docker rmi harness-agent:latest >/dev/null 2>&1 || true
 fi
 restore_image() {
     if [[ -n "${stash_tag}" ]]; then
-        docker tag "${stash_tag}" harness-claude-agent:latest >/dev/null 2>&1 || true
+        docker tag "${stash_tag}" harness-agent:latest >/dev/null 2>&1 || true
         docker rmi "${stash_tag}" >/dev/null 2>&1 || true
         stash_tag=""
     fi
@@ -366,7 +366,7 @@ set -e
 restore_image
 trap cleanup EXIT INT TERM
 
-side_file="${FAKE_INSTALL_ROOT}/state/agent/claude/.harness-mcp-servers.json"
+side_file="${FAKE_INSTALL_ROOT}/state/agent/home/.harness-mcp-servers.json"
 if [[ ! -f "${side_file}" ]]; then
     echo "[mcp] T7 FAIL: ${side_file} not written" >&2
     exit 1
@@ -589,10 +589,10 @@ echo "[mcp] T17: side file disappears when no MCPs are active"
 # Re-trigger the side-file write path. Stash image + image-not-found
 # again, same trick as T7.
 stash_tag=""
-if docker image inspect harness-claude-agent:latest >/dev/null 2>&1; then
-    stash_tag="harness-claude-agent:mcp-test-stash-$$"
-    docker tag harness-claude-agent:latest "${stash_tag}" >/dev/null
-    docker rmi harness-claude-agent:latest >/dev/null 2>&1 || true
+if docker image inspect harness-agent:latest >/dev/null 2>&1; then
+    stash_tag="harness-agent:mcp-test-stash-$$"
+    docker tag harness-agent:latest "${stash_tag}" >/dev/null
+    docker rmi harness-agent:latest >/dev/null 2>&1 || true
 fi
 trap 'restore_image; cleanup' EXIT INT TERM
 set +e

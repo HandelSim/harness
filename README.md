@@ -39,7 +39,8 @@ harness/
 ├── ollama/                  custom ollama image + entrypoint that registers
 │                            the stub model with RemoteHost set to the proxy
 ├── proxy/                   the translating proxy
-├── agents/                  agent images (claude, opencode)
+├── agents/                  unified agent image (Dockerfile + entrypoint
+│                            with mode dispatch: claude, opencode, shell)
 ├── mcp-registry/            vetted MCP service definitions (Phase 6)
 └── scripts/
     ├── derisk_test.sh       Phase 1 end-to-end smoke
@@ -57,15 +58,16 @@ harness/
         └── test-project/    small Python calculator package used by integration_test.sh
 ```
 
-## Persistent agent homes
+## Persistent agent home
 
-The agent containers' entire `/home/harness` is bind-mounted from
-`<install-root>/state/agent/<tool>/`. Anything a user installs inside an agent
-(`pipx install graphifyy`, `pip install --user requests`, custom dotfiles)
-survives container rebuilds. The image's build-time home contents are
-snapshotted into `/etc/skel/harness/`, and the entrypoint copies them into
-an empty bind mount on first run, marking with
-`~/.harness-home-initialized` so subsequent runs skip the seed.
+A single bind-mounted home — `<install-root>/state/agent/home/` — backs
+every agent invocation (claude, opencode, shell). Anything a user installs
+inside an agent (`pipx install graphifyy`, `pip install --user requests`,
+custom dotfiles) is visible across all modes and survives container
+rebuilds. The image's build-time home contents are snapshotted into
+`/etc/skel/harness/`, and the entrypoint copies them into an empty bind
+mount on first run, marking with `~/.harness-home-initialized` so
+subsequent runs skip the seed.
 
 ## MCP registry
 
@@ -149,7 +151,7 @@ harness net close <service>             # restore the firewall
 
 `net open` requires you to type the literal phrase `I understand the risks`
 on a TTY prompt — scripts cannot bypass this. `<service>` is one of
-`proxy`, `ollama`, `claude-agent`, `opencode-agent`. State lives in
+`proxy`, `ollama`, `agent`, or any installed MCP service. State lives in
 `<install-root>/.harness-net-overrides.json` (managed by the script;
 override the path via `HARNESS_NET_OVERRIDES_PATH` for tests). Run
 `harness restart` after any mutation to apply it to live containers.
@@ -277,7 +279,7 @@ The manifest at `scripts/upgrade-manifest.json` is the contract between the
 upstream repo and your local install root. Since B4 the install root IS the
 clone, so "managed files" means files harness writes inside the clone that
 aren't tracked git content (`.env`, `.harness-allowlist`, `state/mcp/<name>/`,
-the ccstatusline config under `state/agent/claude/`). Every `B3-MANAGED:`
+the ccstatusline config under `state/agent/home/`). Every `B3-MANAGED:`
 comment in the codebase has a matching manifest entry (see audit step in
 Phase B3 docs).
 
@@ -304,7 +306,7 @@ Files harness manages (covered by the manifest):
 - `.env` — env vars merged in (preserves your values)
 - `.harness-allowlist` — new hosts appended (preserves your entries and
   any `# git-push` annotations)
-- `state/agent/claude/.config/ccstatusline/settings.json` — new widgets/keys
+- `state/agent/home/.config/ccstatusline/settings.json` — new widgets/keys
   added (preserves layout and user widget customizations)
 - `state/mcp/<name>/` — definition files (`compose.yml`, `client-config.json`,
   `README.md`) updated (preserves `harness-meta.json` enable state and
@@ -316,7 +318,7 @@ Files purely user-managed (not in the manifest):
 - `state/output/` — proxy debug dumps
 - `state/ollama-data/` — model blobs
 - **User-installed skills and `pipx` packages** under `state/agent/<tool>/`
-  (e.g., `state/agent/claude/.local/bin/graphify`, `state/agent/claude/.claude/skills/graphify/`).
+  (e.g., `state/agent/home/.local/bin/graphify`, `state/agent/home/.claude/skills/graphify/`).
   These live entirely inside the bind-mounted agent home and are never
   touched by upgrade actions. The skel-seed step in the agent entrypoint
   only runs once per home (gated by `~/.harness-home-initialized`), so
@@ -350,7 +352,7 @@ harness claude-statusline-config
 
 This launches an ephemeral claude container (no ollama/proxy required)
 attached to the persistent agent home; the ccstatusline TUI writes its
-edits straight to `<install-root>/state/agent/claude/.config/ccstatusline/settings.json`.
+edits straight to `<install-root>/state/agent/home/.config/ccstatusline/settings.json`.
 
 ## Tests
 
@@ -382,7 +384,7 @@ The test exercises four phases against a clean install in a temp directory:
    end-to-end through the proxy.
 2. **Serena (HTTP MCP)** — install → restart → reach on tcp://serena:9121
    from the proxy → trigger an agent launch and verify
-   `state/agent/claude/.harness-mcp-servers.json` has the merged entry →
+   `state/agent/home/.harness-mcp-servers.json` has the merged entry →
    confirm `/workspaces/projects/test-project/` is visible inside the serena container
    → drive a TUI claude that asks serena to find the `Calculator` symbol →
    `mcp down/up`, `mcp disable/enable`, `mcp uninstall --force`.

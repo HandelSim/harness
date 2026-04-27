@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Harness upgrade manifest. Each entry describes how a file harness manages inside <install-root>/ is brought forward when 'harness upgrade' runs. Paths are relative to the install root; user config (.env, .harness-allowlist) lives at the root, runtime state (agent homes, MCP active tree) lives under state/. The runner sources scripts/lib/upgrade_actions.sh, dispatches each entry to the right action function, and aggregates results. See agents/claude/Dockerfile, agents/claude/entrypoint.sh, harness-install.sh, and harness's cmd_mcp_install for B3-MANAGED comments that anchor each entry. Files intentionally NOT covered: .harness-net-overrides.json (user-managed via 'harness net open/close'), state/agent/<tool>/.harness-mcp-servers.json (regenerated each agent launch), state/agent/claude/.claude/settings.json (auto-augmented by the claude entrypoint each launch), state/.harness-runtime.yml (regenerated each compose invocation), state/output/ (proxy debug dumps, never managed), state/ollama-data/ (model blobs, never managed).",
+  "description": "Harness upgrade manifest. Each entry describes how a file harness manages inside <install-root>/ is brought forward when 'harness upgrade' runs. Paths are relative to the install root; user config (.env, .harness-allowlist) lives at the root, runtime state (shared agent home, MCP active tree) lives under state/. The runner sources scripts/lib/upgrade_actions.sh, dispatches each entry to the right action function, and aggregates results. See agents/Dockerfile, agents/entrypoint.sh, harness-install.sh, and harness's cmd_mcp_install for B3-MANAGED comments that anchor each entry. Files intentionally NOT covered: .harness-net-overrides.json (user-managed via 'harness net open/close'), state/agent/home/.harness-mcp-servers.json (regenerated each agent launch), state/agent/home/.claude/settings.json (auto-augmented by the agent entrypoint each launch), state/.harness-runtime.yml (regenerated each compose invocation), state/output/ (proxy debug dumps, never managed), state/ollama-data/ (model blobs, never managed).",
   "actions": [
     {
       "id": "env_vars",
@@ -19,8 +19,8 @@
     {
       "id": "ccstatusline_default_config",
       "type": "json_merge",
-      "source": "agents/claude/defaults/ccstatusline-settings.json",
-      "target_relative": "state/agent/claude/.config/ccstatusline/settings.json",
+      "source": "agents/defaults/ccstatusline-settings.json",
+      "target_relative": "state/agent/home/.config/ccstatusline/settings.json",
       "strategy": "add_missing_keys",
       "description": "Add new ccstatusline keys (preserves user widget customization; arrays are user-wins)"
     }
