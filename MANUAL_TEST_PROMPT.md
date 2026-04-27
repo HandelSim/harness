@@ -454,25 +454,36 @@ Report:
 Report whether the configurator launched cleanly without requiring
 ollama/proxy services, and whether your edits stuck.
 
-## Scenario K2: MCP lifecycle deprecation aliases
+## Scenario K2: MCP lifecycle — canonical commands
 
-For backward compatibility with Phase 6 muscle memory, the old verbs
-still work but emit a `DEPRECATED` warning. Verify them quickly:
+The four lifecycle verbs (install / uninstall / enable / disable) are
+distinct. enable and disable only flip the auto-start flag on an
+already-installed entry; they do not install or uninstall. Verify:
 
 1. Pick any registry MCP that's currently `available`:
    ```
    harness mcp enable <name>
    ```
-   Expected: stderr line starting with `DEPRECATED:`, then a normal
-   install. `harness mcp list` should show `installed-enabled`.
-2. Tear it down with the Phase 6 form:
+   Expected: refuses with "is in the registry but not installed" (or
+   similar). The MCP state should still be `available`.
+2. Install it:
    ```
-   harness mcp disable <name> --force
+   harness mcp install <name>
    ```
-   Expected: another `DEPRECATED:` warning, then a normal uninstall.
+   Expected: state becomes `installed-enabled`.
+3. Disable (do NOT uninstall):
+   ```
+   harness mcp disable <name>
+   ```
+   Expected: state becomes `installed-disabled`. Files stay in
+   `state/mcp/<name>/`.
+4. Uninstall:
+   ```
+   harness mcp uninstall <name> --force
+   ```
+   Expected: state returns to `available`. `data/` is preserved.
 
-If either alias fails or stops emitting the warning, that's a regression
-worth flagging.
+If any verb does the wrong thing, flag it.
 
 ## Scenario N: Upgrade flow against a synthetic version transition
 

@@ -526,7 +526,7 @@ agent flags:
                         `opencode run` inside the container
 
 'harness mcp' subcommands:
-  mcp list                          list registry + installed entries and their state
+  mcp list [--available]            show installed MCPs (and registry with --available)
   mcp install <name> [--force]      copy a registry MCP into the active tree
   mcp uninstall <name> [--force]    remove an installed MCP; data dir is preserved
   mcp enable <name>                 mark an installed MCP as auto-start
@@ -535,7 +535,15 @@ agent flags:
   mcp down <name>                   stop a running MCP container
   mcp logs <name>                   follow logs for a single MCP
   mcp status <name>                 per-MCP diagnostic
-  mcp install-custom <path>         install a user-supplied MCP definition
+
+'harness net' subcommands:
+  net list                          show current allowlist with annotations
+  net allow <host> [--git-push]     add host to allowlist (with optional push annotation)
+  net deny <host>                   remove host from allowlist
+  net edit                          open allowlist in $EDITOR
+  net status                        show firewall state per service
+  net open <service>                disable firewall for one service (typed phrase confirmation)
+  net close <service>               re-enable firewall for one service
 
 notes:
   - 'harness down' stops services but leaves agent containers alone. Stop
@@ -1465,11 +1473,14 @@ usage:
   harness mcp <subcommand> [args...]
 
 subcommands:
-  list                          show registry + installed entries with state
+  list [--available]            show installed entries with state. With
+                                  --available also list registry entries
+                                  not yet installed.
   install <name> [--force]      copy a registry entry into the active tree
+                                  and mark it enabled.
   uninstall <name> [--force]    remove an installed entry; data/ is preserved
-  enable <name>                 mark an installed MCP as auto-start (default
-                                  on install). 'harness start' brings it up.
+  enable <name>                 mark an installed MCP as auto-start.
+                                  'harness start' brings it up next time.
   disable <name>                mark an installed MCP as do-not-auto-start.
                                   Container is left alone; use 'mcp down' to
                                   stop one immediately or 'mcp up' to start
@@ -1478,17 +1489,14 @@ subcommands:
   down <name>                   stop an installed MCP container
   logs <name>                   follow logs for a single MCP
   status <name>                 per-MCP diagnostic
-  install-custom <path>         install a user-supplied MCP definition
-
-deprecated (still works, with a warning to stderr):
-  enable <name>                 when <name> is in the registry but not yet
-                                  installed, this is the Phase 6 verb —
-                                  forwarded to 'install <name>'.
-  disable <name> --force        forwarded to 'uninstall <name> --force'.
 
 state diagram:
   available --install--> installed-enabled <-> installed-disabled
                                           \--uninstall--> available
+
+The four canonical lifecycle verbs (install / uninstall / enable / disable)
+are distinct: install/uninstall move between available and installed;
+enable/disable flip the auto-start flag on an already-installed entry.
 
 After install/uninstall/enable/disable, run 'harness start' (or
 'harness upgrade') to materialize the change in the running compose stack.
@@ -1497,6 +1505,18 @@ EOF
 }
 
 cmd_mcp_list() {
+    # Default: only show installed entries. With --available, also show
+    # registry entries that haven't been installed yet (state: available).
+    local show_available=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --available) show_available=1 ;;
+            -*) err "unknown flag '$1'"; exit 1 ;;
+            *) err "unexpected extra argument '$1'"; exit 1 ;;
+        esac
+        shift
+    done
+
     local printed_header=0
     local seen_names=()
 
@@ -1507,10 +1527,6 @@ cmd_mcp_list() {
         name=$(basename "$entry_dir")
         # Hide reserved test fixture names from user output.
         [[ "$name" =~ ^_ ]] && continue
-        if (( printed_header == 0 )); then
-            printf '%-20s %-22s %s\n' "NAME" "STATE" "STATUS"
-            printed_header=1
-        fi
         local state status
         if mcp_is_installed "$name"; then
             if mcp_is_enabled "$name"; then
@@ -1522,13 +1538,18 @@ cmd_mcp_list() {
         else
             state="available"
             status="-"
+            (( show_available )) || { seen_names+=("$name"); continue; }
+        fi
+        if (( printed_header == 0 )); then
+            printf '%-20s %-22s %s\n' "NAME" "STATE" "STATUS"
+            printed_header=1
         fi
         printf '%-20s %-22s %s\n' "$name" "$state" "$status"
         seen_names+=("$name")
     done < <(list_registry_entries)
 
     # Surface anything in the active tree that doesn't have a registry entry
-    # (custom installs, locally-edited copies).
+    # (locally-edited copies; install-custom removed in 13b).
     while IFS= read -r entry_dir; do
         [[ -n "$entry_dir" ]] || continue
         local name
@@ -1550,11 +1571,15 @@ cmd_mcp_list() {
             state="installed-disabled"
         fi
         status=$(mcp_runtime_status "$name")
-        printf '%-20s %-22s %s\n' "${name} (custom)" "$state" "$status"
+        printf '%-20s %-22s %s\n' "${name} (local)" "$state" "$status"
     done < <(list_active_entries)
 
     if (( printed_header == 0 )); then
-        echo "no MCP entries (registry: $registry_dir)"
+        if (( show_available )); then
+            echo "no MCP entries (registry: $registry_dir)"
+        else
+            echo "no MCPs installed; run 'harness mcp list --available' to see what's available"
+        fi
     fi
 }
 
@@ -1776,14 +1801,12 @@ cmd_mcp_uninstall() {
     fi
 }
 
-# enable: mark installed MCP as auto-start.
-# Phase 6 alias: when <name> is in the registry but NOT yet installed, the
-# Phase 6 'enable' verb meant 'install'. We forward, with a warning.
+# enable: mark installed MCP as auto-start. Pure state-flag flip.
 cmd_mcp_enable() {
     local name=""
     while (( $# > 0 )); do
         case "$1" in
-            -*) err "unknown flag '$1' (did you mean 'harness mcp install $1'?)"; exit 1 ;;
+            -*) err "unknown flag '$1'"; exit 1 ;;
             *)
                 if [[ -z "$name" ]]; then
                     name="$1"
@@ -1802,11 +1825,10 @@ cmd_mcp_enable() {
 
     if ! mcp_is_installed "$name"; then
         if [[ -d "$registry_dir/$name" ]]; then
-            err "DEPRECATED: 'harness mcp enable <name>' for not-yet-installed MCPs is the Phase 6 form. Use 'harness mcp install <name>'. Forwarding..."
-            cmd_mcp_install "$name"
-            return
+            err "$name is in the registry but not installed; use 'harness mcp install $name' first"
+        else
+            err "unknown MCP '$name'; available: $(mcp_registry_names_csv)"
         fi
-        err "unknown MCP '$name'; available: $(mcp_registry_names_csv)"
         exit 1
     fi
 
@@ -1815,13 +1837,11 @@ cmd_mcp_enable() {
     echo "next: 'harness start' (or 'harness upgrade') to bring it up."
 }
 
-# disable: mark installed MCP as do-not-auto-start.
-# Phase 6 alias: --force triggers the old uninstall semantics.
+# disable: mark installed MCP as do-not-auto-start. Pure state-flag flip.
 cmd_mcp_disable() {
-    local force=0 name=""
+    local name=""
     while (( $# > 0 )); do
         case "$1" in
-            --force) force=1 ;;
             -*) err "unknown flag '$1'"; exit 1 ;;
             *)
                 if [[ -z "$name" ]]; then
@@ -1837,12 +1857,6 @@ cmd_mcp_disable() {
     if [[ -z "$name" ]]; then
         err "usage: harness mcp disable <name>"
         exit 1
-    fi
-
-    if (( force )); then
-        err "DEPRECATED: 'harness mcp disable --force' is the Phase 6 form. Use 'harness mcp uninstall <name> --force'. Forwarding..."
-        cmd_mcp_uninstall --force "$name"
-        return
     fi
 
     if ! mcp_is_installed "$name"; then
@@ -2047,42 +2061,12 @@ cmd_mcp_status() {
     printf 'services:  %s\n' "${svcs:-(none)}"
 }
 
-cmd_mcp_install_custom() {
-    local src="${1:-}"
-    if [[ -z "$src" ]]; then
-        err "usage: harness mcp install-custom <path>"
-        exit 1
-    fi
-    if [[ ! -d "$src" ]]; then
-        err "$src is not a directory"
-        exit 1
-    fi
-    if [[ ! -f "$src/compose.yml" ]]; then
-        err "$src is missing compose.yml"
-        exit 1
-    fi
-    local name
-    name=$(basename "$(realpath "$src")")
-    local dest="$mcp_active_dir/$name"
-    if [[ -d "$dest" ]]; then
-        err "$name is already installed (remove $dest first or use a different basename)"
-        exit 1
-    fi
-    mkdir -p "$mcp_active_dir"
-    cp -a "$src" "$dest"
-    mkdir -p "$dest/data"
-    mcp_set_enabled "$name" "true"
-    echo "installed custom MCP: $name (from $src)"
-    echo "state: installed-enabled"
-    echo "next: run 'harness start' to bring it up"
-}
-
 cmd_mcp() {
     local sub="${1:-help}"
     if [[ $# -gt 0 ]]; then shift; fi
     case "$sub" in
         help|-h|--help) cmd_mcp_help ;;
-        list)           cmd_mcp_list ;;
+        list)           cmd_mcp_list "$@" ;;
         install)        cmd_mcp_install "$@" ;;
         uninstall)      cmd_mcp_uninstall "$@" ;;
         enable)         cmd_mcp_enable "$@" ;;
@@ -2091,7 +2075,6 @@ cmd_mcp() {
         down)           cmd_mcp_down "$@" ;;
         logs)           cmd_mcp_logs "$@" ;;
         status)         cmd_mcp_status "$@" ;;
-        install-custom) cmd_mcp_install_custom "$@" ;;
         *)
             err "unknown mcp subcommand '$sub'"
             cmd_mcp_help >&2
@@ -2184,8 +2167,55 @@ cmd_net_list() {
         err "$allowlist_path does not exist; run install.sh or copy .harness-allowlist.example"
         exit 1
     fi
-    printf '%-50s %s\n' "HOST" "MODE"
-    netlib_list_hosts | awk -F '\t' '{ printf "%-50s %s\n", $1, $2 }'
+    local count
+    count=$(netlib_list_hosts | wc -l | tr -d ' ')
+    cat <<EOF
+Allowlist (${count} entries):
+
+Note: git domains allow pull only by default. To enable git push for a
+host, add it with the '--git-push' flag (or annotate the line with
+'# git-push' when editing manually). Use 'harness net allow <host> --git-push'.
+
+EOF
+    # Format: hostname [+ '[git-push]' if annotated] [+ inline comment if any].
+    # Read the allowlist directly so we can preserve inline comments that
+    # netlib_list_hosts strips.
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            line = $0
+            push = 0
+            comment = ""
+            # Extract any trailing comment.
+            if (match(line, /[[:space:]]*#.*$/)) {
+                comment = substr(line, RSTART, RLENGTH)
+                line = substr(line, 1, RSTART - 1)
+            }
+            # If the comment is exactly the git-push annotation, recognize it.
+            if (comment ~ /^[[:space:]]*#[[:space:]]*git-push[[:space:]]*$/) {
+                push = 1
+                comment = ""
+            } else if (comment ~ /^[[:space:]]*#[[:space:]]*git-push[[:space:]]+/) {
+                push = 1
+                # Strip the git-push token, keep any further note.
+                sub(/^[[:space:]]*#[[:space:]]*git-push[[:space:]]+/, "  # ", comment)
+            }
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (length(line) == 0) next
+
+            host = line
+            tag = push ? "  [git-push]" : ""
+            note = ""
+            if (length(comment) > 0) {
+                # Normalize whitespace before the comment.
+                gsub(/^[[:space:]]+/, " ", comment)
+                note = comment
+            }
+            printf "  %-30s%s%s\n", host, tag, note
+        }
+    ' "$allowlist_path"
 }
 
 cmd_net_allow() {
@@ -2593,16 +2623,20 @@ cmd_doctor() {
     fi
 
     local local_bin="$HOME/.local/bin/harness"
-    if [[ -L "$local_bin" ]]; then
+    if [[ -x "$local_bin" ]]; then
+        # The wrapper is a small shell script (a real symlink isn't always
+        # creatable on Windows without Developer Mode). Match against the
+        # install root by extracting the exec target from the wrapper.
         local target
-        target=$(readlink -f "$local_bin" 2>/dev/null || true)
-        if [[ "$target" == "$real_self" ]]; then
-            doctor_check ok "harness symlink" "$local_bin -> $real_self"
+        target=$(grep -oE 'exec "[^"]+/harness"' "$local_bin" 2>/dev/null \
+            | head -1 | sed -E 's/exec "(.*)"/\1/')
+        if [[ -n "$target" && "$target" == "$real_self" ]]; then
+            doctor_check ok "harness wrapper" "$local_bin -> $real_self"
         else
-            doctor_check warn "harness symlink" "points to ${target:-?} (expected $real_self)"
+            doctor_check warn "harness wrapper" "$local_bin (target ${target:-unknown})"
         fi
     else
-        doctor_check warn "harness symlink" "$local_bin missing; reinstall to add"
+        doctor_check warn "harness wrapper" "$local_bin missing; reinstall to add"
     fi
 
     case ":$PATH:" in

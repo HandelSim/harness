@@ -104,22 +104,52 @@ Per-install state lives in `<install-root>/state/mcp/<name>/harness-meta.json`
 | `harness mcp down <name>`             | Manually stop the container without flipping `enabled`.                      |
 | `harness mcp logs <name>`             | `docker compose logs -f` for the MCP's services.                             |
 | `harness mcp status <name>`           | Print state, enabled flag, runtime status, paths, services.                  |
-| `harness mcp list`                    | All registry entries with `STATE` column.                                    |
-| `harness mcp install-custom <path>`   | Install an MCP from a local directory instead of the registry.               |
+| `harness mcp list`                    | Installed entries with `STATE` column.                                       |
+| `harness mcp list --available`        | Installed entries plus registry entries not yet installed.                   |
 
-The Phase 6 forms — `harness mcp enable <not-yet-installed>` and
-`harness mcp disable <name> --force` — still work but emit a `DEPRECATED`
-warning to stderr and forward to `install` / `uninstall --force`.
+The four lifecycle verbs (`install` / `uninstall` / `enable` / `disable`)
+are distinct and idempotent. `enable`/`disable` only flip the auto-start
+flag on an already-installed entry; they do not install or uninstall.
 
-### Contributing a registry entry
+### Adding new MCPs
 
-1. Create `mcp-registry/<name>/` with the three required files
-   (`compose.yml`, `client-config.json`, `README.md`).
-2. Make sure the compose snippet uses `profiles: [mcp]` and joins the
-   `harness-net` network.
-3. Document any optional env vars in `README.md` and add them to
-   `.env.example` if they have a default that users should know about.
-4. Test locally with `HARNESS_REGISTRY_DIR=$(pwd)/mcp-registry harness mcp install <name>`.
+Currently supported: HTTP/SSE MCPs in Docker containers (Pattern A). To
+add a new MCP, fork the repo and add a directory under `mcp-registry/<name>/`
+containing:
+
+- `compose.yml` — partial compose snippet defining the service. References
+  the `harness_harness-net` network as external so it merges cleanly with
+  the main `docker-compose.yml`. Lives behind the `mcp` profile so
+  `docker compose up` without the profile leaves it alone.
+- `client-config.json` — the entry that gets merged into the agent's MCP
+  config. Uses the `{"mcpServers": {"<name>": {...}}}` shape.
+- `harness-meta.json.template` — metadata. Materialized into the active
+  tree as `harness-meta.json` on install.
+- `README.md` — what the MCP does and any required env vars.
+
+See `mcp-registry/serena/` as the reference example. Submit a PR to add
+to the official registry. For private/internal MCPs, fork the repo and
+maintain your own registry entry.
+
+### Installing skills (graphify, etc.)
+
+Skills are CLI tools the agent invokes. To install one:
+
+**Easy way (recommended):** ask the agent. From inside `harness claude`:
+
+> Please install graphify by running `pipx install graphifyy` and then
+> `graphify install`.
+
+The agent runs the commands inside the container, registers the skill,
+and confirms.
+
+**Direct way:** run `harness shell` to drop into a bash shell inside the
+agent container. Run the install commands yourself, exit. The shell
+shares the same persistent home as `harness claude` and `harness
+opencode`, so the install is available everywhere.
+
+Either way, the install persists across container restarts and
+`harness upgrade`.
 
 ## Universal egress firewall
 

@@ -427,25 +427,77 @@ EOF
 fi
 
 # --- final message ----------------------------------------------------------
+#
+# Direct, no-jargon. Lists the agents available out-of-the-box and any MCPs
+# that came pre-installed (currently always zero, but the loop is here in
+# case future installer flags pre-stage one).
+
+if (( want_path )) && [[ ":$PATH:" != *":$LOCAL_BIN:"* ]]; then
+    # If install.sh was sourced (rather than run as a subprocess), update
+    # the parent shell's PATH directly so `harness` works in this session
+    # without opening a new terminal. When run as a subprocess the `export`
+    # is harmless; the user still needs the rcfile to take effect for
+    # future shells.
+    export PATH="$LOCAL_BIN:$PATH"
+fi
 
 cat <<EOF
 
-${C_BOLD}install complete${C_RESET}
+${C_BOLD}install complete${C_RESET} at $install_root.
 
-install root: $install_root
+EOF
 
-next steps:
-  1. edit ${install_root}/.env and fill in any blank required values (especially PROXY_API_KEY)
-  2. ${want_path:+(open a new Git Bash session if you opted into PATH integration)}
-  3. run: harness preflight     (validates configuration before starting)
-  4. run: harness start          (brings up the stack)
-  5. cd into a project directory and run: harness claude
+if (( want_path )); then
+    cat <<EOF
+'harness' added to PATH. If it doesn't work immediately:
+  - Open a new terminal, OR
+  - Run: export PATH="\$HOME/.local/bin:\$PATH"
 
-To uninstall later:
-  rm -rf $install_root
-  rm $LOCAL_BIN/$PROGRAM_NAME
+EOF
+fi
 
-If PATH was just modified, open a new terminal first.
+cat <<EOF
+Next:
+  1. Edit $install_root/.env and set PROXY_API_KEY (and any other required values)
+  2. cd into a project directory and run: harness <agent>
+
+Available agents:
+  harness claude
+  harness opencode
+
+Auto-installed MCPs:
+EOF
+
+mcp_count=0
+if [[ -d "$install_root/state/mcp" ]]; then
+    for mcp_dir in "$install_root"/state/mcp/*/; do
+        [[ -f "$mcp_dir/harness-meta.json" ]] || continue
+        mcp_name=$(jq -r '.name // empty' "$mcp_dir/harness-meta.json" 2>/dev/null || true)
+        [[ -n "$mcp_name" ]] || mcp_name=$(basename "$mcp_dir")
+        mcp_enabled=$(jq -r '.enabled // empty' "$mcp_dir/harness-meta.json" 2>/dev/null || echo "?")
+        echo "  - $mcp_name (enabled: $mcp_enabled)"
+        mcp_count=$((mcp_count + 1))
+    done
+fi
+if (( mcp_count == 0 )); then
+    echo "  (none)"
+fi
+
+cat <<EOF
+
+Manage MCPs:
+  harness mcp list                  show installed MCPs
+  harness mcp install <name>        copy a registry entry into the active tree
+  harness mcp uninstall <name>      remove entirely
+  harness mcp enable <name>         start auto-loading on 'harness start'
+  harness mcp disable <name>        stop auto-loading
+
+Need a shell inside an agent container (for installing skills, debugging)?
+  harness shell
+
+Uninstall harness:
+  rm -rf "$install_root"
+  rm "\$HOME/.local/bin/harness"
 EOF
 
 exit 0

@@ -318,43 +318,38 @@ HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp uninstall foo --for
 [[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
     && { echo "[harness-test] T5b FAIL: uninstall did not remove compose.yml" >&2; exit 1; }
 
-# 5b.5: deprecation alias — Phase 6 'enable <name>' for not-yet-installed
-# is forwarded to install. Verify it works AND emits a deprecation warning.
+# 5b.5: enable on a not-yet-installed entry now refuses (Phase 13b made
+# enable/disable canonical state-flag commands; the Phase 6 deprecation
+# alias was removed). The user must explicitly run install first.
 set +e
-dep_out=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp enable foo 2>&1)
-dep_rc=$?
+not_installed_out=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp enable foo 2>&1)
+not_installed_rc=$?
 set -e
-if (( dep_rc != 0 )); then
-    echo "[harness-test] T5b FAIL: deprecated enable forward exited ${dep_rc}" >&2
-    echo "${dep_out}" >&2
+if (( not_installed_rc == 0 )); then
+    echo "[harness-test] T5b FAIL: 'mcp enable <not-yet-installed>' should refuse" >&2
+    echo "${not_installed_out}" >&2
     exit 1
 fi
-if ! grep -qi 'DEPRECATED' <<<"${dep_out}"; then
-    echo "[harness-test] T5b FAIL: Phase 6 enable alias did not warn 'DEPRECATED'" >&2
-    echo "${dep_out}" >&2
+if ! grep -qi 'not installed' <<<"${not_installed_out}"; then
+    echo "[harness-test] T5b FAIL: enable refusal did not mention 'not installed'" >&2
+    echo "${not_installed_out}" >&2
     exit 1
 fi
-[[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
-    || { echo "[harness-test] T5b FAIL: deprecated enable did not install" >&2; exit 1; }
 
-# 5b.6: deprecation alias — Phase 6 'disable <name> --force' is forwarded
-# to uninstall --force. Verify warning + effect.
-set +e
-dep_dis_out=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp disable foo --force 2>&1)
-dep_dis_rc=$?
-set -e
-if (( dep_dis_rc != 0 )); then
-    echo "[harness-test] T5b FAIL: deprecated disable --force exited ${dep_dis_rc}" >&2
-    echo "${dep_dis_out}" >&2
-    exit 1
-fi
-if ! grep -qi 'DEPRECATED' <<<"${dep_dis_out}"; then
-    echo "[harness-test] T5b FAIL: Phase 6 'disable --force' did not warn 'DEPRECATED'" >&2
-    echo "${dep_dis_out}" >&2
-    exit 1
-fi
+# 5b.6: install foo, then disable (state flag), then enable, verifying
+# enabled flag toggles without affecting installed state. Files stay.
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp install foo >/dev/null
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp disable foo >/dev/null
 [[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
-    && { echo "[harness-test] T5b FAIL: deprecated disable --force did not uninstall" >&2; exit 1; }
+    || { echo "[harness-test] T5b FAIL: disable removed files (should only flip flag)" >&2; exit 1; }
+state_after_disable=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp status foo 2>&1)
+grep -Eq 'state:[[:space:]]+installed-disabled' <<<"${state_after_disable}" \
+    || { echo "[harness-test] T5b FAIL: disable did not flip state to installed-disabled" >&2
+         echo "${state_after_disable}" >&2; exit 1; }
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp enable foo >/dev/null
+HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp uninstall foo --force >/dev/null
+[[ -f "${TEST_ROOT}/state/mcp/foo/compose.yml" ]] \
+    && { echo "[harness-test] T5b FAIL: uninstall did not remove compose.yml" >&2; exit 1; }
 
 # 5b.7: status reports state correctly.
 HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp install foo >/dev/null
@@ -591,7 +586,7 @@ fi
 # T11.3: --git-push annotates a host as push-enabled.
 "${HARNESS_BIN}" net allow my-gitlab.example.com --git-push >/dev/null
 push_out=$("${HARNESS_BIN}" net list)
-if ! grep -Eq 'my-gitlab\.example\.com[[:space:]]+push' <<<"${push_out}"; then
+if ! grep -Eq 'my-gitlab\.example\.com[[:space:]]+\[git-push\]' <<<"${push_out}"; then
     echo "[harness-test] T11 FAIL: --git-push did not annotate host as push" >&2
     echo "${push_out}" >&2; exit 1
 fi

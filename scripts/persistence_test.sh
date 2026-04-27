@@ -369,6 +369,62 @@ if ! grep -q 'ccstatusline' "$claude_settings"; then
 fi
 echo "[persist] T5 OK"
 
+# --- T6: git credential persistence ----------------------------------------
+#
+# Verifies that a credential the agent writes to ~/.git-credentials
+# survives container rebuild — i.e., it lands on the host bind mount and
+# the next container sees it. Uses a fake host (no real upstream) so we
+# don't ship credentials anywhere.
+
+echo "[persist] T6: git credential persistence"
+T6_HOME="${TEST_ROOT}/agent/home-t6"
+mkdir -p "${T6_HOME}"
+T6_HOME_HOST=$(harness_docker_path "${T6_HOME}")
+
+# First run: write a fake credential into ~/.git-credentials.
+harness_docker run --rm \
+    --label "harness-persist-test=1" \
+    -v "${T6_HOME_HOST}:/home/harness" \
+    --entrypoint /bin/bash \
+    --user harness \
+    -e HOME=/home/harness \
+    harness-agent:latest \
+    -c '
+        set -e
+        if [[ ! -f $HOME/.harness-home-initialized ]]; then
+            cp -an /etc/skel/harness/. $HOME/ 2>/dev/null || true
+            touch $HOME/.harness-home-initialized
+        fi
+        echo "https://test-user:test-token@example.com" >> $HOME/.git-credentials
+    '
+
+if [[ ! -f "${T6_HOME}/.git-credentials" ]]; then
+    echo "[persist] T6 FAIL: .git-credentials not written to host bind mount" >&2
+    ls -la "${T6_HOME}" >&2 || true
+    exit 1
+fi
+if ! grep -q "test-user:test-token" "${T6_HOME}/.git-credentials"; then
+    echo "[persist] T6 FAIL: credential content missing on host" >&2
+    cat "${T6_HOME}/.git-credentials" >&2
+    exit 1
+fi
+
+# Second run: fresh container, same home, must still see the credential.
+second_out=$(harness_docker run --rm \
+    --label "harness-persist-test=1" \
+    -v "${T6_HOME_HOST}:/home/harness" \
+    --entrypoint /bin/bash \
+    --user harness \
+    -e HOME=/home/harness \
+    harness-agent:latest \
+    -c 'grep -q "test-user:test-token" "$HOME/.git-credentials" && echo "persisted"' 2>&1)
+if ! grep -q "persisted" <<<"${second_out}"; then
+    echo "[persist] T6 FAIL: credential not visible in second container" >&2
+    echo "${second_out}" >&2
+    exit 1
+fi
+echo "[persist] T6 OK"
+
 echo "============================================================"
 echo " PERSISTENCE TEST PASSED"
 echo "============================================================"

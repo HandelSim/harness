@@ -537,30 +537,34 @@ if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/data/marker.txt" ]]; then
 fi
 echo "[mcp] T14 OK"
 
-# --- T15: deprecation alias 'mcp disable --force' still works --------------
+# --- T15: --force on disable is rejected (canonical state-flag command) ----
 #
-# After T14 the MCP is uninstalled; reinstall it briefly so we can prove the
-# deprecation alias path forwards correctly into the new uninstall verb.
+# After Phase 13b enable/disable became canonical state-flag commands and
+# the --force alias was removed. Verify disable rejects unknown flags
+# rather than forwarding to uninstall.
 
-echo "[mcp] T15: deprecation alias 'mcp disable --force' forwards to uninstall"
+echo "[mcp] T15: 'mcp disable --force' is rejected (no longer an uninstall alias)"
 harness_call mcp install _test_mcp >/dev/null 2>&1
 set +e
-dep_out=$(harness_call mcp disable _test_mcp --force 2>&1)
-dep_rc=$?
+no_force_out=$(harness_call mcp disable _test_mcp --force 2>&1)
+no_force_rc=$?
 set -e
-echo "${dep_out}" | sed 's/^/  | /'
-if (( dep_rc != 0 )); then
-    echo "[mcp] T15 FAIL: deprecation alias should still succeed (rc=${dep_rc})" >&2
+echo "${no_force_out}" | sed 's/^/  | /'
+if (( no_force_rc == 0 )); then
+    echo "[mcp] T15 FAIL: disable --force should be rejected" >&2
     exit 1
 fi
-if ! grep -q 'DEPRECATED' <<<"${dep_out}"; then
-    echo "[mcp] T15 FAIL: deprecation warning missing from stderr" >&2
+if ! grep -qiE "unknown flag" <<<"${no_force_out}"; then
+    echo "[mcp] T15 FAIL: rejection should mention 'unknown flag'" >&2
     exit 1
 fi
-if [[ -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" ]]; then
-    echo "[mcp] T15 FAIL: deprecation alias did not perform uninstall" >&2
+# Files should still be there (disable was rejected).
+if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" ]]; then
+    echo "[mcp] T15 FAIL: rejected disable still removed files" >&2
     exit 1
 fi
+# Clean up: uninstall properly so T16 sees a clean state.
+harness_call mcp uninstall _test_mcp --force >/dev/null 2>&1
 echo "[mcp] T15 OK"
 
 # --- T16: re-running harness start no longer brings up the MCP -------------
