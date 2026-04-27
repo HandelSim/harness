@@ -7,6 +7,7 @@ Run inside the proxy container:
 import json
 import os
 import unittest
+from unittest.mock import MagicMock, patch
 
 # proxy.main() runs only when invoked as __main__, but module-level import
 # touches env defaults. Set required vars before import so module load doesn't
@@ -438,6 +439,153 @@ class TestMakeChunk(unittest.TestCase):
         self.assertIn("total_duration", c)
         self.assertIn("load_duration", c)
         self.assertIn("eval_duration", c)
+
+
+class TestAutoUnlock(unittest.TestCase):
+    """Auto-unlock retry behavior for 4xx + error.unlock_url.
+
+    All tests patch proxy.requests.post and proxy.requests.get and drive the
+    Flask app via its test_client so the full request flow runs.
+    """
+
+    OLLAMA_REQUEST = {
+        "model": "harness",
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": False,
+    }
+
+    def setUp(self):
+        self.client = proxy.app.test_client()
+
+    def _make_locked_response(self, status=401):
+        m = MagicMock()
+        m.status_code = status
+        m.json.return_value = {
+            "error": {
+                "type": "unauthorized",
+                "message": "API key locked",
+                "unlock_url": "https://example.com/api/unlock/abc123",
+            }
+        }
+        m.text = json.dumps(m.json.return_value)
+        return m
+
+    def _make_success_response(self, content="hello world"):
+        m = MagicMock()
+        m.status_code = 200
+        m.json.return_value = {
+            "choices": [{"message": {"content": content}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        m.text = json.dumps(m.json.return_value)
+        return m
+
+    def _make_unlock_response(self, status=200):
+        m = MagicMock()
+        m.status_code = status
+        m.text = ""
+        return m
+
+    @patch("proxy.requests.get")
+    @patch("proxy.requests.post")
+    def test_auto_unlock_then_success(self, mock_post, mock_get):
+        """Locked → unlock 200 → retry → success. Agent sees normal response."""
+        mock_post.side_effect = [
+            self._make_locked_response(401),
+            self._make_success_response("hello world"),
+        ]
+        mock_get.return_value = self._make_unlock_response(200)
+
+        rv = self.client.post(
+            "/api/chat",
+            data=json.dumps(self.OLLAMA_REQUEST),
+            content_type="application/json",
+        )
+
+        self.assertEqual(rv.status_code, 200, msg=rv.data)
+        self.assertEqual(mock_post.call_count, 2, "expected original + retry POST")
+        self.assertEqual(mock_get.call_count, 1, "expected one unlock GET")
+        called_url = mock_get.call_args[0][0]
+        self.assertEqual(called_url, "https://example.com/api/unlock/abc123")
+        # The agent-facing NDJSON should contain the success text.
+        self.assertIn(b"hello world", rv.data)
+
+    @patch("proxy.requests.get")
+    @patch("proxy.requests.post")
+    def test_auto_unlock_then_still_fails(self, mock_post, mock_get):
+        """Locked → unlock 200 → retry STILL locked → flow through as 502."""
+        mock_post.side_effect = [
+            self._make_locked_response(401),
+            self._make_locked_response(401),
+        ]
+        mock_get.return_value = self._make_unlock_response(200)
+
+        rv = self.client.post(
+            "/api/chat",
+            data=json.dumps(self.OLLAMA_REQUEST),
+            content_type="application/json",
+        )
+
+        self.assertEqual(rv.status_code, 502)
+        self.assertEqual(mock_post.call_count, 2, "tried twice")
+        self.assertEqual(mock_get.call_count, 1, "unlock attempted once")
+
+    @patch("proxy.requests.get")
+    @patch("proxy.requests.post")
+    def test_unlock_url_get_fails(self, mock_post, mock_get):
+        """Locked → unlock GET returns 500 → no retry → flow through as 502."""
+        mock_post.return_value = self._make_locked_response(401)
+        mock_get.return_value = self._make_unlock_response(500)
+
+        rv = self.client.post(
+            "/api/chat",
+            data=json.dumps(self.OLLAMA_REQUEST),
+            content_type="application/json",
+        )
+
+        self.assertEqual(rv.status_code, 502)
+        self.assertEqual(mock_post.call_count, 1, "must not retry when unlock fails")
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("proxy.requests.get")
+    @patch("proxy.requests.post")
+    def test_no_unlock_url_in_error(self, mock_post, mock_get):
+        """4xx without unlock_url → no unlock attempted → flow through as 502."""
+        m = MagicMock()
+        m.status_code = 401
+        m.json.return_value = {"error": {"type": "invalid_authentication"}}
+        m.text = json.dumps(m.json.return_value)
+        mock_post.return_value = m
+
+        rv = self.client.post(
+            "/api/chat",
+            data=json.dumps(self.OLLAMA_REQUEST),
+            content_type="application/json",
+        )
+
+        self.assertEqual(rv.status_code, 502)
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(mock_get.call_count, 0, "must not call unlock without unlock_url")
+
+    @patch("proxy.requests.get")
+    @patch("proxy.requests.post")
+    def test_5xx_does_not_trigger_unlock(self, mock_post, mock_get):
+        """5xx upstream errors don't go through the unlock flow."""
+        m = MagicMock()
+        m.status_code = 503
+        m.json.return_value = {"error": "service unavailable"}
+        m.text = json.dumps(m.json.return_value)
+        mock_post.return_value = m
+
+        rv = self.client.post(
+            "/api/chat",
+            data=json.dumps(self.OLLAMA_REQUEST),
+            content_type="application/json",
+        )
+
+        self.assertEqual(rv.status_code, 502)
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(mock_get.call_count, 0, "5xx must not trigger unlock retry")
 
 
 if __name__ == "__main__":

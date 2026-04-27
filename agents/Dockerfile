@@ -12,12 +12,10 @@
 FROM node:20-bookworm-slim
 
 # Shared runtime deps:
-#   tmux           — entrypoint wraps the agent in a detached tmux session
-#                    so the user can reattach from the host
 #   git            — agents shell out to git for some operations
 #   curl           — handy for in-container debugging
 #   ca-certificates— TLS for any outbound HTTPS
-#   procps         — `ps`, used by tmux/agent diagnostics
+#   procps         — `ps`, used by agent diagnostics
 #   gosu           — used by the entrypoint to drop from root to the harness
 #                    user after remapping uid/gid to match the host caller
 #   jq             — used by the entrypoint to merge config files and by
@@ -33,7 +31,6 @@ FROM node:20-bookworm-slim
 #                    TUI. Generated to C.UTF-8 below.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        tmux \
         git \
         curl \
         ca-certificates \
@@ -52,9 +49,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Generate C.UTF-8 and export LANG/LC_ALL so every process inside the
-# container (entrypoint, gosu-launched harness user, tmux session, agent
-# CLIs) sees a UTF-8 locale. Use C.UTF-8 (not en_US.UTF-8) for portability:
-# no English-specific assumptions, just ASCII-compatible bytes plus UTF-8.
+# container (entrypoint, gosu-launched harness user, agent CLIs) sees a
+# UTF-8 locale. Use C.UTF-8 (not en_US.UTF-8) for portability: no
+# English-specific assumptions, just ASCII-compatible bytes plus UTF-8.
 RUN sed -i 's/^# *\(C.UTF-8\)/\1/' /etc/locale.gen \
     && locale-gen C.UTF-8
 ENV LANG=C.UTF-8
