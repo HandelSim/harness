@@ -10,7 +10,8 @@
 #   2. runs harness-install.sh non-interactively (cloning the local repo,
 #      not GitHub — via HARNESS_REPO_URL),
 #   3. exercises every major harness subcommand with a mock upstream,
-#   4. drives a real tmux-wrapped agent session via send-keys / capture-pane,
+#   4. runs `harness claude -p` and `harness opencode -p` print-mode round
+#      trips against the mock,
 #   5. tears everything down on exit.
 #
 # What this test does NOT cover (covered instead by MANUAL_TEST_PROMPT.md):
@@ -35,13 +36,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=lib/platform.sh
 source "${REPO_ROOT}/scripts/lib/platform.sh"
 
-# shellcheck source=lib/tui_driver.sh
-source "${SCRIPT_DIR}/lib/tui_driver.sh"
-
 PROJECT_NAME="harness-pipeline-test"
 NETWORK="${PROJECT_NAME}_harness-net"
 MOCK_NAME="harness-pipeline-test-mockupstream"
-TMUX_AGENT_NAME="harness-claude-tmuxtest"
 
 echo "============================================================"
 echo " harness full pipeline test"
@@ -74,9 +71,6 @@ export HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist"
 cleanup() {
     local rc=$?
     echo "[pipeline] cleanup (rc=${rc})"
-
-    # Tear down the tmux test agent if it survived.
-    docker rm -f "${TMUX_AGENT_NAME}" >/dev/null 2>&1 || true
 
     # Tear down the mock upstream sidecar.
     docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
@@ -140,7 +134,7 @@ harness_call() {
 docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     down -v --remove-orphans >/dev/null 2>&1 || true
-docker rm -f "${MOCK_NAME}" "${TMUX_AGENT_NAME}" >/dev/null 2>&1 || true
+docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
 
 # --- T0: stage installer ---------------------------------------------------
 
@@ -422,168 +416,16 @@ else
     echo "[pipeline] T10 OK"
 fi
 
-# --- T11: tmux interactive flow --------------------------------------------
+# --- T11: removed --------------------------------------------------------
 #
-# We can't directly drive `harness claude` because it execs into
-# `docker exec -it tmux attach`, which would block this script. Instead we
-# reproduce the docker run command (matching what run_agent_interactive
-# would issue) but skip the attach step. Then we drive tmux via the
-# tui_driver.sh toolkit (hex-0d Enter, ANSI stripping, busy→idle detection)
-# and verify the response in capture-pane.
-#
-# We use a fixed container name (TMUX_AGENT_NAME) instead of the hash-based
-# name so the trap can clean up unconditionally.
-
-echo "[pipeline] T11: tmux send-keys / capture-pane (via tui_driver.sh)"
-# The full agent entrypoint (root branch) runs init-firewall.sh before gosu —
-# we must mirror what run_agent_interactive does in the harness CLI:
-#   --cap-add NET_ADMIN --cap-add NET_RAW
-#   -v <install-root>/.harness-allowlist:/etc/harness/allowlist:ro
-# harness-install.sh has already seeded ${TEST_ROOT}/.harness-allowlist from the
-# bundled .harness-allowlist.example (T1).
-workspace_host=$(harness_docker_path "${TEST_WORKSPACE}")
-agent_home_host=$(harness_docker_path "${TEST_ROOT}/harness/state/agent/home")
-allowlist_host=$(harness_docker_path "${TEST_ROOT}/.harness-allowlist")
-harness_docker run -d \
-    --name "${TMUX_AGENT_NAME}" \
-    --network "${NETWORK}" \
-    --user 0:0 \
-    --cap-add NET_ADMIN \
-    --cap-add NET_RAW \
-    -e "HOST_UID=$(id -u)" \
-    -e "HOST_GID=$(id -g)" \
-    -e "OLLAMA_AGENT_MODEL=harness" \
-    -e "ANTHROPIC_BASE_URL=http://ollama:11434" \
-    -e "ANTHROPIC_AUTH_TOKEN=harness-dummy" \
-    -e "ANTHROPIC_MODEL=harness" \
-    -e "ANTHROPIC_SMALL_FAST_MODEL=harness" \
-    -v "${workspace_host}:/workspace" \
-    -v "${agent_home_host}:/home/harness" \
-    -v "${allowlist_host}:/etc/harness/allowlist:ro" \
-    -w /workspace \
-    --label "harness.agent=true" \
-    --label "harness.tool=claude" \
-    --label "harness.mount=${TEST_WORKSPACE}" \
-    harness-agent:latest \
-    claude \
-    >/dev/null
-
-# Phase 1: tmux session must exist. tmux is owned by the harness user in
-# the container (entrypoint exec's gosu harness after the UID remap), so
-# we exec as harness rather than root. tui_driver wraps that — but here we
-# need a one-shot has-session probe with a deadline, so we spell it out.
-deadline=$(( $(date +%s) + 30 ))
-while true; do
-    if harness_docker exec --user harness "${TMUX_AGENT_NAME}" tmux has-session -t harness-agent 2>/dev/null; then
-        break
-    fi
-    if [[ -z "$(docker ps -q -f "name=^${TMUX_AGENT_NAME}$" 2>/dev/null)" ]]; then
-        echo "[pipeline] T11 FAIL: container exited before tmux ready" >&2
-        docker logs "${TMUX_AGENT_NAME}" >&2 || true
-        exit 1
-    fi
-    if (( $(date +%s) >= deadline )); then
-        echo "[pipeline] T11 FAIL: tmux session not ready in 30s" >&2
-        docker logs "${TMUX_AGENT_NAME}" >&2 || true
-        exit 1
-    fi
-    sleep 1
-done
-
-# Helper: dump the cleaned pane on failure so we can diagnose without
-# re-capturing. `tui_capture_clean` uses -J (join wrapped lines) and ANSI-
-# strips, so the output is regex-friendly.
-t11_dump_pane() {
-    {
-        echo "--- pane (ANSI stripped, joined) ---"
-        tui_capture_clean "${TMUX_AGENT_NAME}" harness-agent || true
-        echo "--- container logs (last 50) ---"
-        docker logs "${TMUX_AGENT_NAME}" 2>&1 | tail -50 || true
-    } >&2
-}
-
-# Phase 2: walk claude's first-run dialogs (theme → API-key → security
-# notes → workspace-trust). The state is persisted in agent/claude/ so
-# subsequent runs in production skip these; the pipeline test mounts a
-# fresh agent/claude/ so we always hit them.
-
-if ! tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent 'Choose the text style|Dark mode' 30; then
-    echo "[pipeline] T11 FAIL: theme picker did not appear in 30s" >&2
-    t11_dump_pane
-    exit 1
-fi
-tui_send_key "${TMUX_AGENT_NAME}" harness-agent Enter
-
-# After theme select, claude shows either:
-#   (a) "Detected a custom API key" dialog — only when ANTHROPIC_API_KEY is set
-#   (b) Security notes screen (older builds) or workspace-trust (newer)
-# The harness now sets ANTHROPIC_AUTH_TOKEN (not API_KEY) so claude can skip
-# its api.anthropic.com preflight probe behind our default firewall, which
-# means path (a) is no longer expected. Keep the branch optional in case a
-# future caller still passes API_KEY.
-if tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent 'Detected a custom API key|API_KEY' 5; then
-    # "1" picks "Yes". send-text avoids tmux interpreting "1" as a key name.
-    tui_send_text "${TMUX_AGENT_NAME}" harness-agent "1"
-    sleep 0.1
-    tui_send_key "${TMUX_AGENT_NAME}" harness-agent Enter
-fi
-
-# Wait for Security notes (older builds) or workspace-trust (newer builds —
-# Security notes screen was removed). Dismiss Security notes if present, then
-# always Enter through workspace-trust.
-if ! tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent \
-        'Security notes|Press Enter|Accessing workspace|trust this folder' 20; then
-    echo "[pipeline] T11 FAIL: neither Security notes nor workspace-trust dialog appeared" >&2
-    t11_dump_pane
-    exit 1
-fi
-__t11_pane=$(tui_capture_clean "${TMUX_AGENT_NAME}" harness-agent || true)
-if grep -qE 'Security notes' <<<"${__t11_pane}"; then
-    tui_send_key "${TMUX_AGENT_NAME}" harness-agent Enter
-    if ! tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent 'Accessing workspace|trust this folder' 20; then
-        echo "[pipeline] T11 FAIL: workspace-trust dialog did not follow security notes" >&2
-        t11_dump_pane
-        exit 1
-    fi
-fi
-tui_send_key "${TMUX_AGENT_NAME}" harness-agent Enter
-
-# Phase 3: wait for the main prompt to render, then send the actual user
-# prompt and let tui_wait_agent_done handle the busy→idle transition.
-if ! tui_wait_for_text "${TMUX_AGENT_NAME}" harness-agent 'Welcome|shortcuts|Tips for getting started' 30; then
-    echo "[pipeline] T11 FAIL: main prompt did not render after dialogs" >&2
-    t11_dump_pane
-    exit 1
-fi
-
-if ! tui_prompt_and_wait "${TMUX_AGENT_NAME}" harness-agent 'say hello' 90; then
-    echo "[pipeline] T11 FAIL: agent did not finish processing 'say hello'" >&2
-    t11_dump_pane
-    exit 1
-fi
-
-# Phase 4: assert the mock response landed in the pane.
-if ! tui_assert_response_contains "${TMUX_AGENT_NAME}" harness-agent 'Hello from mock upstream'; then
-    echo "[pipeline] T11 FAIL: did not see mock-upstream response in pane" >&2
-    docker logs "${TMUX_AGENT_NAME}" 2>&1 | tail -50 >&2 || true
-    exit 1
-fi
-
-# Phase 5: harness list must show the labeled agent.
-list_out=$(harness_call list)
-if ! grep -q "${TMUX_AGENT_NAME}" <<<"${list_out}"; then
-    echo "[pipeline] T11 FAIL: harness list did not include ${TMUX_AGENT_NAME}" >&2
-    echo "${list_out}" >&2
-    exit 1
-fi
-
-# Phase 6: harness stop should kill it cleanly.
-harness_call stop "${TMUX_AGENT_NAME}" >/dev/null
-if [[ -n "$(docker ps -q -f "name=^${TMUX_AGENT_NAME}$" 2>/dev/null)" ]]; then
-    echo "[pipeline] T11 FAIL: container still running after harness stop" >&2
-    exit 1
-fi
-echo "[pipeline] T11 OK"
+# T11 used to drive an interactive tmux session via scripts/lib/tui_driver.sh
+# to walk claude-code's first-run dialogs and verify a prompt round-trip in
+# the pane. Phase 18 dropped tmux wrapping from agent launch in favor of
+# foreground exec, and Phase 19 deleted the tmux-based test driver
+# altogether. T9 (`harness claude -p "say hello"`) already covers the
+# end-to-end mock round-trip for claude, and T10 covers it for opencode,
+# so the tmux flow had no unique coverage. The harness list + harness stop
+# coverage T11 also did is provided by scripts/harness_test.sh.
 
 # --- T12 (skipped here, see MANUAL_TEST_PROMPT.md) -------------------------
 #

@@ -67,9 +67,9 @@ harness/
     ├── mcp_test.sh          MCP install/enable/disable/uninstall lifecycle test
     ├── firewall_test.sh     Phase B1/B2 firewall guardrail (negative) + bypass
     ├── upgrade_test.sh      Phase B3 upgrade actions library + synthetic version transition
-    ├── full_pipeline_test.sh end-to-end install → run → TUI drive (covers both agents)
+    ├── full_pipeline_test.sh end-to-end install → run → print-mode round-trip (covers both agents)
     ├── integration_test.sh  Phase 7b: end-to-end Serena MCP + Graphify skill (HARNESS_RUN_SLOW=1)
-    ├── lib/                 sourceable test toolkits (tui_driver, test_helpers, net_helpers)
+    ├── lib/                 sourceable test toolkits (test_helpers, net_helpers)
     └── fixtures/
         ├── responses/       mock_upstream fixture dispatch table (Phase 7a)
         └── test-project/    small Python calculator package used by integration_test.sh
@@ -387,7 +387,7 @@ $ bash scripts/persistence_test.sh   # persistent home + skel seed
 $ bash scripts/mcp_test.sh           # MCP install/enable/disable/uninstall lifecycle
 $ bash scripts/firewall_test.sh      # firewall guardrail (negative) + per-service bypass
 $ bash scripts/upgrade_test.sh       # upgrade actions library + synthetic version transition
-$ bash scripts/full_pipeline_test.sh # full install + run pipeline (covers both agents; drives a TUI via lib/tui_driver.sh)
+$ bash scripts/full_pipeline_test.sh # full install + run pipeline (covers both agents via print-mode round-trip)
 $ HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh  # Phase 7b: end-to-end Serena + Graphify (slow, ~10-15 min)
 ```
 
@@ -431,14 +431,6 @@ a non-trivial multi-module symbol graph to chew on.
 
 `scripts/lib/` ships sourceable bash libraries shared across tests:
 
-- `tui_driver.sh` — drives agent TUIs from tests by attaching a tmux session
-  inside the test container (production agent launch is foreground-exec —
-  see Phase 18 — but the test toolkit needs a programmable handle for
-  send-keys / capture-pane). Bakes in three hard-won constraints: hex `0d`
-  for Enter (the keyword form silently fails on Ink/React TUIs),
-  `--user harness` on every `docker exec`, and ANSI-strip before regex
-  match. Pair `tui_send_line` + `tui_wait_agent_done` for the prompt-
-  then-wait pattern.
 - `test_helpers.sh` — common setup: `require_docker`, `test_section`,
   `test_generate_env`, `test_generate_mockupstream_override` (mounts the
   fixture-dispatch directory), `test_wait_for_healthy`, `test_cleanup`.

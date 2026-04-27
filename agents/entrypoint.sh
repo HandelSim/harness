@@ -20,12 +20,6 @@
 #                                 path (e.g. /c/Users/you/projects/myapp)
 #   HARNESS_FIREWALL_DISABLED=1 — skip init-firewall.sh entirely
 #                                 (--net flag or `harness net open`)
-#
-# tmux: Phase 3-17 wrapped agents in a detached tmux session to support
-# reattach. Phase 18 dropped that — the foreground exec model is simpler and
-# fixes scroll-behavior issues in claude-code's TUI. The tmux_wrap helper
-# below is preserved as dead code in case the reattach use case becomes
-# important later.
 
 set -euo pipefail
 
@@ -277,27 +271,6 @@ merge_opencode_mcp_servers() {
     if [[ -n "${merged}" ]]; then
         printf '%s\n' "${merged}" > "$config_file"
     fi
-}
-
-# DEAD CODE — kept for potential future revert. Phase 18 dropped tmux from
-# agent launch because the detached-session model caused scroll-behavior
-# issues in claude-code's TUI without delivering on the theoretical reattach
-# use case (which was rarely needed in practice). The agent CLI is now the
-# container's foreground process via `exec`, so the user's terminal connects
-# directly to its PTY. If reattach ever becomes important, this helper is
-# intact and run_claude/run_opencode can be reverted to call it.
-tmux_wrap() {
-    local inner=""
-    inner=$(printf '%q' "$1"); shift
-    local a
-    for a in "$@"; do
-        inner+=" $(printf '%q' "$a")"
-    done
-    tmux new-session -d -s harness-agent \
-        "${inner}; ec=\$?; echo; echo '[harness] agent exited (code '\$ec')'; sleep 30; exit \$ec"
-    while tmux has-session -t harness-agent 2>/dev/null; do
-        sleep 5
-    done
 }
 
 # --- mode: claude ----------------------------------------------------------

@@ -40,8 +40,6 @@ export REPO_ROOT  # test_helpers.sh expects this in scope.
 
 # shellcheck source=lib/test_helpers.sh
 source "${REPO_ROOT}/scripts/lib/test_helpers.sh"
-# shellcheck source=lib/tui_driver.sh
-source "${REPO_ROOT}/scripts/lib/tui_driver.sh"
 
 require_docker
 
@@ -50,7 +48,6 @@ require_docker
 PROJECT_NAME="harness-integration-test"
 NETWORK="${PROJECT_NAME}_harness-net"
 MOCK_NAME="${PROJECT_NAME}-mockupstream-1"
-TUI_AGENT_NAME="harness-claude-integration-tui"
 GRAPHIFY_AGENT_NAME="harness-claude-graphify-install"
 GRAPHIFY_AGENT_NAME_2="harness-claude-graphify-persist"
 
@@ -64,9 +61,9 @@ cleanup() {
     local rc=$?
     echo "[integration] cleanup (rc=${rc})"
 
-    # Kill any TUI / graphify test containers we launched directly. These
+    # Kill any graphify test containers we launched directly. These
     # don't run under compose so `harness down` won't touch them.
-    for c in "${TUI_AGENT_NAME}" "${GRAPHIFY_AGENT_NAME}" "${GRAPHIFY_AGENT_NAME_2}"; do
+    for c in "${GRAPHIFY_AGENT_NAME}" "${GRAPHIFY_AGENT_NAME_2}"; do
         docker rm -f "$c" >/dev/null 2>&1 || true
     done
 
@@ -116,7 +113,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Defensive: clear any stale state from a previous aborted run.
-docker rm -f "${MOCK_NAME}" "${TUI_AGENT_NAME}" \
+docker rm -f "${MOCK_NAME}" \
     "${GRAPHIFY_AGENT_NAME}" "${GRAPHIFY_AGENT_NAME_2}" \
     harness-serena >/dev/null 2>&1 || true
 docker compose --project-name "${PROJECT_NAME}" \
@@ -416,120 +413,39 @@ phase_2_serena() {
 # shows evidence of the tool-call (the keyword "find_symbol" or
 # "Calculator" — the mock returns a fixture containing both).
 phase_2_tui_test() {
-    docker rm -f "${TUI_AGENT_NAME}" >/dev/null 2>&1 || true
-    # Bind-mount sources go through harness_docker_path so /tmp/... (which
-    # Docker Desktop's WSL2 backend can't resolve) becomes C:/Users/.../Temp/.
-    local mnt_workspace mnt_home mnt_allowlist
-    mnt_workspace=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
-    mnt_home=$(harness_docker_path "${TEST_INSTALL}/state/agent/home")
-    mnt_allowlist=$(harness_docker_path "${TEST_INSTALL}/.harness-allowlist")
-    harness_docker run -d \
-        --name "${TUI_AGENT_NAME}" \
-        --network "${NETWORK}" \
-        --user 0:0 \
-        --cap-add NET_ADMIN \
-        --cap-add NET_RAW \
-        -e "HOST_UID=$(id -u)" \
-        -e "HOST_GID=$(id -g)" \
-        -e "OLLAMA_AGENT_MODEL=harness" \
-        -e "ANTHROPIC_BASE_URL=http://ollama:11434" \
-        -e "ANTHROPIC_AUTH_TOKEN=harness-dummy" \
-        -e "ANTHROPIC_MODEL=harness" \
-        -e "ANTHROPIC_SMALL_FAST_MODEL=harness" \
-        -v "${mnt_workspace}:/workspace" \
-        -v "${mnt_home}:/home/harness" \
-        -v "${mnt_allowlist}:/etc/harness/allowlist:ro" \
-        -w /workspace \
-        --label "harness.agent=true" \
-        --label "harness.project=${PROJECT_NAME}" \
-        --label "harness.tool=claude" \
-        --label "harness.mount=${TEST_WORKSPACE}/test-project" \
-        harness-agent:latest \
-        claude \
-        >/dev/null
+    # Phase 18 dropped tmux from agent launch and Phase 19 deleted the
+    # tmux-based test driver, so we drive claude in print mode for this
+    # check. The fixture (04_serena_find_symbol) returns a tool-call JSON
+    # block referencing the Calculator class — the assertion is the same
+    # regardless of whether the surface is a TUI pane or a print-mode
+    # stdout stream.
+    local out rc
+    set +e
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 120 \
+        "${FAKE_HOME}/.local/bin/harness" claude -p \
+        "Use serena to find the Calculator class symbol in this project" \
+        2>&1 < /dev/null)
+    rc=$?
+    set -e
 
-    # Wait for tmux session to come up.
-    local deadline=$(( $(date +%s) + 60 ))
-    while true; do
-        if harness_docker exec --user harness "${TUI_AGENT_NAME}" \
-                tmux has-session -t harness-agent 2>/dev/null; then
-            break
-        fi
-        if [[ -z "$(docker ps -q -f "name=^${TUI_AGENT_NAME}$" 2>/dev/null)" ]]; then
-            echo "[integration] Phase 2.6 FAIL: TUI container exited before tmux ready" >&2
-            docker logs "${TUI_AGENT_NAME}" 2>&1 | tail -30 >&2 || true
-            return 1
-        fi
-        if (( $(date +%s) >= deadline )); then
-            echo "[integration] Phase 2.6 FAIL: tmux session not ready in 60s" >&2
-            return 1
-        fi
-        sleep 1
-    done
-
-    # Walk first-run claude dialogs (theme, optional API-key, optional
-    # security notes, workspace trust). The persistent home is bind-mounted
-    # fresh so we always hit them. Mirrors the T11 sequence in
-    # full_pipeline_test.sh.
-    if ! tui_wait_for_text "${TUI_AGENT_NAME}" harness-agent 'Choose the text style|Dark mode' 30; then
-        echo "[integration] Phase 2.6 FAIL: theme picker did not appear" >&2
-        tui_capture_clean "${TUI_AGENT_NAME}" harness-agent >&2 || true
-        return 1
-    fi
-    tui_send_key "${TUI_AGENT_NAME}" harness-agent Enter
-    if tui_wait_for_text "${TUI_AGENT_NAME}" harness-agent 'Detected a custom API key|API_KEY' 5; then
-        tui_send_text "${TUI_AGENT_NAME}" harness-agent "1"
-        sleep 0.1
-        tui_send_key "${TUI_AGENT_NAME}" harness-agent Enter
-    fi
-    if ! tui_wait_for_text "${TUI_AGENT_NAME}" harness-agent \
-            'Security notes|Press Enter|Accessing workspace|trust this folder' 20; then
-        echo "[integration] Phase 2.6 FAIL: post-theme dialog did not appear" >&2
-        tui_capture_clean "${TUI_AGENT_NAME}" harness-agent >&2 || true
-        return 1
-    fi
-    local pane_pre
-    pane_pre=$(tui_capture_clean "${TUI_AGENT_NAME}" harness-agent || true)
-    if grep -qE 'Security notes' <<<"${pane_pre}"; then
-        tui_send_key "${TUI_AGENT_NAME}" harness-agent Enter
-        if ! tui_wait_for_text "${TUI_AGENT_NAME}" harness-agent 'Accessing workspace|trust this folder' 20; then
-            echo "[integration] Phase 2.6 FAIL: workspace-trust did not follow security notes" >&2
-            return 1
-        fi
-    fi
-    tui_send_key "${TUI_AGENT_NAME}" harness-agent Enter
-    if ! tui_wait_for_text "${TUI_AGENT_NAME}" harness-agent \
-            'Welcome|shortcuts|Tips for getting started' 30; then
-        echo "[integration] Phase 2.6 FAIL: main prompt did not render" >&2
-        return 1
-    fi
-
-    # Send a prompt designed to match the 04_serena_find_symbol fixture.
-    # The mock replies with a tool-call JSON block referencing the
-    # Calculator class. Even if claude doesn't actually dispatch the
-    # mcp__serena__find_symbol tool (which depends on the exact tool-call
-    # protocol the upstream uses), the rendered text contains both
-    # "find_symbol" and "Calculator" — either matches our assertion.
-    if ! tui_prompt_and_wait "${TUI_AGENT_NAME}" harness-agent \
-            "Use serena to find the Calculator class symbol in this project" 120; then
-        echo "[integration] Phase 2.6 FAIL: agent did not finish processing serena prompt" >&2
-        tui_capture_clean "${TUI_AGENT_NAME}" harness-agent >&2 || true
-        return 1
-    fi
-
-    local pane
-    pane=$(tui_capture_clean "${TUI_AGENT_NAME}" harness-agent)
-    if ! grep -qE "find_symbol|Calculator" <<<"${pane}"; then
-        echo "[integration] Phase 2.6 FAIL: pane shows no evidence of serena tool invocation" >&2
-        echo "--- pane (ANSI stripped) ---" >&2
-        echo "${pane}" >&2
+    if (( rc != 0 )); then
+        echo "[integration] Phase 2.6 FAIL: harness claude -p exited ${rc}" >&2
+        echo "--- output (last 60 lines) ---" >&2
+        tail -60 <<<"${out}" >&2
         echo "--- mockupstream logs ---" >&2
         docker logs "${MOCK_NAME}" 2>&1 | tail -40 >&2 || true
         return 1
     fi
-    echo "[integration] Phase 2.6: serena tool-call evidence present in TUI pane"
 
-    docker rm -f "${TUI_AGENT_NAME}" >/dev/null 2>&1
+    if ! grep -qE "find_symbol|Calculator" <<<"${out}"; then
+        echo "[integration] Phase 2.6 FAIL: print-mode output shows no evidence of serena tool invocation" >&2
+        echo "--- output (last 60 lines) ---" >&2
+        tail -60 <<<"${out}" >&2
+        echo "--- mockupstream logs ---" >&2
+        docker logs "${MOCK_NAME}" 2>&1 | tail -40 >&2 || true
+        return 1
+    fi
+    echo "[integration] Phase 2.6: serena tool-call evidence present in print-mode output"
 }
 
 # === Phase 3: Graphify (skill) end-to-end ===================================

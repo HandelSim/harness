@@ -383,21 +383,10 @@ compose() {
     # the serena bind-mount always has a non-empty source.
     local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
 
-    # MSYS_NO_PATHCONV=1 on Windows so absolute-path env values from .env
-    # (e.g. OUTPUT_DIR=/output) don't get translated to Git Bash root
-    # prefixes (e.g. C:/Program Files/Git/output) when compose forwards
-    # them into the proxy container. Without this, the proxy reads the
-    # mangled value and writes debug dumps to the wrong path. On
-    # Linux/macOS this prefix is a no-op.
-    local docker_cmd=(docker)
-    if [[ "$(harness_detect_os)" == "windows" ]]; then
-        docker_cmd=(env MSYS_NO_PATHCONV=1 docker)
-    fi
-
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
-        "${docker_cmd[@]}" "${args[@]}" "$@"
+        docker "${args[@]}" "$@"
 }
 
 # Best-effort check: are ollama and proxy both running for this project?

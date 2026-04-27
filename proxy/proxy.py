@@ -21,6 +21,7 @@ import sys
 import traceback
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, Response, request
@@ -479,6 +480,66 @@ def catch_all(path: str) -> Response:
                 status=502,
                 mimetype="application/json",
             )
+
+        # Auto-unlock retry: some Anthropic-compatible upstreams lock keys
+        # after periods of inactivity and include an `unlock_url` in the
+        # error body. Hit it once and retry the original request — the
+        # agent never sees the lockout.
+        #
+        # Detection is on `error.unlock_url` presence rather than
+        # error.type wording, since the message text varies between
+        # providers. Retry runs at most ONCE: if the second response is
+        # still locked, it flows through to the existing 4xx handler
+        # rather than looping. Concurrent requests racing the same lock
+        # each call unlock independently — that's wasteful but harmless,
+        # since unlock is idempotent.
+        if resp.status_code in (401, 403):
+            unlock_url = None
+            try:
+                err_body_for_unlock = resp.json()
+                unlock_url = (err_body_for_unlock.get("error", {}) or {}).get("unlock_url")
+            except (ValueError, AttributeError):
+                unlock_url = None
+
+            if unlock_url:
+                api_host = urlparse(PROXY_API_URL).hostname
+                unlock_host = urlparse(unlock_url).hostname
+                if api_host and unlock_host and api_host != unlock_host:
+                    print(f"[{req_id}] WARN: unlock_url host '{unlock_host}' differs from API host '{api_host}'", flush=True)
+                    print(f"[{req_id}]       if unlock fails, add '{unlock_host}' to .harness-allowlist", flush=True)
+
+                print(f"[{req_id}] API key locked; hitting unlock_url and retrying", flush=True)
+                try:
+                    unlock_resp = requests.get(
+                        unlock_url,
+                        verify=False,
+                        timeout=15,
+                    )
+                    if unlock_resp.status_code == 200:
+                        print(f"[{req_id}] unlock succeeded; retrying original request", flush=True)
+                        save_debug_file(req_id, "02b", "Unlock_Succeeded", {"unlock_url": unlock_url, "status": unlock_resp.status_code})
+                        try:
+                            resp = requests.post(
+                                PROXY_API_URL,
+                                headers=headers,
+                                json=upstream_payload,
+                                verify=False,
+                                timeout=PROXY_TIMEOUT,
+                            )
+                        except requests.RequestException as e:
+                            print(f"[{req_id}] retry after unlock failed: {e}", flush=True)
+                            save_debug_file(req_id, "03", "API_Error", {"error": "retry-after-unlock-failed", "details": str(e)})
+                            return Response(
+                                json.dumps({"error": "upstream request failed after unlock", "details": str(e)}),
+                                status=502,
+                                mimetype="application/json",
+                            )
+                    else:
+                        print(f"[{req_id}] unlock returned {unlock_resp.status_code}; not retrying", flush=True)
+                        save_debug_file(req_id, "02b", "Unlock_Failed", {"unlock_url": unlock_url, "status": unlock_resp.status_code})
+                except requests.RequestException as e:
+                    print(f"[{req_id}] unlock request failed: {e}", flush=True)
+                    save_debug_file(req_id, "02b", "Unlock_Failed", {"unlock_url": unlock_url, "error": str(e)})
 
         if resp.status_code >= 400:
             err_body: Any

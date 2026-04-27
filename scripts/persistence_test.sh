@@ -16,8 +16,8 @@
 #       inside a container lands the package under ~/.local/, and a
 #       fresh container without re-installing can `import` it.
 #
-# We run the agent image with --entrypoint /bin/bash to bypass tmux and
-# all the per-tool dispatch — this test is about the home-mount mechanics
+# We run the agent image with --entrypoint /bin/bash to bypass the
+# per-tool dispatch entirely — this test is about the home-mount mechanics
 # only, not anything claude-code or opencode does.
 #
 # Project name is fixed to harness-persist-test so this never collides

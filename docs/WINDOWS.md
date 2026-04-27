@@ -119,7 +119,24 @@ displays correctly.
 
 - PowerShell and cmd are not supported. All harness commands must be run from Git Bash.
 - File ownership tests (the `--user` flag, `chown` behavior) are non-meaningful on Windows because NTFS doesn't have POSIX UIDs. Files created in mounted volumes are owned by your Windows user automatically; the harness UID-remap logic that's necessary on Linux has no effect on Windows.
-- Tmux is no longer required at runtime (Phase 18 dropped the wrapping). It still ships with Git for Windows; the test toolkit uses it internally for programmatic TUI input/output.
+- Tmux is not used anywhere in the harness runtime. Phase 18 dropped the wrapping from agent launch and Phase 19 removed the dead-code helpers and the test driver.
+
+## OUTPUT_DIR (proxy debug dumps)
+
+The proxy supports an optional `OUTPUT_DIR` env var that captures every
+request/response trio for debugging. On Linux/macOS, set it to a path like
+`/output` in `.env`.
+
+On Windows under Git Bash, the leading slash gets auto-translated to a Git
+Bash root prefix (`C:/Program Files/Git/output`). Use a double-slash to
+bypass MSYS path translation:
+
+```
+OUTPUT_DIR=//output
+```
+
+Both forms bind-mount to the same host directory at
+`<install-root>/state/output/`.
 
 ## Troubleshooting
 
