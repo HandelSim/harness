@@ -254,7 +254,15 @@ phase_2_serena() {
         # with HARNESS_NO_BUILD=1 just `up`s the existing image. This sidesteps
         # `harness start`'s `compose up -d --build`, which would re-fetch the
         # upstream serena git context and burn buildkit cache repeatedly.
-        if ! docker compose --project-name "${PROJECT_NAME}" \
+        #
+        # Match the env contract the harness `compose()` wrapper provides:
+        # INSTALL_ROOT and HARNESS_ALLOWLIST_PATH are referenced as plain
+        # ${VAR} in mcp-registry/serena/compose.yml. Without them, compose
+        # interpolates the volume specs to empty and rejects them with
+        # 'invalid spec: :/path: empty section between colons'.
+        if ! INSTALL_ROOT="${TEST_INSTALL}" \
+                HARNESS_ALLOWLIST_PATH="${TEST_INSTALL}/.harness-allowlist" \
+                docker compose --project-name "${PROJECT_NAME}" \
                 --env-file "${TEST_INSTALL}/.env" \
                 -f "${TEST_INSTALL}/docker-compose.yml" \
                 -f "${TEST_INSTALL}/state/mcp/serena/compose.yml" \
@@ -290,7 +298,11 @@ phase_2_serena() {
     fi
     if ! docker exec "${proxy_cid}" timeout 5 bash -c "echo > /dev/tcp/serena/9121" 2>/dev/null; then
         echo "[integration] Phase 2.3 FAIL: serena unreachable from proxy at tcp://serena:9121" >&2
-        docker compose --project-name "${PROJECT_NAME}" \
+        # Same env contract as the build call above — required because this
+        # invocation also pulls in the serena compose snippet.
+        INSTALL_ROOT="${TEST_INSTALL}" \
+            HARNESS_ALLOWLIST_PATH="${TEST_INSTALL}/.harness-allowlist" \
+            docker compose --project-name "${PROJECT_NAME}" \
             -f "${TEST_INSTALL}/docker-compose.yml" \
             -f "${TEST_INSTALL}/state/mcp/serena/compose.yml" \
             --profile mcp logs --tail=30 serena >&2 2>/dev/null || true
