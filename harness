@@ -736,7 +736,15 @@ EOF
     fi
 
     if ! command -v jq >/dev/null 2>&1; then
-        err "jq is required for 'harness upgrade'; install it and retry"
+        err "jq is required for 'harness upgrade'."
+        err ""
+        err "install instructions:"
+        err "  Debian/Ubuntu: sudo apt-get install jq"
+        err "  RHEL/Fedora:   sudo dnf install jq"
+        err "  macOS:         brew install jq"
+        err "  Windows:       pacman -S jq (in Git Bash MSYS2 setup)"
+        err ""
+        err "after installing, retry: harness upgrade"
         exit 1
     fi
 

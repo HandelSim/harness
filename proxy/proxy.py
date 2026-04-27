@@ -205,8 +205,8 @@ def _scan_balanced_json(text, start):
     return None, start
 
 
-def extract_tool_call_and_text(response_text):
-    """Extract a tool-call JSON payload from the response.
+def extract_tool_calls_and_text(response_text):
+    """Extract ALL tool-call JSON payloads from the response, in order.
 
     Searches for ```json ... ``` blocks and uses balanced-brace scanning
     (not regex) to locate the JSON object boundaries. The regex this
@@ -214,12 +214,24 @@ def extract_tool_call_and_text(response_text):
     code fences — the lazy match terminated on the first inner ``` instead
     of the outer one, truncating the JSON.
 
-    If multiple ```json blocks exist, returns the first one that parses
-    to a valid {name, arguments} payload.
+    Real upstream LLMs (Gemini Enterprise, claude-3.5-sonnet variants, etc.)
+    frequently emit multiple tool calls per response when the agent's task
+    naturally calls for parallel work — reading multiple files, calling
+    multiple APIs, etc. Each ```json block with valid {name, arguments}
+    becomes a separate tool call; their order is preserved.
 
-    Returns (payload, clean_text). payload is None when no valid tool call
-    was found, in which case clean_text equals response_text.
+    A block that fails to parse, doesn't have the expected shape, or is
+    missing required keys is left in the text — clean_text will contain
+    those invalid blocks intact (the agent then sees them as content,
+    which is correct: the LLM may have been describing JSON, not asking
+    to invoke a tool).
+
+    Returns (payloads, clean_text). payloads is a list (possibly empty)
+    of {name, arguments} dicts in the order they appeared. clean_text is
+    response_text with all VALID extracted blocks removed.
     """
+    payloads = []
+    consumed_ranges = []  # (fence_start, block_end) tuples for blocks we extracted
     pos = 0
 
     while True:
@@ -260,12 +272,20 @@ def extract_tool_call_and_text(response_text):
             pos = after_json
             continue
 
-        block = response_text[fence_start:block_end]
-        clean_text = response_text.replace(block, '', 1).strip()
+        # Valid tool call. Record it and the byte range to remove later.
+        payloads.append(candidate)
+        consumed_ranges.append((fence_start, block_end))
+        pos = block_end
 
-        return candidate, clean_text
+    # Build clean_text by removing all consumed ranges. Process in REVERSE
+    # so earlier indices stay valid as we slice. (Forward-order removal
+    # would shift the offsets of later ranges.)
+    clean_chars = list(response_text)
+    for start, end in sorted(consumed_ranges, reverse=True):
+        del clean_chars[start:end]
+    clean_text = ''.join(clean_chars).strip()
 
-    return None, response_text
+    return payloads, clean_text
 
 
 # ---------------------------------------------------------------------------
@@ -384,28 +404,31 @@ def make_chunk(
 def generate_ndjson(
     model_name: str,
     clean_text: str,
-    tool_call_payload: Optional[Dict[str, Any]],
+    tool_call_payloads: List[Dict[str, Any]],
     usage: Optional[Dict[str, Any]],
 ) -> Iterable[str]:
-    """Yield NDJSON lines for the response."""
+    """Yield NDJSON lines for the response.
+
+    Multiple tool calls (when the upstream produced multiple ```json blocks)
+    are emitted as a single tool_calls array in one chunk, preserving their
+    order. Each call gets a unique toolu_-prefixed id since claude-code's
+    Anthropic-format conversation history requires the id field per
+    tool_use block.
+    """
     if clean_text:
         yield json.dumps(make_chunk(model_name, content=clean_text)) + "\n"
-    if tool_call_payload:
-        # An `id` is required so claude-code can later reference the
-        # tool_use block in conversation history. Without it the
-        # Anthropic-compatible upstream rejects the next turn with
-        # "tool_use block missing required 'id' field". The toolu_<24hex>
-        # format mirrors what real Anthropic returns.
-        tool_call_id = f"toolu_{uuid.uuid4().hex[:24]}"
-        tc = [{
-            "id": tool_call_id,
-            "function": {
-                "name": tool_call_payload["name"],
-                "arguments": tool_call_payload["arguments"],
-            },
-        }]
-        yield json.dumps(make_chunk(model_name, tool_calls=tc)) + "\n"
-    done_reason = "tool_calls" if tool_call_payload else "stop"
+    if tool_call_payloads:
+        tcs = []
+        for payload in tool_call_payloads:
+            tcs.append({
+                "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                "function": {
+                    "name": payload["name"],
+                    "arguments": payload["arguments"],
+                },
+            })
+        yield json.dumps(make_chunk(model_name, tool_calls=tcs)) + "\n"
+    done_reason = "tool_calls" if tool_call_payloads else "stop"
     yield json.dumps(make_chunk(model_name, done=True, done_reason=done_reason, usage=usage)) + "\n"
 
 
@@ -569,7 +592,7 @@ def catch_all(path: str) -> Response:
         save_debug_file(req_id, "03", "API_Response", target_json)
 
         response_text = extract_assistant_content(target_json)
-        tool_call_payload, clean_text = extract_tool_call_and_text(response_text)
+        tool_call_payloads, clean_text = extract_tool_calls_and_text(response_text)
 
         usage = target_json.get("usage") or {}
         # If usage missing fields, estimate from joined inputs/outputs.
@@ -581,10 +604,22 @@ def catch_all(path: str) -> Response:
             usage = dict(usage)
             usage["completion_tokens"] = _estimate_tokens(response_text)
 
-        print(f"[{req_id}] upstream OK; emitting NDJSON (tool_call={'yes' if tool_call_payload else 'no'})", flush=True)
+        print(f"[{req_id}] upstream OK; emitting NDJSON (tool_calls={len(tool_call_payloads)})", flush=True)
+
+        # Materialize the NDJSON chunks so we can dump them to debug output
+        # before streaming. Memory cost is the response size — at most a few
+        # KB for typical tool-call responses; not a concern. Avoids needing
+        # a write-around-while-yielding mechanism. The upstream API call
+        # already completed fully before NDJSON generation began (the proxy
+        # isn't streaming from upstream — it gets the full response, then
+        # translates), so materializing-then-yielding doesn't change latency:
+        # ollama gets the first NDJSON chunk at the same moment it would
+        # have under the streaming generator.
+        ndjson_chunks = list(generate_ndjson(model_name, clean_text, tool_call_payloads, usage))
+        save_debug_file(req_id, "04", "NDJSON_Response", {"chunks": ndjson_chunks})
 
         return app.response_class(
-            generate_ndjson(model_name, clean_text, tool_call_payload, usage),
+            iter(ndjson_chunks),
             mimetype="application/x-ndjson",
         )
 
