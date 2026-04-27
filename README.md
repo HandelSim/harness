@@ -6,27 +6,45 @@ in a container, talks to a local ollama instance, and ollama forwards chat
 requests to a translating proxy that calls the upstream API.
 
 ```
-agent container ──► ollama ──(RemoteHost forward)──► proxy ──► upstream API
+agent container ──► ollama ──► proxy ──► upstream API
+
+  • ollama: registers a stub model that forwards via RemoteHost to the proxy
+  • proxy:  translates between ollama's wire format and the upstream's, AND
+            injects tool-use instructions / parses tool calls (since the
+            upstream doesn't natively support tool calls)
 ```
 
-This repo is the source for the harness runtime AND the install. Users
-clone the repo and run `harness-install.sh` from inside the clone; the
-clone IS the install root.
+This repo is the source for the harness runtime AND the installer. The
+installer clones the repo into `./harness/` (the install root); code,
+user config, and runtime state all live inside it.
 
 ## Installation
 
-```
-git clone https://github.com/HandelSim/harness
-cd harness
+Download `harness-install.sh` and run it from an empty directory:
+
+```bash
+mkdir -p ~/harness-install && cd ~/harness-install
+curl -fsSL -o harness-install.sh https://raw.githubusercontent.com/HandelSim/harness/main/harness-install.sh
 bash harness-install.sh
 ```
+
+The installer clones the repo into `./harness/` (the install root), seeds
+`.env` and `.harness-allowlist` from their `.example` templates, and writes
+a `harness` wrapper to `~/.local/bin/harness`.
 
 (On Windows, use Git Bash. See [docs/WINDOWS.md](docs/WINDOWS.md) for
 Windows-specific setup.)
 
-The installer creates a working install in the cloned directory. State,
-config, and runtime files all live inside the clone (gitignored). To
-uninstall, remove the directory and the wrapper at `~/.local/bin/harness`.
+After install:
+1. Edit `~/harness-install/harness/.env` and set `PROXY_API_KEY` (and any
+   other required values for your upstream).
+2. cd into a project directory and run `harness claude` or `harness opencode`.
+
+To uninstall:
+```bash
+rm -rf ~/harness-install/harness
+rm ~/.local/bin/harness
+```
 
 ## Repo structure
 
@@ -243,28 +261,18 @@ $ docker compose --env-file .env up --build
 To expose ollama on the host (useful for poking at it from outside the docker
 network), set `PUBLISH_OLLAMA_PORT=11434` in `.env`.
 
-## End-user installation
+### Iterating on the proxy
 
-End users clone the repo (`git clone https://github.com/HandelSim/harness`)
-and run `bash harness-install.sh` from inside the clone. The installer
-seeds `.env` from `.env.example` and `.harness-allowlist` from
-`.harness-allowlist.example`, then installs a `harness` wrapper at
-`~/.local/bin/harness` (a real script, not a symlink — works on Windows
-without Developer Mode).
+If you're modifying `proxy/proxy.py` to debug or refine its behavior, you
+can rebuild and restart just the proxy service without touching anything
+else:
 
-The installer runs a **preflight check** before any prompts (git, docker,
-docker compose v2, daemon reachability, disk space, write access). On
-Windows and macOS, the preflight will attempt to auto-start Docker Desktop
-if it isn't running. After install, `harness preflight` re-runs a similar
-set of checks plus configuration validation (.env, allowlist, hostname
-alignment) — run it after editing `.env` to catch issues before
-`harness start`.
+```bash
+docker compose --project-name harness restart proxy
+```
 
-### Windows
-
-harness runs on Windows via Git Bash (Git for Windows + Docker Desktop).
-PowerShell and cmd are not supported. See `docs/WINDOWS.md` for setup,
-limitations, and troubleshooting.
+This picks up your edits in ~10-15 seconds without affecting ollama, agents,
+or MCP services. Faster than `harness restart` for the proxy-iteration loop.
 
 ## Updating
 
@@ -449,15 +457,3 @@ a non-trivial multi-module symbol graph to chew on.
   catch-all. See `scripts/fixtures/responses/README.md` for the file shape
   and naming convention (`NN_short_slug.json`, with reserved priority
   ranges per scenario family).
-
-## Project phases
-
-- **Phase 1** — repo skeleton, ollama service, mock proxy, de-risk test
-- **Phase 2** — real translating proxy
-- **Phase 3** — agent containers (claude-code, opencode)
-- **Phase 4** — `harness` management script + `harness-install.sh` (clone-based install)
-- **Phase 6** — persistent agent homes + MCP server registry
-- **Phase 7a** — MCP lifecycle granularity (install/enable/disable/up/down/logs/status), TUI test toolkit, fixture-dispatch mock upstream
-- **Phase B1** — universal egress firewall (per-container iptables/ipset, allowlist seeded from `.harness-allowlist`)
-- **Phase B2** — user-facing firewall controls (`harness net`, `--net`, service overrides), `harness restart`, `claude-statusline-config`, ccstatusline default, MCP `allowed_domains` print
-- **Phase B3** — upgrade machinery (`harness upgrade --check/--no-prompt/--no-restart`), manifest-driven action library at `scripts/lib/upgrade_actions.sh`, `scripts/upgrade-manifest.json`

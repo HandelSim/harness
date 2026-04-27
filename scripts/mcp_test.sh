@@ -194,7 +194,15 @@ docker compose --project-name "${PROJECT_NAME}" \
 # --- T1: list shows registry entries, none installed -----------------------
 
 echo "[mcp] T1: harness mcp list — registry only, none installed"
-list_out=$(harness_call mcp list)
+# Plain 'mcp list' shows only installed entries (Phase 13b); use --available
+# to surface registry entries that haven't been installed yet.
+plain_out=$(harness_call mcp list)
+echo "${plain_out}" | sed 's/^/  | (plain) /'
+if ! grep -qi 'no MCPs installed' <<<"${plain_out}"; then
+    echo "[mcp] T1 FAIL: plain 'mcp list' with nothing installed should say so" >&2
+    exit 1
+fi
+list_out=$(harness_call mcp list --available)
 echo "${list_out}" | sed 's/^/  | /'
 # `_test_mcp` should be hidden (underscore-prefixed test fixtures don't
 # show in user-facing list). `dummy` should appear with state=available.

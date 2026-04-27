@@ -252,7 +252,9 @@ cleanup_mcp_dirs() {
 trap 'cleanup_mcp_dirs; cleanup' EXIT INT TERM
 
 # 5b.1: empty registry — list reports nothing.
-empty_list=$(HARNESS_REGISTRY_DIR="${empty_reg}" "${HARNESS_BIN}" mcp list)
+# Plain 'mcp list' shows installed-only (Phase 13b); use --available so the
+# empty-registry path emits the dedicated 'no MCP entries' message.
+empty_list=$(HARNESS_REGISTRY_DIR="${empty_reg}" "${HARNESS_BIN}" mcp list --available)
 if ! grep -qi 'no MCP entries' <<<"${empty_list}"; then
     echo "[harness-test] T5b FAIL: empty registry should report 'no MCP entries'" >&2
     echo "${empty_list}" >&2
@@ -260,7 +262,8 @@ if ! grep -qi 'no MCP entries' <<<"${empty_list}"; then
 fi
 
 # 5b.2: populated registry — foo appears with state=available.
-pop_list=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp list)
+# Need --available since foo is in the registry but not yet installed.
+pop_list=$(HARNESS_REGISTRY_DIR="${populated_reg}" "${HARNESS_BIN}" mcp list --available)
 if ! grep -Eq 'foo[[:space:]]+available' <<<"${pop_list}"; then
     echo "[harness-test] T5b FAIL: populated registry should list foo as available" >&2
     echo "${pop_list}" >&2
@@ -518,6 +521,17 @@ echo "[harness-test] T10: -p flag is parsed and dispatched"
 # auto-build fails fast. The error we then see should NOT look like an
 # argument parse error.
 restore_agent_image() {
+    # `timeout 60` may kill the harness wrapper after `docker run --rm
+    # --network <project>_harness-net` has started the agent container.
+    # The container survives client death and stays attached to the network,
+    # which would then cause T12's restart to fail at `compose down`
+    # ("network has active endpoints"). Force-remove any harness-agent
+    # containers we may have left behind so subsequent tests start clean.
+    local stragglers
+    stragglers=$(docker ps -aq --filter "ancestor=harness-agent:latest" 2>/dev/null || true)
+    if [[ -n "${stragglers}" ]]; then
+        docker rm -f ${stragglers} >/dev/null 2>&1 || true
+    fi
     if [[ -n "${agent_img_orig:-}" ]]; then
         docker tag "${agent_img_orig}" "harness-agent:latest" >/dev/null 2>&1 || true
         docker rmi "${agent_img_orig}" >/dev/null 2>&1 || true

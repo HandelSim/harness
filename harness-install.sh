@@ -495,6 +495,9 @@ Manage MCPs:
 Need a shell inside an agent container (for installing skills, debugging)?
   harness shell
 
+Found a bug or have an improvement to suggest, however small?
+  https://github.com/HandelSim/harness/issues
+
 Uninstall harness:
   rm -rf "$install_root"
   rm "\$HOME/.local/bin/harness"
