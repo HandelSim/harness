@@ -3,19 +3,20 @@
 # scripts/firewall_test.sh — focused checks that the per-container egress
 # firewall (firewall/init-firewall.sh) is actually applied at runtime.
 #
-# Two phases:
-#
-#   Phase 1 — positive. Brings up proxy + ollama + mockupstream with a
-#   normal allowlist, waits for healthy, then exec's into each container
-#   to confirm:
-#     * the allowlist is bind-mounted at /etc/harness/allowlist,
-#     * iptables default policy on OUTPUT is DROP,
-#     * the allowed-domains ipset exists and is populated,
-#     * an out-of-allowlist host (example.com) is unreachable.
+# Verifies firewall negative path and bypass behavior:
 #
 #   Phase 2 — negative. Brings up proxy with PROXY_API_URL pointing at a
 #   host that is NOT in the allowlist; asserts the proxy refuses to start
 #   and the FATAL guardrail line appears in its logs.
+#
+#   Phase 3 — bypass. Brings up proxy with HARNESS_FIREWALL_DISABLED=1;
+#   asserts the firewall init script short-circuits, OUTPUT policy stays
+#   ACCEPT for proxy, and other services (ollama) still have the firewall
+#   applied.
+#
+# (Phase 1 — positive firewall posture inside running containers — was
+# folded into proxy_test.sh, which exercises the same path with the
+# firewall on by default.)
 #
 # Both phases use `docker compose down --remove-orphans` on cleanup.
 
@@ -63,118 +64,6 @@ rm -f "$test_allow_check"
 echo "[fw] OK: test_generate_allowlist does not emit api.anthropic.com"
 
 # ============================================================================
-# Phase 1 — positive firewall posture inside running containers.
-# ============================================================================
-
-PROJECT_POS="harness-firewall-pos"
-ENV_POS="$(mktemp -t harness-fw-pos.XXXXXX.env)"
-OVERRIDE_POS="$(mktemp -t harness-fw-pos.XXXXXX.yml)"
-ALLOW_POS="$(mktemp -t harness-fw-pos.XXXXXX.allow)"
-
-test_generate_env "$ENV_POS"
-test_generate_mockupstream_override "$OVERRIDE_POS"
-test_generate_allowlist "$ALLOW_POS"
-
-# Convert host path to a form Docker Desktop's WSL2 backend mounts reliably.
-# On Linux this is a passthrough; on Windows /tmp/... is rewritten to
-# C:/Users/<u>/AppData/Local/Temp/... — without this rewrite the bind
-# mount silently produces an empty /etc/harness/allowlist inside the
-# container, which the firewall init script treats as fatal.
-export HARNESS_ALLOWLIST_PATH="$(harness_docker_path "$ALLOW_POS")"
-
-cleanup_pos() {
-    test_cleanup "$PROJECT_POS" "$ENV_POS" "$OVERRIDE_POS" "$ALLOW_POS"
-}
-trap cleanup_pos EXIT INT TERM
-
-# Defensive: clear stragglers.
-docker compose --project-name "$PROJECT_POS" \
-    -f docker-compose.yml -f "$OVERRIDE_POS" \
-    down -v --remove-orphans >/dev/null 2>&1 || true
-
-COMPOSE_POS=(docker compose --project-name "$PROJECT_POS" --env-file "$ENV_POS" \
-    -f docker-compose.yml -f "$OVERRIDE_POS")
-
-test_section "Phase 1: positive firewall posture"
-
-echo "[fw] bringing up proxy + ollama + mockupstream"
-"${COMPOSE_POS[@]}" up -d --build
-
-echo "[fw] waiting for proxy + ollama + mockupstream to become healthy (up to 180s)"
-if ! test_wait_for_healthy "$PROJECT_POS" mockupstream proxy ollama 180; then
-    echo "[fw] services failed to become healthy" >&2
-    "${COMPOSE_POS[@]}" logs proxy        >&2 || true
-    "${COMPOSE_POS[@]}" logs ollama       >&2 || true
-    "${COMPOSE_POS[@]}" logs mockupstream >&2 || true
-    exit 1
-fi
-
-# Per-service assertions. The unified `agent` service in compose.yml is a
-# stub for build/debug — it exits immediately because it has no agent
-# invocation — so we only assert against the long-running services here.
-assert_firewall_in() {
-    local svc="$1"
-    local cid
-    cid=$("${COMPOSE_POS[@]}" ps -q "$svc")
-    if [[ -z "$cid" ]]; then
-        echo "[fw] FAIL: no container id for $svc" >&2
-        exit 1
-    fi
-    echo "[fw] checking $svc ($cid)"
-
-    # Allowlist must be bind-mounted.
-    if ! harness_docker exec "$cid" test -f /etc/harness/allowlist; then
-        echo "[fw] FAIL: $svc has no /etc/harness/allowlist" >&2
-        exit 1
-    fi
-
-    # iptables default OUTPUT policy must be DROP.
-    local pol
-    pol=$(harness_docker exec "$cid" iptables -S OUTPUT 2>/dev/null | head -n 1 || true)
-    if ! grep -q '^-P OUTPUT DROP' <<<"$pol"; then
-        echo "[fw] FAIL: $svc OUTPUT policy is not DROP (got: $pol)" >&2
-        harness_docker exec "$cid" iptables -S OUTPUT >&2 || true
-        exit 1
-    fi
-
-    # ipset must exist and contain at least one entry (allowlist hosts resolved).
-    local ipset_count
-    ipset_count=$(harness_docker exec "$cid" sh -c 'ipset list allowed-domains 2>/dev/null | awk "/^Number of entries:/ {print \$4}"' || true)
-    if [[ -z "$ipset_count" ]]; then
-        echo "[fw] FAIL: $svc has no 'allowed-domains' ipset" >&2
-        harness_docker exec "$cid" ipset list >&2 || true
-        exit 1
-    fi
-    if (( ipset_count < 1 )); then
-        echo "[fw] FAIL: $svc 'allowed-domains' ipset is empty" >&2
-        exit 1
-    fi
-    echo "[fw]   $svc: ipset 'allowed-domains' has $ipset_count entries"
-
-    # Negative: example.com must NOT be reachable from inside the container.
-    # Use a 5s connect timeout so the failure is fast. We expect rc != 0.
-    set +e
-    harness_docker exec "$cid" curl --connect-timeout 5 -s -o /dev/null https://example.com
-    local curl_rc=$?
-    set -e
-    if (( curl_rc == 0 )); then
-        echo "[fw] FAIL: $svc can reach example.com (firewall not applied?)" >&2
-        exit 1
-    fi
-    echo "[fw]   $svc: example.com unreachable (rc=$curl_rc) — expected"
-}
-
-assert_firewall_in proxy
-assert_firewall_in ollama
-
-echo "[fw] Phase 1 OK"
-
-# Tear down phase 1 explicitly so phase 2 starts from a clean slate. Trap
-# remains armed in case Phase 2 setup fails.
-cleanup_pos
-trap - EXIT INT TERM
-
-# ============================================================================
 # Phase 2 — negative: PROXY_API_URL guardrail rejects out-of-allowlist host.
 # ============================================================================
 
@@ -195,7 +84,10 @@ test_generate_mockupstream_override "$OVERRIDE_NEG"
 # Allowlist deliberately omits blocked.example.com.
 test_generate_allowlist "$ALLOW_NEG"
 
-# See Phase 1 setup for the harness_docker_path rationale.
+# harness_docker_path rewrites /tmp/... to a Docker-Desktop-mountable path on
+# Windows (WSL2 backend); on Linux it's a passthrough. Without it the bind
+# mount silently produces an empty /etc/harness/allowlist inside the
+# container, which init-firewall.sh treats as fatal.
 export HARNESS_ALLOWLIST_PATH="$(harness_docker_path "$ALLOW_NEG")"
 
 cleanup_neg() {
@@ -289,7 +181,7 @@ services:
       HARNESS_FIREWALL_DISABLED: "1"
 EOF
 test_generate_allowlist "$ALLOW_BYP"
-# See Phase 1 setup for the harness_docker_path rationale.
+# See Phase 2 setup above for the harness_docker_path rationale.
 export HARNESS_ALLOWLIST_PATH="$(harness_docker_path "$ALLOW_BYP")"
 
 cleanup_byp() {

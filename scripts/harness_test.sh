@@ -10,8 +10,8 @@
 #
 # Interactive subcommands (claude, opencode, attach with picker, stop with
 # picker) require a TTY and live upstream — those are validated by
-# scripts/agent_test.sh and by the manual smoke checks documented in the
-# Phase 4 commit message. They are NOT covered here.
+# scripts/full_pipeline_test.sh (T9/T10/T11) and by the manual smoke checks
+# documented in MANUAL_TEST_PROMPT.md. They are NOT covered here.
 #
 # Other smoke checks:
 #   - harness-install.sh's PATH-rcfile append is idempotent

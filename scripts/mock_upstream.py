@@ -50,8 +50,8 @@ FIXTURES_DIR = os.environ.get("MOCK_FIXTURES_DIR", "").strip()
 
 
 # Legacy scenarios — preserved verbatim for tests that pre-date the fixture
-# system. derisk_test/proxy_test/agent_test all run with these as the
-# fallback when no fixture matches.
+# system. proxy_test and firewall_test run with these as the fallback when
+# no fixture matches.
 SCENARIO_RESPONSES: dict[str, dict[str, Any]] = {
     "text": {
         "choices": [

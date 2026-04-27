@@ -65,7 +65,7 @@ RUN npm install -g \
 # Phase 4's `harness` script overrides USER with `docker run --user 0:0` so
 # the container starts as root, the entrypoint remaps harness's uid/gid to
 # match the host caller, and re-execs as harness via gosu. When the
-# container is started without --user (e.g. agent_test.sh in test mode), the
+# container is started without --user (e.g. test-mode invocations), the
 # remap block is a no-op.
 #
 # node:20-bookworm-slim ships with a `node` user pre-created at uid/gid 1000.
@@ -120,7 +120,7 @@ WORKDIR /workspace
 
 # NO `USER harness` directive. The harness script invokes with --user 0:0
 # so the entrypoint can run firewall init (which needs NET_ADMIN/NET_RAW)
-# before gosu-dropping. agent_test.sh's test mode runs without --user; the
+# before gosu-dropping. Test-mode invocations may run without --user; the
 # entrypoint's remap block is then skipped.
 
 ENTRYPOINT ["/usr/local/bin/agent-entrypoint.sh"]

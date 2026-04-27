@@ -15,7 +15,6 @@
 #   HARNESS_YOLO=1              — claude: --dangerously-skip-permissions
 #                                 opencode: --agent yolo
 #   HARNESS_TEST_MODE=1         — bypass tmux, exec the CLI directly
-#                                 (scripts/agent_test.sh)
 #   HARNESS_PRINT_MODE=1        — bypass tmux for `harness <agent> -p ...`
 #   HARNESS_FIREWALL_DISABLED=1 — skip init-firewall.sh entirely
 #                                 (--net flag or `harness net open`)

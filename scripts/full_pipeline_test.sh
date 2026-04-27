@@ -286,8 +286,8 @@ if ! wait_healthy_compose ollama 90; then echo "[pipeline] T5 FAIL ollama" >&2; 
 if ! wait_healthy_compose proxy 90; then echo "[pipeline] T5 FAIL proxy" >&2; exit 1; fi
 
 # Build agent images (the harness script doesn't auto-build agents on start;
-# agent_test.sh / install relies on `compose --profile agent build`). The
-# pipeline test needs both images present for T9–T11.
+# the install relies on `compose --profile agent build`). The pipeline
+# test needs both images present for T9–T11.
 echo "[pipeline] T5: building agent images (compose --profile agent build)"
 docker compose --project-name "${PROJECT_NAME}" \
     --env-file "${TEST_ROOT}/harness/.env" \
@@ -403,9 +403,8 @@ set -e
 cd "${REPO_ROOT}"
 echo "[pipeline]   T10 raw (truncated): $(echo "${t10_out}" | tail -c 800)"
 
-# As in agent_test.sh test B, opencode's `run` may require interactive
-# provider auth on some opencode versions. If we hit that, skip with a
-# clear note rather than failing.
+# opencode's `run` may require interactive provider auth on some opencode
+# versions. If we hit that, skip with a clear note rather than failing.
 if (( t10_rc != 0 )); then
     if echo "${t10_out}" | grep -qiE 'auth|login|provider .* not (configured|found)|no .* api key'; then
         echo "[pipeline] T10 SKIPPED: opencode run requires interactive provider auth"

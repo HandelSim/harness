@@ -1077,7 +1077,7 @@ run_agent_interactive() {
     # entrypoint can remap the harness uid/gid to the host caller before
     # gosu-dropping back to harness. Without this, the container runs as
     # harness uid 1000 directly and the remap block is bypassed (matching
-    # the agent_test.sh path).
+    # the test-mode path used by full_pipeline_test.sh).
     local docker_args=(
         run -d
         --name "$cname"

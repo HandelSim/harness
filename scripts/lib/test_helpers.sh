@@ -1,6 +1,6 @@
 # scripts/lib/test_helpers.sh — sourceable bash toolkit for harness test
 # scripts. Extracted from setup boilerplate that used to be duplicated
-# across derisk_test.sh, proxy_test.sh, agent_test.sh, full_pipeline_test.sh.
+# across proxy_test.sh, firewall_test.sh, full_pipeline_test.sh.
 #
 # Source from a test:
 #

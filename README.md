@@ -43,14 +43,13 @@ harness/
 │                            with mode dispatch: claude, opencode, shell)
 ├── mcp-registry/            vetted MCP service definitions (Phase 6)
 └── scripts/
-    ├── derisk_test.sh       Phase 1 end-to-end smoke
-    ├── proxy_test.sh        Phase 2 proxy translation tests
-    ├── agent_test.sh        Phase 3 end-to-end via both agents
+    ├── proxy_test.sh        Phase 2 proxy translation tests (incl. ollama RemoteHost forwarding smoke)
     ├── harness_test.sh      Phase 4 management script tests
     ├── persistence_test.sh  Phase 6 persistent home + skel-seed test
     ├── mcp_test.sh          MCP install/enable/disable/uninstall lifecycle test
-    ├── firewall_test.sh     Phase B1/B2 universal egress firewall + bypass
-    ├── full_pipeline_test.sh end-to-end install → run → tmux drive
+    ├── firewall_test.sh     Phase B1/B2 firewall guardrail (negative) + bypass
+    ├── upgrade_test.sh      Phase B3 upgrade actions library + synthetic version transition
+    ├── full_pipeline_test.sh end-to-end install → run → tmux drive (covers both agents)
     ├── integration_test.sh  Phase 7b: end-to-end Serena MCP + Graphify skill (HARNESS_RUN_SLOW=1)
     ├── lib/                 sourceable test toolkits (tui_driver, test_helpers, net_helpers)
     └── fixtures/
@@ -244,19 +243,6 @@ $ docker compose --env-file .env up --build
 To expose ollama on the host (useful for poking at it from outside the docker
 network), set `PUBLISH_OLLAMA_PORT=11434` in `.env`.
 
-## De-risk test
-
-Phase 1 ships an automated end-to-end test that verifies ollama's RemoteHost
-forwarding is wired up correctly:
-
-```
-$ bash scripts/derisk_test.sh
-```
-
-The script builds the images, brings up ollama + a mock proxy, and asserts
-that a chat request to ollama is forwarded to the proxy and the response is
-returned to the caller. It tears everything down on exit.
-
 ## End-user installation
 
 End users clone the repo (`git clone https://github.com/HandelSim/harness`)
@@ -387,15 +373,13 @@ edits straight to `<install-root>/state/agent/home/.config/ccstatusline/settings
 ## Tests
 
 ```
-$ bash scripts/derisk_test.sh        # ollama RemoteHost forwarding
-$ bash scripts/proxy_test.sh         # proxy translation
-$ bash scripts/agent_test.sh         # end-to-end via both agents
+$ bash scripts/proxy_test.sh         # proxy translation + ollama RemoteHost forwarding + stub model context length
 $ bash scripts/harness_test.sh       # management script subcommands
 $ bash scripts/persistence_test.sh   # persistent home + skel seed
 $ bash scripts/mcp_test.sh           # MCP install/enable/disable/uninstall lifecycle
-$ bash scripts/firewall_test.sh      # universal egress firewall + bypass overrides
+$ bash scripts/firewall_test.sh      # firewall guardrail (negative) + per-service bypass
 $ bash scripts/upgrade_test.sh       # upgrade actions library + synthetic version transition
-$ bash scripts/full_pipeline_test.sh # full install + run pipeline (drives a TUI via lib/tui_driver.sh)
+$ bash scripts/full_pipeline_test.sh # full install + run pipeline (covers both agents; drives a TUI via lib/tui_driver.sh)
 $ HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh  # Phase 7b: end-to-end Serena + Graphify (slow, ~10-15 min)
 ```
 
@@ -457,7 +441,7 @@ a non-trivial multi-module symbol graph to chew on.
 `scripts/mock_upstream.py` supports two modes:
 
 - **Legacy** — `MOCK_SCENARIO=text|tool` env var picks one of two canned
-  responses. Used by `derisk_test.sh`, `proxy_test.sh`, `agent_test.sh`.
+  responses. Used by `proxy_test.sh` and `firewall_test.sh`.
 - **Fixture dispatch** — set `MOCK_FIXTURES_DIR=/fixtures` and mount
   `scripts/fixtures/responses/` there. The mock loads every `*.json`
   lexicographically and matches the most recent user message against each
