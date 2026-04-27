@@ -55,44 +55,51 @@ for attempt in $(seq 1 60); do
     sleep 1
 done
 
-# Build the JSON body for /api/create. Use printf %s with explicit quoting on
-# string fields and explicit numeric formatting on numbers, so we never need
-# to depend on jq being present.
-CREATE_BODY=$(printf '{"model":"%s","from":"%s","remote_host":"%s","info":{"context_length":%d},"parameters":{"num_ctx":%d}}' \
-    "${MODEL_NAME}" \
-    "${MODEL_NAME}" \
-    "${REMOTE_URL}" \
-    "${CONTEXT_LENGTH}" \
-    "${CONTEXT_LENGTH}")
+# Register one stub model with the proxy's RemoteHost. Used both for the
+# canonical OLLAMA_AGENT_MODEL and for the alias names below.
+#
+# Args: <model_name>
+# Returns: 0 on success, non-zero if /api/create didn't end with
+# status:success or the model isn't visible in /api/tags afterwards.
+register_stub_model() {
+    local name="$1"
+    local body
+    body=$(printf '{"model":"%s","from":"%s","remote_host":"%s","info":{"context_length":%d},"parameters":{"num_ctx":%d}}' \
+        "${name}" \
+        "${name}" \
+        "${REMOTE_URL}" \
+        "${CONTEXT_LENGTH}" \
+        "${CONTEXT_LENGTH}")
 
-echo "[entrypoint] registering stub model"
-echo "[entrypoint] POST ${OLLAMA_API}/api/create"
-echo "[entrypoint] body: ${CREATE_BODY}"
+    echo "[entrypoint] registering stub model '${name}'"
 
-# /api/create streams NDJSON progress events. Capture the full body so we can
-# inspect the final line for success or surface error detail on failure.
-CREATE_RESPONSE=$(curl -fsS -X POST \
-    -H "Content-Type: application/json" \
-    --data "${CREATE_BODY}" \
-    "${OLLAMA_API}/api/create" || true)
+    local response
+    response=$(curl -fsS -X POST \
+        -H "Content-Type: application/json" \
+        --data "${body}" \
+        "${OLLAMA_API}/api/create" || true)
 
-if [[ -z "${CREATE_RESPONSE}" ]]; then
-    echo "[entrypoint] ERROR: empty response from /api/create" >&2
-    exit 1
-fi
+    if [[ -z "${response}" ]]; then
+        echo "[entrypoint] ERROR: empty response from /api/create for '${name}'" >&2
+        return 1
+    fi
 
-echo "[entrypoint] /api/create response:"
-echo "${CREATE_RESPONSE}"
+    local final_line
+    final_line=$(echo "${response}" | tail -n 1)
+    if ! echo "${final_line}" | grep -q '"status":"success"'; then
+        echo "[entrypoint] ERROR: /api/create for '${name}' did not end with status:success" >&2
+        echo "[entrypoint] final line was: ${final_line}" >&2
+        return 1
+    fi
+    return 0
+}
 
-# Final NDJSON line should contain "status":"success".
-FINAL_LINE=$(echo "${CREATE_RESPONSE}" | tail -n 1)
-if ! echo "${FINAL_LINE}" | grep -q '"status":"success"'; then
-    echo "[entrypoint] ERROR: /api/create did not end with status:success" >&2
-    echo "[entrypoint] final line was: ${FINAL_LINE}" >&2
-    exit 1
-fi
+# Canonical model: register and abort the entrypoint on failure.
+register_stub_model "${MODEL_NAME}" || exit 1
 
-# Sanity: confirm the stub is visible via /api/tags.
+# Sanity: confirm the canonical stub is visible via /api/tags. The alias
+# registrations below are best-effort; only the canonical name is critical
+# for ollama startup.
 TAGS_RESPONSE=$(curl -fsS "${OLLAMA_API}/api/tags")
 if ! echo "${TAGS_RESPONSE}" | grep -q "\"${MODEL_NAME}"; then
     echo "[entrypoint] ERROR: stub model '${MODEL_NAME}' not found in /api/tags" >&2
@@ -100,7 +107,38 @@ if ! echo "${TAGS_RESPONSE}" | grep -q "\"${MODEL_NAME}"; then
     exit 1
 fi
 
-echo "[entrypoint] harness ollama ready, stub model registered: ${MODEL_NAME} -> ${REMOTE_URL}"
+# Register additional stub aliases for the names claude-code uses internally
+# in sub-agent invocations (Task tool, Explore agent, etc.). All point at the
+# same RemoteHost as the canonical model — they're aliases that satisfy
+# claude-code's model lookups. The proxy ignores the model name in the
+# request and uses PROXY_API_MODEL from .env to decide what to send
+# upstream, so all aliases functionally route to the same upstream.
+#
+# Best-effort: a registration failure on one alias logs and continues; we
+# don't fail ollama startup over partial coverage.
+STUB_ALIASES=(
+    sonnet
+    opus
+    haiku
+    claude-sonnet-4-5
+    claude-opus-4-5
+    claude-haiku-4-5
+    claude-3-5-sonnet-20241022
+    claude-3-5-haiku-20241022
+    claude-3-opus-20240229
+)
+
+for alias_name in "${STUB_ALIASES[@]}"; do
+    # Skip the canonical name to avoid a duplicate-registration round-trip.
+    if [[ "${alias_name}" == "${MODEL_NAME}" ]]; then
+        continue
+    fi
+    if ! register_stub_model "${alias_name}"; then
+        echo "[entrypoint] WARN: failed to register stub alias '${alias_name}'; continuing" >&2
+    fi
+done
+
+echo "[entrypoint] harness ollama ready; stub models -> ${REMOTE_URL}"
 
 # Block on ollama. The trap above tears it down on signals.
 wait "${OLLAMA_PID}"
