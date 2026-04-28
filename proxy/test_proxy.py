@@ -7,7 +7,7 @@ Run inside the proxy container:
 import json
 import os
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # proxy.main() runs only when invoked as __main__, but module-level import
 # touches env defaults. Set required vars before import so module load doesn't
@@ -393,12 +393,15 @@ class TestTranslateHistory(unittest.TestCase):
         self.assertEqual(proxy.translate_history_and_apply_prompt([], ""), [])
 
     def test_system_plus_user_with_tools_wraps_final_user(self):
+        # Explicitly exercises legacy 'user' mode; the system+hybrid modes
+        # have their own tests in TestPromptInjectionModes below.
         msgs = [
             {"role": "system", "content": "You are helpful."},
             {"role": "user", "content": "What's the weather?"},
         ]
         tools_text = "Tool Name: `get_weather`"
-        out = proxy.translate_history_and_apply_prompt(msgs, tools_text)
+        with patch.object(proxy, "_PROMPT_MODE", "user"):
+            out = proxy.translate_history_and_apply_prompt(msgs, tools_text)
         self.assertEqual(len(out), 2)
         self.assertEqual(out[0], {"role": "system", "content": "You are helpful."})
         self.assertEqual(out[1]["role"], "user")
@@ -473,6 +476,10 @@ And answer "what does this do?"'''
         self.assertIn("Do not use emojis", sys_content)
 
     def test_tool_message_uses_tool_name_and_folds_into_user(self):
+        # Tool-variant cooperative-prompt wrapper only fires in legacy
+        # 'user' mode; in 'system' / 'hybrid' the scaffolding lives on the
+        # system message and the tool result still folds into a user
+        # message but doesn't get the per-turn wrapper.
         msgs = [
             {"role": "user", "content": "weather?"},
             {
@@ -482,7 +489,8 @@ And answer "what does this do?"'''
             },
             {"role": "tool", "tool_name": "get_weather", "content": "72F sunny"},
         ]
-        out = proxy.translate_history_and_apply_prompt(msgs, "Tool Name: `get_weather`")
+        with patch.object(proxy, "_PROMPT_MODE", "user"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "Tool Name: `get_weather`")
         # Final message should be a user-role with System Observation, wrapped
         # in the tool-variant cooperative prompt.
         self.assertEqual(out[-1]["role"], "user")
@@ -524,151 +532,128 @@ class TestMakeChunk(unittest.TestCase):
         self.assertIn("eval_duration", c)
 
 
-class TestAutoUnlock(unittest.TestCase):
-    """Auto-unlock retry behavior for 4xx + error.unlock_url.
+class TestPromptInjectionModes(unittest.TestCase):
+    """Three configurable injection paths for the cooperative tool-use
+    scaffolding, selected by PROXY_PROMPT_MODE: 'user', 'system', 'hybrid'.
 
-    All tests patch proxy.requests.post and proxy.requests.get and drive the
-    Flask app via its test_client so the full request flow runs.
+    Each test patches `proxy._PROMPT_MODE` and runs the translation. The
+    fully-formatted tool text comes from `format_tools_to_text`; tests
+    assert on stable substrings (tool name, description, mode-specific
+    markers) rather than the entire scaffold.
     """
 
-    OLLAMA_REQUEST = {
-        "model": "harness",
-        "messages": [{"role": "user", "content": "ping"}],
-        "stream": False,
-    }
-
     def setUp(self):
-        self.client = proxy.app.test_client()
-
-    def _make_locked_response(self, status=401):
-        m = MagicMock()
-        m.status_code = status
-        m.json.return_value = {
-            "error": {
-                "type": "unauthorized",
-                "message": "API key locked",
-                "unlock_url": "https://example.com/api/unlock/abc123",
-            }
-        }
-        m.text = json.dumps(m.json.return_value)
-        return m
-
-    def _make_success_response(self, content="hello world"):
-        m = MagicMock()
-        m.status_code = 200
-        m.json.return_value = {
-            "choices": [{"message": {"content": content}}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        }
-        m.text = json.dumps(m.json.return_value)
-        return m
-
-    def _make_unlock_response(self, status=200):
-        m = MagicMock()
-        m.status_code = status
-        m.text = ""
-        return m
-
-    @patch("proxy.requests.get")
-    @patch("proxy.requests.post")
-    def test_auto_unlock_then_success(self, mock_post, mock_get):
-        """Locked → unlock 200 → retry → success. Agent sees normal response."""
-        mock_post.side_effect = [
-            self._make_locked_response(401),
-            self._make_success_response("hello world"),
+        self.user_msgs = [
+            {"role": "system", "content": "You are claude-code."},
+            {"role": "user", "content": "say hello"},
         ]
-        mock_get.return_value = self._make_unlock_response(200)
-
-        rv = self.client.post(
-            "/api/chat",
-            data=json.dumps(self.OLLAMA_REQUEST),
-            content_type="application/json",
-        )
-
-        self.assertEqual(rv.status_code, 200, msg=rv.data)
-        self.assertEqual(mock_post.call_count, 2, "expected original + retry POST")
-        self.assertEqual(mock_get.call_count, 1, "expected one unlock GET")
-        called_url = mock_get.call_args[0][0]
-        self.assertEqual(called_url, "https://example.com/api/unlock/abc123")
-        # The agent-facing NDJSON should contain the success text.
-        self.assertIn(b"hello world", rv.data)
-
-    @patch("proxy.requests.get")
-    @patch("proxy.requests.post")
-    def test_auto_unlock_then_still_fails(self, mock_post, mock_get):
-        """Locked → unlock 200 → retry STILL locked → flow through as 502."""
-        mock_post.side_effect = [
-            self._make_locked_response(401),
-            self._make_locked_response(401),
+        self.tools = [
+            {"function": {
+                "name": "Bash",
+                "description": "Run shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }},
         ]
-        mock_get.return_value = self._make_unlock_response(200)
 
-        rv = self.client.post(
-            "/api/chat",
-            data=json.dumps(self.OLLAMA_REQUEST),
-            content_type="application/json",
-        )
+    def _translate_with_mode(self, mode):
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", mode):
+            return proxy.translate_history_and_apply_prompt(self.user_msgs, tools_text)
 
-        self.assertEqual(rv.status_code, 502)
-        self.assertEqual(mock_post.call_count, 2, "tried twice")
-        self.assertEqual(mock_get.call_count, 1, "unlock attempted once")
+    def test_mode_user_injects_into_last_user_message(self):
+        result = self._translate_with_mode("user")
+        # System unchanged.
+        self.assertEqual(result[0]["content"], "You are claude-code.")
+        # Last user message has the full scaffolding + tool list.
+        last_user = result[-1]["content"]
+        self.assertIn("Tool Usage Instructions", last_user)
+        self.assertIn("Bash", last_user)
+        self.assertIn("Run shell command", last_user)
+        self.assertIn("BEGIN_USER_REQUEST", last_user)
+        self.assertIn("say hello", last_user)
 
-    @patch("proxy.requests.get")
-    @patch("proxy.requests.post")
-    def test_unlock_url_get_fails(self, mock_post, mock_get):
-        """Locked → unlock GET returns 500 → no retry → flow through as 502."""
-        mock_post.return_value = self._make_locked_response(401)
-        mock_get.return_value = self._make_unlock_response(500)
+    def test_mode_system_appends_to_system(self):
+        result = self._translate_with_mode("system")
+        sys_content = result[0]["content"]
+        self.assertIn("You are claude-code.", sys_content)
+        self.assertIn("Tool Usage Instructions", sys_content)
+        self.assertIn("Bash", sys_content)
+        # Last user message is UNCHANGED.
+        self.assertEqual(result[-1]["content"], "say hello")
+        self.assertNotIn("Tool Usage Instructions", result[-1]["content"])
+        self.assertNotIn("BEGIN_USER_REQUEST", result[-1]["content"])
 
-        rv = self.client.post(
-            "/api/chat",
-            data=json.dumps(self.OLLAMA_REQUEST),
-            content_type="application/json",
-        )
+    def test_mode_hybrid_full_tools_in_system_reminder_in_user(self):
+        result = self._translate_with_mode("hybrid")
+        sys_content = result[0]["content"]
+        self.assertIn("Tool Usage Instructions", sys_content)
+        self.assertIn("Bash", sys_content)
+        last_user = result[-1]["content"]
+        # Hybrid reminder present, but NOT the full scaffolding/tool list.
+        self.assertIn("Tool reminder", last_user)
+        self.assertIn("system prompt", last_user.lower())
+        self.assertIn("say hello", last_user)
+        self.assertNotIn("Tool Usage Instructions", last_user)
+        self.assertNotIn("Run shell command", last_user)
 
-        self.assertEqual(rv.status_code, 502)
-        self.assertEqual(mock_post.call_count, 1, "must not retry when unlock fails")
-        self.assertEqual(mock_get.call_count, 1)
+    def test_mode_system_inserts_system_when_missing(self):
+        """If the input has no system message, system/hybrid modes insert one."""
+        msgs = [{"role": "user", "content": "hi"}]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "system"):
+            out = proxy.translate_history_and_apply_prompt(msgs, tools_text)
+        self.assertEqual(out[0]["role"], "system")
+        self.assertIn("Tool Usage Instructions", out[0]["content"])
+        self.assertEqual(out[-1]["content"], "hi")
 
-    @patch("proxy.requests.get")
-    @patch("proxy.requests.post")
-    def test_no_unlock_url_in_error(self, mock_post, mock_get):
-        """4xx without unlock_url → no unlock attempted → flow through as 502."""
-        m = MagicMock()
-        m.status_code = 401
-        m.json.return_value = {"error": {"type": "invalid_authentication"}}
-        m.text = json.dumps(m.json.return_value)
-        mock_post.return_value = m
+    def test_invalid_mode_falls_back_to_hybrid(self):
+        with patch.dict(os.environ, {"PROXY_PROMPT_MODE": "garbage"}):
+            proxy._setup_prompt_mode()
+            self.assertEqual(proxy._PROMPT_MODE, "hybrid")
 
-        rv = self.client.post(
-            "/api/chat",
-            data=json.dumps(self.OLLAMA_REQUEST),
-            content_type="application/json",
-        )
+    def test_default_mode_is_hybrid(self):
+        env_no_mode = {k: v for k, v in os.environ.items() if k != "PROXY_PROMPT_MODE"}
+        with patch.dict(os.environ, env_no_mode, clear=True):
+            proxy._setup_prompt_mode()
+            self.assertEqual(proxy._PROMPT_MODE, "hybrid")
 
-        self.assertEqual(rv.status_code, 502)
-        self.assertEqual(mock_post.call_count, 1)
-        self.assertEqual(mock_get.call_count, 0, "must not call unlock without unlock_url")
+    def test_no_tools_skips_injection_in_all_modes(self):
+        """No tools defined → no scaffolding regardless of mode."""
+        for mode in ("user", "system", "hybrid"):
+            with patch.object(proxy, "_PROMPT_MODE", mode):
+                result = proxy.translate_history_and_apply_prompt(self.user_msgs, "")
+            self.assertEqual(result[0]["content"], "You are claude-code.", mode)
+            self.assertEqual(result[-1]["content"], "say hello", mode)
 
-    @patch("proxy.requests.get")
-    @patch("proxy.requests.post")
-    def test_5xx_does_not_trigger_unlock(self, mock_post, mock_get):
-        """5xx upstream errors don't go through the unlock flow."""
-        m = MagicMock()
-        m.status_code = 503
-        m.json.return_value = {"error": "service unavailable"}
-        m.text = json.dumps(m.json.return_value)
-        mock_post.return_value = m
-
-        rv = self.client.post(
-            "/api/chat",
-            data=json.dumps(self.OLLAMA_REQUEST),
-            content_type="application/json",
-        )
-
-        self.assertEqual(rv.status_code, 502)
-        self.assertEqual(mock_post.call_count, 1)
-        self.assertEqual(mock_get.call_count, 0, "5xx must not trigger unlock retry")
+    def test_hybrid_tool_result_message_gets_reminder(self):
+        """In hybrid mode, when the last message is a tool-result-converted
+        user message, the brief reminder still applies — the model needs
+        to know tools are available regardless of how the user msg formed."""
+        msgs = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "Atlanta"}}}],
+            },
+            {"role": "tool", "tool_name": "get_weather", "content": "72F sunny"},
+        ]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(msgs, tools_text)
+        # Last message is the tool-result-converted user, with both the
+        # System Observation wrapper and the hybrid reminder prefix.
+        self.assertEqual(out[-1]["role"], "user")
+        c = out[-1]["content"]
+        self.assertIn("Tool reminder", c)
+        self.assertIn("System Observation", c)
+        self.assertIn("72F sunny", c)
+        # The full per-turn user-mode scaffolding should NOT be present.
+        self.assertNotIn("multi-step process", c)
 
 
 if __name__ == "__main__":

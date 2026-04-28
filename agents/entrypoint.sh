@@ -64,6 +64,25 @@ if [[ "$(id -u)" == "0" ]]; then
             chown -R "${HOST_UID}:${HOST_GID}" /home/harness 2>/dev/null || true
         fi
     fi
+
+    # Create the host CWD symlink while still root. The harness user has no
+    # write permission at /, so this MUST happen before the gosu drop.
+    # (The cd into the symlinked path happens after the drop — see below;
+    # gosu re-execs the entrypoint and resets CWD.)
+    if [[ -n "${HARNESS_HOST_CWD:-}" && "${HARNESS_HOST_CWD}" != "/workspace" ]]; then
+        parent=$(dirname "${HARNESS_HOST_CWD}")
+        if [[ "$parent" != "/" && "$parent" != "." ]]; then
+            mkdir -p "$parent"
+        fi
+        ln -snf /workspace "${HARNESS_HOST_CWD}"
+        # Make the symlink owned by harness so the user can replace it
+        # later if needed (defense in depth — symlink ownership rarely
+        # matters for traversal but doesn't hurt). Best-effort.
+        if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+            chown -h "${HOST_UID}:${HOST_GID}" "${HARNESS_HOST_CWD}" 2>/dev/null || true
+        fi
+    fi
+
     exec gosu harness "$0" "$@"
 fi
 
@@ -98,26 +117,17 @@ if [[ ! -f "${HOME}/.harness-home-initialized" ]]; then
     touch "${HOME}/.harness-home-initialized" 2>/dev/null || true
 fi
 
-# --- host CWD symlink -------------------------------------------------------
+# --- change into host CWD path ----------------------------------------------
 #
-# Symlink the host launch CWD path to /workspace so `pwd` inside the
-# container reflects the host path (e.g. /c/Users/you/projects/myapp).
-# Both /workspace and the host path resolve to the same files via the
-# symlink, but readers of $PWD see the meaningful host path —
-# claude-code's statusline picks it up, and the user isn't confused
-# when working with multiple projects.
-#
-# Failures (parent dir creation, ln -snf, cd) are non-fatal — the agent
-# still works at /workspace if anything below misbehaves on a quirky
-# host path.
+# The symlink itself was created above (still root, before the gosu drop).
+# Here we just cd into it so PWD reflects the host path (e.g.
+# /c/Users/you/projects/myapp) — claude-code's statusline picks it up,
+# and the user isn't confused when working with multiple projects. Both
+# /workspace and the host path resolve to the same files via the
+# symlink. cd failure is non-fatal (we fall back to /workspace).
 if [[ -n "${HARNESS_HOST_CWD:-}" && "${HARNESS_HOST_CWD}" != "/workspace" ]]; then
-    parent=$(dirname "$HARNESS_HOST_CWD")
-    if [[ "$parent" != "/" && "$parent" != "." ]]; then
-        mkdir -p "$parent" 2>/dev/null || true
-    fi
-    ln -snf /workspace "$HARNESS_HOST_CWD" 2>/dev/null || true
-    if [[ -L "$HARNESS_HOST_CWD" ]]; then
-        cd "$HARNESS_HOST_CWD" || cd /workspace
+    if [[ -L "${HARNESS_HOST_CWD}" ]]; then
+        cd "${HARNESS_HOST_CWD}" || cd /workspace
     fi
 fi
 

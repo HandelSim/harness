@@ -379,10 +379,18 @@ write_runtime_override() {
     # `HARNESS_FIREWALL_DISABLED=1` env entry. The firewall init script
     # short-circuits on that variable. We never replace the service's
     # entrypoint or remove its cap_add — option A from the design docs.
+    #
+    # The 'agent' pseudo-service is filtered out here: agent containers
+    # are not in the compose model (they're started by direct docker run
+    # from cmd_claude/cmd_opencode/cmd_shell). The agent launch path
+    # reads the override file directly. Emitting a services.agent block
+    # would either create a phantom compose service or trigger validation
+    # warnings depending on the compose version.
     if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
         local svc
         while IFS= read -r svc; do
             [[ -z "$svc" ]] && continue
+            [[ "$svc" == "agent" ]] && continue
             body+="  ${svc}:"$'\n'
             body+="    environment:"$'\n'
             body+="      HARNESS_FIREWALL_DISABLED: \"1\""$'\n'
@@ -547,6 +555,124 @@ warn_if_firewall_open() {
 
 # --- subcommands ------------------------------------------------------------
 
+# Probe the upstream API to verify the key is valid and unlocked. Returns:
+#   0 — key works, proceed
+#   1 — key is locked or invalid, do not proceed
+#   2 — upstream unhealthy (timeout, 5xx) — warn but allow proceed
+# When the key is locked, prints the unlock URL prominently to the user.
+#
+# Why a host-side probe instead of letting the proxy retry: the upstream's
+# unlock_url requires an authenticated browser session (the user must be
+# signed into the provider's web console). The proxy's GET to it returns
+# 200 but the server-side key state is unchanged. So the only thing we can
+# usefully do is *tell the user* the URL and exit; the user clicks through
+# in a browser, then re-runs harness start.
+_probe_upstream_auth() {
+    local api_url="${PROXY_API_URL:-}"
+    local api_key="${PROXY_API_KEY:-}"
+    local api_model="${PROXY_API_MODEL:-}"
+
+    if [[ -z "$api_url" || -z "$api_key" ]]; then
+        # Missing config; let other validators surface this clearly.
+        return 0
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        # Probe needs curl. Surface it and let the user proceed without
+        # the probe — other validators will catch a fundamentally broken
+        # setup.
+        echo "[harness] WARN: curl not available on host; skipping upstream auth probe" >&2
+        return 2
+    fi
+
+    # Cheapest possible request: max_tokens=1, body just ".".
+    local probe_body
+    probe_body=$(printf '{"model":"%s","messages":[{"role":"user","content":"."}],"max_tokens":1}' \
+        "${api_model:-default}")
+
+    local response status_code body
+    response=$(curl -sSL -k -w "\n__HTTP_STATUS__%{http_code}" \
+        --connect-timeout 5 --max-time 30 \
+        -X POST "$api_url" \
+        -H "Authorization: Bearer $api_key" \
+        -H "Content-Type: application/json" \
+        -d "$probe_body" 2>&1) || true
+
+    status_code=$(grep -o "__HTTP_STATUS__[0-9]*$" <<<"$response" | sed 's/__HTTP_STATUS__//')
+    body=$(sed 's/__HTTP_STATUS__[0-9]*$//' <<<"$response" | sed '$ s/[[:space:]]*$//')
+
+    # No status = curl failed entirely (network / DNS / connection).
+    if [[ -z "$status_code" ]]; then
+        echo "[harness] WARN: upstream auth probe failed (network/connection)" >&2
+        echo "[harness]       starting anyway; agents may fail until upstream is reachable" >&2
+        return 2
+    fi
+
+    case "$status_code" in
+        2*)
+            return 0
+            ;;
+        401|403)
+            local unlock_url=""
+            if command -v jq >/dev/null 2>&1; then
+                unlock_url=$(jq -r '.error.unlock_url // empty' <<<"$body" 2>/dev/null || true)
+            fi
+            if [[ -z "$unlock_url" ]]; then
+                # crude grep fallback when jq isn't on host or jq couldn't parse
+                unlock_url=$(grep -oE '"unlock_url"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$body" \
+                    | head -1 \
+                    | sed 's/"unlock_url"[[:space:]]*:[[:space:]]*"\(.*\)"/\1/')
+            fi
+
+            echo "" >&2
+            echo "================================================================" >&2
+            echo " ERROR: Upstream API key is locked or invalid" >&2
+            echo "================================================================" >&2
+            if [[ -n "$unlock_url" ]]; then
+                echo "" >&2
+                echo " Visit this URL in your browser to unlock the key:" >&2
+                echo "" >&2
+                echo "   $unlock_url" >&2
+                echo "" >&2
+                echo " You must be signed in to the provider's web console for" >&2
+                echo " the unlock to take effect. After unlocking, run:" >&2
+                echo "   harness start" >&2
+            else
+                echo "" >&2
+                echo " The upstream returned $status_code. Verify PROXY_API_KEY in:" >&2
+                echo "   ${install_root}/.env" >&2
+            fi
+            echo "================================================================" >&2
+            echo "" >&2
+            return 1
+            ;;
+        429)
+            echo "[harness] WARN: upstream rate-limited (429); starting anyway" >&2
+            return 2
+            ;;
+        5*)
+            echo "[harness] WARN: upstream returned $status_code; starting anyway" >&2
+            return 2
+            ;;
+        *)
+            echo "[harness] WARN: upstream returned unexpected status $status_code; starting anyway" >&2
+            return 2
+            ;;
+    esac
+}
+
+cmd_unlock() {
+    # Run the same probe `cmd_start` runs. On locked, prints the unlock URL.
+    # On success, prints "key OK". Useful for mid-session lockouts: user
+    # runs this, sees the URL, unlocks in the browser, and the agent's
+    # next request goes through.
+    if _probe_upstream_auth; then
+        echo "[harness] upstream API key is OK; no unlock needed"
+        return 0
+    fi
+    return 1
+}
+
 cmd_help() {
     cat <<'EOF'
 harness — manage the harness runtime.
@@ -578,6 +704,8 @@ commands:
   net <subcmd>          manage the egress allowlist + per-service firewall
                         overrides (see 'harness net')
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
+  unlock                probe the upstream and print the unlock URL if the
+                        key is locked
   doctor                run runtime diagnostics (read-only)
   preflight             validate config (.env, allowlist, docker daemon)
                         before running 'harness start'
@@ -625,6 +753,22 @@ cmd_start() {
     require_runtime_config
     require_docker
     ensure_dirs
+
+    # Probe the upstream auth state before bringing up the stack. A locked
+    # key reads as a confusing chain of failures once agents start hitting
+    # the proxy; surfacing it here lets the user click through the unlock
+    # URL before any container has tried to talk to the upstream.
+    # HARNESS_SKIP_AUTH_PROBE=1 bypasses for CI/automation that doesn't
+    # have real upstream credentials.
+    if [[ "${HARNESS_SKIP_AUTH_PROBE:-0}" != "1" ]]; then
+        local probe_rc=0
+        _probe_upstream_auth || probe_rc=$?
+        if (( probe_rc == 1 )); then
+            return 1
+        fi
+        # rc=2 means warn-and-continue; already logged.
+    fi
+
     # Stop anything still running from a prior session so up brings a clean
     # state. The 2>/dev/null || true handles a fresh install where there's
     # nothing to stop. --remove-orphans is required because `compose` only
@@ -1106,6 +1250,19 @@ run_agent() {
     ensure_services_up
     ensure_dirs
 
+    # Persistent agent firewall override: `harness net open agent` writes
+    # an `agent` entry to .harness-net-overrides.json. Honor it here so
+    # the launch picks up the disabled-firewall state without needing
+    # --net per invocation. Either the per-launch flag or the persistent
+    # override is enough.
+    if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
+        local agent_override
+        agent_override=$(jq -r '.services.agent.firewall_disabled // false' "$net_overrides_path" 2>/dev/null || echo "false")
+        if [[ "$agent_override" == "true" ]]; then
+            net_open=1
+        fi
+    fi
+
     # Pre-launch: prompt user if any firewall is currently open. Skipped via
     # HARNESS_NET_CONFIRM=1 (set by tests). --net is part of the prompt
     # decision; we pass the flag in.
@@ -1364,6 +1521,18 @@ cmd_shell() {
     ah_host=$(harness_docker_path "$agent_home")
     alp_host=$(harness_docker_path "$allowlist_path")
 
+    # Persistent agent firewall override (`harness net open agent`) lets the
+    # shell launch with the firewall disabled too. Mirrors the run_agent
+    # logic for claude/opencode launches.
+    local fw_args=()
+    if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
+        local agent_override
+        agent_override=$(jq -r '.services.agent.firewall_disabled // false' "$net_overrides_path" 2>/dev/null || echo "false")
+        if [[ "$agent_override" == "true" ]]; then
+            fw_args=(-e "HARNESS_FIREWALL_DISABLED=1")
+        fi
+    fi
+
     harness_docker_exec run --rm "$tty_flag" \
         --user 0:0 \
         --network "$network" \
@@ -1372,6 +1541,7 @@ cmd_shell() {
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
         -e "HARNESS_HOST_CWD=$mount_path" \
+        "${fw_args[@]}" \
         -v "$mp_host:/workspace" \
         -v "$ah_host:/home/harness" \
         -v "$alp_host:/etc/harness/allowlist:ro" \
@@ -1781,6 +1951,33 @@ cmd_mcp_install() {
     # anything) the template said. allowed_domains and any other registry-side
     # defaults are preserved by the copy above.
     mcp_set_enabled "$name" "true"
+
+    # If the registry meta declared a repo_clone_url, clone the upstream
+    # repo into state/mcp/<name>/repo/ so the compose snippet can use a
+    # local build context. Some upstreams (Serena) failed on Windows when
+    # docker tried to fetch the build context directly from a git URL —
+    # the WSL2 backend mis-parses the URL as a local path. Cloning here
+    # is host-side, native git, no Docker URL parsing involved.
+    local meta_file="$dest/harness-meta.json"
+    if [[ -f "$meta_file" ]] && command -v jq >/dev/null 2>&1; then
+        local clone_url clone_ref
+        clone_url=$(jq -r '.repo_clone_url // empty' "$meta_file" 2>/dev/null || true)
+        clone_ref=$(jq -r '.repo_clone_ref // "main"' "$meta_file" 2>/dev/null || true)
+        if [[ -n "$clone_url" ]]; then
+            local clone_dir_local="$dest/repo"
+            if [[ -d "$clone_dir_local/.git" ]]; then
+                echo "[harness] $name: repo clone already present at $clone_dir_local; skipping clone"
+            else
+                # Clear any stale non-git directory so the clone target is empty.
+                rm -rf "$clone_dir_local" 2>/dev/null || true
+                echo "[harness] $name: cloning $clone_url ($clone_ref) to $clone_dir_local..."
+                if ! git clone --depth=1 --branch "$clone_ref" "$clone_url" "$clone_dir_local"; then
+                    echo "[harness] $name: WARN: repo clone failed; you may need to clone manually" >&2
+                    echo "[harness]         to $clone_dir_local before 'harness start'" >&2
+                fi
+            fi
+        fi
+    fi
 
     cat <<EOF
 installed: $name (from $src)
@@ -2214,7 +2411,15 @@ net_known_services() {
         printf '%s\n' proxy ollama agent
         return 0
     fi
+    # Agent is a pseudo-service: agent containers aren't in compose
+    # (they're started by direct docker run from cmd_claude/cmd_opencode/
+    # cmd_shell), but the override file can still record an 'agent'
+    # entry. The agent launch path reads it and applies
+    # HARNESS_FIREWALL_DISABLED=1.
     printf '%s\n' "$svcs"
+    if ! grep -qx 'agent' <<<"$svcs"; then
+        printf '%s\n' agent
+    fi
 }
 
 cmd_net_help() {
@@ -3122,6 +3327,7 @@ main() {
         stop)                       cmd_stop "$@" ;;
         net)                        cmd_net "$@" ;;
         mcp)                        cmd_mcp "$@" ;;
+        unlock)                     cmd_unlock "$@" ;;
         doctor)                     cmd_doctor ;;
         preflight)                  cmd_preflight ;;
         *)

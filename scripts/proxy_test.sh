@@ -312,19 +312,28 @@ keys = sorted(body.keys())
 if keys != ['messages', 'model']:
     print('UNEXPECTED_KEYS:' + ','.join(keys))
     sys.exit(0)
-last = body['messages'][-1]
-content = last.get('content','')
-if '### Tool Usage Instructions' not in content:
-    print('NO_WRAPPER')
+# Default mode is 'hybrid': full tool instructions land in the system
+# message and a brief reminder is prepended to the last user message.
+msgs = body['messages']
+sys_msgs = [m for m in msgs if m.get('role') == 'system']
+last = msgs[-1]
+sys_text = '\n'.join(m.get('content','') for m in sys_msgs)
+if '### Tool Usage Instructions' not in sys_text:
+    print('NO_WRAPPER_IN_SYSTEM')
+    sys.exit(0)
+last_content = last.get('content','')
+if 'Tool reminder:' not in last_content:
+    print('NO_REMINDER_IN_LAST_USER')
     sys.exit(0)
 print('OK')
 " <<<"${FORWARDED_BODY}")" || fail "C: failed to inspect forwarded body" "${FORWARDED_BODY}"
 
 case "${KEY_CHECK}" in
     *OK*) ;;
-    *UNEXPECTED_KEYS*) fail "C: forwarded body had keys other than {model,messages}: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
-    *NO_WRAPPER*)      fail "C: final user message is missing the cooperative-prompt wrapper" "${FORWARDED_BODY}" ;;
-    *)                 fail "C: unexpected key-check output: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
+    *UNEXPECTED_KEYS*)            fail "C: forwarded body had keys other than {model,messages}: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
+    *NO_WRAPPER_IN_SYSTEM*)       fail "C: system message is missing the cooperative-prompt wrapper" "${FORWARDED_BODY}" ;;
+    *NO_REMINDER_IN_LAST_USER*)   fail "C: last user message is missing the hybrid 'Tool reminder' line" "${FORWARDED_BODY}" ;;
+    *)                            fail "C: unexpected key-check output: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
 esac
 
 # --- Scenario D: streaming --------------------------------------------------
@@ -427,41 +436,6 @@ case "${E_TC_CHECK}" in
     *)                    fail "E: unexpected check output: ${E_TC_CHECK}" "${E_BODY}" ;;
 esac
 echo "[proxy-test]   E OK (2 distinct Read calls, unique toolu_ ids)"
-
-# --- Scenario F: API key auto-unlock flow -----------------------------------
-#
-# Exercises the proxy's auto-unlock retry path via fixture
-# scripts/fixtures/responses/08_locked_key.json (counter mode):
-#   1. First upstream call -> 401 with unlock_url pointing at mockupstream
-#   2. Proxy GETs the unlock URL
-#   3. Proxy retries the original POST -> 200 with assistant text
-# Agent sees: 200 with text. The lock is transparent.
-
-echo "[proxy-test] scenario F: API key auto-unlock flow"
-
-# Reset per-fixture counters so this scenario is deterministic regardless
-# of any prior calls that may have advanced the locked-key counter.
-"${COMPOSE[@]}" exec -T mockupstream python -c "
-import urllib.request
-req = urllib.request.Request('http://127.0.0.1:9000/__reset_counters__', method='POST')
-urllib.request.urlopen(req, timeout=5)
-" >/dev/null 2>&1 || true
-
-F_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
-    -H 'Content-Type: application/json' \
-    -d '{"model":"harness","messages":[{"role":"user","content":"unlock test"}],"stream":false}')" \
-    || fail "F: /api/chat request failed"
-echo "[proxy-test]   F response: ${F_BODY}"
-
-# Confirm we got the unlocked content (the second counter response).
-echo "${F_BODY}" | grep -q "Unlock test successful" \
-    || fail "F: expected unlocked content, got" "${F_BODY}"
-
-# Confirm the unlock endpoint was actually hit.
-F_LOGS="$("${COMPOSE[@]}" logs --tail=200 mockupstream 2>&1 || true)"
-echo "${F_LOGS}" | grep -q '__mock_unlock__ hit' \
-    || fail "F: mockupstream never logged a hit on /__mock_unlock__" "${F_LOGS}"
-echo "[proxy-test]   F OK (auto-unlock: 401 -> unlock GET -> retry -> 200)"
 
 echo "============================================================"
 echo " PROXY TEST PASSED"

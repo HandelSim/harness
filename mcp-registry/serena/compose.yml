@@ -8,8 +8,14 @@
 # `-f` args. Everything here either references the main compose file
 # (network) or expands env vars the harness script exports at compose time.
 #
-# Build context: pulled directly from upstream's git repo. The first
-# `harness start` after enabling Serena therefore builds the image (~5–10
+# Build context: a local clone at <install-root>/state/mcp/serena/repo,
+# placed there by `harness mcp install serena` (see cmd_mcp_install for
+# the clone logic — it reads repo_clone_url from harness-meta.json).
+# A git-URL build context fails on Windows: Docker Desktop mis-parses
+# the URL as a relative host path and reports
+#   `failed to evaluate path "https://github.com/oraios/serena.git#main"`.
+# Cloning host-side avoids that whole class of bug. The first
+# `harness start` after install therefore builds the image (~5–10
 # minutes; ~2GB result). Subsequent starts reuse the cached image.
 
 services:
@@ -20,7 +26,7 @@ services:
     build:
       # Upstream historically lived at docker/Dockerfile; current main has
       # the Dockerfile at the repo root.
-      context: https://github.com/oraios/serena.git#main
+      context: ${INSTALL_ROOT}/state/mcp/serena/repo
       dockerfile: Dockerfile
     container_name: harness-serena
     networks:

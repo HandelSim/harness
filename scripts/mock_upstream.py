@@ -19,11 +19,11 @@ Two response-selection paths exist:
          "response": { ... full OpenAI chat completion body ... }
        }
 
-   For multi-call fixtures (e.g. exercising the proxy's auto-unlock retry),
-   set `match_counter: true` and provide a `responses` array; the mock
-   tracks per-fixture call count and returns responses[count % len] on
-   each match. POST /__reset_counters__ resets the counters for test
-   isolation. Per-response `status` overrides the fixture-level default.
+   For multi-call fixtures, set `match_counter: true` and provide a
+   `responses` array; the mock tracks per-fixture call count and returns
+   responses[count % len] on each match. POST /__reset_counters__ resets
+   the counters for test isolation. Per-response `status` overrides the
+   fixture-level default.
 
    A fixture whose `match` is the empty string (or missing) is treated as
    the catch-all and should be named so it sorts last (e.g. `99_default.json`).
@@ -254,19 +254,6 @@ def reset_counters() -> Response:
     _fixture_counters = {}
     return Response(
         json.dumps({"status": "ok", "reset": True}),
-        status=200,
-        mimetype="application/json",
-    )
-
-
-@app.route("/__mock_unlock__", methods=["GET"])
-def mock_unlock() -> Response:
-    """Simulate the upstream's unlock URL. Returning 200 here mirrors what a
-    real provider does after the user clicks through their unlock flow; the
-    proxy's auto-unlock path follows up with a retry of the original POST."""
-    print("[mock-upstream] /__mock_unlock__ hit (auto-unlock simulated)", flush=True)
-    return Response(
-        json.dumps({"status": "ok", "unlocked": True}),
         status=200,
         mimetype="application/json",
     )

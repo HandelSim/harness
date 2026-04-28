@@ -87,6 +87,8 @@ services:
       # Users opt in by setting OUTPUT_DIR=/output in .env, then bind-mount
       # the host path of their choice via the volume below.
       OUTPUT_DIR: ${OUTPUT_DIR:-}
+      # Cooperative-prompt injection mode: user / system / hybrid (default).
+      PROXY_PROMPT_MODE: ${PROXY_PROMPT_MODE:-hybrid}
     volumes:
       # When OUTPUT_DIR is set, the proxy writes per-request debug files here.
       # On Windows users should set OUTPUT_DIR=//output to bypass MSYS path

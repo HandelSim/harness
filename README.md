@@ -141,7 +141,12 @@ containing:
 - `client-config.json` — the entry that gets merged into the agent's MCP
   config. Uses the `{"mcpServers": {"<name>": {...}}}` shape.
 - `harness-meta.json.template` — metadata. Materialized into the active
-  tree as `harness-meta.json` on install.
+  tree as `harness-meta.json` on install. Optional `repo_clone_url`
+  (and `repo_clone_ref`, defaulting to `main`) cause `harness mcp install`
+  to git-clone the upstream repo into `state/mcp/<name>/repo/`; the
+  compose snippet then uses `${INSTALL_ROOT}/state/mcp/<name>/repo` as
+  the build context. (Avoids docker's git-URL build-context handling,
+  which fails on Windows.)
 - `README.md` — what the MCP does and any required env vars.
 
 See `mcp-registry/serena/` as the reference example. Submit a PR to add

@@ -1,4 +1,6 @@
 {
   "enabled": true,
-  "allowed_domains": []
+  "allowed_domains": [],
+  "repo_clone_url": "https://github.com/oraios/serena.git",
+  "repo_clone_ref": "main"
 }

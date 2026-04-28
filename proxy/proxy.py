@@ -22,7 +22,6 @@ import sys
 import traceback
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import requests
 from flask import Flask, Response, request
@@ -48,10 +47,40 @@ OLLAMA_CONTEXT_LENGTH: int = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "200000
 
 _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 
+# Cooperative-prompt injection mode. Three values are accepted via the
+# PROXY_PROMPT_MODE env var:
+#   "user"   — legacy: full scaffolding + tool list re-injected into the
+#              last user message every turn. Buries the user's actual
+#              question on every turn (8-15K tokens of scaffolding) and
+#              has caused models to lose conversation context.
+#   "system" — full scaffolding lives in the system message; user turns
+#              pass through unchanged. Cheapest. Best for upstreams that
+#              weight system-prompt instructions persistently.
+#   "hybrid" — DEFAULT. Full tools in the system message + a brief ~50-
+#              token reminder wrapping the last user message. Best
+#              balance: doesn't bury the user's question, doesn't lose
+#              tool awareness in long conversations.
+_PROMPT_MODE: str = "hybrid"  # set in main() before serving
+
 
 # ---------------------------------------------------------------------------
 # OUTPUT_DIR handling
 # ---------------------------------------------------------------------------
+
+def _setup_prompt_mode() -> None:
+    """Read PROXY_PROMPT_MODE from the env, validate, and set the module
+    global. Invalid values fall back to 'hybrid' with a warning."""
+    global _PROMPT_MODE
+    raw = os.environ.get("PROXY_PROMPT_MODE", "hybrid").strip().lower()
+    if raw not in ("user", "system", "hybrid"):
+        print(
+            f"[!] PROXY_PROMPT_MODE='{raw}' is not one of user|system|hybrid; "
+            f"defaulting to 'hybrid'",
+            flush=True,
+        )
+        raw = "hybrid"
+    _PROMPT_MODE = raw
+
 
 def init_output_dir() -> Optional[str]:
     raw = os.environ.get("OUTPUT_DIR", "").strip()
@@ -159,6 +188,44 @@ You may explain your reasoning before or after the JSON block. If the task is fu
 {original_content}
 <<<END_OBSERVATION>>>
 """
+
+
+def build_cooperative_prompt_system_addition(tools_text):
+    """Returns the cooperative-prompt scaffolding to APPEND to the system
+    message in modes 'system' and 'hybrid'. Static across all turns; safe
+    to set once on the system message rather than re-sending per turn.
+    """
+    return f"""
+
+### Tool Usage Instructions
+You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
+{{
+  "name": "<tool_name>",
+  "arguments": {{
+    <tool_parameters>
+  }}
+}}
+You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
+
+### Available Tools
+{tools_text}
+"""
+
+
+def build_cooperative_prompt_hybrid_reminder(content):
+    """In hybrid mode, the full tool list lives in the system message.
+    User turns get a brief reminder so the model doesn't lose tool
+    awareness in long conversations. The reminder is ~50 tokens — far
+    smaller than the full schemas — and is placed BEFORE the user's
+    actual content so the user's content remains at the end (recency
+    bias matters for instruction-following models).
+    """
+    reminder = (
+        "[Tool reminder: tool definitions are in the system prompt above. "
+        "To use a tool, emit a ```json block with {name, arguments}. "
+        "Otherwise answer the user normally.]"
+    )
+    return f"{reminder}\n\n{content}"
 
 
 def _scan_balanced_json(text, start):
@@ -351,13 +418,54 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
             else:
                 messages.append({"role": "user", "content": observation})
 
-    if tools_text and messages and messages[-1]["role"] == "user":
-        original_last_role = original_messages[-1].get("role")
-        final_content = messages[-1]["content"]
-        if original_last_role == "tool":
-            messages[-1]["content"] = build_cooperative_prompt_tool(final_content, tools_text)
+    # Mode-based cooperative-prompt injection. Default mode is 'hybrid'.
+    #   user   — legacy: full scaffolding on the last user message.
+    #   system — full scaffolding appended to the system message; user turns
+    #            pass through unchanged.
+    #   hybrid — full scaffolding in the system message + brief reminder
+    #            wrapping the last user message.
+    if tools_text and messages:
+        if _PROMPT_MODE == "user":
+            if messages[-1]["role"] == "user":
+                original_last_role = original_messages[-1].get("role")
+                final_content = messages[-1]["content"]
+                if original_last_role == "tool":
+                    messages[-1]["content"] = build_cooperative_prompt_tool(final_content, tools_text)
+                else:
+                    messages[-1]["content"] = build_cooperative_prompt_user(final_content, tools_text)
         else:
-            messages[-1]["content"] = build_cooperative_prompt_user(final_content, tools_text)
+            # 'system' or 'hybrid' — both append scaffolding to the system
+            # message. The tool-result handling above already converted
+            # role:"tool" entries into user messages with a [System
+            # Observation] wrapper; we don't tack the cooperative prompt
+            # onto those (it lives in the system message instead).
+            system_addition = build_cooperative_prompt_system_addition(tools_text)
+            if messages[0]["role"] == "system":
+                existing = messages[0]["content"]
+                if isinstance(existing, str):
+                    messages[0]["content"] = existing + system_addition
+                elif isinstance(existing, list):
+                    # Some clients send system as a list of content blocks.
+                    # Append a text block rather than concatenating strings.
+                    messages[0]["content"] = existing + [{"type": "text", "text": system_addition}]
+                else:
+                    messages[0]["content"] = str(existing) + system_addition
+            else:
+                # No system message present — insert one. Strip the leading
+                # blank line that the addition starts with so the system
+                # content doesn't begin with whitespace.
+                messages.insert(0, {"role": "system", "content": system_addition.strip()})
+
+            # Hybrid additionally drops a brief reminder on the last user
+            # turn so the model doesn't lose tool awareness in long
+            # conversations. Applies regardless of how the user message
+            # was formed (real user turn vs. tool-result-converted) — the
+            # reminder is short and the model should be reminded tools
+            # are available either way.
+            if _PROMPT_MODE == "hybrid" and messages[-1]["role"] == "user":
+                messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
+                    messages[-1]["content"]
+                )
 
     return messages
 
@@ -505,66 +613,6 @@ def catch_all(path: str) -> Response:
                 mimetype="application/json",
             )
 
-        # Auto-unlock retry: some Anthropic-compatible upstreams lock keys
-        # after periods of inactivity and include an `unlock_url` in the
-        # error body. Hit it once and retry the original request — the
-        # agent never sees the lockout.
-        #
-        # Detection is on `error.unlock_url` presence rather than
-        # error.type wording, since the message text varies between
-        # providers. Retry runs at most ONCE: if the second response is
-        # still locked, it flows through to the existing 4xx handler
-        # rather than looping. Concurrent requests racing the same lock
-        # each call unlock independently — that's wasteful but harmless,
-        # since unlock is idempotent.
-        if resp.status_code in (401, 403):
-            unlock_url = None
-            try:
-                err_body_for_unlock = resp.json()
-                unlock_url = (err_body_for_unlock.get("error", {}) or {}).get("unlock_url")
-            except (ValueError, AttributeError):
-                unlock_url = None
-
-            if unlock_url:
-                api_host = urlparse(PROXY_API_URL).hostname
-                unlock_host = urlparse(unlock_url).hostname
-                if api_host and unlock_host and api_host != unlock_host:
-                    print(f"[{req_id}] WARN: unlock_url host '{unlock_host}' differs from API host '{api_host}'", flush=True)
-                    print(f"[{req_id}]       if unlock fails, add '{unlock_host}' to .harness-allowlist", flush=True)
-
-                print(f"[{req_id}] API key locked; hitting unlock_url and retrying", flush=True)
-                try:
-                    unlock_resp = requests.get(
-                        unlock_url,
-                        verify=False,
-                        timeout=15,
-                    )
-                    if unlock_resp.status_code == 200:
-                        print(f"[{req_id}] unlock succeeded; retrying original request", flush=True)
-                        save_debug_file(req_id, "02b", "Unlock_Succeeded", {"unlock_url": unlock_url, "status": unlock_resp.status_code})
-                        try:
-                            resp = requests.post(
-                                PROXY_API_URL,
-                                headers=headers,
-                                json=upstream_payload,
-                                verify=False,
-                                timeout=PROXY_TIMEOUT,
-                            )
-                        except requests.RequestException as e:
-                            print(f"[{req_id}] retry after unlock failed: {e}", flush=True)
-                            save_debug_file(req_id, "03", "API_Error", {"error": "retry-after-unlock-failed", "details": str(e)})
-                            return Response(
-                                json.dumps({"error": "upstream request failed after unlock", "details": str(e)}),
-                                status=502,
-                                mimetype="application/json",
-                            )
-                    else:
-                        print(f"[{req_id}] unlock returned {unlock_resp.status_code}; not retrying", flush=True)
-                        save_debug_file(req_id, "02b", "Unlock_Failed", {"unlock_url": unlock_url, "status": unlock_resp.status_code})
-                except requests.RequestException as e:
-                    print(f"[{req_id}] unlock request failed: {e}", flush=True)
-                    save_debug_file(req_id, "02b", "Unlock_Failed", {"unlock_url": unlock_url, "error": str(e)})
-
         if resp.status_code >= 400:
             err_body: Any
             try:
@@ -665,6 +713,7 @@ def main() -> None:
 
     _validate_config()
     _OUTPUT_DIR = init_output_dir()
+    _setup_prompt_mode()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()
     if not raw_output:
@@ -682,6 +731,7 @@ def main() -> None:
         f"   upstream model: {PROXY_API_MODEL}\n"
         f"   upstream key:   {_redact_key(PROXY_API_KEY)}\n"
         f"   timeout:        {PROXY_TIMEOUT}s\n"
+        f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   debug dumps:    {output_status}\n"
         "============================================================",
         flush=True,
