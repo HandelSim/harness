@@ -61,7 +61,16 @@ if [[ "$(id -u)" == "0" ]]; then
             groupmod -g "${HOST_GID}" -o harness 2>/dev/null \
                 || groupadd -g "${HOST_GID}" -o harness
             usermod -u "${HOST_UID}" -g "${HOST_GID}" -o harness
-            chown -R "${HOST_UID}:${HOST_GID}" /home/harness 2>/dev/null || true
+            # Skip recursive chown if the home dir's top-level ownership is
+            # already correct. On Windows + Docker Desktop, recursive chown
+            # across a bind-mounted host path is dramatically slow (every
+            # syscall is a WSL2/virtiofs translation to the Windows
+            # filesystem). After the first launch chowns the tree, subsequent
+            # launches see correct ownership and can skip the walk.
+            existing_uid=$(stat -c '%u' /home/harness 2>/dev/null || echo "")
+            if [[ "$existing_uid" != "${HOST_UID}" ]]; then
+                chown -R "${HOST_UID}:${HOST_GID}" /home/harness 2>/dev/null || true
+            fi
         fi
     fi
 
