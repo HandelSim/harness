@@ -312,28 +312,34 @@ keys = sorted(body.keys())
 if keys != ['messages', 'model']:
     print('UNEXPECTED_KEYS:' + ','.join(keys))
     sys.exit(0)
-# Default mode is 'hybrid': full tool instructions land in the system
-# message and a brief reminder is prepended to the last user message.
+# Default mode is 'user_front': the user's request appears FIRST in the
+# last user message (wrapped in <<<BEGIN_USER_REQUEST>>> markers), then
+# the tool definitions follow. The system message stays unmodified.
 msgs = body['messages']
-sys_msgs = [m for m in msgs if m.get('role') == 'system']
 last = msgs[-1]
-sys_text = '\n'.join(m.get('content','') for m in sys_msgs)
-if '### Tool Usage Instructions' not in sys_text:
-    print('NO_WRAPPER_IN_SYSTEM')
-    sys.exit(0)
 last_content = last.get('content','')
-if 'Tool reminder:' not in last_content:
-    print('NO_REMINDER_IN_LAST_USER')
+if '<<<BEGIN_USER_REQUEST>>>' not in last_content:
+    print('NO_REQUEST_MARKER_IN_LAST_USER')
+    sys.exit(0)
+if '### Available Tools' not in last_content:
+    print('NO_TOOL_LIST_IN_LAST_USER')
+    sys.exit(0)
+# Position check: request marker comes BEFORE tool list.
+req_pos = last_content.index('<<<BEGIN_USER_REQUEST>>>')
+tool_pos = last_content.index('Available Tools')
+if req_pos >= tool_pos:
+    print('REQUEST_NOT_BEFORE_TOOLS')
     sys.exit(0)
 print('OK')
 " <<<"${FORWARDED_BODY}")" || fail "C: failed to inspect forwarded body" "${FORWARDED_BODY}"
 
 case "${KEY_CHECK}" in
     *OK*) ;;
-    *UNEXPECTED_KEYS*)            fail "C: forwarded body had keys other than {model,messages}: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
-    *NO_WRAPPER_IN_SYSTEM*)       fail "C: system message is missing the cooperative-prompt wrapper" "${FORWARDED_BODY}" ;;
-    *NO_REMINDER_IN_LAST_USER*)   fail "C: last user message is missing the hybrid 'Tool reminder' line" "${FORWARDED_BODY}" ;;
-    *)                            fail "C: unexpected key-check output: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
+    *UNEXPECTED_KEYS*)              fail "C: forwarded body had keys other than {model,messages}: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
+    *NO_REQUEST_MARKER_IN_LAST_USER*) fail "C: last user message is missing the <<<BEGIN_USER_REQUEST>>> marker" "${FORWARDED_BODY}" ;;
+    *NO_TOOL_LIST_IN_LAST_USER*)    fail "C: last user message is missing the tool list" "${FORWARDED_BODY}" ;;
+    *REQUEST_NOT_BEFORE_TOOLS*)     fail "C: in user_front mode the request marker should appear before the tool list" "${FORWARDED_BODY}" ;;
+    *)                              fail "C: unexpected key-check output: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
 esac
 
 # --- Scenario D: streaming --------------------------------------------------

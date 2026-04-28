@@ -47,20 +47,33 @@ OLLAMA_CONTEXT_LENGTH: int = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "200000
 
 _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 
-# Cooperative-prompt injection mode. Three values are accepted via the
+# Cooperative-prompt injection mode. Five values are accepted via the
 # PROXY_PROMPT_MODE env var:
-#   "user"   — legacy: full scaffolding + tool list re-injected into the
-#              last user message every turn. Buries the user's actual
-#              question on every turn (8-15K tokens of scaffolding) and
-#              has caused models to lose conversation context.
-#   "system" — full scaffolding lives in the system message; user turns
-#              pass through unchanged. Cheapest. Best for upstreams that
-#              weight system-prompt instructions persistently.
-#   "hybrid" — DEFAULT. Full tools in the system message + a brief ~50-
-#              token reminder wrapping the last user message. Best
-#              balance: doesn't bury the user's question, doesn't lose
-#              tool awareness in long conversations.
-_PROMPT_MODE: str = "hybrid"  # set in main() before serving
+#   "user_front"   — DEFAULT. Same active-instruction structure as `user`
+#                    mode (full scaffolding on the last user message), but
+#                    with the user's request placed BEFORE the tool list
+#                    rather than after it. Avoids burying the question
+#                    under 10-15K tokens of tool schemas while still
+#                    giving the model a clear active-turn instruction to
+#                    emit tool calls when needed.
+#   "user_bookend" — Like `user_front`, but the request is repeated AFTER
+#                    the tool list as well. Both occurrences are wrapped
+#                    in <<<BEGIN_USER_REQUEST>>> markers. Highest
+#                    instruction-following reliability at the cost of a
+#                    duplicated request payload.
+#   "user"         — legacy: full scaffolding + tool list re-injected into
+#                    the last user message, with the request at the END.
+#                    Reliable for tool use but buries the user's actual
+#                    question and causes conversation-context loss across
+#                    turns.
+#   "system"       — full scaffolding lives in the system message; user
+#                    turns pass through unchanged. Cheapest. Some
+#                    upstreams treat system content as background and
+#                    don't reliably emit tool calls.
+#   "hybrid"       — full tools in the system message + a brief ~50-token
+#                    reminder wrapping the last user message. Same caveat
+#                    as `system` for tool reliability.
+_PROMPT_MODE: str = "user_front"  # set in main() before serving
 
 
 # ---------------------------------------------------------------------------
@@ -69,16 +82,17 @@ _PROMPT_MODE: str = "hybrid"  # set in main() before serving
 
 def _setup_prompt_mode() -> None:
     """Read PROXY_PROMPT_MODE from the env, validate, and set the module
-    global. Invalid values fall back to 'hybrid' with a warning."""
+    global. Invalid values fall back to 'user_front' with a warning."""
     global _PROMPT_MODE
-    raw = os.environ.get("PROXY_PROMPT_MODE", "hybrid").strip().lower()
-    if raw not in ("user", "system", "hybrid"):
+    raw = os.environ.get("PROXY_PROMPT_MODE", "user_front").strip().lower()
+    valid = ("user", "system", "hybrid", "user_front", "user_bookend")
+    if raw not in valid:
         print(
-            f"[!] PROXY_PROMPT_MODE='{raw}' is not one of user|system|hybrid; "
-            f"defaulting to 'hybrid'",
+            f"[!] PROXY_PROMPT_MODE='{raw}' is not one of "
+            f"{'/'.join(valid)}; defaulting to 'user_front'",
             flush=True,
         )
-        raw = "hybrid"
+        raw = "user_front"
     _PROMPT_MODE = raw
 
 
@@ -187,6 +201,136 @@ You may explain your reasoning before or after the JSON block. If the task is fu
 <<<BEGIN_OBSERVATION>>>
 {original_content}
 <<<END_OBSERVATION>>>
+"""
+
+
+def build_cooperative_prompt_user_front(original_content, tools_text):
+    """user_front mode: user's request appears FIRST, then tool definitions.
+    Same instruction text and markers as legacy `user` mode — only position
+    differs. The request gets primacy attention rather than being buried
+    after 10-15K tokens of tool schemas, so the model retains conversation
+    context across turns better than the legacy mode.
+    """
+    return f"""<<<BEGIN_USER_REQUEST>>>
+{original_content}
+<<<END_USER_REQUEST>>>
+
+---
+
+You are a helpful and intelligent AI assistant.
+
+### Tool Usage Instructions
+You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
+{{
+  "name": "<tool_name>",
+  "arguments": {{
+    <tool_parameters>
+  }}
+}}
+
+You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
+
+### Available Tools
+{tools_text}
+"""
+
+
+def build_cooperative_prompt_tool_front(original_content, tools_text):
+    """tool_front mode (the user_front variant for tool-result turns).
+    The tool result observation goes first, then the tool definitions.
+    """
+    return f"""<<<BEGIN_USER_REQUEST>>>
+{original_content}
+<<<END_USER_REQUEST>>>
+
+---
+
+You are a helpful and intelligent AI assistant.
+
+### Tool Usage Instructions
+You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
+{{
+  "name": "<tool_name>",
+  "arguments": {{
+    <tool_parameters>
+  }}
+}}
+
+You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
+
+### Available Tools
+{tools_text}
+"""
+
+
+def build_cooperative_prompt_user_bookend(original_content, tools_text):
+    """user_bookend mode: request first, then tool definitions, then
+    request again. Both occurrences wrapped in <<<BEGIN_USER_REQUEST>>>
+    markers. Maximizes attention on the user's actual question via both
+    primacy and recency at the cost of duplicating the request text.
+    """
+    return f"""<<<BEGIN_USER_REQUEST>>>
+{original_content}
+<<<END_USER_REQUEST>>>
+
+---
+
+You are a helpful and intelligent AI assistant.
+
+### Tool Usage Instructions
+You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
+{{
+  "name": "<tool_name>",
+  "arguments": {{
+    <tool_parameters>
+  }}
+}}
+
+You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
+
+### Available Tools
+{tools_text}
+
+---
+
+<<<BEGIN_USER_REQUEST>>>
+{original_content}
+<<<END_USER_REQUEST>>>
+"""
+
+
+def build_cooperative_prompt_tool_bookend(original_content, tools_text):
+    """tool_bookend mode (the user_bookend variant for tool-result turns).
+    Tool result observation appears at both ends with the tool definitions
+    in the middle.
+    """
+    return f"""<<<BEGIN_USER_REQUEST>>>
+{original_content}
+<<<END_USER_REQUEST>>>
+
+---
+
+You are a helpful and intelligent AI assistant.
+
+### Tool Usage Instructions
+You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
+{{
+  "name": "<tool_name>",
+  "arguments": {{
+    <tool_parameters>
+  }}
+}}
+
+You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
+
+### Available Tools
+{tools_text}
+
+---
+
+<<<BEGIN_USER_REQUEST>>>
+{original_content}
+<<<END_USER_REQUEST>>>
 """
 
 
@@ -418,12 +562,18 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
             else:
                 messages.append({"role": "user", "content": observation})
 
-    # Mode-based cooperative-prompt injection. Default mode is 'hybrid'.
-    #   user   — legacy: full scaffolding on the last user message.
-    #   system — full scaffolding appended to the system message; user turns
-    #            pass through unchanged.
-    #   hybrid — full scaffolding in the system message + brief reminder
-    #            wrapping the last user message.
+    # Mode-based cooperative-prompt injection. Default mode is 'user_front'.
+    #   user_front   — request first, then tool definitions, on the last
+    #                  user message. Best balance of tool reliability +
+    #                  conversation-context retention (default).
+    #   user_bookend — request first, tool definitions, request again. Both
+    #                  occurrences wrapped in markers. Highest reliability.
+    #   user         — legacy: full scaffolding on the last user message
+    #                  with the request at the END.
+    #   system       — full scaffolding appended to the system message;
+    #                  user turns pass through unchanged.
+    #   hybrid       — full scaffolding in the system message + brief
+    #                  reminder wrapping the last user message.
     if tools_text and messages:
         if _PROMPT_MODE == "user":
             if messages[-1]["role"] == "user":
@@ -433,6 +583,22 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
                     messages[-1]["content"] = build_cooperative_prompt_tool(final_content, tools_text)
                 else:
                     messages[-1]["content"] = build_cooperative_prompt_user(final_content, tools_text)
+        elif _PROMPT_MODE == "user_front":
+            if messages[-1]["role"] == "user":
+                original_last_role = original_messages[-1].get("role")
+                final_content = messages[-1]["content"]
+                if original_last_role == "tool":
+                    messages[-1]["content"] = build_cooperative_prompt_tool_front(final_content, tools_text)
+                else:
+                    messages[-1]["content"] = build_cooperative_prompt_user_front(final_content, tools_text)
+        elif _PROMPT_MODE == "user_bookend":
+            if messages[-1]["role"] == "user":
+                original_last_role = original_messages[-1].get("role")
+                final_content = messages[-1]["content"]
+                if original_last_role == "tool":
+                    messages[-1]["content"] = build_cooperative_prompt_tool_bookend(final_content, tools_text)
+                else:
+                    messages[-1]["content"] = build_cooperative_prompt_user_bookend(final_content, tools_text)
         else:
             # 'system' or 'hybrid' — both append scaffolding to the system
             # message. The tool-result handling above already converted

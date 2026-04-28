@@ -986,6 +986,23 @@ EOF
             return 1
         fi
 
+        # Force docker compose to re-resolve every bind-mount source path
+        # (notably .harness-allowlist) before `cmd_start` issues `compose up`.
+        # Why: on Windows + Docker Desktop, the linefile_merge step in
+        # apply_upgrade_actions writes to .harness-allowlist via a tmp-file +
+        # atomic-mv. The Git-Bash-side mv lands the new inode on disk
+        # immediately, but Docker Desktop's bind-mount source lookup runs
+        # against its WSL2/virtiofs filesystem cache, which may still hold a
+        # stale "missing" entry for that path right after the rename. When
+        # the next `compose up` then mounts the source, Docker sees nothing
+        # there, auto-creates an empty *directory* at the bind source, and
+        # the proxy/ollama containers boot but fail their firewall init
+        # with "allowlist file not found at /etc/harness/allowlist". A bare
+        # `compose config` triggers compose's path-resolution pass and gives
+        # the daemon a chance to refresh that cache before the real `up`.
+        # On Linux this is just YAML re-validation — effectively a no-op.
+        compose config >/dev/null 2>&1 || true
+
         cmd_start
     fi
 }

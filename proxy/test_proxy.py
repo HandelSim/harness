@@ -610,20 +610,62 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("Tool Usage Instructions", out[0]["content"])
         self.assertEqual(out[-1]["content"], "hi")
 
-    def test_invalid_mode_falls_back_to_hybrid(self):
+    def test_mode_user_front_request_before_tools(self):
+        """In user_front mode, the user's request appears BEFORE the tool
+        list, wrapped in <<<BEGIN_USER_REQUEST>>> markers, so the model
+        sees the actual question in the primacy position rather than buried
+        after 10-15K tokens of tool schemas."""
+        result = self._translate_with_mode("user_front")
+        last_user = result[-1]["content"]
+
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>", last_user)
+        self.assertIn("<<<END_USER_REQUEST>>>", last_user)
+        self.assertIn("say hello", last_user)
+
+        request_marker_pos = last_user.index("<<<BEGIN_USER_REQUEST>>>")
+        tools_section_pos = last_user.index("Available Tools")
+        self.assertLess(
+            request_marker_pos, tools_section_pos,
+            "user_front: request should appear before tools, not after",
+        )
+
+        self.assertIn("Bash", last_user)
+        self.assertIn("Run shell command", last_user)
+
+    def test_mode_user_bookend_request_appears_twice(self):
+        """In user_bookend mode, the user's request appears TWICE — once
+        before tools, once after. Both occurrences wrapped in markers."""
+        result = self._translate_with_mode("user_bookend")
+        last_user = result[-1]["content"]
+
+        occurrences = last_user.count("say hello")
+        self.assertEqual(
+            occurrences, 2,
+            f"user_bookend: expected 2 occurrences of request, got {occurrences}",
+        )
+
+        begin_count = last_user.count("<<<BEGIN_USER_REQUEST>>>")
+        end_count = last_user.count("<<<END_USER_REQUEST>>>")
+        self.assertEqual(begin_count, 2)
+        self.assertEqual(end_count, 2)
+
+        self.assertIn("Available Tools", last_user)
+        self.assertIn("Bash", last_user)
+
+    def test_invalid_mode_falls_back_to_user_front(self):
         with patch.dict(os.environ, {"PROXY_PROMPT_MODE": "garbage"}):
             proxy._setup_prompt_mode()
-            self.assertEqual(proxy._PROMPT_MODE, "hybrid")
+            self.assertEqual(proxy._PROMPT_MODE, "user_front")
 
-    def test_default_mode_is_hybrid(self):
+    def test_default_mode_is_user_front(self):
         env_no_mode = {k: v for k, v in os.environ.items() if k != "PROXY_PROMPT_MODE"}
         with patch.dict(os.environ, env_no_mode, clear=True):
             proxy._setup_prompt_mode()
-            self.assertEqual(proxy._PROMPT_MODE, "hybrid")
+            self.assertEqual(proxy._PROMPT_MODE, "user_front")
 
     def test_no_tools_skips_injection_in_all_modes(self):
         """No tools defined → no scaffolding regardless of mode."""
-        for mode in ("user", "system", "hybrid"):
+        for mode in ("user", "system", "hybrid", "user_front", "user_bookend"):
             with patch.object(proxy, "_PROMPT_MODE", mode):
                 result = proxy.translate_history_and_apply_prompt(self.user_msgs, "")
             self.assertEqual(result[0]["content"], "You are claude-code.", mode)
