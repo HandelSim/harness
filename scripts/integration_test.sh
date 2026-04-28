@@ -169,6 +169,7 @@ test_generate_env "${TEST_INSTALL}/.env" \
     "PROXY_API_KEY=test-key-1234" \
     "PROXY_API_MODEL=test-model" \
     "MOCK_SCENARIO=text" \
+    "OUTPUT_DIR=//output" \
     "HARNESS_PROJECTS_ROOT=${TEST_WORKSPACE}"
 
 # Allowlist must include hosts pipx and graphifyy reach during install,
@@ -438,15 +439,20 @@ phase_2_tui_test() {
         return 1
     fi
 
-    if ! grep -qE "find_symbol|Calculator" <<<"${out}"; then
-        echo "[integration] Phase 2.6 FAIL: print-mode output shows no evidence of serena tool invocation" >&2
-        echo "--- output (last 60 lines) ---" >&2
-        tail -60 <<<"${out}" >&2
+    # Search proxy debug dumps for evidence of the serena tool-call.
+    # The keywords appear in the upstream's first-turn response (where
+    # claude decided to call serena) and in the tool-result that gets
+    # fed back as input to the second turn. Print-mode stdout only
+    # captures the final summary, so we look at the proxy traffic instead.
+    if ! grep -rqE "find_symbol|Calculator" "${TEST_INSTALL}/state/output/" 2>/dev/null; then
+        echo "[integration] Phase 2.6 FAIL: no serena tool-call evidence in proxy dumps" >&2
+        echo "--- proxy dump files ---" >&2
+        ls -la "${TEST_INSTALL}/state/output/" >&2 || true
         echo "--- mockupstream logs ---" >&2
         docker logs "${MOCK_NAME}" 2>&1 | tail -40 >&2 || true
         return 1
     fi
-    echo "[integration] Phase 2.6: serena tool-call evidence present in print-mode output"
+    echo "[integration] Phase 2.6: serena tool-call evidence present in proxy dumps"
 }
 
 # === Phase 3: Graphify (skill) end-to-end ===================================
