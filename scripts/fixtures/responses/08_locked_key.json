@@ -1,0 +1,30 @@
+{
+  "name": "locked-key: 401 then 200 with auto-unlock URL",
+  "match": "\\bunlock test\\b|\\btest the lock\\b",
+  "match_counter": true,
+  "responses": [
+    {
+      "status": 401,
+      "error": {
+        "type": "unauthorized",
+        "message": "API key locked - visit the unlock URL to re-enable your key",
+        "unlock_url": "http://mockupstream:9000/__mock_unlock__"
+      }
+    },
+    {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "Unlock test successful. Your auto-unlock flow worked!"
+          }
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 20,
+        "completion_tokens": 12,
+        "total_tokens": 32
+      }
+    }
+  ]
+}

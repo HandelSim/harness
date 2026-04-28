@@ -174,21 +174,6 @@ preflight() {
     _inline_check_command git "git" || errors=$((errors+1))
     _inline_check_command docker "docker" || errors=$((errors+1))
 
-    # jq is required for `harness upgrade` (parsing manifest JSON), and used
-    # opportunistically by other commands (gracefully degrades to grep without
-    # it). Don't fail install if jq is missing — the user can install it later
-    # and basic harness commands work in the meantime — but warn so they know.
-    if ! command -v jq >/dev/null 2>&1; then
-        warn "jq not found — required for 'harness upgrade'."
-        warn "  install instructions:"
-        warn "    Debian/Ubuntu: sudo apt-get install jq"
-        warn "    RHEL/Fedora:   sudo dnf install jq"
-        warn "    macOS:         brew install jq"
-        warn "    Windows:       pacman -S jq (in Git Bash MSYS2 setup)"
-        warn "  installation can be deferred; harness will work without it"
-        warn "  except for 'harness upgrade' until jq is installed."
-    fi
-
     if ! docker compose version >/dev/null 2>&1; then
         echo "  ✗ docker compose v2 — 'docker compose' subcommand not available"
         echo "    (you may have docker, but need compose v2 specifically)"
@@ -528,16 +513,6 @@ If 'harness start' fails after configuration:
   harness preflight                   # validates .env and allowlist
   docker logs harness-proxy-1         # see what the proxy says
 EOF
-
-if ! command -v jq >/dev/null 2>&1; then
-    echo
-    echo "Note: jq is not installed. harness works for normal use, but"
-    echo "'harness upgrade' requires it. Install before your first upgrade:"
-    echo "  Debian/Ubuntu: sudo apt-get install jq"
-    echo "  RHEL/Fedora:   sudo dnf install jq"
-    echo "  macOS:         brew install jq"
-    echo "  Windows:       pacman -S jq"
-fi
 
 cat <<EOF
 

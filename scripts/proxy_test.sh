@@ -25,7 +25,7 @@ cd "${REPO_ROOT}"
 PROJECT_NAME="harness-proxy-test"
 
 echo "============================================================"
-echo " harness Phase 2 proxy integration test"
+echo " harness proxy integration test"
 echo "============================================================"
 
 # --- preflight ---------------------------------------------------------------
@@ -42,6 +42,7 @@ OVERRIDE_FILE="$(mktemp -t harness-proxy.XXXXXX.yml)"
 
 write_env() {
     local scenario="$1"
+    local fixtures_dir="${2:-}"
     cat >"${ENV_FILE}" <<EOF
 PROXY_API_URL=http://mockupstream:9000/v1/chat/completions
 PROXY_API_KEY=test-key-1234
@@ -54,6 +55,7 @@ OLLAMA_VERSION=0.21.2
 OLLAMA_AGENT_MODEL=harness
 OLLAMA_CONTEXT_LENGTH=200000
 MOCK_SCENARIO=${scenario}
+MOCK_FIXTURES_DIR=${fixtures_dir}
 EOF
 }
 
@@ -67,8 +69,10 @@ services:
     working_dir: /app
     environment:
       MOCK_SCENARIO: ${MOCK_SCENARIO:-text}
+      MOCK_FIXTURES_DIR: ${MOCK_FIXTURES_DIR:-}
     volumes:
       - ./scripts/mock_upstream.py:/app/mock_upstream.py:ro
+      - ./scripts/fixtures/responses:/fixtures:ro
     networks:
       - harness-net
     expose:
@@ -185,6 +189,18 @@ restart_mock_with_scenario() {
     "${COMPOSE[@]}" up -d --force-recreate mockupstream >/dev/null
     if ! wait_healthy 60 mockupstream; then
         fail "mockupstream did not become healthy after switching to scenario '${scenario}'"
+    fi
+}
+
+restart_mock_with_fixtures() {
+    # Switch the mockupstream into fixture-dispatch mode. The fixtures
+    # directory is already bind-mounted at /fixtures in the override; we
+    # just need MOCK_FIXTURES_DIR set so the mock loads them.
+    write_env "text" "/fixtures"
+    echo "[proxy-test] restarting mockupstream with MOCK_FIXTURES_DIR=/fixtures"
+    "${COMPOSE[@]}" up -d --force-recreate mockupstream >/dev/null
+    if ! wait_healthy 60 mockupstream; then
+        fail "mockupstream did not become healthy after switching to fixture mode"
     fi
 }
 
@@ -327,6 +343,125 @@ if (( D_LINE_COUNT < 2 )); then
 fi
 echo "${D_RAW}" | tail -1 | grep -q '"done":true' \
     || fail "D: final line did not have done:true" "${D_RAW}"
+
+# --- Scenario E: multiple tool calls in one response ------------------------
+#
+# Exercises the proxy's multi-call extraction end-to-end via
+# scripts/fixtures/responses/07_multi_tool_calls.json. The fixture's
+# response has TWO ```json``` blocks; the proxy must surface BOTH as
+# distinct tool_calls with unique toolu_ ids.
+
+echo "[proxy-test] scenario E: multiple tool calls in one response"
+restart_mock_with_fixtures
+
+E_REQ='{
+  "model": "harness",
+  "messages": [{"role":"user","content":"please read both files"}],
+  "stream": false,
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "Read",
+      "description": "Read a file",
+      "parameters": {
+        "type": "object",
+        "properties": {"file_path": {"type":"string"}},
+        "required": ["file_path"]
+      }
+    }
+  }]
+}'
+E_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
+    -H 'Content-Type: application/json' \
+    -d "${E_REQ}")" \
+    || fail "E: /api/chat request failed"
+echo "[proxy-test]   E response (truncated): $(echo "${E_BODY}" | head -c 400)"
+
+# Response is NDJSON (multiple chunks); find the chunk with tool_calls.
+E_TC_CHECK="$("${COMPOSE[@]}" exec -T proxy python -c "
+import json, sys
+tool_calls = None
+for raw in sys.stdin.read().splitlines():
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        chunk = json.loads(raw)
+    except ValueError:
+        continue
+    tcs = chunk.get('message', {}).get('tool_calls')
+    if tcs:
+        tool_calls = tcs
+        break
+if tool_calls is None:
+    print('NO_TOOL_CALLS_CHUNK')
+    sys.exit(0)
+if len(tool_calls) != 2:
+    print(f'WRONG_COUNT:{len(tool_calls)}')
+    sys.exit(0)
+p1 = tool_calls[0]['function']['arguments'].get('file_path')
+p2 = tool_calls[1]['function']['arguments'].get('file_path')
+if p1 == p2:
+    print(f'SAME_PATH:{p1}')
+    sys.exit(0)
+id1 = tool_calls[0].get('id', '')
+id2 = tool_calls[1].get('id', '')
+if id1 == id2 or not id1.startswith('toolu_') or not id2.startswith('toolu_'):
+    print(f'BAD_IDS:{id1}/{id2}')
+    sys.exit(0)
+n1 = tool_calls[0]['function'].get('name', '')
+n2 = tool_calls[1]['function'].get('name', '')
+if n1 != 'Read' or n2 != 'Read':
+    print(f'WRONG_NAMES:{n1}/{n2}')
+    sys.exit(0)
+print(f'OK paths={p1},{p2} ids={id1},{id2}')
+" <<<"${E_BODY}")" || fail "E: failed to inspect response" "${E_BODY}"
+
+case "${E_TC_CHECK}" in
+    OK*)                  echo "[proxy-test]   E ${E_TC_CHECK}" ;;
+    NO_TOOL_CALLS_CHUNK*) fail "E: no NDJSON chunk contained a tool_calls field" "${E_BODY}" ;;
+    WRONG_COUNT*)         fail "E: expected 2 tool_calls, got ${E_TC_CHECK#WRONG_COUNT:}" "${E_BODY}" ;;
+    SAME_PATH*)           fail "E: both tool_calls had same file_path: ${E_TC_CHECK#SAME_PATH:}" "${E_BODY}" ;;
+    BAD_IDS*)             fail "E: tool_call ids missing or duplicate: ${E_TC_CHECK#BAD_IDS:}" "${E_BODY}" ;;
+    WRONG_NAMES*)         fail "E: expected both tool_calls named 'Read': ${E_TC_CHECK#WRONG_NAMES:}" "${E_BODY}" ;;
+    *)                    fail "E: unexpected check output: ${E_TC_CHECK}" "${E_BODY}" ;;
+esac
+echo "[proxy-test]   E OK (2 distinct Read calls, unique toolu_ ids)"
+
+# --- Scenario F: API key auto-unlock flow -----------------------------------
+#
+# Exercises the proxy's auto-unlock retry path via fixture
+# scripts/fixtures/responses/08_locked_key.json (counter mode):
+#   1. First upstream call -> 401 with unlock_url pointing at mockupstream
+#   2. Proxy GETs the unlock URL
+#   3. Proxy retries the original POST -> 200 with assistant text
+# Agent sees: 200 with text. The lock is transparent.
+
+echo "[proxy-test] scenario F: API key auto-unlock flow"
+
+# Reset per-fixture counters so this scenario is deterministic regardless
+# of any prior calls that may have advanced the locked-key counter.
+"${COMPOSE[@]}" exec -T mockupstream python -c "
+import urllib.request
+req = urllib.request.Request('http://127.0.0.1:9000/__reset_counters__', method='POST')
+urllib.request.urlopen(req, timeout=5)
+" >/dev/null 2>&1 || true
+
+F_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"harness","messages":[{"role":"user","content":"unlock test"}],"stream":false}')" \
+    || fail "F: /api/chat request failed"
+echo "[proxy-test]   F response: ${F_BODY}"
+
+# Confirm we got the unlocked content (the second counter response).
+echo "${F_BODY}" | grep -q "Unlock test successful" \
+    || fail "F: expected unlocked content, got" "${F_BODY}"
+
+# Confirm the unlock endpoint was actually hit.
+F_LOGS="$("${COMPOSE[@]}" logs --tail=200 mockupstream 2>&1 || true)"
+echo "${F_LOGS}" | grep -q '__mock_unlock__ hit' \
+    || fail "F: mockupstream never logged a hit on /__mock_unlock__" "${F_LOGS}"
+echo "[proxy-test]   F OK (auto-unlock: 401 -> unlock GET -> retry -> 200)"
 
 echo "============================================================"
 echo " PROXY TEST PASSED"

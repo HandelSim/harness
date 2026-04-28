@@ -67,8 +67,9 @@ services:
       start_period: 10s
 
   # -------------------------------------------------------------------------
-  # proxy — Phase 1: a mock that returns a hardcoded valid ChatResponse line.
-  # Phase 2 replaces proxy.py with the real translating proxy.
+  # proxy — translates between ollama's wire format and the upstream's,
+  # injects cooperative tool-use prompts, parses tool calls back from
+  # the upstream's response.
   # -------------------------------------------------------------------------
   proxy:
     build:
@@ -87,8 +88,9 @@ services:
       # the host path of their choice via the volume below.
       OUTPUT_DIR: ${OUTPUT_DIR:-}
     volumes:
-      # Phase 2's proxy will write per-request debug files here. The mock
-      # doesn't use it, but mounting now keeps the compose file stable.
+      # When OUTPUT_DIR is set, the proxy writes per-request debug files here.
+      # On Windows users should set OUTPUT_DIR=//output to bypass MSYS path
+      # translation; both forms resolve to this same host directory.
       - ./state/output:/output
       # Universal egress firewall reads its allowlist from this path.
       - ${HARNESS_ALLOWLIST_PATH:-./.harness-allowlist}:/etc/harness/allowlist:ro

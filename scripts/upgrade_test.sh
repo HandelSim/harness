@@ -26,7 +26,7 @@ source "${REPO_ROOT}/scripts/lib/upgrade_actions.sh"
 export HARNESS_UPGRADE_DATE="2026-04-25"
 
 echo "============================================================"
-echo " upgrade test (Phase B3)"
+echo " upgrade test"
 echo "============================================================"
 
 # Per-test workdir under one parent so the trap can wipe everything.

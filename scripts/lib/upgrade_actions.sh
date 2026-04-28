@@ -24,6 +24,21 @@ if [[ -n "${HARNESS_UPGRADE_ACTIONS_LOADED:-}" ]]; then
 fi
 HARNESS_UPGRADE_ACTIONS_LOADED=1
 
+# Define harness_jq as a fallback for standalone use (e.g. upgrade_test.sh
+# sources us directly without the full harness script). When sourced from
+# the harness script, harness_jq is already defined and we don't override.
+if ! declare -F harness_jq >/dev/null 2>&1; then
+    harness_jq() {
+        if command -v jq >/dev/null 2>&1; then
+            jq "$@"
+        else
+            echo "upgrade_actions: jq required for standalone use; install" >&2
+            echo "upgrade_actions: it via your package manager." >&2
+            return 1
+        fi
+    }
+fi
+
 # --- helpers ---------------------------------------------------------------
 
 # Stderr logger with a stable prefix.
@@ -50,7 +65,7 @@ _upg_json_array() {
         return 0
     fi
     local out
-    out=$(printf '%s\n' "$@" | jq -R . | jq -s .)
+    out=$(printf '%s\n' "$@" | harness_jq -R . | harness_jq -s .)
     printf '%s' "$out"
 }
 
@@ -59,16 +74,8 @@ _upg_json_str() {
     if [[ $# -eq 0 ]]; then
         printf '""'
     else
-        printf '%s' "$1" | jq -Rs .
+        printf '%s' "$1" | harness_jq -Rs .
     fi
-}
-
-# True if jq is available. The four action functions all assume jq is
-# present — `harness upgrade` is gated on it in the parent shell. We still
-# guard the json_merge action explicitly because it is the only one that
-# would silently corrupt a config without jq.
-_upg_have_jq() {
-    command -v jq >/dev/null 2>&1
 }
 
 # Move src -> dst atomically. Honors dry-run by skipping the move and
@@ -412,13 +419,6 @@ upgrade_json_merge() {
     local strategy="${3:-add_missing_keys}"
     local dry_run="${4:-0}"
 
-    if ! _upg_have_jq; then
-        _upg_log "json_merge: jq not available; cannot merge $target safely"
-        printf '{"action":"json_merge","added_paths":[],"target":%s,"skipped":true,"reason":"jq_missing"}\n' \
-            "$(_upg_json_str "$target")"
-        return 1
-    fi
-
     if [[ ! -f "$source" ]]; then
         _upg_log "json_merge: source $source does not exist; skipping"
         printf '{"action":"json_merge","added_paths":[],"target":%s,"skipped":true,"reason":"source_missing"}\n' \
@@ -433,7 +433,7 @@ upgrade_json_merge() {
         return 1
     fi
 
-    if ! jq -e . "$source" >/dev/null 2>&1; then
+    if ! harness_jq -e . "$source" >/dev/null 2>&1; then
         _upg_log "json_merge: source $source is not valid JSON; aborting"
         printf '{"action":"json_merge","added_paths":[],"target":%s,"skipped":true,"reason":"source_invalid_json"}\n' \
             "$(_upg_json_str "$target")"
@@ -449,14 +449,14 @@ upgrade_json_merge() {
         fi
         # All paths in source are "new" here.
         local paths
-        paths=$(jq -c '[paths | map(if type == "number" then "[\(.)]" else "." + . end) | join("")]' "$source" 2>/dev/null || echo '[]')
+        paths=$(harness_jq -c '[paths | map(if type == "number" then "[\(.)]" else "." + . end) | join("")]' "$source" 2>/dev/null || echo '[]')
         printf '{"action":"json_merge","added_paths":%s,"target":%s,"created":true}\n' \
             "$paths" \
             "$(_upg_json_str "$target")"
         return 0
     fi
 
-    if ! jq -e . "$target" >/dev/null 2>&1; then
+    if ! harness_jq -e . "$target" >/dev/null 2>&1; then
         _upg_log "json_merge: target $target is not valid JSON; refusing to overwrite"
         printf '{"action":"json_merge","added_paths":[],"target":%s,"skipped":true,"reason":"target_invalid_json"}\n' \
             "$(_upg_json_str "$target")"
@@ -476,7 +476,7 @@ upgrade_json_merge() {
     #     end;
     #   . | add_missing($src)
     local merged
-    merged=$(jq --slurpfile src "$source" '
+    merged=$(harness_jq --slurpfile src "$source" '
         def add_missing(s):
           if (type == "object") and ((s | type) == "object") then
             reduce (s | keys_unsorted)[] as $k (.;
@@ -506,7 +506,7 @@ upgrade_json_merge() {
     merged_tmp="$target.merged.$$"
     printf '%s\n' "$merged" >"$merged_tmp"
     local added_paths
-    added_paths=$(jq --slurpfile m "$merged_tmp" '
+    added_paths=$(harness_jq --slurpfile m "$merged_tmp" '
         def fmt: map(if type == "number" then "[\(.)]" else "." + . end) | join("");
         ($m[0] | [paths]) - [paths] | map(fmt)
     ' "$target" 2>/dev/null || echo '[]')
@@ -519,12 +519,12 @@ upgrade_json_merge() {
     fi
 
     if (( dry_run )); then
-        _upg_log "json_merge: would add path(s) to $target: $(jq -r '. | join(", ")' <<<"$added_paths")"
+        _upg_log "json_merge: would add path(s) to $target: $(harness_jq -r '. | join(", ")' <<<"$added_paths")"
     else
         local tmp="$target.tmp.$$"
         printf '%s\n' "$merged" >"$tmp"
         # Validate the temp file before swapping in.
-        if ! jq -e . "$tmp" >/dev/null 2>&1; then
+        if ! harness_jq -e . "$tmp" >/dev/null 2>&1; then
             rm -f "$tmp"
             _upg_log "json_merge: refusing to swap; tmp file is not valid JSON"
             printf '{"action":"json_merge","added_paths":[],"target":%s,"skipped":true,"reason":"tmp_invalid_json"}\n' \
@@ -532,7 +532,7 @@ upgrade_json_merge() {
             return 1
         fi
         _upg_atomic_mv "$tmp" "$target" "$dry_run"
-        _upg_log "json_merge: added path(s) to $target: $(jq -r '. | join(", ")' <<<"$added_paths")"
+        _upg_log "json_merge: added path(s) to $target: $(harness_jq -r '. | join(", ")' <<<"$added_paths")"
     fi
 
     printf '{"action":"json_merge","added_paths":%s,"target":%s}\n' \

@@ -15,8 +15,15 @@ Two response-selection paths exist:
        {
          "name": "human-readable label",
          "match": "^regex against user prompt$",
+         "status": 200,                     # optional, default 200
          "response": { ... full OpenAI chat completion body ... }
        }
+
+   For multi-call fixtures (e.g. exercising the proxy's auto-unlock retry),
+   set `match_counter: true` and provide a `responses` array; the mock
+   tracks per-fixture call count and returns responses[count % len] on
+   each match. POST /__reset_counters__ resets the counters for test
+   isolation. Per-response `status` overrides the fixture-level default.
 
    A fixture whose `match` is the empty string (or missing) is treated as
    the catch-all and should be named so it sorts last (e.g. `99_default.json`).
@@ -81,9 +88,17 @@ class Fixture:
 
     `pattern` is None for catch-alls (empty/missing match field); those
     always match and should sort last in the filename ordering.
+
+    Two response shapes are supported:
+      - single `response` (and optional top-level `status`) — same response
+        every time the fixture matches.
+      - `responses` array + `match_counter: true` — the mock tracks per-
+        fixture call count and returns responses[count % len], advancing
+        the counter on each match.
     """
 
-    __slots__ = ("name", "filename", "pattern", "response")
+    __slots__ = ("name", "filename", "pattern", "response", "responses",
+                 "match_counter", "status")
 
     def __init__(self, filename: str, raw: dict[str, Any]) -> None:
         self.filename = filename
@@ -95,12 +110,37 @@ class Fixture:
             )
         else:
             self.pattern = None
-        self.response = raw["response"]
+        self.match_counter = bool(raw.get("match_counter"))
+        self.responses = raw.get("responses") if self.match_counter else None
+        self.response = raw.get("response", {})
+        self.status = int(raw.get("status", 200))
 
     def matches(self, prompt: str) -> bool:
         if self.pattern is None:
             return True
         return self.pattern.search(prompt) is not None
+
+
+# Per-fixture call counters for `match_counter` mode. Keyed by fixture
+# filename so multiple counter-mode fixtures don't share state.
+_fixture_counters: dict[str, int] = {}
+
+
+def select_fixture_response(fx: "Fixture") -> tuple[dict[str, Any], int]:
+    """Pick the right (body, status) for this fixture invocation.
+
+    Counter-mode fixtures cycle through their `responses` array on each
+    matching call. Per-response `status` overrides the fixture-level
+    default; otherwise we fall back to fixture.status (default 200).
+    """
+    if fx.match_counter and fx.responses:
+        count = _fixture_counters.get(fx.filename, 0)
+        _fixture_counters[fx.filename] = count + 1
+        body = fx.responses[count % len(fx.responses)]
+        if isinstance(body, dict) and "status" in body:
+            return body, int(body["status"])
+        return body, fx.status
+    return fx.response, fx.status
 
 
 def load_fixtures(fixtures_dir: str) -> list[Fixture]:
@@ -168,8 +208,8 @@ def extract_user_prompt(body: Any) -> str:
     return ""
 
 
-def select_response(body: Any) -> tuple[dict[str, Any], str]:
-    """Return (response_dict, label) for a forwarded body.
+def select_response(body: Any) -> tuple[dict[str, Any], int, str]:
+    """Return (response_dict, status_code, label) for a forwarded body.
 
     label is human-readable (the fixture name or 'scenario:<x>') so the
     request log makes the dispatch path obvious during debugging.
@@ -177,9 +217,10 @@ def select_response(body: Any) -> tuple[dict[str, Any], str]:
     prompt = extract_user_prompt(body)
     for fx in FIXTURES:
         if fx.matches(prompt):
-            return fx.response, f"fixture:{fx.filename}"
+            resp, status = select_fixture_response(fx)
+            return resp, status, f"fixture:{fx.filename}"
     if SCENARIO in SCENARIO_RESPONSES:
-        return SCENARIO_RESPONSES[SCENARIO], f"scenario:{SCENARIO}"
+        return SCENARIO_RESPONSES[SCENARIO], 200, f"scenario:{SCENARIO}"
     # Last-ditch: emit a stub error response (still 200 so tests don't fail
     # at HTTP level — they fail at content level with a clearer message).
     return (
@@ -192,6 +233,7 @@ def select_response(body: Any) -> tuple[dict[str, Any], str]:
             ],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         },
+        200,
         "fallback:none",
     )
 
@@ -204,6 +246,32 @@ def health() -> Response:
     return Response(json.dumps({"status": "ok"}), status=200, mimetype="application/json")
 
 
+@app.route("/__reset_counters__", methods=["POST"])
+def reset_counters() -> Response:
+    """Test-only endpoint that resets per-fixture call counters so a test
+    re-running the same counter-mode fixture starts at index 0."""
+    global _fixture_counters
+    _fixture_counters = {}
+    return Response(
+        json.dumps({"status": "ok", "reset": True}),
+        status=200,
+        mimetype="application/json",
+    )
+
+
+@app.route("/__mock_unlock__", methods=["GET"])
+def mock_unlock() -> Response:
+    """Simulate the upstream's unlock URL. Returning 200 here mirrors what a
+    real provider does after the user clicks through their unlock flow; the
+    proxy's auto-unlock path follows up with a retry of the original POST."""
+    print("[mock-upstream] /__mock_unlock__ hit (auto-unlock simulated)", flush=True)
+    return Response(
+        json.dumps({"status": "ok", "unlocked": True}),
+        status=200,
+        mimetype="application/json",
+    )
+
+
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 def catch_all(path: str) -> Response:
@@ -213,12 +281,12 @@ def catch_all(path: str) -> Response:
         flush=True,
     )
 
-    response_body, label = select_response(body)
-    print(f"[mock-upstream] dispatch -> {label}", flush=True)
+    response_body, status_code, label = select_response(body)
+    print(f"[mock-upstream] dispatch -> {label} (status={status_code})", flush=True)
 
     return Response(
         json.dumps(response_body),
-        status=200,
+        status=status_code,
         mimetype="application/json",
     )
 

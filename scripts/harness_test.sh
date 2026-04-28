@@ -28,7 +28,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_NAME="harness-mgmt-test"
 
 echo "============================================================"
-echo " harness Phase 4 management script test"
+echo " harness management script test"
 echo "============================================================"
 
 # --- preflight ---------------------------------------------------------------

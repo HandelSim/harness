@@ -1,8 +1,9 @@
-"""harness translating proxy (Phase 2).
+"""harness translating proxy.
 
-Receives ollama-format /api/chat requests, translates them into the
-non-standard upstream API shape ({"model", "messages"} only), POSTs to the
-upstream, then emits NDJSON chunks back to ollama matching api.ChatResponse.
+Translates between ollama's /api/chat wire format and the upstream API's
+chat-completions format. Injects cooperative tool-use prompts so models
+that don't natively support tool calls can produce them as ```json blocks
+that the proxy then parses and re-emits as native tool_calls.
 
 Environment variables (see README / .env.example):
     PROXY_HOST           bind address (default 0.0.0.0)
@@ -675,7 +676,7 @@ def main() -> None:
 
     print(
         "============================================================\n"
-        " harness translating proxy (Phase 2)\n"
+        " harness translating proxy\n"
         f"   listening on:   {PROXY_HOST}:{PROXY_PORT}\n"
         f"   upstream URL:   {PROXY_API_URL}\n"
         f"   upstream model: {PROXY_API_MODEL}\n"

@@ -59,19 +59,19 @@ harness/
 ├── proxy/                   the translating proxy
 ├── agents/                  unified agent image (Dockerfile + entrypoint
 │                            with mode dispatch: claude, opencode, shell)
-├── mcp-registry/            vetted MCP service definitions (Phase 6)
+├── mcp-registry/            vetted MCP service definitions
 └── scripts/
-    ├── proxy_test.sh        Phase 2 proxy translation tests (incl. ollama RemoteHost forwarding smoke)
-    ├── harness_test.sh      Phase 4 management script tests
-    ├── persistence_test.sh  Phase 6 persistent home + skel-seed test
+    ├── proxy_test.sh        proxy translation tests (incl. ollama RemoteHost forwarding smoke)
+    ├── harness_test.sh      management script tests
+    ├── persistence_test.sh  persistent home + skel-seed test
     ├── mcp_test.sh          MCP install/enable/disable/uninstall lifecycle test
-    ├── firewall_test.sh     Phase B1/B2 firewall guardrail (negative) + bypass
-    ├── upgrade_test.sh      Phase B3 upgrade actions library + synthetic version transition
-    ├── full_pipeline_test.sh end-to-end install → run → print-mode round-trip (covers both agents)
-    ├── integration_test.sh  Phase 7b: end-to-end Serena MCP + Graphify skill (HARNESS_RUN_SLOW=1)
+    ├── firewall_test.sh     firewall guardrail (negative) + bypass
+    ├── upgrade_test.sh      upgrade actions library + synthetic version transition
+    ├── full_pipeline_test.sh end-to-end install → run → print-mode round-trip
+    ├── integration_test.sh  end-to-end Serena MCP + Graphify skill (HARNESS_RUN_SLOW=1)
     ├── lib/                 sourceable test toolkits (test_helpers, net_helpers)
     └── fixtures/
-        ├── responses/       mock_upstream fixture dispatch table (Phase 7a)
+        ├── responses/       mock_upstream fixture dispatch table
         └── test-project/    small Python calculator package used by integration_test.sh
 ```
 
@@ -101,8 +101,8 @@ files under `mcp-registry/<name>/`:
 
 ### Lifecycle
 
-Phase 7a split the Phase 6 `enable`/`disable` verbs into a finer-grained
-lifecycle. The state diagram is:
+The MCP lifecycle has four state-changing verbs and a few inspection verbs.
+The state diagram is:
 
 ```
 available ──install──► installed-enabled ⇄ disable / enable ⇄ installed-disabled ──uninstall──► available
@@ -381,17 +381,17 @@ edits straight to `<install-root>/state/agent/home/.config/ccstatusline/settings
 ## Tests
 
 ```
-$ bash scripts/proxy_test.sh         # proxy translation + ollama RemoteHost forwarding + stub model context length
+$ bash scripts/proxy_test.sh         # proxy translation, RemoteHost forwarding, stub model context length
 $ bash scripts/harness_test.sh       # management script subcommands
 $ bash scripts/persistence_test.sh   # persistent home + skel seed
 $ bash scripts/mcp_test.sh           # MCP install/enable/disable/uninstall lifecycle
 $ bash scripts/firewall_test.sh      # firewall guardrail (negative) + per-service bypass
 $ bash scripts/upgrade_test.sh       # upgrade actions library + synthetic version transition
 $ bash scripts/full_pipeline_test.sh # full install + run pipeline (covers both agents via print-mode round-trip)
-$ HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh  # Phase 7b: end-to-end Serena + Graphify (slow, ~10-15 min)
+$ HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh  # end-to-end Serena + Graphify (slow, ~10-15 min)
 ```
 
-### Phase 7b integration test
+### Integration test (Serena + Graphify)
 
 `scripts/integration_test.sh` is the canonical regression test for the two
 flagship integrations: Serena (Pattern A — HTTP MCP server) and Graphify

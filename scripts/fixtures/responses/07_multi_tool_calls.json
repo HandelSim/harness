@@ -1,0 +1,19 @@
+{
+  "name": "multi-call: read two files",
+  "match": "\\bread.*both files\\b|\\bread snake.py and tetris.py\\b",
+  "response": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "I'll read both files in parallel.\n\n```json\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/workspace/snake.py\"}}\n```\n\n```json\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/workspace/tetris.py\"}}\n```\n\nAfter reading these I'll summarize."
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 80,
+      "completion_tokens": 60,
+      "total_tokens": 140
+    }
+  }
+}

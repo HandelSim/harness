@@ -86,8 +86,8 @@ EOF
 
 # Write a docker-compose override file that adds a `mockupstream` service
 # fronting scripts/mock_upstream.py. Mounts the python file AND the fixture
-# directory so the fixture-dispatch path (Phase 7a) sees the same fixtures
-# from any test. MOCK_FIXTURES_DIR is set so mock_upstream.py finds them.
+# directory so the fixture-dispatch path sees the same fixtures used by
+# integration_test.sh. MOCK_FIXTURES_DIR is set so mock_upstream.py finds them.
 #
 # Args: <output_path>
 # Requires: REPO_ROOT in scope (so we can refer to the host paths). The
