@@ -197,7 +197,19 @@ harness_jq() {
         echo "harness: proxy image built; resuming." >&2
     fi
 
-    docker run --rm -i harness-proxy:latest jq "$@"
+    # The container can't see host filesystem paths. If the last argument is
+    # a host file that exists, redirect it as stdin instead of passing it as
+    # a positional arg. This handles `jq '...' file.json` callers (manifest
+    # parsing in cmd_upgrade, net overrides file in netlib_overrides_*).
+    local args=("$@")
+    local n=${#args[@]}
+    if (( n > 0 )) && [[ -f "${args[n-1]}" ]]; then
+        local file="${args[n-1]}"
+        unset 'args[n-1]'
+        docker run --rm -i --entrypoint jq harness-proxy:latest "${args[@]}" <"$file"
+    else
+        docker run --rm -i --entrypoint jq harness-proxy:latest "$@"
+    fi
 }
 
 # Ensure the docker daemon is reachable; auto-start Docker Desktop on
@@ -2682,10 +2694,6 @@ cmd_net_open() {
         err "unknown service '$svc' (services: $(net_known_services | paste -sd, -))"
         exit 1
     fi
-    if ! command -v jq >/dev/null 2>&1; then
-        err "jq is required for net open/close; install it on the host"
-        exit 1
-    fi
     if netlib_overrides_is_open "$svc"; then
         echo "$svc already firewall-disabled"
         return 0
@@ -2712,10 +2720,6 @@ cmd_net_close() {
     local svc="${1:-}"
     if [[ -z "$svc" ]]; then
         err "usage: harness net close <service>"
-        exit 1
-    fi
-    if ! command -v jq >/dev/null 2>&1; then
-        err "jq is required for net open/close; install it on the host"
         exit 1
     fi
     if [[ ! -f "$net_overrides_path" ]] || ! netlib_overrides_is_open "$svc"; then

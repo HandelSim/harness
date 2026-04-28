@@ -16,6 +16,20 @@
 # unless explicitly noted; `set -euo pipefail` in the caller will not be
 # tripped by a missing optional file.
 
+# Define harness_jq as a fallback for standalone use (e.g. tests sourcing this
+# library directly without the full harness script). When sourced from the
+# harness script, harness_jq is already defined and we don't override.
+if ! declare -F harness_jq >/dev/null 2>&1; then
+    harness_jq() {
+        if command -v jq >/dev/null 2>&1; then
+            jq "$@"
+        else
+            echo "net_helpers: jq required for standalone use" >&2
+            return 1
+        fi
+    }
+fi
+
 # --- host validation --------------------------------------------------------
 
 # Validate a hostname against the strict allowlist regex. Echoes the
@@ -205,10 +219,10 @@ netlib_overrides_ensure() {
 netlib_overrides_open_services() {
     local file="${NETLIB_OVERRIDES:-}"
     [[ -f "$file" ]] || return 0
-    if ! command -v jq >/dev/null 2>&1; then
+    if ! command -v harness_jq >/dev/null 2>&1; then
         return 0
     fi
-    jq -r '
+    harness_jq -r '
         .services // {}
         | to_entries[]
         | select(.value.firewall_disabled == true)
@@ -222,11 +236,11 @@ netlib_overrides_is_open() {
     local svc="${1:-}"
     local file="${NETLIB_OVERRIDES:-}"
     [[ -n "$svc" && -f "$file" ]] || return 1
-    if ! command -v jq >/dev/null 2>&1; then
+    if ! command -v harness_jq >/dev/null 2>&1; then
         return 1
     fi
     local v
-    v=$(jq -r --arg s "$svc" '.services[$s].firewall_disabled // false' "$file" 2>/dev/null || echo "false")
+    v=$(harness_jq -r --arg s "$svc" '.services[$s].firewall_disabled // false' "$file" 2>/dev/null || echo "false")
     [[ "$v" == "true" ]]
 }
 
@@ -241,14 +255,14 @@ netlib_overrides_open() {
         echo "[net-helpers] overrides_open: service or NETLIB_OVERRIDES missing" >&2
         return 1
     fi
-    if ! command -v jq >/dev/null 2>&1; then
+    if ! command -v harness_jq >/dev/null 2>&1; then
         echo "[net-helpers] overrides_open: jq is required" >&2
         return 1
     fi
     netlib_overrides_ensure
     local tmp
     tmp=$(mktemp "${file}.XXXXXX")
-    jq --arg s "$svc" --arg r "$reason" '
+    harness_jq --arg s "$svc" --arg r "$reason" '
         .services = (.services // {})
         | .services[$s] = (
             (.services[$s] // {})
@@ -273,13 +287,13 @@ netlib_overrides_close() {
         return 1
     fi
     [[ -f "$file" ]] || return 0
-    if ! command -v jq >/dev/null 2>&1; then
+    if ! command -v harness_jq >/dev/null 2>&1; then
         echo "[net-helpers] overrides_close: jq is required" >&2
         return 1
     fi
     local tmp
     tmp=$(mktemp "${file}.XXXXXX")
-    jq --arg s "$svc" '
+    harness_jq --arg s "$svc" '
         .services = (.services // {})
         | (
             (.services[$s] // {})
