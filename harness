@@ -1976,10 +1976,6 @@ cmd_mcp_install() {
         cp -a "$f" "$dest/"
     done
     mkdir -p "$dest/data"
-    # Always force enabled=true on a fresh install regardless of what (if
-    # anything) the template said. allowed_domains and any other registry-side
-    # defaults are preserved by the copy above.
-    mcp_set_enabled "$name" "true"
 
     # If the registry meta declared a repo_clone_url, clone the upstream
     # repo into state/mcp/<name>/repo/ so the compose snippet can use a
@@ -1987,11 +1983,18 @@ cmd_mcp_install() {
     # docker tried to fetch the build context directly from a git URL —
     # the WSL2 backend mis-parses the URL as a local path. Cloning here
     # is host-side, native git, no Docker URL parsing involved.
+    #
+    # Done BEFORE mcp_set_enabled because that helper has a jq-less
+    # fallback that overwrites the meta with `{"enabled": true}` only —
+    # which would drop repo_clone_url before we got to read it. By
+    # reading the freshly-copied template meta first, we're immune.
+    # harness_jq (host jq with Docker fallback) is used so the clone
+    # block fires even when host jq is unavailable.
     local meta_file="$dest/harness-meta.json"
-    if [[ -f "$meta_file" ]] && command -v jq >/dev/null 2>&1; then
+    if [[ -f "$meta_file" ]]; then
         local clone_url clone_ref
-        clone_url=$(jq -r '.repo_clone_url // empty' "$meta_file" 2>/dev/null || true)
-        clone_ref=$(jq -r '.repo_clone_ref // "main"' "$meta_file" 2>/dev/null || true)
+        clone_url=$(harness_jq -r '.repo_clone_url // empty' "$meta_file" 2>/dev/null || true)
+        clone_ref=$(harness_jq -r '.repo_clone_ref // "main"' "$meta_file" 2>/dev/null || true)
         if [[ -n "$clone_url" ]]; then
             local clone_dir_local="$dest/repo"
             if [[ -d "$clone_dir_local/.git" ]]; then
@@ -2000,13 +2003,25 @@ cmd_mcp_install() {
                 # Clear any stale non-git directory so the clone target is empty.
                 rm -rf "$clone_dir_local" 2>/dev/null || true
                 echo "[harness] $name: cloning $clone_url ($clone_ref) to $clone_dir_local..."
+                # Fatal on failure: the compose snippet build context points
+                # at this path, so 'harness start' would fail later anyway —
+                # better to fail loudly here than report a successful install.
                 if ! git clone --depth=1 --branch "$clone_ref" "$clone_url" "$clone_dir_local"; then
-                    echo "[harness] $name: WARN: repo clone failed; you may need to clone manually" >&2
-                    echo "[harness]         to $clone_dir_local before 'harness start'" >&2
+                    err "$name: repo clone failed (target: $clone_dir_local)"
+                    err "         clone URL: $clone_url ($clone_ref)"
+                    err "         install aborted; retry with 'harness mcp install $name --force' once resolved"
+                    exit 1
                 fi
             fi
         fi
     fi
+
+    # Always force enabled=true on a fresh install regardless of what (if
+    # anything) the template said. allowed_domains and any other registry-side
+    # defaults are preserved by the copy above. Done AFTER the clone block
+    # so the jq-less fallback path in mcp_set_enabled can't drop
+    # repo_clone_url before we read it.
+    mcp_set_enabled "$name" "true"
 
     cat <<EOF
 installed: $name (from $src)
