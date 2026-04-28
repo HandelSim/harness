@@ -422,7 +422,8 @@ phase_2_tui_test() {
     local out rc
     set +e
     out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 120 \
-        "${FAKE_HOME}/.local/bin/harness" claude -p \
+        env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
+        "${TEST_INSTALL}/harness" claude -p \
         "Use serena to find the Calculator class symbol in this project" \
         2>&1 < /dev/null)
     rc=$?
