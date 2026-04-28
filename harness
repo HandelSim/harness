@@ -993,7 +993,12 @@ EOF
             build_args+=(--no-cache)
         fi
         echo "[harness] rebuilding container images..."
-        if ! compose build "${build_args[@]}"; then
+        # --profile agent ensures the agent service (which is profile-gated
+        # in docker-compose.yml) is included in the rebuild set; without it,
+        # only default-profile services (proxy, ollama) get rebuilt and
+        # image-level changes to agents/Dockerfile or agents/entrypoint.sh
+        # silently slip past the upgrade.
+        if ! compose --profile agent build "${build_args[@]}"; then
             err "compose build failed; aborting upgrade"
             return 1
         fi
@@ -2028,7 +2033,7 @@ installed: $name (from $src)
 state: installed-enabled
 data: $dest/data
 next:
-  run 'harness start' (or 'harness upgrade') to bring up the service.
+  run 'harness start' (or 'harness restart' if the stack is already up) to bring up the service.
   agents launched after that will see this MCP in their config.
 EOF
 
