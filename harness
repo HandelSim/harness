@@ -503,6 +503,7 @@ write_runtime_override() {
     if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
         local svc
         while IFS= read -r svc; do
+            svc=${svc%$'\r'}
             [[ -z "$svc" ]] && continue
             [[ "$svc" == "agent" ]] && continue
             body+="  ${svc}:"$'\n'
