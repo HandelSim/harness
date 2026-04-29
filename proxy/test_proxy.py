@@ -389,6 +389,14 @@ After block.'''
 
 
 class TestTranslateHistory(unittest.TestCase):
+    def setUp(self):
+        # These tests assert on the legacy role layout (system role passes
+        # through). Disable the new system→user conversion for the duration.
+        # The conversion has its own dedicated test class below.
+        p = patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", False)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_empty_returns_empty(self):
         self.assertEqual(proxy.translate_history_and_apply_prompt([], ""), [])
 
@@ -543,6 +551,13 @@ class TestPromptInjectionModes(unittest.TestCase):
     """
 
     def setUp(self):
+        # These tests assert on the legacy role layout (system role passes
+        # through). The new system→user conversion is covered by
+        # TestChangeSystemToUser below.
+        p = patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", False)
+        p.start()
+        self.addCleanup(p.stop)
+
         self.user_msgs = [
             {"role": "system", "content": "You are claude-code."},
             {"role": "user", "content": "say hello"},
@@ -696,6 +711,154 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("72F sunny", c)
         # The full per-turn user-mode scaffolding should NOT be present.
         self.assertNotIn("multi-step process", c)
+
+
+class TestChangeSystemToUser(unittest.TestCase):
+    """Tests for PROXY_CHANGE_SYSTEM_PROMPT_TO_USER. The conversion runs
+    AFTER prompt-mode injection and rewrites the head-of-conversation
+    system message as a user message, with a stub assistant turn between
+    it and the actual first user message."""
+
+    def test_change_system_to_user_converts_system_to_user(self):
+        """When PROXY_CHANGE_SYSTEM_PROMPT_TO_USER=1 and a system message
+        is present, it gets converted to a user message with a stub
+        assistant turn before the actual user message."""
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
+            with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+                messages = [
+                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "user", "content": "Hello"},
+                ]
+                result = proxy.translate_history_and_apply_prompt(messages, "")
+                self.assertEqual(len(result), 3)
+                self.assertEqual(result[0]["role"], "user")
+                self.assertEqual(result[0]["content"], "You are claude-code.")
+                self.assertEqual(result[1]["role"], "assistant")
+                self.assertEqual(result[1]["content"], "I understand the instructions above.")
+                self.assertEqual(result[2]["role"], "user")
+                self.assertIn("Hello", result[2]["content"])
+
+    def test_change_system_to_user_disabled_keeps_system(self):
+        """When PROXY_CHANGE_SYSTEM_PROMPT_TO_USER=0, system messages
+        pass through unchanged."""
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", False):
+            with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+                messages = [
+                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "user", "content": "Hello"},
+                ]
+                result = proxy.translate_history_and_apply_prompt(messages, "")
+                self.assertEqual(len(result), 2)
+                self.assertEqual(result[0]["role"], "system")
+                self.assertEqual(result[0]["content"], "You are claude-code.")
+
+    def test_change_system_to_user_with_no_system_message(self):
+        """When there's no system message, conversion is a no-op."""
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
+            with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+                messages = [
+                    {"role": "user", "content": "Hello"},
+                ]
+                result = proxy.translate_history_and_apply_prompt(messages, "")
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]["role"], "user")
+                # No stub assistant inserted; just the user message
+                for msg in result:
+                    self.assertNotEqual(msg["role"], "assistant")
+
+    def test_change_system_to_user_with_empty_system(self):
+        """When the system message is empty/whitespace, it's dropped
+        entirely rather than producing an empty user message."""
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
+            with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+                messages = [
+                    {"role": "system", "content": "   \n  "},
+                    {"role": "user", "content": "Hello"},
+                ]
+                result = proxy.translate_history_and_apply_prompt(messages, "")
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0]["role"], "user")
+
+    def test_change_system_to_user_concatenates_multiple_systems(self):
+        """Multiple system messages are coalesced (existing behavior)
+        then converted as a single combined user message."""
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
+            with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+                messages = [
+                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "system", "content": "Project: foo bar."},
+                    {"role": "user", "content": "Hello"},
+                ]
+                result = proxy.translate_history_and_apply_prompt(messages, "")
+                # Combined user + stub assistant + actual user = 3 messages
+                self.assertEqual(len(result), 3)
+                self.assertEqual(result[0]["role"], "user")
+                self.assertIn("You are claude-code.", result[0]["content"])
+                self.assertIn("Project: foo bar.", result[0]["content"])
+                self.assertIn("\n\n", result[0]["content"])  # the separator
+                self.assertEqual(result[1]["role"], "assistant")
+
+    def test_change_system_to_user_with_system_mode_injection(self):
+        """When PROMPT_MODE='system' AND CHANGE_SYSTEM_TO_USER is on, the
+        tool definitions get injected into the system message FIRST (by
+        the existing system-mode logic), then the loaded system message
+        gets converted to a user message. Tools end up in the converted
+        user message."""
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
+            with patch.object(proxy, "_PROMPT_MODE", "system"):
+                messages = [
+                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "user", "content": "Hello"},
+                ]
+                tools_text = "Bash: Run shell command\nRead: Read a file"
+                result = proxy.translate_history_and_apply_prompt(messages, tools_text)
+                self.assertEqual(result[0]["role"], "user")
+                self.assertIn("You are claude-code.", result[0]["content"])
+                self.assertIn("Bash", result[0]["content"])
+                self.assertIn("Read a file", result[0]["content"])
+                self.assertEqual(result[1]["role"], "assistant")
+                self.assertEqual(result[2]["role"], "user")
+                self.assertEqual(result[2]["content"], "Hello")
+
+    def test_change_system_to_user_with_user_front_mode(self):
+        """When PROMPT_MODE='user_front' AND CHANGE_SYSTEM_TO_USER is on,
+        user_front injection still wraps the LAST user message with tools,
+        and the converted-from-system content sits at the head with the
+        stub assistant between."""
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
+            with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+                messages = [
+                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "user", "content": "Hello"},
+                ]
+                tools_text = "Bash: Run shell command"
+                result = proxy.translate_history_and_apply_prompt(messages, tools_text)
+                self.assertEqual(len(result), 3)
+                self.assertEqual(result[0]["role"], "user")
+                self.assertEqual(result[0]["content"], "You are claude-code.")
+                self.assertEqual(result[1]["role"], "assistant")
+                self.assertEqual(result[2]["role"], "user")
+                # user_front markers wrap the last user message
+                self.assertIn("<<<BEGIN_USER_REQUEST>>>", result[2]["content"])
+                self.assertIn("Hello", result[2]["content"])
+                self.assertIn("Bash", result[2]["content"])
+
+    def test_change_system_to_user_with_list_content(self):
+        """Some clients send system content as a list of content-blocks.
+        Conversion should flatten to a string."""
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
+            with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+                messages = [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "Block 1"},
+                        {"type": "text", "text": "Block 2"},
+                    ]},
+                    {"role": "user", "content": "Hello"},
+                ]
+                result = proxy.translate_history_and_apply_prompt(messages, "")
+                self.assertEqual(result[0]["role"], "user")
+                self.assertIn("Block 1", result[0]["content"])
+                self.assertIn("Block 2", result[0]["content"])
 
 
 if __name__ == "__main__":
