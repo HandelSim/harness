@@ -212,6 +212,108 @@ harness_jq() {
     fi
 }
 
+# --- update-available banner ----------------------------------------------
+#
+# Cheap, non-blocking "is harness behind origin/main?" check. Two halves:
+#
+# - _check_for_update_async fires `git ls-remote` in a backgrounded subshell
+#   that writes the remote main HEAD into state/.harness-update-check. The
+#   parent does not wait — agent startup latency is unaffected.
+#
+# - _show_update_banner_if_pending reads that cache file (populated by the
+#   PRIOR invocation), compares to local HEAD, and prints a one-line banner
+#   to stderr if they differ. This gives "check on every invocation"
+#   semantics with zero blocking cost: drift detected by run N is surfaced
+#   at the start of run N+1.
+#
+# Skipped entirely when HARNESS_SKIP_UPDATE_CHECK=1, when not in a git
+# checkout, or when not on main (working from a feature branch shouldn't
+# nag the user about origin/main).
+_check_for_update_async() {
+    [[ "${HARNESS_SKIP_UPDATE_CHECK:-0}" == "1" ]] && return 0
+    [[ -d "${install_root}/.git" ]] || return 0
+    local branch
+    branch=$(git -C "$install_root" symbolic-ref --short HEAD 2>/dev/null) || return 0
+    [[ "$branch" == "main" ]] || return 0
+    # Fire and forget. Result lands in the cache file for the NEXT invocation.
+    (
+        local remote_head
+        remote_head=$(timeout 5 git -C "$install_root" ls-remote --heads origin main 2>/dev/null | awk '{print $1}')
+        if [[ -n "$remote_head" ]]; then
+            mkdir -p "${install_root}/state" 2>/dev/null
+            printf '%s\n' "$remote_head" >"${install_root}/state/.harness-update-check" 2>/dev/null
+        fi
+    ) &
+    # Detach so SIGHUP from the parent doesn't kill it before the write.
+    disown 2>/dev/null || true
+    return 0
+}
+
+_show_update_banner_if_pending() {
+    [[ "${HARNESS_SKIP_UPDATE_CHECK:-0}" == "1" ]] && return 0
+    local cache="${install_root}/state/.harness-update-check"
+    [[ -f "$cache" ]] || return 0
+    [[ -d "${install_root}/.git" ]] || return 0
+    local branch
+    branch=$(git -C "$install_root" symbolic-ref --short HEAD 2>/dev/null) || return 0
+    [[ "$branch" == "main" ]] || return 0
+    local remote_head local_head
+    remote_head=$(cat "$cache" 2>/dev/null)
+    local_head=$(git -C "$install_root" rev-parse HEAD 2>/dev/null)
+    [[ -n "$remote_head" && -n "$local_head" ]] || return 0
+    [[ "$remote_head" == "$local_head" ]] && return 0
+    # Try to count commits ahead. If origin/main isn't a local ref yet,
+    # fetch it once so the count is meaningful.
+    local commits_behind
+    commits_behind=$(git -C "$install_root" rev-list --count "HEAD..origin/main" 2>/dev/null || echo "")
+    if [[ -z "$commits_behind" || "$commits_behind" == "0" ]]; then
+        timeout 5 git -C "$install_root" fetch origin main --quiet 2>/dev/null || return 0
+        commits_behind=$(git -C "$install_root" rev-list --count "HEAD..origin/main" 2>/dev/null || echo "?")
+    fi
+    if [[ "$commits_behind" != "0" && "$commits_behind" != "?" && -n "$commits_behind" ]]; then
+        echo "[harness] update available: ${commits_behind} commit(s) behind origin/main; run 'harness upgrade' to update" >&2
+    fi
+}
+
+# Synchronous variant of the above for `harness check-updates`. Performs
+# the ls-remote in the foreground, populates the cache file, and prints
+# either "up to date" or the same banner. Useful for CI, and for users who
+# want to force a fresh check without launching an agent.
+cmd_check_updates() {
+    if [[ ! -d "${install_root}/.git" ]]; then
+        err "not a git checkout (no $install_root/.git); update check unavailable"
+        return 1
+    fi
+    local branch
+    branch=$(git -C "$install_root" symbolic-ref --short HEAD 2>/dev/null) || branch=""
+    if [[ "$branch" != "main" ]]; then
+        echo "[harness] not on main (current: ${branch:-detached}); skipping update check"
+        return 0
+    fi
+    local remote_head
+    remote_head=$(timeout 10 git -C "$install_root" ls-remote --heads origin main 2>/dev/null | awk '{print $1}')
+    if [[ -z "$remote_head" ]]; then
+        err "could not reach origin/main (offline, or no remote configured)"
+        return 1
+    fi
+    mkdir -p "${install_root}/state" 2>/dev/null
+    printf '%s\n' "$remote_head" >"${install_root}/state/.harness-update-check" 2>/dev/null
+    local local_head
+    local_head=$(git -C "$install_root" rev-parse HEAD 2>/dev/null)
+    if [[ "$remote_head" == "$local_head" ]]; then
+        echo "[harness] up to date with origin/main ($(echo "$local_head" | cut -c1-7))"
+        return 0
+    fi
+    local commits_behind
+    commits_behind=$(git -C "$install_root" rev-list --count "HEAD..origin/main" 2>/dev/null || echo "")
+    if [[ -z "$commits_behind" || "$commits_behind" == "0" ]]; then
+        timeout 10 git -C "$install_root" fetch origin main --quiet 2>/dev/null || true
+        commits_behind=$(git -C "$install_root" rev-list --count "HEAD..origin/main" 2>/dev/null || echo "?")
+    fi
+    echo "[harness] update available: ${commits_behind} commit(s) behind origin/main; run 'harness upgrade' to update"
+    return 0
+}
+
 # Ensure the docker daemon is reachable; auto-start Docker Desktop on
 # Windows / macOS if we can. Hard exit with a helpful message otherwise.
 # Delegates to platform.sh:harness_require_docker when the library is
@@ -702,6 +804,10 @@ commands:
                                --no-prompt (skip apply confirmation),
                                --no-restart (apply without build/down/start),
                                --rebuild (compose build --no-cache; slower)
+  check-updates         synchronously check origin/main and report whether
+                        this checkout is up to date or N commits behind.
+                        Set HARNESS_SKIP_UPDATE_CHECK=1 to silence the
+                        per-invocation banner shown by claude/opencode/shell.
   logs [service ...]    follow compose logs (no args = all services)
   claude  [args]        launch a claude-code agent in the current directory
   opencode [args]       launch an opencode agent in the current directory
@@ -1284,6 +1390,12 @@ run_agent() {
     ensure_services_up
     ensure_dirs
 
+    # Surface any drift detected by the prior invocation (file read + a
+    # couple of git rev-parses; <10ms), then kick off a fresh background
+    # check whose result the NEXT invocation will read.
+    _show_update_banner_if_pending
+    _check_for_update_async
+
     # Persistent agent firewall override: `harness net open agent` writes
     # an `agent` entry to .harness-net-overrides.json. Honor it here so
     # the launch picks up the disabled-firewall state without needing
@@ -1522,6 +1634,10 @@ run_agent_print() {
 cmd_shell() {
     require_docker
     ensure_dirs
+
+    # Same banner + async refresh as run_agent; see _check_for_update_async.
+    _show_update_banner_if_pending
+    _check_for_update_async
 
     local image
     image=$(agent_image)
@@ -3359,6 +3475,7 @@ main() {
         restart)                    cmd_restart ;;
         update)                     cmd_update ;;
         upgrade)                    cmd_upgrade "$@" ;;
+        check-updates)              cmd_check_updates "$@" ;;
         logs)                       cmd_logs "$@" ;;
         claude)                     run_agent claude   "$@" ;;
         opencode)                   run_agent opencode "$@" ;;

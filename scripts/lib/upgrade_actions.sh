@@ -440,8 +440,23 @@ upgrade_json_merge() {
         return 1
     fi
 
+    # Treat "target missing" and "target unparseable/empty" identically: the
+    # only safe forward path is to overwrite with the source. Common case for
+    # the unparseable branch is ccstatusline (or another tool) writing an
+    # empty stub on first launch and never finishing, leaving a zero-byte or
+    # truncated settings.json that aborts every subsequent upgrade. Refusing
+    # to overwrite a NON-JSON file is the worst of both worlds — the user has
+    # no real data to preserve, and the upgrade fails on every run.
+    local target_missing=0
+    local target_recovered=0
     if [[ ! -f "$target" ]]; then
-        _upg_log "json_merge: target $target does not exist; copying source verbatim"
+        target_missing=1
+    elif ! harness_jq -e . "$target" >/dev/null 2>&1; then
+        target_recovered=1
+        _upg_log "json_merge: target $target is not valid JSON (empty/corrupted); recovering from source"
+    fi
+
+    if (( target_missing || target_recovered )); then
         if (( ! dry_run )); then
             mkdir -p "$(dirname "$target")"
             cp "$source" "$target.tmp.$$"
@@ -450,17 +465,17 @@ upgrade_json_merge() {
         # All paths in source are "new" here.
         local paths
         paths=$(harness_jq -c '[paths | map(if type == "number" then "[\(.)]" else "." + . end) | join("")]' "$source" 2>/dev/null || echo '[]')
-        printf '{"action":"json_merge","added_paths":%s,"target":%s,"created":true}\n' \
+        local extra=""
+        if (( target_recovered )); then
+            extra=',"recovered":true,"reason":"target_invalid_json"'
+        else
+            extra=',"created":true'
+        fi
+        printf '{"action":"json_merge","added_paths":%s,"target":%s%s}\n' \
             "$paths" \
-            "$(_upg_json_str "$target")"
+            "$(_upg_json_str "$target")" \
+            "$extra"
         return 0
-    fi
-
-    if ! harness_jq -e . "$target" >/dev/null 2>&1; then
-        _upg_log "json_merge: target $target is not valid JSON; refusing to overwrite"
-        printf '{"action":"json_merge","added_paths":[],"target":%s,"skipped":true,"reason":"target_invalid_json"}\n' \
-            "$(_upg_json_str "$target")"
-        return 1
     fi
 
     # Recursive add-missing-keys merge. Implemented as a jq filter:
