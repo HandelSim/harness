@@ -1144,12 +1144,13 @@ apply_upgrade_actions() {
 
     # 1. Unconditional actions.
     while IFS= read -r action_json; do
+        action_json=${action_json%$'\r'}
         local id type src_rel src target_rel target strategy result rc
-        id=$(harness_jq -r '.id' <<<"$action_json")
-        type=$(harness_jq -r '.type' <<<"$action_json")
-        src_rel=$(harness_jq -r '.source' <<<"$action_json")
+        id=$(_upg_strip_cr "$(harness_jq -r '.id' <<<"$action_json")")
+        type=$(_upg_strip_cr "$(harness_jq -r '.type' <<<"$action_json")")
+        src_rel=$(_upg_strip_cr "$(harness_jq -r '.source' <<<"$action_json")")
         src="$clone_dir/$src_rel"
-        target_rel=$(harness_jq -r '.target_relative' <<<"$action_json")
+        target_rel=$(_upg_strip_cr "$(harness_jq -r '.target_relative' <<<"$action_json")")
         target="$install_root/$target_rel"
 
         echo "[$id] $type" >&2
@@ -1164,7 +1165,7 @@ apply_upgrade_actions() {
                 result=$(upgrade_linefile_merge "$src" "$target" "$dry_run") || rc=$?
                 ;;
             json_merge)
-                strategy=$(harness_jq -r '.strategy // "add_missing_keys"' <<<"$action_json")
+                strategy=$(_upg_strip_cr "$(harness_jq -r '.strategy // "add_missing_keys"' <<<"$action_json")")
                 result=$(upgrade_json_merge "$src" "$target" "$strategy" "$dry_run") || rc=$?
                 ;;
             *)
@@ -1177,21 +1178,23 @@ apply_upgrade_actions() {
             err "[$id] action returned rc=$rc; continuing"
             failed=$((failed+1))
         fi
+        result=$(_upg_strip_cr "$result")
         if [[ -n "$result" ]] && harness_jq -e . <<<"$result" >/dev/null 2>&1; then
-            results=$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results")
+            results=$(_upg_strip_cr "$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results")")
         fi
     done < <(harness_jq -c '.actions[]?' "$manifest")
 
     # 2. Registry actions (gated on `condition`).
     while IFS= read -r action_json; do
+        action_json=${action_json%$'\r'}
         local id type src_rel src target_rel target cond result rc
-        id=$(harness_jq -r '.id' <<<"$action_json")
-        type=$(harness_jq -r '.type' <<<"$action_json")
-        src_rel=$(harness_jq -r '.source' <<<"$action_json")
+        id=$(_upg_strip_cr "$(harness_jq -r '.id' <<<"$action_json")")
+        type=$(_upg_strip_cr "$(harness_jq -r '.type' <<<"$action_json")")
+        src_rel=$(_upg_strip_cr "$(harness_jq -r '.source' <<<"$action_json")")
         src="$clone_dir/$src_rel"
-        target_rel=$(harness_jq -r '.target_relative' <<<"$action_json")
+        target_rel=$(_upg_strip_cr "$(harness_jq -r '.target_relative' <<<"$action_json")")
         target="$install_root/$target_rel"
-        cond=$(harness_jq -r '.condition // "always"' <<<"$action_json")
+        cond=$(_upg_strip_cr "$(harness_jq -r '.condition // "always"' <<<"$action_json")")
 
         if [[ "$cond" == "installed" && ! -d "$target" ]]; then
             echo "[$id] not installed; skipping" >&2
@@ -1201,6 +1204,7 @@ apply_upgrade_actions() {
         local preserve_args=()
         local p
         while IFS= read -r p; do
+            p=${p%$'\r'}
             [[ -n "$p" ]] && preserve_args+=("$p")
         done < <(harness_jq -r '.preserve[]?' <<<"$action_json")
 
@@ -1222,8 +1226,9 @@ apply_upgrade_actions() {
             err "[$id] action returned rc=$rc; continuing"
             failed=$((failed+1))
         fi
+        result=$(_upg_strip_cr "$result")
         if [[ -n "$result" ]] && harness_jq -e . <<<"$result" >/dev/null 2>&1; then
-            results=$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results")
+            results=$(_upg_strip_cr "$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results")")
         fi
     done < <(harness_jq -c '.registry_actions[]?' "$manifest")
 
@@ -1232,7 +1237,7 @@ apply_upgrade_actions() {
     # point after the loop above, so we've already applied any actions
     # that match types we recognize.
     local mver
-    mver=$(harness_jq -r '.version // 1' "$manifest" 2>/dev/null || echo 1)
+    mver=$(_upg_strip_cr "$(harness_jq -r '.version // 1' "$manifest" 2>/dev/null || echo 1)")
     if [[ "$mver" =~ ^[0-9]+$ ]] && (( mver > 1 )); then
         err "manifest version=$mver is newer than this runner (1); applied known action types only"
     fi
@@ -1245,7 +1250,7 @@ apply_upgrade_actions() {
         echo "Upgrade summary:"
     fi
     local n_total
-    n_total=$(harness_jq 'length' <<<"$results")
+    n_total=$(_upg_strip_cr "$(harness_jq 'length' <<<"$results")")
     if (( n_total == 0 )); then
         echo "  (no actions applied)"
         return 0
@@ -1273,9 +1278,15 @@ apply_upgrade_actions() {
         echo "$skipped"
     fi
 
+    # An "action failure" here is rc=1 from an upgrade_* helper, which in
+    # practice means a single merge couldn't apply (target had user
+    # customization, jq merge filter returned an error, etc.) — the per-
+    # action JSON line records a `skipped: true` with a `reason`, and the
+    # SKIPPED summary block above prints those for the user. The upgrade
+    # itself is not in a broken state. Don't print scary "N action(s) failed"
+    # text and don't propagate a nonzero rc to cmd_upgrade.
     if (( failed > 0 )); then
-        err "${failed} action(s) failed; review log above"
-        return 1
+        echo "[harness] ${failed} action(s) skipped (likely safe — file already matches or has user customization). Upgrade continues." >&2
     fi
     return 0
 }

@@ -243,17 +243,19 @@ grep -q '^Y=2$' "${T5_DIR}/missing.env" || fail "T5.3: created target lacks sour
 [[ "$(json_field 'created' "${T5C}")" == "true" ]] || fail "T5.3: created flag missing in JSON output"
 ok "T5.3: missing target is created from source"
 
-# 5.4: malformed JSON target — refuses to overwrite.
+# 5.4: malformed JSON target — recovered by overwriting with source.
+# (Common case: ccstatusline writes a zero-byte stub on first launch and never
+# finishes; refusing to fix it would block every subsequent harness upgrade.)
 cat >"${T5_DIR}/source.json" <<'EOF'
 {"a": 1}
 EOF
 echo 'this is not json {' >"${T5_DIR}/bad.json"
 T5D_RC=0
 T5D=$(upgrade_json_merge "${T5_DIR}/source.json" "${T5_DIR}/bad.json" add_missing_keys 0) || T5D_RC=$?
-(( T5D_RC != 0 )) || fail "T5.4: malformed target should have triggered nonzero rc"
-[[ "$(json_field 'skipped' "${T5D}")" == "true" ]] || fail "T5.4: skipped flag missing"
-[[ "$(cat "${T5_DIR}/bad.json")" == 'this is not json {' ]] || fail "T5.4: malformed target was modified — DEALBREAKER"
-ok "T5.4: malformed JSON target is left untouched"
+(( T5D_RC == 0 )) || fail "T5.4: malformed target recovery should succeed (rc=$T5D_RC)"
+[[ "$(json_field 'recovered' "${T5D}")" == "true" ]] || fail "T5.4: recovered flag missing"
+[[ "$(jq -c . "${T5_DIR}/bad.json")" == '{"a":1}' ]] || fail "T5.4: malformed target was not recovered from source"
+ok "T5.4: malformed JSON target is recovered from source"
 
 # 5.5: malformed JSON source — refuses to apply.
 cat >"${T5_DIR}/bad-src.json" <<'EOF'

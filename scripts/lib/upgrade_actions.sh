@@ -46,6 +46,13 @@ _upg_log() {
     echo "[upgrade] $*" >&2
 }
 
+# Strip CR characters from a captured string. jq on Windows Git Bash emits
+# CRLF line endings; downstream comparisons like `[[ "$x" == "[]" ]]` and
+# string-into-JSON splices break against "[]<CR>". No-op on Linux/macOS.
+_upg_strip_cr() {
+    printf '%s' "${1//$'\r'/}"
+}
+
 # Today's date as YYYY-MM-DD; used in the "Added by harness upgrade on ..."
 # marker comments. Overridable via HARNESS_UPGRADE_DATE for test
 # determinism.
@@ -66,7 +73,7 @@ _upg_json_array() {
     fi
     local out
     out=$(printf '%s\n' "$@" | harness_jq -R . | harness_jq -s .)
-    printf '%s' "$out"
+    _upg_strip_cr "$out"
 }
 
 # JSON string-escape a single arg.
@@ -74,7 +81,9 @@ _upg_json_str() {
     if [[ $# -eq 0 ]]; then
         printf '""'
     else
-        printf '%s' "$1" | harness_jq -Rs .
+        local out
+        out=$(printf '%s' "$1" | harness_jq -Rs .)
+        _upg_strip_cr "$out"
     fi
 }
 
@@ -464,7 +473,7 @@ upgrade_json_merge() {
         fi
         # All paths in source are "new" here.
         local paths
-        paths=$(harness_jq -c '[paths | map(if type == "number" then "[\(.)]" else "." + . end) | join("")]' "$source" 2>/dev/null || echo '[]')
+        paths=$(_upg_strip_cr "$(harness_jq -c '[paths | map(if type == "number" then "[\(.)]" else "." + . end) | join("")]' "$source" 2>/dev/null || echo '[]')")
         local extra=""
         if (( target_recovered )); then
             extra=',"recovered":true,"reason":"target_invalid_json"'
@@ -508,6 +517,7 @@ upgrade_json_merge() {
             "$(_upg_json_str "$target")"
         return 1
     }
+    merged=$(_upg_strip_cr "$merged")
 
     # Compute the list of newly-added paths by diffing target vs merged
     # path-set. A path is "added" if it exists in merged but not in target.
@@ -521,10 +531,10 @@ upgrade_json_merge() {
     merged_tmp="$target.merged.$$"
     printf '%s\n' "$merged" >"$merged_tmp"
     local added_paths
-    added_paths=$(harness_jq --slurpfile m "$merged_tmp" '
+    added_paths=$(_upg_strip_cr "$(harness_jq --slurpfile m "$merged_tmp" '
         def fmt: map(if type == "number" then "[\(.)]" else "." + . end) | join("");
         ($m[0] | [paths]) - [paths] | map(fmt)
-    ' "$target" 2>/dev/null || echo '[]')
+    ' "$target" 2>/dev/null || echo '[]')")
     rm -f "$merged_tmp"
 
     if [[ "$added_paths" == "[]" || -z "$added_paths" ]]; then
