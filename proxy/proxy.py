@@ -75,6 +75,14 @@ _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 #                    as `system` for tool reliability.
 _PROMPT_MODE: str = "user_front"  # set in main() before serving
 
+# Some upstream APIs silently drop the `system` role. When set, this converts
+# the system message(s) into a user message at the start of the conversation,
+# with a stub assistant message between to satisfy strict role-alternation.
+# Default ON because the failure mode is invisible (the model just doesn't
+# follow system instructions and you may not notice). Set to "0" to disable
+# for upstreams that DO support system roles.
+_CHANGE_SYSTEM_TO_USER: bool = True
+
 
 # ---------------------------------------------------------------------------
 # OUTPUT_DIR handling
@@ -94,6 +102,13 @@ def _setup_prompt_mode() -> None:
         )
         raw = "user_front"
     _PROMPT_MODE = raw
+
+
+def _setup_change_system_to_user() -> None:
+    global _CHANGE_SYSTEM_TO_USER
+    raw = os.environ.get("PROXY_CHANGE_SYSTEM_PROMPT_TO_USER", "1").strip().lower()
+    _CHANGE_SYSTEM_TO_USER = raw not in ("0", "false", "no", "off", "")
+    print(f"[i] convert system to user: {_CHANGE_SYSTEM_TO_USER}", flush=True)
 
 
 def init_output_dir() -> Optional[str]:
@@ -633,6 +648,48 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
                     messages[-1]["content"]
                 )
 
+    # Convert system role to user role if configured. Some upstream APIs
+    # silently drop the system role; this rewrites system content as a
+    # user message at the head of the conversation, with a stub assistant
+    # turn between it and the actual first user message to satisfy
+    # strict role-alternation requirements.
+    #
+    # Multiple system messages are already coalesced upstream into a
+    # single system message (see the `if role == "system"` branch above).
+    # By the time we reach here, there is at most ONE system message and
+    # it is at index 0 (if present at all).
+    if _CHANGE_SYSTEM_TO_USER and messages and messages[0]["role"] == "system":
+        system_content = messages[0]["content"]
+        # Some clients emit content as a list of content-blocks; flatten
+        # to a single string for the user-role rewrite.
+        if isinstance(system_content, list):
+            parts = []
+            for block in system_content:
+                if isinstance(block, dict):
+                    text = block.get("text", "")
+                    if text:
+                        parts.append(text)
+                elif isinstance(block, str):
+                    parts.append(block)
+            system_content = "\n\n".join(parts)
+        elif not isinstance(system_content, str):
+            system_content = str(system_content)
+        if system_content.strip():
+            # Replace the system message with a user message containing
+            # its content. Insert a stub assistant message after it so
+            # the next user message (the actual first user turn from the
+            # original conversation) doesn't violate strict alternation.
+            messages[0] = {"role": "user", "content": system_content}
+            if len(messages) > 1 and messages[1]["role"] == "user":
+                messages.insert(1, {
+                    "role": "assistant",
+                    "content": "I understand the instructions above.",
+                })
+        else:
+            # System message was empty/whitespace-only after normalization.
+            # Drop it entirely rather than producing an empty user message.
+            messages.pop(0)
+
     return messages
 
 
@@ -880,6 +937,7 @@ def main() -> None:
     _validate_config()
     _OUTPUT_DIR = init_output_dir()
     _setup_prompt_mode()
+    _setup_change_system_to_user()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()
     if not raw_output:
@@ -898,6 +956,7 @@ def main() -> None:
         f"   upstream key:   {_redact_key(PROXY_API_KEY)}\n"
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
+        f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   debug dumps:    {output_status}\n"
         "============================================================",
         flush=True,
