@@ -258,21 +258,11 @@ _show_update_banner_if_pending() {
     branch=$(git -C "$install_root" symbolic-ref --short HEAD 2>/dev/null) || return 0
     [[ "$branch" == "main" ]] || return 0
     local remote_head local_head
-    remote_head=$(cat "$cache" 2>/dev/null)
+    remote_head=$(cat "$cache" 2>/dev/null | tr -d '\r\n[:space:]')
     local_head=$(git -C "$install_root" rev-parse HEAD 2>/dev/null)
     [[ -n "$remote_head" && -n "$local_head" ]] || return 0
     [[ "$remote_head" == "$local_head" ]] && return 0
-    # Try to count commits ahead. If origin/main isn't a local ref yet,
-    # fetch it once so the count is meaningful.
-    local commits_behind
-    commits_behind=$(git -C "$install_root" rev-list --count "HEAD..origin/main" 2>/dev/null || echo "")
-    if [[ -z "$commits_behind" || "$commits_behind" == "0" ]]; then
-        timeout 5 git -C "$install_root" fetch origin main --quiet 2>/dev/null || return 0
-        commits_behind=$(git -C "$install_root" rev-list --count "HEAD..origin/main" 2>/dev/null || echo "?")
-    fi
-    if [[ "$commits_behind" != "0" && "$commits_behind" != "?" && -n "$commits_behind" ]]; then
-        echo "[harness] update available: ${commits_behind} commit(s) behind origin/main; run 'harness upgrade' to update" >&2
-    fi
+    echo "[harness] update available; run 'harness upgrade' to update" >&2
 }
 
 # Synchronous variant of the above for `harness check-updates`. Performs
@@ -304,13 +294,7 @@ cmd_check_updates() {
         echo "[harness] up to date with origin/main ($(echo "$local_head" | cut -c1-7))"
         return 0
     fi
-    local commits_behind
-    commits_behind=$(git -C "$install_root" rev-list --count "HEAD..origin/main" 2>/dev/null || echo "")
-    if [[ -z "$commits_behind" || "$commits_behind" == "0" ]]; then
-        timeout 10 git -C "$install_root" fetch origin main --quiet 2>/dev/null || true
-        commits_behind=$(git -C "$install_root" rev-list --count "HEAD..origin/main" 2>/dev/null || echo "?")
-    fi
-    echo "[harness] update available: ${commits_behind} commit(s) behind origin/main; run 'harness upgrade' to update"
+    echo "[harness] update available; run 'harness upgrade' to update"
     return 0
 }
 
@@ -1127,7 +1111,9 @@ EOF
         # On Linux this is just YAML re-validation — effectively a no-op.
         compose config >/dev/null 2>&1 || true
 
-        cmd_start
+        # The 'compose --profile agent build' above already built everything;
+        # skip cmd_start's redundant --build pass.
+        HARNESS_NO_BUILD=1 cmd_start
     fi
 }
 
