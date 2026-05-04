@@ -484,7 +484,15 @@ def extract_tool_calls_and_text(response_text):
         if closing_fence_pos == -1:
             block_end = after_json
         else:
-            block_end = closing_fence_pos + 3
+            # The ``` we found may actually be the opener of the next ```json
+            # block (model emits `}\n```json\n{...` with no real closing
+            # fence between consecutive tool calls). Don't consume those three
+            # backticks — leave them for the next iteration to recognize as
+            # the next ```json opener.
+            if response_text[closing_fence_pos:closing_fence_pos + 7] == '```json':
+                block_end = closing_fence_pos
+            else:
+                block_end = closing_fence_pos + 3
 
         try:
             candidate = json.loads(json_str)
