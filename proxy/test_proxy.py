@@ -354,6 +354,64 @@ After block.'''
         # The invalid block stays in clean text (it's just text, not a tool call)
         self.assertIn("not a tool call", clean)
 
+    def test_three_back_to_back_tool_calls_with_merged_fences(self):
+        """When the model emits consecutive tool calls and reuses ```json as
+        both the closer of one block and the opener of the next, every block
+        must still be extracted and clean_text must be empty."""
+        text = (
+            "```json\n"
+            '{"name": "read", "arguments": {"filePath": "/a"}}\n'
+            "```json\n"
+            '{"name": "read", "arguments": {"filePath": "/b"}}\n'
+            "```json\n"
+            '{"name": "read", "arguments": {"filePath": "/c"}}\n'
+            "```"
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(len(payloads), 3)
+        self.assertEqual(payloads[0]["arguments"]["filePath"], "/a")
+        self.assertEqual(payloads[1]["arguments"]["filePath"], "/b")
+        self.assertEqual(payloads[2]["arguments"]["filePath"], "/c")
+        self.assertEqual(clean, "")
+
+    def test_two_normally_fenced_tool_calls_still_work(self):
+        """Properly-fenced consecutive tool calls (with real ``` separators)
+        continue to extract correctly after the merged-fence fix."""
+        text = (
+            "```json\n"
+            '{"name": "read", "arguments": {"filePath": "/a"}}\n'
+            "```\n"
+            "```json\n"
+            '{"name": "read", "arguments": {"filePath": "/b"}}\n'
+            "```"
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["arguments"]["filePath"], "/a")
+        self.assertEqual(payloads[1]["arguments"]["filePath"], "/b")
+        self.assertEqual(clean, "")
+
+    def test_tool_call_then_prose_then_tool_call(self):
+        """Mixed content: tool call, prose, tool call. Both calls extract and
+        the prose between them survives in clean_text."""
+        text = (
+            "```json\n"
+            '{"name": "read", "arguments": {"filePath": "/a"}}\n'
+            "```\n"
+            "Now let me read the second file.\n"
+            "```json\n"
+            '{"name": "read", "arguments": {"filePath": "/b"}}\n'
+            "```"
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["arguments"]["filePath"], "/a")
+        self.assertEqual(payloads[1]["arguments"]["filePath"], "/b")
+        self.assertIn("Now let me read the second file.", clean)
+        self.assertNotIn("```json", clean)
+        self.assertNotIn("/a", clean)
+        self.assertNotIn("/b", clean)
+
     def test_generate_ndjson_emits_multiple_tool_calls(self):
         """Multiple tool calls produce a single tool_calls array in one chunk,
         each with a unique id."""
