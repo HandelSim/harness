@@ -127,6 +127,96 @@ docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     down -v --remove-orphans >/dev/null 2>&1 || true
 
+# --- Test 0: _gate_on_upstream_auth + run_agent gate (no docker) ------------
+#
+# Regression for #16: when the proxy + ollama services were already up,
+# `harness claude` / `harness opencode` skipped `cmd_start` (and therefore
+# the upstream auth probe) and the agent surfaced a locked key as an opaque
+# proxy error. The fix routes both `cmd_start` and `run_agent` through
+# `_gate_on_upstream_auth`, so a locked key prints the unlock URL and
+# refuses to launch the container.
+#
+# These cases shell-source the script (HARNESS_SOURCE_ONLY=1) and stub
+# `_probe_upstream_auth` to drive each branch deterministically without any
+# live upstream — matching the pattern in scripts/upgrade_test.sh.
+
+echo "[harness-test] T0: _gate_on_upstream_auth + run_agent gate"
+
+# T0.1 — _gate_on_upstream_auth tri-state mapping. Each subshell sources the
+# script fresh so prior stubs don't leak between cases.
+gate_case() {
+    local probe_rc="$1" expected="$2" label="$3"
+    local skip_env="${4:-}"
+    local rc=0
+    (
+        HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+        eval "_probe_upstream_auth() { return ${probe_rc}; }"
+        if [[ -n "$skip_env" ]]; then
+            export "${skip_env?}"
+        fi
+        _gate_on_upstream_auth >/dev/null 2>&1
+    ) || rc=$?
+    if [[ "$rc" != "$expected" ]]; then
+        echo "[harness-test] T0 FAIL [$label]: probe_rc=${probe_rc} expected gate rc=${expected}, got ${rc}" >&2
+        exit 1
+    fi
+}
+
+gate_case 0 0 "probe rc=0 → gate proceeds"
+gate_case 1 1 "probe rc=1 (locked) → gate aborts"
+gate_case 2 0 "probe rc=2 (unhealthy) → gate proceeds"
+gate_case 1 0 "HARNESS_SKIP_AUTH_PROBE=1 bypasses locked probe" "HARNESS_SKIP_AUTH_PROBE=1"
+
+# T0.2 — run_agent calls the gate before any container work. Stub
+# `require_docker` and `ensure_services_up`/`docker` so a gate failure must
+# be the only thing that can produce a non-zero exit, and so a passing gate
+# would visibly try to reach `ensure_services_up` (which we make a sentinel
+# that exits non-zero with a unique code).
+run_agent_locked_rc=0
+locked_out=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    require_docker() { :; }
+    ensure_services_up() { echo "ENSURE_SERVICES_UP_CALLED"; }
+    docker() { echo "DOCKER_CALLED $*"; }
+    _gate_on_upstream_auth() { return 1; }
+    run_agent claude 2>&1
+) || run_agent_locked_rc=$?
+if (( run_agent_locked_rc == 0 )); then
+    echo "[harness-test] T0 FAIL: run_agent should exit non-zero when gate returns 1" >&2
+    exit 1
+fi
+if grep -qE 'ENSURE_SERVICES_UP_CALLED|DOCKER_CALLED' <<<"$locked_out"; then
+    echo "[harness-test] T0 FAIL: run_agent reached services/docker after locked gate:" >&2
+    echo "$locked_out" >&2
+    exit 1
+fi
+
+# T0.3 — when the gate passes, run_agent advances past it. We assert the
+# next stage (ensure_services_up) is reached. We can't run the full launch
+# without docker, so a sentinel that exits with a known code lets us
+# distinguish "gate passed, advanced into the launch path" from "gate
+# blocked the launch".
+run_agent_pass_rc=0
+pass_out=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    require_docker() { :; }
+    _gate_on_upstream_auth() { return 0; }
+    ensure_services_up() { echo "ENSURE_SERVICES_UP_CALLED"; exit 42; }
+    run_agent claude 2>&1
+) || run_agent_pass_rc=$?
+if (( run_agent_pass_rc != 42 )); then
+    echo "[harness-test] T0 FAIL: expected run_agent to advance to ensure_services_up (rc=42), got ${run_agent_pass_rc}" >&2
+    echo "$pass_out" >&2
+    exit 1
+fi
+if ! grep -q 'ENSURE_SERVICES_UP_CALLED' <<<"$pass_out"; then
+    echo "[harness-test] T0 FAIL: run_agent did not reach ensure_services_up after passing gate" >&2
+    echo "$pass_out" >&2
+    exit 1
+fi
+
+echo "[harness-test] T0 OK"
+
 # --- Test 1: harness start brings services up -------------------------------
 
 echo "[harness-test] T1: harness start"

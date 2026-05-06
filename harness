@@ -762,6 +762,25 @@ _probe_upstream_auth() {
     esac
 }
 
+# Wrapper used by both `cmd_start` and `run_agent` (claude/opencode launch).
+# Runs `_probe_upstream_auth` and converts its tri-state return into the
+# desired control flow:
+#   rc=0 → key OK, return 0
+#   rc=1 → locked/invalid, return 1 (caller aborts, unlock URL already printed)
+#   rc=2 → upstream unhealthy, return 0 (warn already logged, allow proceed)
+# HARNESS_SKIP_AUTH_PROBE=1 bypasses the probe entirely (CI / offline use).
+_gate_on_upstream_auth() {
+    if [[ "${HARNESS_SKIP_AUTH_PROBE:-0}" == "1" ]]; then
+        return 0
+    fi
+    local probe_rc=0
+    _probe_upstream_auth || probe_rc=$?
+    if (( probe_rc == 1 )); then
+        return 1
+    fi
+    return 0
+}
+
 cmd_unlock() {
     # Run the same probe `cmd_start` runs. On locked, prints the unlock URL.
     # On success, prints "key OK". Useful for mid-session lockouts: user
@@ -863,16 +882,7 @@ cmd_start() {
     # key reads as a confusing chain of failures once agents start hitting
     # the proxy; surfacing it here lets the user click through the unlock
     # URL before any container has tried to talk to the upstream.
-    # HARNESS_SKIP_AUTH_PROBE=1 bypasses for CI/automation that doesn't
-    # have real upstream credentials.
-    if [[ "${HARNESS_SKIP_AUTH_PROBE:-0}" != "1" ]]; then
-        local probe_rc=0
-        _probe_upstream_auth || probe_rc=$?
-        if (( probe_rc == 1 )); then
-            return 1
-        fi
-        # rc=2 means warn-and-continue; already logged.
-    fi
+    _gate_on_upstream_auth || return 1
 
     # Stop anything still running from a prior session so up brings a clean
     # state. The 2>/dev/null || true handles a fresh install where there's
@@ -1416,6 +1426,15 @@ run_agent() {
     done
 
     require_docker
+
+    # Probe upstream auth before doing anything expensive. When services are
+    # already up (the common case for `harness claude` / `harness opencode`),
+    # `ensure_services_up` is a no-op and `cmd_start`'s probe never runs —
+    # the agent would otherwise launch and surface a locked key as an opaque
+    # error from the proxy. Gating here makes the unlock URL appear before
+    # any container is touched.
+    _gate_on_upstream_auth || exit 1
+
     ensure_services_up
     ensure_dirs
 
