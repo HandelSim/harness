@@ -491,6 +491,65 @@ echo user >"${T7_DIR}/tgt/data/user.txt"
 [[ "$(cat "${T7_DIR}/tgt/data/user.txt")" == "user" ]] || fail "T7: fallback did not preserve data/"
 ok "T7: rsync-fallback shell loop produces identical result"
 
+# === Test 8: cmd_upgrade Y/n confirmation helper =========================
+#
+# Issue #18: on Windows Git Bash, the upgrade prompt would hang on "n"
+# because the harness_jq Docker fallback (docker.exe -i) leaves the
+# parent shell's stdin in a broken state. The fix routes the prompt
+# through /dev/tty and strips a trailing \r. This test exercises the
+# helper's input-classification logic via the HARNESS_CONFIRM_FROM_STDIN
+# hook — /dev/tty isn't reliably available in CI, so we use the stdin
+# path here. The hook itself is the only production-visible difference
+# between the two paths; the answer-classification + \r-strip logic is
+# shared.
+
+echo
+echo "--- T8: _upgrade_confirm input classification ---"
+
+# Source harness with HARNESS_SOURCE_ONLY=1 to access the helper without
+# invoking main. Point HARNESS_INSTALL_ROOT at a fresh tmpdir so the script's
+# top-level .env / state-dir lookups see an empty install (no side effects).
+mkdir -p "${WORK}/t8-install"
+# shellcheck disable=SC1091
+HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${WORK}/t8-install" source "${REPO_ROOT}/harness"
+export HARNESS_CONFIRM_FROM_STDIN=1
+
+# Each case: (input, expected_rc, label)
+# rc=0 → proceed; rc=1 → abort.
+confirm_case() {
+    local input="$1" expected="$2" label="$3"
+    local rc=0
+    _upgrade_confirm "test? " <<<"$input" >/dev/null || rc=$?
+    [[ "$rc" == "$expected" ]] \
+        || fail "T8 [$label]: input=$(printf '%q' "$input") expected rc=$expected, got rc=$rc"
+}
+
+# Proceed cases.
+confirm_case ""    0 "empty (default Y)"
+confirm_case "y"   0 "y"
+confirm_case "Y"   0 "Y"
+confirm_case "yes" 0 "yes"
+confirm_case "YES" 0 "YES"
+
+# Abort cases.
+confirm_case "n"   1 "n"
+confirm_case "N"   1 "N"
+confirm_case "no"  1 "no"
+confirm_case "NO"  1 "NO"
+confirm_case "x"   1 "stray keystroke"
+
+# CR-stripping: 'n\r' (Git Bash CRLF input) must abort, not proceed.
+confirm_case $'n\r'   1 "n with trailing CR"
+confirm_case $'no\r'  1 "no with trailing CR"
+# 'y\r' must still proceed.
+confirm_case $'y\r'   0 "y with trailing CR"
+confirm_case $'yes\r' 0 "yes with trailing CR"
+# Bare CR (empty after strip) defaults to proceed.
+confirm_case $'\r'    0 "bare CR (empty after strip)"
+
+unset HARNESS_CONFIRM_FROM_STDIN
+ok "T8: _upgrade_confirm correctly classifies y/n inputs and strips CR"
+
 echo
 echo "============================================================"
 echo " UPGRADE TEST PASSED"
