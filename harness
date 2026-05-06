@@ -964,6 +964,37 @@ cmd_update() {
     git pull --ff-only
 }
 
+# Y/n confirmation prompt for cmd_upgrade. Reads from /dev/tty by default
+# to insulate the prompt from any stdin/terminal residue left by upstream
+# subprocesses. On Windows Git Bash the harness_jq Docker fallback runs
+# `docker.exe -i` immediately before this prompt; docker.exe interacts
+# with the parent ConPTY and can leave the regular stdin in a state where
+# `read` from FD 0 hangs even when the user types a valid response.
+# Reading from /dev/tty bypasses that. Mirrors pick_agent's prompt.
+#
+# The trailing \r strip is defensive against MSYS line endings — same
+# motivation as the CR fixes elsewhere in this script.
+#
+# HARNESS_CONFIRM_FROM_STDIN=1 reads from FD 0 instead of /dev/tty; this
+# is a test hook only — production callers must leave it unset.
+#
+# Returns 0 to proceed, 1 to abort. Empty/y/Y/yes/YES proceed; anything
+# else aborts.
+_upgrade_confirm() {
+    local prompt="$1"
+    local ans
+    if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
+        IFS= read -rp "$prompt" ans || ans=""
+    else
+        IFS= read -rp "$prompt" ans </dev/tty
+    fi
+    ans=${ans%$'\r'}
+    case "${ans:-}" in
+        ""|y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 cmd_upgrade() {
     local check_only=0
     local no_prompt=0
@@ -1059,12 +1090,10 @@ EOF
 
     if (( ! no_prompt )); then
         if [[ -t 0 ]]; then
-            local ans
-            read -rp "Apply these upgrade actions? [Y/n]: " ans
-            case "${ans:-}" in
-                ""|y|Y|yes|YES) ;;
-                *) echo "harness: aborted by user"; return 1 ;;
-            esac
+            if ! _upgrade_confirm "Apply these upgrade actions? [Y/n]: "; then
+                echo "harness: aborted by user"
+                return 1
+            fi
         else
             err "non-interactive shell; pass --no-prompt to apply without confirmation"
             exit 1
@@ -3496,4 +3525,9 @@ main() {
     esac
 }
 
-main "$@"
+# Allow tests to source this script for access to internal helpers (e.g.
+# _upgrade_confirm) without invoking main. Production execution always
+# falls through to main "$@".
+if [[ -z "${HARNESS_SOURCE_ONLY:-}" ]]; then
+    main "$@"
+fi
