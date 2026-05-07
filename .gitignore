@@ -20,5 +20,10 @@ __pycache__/
 # Windows / Git Bash crash dumps
 *.stackdump
 
-# Local Claude Code state (lock files for skill scheduling, etc.)
-.claude/
+# Local Claude Code state (lock files for skill scheduling, etc.).
+# Default-deny everything under .claude/, then allow checked-in config and
+# skills back in. New runtime files default to ignored without a list change.
+.claude/*
+!.claude/settings.json
+!.claude/skills/
+!.claude/skills/**
