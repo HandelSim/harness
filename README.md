@@ -39,6 +39,11 @@ After install:
 1. Edit `~/harness-install/harness/.env` and set `PROXY_API_KEY` (and any
    other required values for your upstream).
 2. cd into a project directory and run `harness claude` or `harness opencode`.
+   The folder you launch from is bind-mounted into the container at the
+   same absolute path, so `pwd` inside the agent matches your host shell.
+   Pass `--mount /some/host/path` (repeatable) to bind-mount additional
+   folders at their host paths; `HARNESS_EXTRA_MOUNTS` in `.env` makes
+   the list sticky.
 
 To uninstall:
 ```bash
@@ -85,6 +90,58 @@ rebuilds. The image's build-time home contents are snapshotted into
 `/etc/skel/harness/`, and the entrypoint copies them into an empty bind
 mount on first run, marking with `~/.harness-home-initialized` so
 subsequent runs skip the seed.
+
+## Mounts: same-path host ↔ container
+
+The folder you run `harness claude` / `harness opencode` / `harness shell`
+from is bind-mounted into the container at the **same absolute path** —
+no `/workspace` indirection. `pwd` inside the agent matches your host
+shell, which means absolute paths in code, log files, and tool output
+round-trip cleanly.
+
+### `--mount` (extra folders, repeatable)
+
+```
+harness claude --mount /home/me/refs --mount /home/me/data
+```
+
+Each `--mount` adds another host folder bind-mounted at its same
+absolute path inside the container. Rules:
+
+- Path must exist as a directory at launch time. Missing paths produce a
+  hard error before the container starts.
+- Relative paths are resolved against the current directory.
+- The CWD is ALWAYS mounted regardless of `--mount` flags, and the agent
+  always starts in the CWD — extras never override the starting dir.
+- Nested mounts are fine: running `harness claude` from
+  `/home/me/proj/sub` while passing `--mount /home/me/proj` is valid;
+  Docker layers the mounts at their respective targets and both are
+  readable. Duplicate paths (or passing the CWD as `--mount`) are
+  deduped.
+- Paths under container infrastructure (`/etc`, `/usr`, `/home/harness`,
+  `/var`, etc.) are refused with a clear error so you can't accidentally
+  shadow the agent image.
+
+### `HARNESS_EXTRA_MOUNTS` (sticky, .env)
+
+For setups that always want the same extras, put them in
+`<install-root>/.env`:
+
+```
+HARNESS_EXTRA_MOUNTS=/home/me/refs:/home/me/data
+```
+
+Colon-separated list. Merged with any per-launch `--mount` flags;
+deduped. Same validation rules as `--mount`.
+
+### Windows note
+
+Git Bash uses MSYS-style absolute paths (`/c/Users/you/proj`). Inside
+the container the same form is used, so `pwd` inside the agent matches
+what you see in your host Git Bash session. (`harness_docker_path` in
+`scripts/lib/platform.sh` rewrites the source side of `-v` to the
+mixed-form Windows path Docker Desktop expects; the target side is
+untouched.)
 
 ## MCP registry
 

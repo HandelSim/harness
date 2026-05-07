@@ -817,7 +817,7 @@ commands:
   logs [service ...]    follow compose logs (no args = all services)
   claude  [args]        launch a claude-code agent in the current directory
   opencode [args]       launch an opencode agent in the current directory
-  shell                 drop into a bash shell inside the agent container
+  shell [--mount PATH]... drop into a bash shell inside the agent container
                         (for installing skills, debugging — shares the home
                         directory with claude/opencode launches)
   claude-statusline-config
@@ -839,6 +839,13 @@ agent flags:
   --yolo                pass auto-approve / skip-permissions to the agent
   --net                 disable the per-container firewall for THIS launch
                         only (full outbound network). Audit-logged on stderr.
+  --mount PATH          bind-mount an additional host folder into the agent
+                        container at the same absolute path (repeatable).
+                        Path must exist as a directory; relative paths are
+                        resolved against the current directory. Sticky
+                        defaults via HARNESS_EXTRA_MOUNTS in .env (colon-
+                        separated). The CWD is always mounted, regardless
+                        of --mount; the agent always starts in the CWD.
   -p, --print "PROMPT"  headless single-shot invocation; for claude
                         forwards its native -p flag, for opencode invokes
                         `opencode run` inside the container
@@ -1382,11 +1389,14 @@ write_agent_mcp_config() {
 
 # Run an agent (claude or opencode) in the current directory.
 #
-# Phase 18 dropped the tmux-detached-session model; the agent CLI is now the
-# container's foreground process. /workspace is bind-mounted to $PWD and the
-# shared agent home is bind-mounted from <install-root>/state/agent/home;
-# the entrypoint also symlinks $PWD inside the container so `pwd` reflects
-# the host path.
+# The agent's CWD is bind-mounted at the same absolute host path inside the
+# container (e.g. /home/me/proj → /home/me/proj, /c/Users/you/proj →
+# /c/Users/you/proj on Windows Git Bash) so paths are identical from host
+# to container. Additional `--mount <path>` flags (and HARNESS_EXTRA_MOUNTS
+# from .env) bind in extra host folders at their absolute paths too.
+#
+# The shared agent home is bind-mounted from <install-root>/state/agent/home
+# at /home/harness; the firewall allowlist at /etc/harness/allowlist:ro.
 #
 # -p / --print uses the same foreground path with HARNESS_PRINT_MODE=1 set
 # (which makes opencode use `opencode run` and skips claude's first-run
@@ -1394,15 +1404,25 @@ write_agent_mcp_config() {
 run_agent() {
     local tool="$1"; shift
 
-    # Parse --yolo, --net, and -p/--print. --yolo and --net can appear
-    # anywhere; -p / --print is preserved in pass_args (claude consumes it as
-    # its own headless flag; opencode's entrypoint detects it and switches to
-    # `opencode run`).
+    # Parse --yolo, --net, --mount, and -p/--print. --yolo and --net can
+    # appear anywhere; -p/--print is preserved in pass_args (claude consumes
+    # it as its own headless flag; opencode's entrypoint detects it and
+    # switches to `opencode run`). --mount takes a path argument and is
+    # repeatable; the path is resolved+validated here (relative paths
+    # become absolute, missing paths error out) and never reaches the
+    # agent CLI.
     local yolo=0
     local print_mode=0
     local net_open=0
     local pass_args=()
+    local extra_mounts=()
+    local expecting_mount_arg=0
     for arg in "$@"; do
+        if (( expecting_mount_arg )); then
+            extra_mounts+=("$arg")
+            expecting_mount_arg=0
+            continue
+        fi
         case "$arg" in
             --yolo)
                 yolo=1
@@ -1415,6 +1435,12 @@ run_agent() {
                 err "WARNING: --net disables the egress firewall for this $tool launch."
                 err "         The container will have unrestricted outbound network."
                 ;;
+            --mount)
+                expecting_mount_arg=1
+                ;;
+            --mount=*)
+                extra_mounts+=("${arg#--mount=}")
+                ;;
             -p|--print)
                 print_mode=1
                 pass_args+=("$arg")
@@ -1424,6 +1450,10 @@ run_agent() {
                 ;;
         esac
     done
+    if (( expecting_mount_arg )); then
+        err "--mount requires a path argument"
+        exit 1
+    fi
 
     require_docker
 
@@ -1463,7 +1493,39 @@ run_agent() {
     warn_if_firewall_open "$net_open" "$tool" || exit 1
 
     local mount_path
-    mount_path=$(realpath "$PWD")
+    mount_path=$(harness_abs_path "$PWD") || {
+        err "cannot resolve current directory: $PWD"
+        exit 1
+    }
+
+    # Merge --mount flags with HARNESS_EXTRA_MOUNTS (colon-separated, like
+    # PATH). Validate each entry: must exist as a directory; rejected if
+    # under container infrastructure (/etc, /usr, /home/harness, ...).
+    # The resolved set is deduped against $mount_path and against itself,
+    # so passing the same dir twice (or passing the CWD as an extra mount)
+    # is a no-op rather than a mount-conflict error.
+    if [[ -n "${HARNESS_EXTRA_MOUNTS:-}" ]]; then
+        local IFS_save="$IFS"
+        IFS=':'
+        for em in $HARNESS_EXTRA_MOUNTS; do
+            [[ -z "$em" ]] && continue
+            extra_mounts+=("$em")
+        done
+        IFS="$IFS_save"
+    fi
+    local resolved_mounts=()
+    declare -A seen_mounts=()
+    seen_mounts["$mount_path"]=1
+    if (( ${#extra_mounts[@]} > 0 )); then
+        local raw abs
+        for raw in "${extra_mounts[@]}"; do
+            abs=$(harness_validate_mount "$raw") || exit 1
+            if [[ -z "${seen_mounts[$abs]:-}" ]]; then
+                resolved_mounts+=("$abs")
+                seen_mounts["$abs"]=1
+            fi
+        done
+    fi
 
     # Resolve unified image + shared home.
     local image agent_home
@@ -1489,12 +1551,20 @@ run_agent() {
 
     local network="${project_name}_harness-net"
 
+    # Serialize the resolved extras as a single newline-delimited string so
+    # we can pass it through positional args without forcing every callee
+    # to accept a varargs array. The launchers split it back on newlines.
+    local mounts_blob=""
+    if (( ${#resolved_mounts[@]} > 0 )); then
+        mounts_blob=$(printf '%s\n' "${resolved_mounts[@]}")
+    fi
+
     if (( print_mode )); then
         run_agent_print "$tool" "$yolo" "$net_open" "$mount_path" "$image" \
-            "$agent_home" "$network" "${pass_args[@]}"
+            "$agent_home" "$network" "$mounts_blob" "${pass_args[@]}"
     else
         run_agent_interactive "$tool" "$yolo" "$net_open" "$mount_path" "$image" \
-            "$agent_home" "$network" "${pass_args[@]}"
+            "$agent_home" "$network" "$mounts_blob" "${pass_args[@]}"
     fi
 }
 
@@ -1509,8 +1579,10 @@ agent_common_env() {
     printf -- '-e\nHOST_GID=%s\n' "$(id -g)"
     printf -- '-e\nHARNESS_YOLO=%s\n' "$yolo"
     printf -- '-e\nOLLAMA_AGENT_MODEL=%s\n' "$agent_model"
-    # The entrypoint symlinks this path to /workspace so `pwd` inside the
-    # container reflects the host path the user launched from.
+    # Container CWD is also bind-mounted at this exact path; the entrypoint
+    # cd's here after the gosu drop. Surfaced as an env var so agents (and
+    # any user scripts inside the container) can identify the host launch
+    # path without parsing /proc/self/cwd.
     if [[ -n "$mount_path" ]]; then
         printf -- '-e\nHARNESS_HOST_CWD=%s\n' "$mount_path"
     fi
@@ -1543,9 +1615,15 @@ collect_agent_env() {
 
 run_agent_interactive() {
     local tool="$1" yolo="$2" net_open="$3" mount_path="$4" image="$5"
-    local agent_home="$6" network="$7"
-    shift 7
+    local agent_home="$6" network="$7" mounts_blob="$8"
+    shift 8
     local pass_args=("$@")
+    local extra_mounts=()
+    if [[ -n "$mounts_blob" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && extra_mounts+=("$line")
+        done <<<"$mounts_blob"
+    fi
 
     local cname
     cname=$(agent_container_name "$tool" "$mount_path")
@@ -1601,12 +1679,27 @@ run_agent_interactive() {
     alp_host=$(harness_docker_path "$allowlist_path")
 
     docker_args+=(
-        -v "$mp_host:/workspace"
+        # CWD bind-mounted at the same absolute host path inside the
+        # container. The agent's `pwd` then equals the host path the user
+        # launched from (e.g. /home/me/proj or /c/Users/you/proj).
+        -v "$mp_host:$mount_path"
         -v "$ah_host:/home/harness"
         # Universal firewall allowlist, read-only. The init script aborts the
         # container if this is missing.
         -v "$alp_host:/etc/harness/allowlist:ro"
-        -w /workspace
+    )
+    # Extra --mount entries land at their own host paths too. Docker handles
+    # nested bind mounts (e.g. /c/user mounted alongside /c/user/handel)
+    # by applying the more-specific mount within its target subtree.
+    if (( ${#extra_mounts[@]} > 0 )); then
+        local em em_host
+        for em in "${extra_mounts[@]}"; do
+            em_host=$(harness_docker_path "$em")
+            docker_args+=(-v "$em_host:$em")
+        done
+    fi
+    docker_args+=(
+        -w "$mount_path"
         --label "harness.agent=true"
         --label "harness.project=$project_name"
         --label "harness.tool=$tool"
@@ -1627,9 +1720,15 @@ run_agent_interactive() {
 # TTY for some output formats but pipe-based callers shouldn't get a TTY.
 run_agent_print() {
     local tool="$1" yolo="$2" net_open="$3" mount_path="$4" image="$5"
-    local agent_home="$6" network="$7"
-    shift 7
+    local agent_home="$6" network="$7" mounts_blob="$8"
+    shift 8
     local pass_args=("$@")
+    local extra_mounts=()
+    if [[ -n "$mounts_blob" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && extra_mounts+=("$line")
+        done <<<"$mounts_blob"
+    fi
 
     local tty_flag
     if [[ -t 0 ]]; then
@@ -1660,10 +1759,20 @@ run_agent_print() {
 
     docker_args+=(
         -e "HARNESS_PRINT_MODE=1"
-        -v "$mp_host:/workspace"
+        # See run_agent_interactive for why we mount at $mount_path.
+        -v "$mp_host:$mount_path"
         -v "$ah_host:/home/harness"
         -v "$alp_host:/etc/harness/allowlist:ro"
-        -w /workspace
+    )
+    if (( ${#extra_mounts[@]} > 0 )); then
+        local em em_host
+        for em in "${extra_mounts[@]}"; do
+            em_host=$(harness_docker_path "$em")
+            docker_args+=(-v "$em_host:$em")
+        done
+    fi
+    docker_args+=(
+        -w "$mount_path"
         "$image"
         "$tool"
     )
@@ -1682,6 +1791,29 @@ run_agent_print() {
 cmd_shell() {
     require_docker
     ensure_dirs
+
+    # Same --mount parsing as run_agent. The shell shares the same mount
+    # contract with claude/opencode: CWD at its host path, plus any
+    # extras the user passed (or set in HARNESS_EXTRA_MOUNTS).
+    local extra_mounts=()
+    local expecting_mount_arg=0
+    local arg
+    for arg in "$@"; do
+        if (( expecting_mount_arg )); then
+            extra_mounts+=("$arg")
+            expecting_mount_arg=0
+            continue
+        fi
+        case "$arg" in
+            --mount)        expecting_mount_arg=1 ;;
+            --mount=*)      extra_mounts+=("${arg#--mount=}") ;;
+            *)              err "unknown shell flag: $arg"; exit 1 ;;
+        esac
+    done
+    if (( expecting_mount_arg )); then
+        err "--mount requires a path argument"
+        exit 1
+    fi
 
     # Same banner + async refresh as run_agent; see _check_for_update_async.
     _show_update_banner_if_pending
@@ -1702,7 +1834,34 @@ cmd_shell() {
     mkdir -p "$agent_home"
 
     local mount_path
-    mount_path=$(realpath "$PWD")
+    mount_path=$(harness_abs_path "$PWD") || {
+        err "cannot resolve current directory: $PWD"
+        exit 1
+    }
+
+    # Merge HARNESS_EXTRA_MOUNTS, validate, dedupe against $mount_path.
+    if [[ -n "${HARNESS_EXTRA_MOUNTS:-}" ]]; then
+        local IFS_save="$IFS"
+        IFS=':'
+        for em in $HARNESS_EXTRA_MOUNTS; do
+            [[ -z "$em" ]] && continue
+            extra_mounts+=("$em")
+        done
+        IFS="$IFS_save"
+    fi
+    local resolved_mounts=()
+    declare -A seen_mounts=()
+    seen_mounts["$mount_path"]=1
+    if (( ${#extra_mounts[@]} > 0 )); then
+        local raw abs
+        for raw in "${extra_mounts[@]}"; do
+            abs=$(harness_validate_mount "$raw") || exit 1
+            if [[ -z "${seen_mounts[$abs]:-}" ]]; then
+                resolved_mounts+=("$abs")
+                seen_mounts["$abs"]=1
+            fi
+        done
+    fi
 
     local network="${project_name}_harness-net"
     if ! docker network inspect "$network" >/dev/null 2>&1; then
@@ -1731,21 +1890,35 @@ cmd_shell() {
         fi
     fi
 
-    harness_docker_exec run --rm "$tty_flag" \
-        --user 0:0 \
-        --network "$network" \
-        --cap-add NET_ADMIN \
-        --cap-add NET_RAW \
-        -e "HOST_UID=$(id -u)" \
-        -e "HOST_GID=$(id -g)" \
-        -e "HARNESS_HOST_CWD=$mount_path" \
-        "${fw_args[@]}" \
-        -v "$mp_host:/workspace" \
-        -v "$ah_host:/home/harness" \
-        -v "$alp_host:/etc/harness/allowlist:ro" \
-        -w /workspace \
-        "$image" \
+    local shell_args=(
+        run --rm "$tty_flag"
+        --user 0:0
+        --network "$network"
+        --cap-add NET_ADMIN
+        --cap-add NET_RAW
+        -e "HOST_UID=$(id -u)"
+        -e "HOST_GID=$(id -g)"
+        -e "HARNESS_HOST_CWD=$mount_path"
+        "${fw_args[@]}"
+        # CWD at its host path inside the container — same parity contract
+        # as run_agent_interactive.
+        -v "$mp_host:$mount_path"
+        -v "$ah_host:/home/harness"
+        -v "$alp_host:/etc/harness/allowlist:ro"
+    )
+    if (( ${#resolved_mounts[@]} > 0 )); then
+        local em em_host
+        for em in "${resolved_mounts[@]}"; do
+            em_host=$(harness_docker_path "$em")
+            shell_args+=(-v "$em_host:$em")
+        done
+    fi
+    shell_args+=(
+        -w "$mount_path"
+        "$image"
         shell
+    )
+    harness_docker_exec "${shell_args[@]}"
 }
 
 cmd_list() {

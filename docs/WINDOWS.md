@@ -37,9 +37,10 @@ harness handles this in two ways, both via helpers in
 
 1. **`harness_docker` wraps `docker` invocations with `MSYS_NO_PATHCONV=1`
    on Windows.** This tells MSYS to skip path translation for that one
-   call, so container-internal paths like `/bin/bash`, `/etc/harness/allowlist`,
-   or `/workspace` reach Docker untouched. On Linux/macOS the wrapper is
-   a transparent passthrough — same call, no env var.
+   call, so container-internal paths like `/bin/bash`,
+   `/etc/harness/allowlist`, or the agent CWD path (e.g.
+   `/c/Users/you/proj`) reach Docker untouched. On Linux/macOS the
+   wrapper is a transparent passthrough — same call, no env var.
 
 2. **`harness_docker_path` normalizes host paths for bind-mount sources.**
    Docker Desktop's WSL2 backend reliably handles `C:/Users/...` form
@@ -59,6 +60,22 @@ called `exec docker ...` (run_agent_print, attach paths, the
 ccstatusline configurator). It preserves exec semantics while applying
 the Windows env-var wrap, since shell functions cannot themselves be
 exec'd.
+
+A fourth helper, `harness_abs_path`, normalizes a (possibly relative)
+host path to an absolute, canonical UNIX-form path — `/c/Users/you/proj`
+on Windows, plain `/home/me/proj` on Linux/macOS. It's used to compute
+the bind-mount *target* (i.e. the path the agent sees with `pwd`) so
+that paths are identical from host shell to container shell. Paired
+with `harness_docker_path` (source side), the agent can refer to
+absolute paths without translation:
+
+```
+host (Git Bash):       cd /c/Users/you/proj && harness claude
+container (in agent):  pwd → /c/Users/you/proj
+```
+
+`--mount /some/host/path` adds extra folders following the same
+contract.
 
 ## jq compatibility
 

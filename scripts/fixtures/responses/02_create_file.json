@@ -6,7 +6,7 @@
       {
         "message": {
           "role": "assistant",
-          "content": "I'll create the file for you.\n\n```json\n{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/workspace/hello.txt\",\"content\":\"hello from mock upstream\\n\"}}\n```\n"
+          "content": "I'll create the file for you.\n\n```json\n{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/tmp/hello.txt\",\"content\":\"hello from mock upstream\\n\"}}\n```\n"
         }
       }
     ],

@@ -6,7 +6,7 @@
       {
         "message": {
           "role": "assistant",
-          "content": "I'll read both files in parallel.\n\n```json\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/workspace/snake.py\"}}\n```\n\n```json\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/workspace/tetris.py\"}}\n```\n\nAfter reading these I'll summarize."
+          "content": "I'll read both files in parallel.\n\n```json\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/tmp/snake.py\"}}\n```\n\n```json\n{\"name\":\"Read\",\"arguments\":{\"file_path\":\"/tmp/tetris.py\"}}\n```\n\nAfter reading these I'll summarize."
         }
       }
     ],
