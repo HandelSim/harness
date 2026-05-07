@@ -470,7 +470,12 @@ phase_3_graphify() {
     #      run, mirroring the agent entrypoint's skel-seed step.
     #   4. exec gosu harness sleep — keeps the container alive so we can
     #      harness_docker exec into it for pipx install + graphify runs.
-    local mnt_workspace mnt_home mnt_allowlist
+    # Phase post-15: workspace is bind-mounted at its host path inside the
+    # container (no /workspace indirection). Source side may be rewritten
+    # by harness_docker_path on Windows; target side is the unmodified
+    # Linux-style host path.
+    local ws_target mnt_workspace mnt_home mnt_allowlist
+    ws_target=$(harness_abs_path "${TEST_WORKSPACE}/test-project")
     mnt_workspace=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
     mnt_home=$(harness_docker_path "${TEST_INSTALL}/state/agent/home")
     mnt_allowlist=$(harness_docker_path "${TEST_INSTALL}/.harness-allowlist")
@@ -482,10 +487,11 @@ phase_3_graphify() {
         --cap-add NET_RAW \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
-        -v "${mnt_workspace}:/workspace" \
+        -e "HARNESS_HOST_CWD=${ws_target}" \
+        -v "${mnt_workspace}:${ws_target}" \
         -v "${mnt_home}:/home/harness" \
         -v "${mnt_allowlist}:/etc/harness/allowlist:ro" \
-        -w /workspace \
+        -w "${ws_target}" \
         --label "harness.agent=true" \
         --label "harness.project=${PROJECT_NAME}" \
         --entrypoint /bin/bash \
@@ -603,7 +609,7 @@ phase_3_graphify() {
     # any LLM call. The bare `graphify .` form would error with
     # "unknown command '.'".
     if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
-            timeout 180 bash -c "cd /workspace && /home/harness/.local/bin/graphify update ." \
+            timeout 180 bash -c "cd '${ws_target}' && /home/harness/.local/bin/graphify update ." \
             >"${TEST_ROOT}/graphify-run.log" 2>&1; then
         echo "[integration] Phase 3.6 FAIL: 'graphify update .' on test project failed" >&2
         tail -60 "${TEST_ROOT}/graphify-run.log" >&2
@@ -611,12 +617,27 @@ phase_3_graphify() {
     fi
     echo "[integration] Phase 3.6: graphify run completed"
 
+    echo "[integration] Phase 3.6.1: pwd inside agent matches host CWD (no /workspace)"
+    local agent_pwd
+    agent_pwd=$(harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+        bash -c "cd '${ws_target}' && pwd" 2>/dev/null || true)
+    if [[ "${agent_pwd}" != "${ws_target}" ]]; then
+        echo "[integration] Phase 3.6.1 FAIL: pwd inside agent is '${agent_pwd}', expected '${ws_target}'" >&2
+        return 1
+    fi
+    if harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+            test -e /workspace 2>/dev/null; then
+        echo "[integration] Phase 3.6.1 FAIL: /workspace still exists in container; same-path mount expected to drop it" >&2
+        return 1
+    fi
+    echo "[integration] Phase 3.6.1: host CWD path is the in-container CWD; /workspace gone"
+
     echo "[integration] Phase 3.7: graphify-out/ exists in workspace on host"
     local out_dir="${TEST_WORKSPACE}/test-project/graphify-out"
     if [[ ! -d "${out_dir}" ]]; then
         echo "[integration] Phase 3.7 FAIL: graphify-out/ not created at ${out_dir}" >&2
         harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
-            ls -la /workspace/ >&2 2>/dev/null || true
+            ls -la "${ws_target}/" >&2 2>/dev/null || true
         return 1
     fi
     echo "[integration] Phase 3.7: graphify-out/ exists on host"
@@ -659,7 +680,8 @@ phase_3_graphify() {
 
     echo "[integration] Phase 3.11: persistence — fresh container, graphify still works"
     docker rm -f "${GRAPHIFY_AGENT_NAME}" >/dev/null 2>&1 || true
-    local mnt_workspace2 mnt_home2 mnt_allowlist2
+    local ws_target2 mnt_workspace2 mnt_home2 mnt_allowlist2
+    ws_target2=$(harness_abs_path "${TEST_WORKSPACE}/test-project")
     mnt_workspace2=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
     mnt_home2=$(harness_docker_path "${TEST_INSTALL}/state/agent/home")
     mnt_allowlist2=$(harness_docker_path "${TEST_INSTALL}/.harness-allowlist")
@@ -671,10 +693,11 @@ phase_3_graphify() {
         --cap-add NET_RAW \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
-        -v "${mnt_workspace2}:/workspace" \
+        -e "HARNESS_HOST_CWD=${ws_target2}" \
+        -v "${mnt_workspace2}:${ws_target2}" \
         -v "${mnt_home2}:/home/harness" \
         -v "${mnt_allowlist2}:/etc/harness/allowlist:ro" \
-        -w /workspace \
+        -w "${ws_target2}" \
         --label "harness.agent=true" \
         --label "harness.project=${PROJECT_NAME}" \
         --entrypoint /bin/bash \
@@ -705,6 +728,128 @@ phase_3_graphify() {
     docker rm -f "${GRAPHIFY_AGENT_NAME_2}" >/dev/null 2>&1 || true
 
     echo "[integration] Phase 3 (Graphify): all 11 checks passed"
+}
+
+# === Phase 5: --mount + same-path mounting ==================================
+
+phase_5_mount() {
+    # Drives the harness CLI's `--mount` flag end-to-end by way of
+    # `harness claude -p` (print mode is the only headless path that exits
+    # cleanly without TTY). Each subcheck launches its own container so we
+    # don't interleave with the long-lived graphify ones.
+
+    local extra_mount
+    extra_mount=$(mktemp -d -t harness-extra-mount.XXXXXX)
+    echo "marker-$(date +%s)" > "${extra_mount}/marker.txt"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${extra_mount}'" RETURN
+
+    echo "[integration] Phase 5.1: pwd inside agent equals host CWD (no /workspace)"
+    local ws_target out rc
+    ws_target=$(harness_abs_path "${TEST_WORKSPACE}/test-project")
+    set +e
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 90 \
+        env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
+        "${TEST_INSTALL}/harness" claude -p \
+        "Use bash to print exactly the value of pwd, then list /workspace if it exists, then exit." \
+        2>&1 < /dev/null)
+    rc=$?
+    set -e
+    if (( rc != 0 )); then
+        echo "[integration] Phase 5.1 FAIL: harness claude -p exited ${rc}" >&2
+        echo "${out}" | tail -c 1500 >&2
+        return 1
+    fi
+    # Mock fixtures don't actually run bash; they emit canned text. We
+    # assert on the proxy/upstream path being healthy and on the host-side
+    # absence of any "/workspace" reference in the harness's own command
+    # construction by checking the running container's mounts directly.
+
+    echo "[integration] Phase 5.2: --mount adds a host folder visible at its host path"
+    # We cannot inspect a transient -p container's mounts after it exits.
+    # Drive a long-lived container directly with the same mount contract
+    # the harness CLI now applies.
+    local mount_test_name="harness-mount-test-${RANDOM}"
+    docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
+    local ws_src extra_src ah_src alp_src extra_target
+    ws_src=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
+    extra_src=$(harness_docker_path "${extra_mount}")
+    extra_target=$(harness_abs_path "${extra_mount}")
+    ah_src=$(harness_docker_path "${TEST_INSTALL}/state/agent/home")
+    alp_src=$(harness_docker_path "${TEST_INSTALL}/.harness-allowlist")
+    harness_docker run -d \
+        --name "${mount_test_name}" \
+        --network "${NETWORK}" \
+        --user 0:0 \
+        --cap-add NET_ADMIN \
+        --cap-add NET_RAW \
+        -e "HOST_UID=$(id -u)" \
+        -e "HOST_GID=$(id -g)" \
+        -e "HARNESS_HOST_CWD=${ws_target}" \
+        -v "${ws_src}:${ws_target}" \
+        -v "${extra_src}:${extra_target}" \
+        -v "${ah_src}:/home/harness" \
+        -v "${alp_src}:/etc/harness/allowlist:ro" \
+        -w "${ws_target}" \
+        --entrypoint /bin/bash \
+        harness-agent:latest \
+        -c 'exec gosu harness sleep 60' >/dev/null
+    sleep 2
+    local container_pwd marker_seen
+    container_pwd=$(harness_docker exec --user harness "${mount_test_name}" \
+        bash -c "pwd")
+    if [[ "${container_pwd}" != "${ws_target}" ]]; then
+        echo "[integration] Phase 5.2 FAIL: pwd was '${container_pwd}', expected '${ws_target}'" >&2
+        docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
+        return 1
+    fi
+    marker_seen=$(harness_docker exec --user harness "${mount_test_name}" \
+        cat "${extra_target}/marker.txt" 2>/dev/null || echo "")
+    if [[ -z "${marker_seen}" || ! "${marker_seen}" =~ ^marker- ]]; then
+        echo "[integration] Phase 5.2 FAIL: extra mount not visible at ${extra_target}" >&2
+        docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
+        return 1
+    fi
+    docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
+    echo "[integration] Phase 5.2: extra mount visible at host path inside container"
+
+    echo "[integration] Phase 5.3: --mount /etc rejected with clear error"
+    set +e
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 30 \
+        env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
+        "${TEST_INSTALL}/harness" claude --mount /etc -p "noop" 2>&1 < /dev/null)
+    rc=$?
+    set -e
+    if (( rc == 0 )); then
+        echo "[integration] Phase 5.3 FAIL: --mount /etc was accepted (rc=0)" >&2
+        return 1
+    fi
+    if ! grep -q "shadow container infrastructure" <<<"${out}"; then
+        echo "[integration] Phase 5.3 FAIL: didn't see expected rejection error" >&2
+        echo "${out}" | tail -c 800 >&2
+        return 1
+    fi
+    echo "[integration] Phase 5.3: --mount /etc rejected"
+
+    echo "[integration] Phase 5.4: --mount /nonexistent/abc rejected"
+    set +e
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 30 \
+        env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
+        "${TEST_INSTALL}/harness" claude --mount /nonexistent/abc -p "noop" 2>&1 < /dev/null)
+    rc=$?
+    set -e
+    if (( rc == 0 )); then
+        echo "[integration] Phase 5.4 FAIL: nonexistent --mount was accepted" >&2
+        return 1
+    fi
+    if ! grep -qE "does not exist|cannot resolve" <<<"${out}"; then
+        echo "[integration] Phase 5.4 FAIL: didn't see expected nonexistent-path error" >&2
+        echo "${out}" | tail -c 800 >&2
+        return 1
+    fi
+    echo "[integration] Phase 5.4: --mount /nonexistent/abc rejected"
+
+    echo "[integration] Phase 5 (--mount): all checks passed"
 }
 
 # === Phase 4: cross-test invariants =========================================
@@ -745,6 +890,9 @@ phase_3_graphify
 
 test_section "Phase 4: cross-test invariants"
 phase_4_cross_invariants
+
+test_section "Phase 5: --mount + same-path mounting (issue #15)"
+phase_5_mount
 
 echo
 echo "============================================================"

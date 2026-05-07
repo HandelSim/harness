@@ -127,7 +127,10 @@ ENV PATH="/home/harness/.local/bin:${PATH}"
 COPY agents/entrypoint.sh /usr/local/bin/agent-entrypoint.sh
 RUN chmod +x /usr/local/bin/agent-entrypoint.sh
 
-WORKDIR /workspace
+# No WORKDIR. The harness CLI passes -w pointing at the bind-mount target
+# (the host CWD path) on every launch, so the agent lands where the user
+# launched from. There is no /workspace anymore — the prior indirection
+# was replaced with same-path host-to-container mounts (see issue #15).
 
 # NO `USER harness` directive. The harness script invokes with --user 0:0
 # so the entrypoint can run firewall init (which needs NET_ADMIN/NET_RAW)

@@ -288,11 +288,58 @@ on first run.
 Report whether each step passed cleanly, and the contents of the marker
 check in step 6.
 
+## Scenario K': Same-path mounts and `--mount`
+
+> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh`
+> Phase 5 covers `pwd inside agent == host CWD`, `--mount` adds extras at
+> their host paths, and rejection of forbidden / nonexistent mounts.
+
+This scenario validates that the agent CWD is mounted at the host path
+(no `/workspace` indirection) and that `--mount` adds extra folders
+correctly.
+
+1. ```
+   mkdir -p /tmp/harness-manual-K1 && cd /tmp/harness-manual-K1
+   harness claude -p "Use bash to print: pwd; ls -la /workspace 2>&1; exit 0"
+   ```
+   Expected: model output mentions `/tmp/harness-manual-K1`. There should
+   be no `/workspace` directory inside the container.
+
+2. Set up an extra mount target with a marker file:
+   ```
+   mkdir -p /tmp/harness-manual-K2/extra
+   echo hello-from-K2 > /tmp/harness-manual-K2/extra/marker.txt
+   cd /tmp/harness-manual-K1
+   harness claude --mount /tmp/harness-manual-K2/extra -p "Use bash to: cat /tmp/harness-manual-K2/extra/marker.txt"
+   ```
+   Expected: `hello-from-K2` appears in the response.
+
+3. Try a rejected mount:
+   ```
+   harness claude --mount /etc -p "noop"
+   ```
+   Expected: non-zero exit, error mentions "shadow container infrastructure".
+
+4. Try a nonexistent mount:
+   ```
+   harness claude --mount /does/not/exist -p "noop"
+   ```
+   Expected: non-zero exit, error mentions "does not exist".
+
+5. Sticky default via `.env`:
+   - Add `HARNESS_EXTRA_MOUNTS=/tmp/harness-manual-K2/extra` to
+     `<install-root>/.env`.
+   - From any directory: `harness claude -p "Use bash to: ls /tmp/harness-manual-K2/extra"`.
+   - Expected: `marker.txt` listed.
+   - Remove the line afterward.
+
+Report whether each subcheck behaved as expected.
+
 ## Scenario K: Serena MCP
 
 > **Automated baseline:** `HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh`
 > covers Phase 2: install → restart → reachability on tcp://serena:9121 →
-> agent MCP-config side-file merge → workspace mount visibility → TUI
+> agent MCP-config side-file merge → CWD mount visibility → TUI
 > tool-call rendering → down/up cycle → disable/enable → uninstall. Run
 > that first; the steps below add interactive coverage against a real
 > upstream and your own project.

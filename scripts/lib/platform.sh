@@ -149,6 +149,81 @@ harness_docker_path() {
     fi
 }
 
+# Resolve a (possibly relative or unresolved) host path to an absolute,
+# canonical path in the form used INSIDE the agent container as a
+# bind-mount target. The whole point is path parity: `pwd` inside the
+# agent equals the host path the user typed.
+#
+#   Linux/macOS: /home/me/proj      → /home/me/proj
+#   Windows:     C:\Users\you\proj  → /c/Users/you/proj   (MSYS unix form)
+#                /c/Users/you/proj  → /c/Users/you/proj
+#
+# Mirrors harness_docker_path's job for the *source* side of `-v`, but
+# normalizes for the *target* side (always Linux-style — the container
+# is Linux). Args: <path>. Returns 1 if the path doesn't exist.
+harness_abs_path() {
+    local target="$1"
+    if [[ -z "$target" ]]; then
+        echo "harness_abs_path: missing arg" >&2
+        return 1
+    fi
+    local abs
+    abs=$(harness_realpath "$target") || return 1
+    if [[ "$(harness_detect_os)" == "windows" ]] && command -v cygpath >/dev/null 2>&1; then
+        # cygpath -u produces /c/Users/... regardless of input shape
+        # (C:\Users\..., C:/Users/..., /c/Users/...). MSYS unix form is
+        # the variant the user sees in Git Bash, so it's also what they
+        # expect to see inside the container.
+        abs=$(cygpath -u "$abs")
+    fi
+    echo "$abs"
+}
+
+# Validate a user-supplied --mount path. The path must resolve (relative
+# paths are accepted), must exist as a directory, and must not shadow
+# in-container infrastructure the harness depends on (/etc, /usr, the
+# harness home, etc.). On success, echoes the resolved absolute path
+# (same form harness_abs_path returns) on stdout. On failure, prints a
+# specific error to stderr and returns 1.
+#
+# Args: <path>
+harness_validate_mount() {
+    local raw="$1"
+    if [[ -z "$raw" ]]; then
+        echo "harness_validate_mount: --mount: missing path" >&2
+        return 1
+    fi
+    if [[ ! -e "$raw" ]]; then
+        echo "harness_validate_mount: --mount: path does not exist on host: $raw" >&2
+        return 1
+    fi
+    if [[ ! -d "$raw" ]]; then
+        echo "harness_validate_mount: --mount: path is not a directory: $raw" >&2
+        return 1
+    fi
+    local abs
+    abs=$(harness_abs_path "$raw") || {
+        echo "harness_validate_mount: --mount: cannot resolve absolute path: $raw" >&2
+        return 1
+    }
+    # Refuse paths whose container-side target would shadow infrastructure
+    # the agent image relies on (the harness user's home is bind-mounted
+    # separately; the firewall allowlist is bind-mounted at /etc/harness;
+    # / and the system dirs are obviously off-limits).
+    # shellcheck disable=SC2221,SC2222
+    # (Patterns are disjoint: `/etc` is the literal /etc, `/etc/*` is
+    #  anything under it. shellcheck flags them as overlapping but they're
+    #  not — verified by the integration test in scripts/integration_test.sh
+    #  Phase 5.3.)
+    case "$abs" in
+        /|/etc|/etc/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/var|/var/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/root|/root/*|/home/harness|/home/harness/*|/etc/harness|/etc/harness/*|/workspace|/workspace/*)
+            echo "harness_validate_mount: --mount: refusing '$abs' — would shadow container infrastructure" >&2
+            return 1
+            ;;
+    esac
+    echo "$abs"
+}
+
 # === Docker checks ===
 
 # Is the docker daemon running and accepting connections?

@@ -15,9 +15,11 @@
 #   HARNESS_YOLO=1              — claude: --dangerously-skip-permissions
 #                                 opencode: --agent yolo
 #   HARNESS_PRINT_MODE=1        — `harness <agent> -p ...` headless single-shot
-#   HARNESS_HOST_CWD=<path>     — host CWD; entrypoint symlinks it to /workspace
-#                                 so PWD inside the container reflects the host
-#                                 path (e.g. /c/Users/you/projects/myapp)
+#   HARNESS_HOST_CWD=<path>     — host CWD; the harness CLI bind-mounts the
+#                                 host CWD at this same absolute path inside
+#                                 the container, and the entrypoint cd's
+#                                 here so PWD matches the host path
+#                                 (e.g. /c/Users/you/projects/myapp).
 #   HARNESS_FIREWALL_DISABLED=1 — skip init-firewall.sh entirely
 #                                 (--net flag or `harness net open`)
 
@@ -74,24 +76,6 @@ if [[ "$(id -u)" == "0" ]]; then
         fi
     fi
 
-    # Create the host CWD symlink while still root. The harness user has no
-    # write permission at /, so this MUST happen before the gosu drop.
-    # (The cd into the symlinked path happens after the drop — see below;
-    # gosu re-execs the entrypoint and resets CWD.)
-    if [[ -n "${HARNESS_HOST_CWD:-}" && "${HARNESS_HOST_CWD}" != "/workspace" ]]; then
-        parent=$(dirname "${HARNESS_HOST_CWD}")
-        if [[ "$parent" != "/" && "$parent" != "." ]]; then
-            mkdir -p "$parent"
-        fi
-        ln -snf /workspace "${HARNESS_HOST_CWD}"
-        # Make the symlink owned by harness so the user can replace it
-        # later if needed (defense in depth — symlink ownership rarely
-        # matters for traversal but doesn't hurt). Best-effort.
-        if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
-            chown -h "${HOST_UID}:${HOST_GID}" "${HARNESS_HOST_CWD}" 2>/dev/null || true
-        fi
-    fi
-
     exec gosu harness "$0" "$@"
 fi
 
@@ -128,16 +112,13 @@ fi
 
 # --- change into host CWD path ----------------------------------------------
 #
-# The symlink itself was created above (still root, before the gosu drop).
-# Here we just cd into it so PWD reflects the host path (e.g.
-# /c/Users/you/projects/myapp) — claude-code's statusline picks it up,
-# and the user isn't confused when working with multiple projects. Both
-# /workspace and the host path resolve to the same files via the
-# symlink. cd failure is non-fatal (we fall back to /workspace).
-if [[ -n "${HARNESS_HOST_CWD:-}" && "${HARNESS_HOST_CWD}" != "/workspace" ]]; then
-    if [[ -L "${HARNESS_HOST_CWD}" ]]; then
-        cd "${HARNESS_HOST_CWD}" || cd /workspace
-    fi
+# The harness CLI bind-mounted the host CWD at this same absolute path and
+# set --workdir to it; cd is mostly a belt-and-braces since gosu's re-exec
+# inherits cwd, but it ensures any direct test invocations (which may not
+# pass --workdir) still land here. Failure is non-fatal: if HARNESS_HOST_CWD
+# isn't a real directory we just stay in whatever cwd we inherited.
+if [[ -n "${HARNESS_HOST_CWD:-}" && -d "${HARNESS_HOST_CWD}" ]]; then
+    cd "${HARNESS_HOST_CWD}" || true
 fi
 
 # --- mode dispatch ----------------------------------------------------------
