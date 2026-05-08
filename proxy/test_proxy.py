@@ -919,5 +919,99 @@ class TestChangeSystemToUser(unittest.TestCase):
                 self.assertIn("Block 2", result[0]["content"])
 
 
+class TestUsageOverride(unittest.TestCase):
+    """The proxy must override upstream's prompt_tokens with a local estimate
+    of the translated conversation. Some upstreams truncate server-side and
+    only count what they actually sent to the model, so their prompt_tokens
+    does not grow monotonically with the agent's conversation length and is
+    unusable for context tracking. completion_tokens is left to upstream
+    when present."""
+
+    def _fake_upstream_response(self, prompt_tokens, completion_tokens, content):
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return {
+                    "choices": [{"message": {"content": content}}],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                    },
+                }
+
+        return FakeResp()
+
+    def test_prompt_tokens_overridden_with_local_estimate(self):
+        long_user_msg = "x" * 4000  # ~1000 tokens at the chars/4 estimate
+        ollama_request = {
+            "model": "GenAI",
+            "messages": [
+                {"role": "user", "content": long_user_msg},
+            ],
+            "stream": False,
+        }
+
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post") as mock_post:
+            mock_post.return_value = self._fake_upstream_response(
+                prompt_tokens=5,
+                completion_tokens=11,
+                content="ok",
+            )
+            with patch.object(proxy, "save_debug_file"):
+                resp = client.post(
+                    "/api/chat",
+                    data=json.dumps(ollama_request),
+                    content_type="application/json",
+                )
+
+        self.assertEqual(resp.status_code, 200)
+        lines = [line for line in resp.get_data(as_text=True).split("\n") if line.strip()]
+        self.assertTrue(lines)
+        done_chunk = json.loads(lines[-1])
+        self.assertTrue(done_chunk.get("done"))
+        # Upstream said 5; the proxy must report a much larger count derived
+        # from the translated conversation, which contains the 4000-char user
+        # message plus cooperative-prompt scaffolding and markers.
+        self.assertGreater(done_chunk["prompt_eval_count"], 100)
+        self.assertNotEqual(done_chunk["prompt_eval_count"], 5)
+        # completion_tokens passes through from upstream when present.
+        self.assertEqual(done_chunk["eval_count"], 11)
+
+    def test_completion_tokens_falls_back_to_estimate_when_missing(self):
+        """When upstream omits completion_tokens, fall back to local estimate.
+        prompt_tokens still always overridden."""
+        ollama_request = {
+            "model": "GenAI",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return {
+                    "choices": [{"message": {"content": "y" * 400}}],
+                    "usage": {"prompt_tokens": 1},
+                }
+
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post") as mock_post:
+            mock_post.return_value = FakeResp()
+            with patch.object(proxy, "save_debug_file"):
+                resp = client.post(
+                    "/api/chat",
+                    data=json.dumps(ollama_request),
+                    content_type="application/json",
+                )
+
+        self.assertEqual(resp.status_code, 200)
+        lines = [line for line in resp.get_data(as_text=True).split("\n") if line.strip()]
+        done_chunk = json.loads(lines[-1])
+        self.assertGreater(done_chunk["eval_count"], 50)
+
+
 if __name__ == "__main__":
     unittest.main()

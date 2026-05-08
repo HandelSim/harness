@@ -807,7 +807,7 @@ def catch_all(path: str) -> Response:
         ollama_request = request.get_json(silent=True) or {}
         save_debug_file(req_id, "01", "Ollama_Request", ollama_request)
 
-        model_name = ollama_request.get("model") or "harness"
+        model_name = ollama_request.get("model") or "GenAI"
         original_messages = ollama_request.get("messages") or []
         tools = ollama_request.get("tools") or []
 
@@ -874,15 +874,23 @@ def catch_all(path: str) -> Response:
         response_text = extract_assistant_content(target_json)
         tool_call_payloads, clean_text = extract_tool_calls_and_text(response_text)
 
-        usage = target_json.get("usage") or {}
-        # If usage missing fields, estimate from joined inputs/outputs.
-        if not usage.get("prompt_tokens"):
-            joined = "\n".join(m.get("content", "") for m in translated)
-            usage = dict(usage)
-            usage["prompt_tokens"] = _estimate_tokens(joined)
-        if not usage.get("completion_tokens"):
-            usage = dict(usage)
-            usage["completion_tokens"] = _estimate_tokens(response_text)
+        # Compute prompt_tokens from the translated conversation directly.
+        # Upstream's `prompt_tokens` is unreliable for context tracking against
+        # this provider — observed behavior (count not growing monotonically with
+        # conversation length, occasionally shrinking) suggests server-side
+        # sliding-window truncation. The agent needs a count that reflects the
+        # full conversation it sent, not what the upstream charged for. Always
+        # estimate locally from the full translated array so the agent's context
+        # bar grows monotonically with conversation length.
+        joined = "\n".join(m.get("content", "") for m in translated)
+        upstream_usage = target_json.get("usage") or {}
+        usage = {
+            "prompt_tokens": _estimate_tokens(joined),
+            "completion_tokens": (
+                upstream_usage.get("completion_tokens")
+                or _estimate_tokens(response_text)
+            ),
+        }
 
         print(f"[{req_id}] upstream OK; emitting NDJSON (tool_calls={len(tool_call_payloads)})", flush=True)
 
