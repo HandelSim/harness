@@ -20,7 +20,7 @@ else
     echo "[entrypoint] WARN: init-firewall.sh missing; running without firewall" >&2
 fi
 
-MODEL_NAME="${OLLAMA_AGENT_MODEL:-harness}"
+MODEL_NAME="${OLLAMA_AGENT_MODEL:-GenAI}"
 CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-200000}"
 PROXY_PORT="${PROXY_PORT:-8000}"
 REMOTE_URL="http://proxy:${PROXY_PORT}"

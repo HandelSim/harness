@@ -196,7 +196,7 @@ ensure_opencode_config() {
     local config_file="${config_dir}/opencode.json"
     mkdir -p "$config_dir"
 
-    local model_name="${OLLAMA_AGENT_MODEL:-harness}"
+    local model_name="${OLLAMA_AGENT_MODEL:-GenAI}"
     local ollama_url="http://ollama:11434/v1"
 
     # Always (re)write the harness-managed provider/model/agent block —
@@ -215,7 +215,11 @@ ensure_opencode_config() {
       },
       "models": {
         "${model_name}": {
-          "name": "Harness Proxy"
+          "name": "Harness Proxy",
+          "limit": {
+            "context": 200000,
+            "output": 8192
+          }
         }
       }
     }
@@ -326,7 +330,7 @@ run_opencode() {
 
     echo "============================================================"
     echo " harness-agent (opencode)"
-    echo "   model:   harness/${OLLAMA_AGENT_MODEL:-harness}"
+    echo "   model:   harness/${OLLAMA_AGENT_MODEL:-GenAI}"
     echo "   ollama:  http://ollama:11434/v1"
     echo "   yolo:    ${HARNESS_YOLO:-0}"
     echo "   print:   ${HARNESS_PRINT_MODE:-0}"

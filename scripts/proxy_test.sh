@@ -225,8 +225,14 @@ A_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
 echo "[proxy-test]   A response: ${A_BODY}"
 echo "${A_BODY}" | grep -q "Hello from mock upstream" \
     || fail "A: response did not contain upstream content" "${A_BODY}"
-echo "${A_BODY}" | grep -q '"prompt_eval_count":42' \
-    || fail "A: prompt_eval_count != 42 (usage not propagated)" "${A_BODY}"
+# Note: prompt_eval_count no longer matches the upstream's reported
+# prompt_tokens — the proxy now overrides with a local estimate of the
+# translated conversation, so the value reflects what the agent actually
+# sent, not what the upstream charged. We assert it's present and
+# non-zero. eval_count (completion side) is still passed through from
+# upstream and should match the mock's hardcoded 7.
+echo "${A_BODY}" | grep -qE '"prompt_eval_count":[1-9][0-9]*' \
+    || fail "A: prompt_eval_count missing or zero" "${A_BODY}"
 echo "${A_BODY}" | grep -q '"eval_count":7' \
     || fail "A: eval_count != 7 (usage not propagated)" "${A_BODY}"
 echo "${A_BODY}" | grep -q '"done_reason":"stop"' \
