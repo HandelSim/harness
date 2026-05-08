@@ -1117,6 +1117,157 @@ if ! grep -q 'harness net allow' <<<"${pf_mm_out}"; then
 fi
 echo "[harness-test] T22 OK"
 
+# --- Test 23: update check is synchronous and tolerant of failure --------
+#
+# Issue #9: with the prior async-write-for-next-run design, an upstream
+# advance only became visible on the SECOND invocation after the advance.
+# The new helper does a bounded synchronous ls-remote so first-run drift
+# surfaces immediately, with the cache demoted to an offline fallback.
+# These cases exercise the helper in isolation by sourcing the harness
+# script with HARNESS_SOURCE_ONLY=1 and a synthetic install root pointed
+# at a real local git repo with a local-path origin (no network).
+
+echo "[harness-test] T23: update check (sync, fallback, skip)"
+
+UPD_ROOT="$(mktemp -d -t harness-upd-test.XXXXXX)"
+UPD_REMOTE="$(mktemp -d -t harness-upd-remote.XXXXXX)"
+cleanup_upd() {
+    if [[ -n "${UPD_ROOT:-}" && -d "${UPD_ROOT}" ]]; then rm -rf "${UPD_ROOT}"; fi
+    if [[ -n "${UPD_REMOTE:-}" && -d "${UPD_REMOTE}" ]]; then rm -rf "${UPD_REMOTE}"; fi
+}
+trap 'cleanup_upd; restore_agent_image; cleanup' EXIT INT TERM
+
+# Bare remote that the local checkout will use as origin. Local file path,
+# no network involved — `git ls-remote` against it succeeds in <100ms.
+git init --bare --initial-branch=main "${UPD_REMOTE}" >/dev/null
+
+# Local checkout: init, commit, push to bare remote.
+git init --initial-branch=main "${UPD_ROOT}" >/dev/null
+(
+    cd "${UPD_ROOT}"
+    git config user.email "harness-test@invalid.local"
+    git config user.name  "harness test"
+    echo a >a
+    git add a
+    git commit -q -m "initial"
+    git remote add origin "${UPD_REMOTE}"
+    git push -q origin main
+)
+
+# Advance the remote one commit ahead of the local checkout. Use a throw-
+# away clone so UPD_ROOT's local HEAD stays where it is.
+ADV="$(mktemp -d -t harness-upd-adv.XXXXXX)"
+git clone -q "${UPD_REMOTE}" "${ADV}"
+(
+    cd "${ADV}"
+    git config user.email "harness-test@invalid.local"
+    git config user.name  "harness test"
+    echo b >b
+    git add b
+    git commit -q -m "advance"
+    git push -q origin main
+)
+rm -rf "${ADV}"
+
+# T23.1 — first invocation (no cache) shows the banner and writes cache.
+if [[ -e "${UPD_ROOT}/state/.harness-update-check" ]]; then
+    echo "[harness-test] T23.1 FAIL: cache shouldn't exist before first run" >&2
+    exit 1
+fi
+upd_out_1=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${UPD_ROOT}" \
+        source "${HARNESS_BIN}" >/dev/null 2>&1
+    _update_check_and_banner 4 2>&1
+)
+if ! grep -q 'update available' <<<"${upd_out_1}"; then
+    echo "[harness-test] T23.1 FAIL: first run should show banner; got: ${upd_out_1}" >&2
+    exit 1
+fi
+if [[ ! -f "${UPD_ROOT}/state/.harness-update-check" ]]; then
+    echo "[harness-test] T23.1 FAIL: cache not written" >&2
+    exit 1
+fi
+echo "[harness-test] T23.1 OK"
+
+# T23.2 — HARNESS_SKIP_UPDATE_CHECK=1 suppresses the banner entirely.
+# The env-prefix syntax `VAR=val command` only sets the var for that one
+# command; we need it active when the helper runs, so `export` it inside
+# the subshell (matches the pattern used by gate_case in T0).
+upd_out_skip=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${UPD_ROOT}" \
+        source "${HARNESS_BIN}" >/dev/null 2>&1
+    export HARNESS_SKIP_UPDATE_CHECK=1
+    _update_check_and_banner 4 2>&1
+)
+if grep -q 'update available' <<<"${upd_out_skip}"; then
+    echo "[harness-test] T23.2 FAIL: HARNESS_SKIP_UPDATE_CHECK=1 should suppress banner" >&2
+    exit 1
+fi
+echo "[harness-test] T23.2 OK"
+
+# T23.3 — when origin is unreachable, fall back to cached value. Point
+# origin at a nonexistent local path; ls-remote fails fast with empty
+# stdout. Pre-seed the cache with a SHA that differs from local HEAD.
+(
+    cd "${UPD_ROOT}"
+    git remote set-url origin "/nonexistent/harness-upd-bad-$$"
+)
+echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" > "${UPD_ROOT}/state/.harness-update-check"
+upd_out_offline=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${UPD_ROOT}" \
+        source "${HARNESS_BIN}" >/dev/null 2>&1
+    _update_check_and_banner 4 2>&1
+)
+if ! grep -q 'update available' <<<"${upd_out_offline}"; then
+    echo "[harness-test] T23.3 FAIL: offline path should fall back to cached banner; got: ${upd_out_offline}" >&2
+    exit 1
+fi
+echo "[harness-test] T23.3 OK"
+
+# T23.4 — origin still unreachable, but cache absent: no banner, no error.
+# This is the case the user specifically asked us to defend: even when
+# the check yields nothing, the helper must return cleanly so callers can
+# continue past it.
+rm -f "${UPD_ROOT}/state/.harness-update-check"
+upd_rc=0
+upd_out_silent=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${UPD_ROOT}" \
+        source "${HARNESS_BIN}" >/dev/null 2>&1
+    _update_check_and_banner 4 2>&1
+) || upd_rc=$?
+if (( upd_rc != 0 )); then
+    echo "[harness-test] T23.4 FAIL: helper exited rc=${upd_rc}; should always succeed" >&2
+    exit 1
+fi
+if grep -q 'update available' <<<"${upd_out_silent}"; then
+    echo "[harness-test] T23.4 FAIL: no cache + offline should print no banner; got: ${upd_out_silent}" >&2
+    exit 1
+fi
+echo "[harness-test] T23.4 OK"
+
+# T23.5 — local HEAD == remote HEAD: no banner. Restore origin and pull
+# the missing commit so the local checkout matches.
+(
+    cd "${UPD_ROOT}"
+    git remote set-url origin "${UPD_REMOTE}"
+    git pull -q origin main
+)
+rm -f "${UPD_ROOT}/state/.harness-update-check"
+upd_out_uptodate=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${UPD_ROOT}" \
+        source "${HARNESS_BIN}" >/dev/null 2>&1
+    _update_check_and_banner 4 2>&1
+)
+if grep -q 'update available' <<<"${upd_out_uptodate}"; then
+    echo "[harness-test] T23.5 FAIL: up-to-date checkout should not show banner; got: ${upd_out_uptodate}" >&2
+    exit 1
+fi
+echo "[harness-test] T23.5 OK"
+
+cleanup_upd
+trap 'restore_agent_image; cleanup' EXIT INT TERM
+echo "[harness-test] T23 OK"
+
 echo "============================================================"
 echo " HARNESS TEST PASSED"
 echo "============================================================"

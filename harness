@@ -216,63 +216,65 @@ harness_jq() {
 
 # --- update-available banner ----------------------------------------------
 #
-# Cheap, non-blocking "is harness behind origin/main?" check. Two halves:
-#
-# - _check_for_update_async fires `git ls-remote` in a backgrounded subshell
-#   that writes the remote main HEAD into state/.harness-update-check. The
-#   parent does not wait — agent startup latency is unaffected.
-#
-# - _show_update_banner_if_pending reads that cache file (populated by the
-#   PRIOR invocation), compares to local HEAD, and prints a one-line banner
-#   to stderr if they differ. This gives "check on every invocation"
-#   semantics with zero blocking cost: drift detected by run N is surfaced
-#   at the start of run N+1.
+# Synchronous "is harness behind origin/main?" check with a tight timeout.
+# Runs `git ls-remote --heads origin main` in the foreground bounded by
+# $1 seconds (default 4); on success caches the remote HEAD into
+# state/.harness-update-check and prints a one-line banner to stderr if
+# remote != local. On timeout / failure (offline or no remote configured)
+# it falls back to the cached value from a prior successful run, so users
+# behind a flaky network still get a banner if drift was previously
+# detected. Either way the agent launch ALWAYS continues — this is
+# advisory output, not a gate.
 #
 # Skipped entirely when HARNESS_SKIP_UPDATE_CHECK=1, when not in a git
 # checkout, or when not on main (working from a feature branch shouldn't
 # nag the user about origin/main).
-_check_for_update_async() {
+#
+# Used by run_agent and cmd_shell at startup with the default 4s budget,
+# and by cmd_check_updates with a longer budget for an explicit foreground
+# check.
+_update_check_and_banner() {
     [[ "${HARNESS_SKIP_UPDATE_CHECK:-0}" == "1" ]] && return 0
     [[ -d "${install_root}/.git" ]] || return 0
     local branch
     branch=$(git -C "$install_root" symbolic-ref --short HEAD 2>/dev/null) || return 0
     [[ "$branch" == "main" ]] || return 0
-    # Fire and forget. Result lands in the cache file for the NEXT invocation.
-    (
-        local remote_head
-        remote_head=$(timeout 5 git -C "$install_root" ls-remote --heads origin main 2>/dev/null | awk '{print $1}')
-        if [[ -n "$remote_head" ]]; then
-            mkdir -p "${install_root}/state" 2>/dev/null
-            printf '%s\n' "$remote_head" >"${install_root}/state/.harness-update-check" 2>/dev/null
-        fi
-    ) &
-    # Detach so SIGHUP from the parent doesn't kill it before the write.
-    disown 2>/dev/null || true
-    return 0
-}
 
-_show_update_banner_if_pending() {
-    [[ "${HARNESS_SKIP_UPDATE_CHECK:-0}" == "1" ]] && return 0
+    local timeout_secs="${1:-4}"
     local cache="${install_root}/state/.harness-update-check"
-    [[ -f "$cache" ]] || return 0
-    [[ -d "${install_root}/.git" ]] || return 0
-    local branch
-    branch=$(git -C "$install_root" symbolic-ref --short HEAD 2>/dev/null) || return 0
-    [[ "$branch" == "main" ]] || return 0
-    local remote_head local_head
-    remote_head=$(cat "$cache" 2>/dev/null | tr -d '\r\n[:space:]')
-    local_head=$(git -C "$install_root" rev-parse HEAD 2>/dev/null)
-    [[ -n "$remote_head" && -n "$local_head" ]] || return 0
+    local local_head remote_head
+    local_head=$(git -C "$install_root" rev-parse HEAD 2>/dev/null) || return 0
+    [[ -n "$local_head" ]] || return 0
+
+    # Synchronous check, bounded so a flaky network can't stall agent
+    # startup. `timeout` exits 124 on the deadline, non-zero on other
+    # failures; either way we treat $remote_head as empty and fall back
+    # to the cache. `|| true` is required because the script runs under
+    # `set -euo pipefail` — without it, a failed ls-remote (offline,
+    # missing remote, timeout) would propagate out of the pipeline and
+    # abort the agent launch.
+    remote_head=$(timeout "$timeout_secs" git -C "$install_root" ls-remote --heads origin main 2>/dev/null | awk '{print $1}' || true)
+    if [[ -n "$remote_head" ]]; then
+        mkdir -p "${install_root}/state" 2>/dev/null
+        printf '%s\n' "$remote_head" >"$cache" 2>/dev/null
+    elif [[ -f "$cache" ]]; then
+        # Offline / lookup failed — fall back to the last value we saw.
+        remote_head=$(tr -d '\r\n[:space:]' <"$cache" 2>/dev/null)
+    fi
+    [[ -n "$remote_head" ]] || return 0
     [[ "$remote_head" == "$local_head" ]] && return 0
+
     # ANSI green (32) + bold (1), reset at end. Bold green stands out against
     # most terminal themes (light + dark) and isn't reserved for errors.
     printf '\033[1;32m[harness] update available; run '\''harness upgrade'\'' to update\033[0m\n' >&2
+    return 0
 }
 
-# Synchronous variant of the above for `harness check-updates`. Performs
-# the ls-remote in the foreground, populates the cache file, and prints
-# either "up to date" or the same banner. Useful for CI, and for users who
-# want to force a fresh check without launching an agent.
+# `harness check-updates`: explicit foreground check. Reuses the same
+# helper with a longer timeout, then prints an additional "up to date"
+# message when there's no banner to show. Errors out only when we're not
+# in a git checkout — being offline isn't fatal here either, just
+# reported.
 cmd_check_updates() {
     if [[ ! -d "${install_root}/.git" ]]; then
         err "not a git checkout (no $install_root/.git); update check unavailable"
@@ -284,16 +286,17 @@ cmd_check_updates() {
         echo "[harness] not on main (current: ${branch:-detached}); skipping update check"
         return 0
     fi
-    local remote_head
-    remote_head=$(timeout 10 git -C "$install_root" ls-remote --heads origin main 2>/dev/null | awk '{print $1}')
+    local local_head remote_head
+    local_head=$(git -C "$install_root" rev-parse HEAD 2>/dev/null)
+    # `|| true` defends against pipefail aborting on offline / missing
+    # remote — we want the empty-stdout path below to handle it cleanly.
+    remote_head=$(timeout 10 git -C "$install_root" ls-remote --heads origin main 2>/dev/null | awk '{print $1}' || true)
     if [[ -z "$remote_head" ]]; then
         err "could not reach origin/main (offline, or no remote configured)"
         return 1
     fi
     mkdir -p "${install_root}/state" 2>/dev/null
     printf '%s\n' "$remote_head" >"${install_root}/state/.harness-update-check" 2>/dev/null
-    local local_head
-    local_head=$(git -C "$install_root" rev-parse HEAD 2>/dev/null)
     if [[ "$remote_head" == "$local_head" ]]; then
         echo "[harness] up to date with origin/main ($(echo "$local_head" | cut -c1-7))"
         return 0
@@ -1474,11 +1477,12 @@ run_agent() {
     ensure_services_up
     ensure_dirs
 
-    # Surface any drift detected by the prior invocation (file read + a
-    # couple of git rev-parses; <10ms), then kick off a fresh background
-    # check whose result the NEXT invocation will read.
-    _show_update_banner_if_pending
-    _check_for_update_async
+    # Synchronous bounded check (4s) so "update available" surfaces on the
+    # first invocation that sees drift, not the run after it. On timeout or
+    # network failure this falls back to a cached value and continues —
+    # never blocks the launch. The trailing `|| true` is a hard guarantee
+    # that nothing inside the helper can ever abort agent launch via set -e.
+    _update_check_and_banner 4 || true
 
     # Persistent agent firewall override: `harness net open agent` writes
     # an `agent` entry to .harness-net-overrides.json. Honor it here so
@@ -1821,9 +1825,9 @@ cmd_shell() {
         exit 1
     fi
 
-    # Same banner + async refresh as run_agent; see _check_for_update_async.
-    _show_update_banner_if_pending
-    _check_for_update_async
+    # Same banner as run_agent; see _update_check_and_banner. `|| true`
+    # ensures the helper can never abort shell launch via set -e.
+    _update_check_and_banner 4 || true
 
     local image
     image=$(agent_image)
