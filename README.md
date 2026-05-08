@@ -498,6 +498,34 @@ calculator package (Calculator, ScientificCalculator, ExpressionParser, an
 exception hierarchy, and pytest tests) that gives both Serena and Graphify
 a non-trivial multi-module symbol graph to chew on.
 
+### Continuous integration
+
+Every push to `dev` (and `main`) and every PR targeting either branch
+runs `.github/workflows/ci.yml`. Jobs run fully in parallel
+(`fail-fast: false`) so one failure doesn't mask another:
+
+- `lint` — `bash -n` + `check_runtime_calls.sh` + advisory `shellcheck`.
+- `unit` — `upgrade_test.sh`.
+- `docker / <name>` — matrix over `harness_test`, `proxy_test`,
+  `persistence_test`, `mcp_test`, `firewall_test`.
+- `pipeline` — `full_pipeline_test.sh`.
+- `integration` — `HARNESS_RUN_SLOW=1 integration_test.sh`.
+
+`podman_smoke_test.sh` is not run in CI (no podman on
+`ubuntu-latest`); run it manually on Linux when touching the runtime
+wrapper. The interactive scenarios in `MANUAL_TEST_PROMPT.md` also stay
+manual.
+
+A new push to `dev` cancels any in-flight CI run for that branch
+(`cancel-in-progress: true`) so we don't waste minutes on stale commits.
+
+When CI fails on `dev`, `.github/workflows/ci-failure-claude.yml`
+finds-or-creates an issue titled `CI failure on dev: <sha-7>`,
+appends the failed-step logs as a comment, and (up to 5 attempts per
+SHA) directly invokes the Claude auto-fix loop per the
+"When triggered by a CI failure" section of `CLAUDE.md`. CI failures
+do not roll `dev` back.
+
 ### Test toolkits
 
 `scripts/lib/` ships sourceable bash libraries shared across tests:
