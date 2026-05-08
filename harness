@@ -168,22 +168,24 @@ harness_jq() {
     fi
 
     # Host jq missing. Fall back to the proxy container.
-    if ! command -v docker >/dev/null 2>&1; then
+    local rt
+    rt=$(harness_container_runtime)
+    if ! command -v "$rt" >/dev/null 2>&1; then
         echo "harness: jq is required but not installed on the host," >&2
-        echo "harness: and Docker isn't installed either as a fallback." >&2
-        echo "harness: install Docker (which harness already requires) or" >&2
+        echo "harness: and the container runtime ($rt) isn't installed either as a fallback." >&2
+        echo "harness: install $rt (which harness already requires) or" >&2
         echo "harness: install jq via your package manager." >&2
         return 1
     fi
 
-    if ! docker info >/dev/null 2>&1; then
+    if ! harness_docker info >/dev/null 2>&1; then
         echo "harness: jq is required but not installed on the host," >&2
-        echo "harness: and the Docker daemon isn't running for the fallback." >&2
-        echo "harness: start Docker Desktop / the docker daemon and retry." >&2
+        echo "harness: and the $rt runtime isn't reachable for the fallback." >&2
+        echo "harness: start the $rt runtime and retry." >&2
         return 1
     fi
 
-    if ! docker image inspect harness-proxy:latest >/dev/null 2>&1; then
+    if ! harness_docker image inspect harness-proxy:latest >/dev/null 2>&1; then
         echo "harness: jq isn't installed on the host. Falling back to the" >&2
         echo "harness: proxy container's jq, but its image isn't built yet." >&2
         echo "harness: building harness-proxy:latest now (one-time, ~2-5 minutes)..." >&2
@@ -206,9 +208,9 @@ harness_jq() {
     if (( n > 0 )) && [[ -f "${args[n-1]}" ]]; then
         local file="${args[n-1]}"
         unset 'args[n-1]'
-        docker run --rm -i --entrypoint jq harness-proxy:latest "${args[@]}" <"$file"
+        harness_docker run --rm -i --entrypoint jq harness-proxy:latest "${args[@]}" <"$file"
     else
-        docker run --rm -i --entrypoint jq harness-proxy:latest "$@"
+        harness_docker run --rm -i --entrypoint jq harness-proxy:latest "$@"
     fi
 }
 
@@ -300,19 +302,22 @@ cmd_check_updates() {
     return 0
 }
 
-# Ensure the docker daemon is reachable; auto-start Docker Desktop on
-# Windows / macOS if we can. Hard exit with a helpful message otherwise.
-# Delegates to platform.sh:harness_require_docker when the library is
-# available; falls back to the original probe-only check if not.
+# Ensure the container runtime (docker or podman) is reachable; auto-start
+# Docker Desktop / podman machine on Windows / macOS if we can. Hard exit
+# with a helpful message otherwise. Delegates to
+# platform.sh:harness_require_docker when the library is available; falls
+# back to the original probe-only check if not.
 require_docker() {
     if declare -f harness_require_docker >/dev/null 2>&1; then
         harness_require_docker
         return 0
     fi
-    if ! docker info >/dev/null 2>&1; then
-        err "docker daemon is not reachable; is it running?"
-        exit 1
+    # Fallback when platform.sh wasn't sourced — try docker first, then podman.
+    if docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1; then
+        return 0
     fi
+    err "container runtime (docker or podman) is not reachable; is it running?"
+    exit 1
 }
 
 # Validate runtime configuration (.env presence, required vars) before
@@ -515,13 +520,18 @@ write_runtime_override() {
     } >"$runtime_override"
 }
 
-# Wrap docker compose with all the args we always pass. INSTALL_ROOT,
-# HARNESS_ALLOWLIST_PATH, and HARNESS_PROJECTS_ROOT are exported so MCP
-# compose snippets can reference them via plain ${VAR} (no defaults). The
-# fallback for HARNESS_PROJECTS_ROOT is computed here in bash rather than
-# in YAML because docker compose's interpolation parser doesn't reliably
-# resolve nested defaults like ${A:-${B}} — keeping compose snippets to
-# single-level ${VAR} references avoids that whole class of bug.
+# Wrap `<runtime> compose` with all the args we always pass. The runtime is
+# either `docker` or `podman` (see scripts/lib/platform.sh:harness_container_runtime).
+# Both runtimes accept `compose` as a subcommand: docker uses its compose v2
+# plugin, podman 4.x+ ships a built-in `podman compose` that delegates to
+# docker-compose / podman-compose under the hood.
+#
+# INSTALL_ROOT, HARNESS_ALLOWLIST_PATH, and HARNESS_PROJECTS_ROOT are exported
+# so MCP compose snippets can reference them via plain ${VAR} (no defaults).
+# The fallback for HARNESS_PROJECTS_ROOT is computed here in bash rather than
+# in YAML because compose's interpolation parser doesn't reliably resolve
+# nested defaults like ${A:-${B}} — keeping compose snippets to single-level
+# ${VAR} references avoids that whole class of bug.
 compose() {
     write_runtime_override
     local args=(
@@ -552,7 +562,7 @@ compose() {
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
-        docker "${args[@]}" "$@"
+        harness_docker "${args[@]}" "$@"
 }
 
 # Best-effort check: are ollama and proxy both running for this project?
@@ -561,8 +571,8 @@ services_up() {
     ollama_id=$(compose ps -q ollama 2>/dev/null || true)
     proxy_id=$(compose ps -q proxy 2>/dev/null || true)
     [[ -n "$ollama_id" && -n "$proxy_id" ]] || return 1
-    docker inspect -f '{{.State.Running}}' "$ollama_id" 2>/dev/null | grep -q '^true$' || return 1
-    docker inspect -f '{{.State.Running}}' "$proxy_id"  2>/dev/null | grep -q '^true$' || return 1
+    harness_docker inspect -f '{{.State.Running}}' "$ollama_id" 2>/dev/null | grep -q '^true$' || return 1
+    harness_docker inspect -f '{{.State.Running}}' "$proxy_id"  2>/dev/null | grep -q '^true$' || return 1
     return 0
 }
 
@@ -932,8 +942,8 @@ cmd_start() {
         echo
         echo "To diagnose, run:"
         echo "  harness preflight                   # validates configuration"
-        echo "  docker logs harness-proxy-1         # what the proxy printed on startup"
-        echo "  docker logs harness-ollama-1        # what ollama printed on startup"
+        echo "  $(harness_container_runtime) logs harness-proxy-1         # what the proxy printed on startup"
+        echo "  $(harness_container_runtime) logs harness-ollama-1        # what ollama printed on startup"
         return $up_rc
     fi
 }
@@ -947,20 +957,20 @@ cmd_down() {
     # network in use, blocking compose's network teardown and forcing the
     # user to clean up by hand.
     local agent_cids
-    agent_cids=$(docker ps -q \
+    agent_cids=$(harness_docker ps -q \
         --filter "label=harness.project=$project_name" \
         --filter "label=harness.agent=true" 2>/dev/null)
     if [[ -n "$agent_cids" ]]; then
         local agent_names
-        agent_names=$(docker ps \
+        agent_names=$(harness_docker ps \
             --filter "label=harness.project=$project_name" \
             --filter "label=harness.agent=true" \
             --format '{{.Names}}' | tr '\n' ' ')
         echo "[harness] stopping agent containers: $agent_names"
         # shellcheck disable=SC2086
-        docker stop $agent_cids >/dev/null 2>&1 || true
+        harness_docker stop $agent_cids >/dev/null 2>&1 || true
         # shellcheck disable=SC2086
-        docker rm -f $agent_cids >/dev/null 2>&1 || true
+        harness_docker rm -f $agent_cids >/dev/null 2>&1 || true
     fi
 
     compose down "$@"
@@ -1541,7 +1551,7 @@ run_agent() {
     # behavior pre-13a where `harness start` was the only build path.
     # `harness <tool>` is the natural first command users try; auto-build
     # avoids the "no, you have to run start first" dance.
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if ! harness_docker image inspect "$image" >/dev/null 2>&1; then
         echo "harness: building $image (one-time)..."
         compose --profile agent build agent || {
             err "agent image build failed; cannot launch $tool"
@@ -1631,7 +1641,7 @@ run_agent_interactive() {
     # Already running for this dir+tool? Refuse — there's no reattach now,
     # so a duplicate would either compete for the TTY or just die in the
     # background. Stop the existing one first.
-    if [[ -n "$(docker ps -q -f "name=^${cname}$" 2>/dev/null)" ]]; then
+    if [[ -n "$(harness_docker ps -q -f "name=^${cname}$" 2>/dev/null)" ]]; then
         err "$tool agent already running here ($cname)"
         err "stop it first with 'harness stop $cname' (or 'harness stop' for a picker)"
         exit 1
@@ -1639,7 +1649,7 @@ run_agent_interactive() {
 
     # Clean up any stopped container with the same name (e.g. previous run
     # that exited but wasn't removed). Ignore errors.
-    docker rm "$cname" >/dev/null 2>&1 || true
+    harness_docker rm "$cname" >/dev/null 2>&1 || true
 
     # --user 0:0 overrides the image's USER harness directive so the
     # entrypoint can remap the harness uid/gid to the host caller before
@@ -1821,7 +1831,7 @@ cmd_shell() {
 
     local image
     image=$(agent_image)
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if ! harness_docker image inspect "$image" >/dev/null 2>&1; then
         echo "harness: building $image (one-time)..."
         compose --profile agent build agent || {
             err "agent image build failed; cannot launch shell"
@@ -1864,7 +1874,7 @@ cmd_shell() {
     fi
 
     local network="${project_name}_harness-net"
-    if ! docker network inspect "$network" >/dev/null 2>&1; then
+    if ! harness_docker network inspect "$network" >/dev/null 2>&1; then
         # Network doesn't exist (services never started). Use the default
         # bridge — the shell doesn't need to talk to ollama or the proxy.
         network="bridge"
@@ -1924,7 +1934,7 @@ cmd_shell() {
 cmd_list() {
     require_docker
     local rows
-    rows=$(docker ps \
+    rows=$(harness_docker ps \
         --filter "label=harness.agent=true" \
         --format '{{.Names}}\t{{.Label "harness.tool"}}\t{{.Label "harness.mount"}}\t{{.RunningFor}}')
     if [[ -z "$rows" ]]; then
@@ -1939,7 +1949,7 @@ cmd_list() {
 
 # List all running harness agents, returns lines: <name>\t<tool>\t<mount>.
 list_agents_raw() {
-    docker ps \
+    harness_docker ps \
         --filter "label=harness.agent=true" \
         --format '{{.Names}}\t{{.Label "harness.tool"}}\t{{.Label "harness.mount"}}'
 }
@@ -1990,8 +2000,8 @@ cmd_stop() {
         fi
     fi
 
-    docker stop "$target" >/dev/null
-    docker rm "$target" >/dev/null 2>&1 || true
+    harness_docker stop "$target" >/dev/null
+    harness_docker rm "$target" >/dev/null 2>&1 || true
     echo "stopped: $target"
 }
 
@@ -2043,8 +2053,8 @@ mcp_runtime_status() {
     local name="$1"
     local compose_file="$mcp_active_dir/$name/compose.yml"
     [[ -f "$compose_file" ]] || { printf -- '-'; return; }
-    if ! docker info >/dev/null 2>&1; then
-        printf -- 'docker-down'; return
+    if ! harness_docker info >/dev/null 2>&1; then
+        printf -- 'runtime-down'; return
     fi
     # Pull the first service name out of the compose snippet. Naive YAML —
     # the snippet shape is constrained (we control the registry) so this is
@@ -2071,8 +2081,8 @@ mcp_runtime_status() {
         return
     fi
     local running health
-    running=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || echo "")
-    health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo "")
+    running=$(harness_docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || echo "")
+    health=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo "")
     if [[ "$running" != "true" ]]; then
         printf 'stopped'
         return
@@ -2237,7 +2247,7 @@ mcp_services_of() {
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
-        docker compose -f "$compose_file" --profile mcp config --services 2>/dev/null || true
+        harness_docker compose -f "$compose_file" --profile mcp config --services 2>/dev/null || true
 }
 
 # install: registry -> active tree. Default state is enabled.
@@ -2448,7 +2458,7 @@ cmd_mcp_uninstall() {
     # via `compose config --services` (--profile mcp required to see them)
     # and `compose rm -sf` each one through the full project compose so we
     # don't disturb the core services or other MCPs.
-    if [[ -f "$dest/compose.yml" ]] && docker info >/dev/null 2>&1; then
+    if [[ -f "$dest/compose.yml" ]] && harness_docker info >/dev/null 2>&1; then
         local svc
         while IFS= read -r svc; do
             [[ -z "$svc" ]] && continue
@@ -2591,7 +2601,7 @@ cmd_mcp_up() {
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
-        docker "${args[@]}"
+        harness_docker "${args[@]}"
     echo "up: $name"
 }
 
@@ -2642,7 +2652,7 @@ cmd_mcp_down() {
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
-        docker "${args[@]}" 2>/dev/null || true
+        harness_docker "${args[@]}" 2>/dev/null || true
     echo "down: $name"
 }
 
@@ -2692,7 +2702,7 @@ cmd_mcp_logs() {
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
-        exec docker "${args[@]}"
+        harness_docker_exec "${args[@]}"
 }
 
 # status: per-MCP diagnostic. No exit code on warnings; the user is asking
@@ -2786,7 +2796,9 @@ cmd_mcp() {
 # the firewall for the `agent` service propagates onto every subsequent
 # `harness <agent>` launch via the runtime override file.
 net_known_services() {
-    if ! command -v docker >/dev/null 2>&1; then
+    local rt
+    rt=$(harness_container_runtime)
+    if ! command -v "$rt" >/dev/null 2>&1; then
         printf '%s\n' proxy ollama agent
         return 0
     fi
@@ -3119,9 +3131,9 @@ cmd_claude_statusline_config() {
     ensure_dirs
     local image
     image=$(agent_image)
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if ! harness_docker image inspect "$image" >/dev/null 2>&1; then
         # Build the image without starting the rest of the stack. We use
-        # `docker compose build` so the agent profile/path resolution matches
+        # `compose build` so the agent profile/path resolution matches
         # `harness start` exactly.
         echo "harness: building $image (one-time)..."
         compose --profile agent build agent
@@ -3140,7 +3152,7 @@ cmd_claude_statusline_config() {
 
     # If the network doesn't exist (services have never been started), use
     # bridge — the configurator still works without ollama/proxy reachability.
-    if ! docker network inspect "$network" >/dev/null 2>&1; then
+    if ! harness_docker network inspect "$network" >/dev/null 2>&1; then
         network="bridge"
     fi
 
@@ -3251,7 +3263,7 @@ doctor_health_of() {
         printf 'absent'
         return
     fi
-    docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || printf 'unknown'
+    harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || printf 'unknown'
 }
 
 cmd_doctor() {
@@ -3260,18 +3272,20 @@ cmd_doctor() {
 
     # ---------------- [deps] ----------------
     doctor_section deps
-    if docker info >/dev/null 2>&1; then
-        doctor_check ok "docker daemon" "reachable"
+    local rt
+    rt=$(harness_container_runtime)
+    if harness_docker info >/dev/null 2>&1; then
+        doctor_check ok "$rt runtime" "reachable"
     else
-        doctor_check fail "docker daemon" "not reachable; is the daemon running?"
+        doctor_check fail "$rt runtime" "not reachable; is it running?"
     fi
 
-    if docker compose version >/dev/null 2>&1; then
+    if harness_docker compose version >/dev/null 2>&1; then
         local v
-        v=$(docker compose version 2>/dev/null | head -1)
-        doctor_check ok "docker compose" "${v}"
+        v=$(harness_docker compose version 2>/dev/null | head -1)
+        doctor_check ok "$rt compose" "${v}"
     else
-        doctor_check fail "docker compose" "v2 not available"
+        doctor_check fail "$rt compose" "compose subcommand not available"
     fi
 
     if command -v git >/dev/null 2>&1; then
@@ -3438,7 +3452,7 @@ cmd_doctor() {
     doctor_section runtime
     local network="${project_name}_harness-net"
     local network_ok=0
-    if docker network inspect "$network" >/dev/null 2>&1; then
+    if harness_docker network inspect "$network" >/dev/null 2>&1; then
         doctor_check ok "network" "$network"
         network_ok=1
     else
@@ -3509,7 +3523,7 @@ cmd_doctor() {
         "harness-proxy:latest" \
         "harness-agent:latest"
     do
-        if docker image inspect "$img" >/dev/null 2>&1; then
+        if harness_docker image inspect "$img" >/dev/null 2>&1; then
             doctor_check ok "$(printf '%s' "$img" | cut -d: -f1)" "$img present"
         else
             doctor_check warn "$(printf '%s' "$img" | cut -d: -f1)" "$img missing — run 'harness start' to build"
@@ -3554,7 +3568,7 @@ cmd_doctor() {
     # ---------------- [agents] --------------
     doctor_section agents
     local running
-    running=$(docker ps --filter "label=harness.agent=true" --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
+    running=$(harness_docker ps --filter "label=harness.agent=true" --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
     doctor_check ok "running" "${running} agent container(s)"
 
     # ---------------- summary ---------------
@@ -3577,22 +3591,29 @@ cmd_preflight() {
     local errors=0
     echo "[harness] preflight..."
 
-    # Daemon (with auto-start attempt on Win/Mac via platform.sh)
+    # Container runtime (docker/podman) with auto-start attempt on Win/Mac
+    # via platform.sh
+    local rt
+    if declare -f harness_container_runtime >/dev/null 2>&1; then
+        rt=$(harness_container_runtime)
+    else
+        rt="docker"
+    fi
     if declare -f harness_docker_running >/dev/null 2>&1 && harness_docker_running; then
-        echo "  ✓ docker daemon"
+        echo "  ✓ $rt runtime"
     elif declare -f harness_docker_running >/dev/null 2>&1; then
-        echo "  - docker daemon not running; attempting auto-start..."
+        echo "  - $rt runtime not reachable; attempting auto-start..."
         if harness_start_docker_desktop; then
-            echo "  ✓ docker daemon (started)"
+            echo "  ✓ $rt runtime (started)"
         else
-            echo "  ✗ docker daemon not available"
+            echo "  ✗ $rt runtime not available"
             errors=$((errors+1))
         fi
     else
-        if docker info >/dev/null 2>&1; then
-            echo "  ✓ docker daemon"
+        if docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1; then
+            echo "  ✓ container runtime"
         else
-            echo "  ✗ docker daemon not running"
+            echo "  ✗ container runtime not running"
             errors=$((errors+1))
         fi
     fi
@@ -3663,9 +3684,9 @@ cmd_preflight() {
     # `docker compose ps <service>` errors if the project has no compose
     # file context (e.g., running preflight against a never-started
     # install).
-    if docker info >/dev/null 2>&1; then
+    if harness_docker info >/dev/null 2>&1; then
         local proxy_status=""
-        proxy_status=$( { docker compose --project-name "$project_name" ps proxy --format '{{.Status}}' 2>/dev/null || true; } | head -1 )
+        proxy_status=$( { harness_docker compose --project-name "$project_name" ps proxy --format '{{.Status}}' 2>/dev/null || true; } | head -1 )
         if [[ -n "$proxy_status" ]]; then
             echo "  ⓘ proxy: $proxy_status"
         else

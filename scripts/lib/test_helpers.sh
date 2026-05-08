@@ -32,10 +32,12 @@ export HARNESS_NET_CONFIRM=1
 
 # --- preflight --------------------------------------------------------------
 
-# Verify docker daemon is reachable. Exits 1 with a clear message if not.
+# Verify the container runtime (docker or podman) is reachable. Exits 1 with
+# a clear message if not. Despite the historical name, this respects
+# HARNESS_CONTAINER_RUNTIME and auto-detection from platform.sh.
 require_docker() {
-    if ! docker info >/dev/null 2>&1; then
-        echo "[test-helpers] ERROR: docker daemon is not reachable" >&2
+    if ! harness_docker info >/dev/null 2>&1; then
+        echo "[test-helpers] ERROR: container runtime ($(harness_container_runtime)) is not reachable" >&2
         exit 1
     fi
 }
@@ -175,7 +177,7 @@ test_start_mockupstream() {
 
     # Defensive: drop a stale container with the same name so the run -d
     # below doesn't fail with "container name already in use".
-    docker rm -f "$cname" >/dev/null 2>&1 || true
+    harness_docker rm -f "$cname" >/dev/null 2>&1 || true
 
     local mock_py_host fixtures_host
     mock_py_host=$(harness_docker_path "$REPO_ROOT/scripts/mock_upstream.py")
@@ -209,14 +211,14 @@ test_wait_for_container_healthy() {
     local deadline=$(( $(date +%s) + timeout_s ))
     while (( $(date +%s) < deadline )); do
         local status
-        status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cname" 2>/dev/null || echo "none")
+        status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cname" 2>/dev/null || echo "none")
         if [[ "$status" == "healthy" ]]; then
             return 0
         fi
         sleep 2
     done
     echo "[test-helpers] timeout waiting for container $cname to become healthy" >&2
-    docker logs "$cname" 2>&1 | tail -30 >&2 || true
+    harness_docker logs "$cname" 2>&1 | tail -30 >&2 || true
     return 1
 }
 
@@ -227,12 +229,12 @@ test_wait_for_container_healthy() {
 _test_is_healthy() {
     local project="$1" svc="$2"
     local cid
-    cid=$(docker compose --project-name "$project" ps -q "$svc" 2>/dev/null || true)
+    cid=$(harness_docker compose --project-name "$project" ps -q "$svc" 2>/dev/null || true)
     if [[ -z "$cid" ]]; then
         return 1
     fi
     local status
-    status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo "none")
+    status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo "none")
     [[ "$status" == "healthy" ]]
 }
 
@@ -274,7 +276,7 @@ test_wait_for_healthy() {
         fi
         if (( $(date +%s) >= deadline )); then
             echo "[test-helpers] timeout waiting for healthy: ${services[*]}" >&2
-            docker compose --project-name "$project" ps >&2 || true
+            harness_docker compose --project-name "$project" ps >&2 || true
             return 1
         fi
         sleep 2
@@ -291,12 +293,12 @@ test_cleanup() {
     local project="$1" env_file="${2:-}" override="${3:-}"
     shift 3 || true
     if [[ -n "$env_file" && -f "$env_file" && -n "$override" && -f "$override" ]]; then
-        docker compose --project-name "$project" \
+        harness_docker compose --project-name "$project" \
             --env-file "$env_file" \
             -f docker-compose.yml -f "$override" \
             down -v --remove-orphans >/dev/null 2>&1 || true
     else
-        docker compose --project-name "$project" \
+        harness_docker compose --project-name "$project" \
             -f docker-compose.yml \
             down -v --remove-orphans >/dev/null 2>&1 || true
     fi

@@ -64,11 +64,11 @@ cleanup() {
     # Kill any graphify test containers we launched directly. These
     # don't run under compose so `harness down` won't touch them.
     for c in "${GRAPHIFY_AGENT_NAME}" "${GRAPHIFY_AGENT_NAME_2}"; do
-        docker rm -f "$c" >/dev/null 2>&1 || true
+        harness_docker rm -f "$c" >/dev/null 2>&1 || true
     done
 
     # Mock upstream sidecar.
-    docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
+    harness_docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
 
     # Best-effort: tear down the harness stack (proxy, ollama, serena) via
     # the install we built. The script may not exist if we bailed before
@@ -81,16 +81,16 @@ cleanup() {
     fi
 
     # Belt-and-braces compose down in case the harness script is gone.
-    docker compose --project-name "${PROJECT_NAME}" \
+    harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         down -v --remove-orphans >/dev/null 2>&1 || true
 
     # Network may linger if we created it manually for a sidecar.
-    docker network rm "${NETWORK}" >/dev/null 2>&1 || true
+    harness_docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 
     # The serena container is fixed-named (container_name in its compose);
     # remove it explicitly in case compose missed it.
-    docker rm -f harness-serena >/dev/null 2>&1 || true
+    harness_docker rm -f harness-serena >/dev/null 2>&1 || true
 
     # ollama-data may contain root-owned blobs; wipe via privileged docker run.
     # HARNESS_INTEGRATION_KEEP=1 preserves TEST_ROOT/FAKE_HOME for postmortem.
@@ -100,7 +100,7 @@ cleanup() {
         for d in "${TEST_ROOT}" "${FAKE_HOME}"; do
             if [[ -d "$d" ]]; then
                 if ! rm -rf "$d" 2>/dev/null; then
-                    docker run --rm -v "$d:/target" --user 0:0 alpine \
+                    harness_docker run --rm -v "$d:/target" --user 0:0 alpine \
                         sh -c 'rm -rf /target/* /target/.[!.]* 2>/dev/null || true' \
                         >/dev/null 2>&1 || true
                     rm -rf "$d" 2>/dev/null || true
@@ -113,10 +113,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Defensive: clear any stale state from a previous aborted run.
-docker rm -f "${MOCK_NAME}" \
+harness_docker rm -f "${MOCK_NAME}" \
     "${GRAPHIFY_AGENT_NAME}" "${GRAPHIFY_AGENT_NAME_2}" \
     harness-serena >/dev/null 2>&1 || true
-docker compose --project-name "${PROJECT_NAME}" \
+harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     down -v --remove-orphans >/dev/null 2>&1 || true
 
@@ -207,7 +207,7 @@ phase_1_stack_setup() {
     #     which gradually exhausts disk on a 30GB OCI volume.
     # If a real harness install is missing an image, `harness start` (without
     # HARNESS_NO_BUILD) will build it; the env var is opt-in.
-    if ! docker compose --project-name "${PROJECT_NAME}" \
+    if ! harness_docker compose --project-name "${PROJECT_NAME}" \
             --env-file "${TEST_INSTALL}/.env" \
             -f "${TEST_INSTALL}/docker-compose.yml" \
             --profile agent build \
@@ -262,7 +262,7 @@ phase_2_serena() {
         return 1
     fi
 
-    if docker image inspect harness-serena:v0.1 >/dev/null 2>&1; then
+    if harness_docker image inspect harness-serena:v0.1 >/dev/null 2>&1; then
         echo "[integration] Phase 2.2: harness-serena:v0.1 already present, skipping build"
     else
         echo "[integration] Phase 2.2: building serena image (~5-10 min, ~8GB build cache)"
@@ -278,7 +278,7 @@ phase_2_serena() {
         # 'invalid spec: :/path: empty section between colons'.
         if ! INSTALL_ROOT="${TEST_INSTALL}" \
                 HARNESS_ALLOWLIST_PATH="${TEST_INSTALL}/.harness-allowlist" \
-                docker compose --project-name "${PROJECT_NAME}" \
+                harness_docker compose --project-name "${PROJECT_NAME}" \
                 --env-file "${TEST_INSTALL}/.env" \
                 -f "${TEST_INSTALL}/docker-compose.yml" \
                 -f "${TEST_INSTALL}/state/mcp/serena/compose.yml" \
@@ -295,7 +295,7 @@ phase_2_serena() {
     # compose doesn't manage it. `harness restart` calls `compose down`, which
     # tries to remove the network and fails with "has active endpoints" while
     # mockupstream is still attached. Stop it first; Phase 2.2.1 re-launches.
-    docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
+    harness_docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
     if ! HARNESS_NO_BUILD=1 harness_call restart >"${TEST_ROOT}/serena-restart.log" 2>&1; then
         echo "[integration] Phase 2.2 FAIL: harness restart failed" >&2
         tail -120 "${TEST_ROOT}/serena-restart.log" >&2
@@ -311,7 +311,7 @@ phase_2_serena() {
 
     echo "[integration] Phase 2.3: serena reachable from proxy container at tcp://serena:9121"
     local proxy_cid
-    proxy_cid=$(docker compose --project-name "${PROJECT_NAME}" \
+    proxy_cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${TEST_INSTALL}/docker-compose.yml" ps -q proxy 2>/dev/null)
     if [[ -z "${proxy_cid}" ]]; then
         echo "[integration] Phase 2.3 FAIL: cannot find proxy container id" >&2
@@ -323,7 +323,7 @@ phase_2_serena() {
         # invocation also pulls in the serena compose snippet.
         INSTALL_ROOT="${TEST_INSTALL}" \
             HARNESS_ALLOWLIST_PATH="${TEST_INSTALL}/.harness-allowlist" \
-            docker compose --project-name "${PROJECT_NAME}" \
+            harness_docker compose --project-name "${PROJECT_NAME}" \
             -f "${TEST_INSTALL}/docker-compose.yml" \
             -f "${TEST_INSTALL}/state/mcp/serena/compose.yml" \
             --profile mcp logs --tail=30 serena >&2 2>/dev/null || true
@@ -435,7 +435,7 @@ phase_2_tui_test() {
         echo "--- output (last 60 lines) ---" >&2
         tail -60 <<<"${out}" >&2
         echo "--- mockupstream logs ---" >&2
-        docker logs "${MOCK_NAME}" 2>&1 | tail -40 >&2 || true
+        harness_docker logs "${MOCK_NAME}" 2>&1 | tail -40 >&2 || true
         return 1
     fi
 
@@ -449,7 +449,7 @@ phase_2_tui_test() {
         echo "--- proxy dump files ---" >&2
         ls -la "${TEST_INSTALL}/state/output/" >&2 || true
         echo "--- mockupstream logs ---" >&2
-        docker logs "${MOCK_NAME}" 2>&1 | tail -40 >&2 || true
+        harness_docker logs "${MOCK_NAME}" 2>&1 | tail -40 >&2 || true
         return 1
     fi
     echo "[integration] Phase 2.6: serena tool-call evidence present in proxy dumps"
@@ -459,7 +459,7 @@ phase_2_tui_test() {
 
 phase_3_graphify() {
     echo "[integration] Phase 3.1: launching long-lived agent container for graphify"
-    docker rm -f "${GRAPHIFY_AGENT_NAME}" >/dev/null 2>&1 || true
+    harness_docker rm -f "${GRAPHIFY_AGENT_NAME}" >/dev/null 2>&1 || true
     # We override the entrypoint with a small inline shell that:
     #   1. (as root) runs init-firewall.sh so pipx egress is gated by
     #      our test allowlist (matches what the real harness does).
@@ -522,9 +522,9 @@ phase_3_graphify() {
 
     # Give init-firewall + remap a moment to settle, then verify ready.
     sleep 5
-    if [[ -z "$(docker ps -q -f "name=^${GRAPHIFY_AGENT_NAME}$" 2>/dev/null)" ]]; then
+    if [[ -z "$(harness_docker ps -q -f "name=^${GRAPHIFY_AGENT_NAME}$" 2>/dev/null)" ]]; then
         echo "[integration] Phase 3.1 FAIL: agent container exited before sleep" >&2
-        docker logs "${GRAPHIFY_AGENT_NAME}" 2>&1 | tail -30 >&2
+        harness_docker logs "${GRAPHIFY_AGENT_NAME}" 2>&1 | tail -30 >&2
         return 1
     fi
     if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
@@ -679,7 +679,7 @@ phase_3_graphify() {
     echo "[integration] Phase 3.10: file ownership correct (host UID, not container uid 1000)"
 
     echo "[integration] Phase 3.11: persistence — fresh container, graphify still works"
-    docker rm -f "${GRAPHIFY_AGENT_NAME}" >/dev/null 2>&1 || true
+    harness_docker rm -f "${GRAPHIFY_AGENT_NAME}" >/dev/null 2>&1 || true
     local ws_target2 mnt_workspace2 mnt_home2 mnt_allowlist2
     ws_target2=$(harness_abs_path "${TEST_WORKSPACE}/test-project")
     mnt_workspace2=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
@@ -725,7 +725,7 @@ phase_3_graphify() {
         return 1
     fi
     echo "[integration] Phase 3.11: graphify and skill persist across container rebuild"
-    docker rm -f "${GRAPHIFY_AGENT_NAME_2}" >/dev/null 2>&1 || true
+    harness_docker rm -f "${GRAPHIFY_AGENT_NAME_2}" >/dev/null 2>&1 || true
 
     echo "[integration] Phase 3 (Graphify): all 11 checks passed"
 }
@@ -770,7 +770,7 @@ phase_5_mount() {
     # Drive a long-lived container directly with the same mount contract
     # the harness CLI now applies.
     local mount_test_name="harness-mount-test-${RANDOM}"
-    docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
+    harness_docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
     local ws_src extra_src ah_src alp_src extra_target
     ws_src=$(harness_docker_path "${TEST_WORKSPACE}/test-project")
     extra_src=$(harness_docker_path "${extra_mount}")
@@ -800,17 +800,17 @@ phase_5_mount() {
         bash -c "pwd")
     if [[ "${container_pwd}" != "${ws_target}" ]]; then
         echo "[integration] Phase 5.2 FAIL: pwd was '${container_pwd}', expected '${ws_target}'" >&2
-        docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
+        harness_docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
         return 1
     fi
     marker_seen=$(harness_docker exec --user harness "${mount_test_name}" \
         cat "${extra_target}/marker.txt" 2>/dev/null || echo "")
     if [[ -z "${marker_seen}" || ! "${marker_seen}" =~ ^marker- ]]; then
         echo "[integration] Phase 5.2 FAIL: extra mount not visible at ${extra_target}" >&2
-        docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
+        harness_docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
         return 1
     fi
-    docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
+    harness_docker rm -f "${mount_test_name}" >/dev/null 2>&1 || true
     echo "[integration] Phase 5.2: extra mount visible at host path inside container"
 
     echo "[integration] Phase 5.3: --mount /etc rejected with clear error"

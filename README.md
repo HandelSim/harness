@@ -1,9 +1,14 @@
 # harness
 
-A docker-based runtime that lets you launch a coding agent (claude-code,
-opencode) against a third-party API endpoint, transparently. The agent runs
-in a container, talks to a local ollama instance, and ollama forwards chat
-requests to a translating proxy that calls the upstream API.
+A container-runtime-based system that lets you launch a coding agent
+(claude-code, opencode) against a third-party API endpoint, transparently.
+The agent runs in a container, talks to a local ollama instance, and ollama
+forwards chat requests to a translating proxy that calls the upstream API.
+
+Supported runtimes: **Docker** (default) and **Podman** (Linux, rootless).
+See [docs/PODMAN.md](docs/PODMAN.md) for podman-specific notes. The runtime
+is auto-detected (docker first, then podman), and overridable via
+`HARNESS_CONTAINER_RUNTIME` in `.env` or the environment.
 
 ```
 agent container ──► ollama ──► proxy ──► upstream API
@@ -33,7 +38,8 @@ The installer clones the repo into `./harness/` (the install root), seeds
 a `harness` wrapper to `~/.local/bin/harness`.
 
 (On Windows, use Git Bash. See [docs/WINDOWS.md](docs/WINDOWS.md) for
-Windows-specific setup.)
+Windows-specific setup. To run with Podman instead of Docker, see
+[docs/PODMAN.md](docs/PODMAN.md).)
 
 After install:
 1. Edit `~/harness-install/harness/.env` and set `PROXY_API_KEY` (and any
@@ -451,7 +457,12 @@ $ bash scripts/firewall_test.sh      # firewall guardrail (negative) + per-servi
 $ bash scripts/upgrade_test.sh       # upgrade actions library + synthetic version transition
 $ bash scripts/full_pipeline_test.sh # full install + run pipeline (covers both agents via print-mode round-trip)
 $ HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh  # end-to-end Serena + Graphify (slow, ~10-15 min)
+$ bash scripts/podman_smoke_test.sh   # podman-runtime smoke (Linux only; manual)
+$ bash scripts/check_runtime_calls.sh # static guard: no raw 'docker' calls outside the wrapper
 ```
+
+All of the above honor `HARNESS_CONTAINER_RUNTIME=podman` to exercise the
+podman code path. By default they pick docker if it's installed.
 
 ### Integration test (Serena + Graphify)
 

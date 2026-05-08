@@ -46,8 +46,8 @@ echo "============================================================"
 
 # --- preflight --------------------------------------------------------------
 
-if ! docker info >/dev/null 2>&1; then
-    echo "[pipeline] ERROR: docker daemon not reachable" >&2
+if ! harness_docker info >/dev/null 2>&1; then
+    echo "[pipeline] ERROR: container runtime ($(harness_container_runtime)) not reachable" >&2
     exit 1
 fi
 
@@ -73,23 +73,23 @@ cleanup() {
     echo "[pipeline] cleanup (rc=${rc})"
 
     # Tear down the mock upstream sidecar.
-    docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
+    harness_docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
 
     # Tear down any T16 MCP fixture that leaked.
-    docker rm -f "${PROJECT_NAME}_pipe_mcp" >/dev/null 2>&1 || true
+    harness_docker rm -f "${PROJECT_NAME}_pipe_mcp" >/dev/null 2>&1 || true
 
     # Stop any agent containers labeled by this project.
     local stragglers
-    stragglers=$(docker ps -aq --filter "label=harness.agent=true" 2>/dev/null || true)
+    stragglers=$(harness_docker ps -aq --filter "label=harness.agent=true" 2>/dev/null || true)
     if [[ -n "${stragglers}" ]]; then
         # We can't easily filter by project label, but harness-pipeline-test
         # agents are mounted on $TEST_WORKSPACE. The simplest belt-and-braces
         # is to remove anything with our deterministic name pattern.
         for c in ${stragglers}; do
             local mount
-            mount=$(docker inspect -f '{{ index .Config.Labels "harness.mount" }}' "$c" 2>/dev/null || true)
+            mount=$(harness_docker inspect -f '{{ index .Config.Labels "harness.mount" }}' "$c" 2>/dev/null || true)
             if [[ "${mount}" == "${TEST_WORKSPACE}"* ]]; then
-                docker rm -f "$c" >/dev/null 2>&1 || true
+                harness_docker rm -f "$c" >/dev/null 2>&1 || true
             fi
         done
     fi
@@ -100,12 +100,12 @@ cleanup() {
         HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
             "${FAKE_HOME}/.local/bin/harness" down >/dev/null 2>&1 || true
     fi
-    docker compose --project-name "${PROJECT_NAME}" \
+    harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         down -v --remove-orphans >/dev/null 2>&1 || true
 
     # Network may linger if we created it manually for the mockupstream.
-    docker network rm "${NETWORK}" >/dev/null 2>&1 || true
+    harness_docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 
     # ollama-data may contain files owned by a uid we can't directly remove
     # (the in-container ollama runs as root, so blobs land owned by host
@@ -131,10 +131,10 @@ harness_call() {
 }
 
 # Defensive: clear stale state from a prior run.
-docker compose --project-name "${PROJECT_NAME}" \
+harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     down -v --remove-orphans >/dev/null 2>&1 || true
-docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
+harness_docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
 
 # --- T0: stage installer ---------------------------------------------------
 
@@ -256,19 +256,19 @@ wait_healthy_compose() {
     local deadline=$(( $(date +%s) + timeout_s ))
     while true; do
         local cid
-        cid=$(docker compose --project-name "${PROJECT_NAME}" \
+        cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
             -f "${REPO_ROOT}/docker-compose.yml" \
             ps -q "${svc}" 2>/dev/null || true)
         if [[ -n "${cid}" ]]; then
             local status
-            status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" 2>/dev/null || echo "none")
+            status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" 2>/dev/null || echo "none")
             if [[ "${status}" == "healthy" ]]; then
                 return 0
             fi
         fi
         if (( $(date +%s) >= deadline )); then
             echo "[pipeline] timed out waiting for ${svc}" >&2
-            docker compose --project-name "${PROJECT_NAME}" \
+            harness_docker compose --project-name "${PROJECT_NAME}" \
                 -f "${REPO_ROOT}/docker-compose.yml" ps >&2 || true
             return 1
         fi
@@ -283,7 +283,7 @@ if ! wait_healthy_compose proxy 90; then echo "[pipeline] T5 FAIL proxy" >&2; ex
 # the install relies on `compose --profile agent build`). The pipeline
 # test needs both images present for T9–T11.
 echo "[pipeline] T5: building agent images (compose --profile agent build)"
-docker compose --project-name "${PROJECT_NAME}" \
+harness_docker compose --project-name "${PROJECT_NAME}" \
     --env-file "${TEST_ROOT}/harness/.env" \
     -f "${TEST_ROOT}/harness/docker-compose.yml" \
     --profile agent build >"${TEST_ROOT}/agent-build.log" 2>&1
@@ -311,7 +311,7 @@ harness_docker run -d \
 
 # Wait for /health from inside the network (use the ollama container as a
 # probe; it's already on the network and has curl).
-ollama_cid=$(docker compose --project-name "${PROJECT_NAME}" \
+ollama_cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     ps -q ollama)
 deadline=$(( $(date +%s) + 60 ))
@@ -321,7 +321,7 @@ while true; do
     fi
     if (( $(date +%s) >= deadline )); then
         echo "[pipeline] T6 FAIL: mockupstream never became reachable" >&2
-        docker logs "${MOCK_NAME}" >&2 || true
+        harness_docker logs "${MOCK_NAME}" >&2 || true
         exit 1
     fi
     sleep 2
@@ -522,15 +522,15 @@ t16_call start >"${TEST_ROOT}/t16-start.log" 2>&1 || {
 
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    cid=$(docker ps -q --filter "name=^${PROJECT_NAME}_pipe_mcp$" 2>/dev/null || true)
+    cid=$(harness_docker ps -q --filter "name=^${PROJECT_NAME}_pipe_mcp$" 2>/dev/null || true)
     if [[ -n "${cid}" ]]; then
-        status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" 2>/dev/null || echo "none")
+        status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" 2>/dev/null || echo "none")
         if [[ "${status}" == "healthy" ]]; then break; fi
     fi
     if (( $(date +%s) >= deadline )); then
         echo "[pipeline] T16 FAIL: pipe_mcp not healthy in 60s" >&2
-        docker ps --filter "name=pipe_mcp" >&2 || true
-        docker logs "${cid}" 2>&1 | tail -30 >&2 || true
+        harness_docker ps --filter "name=pipe_mcp" >&2 || true
+        harness_docker logs "${cid}" 2>&1 | tail -30 >&2 || true
         exit 1
     fi
     sleep 2
@@ -570,7 +570,7 @@ harness_call start >"${TEST_ROOT}/t16-start2.log" 2>&1 || {
 # pipe_mcp container — but it should be orphaned from compose's view. The
 # expected behavior is for `harness down` (in T13) to clean it up via
 # --remove-orphans. Just remove it explicitly so we don't leak.
-docker rm -f "${PROJECT_NAME}_pipe_mcp" >/dev/null 2>&1 || true
+harness_docker rm -f "${PROJECT_NAME}_pipe_mcp" >/dev/null 2>&1 || true
 
 echo "[pipeline] T16 OK"
 
@@ -583,15 +583,15 @@ echo "[pipeline] T13: harness down"
 # endpoints"). On Linux this used to succeed silently because the
 # orphan didn't gate exit code; on Windows Docker Desktop the whole
 # `compose down` returns non-zero when the network removal errors.
-docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
+harness_docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
 harness_call down >/dev/null
 
-remaining=$(docker compose --project-name "${PROJECT_NAME}" \
+remaining=$(harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     ps -q 2>/dev/null || true)
 if [[ -n "${remaining}" ]]; then
     echo "[pipeline] T13 FAIL: containers still present after down" >&2
-    docker compose --project-name "${PROJECT_NAME}" \
+    harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" ps >&2 || true
     exit 1
 fi
