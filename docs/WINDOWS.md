@@ -79,8 +79,8 @@ contract.
 
 ## jq compatibility
 
-The harness upgrade machinery uses `jq` to merge JSON config files
-(envfile_merge, json_merge). Earlier versions used bash process
+The harness upgrade machinery uses `jq` for several manifest actions
+(e.g. parsing the manifest itself). Earlier versions used bash process
 substitution — `<(printf '%s\n' "$merged")` — to feed jq the in-memory
 merged result, but the **Windows-native `jq.exe`** (e.g., from
 Chocolatey, Scoop, or downloaded direct from github.com/jqlang) cannot

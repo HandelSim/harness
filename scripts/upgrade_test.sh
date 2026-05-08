@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# scripts/upgrade_test.sh — exercise the four upgrade action types and a
+# scripts/upgrade_test.sh — exercise the upgrade action types and a
 # synthetic version-N → N+1 upgrade end-to-end.
 #
 # This test does NOT require docker. It runs entirely against the host
 # filesystem and the upgrade_actions library; the manifest runner inside
 # `harness` is exercised by harness_test.sh under T16/T17. Here we focus on
 # correctness of each individual action plus an integrated scenario where
-# adding new env vars / hosts / json keys / MCP files to a "version N+1"
-# repo, then running the actions against a "version N" install root,
-# results in the user-customized state being preserved exactly while new
-# items are introduced.
+# adding new env vars / hosts / MCP files to a "version N+1" repo, then
+# running the actions against a "version N" install root, results in the
+# user-customized state being preserved exactly while new items are
+# introduced.
 #
 # Prints "UPGRADE TEST PASSED" on success.
 
@@ -140,44 +140,6 @@ T2_OUT2=$(upgrade_linefile_merge "${T2_DIR}/source.list" "${T2_DIR}/target.list"
 [[ "$(json_field 'added_lines | length' "${T2_OUT2}")" == "0" ]] || fail "T2: idempotency broken"
 ok "linefile_merge: append + annotation-diff warning + idempotency"
 
-# === Test 3: json_merge core =============================================
-
-echo
-echo "--- T3: json_merge ---"
-T3_DIR="${WORK}/t3"
-mkdir -p "${T3_DIR}"
-cat >"${T3_DIR}/source.json" <<'EOF'
-{
-  "version": 3,
-  "lines": [["a", "b"]],
-  "newKey": "new-value",
-  "nested": {"existing": "from-source", "added": "yep"}
-}
-EOF
-cat >"${T3_DIR}/target.json" <<'EOF'
-{
-  "version": 3,
-  "lines": [["x", "y", "z"]],
-  "userOnly": true,
-  "nested": {"existing": "USER_VALUE"}
-}
-EOF
-T3_OUT=$(upgrade_json_merge "${T3_DIR}/source.json" "${T3_DIR}/target.json" add_missing_keys 0)
-T3_PATHS=$(json_field 'added_paths | sort | join(",")' "${T3_OUT}")
-echo "${T3_PATHS}" | grep -q '\.newKey' || fail "T3: expected .newKey in added_paths; got ${T3_PATHS}"
-echo "${T3_PATHS}" | grep -q '\.nested\.added' || fail "T3: expected .nested.added in added_paths; got ${T3_PATHS}"
-[[ "$(jq -r '.userOnly' "${T3_DIR}/target.json")" == "true" ]] || fail "T3: userOnly preserved"
-[[ "$(jq -r '.nested.existing' "${T3_DIR}/target.json")" == "USER_VALUE" ]] || fail "T3: nested.existing was overwritten — DEALBREAKER"
-[[ "$(jq -r '.lines | length' "${T3_DIR}/target.json")" == "1" ]] || fail "T3: user array got merged/extended; should be user-wins"
-[[ "$(jq -r '.lines[0] | length' "${T3_DIR}/target.json")" == "3" ]] || fail "T3: user array contents changed"
-[[ "$(jq -r '.newKey' "${T3_DIR}/target.json")" == "new-value" ]] || fail "T3: newKey not added"
-[[ "$(jq -r '.nested.added' "${T3_DIR}/target.json")" == "yep" ]] || fail "T3: nested.added not added"
-
-# Idempotency.
-T3_OUT2=$(upgrade_json_merge "${T3_DIR}/source.json" "${T3_DIR}/target.json" add_missing_keys 0)
-[[ "$(json_field 'added_paths | length' "${T3_OUT2}")" == "0" ]] || fail "T3: idempotency broken"
-ok "json_merge: deep merge + user-wins + array conservatism + idempotency"
-
 # === Test 4: directory_overwrite core ====================================
 
 echo
@@ -243,34 +205,7 @@ grep -q '^Y=2$' "${T5_DIR}/missing.env" || fail "T5.3: created target lacks sour
 [[ "$(json_field 'created' "${T5C}")" == "true" ]] || fail "T5.3: created flag missing in JSON output"
 ok "T5.3: missing target is created from source"
 
-# 5.4: malformed JSON target — recovered by overwriting with source.
-# (Common case: ccstatusline writes a zero-byte stub on first launch and never
-# finishes; refusing to fix it would block every subsequent harness upgrade.)
-cat >"${T5_DIR}/source.json" <<'EOF'
-{"a": 1}
-EOF
-echo 'this is not json {' >"${T5_DIR}/bad.json"
-T5D_RC=0
-T5D=$(upgrade_json_merge "${T5_DIR}/source.json" "${T5_DIR}/bad.json" add_missing_keys 0) || T5D_RC=$?
-(( T5D_RC == 0 )) || fail "T5.4: malformed target recovery should succeed (rc=$T5D_RC)"
-[[ "$(json_field 'recovered' "${T5D}")" == "true" ]] || fail "T5.4: recovered flag missing"
-[[ "$(jq -c . "${T5_DIR}/bad.json")" == '{"a":1}' ]] || fail "T5.4: malformed target was not recovered from source"
-ok "T5.4: malformed JSON target is recovered from source"
-
-# 5.5: malformed JSON source — refuses to apply.
-cat >"${T5_DIR}/bad-src.json" <<'EOF'
-{not json
-EOF
-cat >"${T5_DIR}/good-tgt.json" <<'EOF'
-{"a": 1}
-EOF
-T5E_RC=0
-T5E=$(upgrade_json_merge "${T5_DIR}/bad-src.json" "${T5_DIR}/good-tgt.json" add_missing_keys 0) || T5E_RC=$?
-(( T5E_RC != 0 )) || fail "T5.5: malformed source should have triggered nonzero rc"
-[[ "$(jq -c . "${T5_DIR}/good-tgt.json")" == '{"a":1}' ]] || fail "T5.5: target was modified despite source error"
-ok "T5.5: malformed JSON source leaves target intact"
-
-# 5.6: linefile annotation discrepancy preserved (not modified).
+# 5.4: linefile annotation discrepancy preserved (not modified).
 cat >"${T5_DIR}/src.list" <<'EOF'
 github.com   # git-push
 EOF
@@ -278,9 +213,9 @@ cat >"${T5_DIR}/tgt.list" <<'EOF'
 github.com
 EOF
 T5F=$(upgrade_linefile_merge "${T5_DIR}/src.list" "${T5_DIR}/tgt.list" 0)
-[[ "$(json_field 'warnings | length' "${T5F}")" == "1" ]] || fail "T5.6: expected 1 warning"
-grep -Eq '^github\.com$' "${T5_DIR}/tgt.list" || fail "T5.6: target line should not have been modified"
-ok "T5.6: linefile annotation discrepancy yields warning, no modification"
+[[ "$(json_field 'warnings | length' "${T5F}")" == "1" ]] || fail "T5.4: expected 1 warning"
+grep -Eq '^github\.com$' "${T5_DIR}/tgt.list" || fail "T5.4: target line should not have been modified"
+ok "T5.4: linefile annotation discrepancy yields warning, no modification"
 
 # === Test 6: synthetic version-N → N+1 end-to-end ========================
 #
@@ -292,8 +227,8 @@ echo
 echo "--- T6: synthetic version-N → N+1 upgrade ---"
 T6_REPO="${WORK}/t6/repo"
 T6_INST="${WORK}/t6/install"
-mkdir -p "${T6_REPO}"/{agents/claude/defaults,mcp-registry/_test_mcp,mcp-registry/_test_mcp/data}
-mkdir -p "${T6_INST}"/{agent/claude/.config/ccstatusline,mcp/_test_mcp/data}
+mkdir -p "${T6_REPO}/mcp-registry/_test_mcp/data"
+mkdir -p "${T6_INST}/mcp/_test_mcp/data"
 
 # --- N+1 repo state ---
 cat >"${T6_REPO}/.env.example" <<'EOF'
@@ -310,17 +245,6 @@ cat >"${T6_REPO}/.harness-allowlist.example" <<'EOF'
 github.com
 api.github.com
 new-host.example
-EOF
-cat >"${T6_REPO}/agents/claude/defaults/ccstatusline-settings.json" <<'EOF'
-{
-  "version": 4,
-  "lines": [
-    [{"id": "1", "type": "model"}],
-    [],
-    []
-  ],
-  "newColorScheme": "auto"
-}
 EOF
 cat >"${T6_REPO}/mcp-registry/_test_mcp/compose.yml" <<'EOF'
 # v2 compose for the test MCP
@@ -348,16 +272,6 @@ github.com   # git-push
 api.github.com
 my-corp.example
 EOF
-cat >"${T6_INST}/agent/claude/.config/ccstatusline/settings.json" <<'EOF'
-{
-  "version": 3,
-  "lines": [
-    [{"id": "1", "type": "model", "color": "magenta"}],
-    [],
-    []
-  ]
-}
-EOF
 cat >"${T6_INST}/mcp/_test_mcp/compose.yml" <<'EOF'
 # v1 compose
 services:
@@ -375,8 +289,7 @@ cat >"${T6_REPO}/manifest.json" <<EOF
   "version": 1,
   "actions": [
     {"id":"env_vars","type":"envfile_merge","source":".env.example","target_relative":".env","description":"merge env"},
-    {"id":"allow","type":"linefile_merge","source":".harness-allowlist.example","target_relative":".harness-allowlist","description":"merge allowlist"},
-    {"id":"ccstatus","type":"json_merge","source":"agents/claude/defaults/ccstatusline-settings.json","target_relative":"agent/claude/.config/ccstatusline/settings.json","strategy":"add_missing_keys","description":"merge ccstatus"}
+    {"id":"allow","type":"linefile_merge","source":".harness-allowlist.example","target_relative":".harness-allowlist","description":"merge allowlist"}
   ],
   "registry_actions": [
     {"id":"_test_mcp","type":"directory_overwrite","source":"mcp-registry/_test_mcp","target_relative":"mcp/_test_mcp","preserve":["harness-meta.json","data/","data"],"condition":"installed","description":"refresh test MCP"}
@@ -387,7 +300,6 @@ EOF
 # --- 6a: dry-run reports correct delta and modifies nothing ---
 ENV_MTIME_BEFORE=$(stat -c '%Y' "${T6_INST}/.env")
 ALLOW_MTIME_BEFORE=$(stat -c '%Y' "${T6_INST}/.harness-allowlist")
-JSON_MTIME_BEFORE=$(stat -c '%Y' "${T6_INST}/agent/claude/.config/ccstatusline/settings.json")
 COMPOSE_MTIME_BEFORE=$(stat -c '%Y' "${T6_INST}/mcp/_test_mcp/compose.yml")
 
 DRY_OUT=$(upgrade_envfile_merge "${T6_REPO}/.env.example" "${T6_INST}/.env" 1)
@@ -400,23 +312,15 @@ DRY_OUT=$(upgrade_linefile_merge "${T6_REPO}/.harness-allowlist.example" "${T6_I
 # github.com annotation discrepancy → warning, not modification.
 [[ "$(json_field 'warnings | length' "${DRY_OUT}")" == "1" ]] || fail "T6.dry: expected github.com annotation warning"
 
-DRY_OUT=$(upgrade_json_merge "${T6_REPO}/agents/claude/defaults/ccstatusline-settings.json" \
-    "${T6_INST}/agent/claude/.config/ccstatusline/settings.json" add_missing_keys 1)
-PATHS_DIFF=$(json_field 'added_paths | sort | join(",")' "${DRY_OUT}")
-echo "${PATHS_DIFF}" | grep -q '\.newColorScheme' || fail "T6.dry: ccstatus added_paths missing newColorScheme: ${PATHS_DIFF}"
-
 # Mtimes unchanged → confirms dry run.
 [[ "$(stat -c '%Y' "${T6_INST}/.env")" == "${ENV_MTIME_BEFORE}" ]] || fail "T6.dry: .env mtime changed"
 [[ "$(stat -c '%Y' "${T6_INST}/.harness-allowlist")" == "${ALLOW_MTIME_BEFORE}" ]] || fail "T6.dry: allowlist mtime changed"
-[[ "$(stat -c '%Y' "${T6_INST}/agent/claude/.config/ccstatusline/settings.json")" == "${JSON_MTIME_BEFORE}" ]] || fail "T6.dry: ccstatus mtime changed"
 [[ "$(stat -c '%Y' "${T6_INST}/mcp/_test_mcp/compose.yml")" == "${COMPOSE_MTIME_BEFORE}" ]] || fail "T6.dry: compose.yml mtime changed"
 ok "T6.dry: dry-run reports deltas without modifying files"
 
 # --- 6b: apply mode actually mutates ---
 upgrade_envfile_merge "${T6_REPO}/.env.example" "${T6_INST}/.env" 0 >/dev/null
 upgrade_linefile_merge "${T6_REPO}/.harness-allowlist.example" "${T6_INST}/.harness-allowlist" 0 >/dev/null
-upgrade_json_merge "${T6_REPO}/agents/claude/defaults/ccstatusline-settings.json" \
-    "${T6_INST}/agent/claude/.config/ccstatusline/settings.json" add_missing_keys 0 >/dev/null
 upgrade_directory_overwrite "${T6_REPO}/mcp-registry/_test_mcp" "${T6_INST}/mcp/_test_mcp" 0 \
     harness-meta.json data/ data >/dev/null
 
@@ -433,14 +337,6 @@ grep -q '^new-host.example$' "${T6_INST}/.harness-allowlist" || fail "T6.apply: 
 grep -Eq '^github\.com[[:space:]]+# git-push$' "${T6_INST}/.harness-allowlist" || fail "T6.apply: user's github.com # git-push annotation lost"
 grep -q '^my-corp.example$' "${T6_INST}/.harness-allowlist" || fail "T6.apply: user-only host my-corp.example removed"
 
-# Verify ccstatusline: user color preserved, newColorScheme added.
-[[ "$(jq -r '.lines[0][0].color' "${T6_INST}/agent/claude/.config/ccstatusline/settings.json")" == "magenta" ]] \
-    || fail "T6.apply: user color preserved (should still be magenta)"
-[[ "$(jq -r '.newColorScheme' "${T6_INST}/agent/claude/.config/ccstatusline/settings.json")" == "auto" ]] \
-    || fail "T6.apply: newColorScheme not added"
-[[ "$(jq -r '.version' "${T6_INST}/agent/claude/.config/ccstatusline/settings.json")" == "3" ]] \
-    || fail "T6.apply: version was overwritten (3 → 4) — DEALBREAKER (user value clobbered)"
-
 # Verify mcp/_test_mcp: compose.yml updated, harness-meta.json preserved (enabled=false), data preserved.
 grep -q "v2 compose" "${T6_INST}/mcp/_test_mcp/compose.yml" || fail "T6.apply: compose.yml not updated"
 [[ "$(jq -r '.enabled' "${T6_INST}/mcp/_test_mcp/harness-meta.json")" == "false" ]] \
@@ -455,9 +351,6 @@ RERUN_OUT=$(upgrade_envfile_merge "${T6_REPO}/.env.example" "${T6_INST}/.env" 0)
 [[ "$(json_field 'added_keys | length' "${RERUN_OUT}")" == "0" ]] || fail "T6.rerun: env_vars not idempotent"
 RERUN_OUT=$(upgrade_linefile_merge "${T6_REPO}/.harness-allowlist.example" "${T6_INST}/.harness-allowlist" 0)
 [[ "$(json_field 'added_lines | length' "${RERUN_OUT}")" == "0" ]] || fail "T6.rerun: allowlist not idempotent"
-RERUN_OUT=$(upgrade_json_merge "${T6_REPO}/agents/claude/defaults/ccstatusline-settings.json" \
-    "${T6_INST}/agent/claude/.config/ccstatusline/settings.json" add_missing_keys 0)
-[[ "$(json_field 'added_paths | length' "${RERUN_OUT}")" == "0" ]] || fail "T6.rerun: json_merge not idempotent"
 ok "T6.rerun: idempotent — repeat runs produce zero changes"
 
 # === Test 7: rsync-fallback path =========================================

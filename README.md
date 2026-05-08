@@ -370,10 +370,9 @@ $ harness upgrade --no-restart    # apply without down/start (e.g. CI)
 The manifest at `scripts/upgrade-manifest.json` is the contract between the
 upstream repo and your local install root. Since B4 the install root IS the
 clone, so "managed files" means files harness writes inside the clone that
-aren't tracked git content (`.env`, `.harness-allowlist`, `state/mcp/<name>/`,
-the ccstatusline config under `state/agent/home/`). Every `B3-MANAGED:`
-comment in the codebase has a matching manifest entry (see audit step in
-Phase B3 docs).
+aren't tracked git content (`.env`, `.harness-allowlist`,
+`state/mcp/<name>/`). Every `B3-MANAGED:` comment in the codebase has a
+matching manifest entry (see audit step in Phase B3 docs).
 
 Action types:
 
@@ -384,9 +383,6 @@ Action types:
   ignored). If an entry exists in both files but with different inline
   annotations (e.g. `# git-push`), the user's line is preserved and a
   warning is emitted. Used for `.harness-allowlist`.
-- **json_merge** — recursively adds keys present in source but missing in
-  target. User values win at every depth; arrays are treated as scalars
-  (user-wins, no element merging). Used for ccstatusline config.
 - **directory_overwrite** — refreshes a managed directory tree, with an
   explicit `preserve` list for paths inside the directory that are user or
   system state (typically `harness-meta.json`, `data/`). Files in target
@@ -398,8 +394,6 @@ Files harness manages (covered by the manifest):
 - `.env` — env vars merged in (preserves your values)
 - `.harness-allowlist` — new hosts appended (preserves your entries and
   any `# git-push` annotations)
-- `state/agent/home/.config/ccstatusline/settings.json` — new widgets/keys
-  added (preserves layout and user widget customizations)
 - `state/mcp/<name>/` — definition files (`compose.yml`, `client-config.json`,
   `README.md`) updated (preserves `harness-meta.json` enable state and
   `data/` indexed state)
@@ -407,6 +401,10 @@ Files harness manages (covered by the manifest):
 Files purely user-managed (not in the manifest):
 
 - `.harness-net-overrides.json` — controlled by `harness net open/close`
+- `state/agent/home/.config/ccstatusline/settings.json` — seeded once from
+  `/etc/skel` by the agent entrypoint, then user-managed via the
+  ccstatusline TUI (`harness claude-statusline-config`). Default layout
+  changes upstream do not flow back to existing agent homes.
 - `state/output/` — proxy debug dumps
 - `state/ollama-data/` — model blobs
 - **User-installed skills and `pipx` packages** under `state/agent/<tool>/`

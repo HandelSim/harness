@@ -809,7 +809,7 @@ trap 'cleanup_upg; restore_agent_image; cleanup' EXIT INT TERM
 ln -s "${REPO_ROOT}" "${UPG_ROOT}/harness"
 # Pre-fill .env with a subset of vars so envfile_merge has something to
 # add. .harness-allowlist with a subset so linefile_merge has something to
-# add. ccstatusline target absent so json_merge reports "create from source".
+# add.
 cat >"${UPG_ROOT}/.env" <<'EOF'
 PROXY_API_URL=https://placeholder.invalid/v1/chat/completions
 PROXY_API_KEY=test-key
@@ -851,8 +851,6 @@ allow_mt_after=$(stat -c '%Y' "${UPG_ROOT}/.harness-allowlist")
     || { echo "[harness-test] T16 FAIL: --check modified .env mtime" >&2; exit 1; }
 [[ "${allow_mt_before}" == "${allow_mt_after}" ]] \
     || { echo "[harness-test] T16 FAIL: --check modified allowlist mtime" >&2; exit 1; }
-[[ ! -f "${UPG_ROOT}/state/agent/home/.config/ccstatusline/settings.json" ]] \
-    || { echo "[harness-test] T16 FAIL: --check created ccstatusline settings file" >&2; exit 1; }
 echo "[harness-test] T16 OK"
 
 # --- Test 17: harness upgrade --no-prompt --no-restart -------------------
@@ -886,11 +884,6 @@ fi
 if ! grep -q '^pypi.org$' "${UPG_ROOT}/.harness-allowlist"; then
     echo "[harness-test] T17 FAIL: pypi.org not added to allowlist after upgrade" >&2
     cat "${UPG_ROOT}/.harness-allowlist" >&2; exit 1
-fi
-# ccstatusline target was absent → should now exist.
-if [[ ! -f "${UPG_ROOT}/state/agent/home/.config/ccstatusline/settings.json" ]]; then
-    echo "[harness-test] T17 FAIL: ccstatusline settings file not created" >&2
-    exit 1
 fi
 # Idempotent: re-running adds nothing.
 upg_redo_out=$(HARNESS_INSTALL_ROOT="${UPG_ROOT}" HARNESS_PROJECT_NAME="harness-upg-check" \
