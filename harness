@@ -1054,8 +1054,8 @@ flags:
 The set of upgrade actions is driven by scripts/upgrade-manifest.json. Each
 action describes how a file harness manages inside the install root (which
 is the same directory as the clone, post-B4) is brought forward when the
-repo changes — env vars, firewall hostnames, ccstatusline keys, MCP
-registry definitions. User-set values are NEVER overwritten.
+repo changes — env vars, firewall hostnames, MCP registry definitions.
+User-set values are NEVER overwritten.
 
 Image rebuild is run between manifest-apply and start so image-level
 changes (Dockerfile, proxy.py, agent entrypoint) take effect on upgrade.
@@ -1189,7 +1189,7 @@ apply_upgrade_actions() {
     # 1. Unconditional actions.
     while IFS= read -r action_json; do
         action_json=${action_json%$'\r'}
-        local id type src_rel src target_rel target strategy result rc
+        local id type src_rel src target_rel target result rc
         id=$(_upg_strip_cr "$(harness_jq -r '.id' <<<"$action_json")")
         type=$(_upg_strip_cr "$(harness_jq -r '.type' <<<"$action_json")")
         src_rel=$(_upg_strip_cr "$(harness_jq -r '.source' <<<"$action_json")")
@@ -1207,10 +1207,6 @@ apply_upgrade_actions() {
                 ;;
             linefile_merge)
                 result=$(upgrade_linefile_merge "$src" "$target" "$dry_run") || rc=$?
-                ;;
-            json_merge)
-                strategy=$(_upg_strip_cr "$(harness_jq -r '.strategy // "add_missing_keys"' <<<"$action_json")")
-                result=$(upgrade_json_merge "$src" "$target" "$strategy" "$dry_run") || rc=$?
                 ;;
             *)
                 err "[$id] unknown action type '$type'; skipping"
