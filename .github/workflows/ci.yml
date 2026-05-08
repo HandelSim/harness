@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+# Only one CI run per branch in flight at a time. New pushes cancel the
+# in-progress run on dev so we don't waste minutes testing a stale commit
+# (and don't fire the auto-fix watcher for an obsolete failure). main
+# pushes are infrequent and want full validation, so we still cancel there
+# too — the next push will re-run anyway.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: bash -n syntax check on all shell scripts
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r -d '' f; do
+            if ! bash -n "$f"; then
+              echo "::error file=$f::bash -n failed"
+              fail=1
+            fi
+          done < <(find harness harness-install.sh scripts -type f \
+              \( -name '*.sh' -o -path harness -o -path harness-install.sh \) \
+              -print0)
+          exit $fail
+
+      - name: check_runtime_calls.sh (no raw `docker` calls)
+        run: bash scripts/check_runtime_calls.sh
+
+      - name: shellcheck (advisory)
+        continue-on-error: true
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          scandir: ./scripts
+          additional_files: harness harness-install.sh
+
+  unit:
+    name: unit (upgrade_test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: scripts/upgrade_test.sh
+        run: bash scripts/upgrade_test.sh
+
+  docker-tests:
+    name: docker / ${{ matrix.test }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - harness_test
+          - proxy_test
+          - persistence_test
+          - mcp_test
+          - firewall_test
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Buildx layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-${{ matrix.test }}-${{ hashFiles('agents/Dockerfile', 'proxy/Dockerfile', 'ollama/Dockerfile', 'firewall/**', 'docker-compose.yml') }}
+          restore-keys: |
+            buildx-${{ matrix.test }}-
+            buildx-
+
+      - name: Show docker / compose versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Run scripts/${{ matrix.test }}.sh
+        env:
+          DOCKER_BUILDKIT: "1"
+          COMPOSE_DOCKER_CLI_BUILD: "1"
+        run: bash scripts/${{ matrix.test }}.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== docker ps -a ==="
+          docker ps -a || true
+          echo "=== docker network ls ==="
+          docker network ls || true
+          echo "=== free -h ==="
+          free -h || true
+          echo "=== df -h ==="
+          df -h || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -p harness-mgmt-test down --remove-orphans -v 2>/dev/null || true
+          docker system prune -f --volumes || true
+
+  pipeline:
+    name: full_pipeline_test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Buildx layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-pipeline-${{ hashFiles('agents/Dockerfile', 'proxy/Dockerfile', 'ollama/Dockerfile', 'firewall/**', 'docker-compose.yml') }}
+          restore-keys: |
+            buildx-pipeline-
+            buildx-
+
+      - name: scripts/full_pipeline_test.sh
+        env:
+          DOCKER_BUILDKIT: "1"
+          COMPOSE_DOCKER_CLI_BUILD: "1"
+        run: bash scripts/full_pipeline_test.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== docker ps -a ==="
+          docker ps -a || true
+          echo "=== df -h ==="
+          df -h || true
+
+      - name: Cleanup
+        if: always()
+        run: docker system prune -f --volumes || true
+
+  integration:
+    name: integration_test (slow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install pipx
+        run: |
+          python3 -m pip install --user pipx
+          python3 -m pipx ensurepath
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Buildx layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-integration-${{ hashFiles('agents/Dockerfile', 'proxy/Dockerfile', 'ollama/Dockerfile', 'firewall/**', 'docker-compose.yml') }}
+          restore-keys: |
+            buildx-integration-
+            buildx-
+
+      - name: scripts/integration_test.sh
+        env:
+          HARNESS_RUN_SLOW: "1"
+          DOCKER_BUILDKIT: "1"
+          COMPOSE_DOCKER_CLI_BUILD: "1"
+        run: bash scripts/integration_test.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== docker ps -a ==="
+          docker ps -a || true
+          echo "=== df -h ==="
+          df -h || true
+
+      - name: Cleanup
+        if: always()
+        run: docker system prune -f --volumes || true
