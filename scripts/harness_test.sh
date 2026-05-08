@@ -25,6 +25,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
 PROJECT_NAME="harness-mgmt-test"
 
 echo "============================================================"
@@ -33,8 +36,8 @@ echo "============================================================"
 
 # --- preflight ---------------------------------------------------------------
 
-if ! docker info >/dev/null 2>&1; then
-    echo "[harness-test] ERROR: docker daemon not reachable" >&2
+if ! harness_docker info >/dev/null 2>&1; then
+    echo "[harness-test] ERROR: container runtime ($(harness_container_runtime)) not reachable" >&2
     exit 1
 fi
 
@@ -72,7 +75,7 @@ cleanup() {
                 "${TEST_ROOT}/harness/harness" down >/dev/null 2>&1 || true
         fi
         # Belt-and-braces: remove the project's compose state directly.
-        docker compose --project-name "${PROJECT_NAME}" \
+        harness_docker compose --project-name "${PROJECT_NAME}" \
             -f "${REPO_ROOT}/docker-compose.yml" \
             down -v --remove-orphans >/dev/null 2>&1 || true
         rm -rf "${TEST_ROOT}"
@@ -123,7 +126,7 @@ export HARNESS_INSTALL_ROOT="${TEST_ROOT}"
 export HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist"
 
 # Defensive: clear stale state.
-docker compose --project-name "${PROJECT_NAME}" \
+harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     down -v --remove-orphans >/dev/null 2>&1 || true
 
@@ -225,22 +228,22 @@ echo "[harness-test] T1: harness start"
 # Wait up to 60s for both services to become healthy.
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    ollama_id=$(docker compose --project-name "${PROJECT_NAME}" \
+    ollama_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         ps -q ollama 2>/dev/null || true)
-    proxy_id=$(docker compose --project-name "${PROJECT_NAME}" \
+    proxy_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         ps -q proxy 2>/dev/null || true)
     if [[ -n "${ollama_id}" && -n "${proxy_id}" ]]; then
-        proxy_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
-        ollama_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${ollama_id}" 2>/dev/null || echo "none")
+        proxy_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
+        ollama_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${ollama_id}" 2>/dev/null || echo "none")
         if [[ "${proxy_status}" == "healthy" && "${ollama_status}" == "healthy" ]]; then
             break
         fi
     fi
     if (( $(date +%s) >= deadline )); then
         echo "[harness-test] T1 FAIL: services not healthy in 60s" >&2
-        docker compose --project-name "${PROJECT_NAME}" \
+        harness_docker compose --project-name "${PROJECT_NAME}" \
             -f "${REPO_ROOT}/docker-compose.yml" ps >&2 || true
         exit 1
     fi
@@ -283,12 +286,12 @@ echo "[harness-test] T3 OK"
 echo "[harness-test] T4: harness down"
 "${HARNESS_BIN}" down >/dev/null
 # After down, no ollama/proxy containers should remain for this project.
-remaining=$(docker compose --project-name "${PROJECT_NAME}" \
+remaining=$(harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     ps -q 2>/dev/null || true)
 if [[ -n "${remaining}" ]]; then
     echo "[harness-test] T4 FAIL: containers still present after down" >&2
-    docker compose --project-name "${PROJECT_NAME}" -f "${REPO_ROOT}/docker-compose.yml" ps >&2 || true
+    harness_docker compose --project-name "${PROJECT_NAME}" -f "${REPO_ROOT}/docker-compose.yml" ps >&2 || true
     exit 1
 fi
 echo "[harness-test] T4 OK"
@@ -525,10 +528,11 @@ if ! grep -Eq 'services not running|not present' <<<"${doctor_down_out}"; then
     echo "${doctor_down_out}" >&2
     exit 1
 fi
-# [deps] should at minimum confirm the docker daemon — otherwise the test
-# couldn't have reached this point at all.
-if ! grep -Eq 'docker daemon[[:space:]]+reachable' <<<"${doctor_down_out}"; then
-    echo "[harness-test] T8 FAIL: doctor did not confirm docker daemon" >&2
+# [deps] should at minimum confirm the container runtime — otherwise the
+# test couldn't have reached this point at all. Match either docker or
+# podman (the doctor output prefixes the line with the runtime name).
+if ! grep -Eq '(docker|podman)\s+runtime[[:space:]]+reachable' <<<"${doctor_down_out}"; then
+    echo "[harness-test] T8 FAIL: doctor did not confirm container runtime" >&2
     echo "${doctor_down_out}" >&2
     exit 1
 fi
@@ -540,15 +544,15 @@ echo "[harness-test] T9: harness doctor (services up)"
 "${HARNESS_BIN}" start >/dev/null
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    ollama_id=$(docker compose --project-name "${PROJECT_NAME}" \
+    ollama_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         ps -q ollama 2>/dev/null || true)
-    proxy_id=$(docker compose --project-name "${PROJECT_NAME}" \
+    proxy_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         ps -q proxy 2>/dev/null || true)
     if [[ -n "${ollama_id}" && -n "${proxy_id}" ]]; then
-        proxy_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
-        ollama_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${ollama_id}" 2>/dev/null || echo "none")
+        proxy_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
+        ollama_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${ollama_id}" 2>/dev/null || echo "none")
         if [[ "${proxy_status}" == "healthy" && "${ollama_status}" == "healthy" ]]; then
             break
         fi
@@ -618,22 +622,22 @@ restore_agent_image() {
     # ("network has active endpoints"). Force-remove any harness-agent
     # containers we may have left behind so subsequent tests start clean.
     local stragglers
-    stragglers=$(docker ps -aq --filter "ancestor=harness-agent:latest" 2>/dev/null || true)
+    stragglers=$(harness_docker ps -aq --filter "ancestor=harness-agent:latest" 2>/dev/null || true)
     if [[ -n "${stragglers}" ]]; then
-        docker rm -f ${stragglers} >/dev/null 2>&1 || true
+        harness_docker rm -f ${stragglers} >/dev/null 2>&1 || true
     fi
     if [[ -n "${agent_img_orig:-}" ]]; then
-        docker tag "${agent_img_orig}" "harness-agent:latest" >/dev/null 2>&1 || true
-        docker rmi "${agent_img_orig}" >/dev/null 2>&1 || true
+        harness_docker tag "${agent_img_orig}" "harness-agent:latest" >/dev/null 2>&1 || true
+        harness_docker rmi "${agent_img_orig}" >/dev/null 2>&1 || true
     fi
 }
 trap 'restore_agent_image; cleanup' EXIT INT TERM
 
 agent_img_orig=""
-if docker image inspect harness-agent:latest >/dev/null 2>&1; then
+if harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
     agent_img_orig="harness-agent:harness-test-stash-$$"
-    docker tag harness-agent:latest "${agent_img_orig}" >/dev/null
-    docker rmi harness-agent:latest >/dev/null 2>&1 || true
+    harness_docker tag harness-agent:latest "${agent_img_orig}" >/dev/null
+    harness_docker rmi harness-agent:latest >/dev/null 2>&1 || true
 fi
 
 # Build will be attempted; we don't actually want it to run to completion
@@ -729,11 +733,11 @@ echo "[harness-test] T12: harness restart"
 "${HARNESS_BIN}" restart >/dev/null
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    proxy_id=$(docker compose --project-name "${PROJECT_NAME}" \
+    proxy_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         ps -q proxy 2>/dev/null || true)
     if [[ -n "${proxy_id}" ]]; then
-        proxy_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
+        proxy_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
         if [[ "${proxy_status}" == "healthy" ]]; then break; fi
     fi
     if (( $(date +%s) >= deadline )); then
@@ -1054,12 +1058,18 @@ if ! grep -q 'all checks passed' <<<"${preflight_out}"; then
     echo "[harness-test] T20 FAIL: preflight didn't print 'all checks passed'" >&2
     echo "${preflight_out}" >&2; exit 1
 fi
-for needle in 'PROXY_API_URL is set' 'PROXY_API_KEY is set' 'PROXY_API_MODEL is set' 'docker daemon'; do
+for needle in 'PROXY_API_URL is set' 'PROXY_API_KEY is set' 'PROXY_API_MODEL is set'; do
     if ! grep -q "${needle}" <<<"${preflight_out}"; then
         echo "[harness-test] T20 FAIL: preflight missing line: ${needle}" >&2
         echo "${preflight_out}" >&2; exit 1
     fi
 done
+# Match the runtime line for either docker or podman (preflight prefixes the
+# line with the resolved runtime name).
+if ! grep -Eq '(docker|podman)\s+runtime' <<<"${preflight_out}"; then
+    echo "[harness-test] T20 FAIL: preflight missing container runtime line" >&2
+    echo "${preflight_out}" >&2; exit 1
+fi
 echo "[harness-test] T20 OK"
 
 # --- Test 21: harness preflight catches missing config ---------------------

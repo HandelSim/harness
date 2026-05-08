@@ -33,8 +33,8 @@ echo "============================================================"
 
 # --- preflight --------------------------------------------------------------
 
-if ! docker info >/dev/null 2>&1; then
-    echo "[mcp] ERROR: docker daemon not reachable" >&2
+if ! harness_docker info >/dev/null 2>&1; then
+    echo "[mcp] ERROR: container runtime ($(harness_container_runtime)) not reachable" >&2
     exit 1
 fi
 
@@ -68,7 +68,7 @@ cleanup() {
         HARNESS_REGISTRY_DIR="${FAKE_REGISTRY}" \
             "${FAKE_INSTALL_ROOT}/harness/harness" down >/dev/null 2>&1 || true
     fi
-    docker compose --project-name "${PROJECT_NAME}" \
+    harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         down -v --remove-orphans >/dev/null 2>&1 || true
 
@@ -187,7 +187,7 @@ harness_call() {
 }
 
 # Defensive: clear any stragglers from a prior run.
-docker compose --project-name "${PROJECT_NAME}" \
+harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     down -v --remove-orphans >/dev/null 2>&1 || true
 
@@ -286,22 +286,22 @@ harness_call start >"${TEST_ROOT}/start.log" 2>&1 || {
 deadline=$(( $(date +%s) + 60 ))
 mcp_cid=""
 while true; do
-    mcp_cid=$(docker compose --project-name "${PROJECT_NAME}" \
+    mcp_cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" \
         ps -q test_mcp 2>/dev/null || true)
     if [[ -n "${mcp_cid}" ]]; then
-        status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${mcp_cid}" 2>/dev/null || echo "none")
+        status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${mcp_cid}" 2>/dev/null || echo "none")
         if [[ "${status}" == "healthy" ]]; then
             break
         fi
     fi
     if (( $(date +%s) >= deadline )); then
         echo "[mcp] T5 FAIL: test_mcp not healthy in 60s" >&2
-        docker compose --project-name "${PROJECT_NAME}" \
+        harness_docker compose --project-name "${PROJECT_NAME}" \
             -f "${REPO_ROOT}/docker-compose.yml" \
             -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" ps >&2 || true
-        docker logs "${mcp_cid}" 2>&1 | tail -30 >&2 || true
+        harness_docker logs "${mcp_cid}" 2>&1 | tail -30 >&2 || true
         exit 1
     fi
     sleep 2
@@ -319,7 +319,7 @@ echo "[mcp] T5 OK"
 # --profile mcp. We emit it via compose's verbose output indirectly — the
 # easiest signal is that the test_mcp container is up.
 echo "[mcp] T6: services up after start"
-ollama_cid=$(docker compose --project-name "${PROJECT_NAME}" \
+ollama_cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" \
     ps -q ollama 2>/dev/null || true)
@@ -354,15 +354,15 @@ mkdir -p "${FAKE_INSTALL_ROOT}/state/agent/home"
 # Stash any real claude image so we can deterministically hit the
 # image-not-found path.
 stash_tag=""
-if docker image inspect harness-agent:latest >/dev/null 2>&1; then
+if harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
     stash_tag="harness-agent:mcp-test-stash-$$"
-    docker tag harness-agent:latest "${stash_tag}" >/dev/null
-    docker rmi harness-agent:latest >/dev/null 2>&1 || true
+    harness_docker tag harness-agent:latest "${stash_tag}" >/dev/null
+    harness_docker rmi harness-agent:latest >/dev/null 2>&1 || true
 fi
 restore_image() {
     if [[ -n "${stash_tag}" ]]; then
-        docker tag "${stash_tag}" harness-agent:latest >/dev/null 2>&1 || true
-        docker rmi "${stash_tag}" >/dev/null 2>&1 || true
+        harness_docker tag "${stash_tag}" harness-agent:latest >/dev/null 2>&1 || true
+        harness_docker rmi "${stash_tag}" >/dev/null 2>&1 || true
         stash_tag=""
     fi
 }
@@ -450,7 +450,7 @@ harness_call start >"${TEST_ROOT}/start2.log" 2>&1 || {
 }
 deadline=$(( $(date +%s) + 30 ))
 while true; do
-    cid=$(docker ps -q --filter "name=^harness-mcp-test_test_mcp$" 2>/dev/null || true)
+    cid=$(harness_docker ps -q --filter "name=^harness-mcp-test_test_mcp$" 2>/dev/null || true)
     if [[ -z "${cid}" ]]; then break; fi
     if (( $(date +%s) >= deadline )); then
         echo "[mcp] T10 FAIL: test_mcp container still running after state-flag disable" >&2
@@ -470,7 +470,7 @@ harness_call mcp up _test_mcp >"${TEST_ROOT}/up.log" 2>&1 || {
 }
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    cid=$(docker ps -q --filter "name=^harness-mcp-test_test_mcp$" 2>/dev/null || true)
+    cid=$(harness_docker ps -q --filter "name=^harness-mcp-test_test_mcp$" 2>/dev/null || true)
     if [[ -n "${cid}" ]]; then break; fi
     if (( $(date +%s) >= deadline )); then
         echo "[mcp] T11 FAIL: mcp up did not start the container" >&2
@@ -497,7 +497,7 @@ harness_call mcp down _test_mcp >"${TEST_ROOT}/down.log" 2>&1 || {
 }
 deadline=$(( $(date +%s) + 30 ))
 while true; do
-    cid=$(docker ps -q --filter "name=^harness-mcp-test_test_mcp$" 2>/dev/null || true)
+    cid=$(harness_docker ps -q --filter "name=^harness-mcp-test_test_mcp$" 2>/dev/null || true)
     if [[ -z "${cid}" ]]; then break; fi
     if (( $(date +%s) >= deadline )); then
         echo "[mcp] T12 FAIL: mcp down did not stop the container" >&2
@@ -585,7 +585,7 @@ harness_call start >"${TEST_ROOT}/start3.log" 2>&1 || {
 }
 deadline=$(( $(date +%s) + 30 ))
 while true; do
-    cid=$(docker ps -q --filter "name=^harness-mcp-test_test_mcp$" 2>/dev/null || true)
+    cid=$(harness_docker ps -q --filter "name=^harness-mcp-test_test_mcp$" 2>/dev/null || true)
     if [[ -z "${cid}" ]]; then break; fi
     if (( $(date +%s) >= deadline )); then
         echo "[mcp] T16 FAIL: test_mcp container still running after uninstall" >&2
@@ -601,10 +601,10 @@ echo "[mcp] T17: side file disappears when no MCPs are active"
 # Re-trigger the side-file write path. Stash image + image-not-found
 # again, same trick as T7.
 stash_tag=""
-if docker image inspect harness-agent:latest >/dev/null 2>&1; then
+if harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
     stash_tag="harness-agent:mcp-test-stash-$$"
-    docker tag harness-agent:latest "${stash_tag}" >/dev/null
-    docker rmi harness-agent:latest >/dev/null 2>&1 || true
+    harness_docker tag harness-agent:latest "${stash_tag}" >/dev/null
+    harness_docker rmi harness-agent:latest >/dev/null 2>&1 || true
 fi
 trap 'restore_image; cleanup' EXIT INT TERM
 set +e

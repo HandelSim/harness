@@ -5,7 +5,8 @@
 # Provides:
 #   - OS detection (linux/macos/windows/unknown)
 #   - Path resolution that works on Linux, macOS, and Git Bash on Windows
-#   - Docker daemon checks + Docker Desktop auto-start
+#   - Container runtime selection (docker/podman) + daemon checks +
+#     Docker Desktop / Podman machine auto-start
 #   - Preflight check primitives (used by both install.sh and the harness
 #     script's `harness preflight` command)
 #
@@ -75,7 +76,62 @@ harness_normalize_path() {
     echo "$p"
 }
 
-# === Docker invocation wrappers ===
+# === Container runtime selection ===
+#
+# harness supports two container runtimes: Docker and Podman. Selection is:
+#
+#   1. If $HARNESS_CONTAINER_RUNTIME is set (to `docker` or `podman`), use it.
+#   2. Else if `docker` is on PATH, use docker.
+#   3. Else if `podman` is on PATH, use podman.
+#   4. Else default to `docker` (downstream calls will fail with an actionable
+#      "command not found" error).
+#
+# The result is cached in _harness_runtime_cache after the first call so the
+# auto-detection runs once per shell invocation. Callers that change PATH or
+# the env var partway through a run can clear the cache themselves
+# (unset _harness_runtime_cache) — the harness CLI never does this.
+#
+# This function ECHOES the runtime name on stdout (`docker` or `podman`) and
+# returns 0. It does NOT verify the daemon/socket is reachable; for that, see
+# harness_runtime_running / harness_require_runtime below.
+harness_container_runtime() {
+    if [[ -n "${_harness_runtime_cache:-}" ]]; then
+        printf '%s' "$_harness_runtime_cache"
+        return 0
+    fi
+    local rt=""
+    if [[ -n "${HARNESS_CONTAINER_RUNTIME:-}" ]]; then
+        rt="$HARNESS_CONTAINER_RUNTIME"
+        case "$rt" in
+            docker|podman) ;;
+            *)
+                echo "[harness] WARN: HARNESS_CONTAINER_RUNTIME='$rt' is not 'docker' or 'podman'; falling back to auto-detect" >&2
+                rt=""
+                ;;
+        esac
+    fi
+    if [[ -z "$rt" ]]; then
+        if command -v docker >/dev/null 2>&1; then
+            rt=docker
+        elif command -v podman >/dev/null 2>&1; then
+            rt=podman
+        else
+            # Neither is installed; default to docker so downstream errors
+            # surface a clear "docker: command not found" rather than a
+            # cryptic empty-arg failure.
+            rt=docker
+        fi
+    fi
+    _harness_runtime_cache="$rt"
+    printf '%s' "$rt"
+}
+
+# True if the resolved runtime is podman.
+harness_runtime_is_podman() {
+    [[ "$(harness_container_runtime)" == "podman" ]]
+}
+
+# === Container runtime invocation wrappers ===
 #
 # Git Bash on Windows (MSYS) auto-translates UNIX-style paths in arguments
 # when calling native Windows binaries like docker.exe. That is fine for
@@ -84,36 +140,51 @@ harness_normalize_path() {
 # (which gets mangled to C:/Program Files/Git/usr/bin/bash, a path that
 # doesn't exist inside the container).
 #
-# harness_docker wraps the docker call with MSYS_NO_PATHCONV=1 on Windows
-# so that no path translation happens. Use this any time docker args
+# harness_docker wraps the runtime call with MSYS_NO_PATHCONV=1 on Windows
+# so that no path translation happens. Use this any time runtime args
 # include an in-container UNIX path. On Linux/macOS this is a transparent
 # passthrough.
 #
-# Usage: harness_docker [docker-args...]
+# Despite the name, this wrapper routes through whichever container runtime
+# harness_container_runtime resolved (docker or podman). The name is kept as
+# `harness_docker` for backwards compatibility with the bulk of the codebase
+# that was written before podman support; see also the alias
+# `harness_runtime` further down.
+#
+# Usage: harness_docker [runtime-args...]
 # Example: harness_docker run --rm --entrypoint /bin/bash my-image -c 'echo hi'
 harness_docker() {
+    local rt
+    rt=$(harness_container_runtime)
     if [[ "$(harness_detect_os)" == "windows" ]]; then
-        MSYS_NO_PATHCONV=1 docker "$@"
+        MSYS_NO_PATHCONV=1 "$rt" "$@"
     else
-        docker "$@"
+        "$rt" "$@"
     fi
 }
 
-# Same as harness_docker but `exec`s into the docker process instead of
+# Same as harness_docker but `exec`s into the runtime process instead of
 # returning. Use this in the final exec sites of the harness CLI
 # (run_agent_print's foreground launch, attach paths, etc.) so that
 # signals and exit codes flow through cleanly. `exec harness_docker ...`
 # does not work because `exec` requires an external program, not a shell
 # function — calling this helper instead preserves exec semantics by
-# wrapping `env MSYS_NO_PATHCONV=1 docker` into the exec'd process on
+# wrapping `env MSYS_NO_PATHCONV=1 <runtime>` into the exec'd process on
 # Windows.
 harness_docker_exec() {
+    local rt
+    rt=$(harness_container_runtime)
     if [[ "$(harness_detect_os)" == "windows" ]]; then
-        exec env MSYS_NO_PATHCONV=1 docker "$@"
+        exec env MSYS_NO_PATHCONV=1 "$rt" "$@"
     else
-        exec docker "$@"
+        exec "$rt" "$@"
     fi
 }
+
+# Friendly aliases. Prefer these in new code; harness_docker is retained for
+# the existing call sites that already use it.
+harness_runtime() { harness_docker "$@"; }
+harness_runtime_exec() { harness_docker_exec "$@"; }
 
 # Convert a host path to a form Docker Desktop accepts reliably for bind
 # mounts. On Linux/macOS this is a passthrough.
@@ -224,23 +295,47 @@ harness_validate_mount() {
     echo "$abs"
 }
 
-# === Docker checks ===
+# === Container runtime checks ===
 
-# Is the docker daemon running and accepting connections?
+# Is the resolved container runtime daemon/socket reachable?
+#
+# For docker: `docker info` confirms the daemon socket is up.
+# For rootless podman: `podman info` works without a daemon (it talks to its
+# own user-mode socket / runs forks); the same probe still returns 0/non-zero
+# correctly. For rootful podman it also works.
 harness_docker_running() {
-    docker info >/dev/null 2>&1
+    harness_docker info >/dev/null 2>&1
 }
 
-# Attempt to start Docker Desktop on Windows or macOS.
-# Logs progress to stderr. Returns 0 if Docker becomes available within timeout, 1 otherwise.
+# Friendly alias. Same semantics as harness_docker_running.
+harness_runtime_running() { harness_docker_running; }
+
+# Attempt to start the local container runtime if it isn't already.
+# Logs progress to stderr. Returns 0 if the runtime becomes available within
+# the timeout, 1 otherwise.
+#
+# Behavior by runtime + OS:
+#   - docker on windows/macos: starts Docker Desktop, polls until reachable.
+#   - docker on linux:         prints actionable systemctl/service hints; does
+#                              not attempt to start the system daemon (would
+#                              need sudo). Returns 1.
+#   - podman on macos/windows: tries `podman machine start`. Returns 0/1.
+#   - podman on linux:         rootless podman doesn't need a started daemon
+#                              — `podman info` is enough on its own. Prints a
+#                              hint about `systemctl --user start podman.socket`
+#                              for users who actually want the API socket
+#                              (compose mostly uses it). Returns 1 since we
+#                              didn't actually do anything.
+#
 # Args: [timeout_seconds] (default 90)
 harness_start_docker_desktop() {
     local timeout="${1:-90}"
-    local os
+    local os rt
     os=$(harness_detect_os)
+    rt=$(harness_container_runtime)
 
-    case "$os" in
-        windows)
+    case "$rt:$os" in
+        docker:windows)
             local exe="/c/Program Files/Docker/Docker/Docker Desktop.exe"
             if [[ ! -f "$exe" ]]; then
                 echo "[harness] Docker Desktop not found at expected path: $exe" >&2
@@ -250,30 +345,55 @@ harness_start_docker_desktop() {
             echo "[harness] Docker Desktop is not running. Starting it now (typically 30-60 seconds)..." >&2
             "$exe" >/dev/null 2>&1 &
             ;;
-        macos)
+        docker:macos)
             echo "[harness] Docker Desktop is not running. Starting it now (typically 30-60 seconds)..." >&2
             if ! open -a Docker >/dev/null 2>&1; then
                 echo "[harness] Failed to launch Docker Desktop. Please start it manually." >&2
                 return 1
             fi
             ;;
-        linux)
+        docker:linux)
             echo "[harness] Docker daemon not running on Linux. Start it with one of:" >&2
             echo "[harness]   sudo systemctl start docker" >&2
             echo "[harness]   sudo service docker start" >&2
             return 1
             ;;
+        podman:windows|podman:macos)
+            if ! command -v podman >/dev/null 2>&1; then
+                echo "[harness] podman not found on PATH; cannot auto-start." >&2
+                return 1
+            fi
+            echo "[harness] Podman machine is not running. Starting it now..." >&2
+            if ! podman machine start >/dev/null 2>&1; then
+                echo "[harness] 'podman machine start' failed. Run it manually:" >&2
+                echo "[harness]   podman machine init   # if no machine yet" >&2
+                echo "[harness]   podman machine start" >&2
+                return 1
+            fi
+            ;;
+        podman:linux)
+            # Rootless podman doesn't have a long-running daemon — `podman info`
+            # spawns a short-lived helper as needed. If we got here, the
+            # initial probe failed for some other reason (PATH, permissions,
+            # broken install). Don't try to start anything; print the hint and
+            # let the caller surface the failure.
+            echo "[harness] podman info failed. Common causes on Linux:" >&2
+            echo "[harness]   - rootless not configured: see https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md" >&2
+            echo "[harness]   - subuid/subgid not set for your user:    cat /etc/subuid /etc/subgid" >&2
+            echo "[harness]   - if you want podman's REST API socket:   systemctl --user start podman.socket" >&2
+            return 1
+            ;;
         *)
-            echo "[harness] Unknown OS; cannot auto-start Docker. Please start it manually." >&2
+            echo "[harness] Unknown runtime/OS combination ($rt/$os); cannot auto-start. Please start it manually." >&2
             return 1
             ;;
     esac
 
-    # Poll for daemon availability
+    # Poll for runtime availability.
     local elapsed=0
     while (( elapsed < timeout )); do
         if harness_docker_running; then
-            echo "[harness] Docker is now running." >&2
+            echo "[harness] $rt is now running." >&2
             return 0
         fi
         sleep 2
@@ -283,11 +403,15 @@ harness_start_docker_desktop() {
         fi
     done
 
-    echo "[harness] Docker did not become available within ${timeout}s." >&2
+    echo "[harness] $rt did not become available within ${timeout}s." >&2
     return 1
 }
 
-# Ensure docker is running; auto-start if possible. Hard exit if not.
+# Friendly alias for the runtime-agnostic name.
+harness_start_runtime() { harness_start_docker_desktop "$@"; }
+
+# Ensure the container runtime is running; auto-start if possible. Hard exit
+# if not. Kept named harness_require_docker for backwards compatibility.
 harness_require_docker() {
     if harness_docker_running; then
         return 0
@@ -295,9 +419,14 @@ harness_require_docker() {
     if harness_start_docker_desktop; then
         return 0
     fi
-    echo "[harness] Docker is required but not available. Aborting." >&2
+    local rt
+    rt=$(harness_container_runtime)
+    echo "[harness] $rt is required but not available. Aborting." >&2
     exit 1
 }
+
+# Friendly alias.
+harness_require_runtime() { harness_require_docker; }
 
 # === Preflight check primitives (used by both install.sh and harness) ===
 

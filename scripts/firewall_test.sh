@@ -95,11 +95,11 @@ cleanup_neg() {
 }
 trap cleanup_neg EXIT INT TERM
 
-docker compose --project-name "$PROJECT_NEG" \
+harness_docker compose --project-name "$PROJECT_NEG" \
     -f docker-compose.yml -f "$OVERRIDE_NEG" \
     down -v --remove-orphans >/dev/null 2>&1 || true
 
-COMPOSE_NEG=(docker compose --project-name "$PROJECT_NEG" --env-file "$ENV_NEG" \
+COMPOSE_NEG=(harness_docker compose --project-name "$PROJECT_NEG" --env-file "$ENV_NEG" \
     -f docker-compose.yml -f "$OVERRIDE_NEG")
 
 test_section "Phase 2: PROXY_API_URL guardrail (negative)"
@@ -141,7 +141,7 @@ fi
 # python server never starts.)
 proxy_cid=$("${COMPOSE_NEG[@]}" ps -q proxy 2>/dev/null || true)
 if [[ -n "$proxy_cid" ]]; then
-    health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$proxy_cid" 2>/dev/null || echo "none")
+    health=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$proxy_cid" 2>/dev/null || echo "none")
     if [[ "$health" == "healthy" ]]; then
         echo "[fw] FAIL: proxy reports healthy despite guardrail FATAL" >&2
         exit 1
@@ -190,11 +190,11 @@ cleanup_byp() {
 trap cleanup_byp EXIT INT TERM
 
 # Defensive cleanup of any straggler from previous runs.
-docker compose --project-name "$PROJECT_BYP" \
+harness_docker compose --project-name "$PROJECT_BYP" \
     -f docker-compose.yml -f "$OVERRIDE_BYP" -f "$BYPASS_ENV_FILE" \
     down -v --remove-orphans >/dev/null 2>&1 || true
 
-COMPOSE_BYP=(docker compose --project-name "$PROJECT_BYP" --env-file "$ENV_BYP" \
+COMPOSE_BYP=(harness_docker compose --project-name "$PROJECT_BYP" --env-file "$ENV_BYP" \
     -f docker-compose.yml -f "$OVERRIDE_BYP" -f "$BYPASS_ENV_FILE")
 
 test_section "Phase 3: HARNESS_FIREWALL_DISABLED=1 bypass"

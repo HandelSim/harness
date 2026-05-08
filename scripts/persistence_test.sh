@@ -40,8 +40,8 @@ echo "============================================================"
 
 # --- preflight --------------------------------------------------------------
 
-if ! docker info >/dev/null 2>&1; then
-    echo "[persist] ERROR: docker daemon not reachable" >&2
+if ! harness_docker info >/dev/null 2>&1; then
+    echo "[persist] ERROR: container runtime ($(harness_container_runtime)) not reachable" >&2
     exit 1
 fi
 
@@ -57,8 +57,8 @@ cleanup() {
 
     # Some tests start named containers; remove any survivors. Names use a
     # fixed prefix so we don't have to track individual ids.
-    docker ps -aq --filter "label=harness-persist-test=1" 2>/dev/null \
-        | xargs -r docker rm -f >/dev/null 2>&1 || true
+    harness_docker ps -aq --filter "label=harness-persist-test=1" 2>/dev/null \
+        | xargs -r harness_docker rm -f >/dev/null 2>&1 || true
 
     # Files written into the bind mount were owned by uid 1000 inside the
     # container, which IS the host caller's uid (we don't remap in this
@@ -82,11 +82,11 @@ trap cleanup EXIT INT TERM
 # runs first in CI and primes the image cache. If the image isn't there
 # (running this test in isolation), build it via compose --profile agent.
 
-if ! docker image inspect harness-agent:latest >/dev/null 2>&1; then
+if ! harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
     echo "[persist] building harness-agent (image not cached)"
     # Build context only — we don't need ollama/proxy services for this
     # test, so we skip --env-file and the up dance.
-    docker compose \
+    harness_docker compose \
         --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         --profile agent build agent >"${TEST_ROOT}/build.log" 2>&1 \

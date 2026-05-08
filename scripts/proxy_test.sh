@@ -22,6 +22,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
 PROJECT_NAME="harness-proxy-test"
 
 echo "============================================================"
@@ -30,8 +33,8 @@ echo "============================================================"
 
 # --- preflight ---------------------------------------------------------------
 
-if ! docker info >/dev/null 2>&1; then
-    echo "[proxy-test] ERROR: docker daemon is not reachable" >&2
+if ! harness_docker info >/dev/null 2>&1; then
+    echo "[proxy-test] ERROR: container runtime ($(harness_container_runtime)) is not reachable" >&2
     exit 1
 fi
 
@@ -109,7 +112,7 @@ registry.npmjs.org
 EOF
 export HARNESS_ALLOWLIST_PATH="${ALLOWLIST_FILE}"
 
-COMPOSE=(docker compose --project-name "${PROJECT_NAME}" --env-file "${ENV_FILE}" -f docker-compose.yml -f "${OVERRIDE_FILE}")
+COMPOSE=(harness_docker compose --project-name "${PROJECT_NAME}" --env-file "${ENV_FILE}" -f docker-compose.yml -f "${OVERRIDE_FILE}")
 
 cleanup() {
     echo "[proxy-test] cleanup: tearing down compose state"
@@ -139,7 +142,7 @@ is_healthy() {
     cid="$("${COMPOSE[@]}" ps -q "${svc}" 2>/dev/null || true)"
     if [[ -z "${cid}" ]]; then return 1; fi
     local status
-    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" 2>/dev/null || echo "none")"
+    status="$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" 2>/dev/null || echo "none")"
     [[ "${status}" == "healthy" ]]
 }
 

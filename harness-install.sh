@@ -84,8 +84,9 @@ install_root="$cwd/$CLONE_DIR"
 #
 # install.sh runs BEFORE the clone, so scripts/lib/platform.sh from the
 # repo isn't yet available. We inline the minimum subset of helpers needed
-# in the early phases (OS detection, docker check, Docker Desktop start).
-# After the clone we source the full library for the rest of the script.
+# in the early phases (OS detection, container runtime check, runtime
+# auto-start). After the clone we source the full library for the rest of
+# the script.
 
 _inline_detect_os() {
     case "$(uname -s)" in
@@ -96,15 +97,44 @@ _inline_detect_os() {
     esac
 }
 
-_inline_docker_running() { docker info >/dev/null 2>&1; }
+# Resolve the container runtime once. Honors $HARNESS_CONTAINER_RUNTIME if
+# set; otherwise auto-detects: docker first, then podman. The result is
+# cached in _inline_runtime_cache after the first call.
+_inline_container_runtime() {
+    if [[ -n "${_inline_runtime_cache:-}" ]]; then
+        printf '%s' "$_inline_runtime_cache"
+        return 0
+    fi
+    local rt=""
+    if [[ -n "${HARNESS_CONTAINER_RUNTIME:-}" ]]; then
+        case "$HARNESS_CONTAINER_RUNTIME" in
+            docker|podman) rt="$HARNESS_CONTAINER_RUNTIME" ;;
+            *) rt="" ;;
+        esac
+    fi
+    if [[ -z "$rt" ]]; then
+        if command -v docker >/dev/null 2>&1; then
+            rt=docker
+        elif command -v podman >/dev/null 2>&1; then
+            rt=podman
+        else
+            rt=docker
+        fi
+    fi
+    _inline_runtime_cache="$rt"
+    printf '%s' "$rt"
+}
+
+_inline_docker_running() { "$(_inline_container_runtime)" info >/dev/null 2>&1; }
 
 _inline_start_docker() {
     local timeout=90
-    local os
+    local os rt
     os=$(_inline_detect_os)
+    rt=$(_inline_container_runtime)
 
-    case "$os" in
-        windows)
+    case "$rt:$os" in
+        docker:windows)
             local exe="/c/Program Files/Docker/Docker/Docker Desktop.exe"
             if [[ ! -f "$exe" ]]; then
                 echo "  Docker Desktop not found at expected path: $exe" >&2
@@ -114,21 +144,37 @@ _inline_start_docker() {
             echo "  Docker Desktop is not running. Starting it now (typically 30-60 seconds)..." >&2
             "$exe" >/dev/null 2>&1 &
             ;;
-        macos)
+        docker:macos)
             echo "  Docker Desktop is not running. Starting it now (typically 30-60 seconds)..." >&2
             if ! open -a Docker >/dev/null 2>&1; then
                 echo "  Failed to launch Docker Desktop. Please start it manually." >&2
                 return 1
             fi
             ;;
-        linux)
+        docker:linux)
             echo "  Docker daemon not running on Linux. Start it with one of:" >&2
             echo "    sudo systemctl start docker" >&2
             echo "    sudo service docker start" >&2
             return 1
             ;;
+        podman:windows|podman:macos)
+            echo "  Podman machine not running. Starting it now..." >&2
+            if ! podman machine start >/dev/null 2>&1; then
+                echo "  'podman machine start' failed. Run it manually:" >&2
+                echo "    podman machine init   # if no machine yet" >&2
+                echo "    podman machine start" >&2
+                return 1
+            fi
+            ;;
+        podman:linux)
+            echo "  podman info failed. Common causes on Linux:" >&2
+            echo "    - rootless not configured: see https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md" >&2
+            echo "    - subuid/subgid not set:    cat /etc/subuid /etc/subgid" >&2
+            echo "    - if you want podman's REST API socket: systemctl --user start podman.socket" >&2
+            return 1
+            ;;
         *)
-            echo "  Unknown OS; cannot auto-start Docker. Please start it manually." >&2
+            echo "  Unknown runtime/OS combination ($rt/$os); cannot auto-start. Please start it manually." >&2
             return 1
             ;;
     esac
@@ -136,7 +182,7 @@ _inline_start_docker() {
     local elapsed=0
     while (( elapsed < timeout )); do
         if _inline_docker_running; then
-            echo "  Docker is now running." >&2
+            echo "  $rt is now running." >&2
             return 0
         fi
         sleep 2
@@ -146,7 +192,7 @@ _inline_start_docker() {
         fi
     done
 
-    echo "  Docker did not become available within ${timeout}s." >&2
+    echo "  $rt did not become available within ${timeout}s." >&2
     return 1
 }
 
@@ -157,6 +203,22 @@ _inline_check_command() {
         return 0
     fi
     echo "  ✗ $desc — '$cmd' not found in PATH"
+    return 1
+}
+
+# Variant: pass if EITHER of two commands is found. Used for the
+# docker-or-podman preflight gate.
+_inline_check_either_command() {
+    local cmd_a="$1" cmd_b="$2" desc="$3"
+    if command -v "$cmd_a" >/dev/null 2>&1; then
+        echo "  ✓ $desc (using $cmd_a)"
+        return 0
+    fi
+    if command -v "$cmd_b" >/dev/null 2>&1; then
+        echo "  ✓ $desc (using $cmd_b)"
+        return 0
+    fi
+    echo "  ✗ $desc — neither '$cmd_a' nor '$cmd_b' found in PATH"
     return 1
 }
 
@@ -172,25 +234,33 @@ preflight() {
     title "preflight checks"
 
     _inline_check_command git "git" || errors=$((errors+1))
-    _inline_check_command docker "docker" || errors=$((errors+1))
+    _inline_check_either_command docker podman "container runtime (docker or podman)" \
+        || errors=$((errors+1))
 
-    if ! docker compose version >/dev/null 2>&1; then
-        echo "  ✗ docker compose v2 — 'docker compose' subcommand not available"
-        echo "    (you may have docker, but need compose v2 specifically)"
+    local rt
+    rt=$(_inline_container_runtime)
+
+    if ! "$rt" compose version >/dev/null 2>&1; then
+        echo "  ✗ $rt compose — 'compose' subcommand not available"
+        if [[ "$rt" == "docker" ]]; then
+            echo "    (you may have docker, but need compose v2 specifically)"
+        else
+            echo "    (podman 4.0+ is required for the built-in 'podman compose' subcommand)"
+        fi
         errors=$((errors+1))
     else
-        echo "  ✓ docker compose v2"
+        echo "  ✓ $rt compose"
     fi
 
-    # Docker daemon (with auto-start attempt on Win/Mac)
+    # Container runtime (with auto-start attempt on Win/Mac)
     if _inline_docker_running; then
-        echo "  ✓ docker daemon"
+        echo "  ✓ $rt runtime"
     else
-        echo "  - docker daemon not running; attempting auto-start..."
+        echo "  - $rt runtime not reachable; attempting auto-start..."
         if _inline_start_docker; then
-            echo "  ✓ docker daemon (started)"
+            echo "  ✓ $rt runtime (started)"
         else
-            echo "  ✗ docker daemon not running"
+            echo "  ✗ $rt runtime not running"
             errors=$((errors+1))
         fi
     fi
@@ -511,7 +581,7 @@ Need a shell inside an agent container (for installing skills, debugging)?
 
 If 'harness start' fails after configuration:
   harness preflight                   # validates .env and allowlist
-  docker logs harness-proxy-1         # see what the proxy says
+  <runtime> logs harness-proxy-1      # see what the proxy says (runtime: docker or podman)
 EOF
 
 cat <<EOF
