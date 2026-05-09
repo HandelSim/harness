@@ -194,3 +194,235 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker system prune -f --volumes || true
+
+  # ---------------------------------------------------------------------------
+  # Auto-fix on failure (inlined from the former ci-failure-claude.yml watcher).
+  #
+  # Why inline instead of a separate `workflow_run` watcher: GitHub only fires
+  # `workflow_run` for workflow files that live on the default branch (`main`).
+  # The watcher previously lived only on `dev`, so it never registered and no
+  # auto-fix issue was created when CI failed on dev. Inlining sidesteps the
+  # default-branch trap entirely — `push: dev` triggers fire from any branch,
+  # so this just works.
+  #
+  # The two jobs below preserve the watcher's original semantic split:
+  #   1) failure_triage — always logs the failure on a dedupe-by-SHA issue
+  #      and counts attempts. Runs even after the 5-cap is hit so reruns of
+  #      the same failing SHA still get a paper trail.
+  #   2) failure_invoke_claude — runs only when the triage cap allows it,
+  #      and bypasses the `@claude`-mention sender gate by invoking
+  #      `claude-code-action` directly.
+  # ---------------------------------------------------------------------------
+
+  failure_triage:
+    name: Auto-fix on failure (triage)
+    needs: [lint, unit, docker-tests, pipeline, integration]
+    if: >-
+      failure() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: read
+    outputs:
+      issue_number: ${{ steps.issue.outputs.number }}
+      should_invoke: ${{ steps.cap.outputs.should_invoke }}
+      sha: ${{ steps.ctx.outputs.sha }}
+      sha7: ${{ steps.ctx.outputs.sha7 }}
+      run_url: ${{ steps.ctx.outputs.run_url }}
+    steps:
+      - name: Checkout (for log fetch + git author check)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+
+      - name: Build context
+        id: ctx
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "sha=${SHA}"           >> "$GITHUB_OUTPUT"
+          echo "sha7=${SHA:0:7}"      >> "$GITHUB_OUTPUT"
+          echo "run_url=${run_url}"   >> "$GITHUB_OUTPUT"
+
+      - name: Skip if last dev commit was bot-authored
+        # If the most recent commit on dev is from the auto-fix loop, that
+        # means a Claude run is already in flight or just landed. Re-firing
+        # would race or stack a redundant attempt; bail out and let the
+        # next push (which will produce a new SHA + new issue) handle it.
+        id: bot_check
+        run: |
+          author_email="$(git log -1 --pretty='%ae' "${{ steps.ctx.outputs.sha }}")"
+          author_name="$(git log -1 --pretty='%an' "${{ steps.ctx.outputs.sha }}")"
+          echo "Last commit author: ${author_name} <${author_email}>"
+          if [[ "${author_email}" == *"claude[bot]"* ]] \
+              || [[ "${author_email}" == *"users.noreply.github.com"* && "${author_name}" == *"claude"* ]] \
+              || [[ "${author_name}" == "claude[bot]" ]]; then
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find or create the failure issue
+        if: steps.bot_check.outputs.skip != 'true'
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          SHA7: ${{ steps.ctx.outputs.sha7 }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+          RUN_URL: ${{ steps.ctx.outputs.run_url }}
+        run: |
+          set -euo pipefail
+          title="CI failure on dev: ${SHA7}"
+          # gh issue list with --search "in:title" matches loosely; use
+          # exact-title check on the JSON output.
+          existing="$(gh issue list \
+              --state open \
+              --label ci-failure \
+              --search "${title} in:title" \
+              --json number,title \
+              --jq ".[] | select(.title == \"${title}\") | .number" \
+              | head -n1)"
+          if [[ -n "${existing}" ]]; then
+            echo "Found existing issue #${existing}"
+            echo "number=${existing}" >> "$GITHUB_OUTPUT"
+            echo "created=false"      >> "$GITHUB_OUTPUT"
+          else
+            body=$(cat <<EOF
+          A CI run on \`dev\` failed at commit [\`${SHA7}\`](https://github.com/${{ github.repository }}/commit/${SHA}).
+
+          - Failed run: ${RUN_URL}
+          - Triggered by: inline \`failure_triage\` job in the CI workflow
+
+          The auto-fix workflow will append failed-step logs as a comment and
+          (per CLAUDE.md "When triggered by a CI failure") invoke Claude to
+          investigate and push a fix directly to \`dev\`.
+
+          If five attempts on this SHA have already failed, the watcher
+          stops triggering and pings @HandelSim for review.
+          EOF
+          )
+            num="$(gh issue create \
+                --title "${title}" \
+                --label ci-failure \
+                --body "${body}" \
+              | grep -oE '/issues/[0-9]+' | grep -oE '[0-9]+' | head -n1)"
+            echo "Created issue #${num}"
+            echo "number=${num}"   >> "$GITHUB_OUTPUT"
+            echo "created=true"    >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Append failed-step logs to the issue
+        if: steps.bot_check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          ISSUE: ${{ steps.issue.outputs.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ steps.ctx.outputs.run_url }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          # gh run view --log-failed prints only failed-step output. Cap at
+          # the last ~400 lines so giant test outputs don't blow up the
+          # comment body or the prompt context.
+          gh run view "${RUN_ID}" --log-failed > "$tmp" 2>&1 || true
+          tail_lines=400
+          tail -n "${tail_lines}" "$tmp" > "${tmp}.tail"
+          {
+            echo "<!-- ci-failure-attempt run-${RUN_ID} -->"
+            echo "### CI failure: run [${RUN_ID}](${RUN_URL})"
+            echo
+            echo "Tail (\`last ${tail_lines}\` lines) of failed-step logs:"
+            echo
+            echo '```'
+            cat "${tmp}.tail"
+            echo '```'
+          } > "${tmp}.comment"
+          gh issue comment "${ISSUE}" --body-file "${tmp}.comment"
+
+      - name: Per-SHA attempt cap (max 5)
+        if: steps.bot_check.outputs.skip != 'true'
+        id: cap
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          ISSUE: ${{ steps.issue.outputs.number }}
+        run: |
+          set -euo pipefail
+          # Count attempt markers on the issue. Each watcher-fired comment
+          # carries `<!-- ci-failure-attempt run-... -->`; that's our
+          # canonical attempt counter (it's what gets logged regardless of
+          # whether Claude was actually invoked, so reruns of the same
+          # failing SHA still count).
+          count="$(gh issue view "${ISSUE}" --json comments \
+              --jq '[.comments[] | select(.body | contains("<!-- ci-failure-attempt"))] | length')"
+          echo "Attempt comments on issue #${ISSUE}: ${count}"
+          if [[ "${count}" -gt 5 ]]; then
+            gh issue comment "${ISSUE}" --body \
+              "Per-SHA attempt cap (5) reached on this SHA. Watcher will not invoke Claude again. @HandelSim please review."
+            echo "should_invoke=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_invoke=true"  >> "$GITHUB_OUTPUT"
+          fi
+
+  failure_invoke_claude:
+    name: Auto-fix on failure (invoke Claude)
+    needs: failure_triage
+    if: needs.failure_triage.outputs.should_invoke == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          ref: dev
+
+      - name: Run Claude (auto-fix mode)
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          base_branch: dev
+          branch_prefix: 'agent/'
+          track_progress: true
+          prompt: |
+            A CI test failed on `dev`. Operate per the
+            "When triggered by a CI failure (label: `ci-failure`)"
+            section of CLAUDE.md.
+
+            Context:
+            - Issue: #${{ needs.failure_triage.outputs.issue_number }}
+            - Repository: ${{ github.repository }}
+            - Dev SHA at failure: ${{ needs.failure_triage.outputs.sha }} (`${{ needs.failure_triage.outputs.sha7 }}`)
+            - Failed CI run: ${{ needs.failure_triage.outputs.run_url }}
+
+            The issue body and its comments contain the failed-step logs
+            from the watcher. Investigate (read code, search the web, run
+            targeted tests locally as needed), fix the underlying problem,
+            push to `dev` via the standard rebase + `--ff-only` flow, and
+            close the issue with a fix summary, commit SHA, and link to
+            the originally-failing run.
+
+            If after full investigation the failure falls into the
+            "Must fall back to research-and-propose" list (security-relevant
+            code, public API change, multiple plausible root causes after
+            investigation, etc.), comment your proposal on the issue and
+            stop — do not push.
+
+            The 5-attempt-per-SHA cap is enforced upstream by the watcher,
+            but you should still self-cap as instructed in CLAUDE.md.
+          claude_args: |
+            --model claude-opus-4-7
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Read,Edit,Write,MultiEdit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,NotebookRead,NotebookEdit"
