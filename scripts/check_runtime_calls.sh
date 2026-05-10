@@ -34,17 +34,17 @@ cd "${REPO_ROOT}"
 files=(
     harness
     harness-install.sh
-    scripts/lib/test_helpers.sh
     scripts/lib/upgrade_actions.sh
     scripts/lib/net_helpers.sh
-    scripts/firewall_test.sh
-    scripts/full_pipeline_test.sh
-    scripts/harness_test.sh
-    scripts/integration_test.sh
-    scripts/mcp_test.sh
-    scripts/persistence_test.sh
-    scripts/proxy_test.sh
-    scripts/upgrade_test.sh
+    tests/lib/test_helpers.sh
+    tests/firewall_test.sh
+    tests/full_pipeline_test.sh
+    tests/harness_test.sh
+    tests/integration_test.sh
+    tests/mcp_test.sh
+    tests/persistence_test.sh
+    tests/proxy_test.sh
+    tests/upgrade_test.sh
 )
 
 # Lines that legitimately contain `docker` as a literal:

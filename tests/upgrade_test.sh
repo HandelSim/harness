@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/upgrade_test.sh — exercise the upgrade action types and a
+# tests/upgrade_test.sh — exercise the upgrade action types and a
 # synthetic version-N → N+1 upgrade end-to-end.
 #
 # This test does NOT require docker. It runs entirely against the host

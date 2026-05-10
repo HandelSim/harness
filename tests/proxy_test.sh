@@ -74,8 +74,8 @@ services:
       MOCK_SCENARIO: ${MOCK_SCENARIO:-text}
       MOCK_FIXTURES_DIR: ${MOCK_FIXTURES_DIR:-}
     volumes:
-      - ./scripts/mock_upstream.py:/app/mock_upstream.py:ro
-      - ./scripts/fixtures/responses:/fixtures:ro
+      - ./tests/mock_upstream.py:/app/mock_upstream.py:ro
+      - ./tests/fixtures/responses:/fixtures:ro
     networks:
       - harness-net
     expose:
@@ -371,7 +371,7 @@ echo "${D_RAW}" | tail -1 | grep -q '"done":true' \
 # --- Scenario E: multiple tool calls in one response ------------------------
 #
 # Exercises the proxy's multi-call extraction end-to-end via
-# scripts/fixtures/responses/07_multi_tool_calls.json. The fixture's
+# tests/fixtures/responses/07_multi_tool_calls.json. The fixture's
 # response has TWO ```json``` blocks; the proxy must surface BOTH as
 # distinct tool_calls with unique toolu_ ids.
 

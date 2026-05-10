@@ -116,10 +116,10 @@ as under Docker.
 
 ## Smoke test
 
-A standalone smoke test lives at `scripts/podman_smoke_test.sh`:
+A standalone smoke test lives at `tests/podman_smoke_test.sh`:
 
 ```bash
-bash scripts/podman_smoke_test.sh
+bash tests/podman_smoke_test.sh
 ```
 
 It pins `HARNESS_CONTAINER_RUNTIME=podman`, brings up a temp install root,

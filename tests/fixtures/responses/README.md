@@ -1,6 +1,6 @@
 # mock-upstream response fixtures
 
-Each `*.json` file in this directory is one fixture for `scripts/mock_upstream.py`.
+Each `*.json` file in this directory is one fixture for `tests/mock_upstream.py`.
 At startup the mock loads them lexicographically and, on every request,
 matches the **most recent user-message content** against each fixture's
 `match` regex (case-insensitive, multiline). The first hit wins.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/firewall_test.sh — focused checks that the per-container egress
+# tests/firewall_test.sh — focused checks that the per-container egress
 # firewall (firewall/init-firewall.sh) is actually applied at runtime.
 #
 # Verifies firewall negative path and bypass behavior:
@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-source "${REPO_ROOT}/scripts/lib/test_helpers.sh"
+source "${REPO_ROOT}/tests/lib/test_helpers.sh"
 
 require_docker
 

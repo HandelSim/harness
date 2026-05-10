@@ -50,7 +50,7 @@ exit_or_return() {
     fi
 }
 
-# The default points at the public GitHub remote. scripts/full_pipeline_test.sh
+# The default points at the public GitHub remote. tests/full_pipeline_test.sh
 # overrides this via HARNESS_REPO_URL=<local-path> so the pipeline test can
 # clone the working tree under test without needing a network round-trip.
 # `git clone` accepts a local directory as a URL, so any path on disk works.
