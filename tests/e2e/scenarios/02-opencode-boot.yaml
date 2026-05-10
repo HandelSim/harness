@@ -1,0 +1,53 @@
+name: 02-opencode-boot
+inventory_refs: [F044, A018]
+description: |
+  Same as 01-claude-boot but for opencode: boot `harness opencode`,
+  wait for its TUI to render, exit cleanly.
+
+  Inventory refs:
+    - F044 — `harness opencode` launches the agent container in opencode mode
+    - A018 — `ensure_opencode_config` writes opencode.json on every launch
+      (boot path exercises the config-write side-effect)
+
+setup:
+  env:
+    TERM: xterm-256color
+    PROXY_API_URL: http://127.0.0.1:9000
+    PROXY_API_KEY: test-key
+    PROXY_API_MODEL: claude-sonnet-4-5
+  tmux:
+    width: 200
+    height: 50
+  default_timeout_s: 30
+
+steps:
+  # Boot the opencode TUI. opencode's prompt glyph differs from claude's;
+  # we use a looser marker — "opencode" is in the banner of any opencode
+  # boot screen we've seen. If the boot output changes, tighten this.
+  - launch: "./harness opencode"
+    wait_for_marker: "opencode"
+    timeout_s: 45
+
+  - sleep_s: 0.5
+
+  - capture_assertions:
+      - not_contains: "Traceback"
+      - not_contains: "Error:"
+      - contains: "opencode"
+
+  # Exit. opencode honors Ctrl-C for quit on most builds; fall back to
+  # Ctrl-D if the TUI does not exit cleanly.
+  - send_key: C-c
+    wait_stable_ms: 300
+    timeout_s: 10
+  - send_key: C-d
+    wait_stable_ms: 500
+    timeout_s: 10
+
+  - capture_assertions:
+      - not_contains: "Traceback"
+      - not_contains: "panic:"
+
+cleanup:
+  kill_session: true
+  archive_transcript: true

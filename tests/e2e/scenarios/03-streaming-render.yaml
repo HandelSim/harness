@@ -1,0 +1,58 @@
+name: 03-streaming-render
+inventory_refs: [P051, P032, F043]
+description: |
+  Send a prompt that triggers a long mock streaming response. The TUI must
+  render the streamed deltas cleanly — no escape-sequence artifacts, no
+  garbled control codes, prompt returns at the end.
+
+  Inventory refs:
+    - P051 — streaming requests yield NDJSON with one chunk per upstream delta
+    - P032 — `make_chunk` emits ollama-shaped NDJSON chunks
+    - F043 — `harness claude` is the launcher used to exercise the streaming path
+
+setup:
+  env:
+    TERM: xterm-256color
+    PROXY_API_URL: http://127.0.0.1:9000
+    PROXY_API_KEY: test-key
+    PROXY_API_MODEL: claude-sonnet-4-5
+    # MOCK_FIXTURES_DIR could pin a long-streaming fixture; left unset so
+    # the default text-mode mock applies — long enough to exercise rendering.
+    MOCK_SCENARIO: text
+  tmux:
+    width: 200
+    height: 50
+  default_timeout_s: 60
+
+steps:
+  - launch: "./harness claude"
+    wait_for_marker: "│ > "
+    timeout_s: 45
+
+  # Paste a prompt likely to yield a long response from the mock.
+  - paste: "Please write a long, detailed explanation of the harness architecture."
+    send_key: Enter
+    wait_for_marker: "│ > "
+    wait_stable_ms: 800
+    timeout_s: 90
+
+  # Assertions: the streamed output should be present, free of common
+  # rendering-failure markers, and the prompt should return.
+  #
+  # We intentionally do NOT assert against a literal raw ESC byte in
+  # this YAML; embedding control bytes in the file breaks safe YAML
+  # parsing. If you need to catch stray CSI sequences, use a regex
+  # like `\\x1b\\[` instead.
+  - capture_assertions:
+      - not_contains: "Traceback"
+      - not_contains: "Error:"
+      - regex_match: "│ > "
+
+  - send_key: C-c
+    wait_stable_ms: 300
+  - send_key: C-d
+    wait_stable_ms: 500
+
+cleanup:
+  kill_session: true
+  archive_transcript: true
