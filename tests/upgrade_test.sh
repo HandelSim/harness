@@ -140,6 +140,72 @@ T2_OUT2=$(upgrade_linefile_merge "${T2_DIR}/source.list" "${T2_DIR}/target.list"
 [[ "$(json_field 'added_lines | length' "${T2_OUT2}")" == "0" ]] || fail "T2: idempotency broken"
 ok "linefile_merge: append + annotation-diff warning + idempotency"
 
+# === Test 2b: linefile_merge — target missing trailing newline ===========
+#
+# U012 in the inventory: `upgrade_linefile_merge` must ensure the target
+# file ends with a newline before appending. Without this safety net, a
+# target file that was hand-edited (or produced by a tool that omits the
+# trailing newline) would have the first appended line glued onto the
+# last existing entry, e.g. `host-b.example# Added by harness upgrade...`,
+# silently corrupting the user's allowlist.
+#
+# The default T2 target above is constructed via a heredoc which always
+# ends in \n, so the newline-injection path is NOT exercised by T2. This
+# block constructs a target with NO trailing newline and asserts that the
+# appended content lives on its own line.
+
+echo
+echo "--- T2b: linefile_merge into target without trailing newline ---"
+T2B_DIR="${WORK}/t2b"
+mkdir -p "${T2B_DIR}"
+cat >"${T2B_DIR}/source.list" <<'EOF'
+host-a.example
+host-new.example
+EOF
+# Target ends with the literal bytes "host-a.example" — no trailing \n.
+# Use printf (not heredoc / not echo) to guarantee absence of newline.
+printf 'host-a.example' >"${T2B_DIR}/target.list"
+
+# Inventory U012: target must NOT end with a newline before the merge
+# (precondition for this test — guards against future refactors that
+# accidentally normalize the fixture). `tail -c 1 | od` survives bash's
+# command-substitution stripping of trailing newlines (a naked `$(tail
+# -c 1 ...)` would return an empty string for both "ends with \n" and
+# "is empty", which is exactly the bug we are trying to NOT have here).
+T2B_PRE_LAST=$(tail -c 1 "${T2B_DIR}/target.list" | od -An -tx1 | tr -d ' \n')
+[[ "${T2B_PRE_LAST}" != "0a" ]] \
+    || fail "T2b: precondition violated — target fixture already ends in newline"
+
+T2B_OUT=$(upgrade_linefile_merge "${T2B_DIR}/source.list" "${T2B_DIR}/target.list" 0)
+T2B_ADDED=$(json_field 'added_lines | join(",")' "${T2B_OUT}")
+[[ "${T2B_ADDED}" == "host-new.example" ]] \
+    || fail "T2b: expected added=[host-new.example], got [${T2B_ADDED}]"
+
+# Inventory U012: appended line must live on its own line — no
+# `host-a.examplehost-new.example` or `host-a.example# Added by...`
+# glued-together result.
+grep -Eq '^host-new\.example$' "${T2B_DIR}/target.list" \
+    || fail "U012: host-new.example not on its own line in target after merge"
+
+# Inventory U012: the original last entry must remain intact on its own
+# line (no junk suffix from a missing-newline-induced glue).
+grep -Eq '^host-a\.example$' "${T2B_DIR}/target.list" \
+    || fail "U012: host-a.example was corrupted by missing-newline append"
+
+# Inventory U012: the post-merge target must end with a newline (the
+# injected newline + the appended block, which itself ends in \n).
+# See precondition note above re: od for byte-accurate comparison.
+T2B_POST_LAST=$(tail -c 1 "${T2B_DIR}/target.list" | od -An -tx1 | tr -d ' \n')
+[[ "${T2B_POST_LAST}" == "0a" ]] \
+    || fail "U012: post-merge target does not end with newline (last byte hex: ${T2B_POST_LAST})"
+
+# Inventory U012: the marker comment from the merge must be on its own
+# line, not glued to the previous entry.
+grep -Eq '^# Added by harness upgrade on 2026-04-25$' "${T2B_DIR}/target.list" \
+    || fail "U012: marker comment is not on its own line in the post-merge target"
+
+ok "T2b: linefile_merge injects newline before appending when target lacks one"
+
 # === Test 4: directory_overwrite core ====================================
 
 echo
@@ -442,6 +508,77 @@ confirm_case $'\r'    0 "bare CR (empty after strip)"
 
 unset HARNESS_CONFIRM_FROM_STDIN
 ok "T8: _upgrade_confirm correctly classifies y/n inputs and strips CR"
+
+# === Test 9: harness_jq fallback wired inside upgrade_actions.sh =========
+#
+# U025 in the inventory: `harness_jq` is defined as a standalone fallback
+# inside `upgrade_actions.sh` (gated by `declare -F harness_jq` so it
+# yields to the real harness-script definition when sourced from the CLI).
+# upgrade_actions.sh's own helpers (`_upg_json_array`, `_upg_json_str`)
+# pipe through `harness_jq`, so if the standalone fallback were missing
+# or broken, every JSON-emitting action would silently produce malformed
+# output even though `jq` exists on the host.
+#
+# Earlier tests (T1, T2, T4...) DO source upgrade_actions.sh standalone
+# (line 23), but they only assert that the eventual JSON is parseable by
+# `jq` — they don't isolate the fallback as a named entry point. This
+# block exercises `harness_jq` and the helpers that depend on it directly
+# so a regression like "harness_jq deleted from upgrade_actions.sh" is
+# caught by the test name, not by an unrelated failure deep in T6.
+#
+# Note: this asserts the host-jq path of the fallback (jq present →
+# delegate to jq). The docker-shim path of harness's full `harness_jq`
+# definition is tested elsewhere (F016 territory) — this test only owns
+# what upgrade_actions.sh ships.
+
+echo
+echo "--- T9: harness_jq fallback inside upgrade_actions.sh ---"
+
+# Inventory U025: the standalone fallback `harness_jq` must be defined
+# as a shell function after sourcing upgrade_actions.sh by itself (no
+# outer harness script in play).
+declare -F harness_jq >/dev/null 2>&1 \
+    || fail "U025: harness_jq is not defined after sourcing upgrade_actions.sh standalone"
+
+# Inventory U025: the fallback must behave as a jq wrapper for a basic
+# expression — proves it's actually wired up, not just declared.
+T9_JQ_OUT=$(printf '{"k":1}' | harness_jq -r '.k')
+[[ "${T9_JQ_OUT}" == "1" ]] \
+    || fail "U025: harness_jq fallback did not delegate to jq correctly (got '${T9_JQ_OUT}', want '1')"
+
+# Inventory U025: the fallback must handle the -Rs and -R/.|@. patterns
+# used by _upg_json_str / _upg_json_array, since those helpers route
+# through harness_jq.
+T9_STR_OUT=$(printf 'hello world' | harness_jq -Rs .)
+[[ "${T9_STR_OUT}" == '"hello world"' ]] \
+    || fail "U025: harness_jq -Rs did not produce expected JSON string (got '${T9_STR_OUT}')"
+
+# Inventory U025: `_upg_json_array` is the direct consumer of harness_jq
+# inside upgrade_actions.sh; verify it produces a valid JSON array. The
+# helper pipes through `harness_jq -R . | harness_jq -s .`, which by
+# default emits pretty-printed (multi-line) JSON, so we canonicalize via
+# jq -c before comparing.
+T9_ARR_OUT=$(_upg_json_array foo bar | jq -c .)
+[[ "${T9_ARR_OUT}" == '["foo","bar"]' ]] \
+    || fail "U025: _upg_json_array via harness_jq produced wrong output (got '${T9_ARR_OUT}')"
+
+# Inventory U025: empty-input edge case for _upg_json_array — must yield
+# '[]' without calling harness_jq (the fast path), proving the helper
+# stays consistent regardless of which path harness_jq takes.
+T9_EMPTY_OUT=$(_upg_json_array)
+[[ "${T9_EMPTY_OUT}" == '[]' ]] \
+    || fail "U025: _upg_json_array empty case produced '${T9_EMPTY_OUT}', want '[]'"
+
+# Inventory U025: `_upg_json_str` is the other direct consumer; verify it
+# routes through harness_jq and produces a valid JSON string literal.
+# Canonicalize via jq -c (the helper's `harness_jq -Rs .` output is a
+# single-line JSON string already, but we canonicalize for safety).
+T9_JSTR_OUT=$(_upg_json_str 'a/b "c"' | jq -c .)
+# After canonicalization expect a JSON string with backslash-escaped inner quotes.
+[[ "${T9_JSTR_OUT}" == '"a/b \"c\""' ]] \
+    || fail "U025: _upg_json_str via harness_jq produced wrong output (got '${T9_JSTR_OUT}')"
+
+ok "T9: harness_jq standalone fallback works and is consumed by upgrade_actions.sh helpers"
 
 echo
 echo "============================================================"
