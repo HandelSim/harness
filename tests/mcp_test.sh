@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/mcp_test.sh — exercise the `harness mcp` lifecycle without
+# tests/mcp_test.sh — exercise the `harness mcp` lifecycle without
 # pulling Serena. We synthesize a tiny fake MCP entry under a tmpdir,
 # point HARNESS_REGISTRY_DIR at it, and walk through enable / start /
 # verify-network / disable / verify-removed.
@@ -158,7 +158,7 @@ cat >"${FAKE_REGISTRY}/_test_mcp/client-config.json" <<'EOF'
 EOF
 
 cat >"${FAKE_REGISTRY}/_test_mcp/README.md" <<'EOF'
-# _test_mcp — fixture used by scripts/mcp_test.sh.
+# _test_mcp — fixture used by tests/mcp_test.sh.
 EOF
 
 # Sanity: also register a "non-test" entry so we can verify list filtering.

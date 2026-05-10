@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/full_pipeline_test.sh — full installation-to-running pipeline test.
+# tests/full_pipeline_test.sh — full installation-to-running pipeline test.
 #
 # This is the most comprehensive automated test we ship. It:
 #
@@ -297,7 +297,7 @@ echo "[pipeline] T5 OK"
 # `docker run -d` it with --network and --network-alias.
 
 echo "[pipeline] T6: launch mockupstream on ${NETWORK}"
-mock_py_host=$(harness_docker_path "${REPO_ROOT}/scripts/mock_upstream.py")
+mock_py_host=$(harness_docker_path "${REPO_ROOT}/tests/mock_upstream.py")
 harness_docker run -d \
     --name "${MOCK_NAME}" \
     --network "${NETWORK}" \
@@ -425,7 +425,7 @@ fi
 # altogether. T9 (`harness claude -p "say hello"`) already covers the
 # end-to-end mock round-trip for claude, and T10 covers it for opencode,
 # so the tmux flow had no unique coverage. The harness list + harness stop
-# coverage T11 also did is provided by scripts/harness_test.sh.
+# coverage T11 also did is provided by tests/harness_test.sh.
 
 # --- T12 (skipped here, see MANUAL_TEST_PROMPT.md) -------------------------
 #
@@ -465,7 +465,7 @@ echo "[pipeline] T15 OK"
 #
 # Build a fake MCP fixture under a tmp registry, enable + start it, verify
 # the service comes up healthy on harness-net, then disable and confirm
-# cleanup.  Same shape as scripts/mcp_test.sh but folded into the end-to-
+# cleanup.  Same shape as tests/mcp_test.sh but folded into the end-to-
 # end flow so we exercise the integration with services already running.
 
 echo "[pipeline] T16: MCP install + start + uninstall cycle"

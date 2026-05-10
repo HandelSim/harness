@@ -6,7 +6,7 @@
 > work through scenarios that automated tests can't cover (real LLM
 > responses, subjective UX, multi-session resilience).
 >
-> Automated coverage lives in `scripts/full_pipeline_test.sh`; that script
+> Automated coverage lives in `tests/full_pipeline_test.sh`; that script
 > uses a mock upstream and validates the wiring. This document validates
 > the things the wiring is wired to.
 
@@ -242,7 +242,7 @@ message is the thing we're testing here.
 
 ## Scenario J: Skill persistence
 
-> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh`
+> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash tests/integration_test.sh`
 > covers Phases 3.1–3.11 of this scenario non-interactively (pipx install of
 > graphifyy, host-bind-mount visibility, `graphify install` skill registration,
 > `graphify update .` against the test-project fixture, file-ownership UID match,
@@ -290,7 +290,7 @@ check in step 6.
 
 ## Scenario K': Same-path mounts and `--mount`
 
-> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh`
+> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash tests/integration_test.sh`
 > Phase 5 covers `pwd inside agent == host CWD`, `--mount` adds extras at
 > their host paths, and rejection of forbidden / nonexistent mounts.
 
@@ -337,7 +337,7 @@ Report whether each subcheck behaved as expected.
 
 ## Scenario K: Serena MCP
 
-> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh`
+> **Automated baseline:** `HARNESS_RUN_SLOW=1 bash tests/integration_test.sh`
 > covers Phase 2: install → restart → reachability on tcp://serena:9121 →
 > agent MCP-config side-file merge → CWD mount visibility → TUI
 > tool-call rendering → down/up cycle → disable/enable → uninstall. Run

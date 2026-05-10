@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/integration_test.sh — comprehensive end-to-end integration test
+# tests/integration_test.sh — comprehensive end-to-end integration test
 # for harness's two flagship integrations:
 #
 #   - Pattern A (HTTP MCP):    Serena. Long-lived compose service reached
@@ -21,7 +21,7 @@
 #     persists across container rebuild.
 #
 # Run:
-#   HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh
+#   HARNESS_RUN_SLOW=1 bash tests/integration_test.sh
 
 set -euo pipefail
 
@@ -39,7 +39,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export REPO_ROOT  # test_helpers.sh expects this in scope.
 
 # shellcheck source=lib/test_helpers.sh
-source "${REPO_ROOT}/scripts/lib/test_helpers.sh"
+source "${REPO_ROOT}/tests/lib/test_helpers.sh"
 
 require_docker
 
@@ -193,7 +193,7 @@ harness_call() {
 
 # Copy the test project fixture into the workspace. Serena and Graphify
 # both look at /workspace/test-project/ when an agent runs there.
-cp -a "${REPO_ROOT}/scripts/fixtures/test-project" "${TEST_WORKSPACE}/"
+cp -a "${REPO_ROOT}/tests/fixtures/test-project" "${TEST_WORKSPACE}/"
 
 # === Phase 1: stack setup with mock upstream ================================
 

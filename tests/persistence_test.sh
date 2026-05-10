@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/persistence_test.sh — verify that the agent home bind mount and
+# tests/persistence_test.sh — verify that the agent home bind mount and
 # skel-seed logic produce a persistent /home/harness across container
 # rebuilds.
 #
