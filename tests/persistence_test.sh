@@ -152,6 +152,27 @@ if (( seeded_count < 2 )); then
     ls -la "${AGENT_HOME}" >&2 || true
     exit 1
 fi
+# Inventory A004: Group ownership of files seeded by the container must match
+# the invoking host's GID. The container runs --user harness (gid 1000); on
+# the host this surfaces as the caller's gid because the bind mount preserves
+# numeric IDs. Failing this would indicate the agent group is no longer
+# aligned with the host caller's gid (i.e., the UID/GID remap contract is broken).
+marker_gid=$(stat -c '%g' "${AGENT_HOME}/.harness-home-initialized" 2>/dev/null || echo "")
+host_gid=$(id -g)
+if [[ "${marker_gid}" != "${host_gid}" ]]; then
+    echo "[persist] T1 FAIL: seed marker gid=${marker_gid}, expected host gid=${host_gid}" >&2
+    ls -la "${AGENT_HOME}" >&2 || true
+    exit 1
+fi
+# Inventory A004: Also assert UID alignment on the same marker so the test
+# catches identity-mismatch regressions where only UID-or-GID is correct.
+marker_uid=$(stat -c '%u' "${AGENT_HOME}/.harness-home-initialized" 2>/dev/null || echo "")
+host_uid=$(id -u)
+if [[ "${marker_uid}" != "${host_uid}" ]]; then
+    echo "[persist] T1 FAIL: seed marker uid=${marker_uid}, expected host uid=${host_uid}" >&2
+    ls -la "${AGENT_HOME}" >&2 || true
+    exit 1
+fi
 echo "[persist] T1 OK (${seeded_count} entries seeded)"
 
 # --- T2: marker pins idempotency -------------------------------------------
@@ -228,6 +249,28 @@ else
     if [[ -z "${requests_dirs}" ]]; then
         echo "[persist] T3 FAIL: requests package not found in ~/.local/lib on host" >&2
         find "${AGENT_HOME}/.local/lib" -maxdepth 4 -type d >&2 || true
+        exit 1
+    fi
+
+    # Inventory A004: Group ownership of pip-installed files written by the
+    # container must equal the host caller's GID. Without GID alignment, the
+    # host caller could not later `rm -rf` the bind mount (per the cleanup
+    # rationale at the top of this file). Pick the first requests dir found.
+    requests_first=$(echo "${requests_dirs}" | head -n1)
+    pkg_gid=$(stat -c '%g' "${requests_first}" 2>/dev/null || echo "")
+    host_gid=$(id -g)
+    if [[ "${pkg_gid}" != "${host_gid}" ]]; then
+        echo "[persist] T3 FAIL: requests pkg gid=${pkg_gid}, expected host gid=${host_gid}" >&2
+        ls -la "${requests_first}" >&2 || true
+        exit 1
+    fi
+    # Inventory A004: pair the GID check with an explicit UID check on the
+    # same path so any future drift between user/group remap is caught.
+    pkg_uid=$(stat -c '%u' "${requests_first}" 2>/dev/null || echo "")
+    host_uid=$(id -u)
+    if [[ "${pkg_uid}" != "${host_uid}" ]]; then
+        echo "[persist] T3 FAIL: requests pkg uid=${pkg_uid}, expected host uid=${host_uid}" >&2
+        ls -la "${requests_first}" >&2 || true
         exit 1
     fi
 
@@ -366,6 +409,33 @@ if ! grep -q 'ccstatusline' "$claude_settings"; then
     echo "[persist] T5 FAIL: statusLine command does not point at ccstatusline" >&2
     cat "$claude_settings" >&2
     exit 1
+fi
+# Inventory A012: `ensure_claude_config` sets `includeCoAuthoredBy: false`
+# in the produced ~/.claude/settings.json. The inline seed at line 346 writes
+# this key on first-run create, mirroring the entrypoint's behavior; assert
+# the key is present and explicitly set to false in the final on-disk file.
+if ! grep -q '"includeCoAuthoredBy"' "$claude_settings"; then
+    echo "[persist] T5 FAIL: includeCoAuthoredBy key missing from settings.json" >&2
+    cat "$claude_settings" >&2
+    exit 1
+fi
+# Inventory A012: the value must be `false` (suppresses claude-code's
+# Co-Authored-By trailer). Use jq when available for a strict boolean check;
+# fall back to a grep that matches the literal `"includeCoAuthoredBy": false`
+# pair so a regression to `true` or removal would fail.
+if command -v jq >/dev/null 2>&1; then
+    coauthor_value=$(jq -r '.includeCoAuthoredBy' "$claude_settings" 2>/dev/null || echo "")
+    if [[ "${coauthor_value}" != "false" ]]; then
+        echo "[persist] T5 FAIL: includeCoAuthoredBy=${coauthor_value}, expected false" >&2
+        cat "$claude_settings" >&2
+        exit 1
+    fi
+else
+    if ! grep -Eq '"includeCoAuthoredBy"[[:space:]]*:[[:space:]]*false' "$claude_settings"; then
+        echo "[persist] T5 FAIL: includeCoAuthoredBy not explicitly set to false" >&2
+        cat "$claude_settings" >&2
+        exit 1
+    fi
 fi
 echo "[persist] T5 OK"
 
