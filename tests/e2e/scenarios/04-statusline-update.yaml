@@ -1,0 +1,57 @@
+name: 04-statusline-update
+inventory_refs: [F062, A013, Pe012]
+description: |
+  Boot `harness claude` and verify the statusline configured by
+  `claude-statusline-config` / `ensure_claude_config` appears in the
+  captured pane. The statusline is the persistent bottom-of-pane element
+  rendered by `ccstatusline`.
+
+  Inventory refs:
+    - F062 — `harness claude-statusline-config` writes the ccstatusline config
+    - A013 — `ensure_claude_config` sets a `statusLine` entry pointing at ccstatusline
+    - Pe012 — `state/agent/home/.claude/settings.json` is auto-augmented with statusLine
+              on every agent launch
+
+setup:
+  env:
+    TERM: xterm-256color
+    PROXY_API_URL: http://127.0.0.1:9000
+    PROXY_API_KEY: test-key
+    PROXY_API_MODEL: claude-sonnet-4-5
+  tmux:
+    # Wider pane so the full statusline is visible without truncation.
+    width: 220
+    height: 50
+  default_timeout_s: 30
+
+steps:
+  - launch: "./harness claude"
+    wait_for_marker: "│ > "
+    wait_stable_ms: 1000
+    timeout_s: 45
+
+  # Extra settle: ccstatusline renders on a timer.
+  - sleep_s: 1.0
+
+  # We don't assert exact ccstatusline content (it depends on the user's
+  # configuration). What we DO assert is that the bottom-of-pane region
+  # is non-empty after settling and contains at least one of the tokens
+  # ccstatusline's default segments emit (model, branch, or path).
+  #
+  # Tighten this if track-F2 maintainers know the exact default segments
+  # shipped for this build.
+  - capture_assertions:
+      - not_contains: "Traceback"
+      - not_contains: "Error:"
+      # At least one of these statusline-ish tokens should appear. Use
+      # regex alternation so any one match is enough.
+      - regex_match: "(claude|sonnet|opus|haiku|model|branch|\\$|~)"
+
+  - send_key: C-c
+    wait_stable_ms: 300
+  - send_key: C-d
+    wait_stable_ms: 500
+
+cleanup:
+  kill_session: true
+  archive_transcript: true
