@@ -846,6 +846,17 @@ commands:
   doctor                run runtime diagnostics (read-only)
   preflight             validate config (.env, allowlist, docker daemon)
                         before running 'harness start'
+  test [section]        run the harness test suite (glob-discovered).
+                        sections: all (default), unit, integration, e2e,
+                        or a prefix like 'mcp' or 'firewall'.
+                        flags: --pattern GLOB, --slow.
+                        See 'harness test --help'.
+  benchmark [target]    run a benchmark suite. targets: smoketest (default),
+                        terminal-bench, swe-bench-lite, compare-schemes, all.
+                        flags: --task-ids, --schemes, --agents,
+                        --n-concurrent, --no-smoketest.
+                        Refuses to run when $CI is set.
+                        See 'harness benchmark --help'.
   help                  show this help
 
 agent flags:
@@ -3704,6 +3715,428 @@ cmd_preflight() {
     return 0
 }
 
+# --- harness test -----------------------------------------------------------
+#
+# Glob-based test discovery. New test files added to tests/ (matching
+# <name>_test.sh) are picked up automatically — this dispatcher never
+# needs to be edited when tests are added.
+#
+# Sections:
+#   all          → tests/*_test.sh
+#   unit         → tests/upgrade_test.sh (no docker required); future
+#                  unit-only files can be added here.
+#   integration  → tests/*_test.sh minus tests/e2e/run.sh
+#   e2e          → tests/e2e/run.sh (added by track F)
+#   <prefix>     → tests/<prefix>_test.sh plus tests/<prefix>*_test.sh
+#
+# Exits non-zero if no tests match or any test fails. The glob expansion
+# is always filtered to existing files so missing future directories
+# (tests/e2e/ for example) degrade to a clean "no tests matched" rather
+# than a shell error.
+
+_harness_test_usage() {
+    cat <<'EOF'
+Usage: harness test [section] [--pattern GLOB] [--slow]
+
+Run the harness test suite. Test discovery is glob-based — any file
+matching tests/*_test.sh is picked up automatically without editing
+the wrapper.
+
+sections:
+  all           run every tests/*_test.sh (default)
+  unit          fast, no-docker tests (e.g. upgrade_test.sh)
+  integration   tests/*_test.sh excluding tests/e2e/
+  e2e           tests/e2e/run.sh (full end-to-end suite)
+  <prefix>      tests/<prefix>_test.sh plus tests/<prefix>*_test.sh
+
+flags:
+  --pattern GLOB   explicit glob (relative to repo root); overrides section
+  --slow           export HARNESS_RUN_SLOW=1 for the test run
+  -h, --help       show this help
+
+examples:
+  harness test                       # all tests
+  harness test unit                  # just unit tests
+  harness test mcp                   # tests/mcp_test.sh plus tests/mcp*_test.sh
+  harness test --pattern 'tests/firewall_*'
+EOF
+}
+
+cmd_test() {
+    local section="all"
+    local explicit_pattern=""
+    local slow=0
+
+    while (( $# > 0 )); do
+        case "$1" in
+            -h|--help)
+                _harness_test_usage
+                return 0
+                ;;
+            --pattern)
+                if [[ $# -lt 2 ]]; then
+                    err "harness test: --pattern requires a glob argument"
+                    return 1
+                fi
+                explicit_pattern="$2"
+                shift 2
+                continue
+                ;;
+            --pattern=*)
+                explicit_pattern="${1#--pattern=}"
+                ;;
+            --slow)
+                slow=1
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                err "harness test: unknown flag '$1'"
+                _harness_test_usage >&2
+                return 1
+                ;;
+            *)
+                section="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if (( slow == 1 )); then
+        export HARNESS_RUN_SLOW=1
+    fi
+
+    # Resolve the tests root via the install root (clone_dir).
+    local tests_root="$clone_dir/tests"
+    if [[ ! -d "$tests_root" ]]; then
+        err "harness test: tests directory not found at $tests_root"
+        return 1
+    fi
+
+    # Build the candidate list. We glob inside the repo and filter to
+    # existing regular executable-or-readable files.
+    local -a candidates=()
+    local glob_expr=""
+    if [[ -n "$explicit_pattern" ]]; then
+        # User-supplied pattern is interpreted relative to the repo root
+        # (clone_dir) so 'tests/foo_*' works as expected.
+        glob_expr="$explicit_pattern"
+        local -a matches=()
+        # shellcheck disable=SC2206
+        # We deliberately use word-splitting + glob expansion here.
+        local pat="$clone_dir/$glob_expr"
+        # If pattern is already absolute, don't double-prefix.
+        if [[ "$glob_expr" == /* ]]; then
+            pat="$glob_expr"
+        fi
+        # Use a subshell with nullglob so a no-match becomes empty array.
+        mapfile -t matches < <(shopt -s nullglob; for f in $pat; do echo "$f"; done)
+        candidates=("${matches[@]}")
+    else
+        case "$section" in
+            all)
+                mapfile -t candidates < <(shopt -s nullglob; for f in "$tests_root"/*_test.sh; do echo "$f"; done)
+                # Append the e2e runner if it exists (added by track F).
+                if [[ -f "$tests_root/e2e/run.sh" ]]; then
+                    candidates+=("$tests_root/e2e/run.sh")
+                fi
+                ;;
+            unit)
+                # For now, the only file classified as unit (runs without
+                # docker) is upgrade_test.sh. Future unit-only files can
+                # be added by adopting a naming convention or splitting
+                # this case out.
+                if [[ -f "$tests_root/upgrade_test.sh" ]]; then
+                    candidates+=("$tests_root/upgrade_test.sh")
+                fi
+                # Glob future unit_*.sh files too, so adopting that
+                # convention later is zero-friction.
+                mapfile -t _u < <(shopt -s nullglob; for f in "$tests_root"/unit_*_test.sh; do echo "$f"; done)
+                candidates+=("${_u[@]}")
+                unset _u
+                ;;
+            integration)
+                mapfile -t candidates < <(shopt -s nullglob; for f in "$tests_root"/*_test.sh; do echo "$f"; done)
+                ;;
+            e2e)
+                if [[ -f "$tests_root/e2e/run.sh" ]]; then
+                    candidates+=("$tests_root/e2e/run.sh")
+                fi
+                ;;
+            *)
+                # Prefix mode: tests/<prefix>_test.sh and tests/<prefix>*_test.sh.
+                # We add both forms and dedupe.
+                local -a pref_matches=()
+                mapfile -t pref_matches < <(
+                    shopt -s nullglob
+                    for f in "$tests_root/${section}_test.sh" "$tests_root/${section}"*_test.sh; do
+                        echo "$f"
+                    done
+                )
+                # Dedupe while preserving order.
+                local -A seen=()
+                local p
+                for p in "${pref_matches[@]}"; do
+                    if [[ -z "${seen[$p]:-}" ]]; then
+                        candidates+=("$p")
+                        seen[$p]=1
+                    fi
+                done
+                ;;
+        esac
+    fi
+
+    # Filter to existing files (glob expansions can leave broken paths if
+    # nullglob misbehaves on older bash).
+    local -a tests=()
+    local t
+    for t in "${candidates[@]}"; do
+        [[ -f "$t" ]] && tests+=("$t")
+    done
+
+    if (( ${#tests[@]} == 0 )); then
+        if [[ -n "$explicit_pattern" ]]; then
+            err "harness test: no files matched pattern '$explicit_pattern'"
+        else
+            err "harness test: no tests matched section '$section'"
+        fi
+        return 1
+    fi
+
+    echo "[harness test] section=$section ${explicit_pattern:+pattern=$explicit_pattern }slow=$slow"
+    echo "[harness test] running ${#tests[@]} test file(s):"
+    for t in "${tests[@]}"; do
+        echo "  - ${t#$clone_dir/}"
+    done
+    echo
+
+    local failed=0 passed=0
+    local -a failures=()
+    for t in "${tests[@]}"; do
+        echo "─── ${t#$clone_dir/} ───"
+        # Run from clone_dir so tests can use repo-relative paths if they
+        # want, and so $0 inside the test resolves under tests/.
+        if ( cd "$clone_dir" && bash "$t" ); then
+            passed=$((passed+1))
+            echo "  PASS: ${t#$clone_dir/}"
+        else
+            local rc=$?
+            failed=$((failed+1))
+            failures+=("${t#$clone_dir/} (exit $rc)")
+            echo "  FAIL: ${t#$clone_dir/} (exit $rc)"
+        fi
+        echo
+    done
+
+    echo "─── summary ───"
+    echo "  passed: $passed"
+    echo "  failed: $failed"
+    if (( failed > 0 )); then
+        echo "  failures:"
+        local f
+        for f in "${failures[@]}"; do
+            echo "    - $f"
+        done
+        return 1
+    fi
+    return 0
+}
+
+# --- harness benchmark ------------------------------------------------------
+#
+# Dispatch to one of the benchmark runners under tests/benchmarks/runners/
+# (added by track G). Each runner is a self-contained bash script that
+# reads its config from environment variables — keeping argument-parsing
+# here lets us evolve the runners independently.
+#
+# Defense-in-depth: we refuse to run benchmarks in CI even if the runner
+# script lacks its own guard. Track G's runners will also check $CI.
+
+_harness_benchmark_usage() {
+    cat <<'EOF'
+Usage: harness benchmark [target] [options]
+
+Run a benchmark suite. Runner scripts live under
+tests/benchmarks/runners/<target>.sh.
+
+targets:
+  smoketest         small synthetic suite that proves the harness can run
+                    a benchmark end-to-end (default)
+  terminal-bench    terminal-bench scenarios
+  swe-bench-lite    swe-bench-lite scenarios
+  compare-schemes   compare prompting/agent schemes against each other
+  all               run every runner in tests/benchmarks/runners/
+
+options:
+  --task-ids LIST       comma-separated task ids (HARNESS_BENCH_TASK_IDS)
+  --schemes LIST        comma-separated scheme names (HARNESS_BENCH_SCHEMES)
+  --agents LIST         comma-separated agent names (HARNESS_BENCH_AGENTS)
+  --n-concurrent N      max concurrent tasks (HARNESS_BENCH_N_CONCURRENT)
+  --no-smoketest        skip the implicit smoketest pre-run for non-smoke
+                        targets (use at your own risk)
+  -h, --help            show this help
+
+Non-smoketest targets implicitly require a smoketest pass first unless
+--no-smoketest is given.
+
+This subcommand will refuse to run when $CI is set.
+EOF
+}
+
+cmd_benchmark() {
+    # Defense-in-depth CI guard. The runners (track G) also check $CI,
+    # but checking here means a misconfigured runner or an accidental
+    # invocation without arguments still trips the guard.
+    if [[ -n "${CI:-}" ]]; then
+        echo "Refusing to run benchmarks in CI environment." >&2
+        return 1
+    fi
+
+    local target="smoketest"
+    local no_smoketest=0
+    local task_ids=""
+    local schemes=""
+    local agents=""
+    local n_concurrent=""
+    local target_set=0
+
+    while (( $# > 0 )); do
+        case "$1" in
+            -h|--help)
+                _harness_benchmark_usage
+                return 0
+                ;;
+            --task-ids)
+                if [[ $# -lt 2 ]]; then
+                    err "harness benchmark: --task-ids requires a value"
+                    return 1
+                fi
+                task_ids="$2"; shift 2; continue
+                ;;
+            --task-ids=*)        task_ids="${1#--task-ids=}" ;;
+            --schemes)
+                if [[ $# -lt 2 ]]; then
+                    err "harness benchmark: --schemes requires a value"
+                    return 1
+                fi
+                schemes="$2"; shift 2; continue
+                ;;
+            --schemes=*)         schemes="${1#--schemes=}" ;;
+            --agents)
+                if [[ $# -lt 2 ]]; then
+                    err "harness benchmark: --agents requires a value"
+                    return 1
+                fi
+                agents="$2"; shift 2; continue
+                ;;
+            --agents=*)          agents="${1#--agents=}" ;;
+            --n-concurrent)
+                if [[ $# -lt 2 ]]; then
+                    err "harness benchmark: --n-concurrent requires a value"
+                    return 1
+                fi
+                n_concurrent="$2"; shift 2; continue
+                ;;
+            --n-concurrent=*)    n_concurrent="${1#--n-concurrent=}" ;;
+            --no-smoketest)      no_smoketest=1 ;;
+            --)                  shift; break ;;
+            -*)
+                err "harness benchmark: unknown flag '$1'"
+                _harness_benchmark_usage >&2
+                return 1
+                ;;
+            *)
+                if (( target_set == 0 )); then
+                    target="$1"
+                    target_set=1
+                else
+                    err "harness benchmark: unexpected positional argument '$1'"
+                    return 1
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    # Locate runner directory. clone_dir already resolves the wrapper's
+    # real path through any symlink, so this works whether harness is
+    # invoked from /usr/local/bin/harness, ~/.local/bin/harness, or
+    # in-place from the clone.
+    local runners_dir="$clone_dir/tests/benchmarks/runners"
+
+    # Export option env vars only when set, so runners can apply their
+    # own defaults when callers omit a flag.
+    [[ -n "$task_ids"     ]] && export HARNESS_BENCH_TASK_IDS="$task_ids"
+    [[ -n "$schemes"      ]] && export HARNESS_BENCH_SCHEMES="$schemes"
+    [[ -n "$agents"       ]] && export HARNESS_BENCH_AGENTS="$agents"
+    [[ -n "$n_concurrent" ]] && export HARNESS_BENCH_N_CONCURRENT="$n_concurrent"
+
+    # Helper to invoke a single runner with appropriate error reporting.
+    _harness_run_bench_target() {
+        local tgt="$1"
+        local runner="$runners_dir/${tgt}.sh"
+        if [[ ! -f "$runner" ]]; then
+            err "harness benchmark: runner not found: $runner"
+            err "  benchmark runners are provided by track G and live under tests/benchmarks/runners/"
+            return 1
+        fi
+        echo "[harness benchmark] running $tgt ($runner)"
+        ( cd "$clone_dir" && bash "$runner" )
+    }
+
+    case "$target" in
+        smoketest)
+            _harness_run_bench_target smoketest
+            return $?
+            ;;
+        all)
+            # Run every *.sh under runners/. Smoketest first if present.
+            if [[ ! -d "$runners_dir" ]]; then
+                err "harness benchmark: runners directory not found at $runners_dir"
+                return 1
+            fi
+            local -a runners=()
+            mapfile -t runners < <(shopt -s nullglob; for f in "$runners_dir"/*.sh; do echo "$f"; done)
+            if (( ${#runners[@]} == 0 )); then
+                err "harness benchmark: no runners under $runners_dir"
+                return 1
+            fi
+            # Always run smoketest first when present.
+            if (( no_smoketest == 0 )) && [[ -f "$runners_dir/smoketest.sh" ]]; then
+                _harness_run_bench_target smoketest || return 1
+            fi
+            local r rc=0
+            for r in "${runners[@]}"; do
+                local name
+                name=$(basename "$r" .sh)
+                [[ "$name" == "smoketest" ]] && continue
+                _harness_run_bench_target "$name" || rc=1
+            done
+            return $rc
+            ;;
+        *)
+            # Non-smoketest, non-all target: require smoketest pass first
+            # unless caller opted out.
+            if (( no_smoketest == 0 )); then
+                if [[ -f "$runners_dir/smoketest.sh" ]]; then
+                    echo "[harness benchmark] running smoketest gate before $target (use --no-smoketest to skip)"
+                    if ! _harness_run_bench_target smoketest; then
+                        err "harness benchmark: smoketest failed; refusing to run $target"
+                        return 1
+                    fi
+                else
+                    err "harness benchmark: smoketest runner not present (use --no-smoketest to skip)"
+                    return 1
+                fi
+            fi
+            _harness_run_bench_target "$target"
+            return $?
+            ;;
+    esac
+}
+
 # --- dispatch ---------------------------------------------------------------
 
 main() {
@@ -3730,6 +4163,8 @@ main() {
         unlock)                     cmd_unlock "$@" ;;
         doctor)                     cmd_doctor ;;
         preflight)                  cmd_preflight ;;
+        test)                       cmd_test "$@" ;;
+        benchmark)                  cmd_benchmark "$@" ;;
         *)
             err "unknown command '$cmd'"
             cmd_help >&2
