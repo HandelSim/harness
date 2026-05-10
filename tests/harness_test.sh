@@ -10,7 +10,7 @@
 #
 # Interactive subcommands (claude, opencode, stop with picker) require a
 # TTY and live upstream — those are validated by
-# scripts/full_pipeline_test.sh (T9/T10/T11) and by the manual smoke checks
+# tests/full_pipeline_test.sh (T9/T10/T11) and by the manual smoke checks
 # documented in MANUAL_TEST_PROMPT.md. They are NOT covered here.
 #
 # Other smoke checks:
@@ -141,7 +141,7 @@ harness_docker compose --project-name "${PROJECT_NAME}" \
 #
 # These cases shell-source the script (HARNESS_SOURCE_ONLY=1) and stub
 # `_probe_upstream_auth` to drive each branch deterministically without any
-# live upstream — matching the pattern in scripts/upgrade_test.sh.
+# live upstream — matching the pattern in tests/upgrade_test.sh.
 
 echo "[harness-test] T0: _gate_on_upstream_auth + run_agent gate"
 
@@ -312,7 +312,7 @@ echo "[harness-test] T5 OK"
 #
 # These tests exercise argument parsing and registry/active-tree filesystem
 # logic without actually bringing up MCP services — that's the job of
-# scripts/mcp_test.sh. We override HARNESS_REGISTRY_DIR with an empty dir
+# tests/mcp_test.sh. We override HARNESS_REGISTRY_DIR with an empty dir
 # to assert the empty-registry path, then point it at a tmp registry to
 # verify the populated path.
 #

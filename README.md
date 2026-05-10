@@ -447,15 +447,15 @@ edits straight to `<install-root>/state/agent/home/.config/ccstatusline/settings
 ## Tests
 
 ```
-$ bash scripts/proxy_test.sh         # proxy translation, RemoteHost forwarding, stub model context length
-$ bash scripts/harness_test.sh       # management script subcommands
-$ bash scripts/persistence_test.sh   # persistent home + skel seed
-$ bash scripts/mcp_test.sh           # MCP install/enable/disable/uninstall lifecycle
-$ bash scripts/firewall_test.sh      # firewall guardrail (negative) + per-service bypass
-$ bash scripts/upgrade_test.sh       # upgrade actions library + synthetic version transition
-$ bash scripts/full_pipeline_test.sh # full install + run pipeline (covers both agents via print-mode round-trip)
-$ HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh  # end-to-end Serena + Graphify (slow, ~10-15 min)
-$ bash scripts/podman_smoke_test.sh   # podman-runtime smoke (Linux only; manual)
+$ bash tests/proxy_test.sh         # proxy translation, RemoteHost forwarding, stub model context length
+$ bash tests/harness_test.sh       # management script subcommands
+$ bash tests/persistence_test.sh   # persistent home + skel seed
+$ bash tests/mcp_test.sh           # MCP install/enable/disable/uninstall lifecycle
+$ bash tests/firewall_test.sh      # firewall guardrail (negative) + per-service bypass
+$ bash tests/upgrade_test.sh       # upgrade actions library + synthetic version transition
+$ bash tests/full_pipeline_test.sh # full install + run pipeline (covers both agents via print-mode round-trip)
+$ HARNESS_RUN_SLOW=1 bash tests/integration_test.sh  # end-to-end Serena + Graphify (slow, ~10-15 min)
+$ bash tests/podman_smoke_test.sh   # podman-runtime smoke (Linux only; manual)
 $ bash scripts/check_runtime_calls.sh # static guard: no raw 'docker' calls outside the wrapper
 ```
 
@@ -464,7 +464,7 @@ podman code path. By default they pick docker if it's installed.
 
 ### Integration test (Serena + Graphify)
 
-`scripts/integration_test.sh` is the canonical regression test for the two
+`tests/integration_test.sh` is the canonical regression test for the two
 flagship integrations: Serena (Pattern A — HTTP MCP server) and Graphify
 (Pattern B — pipx-installed skill CLI). It is gated behind
 `HARNESS_RUN_SLOW=1` because the first run pulls/builds the ~2 GB Serena
@@ -493,7 +493,7 @@ The test exercises four phases against a clean install in a temp directory:
 4. **Cross-test invariants** — `harness doctor` returns 0 and the state
    directory layout is intact.
 
-The fixture project at `scripts/fixtures/test-project/` is a small Python
+The fixture project at `tests/fixtures/test-project/` is a small Python
 calculator package (Calculator, ScientificCalculator, ExpressionParser, an
 exception hierarchy, and pytest tests) that gives both Serena and Graphify
 a non-trivial multi-module symbol graph to chew on.
@@ -528,9 +528,11 @@ do not roll `dev` back.
 
 ### Test toolkits
 
-`scripts/lib/` ships sourceable bash libraries shared across tests:
+`tests/lib/` ships sourceable bash libraries used by tests; production
+runtime helpers (`platform.sh`, `net_helpers.sh`, `upgrade_actions.sh`)
+remain under `scripts/lib/` because the `harness` CLI sources them.
 
-- `test_helpers.sh` — common setup: `require_docker`, `test_section`,
+- `tests/lib/test_helpers.sh` — common setup: `require_docker`, `test_section`,
   `test_generate_env`, `test_generate_mockupstream_override` (mounts the
   fixture-dispatch directory), `test_wait_for_healthy`, `test_cleanup`.
   `integration_test.sh` adds two helpers used when the harness compose
@@ -540,14 +542,14 @@ do not roll `dev` back.
 
 ### Mock-upstream fixture dispatch
 
-`scripts/mock_upstream.py` supports two modes:
+`tests/mock_upstream.py` supports two modes:
 
 - **Legacy** — `MOCK_SCENARIO=text|tool` env var picks one of two canned
   responses. Used by `proxy_test.sh` and `firewall_test.sh`.
 - **Fixture dispatch** — set `MOCK_FIXTURES_DIR=/fixtures` and mount
-  `scripts/fixtures/responses/` there. The mock loads every `*.json`
+  `tests/fixtures/responses/` there. The mock loads every `*.json`
   lexicographically and matches the most recent user message against each
   fixture's `match` regex; first match wins. `99_default.json` is the
-  catch-all. See `scripts/fixtures/responses/README.md` for the file shape
+  catch-all. See `tests/fixtures/responses/README.md` for the file shape
   and naming convention (`NN_short_slug.json`, with reserved priority
   ranges per scenario family).

@@ -32,7 +32,7 @@ jobs:
               echo "::error file=$f::bash -n failed"
               fail=1
             fi
-          done < <(find harness harness-install.sh scripts -type f \
+          done < <(find harness harness-install.sh scripts tests -type f \
               \( -name '*.sh' -o -path harness -o -path harness-install.sh \) \
               -print0)
           exit $fail
@@ -45,8 +45,8 @@ jobs:
         uses: ludeeus/action-shellcheck@master
         with:
           severity: warning
-          scandir: ./scripts
-          additional_files: harness harness-install.sh
+          scandir: ./tests
+          additional_files: harness harness-install.sh scripts/check_runtime_calls.sh scripts/lib/platform.sh scripts/lib/net_helpers.sh scripts/lib/upgrade_actions.sh
 
   unit:
     name: unit (upgrade_test)
@@ -54,8 +54,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - name: scripts/upgrade_test.sh
-        run: bash scripts/upgrade_test.sh
+      - name: tests/upgrade_test.sh
+        run: bash tests/upgrade_test.sh
 
   docker-tests:
     name: docker / ${{ matrix.test }}
@@ -90,11 +90,11 @@ jobs:
           docker --version
           docker compose version
 
-      - name: Run scripts/${{ matrix.test }}.sh
+      - name: Run tests/${{ matrix.test }}.sh
         env:
           DOCKER_BUILDKIT: "1"
           COMPOSE_DOCKER_CLI_BUILD: "1"
-        run: bash scripts/${{ matrix.test }}.sh
+        run: bash tests/${{ matrix.test }}.sh
 
       - name: Diagnostics on failure
         if: failure()
@@ -133,11 +133,11 @@ jobs:
             buildx-pipeline-
             buildx-
 
-      - name: scripts/full_pipeline_test.sh
+      - name: tests/full_pipeline_test.sh
         env:
           DOCKER_BUILDKIT: "1"
           COMPOSE_DOCKER_CLI_BUILD: "1"
-        run: bash scripts/full_pipeline_test.sh
+        run: bash tests/full_pipeline_test.sh
 
       - name: Diagnostics on failure
         if: failure()
@@ -176,12 +176,12 @@ jobs:
             buildx-integration-
             buildx-
 
-      - name: scripts/integration_test.sh
+      - name: tests/integration_test.sh
         env:
           HARNESS_RUN_SLOW: "1"
           DOCKER_BUILDKIT: "1"
           COMPOSE_DOCKER_CLI_BUILD: "1"
-        run: bash scripts/integration_test.sh
+        run: bash tests/integration_test.sh
 
       - name: Diagnostics on failure
         if: failure()

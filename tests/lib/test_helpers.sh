@@ -1,10 +1,10 @@
-# scripts/lib/test_helpers.sh — sourceable bash toolkit for harness test
+# tests/lib/test_helpers.sh — sourceable bash toolkit for harness test
 # scripts. Extracted from setup boilerplate that used to be duplicated
 # across proxy_test.sh, firewall_test.sh, full_pipeline_test.sh.
 #
 # Source from a test:
 #
-#   source "$REPO_ROOT/scripts/lib/test_helpers.sh"
+#   source "$REPO_ROOT/tests/lib/test_helpers.sh"
 #   require_docker
 #   ENV_FILE=$(mktemp -t harness-foo.XXXXXX.env)
 #   test_generate_env "$ENV_FILE"
@@ -87,13 +87,13 @@ EOF
 }
 
 # Write a docker-compose override file that adds a `mockupstream` service
-# fronting scripts/mock_upstream.py. Mounts the python file AND the fixture
+# fronting tests/mock_upstream.py. Mounts the python file AND the fixture
 # directory so the fixture-dispatch path sees the same fixtures used by
 # integration_test.sh. MOCK_FIXTURES_DIR is set so mock_upstream.py finds them.
 #
 # Args: <output_path>
 # Requires: REPO_ROOT in scope (so we can refer to the host paths). The
-# generated yml uses ./scripts/... relative paths because docker compose
+# generated yml uses ./tests/... relative paths because docker compose
 # resolves -f-included files relative to the project working directory,
 # which every harness test sets to REPO_ROOT before invoking compose.
 test_generate_mockupstream_override() {
@@ -107,8 +107,8 @@ services:
       MOCK_SCENARIO: ${MOCK_SCENARIO:-text}
       MOCK_FIXTURES_DIR: /fixtures
     volumes:
-      - ./scripts/mock_upstream.py:/app/mock_upstream.py:ro
-      - ./scripts/fixtures/responses:/fixtures:ro
+      - ./tests/mock_upstream.py:/app/mock_upstream.py:ro
+      - ./tests/fixtures/responses:/fixtures:ro
     networks:
       - harness-net
     expose:
@@ -156,7 +156,7 @@ EOF
 # --- standalone mockupstream sidecar (integration_test.sh) ------------------
 
 # Start a mockupstream sidecar attached to an existing harness compose
-# network. Used by scripts/integration_test.sh, which brings the harness
+# network. Used by tests/integration_test.sh, which brings the harness
 # stack up via the real `harness start` (so docker-compose owns the network)
 # and then needs to splice an in-network mock for the proxy to forward to.
 #
@@ -173,14 +173,14 @@ test_start_mockupstream() {
     local project="$1"
     local network="${project}_harness-net"
     local cname="${project}-mockupstream-1"
-    local fixtures_dir="$REPO_ROOT/scripts/fixtures/responses"
+    local fixtures_dir="$REPO_ROOT/tests/fixtures/responses"
 
     # Defensive: drop a stale container with the same name so the run -d
     # below doesn't fail with "container name already in use".
     harness_docker rm -f "$cname" >/dev/null 2>&1 || true
 
     local mock_py_host fixtures_host
-    mock_py_host=$(harness_docker_path "$REPO_ROOT/scripts/mock_upstream.py")
+    mock_py_host=$(harness_docker_path "$REPO_ROOT/tests/mock_upstream.py")
     fixtures_host=$(harness_docker_path "$fixtures_dir")
 
     harness_docker run -d \

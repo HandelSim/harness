@@ -284,7 +284,7 @@ harness_validate_mount() {
     # shellcheck disable=SC2221,SC2222
     # (Patterns are disjoint: `/etc` is the literal /etc, `/etc/*` is
     #  anything under it. shellcheck flags them as overlapping but they're
-    #  not — verified by the integration test in scripts/integration_test.sh
+    #  not — verified by the integration test in tests/integration_test.sh
     #  Phase 5.3.)
     case "$abs" in
         /|/etc|/etc/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/var|/var/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/root|/root/*|/home/harness|/home/harness/*|/etc/harness|/etc/harness/*|/workspace|/workspace/*)

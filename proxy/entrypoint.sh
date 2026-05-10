@@ -17,7 +17,7 @@ else
 fi
 
 # Honor an override command (e.g. `docker compose run --rm proxy python -m
-# unittest ...` from scripts/proxy_test.sh). When no args are supplied, fall
+# unittest ...` from tests/proxy_test.sh). When no args are supplied, fall
 # through to the default CMD baked into the image.
 if (( $# > 0 )); then
     exec "$@"
