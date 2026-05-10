@@ -465,3 +465,13 @@ sufficient disk; see `tests/benchmarks/README.md`.
 
 CI runs the lint, unit, docker-tests, pipeline, integration, e2e, and
 scheme_contract jobs on every push to `dev` and `main`.
+
+## Test coverage
+
+| Status | Count | %    |
+|--------|-------|------|
+| Green  | 249   | 62.7 |
+| Yellow | 3     | 0.8  |
+| Red    | 145   | 36.5 |
+
+See `tests/COVERAGE.md` for the per-item table.

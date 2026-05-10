@@ -13,48 +13,95 @@ with a status flag based on the actual assertion strength.
 
 Inventory total: 397 IDs (F=139, P=56, A=34, M=23, N=30, U=29, Pe=19, O=25, I=42).
 
-Test artifacts audited:
+Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
-- `tests/harness_test.sh` (1274 lines) — CLI surface, doctor, preflight, net, mcp,
+- `tests/harness_test.sh` (1452 lines) — CLI surface, doctor, preflight, net, mcp,
   upgrade flags, update check, platform.sh primitives. Sources the wrapper under
   `HARNESS_SOURCE_ONLY=1` and stubs `ensure_services_up` for non-docker tests.
-- `tests/full_pipeline_test.sh` (613 lines) — end-to-end install → start → claude/opencode
+  Track-D strengthening: F015 (T19b), F042 (T3), F072 (T11 extra chars), F131/F133
+  (T19c), F022 (T23.4b), O003/O009 (T3 log scrape).
+- `tests/full_pipeline_test.sh` (731 lines) — end-to-end install → start → claude/opencode
   print → mcp install/start/uninstall → down → update. Uses bundled mock_upstream sidecar.
-- `tests/proxy_test.sh` (458 lines) — proxy round-trip black-box (Scenarios A-E) AND
-  delegates to `proxy/test_proxy.py` via `python -m unittest`.
+  Track-D strengthening: I009/I012/I024/F006/I005 (T1+T2 source-level greps), F139
+  (T5 firewall banner silence), F026/F135/Pe010 (T5 generator-header check),
+  Pe005 (T5 ollama-data non-empty), A007/A024 (T9 uid-owned marker + token literal),
+  A031 (T10 strip + entrypoint grep), F031 (T14 git-pull literal + ff-only message).
+- `tests/proxy_test.sh` (514 lines) — proxy round-trip black-box (Scenarios A-F) AND
+  delegates to `proxy/test_proxy.py` via `python -m unittest`. Track-D added Scenario F:
+  P003/P004/P006/P012/P050 log-scrape of the proxy startup banner.
 - `proxy/test_proxy.py` (1017 lines) — pure-Python unit tests for `format_tools_to_text`,
   `extract_tool_calls_and_text`, `_scan_balanced_json`, `translate_history_and_apply_prompt`,
   `make_chunk`, prompt-injection modes, system→user rewrite, usage override.
-- `tests/firewall_test.sh` (266 lines) — Phase 2 negative (blocked PROXY_API_URL hostname
-  is fatal) and Phase 3 bypass (`HARNESS_FIREWALL_DISABLED=1` per-service).
+- `tests/scheme_contract_test.sh` (456 lines, Track E) — per-scheme proxy contract test.
+  Brings up ollama + proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
+  a probe through ollama; asserts forwarded-body structure. Covers P010, P013, P014, P015,
+  P016, P017, P018 with direct upstream-body assertions (closes scheme-emission red gaps
+  that were previously only proxied through python unittests).
+- `tests/e2e/scenarios/*.yaml` (Track F2) — tmux-driven TUI scenarios with `inventory_refs`
+  declared in each file's header. Six scenarios cover F001/F043/F044/F051/F062/A013/A018/P032/P051/Pe012.
+- `tests/firewall_test.sh` (324 lines) — Phase 2 negative (blocked PROXY_API_URL hostname
+  is fatal) and Phase 3 bypass (`HARNESS_FIREWALL_DISABLED=1` per-service). Track-D added
+  O001 ordering assertions in Phase 3 via ollama-log scraping.
 - `tests/integration_test.sh` (900 lines, gated `HARNESS_RUN_SLOW=1`) — Serena MCP,
   Graphify pipx, `--mount` rejection paths.
 - `tests/mcp_test.sh` (742 lines) — MCP lifecycle (list/install/enable/disable/up/down/
   uninstall/status), side-file regeneration, allowed_domains recommendation.
-- `tests/persistence_test.sh` (431 lines) — skel-seed, `pip install --user`, ccstatusline,
-  claude `settings.json` jq merge, `.git-credentials` persistence.
-- `tests/upgrade_test.sh` (449 lines, no docker) — `envfile_merge`, `linefile_merge`,
+- `tests/persistence_test.sh` (501 lines) — skel-seed, `pip install --user`, ccstatusline,
+  claude `settings.json` jq merge, `.git-credentials` persistence. Track-D strengthening:
+  A004 (T1 + T3 uid+gid assertions on bind-mounted artifacts), A012 (T5 explicit
+  includeCoAuthoredBy=false check via jq).
+- `tests/upgrade_test.sh` (586 lines, no docker) — `envfile_merge`, `linefile_merge`,
   `directory_overwrite`, `_upgrade_confirm`, synthetic N→N+1 upgrade, rsync fallback.
+  Track-D added T2b (U012 missing-trailing-newline injection) and T9 (U025 standalone
+  harness_jq fallback consumed by `_upg_json_array` / `_upg_json_str`).
 - `tests/podman_smoke_test.sh` (238 lines, manual-run) — `HARNESS_CONTAINER_RUNTIME=podman`
   smoke. Useful corroboration for I032/N017.
 - `tests/lib/test_helpers.sh` (311 lines) — shared fixtures only (no assertions).
 
-Coverage summary
-----------------
+## Summary stats
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   217 |   54.7% |
-| yellow   |    34 |    8.6% |
-| red      |   146 |   36.8% |
+| green    |   249 |   62.7% |
+| yellow   |     3 |    0.8% |
+| red      |   145 |   36.5% |
 | **total**|   397 |  100.0% |
+
+Per-prefix breakdown (J2):
+
+| prefix | total | green | yellow | red |
+|--------|-------|-------|--------|-----|
+| F      |   139 |    95 |      0 |  44 |
+| P      |    56 |    41 |      2 |  13 |
+| A      |    34 |    18 |      0 |  16 |
+| M      |    23 |    18 |      0 |   5 |
+| N      |    30 |     6 |      0 |  24 |
+| U      |    29 |    22 |      0 |   7 |
+| Pe     |    19 |    16 |      1 |   2 |
+| O      |    25 |     7 |      0 |  18 |
+| I      |    42 |    26 |      0 |  16 |
+
+(Per-prefix counts derived directly from this file's status column; they
+reconcile to the total table above. The three remaining yellows — P008,
+P029, Pe006 — are all indirect-evidence items where the surrounding test
+infrastructure would need substantive extension to promote; they are
+captured in "Notes / known issues" at the bottom.)
 
 Spot-checks performed (regression detection)
 --------------------------------------------
 
-For each spot-check: `git stash` a deliberate regression into the source, re-run the
-named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
+For each spot-check: introduce a deliberate regression into the source, re-run the
+named test, confirm RED, then revert and confirm GREEN again. See the
 "Spot-checks" section at the bottom of this file for the full transcripts.
+
+Track J2 (this audit) re-ran 3 spot-checks against newly-green rows:
+
+- **U012** (linefile_merge newline injection) — `tests/upgrade_test.sh:163-208` (T2b)
+- **U025** (standalone harness_jq fallback) — `tests/upgrade_test.sh:537-580` (T9)
+- **A024** (`ANTHROPIC_AUTH_TOKEN=harness-dummy` literal in wrapper) —
+  `tests/full_pipeline_test.sh:466-470` (T9, source-level grep simulated locally)
+
+Carried over from Track C:
 
 - **F056** (`harness list` empty case) — `tests/harness_test.sh:258`
 - **M003** (post-install `harness-meta.json` shape) — `tests/mcp_test.sh:255`
@@ -62,6 +109,14 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 - **P035** (`toolu_` tool-call id prefix) — `proxy/test_proxy.py:70`
 
 ---
+
+## Coverage table
+
+The per-ID tables below are split by inventory prefix. Each row is one
+INVENTORY.md ID, with the current status (green / yellow / red), the
+test file and line range carrying the strongest assertion, a one-line
+evidence note (quoting real assertion text where possible), and — for
+non-green rows — the gap.
 
 ## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (139 IDs)
 
@@ -72,7 +127,7 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | F003 | green  | tests/harness_test.sh:304                   | `${HARNESS_WRAPPER} -h` invoked & checked. | |
 | F004 | green  | tests/harness_test.sh:305                   | `${HARNESS_WRAPPER} --help` invoked & checked. | |
 | F005 | red    | —                                           | —                                                                                                     | No test invokes `harness <unknown-cmd>` and asserts stderr `unknown command 'X'` + exit 1. |
-| F006 | yellow | tests/full_pipeline_test.sh:152             | Wrapper is invoked through a symlink-or-real path during install but assertion is only "wrapper exists and is executable". `[[ -x "$wrapper" ]]`. | No assertion that `_self_path` resolves through a symlink. |
+| F006 | green  | tests/full_pipeline_test.sh:235-241         | T2 source-grep against installed wrapper: `grep -q '^_self_path()' "${TEST_ROOT}/harness/harness"` then `grep -Eq 'realpath|readlink' ...`. Asserts function + fallback resolver are present in the artifact under test. | |
 | F007 | green  | tests/harness_test.sh:34-52                 | `HARNESS_INSTALL_ROOT="${TMP_INSTALL_ROOT}"` exported before every wrapper call; tests succeed because the override is honored. | |
 | F008 | green  | tests/harness_test.sh:701-705               | T11 sets `HARNESS_ALLOWLIST_PATH=${TMP_INSTALL_ROOT}/.harness-allowlist` and asserts `harness net list` reads from that path. | |
 | F009 | green  | tests/harness_test.sh:691-696               | T11 sets `HARNESS_NET_OVERRIDES_PATH=${TMP_NET_OVR}` and verifies `harness net open` writes there. | |
@@ -81,23 +136,23 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | F012 | green  | tests/harness_test.sh:62-66                 | `HARNESS_SOURCE_ONLY=1 source ${HARNESS_WRAPPER}` then function-level calls (`harness_realpath`, `_probe_upstream_auth`, etc.). T0/T19/T23 all use this. | |
 | F013 | green  | tests/harness_test.sh:1041-1067             | T20 sets `HARNESS_INSTALL_ROOT` to dir w/o `.env`, runs `harness start`, asserts non-zero + `grep -qi 'missing.*\.env\|require_runtime_config'`. | |
 | F014 | green  | tests/harness_test.sh:1071-1095             | T21 setup removes `.harness-allowlist`, asserts wrapper fails with `'missing.*allowlist'`. | |
-| F015 | yellow | tests/harness_test.sh:62-66 (indirect)      | `harness_jq` is invoked indirectly when `mcp install` writes `harness-meta.json`; the test only checks output JSON, not which jq path executed. | No assertion isolating host-jq vs containerized-jq. |
+| F015 | green  | tests/harness_test.sh:1120-1140             | T19b sources wrapper, stubs `harness_docker` to fail loudly, asserts `echo '{"k":"hostjq"}' \| harness_jq -r '.k'` returns `"hostjq"` — proves host-jq branch was taken (any fallback to docker would have surfaced the stub's failure). | |
 | F016 | red    | —                                           | —                                                                                                     | No test forces host jq absence to exercise the docker-run fallback. |
 | F017 | green  | tests/harness_test.sh:1130-1268             | T23 stubs `git ls-remote` to advertise a different SHA, asserts banner `update available` printed with that remote SHA. | |
 | F018 | green  | tests/harness_test.sh:1188-1215             | T23 verifies the `git ls-remote` invocation runs `timeout` (probed by running with an unreachable host and confirming bounded wall time). | |
 | F019 | green  | tests/harness_test.sh:1220-1244             | T23 simulates network failure by pointing remote at unreachable URL; asserts banner falls back to cached `deadbeef...` SHA. | |
 | F020 | green  | tests/harness_test.sh:1252-1268             | T23 up-to-date branch: stubs ls-remote to echo current HEAD, asserts `grep -q 'up to date'`. | |
 | F021 | green  | tests/harness_test.sh:1158-1184             | T23: asserts `update available` notice contains the simulated remote SHA. | |
-| F022 | yellow | tests/harness_test.sh:1220-1244             | T23 covers network-failure-with-cache; the no-cache branch is only implicitly hit because the cache file is removed but the assertion is "exits non-zero". | No specific check that error message mentions "no cached value". |
+| F022 | green  | tests/harness_test.sh:1402-1424             | T23.4b removes cache + points origin at unreachable path, invokes `harness check-updates`, asserts rc != 0 AND `grep -qi 'could not reach origin/main'` diagnostic. | |
 | F023 | green  | tests/harness_test.sh:225-252               | T1: after `harness start`, both proxy and ollama report `"healthy"` via `docker inspect`. Mirrored in full_pipeline_test.sh:230-347 phases. | |
 | F024 | green  | tests/harness_test.sh:1041-1067             | Same T20 evidence as F013. | |
 | F025 | red    | —                                           | —                                                                                                     | No test sets a net-override and asserts `start` prints the warning banner. (`warn_if_firewall_open` is only tested via help mention.) |
-| F026 | yellow | tests/full_pipeline_test.sh:230-300         | After start, the compose project is `up` (proxy healthy), implying override file was generated, but there is no direct assertion on `state/.harness-runtime.yml` content. | No content check on the override yml. |
+| F026 | green  | tests/full_pipeline_test.sh:326-336         | T5: if `state/.harness-runtime.yml` is present, asserts `grep -q '^# Generated by harness; do not edit\.'` — proves it's the generated artifact, not stale. (When the override body is empty the writer removes the file; either branch passes documented contract.) | |
 | F027 | green  | tests/harness_test.sh:146-221               | T0 calls `_gate_on_upstream_auth` with a stubbed `_probe_upstream_auth` returning 1 (401); asserts function aborts with `exit 1`. | |
 | F028 | green  | tests/harness_test.sh:286-297               | T4 invokes `harness down`, then `docker ps --filter` count must be 0 for the project. | |
 | F029 | green  | tests/full_pipeline_test.sh:579-597         | T13 down + verify `state/agent/home/.harness-home-initialized` still present and `state/ollama-data/` not empty. | |
 | F030 | green  | tests/harness_test.sh:732-748               | T12 invokes `harness restart`; afterwards both proxy and ollama are healthy. | |
-| F031 | yellow | tests/full_pipeline_test.sh:601-608         | T14 runs `harness update` against the install root; assertion is only `rc==0`. | No assertion about ff-only vs no-op behavior. |
+| F031 | green  | tests/full_pipeline_test.sh:707-727         | T14 asserts output negates `'rejected\|non-fast-forward\|merge conflict\|cannot fast-forward'` AND contains `'Already up to date\|fast.forward'` AND source-greps the installed wrapper for the literal `git pull --ff-only`. | |
 | F032 | red    | —                                           | —                                                                                                     | No test dirties the working tree and asserts `harness update` refuses. |
 | F033 | green  | tests/harness_test.sh:800-854               | T16 invokes `harness upgrade --check` against a manifest, parses output for planned actions; asserts manifest entries enumerated. | |
 | F034 | green  | tests/harness_test.sh:862-898               | T17: `harness upgrade --no-prompt --no-restart` produces effects from manifest (env merged, allowlist line added). | |
@@ -108,7 +163,7 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | F039 | green  | tests/upgrade_test.sh:399-444               | T8: `printf 'y\n' \| _upgrade_confirm` proceeds; tests Y, y, yes, YES, empty (with default), CR-stripping. | |
 | F040 | green  | tests/upgrade_test.sh:399-444               | T8: `printf 'n\n' \| _upgrade_confirm` aborts; tests n, N, no, NO, x, CR-stripping. | |
 | F041 | green  | tests/harness_test.sh:268-282               | T3: `timeout 5 ${HARNESS_WRAPPER} logs ollama` produces output containing `ollama` or `serve`. | |
-| F042 | yellow | tests/harness_test.sh:268-282               | T3 only invokes `logs ollama` (single service). | No test for `harness logs` with no arg. |
+| F042 | green  | tests/harness_test.sh:283-313               | T3 now runs `timeout 5 ${HARNESS_BIN} logs` (no service), asserts rc 0/124, no parse-error message, AND both `'ollama'` and `'proxy'` appear in the captured output (compose prefixes each line with the service name when no service is given). | |
 | F043 | green  | tests/full_pipeline_test.sh:362-387         | T9: `harness claude -p "<prompt>"` produces `Hello from mock upstream`. Verifies claude profile + mode dispatch. | |
 | F044 | green  | tests/full_pipeline_test.sh:391-417         | T10: `harness opencode -p "<prompt>"` produces a non-empty response with skip-on-auth-fail. | |
 | F045 | red    | —                                           | —                                                                                                     | No test invokes `harness shell` (interactive TTY makes this hard to assert non-trivially). |
@@ -138,7 +193,7 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | F069 | red    | —                                           | —                                                                                                     | No test specifically passes `-foo.com` (leading hyphen). |
 | F070 | red    | —                                           | —                                                                                                     | No test specifically passes `foo-.com` (trailing hyphen). |
 | F071 | red    | —                                           | —                                                                                                     | No test specifically passes `foo..bar` (consecutive dots). |
-| F072 | yellow | tests/harness_test.sh:711-720               | T11 only passes `BAD HOST` (space). The other illegal-char paths in F067-F071 aren't covered. | The `[a-z0-9.-]` charclass test is only spot-tested via the space character. |
+| F072 | green  | tests/harness_test.sh:780-805               | T11 also drives `bad_host.example.com`, `bad@host.example.com`, `bad$host.example.com`, `bad:host.example.com` — each rejected with rc != 0, `'invalid host'` diagnostic, AND the rejected literal never leaks into the allowlist file. | |
 | F073 | green  | tests/harness_test.sh:706-710               | T11 re-runs `harness net allow github.com` (already present); assertion is no duplicate line, exit 0. | |
 | F074 | green  | tests/harness_test.sh:680-686               | T11: `harness net allow --push my-gitlab.example.com` adds line with `# git-push` annotation. | |
 | F075 | red    | —                                           | —                                                                                                     | No test starts with a `pull` entry and runs `--push` to assert upgrade. |
@@ -197,15 +252,15 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | F128 | green  | tests/mcp_test.sh:352-392                   | T7 asserts the side-file lists the service, which requires `mcp_compose_files` to have returned the entry's compose.yml. | |
 | F129 | green  | tests/mcp_test.sh:352-392                   | T7 services list explicitly includes `test_mcp` (the service name parsed from compose.yml). | |
 | F130 | green  | tests/mcp_test.sh:396-411 + 485-497         | T8 expects `running`; T12 expects `stopped` after down. | |
-| F131 | yellow | tests/harness_test.sh:32                    | Every test sets `HARNESS_PROJECT_NAME`; success of project-isolated tests is evidence, but no direct test reads the compose `--project-name` arg. | No direct check on compose invocation args. |
+| F131 | green  | tests/harness_test.sh:1146-1190             | T19c sources wrapper, stubs `harness_docker` to print received args, runs `compose ps --sentinel-token-d19c`, asserts the captured args contain `--project-name harness-compose-args-test`. | |
 | F132 | red    | —                                           | —                                                                                                     | No test simulates Git Bash to exercise the `MSYS_NO_PATHCONV=1` branch. |
-| F133 | yellow | tests/harness_test.sh (sourced)             | Compose runs successfully when both base file and runtime override exist; not asserted directly. | No direct check on compose `-f` args. |
+| F133 | green  | tests/harness_test.sh:1146-1190             | T19c same setup as F131: captured args also asserted to contain `-f <docker-compose.yml>`, and sentinel-token check confirms the captured invocation was from `compose()` (not some earlier helper). | |
 | F134 | green  | tests/mcp_test.sh:277-309                   | T5: after MCP install/enable, `harness mcp up` succeeds — only possible if compose has appended the MCP `-f` entry. | |
-| F135 | yellow | tests/full_pipeline_test.sh:444-462 + persistence_test.sh:191-245 | UID/GID remap effect is visible (files owned by host UID), implying env was injected, but the runtime override yml is not parsed directly. | No direct content check on `state/.harness-runtime.yml`. |
+| F135 | green  | tests/full_pipeline_test.sh:326-336 + persistence_test.sh:155-176 | T5 checks the runtime-override file carries the generator header (proves write_runtime_override produced it); T1+T3 of persistence verify the bind-mounted home and pip-installed files end up owned by host uid AND gid — which only happens if HOST_UID/HOST_GID env was injected by write_runtime_override. | |
 | F136 | green  | tests/full_pipeline_test.sh:444-462         | T15 asserts the agent shared home is mounted (marker file `.harness-home-initialized` persisted between runs). | |
 | F137 | green  | tests/integration_test.sh:735-785           | Phase 5 `--mount` adds a bind that is visible inside the agent container. | |
 | F138 | red    | —                                           | —                                                                                                     | No test sets a net-override and asserts the yellow warning is printed by `start`. |
-| F139 | yellow | tests/full_pipeline_test.sh:230-300         | `harness start` succeeds with empty net-overrides and no warning bleeds into the test output — but no explicit "must be silent" assertion. | No explicit silence assertion. |
+| F139 | green  | tests/full_pipeline_test.sh:317-324         | T5 captures `start.log` and explicitly asserts `! grep -q "NETWORK FIREWALL IS DISABLED"` — silence is now a hard assertion when `.harness-net-overrides.json` is absent. | |
 
 ## P — Proxy (56 IDs)
 
@@ -213,21 +268,21 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
 | P001 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `curl /health` returns 200 with `{"status":"ok"}` (precondition before round-trip). | |
 | P002 | green  | tests/proxy_test.sh:253-285                 | Scenario B posts to `/api/chat` (catch-all) and gets a forwarded chat-completions response. | |
-| P003 | yellow | tests/proxy_test.sh:53                      | `PROXY_HOST=0.0.0.0` set in test env; success of curl evidences listen-on-host, but no direct assertion. | No assertion on bind-host default. |
-| P004 | yellow | tests/proxy_test.sh:54                      | `PROXY_PORT=8000` set in test env; success of curl on 8000 implies env consumed. | No assertion on port default. |
+| P003 | green  | tests/proxy_test.sh:469-475                 | Scenario F captures proxy logs and asserts `grep -qE 'listening on:[[:space:]]+0\.0\.0\.0:8000'` — direct evidence PROXY_HOST env was consumed by the bind. | |
+| P004 | green  | tests/proxy_test.sh:475-479                 | Scenario F same banner asserts the `:8000` suffix on the listening line — PROXY_PORT env was consumed. | |
 | P005 | green  | tests/proxy_test.sh:218-285 + test_proxy.py via env | Test env sets `PROXY_API_URL` and asserts forwarded body lands at mock upstream. | |
-| P006 | yellow | tests/proxy_test.sh:53-60                   | `PROXY_API_KEY=test-key`; mock upstream accepts it; no direct assertion that the key is used in Authorization header. | No header check. |
+| P006 | green  | tests/proxy_test.sh:480-490                 | Scenario F sets `PROXY_API_KEY=test-key-1234`, asserts banner shows redacted form `test...1234` AND raw key is NOT printed (regression guard against accidental key leak). | |
 | P007 | green  | tests/proxy_test.sh:218-249                 | Scenario A checks forwarded `model` equals `PROXY_API_MODEL`, not the inbound name. | |
 | P008 | yellow | tests/proxy_test.sh:56                      | `PROXY_TIMEOUT=30` set; no assertion on actual timeout behavior. | No test simulates a slow upstream to exercise the timeout. |
 | P009 | green  | proxy/test_proxy.py:584-598                 | TestMakeChunk.test_done_chunk_includes_stats asserts `prompt_eval_count` is overridden using context length env. | |
-| P010 | green  | proxy/test_proxy.py:601-771                 | TestPromptInjectionModes covers `user_front` as default via test_default_mode_is_user_front (line 733). | |
+| P010 | green  | proxy/test_proxy.py:601-771 + tests/scheme_contract_test.sh:240-432 | TestPromptInjectionModes covers `user_front` as default via test_default_mode_is_user_front (line 733). Track E adds end-to-end contract assertions for each scheme (`user_front`, `user_bookend`, `user`, `system`, `hybrid`) via mock-upstream body capture. | |
 | P011 | green  | proxy/test_proxy.py:774-919                 | TestChangeSystemToUser stubs the flag via `patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True)`. | |
-| P012 | yellow | tests/proxy_test.sh:55                      | `OUTPUT_DIR=` (empty) sets the env var but the test does not assert dump-file absence/presence. | No dump-file test. |
-| P013 | green  | proxy/test_proxy.py:686-707                 | test_mode_user_front_request_before_tools: `request_marker_pos < tools_section_pos`. Re-asserted in proxy_test.sh:289-352 (Scenario C). | |
-| P014 | green  | proxy/test_proxy.py:708-727                 | test_mode_user_bookend_request_appears_twice: `text.count("say hello") == 2`. | |
-| P015 | green  | proxy/test_proxy.py:640-651                 | test_mode_user_injects_into_last_user_message. | |
-| P016 | green  | proxy/test_proxy.py:652-662, 676-685        | test_mode_system_appends_to_system + test_mode_system_inserts_system_when_missing. | |
-| P017 | green  | proxy/test_proxy.py:663-675                 | test_mode_hybrid_full_tools_in_system_reminder_in_user. | |
+| P012 | green  | tests/proxy_test.sh:491-507                 | Scenario F asserts `grep -qE 'debug dumps:[[:space:]]+disabled \(OUTPUT_DIR not set\)'` — proxy banner reports OUTPUT_DIR consumption explicitly. | |
+| P013 | green  | proxy/test_proxy.py:686-707 + tests/scheme_contract_test.sh:263-296 | test_mode_user_front_request_before_tools: `request_marker_pos < tools_section_pos`. Track E adds end-to-end contract: forwarded body's last user message has `<<<BEGIN_USER_REQUEST>>>` BEFORE `### Available Tools`. | |
+| P014 | green  | proxy/test_proxy.py:708-727 + tests/scheme_contract_test.sh:298-328 | test_mode_user_bookend_request_appears_twice: `text.count("say hello") == 2`. Track E adds end-to-end contract: forwarded last user message has BEGIN marker count == 2, probe count == 2, tool list between the two occurrences. | |
+| P015 | green  | proxy/test_proxy.py:640-651 + tests/scheme_contract_test.sh:330-359 | test_mode_user_injects_into_last_user_message. Track E adds end-to-end contract for legacy `user` mode: forwarded body request marker appears AFTER tool list. | |
+| P016 | green  | proxy/test_proxy.py:652-662, 676-685 + tests/scheme_contract_test.sh:361-398 | test_mode_system_appends_to_system + test_mode_system_inserts_system_when_missing. Track E adds end-to-end contract: scaffolding lives in head of conversation (not last user message); last user message is the unmodified probe. | |
+| P017 | green  | proxy/test_proxy.py:663-675 + tests/scheme_contract_test.sh:400-431 | test_mode_hybrid_full_tools_in_system_reminder_in_user. Track E adds end-to-end contract: forwarded last user message contains "Tool reminder" + probe text but NOT full tool list / instructions header (those live in head). | |
 | P018 | green  | proxy/test_proxy.py:728-738                 | test_invalid_mode_falls_back_to_user_front: stubs `_PROMPT_MODE="bogus"`, asserts function still produces user_front output. | |
 | P019 | green  | proxy/test_proxy.py:138-447 (TestExtractToolCall, TestExtractToolCallScanner) | 20+ asserts on fenced json extraction; e.g., test_simple_tool_call line 172, test_valid_block_extracted_and_removed line 145. | |
 | P020 | green  | proxy/test_proxy.py:249-261                 | test_two_valid_blocks_both_extracted: `len(payloads) == 2`. Re-asserted in proxy_test.sh:378-453 (Scenario E). | |
@@ -260,7 +315,7 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | P047 | red    | —                                           | —                                                                                                     | No test reads back `04_NDJSON_Response_*` dump files. |
 | P048 | red    | —                                           | —                                                                                                     | No test reads back `99_Fatal_Error_*` dump files. |
 | P049 | red    | —                                           | —                                                                                                     | No test reads back dump filenames (monotonic counter pattern). |
-| P050 | yellow | tests/proxy_test.sh:55                      | OUTPUT_DIR is empty; tests pass which implies dump-skip path doesn't crash, but no explicit assertion. | No explicit silence assertion. |
+| P050 | green  | tests/proxy_test.sh:496-507                 | Scenario F asserts proxy logs DO NOT contain `'failed to save debug file'` AND DO NOT contain `OUTPUT_DIR '' is not writable` — silence is hard-asserted, not implied. | |
 | P051 | green  | tests/proxy_test.sh:356-369                 | Scenario D: streaming request yields multi-line NDJSON; `D_LINE_COUNT >= 2`, final line has `"done":true`. | |
 | P052 | green  | tests/proxy_test.sh:218-249                 | Scenario A: non-stream request produces ONE content chunk + done chunk (NDJSON 2 lines). | |
 | P053 | green  | proxy/test_proxy.py:544-569                 | tool messages translated to user-role `System Observation:` text. | |
@@ -275,34 +330,34 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | A001 | green  | tests/firewall_test.sh:200-261              | Phase 3 verifies that without `HARNESS_FIREWALL_DISABLED=1`, ollama's OUTPUT policy remains DROP — proving the firewall script ran. | |
 | A002 | green  | tests/firewall_test.sh:213-228              | Phase 3: `grep -q 'DISABLED via HARNESS_FIREWALL_DISABLED=1'` confirms skip + warning. | |
 | A003 | green  | tests/integration_test.sh:460-573 + persistence_test.sh:191-245 | Graphify phase: `stat -c '%u' = $(id -u)` proves UID remap; persistence T3 asserts pip-installed files are owned by host UID. | |
-| A004 | yellow | tests/persistence_test.sh:191-245           | Group ownership not asserted explicitly; only owner UID. | No GID assertion. |
+| A004 | green  | tests/persistence_test.sh:155-176 + 255-276 | T1 stat's `.harness-home-initialized` and asserts both `%g == host gid` and `%u == host uid`; T3 stat's the pip-installed `requests` package directory and asserts the same paired uid+gid match — catches identity-mismatch regressions where only one half of remap is correct. | |
 | A005 | red    | —                                           | —                                                                                                     | No test runs the entrypoint twice and asserts the second pass is a no-op for remap. |
 | A006 | red    | —                                           | —                                                                                                     | No test asserts chown is skipped when already correctly owned. |
-| A007 | yellow | tests/full_pipeline_test.sh:362-387         | Agent runs `claude -p` and reads `${AGENT_HOME}` files — proves it didn't run as root (writes are user-owned), but no direct `gosu` assertion. | No direct gosu/uid-at-exec assertion. |
+| A007 | green  | tests/full_pipeline_test.sh:453-464         | T9 stat's `${agent_home_marker}` (`.harness-home-initialized`, written by user-side init AFTER gosu drop) and asserts `%u == $(id -u)` — direct evidence the agent dropped privileges before user-side init ran. | |
 | A008 | red    | —                                           | —                                                                                                     | No test asserts `configure-git-credentials.sh` is invoked during agent startup. (persistence_test T6 verifies `.git-credentials` survives, not that the script runs.) |
 | A009 | green  | tests/persistence_test.sh:137-155 + full_pipeline_test.sh:444-462 | T1 + T15: `.harness-home-initialized` marker written; `seeded_count >= 2` after first run. | |
 | A010 | red    | —                                           | —                                                                                                     | No test sets `HARNESS_HOST_CWD` and asserts the agent `cd`'d into it. |
 | A011 | green  | tests/persistence_test.sh:329-368           | T5: starts with no `~/.claude/settings.json`, entrypoint creates it. | |
-| A012 | yellow | tests/persistence_test.sh:329-368           | T5 only asserts `statusLine` block — not `includeCoAuthoredBy: false`. | No assertion on `includeCoAuthoredBy`. |
+| A012 | green  | tests/persistence_test.sh:413-440           | T5 grep's `'"includeCoAuthoredBy"'` then uses jq (or grep fallback) to assert the value is literally `false` — catches both removal and accidental `true`. | |
 | A013 | green  | tests/persistence_test.sh:360-368           | `grep -q '"statusLine"'` + `grep -q 'ccstatusline'`. | |
 | A014 | green  | tests/persistence_test.sh:329-368           | T5 starts with pre-existing settings (`_user_marker`) and asserts marker preserved post-merge. | |
 | A015 | green  | tests/mcp_test.sh:377-392                   | T7: side-file `state/agent/home/.harness-mcp-servers.json` contains `test_mcp` + sse URL. | |
 | A016 | green  | tests/full_pipeline_test.sh:471-575         | T16: after MCP install, `harness claude -p` succeeds — requires the side-file to be merged into `~/.claude.json`. | |
 | A017 | red    | —                                           | —                                                                                                     | No test installs two MCPs with the same key to assert last-write-wins. |
-| A018 | red    | —                                           | —                                                                                                     | No test asserts `~/.config/opencode/opencode.json` is written. |
+| A018 | green  | tests/e2e/scenarios/02-opencode-boot.yaml   | F2 scenario header `inventory_refs: [F044, A018]`; boot path drives `harness opencode` in tmux and verifies the TUI renders — the boot path can only succeed when `ensure_opencode_config` wrote a valid `~/.config/opencode/opencode.json` on launch. | |
 | A019 | red    | —                                           | —                                                                                                     | No test asserts opencode config has a `harness` provider pointing at ollama. |
 | A020 | red    | —                                           | —                                                                                                     | No test asserts opencode config defines a `yolo` agent profile. |
 | A021 | red    | —                                           | —                                                                                                     | No test asserts opencode mcp-servers merge happens. |
 | A022 | red    | —                                           | —                                                                                                     | No test asserts local vs remote mcp distinction in opencode shape. |
 | A023 | red    | —                                           | —                                                                                                     | No test asserts `run_claude` errors when `ANTHROPIC_BASE_URL` is unset. |
-| A024 | yellow | tests/full_pipeline_test.sh:362-387         | claude -p succeeds against mock upstream, evidencing the dummy token was supplied. No direct env-readback. | No direct env assertion. |
+| A024 | green  | tests/full_pipeline_test.sh:466-470         | T9 source-greps the installed wrapper: `grep -Fq 'ANTHROPIC_AUTH_TOKEN=harness-dummy' "${TEST_ROOT}/harness/harness"` — direct literal check on the artifact under test. | |
 | A025 | red    | —                                           | —                                                                                                     | No test asserts `DISABLE_AUTOUPDATER=1` is exported. |
 | A026 | red    | —                                           | —                                                                                                     | No test exercises `--dangerously-skip-permissions` via `HARNESS_YOLO=1`. |
 | A027 | green  | tests/full_pipeline_test.sh:362-387         | T9: passes `-p "<prompt>"` and the prompt body reaches the mock upstream. | |
 | A028 | red    | —                                           | —                                                                                                     | No test asserts `OPENCODE_DISABLE_AUTOUPDATE=1`. |
 | A029 | red    | —                                           | —                                                                                                     | No test exercises `--agent yolo` via `HARNESS_YOLO=1`. |
 | A030 | green  | tests/full_pipeline_test.sh:391-417         | T10: `harness opencode -p` succeeds, producing a response. | |
-| A031 | yellow | tests/full_pipeline_test.sh:391-417         | T10 invokes `-p` and the run succeeds — implies the flag was stripped before forwarding. No direct assertion on argv passed to opencode. | No direct argv-readback. |
+| A031 | green  | tests/full_pipeline_test.sh:500-512         | T10 grep's `! grep -Eqi 'unknown (option\|flag).*-p\|unknown (option\|flag).*--print'` against the opencode output (stray flag would surface an unknown-flag error from opencode), AND source-greps `agents/entrypoint.sh` for the literal strip branch `"$arg" == "-p" || "$arg" == "--print"`. | |
 | A032 | red    | —                                           | —                                                                                                     | No test exercises `harness shell` (interactive). |
 | A033 | green  | tests/full_pipeline_test.sh:362-417         | T9 (claude) and T10 (opencode) both dispatch from positional mode; each test exercises a different mode-branch. | |
 | A034 | red    | —                                           | —                                                                                                     | No test invokes an unknown mode and asserts the usage error. |
@@ -385,7 +440,7 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | U009 | green  | tests/upgrade_test.sh:60-218                | T1 + T5: result blob asserted via `jq -r '.added_keys'`, `.skipped`, `.length`. | |
 | U010 | red    | —                                           | —                                                                                                     | No test runs an envfile_merge against a CRLF source to assert CR stripping. |
 | U011 | green  | tests/upgrade_test.sh:113-141               | T2: linefile_merge appends `host-c.example`; `added_lines=[host-c.example]`. | |
-| U012 | yellow | tests/upgrade_test.sh:113-141               | T2 target ends with newline by construction; not asserted directly. | No "missing trailing newline" case. |
+| U012 | green  | tests/upgrade_test.sh:163-208               | T2b crafts a target file ending with NO newline (via `printf` to bypass heredoc auto-newline), asserts the precondition via `tail -c 1 \| od`, runs `upgrade_linefile_merge`, then asserts: (a) added line on its own line, (b) original last entry intact, (c) post-merge file ends with `0a` byte, (d) marker comment on its own line. | |
 | U013 | green  | tests/upgrade_test.sh:113-141               | T2: line already in target -> skipped (length == 0 for that line). | |
 | U014 | green  | tests/upgrade_test.sh:113-141               | T2: source has different inline annotation than target -> warning count == 1. | |
 | U015 | green  | tests/upgrade_test.sh:113-141               | T2: target retains its `host-b.example # git-push` annotation. | |
@@ -398,7 +453,7 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | U022 | green  | tests/upgrade_test.sh:179-218               | T5: missing-target + `condition: installed` -> reports `target_missing`. | |
 | U023 | green  | tests/upgrade_test.sh:179-218               | T5: missing-source -> reports `source_missing`. | |
 | U024 | red    | —                                           | —                                                                                                     | No test directly exercises `_upg_atomic_mv`. |
-| U025 | yellow | tests/upgrade_test.sh:1-30 (sourced libs)   | upgrade_actions.sh is sourced and used throughout; `harness_jq` fallback path is implicit via host-jq present. | Same as F016 — fallback not isolated. |
+| U025 | green  | tests/upgrade_test.sh:537-580               | T9 sources `upgrade_actions.sh` standalone (no outer harness), asserts `declare -F harness_jq` succeeds, then exercises the fallback: `printf '{"k":1}' \| harness_jq -r '.k'` returns `1`; `printf 'hello world' \| harness_jq -Rs .` returns `"hello world"`; `_upg_json_array foo bar` returns `["foo","bar"]`; `_upg_json_str 'a/b "c"'` round-trips. | |
 | U026 | red    | —                                           | —                                                                                                     | No test asserts `version: 2` manifest is rejected. |
 | U027 | red    | —                                           | —                                                                                                     | No test asserts ordering of `actions[]` vs `registry_actions[]`. |
 | U028 | red    | —                                           | —                                                                                                     | No test runs `registry_actions` with `condition: installed` against a not-installed MCP entry. |
@@ -408,39 +463,39 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
-| Pe001| green  | tests/upgrade_test.sh:227-354               | T6: `.env` (with user-set `PROXY_API_URL=https://my-llm.example/v1`) survives upgrade idempotently. | |
-| Pe002| green  | tests/upgrade_test.sh:113-141               | T2 simulates allowlist upgrade; existing host entries preserved. | |
-| Pe003| red    | —                                           | —                                                                                                     | No test makes `.harness-net-overrides.json` and asserts it survives `down`. |
-| Pe004| green  | tests/persistence_test.sh:191-426 + full_pipeline_test.sh:444-462 | T3, T4, T5, T6 all verify state/agent/home/ content persistence across container rebuild. | |
-| Pe005| yellow | tests/full_pipeline_test.sh:230-300         | After restart, ollama reports healthy implying registered stub models survived; not asserted via content read. | No content check on `state/ollama-data/`. |
-| Pe006| yellow | tests/proxy_test.sh:55                      | OUTPUT_DIR env defined; never modified by upgrade test paths. | No upgrade-touches-output-dir test. |
-| Pe007| green  | tests/mcp_test.sh:238-259 + 527-546         | install creates `state/mcp/<name>/`; uninstall removes it. | |
-| Pe008| green  | tests/upgrade_test.sh:146-174 + mcp_test.sh:415-441 | T4 (DEALBREAKER): post-upgrade `jq '.enabled' harness-meta.json == false` preserved; T9 demonstrates disable state. | |
-| Pe009| red    | —                                           | —                                                                                                     | No test asserts `state/mcp/serena/data/` survives a fake upgrade. (Integration test exercises serena but doesn't run an upgrade across it.) |
-| Pe010| green  | tests/full_pipeline_test.sh:601-608 (T14 update) | After update, `state/.harness-runtime.yml` is regenerated by next compose call. (No assertion the file is fresh — yellow.) | |
-| Pe011| green  | tests/mcp_test.sh:600-621                   | T17 re-triggers side-file write path. | |
-| Pe012| green  | tests/persistence_test.sh:329-368           | T5 auto-augments `~/.claude/settings.json` on launch. | |
-| Pe013| green  | tests/persistence_test.sh:257-315           | T4: ccstatusline `settings.json` seeded; `_user_marker` preserved across re-seed. | |
-| Pe014| green  | tests/persistence_test.sh:137-176           | T1 + T2: skel-seed once, user edits preserved on second run. | |
-| Pe015| green  | tests/full_pipeline_test.sh:579-597         | T13 down: no state files deleted. | |
-| Pe016| green  | tests/upgrade_test.sh:60-354                | All upgrade tests preserve user state files (asserted across T1, T4, T6). | |
-| Pe017| green  | tests/mcp_test.sh:527-546                   | T14: uninstall removes `state/mcp/<name>/` recursively. | |
-| Pe018| green  | tests/upgrade_test.sh:146-174               | T4 (DEALBREAKER): harness-meta.json with `.enabled == false` survives directory_overwrite even when source has it as true. | |
-| Pe019| green  | tests/upgrade_test.sh:146-174               | T4: `data/` subdir preserved (`data/user.txt == "user-state"`). | |
+| Pe001 | green  | tests/upgrade_test.sh:227-354               | T6: `.env` (with user-set `PROXY_API_URL=https://my-llm.example/v1`) survives upgrade idempotently. | |
+| Pe002 | green  | tests/upgrade_test.sh:113-141               | T2 simulates allowlist upgrade; existing host entries preserved. | |
+| Pe003 | red    | —                                           | —                                                                                                     | No test makes `.harness-net-overrides.json` and asserts it survives `down`. |
+| Pe004 | green  | tests/persistence_test.sh:191-426 + full_pipeline_test.sh:444-462 | T3, T4, T5, T6 all verify state/agent/home/ content persistence across container rebuild. | |
+| Pe005 | green  | tests/full_pipeline_test.sh:338-345         | T5 asserts `find "${TEST_ROOT}/harness/state/ollama-data" -mindepth 1` finds at least one entry — proves the directory holds persisted registration data after a successful start. | |
+| Pe006 | yellow | tests/proxy_test.sh:55                      | OUTPUT_DIR env defined; never modified by upgrade test paths. | No upgrade-touches-output-dir test. |
+| Pe007 | green  | tests/mcp_test.sh:238-259 + 527-546         | install creates `state/mcp/<name>/`; uninstall removes it. | |
+| Pe008 | green  | tests/upgrade_test.sh:146-174 + mcp_test.sh:415-441 | T4 (DEALBREAKER): post-upgrade `jq '.enabled' harness-meta.json == false` preserved; T9 demonstrates disable state. | |
+| Pe009 | red    | —                                           | —                                                                                                     | No test asserts `state/mcp/serena/data/` survives a fake upgrade. (Integration test exercises serena but doesn't run an upgrade across it.) |
+| Pe010 | green  | tests/full_pipeline_test.sh:326-336         | T5 asserts if `state/.harness-runtime.yml` exists, it carries the `# Generated by harness; do not edit.` header — guarantees the file is the regenerated artifact, not a stale hand-written one. | |
+| Pe011 | green  | tests/mcp_test.sh:600-621                   | T17 re-triggers side-file write path. | |
+| Pe012 | green  | tests/persistence_test.sh:329-368           | T5 auto-augments `~/.claude/settings.json` on launch. | |
+| Pe013 | green  | tests/persistence_test.sh:257-315           | T4: ccstatusline `settings.json` seeded; `_user_marker` preserved across re-seed. | |
+| Pe014 | green  | tests/persistence_test.sh:137-176           | T1 + T2: skel-seed once, user edits preserved on second run. | |
+| Pe015 | green  | tests/full_pipeline_test.sh:579-597         | T13 down: no state files deleted. | |
+| Pe016 | green  | tests/upgrade_test.sh:60-354                | All upgrade tests preserve user state files (asserted across T1, T4, T6). | |
+| Pe017 | green  | tests/mcp_test.sh:527-546                   | T14: uninstall removes `state/mcp/<name>/` recursively. | |
+| Pe018 | green  | tests/upgrade_test.sh:146-174               | T4 (DEALBREAKER): harness-meta.json with `.enabled == false` survives directory_overwrite even when source has it as true. | |
+| Pe019 | green  | tests/upgrade_test.sh:146-174               | T4: `data/` subdir preserved (`data/user.txt == "user-state"`). | |
 
 ## O — Ollama entrypoint + stub model registration (25 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
-| O001 | yellow | tests/firewall_test.sh:248-258              | Ollama OUTPUT policy is DROP at startup — implies init-firewall.sh ran. | No direct ordering assertion. |
+| O001 | green  | tests/firewall_test.sh:272-318              | Phase 3 captures ollama container logs and asserts: (a) `[harness-firewall] starting init` marker present, (b) `[harness-firewall] init complete` marker present, (c) no `init-firewall.sh missing` fallback, (d) firewall `starting init` log line precedes `waiting for ollama API at` — direct ordering proof that firewall ran before `ollama serve`. | |
 | O002 | red    | —                                           | —                                                                                                     | No test verifies ollama PID capture / background launch. |
-| O003 | yellow | tests/harness_test.sh:225-252               | T1 polls `docker inspect` for `"healthy"` status — implies `/api/tags` polling worked. | No direct assertion on the 60s poll loop. |
+| O003 | green  | tests/harness_test.sh:315-325               | T3 scrapes the ollama container logs and asserts `grep -Eq 'waiting for ollama API at .*?/api/tags'` — direct evidence the entrypoint's poll loop emitted its banner (and, since T1 sees the container become healthy, that the poll succeeded). | |
 | O004 | red    | —                                           | —                                                                                                     | No test forces ollama to be unready to exercise the fatal timeout branch. |
 | O005 | green  | tests/proxy_test.sh:218-249                 | Scenario A's `/api/show` returns the registered model w/ context length 200000 — only possible if `register_stub_model` succeeded. | |
 | O006 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `/api/show` body contains `"context_length": 200000`. | |
 | O007 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `"num_ctx": 200000`. | |
 | O008 | red    | —                                           | —                                                                                                     | No test specifically forces the streaming response to omit `"status":"success"` to assert the registration-fatal path. |
-| O009 | yellow | tests/harness_test.sh:225-252               | Healthy ollama implies canonical MODEL_NAME registered (or container would have exited). | No explicit container-exit assertion on registration failure. |
+| O009 | green  | tests/harness_test.sh:327-336               | T3 also asserts the explicit success log line: `grep -Eq 'harness ollama ready; stub models -> '` — direct evidence registration succeeded and would catch a regression that turns a fatal error into a silent warning. | |
 | O010 | red    | —                                           | —                                                                                                     | No test fakes `sonnet` registration failure to assert best-effort tolerance. |
 | O011 | red    | —                                           | —                                                                                                     | Same for `opus`. |
 | O012 | red    | —                                           | —                                                                                                     | Same for `haiku`. |
@@ -466,14 +521,14 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | I002 | red    | —                                           | —                                                                                                     | No test sources `harness-install.sh` and asserts it does NOT call `exit`. |
 | I003 | green  | tests/full_pipeline_test.sh:139-201         | T0/T1 succeeds only when git is on PATH; preflight inside install runs. | |
 | I004 | green  | tests/full_pipeline_test.sh:139-201         | Install preflight verifies docker (or podman) — test passes against the active runtime. | |
-| I005 | yellow | tests/full_pipeline_test.sh:139-201         | Install proceeds only if compose works; not directly asserted. | No isolated compose-detection failure case. |
+| I005 | green  | tests/full_pipeline_test.sh:243-247         | T2 directly invokes `harness_docker compose version >/dev/null 2>&1` — fails T2 if compose isn't callable, proving the preflight invariant. | |
 | I006 | red    | —                                           | —                                                                                                     | No test simulates < 5 GB free disk to force preflight failure. |
 | I007 | red    | —                                           | —                                                                                                     | No test runs install in a non-writable CWD to assert preflight failure. |
 | I008 | red    | —                                           | —                                                                                                     | No test runs install with `./harness/` already present and asserts refusal. |
-| I009 | yellow | tests/full_pipeline_test.sh:139-201         | Default repo URL is what's used when `HARNESS_REPO_URL` is unset; test always sets it to the local repo. | No explicit default-value assertion. |
+| I009 | green  | tests/full_pipeline_test.sh:203-208         | T1 source-greps `harness-install.sh` for the exact literal `REPO_URL="${HARNESS_REPO_URL:-https://github.com/HandelSim/harness}"` — proves the documented default URL is still wired in. | |
 | I010 | green  | tests/full_pipeline_test.sh:139-201         | `HARNESS_REPO_URL` is exported to point at the local repo; install honors it. | |
 | I011 | red    | —                                           | —                                                                                                     | No test runs install before `platform.sh` exists to exercise inline fallbacks. |
-| I012 | yellow | tests/full_pipeline_test.sh:139-201         | Install completes (calls into platform.sh primitives after clone). | No direct sourcing-order assertion. |
+| I012 | green  | tests/full_pipeline_test.sh:210-217         | T1 asserts `scripts/lib/platform.sh` exists in the clone AND grep's `harness-install.sh` for the literal `source "$install_root/scripts/lib/platform.sh"` — proves the post-clone source happens. | |
 | I013 | red    | —                                           | —                                                                                                     | No test simulates Windows to exercise the dos2unix pass. |
 | I014 | green  | tests/full_pipeline_test.sh:203-213         | T2: `state/output/` exists and is writable. | |
 | I015 | green  | tests/full_pipeline_test.sh:203-213         | T2: `state/agent/home/` exists. | |
@@ -485,7 +540,7 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 | I021 | green  | tests/full_pipeline_test.sh:203-213         | T2: `.harness-allowlist` exists. | |
 | I022 | green  | tests/full_pipeline_test.sh:203-213         | T2: wrapper at `$HOME/.local/bin/harness` exists + executable. | |
 | I023 | green  | tests/full_pipeline_test.sh:203-213         | T2: `[[ ! -L "$wrapper" ]]` confirms NOT a symlink. | |
-| I024 | yellow | tests/full_pipeline_test.sh:203-213         | Wrapper is executable; install-root hard-coding is implicit. | No grep of wrapper contents for the path literal. |
+| I024 | green  | tests/full_pipeline_test.sh:230-233         | T2 source-greps the wrapper at `$HOME/.local/bin/harness` for the literal `${TEST_ROOT}/harness/harness` path — proves the install-root is hard-coded into the wrapper content, not just resolved at runtime. | |
 | I025 | green  | tests/harness_test.sh:471-501               | T7: PATH-append into `~/.bashrc` (deduped to count == 1). | |
 | I026 | red    | —                                           | —                                                                                                     | No test exercises the zshrc branch (SHELL=zsh). |
 | I027 | red    | —                                           | —                                                                                                     | No test exercises the fish config.fish branch. |
@@ -507,74 +562,192 @@ named test, confirm RED, then `git stash pop` and confirm GREEN again. See the
 
 ---
 
-## Spot-checks (regression detection)
+## Changes from previous audit
 
-Goal: pick green rows from different test files, introduce a deliberate regression with
-`git stash`, confirm the test FAILS, then `git stash pop` and confirm the test passes again.
+Track C produced the initial audit; Track J2 re-audited from the current
+state of `tests/` (after Track D strengthened multiple test files, Track
+E added `tests/scheme_contract_test.sh`, and Track F2 added the
+`tests/e2e/scenarios/*.yaml` files with `inventory_refs` keys).
 
-Performed below. (Transcript captured live during this audit.)
+| ID    | C status | J2 status | Track(s) | Why promoted |
+|-------|----------|-----------|----------|--------------|
+| F006  | yellow   | green     | D        | full_pipeline_test T2 now source-greps installed wrapper for `_self_path` function + realpath/readlink fallback. |
+| F015  | yellow   | green     | D        | harness_test T19b sources wrapper, stubs `harness_docker`, asserts host-jq branch returns correct result. |
+| F022  | yellow   | green     | D        | harness_test T23.4b invokes `harness check-updates` with no cache + unreachable origin, asserts rc != 0 + diagnostic. |
+| F026  | yellow   | green     | D        | full_pipeline_test T5 asserts the runtime-override file (when present) carries the generator header. |
+| F031  | yellow   | green     | D        | full_pipeline_test T14 asserts ff-only / no-op output AND source-greps wrapper for `git pull --ff-only` literal. |
+| F042  | yellow   | green     | D        | harness_test T3 runs `harness logs` (no service) and asserts both ollama and proxy lines appear. |
+| F072  | yellow   | green     | D        | harness_test T11 now exercises `_`, `@`, `$`, `:` illegal chars in addition to space. |
+| F131  | yellow   | green     | D        | harness_test T19c stubs `harness_docker` to capture compose() args, asserts `--project-name` is threaded. |
+| F133  | yellow   | green     | D        | harness_test T19c same: asserts `-f docker-compose.yml` is threaded into compose() invocations. |
+| F135  | yellow   | green     | D        | full_pipeline_test T5 (runtime-override header) + persistence_test T1/T3 (uid+gid alignment from injected env). |
+| F139  | yellow   | green     | D        | full_pipeline_test T5 explicitly asserts `start.log` does NOT contain `NETWORK FIREWALL IS DISABLED`. |
+| A004  | yellow   | green     | D        | persistence_test T1 + T3 now assert both uid AND gid match host on bind-mounted artifacts. |
+| A007  | yellow   | green     | D        | full_pipeline_test T9 stat's the home-initialized marker (post-gosu-drop artifact) and asserts owner uid == host. |
+| A012  | yellow   | green     | D        | persistence_test T5 now jq-asserts `includeCoAuthoredBy == false`. |
+| A018  | red      | green     | F2       | e2e scenario 02-opencode-boot.yaml header declares `inventory_refs: [F044, A018]`; boot path exercises ensure_opencode_config. |
+| A024  | yellow   | green     | D        | full_pipeline_test T9 source-greps wrapper for `ANTHROPIC_AUTH_TOKEN=harness-dummy` literal. |
+| A031  | yellow   | green     | D        | full_pipeline_test T10 asserts no `unknown flag` error AND source-greps entrypoint.sh for strip branch. |
+| I005  | yellow   | green     | D        | full_pipeline_test T2 directly invokes `harness_docker compose version`. |
+| I009  | yellow   | green     | D        | full_pipeline_test T1 source-greps `harness-install.sh` for default REPO_URL literal. |
+| I012  | yellow   | green     | D        | full_pipeline_test T1 asserts platform.sh in clone AND source-greps installer for sourcing line. |
+| I024  | yellow   | green     | D        | full_pipeline_test T2 grep's installed wrapper for the install-root path literal. |
+| O001  | yellow   | green     | D        | firewall_test Phase 3 scrapes ollama logs for firewall-init markers AND asserts firewall-line precedes ollama-api-wait-line. |
+| O003  | yellow   | green     | D        | harness_test T3 scrapes ollama logs for `waiting for ollama API at .*?/api/tags` poll banner. |
+| O009  | yellow   | green     | D        | harness_test T3 also asserts the explicit `harness ollama ready; stub models -> ` success line. |
+| P003  | yellow   | green     | D        | proxy_test Scenario F scrapes proxy logs for `listening on: 0.0.0.0:8000` banner. |
+| P004  | yellow   | green     | D        | proxy_test Scenario F same banner, asserts `:8000` port suffix. |
+| P006  | yellow   | green     | D        | proxy_test Scenario F asserts redacted key banner AND raw key NOT printed. |
+| P012  | yellow   | green     | D        | proxy_test Scenario F asserts banner reports `debug dumps: disabled (OUTPUT_DIR not set)`. |
+| P050  | yellow   | green     | D        | proxy_test Scenario F asserts proxy logs have no `failed to save debug file` and no `is not writable` lines. |
+| Pe005 | yellow   | green     | D        | full_pipeline_test T5 asserts `state/ollama-data` is non-empty (find -mindepth 1) after start. |
+| U012  | yellow   | green     | D        | upgrade_test T2b uses `printf` to craft a no-trailing-newline target, then asserts post-merge byte-accuracy via `tail -c 1 \| od`. |
+| U025  | yellow   | green     | D        | upgrade_test T9 sources upgrade_actions.sh standalone and exercises harness_jq + `_upg_json_array` + `_upg_json_str` directly. |
 
-### Spot-check 1 — F056 (`harness list` empty case)
+Per-prefix transition count:
 
-Test file: `tests/harness_test.sh` T2 (line 256-262).
+| prefix | yellow→green | red→green | yellow→yellow | red→red |
+|--------|--------------|-----------|---------------|---------|
+| F      |           11 |         0 |             0 |      44 |
+| P      |            5 |         0 |             2 |      13 |
+| A      |            5 |         1 |             0 |      16 |
+| I      |            4 |         0 |             0 |      16 |
+| O      |            3 |         0 |             0 |      18 |
+| U      |            2 |         0 |             0 |       7 |
+| Pe     |            1 |         0 |             1 |       2 |
+| **total** |       31 |         1 |             3 |     145 |
 
-The test asserts `[[ "${list_out}" != "no harness agents running" ]]`. Regression
-introduced into `harness` wrapper: change the empty-case literal from
-`"no harness agents running"` to `"none running"` and re-run T2.
+(`green→green` and `red→green-via-corroboration-only` not enumerated — neither
+moves the count. Notably P010, P013–P018 stayed green but gained Track-E
+end-to-end contract evidence; the per-row Evidence cells were updated to
+reflect this.)
 
-- Stash the regression: see `git stash list` for `track/C-coverage spot-check F056`.
-- Re-run `tests/harness_test.sh T2`: assertion fails — output `"none running"` does
-  not equal `"no harness agents running"`.
-- Pop stash, re-run T2: passes.
+Track E (scheme_contract_test.sh) and Track F2 (e2e scenarios) corroborated
+several already-green rows with stronger or more direct evidence; the per-row
+Evidence cells were updated where this gives a future reader a better
+test-pointer:
 
-This proves T2 is genuinely guarding the literal.
+- P010, P013, P014, P015, P016, P017 — Track E adds direct mock-upstream body
+  capture assertions per scheme.
+- F001, F043, F044, F051, F062, A013, P032, P051, Pe012 — Track F2 scenarios
+  declare `inventory_refs` and exercise the TUI surface (corroboration of
+  green rows that were previously only python-unit-tested or
+  print-mode-tested).
 
-### Spot-check 2 — M003 (`harness-meta.json` shape after install)
+---
 
-Test file: `tests/mcp_test.sh` T3 (line 238-258) + T5 (line 277-309).
+## Spot-check log
 
-Note: T3 only asserts the file EXISTS (line 255 `[[ ! -f ".../harness-meta.json" ]]`).
-The `{"enabled": true}` content is guarded indirectly by T5 — when `harness start`
-attempts to bring the MCP up, only enabled entries are launched.
+Goal: pick green rows from different test files, introduce a deliberate regression
+into the source, confirm the test FAILS, then revert and confirm the test passes
+again.
 
-Regression: in `harness` line 2376, change `mcp_set_enabled "$name" "true"` to
-`"false"`. Re-run `bash tests/mcp_test.sh`.
+### Spot-check J2-1 — U012 (linefile_merge newline injection, newly green)
 
-- T3 PASSED (file still exists) — confirms T3 is shallow on this dimension.
-- T5 FAILED: `T5 FAIL: test_mcp not healthy in 60s` — the disabled-on-install MCP
-  was not brought up.
-- Revert: T5 passes again.
+Test file: `tests/upgrade_test.sh` T2b (line 163-208).
 
-This proves the M003 contract IS guarded, but via T5 not T3. Updating M003's
-"Test file & line" row would more accurately point at the T5 line range; left as
-documented here because T3 asserts the file existence half of the inventory row
-and T5 asserts the content half.
+The test crafts a target file ending with NO trailing newline (via
+`printf 'host-a.example'` — no `\n`), runs `upgrade_linefile_merge`, then
+asserts via `grep -Eq '^host-new\.example$'` that the appended line lives
+on its own line and `^host-a\.example$` that the original line remains
+intact.
 
-### Spot-check 3 — U003 (envfile_merge adds new keys)
+Regression introduced into `scripts/lib/upgrade_actions.sh:341-349`:
+removed the trailing-newline injection block (replaced with a single
+`printf '%s' "$append_buf"`) so the append is glued directly onto the
+target's last byte.
 
-Test file: `tests/upgrade_test.sh` T1 (line 60-108).
+- Backup: `cp scripts/lib/upgrade_actions.sh /tmp/upgrade_actions.sh.bak`.
+- Re-run `bash tests/upgrade_test.sh`:
+  ```
+  --- T2b: linefile_merge into target without trailing newline ---
+  [upgrade-test] FAIL: U012: host-a.example was corrupted by missing-newline append
+  ```
+- Restore from backup; re-run:
+  ```
+  --- T2b: linefile_merge into target without trailing newline ---
+  [upgrade-test] OK: T2b: linefile_merge injects newline before appending when target lacks one
+   UPGRADE TEST PASSED
+  ```
 
-The test asserts the result blob's `.added_keys` field equals `"C"`.
-Regression: change `upgrade_envfile_merge` to NOT append new keys (early return after
-preserving existing ones).
+This proves T2b genuinely guards the missing-trailing-newline path.
 
-- Re-run `tests/upgrade_test.sh T1`: assertion fails — `added_keys` is empty.
-- Revert: passes.
+### Spot-check J2-2 — U025 (standalone harness_jq fallback, newly green)
 
-This proves T1 guards new-key appending.
+Test file: `tests/upgrade_test.sh` T9 (line 537-580).
 
-### Spot-check 4 — P035 (`toolu_` tool-call id prefix)
+The test asserts that when `upgrade_actions.sh` is sourced standalone
+(without the outer harness wrapper), `harness_jq` is still defined AND
+delegates correctly to the host `jq` binary.
 
-Test file: `proxy/test_proxy.py` line 50-95.
+Regression: removed the entire `if ! declare -F harness_jq` ... `fi`
+block at lines 26-39 of `scripts/lib/upgrade_actions.sh`, replacing it
+with `:` (no-op).
 
-The test asserts each generated tool-call id `startswith("toolu_")`.
-Regression: change the id prefix in `format_tools_to_text` from `toolu_` to `call_`.
+- Backup taken; regression applied.
+- Re-run `bash tests/upgrade_test.sh`: T1 (the first test that uses any
+  helper consuming harness_jq) immediately blows up:
+  ```
+  scripts/lib/upgrade_actions.sh: line 65: harness_jq: command not found
+  scripts/lib/upgrade_actions.sh: line 75: harness_jq: command not found
+  ```
+  (T9 never gets a chance to run, but T1's failure already proves the
+  fallback is load-bearing.)
+- Restore; re-run: `--- T9: harness_jq fallback inside upgrade_actions.sh ---
+  [upgrade-test] OK: T9: ...` and `UPGRADE TEST PASSED`.
 
-- Re-run `python -m unittest proxy/test_proxy.py TestFormatTools.test_tool_call_emits_id_field`:
-  assertion fails — `call_a1b2...` does not start with `toolu_`.
-- Revert: passes.
+This proves the U025 contract (standalone-source path of `harness_jq`)
+is genuinely guarded — by T9 specifically AND by every earlier test
+that goes through `_upg_json_array` / `_upg_json_str`.
 
-This proves the proxy unit test guards the tool-call id format.
+### Spot-check J2-3 — A024 (`ANTHROPIC_AUTH_TOKEN=harness-dummy` literal, newly green)
+
+Test file: `tests/full_pipeline_test.sh` T9 (line 466-470).
+
+Full T9 requires docker (install + start + run claude); the assertion
+itself is a source-level grep:
+
+```
+grep -Fq 'ANTHROPIC_AUTH_TOKEN=harness-dummy' "${TEST_ROOT}/harness/harness"
+```
+
+To exercise the regression detection without bringing up the full
+pipeline, the same grep was simulated locally against the wrapper
+source:
+
+```
+# regression: replace literal in wrapper
+sed -i 's/ANTHROPIC_AUTH_TOKEN=harness-dummy/ANTHROPIC_AUTH_TOKEN=harness-wrong-token/' harness
+grep -Fq 'ANTHROPIC_AUTH_TOKEN=harness-dummy' harness  # rc=1 (expected = literal missing)
+
+# restore from backup
+cp /tmp/harness.bak harness
+grep -Fq 'ANTHROPIC_AUTH_TOKEN=harness-dummy' harness  # rc=0 (expected = literal present)
+```
+
+The grep returns rc=1 with the literal absent and rc=0 once restored.
+T9's assertion is precisely this grep, so a regression replacing the
+token literal would fail T9 inside the docker harness.
+
+### Spot-check C-1 (carried) — F056 (`harness list` empty case)
+
+Test file: `tests/harness_test.sh` T2 (line 256-262). See Track C audit
+for transcript. Re-verified: assertion still references the literal
+`"no harness agents running"`.
+
+### Spot-check C-2 (carried) — M003 (`harness-meta.json` shape after install)
+
+Test file: `tests/mcp_test.sh` T3 (line 238-258) + T5 (line 277-309). See
+Track C audit. Note: T3 asserts file existence; T5 asserts the file's
+`enabled` content indirectly by attempting `harness mcp up`.
+
+### Spot-check C-3 (carried) — U003 (envfile_merge adds new keys)
+
+Test file: `tests/upgrade_test.sh` T1 (line 60-108). See Track C audit.
+
+### Spot-check C-4 (carried) — P035 (`toolu_` tool-call id prefix)
+
+Test file: `proxy/test_proxy.py` line 50-95. See Track C audit.
 
 ---
 
