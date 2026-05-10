@@ -1,0 +1,8 @@
+{
+  "name": "current",
+  "description": "Current production prompt-injection scheme as captured at this repo's HEAD. Maps to PROXY_PROMPT_MODE=user_front (the proxy.py default at the time of writing).",
+  "env": {
+    "HARNESS_PROXY_SCHEME": "current",
+    "PROXY_PROMPT_MODE": "user_front"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "passthrough",
+  "description": "No tool-use injection. Control baseline. Will fail every benchmark task that requires tool calls — that's the point: isolates harness contribution from upstream model capability. NOTE: this scheme name is not yet recognized by proxy/proxy.py at HEAD (valid PROXY_PROMPT_MODE values: user_front, user_bookend, user, system, hybrid). To use as a true control, add a 'passthrough' mode to proxy.py that returns the request unmodified, OR run with HARNESS_DISABLE_PROXY=1 (also currently unimplemented). See orch/questions.md for the open question.",
+  "env": {
+    "HARNESS_PROXY_SCHEME": "passthrough",
+    "PROXY_PROMPT_MODE": "passthrough"
+  }
+}
