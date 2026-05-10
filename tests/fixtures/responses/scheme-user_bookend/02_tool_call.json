@@ -1,0 +1,19 @@
+{
+  "name": "scheme-user_bookend: tool call response",
+  "match": "scheme-probe-tool",
+  "response": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "Calling tool.\n\n```json\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Atlanta\"}}\n```\n"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 50,
+      "completion_tokens": 15,
+      "total_tokens": 65
+    }
+  }
+}
