@@ -1,0 +1,19 @@
+{
+  "name": "scheme-user_front: text response",
+  "match": "scheme-probe-text",
+  "response": {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": "Hello from scheme-user_front fixture"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 42,
+      "completion_tokens": 7,
+      "total_tokens": 49
+    }
+  }
+}
