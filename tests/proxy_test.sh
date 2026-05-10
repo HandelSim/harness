@@ -74,8 +74,8 @@ services:
       MOCK_SCENARIO: ${MOCK_SCENARIO:-text}
       MOCK_FIXTURES_DIR: ${MOCK_FIXTURES_DIR:-}
     volumes:
-      - ./scripts/mock_upstream.py:/app/mock_upstream.py:ro
-      - ./scripts/fixtures/responses:/fixtures:ro
+      - ./tests/mock_upstream.py:/app/mock_upstream.py:ro
+      - ./tests/fixtures/responses:/fixtures:ro
     networks:
       - harness-net
     expose:
@@ -371,7 +371,7 @@ echo "${D_RAW}" | tail -1 | grep -q '"done":true' \
 # --- Scenario E: multiple tool calls in one response ------------------------
 #
 # Exercises the proxy's multi-call extraction end-to-end via
-# scripts/fixtures/responses/07_multi_tool_calls.json. The fixture's
+# tests/fixtures/responses/07_multi_tool_calls.json. The fixture's
 # response has TWO ```json``` blocks; the proxy must surface BOTH as
 # distinct tool_calls with unique toolu_ ids.
 
@@ -451,6 +451,62 @@ case "${E_TC_CHECK}" in
     *)                    fail "E: unexpected check output: ${E_TC_CHECK}" "${E_BODY}" ;;
 esac
 echo "[proxy-test]   E OK (2 distinct Read calls, unique toolu_ ids)"
+
+# --- Scenario F: env-driven startup config ----------------------------------
+#
+# Several env vars set in write_env() must be honored by the proxy. The
+# proxy prints a startup banner that echoes the values it actually
+# consumed (listening on, upstream key redacted, debug-dumps status). We
+# scrape the proxy container logs to assert each variable surfaced.
+
+echo "[proxy-test] scenario F: env-driven startup config"
+
+PROXY_LOGS="$("${COMPOSE[@]}" logs proxy 2>&1 || true)"
+if [[ -z "${PROXY_LOGS}" ]]; then
+    fail "F: could not capture proxy logs"
+fi
+
+# Inventory P003: Proxy reads PROXY_HOST from env (test sets 0.0.0.0).
+# Startup banner echoes "listening on: <host>:<port>" with the actual
+# value the Flask app bound to.
+echo "${PROXY_LOGS}" | grep -qE 'listening on:[[:space:]]+0\.0\.0\.0:8000' \
+    || fail "F/P003: proxy banner did not echo PROXY_HOST=0.0.0.0" "${PROXY_LOGS}"
+
+# Inventory P004: Proxy reads PROXY_PORT from env (test sets 8000).
+# Same banner line; the ":8000" suffix confirms the port env was consumed.
+echo "${PROXY_LOGS}" | grep -qE 'listening on:[[:space:]]+0\.0\.0\.0:8000' \
+    || fail "F/P004: proxy banner did not echo PROXY_PORT=8000" "${PROXY_LOGS}"
+
+# Inventory P006: Proxy reads PROXY_API_KEY from env (test sets test-key-1234).
+# _redact_key shows first-4 + "..." + last-4 for keys >8 chars, so
+# "test-key-1234" (13 chars) becomes "test...1234".
+echo "${PROXY_LOGS}" | grep -qE 'upstream key:[[:space:]]+test\.\.\.1234' \
+    || fail "F/P006: proxy banner did not echo redacted PROXY_API_KEY" "${PROXY_LOGS}"
+# Also assert the raw key is NOT printed (regression guard: the redactor
+# must hide the middle of the key).
+if echo "${PROXY_LOGS}" | grep -qE 'upstream key:[[:space:]]+test-key-1234'; then
+    fail "F/P006: proxy banner leaked raw PROXY_API_KEY" "${PROXY_LOGS}"
+fi
+
+# Inventory P012: Proxy reads OUTPUT_DIR from env (test sets empty).
+# Inventory P050: Debug dumps are skipped silently when OUTPUT_DIR is unset.
+# When OUTPUT_DIR is empty, the banner reports
+# "debug dumps:    disabled (OUTPUT_DIR not set)" and no save_debug_file
+# errors are logged. Asserting BOTH the banner line and the absence of
+# "failed to save debug file" lines covers the silent-skip path.
+echo "${PROXY_LOGS}" | grep -qE 'debug dumps:[[:space:]]+disabled \(OUTPUT_DIR not set\)' \
+    || fail "F/P012: proxy banner did not echo OUTPUT_DIR-disabled status" "${PROXY_LOGS}"
+if echo "${PROXY_LOGS}" | grep -q 'failed to save debug file'; then
+    fail "F/P050: proxy logged save_debug_file errors despite OUTPUT_DIR being unset" "${PROXY_LOGS}"
+fi
+# Stronger silent-skip guard: when OUTPUT_DIR is empty the init_output_dir
+# warning ("not writable") must NOT appear — that message is only emitted
+# for a SET-but-unwritable value, not an empty one.
+if echo "${PROXY_LOGS}" | grep -qE "OUTPUT_DIR '' is not writable"; then
+    fail "F/P050: proxy treated empty OUTPUT_DIR as a writable-check failure" "${PROXY_LOGS}"
+fi
+
+echo "[proxy-test]   F OK (env-driven startup banner reflects configured values)"
 
 echo "============================================================"
 echo " PROXY TEST PASSED"

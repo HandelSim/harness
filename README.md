@@ -446,108 +446,32 @@ edits straight to `<install-root>/state/agent/home/.config/ccstatusline/settings
 
 ## Tests
 
+Tests live under `tests/`. See `tests/README.md` for the testing guide.
+
+Quick commands:
+
 ```
-$ bash scripts/proxy_test.sh         # proxy translation, RemoteHost forwarding, stub model context length
-$ bash scripts/harness_test.sh       # management script subcommands
-$ bash scripts/persistence_test.sh   # persistent home + skel seed
-$ bash scripts/mcp_test.sh           # MCP install/enable/disable/uninstall lifecycle
-$ bash scripts/firewall_test.sh      # firewall guardrail (negative) + per-service bypass
-$ bash scripts/upgrade_test.sh       # upgrade actions library + synthetic version transition
-$ bash scripts/full_pipeline_test.sh # full install + run pipeline (covers both agents via print-mode round-trip)
-$ HARNESS_RUN_SLOW=1 bash scripts/integration_test.sh  # end-to-end Serena + Graphify (slow, ~10-15 min)
-$ bash scripts/podman_smoke_test.sh   # podman-runtime smoke (Linux only; manual)
-$ bash scripts/check_runtime_calls.sh # static guard: no raw 'docker' calls outside the wrapper
+harness test              # all CI-runnable tests
+harness test proxy        # only proxy tests
+harness test e2e          # tmux-driven TUI scenarios
+harness test integration --slow   # full slow integration test
+
+harness benchmark smoketest          # 3-5 small tasks; verifies wiring
+harness benchmark terminal-bench     # full TB 2.0 run; 6-12 hrs
 ```
 
-All of the above honor `HARNESS_CONTAINER_RUNTIME=podman` to exercise the
-podman code path. By default they pick docker if it's installed.
+Benchmarks NEVER run in CI. They require an upstream API key and
+sufficient disk; see `tests/benchmarks/README.md`.
 
-### Integration test (Serena + Graphify)
+CI runs the lint, unit, docker-tests, pipeline, integration, e2e, and
+scheme_contract jobs on every push to `dev` and `main`.
 
-`scripts/integration_test.sh` is the canonical regression test for the two
-flagship integrations: Serena (Pattern A — HTTP MCP server) and Graphify
-(Pattern B — pipx-installed skill CLI). It is gated behind
-`HARNESS_RUN_SLOW=1` because the first run pulls/builds the ~2 GB Serena
-image, so the default test suite stays fast.
+## Test coverage
 
-The test exercises four phases against a clean install in a temp directory:
+| Status | Count | %    |
+|--------|-------|------|
+| Green  | 249   | 62.7 |
+| Yellow | 3     | 0.8  |
+| Red    | 145   | 36.5 |
 
-1. **Stack setup** — `harness start`, build agent images, attach a
-   mockupstream sidecar to `harness-net`, run `harness claude -p "say hello"`
-   end-to-end through the proxy.
-2. **Serena (HTTP MCP)** — install → restart → reach on tcp://serena:9121
-   from the proxy → trigger an agent launch and verify
-   `state/agent/home/.harness-mcp-servers.json` has the merged entry →
-   confirm `/workspaces/projects/test-project/` is visible inside the serena container
-   → drive a TUI claude that asks serena to find the `Calculator` symbol →
-   `mcp down/up`, `mcp disable/enable`, `mcp uninstall --force`.
-3. **Graphify (skill)** — launch a long-lived agent container with the same
-   firewall + UID-remap entrypoint as the real harness → `pipx install
-   graphifyy` → confirm the binary is visible from the host bind mount →
-   `graphify install` registers `~/.claude/skills/graphify/SKILL.md` →
-   `graphify update .` on the test-project fixture writes `graphify-out/graph.json`
-   containing `Calculator` and `ScientificCalculator` → assert the output
-   files are owned by the host UID (not container uid 1000) → tear the
-   container down and confirm a fresh container can still call graphify
-   from the persistent home.
-4. **Cross-test invariants** — `harness doctor` returns 0 and the state
-   directory layout is intact.
-
-The fixture project at `scripts/fixtures/test-project/` is a small Python
-calculator package (Calculator, ScientificCalculator, ExpressionParser, an
-exception hierarchy, and pytest tests) that gives both Serena and Graphify
-a non-trivial multi-module symbol graph to chew on.
-
-### Continuous integration
-
-Every push to `dev` (and `main`) and every PR targeting either branch
-runs `.github/workflows/ci.yml`. Jobs run fully in parallel
-(`fail-fast: false`) so one failure doesn't mask another:
-
-- `lint` — `bash -n` + `check_runtime_calls.sh` + advisory `shellcheck`.
-- `unit` — `upgrade_test.sh`.
-- `docker / <name>` — matrix over `harness_test`, `proxy_test`,
-  `persistence_test`, `mcp_test`, `firewall_test`.
-- `pipeline` — `full_pipeline_test.sh`.
-- `integration` — `HARNESS_RUN_SLOW=1 integration_test.sh`.
-
-`podman_smoke_test.sh` is not run in CI (no podman on
-`ubuntu-latest`); run it manually on Linux when touching the runtime
-wrapper. The interactive scenarios in `MANUAL_TEST_PROMPT.md` also stay
-manual.
-
-A new push to `dev` cancels any in-flight CI run for that branch
-(`cancel-in-progress: true`) so we don't waste minutes on stale commits.
-
-When CI fails on `dev`, `.github/workflows/ci-failure-claude.yml`
-finds-or-creates an issue titled `CI failure on dev: <sha-7>`,
-appends the failed-step logs as a comment, and (up to 5 attempts per
-SHA) directly invokes the Claude auto-fix loop per the
-"When triggered by a CI failure" section of `CLAUDE.md`. CI failures
-do not roll `dev` back.
-
-### Test toolkits
-
-`scripts/lib/` ships sourceable bash libraries shared across tests:
-
-- `test_helpers.sh` — common setup: `require_docker`, `test_section`,
-  `test_generate_env`, `test_generate_mockupstream_override` (mounts the
-  fixture-dispatch directory), `test_wait_for_healthy`, `test_cleanup`.
-  `integration_test.sh` adds two helpers used when the harness compose
-  owns the network: `test_start_mockupstream` (one-shot `docker run` of
-  the mock joined to `<project>_harness-net` with the alias `mockupstream`)
-  and `test_wait_for_container_healthy` for non-compose containers.
-
-### Mock-upstream fixture dispatch
-
-`scripts/mock_upstream.py` supports two modes:
-
-- **Legacy** — `MOCK_SCENARIO=text|tool` env var picks one of two canned
-  responses. Used by `proxy_test.sh` and `firewall_test.sh`.
-- **Fixture dispatch** — set `MOCK_FIXTURES_DIR=/fixtures` and mount
-  `scripts/fixtures/responses/` there. The mock loads every `*.json`
-  lexicographically and matches the most recent user message against each
-  fixture's `match` regex; first match wins. `99_default.json` is the
-  catch-all. See `scripts/fixtures/responses/README.md` for the file shape
-  and naming convention (`NN_short_slug.json`, with reserved priority
-  ranges per scenario family).
+See `tests/COVERAGE.md` for the per-item table.

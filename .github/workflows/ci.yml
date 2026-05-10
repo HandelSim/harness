@@ -15,6 +15,19 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Opt into Node.js 24 for all JS actions in this workflow.
+#
+# As of late 2025, GitHub Actions emits a deprecation warning for actions
+# that still target Node.js 20 (actions/cache@v4, docker/setup-buildx-action@v3,
+# etc.). Node.js 20 will be removed from the runner on 2026-09-16. Setting
+# this env var at the workflow level forces every JS-based action invocation
+# below to run on Node.js 24, which silences the warnings and prevents a
+# surprise breakage when the runner upgrade lands.
+#
+# Per GitHub: once Node.js 24 becomes the default, this can be removed.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   lint:
     name: lint
@@ -32,7 +45,7 @@ jobs:
               echo "::error file=$f::bash -n failed"
               fail=1
             fi
-          done < <(find harness harness-install.sh scripts -type f \
+          done < <(find harness harness-install.sh scripts tests -type f \
               \( -name '*.sh' -o -path harness -o -path harness-install.sh \) \
               -print0)
           exit $fail
@@ -45,8 +58,8 @@ jobs:
         uses: ludeeus/action-shellcheck@master
         with:
           severity: warning
-          scandir: ./scripts
-          additional_files: harness harness-install.sh
+          scandir: ./tests
+          additional_files: harness harness-install.sh scripts/check_runtime_calls.sh scripts/lib/platform.sh scripts/lib/net_helpers.sh scripts/lib/upgrade_actions.sh
 
   unit:
     name: unit (upgrade_test)
@@ -54,8 +67,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - name: scripts/upgrade_test.sh
-        run: bash scripts/upgrade_test.sh
+      - name: tests/upgrade_test.sh
+        run: bash tests/upgrade_test.sh
 
   docker-tests:
     name: docker / ${{ matrix.test }}
@@ -64,6 +77,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Explicit matrix (one entry per tests/<name>_test.sh). Each test
+        # gets its own job + cache key. Convention: any new docker-driven
+        # test script under tests/<name>_test.sh should be added here by
+        # hand. Glob-based discovery is intentionally avoided so adding a
+        # test always triggers an explicit CI review.
         test:
           - harness_test
           - proxy_test
@@ -90,11 +108,11 @@ jobs:
           docker --version
           docker compose version
 
-      - name: Run scripts/${{ matrix.test }}.sh
+      - name: Run tests/${{ matrix.test }}.sh
         env:
           DOCKER_BUILDKIT: "1"
           COMPOSE_DOCKER_CLI_BUILD: "1"
-        run: bash scripts/${{ matrix.test }}.sh
+        run: bash tests/${{ matrix.test }}.sh
 
       - name: Diagnostics on failure
         if: failure()
@@ -133,11 +151,11 @@ jobs:
             buildx-pipeline-
             buildx-
 
-      - name: scripts/full_pipeline_test.sh
+      - name: tests/full_pipeline_test.sh
         env:
           DOCKER_BUILDKIT: "1"
           COMPOSE_DOCKER_CLI_BUILD: "1"
-        run: bash scripts/full_pipeline_test.sh
+        run: bash tests/full_pipeline_test.sh
 
       - name: Diagnostics on failure
         if: failure()
@@ -176,12 +194,12 @@ jobs:
             buildx-integration-
             buildx-
 
-      - name: scripts/integration_test.sh
+      - name: tests/integration_test.sh
         env:
           HARNESS_RUN_SLOW: "1"
           DOCKER_BUILDKIT: "1"
           COMPOSE_DOCKER_CLI_BUILD: "1"
-        run: bash scripts/integration_test.sh
+        run: bash tests/integration_test.sh
 
       - name: Diagnostics on failure
         if: failure()
@@ -190,6 +208,80 @@ jobs:
           docker ps -a || true
           echo "=== df -h ==="
           df -h || true
+
+      - name: Cleanup
+        if: always()
+        run: docker system prune -f --volumes || true
+
+  e2e:
+    name: e2e (tmux scenarios)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Buildx layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-e2e-${{ hashFiles('agents/Dockerfile', 'proxy/Dockerfile', 'ollama/Dockerfile', 'firewall/**', 'docker-compose.yml') }}
+          restore-keys: |
+            buildx-e2e-
+            buildx-
+
+      - name: tests/e2e/run.sh
+        env:
+          DOCKER_BUILDKIT: "1"
+          COMPOSE_DOCKER_CLI_BUILD: "1"
+        run: bash tests/e2e/run.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== docker ps -a ==="; docker ps -a || true
+          echo "=== free -h ==="; free -h || true
+          echo "=== df -h ==="; df -h || true
+
+      - name: Cleanup
+        if: always()
+        run: docker system prune -f --volumes || true
+
+  scheme_contract:
+    name: scheme_contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Buildx layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-scheme-${{ hashFiles('agents/Dockerfile', 'proxy/Dockerfile', 'ollama/Dockerfile', 'firewall/**', 'docker-compose.yml') }}
+          restore-keys: |
+            buildx-scheme-
+            buildx-
+
+      - name: tests/scheme_contract_test.sh
+        env:
+          DOCKER_BUILDKIT: "1"
+          COMPOSE_DOCKER_CLI_BUILD: "1"
+        run: bash tests/scheme_contract_test.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== docker ps -a ==="; docker ps -a || true
+          echo "=== df -h ==="; df -h || true
 
       - name: Cleanup
         if: always()
@@ -216,7 +308,7 @@ jobs:
 
   failure_triage:
     name: Auto-fix on failure (triage)
-    needs: [lint, unit, docker-tests, pipeline, integration]
+    needs: [lint, unit, docker-tests, pipeline, integration, e2e, scheme_contract]
     if: >-
       failure() &&
       github.event_name == 'push' &&

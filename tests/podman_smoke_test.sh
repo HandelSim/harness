@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/podman_smoke_test.sh — bring the harness stack up under podman,
+# tests/podman_smoke_test.sh — bring the harness stack up under podman,
 # verify the proxy /health endpoint responds, run a one-shot agent, tear down.
 #
 # Linux + rootless podman (>= 4.0 with built-in `podman compose`). This is
@@ -8,7 +8,7 @@
 # the primary target.
 #
 # Run manually:
-#   bash scripts/podman_smoke_test.sh
+#   bash tests/podman_smoke_test.sh
 #
 # Honors:
 #   HARNESS_CONTAINER_RUNTIME (always pinned to podman by this script)

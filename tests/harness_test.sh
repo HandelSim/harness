@@ -10,7 +10,7 @@
 #
 # Interactive subcommands (claude, opencode, stop with picker) require a
 # TTY and live upstream — those are validated by
-# scripts/full_pipeline_test.sh (T9/T10/T11) and by the manual smoke checks
+# tests/full_pipeline_test.sh (T9/T10/T11) and by the manual smoke checks
 # documented in MANUAL_TEST_PROMPT.md. They are NOT covered here.
 #
 # Other smoke checks:
@@ -141,7 +141,7 @@ harness_docker compose --project-name "${PROJECT_NAME}" \
 #
 # These cases shell-source the script (HARNESS_SOURCE_ONLY=1) and stub
 # `_probe_upstream_auth` to drive each branch deterministically without any
-# live upstream — matching the pattern in scripts/upgrade_test.sh.
+# live upstream — matching the pattern in tests/upgrade_test.sh.
 
 echo "[harness-test] T0: _gate_on_upstream_auth + run_agent gate"
 
@@ -279,6 +279,63 @@ if [[ -z "${logs_out}" ]]; then
     echo "[harness-test] T3 FAIL: harness logs produced no output" >&2
     exit 1
 fi
+
+# Inventory F042: `harness logs` (no service arg) tails ALL services.
+# Without a service arg, cmd_logs invokes `compose logs -f` with no
+# positional service, so output should include lines from BOTH ollama
+# and proxy. timeout 124 = killed by deadline (expected); rc 0 also
+# acceptable if compose ended on its own.
+set +e
+logs_all_out=$(timeout 5 "${HARNESS_BIN}" logs 2>&1)
+logs_all_rc=$?
+set -e
+if (( logs_all_rc != 124 && logs_all_rc != 0 )); then
+    echo "[harness-test] T3 FAIL [F042]: harness logs (no arg) exited rc=${logs_all_rc}" >&2
+    echo "${logs_all_out}" | tail -20 >&2
+    exit 1
+fi
+if grep -Eqi 'unknown command|invalid option|usage:[[:space:]]+harness' <<<"${logs_all_out}"; then
+    echo "[harness-test] T3 FAIL [F042]: harness logs (no arg) produced a parse error" >&2
+    echo "${logs_all_out}" >&2
+    exit 1
+fi
+# compose logs without a service prefixes each line with the service name.
+# We require lines for BOTH ollama and proxy to prove "tail all services".
+if ! grep -Eq 'ollama' <<<"${logs_all_out}"; then
+    echo "[harness-test] T3 FAIL [F042]: harness logs (no arg) missing ollama lines" >&2
+    echo "${logs_all_out}" | head -40 >&2
+    exit 1
+fi
+if ! grep -Eq 'proxy' <<<"${logs_all_out}"; then
+    echo "[harness-test] T3 FAIL [F042]: harness logs (no arg) missing proxy lines" >&2
+    echo "${logs_all_out}" | head -40 >&2
+    exit 1
+fi
+
+# Inventory O003: ollama entrypoint polls /api/tags up to 60s before
+# proceeding. The poll prints a "waiting for ollama API at" line on
+# startup; once the API is up, registration runs. Probing the
+# accumulated container logs proves the poll loop executed (and
+# succeeded, since T1's healthcheck passed).
+ollama_logs=$(harness_docker logs "${ollama_id}" 2>&1 || true)
+if ! grep -Eq 'waiting for ollama API at .*?/api/tags' <<<"${ollama_logs}"; then
+    echo "[harness-test] T3 FAIL [O003]: ollama entrypoint did not log the /api/tags poll" >&2
+    echo "${ollama_logs}" | tail -40 >&2
+    exit 1
+fi
+
+# Inventory O009: a healthy ollama container means MODEL_NAME was
+# successfully registered (entrypoint.sh exits non-zero on registration
+# failure, which would prevent the container from becoming healthy).
+# We additionally assert the explicit "harness ollama ready; stub
+# models ->" success line is present so a future regression that turns
+# the registration error into a warning still trips this test.
+if ! grep -Eq 'harness ollama ready; stub models -> ' <<<"${ollama_logs}"; then
+    echo "[harness-test] T3 FAIL [O009]: ollama entrypoint did not log registration success" >&2
+    echo "${ollama_logs}" | tail -40 >&2
+    exit 1
+fi
+
 echo "[harness-test] T3 OK"
 
 # --- Test 4: harness down ---------------------------------------------------
@@ -312,7 +369,7 @@ echo "[harness-test] T5 OK"
 #
 # These tests exercise argument parsing and registry/active-tree filesystem
 # logic without actually bringing up MCP services — that's the job of
-# scripts/mcp_test.sh. We override HARNESS_REGISTRY_DIR with an empty dir
+# tests/mcp_test.sh. We override HARNESS_REGISTRY_DIR with an empty dir
 # to assert the empty-registry path, then point it at a tmp registry to
 # verify the populated path.
 #
@@ -720,6 +777,32 @@ if ! grep -qi 'invalid host' <<<"${inv_out}"; then
     echo "${inv_out}" >&2; exit 1
 fi
 
+# Inventory F072: `netlib_validate_host` rejects characters outside
+# `[a-z0-9.-]`. The pre-existing T11.5 only exercises the space
+# character; we additionally exercise other illegal chars (underscore,
+# `@`, `$`, `:`) so a regression that loosens the charclass to allow
+# any of them surfaces here. Each must (a) exit non-zero and (b)
+# include the 'invalid host' diagnostic.
+for bad_host in 'bad_host.example.com' 'bad@host.example.com' 'bad$host.example.com' 'bad:host.example.com'; do
+    set +e
+    bad_out=$("${HARNESS_BIN}" net allow "${bad_host}" 2>&1)
+    bad_rc=$?
+    set -e
+    if (( bad_rc == 0 )); then
+        echo "[harness-test] T11 FAIL [F072]: net allow '${bad_host}' unexpectedly succeeded" >&2
+        echo "${bad_out}" >&2; exit 1
+    fi
+    if ! grep -qi 'invalid host' <<<"${bad_out}"; then
+        echo "[harness-test] T11 FAIL [F072]: net allow '${bad_host}' missing 'invalid host' diagnostic" >&2
+        echo "${bad_out}" >&2; exit 1
+    fi
+    # Confirm the rejected host did NOT get added to the allowlist.
+    if grep -qF "${bad_host}" "${TEST_ROOT}/.harness-allowlist"; then
+        echo "[harness-test] T11 FAIL [F072]: rejected host '${bad_host}' leaked into allowlist" >&2
+        cat "${TEST_ROOT}/.harness-allowlist" >&2; exit 1
+    fi
+done
+
 # Clean up the test additions so subsequent tests start from the seed
 # allowlist.
 "${HARNESS_BIN}" net deny my-gitlab.example.com >/dev/null 2>&1 || true
@@ -1032,6 +1115,77 @@ if ! harness_check_disk_space "${REPO_ROOT}" 0 "any disk space" 2>/dev/null; the
 fi
 echo "[harness-test] T19 OK"
 
+# --- Test 19b: harness_jq prefers host jq when available -------------------
+#
+# Inventory F015: harness_jq uses the host jq binary when present (rather
+# than falling back to the proxy container). We source the wrapper with
+# HARNESS_SOURCE_ONLY=1 inside a subshell, stub harness_docker so any
+# fallback attempt would fail loudly, and assert harness_jq still
+# returns the correct result. Success proves the host-jq branch was
+# taken — the fallback would have invoked harness_docker (stubbed to
+# fail) and bubbled the failure out.
+echo "[harness-test] T19b: harness_jq prefers host jq (F015)"
+if ! command -v jq >/dev/null 2>&1; then
+    echo "[harness-test] T19b SKIP: host jq not installed (cannot exercise F015)" >&2
+else
+    jq_host_out=$(
+        HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+        # If host-jq is preferred, this stub must never be called.
+        harness_docker() { echo "FALLBACK_DOCKER_INVOKED" >&2; return 1; }
+        echo '{"k":"hostjq"}' | harness_jq -r '.k'
+    )
+    if [[ "${jq_host_out}" != "hostjq" ]]; then
+        echo "[harness-test] T19b FAIL [F015]: harness_jq did not return host-jq result; got '${jq_host_out}'" >&2
+        exit 1
+    fi
+fi
+echo "[harness-test] T19b OK"
+
+# --- Test 19c: compose() arg threading (F131, F133) ------------------------
+#
+# Inventory F131: compose() threads HARNESS_PROJECT_NAME through every
+# compose invocation as `--project-name <project_name>`.
+# Inventory F133: compose() always passes `-f <docker-compose.yml>` as
+# the base compose file (plus a runtime override if present).
+#
+# We source the harness wrapper with HARNESS_SOURCE_ONLY=1, stub
+# harness_docker to print its received args, and call compose with a
+# distinctive trailing token so we can locate it in the captured args.
+echo "[harness-test] T19c: compose() arg threading (F131, F133)"
+compose_args_out=$(
+    HARNESS_PROJECT_NAME="harness-compose-args-test" \
+    HARNESS_INSTALL_ROOT="${TEST_ROOT}" \
+    HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist" \
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    # Stub: avoid any real docker invocation; just echo the args we
+    # would have passed.
+    harness_docker() { printf 'HD_ARGS:'; printf ' %s' "$@"; printf '\n'; }
+    # Stub: avoid writing the runtime override file (we don't care
+    # about its content for this assertion).
+    write_runtime_override() { :; }
+    compose ps --sentinel-token-d19c 2>&1
+)
+# Inventory F131: --project-name with the configured project name appears
+# in the captured compose args.
+if ! grep -Eq -- '--project-name[[:space:]]+harness-compose-args-test' <<<"${compose_args_out}"; then
+    echo "[harness-test] T19c FAIL [F131]: compose() did not pass --project-name" >&2
+    echo "${compose_args_out}" >&2; exit 1
+fi
+# Inventory F133: -f <docker-compose.yml> base compose file is threaded
+# into every compose invocation.
+if ! grep -Eq -- '-f[[:space:]]+[^[:space:]]*docker-compose\.yml' <<<"${compose_args_out}"; then
+    echo "[harness-test] T19c FAIL [F133]: compose() did not pass -f docker-compose.yml" >&2
+    echo "${compose_args_out}" >&2; exit 1
+fi
+# Sanity: our distinctive trailing token reached harness_docker, proving
+# we actually captured a compose() invocation (and not some earlier
+# helper call that happens to mention --project-name).
+if ! grep -q -- '--sentinel-token-d19c' <<<"${compose_args_out}"; then
+    echo "[harness-test] T19c FAIL: sentinel token missing — compose() didn't reach harness_docker" >&2
+    echo "${compose_args_out}" >&2; exit 1
+fi
+echo "[harness-test] T19c OK"
+
 # --- Test 20: harness preflight command ------------------------------------
 #
 # Smoke the command end-to-end against the test install root. .env and
@@ -1244,6 +1398,30 @@ if grep -q 'update available' <<<"${upd_out_silent}"; then
     exit 1
 fi
 echo "[harness-test] T23.4 OK"
+
+# Inventory F022: `harness check-updates` (the explicit foreground
+# command) exits non-zero on network failure when no cached value
+# exists. Origin is still unreachable from T23.3 (set to a nonexistent
+# local path), and we removed the cache for T23.4 — so we can drive
+# the F022 path directly. We invoke `harness check-updates` (not the
+# helper) to assert the user-facing command's failure mode: rc != 0
+# plus the "could not reach origin/main" diagnostic on stderr.
+set +e
+chk_out=$(HARNESS_INSTALL_ROOT="${UPD_ROOT}" HARNESS_PROJECT_NAME="harness-upd-test" \
+    "${REPO_ROOT}/harness" check-updates 2>&1)
+chk_rc=$?
+set -e
+if (( chk_rc == 0 )); then
+    echo "[harness-test] T23.4b FAIL [F022]: check-updates should exit non-zero with no cache + offline" >&2
+    echo "${chk_out}" >&2
+    exit 1
+fi
+if ! grep -qi 'could not reach origin/main' <<<"${chk_out}"; then
+    echo "[harness-test] T23.4b FAIL [F022]: check-updates missing 'could not reach origin/main' diagnostic" >&2
+    echo "${chk_out}" >&2
+    exit 1
+fi
+echo "[harness-test] T23.4b OK"
 
 # T23.5 — local HEAD == remote HEAD: no banner. Restore origin and pull
 # the missing commit so the local checkout matches.

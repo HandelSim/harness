@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/firewall_test.sh — focused checks that the per-container egress
+# tests/firewall_test.sh — focused checks that the per-container egress
 # firewall (firewall/init-firewall.sh) is actually applied at runtime.
 #
 # Verifies firewall negative path and bypass behavior:
@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-source "${REPO_ROOT}/scripts/lib/test_helpers.sh"
+source "${REPO_ROOT}/tests/lib/test_helpers.sh"
 
 require_docker
 
@@ -257,6 +257,64 @@ if ! grep -q '^-P OUTPUT DROP' <<<"$opol"; then
     exit 1
 fi
 echo "[fw]   ollama OUTPUT policy: $opol (firewall still applied — good)"
+
+# ----------------------------------------------------------------------------
+# Direct evidence that ollama's entrypoint invokes init-firewall.sh BEFORE
+# `ollama serve` / the API-wait loop. The OUTPUT-policy-DROP assertion above
+# proves init-firewall.sh produced rules, but doesn't prove ordering. Read
+# the ollama container's logs and look for explicit firewall markers and
+# their position relative to the entrypoint's "waiting for ollama API"
+# marker (which is emitted AFTER `ollama serve` is launched).
+# ----------------------------------------------------------------------------
+
+ollama_logs=$("${COMPOSE_BYP[@]}" logs ollama 2>&1 || true)
+
+# Inventory O001: ollama's entrypoint must have actually run init-firewall.sh
+# (i.e. the firewall init's "starting init" log line is present in the
+# ollama container's logs). Proves init-firewall.sh executed inside ollama.
+if ! grep -q '\[harness-firewall\] starting init' <<<"$ollama_logs"; then
+    echo "[fw] FAIL: ollama logs missing '[harness-firewall] starting init' marker" >&2
+    echo "${ollama_logs}" | tail -60 >&2
+    exit 1
+fi
+echo "[fw]   ollama firewall 'starting init' marker found"
+
+# Inventory O001: init-firewall.sh must have run to completion inside ollama
+# (i.e. its final "init complete" line is present). Proves the script
+# didn't error out partway through.
+if ! grep -q '\[harness-firewall\] init complete' <<<"$ollama_logs"; then
+    echo "[fw] FAIL: ollama logs missing '[harness-firewall] init complete' marker" >&2
+    echo "${ollama_logs}" | tail -60 >&2
+    exit 1
+fi
+echo "[fw]   ollama firewall 'init complete' marker found"
+
+# Inventory O001: ollama entrypoint must NOT have hit the "init-firewall.sh
+# missing" fallback warning. If that warning is present, the firewall was
+# not actually applied even if OUTPUT happened to be DROP from a prior run.
+if grep -q 'init-firewall.sh missing; running without firewall' <<<"$ollama_logs"; then
+    echo "[fw] FAIL: ollama logs show init-firewall.sh fallback (missing script)" >&2
+    exit 1
+fi
+
+# Inventory O001: direct ordering assertion — the firewall init's "starting
+# init" log line must appear BEFORE the entrypoint's "waiting for ollama API"
+# line. The entrypoint emits "waiting for ollama API at ..." only after
+# launching `ollama serve` in the background, so firewall-first ordering
+# means init-firewall.sh ran before any ollama process started.
+fw_line=$(grep -n '\[harness-firewall\] starting init' <<<"$ollama_logs" | head -n 1 | cut -d: -f1 || true)
+api_line=$(grep -n '\[entrypoint\] waiting for ollama API at' <<<"$ollama_logs" | head -n 1 | cut -d: -f1 || true)
+if [[ -z "$fw_line" || -z "$api_line" ]]; then
+    echo "[fw] FAIL: could not locate ordering markers in ollama logs (fw='$fw_line' api='$api_line')" >&2
+    echo "${ollama_logs}" | tail -60 >&2
+    exit 1
+fi
+if (( fw_line >= api_line )); then
+    echo "[fw] FAIL: firewall 'starting init' (line $fw_line) did not precede ollama API wait (line $api_line)" >&2
+    echo "${ollama_logs}" | tail -60 >&2
+    exit 1
+fi
+echo "[fw]   ordering OK: firewall init (log line $fw_line) precedes ollama API wait (log line $api_line)"
 
 echo "[fw] Phase 3 OK (HARNESS_FIREWALL_DISABLED bypass works per-service)"
 
