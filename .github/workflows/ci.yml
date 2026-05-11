@@ -594,7 +594,14 @@ jobs:
   failure_invoke_claude:
     name: Auto-fix on failure (invoke Claude)
     needs: failure_triage
-    if: needs.failure_triage.outputs.should_invoke == 'true'
+    # Use `always()` plus an explicit success check on the dependency. The
+    # previous form (`if: needs.failure_triage.outputs.should_invoke ==
+    # 'true'`) was silently skipping every invocation despite the triage
+    # job logs showing `Set output 'should_invoke'` — job-output
+    # propagation evaluated false here for reasons GitHub Actions didn't
+    # surface. Bypassing job-output propagation entirely by re-checking
+    # the cap inline below is more robust.
+    if: ${{ always() && needs.failure_triage.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -609,7 +616,47 @@ jobs:
           token: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
           ref: dev
 
+      - name: Recompute cap guard (inline)
+        # Re-check the per-SHA attempt cap inside this job rather than
+        # trusting a job-output handoff from the triage job. If the issue
+        # for this SHA has reached the cap (or doesn't exist for some
+        # reason), exit this job cleanly without invoking Claude.
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          sha7="${SHA:0:7}"
+          # Find the failure issue for this SHA — the same title pattern
+          # the triage job uses.
+          title="CI failure on dev: ${sha7}"
+          issue="$(gh issue list \
+              --state open \
+              --label ci-failure \
+              --search "${title} in:title" \
+              --json number,title \
+              --jq ".[] | select(.title == \"${title}\") | .number" \
+              | head -n1)"
+          if [[ -z "${issue}" ]]; then
+            echo "No failure issue found for SHA ${SHA7}; nothing to invoke for."
+            echo "should_invoke=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "issue_number=${issue}" >> "$GITHUB_OUTPUT"
+          count="$(gh issue view "${issue}" --json comments \
+              --jq '[.comments[] | select(.body | contains("<!-- ci-failure-attempt"))] | length')"
+          echo "Attempt comments on issue #${issue}: ${count}"
+          if [[ "${count}" -gt 5 ]]; then
+            echo "Cap reached (${count} attempts); skipping invoke."
+            echo "should_invoke=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Cap OK (${count} attempts); will invoke."
+            echo "should_invoke=true"  >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Claude (auto-fix mode)
+        if: steps.guard.outputs.should_invoke == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -623,10 +670,10 @@ jobs:
             section of CLAUDE.md.
 
             Context:
-            - Issue: #${{ needs.failure_triage.outputs.issue_number }}
+            - Issue: #${{ steps.guard.outputs.issue_number }}
             - Repository: ${{ github.repository }}
-            - Dev SHA at failure: ${{ needs.failure_triage.outputs.sha }} (`${{ needs.failure_triage.outputs.sha7 }}`)
-            - Failed CI run: ${{ needs.failure_triage.outputs.run_url }}
+            - Dev SHA at failure: ${{ github.sha }}
+            - Failed CI run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             ## Diagnose before you change anything
 
