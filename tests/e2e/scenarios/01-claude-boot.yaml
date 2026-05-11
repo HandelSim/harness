@@ -32,16 +32,15 @@ steps:
     timeout_s: 45
 
   # Dismiss theme picker / onboarding confirmation pages if present. CI
-  # pre-seeds state/agent/home/.claude/settings.json with
-  # hasCompletedOnboarding=true so these are usually no-ops, but the
-  # defense-in-depth Enter taps cover claude-code versions where the
-  # picker fires regardless. If the prompt is already up, Enter just
-  # submits an empty line which claude ignores.
+  # pre-seeds state/agent/home/.claude.json with hasCompletedOnboarding=true
+  # so these are usually no-ops, but the defense-in-depth Enter taps cover
+  # claude-code versions where the picker fires regardless. If the prompt
+  # is already up, Enter just submits an empty line which claude ignores.
   - send_key: Enter
     wait_stable_ms: 500
     timeout_s: 5
   - send_key: Enter
-    wait_for_marker: "│ > "
+    wait_for_marker: "❯ "
     timeout_s: 30
 
   # Settle: nothing should still be scrolling.
@@ -51,7 +50,7 @@ steps:
   - capture_assertions:
       - not_contains: "Traceback"
       - not_contains: "Error:"
-      - regex_match: "│ > "
+      - regex_match: "❯ "
 
   # Exit cleanly via Ctrl-C twice (claude convention) or Ctrl-D.
   - send_key: C-c

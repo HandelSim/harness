@@ -21,19 +21,23 @@ setup:
   default_timeout_s: 30
 
 steps:
-  # Boot the opencode TUI. opencode's prompt glyph differs from claude's;
-  # we use a looser marker — "opencode" is in the banner of any opencode
-  # boot screen we've seen. If the boot output changes, tighten this.
+  # Boot the opencode TUI. We avoid matching on the loose word "opencode"
+  # because the bash command echo "./harness opencode" would satisfy it
+  # immediately and the rest of the scenario would race Ctrl-C through
+  # firewall init, killing the agent before its TUI ever started. Anchor
+  # on the harness CLI banner line printed AFTER firewall init, then
+  # sleep long enough for opencode to perform its first-run sqlite
+  # migration and render its TUI.
   - launch: "./harness opencode"
-    wait_for_marker: "opencode"
-    timeout_s: 45
+    wait_for_marker: "harness-agent (opencode)"
+    timeout_s: 60
 
-  - sleep_s: 0.5
+  - sleep_s: 8
 
   - capture_assertions:
       - not_contains: "Traceback"
       - not_contains: "Error:"
-      - contains: "opencode"
+      - contains: "harness-agent (opencode)"
 
   # Exit. opencode honors Ctrl-C for quit on most builds; fall back to
   # Ctrl-D if the TUI does not exit cleanly.
