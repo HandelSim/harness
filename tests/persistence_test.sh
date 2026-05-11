@@ -60,10 +60,11 @@ cleanup() {
     harness_docker ps -aq --filter "label=harness-persist-test=1" 2>/dev/null \
         | xargs -r harness_docker rm -f >/dev/null 2>&1 || true
 
-    # Files written into the bind mount were owned by uid 1000 inside the
-    # container, which IS the host caller's uid (we don't remap in this
-    # test) — so a normal rm -rf works. If it doesn't (different host uid),
-    # privileged docker rm -rf as a fallback.
+    # Files written into the bind mount are owned by the host caller's uid
+    # because _run_remapped aligns the container's `harness` user to the
+    # host's uid/gid before writing — so a normal rm -rf works. If a stray
+    # file slips through (older containers, unexpected ownership), fall back
+    # to a privileged docker rm -rf.
     if [[ -d "${TEST_ROOT}" ]]; then
         if ! rm -rf "${TEST_ROOT}" 2>/dev/null; then
             harness_docker run --rm -v "$(harness_docker_path "${TEST_ROOT}"):/target" --user 0:0 alpine \
@@ -107,29 +108,71 @@ fi
 # Why not run the real entrypoint? Because the entrypoint always tries to
 # launch claude; even with HARNESS_TEST_MODE=1 it runs `exec claude` which
 # requires ANTHROPIC_BASE_URL. Bypassing keeps the test focused.
+# Shared wrapper: launch the harness-agent image with /home/harness bind-mounted
+# to a caller-chosen host path, and remap the in-container `harness` user's
+# uid/gid to the host caller's uid/gid before running ${user_cmd} as harness.
+#
+# This is required because docker bind mounts preserve numeric ids: a file
+# written from the container by uid 1000 (the image's default `harness` uid)
+# appears on the host owned by 1000, but on CI the host uid is 1001. Without
+# remap, A004's ownership assertions fail on CI and any host-side cleanup
+# needs sudo. We mirror the same pattern that `tests/integration_test.sh`
+# Phase 3.1 uses for the graphify agent.
+#
+# Args:
+#   $1 host_home — host path to bind onto /home/harness.
+#   $2 with_skel — "yes" to run the entrypoint's skel-seed (cp -an + marker)
+#                  before $3, "no" to skip it.
+#   $3 user_cmd — bash code to run as the (remapped) harness user. May be empty.
+_run_remapped() {
+    local host_home="$1"
+    local with_skel="$2"
+    local user_cmd="$3"
+    local seed_block=""
+    if [[ "${with_skel}" == "yes" ]]; then
+        seed_block='
+            if [[ ! -f $HOME/.harness-home-initialized ]]; then
+                if [[ -d /etc/skel/harness ]]; then
+                    cp -an /etc/skel/harness/. $HOME/ 2>/dev/null || true
+                fi
+                touch $HOME/.harness-home-initialized
+            fi
+        '
+    fi
+    local full_cmd="set -e
+${seed_block}
+${user_cmd}"
+    harness_docker run --rm \
+        --label "harness-persist-test=1" \
+        -v "${host_home}:/home/harness" \
+        --entrypoint /bin/bash \
+        --user 0:0 \
+        -e HOST_UID="$(id -u)" \
+        -e HOST_GID="$(id -g)" \
+        -e HOME=/home/harness \
+        -e USER_CMD="${full_cmd}" \
+        -e PATH="/home/harness/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        harness-agent:latest \
+        -c '
+            set -e
+            if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+                current_uid=$(id -u harness 2>/dev/null || echo "")
+                current_gid=$(id -g harness 2>/dev/null || echo "")
+                if [[ "${current_uid}" != "${HOST_UID}" || "${current_gid}" != "${HOST_GID}" ]]; then
+                    groupmod -g "${HOST_GID}" -o harness 2>/dev/null \
+                        || groupadd -g "${HOST_GID}" -o harness
+                    usermod -u "${HOST_UID}" -g "${HOST_GID}" -o harness
+                fi
+            fi
+            exec gosu harness bash -c "$USER_CMD"
+        '
+}
+
 run_in_agent() {
     local cmd="$1"
     local agent_home_host
     agent_home_host=$(harness_docker_path "${AGENT_HOME}")
-    harness_docker run --rm \
-        --label "harness-persist-test=1" \
-        -v "${agent_home_host}:/home/harness" \
-        --entrypoint /bin/bash \
-        --user harness \
-        -e HOME=/home/harness \
-        -e PATH="/home/harness/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-        harness-agent:latest \
-        -c "
-            set -e
-            # Inline skel-seed: same logic as the entrypoint.
-            if [[ ! -f \$HOME/.harness-home-initialized ]]; then
-                if [[ -d /etc/skel/harness ]]; then
-                    cp -an /etc/skel/harness/. \$HOME/ 2>/dev/null || true
-                fi
-                touch \$HOME/.harness-home-initialized
-            fi
-            ${cmd}
-        "
+    _run_remapped "${agent_home_host}" yes "${cmd}"
 }
 
 # --- T1: first-run skel seed -----------------------------------------------
@@ -301,20 +344,7 @@ echo "[persist] T4: ccstatusline default seed"
 T4_HOME="${TEST_ROOT}/agent/home-t4"
 mkdir -p "${T4_HOME}"
 T4_HOME_HOST=$(harness_docker_path "${T4_HOME}")
-harness_docker run --rm \
-    --label "harness-persist-test=1" \
-    -v "${T4_HOME_HOST}:/home/harness" \
-    --entrypoint /bin/bash \
-    --user harness \
-    -e HOME=/home/harness \
-    harness-agent:latest \
-    -c '
-        set -e
-        if [[ ! -f $HOME/.harness-home-initialized ]]; then
-            cp -an /etc/skel/harness/. $HOME/ 2>/dev/null || true
-            touch $HOME/.harness-home-initialized
-        fi
-    '
+_run_remapped "${T4_HOME_HOST}" yes ""
 
 settings_json="${T4_HOME}/.config/ccstatusline/settings.json"
 if [[ ! -f "${settings_json}" ]]; then
@@ -335,20 +365,7 @@ fi
 # the marker preserved (cp -an should not clobber).
 cp "${settings_json}" "${settings_json}.bak"
 echo '{"version": 3, "lines": [[{"id":"x","type":"separator"}],[],[]], "_user_marker": true}' >"${settings_json}"
-harness_docker run --rm \
-    --label "harness-persist-test=1" \
-    -v "${T4_HOME_HOST}:/home/harness" \
-    --entrypoint /bin/bash \
-    --user harness \
-    -e HOME=/home/harness \
-    harness-agent:latest \
-    -c '
-        set -e
-        if [[ ! -f $HOME/.harness-home-initialized ]]; then
-            cp -an /etc/skel/harness/. $HOME/ 2>/dev/null || true
-            touch $HOME/.harness-home-initialized
-        fi
-    '
+_run_remapped "${T4_HOME_HOST}" yes ""
 if ! grep -q '_user_marker' "${settings_json}"; then
     echo "[persist] T4 FAIL: skel re-seed clobbered user-edited settings.json" >&2
     cat "${settings_json}" >&2
@@ -373,28 +390,18 @@ echo "[persist] T5: claude settings.json statusLine block"
 T5_HOME="${TEST_ROOT}/agent/home-t5"
 mkdir -p "${T5_HOME}"
 T5_HOME_HOST=$(harness_docker_path "${T5_HOME}")
-harness_docker run --rm \
-    --label "harness-persist-test=1" \
-    -v "${T5_HOME_HOST}:/home/harness" \
-    --entrypoint /bin/bash \
-    --user harness \
-    -e HOME=/home/harness \
-    harness-agent:latest \
-    -c '
-        set -e
-        cp -an /etc/skel/harness/. $HOME/ 2>/dev/null || true
-        touch $HOME/.harness-home-initialized
-        mkdir -p $HOME/.claude
-        if [[ ! -f $HOME/.claude/settings.json ]]; then
-            printf "%s\n" "{\"includeCoAuthoredBy\": false}" > $HOME/.claude/settings.json
-        fi
-        has_status=$(jq "has(\"statusLine\")" $HOME/.claude/settings.json 2>/dev/null || echo false)
-        if [[ "$has_status" != "true" ]]; then
-            tmp=$HOME/.claude/settings.json.tmp.$$
-            jq ". + {\"statusLine\": {\"type\": \"command\", \"command\": \"ccstatusline\", \"padding\": 0}}" \
-                $HOME/.claude/settings.json >"$tmp" && mv "$tmp" $HOME/.claude/settings.json
-        fi
-    '
+_run_remapped "${T5_HOME_HOST}" yes '
+    mkdir -p $HOME/.claude
+    if [[ ! -f $HOME/.claude/settings.json ]]; then
+        printf "%s\n" "{\"includeCoAuthoredBy\": false}" > $HOME/.claude/settings.json
+    fi
+    has_status=$(jq "has(\"statusLine\")" $HOME/.claude/settings.json 2>/dev/null || echo false)
+    if [[ "$has_status" != "true" ]]; then
+        tmp=$HOME/.claude/settings.json.tmp.$$
+        jq ". + {\"statusLine\": {\"type\": \"command\", \"command\": \"ccstatusline\", \"padding\": 0}}" \
+            $HOME/.claude/settings.json >"$tmp" && mv "$tmp" $HOME/.claude/settings.json
+    fi
+'
 claude_settings="${T5_HOME}/.claude/settings.json"
 if [[ ! -f "$claude_settings" ]]; then
     echo "[persist] T5 FAIL: $claude_settings not created" >&2
@@ -452,21 +459,7 @@ mkdir -p "${T6_HOME}"
 T6_HOME_HOST=$(harness_docker_path "${T6_HOME}")
 
 # First run: write a fake credential into ~/.git-credentials.
-harness_docker run --rm \
-    --label "harness-persist-test=1" \
-    -v "${T6_HOME_HOST}:/home/harness" \
-    --entrypoint /bin/bash \
-    --user harness \
-    -e HOME=/home/harness \
-    harness-agent:latest \
-    -c '
-        set -e
-        if [[ ! -f $HOME/.harness-home-initialized ]]; then
-            cp -an /etc/skel/harness/. $HOME/ 2>/dev/null || true
-            touch $HOME/.harness-home-initialized
-        fi
-        echo "https://test-user:test-token@example.com" >> $HOME/.git-credentials
-    '
+_run_remapped "${T6_HOME_HOST}" yes 'echo "https://test-user:test-token@example.com" >> $HOME/.git-credentials'
 
 if [[ ! -f "${T6_HOME}/.git-credentials" ]]; then
     echo "[persist] T6 FAIL: .git-credentials not written to host bind mount" >&2
@@ -480,14 +473,7 @@ if ! grep -q "test-user:test-token" "${T6_HOME}/.git-credentials"; then
 fi
 
 # Second run: fresh container, same home, must still see the credential.
-second_out=$(harness_docker run --rm \
-    --label "harness-persist-test=1" \
-    -v "${T6_HOME_HOST}:/home/harness" \
-    --entrypoint /bin/bash \
-    --user harness \
-    -e HOME=/home/harness \
-    harness-agent:latest \
-    -c 'grep -q "test-user:test-token" "$HOME/.git-credentials" && echo "persisted"' 2>&1)
+second_out=$(_run_remapped "${T6_HOME_HOST}" no 'grep -q "test-user:test-token" "$HOME/.git-credentials" && echo "persisted"' 2>&1)
 if ! grep -q "persisted" <<<"${second_out}"; then
     echo "[persist] T6 FAIL: credential not visible in second container" >&2
     echo "${second_out}" >&2
