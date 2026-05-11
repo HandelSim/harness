@@ -477,6 +477,11 @@ echo "${PROXY_LOGS}" | grep -qE 'listening on:[[:space:]]+0\.0\.0\.0:8000' \
 echo "${PROXY_LOGS}" | grep -qE 'listening on:[[:space:]]+0\.0\.0\.0:8000' \
     || fail "F/P004: proxy banner did not echo PROXY_PORT=8000" "${PROXY_LOGS}"
 
+# Inventory P008: Proxy reads PROXY_TIMEOUT from env (test sets 30).
+# Banner emits "   timeout:        <N>s\n".
+echo "${PROXY_LOGS}" | grep -qE 'timeout:[[:space:]]+30s' \
+    || fail "F/P008: proxy banner did not echo PROXY_TIMEOUT=30s" "${PROXY_LOGS}"
+
 # Inventory P006: Proxy reads PROXY_API_KEY from env (test sets test-key-1234).
 # _redact_key shows first-4 + "..." + last-4 for keys >8 chars, so
 # "test-key-1234" (13 chars) becomes "test...1234".
