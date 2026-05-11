@@ -256,18 +256,52 @@ jobs:
           cp .harness-allowlist.example .harness-allowlist
           chmod +x harness
 
-      # Pre-seed claude-code's settings.json BEFORE the agent ever starts so
-      # that the first-run theme picker / onboarding screen does not appear.
+      # Pre-seed claude-code's user state file BEFORE the agent ever starts
+      # so that the first-run theme picker / onboarding screen does not appear.
       # Without this, scenario 01-claude-boot.yaml hangs waiting for the
       # prompt marker `│ > ` because claude is still on the picker screen.
+      #
+      # Cycle 4 wrote hasCompletedOnboarding into ~/.claude/settings.json
+      # and the picker still rendered. Disassembling the v2.1.120 binary
+      # showed the onboarding gate (QN9) reads from ~/.claude.json (the
+      # top-level state file populated by Lq()), not from settings.json.
+      # The fields below match what claude itself writes on first run plus
+      # hasCompletedOnboarding=true and a project-trust entry for the CI
+      # checkout path (claude bind-mounts and cd's into HARNESS_HOST_CWD,
+      # which on CI is the runner's repo path).
+      #
       # state/agent/home is the host side of the agent's $HOME bind mount;
       # the harness CLI remaps the in-container `harness` user to the host
-      # uid/gid so this file is readable inside the container.
+      # uid/gid so these files are readable inside the container.
       - name: Pre-seed claude-code settings
         run: |
           mkdir -p state/agent/home/.claude
           cat > state/agent/home/.claude/settings.json <<'JSON'
-          {"theme":"dark","includeCoAuthoredBy":false,"hasCompletedOnboarding":true}
+          {"theme":"dark","includeCoAuthoredBy":false}
+          JSON
+          repo_cwd="${GITHUB_WORKSPACE}"
+          cat > state/agent/home/.claude.json <<JSON
+          {
+            "theme": "dark",
+            "hasCompletedOnboarding": true,
+            "firstStartTime": "2026-01-01T00:00:00.000Z",
+            "migrationVersion": 12,
+            "opusProMigrationComplete": true,
+            "sonnet1m45MigrationComplete": true,
+            "userID": "ci-placeholder-user-id-0000000000000000000000000000000000000000",
+            "numStartups": 42,
+            "lastOnboardingVersion": {
+              "ISSUES_EXPLAINER": "report the issue at https://github.com/anthropics/claude-code/issues",
+              "PACKAGE_URL": "@anthropic-ai/claude-code",
+              "README_URL": "https://code.claude.com/docs/en/overview",
+              "VERSION": "2.1.120",
+              "FEEDBACK_CHANNEL": "https://github.com/anthropics/claude-code/issues",
+              "BUILD_TIME": "2026-04-24T19:00:00.000Z"
+            },
+            "projects": {
+              "${repo_cwd}": {"hasTrustDialogAccepted": true}
+            }
+          }
           JSON
 
       - name: harness start
