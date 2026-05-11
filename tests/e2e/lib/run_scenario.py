@@ -31,7 +31,17 @@ The YAML schema is documented in tests/e2e/README.md. Briefly:
       kill_session: true
       archive_transcript: true
 
-Exit code is 0 iff every step and every assertion passed.
+Exit codes:
+  0  every step and assertion passed
+  1  scenario failed
+  2  invocation / configuration error
+  77 scenario is marked `expected_failure: true` and failed as expected (XFAIL)
+  78 scenario is marked `expected_failure: true` but unexpectedly passed (XPASS)
+
+A scenario marks itself as expected-failure with a top-level
+`expected_failure: true` and a sibling `expected_failure_reason: "<text>"`.
+The reason is required so the marker doesn't become a silent skip; if
+the reason is missing the runner treats the scenario as unmarked.
 
 Why this is Python rather than bash:
 - YAML parsing in pure bash is painful and brittle.
@@ -310,15 +320,36 @@ def run_scenario(scenario_path: Path, log_dir: Path) -> int:
         if cleanup.get("kill_session", True):
             session_kill(session)
 
+    expected_failure = bool(scenario.get("expected_failure"))
+    reason = (scenario.get("expected_failure_reason") or "").strip()
+    if expected_failure and not reason:
+        print(
+            f"[{name}] WARN expected_failure: true present but "
+            "expected_failure_reason is empty — treating as unmarked",
+            file=sys.stderr,
+        )
+        expected_failure = False
+
     if failed_step is not None:
         print(
-            f"[{name}] FAIL at step {failed_step}: {failure_msg}",
+            f"[{name}] {'XFAIL' if expected_failure else 'FAIL'} "
+            f"at step {failed_step}: {failure_msg}",
             file=sys.stderr,
         )
         print(f"[{name}] pipe-pane log: {pane_log}", file=sys.stderr)
         print(f"[{name}] transcript:    {transcript}", file=sys.stderr)
+        if expected_failure:
+            print(f"[{name}] expected_failure_reason: {reason}", file=sys.stderr)
+            return 77
         return 1
 
+    if expected_failure:
+        print(
+            f"[{name}] XPASS — scenario was marked expected_failure but passed. "
+            f"Remove the marker. Original reason: {reason}",
+            file=sys.stderr,
+        )
+        return 78
     print(f"[{name}] PASS", flush=True)
     return 0
 
