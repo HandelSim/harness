@@ -277,6 +277,18 @@ test_wait_for_healthy() {
         if (( $(date +%s) >= deadline )); then
             echo "[test-helpers] timeout waiting for healthy: ${services[*]}" >&2
             harness_docker compose --project-name "$project" ps >&2 || true
+            # Dump per-service logs for anything that never reached healthy
+            # so the failure path produces actionable evidence. Without this,
+            # a container that crashes during startup leaves no trail once
+            # the calling test's cleanup trap removes it.
+            local _svc _cid
+            for _svc in "${services[@]}"; do
+                _cid=$(harness_docker compose --project-name "$project" ps -q "$_svc" 2>/dev/null || true)
+                if [[ -n "$_cid" ]]; then
+                    echo "[test-helpers] --- docker logs ${_svc} (${_cid}) ---" >&2
+                    harness_docker logs --tail=200 "$_cid" >&2 2>&1 || true
+                fi
+            done
             return 1
         fi
         sleep 2
