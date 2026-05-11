@@ -235,6 +235,60 @@ jobs:
             buildx-e2e-
             buildx-
 
+      # Bootstrap config so `./harness start` will bring the stack up.
+      # The scenarios override PROXY_API_URL/KEY/MODEL with mock values
+      # inside the tmux session — these placeholders only need to be
+      # non-empty for preflight to accept the .env.
+      - name: Seed harness config
+        run: |
+          cp .env.example .env
+          sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=https://api.example.test|' .env
+          sed -i 's|^PROXY_API_KEY=.*|PROXY_API_KEY=ci-placeholder-key|' .env
+          sed -i 's|^PROXY_API_MODEL=.*|PROXY_API_MODEL=ci-placeholder-model|' .env
+          cp .harness-allowlist.example .harness-allowlist
+          chmod +x harness
+
+      # Pre-seed claude-code's settings.json BEFORE the agent ever starts so
+      # that the first-run theme picker / onboarding screen does not appear.
+      # Without this, scenario 01-claude-boot.yaml hangs waiting for the
+      # prompt marker `│ > ` because claude is still on the picker screen.
+      # state/agent/home is the host side of the agent's $HOME bind mount;
+      # the harness CLI remaps the in-container `harness` user to the host
+      # uid/gid so this file is readable inside the container.
+      - name: Pre-seed claude-code settings
+        run: |
+          mkdir -p state/agent/home/.claude
+          cat > state/agent/home/.claude/settings.json <<'JSON'
+          {"theme":"dark","includeCoAuthoredBy":false,"hasCompletedOnboarding":true}
+          JSON
+
+      - name: harness start
+        env:
+          DOCKER_BUILDKIT: "1"
+          COMPOSE_DOCKER_CLI_BUILD: "1"
+          HARNESS_SKIP_AUTH_PROBE: "1"
+        run: ./harness start
+
+      # `compose up -d` returns once containers are started, not once their
+      # healthchecks have passed. Block here until both core services report
+      # healthy so the scenarios don't race the proxy/ollama warm-up.
+      - name: Wait for proxy + ollama healthy
+        run: |
+          for i in $(seq 1 60); do
+            proxy_h=$(docker inspect --format '{{.State.Health.Status}}' "$(docker ps -qf name=harness-proxy)" 2>/dev/null || echo "missing")
+            ollama_h=$(docker inspect --format '{{.State.Health.Status}}' "$(docker ps -qf name=harness-ollama)" 2>/dev/null || echo "missing")
+            echo "tick=${i} proxy=${proxy_h} ollama=${ollama_h}"
+            if [[ "${proxy_h}" == "healthy" && "${ollama_h}" == "healthy" ]]; then
+              echo "Stack healthy after ${i} ticks"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Stack not healthy in 120s"
+          docker ps -a
+          docker compose logs || true
+          exit 1
+
       - name: tests/e2e/run.sh
         env:
           DOCKER_BUILDKIT: "1"

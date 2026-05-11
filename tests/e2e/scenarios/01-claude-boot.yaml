@@ -22,12 +22,27 @@ setup:
   default_timeout_s: 30
 
 steps:
-  # Boot the TUI. The marker `│ > ` is the best-guess claude prompt glyph.
-  # If the real boot uses a different prompt, adjust here after the first
-  # interactive run (see questions.md note about marker discovery).
+  # Boot the TUI. We can't wait_for_marker on the launch step because on a
+  # greenfield agent home claude-code shows a theme picker / onboarding
+  # screen that hides the prompt — wait_for_marker would time out. Wait
+  # for the pane to stabilize after launch instead, then dismiss any
+  # picker, then look for the prompt marker.
   - launch: "./harness claude"
-    wait_for_marker: "│ > "
+    wait_stable_ms: 1500
     timeout_s: 45
+
+  # Dismiss theme picker / onboarding confirmation pages if present. CI
+  # pre-seeds state/agent/home/.claude/settings.json with
+  # hasCompletedOnboarding=true so these are usually no-ops, but the
+  # defense-in-depth Enter taps cover claude-code versions where the
+  # picker fires regardless. If the prompt is already up, Enter just
+  # submits an empty line which claude ignores.
+  - send_key: Enter
+    wait_stable_ms: 500
+    timeout_s: 5
+  - send_key: Enter
+    wait_for_marker: "│ > "
+    timeout_s: 30
 
   # Settle: nothing should still be scrolling.
   - sleep_s: 0.5
