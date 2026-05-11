@@ -55,7 +55,8 @@ declare -a scenarios=()
 for path in "$SCENARIOS_DIR"/*.yaml "$SCENARIOS_DIR"/*.yml; do
     [[ -f "$path" ]] || continue
     if [[ -n "$PATTERN" ]]; then
-        # shellcheck disable=SC2053 — intentional glob, not literal compare
+        # Intentional glob match against PATTERN, not literal comparison.
+        # shellcheck disable=SC2053
         if [[ "$(basename "$path")" != $PATTERN ]]; then
             continue
         fi
