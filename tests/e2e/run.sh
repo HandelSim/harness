@@ -76,29 +76,66 @@ echo
 
 total=${#scenarios[@]}
 failed=0
+xfailed=0
+xpassed=0
 declare -a failed_names=()
+declare -a xfailed_names=()
+declare -a xpassed_names=()
 
+# Exit-code contract with run_scenario.py:
+#   0  pass
+#   1  fail
+#   2  invocation / config error (treat as fail)
+#   77 expected_failure: true, failed as expected (XFAIL — not a CI failure)
+#   78 expected_failure: true, unexpectedly passed (XPASS — IS a CI failure;
+#      the marker must be removed)
 for path in "${scenarios[@]}"; do
     name="$(basename "$path")"
     echo "===== $name ====="
-    if HARNESS_E2E_LOG_DIR="$LOG_DIR" python3 "$RUNNER" "$path" --log-dir "$LOG_DIR"; then
-        :
-    else
-        rc=$?
-        failed=$((failed + 1))
-        failed_names+=("$name (rc=$rc)")
-    fi
+    rc=0
+    HARNESS_E2E_LOG_DIR="$LOG_DIR" python3 "$RUNNER" "$path" --log-dir "$LOG_DIR" || rc=$?
+    case "$rc" in
+        0)  ;;
+        77)
+            xfailed=$((xfailed + 1))
+            xfailed_names+=("$name")
+            ;;
+        78)
+            xpassed=$((xpassed + 1))
+            xpassed_names+=("$name")
+            ;;
+        *)
+            failed=$((failed + 1))
+            failed_names+=("$name (rc=$rc)")
+            ;;
+    esac
     echo
 done
 
 echo "==========================================="
 echo "Total scenarios: $total"
-echo "Failed: $failed"
+echo "Failed:           $failed"
+echo "XFailed (expected): $xfailed"
+echo "XPassed (unexpected pass — fix needed): $xpassed"
+if [[ $xfailed -gt 0 ]]; then
+    echo "Expected failures (counted as success):"
+    for n in "${xfailed_names[@]}"; do
+        echo "  - $n"
+    done
+fi
+if [[ $xpassed -gt 0 ]]; then
+    echo "Unexpected passes (remove expected_failure marker on these):"
+    for n in "${xpassed_names[@]}"; do
+        echo "  - $n"
+    done
+fi
 if [[ $failed -gt 0 ]]; then
     echo "Failures:"
     for n in "${failed_names[@]}"; do
         echo "  - $n"
     done
+fi
+if [[ $failed -gt 0 || $xpassed -gt 0 ]]; then
     exit 1
 fi
 exit 0

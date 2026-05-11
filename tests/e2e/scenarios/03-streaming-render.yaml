@@ -1,5 +1,12 @@
 name: 03-streaming-render
 inventory_refs: [P051, P032, F043]
+# Tracked in #37. The CI e2e job's seed step sets PROXY_API_URL to a
+# placeholder (api.github.com) because no mock-upstream service exists.
+# This scenario sends a real prompt, so proxy.py forwards to the placeholder
+# upstream which 404s; proxy returns 502; the TUI spinner never clears.
+# wait_stable_ms therefore times out. Will pass once a mock upstream is wired.
+expected_failure: true
+expected_failure_reason: "no mock upstream wired in CI; PROXY_API_URL placeholder 404s → proxy 502 → spinner never clears (#37)"
 description: |
   Send a prompt that triggers a long mock streaming response. The TUI must
   render the streamed deltas cleanly — no escape-sequence artifacts, no

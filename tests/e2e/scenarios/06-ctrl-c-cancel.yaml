@@ -1,5 +1,11 @@
 name: 06-ctrl-c-cancel
 inventory_refs: [P051, F043]
+# Tracked in #37. The Enter step triggers a real /api/chat call; the
+# placeholder upstream 404s; the proxy 502s; the TUI never starts streaming
+# so there's nothing to Ctrl-C against. Will pass once a mock upstream is
+# wired and the cancel path can actually exercise an in-flight stream.
+expected_failure: true
+expected_failure_reason: "no mock upstream wired in CI; cannot exercise mid-stream cancel against a placeholder upstream that 404s (#37)"
 description: |
   Start a long streaming response, send Ctrl-C mid-stream, verify the
   TUI cancels cleanly: no error spew, no hung state, prompt returns and
