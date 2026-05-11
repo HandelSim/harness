@@ -309,6 +309,25 @@ jobs:
           echo "=== docker ps -a ==="; docker ps -a || true
           echo "=== docker logs harness-proxy-1 ==="; docker logs harness-proxy-1 2>&1 | tail -100 || true
           echo "=== docker logs harness-ollama-1 ==="; docker logs harness-ollama-1 2>&1 | tail -100 || true
+          # Agent containers are ephemeral per-scenario. Dump anything that
+          # still has the harness.agent=true label so we can see what
+          # claude-code printed when the prompt never appeared.
+          for c in $(docker ps -a --filter label=harness.agent=true --format '{{.Names}}' 2>/dev/null); do
+            echo "=== docker logs ${c} ==="
+            docker logs "${c}" 2>&1 | tail -200 || true
+          done
+          # tmux pane transcripts land under /tmp/harness-e2e-* — these are
+          # the only windows into what the user would have seen on screen.
+          for d in /tmp/harness-e2e-*; do
+            [[ -d "$d" ]] || continue
+            echo "=== contents of ${d} ==="
+            ls -la "${d}" || true
+            for f in "${d}"/*.transcript.txt "${d}"/*.pipe.log; do
+              [[ -f "$f" ]] || continue
+              echo "--- ${f} (last 200 lines) ---"
+              tail -200 "$f" || true
+            done
+          done
           echo "=== free -h ==="; free -h || true
           echo "=== df -h ==="; df -h || true
 
