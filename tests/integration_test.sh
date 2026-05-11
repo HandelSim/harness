@@ -515,6 +515,10 @@ phase_3_graphify() {
                 fi
                 touch /home/harness/.harness-home-initialized 2>/dev/null || true
             fi
+            # pipx 1.x calls mkdir() without parents=True for ~/.local/pipx/logs,
+            # so missing ~/.local breaks `pipx install` with FileNotFoundError
+            # before any package is touched. Pre-create both dirs.
+            mkdir -p /home/harness/.local/bin /home/harness/.local/pipx
             # Chown unconditionally on every container start — and without
             # swallowing failures. Inventory: previously this lived inside
             # the skel-seed marker gate with `|| true`, so a partial /home
