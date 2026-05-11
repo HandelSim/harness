@@ -83,6 +83,7 @@ services:
       PROXY_API_MODEL: ${PROXY_API_MODEL:-}
       PROXY_HOST: ${PROXY_HOST:-0.0.0.0}
       PROXY_PORT: ${PROXY_PORT:-8000}
+      PROXY_TIMEOUT: ${PROXY_TIMEOUT:-180}
       # OUTPUT_DIR is optional — empty by default (no debug dumps).
       # Users opt in by setting OUTPUT_DIR=/output in .env, then bind-mount
       # the host path of their choice via the volume below.
