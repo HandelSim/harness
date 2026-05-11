@@ -21,23 +21,26 @@ setup:
   default_timeout_s: 30
 
 steps:
-  # Boot the opencode TUI. We avoid matching on the loose word "opencode"
-  # because the bash command echo "./harness opencode" would satisfy it
-  # immediately and the rest of the scenario would race Ctrl-C through
-  # firewall init, killing the agent before its TUI ever started. Anchor
-  # on the harness CLI banner line printed AFTER firewall init, then
-  # sleep long enough for opencode to perform its first-run sqlite
-  # migration and render its TUI.
+  # Boot the opencode TUI. opencode uses an alternate-screen TUI: once it
+  # starts, tmux capture-pane no longer sees the pre-TUI scrollback (the
+  # firewall init lines + harness banner are clipped). So we anchor on
+  # the harness CLI banner to confirm we made it past firewall init, but
+  # all subsequent assertions must use markers that appear *inside* the
+  # opencode TUI (e.g. its version number in the bottom bar).
   - launch: "./harness opencode"
     wait_for_marker: "harness-agent (opencode)"
-    timeout_s: 60
+    timeout_s: 90
 
   - sleep_s: 8
 
+  # Assertions against the opencode TUI. The TUI bottom bar shows the
+  # current cwd plus the opencode version (1.14.24 per agents/Dockerfile
+  # OPENCODE_VERSION). That string survives alt-screen rendering and is
+  # a reliable "TUI is up" check.
   - capture_assertions:
       - not_contains: "Traceback"
       - not_contains: "Error:"
-      - contains: "harness-agent (opencode)"
+      - contains: "1.14.24"
 
   # Exit. opencode honors Ctrl-C for quit on most builds; fall back to
   # Ctrl-D if the TUI does not exit cleanly.

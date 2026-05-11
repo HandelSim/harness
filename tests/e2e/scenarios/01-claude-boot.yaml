@@ -22,26 +22,18 @@ setup:
   default_timeout_s: 30
 
 steps:
-  # Boot the TUI. We can't wait_for_marker on the launch step because on a
-  # greenfield agent home claude-code shows a theme picker / onboarding
-  # screen that hides the prompt — wait_for_marker would time out. Wait
-  # for the pane to stabilize after launch instead, then dismiss any
-  # picker, then look for the prompt marker.
+  # Boot the TUI and wait directly for the prompt marker. CI pre-seeds
+  # state/agent/home/.claude.json with hasCompletedOnboarding=true plus
+  # a project-trust entry so claude-code v2.1.120 skips the theme picker
+  # and the trust-dialog and renders straight to the prompt. We give a
+  # generous 90s timeout because the launch sequence on CI is:
+  #   1. firewall init     (~10s — downloads GitHub IP ranges)
+  #   2. agent home init   (~5-10s — first-run setup)
+  #   3. claude TUI render (~5-15s — binary cold-start + first paint)
+  # 45s was empirically too tight on a busy CI runner.
   - launch: "./harness claude"
-    wait_stable_ms: 1500
-    timeout_s: 45
-
-  # Dismiss theme picker / onboarding confirmation pages if present. CI
-  # pre-seeds state/agent/home/.claude.json with hasCompletedOnboarding=true
-  # so these are usually no-ops, but the defense-in-depth Enter taps cover
-  # claude-code versions where the picker fires regardless. If the prompt
-  # is already up, Enter just submits an empty line which claude ignores.
-  - send_key: Enter
-    wait_stable_ms: 500
-    timeout_s: 5
-  - send_key: Enter
     wait_for_marker: "❯ "
-    timeout_s: 30
+    timeout_s: 90
 
   # Settle: nothing should still be scrolling.
   - sleep_s: 0.5
