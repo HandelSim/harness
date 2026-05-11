@@ -585,7 +585,7 @@ jobs:
           echo "Attempt comments on issue #${ISSUE}: ${count}"
           if [[ "${count}" -gt 5 ]]; then
             gh issue comment "${ISSUE}" --body \
-              "Per-SHA attempt cap (5) reached on this SHA. Watcher will not invoke Claude again. @HandelSim please review."
+              "**Auto-fix loop disengaged.** Per-SHA attempt cap (5) reached: this SHA has had 5 unsuccessful Claude attempts and the watcher will not invoke a 6th. The loop has stopped — it has NOT silently succeeded. Land a new commit on \`dev\` to reset the cap (a new SHA produces a new issue and a fresh attempt counter), or escalate manually. @HandelSim please review."
             echo "should_invoke=false" >> "$GITHUB_OUTPUT"
           else
             echo "should_invoke=true"  >> "$GITHUB_OUTPUT"
@@ -628,12 +628,74 @@ jobs:
             - Dev SHA at failure: ${{ needs.failure_triage.outputs.sha }} (`${{ needs.failure_triage.outputs.sha7 }}`)
             - Failed CI run: ${{ needs.failure_triage.outputs.run_url }}
 
-            The issue body and its comments contain the failed-step logs
-            from the watcher. Investigate (read code, search the web, run
-            targeted tests locally as needed), fix the underlying problem,
-            push to `dev` via the standard rebase + `--ff-only` flow, and
-            close the issue with a fix summary, commit SHA, and link to
-            the originally-failing run.
+            ## Diagnose before you change anything
+
+            The failed-step log excerpt in the issue is **starting** evidence,
+            not ending evidence. Past auto-fix runs have failed because they
+            jumped to "what symbol in the log can I change to make the
+            assertion match" instead of asking "what is actually being
+            produced, and why does it disagree with the assertion."
+
+            Before proposing any fix, do at least these:
+
+            1. **Read the raw output from the failing layer, not just the
+               assertion message.** Examples of what "raw" means:
+                 - For e2e tmux tests: dump the per-scenario `pipe.log` byte
+                   stream (`tests/e2e/lib/run_scenario.py` writes one with
+                   `tmux pipe-pane`). `tmux capture-pane -p` strips trailing
+                   whitespace and collapses styling, so it can lie about
+                   what the TUI emitted. The pipe.log does not.
+                 - For HTTP/proxy tests: dump the request/response body,
+                   not just the status code.
+                 - For container/process tests: dump the container logs
+                   (`docker logs`, `journalctl`) and any state-dir contents
+                   the test produced. The harness e2e job already does this
+                   on failure; **read those artifacts** before changing code.
+                 - For Python tests: run with `-x -vv -s` locally and read
+                   what was actually printed.
+            2. **Reproduce locally if reproduction is cheap** (under ~5 min
+               to set up). Most harness test failures reproduce in a fresh
+               container or a fresh checkout. If reproduction is expensive,
+               state that and proceed with log-only analysis.
+            3. **Name the root cause in one sentence before writing any
+               fix.** If you can't, you haven't diagnosed it — keep reading.
+               "The assertion expects X but got Y" is not a root cause; the
+               root cause is *why* Y was produced.
+            4. **Stress-test your fix against the evidence.** If your fix is
+               "change the assertion / increase the timeout / loosen the
+               match," ask whether you've actually understood why the
+               original assertion failed. Loosening a check should be a
+               deliberate decision, not a way to make the failure go away.
+
+            ### Anti-patterns to avoid
+
+            These are real failure modes from prior auto-fix attempts.
+            If you catch yourself doing one of these, stop and re-read
+            the raw evidence:
+
+            - **Timeout bumping.** If a `wait_for_marker` times out and the
+              process is clearly alive, the marker is probably wrong, not
+              the timeout. Read the captured pane (and the pipe.log byte
+              stream) before raising `timeout_s`.
+            - **Marker rewriting by guesswork.** Don't try variants of an
+              expected string until one matches. Look at what was actually
+              emitted and write the marker against that.
+            - **Single-tool tunnel vision.** If `tmux capture-pane` shows
+              one thing and the test still fails, check what other capture
+              paths (the pipe.log, `docker logs`, the agent's own stderr)
+              say. They can disagree, and the disagreement is the clue.
+            - **Adding retries to mask flakes.** A retry is only correct
+              when you've identified a transient cause (network blip,
+              clock-skew, etc.). "Sometimes it fails" is not a transient
+              cause; it's a symptom of one.
+
+            ## Then fix it
+
+            Once you have a named root cause, fix the underlying problem
+            and push to `dev` via the standard rebase + `--ff-only` flow.
+            Close the issue with: the fix summary, the root cause sentence
+            from step 3, the commit SHA, and a link to the originally
+            failing run.
 
             If after full investigation the failure falls into the
             "Must fall back to research-and-propose" list (security-relevant
