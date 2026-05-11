@@ -515,27 +515,46 @@ phase_3_graphify() {
                 fi
                 touch /home/harness/.harness-home-initialized 2>/dev/null || true
             fi
-            # pipx 1.x calls mkdir() without parents=True for ~/.local/pipx/logs,
-            # so missing ~/.local breaks `pipx install` with FileNotFoundError
-            # before any package is touched. Pre-create both dirs.
+            # Pre-create ~/.local so pipx 1.x has a writable log root.
+            # pathlib mkdir parents=True recurses up; if /home/harness is
+            # not writable by uid 1001 yet because our chown has not run,
+            # pipx blows up with PermissionError on /home/harness/.local.
             mkdir -p /home/harness/.local/bin /home/harness/.local/pipx
-            # Chown unconditionally on every container start — and without
-            # swallowing failures. Inventory: previously this lived inside
-            # the skel-seed marker gate with `|| true`, so a partial /home
-            # left over from an earlier run (notably ~/.local pre-pipx) could
-            # stay at the unremapped uid 1000 and break `pipx install`. Run
-            # it every time so drift is repaired; surface errors so a real
-            # chown failure does not look like success.
+            # Chown unconditionally on every container start without
+            # swallowing failures. Surface errors so a real chown failure
+            # does not look like success.
             chown -R harness:harness /home/harness
+            # Sentinel for the test to wait on. The previous fixed
+            # 5-second sleep was racing init-firewall + usermod on CI;
+            # pipx would run before mkdir/chown landed and see
+            # /home/harness as owned by uid 1001 while harness was still
+            # uid 1000, giving PermissionError. The marker is the only
+            # signal the test can use to know the bash -c body completed.
+            touch /tmp/harness-agent-init-complete
             exec gosu harness sleep 3600
         ' \
         >/dev/null
 
-    # Give init-firewall + remap a moment to settle, then verify ready.
-    sleep 5
-    if [[ -z "$(harness_docker ps -q -f "name=^${GRAPHIFY_AGENT_NAME}$" 2>/dev/null)" ]]; then
-        echo "[integration] Phase 3.1 FAIL: agent container exited before sleep" >&2
-        harness_docker logs "${GRAPHIFY_AGENT_NAME}" 2>&1 | tail -30 >&2
+    # Wait for the bash -c init body to finish (sentinel touched at end).
+    # init-firewall + usermod + chown take a variable amount of time on
+    # CI; a fixed sleep races them.
+    local _wait
+    for _wait in $(seq 1 60); do
+        if harness_docker exec "${GRAPHIFY_AGENT_NAME}" \
+                test -f /tmp/harness-agent-init-complete >/dev/null 2>&1; then
+            break
+        fi
+        if [[ -z "$(harness_docker ps -q -f "name=^${GRAPHIFY_AGENT_NAME}$" 2>/dev/null)" ]]; then
+            echo "[integration] Phase 3.1 FAIL: agent container exited before init complete" >&2
+            harness_docker logs "${GRAPHIFY_AGENT_NAME}" 2>&1 | tail -40 >&2
+            return 1
+        fi
+        sleep 1
+    done
+    if ! harness_docker exec "${GRAPHIFY_AGENT_NAME}" \
+            test -f /tmp/harness-agent-init-complete >/dev/null 2>&1; then
+        echo "[integration] Phase 3.1 FAIL: agent container init did not complete within 60s" >&2
+        harness_docker logs "${GRAPHIFY_AGENT_NAME}" 2>&1 | tail -40 >&2
         return 1
     fi
     if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
@@ -721,10 +740,18 @@ phase_3_graphify() {
                     || groupadd -g "${HOST_GID}" -o harness
                 usermod -u "${HOST_UID}" -g "${HOST_GID}" -o harness 2>/dev/null || true
             fi
+            touch /tmp/harness-agent-init-complete
             exec gosu harness sleep 600
         ' \
         >/dev/null
-    sleep 5
+    local _wait2
+    for _wait2 in $(seq 1 60); do
+        if harness_docker exec "${GRAPHIFY_AGENT_NAME_2}" \
+                test -f /tmp/harness-agent-init-complete >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
     if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME_2}" \
             /home/harness/.local/bin/graphify --help >/dev/null 2>&1; then
         echo "[integration] Phase 3.11 FAIL: graphify not callable in fresh container" >&2
