@@ -277,6 +277,18 @@ jobs:
           HARNESS_SKIP_AUTH_PROBE: "1"
         run: ./harness start
 
+      # Pre-build the agent image so `./harness claude` inside each scenario
+      # finds it already present and does NOT inline-build it. The inline
+      # build is ~45s on CI and races the scenarios' 45s wait_for_marker on
+      # the claude prompt; the transcripts dumped by Diagnostics on cycle 3
+      # showed every scenario stuck on `harness: building harness-agent:latest
+      # (one-time)...` and the docker-build output filling the tmux pane.
+      - name: Pre-build agent image
+        env:
+          DOCKER_BUILDKIT: "1"
+          COMPOSE_DOCKER_CLI_BUILD: "1"
+        run: docker compose --env-file ./.env --profile agent build agent
+
       # `compose up -d` returns once containers are started, not once their
       # healthchecks have passed. Block here until both core services report
       # healthy so the scenarios don't race the proxy/ollama warm-up.

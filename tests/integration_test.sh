@@ -779,6 +779,13 @@ phase_5_mount() {
     local extra_mount
     extra_mount=$(mktemp -d -t harness-extra-mount.XXXXXX)
     echo "marker-$(date +%s)" > "${extra_mount}/marker.txt"
+    # mktemp -d creates mode 0700 owned by the host runner uid. On CI
+    # that is uid 1001, but the in-container harness user (no uid remap
+    # in the lightweight bash -c we use for the mount probe below) is
+    # uid 1000 and would get EACCES reading marker.txt. Relax the dir
+    # and the marker so anyone in the container can read them.
+    chmod 0755 "${extra_mount}"
+    chmod 0644 "${extra_mount}/marker.txt"
     # shellcheck disable=SC2064
     trap "rm -rf '${extra_mount}'" RETURN
 
