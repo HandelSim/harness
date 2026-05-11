@@ -236,15 +236,23 @@ jobs:
             buildx-
 
       # Bootstrap config so `./harness start` will bring the stack up.
-      # The scenarios override PROXY_API_URL/KEY/MODEL with mock values
-      # inside the tmux session — these placeholders only need to be
-      # non-empty for preflight to accept the .env.
+      # PROXY_API_URL must point at a host that is in the allowlist or the
+      # proxy's init-firewall.sh guardrail aborts the container with FATAL
+      # before the healthcheck ever runs. api.github.com is in the bundled
+      # .harness-allowlist.example, so use it as the placeholder — the
+      # proxy never actually calls it because the agents in the scenarios
+      # talk to ollama via the intra-cluster name, not the upstream URL.
       - name: Seed harness config
         run: |
           cp .env.example .env
-          sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=https://api.example.test|' .env
+          sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=https://api.github.com|' .env
           sed -i 's|^PROXY_API_KEY=.*|PROXY_API_KEY=ci-placeholder-key|' .env
           sed -i 's|^PROXY_API_MODEL=.*|PROXY_API_MODEL=ci-placeholder-model|' .env
+          # harness source .env with `set -a` on every invocation, so even
+          # though we set this on `harness start` below the scenarios'
+          # `./harness claude` calls would still hit _gate_on_upstream_auth.
+          # Baking the bypass into .env makes every invocation skip it.
+          echo 'HARNESS_SKIP_AUTH_PROBE=1' >> .env
           cp .harness-allowlist.example .harness-allowlist
           chmod +x harness
 
@@ -299,6 +307,8 @@ jobs:
         if: failure()
         run: |
           echo "=== docker ps -a ==="; docker ps -a || true
+          echo "=== docker logs harness-proxy-1 ==="; docker logs harness-proxy-1 2>&1 | tail -100 || true
+          echo "=== docker logs harness-ollama-1 ==="; docker logs harness-ollama-1 2>&1 | tail -100 || true
           echo "=== free -h ==="; free -h || true
           echo "=== df -h ==="; df -h || true
 
