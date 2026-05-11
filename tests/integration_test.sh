@@ -514,8 +514,15 @@ phase_3_graphify() {
                     cp -an /etc/skel/harness/. /home/harness/ 2>/dev/null || true
                 fi
                 touch /home/harness/.harness-home-initialized 2>/dev/null || true
-                chown -R harness:harness /home/harness 2>/dev/null || true
             fi
+            # Chown unconditionally on every container start — and without
+            # swallowing failures. Inventory: previously this lived inside
+            # the skel-seed marker gate with `|| true`, so a partial /home
+            # left over from an earlier run (notably ~/.local pre-pipx) could
+            # stay at the unremapped uid 1000 and break `pipx install`. Run
+            # it every time so drift is repaired; surface errors so a real
+            # chown failure does not look like success.
+            chown -R harness:harness /home/harness
             exec gosu harness sleep 3600
         ' \
         >/dev/null
