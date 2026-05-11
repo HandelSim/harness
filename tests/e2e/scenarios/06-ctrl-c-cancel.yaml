@@ -23,7 +23,7 @@ setup:
 
 steps:
   - launch: "./harness claude"
-    wait_for_marker: "❯ "
+    wait_for_marker: "❯"
     timeout_s: 90
 
   # Send a prompt that's likely to produce a long streaming response so
@@ -40,7 +40,7 @@ steps:
 
   # Cancel.
   - send_key: C-c
-    wait_for_marker: "❯ "
+    wait_for_marker: "❯"
     wait_stable_ms: 800
     timeout_s: 30
 
@@ -52,12 +52,12 @@ steps:
       - not_contains: "Traceback"
       - not_contains: "Error:"
       - not_contains: "panic:"
-      - regex_match: "❯ "
+      - regex_match: "❯"
 
   # Smoke: send a follow-up to prove the TUI is not hung.
   - paste: "ok"
     send_key: Enter
-    wait_for_marker: "❯ "
+    wait_for_marker: "❯"
     wait_stable_ms: 500
     timeout_s: 30
 

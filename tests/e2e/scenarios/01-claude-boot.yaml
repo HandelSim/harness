@@ -32,7 +32,7 @@ steps:
   #   3. claude TUI render (~5-15s — binary cold-start + first paint)
   # 45s was empirically too tight on a busy CI runner.
   - launch: "./harness claude"
-    wait_for_marker: "❯ "
+    wait_for_marker: "❯"
     timeout_s: 90
 
   # Settle: nothing should still be scrolling.
@@ -42,7 +42,7 @@ steps:
   - capture_assertions:
       - not_contains: "Traceback"
       - not_contains: "Error:"
-      - regex_match: "❯ "
+      - regex_match: "❯"
 
   # Exit cleanly via Ctrl-C twice (claude convention) or Ctrl-D.
   - send_key: C-c

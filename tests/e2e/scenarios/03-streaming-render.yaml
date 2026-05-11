@@ -26,13 +26,13 @@ setup:
 
 steps:
   - launch: "./harness claude"
-    wait_for_marker: "❯ "
+    wait_for_marker: "❯"
     timeout_s: 90
 
   # Paste a prompt likely to yield a long response from the mock.
   - paste: "Please write a long, detailed explanation of the harness architecture."
     send_key: Enter
-    wait_for_marker: "❯ "
+    wait_for_marker: "❯"
     wait_stable_ms: 800
     timeout_s: 90
 
@@ -46,7 +46,7 @@ steps:
   - capture_assertions:
       - not_contains: "Traceback"
       - not_contains: "Error:"
-      - regex_match: "❯ "
+      - regex_match: "❯"
 
   - send_key: C-c
     wait_stable_ms: 300
