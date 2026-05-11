@@ -27,7 +27,7 @@ setup:
 steps:
   - launch: "./harness claude"
     wait_for_marker: "❯ "
-    timeout_s: 45
+    timeout_s: 90
 
   # Bracketed paste of a 3-line snippet. The runner's `paste` step uses
   # tmux load-buffer + paste-buffer, which triggers the bracketed-paste

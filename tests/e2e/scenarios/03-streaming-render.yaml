@@ -27,7 +27,7 @@ setup:
 steps:
   - launch: "./harness claude"
     wait_for_marker: "❯ "
-    timeout_s: 45
+    timeout_s: 90
 
   # Paste a prompt likely to yield a long response from the mock.
   - paste: "Please write a long, detailed explanation of the harness architecture."

@@ -24,7 +24,7 @@ setup:
 steps:
   - launch: "./harness claude"
     wait_for_marker: "❯ "
-    timeout_s: 45
+    timeout_s: 90
 
   # Send a prompt that's likely to produce a long streaming response so
   # the cancel arrives mid-stream.

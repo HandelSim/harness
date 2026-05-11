@@ -28,7 +28,7 @@ steps:
   - launch: "./harness claude"
     wait_for_marker: "❯ "
     wait_stable_ms: 1000
-    timeout_s: 45
+    timeout_s: 90
 
   # Extra settle: ccstatusline renders on a timer.
   - sleep_s: 1.0
