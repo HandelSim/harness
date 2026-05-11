@@ -449,12 +449,8 @@ jobs:
       issues: write
       pull-requests: write
       actions: read
-    outputs:
-      issue_number: ${{ steps.issue.outputs.number }}
-      should_invoke: ${{ steps.cap.outputs.should_invoke }}
-      sha: ${{ steps.ctx.outputs.sha }}
-      sha7: ${{ steps.ctx.outputs.sha7 }}
-      run_url: ${{ steps.ctx.outputs.run_url }}
+    # No job-level outputs: this job's effects are emitted via GitHub issue
+    # comments (which fire claude.yml), not via outputs to a downstream job.
     steps:
       - name: Checkout (for log fetch + git author check)
         uses: actions/checkout@v5
@@ -490,6 +486,46 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check cap on any existing issue for this SHA
+        # Run cap-counting BEFORE issue creation so we can gate the @claude
+        # mention. If we let create/append run first and only checked the
+        # cap afterwards, we'd already have fired claude.yml on the cap-
+        # exceeded path. Output `cap_ok` is consumed by every step below.
+        if: steps.bot_check.outputs.skip != 'true'
+        id: precap
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          SHA7: ${{ steps.ctx.outputs.sha7 }}
+        run: |
+          set -euo pipefail
+          title="CI failure on dev: ${SHA7}"
+          existing="$(gh issue list \
+              --state open \
+              --label ci-failure \
+              --search "${title} in:title" \
+              --json number,title \
+              --jq ".[] | select(.title == \"${title}\") | .number" \
+              | head -n1)"
+          if [[ -z "${existing}" ]]; then
+            echo "No existing issue for SHA ${SHA7}; cap_ok=true (count=0)."
+            echo "existing="          >> "$GITHUB_OUTPUT"
+            echo "is_new=true"        >> "$GITHUB_OUTPUT"
+            echo "cap_ok=true"        >> "$GITHUB_OUTPUT"
+            echo "attempt_count=0"    >> "$GITHUB_OUTPUT"
+          else
+            count="$(gh issue view "${existing}" --json comments \
+                --jq '[.comments[] | select(.body | contains("<!-- ci-failure-attempt"))] | length')"
+            echo "Existing issue #${existing}: ${count} prior attempts."
+            echo "existing=${existing}"     >> "$GITHUB_OUTPUT"
+            echo "is_new=false"             >> "$GITHUB_OUTPUT"
+            echo "attempt_count=${count}"   >> "$GITHUB_OUTPUT"
+            if [[ "${count}" -gt 5 ]]; then
+              echo "cap_ok=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "cap_ok=true"  >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
       - name: Find or create the failure issue
         if: steps.bot_check.outputs.skip != 'true'
         id: issue
@@ -498,32 +534,82 @@ jobs:
           SHA7: ${{ steps.ctx.outputs.sha7 }}
           SHA: ${{ steps.ctx.outputs.sha }}
           RUN_URL: ${{ steps.ctx.outputs.run_url }}
+          EXISTING: ${{ steps.precap.outputs.existing }}
+          IS_NEW: ${{ steps.precap.outputs.is_new }}
         run: |
           set -euo pipefail
           title="CI failure on dev: ${SHA7}"
-          # gh issue list with --search "in:title" matches loosely; use
-          # exact-title check on the JSON output.
-          existing="$(gh issue list \
-              --state open \
-              --label ci-failure \
-              --search "${title} in:title" \
-              --json number,title \
-              --jq ".[] | select(.title == \"${title}\") | .number" \
-              | head -n1)"
-          if [[ -n "${existing}" ]]; then
-            echo "Found existing issue #${existing}"
-            echo "number=${existing}" >> "$GITHUB_OUTPUT"
+          if [[ "${IS_NEW}" == "false" ]]; then
+            echo "Found existing issue #${EXISTING}"
+            echo "number=${EXISTING}" >> "$GITHUB_OUTPUT"
             echo "created=false"      >> "$GITHUB_OUTPUT"
           else
+            # NOTE: this body intentionally contains `@claude` so the existing
+            # `claude.yml` workflow (which fires on issues.opened with @claude
+            # in the body, from sender HandelSim) picks up the failure and
+            # invokes claude-code-action. The inline failure_invoke_claude
+            # approach (calling the action directly from a push-event workflow)
+            # is unsupported by the action: "Unsupported event type: push".
             body=$(cat <<EOF
-          A CI run on \`dev\` failed at commit [\`${SHA7}\`](https://github.com/${{ github.repository }}/commit/${SHA}).
+          @claude — a CI run on \`dev\` failed at commit [\`${SHA7}\`](https://github.com/${{ github.repository }}/commit/${SHA}).
 
           - Failed run: ${RUN_URL}
           - Triggered by: inline \`failure_triage\` job in the CI workflow
 
-          The auto-fix workflow will append failed-step logs as a comment and
-          (per CLAUDE.md "When triggered by a CI failure") invoke Claude to
-          investigate and push a fix directly to \`dev\`.
+          Please investigate and fix per the "When triggered by a CI failure
+          (label: \`ci-failure\`)" section of CLAUDE.md.
+
+          ## Diagnose before you change anything
+
+          The failed-step log excerpt appended below is **starting** evidence,
+          not ending evidence. Prior auto-fix attempts have stalled by jumping
+          to "what symbol can I change to make the assertion match" instead of
+          asking "what is actually being produced, and why does it disagree."
+
+          Before proposing any fix, do at least these:
+
+          1. **Read the raw output from the failing layer.** Examples:
+             - e2e tmux: dump the per-scenario \`pipe.log\` (\`tests/e2e/lib/run_scenario.py\`
+               writes one via \`tmux pipe-pane\`). \`tmux capture-pane -p\` strips
+               trailing whitespace by default — it can lie about what the TUI
+               actually emitted. The pipe.log does not.
+             - HTTP/proxy: dump the request/response body, not just status.
+             - Container/process: \`docker logs\`, state-dir contents. The e2e
+               job already dumps these on failure — read those artifacts.
+             - Python tests: rerun with \`-x -vv -s\` and read what was printed.
+          2. **Reproduce locally if cheap.** Most harness failures reproduce in
+             a fresh container or checkout. If reproduction is expensive, say
+             so and proceed with log-only analysis.
+          3. **Name the root cause in one sentence before writing any fix.** If
+             you can't, you haven't diagnosed it. "Assertion expected X, got Y"
+             is the symptom; the root cause is *why* Y was produced.
+          4. **Stress-test your fix.** If the fix is "raise timeout / loosen
+             match / add retry," ask whether you've actually understood *why*
+             the original assertion failed. Loosening is a deliberate choice,
+             not a way to make a red light go away.
+
+          ### Anti-patterns from prior failed attempts
+
+          - **Timeout bumping.** If \`wait_for_marker\` times out and the
+            process is alive, the marker is probably wrong, not the timeout.
+          - **Marker rewriting by guesswork.** Don't iterate string variants
+            until one matches; read what was emitted.
+          - **Single-tool tunnel vision.** \`capture-pane\` vs pipe.log can
+            disagree; the disagreement is the clue.
+          - **Retry-as-flake-mask.** A retry is only right with a named
+            transient cause. "Sometimes fails" is the symptom of one.
+
+          ## Then fix it
+
+          With a named root cause, fix the underlying problem and push to
+          \`dev\` via the standard rebase + \`--ff-only\` flow. Close this
+          issue with the fix summary, the root-cause sentence, commit SHA,
+          and a link to the originally-failing run.
+
+          If after investigation the failure falls into the "Must fall back
+          to research-and-propose" list (security-relevant code, public API
+          change, multiple plausible root causes after investigation, etc.),
+          comment your proposal here and stop.
 
           If five attempts on this SHA have already failed, the watcher
           stops triggering and pings @HandelSim for review.
@@ -541,9 +627,13 @@ jobs:
 
       - name: Append failed-step logs to the issue
         if: steps.bot_check.outputs.skip != 'true'
+        id: append_logs
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
           ISSUE: ${{ steps.issue.outputs.number }}
+          IS_NEW: ${{ steps.precap.outputs.is_new }}
+          CAP_OK: ${{ steps.precap.outputs.cap_ok }}
+          ATTEMPT_COUNT: ${{ steps.precap.outputs.attempt_count }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ steps.ctx.outputs.run_url }}
         run: |
@@ -555,8 +645,30 @@ jobs:
           gh run view "${RUN_ID}" --log-failed > "$tmp" 2>&1 || true
           tail_lines=400
           tail -n "${tail_lines}" "$tmp" > "${tmp}.tail"
+          # Decide whether to @-mention claude in this comment.
+          #
+          # - Brand-new issue this run: the @claude mention is already in the
+          #   issue body; `issues.opened` event will fire claude.yml. Don't
+          #   stack a redundant invocation here.
+          # - Existing issue, cap_ok=true: this is the trigger event for a
+          #   rerun on the same SHA — include @claude so the issue_comment
+          #   event fires claude.yml.
+          # - Existing issue, cap_ok=false: cap has been hit. Do NOT include
+          #   @claude. The dedicated "post cap-reached comment" step below
+          #   posts a separate (also @claude-free) "loop disengaged" notice.
+          if [[ "${IS_NEW}" == "true" ]]; then
+            mention=""
+          elif [[ "${CAP_OK}" == "true" ]]; then
+            mention="@claude — retry on this same SHA (prior attempts: ${ATTEMPT_COUNT}). See the new log tail below."
+          else
+            mention=""
+          fi
           {
             echo "<!-- ci-failure-attempt run-${RUN_ID} -->"
+            if [[ -n "${mention}" ]]; then
+              echo "${mention}"
+              echo
+            fi
             echo "### CI failure: run [${RUN_ID}](${RUN_URL})"
             echo
             echo "Tail (\`last ${tail_lines}\` lines) of failed-step logs:"
@@ -567,192 +679,20 @@ jobs:
           } > "${tmp}.comment"
           gh issue comment "${ISSUE}" --body-file "${tmp}.comment"
 
-      - name: Per-SHA attempt cap (max 5)
-        if: steps.bot_check.outputs.skip != 'true'
-        id: cap
+      - name: Post cap-reached notice if cap was hit
+        # When the precap step decided cap_ok=false, post a clearly-labeled
+        # "loop disengaged" comment with NO @claude mention. This is the only
+        # signal to a human reader that the loop has stopped — without it,
+        # the appended log comment alone looks like a normal retry log.
+        if: >-
+          steps.bot_check.outputs.skip != 'true' &&
+          steps.precap.outputs.cap_ok == 'false'
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
           ISSUE: ${{ steps.issue.outputs.number }}
+          ATTEMPT_COUNT: ${{ steps.precap.outputs.attempt_count }}
         run: |
           set -euo pipefail
-          # Count attempt markers on the issue. Each watcher-fired comment
-          # carries `<!-- ci-failure-attempt run-... -->`; that's our
-          # canonical attempt counter (it's what gets logged regardless of
-          # whether Claude was actually invoked, so reruns of the same
-          # failing SHA still count).
-          count="$(gh issue view "${ISSUE}" --json comments \
-              --jq '[.comments[] | select(.body | contains("<!-- ci-failure-attempt"))] | length')"
-          echo "Attempt comments on issue #${ISSUE}: ${count}"
-          if [[ "${count}" -gt 5 ]]; then
-            gh issue comment "${ISSUE}" --body \
-              "**Auto-fix loop disengaged.** Per-SHA attempt cap (5) reached: this SHA has had 5 unsuccessful Claude attempts and the watcher will not invoke a 6th. The loop has stopped — it has NOT silently succeeded. Land a new commit on \`dev\` to reset the cap (a new SHA produces a new issue and a fresh attempt counter), or escalate manually. @HandelSim please review."
-            echo "should_invoke=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_invoke=true"  >> "$GITHUB_OUTPUT"
-          fi
+          gh issue comment "${ISSUE}" --body \
+            "**Auto-fix loop disengaged.** Per-SHA attempt cap (5) reached: ${ATTEMPT_COUNT} unsuccessful Claude attempts on this SHA. The watcher will not fire claude.yml again for this issue. The loop has stopped — it has NOT silently succeeded. Land a new commit on \`dev\` to reset the cap (a new SHA produces a new issue and a fresh attempt counter), or escalate manually. @HandelSim please review."
 
-  failure_invoke_claude:
-    name: Auto-fix on failure (invoke Claude)
-    needs: failure_triage
-    # Use `always()` plus an explicit success check on the dependency. The
-    # previous form (`if: needs.failure_triage.outputs.should_invoke ==
-    # 'true'`) was silently skipping every invocation despite the triage
-    # job logs showing `Set output 'should_invoke'` — job-output
-    # propagation evaluated false here for reasons GitHub Actions didn't
-    # surface. Bypassing job-output propagation entirely by re-checking
-    # the cap inline below is more robust.
-    if: ${{ always() && needs.failure_triage.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
-      issues: write
-      pull-requests: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
-          ref: dev
-
-      - name: Recompute cap guard (inline)
-        # Re-check the per-SHA attempt cap inside this job rather than
-        # trusting a job-output handoff from the triage job. If the issue
-        # for this SHA has reached the cap (or doesn't exist for some
-        # reason), exit this job cleanly without invoking Claude.
-        id: guard
-        env:
-          GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          sha7="${SHA:0:7}"
-          # Find the failure issue for this SHA — the same title pattern
-          # the triage job uses.
-          title="CI failure on dev: ${sha7}"
-          issue="$(gh issue list \
-              --state open \
-              --label ci-failure \
-              --search "${title} in:title" \
-              --json number,title \
-              --jq ".[] | select(.title == \"${title}\") | .number" \
-              | head -n1)"
-          if [[ -z "${issue}" ]]; then
-            echo "No failure issue found for SHA ${SHA7}; nothing to invoke for."
-            echo "should_invoke=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "issue_number=${issue}" >> "$GITHUB_OUTPUT"
-          count="$(gh issue view "${issue}" --json comments \
-              --jq '[.comments[] | select(.body | contains("<!-- ci-failure-attempt"))] | length')"
-          echo "Attempt comments on issue #${issue}: ${count}"
-          if [[ "${count}" -gt 5 ]]; then
-            echo "Cap reached (${count} attempts); skipping invoke."
-            echo "should_invoke=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Cap OK (${count} attempts); will invoke."
-            echo "should_invoke=true"  >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run Claude (auto-fix mode)
-        if: steps.guard.outputs.should_invoke == 'true'
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
-          base_branch: dev
-          branch_prefix: 'agent/'
-          track_progress: true
-          prompt: |
-            A CI test failed on `dev`. Operate per the
-            "When triggered by a CI failure (label: `ci-failure`)"
-            section of CLAUDE.md.
-
-            Context:
-            - Issue: #${{ steps.guard.outputs.issue_number }}
-            - Repository: ${{ github.repository }}
-            - Dev SHA at failure: ${{ github.sha }}
-            - Failed CI run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            ## Diagnose before you change anything
-
-            The failed-step log excerpt in the issue is **starting** evidence,
-            not ending evidence. Past auto-fix runs have failed because they
-            jumped to "what symbol in the log can I change to make the
-            assertion match" instead of asking "what is actually being
-            produced, and why does it disagree with the assertion."
-
-            Before proposing any fix, do at least these:
-
-            1. **Read the raw output from the failing layer, not just the
-               assertion message.** Examples of what "raw" means:
-                 - For e2e tmux tests: dump the per-scenario `pipe.log` byte
-                   stream (`tests/e2e/lib/run_scenario.py` writes one with
-                   `tmux pipe-pane`). `tmux capture-pane -p` strips trailing
-                   whitespace and collapses styling, so it can lie about
-                   what the TUI emitted. The pipe.log does not.
-                 - For HTTP/proxy tests: dump the request/response body,
-                   not just the status code.
-                 - For container/process tests: dump the container logs
-                   (`docker logs`, `journalctl`) and any state-dir contents
-                   the test produced. The harness e2e job already does this
-                   on failure; **read those artifacts** before changing code.
-                 - For Python tests: run with `-x -vv -s` locally and read
-                   what was actually printed.
-            2. **Reproduce locally if reproduction is cheap** (under ~5 min
-               to set up). Most harness test failures reproduce in a fresh
-               container or a fresh checkout. If reproduction is expensive,
-               state that and proceed with log-only analysis.
-            3. **Name the root cause in one sentence before writing any
-               fix.** If you can't, you haven't diagnosed it — keep reading.
-               "The assertion expects X but got Y" is not a root cause; the
-               root cause is *why* Y was produced.
-            4. **Stress-test your fix against the evidence.** If your fix is
-               "change the assertion / increase the timeout / loosen the
-               match," ask whether you've actually understood why the
-               original assertion failed. Loosening a check should be a
-               deliberate decision, not a way to make the failure go away.
-
-            ### Anti-patterns to avoid
-
-            These are real failure modes from prior auto-fix attempts.
-            If you catch yourself doing one of these, stop and re-read
-            the raw evidence:
-
-            - **Timeout bumping.** If a `wait_for_marker` times out and the
-              process is clearly alive, the marker is probably wrong, not
-              the timeout. Read the captured pane (and the pipe.log byte
-              stream) before raising `timeout_s`.
-            - **Marker rewriting by guesswork.** Don't try variants of an
-              expected string until one matches. Look at what was actually
-              emitted and write the marker against that.
-            - **Single-tool tunnel vision.** If `tmux capture-pane` shows
-              one thing and the test still fails, check what other capture
-              paths (the pipe.log, `docker logs`, the agent's own stderr)
-              say. They can disagree, and the disagreement is the clue.
-            - **Adding retries to mask flakes.** A retry is only correct
-              when you've identified a transient cause (network blip,
-              clock-skew, etc.). "Sometimes it fails" is not a transient
-              cause; it's a symptom of one.
-
-            ## Then fix it
-
-            Once you have a named root cause, fix the underlying problem
-            and push to `dev` via the standard rebase + `--ff-only` flow.
-            Close the issue with: the fix summary, the root cause sentence
-            from step 3, the commit SHA, and a link to the originally
-            failing run.
-
-            If after full investigation the failure falls into the
-            "Must fall back to research-and-propose" list (security-relevant
-            code, public API change, multiple plausible root causes after
-            investigation, etc.), comment your proposal on the issue and
-            stop — do not push.
-
-            The 5-attempt-per-SHA cap is enforced upstream by the watcher,
-            but you should still self-cap as instructed in CLAUDE.md.
-          claude_args: |
-            --model claude-opus-4-7
-            --dangerously-skip-permissions
-            --allowedTools "Bash,Read,Edit,Write,MultiEdit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,NotebookRead,NotebookEdit"
