@@ -361,7 +361,7 @@ Each newly-introduced item is annotated with a marker comment
 
 ```
 $ harness upgrade --check         # preview only (no git pull, no writes)
-$ harness upgrade --no-prompt     # apply without the [Y/n] prompt
+$ harness upgrade --no-prompt     # apply without the [y/n] prompt
 $ harness upgrade --no-restart    # apply without down/start (e.g. CI)
 ```
 

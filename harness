@@ -656,7 +656,7 @@ warn_if_firewall_open() {
     fi
 
     local ans
-    printf 'Continue starting %s? [y/N]: ' "$tool" >&2
+    printf 'Continue starting %s? [y/n]: ' "$tool" >&2
     if ! IFS= read -r ans </dev/tty; then
         err "no input received; aborting"
         return 1
@@ -1052,7 +1052,7 @@ cmd_update() {
     git pull --ff-only
 }
 
-# Y/n confirmation prompt for cmd_upgrade. Reads from /dev/tty by default
+# y/n confirmation prompt for cmd_upgrade. Reads from /dev/tty by default
 # to insulate the prompt from any stdin/terminal residue left by upstream
 # subprocesses. On Windows Git Bash the harness_jq Docker fallback runs
 # `docker.exe -i` immediately before this prompt; docker.exe interacts
@@ -1178,7 +1178,7 @@ EOF
 
     if (( ! no_prompt )); then
         if [[ -t 0 ]]; then
-            if ! _upgrade_confirm "Apply these upgrade actions? [Y/n]: "; then
+            if ! _upgrade_confirm "Apply these upgrade actions? [y/n]: "; then
                 echo "harness: aborted by user"
                 return 1
             fi
@@ -2499,7 +2499,7 @@ cmd_mcp_uninstall() {
     if (( ! force )); then
         local ans
         printf 'this will stop and remove the active config for %s. ' "$name" >&2
-        printf 'data dir at %s/data will be preserved. continue? [y/N]: ' "$dest" >&2
+        printf 'data dir at %s/data will be preserved. continue? [y/n]: ' "$dest" >&2
         if [[ -t 0 ]]; then
             read -r ans </dev/tty
         else

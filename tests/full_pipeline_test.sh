@@ -164,7 +164,7 @@ PUBLISH_OLLAMA_PORT=
 MOCK_SCENARIO=text
 EOF
 
-# harness-install.sh prompts: continue? [y/N], add to PATH? [Y/n]. Send y, y.
+# harness-install.sh prompts: continue? [y/n], add to PATH? [y/n]. Send y, y.
 # harness-install.sh installs into $(pwd) — must cd into TEST_ROOT first.
 (
     cd "${TEST_ROOT}"
