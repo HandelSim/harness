@@ -220,6 +220,90 @@ fi
 
 echo "[harness-test] T0 OK"
 
+# --- Test 0.4: _probe_upstream_auth response parsing ------------------------
+#
+# Regression for #43: the 401/403 branch over-fired (rc=1 on every 401, not
+# just locked-key 401s) and threw away the upstream response body, so a
+# transient non-lock 401 hard-failed every agent launch and gave the user
+# no diagnostic information. Fix scopes rc=1 to "unlock URL was actually
+# recovered" and softens other 401/403 to rc=2 (warn-and-proceed) with the
+# full upstream body dumped.
+#
+# These cases stub `curl` in a subshell so we can drive the parsing logic
+# with deterministic fixtures and assert on (rc, stderr contents).
+
+echo "[harness-test] T0.4: _probe_upstream_auth response parsing"
+
+probe_case() {
+    local label="$1" status="$2" fixture_body="$3" expected_rc="$4"
+    shift 4
+    local rc=0 out
+    out=$(
+        HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+        export PROXY_API_URL=http://probe.invalid/v1/chat/completions
+        export PROXY_API_KEY=test-key
+        export PROXY_API_MODEL=test-model
+        # Stub curl: emit fixture body + the synthetic status marker the
+        # probe parses out of curl -w. _probe_upstream_auth captures stderr
+        # via 2>&1, so writing only to stdout is fine.
+        curl() {
+            printf '%s\n__HTTP_STATUS__%s' "$fixture_body" "$status"
+        }
+        _probe_upstream_auth 2>&1
+    ) || rc=$?
+    if [[ "$rc" != "$expected_rc" ]]; then
+        echo "[harness-test] T0.4 FAIL [$label]: expected rc=${expected_rc}, got ${rc}" >&2
+        echo "$out" >&2
+        exit 1
+    fi
+    local needle
+    for needle in "$@"; do
+        if ! grep -qF -- "$needle" <<<"$out"; then
+            echo "[harness-test] T0.4 FAIL [$label]: expected output to contain: $needle" >&2
+            echo "--- captured output ---" >&2
+            echo "$out" >&2
+            echo "--- end ---" >&2
+            exit 1
+        fi
+    done
+}
+
+# 200 → rc=0, no output banner.
+probe_case "200 → rc=0" "200" '{"choices":[{"message":{"content":"."}}]}' "0"
+
+# 401 with .error.unlock_url + .error.message + .error.type → rc=1, prints
+# unlock banner with all three structured fields plus raw body.
+LOCKED_BODY='{"error":{"type":"unauthorized","message":"API key locked - visit the unlock URL to re-enable your key","unlock_url":"https://example.test/unlock/abc123"}}'
+probe_case "401 locked-key → rc=1 with URL + message + type" "401" "$LOCKED_BODY" "1" \
+    "ERROR: Upstream API key is locked" \
+    "https://example.test/unlock/abc123" \
+    "API key locked - visit the unlock URL to re-enable your key" \
+    "unauthorized" \
+    "Full upstream response body:"
+
+# 401 with no unlock URL → rc=2 (warn-and-proceed), output dumps body and
+# mentions the bypass env var. This is the #43 regression case: previously
+# this returned rc=1 and blocked every agent launch.
+NOLOCK_BODY='{"error":{"type":"invalid_request","message":"bad model name"}}'
+probe_case "401 no-URL → rc=2 (warn, do not block)" "401" "$NOLOCK_BODY" "2" \
+    "WARN: upstream returned 401" \
+    "no" \
+    "unlock URL was found" \
+    "bad model name" \
+    "invalid_request" \
+    "HARNESS_SKIP_AUTH_PROBE=1"
+
+# Top-level unlock_url (alt provider shape) also triggers the rc=1 path.
+TOP_LEVEL_BODY='{"unlock_url":"https://example.test/unlock/top","message":"locked"}'
+probe_case "401 top-level unlock_url → rc=1" "401" "$TOP_LEVEL_BODY" "1" \
+    "https://example.test/unlock/top"
+
+# 5xx → rc=2 warn-and-proceed (unchanged by this fix, asserted for safety).
+probe_case "500 → rc=2" "500" "internal server error" "2" \
+    "WARN: upstream returned 500"
+
+echo "[harness-test] T0.4 OK"
+
 # --- Test 1: harness start brings services up -------------------------------
 
 echo "[harness-test] T1: harness start"
