@@ -450,7 +450,7 @@ echo user >"${T7_DIR}/tgt/data/user.txt"
 [[ "$(cat "${T7_DIR}/tgt/data/user.txt")" == "user" ]] || fail "T7: fallback did not preserve data/"
 ok "T7: rsync-fallback shell loop produces identical result"
 
-# === Test 8: cmd_upgrade Y/n confirmation helper =========================
+# === Test 8: cmd_upgrade y/n confirmation helper =========================
 #
 # Issue #18: on Windows Git Bash, the upgrade prompt would hang on "n"
 # because the harness_jq Docker fallback (docker.exe -i) leaves the

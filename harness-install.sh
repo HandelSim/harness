@@ -331,13 +331,13 @@ preflight
 
 # --- prompts ----------------------------------------------------------------
 
-read -rp "continue? [y/N]: " ans
+read -rp "continue? [y/n]: " ans
 case "${ans:-}" in
     y|Y|yes|YES) ;;
     *) echo "aborted."; exit_or_return 0 ;;
 esac
 
-read -rp "add 'harness' to PATH (recommended)? [Y/n]: " path_ans
+read -rp "add 'harness' to PATH (recommended)? [y/n]: " path_ans
 case "${path_ans:-}" in
     n|N|no|NO) want_path=0 ;;
     *) want_path=1 ;;
