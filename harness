@@ -671,16 +671,27 @@ warn_if_firewall_open() {
 
 # Probe the upstream API to verify the key is valid and unlocked. Returns:
 #   0 — key works, proceed
-#   1 — key is locked or invalid, do not proceed
-#   2 — upstream unhealthy (timeout, 5xx) — warn but allow proceed
-# When the key is locked, prints the unlock URL prominently to the user.
+#   1 — upstream returned 401/403 AND an unlock URL was recovered from the
+#       response body; printed prominently. The user must visit the URL
+#       before the agent can launch.
+#   2 — upstream unhealthy or returned a non-actionable error (5xx, 429,
+#       network failure, OR a 401/403 with no unlock URL we can show the
+#       user). Warn but allow proceed; the proxy will surface the real
+#       error on the first agent request if auth really is broken.
 #
-# Why a host-side probe instead of letting the proxy retry: the upstream's
-# unlock_url requires an authenticated browser session (the user must be
-# signed into the provider's web console). The proxy's GET to it returns
-# 200 but the server-side key state is unchanged. So the only thing we can
-# usefully do is *tell the user* the URL and exit; the user clicks through
-# in a browser, then re-runs harness start.
+# Why the rc=1 path is so narrow: the probe exists to convert a locked-key
+# 401 into a clickable URL. The unlock URL requires an authenticated
+# browser session — the proxy's GET returns 200 but doesn't change
+# server-side state. So the probe's only useful output is the URL itself;
+# everything else is just guessing about an opaque upstream response. If
+# we can't deliver a URL, we get out of the way and let the proxy report
+# whatever it sees.
+#
+# Why we always dump the response body on a 401/403: providers vary in
+# how they shape error responses, and an unlock_url under an unexpected
+# JSON path is unhelpfully invisible. Printing the raw body means the
+# user can always see what came back, even if our field extraction
+# missed something.
 _probe_upstream_auth() {
     local api_url="${PROXY_API_URL:-}"
     local api_key="${PROXY_API_KEY:-}"
@@ -727,22 +738,41 @@ _probe_upstream_auth() {
             return 0
             ;;
         401|403)
-            local unlock_url=""
+            # Provider error shapes vary. Try Anthropic-style nesting
+            # (.error.unlock_url), the metadata variant, and a top-level
+            # fallback. Same for type/message. jq is preferred when present;
+            # the grep fallback handles well-formed JSON when host jq is
+            # absent (common on Windows Git Bash).
+            local unlock_url="" err_type="" err_message=""
             if command -v jq >/dev/null 2>&1; then
-                unlock_url=$(jq -r '.error.unlock_url // empty' <<<"$body" 2>/dev/null || true)
+                unlock_url=$(jq -r '.error.unlock_url // .error.metadata.unlock_url // .unlock_url // empty' <<<"$body" 2>/dev/null || true)
+                err_type=$(jq -r '.error.type // .type // empty' <<<"$body" 2>/dev/null || true)
+                err_message=$(jq -r '.error.message // .message // empty' <<<"$body" 2>/dev/null || true)
             fi
             if [[ -z "$unlock_url" ]]; then
-                # crude grep fallback when jq isn't on host or jq couldn't parse
                 unlock_url=$(grep -oE '"unlock_url"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$body" \
                     | head -1 \
                     | sed 's/"unlock_url"[[:space:]]*:[[:space:]]*"\(.*\)"/\1/')
             fi
+            if [[ -z "$err_message" ]]; then
+                err_message=$(grep -oE '"message"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$body" \
+                    | head -1 \
+                    | sed 's/"message"[[:space:]]*:[[:space:]]*"\(.*\)"/\1/')
+            fi
+            if [[ -z "$err_type" ]]; then
+                err_type=$(grep -oE '"type"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"$body" \
+                    | head -1 \
+                    | sed 's/"type"[[:space:]]*:[[:space:]]*"\(.*\)"/\1/')
+            fi
 
-            echo "" >&2
-            echo "================================================================" >&2
-            echo " ERROR: Upstream API key is locked or invalid" >&2
-            echo "================================================================" >&2
             if [[ -n "$unlock_url" ]]; then
+                # Actionable lockout: deliver the URL, abort the launch.
+                echo "" >&2
+                echo "================================================================" >&2
+                echo " ERROR: Upstream API key is locked" >&2
+                echo "================================================================" >&2
+                [[ -n "$err_type" ]]    && echo " upstream error type: $err_type" >&2
+                [[ -n "$err_message" ]] && echo " upstream message:    $err_message" >&2
                 echo "" >&2
                 echo " Visit this URL in your browser to unlock the key:" >&2
                 echo "" >&2
@@ -751,14 +781,31 @@ _probe_upstream_auth() {
                 echo " You must be signed in to the provider's web console for" >&2
                 echo " the unlock to take effect. After unlocking, run:" >&2
                 echo "   harness start" >&2
-            else
                 echo "" >&2
-                echo " The upstream returned $status_code. Verify PROXY_API_KEY in:" >&2
-                echo "   ${install_root}/.env" >&2
+                echo " Full upstream response body:" >&2
+                printf '%s\n' "$body" | sed 's/^/   /' >&2
+                echo "================================================================" >&2
+                echo "" >&2
+                return 1
             fi
-            echo "================================================================" >&2
+
+            # 401/403 with no recoverable unlock URL — not the locked-key
+            # signature this probe gates on. Warn loudly, dump everything,
+            # and let the launch continue. The proxy will surface the real
+            # error on the first agent request if auth genuinely is broken.
             echo "" >&2
-            return 1
+            echo "[harness] WARN: upstream returned $status_code on the auth probe, but no" >&2
+            echo "[harness]       unlock URL was found in the response body. This is not" >&2
+            echo "[harness]       the locked-key signature the probe gates on, so the" >&2
+            echo "[harness]       launch will continue and the proxy will surface the" >&2
+            echo "[harness]       real error on the first agent request if auth is broken." >&2
+            [[ -n "$err_type" ]]    && echo "[harness]       upstream error type: $err_type" >&2
+            [[ -n "$err_message" ]] && echo "[harness]       upstream message:    $err_message" >&2
+            echo "[harness]       Full upstream response body:" >&2
+            printf '%s\n' "$body" | sed 's/^/[harness]         /' >&2
+            echo "[harness]       To bypass this probe entirely, set HARNESS_SKIP_AUTH_PROBE=1." >&2
+            echo "" >&2
+            return 2
             ;;
         429)
             echo "[harness] WARN: upstream rate-limited (429); starting anyway" >&2
