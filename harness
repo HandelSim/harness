@@ -2416,7 +2416,29 @@ cmd_mcp_install() {
                 # Fatal on failure: the compose snippet build context points
                 # at this path, so 'harness start' would fail later anyway —
                 # better to fail loudly here than report a successful install.
-                if ! git clone --depth=1 --branch "$clone_ref" "$clone_url" "$clone_dir_local"; then
+                #
+                # `git clone --branch` accepts only branch/tag names. For
+                # full 40-char commit SHAs (reproducibility pins), use
+                # init + fetch <sha> + checkout FETCH_HEAD instead. Short
+                # SHAs fall through to the --branch path and fail there
+                # (smart-http fetch protocol requires full SHAs).
+                local clone_ok=0
+                if [[ "$clone_ref" =~ ^[0-9a-f]{40}$ ]]; then
+                    if ( set -e
+                         mkdir -p "$clone_dir_local"
+                         cd "$clone_dir_local"
+                         git init -q
+                         git remote add origin "$clone_url"
+                         git fetch --depth=1 origin "$clone_ref"
+                         git checkout -q FETCH_HEAD ); then
+                        clone_ok=1
+                    fi
+                else
+                    if git clone --depth=1 --branch "$clone_ref" "$clone_url" "$clone_dir_local"; then
+                        clone_ok=1
+                    fi
+                fi
+                if [[ $clone_ok -ne 1 ]]; then
                     err "$name: repo clone failed (target: $clone_dir_local)"
                     err "         clone URL: $clone_url ($clone_ref)"
                     err "         install aborted; retry with 'harness mcp install $name --force' once resolved"
