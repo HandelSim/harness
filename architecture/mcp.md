@@ -27,6 +27,17 @@ Every registry entry under `mcp-registry/<name>/` has:
   a full 40-character SHA; short SHAs are not supported (git's smart-http
   fetch protocol rejects them). Branch/tag refs use a depth-1 clone; full
   SHAs use `git init` + `git fetch --depth=1 <sha>` + checkout `FETCH_HEAD`.
+
+## Pin policy for registry entries
+
+Registry entries with a `repo_clone_url` SHOULD pin `repo_clone_ref` to
+an upstream release tag (e.g. `v1.3.0`) rather than tracking `main`.
+Tracking `main` makes the harness integration test a moving target —
+upstream churn lands here as flaky CI even when nothing in this repo
+changed. Pinning to a tag gives reproducible builds and turns "bump
+this MCP" into an explicit, reviewable commit. Bump on a cadence (or
+when upstream cuts a tag with a fix we need). The reference example
+`mcp-registry/serena/` follows this — pinned to `v1.3.0`.
 - **`README.md`** — what the service does, what it mounts, security
   notes. Operator-facing.
 
