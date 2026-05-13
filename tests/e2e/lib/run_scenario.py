@@ -137,20 +137,23 @@ def wait_for_marker(name: str, marker: str, timeout_s: int = 30) -> bool:
 
 
 def wait_stable(name: str, stable_ms: int = 1000, timeout_s: int = 60) -> bool:
+    # Track the stability window against the wall clock too — capture()
+    # + sha256() can be slow on a busy CI runner, and adding interval_ms
+    # per iteration regardless of wall cost makes the function declare
+    # "stable" sooner than the requested window actually elapsed.
     deadline = time.monotonic() + timeout_s
-    stable_seen_ms = 0
+    stable_start = time.monotonic()
     prev_hash = ""
-    interval_ms = 200
+    interval_s = 0.2
     while time.monotonic() < deadline:
         cur_hash = hashlib.sha256(capture(name).encode("utf-8")).hexdigest()
         if cur_hash == prev_hash:
-            stable_seen_ms += interval_ms
-            if stable_seen_ms >= stable_ms:
+            if (time.monotonic() - stable_start) * 1000 >= stable_ms:
                 return True
         else:
-            stable_seen_ms = 0
             prev_hash = cur_hash
-        time.sleep(interval_ms / 1000.0)
+            stable_start = time.monotonic()
+        time.sleep(interval_s)
     return False
 
 

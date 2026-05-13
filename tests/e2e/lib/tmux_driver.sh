@@ -151,13 +151,16 @@ e2e_wait_for_marker() {
     local name="$1"
     local marker="$2"
     local timeout="${3:-30}"
-    local elapsed=0
-    while [[ $elapsed -lt $timeout ]]; do
+    # Track wall-clock seconds. The earlier version counted `+1` per
+    # `sleep 0.5` iteration, so the loop expired at ~half the requested
+    # timeout and also ignored capture/grep wall time.
+    local start_ts
+    start_ts=$(date +%s)
+    while (( $(date +%s) - start_ts < timeout )); do
         if e2e_capture "$name" | grep -qF "$marker"; then
             return 0
         fi
         sleep 0.5
-        elapsed=$((elapsed + 1))
     done
     echo "TIMEOUT waiting for marker '$marker' in session $name" >&2
     return 1
@@ -175,24 +178,34 @@ e2e_wait_stable() {
     local name="$1"
     local stable_ms="${2:-1000}"
     local timeout="${3:-60}"
-    local elapsed=0
-    local stable_seen_ms=0
+    # Track both the overall timeout and the stability window against the
+    # wall clock. `e2e_capture` + `sha256sum` can be slow on a busy CI
+    # runner, and the prior implementation counted only the `sleep 0.2`
+    # interval per iteration — so the overall timeout overran wall time
+    # and the stability window declared "stable" sooner than it really was.
+    # Requires GNU `date +%s%N`; the e2e suite runs on Linux only.
+    local timeout_ms=$((timeout * 1000))
+    local start_ns now_ns
+    start_ns=$(date +%s%N)
+    local stable_start_ns=$start_ns
     local prev_hash=""
-    local interval_ms=200
-    while [[ $elapsed -lt $((timeout * 1000)) ]]; do
+    while :; do
+        now_ns=$(date +%s%N)
+        if (( (now_ns - start_ns) / 1000000 >= timeout_ms )); then
+            break
+        fi
         local cur_hash
         cur_hash=$(e2e_capture "$name" | sha256sum | cut -d' ' -f1)
         if [[ "$cur_hash" == "$prev_hash" ]]; then
-            stable_seen_ms=$((stable_seen_ms + interval_ms))
-            if [[ $stable_seen_ms -ge $stable_ms ]]; then
+            now_ns=$(date +%s%N)
+            if (( (now_ns - stable_start_ns) / 1000000 >= stable_ms )); then
                 return 0
             fi
         else
-            stable_seen_ms=0
             prev_hash="$cur_hash"
+            stable_start_ns=$(date +%s%N)
         fi
         sleep 0.2
-        elapsed=$((elapsed + interval_ms))
     done
     echo "TIMEOUT waiting for stable output in session $name" >&2
     return 1
