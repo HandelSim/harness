@@ -21,9 +21,12 @@ __pycache__/
 *.stackdump
 
 # Local Claude Code state (lock files for skill scheduling, etc.).
-# Default-deny everything under .claude/, then allow checked-in config and
-# skills back in. New runtime files default to ignored without a list change.
+# Default-deny everything under .claude/, then allow checked-in config,
+# skills, and agent reference docs back in. New runtime files default to
+# ignored without a list change.
 .claude/*
 !.claude/settings.json
 !.claude/skills/
 !.claude/skills/**
+!.claude/references/
+!.claude/references/**
