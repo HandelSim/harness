@@ -928,19 +928,7 @@ test_section "Phase 1: stack setup with mock upstream"
 phase_1_stack_setup
 
 test_section "Phase 2: Serena (HTTP MCP) end-to-end"
-# Phase 2 (serena) is currently skipped pending #39. The upstream oraios/serena
-# main is crashing on startup inside the harness compose+volume+env setup
-# (issue #38 captured the symptom — exit 1 in restart loop, never reaches
-# healthcheck start_period). Local repro of the current upstream HEAD runs
-# clean, so we don't yet have a confirmed pin target. The new
-# test_wait_for_healthy diagnostic will produce serena stderr on the next
-# unskipped failure. Set HARNESS_INTEGRATION_RUN_SERENA=1 to opt back in
-# locally; CI keeps it off until #39 closes.
-if [[ "${HARNESS_INTEGRATION_RUN_SERENA:-0}" == "1" ]]; then
-    phase_2_serena
-else
-    echo "[integration] Phase 2: SKIPPED (#39); set HARNESS_INTEGRATION_RUN_SERENA=1 to enable"
-fi
+phase_2_serena
 
 test_section "Phase 3: Graphify (skill) end-to-end"
 phase_3_graphify
