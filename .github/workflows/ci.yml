@@ -468,30 +468,19 @@ jobs:
           echo "sha7=${SHA:0:7}"      >> "$GITHUB_OUTPUT"
           echo "run_url=${run_url}"   >> "$GITHUB_OUTPUT"
 
-      - name: Skip if last dev commit was bot-authored
-        # If the most recent commit on dev is from the auto-fix loop, that
-        # means a Claude run is already in flight or just landed. Re-firing
-        # would race or stack a redundant attempt; bail out and let the
-        # next push (which will produce a new SHA + new issue) handle it.
-        id: bot_check
-        run: |
-          author_email="$(git log -1 --pretty='%ae' "${{ steps.ctx.outputs.sha }}")"
-          author_name="$(git log -1 --pretty='%an' "${{ steps.ctx.outputs.sha }}")"
-          echo "Last commit author: ${author_name} <${author_email}>"
-          if [[ "${author_email}" == *"claude[bot]"* ]] \
-              || [[ "${author_email}" == *"users.noreply.github.com"* && "${author_name}" == *"claude"* ]] \
-              || [[ "${author_name}" == "claude[bot]" ]]; then
-            echo "skip=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Check cap on any existing issue for this SHA
         # Run cap-counting BEFORE issue creation so we can gate the @claude
         # mention. If we let create/append run first and only checked the
         # cap afterwards, we'd already have fired claude.yml on the cap-
         # exceeded path. Output `cap_ok` is consumed by every step below.
-        if: steps.bot_check.outputs.skip != 'true'
+        #
+        # NOTE: there used to be a "Skip if last dev commit was bot-authored"
+        # step ahead of this one. It killed the self-healing loop: once
+        # claude[bot] lands ANY commit on dev (which it does whenever the
+        # auto-fix flow succeeds at pushing), every subsequent CI failure on
+        # dev was silently dropped and no issue was ever created. The cap
+        # below (5 attempts per SHA) is the only runaway guard we need —
+        # each new push produces a new SHA with a fresh cap. See issue #49.
         id: precap
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
@@ -527,7 +516,6 @@ jobs:
           fi
 
       - name: Find or create the failure issue
-        if: steps.bot_check.outputs.skip != 'true'
         id: issue
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
@@ -626,7 +614,6 @@ jobs:
           fi
 
       - name: Append failed-step logs to the issue
-        if: steps.bot_check.outputs.skip != 'true'
         id: append_logs
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
@@ -684,9 +671,7 @@ jobs:
         # "loop disengaged" comment with NO @claude mention. This is the only
         # signal to a human reader that the loop has stopped — without it,
         # the appended log comment alone looks like a normal retry log.
-        if: >-
-          steps.bot_check.outputs.skip != 'true' &&
-          steps.precap.outputs.cap_ok == 'false'
+        if: steps.precap.outputs.cap_ok == 'false'
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
           ISSUE: ${{ steps.issue.outputs.number }}
