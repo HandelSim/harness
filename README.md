@@ -209,7 +209,9 @@ containing:
   to git-clone the upstream repo into `state/mcp/<name>/repo/`; the
   compose snippet then uses `${INSTALL_ROOT}/state/mcp/<name>/repo` as
   the build context. (Avoids docker's git-URL build-context handling,
-  which fails on Windows.)
+  which fails on Windows.) `repo_clone_ref` may be a branch name, a tag,
+  or a full 40-character commit SHA; short SHAs are not supported (git's
+  smart-http fetch protocol rejects them).
 - `README.md` — what the MCP does and any required env vars.
 
 See `mcp-registry/serena/` as the reference example. Submit a PR to add

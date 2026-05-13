@@ -23,7 +23,10 @@ Every registry entry under `mcp-registry/<name>/` has:
   `harness mcp install` git-clone the upstream repo into
   `state/mcp/<name>/repo/`; the compose snippet then uses that as the
   local build context. Avoids docker's git-URL build-context handling,
-  which fails on Windows.
+  which fails on Windows. `repo_clone_ref` accepts a branch, a tag, or
+  a full 40-character SHA; short SHAs are not supported (git's smart-http
+  fetch protocol rejects them). Branch/tag refs use a depth-1 clone; full
+  SHAs use `git init` + `git fetch --depth=1 <sha>` + checkout `FETCH_HEAD`.
 - **`README.md`** — what the service does, what it mounts, security
   notes. Operator-facing.
 
