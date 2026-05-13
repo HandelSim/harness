@@ -1,0 +1,160 @@
+# `harness` CLI
+
+The `harness` bash script is the management entrypoint. ~4200 lines, one
+file. Symlinked into `~/.local/bin/harness` by `harness-install.sh`; users
+invoke it from anywhere.
+
+## Self-locate and install-root resolution
+
+The script resolves `$0` through any wrapper or symlink using a portable
+realpath (so it works on Windows Git Bash too) to find:
+
+- **`clone_dir`** — where the code lives (this script + `docker-compose.yml`
+  + `scripts/`).
+- **`install_root`** — where user config (`.env`, `.harness-allowlist`) and
+  runtime state (`state/`) live.
+
+In production these are the same directory: `harness-install.sh` clones
+the repo and that clone IS the install root. Tests set
+`HARNESS_INSTALL_ROOT` to a tmpdir to keep `clone_dir` resolved to the
+real repo while pointing `install_root` somewhere disposable.
+
+The portable resolver is duplicated inline here rather than depending on
+`realpath`; the full equivalent lives in `scripts/lib/platform.sh` as
+`harness_realpath`.
+
+## Env loading
+
+The script sources `.env` into its own shell (`set -a; source; set +a`)
+so it can read values like `PUBLISH_OLLAMA_PORT`, `OLLAMA_AGENT_MODEL`,
+`HARNESS_EXTRA_MOUNTS` for its own logic. `docker compose` gets `.env`
+separately via `--env-file`. The two consumers are independent.
+
+## Subcommand surface
+
+`cmd_help` is the source of truth for the user-facing subcommand list.
+The implementation has one `cmd_<name>` function per subcommand:
+
+| Group | Subcommands |
+|---|---|
+| Lifecycle | `start`, `down`, `restart`, `logs`, `unlock` |
+| Update / upgrade | `update`, `upgrade`, `check-updates` |
+| Agent launch | `claude`, `opencode`, `shell`, `list`, `stop`, `claude-statusline-config` |
+| Diagnostics | `doctor`, `preflight`, `help` |
+| Test / bench | `test`, `benchmark` |
+| Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
+| MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
+
+Agent-launch flags (`--yolo`, `--net`, `--mount`, `-p/--print`) are parsed
+inside `cmd_claude` / `cmd_opencode` / `cmd_shell` rather than centrally;
+they decide the `docker run` invocation, not compose flags.
+
+## Compose wrapper (`compose()`)
+
+`compose()` is the single entry point for any `docker compose` / `podman
+compose` invocation. It:
+
+1. Calls `write_runtime_override` (next section) to (re)generate
+   `state/.harness-runtime.yml`.
+2. Builds an args list: `--project-name`, the main `docker-compose.yml`,
+   the runtime override (if non-empty), and any active MCP compose
+   snippets discovered via `mcp_compose_files`.
+3. Exports `INSTALL_ROOT`, `HARNESS_ALLOWLIST_PATH`, `HARNESS_PROJECTS_ROOT`
+   so MCP compose snippets can reference them with plain `${VAR}` (no
+   defaults).
+4. Invokes the detected container runtime (`docker` or `podman`, per
+   `scripts/lib/platform.sh:harness_container_runtime`).
+
+Project name is fixed (`harness`) but overridable for tests via
+`HARNESS_PROJECT_NAME` so `harness_test.sh` doesn't collide with a real
+instance on the same daemon.
+
+## Runtime override (`write_runtime_override`)
+
+`state/.harness-runtime.yml` is regenerated on every compose invocation
+and never tracked. It carries two things:
+
+1. **`PUBLISH_OLLAMA_PORT`** — when set in `.env`, exposes ollama on the
+   host. Default is internal-only.
+2. **Per-service firewall opt-out** — for every service with
+   `firewall_disabled: true` in `state/.harness-net-overrides.json`, an
+   `environment: HARNESS_FIREWALL_DISABLED: "1"` block is emitted. The
+   firewall init script short-circuits on that variable. We never replace
+   the service's entrypoint or remove its `cap_add`.
+
+The `agent` pseudo-service is filtered out: agent containers are launched
+by direct `docker run` from `cmd_claude` / `cmd_opencode` / `cmd_shell`,
+not by compose. The agent launch path reads `.harness-net-overrides.json`
+directly.
+
+If both sources are empty, the file is deleted rather than written empty
+so compose doesn't see a phantom services block.
+
+## Agent launch path
+
+`cmd_claude` / `cmd_opencode` / `cmd_shell` do NOT go through compose.
+They each:
+
+1. Parse agent flags (`--yolo`, `--net`, `--mount`, `-p/--print`).
+2. Compute mounts: CWD at the same absolute path, plus extras from
+   `--mount` and `HARNESS_EXTRA_MOUNTS` (deduped, validated, refused if
+   under container infra paths like `/etc`, `/usr`, `/home/harness`).
+3. Compose `--cap-add NET_ADMIN`, `--cap-add NET_RAW`, the allowlist
+   read-only mount, network `--network harness_harness-net`, and a hash-
+   derived container name.
+4. `docker run` the unified agent image (`harness-agent:latest`) with the
+   mode arg (`claude`, `opencode`, or `shell`) and any forwarded flags.
+
+The hash-derived container name (one per host CWD) is why relaunching
+from the same directory refuses to start a second copy.
+
+## Update-available banner
+
+`_update_check_and_banner` runs synchronously on every agent launch with
+a tight (4s) timeout against `origin/main`. It caches the last successful
+remote HEAD in `state/.harness-update-check` so users on flaky networks
+still get the banner. Skipped entirely when `HARNESS_SKIP_UPDATE_CHECK=1`,
+when not in a git checkout, or when not on `main`. Advisory only — never
+gates a launch.
+
+`cmd_check_updates` runs the same check in the foreground with a longer
+budget for an explicit "am I up to date?" query.
+
+## `harness_jq` fallback
+
+The script uses `jq` to parse `scripts/upgrade-manifest.json` and the
+net-overrides file. `jq` is a host dependency users often lack; the
+script falls back to `docker run --rm -i --entrypoint jq
+harness-proxy:latest` so the proxy image (which already ships jq for its
+firewall scripts) services CLI jq calls transparently. ~200 ms per call
+overhead. On a fresh install with no proxy image yet, the fallback
+inline-builds the proxy image (one-time, ~2–5 min) with a loud warning so
+the user doesn't think the script froze.
+
+## `doctor` and `preflight`
+
+- `cmd_doctor` — diagnostic-only. Reads runtime state, never modifies.
+  Reports `[network]` (allowlist path, host count, whether `PROXY_API_URL`'s
+  host is on the allowlist, any services with active overrides), `[mcp]`,
+  `[runtime]`, etc.
+- `cmd_preflight` — validates `.env`, allowlist, and docker daemon
+  reachability BEFORE `harness start`. Fails loudly on config errors so
+  the user doesn't get an opaque compose error.
+
+## Shared libraries under `scripts/lib/`
+
+- `platform.sh` — OS detection, container runtime detection, portable
+  realpath, jq helpers. Sourced by the harness script after the inline
+  self-locate runs.
+- `net_helpers.sh` — lazily sourced (`load_net_helpers`) so the
+  no-op startup cost on commands that don't touch the network stays
+  near zero. Owns the allowlist + overrides JSON manipulation used by
+  `cmd_net_*`.
+- `upgrade_actions.sh` — the action functions called by `cmd_upgrade`.
+  See [`install-and-upgrade.md`](install-and-upgrade.md).
+
+## Tests
+
+Tests scoped to this file live in `tests/harness_test.sh` (and any
+future `tests/harness_*_test.sh`). E2E TUI behavior is exercised by
+`tests/e2e/`. See [`tests.md`](tests.md).
