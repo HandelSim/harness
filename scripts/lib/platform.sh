@@ -389,17 +389,23 @@ harness_start_docker_desktop() {
             ;;
     esac
 
-    # Poll for runtime availability.
-    local elapsed=0
+    # Poll for runtime availability. Track elapsed against wall clock — each
+    # `harness_docker_running` (i.e. `docker info`) can block for many seconds
+    # while the daemon is still booting, so counting `sleep 2` ticks
+    # under-reports elapsed time and also lets the loop overrun `timeout`.
+    local start_ts elapsed=0 last_log_bucket=0 bucket
+    start_ts=$(date +%s)
     while (( elapsed < timeout )); do
         if harness_docker_running; then
             echo "[harness] $rt is now running." >&2
             return 0
         fi
         sleep 2
-        elapsed=$((elapsed + 2))
-        if (( elapsed % 10 == 0 )); then
+        elapsed=$(( $(date +%s) - start_ts ))
+        bucket=$(( elapsed / 10 ))
+        if (( bucket > last_log_bucket )); then
             echo "[harness]   ...still waiting (${elapsed}s elapsed, ${timeout}s timeout)" >&2
+            last_log_bucket=$bucket
         fi
     done
 

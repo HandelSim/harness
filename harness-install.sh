@@ -179,16 +179,22 @@ _inline_start_docker() {
             ;;
     esac
 
-    local elapsed=0
+    # Track wall-clock elapsed; `docker info` blocks while the daemon boots,
+    # so counting `sleep 2` ticks under-reports time and also overruns the
+    # caller's timeout. Mirrors scripts/lib/platform.sh:harness_start_docker_desktop.
+    local start_ts elapsed=0 last_log_bucket=0 bucket
+    start_ts=$(date +%s)
     while (( elapsed < timeout )); do
         if _inline_docker_running; then
             echo "  $rt is now running." >&2
             return 0
         fi
         sleep 2
-        elapsed=$((elapsed + 2))
-        if (( elapsed % 10 == 0 )); then
+        elapsed=$(( $(date +%s) - start_ts ))
+        bucket=$(( elapsed / 10 ))
+        if (( bucket > last_log_bucket )); then
             echo "    ...still waiting (${elapsed}s elapsed, ${timeout}s timeout)" >&2
+            last_log_bucket=$bucket
         fi
     done
 
