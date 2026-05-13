@@ -368,6 +368,12 @@ ensure_dirs() {
 # Echo the -f arguments for every installed-and-enabled MCP compose snippet,
 # one flag/value pair per line. Disabled MCPs are skipped (their dir stays
 # but they don't get spliced into the compose stack).
+#
+# The emitted paths are normalized via harness_docker_path so they're in a
+# form `docker.exe` accepts on Git Bash for Windows. The compose wrapper
+# below runs through harness_docker, which sets MSYS_NO_PATHCONV=1 — that
+# stops MSYS from auto-translating unix-style paths, so we have to convert
+# them ourselves before docker sees them. Passthrough on Linux/macOS.
 mcp_compose_files() {
     if [[ ! -d "$mcp_active_dir" ]]; then
         return 0
@@ -377,7 +383,7 @@ mcp_compose_files() {
         [[ -f "$mcp_dir/compose.yml" ]] || continue
         name=$(basename "$mcp_dir")
         mcp_is_enabled "$name" || continue
-        printf '%s\n' "-f" "$mcp_dir/compose.yml"
+        printf '%s\n' "-f" "$(harness_docker_path "$mcp_dir/compose.yml")"
     done
 }
 
@@ -537,16 +543,21 @@ write_runtime_override() {
 # ${VAR} references avoids that whole class of bug.
 compose() {
     write_runtime_override
+    # Host paths passed to docker compose must be pre-translated on Git Bash
+    # for Windows: harness_docker (below) sets MSYS_NO_PATHCONV=1 so MSYS
+    # won't auto-translate args, and docker.exe interprets `/c/Users/...`
+    # literally as `C:\c\Users\...`. harness_docker_path runs cygpath -m on
+    # Windows and is a no-op on Linux/macOS.
     local args=(
         compose
         --project-name "$project_name"
-        -f "$clone_dir/docker-compose.yml"
+        -f "$(harness_docker_path "$clone_dir/docker-compose.yml")"
     )
     if [[ -f "$env_file" ]]; then
-        args+=(--env-file "$env_file")
+        args+=(--env-file "$(harness_docker_path "$env_file")")
     fi
     if [[ -f "$runtime_override" ]]; then
-        args+=(-f "$runtime_override")
+        args+=(-f "$(harness_docker_path "$runtime_override")")
     fi
 
     # Splice in any active MCP compose snippets. Each one assumes the
@@ -2658,14 +2669,17 @@ cmd_mcp_up() {
 
     # Force-add this MCP's compose file to the argv even if it's disabled —
     # `compose` (the wrapper) only adds enabled MCPs through mcp_compose_files.
+    # Host paths are run through harness_docker_path for the same reason as
+    # in compose() above (Git Bash + MSYS_NO_PATHCONV=1 means we have to
+    # convert /c/Users/... to C:/Users/... ourselves before docker sees it).
     write_runtime_override
     local args=(
         compose
         --project-name "$project_name"
-        -f "$clone_dir/docker-compose.yml"
+        -f "$(harness_docker_path "$clone_dir/docker-compose.yml")"
     )
-    if [[ -f "$env_file" ]]; then args+=(--env-file "$env_file"); fi
-    if [[ -f "$runtime_override" ]]; then args+=(-f "$runtime_override"); fi
+    if [[ -f "$env_file" ]]; then args+=(--env-file "$(harness_docker_path "$env_file")"); fi
+    if [[ -f "$runtime_override" ]]; then args+=(-f "$(harness_docker_path "$runtime_override")"); fi
     # Other enabled MCPs (so their networks/volumes resolve consistently).
     local mcp_arg
     while IFS= read -r mcp_arg; do
@@ -2673,7 +2687,7 @@ cmd_mcp_up() {
     done < <(mcp_compose_files)
     # Force this MCP in, even if disabled.
     if ! mcp_is_enabled "$name"; then
-        args+=(-f "$mcp_active_dir/$name/compose.yml")
+        args+=(-f "$(harness_docker_path "$mcp_active_dir/$name/compose.yml")")
     fi
     args+=(--profile mcp up -d)
     args+=("${svc_list[@]}")
@@ -2710,17 +2724,18 @@ cmd_mcp_down() {
     fi
 
     # Splice this MCP's compose file in even if disabled, so compose can
-    # find the service to remove.
+    # find the service to remove. Host paths are converted via
+    # harness_docker_path for Windows Git Bash (see compose() for why).
     write_runtime_override
     local args=(
         compose
         --project-name "$project_name"
-        -f "$clone_dir/docker-compose.yml"
+        -f "$(harness_docker_path "$clone_dir/docker-compose.yml")"
     )
-    if [[ -f "$env_file" ]]; then args+=(--env-file "$env_file"); fi
-    if [[ -f "$runtime_override" ]]; then args+=(-f "$runtime_override"); fi
+    if [[ -f "$env_file" ]]; then args+=(--env-file "$(harness_docker_path "$env_file")"); fi
+    if [[ -f "$runtime_override" ]]; then args+=(-f "$(harness_docker_path "$runtime_override")"); fi
     if ! mcp_is_enabled "$name"; then
-        args+=(-f "$mcp_active_dir/$name/compose.yml")
+        args+=(-f "$(harness_docker_path "$mcp_active_dir/$name/compose.yml")")
     fi
     local mcp_arg
     while IFS= read -r mcp_arg; do
@@ -2760,17 +2775,18 @@ cmd_mcp_logs() {
         exit 1
     fi
 
-    # Splice this MCP's compose file in even if disabled.
+    # Splice this MCP's compose file in even if disabled. Host paths are
+    # converted via harness_docker_path for Windows Git Bash (see compose()).
     write_runtime_override
     local args=(
         compose
         --project-name "$project_name"
-        -f "$clone_dir/docker-compose.yml"
+        -f "$(harness_docker_path "$clone_dir/docker-compose.yml")"
     )
-    if [[ -f "$env_file" ]]; then args+=(--env-file "$env_file"); fi
-    if [[ -f "$runtime_override" ]]; then args+=(-f "$runtime_override"); fi
+    if [[ -f "$env_file" ]]; then args+=(--env-file "$(harness_docker_path "$env_file")"); fi
+    if [[ -f "$runtime_override" ]]; then args+=(-f "$(harness_docker_path "$runtime_override")"); fi
     if ! mcp_is_enabled "$name"; then
-        args+=(-f "$mcp_active_dir/$name/compose.yml")
+        args+=(-f "$(harness_docker_path "$mcp_active_dir/$name/compose.yml")")
     fi
     local mcp_arg
     while IFS= read -r mcp_arg; do

@@ -1270,6 +1270,75 @@ if ! grep -q -- '--sentinel-token-d19c' <<<"${compose_args_out}"; then
 fi
 echo "[harness-test] T19c OK"
 
+# --- Test 19d: compose() host-path conversion for Windows Git Bash (#46) --
+#
+# Repro for issue #46: on Git Bash for Windows, harness_docker sets
+# MSYS_NO_PATHCONV=1 (so in-container args like `--entrypoint /bin/bash`
+# aren't mangled) — which means host-side unix paths like
+# /c/Users/handel.sim/harness/.env are NOT auto-translated and docker.exe
+# treats them as drive-root paths, resolving them to C:\c\Users\... and
+# failing with "couldn't find env file". The fix is to run each host
+# path through harness_docker_path before passing it to docker compose;
+# this test asserts the call sites actually do that.
+#
+# We stub harness_docker_path to a recognizable transformation (prefix
+# WIN: ) and stub harness_docker to print its args. Then we call compose
+# with a sentinel token and assert the captured args contain WIN:-prefixed
+# values for the base compose -f, --env-file, and runtime-override -f.
+echo "[harness-test] T19d: compose() host-path conversion (#46)"
+
+# Seed a runtime override so the -f override branch is exercised.
+mkdir -p "${TEST_ROOT}/state"
+cat >"${TEST_ROOT}/state/.harness-runtime.yml" <<'EOF'
+# stub runtime override for T19d
+services: {}
+EOF
+
+t19d_out=$(
+    HARNESS_PROJECT_NAME="harness-19d" \
+    HARNESS_INSTALL_ROOT="${TEST_ROOT}" \
+    HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist" \
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    # Stub: stand in for cygpath -m. Recognizable prefix lets us assert
+    # the call site routed through this helper.
+    harness_docker_path() { printf 'WIN:%s\n' "$1"; }
+    # Stub: skip the real runtime-override regeneration; we seeded one above.
+    write_runtime_override() { :; }
+    # Stub: capture the args compose() ultimately passes to the runtime.
+    harness_docker() { printf 'HD_ARGS:'; printf ' %s' "$@"; printf '\n'; }
+    compose ps --sentinel-token-d19d 2>&1
+)
+# Sentinel reached harness_docker (we actually captured a compose call).
+if ! grep -q -- '--sentinel-token-d19d' <<<"${t19d_out}"; then
+    echo "[harness-test] T19d FAIL: sentinel token missing — compose() didn't reach harness_docker" >&2
+    echo "${t19d_out}" >&2; exit 1
+fi
+# Base compose file path is converted.
+if ! grep -Eq -- '-f[[:space:]]+WIN:[^[:space:]]*docker-compose\.yml' <<<"${t19d_out}"; then
+    echo "[harness-test] T19d FAIL: base -f docker-compose.yml not converted via harness_docker_path" >&2
+    echo "${t19d_out}" >&2; exit 1
+fi
+# --env-file path is converted.
+if ! grep -Eq -- '--env-file[[:space:]]+WIN:[^[:space:]]*\.env' <<<"${t19d_out}"; then
+    echo "[harness-test] T19d FAIL: --env-file not converted via harness_docker_path" >&2
+    echo "${t19d_out}" >&2; exit 1
+fi
+# Runtime override -f path is converted.
+if ! grep -Eq -- '-f[[:space:]]+WIN:[^[:space:]]*\.harness-runtime\.yml' <<<"${t19d_out}"; then
+    echo "[harness-test] T19d FAIL: runtime override -f not converted via harness_docker_path" >&2
+    echo "${t19d_out}" >&2; exit 1
+fi
+# Negative check: no raw, unconverted host path slipped through next to
+# -f or --env-file. Anything coming from the install root or clone dir
+# should be WIN:-prefixed; the only other path-looking values legitimately
+# in argv are container-side paths (none in this invocation).
+if grep -Eq -- '(-f|--env-file)[[:space:]]+/[^[:space:]]*\.(yml|env)' <<<"${t19d_out}"; then
+    echo "[harness-test] T19d FAIL: an unconverted /path/...yml slipped past harness_docker_path" >&2
+    echo "${t19d_out}" >&2; exit 1
+fi
+rm -f "${TEST_ROOT}/state/.harness-runtime.yml"
+echo "[harness-test] T19d OK"
+
 # --- Test 20: harness preflight command ------------------------------------
 #
 # Smoke the command end-to-end against the test install root. .env and
