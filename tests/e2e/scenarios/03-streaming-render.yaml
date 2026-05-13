@@ -1,13 +1,12 @@
 name: 03-streaming-render
 inventory_refs: [P051, P032, F043]
-# Note (#37): this scenario currently "passes" via the error path — the
-# placeholder upstream returns 404, proxy returns 502, claude-code prints
-# an error and returns to the prompt, the pane stabilizes in ~10s. It is
-# NOT actually exercising the streaming render path it was written for.
-# The capture_assertions below survive that (they only assert no Traceback /
-# Error: / a returning marker) so the scenario reports green. Once a mock
-# upstream is wired (#37), tighten the assertions to verify real streamed
-# deltas land in the pane.
+expected_failure: true
+expected_failure_reason: "no mock upstream wired in CI; placeholder upstream 404s, proxy returns 502, claude-code v2.1.120 retries with backoff (up to 10 attempts) so the pane never stabilizes within the step timeout (#37)"
+# Once a mock upstream is wired (#37), drop the expected_failure marker
+# and tighten the assertions to verify real streamed deltas land in the
+# pane. Until then, this scenario cannot exercise the streaming render
+# path it was written for — claude-code's retry behavior makes the
+# error-path "accidental pass" non-deterministic.
 description: |
   Send a prompt that triggers a long mock streaming response. The TUI must
   render the streamed deltas cleanly — no escape-sequence artifacts, no
