@@ -171,6 +171,21 @@ _TOOL_CONTINUE_CUE = (
     "complete.]"
 )
 
+# Opens the cooperative-prompt scaffold on genuine user turns (the
+# build_cooperative_prompt_user* builders). Replaces an earlier generic
+# persona line: because the scaffold lands in the last user message and is
+# re-read every turn, the model treated that line as the ACTIVE persona,
+# overriding the real persona from the upstream conversation (e.g. opencode's
+# "You are opencode") and letting the model's pretrained identity surface
+# ("Gemini Enterprise"). This framing declares only the tool-call format and
+# tells the model to keep the persona established earlier in the conversation.
+_PERSONA_PRESERVE_FRAMING = (
+    "[The tool-call format below is an ADDITION to — not a replacement for — "
+    "the persona, instructions, and context already established earlier in "
+    "this conversation. Continue acting as the assistant defined above; do "
+    "not adopt a new identity.]"
+)
+
 
 def format_tools_to_text(tools_array):
     # Emit the full JSON Schema for each tool's parameters rather than a
@@ -202,7 +217,7 @@ def build_cooperative_prompt_user(original_content, tools_text):
     # if the user's prompt itself contains quotation marks (or code that
     # uses them), bare quotes confuse the model about where the original
     # request ends. The <<<BEGIN/END_USER_REQUEST>>> markers are unambiguous.
-    return f"""You are a helpful and intelligent AI assistant.
+    return f"""{_PERSONA_PRESERVE_FRAMING}
 
 ### Tool Usage Instructions
 You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
@@ -263,7 +278,7 @@ def build_cooperative_prompt_user_front(original_content, tools_text):
 
 ---
 
-You are a helpful and intelligent AI assistant.
+{_PERSONA_PRESERVE_FRAMING}
 
 ### Tool Usage Instructions
 You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
@@ -327,7 +342,7 @@ def build_cooperative_prompt_user_bookend(original_content, tools_text):
 
 ---
 
-You are a helpful and intelligent AI assistant.
+{_PERSONA_PRESERVE_FRAMING}
 
 ### Tool Usage Instructions
 You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
