@@ -500,7 +500,17 @@ write_runtime_override() {
     # reads the override file directly. Emitting a services.agent block
     # would either create a phantom compose service or trigger validation
     # warnings depending on the compose version.
-    if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
+    #
+    # Recursion guard: harness_jq's container fallback runs `compose build
+    # proxy` when the proxy image isn't built yet, and compose() calls
+    # write_runtime_override at its top. Without the guard a jq-less host
+    # would re-enter here and call harness_jq again → infinite recursion.
+    # On the re-entrant call we skip this block: the `compose build proxy`
+    # invocation has no use for per-service overrides, and the outer call
+    # still emits them once its harness_jq returns. `local` gives the flag
+    # dynamic scope so it clears automatically when the outer call returns.
+    if [[ -f "$net_overrides_path" && -z "${_harness_wro_in_progress:-}" ]]; then
+        local _harness_wro_in_progress=1
         local svc
         while IFS= read -r svc; do
             svc=${svc%$'\r'}
@@ -509,7 +519,7 @@ write_runtime_override() {
             body+="  ${svc}:"$'\n'
             body+="    environment:"$'\n'
             body+="      HARNESS_FIREWALL_DISABLED: \"1\""$'\n'
-        done < <(jq -r '
+        done < <(harness_jq -r '
             (.services // {})
             | to_entries[]
             | select(.value.firewall_disabled == true)
@@ -626,9 +636,9 @@ warn_if_firewall_open() {
     if (( agent_net_open )); then
         warn_messages+=("This agent is being launched with --net (firewall DISABLED for this invocation).")
     fi
-    if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
+    if [[ -f "$net_overrides_path" ]]; then
         local opened
-        opened=$(jq -r '
+        opened=$(harness_jq -r '
             (.services // {})
             | to_entries[]?
             | select(.value.firewall_disabled == true)
@@ -1558,9 +1568,9 @@ run_agent() {
     # the launch picks up the disabled-firewall state without needing
     # --net per invocation. Either the per-launch flag or the persistent
     # override is enough.
-    if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
+    if [[ -f "$net_overrides_path" ]]; then
         local agent_override
-        agent_override=$(jq -r '.services.agent.firewall_disabled // false' "$net_overrides_path" 2>/dev/null || echo "false")
+        agent_override=$(harness_jq -r '.services.agent.firewall_disabled // false' "$net_overrides_path" 2>/dev/null || echo "false")
         if [[ "$agent_override" == "true" ]]; then
             net_open=1
         fi
@@ -1961,9 +1971,9 @@ cmd_shell() {
     # shell launch with the firewall disabled too. Mirrors the run_agent
     # logic for claude/opencode launches.
     local fw_args=()
-    if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
+    if [[ -f "$net_overrides_path" ]]; then
         local agent_override
-        agent_override=$(jq -r '.services.agent.firewall_disabled // false' "$net_overrides_path" 2>/dev/null || echo "false")
+        agent_override=$(harness_jq -r '.services.agent.firewall_disabled // false' "$net_overrides_path" 2>/dev/null || echo "false")
         if [[ "$agent_override" == "true" ]]; then
             fw_args=(-e "HARNESS_FIREWALL_DISABLED=1")
         fi
@@ -3502,7 +3512,7 @@ cmd_doctor() {
         doctor_check fail "allowlist" "$allowlist_path missing"
     fi
 
-    if [[ -f "$net_overrides_path" ]] && command -v jq >/dev/null 2>&1; then
+    if [[ -f "$net_overrides_path" ]]; then
         load_net_helpers
         local open_list
         open_list=$(netlib_overrides_open_services | paste -sd ',' -)
