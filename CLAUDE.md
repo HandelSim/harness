@@ -39,6 +39,7 @@ affect** that subject — err on the side of reading.
 |----------------------------------------------------------------------------------|------|
 | `harness` CLI script, subcommands, agent launch path, compose wrapper, doctor    | `architecture/harness-cli.md` |
 | `proxy/` — `proxy.py`, prompt modes, tool-call extraction, NDJSON streaming      | `architecture/proxy.md` |
+| The upstream API contract — quirks, key lifecycle, request/response schema       | `architecture/upstream-api.md` |
 | `docker-compose.yml`, `ollama/`, `agents/`, `firewall/`, container entrypoints   | `architecture/containers.md` |
 | `mcp-registry/`, `state/mcp/`, MCP lifecycle, client-config / compose merge      | `architecture/mcp.md` |
 | `harness-install.sh`, `scripts/upgrade-manifest.json`, `scripts/lib/upgrade_actions.sh` | `architecture/install-and-upgrade.md` |

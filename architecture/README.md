@@ -65,6 +65,10 @@ Read the relevant one(s) before changing code in that area:
 - [`proxy.md`](proxy.md) — `proxy/proxy.py`: ollama ↔ upstream translation,
   cooperative tool-use prompt variants, tool-call extraction, NDJSON
   streaming, env-driven config and validation.
+- [`upstream-api.md`](upstream-api.md) — the third-party chat API the proxy
+  calls: observed contract and quirks (no tools, hidden system prompt, no
+  network), API-key lock/expiry lifecycle, request/response schema, HTTP
+  status codes.
 - [`containers.md`](containers.md) — service composition: `docker-compose.yml`,
   ollama stub-model registration, agent entrypoint (UID remap, firewall,
   gosu drop, skel-seed, mode dispatch), `harness-net` + firewall
