@@ -35,7 +35,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F013 | `require_runtime_config` fails fast when `.env` is missing under the install root |
 | F014 | `require_runtime_config` fails fast when `.harness-allowlist` is missing under the install root |
 | F015 | `harness_jq` uses the host `jq` binary when present |
-| F016 | `harness_jq` falls back to a containerized `jq` (`docker run --rm`) when host `jq` is absent |
+| F016 | `harness_jq` falls back to a containerized `jq` when host `jq` is absent — via a per-invocation `docker exec` sidecar (`_ensure_jq_sidecar`), reaped on exit / before exec (`_reap_jq_sidecar`) and swept when stale (`_sweep_stale_jq_sidecars`) |
 | F017 | `_update_check_and_banner` prints a banner when the local install is behind `origin/main` |
 | F018 | `_update_check_and_banner` honors a short timeout on `git ls-remote` so it never blocks the CLI indefinitely |
 | F019 | `_update_check_and_banner` falls back to a cached value when the network probe fails |

@@ -144,19 +144,24 @@ err() {
 }
 
 # harness_jq — wrapper that uses host jq if available, else falls back to
-# the proxy container's jq via `docker run`. Same args/stdin/stdout/exit
-# semantics as native jq.
+# the proxy container's jq. Same args/stdin/stdout/exit semantics as
+# native jq.
 #
 # Why: the harness script's upgrade flow uses jq to parse the manifest,
 # but jq is a host dependency users frequently don't have. Forcing them to
 # install it via platform-specific package managers is poor UX. The proxy
-# image (harness-proxy:latest) ships jq for its own firewall scripts;
-# using `docker run --rm -i harness-proxy:latest jq` works transparently
-# without adding host dependencies.
+# image (harness-proxy:latest) ships jq for its own firewall scripts, so
+# the fallback runs jq there transparently — no host dependency added.
+#
+# The fallback does NOT spawn a fresh container per call. It runs jq via
+# `docker exec` against a long-lived per-invocation sidecar container
+# (_ensure_jq_sidecar) so the ~200ms container-creation cost is paid once
+# per `harness` invocation rather than once per jq call — `harness
+# upgrade` alone makes ~9 jq calls per merged file. Sidecar lifecycle:
+# _ensure_jq_sidecar (create), _reap_jq_sidecar (tear down on exit / before
+# exec), _sweep_stale_jq_sidecars (self-heal leaks). See those functions.
 #
 # Caveats:
-# - Per-call overhead is ~200ms (Docker container start). harness upgrade
-#   makes a handful of jq calls; total added latency ~1-2s. Acceptable.
 # - First fallback in a fresh install (no proxy image yet) builds the
 #   image inline. We tell the user this is happening so they don't think
 #   the script froze. Build is one-time; subsequent calls are fast.
@@ -167,8 +172,45 @@ harness_jq() {
         return $?
     fi
 
-    # Host jq missing. Fall back to the proxy container.
-    local rt
+    # Host jq missing. Route through the per-invocation container sidecar.
+    local sidecar
+    sidecar=$(_ensure_jq_sidecar) || return 1
+
+    # The container can't see host filesystem paths. If the last argument is
+    # a host file that exists, redirect it as stdin instead of passing it as
+    # a positional arg. This handles `jq '...' file.json` callers (manifest
+    # parsing in cmd_upgrade, net overrides file in netlib_overrides_*).
+    local args=("$@")
+    local n=${#args[@]}
+    if (( n > 0 )) && [[ -f "${args[n-1]}" ]]; then
+        local file="${args[n-1]}"
+        unset 'args[n-1]'
+        harness_docker exec -i "$sidecar" jq "${args[@]}" <"$file"
+    else
+        harness_docker exec -i "$sidecar" jq "$@"
+    fi
+}
+
+# _ensure_jq_sidecar — ensure the per-invocation jq sidecar container is
+# running and echo its name. The sidecar is a long-lived `sleep infinity`
+# container built from the proxy image; harness_jq runs `docker exec`
+# against it instead of paying full container-creation latency per call.
+#
+# Keyed on $$ (the main `harness` PID), which is identical in every
+# subshell — so any harness_jq call site, inside any `$(...)` / `< <(...)`,
+# converges on the same container name with no shared in-process state
+# (a captured container ID would die with the subshell that created it).
+#
+# Created lazily on the first jq call of a jq-less invocation; calls 2..N
+# hit the "already running" fast path. Reaped by the EXIT trap and by
+# explicit pre-exec reap calls on the agent-launch paths (see
+# _reap_jq_sidecar). _sweep_stale_jq_sidecars (called here, so once per
+# invocation) clears sidecars left behind by harness processes that died
+# without reaping.
+_ensure_jq_sidecar() {
+    local name="harness-jq-$$"
+    local rt state
+
     rt=$(harness_container_runtime)
     if ! command -v "$rt" >/dev/null 2>&1; then
         echo "harness: jq is required but not installed on the host," >&2
@@ -177,6 +219,10 @@ harness_jq() {
         echo "harness: install jq via your package manager." >&2
         return 1
     fi
+
+    # Fast path: sidecar already up for this invocation.
+    state=$(harness_docker container inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)
+    [[ "$state" == "true" ]] && { echo "$name"; return 0; }
 
     if ! harness_docker info >/dev/null 2>&1; then
         echo "harness: jq is required but not installed on the host," >&2
@@ -190,6 +236,10 @@ harness_jq() {
         echo "harness: proxy container's jq, but its image isn't built yet." >&2
         echo "harness: building harness-proxy:latest now (one-time, ~2-5 minutes)..." >&2
 
+        # compose build proxy re-enters compose() -> write_runtime_override,
+        # which calls harness_jq again; the _harness_wro_in_progress guard
+        # in write_runtime_override breaks that recursion. Keep this build
+        # ahead of the `docker run` below so the guard covers it.
         if ! (cd "$install_root" && compose build proxy >&2); then
             echo "harness: proxy image build failed; cannot fall back to" >&2
             echo "harness: container jq. Install jq directly via your package" >&2
@@ -199,19 +249,67 @@ harness_jq() {
         echo "harness: proxy image built; resuming." >&2
     fi
 
-    # The container can't see host filesystem paths. If the last argument is
-    # a host file that exists, redirect it as stdin instead of passing it as
-    # a positional arg. This handles `jq '...' file.json` callers (manifest
-    # parsing in cmd_upgrade, net overrides file in netlib_overrides_*).
-    local args=("$@")
-    local n=${#args[@]}
-    if (( n > 0 )) && [[ -f "${args[n-1]}" ]]; then
-        local file="${args[n-1]}"
-        unset 'args[n-1]'
-        harness_docker run --rm -i --entrypoint jq harness-proxy:latest "${args[@]}" <"$file"
-    else
-        harness_docker run --rm -i --entrypoint jq harness-proxy:latest "$@"
+    # A stopped container under our own name (crashed sleep, or PID reuse
+    # the sweep didn't catch) blocks `run --name`; clear it first.
+    if [[ "$state" == "false" ]]; then
+        harness_docker rm -f "$name" >/dev/null 2>&1 || true
     fi
+
+    # Clear sidecars owned by harness processes that are no longer alive.
+    # Runs only on the invocation's first jq call (calls 2..N hit the fast
+    # path above), so it's one `docker ps` per jq-less invocation.
+    _sweep_stale_jq_sidecars
+
+    # Start ours. Concurrent harness_jq calls (a `< <(...)` producer racing
+    # the loop body that consumes it) can both reach here; the loser's
+    # `run` fails on the name collision, which is fine — the re-inspect
+    # below sees the winner's container.
+    harness_docker run -d --name "$name" --entrypoint sleep \
+        harness-proxy:latest infinity >/dev/null 2>&1 || true
+
+    state=$(harness_docker container inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)
+    if [[ "$state" != "true" ]]; then
+        echo "harness: failed to start the jq sidecar container ($name)." >&2
+        return 1
+    fi
+
+    # Marker file so _reap_jq_sidecar knows a sidecar exists for this PID
+    # without an extra docker call on every harness exit (the EXIT trap
+    # fires even for `harness help`). Survives subshells; cleared on reap.
+    mkdir -p "${install_root}/state" 2>/dev/null || true
+    : > "${install_root}/state/.harness-jq-sidecar.$$" 2>/dev/null || true
+
+    echo "$name"
+}
+
+# _reap_jq_sidecar — tear down this invocation's jq sidecar. Cheap no-op
+# when none was created (the marker file is absent), which matters because
+# this runs from the EXIT trap on every harness invocation — including
+# ones that never touch jq or docker at all.
+_reap_jq_sidecar() {
+    local marker="${install_root}/state/.harness-jq-sidecar.$$"
+    [[ -f "$marker" ]] || return 0
+    harness_docker rm -f "harness-jq-$$" >/dev/null 2>&1 || true
+    rm -f "$marker" 2>/dev/null || true
+}
+
+# _sweep_stale_jq_sidecars — remove jq sidecar containers whose owning
+# harness process is gone (crash, SIGKILL, an exec path that replaced the
+# process before its reap call). Self-healing safety net for the
+# EXIT-trap / pre-exec-reap lifecycle. Best-effort and silent.
+_sweep_stale_jq_sidecars() {
+    local name pid
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        pid=${name#harness-jq-}
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [[ "$pid" == "$$" ]] && continue
+        # A live process under that PID means another harness invocation
+        # owns the sidecar — leave it alone.
+        kill -0 "$pid" 2>/dev/null && continue
+        harness_docker rm -f "$name" >/dev/null 2>&1 || true
+        rm -f "${install_root}/state/.harness-jq-sidecar.${pid}" 2>/dev/null || true
+    done < <(harness_docker ps -a --filter 'name=harness-jq-' --format '{{.Names}}' 2>/dev/null || true)
 }
 
 # --- update-available banner ----------------------------------------------
@@ -1055,6 +1153,11 @@ cmd_down() {
         harness_docker rm -f $agent_cids >/dev/null 2>&1 || true
     fi
 
+    # Belt-and-suspenders: clear jq sidecars leaked by crashed harness
+    # invocations. The EXIT trap and pre-exec reaps handle the common
+    # cases; this catches the rest on an explicit teardown.
+    _sweep_stale_jq_sidecars
+
     compose down "$@"
 }
 
@@ -1811,6 +1914,9 @@ run_agent_interactive() {
         docker_args+=("${pass_args[@]}")
     fi
 
+    # exec replaces this process, so the EXIT trap never fires — reap the
+    # jq sidecar (run_agent read the net override through harness_jq) now.
+    _reap_jq_sidecar
     harness_docker_exec "${docker_args[@]}"
 }
 
@@ -1880,6 +1986,8 @@ run_agent_print() {
         docker_args+=("${pass_args[@]}")
     fi
 
+    # exec bypasses the EXIT trap — reap the jq sidecar before it.
+    _reap_jq_sidecar
     harness_docker_exec "${docker_args[@]}"
 }
 
@@ -2018,6 +2126,8 @@ cmd_shell() {
         "$image"
         shell
     )
+    # exec bypasses the EXIT trap — reap the jq sidecar before it.
+    _reap_jq_sidecar
     harness_docker_exec "${shell_args[@]}"
 }
 
@@ -2816,6 +2926,9 @@ cmd_mcp_logs() {
     args+=(--profile mcp logs -f)
     args+=("${svc_list[@]}")
     local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
+    # exec bypasses the EXIT trap — reap the jq sidecar before it (compose()
+    # ran write_runtime_override, which reads the override through harness_jq).
+    _reap_jq_sidecar
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
@@ -3277,6 +3390,8 @@ cmd_claude_statusline_config() {
     acd_host=$(harness_docker_path "$agent_config_dir")
     alp_host=$(harness_docker_path "$allowlist_path")
 
+    # exec bypasses the EXIT trap — reap the jq sidecar before it.
+    _reap_jq_sidecar
     harness_docker_exec run --rm "$tty_flag" \
         --user 0:0 \
         --network "$network" \
@@ -4282,6 +4397,14 @@ main() {
 # Allow tests to source this script for access to internal helpers (e.g.
 # _upgrade_confirm) without invoking main. Production execution always
 # falls through to main "$@".
+#
+# The EXIT trap reaps this invocation's jq sidecar (if one was created).
+# It covers every non-exec command; the agent-launch / mcp-logs paths
+# `exec` the runtime and so never reach this trap — they call
+# _reap_jq_sidecar explicitly just before their `harness_docker_exec`.
+# Set only for real execution: a sourced test shell must not reap on its
+# own subshell exit.
 if [[ -z "${HARNESS_SOURCE_ONLY:-}" ]]; then
+    trap '_reap_jq_sidecar' EXIT
     main "$@"
 fi
