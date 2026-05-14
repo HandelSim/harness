@@ -51,6 +51,11 @@ config or state. No image rebuilds, no compose restart.
 3. `harness down --remove-orphans` and `harness start` (skippable via
    `--no-restart`).
 
+Declining the `[y/n]` confirmation skips step 2 (the file merges) but
+still runs step 3 — the git pull has already happened, so the rebuild +
+restart are needed to avoid running stale images on new code. To abort
+the whole upgrade, use Ctrl-C.
+
 Upgrade actions are conservative: they add new env variables, new
 allowlist hostnames, and new config keys WITHOUT overwriting existing
 customizations. Each newly-introduced item is annotated with a marker
