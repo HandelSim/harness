@@ -7,9 +7,10 @@ Two response-selection paths exist:
 
 1. **Fixture dispatch** (preferred). When MOCK_FIXTURES_DIR is set, on every
    request the server reads the most recent user-message content from the
-   forwarded body, matches it (case-insensitive, multiline) against each
-   fixture's compiled `match` regex in lexicographic filename order, and
-   returns the first hit's `response`. Fixtures are loaded once at startup
+   forwarded body (with the proxy's cooperative-prompt scaffolding stripped —
+   see `extract_user_prompt`), matches it (case-insensitive, multiline)
+   against each fixture's compiled `match` regex in lexicographic filename
+   order, and returns the first hit's `response`. Fixtures are loaded at startup
    from `*.json` files under MOCK_FIXTURES_DIR; each file has the shape:
 
        {
@@ -174,13 +175,65 @@ def load_fixtures(fixtures_dir: str) -> list[Fixture]:
 FIXTURES: list[Fixture] = load_fixtures(FIXTURES_DIR) if FIXTURES_DIR else []
 
 
+# Marker pairs the proxy's cooperative-prompt builders wrap real content in
+# (see proxy/proxy.py). The user's actual request lands inside
+# <<<BEGIN_USER_REQUEST>>> markers; a tool-result turn's output lands inside
+# <<<BEGIN_TOOL_RESULT name="...">>> markers. Everything else in the message
+# is proxy scaffolding — tool-schema dumps and instruction boilerplate.
+_USER_REQUEST_OPEN = "<<<BEGIN_USER_REQUEST>>>"
+_USER_REQUEST_CLOSE = "<<<END_USER_REQUEST>>>"
+_TOOL_RESULT_OPEN = "<<<BEGIN_TOOL_RESULT"
+_TOOL_RESULT_CLOSE = "<<<END_TOOL_RESULT>>>"
+
+
+def unwrap_proxy_scaffolding(content: str) -> str:
+    """Return just the user/tool content from a proxy-wrapped message.
+
+    In the default `user_front` prompt mode the proxy appends the full
+    tool-schema block (~10-15KB across ~24 tools for Claude Code) to the
+    final user message. Matching a fixture regex against that block is a
+    bug magnet: a phrase like "List files in current directory" inside the
+    Bash tool's description matches the `03_list_files` fixture's
+    `\\blist files\\b` regex, so first-match-wins dispatches *every* request
+    to that fixture — an endless `ls -la` tool-call loop that never reaches
+    the `99_default` catch-all.
+
+    Extract the content delimited by the proxy's explicit markers instead,
+    so matching targets the user's actual request (or a tool result), never
+    the injected scaffolding. Fall back to the whole string when no markers
+    are present (e.g. `system`/`hybrid` prompt modes leave user turns
+    unwrapped, or a request that never went through the proxy).
+    """
+    open_idx = content.find(_USER_REQUEST_OPEN)
+    if open_idx != -1:
+        body_start = open_idx + len(_USER_REQUEST_OPEN)
+        # First close marker only: `user_bookend` mode emits two request
+        # blocks with the tool-schema dump *between* them, so spanning to
+        # the last close marker would re-include the scaffolding.
+        close_idx = content.find(_USER_REQUEST_CLOSE, body_start)
+        if close_idx != -1:
+            return content[body_start:close_idx].strip()
+    open_idx = content.find(_TOOL_RESULT_OPEN)
+    if open_idx != -1:
+        # The open marker carries a name="..." attribute; content starts
+        # after the '>>>' that closes the marker tag.
+        tag_end = content.find(">>>", open_idx)
+        if tag_end != -1:
+            body_start = tag_end + len(">>>")
+            close_idx = content.find(_TOOL_RESULT_CLOSE, body_start)
+            if close_idx != -1:
+                return content[body_start:close_idx].strip()
+    return content
+
+
 def extract_user_prompt(body: Any) -> str:
     """Pull the most recent user-message content out of a forwarded body.
 
     Body shape is OpenAI chat-completions: `{"messages": [{"role", "content"}, ...]}`.
-    The proxy's cooperative-prompt wrapper appends a tool-usage preamble to
-    the final user message; we match against the entire content, so fixtures
-    can target either the user's text or the wrapper's instructions.
+    The proxy's cooperative-prompt wrapper pads the final user message with a
+    tool-schema dump and instruction boilerplate; `unwrap_proxy_scaffolding`
+    strips that so fixtures match against the user's actual request (or a
+    tool result), not the injected scaffolding.
     """
     if not isinstance(body, dict):
         return ""
@@ -196,15 +249,16 @@ def extract_user_prompt(body: Any) -> str:
             continue
         content = msg.get("content", "")
         if isinstance(content, str):
-            return content
+            return unwrap_proxy_scaffolding(content)
         # Some clients send content as a list of {"type":"text","text":...}
         # parts. Concatenate the text parts so fixtures can match either.
         if isinstance(content, list):
-            return "\n".join(
+            joined = "\n".join(
                 part.get("text", "")
                 for part in content
                 if isinstance(part, dict) and part.get("type") == "text"
             )
+            return unwrap_proxy_scaffolding(joined)
     return ""
 
 

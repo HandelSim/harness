@@ -148,7 +148,10 @@ uses. Two modes:
   `tests/fixtures/responses/` there. The mock loads every `*.json`
   lexicographically and matches the latest user message against each
   fixture's `match` regex; first match wins. `99_default.json` is the
-  catch-all.
+  catch-all. The proxy's cooperative-prompt scaffolding (the tool-schema
+  dump it pads the user message with) is stripped before matching, so a
+  fixture regex only ever sees the user's actual request or a tool
+  result — never the injected tool descriptions.
 
 See `tests/fixtures/responses/README.md` for the file shape, naming
 convention (`NN_short_slug.json` with reserved priority ranges per
