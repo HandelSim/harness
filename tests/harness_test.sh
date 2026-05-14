@@ -1599,6 +1599,82 @@ cleanup_upd
 trap 'restore_agent_image; cleanup' EXIT INT TERM
 echo "[harness-test] T23 OK"
 
+# --- Test 24: run_agent honors the agent firewall override on a jq-less
+#     host (#8) -------------------------------------------------------------
+#
+# Repro for #8: `harness net open agent` writes firewall_disabled=true to
+# .harness-net-overrides.json, but run_agent read it with bare `jq` gated
+# on `command -v jq`. On hosts without host jq (Windows Git Bash) the gate
+# failed silently, the override block was skipped, and the agent launched
+# with the firewall still enabled. The fix routes the read through
+# harness_jq (host jq OR container fallback) with no `command -v jq` gate.
+#
+# We simulate a jq-less host by stubbing `command -v jq` to report jq
+# missing, stub harness_jq to stand in for the container fallback, and
+# assert run_agent still computes net_open=1. With the old gate in place
+# the override block would be skipped and net_open would stay 0.
+echo "[harness-test] T24: run_agent honors agent override on jq-less host (#8)"
+t24_rc=0
+t24_out=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    net_overrides_path="${TEST_ROOT}/t24-net-overrides.json"
+    printf '%s\n' '{"services":{"agent":{"firewall_disabled":true}}}' >"$net_overrides_path"
+    # Simulate a host without jq: the old `command -v jq` gate must fail.
+    command() {
+        if [[ "${1:-}" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi
+        builtin command "$@"
+    }
+    # Stand in for harness_jq's container fallback.
+    harness_jq() { echo "true"; }
+    require_docker() { :; }
+    _gate_on_upstream_auth() { return 0; }
+    ensure_services_up() { :; }
+    ensure_dirs() { :; }
+    _update_check_and_banner() { :; }
+    # Capture the net_open value run_agent computed and stop the launch.
+    warn_if_firewall_open() { echo "NET_OPEN=$1"; exit 77; }
+    run_agent claude 2>&1
+) || t24_rc=$?
+if (( t24_rc != 77 )); then
+    echo "[harness-test] T24 FAIL: expected run_agent to reach warn_if_firewall_open (rc=77), got ${t24_rc}" >&2
+    echo "${t24_out}" >&2; exit 1
+fi
+if ! grep -q 'NET_OPEN=1' <<<"${t24_out}"; then
+    echo "[harness-test] T24 FAIL [#8]: run_agent ignored the agent firewall override (expected NET_OPEN=1)" >&2
+    echo "${t24_out}" >&2; exit 1
+fi
+echo "[harness-test] T24 OK"
+
+# --- Test 25: warn_if_firewall_open warns on a jq-less host (#8) -----------
+#
+# Same #8 root cause: the pre-launch firewall warning read the overrides
+# file with bare `jq` gated on `command -v jq`, so on a jq-less host the
+# loud "FIREWALL IS DISABLED" warning was silently suppressed. The fix
+# routes the read through harness_jq with no gate. HARNESS_NET_CONFIRM=1
+# short-circuits the interactive prompt so the call returns 0.
+echo "[harness-test] T25: warn_if_firewall_open warns on jq-less host (#8)"
+t25_out=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    net_overrides_path="${TEST_ROOT}/t25-net-overrides.json"
+    printf '%s\n' '{"services":{"ollama":{"firewall_disabled":true}}}' >"$net_overrides_path"
+    command() {
+        if [[ "${1:-}" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi
+        builtin command "$@"
+    }
+    # Stand in for harness_jq's container fallback: list the open service.
+    harness_jq() { echo "ollama"; }
+    HARNESS_NET_CONFIRM=1 warn_if_firewall_open 0 claude 2>&1
+)
+if ! grep -q 'NETWORK FIREWALL IS DISABLED' <<<"${t25_out}"; then
+    echo "[harness-test] T25 FAIL [#8]: warn_if_firewall_open suppressed the warning on a jq-less host" >&2
+    echo "${t25_out}" >&2; exit 1
+fi
+if ! grep -q 'firewall DISABLED: ollama' <<<"${t25_out}"; then
+    echo "[harness-test] T25 FAIL [#8]: warn_if_firewall_open did not name the open service" >&2
+    echo "${t25_out}" >&2; exit 1
+fi
+echo "[harness-test] T25 OK"
+
 echo "============================================================"
 echo " HARNESS TEST PASSED"
 echo "============================================================"
