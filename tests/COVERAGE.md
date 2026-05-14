@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 397 IDs (F=139, P=56, A=34, M=23, N=30, U=29, Pe=19, O=25, I=42).
+Inventory total: 398 IDs (F=139, P=57, A=34, M=23, N=30, U=29, Pe=19, O=25, I=42).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -294,7 +294,7 @@ non-green rows — the gap.
 | P026 | green  | proxy/test_proxy.py:544-568                 | test_tool_message_uses_tool_name_and_wraps_in_markers: tool messages wrapped in `<<<BEGIN_TOOL_RESULT>>>` / `<<<END_TOOL_RESULT>>>` markers. | |
 | P027 | green  | proxy/test_proxy.py:528-543                 | test_consecutive_system_messages_are_coalesced AND assistant/user coalescing via tool_call test path. | |
 | P028 | green  | proxy/test_proxy.py:528-543                 | Specifically test_consecutive_system_messages_are_coalesced (joined with `\n\n`). | |
-| P029 | green  | proxy/test_proxy.py:838-857                 | test_coalesced_tool_results_each_delimited: two tool-result-derived user messages coalesce into one, each keeping its own markers. | |
+| P029 | green  | proxy/test_proxy.py:876-895                 | test_coalesced_tool_results_each_delimited: two tool-result-derived user messages coalesce into one, each keeping its own markers. | |
 | P030 | green  | proxy/test_proxy.py:780-811                 | test_change_system_to_user_converts_system_to_user: system role rewritten to user. | |
 | P031 | green  | proxy/test_proxy.py:780-811                 | Same test asserts an assistant stub `"I understand the instructions above."` is inserted. | |
 | P032 | green  | proxy/test_proxy.py:572-583                 | test_streaming_chunk_no_done_reason: ollama-shaped JSON without `done_reason`. Re-asserted in proxy_test.sh:218-249. | |
@@ -318,10 +318,11 @@ non-green rows — the gap.
 | P050 | green  | tests/proxy_test.sh:496-507                 | Scenario F asserts proxy logs DO NOT contain `'failed to save debug file'` AND DO NOT contain `OUTPUT_DIR '' is not writable` — silence is hard-asserted, not implied. | |
 | P051 | green  | tests/proxy_test.sh:356-369                 | Scenario D: streaming request yields multi-line NDJSON; `D_LINE_COUNT >= 2`, final line has `"done":true`. | |
 | P052 | green  | tests/proxy_test.sh:218-249                 | Scenario A: non-stream request produces ONE content chunk + done chunk (NDJSON 2 lines). | |
-| P053 | green  | proxy/test_proxy.py:799-835                 | TestToolResultDelimiting: tool messages wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers across every prompt mode; content never parsed. | |
+| P053 | green  | proxy/test_proxy.py:837-874                 | TestToolResultDelimiting: tool messages wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers across every prompt mode; content never parsed. | |
 | P054 | green  | proxy/test_proxy.py:26-49 + 96-131          | test_top_level_schema_emitted + test_format_tools_includes_nested_schema confirm tools section format. Cooperative prompt content asserted indirectly via Scenario C body check. | |
 | P055 | green  | proxy/test_proxy.py:26-131                  | TestFormatTools asserts each tool's name, schema, and arguments enumerated. | |
 | P056 | green  | tests/proxy_test.sh:289-352                 | Scenario C body check: keys == `['messages', 'model']`, with `model == PROXY_API_MODEL`. | |
+| P057 | green  | proxy/test_proxy.py:939-1004                | test_tool_result_name_resolved_via_tool_call_id / _falls_back_to_positional_order / _prefers_explicit_field / _unknown_when_no_metadata: name resolution chain (field → id → positional → `unknown_tool`). | |
 
 ## A — Agent runtime (init, configs, run-claude/opencode/shell) (34 IDs)
 

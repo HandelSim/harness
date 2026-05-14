@@ -266,19 +266,19 @@ You may explain your reasoning before or after the JSON block. If the task is fu
 
 
 def build_cooperative_prompt_user_front(original_content, tools_text):
-    """user_front mode: user's request appears FIRST, then tool definitions.
-    Same instruction text and markers as legacy `user` mode — only position
-    differs. The request gets primacy attention rather than being buried
-    after 10-15K tokens of tool schemas, so the model retains conversation
-    context across turns better than the legacy mode.
+    """user_front mode: a persona-preserve intro line, then the user's
+    request, then the tool definitions. The request gets primacy attention
+    rather than being buried after 10-15K tokens of tool schemas, and the
+    intro line keeps the model from adopting a new identity. Layout matches
+    the tool-result variant: intro → delimited block → tool intro → tools.
     """
-    return f"""<<<BEGIN_USER_REQUEST>>>
+    return f"""{_PERSONA_PRESERVE_FRAMING}
+
+<<<BEGIN_USER_REQUEST>>>
 {original_content}
 <<<END_USER_REQUEST>>>
 
 ---
-
-{_PERSONA_PRESERVE_FRAMING}
 
 ### Tool Usage Instructions
 You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
@@ -331,18 +331,19 @@ You may explain your thought process before or after the JSON block. If NO furth
 
 
 def build_cooperative_prompt_user_bookend(original_content, tools_text):
-    """user_bookend mode: request first, then tool definitions, then
-    request again. Both occurrences wrapped in <<<BEGIN_USER_REQUEST>>>
-    markers. Maximizes attention on the user's actual question via both
-    primacy and recency at the cost of duplicating the request text.
+    """user_bookend mode: a persona-preserve intro line, the request, the
+    tool definitions, then the request again. Both request occurrences are
+    wrapped in <<<BEGIN_USER_REQUEST>>> markers. Maximizes attention on the
+    user's actual question via both primacy and recency at the cost of
+    duplicating the request text. Same intro-first layout as user_front.
     """
-    return f"""<<<BEGIN_USER_REQUEST>>>
+    return f"""{_PERSONA_PRESERVE_FRAMING}
+
+<<<BEGIN_USER_REQUEST>>>
 {original_content}
 <<<END_USER_REQUEST>>>
 
 ---
-
-{_PERSONA_PRESERVE_FRAMING}
 
 ### Tool Usage Instructions
 You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
@@ -586,13 +587,25 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
     upstream API. Tool calls become markdown JSON blocks embedded in assistant
     content; tool results (role:"tool" messages) are wrapped verbatim in
     <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>> markers and folded into a
-    user message. The cooperative-prompt wrapper is applied to the final user
-    message if tools are available.
+    user message. The tool name on each result is resolved from metadata — an
+    explicit name field, else the tool_call_id correlated against the
+    originating assistant tool_calls, else positional order. The
+    cooperative-prompt wrapper is applied to the final user message if tools
+    are available.
     """
     if not original_messages:
         return []
 
     messages: List[Dict[str, str]] = []
+
+    # Tool-call name lookup. A role:"tool" result must be labeled with the
+    # name of the tool it answers, but not every agent puts that name on the
+    # tool message: opencode and ollama send `tool_name`/`name` directly,
+    # while Claude Code sends only a `tool_call_id`. So we record names as
+    # assistant tool_calls go by — keyed by id for exact correlation, plus an
+    # ordered list as a positional fallback when no id is present anywhere.
+    tool_names_by_id: Dict[str, str] = {}
+    pending_tool_names: List[str] = []
 
     for msg in original_messages:
         role = msg.get("role")
@@ -621,6 +634,12 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
                     func = tc.get("function", {})
                     name = func.get("name", "unknown")
                     args = func.get("arguments", {})
+                    # Record the call name so the matching tool result can be
+                    # labeled even if it carries no name field of its own.
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        tool_names_by_id[tc_id] = name
+                    pending_tool_names.append(name)
                     # Ollama args is an object; render as compact JSON. Accept a
                     # string defensively in case of mixed-protocol clients.
                     if isinstance(args, str):
@@ -635,9 +654,21 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
             # Wrap the tool result in explicit open/close markers. The content
             # is taken VERBATIM — never parsed — because opencode and Claude
             # Code present tool output differently and harness must stay
-            # agnostic to both. tool_name comes from message metadata, not
-            # from inspecting the content.
-            tool_name = msg.get("tool_name") or msg.get("name") or "unknown_tool"
+            # agnostic to both. The name comes from message metadata, never
+            # from inspecting the content: an explicit `tool_name`/`name` field
+            # if present (opencode, ollama), else the `tool_call_id` correlated
+            # against the originating assistant tool_calls (Claude Code), else
+            # positional order, else "unknown_tool".
+            tool_name = msg.get("tool_name") or msg.get("name")
+            tc_id = msg.get("tool_call_id") or msg.get("id")
+            # Pop one positional candidate per tool message so the fallback
+            # queue stays in lockstep with the tool-result stream regardless
+            # of how the other results were resolved.
+            positional = pending_tool_names.pop(0) if pending_tool_names else None
+            if not tool_name and tc_id:
+                tool_name = tool_names_by_id.get(tc_id)
+            if not tool_name:
+                tool_name = positional or "unknown_tool"
             observation = (
                 f'<<<BEGIN_TOOL_RESULT name="{tool_name}">>>\n'
                 f"{content}\n"
