@@ -1133,6 +1133,9 @@ flags:
                   but bypasses any cache-poisoning from earlier failed
                   builds.
 
+Declining the "apply?" prompt skips only the file merges — the upgrade
+still rebuilds images and restarts. Use Ctrl-C to abort entirely.
+
 The set of upgrade actions is driven by scripts/upgrade-manifest.json. Each
 action describes how a file harness manages inside the install root (which
 is the same directory as the clone, post-B4) is brought forward when the
@@ -1197,11 +1200,17 @@ EOF
         return 0
     fi
 
+    # Declining the prompt skips only the file merges — the rebuild +
+    # restart still run. Nothing about applying the manifest gates the
+    # rest of the upgrade, and the git pull has already happened, so a
+    # decline that aborts everything just leaves the user on new code
+    # with stale images. Ctrl-C is the way to bail out entirely.
+    local skip_actions=0
     if (( ! no_prompt )); then
         if [[ -t 0 ]]; then
-            if ! _upgrade_confirm "Apply these upgrade actions? [y/n]: "; then
-                echo "harness: aborted by user"
-                return 1
+            if ! _upgrade_confirm "Apply these upgrade actions? [y/n] (n skips the merges; upgrade still rebuilds + restarts): "; then
+                skip_actions=1
+                echo "harness: skipping upgrade actions; continuing with rebuild + restart"
             fi
         else
             err "non-interactive shell; pass --no-prompt to apply without confirmation"
@@ -1209,7 +1218,9 @@ EOF
         fi
     fi
 
-    apply_upgrade_actions "$manifest" 0
+    if (( ! skip_actions )); then
+        apply_upgrade_actions "$manifest" 0
+    fi
 
     if (( ! no_restart )); then
         cmd_down --remove-orphans 2>/dev/null || true
