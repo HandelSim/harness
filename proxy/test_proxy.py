@@ -789,6 +789,28 @@ class TestPromptInjectionModes(unittest.TestCase):
         # The full per-turn tool-variant builder framing should NOT be present.
         self.assertNotIn("NOT a message from the user", c)
 
+    def test_mode_user_front_intro_line_before_request(self):
+        """user_front opens with the persona-preserve intro line, THEN the
+        request, THEN the tool list (intro → delimited block → tools)."""
+        result = self._translate_with_mode("user_front")
+        last_user = result[-1]["content"]
+        intro_pos = last_user.index("do not adopt a new identity")
+        request_pos = last_user.index("<<<BEGIN_USER_REQUEST>>>")
+        tools_pos = last_user.index("Available Tools")
+        self.assertLess(
+            intro_pos, request_pos,
+            "user_front: persona intro line must come before the request",
+        )
+        self.assertLess(request_pos, tools_pos)
+
+    def test_mode_user_bookend_intro_line_before_request(self):
+        """user_bookend uses the same intro-first layout as user_front."""
+        result = self._translate_with_mode("user_bookend")
+        last_user = result[-1]["content"]
+        intro_pos = last_user.index("do not adopt a new identity")
+        first_request_pos = last_user.index("<<<BEGIN_USER_REQUEST>>>")
+        self.assertLess(intro_pos, first_request_pos)
+
 
 class TestToolResultDelimiting(unittest.TestCase):
     """Tool results are wrapped in <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>>
@@ -913,6 +935,72 @@ class TestToolResultDelimiting(unittest.TestCase):
         self.assertIn("TOOLS_HERE", out)
         self.assertLess(out.index("TOOLS_HERE"), out.index(wrapped))
         self.assertNotIn("<<<BEGIN_OBSERVATION>>>", out)
+
+    def test_tool_result_name_resolved_via_tool_call_id(self):
+        """A role:'tool' message with no name field but a tool_call_id is
+        labeled by correlating that id against the originating assistant
+        tool_calls — the shape Claude Code sends."""
+        msgs = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "toolu_abc", "function": {"name": "Bash", "arguments": {}}},
+            ]},
+            {"role": "tool", "tool_call_id": "toolu_abc", "content": "ok"},
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "tools")
+        c = out[-1]["content"]
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="Bash">>>', c)
+        self.assertNotIn("unknown_tool", c)
+
+    def test_tool_result_name_falls_back_to_positional_order(self):
+        """With neither a name field nor a tool_call_id, the name is
+        recovered from the order of the assistant's tool_calls."""
+        msgs = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "read", "arguments": {}}},
+                {"function": {"name": "write", "arguments": {}}},
+            ]},
+            {"role": "tool", "content": "first result"},
+            {"role": "tool", "content": "second result"},
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "tools")
+        c = out[-1]["content"]
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="read">>>', c)
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="write">>>', c)
+        self.assertNotIn("unknown_tool", c)
+
+    def test_tool_result_name_prefers_explicit_field(self):
+        """An explicit tool_name field wins over id correlation and
+        positional order — opencode and ollama send it directly."""
+        msgs = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "toolu_x", "function": {"name": "WrongName", "arguments": {}}},
+            ]},
+            {"role": "tool", "tool_name": "RightName", "tool_call_id": "toolu_x",
+             "content": "ok"},
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "tools")
+        c = out[-1]["content"]
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="RightName">>>', c)
+        self.assertNotIn("WrongName", c)
+
+    def test_tool_result_name_unknown_when_no_metadata(self):
+        """No name field, no id, and no preceding tool_calls to draw from →
+        labeled unknown_tool rather than crashing."""
+        msgs = [
+            {"role": "user", "content": "go"},
+            {"role": "tool", "content": "orphan result"},
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "tools")
+        c = out[-1]["content"]
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="unknown_tool">>>', c)
+        self.assertIn("orphan result", c)
 
 
 class TestChangeSystemToUser(unittest.TestCase):
