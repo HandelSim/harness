@@ -140,9 +140,37 @@ def save_debug_file(req_id: str, stage_prefix: str, stage_name: str, payload: An
 
 
 # ---------------------------------------------------------------------------
-# Preserved-verbatim helpers (proven correct against opencode in production).
-# Do not modify these — the prompt text inside is tuned.
+# Cooperative-prompt builders and tool-call extraction.
+#
+# The prompt text in these builders is tuned — change it deliberately, with
+# a reason, not incidentally. It must stay AGENT-AGNOSTIC: harness serves
+# both opencode and Claude Code, which present tool results differently. The
+# builders therefore wrap and inject around incoming content; they never
+# parse or depend on the shape of what the agent put inside a tool message.
 # ---------------------------------------------------------------------------
+
+# Tool-result turns: the translator wraps every role:"tool" message's content
+# in <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>> markers BEFORE any builder
+# runs, so the result arrives self-delimiting. The tool-variant builders below
+# only inject framing around that already-delimited block — they do not parse
+# it and do not re-wrap it. This framing line states what the block is and the
+# loop semantics; it opens every tool-result turn.
+_TOOL_RESULT_FRAMING = (
+    "[The <<<BEGIN_TOOL_RESULT>>> block(s) in this message are output from "
+    "tool call(s) you made on a previous turn — they are NOT a message from "
+    "the user. Review the result(s), then continue the task: emit a ```json "
+    "block to call another tool, or give your final answer if the task is "
+    "complete.]"
+)
+
+# Closes a tool-result turn in user_front (`tool_front`) mode so the recency
+# slot is a "now act" instruction rather than raw tool schema.
+_TOOL_CONTINUE_CUE = (
+    "[End of tool definitions. Act on the tool result(s) above now — emit a "
+    "```json tool call to continue, or give your final answer if the task is "
+    "complete.]"
+)
+
 
 def format_tools_to_text(tools_array):
     # Emit the full JSON Schema for each tool's parameters rather than a
@@ -197,10 +225,15 @@ You may explain your thought process before or after the JSON block. If NO tools
 
 
 def build_cooperative_prompt_tool(original_content, tools_text):
-    return f"""You are a helpful AI assistant executing a multi-step process.
+    """Legacy `user`-mode builder for tool-result turns. `original_content`
+    arrives already wrapped in <<<BEGIN_TOOL_RESULT>>> markers by the
+    translator, so this builder injects framing only — it neither parses nor
+    re-wraps the result. The result stays at the END (the `user`-mode layout).
+    """
+    return f"""{_TOOL_RESULT_FRAMING}
 
 ### Tool Usage Instructions
-Review the latest System Observation below. If you need to use another tool to continue, output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```) with this structure:
+To call another tool, output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```) with this structure:
 {{
   "name": "<tool_name>",
   "arguments": {{
@@ -212,10 +245,8 @@ You may explain your reasoning before or after the JSON block. If the task is fu
 ### Available Tools
 {tools_text}
 
-### Latest System Observation
-<<<BEGIN_OBSERVATION>>>
+### Tool Result
 {original_content}
-<<<END_OBSERVATION>>>
 """
 
 
@@ -252,18 +283,20 @@ You may explain your thought process before or after the JSON block. If NO tools
 
 def build_cooperative_prompt_tool_front(original_content, tools_text):
     """tool_front mode (the user_front variant for tool-result turns).
-    The tool result observation goes first, then the tool definitions.
+    `original_content` is already wrapped in <<<BEGIN_TOOL_RESULT>>> markers
+    by the translator. Layout: framing line, the delimited result, tool
+    definitions, then a one-line continue cue so the recency slot is a
+    'now act' instruction rather than raw tool schema. The builder injects
+    framing around the result — it does not parse or re-wrap it.
     """
-    return f"""<<<BEGIN_USER_REQUEST>>>
+    return f"""{_TOOL_RESULT_FRAMING}
+
 {original_content}
-<<<END_USER_REQUEST>>>
 
 ---
 
-You are a helpful and intelligent AI assistant.
-
 ### Tool Usage Instructions
-You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
+To call another tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
 {{
   "name": "<tool_name>",
   "arguments": {{
@@ -271,10 +304,14 @@ You have access to specific tools to help answer the user's request. If you need
   }}
 }}
 
-You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
+You may explain your thought process before or after the JSON block. If NO further tool calls are needed, give your final answer normally.
 
 ### Available Tools
 {tools_text}
+
+---
+
+{_TOOL_CONTINUE_CUE}
 """
 
 
@@ -316,19 +353,20 @@ You may explain your thought process before or after the JSON block. If NO tools
 
 def build_cooperative_prompt_tool_bookend(original_content, tools_text):
     """tool_bookend mode (the user_bookend variant for tool-result turns).
-    Tool result observation appears at both ends with the tool definitions
-    in the middle.
+    `original_content` is already wrapped in <<<BEGIN_TOOL_RESULT>>> markers
+    by the translator. Layout: framing line, the delimited result, tool
+    definitions, then the delimited result again — the repeated result
+    occupies the recency slot. The builder injects framing around the
+    result — it does not parse or re-wrap it.
     """
-    return f"""<<<BEGIN_USER_REQUEST>>>
+    return f"""{_TOOL_RESULT_FRAMING}
+
 {original_content}
-<<<END_USER_REQUEST>>>
 
 ---
 
-You are a helpful and intelligent AI assistant.
-
 ### Tool Usage Instructions
-You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
+To call another tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
 {{
   "name": "<tool_name>",
   "arguments": {{
@@ -336,16 +374,16 @@ You have access to specific tools to help answer the user's request. If you need
   }}
 }}
 
-You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
+You may explain your thought process before or after the JSON block. If NO further tool calls are needed, give your final answer normally.
 
 ### Available Tools
 {tools_text}
 
 ---
 
-<<<BEGIN_USER_REQUEST>>>
+{_TOOL_RESULT_FRAMING}
+
 {original_content}
-<<<END_USER_REQUEST>>>
 """
 
 
@@ -531,9 +569,10 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
     """
     Translate ollama-format messages into a flat conversation suitable for the
     upstream API. Tool calls become markdown JSON blocks embedded in assistant
-    content; tool results become System Observations folded into the next user
-    message. The cooperative-prompt wrapper is applied to the final user message
-    if tools are available.
+    content; tool results (role:"tool" messages) are wrapped verbatim in
+    <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>> markers and folded into a
+    user message. The cooperative-prompt wrapper is applied to the final user
+    message if tools are available.
     """
     if not original_messages:
         return []
@@ -578,8 +617,17 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
             messages.append({"role": "assistant", "content": content.strip()})
 
         elif role == "tool":
+            # Wrap the tool result in explicit open/close markers. The content
+            # is taken VERBATIM — never parsed — because opencode and Claude
+            # Code present tool output differently and harness must stay
+            # agnostic to both. tool_name comes from message metadata, not
+            # from inspecting the content.
             tool_name = msg.get("tool_name") or msg.get("name") or "unknown_tool"
-            observation = f"[System Observation: Tool '{tool_name}' executed. Result:]\n{content}"
+            observation = (
+                f'<<<BEGIN_TOOL_RESULT name="{tool_name}">>>\n'
+                f"{content}\n"
+                f"<<<END_TOOL_RESULT>>>"
+            )
             if messages and messages[-1]["role"] == "user":
                 messages[-1]["content"] += f"\n\n{observation}"
             else:
@@ -625,9 +673,9 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
         else:
             # 'system' or 'hybrid' — both append scaffolding to the system
             # message. The tool-result handling above already converted
-            # role:"tool" entries into user messages with a [System
-            # Observation] wrapper; we don't tack the cooperative prompt
-            # onto those (it lives in the system message instead).
+            # role:"tool" entries into user messages wrapped in
+            # <<<BEGIN_TOOL_RESULT>>> markers; we don't tack the cooperative
+            # prompt onto those (it lives in the system message instead).
             system_addition = build_cooperative_prompt_system_addition(tools_text)
             if messages[0]["role"] == "system":
                 existing = messages[0]["content"]
