@@ -5,6 +5,12 @@ At startup the mock loads them lexicographically and, on every request,
 matches the **most recent user-message content** against each fixture's
 `match` regex (case-insensitive, multiline). The first hit wins.
 
+The proxy's cooperative-prompt scaffolding — the tool-schema dump it pads
+the user message with — is stripped before matching (the mock unwraps the
+`<<<BEGIN_USER_REQUEST>>>` / `<<<BEGIN_TOOL_RESULT>>>` markers). So a
+`match` regex only ever sees the user's real request or a tool result;
+don't write a regex expecting to target the injected tool descriptions.
+
 Mount this directory into the mock container at `/fixtures` and set
 `MOCK_FIXTURES_DIR=/fixtures` to enable the dispatch path. Without that env
 var, the mock falls back to the legacy `MOCK_SCENARIO={text,tool}` env (so
