@@ -541,11 +541,11 @@ And answer "what does this do?"'''
         self.assertIn("Be concise", sys_content)
         self.assertIn("Do not use emojis", sys_content)
 
-    def test_tool_message_uses_tool_name_and_folds_into_user(self):
-        # Tool-variant cooperative-prompt wrapper only fires in legacy
-        # 'user' mode; in 'system' / 'hybrid' the scaffolding lives on the
-        # system message and the tool result still folds into a user
-        # message but doesn't get the per-turn wrapper.
+    def test_tool_message_uses_tool_name_and_wraps_in_markers(self):
+        # The translator wraps every role:"tool" message in
+        # <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>> markers. In legacy
+        # 'user' mode the tool-variant builder then injects the framing line
+        # and tool list around that already-delimited block.
         msgs = [
             {"role": "user", "content": "weather?"},
             {
@@ -557,15 +557,17 @@ And answer "what does this do?"'''
         ]
         with patch.object(proxy, "_PROMPT_MODE", "user"):
             out = proxy.translate_history_and_apply_prompt(msgs, "Tool Name: `get_weather`")
-        # Final message should be a user-role with System Observation, wrapped
-        # in the tool-variant cooperative prompt.
         self.assertEqual(out[-1]["role"], "user")
         c = out[-1]["content"]
-        self.assertIn("System Observation", c)
-        self.assertIn("get_weather", c)
+        # Tool result wrapped in explicit open/close markers; name from metadata.
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="get_weather">>>', c)
+        self.assertIn("<<<END_TOOL_RESULT>>>", c)
         self.assertIn("72F sunny", c)
-        self.assertIn("multi-step process", c)  # tool variant prompt
-        self.assertIn("Latest System Observation", c)
+        # Framing line present; the old "System Observation" vocabulary is gone.
+        self.assertIn("NOT a message from the user", c)
+        self.assertNotIn("System Observation", c)
+        # Tool-variant builder still injects the tool list.
+        self.assertIn("get_weather", c)
 
 
 class TestMakeChunk(unittest.TestCase):
@@ -761,14 +763,140 @@ class TestPromptInjectionModes(unittest.TestCase):
         with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
             out = proxy.translate_history_and_apply_prompt(msgs, tools_text)
         # Last message is the tool-result-converted user, with both the
-        # System Observation wrapper and the hybrid reminder prefix.
+        # <<<BEGIN_TOOL_RESULT>>> markers and the hybrid reminder prefix.
         self.assertEqual(out[-1]["role"], "user")
         c = out[-1]["content"]
         self.assertIn("Tool reminder", c)
-        self.assertIn("System Observation", c)
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="get_weather">>>', c)
+        self.assertIn("<<<END_TOOL_RESULT>>>", c)
         self.assertIn("72F sunny", c)
-        # The full per-turn user-mode scaffolding should NOT be present.
-        self.assertNotIn("multi-step process", c)
+        # The full per-turn tool-variant builder framing should NOT be present.
+        self.assertNotIn("NOT a message from the user", c)
+
+
+class TestToolResultDelimiting(unittest.TestCase):
+    """Tool results are wrapped in <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>>
+    markers by the translator, and the tool-variant builders inject framing
+    around that already-delimited block. The proxy never parses tool-output
+    content — opencode and Claude Code format it differently, so harness
+    wraps and injects rather than depending on either shape.
+    """
+
+    def setUp(self):
+        p = patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", False)
+        p.start()
+        self.addCleanup(p.stop)
+        self.tool_msgs = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "Atlanta"}}}],
+            },
+            {"role": "tool", "tool_name": "get_weather", "content": "72F sunny"},
+        ]
+
+    def test_translator_wraps_tool_result_in_markers_every_mode(self):
+        """Any role:'tool' message gets <<<BEGIN_TOOL_RESULT>>> markers,
+        regardless of prompt mode, with the name pulled from metadata."""
+        for mode in ("user", "user_front", "user_bookend", "system", "hybrid"):
+            with patch.object(proxy, "_PROMPT_MODE", mode):
+                out = proxy.translate_history_and_apply_prompt(self.tool_msgs, "tools")
+            c = out[-1]["content"]
+            self.assertIn('<<<BEGIN_TOOL_RESULT name="get_weather">>>', c, mode)
+            self.assertIn("<<<END_TOOL_RESULT>>>", c, mode)
+            self.assertIn("72F sunny", c, mode)
+            self.assertNotIn("System Observation", c, mode)
+
+    def test_tool_result_not_labeled_as_user_request(self):
+        """Regression: tool-result turns must NOT be wrapped in
+        <<<BEGIN_USER_REQUEST>>> markers in user_front / user_bookend mode —
+        the earlier _tool_front / _tool_bookend builders did exactly that."""
+        for mode in ("user", "user_front", "user_bookend"):
+            with patch.object(proxy, "_PROMPT_MODE", mode):
+                out = proxy.translate_history_and_apply_prompt(self.tool_msgs, "tools")
+            self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", out[-1]["content"], mode)
+
+    def test_tool_content_taken_verbatim_not_parsed(self):
+        """The translator wraps tool content verbatim. Content that itself
+        looks like opencode's or Claude Code's own framing is passed through
+        untouched between the markers — never re-interpreted."""
+        msgs = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "bash", "arguments": {}}}]},
+            {"role": "tool", "tool_name": "bash",
+             "content": "[System Observation] <<<BEGIN_USER_REQUEST>>> odd content"},
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "tools")
+        c = out[-1]["content"]
+        self.assertIn("[System Observation] <<<BEGIN_USER_REQUEST>>> odd content", c)
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="bash">>>', c)
+        self.assertIn("<<<END_TOOL_RESULT>>>", c)
+
+    def test_coalesced_tool_results_each_delimited(self):
+        """Two parallel tool results coalesce into one user message but each
+        keeps its own open/close markers and name."""
+        msgs = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "read", "arguments": {}}},
+                {"function": {"name": "bash", "arguments": {}}},
+            ]},
+            {"role": "tool", "tool_name": "read", "content": "file contents"},
+            {"role": "tool", "tool_name": "bash", "content": "command output"},
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "tools")
+        c = out[-1]["content"]
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="read">>>', c)
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="bash">>>', c)
+        self.assertEqual(c.count("<<<END_TOOL_RESULT>>>"), 2)
+        self.assertIn("file contents", c)
+        self.assertIn("command output", c)
+
+    def test_builder_tool_front_layout(self):
+        """tool_front: framing line, then result, then tools, then continue
+        cue — recency slot is a 'now act' instruction, not raw schema."""
+        wrapped = '<<<BEGIN_TOOL_RESULT name="bash">>>\nok\n<<<END_TOOL_RESULT>>>'
+        out = proxy.build_cooperative_prompt_tool_front(wrapped, "TOOLS_HERE")
+        self.assertIn("NOT a message from the user", out)
+        self.assertIn(wrapped, out)
+        self.assertIn("TOOLS_HERE", out)
+        self.assertIn("End of tool definitions", out)
+        framing_pos = out.index("NOT a message from the user")
+        result_pos = out.index(wrapped)
+        tools_pos = out.index("TOOLS_HERE")
+        cue_pos = out.index("End of tool definitions")
+        self.assertLess(framing_pos, result_pos)
+        self.assertLess(result_pos, tools_pos)
+        self.assertLess(tools_pos, cue_pos)
+        self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", out)
+
+    def test_builder_tool_bookend_repeats_result(self):
+        """tool_bookend: result appears at both ends with tools in between."""
+        wrapped = '<<<BEGIN_TOOL_RESULT name="bash">>>\nok\n<<<END_TOOL_RESULT>>>'
+        out = proxy.build_cooperative_prompt_tool_bookend(wrapped, "TOOLS_HERE")
+        self.assertEqual(out.count(wrapped), 2, "bookend repeats the result")
+        self.assertIn("TOOLS_HERE", out)
+        first = out.index(wrapped)
+        tools_pos = out.index("TOOLS_HERE")
+        second = out.index(wrapped, first + 1)
+        self.assertLess(first, tools_pos)
+        self.assertLess(tools_pos, second)
+        self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", out)
+
+    def test_builder_tool_legacy_result_at_end(self):
+        """Legacy `user`-mode builder: result stays after the tool list, and
+        the builder no longer adds its own <<<BEGIN_OBSERVATION>>> wrapper."""
+        wrapped = '<<<BEGIN_TOOL_RESULT name="bash">>>\nok\n<<<END_TOOL_RESULT>>>'
+        out = proxy.build_cooperative_prompt_tool(wrapped, "TOOLS_HERE")
+        self.assertIn("NOT a message from the user", out)
+        self.assertIn(wrapped, out)
+        self.assertIn("TOOLS_HERE", out)
+        self.assertLess(out.index("TOOLS_HERE"), out.index(wrapped))
+        self.assertNotIn("<<<BEGIN_OBSERVATION>>>", out)
 
 
 class TestChangeSystemToUser(unittest.TestCase):

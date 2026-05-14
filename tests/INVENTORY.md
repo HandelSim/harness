@@ -191,7 +191,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P023 | `_scan_balanced_json` correctly handles strings containing literal backticks |
 | P024 | `_scan_balanced_json` returns failure on truncated JSON |
 | P025 | Tool calls in assistant history are converted to fenced ```json markdown blocks for upstream |
-| P026 | Tool results in user history are converted to `System Observation:` blocks for upstream |
+| P026 | Tool results in user history are wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` / `<<<END_TOOL_RESULT>>>` markers for upstream |
 | P027 | `translate_history_and_apply_prompt` coalesces consecutive same-role messages |
 | P028 | Multiple consecutive system messages are merged into one |
 | P029 | Multiple consecutive user messages are merged into one |
@@ -218,7 +218,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P050 | Debug dumps are skipped silently when `OUTPUT_DIR` is unset |
 | P051 | Streaming requests yield NDJSON with one chunk per upstream delta |
 | P052 | Non-streaming requests still yield a single NDJSON line followed by the done chunk |
-| P053 | Tool-result messages in the inbound ollama payload are translated into user-role `System Observation:` text |
+| P053 | Tool-result messages in the inbound ollama payload are translated into user-role text, wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers (content never parsed; agent-agnostic) |
 | P054 | The cooperative prompt instructs the model to use ```json fenced blocks for tool calls |
 | P055 | The cooperative prompt enumerates available tools by name and schema |
 | P056 | Proxy passes through the upstream `model` field as `PROXY_API_MODEL`, not the inbound ollama model name |

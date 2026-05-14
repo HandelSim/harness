@@ -63,6 +63,26 @@ accepts:
 
 Invalid values fall back to `user_front` with a warning.
 
+## Tool-result delimiting
+
+`role:"tool"` messages are wrapped — content **verbatim**, never parsed —
+in `<<<BEGIN_TOOL_RESULT name="…">>>` / `<<<END_TOOL_RESULT>>>` markers at
+translation time, so a tool result is unambiguously bounded whether it is
+the live turn or buried in history. The name comes from message metadata
+(`tool_name` / `name`), not the content. harness serves both opencode and
+Claude Code, which format tool output differently; wrapping rather than
+parsing keeps the proxy agnostic to either shape.
+
+On a tool-result turn the `user` / `user_front` / `user_bookend` modes use
+tool-variant builders (`build_cooperative_prompt_tool*`) that inject a
+framing line — "this block is tool output, not a user message; continue
+the task" — around the already-delimited result, instead of the
+`<<<BEGIN_USER_REQUEST>>>` wrapper used for genuine user turns. `tool_front`
+additionally closes with a one-line "now act" cue so the recency slot is an
+instruction rather than raw schema. The `system` / `hybrid` modes leave the
+marker-wrapped result as the user message and keep the scaffold in the
+system message.
+
 ## `_CHANGE_SYSTEM_TO_USER`
 
 Default ON. Some upstreams silently drop the `system` role; the

@@ -62,8 +62,8 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   249 |   62.7% |
-| yellow   |     3 |    0.8% |
+| green    |   250 |   63.0% |
+| yellow   |     2 |    0.5% |
 | red      |   145 |   36.5% |
 | **total**|   397 |  100.0% |
 
@@ -72,7 +72,7 @@ Per-prefix breakdown (J2):
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
 | F      |   139 |    95 |      0 |  44 |
-| P      |    56 |    41 |      2 |  13 |
+| P      |    56 |    42 |      1 |  13 |
 | A      |    34 |    18 |      0 |  16 |
 | M      |    23 |    18 |      0 |   5 |
 | N      |    30 |     6 |      0 |  24 |
@@ -82,8 +82,8 @@ Per-prefix breakdown (J2):
 | I      |    42 |    26 |      0 |  16 |
 
 (Per-prefix counts derived directly from this file's status column; they
-reconcile to the total table above. The three remaining yellows — P008,
-P029, Pe006 — are all indirect-evidence items where the surrounding test
+reconcile to the total table above. The two remaining yellows — P008 and
+Pe006 — are indirect-evidence items where the surrounding test
 infrastructure would need substantive extension to promote; they are
 captured in "Notes / known issues" at the bottom.)
 
@@ -291,10 +291,10 @@ non-green rows — the gap.
 | P023 | green  | proxy/test_proxy.py:190-212                 | test_tool_call_with_embedded_code_fences_in_arguments handles literal backticks inside string values. | |
 | P024 | green  | proxy/test_proxy.py:288-295                 | test_truncated_json: returns empty list + original text preserved. | |
 | P025 | green  | proxy/test_proxy.py:483-504                 | test_assistant_tool_call_renders_markdown_block: assistant `tool_calls` rendered as ```json``` block. | |
-| P026 | green  | proxy/test_proxy.py:544-569                 | test_tool_message_uses_tool_name_and_folds_into_user: tool messages become `System Observation:` blocks. | |
+| P026 | green  | proxy/test_proxy.py:544-568                 | test_tool_message_uses_tool_name_and_wraps_in_markers: tool messages wrapped in `<<<BEGIN_TOOL_RESULT>>>` / `<<<END_TOOL_RESULT>>>` markers. | |
 | P027 | green  | proxy/test_proxy.py:528-543                 | test_consecutive_system_messages_are_coalesced AND assistant/user coalescing via tool_call test path. | |
 | P028 | green  | proxy/test_proxy.py:528-543                 | Specifically test_consecutive_system_messages_are_coalesced (joined with `\n\n`). | |
-| P029 | yellow | proxy/test_proxy.py:544-569 (indirect)      | User-message coalescing is checked indirectly via the tool_message_uses_tool_name path. | No direct standalone user/user coalesce test. |
+| P029 | green  | proxy/test_proxy.py:838-857                 | test_coalesced_tool_results_each_delimited: two tool-result-derived user messages coalesce into one, each keeping its own markers. | |
 | P030 | green  | proxy/test_proxy.py:780-811                 | test_change_system_to_user_converts_system_to_user: system role rewritten to user. | |
 | P031 | green  | proxy/test_proxy.py:780-811                 | Same test asserts an assistant stub `"I understand the instructions above."` is inserted. | |
 | P032 | green  | proxy/test_proxy.py:572-583                 | test_streaming_chunk_no_done_reason: ollama-shaped JSON without `done_reason`. Re-asserted in proxy_test.sh:218-249. | |
@@ -318,7 +318,7 @@ non-green rows — the gap.
 | P050 | green  | tests/proxy_test.sh:496-507                 | Scenario F asserts proxy logs DO NOT contain `'failed to save debug file'` AND DO NOT contain `OUTPUT_DIR '' is not writable` — silence is hard-asserted, not implied. | |
 | P051 | green  | tests/proxy_test.sh:356-369                 | Scenario D: streaming request yields multi-line NDJSON; `D_LINE_COUNT >= 2`, final line has `"done":true`. | |
 | P052 | green  | tests/proxy_test.sh:218-249                 | Scenario A: non-stream request produces ONE content chunk + done chunk (NDJSON 2 lines). | |
-| P053 | green  | proxy/test_proxy.py:544-569                 | tool messages translated to user-role `System Observation:` text. | |
+| P053 | green  | proxy/test_proxy.py:799-835                 | TestToolResultDelimiting: tool messages wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers across every prompt mode; content never parsed. | |
 | P054 | green  | proxy/test_proxy.py:26-49 + 96-131          | test_top_level_schema_emitted + test_format_tools_includes_nested_schema confirm tools section format. Cooperative prompt content asserted indirectly via Scenario C body check. | |
 | P055 | green  | proxy/test_proxy.py:26-131                  | TestFormatTools asserts each tool's name, schema, and arguments enumerated. | |
 | P056 | green  | tests/proxy_test.sh:289-352                 | Scenario C body check: keys == `['messages', 'model']`, with `model == PROXY_API_MODEL`. | |
