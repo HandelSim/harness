@@ -1,10 +1,5 @@
 name: 05-multiline-paste
 inventory_refs: [F043, F051]
-# Tracked in #37. Same root cause as scenario 03: the post-paste Enter
-# triggers a real /api/chat call; the placeholder upstream 404s; proxy 502s;
-# wait_stable_ms times out waiting for the TUI to settle.
-expected_failure: true
-expected_failure_reason: "no mock upstream wired in CI; post-paste Enter triggers real /api/chat that placeholder upstream 404s (#37)"
 description: |
   Paste a multi-line block into the claude TUI via bracketed paste and
   verify the TUI treats it as ONE input (i.e. submitting once produces a

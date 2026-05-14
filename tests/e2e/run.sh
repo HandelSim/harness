@@ -74,6 +74,42 @@ echo "e2e scenarios: ${#scenarios[@]} found in $SCENARIOS_DIR"
 echo "e2e logs:      $LOG_DIR"
 echo
 
+# --- optional mock upstream sidecar ----------------------------------------
+#
+# The e2e scenarios drive a full agent -> ollama -> proxy -> upstream round
+# trip, so the proxy needs a real upstream to forward `/api/chat` to. When
+# HARNESS_E2E_MOCK_UPSTREAM=1 (set by the CI e2e job), bring up the shared
+# tests/mock_upstream.py as a sidecar on the harness network with the alias
+# `mockupstream`, and tear it down on exit. PROXY_API_URL must already point
+# at http://mockupstream:9000/... — the proxy reads it once at `harness
+# start`, before this runs (mockupstream is a dotless intra-cluster name, so
+# the proxy's firewall guardrail lets it through without an allowlist entry).
+# Local runs leave the var unset and use whatever upstream the operator's
+# .env configured.
+MOCK_CONTAINER=""
+cleanup_mock() {
+    [[ -n "$MOCK_CONTAINER" ]] || return 0
+    echo "e2e: removing mock upstream sidecar ($MOCK_CONTAINER)"
+    harness_docker rm -f "$MOCK_CONTAINER" >/dev/null 2>&1 || true
+}
+if [[ "${HARNESS_E2E_MOCK_UPSTREAM:-0}" == "1" ]]; then
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    export REPO_ROOT
+    # shellcheck source=../lib/test_helpers.sh
+    source "$REPO_ROOT/tests/lib/test_helpers.sh"
+    e2e_project="${HARNESS_PROJECT_NAME:-harness}"
+    MOCK_CONTAINER="${e2e_project}-mockupstream-1"
+    trap cleanup_mock EXIT
+    echo "e2e: starting mock upstream sidecar ($MOCK_CONTAINER)"
+    test_start_mockupstream "$e2e_project"
+    if ! test_wait_for_container_healthy "$MOCK_CONTAINER" 90; then
+        echo "e2e: mock upstream sidecar did not become healthy within 90s" >&2
+        exit 1
+    fi
+    echo "e2e: mock upstream sidecar healthy"
+    echo
+fi
+
 total=${#scenarios[@]}
 failed=0
 xfailed=0
