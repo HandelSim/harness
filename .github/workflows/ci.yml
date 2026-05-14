@@ -236,16 +236,16 @@ jobs:
             buildx-
 
       # Bootstrap config so `./harness start` will bring the stack up.
-      # PROXY_API_URL must point at a host that is in the allowlist or the
-      # proxy's init-firewall.sh guardrail aborts the container with FATAL
-      # before the healthcheck ever runs. api.github.com is in the bundled
-      # .harness-allowlist.example, so use it as the placeholder — the
-      # proxy never actually calls it because the agents in the scenarios
-      # talk to ollama via the intra-cluster name, not the upstream URL.
+      # PROXY_API_URL points at the mockupstream sidecar that
+      # tests/e2e/run.sh provisions on the harness network (gated by
+      # HARNESS_E2E_MOCK_UPSTREAM=1, set on the run.sh step below). It is a
+      # dotless intra-cluster name, so the proxy's init-firewall.sh
+      # guardrail lets it through without an allowlist entry, and the
+      # scenarios get a real, deterministic upstream to drive.
       - name: Seed harness config
         run: |
           cp .env.example .env
-          sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=https://api.github.com|' .env
+          sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=http://mockupstream:9000/v1/chat/completions|' .env
           sed -i 's|^PROXY_API_KEY=.*|PROXY_API_KEY=ci-placeholder-key|' .env
           sed -i 's|^PROXY_API_MODEL=.*|PROXY_API_MODEL=ci-placeholder-model|' .env
           # harness source .env with `set -a` on every invocation, so even
@@ -347,6 +347,7 @@ jobs:
         env:
           DOCKER_BUILDKIT: "1"
           COMPOSE_DOCKER_CLI_BUILD: "1"
+          HARNESS_E2E_MOCK_UPSTREAM: "1"
         run: bash tests/e2e/run.sh
 
       - name: Diagnostics on failure

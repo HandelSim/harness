@@ -210,3 +210,27 @@ These are why the API looks the way it does:
 | `HARNESS_E2E_SCENARIOS_DIR`    | Override scenarios directory.              | `tests/e2e/scenarios`                  |
 | `HARNESS_E2E_PATTERN`          | Bash glob filter on scenario basenames.    | (unset; matches everything)            |
 | `HARNESS_E2E_LOG_DIR`          | Directory for pipe-pane logs + transcripts.| `/tmp/harness-e2e-<epoch>`             |
+| `HARNESS_E2E_MOCK_UPSTREAM`    | `=1` makes `run.sh` start a `mockupstream` sidecar before the scenarios and remove it after (see "Upstream for scenarios"). | (unset; no sidecar) |
+| `HARNESS_PROJECT_NAME`         | Compose project whose `harness-net` the mock sidecar joins. | `harness` |
+
+## Upstream for scenarios
+
+Every scenario drives a full agent → ollama → proxy → upstream round trip,
+so the `proxy` service needs a real upstream to forward `/api/chat` to. The
+scenarios must stay deterministic and offline-capable, so that upstream is
+always `tests/mock_upstream.py`, never a real LLM.
+
+In CI the e2e job runs `./harness start` (which brings up `proxy` + `ollama`
+with `PROXY_API_URL=http://mockupstream:9000/...`) and then runs `run.sh`
+with `HARNESS_E2E_MOCK_UPSTREAM=1`. That flag makes `run.sh` start the
+shared `tests/mock_upstream.py` as a `mockupstream` sidecar on the harness
+network (via `test_start_mockupstream` from `tests/lib/test_helpers.sh`),
+wait for it healthy, run the scenarios, then remove it. `mockupstream` is a
+dotless intra-cluster name, so the proxy's firewall guardrail lets it
+through without an allowlist entry.
+
+Run it the same way locally:
+
+```bash
+HARNESS_E2E_MOCK_UPSTREAM=1 bash tests/e2e/run.sh
+```
