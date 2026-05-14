@@ -1675,6 +1675,158 @@ if ! grep -q 'firewall DISABLED: ollama' <<<"${t25_out}"; then
 fi
 echo "[harness-test] T25 OK"
 
+# --- Test 26: jq sidecar is started once per invocation and reused (#8) ----
+#
+# The jq-less fallback no longer spawns a container per call — it starts
+# one long-lived `harness-jq-$$` sidecar and runs `docker exec` against it.
+# We simulate a jq-less host, stub the runtime to fake just enough for
+# _ensure_jq_sidecar (and to run the real host `jq` for the `docker exec`
+# leg), call harness_jq twice, and assert exactly one `run -d` and two
+# `docker exec` calls were issued.
+echo "[harness-test] T26: jq sidecar is started once and reused (#8)"
+t26_calls="${TEST_ROOT}/t26-docker-calls"
+: > "${t26_calls}"
+t26_rc=0
+t26_out=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    install_root="${TEST_ROOT}"
+    t26_state="${TEST_ROOT}/t26-sidecar-up"
+    rm -f "${t26_state}"
+    # Simulate a jq-less host: the host-jq probe must report jq missing.
+    command() {
+        if [[ "${1:-}" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi
+        builtin command "$@"
+    }
+    harness_container_runtime() { echo "docker"; }
+    # Stub the runtime: record every call, fake just enough behaviour. The
+    # `exec` leg runs the real host jq so harness_jq still produces output.
+    harness_docker() {
+        printf '%s\n' "$*" >> "${t26_calls}"
+        case "$1" in
+            container)  # container inspect -f '{{.State.Running}}' <name>
+                if [[ -f "${t26_state}" ]]; then echo "true"; else echo ""; fi
+                ;;
+            info)  return 0 ;;
+            image) return 0 ;;                       # image present, skip build
+            ps)    return 0 ;;                       # sweep finds nothing
+            run)   : > "${t26_state}"; echo "cid" ;; # run -d --name ...
+            exec)  shift 3; "$@" ;;                  # exec -i <name> jq <args>
+            rm)    rm -f "${t26_state}"; return 0 ;;
+            *)     return 0 ;;
+        esac
+    }
+    v1=$(echo '{"k":"v1"}' | harness_jq -r '.k')
+    v2=$(echo '{"k":"v2"}' | harness_jq -r '.k')
+    echo "v1=${v1} v2=${v2}"
+) || t26_rc=$?
+if (( t26_rc != 0 )); then
+    echo "[harness-test] T26 FAIL [#8]: harness_jq sidecar path errored (rc=${t26_rc})" >&2
+    cat "${t26_calls}" >&2; exit 1
+fi
+if [[ "${t26_out}" != "v1=v1 v2=v2" ]]; then
+    echo "[harness-test] T26 FAIL [#8]: harness_jq via sidecar produced wrong output: '${t26_out}'" >&2
+    cat "${t26_calls}" >&2; exit 1
+fi
+t26_runs=$(grep -c '^run -d --name harness-jq-' "${t26_calls}" || true)
+t26_execs=$(grep -c '^exec -i harness-jq-' "${t26_calls}" || true)
+if [[ "${t26_runs}" != "1" ]]; then
+    echo "[harness-test] T26 FAIL [#8]: expected 1 sidecar 'run -d', got ${t26_runs}" >&2
+    cat "${t26_calls}" >&2; exit 1
+fi
+if [[ "${t26_execs}" != "2" ]]; then
+    echo "[harness-test] T26 FAIL [#8]: expected 2 'docker exec' jq calls, got ${t26_execs}" >&2
+    cat "${t26_calls}" >&2; exit 1
+fi
+echo "[harness-test] T26 OK"
+
+# --- Test 27: _reap_jq_sidecar tears down only when a sidecar exists (#8) --
+#
+# _reap_jq_sidecar runs from the EXIT trap on every harness invocation,
+# including ones that never touch jq or docker — so it must be a cheap
+# no-op unless a sidecar was actually created. It uses a per-PID marker
+# file under state/ as that signal. Case A: no marker -> no docker call.
+# Case B: marker present -> `docker rm -f` the sidecar and clear the marker.
+echo "[harness-test] T27: _reap_jq_sidecar reaps only when a sidecar marker exists (#8)"
+t27_calls="${TEST_ROOT}/t27-docker-calls"
+
+: > "${t27_calls}"
+(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    install_root="${TEST_ROOT}"
+    harness_docker() { printf '%s\n' "$*" >> "${t27_calls}"; }
+    rm -f "${TEST_ROOT}/state/.harness-jq-sidecar.$$"
+    _reap_jq_sidecar
+)
+if [[ -s "${t27_calls}" ]]; then
+    echo "[harness-test] T27 FAIL [#8]: _reap_jq_sidecar touched docker with no marker present" >&2
+    cat "${t27_calls}" >&2; exit 1
+fi
+
+: > "${t27_calls}"
+t27_rc=0
+(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    install_root="${TEST_ROOT}"
+    harness_docker() { printf '%s\n' "$*" >> "${t27_calls}"; }
+    mkdir -p "${TEST_ROOT}/state"
+    : > "${TEST_ROOT}/state/.harness-jq-sidecar.$$"
+    _reap_jq_sidecar
+    if [[ -f "${TEST_ROOT}/state/.harness-jq-sidecar.$$" ]]; then
+        echo "marker not cleared" >&2; exit 1
+    fi
+) || t27_rc=$?
+if (( t27_rc != 0 )); then
+    echo "[harness-test] T27 FAIL [#8]: _reap_jq_sidecar did not clear the marker" >&2
+    exit 1
+fi
+if ! grep -q '^rm -f harness-jq-' "${t27_calls}"; then
+    echo "[harness-test] T27 FAIL [#8]: _reap_jq_sidecar did not 'docker rm -f' the sidecar" >&2
+    cat "${t27_calls}" >&2; exit 1
+fi
+echo "[harness-test] T27 OK"
+
+# --- Test 28: _sweep_stale_jq_sidecars removes dead-PID sidecars only (#8) -
+#
+# The sweep is the self-healing safety net: it removes `harness-jq-<pid>`
+# containers whose owning process is gone, but must leave alone sidecars
+# owned by harness invocations that are still running. We feed it one
+# dead PID and one live PID (distinct from $$) and assert only the dead
+# one is removed.
+echo "[harness-test] T28: _sweep_stale_jq_sidecars removes dead-PID sidecars only (#8)"
+t28_calls="${TEST_ROOT}/t28-docker-calls"
+: > "${t28_calls}"
+t28_rc=0
+(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    install_root="${TEST_ROOT}"
+    # A definitely-dead PID: spawn a trivial process and reap it.
+    sleep 0 & dead_pid=$!
+    wait "${dead_pid}" 2>/dev/null || true
+    # A definitely-live PID, distinct from the harness PID ($$).
+    sleep 30 & live_pid=$!
+    harness_docker() {
+        case "$1" in
+            ps) printf '%s\n' "harness-jq-${dead_pid}" "harness-jq-${live_pid}" ;;
+            rm) printf '%s\n' "$3" >> "${t28_calls}" ;;   # rm -f <name>
+            *)  return 0 ;;
+        esac
+    }
+    _sweep_stale_jq_sidecars
+    kill "${live_pid}" 2>/dev/null || true
+    wait "${live_pid}" 2>/dev/null || true
+    if ! grep -qx "harness-jq-${dead_pid}" "${t28_calls}"; then
+        echo "dead-PID sidecar was not swept" >&2; exit 1
+    fi
+    if grep -qx "harness-jq-${live_pid}" "${t28_calls}"; then
+        echo "live-PID sidecar was wrongly swept" >&2; exit 1
+    fi
+) || t28_rc=$?
+if (( t28_rc != 0 )); then
+    echo "[harness-test] T28 FAIL [#8]: stale-sidecar sweep behaved incorrectly" >&2
+    cat "${t28_calls}" >&2; exit 1
+fi
+echo "[harness-test] T28 OK"
+
 echo "============================================================"
 echo " HARNESS TEST PASSED"
 echo "============================================================"

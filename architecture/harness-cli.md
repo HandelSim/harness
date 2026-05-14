@@ -123,13 +123,35 @@ budget for an explicit "am I up to date?" query.
 ## `harness_jq` fallback
 
 The script uses `jq` to parse `scripts/upgrade-manifest.json` and the
-net-overrides file. `jq` is a host dependency users often lack; the
-script falls back to `docker run --rm -i --entrypoint jq
-harness-proxy:latest` so the proxy image (which already ships jq for its
-firewall scripts) services CLI jq calls transparently. ~200 ms per call
-overhead. On a fresh install with no proxy image yet, the fallback
-inline-builds the proxy image (one-time, ~2–5 min) with a loud warning so
-the user doesn't think the script froze.
+net-overrides file. `jq` is a host dependency users often lack; when host
+`jq` is missing the script runs jq inside the proxy image (which already
+ships jq for its firewall scripts) so CLI jq calls work transparently.
+
+The fallback does **not** spawn a container per call. `_ensure_jq_sidecar`
+lazily starts one long-lived `sleep infinity` sidecar per `harness`
+invocation, named `harness-jq-$$` — keyed on the main PID so every
+subshell (`$(…)`, `< <(…)`) converges on the same name without shared
+in-process state. Each `harness_jq` call is then a `docker exec` into
+that sidecar, paying the ~container-creation cost once per invocation
+instead of once per call (`harness upgrade` alone makes ~9 jq calls per
+merged file).
+
+Sidecar lifecycle:
+- **Reap** — `_reap_jq_sidecar` removes it. Runs from an `EXIT` trap for
+  normal commands; the agent-launch / `mcp logs` paths `exec` the runtime
+  (bypassing the trap) so they call `_reap_jq_sidecar` explicitly just
+  before `harness_docker_exec`. A per-PID marker file under `state/`
+  makes the reap a cheap no-op when no sidecar was created.
+- **Sweep** — `_sweep_stale_jq_sidecars` removes `harness-jq-<pid>`
+  containers whose owning process is no longer alive (crash, SIGKILL).
+  Called once per jq-less invocation from `_ensure_jq_sidecar` and again
+  from `cmd_down`.
+
+On a fresh install with no proxy image yet, the fallback inline-builds
+the proxy image (one-time, ~2–5 min) with a loud warning so the user
+doesn't think the script froze. That build re-enters `compose()` →
+`write_runtime_override`; the `_harness_wro_in_progress` guard there
+breaks the recursion.
 
 ## `doctor` and `preflight`
 
