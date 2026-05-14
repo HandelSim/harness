@@ -530,7 +530,10 @@ And answer "what does this do?"'''
         generic persona ("You are a helpful and intelligent AI assistant.").
         That line lands in the last user message every turn, so the model
         treated it as the active persona and collapsed the real persona from
-        the upstream conversation. They use additive framing instead."""
+        the upstream conversation. The intro line instead introduces the
+        user-request block and tells the model to keep its established
+        identity — it must not describe the tool-call format (the tool
+        scaffolding sits after the request, not after the intro)."""
         for builder in (
             proxy.build_cooperative_prompt_user,
             proxy.build_cooperative_prompt_user_front,
@@ -539,7 +542,8 @@ And answer "what does this do?"'''
             out = builder("do the thing", "TOOLS_HERE")
             self.assertNotIn("helpful and intelligent AI assistant", out, builder.__name__)
             self.assertIn("do not adopt a new identity", out, builder.__name__)
-            self.assertIn("ADDITION", out, builder.__name__)
+            self.assertIn("user's next message", out, builder.__name__)
+            self.assertNotIn("tool-call format", out, builder.__name__)
 
     def test_consecutive_system_messages_are_coalesced(self):
         """Multiple system messages in input → one coalesced system message in output."""

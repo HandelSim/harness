@@ -172,18 +172,22 @@ _TOOL_CONTINUE_CUE = (
 )
 
 # Opens the cooperative-prompt scaffold on genuine user turns (the
-# build_cooperative_prompt_user* builders). Replaces an earlier generic
-# persona line: because the scaffold lands in the last user message and is
+# build_cooperative_prompt_user* builders). It does two things: tells the
+# model the delimited block is the user's actual message for this turn, and
+# keeps the model's identity anchored. The identity clause replaces an
+# earlier generic persona line ("You are a helpful and intelligent AI
+# assistant"): because the scaffold lands in the last user message and is
 # re-read every turn, the model treated that line as the ACTIVE persona,
 # overriding the real persona from the upstream conversation (e.g. opencode's
-# "You are opencode") and letting the model's pretrained identity surface
-# ("Gemini Enterprise"). This framing declares only the tool-call format and
-# tells the model to keep the persona established earlier in the conversation.
+# "You are opencode") and letting its pretrained identity surface ("Gemini
+# Enterprise"). This line must NOT describe the tool-call format — that
+# scaffolding sits AFTER the request block, so an intro about tools would
+# mislabel what follows it. It also must not contain the literal
+# <<<BEGIN_USER_REQUEST>>> token, which would collide with the real marker.
 _PERSONA_PRESERVE_FRAMING = (
-    "[The tool-call format below is an ADDITION to — not a replacement for — "
-    "the persona, instructions, and context already established earlier in "
-    "this conversation. Continue acting as the assistant defined above; do "
-    "not adopt a new identity.]"
+    "[The delimited block below is the user's next message in this "
+    "conversation. Continue acting as the assistant established earlier in "
+    "this conversation; do not adopt a new identity.]"
 )
 
 
