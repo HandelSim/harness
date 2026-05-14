@@ -525,6 +525,22 @@ And answer "what does this do?"'''
         self.assertEqual(result.count("<<<BEGIN_USER_REQUEST>>>"), 1)
         self.assertEqual(result.count("<<<END_USER_REQUEST>>>"), 1)
 
+    def test_user_builders_omit_generic_persona_line(self):
+        """The build_cooperative_prompt_user* builders must NOT re-declare a
+        generic persona ("You are a helpful and intelligent AI assistant.").
+        That line lands in the last user message every turn, so the model
+        treated it as the active persona and collapsed the real persona from
+        the upstream conversation. They use additive framing instead."""
+        for builder in (
+            proxy.build_cooperative_prompt_user,
+            proxy.build_cooperative_prompt_user_front,
+            proxy.build_cooperative_prompt_user_bookend,
+        ):
+            out = builder("do the thing", "TOOLS_HERE")
+            self.assertNotIn("helpful and intelligent AI assistant", out, builder.__name__)
+            self.assertIn("do not adopt a new identity", out, builder.__name__)
+            self.assertIn("ADDITION", out, builder.__name__)
+
     def test_consecutive_system_messages_are_coalesced(self):
         """Multiple system messages in input → one coalesced system message in output."""
         messages = [
