@@ -166,7 +166,11 @@ either branch (see `.github/workflows/ci.yml`):
   harness, persistence, mcp, firewall).
 - `pipeline` — `tests/full_pipeline_test.sh`.
 - `integration` — `HARNESS_RUN_SLOW=1 tests/integration_test.sh`.
-- `e2e` — `tests/e2e/run.sh` over every scenario.
+- `e2e` — `tests/e2e/run.sh` over every scenario. The job runs
+  `./harness start` with `PROXY_API_URL` pointed at `mockupstream`, then
+  runs `run.sh` with `HARNESS_E2E_MOCK_UPSTREAM=1` so it provisions a
+  `mock_upstream.py` sidecar on the harness network for the scenarios to
+  drive (see `tests/e2e/README.md`).
 - `scheme_contract` — `tests/scheme_contract_test.sh`.
 
 Benchmarks (`harness benchmark ...`) NEVER run in CI; they need an
