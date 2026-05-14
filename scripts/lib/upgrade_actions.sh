@@ -71,7 +71,11 @@ _upg_json_array() {
         return 0
     fi
     local out
-    out=$(printf '%s\n' "$@" | harness_jq -R . | harness_jq -s .)
+    # `-Rn '[inputs]'` slurps every raw line into one array in a single jq
+    # process — same result as the old `-R . | -s .` pipeline (including
+    # the split-on-newline behavior), but one jq invocation instead of two.
+    # On a jq-less host each invocation is a container round-trip.
+    out=$(printf '%s\n' "$@" | harness_jq -Rn '[inputs]')
     _upg_strip_cr "$out"
 }
 
@@ -132,9 +136,13 @@ upgrade_envfile_merge() {
         while IFS= read -r key; do
             [[ -n "$key" ]] && added+=("$key")
         done < <(_upg_envfile_keys "$source" || true)
-        printf '{"action":"envfile_merge","added_keys":%s,"skipped":false,"target":%s,"created":true}\n' \
-            "$(_upg_json_array "${added[@]}")" \
-            "$(_upg_json_str "$target")"
+        # One jq call builds the whole summary object, replacing the
+        # separate _upg_json_array + _upg_json_str round-trips (each a
+        # container spawn on a jq-less host). Keys arrive on stdin as raw
+        # lines; select(.!="") drops the spurious empty line printf emits
+        # when "${added[@]}" expands to nothing.
+        printf '%s\n' "${added[@]}" | harness_jq -cRn --arg target "$target" \
+            '{action:"envfile_merge",added_keys:[inputs|select(.!="")],skipped:false,target:$target,created:true}'
         return 0
     fi
 
@@ -219,9 +227,8 @@ upgrade_envfile_merge() {
         _upg_log "envfile_merge: added ${#added[@]} key(s) to $target: ${added[*]}"
     fi
 
-    printf '{"action":"envfile_merge","added_keys":%s,"skipped":false,"target":%s}\n' \
-        "$(_upg_json_array "${added[@]}")" \
-        "$(_upg_json_str "$target")"
+    printf '%s\n' "${added[@]}" | harness_jq -cRn --arg target "$target" \
+        '{action:"envfile_merge",added_keys:[inputs|select(.!="")],skipped:false,target:$target}'
     return 0
 }
 
@@ -275,9 +282,8 @@ upgrade_linefile_merge() {
         while IFS= read -r entry; do
             [[ -n "$entry" ]] && added+=("$entry")
         done < <(_upg_linefile_entries "$source")
-        printf '{"action":"linefile_merge","added_lines":%s,"warnings":[],"target":%s,"created":true}\n' \
-            "$(_upg_json_array "${added[@]}")" \
-            "$(_upg_json_str "$target")"
+        printf '%s\n' "${added[@]}" | harness_jq -cRn --arg target "$target" \
+            '{action:"linefile_merge",added_lines:[inputs|select(.!="")],warnings:[],target:$target,created:true}'
         return 0
     fi
 
@@ -359,10 +365,15 @@ upgrade_linefile_merge() {
         done
     fi
 
-    printf '{"action":"linefile_merge","added_lines":%s,"warnings":%s,"target":%s}\n' \
-        "$(_upg_json_array "${added[@]}")" \
-        "$(_upg_json_array "${warnings[@]}")" \
-        "$(_upg_json_str "$target")"
+    # warnings is almost always empty (only set on annotation diffs), so
+    # _upg_json_array short-circuits to "[]" with no jq call; added_lines
+    # and the object envelope are then built in a single jq process.
+    local warnings_json
+    warnings_json=$(_upg_json_array "${warnings[@]}")
+    printf '%s\n' "${added[@]}" | harness_jq -cRn \
+        --arg target "$target" \
+        --argjson warnings "$warnings_json" \
+        '{action:"linefile_merge",added_lines:[inputs|select(.!="")],warnings:$warnings,target:$target}'
     return 0
 }
 

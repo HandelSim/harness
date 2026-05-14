@@ -157,7 +157,7 @@ err() {
 # `docker exec` against a long-lived per-invocation sidecar container
 # (_ensure_jq_sidecar) so the ~200ms container-creation cost is paid once
 # per `harness` invocation rather than once per jq call — `harness
-# upgrade` alone makes ~9 jq calls per merged file. Sidecar lifecycle:
+# upgrade` still makes ~3 jq calls per merged file. Sidecar lifecycle:
 # _ensure_jq_sidecar (create), _reap_jq_sidecar (tear down on exit / before
 # exec), _sweep_stale_jq_sidecars (self-heal leaks). See those functions.
 #
@@ -1385,12 +1385,13 @@ apply_upgrade_actions() {
     # 1. Unconditional actions.
     while IFS= read -r action_json; do
         action_json=${action_json%$'\r'}
-        local id type src_rel src target_rel target result rc
-        id=$(_upg_strip_cr "$(harness_jq -r '.id' <<<"$action_json")")
-        type=$(_upg_strip_cr "$(harness_jq -r '.type' <<<"$action_json")")
-        src_rel=$(_upg_strip_cr "$(harness_jq -r '.source' <<<"$action_json")")
+        local id type src_rel src target_rel target result rc fields acc
+        # One jq call pulls all four manifest fields as a TSV row instead
+        # of four separate harness_jq invocations — on a jq-less host each
+        # invocation is a container round-trip.
+        fields=$(_upg_strip_cr "$(harness_jq -r '[.id,.type,.source,.target_relative]|@tsv' <<<"$action_json")")
+        IFS=$'\t' read -r id type src_rel target_rel <<<"$fields"
         src="$clone_dir/$src_rel"
-        target_rel=$(_upg_strip_cr "$(harness_jq -r '.target_relative' <<<"$action_json")")
         target="$install_root/$target_rel"
 
         echo "[$id] $type" >&2
@@ -1415,22 +1416,28 @@ apply_upgrade_actions() {
             failed=$((failed+1))
         fi
         result=$(_upg_strip_cr "$result")
-        if [[ -n "$result" ]] && harness_jq -e . <<<"$result" >/dev/null 2>&1; then
-            results=$(_upg_strip_cr "$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results")")
+        # --argjson validates $result as JSON itself (non-zero exit on
+        # malformed input), so the old separate `jq -e .` guard call is
+        # redundant. Capture into a temp var and only commit it when the
+        # call succeeds — a failed accumulate must never clobber the
+        # running results array.
+        if [[ -n "$result" ]] && \
+           acc=$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results" 2>/dev/null); then
+            results=$(_upg_strip_cr "$acc")
         fi
     done < <(harness_jq -c '.actions[]?' "$manifest")
 
     # 2. Registry actions (gated on `condition`).
     while IFS= read -r action_json; do
         action_json=${action_json%$'\r'}
-        local id type src_rel src target_rel target cond result rc
-        id=$(_upg_strip_cr "$(harness_jq -r '.id' <<<"$action_json")")
-        type=$(_upg_strip_cr "$(harness_jq -r '.type' <<<"$action_json")")
-        src_rel=$(_upg_strip_cr "$(harness_jq -r '.source' <<<"$action_json")")
+        local id type src_rel src target_rel target cond result rc fields acc
+        # One jq call for all five scalar manifest fields (see the
+        # unconditional loop above). `.preserve[]` is an array, so it
+        # stays a separate read below.
+        fields=$(_upg_strip_cr "$(harness_jq -r '[.id,.type,.source,.target_relative,(.condition // "always")]|@tsv' <<<"$action_json")")
+        IFS=$'\t' read -r id type src_rel target_rel cond <<<"$fields"
         src="$clone_dir/$src_rel"
-        target_rel=$(_upg_strip_cr "$(harness_jq -r '.target_relative' <<<"$action_json")")
         target="$install_root/$target_rel"
-        cond=$(_upg_strip_cr "$(harness_jq -r '.condition // "always"' <<<"$action_json")")
 
         if [[ "$cond" == "installed" && ! -d "$target" ]]; then
             echo "[$id] not installed; skipping" >&2
@@ -1463,8 +1470,11 @@ apply_upgrade_actions() {
             failed=$((failed+1))
         fi
         result=$(_upg_strip_cr "$result")
-        if [[ -n "$result" ]] && harness_jq -e . <<<"$result" >/dev/null 2>&1; then
-            results=$(_upg_strip_cr "$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results")")
+        # See the unconditional loop above: --argjson validates $result on
+        # its own, and a failed accumulate must not clobber $results.
+        if [[ -n "$result" ]] && \
+           acc=$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results" 2>/dev/null); then
+            results=$(_upg_strip_cr "$acc")
         fi
     done < <(harness_jq -c '.registry_actions[]?' "$manifest")
 

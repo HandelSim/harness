@@ -133,8 +133,10 @@ invocation, named `harness-jq-$$` — keyed on the main PID so every
 subshell (`$(…)`, `< <(…)`) converges on the same name without shared
 in-process state. Each `harness_jq` call is then a `docker exec` into
 that sidecar, paying the ~container-creation cost once per invocation
-instead of once per call (`harness upgrade` alone makes ~9 jq calls per
-merged file).
+instead of once per call (`harness upgrade` makes ~3 jq calls per merged
+file — manifest fields are read as one `@tsv` row, the per-action result
+is validated and accumulated in one `--argjson` call, and each merge
+helper builds its summary object in a single `jq -n`).
 
 Sidecar lifecycle:
 - **Reap** — `_reap_jq_sidecar` removes it. Runs from an `EXIT` trap for
