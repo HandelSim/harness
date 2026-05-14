@@ -283,6 +283,29 @@ T5F=$(upgrade_linefile_merge "${T5_DIR}/src.list" "${T5_DIR}/tgt.list" 0)
 grep -Eq '^github\.com$' "${T5_DIR}/tgt.list" || fail "T5.4: target line should not have been modified"
 ok "T5.4: linefile annotation discrepancy yields warning, no modification"
 
+# 5.5: comment-only source + missing target — the created-path summary
+# builds added_keys from an empty bash array. The single-jq-call emit
+# feeds keys to jq on stdin via `printf '%s\n' "${added[@]}"`, which
+# prints one empty line when the array is empty; the `select(.!="")`
+# filter must drop it so added_keys is `[]`, not `[""]`.
+rm -f "${T5_DIR}/created-empty.env"
+T5G=$(upgrade_envfile_merge "${T5_DIR}/comments.env" "${T5_DIR}/created-empty.env" 0)
+[[ -f "${T5_DIR}/created-empty.env" ]] || fail "T5.5: target was not created"
+[[ "$(json_field 'created' "${T5G}")" == "true" ]] || fail "T5.5: created flag missing"
+[[ "$(json_field 'added_keys | length' "${T5G}")" == "0" ]] \
+    || fail "T5.5: empty added_keys leaked a phantom entry (got $(json_field 'added_keys' "${T5G}"))"
+ok "T5.5: created-path emit yields added_keys=[] for a comment-only source"
+
+# 5.6: same empty-array edge for linefile_merge's created path.
+printf '# only a comment\n' >"${T5_DIR}/comments.list"
+rm -f "${T5_DIR}/created-empty.list"
+T5H=$(upgrade_linefile_merge "${T5_DIR}/comments.list" "${T5_DIR}/created-empty.list" 0)
+[[ -f "${T5_DIR}/created-empty.list" ]] || fail "T5.6: target was not created"
+[[ "$(json_field 'created' "${T5H}")" == "true" ]] || fail "T5.6: created flag missing"
+[[ "$(json_field 'added_lines | length' "${T5H}")" == "0" ]] \
+    || fail "T5.6: empty added_lines leaked a phantom entry (got $(json_field 'added_lines' "${T5H}"))"
+ok "T5.6: created-path emit yields added_lines=[] for a comment-only source"
+
 # === Test 6: synthetic version-N → N+1 end-to-end ========================
 #
 # Build a synthetic install root mirroring "version N" and a synthetic repo
@@ -561,6 +584,15 @@ T9_STR_OUT=$(printf 'hello world' | harness_jq -Rs .)
 T9_ARR_OUT=$(_upg_json_array foo bar | jq -c .)
 [[ "${T9_ARR_OUT}" == '["foo","bar"]' ]] \
     || fail "U025: _upg_json_array via harness_jq produced wrong output (got '${T9_ARR_OUT}')"
+
+# Inventory U025: `_upg_json_array` builds the array in a single
+# `harness_jq -Rn '[inputs]'` call; verify it still JSON-escapes values
+# with embedded quotes and backslashes exactly as the old two-call
+# `-R . | -s .` pipeline did — a botched collapse would corrupt env keys
+# / allowlist entries that contain such characters.
+T9_ESC_OUT=$(_upg_json_array 'a"b' 'c\d' | jq -c .)
+[[ "${T9_ESC_OUT}" == '["a\"b","c\\d"]' ]] \
+    || fail "U025: _upg_json_array did not JSON-escape special chars (got '${T9_ESC_OUT}')"
 
 # Inventory U025: empty-input edge case for _upg_json_array — must yield
 # '[]' without calling harness_jq (the fast path), proving the helper
