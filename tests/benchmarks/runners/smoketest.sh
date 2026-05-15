@@ -99,4 +99,4 @@ else
     HARBOR_ARGS+=(--dataset terminal-bench/canary --n-tasks 1)
 fi
 
-exec harbor "${HARBOR_ARGS[@]}"
+exec "${HARBOR_BIN}" "${HARBOR_ARGS[@]}"
