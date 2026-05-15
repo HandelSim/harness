@@ -31,6 +31,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BENCH_ROOT="$SCRIPT_DIR"
 
+# Pull in bench_jq (host jq, container fallback) so JSON parsing here
+# doesn't require host python or jq.
+# shellcheck source=runners/_lib.sh
+source "${SCRIPT_DIR}/runners/_lib.sh"
+
 KEEP=0
 SCHEMES_CSV=""
 PROBE_MODES=0
@@ -53,8 +58,9 @@ done
 # --- preflight ---------------------------------------------------------------
 command -v docker >/dev/null || { echo "[mock-smoketest] docker required"; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo "[mock-smoketest] docker compose v2 required"; exit 1; }
-command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 || \
-    { echo "[mock-smoketest] need jq or python3 to parse mock request log"; exit 1; }
+# JSON parsing goes through bench_jq, which falls back to a one-shot
+# proxy-image container when host jq is missing — so no separate jq /
+# python3 preflight is needed here.
 
 # Bold + colors for the summary.
 if [[ -t 1 ]]; then BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; RED=$'\033[31m'; RESET=$'\033[0m'
@@ -178,8 +184,8 @@ for scheme in "${SCHEMES[@]}"; do
         # Synthetic probe scheme — mode comes from the lookup, not a file.
         mode="${PROBE_MODE_FOR[$scheme]}"
     elif [[ -f "$scheme_file" ]]; then
-        # Read PROXY_PROMPT_MODE from the scheme JSON (python3 always present).
-        mode=$(python3 -c "import json; print((json.load(open('${scheme_file}')).get('env') or {}).get('PROXY_PROMPT_MODE',''))")
+        # Read PROXY_PROMPT_MODE from the scheme JSON via bench_jq.
+        mode=$(bench_jq -r '(.env // {}).PROXY_PROMPT_MODE // ""' "$scheme_file")
     else
         echo "[mock-smoketest] skip: ${scheme}.json missing"
         continue
@@ -264,22 +270,18 @@ JSON
     # whether tool-scaffolding was injected — the discriminator across
     # PROXY_PROMPT_MODE values.
     if [[ -s "${RUN_DIR}/${scheme}.upstream-request.json" ]]; then
-        preview=$(python3 - <<PY
-import json
-d = json.load(open("${RUN_DIR}/${scheme}.upstream-request.json"))
-msgs = d.get("messages", [])
-roles = [m.get("role","?") for m in msgs]
-print("roles:", ",".join(roles))
-print("count:", len(msgs))
-for i, m in enumerate(msgs):
-    c = m.get("content","") or ""
-    head = c[:120].replace("\n","\\n")
-    tail = c[-120:].replace("\n","\\n") if len(c) > 240 else ""
-    print(f"  [{i}/{m.get('role','?')}] len={len(c)} head={head!r}")
-    if tail:
-        print(f"       tail={tail!r}")
-PY
-)
+        preview=$(bench_jq -r '
+            (.messages // []) as $m
+            | "roles: " + ([$m[].role // "?"] | join(","))
+            , "count: " + ($m | length | tostring)
+            , ( $m | to_entries[] |
+                ((.value.content // "") | tostring) as $c |
+                "  [\(.key)/\(.value.role // "?")] len=\($c | length) head=\($c[0:120] | tojson)" +
+                (if ($c | length) > 240
+                 then "\n       tail=" + ($c[-120:] | tojson)
+                 else "" end)
+              )
+        ' "${RUN_DIR}/${scheme}.upstream-request.json")
         SCHEME_USER_PREFIX[$scheme]="${preview}"
         echo "    upstream request captured ($(stat -c%s "${RUN_DIR}/${scheme}.upstream-request.json") bytes)"
     else

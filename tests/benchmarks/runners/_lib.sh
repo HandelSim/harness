@@ -132,20 +132,27 @@ bench_concurrency() {
     fi
 }
 
-# --- Docker socket sanity ----------------------------------------------------
+# --- Docker daemon sanity ----------------------------------------------------
 #
 # Harbor's per-task container needs host docker access to spawn the
 # harness compose stack. This is a HARD requirement; print a clear
-# diagnostic if the socket is missing or unreadable.
+# diagnostic if the daemon is unreachable.
+#
+# We probe with `docker info` rather than `[[ -S /var/run/docker.sock ]]`
+# because the latter is Linux-only — Docker Desktop on Windows/macOS
+# reaches the daemon over a named pipe / vsock and has no host-side UNIX
+# socket file, even though the `-v /var/run/docker.sock:...` mount used
+# by harbor.sh is translated transparently by Docker Desktop's backend.
+# `docker info` tests what we actually care about (daemon reachable) and
+# works uniformly across Linux, macOS, and Windows.
 bench_check_docker_socket() {
-    if [[ ! -S /var/run/docker.sock ]]; then
-        echo "[bench] WARNING: /var/run/docker.sock not present on host." >&2
+    if ! docker info >/dev/null 2>&1; then
+        echo "[bench] WARNING: docker daemon not reachable" \
+             "(\`docker info\` failed)." >&2
         echo "[bench] Harbor task containers cannot spawn harness compose." >&2
+        echo "[bench] On Linux: start dockerd / check the 'docker' group." >&2
+        echo "[bench] On Docker Desktop: start the app." >&2
         return 1
-    fi
-    if [[ ! -r /var/run/docker.sock ]]; then
-        echo "[bench] WARNING: /var/run/docker.sock not readable by" \
-             "$(id -un). Add user to the 'docker' group." >&2
     fi
 }
 
@@ -165,11 +172,69 @@ bench_check_disk() {
     fi
 }
 
+# --- jq wrapper (host or container fallback) --------------------------------
+#
+# bench_jq — run jq with host args/stdin/stdout/exit semantics. Prefers
+# host jq; falls back to the proxy image's jq via a one-shot container
+# when the host has no jq installed.
+#
+# Why: scheme files are JSON, so reading them needs a JSON parser. The
+# bench runners' contract (README.md) is "no host Python, uv, pipx, or
+# harbor binary needed — just docker + this repo" — which implies no
+# host jq either. Most dev hosts do have jq, so the host path is fast;
+# Windows / minimal Docker Desktop installs get the container path.
+#
+# Mirrors the `harness_jq` pattern in the top-level `harness` script
+# (without the sidecar — bench runners read ≤2 schemes per invocation,
+# so a one-shot container per call is fine).
+#
+# Fallback image: harness-proxy:latest. The proxy ships jq for its own
+# firewall scripts (see proxy/Dockerfile), so reusing it avoids pulling
+# a new image. If the proxy image isn't built yet, we build it once —
+# same UX as harness_jq.
+bench_jq() {
+    if command -v jq >/dev/null 2>&1; then
+        jq "$@"
+        return $?
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        echo "[bench] FATAL: jq not installed on host and docker daemon" \
+             "not reachable for the fallback." >&2
+        echo "[bench] Install jq (apt/dnf/brew/pacman/choco) or start docker." >&2
+        return 1
+    fi
+
+    if ! docker image inspect harness-proxy:latest >/dev/null 2>&1; then
+        echo "[bench] host jq missing; building harness-proxy:latest for the" \
+             "jq fallback (one-time, ~2-5 minutes)..." >&2
+        if ! (cd "${REPO_ROOT}" && docker compose build proxy >&2); then
+            echo "[bench] FATAL: harness-proxy build failed." >&2
+            echo "[bench] Install jq on the host instead." >&2
+            return 1
+        fi
+    fi
+
+    # The container can't see host filesystem paths. If the last argument
+    # is a host file, redirect it as stdin instead of passing it as a
+    # positional arg — matches the `harness_jq` heuristic.
+    local args=("$@")
+    local n=${#args[@]}
+    if (( n > 0 )) && [[ -f "${args[n-1]}" ]]; then
+        local file="${args[n-1]}"
+        unset 'args[n-1]'
+        docker run --rm -i --entrypoint jq \
+            harness-proxy:latest "${args[@]}" <"$file"
+    else
+        docker run --rm -i --entrypoint jq harness-proxy:latest "$@"
+    fi
+}
+
 # --- Scheme env injection ----------------------------------------------------
 #
 # Read a JSON scheme file from tests/benchmarks/schemes/<name>.json and
 # export each key in its "env" object into the current environment.
-# Requires python3 (always present on Oracle Linux).
+# Uses bench_jq, so works on any host with docker (jq optional).
 bench_apply_scheme() {
     local scheme="${1:?scheme name required}"
     local scheme_file="${BENCH_ROOT}/schemes/${scheme}.json"
@@ -177,14 +242,15 @@ bench_apply_scheme() {
         echo "[bench] FATAL: scheme file not found: $scheme_file" >&2
         exit 1
     fi
-    # Emit KEY=VALUE lines and source them. python3 handles JSON for us.
+    # Emit `export KEY=value` lines from the scheme's .env block.
+    # @sh formats values with shell-safe single-quote quoting.
     local kv
-    kv="$(python3 -c "
-import json, shlex, sys
-data = json.load(open('${scheme_file}'))
-for k, v in (data.get('env') or {}).items():
-    print(f'export {k}={shlex.quote(str(v))}')
-")"
+    kv=$(bench_jq -r '
+        (.env // {}) | to_entries[] | "export \(.key)=\(.value | tostring | @sh)"
+    ' "$scheme_file") || {
+        echo "[bench] FATAL: failed to parse $scheme_file" >&2
+        exit 1
+    }
     eval "$kv"
     echo "[bench] Applied scheme: ${scheme}" >&2
 }
