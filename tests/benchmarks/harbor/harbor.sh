@@ -21,12 +21,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
+# shellcheck source=../../../scripts/lib/platform.sh
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
 IMAGE_TAG="${HARNESS_BENCH_HARBOR_IMAGE:-harness-harbor:0.6.6}"
 
 # Build once and cache. `docker image inspect` exits 0 only if present.
-if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+if ! harness_docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
     echo "[harbor.sh] building ${IMAGE_TAG} (one-time)..." >&2
-    docker build -t "${IMAGE_TAG}" "${SCRIPT_DIR}" >&2
+    harness_docker build -t "${IMAGE_TAG}" "${SCRIPT_DIR}" >&2
 fi
 
 # Forward PROXY_*/HARNESS_* env vars so the runner's exported scheme reaches
@@ -44,10 +47,10 @@ done < <(env)
 tty_args=()
 [[ -t 0 && -t 1 ]] && tty_args=(-it)
 
-exec docker run --rm "${tty_args[@]}" \
+harness_docker_exec run --rm "${tty_args[@]}" \
     -v /var/run/docker.sock:/var/run/docker.sock \
-    -v "${REPO_ROOT}":"${REPO_ROOT}" \
-    -v "${PWD}":"${PWD}" \
+    -v "$(harness_docker_path "${REPO_ROOT}")":"${REPO_ROOT}" \
+    -v "$(harness_docker_path "${PWD}")":"${PWD}" \
     -w "${PWD}" \
     "${env_args[@]}" \
     "${IMAGE_TAG}" "$@"
