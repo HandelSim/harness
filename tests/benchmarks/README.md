@@ -169,6 +169,30 @@ siblings on the host daemon — identical layout to the bare-metal path.
 
 ---
 
+## Wiring test (no API key required)
+
+Before consuming real API budget, verify the benchmark plumbing with a
+mock upstream:
+
+```bash
+# Spin up proxy + ollama + mock-api on a private compose project,
+# loop over every scheme, capture per-scheme upstream requests, and
+# print a summary that proves prompt-mode switching works.
+./tests/benchmarks/mock-smoketest.sh                  # tests schemes/*.json
+./tests/benchmarks/mock-smoketest.sh --probe-modes    # also tests every proxy mode
+./tests/benchmarks/mock-smoketest.sh --keep           # leave the stack up to inspect
+```
+
+The script writes artifacts to `tests/benchmarks/runs/mock-smoketest-*/`
+including the exact JSON payload the proxy sent to the mock for each
+scheme. The summary table flags any schemes that produced identical
+requests (i.e. schemes that aren't actually testing different prompts).
+
+This script is **fully independent** from `runners/smoketest.sh` — it
+doesn't touch your real `.env`, doesn't need Harbor, doesn't consume
+LLM budget. Use it after editing schemes or after touching proxy
+prompt-mode logic.
+
 ## Smoketest first
 
 ```bash
