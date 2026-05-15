@@ -6,7 +6,7 @@
 #   bench_guard_ci         FIRST. Refuses to run under CI=*.
 #   bench_check_arch       Warns on aarch64 + sets BENCH_DEFAULT_CONCURRENT=1.
 #   bench_check_binfmt     Verifies binfmt_misc has qemu-x86_64 registered.
-#   bench_require_harbor   Errors out if `harbor` is not on PATH.
+#   bench_require_harbor   Sets HARBOR_BIN to the dockerized wrapper.
 #   bench_concurrency      Echoes the resolved --n-concurrent value.
 #
 # These functions are intentionally simple and dependency-free (bash + GNU
@@ -99,67 +99,19 @@ bench_check_binfmt() {
 
 # --- Harbor resolution -------------------------------------------------------
 #
-# Two modes:
-#   1. Host harbor — `harbor` on PATH (uv/pipx/pip install).
-#   2. Dockerized harbor — tests/benchmarks/harbor/harbor.sh, which runs
-#      Harbor inside a container with the host docker socket and the repo
-#      bind-mounted. Image is built lazily on first call.
-#
-# Override:
-#   HARNESS_BENCH_HARBOR=docker      force the dockerized wrapper
-#   HARNESS_BENCH_HARBOR=/path/bin   use a specific binary
-#   HARNESS_BENCH_HARBOR=host        force the PATH harbor (fail if absent)
-#
-# Default: prefer PATH; fall back to dockerized.
-#
-# The runners use `${HARBOR_BIN}` (not bare `harbor`) for the actual
-# invocation. bench_require_harbor sets HARBOR_BIN and exits non-zero
-# if neither mode is available.
+# Harbor always runs from the dockerized wrapper at
+# tests/benchmarks/harbor/harbor.sh — no host install path is supported.
+# The wrapper builds the pinned image on first call and bind-mounts the
+# host docker socket so Harbor's per-task containers are siblings on the
+# host daemon. Keeping Harbor out of the host environment means a laptop
+# with .env credentials only needs docker + this repo.
 bench_require_harbor() {
-    local mode="${HARNESS_BENCH_HARBOR:-auto}"
     local docker_wrapper="${BENCH_ROOT}/harbor/harbor.sh"
-    case "$mode" in
-        host)
-            command -v harbor >/dev/null 2>&1 || {
-                echo "[bench] FATAL: HARNESS_BENCH_HARBOR=host but 'harbor'" \
-                     "not on PATH." >&2
-                exit 1
-            }
-            HARBOR_BIN="$(command -v harbor)"
-            ;;
-        docker)
-            [[ -x "$docker_wrapper" ]] || {
-                echo "[bench] FATAL: HARNESS_BENCH_HARBOR=docker but" \
-                     "${docker_wrapper} missing or not executable." >&2
-                exit 1
-            }
-            HARBOR_BIN="$docker_wrapper"
-            ;;
-        auto)
-            if command -v harbor >/dev/null 2>&1; then
-                HARBOR_BIN="$(command -v harbor)"
-            elif [[ -x "$docker_wrapper" ]]; then
-                echo "[bench] harbor not on PATH; using dockerized wrapper" \
-                     "(${docker_wrapper})." >&2
-                HARBOR_BIN="$docker_wrapper"
-            else
-                echo "[bench] FATAL: no harbor available. Install one of:" >&2
-                echo "  uv tool install harbor   (host install)" >&2
-                echo "  or ensure tests/benchmarks/harbor/harbor.sh is" \
-                     "executable (dockerized)" >&2
-                exit 1
-            fi
-            ;;
-        *)
-            # Treat as an explicit path.
-            [[ -x "$mode" ]] || {
-                echo "[bench] FATAL: HARNESS_BENCH_HARBOR=$mode is not an" \
-                     "executable path." >&2
-                exit 1
-            }
-            HARBOR_BIN="$mode"
-            ;;
-    esac
+    if [[ ! -x "$docker_wrapper" ]]; then
+        echo "[bench] FATAL: ${docker_wrapper} missing or not executable." >&2
+        exit 1
+    fi
+    HARBOR_BIN="$docker_wrapper"
     export HARBOR_BIN
 }
 
