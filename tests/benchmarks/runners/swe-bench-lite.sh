@@ -97,4 +97,4 @@ if [[ -n "${TASK_IDS}" ]]; then
     done
 fi
 
-exec harbor "${HARBOR_ARGS[@]}"
+exec "${HARBOR_BIN}" "${HARBOR_ARGS[@]}"
