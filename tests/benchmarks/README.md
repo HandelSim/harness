@@ -135,37 +135,23 @@ after observing a clean smoketest.
 
 ---
 
-## Install Harbor
+## Harbor (dockerized only)
 
-Two options. The runners auto-detect — if `harbor` is on PATH, they use
-it; otherwise they fall back to the dockerized wrapper.
+Harbor always runs from a pinned container — there is **no host install
+path**. The wrapper at `tests/benchmarks/harbor/harbor.sh` builds the
+image on first invocation and bind-mounts the host docker socket so
+per-task containers it spawns are siblings on the host daemon.
 
-### Host install (smaller image cache)
-
-```bash
-uv tool install harbor
-# alternatives:
-pipx install harbor
-pip install --user harbor
-
-harbor --help
-```
-
-Harbor depends on Python 3.10+ (uv pulls a 3.13 toolchain by default).
-
-### Dockerized (no host Python or uv needed)
+Host requirements: docker (with compose v2) and this repo. No host
+Python, uv, pipx, or `harbor` binary needed.
 
 ```bash
-# Built lazily on first runner invocation. To pre-build:
+# Image is built lazily on first runner invocation. To pre-build:
 docker build -t harness-harbor:0.6.6 tests/benchmarks/harbor
 
-# Force dockerized even when host harbor is installed:
-export HARNESS_BENCH_HARBOR=docker
+# Override the image tag (e.g. when bumping versions):
+export HARNESS_BENCH_HARBOR_IMAGE=harness-harbor:0.7.0
 ```
-
-The wrapper at `tests/benchmarks/harbor/harbor.sh` bind-mounts the host
-docker socket and the repo, so per-task containers Harbor spawns are
-siblings on the host daemon — identical layout to the bare-metal path.
 
 ---
 

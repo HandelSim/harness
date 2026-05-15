@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
 #
-# Dockerized Harbor wrapper. Same CLI surface as `harbor` on PATH, but
-# runs out of a pinned container so the host doesn't need uv/pipx/Python.
+# Dockerized Harbor wrapper. Runs Harbor out of a pinned container so the
+# host never needs uv/pipx/Python/harbor. The benchmark runners under
+# tests/benchmarks/runners/ always invoke harbor via this wrapper.
 #
-# Usage (identical to bare harbor):
+# Usage (same CLI surface as bare harbor):
 #   harbor.sh run --jobs-dir ./runs --agent-import-path foo:Bar ...
-#
-# Resolution order in tests/benchmarks/runners/_lib.sh:
-#   1. HARNESS_BENCH_HARBOR override (explicit path or 'docker')
-#   2. `harbor` on PATH
-#   3. this wrapper (built on demand)
 #
 # Mounts:
 #   /var/run/docker.sock         (so Harbor can spawn per-task siblings)
