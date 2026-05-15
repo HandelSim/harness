@@ -88,10 +88,15 @@ HARBOR_ARGS=(
 )
 
 if [[ -n "${TASK_IDS}" ]]; then
-    HARBOR_ARGS+=(--task-ids "${TASK_IDS}")
+    # Harbor 0.6.x: -i / --include-task-name takes a single name and is
+    # repeatable. Split comma-separated --task-ids into one flag per task.
+    IFS=',' read -r -a _task_arr <<< "${TASK_IDS}"
+    for t in "${_task_arr[@]}"; do
+        [[ -n "$t" ]] && HARBOR_ARGS+=(-i "$t")
+    done
 else
     # The smallest known Terminal-Bench task; tweak if the dataset moves.
-    HARBOR_ARGS+=(--dataset terminal-bench/canary --limit 1)
+    HARBOR_ARGS+=(--dataset terminal-bench/canary --n-tasks 1)
 fi
 
 exec harbor "${HARBOR_ARGS[@]}"

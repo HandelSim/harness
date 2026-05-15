@@ -94,7 +94,11 @@ HARBOR_ARGS=(
 )
 
 if [[ -n "${TASK_IDS}" ]]; then
-    HARBOR_ARGS+=(--task-ids "${TASK_IDS}")
+    # Harbor 0.6.x: -i / --include-task-name takes a single name, repeatable.
+    IFS=',' read -r -a _task_arr <<< "${TASK_IDS}"
+    for t in "${_task_arr[@]}"; do
+        [[ -n "$t" ]] && HARBOR_ARGS+=(-i "$t")
+    done
 fi
 
 exec harbor "${HARBOR_ARGS[@]}"
