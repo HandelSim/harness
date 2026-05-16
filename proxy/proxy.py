@@ -93,7 +93,7 @@ def _setup_prompt_mode() -> None:
     global. Invalid values fall back to 'user_front' with a warning."""
     global _PROMPT_MODE
     raw = os.environ.get("PROXY_PROMPT_MODE", "user_front").strip().lower()
-    valid = ("user", "system", "hybrid", "user_front", "user_bookend")
+    valid = ("user", "system", "hybrid", "user_front", "user_bookend", "passthrough")
     if raw not in valid:
         print(
             f"[!] PROXY_PROMPT_MODE='{raw}' is not one of "
@@ -596,9 +596,21 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
     originating assistant tool_calls, else positional order. The
     cooperative-prompt wrapper is applied to the final user message if tools
     are available.
+
+    Special-case 'passthrough' mode: emit `original_messages` verbatim (only
+    shallow-copied so the caller can't mutate proxy state through the returned
+    list). No history translation, no cooperative-prompt scaffolding, no
+    system→user rewrite. This is a benchmark control — see the catch_all
+    handler for the matching `tools` passthrough that completes the bypass.
     """
     if not original_messages:
         return []
+
+    if _PROMPT_MODE == "passthrough":
+        # Shallow copy each dict so a downstream mutation can't poison the
+        # caller's view of the upstream payload. We intentionally don't
+        # validate or coerce any fields — the whole point is "do nothing".
+        return [dict(m) for m in original_messages]
 
     messages: List[Dict[str, str]] = []
 
@@ -918,6 +930,15 @@ def catch_all(path: str) -> Response:
             "model": PROXY_API_MODEL,
             "messages": translated,
         }
+        # Passthrough mode forwards the agent's tool definitions to upstream
+        # as-is so the conversation actually contains tool schemas (rather
+        # than the proxy's cooperative-prompt markdown injection). The
+        # benchmark control's value is measuring what harness contributes
+        # by stripping the mediation; the schemas the agent provides match
+        # the ollama tool format, which most non-ollama upstreams won't
+        # honor — that mismatch IS the data point.
+        if _PROMPT_MODE == "passthrough" and tools:
+            upstream_payload["tools"] = tools
         save_debug_file(req_id, "02", "API_Request", upstream_payload)
 
         headers = {
