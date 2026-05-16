@@ -43,9 +43,9 @@ Errors return 502 with a structured body and a debug dump under
 
 The upstream doesn't natively support tool calls, so the proxy injects a
 scaffold that tells the model to emit ```json blocks of the form
-`{"name": "...", "arguments": {...}}`. Five modes live as separate
-`build_cooperative_prompt_*` functions. The validator in `_setup_prompt_mode`
-accepts:
+`{"name": "...", "arguments": {...}}`. Five cooperative modes live as
+separate `build_cooperative_prompt_*` functions, plus one bypass mode.
+The validator in `_setup_prompt_mode` accepts:
 
 - **`user_front`** (default) — full scaffolding on the last user message,
   request placed BEFORE the tool list. Avoids burying a ~10–15K-token tool
@@ -60,6 +60,16 @@ accepts:
   background and don't reliably emit tool calls.
 - **`hybrid`** — full tools in the system message + a ~50-token reminder
   on the last user message.
+- **`passthrough`** — benchmark control. Skips every harness-side
+  mediation: no cooperative-prompt injection, no system→user rewrite, no
+  history translation. `translate_history_and_apply_prompt` short-circuits
+  to `[dict(m) for m in original_messages]`, and `catch_all` forwards
+  `tools` to upstream verbatim (other modes never set `tools` on the
+  upstream payload). Use this to measure what harness's mediation
+  contributes — the request the model sees is the request the agent sent.
+  Note that ollama-format tool schemas typically aren't honored by
+  non-ollama upstreams, so this mode often results in the model not using
+  tools at all; that mismatch IS the data point.
 
 Invalid values fall back to `user_front` with a warning.
 

@@ -816,6 +816,98 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertLess(intro_pos, first_request_pos)
 
 
+class TestPassthroughMode(unittest.TestCase):
+    """`passthrough` mode is the benchmark control: skip every harness-side
+    mediation (cooperative-prompt injection, system→user rewrite, history
+    translation) and forward the agent's request verbatim. The matching
+    tools-passthrough on the catch_all side is covered indirectly: this
+    class verifies translate_history_and_apply_prompt's contract.
+    """
+
+    def test_validator_accepts_passthrough(self):
+        """`passthrough` is in the valid PROMPT_MODE set; it must not coerce
+        to user_front (which was the pre-#58 bug)."""
+        with patch.dict(os.environ, {"PROXY_PROMPT_MODE": "passthrough"}):
+            proxy._setup_prompt_mode()
+            self.assertEqual(proxy._PROMPT_MODE, "passthrough")
+
+    def test_passthrough_skips_cooperative_prompt_injection(self):
+        """With tools provided, passthrough does NOT wrap the last user
+        message in cooperative-prompt scaffolding. Other modes always do."""
+        msgs = [
+            {"role": "system", "content": "You are claude-code."},
+            {"role": "user", "content": "weather?"},
+        ]
+        tools_text = "Tool Name: `get_weather`"
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            out = proxy.translate_history_and_apply_prompt(msgs, tools_text)
+        self.assertEqual(out, msgs)
+        self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", out[-1]["content"])
+        self.assertNotIn("Available Tools", out[-1]["content"])
+
+    def test_passthrough_skips_system_to_user_rewrite(self):
+        """passthrough leaves system role as system even when
+        _CHANGE_SYSTEM_TO_USER is true (the default). Other modes rewrite."""
+        msgs = [
+            {"role": "system", "content": "You are claude-code."},
+            {"role": "user", "content": "hi"},
+        ]
+        with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True), \
+             patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "")
+        self.assertEqual(out[0]["role"], "system")
+        self.assertEqual(out[0]["content"], "You are claude-code.")
+
+    def test_passthrough_does_not_translate_assistant_tool_calls(self):
+        """Other modes render assistant tool_calls into a markdown JSON
+        block in content. passthrough leaves the message structure alone."""
+        msgs = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [{
+                    "function": {"name": "get_weather", "arguments": {"city": "Atlanta"}}
+                }],
+            },
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "")
+        self.assertEqual(out[1]["content"], "checking")
+        self.assertIn("tool_calls", out[1])
+        self.assertNotIn("```json", out[1]["content"])
+
+    def test_passthrough_does_not_wrap_tool_results(self):
+        """Other modes wrap role:tool messages in
+        <<<BEGIN_TOOL_RESULT>>>/<<<END_TOOL_RESULT>>> markers and fold them
+        into a user message. passthrough keeps them as role:tool."""
+        msgs = [
+            {"role": "user", "content": "weather?"},
+            {"role": "tool", "tool_name": "get_weather", "content": "72F sunny"},
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "")
+        self.assertEqual(out[1]["role"], "tool")
+        self.assertEqual(out[1]["content"], "72F sunny")
+        self.assertNotIn("<<<BEGIN_TOOL_RESULT", str(out))
+
+    def test_passthrough_returns_shallow_copy(self):
+        """The return value is a fresh list of fresh dicts so a caller
+        mutating the result can't corrupt the original_messages structure
+        that may still be in use upstream (e.g. for token accounting)."""
+        msgs = [{"role": "user", "content": "hi"}]
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "")
+        self.assertIsNot(out, msgs)
+        self.assertIsNot(out[0], msgs[0])
+        # Equal content though
+        self.assertEqual(out, msgs)
+
+    def test_passthrough_empty_returns_empty(self):
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            self.assertEqual(proxy.translate_history_and_apply_prompt([], ""), [])
+
+
 class TestToolResultDelimiting(unittest.TestCase):
     """Tool results are wrapped in <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>>
     markers by the translator, and the tool-variant builders inject framing

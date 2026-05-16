@@ -215,7 +215,7 @@ tests/benchmarks/
       harness_opencode_agent.py
   schemes/
     current.json                        # prod scheme (PROXY_PROMPT_MODE=user_front)
-    passthrough.json                    # control (no injection — see caveat below)
+    passthrough.json                    # control (PROXY_PROMPT_MODE=passthrough — no mediation)
   runners/
     _lib.sh                             # bench_guard_ci, bench_check_arch, ...
     smoketest.sh
@@ -251,10 +251,10 @@ tests/benchmarks/
    in `_common.py` then writes those into the per-task `.env`.
 
 3. If the scheme requires a new `PROXY_PROMPT_MODE` value that
-   `proxy/proxy.py` does not yet accept (e.g. `passthrough`), file a
-   proxy change first. Without it, the proxy's startup validator
-   falls back to `user_front` and the scheme silently becomes a duplicate
-   of `current`.
+   `proxy/proxy.py` does not yet accept, file a proxy change first.
+   Without it, the proxy's startup validator falls back to `user_front`
+   and the scheme silently becomes a duplicate of `current`. The
+   currently-accepted modes are listed in `architecture/proxy.md`.
 
 ---
 
@@ -277,21 +277,16 @@ benchmarks Harbor knows about are listed at
 
 ## Schemes shipped today
 
-| Scheme       | `PROXY_PROMPT_MODE`     | Purpose |
-| ------------ | ----------------------- | ------- |
-| `current`    | `user_front`            | Production scheme captured at HEAD. The baseline we compare against. |
-| `passthrough`| `passthrough` (planned) | Control. Proxy returns request unmodified — isolates harness contribution from upstream model capability. **Not yet implemented in `proxy.py`.** See `orch/questions.md`. |
+| Scheme       | `PROXY_PROMPT_MODE` | Purpose |
+| ------------ | ------------------- | ------- |
+| `current`    | `user_front`        | Production scheme captured at HEAD. The baseline we compare against. |
+| `passthrough`| `passthrough`       | Control. Skips every harness-side mediation: no cooperative-prompt injection, no system→user rewrite, no history translation. `tools` are forwarded to upstream verbatim. Isolates the harness contribution from upstream model capability. |
 
-When `passthrough` is implemented, it should:
-
-- Skip all cooperative-prompt injection.
-- Skip system-to-user rewriting.
-- Pass tool definitions through to the upstream as-is (the proxy
-  currently strips them).
-
-Until then, `passthrough` runs as if `current` (proxy validator coerces
-unknown modes back to `user_front`). Compare-schemes results during this
-window are not meaningful for `passthrough`.
+The passthrough caveat to be aware of: ollama-format tool schemas typically
+aren't honored by non-ollama upstreams. Most A/B runs using passthrough
+will show the model failing to call tools at all — that mismatch is
+exactly the data point ("what does harness's mediation add on top of the
+raw upstream?"). See `architecture/proxy.md` for the proxy-side details.
 
 ---
 
@@ -307,7 +302,6 @@ host where you can watch the bill.
 
 ## Open questions / future work
 
-- `passthrough` proxy support (see schemes table).
 - Trajectory ingestion: parse `state/output/*` proxy logs and emit ATIF
   trajectories for richer Harbor `analyze` output.
 - Caching: Harbor's task-container layers and harness's compose images
