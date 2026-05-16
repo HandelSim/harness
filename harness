@@ -1599,6 +1599,75 @@ write_agent_mcp_config() {
     fi
 }
 
+# Pre-seed claude-code's onboarding state so the first interactive run on a
+# fresh state/agent/home/ does not stall on the theme picker / trust dialog.
+# Idempotent: only writes when .claude.json is absent. Never clobbers a real
+# config a returning user has built up.
+#
+# Two files are seeded (per the v2.1.120 disassembly findings recorded in
+# .github/workflows/ci.yml around line 264):
+#   - .claude.json         — the onboarding gate (QN9) reads this, not
+#                            settings.json. Without hasCompletedOnboarding=true
+#                            here, the TUI renders the theme picker instead
+#                            of the prompt.
+#   - .claude/settings.json — theme preference; claude writes one on first
+#                             run, so seeding it suppresses the picker even
+#                             before the .claude.json gate fires.
+# The projects map keyed by mount_path mirrors the CI seed and pre-accepts
+# the trust dialog for the directory the user just launched from — which is
+# exactly the directory the dialog would prompt them to trust anyway.
+#
+# CI's e2e jobs already do this seeding inline (ci.yml: "Pre-seed claude-code
+# settings"). This brings parity for greenfield local hosts so contributors
+# don't hit a 90s timeout on the first run.
+seed_claude_home() {
+    local agent_home="$1"
+    local mount_path="$2"
+
+    local top_state="$agent_home/.claude.json"
+    local settings_dir="$agent_home/.claude"
+    local settings_file="$settings_dir/settings.json"
+
+    # Idempotency gate: presence of .claude.json means claude (or a prior
+    # seed) has already initialized this home. Bail rather than overwrite.
+    if [[ -f "$top_state" ]]; then
+        return 0
+    fi
+
+    mkdir -p "$settings_dir"
+    if [[ ! -f "$settings_file" ]]; then
+        printf '%s\n' '{"theme":"dark","includeCoAuthoredBy":false}' >"$settings_file"
+    fi
+
+    # mount_path is a POSIX absolute path the user just cd'd into; safe to
+    # embed verbatim in JSON (no escaping needed for ", \, or control chars
+    # in a path the shell could resolve). lastOnboardingVersion mirrors the
+    # CI seed shape — see ci.yml for the source of these constants.
+    cat >"$top_state" <<JSON
+{
+  "theme": "dark",
+  "hasCompletedOnboarding": true,
+  "firstStartTime": "2026-01-01T00:00:00.000Z",
+  "migrationVersion": 12,
+  "opusProMigrationComplete": true,
+  "sonnet1m45MigrationComplete": true,
+  "userID": "harness-greenfield-seed-0000000000000000000000000000000000000000",
+  "numStartups": 1,
+  "lastOnboardingVersion": {
+    "ISSUES_EXPLAINER": "report the issue at https://github.com/anthropics/claude-code/issues",
+    "PACKAGE_URL": "@anthropic-ai/claude-code",
+    "README_URL": "https://code.claude.com/docs/en/overview",
+    "VERSION": "2.1.120",
+    "FEEDBACK_CHANNEL": "https://github.com/anthropics/claude-code/issues",
+    "BUILD_TIME": "2026-04-24T19:00:00.000Z"
+  },
+  "projects": {
+    "${mount_path}": {"hasTrustDialogAccepted": true}
+  }
+}
+JSON
+}
+
 # Run an agent (claude or opencode) in the current directory.
 #
 # The agent's CWD is bind-mounted at the same absolute host path inside the
@@ -1749,6 +1818,14 @@ run_agent() {
     # Refresh the MCP side file before launch so the entrypoint sees the
     # current set of enabled MCPs. Done after mkdir so the dir exists.
     write_agent_mcp_config
+
+    # Pre-seed claude-code's onboarding state on greenfield homes so the
+    # first run renders the prompt instead of the theme picker. Idempotent;
+    # only seeds when .claude.json is absent. Opencode has its own onboarding
+    # gates and does not use these files, so this is claude-only.
+    if [[ "$tool" == "claude" ]]; then
+        seed_claude_home "$agent_home" "$mount_path"
+    fi
 
     # Build image on demand if missing — different from the per-tool
     # behavior pre-13a where `harness start` was the only build path.
