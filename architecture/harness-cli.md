@@ -108,6 +108,20 @@ They each:
 The hash-derived container name (one per host CWD) is why relaunching
 from the same directory refuses to start a second copy.
 
+### Greenfield seeding for `claude`
+
+Before the `docker run`, `run_agent` invokes `seed_claude_home` (when
+`tool == "claude"`) to pre-populate `state/agent/home/.claude.json` (and
+`.claude/settings.json`) with `hasCompletedOnboarding=true` plus a
+project-trust entry for the launch CWD. Without this, the first interactive
+run on a fresh state hangs on the theme picker / trust dialog instead of
+rendering the prompt.
+
+Idempotent: only writes when `.claude.json` is absent, so a returning user's
+state is never clobbered. Opencode does not use these files and is skipped.
+The same shape is written by the CI workflow's "Pre-seed claude-code
+settings" step — the runtime path brings that parity to local hosts.
+
 ## Update-available banner
 
 `_update_check_and_banner` runs synchronously on every agent launch with
