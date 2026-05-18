@@ -294,9 +294,9 @@ jobs:
               "ISSUES_EXPLAINER": "report the issue at https://github.com/anthropics/claude-code/issues",
               "PACKAGE_URL": "@anthropic-ai/claude-code",
               "README_URL": "https://code.claude.com/docs/en/overview",
-              "VERSION": "2.1.120",
+              "VERSION": "2.1.143",
               "FEEDBACK_CHANNEL": "https://github.com/anthropics/claude-code/issues",
-              "BUILD_TIME": "2026-04-24T19:00:00.000Z"
+              "BUILD_TIME": "2026-05-15T18:00:00.000Z"
             },
             "projects": {
               "${repo_cwd}": {"hasTrustDialogAccepted": true}
