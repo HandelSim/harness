@@ -95,8 +95,16 @@ if [[ -n "${TASK_IDS}" ]]; then
         [[ -n "$t" ]] && HARBOR_ARGS+=(-i "$t")
     done
 else
-    # The smallest known Terminal-Bench task; tweak if the dataset moves.
-    HARBOR_ARGS+=(--dataset terminal-bench/canary --n-tasks 1)
+    # Default to the vendored hello-harness task so smoketest runs
+    # offline: no harbor registry call, no tarball download, nothing
+    # outside the allowlist firewall. The task is trivial-by-design
+    # (write /app/hello.txt) — sufficient to prove the full wiring path
+    # (per-task container -> harness compose -> proxy -> upstream LLM ->
+    # tool call -> verifier) without leaking the user's network footprint
+    # to harborframework.com. For richer task coverage, use
+    # `harness benchmark terminal-bench` (which DOES need harbor's
+    # registry hosts in your allowlist — see tests/benchmarks/README.md).
+    HARBOR_ARGS+=(--dataset "${BENCH_ROOT}/tasks/hello-harness" --n-tasks 1)
 fi
 
 exec "${HARBOR_BIN}" "${HARBOR_ARGS[@]}"
