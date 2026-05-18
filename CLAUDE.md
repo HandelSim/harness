@@ -123,3 +123,14 @@ anyone.
 - Modifying `.github/` files unless HandelSim has explicitly approved
   the specific change
 - Approving PRs (you can't anyway, but flagged for clarity)
+
+## After approval: finish implementing.md steps 9–12
+
+The default outcome of an approved implementation is the ff-merge into
+`dev` (steps 9–12 of `.claude/references/workflows/implementing.md`),
+**not** a PR link. The action's outer prompt nudges toward "provide a
+PR link" — that is a fallback for this repo, not the default. If you
+stop at "branch pushed + PR link" without one of the fallback reasons
+in implementing.md ("When to fall back to a PR instead of auto-merging"),
+you have skipped the workflow. Your end-of-work status block must state
+whether `dev` was ff-merged; if no, name the fallback reason.
