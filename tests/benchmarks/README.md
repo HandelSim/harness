@@ -30,8 +30,9 @@ host                                                upstream LLM
                     +------------------+
 ```
 
-Harbor (running on the host) launches one container per benchmark task.
-Inside that container the adapter:
+Harbor runs in its own container (`harness-harbor:<version>`) and
+launches one per-task container per benchmark task. Inside the per-task
+container the adapter:
 
 1. Clones the harness repo (`HARNESS_GIT_REF`, default `dev`).
 2. Writes `.env` from runner-provided env vars
@@ -42,9 +43,71 @@ Inside that container the adapter:
 4. For each task, invokes `harness <agent> -p "<instruction>"` headlessly
    and captures stdout/stderr.
 
-**Only outbound traffic during a benchmark run is the LLM API call.** Task
-container -> docker (compose stack) -> firewall container -> upstream
-host (allow-listed in `.harness-allowlist`).
+### Network model
+
+Every long-running container in the path is under the same universal
+egress firewall (`firewall/init-firewall.sh`), reading the same
+`.harness-allowlist`:
+
+```
+harbor container             -> allowed: .harness-allowlist hosts only
+  per-task container [*]     -> open network (apt/git/docker pulls at install)
+    harness compose stack    -> allowed: .harness-allowlist hosts only
+      proxy -> firewall ---> upstream LLM API
+```
+
+[*] The per-task container itself is NOT under the harness firewall —
+it does `apt-get`, `git clone`, and `docker compose build` (which pulls
+base images from Docker Hub / pip / npm) before the harness compose stack
+comes up. That layer is intentionally left open; locking it down would
+require a fully-vendored harness install image.
+
+**Harbor's outbound is restricted to `.harness-allowlist`.** The harbor
+container's entrypoint runs `init-firewall.sh` and verifies the policy
+is live (example.com must be blocked; one canonical allowlist host must
+be reachable) before harbor is exec'd. If harbor's hosted package
+registry (Supabase backend + CDN) isn't on the allowlist, dataset-
+registry calls fail closed with `icmp-admin-prohibited` rather than
+leaking outbound. By default no harbor backend hosts are allowlisted —
+this is what stops harbor from phoning home with anything it observes
+during a benchmark run.
+
+The only outbound the user's upstream LLM responses can travel through
+is proxy -> firewall -> upstream LLM API, and that path never crosses
+harbor's network namespace.
+
+### When you DO want harbor to fetch a dataset
+
+The shipped `smoketest.sh` uses a vendored local task
+(`tests/benchmarks/tasks/hello-harness/`) so it works fully offline
+w.r.t. harbor's backend — no allowlist edits required.
+
+The full-scale runners (`terminal-bench.sh`, `swe-bench-lite.sh`) pass
+`--dataset <org>/<name>` to harbor, which has to resolve the name
+against harbor's hosted registry. To make this work without weakening
+the production-run posture, do a one-time prefetch with the registry
+hosts temporarily allowlisted, then remove them before running the real
+benchmark:
+
+```bash
+# 1) Add harbor's backend hosts to .harness-allowlist (one-time).
+echo 'harborframework.com'      >> .harness-allowlist
+echo 'cdn.harborframework.com'  >> .harness-allowlist
+# (plus the Supabase project host the harbor version uses; check the
+# error from a first attempt to see which exact host gets queried.)
+
+# 2) Run the full benchmark — harbor downloads + caches the dataset.
+./tests/benchmarks/runners/terminal-bench.sh
+
+# 3) Remove the entries from .harness-allowlist before the next run if
+#    you want harbor fully sealed off again. Cached datasets stay on
+#    disk; subsequent runs reuse the cache and don't re-query the
+#    registry.
+```
+
+This preserves the "no harbor phone-home during benchmarking" property:
+at the moment the agent is running and the upstream LLM is replying, the
+firewall actively rejects any harbor outbound that isn't on the list.
 
 ---
 
@@ -140,14 +203,19 @@ after observing a clean smoketest.
 Harbor always runs from a pinned container — there is **no host install
 path**. The wrapper at `tests/benchmarks/harbor/harbor.sh` builds the
 image on first invocation and bind-mounts the host docker socket so
-per-task containers it spawns are siblings on the host daemon.
+per-task containers it spawns are siblings on the host daemon. The
+container also boots the universal harness egress firewall before exec'ing
+harbor — see "Network model" above.
 
-Host requirements: docker (with compose v2) and this repo. No host
-Python, uv, pipx, or `harbor` binary needed.
+Host requirements: docker (with compose v2), this repo, and a
+`.harness-allowlist` file (copy from `.harness-allowlist.example`). No
+host Python, uv, pipx, or `harbor` binary needed.
 
 ```bash
 # Image is built lazily on first runner invocation. To pre-build:
-docker build -t harness-harbor:0.6.6 tests/benchmarks/harbor
+# (build context must be the repo root so the Dockerfile can COPY
+# firewall/init-firewall.sh into the image)
+docker build -t harness-harbor:0.6.6 -f tests/benchmarks/harbor/Dockerfile .
 
 # Override the image tag (e.g. when bumping versions):
 export HARNESS_BENCH_HARBOR_IMAGE=harness-harbor:0.7.0

@@ -9,12 +9,21 @@
 #
 # Mounts:
 #   /var/run/docker.sock         (so Harbor can spawn per-task siblings)
-#   <repo root>:/work            (the runner cwd, where Harbor reads/writes)
+#   <repo root>:<repo root>      (the runner cwd, where Harbor reads/writes)
 #   $PWD:$PWD                    (so any absolute paths the runner passes
 #                                 resolve identically inside the container)
+#   .harness-allowlist:/etc/harness/allowlist:ro
+#                                (consumed by init-firewall.sh in the
+#                                 container's entrypoint — restricts harbor's
+#                                 outbound to allowlisted hosts only)
+#
+# Capabilities:
+#   NET_ADMIN, NET_RAW           (required by init-firewall.sh to manage
+#                                 iptables/ipset)
 #
 # The image is built lazily on first invocation. Rebuild manually with:
-#   docker build -t harness-harbor:<version> tests/benchmarks/harbor
+#   docker build -t harness-harbor:<version> -f tests/benchmarks/harbor/Dockerfile .
+# (build context must be repo root so the Dockerfile can COPY firewall/).
 
 set -euo pipefail
 
@@ -26,10 +35,27 @@ source "${REPO_ROOT}/scripts/lib/platform.sh"
 
 IMAGE_TAG="${HARNESS_BENCH_HARBOR_IMAGE:-harness-harbor:0.6.6}"
 
+# Allowlist path: same default as docker-compose.yml so harbor uses the same
+# file as the rest of the stack. Override with HARNESS_ALLOWLIST_PATH.
+ALLOWLIST_PATH="${HARNESS_ALLOWLIST_PATH:-${REPO_ROOT}/.harness-allowlist}"
+if [[ ! -f "${ALLOWLIST_PATH}" ]]; then
+    cat >&2 <<EOF
+[harbor.sh] FATAL: allowlist file not found at ${ALLOWLIST_PATH}.
+[harbor.sh] Harbor runs behind the same egress firewall as the rest of
+[harbor.sh] the harness stack and refuses to start without one. Copy
+[harbor.sh] .harness-allowlist.example to .harness-allowlist and edit, or
+[harbor.sh] set HARNESS_ALLOWLIST_PATH=<path> to point at your existing file.
+EOF
+    exit 1
+fi
+
 # Build once and cache. `docker image inspect` exits 0 only if present.
+# Build context is repo root (not SCRIPT_DIR) so the Dockerfile can COPY
+# firewall/init-firewall.sh into the image.
 if ! harness_docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
     echo "[harbor.sh] building ${IMAGE_TAG} (one-time)..." >&2
-    harness_docker build -t "${IMAGE_TAG}" "${SCRIPT_DIR}" >&2
+    harness_docker build -t "${IMAGE_TAG}" \
+        -f "${SCRIPT_DIR}/Dockerfile" "${REPO_ROOT}" >&2
 fi
 
 # Forward PROXY_*/HARNESS_* env vars so the runner's exported scheme reaches
@@ -48,9 +74,11 @@ tty_args=()
 [[ -t 0 && -t 1 ]] && tty_args=(-it)
 
 harness_docker_exec run --rm "${tty_args[@]}" \
+    --cap-add NET_ADMIN --cap-add NET_RAW \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$(harness_docker_path "${REPO_ROOT}")":"${REPO_ROOT}" \
     -v "$(harness_docker_path "${PWD}")":"${PWD}" \
+    -v "$(harness_docker_path "${ALLOWLIST_PATH}")":/etc/harness/allowlist:ro \
     -w "${PWD}" \
     "${env_args[@]}" \
     "${IMAGE_TAG}" "$@"
