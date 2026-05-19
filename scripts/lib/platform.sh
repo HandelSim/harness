@@ -151,15 +151,25 @@ harness_runtime_is_podman() {
 # that was written before podman support; see also the alias
 # `harness_runtime` further down.
 #
+# Proxy env vars that harness honors for HOST-side git calls (clone/pull/
+# fetch) but deliberately strips from every container-runtime invocation.
+# Container egress is already routed by the runtime/firewall, so forwarding a
+# host-only corp proxy URL into a container (or letting BuildKit auto-export
+# it as a build arg) would break image builds and runtime egress. Stripping
+# here — the single chokepoint every docker/podman call funnels through
+# (enforced by scripts/check_runtime_calls.sh) — guarantees it can't leak.
+_HARNESS_PROXY_STRIP=(-u HTTP_PROXY -u HTTPS_PROXY -u NO_PROXY \
+                      -u http_proxy -u https_proxy -u no_proxy)
+
 # Usage: harness_docker [runtime-args...]
 # Example: harness_docker run --rm --entrypoint /bin/bash my-image -c 'echo hi'
 harness_docker() {
     local rt
     rt=$(harness_container_runtime)
     if [[ "$(harness_detect_os)" == "windows" ]]; then
-        MSYS_NO_PATHCONV=1 "$rt" "$@"
+        env "${_HARNESS_PROXY_STRIP[@]}" MSYS_NO_PATHCONV=1 "$rt" "$@"
     else
-        "$rt" "$@"
+        env "${_HARNESS_PROXY_STRIP[@]}" "$rt" "$@"
     fi
 }
 
@@ -175,9 +185,9 @@ harness_docker_exec() {
     local rt
     rt=$(harness_container_runtime)
     if [[ "$(harness_detect_os)" == "windows" ]]; then
-        exec env MSYS_NO_PATHCONV=1 "$rt" "$@"
+        exec env "${_HARNESS_PROXY_STRIP[@]}" MSYS_NO_PATHCONV=1 "$rt" "$@"
     else
-        exec "$rt" "$@"
+        exec env "${_HARNESS_PROXY_STRIP[@]}" "$rt" "$@"
     fi
 }
 
@@ -185,6 +195,20 @@ harness_docker_exec() {
 # the existing call sites that already use it.
 harness_runtime() { harness_docker "$@"; }
 harness_runtime_exec() { harness_docker_exec "$@"; }
+
+# Mirror the upper/lower-case spellings of the proxy env vars so git's libcurl
+# picks them up regardless of which it checks (libcurl special-cases lowercase
+# `http_proxy`; HTTPS honors either case). Fills a missing side from a present
+# one; never overwrites an explicit value. Called by harness after .env load.
+harness_normalize_proxy_env() {
+    [[ -n "${HTTP_PROXY:-}"  && -z "${http_proxy:-}"  ]] && export http_proxy="$HTTP_PROXY"
+    [[ -n "${http_proxy:-}"  && -z "${HTTP_PROXY:-}"  ]] && export HTTP_PROXY="$http_proxy"
+    [[ -n "${HTTPS_PROXY:-}" && -z "${https_proxy:-}" ]] && export https_proxy="$HTTPS_PROXY"
+    [[ -n "${https_proxy:-}" && -z "${HTTPS_PROXY:-}" ]] && export HTTPS_PROXY="$https_proxy"
+    [[ -n "${NO_PROXY:-}"    && -z "${no_proxy:-}"    ]] && export no_proxy="$NO_PROXY"
+    [[ -n "${no_proxy:-}"    && -z "${NO_PROXY:-}"    ]] && export NO_PROXY="$no_proxy"
+    return 0
+}
 
 # Convert a host path to a form Docker Desktop accepts reliably for bind
 # mounts. On Linux/macOS this is a passthrough.

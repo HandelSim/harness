@@ -641,6 +641,110 @@ fi
 rm -rf "${fake_home}"
 echo "[harness-test] T7 OK"
 
+# --- Test 7b: harness_docker strips host proxy from runtime calls (#68) -----
+#
+# Host proxy vars (HTTP_PROXY/HTTPS_PROXY/NO_PROXY, upper + lower) are honored
+# for host-side git but must NEVER reach the container runtime — including
+# BuildKit, which auto-exports them as build args from the CLI env.
+# harness_docker / harness_docker_exec run the runtime under `env -u` for all
+# six spellings. Drive a fake runtime that records its environment and assert
+# none of the six leak through. Wrapped in a subshell so the function/env
+# overrides don't bleed into later tests.
+echo "[harness-test] T7b: harness_docker strips proxy from runtime env"
+(
+    t7b_rt="$(mktemp -t harness-fake-rt.XXXXXX)"
+    cat >"${t7b_rt}" <<'FAKE'
+#!/usr/bin/env bash
+env >"${HARNESS_FAKE_RT_REC}"
+FAKE
+    chmod +x "${t7b_rt}"
+
+    # Force the linux branch and resolve the runtime to our recorder.
+    harness_container_runtime() { printf '%s' "${t7b_rt}"; }
+    harness_detect_os() { printf '%s' linux; }
+
+    export HTTP_PROXY="http://corp.invalid:8080"  HTTPS_PROXY="http://corp.invalid:8080"  NO_PROXY="localhost"
+    export http_proxy="http://corp.invalid:8080"  https_proxy="http://corp.invalid:8080"  no_proxy="localhost"
+
+    # Guard against a vacuous test: the proxy must really be in this env.
+    env | grep -q '^HTTPS_PROXY=' \
+        || { echo "[harness-test] T7b FAIL: HTTPS_PROXY not set; test would be vacuous" >&2; exit 1; }
+
+    proxy_re='^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)='
+
+    # harness_docker (returns normally).
+    rec="$(mktemp -t harness-fake-rt-rec.XXXXXX)"
+    export HARNESS_FAKE_RT_REC="${rec}"
+    harness_docker run --rm hello >/dev/null 2>&1
+    if grep -Eq "${proxy_re}" "${rec}"; then
+        echo "[harness-test] T7b FAIL: proxy leaked into harness_docker runtime env:" >&2
+        grep -E "${proxy_re}" "${rec}" >&2
+        exit 1
+    fi
+
+    # harness_docker_exec (execs — run in a nested subshell so only it is replaced).
+    rec_exec="$(mktemp -t harness-fake-rt-rec.XXXXXX)"
+    export HARNESS_FAKE_RT_REC="${rec_exec}"
+    ( harness_docker_exec run --rm hello ) >/dev/null 2>&1
+    if grep -Eq "${proxy_re}" "${rec_exec}"; then
+        echo "[harness-test] T7b FAIL: proxy leaked into harness_docker_exec runtime env:" >&2
+        grep -E "${proxy_re}" "${rec_exec}" >&2
+        exit 1
+    fi
+
+    rm -f "${t7b_rt}" "${rec}" "${rec_exec}"
+)
+echo "[harness-test] T7b OK"
+
+# --- Test 7c: Windows Git Bash .bash_profile -> .bashrc bridge (#68) --------
+#
+# Git Bash starts login shells, which read ~/.bash_profile and skip ~/.bashrc,
+# so the installer's PATH line in ~/.bashrc never runs in fresh sessions. The
+# installer (Windows-only) bridges ~/.bash_profile -> ~/.bashrc. This branch
+# can't execute on Linux CI (it's gated on harness_detect_os == windows), so
+# we (a) source-grep that the real bridge exists in the installer and (b)
+# exercise the bridge logic for idempotency + ~/.profile preservation.
+echo "[harness-test] T7c: Git Bash .bash_profile bridge"
+grep -q 'Git Bash starts login shells' "${REPO_ROOT}/harness-install.sh" \
+    || { echo "[harness-test] T7c FAIL: bridge code missing from harness-install.sh" >&2; exit 1; }
+(
+    t7c_home="$(mktemp -d -t harness-fake-home.XXXXXX)"
+
+    # Mirror of the installer's bridge snippet, parameterized on $t7c_home.
+    bridge() {
+        local bp="${t7c_home}/.bash_profile"
+        if [[ -f "$bp" ]] && grep -q '\.bashrc' "$bp"; then
+            return 0
+        fi
+        # Capture existence BEFORE the append (>> creates the file), mirroring
+        # the installer — an inline `! -f` inside the block is always false.
+        local bp_new=1
+        [[ -f "$bp" ]] && bp_new=0
+        {
+            printf '\n# Added by harness installer: bridge\n'
+            if (( bp_new )) && [[ -f "${t7c_home}/.profile" ]]; then
+                printf 'if [ -f ~/.profile ]; then . ~/.profile; fi\n'
+            fi
+            printf 'if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n'
+        } >>"$bp"
+    }
+
+    # Fresh home with a pre-existing ~/.profile: bridge must source BOTH and
+    # be idempotent across repeated installer runs.
+    printf 'export FOO=1\n' >"${t7c_home}/.profile"
+    touch "${t7c_home}/.bashrc"
+    bridge; bridge; bridge
+    bp="${t7c_home}/.bash_profile"
+    [[ -f "$bp" ]] || { echo "[harness-test] T7c FAIL: bridge did not create .bash_profile" >&2; exit 1; }
+    cnt=$(grep -c '\. ~/.bashrc' "$bp")
+    (( cnt == 1 )) || { echo "[harness-test] T7c FAIL: expected 1 '.bashrc' source line, got ${cnt}" >&2; cat "$bp" >&2; exit 1; }
+    grep -q '\. ~/.profile' "$bp" \
+        || { echo "[harness-test] T7c FAIL: pre-existing ~/.profile not preserved by bridge" >&2; cat "$bp" >&2; exit 1; }
+
+    rm -rf "${t7c_home}"
+)
+echo "[harness-test] T7c OK"
+
 # --- Test 8: harness doctor (services down) --------------------------------
 #
 # At this point T4 has torn services down. Doctor should run through every

@@ -491,6 +491,38 @@ if (( want_api_key )) && [[ -n "$api_key_value" ]]; then
     ok "wrote PROXY_API_KEY from prompt input into $install_root/.env"
 fi
 
+# Persist any corp proxy exported in the installing shell into the .env so
+# later 'harness' runs (update/upgrade pull, mcp clone) reuse it without the
+# user re-exporting each time. We fill ONLY blank HTTP_PROXY/HTTPS_PROXY/
+# NO_PROXY lines, so a value the user pre-placed in their own .env wins. These
+# are host-only (honored for host git, stripped from containers by harness).
+proxy_env_target="$install_root/.env"
+for pk in HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+    pv="${!pk:-}"
+    [[ -z "$pv" ]] && continue
+    # Read the current value (if any) without sed, so proxy URLs containing
+    # / & : @ need no escaping.
+    cur=""
+    has_key=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*${pk}=(.*)$ ]]; then
+            cur="${BASH_REMATCH[1]}"; has_key=1; break
+        fi
+    done <"$proxy_env_target"
+    [[ -n "$cur" ]] && continue   # explicit value already set — don't clobber
+    proxy_tmp="$proxy_env_target.tmp.$$"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*${pk}= ]]; then
+            printf '%s=%s\n' "$pk" "$pv"
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$proxy_env_target" >"$proxy_tmp"
+    (( has_key )) || printf '%s=%s\n' "$pk" "$pv" >>"$proxy_tmp"
+    mv -f "$proxy_tmp" "$proxy_env_target"
+    ok "persisted $pk from your shell into $install_root/.env"
+done
+
 # --- firewall allowlist -----------------------------------------------------
 #
 # Every harness container reads its egress allowlist from
@@ -579,6 +611,43 @@ EOF
             fi
             ;;
     esac
+
+    # Windows Git Bash: it starts LOGIN shells, which source ~/.bash_profile
+    # (or ~/.bash_login / ~/.profile) and skip ~/.bashrc by default. The PATH
+    # line we wrote to ~/.bashrc above therefore never runs in a fresh Git
+    # Bash session — the reported symptom: harness installed, but ~/.local/bin
+    # still not on PATH in new shells. Bridge it: make ~/.bash_profile source
+    # ~/.bashrc. Only relevant for bash (other shells write to a file login
+    # shells already read). Done outside the PATH-check above so a re-install
+    # repairs a missing bridge even when ~/.local/bin is already on PATH.
+    if [[ "$(harness_detect_os)" == "windows" ]] \
+       && [[ "$(basename "${SHELL:-}")" == "bash" ]]; then
+        bp="$HOME/.bash_profile"
+        if [[ -f "$bp" ]] && grep -q '\.bashrc' "$bp"; then
+            ok "$bp already sources ~/.bashrc; left untouched"
+        else
+            # Capture whether ~/.bash_profile existed BEFORE the append: the
+            # `>>` redirection below creates the file, so an inline `! -f`
+            # test inside the block would always be false.
+            bp_new=1
+            [[ -f "$bp" ]] && bp_new=0
+            {
+                printf '\n# Added by harness installer: Git Bash starts login shells,\n'
+                printf '# which read ~/.bash_profile and skip ~/.bashrc by default.\n'
+                # When creating a fresh ~/.bash_profile we would shadow an
+                # existing ~/.profile (login shells stop reading it), so source
+                # it too. When ~/.bash_profile already exists it already
+                # handles ~/.profile as the user intended — only add the
+                # ~/.bashrc bridge in that case.
+                if (( bp_new )) && [[ -f "$HOME/.profile" ]]; then
+                    printf 'if [ -f ~/.profile ]; then . ~/.profile; fi\n'
+                fi
+                printf 'if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n'
+            } >>"$bp"
+            ok "bridged $bp -> ~/.bashrc for Git Bash login shells"
+            warn "open a new terminal for 'harness' to be on PATH"
+        fi
+    fi
 fi
 
 # --- final message ----------------------------------------------------------

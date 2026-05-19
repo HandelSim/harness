@@ -170,9 +170,16 @@ EOF
 # wins over the pre-placed .env's PROXY_API_KEY=test-key-1234 (mock upstream
 # ignores the key, so the downstream round-trip is unaffected).
 # harness-install.sh installs into $(pwd) — must cd into TEST_ROOT first.
+# Issue #68: a corp proxy exported in the installing shell must be persisted
+# into the seeded .env (host-only — honored for host git, stripped from
+# containers). The local-path clone ignores the (bogus) proxy, so it's safe
+# to set here; we assert persistence below, then scrub it so the rest of the
+# pipeline runs with a clean .env. HTTPS_PROXY is scoped to this subshell's
+# install command and does not leak to the outer test shell.
+PIPE_PROXY="http://pipeline-corp-proxy.invalid:3128"
 (
     cd "${TEST_ROOT}"
-    HOME="${FAKE_HOME}" HARNESS_REPO_URL="${REPO_ROOT}" \
+    HOME="${FAKE_HOME}" HARNESS_REPO_URL="${REPO_ROOT}" HTTPS_PROXY="${PIPE_PROXY}" \
         bash "${TEST_ROOT}/harness-install.sh" <<<$'y\ny\ny\nharness-pipeline-prompt-key\n' >"${TEST_ROOT}/install.log" 2>&1
 )
 
@@ -203,6 +210,28 @@ else
 fi
 
 echo "[pipeline] T1 OK"
+
+# --- T1b: corp-proxy persisted into seeded .env (issue #68) ------------------
+#
+# The installer ran with HTTPS_PROXY exported; it must have written that value
+# into the install root's .env (filling the blank line, or appending it) so
+# later 'harness' runs reuse the proxy without re-exporting. The .env is
+# excluded from the working-tree overlay above, so the persisted value
+# survives. After asserting, scrub the proxy lines so the docker-driven part
+# of the pipeline runs with a clean .env (the proxy strip is proven directly
+# by tests/harness_test.sh T7b, so we don't need it live here).
+echo "[pipeline] T1b: corp proxy persisted into .env"
+pipe_env="${TEST_ROOT}/harness/.env"
+if ! grep -Eq "^[[:space:]]*HTTPS_PROXY=${PIPE_PROXY//./\\.}$" "${pipe_env}"; then
+    echo "[pipeline] T1b FAIL: HTTPS_PROXY=${PIPE_PROXY} not persisted into ${pipe_env}" >&2
+    grep -nE '^[[:space:]]*HTTPS?_PROXY=' "${pipe_env}" >&2 || echo "(no proxy lines present)" >&2
+    exit 1
+fi
+# Scrub all three host-proxy lines so nothing downstream inherits the bogus URL.
+proxy_scrub_tmp="${pipe_env}.scrub.$$"
+grep -vE '^[[:space:]]*(HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' "${pipe_env}" >"${proxy_scrub_tmp}"
+mv -f "${proxy_scrub_tmp}" "${pipe_env}"
+echo "[pipeline] T1b OK"
 
 # Inventory I009: harness-install.sh defaults REPO_URL to the public GitHub URL.
 # The test overrides via HARNESS_REPO_URL, but the source still must carry the
