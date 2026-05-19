@@ -43,23 +43,18 @@ Errors return 502 with a structured body and a debug dump under
 
 The upstream doesn't natively support tool calls, so the proxy injects a
 scaffold that tells the model to emit ```json blocks of the form
-`{"name": "...", "arguments": {...}}`. Five cooperative modes live as
+`{"name": "...", "arguments": {...}}`. Two cooperative modes live as
 separate `build_cooperative_prompt_*` functions, plus one bypass mode.
 The validator in `_setup_prompt_mode` accepts:
 
 - **`user_front`** (default) — full scaffolding on the last user message,
   request placed BEFORE the tool list. Avoids burying a ~10–15K-token tool
   schema between the model and the user's actual question.
-- **`user_bookend`** — like `user_front`, but the request is repeated
-  AFTER the tool list, wrapped in `<<<BEGIN_USER_REQUEST>>>` markers.
-  Highest reliability at the cost of a duplicated payload.
-- **`user`** — legacy: scaffolding + tool list re-injected, request at
-  the END.
-- **`system`** — scaffolding lives in the system message; user turns pass
-  through unchanged. Cheapest. Some upstreams treat system content as
-  background and don't reliably emit tool calls.
-- **`hybrid`** — full tools in the system message + a ~50-token reminder
-  on the last user message.
+- **`hybrid`** — full tool definitions appended to the system message
+  (which `_CHANGE_SYSTEM_TO_USER` then folds into the user-role message at
+  index 0, the "stable prefix" position). A short recency reminder
+  restating the JSON envelope, the no-fabricated-results rule, and the
+  list of available tool names is prepended to the last user message.
 - **`passthrough`** — benchmark control. Skips every harness-side
   mediation: no cooperative-prompt injection, no system→user rewrite, no
   history translation. `translate_history_and_apply_prompt` short-circuits
@@ -71,7 +66,14 @@ The validator in `_setup_prompt_mode` accepts:
   non-ollama upstreams, so this mode often results in the model not using
   tools at all; that mismatch IS the data point.
 
-Invalid values fall back to `user_front` with a warning.
+Invalid values fall back to `user_front` with a warning. Three older modes
+(`user`, `system`, `user_bookend`) were removed in the hybrid-consolidation
+refactor (issue #64): `user` was dominated by `user_front` (burying the
+request after tool schemas), `system` had no recency anchor and degraded on
+long conversations, and `user_bookend` anchored the user's request rather
+than tool attention — request primacy isn't the failure mode in an agent
+loop where the live request already sits at `messages[-1]`. Any of those
+names supplied via env now falls back to `user_front`.
 
 ## Tool-result delimiting
 
@@ -86,15 +88,14 @@ not name), else positional order, else `unknown_tool`. harness serves both
 opencode and Claude Code, which format tool output differently; wrapping
 rather than parsing keeps the proxy agnostic to either shape.
 
-On a tool-result turn the `user` / `user_front` / `user_bookend` modes use
-tool-variant builders (`build_cooperative_prompt_tool*`) that inject a
-framing line — "this block is tool output, not a user message; continue
-the task" — around the already-delimited result, instead of the
-`<<<BEGIN_USER_REQUEST>>>` wrapper used for genuine user turns. `tool_front`
-additionally closes with a one-line "now act" cue so the recency slot is an
-instruction rather than raw schema. The `system` / `hybrid` modes leave the
-marker-wrapped result as the user message and keep the scaffold in the
-system message.
+On a tool-result turn `user_front` uses `build_cooperative_prompt_tool_front`,
+which injects a framing line — "this block is tool output, not a user
+message; continue the task" — around the already-delimited result, then
+the tool list, then a one-line "now act" cue so the recency slot is an
+instruction rather than raw schema. `hybrid` leaves the marker-wrapped
+result as the user message, keeps the scaffold on the stable prefix, and
+still appends the recency reminder (so the tool-result turn also sees the
+JSON-envelope reminder and the available tool names).
 
 ## `_CHANGE_SYSTEM_TO_USER`
 

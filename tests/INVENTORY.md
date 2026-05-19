@@ -179,11 +179,8 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P011 | Proxy reads `PROXY_CHANGE_SYSTEM_PROMPT_TO_USER` from env |
 | P012 | Proxy reads `OUTPUT_DIR` from env for debug dumps |
 | P013 | `PROXY_PROMPT_MODE=user_front` injects the cooperative prompt before the latest user message |
-| P014 | `PROXY_PROMPT_MODE=user_bookend` injects cooperative prompt both before and after the latest user message |
-| P015 | `PROXY_PROMPT_MODE=user` (legacy) appends cooperative prompt after the latest user message |
-| P016 | `PROXY_PROMPT_MODE=system` appends cooperative addition to the upstream system message |
-| P017 | `PROXY_PROMPT_MODE=hybrid` combines a system addition with a user-side reminder |
-| P018 | Unknown `PROXY_PROMPT_MODE` falls back to `user_front` and warns |
+| P017 | `PROXY_PROMPT_MODE=hybrid` puts full tool definitions at the stable prefix and a tool-name-list reminder on the latest user message |
+| P018 | Unknown or removed `PROXY_PROMPT_MODE` (incl. legacy `user`, `system`, `user_bookend`) falls back to `user_front` and warns |
 | P019 | `extract_tool_calls_and_text` parses fenced ```json blocks from assistant text |
 | P020 | `extract_tool_calls_and_text` extracts ALL `json` blocks, not just the first |
 | P021 | `extract_tool_calls_and_text` preserves the textual order of tool_use blocks |

@@ -18,6 +18,7 @@ Environment variables (see README / .env.example):
 import datetime
 import json
 import os
+import re
 import sys
 import traceback
 import uuid
@@ -47,32 +48,26 @@ OLLAMA_CONTEXT_LENGTH: int = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "200000
 
 _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 
-# Cooperative-prompt injection mode. Five values are accepted via the
-# PROXY_PROMPT_MODE env var:
-#   "user_front"   — DEFAULT. Same active-instruction structure as `user`
-#                    mode (full scaffolding on the last user message), but
-#                    with the user's request placed BEFORE the tool list
-#                    rather than after it. Avoids burying the question
-#                    under 10-15K tokens of tool schemas while still
-#                    giving the model a clear active-turn instruction to
-#                    emit tool calls when needed.
-#   "user_bookend" — Like `user_front`, but the request is repeated AFTER
-#                    the tool list as well. Both occurrences are wrapped
-#                    in <<<BEGIN_USER_REQUEST>>> markers. Highest
-#                    instruction-following reliability at the cost of a
-#                    duplicated request payload.
-#   "user"         — legacy: full scaffolding + tool list re-injected into
-#                    the last user message, with the request at the END.
-#                    Reliable for tool use but buries the user's actual
-#                    question and causes conversation-context loss across
-#                    turns.
-#   "system"       — full scaffolding lives in the system message; user
-#                    turns pass through unchanged. Cheapest. Some
-#                    upstreams treat system content as background and
-#                    don't reliably emit tool calls.
-#   "hybrid"       — full tools in the system message + a brief ~50-token
-#                    reminder wrapping the last user message. Same caveat
-#                    as `system` for tool reliability.
+# Cooperative-prompt injection mode. Two cooperative modes plus one bypass
+# are accepted via the PROXY_PROMPT_MODE env var:
+#   "user_front" — DEFAULT. Full scaffolding (tool list + tool-call format
+#                  instructions) on the last user message, with the user's
+#                  request placed BEFORE the tool list rather than after
+#                  it. Puts the request in primacy position; the tool list
+#                  follows at recency. Established baseline.
+#   "hybrid"     — Full tool definitions sit at the stable prefix
+#                  (appended to the system message; with the default
+#                  _CHANGE_SYSTEM_TO_USER post-pass this becomes the
+#                  user-role message at index 0). A short reminder
+#                  restating the JSON envelope format, the "don't invent
+#                  tool results" rule, and the list of available tool
+#                  names is prepended to the last user message. Tools at
+#                  prefix + name-list reminder at recency.
+#   "passthrough" — Benchmark control. Skips every harness-side mediation:
+#                  no cooperative-prompt injection, no system→user
+#                  rewrite, no history translation. Forwards tools to
+#                  upstream verbatim. Not a cooperative mode; used to
+#                  measure what harness's mediation contributes.
 _PROMPT_MODE: str = "user_front"  # set in main() before serving
 
 # Some upstream APIs silently drop the `system` role. When set, this converts
@@ -93,7 +88,7 @@ def _setup_prompt_mode() -> None:
     global. Invalid values fall back to 'user_front' with a warning."""
     global _PROMPT_MODE
     raw = os.environ.get("PROXY_PROMPT_MODE", "user_front").strip().lower()
-    valid = ("user", "system", "hybrid", "user_front", "user_bookend", "passthrough")
+    valid = ("hybrid", "user_front", "passthrough")
     if raw not in valid:
         print(
             f"[!] PROXY_PROMPT_MODE='{raw}' is not one of "
@@ -171,9 +166,10 @@ _TOOL_CONTINUE_CUE = (
     "complete.]"
 )
 
-# Opens the cooperative-prompt scaffold on genuine user turns (the
-# build_cooperative_prompt_user* builders). It does two things: tells the
-# model the delimited block is the user's actual message for this turn, and
+# Opens the cooperative-prompt scaffold on genuine user turns in
+# user_front mode (`build_cooperative_prompt_user_front`). It does two
+# things: tells the model the delimited block is the user's actual message
+# for this turn, and
 # keeps the model's identity anchored. The identity clause replaces an
 # earlier generic persona line ("You are a helpful and intelligent AI
 # assistant"): because the scaffold lands in the last user message and is
@@ -214,59 +210,6 @@ def format_tools_to_text(tools_array):
         schema_text += json.dumps(parameters, indent=2)
         schema_text += "\n```\n\n"
     return schema_text.strip()
-
-
-def build_cooperative_prompt_user(original_content, tools_text):
-    # Marker delimiters around the user content rather than bare quotes —
-    # if the user's prompt itself contains quotation marks (or code that
-    # uses them), bare quotes confuse the model about where the original
-    # request ends. The <<<BEGIN/END_USER_REQUEST>>> markers are unambiguous.
-    return f"""{_PERSONA_PRESERVE_FRAMING}
-
-### Tool Usage Instructions
-You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
-{{
-  "name": "<tool_name>",
-  "arguments": {{
-    <tool_parameters>
-  }}
-}}
-You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
-
-### Available Tools
-{tools_text}
-
-### User Request
-<<<BEGIN_USER_REQUEST>>>
-{original_content}
-<<<END_USER_REQUEST>>>
-"""
-
-
-def build_cooperative_prompt_tool(original_content, tools_text):
-    """Legacy `user`-mode builder for tool-result turns. `original_content`
-    arrives already wrapped in <<<BEGIN_TOOL_RESULT>>> markers by the
-    translator, so this builder injects framing only — it neither parses nor
-    re-wraps the result. The result stays at the END (the `user`-mode layout).
-    """
-    return f"""{_TOOL_RESULT_FRAMING}
-
-### Tool Usage Instructions
-To call another tool, output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```) with this structure:
-{{
-  "name": "<tool_name>",
-  "arguments": {{
-    <tool_parameters>
-  }}
-}}
-You may explain your reasoning before or after the JSON block. If the task is fully complete, answer the user normally without any JSON.
-
-### Available Tools
-{tools_text}
-
-### Tool Result
-{original_content}
-"""
 
 
 def build_cooperative_prompt_user_front(original_content, tools_text):
@@ -334,79 +277,6 @@ You may explain your thought process before or after the JSON block. If NO furth
 """
 
 
-def build_cooperative_prompt_user_bookend(original_content, tools_text):
-    """user_bookend mode: a persona-preserve intro line, the request, the
-    tool definitions, then the request again. Both request occurrences are
-    wrapped in <<<BEGIN_USER_REQUEST>>> markers. Maximizes attention on the
-    user's actual question via both primacy and recency at the cost of
-    duplicating the request text. Same intro-first layout as user_front.
-    """
-    return f"""{_PERSONA_PRESERVE_FRAMING}
-
-<<<BEGIN_USER_REQUEST>>>
-{original_content}
-<<<END_USER_REQUEST>>>
-
----
-
-### Tool Usage Instructions
-You have access to specific tools to help answer the user's request. If you need to use a tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
-{{
-  "name": "<tool_name>",
-  "arguments": {{
-    <tool_parameters>
-  }}
-}}
-
-You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
-
-### Available Tools
-{tools_text}
-
----
-
-<<<BEGIN_USER_REQUEST>>>
-{original_content}
-<<<END_USER_REQUEST>>>
-"""
-
-
-def build_cooperative_prompt_tool_bookend(original_content, tools_text):
-    """tool_bookend mode (the user_bookend variant for tool-result turns).
-    `original_content` is already wrapped in <<<BEGIN_TOOL_RESULT>>> markers
-    by the translator. Layout: framing line, the delimited result, tool
-    definitions, then the delimited result again — the repeated result
-    occupies the recency slot. The builder injects framing around the
-    result — it does not parse or re-wrap it.
-    """
-    return f"""{_TOOL_RESULT_FRAMING}
-
-{original_content}
-
----
-
-### Tool Usage Instructions
-To call another tool, you MUST output a strictly formatted JSON object inside standard Markdown code blocks (```json ... ```). It must follow this exact structure:
-{{
-  "name": "<tool_name>",
-  "arguments": {{
-    <tool_parameters>
-  }}
-}}
-
-You may explain your thought process before or after the JSON block. If NO further tool calls are needed, give your final answer normally.
-
-### Available Tools
-{tools_text}
-
----
-
-{_TOOL_RESULT_FRAMING}
-
-{original_content}
-"""
-
-
 def build_cooperative_prompt_system_addition(tools_text):
     """Returns the cooperative-prompt scaffolding to APPEND to the system
     message in modes 'system' and 'hybrid'. Static across all turns; safe
@@ -429,18 +299,25 @@ You may explain your thought process before or after the JSON block. If NO tools
 """
 
 
-def build_cooperative_prompt_hybrid_reminder(content):
-    """In hybrid mode, the full tool list lives in the system message.
-    User turns get a brief reminder so the model doesn't lose tool
-    awareness in long conversations. The reminder is ~50 tokens — far
-    smaller than the full schemas — and is placed BEFORE the user's
-    actual content so the user's content remains at the end (recency
-    bias matters for instruction-following models).
+def build_cooperative_prompt_hybrid_reminder(content, tool_names):
+    """In hybrid mode the full tool definitions sit at the stable prefix
+    (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
+    message at index 0). This reminder is prepended to the last user
+    message — recency slot — so the model is anchored to the JSON envelope
+    format AND given a short list of tool names. It also tells the model
+    not to fabricate tool results, which closes a common failure mode where
+    the model emits a JSON call and then narrates an imagined output in the
+    same turn.
     """
+    tools_clause = f" Available tools: {', '.join(tool_names)}." if tool_names else ""
     reminder = (
-        "[Tool reminder: tool definitions are in the system prompt above. "
-        "To use a tool, emit a ```json block with {name, arguments}. "
-        "Otherwise answer the user normally.]"
+        "[Reminder: To use a tool, emit a ```json block with "
+        "{\"name\": ..., \"arguments\": ...}. You may explain your "
+        "reasoning before or after the JSON block. After emitting a tool "
+        "call, do not invent or narrate the tool's result — the real "
+        "result will be provided in the next turn. If no tool is needed, "
+        "answer normally without any JSON."
+        f"{tools_clause}]"
     )
     return f"{reminder}\n\n{content}"
 
@@ -585,7 +462,35 @@ def extract_tool_calls_and_text(response_text):
 # Translation: ollama-format -> upstream-format
 # ---------------------------------------------------------------------------
 
-def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], tools_text: str) -> List[Dict[str, str]]:
+_TOOL_NAME_PATTERN = re.compile(r"^Tool Name: `([^`]+)`", re.MULTILINE)
+
+
+def _extract_tool_names(
+    tools: Optional[List[Dict[str, Any]]],
+    tools_text: str,
+) -> List[str]:
+    """Return the list of tool names for the hybrid reminder. Prefer the
+    raw `tools` array (production call site) where each name is a
+    structured field; fall back to regex over `tools_text` so existing
+    tests (and any caller that only has the formatted text) continue to
+    work without signature updates.
+    """
+    if tools:
+        names: List[str] = []
+        for tool in tools:
+            func = tool.get("function", {}) if "function" in tool else tool
+            name = func.get("name")
+            if name:
+                names.append(name)
+        return names
+    return _TOOL_NAME_PATTERN.findall(tools_text)
+
+
+def translate_history_and_apply_prompt(
+    original_messages: List[Dict[str, Any]],
+    tools_text: str,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, str]]:
     """
     Translate ollama-format messages into a flat conversation suitable for the
     upstream API. Tool calls become markdown JSON blocks embedded in assistant
@@ -696,27 +601,16 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
                 messages.append({"role": "user", "content": observation})
 
     # Mode-based cooperative-prompt injection. Default mode is 'user_front'.
-    #   user_front   — request first, then tool definitions, on the last
-    #                  user message. Best balance of tool reliability +
-    #                  conversation-context retention (default).
-    #   user_bookend — request first, tool definitions, request again. Both
-    #                  occurrences wrapped in markers. Highest reliability.
-    #   user         — legacy: full scaffolding on the last user message
-    #                  with the request at the END.
-    #   system       — full scaffolding appended to the system message;
-    #                  user turns pass through unchanged.
-    #   hybrid       — full scaffolding in the system message + brief
-    #                  reminder wrapping the last user message.
+    #   user_front — request first, then tool definitions, on the last
+    #                user message. Established baseline.
+    #   hybrid     — full tool definitions appended to the system message
+    #                (which the _CHANGE_SYSTEM_TO_USER post-pass then folds
+    #                into a user-role message at index 0); a short reminder
+    #                restating the JSON envelope, the no-fabricated-results
+    #                rule, and the list of available tool names is prepended
+    #                to the last user message.
     if tools_text and messages:
-        if _PROMPT_MODE == "user":
-            if messages[-1]["role"] == "user":
-                original_last_role = original_messages[-1].get("role")
-                final_content = messages[-1]["content"]
-                if original_last_role == "tool":
-                    messages[-1]["content"] = build_cooperative_prompt_tool(final_content, tools_text)
-                else:
-                    messages[-1]["content"] = build_cooperative_prompt_user(final_content, tools_text)
-        elif _PROMPT_MODE == "user_front":
+        if _PROMPT_MODE == "user_front":
             if messages[-1]["role"] == "user":
                 original_last_role = original_messages[-1].get("role")
                 final_content = messages[-1]["content"]
@@ -724,20 +618,12 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
                     messages[-1]["content"] = build_cooperative_prompt_tool_front(final_content, tools_text)
                 else:
                     messages[-1]["content"] = build_cooperative_prompt_user_front(final_content, tools_text)
-        elif _PROMPT_MODE == "user_bookend":
-            if messages[-1]["role"] == "user":
-                original_last_role = original_messages[-1].get("role")
-                final_content = messages[-1]["content"]
-                if original_last_role == "tool":
-                    messages[-1]["content"] = build_cooperative_prompt_tool_bookend(final_content, tools_text)
-                else:
-                    messages[-1]["content"] = build_cooperative_prompt_user_bookend(final_content, tools_text)
-        else:
-            # 'system' or 'hybrid' — both append scaffolding to the system
-            # message. The tool-result handling above already converted
-            # role:"tool" entries into user messages wrapped in
-            # <<<BEGIN_TOOL_RESULT>>> markers; we don't tack the cooperative
-            # prompt onto those (it lives in the system message instead).
+        elif _PROMPT_MODE == "hybrid":
+            # Hybrid: full tool definitions go on the system message (stable
+            # prefix). Tool-result-converted role:"tool" entries already became
+            # user messages wrapped in <<<BEGIN_TOOL_RESULT>>> markers above;
+            # we don't tack the cooperative prompt onto those — it lives in
+            # the system message instead.
             system_addition = build_cooperative_prompt_system_addition(tools_text)
             if messages[0]["role"] == "system":
                 existing = messages[0]["content"]
@@ -755,15 +641,14 @@ def translate_history_and_apply_prompt(original_messages: List[Dict[str, Any]], 
                 # content doesn't begin with whitespace.
                 messages.insert(0, {"role": "system", "content": system_addition.strip()})
 
-            # Hybrid additionally drops a brief reminder on the last user
-            # turn so the model doesn't lose tool awareness in long
-            # conversations. Applies regardless of how the user message
-            # was formed (real user turn vs. tool-result-converted) — the
-            # reminder is short and the model should be reminded tools
-            # are available either way.
-            if _PROMPT_MODE == "hybrid" and messages[-1]["role"] == "user":
+            # Recency reminder on the last user-role message (real user
+            # turn or tool-result-converted-to-user). Same scope as the
+            # original hybrid reminder.
+            if messages[-1]["role"] == "user":
+                tool_names = _extract_tool_names(tools, tools_text)
                 messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
-                    messages[-1]["content"]
+                    messages[-1]["content"],
+                    tool_names,
                 )
 
     # Convert system role to user role if configured. Some upstream APIs
@@ -924,7 +809,7 @@ def catch_all(path: str) -> Response:
         print(f"[{req_id}] {request.method} /{path} model={model_name} messages={len(original_messages)} tools={len(tools)}", flush=True)
 
         tools_text = format_tools_to_text(tools)
-        translated = translate_history_and_apply_prompt(original_messages, tools_text)
+        translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=tools)
 
         upstream_payload = {
             "model": PROXY_API_MODEL,

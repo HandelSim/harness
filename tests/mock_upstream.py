@@ -201,15 +201,17 @@ def unwrap_proxy_scaffolding(content: str) -> str:
     Extract the content delimited by the proxy's explicit markers instead,
     so matching targets the user's actual request (or a tool result), never
     the injected scaffolding. Fall back to the whole string when no markers
-    are present (e.g. `system`/`hybrid` prompt modes leave user turns
-    unwrapped, or a request that never went through the proxy).
+    are present (e.g. `hybrid` prompt mode leaves user turns unwrapped
+    with only a short reminder prefix, or a request that never went
+    through the proxy).
     """
     open_idx = content.find(_USER_REQUEST_OPEN)
     if open_idx != -1:
         body_start = open_idx + len(_USER_REQUEST_OPEN)
-        # First close marker only: `user_bookend` mode emits two request
-        # blocks with the tool-schema dump *between* them, so spanning to
-        # the last close marker would re-include the scaffolding.
+        # First close marker only — defensive against any future
+        # bookend-style scheme that emits two request blocks with the
+        # tool-schema dump *between* them. Spanning to the last close
+        # marker would re-include the scaffolding.
         close_idx = content.find(_USER_REQUEST_CLOSE, body_start)
         if close_idx != -1:
             return content[body_start:close_idx].strip()

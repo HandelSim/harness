@@ -20,7 +20,7 @@ ENVIRONMENT VARIABLES (set by the runner before harbor invocation):
 - PROXY_API_URL        : upstream LLM endpoint
 - PROXY_API_MODEL      : model identifier
 - PROXY_PROMPT_MODE    : current prod injection mode
-                         (user_front | user_bookend | user | system | hybrid)
+                         (user_front | hybrid; passthrough = bypass)
 - HARNESS_PROXY_SCHEME : reserved for future named-scheme support; see
                          tests/benchmarks/schemes/*.json
 - HARNESS_GIT_REF      : git ref to clone (default: dev)
