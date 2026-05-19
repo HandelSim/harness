@@ -632,13 +632,16 @@ class TestPromptInjectionModes(unittest.TestCase):
             }},
         ]
 
-    def _translate_with_mode(self, mode):
+    def _translate_with_mode(self, mode, pass_tools=False):
         tools_text = proxy.format_tools_to_text(self.tools)
+        kwargs = {"tools": self.tools} if pass_tools else {}
         with patch.object(proxy, "_PROMPT_MODE", mode):
-            return proxy.translate_history_and_apply_prompt(self.user_msgs, tools_text)
+            return proxy.translate_history_and_apply_prompt(
+                self.user_msgs, tools_text, **kwargs,
+            )
 
     def test_mode_hybrid_full_tools_in_system_reminder_in_user(self):
-        result = self._translate_with_mode("hybrid")
+        result = self._translate_with_mode("hybrid", pass_tools=True)
         # [0] is the system message; it must contain the original system
         # text AND the full tool definitions (Tool Name / JSON Schema).
         sys_content = result[0]["content"]
@@ -651,9 +654,12 @@ class TestPromptInjectionModes(unittest.TestCase):
         last_user = result[-1]["content"]
         # The new reminder is present.
         self.assertIn("Reminder:", last_user)
-        # Lists the available tool names (recency anchoring).
-        self.assertIn("Bash", last_user)
+        # Lists the available tool signature (recency anchoring on the
+        # parameter keys, not just the bare name).
+        self.assertIn("Bash(command)", last_user)
         self.assertIn("Available tools:", last_user)
+        # Tells the model the listed keys are exact (the chronic miss).
+        self.assertIn("Use parameter keys exactly as listed", last_user)
         # New sentence telling the model not to fabricate tool results.
         self.assertIn("do not invent", last_user)
         # The user's original message survives.
@@ -663,6 +669,67 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertNotIn("Tool Usage Instructions", last_user)
         self.assertNotIn("Run shell command", last_user)
         self.assertNotIn('"required"', last_user)
+
+    def test_mode_hybrid_signatures_show_required_and_optional(self):
+        """The reminder lists required params bare and each optional param
+        in its own `[brackets]`. This is the recency anchor for the keys
+        the model most often guesses wrong (e.g. opencode's `bash` requires
+        both `command` and `description`; `read` takes `filePath` and
+        optional `offset`/`limit`)."""
+        tools = [
+            {"function": {
+                "name": "bash",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                        "workdir": {"type": "string"},
+                    },
+                    "required": ["command", "description"],
+                },
+            }},
+            {"function": {
+                "name": "read",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filePath": {"type": "string"},
+                        "offset": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["filePath"],
+                },
+            }},
+            {"function": {
+                "name": "noop",
+                "description": "no params",
+                "parameters": {"type": "object", "properties": {}},
+            }},
+        ]
+        tools_text = proxy.format_tools_to_text(tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            result = proxy.translate_history_and_apply_prompt(
+                self.user_msgs, tools_text, tools=tools,
+            )
+        last_user = result[-1]["content"]
+        self.assertIn("bash(command, description, [timeout], [workdir])", last_user)
+        self.assertIn("read(filePath, [offset], [limit])", last_user)
+        # Zero-param tool: bare name, no empty parens.
+        self.assertIn(" noop", last_user)
+        self.assertNotIn("noop()", last_user)
+
+    def test_mode_hybrid_signatures_via_tools_text_fallback(self):
+        """When the production `tools=` kwarg is omitted (test convenience
+        path), signatures are parsed from the schema blocks embedded in
+        `tools_text` by `format_tools_to_text`. Same output shape as the
+        primary path."""
+        result = self._translate_with_mode("hybrid")  # no pass_tools
+        last_user = result[-1]["content"]
+        self.assertIn("Bash(command)", last_user)
 
     def test_mode_user_front_request_before_tools(self):
         """In user_front mode, the user's request appears BEFORE the tool
