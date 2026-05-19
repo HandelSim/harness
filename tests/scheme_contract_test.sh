@@ -10,21 +10,18 @@
 # Schemes covered:
 #   user_front   — request first (in <<<BEGIN_USER_REQUEST>>> markers),
 #                  then tool list, in last user message.
-#   user_bookend — request appears TWICE in last user message: once
-#                  before the tool list, once after.
-#   user         — legacy: full scaffolding on last user message with
-#                  request at the END (after the tool list).
-#   system       — full scaffolding lives in the system message; last
-#                  user message passes through unchanged.
-#   hybrid       — full scaffolding in system message + brief reminder
-#                  prefix on last user message.
+#   hybrid       — full scaffolding at stable prefix (head of conversation
+#                  after the _CHANGE_SYSTEM_TO_USER post-pass) + a
+#                  "[Reminder: …]" prefix listing available tool names
+#                  prepended to the last user message.
 #
 # Per-scheme fixture directories under tests/fixtures/responses/scheme-*/
 # hold the canned upstream responses (text-only + tool-call) that the
 # mock returns for each scheme variant.
 #
-# References: P010, P013, P014, P015, P016, P017, P018 (INVENTORY.md
-# under track/B-inventory).
+# References: P010, P013, P017, P018 (INVENTORY.md under track/B-inventory).
+# The user / system / user_bookend modes were removed in the hybrid
+# consolidation refactor (issue #64).
 
 set -euo pipefail
 
@@ -236,7 +233,7 @@ assert_forwarded() {
 
 # --- per-scheme test loop ----------------------------------------------------
 
-SCHEMES=("user_front" "user_bookend" "user" "system" "hybrid")
+SCHEMES=("user_front" "hybrid")
 
 for scheme in "${SCHEMES[@]}"; do
     test_section "scheme contract: ${scheme}"
@@ -249,9 +246,6 @@ for scheme in "${SCHEMES[@]}"; do
 
     case "${scheme}" in
         user_front)  expected_content="scheme-user_front fixture" ;;
-        user_bookend) expected_content="scheme-user_bookend fixture" ;;
-        user)        expected_content="scheme-user fixture" ;;
-        system)      expected_content="scheme-system fixture" ;;
         hybrid)      expected_content="scheme-hybrid fixture" ;;
     esac
     echo "${text_resp}" | grep -q "${expected_content}" \
@@ -295,113 +289,14 @@ print("OK request-before-tools")
 '
             ;;
 
-        user_bookend)
-            # P014: request appears twice in last user message, both
-            # wrapped in markers; tool list appears between them.
-            assert_forwarded "${scheme}/text/forwarded" "${forwarded}" '
-import json, sys
-body = json.loads(sys.stdin.read())
-msgs = body["messages"]
-last = msgs[-1]
-if last["role"] != "user":
-    print("LAST_NOT_USER:" + last["role"]); sys.exit(0)
-c = last["content"]
-begin_n = c.count("<<<BEGIN_USER_REQUEST>>>")
-end_n = c.count("<<<END_USER_REQUEST>>>")
-if begin_n != 2:
-    print(f"BEGIN_MARKER_COUNT:{begin_n}"); sys.exit(0)
-if end_n != 2:
-    print(f"END_MARKER_COUNT:{end_n}"); sys.exit(0)
-probe_n = c.count("scheme-probe-text")
-if probe_n != 2:
-    print(f"PROBE_COUNT:{probe_n}"); sys.exit(0)
-if "### Available Tools" not in c:
-    print("NO_TOOL_LIST"); sys.exit(0)
-# Tool list should sit between the two request occurrences.
-first_req = c.index("<<<BEGIN_USER_REQUEST>>>")
-tool_pos = c.index("Available Tools")
-last_req = c.rindex("<<<BEGIN_USER_REQUEST>>>")
-if not (first_req < tool_pos < last_req):
-    print("TOOLS_NOT_BETWEEN_REQUESTS"); sys.exit(0)
-print("OK request-bookended-around-tools")
-'
-            ;;
-
-        user)
-            # P015: legacy mode. Full scaffolding (including marker-
-            # wrapped request) on last user message; request appears
-            # AFTER the tool list, not before.
-            assert_forwarded "${scheme}/text/forwarded" "${forwarded}" '
-import json, sys
-body = json.loads(sys.stdin.read())
-msgs = body["messages"]
-last = msgs[-1]
-if last["role"] != "user":
-    print("LAST_NOT_USER:" + last["role"]); sys.exit(0)
-c = last["content"]
-if "<<<BEGIN_USER_REQUEST>>>" not in c:
-    print("NO_BEGIN_MARKER"); sys.exit(0)
-if "<<<END_USER_REQUEST>>>" not in c:
-    print("NO_END_MARKER"); sys.exit(0)
-if "### Available Tools" not in c:
-    print("NO_TOOL_LIST"); sys.exit(0)
-if "### Tool Usage Instructions" not in c:
-    print("NO_INSTRUCTIONS_HEADER"); sys.exit(0)
-# Legacy `user` mode puts the request AFTER the tool list.
-req_pos = c.index("<<<BEGIN_USER_REQUEST>>>")
-tool_pos = c.index("Available Tools")
-if req_pos <= tool_pos:
-    print("REQUEST_NOT_AFTER_TOOLS"); sys.exit(0)
-if c.count("scheme-probe-text") != 1:
-    print(f"PROBE_COUNT:{c.count(chr(34) + chr(34))}"); sys.exit(0)
-print("OK request-after-tools")
-'
-            ;;
-
-        system)
-            # P016: scaffolding appended to system message. The request
-            # is sent with NO system message, but the proxy inserts one
-            # in that case. Last user message stays unchanged (just the
-            # probe text). PROXY_CHANGE_SYSTEM_PROMPT_TO_USER defaults
-            # to on, so the inserted system message gets converted to
-            # a user role with a stub assistant turn after it. Assert
-            # that the scaffolding lives at the HEAD of the conversation
-            # (not on the last user message) and the last user message
-            # is the unmodified probe.
-            assert_forwarded "${scheme}/text/forwarded" "${forwarded}" '
-import json, sys
-body = json.loads(sys.stdin.read())
-msgs = body["messages"]
-# Find where the tool scaffolding lives. It MUST NOT be on the last
-# user message (that distinguishes system mode from user/user_front).
-last = msgs[-1]
-if last["role"] != "user":
-    print("LAST_NOT_USER:" + last["role"]); sys.exit(0)
-last_c = last["content"]
-if "### Available Tools" in last_c:
-    print("TOOL_LIST_ON_LAST_USER"); sys.exit(0)
-if "<<<BEGIN_USER_REQUEST>>>" in last_c:
-    print("REQUEST_MARKER_ON_LAST_USER"); sys.exit(0)
-if "scheme-probe-text" not in last_c:
-    print("PROBE_MISSING_FROM_LAST_USER"); sys.exit(0)
-# Scaffolding must live in some earlier message (the converted
-# system, or — if PROXY_CHANGE_SYSTEM_PROMPT_TO_USER were off — the
-# system message itself). Look anywhere except the last message.
-head_content = "\n".join(m.get("content", "") for m in msgs[:-1])
-if "### Tool Usage Instructions" not in head_content:
-    print("NO_INSTRUCTIONS_HEADER_IN_HEAD"); sys.exit(0)
-if "### Available Tools" not in head_content:
-    print("NO_TOOL_LIST_IN_HEAD"); sys.exit(0)
-print("OK scaffolding-in-head last-user-pristine")
-'
-            ;;
-
         hybrid)
-            # P017: full scaffolding in head (same as `system`) + a
-            # brief "Tool reminder" prefix on the last user message.
-            # The last user message must contain BOTH the reminder
-            # AND the original probe text, but NOT the full tool list
-            # or instruction header.
+            # P017: full scaffolding at the stable prefix (head of
+            # conversation after _CHANGE_SYSTEM_TO_USER) + a "[Reminder: …]"
+            # prefix on the last user message that lists available tool
+            # names and includes the "do not invent" sentence. The last
+            # user message must contain the reminder AND the original
+            # probe text, but NOT the full tool list or instruction
+            # header.
             assert_forwarded "${scheme}/text/forwarded" "${forwarded}" '
 import json, sys
 body = json.loads(sys.stdin.read())
@@ -410,10 +305,12 @@ last = msgs[-1]
 if last["role"] != "user":
     print("LAST_NOT_USER:" + last["role"]); sys.exit(0)
 c = last["content"]
-if "Tool reminder" not in c:
-    print("NO_TOOL_REMINDER"); sys.exit(0)
-if "system prompt" not in c.lower():
-    print("REMINDER_DOES_NOT_REFERENCE_SYSTEM_PROMPT"); sys.exit(0)
+if "Reminder:" not in c:
+    print("NO_REMINDER_PREFIX"); sys.exit(0)
+if "do not invent" not in c:
+    print("REMINDER_MISSING_DO_NOT_INVENT"); sys.exit(0)
+if "Available tools:" not in c:
+    print("REMINDER_MISSING_TOOL_NAMES_HEADER"); sys.exit(0)
 if "scheme-probe-text" not in c:
     print("PROBE_MISSING_FROM_LAST_USER"); sys.exit(0)
 # Full tool list / instructions header MUST NOT be on the last user

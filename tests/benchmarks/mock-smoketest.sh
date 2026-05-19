@@ -46,9 +46,8 @@ while (( $# > 0 )); do
         --probe-modes)
             # Also test every proxy-supported PROXY_PROMPT_MODE so we can
             # confirm scheme switching produces measurably different
-            # upstream requests on actually-distinct modes. Adds
-            # synthetic schemes: probe-user, probe-system, probe-hybrid,
-            # probe-user_front, probe-user_bookend.
+            # upstream requests on actually-distinct modes. Adds synthetic
+            # schemes: probe-user_front, probe-hybrid.
             PROBE_MODES=1; shift ;;
         -h|--help) sed -n '1,30p' "$0"; exit 0 ;;
         *) echo "[mock-smoketest] unknown arg: $1" >&2; exit 2 ;;
@@ -77,7 +76,7 @@ fi
 # Synthetic probe schemes: one per proxy-supported mode.
 declare -A PROBE_MODE_FOR
 if (( PROBE_MODES )); then
-    for m in user_front user_bookend user system hybrid; do
+    for m in user_front hybrid; do
         SCHEMES+=("probe-${m}")
         PROBE_MODE_FOR["probe-${m}"]="$m"
     done

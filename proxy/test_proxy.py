@@ -458,23 +458,6 @@ class TestTranslateHistory(unittest.TestCase):
     def test_empty_returns_empty(self):
         self.assertEqual(proxy.translate_history_and_apply_prompt([], ""), [])
 
-    def test_system_plus_user_with_tools_wraps_final_user(self):
-        # Explicitly exercises legacy 'user' mode; the system+hybrid modes
-        # have their own tests in TestPromptInjectionModes below.
-        msgs = [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "What's the weather?"},
-        ]
-        tools_text = "Tool Name: `get_weather`"
-        with patch.object(proxy, "_PROMPT_MODE", "user"):
-            out = proxy.translate_history_and_apply_prompt(msgs, tools_text)
-        self.assertEqual(len(out), 2)
-        self.assertEqual(out[0], {"role": "system", "content": "You are helpful."})
-        self.assertEqual(out[1]["role"], "user")
-        self.assertIn("### Tool Usage Instructions", out[1]["content"])
-        self.assertIn("What's the weather?", out[1]["content"])
-        self.assertIn("get_weather", out[1]["content"])
-
     def test_no_tools_does_not_wrap(self):
         msgs = [{"role": "user", "content": "hi"}]
         out = proxy.translate_history_and_apply_prompt(msgs, "")
@@ -505,7 +488,7 @@ class TestTranslateHistory(unittest.TestCase):
 
     def test_user_request_uses_marker_delimiters(self):
         """Verify the wrapper uses <<<BEGIN_USER_REQUEST>>> markers, not bare quotes."""
-        result = proxy.build_cooperative_prompt_user("hello", "some tools")
+        result = proxy.build_cooperative_prompt_user_front("hello", "some tools")
         self.assertIn("<<<BEGIN_USER_REQUEST>>>", result)
         self.assertIn("<<<END_USER_REQUEST>>>", result)
         # Explicitly NOT the old quote pattern around content
@@ -518,32 +501,27 @@ class TestTranslateHistory(unittest.TestCase):
 print("hello")
 ```
 And answer "what does this do?"'''
-        result = proxy.build_cooperative_prompt_user(complex_content, "tools")
+        result = proxy.build_cooperative_prompt_user_front(complex_content, "tools")
         self.assertIn("<<<BEGIN_USER_REQUEST>>>", result)
         self.assertIn(complex_content, result)
         self.assertIn("<<<END_USER_REQUEST>>>", result)
         self.assertEqual(result.count("<<<BEGIN_USER_REQUEST>>>"), 1)
         self.assertEqual(result.count("<<<END_USER_REQUEST>>>"), 1)
 
-    def test_user_builders_omit_generic_persona_line(self):
-        """The build_cooperative_prompt_user* builders must NOT re-declare a
-        generic persona ("You are a helpful and intelligent AI assistant.").
-        That line lands in the last user message every turn, so the model
-        treated it as the active persona and collapsed the real persona from
-        the upstream conversation. The intro line instead introduces the
+    def test_user_front_builder_omits_generic_persona_line(self):
+        """The user_front builder must NOT re-declare a generic persona
+        ("You are a helpful and intelligent AI assistant.").  That line
+        lands in the last user message every turn, so the model treated
+        it as the active persona and collapsed the real persona from the
+        upstream conversation. The intro line instead introduces the
         user-request block and tells the model to keep its established
         identity — it must not describe the tool-call format (the tool
         scaffolding sits after the request, not after the intro)."""
-        for builder in (
-            proxy.build_cooperative_prompt_user,
-            proxy.build_cooperative_prompt_user_front,
-            proxy.build_cooperative_prompt_user_bookend,
-        ):
-            out = builder("do the thing", "TOOLS_HERE")
-            self.assertNotIn("helpful and intelligent AI assistant", out, builder.__name__)
-            self.assertIn("do not adopt a new identity", out, builder.__name__)
-            self.assertIn("user's next message", out, builder.__name__)
-            self.assertNotIn("tool-call format", out, builder.__name__)
+        out = proxy.build_cooperative_prompt_user_front("do the thing", "TOOLS_HERE")
+        self.assertNotIn("helpful and intelligent AI assistant", out)
+        self.assertIn("do not adopt a new identity", out)
+        self.assertIn("user's next message", out)
+        self.assertNotIn("tool-call format", out)
 
     def test_consecutive_system_messages_are_coalesced(self):
         """Multiple system messages in input → one coalesced system message in output."""
@@ -563,9 +541,9 @@ And answer "what does this do?"'''
 
     def test_tool_message_uses_tool_name_and_wraps_in_markers(self):
         # The translator wraps every role:"tool" message in
-        # <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>> markers. In legacy
-        # 'user' mode the tool-variant builder then injects the framing line
-        # and tool list around that already-delimited block.
+        # <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>> markers. In
+        # user_front mode the tool-variant builder then injects the framing
+        # line and tool list around that already-delimited block.
         msgs = [
             {"role": "user", "content": "weather?"},
             {
@@ -575,7 +553,7 @@ And answer "what does this do?"'''
             },
             {"role": "tool", "tool_name": "get_weather", "content": "72F sunny"},
         ]
-        with patch.object(proxy, "_PROMPT_MODE", "user"):
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
             out = proxy.translate_history_and_apply_prompt(msgs, "Tool Name: `get_weather`")
         self.assertEqual(out[-1]["role"], "user")
         c = out[-1]["content"]
@@ -621,8 +599,8 @@ class TestMakeChunk(unittest.TestCase):
 
 
 class TestPromptInjectionModes(unittest.TestCase):
-    """Three configurable injection paths for the cooperative tool-use
-    scaffolding, selected by PROXY_PROMPT_MODE: 'user', 'system', 'hybrid'.
+    """Two configurable injection paths for the cooperative tool-use
+    scaffolding, selected by PROXY_PROMPT_MODE: 'user_front', 'hybrid'.
 
     Each test patches `proxy._PROMPT_MODE` and runs the translation. The
     fully-formatted tool text comes from `format_tools_to_text`; tests
@@ -659,51 +637,32 @@ class TestPromptInjectionModes(unittest.TestCase):
         with patch.object(proxy, "_PROMPT_MODE", mode):
             return proxy.translate_history_and_apply_prompt(self.user_msgs, tools_text)
 
-    def test_mode_user_injects_into_last_user_message(self):
-        result = self._translate_with_mode("user")
-        # System unchanged.
-        self.assertEqual(result[0]["content"], "You are claude-code.")
-        # Last user message has the full scaffolding + tool list.
-        last_user = result[-1]["content"]
-        self.assertIn("Tool Usage Instructions", last_user)
-        self.assertIn("Bash", last_user)
-        self.assertIn("Run shell command", last_user)
-        self.assertIn("BEGIN_USER_REQUEST", last_user)
-        self.assertIn("say hello", last_user)
-
-    def test_mode_system_appends_to_system(self):
-        result = self._translate_with_mode("system")
-        sys_content = result[0]["content"]
-        self.assertIn("You are claude-code.", sys_content)
-        self.assertIn("Tool Usage Instructions", sys_content)
-        self.assertIn("Bash", sys_content)
-        # Last user message is UNCHANGED.
-        self.assertEqual(result[-1]["content"], "say hello")
-        self.assertNotIn("Tool Usage Instructions", result[-1]["content"])
-        self.assertNotIn("BEGIN_USER_REQUEST", result[-1]["content"])
-
     def test_mode_hybrid_full_tools_in_system_reminder_in_user(self):
         result = self._translate_with_mode("hybrid")
+        # [0] is the system message; it must contain the original system
+        # text AND the full tool definitions (Tool Name / JSON Schema).
         sys_content = result[0]["content"]
-        self.assertIn("Tool Usage Instructions", sys_content)
-        self.assertIn("Bash", sys_content)
+        self.assertIn("You are claude-code.", sys_content)
+        self.assertIn("Tool Name: `Bash`", sys_content)
+        self.assertIn("Run shell command", sys_content)
+        self.assertIn('"required"', sys_content, "JSON Schema body present in system")
+        self.assertIn('"command"', sys_content)
+
         last_user = result[-1]["content"]
-        # Hybrid reminder present, but NOT the full scaffolding/tool list.
-        self.assertIn("Tool reminder", last_user)
-        self.assertIn("system prompt", last_user.lower())
+        # The new reminder is present.
+        self.assertIn("Reminder:", last_user)
+        # Lists the available tool names (recency anchoring).
+        self.assertIn("Bash", last_user)
+        self.assertIn("Available tools:", last_user)
+        # New sentence telling the model not to fabricate tool results.
+        self.assertIn("do not invent", last_user)
+        # The user's original message survives.
         self.assertIn("say hello", last_user)
+        # The reminder must NOT contain the full tool schema or instructions
+        # header — those live only in the prefix at [0].
         self.assertNotIn("Tool Usage Instructions", last_user)
         self.assertNotIn("Run shell command", last_user)
-
-    def test_mode_system_inserts_system_when_missing(self):
-        """If the input has no system message, system/hybrid modes insert one."""
-        msgs = [{"role": "user", "content": "hi"}]
-        tools_text = proxy.format_tools_to_text(self.tools)
-        with patch.object(proxy, "_PROMPT_MODE", "system"):
-            out = proxy.translate_history_and_apply_prompt(msgs, tools_text)
-        self.assertEqual(out[0]["role"], "system")
-        self.assertIn("Tool Usage Instructions", out[0]["content"])
-        self.assertEqual(out[-1]["content"], "hi")
+        self.assertNotIn('"required"', last_user)
 
     def test_mode_user_front_request_before_tools(self):
         """In user_front mode, the user's request appears BEFORE the tool
@@ -727,30 +686,20 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("Bash", last_user)
         self.assertIn("Run shell command", last_user)
 
-    def test_mode_user_bookend_request_appears_twice(self):
-        """In user_bookend mode, the user's request appears TWICE — once
-        before tools, once after. Both occurrences wrapped in markers."""
-        result = self._translate_with_mode("user_bookend")
-        last_user = result[-1]["content"]
-
-        occurrences = last_user.count("say hello")
-        self.assertEqual(
-            occurrences, 2,
-            f"user_bookend: expected 2 occurrences of request, got {occurrences}",
-        )
-
-        begin_count = last_user.count("<<<BEGIN_USER_REQUEST>>>")
-        end_count = last_user.count("<<<END_USER_REQUEST>>>")
-        self.assertEqual(begin_count, 2)
-        self.assertEqual(end_count, 2)
-
-        self.assertIn("Available Tools", last_user)
-        self.assertIn("Bash", last_user)
-
     def test_invalid_mode_falls_back_to_user_front(self):
         with patch.dict(os.environ, {"PROXY_PROMPT_MODE": "garbage"}):
             proxy._setup_prompt_mode()
             self.assertEqual(proxy._PROMPT_MODE, "user_front")
+        # Previously-valid modes that were removed in the hybrid-consolidation
+        # refactor must now also fall back to user_front. This guards against
+        # silent re-introduction.
+        for removed in ("user", "system", "user_bookend"):
+            with patch.dict(os.environ, {"PROXY_PROMPT_MODE": removed}):
+                proxy._setup_prompt_mode()
+                self.assertEqual(
+                    proxy._PROMPT_MODE, "user_front",
+                    f"removed mode '{removed}' should fall back to user_front",
+                )
 
     def test_default_mode_is_user_front(self):
         env_no_mode = {k: v for k, v in os.environ.items() if k != "PROXY_PROMPT_MODE"}
@@ -760,7 +709,7 @@ class TestPromptInjectionModes(unittest.TestCase):
 
     def test_no_tools_skips_injection_in_all_modes(self):
         """No tools defined → no scaffolding regardless of mode."""
-        for mode in ("user", "system", "hybrid", "user_front", "user_bookend"):
+        for mode in ("hybrid", "user_front"):
             with patch.object(proxy, "_PROMPT_MODE", mode):
                 result = proxy.translate_history_and_apply_prompt(self.user_msgs, "")
             self.assertEqual(result[0]["content"], "You are claude-code.", mode)
@@ -768,8 +717,8 @@ class TestPromptInjectionModes(unittest.TestCase):
 
     def test_hybrid_tool_result_message_gets_reminder(self):
         """In hybrid mode, when the last message is a tool-result-converted
-        user message, the brief reminder still applies — the model needs
-        to know tools are available regardless of how the user msg formed."""
+        user message, the reminder still applies — the model needs to know
+        tools are available regardless of how the user msg formed."""
         msgs = [
             {"role": "user", "content": "weather?"},
             {
@@ -786,7 +735,11 @@ class TestPromptInjectionModes(unittest.TestCase):
         # <<<BEGIN_TOOL_RESULT>>> markers and the hybrid reminder prefix.
         self.assertEqual(out[-1]["role"], "user")
         c = out[-1]["content"]
-        self.assertIn("Tool reminder", c)
+        # New reminder text ("Reminder:" — not the old "Tool reminder").
+        self.assertIn("Reminder:", c)
+        # The new "do not invent" sentence telling the model not to
+        # fabricate tool results.
+        self.assertIn("do not invent", c)
         self.assertIn('<<<BEGIN_TOOL_RESULT name="get_weather">>>', c)
         self.assertIn("<<<END_TOOL_RESULT>>>", c)
         self.assertIn("72F sunny", c)
@@ -806,15 +759,6 @@ class TestPromptInjectionModes(unittest.TestCase):
             "user_front: persona intro line must come before the request",
         )
         self.assertLess(request_pos, tools_pos)
-
-    def test_mode_user_bookend_intro_line_before_request(self):
-        """user_bookend uses the same intro-first layout as user_front."""
-        result = self._translate_with_mode("user_bookend")
-        last_user = result[-1]["content"]
-        intro_pos = last_user.index("do not adopt a new identity")
-        first_request_pos = last_user.index("<<<BEGIN_USER_REQUEST>>>")
-        self.assertLess(intro_pos, first_request_pos)
-
 
 class TestPassthroughMode(unittest.TestCase):
     """`passthrough` mode is the benchmark control: skip every harness-side
@@ -933,7 +877,7 @@ class TestToolResultDelimiting(unittest.TestCase):
     def test_translator_wraps_tool_result_in_markers_every_mode(self):
         """Any role:'tool' message gets <<<BEGIN_TOOL_RESULT>>> markers,
         regardless of prompt mode, with the name pulled from metadata."""
-        for mode in ("user", "user_front", "user_bookend", "system", "hybrid"):
+        for mode in ("user_front", "hybrid"):
             with patch.object(proxy, "_PROMPT_MODE", mode):
                 out = proxy.translate_history_and_apply_prompt(self.tool_msgs, "tools")
             c = out[-1]["content"]
@@ -944,12 +888,11 @@ class TestToolResultDelimiting(unittest.TestCase):
 
     def test_tool_result_not_labeled_as_user_request(self):
         """Regression: tool-result turns must NOT be wrapped in
-        <<<BEGIN_USER_REQUEST>>> markers in user_front / user_bookend mode —
-        the earlier _tool_front / _tool_bookend builders did exactly that."""
-        for mode in ("user", "user_front", "user_bookend"):
-            with patch.object(proxy, "_PROMPT_MODE", mode):
-                out = proxy.translate_history_and_apply_prompt(self.tool_msgs, "tools")
-            self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", out[-1]["content"], mode)
+        <<<BEGIN_USER_REQUEST>>> markers — the deleted user_bookend's
+        _tool_bookend builder did exactly that."""
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+            out = proxy.translate_history_and_apply_prompt(self.tool_msgs, "tools")
+        self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", out[-1]["content"])
 
     def test_tool_content_taken_verbatim_not_parsed(self):
         """The translator wraps tool content verbatim. Content that itself
@@ -1007,30 +950,6 @@ class TestToolResultDelimiting(unittest.TestCase):
         self.assertLess(result_pos, tools_pos)
         self.assertLess(tools_pos, cue_pos)
         self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", out)
-
-    def test_builder_tool_bookend_repeats_result(self):
-        """tool_bookend: result appears at both ends with tools in between."""
-        wrapped = '<<<BEGIN_TOOL_RESULT name="bash">>>\nok\n<<<END_TOOL_RESULT>>>'
-        out = proxy.build_cooperative_prompt_tool_bookend(wrapped, "TOOLS_HERE")
-        self.assertEqual(out.count(wrapped), 2, "bookend repeats the result")
-        self.assertIn("TOOLS_HERE", out)
-        first = out.index(wrapped)
-        tools_pos = out.index("TOOLS_HERE")
-        second = out.index(wrapped, first + 1)
-        self.assertLess(first, tools_pos)
-        self.assertLess(tools_pos, second)
-        self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", out)
-
-    def test_builder_tool_legacy_result_at_end(self):
-        """Legacy `user`-mode builder: result stays after the tool list, and
-        the builder no longer adds its own <<<BEGIN_OBSERVATION>>> wrapper."""
-        wrapped = '<<<BEGIN_TOOL_RESULT name="bash">>>\nok\n<<<END_TOOL_RESULT>>>'
-        out = proxy.build_cooperative_prompt_tool(wrapped, "TOOLS_HERE")
-        self.assertIn("NOT a message from the user", out)
-        self.assertIn(wrapped, out)
-        self.assertIn("TOOLS_HERE", out)
-        self.assertLess(out.index("TOOLS_HERE"), out.index(wrapped))
-        self.assertNotIn("<<<BEGIN_OBSERVATION>>>", out)
 
     def test_tool_result_name_resolved_via_tool_call_id(self):
         """A role:'tool' message with no name field but a tool_call_id is
@@ -1184,27 +1103,29 @@ class TestChangeSystemToUser(unittest.TestCase):
                 self.assertIn("\n\n", result[0]["content"])  # the separator
                 self.assertEqual(result[1]["role"], "assistant")
 
-    def test_change_system_to_user_with_system_mode_injection(self):
-        """When PROMPT_MODE='system' AND CHANGE_SYSTEM_TO_USER is on, the
-        tool definitions get injected into the system message FIRST (by
-        the existing system-mode logic), then the loaded system message
-        gets converted to a user message. Tools end up in the converted
-        user message."""
+    def test_change_system_to_user_with_hybrid_mode_injection(self):
+        """When PROMPT_MODE='hybrid' AND CHANGE_SYSTEM_TO_USER is on, the
+        tool definitions get injected into the system message FIRST (the
+        stable prefix), then the loaded system message gets converted to a
+        user message at index 0. The recency reminder lands on the actual
+        last user message — index 2 (post-stub-assistant)."""
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
-            with patch.object(proxy, "_PROMPT_MODE", "system"):
+            with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
                 messages = [
                     {"role": "system", "content": "You are claude-code."},
                     {"role": "user", "content": "Hello"},
                 ]
-                tools_text = "Bash: Run shell command\nRead: Read a file"
+                tools_text = "Tool Name: `Bash`\nRun shell command"
                 result = proxy.translate_history_and_apply_prompt(messages, tools_text)
                 self.assertEqual(result[0]["role"], "user")
                 self.assertIn("You are claude-code.", result[0]["content"])
                 self.assertIn("Bash", result[0]["content"])
-                self.assertIn("Read a file", result[0]["content"])
+                self.assertIn("Run shell command", result[0]["content"])
                 self.assertEqual(result[1]["role"], "assistant")
                 self.assertEqual(result[2]["role"], "user")
-                self.assertEqual(result[2]["content"], "Hello")
+                # The recency reminder lands on the live user turn.
+                self.assertIn("Reminder:", result[2]["content"])
+                self.assertIn("Hello", result[2]["content"])
 
     def test_change_system_to_user_with_user_front_mode(self):
         """When PROMPT_MODE='user_front' AND CHANGE_SYSTEM_TO_USER is on,
