@@ -59,7 +59,16 @@ ENV LC_ALL=C.UTF-8
 
 # Both agent CLIs at pinned versions. Bumping requires editing this file.
 ARG CLAUDE_CODE_VERSION=2.1.143
-ARG OPENCODE_VERSION=1.15.4
+# OPENCODE_VERSION floor: must stay <= 1.14.41 until upstream restores
+# headless stdout. opencode 1.14.42 added an "interactive split-footer mode
+# for `opencode run`" that suppresses the formatted-default response body
+# when stdout is not a TTY — `opencode run "say hello"` then exits 0 with
+# only "> build · <project>" printed, no assistant content, breaking
+# `harness opencode -p` (full_pipeline_test.sh T10). The regression is
+# present in every 1.14.42..1.14.51 and 1.15.x release we tested. Bump
+# only after confirming `opencode run --format default <prompt>` on the
+# bumped version emits the assistant body on a non-TTY stdout.
+ARG OPENCODE_VERSION=1.14.41
 ARG OPENAI_COMPAT_VERSION=2.0.47
 ARG CCSTATUSLINE_VERSION=2.2.19
 
