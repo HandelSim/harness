@@ -423,6 +423,54 @@ _upg_linefile_full_for_entry() {
     ' "$f"
 }
 
+# --- merge prechecks -------------------------------------------------------
+#
+# Cheap "does <target> need a merge from <source>?" predicates. Pure bash +
+# awk — NO jq and NO container round-trips — so they're safe to run on every
+# agent launch as a gate before the (jq-backed) merge functions above. Both
+# return 0 (success) when a merge IS needed, 1 when the target is already up
+# to date. The "needed" set is computed from exactly the same key/entry
+# extraction the merge uses (_upg_envfile_keys / _upg_linefile_entries), so
+# the precheck can never disagree with what the merge would actually add.
+#
+# Annotation-only differences (a linefile entry present in both files but
+# with different inline `# ...` text) are NOT reported as needing a merge:
+# the merge only warns about those, it never appends, so the file wouldn't
+# change and the user shouldn't be prompted.
+
+# envfile: a merge is needed if <source> has any KEY= that <target> lacks.
+upgrade_envfile_needs_merge() {
+    local source="$1" target="$2"
+    [[ -f "$source" ]] || return 1     # nothing to merge from
+    [[ -f "$target" ]] || return 0     # target missing → would be created
+    local key
+    while IFS= read -r key; do
+        [[ -z "$key" ]] && continue
+        # Anchor on '=' so a prefix key (PROXY_API) can't false-match a
+        # longer one (PROXY_API_KEY=). Keys are [A-Za-z_][A-Za-z0-9_]* (per
+        # _upg_envfile_keys), so they carry no regex metacharacters.
+        grep -qE "^[[:space:]]*${key}=" "$target" || return 0
+    done < <(_upg_envfile_keys "$source")
+    return 1
+}
+
+# linefile: a merge is needed if <source> has any entry <target> lacks.
+upgrade_linefile_needs_merge() {
+    local source="$1" target="$2"
+    [[ -f "$source" ]] || return 1
+    [[ -f "$target" ]] || return 0
+    local target_entries=$'\n'
+    local entry
+    while IFS= read -r entry; do
+        target_entries+="$entry"$'\n'
+    done < <(_upg_linefile_entries "$target")
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        grep -Fxq -- "$entry" <<<"$target_entries" || return 0
+    done < <(_upg_linefile_entries "$source")
+    return 1
+}
+
 # --- directory_overwrite ---------------------------------------------------
 #
 # Refresh a managed directory from <source>, leaving any path inside

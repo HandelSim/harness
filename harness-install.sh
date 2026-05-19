@@ -80,6 +80,17 @@ title() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 cwd=$(pwd)
 install_root="$cwd/$CLONE_DIR"
 
+# Resolve the directory that harness-install.sh itself lives in. This is
+# where a distributor can drop a pre-edited .env and .harness-allowlist
+# beside the installer so the user gets them copied into the install root
+# automatically (one folder to ship, fewer post-install steps). Prefer the
+# script's own location over $cwd so "beside the script" works even when the
+# installer is run from a different directory. Falls back to $cwd when
+# BASH_SOURCE can't be resolved (e.g. piped from curl), which matches the
+# pre-existing $cwd-based behavior.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir="$cwd"
+[[ -n "$script_dir" ]] || script_dir="$cwd"
+
 # --- inline platform fallbacks (pre-clone) ----------------------------------
 #
 # install.sh runs BEFORE the clone, so scripts/lib/platform.sh from the
@@ -325,9 +336,12 @@ Steps:
   2. Refuse if $install_root already exists.
   3. Clone $REPO_URL into $install_root
   4. Create runtime state directories under $install_root/state/
-  5. Seed .env (from a pre-edited .env in $cwd if present, else from .env.example).
-  6. Seed .harness-allowlist from .harness-allowlist.example (if not present).
+  5. Seed .env (from a pre-edited .env beside this installer if present, else
+     from .env.example).
+  6. Seed .harness-allowlist (from one beside this installer if present, else
+     from .harness-allowlist.example).
   7. Optionally install a 'harness' wrapper into $LOCAL_BIN and update PATH.
+  8. Optionally accept an upstream API key to write into PROXY_API_KEY in .env.
 
 EOF
 
@@ -347,6 +361,30 @@ read -rp "add 'harness' to PATH (recommended)? [y/n]: " path_ans
 case "${path_ans:-}" in
     n|N|no|NO) want_path=0 ;;
     *) want_path=1 ;;
+esac
+
+# Upstream API key. The proxy needs a per-user key (PROXY_API_KEY in .env)
+# that we can't ship — every user brings their own. Offer to capture it now
+# so the user doesn't have to hand-edit .env afterward. Declining is fine;
+# we just remind them to set it manually. No validation: whatever is pasted
+# is accepted verbatim and written later (after .env is seeded).
+want_api_key=0
+api_key_value=""
+echo
+echo "The proxy needs an upstream API key (PROXY_API_KEY in .env)."
+echo "If you skip this, edit .env and set PROXY_API_KEY before 'harness start'."
+read -rp "enter an upstream API key now? [y/n]: " key_ans
+case "${key_ans:-}" in
+    y|Y|yes|YES)
+        want_api_key=1
+        # -s hides the key from the terminal; the trailing echo restores the
+        # newline that -s swallows so subsequent output isn't glued on.
+        read -rsp "paste API key (input hidden): " api_key_value
+        echo
+        ;;
+    *)
+        echo "  skipping; remember to set PROXY_API_KEY in .env manually."
+        ;;
 esac
 
 # --- clone ------------------------------------------------------------------
@@ -405,8 +443,9 @@ ok "created state/output, state/agent/home, state/ollama-data, state/mcp"
 # Three cases, in priority order:
 #   1. $install_root/.env already exists (unusual; clone shouldn't ship .env)
 #      → leave it alone.
-#   2. $cwd/.env exists (user pre-placed an edited .env in cwd)
-#      → move it into the clone and remove the source so the layout is clean.
+#   2. $script_dir/.env exists (distributor/user dropped an edited .env beside
+#      the installer) → copy it into the clone, leaving the source in place so
+#      the shipped folder stays intact.
 #   3. Neither → seed from .env.example inside the clone.
 #
 # B3-MANAGED: env-vars — <install-root>/.env. `harness upgrade` runs the
@@ -417,21 +456,50 @@ ok "created state/output, state/agent/home, state/ollama-data, state/mcp"
 title "configuring .env"
 if [[ -f "$install_root/.env" ]]; then
     ok "$install_root/.env already present; left untouched"
-elif [[ -f "$cwd/.env" ]]; then
-    cp "$cwd/.env" "$install_root/.env"
-    ok "moved your pre-filled .env into $install_root/.env"
-    rm -f "$cwd/.env"
+elif [[ -f "$script_dir/.env" ]]; then
+    cp "$script_dir/.env" "$install_root/.env"
+    ok "copied your pre-filled .env from $script_dir into $install_root/.env"
 else
     cp "$install_root/.env.example" "$install_root/.env"
     ok "seeded $install_root/.env from .env.example"
     warn "edit $install_root/.env and fill in PROXY_API_KEY (and any other blank required values)"
 fi
 
+# If the user supplied an API key at the prompt, write it into the freshly
+# seeded .env now, overwriting whatever PROXY_API_KEY value was there (the
+# prompt is the most recent explicit signal, so it wins over a pre-placed
+# value). A bash read-loop rewrites just the PROXY_API_KEY= line — not sed —
+# so keys containing /, &, etc. need no escaping. Atomic .tmp + rename
+# matches the rest of the script's write convention. Only non-empty input is
+# written, so an accidental empty paste can't blank out a pre-placed key.
+if (( want_api_key )) && [[ -n "$api_key_value" ]]; then
+    env_target="$install_root/.env"
+    env_tmp="$env_target.tmp.$$"
+    key_written=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*PROXY_API_KEY= ]]; then
+            printf 'PROXY_API_KEY=%s\n' "$api_key_value"
+            key_written=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$env_target" >"$env_tmp"
+    if (( ! key_written )); then
+        printf 'PROXY_API_KEY=%s\n' "$api_key_value" >>"$env_tmp"
+    fi
+    mv -f "$env_tmp" "$env_target"
+    ok "wrote PROXY_API_KEY from prompt input into $install_root/.env"
+fi
+
 # --- firewall allowlist -----------------------------------------------------
 #
 # Every harness container reads its egress allowlist from
-# <install-root>/.harness-allowlist. Seed from the bundled example on a
-# fresh install. Idempotent: existing user customizations are never touched.
+# <install-root>/.harness-allowlist. Priority order mirrors the .env logic:
+#   1. one already in the install root → leave it alone.
+#   2. one beside the installer ($script_dir) → copy it in, source left in
+#      place.
+#   3. otherwise seed from the bundled .harness-allowlist.example.
+# Idempotent: existing user customizations are never touched.
 #
 # B3-MANAGED: allowlist-hosts — <install-root>/.harness-allowlist. `harness
 # upgrade` runs the `allowlist_hosts` manifest action (linefile_merge) to
@@ -440,6 +508,9 @@ fi
 title "configuring firewall allowlist"
 if [[ -f "$install_root/.harness-allowlist" ]]; then
     ok ".harness-allowlist already present; left untouched"
+elif [[ -f "$script_dir/.harness-allowlist" ]]; then
+    cp "$script_dir/.harness-allowlist" "$install_root/.harness-allowlist"
+    ok "copied your pre-filled .harness-allowlist from $script_dir into $install_root/.harness-allowlist"
 elif [[ -f "$install_root/.harness-allowlist.example" ]]; then
     cp "$install_root/.harness-allowlist.example" "$install_root/.harness-allowlist"
     ok "seeded $install_root/.harness-allowlist from .harness-allowlist.example"

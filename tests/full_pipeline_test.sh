@@ -164,12 +164,16 @@ PUBLISH_OLLAMA_PORT=
 MOCK_SCENARIO=text
 EOF
 
-# harness-install.sh prompts: continue? [y/n], add to PATH? [y/n]. Send y, y.
+# harness-install.sh prompts: continue? [y/n], add to PATH? [y/n], enter API
+# key? [y/n], then (on y) the key itself. Send: y, y, y, <key>. Supplying the
+# key here exercises issue #67's PROXY_API_KEY rewrite — the prompt value
+# wins over the pre-placed .env's PROXY_API_KEY=test-key-1234 (mock upstream
+# ignores the key, so the downstream round-trip is unaffected).
 # harness-install.sh installs into $(pwd) — must cd into TEST_ROOT first.
 (
     cd "${TEST_ROOT}"
     HOME="${FAKE_HOME}" HARNESS_REPO_URL="${REPO_ROOT}" \
-        bash "${TEST_ROOT}/harness-install.sh" <<<$'y\ny\n' >"${TEST_ROOT}/install.log" 2>&1
+        bash "${TEST_ROOT}/harness-install.sh" <<<$'y\ny\ny\nharness-pipeline-prompt-key\n' >"${TEST_ROOT}/install.log" 2>&1
 )
 
 # harness-install.sh clones HEAD of the local repo, but the pipeline test is
@@ -226,6 +230,17 @@ echo "[pipeline] T2: install layout"
 [[ -d "${TEST_ROOT}/harness/state/ollama-data" ]]       || { echo "[pipeline] T2 FAIL: state/ollama-data/ missing" >&2; exit 1; }
 [[ -f "${TEST_ROOT}/harness/.env" ]]                    || { echo "[pipeline] T2 FAIL: .env missing in clone" >&2; exit 1; }
 [[ -f "${TEST_ROOT}/harness/.harness-allowlist" ]]      || { echo "[pipeline] T2 FAIL: .harness-allowlist missing in clone" >&2; exit 1; }
+
+# Issue #67: a pre-placed .env beside the installer is COPIED into the clone
+# (not moved — source must survive), and a prompt-supplied API key is written
+# into PROXY_API_KEY, overwriting the pre-placed value while leaving the rest
+# of the file intact.
+grep -q '^PROXY_API_KEY=harness-pipeline-prompt-key$' "${TEST_ROOT}/harness/.env" \
+    || { echo "[pipeline] T2 FAIL: #67 installer did not write prompt-supplied PROXY_API_KEY into .env" >&2; grep '^PROXY_API_KEY=' "${TEST_ROOT}/harness/.env" >&2; exit 1; }
+grep -q '^PROXY_API_URL=http://mockupstream:9000/v1/chat/completions$' "${TEST_ROOT}/harness/.env" \
+    || { echo "[pipeline] T2 FAIL: #67 PROXY_API_KEY rewrite clobbered other .env vars (PROXY_API_URL lost)" >&2; exit 1; }
+[[ -f "${TEST_ROOT}/.env" ]] \
+    || { echo "[pipeline] T2 FAIL: #67 pre-placed source .env was removed (copy, not move, expected)" >&2; exit 1; }
 
 # Inventory I024: wrapper hard-codes the install-root path. Grep the wrapper
 # body for the literal install root we expect ("${TEST_ROOT}/harness/harness").

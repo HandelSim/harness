@@ -612,6 +612,112 @@ T9_JSTR_OUT=$(_upg_json_str 'a/b "c"' | jq -c .)
 
 ok "T9: harness_jq standalone fallback works and is consumed by upgrade_actions.sh helpers"
 
+# === Test 10: merge prechecks ============================================
+#
+# upgrade_envfile_needs_merge / upgrade_linefile_needs_merge are the
+# pure-bash gates that let `harness upgrade` and the agent-launch config
+# merge skip the prompt + jq when nothing changed. Contract: return 0 when a
+# merge IS needed, 1 when the target is already up to date. They must agree
+# with what the corresponding merge function would actually add.
+
+echo
+echo "--- T10: merge prechecks ---"
+T10_DIR="${WORK}/t10"
+mkdir -p "${T10_DIR}"
+
+# envfile source with three keys.
+cat >"${T10_DIR}/source.env" <<'EOF'
+# A
+A=1
+# B
+B=2
+# C
+C=3
+EOF
+
+# 10.1: target has all keys → no merge needed (rc 1).
+cat >"${T10_DIR}/full.env" <<'EOF'
+A=user
+B=user
+C=user
+EOF
+upgrade_envfile_needs_merge "${T10_DIR}/source.env" "${T10_DIR}/full.env" \
+    && fail "T10.1: needs_merge reported work for an up-to-date target"
+ok "T10.1: envfile up-to-date target → no merge needed"
+
+# 10.2: target missing a key → merge needed (rc 0).
+cat >"${T10_DIR}/partial.env" <<'EOF'
+A=user
+B=user
+EOF
+upgrade_envfile_needs_merge "${T10_DIR}/source.env" "${T10_DIR}/partial.env" \
+    || fail "T10.2: needs_merge missed a genuinely-absent key (C)"
+ok "T10.2: envfile target missing a key → merge needed"
+
+# 10.3: target file missing entirely → merge needed (would be created).
+rm -f "${T10_DIR}/absent.env"
+upgrade_envfile_needs_merge "${T10_DIR}/source.env" "${T10_DIR}/absent.env" \
+    || fail "T10.3: needs_merge did not flag a missing target"
+ok "T10.3: missing envfile target → merge needed"
+
+# 10.4: source missing → never needs merge (rc 1).
+rm -f "${T10_DIR}/no-source.env"
+upgrade_envfile_needs_merge "${T10_DIR}/no-source.env" "${T10_DIR}/full.env" \
+    && fail "T10.4: needs_merge reported work with no source file"
+ok "T10.4: missing envfile source → no merge needed"
+
+# 10.5: prefix-collision safety — target has PROXY_API_KEY but source adds
+# PROXY_API. The '=' anchor must NOT let PROXY_API match PROXY_API_KEY=.
+cat >"${T10_DIR}/prefix-src.env" <<'EOF'
+PROXY_API=1
+EOF
+cat >"${T10_DIR}/prefix-tgt.env" <<'EOF'
+PROXY_API_KEY=set
+EOF
+upgrade_envfile_needs_merge "${T10_DIR}/prefix-src.env" "${T10_DIR}/prefix-tgt.env" \
+    || fail "T10.5: prefix key PROXY_API false-matched PROXY_API_KEY= (anchor broken)"
+ok "T10.5: envfile precheck anchors on '=' (no prefix false-match)"
+
+# 10.6: linefile up-to-date → no merge needed.
+cat >"${T10_DIR}/source.list" <<'EOF'
+host-a.example
+host-b.example
+EOF
+cat >"${T10_DIR}/full.list" <<'EOF'
+host-a.example
+host-b.example
+host-extra.example
+EOF
+upgrade_linefile_needs_merge "${T10_DIR}/source.list" "${T10_DIR}/full.list" \
+    && fail "T10.6: linefile needs_merge reported work for an up-to-date target"
+ok "T10.6: linefile up-to-date target → no merge needed"
+
+# 10.7: linefile missing an entry → merge needed.
+cat >"${T10_DIR}/partial.list" <<'EOF'
+host-a.example
+EOF
+upgrade_linefile_needs_merge "${T10_DIR}/source.list" "${T10_DIR}/partial.list" \
+    || fail "T10.7: linefile needs_merge missed an absent entry (host-b.example)"
+ok "T10.7: linefile target missing an entry → merge needed"
+
+# 10.8: annotation-only diff is NOT a merge (merge only warns, never adds).
+cat >"${T10_DIR}/annot-src.list" <<'EOF'
+github.com   # git-push
+EOF
+cat >"${T10_DIR}/annot-tgt.list" <<'EOF'
+github.com
+EOF
+upgrade_linefile_needs_merge "${T10_DIR}/annot-src.list" "${T10_DIR}/annot-tgt.list" \
+    && fail "T10.8: annotation-only diff falsely reported as needing a merge"
+ok "T10.8: linefile annotation-only diff → no merge needed (matches merge behavior)"
+
+# 10.9: precheck agrees with the actual merge — after a real merge applies
+# the missing key, the precheck must flip to "up to date".
+upgrade_envfile_merge "${T10_DIR}/source.env" "${T10_DIR}/partial.env" 0 >/dev/null
+upgrade_envfile_needs_merge "${T10_DIR}/source.env" "${T10_DIR}/partial.env" \
+    && fail "T10.9: precheck still reports work after the merge applied it"
+ok "T10.9: precheck flips to up-to-date once the merge has run"
+
 echo
 echo "============================================================"
 echo " UPGRADE TEST PASSED"
