@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 398 IDs (F=139, P=57, A=34, M=23, N=30, U=29, Pe=19, O=25, I=42).
+Inventory total: 404 IDs (F=142, P=57, A=34, M=23, N=30, U=29, Pe=19, O=25, I=45).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -221,6 +221,9 @@ non-green rows — the gap.
 | F097 | green  | tests/harness_test.sh:1100-1118             | T22 + doctor T8/T9: `[config]` section reports `.env` parseable / allowlist parseable. | |
 | F098 | green  | tests/harness_test.sh:773-790               | T15: doctor `[network]` section + `allowlist` keyword. | |
 | F099 | green  | tests/harness_test.sh:533-555               | T8 verifies `[storage]` block lists state/output, state/agent/home, state/ollama-data with writable status. | |
+| F100 | green  | tests/full_pipeline_test.sh (T1b)           | T1b runs the installer with `HTTPS_PROXY` exported and asserts the value is persisted into the install root `.env` (then scrubs it). | |
+| F101 | green  | tests/harness_test.sh (T7b)                 | T7b drives a fake runtime via `harness_docker`/`harness_docker_exec` with all six proxy spellings exported and asserts none appear in the recorded runtime env. | |
+| F102 | yellow | tests/harness_test.sh (T7b)                 | Exercised indirectly: T7b exports both upper/lower spellings; the mirror runs at harness env-load (not asserted in isolation). | |
 | F100 | green  | tests/harness_test.sh:557-572               | T8: `grep -Eq '(docker\|podman)\\s+runtime[[:space:]]+reachable'`. | |
 | F101 | green  | tests/harness_test.sh:574-585               | T8: `[images]` section asserted; image presence + age lines printed for proxy/ollama/agents. | |
 | F102 | green  | tests/harness_test.sh:580-591 + mcp_test.sh:396-411 | doctor `[mcp]` section; mcp_test T8 verifies status reports `state: installed-enabled`. | |
@@ -557,6 +560,9 @@ non-green rows — the gap.
 | I040 | green  | tests/harness_test.sh:976-984               | T19: `harness_check_command bash` succeeds; `harness_check_command __nonexistent_cmd_xyz__` fails. | |
 | I041 | green  | tests/harness_test.sh:1029-1033             | T19: `harness_check_disk_space "${REPO_ROOT}" 0 "any"` succeeds; threshold tests embedded in the helper. | |
 | I042 | green  | tests/harness_test.sh:1022-1027             | T19: `harness_check_dir_writable "${tmpdir}" true "writable"` succeeds against a writable dir. | |
+| I043 | green  | tests/full_pipeline_test.sh (T1b)           | T1b installs with `HTTPS_PROXY` exported and asserts the value lands in the seeded `.env` (blank line filled). | |
+| I044 | yellow | tests/harness_test.sh (T7c)                 | Windows-gated, can't run on Linux CI: T7c source-greps the bridge in `harness-install.sh` and exercises the bridge snippet logic. | |
+| I045 | green  | tests/harness_test.sh (T7c)                 | T7c asserts bridge idempotency (one `.bashrc` source line over 3 runs) and that a pre-existing `~/.profile` is preserved. | |
 
 ---
 

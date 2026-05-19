@@ -36,10 +36,21 @@ run from an empty directory. Stages:
    was captured at the prompt, its value is then written into the `.env`'s
    `PROXY_API_KEY=` line (prompt wins over any pre-placed value; the
    rewrite touches only that line via a bash read-loop, no `sed` escaping).
+   If `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are exported in the installing
+   shell, their values are persisted into the `.env` (filling only blank
+   lines, so a pre-placed value wins) so later `harness` runs reuse the proxy
+   without re-exporting. The initial `git clone` itself just inherits the
+   shell's proxy (git's libcurl honors these env vars). These are host-only;
+   `harness` strips them from containers (see [`containers.md`](containers.md)).
 8. **PATH wrapper.** Writes a `harness` script wrapper to
    `~/.local/bin/harness` that `exec`s into `<install-root>/harness`.
    Prints a one-line "add to PATH" reminder if `~/.local/bin` isn't
-   already there.
+   already there. The PATH export goes to the shell rcfile (`.bashrc` for
+   bash). On **Windows Git Bash** the installer also bridges
+   `~/.bash_profile` → `~/.bashrc`: Git Bash starts login shells, which read
+   `~/.bash_profile` and skip `~/.bashrc`, so without the bridge the PATH
+   line never runs in fresh sessions. The bridge preserves an existing
+   `~/.profile` when it has to create `~/.bash_profile`.
 9. **Final message.** Tells the user to edit `.env` (set
    `PROXY_API_KEY` etc.) and `cd` into a project to run `harness claude`.
 

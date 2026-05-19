@@ -102,6 +102,18 @@ project_name="${HARNESS_PROJECT_NAME:-harness}"
 # Source .env into this shell so we can read PUBLISH_OLLAMA_PORT,
 # OLLAMA_AGENT_MODEL etc. for our own logic. docker compose gets the file
 # separately via --env-file.
+#
+# Host proxy (HTTP_PROXY/HTTPS_PROXY/NO_PROXY): honored for the host-side git
+# calls this script runs (update/upgrade pull, mcp clone) — git's libcurl
+# reads them from the process env — but stripped from every container-runtime
+# call by harness_docker (see platform.sh). A non-empty value in .env wins; a
+# blank value (the optional default) must NOT clobber a proxy the invoking
+# shell already exported, so capture the shell's values before sourcing and
+# restore any that .env left empty.
+_harness_proxy_keys=(HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy)
+for _k in "${_harness_proxy_keys[@]}"; do
+    printf -v "_harness_shell_$_k" '%s' "${!_k:-}"
+done
 
 if [[ -f "$env_file" ]]; then
     set -a
@@ -109,6 +121,19 @@ if [[ -f "$env_file" ]]; then
     source "$env_file"
     set +a
 fi
+
+for _k in "${_harness_proxy_keys[@]}"; do
+    if [[ -z "${!_k:-}" ]]; then
+        _sv="_harness_shell_$_k"
+        [[ -n "${!_sv:-}" ]] && export "$_k=${!_sv}"
+    fi
+done
+# harness_normalize_proxy_env lives in platform.sh, which is always present in
+# a real install but may be absent when this script is sourced from a test
+# harness that didn't load it (HARNESS_SOURCE_ONLY). Guard so source-only
+# contexts don't abort under set -u/-e.
+command -v harness_normalize_proxy_env >/dev/null 2>&1 && harness_normalize_proxy_env
+unset _harness_proxy_keys _k _sv
 
 agent_model="${OLLAMA_AGENT_MODEL:-harness}"
 

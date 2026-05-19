@@ -30,6 +30,18 @@ so it can read values like `PUBLISH_OLLAMA_PORT`, `OLLAMA_AGENT_MODEL`,
 `HARNESS_EXTRA_MOUNTS` for its own logic. `docker compose` gets `.env`
 separately via `--env-file`. The two consumers are independent.
 
+### Host proxy (`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`)
+
+Optional, host-side only. Honored for the git calls this script runs
+(`update`/`upgrade` pull, `mcp install` clone) — git's libcurl reads them
+straight from the process env, so no per-call wiring is needed — and
+**stripped from every container-runtime call** by `harness_docker` (see
+[`containers.md`](containers.md)). Resolution around the `.env` source: a
+non-empty value in `.env` wins; a blank value (the optional default) is
+prevented from clobbering a proxy the invoking shell already exported by
+capturing the shell values first and restoring any `.env` left empty.
+`harness_normalize_proxy_env` then mirrors the upper/lower-case spellings.
+
 ## Subcommand surface
 
 `cmd_help` is the source of truth for the user-facing subcommand list.
