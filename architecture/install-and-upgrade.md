@@ -13,8 +13,11 @@ run from an empty directory. Stages:
    check: container runtime present (docker or podman), runtime reachable
    (`docker info`), required commands available. Failures abort with a
    clear message.
-2. **Intent prompts.** Asks where to clone (default `./harness/`), and
-   confirms before any writes.
+2. **Intent prompts.** Confirms before any writes, asks whether to add a
+   `harness` wrapper to PATH, and offers to capture an upstream API key now
+   (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves
+   it for the user to edit manually). No key validation — whatever is
+   pasted is accepted verbatim.
 3. **Clone.** `git clone` into the install dir. **The clone IS the
    install root** — there's no separate config dir.
 4. **Source full `platform.sh`** now that it's local. Subsequent helpers
@@ -23,9 +26,16 @@ run from an empty directory. Stages:
    LF line endings even if Git's autocrlf put CRLFs in the working tree.
 6. **Runtime state dirs.** Creates `state/output/`, `state/agent/home/`,
    `state/ollama-data/`, `state/mcp/`.
-7. **`.env` and `.harness-allowlist`.** Seeds from `.env.example` and
-   `.harness-allowlist.example` (no overwrite if the user's targets
-   already exist).
+7. **`.env` and `.harness-allowlist`.** For each, in priority order: leave
+   a target already in the install root untouched → else copy one dropped
+   beside the installer (the directory containing `harness-install.sh`,
+   `$script_dir` — **copy, not move**, so the shipped folder stays intact)
+   → else seed from the `.example`. This lets a distributor ship
+   `harness-install.sh` + a pre-edited `.env` + `.harness-allowlist` as one
+   folder and have the installer place them automatically. If an API key
+   was captured at the prompt, its value is then written into the `.env`'s
+   `PROXY_API_KEY=` line (prompt wins over any pre-placed value; the
+   rewrite touches only that line via a bash read-loop, no `sed` escaping).
 8. **PATH wrapper.** Writes a `harness` script wrapper to
    `~/.local/bin/harness` that `exec`s into `<install-root>/harness`.
    Prints a one-line "add to PATH" reminder if `~/.local/bin` isn't
@@ -55,13 +65,24 @@ config or state. No image rebuilds, no compose restart.
    `scripts/lib/upgrade_actions.sh` and the manifest are re-sourced /
    re-read post-pull regardless and so don't need this — re-exec
    exclusively covers changes to the `harness` script itself.
-2. Apply upgrade actions from `scripts/upgrade-manifest.json` to the
-   install root.
-3. `harness down --remove-orphans` and `harness start` (skippable via
+2. **Precheck** which managed files actually need a merge — pure bash +
+   awk, no jq and no container (see `upgrade_envfile_needs_merge` /
+   `upgrade_linefile_needs_merge`). If nothing needs merging, print
+   "Configuration files are up to date — no merges needed." and skip BOTH
+   the prompt and the merges. Otherwise list only the files that need
+   updating and prompt once (all-or-nothing). This is why a no-op upgrade
+   no longer prompts or spins jq for every config file.
+3. Apply the flagged upgrade actions from `scripts/upgrade-manifest.json`
+   to the install root (`apply_upgrade_actions` takes an optional ID
+   filter so only the prechecked actions run).
+4. `harness down --remove-orphans` and `harness start` (skippable via
    `--no-restart`).
 
-Declining the `[y/n]` confirmation skips step 2 (the file merges) but
-still runs step 3 — the git pull has already happened, so the rebuild +
+`--check` is the exception: it lists every action and dry-runs them all
+(full preview), bypassing the precheck.
+
+Declining the `[y/n]` confirmation skips step 3 (the file merges) but
+still runs step 4 — the git pull has already happened, so the rebuild +
 restart are needed to avoid running stale images on new code. To abort
 the whole upgrade, use Ctrl-C.
 
@@ -83,6 +104,33 @@ Flags:
 - `--no-prompt` — apply without the [y/n] confirmation.
 - `--no-restart` — apply without down/start (e.g. for CI).
 - `--rebuild` — `compose build --no-cache`; slower.
+
+## Agent-launch config merge
+
+`run_agent` (claude/opencode) and `cmd_shell` call
+`_check_and_offer_config_merge` at startup, right after the update banner.
+It reuses the same precheck + merge functions as `harness upgrade`, but only
+for the two config files (`.env`, `.harness-allowlist`) — not the rebuild,
+restart, or MCP registry actions. Purpose: a plain `harness update` pulls new
+code that may introduce env vars / allowlist hosts without merging them; this
+surfaces the merge at the next agent launch instead of silently running on a
+stale config.
+
+It is deliberately cheap and non-blocking:
+
+- The precheck is the pure-bash `upgrade_*_needs_merge` against the two
+  fixed config paths — no jq, no manifest read, no container. When nothing
+  changed it's a silent sub-10ms no-op on every launch.
+- One prompt, all-or-nothing (matches `harness upgrade`).
+- It NEVER gates the launch: headless `-p`/`--print` mode is skipped
+  entirely, a missing terminal falls through with a "run `harness upgrade`"
+  hint, and declining continues to the agent. `HARNESS_SKIP_CONFIG_MERGE=1`
+  disables it.
+
+Because the precheck is hard-coded to the two known config files (rather than
+manifest-driven, to avoid a per-launch jq/container cost), a future *new*
+config-file action added to the manifest is picked up by `harness upgrade`
+but not by this launch path until the helper is extended.
 
 ## The manifest (`scripts/upgrade-manifest.json`)
 

@@ -403,6 +403,72 @@ cmd_check_updates() {
     return 0
 }
 
+# --- agent-launch config merge --------------------------------------------
+#
+# Offer to merge newly-added config keys/hosts into the user's .env and
+# .harness-allowlist at agent / shell launch — the same merge `harness
+# upgrade` performs, but gated so the user is only prompted when something
+# actually changed (e.g. a `harness update` pulled new code that introduced
+# env vars or allowlist hosts, without the rebuild/restart that `harness
+# upgrade` does).
+#
+# The precheck is pure bash + awk (upgrade_*_needs_merge against the two
+# known config files) — NO jq and NO container — so when nothing changed
+# this is a near-zero-cost silent no-op on every launch. Only when a merge
+# is actually needed do we source-and-call the (jq-backed) merge functions.
+#
+# It NEVER gates the launch: headless (-p) mode, a missing tty, or the user
+# declining all fall through and the agent starts normally. One prompt,
+# all-or-nothing (matches `harness upgrade`).
+#
+# Arg 1: print_mode (1 = headless; skip entirely).
+_check_and_offer_config_merge() {
+    local print_mode="${1:-0}"
+    (( print_mode )) && return 0
+    [[ "${HARNESS_SKIP_CONFIG_MERGE:-0}" == "1" ]] && return 0
+    [[ -d "$install_root" ]] || return 0
+
+    local lib="$clone_dir/scripts/lib/upgrade_actions.sh"
+    [[ -f "$lib" ]] || return 0
+    # shellcheck disable=SC1090
+    source "$lib"
+
+    local env_src="$clone_dir/.env.example"
+    local env_tgt="$install_root/.env"
+    local allow_src="$clone_dir/.harness-allowlist.example"
+    local allow_tgt="$install_root/.harness-allowlist"
+
+    local need_env=0 need_allow=0
+    if upgrade_envfile_needs_merge "$env_src" "$env_tgt"; then need_env=1; fi
+    if upgrade_linefile_needs_merge "$allow_src" "$allow_tgt"; then need_allow=1; fi
+    (( need_env || need_allow )) || return 0
+
+    echo >&2
+    err "new configuration is available to merge into your install:"
+    (( need_env ))   && err "  - .env (new variables in .env.example)"
+    (( need_allow )) && err "  - .harness-allowlist (new hostnames in .harness-allowlist.example)"
+
+    # Need a terminal to prompt on. Interactive agent/shell launches have a
+    # tty; if not, don't block — just point the user at `harness upgrade`.
+    if [[ ! -t 0 && ! -e /dev/tty ]]; then
+        err "run 'harness upgrade' to apply (no terminal to prompt on now)."
+        return 0
+    fi
+
+    if _upgrade_confirm "merge now? [y/n] (n continues launch; run 'harness upgrade' later): "; then
+        if (( need_env )); then
+            upgrade_envfile_merge "$env_src" "$env_tgt" 0 >/dev/null || true
+        fi
+        if (( need_allow )); then
+            upgrade_linefile_merge "$allow_src" "$allow_tgt" 0 >/dev/null || true
+        fi
+        err "configuration merged."
+    else
+        err "skipped; run 'harness upgrade' to apply later."
+    fi
+    return 0
+}
+
 # Ensure the container runtime (docker or podman) is reachable; auto-start
 # Docker Desktop / podman machine on Windows / macOS if we can. Hard exit
 # with a helpful message otherwise. Delegates to
@@ -1329,18 +1395,25 @@ EOF
     # shellcheck disable=SC1090
     source "$lib"
 
-    echo
-    echo "Upgrade actions to apply:"
-    harness_jq -r '.actions[] | "  - \(.id): \(.description)"' "$manifest"
-    harness_jq -r '.registry_actions[]? | "  - \(.id) [\(.condition // "always")]: \(.description)"' "$manifest"
-    echo
-
+    # --check is a full preview: list every action and dry-run them all.
     if (( check_only )); then
+        echo
+        echo "Upgrade actions to apply:"
+        harness_jq -r '.actions[] | "  - \(.id): \(.description)"' "$manifest"
+        harness_jq -r '.registry_actions[]? | "  - \(.id) [\(.condition // "always")]: \(.description)"' "$manifest"
+        echo
         echo "(--check: dry-run; no changes will be made)"
         echo
         apply_upgrade_actions "$manifest" 1
         return 0
     fi
+
+    # Precheck which actions actually have work to do. The config-file
+    # prechecks (.env / .harness-allowlist) are pure bash + awk — no jq, no
+    # container — so when nothing changed we skip the prompt AND the jq-backed
+    # merges entirely, instead of prompting + running jq on every upgrade.
+    local needed_ids
+    needed_ids=$(_upgrade_actions_needing_work "$manifest")
 
     # Declining the prompt skips only the file merges — the rebuild +
     # restart still run. Nothing about applying the manifest gates the
@@ -1348,20 +1421,36 @@ EOF
     # decline that aborts everything just leaves the user on new code
     # with stale images. Ctrl-C is the way to bail out entirely.
     local skip_actions=0
-    if (( ! no_prompt )); then
-        if [[ -t 0 ]]; then
-            if ! _upgrade_confirm "Apply these upgrade actions? [y/n] (n skips the merges; upgrade still rebuilds + restarts): "; then
-                skip_actions=1
-                echo "harness: skipping upgrade actions; continuing with rebuild + restart"
+    if [[ -z "$needed_ids" ]]; then
+        echo
+        echo "Configuration files are up to date — no merges needed."
+        skip_actions=1
+    else
+        echo
+        echo "Updates available for:"
+        local nid
+        while IFS= read -r nid; do
+            [[ -n "$nid" ]] || continue
+            harness_jq -r --arg id "$nid" \
+                '(.actions[]?, .registry_actions[]?) | select(.id == $id) | "  - \(.id): \(.description)"' \
+                "$manifest"
+        done <<<"$needed_ids"
+        echo
+        if (( ! no_prompt )); then
+            if [[ -t 0 ]]; then
+                if ! _upgrade_confirm "Apply these upgrade actions? [y/n] (n skips the merges; upgrade still rebuilds + restarts): "; then
+                    skip_actions=1
+                    echo "harness: skipping upgrade actions; continuing with rebuild + restart"
+                fi
+            else
+                err "non-interactive shell; pass --no-prompt to apply without confirmation"
+                exit 1
             fi
-        else
-            err "non-interactive shell; pass --no-prompt to apply without confirmation"
-            exit 1
         fi
     fi
 
     if (( ! skip_actions )); then
-        apply_upgrade_actions "$manifest" 0
+        apply_upgrade_actions "$manifest" 0 "$needed_ids"
     fi
 
     if (( ! no_restart )); then
@@ -1410,14 +1499,66 @@ EOF
     fi
 }
 
+# Echo (newline-delimited) the IDs of manifest actions that actually have
+# work to do. Config-file merges (envfile_merge / linefile_merge) are
+# prechecked via the pure-bash upgrade_*_needs_merge helpers — no jq, no
+# container — so a clean install yields empty output and the caller can skip
+# the prompt + the merge entirely. Registry directory_overwrite actions have
+# no cheap content precheck; an installed MCP whose target tree exists is
+# always reported as needing work (the overwrite itself is idempotent).
+#
+# Requires scripts/lib/upgrade_actions.sh to be sourced (for the
+# upgrade_*_needs_merge functions). Reading the manifest uses harness_jq, but
+# this only runs from cmd_upgrade where the manifest is already being parsed,
+# so no new container cost is introduced relative to the existing flow.
+_upgrade_actions_needing_work() {
+    local manifest="$1"
+    local action_json id type src_rel target_rel src target fields cond
+
+    while IFS= read -r action_json; do
+        action_json=${action_json%$'\r'}
+        fields=$(_upg_strip_cr "$(harness_jq -r '[.id,.type,.source,.target_relative]|@tsv' <<<"$action_json")")
+        IFS=$'\t' read -r id type src_rel target_rel <<<"$fields"
+        src="$clone_dir/$src_rel"
+        target="$install_root/$target_rel"
+        case "$type" in
+            envfile_merge)
+                upgrade_envfile_needs_merge "$src" "$target" && printf '%s\n' "$id"
+                ;;
+            linefile_merge)
+                upgrade_linefile_needs_merge "$src" "$target" && printf '%s\n' "$id"
+                ;;
+        esac
+    done < <(harness_jq -c '.actions[]?' "$manifest")
+
+    while IFS= read -r action_json; do
+        action_json=${action_json%$'\r'}
+        fields=$(_upg_strip_cr "$(harness_jq -r '[.id,.type,.target_relative,(.condition // "always")]|@tsv' <<<"$action_json")")
+        IFS=$'\t' read -r id type target_rel cond <<<"$fields"
+        target="$install_root/$target_rel"
+        case "$type" in
+            directory_overwrite)
+                if [[ "$cond" == "installed" && ! -d "$target" ]]; then
+                    continue
+                fi
+                [[ -d "$target" ]] && printf '%s\n' "$id"
+                ;;
+        esac
+    done < <(harness_jq -c '.registry_actions[]?' "$manifest")
+}
+
 # Iterate the manifest's actions and registry_actions, dispatch to the
 # right upgrade_* function in scripts/lib/upgrade_actions.sh, accumulate
 # JSON results, and print a final summary.
 #
-# Args: <manifest_path> <dry_run_int>
+# Args: <manifest_path> <dry_run_int> [filter_ids]
+# filter_ids: optional newline-delimited set of action IDs. When non-empty,
+# actions whose id is not in the set are skipped (used by cmd_upgrade to run
+# only the actions the precheck flagged). Empty/unset runs every action.
 apply_upgrade_actions() {
     local manifest="$1"
     local dry_run="$2"
+    local filter_ids="${3:-}"
     local results="[]"
     local failed=0
 
@@ -1432,6 +1573,10 @@ apply_upgrade_actions() {
         IFS=$'\t' read -r id type src_rel target_rel <<<"$fields"
         src="$clone_dir/$src_rel"
         target="$install_root/$target_rel"
+
+        if [[ -n "$filter_ids" ]] && ! grep -Fxq -- "$id" <<<"$filter_ids"; then
+            continue
+        fi
 
         echo "[$id] $type" >&2
 
@@ -1477,6 +1622,10 @@ apply_upgrade_actions() {
         IFS=$'\t' read -r id type src_rel target_rel cond <<<"$fields"
         src="$clone_dir/$src_rel"
         target="$install_root/$target_rel"
+
+        if [[ -n "$filter_ids" ]] && ! grep -Fxq -- "$id" <<<"$filter_ids"; then
+            continue
+        fi
 
         if [[ "$cond" == "installed" && ! -d "$target" ]]; then
             echo "[$id] not installed; skipping" >&2
@@ -1794,6 +1943,12 @@ run_agent() {
     # never blocks the launch. The trailing `|| true` is a hard guarantee
     # that nothing inside the helper can ever abort agent launch via set -e.
     _update_check_and_banner 4 || true
+
+    # Offer to merge newly-introduced config keys/hosts (e.g. after a
+    # `harness update` pulled new code) before launch. Pure-bash precheck;
+    # silent no-op when nothing changed. Skipped in headless mode and never
+    # gates the launch (the `|| true` is belt-and-braces under set -e).
+    _check_and_offer_config_merge "$print_mode" || true
 
     # Persistent agent firewall override: `harness net open agent` writes
     # an `agent` entry to .harness-net-overrides.json. Honor it here so
@@ -2152,6 +2307,10 @@ cmd_shell() {
     # Same banner as run_agent; see _update_check_and_banner. `|| true`
     # ensures the helper can never abort shell launch via set -e.
     _update_check_and_banner 4 || true
+
+    # Same config-merge offer as run_agent (shell is always interactive, so
+    # print_mode is 0). Never gates the shell launch.
+    _check_and_offer_config_merge 0 || true
 
     local image
     image=$(agent_image)

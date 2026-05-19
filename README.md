@@ -35,14 +35,23 @@ bash harness-install.sh
 
 The installer clones the repo into `./harness/` (the install root), seeds
 `.env` and `.harness-allowlist` from their `.example` templates, and writes
-a `harness` wrapper to `~/.local/bin/harness`.
+a `harness` wrapper to `~/.local/bin/harness`. It also offers to capture your
+upstream API key and write it into `PROXY_API_KEY` for you (decline to set it
+manually later).
+
+To skip the post-install config edit entirely, drop a pre-edited `.env`
+and/or `.harness-allowlist` **next to `harness-install.sh`** before running
+it — the installer copies them into the install root (the originals are left
+in place, so you can ship `harness-install.sh` + `.env` + `.harness-allowlist`
+as a single folder).
 
 (On Windows, use Git Bash. See [docs/WINDOWS.md](docs/WINDOWS.md) for
 Windows-specific setup. To run with Podman instead of Docker, see
 [docs/PODMAN.md](docs/PODMAN.md).)
 
 After install:
-1. Edit `~/harness-install/harness/.env` and set `PROXY_API_KEY` (and any
+1. If you didn't enter an API key at the prompt (or pre-place a `.env`),
+   edit `~/harness-install/harness/.env` and set `PROXY_API_KEY` (and any
    other required values for your upstream).
 2. cd into a project directory and run `harness claude` or `harness opencode`.
    The folder you launch from is bind-mounted into the container at the
