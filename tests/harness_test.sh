@@ -1064,6 +1064,57 @@ cleanup_upg
 trap 'restore_agent_image; cleanup' EXIT INT TERM
 echo "[harness-test] T17 OK"
 
+# --- Test 17b: harness upgrade --resume-after-pull skips pull -------------
+#
+# Issue #66: after a successful 'git pull' that advanced HEAD, cmd_upgrade
+# re-execs into the freshly-pulled harness with --resume-after-pull so the
+# post-pull cmd_upgrade orchestration runs from new bytes. This test
+# covers the flag itself: --resume-after-pull is accepted by the parser
+# and skips the pull step (the previous instance already did it). The
+# UPG_ROOT here has NO git remote configured, so a real 'git pull' would
+# fail — the test succeeding proves the pull was skipped.
+
+echo "[harness-test] T17b: harness upgrade --resume-after-pull"
+UPG17B_ROOT="$(mktemp -d -t harness-upg17b.XXXXXX)"
+cleanup_upg17b() {
+    if [[ -n "${UPG17B_ROOT:-}" && -d "${UPG17B_ROOT}" ]]; then
+        rm -rf "${UPG17B_ROOT}"
+    fi
+}
+trap 'cleanup_upg17b; restore_agent_image; cleanup' EXIT INT TERM
+ln -s "${REPO_ROOT}" "${UPG17B_ROOT}/harness"
+cat >"${UPG17B_ROOT}/.env" <<'EOF'
+PROXY_API_URL=https://placeholder.invalid/v1/chat/completions
+PROXY_API_KEY=test-key
+PROXY_API_MODEL=test-model
+EOF
+echo "github.com" >"${UPG17B_ROOT}/.harness-allowlist"
+
+set +e
+upg17b_out=$(HARNESS_INSTALL_ROOT="${UPG17B_ROOT}" HARNESS_PROJECT_NAME="harness-upg17b" \
+    "${UPG17B_ROOT}/harness/harness" upgrade --resume-after-pull --no-prompt --no-restart 2>&1)
+upg17b_rc=$?
+set -e
+if (( upg17b_rc != 0 )); then
+    echo "[harness-test] T17b FAIL: --resume-after-pull rc=${upg17b_rc}" >&2
+    echo "${upg17b_out}" >&2; exit 1
+fi
+# The skip message must come from the resume-after-pull branch, not the
+# HARNESS_UPGRADE_SKIP_PULL branch — otherwise we'd be testing the env-var
+# path that T17 already covers.
+if ! grep -q 'continuing from re-exec after pull' <<<"${upg17b_out}"; then
+    echo "[harness-test] T17b FAIL: did not see resume-after-pull skip message" >&2
+    echo "${upg17b_out}" >&2; exit 1
+fi
+# Sanity-check: the manifest still ran (an env var should have been added).
+if ! grep -q '^OLLAMA_VERSION=' "${UPG17B_ROOT}/.env"; then
+    echo "[harness-test] T17b FAIL: OLLAMA_VERSION not added — manifest did not run after pull-skip" >&2
+    cat "${UPG17B_ROOT}/.env" >&2; exit 1
+fi
+cleanup_upg17b
+trap 'restore_agent_image; cleanup' EXIT INT TERM
+echo "[harness-test] T17b OK"
+
 # --- Test 18: harness upgrade non-interactive without --no-prompt --------
 #
 # Non-interactive shells without --no-prompt MUST refuse rather than hang.

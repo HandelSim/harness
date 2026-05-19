@@ -46,6 +46,15 @@ config or state. No image rebuilds, no compose restart.
 `harness upgrade` runs the full migration flow:
 
 1. `git pull --ff-only` in the clone.
+1a. **If the pull advanced `HEAD`**, re-exec into the freshly-pulled
+   `harness` with `--resume-after-pull` so `cmd_upgrade`'s own
+   orchestration (flag parser, manifest runner, rebuild/restart) runs
+   from new bytes for the rest of this upgrade. Gated on `bash -n` of
+   the new file: if the syntax check fails, we warn and continue with
+   the in-memory pre-pull orchestrator instead of halting mid-flight.
+   `scripts/lib/upgrade_actions.sh` and the manifest are re-sourced /
+   re-read post-pull regardless and so don't need this — re-exec
+   exclusively covers changes to the `harness` script itself.
 2. Apply upgrade actions from `scripts/upgrade-manifest.json` to the
    install root.
 3. `harness down --remove-orphans` and `harness start` (skippable via
@@ -55,6 +64,12 @@ Declining the `[y/n]` confirmation skips step 2 (the file merges) but
 still runs step 3 — the git pull has already happened, so the rebuild +
 restart are needed to avoid running stale images on new code. To abort
 the whole upgrade, use Ctrl-C.
+
+**Cross-version contract on `--resume-after-pull`.** Once a version
+that introduces the re-exec is in the field, every future version must
+keep `cmd_upgrade --resume-after-pull` as a valid (no-op skip-pull)
+flag forever — old code in the field re-execs into new code by passing
+it. Dropping the flag breaks any upgrade FROM that older version.
 
 Upgrade actions are conservative: they add new env variables, new
 allowlist hostnames, and new config keys WITHOUT overwriting existing
