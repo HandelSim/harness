@@ -53,8 +53,13 @@ The validator in `_setup_prompt_mode` accepts:
 - **`hybrid`** — full tool definitions appended to the system message
   (which `_CHANGE_SYSTEM_TO_USER` then folds into the user-role message at
   index 0, the "stable prefix" position). A short recency reminder
-  restating the JSON envelope, the no-fabricated-results rule, and the
-  list of available tool names is prepended to the last user message.
+  restating the JSON envelope, the no-fabricated-results rule, and each
+  tool's parameter signature (`name(required, [optional])` per tool) is
+  prepended to the last user message. The signature list — not just bare
+  names — is the recency anchor for the parameter keys models most often
+  guess wrong (e.g. calling `read({"filename": ...})` instead of
+  `read({"filePath": ...})`, or omitting opencode's `bash` required
+  `description`).
 - **`passthrough`** — benchmark control. Skips every harness-side
   mediation: no cooperative-prompt injection, no system→user rewrite, no
   history translation. `translate_history_and_apply_prompt` short-circuits
@@ -95,7 +100,7 @@ the tool list, then a one-line "now act" cue so the recency slot is an
 instruction rather than raw schema. `hybrid` leaves the marker-wrapped
 result as the user message, keeps the scaffold on the stable prefix, and
 still appends the recency reminder (so the tool-result turn also sees the
-JSON-envelope reminder and the available tool names).
+JSON-envelope reminder and the per-tool signature list).
 
 ## `_CHANGE_SYSTEM_TO_USER`
 

@@ -60,9 +60,10 @@ _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 #                  _CHANGE_SYSTEM_TO_USER post-pass this becomes the
 #                  user-role message at index 0). A short reminder
 #                  restating the JSON envelope format, the "don't invent
-#                  tool results" rule, and the list of available tool
-#                  names is prepended to the last user message. Tools at
-#                  prefix + name-list reminder at recency.
+#                  tool results" rule, and the per-tool parameter
+#                  signatures (`name(required, [optional])`) is prepended
+#                  to the last user message. Tools at prefix + signature
+#                  reminder at recency.
 #   "passthrough" — Benchmark control. Skips every harness-side mediation:
 #                  no cooperative-prompt injection, no system→user
 #                  rewrite, no history translation. Forwards tools to
@@ -299,17 +300,45 @@ You may explain your thought process before or after the JSON block. If NO tools
 """
 
 
-def build_cooperative_prompt_hybrid_reminder(content, tool_names):
+def _format_tool_signature(name, required, optional):
+    """Render one tool's recency-reminder entry as
+    `name(required_a, required_b, [optional_c], [optional_d])`. Required
+    keys come first in their declared order; each optional key is wrapped
+    in its own brackets so the model can't mistake the comma for an
+    "all-or-nothing" group. When both lists are empty (no schema info, or
+    a zero-param tool) we render a bare `name` rather than `name()` — the
+    latter would imply we'd looked and found nothing.
+    """
+    parts = list(required)
+    parts.extend(f"[{k}]" for k in optional)
+    if not parts:
+        return name
+    return f"{name}({', '.join(parts)})"
+
+
+def build_cooperative_prompt_hybrid_reminder(content, tool_signatures):
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). This reminder is prepended to the last user
     message — recency slot — so the model is anchored to the JSON envelope
-    format AND given a short list of tool names. It also tells the model
-    not to fabricate tool results, which closes a common failure mode where
-    the model emits a JSON call and then narrates an imagined output in the
-    same turn.
+    format AND given each tool's parameter signature. The signatures are
+    the recency anchor for the keys the model most often gets wrong
+    (e.g. opencode's `bash` requires `description`; `read` takes `filePath`
+    not `filename`). The "do not invent" sentence closes a common failure
+    mode where the model emits a JSON call and then narrates an imagined
+    output in the same turn.
+
+    `tool_signatures` is a list of `(name, required_keys, optional_keys)`
+    triples produced by `_extract_tool_signatures`.
     """
-    tools_clause = f" Available tools: {', '.join(tool_names)}." if tool_names else ""
+    if tool_signatures:
+        rendered = ", ".join(
+            _format_tool_signature(name, req, opt)
+            for name, req, opt in tool_signatures
+        )
+        tools_clause = f" Available tools: {rendered}. Use parameter keys exactly as listed."
+    else:
+        tools_clause = ""
     reminder = (
         "[Reminder: To use a tool, emit a ```json block with "
         "{\"name\": ..., \"arguments\": ...}. You may explain your "
@@ -465,25 +494,72 @@ def extract_tool_calls_and_text(response_text):
 _TOOL_NAME_PATTERN = re.compile(r"^Tool Name: `([^`]+)`", re.MULTILINE)
 
 
-def _extract_tool_names(
+def _split_schema_params(parameters: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """Given a JSON-Schema `parameters` dict, return
+    (required_keys, optional_keys). Required keys keep their declared
+    order from the schema's `required` list; optional keys are the
+    `properties` keys not in `required`, in declared order.
+    """
+    if not isinstance(parameters, dict):
+        return [], []
+    props = parameters.get("properties") or {}
+    if not isinstance(props, dict):
+        props = {}
+    required_raw = parameters.get("required") or []
+    if not isinstance(required_raw, list):
+        required_raw = []
+    required = [k for k in required_raw if isinstance(k, str)]
+    required_set = set(required)
+    optional = [k for k in props.keys() if k not in required_set]
+    return required, optional
+
+
+def _extract_tool_signatures(
     tools: Optional[List[Dict[str, Any]]],
     tools_text: str,
-) -> List[str]:
-    """Return the list of tool names for the hybrid reminder. Prefer the
-    raw `tools` array (production call site) where each name is a
-    structured field; fall back to regex over `tools_text` so existing
-    tests (and any caller that only has the formatted text) continue to
-    work without signature updates.
+) -> List[Tuple[str, List[str], List[str]]]:
+    """Return per-tool `(name, required_keys, optional_keys)` triples for
+    the hybrid reminder.
+
+    Primary path: the raw `tools` array (production call site) where each
+    tool's JSON-Schema `parameters` is a structured field.
+
+    Fallback path: parse the schema blocks that `format_tools_to_text`
+    embedded inside `tools_text` — split the text on `Tool Name:`
+    boundaries, then read each block's ```json ... ``` payload as JSON
+    Schema. If a block has no schema (e.g. tests that hand in
+    `"Tool Name: \\`Foo\\`"` as bare text), the tool surfaces as
+    `(name, [], [])` and renders as a bare `name` in the reminder.
     """
     if tools:
-        names: List[str] = []
+        sigs: List[Tuple[str, List[str], List[str]]] = []
         for tool in tools:
             func = tool.get("function", {}) if "function" in tool else tool
             name = func.get("name")
-            if name:
-                names.append(name)
-        return names
-    return _TOOL_NAME_PATTERN.findall(tools_text)
+            if not name:
+                continue
+            req, opt = _split_schema_params(func.get("parameters") or {})
+            sigs.append((name, req, opt))
+        return sigs
+
+    sigs = []
+    chunks = re.split(r"(?=^Tool Name: `)", tools_text, flags=re.MULTILINE)
+    for chunk in chunks:
+        m = re.match(r"Tool Name: `([^`]+)`", chunk)
+        if not m:
+            continue
+        name = m.group(1)
+        schema_match = re.search(r"```json\s*(.*?)\s*```", chunk, re.DOTALL)
+        if schema_match:
+            try:
+                parameters = json.loads(schema_match.group(1))
+            except (ValueError, TypeError):
+                parameters = {}
+            req, opt = _split_schema_params(parameters)
+            sigs.append((name, req, opt))
+        else:
+            sigs.append((name, [], []))
+    return sigs
 
 
 def translate_history_and_apply_prompt(
@@ -645,10 +721,10 @@ def translate_history_and_apply_prompt(
             # turn or tool-result-converted-to-user). Same scope as the
             # original hybrid reminder.
             if messages[-1]["role"] == "user":
-                tool_names = _extract_tool_names(tools, tools_text)
+                signatures = _extract_tool_signatures(tools, tools_text)
                 messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
                     messages[-1]["content"],
-                    tool_names,
+                    signatures,
                 )
 
     # Convert system role to user role if configured. Some upstream APIs
