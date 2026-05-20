@@ -5,7 +5,7 @@ the upstream's chat-completions format, AND injects cooperative tool-use
 prompts so models that don't natively support tool calls can produce them
 as ```json blocks that the proxy parses back into native `tool_calls`.
 
-Single-process, single file, ~985 lines.
+Single-process, single file, ~1,130 lines.
 
 ## Request lifecycle
 
@@ -59,7 +59,10 @@ The validator in `_setup_prompt_mode` accepts:
   names — is the recency anchor for the parameter keys models most often
   guess wrong (e.g. calling `read({"filename": ...})` instead of
   `read({"filePath": ...})`, or omitting opencode's `bash` required
-  `description`).
+  `description`). Hybrid additionally delimits three content categories so
+  each is addressable by name and the model can't conflate them with the
+  upstream gateway's own system prompt/tools — see
+  [Hybrid delimiters](#hybrid-delimiters) below.
 - **`passthrough`** — benchmark control. Skips every harness-side
   mediation: no cooperative-prompt injection, no system→user rewrite, no
   history translation. `translate_history_and_apply_prompt` short-circuits
@@ -101,6 +104,42 @@ instruction rather than raw schema. `hybrid` leaves the marker-wrapped
 result as the user message, keeps the scaffold on the stable prefix, and
 still appends the recency reminder (so the tool-result turn also sees the
 JSON-envelope reminder and the per-tool signature list).
+
+## Hybrid delimiters
+
+`hybrid` mode (and ONLY hybrid) additionally wraps three content categories
+in `<<<BEGIN_X>>>` / `<<<END_X>>>` markers so each section is addressable by
+name. The failure pattern this targets: the upstream gateway injects its own
+system prompt mentioning its own tools/subagents, and the model conflates
+harness's injected tools with those — or, when the user says "the first
+message" / "the tool definitions", can't tell which section is meant. The
+markers are applied in the hybrid dispatch branch of
+`translate_history_and_apply_prompt`; `user_front` and `passthrough` never
+emit them, and `<<<BEGIN_USER_REQUEST>>>` stays exclusive to `user_front`.
+
+- **`<<<BEGIN_AGENT_INSTRUCTIONS>>>`** — wraps the inbound claude-code /
+  opencode system prompt (`messages[0]` content as it arrives), applied
+  BEFORE harness's tool block is appended. Skipped when that content is
+  empty/whitespace-only, and absent entirely when there was no inbound
+  system message.
+- **`<<<BEGIN_AGENT_TOOLS>>>`** — wraps the harness-injected tool
+  definitions inside `build_cooperative_prompt_system_addition`, replacing
+  the old `### Available Tools` header. A disambiguation sentence inside the
+  wrap tells the model these are the only valid tools and to ignore any
+  competing tool names from elsewhere in the prompt. The format-spec block
+  above it (the JSON-envelope instructions) stays outside the wrap.
+- **`<<<BEGIN_USER_MESSAGE>>>`** — wraps every real user-role turn (original
+  role `user`). Tool-result-converted-to-user messages are detected by their
+  `<<<BEGIN_TOOL_RESULT` marker and skipped — they keep only the TOOL_RESULT
+  delimiters. On the latest turn the recency reminder is prepended OUTSIDE
+  this wrap (it's proxy stage-direction, not user text).
+
+The reminder (`build_cooperative_prompt_hybrid_reminder`) leads with an
+explicit pointer to `<<<BEGIN_AGENT_TOOLS>>>` so that when attention to
+`messages[0]` dilutes on long conversations the model still has a named
+target to retrieve for full tool descriptions and parameter-value
+constraints. This is additive — token cost is ~100–200 tokens/turn; hybrid's
+lighter-than-user_front recency profile is preserved.
 
 ## `_CHANGE_SYSTEM_TO_USER`
 

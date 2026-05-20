@@ -651,6 +651,33 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn('"required"', sys_content, "JSON Schema body present in system")
         self.assertIn('"command"', sys_content)
 
+        # The inbound agent system prompt is delimited in AGENT_INSTRUCTIONS,
+        # and the harness tool block in AGENT_TOOLS. The legacy
+        # "### Available Tools" markdown header is gone — the marker plus the
+        # disambiguation sentence replaces it.
+        self.assertIn("<<<BEGIN_AGENT_INSTRUCTIONS>>>", sys_content)
+        self.assertIn("<<<END_AGENT_INSTRUCTIONS>>>", sys_content)
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", sys_content)
+        self.assertIn("<<<END_AGENT_TOOLS>>>", sys_content)
+        self.assertNotIn("### Available Tools", sys_content)
+        # AGENT_INSTRUCTIONS wraps the original system content.
+        self.assertLess(
+            sys_content.index("<<<BEGIN_AGENT_INSTRUCTIONS>>>"),
+            sys_content.index("You are claude-code."),
+        )
+        self.assertLess(
+            sys_content.index("You are claude-code."),
+            sys_content.index("<<<END_AGENT_INSTRUCTIONS>>>"),
+        )
+        # The disambiguation sentence and the tool definitions both live
+        # inside the AGENT_TOOLS wrap.
+        tools_open = sys_content.index("<<<BEGIN_AGENT_TOOLS>>>")
+        tools_close = sys_content.index("<<<END_AGENT_TOOLS>>>")
+        disambig = sys_content.index("only tools available for use in this conversation")
+        bash_def = sys_content.index("Tool Name: `Bash`")
+        self.assertTrue(tools_open < disambig < tools_close)
+        self.assertTrue(tools_open < bash_def < tools_close)
+
         last_user = result[-1]["content"]
         # The new reminder is present.
         self.assertIn("Reminder:", last_user)
@@ -662,8 +689,16 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("Use parameter keys exactly as listed", last_user)
         # New sentence telling the model not to fabricate tool results.
         self.assertIn("do not invent", last_user)
-        # The user's original message survives.
+        # The user's original message survives, wrapped in USER_MESSAGE.
         self.assertIn("say hello", last_user)
+        self.assertIn("<<<BEGIN_USER_MESSAGE>>>", last_user)
+        self.assertIn("<<<END_USER_MESSAGE>>>", last_user)
+        # The reminder sits OUTSIDE the USER_MESSAGE wrap — it's proxy
+        # stage-direction, not part of what the user wrote.
+        self.assertLess(
+            last_user.index("Reminder:"),
+            last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
+        )
         # The reminder must NOT contain the full tool schema or instructions
         # header — those live only in the prefix at [0].
         self.assertNotIn("Tool Usage Instructions", last_user)
@@ -810,8 +845,153 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn('<<<BEGIN_TOOL_RESULT name="get_weather">>>', c)
         self.assertIn("<<<END_TOOL_RESULT>>>", c)
         self.assertIn("72F sunny", c)
+        # A tool-result-converted message is NOT a user message, so it must
+        # NOT also receive a USER_MESSAGE wrap — only the TOOL_RESULT markers
+        # from the universal pre-dispatch wrap, plus the reminder.
+        self.assertNotIn("<<<BEGIN_USER_MESSAGE>>>", c)
+        self.assertNotIn("<<<END_USER_MESSAGE>>>", c)
         # The full per-turn tool-variant builder framing should NOT be present.
         self.assertNotIn("NOT a message from the user", c)
+
+    def test_mode_hybrid_wraps_system_content_in_agent_instructions(self):
+        """Non-trivial inbound system content is delimited in
+        AGENT_INSTRUCTIONS markers at messages[0] so the model can tell the
+        agent's own system prompt apart from harness's tool block and the
+        gateway's system content."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        sys_content = result[0]["content"]
+        self.assertIn("<<<BEGIN_AGENT_INSTRUCTIONS>>>", sys_content)
+        self.assertIn("<<<END_AGENT_INSTRUCTIONS>>>", sys_content)
+        open_pos = sys_content.index("<<<BEGIN_AGENT_INSTRUCTIONS>>>")
+        text_pos = sys_content.index("You are claude-code.")
+        close_pos = sys_content.index("<<<END_AGENT_INSTRUCTIONS>>>")
+        self.assertTrue(open_pos < text_pos < close_pos)
+
+    def test_mode_hybrid_no_agent_instructions_wrap_when_no_system_content(self):
+        """With no inbound system message, no AGENT_INSTRUCTIONS markers
+        appear — but the harness tool block still gets its AGENT_TOOLS wrap on
+        the inserted system message."""
+        msgs = [{"role": "user", "content": "hi there"}]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            result = proxy.translate_history_and_apply_prompt(
+                msgs, tools_text, tools=self.tools,
+            )
+        joined = "\n".join(m["content"] for m in result)
+        self.assertNotIn("<<<BEGIN_AGENT_INSTRUCTIONS>>>", joined)
+        self.assertNotIn("<<<END_AGENT_INSTRUCTIONS>>>", joined)
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", joined)
+
+    def test_mode_hybrid_no_agent_instructions_wrap_when_empty_system_content(self):
+        """Empty/whitespace-only inbound system content gets no
+        AGENT_INSTRUCTIONS wrap (empty markers would be noise); the AGENT_TOOLS
+        wrap is still applied."""
+        msgs = [
+            {"role": "system", "content": "   \n  "},
+            {"role": "user", "content": "hi there"},
+        ]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            result = proxy.translate_history_and_apply_prompt(
+                msgs, tools_text, tools=self.tools,
+            )
+        joined = "\n".join(m["content"] for m in result)
+        self.assertNotIn("<<<BEGIN_AGENT_INSTRUCTIONS>>>", joined)
+        self.assertNotIn("<<<END_AGENT_INSTRUCTIONS>>>", joined)
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", joined)
+
+    def test_mode_hybrid_wraps_every_real_user_message(self):
+        """Every real user-role turn in a multi-turn conversation is wrapped
+        in USER_MESSAGE markers."""
+        msgs = [
+            {"role": "system", "content": "You are claude-code."},
+            {"role": "user", "content": "first turn"},
+            {"role": "assistant", "content": "ok one"},
+            {"role": "user", "content": "second turn"},
+            {"role": "assistant", "content": "ok two"},
+            {"role": "user", "content": "third turn"},
+        ]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            result = proxy.translate_history_and_apply_prompt(
+                msgs, tools_text, tools=self.tools,
+            )
+        user_msgs = [m for m in result if m["role"] == "user"]
+        self.assertEqual(len(user_msgs), 3)
+        for m in user_msgs:
+            self.assertIn("<<<BEGIN_USER_MESSAGE>>>", m["content"])
+            self.assertIn("<<<END_USER_MESSAGE>>>", m["content"])
+        joined = "\n".join(m["content"] for m in result)
+        self.assertEqual(joined.count("<<<BEGIN_USER_MESSAGE>>>"), 3)
+
+    def test_mode_hybrid_does_not_wrap_tool_result_converted_user_messages(self):
+        """A real user turn gets a USER_MESSAGE wrap; a tool-result-converted
+        user turn (TOOL_RESULT markers) does not."""
+        msgs = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "Atlanta"}}}],
+            },
+            {"role": "tool", "tool_name": "get_weather", "content": "72F sunny"},
+        ]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            result = proxy.translate_history_and_apply_prompt(
+                msgs, tools_text, tools=self.tools,
+            )
+        real_user = next(m for m in result if "weather?" in m["content"])
+        tool_result = next(m for m in result if "72F sunny" in m["content"])
+        self.assertIn("<<<BEGIN_USER_MESSAGE>>>", real_user["content"])
+        self.assertNotIn("<<<BEGIN_USER_MESSAGE>>>", tool_result["content"])
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="get_weather">>>', tool_result["content"])
+
+    def test_mode_hybrid_reminder_references_agent_tools_marker(self):
+        """The recency reminder points the model back at the AGENT_TOOLS
+        section by literal name."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", last_user)
+
+    def test_mode_hybrid_tools_block_contains_disambiguation_sentence(self):
+        """The AGENT_TOOLS block tells the model these are the only tools and
+        to ignore competing definitions from elsewhere in the prompt."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        sys_content = result[0]["content"]
+        self.assertIn("only tools available for use in this conversation", sys_content)
+
+    def test_user_front_does_not_use_agent_instructions_marker(self):
+        """AGENT_INSTRUCTIONS is hybrid-only; user_front never emits it."""
+        result = self._translate_with_mode("user_front", pass_tools=True)
+        joined = "\n".join(m["content"] for m in result)
+        self.assertNotIn("AGENT_INSTRUCTIONS", joined)
+
+    def test_user_front_does_not_use_agent_tools_marker(self):
+        """AGENT_TOOLS is hybrid-only; user_front never emits it."""
+        result = self._translate_with_mode("user_front", pass_tools=True)
+        joined = "\n".join(m["content"] for m in result)
+        self.assertNotIn("AGENT_TOOLS", joined)
+
+    def test_user_front_does_not_use_user_message_marker(self):
+        """USER_MESSAGE is hybrid-only; user_front uses USER_REQUEST on the
+        latest user turn, as before."""
+        result = self._translate_with_mode("user_front", pass_tools=True)
+        joined = "\n".join(m["content"] for m in result)
+        self.assertNotIn("USER_MESSAGE", joined)
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>", joined)
+
+    def test_passthrough_does_not_use_any_new_markers(self):
+        """passthrough is a verbatim bypass — none of the new hybrid markers
+        appear."""
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            result = proxy.translate_history_and_apply_prompt(
+                self.user_msgs, proxy.format_tools_to_text(self.tools), tools=self.tools,
+            )
+        joined = "\n".join(m["content"] for m in result)
+        self.assertNotIn("AGENT_INSTRUCTIONS", joined)
+        self.assertNotIn("AGENT_TOOLS", joined)
+        self.assertNotIn("USER_MESSAGE", joined)
 
     def test_mode_user_front_intro_line_before_request(self):
         """user_front opens with the persona-preserve intro line, THEN the
@@ -1188,11 +1368,22 @@ class TestChangeSystemToUser(unittest.TestCase):
                 self.assertIn("You are claude-code.", result[0]["content"])
                 self.assertIn("Bash", result[0]["content"])
                 self.assertIn("Run shell command", result[0]["content"])
+                # The AGENT_INSTRUCTIONS / AGENT_TOOLS wraps survive the
+                # system→user conversion (they were applied to the content
+                # before the role rewrite).
+                self.assertIn("<<<BEGIN_AGENT_INSTRUCTIONS>>>", result[0]["content"])
+                self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", result[0]["content"])
                 self.assertEqual(result[1]["role"], "assistant")
                 self.assertEqual(result[2]["role"], "user")
-                # The recency reminder lands on the live user turn.
+                # The recency reminder lands on the live user turn, outside
+                # the USER_MESSAGE wrap.
                 self.assertIn("Reminder:", result[2]["content"])
                 self.assertIn("Hello", result[2]["content"])
+                self.assertIn("<<<BEGIN_USER_MESSAGE>>>", result[2]["content"])
+                self.assertLess(
+                    result[2]["content"].index("Reminder:"),
+                    result[2]["content"].index("<<<BEGIN_USER_MESSAGE>>>"),
+                )
 
     def test_change_system_to_user_with_user_front_mode(self):
         """When PROMPT_MODE='user_front' AND CHANGE_SYSTEM_TO_USER is on,
