@@ -311,11 +311,21 @@ if "do not invent" not in c:
     print("REMINDER_MISSING_DO_NOT_INVENT"); sys.exit(0)
 if "Available tools:" not in c:
     print("REMINDER_MISSING_TOOL_NAMES_HEADER"); sys.exit(0)
+# The reminder points the model back at the AGENT_TOOLS section by name.
+if "<<<BEGIN_AGENT_TOOLS>>>" not in c:
+    print("REMINDER_MISSING_AGENT_TOOLS_POINTER"); sys.exit(0)
 if "scheme-probe-text" not in c:
     print("PROBE_MISSING_FROM_LAST_USER"); sys.exit(0)
-# Full tool list / instructions header MUST NOT be on the last user
-# message — those go in the head (system) under hybrid.
-if "### Available Tools" in c:
+# The probe (real user turn) is wrapped in USER_MESSAGE markers under
+# hybrid, with the reminder OUTSIDE that wrap.
+if "<<<BEGIN_USER_MESSAGE>>>" not in c:
+    print("NO_USER_MESSAGE_WRAP"); sys.exit(0)
+if c.index("Reminder:") >= c.index("<<<BEGIN_USER_MESSAGE>>>"):
+    print("REMINDER_NOT_OUTSIDE_USER_MESSAGE"); sys.exit(0)
+# The full tool list / instructions header MUST NOT be on the last user
+# message — those go in the head (system) under hybrid. (The reminder
+# only *references* the AGENT_TOOLS marker; the block itself is in head.)
+if "<<<END_AGENT_TOOLS>>>" in c:
     print("FULL_TOOL_LIST_ON_LAST_USER"); sys.exit(0)
 if "### Tool Usage Instructions" in c:
     print("FULL_INSTRUCTIONS_ON_LAST_USER"); sys.exit(0)
@@ -323,8 +333,8 @@ if "### Tool Usage Instructions" in c:
 head_content = "\n".join(m.get("content", "") for m in msgs[:-1])
 if "### Tool Usage Instructions" not in head_content:
     print("NO_INSTRUCTIONS_HEADER_IN_HEAD"); sys.exit(0)
-if "### Available Tools" not in head_content:
-    print("NO_TOOL_LIST_IN_HEAD"); sys.exit(0)
+if "<<<BEGIN_AGENT_TOOLS>>>" not in head_content:
+    print("NO_AGENT_TOOLS_IN_HEAD"); sys.exit(0)
 print("OK hybrid reminder+head-scaffolding")
 '
             ;;

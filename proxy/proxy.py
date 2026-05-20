@@ -295,8 +295,11 @@ You have access to specific tools to help answer the user's request. If you need
 }}
 You may explain your thought process before or after the JSON block. If NO tools are needed, simply answer the user normally.
 
-### Available Tools
+<<<BEGIN_AGENT_TOOLS>>>
+The following are the only tools available for use in this conversation. Any other tool names or capabilities you may know about from other contexts or from elsewhere in this prompt do not apply here — use only the tools defined below.
+
 {tools_text}
+<<<END_AGENT_TOOLS>>>
 """
 
 
@@ -330,6 +333,12 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures):
 
     `tool_signatures` is a list of `(name, required_keys, optional_keys)`
     triples produced by `_extract_tool_signatures`.
+
+    The reminder leads with a pointer back to the `<<<BEGIN_AGENT_TOOLS>>>`
+    section (the stable prefix where the full tool definitions live) so that
+    when attention to messages[0] dilutes on long conversations the model
+    still has a precise, named target to retrieve when it needs full tool
+    descriptions or parameter-value constraints.
     """
     if tool_signatures:
         rendered = ", ".join(
@@ -340,7 +349,12 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures):
     else:
         tools_clause = ""
     reminder = (
-        "[Reminder: To use a tool, emit a ```json block with "
+        "[Reminder: The tools listed in the <<<BEGIN_AGENT_TOOLS>>> section "
+        "at the start of this conversation are the only tools available — "
+        "refer back to that section for full tool descriptions, parameter "
+        "details, and any constraints on parameter values (e.g. which agent "
+        "types are valid for a `task` tool, or which skills are listed for a "
+        "`skill` tool). To use a tool, emit a ```json block with "
         "{\"name\": ..., \"arguments\": ...}. You may explain your "
         "reasoning before or after the JSON block. After emitting a tool "
         "call, do not invent or narrate the tool's result — the real "
@@ -562,6 +576,29 @@ def _extract_tool_signatures(
     return sigs
 
 
+def _flatten_content_to_str(content):
+    """Flatten a message's `content` to a plain string. Some clients send
+    content as a list of content-blocks (each a dict carrying a `text` field,
+    or a bare string); their text is joined with blank-line separators. A
+    string passes through unchanged; any other type is coerced via str().
+    Shared by the sys→user post-pass and the hybrid AGENT_INSTRUCTIONS /
+    USER_MESSAGE wraps so all three handle list-valued content identically.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n\n".join(parts)
+    return str(content)
+
+
 def translate_history_and_apply_prompt(
     original_messages: List[Dict[str, Any]],
     tools_text: str,
@@ -684,7 +721,15 @@ def translate_history_and_apply_prompt(
     #                into a user-role message at index 0); a short reminder
     #                restating the JSON envelope, the no-fabricated-results
     #                rule, and the list of available tool names is prepended
-    #                to the last user message.
+    #                to the last user message. Hybrid additionally wraps three
+    #                content categories in distinctive delimiters so the model
+    #                (and the reminder) can address them by name and not
+    #                conflate them with the upstream gateway's own system
+    #                content: the inbound agent system prompt in
+    #                <<<BEGIN_AGENT_INSTRUCTIONS>>>, the harness tool block in
+    #                <<<BEGIN_AGENT_TOOLS>>> (inside system_addition), and every
+    #                real user turn in <<<BEGIN_USER_MESSAGE>>>. Tool-result
+    #                turns keep only their <<<BEGIN_TOOL_RESULT>>> markers.
     if tools_text and messages:
         if _PROMPT_MODE == "user_front":
             if messages[-1]["role"] == "user":
@@ -702,24 +747,56 @@ def translate_history_and_apply_prompt(
             # the system message instead.
             system_addition = build_cooperative_prompt_system_addition(tools_text)
             if messages[0]["role"] == "system":
-                existing = messages[0]["content"]
-                if isinstance(existing, str):
-                    messages[0]["content"] = existing + system_addition
-                elif isinstance(existing, list):
-                    # Some clients send system as a list of content blocks.
-                    # Append a text block rather than concatenating strings.
-                    messages[0]["content"] = existing + [{"type": "text", "text": system_addition}]
+                # Wrap the inbound agent (claude-code/opencode) system prompt
+                # in AGENT_INSTRUCTIONS markers BEFORE appending harness's own
+                # tool block, so the two are individually addressable and the
+                # model can't conflate either with the upstream gateway's
+                # system content. Empty/whitespace-only inbound content gets no
+                # wrap — emitting empty markers would just add noise. Trailing
+                # newline + the "\n\n" that system_addition leads with yields a
+                # one-blank-line gap before "### Tool Usage Instructions".
+                existing = _flatten_content_to_str(messages[0]["content"])
+                if existing.strip():
+                    messages[0]["content"] = (
+                        f"<<<BEGIN_AGENT_INSTRUCTIONS>>>\n"
+                        f"{existing}\n"
+                        f"<<<END_AGENT_INSTRUCTIONS>>>\n"
+                        f"{system_addition}"
+                    )
                 else:
-                    messages[0]["content"] = str(existing) + system_addition
+                    messages[0]["content"] = existing + system_addition
             else:
                 # No system message present — insert one. Strip the leading
                 # blank line that the addition starts with so the system
-                # content doesn't begin with whitespace.
+                # content doesn't begin with whitespace. No AGENT_INSTRUCTIONS
+                # wrap: there was no inbound agent prompt to delimit.
                 messages.insert(0, {"role": "system", "content": system_addition.strip()})
+
+            # Wrap every real user-role message in USER_MESSAGE markers.
+            # "Real" = original role was `user`, not a tool-result that got
+            # role-converted; the latter already carry <<<BEGIN_TOOL_RESULT
+            # name="…">>> markers from the universal pre-dispatch wrap, so we
+            # detect and skip them by that marker prefix. The system message at
+            # index 0 is still role "system" here (sys→user runs later), so the
+            # role filter leaves it alone. This runs BEFORE the recency reminder
+            # so the reminder lands OUTSIDE the wrap — it's proxy stage
+            # direction, not part of what the user wrote.
+            for m in messages:
+                if m["role"] != "user":
+                    continue
+                flattened = _flatten_content_to_str(m["content"])
+                if "<<<BEGIN_TOOL_RESULT" in flattened:
+                    continue
+                m["content"] = (
+                    f"<<<BEGIN_USER_MESSAGE>>>\n"
+                    f"{flattened}\n"
+                    f"<<<END_USER_MESSAGE>>>"
+                )
 
             # Recency reminder on the last user-role message (real user
             # turn or tool-result-converted-to-user). Same scope as the
-            # original hybrid reminder.
+            # original hybrid reminder; prepended after the USER_MESSAGE wrap
+            # so it sits outside it.
             if messages[-1]["role"] == "user":
                 signatures = _extract_tool_signatures(tools, tools_text)
                 messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
@@ -738,21 +815,9 @@ def translate_history_and_apply_prompt(
     # By the time we reach here, there is at most ONE system message and
     # it is at index 0 (if present at all).
     if _CHANGE_SYSTEM_TO_USER and messages and messages[0]["role"] == "system":
-        system_content = messages[0]["content"]
         # Some clients emit content as a list of content-blocks; flatten
         # to a single string for the user-role rewrite.
-        if isinstance(system_content, list):
-            parts = []
-            for block in system_content:
-                if isinstance(block, dict):
-                    text = block.get("text", "")
-                    if text:
-                        parts.append(text)
-                elif isinstance(block, str):
-                    parts.append(block)
-            system_content = "\n\n".join(parts)
-        elif not isinstance(system_content, str):
-            system_content = str(system_content)
+        system_content = _flatten_content_to_str(messages[0]["content"])
         if system_content.strip():
             # Replace the system message with a user message containing
             # its content. Insert a stub assistant message after it so
