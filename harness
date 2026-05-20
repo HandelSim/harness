@@ -797,15 +797,18 @@ ensure_services_up() {
     fi
 }
 
-# Deterministic short suffix for an agent container name. Two simultaneous
-# agents in the same dir for the same tool would collide, so we hash the
-# absolute mount path together with the tool name and take the first 8 chars.
+# Unique container name for one agent launch. Discovery (list/stop/picker)
+# is entirely label-based (harness.agent/tool/mount), so the name needs no
+# determinism — only uniqueness, so concurrent launches of the same tool
+# from the same directory never collide on Docker's unique-name constraint.
 agent_container_name() {
     local tool="$1"
-    local mount="$2"
-    local hash
-    hash=$(printf '%s' "$tool:$mount" | sha256sum | cut -c1-8)
-    printf 'harness-%s-%s' "$tool" "$hash"
+    local rand
+    if ! { [[ -r /dev/urandom ]] && rand=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') && [[ -n "$rand" ]]; }; then
+        # /dev/urandom unavailable: mix the PID with two $RANDOM draws.
+        rand=$(printf '%s' "$$:$RANDOM:$RANDOM" | sha256sum | cut -c1-8)
+    fi
+    printf 'harness-%s-%s' "$tool" "$rand"
 }
 
 # Pre-launch check: if the firewall is currently disabled (either via --net
@@ -1154,9 +1157,9 @@ agent flags:
 notes:
   - 'harness down' stops labeled agent containers, then services and
     network. Stop individual agents with 'harness stop'.
-  - agent containers are named harness-<tool>-<hash> where the hash is
-    derived from the working directory; relaunching from the same directory
-    refuses to start a second copy if one is already running.
+  - agent containers are named harness-<tool>-<rand> with a per-launch
+    random suffix, so you can run multiple agents from the same directory
+    at once. Use 'harness list' to see them and 'harness stop' to pick one.
   - 'harness doctor' is diagnostic-only and never modifies state.
 EOF
 }
@@ -2135,20 +2138,11 @@ run_agent_interactive() {
     fi
 
     local cname
-    cname=$(agent_container_name "$tool" "$mount_path")
+    cname=$(agent_container_name "$tool")
 
-    # Already running for this dir+tool? Refuse — there's no reattach now,
-    # so a duplicate would either compete for the TTY or just die in the
-    # background. Stop the existing one first.
-    if [[ -n "$(harness_docker ps -q -f "name=^${cname}$" 2>/dev/null)" ]]; then
-        err "$tool agent already running here ($cname)"
-        err "stop it first with 'harness stop $cname' (or 'harness stop' for a picker)"
-        exit 1
-    fi
-
-    # Clean up any stopped container with the same name (e.g. previous run
-    # that exited but wasn't removed). Ignore errors.
-    harness_docker rm "$cname" >/dev/null 2>&1 || true
+    # The name carries a per-launch random suffix, so multiple agents can run
+    # from the same directory at once — no collision check, no pre-launch rm.
+    # --rm cleans each container up on exit.
 
     # --user 0:0 overrides the image's USER harness directive so the
     # entrypoint can remap the harness uid/gid to the host caller before

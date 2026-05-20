@@ -73,8 +73,8 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F051 | `harness claude -p "<prompt>"` runs claude in print mode |
 | F052 | `harness claude --print "<prompt>"` is an alias for `-p` |
 | F053 | `harness opencode -p "<prompt>"` runs opencode in print mode |
-| F054 | `agent_container_name` derives a deterministic container name via sha256 of the install-root path |
-| F055 | Two installs in different roots produce different agent container names |
+| F054 | `agent_container_name` produces a unique per-launch container name (`harness-<tool>-<rand>`), not derived from the directory |
+| F055 | Two launches of the same tool from the same directory produce distinct container names (concurrent same-dir agents don't collide) |
 | F056 | `harness list` lists currently running harness containers for this install root |
 | F057 | `harness stop` stops the agent container without affecting `ollama`/`proxy` |
 | F058 | `harness stop <name>` stops the named agent container |

@@ -113,13 +113,17 @@ They each:
    `--mount` and `HARNESS_EXTRA_MOUNTS` (deduped, validated, refused if
    under container infra paths like `/etc`, `/usr`, `/home/harness`).
 3. Compose `--cap-add NET_ADMIN`, `--cap-add NET_RAW`, the allowlist
-   read-only mount, network `--network harness_harness-net`, and a hash-
-   derived container name.
+   read-only mount, network `--network harness_harness-net`, and a
+   per-launch unique container name.
 4. `docker run` the unified agent image (`harness-agent:latest`) with the
    mode arg (`claude`, `opencode`, or `shell`) and any forwarded flags.
 
-The hash-derived container name (one per host CWD) is why relaunching
-from the same directory refuses to start a second copy.
+The container name carries a per-launch random suffix, so multiple agents
+can run from the same directory at once. `list`/`stop`/the picker discover
+agents by label (`harness.agent`/`tool`/`mount`), never by name, so the
+name needs no determinism — only uniqueness, to avoid Docker's unique-name
+collision. The `--print` path sets no name or labels and was already
+concurrent.
 
 ### Greenfield seeding for `claude`
 

@@ -1980,6 +1980,74 @@ if (( t28_rc != 0 )); then
 fi
 echo "[harness-test] T28 OK"
 
+# --- Test 29: same-dir agents get unique names, no refusal (#76) ------------
+#
+# Issue #76: relaunching an agent from a directory that already has one was
+# refused because the container name was a deterministic hash of (tool, dir),
+# which collided on Docker's unique-name constraint. The fix makes the name
+# carry a per-launch random suffix and drops the "already running here" guard.
+#
+# Part A (F054): two agent_container_name calls for the same tool return
+# DIFFERENT names, both prefixed harness-<tool>-. This inverts the old
+# determinism assumption.
+# Part B (F055): run_agent_interactive can be invoked twice for the same
+# tool+dir without refusing — both reach `docker exec` with distinct --name.
+echo "[harness-test] T29: same-dir agents get unique names, no refusal (#76)"
+
+t29a_rc=0
+(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    n1=$(agent_container_name opencode)
+    n2=$(agent_container_name opencode)
+    if [[ -z "${n1}" || -z "${n2}" ]]; then
+        echo "empty container name (n1='${n1}' n2='${n2}')" >&2; exit 1
+    fi
+    if [[ "${n1}" != harness-opencode-* ]]; then
+        echo "name missing harness-<tool>- prefix: '${n1}'" >&2; exit 1
+    fi
+    if [[ "${n1}" == "${n2}" ]]; then
+        echo "two calls returned identical names ('${n1}'); expected per-launch uniqueness" >&2; exit 1
+    fi
+) || t29a_rc=$?
+if (( t29a_rc != 0 )); then
+    echo "[harness-test] T29 FAIL [#76,F054]: agent_container_name is not unique per launch" >&2
+    exit 1
+fi
+
+t29_calls="${TEST_ROOT}/t29-exec-calls"
+: > "${t29_calls}"
+t29b_rc=0
+(
+    HARNESS_INSTALL_ROOT="${TEST_ROOT}" \
+    HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist" \
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    # Stubs: keep the launch path off any real daemon/state.
+    collect_agent_env() { :; }                       # emit no env lines
+    harness_docker_path() { printf '%s\n' "$1"; }    # passthrough host paths
+    _reap_jq_sidecar() { :; }
+    # The removed guard would `docker ps` then exit 1 on a name match; nothing
+    # in the launch path should touch harness_docker anymore.
+    harness_docker() { echo "UNEXPECTED_DOCKER_CALL: $*" >&2; return 0; }
+    harness_docker_exec() { printf '%s\n' "$*" >> "${t29_calls}"; }
+    run_agent_interactive opencode 0 0 /work/proj img /home/agent harness-net ""
+    run_agent_interactive opencode 0 0 /work/proj img /home/agent harness-net ""
+) || t29b_rc=$?
+if (( t29b_rc != 0 )); then
+    echo "[harness-test] T29 FAIL [#76]: run_agent_interactive errored on repeat same-dir launch (rc=${t29b_rc})" >&2
+    cat "${t29_calls}" >&2; exit 1
+fi
+t29_execs=$(grep -c . "${t29_calls}" || true)
+if (( t29_execs != 2 )); then
+    echo "[harness-test] T29 FAIL [#76,F055]: expected 2 interactive launches to reach docker exec, got ${t29_execs}" >&2
+    cat "${t29_calls}" >&2; exit 1
+fi
+t29_names=$(grep -oE 'harness-opencode-[a-f0-9]+' "${t29_calls}" | sort -u | grep -c . || true)
+if (( t29_names != 2 )); then
+    echo "[harness-test] T29 FAIL [#76,F055]: same-dir launches did not get distinct --name values" >&2
+    cat "${t29_calls}" >&2; exit 1
+fi
+echo "[harness-test] T29 OK"
+
 echo "============================================================"
 echo " HARNESS TEST PASSED"
 echo "============================================================"

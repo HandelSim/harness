@@ -175,8 +175,8 @@ non-green rows — the gap.
 | F051 | green  | tests/full_pipeline_test.sh:362-387         | T9 invokes `harness claude -p` and asserts mock response present. | |
 | F052 | red    | —                                           | —                                                                                                     | No test exercises the `--print` long form. |
 | F053 | green  | tests/full_pipeline_test.sh:391-417         | T10 invokes `harness opencode -p`. | |
-| F054 | red    | —                                           | —                                                                                                     | No test asserts that `agent_container_name` is a deterministic sha256 of install-root. |
-| F055 | red    | —                                           | —                                                                                                     | No test installs into two roots and verifies distinct agent container names. |
+| F054 | green  | tests/harness_test.sh:T29                    | T29 asserts two `agent_container_name opencode` calls return different `harness-opencode-*` names (per-launch uniqueness; inverts the old determinism premise, #76). | |
+| F055 | green  | tests/harness_test.sh:T29                    | T29 launches `run_agent_interactive` twice for the same tool+dir and asserts both reach `docker exec` with distinct `--name` values (no refusal; #76). | |
 | F056 | green  | tests/harness_test.sh:256-262               | T2: `[[ "${list_out}" != "no harness agents running" ]]` then fails; expectation is the LHS literal. Re-asserted in full_pipeline_test.sh:353,382. | |
 | F057 | red    | —                                           | —                                                                                                     | No test starts an agent then calls `harness stop` and verifies proxy/ollama remain. |
 | F058 | red    | —                                           | —                                                                                                     | No test invokes `harness stop <name>`. |
