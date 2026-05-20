@@ -252,7 +252,7 @@ prompt-mode logic.
 ```bash
 # Run from anywhere; the runner resolves paths relative to its own
 # location.
-./tests/benchmarks/runners/smoketest.sh --agent claude --scheme current
+./tests/benchmarks/runners/smoketest.sh --agent claude --scheme user_front
 ```
 
 A successful smoketest means:
@@ -282,7 +282,8 @@ tests/benchmarks/
       pyproject.toml
       harness_opencode_agent.py
   schemes/
-    current.json                        # prod scheme (PROXY_PROMPT_MODE=user_front)
+    user_front.json                     # prod baseline (PROXY_PROMPT_MODE=user_front)
+    hybrid.json                         # A/B variant (PROXY_PROMPT_MODE=hybrid)
     passthrough.json                    # control (PROXY_PROMPT_MODE=passthrough — no mediation)
   runners/
     _lib.sh                             # bench_guard_ci, bench_check_arch, ...
@@ -293,7 +294,6 @@ tests/benchmarks/
   runs/                                 # gitignored
     .gitkeep
     .gitignore
-  analyze/                              # placeholder for post-run analysis
   README.md                             # this file
 ```
 
@@ -321,7 +321,7 @@ tests/benchmarks/
 3. If the scheme requires a new `PROXY_PROMPT_MODE` value that
    `proxy/proxy.py` does not yet accept, file a proxy change first.
    Without it, the proxy's startup validator falls back to `user_front`
-   and the scheme silently becomes a duplicate of `current`. The
+   and the scheme silently becomes a duplicate of `user_front`. The
    currently-accepted modes are listed in `architecture/proxy.md`.
 
 ---
@@ -347,7 +347,8 @@ benchmarks Harbor knows about are listed at
 
 | Scheme       | `PROXY_PROMPT_MODE` | Purpose |
 | ------------ | ------------------- | ------- |
-| `current`    | `user_front`        | Production scheme captured at HEAD. The baseline we compare against. |
+| `user_front` | `user_front`        | Production baseline captured at HEAD: full scaffolding on the last user message, request before the tool list. The baseline most A/B runs compare against. |
+| `hybrid`     | `hybrid`            | Variant: full tool definitions on the stable prefix (system→user index 0) plus a short per-turn recency reminder (JSON envelope + per-tool signatures) on the last user message. A/B against `user_front` to measure stable-prefix vs. front-loaded scaffolding. |
 | `passthrough`| `passthrough`       | Control. Skips every harness-side mediation: no cooperative-prompt injection, no system→user rewrite, no history translation. `tools` are forwarded to upstream verbatim. Isolates the harness contribution from upstream model capability. |
 
 The passthrough caveat to be aware of: ollama-format tool schemas typically

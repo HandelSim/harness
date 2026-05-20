@@ -18,13 +18,13 @@
 #
 # This script is opt-in and completely independent from
 # tests/benchmarks/runners/*. Your real benchmark command stays:
-#     ./tests/benchmarks/runners/smoketest.sh --agent claude --scheme current
+#     ./tests/benchmarks/runners/smoketest.sh --agent claude --scheme user_front
 # with a real .env on the host. This file leaves that flow untouched.
 #
 # Usage:
 #   ./tests/benchmarks/mock-smoketest.sh
 #   ./tests/benchmarks/mock-smoketest.sh --keep        # don't tear down at end
-#   ./tests/benchmarks/mock-smoketest.sh --schemes current,passthrough
+#   ./tests/benchmarks/mock-smoketest.sh --schemes user_front,passthrough
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
