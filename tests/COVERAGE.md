@@ -222,7 +222,7 @@ non-green rows — the gap.
 | F098 | green  | tests/harness_test.sh:773-790               | T15: doctor `[network]` section + `allowlist` keyword. | |
 | F099 | green  | tests/harness_test.sh:533-555               | T8 verifies `[storage]` block lists state/output, state/agent/home, state/ollama-data with writable status. | |
 | F100 | green  | tests/full_pipeline_test.sh (T1b)           | T1b runs the installer with `HTTPS_PROXY` exported and asserts the value is persisted into the install root `.env` (then scrubs it). | |
-| F101 | green  | tests/harness_test.sh (T7b)                 | T7b drives a fake runtime via `harness_docker`/`harness_docker_exec` with all six proxy spellings exported and asserts none appear in the recorded runtime env. | |
+| F101 | green  | tests/harness_test.sh (T7b)                 | T7b drives a fake runtime via `harness_docker`/`harness_docker_exec` with all four proxy spellings exported and asserts none appear in the recorded runtime env. | |
 | F102 | yellow | tests/harness_test.sh (T7b)                 | Exercised indirectly: T7b exports both upper/lower spellings; the mirror runs at harness env-load (not asserted in isolation). | |
 | F100 | green  | tests/harness_test.sh:557-572               | T8: `grep -Eq '(docker\|podman)\\s+runtime[[:space:]]+reachable'`. | |
 | F101 | green  | tests/harness_test.sh:574-585               | T8: `[images]` section asserted; image presence + age lines printed for proxy/ollama/agents. | |

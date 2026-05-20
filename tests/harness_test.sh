@@ -643,12 +643,12 @@ echo "[harness-test] T7 OK"
 
 # --- Test 7b: harness_docker strips host proxy from runtime calls (#68) -----
 #
-# Host proxy vars (HTTP_PROXY/HTTPS_PROXY/NO_PROXY, upper + lower) are honored
+# Host proxy vars (HTTP_PROXY/HTTPS_PROXY, upper + lower) are honored
 # for host-side git but must NEVER reach the container runtime — including
 # BuildKit, which auto-exports them as build args from the CLI env.
 # harness_docker / harness_docker_exec run the runtime under `env -u` for all
-# six spellings. Drive a fake runtime that records its environment and assert
-# none of the six leak through. Wrapped in a subshell so the function/env
+# four spellings. Drive a fake runtime that records its environment and assert
+# none of the four leak through. Wrapped in a subshell so the function/env
 # overrides don't bleed into later tests.
 echo "[harness-test] T7b: harness_docker strips proxy from runtime env"
 (
@@ -663,14 +663,14 @@ FAKE
     harness_container_runtime() { printf '%s' "${t7b_rt}"; }
     harness_detect_os() { printf '%s' linux; }
 
-    export HTTP_PROXY="http://corp.invalid:8080"  HTTPS_PROXY="http://corp.invalid:8080"  NO_PROXY="localhost"
-    export http_proxy="http://corp.invalid:8080"  https_proxy="http://corp.invalid:8080"  no_proxy="localhost"
+    export HTTP_PROXY="http://corp.invalid:8080"  HTTPS_PROXY="http://corp.invalid:8080"
+    export http_proxy="http://corp.invalid:8080"  https_proxy="http://corp.invalid:8080"
 
     # Guard against a vacuous test: the proxy must really be in this env.
     env | grep -q '^HTTPS_PROXY=' \
         || { echo "[harness-test] T7b FAIL: HTTPS_PROXY not set; test would be vacuous" >&2; exit 1; }
 
-    proxy_re='^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)='
+    proxy_re='^(HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy)='
 
     # harness_docker (returns normally).
     rec="$(mktemp -t harness-fake-rt-rec.XXXXXX)"

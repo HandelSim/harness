@@ -30,7 +30,7 @@ so it can read values like `PUBLISH_OLLAMA_PORT`, `OLLAMA_AGENT_MODEL`,
 `HARNESS_EXTRA_MOUNTS` for its own logic. `docker compose` gets `.env`
 separately via `--env-file`. The two consumers are independent.
 
-### Host proxy (`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`)
+### Host proxy (`HTTP_PROXY` / `HTTPS_PROXY`)
 
 Optional, host-side only. Honored for the git calls this script runs
 (`update`/`upgrade` pull, `mcp install` clone) — git's libcurl reads them

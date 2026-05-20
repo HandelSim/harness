@@ -158,8 +158,8 @@ harness_runtime_is_podman() {
 # it as a build arg) would break image builds and runtime egress. Stripping
 # here — the single chokepoint every docker/podman call funnels through
 # (enforced by scripts/check_runtime_calls.sh) — guarantees it can't leak.
-_HARNESS_PROXY_STRIP=(-u HTTP_PROXY -u HTTPS_PROXY -u NO_PROXY \
-                      -u http_proxy -u https_proxy -u no_proxy)
+_HARNESS_PROXY_STRIP=(-u HTTP_PROXY -u HTTPS_PROXY \
+                      -u http_proxy -u https_proxy)
 
 # Usage: harness_docker [runtime-args...]
 # Example: harness_docker run --rm --entrypoint /bin/bash my-image -c 'echo hi'
@@ -205,8 +205,6 @@ harness_normalize_proxy_env() {
     [[ -n "${http_proxy:-}"  && -z "${HTTP_PROXY:-}"  ]] && export HTTP_PROXY="$http_proxy"
     [[ -n "${HTTPS_PROXY:-}" && -z "${https_proxy:-}" ]] && export https_proxy="$HTTPS_PROXY"
     [[ -n "${https_proxy:-}" && -z "${HTTPS_PROXY:-}" ]] && export HTTPS_PROXY="$https_proxy"
-    [[ -n "${NO_PROXY:-}"    && -z "${no_proxy:-}"    ]] && export no_proxy="$NO_PROXY"
-    [[ -n "${no_proxy:-}"    && -z "${NO_PROXY:-}"    ]] && export NO_PROXY="$no_proxy"
     return 0
 }
 
