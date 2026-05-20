@@ -40,8 +40,9 @@ run from an empty directory. Stages:
    shell, their values are persisted into the `.env` (filling only blank
    lines, so a pre-placed value wins) so later `harness` runs reuse the proxy
    without re-exporting. The initial `git clone` itself just inherits the
-   shell's proxy (git's libcurl honors these env vars). These are host-only;
-   `harness` strips them from containers (see [`containers.md`](containers.md)).
+   shell's proxy (git's libcurl honors these env vars). `harness` later
+   exports them so `docker compose build` runs through the proxy too; they are
+   not forwarded into running containers (see [`containers.md`](containers.md)).
 8. **PATH wrapper.** Writes a `harness` script wrapper to
    `~/.local/bin/harness` that `exec`s into `<install-root>/harness`.
    Prints a one-line "add to PATH" reminder if `~/.local/bin` isn't

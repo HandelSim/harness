@@ -32,10 +32,11 @@ separately via `--env-file`. The two consumers are independent.
 
 ### Host proxy (`HTTP_PROXY` / `HTTPS_PROXY`)
 
-Optional, host-side only. Honored for the git calls this script runs
-(`update`/`upgrade` pull, `mcp install` clone) — git's libcurl reads them
-straight from the process env, so no per-call wiring is needed — and
-**stripped from every container-runtime call** by `harness_docker` (see
+Optional. Exported into the process env so the host-side work this script
+runs picks them up: the git calls (`update`/`upgrade` pull, `mcp install`
+clone — git's libcurl reads them straight from the env) and `docker compose
+build`, where BuildKit routes base-image pulls and the image `RUN` steps
+through the proxy. They are **not** forwarded into running containers (see
 [`containers.md`](containers.md)). Resolution around the `.env` source: a
 non-empty value in `.env` wins; a blank value (the optional default) is
 prevented from clobbering a proxy the invoking shell already exported by

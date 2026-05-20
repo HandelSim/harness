@@ -171,10 +171,11 @@ EOF
 # ignores the key, so the downstream round-trip is unaffected).
 # harness-install.sh installs into $(pwd) — must cd into TEST_ROOT first.
 # Issue #68: a corp proxy exported in the installing shell must be persisted
-# into the seeded .env (host-only — honored for host git, stripped from
-# containers). The local-path clone ignores the (bogus) proxy, so it's safe
-# to set here; we assert persistence below, then scrub it so the rest of the
-# pipeline runs with a clean .env. HTTPS_PROXY is scoped to this subshell's
+# into the seeded .env (host-side — honored for host git AND for the docker
+# image builds further down). The local-path clone ignores the (bogus) proxy,
+# so it's safe to set here; we assert persistence below, then scrub it so the
+# docker-driven part of the pipeline doesn't route 'docker compose build'
+# through the unreachable bogus URL. HTTPS_PROXY is scoped to this subshell's
 # install command and does not leak to the outer test shell.
 PIPE_PROXY="http://pipeline-corp-proxy.invalid:3128"
 (
@@ -217,9 +218,10 @@ echo "[pipeline] T1 OK"
 # into the install root's .env (filling the blank line, or appending it) so
 # later 'harness' runs reuse the proxy without re-exporting. The .env is
 # excluded from the working-tree overlay above, so the persisted value
-# survives. After asserting, scrub the proxy lines so the docker-driven part
-# of the pipeline runs with a clean .env (the proxy strip is proven directly
-# by tests/harness_test.sh T7b, so we don't need it live here).
+# survives. After asserting, scrub the proxy lines: harness now lets the proxy
+# reach 'docker compose build' (issue #68 fix), so leaving the bogus URL in
+# .env would route the pipeline's build through an unreachable host and hang.
+# The build passthrough itself is proven directly by tests/harness_test.sh T7b.
 echo "[pipeline] T1b: corp proxy persisted into .env"
 pipe_env="${TEST_ROOT}/harness/.env"
 if ! grep -Eq "^[[:space:]]*HTTPS_PROXY=${PIPE_PROXY//./\\.}$" "${pipe_env}"; then

@@ -151,25 +151,24 @@ harness_runtime_is_podman() {
 # that was written before podman support; see also the alias
 # `harness_runtime` further down.
 #
-# Proxy env vars that harness honors for HOST-side git calls (clone/pull/
-# fetch) but deliberately strips from every container-runtime invocation.
-# Container egress is already routed by the runtime/firewall, so forwarding a
-# host-only corp proxy URL into a container (or letting BuildKit auto-export
-# it as a build arg) would break image builds and runtime egress. Stripping
-# here — the single chokepoint every docker/podman call funnels through
-# (enforced by scripts/check_runtime_calls.sh) — guarantees it can't leak.
-_HARNESS_PROXY_STRIP=(-u HTTP_PROXY -u HTTPS_PROXY \
-                      -u http_proxy -u https_proxy)
-
+# Host proxy env vars (HTTP_PROXY/HTTPS_PROXY) are NOT stripped here: they
+# flow through to the runtime call so `docker compose build` inherits them and
+# BuildKit routes base-image pulls and the image `RUN` steps through the corp
+# proxy. The build runs on the host's BuildKit *before* any container/firewall
+# exists, so it genuinely needs the proxy. Running containers never receive it
+# because docker-compose.yml declares no proxy vars in any service
+# `environment:` and compose does not copy the host env into started
+# containers — see architecture/containers.md.
+#
 # Usage: harness_docker [runtime-args...]
 # Example: harness_docker run --rm --entrypoint /bin/bash my-image -c 'echo hi'
 harness_docker() {
     local rt
     rt=$(harness_container_runtime)
     if [[ "$(harness_detect_os)" == "windows" ]]; then
-        env "${_HARNESS_PROXY_STRIP[@]}" MSYS_NO_PATHCONV=1 "$rt" "$@"
+        MSYS_NO_PATHCONV=1 "$rt" "$@"
     else
-        env "${_HARNESS_PROXY_STRIP[@]}" "$rt" "$@"
+        "$rt" "$@"
     fi
 }
 
@@ -185,9 +184,9 @@ harness_docker_exec() {
     local rt
     rt=$(harness_container_runtime)
     if [[ "$(harness_detect_os)" == "windows" ]]; then
-        exec env "${_HARNESS_PROXY_STRIP[@]}" MSYS_NO_PATHCONV=1 "$rt" "$@"
+        exec env MSYS_NO_PATHCONV=1 "$rt" "$@"
     else
-        exec env "${_HARNESS_PROXY_STRIP[@]}" "$rt" "$@"
+        exec "$rt" "$@"
     fi
 }
 
