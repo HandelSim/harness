@@ -62,52 +62,79 @@ base images from Docker Hub / pip / npm) before the harness compose stack
 comes up. That layer is intentionally left open; locking it down would
 require a fully-vendored harness install image.
 
-**Harbor's outbound is restricted to `.harness-allowlist`.** The harbor
-container's entrypoint runs `init-firewall.sh` and verifies the policy
-is live (example.com must be blocked; one canonical allowlist host must
-be reachable) before harbor is exec'd. If harbor's hosted package
-registry (Supabase backend + CDN) isn't on the allowlist, dataset-
-registry calls fail closed with `icmp-admin-prohibited` rather than
-leaking outbound. By default no harbor backend hosts are allowlisted —
-this is what stops harbor from phoning home with anything it observes
-during a benchmark run.
+**Harbor's outbound is restricted to `.harness-allowlist`.** Harbor runs
+the *same* shared `init-firewall.sh` as proxy/ollama/agents — there are no
+harbor-specific firewall rules. Its entrypoint applies the firewall and
+verifies the policy is live (example.com must be blocked; one canonical
+allowlist host must be reachable) before harbor is exec'd. If harbor's
+hosted package registry (Supabase backend + CDN) isn't on the allowlist,
+dataset-registry calls fail closed with `icmp-admin-prohibited` rather than
+leaking outbound. By default no harbor backend hosts are allowlisted — this
+is what stops harbor from phoning home with anything it observes during a
+benchmark run.
 
-The only outbound the user's upstream LLM responses can travel through
-is proxy -> firewall -> upstream LLM API, and that path never crosses
-harbor's network namespace.
+"Sealed" therefore means exactly: harbor's backend is not in
+`.harness-allowlist` during the measured run. The allowlist is the control
+surface — keep it to hosts that can't leak benchmark info. The shared
+firewall's standing exemptions (loopback, DNS resolution, the intra-cluster
+network) are identical to every other harness container; the no-phone-home
+guarantee rests on the allowlist, not on harbor having a stricter firewall
+than the rest of the stack.
 
-### When you DO want harbor to fetch a dataset
+For real datasets, downloading and sealing are split across two harbor
+invocations (prefetch then sealed run) backed by a persistent cache — see
+[below](#when-you-do-want-harbor-to-fetch-a-dataset-prefetch-then-seal).
+
+The only outbound the user's upstream LLM responses can travel through is
+proxy -> firewall -> upstream LLM API, and that path never crosses harbor's
+network namespace.
+
+### When you DO want harbor to fetch a dataset (prefetch, then seal)
 
 The shipped `smoketest.sh` uses a vendored local task
 (`tests/benchmarks/tasks/hello-harness/`) so it works fully offline
-w.r.t. harbor's backend — no allowlist edits required.
+w.r.t. harbor's backend — no allowlist edits required, no prefetch.
 
 The full-scale runners (`terminal-bench.sh`, `swe-bench-lite.sh`) pass
-`--dataset <org>/<name>` to harbor, which has to resolve the name
-against harbor's hosted registry. To make this work without weakening
-the production-run posture, do a one-time prefetch with the registry
-hosts temporarily allowlisted, then remove them before running the real
-benchmark:
+`--dataset <org>/<name>` to harbor, which has to resolve the name against
+harbor's hosted registry. That registry call is the ONE outbound harbor
+must make to its own backend. To keep "download before, sealed during"
+real — not just documented — split it into two phases against a
+**persistent cache**:
 
 ```bash
-# 1) Add harbor's backend hosts to .harness-allowlist (one-time).
+# 1) Add harbor's backend hosts to .harness-allowlist FOR THE PREFETCH ONLY.
 echo 'harborframework.com'      >> .harness-allowlist
 echo 'cdn.harborframework.com'  >> .harness-allowlist
 # (plus the Supabase project host the harbor version uses; check the
 # error from a first attempt to see which exact host gets queried.)
 
-# 2) Run the full benchmark — harbor downloads + caches the dataset.
-./tests/benchmarks/runners/terminal-bench.sh
+# 2) PREFETCH: download + cache the dataset (backend reachable). This runs
+#    one warmup task to force the download into the persistent cache
+#    (tests/benchmarks/runs/.harbor-cache, override HARNESS_BENCH_CACHE_DIR).
+#    It fails loudly if the cache didn't actually persist.
+./tests/benchmarks/runners/prefetch.sh --target terminal-bench
 
-# 3) Remove the entries from .harness-allowlist before the next run if
-#    you want harbor fully sealed off again. Cached datasets stay on
-#    disk; subsequent runs reuse the cache and don't re-query the
-#    registry.
+# 3) SEAL: remove the backend hosts you added in step 1.
+#    (edit .harness-allowlist back, or `harness net deny harborframework.com`)
+
+# 4) SEALED RUN: harbor reuses the cache and never touches its backend.
+./tests/benchmarks/runners/terminal-bench.sh
 ```
 
-This preserves the "no harbor phone-home during benchmarking" property:
-at the moment the agent is running and the upstream LLM is replying, the
-firewall actively rejects any harbor outbound that isn't on the list.
+Why two phases and a persistent cache: the harbor container runs `--rm`,
+so without the bind-mounted cache (`/harbor-cache`, wired in `harbor.sh`)
+every run would re-query the registry — meaning you could never remove the
+backend, and harbor could never actually be sealed. With the cache, the
+download happens once in phase 2 and the measured run in phase 4 makes
+**zero** calls to harbor's backend. Because `init-firewall.sh` fails
+closed, a missing cache makes the sealed run *error*, never leak.
+
+Caveat (harbor-version dependent): this assumes harbor 0.6.6 writes its
+dataset cache under `HOME`/`XDG_CACHE_HOME` (both pointed at `/harbor-cache`
+by `harbor.sh`). `prefetch.sh` checks the cache actually grew and aborts if
+not — if that fires, point `HARNESS_BENCH_CACHE_DIR` at harbor's real cache
+path.
 
 ---
 
@@ -288,6 +315,7 @@ tests/benchmarks/
   runners/
     _lib.sh                             # bench_guard_ci, bench_check_arch, ...
     smoketest.sh
+    prefetch.sh                         # download+cache a dataset before sealing
     terminal-bench.sh
     swe-bench-lite.sh
     compare-schemes.sh

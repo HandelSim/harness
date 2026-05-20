@@ -107,6 +107,13 @@ Benchmarks are NOT regular tests; they're driven by `harness benchmark
 - `harness benchmark compare-schemes` — run the same task list across
   every scheme; for comparing prompt-injection schemes head-to-head.
 
+The two full-scale targets need their dataset resolved against harbor's
+backend. To keep that backend unreachable during the measured run, fetch
+first and seal after: run `tests/benchmarks/runners/prefetch.sh --target
+<t>` (backend temporarily allowlisted) into the persistent harbor cache,
+remove the backend from `.harness-allowlist`, then run the target. See the
+prefetch-then-seal section of `tests/benchmarks/README.md`.
+
 See `tests/benchmarks/README.md` for the full reference: installation,
 docker socket caveat, smoketest-first guidance, adding a new scheme,
 adding a new benchmark target.
