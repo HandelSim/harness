@@ -223,6 +223,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P055 | The cooperative prompt enumerates available tools by name and schema |
 | P056 | Proxy passes through the upstream `model` field as `PROXY_API_MODEL`, not the inbound ollama model name |
 | P057 | Tool-result name is resolved from metadata: explicit `tool_name`/`name` field, else `tool_call_id` correlated to the assistant `tool_calls`, else positional order, else `unknown_tool` |
+| P058 | Hybrid mode echoes the full description of `PROXY_HYBRID_DETAIL_TOOLS` (default `task,skill`) into the recency reminder in `<<<BEGIN_TOOL_DETAIL>>>` blocks; empty disables; only present, non-empty-description tools surface |
 
 ---
 

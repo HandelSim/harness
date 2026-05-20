@@ -1007,6 +1007,174 @@ class TestPromptInjectionModes(unittest.TestCase):
         )
         self.assertLess(request_pos, tools_pos)
 
+
+class TestHybridDetailTools(unittest.TestCase):
+    """Hybrid mode echoes the FULL description of a configurable set of
+    "detail tools" (default `task,skill`) into the recency reminder, each in
+    its own <<<BEGIN_TOOL_DETAIL>>> block. These are the tools whose valid
+    argument values are a closed set opencode documents only as description
+    prose (a `task`'s agent types, a `skill`'s skill names); the signature
+    list carries the parameter keys but not those values.
+    """
+
+    def setUp(self):
+        p = patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", False)
+        p.start()
+        self.addCleanup(p.stop)
+        # A task tool whose valid subagent_type values live ONLY in the
+        # description prose (no JSON-Schema enum) — the exact opencode shape.
+        self.task_tool = {"function": {
+            "name": "task",
+            "description": (
+                "Launch a subagent to handle a multi-step task.\n"
+                "Available agent types and the tools they have access to:\n"
+                "- general-purpose: research and multi-step tasks\n"
+                "- Explore: fast read-only code search\n"
+                "- Plan: software architect for implementation plans"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "subagent_type": {"type": "string"},
+                },
+                "required": ["description", "prompt", "subagent_type"],
+            },
+        }}
+        self.bash_tool = {"function": {
+            "name": "bash",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        }}
+        self.user_msgs = [
+            {"role": "system", "content": "You are opencode."},
+            {"role": "user", "content": "do the thing"},
+        ]
+
+    def _translate(self, tools, flagged=("task", "skill")):
+        tools_text = proxy.format_tools_to_text(tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"), \
+             patch.object(proxy, "_HYBRID_DETAIL_TOOLS", list(flagged)):
+            return proxy.translate_history_and_apply_prompt(
+                self.user_msgs, tools_text, tools=tools,
+            )
+
+    def test_setup_default_is_task_and_skill(self):
+        env_no_var = {k: v for k, v in os.environ.items()
+                      if k != "PROXY_HYBRID_DETAIL_TOOLS"}
+        with patch.dict(os.environ, env_no_var, clear=True):
+            proxy._setup_hybrid_detail_tools()
+            self.assertEqual(proxy._HYBRID_DETAIL_TOOLS, ["task", "skill"])
+
+    def test_setup_parses_and_trims_custom_list(self):
+        with patch.dict(os.environ, {"PROXY_HYBRID_DETAIL_TOOLS": " task , foo,bar "}):
+            proxy._setup_hybrid_detail_tools()
+            self.assertEqual(proxy._HYBRID_DETAIL_TOOLS, ["task", "foo", "bar"])
+
+    def test_setup_empty_value_disables(self):
+        with patch.dict(os.environ, {"PROXY_HYBRID_DETAIL_TOOLS": "  "}):
+            proxy._setup_hybrid_detail_tools()
+            self.assertEqual(proxy._HYBRID_DETAIL_TOOLS, [])
+
+    def test_extract_tool_details_returns_flagged_pairs_in_order(self):
+        details = proxy._extract_tool_details(
+            [self.bash_tool, self.task_tool], ["task", "bash"],
+        )
+        self.assertEqual([n for n, _ in details], ["task", "bash"])
+        self.assertIn("Available agent types", dict(details)["task"])
+
+    def test_extract_tool_details_skips_absent_and_empty(self):
+        empty_desc = {"function": {"name": "skill", "description": "  ",
+                                   "parameters": {}}}
+        details = proxy._extract_tool_details(
+            [self.task_tool, empty_desc], ["skill", "task", "missing"],
+        )
+        # skill present but empty desc → skipped; missing absent → skipped.
+        self.assertEqual([n for n, _ in details], ["task"])
+
+    def test_extract_tool_details_no_tools_returns_empty(self):
+        self.assertEqual(proxy._extract_tool_details(None, ["task"]), [])
+
+    def test_detail_block_emitted_for_flagged_task_tool(self):
+        last_user = self._translate([self.task_tool])[-1]["content"]
+        self.assertIn('<<<BEGIN_TOOL_DETAIL name="task">>>', last_user)
+        self.assertIn("<<<END_TOOL_DETAIL>>>", last_user)
+        # The closed-set values (agent types) reach recency verbatim.
+        self.assertIn("Available agent types", last_user)
+        self.assertIn("general-purpose", last_user)
+        self.assertIn("Explore", last_user)
+
+    def test_detail_block_sits_after_reminder_outside_user_message_wrap(self):
+        last_user = self._translate([self.task_tool])[-1]["content"]
+        reminder_pos = last_user.index("Reminder:")
+        detail_pos = last_user.index('<<<BEGIN_TOOL_DETAIL name="task">>>')
+        user_wrap_pos = last_user.index("<<<BEGIN_USER_MESSAGE>>>")
+        # Reminder, then the detail block, then the wrapped user message — the
+        # detail block is proxy stage-direction, outside USER_MESSAGE.
+        self.assertLess(reminder_pos, detail_pos)
+        self.assertLess(detail_pos, user_wrap_pos)
+        self.assertIn("do the thing", last_user)
+
+    def test_detail_block_has_framing_pointing_at_agent_tools(self):
+        last_user = self._translate([self.task_tool])[-1]["content"]
+        self.assertIn("called with invalid arguments", last_user)
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", last_user)
+
+    def test_no_detail_block_for_unflagged_tool(self):
+        # bash isn't in the flagged set → no TOOL_DETAIL block.
+        last_user = self._translate([self.bash_tool])[-1]["content"]
+        self.assertNotIn("<<<BEGIN_TOOL_DETAIL", last_user)
+
+    def test_detail_block_only_for_present_flagged_tools(self):
+        # skill is flagged but absent from the toolset; only task gets a block.
+        last_user = self._translate([self.task_tool, self.bash_tool])[-1]["content"]
+        self.assertEqual(last_user.count("<<<BEGIN_TOOL_DETAIL"), 1)
+        self.assertIn('name="task"', last_user)
+        self.assertNotIn('name="skill"', last_user)
+
+    def test_empty_flagged_set_disables_detail_blocks(self):
+        last_user = self._translate([self.task_tool], flagged=[])[-1]["content"]
+        self.assertNotIn("<<<BEGIN_TOOL_DETAIL", last_user)
+        # The rest of the reminder is unaffected.
+        self.assertIn("Reminder:", last_user)
+        self.assertIn("task(description, prompt, subagent_type)", last_user)
+
+    def test_detail_block_also_on_tool_result_turn(self):
+        """The detail block must reach recency on tool-result turns too — the
+        model still needs the valid agent types when continuing the loop."""
+        msgs = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"function": {"name": "task", "arguments": {}}}]},
+            {"role": "tool", "tool_name": "task", "content": "subagent done"},
+        ]
+        tools_text = proxy.format_tools_to_text([self.task_tool])
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"), \
+             patch.object(proxy, "_HYBRID_DETAIL_TOOLS", ["task", "skill"]):
+            out = proxy.translate_history_and_apply_prompt(
+                msgs, tools_text, tools=[self.task_tool],
+            )
+        c = out[-1]["content"]
+        self.assertIn('<<<BEGIN_TOOL_DETAIL name="task">>>', c)
+        self.assertIn("Available agent types", c)
+
+    def test_user_front_never_emits_detail_block(self):
+        """TOOL_DETAIL is hybrid-only."""
+        tools_text = proxy.format_tools_to_text([self.task_tool])
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"), \
+             patch.object(proxy, "_HYBRID_DETAIL_TOOLS", ["task", "skill"]):
+            out = proxy.translate_history_and_apply_prompt(
+                self.user_msgs, tools_text, tools=[self.task_tool],
+            )
+        joined = "\n".join(m["content"] for m in out)
+        self.assertNotIn("TOOL_DETAIL", joined)
+
+
 class TestPassthroughMode(unittest.TestCase):
     """`passthrough` mode is the benchmark control: skip every harness-side
     mediation (cooperative-prompt injection, system→user rewrite, history

@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 404 IDs (F=142, P=57, A=34, M=23, N=30, U=29, Pe=19, O=25, I=45).
+Inventory total: 405 IDs (F=142, P=58, A=34, M=23, N=30, U=29, Pe=19, O=25, I=45).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -323,6 +323,7 @@ non-green rows — the gap.
 | P055 | green  | proxy/test_proxy.py:26-131                  | TestFormatTools asserts each tool's name, schema, and arguments enumerated. | |
 | P056 | green  | tests/proxy_test.sh:289-352                 | Scenario C body check: keys == `['messages', 'model']`, with `model == PROXY_API_MODEL`. | |
 | P057 | green  | proxy/test_proxy.py:939-1004                | test_tool_result_name_resolved_via_tool_call_id / _falls_back_to_positional_order / _prefers_explicit_field / _unknown_when_no_metadata: name resolution chain (field → id → positional → `unknown_tool`). | |
+| P058 | green  | proxy/test_proxy.py (TestHybridDetailTools) | test_detail_block_emitted_for_flagged_task_tool asserts `<<<BEGIN_TOOL_DETAIL name="task">>>` + verbatim agent types reach the last user message; _sits_after_reminder_outside_user_message_wrap asserts ordering; _no_detail_block_for_unflagged_tool / _only_for_present_flagged_tools / _empty_flagged_set_disables cover the gating; setup tests cover `PROXY_HYBRID_DETAIL_TOOLS` parse/default/empty. | |
 
 ## A — Agent runtime (init, configs, run-claude/opencode/shell) (34 IDs)
 

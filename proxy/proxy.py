@@ -79,6 +79,16 @@ _PROMPT_MODE: str = "user_front"  # set in main() before serving
 # for upstreams that DO support system roles.
 _CHANGE_SYSTEM_TO_USER: bool = True
 
+# Hybrid mode only. Tool names whose FULL description is echoed verbatim into
+# the recency reminder, each in its own <<<BEGIN_TOOL_DETAIL>>> block. These
+# are the tools whose valid argument *values* are an unguessable closed set
+# that opencode documents only as prose inside the tool description — `task`
+# (the valid `subagent_type` agent names) and `skill` (the valid skill
+# names). The per-tool signature list carries the parameter keys but not
+# those values, so the whole description is what has to reach recency. Read
+# from PROXY_HYBRID_DETAIL_TOOLS (comma-separated) in main(); empty disables.
+_HYBRID_DETAIL_TOOLS: List[str] = ["task", "skill"]
+
 
 # ---------------------------------------------------------------------------
 # OUTPUT_DIR handling
@@ -105,6 +115,18 @@ def _setup_change_system_to_user() -> None:
     raw = os.environ.get("PROXY_CHANGE_SYSTEM_PROMPT_TO_USER", "1").strip().lower()
     _CHANGE_SYSTEM_TO_USER = raw not in ("0", "false", "no", "off", "")
     print(f"[i] convert system to user: {_CHANGE_SYSTEM_TO_USER}", flush=True)
+
+
+def _setup_hybrid_detail_tools() -> None:
+    """Read PROXY_HYBRID_DETAIL_TOOLS (comma-separated tool names) and set the
+    module global. Names are trimmed and blanks dropped. An empty value
+    disables the feature (no TOOL_DETAIL blocks emitted). Only consulted in
+    hybrid mode."""
+    global _HYBRID_DETAIL_TOOLS
+    raw = os.environ.get("PROXY_HYBRID_DETAIL_TOOLS", "task,skill")
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    _HYBRID_DETAIL_TOOLS = names
+    print(f"[i] hybrid detail tools: {', '.join(names) or '(none)'}", flush=True)
 
 
 def init_output_dir() -> Optional[str]:
@@ -319,7 +341,35 @@ def _format_tool_signature(name, required, optional):
     return f"{name}({', '.join(parts)})"
 
 
-def build_cooperative_prompt_hybrid_reminder(content, tool_signatures):
+def _format_tool_detail_blocks(tool_details):
+    """Render the per-tool TOOL_DETAIL section appended to the hybrid
+    reminder. `tool_details` is a list of `(name, description)` pairs from
+    `_extract_tool_details`. Each tool's full description is echoed verbatim
+    inside its own `<<<BEGIN_TOOL_DETAIL name="…">>>` block — never parsed —
+    so the closed set of valid argument values opencode documents only as
+    prose (a `task`'s agent types, a `skill`'s skill names) reaches recency
+    even when attention to messages[0] dilutes. The named delimiter (part of
+    the same marker family as AGENT_TOOLS / TOOL_RESULT / USER_MESSAGE) keeps
+    the model from conflating this recency copy with the authoritative copy at
+    the stable prefix. Returns "" when there's nothing to surface.
+    """
+    if not tool_details:
+        return ""
+    blocks = "\n".join(
+        f'<<<BEGIN_TOOL_DETAIL name="{name}">>>\n{desc}\n<<<END_TOOL_DETAIL>>>'
+        for name, desc in tool_details
+    )
+    framing = (
+        "[The full descriptions below are repeated for the tools most often "
+        "called with invalid arguments. Consult them for the exact set of "
+        "valid argument values (e.g. which agent types are valid for `task`, "
+        "which skills exist for `skill`). The authoritative copy lives in the "
+        "<<<BEGIN_AGENT_TOOLS>>> section.]"
+    )
+    return f"\n\n{framing}\n{blocks}"
+
+
+def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None):
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). This reminder is prepended to the last user
@@ -333,6 +383,14 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures):
 
     `tool_signatures` is a list of `(name, required_keys, optional_keys)`
     triples produced by `_extract_tool_signatures`.
+
+    `tool_details` is an optional list of `(name, description)` pairs from
+    `_extract_tool_details` — the "detail tools" whose full description is
+    echoed verbatim after the reminder in <<<BEGIN_TOOL_DETAIL>>> blocks. The
+    signature line carries only parameter *keys*; a `task`'s valid agent types
+    and a `skill`'s valid names are a closed set of *values* that opencode
+    documents only in the description prose, so the whole description is what
+    must reach recency for those tools.
 
     The reminder leads with a pointer back to the `<<<BEGIN_AGENT_TOOLS>>>`
     section (the stable prefix where the full tool definitions live) so that
@@ -362,7 +420,8 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures):
         "answer normally without any JSON."
         f"{tools_clause}]"
     )
-    return f"{reminder}\n\n{content}"
+    detail_blocks = _format_tool_detail_blocks(tool_details)
+    return f"{reminder}{detail_blocks}\n\n{content}"
 
 
 def _scan_balanced_json(text, start):
@@ -574,6 +633,41 @@ def _extract_tool_signatures(
         else:
             sigs.append((name, [], []))
     return sigs
+
+
+def _extract_tool_details(
+    tools: Optional[List[Dict[str, Any]]],
+    flagged: List[str],
+) -> List[Tuple[str, str]]:
+    """Return `(name, description)` pairs for each name in `flagged` that is
+    present in `tools`, preserving the order of `flagged`. Tools with an
+    empty/whitespace-only description are skipped (an empty TOOL_DETAIL block
+    would be noise). Used by hybrid mode to echo a small set of "detail
+    tools" full descriptions into the recency reminder — see
+    `_format_tool_detail_blocks`.
+
+    Source is the raw `tools` array's `description` field, taken whole — no
+    prose parsing. Unlike `_extract_tool_signatures` there is no `tools_text`
+    fallback: a tool's JSON-Schema params reserialize losslessly into
+    `tools_text`, but its free-form, multi-line description does not, and the
+    production call site always supplies `tools`. Without `tools` (a test
+    convenience path) no detail blocks are surfaced.
+    """
+    if not tools or not flagged:
+        return []
+    by_name: Dict[str, str] = {}
+    for tool in tools:
+        func = tool.get("function", {}) if "function" in tool else tool
+        name = func.get("name")
+        if not name:
+            continue
+        by_name[name] = func.get("description") or ""
+    details: List[Tuple[str, str]] = []
+    for name in flagged:
+        desc = by_name.get(name)
+        if desc and desc.strip():
+            details.append((name, desc))
+    return details
 
 
 def _flatten_content_to_str(content):
@@ -799,9 +893,11 @@ def translate_history_and_apply_prompt(
             # so it sits outside it.
             if messages[-1]["role"] == "user":
                 signatures = _extract_tool_signatures(tools, tools_text)
+                details = _extract_tool_details(tools, _HYBRID_DETAIL_TOOLS)
                 messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
                     messages[-1]["content"],
                     signatures,
+                    details,
                 )
 
     # Convert system role to user role if configured. Some upstream APIs
@@ -1099,6 +1195,7 @@ def main() -> None:
     _OUTPUT_DIR = init_output_dir()
     _setup_prompt_mode()
     _setup_change_system_to_user()
+    _setup_hybrid_detail_tools()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()
     if not raw_output:
@@ -1118,6 +1215,7 @@ def main() -> None:
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
+        f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"
         f"   debug dumps:    {output_status}\n"
         "============================================================",
         flush=True,

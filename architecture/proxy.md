@@ -59,10 +59,15 @@ The validator in `_setup_prompt_mode` accepts:
   names — is the recency anchor for the parameter keys models most often
   guess wrong (e.g. calling `read({"filename": ...})` instead of
   `read({"filePath": ...})`, or omitting opencode's `bash` required
-  `description`). Hybrid additionally delimits three content categories so
-  each is addressable by name and the model can't conflate them with the
-  upstream gateway's own system prompt/tools — see
-  [Hybrid delimiters](#hybrid-delimiters) below.
+  `description`). The signature list carries parameter *keys* but not their
+  *values*; for a small configurable set of "detail tools" whose valid
+  values are a closed set opencode documents only in description prose (a
+  `task`'s agent types, a `skill`'s skill names) the reminder additionally
+  echoes the tool's full description verbatim — see
+  [Hybrid delimiters](#hybrid-delimiters). Hybrid additionally delimits
+  three content categories so each is addressable by name and the model
+  can't conflate them with the upstream gateway's own system prompt/tools —
+  again see [Hybrid delimiters](#hybrid-delimiters) below.
 - **`passthrough`** — benchmark control. Skips every harness-side
   mediation: no cooperative-prompt injection, no system→user rewrite, no
   history translation. `translate_history_and_apply_prompt` short-circuits
@@ -141,6 +146,22 @@ target to retrieve for full tool descriptions and parameter-value
 constraints. This is additive — token cost is ~100–200 tokens/turn; hybrid's
 lighter-than-user_front recency profile is preserved.
 
+- **`<<<BEGIN_TOOL_DETAIL name="…">>>`** — recency-only (it lives in the
+  reminder, not at the stable prefix). For each tool named in
+  `PROXY_HYBRID_DETAIL_TOOLS` (default `task,skill`) that is present in the
+  toolset, the reminder appends the tool's **full description, verbatim**, in
+  its own block. The pointer-back above is too weak for tools whose valid
+  argument *values* are an unguessable closed set that opencode documents
+  only as prose in the description — `task`'s `subagent_type` agent names and
+  `skill`'s skill names (neither is a JSON-Schema `enum`). The signature list
+  carries only keys, so the whole description has to reach recency. The block
+  sits after the reminder and OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap
+  (proxy stage-direction). `_extract_tool_details` reads the raw `tools`
+  array's `description` field whole — no prose parsing, no `tools_text`
+  fallback. Empty `PROXY_HYBRID_DETAIL_TOOLS` disables the blocks; tools with
+  an empty description, or flagged tools absent from the toolset, are
+  skipped.
+
 ## `_CHANGE_SYSTEM_TO_USER`
 
 Default ON. Some upstreams silently drop the `system` role; the
@@ -205,9 +226,12 @@ non-empty and `PROXY_API_URL` parses; the process exits with a clear
 message if not. `_redact_key` is used in startup logging so logs show
 something like `sk-abc...xyz`.
 
-`_setup_prompt_mode` and `_setup_change_system_to_user` read their env
-vars from the same `main()` startup path and stash the resolved values
-as module globals.
+`_setup_prompt_mode`, `_setup_change_system_to_user`, and
+`_setup_hybrid_detail_tools` read their env vars from the same `main()`
+startup path and stash the resolved values as module globals.
+`PROXY_HYBRID_DETAIL_TOOLS` (comma-separated, default `task,skill`, empty to
+disable) names the hybrid "detail tools" — see [Hybrid
+delimiters](#hybrid-delimiters).
 
 ## Debug dumps
 
