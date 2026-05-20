@@ -227,9 +227,9 @@ if ! grep -Eq "^[[:space:]]*HTTPS_PROXY=${PIPE_PROXY//./\\.}$" "${pipe_env}"; th
     grep -nE '^[[:space:]]*HTTPS?_PROXY=' "${pipe_env}" >&2 || echo "(no proxy lines present)" >&2
     exit 1
 fi
-# Scrub all three host-proxy lines so nothing downstream inherits the bogus URL.
+# Scrub both host-proxy lines so nothing downstream inherits the bogus URL.
 proxy_scrub_tmp="${pipe_env}.scrub.$$"
-grep -vE '^[[:space:]]*(HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' "${pipe_env}" >"${proxy_scrub_tmp}"
+grep -vE '^[[:space:]]*(HTTP_PROXY|HTTPS_PROXY)=' "${pipe_env}" >"${proxy_scrub_tmp}"
 mv -f "${proxy_scrub_tmp}" "${pipe_env}"
 echo "[pipeline] T1b OK"
 

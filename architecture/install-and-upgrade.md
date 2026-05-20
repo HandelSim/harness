@@ -36,7 +36,7 @@ run from an empty directory. Stages:
    was captured at the prompt, its value is then written into the `.env`'s
    `PROXY_API_KEY=` line (prompt wins over any pre-placed value; the
    rewrite touches only that line via a bash read-loop, no `sed` escaping).
-   If `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are exported in the installing
+   If `HTTP_PROXY`/`HTTPS_PROXY` are exported in the installing
    shell, their values are persisted into the `.env` (filling only blank
    lines, so a pre-placed value wins) so later `harness` runs reuse the proxy
    without re-exporting. The initial `git clone` itself just inherits the

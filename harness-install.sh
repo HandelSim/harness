@@ -493,11 +493,11 @@ fi
 
 # Persist any corp proxy exported in the installing shell into the .env so
 # later 'harness' runs (update/upgrade pull, mcp clone) reuse it without the
-# user re-exporting each time. We fill ONLY blank HTTP_PROXY/HTTPS_PROXY/
-# NO_PROXY lines, so a value the user pre-placed in their own .env wins. These
+# user re-exporting each time. We fill ONLY blank HTTP_PROXY/HTTPS_PROXY
+# lines, so a value the user pre-placed in their own .env wins. These
 # are host-only (honored for host git, stripped from containers by harness).
 proxy_env_target="$install_root/.env"
-for pk in HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+for pk in HTTP_PROXY HTTPS_PROXY; do
     pv="${!pk:-}"
     [[ -z "$pv" ]] && continue
     # Read the current value (if any) without sed, so proxy URLs containing

@@ -183,12 +183,12 @@ cannot bypass.
 
 ### Host proxy is never forwarded into containers
 
-`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are a host-only convenience for the
+`HTTP_PROXY`/`HTTPS_PROXY` are a host-only convenience for the
 git calls harness makes (see [`harness-cli.md`](harness-cli.md)). Container
 egress is already routed by the runtime/firewall, so a host-only corp proxy
 URL forwarded inward would break image builds and runtime egress.
 `harness_docker`/`harness_docker_exec` (`scripts/lib/platform.sh`) therefore
-run every docker/podman invocation under `env -u` for all six proxy var
+run every docker/podman invocation under `env -u` for all four proxy var
 spellings — including `compose build`, so BuildKit can't auto-export them as
 build args. This is airtight because `scripts/check_runtime_calls.sh` proves
 nothing reaches the runtime outside those two wrappers. `docker-compose.yml`

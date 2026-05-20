@@ -119,8 +119,8 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F097 | `harness doctor` reports config section: `.env` and `.harness-allowlist` presence and parseability |
 | F098 | `harness doctor` reports network section: PROXY_API_URL hostname allowlisted vs not |
 | F099 | `harness doctor` reports storage section: state/output, state/agent/home, state/ollama-data writability |
-| F100 | harness honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` for host-side git calls; a non-empty value in `.env` wins, else the invoking shell's value (a blank `.env` value does not clobber the shell) |
-| F101 | `harness_docker` / `harness_docker_exec` strip all six proxy spellings (upper + lower) from every container-runtime call, including `compose build` / BuildKit |
+| F100 | harness honors `HTTP_PROXY`/`HTTPS_PROXY` for host-side git calls; a non-empty value in `.env` wins, else the invoking shell's value (a blank `.env` value does not clobber the shell) |
+| F101 | `harness_docker` / `harness_docker_exec` strip all four proxy spellings (upper + lower) from every container-runtime call, including `compose build` / BuildKit |
 | F102 | `harness_normalize_proxy_env` mirrors the upper/lower-case proxy spellings without overwriting an explicit value |
 | F100 | `harness doctor` reports runtime section: docker/podman daemon reachable |
 | F101 | `harness doctor` reports images section: presence and age of `harness-proxy`, `harness-ollama`, `harness-agents` |
@@ -474,6 +474,6 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | I040 | Preflight primitive `harness_check_command` exits non-zero with a clear message when a command is missing |
 | I041 | Preflight primitive `_disk_space` returns failure when free space is below the threshold |
 | I042 | Preflight primitive `_dir_writable` returns failure when the directory cannot accept a tempfile |
-| I043 | When `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are exported in the installing shell, the installer persists them into the seeded `.env`, filling only blank lines (a pre-placed value wins) |
+| I043 | When `HTTP_PROXY`/`HTTPS_PROXY` are exported in the installing shell, the installer persists them into the seeded `.env`, filling only blank lines (a pre-placed value wins) |
 | I044 | On Windows Git Bash the installer bridges `~/.bash_profile` -> `~/.bashrc` so login shells pick up the PATH export |
 | I045 | The `.bash_profile` bridge preserves a pre-existing `~/.profile` when it has to create `~/.bash_profile`, and is idempotent |
