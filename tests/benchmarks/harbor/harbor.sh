@@ -16,6 +16,11 @@
 #                                (consumed by init-firewall.sh in the
 #                                 container's entrypoint — restricts harbor's
 #                                 outbound to allowlisted hosts only)
+#   <cache dir>:/harbor-cache    (persistent harbor HOME/cache — survives the
+#                                 --rm container so a dataset downloaded by
+#                                 prefetch.sh stays on disk for the sealed run.
+#                                 HOME + XDG_CACHE_HOME point here. Override the
+#                                 host path with HARNESS_BENCH_CACHE_DIR.)
 #
 # Capabilities:
 #   NET_ADMIN, NET_RAW           (required by init-firewall.sh to manage
@@ -34,6 +39,21 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/platform.sh"
 
 IMAGE_TAG="${HARNESS_BENCH_HARBOR_IMAGE:-harness-harbor:0.6.6}"
+
+# Persistent cache dir. The harbor container runs with `--rm`, so anything
+# harbor writes under its own HOME ($HOME/.cache, $HOME/.harbor, ...) is
+# destroyed on exit unless we bind-mount it. We point HOME (and
+# XDG_CACHE_HOME) at this dir so a dataset that prefetch.sh downloads with
+# harbor's backend temporarily allowlisted persists to disk and is reused by
+# the later *sealed* run (backend removed from the allowlist). Without this,
+# every run re-queries harbor's registry and the backend could never be
+# removed — i.e. harbor could never be sealed for real datasets.
+#
+# Default lives under runs/ (gitignored). Files are created by the container's
+# root user, so they may be root-owned on the host. Override with
+# HARNESS_BENCH_CACHE_DIR.
+CACHE_DIR="${HARNESS_BENCH_CACHE_DIR:-${REPO_ROOT}/tests/benchmarks/runs/.harbor-cache}"
+mkdir -p "${CACHE_DIR}"
 
 # Allowlist path: same default as docker-compose.yml so harbor uses the same
 # file as the rest of the stack. Override with HARNESS_ALLOWLIST_PATH.
@@ -79,6 +99,9 @@ harness_docker_exec run --rm "${tty_args[@]}" \
     -v "$(harness_docker_path "${REPO_ROOT}")":"${REPO_ROOT}" \
     -v "$(harness_docker_path "${PWD}")":"${PWD}" \
     -v "$(harness_docker_path "${ALLOWLIST_PATH}")":/etc/harness/allowlist:ro \
+    -v "$(harness_docker_path "${CACHE_DIR}")":/harbor-cache \
+    --env HOME=/harbor-cache \
+    --env XDG_CACHE_HOME=/harbor-cache/.cache \
     -w "${PWD}" \
     "${env_args[@]}" \
     "${IMAGE_TAG}" "$@"
