@@ -9,7 +9,7 @@
 # Always run smoketest first unless --no-smoketest is set.
 #
 # Usage:
-#   ./terminal-bench.sh --agent claude --scheme current
+#   ./terminal-bench.sh --agent claude --scheme user_front
 #   ./terminal-bench.sh --no-smoketest
 #   ./terminal-bench.sh --task-ids hello-world,fix-bug-123
 #   ./terminal-bench.sh --n-concurrent 4
@@ -29,7 +29,7 @@ bench_check_disk "${BENCH_ROOT}/runs" || true
 AGENT="claude"
 TASK_IDS=""
 N_CONCURRENT=""
-SCHEME="current"
+SCHEME="user_front"
 RUN_SMOKETEST=1
 while (( $# > 0 )); do
     case "$1" in

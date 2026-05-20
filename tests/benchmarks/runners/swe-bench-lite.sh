@@ -7,7 +7,7 @@
 # at this stage.
 #
 # Usage:
-#   ./swe-bench-lite.sh --agent claude --scheme current
+#   ./swe-bench-lite.sh --agent claude --scheme user_front
 #   ./swe-bench-lite.sh --task-ids astropy__astropy-12907
 
 set -euo pipefail
@@ -24,7 +24,7 @@ bench_check_disk "${BENCH_ROOT}/runs" || true
 AGENT="claude"
 TASK_IDS=""
 N_CONCURRENT=""
-SCHEME="current"
+SCHEME="user_front"
 RUN_SMOKETEST=1
 while (( $# > 0 )); do
     case "$1" in

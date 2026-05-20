@@ -2,7 +2,7 @@
 #
 # smoketest.sh — small, fast Harbor run to verify adapter wiring.
 #
-# Runs 1-3 of Terminal-Bench's smallest tasks against the `current`
+# Runs 1-3 of Terminal-Bench's smallest tasks against the `user_front`
 # scheme with one agent. 5-15 min target on x86_64. On aarch64 with QEMU,
 # expect 30-60 min for 1 task.
 #
@@ -27,7 +27,7 @@ bench_check_disk "${BENCH_ROOT}/runs" || true
 AGENT="claude"
 TASK_IDS=""
 N_CONCURRENT=""
-SCHEME="current"
+SCHEME="user_front"
 while (( $# > 0 )); do
     case "$1" in
         --agent) AGENT="$2"; shift 2 ;;

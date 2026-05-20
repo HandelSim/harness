@@ -1,0 +1,8 @@
+{
+  "name": "hybrid",
+  "description": "Full tool definitions on the stable prefix (system message folded to user index 0 by _CHANGE_SYSTEM_TO_USER), plus a short per-turn recency reminder listing the JSON envelope, the no-fabricated-results rule, and each tool's parameter signature on the last user message. Maps to PROXY_PROMPT_MODE=hybrid. A/B this against user_front to measure stable-prefix scaffolding vs. front-loaded scaffolding. See architecture/proxy.md for proxy-side details.",
+  "env": {
+    "HARNESS_PROXY_SCHEME": "hybrid",
+    "PROXY_PROMPT_MODE": "hybrid"
+  }
+}
