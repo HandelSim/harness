@@ -641,16 +641,18 @@ fi
 rm -rf "${fake_home}"
 echo "[harness-test] T7 OK"
 
-# --- Test 7b: harness_docker strips host proxy from runtime calls (#68) -----
+# --- Test 7b: harness_docker passes host proxy through to the runtime (#68) --
 #
-# Host proxy vars (HTTP_PROXY/HTTPS_PROXY, upper + lower) are honored
-# for host-side git but must NEVER reach the container runtime — including
-# BuildKit, which auto-exports them as build args from the CLI env.
-# harness_docker / harness_docker_exec run the runtime under `env -u` for all
-# four spellings. Drive a fake runtime that records its environment and assert
-# none of the four leak through. Wrapped in a subshell so the function/env
-# overrides don't bleed into later tests.
-echo "[harness-test] T7b: harness_docker strips proxy from runtime env"
+# Host proxy vars (HTTP_PROXY/HTTPS_PROXY, upper + lower) MUST reach the
+# container runtime so `docker compose build` inherits them and BuildKit routes
+# base-image pulls and the image RUN steps through the corp proxy. The wrappers
+# therefore do NOT scrub them — whatever is in the harness process env flows
+# into the runtime call. (Running containers don't get it because compose
+# declares no proxy vars in any service environment, not because these wrappers
+# strip it.) Drive a fake runtime that records its environment and assert all
+# four spellings are present. Subshell-scoped so the overrides don't bleed into
+# later tests.
+echo "[harness-test] T7b: harness_docker passes proxy through to runtime env"
 (
     t7b_rt="$(mktemp -t harness-fake-rt.XXXXXX)"
     cat >"${t7b_rt}" <<'FAKE'
@@ -670,27 +672,23 @@ FAKE
     env | grep -q '^HTTPS_PROXY=' \
         || { echo "[harness-test] T7b FAIL: HTTPS_PROXY not set; test would be vacuous" >&2; exit 1; }
 
-    proxy_re='^(HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy)='
-
     # harness_docker (returns normally).
     rec="$(mktemp -t harness-fake-rt-rec.XXXXXX)"
     export HARNESS_FAKE_RT_REC="${rec}"
     harness_docker run --rm hello >/dev/null 2>&1
-    if grep -Eq "${proxy_re}" "${rec}"; then
-        echo "[harness-test] T7b FAIL: proxy leaked into harness_docker runtime env:" >&2
-        grep -E "${proxy_re}" "${rec}" >&2
-        exit 1
-    fi
+    for v in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+        grep -Eq "^${v}=http://corp\.invalid:8080$" "${rec}" \
+            || { echo "[harness-test] T7b FAIL: ${v} did not reach harness_docker runtime env:" >&2; cat "${rec}" >&2; exit 1; }
+    done
 
     # harness_docker_exec (execs — run in a nested subshell so only it is replaced).
     rec_exec="$(mktemp -t harness-fake-rt-rec.XXXXXX)"
     export HARNESS_FAKE_RT_REC="${rec_exec}"
     ( harness_docker_exec run --rm hello ) >/dev/null 2>&1
-    if grep -Eq "${proxy_re}" "${rec_exec}"; then
-        echo "[harness-test] T7b FAIL: proxy leaked into harness_docker_exec runtime env:" >&2
-        grep -E "${proxy_re}" "${rec_exec}" >&2
-        exit 1
-    fi
+    for v in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+        grep -Eq "^${v}=http://corp\.invalid:8080$" "${rec_exec}" \
+            || { echo "[harness-test] T7b FAIL: ${v} did not reach harness_docker_exec runtime env:" >&2; cat "${rec_exec}" >&2; exit 1; }
+    done
 
     rm -f "${t7b_rt}" "${rec}" "${rec_exec}"
 )

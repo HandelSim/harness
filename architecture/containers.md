@@ -181,18 +181,19 @@ configured `PROXY_API_URL` host, and allowlist entries.
 requires the user to type `I understand the risks` on a TTY; scripts
 cannot bypass.
 
-### Host proxy is never forwarded into containers
+### Host proxy reaches builds, never running containers
 
-`HTTP_PROXY`/`HTTPS_PROXY` are a host-only convenience for the
-git calls harness makes (see [`harness-cli.md`](harness-cli.md)). Container
-egress is already routed by the runtime/firewall, so a host-only corp proxy
-URL forwarded inward would break image builds and runtime egress.
-`harness_docker`/`harness_docker_exec` (`scripts/lib/platform.sh`) therefore
-run every docker/podman invocation under `env -u` for all four proxy var
-spellings — including `compose build`, so BuildKit can't auto-export them as
-build args. This is airtight because `scripts/check_runtime_calls.sh` proves
-nothing reaches the runtime outside those two wrappers. `docker-compose.yml`
-likewise declares no proxy vars in any service `environment:`.
+`HTTP_PROXY`/`HTTPS_PROXY` (see [`harness-cli.md`](harness-cli.md)) are
+inherited by `docker compose build` from the harness process env: BuildKit
+routes base-image pulls and the image `RUN` steps through the proxy. This is
+required because the build happens on the host's BuildKit *before* any
+container or firewall exists — nothing else can route it. They are **not**
+injected into running containers, because `docker-compose.yml` declares no
+proxy vars in any service `environment:` and compose does not copy the host
+env into started containers; runtime egress stays on the runtime/firewall
+path. No stripping is done in `harness_docker`/`harness_docker_exec`
+(`scripts/lib/platform.sh`): build needs the proxy, and runtime simply never
+receives it.
 
 ## `harness-net` is the integration surface
 

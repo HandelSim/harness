@@ -120,7 +120,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F098 | `harness doctor` reports network section: PROXY_API_URL hostname allowlisted vs not |
 | F099 | `harness doctor` reports storage section: state/output, state/agent/home, state/ollama-data writability |
 | F100 | harness honors `HTTP_PROXY`/`HTTPS_PROXY` for host-side git calls; a non-empty value in `.env` wins, else the invoking shell's value (a blank `.env` value does not clobber the shell) |
-| F101 | `harness_docker` / `harness_docker_exec` strip all four proxy spellings (upper + lower) from every container-runtime call, including `compose build` / BuildKit |
+| F101 | `harness_docker` / `harness_docker_exec` pass the host proxy (all four spellings) through to the container runtime so `compose build` / BuildKit routes image pulls and `RUN` steps through it; running containers never get it (compose declares no proxy vars) |
 | F102 | `harness_normalize_proxy_env` mirrors the upper/lower-case proxy spellings without overwriting an explicit value |
 | F100 | `harness doctor` reports runtime section: docker/podman daemon reachable |
 | F101 | `harness doctor` reports images section: presence and age of `harness-proxy`, `harness-ollama`, `harness-agents` |
