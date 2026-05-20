@@ -485,6 +485,7 @@ phase_3_graphify() {
         --user 0:0 \
         --cap-add NET_ADMIN \
         --cap-add NET_RAW \
+        --sysctl net.ipv6.conf.all.disable_ipv6=1 \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
         -e "HARNESS_HOST_CWD=${ws_target}" \
@@ -721,6 +722,7 @@ phase_3_graphify() {
         --user 0:0 \
         --cap-add NET_ADMIN \
         --cap-add NET_RAW \
+        --sysctl net.ipv6.conf.all.disable_ipv6=1 \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
         -e "HARNESS_HOST_CWD=${ws_target2}" \
@@ -828,6 +830,7 @@ phase_5_mount() {
         --user 0:0 \
         --cap-add NET_ADMIN \
         --cap-add NET_RAW \
+        --sysctl net.ipv6.conf.all.disable_ipv6=1 \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
         -e "HARNESS_HOST_CWD=${ws_target}" \

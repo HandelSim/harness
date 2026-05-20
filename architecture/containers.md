@@ -174,6 +174,15 @@ configured `PROXY_API_URL` host, and allowlist entries.
 - The proxy container additionally validates `PROXY_API_URL`'s host is
   on the allowlist before applying rules; otherwise the proxy cannot
   reach upstream and there's no point continuing.
+- The rules are IPv4-only (`iptables` + `dig +short A` + an `inet` ipset), so
+  every harness container is created with the kernel IPv6 stack disabled via
+  the `net.ipv6.conf.all.disable_ipv6=1` sysctl (`sysctls:` in
+  `docker-compose.yml`, `--sysctl` on the CLI/`docker run` agent launches —
+  it must be set at creation because `/proc/sys` is read-only inside the
+  running container even with `NET_ADMIN`). Otherwise IPv6 egress would be an
+  unfiltered hole, and dualstack allowlist hosts' AAAA records would draw an
+  unroutable IPv6 connect attempt (instant `ENETUNREACH`) instead of using
+  the allowed IPv4 path.
 - See `firewall/README.md` for operator-side debugging.
 
 `harness net` subcommands (`list`/`allow`/`deny`/`edit`/`status`/`open`/
