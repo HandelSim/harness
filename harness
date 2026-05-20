@@ -2171,6 +2171,11 @@ run_agent_interactive() {
         # dropping to harness; iptables/ipset need NET_ADMIN/NET_RAW.
         --cap-add NET_ADMIN
         --cap-add NET_RAW
+        # The firewall is IPv4-only; disable the kernel IPv6 stack so dualstack
+        # hosts' AAAA records can't draw an unroutable IPv6 connect attempt
+        # (instant ENETUNREACH) and v6 egress can't slip past the v4 rules.
+        # Must be set at creation: /proc/sys is read-only inside the container.
+        --sysctl net.ipv6.conf.all.disable_ipv6=1
     )
 
     local env_line
@@ -2253,9 +2258,10 @@ run_agent_print() {
         run --rm "$tty_flag"
         --user 0:0
         --network "$network"
-        # See run_agent_interactive for the cap rationale.
+        # See run_agent_interactive for the cap + IPv6 rationale.
         --cap-add NET_ADMIN
         --cap-add NET_RAW
+        --sysctl net.ipv6.conf.all.disable_ipv6=1
     )
 
     local env_line
@@ -2414,6 +2420,8 @@ cmd_shell() {
         --network "$network"
         --cap-add NET_ADMIN
         --cap-add NET_RAW
+        # See run_agent_interactive: IPv4-only firewall ⇒ disable IPv6.
+        --sysctl net.ipv6.conf.all.disable_ipv6=1
         -e "HOST_UID=$(id -u)"
         -e "HOST_GID=$(id -g)"
         -e "HARNESS_HOST_CWD=$mount_path"
@@ -3707,6 +3715,7 @@ cmd_claude_statusline_config() {
         --network "$network" \
         --cap-add NET_ADMIN \
         --cap-add NET_RAW \
+        --sysctl net.ipv6.conf.all.disable_ipv6=1 \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
         -e "HARNESS_PRINT_MODE=1" \

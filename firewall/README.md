@@ -5,6 +5,10 @@ egress policy and block accidental git pushes:
 
 - `init-firewall.sh` — sets up iptables + ipset rules; reads the allowlist
   from `/etc/harness/allowlist` (mounted from `<install-root>/.harness-allowlist`).
+  The rules are IPv4-only; containers are launched with the kernel IPv6 stack
+  disabled (`net.ipv6.conf.all.disable_ipv6=1`, set at `docker run`/compose
+  creation time since `/proc/sys` is read-only inside the container) so IPv6
+  egress can't slip past the v4 rules.
 - `configure-git-credentials.sh` — sets `credential.helper=/bin/false`
   globally, then enables `store` for any host annotated `# git-push` in the
   allowlist.

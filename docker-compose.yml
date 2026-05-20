@@ -49,6 +49,13 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    # The firewall is IPv4-only (iptables + `dig +short A` + an inet ipset), so
+    # disable the kernel IPv6 stack to close the unfiltered v6 egress path and
+    # stop dualstack hosts' AAAA records from drawing an unroutable IPv6
+    # connect attempt (instant ENETUNREACH). Must be set at creation: /proc/sys
+    # is read-only inside the running container even with NET_ADMIN.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
     networks:
       - harness-net
     # Always expose internally. Other services on harness-net reach ollama
@@ -102,6 +109,9 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    # IPv4-only firewall ⇒ disable the kernel IPv6 stack. See ollama above.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
     networks:
       - harness-net
     restart: unless-stopped
@@ -132,6 +142,10 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    # IPv4-only firewall ⇒ disable the kernel IPv6 stack. See ollama above.
+    # The harness CLI passes the matching --sysctl on its docker run call.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
     volumes:
       - ${HARNESS_ALLOWLIST_PATH:-./.harness-allowlist}:/etc/harness/allowlist:ro
     networks:
