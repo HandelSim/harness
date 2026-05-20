@@ -4504,6 +4504,10 @@ tests/benchmarks/runners/<target>.sh.
 targets:
   smoketest         small synthetic suite that proves the harness can run
                     a benchmark end-to-end (default)
+  prefetch          download + cache the real datasets with harbor's backend
+                    temporarily allowlisted, so the benchmark runs can stay
+                    sealed (no harbor phone-home during the run). Run this
+                    once before terminal-bench / swe-bench-lite.
   terminal-bench    terminal-bench scenarios
   swe-bench-lite    swe-bench-lite scenarios
   compare-schemes   compare prompting/agent schemes against each other
@@ -4631,6 +4635,13 @@ cmd_benchmark() {
             _harness_run_bench_target smoketest
             return $?
             ;;
+        prefetch)
+            # Setup step, not a benchmark: downloads datasets with harbor's
+            # backend temporarily allowlisted. No smoketest gate (it runs no
+            # agent and consumes no LLM budget).
+            _harness_run_bench_target prefetch
+            return $?
+            ;;
         all)
             # Run every *.sh under runners/. Smoketest first if present.
             if [[ ! -d "$runners_dir" ]]; then
@@ -4651,7 +4662,10 @@ cmd_benchmark() {
             for r in "${runners[@]}"; do
                 local name
                 name=$(basename "$r" .sh)
-                [[ "$name" == "smoketest" ]] && continue
+                # smoketest already ran as the gate above. prefetch opens
+                # harbor's backend, so it only ever runs when the operator
+                # asks for it explicitly — never implicitly inside `all`.
+                [[ "$name" == "smoketest" || "$name" == "prefetch" ]] && continue
                 _harness_run_bench_target "$name" || rc=1
             done
             return $rc

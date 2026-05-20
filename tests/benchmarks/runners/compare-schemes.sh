@@ -3,12 +3,13 @@
 # compare-schemes.sh — run the same benchmark under multiple schemes
 # back-to-back, then write a small comparison summary.
 #
-# Default: passthrough vs. current on Terminal-Bench, claude agent.
+# Default: user_front, hybrid, passthrough on the smoketest target,
+# claude agent.
 #
 # Usage:
 #   ./compare-schemes.sh
-#   ./compare-schemes.sh --schemes current,passthrough --agent claude
-#   ./compare-schemes.sh --target smoketest
+#   ./compare-schemes.sh --schemes user_front,hybrid --agent claude
+#   ./compare-schemes.sh --target terminal-bench
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +22,7 @@ bench_check_binfmt || true
 bench_check_docker_socket || true
 bench_check_disk "${BENCH_ROOT}/runs" || true
 
-SCHEMES="current,passthrough"
+SCHEMES="user_front,hybrid,passthrough"
 AGENT="claude"
 TARGET="smoketest"   # smoketest | terminal-bench | swe-bench-lite
 N_CONCURRENT=""
@@ -62,7 +63,11 @@ IFS=',' read -r -a SCHEME_LIST <<< "${SCHEMES}"
 for scheme in "${SCHEME_LIST[@]}"; do
     echo "[compare-schemes] >>> running scheme=${scheme} agent=${AGENT}" \
          "target=${TARGET}" >&2
-    runner_args=(--agent "${AGENT}" --scheme "${scheme}" --no-smoketest)
+    runner_args=(--agent "${AGENT}" --scheme "${scheme}")
+    # Only the full-scale runners accept --no-smoketest; smoketest.sh does
+    # not. Suppress the redundant per-scheme smoketest pre-run only when the
+    # target IS one of those runners.
+    [[ "${TARGET}" != "smoketest" ]] && runner_args+=(--no-smoketest)
     [[ -n "${TASK_IDS}" ]] && runner_args+=(--task-ids "${TASK_IDS}")
     [[ -n "${N_CONCURRENT}" ]] && runner_args+=(--n-concurrent "${N_CONCURRENT}")
     # Capture this scheme's stdout/stderr in the compare dir for later diff.
@@ -75,5 +80,5 @@ for scheme in "${SCHEME_LIST[@]}"; do
 done
 
 echo "[compare-schemes] done. Per-scheme logs in: ${COMPARE_DIR}" >&2
-echo "[compare-schemes] Next: see tests/benchmarks/analyze/ for" \
-     "summary tooling (TODO)." >&2
+echo "[compare-schemes] Compare the per-scheme harbor result JSON under" \
+     "each scheme's run dir in ${BENCH_ROOT}/runs/ to read pass rates." >&2
