@@ -101,11 +101,18 @@ Benchmarks are NOT regular tests; they're driven by `harness benchmark
 
 - `harness benchmark smoketest` — 3–5 small tasks; 5–15 min; verifies
   wiring. Required gate before any full-scale target.
+- `harness benchmark prefetch` — downloads the real datasets into the
+  persistent cache (`tests/benchmarks/cache/`) with harbor's backend
+  temporarily allowlisted. The ONLY phase that opens harbor's backend; runs
+  no agent. Run once before terminal-bench / swe-bench-lite, which then run
+  sealed (backend unreachable, cache reused).
 - `harness benchmark terminal-bench` — full Terminal-Bench 2.0 run;
   6–12 hrs.
 - `harness benchmark swe-bench-lite` — full SWE-bench Lite run; 4–8 hrs.
 - `harness benchmark compare-schemes` — run the same task list across
   every scheme; for comparing prompt-injection schemes head-to-head.
+  Schemes are one per honored proxy mode: `user_front`, `hybrid`,
+  `passthrough`.
 
 See `tests/benchmarks/README.md` for the full reference: installation,
 docker socket caveat, smoketest-first guidance, adding a new scheme,

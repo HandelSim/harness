@@ -16,6 +16,16 @@
 #                                (consumed by init-firewall.sh in the
 #                                 container's entrypoint — restricts harbor's
 #                                 outbound to allowlisted hosts only)
+#   <cache dir>:/harbor-cache    (persistent dataset/download cache so a
+#                                 dataset fetched during `prefetch.sh` (with
+#                                 harbor's backend temporarily allowlisted)
+#                                 survives the container's --rm and is reused
+#                                 by the sealed benchmark run, which runs with
+#                                 the backend NOT allowlisted. HOME/XDG/HF
+#                                 caches are pointed here so wherever harbor or
+#                                 the huggingface client writes, it lands in
+#                                 the persistent mount. Override the host path
+#                                 with HARNESS_BENCH_CACHE_DIR.)
 #
 # Capabilities:
 #   NET_ADMIN, NET_RAW           (required by init-firewall.sh to manage
@@ -49,6 +59,14 @@ EOF
     exit 1
 fi
 
+# Persistent cache dir. Without this, harbor's downloads live under the
+# container's $HOME and are destroyed on --rm, so a "fetch once, then run
+# sealed" workflow could never reuse a cached dataset. Bind-mounting a host
+# dir and pointing HOME/XDG/HF caches at it makes the cache survive across
+# runs regardless of harbor's exact internal cache path.
+CACHE_DIR="${HARNESS_BENCH_CACHE_DIR:-${REPO_ROOT}/tests/benchmarks/cache}"
+mkdir -p "${CACHE_DIR}"
+
 # Build once and cache. `docker image inspect` exits 0 only if present.
 # Build context is repo root (not SCRIPT_DIR) so the Dockerfile can COPY
 # firewall/init-firewall.sh into the image.
@@ -65,7 +83,10 @@ fi
 env_args=()
 while IFS='=' read -r k _; do
     case "$k" in
-        PROXY_*|HARNESS_*|PYTHONPATH|HARBOR_*) env_args+=("--env" "$k") ;;
+        # HF_* lets prefetch.sh / the sealed runners toggle huggingface
+        # offline mode (HF_HUB_OFFLINE / HF_DATASETS_OFFLINE) so the HF
+        # dataset client uses the cache instead of attempting egress.
+        PROXY_*|HARNESS_*|PYTHONPATH|HARBOR_*|HF_*) env_args+=("--env" "$k") ;;
     esac
 done < <(env)
 
@@ -79,6 +100,10 @@ harness_docker_exec run --rm "${tty_args[@]}" \
     -v "$(harness_docker_path "${REPO_ROOT}")":"${REPO_ROOT}" \
     -v "$(harness_docker_path "${PWD}")":"${PWD}" \
     -v "$(harness_docker_path "${ALLOWLIST_PATH}")":/etc/harness/allowlist:ro \
+    -v "$(harness_docker_path "${CACHE_DIR}")":/harbor-cache \
+    --env HOME=/harbor-cache \
+    --env XDG_CACHE_HOME=/harbor-cache/.cache \
+    --env HF_HOME=/harbor-cache/huggingface \
     -w "${PWD}" \
     "${env_args[@]}" \
     "${IMAGE_TAG}" "$@"

@@ -1,0 +1,8 @@
+{
+  "name": "hybrid",
+  "description": "Full tool definitions folded into the stable prefix (system→user message at index 0), plus a short recency reminder on the last user message restating the JSON envelope and each tool's parameter signature. Three content categories are delimited so the model can address each by name. Lighter recency profile than user_front; the A/B candidate against it. See architecture/proxy.md for the proxy-side details.",
+  "env": {
+    "HARNESS_PROXY_SCHEME": "hybrid",
+    "PROXY_PROMPT_MODE": "hybrid"
+  }
+}

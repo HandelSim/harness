@@ -1,0 +1,8 @@
+{
+  "name": "user_front",
+  "description": "Production prompt-injection scheme: full cooperative scaffolding on the last user message, the request placed BEFORE the tool list. This is the prod baseline captured at HEAD — the scheme other schemes are compared against. See architecture/proxy.md for the proxy-side details.",
+  "env": {
+    "HARNESS_PROXY_SCHEME": "user_front",
+    "PROXY_PROMPT_MODE": "user_front"
+  }
+}

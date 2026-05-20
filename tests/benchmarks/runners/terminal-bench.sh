@@ -9,7 +9,7 @@
 # Always run smoketest first unless --no-smoketest is set.
 #
 # Usage:
-#   ./terminal-bench.sh --agent claude --scheme current
+#   ./terminal-bench.sh --agent claude --scheme user_front
 #   ./terminal-bench.sh --no-smoketest
 #   ./terminal-bench.sh --task-ids hello-world,fix-bug-123
 #   ./terminal-bench.sh --n-concurrent 4
@@ -29,7 +29,7 @@ bench_check_disk "${BENCH_ROOT}/runs" || true
 AGENT="claude"
 TASK_IDS=""
 N_CONCURRENT=""
-SCHEME="current"
+SCHEME="user_front"
 RUN_SMOKETEST=1
 while (( $# > 0 )); do
     case "$1" in
@@ -83,6 +83,13 @@ mkdir -p "${RUN_DIR}"
 
 echo "[terminal-bench] agent=${AGENT} scheme=${SCHEME} concurrency=${CONC}" >&2
 echo "[terminal-bench] output dir: ${RUN_DIR}" >&2
+
+# Sealed run: harbor's backend is NOT on the allowlist, so the dataset must
+# already be cached — run tests/benchmarks/runners/prefetch.sh first. Tell the
+# huggingface client to use the cache rather than attempt egress the firewall
+# would reject anyway.
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
 
 HARBOR_ARGS=(
     run
