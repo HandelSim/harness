@@ -3,12 +3,12 @@
 # compare-schemes.sh — run the same benchmark under multiple schemes
 # back-to-back, then write a small comparison summary.
 #
-# Default: user_front vs. passthrough on the smoketest target, claude agent.
-# Pick a heavier target with --target terminal-bench|swe-bench-lite.
+# Default: user_front, hybrid, passthrough on the smoketest target,
+# claude agent.
 #
 # Usage:
 #   ./compare-schemes.sh
-#   ./compare-schemes.sh --schemes user_front,passthrough --agent claude
+#   ./compare-schemes.sh --schemes user_front,hybrid --agent claude
 #   ./compare-schemes.sh --target terminal-bench
 
 set -euo pipefail
@@ -22,7 +22,7 @@ bench_check_binfmt || true
 bench_check_docker_socket || true
 bench_check_disk "${BENCH_ROOT}/runs" || true
 
-SCHEMES="user_front,passthrough"
+SCHEMES="user_front,hybrid,passthrough"
 AGENT="claude"
 TARGET="smoketest"   # smoketest | terminal-bench | swe-bench-lite
 N_CONCURRENT=""
@@ -64,10 +64,9 @@ for scheme in "${SCHEME_LIST[@]}"; do
     echo "[compare-schemes] >>> running scheme=${scheme} agent=${AGENT}" \
          "target=${TARGET}" >&2
     runner_args=(--agent "${AGENT}" --scheme "${scheme}")
-    # Only terminal-bench.sh / swe-bench-lite.sh accept --no-smoketest;
-    # smoketest.sh has no such flag and would exit 2. Each scheme run is
-    # already its own invocation here, so suppress the redundant pre-run
-    # smoketest only for the targets that support the flag.
+    # Only the full-scale runners accept --no-smoketest; smoketest.sh does
+    # not. Suppress the redundant per-scheme smoketest pre-run only when the
+    # target IS one of those runners.
     [[ "${TARGET}" != "smoketest" ]] && runner_args+=(--no-smoketest)
     [[ -n "${TASK_IDS}" ]] && runner_args+=(--task-ids "${TASK_IDS}")
     [[ -n "${N_CONCURRENT}" ]] && runner_args+=(--n-concurrent "${N_CONCURRENT}")
@@ -81,5 +80,5 @@ for scheme in "${SCHEME_LIST[@]}"; do
 done
 
 echo "[compare-schemes] done. Per-scheme logs in: ${COMPARE_DIR}" >&2
-echo "[compare-schemes] Next: diff the per-scheme harbor result JSON under" \
-     "each ${COMPARE_DIR}/<scheme>.log run dir to compare pass rates." >&2
+echo "[compare-schemes] Compare the per-scheme harbor result JSON under" \
+     "each scheme's run dir in ${BENCH_ROOT}/runs/ to read pass rates." >&2

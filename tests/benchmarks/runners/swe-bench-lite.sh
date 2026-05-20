@@ -80,6 +80,13 @@ echo "[swe-bench-lite] agent=${AGENT} scheme=${SCHEME}" \
      "concurrency=${CONC}" >&2
 echo "[swe-bench-lite] output dir: ${RUN_DIR}" >&2
 
+# Sealed run: harbor's backend is NOT on the allowlist, so the dataset must
+# already be cached — run tests/benchmarks/runners/prefetch.sh first. Tell the
+# huggingface client to use the cache rather than attempt egress the firewall
+# would reject anyway.
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
 HARBOR_ARGS=(
     run
     --jobs-dir "${RUN_DIR}"

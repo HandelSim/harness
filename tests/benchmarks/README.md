@@ -76,38 +76,63 @@ The only outbound the user's upstream LLM responses can travel through
 is proxy -> firewall -> upstream LLM API, and that path never crosses
 harbor's network namespace.
 
-### When you DO want harbor to fetch a dataset
+### When you DO want harbor to fetch a dataset: prefetch, then run sealed
 
 The shipped `smoketest.sh` uses a vendored local task
 (`tests/benchmarks/tasks/hello-harness/`) so it works fully offline
-w.r.t. harbor's backend — no allowlist edits required.
+w.r.t. harbor's backend — no allowlist edits required, no prefetch.
 
 The full-scale runners (`terminal-bench.sh`, `swe-bench-lite.sh`) pass
 `--dataset <org>/<name>` to harbor, which has to resolve the name
-against harbor's hosted registry. To make this work without weakening
-the production-run posture, do a one-time prefetch with the registry
-hosts temporarily allowlisted, then remove them before running the real
-benchmark:
+against harbor's hosted registry (and, for HF-backed datasets, against
+huggingface.co). The download and the benchmark are split into two
+phases so harbor's backend is reachable ONLY while downloading — never
+while the agent is running and the upstream LLM is replying:
 
 ```bash
-# 1) Add harbor's backend hosts to .harness-allowlist (one-time).
-echo 'harborframework.com'      >> .harness-allowlist
-echo 'cdn.harborframework.com'  >> .harness-allowlist
-# (plus the Supabase project host the harbor version uses; check the
-# error from a first attempt to see which exact host gets queried.)
+# 1) Prefetch (the ONLY phase where harbor's backend is reachable). Runs
+#    behind the same firewall, but against a throwaway allowlist that adds
+#    harbor's backend + huggingface hosts. Downloads into the persistent
+#    cache. Runs NO agent task and sends NO upstream LLM traffic.
+harness benchmark prefetch                 # all real datasets
+# or: ./tests/benchmarks/runners/prefetch.sh --target terminal-bench
 
-# 2) Run the full benchmark — harbor downloads + caches the dataset.
-./tests/benchmarks/runners/terminal-bench.sh
-
-# 3) Remove the entries from .harness-allowlist before the next run if
-#    you want harbor fully sealed off again. Cached datasets stay on
-#    disk; subsequent runs reuse the cache and don't re-query the
-#    registry.
+# 2) Run the real benchmark SEALED. The backend is NOT on .harness-allowlist,
+#    so the firewall has no route back to it; harbor reuses the cache.
+harness benchmark terminal-bench
 ```
 
-This preserves the "no harbor phone-home during benchmarking" property:
-at the moment the agent is running and the upstream LLM is replying, the
-firewall actively rejects any harbor outbound that isn't on the list.
+Why this is verifiable rather than just documented:
+
+- **The seal is the firewall, not harbor's good behavior.** During the
+  sealed run the harbor container's OUTPUT chain default-DROPs and only the
+  `.harness-allowlist` IPs are reachable. harbor's backend is not among
+  them, so any phone-home attempt gets `icmp-admin-prohibited` — it fails
+  closed. If the cache is insufficient the run fails loudly instead of
+  silently leaking.
+- **The cache survives the container.** `harbor.sh` bind-mounts a host
+  cache dir at `/harbor-cache` and points `HOME` / `XDG_CACHE_HOME` /
+  `HF_HOME` there, so whatever harbor or the huggingface client caches
+  persists across the `--rm` between the prefetch and the sealed run.
+  Override the host path with `HARNESS_BENCH_CACHE_DIR`.
+- **The backend is opened only on explicit request.** Nothing opens
+  harbor's backend implicitly — not `terminal-bench`, not `swe-bench-lite`,
+  not `harness benchmark all`. Only an explicit `prefetch` does, and only
+  for its own throwaway allowlist file.
+
+The exact Supabase project host harbor queries can vary by harbor version.
+If a prefetch is blocked reaching a host you don't recognise, add it to
+`HARNESS_BENCH_PREFETCH_HOSTS` (space/comma-separated) and re-run; the
+first blocked-host error names the host. The default set is
+`harborframework.com cdn.harborframework.com huggingface.co
+cdn-lfs.huggingface.co datasets-server.huggingface.co`.
+
+> Harbor-internals caveat: `prefetch.sh` asks harbor to enumerate the
+> dataset (forcing the download) via a zero-match `-i` task filter, which
+> warms the cache without running an agent. If your harbor build only
+> downloads when a task actually runs, override the whole harbor command
+> with `HARNESS_BENCH_PREFETCH_HARBOR_ARGS` (the literal `{dataset}` token
+> is substituted with the dataset id).
 
 ---
 
@@ -283,15 +308,19 @@ tests/benchmarks/
       harness_opencode_agent.py
   schemes/
     user_front.json                     # prod baseline (PROXY_PROMPT_MODE=user_front)
-    hybrid.json                         # A/B variant (PROXY_PROMPT_MODE=hybrid)
+    hybrid.json                         # A/B candidate (PROXY_PROMPT_MODE=hybrid)
     passthrough.json                    # control (PROXY_PROMPT_MODE=passthrough — no mediation)
   runners/
     _lib.sh                             # bench_guard_ci, bench_check_arch, ...
     smoketest.sh
+    prefetch.sh                         # download datasets before a sealed run
     terminal-bench.sh
     swe-bench-lite.sh
     compare-schemes.sh
   runs/                                 # gitignored
+    .gitkeep
+    .gitignore
+  cache/                                # gitignored; persistent harbor/HF cache
     .gitkeep
     .gitignore
   README.md                             # this file
@@ -322,7 +351,8 @@ tests/benchmarks/
    `proxy/proxy.py` does not yet accept, file a proxy change first.
    Without it, the proxy's startup validator falls back to `user_front`
    and the scheme silently becomes a duplicate of `user_front`. The
-   currently-accepted modes are listed in `architecture/proxy.md`.
+   currently-accepted modes (`user_front`, `hybrid`, `passthrough`) are
+   listed in `architecture/proxy.md`.
 
 ---
 
@@ -347,9 +377,13 @@ benchmarks Harbor knows about are listed at
 
 | Scheme       | `PROXY_PROMPT_MODE` | Purpose |
 | ------------ | ------------------- | ------- |
-| `user_front` | `user_front`        | Production baseline captured at HEAD: full scaffolding on the last user message, request before the tool list. The baseline most A/B runs compare against. |
-| `hybrid`     | `hybrid`            | Variant: full tool definitions on the stable prefix (system→user index 0) plus a short per-turn recency reminder (JSON envelope + per-tool signatures) on the last user message. A/B against `user_front` to measure stable-prefix vs. front-loaded scaffolding. |
+| `user_front` | `user_front`        | Production baseline captured at HEAD. Full scaffolding on the last user message, request placed before the tool list. The scheme other schemes are compared against. |
+| `hybrid`     | `hybrid`            | A/B candidate against `user_front`. Tool definitions on the stable prefix plus a per-turn recency reminder; lighter recency profile. See `architecture/proxy.md`. |
 | `passthrough`| `passthrough`       | Control. Skips every harness-side mediation: no cooperative-prompt injection, no system→user rewrite, no history translation. `tools` are forwarded to upstream verbatim. Isolates the harness contribution from upstream model capability. |
+
+These three are exactly the proxy's currently-honored `PROXY_PROMPT_MODE`
+values — one scheme per mode. Any other mode name falls back to
+`user_front` (see `architecture/proxy.md`).
 
 The passthrough caveat to be aware of: ollama-format tool schemas typically
 aren't honored by non-ollama upstreams. Most A/B runs using passthrough
