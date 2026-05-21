@@ -104,6 +104,27 @@ After the drop, still in the entrypoint:
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.
 
+### Headless `-p` output recovery
+
+`run_opencode`'s `HARNESS_PRINT_MODE` branch (`harness -p` / `harness
+opencode -p`) does NOT just `exec opencode run`. Since opencode 1.14.42 the
+`run` renderer only writes the assistant body to a **non-TTY** stdout if the
+text part's update event is processed before the session goes idle; for
+fast/short replies (mock upstream, cached models) the idle event wins that
+race and the body is silently dropped — the regression that forced the 1.15.7
+rollback in issue #86. `--format json` does not avoid it either.
+
+The body is always **persisted** to the session regardless of the race, so the
+branch instead: runs `opencode run --format json` (stdout captured to a temp
+file), reads the session id from the `step_start` event, then prints the final
+assistant text from `opencode export <session>` (parsed with `jq` from
+`{messages:[{info.role, parts:[{type:"text", text}]}]}`). A fallback extracts
+text parts from the json stream if `export` yields nothing. The run's exit code
+is preserved so the tests' provider-auth skip path keeps working. This trades
+live streaming (irrelevant for single-shot `-p`) for a deterministic final
+answer. The opencode-version coupling and the bump checklist live in the
+`OPENCODE_VERSION` note in `agents/Dockerfile`.
+
 ### Why a single image for both modes
 
 UID remap, firewall, gosu drop, skel-seed, and git config are identical

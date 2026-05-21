@@ -245,7 +245,39 @@ run_opencode() {
             fi
             op_args+=("$arg")
         done
-        exec opencode run "${args[@]}" "${op_args[@]}"
+
+        # opencode 1.15.x's `run` renderer drops the assistant body on a
+        # non-TTY stdout when the reply finalizes before the session goes idle
+        # (fast/short responses lose that race — see the note in Dockerfile and
+        # architecture/containers.md). `--format json` doesn't dodge it either.
+        # So we don't trust run's stdout for headless `-p`: capture the json
+        # event stream to learn the session id, then print the final assistant
+        # text from the persisted session via `opencode export`, which is
+        # independent of the render race. stderr flows through so opencode's
+        # own diagnostics (e.g. provider-auth errors the tests skip on) stay
+        # visible, and the run's exit code is preserved.
+        local events_file rc sid text
+        events_file="$(mktemp)"
+        # `|| rc=$?` keeps set -e from aborting on a non-zero opencode exit and
+        # preserves the code so the tests' provider-auth skip path still works.
+        rc=0
+        opencode run --format json "${args[@]}" "${op_args[@]}" >"${events_file}" || rc=$?
+        sid="$(jq -rs 'map(select(.sessionID))[0].sessionID // empty' "${events_file}" 2>/dev/null || true)"
+        text=""
+        if [[ -n "${sid}" ]]; then
+            text="$(opencode export "${sid}" 2>/dev/null \
+                | jq -r '([.messages[] | select(.info.role=="assistant")] | last | (.parts[]? | select(.type=="text") | .text)) // empty' 2>/dev/null || true)"
+        fi
+        # Fallback: if export yielded nothing (e.g. its schema drifted) but the
+        # render race was won, the json stream itself carries the text parts.
+        if [[ -z "${text}" ]]; then
+            text="$(jq -rs '[.[] | select(.type=="text") | .part.text] | join("")' "${events_file}" 2>/dev/null || true)"
+        fi
+        if [[ -n "${text}" ]]; then
+            printf '%s\n' "${text}"
+        fi
+        rm -f "${events_file}"
+        exit "${rc}"
     fi
 
     # Always foreground exec — no tmux. The container's PID 1 becomes opencode
