@@ -78,6 +78,8 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F053 | `harness opencode -p "<prompt>"` runs opencode in print mode |
 | F054 | `agent_container_name` produces a unique per-launch container name (`harness-<tool>-<rand>`), not derived from the directory |
 | F055 | Two launches of the same tool from the same directory produce distinct container names (concurrent same-dir agents don't collide) |
+| F143 | Interactive agent launch (`run_agent_interactive`, `cmd_shell`) runs docker as a child (not exec), prints the GitHub-issues footer to stderr after the session exits, and propagates the container's exit code |
+| F144 | `-p`/print mode (`run_agent_print`) does NOT print the issues footer (kept clean for scripts/pipes) |
 | F056 | `harness list` lists currently running harness containers for this install root |
 | F057 | `harness stop` stops the agent container without affecting `ollama`/`proxy` |
 | F058 | `harness stop <name>` stops the named agent container |

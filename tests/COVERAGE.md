@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 382 IDs (F=144, P=56, A=22, M=23, N=30, U=29, Pe=17, O=16, I=45).
+Inventory total: 384 IDs (F=146, P=56, A=22, M=23, N=30, U=29, Pe=17, O=16, I=45).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -61,16 +61,16 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   250 |   65.4% |
+| green    |   252 |   65.6% |
 | yellow   |     5 |    1.3% |
-| red      |   127 |   33.2% |
-| **total**|   382 |  100.0% |
+| red      |   127 |   33.1% |
+| **total**|   384 |  100.0% |
 
 Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
-| F      |   144 |   102 |      2 |  40 |
+| F      |   146 |   104 |      2 |  40 |
 | P      |    56 |    42 |      1 |  13 |
 | A      |    22 |    10 |      0 |  12 |
 | M      |    23 |    18 |      0 |   5 |
@@ -175,7 +175,9 @@ non-green rows — the gap.
 | F052 | red    | —                                           | —                                                                                                     | No test exercises the `--print` long form. |
 | F053 | green  | tests/full_pipeline_test.sh:391-417         | T10 invokes `harness opencode -p`. | |
 | F054 | green  | tests/harness_test.sh:T29                    | T29 asserts two `agent_container_name opencode` calls return different `harness-opencode-*` names (per-launch uniqueness; inverts the old determinism premise, #76). | |
-| F055 | green  | tests/harness_test.sh:T29                    | T29 launches `run_agent_interactive` twice for the same tool+dir and asserts both reach `docker exec` with distinct `--name` values (no refusal; #76). | |
+| F055 | green  | tests/harness_test.sh:T29                    | T29 launches `run_agent_interactive` twice for the same tool+dir (each in its own subshell, since the path now `exit`s) and asserts both reach `docker run` with distinct `--name` values (no refusal; #76). | |
+| F143 | green  | tests/harness_test.sh:T29                    | T29 part C drives `run_agent_interactive` with `harness_docker` stubbed to return 7; asserts the subshell exits 7 (exit-code propagation) and the `/issues` footer reached stderr (#81). | |
+| F144 | green  | tests/harness_test.sh:T29                    | T29 part D drives `run_agent_print` and asserts the `/issues` footer is absent from stderr (#81). | |
 | F056 | green  | tests/harness_test.sh:256-262               | T2: `[[ "${list_out}" != "no harness agents running" ]]` then fails; expectation is the LHS literal. Re-asserted in full_pipeline_test.sh:353,382. | |
 | F057 | red    | —                                           | —                                                                                                     | No test starts an agent then calls `harness stop` and verifies proxy/ollama remain. |
 | F058 | red    | —                                           | —                                                                                                     | No test invokes `harness stop <name>`. |

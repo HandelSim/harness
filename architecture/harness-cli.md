@@ -135,6 +135,22 @@ name needs no determinism — only uniqueness, to avoid Docker's unique-name
 collision. The `--print` path sets no name or labels and was already
 concurrent.
 
+### Post-run issue footer (interactive only)
+
+The interactive launch paths (`run_agent_interactive`, `cmd_shell`) run
+docker as a child rather than `exec`-ing it, so once the session exits
+they print `_print_agent_issue_footer` — the same "report a bug" line +
+`/issues` URL that `harness-install.sh` prints at the end of install — to
+**stderr**, then `exit` with the container's exit code. Reasons it lives
+*after* the run and on stderr: an interactive TUI takes the alt-screen, so
+anything printed before launch is wiped; stderr keeps it out of captured
+stdout. The `--print` (`-p`) path is left untouched — no footer — because
+headless single-shot is used in scripts and pipes where a per-call footer
+is noise. Because these paths now `exit` instead of `exec`, the top-level
+`EXIT` trap fires and reaps the jq sidecar; the explicit pre-run
+`_reap_jq_sidecar` call is therefore a harmless idempotent no-op the second
+time.
+
 ## Update-available banner
 
 `_update_check_and_banner` runs synchronously on every agent launch with

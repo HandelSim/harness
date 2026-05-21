@@ -1999,37 +1999,85 @@ if (( t29a_rc != 0 )); then
     exit 1
 fi
 
-t29_calls="${TEST_ROOT}/t29-exec-calls"
+t29_calls="${TEST_ROOT}/t29-run-calls"
 : > "${t29_calls}"
+# run_agent_interactive now runs docker as a child and `exit`s (so the issue
+# footer can print after — #81); each launch must therefore run in its own
+# subshell. Two same-dir launches must both reach docker run with distinct names.
 t29b_rc=0
-(
-    HARNESS_INSTALL_ROOT="${TEST_ROOT}" \
-    HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist" \
-    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
-    # Stubs: keep the launch path off any real daemon/state.
-    collect_agent_env() { :; }                       # emit no env lines
-    harness_docker_path() { printf '%s\n' "$1"; }    # passthrough host paths
-    _reap_jq_sidecar() { :; }
-    # The removed guard would `docker ps` then exit 1 on a name match; nothing
-    # in the launch path should touch harness_docker anymore.
-    harness_docker() { echo "UNEXPECTED_DOCKER_CALL: $*" >&2; return 0; }
-    harness_docker_exec() { printf '%s\n' "$*" >> "${t29_calls}"; }
-    run_agent_interactive opencode 0 0 /work/proj img /home/agent harness-net ""
-    run_agent_interactive opencode 0 0 /work/proj img /home/agent harness-net ""
-) || t29b_rc=$?
+for _ in 1 2; do
+    (
+        HARNESS_INSTALL_ROOT="${TEST_ROOT}" \
+        HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist" \
+        HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+        # Stubs: keep the launch path off any real daemon/state.
+        collect_agent_env() { :; }                       # emit no env lines
+        harness_docker_path() { printf '%s\n' "$1"; }    # passthrough host paths
+        _reap_jq_sidecar() { :; }
+        # The launch path runs docker as a child now (no exec); record the run
+        # args. Nothing should exec anymore.
+        harness_docker_exec() { echo "UNEXPECTED_EXEC_CALL: $*" >&2; return 0; }
+        harness_docker() { printf '%s\n' "$*" >> "${t29_calls}"; }
+        run_agent_interactive opencode 0 0 /work/proj img /home/agent harness-net ""
+    ) 2>/dev/null || t29b_rc=$?   # discard the post-run footer noise; the
+                                  # run-count check below catches any regression
+    (( t29b_rc != 0 )) && break
+done
 if (( t29b_rc != 0 )); then
     echo "[harness-test] T29 FAIL [#76]: run_agent_interactive errored on repeat same-dir launch (rc=${t29b_rc})" >&2
     cat "${t29_calls}" >&2; exit 1
 fi
-t29_execs=$(grep -c . "${t29_calls}" || true)
-if (( t29_execs != 2 )); then
-    echo "[harness-test] T29 FAIL [#76,F055]: expected 2 interactive launches to reach docker exec, got ${t29_execs}" >&2
+t29_runs=$(grep -c . "${t29_calls}" || true)
+if (( t29_runs != 2 )); then
+    echo "[harness-test] T29 FAIL [#76,F055]: expected 2 interactive launches to reach docker run, got ${t29_runs}" >&2
     cat "${t29_calls}" >&2; exit 1
 fi
 t29_names=$(grep -oE 'harness-opencode-[a-f0-9]+' "${t29_calls}" | sort -u | grep -c . || true)
 if (( t29_names != 2 )); then
     echo "[harness-test] T29 FAIL [#76,F055]: same-dir launches did not get distinct --name values" >&2
     cat "${t29_calls}" >&2; exit 1
+fi
+
+# Part C (#81): an interactive launch prints the issues footer to stderr after
+# the run, and propagates the container's exit code.
+t29c_err="${TEST_ROOT}/t29c-stderr"
+t29c_rc=0
+# `|| t29c_rc=$?` is required: under `set -e` an unguarded subshell that exits
+# non-zero aborts the whole script before $? can be captured.
+(
+    HARNESS_INSTALL_ROOT="${TEST_ROOT}" \
+    HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist" \
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null
+    collect_agent_env() { :; }
+    harness_docker_path() { printf '%s\n' "$1"; }
+    _reap_jq_sidecar() { :; }
+    harness_docker() { return 7; }   # simulate the container exiting non-zero
+    run_agent_interactive opencode 0 0 /work/proj img /home/agent harness-net ""
+) 2>"${t29c_err}" || t29c_rc=$?
+if (( t29c_rc != 7 )); then
+    echo "[harness-test] T29 FAIL [#81]: interactive launch did not propagate container exit code (want 7, got ${t29c_rc})" >&2
+    cat "${t29c_err}" >&2; exit 1
+fi
+if ! grep -q 'github.com/HandelSim/harness/issues' "${t29c_err}"; then
+    echo "[harness-test] T29 FAIL [#81]: issues footer not printed to stderr after interactive run" >&2
+    cat "${t29c_err}" >&2; exit 1
+fi
+
+# Part D (#81): -p / print mode must NOT emit the footer (scripted output).
+t29d_err="${TEST_ROOT}/t29d-stderr"
+(
+    HARNESS_INSTALL_ROOT="${TEST_ROOT}" \
+    HARNESS_ALLOWLIST_PATH="${TEST_ROOT}/.harness-allowlist" \
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null
+    collect_agent_env() { :; }
+    harness_docker_path() { printf '%s\n' "$1"; }
+    _reap_jq_sidecar() { :; }
+    harness_docker_exec() { return 0; }   # stubbed: don't actually exec
+    run_agent_print opencode 0 0 /work/proj img /home/agent harness-net "" -p "hi"
+) 2>"${t29d_err}" || true
+if grep -q 'github.com/HandelSim/harness/issues' "${t29d_err}"; then
+    echo "[harness-test] T29 FAIL [#81]: -p/print mode must not emit the issues footer" >&2
+    cat "${t29d_err}" >&2; exit 1
 fi
 echo "[harness-test] T29 OK"
 

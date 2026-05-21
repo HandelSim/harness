@@ -992,8 +992,7 @@ _probe_upstream_auth() {
                 echo "   $unlock_url" >&2
                 echo "" >&2
                 echo " You must be signed in to the provider's web console for" >&2
-                echo " the unlock to take effect. After unlocking, run:" >&2
-                echo "   harness start" >&2
+                echo " the unlock to take effect." >&2
                 echo "" >&2
                 echo " Full upstream response body:" >&2
                 printf '%s\n' "$body" | sed 's/^/   /' >&2
@@ -2145,6 +2144,18 @@ collect_agent_env() {
     printf '%s\0' "${out[@]}"
 }
 
+# Footer shown after an interactive agent session exits. Mirrors the
+# "report a bug" line harness-install.sh prints at the end of install.
+# Written to stderr (never stdout, so captured/piped output stays clean)
+# and only after the run — anything printed before the TUI launches is
+# wiped when opencode takes the alt-screen. Not emitted in -p/print mode,
+# which is for scripts and pipes.
+_print_agent_issue_footer() {
+    echo "" >&2
+    echo "Found a bug or have an improvement to suggest, however small?" >&2
+    echo "  https://github.com/HandelSim/harness/issues" >&2
+}
+
 run_agent_interactive() {
     local tool="$1" yolo="$2" net_open="$3" mount_path="$4" image="$5"
     local agent_home="$6" network="$7" mounts_blob="$8"
@@ -2239,10 +2250,14 @@ run_agent_interactive() {
         docker_args+=("${pass_args[@]}")
     fi
 
-    # exec replaces this process, so the EXIT trap never fires — reap the
-    # jq sidecar (run_agent read the net override through harness_jq) now.
+    # Run docker as a child (not exec) so the issue footer can print once the
+    # session exits. _reap_jq_sidecar runs here and again from the EXIT trap on
+    # `exit` below; it's idempotent, so the second call is a cheap no-op.
     _reap_jq_sidecar
-    harness_docker_exec "${docker_args[@]}"
+    local rc=0
+    harness_docker "${docker_args[@]}" || rc=$?
+    _print_agent_issue_footer
+    exit "$rc"
 }
 
 # Headless single-shot agent invocation. No tmux, no detach, no labels (so
@@ -2458,9 +2473,14 @@ cmd_shell() {
         "$image"
         shell
     )
-    # exec bypasses the EXIT trap — reap the jq sidecar before it.
+    # Run docker as a child (not exec) so the issue footer can print once the
+    # session exits. _reap_jq_sidecar runs here and again from the EXIT trap on
+    # `exit` below; it's idempotent, so the second call is a cheap no-op.
     _reap_jq_sidecar
-    harness_docker_exec "${shell_args[@]}"
+    local rc=0
+    harness_docker "${shell_args[@]}" || rc=$?
+    _print_agent_issue_footer
+    exit "$rc"
 }
 
 cmd_list() {
@@ -4676,9 +4696,11 @@ main() {
 # falls through to main "$@".
 #
 # The EXIT trap reaps this invocation's jq sidecar (if one was created).
-# It covers every non-exec command; the agent-launch / mcp-logs paths
-# `exec` the runtime and so never reach this trap — they call
-# _reap_jq_sidecar explicitly just before their `harness_docker_exec`.
+# It covers every non-exec command; the `exec` paths (run_agent_print,
+# mcp logs) never reach this trap, so they call _reap_jq_sidecar explicitly
+# just before their `harness_docker_exec`. The interactive agent-launch /
+# shell paths also reap explicitly but then run docker as a child and
+# `exit`, so this trap fires too — harmless, the reap is idempotent.
 # Set only for real execution: a sourced test shell must not reap on its
 # own subshell exit.
 if [[ -z "${HARNESS_SOURCE_ONLY:-}" ]]; then
