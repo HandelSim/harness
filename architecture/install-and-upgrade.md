@@ -130,6 +130,41 @@ Flags:
 - `--no-restart` — apply without down/start (e.g. for CI).
 - `--rebuild` — `compose build --no-cache`; slower.
 
+## `harness downgrade` — move back to the previous release tag
+
+`harness downgrade` rolls the clone back to the previous **release tag** and
+then re-runs the upgrade machinery so the running images match the older code.
+Release tags are deliberate releases on `main` (two-number scheme, e.g.
+`v0.1` / `v1.0`); `update`/`upgrade` still track the branch tip, not tags.
+
+Flow:
+
+1. `git fetch --tags`, then `_downgrade_target_tag` resolves the target
+   **topologically** via `git describe` (no version parsing, so two-number
+   tags work): HEAD exactly on a tag → the tag before it; HEAD past the latest
+   tag → the latest tag. No earlier tag → hard error.
+2. A loud confirm (defaults to **N**) states how many commits the
+   `git reset --hard` will discard. `.env`, `.harness-allowlist`, and `state/`
+   are gitignored, so only tracked code is rolled back — same guarantee as the
+   `upgrade` divergence reset.
+3. `git reset --hard <target>` on the **current branch** (not a detached tag
+   checkout). Staying on the branch is the whole point: the branch is now
+   strictly behind upstream, so a later `update`/`upgrade` fast-forwards back
+   to the tip with no detached-HEAD special-casing.
+4. **Re-exec the downgraded `harness upgrade --resume-after-pull`** so the
+   config merge + image rebuild + restart run from the *older* code (and any
+   config var removed since the target release is merged back in).
+   `--resume-after-pull` skips the git pull (downgrade already moved HEAD).
+   This reuses the same re-exec hand-off and cross-version `--resume-after-pull`
+   contract as `harness upgrade` (above); gated on `bash -n` of the downgraded
+   script, falling back to an in-process orchestration if it fails the check.
+
+Flags mirror `upgrade`: `--no-prompt` (skip the confirm — required for a
+non-interactive run), `--no-restart` (pure git reset, no rebuild; the only
+path that doesn't require docker), `--rebuild` (`--no-cache`). Because the
+branch is intentionally left behind the tip, the `main` update banner will
+report "update available" after a downgrade — expected, not a bug.
+
 ## Agent-launch config merge
 
 `run_agent` (opencode) and `cmd_shell` call

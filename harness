@@ -135,7 +135,11 @@ done
 command -v harness_normalize_proxy_env >/dev/null 2>&1 && harness_normalize_proxy_env
 unset _harness_proxy_keys _k _sv
 
-agent_model="${OLLAMA_AGENT_MODEL:-harness}"
+# Default must match every other consumer of OLLAMA_AGENT_MODEL (compose,
+# ollama/entrypoint.sh, agents/entrypoint.sh all fall back to GenAI). When the
+# var is unset/blank, a divergent default here would point opencode at a model
+# name ollama never registered. See architecture/harness-cli.md (Env loading).
+agent_model="${OLLAMA_AGENT_MODEL:-GenAI}"
 
 # --- net helpers (lazy load) ------------------------------------------------
 #
@@ -1091,6 +1095,13 @@ commands:
                                --no-prompt (skip apply confirmation),
                                --no-restart (apply without build/down/start),
                                --rebuild (compose build --no-cache; slower)
+  downgrade [flags]     reset the clone to the previous release tag, then run
+                        the upgrade machinery (config merge + rebuild + restart)
+                        so images match the older code. Stays on the branch, so
+                        a later 'update'/'upgrade' returns you to the tip.
+                        flags: --no-prompt, --no-restart, --rebuild.
+                        WARNING: 'git reset --hard' discards commits after the
+                        target tag (gitignored .env/allowlist/state untouched).
   check-updates         synchronously check origin/main and report whether
                         this checkout is up to date or N commits behind.
                         Set HARNESS_SKIP_UPDATE_CHECK=1 to silence the
@@ -1637,6 +1648,150 @@ EOF
         # skip cmd_start's redundant --build pass.
         HARNESS_NO_BUILD=1 cmd_start
     fi
+}
+
+# Resolve the release tag that `harness downgrade` should move the clone to.
+# Topological, not version-parsing (`git describe`), so any tag scheme works,
+# including the two-number scheme (v0.1 / v1.0):
+#   - HEAD sits exactly on a tag  -> the tag immediately before it in history
+#   - HEAD is past the latest tag -> the most recent tag reachable from HEAD
+# Echoes the target tag and returns 0; returns 1 with no output when there is
+# no earlier release tag to land on. Reads local tags only — callers fetch
+# first so newly-pushed tags are visible.
+_downgrade_target_tag() {
+    local exact target
+    exact=$(git -C "$clone_dir" describe --tags --exact-match HEAD 2>/dev/null || true)
+    if [[ -n "$exact" ]]; then
+        target=$(git -C "$clone_dir" describe --tags --abbrev=0 "${exact}^" 2>/dev/null || true)
+    else
+        target=$(git -C "$clone_dir" describe --tags --abbrev=0 HEAD 2>/dev/null || true)
+    fi
+    [[ -n "$target" ]] || return 1
+    printf '%s\n' "$target"
+}
+
+cmd_downgrade() {
+    # Move the clone's CURRENT branch back to the previous release tag with
+    # `git reset --hard`, then re-run the upgrade machinery (config merge +
+    # rebuild + restart) so the running images match the older code. Staying on
+    # the branch (rather than a detached tag checkout) is deliberate: a later
+    # `harness update`/`upgrade` fast-forwards the user back to the tip with no
+    # special detached-HEAD handling.
+    local no_prompt=0 no_restart=0 rebuild=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --no-prompt) no_prompt=1 ;;
+            --no-restart) no_restart=1 ;;
+            --rebuild) rebuild=1 ;;
+            -h|--help)
+                cat <<'EOF'
+harness downgrade — reset the clone to the previous release tag, then run the
+                    upgrade machinery so the images match the older code.
+
+usage:
+  harness downgrade [--no-prompt] [--no-restart] [--rebuild]
+
+Moves the clone's CURRENT branch back to the previous release tag with
+'git reset --hard', staying on the branch so a later 'harness update' /
+'harness upgrade' fast-forwards you back to the tip. The first downgrade from
+the tip lands on the latest release tag; a second steps to the one before it.
+Tags are resolved topologically (git describe), so any scheme works, including
+two-number tags like v0.1 / v1.0.
+
+After the reset it re-execs the downgraded 'harness upgrade
+--resume-after-pull', so the same config merge + image rebuild + restart that
+'upgrade' runs are applied from the older code (config vars removed since the
+target release are merged back in).
+
+WARNING: 'git reset --hard' DISCARDS commits and uncommitted changes to
+tracked files between the target tag and HEAD. .env, .harness-allowlist and
+state/ are gitignored and are NOT touched. The confirm prompt shows how many
+commits will be dropped and defaults to N; --no-prompt skips it (automation).
+
+flags:
+  --no-prompt   skip the confirmation prompt (CI / automation).
+  --no-restart  reset only; skip the config merge + rebuild + restart.
+  --rebuild     force a clean rebuild (compose build --no-cache).
+EOF
+                return 0
+                ;;
+            *)
+                err "harness downgrade: unknown flag '$1'"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    # The reset itself is pure git; only the rebuild/restart needs docker, so
+    # fail fast on a missing daemon BEFORE the destructive reset (but allow a
+    # code-only --no-restart downgrade on a host without docker).
+    if (( ! no_restart )); then
+        require_docker
+    fi
+
+    git -C "$clone_dir" fetch --tags --quiet 2>/dev/null || true
+
+    local target
+    if ! target=$(_downgrade_target_tag); then
+        err "no earlier release tag to downgrade to."
+        err "downgrade moves the clone to the previous release tag; none was found in this checkout's history."
+        return 1
+    fi
+
+    local current drop
+    current=$(git -C "$clone_dir" rev-parse --short HEAD 2>/dev/null) || current="?"
+    drop=$(git -C "$clone_dir" rev-list --count "${target}..HEAD" 2>/dev/null) || drop="?"
+
+    echo "harness: downgrade target is ${target} (current HEAD ${current})."
+    echo "harness: this resets --hard to ${target}, discarding ${drop} commit(s) and any uncommitted changes to tracked files."
+    echo "harness: .env, .harness-allowlist and state/ are gitignored and will NOT be touched."
+
+    if (( ! no_prompt )); then
+        # HARNESS_CONFIRM_FROM_STDIN=1 (test hook) reads the answer from FD 0;
+        # production has no terminal-less interactive path, so without it a
+        # missing TTY must refuse rather than hang on `read`.
+        if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" != "1" && ! -t 0 && ! -e /dev/tty ]]; then
+            err "non-interactive shell; pass --no-prompt to downgrade without confirmation"
+            exit 1
+        fi
+        if ! _upgrade_confirm "Reset --hard to ${target}? This DISCARDS ${drop} commit(s) and uncommitted changes to tracked files. [y/N] " n; then
+            err "downgrade declined; nothing changed."
+            return 1
+        fi
+    fi
+
+    if ! git -C "$clone_dir" reset --hard "$target"; then
+        err "git reset --hard ${target} failed; aborting downgrade."
+        return 1
+    fi
+    echo "harness: reset to ${target} complete."
+
+    if (( no_restart )); then
+        echo "harness: --no-restart given; skipping config merge + rebuild + restart."
+        echo "harness: run 'harness upgrade --resume-after-pull' to bring images in line with ${target}."
+        return 0
+    fi
+
+    # Re-exec the DOWNGRADED harness's upgrade orchestration so the config
+    # merge + image rebuild + restart run from the older code we just reset to,
+    # not from this still-in-memory newer process. --resume-after-pull skips
+    # the git pull (we moved HEAD ourselves). This mirrors cmd_upgrade's own
+    # post-pull re-exec and relies on the same cross-version contract that
+    # keeps --resume-after-pull a valid flag (see install-and-upgrade.md). Gate
+    # on `bash -n` so a syntax-broken older harness doesn't strand us; fall
+    # back to running the orchestration in-process.
+    local new_harness="$clone_dir/harness"
+    local upgrade_args=(upgrade --resume-after-pull)
+    (( no_prompt )) && upgrade_args+=(--no-prompt)
+    (( rebuild )) && upgrade_args+=(--rebuild)
+    if [[ -f "$new_harness" ]] && bash -n "$new_harness" 2>/dev/null; then
+        echo "harness: re-executing into ${target} harness for config merge + rebuild + restart..."
+        _reap_jq_sidecar 2>/dev/null || true
+        exec "$new_harness" "${upgrade_args[@]}"
+    fi
+    err "warning: downgraded harness failed syntax check; running upgrade orchestration from the current process instead"
+    cmd_upgrade "${upgrade_args[@]}"
 }
 
 # Echo (newline-delimited) the IDs of manifest actions that actually have
@@ -4664,6 +4819,7 @@ main() {
         restart)                    cmd_restart ;;
         update)                     cmd_update ;;
         upgrade)                    cmd_upgrade "$@" ;;
+        downgrade)                  cmd_downgrade "$@" ;;
         check-updates)              cmd_check_updates "$@" ;;
         logs)                       cmd_logs "$@" ;;
         opencode)                   run_agent opencode "$@" ;;

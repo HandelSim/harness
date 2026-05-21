@@ -149,7 +149,7 @@ ensure_opencode_config() {
       },
       "models": {
         "${model_name}": {
-          "name": "Harness Proxy",
+          "name": "${model_name}",
           "limit": {
             "context": 200000,
             "output": 8192
