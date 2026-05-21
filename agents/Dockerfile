@@ -57,31 +57,33 @@ ENV LC_ALL=C.UTF-8
 
 # Agent CLI at a pinned version. Bumping requires editing this file.
 #
-# OPENCODE_VERSION floor: must stay <= 1.14.41 until upstream restores headless
-# stdout. opencode 1.14.42 added an "interactive split-footer mode for
-# `opencode run`" that suppresses the formatted-default response body when
-# stdout is NOT a TTY — `opencode run "say hello"` then exits 0 with only
-# "> build · <project>" printed, no assistant content, breaking `harness -p`
-# and `harness opencode -p` (full_pipeline_test.sh T9/T10, integration_test.sh
-# smoke). The regression is present in every 1.14.42..1.14.51 and 1.15.x
-# release tested.
+# Headless-stdout caveat (handled in entrypoint.sh, not by pinning): since
+# 1.14.42, `opencode run`'s renderer only writes the assistant body to a
+# non-TTY stdout if the text part's `message.part.updated` event (carrying
+# `time.end`) is processed before the session goes idle. For fast/short
+# replies — the mock upstream, cached models — the idle event wins that race
+# and the body is dropped (`opencode run "say hello"` exits 0 with no
+# assistant content). This previously broke `harness -p` / `harness opencode
+# -p` (full_pipeline_test.sh T9/T10, integration_test.sh smoke) and forced a
+# rollback at 1.15.7 (issue #86). `--format json` does NOT dodge the race
+# (verified on 1.15.7: only `step_start` is emitted). The headless `-p` path
+# in agents/entrypoint.sh therefore recovers the final assistant text from the
+# persisted session via `opencode export <session>`, which is independent of
+# the render race — see architecture/containers.md.
 #
-# 1.15.7 was tried (2026-05-21, issue #83/#86) on the theory that the
-# split-footer was made opt-in via `opencode run -i/--interactive`. It is NOT
-# fixed: 1.15.7 still suppresses the body on a non-TTY `opencode run` (verified
-# against a streaming OpenAI endpoint — 1.14.41 prints the body, 1.15.7 prints
-# nothing), and CI on dev@47b60a6 failed at T9 with "> build · harness" and no
-# "Hello from mock upstream". Do NOT bump again without confirming
-# `opencode run "say hello" </dev/null | grep -q <expected>` on a non-TTY
-# stdout against the bumped binary first.
-#
-# When bumping does become possible, also re-verify the proxy pares the `task`
-# tool description by anchoring on opencode's "Available agent types and the
-# tools they have access to:" header (proxy/proxy.py
-# `_OPENCODE_TASK_AGENTS_HEADER`); keep that parse working.
-# proxy/test_proxy.py TestTaskDescriptionParing is the canary — refresh its
-# fixture from the bumped binary and fix the header constant if it drifts.
-ARG OPENCODE_VERSION=1.14.41
+# When bumping, refresh the version below and re-verify two things against the
+# new binary:
+#   1. headless `-p` still round-trips — full_pipeline_test.sh T9/T10 are the
+#      gate (they assert the mock reply reaches stdout). If opencode renames
+#      `opencode export` or changes its `{messages:[{info.role,parts:[{type,
+#      text}]}]}` shape, update the jq in entrypoint.sh's print-mode branch.
+#   2. the proxy still pares the `task` tool description by anchoring on
+#      opencode's "Available agent types and the tools they have access to:"
+#      header (proxy/proxy.py `_OPENCODE_TASK_AGENTS_HEADER`).
+#      proxy/test_proxy.py TestTaskDescriptionParing is the canary — refresh
+#      its fixture from the bumped binary and fix the header constant if it
+#      drifts.
+ARG OPENCODE_VERSION=1.15.7
 ARG OPENAI_COMPAT_VERSION=2.0.47
 
 RUN npm install -g \
