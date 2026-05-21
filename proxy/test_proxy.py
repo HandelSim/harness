@@ -680,7 +680,7 @@ class TestPromptInjectionModes(unittest.TestCase):
 
         last_user = result[-1]["content"]
         # The new reminder is present.
-        self.assertIn("Harness reminder", last_user)
+        self.assertIn("Reminder", last_user)
         # Lists the available tool signature (recency anchoring on the
         # parameter keys, not just the bare name).
         self.assertIn("Bash(command)", last_user)
@@ -696,7 +696,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         # The reminder sits OUTSIDE the USER_MESSAGE wrap — it's proxy
         # stage-direction, not part of what the user wrote.
         self.assertLess(
-            last_user.index("Harness reminder"),
+            last_user.index("Reminder"),
             last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
         )
         # The reminder must NOT contain the full tool schema or instructions
@@ -908,8 +908,8 @@ class TestPromptInjectionModes(unittest.TestCase):
         # <<<BEGIN_TOOL_RESULT>>> markers and the hybrid reminder prefix.
         self.assertEqual(out[-1]["role"], "user")
         c = out[-1]["content"]
-        # New reminder text ("Harness reminder" — not the old "Tool reminder").
-        self.assertIn("Harness reminder", c)
+        # New reminder text ("Reminder" — not the old "Tool reminder").
+        self.assertIn("Reminder", c)
         # The new "do not invent" sentence telling the model not to
         # fabricate tool results.
         self.assertIn("do not invent", c)
@@ -1193,7 +1193,7 @@ class TestHybridDetailTools(unittest.TestCase):
 
     def test_detail_block_sits_after_reminder_outside_user_message_wrap(self):
         last_user = self._translate([self.task_tool])[-1]["content"]
-        reminder_pos = last_user.index("Harness reminder")
+        reminder_pos = last_user.index("Reminder")
         detail_pos = last_user.index('<<<BEGIN_TOOL_DETAIL name="task">>>')
         user_wrap_pos = last_user.index("<<<BEGIN_USER_MESSAGE>>>")
         # Reminder, then the detail block, then the wrapped user message — the
@@ -1223,7 +1223,7 @@ class TestHybridDetailTools(unittest.TestCase):
         last_user = self._translate([self.task_tool], flagged=[])[-1]["content"]
         self.assertNotIn("<<<BEGIN_TOOL_DETAIL", last_user)
         # The rest of the reminder is unaffected.
-        self.assertIn("Harness reminder", last_user)
+        self.assertIn("Reminder", last_user)
         self.assertIn("task(description, prompt, subagent_type)", last_user)
 
     def test_detail_block_also_on_tool_result_turn(self):
@@ -1761,11 +1761,11 @@ class TestChangeSystemToUser(unittest.TestCase):
                 self.assertEqual(result[2]["role"], "user")
                 # The recency reminder lands on the live user turn, outside
                 # the USER_MESSAGE wrap.
-                self.assertIn("Harness reminder", result[2]["content"])
+                self.assertIn("Reminder", result[2]["content"])
                 self.assertIn("Hello", result[2]["content"])
                 self.assertIn("<<<BEGIN_USER_MESSAGE>>>", result[2]["content"])
                 self.assertLess(
-                    result[2]["content"].index("Harness reminder"),
+                    result[2]["content"].index("Reminder"),
                     result[2]["content"].index("<<<BEGIN_USER_MESSAGE>>>"),
                 )
 

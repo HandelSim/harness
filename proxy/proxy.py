@@ -461,7 +461,7 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         tools_clause = ""
     host_os_clause = f" (host OS: {_HOST_OS})" if _HOST_OS else ""
     reminder = (
-        "[Harness reminder — operating rules for this turn.\n"
+        "[Reminder — operating rules for this turn.\n"
         "- Tools: the only tools available are defined in the "
         "<<<BEGIN_AGENT_TOOLS>>> section at the start of this conversation — "
         "refer back there for full descriptions. Call a tool by emitting a "

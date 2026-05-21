@@ -12,7 +12,7 @@
 #                  then tool list, in last user message.
 #   hybrid       — full scaffolding at stable prefix (head of conversation
 #                  after the _CHANGE_SYSTEM_TO_USER post-pass) + a
-#                  "[Harness reminder — …]" prefix listing available tool
+#                  "[Reminder — …]" prefix listing available tool
 #                  names prepended to the last user message.
 #
 # Per-scheme fixture directories under tests/fixtures/responses/scheme-*/
@@ -292,7 +292,7 @@ print("OK request-before-tools")
         hybrid)
             # P017: full scaffolding at the stable prefix (head of
             # conversation after _CHANGE_SYSTEM_TO_USER) + a
-            # "[Harness reminder — …]"
+            # "[Reminder — …]"
             # prefix on the last user message that lists available tool
             # names and includes the "do not invent" sentence. The last
             # user message must contain the reminder AND the original
@@ -306,7 +306,7 @@ last = msgs[-1]
 if last["role"] != "user":
     print("LAST_NOT_USER:" + last["role"]); sys.exit(0)
 c = last["content"]
-if "Harness reminder" not in c:
+if "Reminder" not in c:
     print("NO_REMINDER_PREFIX"); sys.exit(0)
 if "do not invent" not in c:
     print("REMINDER_MISSING_DO_NOT_INVENT"); sys.exit(0)
@@ -321,7 +321,7 @@ if "scheme-probe-text" not in c:
 # hybrid, with the reminder OUTSIDE that wrap.
 if "<<<BEGIN_USER_MESSAGE>>>" not in c:
     print("NO_USER_MESSAGE_WRAP"); sys.exit(0)
-if c.index("Harness reminder") >= c.index("<<<BEGIN_USER_MESSAGE>>>"):
+if c.index("Reminder") >= c.index("<<<BEGIN_USER_MESSAGE>>>"):
     print("REMINDER_NOT_OUTSIDE_USER_MESSAGE"); sys.exit(0)
 # The full tool list / instructions header MUST NOT be on the last user
 # message — those go in the head (system) under hybrid. (The reminder
