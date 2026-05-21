@@ -84,7 +84,11 @@ compose` invocation. It:
    snippets discovered via `mcp_compose_files`.
 3. Exports `INSTALL_ROOT`, `HARNESS_ALLOWLIST_PATH`, `HARNESS_PROJECTS_ROOT`
    so MCP compose snippets can reference them with plain `${VAR}` (no
-   defaults).
+   defaults), plus `HARNESS_HOST_OS="$(harness_detect_os)"` so the proxy
+   service learns the host platform. The proxy injects it into the hybrid
+   recency reminder's Environment line (see `architecture/proxy.md` →
+   Host-OS injection); `docker-compose.yml` defaults it to `unknown` when
+   harness isn't the launcher.
 4. Invokes the detected container runtime (`docker` or `podman`, per
    `scripts/lib/platform.sh:harness_container_runtime`).
 

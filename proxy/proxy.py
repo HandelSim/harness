@@ -107,6 +107,15 @@ _OPENCODE_TASK_AGENTS_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 
+# Host OS family (linux/macos/windows), injected by the harness CLI via
+# HARNESS_HOST_OS (from harness_detect_os). The proxy always runs in a Linux
+# container; the host the user actually reproduces work on may differ. The
+# recency reminder surfaces this so the agent gives reproducible setup advice
+# (e.g. a project-local venv) instead of relying on the container's own
+# environment. Empty/unrecognised (including "unknown") suppresses only the
+# host-OS parenthetical — the rest of the Environment line is host-independent.
+_HOST_OS: str = ""
+
 
 # ---------------------------------------------------------------------------
 # OUTPUT_DIR handling
@@ -145,6 +154,19 @@ def _setup_hybrid_detail_tools() -> None:
     names = [n.strip() for n in raw.split(",") if n.strip()]
     _HYBRID_DETAIL_TOOLS = names
     print(f"[i] hybrid detail tools: {', '.join(names) or '(none)'}", flush=True)
+
+
+def _setup_host_os() -> None:
+    """Read HARNESS_HOST_OS (set by the harness CLI from harness_detect_os) into
+    the module global. Recognised values are linux/macos/windows; anything else
+    — unset, empty, or the literal "unknown" — becomes "" so the reminder omits
+    the host-OS parenthetical while still stating the container/reproducibility
+    facts. Host OS is fixed per install, so reading it once at startup is
+    correct; no per-request threading."""
+    global _HOST_OS
+    raw = os.environ.get("HARNESS_HOST_OS", "").strip().lower()
+    _HOST_OS = raw if raw in ("linux", "macos", "windows") else ""
+    print(f"[i] host OS: {_HOST_OS or '(unknown)'}", flush=True)
 
 
 def init_output_dir() -> Optional[str]:
@@ -379,11 +401,8 @@ def _format_tool_detail_blocks(tool_details):
         for name, desc in tool_details
     )
     framing = (
-        "[The full descriptions below are repeated for the tools most often "
-        "called with invalid arguments. Consult them for the exact set of "
-        "valid argument values (e.g. which agent types are valid for `task`, "
-        "which skills exist for `skill`). The authoritative copy lives in the "
-        "<<<BEGIN_AGENT_TOOLS>>> section.]"
+        "[Valid argument values for the tools below — authoritative copy in "
+        "<<<BEGIN_AGENT_TOOLS>>>.]"
     )
     return f"\n\n{framing}\n{blocks}"
 
@@ -392,58 +411,81 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). This reminder is prepended to the last user
-    message — recency slot — so the model is anchored to the JSON envelope
-    format AND given each tool's parameter signature. The signatures are
-    the recency anchor for the keys the model most often gets wrong
-    (e.g. opencode's `bash` requires `description`; `read` takes `filePath`
-    not `filename`). The "do not invent" sentence closes a common failure
-    mode where the model emits a JSON call and then narrates an imagined
-    output in the same turn. The "default to the tools above" sentence
-    nudges the model to reach for a dedicated tool rather than improvising
-    by hand (e.g. `webfetch` over a curl/Python script, `todowrite`/
-    `todoread` over a hand-written todo file).
+    message — recency slot — so the live turn is preceded by a compact,
+    scannable set of operating rules grouped under four labels:
+
+      - Tools    — the JSON envelope, the no-fabricated-results rule, and a
+                   pointer back to <<<BEGIN_AGENT_TOOLS>>> for full
+                   descriptions. The pointer is for *descriptions only*: the
+                   closed set of valid argument values (a `task`'s agent
+                   types, a `skill`'s names) now reaches recency in the
+                   TOOL_DETAIL blocks, so the old "constraints on parameter
+                   values" parenthetical here would be misleading and is gone.
+      - Workflow — prefer a listed tool over hand-work, keep a live plan with
+                   `todowrite`/`todoread`, and launch `task` agents (several
+                   concurrently when possible) to parallelize and conserve
+                   context. This is the general guidance that replaces the
+                   `task` boilerplate pared out of the recency TOOL_DETAIL.
+      - Honesty  — never fabricate; no invented names/paths/signatures/
+                   citations; "I don't know" / "I'll check" are valid.
+      - Environment — the proxy runs in a Linux container with the working
+                   directory mounted from the host (host OS injected via
+                   `_HOST_OS` when known), so reproducible setup must live in
+                   the working directory, not the container.
+
+    The per-tool signatures (`name(required, [optional])`) close the line:
+    they are the recency anchor for the parameter keys the model most often
+    gets wrong (e.g. opencode's `bash` requires `description`; `read` takes
+    `filePath` not `filename`).
 
     `tool_signatures` is a list of `(name, required_keys, optional_keys)`
     triples produced by `_extract_tool_signatures`.
 
     `tool_details` is an optional list of `(name, description)` pairs from
-    `_extract_tool_details` — the "detail tools" whose full description is
-    echoed verbatim after the reminder in <<<BEGIN_TOOL_DETAIL>>> blocks. The
-    signature line carries only parameter *keys*; a `task`'s valid agent types
-    and a `skill`'s valid names are a closed set of *values* that opencode
-    documents only in the description prose, so the whole description is what
-    must reach recency for those tools.
-
-    The reminder leads with a pointer back to the `<<<BEGIN_AGENT_TOOLS>>>`
-    section (the stable prefix where the full tool definitions live) so that
-    when attention to messages[0] dilutes on long conversations the model
-    still has a precise, named target to retrieve when it needs full tool
-    descriptions or parameter-value constraints.
+    `_extract_tool_details` — the "detail tools" whose description is echoed
+    after the reminder in <<<BEGIN_TOOL_DETAIL>>> blocks. The signature line
+    carries only parameter *keys*; a `task`'s valid agent types and a
+    `skill`'s valid names are a closed set of *values* opencode documents only
+    in the description prose, so the whole (pared) description must reach
+    recency for those tools.
     """
     if tool_signatures:
         rendered = ", ".join(
             _format_tool_signature(name, req, opt)
             for name, req, opt in tool_signatures
         )
-        tools_clause = f" Available tools: {rendered}. Use parameter keys exactly as listed."
+        tools_clause = (
+            f"\nAvailable tools: {rendered}. Use parameter keys exactly as listed."
+        )
     else:
         tools_clause = ""
+    host_os_clause = f" (host OS: {_HOST_OS})" if _HOST_OS else ""
     reminder = (
-        "[Reminder: The tools listed in the <<<BEGIN_AGENT_TOOLS>>> section "
-        "at the start of this conversation are the only tools available — "
-        "refer back to that section for full tool descriptions, parameter "
-        "details, and any constraints on parameter values (e.g. which agent "
-        "types are valid for a `task` tool, or which skills are listed for a "
-        "`skill` tool). To use a tool, emit a ```json block with "
-        "{\"name\": ..., \"arguments\": ...}. You may explain your "
-        "reasoning before or after the JSON block. After emitting a tool "
-        "call, do not invent or narrate the tool's result — the real "
-        "result will be provided in the next turn. If no tool is needed, "
-        "answer normally without any JSON. Default to the tools above for any "
-        "task they cover instead of doing the work by hand — e.g. use "
-        "`webfetch` to retrieve a URL instead of curl or a Python script, and "
-        "use `todowrite`/`todoread` to manage your task list instead of "
-        "writing a todo file."
+        "[Harness reminder — operating rules for this turn.\n"
+        "- Tools: the only tools available are defined in the "
+        "<<<BEGIN_AGENT_TOOLS>>> section at the start of this conversation — "
+        "refer back there for full descriptions. Call a tool by emitting a "
+        "```json block with {\"name\": ..., \"arguments\": ...}; you may "
+        "reason before or after it. After a tool call, do not invent or "
+        "narrate its result — the real result arrives next turn. If no tool "
+        "is needed, just answer.\n"
+        "- Workflow: prefer a listed tool over doing the work by hand (e.g. "
+        "use `webfetch` for a URL instead of curl or a script). Track your "
+        "work with `todowrite`/`todoread` to stay on plan. Launch `task` "
+        "agents — several concurrently when the work allows — to parallelize "
+        "and conserve your context.\n"
+        "- Honesty: never fabricate. Do not present guesses as facts — no "
+        "invented function names, file paths, signatures, config keys, or "
+        "citations. \"I don't know\" or \"I'd need to check X\" are valid "
+        "answers — then check.\n"
+        "- Environment: you run in a Linux container with the current working "
+        f"directory mounted from the host{host_os_clause}. Your work must "
+        "reproduce in the user's environment, not this container — anything "
+        "installed only here (e.g. a global/system venv) the user cannot run. "
+        "Put reproducible setup in the working directory (e.g. a project-local "
+        "venv + requirements.txt); a venv built here is Linux-native, so on a "
+        "non-Linux host the user may need to recreate it (python -m venv .venv "
+        "&& pip install -r requirements.txt)."
         f"{tools_clause}]"
     )
     detail_blocks = _format_tool_detail_blocks(tool_details)
@@ -1247,6 +1289,7 @@ def main() -> None:
     _setup_prompt_mode()
     _setup_change_system_to_user()
     _setup_hybrid_detail_tools()
+    _setup_host_os()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()
     if not raw_output:
@@ -1267,6 +1310,7 @@ def main() -> None:
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"
+        f"   host OS:        {_HOST_OS or '(unknown)'}\n"
         f"   debug dumps:    {output_status}\n"
         "============================================================",
         flush=True,

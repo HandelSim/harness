@@ -680,7 +680,7 @@ class TestPromptInjectionModes(unittest.TestCase):
 
         last_user = result[-1]["content"]
         # The new reminder is present.
-        self.assertIn("Reminder:", last_user)
+        self.assertIn("Harness reminder", last_user)
         # Lists the available tool signature (recency anchoring on the
         # parameter keys, not just the bare name).
         self.assertIn("Bash(command)", last_user)
@@ -696,7 +696,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         # The reminder sits OUTSIDE the USER_MESSAGE wrap — it's proxy
         # stage-direction, not part of what the user wrote.
         self.assertLess(
-            last_user.index("Reminder:"),
+            last_user.index("Harness reminder"),
             last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
         )
         # The reminder must NOT contain the full tool schema or instructions
@@ -706,11 +706,11 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertNotIn('"required"', last_user)
 
     def test_mode_hybrid_reminder_advises_default_to_tools(self):
-        """The reminder nudges the model to reach for a dedicated tool rather
-        than improvising by hand, with concrete examples."""
+        """The Workflow line nudges the model to reach for a dedicated tool
+        rather than improvising by hand, and to track work with todo tools."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        self.assertIn("Default to the tools above", last_user)
+        self.assertIn("prefer a listed tool over doing the work by hand", last_user)
         # Concrete examples the user asked for.
         self.assertIn("webfetch", last_user)
         self.assertIn("todowrite", last_user)
@@ -718,9 +718,63 @@ class TestPromptInjectionModes(unittest.TestCase):
         # The guidance is part of the reminder (proxy stage-direction),
         # OUTSIDE the wrapped user message.
         self.assertLess(
-            last_user.index("Default to the tools above"),
+            last_user.index("prefer a listed tool over doing the work by hand"),
             last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
         )
+
+    def test_mode_hybrid_reminder_advises_concurrent_task_agents(self):
+        """The Workflow line tells the model to launch task agents, several
+        concurrently when possible, to parallelize and conserve context."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("Launch `task` agents", last_user)
+        self.assertIn("concurrently", last_user)
+        self.assertIn("conserve your context", last_user)
+
+    def test_mode_hybrid_reminder_has_honesty_rules(self):
+        """The Honesty line carries the anti-fabrication guidance."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("never fabricate", last_user)
+        self.assertIn("Do not present guesses as facts", last_user)
+        self.assertIn("I don't know", last_user)
+
+    def test_mode_hybrid_reminder_has_environment_context(self):
+        """The Environment line states the container / mounted-workdir /
+        reproducibility facts so agents give reproducible setup advice."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("Linux container", last_user)
+        self.assertIn("mounted from the host", last_user)
+        self.assertIn("reproduce in the user's environment", last_user)
+        self.assertIn("project-local", last_user)
+
+    def test_mode_hybrid_reminder_drops_stale_value_parenthetical(self):
+        """The old "which agent types are valid for a `task` tool" pointer is
+        gone from the reminder — those values now live in the TOOL_DETAIL
+        blocks at recency, so pointing back to AGENT_TOOLS for them misleads."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertNotIn("which agent types are valid for a `task` tool", last_user)
+        self.assertNotIn("which skills are listed for a `skill` tool", last_user)
+
+    def test_mode_hybrid_reminder_injects_known_host_os(self):
+        """When HARNESS_HOST_OS is a recognised value the Environment line
+        names it; the rest of the line is unchanged."""
+        with patch.object(proxy, "_HOST_OS", "macos"):
+            result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("host OS: macos", last_user)
+        self.assertIn("Linux container", last_user)
+
+    def test_mode_hybrid_reminder_omits_host_os_when_unknown(self):
+        """An empty/unknown host OS suppresses only the parenthetical; the
+        container/reproducibility facts still render."""
+        with patch.object(proxy, "_HOST_OS", ""):
+            result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertNotIn("host OS:", last_user)
+        self.assertIn("mounted from the host.", last_user)
 
     def test_mode_hybrid_signatures_show_required_and_optional(self):
         """The reminder lists required params bare and each optional param
@@ -854,8 +908,8 @@ class TestPromptInjectionModes(unittest.TestCase):
         # <<<BEGIN_TOOL_RESULT>>> markers and the hybrid reminder prefix.
         self.assertEqual(out[-1]["role"], "user")
         c = out[-1]["content"]
-        # New reminder text ("Reminder:" — not the old "Tool reminder").
-        self.assertIn("Reminder:", c)
+        # New reminder text ("Harness reminder" — not the old "Tool reminder").
+        self.assertIn("Harness reminder", c)
         # The new "do not invent" sentence telling the model not to
         # fabricate tool results.
         self.assertIn("do not invent", c)
@@ -1139,7 +1193,7 @@ class TestHybridDetailTools(unittest.TestCase):
 
     def test_detail_block_sits_after_reminder_outside_user_message_wrap(self):
         last_user = self._translate([self.task_tool])[-1]["content"]
-        reminder_pos = last_user.index("Reminder:")
+        reminder_pos = last_user.index("Harness reminder")
         detail_pos = last_user.index('<<<BEGIN_TOOL_DETAIL name="task">>>')
         user_wrap_pos = last_user.index("<<<BEGIN_USER_MESSAGE>>>")
         # Reminder, then the detail block, then the wrapped user message — the
@@ -1150,7 +1204,7 @@ class TestHybridDetailTools(unittest.TestCase):
 
     def test_detail_block_has_framing_pointing_at_agent_tools(self):
         last_user = self._translate([self.task_tool])[-1]["content"]
-        self.assertIn("called with invalid arguments", last_user)
+        self.assertIn("Valid argument values for the tools below", last_user)
         self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", last_user)
 
     def test_no_detail_block_for_unflagged_tool(self):
@@ -1169,7 +1223,7 @@ class TestHybridDetailTools(unittest.TestCase):
         last_user = self._translate([self.task_tool], flagged=[])[-1]["content"]
         self.assertNotIn("<<<BEGIN_TOOL_DETAIL", last_user)
         # The rest of the reminder is unaffected.
-        self.assertIn("Reminder:", last_user)
+        self.assertIn("Harness reminder", last_user)
         self.assertIn("task(description, prompt, subagent_type)", last_user)
 
     def test_detail_block_also_on_tool_result_turn(self):
@@ -1201,6 +1255,40 @@ class TestHybridDetailTools(unittest.TestCase):
             )
         joined = "\n".join(m["content"] for m in out)
         self.assertNotIn("TOOL_DETAIL", joined)
+
+
+class TestHostOsSetup(unittest.TestCase):
+    """`_setup_host_os` reads HARNESS_HOST_OS (injected by the harness CLI from
+    harness_detect_os) into `_HOST_OS`. Only linux/macos/windows are honoured;
+    anything else — unset, empty, or "unknown" — normalises to "" so the
+    Environment line drops the host-OS parenthetical."""
+
+    def tearDown(self):
+        # Restore the module default so other tests see a stable global.
+        proxy._HOST_OS = ""
+
+    def test_setup_honours_recognised_values(self):
+        for val in ("linux", "macos", "windows"):
+            with patch.dict(os.environ, {"HARNESS_HOST_OS": val}):
+                proxy._setup_host_os()
+                self.assertEqual(proxy._HOST_OS, val)
+
+    def test_setup_normalises_case_and_whitespace(self):
+        with patch.dict(os.environ, {"HARNESS_HOST_OS": "  Windows "}):
+            proxy._setup_host_os()
+            self.assertEqual(proxy._HOST_OS, "windows")
+
+    def test_setup_unknown_becomes_empty(self):
+        with patch.dict(os.environ, {"HARNESS_HOST_OS": "unknown"}):
+            proxy._setup_host_os()
+            self.assertEqual(proxy._HOST_OS, "")
+
+    def test_setup_unset_becomes_empty(self):
+        env_no_var = {k: v for k, v in os.environ.items()
+                      if k != "HARNESS_HOST_OS"}
+        with patch.dict(os.environ, env_no_var, clear=True):
+            proxy._setup_host_os()
+            self.assertEqual(proxy._HOST_OS, "")
 
 
 class TestTaskDescriptionParing(unittest.TestCase):
@@ -1673,11 +1761,11 @@ class TestChangeSystemToUser(unittest.TestCase):
                 self.assertEqual(result[2]["role"], "user")
                 # The recency reminder lands on the live user turn, outside
                 # the USER_MESSAGE wrap.
-                self.assertIn("Reminder:", result[2]["content"])
+                self.assertIn("Harness reminder", result[2]["content"])
                 self.assertIn("Hello", result[2]["content"])
                 self.assertIn("<<<BEGIN_USER_MESSAGE>>>", result[2]["content"])
                 self.assertLess(
-                    result[2]["content"].index("Reminder:"),
+                    result[2]["content"].index("Harness reminder"),
                     result[2]["content"].index("<<<BEGIN_USER_MESSAGE>>>"),
                 )
 

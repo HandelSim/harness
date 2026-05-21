@@ -52,13 +52,20 @@ The validator in `_setup_prompt_mode` accepts:
   schema between the model and the user's actual question.
 - **`hybrid`** — full tool definitions appended to the system message
   (which `_CHANGE_SYSTEM_TO_USER` then folds into the user-role message at
-  index 0, the "stable prefix" position). A short recency reminder
-  restating the JSON envelope, the no-fabricated-results rule, a
-  default-to-the-listed-tools nudge (prefer a dedicated tool over doing the
-  work by hand — e.g. `webfetch` over a curl/Python script, `todowrite`/
-  `todoread` over a hand-written todo file), and each tool's parameter
-  signature (`name(required, [optional])` per tool) is prepended to the last
-  user message. The signature list — not just bare
+  index 0, the "stable prefix" position). A short recency reminder is
+  prepended to the last user message, organised as four labelled lines —
+  **Tools** (JSON envelope, no-fabricated-results rule, a pointer back to
+  `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions), **Workflow** (prefer a
+  listed tool over hand-work — e.g. `webfetch` over curl/a script — keep a
+  live plan with `todowrite`/`todoread`, launch `task` agents several
+  concurrently to parallelise and conserve context), **Honesty**
+  (anti-fabrication: no invented names/paths/signatures/citations), and
+  **Environment** (the proxy runs in a Linux container with the working
+  directory mounted from the host — host OS named when known, see
+  [Host-OS injection](#host-os-injection) — so reproducible setup must live
+  in the working directory, not the container). The line closes with each
+  tool's parameter signature (`name(required, [optional])` per tool). The
+  signature list — not just bare
   names — is the recency anchor for the parameter keys models most often
   guess wrong (e.g. calling `read({"filename": ...})` instead of
   `read({"filePath": ...})`, or omitting opencode's `bash` required
@@ -142,11 +149,15 @@ emit them, and `<<<BEGIN_USER_REQUEST>>>` stays exclusive to `user_front`.
   delimiters. On the latest turn the recency reminder is prepended OUTSIDE
   this wrap (it's proxy stage-direction, not user text).
 
-The reminder (`build_cooperative_prompt_hybrid_reminder`) leads with an
-explicit pointer to `<<<BEGIN_AGENT_TOOLS>>>` so that when attention to
-`messages[0]` dilutes on long conversations the model still has a named
-target to retrieve for full tool descriptions and parameter-value
-constraints. This is additive — token cost is ~100–200 tokens/turn; hybrid's
+The reminder (`build_cooperative_prompt_hybrid_reminder`) Tools line points
+at `<<<BEGIN_AGENT_TOOLS>>>` for **full tool descriptions only** so that when
+attention to `messages[0]` dilutes on long conversations the model still has
+a named target to retrieve. It deliberately does NOT claim that section is
+where to find parameter-*value* constraints (a `task`'s agent types, a
+`skill`'s names): those now reach recency in the TOOL_DETAIL blocks below, so
+an earlier "e.g. which agent types are valid for `task`" parenthetical here
+was removed as misleading. This is additive — token cost is ~150–250
+tokens/turn with the labelled lines + Environment context; hybrid's
 lighter-than-user_front recency profile is preserved.
 
 - **`<<<BEGIN_TOOL_DETAIL name="…">>>`** — recency-only (it lives in the
@@ -177,6 +188,27 @@ lighter-than-user_front recency profile is preserved.
   never a silent loss of the agent list), and `proxy/test_proxy.py`
   `TestTaskDescriptionParing` is the canary that flags the drift. Every other
   detail tool, including `skill` (its description is short), is echoed whole.
+
+## Host-OS injection
+
+The hybrid reminder's **Environment** line tells the agent it runs in a Linux
+container with the working directory bind-mounted from the host, so any setup
+done only inside the container (a global/system venv, etc.) won't reproduce in
+the user's environment — reproducible setup belongs in the working directory
+(e.g. a project-local venv). Knowing the host OS family lets the agent give a
+host-appropriate caveat (a Linux-native venv may need recreating on a
+non-Linux host).
+
+The host OS is fixed per install and the proxy is long-running, so it is read
+once at startup, not threaded per-request. The harness CLI exports
+`HARNESS_HOST_OS="$(harness_detect_os)"` in its `compose()` wrapper (see
+`architecture/harness-cli.md`); `docker-compose.yml` passes it to the proxy
+service (`HARNESS_HOST_OS: ${HARNESS_HOST_OS:-unknown}`); `_setup_host_os`
+reads it into the `_HOST_OS` module global, honouring only `linux`/`macos`/
+`windows` and normalising anything else (unset, empty, `unknown`) to `""`.
+When `_HOST_OS` is `""` the Environment line drops only the `(host OS: …)`
+parenthetical — the container/reproducibility facts still render, so the proxy
+degrades gracefully when launched outside the harness CLI.
 
 ## `_CHANGE_SYSTEM_TO_USER`
 

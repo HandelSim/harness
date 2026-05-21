@@ -98,6 +98,12 @@ services:
       # Cooperative-prompt injection mode: user_front (default) / hybrid,
       # plus the passthrough bypass. See .env.example for the full description.
       PROXY_PROMPT_MODE: ${PROXY_PROMPT_MODE:-user_front}
+      # Host OS family (linux/macos/windows) the user runs harness from; the
+      # harness CLI exports it via harness_detect_os. The proxy injects it into
+      # the hybrid recency reminder so agents give host-appropriate,
+      # reproducible setup advice. Defaults to unknown (suppresses the host-OS
+      # hint) when harness isn't the launcher.
+      HARNESS_HOST_OS: ${HARNESS_HOST_OS:-unknown}
     volumes:
       # When OUTPUT_DIR is set, the proxy writes per-request debug files here.
       # On Windows users should set OUTPUT_DIR=//output to bypass MSYS path

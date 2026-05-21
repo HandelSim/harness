@@ -772,9 +772,14 @@ compose() {
     # the serena bind-mount always has a non-empty source.
     local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
 
+    # HARNESS_HOST_OS lets the proxy tell agents which host platform the user
+    # will reproduce work on (the proxy itself always runs in a Linux
+    # container). docker-compose.yml passes it to the proxy service; the proxy
+    # injects it into the recency reminder's Environment line.
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
+        HARNESS_HOST_OS="$(harness_detect_os)" \
         harness_docker "${args[@]}" "$@"
 }
 
