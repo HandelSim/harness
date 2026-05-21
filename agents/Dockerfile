@@ -1,10 +1,8 @@
-# harness-agent — unified image for both claude-code and opencode CLIs.
+# harness-agent — image for the opencode CLI.
 #
-# Replaces the prior agents/claude/Dockerfile and agents/opencode/Dockerfile.
-# Both CLIs are installed in a single image; the entrypoint dispatches on a
-# mode argument (claude / opencode / shell) so we don't fork the runtime
-# infrastructure (firewall init, UID remap, skel seeding, gosu drop) across
-# two Dockerfiles. The mode is appended by the host harness script.
+# The entrypoint dispatches on a mode argument (opencode / shell) so we don't
+# fork the runtime infrastructure (firewall init, UID remap, skel seeding,
+# gosu drop). The mode is appended by the host harness script.
 #
 # Build context is the repo root (see docker-compose.yml). All COPYs below
 # use repo-root-relative paths.
@@ -26,9 +24,9 @@ FROM node:20-bookworm-slim
 #                    sets for skill-style installers (graphify, etc.)
 #   iptables, ipset, dnsutils, iproute2 — required by init-firewall.sh
 #   locales        — without it the container LANG defaults to POSIX, which
-#                    makes claude-code/opencode fall back to ASCII underscores
-#                    instead of Unicode box-drawing/indicator glyphs in the
-#                    TUI. Generated to C.UTF-8 below.
+#                    makes opencode fall back to ASCII underscores instead of
+#                    Unicode box-drawing/indicator glyphs in the TUI.
+#                    Generated to C.UTF-8 below.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git \
@@ -57,8 +55,7 @@ RUN sed -i 's/^# *\(C.UTF-8\)/\1/' /etc/locale.gen \
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-# Both agent CLIs at pinned versions. Bumping requires editing this file.
-ARG CLAUDE_CODE_VERSION=2.1.143
+# Agent CLI at a pinned version. Bumping requires editing this file.
 # OPENCODE_VERSION floor: must stay <= 1.14.41 until upstream restores
 # headless stdout. opencode 1.14.42 added an "interactive split-footer mode
 # for `opencode run`" that suppresses the formatted-default response body
@@ -70,14 +67,10 @@ ARG CLAUDE_CODE_VERSION=2.1.143
 # bumped version emits the assistant body on a non-TTY stdout.
 ARG OPENCODE_VERSION=1.14.41
 ARG OPENAI_COMPAT_VERSION=2.0.47
-ARG CCSTATUSLINE_VERSION=2.2.19
 
 RUN npm install -g \
-        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
         "opencode-ai@${OPENCODE_VERSION}" \
         "@ai-sdk/openai-compatible@${OPENAI_COMPAT_VERSION}" \
-        "ccstatusline@${CCSTATUSLINE_VERSION}" \
-    && (claude --version > /etc/claude-version 2>/dev/null || true) \
     && (opencode --version > /etc/opencode-version 2>/dev/null || true)
 
 # Non-root harness user pre-created at uid/gid 1000.
@@ -119,14 +112,6 @@ ENV GIT_ASKPASS=/bin/false
 RUN mkdir -p /etc/skel/harness \
     && cp -a /home/harness/. /etc/skel/harness/ 2>/dev/null || true \
     && chown -R harness:harness /etc/skel/harness
-
-# Default ccstatusline config (used by the claude mode; harmless for opencode
-# and shell modes). Lands in the skel so first-run users see a useful status
-# line; preserved on subsequent runs because the entrypoint's seed pass uses
-# cp -an. Users override with `harness claude-statusline-config`.
-COPY agents/defaults/ccstatusline-settings.json \
-     /etc/skel/harness/.config/ccstatusline/settings.json
-RUN chown -R harness:harness /etc/skel/harness/.config
 
 # Surface user-installed binaries (pipx, pip --user) on PATH. /home/harness
 # is shadowed by the bind mount at runtime; this PATH entry resolves once

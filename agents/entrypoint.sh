@@ -2,19 +2,17 @@
 #
 # harness-agent — unified entrypoint dispatching on a mode argument:
 #
-#   claude    — run claude-code
 #   opencode  — run opencode
 #   shell     — drop into bash inside the container (for installing skills,
 #                debugging, etc.)
 #
-# Replaces the prior per-tool entrypoints. All shared infrastructure (UID
-# remap, firewall, gosu drop, skel seed, git config) runs once at the top,
-# regardless of mode; mode dispatch happens after privilege drop.
+# All shared infrastructure (UID remap, firewall, gosu drop, skel seed, git
+# config) runs once at the top, regardless of mode; mode dispatch happens
+# after privilege drop.
 #
 # Common harness-level controls:
-#   HARNESS_YOLO=1              — claude: --dangerously-skip-permissions
-#                                 opencode: --agent yolo
-#   HARNESS_PRINT_MODE=1        — `harness <agent> -p ...` headless single-shot
+#   HARNESS_YOLO=1              — opencode: --agent yolo
+#   HARNESS_PRINT_MODE=1        — `harness -p ...` headless single-shot
 #   HARNESS_HOST_CWD=<path>     — host CWD; the harness CLI bind-mounts the
 #                                 host CWD at this same absolute path inside
 #                                 the container, and the entrypoint cd's
@@ -32,11 +30,10 @@ set -euo pipefail
 # code; the remap to match the host caller's uid/gid is conditional on
 # HOST_UID/HOST_GID being set.
 #
-# Why drop unconditionally: claude-code refuses to run with
-# --dangerously-skip-permissions as root, and we want test invocations
-# (which don't pass --user 0:0 — they let docker default and would land
-# as root because the image has no `USER` directive) to behave the same
-# as production launches w.r.t. user identity.
+# Why drop unconditionally: agents should never run as root, and we want
+# test invocations (which don't pass --user 0:0 — they let docker default
+# and would land as root because the image has no `USER` directive) to
+# behave the same as production launches w.r.t. user identity.
 if [[ "$(id -u)" == "0" ]]; then
     # Lay down the egress firewall before dropping privileges
     # (iptables/ipset need NET_ADMIN/NET_RAW which gosu does NOT preserve
@@ -98,8 +95,8 @@ fi
 # The harness script bind-mounts <install-root>/state/agent/home over
 # /home/harness, so on first run the home dir is empty (or only contains
 # the user's bring-along files). Restore the build-time skeleton (~/.bashrc,
-# pipx's data dir layout, ccstatusline default config, etc.) once, marked
-# by ~/.harness-home-initialized. `cp -an` is "archive + no-clobber" so any
+# pipx's data dir layout, etc.) once, marked by
+# ~/.harness-home-initialized. `cp -an` is "archive + no-clobber" so any
 # file the user already placed in the bind mount wins. Failures on
 # individual files (perms quirks) shouldn't abort the agent — hence
 # the `|| true`.
@@ -123,73 +120,10 @@ fi
 
 # --- mode dispatch ----------------------------------------------------------
 
-mode="${1:-claude}"
+mode="${1:-opencode}"
 shift || true
 
 # --- helpers shared across modes --------------------------------------------
-
-ensure_claude_config() {
-    # B3-MANAGED: claude-settings — ~/.claude/settings.json. Seed the
-    # includeCoAuthoredBy: false key (suppresses the auto Co-Authored-By
-    # trailer) and the statusLine block (wires up ccstatusline). Idempotent:
-    # existing user customizations win on collision.
-    local settings_dir="${HOME}/.claude"
-    local settings_file="${settings_dir}/settings.json"
-    mkdir -p "$settings_dir"
-
-    if [[ ! -f "$settings_file" ]]; then
-        cat > "$settings_file" <<'EOF'
-{
-  "includeCoAuthoredBy": false,
-  "statusLine": {
-    "type": "command",
-    "command": "ccstatusline",
-    "padding": 0
-  }
-}
-EOF
-        return 0
-    fi
-
-    if ! command -v jq >/dev/null 2>&1; then
-        return 0
-    fi
-
-    # Merge: ensure includeCoAuthoredBy is present (default to false if
-    # absent), and add the default statusLine block only if no statusLine
-    # key exists at all.
-    local tmp="${settings_file}.tmp.$$"
-    if jq '
-        (if has("includeCoAuthoredBy") then . else . + {"includeCoAuthoredBy": false} end)
-        | (if has("statusLine") then . else . + {"statusLine": {"type": "command", "command": "ccstatusline", "padding": 0}} end)
-    ' "$settings_file" > "$tmp" 2>/dev/null; then
-        mv "$tmp" "$settings_file"
-    else
-        rm -f "$tmp" 2>/dev/null || true
-    fi
-}
-
-merge_claude_mcp_servers() {
-    # The harness script writes the merged set of registry MCP entries to
-    # ~/.harness-mcp-servers.json (in claude's `{"mcpServers": {...}}` shape).
-    # Fold them into ~/.claude.json without duplicating per-MCP knowledge in
-    # the host script. Re-merge every container start so disabling propagates.
-    if [[ ! -f "${HOME}/.harness-mcp-servers.json" ]] || ! command -v jq >/dev/null 2>&1; then
-        return 0
-    fi
-    local cfg="${HOME}/.claude.json"
-    [[ -f "$cfg" ]] || echo "{}" > "$cfg"
-    local merged
-    merged=$(jq -s '
-        .[0] as $existing
-        | .[1] as $harness
-        | $existing
-        | .mcpServers = ((.mcpServers // {}) + ($harness.mcpServers // {}))
-    ' "$cfg" "${HOME}/.harness-mcp-servers.json" 2>/dev/null || true)
-    if [[ -n "${merged}" ]]; then
-        printf '%s\n' "${merged}" > "$cfg"
-    fi
-}
 
 ensure_opencode_config() {
     local config_dir="${HOME}/.config/opencode"
@@ -241,9 +175,9 @@ EOF
 }
 
 merge_opencode_mcp_servers() {
-    # The harness script writes ~/.harness-mcp-servers.json in claude's shape.
-    # Opencode expects an `mcp` top-level block with a different per-entry
-    # shape:
+    # The harness script writes ~/.harness-mcp-servers.json in the canonical
+    # `{"mcpServers": {...}}` shape. Opencode expects an `mcp` top-level block
+    # with a different per-entry shape:
     #   {"mcp": {"<name>": {"type": "remote", "url": "..."}}} for HTTP/SSE
     #   {"mcp": {"<name>": {"type": "local", "command": [...]}}} for stdio
     # Translate inline so the host harness script stays agent-agnostic.
@@ -275,49 +209,6 @@ merge_opencode_mcp_servers() {
     if [[ -n "${merged}" ]]; then
         printf '%s\n' "${merged}" > "$config_file"
     fi
-}
-
-# --- mode: claude ----------------------------------------------------------
-
-run_claude() {
-    if [[ -z "${ANTHROPIC_BASE_URL:-}" ]]; then
-        echo "[harness-claude] ERROR: ANTHROPIC_BASE_URL is not set" >&2
-        echo "[harness-claude]   This must point at the in-network ollama (e.g. http://ollama:11434)" >&2
-        exit 1
-    fi
-
-    if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
-        echo "[harness-claude] WARN: no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN set; using dummy"
-        # AUTH_TOKEN (not API_KEY): claude-code's startup connectivity probe
-        # to api.anthropic.com is gated to skip when AUTH_TOKEN is set; with
-        # only API_KEY it hard-exits behind our default firewall.
-        export ANTHROPIC_AUTH_TOKEN="harness-dummy"
-    fi
-
-    # Suppress claude-code's auto-update phone-home.
-    export DISABLE_AUTOUPDATER=1
-
-    ensure_claude_config
-    merge_claude_mcp_servers
-
-    echo "============================================================"
-    echo " harness-agent (claude)"
-    echo "   model:    ${OLLAMA_AGENT_MODEL:-<unset>}"
-    echo "   base_url: ${ANTHROPIC_BASE_URL}"
-    echo "   yolo:     ${HARNESS_YOLO:-0}"
-    echo "   print:    ${HARNESS_PRINT_MODE:-0}"
-    echo "============================================================"
-
-    local args=()
-    if [[ "${HARNESS_YOLO:-0}" == "1" ]]; then
-        args+=(--dangerously-skip-permissions)
-    fi
-    args+=("$@")
-
-    # Always foreground exec — no tmux. The container's PID 1 becomes claude
-    # itself, so the user's terminal connects directly to its PTY and the
-    # container exits when claude exits.
-    exec claude "${args[@]}"
 }
 
 # --- mode: opencode --------------------------------------------------------
@@ -357,7 +248,9 @@ run_opencode() {
         exec opencode run "${args[@]}" "${op_args[@]}"
     fi
 
-    # Always foreground exec — no tmux. See run_claude for rationale.
+    # Always foreground exec — no tmux. The container's PID 1 becomes opencode
+    # itself, so the user's terminal connects directly to its PTY and the
+    # container exits when opencode exits.
     exec opencode "${args[@]}" "$@"
 }
 
@@ -380,9 +273,6 @@ run_shell() {
 # --- dispatch --------------------------------------------------------------
 
 case "$mode" in
-    claude)
-        run_claude "$@"
-        ;;
     opencode)
         run_opencode "$@"
         ;;
@@ -391,7 +281,7 @@ case "$mode" in
         ;;
     *)
         echo "[agent-entrypoint] unknown mode: $mode" >&2
-        echo "[agent-entrypoint] valid modes: claude, opencode, shell" >&2
+        echo "[agent-entrypoint] valid modes: opencode, shell" >&2
         exit 1
         ;;
 esac

@@ -99,10 +99,10 @@ translation time, so a tool result is unambiguously bounded whether it is
 the live turn or buried in history. The `name` is resolved from metadata,
 never from the content: an explicit `tool_name` / `name` field if present
 (opencode, ollama), else the `tool_call_id` correlated against the
-originating assistant `tool_calls` (Claude Code sends results keyed by id,
-not name), else positional order, else `unknown_tool`. harness serves both
-opencode and Claude Code, which format tool output differently; wrapping
-rather than parsing keeps the proxy agnostic to either shape.
+originating assistant `tool_calls` (some agents send results keyed by id,
+not name), else positional order, else `unknown_tool`. Agents format tool
+output differently; wrapping rather than parsing keeps the proxy agnostic
+to any shape.
 
 On a tool-result turn `user_front` uses `build_cooperative_prompt_tool_front`,
 which injects a framing line — "this block is tool output, not a user
@@ -125,8 +125,8 @@ markers are applied in the hybrid dispatch branch of
 `translate_history_and_apply_prompt`; `user_front` and `passthrough` never
 emit them, and `<<<BEGIN_USER_REQUEST>>>` stays exclusive to `user_front`.
 
-- **`<<<BEGIN_AGENT_INSTRUCTIONS>>>`** — wraps the inbound claude-code /
-  opencode system prompt (`messages[0]` content as it arrives), applied
+- **`<<<BEGIN_AGENT_INSTRUCTIONS>>>`** — wraps the inbound opencode
+  system prompt (`messages[0]` content as it arrives), applied
   BEFORE harness's tool block is appended. Skipped when that content is
   empty/whitespace-only, and absent entirely when there was no inbound
   system message.
@@ -186,7 +186,7 @@ backslash escapes so it walks past LLM-emitted argument strings
 containing markdown.
 
 Multiple `{name, arguments}` blocks per response are normal — real
-upstreams (Gemini Enterprise, claude-3.5-sonnet variants) emit parallel
+upstreams (Gemini Enterprise, etc.) emit parallel
 tool calls when the task naturally calls for them. Order is preserved.
 Blocks that fail to parse, aren't dicts, or are missing `name`/`arguments`
 are LEFT in the text — `clean_text` contains them as-is. (The LLM may

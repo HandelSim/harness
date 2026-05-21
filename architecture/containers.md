@@ -35,12 +35,9 @@ direct `docker run`, not compose — see "Agent launch path" in
    points at `http://proxy:${PROXY_PORT}`. The same body sets
    `context_length` and `num_ctx` from `OLLAMA_CONTEXT_LENGTH`.
 5. Confirms the canonical name appears in `/api/tags`. Aborts on failure.
-6. Best-effort: registers alias names claude-code uses internally
-   (`sonnet`, `opus`, `haiku`, `claude-3-5-sonnet-20241022`, etc.) so
-   sub-agent invocations (Task tool, Explore agent) resolve. All point at
-   the same `RemoteHost`. The proxy ignores the model name in the request
-   and uses `PROXY_API_MODEL` from `.env` to decide what to send upstream.
-7. `wait`s on the ollama process so PID 1 stays alive.
+   (The proxy ignores the model name in the request and uses
+   `PROXY_API_MODEL` from `.env` to decide what to send upstream.)
+6. `wait`s on the ollama process so PID 1 stays alive.
 
 ### `OLLAMA_REMOTES` is load-bearing
 
@@ -62,7 +59,7 @@ stub-model registration doesn't fire against an unready proxy.
 
 ## agent containers (`agents/Dockerfile` + `agents/entrypoint.sh`)
 
-A single image backs all three modes (`claude`, `opencode`, `shell`) with
+A single image backs both modes (`opencode`, `shell`) with
 a shared `/home/harness`. The entrypoint runs once at the top of every
 launch (root side), regardless of mode:
 
@@ -76,10 +73,9 @@ launch (root side), regardless of mode:
    ownership is already correct — on Windows + Docker Desktop the
    recursive chown across a bind-mounted host path is dramatically slow
    (every syscall is a WSL2/virtiofs translation), so the gate matters.
-3. **gosu drop.** `exec gosu harness "$0" "$@"`. Claude-code refuses to
-   run with `--dangerously-skip-permissions` as root, and we want tests
-   (which may not pass `--user 0:0`) to behave the same as production
-   launches.
+3. **gosu drop.** `exec gosu harness "$0" "$@"`. Agents should never run
+   as root, and we want tests (which may not pass `--user 0:0`) to behave
+   the same as production launches.
 
 After the drop, still in the entrypoint:
 
@@ -95,33 +91,29 @@ After the drop, still in the entrypoint:
    re-running the image during `harness upgrade` does NOT re-seed.
 6. **cd to host CWD.** `cd "$HARNESS_HOST_CWD"` so `pwd` inside the
    container matches the host shell.
-7. **Mode dispatch.** `mode=${1:-claude}`; calls `run_claude`,
-   `run_opencode`, or drops to `bash`.
+7. **Mode dispatch.** `mode=${1:-opencode}`; calls `run_opencode` or drops
+   to `bash`.
 
 ### Mode helpers
 
-- `ensure_claude_config` and `merge_claude_mcp_servers` seed
-  `~/.claude/settings.json` (with `includeCoAuthoredBy: false` and the
-  `statusLine` block wiring up ccstatusline) and merge the
-  per-launch-regenerated `~/.harness-mcp-servers.json` into `~/.claude.json`.
 - `ensure_opencode_config` writes `~/.config/opencode/opencode.json` with
   the harness provider block pointing at `http://ollama:11434/v1` and the
   `OLLAMA_AGENT_MODEL` registered as `harness/<MODEL_NAME>`. Re-written
   every launch because `OLLAMA_AGENT_MODEL` may have changed.
-- `merge_opencode_mcp_servers` translates claude's `{"mcpServers": {...}}`
+- `merge_opencode_mcp_servers` translates the canonical `{"mcpServers": {...}}`
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.
 
-### Why a single image for all three modes
+### Why a single image for both modes
 
 UID remap, firewall, gosu drop, skel-seed, and git config are identical
-across modes. Splitting per-tool images would duplicate that infra five
-ways. The mode dispatch happens after privilege drop; the only divergence
-is which command line gets `exec`d.
+across modes. Splitting per-tool images would duplicate that infra. The
+mode dispatch happens after privilege drop; the only divergence is which
+command line gets `exec`d.
 
 ## Mounts: same-path host ↔ container
 
-The folder you run `harness claude` / `opencode` / `shell` from is
+The folder you run `harness` / `opencode` / `shell` from is
 bind-mounted into the container at the **same absolute path** — no
 `/workspace` indirection. `pwd` inside the agent matches your host
 shell, which means absolute paths in code, log files, and tool output

@@ -55,8 +55,7 @@ for attempt in $(seq 1 60); do
     sleep 1
 done
 
-# Register one stub model with the proxy's RemoteHost. Used both for the
-# canonical OLLAMA_AGENT_MODEL and for the alias names below.
+# Register the stub model with the proxy's RemoteHost.
 #
 # Args: <model_name>
 # Returns: 0 on success, non-zero if /api/create didn't end with
@@ -94,12 +93,10 @@ register_stub_model() {
     return 0
 }
 
-# Canonical model: register and abort the entrypoint on failure.
+# Register the canonical model and abort the entrypoint on failure.
 register_stub_model "${MODEL_NAME}" || exit 1
 
-# Sanity: confirm the canonical stub is visible via /api/tags. The alias
-# registrations below are best-effort; only the canonical name is critical
-# for ollama startup.
+# Sanity: confirm the stub model is visible via /api/tags.
 TAGS_RESPONSE=$(curl -fsS "${OLLAMA_API}/api/tags")
 if ! echo "${TAGS_RESPONSE}" | grep -q "\"${MODEL_NAME}"; then
     echo "[entrypoint] ERROR: stub model '${MODEL_NAME}' not found in /api/tags" >&2
@@ -107,38 +104,7 @@ if ! echo "${TAGS_RESPONSE}" | grep -q "\"${MODEL_NAME}"; then
     exit 1
 fi
 
-# Register additional stub aliases for the names claude-code uses internally
-# in sub-agent invocations (Task tool, Explore agent, etc.). All point at the
-# same RemoteHost as the canonical model — they're aliases that satisfy
-# claude-code's model lookups. The proxy ignores the model name in the
-# request and uses PROXY_API_MODEL from .env to decide what to send
-# upstream, so all aliases functionally route to the same upstream.
-#
-# Best-effort: a registration failure on one alias logs and continues; we
-# don't fail ollama startup over partial coverage.
-STUB_ALIASES=(
-    sonnet
-    opus
-    haiku
-    claude-sonnet-4-5
-    claude-opus-4-5
-    claude-haiku-4-5
-    claude-3-5-sonnet-20241022
-    claude-3-5-haiku-20241022
-    claude-3-opus-20240229
-)
-
-for alias_name in "${STUB_ALIASES[@]}"; do
-    # Skip the canonical name to avoid a duplicate-registration round-trip.
-    if [[ "${alias_name}" == "${MODEL_NAME}" ]]; then
-        continue
-    fi
-    if ! register_stub_model "${alias_name}"; then
-        echo "[entrypoint] WARN: failed to register stub alias '${alias_name}'; continuing" >&2
-    fi
-done
-
-echo "[entrypoint] harness ollama ready; stub models -> ${REMOTE_URL}"
+echo "[entrypoint] harness ollama ready; stub model -> ${REMOTE_URL}"
 
 # Block on ollama. The trap above tears it down on signals.
 wait "${OLLAMA_PID}"

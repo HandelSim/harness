@@ -161,10 +161,10 @@ def save_debug_file(req_id: str, stage_prefix: str, stage_name: str, payload: An
 # Cooperative-prompt builders and tool-call extraction.
 #
 # The prompt text in these builders is tuned — change it deliberately, with
-# a reason, not incidentally. It must stay AGENT-AGNOSTIC: harness serves
-# both opencode and Claude Code, which present tool results differently. The
-# builders therefore wrap and inject around incoming content; they never
-# parse or depend on the shape of what the agent put inside a tool message.
+# a reason, not incidentally. It must stay AGENT-AGNOSTIC: agents present
+# tool results differently, so the builders wrap and inject around incoming
+# content; they never parse or depend on the shape of what the agent put
+# inside a tool message.
 # ---------------------------------------------------------------------------
 
 # Tool-result turns: the translator wraps every role:"tool" message's content
@@ -216,7 +216,7 @@ def format_tools_to_text(tools_array):
     # object/array structure (e.g., opencode's `todowrite` with an array of
     # {content, status, priority} objects), so the upstream LLM had no idea
     # what fields to populate inside each item. JSON Schema is the lingua
-    # franca here — Claude and other capable models read it natively. Token
+    # franca here — capable models read it natively. Token
     # cost goes up a few KB per request; correctness wins.
     if not tools_array:
         return "No tools available."
@@ -485,7 +485,7 @@ def extract_tool_calls_and_text(response_text):
     code fences — the lazy match terminated on the first inner ``` instead
     of the outer one, truncating the JSON.
 
-    Real upstream LLMs (Gemini Enterprise, claude-3.5-sonnet variants, etc.)
+    Real upstream LLMs (Gemini Enterprise, etc.)
     frequently emit multiple tool calls per response when the agent's task
     naturally calls for parallel work — reading multiple files, calling
     multiple APIs, etc. Each ```json block with valid {name, arguments}
@@ -736,7 +736,7 @@ def translate_history_and_apply_prompt(
     # Tool-call name lookup. A role:"tool" result must be labeled with the
     # name of the tool it answers, but not every agent puts that name on the
     # tool message: opencode and ollama send `tool_name`/`name` directly,
-    # while Claude Code sends only a `tool_call_id`. So we record names as
+    # while some agents send only a `tool_call_id`. So we record names as
     # assistant tool_calls go by — keyed by id for exact correlation, plus an
     # ordered list as a positional fallback when no id is present anywhere.
     tool_names_by_id: Dict[str, str] = {}
@@ -787,13 +787,13 @@ def translate_history_and_apply_prompt(
 
         elif role == "tool":
             # Wrap the tool result in explicit open/close markers. The content
-            # is taken VERBATIM — never parsed — because opencode and Claude
-            # Code present tool output differently and harness must stay
-            # agnostic to both. The name comes from message metadata, never
-            # from inspecting the content: an explicit `tool_name`/`name` field
-            # if present (opencode, ollama), else the `tool_call_id` correlated
-            # against the originating assistant tool_calls (Claude Code), else
-            # positional order, else "unknown_tool".
+            # is taken VERBATIM — never parsed — because agents present tool
+            # output differently and harness must stay agnostic to all of
+            # them. The name comes from message metadata, never from
+            # inspecting the content: an explicit `tool_name`/`name` field if
+            # present (opencode, ollama), else the `tool_call_id` correlated
+            # against the originating assistant tool_calls, else positional
+            # order, else "unknown_tool".
             tool_name = msg.get("tool_name") or msg.get("name")
             tc_id = msg.get("tool_call_id") or msg.get("id")
             # Pop one positional candidate per tool message so the fallback
@@ -848,7 +848,7 @@ def translate_history_and_apply_prompt(
             # the system message instead.
             system_addition = build_cooperative_prompt_system_addition(tools_text)
             if messages[0]["role"] == "system":
-                # Wrap the inbound agent (claude-code/opencode) system prompt
+                # Wrap the inbound agent (opencode) system prompt
                 # in AGENT_INSTRUCTIONS markers BEFORE appending harness's own
                 # tool block, so the two are individually addressable and the
                 # model can't conflate either with the upstream gateway's
@@ -990,9 +990,8 @@ def generate_ndjson(
 
     Multiple tool calls (when the upstream produced multiple ```json blocks)
     are emitted as a single tool_calls array in one chunk, preserving their
-    order. Each call gets a unique toolu_-prefixed id since claude-code's
-    Anthropic-format conversation history requires the id field per
-    tool_use block.
+    order. Each call gets a unique toolu_-prefixed id so tool_use blocks in
+    the conversation history can be correlated to their results.
     """
     if clean_text:
         yield json.dumps(make_chunk(model_name, content=clean_text)) + "\n"
