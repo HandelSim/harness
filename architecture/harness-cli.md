@@ -30,6 +30,14 @@ so it can read values like `PUBLISH_OLLAMA_PORT`, `OLLAMA_AGENT_MODEL`,
 `HARNESS_EXTRA_MOUNTS` for its own logic. `docker compose` gets `.env`
 separately via `--env-file`. The two consumers are independent.
 
+`OLLAMA_AGENT_MODEL` has four independent consumers — the CLI
+(`agent_model=`), `docker-compose.yml`, `ollama/entrypoint.sh`, and
+`agents/entrypoint.sh` — and **all four fall back to the same default,
+`GenAI`**, when the var is unset/blank. This invariant matters: the ollama
+side registers the stub model under this name and the opencode side points
+the agent at it, so a divergent default makes opencode request a model name
+ollama never created (silent 404s). Keep the four in sync.
+
 ### Host proxy (`HTTP_PROXY` / `HTTPS_PROXY`)
 
 Optional. Exported into the process env so the host-side work this script
@@ -51,7 +59,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Group | Subcommands |
 |---|---|
 | Lifecycle | `start`, `down`, `restart`, `logs`, `unlock` |
-| Update / upgrade | `update`, `upgrade`, `check-updates` |
+| Update / upgrade | `update`, `upgrade`, `downgrade`, `check-updates` |
 | Agent launch | `opencode`, `shell`, `list`, `stop` |
 | Diagnostics | `doctor`, `preflight`, `help` |
 | Test / bench | `test`, `benchmark` |

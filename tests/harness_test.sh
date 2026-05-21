@@ -2139,6 +2139,142 @@ if ! grep -q 'CMD_HELP_CALLED' <<<"${t30_help_out}" || grep -q 'RUN_AGENT_CALLED
 fi
 echo "[harness-test] T30 OK"
 
+# --- Test 31: OLLAMA_AGENT_MODEL CLI default matches the other consumers (#87)
+#
+# The CLI's agent_model fallback must be GenAI when OLLAMA_AGENT_MODEL is
+# unset/blank — the same default as docker-compose.yml, ollama/entrypoint.sh
+# and agents/entrypoint.sh — so opencode is never pointed at a model name
+# ollama never registered. An explicit value must pass through verbatim. The
+# install root is an empty tmpdir so no real .env is sourced over the var.
+echo "[harness-test] T31: OLLAMA_AGENT_MODEL CLI default"
+T31_ROOT="$(mktemp -d -t harness-t31.XXXXXX)"
+cleanup_t31() { [[ -n "${T31_ROOT:-}" && -d "${T31_ROOT}" ]] && rm -rf "${T31_ROOT}"; }
+trap 'cleanup_t31; restore_agent_image; cleanup' EXIT INT TERM
+
+t31_default=$(
+    unset OLLAMA_AGENT_MODEL
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${T31_ROOT}" \
+        source "${HARNESS_BIN}" >/dev/null 2>&1
+    printf '%s' "${agent_model}"
+)
+if [[ "${t31_default}" != "GenAI" ]]; then
+    echo "[harness-test] T31 FAIL: default agent_model='${t31_default}' != GenAI" >&2
+    exit 1
+fi
+
+t31_explicit=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${T31_ROOT}" OLLAMA_AGENT_MODEL=mymodel \
+        source "${HARNESS_BIN}" >/dev/null 2>&1
+    printf '%s' "${agent_model}"
+)
+if [[ "${t31_explicit}" != "mymodel" ]]; then
+    echo "[harness-test] T31 FAIL: explicit agent_model='${t31_explicit}' != mymodel" >&2
+    exit 1
+fi
+cleanup_t31
+trap 'restore_agent_image; cleanup' EXIT INT TERM
+echo "[harness-test] T31 OK"
+
+# --- Test 32: harness downgrade tag resolution + confirm/abort (#85) ---------
+#
+# `_downgrade_target_tag` resolves the previous release tag topologically
+# (git describe, no version parsing — so two-number tags like v0.1/v1.0 work):
+# from an untagged tip it lands on the latest tag; sitting exactly on a tag it
+# steps to the prior one; on the earliest tag it errors. `cmd_downgrade` then
+# does a loud-confirm `git reset --hard` (default N) — declining must leave
+# HEAD untouched, accepting must move HEAD to the target. Pure git fixtures,
+# no docker.
+echo "[harness-test] T32: harness downgrade"
+DG_ROOT="$(mktemp -d -t harness-dg.XXXXXX)"
+cleanup_dg() { [[ -n "${DG_ROOT:-}" && -d "${DG_ROOT}" ]] && rm -rf "${DG_ROOT}"; }
+trap 'cleanup_dg; restore_agent_image; cleanup' EXIT INT TERM
+(
+    cd "${DG_ROOT}"
+    git init -q
+    git config user.email t@t
+    git config user.name t
+    echo 1 >f; git add f; git commit -qm c1; git tag v0.1
+    echo 2 >f; git commit -qam c2; git tag v1.0
+    echo 3 >f; git commit -qam c3
+)
+DG_BRANCH="$(cd "${DG_ROOT}" && git rev-parse --abbrev-ref HEAD)"
+DG_TIP="$(cd "${DG_ROOT}" && git rev-parse HEAD)"
+DG_V10="$(cd "${DG_ROOT}" && git rev-parse v1.0^{commit})"
+
+# T32.1 — from the untagged tip, target is the latest tag (v1.0).
+t32_tip=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    clone_dir="${DG_ROOT}"; _downgrade_target_tag
+)
+if [[ "${t32_tip}" != "v1.0" ]]; then
+    echo "[harness-test] T32.1 FAIL: tip target '${t32_tip}' != v1.0" >&2; exit 1
+fi
+
+# T32.2 — sitting exactly on v1.0, target is the prior tag (v0.1).
+(cd "${DG_ROOT}" && git checkout -q v1.0)
+t32_ontag=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    clone_dir="${DG_ROOT}"; _downgrade_target_tag
+)
+if [[ "${t32_ontag}" != "v0.1" ]]; then
+    echo "[harness-test] T32.2 FAIL: on-tag target '${t32_ontag}' != v0.1" >&2; exit 1
+fi
+
+# T32.3 — sitting on the earliest tag, no earlier tag → non-zero, no output.
+(cd "${DG_ROOT}" && git checkout -q v0.1)
+set +e
+t32_none=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    clone_dir="${DG_ROOT}"; _downgrade_target_tag
+)
+t32_none_rc=$?
+set -e
+if (( t32_none_rc == 0 )) || [[ -n "${t32_none}" ]]; then
+    echo "[harness-test] T32.3 FAIL: earliest tag should yield rc!=0 + empty (rc=${t32_none_rc} out='${t32_none}')" >&2; exit 1
+fi
+
+(cd "${DG_ROOT}" && git checkout -q "${DG_BRANCH}")
+
+# T32.4 — decline the reset: HEAD unchanged, non-zero exit.
+set +e
+t32_abort=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    clone_dir="${DG_ROOT}"; HARNESS_CONFIRM_FROM_STDIN=1
+    require_docker() { :; }
+    printf 'n\n' | cmd_downgrade --no-restart 2>&1
+)
+t32_abort_rc=$?
+set -e
+if (( t32_abort_rc == 0 )); then
+    echo "[harness-test] T32.4 FAIL: declined downgrade should exit non-zero" >&2
+    echo "${t32_abort}" >&2; exit 1
+fi
+if [[ "$(cd "${DG_ROOT}" && git rev-parse HEAD)" != "${DG_TIP}" ]]; then
+    echo "[harness-test] T32.4 FAIL: declined downgrade moved HEAD" >&2; exit 1
+fi
+
+# T32.5 — accept the reset with --no-restart: HEAD moves to v1.0, exit 0,
+# no rebuild attempted (no docker available here).
+set +e
+t32_do=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    clone_dir="${DG_ROOT}"; HARNESS_CONFIRM_FROM_STDIN=1
+    require_docker() { :; }
+    printf 'y\n' | cmd_downgrade --no-restart 2>&1
+)
+t32_do_rc=$?
+set -e
+if (( t32_do_rc != 0 )); then
+    echo "[harness-test] T32.5 FAIL: accepted downgrade rc=${t32_do_rc}" >&2
+    echo "${t32_do}" >&2; exit 1
+fi
+if [[ "$(cd "${DG_ROOT}" && git rev-parse HEAD)" != "${DG_V10}" ]]; then
+    echo "[harness-test] T32.5 FAIL: HEAD not reset to v1.0" >&2; exit 1
+fi
+cleanup_dg
+trap 'restore_agent_image; cleanup' EXIT INT TERM
+echo "[harness-test] T32 OK"
+
 echo "============================================================"
 echo " HARNESS TEST PASSED"
 echo "============================================================"
