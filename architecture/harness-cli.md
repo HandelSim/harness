@@ -52,15 +52,25 @@ The implementation has one `cmd_<name>` function per subcommand:
 |---|---|
 | Lifecycle | `start`, `down`, `restart`, `logs`, `unlock` |
 | Update / upgrade | `update`, `upgrade`, `check-updates` |
-| Agent launch | `claude`, `opencode`, `shell`, `list`, `stop`, `claude-statusline-config` |
+| Agent launch | `opencode`, `shell`, `list`, `stop` |
 | Diagnostics | `doctor`, `preflight`, `help` |
 | Test / bench | `test`, `benchmark` |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
 | MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
 
+### Bare `harness` launches the agent
+
+`main()` dispatches as follows: zero args, or a leading agent flag
+(anything starting with `-` other than `-h`/`--help`), launches an opencode
+agent in the CWD and forwards everything (`harness`, `harness --yolo`,
+`harness -p "x"`). `-h`/`--help` show help. A leading bare word is treated
+as a subcommand: known ones dispatch; an unknown word errors (so a typo
+like `harness statt` is caught instead of silently launching an agent).
+`harness opencode` remains as an explicit alias for the bare form.
+
 Agent-launch flags (`--yolo`, `--net`, `--mount`, `-p/--print`) are parsed
-inside `cmd_claude` / `cmd_opencode` / `cmd_shell` rather than centrally;
-they decide the `docker run` invocation, not compose flags.
+inside `run_agent` (opencode) / `cmd_shell` rather than centrally; they
+decide the `docker run` invocation, not compose flags.
 
 ## Compose wrapper (`compose()`)
 
@@ -96,7 +106,7 @@ and never tracked. It carries two things:
    the service's entrypoint or remove its `cap_add`.
 
 The `agent` pseudo-service is filtered out: agent containers are launched
-by direct `docker run` from `cmd_claude` / `cmd_opencode` / `cmd_shell`,
+by direct `docker run` from `run_agent` (opencode) / `cmd_shell`,
 not by compose. The agent launch path reads `.harness-net-overrides.json`
 directly.
 
@@ -105,7 +115,7 @@ so compose doesn't see a phantom services block.
 
 ## Agent launch path
 
-`cmd_claude` / `cmd_opencode` / `cmd_shell` do NOT go through compose.
+`run_agent` (opencode) / `cmd_shell` do NOT go through compose.
 They each:
 
 1. Parse agent flags (`--yolo`, `--net`, `--mount`, `-p/--print`).
@@ -116,7 +126,7 @@ They each:
    read-only mount, network `--network harness_harness-net`, and a
    per-launch unique container name.
 4. `docker run` the unified agent image (`harness-agent:latest`) with the
-   mode arg (`claude`, `opencode`, or `shell`) and any forwarded flags.
+   mode arg (`opencode` or `shell`) and any forwarded flags.
 
 The container name carries a per-launch random suffix, so multiple agents
 can run from the same directory at once. `list`/`stop`/the picker discover
@@ -124,20 +134,6 @@ agents by label (`harness.agent`/`tool`/`mount`), never by name, so the
 name needs no determinism — only uniqueness, to avoid Docker's unique-name
 collision. The `--print` path sets no name or labels and was already
 concurrent.
-
-### Greenfield seeding for `claude`
-
-Before the `docker run`, `run_agent` invokes `seed_claude_home` (when
-`tool == "claude"`) to pre-populate `state/agent/home/.claude.json` (and
-`.claude/settings.json`) with `hasCompletedOnboarding=true` plus a
-project-trust entry for the launch CWD. Without this, the first interactive
-run on a fresh state hangs on the theme picker / trust dialog instead of
-rendering the prompt.
-
-Idempotent: only writes when `.claude.json` is absent, so a returning user's
-state is never clobbered. Opencode does not use these files and is skipped.
-The same shape is written by the CI workflow's "Pre-seed claude-code
-settings" step — the runtime path brings that parity to local hosts.
 
 ## Update-available banner
 

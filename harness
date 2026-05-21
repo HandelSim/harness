@@ -16,7 +16,7 @@
 #     state/                               # gitignored — runtime state
 #       output/                            # bind-mounted into the proxy
 #       agent/home/                        # shared agent /home/harness
-#                                            (claude, opencode, shell)
+#                                            (opencode, shell)
 #       mcp/<name>/                        # active MCP services
 #       ollama-data/                       # ollama's blob store
 #
@@ -685,7 +685,7 @@ write_runtime_override() {
     #
     # The 'agent' pseudo-service is filtered out here: agent containers
     # are not in the compose model (they're started by direct docker run
-    # from cmd_claude/cmd_opencode/cmd_shell). The agent launch path
+    # from run_agent / cmd_shell). The agent launch path
     # reads the override file directly. Emitting a services.agent block
     # would either create a phantom compose service or trigger validation
     # warnings depending on the compose version.
@@ -1035,7 +1035,7 @@ _probe_upstream_auth() {
     esac
 }
 
-# Wrapper used by both `cmd_start` and `run_agent` (claude/opencode launch).
+# Wrapper used by both `cmd_start` and `run_agent` (opencode launch).
 # Runs `_probe_upstream_auth` and converts its tri-state return into the
 # desired control flow:
 #   rc=0 → key OK, return 0
@@ -1071,7 +1071,11 @@ cmd_help() {
 harness — manage the harness runtime.
 
 usage:
-  harness <command> [args...]
+  harness [agent-args...]      launch an opencode agent in the current directory
+  harness <command> [args...]  run a management command
+
+Running 'harness' with no command — or with only agent flags such as --yolo,
+--net, --mount, or -p — launches an opencode agent in the current directory.
 
 commands:
   start                 build and bring up the ollama + proxy services
@@ -1086,16 +1090,13 @@ commands:
   check-updates         synchronously check origin/main and report whether
                         this checkout is up to date or N commits behind.
                         Set HARNESS_SKIP_UPDATE_CHECK=1 to silence the
-                        per-invocation banner shown by claude/opencode/shell.
+                        per-invocation banner shown on agent launch.
   logs [service ...]    follow compose logs (no args = all services)
-  claude  [args]        launch a claude-code agent in the current directory
   opencode [args]       launch an opencode agent in the current directory
+                        (same as running bare 'harness')
   shell [--mount PATH]... drop into a bash shell inside the agent container
                         (for installing skills, debugging — shares the home
-                        directory with claude/opencode launches)
-  claude-statusline-config
-                        run the ccstatusline configurator inside an ephemeral
-                        agent container (no ollama/proxy needed)
+                        directory with agent launches)
   list                  list running harness agent containers
   stop   [name]         stop a running agent (picker if no name)
   net <subcmd>          manage the egress allowlist + per-service firewall
@@ -1130,9 +1131,8 @@ agent flags:
                         defaults via HARNESS_EXTRA_MOUNTS in .env (colon-
                         separated). The CWD is always mounted, regardless
                         of --mount; the agent always starts in the CWD.
-  -p, --print "PROMPT"  headless single-shot invocation; for claude
-                        forwards its native -p flag, for opencode invokes
-                        `opencode run` inside the container
+  -p, --print "PROMPT"  headless single-shot invocation; runs `opencode run`
+                        inside the container
 
 'harness mcp' subcommands:
   mcp list [--available]            show installed MCPs (and registry with --available)
@@ -1226,7 +1226,7 @@ cmd_down() {
     require_docker
 
     # Stop any agent containers attached to this project's network. They were
-    # started by `harness claude`/`opencode` via direct docker run (not
+    # started by `harness opencode` via direct docker run (not
     # compose), so compose doesn't know about them — but they hold the
     # network in use, blocking compose's network teardown and forcing the
     # user to clean up by hand.
@@ -1760,20 +1760,19 @@ cmd_logs() {
 
 # Single shared agent image and home directory.
 #
-# After the unification (Phase 13a), claude and opencode share both the
-# image and the persistent home. The entrypoint dispatches on a mode arg
-# (claude/opencode/shell) so user-installed skills and tools (pipx,
-# pip --user, ~/.gitconfig, etc.) are visible across all modes. Build-time
-# skel content is restored on first run by the entrypoint via
-# /etc/skel/harness/.
+# The agent image and persistent home are shared across modes. The
+# entrypoint dispatches on a mode arg (opencode/shell) so user-installed
+# skills and tools (pipx, pip --user, ~/.gitconfig, etc.) are visible across
+# all modes. Build-time skel content is restored on first run by the
+# entrypoint via /etc/skel/harness/.
 agent_image() { printf 'harness-agent:latest'; }
 agent_home_dir() { printf '%s' "$state_root/agent/home"; }
 
 # Write the merged MCP client config to <install-root>/state/agent/home/
 # .harness-mcp-servers.json so the entrypoint picks it up at startup. The
-# harness emits a single claude-style shape —
-# `{"mcpServers": {"<name>": {...}}}` — and the entrypoint translates to
-# opencode's `mcp` block when needed. We rewrite this file on every agent
+# harness emits a single canonical
+# `{"mcpServers": {"<name>": {...}}}` shape — and the entrypoint translates
+# to opencode's `mcp` block when needed. We rewrite this file on every agent
 # launch so disabling an MCP propagates without leaving stale entries.
 #
 # When no MCPs are active, the file is removed so the entrypoint's "merge
@@ -1815,76 +1814,7 @@ write_agent_mcp_config() {
     fi
 }
 
-# Pre-seed claude-code's onboarding state so the first interactive run on a
-# fresh state/agent/home/ does not stall on the theme picker / trust dialog.
-# Idempotent: only writes when .claude.json is absent. Never clobbers a real
-# config a returning user has built up.
-#
-# Two files are seeded (per the v2.1.120 disassembly findings recorded in
-# .github/workflows/ci.yml around line 264):
-#   - .claude.json         — the onboarding gate (QN9) reads this, not
-#                            settings.json. Without hasCompletedOnboarding=true
-#                            here, the TUI renders the theme picker instead
-#                            of the prompt.
-#   - .claude/settings.json — theme preference; claude writes one on first
-#                             run, so seeding it suppresses the picker even
-#                             before the .claude.json gate fires.
-# The projects map keyed by mount_path mirrors the CI seed and pre-accepts
-# the trust dialog for the directory the user just launched from — which is
-# exactly the directory the dialog would prompt them to trust anyway.
-#
-# CI's e2e jobs already do this seeding inline (ci.yml: "Pre-seed claude-code
-# settings"). This brings parity for greenfield local hosts so contributors
-# don't hit a 90s timeout on the first run.
-seed_claude_home() {
-    local agent_home="$1"
-    local mount_path="$2"
-
-    local top_state="$agent_home/.claude.json"
-    local settings_dir="$agent_home/.claude"
-    local settings_file="$settings_dir/settings.json"
-
-    # Idempotency gate: presence of .claude.json means claude (or a prior
-    # seed) has already initialized this home. Bail rather than overwrite.
-    if [[ -f "$top_state" ]]; then
-        return 0
-    fi
-
-    mkdir -p "$settings_dir"
-    if [[ ! -f "$settings_file" ]]; then
-        printf '%s\n' '{"theme":"dark","includeCoAuthoredBy":false}' >"$settings_file"
-    fi
-
-    # mount_path is a POSIX absolute path the user just cd'd into; safe to
-    # embed verbatim in JSON (no escaping needed for ", \, or control chars
-    # in a path the shell could resolve). lastOnboardingVersion mirrors the
-    # CI seed shape — see ci.yml for the source of these constants.
-    cat >"$top_state" <<JSON
-{
-  "theme": "dark",
-  "hasCompletedOnboarding": true,
-  "firstStartTime": "2026-01-01T00:00:00.000Z",
-  "migrationVersion": 12,
-  "opusProMigrationComplete": true,
-  "sonnet1m45MigrationComplete": true,
-  "userID": "harness-greenfield-seed-0000000000000000000000000000000000000000",
-  "numStartups": 1,
-  "lastOnboardingVersion": {
-    "ISSUES_EXPLAINER": "report the issue at https://github.com/anthropics/claude-code/issues",
-    "PACKAGE_URL": "@anthropic-ai/claude-code",
-    "README_URL": "https://code.claude.com/docs/en/overview",
-    "VERSION": "2.1.120",
-    "FEEDBACK_CHANNEL": "https://github.com/anthropics/claude-code/issues",
-    "BUILD_TIME": "2026-04-24T19:00:00.000Z"
-  },
-  "projects": {
-    "${mount_path}": {"hasTrustDialogAccepted": true}
-  }
-}
-JSON
-}
-
-# Run an agent (claude or opencode) in the current directory.
+# Run an opencode agent in the current directory.
 #
 # The agent's CWD is bind-mounted at the same absolute host path inside the
 # container (e.g. /home/me/proj → /home/me/proj, /c/Users/you/proj →
@@ -1896,15 +1826,14 @@ JSON
 # at /home/harness; the firewall allowlist at /etc/harness/allowlist:ro.
 #
 # -p / --print uses the same foreground path with HARNESS_PRINT_MODE=1 set
-# (which makes opencode use `opencode run` and skips claude's first-run
-# dialogs).
+# (which makes opencode use `opencode run`).
 run_agent() {
     local tool="$1"; shift
 
     # Parse --yolo, --net, --mount, and -p/--print. --yolo and --net can
-    # appear anywhere; -p/--print is preserved in pass_args (claude consumes
-    # it as its own headless flag; opencode's entrypoint detects it and
-    # switches to `opencode run`). --mount takes a path argument and is
+    # appear anywhere; -p/--print is preserved in pass_args (opencode's
+    # entrypoint detects it and switches to `opencode run`). --mount takes
+    # a path argument and is
     # repeatable; the path is resolved+validated here (relative paths
     # become absolute, missing paths error out) and never reaches the
     # agent CLI.
@@ -1955,7 +1884,7 @@ run_agent() {
     require_docker
 
     # Probe upstream auth before doing anything expensive. When services are
-    # already up (the common case for `harness claude` / `harness opencode`),
+    # already up (the common case for `harness` / `harness opencode`),
     # `ensure_services_up` is a no-op and `cmd_start`'s probe never runs —
     # the agent would otherwise launch and surface a locked key as an opaque
     # error from the proxy. Gating here makes the unlock URL appear before
@@ -2041,14 +1970,6 @@ run_agent() {
     # current set of enabled MCPs. Done after mkdir so the dir exists.
     write_agent_mcp_config
 
-    # Pre-seed claude-code's onboarding state on greenfield homes so the
-    # first run renders the prompt instead of the theme picker. Idempotent;
-    # only seeds when .claude.json is absent. Opencode has its own onboarding
-    # gates and does not use these files, so this is claude-only.
-    if [[ "$tool" == "claude" ]]; then
-        seed_claude_home "$agent_home" "$mount_path"
-    fi
-
     # Build image on demand if missing — different from the per-tool
     # behavior pre-13a where `harness start` was the only build path.
     # `harness <tool>` is the natural first command users try; auto-build
@@ -2103,15 +2024,6 @@ agent_common_env() {
         # "0" explicitly when not opted-in is intentional: a stale value in
         # the environment can't accidentally re-enable the bypass.
         printf -- '-e\nHARNESS_FIREWALL_DISABLED=1\n'
-    fi
-    if [[ "$tool" == "claude" ]]; then
-        printf -- '-e\nANTHROPIC_BASE_URL=http://ollama:11434\n'
-        # AUTH_TOKEN (not API_KEY): claude-code's startup connectivity probe
-        # to api.anthropic.com is gated to skip when AUTH_TOKEN is set; with
-        # only API_KEY it hard-exits behind our default firewall.
-        printf -- '-e\nANTHROPIC_AUTH_TOKEN=harness-dummy\n'
-        printf -- '-e\nANTHROPIC_MODEL=%s\n' "$agent_model"
-        printf -- '-e\nANTHROPIC_SMALL_FAST_MODEL=%s\n' "$agent_model"
     fi
 }
 
@@ -2227,7 +2139,7 @@ run_agent_interactive() {
 
 # Headless single-shot agent invocation. No tmux, no detach, no labels (so
 # it doesn't appear in `harness list`). Container is auto-removed on exit.
-# stdin handling: -it if running on a TTY, -i otherwise — claude needs the
+# stdin handling: -it if running on a TTY, -i otherwise — the agent needs the
 # TTY for some output formats but pipe-based callers shouldn't get a TTY.
 run_agent_print() {
     local tool="$1" yolo="$2" net_open="$3" mount_path="$4" image="$5"
@@ -2298,7 +2210,7 @@ run_agent_print() {
 }
 
 # Drop into an interactive bash shell inside the unified agent container.
-# Uses the same shared home as `harness claude` / `harness opencode`, so any
+# Uses the same shared home as `harness opencode`, so any
 # install (pipx, pip --user, etc.) the user does in here is visible to the
 # agent commands later. Useful for installing skill-style tools (graphify),
 # poking around, debugging.
@@ -2307,7 +2219,7 @@ cmd_shell() {
     ensure_dirs
 
     # Same --mount parsing as run_agent. The shell shares the same mount
-    # contract with claude/opencode: CWD at its host path, plus any
+    # contract with opencode: CWD at its host path, plus any
     # extras the user passed (or set in HARNESS_EXTRA_MOUNTS).
     local extra_mounts=()
     local expecting_mount_arg=0
@@ -2398,7 +2310,7 @@ cmd_shell() {
 
     # Persistent agent firewall override (`harness net open agent`) lets the
     # shell launch with the firewall disabled too. Mirrors the run_agent
-    # logic for claude/opencode launches.
+    # logic for opencode launches.
     local fw_args=()
     if [[ -f "$net_overrides_path" ]]; then
         local agent_override
@@ -3352,8 +3264,8 @@ net_known_services() {
         return 0
     fi
     # Agent is a pseudo-service: agent containers aren't in compose
-    # (they're started by direct docker run from cmd_claude/cmd_opencode/
-    # cmd_shell), but the override file can still record an 'agent'
+    # (they're started by direct docker run from run_agent / cmd_shell),
+    # but the override file can still record an 'agent'
     # entry. The agent launch path reads it and applies
     # HARNESS_FIREWALL_DISABLED=1.
     printf '%s\n' "$svcs"
@@ -3660,95 +3572,6 @@ cmd_net() {
             exit 1
             ;;
     esac
-}
-
-# --- claude-statusline-config -----------------------------------------------
-#
-# Run the ccstatusline TUI inside an ephemeral claude container without
-# bringing up ollama or the proxy — the statusline binary doesn't need either.
-# We mount only the agent home so changes persist and the universal firewall
-# allowlist is still applied.
-cmd_claude_statusline_config() {
-    require_docker
-    ensure_dirs
-    local image
-    image=$(agent_image)
-    if ! harness_docker image inspect "$image" >/dev/null 2>&1; then
-        # Build the image without starting the rest of the stack. We use
-        # `compose build` so the agent profile/path resolution matches
-        # `harness start` exactly.
-        echo "harness: building $image (one-time)..."
-        compose --profile agent build agent
-    fi
-    local agent_config_dir
-    agent_config_dir=$(agent_home_dir)
-    mkdir -p "$agent_config_dir"
-
-    local tty_flag="-it"
-    [[ -t 0 ]] || tty_flag="-i"
-
-    # Network: harness-net IS NOT required for the configurator (it doesn't
-    # talk to ollama). We attach to it anyway so the same firewall rules apply
-    # — `ccstatusline` is a local TUI but consistency wins.
-    local network="${project_name}_harness-net"
-
-    # If the network doesn't exist (services have never been started), use
-    # bridge — the configurator still works without ollama/proxy reachability.
-    if ! harness_docker network inspect "$network" >/dev/null 2>&1; then
-        network="bridge"
-    fi
-
-    local acd_host alp_host
-    acd_host=$(harness_docker_path "$agent_config_dir")
-    alp_host=$(harness_docker_path "$allowlist_path")
-
-    # exec bypasses the EXIT trap — reap the jq sidecar before it.
-    _reap_jq_sidecar
-    harness_docker_exec run --rm "$tty_flag" \
-        --user 0:0 \
-        --network "$network" \
-        --cap-add NET_ADMIN \
-        --cap-add NET_RAW \
-        --sysctl net.ipv6.conf.all.disable_ipv6=1 \
-        -e "HOST_UID=$(id -u)" \
-        -e "HOST_GID=$(id -g)" \
-        -e "HARNESS_PRINT_MODE=1" \
-        -v "$acd_host:/home/harness" \
-        -v "$alp_host:/etc/harness/allowlist:ro" \
-        --entrypoint /bin/bash \
-        "$image" \
-        -c '
-            set -e
-            # Reuse the entrypoints uid-remap + skel-seed paths so the home
-            # is in the same shape as a real claude launch. We invoke them
-            # explicitly because we override --entrypoint.
-            if [[ "$(id -u)" == "0" && -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
-                if [[ -x /usr/local/bin/init-firewall.sh ]]; then
-                    /usr/local/bin/init-firewall.sh || true
-                fi
-                current_uid=$(id -u harness 2>/dev/null || echo "")
-                current_gid=$(id -g harness 2>/dev/null || echo "")
-                if [[ "${current_uid}" != "${HOST_UID}" || "${current_gid}" != "${HOST_GID}" ]]; then
-                    groupmod -g "${HOST_GID}" -o harness 2>/dev/null \
-                        || groupadd -g "${HOST_GID}" -o harness
-                    usermod -u "${HOST_UID}" -g "${HOST_GID}" -o harness
-                    chown -R "${HOST_UID}:${HOST_GID}" /home/harness 2>/dev/null || true
-                fi
-                exec gosu harness /bin/bash -lc "
-                    if [[ ! -f \$HOME/.harness-home-initialized ]]; then
-                        cp -an /etc/skel/harness/. \$HOME/ 2>/dev/null || true
-                        touch \$HOME/.harness-home-initialized
-                    fi
-                    exec ccstatusline
-                "
-            fi
-            # Already non-root (test path).
-            if [[ ! -f $HOME/.harness-home-initialized ]]; then
-                cp -an /etc/skel/harness/. $HOME/ 2>/dev/null || true
-                touch $HOME/.harness-home-initialized
-            fi
-            exec ccstatusline
-        '
 }
 
 # --- doctor -----------------------------------------------------------------
@@ -4688,11 +4511,32 @@ cmd_benchmark() {
 # --- dispatch ---------------------------------------------------------------
 
 main() {
-    local cmd="${1:-help}"
-    if [[ $# -gt 0 ]]; then shift; fi
+    # Dispatch: bare `harness` (no args) — or `harness` followed by an agent
+    # flag like --yolo / -p — launches an opencode agent in the current
+    # directory and forwards everything. The help flags (-h/--help) are the
+    # one flag exception and show help. A leading bare word is a subcommand:
+    # known ones dispatch; an unknown one errors (so a typo like
+    # `harness statt` is caught instead of silently launching an agent).
+    if [[ $# -eq 0 ]]; then
+        run_agent opencode
+        return
+    fi
+
+    case "$1" in
+        -h|--help)
+            cmd_help
+            return
+            ;;
+        -*)
+            run_agent opencode "$@"
+            return
+            ;;
+    esac
+
+    local cmd="$1"; shift
 
     case "$cmd" in
-        help|-h|--help)             cmd_help ;;
+        help)                       cmd_help ;;
         start)                      cmd_start ;;
         down)                       cmd_down ;;
         restart)                    cmd_restart ;;
@@ -4700,10 +4544,8 @@ main() {
         upgrade)                    cmd_upgrade "$@" ;;
         check-updates)              cmd_check_updates "$@" ;;
         logs)                       cmd_logs "$@" ;;
-        claude)                     run_agent claude   "$@" ;;
         opencode)                   run_agent opencode "$@" ;;
         shell)                      cmd_shell "$@" ;;
-        claude-statusline-config)   cmd_claude_statusline_config "$@" ;;
         list)                       cmd_list ;;
         stop)                       cmd_stop "$@" ;;
         net)                        cmd_net "$@" ;;
