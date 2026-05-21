@@ -63,11 +63,24 @@ Uninstall is `rm -rf <install-root> && rm ~/.local/bin/harness`.
 when all you want is the latest harness code with no side effects on
 config or state. No image rebuilds, no compose restart.
 
+If the clone's branch has **diverged** from its upstream (the remote was
+rebased/force-pushed, so `--ff-only` can't proceed), `update` re-fetches
+and — only on a true divergence, only with a terminal — offers a
+`git reset --hard @{u}` that discards the local commits to recover. The
+prompt defaults to **N**; declining (or any non-divergence pull failure,
+or no terminal) aborts as before. Shares the `_upgrade_pull_or_reset`
+helper with `harness upgrade`.
+
 ## `harness upgrade` — full flow
 
 `harness upgrade` runs the full migration flow:
 
-1. `git pull --ff-only` in the clone.
+1. `git pull --ff-only` in the clone. If the branch has **diverged** from
+   its upstream (so a fast-forward is impossible), re-fetch and — only on
+   a true divergence — offer a `git reset --hard @{u}` recovery
+   (defaults to N; `--no-prompt`/CI never auto-resets; non-divergence
+   failures abort unchanged). Accepting the reset advances `HEAD`, so the
+   re-exec in 1a fires and the rest of the upgrade runs on the reset code.
 1a. **If the pull advanced `HEAD`**, re-exec into the freshly-pulled
    `harness` with `--resume-after-pull` so `cmd_upgrade`'s own
    orchestration (flag parser, manifest runner, rebuild/restart) runs

@@ -1266,8 +1266,13 @@ cmd_restart() {
 }
 
 cmd_update() {
-    cd "$clone_dir"
-    git pull --ff-only
+    # Code-only fast-forward pull. On a diverged history it offers the same
+    # interactive `reset --hard` recovery as `harness upgrade` (no auto-reset
+    # without confirmation; aborts as before when there's no terminal).
+    if ! _upgrade_pull_or_reset 1; then
+        err "update aborted"
+        return 1
+    fi
 }
 
 # y/n confirmation prompt for cmd_upgrade. Reads from /dev/tty by default
@@ -1284,10 +1289,14 @@ cmd_update() {
 # HARNESS_CONFIRM_FROM_STDIN=1 reads from FD 0 instead of /dev/tty; this
 # is a test hook only — production callers must leave it unset.
 #
-# Returns 0 to proceed, 1 to abort. Empty/y/Y/yes/YES proceed; anything
-# else aborts.
+# Returns 0 to proceed, 1 to abort. y/Y/yes/YES proceed; n/N/no/NO and any
+# other keystroke abort. An empty answer (Enter) resolves to the optional
+# second argument `default`: "y" → proceed (the historical behavior, kept
+# for existing callers), "n" → abort (used by destructive prompts like the
+# divergence reset). Defaults to "y" so callers that omit it are unchanged.
 _upgrade_confirm() {
     local prompt="$1"
+    local default="${2:-y}"
     local ans
     if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
         IFS= read -rp "$prompt" ans || ans=""
@@ -1295,10 +1304,99 @@ _upgrade_confirm() {
         IFS= read -rp "$prompt" ans </dev/tty
     fi
     ans=${ans%$'\r'}
-    case "${ans:-}" in
-        ""|y|Y|yes|YES) return 0 ;;
+    if [[ -z "${ans:-}" ]]; then
+        case "$default" in
+            n|N) return 1 ;;
+            *)   return 0 ;;
+        esac
+    fi
+    case "$ans" in
+        y|Y|yes|YES) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Resolve the upstream tracking ref of the clone's current branch (e.g.
+# "origin/dev"), or empty if the branch has no upstream configured.
+_git_upstream_ref() {
+    git -C "$clone_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null
+}
+
+# Return 0 if the clone's HEAD and its upstream have genuinely DIVERGED —
+# each carries commit(s) the other lacks — and 1 otherwise (no upstream,
+# fast-forwardable, only-ahead, identical, or any git error). Divergence is
+# the one state where `git pull --ff-only` cannot proceed yet a
+# `reset --hard @{u}` is a meaningful recovery: a merely-behind branch
+# fast-forwards on its own, and a merely-ahead branch has nothing upstream
+# to reset to. Callers must fetch first so @{u} reflects the real remote.
+_git_branches_diverged() {
+    local counts behind ahead
+    # `@{u}...HEAD` with --left-right --count prints "<behind>\t<ahead>":
+    # left = commits in upstream not in HEAD, right = commits in HEAD not
+    # in upstream.
+    counts=$(git -C "$clone_dir" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null) || return 1
+    behind=${counts%%[[:space:]]*}
+    ahead=${counts##*[[:space:]]}
+    [[ "$behind" =~ ^[0-9]+$ && "$ahead" =~ ^[0-9]+$ ]] || return 1
+    if (( behind > 0 && ahead > 0 )); then
+        return 0
+    fi
+    return 1
+}
+
+# Pull latest code into the clone, recovering from a diverged history when
+# possible. Returns 0 if the working tree is now at the upstream tip (the
+# pull fast-forwarded, OR the user accepted a reset), non-zero if the
+# caller should abort its operation.
+#
+# On an --ff-only failure we re-fetch and check for true divergence. Only
+# then — and only when allow_prompt=1 with a terminal available — do we
+# offer a `git reset --hard @{u}`. Any other failure (offline, dirty tree,
+# no upstream) aborts unchanged, and CI / --no-prompt (allow_prompt=0)
+# never auto-resets: silently discarding history is too dangerous for
+# automation. .env, .harness-allowlist and state/ are gitignored, so a
+# reset only rolls back tracked harness code — user config/state survive.
+_upgrade_pull_or_reset() {
+    local allow_prompt="${1:-0}"
+
+    if git -C "$clone_dir" pull --ff-only; then
+        return 0
+    fi
+
+    # The pull failed. Re-fetch so the divergence check sees the true
+    # upstream tip, then distinguish the recoverable diverged-history case
+    # from failures a reset must NOT paper over.
+    git -C "$clone_dir" fetch --quiet 2>/dev/null || true
+    if ! _git_branches_diverged; then
+        return 1
+    fi
+
+    local upstream ahead
+    upstream=$(_git_upstream_ref)
+    ahead=$(git -C "$clone_dir" rev-list --count '@{u}..HEAD' 2>/dev/null) || ahead="?"
+
+    err "git pull failed: your branch has diverged from ${upstream}"
+    err "(${ahead} local commit(s) not on ${upstream}; a fast-forward isn't possible)."
+
+    if (( ! allow_prompt )); then
+        err "refusing to auto-reset without confirmation; aborting."
+        return 1
+    fi
+    if [[ ! -t 0 && ! -e /dev/tty ]]; then
+        err "no terminal to confirm a reset on; aborting. Re-run interactively to recover."
+        return 1
+    fi
+
+    if _upgrade_confirm "Reset --hard to ${upstream}? This DISCARDS those local commit(s) and any uncommitted changes to tracked files. [y/N] " n; then
+        if git -C "$clone_dir" reset --hard '@{u}'; then
+            err "reset to ${upstream} complete."
+            return 0
+        fi
+        err "git reset --hard failed; aborting."
+        return 1
+    fi
+    err "reset declined; aborting. Resolve the divergence manually (e.g. cd into the install dir and run 'git reset --hard @{u}')."
+    return 1
 }
 
 cmd_upgrade() {
@@ -1335,6 +1433,11 @@ flags:
 
 Declining the "apply?" prompt skips only the file merges — the upgrade
 still rebuilds images and restarts. Use Ctrl-C to abort entirely.
+
+If 'git pull' can't fast-forward because the clone's branch has diverged
+from its upstream (e.g. the remote was rebased), upgrade offers a
+'git reset --hard' to the upstream that DISCARDS local commits/changes to
+tracked files — defaults to N, and is never offered under --no-prompt.
 
 The set of upgrade actions is driven by scripts/upgrade-manifest.json. Each
 action describes how a file harness manages inside the install root (which
@@ -1375,13 +1478,18 @@ EOF
             echo "harness: skipping git pull (continuing from re-exec after pull)"
         else
             local head_before head_after
-            head_before=$(cd "$clone_dir" && git rev-parse HEAD 2>/dev/null) || head_before=""
+            head_before=$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null) || head_before=""
             echo "harness: pulling latest..."
-            if ! (cd "$clone_dir" && git pull --ff-only); then
-                err "git pull failed; aborting upgrade"
+            # On a diverged history, offer a reset --hard recovery unless
+            # this is a non-interactive run (--no-prompt): a silent
+            # history-discarding reset is too dangerous for automation.
+            local allow_reset_prompt=1
+            (( no_prompt )) && allow_reset_prompt=0
+            if ! _upgrade_pull_or_reset "$allow_reset_prompt"; then
+                err "aborting upgrade"
                 exit 1
             fi
-            head_after=$(cd "$clone_dir" && git rev-parse HEAD 2>/dev/null) || head_after=""
+            head_after=$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null) || head_after=""
             # If the pull advanced HEAD, re-exec into the freshly-pulled
             # harness so cmd_upgrade's own orchestration shell — flag
             # parsing, the rebuild/restart sequence, manifest-runner — runs

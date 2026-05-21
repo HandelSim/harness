@@ -718,6 +718,158 @@ upgrade_envfile_needs_merge "${T10_DIR}/source.env" "${T10_DIR}/partial.env" \
     && fail "T10.9: precheck still reports work after the merge applied it"
 ok "T10.9: precheck flips to up-to-date once the merge has run"
 
+# === Test 11: _git_branches_diverged classification ======================
+#
+# Issue #80: `harness upgrade` / `harness update` must detect the one git
+# state where `git pull --ff-only` can't proceed but a `reset --hard @{u}`
+# is a meaningful recovery — a TRUE divergence (local has commits the
+# upstream lacks AND is behind it). `_git_branches_diverged` is the gate;
+# get it wrong and we'd either offer a destructive reset when a plain
+# fast-forward would do, or fail to offer it when the user is genuinely
+# stuck. This builds real two-repo git fixtures (origin + clone with an
+# upstream tracking ref) for each state and asserts the classification.
+#
+# The helper lives in the `harness` script, so we source it the same way
+# T8 sources `_upgrade_confirm`. It reads the global `clone_dir`; each
+# case points `clone_dir` at the fixture clone and restores it after.
+
+echo
+echo "--- T11: _git_branches_diverged classification ---"
+
+# Source the harness script for its helpers if T8 didn't already (T8 runs
+# first in this file, but guard so T11 is self-contained if reordered).
+if ! declare -F _git_branches_diverged >/dev/null 2>&1; then
+    mkdir -p "${WORK}/t11-install"
+    # shellcheck disable=SC1091
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${WORK}/t11-install" \
+        source "${REPO_ROOT}/harness"
+fi
+declare -F _git_branches_diverged >/dev/null 2>&1 \
+    || fail "T11: _git_branches_diverged not defined after sourcing harness"
+
+T11_SAVED_CLONE_DIR="${clone_dir:-}"
+
+# Build a fresh origin+clone pair with a shared base commit. Echoes the
+# clone path. The clone has an upstream tracking ref (origin/<branch>).
+t11_make_pair() {
+    local base="$1"
+    local origin="${base}/origin"
+    local clone="${base}/clone"
+    mkdir -p "${origin}"
+    git -C "${origin}" init -q
+    git -C "${origin}" config user.email t@example.com
+    git -C "${origin}" config user.name tester
+    echo base >"${origin}/f.txt"
+    git -C "${origin}" add f.txt
+    git -C "${origin}" commit -qm base
+    git clone -q "${origin}" "${clone}"
+    git -C "${clone}" config user.email t@example.com
+    git -C "${clone}" config user.name tester
+    echo "${clone}"
+}
+
+# Add a commit on the given repo (origin or clone working tree).
+t11_commit() {
+    local repo="$1" content="$2"
+    echo "${content}" >>"${repo}/f.txt"
+    git -C "${repo}" commit -aqm "${content}"
+}
+
+# rc 0 → diverged; rc 1 → not diverged.
+diverged_case() {
+    local repo="$1" expected="$2" label="$3" rc=0
+    clone_dir="${repo}"
+    _git_branches_diverged || rc=$?
+    clone_dir="${T11_SAVED_CLONE_DIR}"
+    [[ "${rc}" == "${expected}" ]] \
+        || fail "T11 [${label}]: expected rc=${expected}, got rc=${rc}"
+}
+
+# 11.1: up-to-date (HEAD == @{u}) → NOT diverged.
+T11A="${WORK}/t11a"; mkdir -p "${T11A}"
+CLONE_A=$(t11_make_pair "${T11A}")
+diverged_case "${CLONE_A}" 1 "up-to-date"
+ok "T11.1: up-to-date branch → not diverged"
+
+# 11.2: behind only (origin advanced, clone fetched but not merged) → NOT
+# diverged (a plain fast-forward, no reset warranted).
+T11B="${WORK}/t11b"; mkdir -p "${T11B}"
+CLONE_B=$(t11_make_pair "${T11B}")
+t11_commit "${T11B}/origin" remote-1
+git -C "${CLONE_B}" fetch -q
+diverged_case "${CLONE_B}" 1 "behind-only"
+ok "T11.2: behind-only branch → not diverged (fast-forwardable)"
+
+# 11.3: ahead only (clone has a local commit, origin unchanged) → NOT
+# diverged (nothing upstream to reset to).
+T11C="${WORK}/t11c"; mkdir -p "${T11C}"
+CLONE_C=$(t11_make_pair "${T11C}")
+t11_commit "${CLONE_C}" local-1
+git -C "${CLONE_C}" fetch -q
+diverged_case "${CLONE_C}" 1 "ahead-only"
+ok "T11.3: ahead-only branch → not diverged"
+
+# 11.4: genuinely diverged — origin AND clone each gained a different
+# commit on top of the shared base; clone fetched so @{u} is the origin
+# tip. This is the ONLY case that should report diverged.
+T11D="${WORK}/t11d"; mkdir -p "${T11D}"
+CLONE_D=$(t11_make_pair "${T11D}")
+t11_commit "${T11D}/origin" remote-1
+t11_commit "${CLONE_D}" local-1
+git -C "${CLONE_D}" fetch -q
+diverged_case "${CLONE_D}" 0 "diverged"
+ok "T11.4: diverged branch (ahead>0 AND behind>0) → diverged"
+
+# 11.5: no upstream configured → NOT diverged (helper must not error out;
+# @{u} resolution fails and we report 'not diverged' so the caller aborts
+# rather than offering a reset against a nonexistent ref).
+T11E="${WORK}/t11e"; mkdir -p "${T11E}"
+git -C "${T11E}" init -q
+git -C "${T11E}" config user.email t@example.com
+git -C "${T11E}" config user.name tester
+echo x >"${T11E}/f.txt"
+git -C "${T11E}" add f.txt
+git -C "${T11E}" commit -qm only
+diverged_case "${T11E}" 1 "no-upstream"
+ok "T11.5: branch with no upstream → not diverged (no spurious reset offer)"
+
+# === Test 12: _upgrade_confirm default-N classification ==================
+#
+# Issue #80: the destructive divergence-reset prompt must default to N, so
+# a bare Enter aborts. T8 covers the historical default (empty → proceed);
+# this covers the new `default` arg, including that passing "y" / unset
+# preserves the old behavior for existing callers.
+
+echo
+echo "--- T12: _upgrade_confirm default-N classification ---"
+declare -F _upgrade_confirm >/dev/null 2>&1 \
+    || fail "T12: _upgrade_confirm not defined after sourcing harness"
+export HARNESS_CONFIRM_FROM_STDIN=1
+
+# Each case: (input, default, expected_rc, label). rc 0 → proceed; 1 → abort.
+confirm_default_case() {
+    local input="$1" default="$2" expected="$3" label="$4" rc=0
+    _upgrade_confirm "test? " "${default}" <<<"${input}" >/dev/null || rc=$?
+    [[ "${rc}" == "${expected}" ]] \
+        || fail "T12 [${label}]: input=$(printf '%q' "${input}") default=${default} expected rc=${expected}, got rc=${rc}"
+}
+
+# default=n: empty/Enter must ABORT (the issue-#80 requirement).
+confirm_default_case ""      n 1 "empty + default n → abort"
+confirm_default_case $'\r'   n 1 "bare CR + default n → abort"
+confirm_default_case "n"     n 1 "n + default n → abort"
+confirm_default_case "x"     n 1 "stray + default n → abort"
+# default=n: explicit yes still proceeds.
+confirm_default_case "y"     n 0 "y overrides default n"
+confirm_default_case "yes"   n 0 "yes overrides default n"
+confirm_default_case $'y\r'  n 0 "y+CR overrides default n"
+# default=y (and the unset default) must keep the historical behavior.
+confirm_default_case ""      y 0 "empty + default y → proceed"
+confirm_default_case "n"     y 1 "n + default y → abort"
+
+unset HARNESS_CONFIRM_FROM_STDIN
+ok "T12: _upgrade_confirm honors default-N (Enter aborts) without breaking default-Y callers"
+
 echo
 echo "============================================================"
 echo " UPGRADE TEST PASSED"

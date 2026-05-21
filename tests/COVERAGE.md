@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 379 IDs (F=141, P=56, A=22, M=23, N=30, U=29, Pe=17, O=16, I=45).
+Inventory total: 382 IDs (F=144, P=56, A=22, M=23, N=30, U=29, Pe=17, O=16, I=45).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -61,16 +61,16 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   248 |   65.4% |
-| yellow   |     4 |    1.1% |
-| red      |   127 |   33.5% |
-| **total**|   379 |  100.0% |
+| green    |   250 |   65.4% |
+| yellow   |     5 |    1.3% |
+| red      |   127 |   33.2% |
+| **total**|   382 |  100.0% |
 
 Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
-| F      |   141 |   100 |      1 |  40 |
+| F      |   144 |   102 |      2 |  40 |
 | P      |    56 |    42 |      1 |  13 |
 | A      |    22 |    10 |      0 |  12 |
 | M      |    23 |    18 |      0 |   5 |
@@ -81,9 +81,9 @@ Per-prefix breakdown:
 | I      |    45 |    29 |      1 |  15 |
 
 (Per-prefix counts derived directly from this file's status column; they
-reconcile to the total table above. The remaining yellows — F102, P008,
-Pe006, and I044 — are indirect-evidence items where the surrounding test
-infrastructure would need substantive extension to promote.)
+reconcile to the total table above. The remaining yellows — F102, F142,
+P008, Pe006, and I044 — are indirect-evidence items where the surrounding
+test infrastructure would need substantive extension to promote.)
 
 Spot-checks performed (regression detection)
 --------------------------------------------
@@ -158,6 +158,9 @@ non-green rows — the gap.
 | F038 | red    | —                                           | —                                                                                                     | No test exercises `harness upgrade --rebuild` (would need to assert `docker compose build --no-cache` ran). |
 | F039 | green  | tests/upgrade_test.sh:399-444               | T8: `printf 'y\n' \| _upgrade_confirm` proceeds; tests Y, y, yes, YES, empty (with default), CR-stripping. | |
 | F040 | green  | tests/upgrade_test.sh:399-444               | T8: `printf 'n\n' \| _upgrade_confirm` aborts; tests n, N, no, NO, x, CR-stripping. | |
+| F140 | green  | tests/upgrade_test.sh:836-871               | T12: `_upgrade_confirm "test? " n <<<""` returns rc 1 (Enter aborts); `<<<"y"` returns 0; default-y cases assert `""`→0, `n`→1 (back-compat). | |
+| F141 | green  | tests/upgrade_test.sh:721-834               | T11: real origin+clone git fixtures — diverged (ahead+behind)→rc 0; up-to-date / behind-only / ahead-only / no-upstream→rc 1. | |
+| F142 | yellow | tests/upgrade_test.sh:721-871               | Decision logic covered via building blocks (T11 `_git_branches_diverged` + T12 default-N `_upgrade_confirm`); the end-to-end `_upgrade_pull_or_reset` (reset-on-divergence, --no-prompt abort) is not driven through its TTY path in CI. | The TTY/`reset --hard` path is exercised manually, not in the unit suite. |
 | F041 | green  | tests/harness_test.sh:268-282               | T3: `timeout 5 ${HARNESS_WRAPPER} logs ollama` produces output containing `ollama` or `serve`. | |
 | F042 | green  | tests/harness_test.sh:283-313               | T3 now runs `timeout 5 ${HARNESS_BIN} logs` (no service), asserts rc 0/124, no parse-error message, AND both `'ollama'` and `'proxy'` appear in the captured output (compose prefixes each line with the service name when no service is given). | |
 | F043 | green  | tests/full_pipeline_test.sh T9 + harness_test.sh T30 | T9: bare `harness -p "<prompt>"` produces `Hello from mock upstream` (option C → opencode); T30 asserts bare/flag dispatch routes to opencode. | |

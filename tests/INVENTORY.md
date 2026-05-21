@@ -60,6 +60,9 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F038 | `harness upgrade --rebuild` forces `docker compose build --no-cache` before restart |
 | F039 | `_upgrade_confirm` returns success when stdin says "y" |
 | F040 | `_upgrade_confirm` returns failure when stdin says "n" or empty default |
+| F140 | `_upgrade_confirm` empty answer (Enter) resolves to the optional `default` arg: "n" aborts, "y"/unset proceeds (back-compat for existing callers) |
+| F141 | `_git_branches_diverged` returns success only when HEAD and `@{u}` have each diverged (ahead>0 AND behind>0); failure for up-to-date, behind-only, ahead-only, and no-upstream branches |
+| F142 | `harness upgrade` / `harness update` offer a `git reset --hard @{u}` recovery on a diverged-history `--ff-only` failure (defaults to N); `--no-prompt`/CI never auto-resets, and non-divergence pull failures abort unchanged |
 | F041 | `harness logs <service>` follows compose logs for the named service |
 | F042 | `harness logs` (no service) tails all services |
 | F043 | Bare `harness` (no command), or `harness` with a leading agent flag, launches an opencode agent in the CWD (option C dispatch); an unknown bare word still errors |
