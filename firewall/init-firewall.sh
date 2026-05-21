@@ -46,7 +46,7 @@ fatal() {
 # When HARNESS_FIREWALL_DISABLED=1 we skip every rule and exit 0. Used by:
 #   * `harness net open <service>` (service-level: stamped into the runtime
 #     compose override as an env var on that service)
-#   * `harness claude --net` / `harness opencode --net` (per-invocation)
+#   * `harness --net` / `harness opencode --net` (per-invocation)
 # The variable is set deliberately by the harness CLI; the user is asked to
 # acknowledge with a typed phrase before `net open` is honored. We log loudly
 # so the bypass shows up in `docker logs` and there's a paper trail.

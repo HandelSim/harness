@@ -5,23 +5,22 @@ deep-dives that live alongside this file.
 
 ## What harness is
 
-A container-runtime-based system that lets a coding agent (claude-code,
-opencode) talk to a third-party API endpoint without knowing it's not
-talking to Claude. The agent runs in a container, calls a local ollama
-instance, and ollama forwards chat requests to a translating proxy that
-calls the upstream API.
+A container-runtime-based system that lets a coding agent (opencode) talk
+to a third-party API endpoint transparently. The agent runs in a container,
+calls a local ollama instance, and ollama forwards chat requests to a
+translating proxy that calls the upstream API.
 
 ```
 ┌────────────────┐   /api/chat   ┌────────┐   chat-completions   ┌──────────┐
 │ agent          │ ────────────▶ │ ollama │ ───────────────────▶ │ proxy    │ ──▶ upstream API
-│ (claude-code,  │               │  stub  │  (RemoteHost=proxy)  │ flask    │
-│  opencode)     │ ◀──ndjson──── │ model  │ ◀────────────────────│ app      │
+│ (opencode)     │               │  stub  │  (RemoteHost=proxy)  │ flask    │
+│                │ ◀──ndjson──── │ model  │ ◀────────────────────│ app      │
 └────────────────┘               └────────┘                      └──────────┘
 ```
 
 Three long-running services share the `harness-net` bridge network and a
 universal egress firewall: `ollama`, `proxy`, and any enabled MCP
-service. Agents are short-lived containers spawned by `harness claude` /
+service. Agents are short-lived containers spawned by `harness` /
 `harness opencode` / `harness shell`; they join the same network for the
 duration of an invocation.
 
@@ -40,7 +39,7 @@ clone. User config and `state/` are gitignored. `harness update` and
 ├── docker-compose.yml          service definitions
 ├── proxy/                      translating proxy (Flask)
 ├── ollama/                     custom ollama image + stub-model entrypoint
-├── agents/                     unified agent image (claude/opencode/shell)
+├── agents/                     agent image (opencode/shell)
 ├── firewall/                   universal egress firewall + git-creds
 ├── mcp-registry/<name>/        vetted MCP definitions
 ├── scripts/lib/                shared bash libraries (platform, net, upgrade)
@@ -61,7 +60,7 @@ Read the relevant one(s) before changing code in that area:
 
 - [`harness-cli.md`](harness-cli.md) — the `harness` bash CLI: self-locate,
   env loading, subcommand layout, runtime-override generation, doctor /
-  preflight, agent launch path (`docker run` from cmd_claude/opencode/shell).
+  preflight, agent launch path (`docker run` from run_agent / cmd_shell).
 - [`proxy.md`](proxy.md) — `proxy/proxy.py`: ollama ↔ upstream translation,
   cooperative tool-use prompt variants, tool-call extraction, NDJSON
   streaming, env-driven config and validation.

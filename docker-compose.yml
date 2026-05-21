@@ -125,7 +125,7 @@ services:
   # -------------------------------------------------------------------------
   # Unified agent service. Excluded from default compose operations via the
   # `agent` profile so `docker compose up` doesn't try to start it. The
-  # entrypoint dispatches on a mode arg (claude / opencode / shell) so a
+  # entrypoint dispatches on a mode arg (opencode / shell) so a
   # single image and a single bind-mounted home backs all agent invocations.
   # -------------------------------------------------------------------------
   agent:

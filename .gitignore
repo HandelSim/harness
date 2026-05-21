@@ -5,7 +5,7 @@
 .harness-net-overrides.json
 
 # Runtime state — bind-mounted into containers; not part of the repo.
-# Includes output/, agent/{claude,opencode}/, ollama-data/, mcp/<name>/,
+# Includes output/, agent/home/, ollama-data/, mcp/<name>/,
 # and the .harness-runtime.yml compose override.
 state/
 

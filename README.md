@@ -1,7 +1,7 @@
 # harness
 
 A container-runtime-based system that lets you launch a coding agent
-(claude-code, opencode) against a third-party API endpoint, transparently.
+(opencode) against a third-party API endpoint, transparently.
 The agent runs in a container, talks to a local ollama instance, and ollama
 forwards chat requests to a translating proxy that calls the upstream API.
 
@@ -53,7 +53,8 @@ After install:
 1. If you didn't enter an API key at the prompt (or pre-place a `.env`),
    edit `~/harness-install/harness/.env` and set `PROXY_API_KEY` (and any
    other required values for your upstream).
-2. cd into a project directory and run `harness claude` or `harness opencode`.
+2. cd into a project directory and run `harness` (or, equivalently,
+   `harness opencode`).
    The folder you launch from is bind-mounted into the container at the
    same absolute path, so `pwd` inside the agent matches your host shell.
    Pass `--mount /some/host/path` (repeatable) to bind-mount additional
@@ -77,8 +78,8 @@ harness/
 ├── ollama/                  custom ollama image + entrypoint that registers
 │                            the stub model with RemoteHost set to the proxy
 ├── proxy/                   the translating proxy
-├── agents/                  unified agent image (Dockerfile + entrypoint
-│                            with mode dispatch: claude, opencode, shell)
+├── agents/                  agent image (Dockerfile + entrypoint
+│                            with mode dispatch: opencode, shell)
 ├── mcp-registry/            vetted MCP service definitions
 └── scripts/
     ├── proxy_test.sh        proxy translation tests (incl. ollama RemoteHost forwarding smoke)
@@ -98,7 +99,7 @@ harness/
 ## Persistent agent home
 
 A single bind-mounted home — `<install-root>/state/agent/home/` — backs
-every agent invocation (claude, opencode, shell). Anything a user installs
+every agent invocation (opencode, shell). Anything a user installs
 inside an agent (`pipx install graphifyy`, `pip install --user requests`,
 custom dotfiles) is visible across all modes and survives container
 rebuilds. The image's build-time home contents are snapshotted into
@@ -108,7 +109,7 @@ subsequent runs skip the seed.
 
 ## Mounts: same-path host ↔ container
 
-The folder you run `harness claude` / `harness opencode` / `harness shell`
+The folder you run `harness` / `harness opencode` / `harness shell`
 from is bind-mounted into the container at the **same absolute path** —
 no `/workspace` indirection. `pwd` inside the agent matches your host
 shell, which means absolute paths in code, log files, and tool output
@@ -117,7 +118,7 @@ round-trip cleanly.
 ### `--mount` (extra folders, repeatable)
 
 ```
-harness claude --mount /home/me/refs --mount /home/me/data
+harness --mount /home/me/refs --mount /home/me/data
 ```
 
 Each `--mount` adds another host folder bind-mounted at its same
@@ -128,7 +129,7 @@ absolute path inside the container. Rules:
 - Relative paths are resolved against the current directory.
 - The CWD is ALWAYS mounted regardless of `--mount` flags, and the agent
   always starts in the CWD — extras never override the starting dir.
-- Nested mounts are fine: running `harness claude` from
+- Nested mounts are fine: running `harness` from
   `/home/me/proj/sub` while passing `--mount /home/me/proj` is valid;
   Docker layers the mounts at their respective targets and both are
   readable. Duplicate paths (or passing the CWD as `--mount`) are
@@ -231,7 +232,7 @@ maintain your own registry entry.
 
 Skills are CLI tools the agent invokes. To install one:
 
-**Easy way (recommended):** ask the agent. From inside `harness claude`:
+**Easy way (recommended):** ask the agent. From inside `harness`:
 
 > Please install graphify by running `pipx install graphifyy` and then
 > `graphify install`.
@@ -241,8 +242,8 @@ and confirms.
 
 **Direct way:** run `harness shell` to drop into a bash shell inside the
 agent container. Run the install commands yourself, exit. The shell
-shares the same persistent home as `harness claude` and `harness
-opencode`, so the install is available everywhere.
+shares the same persistent home as `harness` / `harness opencode`, so the
+install is available everywhere.
 
 Either way, the install persists across container restarts and
 `harness upgrade`.
@@ -285,7 +286,7 @@ override the path via `HARNESS_NET_OVERRIDES_PATH` for tests). Run
 ### `--net` per-launch bypass
 
 ```
-harness claude --net      # this launch only — full outbound network
+harness --net             # this launch only — full outbound network
 ```
 
 Sets `HARNESS_FIREWALL_DISABLED=1` for the agent container only; the next
@@ -320,7 +321,7 @@ live inside it; user config and `state/` are gitignored:
 ├── .harness-net-overrides.json firewall overrides (gitignored)
 └── state/                      runtime state (gitignored)
     ├── output/                 proxy debug dumps
-    ├── agent/{claude,opencode}/ persistent /home/harness for each agent
+    ├── agent/home/             shared /home/harness for every agent
     ├── ollama-data/            ollama model blobs
     └── mcp/<name>/             active MCP services (compose.yml + data)
 ```
@@ -412,14 +413,10 @@ Files harness manages (covered by the manifest):
 Files purely user-managed (not in the manifest):
 
 - `.harness-net-overrides.json` — controlled by `harness net open/close`
-- `state/agent/home/.config/ccstatusline/settings.json` — seeded once from
-  `/etc/skel` by the agent entrypoint, then user-managed via the
-  ccstatusline TUI (`harness claude-statusline-config`). Default layout
-  changes upstream do not flow back to existing agent homes.
 - `state/output/` — proxy debug dumps
 - `state/ollama-data/` — model blobs
-- **User-installed skills and `pipx` packages** under `state/agent/<tool>/`
-  (e.g., `state/agent/home/.local/bin/graphify`, `state/agent/home/.claude/skills/graphify/`).
+- **User-installed skills and `pipx` packages** under `state/agent/home/`
+  (e.g., `state/agent/home/.local/bin/graphify`).
   These live entirely inside the bind-mounted agent home and are never
   touched by upgrade actions. The skel-seed step in the agent entrypoint
   only runs once per home (gated by `~/.harness-home-initialized`), so
@@ -436,24 +433,6 @@ Files purely user-managed (not in the manifest):
 To force a full reset of a harness-managed file (and lose customizations):
 delete the file in your install root, then run `harness upgrade`. The
 target-missing branch of each action will recreate it from source.
-
-## Customizing the claude status line
-
-The claude image pre-installs `ccstatusline` and seeds a curated default
-config (model + cwd + git branch + context bar) into
-`/etc/skel/harness/.config/ccstatusline/settings.json`. The entrypoint
-also merges a `statusLine` block into `~/.claude/settings.json` so claude
-calls `ccstatusline` on each render.
-
-To change the status line, run:
-
-```
-harness claude-statusline-config
-```
-
-This launches an ephemeral claude container (no ollama/proxy required)
-attached to the persistent agent home; the ccstatusline TUI writes its
-edits straight to `<install-root>/state/agent/home/.config/ccstatusline/settings.json`.
 
 ## Tests
 

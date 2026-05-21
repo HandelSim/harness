@@ -14,7 +14,7 @@ Every registry entry under `mcp-registry/<name>/` has:
   cleanly with the main `docker-compose.yml`. Lives behind the `mcp`
   profile so `docker compose up` without the profile leaves it alone.
 - **`client-config.json`** — the entry merged into the agent's MCP
-  config. Uses claude's `{"mcpServers": {"<name>": {...}}}` shape.
+  config. Uses the canonical `{"mcpServers": {"<name>": {...}}}` shape.
   Translated for opencode by the agent entrypoint (see
   [`containers.md`](containers.md)).
 - **`harness-meta.json.template`** — metadata; materialized as
@@ -102,13 +102,11 @@ up first. `any_mcp_active` decides whether `harness start` adds
 
 On each agent launch, the harness CLI writes
 `state/agent/home/.harness-mcp-servers.json` by merging every
-enabled MCP's `client-config.json`. The agent entrypoint then:
-
-- Folds it into `~/.claude.json` (`merge_claude_mcp_servers`), or
-- Translates and folds into `~/.config/opencode/opencode.json`
-  (`merge_opencode_mcp_servers`) — claude's
-  `{"mcpServers": {<name>: {"url" | "command"}}}` becomes opencode's
-  `{"mcp": {<name>: {"type": "remote"|"local", ...}}}`.
+enabled MCP's `client-config.json`. The agent entrypoint then translates
+and folds it into `~/.config/opencode/opencode.json`
+(`merge_opencode_mcp_servers`) — the canonical
+`{"mcpServers": {<name>: {"url" | "command"}}}` becomes opencode's
+`{"mcp": {<name>: {"type": "remote"|"local", ...}}}`.
 
 Re-merging on every container start means disable propagates without
 needing to clean up old entries.

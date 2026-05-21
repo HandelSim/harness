@@ -53,7 +53,7 @@ run from an empty directory. Stages:
    line never runs in fresh sessions. The bridge preserves an existing
    `~/.profile` when it has to create `~/.bash_profile`.
 9. **Final message.** Tells the user to edit `.env` (set
-   `PROXY_API_KEY` etc.) and `cd` into a project to run `harness claude`.
+   `PROXY_API_KEY` etc.) and `cd` into a project to run `harness`.
 
 Uninstall is `rm -rf <install-root> && rm ~/.local/bin/harness`.
 
@@ -119,7 +119,7 @@ Flags:
 
 ## Agent-launch config merge
 
-`run_agent` (claude/opencode) and `cmd_shell` call
+`run_agent` (opencode) and `cmd_shell` call
 `_check_and_offer_config_merge` at startup, right after the update banner.
 It reuses the same precheck + merge functions as `harness upgrade`, but only
 for the two config files (`.env`, `.harness-allowlist`) — not the rebuild,

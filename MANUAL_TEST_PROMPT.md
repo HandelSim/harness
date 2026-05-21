@@ -1,6 +1,6 @@
 # Manual End-to-End Test Prompt for harness
 
-> Paste the contents below into a fresh Claude Code session running on a
+> Paste the contents below into a fresh coding-agent session running on a
 > machine with the harness already installed. Provide your real upstream
 > API credentials in `<install-root>/.env` before running. The agent will
 > work through scenarios that automated tests can't cover (real LLM
@@ -37,10 +37,10 @@ infrastructure remaining healthy.
    now shows ollama and proxy as healthy.
 3. Confirm `harness list` reports zero agents (`no harness agents running`).
 
-## Scenario A: Claude single-prompt sanity
+## Scenario A: Single-prompt sanity
 
 ```
-harness claude -p "What is 2+2? Reply with just the number."
+harness -p "What is 2+2? Reply with just the number."
 ```
 
 **Expected**: response containing "4". Report:
@@ -48,7 +48,7 @@ harness claude -p "What is 2+2? Reply with just the number."
 - rough latency (count seconds with a stopwatch; first-token vs. completion)
 - whether the response is sensible
 
-## Scenario B: Claude TUI session
+## Scenario B: TUI session
 
 > Phase 18 dropped the tmux-detached-session model — the agent CLI now runs
 > as the container's foreground process. There is no detach/reattach; exit
@@ -58,7 +58,7 @@ In one terminal:
 
 ```
 mkdir -p /tmp/harness-manual-B && cd /tmp/harness-manual-B
-harness claude
+harness
 ```
 
 Inside the TUI, send the prompt:
@@ -78,7 +78,10 @@ remain.
 Report the response quality and whether mouse-scroll behaves correctly
 (scrolls the conversation, not the prompt history).
 
-## Scenario C: Opencode equivalent of A and B
+## Scenario C: Explicit `opencode` subcommand
+
+Bare `harness` and `harness opencode` launch the same agent; this scenario
+confirms the explicit subcommand behaves identically to Scenarios A and B.
 
 Single-prompt:
 
@@ -96,10 +99,10 @@ harness opencode
 Same shape as Scenario B: send a prompt, send a follow-up that requires
 prior context, then exit the agent.
 
-Note any opencode-specific behaviors (different keybindings, different
-status indicators, slower or faster response). Some opencode versions
-require provider-auth setup; if `opencode -p` fails with an auth/login
-error, note it as a known limitation and continue with the TUI test.
+Confirm the explicit subcommand is indistinguishable from bare `harness`.
+Some opencode versions require provider-auth setup; if `opencode -p` fails
+with an auth/login error, note it as a known limitation and continue with
+the TUI test.
 
 ## Scenario D: File creation with --yolo
 
@@ -107,7 +110,7 @@ From a temporary working directory:
 
 ```
 mkdir -p /tmp/harness-manual-D && cd /tmp/harness-manual-D
-harness claude --yolo -p "Create a file called test.py containing a function 'add(a, b)' that returns a+b. Then create test_test.py that contains a unittest.TestCase exercising add for at least three input pairs including a negative."
+harness --yolo -p "Create a file called test.py containing a function 'add(a, b)' that returns a+b. Then create test_test.py that contains a unittest.TestCase exercising add for at least three input pairs including a negative."
 ```
 
 Verify after the agent completes:
@@ -135,7 +138,7 @@ the tests pass.
 
 Open two separate terminals.
 
-- Terminal 1: `cd /tmp/harness-manual-E1 && mkdir -p . && harness claude`
+- Terminal 1: `cd /tmp/harness-manual-E1 && mkdir -p . && harness`
 - Terminal 2: `cd /tmp/harness-manual-E2 && mkdir -p . && harness opencode`
 
 (Create the directories first if they don't exist.)
@@ -199,7 +202,7 @@ ollama/proxy healthy).
 
 ```
 mkdir -p /tmp/harness-manual-H && cd /tmp/harness-manual-H
-harness claude
+harness
 ```
 
 Send a prompt that produces a long response:
@@ -207,8 +210,8 @@ Send a prompt that produces a long response:
 > Write a 500-word essay on the cultural significance of toast.
 
 When you see text actively streaming into the pane, press `Ctrl-C`. The
-TUI should remain alive (claude itself handles the SIGINT and prompts you
-again).
+TUI should remain alive (the agent itself handles the SIGINT and prompts
+you again).
 
 Verify by sending a follow-up:
 
@@ -230,12 +233,12 @@ rather than a hang or cryptic crash.
    `PROXY_API_KEY_BROKEN` so the variable is unset when compose loads it.
 3. `harness start` — should still come up; the proxy doesn't validate the
    key on boot.
-4. `harness claude -p "ping"` — expected: a non-zero exit with an error
+4. `harness -p "ping"` — expected: a non-zero exit with an error
    that mentions the upstream / API key / authorization, NOT a hang and
-   NOT a stack trace from inside claude itself.
+   NOT a stack trace from inside the agent itself.
 5. Restore the original line in `.env`.
 6. `harness start` to pick up the corrected env, then re-run
-   `harness claude -p "ping"` and verify it now succeeds.
+   `harness -p "ping"` and verify it now succeeds.
 
 Report the error you saw in step 4 — verbatim. The quality of that error
 message is the thing we're testing here.
@@ -251,14 +254,14 @@ message is the thing we're testing here.
 
 This scenario validates that things installed inside an agent survive
 container restarts and full service rebuilds. Persistence is implemented
-by bind-mounting `<install-root>/state/agent/<tool>/` as the agent's whole
+by bind-mounting `<install-root>/state/agent/home/` as the agent's whole
 `/home/harness` and seeding the build-time skeleton from `/etc/skel/harness/`
 on first run.
 
 1. ```
-   harness claude
+   harness shell
    ```
-   In the TUI, drop into a shell (claude's `!` shell escape) and run:
+   In the shell (which shares the agent's persistent home), run:
    ```
    pipx install graphifyy
    ```
@@ -274,9 +277,8 @@ on first run.
    ```
    ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/state/agent/home/.local/bin"
    ```
-4. Re-launch: `harness claude`. Inside the TUI, `! which graphify` should
-   still resolve. (No re-install required — the binary was on disk all
-   along.)
+4. Re-launch: `harness shell`. Running `which graphify` should still
+   resolve. (No re-install required — the binary was on disk all along.)
 5. Tear down and bring back up: `harness down && harness start`. Repeat
    step 4. graphify must still work, since the home dir is bind-mounted
    from outside the container lifecycle.
@@ -300,7 +302,7 @@ correctly.
 
 1. ```
    mkdir -p /tmp/harness-manual-K1 && cd /tmp/harness-manual-K1
-   harness claude -p "Use bash to print: pwd; ls -la /workspace 2>&1; exit 0"
+   harness -p "Use bash to print: pwd; ls -la /workspace 2>&1; exit 0"
    ```
    Expected: model output mentions `/tmp/harness-manual-K1`. There should
    be no `/workspace` directory inside the container.
@@ -310,26 +312,26 @@ correctly.
    mkdir -p /tmp/harness-manual-K2/extra
    echo hello-from-K2 > /tmp/harness-manual-K2/extra/marker.txt
    cd /tmp/harness-manual-K1
-   harness claude --mount /tmp/harness-manual-K2/extra -p "Use bash to: cat /tmp/harness-manual-K2/extra/marker.txt"
+   harness --mount /tmp/harness-manual-K2/extra -p "Use bash to: cat /tmp/harness-manual-K2/extra/marker.txt"
    ```
    Expected: `hello-from-K2` appears in the response.
 
 3. Try a rejected mount:
    ```
-   harness claude --mount /etc -p "noop"
+   harness --mount /etc -p "noop"
    ```
    Expected: non-zero exit, error mentions "shadow container infrastructure".
 
 4. Try a nonexistent mount:
    ```
-   harness claude --mount /does/not/exist -p "noop"
+   harness --mount /does/not/exist -p "noop"
    ```
    Expected: non-zero exit, error mentions "does not exist".
 
 5. Sticky default via `.env`:
    - Add `HARNESS_EXTRA_MOUNTS=/tmp/harness-manual-K2/extra` to
      `<install-root>/.env`.
-   - From any directory: `harness claude -p "Use bash to: ls /tmp/harness-manual-K2/extra"`.
+   - From any directory: `harness -p "Use bash to: ls /tmp/harness-manual-K2/extra"`.
    - Expected: `marker.txt` listed.
    - Remove the line afterward.
 
@@ -369,16 +371,16 @@ release-time validation.
 4. Launch an agent in a real project and ask it to use Serena:
    ```
    cd $HOME/some-test-project
-   harness claude
+   harness
    ```
    Inside the TUI, prompt:
    > Use the serena MCP tool to list the symbols in this project's
    > main entry point.
 
-   Expected: claude calls Serena's tools and surfaces useful output
-   (symbol names, locations). If claude says it doesn't have an MCP
-   tool available, drop into a shell and run `claude mcp list` —
-   `serena` should be present.
+   Expected: the agent calls Serena's tools and surfaces useful output
+   (symbol names, locations). If the agent says it doesn't have an MCP
+   tool available, check `harness mcp status serena` and confirm it is
+   running and listed in the agent's merged MCP config.
 5. Toggle disable / enable without uninstalling. Disable just flips the
    enabled flag — the entry stays installed and `mcp up` can still bring
    it back manually:
@@ -405,7 +407,7 @@ release-time validation.
    data dir is still there.
 
 Report the latency of the first build, the latency of subsequent starts,
-the quality of Serena's responses inside claude, and whether the
+the quality of Serena's responses inside the agent, and whether the
 uninstall/re-install cycle preserved data.
 
 ## Scenario L: Network firewall + bypass controls
@@ -418,8 +420,7 @@ controls added in Phase B2.
    harness net list
    ```
    Expected: a table with at least DNS-related defaults and any hosts
-   shipped in `.harness-allowlist.example`. **`api.anthropic.com` should
-   NOT appear** — the cosmetic warning at agent startup is intentional.
+   shipped in `.harness-allowlist.example`.
 
 2. Run `harness doctor`. Confirm the `[network]` section reports:
    - the allowlist path,
@@ -443,7 +444,7 @@ controls added in Phase B2.
 4. Verify the per-launch bypass:
    ```
    mkdir -p /tmp/harness-manual-L && cd /tmp/harness-manual-L
-   harness claude --net -p "Use bash to run: curl -sS -o /dev/null -w '%{http_code}\n' https://example.com"
+   harness --net -p "Use bash to run: curl -sS -o /dev/null -w '%{http_code}\n' https://example.com"
    ```
    Expected: stderr from `harness` itself includes a loud `--net` warning;
    the curl returns `200` (or any 2xx/3xx, just not a connection refused).
@@ -468,33 +469,6 @@ Report:
 - whether `--net`'s stderr warning is loud enough that you'd notice it,
 - any hosts you had to add to make daily work usable (worth feeding back
   into the seed allowlist).
-
-## Scenario M: Status line customization
-
-1. Launch claude in any working directory:
-   ```
-   harness claude
-   ```
-   The bottom status line should show the model name, the current
-   directory (with home abbreviated), the git branch (if any), and a
-   context-bar progress indicator.
-
-2. Exit the agent. Run:
-   ```
-   harness claude-statusline-config
-   ```
-   The ccstatusline TUI should appear. Make a visible change (e.g.,
-   recolor a widget) and save/quit.
-
-3. Re-launch `harness claude` and confirm the change is reflected. Also
-   confirm:
-   ```
-   ls "$(harness doctor 2>/dev/null | grep 'install root' | awk '{print $NF}')/state/agent/home/.config/ccstatusline/settings.json"
-   ```
-   exists. Settings persist across container rebuilds (bind-mounted home).
-
-Report whether the configurator launched cleanly without requiring
-ollama/proxy services, and whether your edits stuck.
 
 ## Scenario K2: MCP lifecycle — canonical commands
 
@@ -617,7 +591,7 @@ was clear.
    - Configuration issues identified by name (e.g. "PROXY_API_URL is empty").
    - PROXY_API_URL hostname is checked against the allowlist.
 8. Run `harness start`. Verify it completes without errors.
-9. Run `harness claude -p "say hello"`. Verify response.
+9. Run `harness -p "say hello"`. Verify response.
 10. Stop the stack with `harness down`.
 11. Verify uninstall: `rm -rf <install-root> && rm ~/.local/bin/harness`.
 

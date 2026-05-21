@@ -96,7 +96,7 @@ temporarily disable the firewall for one service:
 
 ```bash
 harness net open agent      # persistent (until 'harness net close agent')
-harness claude --net        # per-launch only
+harness --net               # per-launch only
 ```
 
 ## `harness start` under podman
@@ -108,7 +108,7 @@ installed), every `harness` subcommand routes through podman:
 harness preflight   # 'podman runtime ✓' / 'podman compose ✓'
 harness start       # builds proxy/ollama/agent images via 'podman compose'
 harness doctor      # reports 'podman runtime reachable'
-harness claude      # ephemeral agent container via 'podman run'
+harness             # ephemeral agent container via 'podman run'
 ```
 
 State paths, the bind-mounted CWD, and `--mount` extras work the same way

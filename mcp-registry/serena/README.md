@@ -17,7 +17,7 @@ The first `start` after enabling builds Serena from upstream source
 image, and the data dir at `<install-root>/state/mcp/serena/data/`
 persists across rebuilds.
 
-Once it's up, agents launched with `harness claude` or `harness opencode`
+Once it's up, agents launched with `harness` (or `harness opencode`)
 will find Serena listed in their MCP servers and can call its tools.
 
 ## What it can see

@@ -16,7 +16,7 @@
 #     state/                               runtime state (gitignored)
 #       output/                            proxy debug dumps
 #       agent/home/                        shared agent /home/harness
-#                                          (claude, opencode, shell)
+#                                          (opencode, shell)
 #       ollama-data/                       ollama model blobs
 #       mcp/<name>/                        active MCP services
 #
@@ -683,11 +683,10 @@ fi
 cat <<EOF
 Next:
   1. Edit $install_root/.env and set PROXY_API_KEY (and any other required values)
-  2. cd into a project directory and run: harness <agent>
+  2. cd into a project directory and run: harness
 
-Available agents:
-  harness claude
-  harness opencode
+Running 'harness' with no command launches an opencode agent in the current
+directory. 'harness opencode' does the same thing explicitly.
 EOF
 
 # Show what MCPs are present in the bundled registry, since none are

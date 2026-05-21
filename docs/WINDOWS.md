@@ -56,10 +56,9 @@ normalized; the container side is left alone (and `harness_docker` keeps
 MSYS from rewriting it).
 
 A third helper, `harness_docker_exec`, exists for sites that previously
-called `exec docker ...` (run_agent_print, attach paths, the
-ccstatusline configurator). It preserves exec semantics while applying
-the Windows env-var wrap, since shell functions cannot themselves be
-exec'd.
+called `exec docker ...` (run_agent_print, attach paths). It preserves
+exec semantics while applying the Windows env-var wrap, since shell
+functions cannot themselves be exec'd.
 
 A fourth helper, `harness_abs_path`, normalizes a (possibly relative)
 host path to an absolute, canonical UNIX-form path — `/c/Users/you/proj`
@@ -70,7 +69,7 @@ with `harness_docker_path` (source side), the agent can refer to
 absolute paths without translation:
 
 ```
-host (Git Bash):       cd /c/Users/you/proj && harness claude
+host (Git Bash):       cd /c/Users/you/proj && harness
 container (in agent):  pwd → /c/Users/you/proj
 ```
 
@@ -113,8 +112,8 @@ This re-checks-out files with the .gitattributes rules applied. Should not be ne
 
 ## Terminal font for Unicode rendering
 
-Claude-code and opencode use Unicode box-drawing and indicator characters
-in their TUI. Git Bash's default font (Lucida Console) has limited Unicode
+opencode uses Unicode box-drawing and indicator characters
+in its TUI. Git Bash's default font (Lucida Console) has limited Unicode
 coverage. If you see underscores instead of box characters or icons, switch
 to a font with broader Unicode coverage:
 
