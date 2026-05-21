@@ -56,16 +56,24 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
 # Agent CLI at a pinned version. Bumping requires editing this file.
-# OPENCODE_VERSION floor: must stay <= 1.14.41 until upstream restores
-# headless stdout. opencode 1.14.42 added an "interactive split-footer mode
-# for `opencode run`" that suppresses the formatted-default response body
-# when stdout is not a TTY — `opencode run "say hello"` then exits 0 with
-# only "> build · <project>" printed, no assistant content, breaking
-# `harness opencode -p` (full_pipeline_test.sh T10). The regression is
-# present in every 1.14.42..1.14.51 and 1.15.x release we tested. Bump
-# only after confirming `opencode run --format default <prompt>` on the
-# bumped version emits the assistant body on a non-TTY stdout.
-ARG OPENCODE_VERSION=1.14.41
+#
+# The 1.14.42..1.15.x "interactive split-footer" headless regression is FIXED
+# as of 1.15.7: the split-footer mode is now opt-in via `opencode run -i/
+# --interactive` (default off; it errors without a TTY stdout), and `opencode
+# run` on a non-TTY writes the assistant body to stdout — verified in the
+# 1.15.7 binary, whose run-command text renderer branches
+# `if (!process.stdout.isTTY) process.stdout.write(text)`. So `harness opencode
+# -p` (full_pipeline_test.sh T10) gets the body again with no entrypoint change.
+#
+# Two things to re-verify on any future bump:
+#   1. `opencode run --format default <prompt>` still emits the assistant body
+#      on a non-TTY stdout (the regression above must not return).
+#   2. The proxy pares the `task` tool description by anchoring on opencode's
+#      "Available agent types and the tools they have access to:" header
+#      (proxy/proxy.py `_OPENCODE_TASK_AGENTS_HEADER`); keep that parse working.
+#      proxy/test_proxy.py TestTaskDescriptionParing is the canary — refresh its
+#      fixture from the bumped binary and fix the header constant if it drifts.
+ARG OPENCODE_VERSION=1.15.7
 ARG OPENAI_COMPAT_VERSION=2.0.47
 
 RUN npm install -g \

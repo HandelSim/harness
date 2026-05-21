@@ -1039,11 +1039,16 @@ class TestHybridDetailTools(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         # A task tool whose valid subagent_type values live ONLY in the
-        # description prose (no JSON-Schema enum) — the exact opencode shape.
+        # description prose (no JSON-Schema enum) — the exact opencode shape:
+        # static boilerplate first, then the dynamic agent list introduced by
+        # the header the proxy anchors on. The boilerplate is what paring drops.
         self.task_tool = {"function": {
             "name": "task",
             "description": (
-                "Launch a subagent to handle a multi-step task.\n"
+                "Launch a new agent to handle complex, multistep tasks "
+                "autonomously.\n\n"
+                "When NOT to use the Task tool:\n"
+                "- If you want to read a specific file path, use Read instead\n\n"
                 "Available agent types and the tools they have access to:\n"
                 "- general-purpose: research and multi-step tasks\n"
                 "- Explore: fast read-only code search\n"
@@ -1125,6 +1130,12 @@ class TestHybridDetailTools(unittest.TestCase):
         self.assertIn("Available agent types", last_user)
         self.assertIn("general-purpose", last_user)
         self.assertIn("Explore", last_user)
+        # …but the static boilerplate is pared out of the task block (it is
+        # redundant with the stable-prefix copy and is what dilutes recency).
+        detail = last_user.split('<<<BEGIN_TOOL_DETAIL name="task">>>', 1)[1]
+        detail = detail.split("<<<END_TOOL_DETAIL>>>", 1)[0]
+        self.assertNotIn("Launch a new agent", detail)
+        self.assertNotIn("When NOT to use", detail)
 
     def test_detail_block_sits_after_reminder_outside_user_message_wrap(self):
         last_user = self._translate([self.task_tool])[-1]["content"]
@@ -1190,6 +1201,106 @@ class TestHybridDetailTools(unittest.TestCase):
             )
         joined = "\n".join(m["content"] for m in out)
         self.assertNotIn("TOOL_DETAIL", joined)
+
+
+class TestTaskDescriptionParing(unittest.TestCase):
+    """`task`'s TOOL_DETAIL block is pared to its agent-list section; the static
+    boilerplate (redundant at recency) is dropped. The parse anchors on a header
+    string opencode emits in ToolRegistry.describeTask. `skill` is left whole.
+
+    REAL_TASK_DESCRIPTION below is a faithful copy of what opencode hands the
+    proxy: static boilerplate, then the dynamic agent list. The opening lines
+    are verbatim from opencode's bundled task prompt (var `an`) and the list
+    rows follow describeTask's `- <name>: <description>` shape.
+
+    CANARY: this fixture is the cross-version guard the issue asked for. On every
+    opencode bump, re-extract the real description and refresh this fixture, e.g.
+
+        strings -n 6 node_modules/opencode-linux-x64/bin/opencode \\
+          | grep -m1 'Available agent types and the tools they have access to'
+
+    If opencode renames/reflows the header, refreshing the fixture makes
+    `test_anchor_is_the_string_opencode_emits` /
+    `test_paring_keeps_agent_list_drops_boilerplate` fail loudly — the signal to
+    update `proxy._OPENCODE_TASK_AGENTS_HEADER`. Until then, paring degrades
+    safely: an unrecognised description is echoed whole, never silently dropped.
+    """
+
+    REAL_TASK_DESCRIPTION = (
+        "Launch a new agent to handle complex, multistep tasks autonomously.\n\n"
+        "When using the Task tool, you must specify a subagent_type parameter "
+        "to select which agent type to use.\n\n"
+        "When NOT to use the Task tool:\n"
+        "- If you want to read a specific file path, use the Read or Glob tool "
+        "instead of the Task tool, to find the match more quickly\n"
+        "- If no available agent is a good fit for the task, use other tools "
+        "directly\n\n\n"
+        "Usage notes:\n"
+        "1. Launch multiple agents concurrently whenever possible, to maximize "
+        "performance; to do that, use a single message with multiple tool uses\n"
+        "2. When the agent is done, it will return a single message back to "
+        "you.\n\n"
+        "Available agent types and the tools they have access to:\n"
+        "- Explore: fast read-only code search\n"
+        "- general-purpose: research and multi-step tasks\n"
+        "- Plan: software architect for implementation plans"
+    )
+
+    def test_anchor_is_the_string_opencode_emits(self):
+        # The header constant must appear verbatim in the real description.
+        self.assertIn(
+            proxy._OPENCODE_TASK_AGENTS_HEADER, self.REAL_TASK_DESCRIPTION
+        )
+
+    def test_paring_keeps_agent_list_drops_boilerplate(self):
+        pared = proxy._pare_task_description(self.REAL_TASK_DESCRIPTION)
+        # Starts exactly at the header — no boilerplate ahead of it.
+        self.assertTrue(pared.startswith(proxy._OPENCODE_TASK_AGENTS_HEADER))
+        # The closed-set agent values survive intact, in order.
+        self.assertIn("- Explore: fast read-only code search", pared)
+        self.assertIn("- general-purpose: research and multi-step tasks", pared)
+        self.assertIn("- Plan: software architect for implementation plans", pared)
+        # The boilerplate is gone.
+        self.assertNotIn("Launch a new agent", pared)
+        self.assertNotIn("When NOT to use", pared)
+        self.assertNotIn("Usage notes", pared)
+
+    def test_paring_is_idempotent(self):
+        once = proxy._pare_task_description(self.REAL_TASK_DESCRIPTION)
+        twice = proxy._pare_task_description(once)
+        self.assertEqual(once, twice)
+
+    def test_paring_falls_back_to_full_when_header_absent(self):
+        # A future opencode that reflows the header: keep the whole description
+        # rather than drop the agent list. Degrade to more tokens, never to a
+        # silent loss of the closed set.
+        drifted = "Spawn a worker.\nValid workers:\n- alpha\n- beta"
+        self.assertEqual(proxy._pare_task_description(drifted), drifted)
+
+    def test_only_task_is_pared_skill_left_whole(self):
+        # Even a (contrived) skill whose description contains the task header is
+        # NOT pared — the transform is keyed on the tool name `task` only.
+        skill_tool = {"function": {
+            "name": "skill",
+            "description": (
+                "Execute a skill.\n"
+                "Available agent types and the tools they have access to:\n"
+                "- noise"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        }}
+        task_tool = {"function": {
+            "name": "task",
+            "description": self.REAL_TASK_DESCRIPTION,
+            "parameters": {"type": "object", "properties": {}},
+        }}
+        details = dict(proxy._extract_tool_details(
+            [skill_tool, task_tool], ["skill", "task"],
+        ))
+        self.assertTrue(details["skill"].startswith("Execute a skill."))
+        self.assertTrue(
+            details["task"].startswith(proxy._OPENCODE_TASK_AGENTS_HEADER)
+        )
 
 
 class TestPassthroughMode(unittest.TestCase):

@@ -89,6 +89,24 @@ _CHANGE_SYSTEM_TO_USER: bool = True
 # from PROXY_HYBRID_DETAIL_TOOLS (comma-separated) in main(); empty disables.
 _HYBRID_DETAIL_TOOLS: List[str] = ["task", "skill"]
 
+# opencode builds the `task` tool's description by appending a dynamic agent
+# list onto a block of static boilerplate ("when to use Task", usage notes).
+# That boilerplate carries no closed-set values and is already present verbatim
+# at the stable prefix, so for `task` ONLY the recency TOOL_DETAIL block is
+# pared to the agent-list section — everything from this header onward. The
+# header is the seam in opencode's ToolRegistry.describeTask and has been
+# byte-identical across releases (verified 1.14.41 and 1.15.7). If a future
+# opencode renames it, the parse falls back to the full description — no
+# closed-set values are ever dropped — and TestTaskDescriptionParing is the
+# canary that flags the drift. `skill`'s description is short and left verbatim.
+_OPENCODE_TASK_AGENTS_HEADER = (
+    "Available agent types and the tools they have access to:"
+)
+_OPENCODE_TASK_AGENTS_RE = re.compile(
+    "^" + re.escape(_OPENCODE_TASK_AGENTS_HEADER) + ".*",
+    re.MULTILINE | re.DOTALL,
+)
+
 
 # ---------------------------------------------------------------------------
 # OUTPUT_DIR handling
@@ -344,11 +362,12 @@ def _format_tool_signature(name, required, optional):
 def _format_tool_detail_blocks(tool_details):
     """Render the per-tool TOOL_DETAIL section appended to the hybrid
     reminder. `tool_details` is a list of `(name, description)` pairs from
-    `_extract_tool_details`. Each tool's full description is echoed verbatim
-    inside its own `<<<BEGIN_TOOL_DETAIL name="…">>>` block — never parsed —
-    so the closed set of valid argument values opencode documents only as
-    prose (a `task`'s agent types, a `skill`'s skill names) reaches recency
-    even when attention to messages[0] dilutes. The named delimiter (part of
+    `_extract_tool_details` (which has already pared `task` down to its agent
+    list). Each pair's description is echoed inside its own
+    `<<<BEGIN_TOOL_DETAIL name="…">>>` block — never parsed here — so the closed
+    set of valid argument values opencode documents only as prose (a `task`'s
+    agent types, a `skill`'s skill names) reaches recency even when attention to
+    messages[0] dilutes. The named delimiter (part of
     the same marker family as AGENT_TOOLS / TOOL_RESULT / USER_MESSAGE) keeps
     the model from conflating this recency copy with the authoritative copy at
     the stable prefix. Returns "" when there's nothing to surface.
@@ -642,6 +661,26 @@ def _extract_tool_signatures(
     return sigs
 
 
+def _pare_task_description(description: str) -> str:
+    """Pare opencode's `task` tool description down to its agent-list section.
+
+    opencode assembles the description as `<static boilerplate>` followed by the
+    dynamic agent list, the latter introduced by `_OPENCODE_TASK_AGENTS_HEADER`.
+    The boilerplate carries no closed-set values and is already present verbatim
+    at the stable prefix, so echoing it again in the recency TOOL_DETAIL block is
+    pure dilution. Keep only the header line onward — the agent names and their
+    one-line descriptions, the closed set models most often guess wrong.
+
+    Fallback: if the header isn't found (a future opencode reformats the
+    description) return it unchanged. Degrading to "more tokens" is safe;
+    silently dropping the agent list would not be.
+    """
+    match = _OPENCODE_TASK_AGENTS_RE.search(description)
+    if match is None:
+        return description
+    return match.group(0)
+
+
 def _extract_tool_details(
     tools: Optional[List[Dict[str, Any]]],
     flagged: List[str],
@@ -650,15 +689,18 @@ def _extract_tool_details(
     present in `tools`, preserving the order of `flagged`. Tools with an
     empty/whitespace-only description are skipped (an empty TOOL_DETAIL block
     would be noise). Used by hybrid mode to echo a small set of "detail
-    tools" full descriptions into the recency reminder — see
+    tools" descriptions into the recency reminder — see
     `_format_tool_detail_blocks`.
 
-    Source is the raw `tools` array's `description` field, taken whole — no
-    prose parsing. Unlike `_extract_tool_signatures` there is no `tools_text`
-    fallback: a tool's JSON-Schema params reserialize losslessly into
-    `tools_text`, but its free-form, multi-line description does not, and the
-    production call site always supplies `tools`. Without `tools` (a test
-    convenience path) no detail blocks are surfaced.
+    Source is the raw `tools` array's `description` field. For every tool except
+    `task` it is taken whole — no prose parsing. `task`'s description is pared by
+    `_pare_task_description` to just its agent-list section (the static
+    boilerplate is redundant at recency); see that helper. Unlike
+    `_extract_tool_signatures` there is no `tools_text` fallback: a tool's
+    JSON-Schema params reserialize losslessly into `tools_text`, but its
+    free-form, multi-line description does not, and the production call site
+    always supplies `tools`. Without `tools` (a test convenience path) no detail
+    blocks are surfaced.
     """
     if not tools or not flagged:
         return []
@@ -672,8 +714,11 @@ def _extract_tool_details(
     details: List[Tuple[str, str]] = []
     for name in flagged:
         desc = by_name.get(name)
-        if desc and desc.strip():
-            details.append((name, desc))
+        if not (desc and desc.strip()):
+            continue
+        if name == "task":
+            desc = _pare_task_description(desc)
+        details.append((name, desc))
     return details
 
 

@@ -66,8 +66,8 @@ The validator in `_setup_prompt_mode` accepts:
   *values*; for a small configurable set of "detail tools" whose valid
   values are a closed set opencode documents only in description prose (a
   `task`'s agent types, a `skill`'s skill names) the reminder additionally
-  echoes the tool's full description verbatim — see
-  [Hybrid delimiters](#hybrid-delimiters). Hybrid additionally delimits
+  echoes the tool's description (whole for `skill`; pared to the agent-list
+  section for `task`) — see [Hybrid delimiters](#hybrid-delimiters). Hybrid additionally delimits
   three content categories so each is addressable by name and the model
   can't conflate them with the upstream gateway's own system prompt/tools —
   again see [Hybrid delimiters](#hybrid-delimiters) below.
@@ -152,18 +152,31 @@ lighter-than-user_front recency profile is preserved.
 - **`<<<BEGIN_TOOL_DETAIL name="…">>>`** — recency-only (it lives in the
   reminder, not at the stable prefix). For each tool named in
   `PROXY_HYBRID_DETAIL_TOOLS` (default `task,skill`) that is present in the
-  toolset, the reminder appends the tool's **full description, verbatim**, in
-  its own block. The pointer-back above is too weak for tools whose valid
-  argument *values* are an unguessable closed set that opencode documents
-  only as prose in the description — `task`'s `subagent_type` agent names and
-  `skill`'s skill names (neither is a JSON-Schema `enum`). The signature list
-  carries only keys, so the whole description has to reach recency. The block
-  sits after the reminder and OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap
-  (proxy stage-direction). `_extract_tool_details` reads the raw `tools`
-  array's `description` field whole — no prose parsing, no `tools_text`
-  fallback. Empty `PROXY_HYBRID_DETAIL_TOOLS` disables the blocks; tools with
-  an empty description, or flagged tools absent from the toolset, are
+  toolset, the reminder appends the tool's description in its own block. The
+  pointer-back above is too weak for tools whose valid argument *values* are an
+  unguessable closed set that opencode documents only as prose in the
+  description — `task`'s `subagent_type` agent names and `skill`'s skill names
+  (neither is a JSON-Schema `enum`). The signature list carries only keys, so
+  those values have to reach recency. The block sits after the reminder and
+  OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap (proxy stage-direction).
+  `_extract_tool_details` reads the raw `tools` array's `description` field — no
+  `tools_text` fallback. Empty `PROXY_HYBRID_DETAIL_TOOLS` disables the blocks;
+  tools with an empty description, or flagged tools absent from the toolset, are
   skipped.
+
+  **`task` is pared, not verbatim.** opencode builds the `task` description as
+  static boilerplate ("when to use Task", usage notes) followed by the dynamic
+  agent list, the latter introduced by the literal header `Available agent types
+  and the tools they have access to:` (opencode's `ToolRegistry.describeTask`).
+  The boilerplate carries no closed-set values and is already present verbatim
+  at the stable prefix, so `_pare_task_description` (anchored on
+  `_OPENCODE_TASK_AGENTS_HEADER`) keeps only that header onward — the agent
+  names and their one-line descriptions. The header is byte-stable across
+  opencode releases (verified 1.14.41 and 1.15.7); if a future opencode renames
+  it the parse falls back to the **full** description (degrade to more tokens,
+  never a silent loss of the agent list), and `proxy/test_proxy.py`
+  `TestTaskDescriptionParing` is the canary that flags the drift. Every other
+  detail tool, including `skill` (its description is short), is echoed whole.
 
 ## `_CHANGE_SYSTEM_TO_USER`
 
