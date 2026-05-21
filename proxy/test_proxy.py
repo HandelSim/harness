@@ -49,7 +49,7 @@ class TestFormatTools(unittest.TestCase):
 
     def test_tool_call_emits_id_field(self):
         """Tool calls in NDJSON output must include an 'id' field that downstream
-        Anthropic-compatible agents (claude-code) require for tool_use blocks."""
+        Anthropic-format conversation history requires for tool_use blocks."""
         chunks = list(proxy.generate_ndjson(
             model_name="test-model",
             clean_text="",
@@ -617,7 +617,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.addCleanup(p.stop)
 
         self.user_msgs = [
-            {"role": "system", "content": "You are claude-code."},
+            {"role": "system", "content": "You are a coding agent."},
             {"role": "user", "content": "say hello"},
         ]
         self.tools = [
@@ -645,7 +645,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         # [0] is the system message; it must contain the original system
         # text AND the full tool definitions (Tool Name / JSON Schema).
         sys_content = result[0]["content"]
-        self.assertIn("You are claude-code.", sys_content)
+        self.assertIn("You are a coding agent.", sys_content)
         self.assertIn("Tool Name: `Bash`", sys_content)
         self.assertIn("Run shell command", sys_content)
         self.assertIn('"required"', sys_content, "JSON Schema body present in system")
@@ -663,10 +663,10 @@ class TestPromptInjectionModes(unittest.TestCase):
         # AGENT_INSTRUCTIONS wraps the original system content.
         self.assertLess(
             sys_content.index("<<<BEGIN_AGENT_INSTRUCTIONS>>>"),
-            sys_content.index("You are claude-code."),
+            sys_content.index("You are a coding agent."),
         )
         self.assertLess(
-            sys_content.index("You are claude-code."),
+            sys_content.index("You are a coding agent."),
             sys_content.index("<<<END_AGENT_INSTRUCTIONS>>>"),
         )
         # The disambiguation sentence and the tool definitions both live
@@ -831,7 +831,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         for mode in ("hybrid", "user_front"):
             with patch.object(proxy, "_PROMPT_MODE", mode):
                 result = proxy.translate_history_and_apply_prompt(self.user_msgs, "")
-            self.assertEqual(result[0]["content"], "You are claude-code.", mode)
+            self.assertEqual(result[0]["content"], "You are a coding agent.", mode)
             self.assertEqual(result[-1]["content"], "say hello", mode)
 
     def test_hybrid_tool_result_message_gets_reminder(self):
@@ -880,7 +880,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("<<<BEGIN_AGENT_INSTRUCTIONS>>>", sys_content)
         self.assertIn("<<<END_AGENT_INSTRUCTIONS>>>", sys_content)
         open_pos = sys_content.index("<<<BEGIN_AGENT_INSTRUCTIONS>>>")
-        text_pos = sys_content.index("You are claude-code.")
+        text_pos = sys_content.index("You are a coding agent.")
         close_pos = sys_content.index("<<<END_AGENT_INSTRUCTIONS>>>")
         self.assertTrue(open_pos < text_pos < close_pos)
 
@@ -921,7 +921,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         """Every real user-role turn in a multi-turn conversation is wrapped
         in USER_MESSAGE markers."""
         msgs = [
-            {"role": "system", "content": "You are claude-code."},
+            {"role": "system", "content": "You are a coding agent."},
             {"role": "user", "content": "first turn"},
             {"role": "assistant", "content": "ok one"},
             {"role": "user", "content": "second turn"},
@@ -1211,7 +1211,7 @@ class TestPassthroughMode(unittest.TestCase):
         """With tools provided, passthrough does NOT wrap the last user
         message in cooperative-prompt scaffolding. Other modes always do."""
         msgs = [
-            {"role": "system", "content": "You are claude-code."},
+            {"role": "system", "content": "You are a coding agent."},
             {"role": "user", "content": "weather?"},
         ]
         tools_text = "Tool Name: `get_weather`"
@@ -1225,14 +1225,14 @@ class TestPassthroughMode(unittest.TestCase):
         """passthrough leaves system role as system even when
         _CHANGE_SYSTEM_TO_USER is true (the default). Other modes rewrite."""
         msgs = [
-            {"role": "system", "content": "You are claude-code."},
+            {"role": "system", "content": "You are a coding agent."},
             {"role": "user", "content": "hi"},
         ]
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True), \
              patch.object(proxy, "_PROMPT_MODE", "passthrough"):
             out = proxy.translate_history_and_apply_prompt(msgs, "")
         self.assertEqual(out[0]["role"], "system")
-        self.assertEqual(out[0]["content"], "You are claude-code.")
+        self.assertEqual(out[0]["content"], "You are a coding agent.")
 
     def test_passthrough_does_not_translate_assistant_tool_calls(self):
         """Other modes render assistant tool_calls into a markdown JSON
@@ -1288,8 +1288,8 @@ class TestToolResultDelimiting(unittest.TestCase):
     """Tool results are wrapped in <<<BEGIN_TOOL_RESULT>>> / <<<END_TOOL_RESULT>>>
     markers by the translator, and the tool-variant builders inject framing
     around that already-delimited block. The proxy never parses tool-output
-    content — opencode and Claude Code format it differently, so harness
-    wraps and injects rather than depending on either shape.
+    content — agents format it differently, so harness wraps and injects
+    rather than depending on any one shape.
     """
 
     def setUp(self):
@@ -1328,8 +1328,8 @@ class TestToolResultDelimiting(unittest.TestCase):
 
     def test_tool_content_taken_verbatim_not_parsed(self):
         """The translator wraps tool content verbatim. Content that itself
-        looks like opencode's or Claude Code's own framing is passed through
-        untouched between the markers — never re-interpreted."""
+        looks like an agent's own framing is passed through untouched between
+        the markers — never re-interpreted."""
         msgs = [
             {"role": "user", "content": "go"},
             {"role": "assistant", "content": "", "tool_calls": [
@@ -1386,7 +1386,7 @@ class TestToolResultDelimiting(unittest.TestCase):
     def test_tool_result_name_resolved_via_tool_call_id(self):
         """A role:'tool' message with no name field but a tool_call_id is
         labeled by correlating that id against the originating assistant
-        tool_calls — the shape Claude Code sends."""
+        tool_calls — the shape some agents send."""
         msgs = [
             {"role": "user", "content": "go"},
             {"role": "assistant", "content": "", "tool_calls": [
@@ -1463,13 +1463,13 @@ class TestChangeSystemToUser(unittest.TestCase):
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
             with patch.object(proxy, "_PROMPT_MODE", "user_front"):
                 messages = [
-                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "system", "content": "You are a coding agent."},
                     {"role": "user", "content": "Hello"},
                 ]
                 result = proxy.translate_history_and_apply_prompt(messages, "")
                 self.assertEqual(len(result), 3)
                 self.assertEqual(result[0]["role"], "user")
-                self.assertEqual(result[0]["content"], "You are claude-code.")
+                self.assertEqual(result[0]["content"], "You are a coding agent.")
                 self.assertEqual(result[1]["role"], "assistant")
                 self.assertEqual(result[1]["content"], "I understand the instructions above.")
                 self.assertEqual(result[2]["role"], "user")
@@ -1481,13 +1481,13 @@ class TestChangeSystemToUser(unittest.TestCase):
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", False):
             with patch.object(proxy, "_PROMPT_MODE", "user_front"):
                 messages = [
-                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "system", "content": "You are a coding agent."},
                     {"role": "user", "content": "Hello"},
                 ]
                 result = proxy.translate_history_and_apply_prompt(messages, "")
                 self.assertEqual(len(result), 2)
                 self.assertEqual(result[0]["role"], "system")
-                self.assertEqual(result[0]["content"], "You are claude-code.")
+                self.assertEqual(result[0]["content"], "You are a coding agent.")
 
     def test_change_system_to_user_with_no_system_message(self):
         """When there's no system message, conversion is a no-op."""
@@ -1522,7 +1522,7 @@ class TestChangeSystemToUser(unittest.TestCase):
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
             with patch.object(proxy, "_PROMPT_MODE", "user_front"):
                 messages = [
-                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "system", "content": "You are a coding agent."},
                     {"role": "system", "content": "Project: foo bar."},
                     {"role": "user", "content": "Hello"},
                 ]
@@ -1530,7 +1530,7 @@ class TestChangeSystemToUser(unittest.TestCase):
                 # Combined user + stub assistant + actual user = 3 messages
                 self.assertEqual(len(result), 3)
                 self.assertEqual(result[0]["role"], "user")
-                self.assertIn("You are claude-code.", result[0]["content"])
+                self.assertIn("You are a coding agent.", result[0]["content"])
                 self.assertIn("Project: foo bar.", result[0]["content"])
                 self.assertIn("\n\n", result[0]["content"])  # the separator
                 self.assertEqual(result[1]["role"], "assistant")
@@ -1544,13 +1544,13 @@ class TestChangeSystemToUser(unittest.TestCase):
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
             with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
                 messages = [
-                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "system", "content": "You are a coding agent."},
                     {"role": "user", "content": "Hello"},
                 ]
                 tools_text = "Tool Name: `Bash`\nRun shell command"
                 result = proxy.translate_history_and_apply_prompt(messages, tools_text)
                 self.assertEqual(result[0]["role"], "user")
-                self.assertIn("You are claude-code.", result[0]["content"])
+                self.assertIn("You are a coding agent.", result[0]["content"])
                 self.assertIn("Bash", result[0]["content"])
                 self.assertIn("Run shell command", result[0]["content"])
                 # The AGENT_INSTRUCTIONS / AGENT_TOOLS wraps survive the
@@ -1578,14 +1578,14 @@ class TestChangeSystemToUser(unittest.TestCase):
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
             with patch.object(proxy, "_PROMPT_MODE", "user_front"):
                 messages = [
-                    {"role": "system", "content": "You are claude-code."},
+                    {"role": "system", "content": "You are a coding agent."},
                     {"role": "user", "content": "Hello"},
                 ]
                 tools_text = "Bash: Run shell command"
                 result = proxy.translate_history_and_apply_prompt(messages, tools_text)
                 self.assertEqual(len(result), 3)
                 self.assertEqual(result[0]["role"], "user")
-                self.assertEqual(result[0]["content"], "You are claude-code.")
+                self.assertEqual(result[0]["content"], "You are a coding agent.")
                 self.assertEqual(result[1]["role"], "assistant")
                 self.assertEqual(result[2]["role"], "user")
                 # user_front markers wrap the last user message

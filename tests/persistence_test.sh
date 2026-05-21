@@ -18,7 +18,7 @@
 #
 # We run the agent image with --entrypoint /bin/bash to bypass the
 # per-tool dispatch entirely — this test is about the home-mount mechanics
-# only, not anything claude-code or opencode does.
+# only, not anything the agent itself does.
 #
 # Project name is fixed to harness-persist-test so this never collides
 # with a real harness instance running on the same daemon.
@@ -98,16 +98,16 @@ fi
 
 # Run a one-shot bash command inside an agent container with the persistent
 # home mounted. We pass --entrypoint /bin/bash to bypass the agent
-# entrypoint's claude/opencode dispatch, but we manually invoke the
+# entrypoint's opencode/shell dispatch, but we manually invoke the
 # entrypoint's skel-seed logic by sourcing the script under test mode flag
-# — except that the entrypoint's own logic runs claude at the end. So
+# — except that the entrypoint's own logic launches the agent at the end. So
 # instead, the bash command directly mimics the relevant steps: cp -an
 # /etc/skel/harness/. ~/ + touch marker. We do this BEFORE the user's
 # command so the test exercises the same mechanics.
 #
 # Why not run the real entrypoint? Because the entrypoint always tries to
-# launch claude; even with HARNESS_TEST_MODE=1 it runs `exec claude` which
-# requires ANTHROPIC_BASE_URL. Bypassing keeps the test focused.
+# launch the agent (opencode), which requires a live ollama. Bypassing keeps
+# the test focused.
 # Shared wrapper: launch the harness-agent image with /home/harness bind-mounted
 # to a caller-chosen host path, and remap the in-container `harness` user's
 # uid/gid to the host caller's uid/gid before running ${user_cmd} as harness.
@@ -329,122 +329,6 @@ else
     fi
     echo "[persist] T3 OK"
 fi
-
-# --- T4: ccstatusline default seed ------------------------------------------
-#
-# B2 ships a default ccstatusline settings.json under
-# /etc/skel/harness/.config/ccstatusline/. The first-run skel-seed should
-# stamp it into the bind-mounted home, and subsequent runs must NOT clobber
-# it (cp -an semantics). The default config drives a working status line in
-# claude-code without user setup.
-#
-# We use a fresh agent home so the seed actually fires for this test.
-
-echo "[persist] T4: ccstatusline default seed"
-T4_HOME="${TEST_ROOT}/agent/home-t4"
-mkdir -p "${T4_HOME}"
-T4_HOME_HOST=$(harness_docker_path "${T4_HOME}")
-_run_remapped "${T4_HOME_HOST}" yes ""
-
-settings_json="${T4_HOME}/.config/ccstatusline/settings.json"
-if [[ ! -f "${settings_json}" ]]; then
-    echo "[persist] T4 FAIL: ccstatusline default settings.json not seeded" >&2
-    find "${T4_HOME}" -maxdepth 4 -type f 2>&1 | head -50 >&2
-    exit 1
-fi
-# Must contain the version key + the model widget.
-if ! grep -q '"version": 3' "${settings_json}"; then
-    echo "[persist] T4 FAIL: settings.json schema version missing" >&2
-    cat "${settings_json}" >&2; exit 1
-fi
-if ! grep -q '"model"' "${settings_json}"; then
-    echo "[persist] T4 FAIL: settings.json missing 'model' widget" >&2
-    cat "${settings_json}" >&2; exit 1
-fi
-# Idempotency: write a marker into settings.json, re-run skel-seed, expect
-# the marker preserved (cp -an should not clobber).
-cp "${settings_json}" "${settings_json}.bak"
-echo '{"version": 3, "lines": [[{"id":"x","type":"separator"}],[],[]], "_user_marker": true}' >"${settings_json}"
-_run_remapped "${T4_HOME_HOST}" yes ""
-if ! grep -q '_user_marker' "${settings_json}"; then
-    echo "[persist] T4 FAIL: skel re-seed clobbered user-edited settings.json" >&2
-    cat "${settings_json}" >&2
-    exit 1
-fi
-mv "${settings_json}.bak" "${settings_json}"
-echo "[persist] T4 OK"
-
-# --- T5: claude statusLine block injected on first start --------------------
-#
-# The agent entrypoint jq-merges a statusLine block into ~/.claude/settings.json
-# pointing at ccstatusline. Verify by running the entrypoint to its claude
-# launch (we set HARNESS_PRINT_MODE=1 plus a no-op claude shim so it doesn't
-# actually try to talk to ollama).
-#
-# Approach: replace /usr/local/bin/claude with a stub via a wrapping script.
-# Simpler: run only the parts of the entrypoint that we care about by directly
-# `bash`-ing the same merge logic the entrypoint uses. This keeps the test
-# free of network/ollama dependencies.
-
-echo "[persist] T5: claude settings.json statusLine block"
-T5_HOME="${TEST_ROOT}/agent/home-t5"
-mkdir -p "${T5_HOME}"
-T5_HOME_HOST=$(harness_docker_path "${T5_HOME}")
-_run_remapped "${T5_HOME_HOST}" yes '
-    mkdir -p $HOME/.claude
-    if [[ ! -f $HOME/.claude/settings.json ]]; then
-        printf "%s\n" "{\"includeCoAuthoredBy\": false}" > $HOME/.claude/settings.json
-    fi
-    has_status=$(jq "has(\"statusLine\")" $HOME/.claude/settings.json 2>/dev/null || echo false)
-    if [[ "$has_status" != "true" ]]; then
-        tmp=$HOME/.claude/settings.json.tmp.$$
-        jq ". + {\"statusLine\": {\"type\": \"command\", \"command\": \"ccstatusline\", \"padding\": 0}}" \
-            $HOME/.claude/settings.json >"$tmp" && mv "$tmp" $HOME/.claude/settings.json
-    fi
-'
-claude_settings="${T5_HOME}/.claude/settings.json"
-if [[ ! -f "$claude_settings" ]]; then
-    echo "[persist] T5 FAIL: $claude_settings not created" >&2
-    exit 1
-fi
-if ! grep -q '"statusLine"' "$claude_settings"; then
-    echo "[persist] T5 FAIL: statusLine block not injected" >&2
-    cat "$claude_settings" >&2
-    exit 1
-fi
-if ! grep -q 'ccstatusline' "$claude_settings"; then
-    echo "[persist] T5 FAIL: statusLine command does not point at ccstatusline" >&2
-    cat "$claude_settings" >&2
-    exit 1
-fi
-# Inventory A012: `ensure_claude_config` sets `includeCoAuthoredBy: false`
-# in the produced ~/.claude/settings.json. The inline seed at line 346 writes
-# this key on first-run create, mirroring the entrypoint's behavior; assert
-# the key is present and explicitly set to false in the final on-disk file.
-if ! grep -q '"includeCoAuthoredBy"' "$claude_settings"; then
-    echo "[persist] T5 FAIL: includeCoAuthoredBy key missing from settings.json" >&2
-    cat "$claude_settings" >&2
-    exit 1
-fi
-# Inventory A012: the value must be `false` (suppresses claude-code's
-# Co-Authored-By trailer). Use jq when available for a strict boolean check;
-# fall back to a grep that matches the literal `"includeCoAuthoredBy": false`
-# pair so a regression to `true` or removal would fail.
-if command -v jq >/dev/null 2>&1; then
-    coauthor_value=$(jq -r '.includeCoAuthoredBy' "$claude_settings" 2>/dev/null || echo "")
-    if [[ "${coauthor_value}" != "false" ]]; then
-        echo "[persist] T5 FAIL: includeCoAuthoredBy=${coauthor_value}, expected false" >&2
-        cat "$claude_settings" >&2
-        exit 1
-    fi
-else
-    if ! grep -Eq '"includeCoAuthoredBy"[[:space:]]*:[[:space:]]*false' "$claude_settings"; then
-        echo "[persist] T5 FAIL: includeCoAuthoredBy not explicitly set to false" >&2
-        cat "$claude_settings" >&2
-        exit 1
-    fi
-fi
-echo "[persist] T5 OK"
 
 # --- T6: git credential persistence ----------------------------------------
 #

@@ -8,7 +8,7 @@
 #   - logs       (follows service logs, killed by timeout)
 #   - down       (tears services down)
 #
-# Interactive subcommands (claude, opencode, stop with picker) require a
+# Interactive subcommands (opencode, stop with picker) require a
 # TTY and live upstream — those are validated by
 # tests/full_pipeline_test.sh (T9/T10/T11) and by the manual smoke checks
 # documented in MANUAL_TEST_PROMPT.md. They are NOT covered here.
@@ -133,7 +133,7 @@ harness_docker compose --project-name "${PROJECT_NAME}" \
 # --- Test 0: _gate_on_upstream_auth + run_agent gate (no docker) ------------
 #
 # Regression for #16: when the proxy + ollama services were already up,
-# `harness claude` / `harness opencode` skipped `cmd_start` (and therefore
+# `harness opencode` (or bare `harness`) skipped `cmd_start` (and therefore
 # the upstream auth probe) and the agent surfaced a locked key as an opaque
 # proxy error. The fix routes both `cmd_start` and `run_agent` through
 # `_gate_on_upstream_auth`, so a locked key prints the unlock URL and
@@ -182,7 +182,7 @@ locked_out=$(
     ensure_services_up() { echo "ENSURE_SERVICES_UP_CALLED"; }
     docker() { echo "DOCKER_CALLED $*"; }
     _gate_on_upstream_auth() { return 1; }
-    run_agent claude 2>&1
+    run_agent opencode 2>&1
 ) || run_agent_locked_rc=$?
 if (( run_agent_locked_rc == 0 )); then
     echo "[harness-test] T0 FAIL: run_agent should exit non-zero when gate returns 1" >&2
@@ -205,7 +205,7 @@ pass_out=$(
     require_docker() { :; }
     _gate_on_upstream_auth() { return 0; }
     ensure_services_up() { echo "ENSURE_SERVICES_UP_CALLED"; exit 42; }
-    run_agent claude 2>&1
+    run_agent opencode 2>&1
 ) || run_agent_pass_rc=$?
 if (( run_agent_pass_rc != 42 )); then
     echo "[harness-test] T0 FAIL: expected run_agent to advance to ensure_services_up (rc=42), got ${run_agent_pass_rc}" >&2
@@ -441,7 +441,7 @@ echo "[harness-test] T4 OK"
 
 echo "[harness-test] T5: harness help mentions all subcommands"
 help_out=$("${HARNESS_BIN}" help)
-for cmd in start down restart update upgrade logs claude opencode list stop net mcp doctor claude-statusline-config; do
+for cmd in start down restart update upgrade logs opencode list stop net mcp doctor; do
     if ! grep -q "$cmd" <<<"${help_out}"; then
         echo "[harness-test] T5 FAIL: help text missing '${cmd}'" >&2
         exit 1
@@ -850,7 +850,7 @@ echo "[harness-test] T9 OK"
 
 echo "[harness-test] T10: -p flag is parsed and dispatched"
 
-# Post-13a, harness claude auto-builds the agent image on first launch
+# Post-13a, harness auto-builds the agent image on first launch
 # rather than failing with "image not found". So the missing-image path
 # we used to assert against is gone. Instead, we verify that `-p` is
 # parsed and that the script enters the agent-launch path — we can detect
@@ -889,7 +889,7 @@ fi
 # care that no parse error appeared in the output. If image was already
 # absent before the test, the build will run; that's fine.
 set +e
-p_out=$(timeout 60 "${HARNESS_BIN}" claude -p "test prompt" 2>&1)
+p_out=$(timeout 60 "${HARNESS_BIN}" -p "test prompt" 2>&1)
 p_rc=$?
 set -e
 
@@ -1015,21 +1015,6 @@ while true; do
     sleep 2
 done
 echo "[harness-test] T12 OK"
-
-# --- Test 13: claude-statusline-config dispatches -----------------------------
-#
-# Like T10, we just want to prove the dispatcher routes the verb to the
-# right command — building/running the configurator interactively isn't
-# something we can do in a non-TTY test. We verify it appears in `harness
-# help` and that the help-only path doesn't error.
-
-echo "[harness-test] T13: claude-statusline-config in help"
-help_out=$("${HARNESS_BIN}" help)
-if ! grep -q 'claude-statusline-config' <<<"${help_out}"; then
-    echo "[harness-test] T13 FAIL: help text missing claude-statusline-config" >&2
-    exit 1
-fi
-echo "[harness-test] T13 OK"
 
 # --- Test 14: harness help mentions new B2 commands -------------------------
 
@@ -1786,7 +1771,7 @@ t24_out=$(
     _update_check_and_banner() { :; }
     # Capture the net_open value run_agent computed and stop the launch.
     warn_if_firewall_open() { echo "NET_OPEN=$1"; exit 77; }
-    run_agent claude 2>&1
+    run_agent opencode 2>&1
 ) || t24_rc=$?
 if (( t24_rc != 77 )); then
     echo "[harness-test] T24 FAIL: expected run_agent to reach warn_if_firewall_open (rc=77), got ${t24_rc}" >&2
@@ -1816,7 +1801,7 @@ t25_out=$(
     }
     # Stand in for harness_jq's container fallback: list the open service.
     harness_jq() { echo "ollama"; }
-    HARNESS_NET_CONFIRM=1 warn_if_firewall_open 0 claude 2>&1
+    HARNESS_NET_CONFIRM=1 warn_if_firewall_open 0 opencode 2>&1
 )
 if ! grep -q 'NETWORK FIREWALL IS DISABLED' <<<"${t25_out}"; then
     echo "[harness-test] T25 FAIL [#8]: warn_if_firewall_open suppressed the warning on a jq-less host" >&2
@@ -2047,6 +2032,64 @@ if (( t29_names != 2 )); then
     cat "${t29_calls}" >&2; exit 1
 fi
 echo "[harness-test] T29 OK"
+
+# --- Test 30: option-C dispatch (bare/flag → opencode, bad word errors) -----
+#
+# main() routes a bare invocation, or one whose first arg is an agent flag,
+# to `run_agent opencode`; a leading bare word is still a subcommand and an
+# unknown one must error (typo protection). The help flags are the one flag
+# exception.
+echo "[harness-test] T30: option-C dispatch routing"
+
+# Unknown bare word → non-zero exit with an 'unknown command' message.
+set +e
+t30_word_out=$("${HARNESS_BIN}" definitelynotacommand 2>&1)
+t30_word_rc=$?
+set -e
+if (( t30_word_rc == 0 )); then
+    echo "[harness-test] T30 FAIL: unknown bare word should exit non-zero" >&2
+    exit 1
+fi
+if ! grep -q "unknown command" <<<"${t30_word_out}"; then
+    echo "[harness-test] T30 FAIL: unknown bare word should report 'unknown command'" >&2
+    echo "${t30_word_out}" >&2; exit 1
+fi
+
+# Bare invocation (no args) routes to run_agent opencode.
+t30_bare_out=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    run_agent() { echo "RUN_AGENT_CALLED tool=$1"; }
+    main
+)
+if ! grep -q 'RUN_AGENT_CALLED tool=opencode' <<<"${t30_bare_out}"; then
+    echo "[harness-test] T30 FAIL: bare 'harness' did not route to run_agent opencode" >&2
+    echo "${t30_bare_out}" >&2; exit 1
+fi
+
+# A leading agent flag routes to run_agent opencode (not an unknown-command
+# error) and forwards the flag.
+t30_flag_out=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    run_agent() { echo "RUN_AGENT_CALLED tool=$1 args=$*"; }
+    main --yolo -p "hi"
+)
+if ! grep -q 'RUN_AGENT_CALLED tool=opencode args=opencode --yolo -p hi' <<<"${t30_flag_out}"; then
+    echo "[harness-test] T30 FAIL: leading flag did not route to run_agent opencode with forwarded args" >&2
+    echo "${t30_flag_out}" >&2; exit 1
+fi
+
+# The help flags stay help, not an agent launch.
+t30_help_out=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    run_agent() { echo "RUN_AGENT_CALLED"; }
+    cmd_help() { echo "CMD_HELP_CALLED"; }
+    main --help
+)
+if ! grep -q 'CMD_HELP_CALLED' <<<"${t30_help_out}" || grep -q 'RUN_AGENT_CALLED' <<<"${t30_help_out}"; then
+    echo "[harness-test] T30 FAIL: --help should show help, not launch an agent" >&2
+    echo "${t30_help_out}" >&2; exit 1
+fi
+echo "[harness-test] T30 OK"
 
 echo "============================================================"
 echo " HARNESS TEST PASSED"

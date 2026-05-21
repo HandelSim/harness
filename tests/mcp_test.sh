@@ -333,7 +333,7 @@ echo "[mcp] T6 OK"
 #
 # We don't launch a real agent here (image may not be built). Instead we
 # call the same code path harness uses internally: mkdir agent dir,
-# trigger the merge by running `harness claude` against an unbuilt image
+# trigger the merge by running `harness opencode` against an unbuilt image
 # — the script writes the side file BEFORE checking image existence.
 # Actually: the script writes the side file AFTER the image-existence
 # check passes... let me re-examine. (See the harness script: order is
@@ -346,12 +346,12 @@ echo "[mcp] T6 OK"
 #
 # Simpler approach: directly test the side-effect on the host. Once
 # enabled, we run a harness invocation that triggers the merge. Use
-# `harness claude -p` against an unbuilt image: the script enters
+# `harness opencode -p` against an unbuilt image: the script enters
 # run_agent, calls write_agent_mcp_config, then errors on the image.
 
 echo "[mcp] T7: merged client config side file"
 mkdir -p "${FAKE_INSTALL_ROOT}/state/agent/home"
-# Stash any real claude image so we can deterministically hit the
+# Stash any real agent image so we can deterministically hit the
 # image-not-found path.
 stash_tag=""
 if harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
@@ -369,7 +369,7 @@ restore_image() {
 trap 'restore_image; cleanup' EXIT INT TERM
 
 set +e
-harness_call claude -p "ignored" >/dev/null 2>&1
+harness_call opencode -p "ignored" >/dev/null 2>&1
 set -e
 restore_image
 trap cleanup EXIT INT TERM
@@ -608,7 +608,7 @@ if harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
 fi
 trap 'restore_image; cleanup' EXIT INT TERM
 set +e
-harness_call claude -p "ignored" >/dev/null 2>&1
+harness_call opencode -p "ignored" >/dev/null 2>&1
 set -e
 restore_image
 trap cleanup EXIT INT TERM

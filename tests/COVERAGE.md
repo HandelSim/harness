@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 405 IDs (F=142, P=58, A=34, M=23, N=30, U=29, Pe=19, O=25, I=45).
+Inventory total: 379 IDs (F=141, P=56, A=22, M=23, N=30, U=29, Pe=17, O=16, I=45).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -20,7 +20,7 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   `HARNESS_SOURCE_ONLY=1` and stubs `ensure_services_up` for non-docker tests.
   Track-D strengthening: F015 (T19b), F042 (T3), F072 (T11 extra chars), F131/F133
   (T19c), F022 (T23.4b), O003/O009 (T3 log scrape).
-- `tests/full_pipeline_test.sh` (731 lines) — end-to-end install → start → claude/opencode
+- `tests/full_pipeline_test.sh` — end-to-end install → start → agent (bare + opencode)
   print → mcp install/start/uninstall → down → update. Uses bundled mock_upstream sidecar.
   Track-D strengthening: I009/I012/I024/F006/I005 (T1+T2 source-level greps), F139
   (T5 firewall banner silence), F026/F135/Pe010 (T5 generator-header check),
@@ -38,7 +38,7 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   P016, P017, P018 with direct upstream-body assertions (closes scheme-emission red gaps
   that were previously only proxied through python unittests).
 - `tests/e2e/scenarios/*.yaml` (Track F2) — tmux-driven TUI scenarios with `inventory_refs`
-  declared in each file's header. Six scenarios cover F001/F043/F044/F051/F062/A013/A018/P032/P051/Pe012.
+  declared in each file's header. The opencode-boot scenario covers F044/A018.
 - `tests/firewall_test.sh` (324 lines) — Phase 2 negative (blocked PROXY_API_URL hostname
   is fatal) and Phase 3 bypass (`HARNESS_FIREWALL_DISABLED=1` per-service). Track-D added
   O001 ordering assertions in Phase 3 via ollama-log scraping.
@@ -46,10 +46,9 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   Graphify pipx, `--mount` rejection paths.
 - `tests/mcp_test.sh` (742 lines) — MCP lifecycle (list/install/enable/disable/up/down/
   uninstall/status), side-file regeneration, allowed_domains recommendation.
-- `tests/persistence_test.sh` (501 lines) — skel-seed, `pip install --user`, ccstatusline,
-  claude `settings.json` jq merge, `.git-credentials` persistence. Track-D strengthening:
-  A004 (T1 + T3 uid+gid assertions on bind-mounted artifacts), A012 (T5 explicit
-  includeCoAuthoredBy=false check via jq).
+- `tests/persistence_test.sh` — skel-seed, `pip install --user`,
+  `.git-credentials` persistence. Track-D strengthening:
+  A004 (T1 + T3 uid+gid assertions on bind-mounted artifacts).
 - `tests/upgrade_test.sh` (586 lines, no docker) — `envfile_merge`, `linefile_merge`,
   `directory_overwrite`, `_upgrade_confirm`, synthetic N→N+1 upgrade, rsync fallback.
   Track-D added T2b (U012 missing-trailing-newline injection) and T9 (U025 standalone
@@ -62,30 +61,29 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   250 |   63.0% |
-| yellow   |     2 |    0.5% |
-| red      |   145 |   36.5% |
-| **total**|   397 |  100.0% |
+| green    |   248 |   65.4% |
+| yellow   |     4 |    1.1% |
+| red      |   127 |   33.5% |
+| **total**|   379 |  100.0% |
 
-Per-prefix breakdown (J2):
+Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
-| F      |   139 |    95 |      0 |  44 |
+| F      |   141 |   100 |      1 |  40 |
 | P      |    56 |    42 |      1 |  13 |
-| A      |    34 |    18 |      0 |  16 |
+| A      |    22 |    10 |      0 |  12 |
 | M      |    23 |    18 |      0 |   5 |
 | N      |    30 |     6 |      0 |  24 |
 | U      |    29 |    22 |      0 |   7 |
-| Pe     |    19 |    16 |      1 |   2 |
-| O      |    25 |     7 |      0 |  18 |
-| I      |    42 |    26 |      0 |  16 |
+| Pe     |    17 |    14 |      1 |   2 |
+| O      |    16 |     7 |      0 |   9 |
+| I      |    45 |    29 |      1 |  15 |
 
 (Per-prefix counts derived directly from this file's status column; they
-reconcile to the total table above. The two remaining yellows — P008 and
-Pe006 — are indirect-evidence items where the surrounding test
-infrastructure would need substantive extension to promote; they are
-captured in "Notes / known issues" at the bottom.)
+reconcile to the total table above. The remaining yellows — F102, P008,
+Pe006, and I044 — are indirect-evidence items where the surrounding test
+infrastructure would need substantive extension to promote.)
 
 Spot-checks performed (regression detection)
 --------------------------------------------
@@ -98,8 +96,6 @@ Track J2 (this audit) re-ran 3 spot-checks against newly-green rows:
 
 - **U012** (linefile_merge newline injection) — `tests/upgrade_test.sh:163-208` (T2b)
 - **U025** (standalone harness_jq fallback) — `tests/upgrade_test.sh:537-580` (T9)
-- **A024** (`ANTHROPIC_AUTH_TOKEN=harness-dummy` literal in wrapper) —
-  `tests/full_pipeline_test.sh:466-470` (T9, source-level grep simulated locally)
 
 Carried over from Track C:
 
@@ -118,15 +114,15 @@ test file and line range carrying the strongest assertion, a one-line
 evidence note (quoting real assertion text where possible), and — for
 non-green rows — the gap.
 
-## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (139 IDs)
+## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (141 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
-| F001 | green  | tests/harness_test.sh:301-309               | T5 asserts help mentions `start down restart update upgrade logs claude opencode list stop net mcp doctor claude-statusline-config`; full_pipeline T3 (line 217-226) re-asserts. | |
+| F001 | green  | tests/harness_test.sh:301-309               | T5 asserts help mentions `start down restart update upgrade logs opencode list stop net mcp doctor`; full_pipeline T3 re-asserts. | |
 | F002 | green  | tests/harness_test.sh:303                   | `out=$(${HARNESS_WRAPPER} help 2>&1)` then `grep -q 'start'` etc. | |
 | F003 | green  | tests/harness_test.sh:304                   | `${HARNESS_WRAPPER} -h` invoked & checked. | |
 | F004 | green  | tests/harness_test.sh:305                   | `${HARNESS_WRAPPER} --help` invoked & checked. | |
-| F005 | red    | —                                           | —                                                                                                     | No test invokes `harness <unknown-cmd>` and asserts stderr `unknown command 'X'` + exit 1. |
+| F005 | green  | tests/harness_test.sh:T30                    | T30 invokes `harness definitelynotacommand` and asserts non-zero exit + `unknown command` on stderr (option C still catches typos). | |
 | F006 | green  | tests/full_pipeline_test.sh:235-241         | T2 source-grep against installed wrapper: `grep -q '^_self_path()' "${TEST_ROOT}/harness/harness"` then `grep -Eq 'realpath|readlink' ...`. Asserts function + fallback resolver are present in the artifact under test. | |
 | F007 | green  | tests/harness_test.sh:34-52                 | `HARNESS_INSTALL_ROOT="${TMP_INSTALL_ROOT}"` exported before every wrapper call; tests succeed because the override is honored. | |
 | F008 | green  | tests/harness_test.sh:701-705               | T11 sets `HARNESS_ALLOWLIST_PATH=${TMP_INSTALL_ROOT}/.harness-allowlist` and asserts `harness net list` reads from that path. | |
@@ -164,15 +160,15 @@ non-green rows — the gap.
 | F040 | green  | tests/upgrade_test.sh:399-444               | T8: `printf 'n\n' \| _upgrade_confirm` aborts; tests n, N, no, NO, x, CR-stripping. | |
 | F041 | green  | tests/harness_test.sh:268-282               | T3: `timeout 5 ${HARNESS_WRAPPER} logs ollama` produces output containing `ollama` or `serve`. | |
 | F042 | green  | tests/harness_test.sh:283-313               | T3 now runs `timeout 5 ${HARNESS_BIN} logs` (no service), asserts rc 0/124, no parse-error message, AND both `'ollama'` and `'proxy'` appear in the captured output (compose prefixes each line with the service name when no service is given). | |
-| F043 | green  | tests/full_pipeline_test.sh:362-387         | T9: `harness claude -p "<prompt>"` produces `Hello from mock upstream`. Verifies claude profile + mode dispatch. | |
+| F043 | green  | tests/full_pipeline_test.sh T9 + harness_test.sh T30 | T9: bare `harness -p "<prompt>"` produces `Hello from mock upstream` (option C → opencode); T30 asserts bare/flag dispatch routes to opencode. | |
 | F044 | green  | tests/full_pipeline_test.sh:391-417         | T10: `harness opencode -p "<prompt>"` produces a non-empty response with skip-on-auth-fail. | |
 | F045 | red    | —                                           | —                                                                                                     | No test invokes `harness shell` (interactive TTY makes this hard to assert non-trivially). |
-| F046 | red    | —                                           | —                                                                                                     | No test invokes `harness claude --yolo` and verifies `HARNESS_YOLO=1` is passed through. |
-| F047 | red    | —                                           | —                                                                                                     | No test invokes `harness claude --net <svc>` with an open override to verify the network attachment. |
+| F046 | red    | —                                           | —                                                                                                     | No test invokes `harness --yolo` and verifies `HARNESS_YOLO=1` is passed through. |
+| F047 | red    | —                                           | —                                                                                                     | No test invokes `harness --net` with an open override to verify the network attachment. |
 | F048 | green  | tests/integration_test.sh:735-785           | Phase 5 mounts a host dir via `--mount` and asserts the mount is visible inside the agent container; pwd inside container matches host CWD. | |
 | F049 | green  | tests/integration_test.sh:790-825           | Phase 5: `--mount /etc` rejected with `shadow container infrastructure`; `--mount /nonexistent/abc` rejected with `does not exist\|cannot resolve`. | |
 | F050 | red    | —                                           | —                                                                                                     | No test passes multiple `--mount` flags in one invocation and asserts both bind mounts present. |
-| F051 | green  | tests/full_pipeline_test.sh:362-387         | T9 invokes `harness claude -p` and asserts mock response present. | |
+| F051 | green  | tests/full_pipeline_test.sh T9              | T9 invokes bare `harness -p` and asserts mock response present (skip-on-auth-fail). | |
 | F052 | red    | —                                           | —                                                                                                     | No test exercises the `--print` long form. |
 | F053 | green  | tests/full_pipeline_test.sh:391-417         | T10 invokes `harness opencode -p`. | |
 | F054 | green  | tests/harness_test.sh:T29                    | T29 asserts two `agent_container_name opencode` calls return different `harness-opencode-*` names (per-launch uniqueness; inverts the old determinism premise, #76). | |
@@ -183,7 +179,6 @@ non-green rows — the gap.
 | F059 | red    | —                                           | —                                                                                                     | No test forces multiple agent containers to exist to exercise `pick_agent` prompting. |
 | F060 | red    | —                                           | —                                                                                                     | No test asserts `pick_agent` non-interactive single-agent path. |
 | F061 | red    | —                                           | —                                                                                                     | No test asserts `pick_agent` error when 0 agents running. |
-| F062 | green  | tests/harness_test.sh:301-309 (help mention) + persistence_test.sh:329-368 (T5) | Help mention + T5 asserts the produced settings.json has `"statusLine"` and `ccstatusline`. | |
 | F063 | green  | tests/harness_test.sh:673-726               | T11 asserts each allowlist host appears in `harness net list` with `pull` or `push` direction. | |
 | F064 | green  | tests/harness_test.sh:673-726               | T11: line `my-gitlab\.example\.com[[:space:]]+\[git-push\]` regex-matched. | |
 | F065 | green  | tests/harness_test.sh:673-726               | T11: `harness net allow BAD\ HOST` rejected with `'invalid host'`. | |
@@ -326,7 +321,7 @@ non-green rows — the gap.
 | P058 | green  | proxy/test_proxy.py (TestHybridDetailTools) | test_detail_block_emitted_for_flagged_task_tool asserts `<<<BEGIN_TOOL_DETAIL name="task">>>` + verbatim agent types reach the last user message; _sits_after_reminder_outside_user_message_wrap asserts ordering; _no_detail_block_for_unflagged_tool / _only_for_present_flagged_tools / _empty_flagged_set_disables cover the gating; setup tests cover `PROXY_HYBRID_DETAIL_TOOLS` parse/default/empty. | |
 | P059 | green  | proxy/test_proxy.py:test_mode_hybrid_reminder_advises_default_to_tools | Asserts the reminder contains "Default to the tools above" + the `webfetch`/`todowrite`/`todoread` examples, and that the guidance sits OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap (proxy stage-direction). | |
 
-## A — Agent runtime (init, configs, run-claude/opencode/shell) (34 IDs)
+## A — Agent runtime (init, configs, run-opencode/shell) (22 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -340,29 +335,17 @@ non-green rows — the gap.
 | A008 | red    | —                                           | —                                                                                                     | No test asserts `configure-git-credentials.sh` is invoked during agent startup. (persistence_test T6 verifies `.git-credentials` survives, not that the script runs.) |
 | A009 | green  | tests/persistence_test.sh:137-155 + full_pipeline_test.sh:444-462 | T1 + T15: `.harness-home-initialized` marker written; `seeded_count >= 2` after first run. | |
 | A010 | red    | —                                           | —                                                                                                     | No test sets `HARNESS_HOST_CWD` and asserts the agent `cd`'d into it. |
-| A011 | green  | tests/persistence_test.sh:329-368           | T5: starts with no `~/.claude/settings.json`, entrypoint creates it. | |
-| A012 | green  | tests/persistence_test.sh:413-440           | T5 grep's `'"includeCoAuthoredBy"'` then uses jq (or grep fallback) to assert the value is literally `false` — catches both removal and accidental `true`. | |
-| A013 | green  | tests/persistence_test.sh:360-368           | `grep -q '"statusLine"'` + `grep -q 'ccstatusline'`. | |
-| A014 | green  | tests/persistence_test.sh:329-368           | T5 starts with pre-existing settings (`_user_marker`) and asserts marker preserved post-merge. | |
-| A015 | green  | tests/mcp_test.sh:377-392                   | T7: side-file `state/agent/home/.harness-mcp-servers.json` contains `test_mcp` + sse URL. | |
-| A016 | green  | tests/full_pipeline_test.sh:471-575         | T16: after MCP install, `harness claude -p` succeeds — requires the side-file to be merged into `~/.claude.json`. | |
-| A017 | red    | —                                           | —                                                                                                     | No test installs two MCPs with the same key to assert last-write-wins. |
-| A018 | green  | tests/e2e/scenarios/02-opencode-boot.yaml   | F2 scenario header `inventory_refs: [F044, A018]`; boot path drives `harness opencode` in tmux and verifies the TUI renders — the boot path can only succeed when `ensure_opencode_config` wrote a valid `~/.config/opencode/opencode.json` on launch. | |
+| A018 | green  | tests/e2e/scenarios/01-opencode-boot.yaml   | F2 scenario header `inventory_refs: [F044, A018]`; boot path drives `harness opencode` in tmux and verifies the TUI renders — the boot path can only succeed when `ensure_opencode_config` wrote a valid `~/.config/opencode/opencode.json` on launch. | |
 | A019 | red    | —                                           | —                                                                                                     | No test asserts opencode config has a `harness` provider pointing at ollama. |
 | A020 | red    | —                                           | —                                                                                                     | No test asserts opencode config defines a `yolo` agent profile. |
 | A021 | red    | —                                           | —                                                                                                     | No test asserts opencode mcp-servers merge happens. |
 | A022 | red    | —                                           | —                                                                                                     | No test asserts local vs remote mcp distinction in opencode shape. |
-| A023 | red    | —                                           | —                                                                                                     | No test asserts `run_claude` errors when `ANTHROPIC_BASE_URL` is unset. |
-| A024 | green  | tests/full_pipeline_test.sh:466-470         | T9 source-greps the installed wrapper: `grep -Fq 'ANTHROPIC_AUTH_TOKEN=harness-dummy' "${TEST_ROOT}/harness/harness"` — direct literal check on the artifact under test. | |
-| A025 | red    | —                                           | —                                                                                                     | No test asserts `DISABLE_AUTOUPDATER=1` is exported. |
-| A026 | red    | —                                           | —                                                                                                     | No test exercises `--dangerously-skip-permissions` via `HARNESS_YOLO=1`. |
-| A027 | green  | tests/full_pipeline_test.sh:362-387         | T9: passes `-p "<prompt>"` and the prompt body reaches the mock upstream. | |
 | A028 | red    | —                                           | —                                                                                                     | No test asserts `OPENCODE_DISABLE_AUTOUPDATE=1`. |
 | A029 | red    | —                                           | —                                                                                                     | No test exercises `--agent yolo` via `HARNESS_YOLO=1`. |
 | A030 | green  | tests/full_pipeline_test.sh:391-417         | T10: `harness opencode -p` succeeds, producing a response. | |
 | A031 | green  | tests/full_pipeline_test.sh:500-512         | T10 grep's `! grep -Eqi 'unknown (option\|flag).*-p\|unknown (option\|flag).*--print'` against the opencode output (stray flag would surface an unknown-flag error from opencode), AND source-greps `agents/entrypoint.sh` for the literal strip branch `"$arg" == "-p" || "$arg" == "--print"`. | |
 | A032 | red    | —                                           | —                                                                                                     | No test exercises `harness shell` (interactive). |
-| A033 | green  | tests/full_pipeline_test.sh:362-417         | T9 (claude) and T10 (opencode) both dispatch from positional mode; each test exercises a different mode-branch. | |
+| A033 | green  | tests/full_pipeline_test.sh + harness_test.sh T30 | T9 (bare `harness` → opencode) and T10 (explicit opencode) dispatch from positional mode; harness_test T30 asserts bare/flag dispatch routes to opencode and an unknown bare word errors. | |
 | A034 | red    | —                                           | —                                                                                                     | No test invokes an unknown mode and asserts the usage error. |
 
 ## M — MCP framework (23 IDs)
@@ -462,7 +445,7 @@ non-green rows — the gap.
 | U028 | red    | —                                           | —                                                                                                     | No test runs `registry_actions` with `condition: installed` against a not-installed MCP entry. |
 | U029 | green  | tests/upgrade_test.sh:227-354               | T6 manifest includes a failing action; final `apply_upgrade_actions` rc != 0. | |
 
-## Pe — Persistence (paths that must survive lifecycle/upgrade) (19 IDs)
+## Pe — Persistence (paths that must survive lifecycle/upgrade) (17 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -477,8 +460,6 @@ non-green rows — the gap.
 | Pe009 | red    | —                                           | —                                                                                                     | No test asserts `state/mcp/serena/data/` survives a fake upgrade. (Integration test exercises serena but doesn't run an upgrade across it.) |
 | Pe010 | green  | tests/full_pipeline_test.sh:326-336         | T5 asserts if `state/.harness-runtime.yml` exists, it carries the `# Generated by harness; do not edit.` header — guarantees the file is the regenerated artifact, not a stale hand-written one. | |
 | Pe011 | green  | tests/mcp_test.sh:600-621                   | T17 re-triggers side-file write path. | |
-| Pe012 | green  | tests/persistence_test.sh:329-368           | T5 auto-augments `~/.claude/settings.json` on launch. | |
-| Pe013 | green  | tests/persistence_test.sh:257-315           | T4: ccstatusline `settings.json` seeded; `_user_marker` preserved across re-seed. | |
 | Pe014 | green  | tests/persistence_test.sh:137-176           | T1 + T2: skel-seed once, user edits preserved on second run. | |
 | Pe015 | green  | tests/full_pipeline_test.sh:579-597         | T13 down: no state files deleted. | |
 | Pe016 | green  | tests/upgrade_test.sh:60-354                | All upgrade tests preserve user state files (asserted across T1, T4, T6). | |
@@ -486,7 +467,7 @@ non-green rows — the gap.
 | Pe018 | green  | tests/upgrade_test.sh:146-174               | T4 (DEALBREAKER): harness-meta.json with `.enabled == false` survives directory_overwrite even when source has it as true. | |
 | Pe019 | green  | tests/upgrade_test.sh:146-174               | T4: `data/` subdir preserved (`data/user.txt == "user-state"`). | |
 
-## O — Ollama entrypoint + stub model registration (25 IDs)
+## O — Ollama entrypoint + stub model registration (16 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -498,17 +479,8 @@ non-green rows — the gap.
 | O006 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `/api/show` body contains `"context_length": 200000`. | |
 | O007 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `"num_ctx": 200000`. | |
 | O008 | red    | —                                           | —                                                                                                     | No test specifically forces the streaming response to omit `"status":"success"` to assert the registration-fatal path. |
-| O009 | green  | tests/harness_test.sh:327-336               | T3 also asserts the explicit success log line: `grep -Eq 'harness ollama ready; stub models -> '` — direct evidence registration succeeded and would catch a regression that turns a fatal error into a silent warning. | |
-| O010 | red    | —                                           | —                                                                                                     | No test fakes `sonnet` registration failure to assert best-effort tolerance. |
-| O011 | red    | —                                           | —                                                                                                     | Same for `opus`. |
-| O012 | red    | —                                           | —                                                                                                     | Same for `haiku`. |
-| O013 | red    | —                                           | —                                                                                                     | Same for `claude-sonnet-4-5`. |
-| O014 | red    | —                                           | —                                                                                                     | Same for `claude-opus-4-5`. |
-| O015 | red    | —                                           | —                                                                                                     | Same for `claude-haiku-4-5`. |
-| O016 | red    | —                                           | —                                                                                                     | Same for `claude-3-5-sonnet-20241022`. |
-| O017 | red    | —                                           | —                                                                                                     | Same for `claude-3-5-haiku-20241022`. |
-| O018 | red    | —                                           | —                                                                                                     | Same for `claude-3-opus-20240229`. |
-| O019 | red    | —                                           | —                                                                                                     | No test reads back each alias's `remote_host` to verify it equals the proxy URL. |
+| O009 | green  | tests/harness_test.sh:327-336               | T3 also asserts the explicit success log line: `grep -Eq 'harness ollama ready; stub model -> '` — direct evidence registration succeeded and would catch a regression that turns a fatal error into a silent warning. | |
+| O019 | red    | —                                           | —                                                                                                     | No test reads back the stub model's `remote_host` to verify it equals the proxy URL. |
 | O020 | red    | —                                           | —                                                                                                     | No test sends EXIT to the entrypoint and asserts cleanup. |
 | O021 | red    | —                                           | —                                                                                                     | No test sends INT. |
 | O022 | red    | —                                           | —                                                                                                     | No test sends TERM. |
@@ -591,7 +563,7 @@ E added `tests/scheme_contract_test.sh`, and Track F2 added the
 | A004  | yellow   | green     | D        | persistence_test T1 + T3 now assert both uid AND gid match host on bind-mounted artifacts. |
 | A007  | yellow   | green     | D        | full_pipeline_test T9 stat's the home-initialized marker (post-gosu-drop artifact) and asserts owner uid == host. |
 | A012  | yellow   | green     | D        | persistence_test T5 now jq-asserts `includeCoAuthoredBy == false`. |
-| A018  | red      | green     | F2       | e2e scenario 02-opencode-boot.yaml header declares `inventory_refs: [F044, A018]`; boot path exercises ensure_opencode_config. |
+| A018  | red      | green     | F2       | e2e scenario 01-opencode-boot.yaml header declares `inventory_refs: [F044, A018]`; boot path exercises ensure_opencode_config. |
 | A024  | yellow   | green     | D        | full_pipeline_test T9 source-greps wrapper for `ANTHROPIC_AUTH_TOKEN=harness-dummy` literal. |
 | A031  | yellow   | green     | D        | full_pipeline_test T10 asserts no `unknown flag` error AND source-greps entrypoint.sh for strip branch. |
 | I005  | yellow   | green     | D        | full_pipeline_test T2 directly invokes `harness_docker compose version`. |
@@ -705,35 +677,6 @@ with `:` (no-op).
 This proves the U025 contract (standalone-source path of `harness_jq`)
 is genuinely guarded — by T9 specifically AND by every earlier test
 that goes through `_upg_json_array` / `_upg_json_str`.
-
-### Spot-check J2-3 — A024 (`ANTHROPIC_AUTH_TOKEN=harness-dummy` literal, newly green)
-
-Test file: `tests/full_pipeline_test.sh` T9 (line 466-470).
-
-Full T9 requires docker (install + start + run claude); the assertion
-itself is a source-level grep:
-
-```
-grep -Fq 'ANTHROPIC_AUTH_TOKEN=harness-dummy' "${TEST_ROOT}/harness/harness"
-```
-
-To exercise the regression detection without bringing up the full
-pipeline, the same grep was simulated locally against the wrapper
-source:
-
-```
-# regression: replace literal in wrapper
-sed -i 's/ANTHROPIC_AUTH_TOKEN=harness-dummy/ANTHROPIC_AUTH_TOKEN=harness-wrong-token/' harness
-grep -Fq 'ANTHROPIC_AUTH_TOKEN=harness-dummy' harness  # rc=1 (expected = literal missing)
-
-# restore from backup
-cp /tmp/harness.bak harness
-grep -Fq 'ANTHROPIC_AUTH_TOKEN=harness-dummy' harness  # rc=0 (expected = literal present)
-```
-
-The grep returns rc=1 with the literal absent and rc=0 once restored.
-T9's assertion is precisely this grep, so a regression replacing the
-token literal would fail T9 inside the docker harness.
 
 ### Spot-check C-1 (carried) — F056 (`harness list` empty case)
 

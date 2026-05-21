@@ -62,16 +62,16 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F040 | `_upgrade_confirm` returns failure when stdin says "n" or empty default |
 | F041 | `harness logs <service>` follows compose logs for the named service |
 | F042 | `harness logs` (no service) tails all services |
-| F043 | `harness claude` launches the agent container with the claude profile and `claude` mode |
+| F043 | Bare `harness` (no command), or `harness` with a leading agent flag, launches an opencode agent in the CWD (option C dispatch); an unknown bare word still errors |
 | F044 | `harness opencode` launches the agent container with the `opencode` mode |
 | F045 | `harness shell` launches the agent container with the `shell` mode and an interactive TTY |
-| F046 | `harness claude --yolo` sets `HARNESS_YOLO=1` in the agent container env |
-| F047 | `harness claude --net <svc>` enables the named net-override service for this invocation |
-| F048 | `harness claude --mount <path>` adds a bind mount to the agent container |
-| F049 | `harness claude --mount` rejects unsafe targets via `harness_validate_mount` |
+| F046 | `harness --yolo` sets `HARNESS_YOLO=1` in the agent container env |
+| F047 | `harness --net` enables the per-invocation net-override for this launch |
+| F048 | `harness --mount <path>` adds a bind mount to the agent container |
+| F049 | `harness --mount` rejects unsafe targets via `harness_validate_mount` |
 | F050 | `--mount` is repeatable: multiple `--mount <path>` flags accumulate |
-| F051 | `harness claude -p "<prompt>"` runs claude in print mode |
-| F052 | `harness claude --print "<prompt>"` is an alias for `-p` |
+| F051 | `harness -p "<prompt>"` runs the agent in print mode |
+| F052 | `harness --print "<prompt>"` is an alias for `-p` |
 | F053 | `harness opencode -p "<prompt>"` runs opencode in print mode |
 | F054 | `agent_container_name` produces a unique per-launch container name (`harness-<tool>-<rand>`), not derived from the directory |
 | F055 | Two launches of the same tool from the same directory produce distinct container names (concurrent same-dir agents don't collide) |
@@ -81,7 +81,6 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F059 | `pick_agent` prompts when multiple agents are running |
 | F060 | `pick_agent` returns the single running agent without prompting |
 | F061 | `pick_agent` errors when no agent is running |
-| F062 | `harness claude-statusline-config` writes the ccstatusline config into the shared agent home |
 | F063 | `harness net list` prints every host on the allowlist with `pull`/`push` direction |
 | F064 | `harness net list` includes hosts annotated with `# git-push` as `push` direction |
 | F065 | `harness net allow <host>` validates the host via `netlib_validate_host` |
@@ -242,29 +241,17 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | A008 | User-side init calls `configure-git-credentials.sh` before the agent runs |
 | A009 | User-side init seeds `/etc/skel/harness/.` into `$HOME` once (`cp -an`) so it never overwrites user edits |
 | A010 | User-side init `cd`s into `HARNESS_HOST_CWD` if set |
-| A011 | `ensure_claude_config` creates `~/.claude/settings.json` if missing |
-| A012 | `ensure_claude_config` sets `includeCoAuthoredBy: false` in the settings |
-| A013 | `ensure_claude_config` sets a `statusLine` entry pointing at ccstatusline |
-| A014 | `ensure_claude_config` merges into an existing settings.json via `jq` rather than overwriting |
-| A015 | `merge_claude_mcp_servers` reads `~/.harness-mcp-servers.json` |
-| A016 | `merge_claude_mcp_servers` folds entries into `~/.claude.json` `mcpServers` key |
-| A017 | `merge_claude_mcp_servers` overwrites entries with the same name (last write wins) |
 | A018 | `ensure_opencode_config` writes `~/.config/opencode/opencode.json` on every launch |
 | A019 | `ensure_opencode_config` configures a `harness` provider pointing at the local ollama endpoint |
 | A020 | `ensure_opencode_config` defines a `yolo` agent profile |
-| A021 | `merge_opencode_mcp_servers` translates the claude-shaped mcp-servers JSON into opencode's mcp shape |
+| A021 | `merge_opencode_mcp_servers` translates the canonical `mcpServers` JSON into opencode's mcp shape |
 | A022 | `merge_opencode_mcp_servers` distinguishes `local` (stdio) from `remote` (SSE/HTTP) entries |
-| A023 | `run_claude` requires `ANTHROPIC_BASE_URL` to be set, errors otherwise |
-| A024 | `run_claude` sets `ANTHROPIC_AUTH_TOKEN=harness-dummy` |
-| A025 | `run_claude` sets `DISABLE_AUTOUPDATER=1` |
-| A026 | `run_claude` passes `--dangerously-skip-permissions` when `HARNESS_YOLO=1` |
-| A027 | `run_claude` passes `-p "$prompt"` straight through to the claude CLI |
 | A028 | `run_opencode` sets `OPENCODE_DISABLE_AUTOUPDATE=1` |
 | A029 | `run_opencode` passes `--agent yolo` when `HARNESS_YOLO=1` |
 | A030 | `run_opencode` invokes `opencode run "<prompt>"` when `-p` is passed |
 | A031 | `run_opencode` strips the `-p`/`--print` flag before forwarding remaining args |
 | A032 | `run_shell` execs `bash -l` so login dotfiles run |
-| A033 | Entry dispatch chooses claude/opencode/shell based on the first positional arg |
+| A033 | Entry dispatch chooses opencode/shell based on the first positional arg (default opencode) |
 | A034 | Unknown mode in dispatch errors with usage |
 
 ---
@@ -387,8 +374,6 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | Pe009 | `state/mcp/serena/data/` (Serena index) is preserved by upgrades |
 | Pe010 | `state/.harness-runtime.yml` is regenerated on every compose invocation |
 | Pe011 | `state/agent/home/.harness-mcp-servers.json` is regenerated on every agent launch |
-| Pe012 | `state/agent/home/.claude/settings.json` is auto-augmented on every agent launch (statusLine + includeCoAuthoredBy) |
-| Pe013 | `state/agent/home/.config/ccstatusline/settings.json` is seeded once from `/etc/skel` then user-managed |
 | Pe014 | `state/agent/home/.bashrc`, `.gitconfig` etc are seeded once from `/etc/skel/harness/.` then user-managed |
 | Pe015 | `harness down` does not delete any `state/` content |
 | Pe016 | `harness upgrade` does not delete any `state/` content |
@@ -411,16 +396,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | O007 | `register_stub_model` POSTs `parameters.num_ctx` matching `OLLAMA_CONTEXT_LENGTH` |
 | O008 | `register_stub_model` requires the response stream's final line to have `"status":"success"` |
 | O009 | Canonical `MODEL_NAME` registration is fatal on failure (exit non-zero) |
-| O010 | Alias `sonnet` registration is best-effort (failure is logged, not fatal) |
-| O011 | Alias `opus` registration is best-effort |
-| O012 | Alias `haiku` registration is best-effort |
-| O013 | Alias `claude-sonnet-4-5` registration is best-effort |
-| O014 | Alias `claude-opus-4-5` registration is best-effort |
-| O015 | Alias `claude-haiku-4-5` registration is best-effort |
-| O016 | Alias `claude-3-5-sonnet-20241022` registration is best-effort |
-| O017 | Alias `claude-3-5-haiku-20241022` registration is best-effort |
-| O018 | Alias `claude-3-opus-20240229` registration is best-effort |
-| O019 | All registered aliases point at the proxy via `remote_host` |
+| O019 | The registered stub model points at the proxy via `remote_host` |
 | O020 | Trap on EXIT cleans up the background ollama process |
 | O021 | Trap on INT cleans up the background ollama process |
 | O022 | Trap on TERM cleans up the background ollama process |

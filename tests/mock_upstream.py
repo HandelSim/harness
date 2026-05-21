@@ -190,7 +190,7 @@ def unwrap_proxy_scaffolding(content: str) -> str:
     """Return just the user/tool content from a proxy-wrapped message.
 
     In the default `user_front` prompt mode the proxy appends the full
-    tool-schema block (~10-15KB across ~24 tools for Claude Code) to the
+    tool-schema block (~10-15KB across the agent's tools) to the
     final user message. Matching a fixture regex against that block is a
     bug magnet: a phrase like "List files in current directory" inside the
     Bash tool's description matches the `03_list_files` fixture's
