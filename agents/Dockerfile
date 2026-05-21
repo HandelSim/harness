@@ -57,23 +57,31 @@ ENV LC_ALL=C.UTF-8
 
 # Agent CLI at a pinned version. Bumping requires editing this file.
 #
-# The 1.14.42..1.15.x "interactive split-footer" headless regression is FIXED
-# as of 1.15.7: the split-footer mode is now opt-in via `opencode run -i/
-# --interactive` (default off; it errors without a TTY stdout), and `opencode
-# run` on a non-TTY writes the assistant body to stdout — verified in the
-# 1.15.7 binary, whose run-command text renderer branches
-# `if (!process.stdout.isTTY) process.stdout.write(text)`. So `harness opencode
-# -p` (full_pipeline_test.sh T10) gets the body again with no entrypoint change.
+# OPENCODE_VERSION floor: must stay <= 1.14.41 until upstream restores headless
+# stdout. opencode 1.14.42 added an "interactive split-footer mode for
+# `opencode run`" that suppresses the formatted-default response body when
+# stdout is NOT a TTY — `opencode run "say hello"` then exits 0 with only
+# "> build · <project>" printed, no assistant content, breaking `harness -p`
+# and `harness opencode -p` (full_pipeline_test.sh T9/T10, integration_test.sh
+# smoke). The regression is present in every 1.14.42..1.14.51 and 1.15.x
+# release tested.
 #
-# Two things to re-verify on any future bump:
-#   1. `opencode run --format default <prompt>` still emits the assistant body
-#      on a non-TTY stdout (the regression above must not return).
-#   2. The proxy pares the `task` tool description by anchoring on opencode's
-#      "Available agent types and the tools they have access to:" header
-#      (proxy/proxy.py `_OPENCODE_TASK_AGENTS_HEADER`); keep that parse working.
-#      proxy/test_proxy.py TestTaskDescriptionParing is the canary — refresh its
-#      fixture from the bumped binary and fix the header constant if it drifts.
-ARG OPENCODE_VERSION=1.15.7
+# 1.15.7 was tried (2026-05-21, issue #83/#86) on the theory that the
+# split-footer was made opt-in via `opencode run -i/--interactive`. It is NOT
+# fixed: 1.15.7 still suppresses the body on a non-TTY `opencode run` (verified
+# against a streaming OpenAI endpoint — 1.14.41 prints the body, 1.15.7 prints
+# nothing), and CI on dev@47b60a6 failed at T9 with "> build · harness" and no
+# "Hello from mock upstream". Do NOT bump again without confirming
+# `opencode run "say hello" </dev/null | grep -q <expected>` on a non-TTY
+# stdout against the bumped binary first.
+#
+# When bumping does become possible, also re-verify the proxy pares the `task`
+# tool description by anchoring on opencode's "Available agent types and the
+# tools they have access to:" header (proxy/proxy.py
+# `_OPENCODE_TASK_AGENTS_HEADER`); keep that parse working.
+# proxy/test_proxy.py TestTaskDescriptionParing is the canary — refresh its
+# fixture from the bumped binary and fix the header constant if it drifts.
+ARG OPENCODE_VERSION=1.14.41
 ARG OPENAI_COMPAT_VERSION=2.0.47
 
 RUN npm install -g \
