@@ -16,6 +16,21 @@ syntax, tool flags, third-party docs), and run targeted tests locally to
 disambiguate. Do NOT fall back to research-and-propose just because the
 cause isn't obvious from the logs alone — investigation is your job.
 
+## Review recent commits — do not undo intentional work
+
+Before changing anything, run `git log --oneline -20 origin/dev` and read
+the diffs of commits near the failing SHA to understand what changed
+recently and why. A failing test does not always mean the recent change was
+wrong — sometimes a change was made intentionally by HandelSim and the
+*test* is now what is stale.
+
+- **Never "fix" CI by reverting an intentional change.** If a recent commit
+  deliberately changed behavior and an older test now fails, the correct fix
+  is to update the test to the new intended behavior (or fix the real bug the
+  test exposed), not to roll the change back.
+- If you cannot tell whether a recent change was intentional, do NOT guess —
+  fall back to research-and-propose and ask HandelSim.
+
 ## Eligible for direct fix-and-push (no proposal, no approval)
 
 - Test flake stabilization (retry, sleep, race fix).
@@ -40,10 +55,14 @@ cause isn't obvious from the logs alone — investigation is your job.
 ## Auto-fix flow (when eligible)
 
 1. Read the failing logs from the issue body and comments.
-2. Investigate per the research discipline above. Reproduce locally if
-   useful. Identify root cause.
-3. Implement the fix on the agent branch.
-4. Run the specific failing test locally; it must pass before commit.
+2. Investigate per the research discipline above, and **review recent
+   commits** (see "Review recent commits" above) so you do not revert
+   intentional work. Reproduce locally if useful. Identify root cause.
+3. Implement the fix on the agent branch, committing and pushing at
+   checkpoints as you go (see [`implementing.md`](implementing.md) →
+   "Checkpoint commits — push as you go").
+4. Run the specific failing test locally; it must pass before the final
+   commit.
 5. Update any architecture doc whose subject was affected, in the same
    commit (see the architecture router in `CLAUDE.md`).
 6. Commit with `Fix #<N>: <summary>` + the `Co-authored-by` trailer.
