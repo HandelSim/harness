@@ -412,9 +412,9 @@ fi
 # successfully registered (entrypoint.sh exits non-zero on registration
 # failure, which would prevent the container from becoming healthy).
 # We additionally assert the explicit "harness ollama ready; stub
-# models ->" success line is present so a future regression that turns
+# model ->" success line is present so a future regression that turns
 # the registration error into a warning still trips this test.
-if ! grep -Eq 'harness ollama ready; stub models -> ' <<<"${ollama_logs}"; then
+if ! grep -Eq 'harness ollama ready; stub model -> ' <<<"${ollama_logs}"; then
     echo "[harness-test] T3 FAIL [O009]: ollama entrypoint did not log registration success" >&2
     echo "${ollama_logs}" | tail -40 >&2
     exit 1

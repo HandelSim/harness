@@ -575,7 +575,7 @@ E added `tests/scheme_contract_test.sh`, and Track F2 added the
 | I024  | yellow   | green     | D        | full_pipeline_test T2 grep's installed wrapper for the install-root path literal. |
 | O001  | yellow   | green     | D        | firewall_test Phase 3 scrapes ollama logs for firewall-init markers AND asserts firewall-line precedes ollama-api-wait-line. |
 | O003  | yellow   | green     | D        | harness_test T3 scrapes ollama logs for `waiting for ollama API at .*?/api/tags` poll banner. |
-| O009  | yellow   | green     | D        | harness_test T3 also asserts the explicit `harness ollama ready; stub models -> ` success line. |
+| O009  | yellow   | green     | D        | harness_test T3 also asserts the explicit `harness ollama ready; stub model -> ` success line. |
 | P003  | yellow   | green     | D        | proxy_test Scenario F scrapes proxy logs for `listening on: 0.0.0.0:8000` banner. |
 | P004  | yellow   | green     | D        | proxy_test Scenario F same banner, asserts `:8000` port suffix. |
 | P006  | yellow   | green     | D        | proxy_test Scenario F asserts redacted key banner AND raw key NOT printed. |
