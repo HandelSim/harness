@@ -13,9 +13,6 @@ egress policy and block accidental git pushes:
   globally, then enables `store` for any host annotated `# git-push` in the
   allowlist.
 
-Both are adapted from the canonical Anthropic devcontainer init script:
-<https://github.com/anthropics/claude-code/blob/main/.devcontainer/init-firewall.sh>
-
 ## Where they run
 
 Each container's entrypoint invokes `init-firewall.sh` early — for proxy

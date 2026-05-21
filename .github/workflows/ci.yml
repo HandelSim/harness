@@ -250,59 +250,11 @@ jobs:
           sed -i 's|^PROXY_API_MODEL=.*|PROXY_API_MODEL=ci-placeholder-model|' .env
           # harness source .env with `set -a` on every invocation, so even
           # though we set this on `harness start` below the scenarios'
-          # `./harness claude` calls would still hit _gate_on_upstream_auth.
+          # `./harness opencode` calls would still hit _gate_on_upstream_auth.
           # Baking the bypass into .env makes every invocation skip it.
           echo 'HARNESS_SKIP_AUTH_PROBE=1' >> .env
           cp .harness-allowlist.example .harness-allowlist
           chmod +x harness
-
-      # Pre-seed claude-code's user state file BEFORE the agent ever starts
-      # so that the first-run theme picker / onboarding screen does not appear.
-      # Without this, scenario 01-claude-boot.yaml hangs waiting for the
-      # prompt marker `│ > ` because claude is still on the picker screen.
-      #
-      # Cycle 4 wrote hasCompletedOnboarding into ~/.claude/settings.json
-      # and the picker still rendered. Disassembling the v2.1.120 binary
-      # showed the onboarding gate (QN9) reads from ~/.claude.json (the
-      # top-level state file populated by Lq()), not from settings.json.
-      # The fields below match what claude itself writes on first run plus
-      # hasCompletedOnboarding=true and a project-trust entry for the CI
-      # checkout path (claude bind-mounts and cd's into HARNESS_HOST_CWD,
-      # which on CI is the runner's repo path).
-      #
-      # state/agent/home is the host side of the agent's $HOME bind mount;
-      # the harness CLI remaps the in-container `harness` user to the host
-      # uid/gid so these files are readable inside the container.
-      - name: Pre-seed claude-code settings
-        run: |
-          mkdir -p state/agent/home/.claude
-          cat > state/agent/home/.claude/settings.json <<'JSON'
-          {"theme":"dark","includeCoAuthoredBy":false}
-          JSON
-          repo_cwd="${GITHUB_WORKSPACE}"
-          cat > state/agent/home/.claude.json <<JSON
-          {
-            "theme": "dark",
-            "hasCompletedOnboarding": true,
-            "firstStartTime": "2026-01-01T00:00:00.000Z",
-            "migrationVersion": 12,
-            "opusProMigrationComplete": true,
-            "sonnet1m45MigrationComplete": true,
-            "userID": "ci-placeholder-user-id-0000000000000000000000000000000000000000",
-            "numStartups": 42,
-            "lastOnboardingVersion": {
-              "ISSUES_EXPLAINER": "report the issue at https://github.com/anthropics/claude-code/issues",
-              "PACKAGE_URL": "@anthropic-ai/claude-code",
-              "README_URL": "https://code.claude.com/docs/en/overview",
-              "VERSION": "2.1.143",
-              "FEEDBACK_CHANNEL": "https://github.com/anthropics/claude-code/issues",
-              "BUILD_TIME": "2026-05-15T18:00:00.000Z"
-            },
-            "projects": {
-              "${repo_cwd}": {"hasTrustDialogAccepted": true}
-            }
-          }
-          JSON
 
       - name: harness start
         env:
@@ -311,10 +263,10 @@ jobs:
           HARNESS_SKIP_AUTH_PROBE: "1"
         run: ./harness start
 
-      # Pre-build the agent image so `./harness claude` inside each scenario
+      # Pre-build the agent image so `./harness opencode` inside each scenario
       # finds it already present and does NOT inline-build it. The inline
       # build is ~45s on CI and races the scenarios' 45s wait_for_marker on
-      # the claude prompt; the transcripts dumped by Diagnostics on cycle 3
+      # the agent's TUI prompt; the transcripts dumped by Diagnostics on cycle 3
       # showed every scenario stuck on `harness: building harness-agent:latest
       # (one-time)...` and the docker-build output filling the tmux pane.
       - name: Pre-build agent image
@@ -358,7 +310,7 @@ jobs:
           echo "=== docker logs harness-ollama-1 ==="; docker logs harness-ollama-1 2>&1 | tail -100 || true
           # Agent containers are ephemeral per-scenario. Dump anything that
           # still has the harness.agent=true label so we can see what
-          # claude-code printed when the prompt never appeared.
+          # the agent printed when the prompt never appeared.
           for c in $(docker ps -a --filter label=harness.agent=true --format '{{.Names}}' 2>/dev/null); do
             echo "=== docker logs ${c} ==="
             docker logs "${c}" 2>&1 | tail -200 || true

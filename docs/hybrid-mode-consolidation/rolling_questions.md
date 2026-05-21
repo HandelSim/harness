@@ -50,7 +50,6 @@ router target) and skip creating new decisions/history docs.
 - `tests/INVENTORY.md` (entries P013–P017)
 - `tests/COVERAGE.md` (entries P010, P013–P018)
 - `tests/benchmarks/mock-smoketest.sh` (scheme list)
-- `tests/benchmarks/adapters/harness_claude/harness_claude_agent.py` (docstring)
 - `tests/benchmarks/README.md` (mode discussion)
 - `tests/mock_upstream.py` (line 210 comment)
 

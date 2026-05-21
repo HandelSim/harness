@@ -2,10 +2,7 @@
 #
 # firewall/init-firewall.sh — universal egress firewall for harness containers.
 #
-# Adapted from the canonical Anthropic devcontainer init script:
-#   https://github.com/anthropics/claude-code/blob/main/.devcontainer/init-firewall.sh
-#
-# Differences from the upstream version:
+# Notable behaviors:
 #   1. Allowlist of hosts is read from /etc/harness/allowlist (mounted from
 #      <install-root>/.harness-allowlist), not hardcoded.
 #   2. VS Code marketplace and statsig hosts are dropped (not used here).
