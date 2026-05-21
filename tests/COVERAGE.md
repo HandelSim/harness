@@ -324,6 +324,7 @@ non-green rows — the gap.
 | P056 | green  | tests/proxy_test.sh:289-352                 | Scenario C body check: keys == `['messages', 'model']`, with `model == PROXY_API_MODEL`. | |
 | P057 | green  | proxy/test_proxy.py:939-1004                | test_tool_result_name_resolved_via_tool_call_id / _falls_back_to_positional_order / _prefers_explicit_field / _unknown_when_no_metadata: name resolution chain (field → id → positional → `unknown_tool`). | |
 | P058 | green  | proxy/test_proxy.py (TestHybridDetailTools) | test_detail_block_emitted_for_flagged_task_tool asserts `<<<BEGIN_TOOL_DETAIL name="task">>>` + verbatim agent types reach the last user message; _sits_after_reminder_outside_user_message_wrap asserts ordering; _no_detail_block_for_unflagged_tool / _only_for_present_flagged_tools / _empty_flagged_set_disables cover the gating; setup tests cover `PROXY_HYBRID_DETAIL_TOOLS` parse/default/empty. | |
+| P059 | green  | proxy/test_proxy.py:test_mode_hybrid_reminder_advises_default_to_tools | Asserts the reminder contains "Default to the tools above" + the `webfetch`/`todowrite`/`todoread` examples, and that the guidance sits OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap (proxy stage-direction). | |
 
 ## A — Agent runtime (init, configs, run-claude/opencode/shell) (34 IDs)
 

@@ -379,7 +379,10 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     (e.g. opencode's `bash` requires `description`; `read` takes `filePath`
     not `filename`). The "do not invent" sentence closes a common failure
     mode where the model emits a JSON call and then narrates an imagined
-    output in the same turn.
+    output in the same turn. The "default to the tools above" sentence
+    nudges the model to reach for a dedicated tool rather than improvising
+    by hand (e.g. `webfetch` over a curl/Python script, `todowrite`/
+    `todoread` over a hand-written todo file).
 
     `tool_signatures` is a list of `(name, required_keys, optional_keys)`
     triples produced by `_extract_tool_signatures`.
@@ -417,7 +420,11 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         "reasoning before or after the JSON block. After emitting a tool "
         "call, do not invent or narrate the tool's result — the real "
         "result will be provided in the next turn. If no tool is needed, "
-        "answer normally without any JSON."
+        "answer normally without any JSON. Default to the tools above for any "
+        "task they cover instead of doing the work by hand — e.g. use "
+        "`webfetch` to retrieve a URL instead of curl or a Python script, and "
+        "use `todowrite`/`todoread` to manage your task list instead of "
+        "writing a todo file."
         f"{tools_clause}]"
     )
     detail_blocks = _format_tool_detail_blocks(tool_details)

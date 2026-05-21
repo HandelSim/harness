@@ -705,6 +705,23 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertNotIn("Run shell command", last_user)
         self.assertNotIn('"required"', last_user)
 
+    def test_mode_hybrid_reminder_advises_default_to_tools(self):
+        """The reminder nudges the model to reach for a dedicated tool rather
+        than improvising by hand, with concrete examples."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("Default to the tools above", last_user)
+        # Concrete examples the user asked for.
+        self.assertIn("webfetch", last_user)
+        self.assertIn("todowrite", last_user)
+        self.assertIn("todoread", last_user)
+        # The guidance is part of the reminder (proxy stage-direction),
+        # OUTSIDE the wrapped user message.
+        self.assertLess(
+            last_user.index("Default to the tools above"),
+            last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
+        )
+
     def test_mode_hybrid_signatures_show_required_and_optional(self):
         """The reminder lists required params bare and each optional param
         in its own `[brackets]`. This is the recency anchor for the keys

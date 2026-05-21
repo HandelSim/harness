@@ -53,9 +53,12 @@ The validator in `_setup_prompt_mode` accepts:
 - **`hybrid`** — full tool definitions appended to the system message
   (which `_CHANGE_SYSTEM_TO_USER` then folds into the user-role message at
   index 0, the "stable prefix" position). A short recency reminder
-  restating the JSON envelope, the no-fabricated-results rule, and each
-  tool's parameter signature (`name(required, [optional])` per tool) is
-  prepended to the last user message. The signature list — not just bare
+  restating the JSON envelope, the no-fabricated-results rule, a
+  default-to-the-listed-tools nudge (prefer a dedicated tool over doing the
+  work by hand — e.g. `webfetch` over a curl/Python script, `todowrite`/
+  `todoread` over a hand-written todo file), and each tool's parameter
+  signature (`name(required, [optional])` per tool) is prepended to the last
+  user message. The signature list — not just bare
   names — is the recency anchor for the parameter keys models most often
   guess wrong (e.g. calling `read({"filename": ...})` instead of
   `read({"filePath": ...})`, or omitting opencode's `bash` required
