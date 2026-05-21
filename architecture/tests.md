@@ -17,8 +17,7 @@ and coverage map, see `tests/INVENTORY.md` and `tests/COVERAGE.md`
 | `tests/lib/`               | Sourceable bash test toolkits. `test_helpers.sh` is the main one (`require_docker`, `test_section`, `test_generate_env`, `test_generate_mockupstream_override`, `test_wait_for_healthy`, `test_cleanup`, plus integration helpers). |
 | `tests/fixtures/`          | Test fixtures. `fixtures/responses/` holds mock-upstream response fixtures (see `fixtures/responses/README.md`); `fixtures/test-project/` is the small Python calculator package used by `integration_test.sh`. |
 | `tests/mock_upstream.py`   | Mock upstream LLM API used by every docker-based test. Two modes: legacy `MOCK_SCENARIO=text\|tool` and fixture dispatch (`MOCK_FIXTURES_DIR=/fixtures`). |
-| `tests/*_test.sh`          | Top-level test scripts (one per area: `proxy`, `harness`, `persistence`, `mcp`, `firewall`, `upgrade`, `full_pipeline`, `integration`, `scheme_contract`, `podman_smoke`). |
-| `tests/e2e/`               | tmux-driven TUI scenarios. `e2e/lib/` (driver), `e2e/run.sh` (orchestrator), `e2e/scenarios/*.yaml` (per-scenario specs). See `tests/e2e/README.md`. |
+| `tests/*_test.sh`          | Top-level test scripts (one per area: `proxy`, `harness`, `persistence`, `mcp`, `firewall`, `upgrade`, `full_pipeline`, `integration`, `scheme_contract`, `podman_smoke`). Plus docker-free `unit_*_test.sh` (e.g. `unit_platform_timer_test.sh`). |
 | `tests/benchmarks/`        | Harbor-based agent benchmarks (Terminal-Bench 2.0, SWE-bench Lite). Adapters under `benchmarks/adapters/`, schemes under `benchmarks/schemes/`, runners under `benchmarks/runners/`. Benchmarks NEVER run in CI. See `tests/benchmarks/README.md`. |
 
 ## Quick start
@@ -41,9 +40,8 @@ wrapper edits needed.
 | Section          | What runs |
 |------------------|-----------|
 | `all` (default)  | Every `tests/*_test.sh` script. |
-| `unit`           | Standalone tests with no docker dependency (currently `upgrade_test.sh`). |
+| `unit`           | Standalone tests with no docker dependency: `upgrade_test.sh` plus every `unit_*_test.sh` (glob-discovered). |
 | `integration`    | Docker-based tests. Use `--slow` for `integration_test.sh`. |
-| `e2e`            | `tests/e2e/run.sh` — every tmux scenario under `tests/e2e/scenarios/`. |
 | `<prefix>`       | Matches `tests/<prefix>*_test.sh`. E.g. `harness test proxy` runs `proxy_test.sh` and any future `proxy_*_test.sh`. |
 
 `--pattern '<glob>'` overrides the section and runs whatever the glob
@@ -54,8 +52,6 @@ matches under `tests/`. Useful for one-off runs (`--pattern 'scheme_*'`).
 | Variable                    | Effect |
 |-----------------------------|--------|
 | `HARNESS_RUN_SLOW`          | `=1` opts into the slow integration test (`integration_test.sh`). `harness test --slow` sets this for you. The default suite stays fast without it. |
-| `HARNESS_E2E_PATTERN`       | Glob restricting which scenarios `tests/e2e/run.sh` will execute (default: `tests/e2e/scenarios/*.yaml`). |
-| `HARNESS_E2E_LOG_DIR`       | Where the tmux driver writes per-scenario `pipe-pane` transcripts. Defaults to a temp dir under the worktree. Keep this to retain transcripts after a failed run. |
 | `HARNESS_CONTAINER_RUNTIME` | `=podman` runs the suite under podman instead of docker. All `*_test.sh` honor this. |
 
 `mock_upstream.py` honors `MOCK_SCENARIO` (legacy) or `MOCK_FIXTURES_DIR`
@@ -80,19 +76,6 @@ them from your shell.
    run the new file. No wrapper edits required.
 5. If the test is slow (> ~60 s) or needs a heavy image, gate it behind
    `HARNESS_RUN_SLOW=1` so CI's default matrix doesn't pick it up.
-
-### e2e scenario
-
-1. Add `tests/e2e/scenarios/NN-<name>.yaml` per the schema in
-   `tests/e2e/README.md`. Number prefix controls ordering.
-2. Reference at least one `inventory_refs:` ID so the scenario maps back
-   to `INVENTORY.md`.
-3. Always use `tests/mock_upstream.py` for the upstream side — never a
-   real LLM.
-4. Run `harness test e2e` or `bash tests/e2e/run.sh` to exercise it.
-5. Use `wait_for_marker` and `wait_stable_ms` rather than fixed sleeps —
-   the driver helpers exist for exactly this. See the e2e/README.md
-   pitfalls section.
 
 ### Benchmark
 
@@ -171,16 +154,14 @@ either branch (see `.github/workflows/ci.yml`):
 
 - `lint` — `bash -n` over all shell scripts, `check_runtime_calls.sh`,
   advisory `shellcheck`.
-- `unit` — `tests/upgrade_test.sh`.
+- `unit` — `harness test unit` (`upgrade_test.sh` + every
+  `unit_*_test.sh`; no docker).
 - `docker-tests` — matrix over the docker-based `*_test.sh` (proxy,
   harness, persistence, mcp, firewall).
-- `pipeline` — `tests/full_pipeline_test.sh`.
+- `pipeline` — `tests/full_pipeline_test.sh`. Its T9 boot-smoke also
+  asserts `ensure_opencode_config` writes `opencode.json` on launch
+  (A018).
 - `integration` — `HARNESS_RUN_SLOW=1 tests/integration_test.sh`.
-- `e2e` — `tests/e2e/run.sh` over every scenario. The job runs
-  `./harness start` with `PROXY_API_URL` pointed at `mockupstream`, then
-  runs `run.sh` with `HARNESS_E2E_MOCK_UPSTREAM=1` so it provisions a
-  `mock_upstream.py` sidecar on the harness network for the scenarios to
-  drive (see `tests/e2e/README.md`).
 - `scheme_contract` — `tests/scheme_contract_test.sh`.
 
 Benchmarks (`harness benchmark ...`) NEVER run in CI; they need an

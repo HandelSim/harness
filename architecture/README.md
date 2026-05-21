@@ -93,7 +93,7 @@ docs:
   bypass; cross-referenced from `architecture/containers.md`.
 - `mcp-registry/serena/README.md` — the reference MCP registry entry;
   cross-referenced from `architecture/mcp.md`.
-- `tests/e2e/README.md`, `tests/benchmarks/README.md`,
+- `tests/benchmarks/README.md`,
   `tests/fixtures/responses/README.md` — area-specific test guides;
   cross-referenced from `architecture/tests.md`.
 - `docs/PODMAN.md`, `docs/WINDOWS.md` — runtime-specific operator notes.

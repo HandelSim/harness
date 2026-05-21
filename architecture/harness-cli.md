@@ -223,5 +223,6 @@ breaks the recursion.
 ## Tests
 
 Tests scoped to this file live in `tests/harness_test.sh` (and any
-future `tests/harness_*_test.sh`). E2E TUI behavior is exercised by
-`tests/e2e/`. See [`tests.md`](tests.md).
+future `tests/harness_*_test.sh`). End-to-end install → start → agent
+launch is exercised by `tests/full_pipeline_test.sh`. See
+[`tests.md`](tests.md).

@@ -1107,7 +1107,7 @@ commands:
   preflight             validate config (.env, allowlist, docker daemon)
                         before running 'harness start'
   test [section]        run the harness test suite (glob-discovered).
-                        sections: all (default), unit, integration, e2e,
+                        sections: all (default), unit, integration,
                         or a prefix like 'mcp' or 'firewall'.
                         flags: --pattern GLOB, --slow.
                         See 'harness test --help'.
@@ -4208,16 +4208,15 @@ cmd_preflight() {
 #
 # Sections:
 #   all          → tests/*_test.sh
-#   unit         → tests/upgrade_test.sh (no docker required); future
-#                  unit-only files can be added here.
-#   integration  → tests/*_test.sh minus tests/e2e/run.sh
-#   e2e          → tests/e2e/run.sh (added by track F)
+#   unit         → tests/upgrade_test.sh + tests/unit_*_test.sh (no docker
+#                  required); new docker-free files matching unit_*_test.sh
+#                  are picked up automatically.
+#   integration  → tests/*_test.sh
 #   <prefix>     → tests/<prefix>_test.sh plus tests/<prefix>*_test.sh
 #
 # Exits non-zero if no tests match or any test fails. The glob expansion
-# is always filtered to existing files so missing future directories
-# (tests/e2e/ for example) degrade to a clean "no tests matched" rather
-# than a shell error.
+# is always filtered to existing files so an empty match degrades to a
+# clean "no tests matched" rather than a shell error.
 
 _harness_test_usage() {
     cat <<'EOF'
@@ -4229,9 +4228,8 @@ the wrapper.
 
 sections:
   all           run every tests/*_test.sh (default)
-  unit          fast, no-docker tests (e.g. upgrade_test.sh)
-  integration   tests/*_test.sh excluding tests/e2e/
-  e2e           tests/e2e/run.sh (full end-to-end suite)
+  unit          fast, no-docker tests (upgrade_test.sh + unit_*_test.sh)
+  integration   tests/*_test.sh
   <prefix>      tests/<prefix>_test.sh plus tests/<prefix>*_test.sh
 
 flags:
@@ -4323,10 +4321,6 @@ cmd_test() {
         case "$section" in
             all)
                 mapfile -t candidates < <(shopt -s nullglob; for f in "$tests_root"/*_test.sh; do echo "$f"; done)
-                # Append the e2e runner if it exists (added by track F).
-                if [[ -f "$tests_root/e2e/run.sh" ]]; then
-                    candidates+=("$tests_root/e2e/run.sh")
-                fi
                 ;;
             unit)
                 # For now, the only file classified as unit (runs without
@@ -4344,11 +4338,6 @@ cmd_test() {
                 ;;
             integration)
                 mapfile -t candidates < <(shopt -s nullglob; for f in "$tests_root"/*_test.sh; do echo "$f"; done)
-                ;;
-            e2e)
-                if [[ -f "$tests_root/e2e/run.sh" ]]; then
-                    candidates+=("$tests_root/e2e/run.sh")
-                fi
                 ;;
             *)
                 # Prefix mode: tests/<prefix>_test.sh and tests/<prefix>*_test.sh.

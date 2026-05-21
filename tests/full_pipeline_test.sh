@@ -524,6 +524,22 @@ agent_home_marker="${TEST_ROOT}/harness/state/agent/home/.harness-home-initializ
 marker_uid=$(stat -c '%u' "${agent_home_marker}" 2>/dev/null || echo "")
 [[ "${marker_uid}" == "$(id -u)" ]] \
     || { echo "[pipeline] T9 FAIL: A007 home-initialized marker owner=${marker_uid}, expected host uid=$(id -u) — agent did not drop privileges" >&2; exit 1; }
+
+# Inventory A018: ensure_opencode_config writes ~/.config/opencode/opencode.json
+# on every launch. T9 booted opencode through agents/entrypoint.sh, which calls
+# ensure_opencode_config BEFORE exec'ing the agent — so the config lands in the
+# bind-mounted agent home regardless of whether opencode's own run later hit the
+# provider-auth skip above (t9_round_trip_ok=0). Assert the file exists in the
+# shared home AND carries the harness-managed provider/model block (not just any
+# non-empty file). This is the boot-smoke folded in from the former e2e
+# 01-opencode-boot scenario.
+opencode_cfg="${TEST_ROOT}/harness/state/agent/home/.config/opencode/opencode.json"
+[[ -f "${opencode_cfg}" ]] \
+    || { echo "[pipeline] T9 FAIL: A018 ensure_opencode_config did not write opencode.json on launch (${opencode_cfg})" >&2; ls -la "${TEST_ROOT}/harness/state/agent/home/.config/opencode" >&2 || true; exit 1; }
+grep -q '"harness"' "${opencode_cfg}" \
+    || { echo "[pipeline] T9 FAIL: A018 opencode.json missing the harness provider block" >&2; cat "${opencode_cfg}" >&2; exit 1; }
+grep -q '"model": "harness/' "${opencode_cfg}" \
+    || { echo "[pipeline] T9 FAIL: A018 opencode.json missing the harness model binding" >&2; cat "${opencode_cfg}" >&2; exit 1; }
 echo "[pipeline] T9 OK"
 
 # --- T10: harness opencode -p (headless) -----------------------------------

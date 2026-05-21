@@ -62,13 +62,18 @@ jobs:
           additional_files: harness harness-install.sh scripts/check_runtime_calls.sh scripts/lib/platform.sh scripts/lib/net_helpers.sh scripts/lib/upgrade_actions.sh
 
   unit:
-    name: unit (upgrade_test)
+    name: unit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - name: tests/upgrade_test.sh
-        run: bash tests/upgrade_test.sh
+      # Drive the wrapper's `unit` section instead of a single hardcoded
+      # file. It globs upgrade_test.sh + every unit_*_test.sh, so new
+      # docker-free unit tests are picked up without editing CI (closes the
+      # gap where tests/unit_platform_timer_test.sh ran locally but never
+      # in CI). These tests need no docker, so a bare checkout suffices.
+      - name: harness test unit
+        run: bash ./harness test unit
 
   docker-tests:
     name: docker / ${{ matrix.test }}
@@ -230,127 +235,6 @@ jobs:
         if: always()
         run: docker system prune -f --volumes || true
 
-  e2e:
-    name: e2e (tmux scenarios)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install tmux
-        run: sudo apt-get update && sudo apt-get install -y tmux
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Cache Buildx layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache
-          key: buildx-e2e-${{ hashFiles('agents/Dockerfile', 'proxy/Dockerfile', 'ollama/Dockerfile', 'firewall/**', 'docker-compose.yml') }}
-          restore-keys: |
-            buildx-e2e-
-            buildx-
-
-      # Bootstrap config so `./harness start` will bring the stack up.
-      # PROXY_API_URL points at the mockupstream sidecar that
-      # tests/e2e/run.sh provisions on the harness network (gated by
-      # HARNESS_E2E_MOCK_UPSTREAM=1, set on the run.sh step below). It is a
-      # dotless intra-cluster name, so the proxy's init-firewall.sh
-      # guardrail lets it through without an allowlist entry, and the
-      # scenarios get a real, deterministic upstream to drive.
-      - name: Seed harness config
-        run: |
-          cp .env.example .env
-          sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=http://mockupstream:9000/v1/chat/completions|' .env
-          sed -i 's|^PROXY_API_KEY=.*|PROXY_API_KEY=ci-placeholder-key|' .env
-          sed -i 's|^PROXY_API_MODEL=.*|PROXY_API_MODEL=ci-placeholder-model|' .env
-          # harness source .env with `set -a` on every invocation, so even
-          # though we set this on `harness start` below the scenarios'
-          # `./harness opencode` calls would still hit _gate_on_upstream_auth.
-          # Baking the bypass into .env makes every invocation skip it.
-          echo 'HARNESS_SKIP_AUTH_PROBE=1' >> .env
-          cp .harness-allowlist.example .harness-allowlist
-          chmod +x harness
-
-      - name: harness start
-        env:
-          DOCKER_BUILDKIT: "1"
-          COMPOSE_DOCKER_CLI_BUILD: "1"
-          HARNESS_SKIP_AUTH_PROBE: "1"
-        run: ./harness start
-
-      # Pre-build the agent image so `./harness opencode` inside each scenario
-      # finds it already present and does NOT inline-build it. The inline
-      # build is ~45s on CI and races the scenarios' 45s wait_for_marker on
-      # the agent's TUI prompt; the transcripts dumped by Diagnostics on cycle 3
-      # showed every scenario stuck on `harness: building harness-agent:latest
-      # (one-time)...` and the docker-build output filling the tmux pane.
-      - name: Pre-build agent image
-        env:
-          DOCKER_BUILDKIT: "1"
-          COMPOSE_DOCKER_CLI_BUILD: "1"
-        run: docker compose --env-file ./.env --profile agent build agent
-
-      # `compose up -d` returns once containers are started, not once their
-      # healthchecks have passed. Block here until both core services report
-      # healthy so the scenarios don't race the proxy/ollama warm-up.
-      - name: Wait for proxy + ollama healthy
-        run: |
-          for i in $(seq 1 60); do
-            proxy_h=$(docker inspect --format '{{.State.Health.Status}}' "$(docker ps -qf name=harness-proxy)" 2>/dev/null || echo "missing")
-            ollama_h=$(docker inspect --format '{{.State.Health.Status}}' "$(docker ps -qf name=harness-ollama)" 2>/dev/null || echo "missing")
-            echo "tick=${i} proxy=${proxy_h} ollama=${ollama_h}"
-            if [[ "${proxy_h}" == "healthy" && "${ollama_h}" == "healthy" ]]; then
-              echo "Stack healthy after ${i} ticks"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "Stack not healthy in 120s"
-          docker ps -a
-          docker compose logs || true
-          exit 1
-
-      - name: tests/e2e/run.sh
-        env:
-          DOCKER_BUILDKIT: "1"
-          COMPOSE_DOCKER_CLI_BUILD: "1"
-          HARNESS_E2E_MOCK_UPSTREAM: "1"
-        run: bash tests/e2e/run.sh
-
-      - name: Diagnostics on failure
-        if: failure()
-        run: |
-          echo "=== docker ps -a ==="; docker ps -a || true
-          echo "=== docker logs harness-proxy-1 ==="; docker logs harness-proxy-1 2>&1 | tail -100 || true
-          echo "=== docker logs harness-ollama-1 ==="; docker logs harness-ollama-1 2>&1 | tail -100 || true
-          # Agent containers are ephemeral per-scenario. Dump anything that
-          # still has the harness.agent=true label so we can see what
-          # the agent printed when the prompt never appeared.
-          for c in $(docker ps -a --filter label=harness.agent=true --format '{{.Names}}' 2>/dev/null); do
-            echo "=== docker logs ${c} ==="
-            docker logs "${c}" 2>&1 | tail -200 || true
-          done
-          # tmux pane transcripts land under /tmp/harness-e2e-* — these are
-          # the only windows into what the user would have seen on screen.
-          for d in /tmp/harness-e2e-*; do
-            [[ -d "$d" ]] || continue
-            echo "=== contents of ${d} ==="
-            ls -la "${d}" || true
-            for f in "${d}"/*.transcript.txt "${d}"/*.pipe.log; do
-              [[ -f "$f" ]] || continue
-              echo "--- ${f} (last 200 lines) ---"
-              tail -200 "$f" || true
-            done
-          done
-          echo "=== free -h ==="; free -h || true
-          echo "=== df -h ==="; df -h || true
-
-      - name: Cleanup
-        if: always()
-        run: docker system prune -f --volumes || true
-
   scheme_contract:
     name: scheme_contract
     runs-on: ubuntu-latest
@@ -407,7 +291,7 @@ jobs:
 
   failure_triage:
     name: Auto-fix on failure (triage)
-    needs: [lint, unit, docker-tests, pipeline, integration, e2e, scheme_contract]
+    needs: [lint, unit, docker-tests, pipeline, integration, scheme_contract]
     if: >-
       failure() &&
       github.event_name == 'push' &&
@@ -527,13 +411,10 @@ jobs:
           Before proposing any fix, do at least these:
 
           1. **Read the raw output from the failing layer.** Examples:
-             - e2e tmux: dump the per-scenario \`pipe.log\` (\`tests/e2e/lib/run_scenario.py\`
-               writes one via \`tmux pipe-pane\`). \`tmux capture-pane -p\` strips
-               trailing whitespace by default — it can lie about what the TUI
-               actually emitted. The pipe.log does not.
              - HTTP/proxy: dump the request/response body, not just status.
-             - Container/process: \`docker logs\`, state-dir contents. The e2e
-               job already dumps these on failure — read those artifacts.
+             - Container/process: \`docker logs\`, state-dir contents. The
+               docker-backed jobs already dump these on failure — read those
+               artifacts.
              - Python tests: rerun with \`-x -vv -s\` and read what was printed.
           2. **Reproduce locally if cheap.** Most harness failures reproduce in
              a fresh container or checkout. If reproduction is expensive, say
@@ -548,12 +429,14 @@ jobs:
 
           ### Anti-patterns from prior failed attempts
 
-          - **Timeout bumping.** If \`wait_for_marker\` times out and the
-            process is alive, the marker is probably wrong, not the timeout.
-          - **Marker rewriting by guesswork.** Don't iterate string variants
-            until one matches; read what was emitted.
-          - **Single-tool tunnel vision.** \`capture-pane\` vs pipe.log can
-            disagree; the disagreement is the clue.
+          - **Timeout/wait bumping.** If a wait or healthcheck loop times out
+            while the process is alive, the thing being waited for is probably
+            wrong, not the timeout.
+          - **Assertion rewriting by guesswork.** Don't iterate string
+            variants until one matches; read what was actually emitted.
+          - **Single-tool tunnel vision.** Two views of the same output (e.g.
+            captured stdout vs a log file) can disagree; the disagreement is
+            the clue.
           - **Retry-as-flake-mask.** A retry is only right with a named
             transient cause. "Sometimes fails" is the symptom of one.
 

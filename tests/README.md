@@ -10,7 +10,6 @@ Tests for the harness project. Quick navigation:
   ...). Source of truth that coverage maps against.
 - **Coverage** — `COVERAGE.md`, this directory. Map of every inventory
   ID to its test(s), with status and quoted assertion evidence.
-- **e2e scenarios** — `e2e/README.md`.
 - **Benchmarks** — `benchmarks/README.md`.
 - **Fixtures** — `fixtures/responses/README.md`.
 

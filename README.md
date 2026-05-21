@@ -443,7 +443,7 @@ Quick commands:
 ```
 harness test              # all CI-runnable tests
 harness test proxy        # only proxy tests
-harness test e2e          # tmux-driven TUI scenarios
+harness test unit         # fast no-docker tests
 harness test integration --slow   # full slow integration test
 
 harness benchmark smoketest          # 3-5 small tasks; verifies wiring
@@ -453,7 +453,7 @@ harness benchmark terminal-bench     # full TB 2.0 run; 6-12 hrs
 Benchmarks NEVER run in CI. They require an upstream API key and
 sufficient disk; see `tests/benchmarks/README.md`.
 
-CI runs the lint, unit, docker-tests, pipeline, integration, e2e, and
+CI runs the lint, unit, docker-tests, pipeline, integration, and
 scheme_contract jobs on every push to `dev` and `main`.
 
 ## Test coverage

@@ -37,8 +37,6 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   a probe through ollama; asserts forwarded-body structure. Covers P010, P013, P014, P015,
   P016, P017, P018 with direct upstream-body assertions (closes scheme-emission red gaps
   that were previously only proxied through python unittests).
-- `tests/e2e/scenarios/*.yaml` (Track F2) — tmux-driven TUI scenarios with `inventory_refs`
-  declared in each file's header. The opencode-boot scenario covers F044/A018.
 - `tests/firewall_test.sh` (324 lines) — Phase 2 negative (blocked PROXY_API_URL hostname
   is fatal) and Phase 3 bypass (`HARNESS_FIREWALL_DISABLED=1` per-service). Track-D added
   O001 ordering assertions in Phase 3 via ollama-log scraping.
@@ -340,7 +338,7 @@ non-green rows — the gap.
 | A008 | red    | —                                           | —                                                                                                     | No test asserts `configure-git-credentials.sh` is invoked during agent startup. (persistence_test T6 verifies `.git-credentials` survives, not that the script runs.) |
 | A009 | green  | tests/persistence_test.sh:137-155 + full_pipeline_test.sh:444-462 | T1 + T15: `.harness-home-initialized` marker written; `seeded_count >= 2` after first run. | |
 | A010 | red    | —                                           | —                                                                                                     | No test sets `HARNESS_HOST_CWD` and asserts the agent `cd`'d into it. |
-| A018 | green  | tests/e2e/scenarios/01-opencode-boot.yaml   | F2 scenario header `inventory_refs: [F044, A018]`; boot path drives `harness opencode` in tmux and verifies the TUI renders — the boot path can only succeed when `ensure_opencode_config` wrote a valid `~/.config/opencode/opencode.json` on launch. | |
+| A018 | green  | tests/full_pipeline_test.sh (T9)            | T9 boots opencode via bare `harness -p`; the entrypoint runs `ensure_opencode_config` before exec'ing the agent, so the test asserts `state/agent/home/.config/opencode/opencode.json` exists in the shared home AND carries the harness provider block (`"harness"`) + model binding (`"model": "harness/`). Holds even on the opencode provider-auth skip, since the config write precedes the agent run. | |
 | A019 | red    | —                                           | —                                                                                                     | No test asserts opencode config has a `harness` provider pointing at ollama. |
 | A020 | red    | —                                           | —                                                                                                     | No test asserts opencode config defines a `yolo` agent profile. |
 | A021 | red    | —                                           | —                                                                                                     | No test asserts opencode mcp-servers merge happens. |
