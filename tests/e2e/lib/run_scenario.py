@@ -172,8 +172,8 @@ class ScenarioError(Exception):
 
 def _safe_session_name(scenario_name: str) -> str:
     # tmux session names can't contain '.' or ':'. Replace anything that
-    # isn't [A-Za-z0-9_-] with '_' so a scenario name like "01-claude-boot"
-    # becomes "01-claude-boot" (unchanged) and "foo.bar:baz" becomes
+    # isn't [A-Za-z0-9_-] with '_' so a scenario name like "01-opencode-boot"
+    # becomes "01-opencode-boot" (unchanged) and "foo.bar:baz" becomes
     # "foo_bar_baz".
     return re.sub(r"[^A-Za-z0-9_-]", "_", scenario_name)
 

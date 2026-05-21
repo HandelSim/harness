@@ -2,9 +2,8 @@
 
 End-to-end TUI tests for the harness. Drives a real tmux session,
 captures pane output, asserts against it. Built for the TUI surface that
-script-based tests (`harness claude -p ...`) cannot reach: streaming
-rendering, statusline updates, multi-line paste, Ctrl-C cancellation,
-etc.
+script-based tests (`harness -p ...`) cannot reach: agent boot, banner
+rendering, and clean exit.
 
 This directory ships the **scaffolding** only — driver functions, the
 runner, and the schema docs. Scenario files live under `scenarios/` and
@@ -55,10 +54,10 @@ Scenarios are YAML. Top-level keys: `name`, `inventory_refs`,
 required.
 
 ```yaml
-name: 01-claude-boot
+name: 01-opencode-boot
 inventory_refs: [F001, F003]
 description: |
-  Launch `harness claude`, wait for the prompt, then exit cleanly.
+  Launch `harness`, wait for the banner, then exit cleanly.
 
 setup:
   cwd: /path/to/run/in              # optional; defaults to runner cwd
@@ -74,16 +73,15 @@ setup:
 steps:
   # Type a command into the session shell and press Enter, then wait
   # until `marker` appears in the pane.
-  - launch: "harness claude"
-    wait_for_marker: "│ > "
-    timeout_s: 10
+  - launch: "harness"
+    wait_for_marker: "harness-agent (opencode)"
+    timeout_s: 90
 
-  # Bracketed-paste multi-line text, send Enter, wait for the prompt
-  # to come back AND for output to settle for 500ms.
+  # Bracketed-paste multi-line text, send Enter, wait for output to
+  # settle for 500ms.
   - paste: |
       what is 2 + 2?
     send_key: Enter
-    wait_for_marker: "│ > "
     wait_stable_ms: 500
     timeout_s: 60
 
@@ -105,7 +103,7 @@ steps:
   - capture_assertions:
       - contains: "4"
       - not_contains: "Error"
-      - regex_match: "│ > $"
+      - regex_match: "harness-agent \\(opencode\\)"
 
 cleanup:
   kill_session: true                # default true; kills the tmux session

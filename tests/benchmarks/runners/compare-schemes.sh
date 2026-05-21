@@ -4,11 +4,11 @@
 # back-to-back, then write a small comparison summary.
 #
 # Default: user_front, hybrid, passthrough on the smoketest target,
-# claude agent.
+# opencode agent.
 #
 # Usage:
 #   ./compare-schemes.sh
-#   ./compare-schemes.sh --schemes user_front,hybrid --agent claude
+#   ./compare-schemes.sh --schemes user_front,hybrid --agent opencode
 #   ./compare-schemes.sh --target terminal-bench
 
 set -euo pipefail
@@ -23,7 +23,7 @@ bench_check_docker_socket || true
 bench_check_disk "${BENCH_ROOT}/runs" || true
 
 SCHEMES="user_front,hybrid,passthrough"
-AGENT="claude"
+AGENT="opencode"
 TARGET="smoketest"   # smoketest | terminal-bench | swe-bench-lite
 N_CONCURRENT=""
 TASK_IDS=""

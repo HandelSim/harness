@@ -9,7 +9,7 @@
 # Always run smoketest first unless --no-smoketest is set.
 #
 # Usage:
-#   ./terminal-bench.sh --agent claude --scheme user_front
+#   ./terminal-bench.sh --agent opencode --scheme user_front
 #   ./terminal-bench.sh --no-smoketest
 #   ./terminal-bench.sh --task-ids hello-world,fix-bug-123
 #   ./terminal-bench.sh --n-concurrent 4
@@ -26,7 +26,7 @@ bench_check_docker_socket || true
 bench_check_disk "${BENCH_ROOT}/runs" || true
 
 # --- Arg parsing -------------------------------------------------------------
-AGENT="claude"
+AGENT="opencode"
 TASK_IDS=""
 N_CONCURRENT=""
 SCHEME="user_front"
@@ -60,16 +60,12 @@ fi
 bench_apply_scheme "${SCHEME}"
 
 case "$AGENT" in
-    claude)
-        AGENT_IMPORT="harness_claude_agent:HarnessClaudeAgent"
-        ADAPTER_DIR="${BENCH_ROOT}/adapters/harness_claude"
-        ;;
     opencode)
         AGENT_IMPORT="harness_opencode_agent:HarnessOpencodeAgent"
         ADAPTER_DIR="${BENCH_ROOT}/adapters/harness_opencode"
         ;;
     *)
-        echo "[terminal-bench] unknown agent: $AGENT" >&2
+        echo "[terminal-bench] unknown agent: $AGENT (expected: opencode)" >&2
         exit 2
         ;;
 esac

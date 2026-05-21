@@ -1,8 +1,8 @@
-name: 02-opencode-boot
+name: 01-opencode-boot
 inventory_refs: [F044, A018]
 description: |
-  Same as 01-claude-boot but for opencode: boot `harness opencode`,
-  wait for its TUI banner to appear, exit cleanly.
+  Boot `harness opencode` (equivalently bare `harness`), wait for its TUI
+  banner to appear, exit cleanly.
 
   Inventory refs:
     - F044 — `harness opencode` launches the agent container in opencode mode
@@ -14,7 +14,7 @@ setup:
     TERM: xterm-256color
     PROXY_API_URL: http://127.0.0.1:9000
     PROXY_API_KEY: test-key
-    PROXY_API_MODEL: claude-sonnet-4-5
+    PROXY_API_MODEL: ci-placeholder-model
   tmux:
     width: 200
     height: 50

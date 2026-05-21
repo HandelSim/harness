@@ -7,7 +7,7 @@
 # expect 30-60 min for 1 task.
 #
 # Usage:
-#   ./smoketest.sh                  # defaults: claude, 1 task
+#   ./smoketest.sh                  # defaults: opencode, 1 task
 #   ./smoketest.sh --agent opencode
 #   ./smoketest.sh --task-id hello-world
 #   ./smoketest.sh --n-concurrent 2
@@ -24,7 +24,7 @@ bench_check_docker_socket || true
 bench_check_disk "${BENCH_ROOT}/runs" || true
 
 # --- Arg parsing -------------------------------------------------------------
-AGENT="claude"
+AGENT="opencode"
 TASK_IDS=""
 N_CONCURRENT=""
 SCHEME="user_front"
@@ -50,16 +50,12 @@ bench_apply_scheme "${SCHEME}"
 
 # Resolve adapter import path for the chosen agent.
 case "$AGENT" in
-    claude)
-        AGENT_IMPORT="harness_claude_agent:HarnessClaudeAgent"
-        ADAPTER_DIR="${BENCH_ROOT}/adapters/harness_claude"
-        ;;
     opencode)
         AGENT_IMPORT="harness_opencode_agent:HarnessOpencodeAgent"
         ADAPTER_DIR="${BENCH_ROOT}/adapters/harness_opencode"
         ;;
     *)
-        echo "[smoketest] unknown agent: $AGENT (expected: claude|opencode)" >&2
+        echo "[smoketest] unknown agent: $AGENT (expected: opencode)" >&2
         exit 2
         ;;
 esac

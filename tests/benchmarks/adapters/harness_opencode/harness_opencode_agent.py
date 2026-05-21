@@ -1,10 +1,31 @@
 """
 Harbor agent adapter for `harness opencode`.
 
-See harness_claude_agent.py for the full execution-model description;
-this file differs only in which underlying agent is invoked.
+EXECUTION MODEL:
+- Harbor (host) launches a per-task container per benchmark task.
+- Inside the task container, this adapter clones harness, runs
+  harness-install.sh, then invokes `harness opencode -p "<instruction>"`
+  per task.
+- harness's `docker compose up` requires host Docker access — Harbor
+  must mount /var/run/docker.sock into the task container (rw).
+- LLM calls flow: harness agent (opencode) -> ollama stub
+  -> harness proxy -> upstream LLM API.
 
-ENVIRONMENT VARIABLES: identical to harness_claude_agent.py.
+ARCHITECTURE NOTE (host = ARM64, TB task images = mostly x86_64):
+- Task containers run under QEMU user-mode emulation via binfmt_misc.
+- See tests/benchmarks/README.md for one-time binfmt registration.
+
+ENVIRONMENT VARIABLES (set by the runner before harbor invocation):
+- PROXY_API_KEY        : upstream LLM API key
+- PROXY_API_URL        : upstream LLM endpoint
+- PROXY_API_MODEL      : model identifier
+- PROXY_PROMPT_MODE    : current prod injection mode
+                         (user_front | hybrid; passthrough = bypass)
+- HARNESS_PROXY_SCHEME : reserved for future named-scheme support; see
+                         tests/benchmarks/schemes/*.json
+- HARNESS_GIT_REF      : git ref to clone (default: dev)
+- HARNESS_REPO         : git repo URL (default: github.com/HandelSim/harness)
+- HARNESS_DIR          : clone target (default: /opt/harness)
 """
 
 from __future__ import annotations

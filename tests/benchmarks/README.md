@@ -1,8 +1,8 @@
 # `tests/benchmarks/` — Harbor adapters for `harness`
 
-This directory contains the Harbor benchmark adapters for `harness claude`
-and `harness opencode`, the prompt-injection schemes evaluated, the shell
-runners, and the output directory for run artifacts.
+This directory contains the Harbor benchmark adapter for `harness opencode`,
+the prompt-injection schemes evaluated, the shell runners, and the output
+directory for run artifacts.
 
 Benchmarks are **never** run in CI. Each runner refuses to start when
 `$CI` is set.
@@ -277,7 +277,7 @@ prompt-mode logic.
 ```bash
 # Run from anywhere; the runner resolves paths relative to its own
 # location.
-./tests/benchmarks/runners/smoketest.sh --agent claude --scheme user_front
+./tests/benchmarks/runners/smoketest.sh --agent opencode --scheme user_front
 ```
 
 A successful smoketest means:
@@ -285,7 +285,7 @@ A successful smoketest means:
 - The adapter is importable on `PYTHONPATH` Harbor picked up.
 - The task container builds and starts.
 - The harness repo clones and `harness-install.sh` succeeds inside it.
-- `harness claude -p "..."` returns a transcript.
+- `harness opencode -p "..."` returns a transcript.
 - The trial verifier marks the result (pass or fail — either proves
   wiring; fail just means the model couldn't do the task).
 
@@ -300,12 +300,9 @@ host's binfmt registration.
 tests/benchmarks/
   adapters/
     _common.py                          # shared HarnessAgentBase
-    harness_claude/
-      pyproject.toml
-      harness_claude_agent.py           # imports _common
     harness_opencode/
       pyproject.toml
-      harness_opencode_agent.py
+      harness_opencode_agent.py         # imports _common
   schemes/
     user_front.json                     # prod baseline (PROXY_PROMPT_MODE=user_front)
     hybrid.json                         # A/B candidate (PROXY_PROMPT_MODE=hybrid)

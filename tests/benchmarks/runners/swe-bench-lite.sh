@@ -7,7 +7,7 @@
 # at this stage.
 #
 # Usage:
-#   ./swe-bench-lite.sh --agent claude --scheme user_front
+#   ./swe-bench-lite.sh --agent opencode --scheme user_front
 #   ./swe-bench-lite.sh --task-ids astropy__astropy-12907
 
 set -euo pipefail
@@ -21,7 +21,7 @@ bench_check_binfmt || true
 bench_check_docker_socket || true
 bench_check_disk "${BENCH_ROOT}/runs" || true
 
-AGENT="claude"
+AGENT="opencode"
 TASK_IDS=""
 N_CONCURRENT=""
 SCHEME="user_front"
@@ -55,16 +55,12 @@ fi
 bench_apply_scheme "${SCHEME}"
 
 case "$AGENT" in
-    claude)
-        AGENT_IMPORT="harness_claude_agent:HarnessClaudeAgent"
-        ADAPTER_DIR="${BENCH_ROOT}/adapters/harness_claude"
-        ;;
     opencode)
         AGENT_IMPORT="harness_opencode_agent:HarnessOpencodeAgent"
         ADAPTER_DIR="${BENCH_ROOT}/adapters/harness_opencode"
         ;;
     *)
-        echo "[swe-bench-lite] unknown agent: $AGENT" >&2
+        echo "[swe-bench-lite] unknown agent: $AGENT (expected: opencode)" >&2
         exit 2
         ;;
 esac

@@ -95,13 +95,13 @@ def harness_git_ref() -> str:
 
 class HarnessAgentBase(BaseInstalledAgent):
     """
-    Base class for `harness claude` and `harness opencode` Harbor adapters.
+    Base class for `harness opencode` Harbor adapters.
 
-    Subclasses define ``HARNESS_AGENT`` (e.g. "claude", "opencode") and
-    optionally override ``OUTPUT_FILENAME``.
+    Subclasses define ``HARNESS_AGENT`` (e.g. "opencode") and optionally
+    override ``OUTPUT_FILENAME``.
     """
 
-    HARNESS_AGENT: str = "claude"
+    HARNESS_AGENT: str = "opencode"
     OUTPUT_FILENAME: str = "harness-output.txt"
 
     @staticmethod

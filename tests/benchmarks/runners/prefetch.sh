@@ -46,7 +46,7 @@ bench_check_disk "${BENCH_ROOT}/runs" || true
 # --- Arg parsing -------------------------------------------------------------
 TARGET=""
 DATASET=""
-AGENT="claude"
+AGENT="opencode"
 N_CONCURRENT=""
 while (( $# > 0 )); do
     case "$1" in
@@ -139,16 +139,12 @@ export HF_DATASETS_OFFLINE=0
 # zero-task filter below), but `harbor run` still wants a valid import path, so
 # we supply the chosen agent's adapter.
 case "$AGENT" in
-    claude)
-        AGENT_IMPORT="harness_claude_agent:HarnessClaudeAgent"
-        ADAPTER_DIR="${BENCH_ROOT}/adapters/harness_claude"
-        ;;
     opencode)
         AGENT_IMPORT="harness_opencode_agent:HarnessOpencodeAgent"
         ADAPTER_DIR="${BENCH_ROOT}/adapters/harness_opencode"
         ;;
     *)
-        echo "[prefetch] unknown agent: $AGENT (expected: claude|opencode)" >&2
+        echo "[prefetch] unknown agent: $AGENT (expected: opencode)" >&2
         exit 2
         ;;
 esac
