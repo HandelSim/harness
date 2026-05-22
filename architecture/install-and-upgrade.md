@@ -17,7 +17,10 @@ run from an empty directory. Stages:
    add a `harness` wrapper to PATH and offers to capture an upstream API key
    now (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves
    it for the user to edit manually). No key validation — whatever is
-   pasted is accepted verbatim. There is no separate "continue?" gate: the
+   pasted is accepted verbatim. The key prompt (`_read_secret_masked`) echoes
+   one `*` per character instead of hiding input entirely, so a wrong/blank
+   paste is visible by length without revealing the value (backspace works; it
+   falls back to a fully hidden read off a tty). There is no separate "continue?" gate: the
    PATH prompt is the first interactive stop (so the intent text still gets a
    beat of consideration) and Ctrl-C aborts at any prompt. The old confirm
    prompt was also broken when the script is sourced — its abort called
