@@ -172,6 +172,34 @@ name needs no determinism — only uniqueness, to avoid Docker's unique-name
 collision. The `--print` path sets no name or labels and was already
 concurrent.
 
+### Interactive TTY resolution (Windows) — issue #82
+
+The two interactive launches (`run_agent_interactive`, `cmd_shell` — **not**
+the `-p/--print` path) decide the `docker run` TTY flags via
+`harness_resolve_interactive_tty` (`scripts/lib/platform.sh`) instead of a bare
+`[[ -t 0 ]]`. The split exists because on Windows Git Bash, bash's `[[ -t 0 ]]`
+(an MSYS pty) and the native `docker.exe`'s `isTerminal()` (a real Windows
+console) disagree: under MinTTY without ConPTY, bash says "tty" so harness adds
+`-t`, then `docker.exe` rejects it with *"cannot attach stdin to a TTY-enabled
+container because stdin is not a terminal"*.
+
+The resolver returns one of three strategies:
+
+- `it` — stdin is a real tty to the runtime (Linux/macOS always; Windows when
+  ConPTY/Windows Terminal makes `docker.exe` accept `-t`). Launch as before.
+- `it-winpty` — Windows, `docker.exe` rejects `-t`, but `winpty` is on PATH.
+  The launch is wrapped via `harness_docker_winpty` so winpty bridges a real
+  console (keeps `-it`, TUI works). Set `HARNESS_NO_WINPTY=1` to opt out.
+- `i` — no usable tty (genuinely piped stdin, or Windows with no winpty). Falls
+  back to `-i`; the Windows-from-a-tty case prints a one-line degraded note.
+
+The actual `docker.exe` capability is probed once per launch by
+`harness_runtime_tty_ok` (a throwaway `--rm --entrypoint true` run against the
+already-built agent image — no pull, instant). On Linux/macOS the whole thing
+collapses to the historical "`-it` if stdin is a tty, else `-i`" with no probe.
+`harness_tty_strategy` is the pure (I/O-free) decision function the resolver
+wraps, kept separate so it is unit-testable without a real tty or daemon.
+
 ### Post-run issue footer (interactive only)
 
 The interactive launch paths (`run_agent_interactive`, `cmd_shell`) run
@@ -240,7 +268,10 @@ breaks the recursion.
 - `cmd_doctor` — diagnostic-only. Reads runtime state, never modifies.
   Reports `[network]` (allowlist path, host count, whether `PROXY_API_URL`'s
   host is on the allowlist, any services with active overrides), `[mcp]`,
-  `[runtime]`, etc.
+  `[runtime]`, etc. On Windows, `[runtime]` adds an `interactive tty` line
+  that probes whether `docker.exe` accepts `-t` in the current terminal and
+  whether winpty is needed/present (see "Interactive TTY resolution" below) —
+  the probe is a throwaway `--rm` container, so doctor stays read-only.
 - `cmd_preflight` — validates `.env`, allowlist, and docker daemon
   reachability BEFORE `harness start`. Fails loudly on config errors so
   the user doesn't get an opaque compose error.

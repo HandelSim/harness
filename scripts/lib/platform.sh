@@ -195,6 +195,112 @@ harness_docker_exec() {
 harness_runtime() { harness_docker "$@"; }
 harness_runtime_exec() { harness_docker_exec "$@"; }
 
+# === Interactive TTY resolution (issue #82) ===
+#
+# On Windows Git Bash the two layers disagree about what "stdin is a terminal"
+# means:
+#   - bash's `[[ -t 0 ]]` asks MSYS — for a MinTTY window the answer is *yes*
+#     (MinTTY hands bash an MSYS pty).
+#   - the native docker.exe's isTerminal() asks Windows — for that same MinTTY
+#     pty the answer is *no* (it's a pipe, not a real console handle).
+# So harness can hand docker `-t`, and docker then refuses it with
+#   "cannot attach stdin to a TTY-enabled container because stdin is not a
+#    terminal"  (docker/cli cli/streams/in.go: CheckTty).
+# ConPTY (modern Git-for-Windows / Windows Terminal) bridges the pty to a real
+# console so `-t` works; plain MinTTY without it doesn't — which is why the
+# failure is per-terminal and flaky. winpty allocates a real console for the
+# whole process tree, restoring `-t`.
+#
+# Linux/macOS have no such split: bash and the runtime see the same fd, so the
+# helpers below collapse to the historical "`-it` if stdin is a tty, else `-i`".
+
+# Probe whether the native container runtime will accept an interactive TTY
+# (`-t -i`) from the current stdin. Asks the runtime directly rather than
+# trusting bash's `[[ -t 0 ]]`. The image must already exist locally so the
+# throwaway run is instant (no pull). Silent; returns 0 iff `-it` is accepted.
+# Args: <image>
+harness_runtime_tty_ok() {
+    local image="$1" rt
+    [[ -n "$image" ]] || return 1
+    rt=$(harness_container_runtime)
+    MSYS_NO_PATHCONV=1 "$rt" run --rm -it --entrypoint true "$image" >/dev/null 2>&1
+}
+
+# True if winpty is on PATH (ships with Git for Windows).
+harness_winpty_available() {
+    command -v winpty >/dev/null 2>&1
+}
+
+# Like harness_docker, but routes the runtime call through winpty so a MinTTY
+# pty is bridged to a real Windows console for an interactive `-it` launch.
+# Only meaningful on Windows; callers reach it via the 'it-winpty' strategy
+# from harness_resolve_interactive_tty.
+harness_docker_winpty() {
+    local rt
+    rt=$(harness_container_runtime)
+    MSYS_NO_PATHCONV=1 winpty "$rt" "$@"
+}
+
+# Pure decision: pick the interactive TTY strategy from explicit facts. No I/O,
+# so it is directly unit-testable; the live wiring is harness_resolve_interactive_tty.
+# Args: <os> <stdin_is_tty:0|1> <runtime_tty_ok:0|1> <winpty_present:0|1>
+# Echoes one of: it | it-winpty | i
+harness_tty_strategy() {
+    local os="$1" stdin_tty="$2" rt_ok="$3" winpty="$4"
+    # Non-Windows: bash and the runtime share the same fd, so bash's view wins.
+    if [[ "$os" != "windows" ]]; then
+        [[ "$stdin_tty" == 1 ]] && { echo it; return 0; }
+        echo i; return 0
+    fi
+    # Windows: if bash itself has no tty (genuinely piped/redirected stdin),
+    # `-t` is hopeless and winpty can't conjure a terminal — degrade silently.
+    if [[ "$stdin_tty" != 1 ]]; then
+        echo i; return 0
+    fi
+    # docker.exe accepts `-t` directly (ConPTY / Windows Terminal): use as-is.
+    if [[ "$rt_ok" == 1 ]]; then
+        echo it; return 0
+    fi
+    # docker.exe refuses `-t` (MinTTY pty without ConPTY): winpty bridges it.
+    if [[ "$winpty" == 1 ]]; then
+        echo it-winpty; return 0
+    fi
+    # No winpty: degrade to `-i` so the launch still works (TUI may render
+    # degraded). The caller surfaces a note.
+    echo i; return 0
+}
+
+# One-line, actionable note printed to stderr when an interactive Windows
+# launch degrades to `-i` because docker rejected `-t` and winpty is absent.
+harness_tty_degraded_note() {
+    echo "[harness] stdin isn't a Windows console; running the TUI without a TTY (may render degraded). For a full TTY use Windows Terminal, or install winpty and re-run." >&2
+}
+
+# Resolve the interactive TTY strategy for a launch, running the live probes.
+# Echoes the strategy token (it | it-winpty | i) on stdout; on Windows, prints
+# the degraded-mode note to stderr when falling back to `-i` from a real tty.
+# Set HARNESS_NO_WINPTY=1 to opt out of winpty wrapping (treats it as absent).
+# Args: <image>
+harness_resolve_interactive_tty() {
+    local image="$1"
+    local os stdin_tty=0 rt_ok=0 winpty=0
+    os=$(harness_detect_os)
+    [[ -t 0 ]] && stdin_tty=1
+    if [[ "$os" == "windows" && "$stdin_tty" == 1 ]]; then
+        if harness_runtime_tty_ok "$image"; then
+            rt_ok=1
+        elif [[ -z "${HARNESS_NO_WINPTY:-}" ]] && harness_winpty_available; then
+            winpty=1
+        fi
+    fi
+    local strategy
+    strategy=$(harness_tty_strategy "$os" "$stdin_tty" "$rt_ok" "$winpty")
+    if [[ "$os" == "windows" && "$strategy" == "i" && "$stdin_tty" == 1 ]]; then
+        harness_tty_degraded_note
+    fi
+    printf '%s' "$strategy"
+}
+
 # Mirror the upper/lower-case spellings of the proxy env vars so git's libcurl
 # picks them up regardless of which it checks (libcurl special-cases lowercase
 # `http_proxy`; HTTPS honors either case). Fills a missing side from a present

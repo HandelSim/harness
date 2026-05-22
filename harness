@@ -2495,8 +2495,18 @@ run_agent_interactive() {
     # --rm + -it: the agent CLI is the container's foreground process. The
     # user's terminal connects directly to its PTY; container exits when
     # the agent exits, and Docker removes it.
-    local tty_flag="-it"
-    [[ -t 0 ]] || tty_flag="-i"
+    #
+    # On Windows, bash's `[[ -t 0 ]]` and the native docker.exe disagree about
+    # whether stdin is a terminal (issue #82); harness_resolve_interactive_tty
+    # reconciles them and may route the launch through winpty. On Linux/macOS
+    # it reduces to the historical `-it` if stdin is a tty, else `-i`.
+    local tty_strategy tty_flag="-it" use_winpty=0
+    tty_strategy=$(harness_resolve_interactive_tty "$image")
+    case "$tty_strategy" in
+        it-winpty) tty_flag="-it"; use_winpty=1 ;;
+        i)         tty_flag="-i" ;;
+        *)         tty_flag="-it" ;;
+    esac
 
     local docker_args=(
         run --rm "$tty_flag"
@@ -2566,7 +2576,11 @@ run_agent_interactive() {
     # `exit` below; it's idempotent, so the second call is a cheap no-op.
     _reap_jq_sidecar
     local rc=0
-    harness_docker "${docker_args[@]}" || rc=$?
+    if (( use_winpty )); then
+        harness_docker_winpty "${docker_args[@]}" || rc=$?
+    else
+        harness_docker "${docker_args[@]}" || rc=$?
+    fi
     _print_agent_issue_footer
     exit "$rc"
 }
@@ -2734,8 +2748,15 @@ cmd_shell() {
         network="bridge"
     fi
 
-    local tty_flag="-it"
-    [[ -t 0 ]] || tty_flag="-i"
+    # See run_agent_interactive: on Windows reconcile bash's tty view with
+    # what docker.exe accepts (issue #82); elsewhere `-it` vs `-i` as before.
+    local tty_strategy tty_flag="-it" use_winpty=0
+    tty_strategy=$(harness_resolve_interactive_tty "$image")
+    case "$tty_strategy" in
+        it-winpty) tty_flag="-it"; use_winpty=1 ;;
+        i)         tty_flag="-i" ;;
+        *)         tty_flag="-it" ;;
+    esac
 
     local mp_host ah_host alp_host
     mp_host=$(harness_docker_path "$mount_path")
@@ -2789,7 +2810,11 @@ cmd_shell() {
     # `exit` below; it's idempotent, so the second call is a cheap no-op.
     _reap_jq_sidecar
     local rc=0
-    harness_docker "${shell_args[@]}" || rc=$?
+    if (( use_winpty )); then
+        harness_docker_winpty "${shell_args[@]}" || rc=$?
+    else
+        harness_docker "${shell_args[@]}" || rc=$?
+    fi
     _print_agent_issue_footer
     exit "$rc"
 }
@@ -4319,6 +4344,27 @@ cmd_doctor() {
         doctor_check skip "proxy" "services not running"
         doctor_check skip "stub model" "services not running"
         doctor_check skip "proxy /health" "services not running"
+    fi
+
+    # Windows-only: interactive launches (opencode/shell) need docker.exe to
+    # accept `-t` from the current terminal. bash's `[[ -t 0 ]]` and docker's
+    # isTerminal() disagree under MinTTY (issue #82), so report what actually
+    # works in this terminal instead of guessing. The probe is a throwaway
+    # `--rm` container — read-only with respect to harness state.
+    if [[ "$(harness_detect_os)" == "windows" ]]; then
+        local tty_img
+        tty_img=$(agent_image)
+        if ! harness_docker image inspect "$tty_img" >/dev/null 2>&1; then
+            doctor_check skip "interactive tty" "agent image not built yet"
+        elif [[ ! -t 0 ]]; then
+            doctor_check skip "interactive tty" "stdin not a terminal here"
+        elif harness_runtime_tty_ok "$tty_img"; then
+            doctor_check ok "interactive tty" "docker accepts -t in this terminal"
+        elif [[ -z "${HARNESS_NO_WINPTY:-}" ]] && harness_winpty_available; then
+            doctor_check warn "interactive tty" "docker rejects -t here; harness will use winpty"
+        else
+            doctor_check warn "interactive tty" "docker rejects -t and winpty missing; use Windows Terminal or install winpty"
+        fi
     fi
 
     # ---------------- [images] --------------
