@@ -14,7 +14,7 @@ from unittest.mock import patch
 # trigger sys.exit in any future tightened validation path.
 os.environ.setdefault("PROXY_API_URL", "http://example.invalid")
 os.environ.setdefault("PROXY_API_KEY", "test-key-1234")
-os.environ.setdefault("PROXY_API_MODEL", "test-model")
+os.environ.setdefault("DEFAULT_MODEL_NAME", "test-model")
 
 import proxy  # noqa: E402
 
