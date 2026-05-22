@@ -1257,6 +1257,10 @@ agent flags:
   -p, --print "PROMPT"  headless single-shot invocation; runs `opencode run`
                         inside the container
 
+  These are the harness-specific flags; any other flag is forwarded to the
+  agent unchanged, so anything the underlying 'opencode' CLI accepts works
+  here too.
+
 'harness mcp' subcommands:
   mcp list [--available]            show installed MCPs (and registry with --available)
   mcp install <name> [--force]      copy a registry MCP into the active tree

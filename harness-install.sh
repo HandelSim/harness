@@ -671,24 +671,6 @@ ${C_BOLD}install complete${C_RESET} at $install_root.
 
 EOF
 
-if (( want_path )); then
-    cat <<EOF
-'harness' added to PATH. If it doesn't work immediately:
-  - Open a new terminal, OR
-  - Run: export PATH="\$HOME/.local/bin:\$PATH"
-
-EOF
-fi
-
-cat <<EOF
-Next:
-  1. Edit $install_root/.env and set PROXY_API_KEY (and any other required values)
-  2. cd into a project directory and run: harness
-
-Running 'harness' with no command launches an opencode agent in the current
-directory. 'harness opencode' does the same thing explicitly.
-EOF
-
 # Show what MCPs are present in the bundled registry, since none are
 # auto-installed by this script. Earlier the message said "Auto-installed
 # MCPs:" with a list pulled from state/mcp, which was always "(none)" on
@@ -731,12 +713,69 @@ EOF
 
 cat <<EOF
 
-Found a bug or have an improvement to suggest, however small?
-  https://github.com/HandelSim/harness/issues
-
 Uninstall harness:
   rm -rf "$install_root"
   rm "\$HOME/.local/bin/harness"
+EOF
+
+if (( want_path )); then
+    cat <<EOF
+
+'harness' added to PATH. If it doesn't work immediately:
+  - Open a new terminal, OR
+  - Run: export PATH="\$HOME/.local/bin:\$PATH"
+EOF
+fi
+
+cat <<EOF
+
+Found a bug or have an improvement to suggest, however small?
+  https://github.com/HandelSim/harness/issues
+EOF
+
+# Final 'Next' block. Parse the three REQUIRED vars straight from the freshly
+# written .env (same grep-based parse 'harness preflight' uses; the installer
+# never sources .env) so we only flag values that are actually still empty —
+# e.g. if PROXY_API_KEY was supplied at the prompt above, we don't nag for it.
+missing_required=()
+for v in PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME; do
+    val=$(grep -E "^${v}=" "$install_root/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+    [[ -z "$val" ]] && missing_required+=("$v")
+done
+
+echo
+title "Next"
+if (( ${#missing_required[@]} > 0 )); then
+    cat <<EOF
+  1. Edit $install_root/.env and set these still-empty REQUIRED value(s):
+       ${C_YELLOW}${missing_required[*]}${C_RESET}
+  2. cd into any project directory and run: harness [agent flags...]
+EOF
+else
+    cat <<EOF
+  ${C_GREEN}✓${C_RESET} all REQUIRED values in .env are set
+  Just one step: cd into any project directory and run: harness [agent flags...]
+EOF
+fi
+
+cat <<EOF
+
+Running 'harness' with no command launches an opencode agent in the current
+directory ('harness opencode' does the same). The FIRST run builds the
+container images (ollama + proxy + agent), so expect it to take a few minutes;
+every run afterward starts in seconds.
+
+Common agent flags (examples, not the full set):
+  --yolo         auto-approve / skip-permissions
+  --net          full outbound network for THIS run only
+  --mount PATH   mount an extra host directory (repeatable)
+  -p "PROMPT"    headless single-shot run
+Any other opencode flag is passed straight through, so anything 'opencode'
+accepts works here too.
+
+Tip: don't install the 'serena' MCP up front — it adds a slow image build to
+your first run. Add it later with 'harness mcp install serena', and only if
+you understand it and know you need it.
 EOF
 
 exit_or_return 0
