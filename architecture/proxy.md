@@ -25,10 +25,13 @@ non-health request. It:
    conversation into a single-role-alternating array for the upstream
    and to inject the cooperative tool-use scaffolding into whichever
    message the prompt-mode dictates.
-4. POSTs `{model: PROXY_API_MODEL, messages: translated}` to
-   `PROXY_API_URL` with a `Bearer PROXY_API_KEY` header,
-   `verify=False` (the upstream uses a self-signed cert), and
-   `timeout=PROXY_TIMEOUT`.
+4. POSTs `{model: <requested>, messages: translated}` to the derived chat
+   endpoint `{base}/v1/chat/completions` (see [URL base + model
+   passthrough](#url-base--model-passthrough)) with a `Bearer PROXY_API_KEY`
+   header, `verify=False` (the upstream uses a self-signed cert), and
+   `timeout=PROXY_TIMEOUT`. `<requested>` is the inbound ollama model with any
+   `:latest` tag stripped — i.e. passthrough — falling back to
+   `DEFAULT_MODEL_NAME` only when the request omits a model.
 5. Extracts assistant content from the upstream response
    (`extract_assistant_content`).
 6. Parses ```json tool-call blocks out of the assistant content
@@ -38,6 +41,30 @@ non-health request. It:
 
 Errors return 502 with a structured body and a debug dump under
 `OUTPUT_DIR`.
+
+## URL base + model passthrough
+
+`PROXY_API_URL` is a **base**, not a full endpoint. `_normalize_api_base`
+strips a trailing `/v1/chat/completions`, `/chat/completions`, or `/v1` (so a
+base, an OpenAI-style `/v1` base, or a legacy full chat URL all work), and the
+module derives two endpoints once at import: `CHAT_URL` =
+`{base}/v1/chat/completions` and `MODELS_URL` = `{base}/v1/models`.
+
+`catch_all` forwards the **requested** model to upstream rather than a fixed id:
+`_strip_model_tag(model_name) or DEFAULT_MODEL_NAME`. ollama registers its stubs
+as `<id>:latest` and forwards that tagged name; `_strip_model_tag` removes only a
+`:latest` suffix (a real upstream id may contain a colon, so an arbitrary tag is
+not stripped). This is what lets a user switch between the upstream's models from
+opencode — the selected model flows opencode → ollama → proxy → upstream
+unchanged. `DEFAULT_MODEL_NAME` is only the fallback when a request carries no
+model.
+
+The `GET /v1/models` route is a thin pass-through: it forwards `MODELS_URL` with
+the bearer key and `verify=False` and returns the upstream status + body
+verbatim, so a locked-key `401` (with its `unlock_url`) reaches the caller
+unchanged. It's declared as an explicit Flask route so it wins over `catch_all`.
+ollama's entrypoint consumes it at startup to discover and register a stub per
+upstream model (see [`containers.md`](containers.md)).
 
 ## Cooperative-prompt modes (`PROXY_PROMPT_MODE`)
 
@@ -264,15 +291,16 @@ Module-level env reads at startup:
 
 ```
 PROXY_HOST=0.0.0.0          PROXY_PORT=8000
-PROXY_API_URL (REQUIRED)    PROXY_API_KEY (REQUIRED)    PROXY_API_MODEL (REQUIRED)
+PROXY_API_URL (REQUIRED)    PROXY_API_KEY (REQUIRED)    DEFAULT_MODEL_NAME (REQUIRED)
 PROXY_TIMEOUT=180           OUTPUT_DIR (optional)
 OLLAMA_CONTEXT_LENGTH=200000
 ```
 
-`_validate_config` in `main()` enforces the three REQUIRED values are
-non-empty and `PROXY_API_URL` parses; the process exits with a clear
-message if not. `_redact_key` is used in startup logging so logs show
-something like `sk-abc...xyz`.
+`DEFAULT_MODEL_NAME` (the renamed `PROXY_API_MODEL`) is the fallback model — see
+[URL base + model passthrough](#url-base--model-passthrough). `_validate_config`
+in `main()` enforces the three REQUIRED values are non-empty and `PROXY_API_URL`
+parses; the process exits with a clear message if not. `_redact_key` is used in
+startup logging so logs show something like `sk-abc...xyz`.
 
 `_setup_prompt_mode`, `_setup_change_system_to_user`, and
 `_setup_hybrid_detail_tools` read their env vars from the same `main()`
