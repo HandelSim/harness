@@ -350,12 +350,13 @@ EOF
 preflight
 
 # --- prompts ----------------------------------------------------------------
-
-read -rp "continue? [y/n]: " ans
-case "${ans:-}" in
-    y|Y|yes|YES) ;;
-    *) echo "aborted."; exit_or_return 0 ;;
-esac
+#
+# No "continue?" gate here: the next prompt (PATH) is the first thing the user
+# answers, so the intent text above still gets a beat of consideration, and
+# Ctrl-C aborts at any prompt. A prior confirm prompt was also broken when the
+# script is sourced (the README-recommended path) — its abort ran
+# `exit_or_return 0`, whose `return` only leaves that helper function, not the
+# sourced script, so answering "n" continued the install anyway.
 
 read -rp "add 'harness' to PATH (recommended)? [y/n]: " path_ans
 case "${path_ans:-}" in

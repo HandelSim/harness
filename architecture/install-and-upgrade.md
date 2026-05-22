@@ -13,11 +13,16 @@ run from an empty directory. Stages:
    check: container runtime present (docker or podman), runtime reachable
    (`docker info`), required commands available. Failures abort with a
    clear message.
-2. **Intent prompts.** Confirms before any writes, asks whether to add a
-   `harness` wrapper to PATH, and offers to capture an upstream API key now
-   (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves
+2. **Intent prompts.** Prints what the install will do, then asks whether to
+   add a `harness` wrapper to PATH and offers to capture an upstream API key
+   now (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves
    it for the user to edit manually). No key validation — whatever is
-   pasted is accepted verbatim.
+   pasted is accepted verbatim. There is no separate "continue?" gate: the
+   PATH prompt is the first interactive stop (so the intent text still gets a
+   beat of consideration) and Ctrl-C aborts at any prompt. The old confirm
+   prompt was also broken when the script is sourced — its abort called
+   `exit_or_return 0`, whose `return` only leaves that helper, not the sourced
+   script, so "n" continued the install anyway.
 3. **Clone.** `git clone` into the install dir. **The clone IS the
    install root** — there's no separate config dir.
 4. **Source full `platform.sh`** now that it's local. Subsequent helpers
