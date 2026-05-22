@@ -200,7 +200,7 @@ _TOOL_RESULT_CLOSE = "<<<END_TOOL_RESULT>>>"
 def unwrap_proxy_scaffolding(content: str) -> str:
     """Return just the user/tool content from a proxy-wrapped message.
 
-    In the default `user_front` prompt mode the proxy appends the full
+    In `user_front` prompt mode the proxy appends the full
     tool-schema block (~10-15KB across the agent's tools) to the
     final user message. Matching a fixture regex against that block is a
     bug magnet: a phrase like "List files in current directory" inside the

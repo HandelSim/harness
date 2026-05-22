@@ -66,11 +66,17 @@ HARNESS_DIR_DEFAULT = "/opt/harness"
 # Env vars the runner sets BEFORE invoking harbor. The adapter reads them
 # at install() time and writes them into harness's .env. These mirror the
 # variables docker-compose.yml expects.
+#
+# PROXY_PROMPT_MODE is intentionally NOT here: it is no longer a .env knob
+# (docker-compose.yml stopped interpolating it so a stale .env can't override
+# the hybrid default). The benchmark scheme still selects a mode via the
+# PROXY_PROMPT_MODE env var, but the adapter applies it through the ephemeral
+# `harness restart --prompt-mode <mode>` flag after install — see
+# harness_prompt_mode() and install().
 HARNESS_ENV_KEYS = (
     "PROXY_API_KEY",
     "PROXY_API_URL",
     "DEFAULT_MODEL_NAME",
-    "PROXY_PROMPT_MODE",
     "HARNESS_PROXY_SCHEME",
 )
 
@@ -79,6 +85,17 @@ def render_harness_env() -> str:
     """Render the contents of harness's .env from the current process env."""
     lines = [f"{k}={os.environ[k]}" for k in HARNESS_ENV_KEYS if k in os.environ]
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+def harness_prompt_mode() -> str:
+    """The cooperative-prompt mode the scheme selected, or "" if none.
+
+    The benchmark scheme exports PROXY_PROMPT_MODE into the runner env (see
+    tests/benchmarks/schemes/*.json + bench_apply_scheme). Since it is no
+    longer fed to the proxy via .env, the adapter applies it post-install with
+    `harness restart --prompt-mode <mode>`.
+    """
+    return os.environ.get("PROXY_PROMPT_MODE", "").strip()
 
 
 def harness_dir() -> Path:
@@ -166,6 +183,17 @@ class HarnessAgentBase(BaseInstalledAgent):
             environment,
             command=f"bash {shlex.quote(clone_dir + '/harness-install.sh')}",
         )
+
+        # Apply the scheme's cooperative-prompt mode, if any. It is no longer
+        # carried in .env; the proxy defaults to hybrid, so we only restart to
+        # switch when the scheme asked for a specific mode. The flag is
+        # ephemeral, so it must be (re)applied here every install.
+        mode = harness_prompt_mode()
+        if mode:
+            await self.exec_as_root(
+                environment,
+                command=f"harness restart --prompt-mode {shlex.quote(mode)}",
+            )
 
     async def run(
         self,

@@ -334,23 +334,51 @@ keys = sorted(body.keys())
 if keys != ['messages', 'model']:
     print('UNEXPECTED_KEYS:' + ','.join(keys))
     sys.exit(0)
-# Default mode is 'user_front': the user's request appears FIRST in the
-# last user message (wrapped in <<<BEGIN_USER_REQUEST>>> markers), then
-# the tool definitions follow. The system message stays unmodified.
+# Default mode is now 'hybrid': the last user message carries the recency
+# reminder plus the probe wrapped in <<<BEGIN_USER_MESSAGE>>> markers, while
+# the full tool scaffolding (### Tool Usage Instructions + the AGENT_TOOLS
+# block) lives at the HEAD of the conversation, not on the last user message.
 msgs = body['messages']
 last = msgs[-1]
 last_content = last.get('content','')
-if '<<<BEGIN_USER_REQUEST>>>' not in last_content:
-    print('NO_REQUEST_MARKER_IN_LAST_USER')
+if last.get('role') != 'user':
+    print('LAST_NOT_USER:' + str(last.get('role')))
     sys.exit(0)
-if '### Available Tools' not in last_content:
-    print('NO_TOOL_LIST_IN_LAST_USER')
+if 'Reminder' not in last_content:
+    print('NO_REMINDER_PREFIX')
     sys.exit(0)
-# Position check: request marker comes BEFORE tool list.
-req_pos = last_content.index('<<<BEGIN_USER_REQUEST>>>')
-tool_pos = last_content.index('Available Tools')
-if req_pos >= tool_pos:
-    print('REQUEST_NOT_BEFORE_TOOLS')
+if 'do not invent' not in last_content:
+    print('REMINDER_MISSING_DO_NOT_INVENT')
+    sys.exit(0)
+if 'Available tools:' not in last_content:
+    print('REMINDER_MISSING_TOOL_NAMES')
+    sys.exit(0)
+# The reminder points the model back at the AGENT_TOOLS block by name.
+if '<<<BEGIN_AGENT_TOOLS>>>' not in last_content:
+    print('REMINDER_MISSING_AGENT_TOOLS_POINTER')
+    sys.exit(0)
+# The probe (real user turn) is wrapped in USER_MESSAGE markers, reminder out.
+if '<<<BEGIN_USER_MESSAGE>>>' not in last_content:
+    print('NO_USER_MESSAGE_WRAP')
+    sys.exit(0)
+if last_content.index('Reminder') >= last_content.index('<<<BEGIN_USER_MESSAGE>>>'):
+    print('REMINDER_NOT_OUTSIDE_USER_MESSAGE')
+    sys.exit(0)
+# The full tool list / instructions header must NOT be on the last user
+# message — those live in the head under hybrid.
+if '### Tool Usage Instructions' in last_content:
+    print('FULL_INSTRUCTIONS_ON_LAST_USER')
+    sys.exit(0)
+if '<<<END_AGENT_TOOLS>>>' in last_content:
+    print('FULL_TOOL_LIST_ON_LAST_USER')
+    sys.exit(0)
+# Verify the scaffolding lives at the head of the conversation.
+head = '\n'.join(m.get('content','') for m in msgs[:-1])
+if '### Tool Usage Instructions' not in head:
+    print('NO_INSTRUCTIONS_HEADER_IN_HEAD')
+    sys.exit(0)
+if '<<<BEGIN_AGENT_TOOLS>>>' not in head:
+    print('NO_AGENT_TOOLS_IN_HEAD')
     sys.exit(0)
 # Passthrough: the forwarded model is the inbound request's model ('harness'),
 # not a fixed PROXY_API_MODEL. ollama may tag it ':latest'; the proxy strips it.
@@ -364,9 +392,17 @@ case "${KEY_CHECK}" in
     *OK*) ;;
     *WRONG_MODEL*)                 fail "C: forwarded model is not the passed-through request model: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
     *UNEXPECTED_KEYS*)              fail "C: forwarded body had keys other than {model,messages}: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
-    *NO_REQUEST_MARKER_IN_LAST_USER*) fail "C: last user message is missing the <<<BEGIN_USER_REQUEST>>> marker" "${FORWARDED_BODY}" ;;
-    *NO_TOOL_LIST_IN_LAST_USER*)    fail "C: last user message is missing the tool list" "${FORWARDED_BODY}" ;;
-    *REQUEST_NOT_BEFORE_TOOLS*)     fail "C: in user_front mode the request marker should appear before the tool list" "${FORWARDED_BODY}" ;;
+    *LAST_NOT_USER*)               fail "C: last forwarded message is not a user message: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
+    *NO_REMINDER_PREFIX*)          fail "C: hybrid last user message is missing the [Reminder …] prefix" "${FORWARDED_BODY}" ;;
+    *REMINDER_MISSING_DO_NOT_INVENT*) fail "C: hybrid reminder is missing the 'do not invent' rule" "${FORWARDED_BODY}" ;;
+    *REMINDER_MISSING_TOOL_NAMES*) fail "C: hybrid reminder is missing the 'Available tools:' list" "${FORWARDED_BODY}" ;;
+    *REMINDER_MISSING_AGENT_TOOLS_POINTER*) fail "C: hybrid reminder does not point back at <<<BEGIN_AGENT_TOOLS>>>" "${FORWARDED_BODY}" ;;
+    *NO_USER_MESSAGE_WRAP*)        fail "C: hybrid probe is not wrapped in <<<BEGIN_USER_MESSAGE>>> markers" "${FORWARDED_BODY}" ;;
+    *REMINDER_NOT_OUTSIDE_USER_MESSAGE*) fail "C: hybrid reminder should sit OUTSIDE the USER_MESSAGE wrap" "${FORWARDED_BODY}" ;;
+    *FULL_INSTRUCTIONS_ON_LAST_USER*) fail "C: full tool instructions leaked onto the last user message (should be in head)" "${FORWARDED_BODY}" ;;
+    *FULL_TOOL_LIST_ON_LAST_USER*) fail "C: full tool list leaked onto the last user message (should be in head)" "${FORWARDED_BODY}" ;;
+    *NO_INSTRUCTIONS_HEADER_IN_HEAD*) fail "C: tool instructions header is missing from the conversation head" "${FORWARDED_BODY}" ;;
+    *NO_AGENT_TOOLS_IN_HEAD*)      fail "C: <<<BEGIN_AGENT_TOOLS>>> block is missing from the conversation head" "${FORWARDED_BODY}" ;;
     *)                              fail "C: unexpected key-check output: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
 esac
 

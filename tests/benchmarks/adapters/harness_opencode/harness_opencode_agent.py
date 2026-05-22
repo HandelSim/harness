@@ -19,8 +19,10 @@ ENVIRONMENT VARIABLES (set by the runner before harbor invocation):
 - PROXY_API_KEY        : upstream LLM API key
 - PROXY_API_URL        : upstream LLM endpoint
 - DEFAULT_MODEL_NAME    : default/fallback model id
-- PROXY_PROMPT_MODE    : current prod injection mode
-                         (user_front | hybrid; passthrough = bypass)
+- PROXY_PROMPT_MODE    : cooperative-prompt mode the scheme selected
+                         (hybrid (default) | user_front; passthrough = bypass).
+                         No longer written to .env — the adapter applies it via
+                         `harness restart --prompt-mode <mode>` after install.
 - HARNESS_PROXY_SCHEME : reserved for future named-scheme support; see
                          tests/benchmarks/schemes/*.json
 - HARNESS_GIT_REF      : git ref to clone (default: dev)

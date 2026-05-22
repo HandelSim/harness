@@ -72,9 +72,16 @@ EOF
 
 # The override file bind-mounts the scheme-specific fixture subdir into
 # the mock container at /fixtures and exposes a host port on ollama so
-# the test driver can curl it.
+# the test driver can curl it. It also re-injects PROXY_PROMPT_MODE onto
+# the proxy: production docker-compose.yml no longer interpolates that var
+# (removed so a stale user .env can't override the hybrid default), so this
+# test supplies it through its own override, interpolated from the per-scheme
+# value write_scheme_env writes into ENV_FILE.
 cat >"${OVERRIDE_FILE}" <<'EOF'
 services:
+  proxy:
+    environment:
+      PROXY_PROMPT_MODE: ${PROXY_PROMPT_MODE}
   ollama:
     ports:
       - "11434:11434"
