@@ -10,7 +10,7 @@
 # Point .env at it:
 #   PROXY_API_URL=http://mock-api:80/v1/chat/completions
 #   PROXY_API_KEY=mock-key
-#   PROXY_API_MODEL=mock-model
+#   DEFAULT_MODEL_NAME=mock-model
 #
 # The firewall treats bare (dot-less) hostnames as intra-cluster and skips
 # the allowlist check — see firewall/init-firewall.sh. No allowlist edits

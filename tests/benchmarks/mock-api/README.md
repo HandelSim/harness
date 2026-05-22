@@ -35,7 +35,7 @@ docker compose --env-file ./.env \
 # .env must contain:
 #   PROXY_API_URL=http://mock-api:80/v1/chat/completions
 #   PROXY_API_KEY=mock-key
-#   PROXY_API_MODEL=mock-model
+#   DEFAULT_MODEL_NAME=mock-model
 ```
 
 The firewall script in `firewall/init-firewall.sh` treats bare hostnames
