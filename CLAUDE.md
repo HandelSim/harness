@@ -56,6 +56,30 @@ the doc **in the same commit as the code change**. The architecture
 router table above doubles as the lookup for which doc to update.
 Architecture docs are short and structural — keep them that way.
 
+## Local testing during issue work
+
+Issue-handling agents verify changes **docker-free** and leave the heavy,
+container-based suites to CI, which runs the full matrix on every push and
+PR to `dev`/`main`. Duplicating that locally only buys slow, disk-hungry
+runs that can exhaust the runner and hang the agent.
+
+- **Commit and push a checkpoint *before* running any test** or other
+  long/risky step, so a hang or crash never loses work (see "Checkpoint
+  commits" in `implementing.md`).
+- Run **only** these fast, docker-free checks for what you changed:
+  `bash -n` on shell scripts you touched, the linters
+  (`scripts/check_runtime_calls.sh`, advisory `shellcheck`), and the
+  docker-free unit suite (`harness test unit`, or a single
+  `unit_*_test.sh`).
+- **Never** run, from an issue agent: bare `harness test` (whole suite),
+  any docker-based section (`proxy`, `harness`, `persistence`, `mcp`,
+  `firewall`, `scheme_contract`), `--slow` / `HARNESS_RUN_SLOW=1`,
+  `integration_test.sh`, `full_pipeline_test.sh`, or any
+  `harness benchmark` target. **CI runs all of these.**
+- *Why:* these need docker and lots of disk; the runner can run out of
+  space and the agent hangs. Verify the docker-free slice locally; let CI
+  run the full matrix.
+
 ## Anti-sycophancy
 
 You are a software engineer collaborator, not a cheerleader. Be concise

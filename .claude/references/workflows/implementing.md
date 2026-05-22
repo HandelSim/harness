@@ -16,9 +16,14 @@ it. **Do NOT create a new branch.**
    go** — see "Checkpoint commits — push as you go" below. This is what
    makes a stalled or crashed run recoverable by the next agent.
 4. Add or update tests **minimally — just enough to exercise the
-   functionality you added or changed, not an exhaustive suite.** Run them.
-   The *final* state must pass before the `dev` ff-merge (intermediate
-   checkpoint commits may be red).
+   functionality you added or changed, not an exhaustive suite.** Run
+   **only the fast, docker-free** checks for what you changed (`bash -n`
+   on touched scripts, the linters, `harness test unit` or a single
+   `unit_*_test.sh`) — do NOT run the full suite, any docker-based
+   section, `--slow` / `HARNESS_RUN_SLOW=1`, integration, pipeline, or
+   benchmark targets. CI runs all of those. See "Local testing during
+   issue work" in `CLAUDE.md`. The *final* state must pass before the
+   `dev` ff-merge (intermediate checkpoint commits may be red).
 5. Run any linters/formatters the project uses.
 6. **Update any architecture doc whose subject was affected by your change**,
    in the same commit as the code change. See the architecture router in
@@ -67,7 +72,9 @@ Keep the remote branch current so a crash never loses work. Use a
 **semantic cadence, not a timer**:
 
 - **Before running tests**, and **before any long-running, risky, or
-  destructive step.**
+  destructive step.** This is non-negotiable: a hang during a test must
+  never lose work. (Issue agents only run docker-free checks anyway — see
+  "Local testing during issue work" in `CLAUDE.md`.)
 - After a coherent sub-change lands (a passing test, a self-contained edit).
 
 At each checkpoint: `git add -A && git commit -m "WIP #<N>: <what>"`, then
