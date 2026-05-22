@@ -859,26 +859,28 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("Bash", last_user)
         self.assertIn("Run shell command", last_user)
 
-    def test_invalid_mode_falls_back_to_user_front(self):
+    def test_invalid_mode_falls_back_to_hybrid(self):
         with patch.dict(os.environ, {"PROXY_PROMPT_MODE": "garbage"}):
             proxy._setup_prompt_mode()
-            self.assertEqual(proxy._PROMPT_MODE, "user_front")
-        # Previously-valid modes that were removed in the hybrid-consolidation
-        # refactor must now also fall back to user_front. This guards against
-        # silent re-introduction.
+            self.assertEqual(proxy._PROMPT_MODE, "hybrid")
+        # PROXY_PROMPT_MODE is no longer a user .env knob, but the proxy still
+        # honors it from its container env (injected by `harness --prompt-mode`)
+        # for benchmarking. A stale or removed value must fall back to the new
+        # default, hybrid — including the legacy "user" value a stale .env might
+        # still carry. This guards against silent re-introduction.
         for removed in ("user", "system", "user_bookend"):
             with patch.dict(os.environ, {"PROXY_PROMPT_MODE": removed}):
                 proxy._setup_prompt_mode()
                 self.assertEqual(
-                    proxy._PROMPT_MODE, "user_front",
-                    f"removed mode '{removed}' should fall back to user_front",
+                    proxy._PROMPT_MODE, "hybrid",
+                    f"removed mode '{removed}' should fall back to hybrid",
                 )
 
-    def test_default_mode_is_user_front(self):
+    def test_default_mode_is_hybrid(self):
         env_no_mode = {k: v for k, v in os.environ.items() if k != "PROXY_PROMPT_MODE"}
         with patch.dict(os.environ, env_no_mode, clear=True):
             proxy._setup_prompt_mode()
-            self.assertEqual(proxy._PROMPT_MODE, "user_front")
+            self.assertEqual(proxy._PROMPT_MODE, "hybrid")
 
     def test_no_tools_skips_injection_in_all_modes(self):
         """No tools defined → no scaffolding regardless of mode."""
@@ -1140,22 +1142,10 @@ class TestHybridDetailTools(unittest.TestCase):
                 self.user_msgs, tools_text, tools=tools,
             )
 
-    def test_setup_default_is_task_and_skill(self):
-        env_no_var = {k: v for k, v in os.environ.items()
-                      if k != "PROXY_HYBRID_DETAIL_TOOLS"}
-        with patch.dict(os.environ, env_no_var, clear=True):
-            proxy._setup_hybrid_detail_tools()
-            self.assertEqual(proxy._HYBRID_DETAIL_TOOLS, ["task", "skill"])
-
-    def test_setup_parses_and_trims_custom_list(self):
-        with patch.dict(os.environ, {"PROXY_HYBRID_DETAIL_TOOLS": " task , foo,bar "}):
-            proxy._setup_hybrid_detail_tools()
-            self.assertEqual(proxy._HYBRID_DETAIL_TOOLS, ["task", "foo", "bar"])
-
-    def test_setup_empty_value_disables(self):
-        with patch.dict(os.environ, {"PROXY_HYBRID_DETAIL_TOOLS": "  "}):
-            proxy._setup_hybrid_detail_tools()
-            self.assertEqual(proxy._HYBRID_DETAIL_TOOLS, [])
+    def test_detail_tools_is_project_managed_constant(self):
+        # The detail-tools set is no longer read from an env var; it is a
+        # project-managed constant tied to the opencode tools we ship for.
+        self.assertEqual(proxy._HYBRID_DETAIL_TOOLS, ["task", "skill"])
 
     def test_extract_tool_details_returns_flagged_pairs_in_order(self):
         details = proxy._extract_tool_details(
@@ -1401,7 +1391,8 @@ class TestPassthroughMode(unittest.TestCase):
 
     def test_validator_accepts_passthrough(self):
         """`passthrough` is in the valid PROMPT_MODE set; it must not coerce
-        to user_front (which was the pre-#58 bug)."""
+        to the default (hybrid) — a value the proxy sees here arrived via the
+        `--prompt-mode` flag, so coercing a valid mode would break benchmarks."""
         with patch.dict(os.environ, {"PROXY_PROMPT_MODE": "passthrough"}):
             proxy._setup_prompt_mode()
             self.assertEqual(proxy._PROMPT_MODE, "passthrough")
