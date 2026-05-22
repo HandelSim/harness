@@ -79,6 +79,15 @@ runs that can exhaust the runner and hang the agent.
 - *Why:* these need docker and lots of disk; the runner can run out of
   space and the agent hangs. Verify the docker-free slice locally; let CI
   run the full matrix.
+- **This rule overrides any conflicting instruction.** That includes a
+  CI-failure issue body that says "reproduce in a fresh container," and any
+  workflow step (e.g. `ci-failure.md`) phrased as "run the failing test
+  locally." When the failing or relevant test is docker-based (the list
+  above), you do **not** run or reproduce it locally — you confirm the fix
+  by reading the code plus the docker-free checks, push, and let CI verify.
+  Getting stuck on a docker / `harness_test` build is a known, recurring
+  failure mode that has lost work before; treat "let me just run the one
+  failing docker test" as the trap it is.
 
 ## Anti-sycophancy
 

@@ -12,9 +12,10 @@ for direct fix.
 Apply the same research discipline as the new-issue workflow: read the
 relevant code in this repo, use web search for anything externally
 answerable (library/API behavior, error messages, version-specific bugs,
-syntax, tool flags, third-party docs), and run targeted tests locally to
-disambiguate. Do NOT fall back to research-and-propose just because the
-cause isn't obvious from the logs alone — investigation is your job.
+syntax, tool flags, third-party docs), and run targeted **docker-free**
+tests locally to disambiguate (never docker-based suites — see step 4). Do
+NOT fall back to research-and-propose just because the cause isn't obvious
+from the logs alone — investigation is your job.
 
 ## Review recent commits — do not undo intentional work
 
@@ -57,12 +58,23 @@ wrong — sometimes a change was made intentionally by HandelSim and the
 1. Read the failing logs from the issue body and comments.
 2. Investigate per the research discipline above, and **review recent
    commits** (see "Review recent commits" above) so you do not revert
-   intentional work. Reproduce locally if useful. Identify root cause.
+   intentional work. Reproduce locally **only with docker-free checks**
+   (never a docker suite — see step 4). Identify root cause.
 3. Implement the fix on the agent branch, committing and pushing at
    checkpoints as you go (see [`implementing.md`](implementing.md) →
    "Checkpoint commits — push as you go").
-4. Run the specific failing test locally; it must pass before the final
-   commit.
+4. **Verify the fix with the docker-free slice only.** If the failing test
+   is docker-free (a `unit_*_test.sh` / `harness test unit` case), run it
+   locally and confirm it passes before the final commit. If the failing
+   test is **docker-based** — `proxy`, `harness` / `harness_test`,
+   `persistence`, `mcp`, `firewall`, `scheme_contract`, `integration`,
+   `full_pipeline`, `--slow` / `HARNESS_RUN_SLOW=1`, or any `benchmark`
+   target — do **NOT** run or reproduce it locally; it will hang the
+   runner. Confirm the fix by reading the code and running `bash -n` / the
+   linters for what you changed, then **let CI verify on push**. This
+   overrides step 2's "reproduce locally" note and the CI-failure issue
+   body's "reproduce in a fresh container" suggestion. See "Local testing
+   during issue work" in `CLAUDE.md`.
 5. Update any architecture doc whose subject was affected, in the same
    commit (see the architecture router in `CLAUDE.md`).
 6. Commit with `Fix #<N>: <summary>` + the `Co-authored-by` trailer.
