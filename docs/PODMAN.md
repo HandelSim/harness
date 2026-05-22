@@ -99,7 +99,7 @@ harness net open agent      # persistent (until 'harness net close agent')
 harness --net               # per-launch only
 ```
 
-## `harness start` under podman
+## Bringing up the stack under podman
 
 Once the env var is set (or auto-detect picks podman because docker isn't
 installed), every `harness` subcommand routes through podman:

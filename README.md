@@ -188,8 +188,8 @@ Per-install state lives in `<install-root>/state/mcp/<name>/harness-meta.json`
 | ------------------------------------- | ---------------------------------------------------------------------------- |
 | `harness mcp install <name>`          | Copy registry entry → active tree, set `enabled: true`. Re-install needs `--force`. |
 | `harness mcp uninstall <name> --force` | Remove the active entry. `data/` is preserved.                              |
-| `harness mcp enable <name>`           | State toggle: set `enabled: true`. `harness start` will include it.          |
-| `harness mcp disable <name>`          | State toggle: set `enabled: false`. Files stay; `harness start` skips it.    |
+| `harness mcp enable <name>`           | State toggle: set `enabled: true`. Included the next time the stack starts.  |
+| `harness mcp disable <name>`          | State toggle: set `enabled: false`. Files stay; skipped the next time the stack starts. |
 | `harness mcp up <name>`               | Manually start the container (works even if disabled).                       |
 | `harness mcp down <name>`             | Manually stop the container without flipping `enabled`.                      |
 | `harness mcp logs <name>`             | `docker compose logs -f` for the MCP's services.                             |

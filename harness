@@ -1086,7 +1086,9 @@ Running 'harness' with no command — or with only agent flags such as --yolo,
 --net, --mount, or -p — launches an opencode agent in the current directory.
 
 commands:
-  start                 build and bring up the ollama + proxy services
+  start                 build and bring up the ollama + proxy services.
+                        Run automatically by bare 'harness'; rarely needed
+                        by hand.
   down                  stop the ollama + proxy services (does NOT touch agents)
   restart               down + start (preserves per-invocation state)
   update                git pull --ff-only in the clone
@@ -1121,7 +1123,7 @@ commands:
                         key is locked
   doctor                run runtime diagnostics (read-only)
   preflight             validate config (.env, allowlist, docker daemon)
-                        before running 'harness start'
+                        before the stack starts
   test [section]        run the harness test suite (glob-discovered).
                         sections: all (default), unit, integration,
                         or a prefix like 'mcp' or 'firewall'.
@@ -2823,7 +2825,7 @@ subcommands:
                                   and mark it enabled.
   uninstall <name> [--force]    remove an installed entry; data/ is preserved
   enable <name>                 mark an installed MCP as auto-start.
-                                  'harness start' brings it up next time.
+                                  Brought up the next time the stack starts.
   disable <name>                mark an installed MCP as do-not-auto-start.
                                   Container is left alone; use 'mcp down' to
                                   stop one immediately or 'mcp up' to start
@@ -2841,9 +2843,10 @@ The four canonical lifecycle verbs (install / uninstall / enable / disable)
 are distinct: install/uninstall move between available and installed;
 enable/disable flip the auto-start flag on an already-installed entry.
 
-After install/uninstall/enable/disable, run 'harness start' (or
-'harness upgrade') to materialize the change in the running compose stack.
-'mcp up' / 'mcp down' bypass the start/down cycle and act on a single MCP.
+After install/uninstall/enable/disable, the change takes effect the next time
+the stack starts: run 'harness' if it's down, or 'harness restart' if it's
+already up. 'mcp up' / 'mcp down' bypass the restart cycle and act on a single
+MCP.
 EOF
 }
 
@@ -3114,7 +3117,7 @@ installed: $name (from $src)
 state: installed-enabled
 data: $dest/data
 next:
-  run 'harness start' (or 'harness restart' if the stack is already up) to bring up the service.
+  run 'harness' to start the stack (or 'harness restart' if it's already up) to bring up the service.
   agents launched after that will see this MCP in their config.
 EOF
 
@@ -3251,7 +3254,7 @@ cmd_mcp_enable() {
 
     mcp_set_enabled "$name" "true"
     echo "enabled: $name"
-    echo "next: 'harness start' (or 'harness upgrade') to bring it up."
+    echo "next: run 'harness' to start the stack (or 'harness restart' if it's already up) to bring it up."
 }
 
 # disable: mark installed MCP as do-not-auto-start. Pure state-flag flip.
@@ -3283,7 +3286,7 @@ cmd_mcp_disable() {
     mcp_set_enabled "$name" "false"
     echo "disabled: $name (still installed; data + config preserved)"
     echo "next: 'harness mcp down $name' to stop a running container, or"
-    echo "      'harness start' to apply the change to the running stack."
+    echo "      'harness restart' to apply the change to a running stack."
 }
 
 # up: start an installed MCP's containers regardless of enabled flag.
@@ -4182,7 +4185,7 @@ cmd_doctor() {
         if harness_docker image inspect "$img" >/dev/null 2>&1; then
             doctor_check ok "$(printf '%s' "$img" | cut -d: -f1)" "$img present"
         else
-            doctor_check warn "$(printf '%s' "$img" | cut -d: -f1)" "$img missing — run 'harness start' to build"
+            doctor_check warn "$(printf '%s' "$img" | cut -d: -f1)" "$img missing — run 'harness' to build"
         fi
     done
 
@@ -4346,13 +4349,13 @@ cmd_preflight() {
         if [[ -n "$proxy_status" ]]; then
             echo "  ⓘ proxy: $proxy_status"
         else
-            echo "  ⓘ proxy: not running (run 'harness start')"
+            echo "  ⓘ proxy: not running (run 'harness' to start it)"
         fi
     fi
 
     if (( errors > 0 )); then
         echo
-        echo "[harness] preflight: $errors error(s). Resolve issues above before running 'harness start'."
+        echo "[harness] preflight: $errors error(s). Resolve issues above before running harness."
         return 1
     fi
 

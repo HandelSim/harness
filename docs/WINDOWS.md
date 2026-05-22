@@ -20,7 +20,7 @@ harness supports Windows via Git Bash. PowerShell and cmd are not supported.
 8. Edit `<install-root>/.env` and set required values (especially `PROXY_API_KEY`).
 9. Open a new Git Bash session if PATH was modified by the installer.
 10. Run `harness preflight` to validate configuration.
-11. Run `harness start`.
+11. `cd` into a project directory and run `harness` (this starts the stack and launches an agent).
 
 ## How harness handles paths on Windows
 
@@ -129,7 +129,7 @@ displays correctly.
 ## Performance notes
 
 - Bind mounts to NTFS are slower than to Linux ext4. For performance-sensitive workloads, consider running harness inside WSL2 — but that's beyond the scope of this guide.
-- Docker Desktop's default resource limits may be conservative. If `harness start` is slow or runs out of memory, increase Docker Desktop's CPU/RAM limits in its Settings.
+- Docker Desktop's default resource limits may be conservative. If `harness` is slow to start the stack or runs out of memory, increase Docker Desktop's CPU/RAM limits in its Settings.
 
 ## Limitations
 

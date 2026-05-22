@@ -372,7 +372,7 @@ want_api_key=0
 api_key_value=""
 echo
 echo "The proxy needs an upstream API key (PROXY_API_KEY in .env)."
-echo "If you skip this, edit .env and set PROXY_API_KEY before 'harness start'."
+echo "If you skip this, edit .env and set PROXY_API_KEY before running harness."
 read -rp "enter an upstream API key now? [y/n]: " key_ans
 case "${key_ans:-}" in
     y|Y|yes|YES)
@@ -548,7 +548,7 @@ elif [[ -f "$install_root/.harness-allowlist.example" ]]; then
     ok "seeded $install_root/.harness-allowlist from .harness-allowlist.example"
     warn "edit $install_root/.harness-allowlist and add your upstream LLM API hostname (must match PROXY_API_URL)"
 else
-    warn "no .harness-allowlist.example bundled; create $install_root/.harness-allowlist before 'harness start'"
+    warn "no .harness-allowlist.example bundled; create $install_root/.harness-allowlist before running harness"
 fi
 
 # --- PATH setup -------------------------------------------------------------
@@ -718,13 +718,13 @@ Manage MCPs:
   harness mcp list                  show installed MCPs
   harness mcp install <name>        copy a registry entry into the active tree
   harness mcp uninstall <name>      remove entirely
-  harness mcp enable <name>         start auto-loading on 'harness start'
+  harness mcp enable <name>         auto-load it the next time the stack starts
   harness mcp disable <name>        stop auto-loading
 
 Need a shell inside an agent container (for installing skills, debugging)?
   harness shell
 
-If 'harness start' fails after configuration:
+If harness can't start the stack after configuration:
   harness preflight                   # validates .env and allowlist
   <runtime> logs harness-proxy-1      # see what the proxy says (runtime: docker or podman)
 EOF

@@ -9,11 +9,11 @@ symbols, etc.) instead of grepping raw text.
 
 ```
 harness mcp enable serena
-harness start
+harness          # start the stack (or 'harness restart' if it's already up)
 ```
 
-The first `start` after enabling builds Serena from upstream source
-(roughly 5–10 minutes; ~2GB image). Subsequent starts reuse the cached
+The first startup after enabling builds Serena from upstream source
+(roughly 5–10 minutes; ~2GB image). Subsequent startups reuse the cached
 image, and the data dir at `<install-root>/state/mcp/serena/data/`
 persists across rebuilds.
 

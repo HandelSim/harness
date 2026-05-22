@@ -71,7 +71,7 @@ problem is firewall-induced vs application-induced):
 1. Edit `<install-root>/.harness-allowlist` to add a wildcard-ish set of
    hosts the failing operation needs (you cannot blanket-disable; the
    firewall is wired into the container's startup path).
-2. `harness restart` (B2) or `harness start` to reload.
+2. `harness restart` (B2) to reload (or just run `harness` if the stack is down).
 3. After debugging, restore the original allowlist.
 
 A future `harness net open <service>` (B2) will provide a one-command path
