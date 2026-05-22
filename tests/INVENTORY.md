@@ -171,6 +171,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F137 | `write_runtime_override` adds bind mounts requested via `--mount` |
 | F138 | `warn_if_firewall_open` prints a yellow warning when any service is in net-overrides |
 | F139 | `warn_if_firewall_open` is silent when net-overrides is empty or absent |
+| F150 | `harness start/restart --prompt-mode <mode>` validates `hybrid`/`user_front`/`passthrough` (`_parse_prompt_mode_flag`) and injects `PROXY_PROMPT_MODE` onto the proxy via `write_runtime_override` (ephemeral, not persisted); folds into the proxy's firewall opt-out block when both apply |
 
 ---
 
@@ -187,12 +188,12 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P007 | Proxy reads `DEFAULT_MODEL_NAME` from env (fallback model when a request omits one) |
 | P008 | Proxy reads `PROXY_TIMEOUT` from env |
 | P009 | Proxy reads `OLLAMA_CONTEXT_LENGTH` from env |
-| P010 | Proxy reads `PROXY_PROMPT_MODE` from env (default `user_front`) |
-| P011 | Proxy reads `PROXY_CHANGE_SYSTEM_PROMPT_TO_USER` from env |
+| P010 | Proxy reads `PROXY_PROMPT_MODE` from the container env (default `hybrid`); not a `.env` knob — set only via `harness --prompt-mode` for benchmarking |
+| P011 | The system→user conversion is governed by the hardcoded `_CHANGE_SYSTEM_TO_USER=True` constant (no longer read from an env var) |
 | P012 | Proxy reads `OUTPUT_DIR` from env for debug dumps |
 | P013 | `PROXY_PROMPT_MODE=user_front` injects the cooperative prompt before the latest user message |
-| P017 | `PROXY_PROMPT_MODE=hybrid` puts full tool definitions at the stable prefix and a tool-name-list reminder on the latest user message |
-| P018 | Unknown or removed `PROXY_PROMPT_MODE` (incl. legacy `user`, `system`, `user_bookend`) falls back to `user_front` and warns |
+| P017 | `PROXY_PROMPT_MODE=hybrid` (the default) puts full tool definitions at the stable prefix and a tool-name-list reminder on the latest user message |
+| P018 | Unknown, absent, or removed `PROXY_PROMPT_MODE` (incl. legacy `user_front`/`user`/`system`/`user_bookend`) falls back to `hybrid` and warns |
 | P019 | `extract_tool_calls_and_text` parses fenced ```json blocks from assistant text |
 | P020 | `extract_tool_calls_and_text` extracts ALL `json` blocks, not just the first |
 | P021 | `extract_tool_calls_and_text` preserves the textual order of tool_use blocks |
@@ -204,7 +205,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P027 | `translate_history_and_apply_prompt` coalesces consecutive same-role messages |
 | P028 | Multiple consecutive system messages are merged into one |
 | P029 | Multiple consecutive user messages are merged into one |
-| P030 | When `PROXY_CHANGE_SYSTEM_PROMPT_TO_USER=1`, the system message is rewritten as a user message |
+| P030 | With `_CHANGE_SYSTEM_TO_USER` True (always, since it is a hardcoded constant), the system message is rewritten as a user message |
 | P031 | When system→user rewrite happens, a stub assistant turn ("Understood…") is inserted so upstream sees user/assistant alternation |
 | P032 | `make_chunk` emits ollama-shaped NDJSON chunks |
 | P033 | Final NDJSON chunk includes `done: true` and `done_reason` |
@@ -232,7 +233,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P055 | The cooperative prompt enumerates available tools by name and schema |
 | P056 | Proxy forwards the inbound (requested) model to upstream, stripping a `:latest` tag; falls back to `DEFAULT_MODEL_NAME` only when the request omits a model |
 | P057 | Tool-result name is resolved from metadata: explicit `tool_name`/`name` field, else `tool_call_id` correlated to the assistant `tool_calls`, else positional order, else `unknown_tool` |
-| P058 | Hybrid mode echoes the full description of `PROXY_HYBRID_DETAIL_TOOLS` (default `task,skill`) into the recency reminder in `<<<BEGIN_TOOL_DETAIL>>>` blocks; empty disables; only present, non-empty-description tools surface |
+| P058 | Hybrid mode echoes the full description of the project-managed `_HYBRID_DETAIL_TOOLS` constant (`["task","skill"]`, not an env var) into the recency reminder in `<<<BEGIN_TOOL_DETAIL>>>` blocks; only present, non-empty-description tools surface |
 | P059 | The hybrid recency reminder advises the model to default to the listed tools over doing the work by hand, with concrete examples (`webfetch` vs curl/Python, `todowrite`/`todoread` vs a todo file) |
 | P060 | Proxy `GET /v1/models` proxies the upstream models catalog: forwards `{base}/v1/models` with the bearer key and returns the upstream status/body verbatim (so a locked-key 401 + `unlock_url` passes through) |
 | P061 | Proxy derives endpoints from `PROXY_API_URL` as a base — `{base}/v1/chat/completions` and `{base}/v1/models` — stripping a trailing `/v1/chat/completions`, `/chat/completions`, or `/v1` first |

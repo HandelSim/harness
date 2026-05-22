@@ -36,8 +36,10 @@ These are the load-bearing behaviors the proxy is built around:
 - **Hidden, uncontrollable system prompt.** The upstream runs its own
   system prompt that we can neither see nor override. A `system`-role
   message in the request is **quietly ignored** (no error). Its prompt is
-  chat-oriented, not coding-agent-oriented. This is *why* the proxy
-  defaults `_CHANGE_SYSTEM_TO_USER` ON — see [`proxy.md`](proxy.md).
+  chat-oriented, not coding-agent-oriented. This is *why* the proxy **always**
+  converts the system role to user: `_CHANGE_SYSTEM_TO_USER` is a hardcoded
+  `True` constant (not a knob — the conversion must always happen since the
+  upstream never honors a system prompt) — see [`proxy.md`](proxy.md).
 - **No network access.** The upstream LLM cannot web-search. All web
   access must happen agent-side (e.g. opencode's own fetch tooling), not
   by asking the model.

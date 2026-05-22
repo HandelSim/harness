@@ -265,9 +265,9 @@ for scheme in "${SCHEMES[@]}"; do
         user_front)
             # P013: request appears in last user message wrapped in
             # markers, BEFORE the tool list. System role intact (the
-            # PROXY_CHANGE_SYSTEM_PROMPT_TO_USER default is on, but the
-            # incoming request has NO system message, so no conversion
-            # fires; just verify keys + last-user-message structure).
+            # system→user conversion is always on, but the incoming request
+            # has NO system message, so no conversion fires; just verify
+            # keys + last-user-message structure).
             assert_forwarded "${scheme}/text/forwarded" "${forwarded}" '
 import json, sys
 body = json.loads(sys.stdin.read())

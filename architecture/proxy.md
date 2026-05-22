@@ -72,12 +72,21 @@ The upstream doesn't natively support tool calls, so the proxy injects a
 scaffold that tells the model to emit ```json blocks of the form
 `{"name": "...", "arguments": {...}}`. Two cooperative modes live as
 separate `build_cooperative_prompt_*` functions, plus one bypass mode.
-The validator in `_setup_prompt_mode` accepts:
 
-- **`user_front`** (default) — full scaffolding on the last user message,
+`PROXY_PROMPT_MODE` is **not a user `.env` knob**. The proxy defaults to
+`hybrid` and `docker-compose.yml` no longer interpolates the var (so a stale
+`.env` can't silently override the default). It is still honored from the
+proxy's *container* env so all three modes stay reachable for benchmarking and
+power use: `harness start/restart --prompt-mode <mode>` injects it ephemerally
+via the runtime override (see [`harness-cli.md`](harness-cli.md)), and the
+benchmark stack supplies it through its own compose overrides / the same flag
+(see [`tests.md`](../tests/INVENTORY.md) and `tests/benchmarks/`). The
+validator in `_setup_prompt_mode` accepts:
+
+- **`user_front`** — full scaffolding on the last user message,
   request placed BEFORE the tool list. Avoids burying a ~10–15K-token tool
   schema between the model and the user's actual question.
-- **`hybrid`** — full tool definitions appended to the system message
+- **`hybrid`** (default) — full tool definitions appended to the system message
   (which `_CHANGE_SYSTEM_TO_USER` then folds into the user-role message at
   index 0, the "stable prefix" position). A short recency reminder is
   prepended to the last user message, organised as four labelled lines —
@@ -116,14 +125,16 @@ The validator in `_setup_prompt_mode` accepts:
   non-ollama upstreams, so this mode often results in the model not using
   tools at all; that mismatch IS the data point.
 
-Invalid values fall back to `user_front` with a warning. Three older modes
-(`user`, `system`, `user_bookend`) were removed in the hybrid-consolidation
-refactor (issue #64): `user` was dominated by `user_front` (burying the
-request after tool schemas), `system` had no recency anchor and degraded on
-long conversations, and `user_bookend` anchored the user's request rather
-than tool attention — request primacy isn't the failure mode in an agent
-loop where the live request already sits at `messages[-1]`. Any of those
-names supplied via env now falls back to `user_front`.
+Invalid or absent values fall back to `hybrid` with a warning — including the
+legacy `user_front`/`user` value a stale `.env` might still carry, since the
+var is no longer fed to the proxy from `.env`. Three older modes (`user`,
+`system`, `user_bookend`) were removed in the hybrid-consolidation refactor
+(issue #64): `user` was dominated by `user_front` (burying the request after
+tool schemas), `system` had no recency anchor and degraded on long
+conversations, and `user_bookend` anchored the user's request rather than tool
+attention — request primacy isn't the failure mode in an agent loop where the
+live request already sits at `messages[-1]`. Any unrecognised value now falls
+back to `hybrid`.
 
 ## Tool-result delimiting
 
@@ -188,19 +199,20 @@ tokens/turn with the labelled lines + Environment context; hybrid's
 lighter-than-user_front recency profile is preserved.
 
 - **`<<<BEGIN_TOOL_DETAIL name="…">>>`** — recency-only (it lives in the
-  reminder, not at the stable prefix). For each tool named in
-  `PROXY_HYBRID_DETAIL_TOOLS` (default `task,skill`) that is present in the
-  toolset, the reminder appends the tool's description in its own block. The
-  pointer-back above is too weak for tools whose valid argument *values* are an
-  unguessable closed set that opencode documents only as prose in the
-  description — `task`'s `subagent_type` agent names and `skill`'s skill names
-  (neither is a JSON-Schema `enum`). The signature list carries only keys, so
-  those values have to reach recency. The block sits after the reminder and
-  OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap (proxy stage-direction).
-  `_extract_tool_details` reads the raw `tools` array's `description` field — no
-  `tools_text` fallback. Empty `PROXY_HYBRID_DETAIL_TOOLS` disables the blocks;
-  tools with an empty description, or flagged tools absent from the toolset, are
-  skipped.
+  reminder, not at the stable prefix). For each tool in the project-managed
+  `_HYBRID_DETAIL_TOOLS` constant (`["task", "skill"]`) that is present in the
+  toolset, the reminder appends the tool's description in its own block. This is
+  a code constant, not an env var — the closed set is tied to the opencode tools
+  we ship for, so there is nothing for a user to tune. The pointer-back above is
+  too weak for tools whose valid argument *values* are an unguessable closed set
+  that opencode documents only as prose in the description — `task`'s
+  `subagent_type` agent names and `skill`'s skill names (neither is a JSON-Schema
+  `enum`). The signature list carries only keys, so those values have to reach
+  recency. The block sits after the reminder and OUTSIDE the
+  `<<<BEGIN_USER_MESSAGE>>>` wrap (proxy stage-direction). `_extract_tool_details`
+  reads the raw `tools` array's `description` field — no `tools_text` fallback.
+  Tools with an empty description, or constant-listed tools absent from the
+  toolset, are skipped.
 
   **`task` is pared, not verbatim.** opencode builds the `task` description as
   static boilerplate ("when to use Task", usage notes) followed by the dynamic
@@ -302,12 +314,16 @@ in `main()` enforces the three REQUIRED values are non-empty and `PROXY_API_URL`
 parses; the process exits with a clear message if not. `_redact_key` is used in
 startup logging so logs show something like `sk-abc...xyz`.
 
-`_setup_prompt_mode`, `_setup_change_system_to_user`, and
-`_setup_hybrid_detail_tools` read their env vars from the same `main()`
-startup path and stash the resolved values as module globals.
-`PROXY_HYBRID_DETAIL_TOOLS` (comma-separated, default `task,skill`, empty to
-disable) names the hybrid "detail tools" — see [Hybrid
-delimiters](#hybrid-delimiters).
+`_setup_prompt_mode` runs from `main()` and resolves `PROXY_PROMPT_MODE` (read
+from the *container* env — see [Cooperative-prompt
+modes](#cooperative-prompt-modes-proxy_prompt_mode); absent on a normal launch,
+so it lands on the `hybrid` default) into a module global. The
+system→user conversion (`_CHANGE_SYSTEM_TO_USER`) and the hybrid "detail tools"
+(`_HYBRID_DETAIL_TOOLS`, `["task", "skill"]`) are project-managed code
+constants, not env reads: the upstream takes no system prompt (so the
+conversion always runs — see [`upstream-api.md`](upstream-api.md)) and the
+detail-tools set is tied to the opencode tools we ship for. There are no longer
+`_setup_change_system_to_user` / `_setup_hybrid_detail_tools` functions.
 
 ## Debug dumps
 

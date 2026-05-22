@@ -125,7 +125,7 @@ instance on the same daemon.
 ## Runtime override (`write_runtime_override`)
 
 `state/.harness-runtime.yml` is regenerated on every compose invocation
-and never tracked. It carries two things:
+and never tracked. It carries three things:
 
 1. **`PUBLISH_OLLAMA_PORT`** — when set in `.env`, exposes ollama on the
    host. Default is internal-only.
@@ -134,13 +134,24 @@ and never tracked. It carries two things:
    `environment: HARNESS_FIREWALL_DISABLED: "1"` block is emitted. The
    firewall init script short-circuits on that variable. We never replace
    the service's entrypoint or remove its `cap_add`.
+3. **Ephemeral `--prompt-mode`** — `harness start/restart --prompt-mode
+   <mode>` (`_parse_prompt_mode_flag` validates `hybrid`/`user_front`/
+   `passthrough`) sets the `prompt_mode_override` global, which adds
+   `environment: PROXY_PROMPT_MODE: "<mode>"` onto the proxy service. This is
+   the only path that sets `PROXY_PROMPT_MODE` for the proxy now that
+   `docker-compose.yml` no longer interpolates it (a stale `.env` value is
+   inert). It is **not persisted** — a later bare `start`/`restart` regenerates
+   the file without it, reverting the proxy to its built-in `hybrid` default.
+   When the proxy *also* has a firewall opt-out (2), the prompt mode is folded
+   into that same `proxy:` block rather than emitted as a second mapping
+   (duplicate top-level service keys are invalid compose YAML).
 
 The `agent` pseudo-service is filtered out: agent containers are launched
 by direct `docker run` from `run_agent` (opencode) / `cmd_shell`,
 not by compose. The agent launch path reads `.harness-net-overrides.json`
 directly.
 
-If both sources are empty, the file is deleted rather than written empty
+If all three sources are empty, the file is deleted rather than written empty
 so compose doesn't see a phantom services block.
 
 ## Agent launch path

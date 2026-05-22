@@ -1641,13 +1641,15 @@ class TestToolResultDelimiting(unittest.TestCase):
 
 
 class TestChangeSystemToUser(unittest.TestCase):
-    """Tests for PROXY_CHANGE_SYSTEM_PROMPT_TO_USER. The conversion runs
-    AFTER prompt-mode injection and rewrites the head-of-conversation
-    system message as a user message, with a stub assistant turn between
-    it and the actual first user message."""
+    """Tests for the system→user conversion (the `_CHANGE_SYSTEM_TO_USER`
+    constant, hardcoded True). The conversion runs AFTER prompt-mode injection
+    and rewrites the head-of-conversation system message as a user message,
+    with a stub assistant turn between it and the actual first user message.
+    The constant (rather than an inlined `True`) keeps the non-conversion path
+    testable; the env var that used to set it is gone."""
 
     def test_change_system_to_user_converts_system_to_user(self):
-        """When PROXY_CHANGE_SYSTEM_PROMPT_TO_USER=1 and a system message
+        """When `_CHANGE_SYSTEM_TO_USER` is True (always) and a system message
         is present, it gets converted to a user message with a stub
         assistant turn before the actual user message."""
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
@@ -1666,8 +1668,8 @@ class TestChangeSystemToUser(unittest.TestCase):
                 self.assertIn("Hello", result[2]["content"])
 
     def test_change_system_to_user_disabled_keeps_system(self):
-        """When PROXY_CHANGE_SYSTEM_PROMPT_TO_USER=0, system messages
-        pass through unchanged."""
+        """When `_CHANGE_SYSTEM_TO_USER` is False (the test-only non-conversion
+        path), system messages pass through unchanged."""
         with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", False):
             with patch.object(proxy, "_PROMPT_MODE", "user_front"):
                 messages = [

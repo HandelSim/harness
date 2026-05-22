@@ -95,7 +95,11 @@ Benchmarks are NOT regular tests; they're driven by `harness benchmark
 - `harness benchmark compare-schemes` — run the same task list across
   every scheme; for comparing prompt-injection schemes head-to-head.
   Schemes are one per honored proxy mode: `user_front`, `hybrid`,
-  `passthrough`.
+  `passthrough`. `PROXY_PROMPT_MODE` is no longer a `.env` knob (production
+  `docker-compose.yml` doesn't interpolate it), so each path injects the mode
+  itself: `scheme_contract_test.sh` and the mock benchmark stack add it onto
+  the proxy via their own compose overrides, and the Harbor adapter applies it
+  with `harness restart --prompt-mode <mode>` after install.
 
 See `tests/benchmarks/README.md` for the full reference: installation,
 docker socket caveat, smoketest-first guidance, adding a new scheme,
