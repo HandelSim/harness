@@ -255,8 +255,8 @@ non-green rows — the gap.
 | F125 | green  | tests/mcp_test.sh:485-497                   | T12: `mcp down test_mcp` single-target stop. | |
 | F126 | red    | —                                           | —                                                                                                     | No test invokes `harness mcp logs <name>` (would need extended setup). |
 | F127 | green  | tests/mcp_test.sh:396-411                   | T8: `harness mcp status` reports `state: installed-enabled` (then disabled in T9). | |
-| F128 | green  | tests/mcp_test.sh:352-392                   | T7 asserts the side-file lists the service, which requires `mcp_compose_files` to have returned the entry's compose.yml. | |
-| F129 | green  | tests/mcp_test.sh:352-392                   | T7 services list explicitly includes `test_mcp` (the service name parsed from compose.yml). | |
+| F128 | green  | tests/mcp_test.sh:353-368                   | T7 asserts the side-file lists the service, which requires `mcp_compose_files` to have returned the entry's compose.yml. | |
+| F129 | green  | tests/mcp_test.sh:353-368                   | T7 services list explicitly includes `test_mcp` (the service name parsed from compose.yml). | |
 | F130 | green  | tests/mcp_test.sh:396-411 + 485-497         | T8 expects `running`; T12 expects `stopped` after down. | |
 | F131 | green  | tests/harness_test.sh:1146-1190             | T19c sources wrapper, stubs `harness_docker` to print received args, runs `compose ps --sentinel-token-d19c`, asserts the captured args contain `--project-name harness-compose-args-test`. | |
 | F132 | red    | —                                           | —                                                                                                     | No test simulates Git Bash to exercise the `MSYS_NO_PATHCONV=1` branch. |
@@ -376,8 +376,8 @@ non-green rows — the gap.
 | M010 | red    | —                                           | —                                                                                                     | No test installs an MCP entry that has no `compose.yml` and asserts `mcp up` skips it. |
 | M011 | green  | tests/mcp_test.sh:445-523                   | T11-T13: `mcp up <disabled>` brings it up manually (overrides flag); `mcp down` stops regardless. | |
 | M012 | red    | —                                           | —                                                                                                     | No test asserts plain `harness start` does NOT bring up MCP services (compose profile gate). |
-| M013 | green  | tests/mcp_test.sh:352-392 + 415-441         | T7 side-file lists service when enabled; after T9 disable T17 verifies side-file is regenerated/removed. | |
-| M014 | green  | tests/mcp_test.sh:352-392                   | T7: services list parsed from compose.yml shows `test_mcp`. | |
+| M013 | green  | tests/mcp_test.sh:353-368 + 415-441         | T7 side-file lists service when enabled; after T9 disable T17 verifies side-file is regenerated/removed. | |
+| M014 | green  | tests/mcp_test.sh:353-368                   | T7: services list parsed from compose.yml shows `test_mcp`. | |
 | M015 | green  | tests/mcp_test.sh:396-411                   | T8: post-up `mcp status` shows `running`. | |
 | M016 | green  | tests/mcp_test.sh:485-497                   | T12: post-down `mcp status` shows `stopped`. | |
 | M017 | red    | —                                           | —                                                                                                     | No test deletes the container outright (without `mcp down`) to assert `not_created`. |
@@ -386,7 +386,7 @@ non-green rows — the gap.
 | M020 | green  | tests/integration_test.sh:253-456           | Phase 2 down/up cycle: serena index `data/` persists across container recreation. | |
 | M021 | green  | tests/integration_test.sh:253-456           | Phase 2: proxy reaches `tcp://serena:9121` (SSE port) inside the compose network. | |
 | M022 | green  | tests/integration_test.sh:253-456           | Phase 2: side-file contains `serena`, requiring the allowlist mount to have been merged. | |
-| M023 | green  | tests/mcp_test.sh:600-621 + 415-441         | T17 verifies side-file removed when no MCPs are enabled; T9 demonstrates regeneration on flag change. | |
+| M023 | green  | tests/mcp_test.sh:576-595 + 415-441         | T17 verifies side-file removed when no MCPs are enabled; T9 demonstrates regeneration on flag change. | |
 
 ## N — Network egress / firewall / allowlist / git creds / overrides (30 IDs)
 
@@ -471,7 +471,7 @@ non-green rows — the gap.
 | Pe008 | green  | tests/upgrade_test.sh:146-174 + mcp_test.sh:415-441 | T4 (DEALBREAKER): post-upgrade `jq '.enabled' harness-meta.json == false` preserved; T9 demonstrates disable state. | |
 | Pe009 | red    | —                                           | —                                                                                                     | No test asserts `state/mcp/serena/data/` survives a fake upgrade. (Integration test exercises serena but doesn't run an upgrade across it.) |
 | Pe010 | green  | tests/full_pipeline_test.sh:326-336         | T5 asserts if `state/.harness-runtime.yml` exists, it carries the `# Generated by harness; do not edit.` header — guarantees the file is the regenerated artifact, not a stale hand-written one. | |
-| Pe011 | green  | tests/mcp_test.sh:600-621                   | T17 re-triggers side-file write path. | |
+| Pe011 | green  | tests/mcp_test.sh:576-595                   | T17 re-triggers side-file write path. | |
 | Pe014 | green  | tests/persistence_test.sh:137-176           | T1 + T2: skel-seed once, user edits preserved on second run. | |
 | Pe015 | green  | tests/full_pipeline_test.sh:579-597         | T13 down: no state files deleted. | |
 | Pe016 | green  | tests/upgrade_test.sh:60-354                | All upgrade tests preserve user state files (asserted across T1, T4, T6). | |
