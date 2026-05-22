@@ -17,6 +17,14 @@
 # required.
 
 services:
+  # Re-inject the cooperative-prompt mode onto the proxy. Production
+  # docker-compose.yml no longer interpolates PROXY_PROMPT_MODE (removed so a
+  # stale user .env can't override the hybrid default), so the benchmark/mock
+  # stack supplies it here, interpolated from the .env(.mock) value the runner
+  # rewrites per scheme. Empty (var unset) leaves the proxy on its default.
+  proxy:
+    environment:
+      PROXY_PROMPT_MODE: ${PROXY_PROMPT_MODE:-}
   mock-api:
     build:
       context: ./tests/benchmarks/mock-api

@@ -37,10 +37,15 @@ container the adapter:
 1. Clones the harness repo (`HARNESS_GIT_REF`, default `dev`).
 2. Writes `.env` from runner-provided env vars
    (`PROXY_API_KEY`, `PROXY_API_URL`, `DEFAULT_MODEL_NAME`,
-   `PROXY_PROMPT_MODE`, `HARNESS_PROXY_SCHEME`).
+   `HARNESS_PROXY_SCHEME`).
 3. Runs `harness-install.sh`, which boots the docker compose stack
    (proxy + ollama + firewall + agent).
-4. For each task, invokes `harness <agent> -p "<instruction>"` headlessly
+4. If the scheme selected a `PROXY_PROMPT_MODE`, applies it with
+   `harness restart --prompt-mode <mode>`. `PROXY_PROMPT_MODE` is no longer
+   written to `.env` (the proxy defaults to `hybrid` and `docker-compose.yml`
+   doesn't interpolate the var); the ephemeral flag is now how a scheme other
+   than `hybrid` reaches the proxy.
+5. For each task, invokes `harness <agent> -p "<instruction>"` headlessly
    and captures stdout/stderr.
 
 ### Network model
@@ -341,13 +346,15 @@ tests/benchmarks/
    ```
 
 2. The runner's `bench_apply_scheme` reads the `env` map and exports
-   each key before invoking `harbor run`. The harness `.env` rendering
-   in `_common.py` then writes those into the per-task `.env`.
+   each key before invoking `harbor run`. `HARNESS_PROXY_SCHEME` is written
+   into the per-task `.env` by `_common.py`; `PROXY_PROMPT_MODE` is NOT — the
+   adapter applies it post-install via `harness restart --prompt-mode <mode>`
+   (the var is no longer a `.env` knob, see "Inside the per-task container").
 
 3. If the scheme requires a new `PROXY_PROMPT_MODE` value that
    `proxy/proxy.py` does not yet accept, file a proxy change first.
-   Without it, the proxy's startup validator falls back to `user_front`
-   and the scheme silently becomes a duplicate of `user_front`. The
+   Without it, the proxy's startup validator falls back to `hybrid`
+   and the scheme silently becomes a duplicate of `hybrid`. The
    currently-accepted modes (`user_front`, `hybrid`, `passthrough`) are
    listed in `architecture/proxy.md`.
 
@@ -380,7 +387,7 @@ benchmarks Harbor knows about are listed at
 
 These three are exactly the proxy's currently-honored `PROXY_PROMPT_MODE`
 values — one scheme per mode. Any other mode name falls back to
-`user_front` (see `architecture/proxy.md`).
+`hybrid`, the default (see `architecture/proxy.md`).
 
 The passthrough caveat to be aware of: ollama-format tool schemas typically
 aren't honored by non-ollama upstreams. Most A/B runs using passthrough

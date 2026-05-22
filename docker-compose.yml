@@ -100,9 +100,11 @@ services:
       # Users opt in by setting OUTPUT_DIR=/output in .env, then bind-mount
       # the host path of their choice via the volume below.
       OUTPUT_DIR: ${OUTPUT_DIR:-}
-      # Cooperative-prompt injection mode: user_front (default) / hybrid,
-      # plus the passthrough bypass. See .env.example for the full description.
-      PROXY_PROMPT_MODE: ${PROXY_PROMPT_MODE:-user_front}
+      # Cooperative-prompt injection mode is NOT set here on purpose. The proxy
+      # defaults to "hybrid" on its own; `harness start/restart --prompt-mode
+      # <mode>` injects PROXY_PROMPT_MODE for a benchmark/power launch via the
+      # runtime override. Interpolating it here would let a stale .env value
+      # silently override the default, which is exactly what we removed.
       # Host OS family (linux/macos/windows) the user runs harness from; the
       # harness CLI exports it via harness_detect_os. The proxy injects it into
       # the hybrid recency reminder so agents give host-appropriate,
