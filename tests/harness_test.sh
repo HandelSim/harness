@@ -1876,6 +1876,95 @@ if [[ "${t26_execs}" != "2" ]]; then
 fi
 echo "[harness-test] T26 OK"
 
+# --- Test 26pm: start/restart --prompt-mode flag (#91) ---------------------
+#
+# `harness start/restart --prompt-mode <mode>` is the ephemeral replacement
+# for the removed PROXY_PROMPT_MODE .env knob. It must (a) validate the mode
+# in _parse_prompt_mode_flag, and (b) inject PROXY_PROMPT_MODE onto the proxy
+# service via write_runtime_override — folded into a single proxy: block when
+# the proxy also has a firewall opt-out.
+echo "[harness-test] T26pm: --prompt-mode flag (#91)"
+
+# Case 1: _parse_prompt_mode_flag accepts both forms and rejects bad input.
+t26pm_parse=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    _parse_prompt_mode_flag --prompt-mode passthrough
+    echo "space=${prompt_mode_override}"
+    prompt_mode_override=""
+    _parse_prompt_mode_flag --prompt-mode=user_front
+    echo "equals=${prompt_mode_override}"
+)
+if ! grep -q 'space=passthrough' <<<"${t26pm_parse}"; then
+    echo "[harness-test] T26pm FAIL: '--prompt-mode passthrough' did not set the override" >&2
+    echo "${t26pm_parse}" >&2; exit 1
+fi
+if ! grep -q 'equals=user_front' <<<"${t26pm_parse}"; then
+    echo "[harness-test] T26pm FAIL: '--prompt-mode=user_front' did not set the override" >&2
+    echo "${t26pm_parse}" >&2; exit 1
+fi
+# Invalid mode and unknown option must both abort non-zero.
+t26pm_bad_rc=0
+( HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+  _parse_prompt_mode_flag --prompt-mode bogus ) >/dev/null 2>&1 || t26pm_bad_rc=$?
+if (( t26pm_bad_rc == 0 )); then
+    echo "[harness-test] T26pm FAIL: invalid --prompt-mode value was accepted" >&2; exit 1
+fi
+t26pm_unknown_rc=0
+( HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+  _parse_prompt_mode_flag --frobnicate ) >/dev/null 2>&1 || t26pm_unknown_rc=$?
+if (( t26pm_unknown_rc == 0 )); then
+    echo "[harness-test] T26pm FAIL: unknown start/restart option was accepted" >&2; exit 1
+fi
+
+# Case 2: write_runtime_override emits a standalone proxy block when only the
+# prompt-mode override is set (no firewall opt-out, no published ollama port).
+t26pm_ov="${TEST_ROOT}/t26pm-standalone.yml"
+(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    runtime_override="${t26pm_ov}"
+    net_overrides_path="${TEST_ROOT}/t26pm-absent-net-overrides.json"  # does not exist
+    PUBLISH_OLLAMA_PORT=""
+    prompt_mode_override="user_front"
+    write_runtime_override
+)
+if ! grep -q 'PROXY_PROMPT_MODE: "user_front"' "${t26pm_ov}" 2>/dev/null; then
+    echo "[harness-test] T26pm FAIL: standalone override missing PROXY_PROMPT_MODE" >&2
+    cat "${t26pm_ov}" >&2 2>/dev/null || true; exit 1
+fi
+if ! grep -qE '^  proxy:' "${t26pm_ov}"; then
+    echo "[harness-test] T26pm FAIL: standalone override missing a proxy: service block" >&2
+    cat "${t26pm_ov}" >&2; exit 1
+fi
+
+# Case 3: when the proxy ALSO has a firewall opt-out, the prompt mode folds
+# into the SAME proxy: block (one mapping, both env entries).
+t26pm_fold="${TEST_ROOT}/t26pm-fold.yml"
+(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    runtime_override="${t26pm_fold}"
+    net_overrides_path="${TEST_ROOT}/t26pm-net-overrides.json"
+    printf '%s\n' '{"services":{"proxy":{"firewall_disabled":true}}}' >"$net_overrides_path"
+    harness_jq() { echo "proxy"; }   # stand in for the jq query → service list
+    PUBLISH_OLLAMA_PORT=""
+    prompt_mode_override="hybrid"
+    write_runtime_override
+)
+fold_proxy_count=$(grep -cE '^  proxy:' "${t26pm_fold}" || true)
+if [[ "${fold_proxy_count}" != "1" ]]; then
+    echo "[harness-test] T26pm FAIL: expected exactly one proxy: block, got ${fold_proxy_count}" >&2
+    cat "${t26pm_fold}" >&2; exit 1
+fi
+if ! grep -q 'HARNESS_FIREWALL_DISABLED: "1"' "${t26pm_fold}"; then
+    echo "[harness-test] T26pm FAIL: folded block missing the firewall opt-out entry" >&2
+    cat "${t26pm_fold}" >&2; exit 1
+fi
+if ! grep -q 'PROXY_PROMPT_MODE: "hybrid"' "${t26pm_fold}"; then
+    echo "[harness-test] T26pm FAIL: folded block missing PROXY_PROMPT_MODE" >&2
+    cat "${t26pm_fold}" >&2; exit 1
+fi
+rm -f "${t26pm_ov}" "${t26pm_fold}" "${TEST_ROOT}/t26pm-net-overrides.json"
+echo "[harness-test] T26pm OK"
+
 # --- Test 27: _reap_jq_sidecar tears down only when a sidecar exists (#8) --
 #
 # _reap_jq_sidecar runs from the EXIT trap on every harness invocation,
