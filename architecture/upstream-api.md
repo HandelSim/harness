@@ -154,6 +154,16 @@ key-lock behavior — a locked key returns the `401` + `unlock_url` shape above.
 | `500` | Internal Server Error — server error |
 | `502` | Bad Gateway — upstream LLM backend failure |
 
+A `401`/`403` carries an `error.type` that distinguishes *why* it failed, and
+the harness auth probe keys off it (see [`harness-cli.md`](harness-cli.md) →
+auth/model probes): `unauthorized` (or any non-`invalid_request` type, or no
+type) means the **key** was rejected — e.g. a mis-pasted key produced
+`{"error":{"type":"unauthorized","message":"Invalid token: ... Invalid symbol
+47, offset 0."}}` (a leading `/` in the key), and the probe aborts the launch
+(#108). `invalid_request` means the **request** was malformed but the key is
+valid (e.g. a bad model id) — the probe warns and continues (#43). A locked key
+is the `unauthorized` + `unlock_url` shape above and aborts with the unlock URL.
+
 ## Self-reported internals (unverified)
 
 Distilled from probing the API with direct questions in fresh chats.

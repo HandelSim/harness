@@ -44,8 +44,14 @@ by default.
 `PROXY_API_URL` is a **base**; `_api_base` normalizes it (stripping a trailing
 `/v1/chat/completions`, `/chat/completions`, or `/v1`), mirroring proxy.py's
 `_normalize_api_base` — keep the two in sync. `_probe_upstream_auth` POSTs to
-`{base}/v1/chat/completions` to convert a locked-key `401` into a clickable
-unlock URL before the stack starts. `_print_upstream_models` then GETs
+`{base}/v1/chat/completions` before the stack starts and **gates the launch**:
+a locked key (`401`/`403` with an unlock URL in the body) aborts and prints the
+clickable unlock URL; a `401`/`403` with **no** unlock URL also aborts as a
+rejected key (#108) **unless** the upstream's `error.type` is in the
+`invalid_request` family — the one "key is fine, the probe request was bad"
+case (#43, `_auth_probe_type_is_request_error`) that warns-and-continues. An
+empty/unknown type on a `401`/`403` aborts. Aborting here is what stops a bad
+key from reaching ollama, where no models would register. `_print_upstream_models` then GETs
 `{base}/v1/models` (best-effort): on success it prints the catalog, on a locked
 key it shows the unlock URL and aborts, and on an unreachable upstream (e.g.
 tests pointing at an in-network mock the host can't reach) it stays quiet and

@@ -924,26 +924,28 @@ warn_if_firewall_open() {
 
 # Probe the upstream API to verify the key is valid and unlocked. Returns:
 #   0 — key works, proceed
-#   1 — upstream returned 401/403 AND an unlock URL was recovered from the
-#       response body; printed prominently. The user must visit the URL
-#       before the agent can launch.
-#   2 — upstream unhealthy or returned a non-actionable error (5xx, 429,
-#       network failure, OR a 401/403 with no unlock URL we can show the
-#       user). Warn but allow proceed; the proxy will surface the real
-#       error on the first agent request if auth really is broken.
+#   1 — auth failed; the launch must abort. Two sub-cases, both print a
+#       prominent banner: a LOCKED key (401/403 carrying a recoverable unlock
+#       URL, shown so the user can re-enable it), or a REJECTED key (401/403
+#       with no unlock URL and no "key-is-fine" error type — #108). The agent
+#       cannot launch until the key is fixed/unlocked.
+#   2 — upstream unhealthy or returned a non-actionable, key-is-fine error
+#       (5xx, 429, network failure, OR a 401/403 whose error.type is in the
+#       invalid_request family — #43: the probe request was malformed but the
+#       key itself is valid). Warn but allow proceed.
 #
-# Why the rc=1 path is so narrow: the probe exists to convert a locked-key
-# 401 into a clickable URL. The unlock URL requires an authenticated
-# browser session — the proxy's GET returns 200 but doesn't change
-# server-side state. So the probe's only useful output is the URL itself;
-# everything else is just guessing about an opaque upstream response. If
-# we can't deliver a URL, we get out of the way and let the proxy report
-# whatever it sees.
+# Why a no-unlock-URL 401/403 aborts by default (#108): a rejected key
+# otherwise warned-and-continued, dropping the user into an agent with NO
+# models registered and nothing working. A 401 means "Unauthorized" — stop —
+# UNLESS the upstream positively says the *request* (not the key) was
+# malformed via an invalid_request-family error.type (#43), the one case still
+# allowed to warn-and-continue. An empty/unknown type on a 401/403 is treated
+# as auth failure. HARNESS_SKIP_AUTH_PROBE=1 bypasses the probe entirely.
 #
 # Why we always dump the response body on a 401/403: providers vary in
-# how they shape error responses, and an unlock_url under an unexpected
-# JSON path is unhelpfully invisible. Printing the raw body means the
-# user can always see what came back, even if our field extraction
+# how they shape error responses, and an unlock_url (or error type) under an
+# unexpected JSON path is unhelpfully invisible. Printing the raw body means
+# the user can always see what came back, even if our field extraction
 # missed something.
 # Normalize PROXY_API_URL to a scheme://host[/prefix] base, mirroring
 # proxy.py's _normalize_api_base. PROXY_API_URL is a base; the chat endpoint is
@@ -961,6 +963,20 @@ _api_base() {
     base="${base%/v1}"
     base="${base%/}"
     printf '%s' "$base"
+}
+
+# Decide whether a 401/403 with no unlock URL is the #43 "key is fine, the probe
+# request was bad" case (warn and continue) rather than the #108 "rejected key"
+# case (abort). Only an upstream error.type in the invalid_request family
+# qualifies; an empty or unrecognized type falls through to abort. The allowlist
+# is deliberately tight — calibrated on the only key-is-fine type observed.
+_auth_probe_type_is_request_error() {
+    local t
+    t=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+    case "$t" in
+        invalid_request*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 _probe_upstream_auth() {
@@ -1060,23 +1076,47 @@ _probe_upstream_auth() {
                 return 1
             fi
 
-            # 401/403 with no recoverable unlock URL — not the locked-key
-            # signature this probe gates on. Warn loudly, dump everything,
-            # and let the launch continue. The proxy will surface the real
-            # error on the first agent request if auth genuinely is broken.
+            # No unlock URL recovered. #43 carve-out: if the upstream says the
+            # probe *request* was malformed (invalid_request-family type), the
+            # key is fine — warn and continue. Anything else on a 401/403 is a
+            # rejected key; abort so the proxy/ollama never start with a key that
+            # can't register models.
+            if _auth_probe_type_is_request_error "$err_type"; then
+                echo "" >&2
+                echo "[harness] WARN: upstream returned $status_code on the auth probe, but the" >&2
+                echo "[harness]       error type ($err_type) says the probe REQUEST—not the API" >&2
+                echo "[harness]       key—was rejected, so the launch will continue." >&2
+                [[ -n "$err_message" ]] && echo "[harness]       upstream message:    $err_message" >&2
+                echo "[harness]       Full upstream response body:" >&2
+                printf '%s\n' "$body" | sed 's/^/[harness]         /' >&2
+                echo "[harness]       To bypass this probe entirely, set HARNESS_SKIP_AUTH_PROBE=1." >&2
+                echo "" >&2
+                return 2
+            fi
+
+            # Rejected key (#108): a 401/403 with no unlock URL and no
+            # key-is-fine error type. Abort with an actionable banner instead of
+            # warning and dropping the user into an agent with no models.
             echo "" >&2
-            echo "[harness] WARN: upstream returned $status_code on the auth probe, but no" >&2
-            echo "[harness]       unlock URL was found in the response body. This is not" >&2
-            echo "[harness]       the locked-key signature the probe gates on, so the" >&2
-            echo "[harness]       launch will continue and the proxy will surface the" >&2
-            echo "[harness]       real error on the first agent request if auth is broken." >&2
-            [[ -n "$err_type" ]]    && echo "[harness]       upstream error type: $err_type" >&2
-            [[ -n "$err_message" ]] && echo "[harness]       upstream message:    $err_message" >&2
-            echo "[harness]       Full upstream response body:" >&2
-            printf '%s\n' "$body" | sed 's/^/[harness]         /' >&2
-            echo "[harness]       To bypass this probe entirely, set HARNESS_SKIP_AUTH_PROBE=1." >&2
+            echo "================================================================" >&2
+            echo " ERROR: Upstream rejected the API key (HTTP $status_code)" >&2
+            echo "================================================================" >&2
+            [[ -n "$err_type" ]]    && echo " upstream error type: $err_type" >&2
+            [[ -n "$err_message" ]] && echo " upstream message:    $err_message" >&2
             echo "" >&2
-            return 2
+            echo " This usually means PROXY_API_KEY in your .env is wrong:" >&2
+            echo "   - a stray character (e.g. a leading '/') or surrounding quotes" >&2
+            echo "   - a truncated or mis-pasted key, or an expired key" >&2
+            echo " A valid key is a JWT and starts with 'eyJ'. Run 'harness doctor'" >&2
+            echo " to see it as <first4>...<last4>." >&2
+            echo "" >&2
+            echo " Full upstream response body:" >&2
+            printf '%s\n' "$body" | sed 's/^/   /' >&2
+            echo "" >&2
+            echo " To bypass this probe, set HARNESS_SKIP_AUTH_PROBE=1." >&2
+            echo "================================================================" >&2
+            echo "" >&2
+            return 1
             ;;
         429)
             echo "[harness] WARN: upstream rate-limited (429); starting anyway" >&2

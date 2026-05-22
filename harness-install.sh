@@ -400,6 +400,40 @@ case "${path_ans:-}" in
     *) want_path=1 ;;
 esac
 
+# Read a secret with each character echoed as '*' (not hidden entirely). Sets
+# the global REPLY_SECRET. The point is diagnostic: the user sees the LENGTH and
+# shape of what was pasted, so a wrong clipboard (a URL, a blank paste) is
+# obvious from the count of stars, while the value itself stays off-screen.
+# Backspace works (DEL 0x7f and BS 0x08). Char-by-char masking needs a real tty;
+# when stdin isn't one (piped/non-interactive install) we fall back to a plain
+# hidden read, matching the previous behavior. This must be the LAST interactive
+# stdin read in the installer, so a multi-line clipboard that stops at the first
+# newline can't bleed into a later prompt.
+_read_secret_masked() {
+    local prompt="$1"
+    REPLY_SECRET=""
+    printf '%s' "$prompt" >&2
+    if [[ ! -t 0 ]]; then
+        read -rs REPLY_SECRET
+        printf '\n' >&2
+        return 0
+    fi
+    local ch
+    while IFS= read -rsn1 ch; do
+        [[ -z "$ch" ]] && break                          # Enter ends input
+        if [[ "$ch" == $'\x7f' || "$ch" == $'\x08' ]]; then   # DEL / Backspace
+            if [[ -n "$REPLY_SECRET" ]]; then
+                REPLY_SECRET="${REPLY_SECRET%?}"
+                printf '\b \b' >&2
+            fi
+            continue
+        fi
+        REPLY_SECRET+="$ch"
+        printf '*' >&2
+    done
+    printf '\n' >&2
+}
+
 # Upstream API key. The proxy needs a per-user key (PROXY_API_KEY in .env)
 # that we can't ship — every user brings their own. Offer to capture it now
 # so the user doesn't have to hand-edit .env afterward. Declining is fine;
@@ -414,10 +448,10 @@ read -rp "enter an upstream API key now? [y/n]: " key_ans
 case "${key_ans:-}" in
     y|Y|yes|YES)
         want_api_key=1
-        # -s hides the key from the terminal; the trailing echo restores the
-        # newline that -s swallows so subsequent output isn't glued on.
-        read -rsp "paste API key (input hidden): " api_key_value
-        echo
+        # Echo each char as '*' so a wrong/blank paste is visible by length
+        # without revealing the key. Falls back to a hidden read off a tty.
+        _read_secret_masked "paste API key (each char shown as *): "
+        api_key_value="$REPLY_SECRET"
         ;;
     *)
         echo "  skipping; remember to set PROXY_API_KEY in .env manually."

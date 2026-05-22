@@ -221,12 +221,14 @@ echo "[harness-test] T0 OK"
 
 # --- Test 0.4: _probe_upstream_auth response parsing ------------------------
 #
-# Regression for #43: the 401/403 branch over-fired (rc=1 on every 401, not
-# just locked-key 401s) and threw away the upstream response body, so a
-# transient non-lock 401 hard-failed every agent launch and gave the user
-# no diagnostic information. Fix scopes rc=1 to "unlock URL was actually
-# recovered" and softens other 401/403 to rc=2 (warn-and-proceed) with the
-# full upstream body dumped.
+# Regression for #43 and #108. #43: the 401/403 branch over-fired (rc=1 on
+# every 401) and threw away the upstream body, so a transient non-lock 401
+# hard-failed every launch. #108: the over-correction then warned-and-continued
+# on a genuinely rejected key, dropping the user into an agent with no models.
+# Current contract for a 401/403 with no unlock URL: abort (rc=1) UNLESS the
+# upstream error.type is in the invalid_request family (#43 — key is fine, the
+# probe request was bad), which warns-and-proceeds (rc=2). A locked key (unlock
+# URL present) still aborts (rc=1) with the unlock banner.
 #
 # These cases stub `curl` in a subshell so we can drive the parsing logic
 # with deterministic fixtures and assert on (rc, stderr contents).
@@ -280,16 +282,32 @@ probe_case "401 locked-key → rc=1 with URL + message + type" "401" "$LOCKED_BO
     "unauthorized" \
     "Full upstream response body:"
 
-# 401 with no unlock URL → rc=2 (warn-and-proceed), output dumps body and
-# mentions the bypass env var. This is the #43 regression case: previously
-# this returned rc=1 and blocked every agent launch.
+# 401 with no unlock URL but an invalid_request-family type → rc=2
+# (warn-and-proceed): the key is fine, the probe request was bad (#43).
 NOLOCK_BODY='{"error":{"type":"invalid_request","message":"bad model name"}}'
-probe_case "401 no-URL → rc=2 (warn, do not block)" "401" "$NOLOCK_BODY" "2" \
+probe_case "401 invalid_request (key-is-fine) → rc=2 (warn, do not block)" "401" "$NOLOCK_BODY" "2" \
     "WARN: upstream returned 401" \
-    "no" \
-    "unlock URL was found" \
-    "bad model name" \
     "invalid_request" \
+    "bad model name" \
+    "HARNESS_SKIP_AUTH_PROBE=1"
+
+# 401 with an auth-typed error and no unlock URL → rc=1 (abort). #108: a
+# rejected key must stop the launch so the user fixes PROXY_API_KEY instead of
+# landing in an agent with no models registered. Body mirrors the real #108
+# report (a key with a leading '/').
+REJECTED_BODY='{"error":{"type":"unauthorized","message":"Invalid token: Invalid header: Base64 error: Invalid symbol 47, offset 0."}}'
+probe_case "401 unauthorized no-URL → rc=1 (abort)" "401" "$REJECTED_BODY" "1" \
+    "ERROR: Upstream rejected the API key" \
+    "unauthorized" \
+    "Invalid symbol 47" \
+    "Full upstream response body:" \
+    "HARNESS_SKIP_AUTH_PROBE=1"
+
+# 401 with no error type at all → rc=1 (abort). A bare/unknown-typed 401 is
+# Unauthorized by HTTP semantics, so it must stop the launch (#108).
+BARE_401_BODY='{"error":{"message":"Unauthorized"}}'
+probe_case "401 empty-type no-URL → rc=1 (abort)" "401" "$BARE_401_BODY" "1" \
+    "ERROR: Upstream rejected the API key" \
     "HARNESS_SKIP_AUTH_PROBE=1"
 
 # Top-level unlock_url (alt provider shape) also triggers the rc=1 path.
