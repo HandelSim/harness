@@ -185,21 +185,6 @@ harness_call() {
         "${FAKE_INSTALL_ROOT}/harness/harness" "$@"
 }
 
-# Like harness_call but time-bounded (first arg = seconds). Used for the
-# agent-launch path: with the agent image absent, run_agent builds it on
-# demand (minutes) and then launches, which would otherwise run to the CI
-# job cap. The side effect under test here — the MCP side file — is written
-# by write_agent_mcp_config *before* the image check, so a short cap is
-# enough to observe it without waiting on the build/launch.
-harness_call_capped() {
-    local secs="$1"; shift
-    timeout -k 5 "${secs}" env \
-        HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
-        HARNESS_INSTALL_ROOT="${FAKE_INSTALL_ROOT}" \
-        HARNESS_REGISTRY_DIR="${FAKE_REGISTRY}" \
-        "${FAKE_INSTALL_ROOT}/harness/harness" "$@"
-}
-
 # Defensive: clear any stragglers from a prior run.
 harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
@@ -345,48 +330,25 @@ echo "[mcp] T6 OK"
 
 # --- T7: agent client config gets the merged entry -------------------------
 #
-# We don't launch a real agent here (image may not be built). Instead we
-# call the same code path harness uses internally: mkdir agent dir,
-# trigger the merge by running `harness opencode` against an unbuilt image
-# — the script writes the side file BEFORE checking image existence.
-# Actually: the script writes the side file AFTER the image-existence
-# check passes... let me re-examine. (See the harness script: order is
-# image check, then write_agent_mcp_config in run_agent.)
-#
-# Easier: invoke a no-op subcommand that hits ensure_dirs +
-# write_agent_mcp_config. There isn't one, so we synthesize the work by
-# stashing a real agent image first. Skip this if no image is present —
-# the integration check happens in full_pipeline_test.sh.
-#
-# Simpler approach: directly test the side-effect on the host. Once
-# enabled, we run a harness invocation that triggers the merge. Use
-# `harness opencode -p` against an unbuilt image: the script enters
-# run_agent, calls write_agent_mcp_config, then errors on the image.
-
+# The MCP side file is produced by write_agent_mcp_config, which run_agent
+# calls *before* the on-demand image build (write_agent_mcp_config precedes
+# run_agent's `image inspect` / `compose build agent` block). Observing it
+# via `harness opencode` would auto-build the multi-GB agent image — a build
+# that never even touches the file. So we call write_agent_mcp_config
+# directly: source harness with HARNESS_SOURCE_ONLY=1 (its documented test
+# seam — main is skipped) inside a subshell so its helpers don't leak into
+# this script, with the same env the real launch resolves paths from.
+# The real launch ordering is covered separately by full_pipeline_test.sh.
 echo "[mcp] T7: merged client config side file"
-mkdir -p "${FAKE_INSTALL_ROOT}/state/agent/home"
-# Stash any real agent image so we can deterministically hit the
-# image-not-found path.
-stash_tag=""
-if harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
-    stash_tag="harness-agent:mcp-test-stash-$$"
-    harness_docker tag harness-agent:latest "${stash_tag}" >/dev/null
-    harness_docker rmi harness-agent:latest >/dev/null 2>&1 || true
-fi
-restore_image() {
-    if [[ -n "${stash_tag}" ]]; then
-        harness_docker tag "${stash_tag}" harness-agent:latest >/dev/null 2>&1 || true
-        harness_docker rmi "${stash_tag}" >/dev/null 2>&1 || true
-        stash_tag=""
-    fi
-}
-trap 'restore_image; cleanup' EXIT INT TERM
-
-set +e
-harness_call_capped 60 opencode -p "ignored" >/dev/null 2>&1
-set -e
-restore_image
-trap cleanup EXIT INT TERM
+(
+    export HARNESS_SOURCE_ONLY=1
+    export HARNESS_PROJECT_NAME="${PROJECT_NAME}"
+    export HARNESS_INSTALL_ROOT="${FAKE_INSTALL_ROOT}"
+    export HARNESS_REGISTRY_DIR="${FAKE_REGISTRY}"
+    # shellcheck disable=SC1091
+    source "${FAKE_INSTALL_ROOT}/harness/harness"
+    write_agent_mcp_config
+)
 
 side_file="${FAKE_INSTALL_ROOT}/state/agent/home/.harness-mcp-servers.json"
 if [[ ! -f "${side_file}" ]]; then
@@ -612,20 +574,18 @@ echo "[mcp] T16 OK"
 # --- T17: agent side file is cleaned on next launch ------------------------
 
 echo "[mcp] T17: side file disappears when no MCPs are active"
-# Re-trigger the side-file write path. Stash image + image-not-found
-# again, same trick as T7.
-stash_tag=""
-if harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
-    stash_tag="harness-agent:mcp-test-stash-$$"
-    harness_docker tag harness-agent:latest "${stash_tag}" >/dev/null
-    harness_docker rmi harness-agent:latest >/dev/null 2>&1 || true
-fi
-trap 'restore_image; cleanup' EXIT INT TERM
-set +e
-harness_call_capped 60 opencode -p "ignored" >/dev/null 2>&1
-set -e
-restore_image
-trap cleanup EXIT INT TERM
+# Re-run the side-file write path now that T16 has uninstalled _test_mcp:
+# with zero enabled entries, write_agent_mcp_config removes the stale side
+# file. Direct call via the source seam — same rationale as T7 (no build).
+(
+    export HARNESS_SOURCE_ONLY=1
+    export HARNESS_PROJECT_NAME="${PROJECT_NAME}"
+    export HARNESS_INSTALL_ROOT="${FAKE_INSTALL_ROOT}"
+    export HARNESS_REGISTRY_DIR="${FAKE_REGISTRY}"
+    # shellcheck disable=SC1091
+    source "${FAKE_INSTALL_ROOT}/harness/harness"
+    write_agent_mcp_config
+)
 
 if [[ -f "${side_file}" ]]; then
     echo "[mcp] T17 FAIL: stale side file should have been removed: ${side_file}" >&2
