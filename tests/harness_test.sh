@@ -2363,6 +2363,74 @@ cleanup_dg
 trap 'restore_agent_image; cleanup' EXIT INT TERM
 echo "[harness-test] T32 OK"
 
+# --- Test 33: interactive TTY resolution (#82) -----------------------------
+#
+# On Windows Git Bash, bash's `[[ -t 0 ]]` (an MSYS pty) and the native
+# docker.exe's isTerminal() (a real Windows console) disagree, so harness must
+# probe the runtime rather than trust bash, and may wrap the launch in winpty.
+# The decision lives in the pure (I/O-free) helper harness_tty_strategy so it
+# is testable without a real tty or daemon; the live resolver and the winpty
+# wrapper are exercised with stubs. The Windows branches can't actually run on
+# Linux CI (they're gated on harness_detect_os == windows), so we drive the
+# logic directly with explicit inputs.
+echo "[harness-test] T33: interactive TTY resolution (#82)"
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/scripts/lib/platform.sh"
+
+# T33.1 — pure decision matrix. Each row: os tty rt_ok winpty -> expected.
+t33_check() {
+    local got exp="$5"
+    got=$(harness_tty_strategy "$1" "$2" "$3" "$4")
+    if [[ "${got}" != "${exp}" ]]; then
+        echo "[harness-test] T33.1 FAIL: tty_strategy($1,$2,$3,$4) = '${got}', want '${exp}'" >&2
+        exit 1
+    fi
+}
+t33_check linux   1 0 0 it          # linux tty → it (rt_ok/winpty irrelevant)
+t33_check linux   0 0 0 i           # linux no-tty → i
+t33_check macos   1 0 0 it          # macos tty → it
+t33_check windows 0 1 1 i           # windows, bash has no tty → i regardless
+t33_check windows 1 1 0 it          # windows, docker accepts -t → it
+t33_check windows 1 0 1 it-winpty   # windows, docker rejects -t, winpty present
+t33_check windows 1 0 0 i           # windows, docker rejects -t, no winpty → i
+
+# T33.2 — resolver reflects a non-tty stdin as `i` and stays silent (no
+# degraded note) because the pipe case is expected, not a Windows TTY split.
+# Force the Windows branch but feed non-tty stdin; the note must not appear.
+t33_res=$(
+    harness_detect_os() { printf windows; }
+    harness_runtime_tty_ok() { return 0; }   # must not be consulted (no tty)
+    harness_winpty_available() { return 0; }
+    harness_resolve_interactive_tty fake-image 2>/dev/null </dev/null
+)
+if [[ "${t33_res}" != "i" ]]; then
+    echo "[harness-test] T33.2 FAIL: resolver with non-tty stdin = '${t33_res}', want 'i'" >&2
+    exit 1
+fi
+t33_note=$(
+    harness_detect_os() { printf windows; }
+    harness_runtime_tty_ok() { return 1; }
+    harness_winpty_available() { return 1; }
+    harness_resolve_interactive_tty fake-image 2>&1 </dev/null >/dev/null
+)
+if [[ -n "${t33_note}" ]]; then
+    echo "[harness-test] T33.2 FAIL: degraded note printed for a plain pipe: '${t33_note}'" >&2
+    exit 1
+fi
+
+# T33.3 — harness_docker_winpty routes the runtime call through winpty. Stub
+# the runtime name and shadow `winpty` with a recorder; assert ordering.
+t33_winpty=$(
+    harness_container_runtime() { printf 'FAKE_RT'; }
+    winpty() { printf 'WINPTY:'; printf ' %s' "$@"; printf '\n'; }
+    harness_docker_winpty run --rm --sentinel-t33 hello
+)
+if [[ "${t33_winpty}" != "WINPTY: FAKE_RT run --rm --sentinel-t33 hello" ]]; then
+    echo "[harness-test] T33.3 FAIL: winpty wrapper routing wrong: '${t33_winpty}'" >&2
+    exit 1
+fi
+echo "[harness-test] T33 OK"
+
 echo "============================================================"
 echo " HARNESS TEST PASSED"
 echo "============================================================"
