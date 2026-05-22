@@ -131,7 +131,7 @@ ensure_opencode_config() {
     mkdir -p "$config_dir"
 
     local default_model="${DEFAULT_MODEL_NAME:-}"
-    local provider_name="${OPENCODE_PROVIDER_NAME:-GenAI Harness}"
+    local provider_name="GenAI Harness"
     local ollama_url="http://ollama:11434/v1"
     local ctx="${OLLAMA_CONTEXT_LENGTH:-200000}"
 
@@ -170,9 +170,9 @@ ensure_opencode_config() {
         --argjson ctx "$ctx" \
         'map({key: ., value: {name: ., limit: {context: $ctx, output: 8192}}}) | from_entries')
 
-    # Always (re)write the harness-managed block — the model set or provider
-    # name may have changed between launches. Built with jq so the models map
-    # is dynamic and the strings are correctly escaped.
+    # Always (re)write the harness-managed block — the model set may have
+    # changed between launches. Built with jq so the models map is dynamic and
+    # the strings are correctly escaped.
     jq -n \
         --arg provider_name "$provider_name" \
         --arg ollama_url "$ollama_url" \
@@ -246,7 +246,7 @@ run_opencode() {
 
     echo "============================================================"
     echo " harness-agent (opencode)"
-    echo "   provider: ${OPENCODE_PROVIDER_NAME:-GenAI Harness}"
+    echo "   provider: GenAI Harness"
     echo "   model:    harness/${DEFAULT_MODEL_NAME:-default}"
     echo "   ollama:   http://ollama:11434/v1"
     echo "   yolo:     ${HARNESS_YOLO:-0}"

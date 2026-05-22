@@ -257,7 +257,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | A018 | `ensure_opencode_config` writes `~/.config/opencode/opencode.json` on every launch |
 | A019 | `ensure_opencode_config` configures a `harness` provider pointing at the local ollama endpoint |
 | A020 | `ensure_opencode_config` defines a `yolo` agent profile |
-| A035 | `ensure_opencode_config` sets the opencode provider display name from `OPENCODE_PROVIDER_NAME` (default `GenAI Harness`) |
+| A035 | `ensure_opencode_config` sets the opencode provider display name to the fixed string `GenAI Harness` |
 | A036 | `ensure_opencode_config` builds the opencode model list from ollama `/api/tags` (stub names minus `:latest`), always includes `DEFAULT_MODEL_NAME`, and selects `harness/${DEFAULT_MODEL_NAME}` |
 | A021 | `merge_opencode_mcp_servers` translates the canonical `mcpServers` JSON into opencode's mcp shape |
 | A022 | `merge_opencode_mcp_servers` distinguishes `local` (stdio) from `remote` (SSE/HTTP) entries |

@@ -105,13 +105,13 @@ After the drop, still in the entrypoint:
 
 - `ensure_opencode_config` writes `~/.config/opencode/opencode.json` with
   the harness provider block pointing at `http://ollama:11434/v1`. The
-  provider display name comes from `OPENCODE_PROVIDER_NAME` (default
-  `GenAI Harness`). The model dropdown is built from ollama `/api/tags` (each
+  provider display name is the fixed string `GenAI Harness`. The model
+  dropdown is built from ollama `/api/tags` (each
   stub name with its `:latest` tag stripped) so opencode lists exactly the
   models discovered at start; `DEFAULT_MODEL_NAME` is always included and is the
   default selection (`harness/<DEFAULT_MODEL_NAME>`). Built with `jq` and
-  re-written every launch because the model set or provider name may have
-  changed. Falls back to `DEFAULT_MODEL_NAME` alone if ollama isn't reachable.
+  re-written every launch because the model set may have changed. Falls back
+  to `DEFAULT_MODEL_NAME` alone if ollama isn't reachable.
 - `merge_opencode_mcp_servers` translates the canonical `{"mcpServers": {...}}`
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.

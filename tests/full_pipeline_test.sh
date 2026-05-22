@@ -539,10 +539,10 @@ grep -q '"harness"' "${opencode_cfg}" \
     || { echo "[pipeline] T9 FAIL: A018 opencode.json missing the harness provider block" >&2; cat "${opencode_cfg}" >&2; exit 1; }
 grep -q '"model": "harness/' "${opencode_cfg}" \
     || { echo "[pipeline] T9 FAIL: A018 opencode.json missing the harness model binding" >&2; cat "${opencode_cfg}" >&2; exit 1; }
-# #94 A035: the provider display name comes from OPENCODE_PROVIDER_NAME, which
-# defaults to "GenAI Harness" (the .env above doesn't set it).
+# #94 A035: the provider display name is the fixed string "GenAI Harness"
+# (hardcoded in the agent entrypoint; no longer user-configurable).
 grep -q '"name": "GenAI Harness"' "${opencode_cfg}" \
-    || { echo "[pipeline] T9 FAIL: A035 opencode.json provider name is not the OPENCODE_PROVIDER_NAME default 'GenAI Harness'" >&2; cat "${opencode_cfg}" >&2; exit 1; }
+    || { echo "[pipeline] T9 FAIL: A035 opencode.json provider name is not the fixed 'GenAI Harness'" >&2; cat "${opencode_cfg}" >&2; exit 1; }
 # #94 A036: the model dropdown is built from ollama /api/tags, which discovered
 # 'harness' via the proxy's /v1/models route — so a model entry named 'harness'
 # (distinct from the provider whose name is 'GenAI Harness') is registered.

@@ -39,10 +39,6 @@ launch. ollama discovers the upstream's full model list and registers a stub per
 model (always including this one); opencode selects `harness/${DEFAULT_MODEL_NAME}`
 by default.
 
-`OPENCODE_PROVIDER_NAME` (default `GenAI Harness`) is the opencode-only provider
-display name; the CLI threads it into the agent container via `agent_common_env`
-alongside `DEFAULT_MODEL_NAME`.
-
 ### Upstream URL base + auth/model probes
 
 `PROXY_API_URL` is a **base**; `_api_base` normalizes it (stripping a trailing

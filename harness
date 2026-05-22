@@ -2430,7 +2430,6 @@ agent_common_env() {
     printf -- '-e\nHOST_GID=%s\n' "$(id -g)"
     printf -- '-e\nHARNESS_YOLO=%s\n' "$yolo"
     printf -- '-e\nDEFAULT_MODEL_NAME=%s\n' "$agent_model"
-    printf -- '-e\nOPENCODE_PROVIDER_NAME=%s\n' "${OPENCODE_PROVIDER_NAME:-GenAI Harness}"
     # Container CWD is also bind-mounted at this exact path; the entrypoint
     # cd's here after the gosu drop. Surfaced as an env var so agents (and
     # any user scripts inside the container) can identify the host launch
