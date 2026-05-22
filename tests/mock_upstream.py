@@ -56,6 +56,17 @@ SCENARIO = os.environ.get("MOCK_SCENARIO", "text").strip().lower()
 PORT = int(os.environ.get("MOCK_PORT", "9000"))
 FIXTURES_DIR = os.environ.get("MOCK_FIXTURES_DIR", "").strip()
 
+# Models advertised on GET /v1/models. Comma-separated ids; the proxy's
+# /v1/models route forwards here and ollama registers a stub per id. Defaults
+# to the single id the full-stack tests use as DEFAULT_MODEL_NAME so discovery
+# is a no-op for them; a test exercising multi-model discovery overrides it.
+MOCK_MODELS = [
+    m.strip() for m in os.environ.get("MOCK_MODELS", "harness").split(",") if m.strip()
+]
+# When set, GET /v1/models returns this status with a canned locked-key body
+# so tests can exercise the discovery failure / unlock path.
+MOCK_MODELS_STATUS = int(os.environ.get("MOCK_MODELS_STATUS", "200"))
+
 
 # Legacy scenarios — preserved verbatim for tests that pre-date the fixture
 # system. proxy_test and firewall_test run with these as the fallback when
@@ -300,6 +311,33 @@ app = Flask(__name__)
 @app.route("/health", methods=["GET"])
 def health() -> Response:
     return Response(json.dumps({"status": "ok"}), status=200, mimetype="application/json")
+
+
+@app.route("/v1/models", methods=["GET"])
+def list_models() -> Response:
+    """OpenAI-style model catalog the proxy's /v1/models route forwards to.
+
+    MOCK_MODELS_STATUS lets a test force a non-200 (e.g. 401 locked key) to
+    exercise the discovery failure path; otherwise return the configured ids.
+    """
+    if MOCK_MODELS_STATUS != 200:
+        body = {
+            "error": {
+                "type": "unauthorized",
+                "message": "API key locked - visit the unlock URL to re-enable your key",
+                "unlock_url": "https://mock.invalid/unlock/test-key",
+            }
+        }
+        return Response(json.dumps(body), status=MOCK_MODELS_STATUS, mimetype="application/json")
+    body = {
+        "object": "list",
+        "data": [
+            {"id": mid, "object": "model", "created": 1686935002, "owned_by": "mock-upstream"}
+            for mid in MOCK_MODELS
+        ],
+    }
+    print(f"[mock-upstream] GET /v1/models -> {len(MOCK_MODELS)} models: {MOCK_MODELS}", flush=True)
+    return Response(json.dumps(body), status=200, mimetype="application/json")
 
 
 @app.route("/__reset_counters__", methods=["POST"])

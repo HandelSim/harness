@@ -35,7 +35,10 @@ services:
       # CRITICAL: must match the literal hostname in the RemoteHost URL.
       # Ollama uses slices.Contains for matching — exact string, no DNS.
       OLLAMA_REMOTES: proxy
-      OLLAMA_AGENT_MODEL: ${OLLAMA_AGENT_MODEL:-GenAI}
+      # Single source of truth for the default/fallback model id. The entrypoint
+      # discovers the upstream's full model list via the proxy and registers a
+      # stub per model, always including this one as the default selection.
+      DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-}
       OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-200000}
       # The entrypoint reads PROXY_PORT to build the RemoteHost URL.
       PROXY_PORT: ${PROXY_PORT:-8000}
@@ -87,7 +90,9 @@ services:
     environment:
       PROXY_API_URL: ${PROXY_API_URL:-}
       PROXY_API_KEY: ${PROXY_API_KEY:-}
-      PROXY_API_MODEL: ${PROXY_API_MODEL:-}
+      # Fallback model when a request omits one; the proxy otherwise forwards
+      # whatever model the request asked for (passthrough).
+      DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-}
       PROXY_HOST: ${PROXY_HOST:-0.0.0.0}
       PROXY_PORT: ${PROXY_PORT:-8000}
       PROXY_TIMEOUT: ${PROXY_TIMEOUT:-180}

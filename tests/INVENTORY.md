@@ -80,7 +80,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F055 | Two launches of the same tool from the same directory produce distinct container names (concurrent same-dir agents don't collide) |
 | F143 | Interactive agent launch (`run_agent_interactive`, `cmd_shell`) runs docker as a child (not exec), prints the GitHub-issues footer to stderr after the session exits, and propagates the container's exit code |
 | F144 | `-p`/print mode (`run_agent_print`) does NOT print the issues footer (kept clean for scripts/pipes) |
-| F145 | The CLI's `agent_model` default is `GenAI` when `OLLAMA_AGENT_MODEL` is unset/blank (matching compose, ollama/entrypoint.sh, agents/entrypoint.sh); an explicit value passes through verbatim |
+| F145 | The CLI's `agent_model` reads `DEFAULT_MODEL_NAME` (required, no hardcoded default): empty when the var is unset/blank, an explicit value passes through verbatim |
 | F146 | `_downgrade_target_tag` from an untagged tip resolves to the latest reachable release tag |
 | F147 | `_downgrade_target_tag` sitting exactly on a tag resolves to the prior tag in history (topological, two-number tags ok) |
 | F148 | `_downgrade_target_tag` on the earliest tag returns non-zero with no output (no earlier tag to downgrade to) |
@@ -136,7 +136,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F102 | `harness doctor` reports mcp section: installed MCP services and enabled/disabled state |
 | F103 | `harness doctor` reports agents section: any agent container currently running |
 | F104 | `harness preflight` validates required commands exist (docker/podman, git) |
-| F105 | `harness preflight` validates `.env` exists with non-empty `PROXY_API_URL`, `PROXY_API_KEY`, `PROXY_API_MODEL` |
+| F105 | `harness preflight` validates `.env` exists with non-empty `PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME` |
 | F106 | `harness preflight` validates the PROXY_API_URL hostname appears on the allowlist |
 | F107 | `harness preflight` exits 0 on success |
 | F108 | `harness preflight` exits non-zero with summary count on failure |
@@ -184,7 +184,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P004 | Proxy reads `PROXY_PORT` from env (default `8000`) |
 | P005 | Proxy reads `PROXY_API_URL` from env |
 | P006 | Proxy reads `PROXY_API_KEY` from env |
-| P007 | Proxy reads `PROXY_API_MODEL` from env |
+| P007 | Proxy reads `DEFAULT_MODEL_NAME` from env (fallback model when a request omits one) |
 | P008 | Proxy reads `PROXY_TIMEOUT` from env |
 | P009 | Proxy reads `OLLAMA_CONTEXT_LENGTH` from env |
 | P010 | Proxy reads `PROXY_PROMPT_MODE` from env (default `user_front`) |
@@ -230,10 +230,12 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P053 | Tool-result messages in the inbound ollama payload are translated into user-role text, wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers (content never parsed; agent-agnostic) |
 | P054 | The cooperative prompt instructs the model to use ```json fenced blocks for tool calls |
 | P055 | The cooperative prompt enumerates available tools by name and schema |
-| P056 | Proxy passes through the upstream `model` field as `PROXY_API_MODEL`, not the inbound ollama model name |
+| P056 | Proxy forwards the inbound (requested) model to upstream, stripping a `:latest` tag; falls back to `DEFAULT_MODEL_NAME` only when the request omits a model |
 | P057 | Tool-result name is resolved from metadata: explicit `tool_name`/`name` field, else `tool_call_id` correlated to the assistant `tool_calls`, else positional order, else `unknown_tool` |
 | P058 | Hybrid mode echoes the full description of `PROXY_HYBRID_DETAIL_TOOLS` (default `task,skill`) into the recency reminder in `<<<BEGIN_TOOL_DETAIL>>>` blocks; empty disables; only present, non-empty-description tools surface |
 | P059 | The hybrid recency reminder advises the model to default to the listed tools over doing the work by hand, with concrete examples (`webfetch` vs curl/Python, `todowrite`/`todoread` vs a todo file) |
+| P060 | Proxy `GET /v1/models` proxies the upstream models catalog: forwards `{base}/v1/models` with the bearer key and returns the upstream status/body verbatim (so a locked-key 401 + `unlock_url` passes through) |
+| P061 | Proxy derives endpoints from `PROXY_API_URL` as a base — `{base}/v1/chat/completions` and `{base}/v1/models` — stripping a trailing `/v1/chat/completions`, `/chat/completions`, or `/v1` first |
 
 ---
 
@@ -254,6 +256,8 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | A018 | `ensure_opencode_config` writes `~/.config/opencode/opencode.json` on every launch |
 | A019 | `ensure_opencode_config` configures a `harness` provider pointing at the local ollama endpoint |
 | A020 | `ensure_opencode_config` defines a `yolo` agent profile |
+| A035 | `ensure_opencode_config` sets the opencode provider display name from `OPENCODE_PROVIDER_NAME` (default `GenAI Harness`) |
+| A036 | `ensure_opencode_config` builds the opencode model list from ollama `/api/tags` (stub names minus `:latest`), always includes `DEFAULT_MODEL_NAME`, and selects `harness/${DEFAULT_MODEL_NAME}` |
 | A021 | `merge_opencode_mcp_servers` translates the canonical `mcpServers` JSON into opencode's mcp shape |
 | A022 | `merge_opencode_mcp_servers` distinguishes `local` (stdio) from `remote` (SSE/HTTP) entries |
 | A028 | `run_opencode` sets `OPENCODE_DISABLE_AUTOUPDATE=1` |

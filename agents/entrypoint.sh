@@ -130,48 +130,73 @@ ensure_opencode_config() {
     local config_file="${config_dir}/opencode.json"
     mkdir -p "$config_dir"
 
-    local model_name="${OLLAMA_AGENT_MODEL:-GenAI}"
+    local default_model="${DEFAULT_MODEL_NAME:-}"
+    local provider_name="${OPENCODE_PROVIDER_NAME:-GenAI Harness}"
     local ollama_url="http://ollama:11434/v1"
+    local ctx="${OLLAMA_CONTEXT_LENGTH:-200000}"
 
-    # Always (re)write the harness-managed provider/model/agent block —
-    # OLLAMA_AGENT_MODEL may have changed between launches. We use a
-    # heredoc (escaped $ for the schema literal) and overwrite unconditionally.
-    cat > "$config_file" <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "harness": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Harness",
-      "options": {
-        "baseURL": "${ollama_url}",
-        "apiKey": "harness-dummy"
-      },
-      "models": {
-        "${model_name}": {
-          "name": "${model_name}",
-          "limit": {
-            "context": 200000,
-            "output": 8192
+    # Build the opencode model dropdown from the stubs ollama actually has
+    # registered (its /api/tags), so opencode lists exactly the upstream
+    # models discovered at start — and never drifts from what's registered.
+    # ollama tags stubs as `<id>:latest`; strip the tag back to the bare
+    # upstream id opencode/the proxy use. Falls back to DEFAULT_MODEL_NAME if
+    # ollama isn't reachable yet so the config always has at least one model.
+    local model_ids=()
+    local tags
+    tags=$(curl -fsS --max-time 10 "http://ollama:11434/api/tags" 2>/dev/null || true)
+    if [[ -n "$tags" ]]; then
+        mapfile -t model_ids < <(printf '%s' "$tags" \
+            | jq -r '.models[]?.name | sub(":latest$"; "")' 2>/dev/null | sort -u || true)
+    fi
+    # Ensure the default model is always present (it's the default selection).
+    if [[ -n "$default_model" ]]; then
+        local found=0 m
+        for m in "${model_ids[@]}"; do [[ "$m" == "$default_model" ]] && found=1; done
+        (( found == 0 )) && model_ids+=("$default_model")
+    fi
+    if (( ${#model_ids[@]} == 0 )); then
+        model_ids=("${default_model:-default}")
+    fi
+
+    # Selected model: the configured default if present, else the first id.
+    local selected="$default_model"
+    if [[ -z "$selected" ]]; then
+        selected="${model_ids[0]}"
+    fi
+
+    # provider.models map: {"<id>": {"name": "<id>", "limit": {...}}, ...}
+    local models_json
+    models_json=$(printf '%s\n' "${model_ids[@]}" | jq -R . | jq -s \
+        --argjson ctx "$ctx" \
+        'map({key: ., value: {name: ., limit: {context: $ctx, output: 8192}}}) | from_entries')
+
+    # Always (re)write the harness-managed block — the model set or provider
+    # name may have changed between launches. Built with jq so the models map
+    # is dynamic and the strings are correctly escaped.
+    jq -n \
+        --arg provider_name "$provider_name" \
+        --arg ollama_url "$ollama_url" \
+        --arg selected "harness/${selected}" \
+        --argjson models "$models_json" \
+        '{
+          "$schema": "https://opencode.ai/config.json",
+          "provider": {
+            "harness": {
+              "npm": "@ai-sdk/openai-compatible",
+              "name": $provider_name,
+              "options": {"baseURL": $ollama_url, "apiKey": "harness-dummy"},
+              "models": $models
+            }
+          },
+          "model": $selected,
+          "small_model": $selected,
+          "agent": {
+            "yolo": {
+              "description": "Auto-approve all permissions; harness yolo mode",
+              "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": "allow"}
+            }
           }
-        }
-      }
-    }
-  },
-  "model": "harness/${model_name}",
-  "small_model": "harness/${model_name}",
-  "agent": {
-    "yolo": {
-      "description": "Auto-approve all permissions; harness yolo mode",
-      "permission": {
-        "edit": "allow",
-        "bash": {"*": "allow"},
-        "webfetch": "allow"
-      }
-    }
-  }
-}
-EOF
+        }' > "$config_file"
 }
 
 merge_opencode_mcp_servers() {
@@ -221,10 +246,11 @@ run_opencode() {
 
     echo "============================================================"
     echo " harness-agent (opencode)"
-    echo "   model:   harness/${OLLAMA_AGENT_MODEL:-GenAI}"
-    echo "   ollama:  http://ollama:11434/v1"
-    echo "   yolo:    ${HARNESS_YOLO:-0}"
-    echo "   print:   ${HARNESS_PRINT_MODE:-0}"
+    echo "   provider: ${OPENCODE_PROVIDER_NAME:-GenAI Harness}"
+    echo "   model:    harness/${DEFAULT_MODEL_NAME:-default}"
+    echo "   ollama:   http://ollama:11434/v1"
+    echo "   yolo:     ${HARNESS_YOLO:-0}"
+    echo "   print:    ${HARNESS_PRINT_MODE:-0}"
     echo "============================================================"
 
     local args=()

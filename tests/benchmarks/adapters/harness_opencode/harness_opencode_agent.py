@@ -18,7 +18,7 @@ ARCHITECTURE NOTE (host = ARM64, TB task images = mostly x86_64):
 ENVIRONMENT VARIABLES (set by the runner before harbor invocation):
 - PROXY_API_KEY        : upstream LLM API key
 - PROXY_API_URL        : upstream LLM endpoint
-- PROXY_API_MODEL      : model identifier
+- DEFAULT_MODEL_NAME    : default/fallback model id
 - PROXY_PROMPT_MODE    : current prod injection mode
                          (user_front | hybrid; passthrough = bypass)
 - HARNESS_PROXY_SCHEME : reserved for future named-scheme support; see

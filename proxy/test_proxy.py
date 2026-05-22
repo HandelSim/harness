@@ -14,7 +14,7 @@ from unittest.mock import patch
 # trigger sys.exit in any future tightened validation path.
 os.environ.setdefault("PROXY_API_URL", "http://example.invalid")
 os.environ.setdefault("PROXY_API_KEY", "test-key-1234")
-os.environ.setdefault("PROXY_API_MODEL", "test-model")
+os.environ.setdefault("DEFAULT_MODEL_NAME", "test-model")
 
 import proxy  # noqa: E402
 
@@ -1902,6 +1902,94 @@ class TestUsageOverride(unittest.TestCase):
         lines = [line for line in resp.get_data(as_text=True).split("\n") if line.strip()]
         done_chunk = json.loads(lines[-1])
         self.assertGreater(done_chunk["eval_count"], 50)
+
+
+class TestConfigHelpers(unittest.TestCase):
+    """URL-base normalization and model-tag stripping that back the
+    passthrough + discovery behavior."""
+
+    def test_normalize_strips_full_chat_url(self):
+        self.assertEqual(
+            proxy._normalize_api_base("https://host.example/v1/chat/completions"),
+            "https://host.example",
+        )
+
+    def test_normalize_strips_bare_chat_completions(self):
+        self.assertEqual(
+            proxy._normalize_api_base("https://host.example/chat/completions"),
+            "https://host.example",
+        )
+
+    def test_normalize_strips_trailing_v1(self):
+        self.assertEqual(
+            proxy._normalize_api_base("https://host.example/v1"), "https://host.example"
+        )
+
+    def test_normalize_root_unchanged(self):
+        self.assertEqual(
+            proxy._normalize_api_base("https://host.example/"), "https://host.example"
+        )
+
+    def test_normalize_preserves_extra_prefix(self):
+        # A non-/v1 path prefix is kept; only the known suffixes are stripped.
+        self.assertEqual(
+            proxy._normalize_api_base("https://host.example/openai/v1/chat/completions"),
+            "https://host.example/openai",
+        )
+
+    def test_chat_and_models_urls_derive_from_base(self):
+        base = proxy._normalize_api_base("https://host.example/v1/chat/completions")
+        self.assertEqual(base + "/v1/chat/completions", "https://host.example/v1/chat/completions")
+        self.assertEqual(base + "/v1/models", "https://host.example/v1/models")
+
+    def test_strip_model_tag_removes_latest(self):
+        self.assertEqual(proxy._strip_model_tag("gpt-4:latest"), "gpt-4")
+
+    def test_strip_model_tag_leaves_untagged(self):
+        self.assertEqual(proxy._strip_model_tag("gpt-4"), "gpt-4")
+
+    def test_strip_model_tag_keeps_non_latest_colon(self):
+        self.assertEqual(proxy._strip_model_tag("ns:model"), "ns:model")
+
+
+class TestModelPassthrough(unittest.TestCase):
+    """The proxy forwards the requested model (minus :latest) upstream, not a
+    fixed id; it falls back to DEFAULT_MODEL_NAME only when none was sent."""
+
+    def _capture_forwarded(self, ollama_request):
+        captured = {}
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+        def fake_post(url, headers=None, json=None, **kwargs):
+            captured["model"] = json.get("model")
+            return FakeResp()
+
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post", side_effect=fake_post):
+            with patch.object(proxy, "save_debug_file"):
+                client.post(
+                    "/api/chat",
+                    data=json.dumps(ollama_request),
+                    content_type="application/json",
+                )
+        return captured.get("model")
+
+    def test_requested_model_passes_through_stripped(self):
+        forwarded = self._capture_forwarded(
+            {"model": "gpt-4:latest", "messages": [{"role": "user", "content": "hi"}]}
+        )
+        self.assertEqual(forwarded, "gpt-4")
+
+    def test_missing_model_falls_back_to_default(self):
+        forwarded = self._capture_forwarded(
+            {"messages": [{"role": "user", "content": "hi"}]}
+        )
+        self.assertEqual(forwarded, proxy.DEFAULT_MODEL_NAME)
 
 
 if __name__ == "__main__":

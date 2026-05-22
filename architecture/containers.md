@@ -31,13 +31,20 @@ direct `docker run`, not compose — see "Agent launch path" in
 2. Starts `ollama serve` in the background; traps EXIT/INT/TERM to clean
    it up.
 3. Waits up to 60 s for `GET /api/tags` to succeed.
-4. POSTs `/api/create` to register a stub model whose `remote_host`
-   points at `http://proxy:${PROXY_PORT}`. The same body sets
-   `context_length` and `num_ctx` from `OLLAMA_CONTEXT_LENGTH`.
-5. Confirms the canonical name appears in `/api/tags`. Aborts on failure.
-   (The proxy ignores the model name in the request and uses
-   `PROXY_API_MODEL` from `.env` to decide what to send upstream.)
-6. `wait`s on the ollama process so PID 1 stays alive.
+4. **Discovers** the upstream's model list via `GET http://proxy:${PROXY_PORT}/v1/models`
+   (the proxy's pass-through route — see [`proxy.md`](proxy.md)). On a locked-key
+   `401` carrying an `unlock_url` it prints the URL and aborts; on any other
+   failure (proxy/upstream unreachable, empty list) it warns and falls back to
+   just `DEFAULT_MODEL_NAME` so a transient hiccup doesn't brick the stack in a
+   restart loop.
+5. POSTs `/api/create` to register a stub model **per discovered id** (always
+   including `DEFAULT_MODEL_NAME`, deduped) whose `remote_host` points at
+   `http://proxy:${PROXY_PORT}`. The same body sets `context_length` and
+   `num_ctx` from `OLLAMA_CONTEXT_LENGTH`. The proxy forwards whichever stub
+   name the request used (passthrough), so each stub maps to its own upstream
+   model.
+6. Confirms every registered name appears in `/api/tags`. Aborts on failure.
+7. `wait`s on the ollama process so PID 1 stays alive.
 
 ### `OLLAMA_REMOTES` is load-bearing
 
@@ -97,9 +104,14 @@ After the drop, still in the entrypoint:
 ### Mode helpers
 
 - `ensure_opencode_config` writes `~/.config/opencode/opencode.json` with
-  the harness provider block pointing at `http://ollama:11434/v1` and the
-  `OLLAMA_AGENT_MODEL` registered as `harness/<MODEL_NAME>`. Re-written
-  every launch because `OLLAMA_AGENT_MODEL` may have changed.
+  the harness provider block pointing at `http://ollama:11434/v1`. The
+  provider display name comes from `OPENCODE_PROVIDER_NAME` (default
+  `GenAI Harness`). The model dropdown is built from ollama `/api/tags` (each
+  stub name with its `:latest` tag stripped) so opencode lists exactly the
+  models discovered at start; `DEFAULT_MODEL_NAME` is always included and is the
+  default selection (`harness/<DEFAULT_MODEL_NAME>`). Built with `jq` and
+  re-written every launch because the model set or provider name may have
+  changed. Falls back to `DEFAULT_MODEL_NAME` alone if ollama isn't reachable.
 - `merge_opencode_mcp_servers` translates the canonical `{"mcpServers": {...}}`
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.

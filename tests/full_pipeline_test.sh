@@ -152,13 +152,12 @@ echo "[pipeline] T1: run harness-install.sh from staged dir"
 cat >"${TEST_ROOT}/.env" <<EOF
 PROXY_API_URL=http://mockupstream:9000/v1/chat/completions
 PROXY_API_KEY=test-key-1234
-PROXY_API_MODEL=test-model
+DEFAULT_MODEL_NAME=harness
 PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
 OLLAMA_VERSION=0.21.2
-OLLAMA_AGENT_MODEL=harness
 OLLAMA_CONTEXT_LENGTH=200000
 PUBLISH_OLLAMA_PORT=
 MOCK_SCENARIO=text
@@ -540,6 +539,15 @@ grep -q '"harness"' "${opencode_cfg}" \
     || { echo "[pipeline] T9 FAIL: A018 opencode.json missing the harness provider block" >&2; cat "${opencode_cfg}" >&2; exit 1; }
 grep -q '"model": "harness/' "${opencode_cfg}" \
     || { echo "[pipeline] T9 FAIL: A018 opencode.json missing the harness model binding" >&2; cat "${opencode_cfg}" >&2; exit 1; }
+# #94 A035: the provider display name comes from OPENCODE_PROVIDER_NAME, which
+# defaults to "GenAI Harness" (the .env above doesn't set it).
+grep -q '"name": "GenAI Harness"' "${opencode_cfg}" \
+    || { echo "[pipeline] T9 FAIL: A035 opencode.json provider name is not the OPENCODE_PROVIDER_NAME default 'GenAI Harness'" >&2; cat "${opencode_cfg}" >&2; exit 1; }
+# #94 A036: the model dropdown is built from ollama /api/tags, which discovered
+# 'harness' via the proxy's /v1/models route — so a model entry named 'harness'
+# (distinct from the provider whose name is 'GenAI Harness') is registered.
+grep -q '"name": "harness"' "${opencode_cfg}" \
+    || { echo "[pipeline] T9 FAIL: A036 opencode.json model dropdown missing the discovered 'harness' model" >&2; cat "${opencode_cfg}" >&2; exit 1; }
 echo "[pipeline] T9 OK"
 
 # --- T10: harness opencode -p (headless) -----------------------------------

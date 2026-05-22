@@ -89,13 +89,12 @@ ln -s "${REPO_ROOT}" "${TEST_ROOT}/harness"
 cat >"${TEST_ROOT}/.env" <<'EOF'
 PROXY_API_URL=http://placeholder.invalid/v1/chat/completions
 PROXY_API_KEY=test-key-1234
-PROXY_API_MODEL=test-model
+DEFAULT_MODEL_NAME=harness
 PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
 OLLAMA_VERSION=0.21.2
-OLLAMA_AGENT_MODEL=harness
 OLLAMA_CONTEXT_LENGTH=200000
 PUBLISH_OLLAMA_PORT=
 EOF
@@ -242,7 +241,7 @@ probe_case() {
         HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
         export PROXY_API_URL=http://probe.invalid/v1/chat/completions
         export PROXY_API_KEY=test-key
-        export PROXY_API_MODEL=test-model
+        export DEFAULT_MODEL_NAME=test-model
         # Stub curl: emit fixture body + the synthetic status marker the
         # probe parses out of curl -w. _probe_upstream_auth captures stderr
         # via 2>&1, so writing only to stdout is fine.
@@ -1067,7 +1066,7 @@ ln -s "${REPO_ROOT}" "${UPG_ROOT}/harness"
 cat >"${UPG_ROOT}/.env" <<'EOF'
 PROXY_API_URL=https://placeholder.invalid/v1/chat/completions
 PROXY_API_KEY=test-key
-PROXY_API_MODEL=test-model
+DEFAULT_MODEL_NAME=harness
 EOF
 cat >"${UPG_ROOT}/.harness-allowlist" <<'EOF'
 github.com
@@ -1173,7 +1172,7 @@ ln -s "${REPO_ROOT}" "${UPG17B_ROOT}/harness"
 cat >"${UPG17B_ROOT}/.env" <<'EOF'
 PROXY_API_URL=https://placeholder.invalid/v1/chat/completions
 PROXY_API_KEY=test-key
-PROXY_API_MODEL=test-model
+DEFAULT_MODEL_NAME=harness
 EOF
 echo "github.com" >"${UPG17B_ROOT}/.harness-allowlist"
 
@@ -1496,7 +1495,7 @@ if ! grep -q 'all checks passed' <<<"${preflight_out}"; then
     echo "[harness-test] T20 FAIL: preflight didn't print 'all checks passed'" >&2
     echo "${preflight_out}" >&2; exit 1
 fi
-for needle in 'PROXY_API_URL is set' 'PROXY_API_KEY is set' 'PROXY_API_MODEL is set'; do
+for needle in 'PROXY_API_URL is set' 'PROXY_API_KEY is set' 'DEFAULT_MODEL_NAME is set'; do
     if ! grep -q "${needle}" <<<"${preflight_out}"; then
         echo "[harness-test] T20 FAIL: preflight missing line: ${needle}" >&2
         echo "${preflight_out}" >&2; exit 1
@@ -2139,31 +2138,31 @@ if ! grep -q 'CMD_HELP_CALLED' <<<"${t30_help_out}" || grep -q 'RUN_AGENT_CALLED
 fi
 echo "[harness-test] T30 OK"
 
-# --- Test 31: OLLAMA_AGENT_MODEL CLI default matches the other consumers (#87)
+# --- Test 31: DEFAULT_MODEL_NAME CLI passthrough (#94) -----------------------
 #
-# The CLI's agent_model fallback must be GenAI when OLLAMA_AGENT_MODEL is
-# unset/blank — the same default as docker-compose.yml, ollama/entrypoint.sh
-# and agents/entrypoint.sh — so opencode is never pointed at a model name
-# ollama never registered. An explicit value must pass through verbatim. The
-# install root is an empty tmpdir so no real .env is sourced over the var.
-echo "[harness-test] T31: OLLAMA_AGENT_MODEL CLI default"
+# DEFAULT_MODEL_NAME is the single source of truth for the default/fallback
+# model id (it replaced OLLAMA_AGENT_MODEL + PROXY_API_MODEL). It is REQUIRED
+# with no hardcoded default, so the CLI's agent_model is empty when the var is
+# unset/blank and passes an explicit value through verbatim. The install root
+# is an empty tmpdir so no real .env is sourced over the var.
+echo "[harness-test] T31: DEFAULT_MODEL_NAME CLI passthrough"
 T31_ROOT="$(mktemp -d -t harness-t31.XXXXXX)"
 cleanup_t31() { [[ -n "${T31_ROOT:-}" && -d "${T31_ROOT}" ]] && rm -rf "${T31_ROOT}"; }
 trap 'cleanup_t31; restore_agent_image; cleanup' EXIT INT TERM
 
 t31_default=$(
-    unset OLLAMA_AGENT_MODEL
+    unset DEFAULT_MODEL_NAME
     HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${T31_ROOT}" \
         source "${HARNESS_BIN}" >/dev/null 2>&1
     printf '%s' "${agent_model}"
 )
-if [[ "${t31_default}" != "GenAI" ]]; then
-    echo "[harness-test] T31 FAIL: default agent_model='${t31_default}' != GenAI" >&2
+if [[ -n "${t31_default}" ]]; then
+    echo "[harness-test] T31 FAIL: unset DEFAULT_MODEL_NAME should yield empty agent_model, got '${t31_default}'" >&2
     exit 1
 fi
 
 t31_explicit=$(
-    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${T31_ROOT}" OLLAMA_AGENT_MODEL=mymodel \
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${T31_ROOT}" DEFAULT_MODEL_NAME=mymodel \
         source "${HARNESS_BIN}" >/dev/null 2>&1
     printf '%s' "${agent_model}"
 )

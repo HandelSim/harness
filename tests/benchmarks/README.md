@@ -36,7 +36,7 @@ container the adapter:
 
 1. Clones the harness repo (`HARNESS_GIT_REF`, default `dev`).
 2. Writes `.env` from runner-provided env vars
-   (`PROXY_API_KEY`, `PROXY_API_URL`, `PROXY_API_MODEL`,
+   (`PROXY_API_KEY`, `PROXY_API_URL`, `DEFAULT_MODEL_NAME`,
    `PROXY_PROMPT_MODE`, `HARNESS_PROXY_SCHEME`).
 3. Runs `harness-install.sh`, which boots the docker compose stack
    (proxy + ollama + firewall + agent).

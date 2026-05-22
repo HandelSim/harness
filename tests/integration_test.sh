@@ -167,7 +167,7 @@ mkdir -p \
 test_generate_env "${TEST_INSTALL}/.env" \
     "PROXY_API_URL=http://mockupstream:9000/v1/chat/completions" \
     "PROXY_API_KEY=test-key-1234" \
-    "PROXY_API_MODEL=test-model" \
+    "DEFAULT_MODEL_NAME=harness" \
     "MOCK_SCENARIO=text" \
     "OUTPUT_DIR=//output" \
     "HARNESS_PROJECTS_ROOT=${TEST_WORKSPACE}"

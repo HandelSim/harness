@@ -334,7 +334,7 @@ The `.env` file lives inside the clone:
 
 ```
 $ cp .env.example .env
-$ $EDITOR .env          # fill in PROXY_API_URL / PROXY_API_KEY / PROXY_API_MODEL
+$ $EDITOR .env          # fill in PROXY_API_URL / PROXY_API_KEY / DEFAULT_MODEL_NAME
 $ docker compose --env-file .env up --build
 ```
 
