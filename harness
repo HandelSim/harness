@@ -100,7 +100,7 @@ project_name="${HARNESS_PROJECT_NAME:-harness}"
 # --- env loading ------------------------------------------------------------
 #
 # Source .env into this shell so we can read PUBLISH_OLLAMA_PORT,
-# OLLAMA_AGENT_MODEL etc. for our own logic. docker compose gets the file
+# DEFAULT_MODEL_NAME etc. for our own logic. docker compose gets the file
 # separately via --env-file.
 #
 # Host proxy (HTTP_PROXY/HTTPS_PROXY/NO_PROXY): honored for the host-side git
@@ -135,11 +135,13 @@ done
 command -v harness_normalize_proxy_env >/dev/null 2>&1 && harness_normalize_proxy_env
 unset _harness_proxy_keys _k _sv
 
-# Default must match every other consumer of OLLAMA_AGENT_MODEL (compose,
-# ollama/entrypoint.sh, agents/entrypoint.sh all fall back to GenAI). When the
-# var is unset/blank, a divergent default here would point opencode at a model
-# name ollama never registered. See architecture/harness-cli.md (Env loading).
-agent_model="${OLLAMA_AGENT_MODEL:-GenAI}"
+# The default/fallback model id. REQUIRED (no hardcoded default): once the
+# model passes through to the upstream, a cosmetic default would be a real
+# upstream id we can't know. require_runtime_config enforces it's set before
+# any launch. ollama registers a stub for it (plus every discovered model) and
+# opencode selects harness/${DEFAULT_MODEL_NAME} by default.
+# See architecture/harness-cli.md (Env loading).
+agent_model="${DEFAULT_MODEL_NAME:-}"
 
 # --- net helpers (lazy load) ------------------------------------------------
 #
@@ -530,7 +532,7 @@ require_runtime_config() {
 
     local missing=()
     local v
-    for v in PROXY_API_URL PROXY_API_KEY PROXY_API_MODEL; do
+    for v in PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME; do
         local val="${!v:-}"
         if [[ -z "$val" ]]; then
             missing+=("$v")
@@ -914,12 +916,31 @@ warn_if_firewall_open() {
 # JSON path is unhelpfully invisible. Printing the raw body means the
 # user can always see what came back, even if our field extraction
 # missed something.
-_probe_upstream_auth() {
-    local api_url="${PROXY_API_URL:-}"
-    local api_key="${PROXY_API_KEY:-}"
-    local api_model="${PROXY_API_MODEL:-}"
+# Normalize PROXY_API_URL to a scheme://host[/prefix] base, mirroring
+# proxy.py's _normalize_api_base. PROXY_API_URL is a base; the chat endpoint is
+# {base}/v1/chat/completions and the models endpoint is {base}/v1/models. Strip
+# a trailing full chat URL or /v1 first so either form works. Keep in sync with
+# proxy/proxy.py.
+_api_base() {
+    local base="${PROXY_API_URL:-}"
+    base="${base%/}"
+    case "$base" in
+        */v1/chat/completions) base="${base%/v1/chat/completions}" ;;
+        */chat/completions)    base="${base%/chat/completions}" ;;
+    esac
+    base="${base%/}"
+    base="${base%/v1}"
+    base="${base%/}"
+    printf '%s' "$base"
+}
 
-    if [[ -z "$api_url" || -z "$api_key" ]]; then
+_probe_upstream_auth() {
+    local api_url
+    api_url="$(_api_base)/v1/chat/completions"
+    local api_key="${PROXY_API_KEY:-}"
+    local api_model="${DEFAULT_MODEL_NAME:-}"
+
+    if [[ -z "${PROXY_API_URL:-}" || -z "$api_key" ]]; then
         # Missing config; let other validators surface this clearly.
         return 0
     fi
@@ -1062,6 +1083,57 @@ _gate_on_upstream_auth() {
     return 0
 }
 
+# Best-effort: print the upstream's model catalog at start so the user sees
+# what's available. Tolerant of an unreachable upstream (e.g. tests where the
+# upstream is an in-network mock the host can't reach) — the authoritative
+# per-model stub registration happens in the ollama container via the proxy's
+# /v1/models route. Only a locked-key 401/403 carrying an unlock URL returns 1
+# (aborting the start, mirroring _gate_on_upstream_auth). HARNESS_SKIP_AUTH_PROBE=1
+# bypasses it.
+_print_upstream_models() {
+    [[ "${HARNESS_SKIP_AUTH_PROBE:-0}" == "1" ]] && return 0
+    [[ -z "${PROXY_API_URL:-}" || -z "${PROXY_API_KEY:-}" ]] && return 0
+    command -v curl >/dev/null 2>&1 || return 0
+
+    local url response status body
+    url="$(_api_base)/v1/models"
+    response=$(curl -sSL -k -w $'\n__HTTP_STATUS__%{http_code}' \
+        --connect-timeout 5 --max-time 30 \
+        -H "Authorization: Bearer ${PROXY_API_KEY}" \
+        "$url" 2>&1) || true
+    status=$(grep -o '__HTTP_STATUS__[0-9]*$' <<<"$response" | sed 's/__HTTP_STATUS__//')
+    body=$(sed 's/__HTTP_STATUS__[0-9]*$//' <<<"$response")
+
+    if [[ -n "$status" && "${status:0:1}" == "2" ]]; then
+        local ids=""
+        if command -v jq >/dev/null 2>&1; then
+            ids=$(jq -r '.data[].id // empty' <<<"$body" 2>/dev/null | paste -sd ' ' - || true)
+        fi
+        [[ -n "$ids" ]] && echo "[harness] upstream models available: $ids"
+        return 0
+    fi
+
+    case "$status" in
+        401|403)
+            local unlock_url=""
+            if command -v jq >/dev/null 2>&1; then
+                unlock_url=$(jq -r '.error.unlock_url // .error.metadata.unlock_url // .unlock_url // empty' <<<"$body" 2>/dev/null || true)
+            fi
+            if [[ -n "$unlock_url" ]]; then
+                echo "" >&2
+                echo "[harness] ERROR: upstream API key is locked (models endpoint returned $status)." >&2
+                echo "[harness]   Visit this URL in a signed-in browser to unlock it:" >&2
+                echo "[harness]   $unlock_url" >&2
+                echo "" >&2
+                return 1
+            fi
+            ;;
+    esac
+    # Unreachable / non-actionable: don't block. ollama registers what it can
+    # (falling back to DEFAULT_MODEL_NAME) and the proxy surfaces real errors later.
+    return 0
+}
+
 cmd_unlock() {
     # Run the same probe `cmd_start` runs. On locked, prints the unlock URL.
     # On success, prints "key OK". Useful for mid-session lockouts: user
@@ -1191,6 +1263,10 @@ cmd_start() {
     # the proxy; surfacing it here lets the user click through the unlock
     # URL before any container has tried to talk to the upstream.
     _gate_on_upstream_auth || return 1
+
+    # Print the upstream model catalog (best-effort; aborts only on a locked
+    # key). The ollama container does the authoritative per-model registration.
+    _print_upstream_models || return 1
 
     # Stop anything still running from a prior session so up brings a clean
     # state. The 2>/dev/null || true handles a fresh install where there's
@@ -2280,7 +2356,8 @@ agent_common_env() {
     printf -- '-e\nHOST_UID=%s\n' "$(id -u)"
     printf -- '-e\nHOST_GID=%s\n' "$(id -g)"
     printf -- '-e\nHARNESS_YOLO=%s\n' "$yolo"
-    printf -- '-e\nOLLAMA_AGENT_MODEL=%s\n' "$agent_model"
+    printf -- '-e\nDEFAULT_MODEL_NAME=%s\n' "$agent_model"
+    printf -- '-e\nOPENCODE_PROVIDER_NAME=%s\n' "${OPENCODE_PROVIDER_NAME:-GenAI Harness}"
     # Container CWD is also bind-mounted at this exact path; the entrypoint
     # cd's here after the gosu drop. Surfaced as an env var so agents (and
     # any user scripts inside the container) can identify the host launch
@@ -4033,7 +4110,7 @@ cmd_doctor() {
             doctor_check fail "OLLAMA_VERSION" "unset"
         fi
 
-        doctor_check ok "OLLAMA_AGENT_MODEL" "$agent_model"
+        doctor_check ok "DEFAULT_MODEL_NAME" "$agent_model"
     fi
 
     # ---------------- [network] -------------
@@ -4293,7 +4370,7 @@ cmd_preflight() {
         local proxy_url proxy_key proxy_model
         proxy_url=$(grep -E '^PROXY_API_URL=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
         proxy_key=$(grep -E '^PROXY_API_KEY=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
-        proxy_model=$(grep -E '^PROXY_API_MODEL=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+        proxy_model=$(grep -E '^DEFAULT_MODEL_NAME=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
 
         if [[ -z "$proxy_url" ]]; then
             echo "  ✗ PROXY_API_URL is empty in $env_file (required: upstream API base URL)"
@@ -4308,10 +4385,10 @@ cmd_preflight() {
             echo "  ✓ PROXY_API_KEY is set"
         fi
         if [[ -z "$proxy_model" ]]; then
-            echo "  ✗ PROXY_API_MODEL is empty in $env_file (required: upstream model identifier)"
+            echo "  ✗ DEFAULT_MODEL_NAME is empty in $env_file (required: default/fallback upstream model id)"
             errors=$((errors+1))
         else
-            echo "  ✓ PROXY_API_MODEL is set"
+            echo "  ✓ DEFAULT_MODEL_NAME is set"
         fi
 
         # PROXY_API_URL hostname must be in the allowlist or container egress

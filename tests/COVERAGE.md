@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 384 IDs (F=146, P=56, A=22, M=23, N=30, U=29, Pe=17, O=16, I=45).
+Inventory total: 388 IDs (F=146, P=58, A=24, M=23, N=30, U=29, Pe=17, O=16, I=45).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -176,7 +176,7 @@ non-green rows — the gap.
 | F055 | green  | tests/harness_test.sh:T29                    | T29 launches `run_agent_interactive` twice for the same tool+dir (each in its own subshell, since the path now `exit`s) and asserts both reach `docker run` with distinct `--name` values (no refusal; #76). | |
 | F143 | green  | tests/harness_test.sh:T29                    | T29 part C drives `run_agent_interactive` with `harness_docker` stubbed to return 7; asserts the subshell exits 7 (exit-code propagation) and the `/issues` footer reached stderr (#81). | |
 | F144 | green  | tests/harness_test.sh:T29                    | T29 part D drives `run_agent_print` and asserts the `/issues` footer is absent from stderr (#81). | |
-| F145 | green  | tests/harness_test.sh:T31                    | T31 sources the script with an empty install root: unset `OLLAMA_AGENT_MODEL` → `agent_model==GenAI`; `OLLAMA_AGENT_MODEL=mymodel` → `agent_model==mymodel` (#87). | |
+| F145 | green  | tests/harness_test.sh:T31                    | T31 sources the script with an empty install root: unset `DEFAULT_MODEL_NAME` → `agent_model==""` (empty); `DEFAULT_MODEL_NAME=mymodel` → `agent_model==mymodel` (#94). | |
 | F146 | green  | tests/harness_test.sh:T32                    | T32.1: `_downgrade_target_tag` against a v0.1/v1.0/tip git fixture from the untagged tip returns `v1.0` (#85). | |
 | F147 | green  | tests/harness_test.sh:T32                    | T32.2: checked out exactly on `v1.0`, `_downgrade_target_tag` returns `v0.1` (#85). | |
 | F148 | green  | tests/harness_test.sh:T32                    | T32.3: checked out on the earliest tag `v0.1`, `_downgrade_target_tag` exits non-zero with empty output (#85). | |
@@ -278,7 +278,7 @@ non-green rows — the gap.
 | P004 | green  | tests/proxy_test.sh:475-479                 | Scenario F same banner asserts the `:8000` suffix on the listening line — PROXY_PORT env was consumed. | |
 | P005 | green  | tests/proxy_test.sh:218-285 + test_proxy.py via env | Test env sets `PROXY_API_URL` and asserts forwarded body lands at mock upstream. | |
 | P006 | green  | tests/proxy_test.sh:480-490                 | Scenario F sets `PROXY_API_KEY=test-key-1234`, asserts banner shows redacted form `test...1234` AND raw key is NOT printed (regression guard against accidental key leak). | |
-| P007 | green  | tests/proxy_test.sh:218-249                 | Scenario A checks forwarded `model` equals `PROXY_API_MODEL`, not the inbound name. | |
+| P007 | green  | proxy/test_proxy.py (TestModelPassthrough)  | test_missing_model_falls_back_to_default asserts the proxy forwards `DEFAULT_MODEL_NAME` when the request omits a model. | |
 | P008 | yellow | tests/proxy_test.sh:56                      | `PROXY_TIMEOUT=30` set; no assertion on actual timeout behavior. | No test simulates a slow upstream to exercise the timeout. |
 | P009 | green  | proxy/test_proxy.py:584-598                 | TestMakeChunk.test_done_chunk_includes_stats asserts `prompt_eval_count` is overridden using context length env. | |
 | P010 | green  | proxy/test_proxy.py:601-771 + tests/scheme_contract_test.sh | TestPromptInjectionModes covers `user_front` as default via test_default_mode_is_user_front. The scheme contract test adds end-to-end assertions for each surviving cooperative scheme (`user_front`, `hybrid`) via mock-upstream body capture. | |
@@ -324,10 +324,12 @@ non-green rows — the gap.
 | P053 | green  | proxy/test_proxy.py:837-874                 | TestToolResultDelimiting: tool messages wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers across every prompt mode; content never parsed. | |
 | P054 | green  | proxy/test_proxy.py:26-49 + 96-131          | test_top_level_schema_emitted + test_format_tools_includes_nested_schema confirm tools section format. Cooperative prompt content asserted indirectly via Scenario C body check. | |
 | P055 | green  | proxy/test_proxy.py:26-131                  | TestFormatTools asserts each tool's name, schema, and arguments enumerated. | |
-| P056 | green  | tests/proxy_test.sh:289-352                 | Scenario C body check: keys == `['messages', 'model']`, with `model == PROXY_API_MODEL`. | |
+| P056 | green  | tests/proxy_test.sh (Scenario C) + proxy/test_proxy.py (TestModelPassthrough) | Scenario C asserts the forwarded body's `model == 'harness'` (the passed-through request model, not a fixed id); test_requested_model_passes_through_stripped asserts `gpt-4:latest` → `gpt-4`. | |
 | P057 | green  | proxy/test_proxy.py:939-1004                | test_tool_result_name_resolved_via_tool_call_id / _falls_back_to_positional_order / _prefers_explicit_field / _unknown_when_no_metadata: name resolution chain (field → id → positional → `unknown_tool`). | |
 | P058 | green  | proxy/test_proxy.py (TestHybridDetailTools) | test_detail_block_emitted_for_flagged_task_tool asserts `<<<BEGIN_TOOL_DETAIL name="task">>>` + verbatim agent types reach the last user message; _sits_after_reminder_outside_user_message_wrap asserts ordering; _no_detail_block_for_unflagged_tool / _only_for_present_flagged_tools / _empty_flagged_set_disables cover the gating; setup tests cover `PROXY_HYBRID_DETAIL_TOOLS` parse/default/empty. | |
 | P059 | green  | proxy/test_proxy.py:test_mode_hybrid_reminder_advises_default_to_tools (+_concurrent_task_agents/_has_honesty_rules/_has_environment_context/_drops_stale_value_parenthetical/_injects_known_host_os/_omits_host_os_when_unknown) | Asserts the labelled recency reminder: Workflow line (prefer a listed tool + `webfetch`/`todowrite`/`todoread` + concurrent `task` agents), Honesty line (anti-fabrication), Environment line (Linux container / mounted workdir / reproducibility), the dropped stale "which agent types…" parenthetical, host-OS parenthetical rendered when `_HOST_OS` set and omitted when empty, and that guidance sits OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap. TestHostOsSetup covers `HARNESS_HOST_OS` parse/normalise/default. | |
+| P060 | green  | tests/proxy_test.sh (Scenario A2)            | Scenario A2 GETs `http://proxy:8000/v1/models` from inside ollama and asserts the response lists the mock model `harness` and is an OpenAI `"object":"list"` envelope. | |
+| P061 | green  | proxy/test_proxy.py (TestConfigHelpers)      | test_normalize_* asserts `_normalize_api_base` strips `/v1/chat/completions`, `/chat/completions`, and a trailing `/v1` (and preserves a non-`/v1` prefix); chat/models URLs derive from the base. | |
 
 ## A — Agent runtime (init, configs, run-opencode/shell) (22 IDs)
 
@@ -346,6 +348,8 @@ non-green rows — the gap.
 | A018 | green  | tests/full_pipeline_test.sh (T9)            | T9 boots opencode via bare `harness -p`; the entrypoint runs `ensure_opencode_config` before exec'ing the agent, so the test asserts `state/agent/home/.config/opencode/opencode.json` exists in the shared home AND carries the harness provider block (`"harness"`) + model binding (`"model": "harness/`). Holds even on the opencode provider-auth skip, since the config write precedes the agent run. | |
 | A019 | red    | —                                           | —                                                                                                     | No test asserts opencode config has a `harness` provider pointing at ollama. |
 | A020 | red    | —                                           | —                                                                                                     | No test asserts opencode config defines a `yolo` agent profile. |
+| A035 | green  | tests/full_pipeline_test.sh:T9              | T9 asserts the launched opencode.json carries `"name": "GenAI Harness"` (the OPENCODE_PROVIDER_NAME default, unset in the test .env). | |
+| A036 | green  | tests/full_pipeline_test.sh:T9              | T9 asserts opencode.json carries a model entry `"name": "harness"` — the model discovered via the proxy `/v1/models` route and read from ollama `/api/tags`, distinct from the provider whose name is `GenAI Harness`. | |
 | A021 | red    | —                                           | —                                                                                                     | No test asserts opencode mcp-servers merge happens. |
 | A022 | red    | —                                           | —                                                                                                     | No test asserts local vs remote mcp distinction in opencode shape. |
 | A028 | red    | —                                           | —                                                                                                     | No test asserts `OPENCODE_DISABLE_AUTOUPDATE=1`. |

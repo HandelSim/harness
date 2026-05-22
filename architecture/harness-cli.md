@@ -26,17 +26,35 @@ The portable resolver is duplicated inline here rather than depending on
 ## Env loading
 
 The script sources `.env` into its own shell (`set -a; source; set +a`)
-so it can read values like `PUBLISH_OLLAMA_PORT`, `OLLAMA_AGENT_MODEL`,
+so it can read values like `PUBLISH_OLLAMA_PORT`, `DEFAULT_MODEL_NAME`,
 `HARNESS_EXTRA_MOUNTS` for its own logic. `docker compose` gets `.env`
 separately via `--env-file`. The two consumers are independent.
 
-`OLLAMA_AGENT_MODEL` has four independent consumers — the CLI
-(`agent_model=`), `docker-compose.yml`, `ollama/entrypoint.sh`, and
-`agents/entrypoint.sh` — and **all four fall back to the same default,
-`GenAI`**, when the var is unset/blank. This invariant matters: the ollama
-side registers the stub model under this name and the opencode side points
-the agent at it, so a divergent default makes opencode request a model name
-ollama never created (silent 404s). Keep the four in sync.
+`DEFAULT_MODEL_NAME` (which replaced the old `PROXY_API_MODEL` +
+`OLLAMA_AGENT_MODEL`) is the default/fallback model id and is **REQUIRED with no
+hardcoded default** — once the selected model passes through to the upstream, a
+cosmetic default would be a real upstream id we can't know. `agent_model` reads
+it (empty when unset) and `require_runtime_config` enforces it's set before any
+launch. ollama discovers the upstream's full model list and registers a stub per
+model (always including this one); opencode selects `harness/${DEFAULT_MODEL_NAME}`
+by default.
+
+`OPENCODE_PROVIDER_NAME` (default `GenAI Harness`) is the opencode-only provider
+display name; the CLI threads it into the agent container via `agent_common_env`
+alongside `DEFAULT_MODEL_NAME`.
+
+### Upstream URL base + auth/model probes
+
+`PROXY_API_URL` is a **base**; `_api_base` normalizes it (stripping a trailing
+`/v1/chat/completions`, `/chat/completions`, or `/v1`), mirroring proxy.py's
+`_normalize_api_base` — keep the two in sync. `_probe_upstream_auth` POSTs to
+`{base}/v1/chat/completions` to convert a locked-key `401` into a clickable
+unlock URL before the stack starts. `_print_upstream_models` then GETs
+`{base}/v1/models` (best-effort): on success it prints the catalog, on a locked
+key it shows the unlock URL and aborts, and on an unreachable upstream (e.g.
+tests pointing at an in-network mock the host can't reach) it stays quiet and
+proceeds — the authoritative per-model registration happens in the ollama
+container. Both honor `HARNESS_SKIP_AUTH_PROBE=1`.
 
 ### Host proxy (`HTTP_PROXY` / `HTTPS_PROXY`)
 

@@ -10,7 +10,16 @@ API does*; [`proxy.md`](proxy.md) covers *how the proxy reacts* to it.
 A **Gemini Enterprise chat product** exposed behind a
 chat-completions-shaped HTTP API. It is a general chat assistant, not a
 coding-agent API — there is no agent-oriented system prompt and no native
-tool protocol. Current model: **`gemini 3.1 pro`**.
+tool protocol.
+
+**Multi-model.** The upstream serves several models and **honors the request's
+`model` field**, and it exposes an OpenAI-style `GET /v1/models` catalog. The
+proxy treats `PROXY_API_URL` as a base and derives `{base}/v1/chat/completions`
+and `{base}/v1/models` from it; it forwards the model the agent selected
+(passthrough) and registers an ollama stub per advertised model so the user can
+switch models from opencode. See [`proxy.md`](proxy.md) → URL base + model
+passthrough. (Earlier the harness pinned one model — `gemini 3.1 pro` was the
+one clear best choice — which is why older docs/config spoke of a single model.)
 
 Note: the upstream's own request/response examples use placeholder model
 ids (`gemini-2.5-flash`, `gpt-4`) and example `usage` numbers that do not
@@ -119,6 +128,17 @@ it is worth doing.
 The `gemini_enterprise` block is upstream-specific: `assist_token`,
 `session`, and a `thinking[]` array of the model's reasoning traces.
 `usage` is per-request only (see "Unreliable `usage`" above).
+
+### Models endpoint (`GET /v1/models`)
+
+OpenAI-style catalog used for model discovery:
+
+```json
+{ "object": "list", "data": [ { "id": "gpt-4", "object": "model", "owned_by": "..." } ] }
+```
+
+Authenticated like the chat endpoint (Bearer key) and subject to the same
+key-lock behavior — a locked key returns the `401` + `unlock_url` shape above.
 
 ## HTTP status codes
 

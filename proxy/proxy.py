@@ -8,9 +8,16 @@ that the proxy then parses and re-emits as native tool_calls.
 Environment variables (see README / .env.example):
     PROXY_HOST           bind address (default 0.0.0.0)
     PROXY_PORT           bind port (default 8000)
-    PROXY_API_URL        upstream endpoint URL (REQUIRED)
+    PROXY_API_URL        upstream base URL (REQUIRED). The proxy derives the
+                         chat endpoint ({base}/v1/chat/completions) and the
+                         models endpoint ({base}/v1/models) from it; a trailing
+                         /v1/chat/completions, /chat/completions, or /v1 is
+                         stripped first so either a base or a full chat URL works.
     PROXY_API_KEY        upstream bearer token (REQUIRED)
-    PROXY_API_MODEL      upstream model id (REQUIRED)
+    DEFAULT_MODEL_NAME   fallback upstream model id (REQUIRED). The proxy
+                         forwards whatever model the request asked for (the
+                         ollama stub name, with any :latest tag stripped) and
+                         only falls back to this when the request omits a model.
     OUTPUT_DIR           debug-dump directory (optional)
     PROXY_TIMEOUT        upstream request timeout, seconds (default 180)
 """
@@ -42,9 +49,50 @@ PROXY_HOST: str = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT: int = int(os.environ.get("PROXY_PORT", "8000"))
 PROXY_API_URL: str = os.environ.get("PROXY_API_URL", "").strip()
 PROXY_API_KEY: str = os.environ.get("PROXY_API_KEY", "").strip()
-PROXY_API_MODEL: str = os.environ.get("PROXY_API_MODEL", "").strip()
+DEFAULT_MODEL_NAME: str = os.environ.get("DEFAULT_MODEL_NAME", "").strip()
 PROXY_TIMEOUT: int = int(os.environ.get("PROXY_TIMEOUT", "180"))
 OLLAMA_CONTEXT_LENGTH: int = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "200000"))
+
+
+def _normalize_api_base(url: str) -> str:
+    """Reduce PROXY_API_URL to a scheme://host[/prefix] base.
+
+    The user sets PROXY_API_URL to a base; the proxy appends the standard
+    OpenAI-style paths (/v1/chat/completions, /v1/models). To stay forgiving
+    of the older "full chat URL" form and of the OpenAI base-includes-/v1
+    convention, strip a trailing /v1/chat/completions, /chat/completions, or
+    /v1 (plus surrounding slashes) before re-deriving the endpoints. The
+    harness CLI mirrors this normalization in bash (see _api_base in
+    `harness`); keep the two in sync.
+    """
+    base = url.strip().rstrip("/")
+    for suffix in ("/v1/chat/completions", "/chat/completions"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    base = base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base.rstrip("/")
+
+
+_API_BASE: str = _normalize_api_base(PROXY_API_URL)
+CHAT_URL: str = f"{_API_BASE}/v1/chat/completions"
+MODELS_URL: str = f"{_API_BASE}/v1/models"
+
+
+def _strip_model_tag(model: str) -> str:
+    """Drop the ollama `:latest` tag so the upstream sees a clean model id.
+
+    ollama registers stub models as `<id>:latest` and forwards that tagged
+    name in the request, but the upstream expects the bare id it advertised
+    on /v1/models. Only `:latest` is stripped — real upstream ids may legitimately
+    contain a colon, so we don't strip an arbitrary trailing tag.
+    """
+    if model.endswith(":latest"):
+        return model[: -len(":latest")]
+    return model
+
 
 _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 
@@ -1123,6 +1171,43 @@ def health() -> Response:
     return Response(json.dumps({"status": "ok"}), status=200, mimetype="application/json")
 
 
+@app.route("/v1/models", methods=["GET"])
+def list_models() -> Response:
+    """Proxy the upstream's model catalog so ollama/opencode can discover and
+    register every available model.
+
+    This is a thin pass-through: forward GET {base}/v1/models upstream with the
+    bearer key and the same verify=False the chat path uses, then return the
+    upstream status and body verbatim. Returning the upstream body (not just a
+    parsed list) means a locked-key 401 — with its unlock_url — reaches the
+    caller unchanged, so the same unlock flow the chat path triggers also
+    applies here. Declared as an explicit route so it wins over catch_all,
+    which would otherwise treat the GET as a (body-less) chat request.
+    """
+    req_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    headers = {"Authorization": f"Bearer {PROXY_API_KEY}"}
+    try:
+        resp = requests.get(
+            MODELS_URL,
+            headers=headers,
+            verify=False,
+            timeout=PROXY_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        print(f"[{req_id}] upstream models request failed: {e}", flush=True)
+        return Response(
+            json.dumps({"error": "upstream models request failed", "details": str(e)}),
+            status=502,
+            mimetype="application/json",
+        )
+    print(f"[{req_id}] GET /v1/models -> upstream {resp.status_code}", flush=True)
+    return Response(
+        resp.text,
+        status=resp.status_code,
+        mimetype=resp.headers.get("Content-Type", "application/json"),
+    )
+
+
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 def catch_all(path: str) -> Response:
@@ -1132,7 +1217,7 @@ def catch_all(path: str) -> Response:
         ollama_request = request.get_json(silent=True) or {}
         save_debug_file(req_id, "01", "Ollama_Request", ollama_request)
 
-        model_name = ollama_request.get("model") or "GenAI"
+        model_name = ollama_request.get("model") or DEFAULT_MODEL_NAME
         original_messages = ollama_request.get("messages") or []
         tools = ollama_request.get("tools") or []
 
@@ -1141,8 +1226,14 @@ def catch_all(path: str) -> Response:
         tools_text = format_tools_to_text(tools)
         translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=tools)
 
+        # Forward whatever model the request asked for so the user can switch
+        # between the upstream's models from opencode. ollama tags its stub
+        # models as `<id>:latest`; strip that so the upstream sees the bare id
+        # it advertised on /v1/models. Fall back to DEFAULT_MODEL_NAME only when
+        # the request omits a model entirely (shouldn't happen via ollama).
+        upstream_model = _strip_model_tag(model_name) or DEFAULT_MODEL_NAME
         upstream_payload = {
-            "model": PROXY_API_MODEL,
+            "model": upstream_model,
             "messages": translated,
         }
         # Passthrough mode forwards the agent's tool definitions to upstream
@@ -1163,7 +1254,7 @@ def catch_all(path: str) -> Response:
 
         try:
             resp = requests.post(
-                PROXY_API_URL,
+                CHAT_URL,
                 headers=headers,
                 json=upstream_payload,
                 verify=False,
@@ -1274,8 +1365,8 @@ def _validate_config() -> None:
         missing.append("PROXY_API_URL")
     if not PROXY_API_KEY:
         missing.append("PROXY_API_KEY")
-    if not PROXY_API_MODEL:
-        missing.append("PROXY_API_MODEL")
+    if not DEFAULT_MODEL_NAME:
+        missing.append("DEFAULT_MODEL_NAME")
     if missing:
         print(f"[!] FATAL: required env vars missing or empty: {', '.join(missing)}", flush=True)
         sys.exit(1)
@@ -1303,8 +1394,9 @@ def main() -> None:
         "============================================================\n"
         " harness translating proxy\n"
         f"   listening on:   {PROXY_HOST}:{PROXY_PORT}\n"
-        f"   upstream URL:   {PROXY_API_URL}\n"
-        f"   upstream model: {PROXY_API_MODEL}\n"
+        f"   chat URL:       {CHAT_URL}\n"
+        f"   models URL:     {MODELS_URL}\n"
+        f"   default model:  {DEFAULT_MODEL_NAME}\n"
         f"   upstream key:   {_redact_key(PROXY_API_KEY)}\n"
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"

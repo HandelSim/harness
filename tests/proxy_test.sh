@@ -49,13 +49,12 @@ write_env() {
     cat >"${ENV_FILE}" <<EOF
 PROXY_API_URL=http://mockupstream:9000/v1/chat/completions
 PROXY_API_KEY=test-key-1234
-PROXY_API_MODEL=test-model
+DEFAULT_MODEL_NAME=harness
 PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
 OLLAMA_VERSION=0.21.2
-OLLAMA_AGENT_MODEL=harness
 OLLAMA_CONTEXT_LENGTH=200000
 MOCK_SCENARIO=${scenario}
 MOCK_FIXTURES_DIR=${fixtures_dir}
@@ -248,6 +247,20 @@ SHOW_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/show" \
 echo "${SHOW_BODY}" | grep -q '200000' \
     || fail "A: /api/show did not include the configured context length 200000" "${SHOW_BODY}"
 
+# --- Scenario A2: proxy /v1/models discovery route --------------------------
+
+echo "[proxy-test] scenario A2: proxy /v1/models forwards the upstream catalog"
+# Query from inside the ollama container — the proxy port isn't published to
+# the host. The proxy forwards GET {upstream}/v1/models; the mock returns its
+# MOCK_MODELS list (default 'harness').
+MODELS_JSON="$("${COMPOSE[@]}" exec -T ollama curl -fsS http://proxy:8000/v1/models)" \
+    || fail "A2: GET /v1/models via proxy failed"
+echo "[proxy-test]   A2 /v1/models: ${MODELS_JSON}"
+echo "${MODELS_JSON}" | grep -q '"harness"' \
+    || fail "A2: /v1/models did not list the mock model 'harness'" "${MODELS_JSON}"
+echo "${MODELS_JSON}" | grep -qE '"object":[[:space:]]*"list"' \
+    || fail "A2: /v1/models response is not an OpenAI list envelope" "${MODELS_JSON}"
+
 # --- Scenario B: tool call --------------------------------------------------
 
 echo "[proxy-test] scenario B: tool call"
@@ -339,11 +352,17 @@ tool_pos = last_content.index('Available Tools')
 if req_pos >= tool_pos:
     print('REQUEST_NOT_BEFORE_TOOLS')
     sys.exit(0)
+# Passthrough: the forwarded model is the inbound request's model ('harness'),
+# not a fixed PROXY_API_MODEL. ollama may tag it ':latest'; the proxy strips it.
+if body['model'] != 'harness':
+    print('WRONG_MODEL:' + str(body['model']))
+    sys.exit(0)
 print('OK')
 " <<<"${FORWARDED_BODY}")" || fail "C: failed to inspect forwarded body" "${FORWARDED_BODY}"
 
 case "${KEY_CHECK}" in
     *OK*) ;;
+    *WRONG_MODEL*)                 fail "C: forwarded model is not the passed-through request model: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
     *UNEXPECTED_KEYS*)              fail "C: forwarded body had keys other than {model,messages}: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
     *NO_REQUEST_MARKER_IN_LAST_USER*) fail "C: last user message is missing the <<<BEGIN_USER_REQUEST>>> marker" "${FORWARDED_BODY}" ;;
     *NO_TOOL_LIST_IN_LAST_USER*)    fail "C: last user message is missing the tool list" "${FORWARDED_BODY}" ;;
