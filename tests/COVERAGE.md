@@ -491,7 +491,7 @@ non-green rows — the gap.
 | O006 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `/api/show` body contains `"context_length": 200000`. | |
 | O007 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `"num_ctx": 200000`. | |
 | O008 | red    | —                                           | —                                                                                                     | No test specifically forces the streaming response to omit `"status":"success"` to assert the registration-fatal path. |
-| O009 | green  | tests/harness_test.sh:327-336               | T3 also asserts the explicit success log line: `grep -Eq 'harness ollama ready; stub model -> '` — direct evidence registration succeeded and would catch a regression that turns a fatal error into a silent warning. | |
+| O009 | green  | tests/harness_test.sh:327-336               | T3 also asserts the explicit success log line: `grep -Eq 'harness ollama ready; [0-9]+ stub model(s) -> '` — direct evidence registration succeeded and would catch a regression that turns a fatal error into a silent warning. | |
 | O019 | red    | —                                           | —                                                                                                     | No test reads back the stub model's `remote_host` to verify it equals the proxy URL. |
 | O020 | red    | —                                           | —                                                                                                     | No test sends EXIT to the entrypoint and asserts cleanup. |
 | O021 | red    | —                                           | —                                                                                                     | No test sends INT. |
@@ -584,7 +584,7 @@ E added `tests/scheme_contract_test.sh`, and Track F2 added the
 | I024  | yellow   | green     | D        | full_pipeline_test T2 grep's installed wrapper for the install-root path literal. |
 | O001  | yellow   | green     | D        | firewall_test Phase 3 scrapes ollama logs for firewall-init markers AND asserts firewall-line precedes ollama-api-wait-line. |
 | O003  | yellow   | green     | D        | harness_test T3 scrapes ollama logs for `waiting for ollama API at .*?/api/tags` poll banner. |
-| O009  | yellow   | green     | D        | harness_test T3 also asserts the explicit `harness ollama ready; stub model -> ` success line. |
+| O009  | yellow   | green     | D        | harness_test T3 also asserts the explicit `harness ollama ready; <N> stub model(s) -> ` success line. |
 | P003  | yellow   | green     | D        | proxy_test Scenario F scrapes proxy logs for `listening on: 0.0.0.0:8000` banner. |
 | P004  | yellow   | green     | D        | proxy_test Scenario F same banner, asserts `:8000` port suffix. |
 | P006  | yellow   | green     | D        | proxy_test Scenario F asserts redacted key banner AND raw key NOT printed. |

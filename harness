@@ -4098,19 +4098,17 @@ cmd_doctor() {
             doctor_check fail "PROXY_API_KEY" "unset"
         fi
 
-        if [[ -n "${PROXY_API_MODEL:-}" ]]; then
-            doctor_check ok "PROXY_API_MODEL" "$PROXY_API_MODEL"
-        else
-            doctor_check fail "PROXY_API_MODEL" "unset"
-        fi
-
         if [[ -n "${OLLAMA_VERSION:-}" ]]; then
             doctor_check ok "OLLAMA_VERSION" "$OLLAMA_VERSION"
         else
             doctor_check fail "OLLAMA_VERSION" "unset"
         fi
 
-        doctor_check ok "DEFAULT_MODEL_NAME" "$agent_model"
+        if [[ -n "${agent_model}" ]]; then
+            doctor_check ok "DEFAULT_MODEL_NAME" "$agent_model"
+        else
+            doctor_check fail "DEFAULT_MODEL_NAME" "unset"
+        fi
     fi
 
     # ---------------- [network] -------------

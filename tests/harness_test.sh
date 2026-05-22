@@ -410,10 +410,10 @@ fi
 # Inventory O009: a healthy ollama container means MODEL_NAME was
 # successfully registered (entrypoint.sh exits non-zero on registration
 # failure, which would prevent the container from becoming healthy).
-# We additionally assert the explicit "harness ollama ready; stub
-# model ->" success line is present so a future regression that turns
+# We additionally assert the explicit "harness ollama ready; <N> stub
+# model(s) ->" success line is present so a future regression that turns
 # the registration error into a warning still trips this test.
-if ! grep -Eq 'harness ollama ready; stub model -> ' <<<"${ollama_logs}"; then
+if ! grep -Eq 'harness ollama ready; [0-9]+ stub model\(s\) -> ' <<<"${ollama_logs}"; then
     echo "[harness-test] T3 FAIL [O009]: ollama entrypoint did not log registration success" >&2
     echo "${ollama_logs}" | tail -40 >&2
     exit 1
