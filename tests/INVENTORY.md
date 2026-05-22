@@ -470,3 +470,6 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | I043 | When `HTTP_PROXY`/`HTTPS_PROXY` are exported in the installing shell, the installer persists them into the seeded `.env`, filling only blank lines (a pre-placed value wins) |
 | I044 | On Windows Git Bash the installer bridges `~/.bash_profile` -> `~/.bashrc` so login shells pick up the PATH export |
 | I045 | The `.bash_profile` bridge preserves a pre-existing `~/.profile` when it has to create `~/.bash_profile`, and is idempotent |
+| I046 | A failed `git clone` is detected via its exit code and aborts the install with an actionable message; the installer never prints `✓ cloned` or `install complete` past a failed clone |
+| I047 | Fatal errors (preflight failure, pre-existing install root, failed clone, missing `platform.sh`) abort even when the installer is `source`d — the terminating `return`/`exit` runs at the script's top level, so a sourced run does not continue past a fatal error |
+| I048 | The initial clone takes its proxy from `HTTP_PROXY`/`HTTPS_PROXY` in a `.env` placed beside the installer when set (exported in both upper- and lower-case for git's libcurl), falling back to the host shell's exported proxy when the `.env` value is blank/absent |

@@ -49,7 +49,7 @@ fi
 # sourced script. Calling it from a NESTED helper (e.g. an old `fail` that ran
 # `exit_or_return`) just pops back into that helper and the script keeps going.
 # That is the bug that bit #105 and #106. For fatal aborts MID-script, use the
-# `abort` idiom instead, which runs its `return` at the top level.
+# fatal-abort idiom below instead, which runs its `return` at the top level.
 exit_or_return() {
     local code="${1:-0}"
     if (( HARNESS_INSTALL_SOURCED )); then
@@ -96,11 +96,14 @@ fi
 
 ok()    { printf '%s✓%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
 warn()  { printf '%s!%s %s\n'  "$C_YELLOW" "$C_RESET" "$*"; }
-# fail() only PRINTS and returns non-zero — it deliberately does NOT abort.
-# A `return` inside a helper can't terminate a sourced script (it just leaves
-# the helper), so the actual abort must happen at the script's top level. Every
-# fatal site pairs `fail` with the `abort` idiom below. See exit_or_return.
-fail()  { printf '%sx%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; return 1; }
+# fail() ONLY prints an error to stderr — it deliberately does NOT abort and
+# returns success. Two reasons: (1) a `return` inside a helper can't terminate a
+# sourced script (it just leaves the helper), so the abort must happen at the
+# script's top level; (2) if fail returned non-zero, `set -e` (on in executed
+# mode) would exit on the fail line itself, swallowing any follow-up hint lines.
+# So every fatal site prints with fail/echo, then aborts explicitly with the
+# top-level idiom: `(( HARNESS_INSTALL_SOURCED )) && return 1; exit 1`.
+fail()  { printf '%sx%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; }
 title() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 
 cwd=$(pwd)
@@ -449,6 +452,7 @@ apply_preclone_proxy() {
         export "$pk"="$val" "$lk"="$val"
         ok "using $pk from $env_file for the clone"
     done
+    return 0   # never let the loop's last status trip the caller's set -e
 }
 
 title "cloning repo"
