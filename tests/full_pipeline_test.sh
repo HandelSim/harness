@@ -143,6 +143,56 @@ cp "${REPO_ROOT}/harness-install.sh" "${TEST_ROOT}/harness-install.sh"
 chmod +x "${TEST_ROOT}/harness-install.sh"
 echo "[pipeline] T0 OK: ${TEST_ROOT}/harness-install.sh"
 
+# --- T0b: failed clone aborts a SOURCED run + beside-.env proxy (#106) -------
+#
+# Issue #106: a clone that fails (no network / unreachable host) used to print
+# a misleading "✓ cloned" and keep going, producing a broken half-install —
+# because when the installer is `source`d (the README-recommended path) strict
+# mode is off and the abort `return` was buried in a helper, so it never ended
+# the script. Drive that exact scenario: point HARNESS_REPO_URL at a
+# non-existent path and run the installer SOURCED. It must (a) abort non-zero,
+# (b) print a clone-failure message, (c) NOT print "install complete", and
+# (d) leave no half-install behind. Also drop a .env beside the installer with
+# HTTPS_PROXY set and assert the installer announces it uses that for the clone
+# (the #106 follow-up: beside-.env proxy feeds the clone, host env is the
+# fallback when unset).
+echo "[pipeline] T0b: failed clone aborts sourced run + beside-.env proxy"
+CLONE_FAIL_ROOT="${TEST_ROOT}/clonefail"
+mkdir -p "${CLONE_FAIL_ROOT}"
+cp "${REPO_ROOT}/harness-install.sh" "${CLONE_FAIL_ROOT}/harness-install.sh"
+cat >"${CLONE_FAIL_ROOT}/.env" <<EOF
+HTTPS_PROXY=http://t0b-beside-proxy.invalid:3128
+EOF
+set +e
+# Source (not execute) the installer so we exercise the sourced-abort path.
+# Prompts before the clone are answered n,n (no PATH, no API key). A local-path
+# clone ignores the bogus proxy URL, so the failure is purely the missing repo.
+( cd "${CLONE_FAIL_ROOT}" \
+  && HOME="${FAKE_HOME}" HARNESS_REPO_URL="${TEST_ROOT}/does-not-exist-$$" \
+       bash -c 'source ./harness-install.sh' <<<$'n\nn\n' ) \
+  >"${CLONE_FAIL_ROOT}/clonefail.log" 2>&1
+t0b_rc=$?
+set -e
+if (( t0b_rc == 0 )); then
+    echo "[pipeline] T0b FAIL: sourced installer returned 0 on a failed clone" >&2
+    cat "${CLONE_FAIL_ROOT}/clonefail.log" >&2
+    exit 1
+fi
+grep -Eq 'git clone of .* failed' "${CLONE_FAIL_ROOT}/clonefail.log" \
+    || { echo "[pipeline] T0b FAIL: no clone-failure message printed" >&2; cat "${CLONE_FAIL_ROOT}/clonefail.log" >&2; exit 1; }
+if grep -q 'install complete' "${CLONE_FAIL_ROOT}/clonefail.log"; then
+    echo "[pipeline] T0b FAIL: 'install complete' printed despite a failed clone" >&2
+    cat "${CLONE_FAIL_ROOT}/clonefail.log" >&2
+    exit 1
+fi
+grep -q 'using HTTPS_PROXY from .* for the clone' "${CLONE_FAIL_ROOT}/clonefail.log" \
+    || { echo "[pipeline] T0b FAIL: beside-.env HTTPS_PROXY not used for the clone" >&2; cat "${CLONE_FAIL_ROOT}/clonefail.log" >&2; exit 1; }
+if [[ -e "${CLONE_FAIL_ROOT}/harness/state" ]]; then
+    echo "[pipeline] T0b FAIL: half-install left behind (state/ created after a failed clone)" >&2
+    exit 1
+fi
+echo "[pipeline] T0b OK (rc=${t0b_rc})"
+
 # --- T1: install flow -------------------------------------------------------
 
 echo "[pipeline] T1: run harness-install.sh from staged dir"

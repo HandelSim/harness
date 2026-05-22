@@ -41,6 +41,15 @@ fi
 # Helper: exit if executed, return if sourced. Without this, `source
 # harness-install.sh` (which the README recommends so PATH updates land in
 # the parent shell) would kill the calling shell on the first `exit`.
+#
+# IMPORTANT — only safe to abort the script from the TOP LEVEL. When sourced
+# this does `return "$code"`, which terminates the script ONLY if exit_or_return
+# is called at the script's top level (the final line below) — i.e. the
+# `return` it runs is itself one stack frame deep, so it pops back into the
+# sourced script. Calling it from a NESTED helper (e.g. an old `fail` that ran
+# `exit_or_return`) just pops back into that helper and the script keeps going.
+# That is the bug that bit #105 and #106. For fatal aborts MID-script, use the
+# fatal-abort idiom below instead, which runs its `return` at the top level.
 exit_or_return() {
     local code="${1:-0}"
     if (( HARNESS_INSTALL_SOURCED )); then
@@ -49,6 +58,19 @@ exit_or_return() {
         exit "$code"
     fi
 }
+
+# Fatal-abort idiom. Because the terminating `return` MUST run at the script's
+# top level (it can't be hidden inside a helper — see above), every fatal site
+# inlines these two lines rather than calling a shared function:
+#
+#     if <bad condition>; then
+#         fail "message"
+#         (( HARNESS_INSTALL_SOURCED )) && return 1   # ends a sourced run here
+#         exit 1                                       # ends an executed run
+#     fi
+#
+# Keep this pattern verbatim at each fatal site; do not refactor it into a
+# function (that reintroduces the #105/#106 "kept going after a fatal" bug).
 
 # The default points at the public GitHub remote. tests/full_pipeline_test.sh
 # overrides this via HARNESS_REPO_URL=<local-path> so the pipeline test can
@@ -74,7 +96,14 @@ fi
 
 ok()    { printf '%s✓%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
 warn()  { printf '%s!%s %s\n'  "$C_YELLOW" "$C_RESET" "$*"; }
-fail()  { printf '%sx%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; exit_or_return 1; }
+# fail() ONLY prints an error to stderr — it deliberately does NOT abort and
+# returns success. Two reasons: (1) a `return` inside a helper can't terminate a
+# sourced script (it just leaves the helper), so the abort must happen at the
+# script's top level; (2) if fail returned non-zero, `set -e` (on in executed
+# mode) would exit on the fail line itself, swallowing any follow-up hint lines.
+# So every fatal site prints with fail/echo, then aborts explicitly with the
+# top-level idiom: `(( HARNESS_INSTALL_SOURCED )) && return 1; exit 1`.
+fail()  { printf '%sx%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; }
 title() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 
 cwd=$(pwd)
@@ -311,7 +340,11 @@ preflight() {
     if (( errors > 0 )); then
         echo
         echo "[install] $errors check(s) failed. Resolve the issues above and re-run."
-        exit_or_return 1
+        # Signal failure to the top-level caller, which performs the actual
+        # abort. preflight is a function, so it cannot end a sourced script
+        # itself (see exit_or_return) — it must return non-zero and let the
+        # caller abort at the top level.
+        return 1
     fi
 
     echo "  all checks passed"
@@ -347,7 +380,10 @@ EOF
 
 # --- preflight (fail fast, before any prompts) ------------------------------
 
-preflight
+if ! preflight; then
+    (( HARNESS_INSTALL_SOURCED )) && return 1
+    exit 1
+fi
 
 # --- prompts ----------------------------------------------------------------
 #
@@ -389,13 +425,59 @@ case "${key_ans:-}" in
 esac
 
 # --- clone ------------------------------------------------------------------
+#
+# Resolve a proxy for the clone BEFORE running it. The clone happens before the
+# install root's .env exists, so it can only reach a corp proxy via the
+# environment. If a .env was dropped beside the installer ($script_dir) with
+# HTTP_PROXY/HTTPS_PROXY set, honor those for the clone too — the same file is
+# copied into the install root afterward, so the clone and later 'harness' runs
+# share one source of truth. A blank/absent value in that .env is treated as
+# unset: we leave the host's existing proxy environment alone, so whatever the
+# shell already exports wins by default ("default to the host config").
+#
+# Both cases are exported (HTTPS_PROXY and https_proxy): git's libcurl gives the
+# LOWER-case name precedence, so exporting only the upper-case form would lose
+# to a host-exported lower-case value and defeat "the .env value wins".
+apply_preclone_proxy() {
+    local env_file="$script_dir/.env"
+    [[ -f "$env_file" ]] || return 0
+    local pk val lk line
+    for pk in HTTP_PROXY HTTPS_PROXY; do
+        val=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*${pk}=(.*)$ ]] && val="${BASH_REMATCH[1]}"
+        done <"$env_file"
+        [[ -z "$val" ]] && continue   # unset/blank in .env → keep host env
+        lk=$(printf '%s' "$pk" | tr '[:upper:]' '[:lower:]')
+        export "$pk"="$val" "$lk"="$val"
+        ok "using $pk from $env_file for the clone"
+    done
+    return 0   # never let the loop's last status trip the caller's set -e
+}
 
 title "cloning repo"
 
 if [[ -e "$install_root" ]]; then
     fail "$install_root already exists; remove it or run harness-install.sh in a clean directory"
+    (( HARNESS_INSTALL_SOURCED )) && return 1
+    exit 1
 fi
-git clone "$REPO_URL" "$install_root"
+
+apply_preclone_proxy
+
+# Detect a failed clone explicitly. We can't rely on `set -e` here: when the
+# script is sourced (the README-recommended path) strict mode is off, so an
+# unchecked failure would fall through to the ok() below and leave a broken
+# half-install (the original #106 report). Check the exit code directly.
+if ! git clone "$REPO_URL" "$install_root"; then
+    fail "git clone of $REPO_URL failed."
+    echo "  - Check network/VPN connectivity to the git host." >&2
+    echo "  - Behind a corporate proxy? Export it before running, e.g." >&2
+    echo "      HTTPS_PROXY=http://proxy.example:8080 source harness-install.sh" >&2
+    echo "    or set HTTP_PROXY/HTTPS_PROXY in a .env placed beside this installer." >&2
+    (( HARNESS_INSTALL_SOURCED )) && return 1
+    exit 1
+fi
 ok "cloned into $install_root"
 
 # --- post-clone: source full platform.sh ------------------------------------
@@ -406,6 +488,8 @@ ok "cloned into $install_root"
 
 if [[ ! -f "$install_root/scripts/lib/platform.sh" ]]; then
     fail "internal: $install_root/scripts/lib/platform.sh missing after clone"
+    (( HARNESS_INSTALL_SOURCED )) && return 1
+    exit 1
 fi
 # shellcheck disable=SC1091
 source "$install_root/scripts/lib/platform.sh"

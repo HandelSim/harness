@@ -550,6 +550,9 @@ non-green rows — the gap.
 | I043 | green  | tests/full_pipeline_test.sh (T1b)           | T1b installs with `HTTPS_PROXY` exported and asserts the value lands in the seeded `.env` (blank line filled). | |
 | I044 | yellow | tests/harness_test.sh (T7c)                 | Windows-gated, can't run on Linux CI: T7c source-greps the bridge in `harness-install.sh` and exercises the bridge snippet logic. | |
 | I045 | green  | tests/harness_test.sh (T7c)                 | T7c asserts bridge idempotency (one `.bashrc` source line over 3 runs) and that a pre-existing `~/.profile` is preserved. | |
+| I046 | green  | tests/full_pipeline_test.sh (T0b)           | T0b points `HARNESS_REPO_URL` at a non-existent path, runs the installer, and asserts non-zero exit, a `git clone of .* failed` message, and that `install complete` is NOT printed. | |
+| I047 | green  | tests/full_pipeline_test.sh (T0b)           | T0b `source`s the installer (the README path) on a failing clone and asserts the sourced run aborts non-zero and leaves no half-install (`harness/state` not created) — the regression #105/#106 guard. | |
+| I048 | green  | tests/full_pipeline_test.sh (T0b)           | T0b drops a `.env` beside the installer with `HTTPS_PROXY` set and asserts the installer prints `using HTTPS_PROXY from .* for the clone`. | |
 
 ---
 

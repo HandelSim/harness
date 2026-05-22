@@ -22,9 +22,21 @@ run from an empty directory. Stages:
    beat of consideration) and Ctrl-C aborts at any prompt. The old confirm
    prompt was also broken when the script is sourced — its abort called
    `exit_or_return 0`, whose `return` only leaves that helper, not the sourced
-   script, so "n" continued the install anyway.
+   script, so "n" continued the install anyway. **All fatal sites** (preflight
+   failure, pre-existing install root, failed clone, missing `platform.sh`)
+   abort correctly in both modes by running the terminating `return`/`exit` at
+   the script's **top level**; a `return` buried in a helper (`fail`,
+   `exit_or_return`) can't end a sourced script, which was the root cause of
+   #105/#106.
 3. **Clone.** `git clone` into the install dir. **The clone IS the
-   install root** — there's no separate config dir.
+   install root** — there's no separate config dir. A failed clone (no
+   network, unreachable git host, corp proxy not exported) is caught by
+   checking git's exit code and aborts with an actionable message — the
+   installer never proceeds past a broken clone. The clone's proxy is
+   resolved first: `HTTP_PROXY`/`HTTPS_PROXY` set in a `.env` dropped beside
+   the installer are exported for it (both upper- and lower-case, since git's
+   libcurl gives the lower-case name precedence); a blank/absent value there
+   leaves the host's exported proxy untouched.
 4. **Source full `platform.sh`** now that it's local. Subsequent helpers
    come from the library.
 5. **dos2unix on Windows.** Defense-in-depth: ensures bash scripts have
@@ -44,10 +56,12 @@ run from an empty directory. Stages:
    If `HTTP_PROXY`/`HTTPS_PROXY` are exported in the installing
    shell, their values are persisted into the `.env` (filling only blank
    lines, so a pre-placed value wins) so later `harness` runs reuse the proxy
-   without re-exporting. The initial `git clone` itself just inherits the
-   shell's proxy (git's libcurl honors these env vars). `harness` later
-   exports them so `docker compose build` runs through the proxy too; they are
-   not forwarded into running containers (see [`containers.md`](containers.md)).
+   without re-exporting. The initial `git clone` (stage 3) takes its proxy
+   from, in priority: the beside-installer `.env`'s `HTTP_PROXY`/`HTTPS_PROXY`
+   if set, else whatever the host shell exports (git's libcurl honors these
+   env vars). `harness` later exports them so `docker compose build` runs
+   through the proxy too; they are not forwarded into running containers (see
+   [`containers.md`](containers.md)).
 8. **PATH wrapper.** Writes a `harness` script wrapper to
    `~/.local/bin/harness` that `exec`s into `<install-root>/harness`.
    Prints a one-line "add to PATH" reminder if `~/.local/bin` isn't
