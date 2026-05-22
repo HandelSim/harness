@@ -66,17 +66,22 @@ ENV LC_ALL=C.UTF-8
 # assistant content). This previously broke `harness -p` / `harness opencode
 # -p` (full_pipeline_test.sh T9/T10, integration_test.sh smoke) and forced a
 # rollback at 1.15.7 (issue #86). `--format json` does NOT dodge the race
-# (verified on 1.15.7: only `step_start` is emitted). The headless `-p` path
-# in agents/entrypoint.sh therefore recovers the final assistant text from the
-# persisted session via `opencode export <session>`, which is independent of
-# the render race — see architecture/containers.md.
+# (verified on 1.15.7: on a race-loss only `step_start` is emitted, and ~10% of
+# fast runs emit an entirely empty stream — zero bytes, no id). The headless
+# `-p` path in agents/entrypoint.sh therefore recovers the final assistant text
+# from the persisted session via `opencode export <session>`, which is
+# independent of the render race; when the stream carries no session id it finds
+# the newest session via `opencode session list --format json` — see
+# architecture/containers.md.
 #
 # When bumping, refresh the version below and re-verify two things against the
 # new binary:
 #   1. headless `-p` still round-trips — full_pipeline_test.sh T9/T10 are the
 #      gate (they assert the mock reply reaches stdout). If opencode renames
 #      `opencode export` or changes its `{messages:[{info.role,parts:[{type,
-#      text}]}]}` shape, update the jq in entrypoint.sh's print-mode branch.
+#      text}]}]}` shape, OR changes `opencode session list --format json`'s
+#      `[{id,directory,created}]` shape, update the jq in entrypoint.sh's
+#      print-mode branch.
 #   2. the proxy still pares the `task` tool description by anchoring on
 #      opencode's "Available agent types and the tools they have access to:"
 #      header (proxy/proxy.py `_OPENCODE_TASK_AGENTS_HEADER`).

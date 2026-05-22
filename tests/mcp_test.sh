@@ -186,6 +186,21 @@ harness_call() {
         "${FAKE_INSTALL_ROOT}/harness/harness" "$@"
 }
 
+# Like harness_call but time-bounded (first arg = seconds). Used for the
+# agent-launch path: with the agent image absent, run_agent builds it on
+# demand (minutes) and then launches, which would otherwise run to the CI
+# job cap. The side effect under test here — the MCP side file — is written
+# by write_agent_mcp_config *before* the image check, so a short cap is
+# enough to observe it without waiting on the build/launch.
+harness_call_capped() {
+    local secs="$1"; shift
+    timeout -k 5 "${secs}" env \
+        HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
+        HARNESS_INSTALL_ROOT="${FAKE_INSTALL_ROOT}" \
+        HARNESS_REGISTRY_DIR="${FAKE_REGISTRY}" \
+        "${FAKE_INSTALL_ROOT}/harness/harness" "$@"
+}
+
 # Defensive: clear any stragglers from a prior run.
 harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
@@ -369,7 +384,7 @@ restore_image() {
 trap 'restore_image; cleanup' EXIT INT TERM
 
 set +e
-harness_call opencode -p "ignored" >/dev/null 2>&1
+harness_call_capped 60 opencode -p "ignored" >/dev/null 2>&1
 set -e
 restore_image
 trap cleanup EXIT INT TERM
@@ -608,7 +623,7 @@ if harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
 fi
 trap 'restore_image; cleanup' EXIT INT TERM
 set +e
-harness_call opencode -p "ignored" >/dev/null 2>&1
+harness_call_capped 60 opencode -p "ignored" >/dev/null 2>&1
 set -e
 restore_image
 trap cleanup EXIT INT TERM

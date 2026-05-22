@@ -116,14 +116,25 @@ rollback in issue #86. `--format json` does not avoid it either.
 
 The body is always **persisted** to the session regardless of the race, so the
 branch instead: runs `opencode run --format json` (stdout captured to a temp
-file), reads the session id from the `step_start` event, then prints the final
-assistant text from `opencode export <session>` (parsed with `jq` from
+file), learns the session id, then prints the final assistant text from
+`opencode export <session>` (parsed with `jq` from
 `{messages:[{info.role, parts:[{type:"text", text}]}]}`). A fallback extracts
-text parts from the json stream if `export` yields nothing. The run's exit code
-is preserved so the tests' provider-auth skip path keeps working. This trades
-live streaming (irrelevant for single-shot `-p`) for a deterministic final
-answer. The opencode-version coupling and the bump checklist live in the
-`OPENCODE_VERSION` note in `agents/Dockerfile`.
+text parts from the json stream if `export` yields nothing.
+
+The session id is read from the `step_start` event when present, but that same
+non-TTY race **also** drops the whole json stream on ~10% of fast runs (zero
+bytes — not even `step_start`). When the stream yields no id, the branch falls
+back to the newest persisted session for the launch directory via `opencode
+session list --format json` (`max_by(.created)`, directory-scoped with a global
+fallback), which reads the session store directly and is independent of the
+render race. Without this, an empty stream means no id → `export` never runs →
+empty `-p` output (the `full_pipeline_test` T10 failure on the first full CI run
+of opencode 1.15.7).
+
+The run's exit code is preserved so the tests' provider-auth skip path keeps
+working. This trades live streaming (irrelevant for single-shot `-p`) for a
+deterministic final answer. The opencode-version coupling and the bump checklist
+live in the `OPENCODE_VERSION` note in `agents/Dockerfile`.
 
 ### Why a single image for both modes
 

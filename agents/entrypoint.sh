@@ -262,14 +262,26 @@ run_opencode() {
         # preserves the code so the tests' provider-auth skip path still works.
         rc=0
         opencode run --format json "${args[@]}" "${op_args[@]}" >"${events_file}" || rc=$?
+        # Learn the session id. Prefer the json event stream — it names *this*
+        # run's session — but opencode 1.15.x intermittently writes an empty
+        # stream to a non-TTY stdout (the same finalize-before-idle race that
+        # drops the body; ~10% of fast runs emit zero bytes, not even the
+        # step_start that carries the id). When the stream gives us nothing,
+        # fall back to the newest persisted session for this directory via
+        # `opencode session list`, which reads the session store directly and
+        # is independent of the render race.
         sid="$(jq -rs 'map(select(.sessionID))[0].sessionID // empty' "${events_file}" 2>/dev/null || true)"
+        if [[ -z "${sid}" ]]; then
+            sid="$(opencode session list --format json 2>/dev/null \
+                | jq -r --arg dir "$PWD" '((map(select(.directory==$dir)) | max_by(.created) | .id) // (max_by(.created) | .id)) // empty' 2>/dev/null || true)"
+        fi
         text=""
         if [[ -n "${sid}" ]]; then
             text="$(opencode export "${sid}" 2>/dev/null \
                 | jq -r '([.messages[] | select(.info.role=="assistant")] | last | (.parts[]? | select(.type=="text") | .text)) // empty' 2>/dev/null || true)"
         fi
-        # Fallback: if export yielded nothing (e.g. its schema drifted) but the
-        # render race was won, the json stream itself carries the text parts.
+        # Last-ditch: if export yielded nothing but the json stream happened to
+        # carry text parts, use them.
         if [[ -z "${text}" ]]; then
             text="$(jq -rs '[.[] | select(.type=="text") | .part.text] | join("")' "${events_file}" 2>/dev/null || true)"
         fi
