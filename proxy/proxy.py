@@ -97,13 +97,12 @@ def _strip_model_tag(model: str) -> str:
 _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 
 # Cooperative-prompt injection mode. Two cooperative modes plus one bypass
-# are accepted via the PROXY_PROMPT_MODE env var:
-#   "user_front" — DEFAULT. Full scaffolding (tool list + tool-call format
-#                  instructions) on the last user message, with the user's
-#                  request placed BEFORE the tool list rather than after
-#                  it. Puts the request in primacy position; the tool list
-#                  follows at recency. Established baseline.
-#   "hybrid"     — Full tool definitions sit at the stable prefix
+# are accepted. This is no longer a user-facing .env knob: it defaults to
+# "hybrid" and is overridden only via `harness start/restart --prompt-mode
+# <mode>`, which injects PROXY_PROMPT_MODE into the proxy container env for
+# that launch (ephemeral). Keeping the var honored is what keeps all three
+# modes reachable for benchmarking and power use.
+#   "hybrid"     — DEFAULT. Full tool definitions sit at the stable prefix
 #                  (appended to the system message; with the default
 #                  _CHANGE_SYSTEM_TO_USER post-pass this becomes the
 #                  user-role message at index 0). A short reminder
@@ -112,19 +111,27 @@ _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 #                  signatures (`name(required, [optional])`) is prepended
 #                  to the last user message. Tools at prefix + signature
 #                  reminder at recency.
+#   "user_front" — Full scaffolding (tool list + tool-call format
+#                  instructions) on the last user message, with the user's
+#                  request placed BEFORE the tool list rather than after
+#                  it. Puts the request in primacy position; the tool list
+#                  follows at recency. Established baseline; reachable as a
+#                  benchmark/power override.
 #   "passthrough" — Benchmark control. Skips every harness-side mediation:
 #                  no cooperative-prompt injection, no system→user
 #                  rewrite, no history translation. Forwards tools to
 #                  upstream verbatim. Not a cooperative mode; used to
 #                  measure what harness's mediation contributes.
-_PROMPT_MODE: str = "user_front"  # set in main() before serving
+_PROMPT_MODE: str = "hybrid"  # set in main() before serving
 
-# Some upstream APIs silently drop the `system` role. When set, this converts
-# the system message(s) into a user message at the start of the conversation,
-# with a stub assistant message between to satisfy strict role-alternation.
-# Default ON because the failure mode is invisible (the model just doesn't
-# follow system instructions and you may not notice). Set to "0" to disable
-# for upstreams that DO support system roles.
+# The confirmed upstream silently drops the `system` role, so its content
+# must always be converted into a user message at the start of the
+# conversation, with a stub assistant message between to satisfy strict
+# role-alternation. This is a project-managed constant, not a user knob: the
+# upstream takes no system prompt (see architecture/upstream-api.md), so the
+# conversion always has to happen. The `if _CHANGE_SYSTEM_TO_USER:` guard and
+# constant are kept (rather than inlined) to preserve the non-conversion code
+# path for tests.
 _CHANGE_SYSTEM_TO_USER: bool = True
 
 # Hybrid mode only. Tool names whose FULL description is echoed verbatim into
@@ -133,8 +140,9 @@ _CHANGE_SYSTEM_TO_USER: bool = True
 # that opencode documents only as prose inside the tool description — `task`
 # (the valid `subagent_type` agent names) and `skill` (the valid skill
 # names). The per-tool signature list carries the parameter keys but not
-# those values, so the whole description is what has to reach recency. Read
-# from PROXY_HYBRID_DETAIL_TOOLS (comma-separated) in main(); empty disables.
+# those values, so the whole description is what has to reach recency. This is
+# a project-managed constant, not a user knob — the closed set is tied to the
+# opencode tools we ship for, so there is nothing for a user to tune.
 _HYBRID_DETAIL_TOOLS: List[str] = ["task", "skill"]
 
 # opencode builds the `task` tool's description by appending a dynamic agent
@@ -170,38 +178,22 @@ _HOST_OS: str = ""
 # ---------------------------------------------------------------------------
 
 def _setup_prompt_mode() -> None:
-    """Read PROXY_PROMPT_MODE from the env, validate, and set the module
-    global. Invalid values fall back to 'user_front' with a warning."""
+    """Read PROXY_PROMPT_MODE from the container env, validate, and set the
+    module global. The var is no longer a user .env knob: it is absent for
+    normal launches (the proxy then uses the 'hybrid' default) and is set only
+    when `harness start/restart --prompt-mode <mode>` injects it for a
+    benchmark/power launch. Invalid or absent values fall back to 'hybrid'."""
     global _PROMPT_MODE
-    raw = os.environ.get("PROXY_PROMPT_MODE", "user_front").strip().lower()
+    raw = os.environ.get("PROXY_PROMPT_MODE", "hybrid").strip().lower()
     valid = ("hybrid", "user_front", "passthrough")
     if raw not in valid:
         print(
             f"[!] PROXY_PROMPT_MODE='{raw}' is not one of "
-            f"{'/'.join(valid)}; defaulting to 'user_front'",
+            f"{'/'.join(valid)}; defaulting to 'hybrid'",
             flush=True,
         )
-        raw = "user_front"
+        raw = "hybrid"
     _PROMPT_MODE = raw
-
-
-def _setup_change_system_to_user() -> None:
-    global _CHANGE_SYSTEM_TO_USER
-    raw = os.environ.get("PROXY_CHANGE_SYSTEM_PROMPT_TO_USER", "1").strip().lower()
-    _CHANGE_SYSTEM_TO_USER = raw not in ("0", "false", "no", "off", "")
-    print(f"[i] convert system to user: {_CHANGE_SYSTEM_TO_USER}", flush=True)
-
-
-def _setup_hybrid_detail_tools() -> None:
-    """Read PROXY_HYBRID_DETAIL_TOOLS (comma-separated tool names) and set the
-    module global. Names are trimmed and blanks dropped. An empty value
-    disables the feature (no TOOL_DETAIL blocks emitted). Only consulted in
-    hybrid mode."""
-    global _HYBRID_DETAIL_TOOLS
-    raw = os.environ.get("PROXY_HYBRID_DETAIL_TOOLS", "task,skill")
-    names = [n.strip() for n in raw.split(",") if n.strip()]
-    _HYBRID_DETAIL_TOOLS = names
-    print(f"[i] hybrid detail tools: {', '.join(names) or '(none)'}", flush=True)
 
 
 def _setup_host_os() -> None:
@@ -1378,8 +1370,6 @@ def main() -> None:
     _validate_config()
     _OUTPUT_DIR = init_output_dir()
     _setup_prompt_mode()
-    _setup_change_system_to_user()
-    _setup_hybrid_detail_tools()
     _setup_host_os()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()

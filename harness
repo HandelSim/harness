@@ -74,6 +74,13 @@ state_root="$install_root/state"
 env_file="$install_root/.env"
 runtime_override="$state_root/.harness-runtime.yml"
 
+# Ephemeral cooperative-prompt mode for this invocation. Empty unless
+# `harness start/restart --prompt-mode <mode>` was passed; when set it is
+# injected into the proxy container's env (PROXY_PROMPT_MODE) by
+# write_runtime_override. Never persisted — a later bare start/restart reverts
+# the proxy to its built-in "hybrid" default. See _parse_prompt_mode_flag.
+prompt_mode_override=""
+
 # Universal egress firewall allowlist. Bind-mounted into every harness
 # container at /etc/harness/allowlist. install.sh seeds this from
 # .harness-allowlist.example on a fresh install. Tests can override by
@@ -662,15 +669,19 @@ mcp_set_enabled() {
 # `harness net open/close` or PUBLISH_OLLAMA_PORT propagates immediately on
 # the next `harness start` / `harness restart`.
 #
-# Two pieces of state can land in the override:
+# Three pieces of state can land in the override:
 #   1. PUBLISH_OLLAMA_PORT — publishes ollama on a host port if non-empty.
 #   2. .harness-net-overrides.json — per-service `firewall_disabled: true`
 #      becomes an environment block on that service that the firewall
 #      init-script honors as an opt-out.
+#   3. prompt_mode_override — an ephemeral `--prompt-mode <mode>` from this
+#      start/restart invocation, injected as PROXY_PROMPT_MODE on the proxy
+#      service. Folded into the proxy block from (2) when proxy also has a
+#      firewall opt-out, so only one `proxy:` mapping is emitted.
 #
-# When both pieces are empty the override file is removed entirely (compose
+# When all three are empty the override file is removed entirely (compose
 # is invoked without the -f flag). This keeps `harness start` exactly as it
-# was for installs that don't use either feature.
+# was for installs that don't use any of these features.
 write_runtime_override() {
     # Build the body in a temp variable, write only if non-empty.
     local body=""
@@ -704,6 +715,7 @@ write_runtime_override() {
     # invocation has no use for per-service overrides, and the outer call
     # still emits them once its harness_jq returns. `local` gives the flag
     # dynamic scope so it clears automatically when the outer call returns.
+    local proxy_emitted=0
     if [[ -f "$net_overrides_path" && -z "${_harness_wro_in_progress:-}" ]]; then
         local _harness_wro_in_progress=1
         local svc
@@ -714,12 +726,29 @@ write_runtime_override() {
             body+="  ${svc}:"$'\n'
             body+="    environment:"$'\n'
             body+="      HARNESS_FIREWALL_DISABLED: \"1\""$'\n'
+            # Fold an ephemeral --prompt-mode override into the SAME proxy
+            # environment block rather than emitting a second `proxy:` mapping
+            # below (duplicate top-level service keys are invalid compose YAML).
+            if [[ "$svc" == "proxy" && -n "$prompt_mode_override" ]]; then
+                body+="      PROXY_PROMPT_MODE: \"${prompt_mode_override}\""$'\n'
+                proxy_emitted=1
+            fi
         done < <(harness_jq -r '
             (.services // {})
             | to_entries[]
             | select(.value.firewall_disabled == true)
             | .key
         ' "$net_overrides_path" 2>/dev/null || true)
+    fi
+
+    # 3. Ephemeral cooperative-prompt mode (`start/restart --prompt-mode`).
+    # Injected into the proxy container env for this launch only. If the
+    # firewall loop above already emitted a `proxy:` block we appended it
+    # there; otherwise emit a standalone block here.
+    if [[ -n "$prompt_mode_override" && "$proxy_emitted" -eq 0 ]]; then
+        body+="  proxy:"$'\n'
+        body+="    environment:"$'\n'
+        body+="      PROXY_PROMPT_MODE: \"${prompt_mode_override}\""$'\n'
     fi
 
     if [[ -z "$body" ]]; then
@@ -1158,11 +1187,16 @@ Running 'harness' with no command — or with only agent flags such as --yolo,
 --net, --mount, or -p — launches an opencode agent in the current directory.
 
 commands:
-  start                 build and bring up the ollama + proxy services.
+  start [--prompt-mode M]  build and bring up the ollama + proxy services.
                         Run automatically by bare 'harness'; rarely needed
-                        by hand.
+                        by hand. --prompt-mode sets the proxy's cooperative-
+                        prompt mode (hybrid (default) / user_front /
+                        passthrough) for THIS launch only — ephemeral, for
+                        benchmarking/power use; a later bare start reverts to
+                        hybrid.
   down                  stop the ollama + proxy services (does NOT touch agents)
-  restart               down + start (preserves per-invocation state)
+  restart [--prompt-mode M]  down + start (preserves per-invocation state).
+                        Accepts the same --prompt-mode flag as start.
   update                git pull --ff-only in the clone
   upgrade [flags]       pull + apply manifest + rebuild images + restart
                         flags: --check (dry-run preview, no pull),
@@ -1253,7 +1287,43 @@ notes:
 EOF
 }
 
+# Parse the optional `--prompt-mode <mode>` flag out of start/restart args and
+# set the global prompt_mode_override (validated against the three modes the
+# proxy accepts). The mode is ephemeral — see prompt_mode_override and
+# write_runtime_override. Any other argument is rejected so a typo doesn't pass
+# silently. Accepts both `--prompt-mode hybrid` and `--prompt-mode=hybrid`.
+_parse_prompt_mode_flag() {
+    while (( $# )); do
+        case "$1" in
+            --prompt-mode)
+                shift
+                prompt_mode_override="${1:-}"
+                if [[ -z "$prompt_mode_override" ]]; then
+                    err "--prompt-mode requires a value (hybrid, user_front, or passthrough)"
+                    exit 1
+                fi
+                ;;
+            --prompt-mode=*)
+                prompt_mode_override="${1#--prompt-mode=}"
+                ;;
+            *)
+                err "unknown option '$1' (start/restart accept only --prompt-mode <mode>)"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+    case "$prompt_mode_override" in
+        ""|hybrid|user_front|passthrough) ;;
+        *)
+            err "invalid --prompt-mode '$prompt_mode_override' (expected hybrid, user_front, or passthrough)"
+            exit 1
+            ;;
+    esac
+}
+
 cmd_start() {
+    _parse_prompt_mode_flag "$@"
     require_runtime_config
     require_docker
     ensure_dirs
@@ -1353,8 +1423,11 @@ cmd_down() {
 # Implementation is exactly down + start so any future change to either is
 # inherited automatically.
 cmd_restart() {
+    _parse_prompt_mode_flag "$@"
     require_docker
     cmd_down
+    # prompt_mode_override is already set as a global; cmd_start re-parses an
+    # empty arg list (a no-op that leaves the global intact).
     cmd_start
 }
 
@@ -4894,9 +4967,9 @@ main() {
 
     case "$cmd" in
         help)                       cmd_help ;;
-        start)                      cmd_start ;;
+        start)                      cmd_start "$@" ;;
         down)                       cmd_down ;;
-        restart)                    cmd_restart ;;
+        restart)                    cmd_restart "$@" ;;
         update)                     cmd_update ;;
         upgrade)                    cmd_upgrade "$@" ;;
         downgrade)                  cmd_downgrade "$@" ;;
