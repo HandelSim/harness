@@ -297,6 +297,15 @@ conversation it actually sent. `_estimate_tokens` is called on the
 joined translated messages so the agent always sees a stable count.
 `completion_tokens` is taken from upstream if present, else estimated.
 
+The estimator uses `len(text) // 3`, not the prose rule-of-thumb of 4.
+Agent turns are dominated by code, JSON-formatted tool-call blocks, and
+verbatim tool results, which BPE tokenizers pack denser than prose
+(roughly 2.5–3.5 chars/token). The joined text also omits role/chat-
+template framing, which is real tokens upstream. Both effects bias a
+chars/4 estimate low and delayed auto-compaction past the true limit;
+chars/3 closes that gap without being aggressive enough to compact
+prematurely on prose-heavy turns.
+
 ## Config and validation
 
 Module-level env reads at startup:

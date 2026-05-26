@@ -1827,7 +1827,7 @@ class TestUsageOverride(unittest.TestCase):
         return FakeResp()
 
     def test_prompt_tokens_overridden_with_local_estimate(self):
-        long_user_msg = "x" * 4000  # ~1000 tokens at the chars/4 estimate
+        long_user_msg = "x" * 4000  # ~1333 tokens at the chars/3 estimate
         ollama_request = {
             "model": "GenAI",
             "messages": [

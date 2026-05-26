@@ -1072,7 +1072,10 @@ def translate_history_and_apply_prompt(
 # ---------------------------------------------------------------------------
 
 def _estimate_tokens(text: str) -> int:
-    n = max(1, len(text) // 4)
+    # Divisor of 3 (not the prose rule-of-thumb 4) reflects that agent
+    # turns are dominated by code, JSON tool-call blocks, and verbatim
+    # tool results, which BPE tokenizers pack denser than prose.
+    n = max(1, len(text) // 3)
     return min(n, OLLAMA_CONTEXT_LENGTH)
 
 
