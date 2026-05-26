@@ -739,6 +739,67 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("Do not present guesses as facts", last_user)
         self.assertIn("I don't know", last_user)
 
+    def test_mode_hybrid_reminder_has_agency_assertion(self):
+        """The Agency line asserts that tool calls really execute against the
+        working directory mounted from the user's machine and results are
+        real — the missing anchor for issue #109's reversion to "I can't
+        execute, here are commands you should run" right after a tool call."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("Agency:", last_user)
+        self.assertIn("really execute", last_user)
+        self.assertIn("results you get back are real", last_user)
+        # Don't downgrade to handing the user commands.
+        self.assertIn("don't downgrade to listing commands", last_user)
+        # The legitimate fallback (when no tool fits) stays available.
+        self.assertIn("just ask or answer", last_user)
+
+    def test_mode_hybrid_reminder_agency_names_opencode(self):
+        """The Agency line names opencode as the disambiguator from the
+        upstream's own (phantom) tools/subagents — bare "agency"/"tools"
+        could otherwise re-resolve to the upstream's persona."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("opencode", last_user)
+        # Specifically the opencode tools (not just "tools") are the
+        # referent for what to call.
+        self.assertIn("opencode tools", last_user)
+
+    def test_mode_hybrid_reminder_agency_points_at_both_tool_anchors(self):
+        """The Agency line tells the model the tools are listed both in this
+        reminder (signature list — survives dilution) AND in
+        <<<BEGIN_AGENT_TOOLS>>> earlier in the conversation (authoritative
+        copy that may have drifted out of attention on long conversations)."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        agency_start = last_user.index("Agency:")
+        # Slice from Agency to the next labelled line so we test the Agency
+        # clause specifically, not the existing Tools clause beneath it.
+        agency_block = last_user[agency_start:last_user.index("- Tools:", agency_start)]
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", agency_block)
+        self.assertIn("this reminder", agency_block)
+
+    def test_mode_hybrid_reminder_agency_is_first_label(self):
+        """Agency is the premise for everything else in the reminder, so it
+        sits as the first label — before Tools/Workflow/Honesty/Environment."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertLess(last_user.index("- Agency:"), last_user.index("- Tools:"))
+        self.assertLess(last_user.index("- Agency:"), last_user.index("- Workflow:"))
+        self.assertLess(last_user.index("- Agency:"), last_user.index("- Honesty:"))
+        self.assertLess(last_user.index("- Agency:"), last_user.index("- Environment:"))
+
+    def test_mode_hybrid_reminder_agency_is_proxy_stage_direction(self):
+        """The Agency line is part of the recency reminder (proxy
+        stage-direction), so it lives OUTSIDE the wrapped user message — same
+        as the rest of the reminder."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertLess(
+            last_user.index("Agency:"),
+            last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
+        )
+
     def test_mode_hybrid_reminder_has_environment_context(self):
         """The Environment line states the container / mounted-workdir /
         reproducibility facts so agents give reproducible setup advice."""
