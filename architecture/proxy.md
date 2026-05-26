@@ -89,17 +89,25 @@ validator in `_setup_prompt_mode` accepts:
 - **`hybrid`** (default) — full tool definitions appended to the system message
   (which `_CHANGE_SYSTEM_TO_USER` then folds into the user-role message at
   index 0, the "stable prefix" position). A short recency reminder is
-  prepended to the last user message, organised as four labelled lines —
-  **Tools** (JSON envelope, no-fabricated-results rule, a pointer back to
-  `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions), **Workflow** (prefer a
-  listed tool over hand-work — e.g. `webfetch` over curl/a script — keep a
-  live plan with `todowrite`/`todoread`, launch `task` agents several
-  concurrently to parallelise and conserve context), **Honesty**
-  (anti-fabrication: no invented names/paths/signatures/citations), and
-  **Environment** (the proxy runs in a Linux container with the working
-  directory mounted from the host — host OS named when known, see
-  [Host-OS injection](#host-os-injection) — so reproducible setup must live
-  in the working directory, not the container). The line closes with each
+  prepended to the last user message, organised as five labelled lines —
+  **Agency** (positive assertion that the model acts through opencode and
+  its ```json calls really execute against the working directory mounted
+  from the user's machine, with results that are real; named target for
+  the ~20% reversion to the upstream's "I can't execute, here are commands
+  for you to run" persona that surfaces even right after a successful tool
+  call — issue #109; points at both `<<<BEGIN_AGENT_TOOLS>>>` and the
+  signature list later in this same reminder, because the former is
+  authoritative but drifts on long conversations — which is exactly when
+  the reversion fires), **Tools** (JSON envelope, no-fabricated-results
+  rule, a pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions),
+  **Workflow** (prefer a listed tool over hand-work — e.g. `webfetch` over
+  curl/a script — keep a live plan with `todowrite`/`todoread`, launch
+  `task` agents several concurrently to parallelise and conserve context),
+  **Honesty** (anti-fabrication: no invented names/paths/signatures/
+  citations), and **Environment** (the proxy runs in a Linux container
+  with the working directory mounted from the host — host OS named when
+  known, see [Host-OS injection](#host-os-injection) — so reproducible
+  setup must live in the working directory, not the container). The line closes with each
   tool's parameter signature (`name(required, [optional])` per tool). The
   signature list — not just bare
   names — is the recency anchor for the parameter keys models most often

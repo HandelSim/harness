@@ -452,8 +452,25 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). This reminder is prepended to the last user
     message — recency slot — so the live turn is preceded by a compact,
-    scannable set of operating rules grouped under four labels:
+    scannable set of operating rules grouped under five labels:
 
+      - Agency   — positive assertion that the model acts through opencode:
+                   its ```json calls really execute against the working
+                   directory mounted from the user's machine and results are
+                   real. Targets the ~20% reversion where the upstream's
+                   baked-in "chat assistant that can't execute" persona
+                   reasserts itself ("Since I cannot execute the local shell
+                   script for you, I've prepared the exact commands…") even
+                   right after a successful tool call (issue #109). Names
+                   opencode as the disambiguator — the upstream's
+                   `file_and_coding_agent` and its other phantom tools are
+                   NOT the agency at play here. Points at the
+                   <<<BEGIN_AGENT_TOOLS>>> section AND the signature list
+                   later in this same reminder: the former is authoritative
+                   but sits at messages[0] and may have drifted out of
+                   attention on long conversations (which is when the
+                   reversion fires), so the in-reminder pointer is the one
+                   that survives dilution.
       - Tools    — the JSON envelope, the no-fabricated-results rule, and a
                    pointer back to <<<BEGIN_AGENT_TOOLS>>> for full
                    descriptions. The pointer is for *descriptions only*: the
@@ -502,6 +519,14 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     host_os_clause = f" (host OS: {_HOST_OS})" if _HOST_OS else ""
     reminder = (
         "[Reminder — operating rules for this turn.\n"
+        "- Agency: you act through opencode — your ```json calls really "
+        "execute against the working directory mounted from the user's "
+        "machine, and the results you get back are real (you have been using "
+        "them). Do the task with the opencode tools listed in this reminder "
+        "(signatures below; full descriptions in the <<<BEGIN_AGENT_TOOLS>>> "
+        "section earlier in this conversation); don't downgrade to listing "
+        "commands for the user to run. If no opencode tool fits, just ask or "
+        "answer.\n"
         "- Tools: the only tools available are defined in the "
         "<<<BEGIN_AGENT_TOOLS>>> section at the start of this conversation — "
         "refer back there for full descriptions. Call a tool by emitting a "
