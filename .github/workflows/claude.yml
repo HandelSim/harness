@@ -17,7 +17,7 @@ concurrency:
 jobs:
   claude:
     if: |
-      (github.event.sender.login == 'HandelSim') &&
+      (github.event.sender.type != 'Bot') &&
       (
         (github.event_name == 'issues' &&
           contains(github.event.issue.body, '@claude')) ||
