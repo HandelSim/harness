@@ -22,6 +22,16 @@ FROM node:20-bookworm-slim
 #                    have it land under ~/.local/ (which is bind-mounted out
 #                    via the persistent home). pipx solves competing dep
 #                    sets for skill-style installers (graphify, etc.)
+#   build-essential + python3-dev
+#                  — C toolchain + Python headers so pipx/pip can build sdists
+#                    of native Python extensions. Required because skill
+#                    installers in the wild pull tree-sitter language
+#                    grammars (e.g. graphifyy >=0.8.22 depends on
+#                    `tree-sitter-dm`, which publishes only an sdist with no
+#                    Linux wheels). Without these, `pipx install graphifyy`
+#                    aborts on the gcc invocation. README explicitly directs
+#                    users to that command, so the agent image must be able
+#                    to compile.
 #   iptables, ipset, dnsutils, iproute2 — required by init-firewall.sh
 #   locales        — without it the container LANG defaults to POSIX, which
 #                    makes opencode fall back to ASCII underscores instead of
@@ -38,7 +48,9 @@ RUN apt-get update \
         python3 \
         python3-pip \
         python3-venv \
+        python3-dev \
         pipx \
+        build-essential \
         iptables \
         ipset \
         dnsutils \
