@@ -284,6 +284,16 @@ Blocks that fail to parse, aren't dicts, or are missing `name`/`arguments`
 are LEFT in the text — `clean_text` contains them as-is. (The LLM may
 have been describing JSON, not asking to invoke a tool.)
 
+Parsing uses `json.loads(..., strict=False)` so unescaped control
+characters inside string values (literal `\n`, `\t`, `\r`) are accepted.
+Models often emit a multi-line `python -c "..."` or heredoc as a
+`command` argument with **real** newline bytes inside the JSON string
+rather than `\\n` escapes — strict JSON forbids this, but rejecting the
+block means the whole fenced payload bleeds into chat as raw text
+(issue #115). The leniency only widens what counts as a valid tool call;
+balanced-brace scanning, the `name`/`arguments` shape check, and the
+"left in text on parse failure" behaviour are unchanged.
+
 ## NDJSON streaming
 
 `generate_ndjson` yields ollama-compatible streaming chunks: a sequence

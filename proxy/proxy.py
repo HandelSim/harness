@@ -623,6 +623,13 @@ def extract_tool_calls_and_text(response_text):
     which is correct: the LLM may have been describing JSON, not asking
     to invoke a tool).
 
+    Parsing uses `strict=False` so unescaped control characters inside
+    string values are accepted — LLMs commonly emit a multi-line
+    `python -c "..."` or heredoc as the `command` value with real `\n`
+    bytes instead of `\\n` escapes. Strict mode (the json.loads default)
+    rejects those and the block bleeds into chat as raw fenced text;
+    issue #115 was exactly that.
+
     Returns (payloads, clean_text). payloads is a list (possibly empty)
     of {name, arguments} dicts in the order they appeared. clean_text is
     response_text with all VALID extracted blocks removed.
@@ -665,7 +672,7 @@ def extract_tool_calls_and_text(response_text):
                 block_end = closing_fence_pos + 3
 
         try:
-            candidate = json.loads(json_str)
+            candidate = json.loads(json_str, strict=False)
         except json.JSONDecodeError:
             pos = after_json
             continue

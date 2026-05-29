@@ -412,6 +412,47 @@ After block.'''
         self.assertNotIn("/a", clean)
         self.assertNotIn("/b", clean)
 
+    def test_literal_newlines_in_string_value(self):
+        """Issue #115 — model emits a multi-line `python -c "..."` as the
+        bash `command` value with real `\\n` bytes inside the JSON string
+        instead of `\\\\n` escapes. Strict json.loads rejects unescaped
+        control characters in strings; we must accept them, otherwise the
+        whole fenced block falls through to clean_text and bleeds into
+        chat. strict=False is the json.loads flag for this."""
+        text = (
+            "```json\n"
+            "{\n"
+            '  "name": "bash",\n'
+            '  "arguments": {\n'
+            '    "command": "python3 -c \\"\n'
+            "import os\n"
+            "print(os.getcwd())\n"
+            '\\"",\n'
+            '    "description": "Print cwd."\n'
+            "  }\n"
+            "}\n"
+            "```"
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(len(payloads), 1, "literal-newline JSON must still extract")
+        self.assertEqual(payloads[0]["name"], "bash")
+        self.assertIn("import os", payloads[0]["arguments"]["command"])
+        self.assertEqual(payloads[0]["arguments"]["description"], "Print cwd.")
+        self.assertNotIn("```json", clean)
+        self.assertNotIn("import os", clean)
+
+    def test_literal_tab_in_string_value(self):
+        """Tabs (U+0009) are also control characters that strict json.loads
+        rejects inside strings. Same fix covers them."""
+        text = (
+            "```json\n"
+            '{"name": "bash", "arguments": {"command": "echo a\tb"}}\n'
+            "```"
+        )
+        payloads, _ = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["arguments"]["command"], "echo a\tb")
+
     def test_generate_ndjson_emits_multiple_tool_calls(self):
         """Multiple tool calls produce a single tool_calls array in one chunk,
         each with a unique id."""
