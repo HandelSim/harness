@@ -103,9 +103,16 @@ validator in `_setup_prompt_mode` accepts:
   `todowrite`; launch `task` agents in parallel when independent; pointer
   back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions),
   **Honesty** (anti-fabrication: no invented names/paths/signatures/
-  citations), and **Environment** (the proxy runs in a Linux container
-  with the working directory mounted from the host — host OS named when
-  known, see [Host-OS injection](#host-os-injection) — so reproducible
+  citations; **plus** the addition from issue #110: any claim about the
+  working directory, its contents, or local filesystem state must come
+  from a tool result, AND no naming of a remembered training path
+  (`/home/<name>`, `/workspace`, `/sandbox`) — see
+  [Working-directory echo](#working-directory-echo) for why), and
+  **Environment** (the proxy runs in a Linux container with the working
+  directory mounted from the host — host OS named when known, see
+  [Host-OS injection](#host-os-injection); the live host CWD is echoed
+  inline so "this folder" / "here" resolve to the real path, see
+  [Working-directory echo](#working-directory-echo) — so reproducible
   setup must live in the working directory, not the container). Below the
   bullets is **one entry per tool** — signature, one-line guidance from
   `_HYBRID_TOOL_GUIDANCE`, and (for "detail tools") the verbatim closed-set
@@ -274,6 +281,30 @@ The header is byte-stable across opencode releases (verified 1.14.41 and
 agent list), and `proxy/test_proxy.py` `TestTaskDescriptionParing` is the
 canary that flags the drift. Every other detail tool, including `skill`
 (its description is short), is inlined whole.
+
+## Working-directory echo
+
+The reminder's **Environment** line echoes the live host CWD inline (e.g.
+`The working directory for this turn is \`/c/Users/.../ENC\` — when the
+user says "this folder", "here", "my machine", or "the workspace", they
+mean exactly that path.`). The Environment bullet without this anchor
+described **where** the working directory came from (host bind-mount) but
+not **which path it was**, which let the upstream's pretrained sense of
+its own sandbox win — `/home/bard`, `/home/user`, `/workspace`, etc. —
+when asked "what's in this folder?". Pairing the positive anchor with
+Honesty's prohibition on naming a remembered training path closes both
+sides: here's the right answer, and here's what not to say.
+
+`_extract_working_directory(system_content)` pulls the path from
+`Working directory: <path>` inside `messages[0]`'s content at request
+time. The system message is still role `system` when the recency builder
+runs (the `_CHANGE_SYSTEM_TO_USER` post-pass runs later), so the regex
+sees the inbound agent prompt — opencode's `<env>` block carries this
+line at a stable label. If the label is missing or unparsable (a future
+opencode rename, a non-opencode upstream), the Environment line falls
+back to the prior wording (host OS only) — graceful degradation, never
+a hard fail. Honesty's no-training-path clause renders unconditionally
+because it's load-bearing whether or not the CWD anchor was found.
 
 ## Host-OS injection
 

@@ -581,7 +581,30 @@ def _format_tool_entries(tool_signatures, tool_details=None):
     return f"\n\n{legend}\n" + "\n".join(lines)
 
 
-def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None):
+_WORKING_DIR_RE = re.compile(r"Working directory:\s*(\S[^\n]*)")
+
+
+def _extract_working_directory(system_content):
+    """Pull `Working directory: <path>` out of the opencode `<env>` block in
+    a system/agent-instructions message. Returns the trimmed path string or
+    None if the marker isn't present (non-opencode upstream, or upstream
+    changes the label).
+
+    The path is echoed at recency in the Environment bullet so the model
+    answers questions like "what's in this folder?" against the host's
+    bind-mounted CWD rather than from a pretrained sense of its own
+    sandbox path (e.g. `/home/bard`, `/workspace`). Missing or unparsable
+    => recency degrades gracefully to the prior wording (host OS only).
+    """
+    if not system_content:
+        return None
+    m = _WORKING_DIR_RE.search(system_content)
+    if not m:
+        return None
+    return m.group(1).strip() or None
+
+
+def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None, working_directory=None):
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). The recency message that lands on the LAST user
@@ -654,6 +677,14 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
             f"<<<BEGIN_USER_REQUEST>>>\n{content}\n<<<END_USER_REQUEST>>>"
         )
     host_os_clause = f" (host OS: {_HOST_OS})" if _HOST_OS else ""
+    if working_directory:
+        cwd_clause = (
+            f" The working directory for this turn is `{working_directory}` — "
+            "when the user says \"this folder\", \"here\", \"my machine\", or "
+            "\"the workspace\", they mean exactly that path."
+        )
+    else:
+        cwd_clause = ""
     tool_entries = _format_tool_entries(tool_signatures, tool_details)
     reminder = (
         "[Reminder — operating rules for this turn.\n"
@@ -673,16 +704,22 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         "your context. If no opencode tool fits, just ask or answer.\n"
         "- Honesty: never fabricate. Do not present guesses as facts — no "
         "invented function names, file paths, signatures, config keys, or "
-        "citations. \"I don't know\" or \"I'd need to check X\" are valid "
-        "answers — then check.\n"
+        "citations. Any claim about the working directory, its contents, or "
+        "local filesystem state must come from a tool result in this "
+        "conversation — if no tool produced it, you don't know. Do not name "
+        "a path you remember from training (e.g. `/home/<name>`, "
+        "`/workspace`, `/sandbox`); the only valid filesystem paths are the "
+        "one named in Environment below and what tool results return. "
+        "\"I don't know\" or \"I'd need to check X\" are valid answers — "
+        "then check.\n"
         "- Environment: you run in a Linux container with the current working "
-        f"directory mounted from the host{host_os_clause}. Your work must "
-        "reproduce in the user's environment, not this container — anything "
-        "installed only here (e.g. a global/system venv) the user cannot run. "
-        "Put reproducible setup in the working directory (e.g. a project-local "
-        "venv + requirements.txt); a venv built here is Linux-native, so on a "
-        "non-Linux host the user may need to recreate it (python -m venv .venv "
-        "&& pip install -r requirements.txt)."
+        f"directory mounted from the host{host_os_clause}.{cwd_clause} Your "
+        "work must reproduce in the user's environment, not this container — "
+        "anything installed only here (e.g. a global/system venv) the user "
+        "cannot run. Put reproducible setup in the working directory (e.g. a "
+        "project-local venv + requirements.txt); a venv built here is "
+        "Linux-native, so on a non-Linux host the user may need to recreate "
+        "it (python -m venv .venv && pip install -r requirements.txt)."
         f"{tool_entries}]"
     )
     return f"{wrapped}\n\n{reminder}"
@@ -1213,10 +1250,23 @@ def translate_history_and_apply_prompt(
                 # messages carry TOOL_RESULT markers already; the builder
                 # passes those through.
                 live_content = _flatten_content_to_str(messages[-1]["content"])
+                # Pull the host CWD from the inbound opencode `<env>` block
+                # at messages[0] so the recency Environment line can echo
+                # exactly where "this folder" lives — without that anchor,
+                # the model has answered from a pretrained sandbox path
+                # (e.g. `/home/bard`) when the upstream's prior wins out
+                # over harness's "you act through opencode" framing.
+                system_content = (
+                    _flatten_content_to_str(messages[0]["content"])
+                    if messages and messages[0]["role"] == "system"
+                    else ""
+                )
+                working_directory = _extract_working_directory(system_content)
                 messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
                     live_content,
                     signatures,
                     details,
+                    working_directory=working_directory,
                 )
 
     # Convert system role to user role if configured. Some upstream APIs

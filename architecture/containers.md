@@ -125,11 +125,12 @@ in `agents/Dockerfile`, not opencode's self-update) and `OPENCODE_ENABLE_EXA=1`
 (opens up opencode's built-in `websearch` tool, which is otherwise hidden when
 the openai-compatible provider is in use — the official OpenCode provider is
 opencode's other gate for it, and we're not that). The websearch call hits
-Exa's hosted MCP at `mcp.exa.ai`, which the egress firewall blocks unless the
-user adds the host to `.harness-allowlist` (the example file ships it
-commented out under "Optional: websearch (Exa)"). Without the allowlist entry
-the tool surfaces but invocations return a network error — preferred over the
-prior failure mode of the tool silently not being there.
+Exa's hosted MCP at `mcp.exa.ai`; the egress firewall blocks it by design
+(no separate allowlist entry — websearch belongs to the same
+firewall-down / `--net` use case as the rest of unrestricted egress), and
+when the firewall is off it's reachable like any other host. Without
+reachability the tool surfaces but invocations return a network error,
+preferred over the prior failure mode of the tool silently not being there.
 
 ### Headless `-p` output recovery
 
