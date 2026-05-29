@@ -1669,6 +1669,77 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         # TOOL_RESULT content at the front, reminder behind it.
         self.assertLess(c.index("<<<END_TOOL_RESULT>>>"), c.index("Reminder"))
 
+    def test_guidance_map_covers_known_opencode_tools(self):
+        """The `_HYBRID_TOOL_GUIDANCE` map is the union of tools harness
+        knows about — including situational/optional ones opencode ships
+        only when enabled (`websearch`, `lsp`, `apply_patch`, `question`,
+        `repo_clone`/`repo_overview`, `plan-enter`/`plan-exit`). The cost
+        of a stale entry is zero (it never renders unless the tool is
+        passed for the turn), and the cost of missing an entry the moment
+        a tool starts shipping is a bare signature with no failure-mode
+        hint — so the map errs toward broader coverage. This test is the
+        canary that flags accidental removal."""
+        required = {
+            "apply_patch", "bash", "edit", "glob", "grep", "lsp",
+            "plan-enter", "plan-exit", "question", "read", "repo_clone",
+            "repo_overview", "skill", "task", "todowrite", "webfetch",
+            "websearch", "write",
+        }
+        self.assertTrue(
+            required.issubset(set(proxy._HYBRID_TOOL_GUIDANCE.keys())),
+            "missing keys in _HYBRID_TOOL_GUIDANCE: "
+            f"{sorted(required - set(proxy._HYBRID_TOOL_GUIDANCE.keys()))}",
+        )
+
+    def test_optional_tool_renders_guidance_when_passed(self):
+        """`websearch` is opencode-disabled by default and only ships when
+        the agent env sets OPENCODE_ENABLE_EXA=1. When it IS in the tools
+        list, the recency block must render its guidance line — exercising
+        the same code path as for always-shipped tools like `bash`."""
+        tools = self.tools + [{"function": {
+            "name": "websearch",
+            "description": "Search the web.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "type": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+        }}]
+        tools_text = proxy.format_tools_to_text(tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(
+                self.user_msgs, tools_text, tools=tools,
+            )
+        c = out[-1]["content"]
+        self.assertIn(
+            "- websearch(query, [type]) — Live web search via the session's "
+            "web search provider",
+            c,
+        )
+        # Year-framing reminder, the most common misuse.
+        self.assertIn("Use the current year in queries", c)
+
+    def test_optional_tool_not_in_block_when_absent(self):
+        """An entry in `_HYBRID_TOOL_GUIDANCE` for a tool the agent isn't
+        currently passing must NOT render — the per-turn block only shows
+        what's actually available. Guards against the registry causing
+        per-turn token regressions on stripped-down toolsets."""
+        c = self._translate()[-1]["content"]
+        # `self.tools` is the baseline 4-tool set (bash/todowrite/task/skill).
+        # None of the optional-tool guidance strings should appear, even
+        # though all those entries exist in the map.
+        for absent in (
+            "websearch", "apply_patch", "lsp", "plan-enter", "plan-exit",
+            "question", "repo_clone", "repo_overview",
+        ):
+            self.assertNotIn(
+                f"- {absent}", c,
+                f"unexpected guidance for absent tool {absent!r} in recency",
+            )
+
 
 class TestHostOsSetup(unittest.TestCase):
     """`_setup_host_os` reads HARNESS_HOST_OS (injected by the harness CLI from

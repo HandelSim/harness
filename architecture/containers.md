@@ -111,10 +111,25 @@ After the drop, still in the entrypoint:
   models discovered at start; `DEFAULT_MODEL_NAME` is always included and is the
   default selection (`harness/<DEFAULT_MODEL_NAME>`). Built with `jq` and
   re-written every launch because the model set may have changed. Falls back
-  to `DEFAULT_MODEL_NAME` alone if ollama isn't reachable.
+  to `DEFAULT_MODEL_NAME` alone if ollama isn't reachable. The yolo agent's
+  `permission` block grants `edit`, `bash` (all commands), `webfetch`, and
+  `websearch` — matching the set of tools the agent ships so yolo mode
+  doesn't trip on the new ones.
 - `merge_opencode_mcp_servers` translates the canonical `{"mcpServers": {...}}`
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.
+
+`run_opencode` exports two static opencode env vars before the launch:
+`OPENCODE_DISABLE_AUTOUPDATE=1` (we manage the version via `OPENCODE_VERSION`
+in `agents/Dockerfile`, not opencode's self-update) and `OPENCODE_ENABLE_EXA=1`
+(opens up opencode's built-in `websearch` tool, which is otherwise hidden when
+the openai-compatible provider is in use — the official OpenCode provider is
+opencode's other gate for it, and we're not that). The websearch call hits
+Exa's hosted MCP at `mcp.exa.ai`, which the egress firewall blocks unless the
+user adds the host to `.harness-allowlist` (the example file ships it
+commented out under "Optional: websearch (Exa)"). Without the allowlist entry
+the tool surfaces but invocations return a network error — preferred over the
+prior failure mode of the tool silently not being there.
 
 ### Headless `-p` output recovery
 

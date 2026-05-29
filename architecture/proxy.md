@@ -234,6 +234,17 @@ together. Each entry is a single bullet that combines:
    Tools absent from the map render as a bare `- name(signature)` with no
    guidance, so adding a custom MCP tool degrades gracefully. The map is a
    code constant, not an env var — keyed to the opencode tools we ship for.
+   The map deliberately covers the **union** of tools harness knows about,
+   not just the always-shipped subset: situational/optional opencode tools
+   (`websearch` — gated by `OPENCODE_ENABLE_EXA`; `lsp`, `apply_patch`,
+   `question`, `repo_clone`/`repo_overview`, `plan-enter`/`plan-exit` —
+   gated by user config or other opencode flags) get entries too. The
+   `_HYBRID_TOOL_GUIDANCE.get(name)` lookup means a stale entry costs
+   nothing (it renders only when the tool is actually in `tools`), but a
+   *missing* entry the moment a tool starts shipping is a bare signature
+   with no failure-mode hint at recency. `TestHybridConsolidatedRecency
+   ::test_guidance_map_covers_known_opencode_tools` is the canary that
+   flags accidental removal.
 3. **Closed-set argument values** — for tools in the project-managed
    `_HYBRID_DETAIL_TOOLS` constant (`["task", "skill"]`), the tool's
    verbatim description is inlined as an indented block UNDER the tool's
