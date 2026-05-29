@@ -119,18 +119,32 @@ After the drop, still in the entrypoint:
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.
 
-`run_opencode` exports two static opencode env vars before the launch:
-`OPENCODE_DISABLE_AUTOUPDATE=1` (we manage the version via `OPENCODE_VERSION`
-in `agents/Dockerfile`, not opencode's self-update) and `OPENCODE_ENABLE_EXA=1`
-(opens up opencode's built-in `websearch` tool, which is otherwise hidden when
-the openai-compatible provider is in use — the official OpenCode provider is
-opencode's other gate for it, and we're not that). The websearch call hits
-Exa's hosted MCP at `mcp.exa.ai`; the egress firewall blocks it by design
-(no separate allowlist entry — websearch belongs to the same
-firewall-down / `--net` use case as the rest of unrestricted egress), and
-when the firewall is off it's reachable like any other host. Without
-reachability the tool surfaces but invocations return a network error,
-preferred over the prior failure mode of the tool silently not being there.
+`run_opencode` exports `OPENCODE_DISABLE_AUTOUPDATE=1` before launch (we
+manage the version via `OPENCODE_VERSION` in `agents/Dockerfile`, not
+opencode's self-update) and conditionally exports `OPENCODE_ENABLE_EXA=1`
+to open up opencode's built-in `websearch` tool (otherwise hidden when the
+openai-compatible provider is in use — the official OpenCode provider is
+opencode's other gate, and we're not that). The websearch call hits Exa's
+hosted MCP at `mcp.exa.ai`; the egress firewall blocks it by design (no
+separate allowlist entry — websearch belongs to the same firewall-down /
+`--net` use case as the rest of unrestricted egress).
+
+**Exa reachability gate.** Opencode's MCP startup is synchronous (see
+[anomalyco/opencode#20755](https://github.com/anomalyco/opencode/issues/20755)) —
+it blocks the TUI on the `initialize` + `list_tools` round-trip to
+`mcp.exa.ai`. With the firewall **up**, the TCP REJECT is instant so the
+handshake fails fast and the env var is harmless (websearch surfaces, calls
+return a network error at use time — the right failure mode). With the
+firewall **down** (`--net` or `harness net open`), the handshake actually
+runs against Cloudflare-fronted Exa, which is intermittently slow / returns
+520s (see [anomalyco/opencode#6878](https://github.com/anomalyco/opencode/issues/6878)) —
+the symptom is "the TUI never appears". So when
+`HARNESS_FIREWALL_DISABLED=1`, the entrypoint probes Exa with a 1s
+connect-timeout / 2s overall-timeout `curl` before exporting the env var: if
+Exa doesn't answer in time, the var stays unset, opencode skips Exa
+registration, and the TUI starts immediately. With the firewall up the probe
+is skipped (REJECT is already fast) and the var is unconditionally exported
+so the tool surface stays consistent with the firewall-down healthy case.
 
 ### Headless `-p` output recovery
 

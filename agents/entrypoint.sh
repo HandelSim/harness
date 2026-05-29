@@ -249,12 +249,38 @@ run_opencode() {
     # this branch never fires for us — or (b) OPENCODE_ENABLE_EXA is set. With
     # this on, websearch ships in the tool list every turn; the actual call
     # hits Exa's hosted MCP at mcp.exa.ai, which the egress firewall blocks
-    # unless the user adds that host to <install-root>/.harness-allowlist
-    # (see .harness-allowlist.example). Without the allowlist entry the tool
-    # is registered but invocations return a network error — which is the
-    # right failure mode (tool exists, network is the gate users own) rather
-    # than the prior failure mode of the tool silently not being there.
-    export OPENCODE_ENABLE_EXA=1
+    # by design (same firewall-down / --net use case as the rest of
+    # unrestricted egress).
+    #
+    # Reachability gate (firewall-down only). Opencode's MCP startup is
+    # synchronous (anomalyco/opencode#20755) — it blocks the TUI on the
+    # `initialize` + `list_tools` round-trip to mcp.exa.ai. With the
+    # firewall UP, the TCP REJECT is instant so the handshake fails fast
+    # and the var is harmless (websearch surfaces, calls fail at use
+    # time — the right failure mode). With the firewall DOWN (`--net`),
+    # the handshake actually runs against Cloudflare-fronted Exa, which
+    # is intermittently slow / returns 520s (anomalyco/opencode#6878) —
+    # then the TUI never appears. Probe Exa before exporting the var:
+    # if it doesn't answer within ~1.5s, leave the var unset so opencode
+    # skips Exa registration entirely and the TUI starts immediately.
+    # Net effect: websearch ships when Exa is actually reachable, and
+    # opencode never gets stuck waiting for a sick Exa endpoint.
+    if [[ "${HARNESS_FIREWALL_DISABLED:-0}" == "1" ]]; then
+        if command -v curl >/dev/null 2>&1 \
+            && curl --connect-timeout 1 --max-time 2 -so /dev/null \
+                    https://mcp.exa.ai/mcp 2>/dev/null
+        then
+            export OPENCODE_ENABLE_EXA=1
+        else
+            echo "[agent-entrypoint] mcp.exa.ai unreachable (or slow) — skipping OPENCODE_ENABLE_EXA so the TUI doesn't hang on Exa's MCP handshake" >&2
+        fi
+    else
+        # Firewall up: REJECT is instant; opencode fails fast on Exa
+        # without us probing. Keep the var on so the tool surface is
+        # consistent with the firewall-down case for the prompt builder
+        # (recency, etc.) — invocations just return a network error.
+        export OPENCODE_ENABLE_EXA=1
+    fi
 
     echo "============================================================"
     echo " harness-agent (opencode)"
