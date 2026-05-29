@@ -105,9 +105,8 @@ validator in `_setup_prompt_mode` accepts:
   **Honesty** (anti-fabrication: no invented names/paths/signatures/
   citations; **plus** the addition from issue #110: any claim about the
   working directory, its contents, or local filesystem state must come
-  from a tool result, AND no naming of a remembered training path
-  (`/home/<name>`, `/workspace`, `/sandbox`) — see
-  [Working-directory echo](#working-directory-echo) for why), and
+  from a tool result — see [Working-directory echo](#working-directory-echo)
+  for why), and
   **Environment** (the proxy runs in a Linux container with the working
   directory mounted from the host — host OS named when known, see
   [Host-OS injection](#host-os-injection); the live host CWD is echoed
@@ -292,8 +291,10 @@ described **where** the working directory came from (host bind-mount) but
 not **which path it was**, which let the upstream's pretrained sense of
 its own sandbox win — `/home/bard`, `/home/user`, `/workspace`, etc. —
 when asked "what's in this folder?". Pairing the positive anchor with
-Honesty's prohibition on naming a remembered training path closes both
-sides: here's the right answer, and here's what not to say.
+Honesty's filesystem-claims rule (any claim about the working directory,
+its contents, or filesystem state must come from a tool result) closes
+both sides: here's the right answer, and here's what not to claim
+without checking.
 
 `_extract_working_directory(system_content)` pulls the path from
 `Working directory: <path>` inside `messages[0]`'s content at request
@@ -303,7 +304,7 @@ sees the inbound agent prompt — opencode's `<env>` block carries this
 line at a stable label. If the label is missing or unparsable (a future
 opencode rename, a non-opencode upstream), the Environment line falls
 back to the prior wording (host OS only) — graceful degradation, never
-a hard fail. Honesty's no-training-path clause renders unconditionally
+a hard fail. Honesty's filesystem-claims clause renders unconditionally
 because it's load-bearing whether or not the CWD anchor was found.
 
 ## Host-OS injection

@@ -1794,19 +1794,22 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertIn("- Environment:", c)
         self.assertIn("mounted from the host", c)
 
-    def test_honesty_filesystem_and_training_path_clauses_unconditional(self):
-        """The Honesty additions (filesystem-claims must come from tool
-        results; no naming a remembered training path) render even when no
-        CWD is found — they're load-bearing whether or not the positive
-        anchor was extractable. Same baseline message set as
-        `_translate()` (no `Working directory:` in `self.user_msgs`)."""
+    def test_honesty_filesystem_clause_unconditional(self):
+        """The Honesty addition (filesystem-claims must come from tool
+        results) renders even when no CWD is found — it's load-bearing
+        whether or not the positive anchor was extractable. The companion
+        "don't name a remembered training path" clause was removed per
+        user feedback on issue #110; only the positive filesystem-claim
+        rule remains. Same baseline message set as `_translate()` (no
+        `Working directory:` in `self.user_msgs`)."""
         c = self._translate()[-1]["content"]
         honesty = c[c.index("- Honesty:"):c.index("- Environment:")]
         self.assertIn("must come from a tool result", honesty)
-        self.assertIn("Do not name a path you remember from training", honesty)
-        self.assertIn("/home/<name>", honesty)
-        self.assertIn("/workspace", honesty)
-        self.assertIn("/sandbox", honesty)
+        # Companion training-path clause is gone — verify it stays gone so
+        # nobody re-adds it without re-opening the conversation.
+        self.assertNotIn("training", honesty)
+        self.assertNotIn("/home/<name>", honesty)
+        self.assertNotIn("/sandbox", honesty)
 
 
 class TestExtractWorkingDirectory(unittest.TestCase):
