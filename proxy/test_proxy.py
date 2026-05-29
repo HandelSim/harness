@@ -1740,6 +1740,117 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
                 f"unexpected guidance for absent tool {absent!r} in recency",
             )
 
+    def test_cwd_echoed_in_environment_when_system_has_working_directory(self):
+        """When the inbound opencode system prompt carries a
+        `Working directory: <path>` line in its `<env>` block, the recency
+        Environment bullet echoes that path inline so "this folder"/"here"
+        resolve concretely. Without this, the upstream's pretrained sense
+        of its own sandbox path (e.g. `/home/bard`) has answered file-
+        system questions instead of the real bind-mounted CWD."""
+        msgs = [
+            {"role": "system", "content": (
+                "You are opencode.\n"
+                "<env>\n"
+                "  Working directory: /c/Users/handel.sim/Documents/ENC\n"
+                "  Platform: linux\n"
+                "</env>\n"
+            )},
+            {"role": "user", "content": "tell me about what is in this folder"},
+        ]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(
+                msgs, tools_text, tools=self.tools,
+            )
+        c = out[-1]["content"]
+        self.assertIn(
+            "The working directory for this turn is "
+            "`/c/Users/handel.sim/Documents/ENC`",
+            c,
+        )
+        # The aliases the user is most likely to use must be tied to the
+        # echoed path so the model resolves them concretely.
+        self.assertIn('"this folder"', c)
+        self.assertIn('"here"', c)
+
+    def test_cwd_clause_absent_when_system_has_no_working_directory(self):
+        """No `Working directory:` line in the inbound system prompt (a
+        non-opencode upstream, or a future opencode rename) => the
+        Environment bullet falls back to the prior wording. Graceful
+        degradation, never a hard fail."""
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "do the thing"},
+        ]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(
+                msgs, tools_text, tools=self.tools,
+            )
+        c = out[-1]["content"]
+        self.assertNotIn("The working directory for this turn is", c)
+        # Environment still renders the load-bearing facts (host bind-mount,
+        # reproducibility) — only the CWD clause drops.
+        self.assertIn("- Environment:", c)
+        self.assertIn("mounted from the host", c)
+
+    def test_honesty_filesystem_and_training_path_clauses_unconditional(self):
+        """The Honesty additions (filesystem-claims must come from tool
+        results; no naming a remembered training path) render even when no
+        CWD is found — they're load-bearing whether or not the positive
+        anchor was extractable. Same baseline message set as
+        `_translate()` (no `Working directory:` in `self.user_msgs`)."""
+        c = self._translate()[-1]["content"]
+        honesty = c[c.index("- Honesty:"):c.index("- Environment:")]
+        self.assertIn("must come from a tool result", honesty)
+        self.assertIn("Do not name a path you remember from training", honesty)
+        self.assertIn("/home/<name>", honesty)
+        self.assertIn("/workspace", honesty)
+        self.assertIn("/sandbox", honesty)
+
+
+class TestExtractWorkingDirectory(unittest.TestCase):
+    """`_extract_working_directory` reads the host CWD out of opencode's
+    `<env>` block in the inbound system prompt so the recency builder can
+    echo it. Missing/unparsable => None, and the Environment line falls
+    back to its prior wording."""
+
+    def test_extracts_typical_opencode_env_block(self):
+        text = (
+            "You are opencode.\n"
+            "<env>\n"
+            "  Working directory: /home/user/project\n"
+            "  Platform: linux\n"
+            "</env>\n"
+        )
+        self.assertEqual(
+            proxy._extract_working_directory(text),
+            "/home/user/project",
+        )
+
+    def test_extracts_windows_style_host_path(self):
+        text = "<env>\n  Working directory: /c/Users/foo/bar baz\n</env>"
+        self.assertEqual(
+            proxy._extract_working_directory(text),
+            "/c/Users/foo/bar baz",
+        )
+
+    def test_no_marker_returns_none(self):
+        self.assertIsNone(
+            proxy._extract_working_directory("You are a helpful assistant."),
+        )
+
+    def test_empty_and_none_inputs_return_none(self):
+        self.assertIsNone(proxy._extract_working_directory(""))
+        self.assertIsNone(proxy._extract_working_directory(None))
+
+    def test_empty_path_after_marker_returns_none(self):
+        # The model shouldn't echo an empty path — a `Working directory:`
+        # line with no value is no better than no marker at all.
+        self.assertIsNone(
+            proxy._extract_working_directory("<env>\n  Working directory:   \n</env>"),
+        )
+
 
 class TestHostOsSetup(unittest.TestCase):
     """`_setup_host_os` reads HARNESS_HOST_OS (injected by the harness CLI from
