@@ -34,6 +34,13 @@ objects.githubusercontent.com
 # api.openai.com
 # generativelanguage.googleapis.com
 
+# === Optional: opencode `websearch` tool (Exa) ===
+# Uncomment to let opencode's built-in websearch tool reach Exa's hosted MCP.
+# Opencode-side enablement (OPENCODE_ENABLE_EXA=1) is already on in the agent;
+# without this host on the allowlist the tool is registered but every call
+# fails with a network error.
+# mcp.exa.ai
+
 # === ADD YOUR SELF-HOSTED GIT REMOTES HERE (with `# git-push` if needed) ===
 # my-gitlab.example.com   # git-push
 # git.internal.corp       # git-push

@@ -193,7 +193,7 @@ ensure_opencode_config() {
           "agent": {
             "yolo": {
               "description": "Auto-approve all permissions; harness yolo mode",
-              "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": "allow"}
+              "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": "allow", "websearch": "allow"}
             }
           }
         }' > "$config_file"
@@ -243,6 +243,18 @@ run_opencode() {
     merge_opencode_mcp_servers
 
     export OPENCODE_DISABLE_AUTOUPDATE=1
+    # Expose opencode's built-in `websearch` tool to the model. Opencode hides
+    # it by default unless either (a) the official OpenCode provider is in use
+    # — we use the openai-compatible adapter pointing at harness's proxy, so
+    # this branch never fires for us — or (b) OPENCODE_ENABLE_EXA is set. With
+    # this on, websearch ships in the tool list every turn; the actual call
+    # hits Exa's hosted MCP at mcp.exa.ai, which the egress firewall blocks
+    # unless the user adds that host to <install-root>/.harness-allowlist
+    # (see .harness-allowlist.example). Without the allowlist entry the tool
+    # is registered but invocations return a network error — which is the
+    # right failure mode (tool exists, network is the gate users own) rather
+    # than the prior failure mode of the tool silently not being there.
+    export OPENCODE_ENABLE_EXA=1
 
     echo "============================================================"
     echo " harness-agent (opencode)"

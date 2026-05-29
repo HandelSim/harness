@@ -155,9 +155,23 @@ _HYBRID_DETAIL_TOOLS: List[str] = ["task", "skill"]
 # the tool's signature on its recency entry — the "shortened description" that
 # replaces the multi-KB schema for the agent's read-at-each-turn budget. Tools
 # absent from this map render as bare `name(signature)` with no guidance, so
-# adding a custom MCP tool degrades gracefully. Project-managed constant tied
-# to the opencode tools we ship for; not a user knob.
+# adding a custom MCP tool degrades gracefully — and equivalently, a tool with
+# an entry here renders only when opencode actually passes it for the turn.
+# This is why the map covers the union of opencode tools we know about
+# (including situational/optional ones like `websearch`, `lsp`, `apply_patch`,
+# `repo_clone`/`repo_overview`, `question`, `plan-enter`/`plan-exit`) even
+# though many turns won't ship most of them: the cost of a stale entry is zero
+# (`get` returns `None`, the line never renders), and the cost of missing an
+# entry the moment a tool does ship is a bare signature with no failure-mode
+# hint. Project-managed constant tied to the opencode tools we ship for; not a
+# user knob.
 _HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
+    "apply_patch": (
+        "Apply a multi-file diff in one envelope. Wrap in `*** Begin Patch` "
+        "/ `*** End Patch`. Each file needs an `Add File:`/`Update File:`/"
+        "`Delete File:` header. Existing files must be `read` first, same "
+        "as `edit`."
+    ),
     "bash": (
         "Run a shell command (terminal: git, npm, docker, etc.). Pass "
         "`description` (short verb phrase). Use `workdir`, not "
@@ -178,10 +192,37 @@ _HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
         "Regex search across file contents (not names). Use `include` to "
         "scope (`\"*.ts\"`). For match counts use `bash` + `rg`."
     ),
+    "lsp": (
+        "Language-server operations (defs, refs, hover, symbols). `line` "
+        "and `character` are 1-based. Use only when you need symbol-level "
+        "navigation; for plain text search, `grep`/`glob` are faster."
+    ),
+    "plan-enter": (
+        "Switch into the plan agent. Only call when the user has actually "
+        "asked to plan; not for simple/direct asks."
+    ),
+    "plan-exit": (
+        "Switch out of the plan agent into build. Only call after the plan "
+        "file is complete and the user is ready to implement."
+    ),
+    "question": (
+        "Ask the user a clarifying question with options. Ask BEFORE "
+        "acting, not after. Don't ask for info the user has already "
+        "supplied this turn."
+    ),
     "read": (
         "Read a file (or list a directory) by absolute path. Param is "
         "`filePath`, not `filename`/`path`. Prefer one larger read over many "
         "small re-reads."
+    ),
+    "repo_clone": (
+        "Clone an external repo into opencode's cache. For *external* repos "
+        "only — your working dir is already mounted. The cache is read-only "
+        "research material; don't try to modify it."
+    ),
+    "repo_overview": (
+        "Summarise structure/entrypoints of a cloned repo. Run after "
+        "`repo_clone` to orient. Don't re-call within the same task."
     ),
     "skill": (
         "Load a named skill's instructions into context. `name` must match "
@@ -202,6 +243,11 @@ _HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
     "webfetch": (
         "Fetch a URL and convert to markdown/text/html. Read-only. If the "
         "fetch fails or is empty, say so — never invent the page contents."
+    ),
+    "websearch": (
+        "Live web search via the session's web search provider. Use the "
+        "current year in queries (avoid stale-year framing). If you already "
+        "have the URL, prefer `webfetch`."
     ),
     "write": (
         "Create or overwrite a file at a path. If the file already exists "
