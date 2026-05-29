@@ -299,11 +299,12 @@ print("OK request-before-tools")
             # P017: full scaffolding at the stable prefix (head of
             # conversation after _CHANGE_SYSTEM_TO_USER) + a
             # "[Reminder — …]"
-            # prefix on the last user message that lists available tool
-            # names and includes the "do not invent" sentence. The last
-            # user message must contain the reminder AND the original
-            # probe text, but NOT the full tool list or instruction
-            # header.
+            # block on the last user message that carries the per-tool
+            # legend ("Tools — one entry per tool …") and the "do not
+            # invent" sentence. The last user message must contain the
+            # live probe (wrapped in <<<BEGIN_USER_REQUEST>>> markers,
+            # placed FIRST) AND the reminder (placed AFTER the wrap),
+            # but NOT the full tool list or instruction header.
             assert_forwarded "${scheme}/text/forwarded" "${forwarded}" '
 import json, sys
 body = json.loads(sys.stdin.read())
@@ -316,19 +317,20 @@ if "Reminder" not in c:
     print("NO_REMINDER_PREFIX"); sys.exit(0)
 if "do not invent" not in c:
     print("REMINDER_MISSING_DO_NOT_INVENT"); sys.exit(0)
-if "Available tools:" not in c:
-    print("REMINDER_MISSING_TOOL_NAMES_HEADER"); sys.exit(0)
+if "Tools — one entry per tool" not in c:
+    print("REMINDER_MISSING_TOOLS_LEGEND"); sys.exit(0)
 # The reminder points the model back at the AGENT_TOOLS section by name.
 if "<<<BEGIN_AGENT_TOOLS>>>" not in c:
     print("REMINDER_MISSING_AGENT_TOOLS_POINTER"); sys.exit(0)
 if "scheme-probe-text" not in c:
     print("PROBE_MISSING_FROM_LAST_USER"); sys.exit(0)
-# The probe (real user turn) is wrapped in USER_MESSAGE markers under
-# hybrid, with the reminder OUTSIDE that wrap.
-if "<<<BEGIN_USER_MESSAGE>>>" not in c:
-    print("NO_USER_MESSAGE_WRAP"); sys.exit(0)
-if c.index("Reminder") >= c.index("<<<BEGIN_USER_MESSAGE>>>"):
-    print("REMINDER_NOT_OUTSIDE_USER_MESSAGE"); sys.exit(0)
+# The probe (live user request) is wrapped in USER_REQUEST markers and
+# placed FIRST under hybrid; the reminder sits AFTER the wrap so the
+# model'\''s most-recent attention lands on the question, not the rules.
+if "<<<BEGIN_USER_REQUEST>>>" not in c:
+    print("NO_USER_REQUEST_WRAP"); sys.exit(0)
+if c.index("Reminder") <= c.index("<<<END_USER_REQUEST>>>"):
+    print("REMINDER_NOT_AFTER_USER_REQUEST"); sys.exit(0)
 # The full tool list / instructions header MUST NOT be on the last user
 # message — those go in the head (system) under hybrid. (The reminder
 # only *references* the AGENT_TOOLS marker; the block itself is in head.)

@@ -334,10 +334,11 @@ keys = sorted(body.keys())
 if keys != ['messages', 'model']:
     print('UNEXPECTED_KEYS:' + ','.join(keys))
     sys.exit(0)
-# Default mode is now 'hybrid': the last user message carries the recency
-# reminder plus the probe wrapped in <<<BEGIN_USER_MESSAGE>>> markers, while
-# the full tool scaffolding (### Tool Usage Instructions + the AGENT_TOOLS
-# block) lives at the HEAD of the conversation, not on the last user message.
+# Default mode is now 'hybrid': the last user message carries the live probe
+# wrapped in <<<BEGIN_USER_REQUEST>>> markers (placed FIRST) followed by the
+# recency reminder with its per-tool legend, while the full tool scaffolding
+# (### Tool Usage Instructions + the AGENT_TOOLS block) lives at the HEAD of
+# the conversation, not on the last user message.
 msgs = body['messages']
 last = msgs[-1]
 last_content = last.get('content','')
@@ -350,19 +351,20 @@ if 'Reminder' not in last_content:
 if 'do not invent' not in last_content:
     print('REMINDER_MISSING_DO_NOT_INVENT')
     sys.exit(0)
-if 'Available tools:' not in last_content:
-    print('REMINDER_MISSING_TOOL_NAMES')
+if 'Tools — one entry per tool' not in last_content:
+    print('REMINDER_MISSING_TOOLS_LEGEND')
     sys.exit(0)
 # The reminder points the model back at the AGENT_TOOLS block by name.
 if '<<<BEGIN_AGENT_TOOLS>>>' not in last_content:
     print('REMINDER_MISSING_AGENT_TOOLS_POINTER')
     sys.exit(0)
-# The probe (real user turn) is wrapped in USER_MESSAGE markers, reminder out.
-if '<<<BEGIN_USER_MESSAGE>>>' not in last_content:
-    print('NO_USER_MESSAGE_WRAP')
+# The probe (live user request) is wrapped in USER_REQUEST markers and placed
+# FIRST under hybrid; the reminder sits AFTER the wrap.
+if '<<<BEGIN_USER_REQUEST>>>' not in last_content:
+    print('NO_USER_REQUEST_WRAP')
     sys.exit(0)
-if last_content.index('Reminder') >= last_content.index('<<<BEGIN_USER_MESSAGE>>>'):
-    print('REMINDER_NOT_OUTSIDE_USER_MESSAGE')
+if last_content.index('Reminder') <= last_content.index('<<<END_USER_REQUEST>>>'):
+    print('REMINDER_NOT_AFTER_USER_REQUEST')
     sys.exit(0)
 # The full tool list / instructions header must NOT be on the last user
 # message — those live in the head under hybrid.
@@ -395,10 +397,10 @@ case "${KEY_CHECK}" in
     *LAST_NOT_USER*)               fail "C: last forwarded message is not a user message: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
     *NO_REMINDER_PREFIX*)          fail "C: hybrid last user message is missing the [Reminder …] prefix" "${FORWARDED_BODY}" ;;
     *REMINDER_MISSING_DO_NOT_INVENT*) fail "C: hybrid reminder is missing the 'do not invent' rule" "${FORWARDED_BODY}" ;;
-    *REMINDER_MISSING_TOOL_NAMES*) fail "C: hybrid reminder is missing the 'Available tools:' list" "${FORWARDED_BODY}" ;;
+    *REMINDER_MISSING_TOOLS_LEGEND*) fail "C: hybrid reminder is missing the 'Tools — one entry per tool' legend" "${FORWARDED_BODY}" ;;
     *REMINDER_MISSING_AGENT_TOOLS_POINTER*) fail "C: hybrid reminder does not point back at <<<BEGIN_AGENT_TOOLS>>>" "${FORWARDED_BODY}" ;;
-    *NO_USER_MESSAGE_WRAP*)        fail "C: hybrid probe is not wrapped in <<<BEGIN_USER_MESSAGE>>> markers" "${FORWARDED_BODY}" ;;
-    *REMINDER_NOT_OUTSIDE_USER_MESSAGE*) fail "C: hybrid reminder should sit OUTSIDE the USER_MESSAGE wrap" "${FORWARDED_BODY}" ;;
+    *NO_USER_REQUEST_WRAP*)        fail "C: hybrid probe is not wrapped in <<<BEGIN_USER_REQUEST>>> markers" "${FORWARDED_BODY}" ;;
+    *REMINDER_NOT_AFTER_USER_REQUEST*) fail "C: hybrid reminder should sit AFTER the USER_REQUEST wrap (live ask comes first)" "${FORWARDED_BODY}" ;;
     *FULL_INSTRUCTIONS_ON_LAST_USER*) fail "C: full tool instructions leaked onto the last user message (should be in head)" "${FORWARDED_BODY}" ;;
     *FULL_TOOL_LIST_ON_LAST_USER*) fail "C: full tool list leaked onto the last user message (should be in head)" "${FORWARDED_BODY}" ;;
     *NO_INSTRUCTIONS_HEADER_IN_HEAD*) fail "C: tool instructions header is missing from the conversation head" "${FORWARDED_BODY}" ;;
