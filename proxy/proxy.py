@@ -571,8 +571,8 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
       - the JSON envelope and the no-fabricated-results rule
       - "prefer a listed tool over hand-work"
       - "don't downgrade to listing commands for the user to run"
-      - "track non-trivial work with `todowrite`; launch `task` agents in
-        parallel when independent"
+      - "track non-trivial work with `todowrite`; Launch `task` agents
+        in parallel when independent"
       - "if no listed tool fits, just ask or answer"
       - a pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions
 
@@ -622,7 +622,7 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         "conversation); prefer a listed tool over doing the work by hand "
         "(e.g. use `webfetch` for a URL instead of curl or a script), and "
         "don't downgrade to listing commands for the user to run. Track "
-        "non-trivial work with `todowrite`; launch `task` agents — several "
+        "non-trivial work with `todowrite`. Launch `task` agents — several "
         "concurrently when the work allows — to parallelize and conserve "
         "your context. If no opencode tool fits, just ask or answer.\n"
         "- Honesty: never fabricate. Do not present guesses as facts — no "

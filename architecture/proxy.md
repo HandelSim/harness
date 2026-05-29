@@ -88,40 +88,44 @@ validator in `_setup_prompt_mode` accepts:
   schema between the model and the user's actual question.
 - **`hybrid`** (default) — full tool definitions appended to the system message
   (which `_CHANGE_SYSTEM_TO_USER` then folds into the user-role message at
-  index 0, the "stable prefix" position). A short recency reminder is
-  prepended to the last user message, organised as five labelled lines —
-  **Agency** (positive assertion that the model acts through opencode and
-  its ```json calls really execute against the working directory mounted
-  from the user's machine, with results that are real; named target for
-  the ~20% reversion to the upstream's "I can't execute, here are commands
-  for you to run" persona that surfaces even right after a successful tool
-  call — issue #109; points at both `<<<BEGIN_AGENT_TOOLS>>>` and the
-  signature list later in this same reminder, because the former is
-  authoritative but drifts on long conversations — which is exactly when
-  the reversion fires), **Tools** (JSON envelope, no-fabricated-results
-  rule, a pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions),
-  **Workflow** (prefer a listed tool over hand-work — e.g. `webfetch` over
-  curl/a script — keep a live plan with `todowrite`/`todoread`, launch
-  `task` agents several concurrently to parallelise and conserve context),
+  index 0, the "stable prefix" position). A consolidated recency block lands
+  on the last user message, organised so the **live user request comes FIRST**
+  (wrapped in `<<<BEGIN_USER_REQUEST>>>` markers — issue #110), then a short
+  reminder follows. The reminder has three labelled bullets —
+  **Operating** (the merged Agency/Tools/Workflow bullet from the earlier
+  format: positive assertion that the model acts through opencode and its
+  ```json calls really execute against the working directory mounted from
+  the user's machine with results that are real — named target for the
+  ~20% reversion to the upstream's "I can't execute, here are commands for
+  you to run" persona, issue #109; the JSON envelope and the
+  no-fabricated-results rule; prefer-a-listed-tool guidance with
+  `webfetch` over curl as the worked example; track non-trivial work with
+  `todowrite`; launch `task` agents in parallel when independent; pointer
+  back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions),
   **Honesty** (anti-fabrication: no invented names/paths/signatures/
   citations), and **Environment** (the proxy runs in a Linux container
   with the working directory mounted from the host — host OS named when
   known, see [Host-OS injection](#host-os-injection) — so reproducible
-  setup must live in the working directory, not the container). The line closes with each
-  tool's parameter signature (`name(required, [optional])` per tool). The
-  signature list — not just bare
-  names — is the recency anchor for the parameter keys models most often
-  guess wrong (e.g. calling `read({"filename": ...})` instead of
-  `read({"filePath": ...})`, or omitting opencode's `bash` required
-  `description`). The signature list carries parameter *keys* but not their
-  *values*; for a small configurable set of "detail tools" whose valid
-  values are a closed set opencode documents only in description prose (a
-  `task`'s agent types, a `skill`'s skill names) the reminder additionally
-  echoes the tool's description (whole for `skill`; pared to the agent-list
-  section for `task`) — see [Hybrid delimiters](#hybrid-delimiters). Hybrid additionally delimits
-  three content categories so each is addressable by name and the model
-  can't conflate them with the upstream gateway's own system prompt/tools —
-  again see [Hybrid delimiters](#hybrid-delimiters) below.
+  setup must live in the working directory, not the container). Below the
+  bullets is **one entry per tool** — signature, one-line guidance from
+  `_HYBRID_TOOL_GUIDANCE`, and (for "detail tools") the verbatim closed-set
+  argument values inlined under the same entry. This is the
+  consolidated-recency change from issue #110: everything the model needs
+  to know about a tool sits in one place rather than being split across a
+  signature list, a separate guidance section, and standalone
+  `<<<BEGIN_TOOL_DETAIL>>>` blocks. Signatures take the
+  `name(required, [optional])` shape — the recency anchor for the parameter
+  keys models most often guess wrong (e.g. calling `read({"filename": ...})`
+  instead of `read({"filePath": ...})`, or omitting opencode's `bash`
+  required `description`). For the "detail tools" whose valid argument
+  *values* are a closed set opencode documents only in description prose (a
+  `task`'s `subagent_type` agents, a `skill`'s skill names), the tool's
+  description is inlined directly under its entry (whole for `skill`; pared
+  to the agent-list section for `task`) — see
+  [Hybrid delimiters](#hybrid-delimiters). Hybrid additionally delimits four
+  content categories so each is addressable by name and the model can't
+  conflate them with the upstream gateway's own system prompt/tools — again
+  see [Hybrid delimiters](#hybrid-delimiters) below.
 - **`passthrough`** — benchmark control. Skips every harness-side
   mediation: no cooperative-prompt injection, no system→user rewrite, no
   history translation. `translate_history_and_apply_prompt` short-circuits
@@ -168,7 +172,7 @@ JSON-envelope reminder and the per-tool signature list).
 
 ## Hybrid delimiters
 
-`hybrid` mode (and ONLY hybrid) additionally wraps three content categories
+`hybrid` mode (and ONLY hybrid) additionally wraps four content categories
 in `<<<BEGIN_X>>>` / `<<<END_X>>>` markers so each section is addressable by
 name. The failure pattern this targets: the upstream gateway injects its own
 system prompt mentioning its own tools/subagents, and the model conflates
@@ -176,7 +180,10 @@ harness's injected tools with those — or, when the user says "the first
 message" / "the tool definitions", can't tell which section is meant. The
 markers are applied in the hybrid dispatch branch of
 `translate_history_and_apply_prompt`; `user_front` and `passthrough` never
-emit them, and `<<<BEGIN_USER_REQUEST>>>` stays exclusive to `user_front`.
+emit them. The exception is `<<<BEGIN_USER_REQUEST>>>`, which is shared with
+`user_front`: hybrid uses it to delimit the live user ask on the recency
+turn (placed at the FRONT of the recency block, before the reminder), and
+`user_front` uses it as part of its own scaffold.
 
 - **`<<<BEGIN_AGENT_INSTRUCTIONS>>>`** — wraps the inbound opencode
   system prompt (`messages[0]` content as it arrives), applied
@@ -189,52 +196,73 @@ emit them, and `<<<BEGIN_USER_REQUEST>>>` stays exclusive to `user_front`.
   wrap tells the model these are the only valid tools and to ignore any
   competing tool names from elsewhere in the prompt. The format-spec block
   above it (the JSON-envelope instructions) stays outside the wrap.
-- **`<<<BEGIN_USER_MESSAGE>>>`** — wraps every real user-role turn (original
-  role `user`). Tool-result-converted-to-user messages are detected by their
-  `<<<BEGIN_TOOL_RESULT` marker and skipped — they keep only the TOOL_RESULT
-  delimiters. On the latest turn the recency reminder is prepended OUTSIDE
-  this wrap (it's proxy stage-direction, not user text).
+- **`<<<BEGIN_USER_MESSAGE>>>`** — wraps every PRIOR real user-role turn
+  (original role `user`). The live (last) real user turn is NOT wrapped in
+  USER_MESSAGE; the recency builder wraps it in `<<<BEGIN_USER_REQUEST>>>`
+  instead — see below. Tool-result-converted-to-user messages are detected
+  by their `<<<BEGIN_TOOL_RESULT` marker and skipped — they keep only the
+  TOOL_RESULT delimiters.
+- **`<<<BEGIN_USER_REQUEST>>>`** — wraps the LIVE user ask on the recency
+  turn, placed at the FRONT of the recency block (before the reminder).
+  Order swap from the prior "reminder-first" layout: the live ask now sits
+  in the most-recent attention slot rather than behind a wall of operating
+  rules. Tool-result-converted-to-user turns skip this wrap (the TOOL_RESULT
+  markers already delimit the live content).
 
-The reminder (`build_cooperative_prompt_hybrid_reminder`) Tools line points
-at `<<<BEGIN_AGENT_TOOLS>>>` for **full tool descriptions only** so that when
-attention to `messages[0]` dilutes on long conversations the model still has
-a named target to retrieve. It deliberately does NOT claim that section is
-where to find parameter-*value* constraints (a `task`'s agent types, a
-`skill`'s names): those now reach recency in the TOOL_DETAIL blocks below, so
-an earlier "e.g. which agent types are valid for `task`" parenthetical here
-was removed as misleading. This is additive — token cost is ~150–250
-tokens/turn with the labelled lines + Environment context; hybrid's
-lighter-than-user_front recency profile is preserved.
+The reminder (`build_cooperative_prompt_hybrid_reminder`) Operating bullet
+points at `<<<BEGIN_AGENT_TOOLS>>>` for **full tool descriptions only**, so
+that when attention to `messages[0]` dilutes on long conversations the
+model still has a named target to retrieve. It deliberately does NOT claim
+that section is where to find parameter-*value* constraints (a `task`'s
+agent types, a `skill`'s names): those reach recency INLINED under each
+tool's own entry — see "Per-tool entries" below. This is additive — token
+cost is ~150–250 tokens/turn with the three bullets + Environment context;
+hybrid's lighter-than-user_front recency profile is preserved.
 
-- **`<<<BEGIN_TOOL_DETAIL name="…">>>`** — recency-only (it lives in the
-  reminder, not at the stable prefix). For each tool in the project-managed
-  `_HYBRID_DETAIL_TOOLS` constant (`["task", "skill"]`) that is present in the
-  toolset, the reminder appends the tool's description in its own block. This is
-  a code constant, not an env var — the closed set is tied to the opencode tools
-  we ship for, so there is nothing for a user to tune. The pointer-back above is
-  too weak for tools whose valid argument *values* are an unguessable closed set
-  that opencode documents only as prose in the description — `task`'s
-  `subagent_type` agent names and `skill`'s skill names (neither is a JSON-Schema
-  `enum`). The signature list carries only keys, so those values have to reach
-  recency. The block sits after the reminder and OUTSIDE the
-  `<<<BEGIN_USER_MESSAGE>>>` wrap (proxy stage-direction). `_extract_tool_details`
-  reads the raw `tools` array's `description` field — no `tools_text` fallback.
-  Tools with an empty description, or constant-listed tools absent from the
-  toolset, are skipped.
+### Per-tool entries
 
-  **`task` is pared, not verbatim.** opencode builds the `task` description as
-  static boilerplate ("when to use Task", usage notes) followed by the dynamic
-  agent list, the latter introduced by the literal header `Available agent types
-  and the tools they have access to:` (opencode's `ToolRegistry.describeTask`).
-  The boilerplate carries no closed-set values and is already present verbatim
-  at the stable prefix, so `_pare_task_description` (anchored on
-  `_OPENCODE_TASK_AGENTS_HEADER`) keeps only that header onward — the agent
-  names and their one-line descriptions. The header is byte-stable across
-  opencode releases (verified 1.14.41 and 1.15.7); if a future opencode renames
-  it the parse falls back to the **full** description (degrade to more tokens,
-  never a silent loss of the agent list), and `proxy/test_proxy.py`
-  `TestTaskDescriptionParing` is the canary that flags the drift. Every other
-  detail tool, including `skill` (its description is short), is echoed whole.
+Below the three reminder bullets is **one entry per tool** — the
+consolidated recency format (issue #110) that puts every fact about a tool
+together. Each entry is a single bullet that combines:
+
+1. **Signature** — `name(required, [optional])` per tool, the recency
+   anchor for parameter keys models most often guess wrong (e.g.
+   `read({"filename": ...})` vs `read({"filePath": ...})`).
+2. **Guidance** — the one-line failure-mode reminder from the project-
+   managed `_HYBRID_TOOL_GUIDANCE` map (the "shortened description" the
+   model reads each turn instead of the multi-KB schema at the prefix).
+   Tools absent from the map render as a bare `- name(signature)` with no
+   guidance, so adding a custom MCP tool degrades gracefully. The map is a
+   code constant, not an env var — keyed to the opencode tools we ship for.
+3. **Closed-set argument values** — for tools in the project-managed
+   `_HYBRID_DETAIL_TOOLS` constant (`["task", "skill"]`), the tool's
+   verbatim description is inlined as an indented block UNDER the tool's
+   entry. These are the tools whose valid argument *values* are an
+   unguessable closed set opencode documents only as prose in the
+   description (a `task`'s `subagent_type` agents, a `skill`'s skill
+   names; neither is a JSON-Schema `enum`). The signature carries only
+   keys, so those values have to reach recency somewhere — they used to
+   render in their own `<<<BEGIN_TOOL_DETAIL name="…">>>` blocks below the
+   bullets; the consolidated format inlines them so every fact about a
+   tool sits in one place. `_extract_tool_details` reads the raw `tools`
+   array's `description` field; tools with an empty description, or
+   constant-listed tools absent from the toolset, contribute no inlined
+   block.
+
+**`task` is pared, not verbatim.** opencode builds the `task` description as
+static boilerplate ("when to use Task", usage notes) followed by the
+dynamic agent list, the latter introduced by the literal header
+`Available agent types and the tools they have access to:` (opencode's
+`ToolRegistry.describeTask`). The boilerplate carries no closed-set values
+and is already present verbatim at the stable prefix, so
+`_pare_task_description` (anchored on `_OPENCODE_TASK_AGENTS_HEADER`) keeps
+only that header onward — the agent names and their one-line descriptions.
+The header is byte-stable across opencode releases (verified 1.14.41 and
+1.15.7); if a future opencode renames it the parse falls back to the
+**full** description (degrade to more tokens, never a silent loss of the
+agent list), and `proxy/test_proxy.py` `TestTaskDescriptionParing` is the
+canary that flags the drift. Every other detail tool, including `skill`
+(its description is short), is inlined whole.
 
 ## Host-OS injection
 

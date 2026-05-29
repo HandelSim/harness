@@ -722,23 +722,25 @@ class TestPromptInjectionModes(unittest.TestCase):
         last_user = result[-1]["content"]
         # The new reminder is present.
         self.assertIn("Reminder", last_user)
-        # Lists the available tool signature (recency anchoring on the
-        # parameter keys, not just the bare name).
-        self.assertIn("Bash(command)", last_user)
-        self.assertIn("Available tools:", last_user)
-        # Tells the model the listed keys are exact (the chronic miss).
-        self.assertIn("Use parameter keys exactly as listed", last_user)
+        # Each tool gets a recency entry led by its signature (parameter
+        # keys, not just the bare name — the chronic miss).
+        self.assertIn("- Bash(command)", last_user)
+        # Signature-format legend telling the model the listed keys are exact.
+        self.assertIn("parameter names must match exactly", last_user)
         # New sentence telling the model not to fabricate tool results.
         self.assertIn("do not invent", last_user)
-        # The user's original message survives, wrapped in USER_MESSAGE.
+        # The user's live request is wrapped in USER_REQUEST on the last
+        # turn (not USER_MESSAGE — USER_MESSAGE wraps prior user turns).
         self.assertIn("say hello", last_user)
-        self.assertIn("<<<BEGIN_USER_MESSAGE>>>", last_user)
-        self.assertIn("<<<END_USER_MESSAGE>>>", last_user)
-        # The reminder sits OUTSIDE the USER_MESSAGE wrap — it's proxy
-        # stage-direction, not part of what the user wrote.
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>", last_user)
+        self.assertIn("<<<END_USER_REQUEST>>>", last_user)
+        self.assertNotIn("<<<BEGIN_USER_MESSAGE>>>", last_user)
+        # USER_REQUEST sits at the FRONT — the live ask comes BEFORE the
+        # reminder so the model's most-recent attention lands on the
+        # user's actual question, not on operating-rules prose.
         self.assertLess(
+            last_user.index("<<<BEGIN_USER_REQUEST>>>"),
             last_user.index("Reminder"),
-            last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
         )
         # The reminder must NOT contain the full tool schema or instructions
         # header — those live only in the prefix at [0].
@@ -747,24 +749,23 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertNotIn('"required"', last_user)
 
     def test_mode_hybrid_reminder_advises_default_to_tools(self):
-        """The Workflow line nudges the model to reach for a dedicated tool
-        rather than improvising by hand, and to track work with todo tools."""
+        """The Operating bullet nudges the model to reach for a dedicated tool
+        rather than improvising by hand, and to track work with `todowrite`."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
         self.assertIn("prefer a listed tool over doing the work by hand", last_user)
         # Concrete examples the user asked for.
         self.assertIn("webfetch", last_user)
         self.assertIn("todowrite", last_user)
-        self.assertIn("todoread", last_user)
         # The guidance is part of the reminder (proxy stage-direction),
-        # OUTSIDE the wrapped user message.
-        self.assertLess(
+        # which now sits AFTER the wrapped user request.
+        self.assertGreater(
             last_user.index("prefer a listed tool over doing the work by hand"),
-            last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
+            last_user.index("<<<END_USER_REQUEST>>>"),
         )
 
     def test_mode_hybrid_reminder_advises_concurrent_task_agents(self):
-        """The Workflow line tells the model to launch task agents, several
+        """The Operating bullet tells the model to launch task agents, several
         concurrently when possible, to parallelize and conserve context."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
@@ -773,7 +774,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("conserve your context", last_user)
 
     def test_mode_hybrid_reminder_has_honesty_rules(self):
-        """The Honesty line carries the anti-fabrication guidance."""
+        """The Honesty bullet carries the anti-fabrication guidance."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
         self.assertIn("never fabricate", last_user)
@@ -781,13 +782,13 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("I don't know", last_user)
 
     def test_mode_hybrid_reminder_has_agency_assertion(self):
-        """The Agency line asserts that tool calls really execute against the
-        working directory mounted from the user's machine and results are
+        """The Operating bullet asserts that tool calls really execute against
+        the working directory mounted from the user's machine and results are
         real — the missing anchor for issue #109's reversion to "I can't
         execute, here are commands you should run" right after a tool call."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        self.assertIn("Agency:", last_user)
+        self.assertIn("Operating:", last_user)
         self.assertIn("really execute", last_user)
         self.assertIn("results you get back are real", last_user)
         # Don't downgrade to handing the user commands.
@@ -796,7 +797,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("just ask or answer", last_user)
 
     def test_mode_hybrid_reminder_agency_names_opencode(self):
-        """The Agency line names opencode as the disambiguator from the
+        """The Operating bullet names opencode as the disambiguator from the
         upstream's own (phantom) tools/subagents — bare "agency"/"tools"
         could otherwise re-resolve to the upstream's persona."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
@@ -806,39 +807,44 @@ class TestPromptInjectionModes(unittest.TestCase):
         # referent for what to call.
         self.assertIn("opencode tools", last_user)
 
-    def test_mode_hybrid_reminder_agency_points_at_both_tool_anchors(self):
-        """The Agency line tells the model the tools are listed both in this
-        reminder (signature list — survives dilution) AND in
-        <<<BEGIN_AGENT_TOOLS>>> earlier in the conversation (authoritative
-        copy that may have drifted out of attention on long conversations)."""
+    def test_mode_hybrid_reminder_operating_points_at_agent_tools(self):
+        """The Operating bullet tells the model the tools are listed below
+        in this reminder AND in <<<BEGIN_AGENT_TOOLS>>> earlier in the
+        conversation (authoritative copy that may have drifted out of
+        attention on long conversations)."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        agency_start = last_user.index("Agency:")
-        # Slice from Agency to the next labelled line so we test the Agency
-        # clause specifically, not the existing Tools clause beneath it.
-        agency_block = last_user[agency_start:last_user.index("- Tools:", agency_start)]
-        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", agency_block)
-        self.assertIn("this reminder", agency_block)
+        operating_start = last_user.index("- Operating:")
+        operating_block = last_user[
+            operating_start:last_user.index("- Honesty:", operating_start)
+        ]
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", operating_block)
+        # "listed below" pointer to the per-tool entries that follow.
+        self.assertIn("below", operating_block)
 
-    def test_mode_hybrid_reminder_agency_is_first_label(self):
-        """Agency is the premise for everything else in the reminder, so it
-        sits as the first label — before Tools/Workflow/Honesty/Environment."""
+    def test_mode_hybrid_reminder_operating_is_first_label(self):
+        """Operating is the merged Agency/Tools/Workflow bullet and is the
+        premise for everything else, so it sits first — before Honesty and
+        Environment. Tools/Workflow/Agency labels no longer exist as
+        separate lines."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        self.assertLess(last_user.index("- Agency:"), last_user.index("- Tools:"))
-        self.assertLess(last_user.index("- Agency:"), last_user.index("- Workflow:"))
-        self.assertLess(last_user.index("- Agency:"), last_user.index("- Honesty:"))
-        self.assertLess(last_user.index("- Agency:"), last_user.index("- Environment:"))
+        self.assertLess(last_user.index("- Operating:"), last_user.index("- Honesty:"))
+        self.assertLess(last_user.index("- Operating:"), last_user.index("- Environment:"))
+        # The old separate labels are gone.
+        self.assertNotIn("- Agency:", last_user)
+        self.assertNotIn("- Tools:", last_user)
+        self.assertNotIn("- Workflow:", last_user)
 
-    def test_mode_hybrid_reminder_agency_is_proxy_stage_direction(self):
-        """The Agency line is part of the recency reminder (proxy
-        stage-direction), so it lives OUTSIDE the wrapped user message — same
-        as the rest of the reminder."""
+    def test_mode_hybrid_reminder_lives_after_user_request(self):
+        """The reminder is proxy stage-direction; with the user-request-first
+        ordering it sits AFTER the wrapped USER_REQUEST block (the user's
+        actual ask now comes first; the reminder follows)."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
         self.assertLess(
-            last_user.index("Agency:"),
-            last_user.index("<<<BEGIN_USER_MESSAGE>>>"),
+            last_user.index("<<<END_USER_REQUEST>>>"),
+            last_user.index("Operating:"),
         )
 
     def test_mode_hybrid_reminder_has_environment_context(self):
@@ -853,8 +859,9 @@ class TestPromptInjectionModes(unittest.TestCase):
 
     def test_mode_hybrid_reminder_drops_stale_value_parenthetical(self):
         """The old "which agent types are valid for a `task` tool" pointer is
-        gone from the reminder — those values now live in the TOOL_DETAIL
-        blocks at recency, so pointing back to AGENT_TOOLS for them misleads."""
+        gone — closed-set values (a `task`'s agent types, a `skill`'s names)
+        now live INLINED under each tool's own entry, so pointing back to
+        AGENT_TOOLS for them would misdirect."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
         self.assertNotIn("which agent types are valid for a `task` tool", last_user)
@@ -1075,9 +1082,11 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertNotIn("<<<END_AGENT_INSTRUCTIONS>>>", joined)
         self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", joined)
 
-    def test_mode_hybrid_wraps_every_real_user_message(self):
-        """Every real user-role turn in a multi-turn conversation is wrapped
-        in USER_MESSAGE markers."""
+    def test_mode_hybrid_wraps_prior_user_turns_in_user_message(self):
+        """In a multi-turn conversation, every PRIOR real user-role turn is
+        wrapped in USER_MESSAGE markers. The LAST real user turn (the live
+        ask) is wrapped in USER_REQUEST by the recency builder instead and
+        placed at the front of the recency block."""
         msgs = [
             {"role": "system", "content": "You are a coding agent."},
             {"role": "user", "content": "first turn"},
@@ -1093,11 +1102,21 @@ class TestPromptInjectionModes(unittest.TestCase):
             )
         user_msgs = [m for m in result if m["role"] == "user"]
         self.assertEqual(len(user_msgs), 3)
-        for m in user_msgs:
+        # The first two user turns are historical — wrapped in USER_MESSAGE.
+        for m in user_msgs[:-1]:
             self.assertIn("<<<BEGIN_USER_MESSAGE>>>", m["content"])
             self.assertIn("<<<END_USER_MESSAGE>>>", m["content"])
+        # The last (live) user turn is wrapped in USER_REQUEST by the
+        # recency builder and sits at the front of the recency block.
+        live = user_msgs[-1]["content"]
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>", live)
+        self.assertIn("<<<END_USER_REQUEST>>>", live)
+        self.assertNotIn("<<<BEGIN_USER_MESSAGE>>>", live)
         joined = "\n".join(m["content"] for m in result)
-        self.assertEqual(joined.count("<<<BEGIN_USER_MESSAGE>>>"), 3)
+        # Two USER_MESSAGE wraps (for the prior two user turns), one
+        # USER_REQUEST wrap (for the live one).
+        self.assertEqual(joined.count("<<<BEGIN_USER_MESSAGE>>>"), 2)
+        self.assertEqual(joined.count("<<<BEGIN_USER_REQUEST>>>"), 1)
 
     def test_mode_hybrid_does_not_wrap_tool_result_converted_user_messages(self):
         """A real user turn gets a USER_MESSAGE wrap; a tool-result-converted
@@ -1184,12 +1203,17 @@ class TestPromptInjectionModes(unittest.TestCase):
 
 
 class TestHybridDetailTools(unittest.TestCase):
-    """Hybrid mode echoes the FULL description of a configurable set of
-    "detail tools" (default `task,skill`) into the recency reminder, each in
-    its own <<<BEGIN_TOOL_DETAIL>>> block. These are the tools whose valid
-    argument values are a closed set opencode documents only as description
-    prose (a `task`'s agent types, a `skill`'s skill names); the signature
-    list carries the parameter keys but not those values.
+    """Hybrid mode inlines the FULL (pared) description of a project-managed
+    set of "detail tools" (default `task,skill`) UNDER THE TOOL'S OWN RECENCY
+    ENTRY. These are the tools whose valid argument values are a closed set
+    opencode documents only as description prose (a `task`'s agent types, a
+    `skill`'s skill names); the signature carries the parameter keys but not
+    those values, so the description has to reach recency.
+
+    Earlier versions rendered these in separate
+    `<<<BEGIN_TOOL_DETAIL name="…">>>` blocks below the bullets; the
+    consolidated format inlines them under the tool's entry so every fact
+    about a tool (signature, guidance, valid argument values) sits together.
     """
 
     def setUp(self):
@@ -1268,59 +1292,75 @@ class TestHybridDetailTools(unittest.TestCase):
     def test_extract_tool_details_no_tools_returns_empty(self):
         self.assertEqual(proxy._extract_tool_details(None, ["task"]), [])
 
-    def test_detail_block_emitted_for_flagged_task_tool(self):
+    def test_detail_inlined_under_flagged_task_tool_entry(self):
         last_user = self._translate([self.task_tool])[-1]["content"]
-        self.assertIn('<<<BEGIN_TOOL_DETAIL name="task">>>', last_user)
-        self.assertIn("<<<END_TOOL_DETAIL>>>", last_user)
         # The closed-set values (agent types) reach recency verbatim.
         self.assertIn("Available agent types", last_user)
         self.assertIn("general-purpose", last_user)
         self.assertIn("Explore", last_user)
-        # …but the static boilerplate is pared out of the task block (it is
-        # redundant with the stable-prefix copy and is what dilutes recency).
-        detail = last_user.split('<<<BEGIN_TOOL_DETAIL name="task">>>', 1)[1]
-        detail = detail.split("<<<END_TOOL_DETAIL>>>", 1)[0]
-        self.assertNotIn("Launch a new agent", detail)
-        self.assertNotIn("When NOT to use", detail)
+        # …but the static boilerplate is pared out (redundant with the
+        # stable-prefix copy and is what dilutes recency).
+        self.assertNotIn("Launch a new agent", last_user)
+        self.assertNotIn("When NOT to use", last_user)
+        # No separate TOOL_DETAIL block in the consolidated format.
+        self.assertNotIn("<<<BEGIN_TOOL_DETAIL", last_user)
+        # The inlined description sits immediately after the task entry's
+        # signature/guidance line — between `task(...)` and the next bullet.
+        task_entry_start = last_user.index(
+            "- task(description, prompt, subagent_type)"
+        )
+        next_bullet = last_user.find("\n- ", task_entry_start + 1)
+        if next_bullet == -1:
+            # task is the last bullet; everything after it through the closing
+            # ']' is the inlined description.
+            next_bullet = last_user.index("]", task_entry_start)
+        task_block = last_user[task_entry_start:next_bullet]
+        self.assertIn("Available agent types", task_block)
 
-    def test_detail_block_sits_after_reminder_outside_user_message_wrap(self):
+    def test_detail_inlined_block_sits_inside_reminder_after_request(self):
         last_user = self._translate([self.task_tool])[-1]["content"]
+        request_end = last_user.index("<<<END_USER_REQUEST>>>")
         reminder_pos = last_user.index("Reminder")
-        detail_pos = last_user.index('<<<BEGIN_TOOL_DETAIL name="task">>>')
-        user_wrap_pos = last_user.index("<<<BEGIN_USER_MESSAGE>>>")
-        # Reminder, then the detail block, then the wrapped user message — the
-        # detail block is proxy stage-direction, outside USER_MESSAGE.
-        self.assertLess(reminder_pos, detail_pos)
-        self.assertLess(detail_pos, user_wrap_pos)
+        agents_pos = last_user.index("Available agent types")
+        # USER_REQUEST first, then reminder, then the inlined description.
+        self.assertLess(request_end, reminder_pos)
+        self.assertLess(reminder_pos, agents_pos)
         self.assertIn("do the thing", last_user)
 
-    def test_detail_block_has_framing_pointing_at_agent_tools(self):
-        last_user = self._translate([self.task_tool])[-1]["content"]
-        self.assertIn("Valid argument values for the tools below", last_user)
-        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", last_user)
-
-    def test_no_detail_block_for_unflagged_tool(self):
-        # bash isn't in the flagged set → no TOOL_DETAIL block.
+    def test_no_inlined_detail_for_unflagged_tool(self):
+        # bash isn't in the flagged set → its entry has the guidance line
+        # but no inlined description content.
         last_user = self._translate([self.bash_tool])[-1]["content"]
         self.assertNotIn("<<<BEGIN_TOOL_DETAIL", last_user)
+        # bash's own description ("Run a shell command") should not appear
+        # verbatim from the tools array (it's not a detail tool); only the
+        # _HYBRID_TOOL_GUIDANCE one-liner accompanies the signature.
+        self.assertIn("- bash(command)", last_user)
 
-    def test_detail_block_only_for_present_flagged_tools(self):
-        # skill is flagged but absent from the toolset; only task gets a block.
+    def test_inlined_detail_only_for_present_flagged_tools(self):
+        # skill is flagged but absent from the toolset; only task gets its
+        # description inlined. bash is present but unflagged, so its tools-
+        # array description ("Run a shell command") is NOT inlined.
         last_user = self._translate([self.task_tool, self.bash_tool])[-1]["content"]
-        self.assertEqual(last_user.count("<<<BEGIN_TOOL_DETAIL"), 1)
-        self.assertIn('name="task"', last_user)
-        self.assertNotIn('name="skill"', last_user)
+        self.assertIn("Available agent types", last_user)
+        # No verbatim copy of bash's description ("Run a shell command") —
+        # only the guidance one-liner ("Run a shell command (terminal:
+        # git, npm, docker, etc.)") from _HYBRID_TOOL_GUIDANCE.
+        self.assertNotIn("<<<BEGIN_TOOL_DETAIL", last_user)
 
-    def test_empty_flagged_set_disables_detail_blocks(self):
+    def test_empty_flagged_set_disables_inlined_detail(self):
         last_user = self._translate([self.task_tool], flagged=[])[-1]["content"]
         self.assertNotIn("<<<BEGIN_TOOL_DETAIL", last_user)
+        # The task closed-set values don't reach recency at all.
+        self.assertNotIn("Available agent types", last_user)
         # The rest of the reminder is unaffected.
         self.assertIn("Reminder", last_user)
         self.assertIn("task(description, prompt, subagent_type)", last_user)
 
-    def test_detail_block_also_on_tool_result_turn(self):
-        """The detail block must reach recency on tool-result turns too — the
-        model still needs the valid agent types when continuing the loop."""
+    def test_inlined_detail_also_on_tool_result_turn(self):
+        """The inlined description must reach recency on tool-result turns
+        too — the model still needs the valid agent types when continuing
+        the loop."""
         msgs = [
             {"role": "user", "content": "go"},
             {"role": "assistant", "content": "",
@@ -1334,11 +1374,12 @@ class TestHybridDetailTools(unittest.TestCase):
                 msgs, tools_text, tools=[self.task_tool],
             )
         c = out[-1]["content"]
-        self.assertIn('<<<BEGIN_TOOL_DETAIL name="task">>>', c)
         self.assertIn("Available agent types", c)
+        self.assertNotIn("<<<BEGIN_TOOL_DETAIL", c)
 
-    def test_user_front_never_emits_detail_block(self):
-        """TOOL_DETAIL is hybrid-only."""
+    def test_user_front_never_emits_inlined_detail(self):
+        """The inlined description / consolidated recency entries are
+        hybrid-only — user_front has its own (different) scaffold."""
         tools_text = proxy.format_tools_to_text([self.task_tool])
         with patch.object(proxy, "_PROMPT_MODE", "user_front"), \
              patch.object(proxy, "_HYBRID_DETAIL_TOOLS", ["task", "skill"]):
@@ -1346,7 +1387,287 @@ class TestHybridDetailTools(unittest.TestCase):
                 self.user_msgs, tools_text, tools=[self.task_tool],
             )
         joined = "\n".join(m["content"] for m in out)
+        # No leftover TOOL_DETAIL framing from the prior format.
         self.assertNotIn("TOOL_DETAIL", joined)
+        # No "Tools — one entry per tool" recency legend from the hybrid
+        # consolidated format.
+        self.assertNotIn("Tools — one entry per tool", joined)
+
+
+class TestHybridConsolidatedRecency(unittest.TestCase):
+    """The consolidated recency format puts everything for a given tool in
+    one place: signature, one-line guidance from `_HYBRID_TOOL_GUIDANCE`, and
+    (for detail tools) the verbatim closed-set argument values. The five
+    earlier labelled bullets (Agency/Tools/Workflow/Honesty/Environment)
+    collapse to three (Operating/Honesty/Environment), and the live user
+    request moves to the FRONT of the recency block (USER_REQUEST delimiter)
+    so the model's most-recent attention lands on the ask, not the rules.
+    """
+
+    def setUp(self):
+        p = patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", False)
+        p.start()
+        self.addCleanup(p.stop)
+        # A representative shipped opencode toolset — every tool is in
+        # `_HYBRID_TOOL_GUIDANCE`, and `task`/`skill` are detail tools.
+        self.tools = [
+            {"function": {
+                "name": "bash",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                        "workdir": {"type": "string"},
+                    },
+                    "required": ["command", "description"],
+                },
+            }},
+            {"function": {
+                "name": "todowrite",
+                "description": "Maintain a todo list",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"todos": {"type": "array"}},
+                    "required": ["todos"],
+                },
+            }},
+            {"function": {
+                "name": "task",
+                "description": (
+                    "Launch a sub-agent.\n\n"
+                    "Available agent types and the tools they have access to:\n"
+                    "- explore: codebase search\n"
+                    "- general: multi-step work\n"
+                    "- yolo: auto-approve permissions"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "subagent_type": {"type": "string"},
+                    },
+                    "required": ["description", "prompt", "subagent_type"],
+                },
+            }},
+            {"function": {
+                "name": "skill",
+                "description": (
+                    "Load a specialized skill.\n"
+                    "## Available Skills\n"
+                    "- save: file a conversation\n"
+                    "- wiki: scaffold a vault"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                },
+            }},
+        ]
+        self.user_msgs = [
+            {"role": "system", "content": "You are opencode."},
+            {"role": "user", "content": "do the thing"},
+        ]
+
+    def _translate(self):
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            return proxy.translate_history_and_apply_prompt(
+                self.user_msgs, tools_text, tools=self.tools,
+            )
+
+    def test_user_request_wrapped_and_at_front(self):
+        """The live user request is wrapped in USER_REQUEST and placed
+        BEFORE the reminder — the order swap the user asked for."""
+        c = self._translate()[-1]["content"]
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>\ndo the thing\n<<<END_USER_REQUEST>>>", c)
+        self.assertLess(c.index("<<<BEGIN_USER_REQUEST>>>"), c.index("Reminder"))
+
+    def test_no_user_message_wrap_on_live_turn(self):
+        """USER_MESSAGE is for prior user turns only. The live ask gets
+        USER_REQUEST instead — they're mutually exclusive on the live turn."""
+        c = self._translate()[-1]["content"]
+        self.assertNotIn("<<<BEGIN_USER_MESSAGE>>>", c)
+        self.assertNotIn("<<<END_USER_MESSAGE>>>", c)
+
+    def test_three_bullets_only_no_agency_tools_workflow_labels(self):
+        """Agency/Tools/Workflow are merged into one Operating bullet, so the
+        old separate labels are gone. Honesty/Environment keep their own
+        bullets."""
+        c = self._translate()[-1]["content"]
+        self.assertIn("- Operating:", c)
+        self.assertIn("- Honesty:", c)
+        self.assertIn("- Environment:", c)
+        self.assertNotIn("- Agency:", c)
+        self.assertNotIn("- Tools:", c)
+        self.assertNotIn("- Workflow:", c)
+
+    def test_operating_carries_merged_agency_tools_workflow_content(self):
+        """The Operating bullet must preserve the load-bearing content from
+        each of the three merged bullets — losing any of these is a real
+        regression."""
+        c = self._translate()[-1]["content"]
+        operating = c[c.index("- Operating:"):c.index("- Honesty:")]
+        # Agency content: tools really execute, results are real,
+        # don't downgrade to listing commands, opencode named.
+        self.assertIn("really execute", operating)
+        self.assertIn("results you get back are real", operating)
+        self.assertIn("don't downgrade to listing commands", operating)
+        self.assertIn("opencode", operating)
+        # Tools content: JSON envelope + no-fabricated-results.
+        self.assertIn('"name": ...', operating)
+        self.assertIn('"arguments": ...', operating)
+        self.assertIn("do not invent", operating)
+        # Workflow content: prefer listed tool, todowrite, task agents,
+        # parallel/concurrent.
+        self.assertIn("prefer a listed tool", operating)
+        self.assertIn("todowrite", operating)
+        self.assertIn("Launch `task` agents", operating)
+        self.assertIn("concurrently", operating)
+        # Fallback ("ask or answer") + AGENT_TOOLS pointer survive.
+        self.assertIn("just ask or answer", operating)
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", operating)
+
+    def test_per_tool_entry_format_with_guidance(self):
+        """Tools in `_HYBRID_TOOL_GUIDANCE` get one entry: signature + ` — `
+        + guidance one-liner. All info for that tool sits in one place."""
+        c = self._translate()[-1]["content"]
+        # bash gets its full signature plus the guidance one-liner.
+        self.assertIn(
+            "- bash(command, description, [timeout], [workdir]) — Run a shell command",
+            c,
+        )
+        # todowrite's guidance is the headline misuse fix.
+        self.assertIn(
+            "- todowrite(todos) — Maintain a structured todo list",
+            c,
+        )
+        self.assertIn("Exactly ONE item may be `in_progress`", c)
+
+    def test_signature_format_legend_present(self):
+        """The legend above the per-tool entries teaches the model what the
+        `name(required, [optional])` shape means."""
+        c = self._translate()[-1]["content"]
+        self.assertIn("Signature format: name(required, [optional])", c)
+        self.assertIn("parameter names must match exactly", c)
+        # The legend names the exact misuse that surfaces in the wild.
+        self.assertIn("`filename` fails where `filePath` is required", c)
+
+    def test_skill_detail_inlined_under_skill_entry(self):
+        """The skill description content (the closed set of valid `name`
+        values) is inlined directly under the skill tool's own entry — same
+        information as the old TOOL_DETAIL block, but in one place with the
+        rest of the skill tool's info."""
+        c = self._translate()[-1]["content"]
+        skill_entry_start = c.index("- skill(name)")
+        next_bullet_after_skill = c.find("\n- ", skill_entry_start + 1)
+        if next_bullet_after_skill == -1:
+            next_bullet_after_skill = c.index("]", skill_entry_start)
+        skill_block = c[skill_entry_start:next_bullet_after_skill]
+        self.assertIn("Available Skills", skill_block)
+        self.assertIn("save", skill_block)
+        self.assertIn("wiki", skill_block)
+
+    def test_task_detail_inlined_under_task_entry_pared(self):
+        """The task description's agent-list section is inlined under the
+        task entry; the static boilerplate is pared out (redundant with the
+        stable prefix)."""
+        c = self._translate()[-1]["content"]
+        task_entry_start = c.index("- task(description, prompt, subagent_type)")
+        next_bullet = c.find("\n- ", task_entry_start + 1)
+        if next_bullet == -1:
+            next_bullet = c.index("]", task_entry_start)
+        task_block = c[task_entry_start:next_bullet]
+        self.assertIn("Available agent types", task_block)
+        self.assertIn("explore", task_block)
+        self.assertIn("general", task_block)
+        self.assertIn("yolo", task_block)
+        # Paring keeps only the agent-list section of the tool's verbatim
+        # description; the inlined description starts with the header. Use
+        # the indented-line prefix ("  ") to isolate the inlined description
+        # from the guidance one-liner (which sits on the same line as the
+        # signature and may share phrases with the tool's prose).
+        indented_lines = [
+            ln for ln in task_block.splitlines() if ln.startswith("  ")
+        ]
+        inlined = "\n".join(indented_lines)
+        self.assertTrue(inlined.lstrip().startswith(
+            proxy._OPENCODE_TASK_AGENTS_HEADER
+        ))
+
+    def test_unknown_tool_renders_bare_signature(self):
+        """A tool absent from `_HYBRID_TOOL_GUIDANCE` (e.g. a custom MCP
+        tool the user added) renders as just `- name(signature)` with no
+        guidance text. Format degrades gracefully."""
+        custom = {"function": {
+            "name": "mcp_thing",
+            "description": "custom",
+            "parameters": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+        }}
+        tools = [custom]
+        tools_text = proxy.format_tools_to_text(tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(
+                self.user_msgs, tools_text, tools=tools,
+            )
+        c = out[-1]["content"]
+        # Bare signature line — no ` — ` separator and no guidance text.
+        # mcp_thing is the only tool, so it's also the last entry and the
+        # reminder's closing `]` lands on the same line — strip it before
+        # asserting on the bare entry shape.
+        self.assertIn("- mcp_thing(q)", c)
+        line = next(ln for ln in c.splitlines() if ln.startswith("- mcp_thing"))
+        self.assertEqual(line.rstrip("]"), "- mcp_thing(q)")
+        # The em-dash separator only appears when guidance is present.
+        self.assertNotIn("- mcp_thing(q) —", c)
+
+    def test_no_tool_detail_blocks_anywhere(self):
+        """The legacy `<<<BEGIN_TOOL_DETAIL>>>` framing is gone in the
+        consolidated format — its content is inlined per tool instead."""
+        c = self._translate()[-1]["content"]
+        self.assertNotIn("<<<BEGIN_TOOL_DETAIL", c)
+        self.assertNotIn("<<<END_TOOL_DETAIL>>>", c)
+        self.assertNotIn(
+            "Valid argument values for the tools below", c,
+        )
+
+    def test_reminder_appears_once_at_end_of_message(self):
+        """Single reminder block per turn. The user request comes first;
+        the reminder follows. Asserts the simple ordering invariant."""
+        c = self._translate()[-1]["content"]
+        self.assertEqual(c.count("[Reminder — operating rules for this turn."), 1)
+        request_pos = c.index("<<<BEGIN_USER_REQUEST>>>")
+        reminder_pos = c.index("[Reminder")
+        self.assertLess(request_pos, reminder_pos)
+
+    def test_tool_result_turn_skips_user_request_wrap(self):
+        """On a tool-result turn the content already has TOOL_RESULT markers
+        delimiting it; the builder must NOT also wrap in USER_REQUEST. The
+        TOOL_RESULT block stays at the front, reminder behind it."""
+        msgs = [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"function": {"name": "bash", "arguments": {}}}]},
+            {"role": "tool", "tool_name": "bash", "content": "72F sunny"},
+        ]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(
+                msgs, tools_text, tools=self.tools,
+            )
+        c = out[-1]["content"]
+        self.assertIn("<<<BEGIN_TOOL_RESULT", c)
+        self.assertNotIn("<<<BEGIN_USER_REQUEST>>>", c)
+        # TOOL_RESULT content at the front, reminder behind it.
+        self.assertLess(c.index("<<<END_TOOL_RESULT>>>"), c.index("Reminder"))
 
 
 class TestHostOsSetup(unittest.TestCase):
@@ -1384,9 +1705,10 @@ class TestHostOsSetup(unittest.TestCase):
 
 
 class TestTaskDescriptionParing(unittest.TestCase):
-    """`task`'s TOOL_DETAIL block is pared to its agent-list section; the static
-    boilerplate (redundant at recency) is dropped. The parse anchors on a header
-    string opencode emits in ToolRegistry.describeTask. `skill` is left whole.
+    """`task`'s inlined recency description is pared to its agent-list section;
+    the static boilerplate (redundant at recency) is dropped. The parse anchors
+    on a header string opencode emits in ToolRegistry.describeTask. `skill` is
+    left whole.
 
     REAL_TASK_DESCRIPTION below is a faithful copy of what opencode hands the
     proxy: static boilerplate, then the dynamic agent list. The opening lines
@@ -1854,14 +2176,17 @@ class TestChangeSystemToUser(unittest.TestCase):
                 self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", result[0]["content"])
                 self.assertEqual(result[1]["role"], "assistant")
                 self.assertEqual(result[2]["role"], "user")
-                # The recency reminder lands on the live user turn, outside
-                # the USER_MESSAGE wrap.
+                # The recency block lands on the live user turn: the live
+                # ask is wrapped in USER_REQUEST at the front, followed by
+                # the reminder. USER_MESSAGE is reserved for prior user
+                # turns (there are none here).
                 self.assertIn("Reminder", result[2]["content"])
                 self.assertIn("Hello", result[2]["content"])
-                self.assertIn("<<<BEGIN_USER_MESSAGE>>>", result[2]["content"])
+                self.assertIn("<<<BEGIN_USER_REQUEST>>>", result[2]["content"])
+                self.assertNotIn("<<<BEGIN_USER_MESSAGE>>>", result[2]["content"])
                 self.assertLess(
+                    result[2]["content"].index("<<<BEGIN_USER_REQUEST>>>"),
                     result[2]["content"].index("Reminder"),
-                    result[2]["content"].index("<<<BEGIN_USER_MESSAGE>>>"),
                 )
 
     def test_change_system_to_user_with_user_front_mode(self):
