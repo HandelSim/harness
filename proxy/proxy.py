@@ -581,7 +581,7 @@ def _format_tool_entries(tool_signatures, tool_details=None):
     return f"\n\n{legend}\n" + "\n".join(lines)
 
 
-_WORKING_DIR_RE = re.compile(r"Working directory:\s*(\S[^\n]*)")
+_WORKING_DIR_RE = re.compile(r"Working directory:[ \t]*(\S[^\n]*)")
 
 
 def _extract_working_directory(system_content):
