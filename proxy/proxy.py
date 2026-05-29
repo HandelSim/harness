@@ -134,27 +134,93 @@ _PROMPT_MODE: str = "hybrid"  # set in main() before serving
 # path for tests.
 _CHANGE_SYSTEM_TO_USER: bool = True
 
-# Hybrid mode only. Tool names whose FULL description is echoed verbatim into
-# the recency reminder, each in its own <<<BEGIN_TOOL_DETAIL>>> block. These
-# are the tools whose valid argument *values* are an unguessable closed set
-# that opencode documents only as prose inside the tool description — `task`
-# (the valid `subagent_type` agent names) and `skill` (the valid skill
-# names). The per-tool signature list carries the parameter keys but not
-# those values, so the whole description is what has to reach recency. This is
-# a project-managed constant, not a user knob — the closed set is tied to the
-# opencode tools we ship for, so there is nothing for a user to tune.
+# Hybrid mode only. Tool names whose FULL description is echoed verbatim under
+# the tool's own entry in the recency reminder. These are the tools whose valid
+# argument *values* are an unguessable closed set that opencode documents only
+# as prose inside the tool description — `task` (the valid `subagent_type`
+# agent names) and `skill` (the valid skill names). The per-tool signature
+# carries the parameter keys but not those values, so the whole description has
+# to reach recency. The description used to live in a separate
+# `<<<BEGIN_TOOL_DETAIL>>>` block; the consolidated recency format inlines it
+# under the tool's own entry so every fact about a tool (signature, guidance,
+# valid argument values) sits in one place. This is a project-managed
+# constant, not a user knob — the closed set is tied to the opencode tools we
+# ship for, so there is nothing for a user to tune.
 _HYBRID_DETAIL_TOOLS: List[str] = ["task", "skill"]
+
+# Hybrid mode only. One-line guidance per tool — the failure mode the upstream
+# description warns about that the model still misses with the full schema in
+# context (e.g. `todowrite` being called repeatedly with the same item in
+# progress, `edit` called without a prior `read`). The string is appended after
+# the tool's signature on its recency entry — the "shortened description" that
+# replaces the multi-KB schema for the agent's read-at-each-turn budget. Tools
+# absent from this map render as bare `name(signature)` with no guidance, so
+# adding a custom MCP tool degrades gracefully. Project-managed constant tied
+# to the opencode tools we ship for; not a user knob.
+_HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
+    "bash": (
+        "Run a shell command (terminal: git, npm, docker, etc.). Pass "
+        "`description` (short verb phrase). Use `workdir`, not "
+        "`cd <dir> && …`. For file ops use read/edit/write, not "
+        "cat/sed/echo."
+    ),
+    "edit": (
+        "Exact-string replacement in a file. `read` the file first. "
+        "`oldString` must occur exactly once — add surrounding context or "
+        "pass `replaceAll: true`. Do not include the `N: ` line-number "
+        "prefix in `oldString`/`newString`."
+    ),
+    "glob": (
+        "Find files by name pattern (e.g. `**/*.ts`), sorted by mtime. For "
+        "file *contents* use `grep`. Batch independent patterns in parallel."
+    ),
+    "grep": (
+        "Regex search across file contents (not names). Use `include` to "
+        "scope (`\"*.ts\"`). For match counts use `bash` + `rg`."
+    ),
+    "read": (
+        "Read a file (or list a directory) by absolute path. Param is "
+        "`filePath`, not `filename`/`path`. Prefer one larger read over many "
+        "small re-reads."
+    ),
+    "skill": (
+        "Load a named skill's instructions into context. `name` must match "
+        "exactly one of the skills listed below (closed set)."
+    ),
+    "task": (
+        "Launch a sub-agent. `subagent_type` must match the closed list "
+        "below. Sub-agent output is invisible to the user — summarise it "
+        "back. Launch independent agents in parallel (multiple calls in one "
+        "message)."
+    ),
+    "todowrite": (
+        "Maintain a structured todo list across the turn. Use only for "
+        "≥3 non-trivial steps. Exactly ONE item may be `in_progress`. Flip "
+        "an item to `completed` immediately after finishing it — not at "
+        "end-of-turn, and not in the same call that starts it."
+    ),
+    "webfetch": (
+        "Fetch a URL and convert to markdown/text/html. Read-only. If the "
+        "fetch fails or is empty, say so — never invent the page contents."
+    ),
+    "write": (
+        "Create or overwrite a file at a path. If the file already exists "
+        "you must `read` it first or the call fails. Don't create "
+        "README/docs files unless asked."
+    ),
+}
 
 # opencode builds the `task` tool's description by appending a dynamic agent
 # list onto a block of static boilerplate ("when to use Task", usage notes).
 # That boilerplate carries no closed-set values and is already present verbatim
-# at the stable prefix, so for `task` ONLY the recency TOOL_DETAIL block is
-# pared to the agent-list section — everything from this header onward. The
-# header is the seam in opencode's ToolRegistry.describeTask and has been
-# byte-identical across releases (verified 1.14.41 and 1.15.7). If a future
-# opencode renames it, the parse falls back to the full description — no
-# closed-set values are ever dropped — and TestTaskDescriptionParing is the
-# canary that flags the drift. `skill`'s description is short and left verbatim.
+# at the stable prefix, so for `task` ONLY the recency description inlined
+# under the tool's entry is pared to the agent-list section — everything from
+# this header onward. The header is the seam in opencode's
+# ToolRegistry.describeTask and has been byte-identical across releases
+# (verified 1.14.41 and 1.15.7). If a future opencode renames it, the parse
+# falls back to the full description — no closed-set values are ever dropped —
+# and TestTaskDescriptionParing is the canary that flags the drift. `skill`'s
+# description is short and left verbatim.
 _OPENCODE_TASK_AGENTS_HEADER = (
     "Available agent types and the tools they have access to:"
 )
@@ -421,124 +487,144 @@ def _format_tool_signature(name, required, optional):
     return f"{name}({', '.join(parts)})"
 
 
-def _format_tool_detail_blocks(tool_details):
-    """Render the per-tool TOOL_DETAIL section appended to the hybrid
-    reminder. `tool_details` is a list of `(name, description)` pairs from
-    `_extract_tool_details` (which has already pared `task` down to its agent
-    list). Each pair's description is echoed inside its own
-    `<<<BEGIN_TOOL_DETAIL name="…">>>` block — never parsed here — so the closed
-    set of valid argument values opencode documents only as prose (a `task`'s
-    agent types, a `skill`'s skill names) reaches recency even when attention to
-    messages[0] dilutes. The named delimiter (part of
-    the same marker family as AGENT_TOOLS / TOOL_RESULT / USER_MESSAGE) keeps
-    the model from conflating this recency copy with the authoritative copy at
-    the stable prefix. Returns "" when there's nothing to surface.
+def _format_tool_entries(tool_signatures, tool_details=None):
+    """Render the per-tool block of the hybrid recency reminder. One entry per
+    tool — signature + the one-line guidance from `_HYBRID_TOOL_GUIDANCE` for
+    well-known tools + (for detail tools) the verbatim description from
+    `_extract_tool_details`. Consolidates information that used to be split
+    across three places (signature line, no per-tool guidance, separate
+    `<<<BEGIN_TOOL_DETAIL>>>` blocks) into a single entry per tool so the
+    agent sees every fact about a tool together.
+
+    `tool_signatures` is the `(name, required, optional)` triples from
+    `_extract_tool_signatures`. `tool_details` is the optional list of
+    `(name, description)` pairs from `_extract_tool_details` — these
+    descriptions used to render as their own `<<<BEGIN_TOOL_DETAIL>>>` blocks
+    after the reminder; the consolidated format inlines them under the
+    matching tool's entry. Returns "" when there are no signatures (no tools).
     """
-    if not tool_details:
+    if not tool_signatures:
         return ""
-    blocks = "\n".join(
-        f'<<<BEGIN_TOOL_DETAIL name="{name}">>>\n{desc}\n<<<END_TOOL_DETAIL>>>'
-        for name, desc in tool_details
+    details_by_name: Dict[str, str] = dict(tool_details or [])
+    lines = []
+    for name, req, opt in tool_signatures:
+        signature = _format_tool_signature(name, req, opt)
+        guidance = _HYBRID_TOOL_GUIDANCE.get(name)
+        head = f"- {signature}"
+        if guidance:
+            head = f"{head} — {guidance}"
+        detail = details_by_name.get(name)
+        if detail and detail.strip():
+            # Indent the multi-line description so it visibly belongs to the
+            # tool entry above. Two spaces per line; preserve internal
+            # blank lines.
+            indented = "\n".join(
+                f"  {ln}" if ln else "" for ln in detail.strip().splitlines()
+            )
+            lines.append(f"{head}\n{indented}")
+        else:
+            lines.append(head)
+    legend = (
+        "Tools — one entry per tool, all info for a tool in one place "
+        "(signature, guidance, and any closed-set argument values). Full "
+        "schemas are at <<<BEGIN_AGENT_TOOLS>>>. Signature format: "
+        "name(required, [optional]); bracketed = optional; names not listed "
+        "are unavailable; parameter names must match exactly (e.g. "
+        "`filename` fails where `filePath` is required)."
     )
-    framing = (
-        "[Valid argument values for the tools below — authoritative copy in "
-        "<<<BEGIN_AGENT_TOOLS>>>.]"
-    )
-    return f"\n\n{framing}\n{blocks}"
+    return f"\n\n{legend}\n" + "\n".join(lines)
 
 
 def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None):
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
-    message at index 0). This reminder is prepended to the last user
-    message — recency slot — so the live turn is preceded by a compact,
-    scannable set of operating rules grouped under five labels:
+    message at index 0). The recency message that lands on the LAST user
+    turn is laid out as:
 
-      - Agency   — positive assertion that the model acts through opencode:
-                   its ```json calls really execute against the working
-                   directory mounted from the user's machine and results are
-                   real. Targets the ~20% reversion where the upstream's
-                   baked-in "chat assistant that can't execute" persona
-                   reasserts itself ("Since I cannot execute the local shell
-                   script for you, I've prepared the exact commands…") even
-                   right after a successful tool call (issue #109). Names
-                   opencode as the disambiguator — the upstream's
-                   `file_and_coding_agent` and its other phantom tools are
-                   NOT the agency at play here. Points at the
-                   <<<BEGIN_AGENT_TOOLS>>> section AND the signature list
-                   later in this same reminder: the former is authoritative
-                   but sits at messages[0] and may have drifted out of
-                   attention on long conversations (which is when the
-                   reversion fires), so the in-reminder pointer is the one
-                   that survives dilution.
-      - Tools    — the JSON envelope, the no-fabricated-results rule, and a
-                   pointer back to <<<BEGIN_AGENT_TOOLS>>> for full
-                   descriptions. The pointer is for *descriptions only*: the
-                   closed set of valid argument values (a `task`'s agent
-                   types, a `skill`'s names) now reaches recency in the
-                   TOOL_DETAIL blocks, so the old "constraints on parameter
-                   values" parenthetical here would be misleading and is gone.
-      - Workflow — prefer a listed tool over hand-work, keep a live plan with
-                   `todowrite`/`todoread`, and launch `task` agents (several
-                   concurrently when possible) to parallelize and conserve
-                   context. This is the general guidance that replaces the
-                   `task` boilerplate pared out of the recency TOOL_DETAIL.
-      - Honesty  — never fabricate; no invented names/paths/signatures/
-                   citations; "I don't know" / "I'll check" are valid.
-      - Environment — the proxy runs in a Linux container with the working
-                   directory mounted from the host (host OS injected via
-                   `_HOST_OS` when known), so reproducible setup must live in
-                   the working directory, not the container.
+      <<<BEGIN_USER_REQUEST>>>
+      {content}
+      <<<END_USER_REQUEST>>>
 
-    The per-tool signatures (`name(required, [optional])`) close the line:
-    they are the recency anchor for the parameter keys the model most often
-    gets wrong (e.g. opencode's `bash` requires `description`; `read` takes
-    `filePath` not `filename`).
+      [Reminder — operating rules for this turn.
+       - Operating: ... (merged Agency/Tools/Workflow)
+       - Honesty:   ...
+       - Environment: ...
+
+       Tools — one entry per tool ...
+       - tool1(...) — guidance line
+       - tool2(...) — guidance line
+         <verbatim description if tool2 is a detail tool>
+       ...]
+
+    The live user request is placed FIRST, before the reminder, so the
+    model's most-recent attention isn't on a wall of operating rules but
+    on what the user actually asked. Tool-result turns (content already
+    delimited by `<<<BEGIN_TOOL_RESULT>>>` markers) skip the
+    USER_REQUEST wrap — the TOOL_RESULT markers already delimit the live
+    "ask" of the turn.
+
+    Operating consolidates the prior Agency/Tools/Workflow bullets into
+    one paragraph. It still carries:
+      - "you act through opencode — calls really execute, results are real"
+        (issue #109's anchor against the upstream's "I can't execute, here
+        are commands for you to run" persona reversion)
+      - the JSON envelope and the no-fabricated-results rule
+      - "prefer a listed tool over hand-work"
+      - "don't downgrade to listing commands for the user to run"
+      - "track non-trivial work with `todowrite`; launch `task` agents in
+        parallel when independent"
+      - "if no listed tool fits, just ask or answer"
+      - a pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions
+
+    Honesty (anti-fabrication) and Environment (Linux container + host-OS
+    parenthetical) keep their own bullets — both are short, orthogonal to
+    Operating, and worth keeping scannable on their own.
+
+    The per-tool entries below the bullets carry all three things that
+    used to be split across the prior recency block — signature, shortened
+    guidance, and the closed-set argument values (a `task`'s
+    `subagent_type` agents, a `skill`'s valid names) — together under the
+    tool's own line. The detail descriptions (`tool_details`) used to
+    render as separate `<<<BEGIN_TOOL_DETAIL>>>` blocks; they are now
+    inlined under the matching tool's entry, so the agent reads
+    everything it needs about a tool in one place.
 
     `tool_signatures` is a list of `(name, required_keys, optional_keys)`
     triples produced by `_extract_tool_signatures`.
 
     `tool_details` is an optional list of `(name, description)` pairs from
-    `_extract_tool_details` — the "detail tools" whose description is echoed
-    after the reminder in <<<BEGIN_TOOL_DETAIL>>> blocks. The signature line
-    carries only parameter *keys*; a `task`'s valid agent types and a
-    `skill`'s valid names are a closed set of *values* opencode documents only
-    in the description prose, so the whole (pared) description must reach
-    recency for those tools.
+    `_extract_tool_details` — the "detail tools" whose description is inlined
+    under the matching tool's entry.
     """
-    if tool_signatures:
-        rendered = ", ".join(
-            _format_tool_signature(name, req, opt)
-            for name, req, opt in tool_signatures
-        )
-        tools_clause = (
-            f"\nAvailable tools: {rendered}. Use parameter keys exactly as listed."
-        )
+    is_tool_result = "<<<BEGIN_TOOL_RESULT" in content
+    if is_tool_result:
+        # Tool-result turn: content is already delimited by TOOL_RESULT
+        # markers; place it first as the "ask" of the turn, reminder
+        # behind it. Do not wrap in USER_REQUEST (TOOL_RESULT already
+        # delimits; USER_REQUEST is for live user asks).
+        wrapped = content
     else:
-        tools_clause = ""
+        wrapped = (
+            f"<<<BEGIN_USER_REQUEST>>>\n{content}\n<<<END_USER_REQUEST>>>"
+        )
     host_os_clause = f" (host OS: {_HOST_OS})" if _HOST_OS else ""
+    tool_entries = _format_tool_entries(tool_signatures, tool_details)
     reminder = (
         "[Reminder — operating rules for this turn.\n"
-        "- Agency: you act through opencode — your ```json calls really "
+        "- Operating: you act through opencode — your ```json calls really "
         "execute against the working directory mounted from the user's "
-        "machine, and the results you get back are real (you have been using "
-        "them). Do the task with the opencode tools listed in this reminder "
-        "(signatures below; full descriptions in the <<<BEGIN_AGENT_TOOLS>>> "
-        "section earlier in this conversation); don't downgrade to listing "
-        "commands for the user to run. If no opencode tool fits, just ask or "
-        "answer.\n"
-        "- Tools: the only tools available are defined in the "
-        "<<<BEGIN_AGENT_TOOLS>>> section at the start of this conversation — "
-        "refer back there for full descriptions. Call a tool by emitting a "
-        "```json block with {\"name\": ..., \"arguments\": ...}; you may "
-        "reason before or after it. After a tool call, do not invent or "
-        "narrate its result — the real result arrives next turn. If no tool "
-        "is needed, just answer.\n"
-        "- Workflow: prefer a listed tool over doing the work by hand (e.g. "
-        "use `webfetch` for a URL instead of curl or a script). Track your "
-        "work with `todowrite`/`todoread` to stay on plan. Launch `task` "
-        "agents — several concurrently when the work allows — to parallelize "
-        "and conserve your context.\n"
+        "machine, and the results you get back are real. Call a tool by "
+        "emitting a ```json block with {\"name\": ..., \"arguments\": ...}; "
+        "you may reason before or after it. After a tool call, do not "
+        "invent or narrate its result — the real result arrives next turn. "
+        "Do the task with the opencode tools listed below (full descriptions "
+        "in the <<<BEGIN_AGENT_TOOLS>>> section earlier in this "
+        "conversation); prefer a listed tool over doing the work by hand "
+        "(e.g. use `webfetch` for a URL instead of curl or a script), and "
+        "don't downgrade to listing commands for the user to run. Track "
+        "non-trivial work with `todowrite`; launch `task` agents — several "
+        "concurrently when the work allows — to parallelize and conserve "
+        "your context. If no opencode tool fits, just ask or answer.\n"
         "- Honesty: never fabricate. Do not present guesses as facts — no "
         "invented function names, file paths, signatures, config keys, or "
         "citations. \"I don't know\" or \"I'd need to check X\" are valid "
@@ -551,10 +637,9 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         "venv + requirements.txt); a venv built here is Linux-native, so on a "
         "non-Linux host the user may need to recreate it (python -m venv .venv "
         "&& pip install -r requirements.txt)."
-        f"{tools_clause}]"
+        f"{tool_entries}]"
     )
-    detail_blocks = _format_tool_detail_blocks(tool_details)
-    return f"{reminder}{detail_blocks}\n\n{content}"
+    return f"{wrapped}\n\n{reminder}"
 
 
 def _scan_balanced_json(text, start):
@@ -1032,17 +1117,32 @@ def translate_history_and_apply_prompt(
                 # wrap: there was no inbound agent prompt to delimit.
                 messages.insert(0, {"role": "system", "content": system_addition.strip()})
 
-            # Wrap every real user-role message in USER_MESSAGE markers.
+            # Wrap every real user-role message in USER_MESSAGE markers —
+            # EXCEPT the last one. The last real user turn is the live ask;
+            # the recency builder wraps it in <<<BEGIN_USER_REQUEST>>>
+            # instead and places it at the FRONT of the recency block
+            # (before the reminder), so the model's most-recent attention
+            # lands on the user's actual question rather than on a wall of
+            # operating rules. Prior user turns keep USER_MESSAGE — they're
+            # historical context, not the live ask.
+            #
             # "Real" = original role was `user`, not a tool-result that got
             # role-converted; the latter already carry <<<BEGIN_TOOL_RESULT
             # name="…">>> markers from the universal pre-dispatch wrap, so we
-            # detect and skip them by that marker prefix. The system message at
-            # index 0 is still role "system" here (sys→user runs later), so the
-            # role filter leaves it alone. This runs BEFORE the recency reminder
-            # so the reminder lands OUTSIDE the wrap — it's proxy stage
-            # direction, not part of what the user wrote.
-            for m in messages:
+            # detect and skip them by that marker prefix. The system message
+            # at index 0 is still role "system" here (sys→user runs later),
+            # so the role filter leaves it alone.
+            last_user_idx = -1
+            for i, m in enumerate(messages):
+                if m["role"] == "user":
+                    last_user_idx = i
+            for i, m in enumerate(messages):
                 if m["role"] != "user":
+                    continue
+                if i == last_user_idx:
+                    # The builder handles delimiting for the live turn
+                    # (USER_REQUEST for a real user turn, none for a tool
+                    # result — the TOOL_RESULT markers already delimit).
                     continue
                 flattened = _flatten_content_to_str(m["content"])
                 if "<<<BEGIN_TOOL_RESULT" in flattened:
@@ -1054,14 +1154,21 @@ def translate_history_and_apply_prompt(
                 )
 
             # Recency reminder on the last user-role message (real user
-            # turn or tool-result-converted-to-user). Same scope as the
-            # original hybrid reminder; prepended after the USER_MESSAGE wrap
-            # so it sits outside it.
+            # turn or tool-result-converted-to-user). The builder places
+            # the live user content at the FRONT (wrapped in USER_REQUEST
+            # for a real user turn, left as-is for a tool result) and
+            # appends the reminder behind it.
             if messages[-1]["role"] == "user":
                 signatures = _extract_tool_signatures(tools, tools_text)
                 details = _extract_tool_details(tools, _HYBRID_DETAIL_TOOLS)
+                # The live user content lands in USER_REQUEST in the builder,
+                # so the message comes in here as plain content (no
+                # USER_MESSAGE wrap to strip). Tool-result-converted user
+                # messages carry TOOL_RESULT markers already; the builder
+                # passes those through.
+                live_content = _flatten_content_to_str(messages[-1]["content"])
                 messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
-                    messages[-1]["content"],
+                    live_content,
                     signatures,
                     details,
                 )
