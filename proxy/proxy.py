@@ -1452,17 +1452,26 @@ def _empty_response_rescue_text() -> str:
     back in history. The text alone unsticks the upstream filter, but a
     text-only response makes opencode end the turn (`done_reason: stop`);
     the *real* continuation comes from pairing this text with the rescue
-    tool call from `_select_rescue_tool` when one is available."""
+    bash/pwd call from `_select_rescue_tool` when a shell tool is
+    available."""
     return "Understood."
 
 
-# Names a `todowrite`-style tool may carry across agents. Match is
-# case-insensitive and underscores are stripped before comparison, so this
-# covers `todowrite` (opencode), `TodoWrite` (Claude Code), `todo_write`,
-# and similar variants. State-only tool: an empty `todos` list is the
-# cheapest no-op that still produces a tool result, which is what unsticks
-# the next turn.
-_RESCUE_TOOL_NAME_PATTERNS = ("todowrite",)
+# Names of a shell-execution tool we can drive across agents (opencode
+# `bash`, Claude Code `Bash`). Matched case-insensitively. We deliberately
+# pick `bash` over `todowrite` for the rescue: `bash` is exposed for every
+# coding agent in practice (broader availability than `todowrite`), and a
+# read-only command like `pwd` is genuinely inconsequential — no
+# filesystem/network/state changes, just prints the working directory.
+_RESCUE_TOOL_NAME_PATTERNS = ("bash",)
+
+# The command + description we send when invoking the rescue bash tool.
+# `pwd` is the right choice because it (a) exists on every POSIX shell and
+# in git-bash on Windows, (b) is read-only, (c) produces a tiny single-line
+# tool result that can't itself re-trigger the upstream filter, and (d) is
+# obviously inconsequential to anyone reading the conversation later.
+_RESCUE_BASH_COMMAND = "pwd"
+_RESCUE_BASH_DESCRIPTION = "Print working directory"
 
 
 def _select_rescue_tool(
@@ -1475,24 +1484,26 @@ def _select_rescue_tool(
     triggering content out of the hot slot). See architecture/proxy.md →
     "Empty-response detection" (issue #117).
 
-    Searches the inbound tools for a `todowrite`-style name and, if found,
-    returns a `{name, arguments}` payload calling it with an empty list.
-    `todowrite` is the right rescue target because (a) it has no
-    filesystem/network side effects, (b) `{"todos": []}` is a valid call
-    for both opencode and Claude Code schemas, and (c) the resulting tool
-    result is a tiny string that won't itself re-trigger the upstream
-    filter. Returns `None` when no rescue tool is available in the inbound
-    tools — caller falls back to the text-only rescue (the upstream still
-    unsticks on the user's next prompt; just no auto-continuation).
+    Searches the inbound tools for a `bash`-style name and, if found,
+    returns a `{name, arguments}` payload that runs `pwd`. `bash`/`pwd` is
+    the right rescue because (a) the shell tool is exposed for every
+    coding agent, (b) `pwd` is read-only with no filesystem/network/state
+    side effects, and (c) the one-line tool result is tiny and can't
+    re-trigger the upstream filter. Returns `None` when no shell tool is
+    available — caller falls back to the text-only rescue (the upstream
+    still unsticks on the user's next prompt; just no auto-continuation).
     """
-    def _normalize(name: str) -> str:
-        return name.replace("_", "").lower()
-
     for name in available_tool_names or ():
         if not isinstance(name, str):
             continue
-        if _normalize(name) in _RESCUE_TOOL_NAME_PATTERNS:
-            return {"name": name, "arguments": {"todos": []}}
+        if name.lower() in _RESCUE_TOOL_NAME_PATTERNS:
+            return {
+                "name": name,
+                "arguments": {
+                    "command": _RESCUE_BASH_COMMAND,
+                    "description": _RESCUE_BASH_DESCRIPTION,
+                },
+            }
     return None
 
 
@@ -1652,15 +1663,15 @@ def catch_all(path: str) -> Response:
         # the recency, so the same empty response keeps coming back.
         #
         # The fix has two parts. (1) Substitute a minimal assistant text
-        # ("Understood.") so the response isn't empty. (2) If a safe "dumb"
-        # tool is available in the inbound tools (todowrite-style), also
-        # emit a no-op call to it — that forces `done_reason: tool_calls`
-        # in the NDJSON, so opencode executes the tool and re-invokes the
-        # model with the tool result as the new recency, which displaces
-        # the filter-triggering content out of the hot slot and the next
-        # turn proceeds normally. Without the tool call the turn just ends
-        # at "Understood.", which the user observed in issue #117 — the
-        # upstream is unstuck but the agent loop stalls.
+        # ("Understood.") so the response isn't empty. (2) If a shell tool
+        # is available in the inbound tools (`bash`/`Bash`), also emit a
+        # no-op call to it (running `pwd`) — that forces `done_reason:
+        # tool_calls` in the NDJSON, so opencode executes the tool and
+        # re-invokes the model with the tool result as the new recency,
+        # which displaces the filter-triggering content out of the hot
+        # slot and the next turn proceeds normally. Without the tool call
+        # the turn just ends at "Understood.", which the user observed in
+        # issue #117 — the upstream is unstuck but the agent loop stalls.
         if not clean_text.strip() and not tool_call_payloads:
             finish_reason = _extract_finish_reason(target_json)
             rescue_payload = _select_rescue_tool(_collect_tool_names(tools))

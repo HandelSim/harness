@@ -2631,21 +2631,25 @@ class TestEmptyResponseDetection(unittest.TestCase):
     finish_reason=stop, 0 completion_tokens, and no content/tool_calls —
     silently short-circuiting before generation when something in the
     most-recent message trips a content/safety filter. The proxy substitutes
-    a minimal rescue text in the assistant slot, AND if a `todowrite`-style
-    tool is available in the inbound tools, also emits a no-op call to it
-    so opencode (a) executes the tool and (b) re-invokes the model with the
-    tool result as the new recency, displacing the trigger out of the hot
-    slot and letting the conversation continue without user intervention."""
+    a minimal rescue text in the assistant slot, AND if a `bash`-style shell
+    tool is available in the inbound tools, also emits a no-op `pwd` call to
+    it so opencode (a) executes the tool and (b) re-invokes the model with
+    the tool result as the new recency, displacing the trigger out of the
+    hot slot and letting the conversation continue without user
+    intervention."""
 
-    _TODOWRITE_TOOL = {
+    _BASH_TOOL = {
         "type": "function",
         "function": {
-            "name": "todowrite",
-            "description": "Maintain a structured todo list.",
+            "name": "bash",
+            "description": "Run a shell command.",
             "parameters": {
                 "type": "object",
-                "required": ["todos"],
-                "properties": {"todos": {"type": "array"}},
+                "required": ["command", "description"],
+                "properties": {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                },
             },
         },
     }
@@ -2695,11 +2699,11 @@ class TestEmptyResponseDetection(unittest.TestCase):
                 return c.get("done_reason")
         return None
 
-    def test_empty_content_with_todowrite_emits_rescue_tool_call(self):
-        """The flagship issue #117 path: empty upstream content + todowrite
-        is available → emit "Understood." text PLUS a no-op todowrite call,
-        so opencode's `done_reason` is `tool_calls` and the agent continues
-        the turn by executing the tool."""
+    def test_empty_content_with_bash_emits_rescue_pwd_call(self):
+        """The flagship issue #117 path: empty upstream content + bash is
+        available → emit "Understood." text PLUS a no-op `pwd` call via the
+        bash tool, so opencode's `done_reason` is `tool_calls` and the agent
+        continues the turn by executing the (read-only) command."""
         resp = self._post(
             {
                 "choices": [{
@@ -2710,30 +2714,31 @@ class TestEmptyResponseDetection(unittest.TestCase):
                 "usage": {"prompt_tokens": 3352, "completion_tokens": 0,
                           "total_tokens": 3352},
             },
-            tools=[self._TODOWRITE_TOOL],
+            tools=[self._BASH_TOOL],
         )
         self.assertEqual(resp.status_code, 200)
         chunks = self._chunks(resp)
-        # Rescue text occupies the assistant content slot.
         self.assertEqual(self._content_joined(chunks).strip(), "Understood.")
-        # The rescue tool call was emitted with a no-op arguments shape.
         tcs = self._tool_calls(chunks)
         self.assertEqual(len(tcs), 1, f"expected 1 rescue tool call, got {tcs}")
-        self.assertEqual(tcs[0]["function"]["name"], "todowrite")
-        self.assertEqual(tcs[0]["function"]["arguments"], {"todos": []})
-        # done_reason must be tool_calls so opencode executes the call
-        # rather than ending the turn.
+        self.assertEqual(tcs[0]["function"]["name"], "bash")
+        # The args must be a read-only pwd invocation — anything else
+        # (e.g. an empty command, or a state-modifying command) would
+        # contradict the "inconsequential" design.
+        self.assertEqual(
+            tcs[0]["function"]["arguments"],
+            {"command": "pwd", "description": "Print working directory"},
+        )
         self.assertEqual(self._done_reason(chunks), "tool_calls")
-        # No verbose diagnostic content.
         joined = self._content_joined(chunks)
         self.assertNotIn("[harness proxy]", joined)
         self.assertNotIn("finish_reason", joined)
 
     def test_empty_content_without_rescue_tool_falls_back_to_text(self):
-        """When no todowrite-style tool is in the inbound tools, the rescue
-        still emits "Understood." in the assistant slot (the upstream
-        unsticks on the user's next prompt), but no fabricated tool call is
-        emitted and the done_reason stays `stop`."""
+        """When no shell tool is in the inbound tools, the rescue still
+        emits "Understood." in the assistant slot (the upstream unsticks on
+        the user's next prompt), but no fabricated tool call is emitted and
+        the done_reason stays `stop`."""
         resp = self._post(
             {
                 "choices": [{
@@ -2749,11 +2754,11 @@ class TestEmptyResponseDetection(unittest.TestCase):
         self.assertEqual(self._tool_calls(chunks), [])
         self.assertEqual(self._done_reason(chunks), "stop")
 
-    def test_rescue_tool_matches_camelcase_todowrite(self):
-        """Claude Code names the tool `TodoWrite`; the selector matches
+    def test_rescue_tool_matches_capitalized_bash(self):
+        """Claude Code names the tool `Bash`; the selector matches
         case-insensitively so the rescue still finds it."""
-        camel_tool = json.loads(json.dumps(self._TODOWRITE_TOOL))
-        camel_tool["function"]["name"] = "TodoWrite"
+        cap_tool = json.loads(json.dumps(self._BASH_TOOL))
+        cap_tool["function"]["name"] = "Bash"
         resp = self._post(
             {
                 "choices": [{
@@ -2762,12 +2767,18 @@ class TestEmptyResponseDetection(unittest.TestCase):
                 }],
                 "usage": {"completion_tokens": 0},
             },
-            tools=[camel_tool],
+            tools=[cap_tool],
         )
         chunks = self._chunks(resp)
         tcs = self._tool_calls(chunks)
         self.assertEqual(len(tcs), 1)
-        self.assertEqual(tcs[0]["function"]["name"], "TodoWrite")
+        # The emitted name must echo the inbound name exactly, so opencode
+        # can route the call.
+        self.assertEqual(tcs[0]["function"]["name"], "Bash")
+        self.assertEqual(
+            tcs[0]["function"]["arguments"],
+            {"command": "pwd", "description": "Print working directory"},
+        )
         self.assertEqual(self._done_reason(chunks), "tool_calls")
 
     def test_whitespace_only_content_treated_as_empty(self):
@@ -2781,7 +2792,7 @@ class TestEmptyResponseDetection(unittest.TestCase):
                 }],
                 "usage": {"completion_tokens": 0},
             },
-            tools=[self._TODOWRITE_TOOL],
+            tools=[self._BASH_TOOL],
         )
         chunks = self._chunks(resp)
         self.assertEqual(self._content_joined(chunks).strip(), "Understood.")
@@ -2798,7 +2809,7 @@ class TestEmptyResponseDetection(unittest.TestCase):
                 }],
                 "usage": {"completion_tokens": 2},
             },
-            tools=[self._TODOWRITE_TOOL],
+            tools=[self._BASH_TOOL],
         )
         chunks = self._chunks(resp)
         joined = self._content_joined(chunks)
@@ -2808,35 +2819,20 @@ class TestEmptyResponseDetection(unittest.TestCase):
 
     def test_tool_only_turn_does_not_trigger_rescue(self):
         """Tool-call-only turns have empty assistant text by design —
-        must not be mistaken for the stalled-empty case."""
+        must not be mistaken for the stalled-empty case. Critically, if
+        the model's own response includes a bash call, the rescue must
+        NOT append a second (spurious) pwd call."""
         tool_block = (
             'Calling a tool.\n'
             '```json\n'
-            '{"name": "Bash", "arguments": {"command": "ls", '
+            '{"name": "bash", "arguments": {"command": "ls", '
             '"description": "list files"}}\n'
             '```'
         )
         ollama_request = {
             "model": "GenAI",
             "messages": [{"role": "user", "content": "list the files"}],
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "Bash",
-                        "description": "Run a shell command",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "command": {"type": "string"},
-                                "description": {"type": "string"},
-                            },
-                            "required": ["command", "description"],
-                        },
-                    },
-                },
-                self._TODOWRITE_TOOL,
-            ],
+            "tools": [self._BASH_TOOL],
             "stream": False,
         }
 
@@ -2865,10 +2861,10 @@ class TestEmptyResponseDetection(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         chunks = self._chunks(resp)
         tcs = self._tool_calls(chunks)
-        # Exactly the model's own Bash call; the rescue todowrite must NOT
-        # have been spuriously appended.
+        # Exactly the model's own `ls` call; no extra rescue `pwd`.
         self.assertEqual(len(tcs), 1)
-        self.assertEqual(tcs[0]["function"]["name"], "Bash")
+        self.assertEqual(tcs[0]["function"]["name"], "bash")
+        self.assertEqual(tcs[0]["function"]["arguments"]["command"], "ls")
         self.assertNotIn("Understood.", self._content_joined(chunks))
 
     def test_no_choices_emits_rescue(self):
@@ -2876,7 +2872,7 @@ class TestEmptyResponseDetection(unittest.TestCase):
         substitute the rescue."""
         resp = self._post(
             {"choices": [], "usage": {"completion_tokens": 0}},
-            tools=[self._TODOWRITE_TOOL],
+            tools=[self._BASH_TOOL],
         )
         chunks = self._chunks(resp)
         self.assertEqual(self._content_joined(chunks).strip(), "Understood.")
@@ -2889,16 +2885,22 @@ class TestEmptyResponseDetection(unittest.TestCase):
         self.assertEqual(text, "Understood.")
         self.assertNotIn("[harness proxy]", text)
 
-    def test_select_rescue_tool_finds_underscored_variant(self):
-        """`todo_write` (underscore variant) must match too."""
-        payload = proxy._select_rescue_tool({"todo_write"})
+    def test_select_rescue_tool_picks_bash_and_emits_pwd(self):
+        """Unit-test the rescue tool selector directly: when `bash` is
+        present it picks it and emits a read-only pwd call."""
+        payload = proxy._select_rescue_tool({"bash"})
         self.assertIsNotNone(payload)
-        self.assertEqual(payload["name"], "todo_write")
-        self.assertEqual(payload["arguments"], {"todos": []})
+        self.assertEqual(payload["name"], "bash")
+        self.assertEqual(
+            payload["arguments"],
+            {"command": "pwd", "description": "Print working directory"},
+        )
 
     def test_select_rescue_tool_returns_none_when_unavailable(self):
-        """No todowrite-style tool in the set → None, caller falls back."""
-        self.assertIsNone(proxy._select_rescue_tool({"bash", "read", "edit"}))
+        """No shell tool in the set → None, caller falls back to text-only.
+        Crucially, `todowrite` does NOT count as a shell rescue — we picked
+        bash specifically and won't silently substitute another tool."""
+        self.assertIsNone(proxy._select_rescue_tool({"todowrite", "read", "edit"}))
         self.assertIsNone(proxy._select_rescue_tool(set()))
         self.assertIsNone(proxy._select_rescue_tool(None))
 

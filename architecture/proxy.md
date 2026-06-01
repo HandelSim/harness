@@ -408,11 +408,12 @@ empty. When both hold, the proxy substitutes a **two-part rescue**:
    reply makes opencode end the turn with `done_reason: stop`. The user
    then has to type something for the conversation to continue.
 2. **Rescue tool call** — when the inbound tools list contains a
-   `todowrite`-style tool, `_select_rescue_tool` returns a `{name,
-   arguments: {"todos": []}}` payload which the proxy appends to
+   `bash`-style shell tool, `_select_rescue_tool` returns a `{name,
+   arguments: {"command": "pwd", "description": "Print working
+   directory"}}` payload which the proxy appends to
    `tool_call_payloads`. The NDJSON `done_reason` becomes `tool_calls`,
-   opencode executes the no-op `todowrite`, and re-invokes the model
-   with the tool result as the **new** recency — which displaces the
+   opencode executes the no-op `pwd`, and re-invokes the model with the
+   tool result as the **new** recency — which displaces the
    filter-triggering content out of the hot slot, so the next model
    turn returns real content without user intervention.
 
@@ -424,22 +425,22 @@ same regardless of the upstream's exact bookkeeping, so the rule is just
 (`text+tool(<name>)` or `text-only`), so the event remains visible in
 `harness logs proxy` for diagnosis.
 
-### Why `todowrite`
+### Why `bash` running `pwd`
 
-`todowrite` is the rescue target because (a) it's available across the
-agents harness ships for (opencode `todowrite`, Claude Code `TodoWrite`),
-(b) the call has no filesystem/network side effects — only the agent's
-local task list changes, (c) `{"todos": []}` is a valid call for both
-schemas and produces a tiny tool result (a string like "Updated 0 todos")
-that itself can't re-trigger the upstream filter, and (d) it is
-exhaustively listed in `_HYBRID_TOOL_GUIDANCE` so the recency reminder
-already documents the call shape — the model that sees the result on the
-follow-up turn isn't surprised by it. `_select_rescue_tool` matches the
-inbound tool name case-insensitively and with underscores stripped, so
-`todowrite`, `TodoWrite`, and `todo_write` all match. When no
-todowrite-style tool is exposed for the turn, the rescue degrades to
-text-only — the upstream still unsticks on the user's next prompt; only
-the auto-continuation is lost.
+The bash tool is the rescue target because (a) every coding agent
+harness ships for exposes a shell tool (opencode `bash`, Claude Code
+`Bash`) — broader availability than `todowrite`-style tools, (b) `pwd`
+is genuinely inconsequential: read-only, no filesystem/network/state
+side effects, and (c) the one-line tool result (the absolute path) is
+tiny and can't itself re-trigger the upstream filter.
+`_select_rescue_tool` matches the inbound tool name case-insensitively,
+so `bash` and `Bash` both match; the emitted call echoes the inbound
+name verbatim so the agent's router can dispatch it. The arguments
+shape `{"command": "pwd", "description": "Print working directory"}`
+satisfies the required-fields contract of both schemas. When no shell
+tool is exposed for the turn, the rescue degrades to text-only — the
+upstream still unsticks on the user's next prompt; only the
+auto-continuation is lost.
 
 ### Earlier iterations
 
@@ -448,9 +449,13 @@ The first fix emitted a verbose `[harness proxy] …` diagnostic with
 own turn, which is jarring given the conversation actually resumes on the
 next prompt. The minimal rescue text replaced it. That in turn proved
 insufficient when the user observed (issue #117) that the turn still
-ended at `"Understood."`; the tool-call leg of the rescue was added so
-the agent loop continues automatically. Diagnosis still belongs in
-`harness logs proxy` and `state/output/<req_id>_03_API_Response.json`.
+ended at `"Understood."` — text-only is `done_reason: stop` and opencode
+ends the turn. A `todowrite {todos: []}` call was prototyped to force
+`done_reason: tool_calls` but rejected in favor of `bash pwd`: bash is
+more universally exposed than todowrite, and a read-only command is more
+unambiguously inconsequential than mutating the agent's task list (even
+to empty). Diagnosis still belongs in `harness logs proxy` and
+`state/output/<req_id>_03_API_Response.json`.
 
 ### Conservatism
 
