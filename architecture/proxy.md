@@ -365,6 +365,22 @@ block means the whole fenced payload bleeds into chat as raw text
 balanced-brace scanning, the `name`/`arguments` shape check, and the
 "left in text on parse failure" behaviour are unchanged.
 
+Same tradeoff drives the **tolerant lift on missing `arguments`** (issue
+#118). Models sometimes spell args at the top level instead of nested —
+e.g. `{"name": "bash", "command": "ls", "description": "list files"}`.
+`catch_all` builds `available_tool_names` from the inbound `tools` array
+and passes it to `extract_tool_calls_and_text`. When a parsed block has
+`name` matching a current tool but no `arguments` key, the remaining
+top-level keys are lifted into `arguments`. The lift is gated on **both**
+conditions: a block whose `arguments` key is already present is
+untouched (correctly-shaped calls aren't rewritten), and a block whose
+`name` isn't a current tool still leaks into chat (instructional prose
+like ` ```json\n{"name": "foo", ...}\n``` ` for a tool we never exposed
+remains user-facing content, same precedent as the issue #115 leniency).
+Lifting fabricates no values — only top-level keys the model already
+wrote — so a misshaped call surfaces upstream as a real argument-shape
+error the model can correct rather than bleeding into chat.
+
 ## NDJSON streaming
 
 `generate_ndjson` yields ollama-compatible streaming chunks: a sequence

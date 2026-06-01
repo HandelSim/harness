@@ -159,6 +159,78 @@ class TestExtractToolCall(unittest.TestCase):
         # The block isn't stripped on malformed JSON.
         self.assertIn("```json", clean)
 
+    def test_missing_arguments_lifted_when_name_is_known_tool(self):
+        """Issue #118: models sometimes spell args at the top level instead
+        of nested under `arguments`. When the `name` matches a tool we
+        actually exposed for this turn, lift the remaining top-level keys
+        into `arguments` rather than leaking the block into chat."""
+        text = (
+            'Here we go:\n'
+            '```json\n'
+            '{"name": "bash", "command": "ls -la", "description": "list files"}\n'
+            '```\n'
+            'Done.'
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(
+            text, available_tool_names={"bash", "read", "write"}
+        )
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["name"], "bash")
+        self.assertEqual(
+            payloads[0]["arguments"],
+            {"command": "ls -la", "description": "list files"},
+        )
+        self.assertNotIn("```json", clean)
+        self.assertIn("Here we go:", clean)
+        self.assertIn("Done.", clean)
+
+    def test_missing_arguments_not_lifted_when_name_is_unknown(self):
+        """The lift is gated on the name matching a currently-available
+        tool — instructional prose like ` ```json\\n{"name": "foo", ...}\\n``` `
+        for a tool we never exposed must still leak into chat (model was
+        describing JSON, not invoking)."""
+        text = (
+            '```json\n'
+            '{"name": "no_such_tool", "command": "ls"}\n'
+            '```'
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(
+            text, available_tool_names={"bash", "read"}
+        )
+        self.assertEqual(payloads, [])
+        # The block stays in clean_text — model gets to see its own prose.
+        self.assertIn("no_such_tool", clean)
+
+    def test_missing_arguments_not_lifted_with_no_tools_passed(self):
+        """Defensive: when `available_tool_names` is empty/None (legacy
+        callers, edge cases), the lift never fires — preserves prior
+        behaviour for any code path that hasn't been updated yet."""
+        text = (
+            '```json\n'
+            '{"name": "bash", "command": "ls"}\n'
+            '```'
+        )
+        payloads, clean = proxy.extract_tool_calls_and_text(text)
+        self.assertEqual(payloads, [])
+        self.assertIn("bash", clean)
+
+    def test_correctly_shaped_block_with_arguments_is_untouched_by_lift(self):
+        """When `arguments` is already present, lifting is a no-op — a
+        well-formed call must extract exactly as before even if other
+        top-level keys happen to be there."""
+        text = (
+            '```json\n'
+            '{"name": "bash", "arguments": {"command": "ls"}, "extra": "ignored"}\n'
+            '```'
+        )
+        payloads, _ = proxy.extract_tool_calls_and_text(
+            text, available_tool_names={"bash"}
+        )
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["arguments"], {"command": "ls"})
+        # The stray top-level key is NOT folded into arguments.
+        self.assertNotIn("extra", payloads[0]["arguments"])
+
 
 class TestExtractToolCallScanner(unittest.TestCase):
     """Tests for the balanced-brace tool call extraction logic.
@@ -1547,6 +1619,21 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
             c,
         )
         self.assertIn("Exactly ONE item may be `in_progress`", c)
+        # Issue #118: per-item shape and the `priority` string enum reach
+        # recency so the model stops trying ints / omitting the key / using
+        # `description` instead of `content`. Locate the todowrite bullet
+        # and assert only against its own body so we don't catch matches in
+        # neighbouring tool entries.
+        todo_start = c.index("- todowrite(todos)")
+        todo_end = c.find("\n- ", todo_start + 1)
+        if todo_end == -1:
+            todo_end = c.index("]", todo_start)
+        todo_block = c[todo_start:todo_end]
+        self.assertIn("{content, status, priority}", todo_block)
+        self.assertIn("'high'", todo_block)
+        self.assertIn("'medium'", todo_block)
+        self.assertIn("'low'", todo_block)
+        self.assertIn("NOT an int", todo_block)
 
     def test_signature_format_legend_present(self):
         """The legend above the per-tool entries teaches the model what the
