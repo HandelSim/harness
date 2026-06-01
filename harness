@@ -2603,7 +2603,7 @@ run_agent_interactive() {
         done
     fi
     docker_args+=(
-        -w "$mount_path"
+        -w "$(harness_container_workdir "$mount_path")"
         --label "harness.agent=true"
         --label "harness.project=$project_name"
         --label "harness.tool=$tool"
@@ -2688,7 +2688,7 @@ run_agent_print() {
         done
     fi
     docker_args+=(
-        -w "$mount_path"
+        -w "$(harness_container_workdir "$mount_path")"
         "$image"
         "$tool"
     )
@@ -2845,7 +2845,7 @@ cmd_shell() {
         done
     fi
     shell_args+=(
-        -w "$mount_path"
+        -w "$(harness_container_workdir "$mount_path")"
         "$image"
         shell
     )
@@ -4408,6 +4408,18 @@ cmd_doctor() {
             doctor_check warn "interactive tty" "docker rejects -t here; harness will use winpty"
         else
             doctor_check warn "interactive tty" "docker rejects -t and winpty missing; use Windows Terminal or install winpty"
+        fi
+
+        # Issue #112: surface the resolved container working-dir for $PWD so
+        # a future "working directory is invalid" failure is one-line
+        # diagnosable. Print both the bind-mount target (`mount_path`) and
+        # the `//`-escaped form actually passed to docker -w.
+        local dx_mp dx_w
+        if dx_mp=$(harness_abs_path "$PWD" 2>/dev/null) && [[ -n "$dx_mp" ]]; then
+            dx_w=$(harness_container_workdir "$dx_mp")
+            doctor_check ok "container workdir" "$dx_mp (docker -w $dx_w)"
+        else
+            doctor_check warn "container workdir" "could not resolve \$PWD ($PWD)"
         fi
     fi
 

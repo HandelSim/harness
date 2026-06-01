@@ -377,6 +377,38 @@ harness_abs_path() {
     echo "$abs"
 }
 
+# Escape a container working-directory path so MSYS does not rewrite it
+# during the docker.exe argv conversion on Windows Git Bash. Issue #112.
+#
+# Bash on MSYS converts `/c/Users/foo`-shape argv to `C:/Users/foo` before
+# the child docker.exe starts (the inline `MSYS_NO_PATHCONV=1` prefix on
+# `harness_docker` / `harness_docker_winpty` reaches the child's env, but
+# the conversion has already happened in bash by then). The Linux docker
+# daemon then rejects `-w C:/Users/foo` with *"the working directory is
+# invalid, it needs to be an absolute path"* — it is not a Linux absolute
+# path. MSYS leaves args starting with `//` alone (UNC-style escape), and
+# Linux normalises a leading `//foo` to `/foo` on chdir, so the container
+# working directory still matches the bind-mount target.
+#
+# Only the `-w` arg trips this — the bind-mount source is already in
+# Windows form (`harness_docker_path`), and `-v src:tgt` is not a single
+# unix-looking arg so MSYS leaves it alone.
+#
+# Args: <unix-form abs path>
+# Echoes: same path on Linux/macOS; `//c/...` form on Windows.
+harness_container_workdir() {
+    local p="$1"
+    if [[ "$(harness_detect_os)" != "windows" ]]; then
+        echo "$p"
+        return 0
+    fi
+    # Strip any existing leading slashes, then re-prefix with exactly //.
+    while [[ "$p" == /* ]]; do
+        p="${p#/}"
+    done
+    echo "//${p}"
+}
+
 # Validate a user-supplied --mount path. The path must resolve (relative
 # paths are accepted), must exist as a directory, and must not shadow
 # in-container infrastructure the harness depends on (/etc, /usr, the
