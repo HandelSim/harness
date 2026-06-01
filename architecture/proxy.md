@@ -381,6 +381,46 @@ Lifting fabricates no values — only top-level keys the model already
 wrote — so a misshaped call surfaces upstream as a real argument-shape
 error the model can correct rather than bleeding into chat.
 
+## Empty-response detection
+
+Some upstreams silently short-circuit before generation — the response is
+well-formed JSON with `finish_reason="stop"`, `completion_tokens=0`, no
+`thinking`/`safety_ratings`/`prompt_feedback`, response time ~1 s — most
+often when something in the conversation history (in the observed case a
+~100-line repetitive tool result) trips an internal content/safety filter
+that the OpenAI-shape façade flattens to plain `stop`. Without
+intervention, opencode sees "no content + done" and stops the turn; the
+user types `continue` and the same history is re-sent, producing the same
+empty response in perpetuity (issue #117).
+
+After `extract_tool_calls_and_text` runs in `catch_all`, the proxy checks
+whether `clean_text` is empty/whitespace-only AND `tool_call_payloads` is
+empty. When both hold, `_build_empty_response_notice` substitutes a
+visible assistant message in place of the empty `clean_text`, naming the
+upstream as the cause ("**This is not a bug in harness or the proxy**"),
+telling the user to **start a new session** (since opencode re-sends the
+full history on every turn, the same trigger will keep firing), inlining
+the `finish_reason` and a pointer to
+`state/output/<req_id>_03_API_Response.json` for verification. The
+detector deliberately does NOT gate on `completion_tokens` or
+`finish_reason` value — the user-facing symptom (visible stall) is the
+same regardless of the upstream's exact bookkeeping, so the rule is just
+"no text, no tool calls". A `print()` line lands in `harness logs proxy`
+so the event is also visible there, not only in `state/output/`.
+
+The detector is conservative on what it considers a "real" response:
+
+- **Tool-only turns are NOT empty.** A response with `clean_text == ""`
+  but `tool_call_payloads != []` is the normal shape for any turn the
+  model spent entirely on calling tools — never treated as a stall.
+- **No automatic retry.** A filter trigger is deterministic on the same
+  payload, so a same-payload retry would refuse again. The visible
+  notice tells the user to act (new session / `/undo`) rather than
+  burning round trips on a guess.
+- **No truncation of the inbound tool result.** Truncating to head+tail
+  is silent context mutation for a trigger we haven't proven the shape
+  of; surfacing the failure is strictly safer than guessing.
+
 ## NDJSON streaming
 
 `generate_ndjson` yields ollama-compatible streaming chunks: a sequence

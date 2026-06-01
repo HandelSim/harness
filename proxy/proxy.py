@@ -1434,6 +1434,38 @@ def extract_assistant_content(target_json: Dict[str, Any]) -> str:
     return msg.get("content") or ""
 
 
+def _extract_finish_reason(target_json: Dict[str, Any]) -> str:
+    choices = target_json.get("choices") or []
+    if not choices:
+        return ""
+    return (choices[0].get("finish_reason") or "").strip()
+
+
+def _build_empty_response_notice(req_id: str, finish_reason: str) -> str:
+    """User-facing message emitted when the upstream returns a well-formed
+    response with no content and no tool calls. See architecture/proxy.md →
+    "Empty-response detection" (issue #117)."""
+    fr = finish_reason or "unknown"
+    return (
+        f"[harness proxy] The upstream model returned an empty response "
+        f"(finish_reason={fr}, 0 completion tokens) — no text and no tool "
+        "calls. This is the upstream model provider silently short-circuiting "
+        "before generation, most likely a content/safety filter firing on "
+        "something in the conversation history. **This is not a bug in "
+        "harness or the proxy** — the proxy forwarded the request normally "
+        "and is reporting exactly what the upstream returned.\n\n"
+        "**You probably need to start a new session.** opencode re-sends the "
+        "full conversation history on every turn, so whatever in the history "
+        "is triggering the upstream filter will keep triggering it. Sending "
+        "`continue` or any follow-up will produce the same empty response. "
+        "Starting a fresh session drops the offending content; `/undo` in "
+        "opencode to remove the most recent turn may also work if you can "
+        "identify which turn is triggering it.\n\n"
+        f"Full upstream response dump (if OUTPUT_DIR is configured): "
+        f"state/output/{req_id}_03_API_Response.json."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
@@ -1579,6 +1611,26 @@ def catch_all(path: str) -> Response:
             response_text,
             available_tool_names=_collect_tool_names(tools),
         )
+
+        # Empty-response detection (issue #117). Some upstreams silently
+        # short-circuit before generation — well-formed JSON, finish_reason
+        # "stop", zero completion tokens, no thinking, no safety fields —
+        # most often when something in the conversation history (typically a
+        # large/repetitive tool result) trips an internal content filter.
+        # Without intervention, opencode sees "no content + done" and stops
+        # the turn; the user types "continue" and the same history is sent
+        # again, producing the same empty response in perpetuity. Surface
+        # the failure as a visible assistant message so the user knows what
+        # happened and what to do about it.
+        if not clean_text.strip() and not tool_call_payloads:
+            finish_reason = _extract_finish_reason(target_json)
+            print(
+                f"[{req_id}] upstream returned empty content "
+                f"(finish_reason={finish_reason or 'unknown'}); "
+                f"emitting visible-error notice",
+                flush=True,
+            )
+            clean_text = _build_empty_response_notice(req_id, finish_reason)
 
         # Compute prompt_tokens from the translated conversation directly.
         # Upstream's `prompt_tokens` is unreliable for context tracking against

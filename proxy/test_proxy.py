@@ -2626,6 +2626,213 @@ class TestUsageOverride(unittest.TestCase):
         self.assertGreater(done_chunk["eval_count"], 50)
 
 
+class TestEmptyResponseDetection(unittest.TestCase):
+    """Issue #117. Some upstreams return a well-formed response with
+    finish_reason=stop, 0 completion_tokens, and no content/tool_calls —
+    silently short-circuiting before generation, usually a content/safety
+    filter firing on something in the conversation history. The proxy must
+    surface this as a visible assistant message instead of letting the agent
+    stall silently."""
+
+    def _post(self, target_json):
+        ollama_request = {
+            "model": "GenAI",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return target_json
+
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post") as mock_post:
+            mock_post.return_value = FakeResp()
+            with patch.object(proxy, "save_debug_file"):
+                resp = client.post(
+                    "/api/chat",
+                    data=json.dumps(ollama_request),
+                    content_type="application/json",
+                )
+        return resp
+
+    def _content_chunks(self, resp):
+        lines = [l for l in resp.get_data(as_text=True).split("\n") if l.strip()]
+        contents = []
+        for line in lines:
+            chunk = json.loads(line)
+            msg = chunk.get("message") or {}
+            c = msg.get("content")
+            if c:
+                contents.append(c)
+        return contents
+
+    def test_empty_content_emits_visible_notice(self):
+        """Empty content + no tool calls + finish_reason=stop must produce
+        a visible assistant message naming the upstream as the cause and
+        telling the user to start a new session."""
+        resp = self._post({
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {"role": "assistant", "content": ""},
+            }],
+            "usage": {"prompt_tokens": 3352, "completion_tokens": 0,
+                      "total_tokens": 3352},
+        })
+        self.assertEqual(resp.status_code, 200)
+        contents = self._content_chunks(resp)
+        joined = "".join(contents)
+        self.assertTrue(contents, "expected at least one content chunk")
+        # Names the upstream as the cause and shifts blame off harness.
+        self.assertIn("upstream", joined.lower())
+        self.assertIn("not a bug in harness", joined.lower())
+        # Tells the user the practical next step.
+        self.assertIn("new session", joined.lower())
+        # Surfaces the finish_reason verbatim so the user can confirm the
+        # pattern in the dump.
+        self.assertIn("finish_reason=stop", joined)
+
+    def test_whitespace_only_content_treated_as_empty(self):
+        """A response whose only content is whitespace still leaves the
+        agent stalled — must trigger the notice."""
+        resp = self._post({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "   \n\t  "},
+            }],
+            "usage": {"completion_tokens": 0},
+        })
+        contents = self._content_chunks(resp)
+        joined = "".join(contents)
+        self.assertIn("upstream", joined.lower())
+        self.assertIn("new session", joined.lower())
+
+    def test_real_content_does_not_trigger_notice(self):
+        """Normal responses must pass through unchanged — no notice added."""
+        resp = self._post({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "hello world"},
+            }],
+            "usage": {"completion_tokens": 2},
+        })
+        contents = self._content_chunks(resp)
+        joined = "".join(contents)
+        self.assertIn("hello world", joined)
+        # Must not have prepended/appended the notice to real content.
+        self.assertNotIn("[harness proxy]", joined)
+        self.assertNotIn("new session", joined.lower())
+
+    def test_tool_only_turn_does_not_trigger_notice(self):
+        """Tool-call-only turns have empty assistant text by design —
+        must not be mistaken for the stalled-empty case."""
+        tool_block = (
+            'Calling a tool.\n'
+            '```json\n'
+            '{"name": "Bash", "arguments": {"command": "ls", '
+            '"description": "list files"}}\n'
+            '```'
+        )
+        ollama_request = {
+            "model": "GenAI",
+            "messages": [{"role": "user", "content": "list the files"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["command", "description"],
+                    },
+                },
+            }],
+            "stream": False,
+        }
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return {
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": tool_block},
+                    }],
+                    "usage": {"completion_tokens": 5},
+                }
+
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post") as mock_post:
+            mock_post.return_value = FakeResp()
+            with patch.object(proxy, "save_debug_file"):
+                resp = client.post(
+                    "/api/chat",
+                    data=json.dumps(ollama_request),
+                    content_type="application/json",
+                )
+
+        self.assertEqual(resp.status_code, 200)
+        lines = [l for l in resp.get_data(as_text=True).split("\n") if l.strip()]
+        # Verify a tool_calls chunk was emitted...
+        tool_call_chunks = []
+        notice_seen = False
+        for line in lines:
+            chunk = json.loads(line)
+            msg = chunk.get("message") or {}
+            if msg.get("tool_calls"):
+                tool_call_chunks.append(msg["tool_calls"])
+            content = msg.get("content") or ""
+            if "new session" in content.lower() or "[harness proxy]" in content:
+                notice_seen = True
+        self.assertTrue(tool_call_chunks, "expected a tool_calls chunk")
+        self.assertFalse(
+            notice_seen,
+            "tool-only turn must NOT emit the empty-response notice",
+        )
+
+    def test_no_choices_emits_notice(self):
+        """Pathological 'no choices' response — agent still stalls, so still
+        surface a visible message. finish_reason renders as 'unknown'."""
+        resp = self._post({"choices": [], "usage": {"completion_tokens": 0}})
+        contents = self._content_chunks(resp)
+        joined = "".join(contents)
+        self.assertIn("upstream", joined.lower())
+        self.assertIn("finish_reason=unknown", joined)
+
+    def test_notice_references_response_dump_path(self):
+        """The notice points at the per-request dump file so the user can
+        verify the upstream's actual response without grepping logs."""
+        resp = self._post({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": ""},
+            }],
+            "usage": {"completion_tokens": 0},
+        })
+        contents = self._content_chunks(resp)
+        joined = "".join(contents)
+        self.assertIn("_03_API_Response.json", joined)
+        self.assertIn("state/output/", joined)
+
+    def test_build_notice_includes_blame_shift_phrasing(self):
+        """Unit-test the message builder directly so phrasing changes
+        require an intentional test update."""
+        text = proxy._build_empty_response_notice("req_xyz", "stop")
+        self.assertIn("upstream", text.lower())
+        self.assertIn("not a bug in harness", text.lower())
+        self.assertIn("new session", text.lower())
+        self.assertIn("req_xyz_03_API_Response.json", text)
+        self.assertIn("finish_reason=stop", text)
+
+
 class TestConfigHelpers(unittest.TestCase):
     """URL-base normalization and model-tag stripping that back the
     passthrough + discovery behavior."""
