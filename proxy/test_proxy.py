@@ -2629,10 +2629,11 @@ class TestUsageOverride(unittest.TestCase):
 class TestEmptyResponseDetection(unittest.TestCase):
     """Issue #117. Some upstreams return a well-formed response with
     finish_reason=stop, 0 completion_tokens, and no content/tool_calls —
-    silently short-circuiting before generation, usually a content/safety
-    filter firing on something in the conversation history. The proxy must
-    surface this as a visible assistant message instead of letting the agent
-    stall silently."""
+    silently short-circuiting before generation when something in the
+    most-recent message trips a content/safety filter. The proxy substitutes
+    a minimal rescue text in the assistant slot so opencode treats the turn
+    as completed; the next user prompt then displaces the trigger and the
+    upstream resumes normally."""
 
     def _post(self, target_json):
         ollama_request = {
@@ -2669,10 +2670,11 @@ class TestEmptyResponseDetection(unittest.TestCase):
                 contents.append(c)
         return contents
 
-    def test_empty_content_emits_visible_notice(self):
+    def test_empty_content_emits_rescue_text(self):
         """Empty content + no tool calls + finish_reason=stop must produce
-        a visible assistant message naming the upstream as the cause and
-        telling the user to start a new session."""
+        the minimal rescue text in the assistant slot — no user-facing
+        diagnostic, just enough to occupy the assistant turn so the next
+        user prompt becomes the new recency."""
         resp = self._post({
             "choices": [{
                 "finish_reason": "stop",
@@ -2686,18 +2688,16 @@ class TestEmptyResponseDetection(unittest.TestCase):
         contents = self._content_chunks(resp)
         joined = "".join(contents)
         self.assertTrue(contents, "expected at least one content chunk")
-        # Names the upstream as the cause and shifts blame off harness.
-        self.assertIn("upstream", joined.lower())
-        self.assertIn("not a bug in harness", joined.lower())
-        # Tells the user the practical next step.
-        self.assertIn("new session", joined.lower())
-        # Surfaces the finish_reason verbatim so the user can confirm the
-        # pattern in the dump.
-        self.assertIn("finish_reason=stop", joined)
+        # The rescue text — short, plausible, no diagnostic framing.
+        self.assertEqual(joined.strip(), "Understood.")
+        # Explicitly NOT the verbose diagnostic that the prior fix emitted.
+        self.assertNotIn("[harness proxy]", joined)
+        self.assertNotIn("new session", joined.lower())
+        self.assertNotIn("finish_reason", joined)
 
     def test_whitespace_only_content_treated_as_empty(self):
         """A response whose only content is whitespace still leaves the
-        agent stalled — must trigger the notice."""
+        agent stalled — must trigger the rescue substitution."""
         resp = self._post({
             "choices": [{
                 "finish_reason": "stop",
@@ -2707,11 +2707,11 @@ class TestEmptyResponseDetection(unittest.TestCase):
         })
         contents = self._content_chunks(resp)
         joined = "".join(contents)
-        self.assertIn("upstream", joined.lower())
-        self.assertIn("new session", joined.lower())
+        self.assertEqual(joined.strip(), "Understood.")
 
-    def test_real_content_does_not_trigger_notice(self):
-        """Normal responses must pass through unchanged — no notice added."""
+    def test_real_content_does_not_trigger_rescue(self):
+        """Normal responses must pass through unchanged — no rescue text
+        appended, no original content mutated."""
         resp = self._post({
             "choices": [{
                 "finish_reason": "stop",
@@ -2722,11 +2722,9 @@ class TestEmptyResponseDetection(unittest.TestCase):
         contents = self._content_chunks(resp)
         joined = "".join(contents)
         self.assertIn("hello world", joined)
-        # Must not have prepended/appended the notice to real content.
-        self.assertNotIn("[harness proxy]", joined)
-        self.assertNotIn("new session", joined.lower())
+        self.assertNotIn("Understood.", joined)
 
-    def test_tool_only_turn_does_not_trigger_notice(self):
+    def test_tool_only_turn_does_not_trigger_rescue(self):
         """Tool-call-only turns have empty assistant text by design —
         must not be mistaken for the stalled-empty case."""
         tool_block = (
@@ -2781,56 +2779,40 @@ class TestEmptyResponseDetection(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         lines = [l for l in resp.get_data(as_text=True).split("\n") if l.strip()]
-        # Verify a tool_calls chunk was emitted...
+        # Verify a tool_calls chunk was emitted and the rescue text was NOT.
         tool_call_chunks = []
-        notice_seen = False
+        rescue_seen = False
         for line in lines:
             chunk = json.loads(line)
             msg = chunk.get("message") or {}
             if msg.get("tool_calls"):
                 tool_call_chunks.append(msg["tool_calls"])
             content = msg.get("content") or ""
-            if "new session" in content.lower() or "[harness proxy]" in content:
-                notice_seen = True
+            if "Understood." in content:
+                rescue_seen = True
         self.assertTrue(tool_call_chunks, "expected a tool_calls chunk")
         self.assertFalse(
-            notice_seen,
-            "tool-only turn must NOT emit the empty-response notice",
+            rescue_seen,
+            "tool-only turn must NOT emit the empty-response rescue text",
         )
 
-    def test_no_choices_emits_notice(self):
+    def test_no_choices_emits_rescue_text(self):
         """Pathological 'no choices' response — agent still stalls, so still
-        surface a visible message. finish_reason renders as 'unknown'."""
+        substitute the rescue text in the assistant slot."""
         resp = self._post({"choices": [], "usage": {"completion_tokens": 0}})
         contents = self._content_chunks(resp)
         joined = "".join(contents)
-        self.assertIn("upstream", joined.lower())
-        self.assertIn("finish_reason=unknown", joined)
+        self.assertEqual(joined.strip(), "Understood.")
 
-    def test_notice_references_response_dump_path(self):
-        """The notice points at the per-request dump file so the user can
-        verify the upstream's actual response without grepping logs."""
-        resp = self._post({
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": ""},
-            }],
-            "usage": {"completion_tokens": 0},
-        })
-        contents = self._content_chunks(resp)
-        joined = "".join(contents)
-        self.assertIn("_03_API_Response.json", joined)
-        self.assertIn("state/output/", joined)
-
-    def test_build_notice_includes_blame_shift_phrasing(self):
-        """Unit-test the message builder directly so phrasing changes
-        require an intentional test update."""
-        text = proxy._build_empty_response_notice("req_xyz", "stop")
-        self.assertIn("upstream", text.lower())
-        self.assertIn("not a bug in harness", text.lower())
-        self.assertIn("new session", text.lower())
-        self.assertIn("req_xyz_03_API_Response.json", text)
-        self.assertIn("finish_reason=stop", text)
+    def test_rescue_text_helper_returns_minimal_text(self):
+        """Unit-test the rescue text helper directly so phrasing changes
+        require an intentional test update. The text must be short,
+        non-empty, and contain no proxy-diagnostic framing."""
+        text = proxy._empty_response_rescue_text()
+        self.assertEqual(text, "Understood.")
+        self.assertNotIn("[harness proxy]", text)
+        self.assertNotIn("upstream", text.lower())
+        self.assertNotIn("new session", text.lower())
 
 
 class TestConfigHelpers(unittest.TestCase):

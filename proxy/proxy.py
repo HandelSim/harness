@@ -1441,29 +1441,26 @@ def _extract_finish_reason(target_json: Dict[str, Any]) -> str:
     return (choices[0].get("finish_reason") or "").strip()
 
 
-def _build_empty_response_notice(req_id: str, finish_reason: str) -> str:
-    """User-facing message emitted when the upstream returns a well-formed
-    response with no content and no tool calls. See architecture/proxy.md →
-    "Empty-response detection" (issue #117)."""
-    fr = finish_reason or "unknown"
-    return (
-        f"[harness proxy] The upstream model returned an empty response "
-        f"(finish_reason={fr}, 0 completion tokens) — no text and no tool "
-        "calls. This is the upstream model provider silently short-circuiting "
-        "before generation, most likely a content/safety filter firing on "
-        "something in the conversation history. **This is not a bug in "
-        "harness or the proxy** — the proxy forwarded the request normally "
-        "and is reporting exactly what the upstream returned.\n\n"
-        "**You probably need to start a new session.** opencode re-sends the "
-        "full conversation history on every turn, so whatever in the history "
-        "is triggering the upstream filter will keep triggering it. Sending "
-        "`continue` or any follow-up will produce the same empty response. "
-        "Starting a fresh session drops the offending content; `/undo` in "
-        "opencode to remove the most recent turn may also work if you can "
-        "identify which turn is triggering it.\n\n"
-        f"Full upstream response dump (if OUTPUT_DIR is configured): "
-        f"state/output/{req_id}_03_API_Response.json."
-    )
+def _empty_response_rescue_text() -> str:
+    """Minimal assistant text substituted when the upstream returns a
+    well-formed response with no content and no tool calls. See
+    architecture/proxy.md → "Empty-response detection" (issue #117).
+
+    The trigger for the empty response is confined to the **most-recent**
+    message slot — once a turn no longer carries the offending content the
+    upstream returns to normal, even with the trigger still present further
+    back in history. opencode treats whatever assistant content we emit as a
+    completed turn, so all we need is some short, plausible reply that
+    occupies the assistant slot; the user's next prompt then becomes the new
+    recency, displacing the trigger, and the conversation resumes naturally.
+
+    Deliberately NOT a user-facing diagnostic. An earlier version inlined
+    `[harness proxy] …` plus instructions to start a new session; opencode
+    rendered that as the assistant's own turn, which is jarring and
+    unnecessary given the conversation continues on the next prompt. The
+    `print()` line at the call site keeps the event visible in
+    `harness logs proxy` for diagnosis."""
+    return "Understood."
 
 
 # ---------------------------------------------------------------------------
@@ -1612,25 +1609,28 @@ def catch_all(path: str) -> Response:
             available_tool_names=_collect_tool_names(tools),
         )
 
-        # Empty-response detection (issue #117). Some upstreams silently
+        # Empty-response rescue (issue #117). Some upstreams silently
         # short-circuit before generation — well-formed JSON, finish_reason
         # "stop", zero completion tokens, no thinking, no safety fields —
-        # most often when something in the conversation history (typically a
+        # when something in the **most-recent** message slot (typically a
         # large/repetitive tool result) trips an internal content filter.
         # Without intervention, opencode sees "no content + done" and stops
-        # the turn; the user types "continue" and the same history is sent
-        # again, producing the same empty response in perpetuity. Surface
-        # the failure as a visible assistant message so the user knows what
-        # happened and what to do about it.
+        # the turn; the user types "continue" and the same content is still
+        # the recency, so the same empty response keeps coming back.
+        # Substituting any short assistant text occupies the assistant slot,
+        # which means the user's next prompt becomes the new recency — and
+        # observed behavior is that the upstream returns to normal as soon
+        # as that happens. We don't surface this as a user-facing error;
+        # the log line below keeps the event diagnosable.
         if not clean_text.strip() and not tool_call_payloads:
             finish_reason = _extract_finish_reason(target_json)
             print(
                 f"[{req_id}] upstream returned empty content "
                 f"(finish_reason={finish_reason or 'unknown'}); "
-                f"emitting visible-error notice",
+                f"substituting minimal rescue text",
                 flush=True,
             )
-            clean_text = _build_empty_response_notice(req_id, finish_reason)
+            clean_text = _empty_response_rescue_text()
 
         # Compute prompt_tokens from the translated conversation directly.
         # Upstream's `prompt_tokens` is unreliable for context tracking against

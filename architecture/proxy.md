@@ -385,28 +385,40 @@ error the model can correct rather than bleeding into chat.
 
 Some upstreams silently short-circuit before generation — the response is
 well-formed JSON with `finish_reason="stop"`, `completion_tokens=0`, no
-`thinking`/`safety_ratings`/`prompt_feedback`, response time ~1 s — most
-often when something in the conversation history (in the observed case a
+`thinking`/`safety_ratings`/`prompt_feedback`, response time ~1 s — when
+something in the **most-recent** message slot (in the observed case a
 ~100-line repetitive tool result) trips an internal content/safety filter
 that the OpenAI-shape façade flattens to plain `stop`. Without
 intervention, opencode sees "no content + done" and stops the turn; the
-user types `continue` and the same history is re-sent, producing the same
-empty response in perpetuity (issue #117).
+user types `continue` and the same content is still the recency, so the
+same empty response keeps coming back (issue #117).
+
+Confirmed scope of the trigger: only the most-recent message matters.
+Once a turn no longer carries the offending content the upstream returns
+to normal, even with the trigger still present further back in history.
+That means a single short assistant reply substituted in place of the
+empty content is enough to unstick the conversation — the user's next
+prompt then becomes the new recency and the trigger drops out of the
+hot slot.
 
 After `extract_tool_calls_and_text` runs in `catch_all`, the proxy checks
 whether `clean_text` is empty/whitespace-only AND `tool_call_payloads` is
-empty. When both hold, `_build_empty_response_notice` substitutes a
-visible assistant message in place of the empty `clean_text`, naming the
-upstream as the cause ("**This is not a bug in harness or the proxy**"),
-telling the user to **start a new session** (since opencode re-sends the
-full history on every turn, the same trigger will keep firing), inlining
-the `finish_reason` and a pointer to
-`state/output/<req_id>_03_API_Response.json` for verification. The
-detector deliberately does NOT gate on `completion_tokens` or
-`finish_reason` value — the user-facing symptom (visible stall) is the
-same regardless of the upstream's exact bookkeeping, so the rule is just
-"no text, no tool calls". A `print()` line lands in `harness logs proxy`
-so the event is also visible there, not only in `state/output/`.
+empty. When both hold, `_empty_response_rescue_text` returns a minimal
+assistant reply (currently the single word `"Understood."`) which the
+proxy substitutes for the empty `clean_text`. The detector deliberately
+does NOT gate on `completion_tokens` or `finish_reason` value — the
+user-facing symptom (visible stall) is the same regardless of the
+upstream's exact bookkeeping, so the rule is just "no text, no tool
+calls". A `print()` line at the call site logs the `finish_reason` and
+the `req_id`, so the event remains visible in `harness logs proxy` for
+diagnosis even though nothing user-facing is surfaced.
+
+Earlier iterations surfaced a verbose `[harness proxy] …` diagnostic
+with "start a new session" guidance. opencode renders that as the
+assistant's own turn, which is jarring; given the conversation actually
+resumes on the next prompt with no intervention, the minimal rescue text
+is a better fit. Diagnosis still belongs in `harness logs proxy` and
+`state/output/<req_id>_03_API_Response.json`.
 
 The detector is conservative on what it considers a "real" response:
 
@@ -414,12 +426,12 @@ The detector is conservative on what it considers a "real" response:
   but `tool_call_payloads != []` is the normal shape for any turn the
   model spent entirely on calling tools — never treated as a stall.
 - **No automatic retry.** A filter trigger is deterministic on the same
-  payload, so a same-payload retry would refuse again. The visible
-  notice tells the user to act (new session / `/undo`) rather than
-  burning round trips on a guess.
+  payload, so a same-payload retry would refuse again. The rescue text
+  occupies the assistant slot and lets the next user prompt resolve the
+  recency naturally.
 - **No truncation of the inbound tool result.** Truncating to head+tail
   is silent context mutation for a trigger we haven't proven the shape
-  of; surfacing the failure is strictly safer than guessing.
+  of, and the rescue strategy doesn't need it.
 
 ## NDJSON streaming
 
