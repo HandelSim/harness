@@ -396,39 +396,76 @@ same empty response keeps coming back (issue #117).
 Confirmed scope of the trigger: only the most-recent message matters.
 Once a turn no longer carries the offending content the upstream returns
 to normal, even with the trigger still present further back in history.
-That means a single short assistant reply substituted in place of the
-empty content is enough to unstick the conversation — the user's next
-prompt then becomes the new recency and the trigger drops out of the
-hot slot.
 
 After `extract_tool_calls_and_text` runs in `catch_all`, the proxy checks
 whether `clean_text` is empty/whitespace-only AND `tool_call_payloads` is
-empty. When both hold, `_empty_response_rescue_text` returns a minimal
-assistant reply (currently the single word `"Understood."`) which the
-proxy substitutes for the empty `clean_text`. The detector deliberately
-does NOT gate on `completion_tokens` or `finish_reason` value — the
-user-facing symptom (visible stall) is the same regardless of the
-upstream's exact bookkeeping, so the rule is just "no text, no tool
-calls". A `print()` line at the call site logs the `finish_reason` and
-the `req_id`, so the event remains visible in `harness logs proxy` for
-diagnosis even though nothing user-facing is surfaced.
+empty. When both hold, the proxy substitutes a **two-part rescue**:
 
-Earlier iterations surfaced a verbose `[harness proxy] …` diagnostic
-with "start a new session" guidance. opencode renders that as the
-assistant's own turn, which is jarring; given the conversation actually
-resumes on the next prompt with no intervention, the minimal rescue text
-is a better fit. Diagnosis still belongs in `harness logs proxy` and
+1. **Rescue text** — `_empty_response_rescue_text` returns the single
+   word `"Understood."` which replaces the empty `clean_text`. The text
+   alone is enough to unstick the upstream filter on the next request
+   (the user's prompt displaces the trigger), but a text-only assistant
+   reply makes opencode end the turn with `done_reason: stop`. The user
+   then has to type something for the conversation to continue.
+2. **Rescue tool call** — when the inbound tools list contains a
+   `bash`-style shell tool, `_select_rescue_tool` returns a `{name,
+   arguments: {"command": "pwd", "description": "Print working
+   directory"}}` payload which the proxy appends to
+   `tool_call_payloads`. The NDJSON `done_reason` becomes `tool_calls`,
+   opencode executes the no-op `pwd`, and re-invokes the model with the
+   tool result as the **new** recency — which displaces the
+   filter-triggering content out of the hot slot, so the next model
+   turn returns real content without user intervention.
+
+The detector deliberately does NOT gate on `completion_tokens` or
+`finish_reason` value — the user-facing symptom (visible stall) is the
+same regardless of the upstream's exact bookkeeping, so the rule is just
+"no text, no tool calls". A `print()` line at the call site logs the
+`finish_reason`, the `req_id`, and which rescue mode fired
+(`text+tool(<name>)` or `text-only`), so the event remains visible in
+`harness logs proxy` for diagnosis.
+
+### Why `bash` running `pwd`
+
+The bash tool is the rescue target because (a) every coding agent
+harness ships for exposes a shell tool (opencode `bash`, Claude Code
+`Bash`) — broader availability than `todowrite`-style tools, (b) `pwd`
+is genuinely inconsequential: read-only, no filesystem/network/state
+side effects, and (c) the one-line tool result (the absolute path) is
+tiny and can't itself re-trigger the upstream filter.
+`_select_rescue_tool` matches the inbound tool name case-insensitively,
+so `bash` and `Bash` both match; the emitted call echoes the inbound
+name verbatim so the agent's router can dispatch it. The arguments
+shape `{"command": "pwd", "description": "Print working directory"}`
+satisfies the required-fields contract of both schemas. When no shell
+tool is exposed for the turn, the rescue degrades to text-only — the
+upstream still unsticks on the user's next prompt; only the
+auto-continuation is lost.
+
+### Earlier iterations
+
+The first fix emitted a verbose `[harness proxy] …` diagnostic with
+"start a new session" guidance. opencode rendered that as the assistant's
+own turn, which is jarring given the conversation actually resumes on the
+next prompt. The minimal rescue text replaced it. That in turn proved
+insufficient when the user observed (issue #117) that the turn still
+ended at `"Understood."` — text-only is `done_reason: stop` and opencode
+ends the turn. A `todowrite {todos: []}` call was prototyped to force
+`done_reason: tool_calls` but rejected in favor of `bash pwd`: bash is
+more universally exposed than todowrite, and a read-only command is more
+unambiguously inconsequential than mutating the agent's task list (even
+to empty). Diagnosis still belongs in `harness logs proxy` and
 `state/output/<req_id>_03_API_Response.json`.
 
-The detector is conservative on what it considers a "real" response:
+### Conservatism
 
 - **Tool-only turns are NOT empty.** A response with `clean_text == ""`
   but `tool_call_payloads != []` is the normal shape for any turn the
   model spent entirely on calling tools — never treated as a stall.
 - **No automatic retry.** A filter trigger is deterministic on the same
-  payload, so a same-payload retry would refuse again. The rescue text
-  occupies the assistant slot and lets the next user prompt resolve the
-  recency naturally.
+  payload, so a same-payload retry would refuse again. The rescue
+  occupies the assistant slot; the next request's recency naturally
+  differs.
 - **No truncation of the inbound tool result.** Truncating to head+tail
   is silent context mutation for a trigger we haven't proven the shape
   of, and the rescue strategy doesn't need it.
