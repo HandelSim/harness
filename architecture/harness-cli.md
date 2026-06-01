@@ -206,6 +206,30 @@ collapses to the historical "`-it` if stdin is a tty, else `-i`" with no probe.
 `harness_tty_strategy` is the pure (I/O-free) decision function the resolver
 wraps, kept separate so it is unit-testable without a real tty or daemon.
 
+### Windows container working directory — issue #112
+
+Bash on MSYS rewrites Unix-form path arguments to Windows form before
+invoking native `.exe` binaries: `/c/Users/foo` in `argv` becomes
+`C:/Users/foo` by the time `docker.exe` sees it. The inline
+`MSYS_NO_PATHCONV=1` prefix on `harness_docker` / `harness_docker_winpty`
+reaches the child process's environment but the conversion has already
+happened in bash. The Linux docker daemon then rejects `-w C:/Users/foo`
+with *"the working directory is invalid, it needs to be an absolute
+path"*. The bind-mount source is unaffected because `harness_docker_path`
+emits Windows-form (`C:/...`), and the `-v src:tgt` composite is not
+single-Unix-path-shaped so MSYS leaves it alone.
+
+`harness_container_workdir` (`scripts/lib/platform.sh`) wraps the `-w`
+arg in the MSYS UNC-escape: it prefixes the resolved `mount_path` with
+`//` on Windows (pass-through elsewhere). MSYS skips conversion for args
+starting with `//`, the Linux kernel collapses `//foo` to `/foo` on
+`chdir`, and the container working directory ends up matching the
+bind-mount target. The three docker launch sites (`run_agent_interactive`,
+`run_agent_print`, `cmd_shell`) all pass `-w "$(harness_container_workdir
+"$mount_path")"`. `harness doctor`'s Windows `[runtime]` block surfaces
+both the resolved `mount_path` and the escaped `-w` form so this failure
+mode is one-line diagnosable.
+
 ### Post-run issue footer (interactive only)
 
 The interactive launch paths (`run_agent_interactive`, `cmd_shell`) run

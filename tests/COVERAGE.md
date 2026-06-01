@@ -539,7 +539,7 @@ non-green rows — the gap.
 | I032 | green  | tests/harness_test.sh:557-572 + podman_smoke_test.sh:181-194 | doctor reports docker; podman_smoke_test sets `HARNESS_CONTAINER_RUNTIME=podman` and confirms preflight + doctor recognize podman. | |
 | I033 | red    | —                                           | —                                                                                                     | No test asserts the cache behavior within a single invocation. |
 | I034 | red    | —                                           | —                                                                                                     | No test simulates Git Bash to exercise `cygpath -m`. |
-| I035 | red    | —                                           | —                                                                                                     | No test asserts `/c/Users/...` -> POSIX translation. |
+| I035 | green  | tests/unit_workdir_test.sh (T3)             | OS pinned to `windows` with a `cygpath -u` stub; `harness_abs_path` normalises `C:/Users/...`, `c:\Users\...`, and `/c/Users/...` to `/c/Users/...`. T4 also covers the issue #112 pipeline (`harness_abs_path` → `harness_container_workdir` produces `-w //c/...` so MSYS does not rewrite it). | |
 | I036 | green  | tests/integration_test.sh:790-825           | Phase 5 mount validation rejects `/etc` (and by extension the protected-paths list); the message text comes from `harness_validate_mount`. | |
 | I037 | green  | tests/harness_test.sh:970-974               | T19: `harness_docker_running` returns success when daemon is up; test asserts boolean. | |
 | I038 | green  | tests/unit_platform_timer_test.sh:38-79     | T1 stubs the macOS+docker branch + a slow always-failing `harness_docker_running`, asserts the poll loop respects the requested timeout (wall-clock, not sleep-tick count) and returns non-zero. T2 asserts the printed "Ns elapsed" counter tracks wall clock within 3s. T3 asserts the success path returns 0 promptly once the probe succeeds. | |
@@ -553,6 +553,7 @@ non-green rows — the gap.
 | I046 | green  | tests/full_pipeline_test.sh (T0b)           | T0b points `HARNESS_REPO_URL` at a non-existent path, runs the installer, and asserts non-zero exit, a `git clone of .* failed` message, and that `install complete` is NOT printed. | |
 | I047 | green  | tests/full_pipeline_test.sh (T0b)           | T0b `source`s the installer (the README path) on a failing clone and asserts the sourced run aborts non-zero and leaves no half-install (`harness/state` not created) — the regression #105/#106 guard. | |
 | I048 | green  | tests/full_pipeline_test.sh (T0b)           | T0b drops a `.env` beside the installer with `HTTPS_PROXY` set and asserts the installer prints `using HTTPS_PROXY from .* for the clone`. | |
+| I049 | green  | tests/unit_workdir_test.sh (T1, T2, T4)     | T1 asserts pass-through on linux/macos; T2 asserts windows produces `//c/...` (including idempotence and slash-collapse); T4 covers the full `harness_abs_path` → `harness_container_workdir` pipeline that feeds docker `-w` (issue #112). | |
 
 ---
 
