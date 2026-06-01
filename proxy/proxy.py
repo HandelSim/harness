@@ -406,6 +406,27 @@ _PERSONA_PRESERVE_FRAMING = (
 )
 
 
+def _collect_tool_names(tools_array):
+    """Return the set of tool names from an ollama-format tools array.
+
+    Used to gate the tolerant missing-`arguments` lift inside
+    `extract_tool_calls_and_text` (issue #118). Tolerates both the
+    `{"function": {"name": ...}}` and bare `{"name": ...}` shapes the
+    upstream agents may send. Non-string / empty names are dropped.
+    """
+    names: set = set()
+    for tool in tools_array or []:
+        if not isinstance(tool, dict):
+            continue
+        func = tool.get("function") if "function" in tool else tool
+        if not isinstance(func, dict):
+            continue
+        name = func.get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
 def format_tools_to_text(tools_array):
     # Emit the full JSON Schema for each tool's parameters rather than a
     # one-level summary. The earlier flattened format dropped nested
@@ -1554,14 +1575,9 @@ def catch_all(path: str) -> Response:
         # Names currently exposed to the model — used to gate the
         # missing-`arguments` lift inside `extract_tool_calls_and_text`
         # (see its docstring; issue #118).
-        available_tool_names = set()
-        for t in tools or []:
-            func = t.get("function", {}) if isinstance(t, dict) and "function" in t else (t if isinstance(t, dict) else {})
-            n = func.get("name") if isinstance(func, dict) else None
-            if isinstance(n, str) and n:
-                available_tool_names.add(n)
         tool_call_payloads, clean_text = extract_tool_calls_and_text(
-            response_text, available_tool_names=available_tool_names
+            response_text,
+            available_tool_names=_collect_tool_names(tools),
         )
 
         # Compute prompt_tokens from the translated conversation directly.

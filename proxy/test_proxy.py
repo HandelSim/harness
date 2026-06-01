@@ -232,6 +232,36 @@ class TestExtractToolCall(unittest.TestCase):
         self.assertNotIn("extra", payloads[0]["arguments"])
 
 
+class TestCollectToolNames(unittest.TestCase):
+    """The small helper that feeds `available_tool_names` into the lift gate."""
+
+    def test_handles_function_envelope(self):
+        tools = [
+            {"function": {"name": "bash", "description": "..."}},
+            {"function": {"name": "read", "description": "..."}},
+        ]
+        self.assertEqual(proxy._collect_tool_names(tools), {"bash", "read"})
+
+    def test_handles_bare_name_shape(self):
+        tools = [{"name": "bash"}, {"name": "read"}]
+        self.assertEqual(proxy._collect_tool_names(tools), {"bash", "read"})
+
+    def test_drops_empty_and_non_string_names(self):
+        tools = [
+            {"function": {"name": "bash"}},
+            {"function": {"name": ""}},
+            {"function": {}},
+            {"function": {"name": 42}},
+            "not a dict",
+            None,
+        ]
+        self.assertEqual(proxy._collect_tool_names(tools), {"bash"})
+
+    def test_none_or_empty_returns_empty_set(self):
+        self.assertEqual(proxy._collect_tool_names(None), set())
+        self.assertEqual(proxy._collect_tool_names([]), set())
+
+
 class TestExtractToolCallScanner(unittest.TestCase):
     """Tests for the balanced-brace tool call extraction logic.
 
