@@ -235,9 +235,13 @@ _HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
         "message)."
     ),
     "todowrite": (
-        "Maintain a structured todo list across the turn. Use only for "
-        "≥3 non-trivial steps. Exactly ONE item may be `in_progress`. Flip "
-        "an item to `completed` immediately after finishing it — not at "
+        "Maintain a structured todo list across the turn. Each item is "
+        "`{content, status, priority}` — `priority` is the string "
+        "`'high'`/`'medium'`/`'low'` (NOT an int, NOT omitted), `content` is "
+        "the task text (NOT `description`/`subject`), `status` is "
+        "`'pending'`/`'in_progress'`/`'completed'`/`'cancelled'`. Use only "
+        "for ≥3 non-trivial steps. Exactly ONE item may be `in_progress`. "
+        "Flip an item to `completed` immediately after finishing it — not at "
         "end-of-turn, and not in the same call that starts it."
     ),
     "webfetch": (
@@ -767,7 +771,7 @@ def _scan_balanced_json(text, start):
     return None, start
 
 
-def extract_tool_calls_and_text(response_text):
+def extract_tool_calls_and_text(response_text, available_tool_names=None):
     """Extract ALL tool-call JSON payloads from the response, in order.
 
     Searches for ```json ... ``` blocks and uses balanced-brace scanning
@@ -795,10 +799,21 @@ def extract_tool_calls_and_text(response_text):
     rejects those and the block bleeds into chat as raw fenced text;
     issue #115 was exactly that.
 
+    `available_tool_names`: iterable of tool names currently exposed to the
+    model for this turn. When set, a block whose `name` matches an entry
+    but is missing the `arguments` key has its remaining top-level keys
+    lifted into `arguments` — the failure mode in issue #118 where models
+    emit `{"name": "bash", "command": "...", "description": "..."}` with
+    args spelled at the top level instead of nested. The lift fires ONLY
+    when (a) `arguments` is absent and (b) `name` is a current tool, so
+    instructional prose using an unknown tool name still leaks intact, and
+    a correctly-shaped call with `arguments` is untouched.
+
     Returns (payloads, clean_text). payloads is a list (possibly empty)
     of {name, arguments} dicts in the order they appeared. clean_text is
     response_text with all VALID extracted blocks removed.
     """
+    known_names = set(available_tool_names) if available_tool_names else set()
     payloads = []
     consumed_ranges = []  # (fence_start, block_end) tuples for blocks we extracted
     pos = 0
@@ -845,9 +860,21 @@ def extract_tool_calls_and_text(response_text):
         if not isinstance(candidate, dict):
             pos = after_json
             continue
-        if 'name' not in candidate or 'arguments' not in candidate:
+        if 'name' not in candidate:
             pos = after_json
             continue
+        if 'arguments' not in candidate:
+            # Tolerant lift: a block like `{"name": "bash", "command": "ls",
+            # "description": "..."}` is a tool call whose args were spelled
+            # at the top level. We only lift when the name matches a tool
+            # we actually exposed for this turn, otherwise instructional
+            # prose like ` ```json\n{"name": "no_such_tool", ...}\n``` `
+            # would be silently promoted to a (failing) tool invocation.
+            if candidate['name'] not in known_names:
+                pos = after_json
+                continue
+            lifted_args = {k: v for k, v in candidate.items() if k != 'name'}
+            candidate = {'name': candidate['name'], 'arguments': lifted_args}
 
         # Valid tool call. Record it and the byte range to remove later.
         payloads.append(candidate)
@@ -1524,7 +1551,18 @@ def catch_all(path: str) -> Response:
         save_debug_file(req_id, "03", "API_Response", target_json)
 
         response_text = extract_assistant_content(target_json)
-        tool_call_payloads, clean_text = extract_tool_calls_and_text(response_text)
+        # Names currently exposed to the model — used to gate the
+        # missing-`arguments` lift inside `extract_tool_calls_and_text`
+        # (see its docstring; issue #118).
+        available_tool_names = set()
+        for t in tools or []:
+            func = t.get("function", {}) if isinstance(t, dict) and "function" in t else (t if isinstance(t, dict) else {})
+            n = func.get("name") if isinstance(func, dict) else None
+            if isinstance(n, str) and n:
+                available_tool_names.add(n)
+        tool_call_payloads, clean_text = extract_tool_calls_and_text(
+            response_text, available_tool_names=available_tool_names
+        )
 
         # Compute prompt_tokens from the translated conversation directly.
         # Upstream's `prompt_tokens` is unreliable for context tracking against
