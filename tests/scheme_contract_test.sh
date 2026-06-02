@@ -2,10 +2,12 @@
 #
 # scheme_contract_test.sh — per-scheme proxy contract assertions.
 #
-# Brings up ollama + the real proxy + a mock upstream, then for each
-# supported value of PROXY_PROMPT_MODE drives a request through ollama
-# and inspects what the proxy forwarded upstream. The mock_upstream
-# server logs every request body to stdout; that's our payload capture.
+# Brings up the real proxy + a mock upstream, then for each supported
+# value of PROXY_PROMPT_MODE drives an OpenAI /v1/chat/completions request
+# straight at the proxy (exec'd from inside the proxy container, since the
+# proxy port isn't published to the host) and inspects what the proxy
+# forwarded upstream. The mock_upstream server logs every request body to
+# stdout; that's our payload capture.
 #
 # Schemes covered:
 #   user_front   — request first (in <<<BEGIN_USER_REQUEST>>> markers),
@@ -61,8 +63,7 @@ PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
-OLLAMA_VERSION=0.21.2
-OLLAMA_CONTEXT_LENGTH=200000
+MODEL_CONTEXT_LENGTH=200000
 MOCK_SCENARIO=text
 MOCK_FIXTURES_DIR=/fixtures
 PROXY_PROMPT_MODE=${scheme}
@@ -71,8 +72,9 @@ EOF
 }
 
 # The override file bind-mounts the scheme-specific fixture subdir into
-# the mock container at /fixtures and exposes a host port on ollama so
-# the test driver can curl it. It also re-injects PROXY_PROMPT_MODE onto
+# the mock container at /fixtures. The proxy port is NOT published to the
+# host; the driver execs into the proxy container to curl it (see
+# send_probe_request). It also re-injects PROXY_PROMPT_MODE onto
 # the proxy: production docker-compose.yml no longer interpolates that var
 # (removed so a stale user .env can't override the hybrid default), so this
 # test supplies it through its own override, interpolated from the per-scheme
@@ -82,9 +84,6 @@ services:
   proxy:
     environment:
       PROXY_PROMPT_MODE: ${PROXY_PROMPT_MODE}
-  ollama:
-    ports:
-      - "11434:11434"
   mockupstream:
     image: python:3.12-slim
     working_dir: /app
@@ -132,19 +131,24 @@ echo "[scheme-test] validating compose config"
 echo "[scheme-test] building and starting initial stack (proxy_mode=user_front)"
 "${COMPOSE[@]}" up -d --build
 
-if ! test_wait_for_healthy "${PROJECT_NAME}" mockupstream proxy ollama 120; then
+if ! test_wait_for_healthy "${PROJECT_NAME}" mockupstream proxy 120; then
     echo "[scheme-test] ERROR: services did not become healthy" >&2
     "${COMPOSE[@]}" ps >&2 || true
     "${COMPOSE[@]}" logs mockupstream >&2 || true
     "${COMPOSE[@]}" logs proxy >&2 || true
-    "${COMPOSE[@]}" logs ollama >&2 || true
     exit 1
 fi
 echo "[scheme-test] initial stack healthy"
 
 # --- helpers -----------------------------------------------------------------
 
-OLLAMA_URL="http://localhost:11434"
+PROXY_URL="http://127.0.0.1:8000"
+
+# Curl the proxy from inside the proxy container (the port isn't published to
+# the host; the proxy image ships curl for its healthcheck).
+proxy_curl() {
+    "${COMPOSE[@]}" exec -T proxy curl "$@"
+}
 
 fail() {
     local label="$1"; shift
@@ -173,9 +177,13 @@ restart_with_scheme() {
     fi
 }
 
-# Send a /api/chat request through ollama with a tools array; returns
-# the ollama response body. The user content is deliberately a fixed
-# probe string so the scheme-specific fixture matches it.
+# Send an OpenAI /v1/chat/completions request directly at the proxy with a
+# tools array (so the cooperative prompt wrapper engages) and stream=false
+# (so the response is a single JSON object and the forwarded-body mock-log
+# inspection still works); returns the OpenAI response body. The request is
+# issued from inside the proxy container because the proxy port isn't
+# published to the host. The user content is deliberately a fixed probe
+# string so the scheme-specific fixture matches it.
 send_probe_request() {
     local probe_label="$1"
     local body
@@ -199,7 +207,7 @@ send_probe_request() {
 }
 EOF
 )
-    curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
+    proxy_curl -fsS -X POST "${PROXY_URL}/v1/chat/completions" \
         -H 'Content-Type: application/json' \
         -d "${body}"
 }
@@ -248,7 +256,7 @@ for scheme in "${SCHEMES[@]}"; do
     # ---- text-response probe ----
     echo "[scheme-test]   sending text probe"
     text_resp=$(send_probe_request "scheme-probe-text") \
-        || fail "${scheme}/text: /api/chat failed"
+        || fail "${scheme}/text: /v1/chat/completions failed"
 
     case "${scheme}" in
         user_front)  expected_content="scheme-user_front fixture" ;;
@@ -355,15 +363,42 @@ print("OK hybrid reminder+head-scaffolding")
     # probe returns a markdown-fenced JSON tool call.
     echo "[scheme-test]   sending tool-call probe"
     tool_resp=$(send_probe_request "scheme-probe-tool") \
-        || fail "${scheme}/tool: /api/chat failed"
+        || fail "${scheme}/tool: /v1/chat/completions failed"
 
-    echo "${tool_resp}" | grep -q '"tool_calls"' \
-        || fail "${scheme}/tool: response had no tool_calls field" "${tool_resp}"
-    echo "${tool_resp}" | grep -q '"name":"get_weather"' \
-        || fail "${scheme}/tool: tool_calls did not contain get_weather" "${tool_resp}"
-    echo "${tool_resp}" | grep -q '"done_reason":"tool_calls"' \
-        || fail "${scheme}/tool: done_reason was not tool_calls" "${tool_resp}"
-    echo "[scheme-test]   ${scheme}/tool OK (tool_calls parsed)"
+    # OpenAI response shape: choices[0].message.tool_calls[0] with
+    # function.name=get_weather, a call_-prefixed id, arguments as a JSON
+    # STRING, and choices[0].finish_reason == "tool_calls". (Mirrors
+    # proxy_test.sh scenario B.)
+    tool_check="$("${COMPOSE[@]}" exec -T proxy python -c "
+import json, sys
+body = json.loads(sys.stdin.read())
+msg = body['choices'][0]['message']
+tcs = msg.get('tool_calls')
+if not tcs:
+    print('NO_TOOL_CALLS'); sys.exit(0)
+tc = tcs[0]
+if not tc.get('id', '').startswith('call_'):
+    print('BAD_ID:' + str(tc.get('id'))); sys.exit(0)
+fn = tc.get('function') or {}
+if fn.get('name') != 'get_weather':
+    print('WRONG_NAME:' + str(fn.get('name'))); sys.exit(0)
+args = fn.get('arguments')
+if not isinstance(args, str):
+    print('ARGS_NOT_STRING:' + type(args).__name__); sys.exit(0)
+if body['choices'][0].get('finish_reason') != 'tool_calls':
+    print('WRONG_FINISH:' + str(body['choices'][0].get('finish_reason'))); sys.exit(0)
+print('OK')
+" <<<"${tool_resp}")" || fail "${scheme}/tool: failed to inspect response" "${tool_resp}"
+
+    case "${tool_check}" in
+        OK*)              echo "[scheme-test]   ${scheme}/tool OK (structured tool_call; arguments is a JSON string)" ;;
+        NO_TOOL_CALLS*)   fail "${scheme}/tool: response had no tool_calls field" "${tool_resp}" ;;
+        BAD_ID*)          fail "${scheme}/tool: tool_call id missing or not call_-prefixed: ${tool_check}" "${tool_resp}" ;;
+        WRONG_NAME*)      fail "${scheme}/tool: tool_call not named get_weather: ${tool_check}" "${tool_resp}" ;;
+        ARGS_NOT_STRING*) fail "${scheme}/tool: tool_call arguments not a JSON string: ${tool_check}" "${tool_resp}" ;;
+        WRONG_FINISH*)    fail "${scheme}/tool: finish_reason was not tool_calls: ${tool_check}" "${tool_resp}" ;;
+        *)                fail "${scheme}/tool: unexpected check output: ${tool_check}" "${tool_resp}" ;;
+    esac
 done
 
 echo "============================================================"

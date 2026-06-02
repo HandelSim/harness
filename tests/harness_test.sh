@@ -47,7 +47,7 @@ fi
 #   $TEST_ROOT/
 #     .env                    (test config, points proxy at mockupstream)
 #     harness/                (symlink to the real repo so 'harness' subcommands resolve)
-#     output/, agent/, ollama-data/  (created on demand by the script)
+#     output/, agent/           (created on demand by the script)
 #
 # We also drop a docker-compose override into $TEST_ROOT that adds the mock
 # upstream service. The harness script itself doesn't know about this file;
@@ -58,7 +58,7 @@ fi
 #
 # Simpler: skip the mock upstream entirely. The harness script's start path
 # does `compose up -d --build`. With a working .env (even with placeholder
-# upstream values) ollama and proxy will start. Proxy will fail to forward
+# upstream values) the proxy will start. Proxy will fail to forward
 # any real request — but we don't make any real requests in this test.
 # Healthchecks may or may not pass depending on whether proxy's /health
 # endpoint requires upstream; per Phase 2's proxy.py /health doesn't dial
@@ -94,9 +94,7 @@ PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
-OLLAMA_VERSION=0.21.2
-OLLAMA_CONTEXT_LENGTH=200000
-PUBLISH_OLLAMA_PORT=
+MODEL_CONTEXT_LENGTH=200000
 EOF
 
 # Firewall allowlist for the test stack. placeholder.invalid is included so
@@ -131,7 +129,7 @@ harness_docker compose --project-name "${PROJECT_NAME}" \
 
 # --- Test 0: _gate_on_upstream_auth + run_agent gate (no docker) ------------
 #
-# Regression for #16: when the proxy + ollama services were already up,
+# Regression for #16: when the proxy service was already up,
 # `harness opencode` (or bare `harness`) skipped `cmd_start` (and therefore
 # the upstream auth probe) and the agent surfaced a locked key as an opaque
 # proxy error. The fix routes both `cmd_start` and `run_agent` through
@@ -329,16 +327,12 @@ echo "[harness-test] T1: harness start"
 # Wait up to 60s for both services to become healthy.
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    ollama_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
-        -f "${REPO_ROOT}/docker-compose.yml" \
-        ps -q ollama 2>/dev/null || true)
     proxy_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         ps -q proxy 2>/dev/null || true)
-    if [[ -n "${ollama_id}" && -n "${proxy_id}" ]]; then
+    if [[ -n "${proxy_id}" ]]; then
         proxy_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
-        ollama_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${ollama_id}" 2>/dev/null || echo "none")
-        if [[ "${proxy_status}" == "healthy" && "${ollama_status}" == "healthy" ]]; then
+        if [[ "${proxy_status}" == "healthy" ]]; then
             break
         fi
     fi
@@ -350,7 +344,7 @@ while true; do
     fi
     sleep 2
 done
-echo "[harness-test] T1 OK: ollama + proxy healthy"
+echo "[harness-test] T1 OK: proxy healthy"
 
 # --- Test 2: harness list with no agents ------------------------------------
 
@@ -366,9 +360,9 @@ echo "[harness-test] T2 OK"
 #
 # Follows logs; we kill it after 5s. timeout exits 124 on success.
 
-echo "[harness-test] T3: harness logs ollama (timeout 5s)"
+echo "[harness-test] T3: harness logs proxy (timeout 5s)"
 set +e
-logs_out=$(timeout 5 "${HARNESS_BIN}" logs ollama 2>&1)
+logs_out=$(timeout 5 "${HARNESS_BIN}" logs proxy 2>&1)
 logs_rc=$?
 set -e
 if (( logs_rc != 124 && logs_rc != 0 )); then
@@ -383,9 +377,9 @@ fi
 
 # Inventory F042: `harness logs` (no service arg) tails ALL services.
 # Without a service arg, cmd_logs invokes `compose logs -f` with no
-# positional service, so output should include lines from BOTH ollama
-# and proxy. timeout 124 = killed by deadline (expected); rc 0 also
-# acceptable if compose ended on its own.
+# positional service, so output should include proxy lines (proxy is the
+# only long-running service in this test stack). timeout 124 = killed by
+# deadline (expected); rc 0 also acceptable if compose ended on its own.
 set +e
 logs_all_out=$(timeout 5 "${HARNESS_BIN}" logs 2>&1)
 logs_all_rc=$?
@@ -401,39 +395,10 @@ if grep -Eqi 'unknown command|invalid option|usage:[[:space:]]+harness' <<<"${lo
     exit 1
 fi
 # compose logs without a service prefixes each line with the service name.
-# We require lines for BOTH ollama and proxy to prove "tail all services".
-if ! grep -Eq 'ollama' <<<"${logs_all_out}"; then
-    echo "[harness-test] T3 FAIL [F042]: harness logs (no arg) missing ollama lines" >&2
-    echo "${logs_all_out}" | head -40 >&2
-    exit 1
-fi
+# We require proxy lines to prove "tail all services".
 if ! grep -Eq 'proxy' <<<"${logs_all_out}"; then
     echo "[harness-test] T3 FAIL [F042]: harness logs (no arg) missing proxy lines" >&2
     echo "${logs_all_out}" | head -40 >&2
-    exit 1
-fi
-
-# Inventory O003: ollama entrypoint polls /api/tags up to 60s before
-# proceeding. The poll prints a "waiting for ollama API at" line on
-# startup; once the API is up, registration runs. Probing the
-# accumulated container logs proves the poll loop executed (and
-# succeeded, since T1's healthcheck passed).
-ollama_logs=$(harness_docker logs "${ollama_id}" 2>&1 || true)
-if ! grep -Eq 'waiting for ollama API at .*?/api/tags' <<<"${ollama_logs}"; then
-    echo "[harness-test] T3 FAIL [O003]: ollama entrypoint did not log the /api/tags poll" >&2
-    echo "${ollama_logs}" | tail -40 >&2
-    exit 1
-fi
-
-# Inventory O009: a healthy ollama container means MODEL_NAME was
-# successfully registered (entrypoint.sh exits non-zero on registration
-# failure, which would prevent the container from becoming healthy).
-# We additionally assert the explicit "harness ollama ready; <N> stub
-# model(s) ->" success line is present so a future regression that turns
-# the registration error into a warning still trips this test.
-if ! grep -Eq 'harness ollama ready; [0-9]+ stub model\(s\) -> ' <<<"${ollama_logs}"; then
-    echo "[harness-test] T3 FAIL [O009]: ollama entrypoint did not log registration success" >&2
-    echo "${ollama_logs}" | tail -40 >&2
     exit 1
 fi
 
@@ -443,7 +408,7 @@ echo "[harness-test] T3 OK"
 
 echo "[harness-test] T4: harness down"
 "${HARNESS_BIN}" down >/dev/null
-# After down, no ollama/proxy containers should remain for this project.
+# After down, no proxy containers should remain for this project.
 remaining=$(harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     ps -q 2>/dev/null || true)
@@ -804,16 +769,12 @@ echo "[harness-test] T9: harness doctor (services up)"
 "${HARNESS_BIN}" start >/dev/null
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    ollama_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
-        -f "${REPO_ROOT}/docker-compose.yml" \
-        ps -q ollama 2>/dev/null || true)
     proxy_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" \
         ps -q proxy 2>/dev/null || true)
-    if [[ -n "${ollama_id}" && -n "${proxy_id}" ]]; then
+    if [[ -n "${proxy_id}" ]]; then
         proxy_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
-        ollama_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${ollama_id}" 2>/dev/null || echo "none")
-        if [[ "${proxy_status}" == "healthy" && "${ollama_status}" == "healthy" ]]; then
+        if [[ "${proxy_status}" == "healthy" ]]; then
             break
         fi
     fi
@@ -831,10 +792,6 @@ set -e
 echo "${doctor_up_out}" | sed 's/^/  | /'
 if (( doctor_up_rc != 0 )); then
     echo "[harness-test] T9 FAIL: doctor exited non-zero (rc=${doctor_up_rc}) with services up" >&2
-    exit 1
-fi
-if ! grep -Eq 'ollama[[:space:]]+healthy' <<<"${doctor_up_out}"; then
-    echo "[harness-test] T9 FAIL: doctor did not report ollama healthy" >&2
     exit 1
 fi
 if ! grep -Eq 'proxy[[:space:]]+healthy' <<<"${doctor_up_out}"; then
@@ -915,7 +872,7 @@ restore_agent_image
 agent_img_orig=""
 
 # A successful exit (rc=0) is unexpected here because we lack a running
-# ollama / mock upstream. But we DON'T require non-zero — the test is
+# mock upstream. But we DON'T require non-zero — the test is
 # purely about argument parsing. The forbidden conditions are parse errors.
 if grep -Eqi 'unknown command|invalid option|usage:[[:space:]]+harness' <<<"${p_out}"; then
     echo "[harness-test] T10 FAIL: -p was parsed as an unknown command/flag" >&2
@@ -1142,8 +1099,8 @@ if (( upg_apply_rc != 0 )); then
     echo "${upg_apply_out}" >&2; exit 1
 fi
 # .env should now have at least one of the new vars from .env.example.
-if ! grep -q '^OLLAMA_VERSION=' "${UPG_ROOT}/.env"; then
-    echo "[harness-test] T17 FAIL: OLLAMA_VERSION not added to .env after upgrade" >&2
+if ! grep -q '^MODEL_CONTEXT_LENGTH=' "${UPG_ROOT}/.env"; then
+    echo "[harness-test] T17 FAIL: MODEL_CONTEXT_LENGTH not added to .env after upgrade" >&2
     cat "${UPG_ROOT}/.env" >&2; exit 1
 fi
 # .env existing values must be preserved.
@@ -1211,8 +1168,8 @@ if ! grep -q 'continuing from re-exec after pull' <<<"${upg17b_out}"; then
     echo "${upg17b_out}" >&2; exit 1
 fi
 # Sanity-check: the manifest still ran (an env var should have been added).
-if ! grep -q '^OLLAMA_VERSION=' "${UPG17B_ROOT}/.env"; then
-    echo "[harness-test] T17b FAIL: OLLAMA_VERSION not added — manifest did not run after pull-skip" >&2
+if ! grep -q '^MODEL_CONTEXT_LENGTH=' "${UPG17B_ROOT}/.env"; then
+    echo "[harness-test] T17b FAIL: MODEL_CONTEXT_LENGTH not added — manifest did not run after pull-skip" >&2
     cat "${UPG17B_ROOT}/.env" >&2; exit 1
 fi
 cleanup_upg17b
@@ -1811,20 +1768,20 @@ echo "[harness-test] T25: warn_if_firewall_open warns on jq-less host (#8)"
 t25_out=$(
     HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
     net_overrides_path="${TEST_ROOT}/t25-net-overrides.json"
-    printf '%s\n' '{"services":{"ollama":{"firewall_disabled":true}}}' >"$net_overrides_path"
+    printf '%s\n' '{"services":{"proxy":{"firewall_disabled":true}}}' >"$net_overrides_path"
     command() {
         if [[ "${1:-}" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi
         builtin command "$@"
     }
     # Stand in for harness_jq's container fallback: list the open service.
-    harness_jq() { echo "ollama"; }
+    harness_jq() { echo "proxy"; }
     HARNESS_NET_CONFIRM=1 warn_if_firewall_open 0 opencode 2>&1
 )
 if ! grep -q 'NETWORK FIREWALL IS DISABLED' <<<"${t25_out}"; then
     echo "[harness-test] T25 FAIL [#8]: warn_if_firewall_open suppressed the warning on a jq-less host" >&2
     echo "${t25_out}" >&2; exit 1
 fi
-if ! grep -q 'firewall DISABLED: ollama' <<<"${t25_out}"; then
+if ! grep -q 'firewall DISABLED: proxy' <<<"${t25_out}"; then
     echo "[harness-test] T25 FAIL [#8]: warn_if_firewall_open did not name the open service" >&2
     echo "${t25_out}" >&2; exit 1
 fi
@@ -1935,13 +1892,12 @@ if (( t26pm_unknown_rc == 0 )); then
 fi
 
 # Case 2: write_runtime_override emits a standalone proxy block when only the
-# prompt-mode override is set (no firewall opt-out, no published ollama port).
+# prompt-mode override is set (no firewall opt-out).
 t26pm_ov="${TEST_ROOT}/t26pm-standalone.yml"
 (
     HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
     runtime_override="${t26pm_ov}"
     net_overrides_path="${TEST_ROOT}/t26pm-absent-net-overrides.json"  # does not exist
-    PUBLISH_OLLAMA_PORT=""
     prompt_mode_override="user_front"
     write_runtime_override
 )
@@ -1963,7 +1919,6 @@ t26pm_fold="${TEST_ROOT}/t26pm-fold.yml"
     net_overrides_path="${TEST_ROOT}/t26pm-net-overrides.json"
     printf '%s\n' '{"services":{"proxy":{"firewall_disabled":true}}}' >"$net_overrides_path"
     harness_jq() { echo "proxy"; }   # stand in for the jq query → service list
-    PUBLISH_OLLAMA_PORT=""
     prompt_mode_override="hybrid"
     write_runtime_override
 )

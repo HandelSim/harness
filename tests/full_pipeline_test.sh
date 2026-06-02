@@ -107,10 +107,10 @@ cleanup() {
     # Network may linger if we created it manually for the mockupstream.
     harness_docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 
-    # ollama-data may contain files owned by a uid we can't directly remove
-    # (the in-container ollama runs as root, so blobs land owned by host
-    # uid 0). Use a privileged docker run to wipe the path before letting
-    # the host rm -rf finish the job.
+    # Some state/agent dirs may contain files owned by a uid we can't
+    # directly remove (in-container services can run as root, so files land
+    # owned by host uid 0). Use a privileged docker run to wipe the path
+    # before letting the host rm -rf finish the job.
     for d in "${TEST_ROOT}" "${FAKE_HOME}" "${TEST_WORKSPACE}"; do
         if [[ -d "$d" ]]; then
             if ! rm -rf "$d" 2>/dev/null; then
@@ -207,9 +207,7 @@ PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
-OLLAMA_VERSION=0.21.2
-OLLAMA_CONTEXT_LENGTH=200000
-PUBLISH_OLLAMA_PORT=
+MODEL_CONTEXT_LENGTH=200000
 MOCK_SCENARIO=text
 EOF
 
@@ -307,7 +305,6 @@ echo "[pipeline] T2: install layout"
 [[ -d "${TEST_ROOT}/harness/.git" ]]                    || { echo "[pipeline] T2 FAIL: clone is not a git repo" >&2; exit 1; }
 [[ -d "${TEST_ROOT}/harness/state/output" ]]            || { echo "[pipeline] T2 FAIL: state/output/ missing" >&2; exit 1; }
 [[ -d "${TEST_ROOT}/harness/state/agent/home" ]]        || { echo "[pipeline] T2 FAIL: state/agent/home/ missing" >&2; exit 1; }
-[[ -d "${TEST_ROOT}/harness/state/ollama-data" ]]       || { echo "[pipeline] T2 FAIL: state/ollama-data/ missing" >&2; exit 1; }
 [[ -f "${TEST_ROOT}/harness/.env" ]]                    || { echo "[pipeline] T2 FAIL: .env missing in clone" >&2; exit 1; }
 [[ -f "${TEST_ROOT}/harness/.harness-allowlist" ]]      || { echo "[pipeline] T2 FAIL: .harness-allowlist missing in clone" >&2; exit 1; }
 
@@ -406,7 +403,6 @@ wait_healthy_compose() {
     done
 }
 
-if ! wait_healthy_compose ollama 90; then echo "[pipeline] T5 FAIL ollama" >&2; exit 1; fi
 if ! wait_healthy_compose proxy 90; then echo "[pipeline] T5 FAIL proxy" >&2; exit 1; fi
 
 # Inventory F139: warn_if_firewall_open is silent when net-overrides is
@@ -420,7 +416,7 @@ fi
 
 # Inventory F026 + F135 + Pe010: write_runtime_override manages
 # state/.harness-runtime.yml as a generated file. With this test's .env
-# (empty PUBLISH_OLLAMA_PORT, no net-overrides), the override body is empty
+# (no net-overrides), the override body is empty
 # and the writer removes the file. Assert the documented behavior: either
 # the file is absent, or — if present — it carries the generator header
 # (i.e. is a generated artifact, not a stale hand-written file).
@@ -430,14 +426,10 @@ if [[ -f "${runtime_override}" ]]; then
         || { echo "[pipeline] T5 FAIL: F026/F135/Pe010 runtime override file lacks generator header" >&2; cat "${runtime_override}" >&2; exit 1; }
 fi
 
-# Inventory Pe005: state/ollama-data/ holds model registration data and
-# survives restarts. After a successful start (ollama is healthy), the
-# directory must contain at least one persisted artifact (manifest/blob).
-if ! find "${TEST_ROOT}/harness/state/ollama-data" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
-    echo "[pipeline] T5 FAIL: Pe005 state/ollama-data/ is empty after start (no model registration persisted)" >&2
-    ls -la "${TEST_ROOT}/harness/state/ollama-data" >&2 || true
-    exit 1
-fi
+# Pe005 (ollama model-data persistence) has been retired: the ollama service
+# was removed. Model data no longer persists in state/ollama-data/; that
+# directory does not exist in the new topology. Model discovery now happens
+# via the proxy's /v1/models route.
 
 # Build agent images (the harness script doesn't auto-build agents on start;
 # the install relies on `compose --profile agent build`). The pipeline
@@ -469,14 +461,15 @@ harness_docker run -d \
     sh -c 'pip install --quiet --no-cache-dir flask==3.0.3 && python /app/mock_upstream.py' \
     >/dev/null
 
-# Wait for /health from inside the network (use the ollama container as a
-# probe; it's already on the network and has curl).
-ollama_cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
+# Wait for /health from inside the network (use the proxy container as a
+# probe; it's already on the network and ships curl for its own healthcheck).
+# The proxy port is not host-published, so we exec into the container.
+proxy_cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
-    ps -q ollama)
+    ps -q proxy)
 deadline=$(( $(date +%s) + 60 ))
 while true; do
-    if harness_docker exec "${ollama_cid}" curl -sf http://mockupstream:9000/health >/dev/null 2>&1; then
+    if harness_docker exec "${proxy_cid}" curl -sf http://mockupstream:9000/health >/dev/null 2>&1; then
         break
     fi
     if (( $(date +%s) >= deadline )); then
@@ -500,8 +493,6 @@ if (( doc_up_rc != 0 )); then
     echo "[pipeline] T7 FAIL: doctor exited ${doc_up_rc}" >&2
     exit 1
 fi
-grep -Eq 'ollama[[:space:]]+healthy' <<<"${doc_up_out}" \
-    || { echo "[pipeline] T7 FAIL: doctor did not show ollama healthy" >&2; exit 1; }
 grep -Eq 'proxy[[:space:]]+healthy'  <<<"${doc_up_out}" \
     || { echo "[pipeline] T7 FAIL: doctor did not show proxy healthy"  >&2; exit 1; }
 echo "[pipeline] T7 OK"
@@ -593,8 +584,8 @@ grep -q '"model": "harness/' "${opencode_cfg}" \
 # (hardcoded in the agent entrypoint; no longer user-configurable).
 grep -q '"name": "GenAI Harness"' "${opencode_cfg}" \
     || { echo "[pipeline] T9 FAIL: A035 opencode.json provider name is not the fixed 'GenAI Harness'" >&2; cat "${opencode_cfg}" >&2; exit 1; }
-# #94 A036: the model dropdown is built from ollama /api/tags, which discovered
-# 'harness' via the proxy's /v1/models route — so a model entry named 'harness'
+# #94 A036: the model dropdown is populated from the proxy's /v1/models route,
+# which returns a model named 'harness' — so a model entry named 'harness'
 # (distinct from the provider whose name is 'GenAI Harness') is registered.
 grep -q '"name": "harness"' "${opencode_cfg}" \
     || { echo "[pipeline] T9 FAIL: A036 opencode.json model dropdown missing the discovered 'harness' model" >&2; cat "${opencode_cfg}" >&2; exit 1; }

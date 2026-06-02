@@ -70,7 +70,7 @@ cleanup() {
     # Mock upstream sidecar.
     harness_docker rm -f "${MOCK_NAME}" >/dev/null 2>&1 || true
 
-    # Best-effort: tear down the harness stack (proxy, ollama, serena) via
+    # Best-effort: tear down the harness stack (proxy, serena) via
     # the install we built. The script may not exist if we bailed before
     # cloning, so guard the call.
     if [[ -x "${TEST_INSTALL}/harness" ]]; then
@@ -92,7 +92,7 @@ cleanup() {
     # remove it explicitly in case compose missed it.
     harness_docker rm -f harness-serena >/dev/null 2>&1 || true
 
-    # ollama-data may contain root-owned blobs; wipe via privileged docker run.
+    # Some state dirs may contain root-owned files; wipe via privileged docker run.
     # HARNESS_INTEGRATION_KEEP=1 preserves TEST_ROOT/FAKE_HOME for postmortem.
     if [[ "${HARNESS_INTEGRATION_KEEP:-0}" == "1" ]]; then
         echo "[integration] HARNESS_INTEGRATION_KEEP=1: leaving TEST_ROOT=${TEST_ROOT} FAKE_HOME=${FAKE_HOME}"
@@ -157,7 +157,6 @@ fi
 mkdir -p \
     "${TEST_INSTALL}/state/output" \
     "${TEST_INSTALL}/state/agent/home" \
-    "${TEST_INSTALL}/state/ollama-data" \
     "${TEST_INSTALL}/state/mcp"
 
 # .env — point PROXY_API_URL at the mockupstream sidecar (joined to
@@ -198,7 +197,7 @@ cp -a "${REPO_ROOT}/tests/fixtures/test-project" "${TEST_WORKSPACE}/"
 # === Phase 1: stack setup with mock upstream ================================
 
 phase_1_stack_setup() {
-    echo "[integration] Phase 1.0: pre-building all images (proxy, ollama, agent)"
+    echo "[integration] Phase 1.0: pre-building all images (proxy, agent)"
     # Build everything once with cache enabled. Subsequent harness_call
     # invocations run with HARNESS_NO_BUILD=1 so compose just `up`s the
     # already-tagged images. This sidesteps two real problems:
@@ -217,14 +216,13 @@ phase_1_stack_setup() {
         return 1
     fi
 
-    echo "[integration] Phase 1.1: harness start (HARNESS_NO_BUILD=1; bring up ollama/proxy)"
+    echo "[integration] Phase 1.1: harness start (HARNESS_NO_BUILD=1; bring up proxy)"
     harness_call start
 
     echo "[integration] Phase 1.3: launching mockupstream sidecar"
     test_start_mockupstream "${PROJECT_NAME}"
 
-    echo "[integration] Phase 1.4: waiting for healthy ollama, proxy, mockupstream"
-    test_wait_for_healthy "${PROJECT_NAME}" ollama 90
+    echo "[integration] Phase 1.4: waiting for healthy proxy, mockupstream"
     test_wait_for_healthy "${PROJECT_NAME}" proxy 60
     test_wait_for_container_healthy "${MOCK_NAME}" 90
 
@@ -956,7 +954,7 @@ phase_4_cross_invariants() {
     echo "[integration] Phase 4.2: state directory layout intact"
     # The agent modes share a single agent/home tree.
     local d
-    for d in output agent/home ollama-data mcp; do
+    for d in output agent/home mcp; do
         if [[ ! -d "${TEST_INSTALL}/state/${d}" ]]; then
             echo "[integration] Phase 4.2 FAIL: missing ${TEST_INSTALL}/state/${d}" >&2
             return 1
