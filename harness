@@ -2474,6 +2474,11 @@ agent_common_env() {
     printf -- '-e\nHOST_GID=%s\n' "$(id -g)"
     printf -- '-e\nHARNESS_YOLO=%s\n' "$yolo"
     printf -- '-e\nDEFAULT_MODEL_NAME=%s\n' "$agent_model"
+    # opencode talks directly to the translating proxy over its OpenAI-
+    # compatible interface; the entrypoint builds the provider baseURL
+    # (http://proxy:${PROXY_PORT}/v1) and discovers models off /v1/models.
+    # PROXY_PORT is sourced from .env into this shell; default 8000.
+    printf -- '-e\nPROXY_PORT=%s\n' "${PROXY_PORT:-8000}"
     # Container CWD is also bind-mounted at this exact path; the entrypoint
     # cd's here after the gosu drop. Surfaced as an env var so agents (and
     # any user scripts inside the container) can identify the host launch
