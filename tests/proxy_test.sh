@@ -2,14 +2,20 @@
 #
 # Phase 2 proxy integration test.
 #
-# Brings up ollama + the real proxy + a mock upstream, then runs four
-# scenarios against /api/chat through ollama:
+# Brings up ollama + the real proxy + a mock upstream, then runs scenarios
+# against /api/chat through ollama:
 #   A. text     — non-streaming, verify content + usage round-trip.
 #   B. tool     — verify the tool-call markdown block is parsed and re-emitted
 #                 as a structured tool_calls field with done_reason=tool_calls.
 #   C. forward  — verify the upstream received {"model","messages"} ONLY and
 #                 the final user message contains the cooperative-prompt wrapper.
 #   D. stream   — stream=true, verify multiple NDJSON lines and a final done:true.
+# Plus scenarios against the proxy's OpenAI-compatible interface directly
+# (the path opencode uses), queried from inside the ollama container:
+#   G. openai-text — POST /v1/chat/completions stream=true; verify SSE
+#                    chat.completion.chunk framing ending in data: [DONE].
+#   H. openai-tool — verify a streamed delta.tool_calls entry with index,
+#                    id+function.name, and arguments as a JSON *string*.
 #
 # Also runs proxy/test_proxy.py inside the proxy container.
 #
@@ -569,6 +575,116 @@ if echo "${PROXY_LOGS}" | grep -qE "OUTPUT_DIR '' is not writable"; then
 fi
 
 echo "[proxy-test]   F OK (env-driven startup banner reflects configured values)"
+
+# --- Scenario G: OpenAI-compatible inbound (/v1/chat/completions, SSE) -------
+#
+# opencode talks to the proxy directly over the OpenAI Chat Completions
+# interface (via @ai-sdk/openai-compatible), NOT through ollama. The AI SDK
+# always sets stream:true and parses text/event-stream. Verify the proxy
+# accepts an OpenAI request and streams chat.completion.chunk objects ending
+# in `data: [DONE]`. Queried from inside the ollama container since the proxy
+# port isn't published to the host (mirrors scenario A2).
+
+echo "[proxy-test] scenario G: OpenAI /v1/chat/completions SSE"
+restart_mock_with_scenario "text"
+
+G_RAW="$("${COMPOSE[@]}" exec -T ollama curl -fsS -N -X POST http://proxy:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"harness","messages":[{"role":"user","content":"hi"}],"stream":true}')" \
+    || fail "G: POST /v1/chat/completions (stream=true) failed"
+echo "[proxy-test]   G raw (first 300 chars): $(echo "${G_RAW}" | head -c 300)"
+
+echo "${G_RAW}" | grep -q '^data: ' \
+    || fail "G: response had no SSE 'data:' lines" "${G_RAW}"
+echo "${G_RAW}" | grep -q '^data: \[DONE\]' \
+    || fail "G: SSE stream did not terminate with [DONE]" "${G_RAW}"
+echo "${G_RAW}" | grep -qE '"object":[[:space:]]*"chat\.completion\.chunk"' \
+    || fail "G: no chat.completion.chunk object in stream" "${G_RAW}"
+echo "${G_RAW}" | grep -q 'Hello from mock upstream' \
+    || fail "G: streamed content missing upstream text" "${G_RAW}"
+echo "${G_RAW}" | grep -qE '"finish_reason":[[:space:]]*"stop"' \
+    || fail "G: stream missing finish_reason=stop" "${G_RAW}"
+echo "[proxy-test]   G OK (OpenAI SSE: chat.completion.chunk stream → [DONE])"
+
+# --- Scenario H: OpenAI tool call over SSE ----------------------------------
+#
+# The AI SDK requires each streamed tool-call delta to carry `index` (always),
+# `id`+`function.name` on the first fragment, and `function.arguments` as a
+# JSON *string* that accumulates to valid JSON. Verify the proxy emits exactly
+# that shape end-to-end through the cooperative-prompt mediation.
+
+echo "[proxy-test] scenario H: OpenAI tool call over SSE"
+restart_mock_with_scenario "tool"
+
+H_REQ='{
+  "model": "harness",
+  "messages": [{"role":"user","content":"what is the weather in Atlanta?"}],
+  "stream": true,
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city.",
+      "parameters": {"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}
+    }
+  }]
+}'
+H_RAW="$("${COMPOSE[@]}" exec -T ollama curl -fsS -N -X POST http://proxy:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d "${H_REQ}")" \
+    || fail "H: POST /v1/chat/completions (tool) failed"
+echo "[proxy-test]   H raw (first 400 chars): $(echo "${H_RAW}" | head -c 400)"
+
+H_CHECK="$("${COMPOSE[@]}" exec -T proxy python -c "
+import json, sys
+tool_calls = None
+finish = None
+for line in sys.stdin.read().splitlines():
+    line = line.strip()
+    if not line.startswith('data:'):
+        continue
+    payload = line[len('data:'):].strip()
+    if payload == '[DONE]':
+        continue
+    try:
+        chunk = json.loads(payload)
+    except ValueError:
+        continue
+    if chunk.get('object') != 'chat.completion.chunk':
+        print('WRONG_OBJECT:' + str(chunk.get('object')))
+        sys.exit(0)
+    for ch in chunk.get('choices') or []:
+        d = ch.get('delta') or {}
+        if d.get('tool_calls'):
+            tool_calls = d['tool_calls']
+        if ch.get('finish_reason'):
+            finish = ch['finish_reason']
+if tool_calls is None:
+    print('NO_TOOL_CALLS'); sys.exit(0)
+tc = tool_calls[0]
+if tc.get('index') != 0:
+    print('NO_INDEX:' + str(tc.get('index'))); sys.exit(0)
+if not tc.get('id'):
+    print('NO_ID'); sys.exit(0)
+fn = tc.get('function') or {}
+if fn.get('name') != 'get_weather':
+    print('WRONG_NAME:' + str(fn.get('name'))); sys.exit(0)
+args = fn.get('arguments')
+if not isinstance(args, str):
+    print('ARGS_NOT_STRING:' + str(type(args).__name__)); sys.exit(0)
+if json.loads(args).get('city') != 'Atlanta':
+    print('WRONG_CITY:' + args); sys.exit(0)
+if finish != 'tool_calls':
+    print('WRONG_FINISH:' + str(finish)); sys.exit(0)
+print('OK')
+" <<<"${H_RAW}")" || fail "H: failed to inspect SSE tool stream" "${H_RAW}"
+
+case "${H_CHECK}" in
+    OK*)             echo "[proxy-test]   H OK (OpenAI tool_call over SSE; arguments is a JSON string)" ;;
+    NO_TOOL_CALLS*)  fail "H: no SSE delta carried tool_calls" "${H_RAW}" ;;
+    ARGS_NOT_STRING*) fail "H: tool_call arguments not a JSON string (AI SDK requires string): ${H_CHECK}" "${H_RAW}" ;;
+    *)               fail "H: OpenAI tool-call SSE check failed: ${H_CHECK}" "${H_RAW}" ;;
+esac
 
 echo "============================================================"
 echo " PROXY TEST PASSED"

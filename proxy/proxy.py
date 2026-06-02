@@ -1,9 +1,21 @@
 """harness translating proxy.
 
-Translates between ollama's /api/chat wire format and the upstream API's
-chat-completions format. Injects cooperative tool-use prompts so models
-that don't natively support tool calls can produce them as ```json blocks
-that the proxy then parses and re-emits as native tool_calls.
+Translates between a client wire format and the upstream API's
+chat-completions format. Two inbound formats are accepted:
+
+  * OpenAI Chat Completions (`POST /v1/chat/completions`) — the primary
+    interface opencode speaks (via the `@ai-sdk/openai-compatible`
+    provider). Responses are emitted as Server-Sent Events
+    (`text/event-stream`, `data: {chunk}\\n\\n` ... `data: [DONE]`) when the
+    request sets `stream: true`, or a single `chat.completion` JSON object
+    otherwise.
+  * ollama `/api/chat` (NDJSON `application/x-ndjson`) — the legacy
+    interface, retained as a fallback during the proxy-direct migration.
+
+Both paths share the same internal pipeline. Injects cooperative tool-use
+prompts so models that don't natively support tool calls can produce them
+as ```json blocks that the proxy then parses and re-emits as native
+tool_calls.
 
 Environment variables (see README / .env.example):
     PROXY_HOST           bind address (default 0.0.0.0)
@@ -1495,6 +1507,138 @@ def generate_ndjson(
 
 
 # ---------------------------------------------------------------------------
+# OpenAI-compatible response emission
+# ---------------------------------------------------------------------------
+
+def _openai_tool_calls(tool_call_payloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert internal {name, arguments} payloads to OpenAI tool_calls.
+
+    OpenAI's `function.arguments` is a JSON *string*, whereas the internal
+    payload (and the ollama wire format) carry it as an object — so encode
+    any non-string arguments. Each call gets a stable index (the array key
+    the AI SDK accumulates streamed deltas into) and a unique id so tool_use
+    blocks in the conversation history can be correlated to their results.
+    """
+    tcs: List[Dict[str, Any]] = []
+    for i, payload in enumerate(tool_call_payloads):
+        args = payload["arguments"]
+        if not isinstance(args, str):
+            args = json.dumps(args)
+        tcs.append({
+            "index": i,
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": payload["name"], "arguments": args},
+        })
+    return tcs
+
+
+def generate_openai_sse(
+    model_name: str,
+    clean_text: str,
+    tool_call_payloads: List[Dict[str, Any]],
+    usage: Optional[Dict[str, Any]],
+) -> Iterable[str]:
+    """Yield OpenAI-compatible SSE lines (`data: {chunk}\\n\\n` ... `data: [DONE]`).
+
+    The proxy has the full upstream response in hand before emission (it must,
+    for balanced-brace tool-call extraction over the complete text), so the
+    content is sent as a small number of chat.completion.chunk deltas rather
+    than incrementally. The AI SDK's openai-compatible provider reassembles
+    these: the first tool-call delta must carry `id` + `function.name` and the
+    accumulated `function.arguments` must parse as JSON, both satisfied here by
+    emitting each call complete in a single delta.
+    """
+    resp_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+
+    def emit(delta: Optional[Dict[str, Any]] = None,
+             finish_reason: Optional[str] = None,
+             usage_obj: Optional[Dict[str, Any]] = None) -> str:
+        chunk: Dict[str, Any] = {
+            "id": resp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+        }
+        if usage_obj is not None:
+            chunk["choices"] = []
+            chunk["usage"] = usage_obj
+        else:
+            chunk["choices"] = [{
+                "index": 0,
+                "delta": delta or {},
+                "finish_reason": finish_reason,
+            }]
+        return "data: " + json.dumps(chunk) + "\n\n"
+
+    # Text delta. Always emit an opening assistant delta so the stream is
+    # well-formed even when there's no text (tool-only or rescued responses).
+    if clean_text:
+        yield emit(delta={"role": "assistant", "content": clean_text})
+    elif not tool_call_payloads:
+        yield emit(delta={"role": "assistant", "content": ""})
+
+    if tool_call_payloads:
+        delta: Dict[str, Any] = {"tool_calls": _openai_tool_calls(tool_call_payloads)}
+        if not clean_text:
+            delta["role"] = "assistant"
+        yield emit(delta=delta)
+
+    finish_reason = "tool_calls" if tool_call_payloads else "stop"
+    yield emit(delta={}, finish_reason=finish_reason)
+
+    if usage:
+        yield emit(usage_obj=_openai_usage(usage))
+
+    yield "data: [DONE]\n\n"
+
+
+def build_openai_response(
+    model_name: str,
+    clean_text: str,
+    tool_call_payloads: List[Dict[str, Any]],
+    usage: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a single non-streamed OpenAI `chat.completion` object.
+
+    Used when an OpenAI-path request sets `stream: false`. opencode always
+    streams, so this serves manual `curl`/debug callers; it's cheap to support
+    and keeps the inbound contract complete.
+    """
+    message: Dict[str, Any] = {"role": "assistant", "content": clean_text or ""}
+    if tool_call_payloads:
+        message["tool_calls"] = [
+            {k: v for k, v in tc.items() if k != "index"}
+            for tc in _openai_tool_calls(tool_call_payloads)
+        ]
+        message["content"] = clean_text or None
+    finish_reason = "tool_calls" if tool_call_payloads else "stop"
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(datetime.datetime.now(datetime.timezone.utc).timestamp()),
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": _openai_usage(usage or {}),
+    }
+
+
+def _openai_usage(usage: Dict[str, Any]) -> Dict[str, int]:
+    prompt = usage.get("prompt_tokens") or 0
+    completion = usage.get("completion_tokens") or 0
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Upstream extraction
 # ---------------------------------------------------------------------------
 
@@ -1764,18 +1908,42 @@ def list_models() -> Response:
     )
 
 
+def _client_error(message: str, status: int, openai: bool,
+                  *, ollama_body: Optional[Dict[str, Any]] = None) -> Response:
+    """Error response in the shape the inbound client expects.
+
+    The OpenAI path needs the `{"error": {"message": ...}}` envelope the AI SDK
+    parses (only `message` is required; it is surfaced to opencode). The ollama
+    fallback keeps its legacy flat body unchanged.
+    """
+    if openai:
+        body: Dict[str, Any] = {"error": {"message": message, "type": "proxy_error"}}
+    else:
+        body = ollama_body if ollama_body is not None else {"error": message}
+    return Response(json.dumps(body), status=status, mimetype="application/json")
+
+
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 def catch_all(path: str) -> Response:
     req_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    # Dispatch on the request path: opencode (and any OpenAI-compatible client)
+    # hits /v1/chat/completions; the legacy ollama fallback hits /api/chat.
+    # Computed before the body is read so the fatal handler can still pick the
+    # right error envelope if parsing throws.
+    is_openai = path.rstrip("/").endswith("chat/completions")
 
     try:
-        ollama_request = request.get_json(silent=True) or {}
-        save_debug_file(req_id, "01", "Ollama_Request", ollama_request)
+        inbound_request = request.get_json(silent=True) or {}
+        save_debug_file(req_id, "01", "Inbound_Request", inbound_request)
 
-        model_name = ollama_request.get("model") or DEFAULT_MODEL_NAME
-        original_messages = ollama_request.get("messages") or []
-        tools = ollama_request.get("tools") or []
+        model_name = inbound_request.get("model") or DEFAULT_MODEL_NAME
+        original_messages = inbound_request.get("messages") or []
+        tools = inbound_request.get("tools") or []
+        # OpenAI semantics: default non-streaming when `stream` is absent. The
+        # AI SDK always sends stream:true, so opencode streams; a bare curl gets
+        # a single JSON object. Ignored on the ollama path (always NDJSON).
+        want_stream = bool(inbound_request.get("stream", False))
 
         print(f"[{req_id}] {request.method} /{path} model={model_name} messages={len(original_messages)} tools={len(tools)}", flush=True)
 
@@ -1819,10 +1987,9 @@ def catch_all(path: str) -> Response:
         except requests.RequestException as e:
             print(f"[{req_id}] upstream request failed: {e}", flush=True)
             save_debug_file(req_id, "03", "API_Error", {"error": str(e)})
-            return Response(
-                json.dumps({"error": "upstream request failed", "details": str(e)}),
-                status=502,
-                mimetype="application/json",
+            return _client_error(
+                f"upstream request failed: {e}", 502, is_openai,
+                ollama_body={"error": "upstream request failed", "details": str(e)},
             )
 
         if resp.status_code >= 400:
@@ -1833,10 +2000,9 @@ def catch_all(path: str) -> Response:
                 err_body = resp.text
             print(f"[{req_id}] upstream returned {resp.status_code}: {err_body}", flush=True)
             save_debug_file(req_id, "03", "API_Error", {"status": resp.status_code, "body": err_body})
-            return Response(
-                json.dumps({"error": "upstream non-OK", "status": resp.status_code, "body": err_body}),
-                status=502,
-                mimetype="application/json",
+            return _client_error(
+                f"upstream returned status {resp.status_code}", 502, is_openai,
+                ollama_body={"error": "upstream non-OK", "status": resp.status_code, "body": err_body},
             )
 
         try:
@@ -1844,10 +2010,9 @@ def catch_all(path: str) -> Response:
         except ValueError as e:
             print(f"[{req_id}] upstream returned non-JSON: {e}", flush=True)
             save_debug_file(req_id, "03", "API_Error", {"error": "non-json", "body": resp.text})
-            return Response(
-                json.dumps({"error": "upstream returned non-JSON", "details": str(e)}),
-                status=502,
-                mimetype="application/json",
+            return _client_error(
+                f"upstream returned non-JSON: {e}", 502, is_openai,
+                ollama_body={"error": "upstream returned non-JSON", "details": str(e)},
             )
 
         save_debug_file(req_id, "03", "API_Response", target_json)
@@ -1966,20 +2131,27 @@ def catch_all(path: str) -> Response:
             ),
         }
 
-        print(f"[{req_id}] upstream OK; emitting NDJSON (tool_calls={len(tool_call_payloads)})", flush=True)
+        # Emit in the format the inbound client expects. Both emitters consume
+        # the same (clean_text, tool_call_payloads, usage) — the upstream call
+        # already completed fully before emission (the proxy isn't streaming
+        # from upstream; it gets the full response, then translates), so
+        # materializing-then-yielding doesn't change latency. Chunks are
+        # materialized so they can be dumped to debug output before streaming;
+        # memory cost is the response size — a few KB for typical responses.
+        if is_openai:
+            if want_stream:
+                sse_chunks = list(generate_openai_sse(model_name, clean_text, tool_call_payloads, usage))
+                save_debug_file(req_id, "04", "OpenAI_SSE_Response", {"chunks": sse_chunks})
+                print(f"[{req_id}] upstream OK; emitting OpenAI SSE (tool_calls={len(tool_call_payloads)})", flush=True)
+                return app.response_class(iter(sse_chunks), mimetype="text/event-stream")
+            body = build_openai_response(model_name, clean_text, tool_call_payloads, usage)
+            save_debug_file(req_id, "04", "OpenAI_Response", body)
+            print(f"[{req_id}] upstream OK; emitting OpenAI JSON (tool_calls={len(tool_call_payloads)})", flush=True)
+            return Response(json.dumps(body), status=200, mimetype="application/json")
 
-        # Materialize the NDJSON chunks so we can dump them to debug output
-        # before streaming. Memory cost is the response size — at most a few
-        # KB for typical tool-call responses; not a concern. Avoids needing
-        # a write-around-while-yielding mechanism. The upstream API call
-        # already completed fully before NDJSON generation began (the proxy
-        # isn't streaming from upstream — it gets the full response, then
-        # translates), so materializing-then-yielding doesn't change latency:
-        # ollama gets the first NDJSON chunk at the same moment it would
-        # have under the streaming generator.
+        print(f"[{req_id}] upstream OK; emitting NDJSON (tool_calls={len(tool_call_payloads)})", flush=True)
         ndjson_chunks = list(generate_ndjson(model_name, clean_text, tool_call_payloads, usage))
         save_debug_file(req_id, "04", "NDJSON_Response", {"chunks": ndjson_chunks})
-
         return app.response_class(
             iter(ndjson_chunks),
             mimetype="application/x-ndjson",
@@ -1989,10 +2161,9 @@ def catch_all(path: str) -> Response:
         tb = traceback.format_exc()
         print(f"[{req_id}] FATAL: {e}\n{tb}", flush=True)
         save_debug_file(req_id, "99", "Fatal_Error", {"error": str(e), "traceback": tb})
-        return Response(
-            json.dumps({"error": "proxy internal error", "details": str(e)}),
-            status=500,
-            mimetype="application/json",
+        return _client_error(
+            f"proxy internal error: {e}", 500, is_openai,
+            ollama_body={"error": "proxy internal error", "details": str(e)},
         )
 
 
