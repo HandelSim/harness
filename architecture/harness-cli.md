@@ -26,18 +26,18 @@ The portable resolver is duplicated inline here rather than depending on
 ## Env loading
 
 The script sources `.env` into its own shell (`set -a; source; set +a`)
-so it can read values like `PUBLISH_OLLAMA_PORT`, `DEFAULT_MODEL_NAME`,
-`HARNESS_EXTRA_MOUNTS` for its own logic. `docker compose` gets `.env`
-separately via `--env-file`. The two consumers are independent.
+so it can read values like `DEFAULT_MODEL_NAME`, `HARNESS_EXTRA_MOUNTS`
+for its own logic. `docker compose` gets `.env` separately via
+`--env-file`. The two consumers are independent.
 
 `DEFAULT_MODEL_NAME` (which replaced the old `PROXY_API_MODEL` +
 `OLLAMA_AGENT_MODEL`) is the default/fallback model id and is **REQUIRED with no
 hardcoded default** — once the selected model passes through to the upstream, a
 cosmetic default would be a real upstream id we can't know. `agent_model` reads
 it (empty when unset) and `require_runtime_config` enforces it's set before any
-launch. ollama discovers the upstream's full model list and registers a stub per
-model (always including this one); opencode selects `harness/${DEFAULT_MODEL_NAME}`
-by default.
+launch. The agent entrypoint discovers the upstream's full model list from the
+proxy's `/v1/models` catalog (always including this one); opencode selects
+`harness/${DEFAULT_MODEL_NAME}` by default.
 
 ### Upstream URL base + auth/model probes
 
@@ -51,12 +51,12 @@ rejected key (#108) **unless** the upstream's `error.type` is in the
 `invalid_request` family — the one "key is fine, the probe request was bad"
 case (#43, `_auth_probe_type_is_request_error`) that warns-and-continues. An
 empty/unknown type on a `401`/`403` aborts. Aborting here is what stops a bad
-key from reaching ollama, where no models would register. `_print_upstream_models` then GETs
+key from reaching the proxy, where every request would fail. `_print_upstream_models` then GETs
 `{base}/v1/models` (best-effort): on success it prints the catalog, on a locked
 key it shows the unlock URL and aborts, and on an unreachable upstream (e.g.
 tests pointing at an in-network mock the host can't reach) it stays quiet and
-proceeds — the authoritative per-model registration happens in the ollama
-container. Both honor `HARNESS_SKIP_AUTH_PROBE=1`.
+proceeds — the agent entrypoint discovers the model list from the proxy's
+`/v1/models` route at config-build time. Both honor `HARNESS_SKIP_AUTH_PROBE=1`.
 
 ### Host proxy (`HTTP_PROXY` / `HTTPS_PROXY`)
 
@@ -127,16 +127,14 @@ instance on the same daemon.
 ## Runtime override (`write_runtime_override`)
 
 `state/.harness-runtime.yml` is regenerated on every compose invocation
-and never tracked. It carries three things:
+and never tracked. It carries two things:
 
-1. **`PUBLISH_OLLAMA_PORT`** — when set in `.env`, exposes ollama on the
-   host. Default is internal-only.
-2. **Per-service firewall opt-out** — for every service with
+1. **Per-service firewall opt-out** — for every service with
    `firewall_disabled: true` in `state/.harness-net-overrides.json`, an
    `environment: HARNESS_FIREWALL_DISABLED: "1"` block is emitted. The
    firewall init script short-circuits on that variable. We never replace
    the service's entrypoint or remove its `cap_add`.
-3. **Ephemeral `--prompt-mode`** — `harness start/restart --prompt-mode
+2. **Ephemeral `--prompt-mode`** — `harness start/restart --prompt-mode
    <mode>` (`_parse_prompt_mode_flag` validates `hybrid`/`user_front`/
    `passthrough`) sets the `prompt_mode_override` global, which adds
    `environment: PROXY_PROMPT_MODE: "<mode>"` onto the proxy service. This is
@@ -144,7 +142,7 @@ and never tracked. It carries three things:
    `docker-compose.yml` no longer interpolates it (a stale `.env` value is
    inert). It is **not persisted** — a later bare `start`/`restart` regenerates
    the file without it, reverting the proxy to its built-in `hybrid` default.
-   When the proxy *also* has a firewall opt-out (2), the prompt mode is folded
+   When the proxy *also* has a firewall opt-out (1), the prompt mode is folded
    into that same `proxy:` block rather than emitted as a second mapping
    (duplicate top-level service keys are invalid compose YAML).
 

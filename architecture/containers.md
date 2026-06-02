@@ -6,12 +6,11 @@ runtime. For the install-time bootstrap and upgrade machinery, see
 
 ## Service graph
 
-`docker-compose.yml` defines three services on a single bridge network
+`docker-compose.yml` defines two services on a single bridge network
 (`harness-net`):
 
 ```
 harness-net (bridge)
-├── ollama      builds from ollama/Dockerfile; entrypoint registers stub model
 ├── proxy       builds from proxy/Dockerfile; runs proxy/proxy.py
 └── agent       builds from agents/Dockerfile; `agent` profile (not in `up`)
 ```
@@ -23,46 +22,15 @@ direct `docker run`, not compose — see "Agent launch path" in
 `docker compose up agent` works for debugging AND so the runtime contract
 (`cap_add`, allowlist mount, network) is documented in one place.
 
-## ollama service: stub model registration
-
-`ollama/entrypoint.sh`:
-
-1. Runs `init-firewall.sh` (root, NET_ADMIN/NET_RAW).
-2. Starts `ollama serve` in the background; traps EXIT/INT/TERM to clean
-   it up.
-3. Waits up to 60 s for `GET /api/tags` to succeed.
-4. **Discovers** the upstream's model list via `GET http://proxy:${PROXY_PORT}/v1/models`
-   (the proxy's pass-through route — see [`proxy.md`](proxy.md)). On a locked-key
-   `401` carrying an `unlock_url` it prints the URL and aborts; on any other
-   failure (proxy/upstream unreachable, empty list) it warns and falls back to
-   just `DEFAULT_MODEL_NAME` so a transient hiccup doesn't brick the stack in a
-   restart loop.
-5. POSTs `/api/create` to register a stub model **per discovered id** (always
-   including `DEFAULT_MODEL_NAME`, deduped) whose `remote_host` points at
-   `http://proxy:${PROXY_PORT}`. The same body sets `context_length` and
-   `num_ctx` from `OLLAMA_CONTEXT_LENGTH`. The proxy forwards whichever stub
-   name the request used (passthrough), so each stub maps to its own upstream
-   model.
-6. Confirms every registered name appears in `/api/tags`. Aborts on failure.
-7. `wait`s on the ollama process so PID 1 stays alive.
-
-### `OLLAMA_REMOTES` is load-bearing
-
-ollama matches `RemoteHost` allowlisting on the **literal hostname** from
-the URL using `slices.Contains` — exact string, no DNS. The compose file
-sets `OLLAMA_REMOTES: proxy`. Renaming the `proxy` service in
-`docker-compose.yml` requires updating `OLLAMA_REMOTES` to match.
-
 ## proxy service
 
 Builds from `proxy/Dockerfile`; entrypoint runs `init-firewall.sh` then
-`python3 proxy.py`. The proxy needs the firewall just like ollama because
-its outbound `PROXY_API_URL` request has to traverse the same allowlist
-gate. See [`proxy.md`](proxy.md) for behavior.
+`python3 proxy.py`. The proxy needs the firewall because its outbound
+`PROXY_API_URL` request has to traverse the allowlist gate. opencode talks
+to it directly over its OpenAI-compatible interface (`http://proxy:${PROXY_PORT}/v1`);
+there is no ollama hop. See [`proxy.md`](proxy.md) for behavior.
 
-Healthcheck: `curl -fsS http://127.0.0.1:${PROXY_PORT:-8000}/health`. The
-ollama service `depends_on: proxy: condition: service_healthy` so the
-stub-model registration doesn't fire against an unready proxy.
+Healthcheck: `curl -fsS http://127.0.0.1:${PROXY_PORT:-8000}/health`.
 
 ## agent containers (`agents/Dockerfile` + `agents/entrypoint.sh`)
 
@@ -266,5 +234,5 @@ Every long-running service joins `harness_harness-net` (compose adds the
 project-name prefix). MCP compose snippets reference this network as
 `external` so they merge cleanly. Agent `docker run` invocations attach
 to the same network with `--network harness_harness-net`. Everything
-reachable on that network is by service name (`http://ollama:11434`,
-`http://proxy:8000`, `http://harness-serena:24282`).
+reachable on that network is by service name (`http://proxy:8000`,
+`http://harness-serena:24282`).
