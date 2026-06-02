@@ -34,7 +34,7 @@ infrastructure remaining healthy.
    report; the rest cannot proceed.
 2. If `[runtime]` shows services aren't running, run `harness start` and
    wait for it to return. Re-run `harness doctor` and confirm `[runtime]`
-   now shows ollama and proxy as healthy.
+   now shows proxy as healthy.
 3. Confirm `harness list` reports zero agents (`no harness agents running`).
 
 ## Scenario A: Single-prompt sanity
@@ -196,7 +196,7 @@ time harness upgrade
 Expected: pull (no-op or fast-forward), rebuild (cached layers should make
 this fast), restart of services. Report the wall time and whether services
 came back healthy (`harness doctor` after upgrade should still show
-ollama/proxy healthy).
+the proxy healthy).
 
 ## Scenario H: Recovery (interrupt mid-stream)
 

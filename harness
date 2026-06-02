@@ -2467,6 +2467,10 @@ agent_common_env() {
     # (http://proxy:${PROXY_PORT}/v1) and discovers models off /v1/models.
     # PROXY_PORT is sourced from .env into this shell; default 8000.
     printf -- '-e\nPROXY_PORT=%s\n' "${PROXY_PORT:-8000}"
+    # Declared context window for opencode's model config. The same knob caps
+    # the proxy's local token estimate. Legacy alias OLLAMA_CONTEXT_LENGTH is
+    # honored as a fallback so existing .env files keep working.
+    printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-${OLLAMA_CONTEXT_LENGTH:-200000}}"
     # Container CWD is also bind-mounted at this exact path; the entrypoint
     # cd's here after the gosu drop. Surfaced as an env var so agents (and
     # any user scripts inside the container) can identify the host launch

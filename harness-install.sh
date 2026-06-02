@@ -17,7 +17,6 @@
 #       output/                            proxy debug dumps
 #       agent/home/                        shared agent /home/harness
 #                                          (opencode, shell)
-#       ollama-data/                       ollama model blobs
 #       mcp/<name>/                        active MCP services
 #
 # To uninstall later:
@@ -318,7 +317,7 @@ preflight() {
         if (( available_mb >= 5120 )); then
             echo "  ✓ disk space (${available_mb}M available, 5120M recommended)"
         else
-            echo "  ⚠ disk space — only ${available_mb}M available; ollama/serena images need ~5GB total"
+            echo "  ⚠ disk space — only ${available_mb}M available; proxy/agent/serena images need ~5GB total"
             # warning, not error
         fi
     fi
@@ -553,9 +552,8 @@ fi
 title "creating runtime state directories"
 mkdir -p "$install_root/state/output" \
          "$install_root/state/agent/home" \
-         "$install_root/state/ollama-data" \
          "$install_root/state/mcp"
-ok "created state/output, state/agent/home, state/ollama-data, state/mcp"
+ok "created state/output, state/agent/home, state/mcp"
 
 # --- .env handling ----------------------------------------------------------
 #
@@ -881,7 +879,7 @@ cat <<EOF
 
 Running 'harness' with no command launches an opencode agent in the current
 directory ('harness opencode' does the same). The FIRST run builds the
-container images (ollama + proxy + agent), so expect it to take a few minutes;
+container images (proxy + agent), so expect it to take a few minutes;
 every run afterward starts in seconds.
 
 Common agent flags (examples, not the full set):

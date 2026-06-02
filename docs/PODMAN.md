@@ -6,8 +6,9 @@ target configuration is **rootless Podman 4.0+** because:
 - Rootless is the default Podman mode on most distros.
 - 4.0+ ships the built-in `podman compose` subcommand. Earlier versions
   require `podman-compose` separately, and `podman-compose` has historical
-  gaps with `depends_on: condition: service_healthy` (which the harness
-  compose file uses to gate ollama on a healthy proxy).
+  gaps with `depends_on: condition: service_healthy`. The harness compose
+  file no longer relies on that (the proxy is the only long-running service),
+  so this is a non-issue in practice.
 
 Rootful Podman should also work but isn't the primary target.
 
@@ -106,7 +107,7 @@ installed), every `harness` subcommand routes through podman:
 
 ```bash
 harness preflight   # 'podman runtime ✓' / 'podman compose ✓'
-harness start       # builds proxy/ollama/agent images via 'podman compose'
+harness start       # builds proxy/agent images via 'podman compose'
 harness doctor      # reports 'podman runtime reachable'
 harness             # ephemeral agent container via 'podman run'
 ```
