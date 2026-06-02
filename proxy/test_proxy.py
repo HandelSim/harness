@@ -2905,6 +2905,434 @@ class TestEmptyResponseDetection(unittest.TestCase):
         self.assertIsNone(proxy._select_rescue_tool(None))
 
 
+class TestMalformedToolCallRetry(unittest.TestCase):
+    """Issue #121. When the upstream emits a ```json tool-call attempt that
+    fails to extract — either a fence opener with no parseable JSON body
+    (the `\\`\\`\\`json_parse_or_id:todowrite}` shape that ended the turn
+    silently), or a brace-balanced JSON object whose strings carry an
+    invalid `\\escape` — the proxy appends a corrective `[assistant(<bad>),
+    user(<correction>)]` pair to the conversation and re-POSTs upstream
+    ONCE. The retry is invisible to opencode: a successful retry replaces
+    the bad attempt; a failed retry falls through to the existing
+    bleed/empty-rescue path."""
+
+    _BASH_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "required": ["command", "description"],
+                "properties": {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+            },
+        },
+    }
+
+    _WRITE_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "Write to a file.",
+            "parameters": {
+                "type": "object",
+                "required": ["filePath", "content"],
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+        },
+    }
+
+    _TODOWRITE_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "description": "Maintain a todo list.",
+            "parameters": {
+                "type": "object",
+                "required": ["todos"],
+                "properties": {"todos": {"type": "array"}},
+            },
+        },
+    }
+
+    # --- _diagnose_failed_tool_call unit tests -----------------------------
+
+    def test_diagnose_empty_response(self):
+        self.assertIsNone(proxy._diagnose_failed_tool_call(""))
+
+    def test_diagnose_no_fence_returns_none(self):
+        self.assertIsNone(
+            proxy._diagnose_failed_tool_call("plain prose, no fence here.")
+        )
+
+    def test_diagnose_malformed_fence_exact_issue_121_shape(self):
+        """The exact shape that ended the turn silently in issue #121:
+        ```json fence opener followed by a non-`{` character. The entire
+        response is the broken fence — high-confidence malformed_fence."""
+        self.assertEqual(
+            proxy._diagnose_failed_tool_call(
+                "```json_parse_or_id:todowrite}"
+            ),
+            "malformed_fence",
+        )
+
+    def test_diagnose_malformed_fence_with_trailing_whitespace(self):
+        self.assertEqual(
+            proxy._diagnose_failed_tool_call(
+                "  ```json_parse_or_id:foo}\n\n"
+            ),
+            "malformed_fence",
+        )
+
+    def test_diagnose_malformed_fence_truncated_after_opener(self):
+        """Fence opener then EOF (model stopped mid-output). Still a
+        botched tool call worth retrying."""
+        self.assertEqual(
+            proxy._diagnose_failed_tool_call("```json"),
+            "malformed_fence",
+        )
+
+    def test_diagnose_malformed_escape_with_invalid_x_escape(self):
+        """Brace-balanced JSON whose `content` carries `\\x1e` — JSON spec
+        rejects it. High-confidence malformed_escape (model attempted a
+        write-style call and only the backslash escaping is wrong)."""
+        text = '```json\n{"name":"write","arguments":{"filePath":"/tmp/x","content":"\\x1e"}}\n```'
+        self.assertEqual(
+            proxy._diagnose_failed_tool_call(text),
+            "malformed_escape",
+        )
+
+    def test_diagnose_malformed_escape_with_invalid_a_escape(self):
+        text = '```json\n{"name":"write","arguments":{"content":"bell:\\a"}}\n```'
+        self.assertEqual(
+            proxy._diagnose_failed_tool_call(text),
+            "malformed_escape",
+        )
+
+    def test_diagnose_prose_with_json_example_is_not_retried(self):
+        """Prose that mentions ```json should NOT trigger a retry — the
+        model wasn't trying to call a tool. The conservative gating on
+        malformed_fence requires the stripped response to START with the
+        fence, so prose before it disqualifies the trigger."""
+        text = (
+            "Here's how a tool call looks: ```json {wrong shape}\n"
+            "but you should use the actual schema."
+        )
+        self.assertIsNone(proxy._diagnose_failed_tool_call(text))
+
+    def test_diagnose_valid_json_wrong_shape_is_not_retried(self):
+        """A ```json block whose JSON parses fine but doesn't match the
+        {name, arguments} shape (e.g. a model describing JSON) is left to
+        bleed into chat, not retried."""
+        text = '```json\n{"foo": "bar"}\n```'
+        self.assertIsNone(proxy._diagnose_failed_tool_call(text))
+
+    def test_diagnose_other_json_parse_error_is_not_retried(self):
+        """Brace-unbalanced or shape-broken JSON that ISN'T a bad-escape
+        falls through to bleed — the retry trigger is narrow to JSON-spec
+        `Invalid \\escape` errors."""
+        text = '```json\n{"name": "foo", missing colon}\n```'
+        self.assertIsNone(proxy._diagnose_failed_tool_call(text))
+
+    # --- Full HTTP path: bad → retry → recovered -------------------------
+
+    def _post_with_sequential_responses(self, responses, tools=None,
+                                        messages=None, capture=None):
+        """Drive the catch_all flow with a queue of `responses` — each
+        FakeResp is dequeued on successive `requests.post` calls. Returns
+        (flask_response, post_call_count)."""
+        ollama_request = {
+            "model": "GenAI",
+            "messages": messages or [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+        if tools is not None:
+            ollama_request["tools"] = tools
+
+        calls = {"count": 0, "payloads": []}
+
+        def fake_post(url, headers=None, json=None, **kwargs):
+            calls["count"] += 1
+            calls["payloads"].append(json)
+            if capture is not None:
+                capture.append(json)
+            try:
+                target = responses.pop(0)
+            except IndexError:
+                self.fail("upstream called more times than expected")
+            return target
+
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post", side_effect=fake_post):
+            with patch.object(proxy, "save_debug_file"):
+                resp = client.post(
+                    "/api/chat",
+                    data=json.dumps(ollama_request),
+                    content_type="application/json",
+                )
+        return resp, calls
+
+    @staticmethod
+    def _resp(content):
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return {
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": content},
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+        return FakeResp()
+
+    def _chunks(self, resp):
+        return [
+            json.loads(l)
+            for l in resp.get_data(as_text=True).split("\n")
+            if l.strip()
+        ]
+
+    def _content_joined(self, chunks):
+        return "".join(
+            (c.get("message") or {}).get("content") or "" for c in chunks
+        )
+
+    def _tool_calls(self, chunks):
+        out = []
+        for c in chunks:
+            tcs = (c.get("message") or {}).get("tool_calls") or []
+            out.extend(tcs)
+        return out
+
+    def test_malformed_fence_recovered_on_retry(self):
+        """The exact issue #121 shape: first response is the bare broken
+        fence, second response carries the corrected todowrite call. The
+        agent never sees the bad attempt — opencode gets only the retry's
+        tool call."""
+        good_block = (
+            '```json\n'
+            '{"name": "todowrite", "arguments": {"todos": []}}\n'
+            '```'
+        )
+        responses = [
+            self._resp("```json_parse_or_id:todowrite}"),
+            self._resp(good_block),
+        ]
+        resp, calls = self._post_with_sequential_responses(
+            responses, tools=[self._TODOWRITE_TOOL]
+        )
+        self.assertEqual(calls["count"], 2, "must POST twice (bad + retry)")
+        chunks = self._chunks(resp)
+        tcs = self._tool_calls(chunks)
+        self.assertEqual(len(tcs), 1)
+        self.assertEqual(tcs[0]["function"]["name"], "todowrite")
+        joined = self._content_joined(chunks)
+        # The broken fence and the proxy's corrective scaffolding must
+        # NOT bleed into the assistant content the user sees.
+        self.assertNotIn("json_parse_or_id", joined)
+        self.assertNotIn("harness proxy", joined)
+
+    def test_malformed_escape_recovered_on_retry(self):
+        """A write call with `\\x1e` in content parses-but-fails-strict.
+        Retry response uses properly-escaped `\\\\x1e` and the file write
+        succeeds via the retry — opencode never sees the bad attempt."""
+        bad = (
+            '```json\n'
+            '{"name":"write","arguments":{"filePath":"/tmp/x.py","content":"a\\x1eb"}}\n'
+            '```'
+        )
+        # Corrected: real backslashes JSON-escaped as `\\\\x1e`. In the
+        # source-level JSON the model would emit, that's `\\x1e`.
+        good = (
+            '```json\n'
+            '{"name":"write","arguments":{"filePath":"/tmp/x.py","content":"a\\\\x1eb"}}\n'
+            '```'
+        )
+        responses = [self._resp(bad), self._resp(good)]
+        resp, calls = self._post_with_sequential_responses(
+            responses, tools=[self._WRITE_TOOL]
+        )
+        self.assertEqual(calls["count"], 2)
+        chunks = self._chunks(resp)
+        tcs = self._tool_calls(chunks)
+        self.assertEqual(len(tcs), 1)
+        self.assertEqual(tcs[0]["function"]["name"], "write")
+        self.assertEqual(
+            tcs[0]["function"]["arguments"]["content"], "a\\x1eb"
+        )
+
+    def test_retry_carries_assistant_bad_and_user_correction(self):
+        """The augmented payload sent to upstream on retry must include
+        the bad assistant turn AND a user-role corrective message — this
+        is the signal the model uses to self-correct. We verify by
+        capturing the upstream messages on the second POST."""
+        bad_text = "```json_parse_or_id:todowrite}"
+        good_block = (
+            '```json\n{"name": "todowrite", "arguments": {"todos": []}}\n```'
+        )
+        captured: list = []
+        responses = [self._resp(bad_text), self._resp(good_block)]
+        self._post_with_sequential_responses(
+            responses,
+            tools=[self._TODOWRITE_TOOL],
+            messages=[{"role": "user", "content": "make a todo list"}],
+            capture=captured,
+        )
+        self.assertEqual(len(captured), 2)
+        retry_messages = captured[1]["messages"]
+        joined = "\n".join(m.get("content", "") for m in retry_messages)
+        # The bad attempt must be in the conversation as an assistant
+        # turn the model can see — that's the signal it gets to recognise
+        # what failed.
+        self.assertIn(bad_text, joined)
+        # The corrective message must be present so the model knows
+        # WHAT to fix.
+        self.assertIn("harness proxy", joined)
+        self.assertIn("Re-emit", joined)
+        # Last upstream message ends in the corrective ask
+        # (recency builder wraps it as the live USER_REQUEST).
+        self.assertIn("emit only the corrected", retry_messages[-1]["content"])
+
+    def test_retry_budget_exhausted_falls_through_to_bleed(self):
+        """Both attempts produce the same malformed fence — retry budget
+        is 1, so the proxy doesn't loop forever. The original bad text
+        bleeds into chat (existing behaviour) and the turn ends; opencode
+        + the user see the malformed output and can react."""
+        bad_text = "```json_parse_or_id:todowrite}"
+        responses = [self._resp(bad_text), self._resp(bad_text)]
+        resp, calls = self._post_with_sequential_responses(
+            responses, tools=[self._TODOWRITE_TOOL]
+        )
+        # Exactly two upstream calls — no third attempt.
+        self.assertEqual(calls["count"], 2)
+        chunks = self._chunks(resp)
+        self.assertEqual(self._tool_calls(chunks), [])
+        # Bleed: the bad text reaches opencode as assistant content.
+        joined = self._content_joined(chunks)
+        self.assertIn("json_parse_or_id", joined)
+
+    def test_retry_recovers_with_pure_text_response(self):
+        """If the retry model gives up on tool-calling and just answers
+        in prose, that's still a recovered response — use it (the user
+        gets a meaningful answer instead of garbage), don't fall through
+        to bleed."""
+        bad_text = "```json_parse_or_id:todowrite}"
+        prose_reply = "I cannot complete that task with the available tools."
+        responses = [self._resp(bad_text), self._resp(prose_reply)]
+        resp, calls = self._post_with_sequential_responses(
+            responses, tools=[self._TODOWRITE_TOOL]
+        )
+        self.assertEqual(calls["count"], 2)
+        chunks = self._chunks(resp)
+        self.assertEqual(self._tool_calls(chunks), [])
+        joined = self._content_joined(chunks)
+        self.assertIn(prose_reply, joined)
+        self.assertNotIn("json_parse_or_id", joined)
+
+    def test_real_tool_call_does_not_trigger_retry(self):
+        """A normal response with a valid tool call must NOT trigger the
+        retry path — only one upstream POST happens."""
+        good_block = (
+            '```json\n'
+            '{"name": "bash", "arguments": {"command": "ls", '
+            '"description": "list files"}}\n'
+            '```'
+        )
+        responses = [self._resp(good_block)]
+        resp, calls = self._post_with_sequential_responses(
+            responses, tools=[self._BASH_TOOL]
+        )
+        self.assertEqual(calls["count"], 1)
+        chunks = self._chunks(resp)
+        tcs = self._tool_calls(chunks)
+        self.assertEqual(len(tcs), 1)
+        self.assertEqual(tcs[0]["function"]["name"], "bash")
+
+    def test_prose_with_json_example_does_not_trigger_retry(self):
+        """Negative case: response with prose around a ```json example
+        the model is describing (not a botched call). No retry; the
+        block stays in clean_text as before (issue #115 precedent)."""
+        text = (
+            "Here is what a write call looks like:\n"
+            "```json\n"
+            '{"this is": "not a tool call"}\n'
+            "```\n"
+            "but use the actual schema instead."
+        )
+        responses = [self._resp(text)]
+        resp, calls = self._post_with_sequential_responses(
+            responses, tools=[self._WRITE_TOOL]
+        )
+        self.assertEqual(calls["count"], 1, "must NOT retry on described JSON")
+        chunks = self._chunks(resp)
+        self.assertEqual(self._tool_calls(chunks), [])
+        joined = self._content_joined(chunks)
+        self.assertIn("not a tool call", joined)
+
+    def test_empty_response_still_triggers_rescue_not_retry(self):
+        """An empty upstream response (issue #117 shape) goes to the
+        empty-response rescue, not the malformed-tool-call retry — the
+        diagnose helper returns None for empty content."""
+        responses = [
+            self._resp(""),
+        ]
+        resp, calls = self._post_with_sequential_responses(
+            responses, tools=[self._BASH_TOOL]
+        )
+        # Only one upstream POST — no retry was triggered. The empty-
+        # response rescue handles this case (Understood. + pwd).
+        self.assertEqual(calls["count"], 1)
+        chunks = self._chunks(resp)
+        joined = self._content_joined(chunks)
+        self.assertIn("Understood.", joined)
+
+    def test_retry_upstream_error_falls_through_to_bleed(self):
+        """If the retry POST itself errors (timeout, non-2xx), the proxy
+        falls back to the original bad response (bleed into chat) rather
+        than crashing or hanging."""
+        bad_text = "```json_parse_or_id:todowrite}"
+
+        class FailingRetry:
+            status_code = 502
+
+            def json(self_inner):
+                return {"error": "upstream broken"}
+
+        responses = [self._resp(bad_text), FailingRetry()]
+        resp, calls = self._post_with_sequential_responses(
+            responses, tools=[self._TODOWRITE_TOOL]
+        )
+        self.assertEqual(calls["count"], 2)
+        # Original response still returned 200 — the retry's failure is
+        # invisible to opencode; bad text bleeds as before.
+        self.assertEqual(resp.status_code, 200)
+        chunks = self._chunks(resp)
+        joined = self._content_joined(chunks)
+        self.assertIn("json_parse_or_id", joined)
+
+    # --- Correction-message constants ------------------------------------
+
+    def test_correction_messages_cover_both_kinds(self):
+        self.assertIn("malformed_escape", proxy._RETRY_CORRECTION_MESSAGES)
+        self.assertIn("malformed_fence", proxy._RETRY_CORRECTION_MESSAGES)
+
+    def test_correction_message_falls_back_to_fence_for_unknown_kind(self):
+        """Defensive: an unknown kind doesn't KeyError, it falls back to
+        the malformed-fence corrective (the more general of the two)."""
+        msg = proxy._build_retry_correction_message("not_a_kind")
+        self.assertEqual(
+            msg, proxy._RETRY_CORRECTION_MESSAGES["malformed_fence"]
+        )
+
+
 class TestConfigHelpers(unittest.TestCase):
     """URL-base normalization and model-tag stripping that back the
     passthrough + discovery behavior."""
