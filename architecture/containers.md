@@ -104,14 +104,19 @@ After the drop, still in the entrypoint:
 ### Mode helpers
 
 - `ensure_opencode_config` writes `~/.config/opencode/opencode.json` with
-  the harness provider block pointing at `http://ollama:11434/v1`. The
-  provider display name is the fixed string `GenAI Harness`. The model
-  dropdown is built from ollama `/api/tags` (each
-  stub name with its `:latest` tag stripped) so opencode lists exactly the
-  models discovered at start; `DEFAULT_MODEL_NAME` is always included and is the
+  the harness provider block pointing at `http://proxy:${PROXY_PORT}/v1`
+  (default port 8000; `PROXY_PORT` is passed into the agent container as an
+  `-e` env var so a custom port resolves correctly). opencode talks directly
+  to the translating proxy over its OpenAI-compatible interface — there is no
+  ollama hop. The provider display name is the fixed string `GenAI Harness`.
+  The model dropdown is built from the proxy's `GET /v1/models` catalog (a
+  verbatim pass-through of the upstream's OpenAI-format list, so ids come off
+  `.data[].id` with no tag to strip) so opencode lists exactly the models the
+  upstream advertises; `DEFAULT_MODEL_NAME` is always included and is the
   default selection (`harness/<DEFAULT_MODEL_NAME>`). Built with `jq` and
   re-written every launch because the model set may have changed. Falls back
-  to `DEFAULT_MODEL_NAME` alone if ollama isn't reachable. The yolo agent's
+  to `DEFAULT_MODEL_NAME` alone if the proxy isn't reachable (or its key is
+  locked). The yolo agent's
   `permission` block grants `edit`, `bash` (all commands), `webfetch`, and
   `websearch` — matching the set of tools the agent ships so yolo mode
   doesn't trip on the new ones.

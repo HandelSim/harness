@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-06-02)
 
 **Core value:** A working coding agent (opencode) driving real tool calls against the user's working directory through the translating proxy — the opencode → proxy → upstream path with cooperative tool-use mediation must keep working.
-**Current focus:** Phase 2 — opencode cutover to the proxy
+**Current focus:** Phase 3 — ollama teardown
 
 ## Current Position
 
-Phase: 2 of 4 (opencode points at the proxy, model discovery off /v1/models)
+Phase: 3 of 4 (delete the ollama service, image, CLI refs, firewall remotes; remove proxy's ollama /api/chat path)
 Plan: direct execution (headless oak worker; not using interactive /gsd:execute-phase)
-Status: Phase 1 complete — proxy speaks OpenAI inbound; Phase 2 next
-Last activity: 2026-06-02 — Phase 1 implemented (proxy OpenAI-compatible inbound)
+Status: Phase 2 complete — opencode points at the proxy; Phase 3 next
+Last activity: 2026-06-02 — Phase 2 implemented (opencode cutover to proxy)
 
-Progress: [██░░░░░░░░] 25%
+Progress: [█████░░░░░] 50%
 
 ## Performance Metrics
 
@@ -58,6 +58,15 @@ Recent decisions affecting current work:
 - **Phase 1 kept the ollama `/api/chat` path** alongside the new
   `/v1/chat/completions` path (dispatch on request path in `catch_all`) so each
   checkpoint runs end-to-end; the ollama path is deleted in Phase 3.
+- **Phase 2 cutover:** opencode's provider `baseURL` now points at
+  `http://proxy:${PROXY_PORT}/v1` (was `http://ollama:11434/v1`); the model
+  dropdown is built from the proxy's `/v1/models` catalog (`.data[].id`,
+  OpenAI list shape) instead of ollama `/api/tags`. `PROXY_PORT` is passed
+  into the agent container via `-e` (added to `agent_common_env` in `harness`)
+  since the agent run path uses no `--env-file`. Model discovery now depends
+  on the proxy/upstream being reachable at launch; falls back to
+  `DEFAULT_MODEL_NAME` alone otherwise (cosmetic dropdown; selection still
+  works).
 
 ### Pending Todos
 

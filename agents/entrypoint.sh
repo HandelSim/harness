@@ -132,21 +132,22 @@ ensure_opencode_config() {
 
     local default_model="${DEFAULT_MODEL_NAME:-}"
     local provider_name="GenAI Harness"
-    local ollama_url="http://ollama:11434/v1"
+    local proxy_url="http://proxy:${PROXY_PORT:-8000}/v1"
     local ctx="${OLLAMA_CONTEXT_LENGTH:-200000}"
 
-    # Build the opencode model dropdown from the stubs ollama actually has
-    # registered (its /api/tags), so opencode lists exactly the upstream
-    # models discovered at start — and never drifts from what's registered.
-    # ollama tags stubs as `<id>:latest`; strip the tag back to the bare
-    # upstream id opencode/the proxy use. Falls back to DEFAULT_MODEL_NAME if
-    # ollama isn't reachable yet so the config always has at least one model.
+    # Build the opencode model dropdown from the proxy's /v1/models catalog
+    # (a verbatim pass-through of the upstream's OpenAI-format model list), so
+    # opencode lists exactly the models the upstream advertises. The list is
+    # OpenAI-shaped — {"object":"list","data":[{"id":...},...]} — so the ids
+    # come straight off `.data[].id` with no tag to strip. Falls back to
+    # DEFAULT_MODEL_NAME if the proxy isn't reachable yet (or the key is
+    # locked) so the config always has at least one model.
     local model_ids=()
-    local tags
-    tags=$(curl -fsS --max-time 10 "http://ollama:11434/api/tags" 2>/dev/null || true)
-    if [[ -n "$tags" ]]; then
-        mapfile -t model_ids < <(printf '%s' "$tags" \
-            | jq -r '.models[]?.name | sub(":latest$"; "")' 2>/dev/null | sort -u || true)
+    local catalog
+    catalog=$(curl -fsS --max-time 10 "${proxy_url}/models" 2>/dev/null || true)
+    if [[ -n "$catalog" ]]; then
+        mapfile -t model_ids < <(printf '%s' "$catalog" \
+            | jq -r '.data[]?.id' 2>/dev/null | sort -u || true)
     fi
     # Ensure the default model is always present (it's the default selection).
     if [[ -n "$default_model" ]]; then
@@ -175,7 +176,7 @@ ensure_opencode_config() {
     # the strings are correctly escaped.
     jq -n \
         --arg provider_name "$provider_name" \
-        --arg ollama_url "$ollama_url" \
+        --arg proxy_url "$proxy_url" \
         --arg selected "harness/${selected}" \
         --argjson models "$models_json" \
         '{
@@ -184,7 +185,7 @@ ensure_opencode_config() {
             "harness": {
               "npm": "@ai-sdk/openai-compatible",
               "name": $provider_name,
-              "options": {"baseURL": $ollama_url, "apiKey": "harness-dummy"},
+              "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy"},
               "models": $models
             }
           },
@@ -259,7 +260,7 @@ run_opencode() {
     echo " harness-agent (opencode)"
     echo "   provider: GenAI Harness"
     echo "   model:    harness/${DEFAULT_MODEL_NAME:-default}"
-    echo "   ollama:   http://ollama:11434/v1"
+    echo "   proxy:    http://proxy:${PROXY_PORT:-8000}/v1"
     echo "   yolo:     ${HARNESS_YOLO:-0}"
     echo "   print:    ${HARNESS_PRINT_MODE:-0}"
     echo "============================================================"
