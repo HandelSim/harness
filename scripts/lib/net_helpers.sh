@@ -195,7 +195,7 @@ netlib_remove_host() {
 #   {
 #     "services": {
 #       "agent": {"firewall_disabled": true, "reason": "..."},
-#       "ollama": {"firewall_disabled": true}
+#       "proxy": {"firewall_disabled": true}
 #     }
 #   }
 #

@@ -16,8 +16,8 @@ tool protocol.
 `model` field**, and it exposes an OpenAI-style `GET /v1/models` catalog. The
 proxy treats `PROXY_API_URL` as a base and derives `{base}/v1/chat/completions`
 and `{base}/v1/models` from it; it forwards the model the agent selected
-(passthrough) and registers an ollama stub per advertised model so the user can
-switch models from opencode. See [`proxy.md`](proxy.md) → URL base + model
+(passthrough) and the agent builds opencode's model list from the advertised
+catalog so the user can switch models from opencode. See [`proxy.md`](proxy.md) → URL base + model
 passthrough. (Earlier the harness pinned one model — `gemini 3.1 pro` was the
 one clear best choice — which is why older docs/config spoke of a single model.)
 

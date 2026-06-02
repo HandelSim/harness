@@ -45,7 +45,7 @@ run from an empty directory. Stages:
 5. **dos2unix on Windows.** Defense-in-depth: ensures bash scripts have
    LF line endings even if Git's autocrlf put CRLFs in the working tree.
 6. **Runtime state dirs.** Creates `state/output/`, `state/agent/home/`,
-   `state/ollama-data/`, `state/mcp/`.
+   `state/mcp/`.
 7. **`.env` and `.harness-allowlist`.** For each, in priority order: leave
    a target already in the install root untouched → else copy one dropped
    beside the installer (the directory containing `harness-install.sh`,

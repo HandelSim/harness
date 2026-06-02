@@ -2,8 +2,8 @@
 
 A container-runtime-based system that lets you launch a coding agent
 (opencode) against a third-party API endpoint, transparently.
-The agent runs in a container, talks to a local ollama instance, and ollama
-forwards chat requests to a translating proxy that calls the upstream API.
+The agent runs in a container and talks to a translating proxy over an
+OpenAI-compatible interface; the proxy calls the upstream API.
 
 Supported runtimes: **Docker** (default) and **Podman** (Linux, rootless).
 See [docs/PODMAN.md](docs/PODMAN.md) for podman-specific notes. The runtime
@@ -11,10 +11,10 @@ is auto-detected (docker first, then podman), and overridable via
 `HARNESS_CONTAINER_RUNTIME` in `.env` or the environment.
 
 ```
-agent container ──► ollama ──► proxy ──► upstream API
+agent container ──► proxy ──► upstream API
 
-  • ollama: registers a stub model that forwards via RemoteHost to the proxy
-  • proxy:  translates between ollama's wire format and the upstream's, AND
+  • proxy:  exposes an OpenAI-compatible endpoint opencode talks to directly,
+            translates between that wire format and the upstream's, AND
             injects tool-use instructions / parses tool calls (since the
             upstream doesn't natively support tool calls)
 ```
@@ -73,16 +73,14 @@ rm ~/.local/bin/harness
 harness/
 ├── harness                  management CLI
 ├── harness-install.sh       bootstrap installer (run once after cloning)
-├── docker-compose.yml       services: ollama, proxy, agents
+├── docker-compose.yml       services: proxy, agents
 ├── .env.example             documented env variables (copy to ./.env at the install root)
-├── ollama/                  custom ollama image + entrypoint that registers
-│                            the stub model with RemoteHost set to the proxy
 ├── proxy/                   the translating proxy
 ├── agents/                  agent image (Dockerfile + entrypoint
 │                            with mode dispatch: opencode, shell)
 ├── mcp-registry/            vetted MCP service definitions
 └── scripts/
-    ├── proxy_test.sh        proxy translation tests (incl. ollama RemoteHost forwarding smoke)
+    ├── proxy_test.sh        proxy translation tests (OpenAI-compatible chat-completions)
     ├── harness_test.sh      management script tests
     ├── persistence_test.sh  persistent home + skel-seed test
     ├── mcp_test.sh          MCP install/enable/disable/uninstall lifecycle test
@@ -278,7 +276,7 @@ harness net close <service>             # restore the firewall
 
 `net open` requires you to type the literal phrase `I understand the risks`
 on a TTY prompt — scripts cannot bypass this. `<service>` is one of
-`proxy`, `ollama`, `agent`, or any installed MCP service. State lives in
+`proxy`, `agent`, or any installed MCP service. State lives in
 `<install-root>/.harness-net-overrides.json` (managed by the script;
 override the path via `HARNESS_NET_OVERRIDES_PATH` for tests). Run
 `harness restart` after any mutation to apply it to live containers.
@@ -322,7 +320,6 @@ live inside it; user config and `state/` are gitignored:
 └── state/                      runtime state (gitignored)
     ├── output/                 proxy debug dumps
     ├── agent/home/             shared /home/harness for every agent
-    ├── ollama-data/            ollama model blobs
     └── mcp/<name>/             active MCP services (compose.yml + data)
 ```
 
@@ -338,9 +335,6 @@ $ $EDITOR .env          # fill in PROXY_API_URL / PROXY_API_KEY / DEFAULT_MODEL_
 $ docker compose --env-file .env up --build
 ```
 
-To expose ollama on the host (useful for poking at it from outside the docker
-network), set `PUBLISH_OLLAMA_PORT=11434` in `.env`.
-
 ### Iterating on the proxy
 
 If you're modifying `proxy/proxy.py` to debug or refine its behavior, you
@@ -351,8 +345,8 @@ else:
 docker compose --project-name harness restart proxy
 ```
 
-This picks up your edits in ~10-15 seconds without affecting ollama, agents,
-or MCP services. Faster than `harness restart` for the proxy-iteration loop.
+This picks up your edits in ~10-15 seconds without affecting agents or MCP
+services. Faster than `harness restart` for the proxy-iteration loop.
 
 ## Updating
 
@@ -414,7 +408,6 @@ Files purely user-managed (not in the manifest):
 
 - `.harness-net-overrides.json` — controlled by `harness net open/close`
 - `state/output/` — proxy debug dumps
-- `state/ollama-data/` — model blobs
 - **User-installed skills and `pipx` packages** under `state/agent/home/`
   (e.g., `state/agent/home/.local/bin/graphify`).
   These live entirely inside the bind-mounted agent home and are never

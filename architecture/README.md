@@ -6,21 +6,21 @@ deep-dives that live alongside this file.
 ## What harness is
 
 A container-runtime-based system that lets a coding agent (opencode) talk
-to a third-party API endpoint transparently. The agent runs in a container,
-calls a local ollama instance, and ollama forwards chat requests to a
-translating proxy that calls the upstream API.
+to a third-party API endpoint transparently. The agent runs in a container
+and talks to a translating proxy over an OpenAI-compatible interface; the
+proxy calls the upstream API.
 
 ```
-┌────────────────┐   /api/chat   ┌────────┐   chat-completions   ┌──────────┐
-│ agent          │ ────────────▶ │ ollama │ ───────────────────▶ │ proxy    │ ──▶ upstream API
-│ (opencode)     │               │  stub  │  (RemoteHost=proxy)  │ flask    │
-│                │ ◀──ndjson──── │ model  │ ◀────────────────────│ app      │
-└────────────────┘               └────────┘                      └──────────┘
+┌────────────────┐  /v1/chat/completions  ┌──────────┐
+│ agent          │ ─────────────────────▶ │ proxy    │ ──▶ upstream API
+│ (opencode)     │     (OpenAI-compat)    │ flask    │   (chat-completions)
+│                │ ◀───── SSE / JSON ───── │ app      │
+└────────────────┘                        └──────────┘
 ```
 
-Three long-running services share the `harness-net` bridge network and a
-universal egress firewall: `ollama`, `proxy`, and any enabled MCP
-service. Agents are short-lived containers spawned by `harness` /
+The `proxy` is the only long-running service besides any enabled MCP
+service; both share the `harness-net` bridge network and a universal
+egress firewall. Agents are short-lived containers spawned by `harness` /
 `harness opencode` / `harness shell`; they join the same network for the
 duration of an invocation.
 
@@ -38,7 +38,6 @@ clone. User config and `state/` are gitignored. `harness update` and
 ├── harness-install.sh          bootstrap installer
 ├── docker-compose.yml          service definitions
 ├── proxy/                      translating proxy (Flask)
-├── ollama/                     custom ollama image + stub-model entrypoint
 ├── agents/                     agent image (opencode/shell)
 ├── firewall/                   universal egress firewall + git-creds
 ├── mcp-registry/<name>/        vetted MCP definitions
@@ -50,7 +49,6 @@ clone. User config and `state/` are gitignored. `harness update` and
 └── state/                      gitignored — runtime state
     ├── output/                 proxy debug dumps
     ├── agent/home/             shared /home/harness bind-mounted into every agent
-    ├── ollama-data/            ollama model blobs
     └── mcp/<name>/             active MCP services (compose + data)
 ```
 
@@ -61,17 +59,16 @@ Read the relevant one(s) before changing code in that area:
 - [`harness-cli.md`](harness-cli.md) — the `harness` bash CLI: self-locate,
   env loading, subcommand layout, runtime-override generation, doctor /
   preflight, agent launch path (`docker run` from run_agent / cmd_shell).
-- [`proxy.md`](proxy.md) — `proxy/proxy.py`: ollama ↔ upstream translation,
-  cooperative tool-use prompt variants, tool-call extraction, NDJSON
-  streaming, env-driven config and validation.
+- [`proxy.md`](proxy.md) — `proxy/proxy.py`: OpenAI-compatible ↔ upstream
+  translation, cooperative tool-use prompt variants, tool-call extraction,
+  SSE streaming, env-driven config and validation.
 - [`upstream-api.md`](upstream-api.md) — the third-party chat API the proxy
   calls: observed contract and quirks (no tools, hidden system prompt, no
   network), API-key lock/expiry lifecycle, request/response schema, HTTP
   status codes.
 - [`containers.md`](containers.md) — service composition: `docker-compose.yml`,
-  ollama stub-model registration, agent entrypoint (UID remap, firewall,
-  gosu drop, skel-seed, mode dispatch), `harness-net` + firewall
-  integration.
+  proxy service, agent entrypoint (UID remap, firewall, gosu drop,
+  skel-seed, mode dispatch), `harness-net` + firewall integration.
 - [`mcp.md`](mcp.md) — MCP registry layout, install/enable/disable/uninstall
   state machine, `harness-meta.json` schema, how registry MCPs get merged
   into the runtime compose graph and into the agent's client config.

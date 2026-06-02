@@ -133,7 +133,10 @@ ensure_opencode_config() {
     local default_model="${DEFAULT_MODEL_NAME:-}"
     local provider_name="GenAI Harness"
     local proxy_url="http://proxy:${PROXY_PORT:-8000}/v1"
-    local ctx="${OLLAMA_CONTEXT_LENGTH:-200000}"
+    # One knob — MODEL_CONTEXT_LENGTH — drives both the proxy's token-estimate
+    # cap and opencode's declared context window. Legacy alias
+    # OLLAMA_CONTEXT_LENGTH is still honored so existing .env files keep working.
+    local ctx="${MODEL_CONTEXT_LENGTH:-${OLLAMA_CONTEXT_LENGTH:-200000}}"
 
     # Build the opencode model dropdown from the proxy's /v1/models catalog
     # (a verbatim pass-through of the upstream's OpenAI-format model list), so

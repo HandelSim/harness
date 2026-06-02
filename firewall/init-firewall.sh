@@ -13,7 +13,7 @@
 #      allowlist before applying rules. If absent, the script aborts with a
 #      clear message — the proxy cannot reach upstream otherwise.
 #   5. After firewall is up, /usr/local/bin/configure-git-credentials.sh is
-#      invoked if present (agent containers ship it; proxy/ollama don't).
+#      invoked if present (agent containers ship it; the proxy doesn't).
 #
 # Required packages (Debian-family): iptables, ipset, dnsutils, iproute2,
 #   curl, jq. `aggregate` is optional — its absence triggers a non-aggregated
@@ -139,7 +139,7 @@ iptables -A INPUT  -p tcp --sport 22 -m state --state ESTABLISHED -j ACCEPT
 # --- 6. allow host network ---------------------------------------------------
 #
 # The default route's gateway lives in the host network. Allow that whole /24
-# so containers in the same docker-compose project (proxy, ollama, mcp, etc.)
+# so containers in the same docker-compose project (proxy, mcp, etc.)
 # can talk to each other without each appearing in the allowlist.
 
 DEFAULT_IFACE=$(ip route | awk '$1=="default"{print $5; exit}')
@@ -212,7 +212,7 @@ fi
 # The proxy refuses to start if its upstream LLM API hostname is not in the
 # allowlist. Catches the most common misconfiguration before the user sees
 # opaque connection errors at request time. Other containers either don't set
-# PROXY_API_URL or set it to an intra-cluster name (e.g. http://ollama:11434)
+# PROXY_API_URL or set it to an intra-cluster name (e.g. http://mockupstream:8080)
 # whose hostname is not expected to be in the allowlist — those skip the
 # guardrail.
 
@@ -220,7 +220,7 @@ if [[ -n "${PROXY_API_URL:-}" ]]; then
     api_host=$(echo "$PROXY_API_URL" | awk -F[/:] '{print $4}')
     if [[ -n "$api_host" ]]; then
         # Only enforce for non-intra-cluster hosts. A bare hostname with no
-        # dots (ollama, mockupstream) is intra-cluster and lives behind the
+        # dots (mockupstream) is intra-cluster and lives behind the
         # host-network rule above.
         if [[ "$api_host" == *.* ]]; then
             if ! grep -qE "^[[:space:]]*${api_host}([[:space:]]|#|\$)" "$ALLOWLIST_FILE"; then
@@ -284,7 +284,7 @@ fi
 #
 # configure-git-credentials.sh is intentionally NOT invoked here. Agent
 # entrypoints run it themselves after the gosu drop so `git config --global`
-# writes to /home/harness/.gitconfig rather than /root/.gitconfig. Proxy and
-# ollama don't need it (no git inside those images).
+# writes to /home/harness/.gitconfig rather than /root/.gitconfig. The proxy
+# doesn't need it (no git inside that image).
 
 log "init complete"

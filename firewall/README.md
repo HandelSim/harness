@@ -15,13 +15,13 @@ egress policy and block accidental git pushes:
 
 ## Where they run
 
-Each container's entrypoint invokes `init-firewall.sh` early — for proxy
-and ollama, as the only privileged process; for agents, before the gosu
+Each container's entrypoint invokes `init-firewall.sh` early — for the
+proxy, as the only privileged process; for agents, before the gosu
 drop, so the script runs with `NET_ADMIN`/`NET_RAW`. `init-firewall.sh`
 deliberately does NOT call `configure-git-credentials.sh` itself. Agent
 entrypoints invoke it after the gosu drop so `git config --global` writes
-to `/home/harness/.gitconfig` rather than `/root/.gitconfig`. Proxy and
-ollama skip it entirely (no git inside those images).
+to `/home/harness/.gitconfig` rather than `/root/.gitconfig`. The proxy
+skips it entirely (no git inside that image).
 
 `docker-compose.yml` and the harness CLI both pass `--cap-add NET_ADMIN
 --cap-add NET_RAW` and mount the allowlist read-only.
