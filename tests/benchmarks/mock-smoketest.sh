@@ -3,7 +3,7 @@
 # mock-smoketest.sh — wiring test for the benchmark stack.
 #
 # What this proves (without consuming real API budget):
-#   * docker-compose stack comes up (proxy + ollama + mock-api).
+#   * docker-compose stack comes up (proxy + mock-api).
 #   * bench_apply_scheme reads each schemes/*.json correctly.
 #   * PROXY_PROMPT_MODE actually switches per scheme — the proxy
 #     receives the var and rebuilds prompts accordingly.
@@ -103,15 +103,14 @@ PROXY_PORT=8000
 PROXY_TIMEOUT=30
 OUTPUT_DIR=/output
 PROXY_PROMPT_MODE=user_front
-OLLAMA_VERSION=0.21.2
-OLLAMA_CONTEXT_LENGTH=200000
+MODEL_CONTEXT_LENGTH=200000
 MOCK_LOG_REQUESTS=1
 MOCK_DEFAULT_CONTENT=Task acknowledged. Done.
 HARNESS_ALLOWLIST_PATH=${RUN_DIR}/.harness-allowlist
 EOF
 
 # Minimal allowlist (mock-api is bare hostname, firewall treats as
-# intra-cluster anyway, but the file must exist for proxy/ollama containers).
+# intra-cluster anyway, but the file must exist for the proxy container).
 cat > "${RUN_DIR}/.harness-allowlist" <<'EOF'
 # mock-smoketest allowlist — intentionally minimal.
 mock-api
@@ -139,7 +138,7 @@ trap cleanup EXIT
 
 # --- bring up the stack ------------------------------------------------------
 echo "[mock-smoketest] starting stack (project=${PROJECT})..."
-(cd "${REPO_ROOT}" && docker compose "${COMPOSE_ARGS[@]}" up -d --build mock-api proxy ollama) >"${RUN_DIR}/compose-up.log" 2>&1 || {
+(cd "${REPO_ROOT}" && docker compose "${COMPOSE_ARGS[@]}" up -d --build mock-api proxy) >"${RUN_DIR}/compose-up.log" 2>&1 || {
     echo "[mock-smoketest] FAIL: compose up failed; see ${RUN_DIR}/compose-up.log"
     tail -40 "${RUN_DIR}/compose-up.log" >&2
     exit 1
@@ -169,7 +168,7 @@ echo "[mock-smoketest] proxy=$proxy_h mock=$mock_h"
 #   1. Apply the scheme's env (rewrite .env.mock's PROXY_PROMPT_MODE).
 #   2. Restart proxy so it re-reads the env.
 #   3. Truncate the mock's log marker so we count only this scheme's reqs.
-#   4. Send a fixed ollama-format request through the proxy.
+#   4. Send a fixed OpenAI-format request through the proxy.
 #   5. Capture what the mock received — body shape proves the prompt mode.
 declare -A SCHEME_OK
 declare -A SCHEME_MODE
@@ -210,9 +209,11 @@ for scheme in "${SCHEMES[@]}"; do
     # identify only this scheme's new file afterward.
     before_dump=$(ls -t "${REPO_ROOT}/state/output"/*_02_API_Request.json 2>/dev/null | head -1)
 
-    # Send a representative ollama /api/chat request through the proxy.
-    # The proxy's ollama handler accepts this shape; output JSON contains
-    # what the mock would have seen (we'll grep the mock log directly).
+    # Send a representative OpenAI /v1/chat/completions request through the proxy.
+    # We exec curl from inside the proxy container (localhost:8000 is the proxy
+    # itself). Saves binding a host port and keeps the test fully internal.
+    # The forwarded upstream body (inspected via state/output dump + mock log)
+    # is what proves prompt-mode switching; the response body is not parsed.
     req_body=$(cat <<'JSON'
 {
   "model": "GenAI",
@@ -232,15 +233,13 @@ for scheme in "${SCHEMES[@]}"; do
 }
 JSON
 )
-    # We exec curl from inside the ollama container (it's on harness-net
-    # already). Saves binding a host port and keeps the test fully internal.
     resp_file="${RUN_DIR}/${scheme}.proxy-response.json"
-    if docker exec "${PROJECT}-ollama-1" curl -fsS -X POST \
+    if docker exec "${PROJECT}-proxy-1" curl -fsS -X POST \
             -H 'content-type: application/json' \
             --data "${req_body}" \
-            http://proxy:8000/api/chat \
+            http://127.0.0.1:8000/v1/chat/completions \
             -o /tmp/proxy-resp.json 2>>"${RUN_DIR}/${scheme}.curl-stderr.log"; then
-        docker cp "${PROJECT}-ollama-1:/tmp/proxy-resp.json" "${resp_file}" 2>/dev/null || true
+        docker cp "${PROJECT}-proxy-1:/tmp/proxy-resp.json" "${resp_file}" 2>/dev/null || true
         SCHEME_OK[$scheme]="yes"
         echo "  ✓ proxy returned 200"
     else

@@ -85,7 +85,7 @@ trap cleanup EXIT INT TERM
 
 if ! harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
     echo "[persist] building harness-agent (image not cached)"
-    # Build context only — we don't need ollama/proxy services for this
+    # Build context only — we don't need proxy/agent services for this
     # test, so we skip --env-file and the up dance.
     harness_docker compose \
         --project-name "${PROJECT_NAME}" \
@@ -106,7 +106,7 @@ fi
 # command so the test exercises the same mechanics.
 #
 # Why not run the real entrypoint? Because the entrypoint always tries to
-# launch the agent (opencode), which requires a live ollama. Bypassing keeps
+# launch the agent (opencode), which requires a live proxy. Bypassing keeps
 # the test focused.
 # Shared wrapper: launch the harness-agent image with /home/harness bind-mounted
 # to a caller-chosen host path, and remap the in-container `harness` user's

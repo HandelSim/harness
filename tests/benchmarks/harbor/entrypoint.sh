@@ -10,7 +10,7 @@
 # harbor's backend or anywhere else harbor might decide to call.
 #
 # This entrypoint enforces that by running the universal harness firewall
-# (same init-firewall.sh used by proxy/ollama/agents) before harbor ever
+# (same init-firewall.sh used by proxy/agents) before harbor ever
 # starts. The firewall:
 #   - Reads /etc/harness/allowlist (bind-mounted from .harness-allowlist
 #     by harbor.sh).

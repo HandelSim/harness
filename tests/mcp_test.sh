@@ -92,9 +92,7 @@ PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
-OLLAMA_VERSION=0.21.2
-OLLAMA_CONTEXT_LENGTH=200000
-PUBLISH_OLLAMA_PORT=
+MODEL_CONTEXT_LENGTH=200000
 EOF
 
 # Firewall allowlist. The .env above points PROXY_API_URL at
@@ -318,12 +316,12 @@ echo "[mcp] T5 OK"
 # --profile mcp. We emit it via compose's verbose output indirectly — the
 # easiest signal is that the test_mcp container is up.
 echo "[mcp] T6: services up after start"
-ollama_cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
+proxy_cid=$(harness_docker compose --project-name "${PROJECT_NAME}" \
     -f "${REPO_ROOT}/docker-compose.yml" \
     -f "${FAKE_INSTALL_ROOT}/state/mcp/_test_mcp/compose.yml" \
-    ps -q ollama 2>/dev/null || true)
-if [[ -z "${ollama_cid}" ]]; then
-    echo "[mcp] T6 FAIL: ollama container not present (unrelated regression?)" >&2
+    ps -q proxy 2>/dev/null || true)
+if [[ -z "${proxy_cid}" ]]; then
+    echo "[mcp] T6 FAIL: proxy container not present (unrelated regression?)" >&2
     exit 1
 fi
 echo "[mcp] T6 OK"

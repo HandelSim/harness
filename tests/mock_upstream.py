@@ -57,9 +57,9 @@ PORT = int(os.environ.get("MOCK_PORT", "9000"))
 FIXTURES_DIR = os.environ.get("MOCK_FIXTURES_DIR", "").strip()
 
 # Models advertised on GET /v1/models. Comma-separated ids; the proxy's
-# /v1/models route forwards here and ollama registers a stub per id. Defaults
-# to the single id the full-stack tests use as DEFAULT_MODEL_NAME so discovery
-# is a no-op for them; a test exercising multi-model discovery overrides it.
+# /v1/models route forwards here. Defaults to the single id the full-stack
+# tests use as DEFAULT_MODEL_NAME so discovery is a no-op for them; a test
+# exercising multi-model discovery overrides it.
 MOCK_MODELS = [
     m.strip() for m in os.environ.get("MOCK_MODELS", "harness").split(",") if m.strip()
 ]

@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 388 IDs (F=146, P=58, A=24, M=23, N=30, U=29, Pe=17, O=16, I=45).
+Inventory total: 372 IDs (F=146, P=58, A=24, M=23, N=30, U=29, Pe=16, O=0, I=44).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -19,12 +19,12 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   upgrade flags, update check, platform.sh primitives. Sources the wrapper under
   `HARNESS_SOURCE_ONLY=1` and stubs `ensure_services_up` for non-docker tests.
   Track-D strengthening: F015 (T19b), F042 (T3), F072 (T11 extra chars), F131/F133
-  (T19c), F022 (T23.4b), O003/O009 (T3 log scrape).
+  (T19c), F022 (T23.4b).
 - `tests/full_pipeline_test.sh` — end-to-end install → start → agent (bare + opencode)
   print → mcp install/start/uninstall → down → update. Uses bundled mock_upstream sidecar.
   Track-D strengthening: I009/I012/I024/F006/I005 (T1+T2 source-level greps), F139
   (T5 firewall banner silence), F026/F135/Pe010 (T5 generator-header check),
-  Pe005 (T5 ollama-data non-empty), A007/A024 (T9 uid-owned marker + token literal),
+  A007/A024 (T9 uid-owned marker + token literal),
   A031 (T10 strip + entrypoint grep), F031 (T14 git-pull literal + ff-only message).
 - `tests/proxy_test.sh` (514 lines) — proxy round-trip black-box (Scenarios A-F) AND
   delegates to `proxy/test_proxy.py` via `python -m unittest`. Track-D added Scenario F:
@@ -33,13 +33,12 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   `extract_tool_calls_and_text`, `_scan_balanced_json`, `translate_history_and_apply_prompt`,
   `make_chunk`, prompt-injection modes, system→user rewrite, usage override.
 - `tests/scheme_contract_test.sh` (456 lines, Track E) — per-scheme proxy contract test.
-  Brings up ollama + proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
-  a probe through ollama; asserts forwarded-body structure. Covers P010, P013, P014, P015,
-  P016, P017, P018 with direct upstream-body assertions (closes scheme-emission red gaps
-  that were previously only proxied through python unittests).
+  Brings up proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
+  a probe through the proxy's OpenAI-compatible interface; asserts forwarded-body structure.
+  Covers P010, P013, P014, P015, P016, P017, P018 with direct upstream-body assertions
+  (closes scheme-emission red gaps that were previously only proxied through python unittests).
 - `tests/firewall_test.sh` (324 lines) — Phase 2 negative (blocked PROXY_API_URL hostname
-  is fatal) and Phase 3 bypass (`HARNESS_FIREWALL_DISABLED=1` per-service). Track-D added
-  O001 ordering assertions in Phase 3 via ollama-log scraping.
+  is fatal) and Phase 3 bypass (`HARNESS_FIREWALL_DISABLED=1` per-service).
 - `tests/integration_test.sh` (900 lines, gated `HARNESS_RUN_SLOW=1`) — Serena MCP,
   Graphify pipx, `--mount` rejection paths.
 - `tests/mcp_test.sh` (742 lines) — MCP lifecycle (list/install/enable/disable/up/down/
@@ -59,10 +58,10 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   252 |   65.6% |
-| yellow   |     5 |    1.3% |
-| red      |   127 |   33.1% |
-| **total**|   384 |  100.0% |
+| green    |   243 |   66.3% |
+| yellow   |     5 |    1.4% |
+| red      |   118 |   32.2% |
+| **total**|   366 |  100.0% |
 
 Per-prefix breakdown:
 
@@ -74,9 +73,9 @@ Per-prefix breakdown:
 | M      |    23 |    18 |      0 |   5 |
 | N      |    30 |     6 |      0 |  24 |
 | U      |    29 |    22 |      0 |   7 |
-| Pe     |    17 |    14 |      1 |   2 |
-| O      |    16 |     7 |      0 |   9 |
-| I      |    45 |    29 |      1 |  15 |
+| Pe     |    16 |    13 |      1 |   2 |
+| O      |     0 |     0 |      0 |   0 |
+| I      |    44 |    28 |      1 |  15 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -100,7 +99,7 @@ Carried over from Track C:
 - **F056** (`harness list` empty case) — `tests/harness_test.sh:258`
 - **M003** (post-install `harness-meta.json` shape) — `tests/mcp_test.sh:255`
 - **U003** (envfile_merge appends new keys) — `tests/upgrade_test.sh:86`
-- **P035** (`toolu_` tool-call id prefix) — `proxy/test_proxy.py:70`
+- **P035** (`call_` tool-call id prefix) — `proxy/test_proxy.py:2902-2942`
 
 ---
 
@@ -138,14 +137,14 @@ non-green rows — the gap.
 | F020 | green  | tests/harness_test.sh:1252-1268             | T23 up-to-date branch: stubs ls-remote to echo current HEAD, asserts `grep -q 'up to date'`. | |
 | F021 | green  | tests/harness_test.sh:1158-1184             | T23: asserts `update available` notice contains the simulated remote SHA. | |
 | F022 | green  | tests/harness_test.sh:1402-1424             | T23.4b removes cache + points origin at unreachable path, invokes `harness check-updates`, asserts rc != 0 AND `grep -qi 'could not reach origin/main'` diagnostic. | |
-| F023 | green  | tests/harness_test.sh:225-252               | T1: after `harness start`, both proxy and ollama report `"healthy"` via `docker inspect`. Mirrored in full_pipeline_test.sh:230-347 phases. | |
+| F023 | green  | tests/harness_test.sh:225-252               | T1: after `harness start`, proxy reports `"healthy"` via `docker inspect`. Mirrored in full_pipeline_test.sh:230-347 phases. | |
 | F024 | green  | tests/harness_test.sh:1041-1067             | Same T20 evidence as F013. | |
 | F025 | red    | —                                           | —                                                                                                     | No test sets a net-override and asserts `start` prints the warning banner. (`warn_if_firewall_open` is only tested via help mention.) |
 | F026 | green  | tests/full_pipeline_test.sh:326-336         | T5: if `state/.harness-runtime.yml` is present, asserts `grep -q '^# Generated by harness; do not edit\.'` — proves it's the generated artifact, not stale. (When the override body is empty the writer removes the file; either branch passes documented contract.) | |
 | F027 | green  | tests/harness_test.sh:146-305               | T0 calls `_gate_on_upstream_auth` with a stubbed `_probe_upstream_auth` returning 1 (401); asserts function aborts with `exit 1`. T0.4 additionally drives the real probe with a locked-key fixture and asserts the unlock URL appears in the printed banner. | |
 | F028 | green  | tests/harness_test.sh:286-297               | T4 invokes `harness down`, then `docker ps --filter` count must be 0 for the project. | |
-| F029 | green  | tests/full_pipeline_test.sh:579-597         | T13 down + verify `state/agent/home/.harness-home-initialized` still present and `state/ollama-data/` not empty. | |
-| F030 | green  | tests/harness_test.sh:732-748               | T12 invokes `harness restart`; afterwards both proxy and ollama are healthy. | |
+| F029 | green  | tests/full_pipeline_test.sh:579-597         | T13 down + verify `state/agent/home/.harness-home-initialized` still present. | |
+| F030 | green  | tests/harness_test.sh:732-748               | T12 invokes `harness restart`; afterwards proxy is healthy. | |
 | F031 | green  | tests/full_pipeline_test.sh:707-727         | T14 asserts output negates `'rejected\|non-fast-forward\|merge conflict\|cannot fast-forward'` AND contains `'Already up to date\|fast.forward'` AND source-greps the installed wrapper for the literal `git pull --ff-only`. | |
 | F032 | red    | —                                           | —                                                                                                     | No test dirties the working tree and asserts `harness update` refuses. |
 | F033 | green  | tests/harness_test.sh:800-854               | T16 invokes `harness upgrade --check` against a manifest, parses output for planned actions; asserts manifest entries enumerated. | |
@@ -159,8 +158,8 @@ non-green rows — the gap.
 | F140 | green  | tests/upgrade_test.sh:836-871               | T12: `_upgrade_confirm "test? " n <<<""` returns rc 1 (Enter aborts); `<<<"y"` returns 0; default-y cases assert `""`→0, `n`→1 (back-compat). | |
 | F141 | green  | tests/upgrade_test.sh:721-834               | T11: real origin+clone git fixtures — diverged (ahead+behind)→rc 0; up-to-date / behind-only / ahead-only / no-upstream→rc 1. | |
 | F142 | yellow | tests/upgrade_test.sh:721-871               | Decision logic covered via building blocks (T11 `_git_branches_diverged` + T12 default-N `_upgrade_confirm`); the end-to-end `_upgrade_pull_or_reset` (reset-on-divergence, --no-prompt abort) is not driven through its TTY path in CI. | The TTY/`reset --hard` path is exercised manually, not in the unit suite. |
-| F041 | green  | tests/harness_test.sh:268-282               | T3: `timeout 5 ${HARNESS_WRAPPER} logs ollama` produces output containing `ollama` or `serve`. | |
-| F042 | green  | tests/harness_test.sh:283-313               | T3 now runs `timeout 5 ${HARNESS_BIN} logs` (no service), asserts rc 0/124, no parse-error message, AND both `'ollama'` and `'proxy'` appear in the captured output (compose prefixes each line with the service name when no service is given). | |
+| F041 | green  | tests/harness_test.sh:268-282               | T3: `timeout 5 ${HARNESS_WRAPPER} logs proxy` produces output containing `proxy`-service log lines. | |
+| F042 | green  | tests/harness_test.sh:283-313               | T3 now runs `timeout 5 ${HARNESS_BIN} logs` (no service), asserts rc 0/124, no parse-error message, AND `'proxy'` appears in the captured output (compose prefixes each line with the service name when no service is given). | |
 | F043 | green  | tests/full_pipeline_test.sh T9 + harness_test.sh T30 | T9: bare `harness -p "<prompt>"` produces `Hello from mock upstream` (option C → opencode); T30 asserts bare/flag dispatch routes to opencode. | |
 | F044 | green  | tests/full_pipeline_test.sh:391-417         | T10: `harness opencode -p "<prompt>"` produces a non-empty response with skip-on-auth-fail. | |
 | F045 | red    | —                                           | —                                                                                                     | No test invokes `harness shell` (interactive TTY makes this hard to assert non-trivially). |
@@ -182,7 +181,7 @@ non-green rows — the gap.
 | F148 | green  | tests/harness_test.sh:T32                    | T32.3: checked out on the earliest tag `v0.1`, `_downgrade_target_tag` exits non-zero with empty output (#85). | |
 | F149 | green  | tests/harness_test.sh:T32                    | T32.4 pipes `n` → `cmd_downgrade --no-restart` exits non-zero and HEAD is unchanged; T32.5 pipes `y` → HEAD is `git reset --hard`'d to `v1.0` (require_docker stubbed; #85). | |
 | F056 | green  | tests/harness_test.sh:256-262               | T2: `[[ "${list_out}" != "no harness agents running" ]]` then fails; expectation is the LHS literal. Re-asserted in full_pipeline_test.sh:353,382. | |
-| F057 | red    | —                                           | —                                                                                                     | No test starts an agent then calls `harness stop` and verifies proxy/ollama remain. |
+| F057 | red    | —                                           | —                                                                                                     | No test starts an agent then calls `harness stop` and verifies proxy remains. |
 | F058 | red    | —                                           | —                                                                                                     | No test invokes `harness stop <name>`. |
 | F059 | red    | —                                           | —                                                                                                     | No test forces multiple agent containers to exist to exercise `pick_agent` prompting. |
 | F060 | red    | —                                           | —                                                                                                     | No test asserts `pick_agent` non-interactive single-agent path. |
@@ -223,12 +222,12 @@ non-green rows — the gap.
 | F096 | green  | tests/harness_test.sh:513-591               | T8/T9: `'\\[install\\]'` section present with install-root path. | |
 | F097 | green  | tests/harness_test.sh:1100-1118             | T22 + doctor T8/T9: `[config]` section reports `.env` parseable / allowlist parseable. | |
 | F098 | green  | tests/harness_test.sh:773-790               | T15: doctor `[network]` section + `allowlist` keyword. | |
-| F099 | green  | tests/harness_test.sh:533-555               | T8 verifies `[storage]` block lists state/output, state/agent/home, state/ollama-data with writable status. | |
+| F099 | green  | tests/harness_test.sh:533-555               | T8 verifies `[storage]` block lists state/output, state/agent/home with writable status. | |
 | F100 | green  | tests/full_pipeline_test.sh (T1b)           | T1b runs the installer with `HTTPS_PROXY` exported and asserts the value is persisted into the install root `.env` (then scrubs it). | |
 | F101 | green  | tests/harness_test.sh (T7b)                 | T7b drives a fake runtime via `harness_docker`/`harness_docker_exec` with all four proxy spellings exported and asserts all four appear in the recorded runtime env (so `compose build`/BuildKit inherits them). | |
 | F102 | yellow | tests/harness_test.sh (T7b)                 | Exercised indirectly: T7b exports both upper/lower spellings; the mirror runs at harness env-load (not asserted in isolation). | |
 | F100 | green  | tests/harness_test.sh:557-572               | T8: `grep -Eq '(docker\|podman)\\s+runtime[[:space:]]+reachable'`. | |
-| F101 | green  | tests/harness_test.sh:574-585               | T8: `[images]` section asserted; image presence + age lines printed for proxy/ollama/agents. | |
+| F101 | green  | tests/harness_test.sh:574-585               | T8: `[images]` section asserted; image presence + age lines printed for proxy/agents. | |
 | F102 | green  | tests/harness_test.sh:580-591 + mcp_test.sh:396-411 | doctor `[mcp]` section; mcp_test T8 verifies status reports `state: installed-enabled`. | |
 | F103 | green  | tests/harness_test.sh:587-591               | T9 `[agents]` block (none-running case asserted). | |
 | F104 | green  | tests/harness_test.sh:1041-1067             | T20: `harness preflight` errors if `.env` missing AND mentions missing command(s). | |
@@ -274,14 +273,14 @@ non-green rows — the gap.
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
 | P001 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `curl /health` returns 200 with `{"status":"ok"}` (precondition before round-trip). | |
-| P002 | green  | tests/proxy_test.sh:253-285                 | Scenario B posts to `/api/chat` (catch-all) and gets a forwarded chat-completions response. | |
+| P002 | green  | tests/proxy_test.sh:253-285                 | Scenario B posts to `/v1/chat/completions` (catch-all) and gets a forwarded chat-completions response. | |
 | P003 | green  | tests/proxy_test.sh:469-475                 | Scenario F captures proxy logs and asserts `grep -qE 'listening on:[[:space:]]+0\.0\.0\.0:8000'` — direct evidence PROXY_HOST env was consumed by the bind. | |
 | P004 | green  | tests/proxy_test.sh:475-479                 | Scenario F same banner asserts the `:8000` suffix on the listening line — PROXY_PORT env was consumed. | |
 | P005 | green  | tests/proxy_test.sh:218-285 + test_proxy.py via env | Test env sets `PROXY_API_URL` and asserts forwarded body lands at mock upstream. | |
 | P006 | green  | tests/proxy_test.sh:480-490                 | Scenario F sets `PROXY_API_KEY=test-key-1234`, asserts banner shows redacted form `test...1234` AND raw key is NOT printed (regression guard against accidental key leak). | |
 | P007 | green  | proxy/test_proxy.py (TestModelPassthrough)  | test_missing_model_falls_back_to_default asserts the proxy forwards `DEFAULT_MODEL_NAME` when the request omits a model. | |
 | P008 | yellow | tests/proxy_test.sh:56                      | `PROXY_TIMEOUT=30` set; no assertion on actual timeout behavior. | No test simulates a slow upstream to exercise the timeout. |
-| P009 | green  | proxy/test_proxy.py:584-598                 | TestMakeChunk.test_done_chunk_includes_stats asserts `prompt_eval_count` is overridden using context length env. | |
+| P009 | green  | proxy/test_proxy.py:2448-2480               | `test_prompt_tokens_overridden_with_local_estimate` asserts the proxy replaces upstream `prompt_tokens` with its local estimate, which `_estimate_tokens` caps at `MODEL_CONTEXT_LENGTH` (proxy.py:1362; legacy alias `OLLAMA_CONTEXT_LENGTH`). The env knob itself is config-only — no test flips the var and re-reads the cap. | |
 | P010 | green  | proxy/test_proxy.py:601-771 + tests/scheme_contract_test.sh | TestPromptInjectionModes covers `hybrid` as default via test_default_mode_is_hybrid (PROXY_PROMPT_MODE absent → hybrid). The scheme contract test adds end-to-end assertions for each cooperative scheme (`user_front`, `hybrid`) via mock-upstream body capture, re-injecting the mode through its own compose override. | |
 | P011 | green  | proxy/test_proxy.py:774-919                 | TestChangeSystemToUser stubs the now-hardcoded constant via `patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True)`; the env-parse path was removed with `_setup_change_system_to_user`. | |
 | P012 | green  | tests/proxy_test.sh:491-507                 | Scenario F asserts `grep -qE 'debug dumps:[[:space:]]+disabled \(OUTPUT_DIR not set\)'` — proxy banner reports OUTPUT_DIR consumption explicitly. | |
@@ -301,10 +300,10 @@ non-green rows — the gap.
 | P029 | green  | proxy/test_proxy.py:876-895                 | test_coalesced_tool_results_each_delimited: two tool-result-derived user messages coalesce into one, each keeping its own markers. | |
 | P030 | green  | proxy/test_proxy.py:780-811                 | test_change_system_to_user_converts_system_to_user: system role rewritten to user. | |
 | P031 | green  | proxy/test_proxy.py:780-811                 | Same test asserts an assistant stub `"I understand the instructions above."` is inserted. | |
-| P032 | green  | proxy/test_proxy.py:572-583                 | test_streaming_chunk_no_done_reason: ollama-shaped JSON without `done_reason`. Re-asserted in proxy_test.sh:218-249. | |
-| P033 | green  | proxy/test_proxy.py:584-598                 | test_done_chunk_includes_stats: final chunk has `done: True`, `done_reason: "stop"`. Re-asserted in proxy_test.sh Scenario D. | |
-| P034 | green  | proxy/test_proxy.py:922-1013                | TestUsageOverride: done chunk includes `prompt_eval_count`+ `eval_count` derived from upstream or local estimate. | |
-| P035 | green  | proxy/test_proxy.py:50-95                   | test_tool_call_emits_id_field + test_tool_call_ids_are_unique: ids `startswith("toolu_")`, unique. Re-asserted Scenario E line 432. | |
+| P032 | green  | proxy/test_proxy.py:2884-2900               | test_sse_text_only_stream: every chunk has `object == "chat.completion.chunk"`. Re-asserted in proxy_test.sh Scenario G (line 593). | |
+| P033 | green  | proxy/test_proxy.py:2876-2900               | test_sse_text_only_stream: `_sse_chunks` (line 2877) asserts the stream's last line is `data: [DONE]` and the final chunk's `finish_reason == "stop"`; test_v1_chat_completions_streams_sse (2967) asserts the response ends with `data: [DONE]`. Re-asserted in proxy_test.sh Scenario G (line 591). | |
+| P034 | green  | proxy/test_proxy.py:2884-2900               | test_sse_text_only_stream: a trailing usage chunk (empty `choices`, `usage` with `prompt_tokens`/`completion_tokens`/`total_tokens`) is emitted; test_sse_tool_calls_arguments_are_json_strings (line 2923) asserts NO usage chunk when usage is omitted. | |
+| P035 | green  | proxy/test_proxy.py:2902-2942               | test_sse_tool_calls_arguments_are_json_strings: each tool_call carries a truthy `id` and ascending `index`; test_build_openai_response_non_streaming (2931) asserts the non-stream shape. proxy_test.sh Scenario E (line 488) asserts both ids start with `call_` and are unique. | |
 | P036 | green  | proxy/test_proxy.py:982-1013                | test_completion_tokens_falls_back_to_estimate_when_missing: when upstream omits completion_tokens, local estimate used. | |
 | P037 | red    | —                                           | —                                                                                                     | No test forces upstream 401 and asserts unlock URL printed + 401 forwarded. |
 | P038 | red    | —                                           | —                                                                                                     | No test for 403. |
@@ -312,16 +311,16 @@ non-green rows — the gap.
 | P040 | red    | —                                           | —                                                                                                     | No test for upstream 5xx. |
 | P041 | red    | —                                           | —                                                                                                     | No test for upstream connection failure -> 502. |
 | P042 | red    | —                                           | —                                                                                                     | No test for upstream non-JSON -> 502. |
-| P043 | red    | —                                           | —                                                                                                     | No test reads back `01_Ollama_Request_*` dump files. |
+| P043 | red    | —                                           | —                                                                                                     | No test reads back `01_Inbound_Request_*` dump files. |
 | P044 | red    | —                                           | —                                                                                                     | No test reads back `02_API_Request_*` dump files. |
 | P045 | red    | —                                           | —                                                                                                     | No test reads back `03_API_Response_*` dump files. |
 | P046 | red    | —                                           | —                                                                                                     | No test reads back `03_API_Error_*` dump files. |
-| P047 | red    | —                                           | —                                                                                                     | No test reads back `04_NDJSON_Response_*` dump files. |
+| P047 | red    | —                                           | —                                                                                                     | No test reads back `04_OpenAI_Response_*` / `04_OpenAI_SSE_Response_*` dump files. |
 | P048 | red    | —                                           | —                                                                                                     | No test reads back `99_Fatal_Error_*` dump files. |
 | P049 | red    | —                                           | —                                                                                                     | No test reads back dump filenames (monotonic counter pattern). |
-| P050 | green  | tests/proxy_test.sh:496-507                 | Scenario F asserts proxy logs DO NOT contain `'failed to save debug file'` AND DO NOT contain `OUTPUT_DIR '' is not writable` — silence is hard-asserted, not implied. | |
-| P051 | green  | tests/proxy_test.sh:356-369                 | Scenario D: streaming request yields multi-line NDJSON; `D_LINE_COUNT >= 2`, final line has `"done":true`. | |
-| P052 | green  | tests/proxy_test.sh:218-249                 | Scenario A: non-stream request produces ONE content chunk + done chunk (NDJSON 2 lines). | |
+| P050 | green  | tests/proxy_test.sh:556-566                 | Scenario F asserts proxy logs DO NOT contain `'failed to save debug file'` AND DO NOT contain `OUTPUT_DIR '' is not writable` — silence is hard-asserted, not implied. | |
+| P051 | green  | tests/proxy_test.sh:582-597                 | Scenario G: streaming request yields OpenAI SSE `data:` lines with `chat.completion.chunk` objects, terminated by `data: [DONE]` (also proxy/test_proxy.py `test_sse_text_only_stream`:2884, `test_v1_chat_completions_streams_sse`:2967). | |
+| P052 | green  | tests/proxy_test.sh:232-250                 | Scenario A: non-stream request produces a single `chat.completion` JSON object (`finish_reason:stop`); also proxy/test_proxy.py `test_build_openai_response_non_streaming`:2931. | |
 | P053 | green  | proxy/test_proxy.py:837-874                 | TestToolResultDelimiting: tool messages wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers across every prompt mode; content never parsed. | |
 | P054 | green  | proxy/test_proxy.py:26-49 + 96-131          | test_top_level_schema_emitted + test_format_tools_includes_nested_schema confirm tools section format. Cooperative prompt content asserted indirectly via Scenario C body check. | |
 | P055 | green  | proxy/test_proxy.py:26-131                  | TestFormatTools asserts each tool's name, schema, and arguments enumerated. | |
@@ -329,14 +328,14 @@ non-green rows — the gap.
 | P057 | green  | proxy/test_proxy.py:939-1004                | test_tool_result_name_resolved_via_tool_call_id / _falls_back_to_positional_order / _prefers_explicit_field / _unknown_when_no_metadata: name resolution chain (field → id → positional → `unknown_tool`). | |
 | P058 | green  | proxy/test_proxy.py (TestHybridDetailTools) | test_detail_block_emitted_for_flagged_task_tool asserts `<<<BEGIN_TOOL_DETAIL name="task">>>` + verbatim agent types reach the last user message; _sits_after_reminder_outside_user_message_wrap asserts ordering; _no_detail_block_for_unflagged_tool / _only_for_present_flagged_tools / _empty_flagged_set_disables_detail_blocks cover the gating; test_detail_tools_is_project_managed_constant asserts `_HYBRID_DETAIL_TOOLS == ["task","skill"]` (the env-parse tests were removed with `_setup_hybrid_detail_tools`). | |
 | P059 | green  | proxy/test_proxy.py:test_mode_hybrid_reminder_advises_default_to_tools (+_concurrent_task_agents/_has_honesty_rules/_has_environment_context/_drops_stale_value_parenthetical/_injects_known_host_os/_omits_host_os_when_unknown) | Asserts the labelled recency reminder: Workflow line (prefer a listed tool + `webfetch`/`todowrite`/`todoread` + concurrent `task` agents), Honesty line (anti-fabrication), Environment line (Linux container / mounted workdir / reproducibility), the dropped stale "which agent types…" parenthetical, host-OS parenthetical rendered when `_HOST_OS` set and omitted when empty, and that guidance sits OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap. TestHostOsSetup covers `HARNESS_HOST_OS` parse/normalise/default. | |
-| P060 | green  | tests/proxy_test.sh (Scenario A2)            | Scenario A2 GETs `http://proxy:8000/v1/models` from inside ollama and asserts the response lists the mock model `harness` and is an OpenAI `"object":"list"` envelope. | |
+| P060 | green  | tests/proxy_test.sh (Scenario A2)            | Scenario A2 GETs `http://proxy:8000/v1/models` from the agent container and asserts the response lists the mock model `harness` and is an OpenAI `"object":"list"` envelope. | |
 | P061 | green  | proxy/test_proxy.py (TestConfigHelpers)      | test_normalize_* asserts `_normalize_api_base` strips `/v1/chat/completions`, `/chat/completions`, and a trailing `/v1` (and preserves a non-`/v1` prefix); chat/models URLs derive from the base. | |
 
 ## A — Agent runtime (init, configs, run-opencode/shell) (22 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
-| A001 | green  | tests/firewall_test.sh:200-261              | Phase 3 verifies that without `HARNESS_FIREWALL_DISABLED=1`, ollama's OUTPUT policy remains DROP — proving the firewall script ran. | |
+| A001 | green  | tests/firewall_test.sh:200-261              | Phase 3 verifies that without `HARNESS_FIREWALL_DISABLED=1`, the agent container's OUTPUT policy remains DROP — proving the firewall script ran. | |
 | A002 | green  | tests/firewall_test.sh:213-228              | Phase 3: `grep -q 'DISABLED via HARNESS_FIREWALL_DISABLED=1'` confirms skip + warning. | |
 | A003 | green  | tests/integration_test.sh:460-573 + persistence_test.sh:191-245 | Graphify phase: `stat -c '%u' = $(id -u)` proves UID remap; persistence T3 asserts pip-installed files are owned by host UID. | |
 | A004 | green  | tests/persistence_test.sh:155-176 + 255-276 | T1 stat's `.harness-home-initialized` and asserts both `%g == host gid` and `%u == host uid`; T3 stat's the pip-installed `requests` package directory and asserts the same paired uid+gid match — catches identity-mismatch regressions where only one half of remap is correct. | |
@@ -347,10 +346,10 @@ non-green rows — the gap.
 | A009 | green  | tests/persistence_test.sh:137-155 + full_pipeline_test.sh:444-462 | T1 + T15: `.harness-home-initialized` marker written; `seeded_count >= 2` after first run. | |
 | A010 | red    | —                                           | —                                                                                                     | No test sets `HARNESS_HOST_CWD` and asserts the agent `cd`'d into it. |
 | A018 | green  | tests/full_pipeline_test.sh (T9)            | T9 boots opencode via bare `harness -p`; the entrypoint runs `ensure_opencode_config` before exec'ing the agent, so the test asserts `state/agent/home/.config/opencode/opencode.json` exists in the shared home AND carries the harness provider block (`"harness"`) + model binding (`"model": "harness/`). Holds even on the opencode provider-auth skip, since the config write precedes the agent run. | |
-| A019 | red    | —                                           | —                                                                                                     | No test asserts opencode config has a `harness` provider pointing at ollama. |
+| A019 | red    | —                                           | —                                                                                                     | No test asserts opencode config has a `harness` provider pointing at the proxy endpoint. |
 | A020 | red    | —                                           | —                                                                                                     | No test asserts opencode config defines a `yolo` agent profile. |
 | A035 | green  | tests/full_pipeline_test.sh:T9              | T9 asserts the launched opencode.json carries `"name": "GenAI Harness"` (the fixed provider name hardcoded in the entrypoint). | |
-| A036 | green  | tests/full_pipeline_test.sh:T9              | T9 asserts opencode.json carries a model entry `"name": "harness"` — the model discovered via the proxy `/v1/models` route and read from ollama `/api/tags`, distinct from the provider whose name is `GenAI Harness`. | |
+| A036 | green  | tests/full_pipeline_test.sh:T9              | T9 asserts opencode.json carries a model entry `"name": "harness"` — the model discovered via the proxy `GET /v1/models` route, distinct from the provider whose name is `GenAI Harness`. | |
 | A021 | red    | —                                           | —                                                                                                     | No test asserts opencode mcp-servers merge happens. |
 | A022 | red    | —                                           | —                                                                                                     | No test asserts local vs remote mcp distinction in opencode shape. |
 | A028 | red    | —                                           | —                                                                                                     | No test asserts `OPENCODE_DISABLE_AUTOUPDATE=1`. |
@@ -409,7 +408,7 @@ non-green rows — the gap.
 | N014 | red    | —                                           | —                                                                                                     | No test that asserts full-line comments are skipped. |
 | N015 | red    | —                                           | —                                                                                                     | No test inspects rules for the ESTABLISHED,RELATED match. |
 | N016 | red    | —                                           | —                                                                                                     | No test inspects rules for the REJECT `icmp-admin-prohibited`. |
-| N017 | green  | tests/firewall_test.sh:248-258 + podman_smoke_test.sh:181-194 | Phase 3: ollama OUTPUT policy STILL `-P OUTPUT DROP` even with proxy bypass. Podman smoke T3 repeats the assertion under rootless podman. | |
+| N017 | green  | tests/firewall_test.sh:248-258 + podman_smoke_test.sh:181-194 | Phase 3: agent OUTPUT policy STILL `-P OUTPUT DROP` even with proxy bypass. Podman smoke T3 repeats the assertion under rootless podman. | |
 | N018 | green  | tests/firewall_test.sh:66-155               | Phase 2: when `PROXY_API_URL` hostname is `blocked.example.com` and not on allowlist, proxy logs `'PROXY_API_URL hostname.*not in'` + container is unhealthy. | |
 | N019 | red    | —                                           | —                                                                                                     | No test forces the in-script verification probe that example.com is blocked (only the outer firewall test verifies block, not the internal probe message). |
 | N020 | red    | —                                           | —                                                                                                     | No test forces the positive verification probe (`api.github.com / pypi.org / registry.npmjs.org`) to be checked explicitly. |
@@ -466,7 +465,6 @@ non-green rows — the gap.
 | Pe002 | green  | tests/upgrade_test.sh:113-141               | T2 simulates allowlist upgrade; existing host entries preserved. | |
 | Pe003 | red    | —                                           | —                                                                                                     | No test makes `.harness-net-overrides.json` and asserts it survives `down`. |
 | Pe004 | green  | tests/persistence_test.sh:191-426 + full_pipeline_test.sh:444-462 | T3, T4, T5, T6 all verify state/agent/home/ content persistence across container rebuild. | |
-| Pe005 | green  | tests/full_pipeline_test.sh:338-345         | T5 asserts `find "${TEST_ROOT}/harness/state/ollama-data" -mindepth 1` finds at least one entry — proves the directory holds persisted registration data after a successful start. | |
 | Pe006 | yellow | tests/proxy_test.sh:55                      | OUTPUT_DIR env defined; never modified by upgrade test paths. | No upgrade-touches-output-dir test. |
 | Pe007 | green  | tests/mcp_test.sh:238-259 + 527-546         | install creates `state/mcp/<name>/`; uninstall removes it. | |
 | Pe008 | green  | tests/upgrade_test.sh:146-174 + mcp_test.sh:415-441 | T4 (DEALBREAKER): post-upgrade `jq '.enabled' harness-meta.json == false` preserved; T9 demonstrates disable state. | |
@@ -480,28 +478,7 @@ non-green rows — the gap.
 | Pe018 | green  | tests/upgrade_test.sh:146-174               | T4 (DEALBREAKER): harness-meta.json with `.enabled == false` survives directory_overwrite even when source has it as true. | |
 | Pe019 | green  | tests/upgrade_test.sh:146-174               | T4: `data/` subdir preserved (`data/user.txt == "user-state"`). | |
 
-## O — Ollama entrypoint + stub model registration (16 IDs)
-
-| ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
-|------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
-| O001 | green  | tests/firewall_test.sh:272-318              | Phase 3 captures ollama container logs and asserts: (a) `[harness-firewall] starting init` marker present, (b) `[harness-firewall] init complete` marker present, (c) no `init-firewall.sh missing` fallback, (d) firewall `starting init` log line precedes `waiting for ollama API at` — direct ordering proof that firewall ran before `ollama serve`. | |
-| O002 | red    | —                                           | —                                                                                                     | No test verifies ollama PID capture / background launch. |
-| O003 | green  | tests/harness_test.sh:315-325               | T3 scrapes the ollama container logs and asserts `grep -Eq 'waiting for ollama API at .*?/api/tags'` — direct evidence the entrypoint's poll loop emitted its banner (and, since T1 sees the container become healthy, that the poll succeeded). | |
-| O004 | red    | —                                           | —                                                                                                     | No test forces ollama to be unready to exercise the fatal timeout branch. |
-| O005 | green  | tests/proxy_test.sh:218-249                 | Scenario A's `/api/show` returns the registered model w/ context length 200000 — only possible if `register_stub_model` succeeded. | |
-| O006 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `/api/show` body contains `"context_length": 200000`. | |
-| O007 | green  | tests/proxy_test.sh:218-249                 | Scenario A: `"num_ctx": 200000`. | |
-| O008 | red    | —                                           | —                                                                                                     | No test specifically forces the streaming response to omit `"status":"success"` to assert the registration-fatal path. |
-| O009 | green  | tests/harness_test.sh:327-336               | T3 also asserts the explicit success log line: `grep -Eq 'harness ollama ready; [0-9]+ stub model(s) -> '` — direct evidence registration succeeded and would catch a regression that turns a fatal error into a silent warning. | |
-| O019 | red    | —                                           | —                                                                                                     | No test reads back the stub model's `remote_host` to verify it equals the proxy URL. |
-| O020 | red    | —                                           | —                                                                                                     | No test sends EXIT to the entrypoint and asserts cleanup. |
-| O021 | red    | —                                           | —                                                                                                     | No test sends INT. |
-| O022 | red    | —                                           | —                                                                                                     | No test sends TERM. |
-| O023 | red    | —                                           | —                                                                                                     | No test inspects `OLLAMA_REMOTES` env. |
-| O024 | green  | tests/harness_test.sh:225-252               | T1 `docker inspect --format '{{.State.Health.Status}}'` returns `healthy` for ollama, which polls `/api/tags`. | |
-| O025 | red    | —                                           | —                                                                                                     | No test asserts the `depends_on: proxy: service_healthy` gate (would need to simulate proxy-unhealthy and assert ollama waits). |
-
-## I — Installer + platform.sh primitives (42 IDs)
+## I — Installer + platform.sh primitives (44 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -520,7 +497,6 @@ non-green rows — the gap.
 | I013 | red    | —                                           | —                                                                                                     | No test simulates Windows to exercise the dos2unix pass. |
 | I014 | green  | tests/full_pipeline_test.sh:203-213         | T2: `state/output/` exists and is writable. | |
 | I015 | green  | tests/full_pipeline_test.sh:203-213         | T2: `state/agent/home/` exists. | |
-| I016 | green  | tests/full_pipeline_test.sh:203-213         | T2: `state/ollama-data/` exists. | |
 | I017 | green  | tests/full_pipeline_test.sh:203-213         | T2: `state/mcp/` exists. | |
 | I018 | red    | —                                           | —                                                                                                     | No test pre-creates `.env` in install root and asserts it is left untouched. |
 | I019 | red    | —                                           | —                                                                                                     | No test pre-creates `$cwd/.env` outside install root and asserts it is moved in. |
@@ -571,7 +547,7 @@ E added `tests/scheme_contract_test.sh`, and Track F2 added the
 | F022  | yellow   | green     | D        | harness_test T23.4b invokes `harness check-updates` with no cache + unreachable origin, asserts rc != 0 + diagnostic. |
 | F026  | yellow   | green     | D        | full_pipeline_test T5 asserts the runtime-override file (when present) carries the generator header. |
 | F031  | yellow   | green     | D        | full_pipeline_test T14 asserts ff-only / no-op output AND source-greps wrapper for `git pull --ff-only` literal. |
-| F042  | yellow   | green     | D        | harness_test T3 runs `harness logs` (no service) and asserts both ollama and proxy lines appear. |
+| F042  | yellow   | green     | D        | harness_test T3 runs `harness logs` (no service) and asserts proxy service lines appear. |
 | F072  | yellow   | green     | D        | harness_test T11 now exercises `_`, `@`, `$`, `:` illegal chars in addition to space. |
 | F131  | yellow   | green     | D        | harness_test T19c stubs `harness_docker` to capture compose() args, asserts `--project-name` is threaded. |
 | F133  | yellow   | green     | D        | harness_test T19c same: asserts `-f docker-compose.yml` is threaded into compose() invocations. |
@@ -587,15 +563,11 @@ E added `tests/scheme_contract_test.sh`, and Track F2 added the
 | I009  | yellow   | green     | D        | full_pipeline_test T1 source-greps `harness-install.sh` for default REPO_URL literal. |
 | I012  | yellow   | green     | D        | full_pipeline_test T1 asserts platform.sh in clone AND source-greps installer for sourcing line. |
 | I024  | yellow   | green     | D        | full_pipeline_test T2 grep's installed wrapper for the install-root path literal. |
-| O001  | yellow   | green     | D        | firewall_test Phase 3 scrapes ollama logs for firewall-init markers AND asserts firewall-line precedes ollama-api-wait-line. |
-| O003  | yellow   | green     | D        | harness_test T3 scrapes ollama logs for `waiting for ollama API at .*?/api/tags` poll banner. |
-| O009  | yellow   | green     | D        | harness_test T3 also asserts the explicit `harness ollama ready; <N> stub model(s) -> ` success line. |
 | P003  | yellow   | green     | D        | proxy_test Scenario F scrapes proxy logs for `listening on: 0.0.0.0:8000` banner. |
 | P004  | yellow   | green     | D        | proxy_test Scenario F same banner, asserts `:8000` port suffix. |
 | P006  | yellow   | green     | D        | proxy_test Scenario F asserts redacted key banner AND raw key NOT printed. |
 | P012  | yellow   | green     | D        | proxy_test Scenario F asserts banner reports `debug dumps: disabled (OUTPUT_DIR not set)`. |
 | P050  | yellow   | green     | D        | proxy_test Scenario F asserts proxy logs have no `failed to save debug file` and no `is not writable` lines. |
-| Pe005 | yellow   | green     | D        | full_pipeline_test T5 asserts `state/ollama-data` is non-empty (find -mindepth 1) after start. |
 | U012  | yellow   | green     | D        | upgrade_test T2b uses `printf` to craft a no-trailing-newline target, then asserts post-merge byte-accuracy via `tail -c 1 \| od`. |
 | U025  | yellow   | green     | D        | upgrade_test T9 sources upgrade_actions.sh standalone and exercises harness_jq + `_upg_json_array` + `_upg_json_str` directly. |
 
@@ -607,10 +579,9 @@ Per-prefix transition count:
 | P      |            5 |         0 |             2 |      13 |
 | A      |            5 |         1 |             0 |      16 |
 | I      |            4 |         0 |             0 |      16 |
-| O      |            3 |         0 |             0 |      18 |
 | U      |            2 |         0 |             0 |       7 |
 | Pe     |            1 |         0 |             1 |       2 |
-| **total** |       31 |         1 |             3 |     145 |
+| **total** |       28 |         1 |             3 |     118 |
 
 (`green→green` and `red→green-via-corroboration-only` not enumerated — neither
 moves the count. Notably P010, P013–P018 stayed green but gained Track-E
@@ -711,9 +682,11 @@ Track C audit. Note: T3 asserts file existence; T5 asserts the file's
 
 Test file: `tests/upgrade_test.sh` T1 (line 60-108). See Track C audit.
 
-### Spot-check C-4 (carried) — P035 (`toolu_` tool-call id prefix)
+### Spot-check C-4 (carried) — P035 (`call_` tool-call id prefix)
 
-Test file: `proxy/test_proxy.py` line 50-95. See Track C audit.
+Test file: `proxy/test_proxy.py` line 2902-2942 (`test_sse_tool_calls_arguments_are_json_strings`,
+`test_build_openai_response_non_streaming`); proxy_test.sh Scenario E (line 488).
+See Track C audit.
 
 ---
 
@@ -730,9 +703,6 @@ Test file: `proxy/test_proxy.py` line 50-95. See Track C audit.
   no test reads back actual iptables/ipset state from a clean firewall run. The two
   branches we DO cover are bypass (N001, N017) and a focused negative (N018). Adding a
   Phase-1-positive test (rules-present after a clean firewall init) would lift ~12 items.
-- Ollama alias registrations (O010-O019) are individually untested. A single test that
-  inspects ollama's model list post-startup against the alias list would cover all
-  eight at once.
 - F-row coverage gaps cluster in `net open`/`net close`/`unlock`/`pick_agent`/`shell`
   surfaces (F045, F057-F061, F081-F092). These are all interactive paths or paths
   requiring 401-mocked upstream that the existing harness can't exercise without

@@ -8,8 +8,7 @@ EXECUTION MODEL:
   per task.
 - harness's `docker compose up` requires host Docker access — Harbor
   must mount /var/run/docker.sock into the task container (rw).
-- LLM calls flow: harness agent (opencode) -> ollama stub
-  -> harness proxy -> upstream LLM API.
+- LLM calls flow: harness agent (opencode) -> harness proxy -> upstream LLM API.
 
 ARCHITECTURE NOTE (host = ARM64, TB task images = mostly x86_64):
 - Task containers run under QEMU user-mode emulation via binfmt_misc.
