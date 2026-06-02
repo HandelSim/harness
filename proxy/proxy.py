@@ -747,58 +747,6 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     return f"{wrapped}\n\n{reminder}"
 
 
-_JSON_VALID_ESCAPE_CHARS = set('"\\/bfnrtu')
-
-
-def _repair_bad_json_escapes(json_str):
-    """Inside string literals only, double any `\\` not followed by a valid
-    JSON escape character (`"\\/bfnrtu`). Used as a one-shot recovery after
-    `json.loads` raises `Invalid \\escape` — issue #120, where models
-    writing code-tool args emit Python source like `\\x1e` (a single
-    backslash, the Python hex-escape form) where strict JSON requires
-    `\\\\x1e`. Without recovery the whole fenced block bleeds into chat.
-
-    The pass is conservative: outside string literals backslashes are
-    untouched (JSON forbids them there anyway, so leaving them alone keeps
-    truly malformed input failing loudly), and inside strings only
-    bad-first-char escapes are repaired — a malformed `\\uXXXX` raises a
-    different decoder message and is left to the original failure path.
-    """
-    out = []
-    i = 0
-    n = len(json_str)
-    in_string = False
-    while i < n:
-        ch = json_str[i]
-        if not in_string:
-            out.append(ch)
-            if ch == '"':
-                in_string = True
-            i += 1
-            continue
-        if ch == '"':
-            out.append(ch)
-            in_string = False
-            i += 1
-            continue
-        if ch == '\\':
-            nxt = json_str[i + 1] if i + 1 < n else ''
-            if nxt in _JSON_VALID_ESCAPE_CHARS:
-                out.append(ch)
-                out.append(nxt)
-                i += 2
-                continue
-            # Bad or trailing backslash: double it and re-examine the next
-            # char on the next iteration (it might itself be significant,
-            # e.g. a closing quote).
-            out.append('\\\\')
-            i += 1
-            continue
-        out.append(ch)
-        i += 1
-    return ''.join(out)
-
-
 def _scan_balanced_json(text, start):
     """Scan from `start` for a complete JSON object, tracking string
     boundaries and brace depth. Returns (json_str, position_after_json)
@@ -872,16 +820,6 @@ def extract_tool_calls_and_text(response_text, available_tool_names=None):
     rejects those and the block bleeds into chat as raw fenced text;
     issue #115 was exactly that.
 
-    Issue #120 extends the same precedent to bad `\\`-escapes. When the
-    payload is a `write`/`edit` call whose `content` is Python source
-    containing `\\x1e`, `\\a`, `\\v` etc. (the model writes them as
-    single-backslash Python escapes rather than the double-backslash form
-    strict JSON requires), `json.loads` raises `Invalid \\escape` and the
-    block bleeds. On exactly that decoder error we retry once with
-    `_repair_bad_json_escapes` — bad backslashes inside string literals
-    get doubled. Gated on the specific message so well-formed input is
-    untouched and other parse failures still bleed loudly.
-
     `available_tool_names`: iterable of tool names currently exposed to the
     model for this turn. When set, a block whose `name` matches an entry
     but is missing the `arguments` key has its remaining top-level keys
@@ -936,20 +874,9 @@ def extract_tool_calls_and_text(response_text, available_tool_names=None):
 
         try:
             candidate = json.loads(json_str, strict=False)
-        except json.JSONDecodeError as e:
-            # Issue #120: when the only thing wrong is bad `\`-escapes
-            # (e.g. Python source with `\x1e` inside a `write` arg), retry
-            # once with bad backslashes doubled. Gated on the specific
-            # decoder message so well-formed-or-differently-broken input
-            # falls through to the bleed path unchanged.
-            if 'Invalid \\escape' not in e.msg:
-                pos = after_json
-                continue
-            try:
-                candidate = json.loads(_repair_bad_json_escapes(json_str), strict=False)
-            except json.JSONDecodeError:
-                pos = after_json
-                continue
+        except json.JSONDecodeError:
+            pos = after_json
+            continue
 
         if not isinstance(candidate, dict):
             pos = after_json

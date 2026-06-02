@@ -365,23 +365,6 @@ block means the whole fenced payload bleeds into chat as raw text
 balanced-brace scanning, the `name`/`arguments` shape check, and the
 "left in text on parse failure" behaviour are unchanged.
 
-Same tradeoff also drives the **tolerant repair of bad `\`-escapes**
-(issue #120). When a `write`/`edit` payload's `content` value is Python
-source containing single-backslash escapes (`\x1e`, `\a`, `\v`, etc. —
-common in S-57 / binary-format code), strict JSON rejects them with
-`Invalid \escape` since the spec only allows `\"\\\/bfnrtu`. On exactly
-that decoder error the extractor retries once via
-`_repair_bad_json_escapes`, which walks the candidate string and doubles
-any backslash not followed by a valid escape character — but only inside
-string literals (outside a string a backslash is its own kind of
-malformed, never a save). Gated on the specific message so well-formed
-input is untouched and other parse failures (missing comma, unbalanced
-brace, malformed `\uXXXX`) still bleed loudly. `strict=False` widens
-**control-character** tolerance only; it does not relax the escape
-alphabet — so issue #115 and #120 are distinct leniencies even though
-they share the same "model emits almost-valid JSON, strict parser
-rejects the whole block" failure shape.
-
 Same tradeoff drives the **tolerant lift on missing `arguments`** (issue
 #118). Models sometimes spell args at the top level instead of nested —
 e.g. `{"name": "bash", "command": "ls", "description": "list files"}`.
