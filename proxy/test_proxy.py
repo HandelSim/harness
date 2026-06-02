@@ -47,52 +47,6 @@ class TestFormatTools(unittest.TestCase):
         self.assertIn('"required"', out)
         self.assertIn('"city"', out)
 
-    def test_tool_call_emits_id_field(self):
-        """Tool calls in NDJSON output must include an 'id' field that downstream
-        Anthropic-format conversation history requires for tool_use blocks."""
-        chunks = list(proxy.generate_ndjson(
-            model_name="test-model",
-            clean_text="",
-            tool_call_payloads=[{"name": "Bash", "arguments": {"command": "ls"}}],
-            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-        ))
-        found_tc = False
-        for chunk_str in chunks:
-            chunk = json.loads(chunk_str)
-            msg = chunk.get("message", {})
-            tcs = msg.get("tool_calls")
-            if tcs:
-                found_tc = True
-                self.assertEqual(len(tcs), 1)
-                tc = tcs[0]
-                self.assertIn("id", tc, "tool_call must have 'id' field")
-                self.assertTrue(
-                    tc["id"].startswith("toolu_"),
-                    f"id should start with 'toolu_', got: {tc['id']}",
-                )
-                self.assertEqual(tc["function"]["name"], "Bash")
-        self.assertTrue(found_tc, "expected at least one chunk with tool_calls")
-
-    def test_tool_call_ids_are_unique(self):
-        """Two separate tool calls should get different ids."""
-        payloads = [{"name": "Bash", "arguments": {"command": "ls"}}]
-        chunks1 = list(proxy.generate_ndjson("m", "", payloads, {}))
-        chunks2 = list(proxy.generate_ndjson("m", "", payloads, {}))
-
-        def get_id(chunks):
-            for c in chunks:
-                msg = json.loads(c).get("message", {})
-                tcs = msg.get("tool_calls")
-                if tcs:
-                    return tcs[0].get("id")
-            return None
-
-        id1 = get_id(chunks1)
-        id2 = get_id(chunks2)
-        self.assertIsNotNone(id1)
-        self.assertIsNotNone(id2)
-        self.assertNotEqual(id1, id2, "two tool calls should have unique ids")
-
     def test_format_tools_includes_nested_schema(self):
         """Tools with nested object/array parameters must have full schema in
         the formatted output, not just top-level field names."""
@@ -555,40 +509,6 @@ After block.'''
         self.assertEqual(len(payloads), 1)
         self.assertEqual(payloads[0]["arguments"]["command"], "echo a\tb")
 
-    def test_generate_ndjson_emits_multiple_tool_calls(self):
-        """Multiple tool calls produce a single tool_calls array in one chunk,
-        each with a unique id."""
-        payloads = [
-            {"name": "Read", "arguments": {"file_path": "/a.py"}},
-            {"name": "Read", "arguments": {"file_path": "/b.py"}},
-            {"name": "Bash", "arguments": {"command": "ls"}},
-        ]
-        chunks = list(proxy.generate_ndjson("test-model", "", payloads, {}))
-
-        # Find the chunk with tool_calls
-        found_tc_chunk = None
-        for chunk_str in chunks:
-            chunk = json.loads(chunk_str)
-            msg = chunk.get("message", {})
-            tcs = msg.get("tool_calls")
-            if tcs:
-                found_tc_chunk = tcs
-
-        self.assertIsNotNone(found_tc_chunk)
-        self.assertEqual(len(found_tc_chunk), 3)
-
-        # Each call has its own unique id
-        ids = [tc["id"] for tc in found_tc_chunk]
-        self.assertEqual(len(set(ids)), 3, "ids should be unique")
-        for tc_id in ids:
-            self.assertTrue(tc_id.startswith("toolu_"))
-
-        # Order preserved
-        self.assertEqual(found_tc_chunk[0]["function"]["arguments"]["file_path"], "/a.py")
-        self.assertEqual(found_tc_chunk[1]["function"]["arguments"]["file_path"], "/b.py")
-        self.assertEqual(found_tc_chunk[2]["function"]["name"], "Bash")
-
-
 class TestTranslateHistory(unittest.TestCase):
     def setUp(self):
         # These tests assert on the legacy role layout (system role passes
@@ -709,36 +629,6 @@ And answer "what does this do?"'''
         self.assertNotIn("System Observation", c)
         # Tool-variant builder still injects the tool list.
         self.assertIn("get_weather", c)
-
-
-class TestMakeChunk(unittest.TestCase):
-    def test_streaming_chunk_no_done_reason(self):
-        c = proxy.make_chunk("harness", content="hello", done=False)
-        self.assertEqual(c["model"], "harness")
-        self.assertEqual(c["message"]["role"], "assistant")
-        self.assertEqual(c["message"]["content"], "hello")
-        self.assertFalse(c["done"])
-        self.assertNotIn("done_reason", c)
-        self.assertNotIn("eval_count", c)
-        # JSON-serializable, single-line when dumped without indent.
-        line = json.dumps(c)
-        self.assertNotIn("\n", line)
-
-    def test_done_chunk_includes_stats(self):
-        c = proxy.make_chunk(
-            "harness",
-            content="",
-            done=True,
-            done_reason="stop",
-            usage={"prompt_tokens": 42, "completion_tokens": 7},
-        )
-        self.assertTrue(c["done"])
-        self.assertEqual(c["done_reason"], "stop")
-        self.assertEqual(c["prompt_eval_count"], 42)
-        self.assertEqual(c["eval_count"], 7)
-        self.assertIn("total_duration", c)
-        self.assertIn("load_duration", c)
-        self.assertIn("eval_duration", c)
 
 
 class TestPromptInjectionModes(unittest.TestCase):
@@ -2342,7 +2232,7 @@ class TestToolResultDelimiting(unittest.TestCase):
 
     def test_tool_result_name_prefers_explicit_field(self):
         """An explicit tool_name field wins over id correlation and
-        positional order — opencode and ollama send it directly."""
+        positional order — opencode sends it directly."""
         msgs = [
             {"role": "user", "content": "go"},
             {"role": "assistant", "content": "", "tool_calls": [
@@ -2562,7 +2452,7 @@ class TestUsageOverride(unittest.TestCase):
 
     def test_prompt_tokens_overridden_with_local_estimate(self):
         long_user_msg = "x" * 4000  # ~1333 tokens at the chars/3 estimate
-        ollama_request = {
+        request_body = {
             "model": "GenAI",
             "messages": [
                 {"role": "user", "content": long_user_msg},
@@ -2579,28 +2469,25 @@ class TestUsageOverride(unittest.TestCase):
             )
             with patch.object(proxy, "save_debug_file"):
                 resp = client.post(
-                    "/api/chat",
-                    data=json.dumps(ollama_request),
+                    "/v1/chat/completions",
+                    data=json.dumps(request_body),
                     content_type="application/json",
                 )
 
         self.assertEqual(resp.status_code, 200)
-        lines = [line for line in resp.get_data(as_text=True).split("\n") if line.strip()]
-        self.assertTrue(lines)
-        done_chunk = json.loads(lines[-1])
-        self.assertTrue(done_chunk.get("done"))
+        body = json.loads(resp.get_data(as_text=True))
         # Upstream said 5; the proxy must report a much larger count derived
         # from the translated conversation, which contains the 4000-char user
         # message plus cooperative-prompt scaffolding and markers.
-        self.assertGreater(done_chunk["prompt_eval_count"], 100)
-        self.assertNotEqual(done_chunk["prompt_eval_count"], 5)
+        self.assertGreater(body["usage"]["prompt_tokens"], 100)
+        self.assertNotEqual(body["usage"]["prompt_tokens"], 5)
         # completion_tokens passes through from upstream when present.
-        self.assertEqual(done_chunk["eval_count"], 11)
+        self.assertEqual(body["usage"]["completion_tokens"], 11)
 
     def test_completion_tokens_falls_back_to_estimate_when_missing(self):
         """When upstream omits completion_tokens, fall back to local estimate.
         prompt_tokens still always overridden."""
-        ollama_request = {
+        request_body = {
             "model": "GenAI",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": False,
@@ -2620,15 +2507,14 @@ class TestUsageOverride(unittest.TestCase):
             mock_post.return_value = FakeResp()
             with patch.object(proxy, "save_debug_file"):
                 resp = client.post(
-                    "/api/chat",
-                    data=json.dumps(ollama_request),
+                    "/v1/chat/completions",
+                    data=json.dumps(request_body),
                     content_type="application/json",
                 )
 
         self.assertEqual(resp.status_code, 200)
-        lines = [line for line in resp.get_data(as_text=True).split("\n") if line.strip()]
-        done_chunk = json.loads(lines[-1])
-        self.assertGreater(done_chunk["eval_count"], 50)
+        body = json.loads(resp.get_data(as_text=True))
+        self.assertGreater(body["usage"]["completion_tokens"], 50)
 
 
 class TestEmptyResponseDetection(unittest.TestCase):
@@ -2660,13 +2546,13 @@ class TestEmptyResponseDetection(unittest.TestCase):
     }
 
     def _post(self, target_json, tools=None):
-        ollama_request = {
+        request_body = {
             "model": "GenAI",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": False,
         }
         if tools is not None:
-            ollama_request["tools"] = tools
+            request_body["tools"] = tools
 
         class FakeResp:
             status_code = 200
@@ -2679,36 +2565,29 @@ class TestEmptyResponseDetection(unittest.TestCase):
             mock_post.return_value = FakeResp()
             with patch.object(proxy, "save_debug_file"):
                 resp = client.post(
-                    "/api/chat",
-                    data=json.dumps(ollama_request),
+                    "/v1/chat/completions",
+                    data=json.dumps(request_body),
                     content_type="application/json",
                 )
         return resp
 
-    def _chunks(self, resp):
-        return [json.loads(l) for l in resp.get_data(as_text=True).split("\n") if l.strip()]
+    def _body(self, resp):
+        return json.loads(resp.get_data(as_text=True))
 
-    def _content_joined(self, chunks):
-        return "".join((c.get("message") or {}).get("content") or "" for c in chunks)
+    def _content(self, body):
+        return (body["choices"][0]["message"].get("content") or "")
 
-    def _tool_calls(self, chunks):
-        out = []
-        for c in chunks:
-            tcs = (c.get("message") or {}).get("tool_calls") or []
-            out.extend(tcs)
-        return out
+    def _tool_calls(self, body):
+        return body["choices"][0]["message"].get("tool_calls") or []
 
-    def _done_reason(self, chunks):
-        for c in chunks:
-            if c.get("done"):
-                return c.get("done_reason")
-        return None
+    def _finish_reason(self, body):
+        return body["choices"][0].get("finish_reason")
 
     def test_empty_content_with_bash_emits_rescue_pwd_call(self):
         """The flagship issue #117 path: empty upstream content + bash is
         available → emit "Understood." text PLUS a no-op `pwd` call via the
-        bash tool, so opencode's `done_reason` is `tool_calls` and the agent
-        continues the turn by executing the (read-only) command."""
+        bash tool, so finish_reason is `tool_calls` and the agent continues
+        the turn by executing the (read-only) command."""
         resp = self._post(
             {
                 "choices": [{
@@ -2722,28 +2601,28 @@ class TestEmptyResponseDetection(unittest.TestCase):
             tools=[self._BASH_TOOL],
         )
         self.assertEqual(resp.status_code, 200)
-        chunks = self._chunks(resp)
-        self.assertEqual(self._content_joined(chunks).strip(), "Understood.")
-        tcs = self._tool_calls(chunks)
+        body = self._body(resp)
+        self.assertEqual(self._content(body).strip(), "Understood.")
+        tcs = self._tool_calls(body)
         self.assertEqual(len(tcs), 1, f"expected 1 rescue tool call, got {tcs}")
         self.assertEqual(tcs[0]["function"]["name"], "bash")
         # The args must be a read-only pwd invocation — anything else
         # (e.g. an empty command, or a state-modifying command) would
         # contradict the "inconsequential" design.
         self.assertEqual(
-            tcs[0]["function"]["arguments"],
+            json.loads(tcs[0]["function"]["arguments"]),
             {"command": "pwd", "description": "Print working directory"},
         )
-        self.assertEqual(self._done_reason(chunks), "tool_calls")
-        joined = self._content_joined(chunks)
-        self.assertNotIn("[harness proxy]", joined)
-        self.assertNotIn("finish_reason", joined)
+        self.assertEqual(self._finish_reason(body), "tool_calls")
+        content = self._content(body)
+        self.assertNotIn("[harness proxy]", content)
+        self.assertNotIn("finish_reason", content)
 
     def test_empty_content_without_rescue_tool_falls_back_to_text(self):
         """When no shell tool is in the inbound tools, the rescue still
         emits "Understood." in the assistant slot (the upstream unsticks on
         the user's next prompt), but no fabricated tool call is emitted and
-        the done_reason stays `stop`."""
+        the finish_reason stays `stop`."""
         resp = self._post(
             {
                 "choices": [{
@@ -2754,10 +2633,10 @@ class TestEmptyResponseDetection(unittest.TestCase):
             },
             tools=[],
         )
-        chunks = self._chunks(resp)
-        self.assertEqual(self._content_joined(chunks).strip(), "Understood.")
-        self.assertEqual(self._tool_calls(chunks), [])
-        self.assertEqual(self._done_reason(chunks), "stop")
+        body = self._body(resp)
+        self.assertEqual(self._content(body).strip(), "Understood.")
+        self.assertEqual(self._tool_calls(body), [])
+        self.assertEqual(self._finish_reason(body), "stop")
 
     def test_rescue_tool_matches_capitalized_bash(self):
         """Claude Code names the tool `Bash`; the selector matches
@@ -2774,17 +2653,17 @@ class TestEmptyResponseDetection(unittest.TestCase):
             },
             tools=[cap_tool],
         )
-        chunks = self._chunks(resp)
-        tcs = self._tool_calls(chunks)
+        body = self._body(resp)
+        tcs = self._tool_calls(body)
         self.assertEqual(len(tcs), 1)
         # The emitted name must echo the inbound name exactly, so opencode
         # can route the call.
         self.assertEqual(tcs[0]["function"]["name"], "Bash")
         self.assertEqual(
-            tcs[0]["function"]["arguments"],
+            json.loads(tcs[0]["function"]["arguments"]),
             {"command": "pwd", "description": "Print working directory"},
         )
-        self.assertEqual(self._done_reason(chunks), "tool_calls")
+        self.assertEqual(self._finish_reason(body), "tool_calls")
 
     def test_whitespace_only_content_treated_as_empty(self):
         """A response whose only content is whitespace still leaves the
@@ -2799,9 +2678,9 @@ class TestEmptyResponseDetection(unittest.TestCase):
             },
             tools=[self._BASH_TOOL],
         )
-        chunks = self._chunks(resp)
-        self.assertEqual(self._content_joined(chunks).strip(), "Understood.")
-        self.assertEqual(len(self._tool_calls(chunks)), 1)
+        body = self._body(resp)
+        self.assertEqual(self._content(body).strip(), "Understood.")
+        self.assertEqual(len(self._tool_calls(body)), 1)
 
     def test_real_content_does_not_trigger_rescue(self):
         """Normal responses must pass through unchanged — no rescue text
@@ -2816,11 +2695,11 @@ class TestEmptyResponseDetection(unittest.TestCase):
             },
             tools=[self._BASH_TOOL],
         )
-        chunks = self._chunks(resp)
-        joined = self._content_joined(chunks)
-        self.assertIn("hello world", joined)
-        self.assertNotIn("Understood.", joined)
-        self.assertEqual(self._tool_calls(chunks), [])
+        body = self._body(resp)
+        content = self._content(body)
+        self.assertIn("hello world", content)
+        self.assertNotIn("Understood.", content)
+        self.assertEqual(self._tool_calls(body), [])
 
     def test_tool_only_turn_does_not_trigger_rescue(self):
         """Tool-call-only turns have empty assistant text by design —
@@ -2834,7 +2713,7 @@ class TestEmptyResponseDetection(unittest.TestCase):
             '"description": "list files"}}\n'
             '```'
         )
-        ollama_request = {
+        request_body = {
             "model": "GenAI",
             "messages": [{"role": "user", "content": "list the files"}],
             "tools": [self._BASH_TOOL],
@@ -2858,19 +2737,21 @@ class TestEmptyResponseDetection(unittest.TestCase):
             mock_post.return_value = FakeResp()
             with patch.object(proxy, "save_debug_file"):
                 resp = client.post(
-                    "/api/chat",
-                    data=json.dumps(ollama_request),
+                    "/v1/chat/completions",
+                    data=json.dumps(request_body),
                     content_type="application/json",
                 )
 
         self.assertEqual(resp.status_code, 200)
-        chunks = self._chunks(resp)
-        tcs = self._tool_calls(chunks)
+        body = self._body(resp)
+        tcs = self._tool_calls(body)
         # Exactly the model's own `ls` call; no extra rescue `pwd`.
         self.assertEqual(len(tcs), 1)
         self.assertEqual(tcs[0]["function"]["name"], "bash")
-        self.assertEqual(tcs[0]["function"]["arguments"]["command"], "ls")
-        self.assertNotIn("Understood.", self._content_joined(chunks))
+        self.assertEqual(
+            json.loads(tcs[0]["function"]["arguments"])["command"], "ls"
+        )
+        self.assertNotIn("Understood.", self._content(body))
 
     def test_no_choices_emits_rescue(self):
         """Pathological 'no choices' response — agent still stalls, so still
@@ -2879,9 +2760,9 @@ class TestEmptyResponseDetection(unittest.TestCase):
             {"choices": [], "usage": {"completion_tokens": 0}},
             tools=[self._BASH_TOOL],
         )
-        chunks = self._chunks(resp)
-        self.assertEqual(self._content_joined(chunks).strip(), "Understood.")
-        self.assertEqual(len(self._tool_calls(chunks)), 1)
+        body = self._body(resp)
+        self.assertEqual(self._content(body).strip(), "Understood.")
+        self.assertEqual(len(self._tool_calls(body)), 1)
 
     def test_rescue_text_helper_returns_minimal_text(self):
         """Unit-test the rescue text helper directly so phrasing changes
@@ -3376,21 +3257,12 @@ class TestConfigHelpers(unittest.TestCase):
         self.assertEqual(base + "/v1/chat/completions", "https://host.example/v1/chat/completions")
         self.assertEqual(base + "/v1/models", "https://host.example/v1/models")
 
-    def test_strip_model_tag_removes_latest(self):
-        self.assertEqual(proxy._strip_model_tag("gpt-4:latest"), "gpt-4")
-
-    def test_strip_model_tag_leaves_untagged(self):
-        self.assertEqual(proxy._strip_model_tag("gpt-4"), "gpt-4")
-
-    def test_strip_model_tag_keeps_non_latest_colon(self):
-        self.assertEqual(proxy._strip_model_tag("ns:model"), "ns:model")
-
 
 class TestModelPassthrough(unittest.TestCase):
-    """The proxy forwards the requested model (minus :latest) upstream, not a
+    """The proxy forwards the requested model verbatim upstream, not a
     fixed id; it falls back to DEFAULT_MODEL_NAME only when none was sent."""
 
-    def _capture_forwarded(self, ollama_request):
+    def _capture_forwarded(self, request_body):
         captured = {}
 
         class FakeResp:
@@ -3407,21 +3279,22 @@ class TestModelPassthrough(unittest.TestCase):
         with patch.object(proxy.requests, "post", side_effect=fake_post):
             with patch.object(proxy, "save_debug_file"):
                 client.post(
-                    "/api/chat",
-                    data=json.dumps(ollama_request),
+                    "/v1/chat/completions",
+                    data=json.dumps(request_body),
                     content_type="application/json",
                 )
         return captured.get("model")
 
-    def test_requested_model_passes_through_stripped(self):
+    def test_requested_model_passes_through_verbatim(self):
         forwarded = self._capture_forwarded(
-            {"model": "gpt-4:latest", "messages": [{"role": "user", "content": "hi"}]}
+            {"model": "gpt-4:latest", "messages": [{"role": "user", "content": "hi"}],
+             "stream": False}
         )
-        self.assertEqual(forwarded, "gpt-4")
+        self.assertEqual(forwarded, "gpt-4:latest")
 
     def test_missing_model_falls_back_to_default(self):
         forwarded = self._capture_forwarded(
-            {"messages": [{"role": "user", "content": "hi"}]}
+            {"messages": [{"role": "user", "content": "hi"}], "stream": False}
         )
         self.assertEqual(forwarded, proxy.DEFAULT_MODEL_NAME)
 
@@ -3545,14 +3418,6 @@ class TestOpenAIEmission(unittest.TestCase):
         self.assertEqual(body["object"], "chat.completion")
         self.assertEqual(body["choices"][0]["message"]["content"], "Hello there")
 
-    def test_ollama_path_still_ndjson(self):
-        resp = self._post("/api/chat",
-                          {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.mimetype, "application/x-ndjson")
-        last = [l for l in resp.get_data(as_text=True).splitlines() if l.strip()][-1]
-        self.assertIn('"done":true', last.replace(" ", ""))
-
     def test_openai_error_envelope_on_upstream_failure(self):
         client = proxy.app.test_client()
         with patch.object(proxy.requests, "post",
@@ -3564,7 +3429,7 @@ class TestOpenAIEmission(unittest.TestCase):
                                      "messages": [{"role": "user", "content": "hi"}]}),
                     content_type="application/json")
         body = json.loads(resp.get_data(as_text=True))
-        # AI SDK requires error.message; ollama path keeps the flat shape.
+        # AI SDK requires error.message.
         self.assertIn("message", body["error"])
         self.assertIn("boom", body["error"]["message"])
 
