@@ -298,6 +298,16 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | M021 | Serena registry compose exposes port 9121 SSE |
 | M022 | Serena registry compose mounts the allowlist file |
 | M023 | `state/agent/home/.harness-mcp-servers.json` is regenerated each agent launch (not user-managed) |
+| M024 | `harness mcp register <name> --from <dir>` materializes `state/mcp/<name>/` (compose.yml + client-config.json + `harness-meta.json` with `{"enabled": true}`) and creates `data/` |
+| M025 | `harness mcp register` discards the hidden `.staging-<name>/` and changes nothing in `state/mcp/` when the staged compose fails to merge into the harness graph (malformed/invalid snippet → non-zero exit) |
+| M026 | `harness mcp register` rejects a staged snippet whose service name already exists in the merged compose graph (compose would silently override it) |
+| M027 | `harness mcp register --no-enable` lands `{"enabled": false}`; the entry is excluded from `mcp_compose_files` until `harness mcp enable` flips it |
+| M028 | An enabled registered MCP appears in `mcp_compose_files` output and its `client-config.json` is merged into `.harness-mcp-servers.json` |
+| M029 | `harness mcp register` refuses an already-installed name without `--force`; `--force` re-materializes while preserving `data/` |
+| M030 | `harness mcp register` prints `allowed_domains` → `harness net allow` recommendations and does NOT modify the allowlist (shared `mcp_print_firewall_recs`) |
+| M031 | `harness mcp uninstall <registered-name> --force` removes config but preserves `data/` (uninstall is the inverse of register) |
+| M032 | `harness mcp register <name>` prints a shadow warning when `<name>` also names a `mcp-registry/` entry |
+| M033 | `harness mcp register --from <git-url> --ref <ref>` clones the source into `state/mcp/<name>/repo/` at the pinned ref and records `repo_clone_url`/`repo_clone_ref` provenance into `harness-meta.json` |
 
 ---
 
