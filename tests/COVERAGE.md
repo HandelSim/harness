@@ -41,8 +41,9 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   is fatal) and Phase 3 bypass (`HARNESS_FIREWALL_DISABLED=1` per-service).
 - `tests/integration_test.sh` (900 lines, gated `HARNESS_RUN_SLOW=1`) — Serena MCP,
   Graphify pipx, `--mount` rejection paths.
-- `tests/mcp_test.sh` (742 lines) — MCP lifecycle (list/install/enable/disable/up/down/
-  uninstall/status), side-file regeneration, allowed_domains recommendation.
+- `tests/mcp_test.sh` (1103 lines) — MCP lifecycle (list/install/enable/disable/up/down/
+  uninstall/status), side-file regeneration, allowed_domains recommendation, and
+  `register` dynamic registration behind the compose-merge validation gate (TR1–TR10).
 - `tests/persistence_test.sh` — skel-seed, `pip install --user`,
   `.git-credentials` persistence. Track-D strengthening:
   A004 (T1 + T3 uid+gid assertions on bind-mounted artifacts).
@@ -360,7 +361,7 @@ non-green rows — the gap.
 | A033 | green  | tests/full_pipeline_test.sh + harness_test.sh T30 | T9 (bare `harness` → opencode) and T10 (explicit opencode) dispatch from positional mode; harness_test T30 asserts bare/flag dispatch routes to opencode and an unknown bare word errors. | |
 | A034 | red    | —                                           | —                                                                                                     | No test invokes an unknown mode and asserts the usage error. |
 
-## M — MCP framework (23 IDs)
+## M — MCP framework (33 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -387,6 +388,16 @@ non-green rows — the gap.
 | M021 | green  | tests/integration_test.sh:253-456           | Phase 2: proxy reaches `tcp://serena:9121` (SSE port) inside the compose network. | |
 | M022 | green  | tests/integration_test.sh:253-456           | Phase 2: side-file contains `serena`, requiring the allowlist mount to have been merged. | |
 | M023 | green  | tests/mcp_test.sh:576-595 + 415-441         | T17 verifies side-file removed when no MCPs are enabled; T9 demonstrates regeneration on flag change. | |
+| M024 | green  | tests/mcp_test.sh (TR1)                      | TR1: `register reg1 --from <dir>` asserts `compose.yml` + `client-config.json` + `harness-meta.json` (`"enabled": true`) materialized, `data/` created, `.staging-reg1` gone. | |
+| M025 | green  | tests/mcp_test.sh (TR2)                      | TR2: malformed-compose source → non-zero exit, no `state/mcp/reg2/compose.yml`, `.staging-reg2` discarded. | |
+| M026 | green  | tests/mcp_test.sh (TR3)                      | TR3: snippet whose service is named `proxy` (already in the graph) is rejected with `redefines service`; no active entry left. | |
+| M027 | green  | tests/mcp_test.sh (TR4)                      | TR4: `--no-enable` → `"enabled": false`, absent from `mcp_compose_files` (source seam); `mcp enable` flips it and it appears. | |
+| M028 | green  | tests/mcp_test.sh (TR5)                      | TR5: enabled `reg5` appears in `mcp_compose_files`; `write_agent_mcp_config` side-file carries `http://reg5:8765/sse` (mirrors T7). | |
+| M029 | green  | tests/mcp_test.sh (TR6)                      | TR6: re-register without `--force` rejected (`already installed`); `--force` re-materializes, `data/marker.txt` preserved. | |
+| M030 | green  | tests/mcp_test.sh (TR7)                      | TR7: register prints `recommends allowlisting` + `harness net allow example.com`/`another.example.org`; allowlist unchanged (`diff -q`). Mirrors T18. | |
+| M031 | green  | tests/mcp_test.sh (TR8)                      | TR8: `uninstall reg8 --force` removes `compose.yml` but keeps `data/marker.txt` (inverse of register). | |
+| M032 | green  | tests/mcp_test.sh (TR9)                      | TR9: registering under name `dummy` (a registry entry) prints `also names a registry entry` shadow warning. | |
+| M033 | green  | tests/mcp_test.sh (TR10)                     | TR10: `register --from file://<repo> --ref v0.0.1 --start` clones into `state/mcp/reg10/repo/.git`, records `repo_clone_url`/`v0.0.1` provenance, and `--start` brings the container to `healthy`. | |
 
 ## N — Network egress / firewall / allowlist / git creds / overrides (30 IDs)
 

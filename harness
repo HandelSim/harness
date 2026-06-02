@@ -3404,12 +3404,26 @@ mcp_validate_staged() {
         return 1
     fi
 
+    # A --force re-register over an already-installed+enabled entry sees that
+    # entry's OWN services/container_names in the live graph (mcp_compose_files
+    # includes it until the swap). Those are precisely the names this register
+    # replaces, so exclude them from the collision baselines — otherwise a
+    # same-name --force re-register would always self-collide. A fresh register
+    # (no existing compose) skips this and behaves as before.
+    local self_compose="$mcp_active_dir/$name/compose.yml"
+    local self_services="" self_cnames=""
+    if [[ -f "$self_compose" ]]; then
+        self_services=$(compose_services_of_file "$self_compose")
+        self_cnames=$(compose_cnames_of_file "$self_compose")
+    fi
+
     # 2a. Service-name collisions.
     local baseline_services
     baseline_services=$(harness_compose_graph "" --profile mcp config --services 2>/dev/null || true)
     local svc collisions=""
     while IFS= read -r svc; do
         [[ -z "$svc" ]] && continue
+        [[ -n "$self_services" ]] && grep -qxF "$svc" <<<"$self_services" && continue
         if grep -qxF "$svc" <<<"$baseline_services"; then
             collisions+=" $svc"
         fi
@@ -3428,6 +3442,7 @@ mcp_validate_staged() {
             | harness_jq -r '.services // {} | to_entries[] | .value.container_name // empty' 2>/dev/null || true)
         while IFS= read -r cn; do
             [[ -z "$cn" ]] && continue
+            [[ -n "$self_cnames" ]] && grep -qxF "$cn" <<<"$self_cnames" && continue
             if grep -qxF "$cn" <<<"$baseline_cnames"; then
                 cn_collisions+=" $cn"
             fi

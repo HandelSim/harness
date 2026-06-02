@@ -708,6 +708,396 @@ HARNESS_REGISTRY_DIR="${EMPTY_REG}" \
     "${FAKE_INSTALL_ROOT}/harness/harness" mcp uninstall empty_dom --force >/dev/null 2>&1 || true
 echo "[mcp] T19 OK"
 
+# ===========================================================================
+# Register (TR-series) — `harness mcp register` dynamic registration.
+#
+# register lands an arbitrary external source (a registry-shaped dir or a git
+# URL) into the active tree behind a compose-merge validation gate, WITHOUT a
+# repo commit. These are docker-tier (the gate runs `docker compose config`
+# over the full graph), so CI exercises them; the docker-free check is bash -n.
+# See .planning/proposals/mcp-register.md and architecture/mcp.md.
+# ===========================================================================
+
+# A minimal valid registry-shaped source dir: one alpine 'sleep' service behind
+# the mcp profile on harness-net, plus the required client-config.json. No
+# harness-meta — register synthesizes one (enabled flag) on materialize.
+make_reg_src() {
+    local dir="$1" svc="$2"
+    local cname="${3:-harness-mcp-test_${svc}}"
+    mkdir -p "${dir}"
+    cat >"${dir}/compose.yml" <<EOF
+services:
+  ${svc}:
+    image: alpine:latest
+    container_name: ${cname}
+    networks: [harness-net]
+    profiles: [mcp]
+    command: sh -c 'sleep 9999'
+networks:
+  harness-net:
+EOF
+    cat >"${dir}/client-config.json" <<EOF
+{ "mcpServers": { "${svc}": { "type": "sse", "url": "http://${svc}:8765/sse" } } }
+EOF
+}
+
+# Source seam: run a harness function with HARNESS_SOURCE_ONLY=1 (main skipped)
+# under the test env, echoing its output. Used to observe mcp_compose_files and
+# write_agent_mcp_config without launching anything (mirrors T7's approach).
+seam_mcp_compose_files() {
+    (
+        export HARNESS_SOURCE_ONLY=1
+        export HARNESS_PROJECT_NAME="${PROJECT_NAME}"
+        export HARNESS_INSTALL_ROOT="${FAKE_INSTALL_ROOT}"
+        export HARNESS_REGISTRY_DIR="${FAKE_REGISTRY}"
+        # shellcheck disable=SC1091
+        source "${FAKE_INSTALL_ROOT}/harness/harness"
+        mcp_compose_files
+    )
+}
+seam_write_agent_mcp_config() {
+    (
+        export HARNESS_SOURCE_ONLY=1
+        export HARNESS_PROJECT_NAME="${PROJECT_NAME}"
+        export HARNESS_INSTALL_ROOT="${FAKE_INSTALL_ROOT}"
+        export HARNESS_REGISTRY_DIR="${FAKE_REGISTRY}"
+        # shellcheck disable=SC1091
+        source "${FAKE_INSTALL_ROOT}/harness/harness"
+        write_agent_mcp_config
+    )
+}
+
+# --- TR1: register from a valid dir materializes the active tree ------------
+
+echo "[mcp] TR1: register <name> --from <valid-dir>"
+make_reg_src "${TEST_ROOT}/src-reg1" reg1
+harness_call mcp register reg1 --from "${TEST_ROOT}/src-reg1" >"${TEST_ROOT}/reg1.log" 2>&1 || {
+    echo "[mcp] TR1 FAIL: register exited non-zero" >&2
+    cat "${TEST_ROOT}/reg1.log" >&2
+    exit 1
+}
+for f in compose.yml client-config.json harness-meta.json; do
+    if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/reg1/${f}" ]]; then
+        echo "[mcp] TR1 FAIL: ${f} not materialized" >&2
+        cat "${TEST_ROOT}/reg1.log" >&2
+        exit 1
+    fi
+done
+if [[ ! -d "${FAKE_INSTALL_ROOT}/state/mcp/reg1/data" ]]; then
+    echo "[mcp] TR1 FAIL: data/ not created" >&2
+    exit 1
+fi
+if ! grep -q '"enabled": true' "${FAKE_INSTALL_ROOT}/state/mcp/reg1/harness-meta.json"; then
+    echo "[mcp] TR1 FAIL: harness-meta.json should report enabled=true" >&2
+    cat "${FAKE_INSTALL_ROOT}/state/mcp/reg1/harness-meta.json" >&2
+    exit 1
+fi
+# The hidden staging dir must not linger after a successful register.
+if [[ -e "${FAKE_INSTALL_ROOT}/state/mcp/.staging-reg1" ]]; then
+    echo "[mcp] TR1 FAIL: staging dir left behind" >&2
+    exit 1
+fi
+echo "[mcp] TR1 OK"
+
+# --- TR2: malformed compose is rejected; staging discarded -----------------
+
+echo "[mcp] TR2: register with malformed compose is rejected"
+mkdir -p "${TEST_ROOT}/src-reg2"
+cat >"${TEST_ROOT}/src-reg2/compose.yml" <<'EOF'
+services:
+  reg2:
+    image: alpine:latest
+    networks: [harness-net
+    profiles: [mcp]
+EOF
+cat >"${TEST_ROOT}/src-reg2/client-config.json" <<'EOF'
+{ "mcpServers": { "reg2": { "type": "sse", "url": "http://reg2:1/" } } }
+EOF
+set +e
+reg2_out=$(harness_call mcp register reg2 --from "${TEST_ROOT}/src-reg2" 2>&1)
+reg2_rc=$?
+set -e
+echo "${reg2_out}" | sed 's/^/  | /'
+if (( reg2_rc == 0 )); then
+    echo "[mcp] TR2 FAIL: register accepted a malformed compose" >&2
+    exit 1
+fi
+if [[ -f "${FAKE_INSTALL_ROOT}/state/mcp/reg2/compose.yml" ]]; then
+    echo "[mcp] TR2 FAIL: malformed register left an active entry" >&2
+    exit 1
+fi
+if [[ -e "${FAKE_INSTALL_ROOT}/state/mcp/.staging-reg2" ]]; then
+    echo "[mcp] TR2 FAIL: staging dir not discarded after failure" >&2
+    exit 1
+fi
+echo "[mcp] TR2 OK"
+
+# --- TR3: service-name collision is rejected -------------------------------
+
+echo "[mcp] TR3: register colliding service name (proxy) is rejected"
+make_reg_src "${TEST_ROOT}/src-reg3" proxy harness-mcp-test_reg3svc
+set +e
+reg3_out=$(harness_call mcp register reg3 --from "${TEST_ROOT}/src-reg3" 2>&1)
+reg3_rc=$?
+set -e
+echo "${reg3_out}" | sed 's/^/  | /'
+if (( reg3_rc == 0 )); then
+    echo "[mcp] TR3 FAIL: register accepted a service-name collision" >&2
+    exit 1
+fi
+if ! grep -qi 'redefines service' <<<"${reg3_out}"; then
+    echo "[mcp] TR3 FAIL: rejection should mention the service collision" >&2
+    exit 1
+fi
+if [[ -f "${FAKE_INSTALL_ROOT}/state/mcp/reg3/compose.yml" ]]; then
+    echo "[mcp] TR3 FAIL: collision register left an active entry" >&2
+    exit 1
+fi
+echo "[mcp] TR3 OK"
+
+# --- TR4: --no-enable lands disabled; excluded from start until enabled ----
+
+echo "[mcp] TR4: register --no-enable lands disabled, excluded from compose files"
+make_reg_src "${TEST_ROOT}/src-reg4" reg4
+harness_call mcp register reg4 --from "${TEST_ROOT}/src-reg4" --no-enable >"${TEST_ROOT}/reg4.log" 2>&1 || {
+    echo "[mcp] TR4 FAIL: register --no-enable exited non-zero" >&2
+    cat "${TEST_ROOT}/reg4.log" >&2
+    exit 1
+}
+if ! grep -q '"enabled": false' "${FAKE_INSTALL_ROOT}/state/mcp/reg4/harness-meta.json"; then
+    echo "[mcp] TR4 FAIL: --no-enable should land enabled=false" >&2
+    exit 1
+fi
+# Disabled => excluded from the enabled-only enumeration `harness start` reads.
+cf_pre=$(seam_mcp_compose_files)
+if grep -q 'mcp/reg4' <<<"${cf_pre}"; then
+    echo "[mcp] TR4 FAIL: disabled reg4 should not appear in mcp_compose_files" >&2
+    echo "${cf_pre}" >&2
+    exit 1
+fi
+# Enable flips it in.
+harness_call mcp enable reg4 >/dev/null 2>&1
+if ! grep -q '"enabled": true' "${FAKE_INSTALL_ROOT}/state/mcp/reg4/harness-meta.json"; then
+    echo "[mcp] TR4 FAIL: enable should flip reg4 to enabled=true" >&2
+    exit 1
+fi
+cf_post=$(seam_mcp_compose_files)
+if ! grep -q 'mcp/reg4' <<<"${cf_post}"; then
+    echo "[mcp] TR4 FAIL: enabled reg4 should appear in mcp_compose_files" >&2
+    echo "${cf_post}" >&2
+    exit 1
+fi
+echo "[mcp] TR4 OK"
+
+# --- TR5: enabled registered MCP reaches compose files + side file ---------
+
+echo "[mcp] TR5: enabled registered MCP in mcp_compose_files + .harness-mcp-servers.json"
+make_reg_src "${TEST_ROOT}/src-reg5" reg5
+harness_call mcp register reg5 --from "${TEST_ROOT}/src-reg5" >"${TEST_ROOT}/reg5.log" 2>&1 || {
+    echo "[mcp] TR5 FAIL: register exited non-zero" >&2
+    cat "${TEST_ROOT}/reg5.log" >&2
+    exit 1
+}
+cf5=$(seam_mcp_compose_files)
+if ! grep -q 'mcp/reg5' <<<"${cf5}"; then
+    echo "[mcp] TR5 FAIL: reg5 not in mcp_compose_files" >&2
+    echo "${cf5}" >&2
+    exit 1
+fi
+seam_write_agent_mcp_config
+if ! grep -q '"http://reg5:8765/sse"' "${side_file}"; then
+    echo "[mcp] TR5 FAIL: side file missing reg5 url" >&2
+    cat "${side_file}" >&2
+    exit 1
+fi
+echo "[mcp] TR5 OK"
+
+# --- TR6: refuse already-installed without --force; --force keeps data/ ----
+
+echo "[mcp] TR6: register refuses an installed name without --force; --force preserves data/"
+make_reg_src "${TEST_ROOT}/src-reg6" reg6
+harness_call mcp register reg6 --from "${TEST_ROOT}/src-reg6" >/dev/null 2>&1 || {
+    echo "[mcp] TR6 FAIL: initial register exited non-zero" >&2
+    exit 1
+}
+echo "reg6 marker" >"${FAKE_INSTALL_ROOT}/state/mcp/reg6/data/marker.txt"
+set +e
+reg6_out=$(harness_call mcp register reg6 --from "${TEST_ROOT}/src-reg6" 2>&1)
+reg6_rc=$?
+set -e
+if (( reg6_rc == 0 )); then
+    echo "[mcp] TR6 FAIL: re-register without --force should fail" >&2
+    exit 1
+fi
+if ! grep -qi 'already installed' <<<"${reg6_out}"; then
+    echo "[mcp] TR6 FAIL: rejection should mention 'already installed'" >&2
+    echo "${reg6_out}" >&2
+    exit 1
+fi
+harness_call mcp register reg6 --from "${TEST_ROOT}/src-reg6" --force >/dev/null 2>&1 || {
+    echo "[mcp] TR6 FAIL: --force re-register exited non-zero" >&2
+    exit 1
+}
+if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/reg6/data/marker.txt" ]]; then
+    echo "[mcp] TR6 FAIL: --force re-register destroyed data/" >&2
+    exit 1
+fi
+echo "[mcp] TR6 OK"
+
+# --- TR7: prints allowed_domains recs; allowlist unchanged (mirrors T18) ---
+
+echo "[mcp] TR7: register prints allowed_domains recommendations, allowlist unchanged"
+make_reg_src "${TEST_ROOT}/src-reg7" reg7
+cat >"${TEST_ROOT}/src-reg7/harness-meta.json.template" <<'EOF'
+{
+  "enabled": true,
+  "allowed_domains": [
+    "example.com",
+    "another.example.org"
+  ]
+}
+EOF
+cp "${ALLOWLIST_FILE}" "${ALLOWLIST_FILE}.before-tr7"
+set +e
+reg7_out=$(harness_call mcp register reg7 --from "${TEST_ROOT}/src-reg7" 2>&1)
+reg7_rc=$?
+set -e
+echo "${reg7_out}" | sed 's/^/  | /'
+if (( reg7_rc != 0 )); then
+    echo "[mcp] TR7 FAIL: register exited ${reg7_rc}" >&2
+    exit 1
+fi
+if ! grep -q 'recommends allowlisting' <<<"${reg7_out}"; then
+    echo "[mcp] TR7 FAIL: register did not print allowed_domains recommendation" >&2
+    exit 1
+fi
+for d in example.com another.example.org; do
+    if ! grep -Eq "harness net allow ${d}" <<<"${reg7_out}"; then
+        echo "[mcp] TR7 FAIL: register did not suggest 'harness net allow ${d}'" >&2
+        exit 1
+    fi
+done
+if ! diff -q "${ALLOWLIST_FILE}.before-tr7" "${ALLOWLIST_FILE}" >/dev/null; then
+    echo "[mcp] TR7 FAIL: register modified the allowlist (must only print)" >&2
+    diff -u "${ALLOWLIST_FILE}.before-tr7" "${ALLOWLIST_FILE}" >&2 || true
+    exit 1
+fi
+rm -f "${ALLOWLIST_FILE}.before-tr7"
+echo "[mcp] TR7 OK"
+
+# --- TR8: uninstall a registered MCP preserves data/ (inverse of register) -
+
+echo "[mcp] TR8: uninstall a registered MCP preserves data/"
+make_reg_src "${TEST_ROOT}/src-reg8" reg8
+harness_call mcp register reg8 --from "${TEST_ROOT}/src-reg8" >/dev/null 2>&1 || {
+    echo "[mcp] TR8 FAIL: register exited non-zero" >&2
+    exit 1
+}
+echo "reg8 marker" >"${FAKE_INSTALL_ROOT}/state/mcp/reg8/data/marker.txt"
+harness_call mcp uninstall reg8 --force >"${TEST_ROOT}/reg8-uninstall.log" 2>&1
+if [[ -f "${FAKE_INSTALL_ROOT}/state/mcp/reg8/compose.yml" ]]; then
+    echo "[mcp] TR8 FAIL: compose.yml present after uninstall" >&2
+    exit 1
+fi
+if [[ ! -f "${FAKE_INSTALL_ROOT}/state/mcp/reg8/data/marker.txt" ]]; then
+    echo "[mcp] TR8 FAIL: data/marker.txt removed by uninstall" >&2
+    exit 1
+fi
+echo "[mcp] TR8 OK"
+
+# --- TR9: registering a name that shadows a registry entry warns -----------
+
+echo "[mcp] TR9: register a name that shadows a registry entry warns"
+make_reg_src "${TEST_ROOT}/src-reg9" shadowsvc
+# 'dummy' exists in FAKE_REGISTRY (created during staging) — registering under
+# that name must warn that `harness upgrade` would later overwrite it.
+set +e
+reg9_out=$(harness_call mcp register dummy --from "${TEST_ROOT}/src-reg9" 2>&1)
+reg9_rc=$?
+set -e
+echo "${reg9_out}" | sed 's/^/  | /'
+if (( reg9_rc != 0 )); then
+    echo "[mcp] TR9 FAIL: register dummy exited ${reg9_rc}" >&2
+    exit 1
+fi
+if ! grep -qi 'also names a registry entry' <<<"${reg9_out}"; then
+    echo "[mcp] TR9 FAIL: register did not print the shadow warning" >&2
+    exit 1
+fi
+harness_call mcp uninstall dummy --force >/dev/null 2>&1 || true
+echo "[mcp] TR9 OK"
+
+# --- TR10: register from a git URL clones repo/ at the pinned ref; --start --
+
+echo "[mcp] TR10: register from a git URL clones repo/ at the pinned ref and --start boots"
+GITSRC="${TEST_ROOT}/reg10-src"
+mkdir -p "${GITSRC}"
+cat >"${GITSRC}/compose.yml" <<'EOF'
+services:
+  reg10:
+    image: alpine:latest
+    container_name: harness-mcp-test_reg10
+    networks: [harness-net]
+    profiles: [mcp]
+    command: sh -c 'sleep 9999'
+    healthcheck:
+      test: ["CMD-SHELL", "true"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+      start_period: 1s
+networks:
+  harness-net:
+EOF
+cat >"${GITSRC}/client-config.json" <<'EOF'
+{ "mcpServers": { "reg10": { "type": "sse", "url": "http://reg10:8765/sse" } } }
+EOF
+(
+    cd "${GITSRC}"
+    git init -q -b main 2>/dev/null || { git init -q; git checkout -q -b main 2>/dev/null || true; }
+    git -c user.email=t@example.invalid -c user.name=test add -A
+    git -c user.email=t@example.invalid -c user.name=test commit -q -m "reg10 mcp fixture"
+    git tag v0.0.1
+)
+harness_call mcp register reg10 --from "file://${GITSRC}" --ref v0.0.1 --start >"${TEST_ROOT}/reg10.log" 2>&1 || {
+    echo "[mcp] TR10 FAIL: register --start exited non-zero" >&2
+    tail -40 "${TEST_ROOT}/reg10.log" >&2
+    exit 1
+}
+if [[ ! -d "${FAKE_INSTALL_ROOT}/state/mcp/reg10/repo/.git" ]]; then
+    echo "[mcp] TR10 FAIL: source was not cloned into state/mcp/reg10/repo/" >&2
+    cat "${TEST_ROOT}/reg10.log" >&2
+    exit 1
+fi
+if ! grep -q '"repo_clone_url"' "${FAKE_INSTALL_ROOT}/state/mcp/reg10/harness-meta.json"; then
+    echo "[mcp] TR10 FAIL: provenance repo_clone_url not recorded" >&2
+    cat "${FAKE_INSTALL_ROOT}/state/mcp/reg10/harness-meta.json" >&2
+    exit 1
+fi
+if ! grep -q 'v0.0.1' "${FAKE_INSTALL_ROOT}/state/mcp/reg10/harness-meta.json"; then
+    echo "[mcp] TR10 FAIL: provenance repo_clone_ref (v0.0.1) not recorded" >&2
+    cat "${FAKE_INSTALL_ROOT}/state/mcp/reg10/harness-meta.json" >&2
+    exit 1
+fi
+# --start booted it: wait for the container to report healthy (60s ceiling).
+deadline=$(( $(date +%s) + 60 ))
+reg10_cid=""
+while true; do
+    reg10_cid=$(harness_docker ps -q --filter "name=^harness-mcp-test_reg10$" 2>/dev/null || true)
+    if [[ -n "${reg10_cid}" ]]; then
+        status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${reg10_cid}" 2>/dev/null || echo none)
+        if [[ "${status}" == "healthy" ]]; then break; fi
+    fi
+    if (( $(date +%s) >= deadline )); then
+        echo "[mcp] TR10 FAIL: reg10 not healthy in 60s" >&2
+        harness_docker logs "${reg10_cid}" 2>&1 | tail -20 >&2 || true
+        exit 1
+    fi
+    sleep 2
+done
+harness_call mcp down reg10 >/dev/null 2>&1 || true
+echo "[mcp] TR10 OK"
+
 echo "============================================================"
 echo " MCP TEST PASSED"
 echo "============================================================"

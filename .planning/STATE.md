@@ -115,8 +115,15 @@ Items acknowledged and carried forward from previous milestone close:
 ## Session Continuity
 
 Last session: 2026-06-02
-Stopped at: Phase 3 teardown + Phase 3b/4 test+docs cleanup complete and pushed
-to `nollama`; ollama fully removed from the data path. Next: confirm CI green on
-the docker suites, then proceed to the `harness mcp register` feature
-(.planning/proposals/mcp-register.md).
+Stopped at: ollama removal fully landed (Phases 1–4) AND the follow-on
+`harness mcp register` feature implemented end-to-end on `nollama`: command +
+shared-helper refactor (install/register converge on `mcp_materialize_src` /
+`mcp_print_firewall_recs`), compose-merge validation gate (merge check +
+service/container_name collision + host-port warn), architecture/mcp.md, and
+TR1–TR10 docker-tier tests in tests/mcp_test.sh (+ INVENTORY M024–M033 /
+COVERAGE rows). A self-collision defect in `--force` re-register (an enabled
+entry's own service collided with itself at validate time) was found while
+writing TR6 and fixed in `mcp_validate_staged` (exclude the entry's own
+current services/cnames from the collision baseline). Next: confirm CI green on
+the docker suites (mcp tier now includes TR1–TR10).
 Resume file: None
