@@ -46,17 +46,23 @@ when upstream cuts a tag with a fix we need). The reference example
 ## State machine
 
 ```
-available ──install──▶ installed-enabled ⇄ disable/enable ⇄ installed-disabled ──uninstall──▶ available
+available ──install/register──▶ installed-enabled ⇄ disable/enable ⇄ installed-disabled ──uninstall──▶ available
 ```
 
-The four lifecycle verbs (`install` / `uninstall` / `enable` / `disable`)
-are distinct and idempotent. `enable`/`disable` only flip the auto-start
-flag on an already-installed entry; they do not install or uninstall.
+`install` and `register` both move an entry from `available` to
+`installed`; they differ only in source. `install` copies a repo-tracked
+`mcp-registry/<name>/`; `register` lands an arbitrary external source (a
+registry-shaped dir or a git URL) **behind a compose-merge validation
+gate** (see [Dynamic registration](#dynamic-registration-register) below).
+`enable`/`disable` only flip the auto-start flag on an already-installed
+entry; they do not install or uninstall. `uninstall` is the inverse of
+both install and register — there is no separate `unregister`.
 
 | Verb                                  | Effect |
 |---------------------------------------|--------|
 | `harness mcp install <name>`          | Copy registry entry → active tree, set `enabled: true`. Re-install needs `--force`. |
-| `harness mcp uninstall <name> --force`| Remove the active entry. `data/` is preserved. |
+| `harness mcp register <name> --from <dir\|git-url>` | Materialize an external source → active tree behind a validation gate, set `enabled: true` (unless `--no-enable`). Re-register needs `--force`. |
+| `harness mcp uninstall <name> --force`| Remove the active entry. `data/` is preserved. Inverse of install **and** register. |
 | `harness mcp enable <name>`           | `enabled: true`. `harness start` will include it. |
 | `harness mcp disable <name>`          | `enabled: false`. Files stay; `harness start` skips it. |
 | `harness mcp up <name>`               | Start container immediately (works even if disabled). |
@@ -84,6 +90,69 @@ then "true" else ...`) because jq's `//` treats `false` as missing.
 
 Writes are atomic (temp file + `mv`) so a crashed write can't leave
 half-parsed JSON.
+
+## Dynamic registration (`register`)
+
+`harness mcp register <name> --from <dir|git-url> [--ref <ref>] [--no-enable]
+[--start] [--force]` brings an MCP into the runtime **without a repo
+commit**. Startup is already registry-independent — `mcp_compose_files`
+re-reads `state/mcp/*/` on every `harness start` and includes any enabled
+entry with a `compose.yml` — so registration reduces to one job: write a
+**validated** `state/mcp/<name>/` from a user-supplied source. No startup
+code changes; the auto-start guarantee is automatic.
+
+`install` and `register` share `mcp_materialize_src` (copy descriptors →
+target, clone any declared upstream build context → `<target>/repo`, set
+the enabled flag) and `mcp_print_firewall_recs`, so the two commands
+cannot drift.
+
+**Sources (`--from`).** Same four-file contract as a registry entry
+(`compose.yml` + `client-config.json` required; `harness-meta.json[.template]`
++ `README.md` optional):
+- a **directory** shaped like a registry entry, or
+- a **git URL** — cloned once at `--ref` into `<staging>/repo` (which
+  doubles as the build context); descriptors are read from the repo root
+  or a `harness-mcp/` subdir. The git-URL provenance is recorded into the
+  staged `harness-meta.json` (`repo_clone_url`/`repo_clone_ref`).
+
+**Materialize → validate → arm.** The source is materialized into a hidden
+**staging dir** `state/mcp/.staging-<name>/` (invisible to every discovery
+glob, which all use `*/` and skip dotdirs — so a crashed run never leaks
+into the live set). It is only armed if the validation gate passes:
+
+1. **Merge check** — `config -q` over (full current graph + staged snippet)
+   under a throwaway project name. Catches bad YAML and graphs that fail to
+   merge. This is the load-bearing check: every MCP snippet splices into ONE
+   `docker compose up`, so a snippet that fails to merge would take the proxy
+   and agent down with it.
+2. **Collision check** — every **service name** AND **container_name** the
+   staged snippet declares must be NEW. Compose silently *merges* same-named
+   services (override semantics) and fails `up` on duplicate
+   `container_name`; neither surfaces from `config -q`, so they are diffed
+   explicitly against the live graph (both sides enumerated with
+   `--profile mcp`, or profiled MCP services would be invisible). An empty
+   service list fails closed.
+3. **Port warning** — duplicate published host ports are warned (they fail
+   only at `up` time), not blocked.
+
+On any failure the staging dir is discarded and nothing in `state/mcp/`
+changed. On success the staged non-`data` files are swapped into
+`state/mcp/<name>/` while `data/` is left untouched in place (a crash can
+never orphan it), and `data/` is (re)created.
+
+**Why validate-then-enable** (not disabled-by-default): the only failure
+mode that affects *other* services is a snippet that fails to merge, and
+the gate closes that hole at register time. A single MCP's runtime crash is
+isolated by compose (`restart: unless-stopped`). So defaulting to enabled is
+safe and matches the goal "make sure they come up when harness does".
+`--no-enable` stages without arming; `--start` boots it immediately via
+`cmd_mcp_up`.
+
+**Shadow warning.** If `<name>` also names a `mcp-registry/` entry, register
+warns: a registered entry that later shares a registry name would start
+being managed by `harness upgrade` (`directory_overwrite` fires on
+`condition: installed`), silently overwriting the registered files. Use a
+distinct name.
 
 ## How installed MCPs reach the runtime
 
@@ -133,9 +202,10 @@ is directory-driven, though, so a custom MCP still shows up in
 
 ## `allowed_domains` recommendation
 
-If a registry MCP's `harness-meta.json.template` declares
-`allowed_domains: ["api.example.com", ...]`, `harness mcp install` prints
-a recommendation block with the matching `harness net allow` commands.
+If an MCP's `harness-meta.json[.template]` declares
+`allowed_domains: ["api.example.com", ...]`, both `harness mcp install` and
+`harness mcp register` print a recommendation block with the matching
+`harness net allow` commands (shared `mcp_print_firewall_recs`).
 **The allowlist is never modified automatically** — the user copy-pastes
 what they actually want. This is deliberate: MCPs are third-party code,
 and the security posture is "the operator explicitly opens the egress
@@ -144,8 +214,13 @@ they need."
 ## Adding a new MCP
 
 Currently supported: HTTP/SSE MCPs in Docker containers (Pattern A).
-Fork the repo and add `mcp-registry/<name>/` containing the four files
-listed above. See `mcp-registry/serena/` as the reference. To make the
-new entry follow `harness upgrade`, add a matching `registry_actions`
-entry to `scripts/upgrade-manifest.json`. Submit a PR to the official
-registry; for private MCPs, maintain your own fork.
+
+- **Vetted / shared:** fork the repo and add `mcp-registry/<name>/`
+  containing the four files listed above (see `mcp-registry/serena/` as the
+  reference). To make the new entry follow `harness upgrade`, add a matching
+  `registry_actions` entry to `scripts/upgrade-manifest.json`. Submit a PR to
+  the official registry; for private MCPs, maintain your own fork.
+- **Dynamic / no fork:** `harness mcp register <name> --from <dir|git-url>`
+  lands the same four-file contract into the active tree directly, behind the
+  validation gate, without a repo commit. This is the right path for one-off,
+  private, or experimental MCPs.

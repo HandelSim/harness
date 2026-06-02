@@ -646,20 +646,10 @@ mcp_is_enabled() {
 # Set meta.enabled to "true" or "false" atomically. Creates the file if it
 # doesn't already exist.
 mcp_set_enabled() {
-    local name="$1" value="$2"
-    local meta
-    meta=$(mcp_meta_file "$name")
-    mkdir -p "$(dirname "$meta")"
-    if command -v jq >/dev/null 2>&1 && [[ -f "$meta" ]]; then
-        local tmp="${meta}.tmp.$$"
-        if jq ".enabled = $value" "$meta" >"$tmp" 2>/dev/null; then
-            mv "$tmp" "$meta"
-            return 0
-        fi
-        rm -f "$tmp" 2>/dev/null || true
-    fi
-    # Fresh write or jq-less fallback.
-    printf '{"enabled": %s}\n' "$value" >"$meta"
+    # Name-based wrapper over the path-based _mcp_set_enabled_file (defined
+    # alongside the register helpers). register writes a staging meta directly
+    # via the path-based form before the entry is named.
+    _mcp_set_enabled_file "$(mcp_meta_file "$1")" "$2"
 }
 
 # Generate the runtime override file in-place. The file is rewritten on
@@ -3038,6 +3028,15 @@ subcommands:
                                   not yet installed.
   install <name> [--force]      copy a registry entry into the active tree
                                   and mark it enabled.
+  register <name> --from <dir|git-url> [--ref <ref>] [--no-enable] [--start] [--force]
+                                register an MCP from an arbitrary source (not
+                                  the repo registry) — a registry-shaped dir or
+                                  a git URL. The staged snippet is validated to
+                                  merge into the compose graph (and not collide
+                                  on service/container names) BEFORE it is
+                                  armed, so it can't brick 'harness start'.
+                                  --no-enable stages without auto-start; --start
+                                  boots it now; --force re-registers (data/ kept).
   uninstall <name> [--force]    remove an installed entry; data/ is preserved
   enable <name>                 mark an installed MCP as auto-start.
                                   Brought up the next time the stack starts.
@@ -3051,8 +3050,12 @@ subcommands:
   status <name>                 per-MCP diagnostic
 
 state diagram:
-  available --install--> installed-enabled <-> installed-disabled
+  available --install/register--> installed-enabled <-> installed-disabled
                                           \--uninstall--> available
+
+install reads the repo-tracked registry; register lands an external source
+(dir or git URL) behind a compose-merge validation gate. Both converge on the
+same installed entry; uninstall is the inverse of both.
 
 The four canonical lifecycle verbs (install / uninstall / enable / disable)
 are distinct: install/uninstall move between available and installed;
@@ -3170,14 +3173,514 @@ mcp_registry_names_csv() {
 # `config --services` returns empty and callers conclude "no services".
 # Mirror the env contract the `compose` wrapper sets.
 mcp_services_of() {
-    local name="$1"
-    local compose_file="$mcp_active_dir/$name/compose.yml"
+    # Thin name-based wrapper; the path-based compose_services_of_file (defined
+    # with the register helpers) is shared with register's collision check.
+    compose_services_of_file "$mcp_active_dir/$1/compose.yml"
+}
+
+# --- shared materialize + register helpers ----------------------------------
+#
+# `install` and `register` converge on the same job: copy a registry-shaped
+# source dir into the active tree (+ optional upstream clone for a build
+# context) and arm it for auto-start. The body is factored here so the two
+# commands can't drift. `register` adds a staging+validation gate on top so an
+# arbitrary (untrusted) source can't brick `harness start` — all MCP snippets
+# splice into ONE `docker compose up`, so a snippet that fails to merge takes
+# the proxy and agent down with it.
+
+# Atomically write {"enabled": <value>} into a specific meta file. Path-based
+# sibling of mcp_set_enabled (which is name-based and only ever writes the
+# active tree); register needs to arm a meta inside a staging dir before the
+# entry is moved into place.
+_mcp_set_enabled_file() {
+    local meta="$1" value="$2"
+    mkdir -p "$(dirname "$meta")"
+    if command -v jq >/dev/null 2>&1 && [[ -f "$meta" ]]; then
+        local tmp="${meta}.tmp.$$"
+        if jq ".enabled = $value" "$meta" >"$tmp" 2>/dev/null; then
+            mv "$tmp" "$meta"
+            return 0
+        fi
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+    printf '{"enabled": %s}\n' "$value" >"$meta"
+}
+
+# Print this MCP's allowed_domains as `harness net allow` recommendations. We
+# never auto-open the allowlist: MCPs are third-party code; the operator opens
+# egress deliberately. Empty/absent arrays produce no output. Shared by
+# install and register so the recommendation text can't drift.
+mcp_print_firewall_recs() {
+    local meta="$1"
+    [[ -f "$meta" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    local domains
+    domains=$(jq -r '(.allowed_domains // []) | .[]' "$meta" 2>/dev/null || true)
+    [[ -n "$domains" ]] || return 0
+    echo
+    echo "this MCP recommends allowlisting the following domains for outbound traffic:"
+    local d
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        echo "  $d"
+    done <<<"$domains"
+    echo
+    echo "to add them, run:"
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        echo "  harness net allow $d"
+    done <<<"$domains"
+}
+
+# Materialize a registry-shaped source dir into a target dir: copy the
+# descriptor files (rendering harness-meta.json.template -> harness-meta.json),
+# clone the declared upstream repo into <target>/repo for a build context, and
+# set the enabled flag. The caller is responsible for any pre-clean of the
+# target (install force-wipes all-but-data first; register stages into a fresh
+# dir). Does NOT touch <target>/data beyond ensuring it exists.
+#
+# Args: <name> <src_dir> <target_dir> <enabled_value> [ref_override]
+# A non-empty ref_override pins the upstream clone (register --ref); otherwise
+# the source meta's repo_clone_ref (default "main") is used.
+mcp_materialize_src() {
+    local name="$1" src="$2" target="$3" enabled_value="$4" ref_override="${5:-}"
+    mkdir -p "$target"
+    local f base
+    for f in "$src"/* "$src"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        # The .template is a source-side default for harness-meta.json — copy
+        # it under the real filename rather than leaving a .template around.
+        if [[ "$base" == "harness-meta.json.template" ]]; then
+            cp -a "$f" "$target/harness-meta.json"
+            continue
+        fi
+        # repo/ (an upstream clone already placed by register's git-url path)
+        # is the build context, not a descriptor file — never recursively
+        # copy it onto itself when src == target's parent staging.
+        cp -a "$f" "$target/"
+    done
+    mkdir -p "$target/data"
+
+    # If the meta declares an upstream repo_clone_url, clone it into
+    # <target>/repo so the compose snippet has a local build context. A
+    # git-URL build context fails on Windows (Docker Desktop mis-parses the
+    # URL as a host path); cloning host-side avoids that whole class of bug.
+    # Skipped when <target>/repo/.git already exists (register's git-url path
+    # pre-clones there), so --from <url> never double-clones.
+    local meta_file="$target/harness-meta.json"
+    if [[ -f "$meta_file" ]]; then
+        local clone_url clone_ref
+        clone_url=$(harness_jq -r '.repo_clone_url // empty' "$meta_file" 2>/dev/null || true)
+        clone_ref=$(harness_jq -r '.repo_clone_ref // "main"' "$meta_file" 2>/dev/null || true)
+        [[ -n "$ref_override" ]] && clone_ref="$ref_override"
+        if [[ -n "$clone_url" ]]; then
+            local clone_dir_local="$target/repo"
+            if [[ -d "$clone_dir_local/.git" ]]; then
+                echo "[harness] $name: repo clone already present at $clone_dir_local; skipping clone"
+            else
+                rm -rf "$clone_dir_local" 2>/dev/null || true
+                echo "[harness] $name: cloning $clone_url ($clone_ref) to $clone_dir_local..."
+                local clone_ok=0
+                if [[ "$clone_ref" =~ ^[0-9a-f]{40}$ ]]; then
+                    if ( set -e
+                         mkdir -p "$clone_dir_local"
+                         cd "$clone_dir_local"
+                         git init -q
+                         git remote add origin "$clone_url"
+                         git fetch --depth=1 origin "$clone_ref"
+                         git checkout -q FETCH_HEAD ); then
+                        clone_ok=1
+                    fi
+                else
+                    if git clone --depth=1 --branch "$clone_ref" "$clone_url" "$clone_dir_local"; then
+                        clone_ok=1
+                    fi
+                fi
+                if [[ $clone_ok -ne 1 ]]; then
+                    err "$name: repo clone failed (target: $clone_dir_local)"
+                    err "         clone URL: $clone_url ($clone_ref)"
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    _mcp_set_enabled_file "$meta_file" "$enabled_value"
+}
+
+# Enumerate the service names declared by a single compose snippet, standalone.
+# `--profile mcp` is required or profiled MCP services are omitted (verified
+# against compose v2). Any config error renders as empty output.
+compose_services_of_file() {
+    local compose_file="$1"
     [[ -f "$compose_file" ]] || return 0
     local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
     INSTALL_ROOT="$install_root" \
         HARNESS_ALLOWLIST_PATH="$allowlist_path" \
         HARNESS_PROJECTS_ROOT="$projects_root" \
         harness_docker compose -f "$compose_file" --profile mcp config --services 2>/dev/null || true
+}
+
+# Enumerate the container_name values a single compose snippet declares. A
+# snippet can dodge the service-name collision check yet hardcode a
+# container_name another service already uses (Serena does); that fails `up`
+# with "container name already in use" at start time, after the proxy is up.
+# Catch it at register time. Any config error renders as empty output.
+compose_cnames_of_file() {
+    local compose_file="$1"
+    [[ -f "$compose_file" ]] || return 0
+    local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
+    INSTALL_ROOT="$install_root" \
+        HARNESS_ALLOWLIST_PATH="$allowlist_path" \
+        HARNESS_PROJECTS_ROOT="$projects_root" \
+        harness_docker compose -f "$compose_file" --profile mcp config --format json 2>/dev/null \
+        | harness_jq -r '.services // {} | to_entries[] | .value.container_name // empty' 2>/dev/null || true
+}
+
+# Run `docker compose` over the full harness graph (main compose + runtime
+# override + every currently-enabled MCP snippet), optionally splicing in one
+# extra (staged) snippet BEFORE the subcommand. register's validation gate
+# needs the staged `-f` and `--profile` ahead of `config`, which the public
+# `compose` wrapper can't do (it appends caller args AFTER the subcommand).
+# Runs under a throwaway project name so it can never resolve to — or act on —
+# the live stack's containers; only ever invoked with read-only `config`.
+# Args: <extra_compose_file_or_empty> <compose subcommand args...>
+harness_compose_graph() {
+    local extra="$1"; shift
+    write_runtime_override
+    local args=(
+        compose
+        --project-name "${project_name}-regcheck"
+        -f "$(harness_docker_path "$clone_dir/docker-compose.yml")"
+    )
+    if [[ -f "$env_file" ]]; then args+=(--env-file "$(harness_docker_path "$env_file")"); fi
+    if [[ -f "$runtime_override" ]]; then args+=(-f "$(harness_docker_path "$runtime_override")"); fi
+    local mcp_arg
+    while IFS= read -r mcp_arg; do
+        [[ -n "$mcp_arg" ]] && args+=("$mcp_arg")
+    done < <(mcp_compose_files)
+    if [[ -n "$extra" ]]; then args+=(-f "$(harness_docker_path "$extra")"); fi
+    local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
+    INSTALL_ROOT="$install_root" \
+        HARNESS_ALLOWLIST_PATH="$allowlist_path" \
+        HARNESS_PROJECTS_ROOT="$projects_root" \
+        HARNESS_HOST_OS="$(harness_detect_os)" \
+        harness_docker "${args[@]}" "$@"
+}
+
+# The load-bearing gate. Validate a staged snippet against the live graph
+# BEFORE it is armed. Two hard checks + one warning:
+#   1. Merge check: `config -q` over (full graph + staged) catches bad YAML and
+#      graphs that fail to merge — the only failure mode that takes down OTHER
+#      services.
+#   2. Collision check: every service-name AND container_name the staged
+#      snippet declares must be NEW. Compose silently MERGES same-named
+#      services (override semantics) and fails `up` on duplicate
+#      container_names — neither surfaces from `config -q`, so diff explicitly.
+#   3. Warn (don't fail) on duplicate published host ports (they fail only at
+#      `up` time).
+# Returns 0 if safe to arm, non-zero otherwise (caller discards staging).
+# Args: <name> <staged_compose_file>
+mcp_validate_staged() {
+    local name="$1" staged="$2"
+
+    # 1. Merge check.
+    if ! harness_compose_graph "$staged" --profile mcp config -q 2>/tmp/harness-regcheck.$$; then
+        err "$name: staged compose does not merge into the harness graph:"
+        sed 's/^/         /' /tmp/harness-regcheck.$$ >&2 2>/dev/null || true
+        rm -f /tmp/harness-regcheck.$$ 2>/dev/null || true
+        return 1
+    fi
+    rm -f /tmp/harness-regcheck.$$ 2>/dev/null || true
+
+    # The snippet must declare at least one service (an empty/serviceless
+    # snippet means config silently produced nothing — fail closed rather than
+    # treat "no services" as "no collisions").
+    local snippet_services
+    snippet_services=$(compose_services_of_file "$staged")
+    if [[ -z "$snippet_services" ]]; then
+        err "$name: staged compose declares no services (nothing to register, or config failed silently)"
+        return 1
+    fi
+
+    # 2a. Service-name collisions.
+    local baseline_services
+    baseline_services=$(harness_compose_graph "" --profile mcp config --services 2>/dev/null || true)
+    local svc collisions=""
+    while IFS= read -r svc; do
+        [[ -z "$svc" ]] && continue
+        if grep -qxF "$svc" <<<"$baseline_services"; then
+            collisions+=" $svc"
+        fi
+    done <<<"$snippet_services"
+    if [[ -n "$collisions" ]]; then
+        err "$name: staged compose redefines service(s) already in the graph:$collisions"
+        err "         compose would silently override them; pick distinct service names."
+        return 1
+    fi
+
+    # 2b. container_name collisions.
+    local snippet_cnames baseline_cnames cn cn_collisions=""
+    snippet_cnames=$(compose_cnames_of_file "$staged")
+    if [[ -n "$snippet_cnames" ]]; then
+        baseline_cnames=$(harness_compose_graph "" --profile mcp config --format json 2>/dev/null \
+            | harness_jq -r '.services // {} | to_entries[] | .value.container_name // empty' 2>/dev/null || true)
+        while IFS= read -r cn; do
+            [[ -z "$cn" ]] && continue
+            if grep -qxF "$cn" <<<"$baseline_cnames"; then
+                cn_collisions+=" $cn"
+            fi
+        done <<<"$snippet_cnames"
+        if [[ -n "$cn_collisions" ]]; then
+            err "$name: staged compose reuses container_name(s) already in the graph:$cn_collisions"
+            err "         'harness start' would fail with 'container name already in use'."
+            return 1
+        fi
+    fi
+
+    # 3. Duplicate published host ports (warn only — fails at up time, not now).
+    local merged_ports staged_ports p
+    merged_ports=$(harness_compose_graph "" --profile mcp config --format json 2>/dev/null \
+        | harness_jq -r '[.services // {} | .[]?.ports // [] | .[]? | .published // empty] | .[]' 2>/dev/null || true)
+    staged_ports=$(compose_published_ports_of_file "$staged")
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        if grep -qxF "$p" <<<"$merged_ports"; then
+            echo "[harness] warning: $name publishes host port $p, already bound in the graph — 'harness start' may fail at up time." >&2
+        fi
+    done <<<"$staged_ports"
+
+    return 0
+}
+
+# Published host ports a single snippet declares (best-effort; for the
+# duplicate-port warning). Empty on any config error.
+compose_published_ports_of_file() {
+    local compose_file="$1"
+    [[ -f "$compose_file" ]] || return 0
+    local projects_root="${HARNESS_PROJECTS_ROOT:-$HOME}"
+    INSTALL_ROOT="$install_root" \
+        HARNESS_ALLOWLIST_PATH="$allowlist_path" \
+        HARNESS_PROJECTS_ROOT="$projects_root" \
+        harness_docker compose -f "$compose_file" --profile mcp config --format json 2>/dev/null \
+        | harness_jq -r '[.services // {} | .[]?.ports // [] | .[]? | .published // empty] | .[]' 2>/dev/null || true
+}
+
+# register: land an arbitrary source (a registry-shaped dir, or a git URL) into
+# the active tree behind the validation gate. See .planning/proposals/
+# mcp-register.md and architecture/mcp.md.
+cmd_mcp_register() {
+    local name="" from="" ref="" no_enable=0 do_start=0 force=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --from)      from="${2:-}"; shift ;;
+            --from=*)    from="${1#--from=}" ;;
+            --ref)       ref="${2:-}"; shift ;;
+            --ref=*)     ref="${1#--ref=}" ;;
+            --no-enable) no_enable=1 ;;
+            --start)     do_start=1 ;;
+            --force)     force=1 ;;
+            -*)          err "unknown flag '$1'"; exit 1 ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    err "unexpected extra argument '$1'"
+                    exit 1
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    if [[ -z "$from" ]]; then
+        err "usage: harness mcp register <name> --from <dir|git-url> [--ref <ref>] [--no-enable] [--start] [--force]"
+        exit 1
+    fi
+
+    # Resolve name: basename of --from when omitted (strip a trailing .git for
+    # git URLs).
+    if [[ -z "$name" ]]; then
+        name=$(basename "$from")
+        name="${name%.git}"
+    fi
+    if [[ -z "$name" || "$name" == "." || "$name" == ".." || "$name" == *"/"* ]]; then
+        err "could not derive a valid MCP name from '$from'; pass an explicit <name>"
+        exit 1
+    fi
+
+    require_docker
+
+    # Refuse a name that's already installed (compose.yml present) unless
+    # --force. A surviving post-uninstall dir (data/ only, no compose.yml) is
+    # not "installed" and is allowed through.
+    if mcp_is_installed "$name" && (( ! force )); then
+        err "$name is already installed (use --force to overwrite; data/ is preserved)"
+        exit 1
+    fi
+
+    # Shadow warning: a registered entry that later shares a registry name
+    # would start being managed by `harness upgrade` (directory_overwrite fires
+    # on condition: installed), silently overwriting the registered files.
+    if [[ -d "$registry_dir/$name" ]]; then
+        echo "[harness] warning: '$name' also names a registry entry ($registry_dir/$name)." >&2
+        echo "[harness]          'harness upgrade' would later overwrite this registered copy from the registry." >&2
+        echo "[harness]          Consider a distinct name to keep the registered entry independent." >&2
+    fi
+
+    local staging="$mcp_active_dir/.staging-$name"
+    mkdir -p "$mcp_active_dir"
+    # Clear any leftover staging from a prior crashed run (invisible to
+    # discovery globs, so it would otherwise accumulate).
+    rm -rf "$staging" 2>/dev/null || true
+
+    local enabled_value="true"
+    (( no_enable )) && enabled_value="false"
+
+    # Resolve the source into a descriptor dir ($src) that mcp_materialize_src
+    # can copy from. Two source kinds:
+    local src=""
+    if [[ -d "$from" ]]; then
+        # Directory source. --ref only applies if the dir's meta declares an
+        # upstream repo_clone_url (the clone mcp_materialize_src may run).
+        src="$from"
+    elif [[ "$from" == *"://"* || "$from" == git@* || "$from" == *.git ]]; then
+        # Git-URL source: clone it ONCE (at --ref) into staging/repo, then look
+        # for the descriptor files (compose.yml + client-config.json) at the
+        # repo root or under harness-mcp/. The clone doubles as the build
+        # context, so mcp_materialize_src's clone step is a no-op (repo/.git
+        # present).
+        mkdir -p "$staging"
+        local clone_ref="${ref:-main}"
+        echo "[harness] $name: cloning $from ($clone_ref) to $staging/repo..."
+        local clone_ok=0
+        if [[ "$clone_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            if ( set -e
+                 mkdir -p "$staging/repo"
+                 cd "$staging/repo"
+                 git init -q
+                 git remote add origin "$from"
+                 git fetch --depth=1 origin "$clone_ref"
+                 git checkout -q FETCH_HEAD ); then
+                clone_ok=1
+            fi
+        else
+            if git clone --depth=1 --branch "$clone_ref" "$from" "$staging/repo"; then
+                clone_ok=1
+            fi
+        fi
+        if (( ! clone_ok )); then
+            err "$name: clone of $from ($clone_ref) failed"
+            rm -rf "$staging" 2>/dev/null || true
+            exit 1
+        fi
+        if [[ -f "$staging/repo/compose.yml" && -f "$staging/repo/client-config.json" ]]; then
+            src="$staging/repo"
+        elif [[ -f "$staging/repo/harness-mcp/compose.yml" && -f "$staging/repo/harness-mcp/client-config.json" ]]; then
+            src="$staging/repo/harness-mcp"
+        else
+            err "$name: cloned repo has no MCP descriptor (need compose.yml + client-config.json at repo root or harness-mcp/)"
+            err "        point --from at a directory containing those files instead."
+            rm -rf "$staging" 2>/dev/null || true
+            exit 1
+        fi
+    else
+        err "$name: --from '$from' is neither an existing directory nor a git URL"
+        exit 1
+    fi
+
+    # Enforce the four-file contract's two required files.
+    if [[ ! -f "$src/compose.yml" ]]; then
+        err "$name: source is missing required compose.yml ($src)"
+        rm -rf "$staging" 2>/dev/null || true
+        exit 1
+    fi
+    if [[ ! -f "$src/client-config.json" ]]; then
+        err "$name: source is missing required client-config.json ($src)"
+        rm -rf "$staging" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Materialize descriptors into staging (clone any declared upstream;
+    # arm the enabled flag). For a git-URL source the repo is already at
+    # staging/repo so the clone step is skipped.
+    if ! mcp_materialize_src "$name" "$src" "$staging" "$enabled_value" "$ref"; then
+        err "$name: materialize failed; nothing registered"
+        rm -rf "$staging" 2>/dev/null || true
+        exit 1
+    fi
+
+    # If the source itself synthesized no meta, materialize created one via the
+    # enabled write — record the git-URL provenance so `harness upgrade` and a
+    # later re-register can see where this came from.
+    if [[ "$from" == *"://"* || "$from" == git@* || "$from" == *.git ]]; then
+        local meta="$staging/harness-meta.json"
+        if command -v jq >/dev/null 2>&1 && [[ -f "$meta" ]]; then
+            local tmp="${meta}.tmp.$$"
+            if jq --arg u "$from" --arg r "${ref:-main}" \
+                 '.repo_clone_url = (.repo_clone_url // $u) | .repo_clone_ref = (.repo_clone_ref // $r)' \
+                 "$meta" >"$tmp" 2>/dev/null; then
+                mv "$tmp" "$meta"
+            fi
+            rm -f "$tmp" 2>/dev/null || true
+        fi
+    fi
+
+    # VALIDATE before arming anything in the live tree.
+    if ! mcp_validate_staged "$name" "$staging/compose.yml"; then
+        rm -rf "$staging" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Atomically swap staging into place WITHOUT ever moving dest/data: clear
+    # the dest's non-data files (force-reinstall), then move staged non-data
+    # entries in. data/ stays put through the whole operation, so a crash can
+    # never orphan it.
+    local dest="$mcp_active_dir/$name"
+    mkdir -p "$dest"
+    local f base
+    for f in "$dest"/*; do
+        [[ -e "$f" ]] || continue
+        [[ "$(basename "$f")" == "data" ]] && continue
+        rm -rf "$f"
+    done
+    for f in "$staging"/* "$staging"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        [[ "$base" == "data" ]] && continue
+        rm -rf "${dest:?}/${base:?}"
+        mv "$f" "$dest/$base"
+    done
+    mkdir -p "$dest/data"
+    rm -rf "$staging" 2>/dev/null || true
+
+    local state_label="installed-enabled"
+    (( no_enable )) && state_label="installed-disabled"
+    cat <<EOF
+registered: $name (from $from)
+state: $state_label
+data: $dest/data
+services: $(compose_services_of_file "$dest/compose.yml" | paste -sd, - 2>/dev/null)
+EOF
+
+    mcp_print_firewall_recs "$dest/harness-meta.json"
+
+    if (( do_start )); then
+        if (( no_enable )); then
+            echo
+            echo "[harness] --start with --no-enable: bringing it up now, but it will NOT auto-start on 'harness start'."
+        fi
+        echo
+        cmd_mcp_up "$name"
+    else
+        echo
+        if (( no_enable )); then
+            echo "next: 'harness mcp enable $name' then 'harness start' (or 'harness mcp up $name' to run it now)."
+        else
+            echo "next: 'harness start' (or 'harness restart' if already up) brings it up; 'harness mcp up $name' runs it now."
+        fi
+    fi
 }
 
 # install: registry -> active tree. Default state is enabled.
@@ -3242,90 +3745,14 @@ cmd_mcp_install() {
             rm -rf "$f"
         done
     fi
-    mkdir -p "$dest"
-    local f
-    for f in "$src"/* "$src"/.[!.]*; do
-        [[ -e "$f" ]] || continue
-        # The .template file is a registry-side default for harness-meta.json
-        # that we materialize into the active tree below — copy as the real
-        # filename rather than leaving the .template extension lying around.
-        local base
-        base=$(basename "$f")
-        if [[ "$base" == "harness-meta.json.template" ]]; then
-            cp -a "$f" "$dest/harness-meta.json"
-            continue
-        fi
-        cp -a "$f" "$dest/"
-    done
-    mkdir -p "$dest/data"
-
-    # If the registry meta declared a repo_clone_url, clone the upstream
-    # repo into state/mcp/<name>/repo/ so the compose snippet can use a
-    # local build context. Some upstreams (Serena) failed on Windows when
-    # docker tried to fetch the build context directly from a git URL —
-    # the WSL2 backend mis-parses the URL as a local path. Cloning here
-    # is host-side, native git, no Docker URL parsing involved.
-    #
-    # Done BEFORE mcp_set_enabled because that helper has a jq-less
-    # fallback that overwrites the meta with `{"enabled": true}` only —
-    # which would drop repo_clone_url before we got to read it. By
-    # reading the freshly-copied template meta first, we're immune.
-    # harness_jq (host jq with Docker fallback) is used so the clone
-    # block fires even when host jq is unavailable.
-    local meta_file="$dest/harness-meta.json"
-    if [[ -f "$meta_file" ]]; then
-        local clone_url clone_ref
-        clone_url=$(harness_jq -r '.repo_clone_url // empty' "$meta_file" 2>/dev/null || true)
-        clone_ref=$(harness_jq -r '.repo_clone_ref // "main"' "$meta_file" 2>/dev/null || true)
-        if [[ -n "$clone_url" ]]; then
-            local clone_dir_local="$dest/repo"
-            if [[ -d "$clone_dir_local/.git" ]]; then
-                echo "[harness] $name: repo clone already present at $clone_dir_local; skipping clone"
-            else
-                # Clear any stale non-git directory so the clone target is empty.
-                rm -rf "$clone_dir_local" 2>/dev/null || true
-                echo "[harness] $name: cloning $clone_url ($clone_ref) to $clone_dir_local..."
-                # Fatal on failure: the compose snippet build context points
-                # at this path, so 'harness start' would fail later anyway —
-                # better to fail loudly here than report a successful install.
-                #
-                # `git clone --branch` accepts only branch/tag names. For
-                # full 40-char commit SHAs (reproducibility pins), use
-                # init + fetch <sha> + checkout FETCH_HEAD instead. Short
-                # SHAs fall through to the --branch path and fail there
-                # (smart-http fetch protocol requires full SHAs).
-                local clone_ok=0
-                if [[ "$clone_ref" =~ ^[0-9a-f]{40}$ ]]; then
-                    if ( set -e
-                         mkdir -p "$clone_dir_local"
-                         cd "$clone_dir_local"
-                         git init -q
-                         git remote add origin "$clone_url"
-                         git fetch --depth=1 origin "$clone_ref"
-                         git checkout -q FETCH_HEAD ); then
-                        clone_ok=1
-                    fi
-                else
-                    if git clone --depth=1 --branch "$clone_ref" "$clone_url" "$clone_dir_local"; then
-                        clone_ok=1
-                    fi
-                fi
-                if [[ $clone_ok -ne 1 ]]; then
-                    err "$name: repo clone failed (target: $clone_dir_local)"
-                    err "         clone URL: $clone_url ($clone_ref)"
-                    err "         install aborted; retry with 'harness mcp install $name --force' once resolved"
-                    exit 1
-                fi
-            fi
-        fi
+    # Copy descriptors, clone any declared upstream build context, and arm
+    # enabled=true — shared with `register` via mcp_materialize_src so the two
+    # commands can't drift. A fresh install is always enabled regardless of
+    # what the template said.
+    if ! mcp_materialize_src "$name" "$src" "$dest" "true"; then
+        err "         install aborted; retry with 'harness mcp install $name --force' once resolved"
+        exit 1
     fi
-
-    # Always force enabled=true on a fresh install regardless of what (if
-    # anything) the template said. allowed_domains and any other registry-side
-    # defaults are preserved by the copy above. Done AFTER the clone block
-    # so the jq-less fallback path in mcp_set_enabled can't drop
-    # repo_clone_url before we read it.
-    mcp_set_enabled "$name" "true"
 
     cat <<EOF
 installed: $name (from $src)
@@ -3336,29 +3763,7 @@ next:
   agents launched after that will see this MCP in their config.
 EOF
 
-    # If the MCP's harness-meta.json declared allowed_domains, surface them
-    # as a recommendation. We DO NOT auto-add — the user should make the
-    # network-policy decision deliberately. Empty arrays produce no output.
-    local installed_meta="$dest/harness-meta.json"
-    if [[ -f "$installed_meta" ]] && command -v jq >/dev/null 2>&1; then
-        local domains
-        domains=$(jq -r '(.allowed_domains // []) | .[]' "$installed_meta" 2>/dev/null || true)
-        if [[ -n "$domains" ]]; then
-            echo
-            echo "this MCP recommends allowlisting the following domains for outbound traffic:"
-            local d
-            while IFS= read -r d; do
-                [[ -z "$d" ]] && continue
-                echo "  $d"
-            done <<<"$domains"
-            echo
-            echo "to add them, run:"
-            while IFS= read -r d; do
-                [[ -z "$d" ]] && continue
-                echo "  harness net allow $d"
-            done <<<"$domains"
-        fi
-    fi
+    mcp_print_firewall_recs "$dest/harness-meta.json"
 }
 
 # uninstall: stop containers, remove active tree (preserve data/).
@@ -3717,6 +4122,7 @@ cmd_mcp() {
         help|-h|--help) cmd_mcp_help ;;
         list)           cmd_mcp_list "$@" ;;
         install)        cmd_mcp_install "$@" ;;
+        register)       cmd_mcp_register "$@" ;;
         uninstall)      cmd_mcp_uninstall "$@" ;;
         enable)         cmd_mcp_enable "$@" ;;
         disable)        cmd_mcp_disable "$@" ;;
