@@ -1620,9 +1620,14 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertIn("results you get back are real", operating)
         self.assertIn("don't downgrade to listing commands", operating)
         self.assertIn("opencode", operating)
-        # Tools content: JSON envelope + no-fabricated-results.
-        self.assertIn('"name": ...', operating)
-        self.assertIn('"arguments": ...', operating)
+        # Tools content: JSON envelope (the tool-call body shape and the
+        # complete-block requirement from issue #121) + no-fabricated-
+        # results. Phrasing tightened in #121 to ban abbreviated/partial
+        # fences and require valid JSON \escape on backslashes.
+        self.assertIn('"name": "<tool>"', operating)
+        self.assertIn('"arguments": {...}', operating)
+        self.assertIn("COMPLETE ```json", operating)
+        self.assertIn("JSON-escaped", operating)
         self.assertIn("do not invent", operating)
         # Workflow content: prefer listed tool, todowrite, task agents,
         # parallel/concurrent.

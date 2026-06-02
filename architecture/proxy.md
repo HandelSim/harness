@@ -381,6 +381,78 @@ Lifting fabricates no values — only top-level keys the model already
 wrote — so a misshaped call surfaces upstream as a real argument-shape
 error the model can correct rather than bleeding into chat.
 
+## Malformed tool-call retry (in-proxy)
+
+Two failure modes look like the model *tried* to call a tool but produced
+output that `extract_tool_calls_and_text` could not parse, and bleeding
+the raw fence into chat ends the turn with no recovery:
+
+- **Malformed fence** — a ```json fence opener followed by a non-`{`
+  character (or by EOF). The observed shape is
+  ` ```json_parse_or_id:todowrite}` (issue #121): the model fabricated a
+  tool-call shorthand instead of emitting a full block. Markdown renders
+  the unclosed fence as a collapsed/empty code block and `done_reason:
+  stop` ends the turn silently.
+- **Malformed `\escape`** — a brace-balanced JSON object whose strings
+  carry an invalid JSON escape (e.g. `\x1e`, `\a`, `\v` — any `\X` where
+  X is not in `"\\/bfnrtu`). `json.loads(..., strict=False)` rejects
+  these with a spec-defined `Invalid \escape` error, the block fails to
+  extract, and the fence bleeds into chat as text. Common when the
+  model lazily transcribes a Python/C source literal into JSON without
+  re-escaping backslashes.
+
+When extraction yields zero tool calls AND `_diagnose_failed_tool_call`
+classifies the response as one of these two kinds, the proxy appends a
+corrective `[assistant(<bad response>), user(<correction>)]` pair to the
+conversation and re-POSTs upstream **once** (budget = 1). The retry goes
+through the same `translate_history_and_apply_prompt` scaffolding as the
+original, so the corrective lands in the hybrid recency `USER_REQUEST`
+slot with the live tool list still at the stable prefix — the model sees
+the full operating rules plus "your previous attempt failed for this
+specific reason; emit the same call(s) again". If the retry produces a
+non-malformed response (valid tool calls, prose, or empty), the retry's
+result replaces the bad attempt and only the retry is streamed back —
+**opencode never sees the failed attempt or any proxy-injected
+correction text**. If the retry itself errors (timeout, non-2xx,
+non-JSON) or produces ANOTHER malformed-tool-call attempt, the original
+bad response falls through to the pre-existing bleed/empty-rescue path;
+the retry is strictly additive.
+
+The detector is conservative so that prose describing JSON doesn't
+trigger a spurious retry:
+
+- `malformed_escape` fires only when a brace-balanced JSON body
+  immediately follows a ```json fence AND `json.loads` raises the
+  JSON-spec `Invalid \escape` error. False-positive risk is near zero
+  because (a) the body already passed balanced-brace scanning, (b) the
+  fence shape was already cleared, and (c) the trigger is the JSON
+  parser's own error string, not a heuristic.
+- `malformed_fence` fires only when the *stripped* response **starts
+  with** the broken fence (no prior prose) AND the first ```json
+  opener is not followed by a balanced JSON object AND there is no
+  later ```json fence in the same response. Prose like "Here's an
+  example: ```json {wrong shape}" stays in clean_text as before.
+
+Other JSON parse errors (brace-unbalanced, shape-wrong-but-parsed,
+missing-key) continue to use the existing "left in text on parse
+failure" path. The retry is keyed to the two failure modes that produce
+turn-ending no-result outputs; everything else continues to bleed
+visibly so the model (and the user, via opencode) can react.
+
+Observability: when retry fires, `catch_all` logs
+`[req_id] in-proxy retry for malformed tool call (kind=<kind>);
+attempt=1, recovered=<yes|no>` and the retry's request/response dumps
+land at `<req_id>_02_API_Retry_Request.json` /
+`<req_id>_03_API_Retry_Response.json` (or `_03_API_Retry_Error.json` if
+the retry POST failed) alongside the original `_02`/`_03` dumps.
+
+The cooperative-prompt reminder's **Operating** bullet was tightened in
+the same change: the tool-call instruction now requires a **complete**
+```json...``` block (opener + body + closing fence, never an abbreviated
+identifier or partial fence) and names valid JSON `\escape` sequences
+(`\n`, `\x1e`, `\\`) so the bad-escape failure mode is less likely to
+arise in the first place. Retry catches the cases that slip through.
+
 ## Empty-response detection
 
 Some upstreams silently short-circuit before generation — the response is
