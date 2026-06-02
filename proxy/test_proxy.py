@@ -631,6 +631,78 @@ And answer "what does this do?"'''
         self.assertIn("get_weather", c)
 
 
+class TestListContentFlattening(unittest.TestCase):
+    """Regression: some clients send `content` as a list of content-blocks
+    (multimodal user turns, or the AI SDK structuring an assistant turn as
+    parts) instead of a plain string. Left as a list it crashed the proxy
+    with a 500 in three places: assistant `.strip()`, the system/user `+=`
+    concatenation, and the token-estimate `"\\n".join(...)`. Every inbound
+    message's content is now flattened via `_flatten_content_to_str` before
+    those paths run. These tests pin that contract and the no-crash behavior
+    in every prompt mode."""
+
+    def test_flatten_passes_str_through_unchanged(self):
+        self.assertEqual(proxy._flatten_content_to_str("hello"), "hello")
+        self.assertEqual(proxy._flatten_content_to_str(""), "")
+
+    def test_flatten_joins_block_dicts_on_text(self):
+        blocks = [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]
+        self.assertEqual(proxy._flatten_content_to_str(blocks), "first\n\nsecond")
+
+    def test_flatten_handles_bare_string_blocks(self):
+        self.assertEqual(proxy._flatten_content_to_str(["a", "b"]), "a\n\nb")
+
+    def test_flatten_skips_blocks_without_text(self):
+        # Non-text blocks (e.g. image_url) carry no `text`; they drop out
+        # rather than crashing or emitting "None".
+        blocks = [
+            {"type": "text", "text": "caption"},
+            {"type": "image_url", "image_url": {"url": "data:..."}},
+        ]
+        self.assertEqual(proxy._flatten_content_to_str(blocks), "caption")
+
+    def test_flatten_coerces_other_types_via_str(self):
+        self.assertEqual(proxy._flatten_content_to_str(42), "42")
+
+    def test_assistant_list_content_does_not_crash(self):
+        # The exact shape that produced "'list' object has no attribute
+        # 'strip'": a prior assistant turn whose content is a parts list.
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "text", "text": "earlier reply"}]},
+            {"role": "user", "content": "again"},
+        ]
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "")
+        assistant = [m for m in out if m["role"] == "assistant"]
+        self.assertEqual(len(assistant), 1)
+        self.assertEqual(assistant[0]["content"], "earlier reply")
+
+    def test_user_multimodal_list_content_does_not_crash(self):
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "say hello"}]}]
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "")
+        user = [m for m in out if m["role"] == "user"]
+        self.assertTrue(user)
+        self.assertIn("say hello", user[-1]["content"])
+
+    def test_user_front_mode_list_content_does_not_crash(self):
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "say hello"}]}]
+        with patch.object(proxy, "_PROMPT_MODE", "user_front"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "")
+        self.assertIn("say hello", out[-1]["content"])
+
+    def test_passthrough_mode_list_content_preserved_verbatim(self):
+        # In passthrough the translator returns messages verbatim (list
+        # content stays a list); the flatten safety net lives at the
+        # token-estimate join instead, exercised by _flatten directly above.
+        blocks = [{"type": "text", "text": "say hello"}]
+        msgs = [{"role": "user", "content": blocks}]
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            out = proxy.translate_history_and_apply_prompt(msgs, "")
+        self.assertEqual(out[0]["content"], blocks)
+
+
 class TestPromptInjectionModes(unittest.TestCase):
     """Two configurable injection paths for the cooperative tool-use
     scaffolding, selected by PROXY_PROMPT_MODE: 'user_front', 'hybrid'.

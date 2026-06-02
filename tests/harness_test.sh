@@ -1851,6 +1851,77 @@ if [[ "${t26_execs}" != "2" ]]; then
 fi
 echo "[harness-test] T26 OK"
 
+# --- Test 27: MCP meta ops use harness_jq on a jq-less host (#8 family) -----
+#
+# Same root cause as #8: the MCP meta read/write helpers parsed JSON with
+# bare `jq` gated on `command -v jq`. On a docker-only host (no host jq) the
+# gate failed and the helpers silently degraded:
+#   - _mcp_set_enabled_file clobbered every meta field but .enabled,
+#   - mcp_print_firewall_recs printed nothing,
+#   - write_agent_mcp_config skipped the client-config merge entirely.
+# The fix routes them through harness_jq (host jq OR container fallback) with
+# no `command -v jq` gate. We simulate a jq-less host (stub `command -v jq`
+# to report jq missing) and stand harness_jq in for the container fallback
+# with the real host jq, then assert each helper still does the right thing.
+echo "[harness-test] T27: MCP meta ops use harness_jq on a jq-less host (#8 family)"
+
+# 27a: _mcp_set_enabled_file flips .enabled while PRESERVING other fields.
+t27_meta="${TEST_ROOT}/t27-meta.json"
+printf '%s\n' '{"enabled": true, "allowed_domains": ["example.com"], "repo_clone_url": "https://x/y.git"}' >"$t27_meta"
+(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    command() { if [[ "${1:-}" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi; builtin command "$@"; }
+    harness_jq() { jq "$@"; }   # stand in for the container-jq fallback
+    _mcp_set_enabled_file "$t27_meta" false
+)
+if ! grep -q '"enabled": false' "$t27_meta"; then
+    echo "[harness-test] T27 FAIL: _mcp_set_enabled_file did not set enabled=false on a jq-less host" >&2
+    cat "$t27_meta" >&2; exit 1
+fi
+if ! grep -q 'example.com' "$t27_meta" || ! grep -q 'y.git' "$t27_meta"; then
+    echo "[harness-test] T27 FAIL [#8]: toggle clobbered other meta fields on a jq-less host" >&2
+    cat "$t27_meta" >&2; exit 1
+fi
+
+# 27b: mcp_print_firewall_recs still prints the allowed_domains recs (the
+# meta from 27a kept its allowed_domains array).
+t27_recs=$(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    command() { if [[ "${1:-}" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi; builtin command "$@"; }
+    harness_jq() { jq "$@"; }
+    mcp_print_firewall_recs "$t27_meta"
+)
+if ! grep -q 'example.com' <<<"$t27_recs"; then
+    echo "[harness-test] T27 FAIL [#8]: mcp_print_firewall_recs printed nothing on a jq-less host" >&2
+    echo "$t27_recs" >&2; exit 1
+fi
+
+# 27c: write_agent_mcp_config merges every enabled MCP's client-config.
+t27_active="${TEST_ROOT}/t27-active"
+mkdir -p "$t27_active/m1" "$t27_active/m2"
+printf '%s\n' '{"mcpServers":{"m1":{"command":"a"}}}' >"$t27_active/m1/client-config.json"
+printf '%s\n' '{"mcpServers":{"m2":{"command":"b"}}}' >"$t27_active/m2/client-config.json"
+t27_home="${TEST_ROOT}/t27-home"
+mkdir -p "$t27_home"
+(
+    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
+    command() { if [[ "${1:-}" == "-v" && "${2:-}" == "jq" ]]; then return 1; fi; builtin command "$@"; }
+    harness_jq() { jq "$@"; }
+    mcp_active_dir="$t27_active"
+    agent_home_dir() { echo "$t27_home"; }
+    mcp_is_enabled() { return 0; }   # both entries enabled
+    write_agent_mcp_config
+)
+t27_side="$t27_home/.harness-mcp-servers.json"
+if [[ ! -f "$t27_side" ]]; then
+    echo "[harness-test] T27 FAIL [#8]: write_agent_mcp_config produced no side file on a jq-less host" >&2; exit 1
+fi
+if ! grep -q '"m1"' "$t27_side" || ! grep -q '"m2"' "$t27_side"; then
+    echo "[harness-test] T27 FAIL [#8]: merged MCP config missing servers on a jq-less host" >&2
+    cat "$t27_side" >&2; exit 1
+fi
+echo "[harness-test] T27 OK"
+
 # --- Test 26pm: start/restart --prompt-mode flag (#91) ---------------------
 #
 # `harness start/restart --prompt-mode <mode>` is the ephemeral replacement
