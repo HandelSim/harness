@@ -18,7 +18,6 @@
 #       agent/home/                        # shared agent /home/harness
 #                                            (opencode, shell)
 #       mcp/<name>/                        # active MCP services
-#       ollama-data/                       # ollama's blob store
 #
 # This script is symlinked into ~/.local/bin/harness by install.sh; we use
 # realpath on $0 to resolve the script's true location independent of how
@@ -106,9 +105,8 @@ project_name="${HARNESS_PROJECT_NAME:-harness}"
 
 # --- env loading ------------------------------------------------------------
 #
-# Source .env into this shell so we can read PUBLISH_OLLAMA_PORT,
-# DEFAULT_MODEL_NAME etc. for our own logic. docker compose gets the file
-# separately via --env-file.
+# Source .env into this shell so we can read DEFAULT_MODEL_NAME etc. for our
+# own logic. docker compose gets the file separately via --env-file.
 #
 # Host proxy (HTTP_PROXY/HTTPS_PROXY/NO_PROXY): honored for the host-side git
 # calls this script runs (update/upgrade pull, mcp clone) — git's libcurl
@@ -145,8 +143,9 @@ unset _harness_proxy_keys _k _sv
 # The default/fallback model id. REQUIRED (no hardcoded default): once the
 # model passes through to the upstream, a cosmetic default would be a real
 # upstream id we can't know. require_runtime_config enforces it's set before
-# any launch. ollama registers a stub for it (plus every discovered model) and
-# opencode selects harness/${DEFAULT_MODEL_NAME} by default.
+# any launch. The agent entrypoint discovers models from the proxy's
+# /v1/models catalog and opencode selects harness/${DEFAULT_MODEL_NAME} by
+# default.
 # See architecture/harness-cli.md (Env loading).
 agent_model="${DEFAULT_MODEL_NAME:-}"
 
@@ -563,7 +562,6 @@ ensure_dirs() {
     mkdir -p \
         "$state_root/output" \
         "$state_root/agent/home" \
-        "$state_root/ollama-data" \
         "$mcp_active_dir"
 }
 
@@ -666,34 +664,26 @@ mcp_set_enabled() {
 
 # Generate the runtime override file in-place. The file is rewritten on
 # every invocation that runs `compose`, so toggling state via
-# `harness net open/close` or PUBLISH_OLLAMA_PORT propagates immediately on
-# the next `harness start` / `harness restart`.
+# `harness net open/close` propagates immediately on the next
+# `harness start` / `harness restart`.
 #
-# Three pieces of state can land in the override:
-#   1. PUBLISH_OLLAMA_PORT — publishes ollama on a host port if non-empty.
-#   2. .harness-net-overrides.json — per-service `firewall_disabled: true`
+# Two pieces of state can land in the override:
+#   1. .harness-net-overrides.json — per-service `firewall_disabled: true`
 #      becomes an environment block on that service that the firewall
 #      init-script honors as an opt-out.
-#   3. prompt_mode_override — an ephemeral `--prompt-mode <mode>` from this
+#   2. prompt_mode_override — an ephemeral `--prompt-mode <mode>` from this
 #      start/restart invocation, injected as PROXY_PROMPT_MODE on the proxy
-#      service. Folded into the proxy block from (2) when proxy also has a
+#      service. Folded into the proxy block from (1) when proxy also has a
 #      firewall opt-out, so only one `proxy:` mapping is emitted.
 #
-# When all three are empty the override file is removed entirely (compose
+# When both are empty the override file is removed entirely (compose
 # is invoked without the -f flag). This keeps `harness start` exactly as it
 # was for installs that don't use any of these features.
 write_runtime_override() {
     # Build the body in a temp variable, write only if non-empty.
     local body=""
 
-    # 1. PUBLISH_OLLAMA_PORT.
-    if [[ -n "${PUBLISH_OLLAMA_PORT:-}" ]]; then
-        body+="  ollama:"$'\n'
-        body+="    ports:"$'\n'
-        body+="      - \"${PUBLISH_OLLAMA_PORT}:11434\""$'\n'
-    fi
-
-    # 2. Per-service firewall opt-out.
+    # 1. Per-service firewall opt-out.
     #
     # Every service that has firewall_disabled=true in the JSON gets a
     # `HARNESS_FIREWALL_DISABLED=1` env entry. The firewall init script
@@ -741,7 +731,7 @@ write_runtime_override() {
         ' "$net_overrides_path" 2>/dev/null || true)
     fi
 
-    # 3. Ephemeral cooperative-prompt mode (`start/restart --prompt-mode`).
+    # 2. Ephemeral cooperative-prompt mode (`start/restart --prompt-mode`).
     # Injected into the proxy container env for this launch only. If the
     # firewall loop above already emitted a `proxy:` block we appended it
     # there; otherwise emit a standalone block here.
@@ -818,14 +808,12 @@ compose() {
         harness_docker "${args[@]}" "$@"
 }
 
-# Best-effort check: are ollama and proxy both running for this project?
+# Best-effort check: is the proxy running for this project?
 services_up() {
-    local ollama_id proxy_id
-    ollama_id=$(compose ps -q ollama 2>/dev/null || true)
+    local proxy_id
     proxy_id=$(compose ps -q proxy 2>/dev/null || true)
-    [[ -n "$ollama_id" && -n "$proxy_id" ]] || return 1
-    harness_docker inspect -f '{{.State.Running}}' "$ollama_id" 2>/dev/null | grep -q '^true$' || return 1
-    harness_docker inspect -f '{{.State.Running}}' "$proxy_id"  2>/dev/null | grep -q '^true$' || return 1
+    [[ -n "$proxy_id" ]] || return 1
+    harness_docker inspect -f '{{.State.Running}}' "$proxy_id" 2>/dev/null | grep -q '^true$' || return 1
     return 0
 }
 
@@ -1079,8 +1067,8 @@ _probe_upstream_auth() {
             # No unlock URL recovered. #43 carve-out: if the upstream says the
             # probe *request* was malformed (invalid_request-family type), the
             # key is fine — warn and continue. Anything else on a 401/403 is a
-            # rejected key; abort so the proxy/ollama never start with a key that
-            # can't register models.
+            # rejected key; abort so the proxy never starts with a key that
+            # can't reach the upstream.
             if _auth_probe_type_is_request_error "$err_type"; then
                 echo "" >&2
                 echo "[harness] WARN: upstream returned $status_code on the auth probe, but the" >&2
@@ -1154,9 +1142,9 @@ _gate_on_upstream_auth() {
 
 # Best-effort: print the upstream's model catalog at start so the user sees
 # what's available. Tolerant of an unreachable upstream (e.g. tests where the
-# upstream is an in-network mock the host can't reach) — the authoritative
-# per-model stub registration happens in the ollama container via the proxy's
-# /v1/models route. Only a locked-key 401/403 carrying an unlock URL returns 1
+# upstream is an in-network mock the host can't reach) — the agent entrypoint
+# discovers the available models from the proxy's /v1/models route at
+# config-build time. Only a locked-key 401/403 carrying an unlock URL returns 1
 # (aborting the start, mirroring _gate_on_upstream_auth). HARNESS_SKIP_AUTH_PROBE=1
 # bypasses it.
 _print_upstream_models() {
@@ -1198,8 +1186,8 @@ _print_upstream_models() {
             fi
             ;;
     esac
-    # Unreachable / non-actionable: don't block. ollama registers what it can
-    # (falling back to DEFAULT_MODEL_NAME) and the proxy surfaces real errors later.
+    # Unreachable / non-actionable: don't block. The agent falls back to
+    # DEFAULT_MODEL_NAME and the proxy surfaces real errors later.
     return 0
 }
 
@@ -1227,14 +1215,14 @@ Running 'harness' with no command — or with only agent flags such as --yolo,
 --net, --mount, or -p — launches an opencode agent in the current directory.
 
 commands:
-  start [--prompt-mode M]  build and bring up the ollama + proxy services.
+  start [--prompt-mode M]  build and bring up the proxy service.
                         Run automatically by bare 'harness'; rarely needed
                         by hand. --prompt-mode sets the proxy's cooperative-
                         prompt mode (hybrid (default) / user_front /
                         passthrough) for THIS launch only — ephemeral, for
                         benchmarking/power use; a later bare start reverts to
                         hybrid.
-  down                  stop the ollama + proxy services (does NOT touch agents)
+  down                  stop the proxy service (does NOT touch agents)
   restart [--prompt-mode M]  down + start (preserves per-invocation state).
                         Accepts the same --prompt-mode flag as start.
   update                git pull --ff-only in the clone
@@ -1379,7 +1367,8 @@ cmd_start() {
     _gate_on_upstream_auth || return 1
 
     # Print the upstream model catalog (best-effort; aborts only on a locked
-    # key). The ollama container does the authoritative per-model registration.
+    # key). The agent entrypoint discovers models from the proxy's /v1/models
+    # route at config-build time.
     _print_upstream_models || return 1
 
     # Stop anything still running from a prior session so up brings a clean
@@ -1424,7 +1413,6 @@ cmd_start() {
         echo "To diagnose, run:"
         echo "  harness preflight                   # validates configuration"
         echo "  $(harness_container_runtime) logs harness-proxy-1         # what the proxy printed on startup"
-        echo "  $(harness_container_runtime) logs harness-ollama-1        # what ollama printed on startup"
         return $up_rc
     fi
 }
@@ -1814,7 +1802,7 @@ EOF
         echo "[harness] rebuilding container images..."
         # --profile agent ensures the agent service (which is profile-gated
         # in docker-compose.yml) is included in the rebuild set; without it,
-        # only default-profile services (proxy, ollama) get rebuilt and
+        # only default-profile services (proxy) get rebuilt and
         # image-level changes to agents/Dockerfile or agents/entrypoint.sh
         # silently slip past the upgrade.
         if ! compose --profile agent build "${build_args[@]}"; then
@@ -1832,7 +1820,7 @@ EOF
         # stale "missing" entry for that path right after the rename. When
         # the next `compose up` then mounts the source, Docker sees nothing
         # there, auto-creates an empty *directory* at the bind source, and
-        # the proxy/ollama containers boot but fail their firewall init
+        # the proxy container boots but fails its firewall init
         # with "allowlist file not found at /etc/harness/allowlist". A bare
         # `compose config` triggers compose's path-resolution pass and gives
         # the daemon a chance to refresh that cache before the real `up`.
@@ -2793,7 +2781,7 @@ cmd_shell() {
     local network="${project_name}_harness-net"
     if ! harness_docker network inspect "$network" >/dev/null 2>&1; then
         # Network doesn't exist (services never started). Use the default
-        # bridge — the shell doesn't need to talk to ollama or the proxy.
+        # bridge — the shell doesn't need to talk to the proxy.
         network="bridge"
     fi
 
@@ -3767,14 +3755,14 @@ net_known_services() {
     local rt
     rt=$(harness_container_runtime)
     if ! command -v "$rt" >/dev/null 2>&1; then
-        printf '%s\n' proxy ollama agent
+        printf '%s\n' proxy agent
         return 0
     fi
     local svcs
     svcs=$(compose --profile mcp config --services 2>/dev/null || true)
     if [[ -z "$svcs" ]]; then
         # Compose not configured / fallback to the static core list.
-        printf '%s\n' proxy ollama agent
+        printf '%s\n' proxy agent
         return 0
     fi
     # Agent is a pseudo-service: agent containers aren't in compose
@@ -3809,7 +3797,7 @@ subcommands:
                                 <service>. Restores the universal firewall.
 
 services that accept open/close:
-  proxy, ollama, agent, plus any installed MCP service.
+  proxy, agent, plus any installed MCP service.
 
 After any mutation, run `harness restart` to apply the change to running
 containers. Both `net open/close` and `net allow/deny` take effect on the
@@ -4244,12 +4232,6 @@ cmd_doctor() {
             doctor_check fail "PROXY_API_KEY" "unset"
         fi
 
-        if [[ -n "${OLLAMA_VERSION:-}" ]]; then
-            doctor_check ok "OLLAMA_VERSION" "$OLLAMA_VERSION"
-        else
-            doctor_check fail "OLLAMA_VERSION" "unset"
-        fi
-
         if [[ -n "${agent_model}" ]]; then
             doctor_check ok "DEFAULT_MODEL_NAME" "$agent_model"
         else
@@ -4302,7 +4284,7 @@ cmd_doctor() {
     # ---------------- [storage] -------------
     doctor_section storage
     local d
-    for d in output agent/home ollama-data; do
+    for d in output agent/home; do
         local path="$state_root/$d"
         if [[ -d "$path" && -w "$path" ]]; then
             doctor_check ok "state/$d" "writable"
@@ -4340,59 +4322,19 @@ cmd_doctor() {
     fi
 
     if (( network_ok )); then
-        local ollama_status proxy_status
-        ollama_status=$(doctor_health_of ollama)
+        local proxy_status
         proxy_status=$(doctor_health_of proxy)
 
-        case "$ollama_status" in
-            healthy)        doctor_check ok   "ollama" "healthy" ;;
-            absent)         doctor_check warn "ollama" "no container for project ($project_name)" ;;
-            none)           doctor_check warn "ollama" "running but no healthcheck reported" ;;
-            *)              doctor_check warn "ollama" "$ollama_status" ;;
-        esac
-
+        # The proxy's compose healthcheck curls http://127.0.0.1/health, so a
+        # "healthy" status here doubles as the proxy /health liveness probe.
         case "$proxy_status" in
             healthy)        doctor_check ok   "proxy" "healthy" ;;
             absent)         doctor_check warn "proxy" "no container for project ($project_name)" ;;
             none)           doctor_check warn "proxy" "running but no healthcheck reported" ;;
             *)              doctor_check warn "proxy" "$proxy_status" ;;
         esac
-
-        # Stub model + proxy /health probes only meaningful if ollama is up.
-        if [[ "$ollama_status" == "healthy" ]]; then
-            local ollama_cid
-            ollama_cid=$(compose ps -q ollama 2>/dev/null || true)
-            if [[ -n "$ollama_cid" ]]; then
-                local show_out
-                show_out=$(timeout 3 harness_docker exec "$ollama_cid" \
-                    curl -sf -X POST -H 'Content-Type: application/json' \
-                    -d "{\"name\":\"${agent_model}\"}" \
-                    http://127.0.0.1:11434/api/show 2>/dev/null || true)
-                if [[ -n "$show_out" ]] && grep -qi 'remote_host' <<<"$show_out"; then
-                    doctor_check ok   "stub model" "$agent_model registered with remote_host"
-                else
-                    doctor_check warn "stub model" "$agent_model not registered yet"
-                fi
-
-                if timeout 3 harness_docker exec "$ollama_cid" \
-                    curl -sf "http://proxy:${PROXY_PORT:-8000}/health" >/dev/null 2>&1; then
-                    doctor_check ok   "proxy /health" "reachable from ollama"
-                else
-                    doctor_check warn "proxy /health" "not reachable from ollama"
-                fi
-            else
-                doctor_check skip "stub model" "ollama container id not found"
-                doctor_check skip "proxy /health" "ollama container id not found"
-            fi
-        else
-            doctor_check skip "stub model" "ollama not healthy"
-            doctor_check skip "proxy /health" "ollama not healthy"
-        fi
     else
-        doctor_check skip "ollama" "services not running"
         doctor_check skip "proxy" "services not running"
-        doctor_check skip "stub model" "services not running"
-        doctor_check skip "proxy /health" "services not running"
     fi
 
     # Windows-only: interactive launches (opencode/shell) need docker.exe to
@@ -4432,7 +4374,6 @@ cmd_doctor() {
     doctor_section images
     local img
     for img in \
-        "harness-ollama:${OLLAMA_VERSION:-0.21.2}" \
         "harness-proxy:latest" \
         "harness-agent:latest"
     do
@@ -4589,7 +4530,6 @@ cmd_preflight() {
     if declare -f harness_check_dir_writable >/dev/null 2>&1; then
         harness_check_dir_writable "$state_root/output" false "output dir" || true
         harness_check_dir_writable "$state_root/agent/home" false "agent home" || true
-        harness_check_dir_writable "$state_root/ollama-data" false "ollama data dir" || true
     fi
 
     # Compose project + service status — informational; doesn't gate exit.
