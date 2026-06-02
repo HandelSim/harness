@@ -1192,7 +1192,12 @@ def translate_history_and_apply_prompt(
 
     for msg in original_messages:
         role = msg.get("role")
-        content = msg.get("content", "") or ""
+        # Normalize content to a plain string up front. Some clients send
+        # content as a list of content-blocks (multimodal user turns, or the
+        # AI SDK structuring an assistant turn as parts). Left as a list it
+        # crashes the downstream `.strip()` / `+=` / join paths with a 500;
+        # flatten once here so every role branch can treat content as a str.
+        content = _flatten_content_to_str(msg.get("content", "") or "")
 
         if role == "system":
             # Coalesce consecutive system messages into one. Some clients
@@ -2031,7 +2036,12 @@ def catch_all(path: str) -> Response:
         # full conversation it sent, not what the upstream charged for. Always
         # estimate locally from the full translated array so the agent's context
         # bar grows monotonically with conversation length.
-        joined = "\n".join(m.get("content", "") for m in translated)
+        # Flatten per message: in passthrough mode `translated` is the inbound
+        # array verbatim, so a multimodal/list content block would otherwise
+        # blow up this join (TypeError) and 500 the turn.
+        joined = "\n".join(
+            _flatten_content_to_str(m.get("content", "") or "") for m in translated
+        )
         upstream_usage = target_json.get("usage") or {}
         usage = {
             "prompt_tokens": _estimate_tokens(joined),

@@ -5,246 +5,338 @@
 
 ## System Overview
 
-```text
-┌────────────────────────────────────────────────────────────────┐
-│                     harness CLI (host)                          │
-│  `harness`  (bash, ~5111 lines)                                 │
-│  Manages: start/stop/update/upgrade/mcp/net/doctor/test         │
-└──────────┬─────────────────────────────────────────────────────┘
-           │ docker run (ephemeral, joins harness_harness-net)
-           ▼
-┌────────────────────────────────────────────────────────────────┐
-│               agent container  (harness-agent:latest)           │
-│  `agents/entrypoint.sh`  — firewall → UID remap → gosu drop    │
-│  mode dispatch: opencode (TUI or -p headless) | shell (bash)    │
-│  opencode  →  http://ollama:11434/v1  (via opencode.json)       │
-└──────────┬─────────────────────────────────────────────────────┘
-           │ /api/chat (NDJSON streaming)
-           ▼
-┌────────────────────────────────────────────────────────────────┐
-│               ollama  (harness-ollama:latest)                   │
-│  `ollama/entrypoint.sh`  — stub model registration at startup   │
-│  stub models: RemoteHost = http://proxy:8000                    │
-│  advertises models discovered from proxy /v1/models             │
-└──────────┬─────────────────────────────────────────────────────┘
-           │ POST /v1/chat/completions  (full response, not streamed)
-           ▼
-┌────────────────────────────────────────────────────────────────┐
-│               proxy  (harness-proxy:latest)                     │
-│  `proxy/proxy.py`  — Flask, ~1802 lines                         │
-│  translate ollama→upstream format                               │
-│  inject cooperative tool-use prompts (hybrid/user_front/pass)   │
-│  parse ```json tool-call blocks → native tool_calls             │
-│  emit NDJSON back to ollama                                     │
-└──────────┬─────────────────────────────────────────────────────┘
-           │ POST {PROXY_API_URL}/v1/chat/completions  (Bearer key)
-           ▼
-┌────────────────────────────────────────────────────────────────┐
-│               upstream API  (Gemini Enterprise / OpenAI-shape)  │
-│  No tool support. Hidden system prompt. No streaming consumed.  │
-│  Keys lock every ~8h; `harness unlock` surfaces unlock URL.     │
-└────────────────────────────────────────────────────────────────┘
+`harness` is a translating proxy plus a containerized `opencode` coding
+agent. The agent runs in an ephemeral container and talks to a long-running
+Flask proxy over an OpenAI-compatible Chat Completions interface; the proxy
+translates to/from a third-party upstream API (a Gemini Enterprise gateway
+behind a self-signed cert) and injects cooperative tool-use prompts so a
+non-tool-native upstream can still produce tool calls.
 
-Shared bridge: harness_harness-net
-Shared egress firewall: firewall/init-firewall.sh (runs in every container)
-MCP services: join harness_harness-net as external peers
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│  harness CLI (bash)  — orchestration, docker run / docker compose      │
+│  `harness`                                                             │
+└───────────────┬──────────────────────────────────────────────────────┘
+                │ launches
+                ▼
+┌──────────────────────────┐  POST /v1/chat/completions  ┌──────────────┐
+│ agent (opencode)         │ ─────────────────────────▶  │ proxy (Flask)│ ──▶ upstream API
+│ `agents/Dockerfile`      │     (OpenAI-compatible)     │ `proxy/      │   (chat-completions,
+│ `agents/entrypoint.sh`   │ ◀────── SSE / JSON ──────── │  proxy.py`   │    self-signed cert)
+└──────────────────────────┘                             └──────────────┘
+        │                                                       │
+        │ both join harness-net (bridge) + egress firewall      │
+        ▼                                                       ▼
+┌──────────────────────────┐                          ┌──────────────────┐
+│ MCP services (optional)  │                          │ egress firewall  │
+│ `state/mcp/<name>/`      │                          │ `firewall/       │
+│ `mcp-registry/<name>/`   │                          │  init-firewall.sh│
+└──────────────────────────┘                          └──────────────────┘
 ```
+
+There is **no** ollama hop. opencode speaks the proxy's OpenAI-compatible
+endpoint directly via its `@ai-sdk/openai-compatible` provider
+(`baseURL: http://proxy:${PROXY_PORT}/v1`). The old three-hop
+opencode -> ollama -> proxy path has been fully removed; the only surviving
+ollama token is `OLLAMA_CONTEXT_LENGTH` as a legacy read-alias for
+`MODEL_CONTEXT_LENGTH` (`proxy/proxy.py`).
 
 ## Component Responsibilities
 
 | Component | Responsibility | File |
 |-----------|----------------|------|
-| `harness` CLI | Lifecycle management, agent launch, MCP/net management, doctor/preflight | `harness` |
-| agent entrypoint | UID remap, firewall setup, gosu drop, skel seed, opencode config, MCP config merge, mode dispatch | `agents/entrypoint.sh` |
-| ollama stub | Register one stub model per upstream model; forward `/api/chat` to proxy via `RemoteHost` | `ollama/entrypoint.sh` |
-| translating proxy | ollama↔upstream format translation, cooperative-prompt injection, tool-call extraction, NDJSON generation | `proxy/proxy.py` |
-| egress firewall | Drop all egress except DNS, `PROXY_API_URL` host, and allowlist entries | `firewall/init-firewall.sh` |
-| MCP registry | Vetted long-running MCP service definitions (compose + client config) | `mcp-registry/<name>/` |
-| platform lib | OS/runtime detection, TTY strategy, mount validation, jq fallback | `scripts/lib/platform.sh` |
-| net helpers | Allowlist + per-service firewall override JSON manipulation | `scripts/lib/net_helpers.sh` |
-| upgrade actions | `envfile_merge`, `linefile_merge`, `directory_overwrite` for `harness upgrade` | `scripts/lib/upgrade_actions.sh` |
+| harness CLI | Orchestration: self-locate, env load, compose wrapper, agent `docker run`, doctor/preflight, net, MCP, update/upgrade | `harness` |
+| Translating proxy | OpenAI ↔ upstream translation, cooperative-prompt injection, tool-call extraction, SSE/JSON emission | `proxy/proxy.py` |
+| Agent image | opencode/shell runtime, UID remap, firewall, gosu drop, opencode config + model dropdown, MCP client-config merge | `agents/Dockerfile`, `agents/entrypoint.sh` |
+| Egress firewall | iptables/ipset allowlist gate at the top of every container entrypoint | `firewall/init-firewall.sh` |
+| Service composition | proxy + agent service definitions, harness-net, cap_add, sysctls | `docker-compose.yml` |
+| MCP registry | Vetted MCP definitions; per-install active tree | `mcp-registry/<name>/`, `state/mcp/<name>/` |
+| Shared libraries | OS/runtime detection, portable realpath, net helpers, upgrade actions | `scripts/lib/*.sh` |
 
 ## Pattern Overview
 
-**Overall:** Container-isolated agent runtime with a format-translating proxy chain.
+**Overall:** A single translating proxy in front of an opinionated agent
+container, orchestrated by one bash CLI. The repo clone IS the install root.
 
 **Key Characteristics:**
-- The agent never touches the upstream API directly; all upstream I/O goes through ollama → proxy
-- The proxy is the sole mediation point: format translation, prompt injection, tool-call extraction
-- The egress firewall runs in every container entrypoint, not as a host-level rule
-- The repo IS the install root — code, config (`.env`, `.harness-allowlist`), and runtime state (`state/`) coexist in the clone
-- Agent containers are ephemeral (`docker run`); long-running services (`ollama`, `proxy`, MCPs) are managed by compose
+- Two monolithic files carry most logic: `proxy/proxy.py` (~1870 lines) and
+  `harness` (~5481 lines). Both are single-file by design.
+- The proxy is single-process, single-file Flask. It does NOT stream from
+  upstream: it gets the full upstream response, then translates and emits.
+- The CLI launches agents by direct `docker run`, not compose; compose runs
+  only the long-running services (proxy + any enabled MCP).
+- Same-path bind mounts: the host CWD is mounted into the agent at the same
+  absolute path, so `pwd` round-trips.
 
 ## Layers
 
-**Management layer:**
-- Purpose: Operate the harness runtime from the host shell
-- Location: `harness` (root script), `scripts/lib/`
-- Contains: Subcommand dispatch (`cmd_*`), compose wrapper, agent launch path (`run_agent`/`run_agent_interactive`/`run_agent_print`), runtime-override generation, MCP lifecycle, net management, doctor/preflight
-- Depends on: Docker/Podman daemon, `scripts/lib/platform.sh`, `scripts/lib/net_helpers.sh`
-- Used by: End users, CI
+**Orchestration (`harness` CLI):**
+- Purpose: Resolve install root, load `.env`, build the compose graph, launch
+  ephemeral agents, run diagnostics, manage net/MCP/update.
+- Location: `harness`, `scripts/lib/*.sh`.
+- Depends on: docker/podman runtime, `docker-compose.yml`, `state/`.
+- Used by: the human operator (and tests via `HARNESS_INSTALL_ROOT`).
 
-**Agent container layer:**
-- Purpose: Run the coding agent in an isolated, firewalled environment
-- Location: `agents/Dockerfile`, `agents/entrypoint.sh`
-- Contains: UID remap, firewall init, gosu privilege drop, skel seed, `ensure_opencode_config`, `merge_opencode_mcp_servers`, `run_opencode`, `run_shell`
-- Depends on: `firewall/init-firewall.sh`, ollama service (for `/api/tags`), `state/agent/home/` bind mount
-- Used by: `harness` CLI via `docker run`
+**Translation (`proxy/proxy.py`):**
+- Purpose: Expose OpenAI Chat Completions, translate to the upstream wire
+  format, inject cooperative tool-use scaffolding, parse tool calls back.
+- Location: `proxy/proxy.py`.
+- Depends on: the upstream API (`PROXY_API_URL`), the egress firewall.
+- Used by: opencode in the agent container.
 
-**Translation layer:**
-- Purpose: Bridge ollama's wire format to upstream's OpenAI-shaped API; inject tool-use prompts
-- Location: `proxy/proxy.py`
-- Contains: `catch_all` Flask route, `translate_history_and_apply_prompt`, `extract_tool_calls_and_text`, `generate_ndjson`, cooperative-prompt builders (`build_cooperative_prompt_hybrid_reminder`, `build_cooperative_prompt_system_addition`, `build_cooperative_prompt_user_front`)
-- Depends on: `PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME` env vars
-- Used by: ollama stub (via `RemoteHost` URL)
-
-**Stub relay layer:**
-- Purpose: Present the upstream's model catalog to opencode via ollama's native API
-- Location: `ollama/Dockerfile`, `ollama/entrypoint.sh`
-- Contains: Model discovery (GET proxy `/v1/models`), stub registration (`/api/create` with `remote_host`), startup validation
-- Depends on: proxy service (must be healthy first — `depends_on: condition: service_healthy`)
-- Used by: agent containers (opencode points at `http://ollama:11434/v1`)
-
-**Egress control layer:**
-- Purpose: Restrict outbound network in every container
-- Location: `firewall/init-firewall.sh`, `firewall/configure-git-credentials.sh`
-- Contains: iptables/ipset rules built from `/etc/harness/allowlist`, `# git-push` annotation handling
-- Depends on: `NET_ADMIN`/`NET_RAW` capabilities; allowlist bind-mounted at `/etc/harness/allowlist`
-- Used by: All containers (agent, ollama, proxy)
-
-**MCP services layer:**
-- Purpose: Provide optional long-running tool servers (e.g. Serena code-intelligence)
-- Location: `mcp-registry/<name>/` (registry), `state/mcp/<name>/` (active)
-- Contains: `compose.yml` (references `harness_harness-net` as external), `client-config.json`, `harness-meta.json`
-- Depends on: main compose stack already up; `harness_harness-net` network exists
-- Used by: agent containers (MCP URLs injected into `~/.config/opencode/opencode.json`)
+**Agent runtime (`agents/`):**
+- Purpose: Run opencode/shell under the right UID, firewall, and config;
+  build opencode's provider block and model dropdown from the proxy's
+  `/v1/models`.
+- Location: `agents/Dockerfile`, `agents/entrypoint.sh`.
+- Depends on: the proxy (`http://proxy:${PROXY_PORT}/v1`), the firewall.
+- Used by: the CLI's `run_agent` / `cmd_shell`.
 
 ## Data Flow
 
-### Primary Request Path (agent turn → upstream → agent)
+### Primary Request Path (proxy request lifecycle)
 
-1. opencode sends `/api/chat` POST to `http://ollama:11434` (`agents/entrypoint.sh:ensure_opencode_config` points opencode here)
-2. ollama stub's `RemoteHost` forwards the chat request to `http://proxy:8000` (`ollama/entrypoint.sh:register_stub_model`)
-3. proxy `catch_all` receives the ollama JSON body (`proxy/proxy.py:1561`)
-4. `format_tools_to_text` serializes the `tools` array to markdown (`proxy/proxy.py:430`)
-5. `translate_history_and_apply_prompt` flattens message history, rewrites system→user, injects cooperative-prompt scaffold (`proxy/proxy.py:1075`)
-6. proxy POSTs `{model, messages}` to `{PROXY_API_URL}/v1/chat/completions` with Bearer key (`proxy/proxy.py:1604`)
-7. `extract_assistant_content` pulls text from `choices[0].message.content` (`proxy/proxy.py:1427`)
-8. `extract_tool_calls_and_text` parses ` ```json ` blocks into `tool_calls` using balanced-brace scanner (`proxy/proxy.py:795`)
-9. Empty-response detection: if both `clean_text` and `tool_call_payloads` are empty, proxy injects rescue text + `bash pwd` tool call (`proxy/proxy.py:1444–1513`)
-10. `generate_ndjson` materializes ollama-compatible streaming chunks and writes debug dumps to `state/output/` (`proxy/proxy.py:1393`)
-11. NDJSON is streamed back through ollama to opencode
+`catch_all(path)` (`proxy/proxy.py:1643`) is the single Flask route handler
+that owns every non-health request:
 
-### Model Discovery Path (stack startup)
+1. Read JSON body — `model`, `messages`, `tools`, OpenAI `stream`
+   (`proxy/proxy.py:1648-1657`).
+2. Build a tools-as-text string via `format_tools_to_text`
+   (`proxy/proxy.py:1661`, def at `proxy/proxy.py:432`).
+3. `translate_history_and_apply_prompt(...)` flattens the inbound
+   conversation into a role-alternating array and injects the
+   cooperative-prompt scaffold per the active prompt mode
+   (`proxy/proxy.py:1662`, def at `proxy/proxy.py:1077`).
+4. POST `{model: <requested>, messages: translated}` to `CHAT_URL`
+   (`{base}/v1/chat/completions`) with `Bearer PROXY_API_KEY`,
+   `verify=False` (self-signed cert), `timeout=PROXY_TIMEOUT`
+   (`proxy/proxy.py:1690-1697`). The requested model is forwarded verbatim,
+   falling back to `DEFAULT_MODEL_NAME` only when absent
+   (`proxy/proxy.py:1669`).
+5. `extract_assistant_content(target_json)` pulls assistant text
+   (`proxy/proxy.py:1722`, def at `proxy/proxy.py:1501`).
+6. `extract_tool_calls_and_text(...)` parses ```json tool-call blocks out of
+   the text using `_scan_balanced_json` (`proxy/proxy.py:1726`, def at
+   `proxy/proxy.py:797`; scanner at `proxy/proxy.py:752`).
+7. Empty-response rescue: if both `clean_text` and tool calls are empty,
+   substitute `"Understood."` and a no-op `pwd` bash call when a shell tool
+   is exposed (`proxy/proxy.py:1750-1764`).
+8. Emit OpenAI: `generate_openai_sse` when `stream: true`, else
+   `build_openai_response` (`proxy/proxy.py:1790-1798`; defs at
+   `proxy/proxy.py:1392` and `proxy/proxy.py:1453`).
 
-1. `harness start` / `harness restart` → `compose()` writes `state/.harness-runtime.yml`, invokes `docker compose up`
-2. `proxy` container starts first; ollama `depends_on: proxy: condition: service_healthy`
-3. ollama entrypoint: GETs `http://proxy:${PROXY_PORT}/v1/models` — proxy passes through to upstream GET `/v1/models` (`ollama/entrypoint.sh:112`)
-4. For each discovered model id (plus `DEFAULT_MODEL_NAME`), ollama POSTs `/api/create` with `remote_host=http://proxy:8000` (`ollama/entrypoint.sh:65`)
-5. `agents/entrypoint.sh:ensure_opencode_config` GETs `http://ollama:11434/api/tags`, builds `opencode.json` with one model entry per registered stub
+Errors return the OpenAI `{"error":{"message":…}}` envelope via
+`_client_error` (`proxy/proxy.py:1634`) plus a debug dump under `OUTPUT_DIR`.
 
-### Agent Launch Path
+### Agent Launch Flow
 
-1. `harness` (or bare `harness`) → `run_agent` (`harness:2292`)
-2. Parse `--yolo`, `--net`, `--mount`, `-p` flags; validate/dedup mounts
-3. `_gate_on_upstream_auth` probes `{PROXY_API_URL}/v1/chat/completions`; abort on locked/invalid key
-4. `ensure_services_up` ensures ollama+proxy are running
-5. `write_agent_mcp_config` writes `state/agent/home/.harness-mcp-servers.json`
-6. `docker run harness-agent:latest opencode` (or `shell`) with NET_ADMIN/NET_RAW caps, allowlist mount, `--network harness_harness-net`, CWD bind-mount at same absolute path, `HOST_UID`/`HOST_GID`, `HARNESS_HOST_CWD`
+1. `harness` (bare, or with a leading agent flag) dispatches to `run_agent`
+   (`harness:2270`); `harness shell` to `cmd_shell` (`harness:2696`).
+2. The CLI computes mounts, cap_add (NET_ADMIN/NET_RAW), allowlist mount, and
+   network, then `docker run`s `harness-agent:latest` with a mode arg.
+3. `agents/entrypoint.sh` runs the firewall, remaps UID, drops privileges via
+   gosu, writes opencode config, merges MCP client-config, and `cd`s to the
+   host CWD before dispatching to opencode or bash.
+
+### GET /v1/models Passthrough
+
+`list_models` (`proxy/proxy.py:1597`) is a thin pass-through that forwards
+`MODELS_URL` with the bearer key and returns the upstream status + body
+verbatim. The agent entrypoint consumes it at startup to build opencode's
+model dropdown; a locked-key 401 (with its unlock URL) reaches the caller
+unchanged. Declared as an explicit route so it wins over `catch_all`.
 
 **State Management:**
-- Runtime state: `state/` (gitignored) — ollama blobs (`state/ollama-data/`), agent home (`state/agent/home/`), proxy debug dumps (`state/output/`), MCP active configs (`state/mcp/`)
-- Runtime compose override: `state/.harness-runtime.yml` — regenerated on every `compose()` call; carries `PUBLISH_OLLAMA_PORT`, per-service firewall opt-outs, ephemeral `PROXY_PROMPT_MODE`
-- Net overrides: `state/.harness-net-overrides.json` — persists `firewall_disabled` per service
+- Per-request only inside the proxy; no cross-request session state. Local
+  token estimation (`_estimate_tokens`, `proxy/proxy.py:1357`) gives the
+  agent a monotonic context count because upstream `prompt_tokens` is
+  unreliable (sliding-window truncation).
+- Agent home persists across launches via the `state/agent/home/` bind mount.
 
 ## Key Abstractions
 
-**Stub model (`ollama/entrypoint.sh`):**
-- Purpose: Make ollama present the upstream's model catalog without running a local model
-- Examples: `ollama/entrypoint.sh:register_stub_model`
-- Pattern: Each upstream model id becomes an ollama stub whose `remote_host` routes chat to the proxy; stub name matches upstream id so the request passes through unchanged
+**Cooperative-prompt mediation:**
+- Purpose: The upstream does not natively support tool calls, so the proxy
+  injects a scaffold telling the model to emit ```json blocks of the form
+  `{"name": ..., "arguments": {...}}`, then parses them back into native
+  `tool_calls`.
+- Modes (`PROXY_PROMPT_MODE`, resolved in `_setup_prompt_mode`,
+  `proxy/proxy.py:298`):
+  - `hybrid` (default) — tool definitions on the system message (folded into
+    the user-role index-0 stable prefix), plus a consolidated recency block on
+    the last user message with the live request first
+    (`<<<BEGIN_USER_REQUEST>>>`), then a reminder with Operating/Honesty/
+    Environment bullets and one entry per tool. Hybrid alone emits the
+    `<<<BEGIN_X>>>` content-category delimiters.
+  - `user_front` — full scaffolding on the last user message, request placed
+    before the tool list.
+  - `passthrough` — benchmark control; skips all mediation and forwards
+    `tools` to upstream verbatim (`proxy/proxy.py:1681-1682`).
+- `PROXY_PROMPT_MODE` is NOT a user `.env` knob. The proxy defaults to
+  `hybrid`; `docker-compose.yml` no longer interpolates it (a stale `.env`
+  cannot override). `harness start/restart --prompt-mode <mode>` injects it
+  ephemerally via the runtime override.
 
-**Cooperative-prompt injection (`proxy/proxy.py`):**
-- Purpose: Give a no-tool-support upstream the ability to emit structured tool calls
-- Examples: `proxy/proxy.py:build_cooperative_prompt_hybrid_reminder`, `build_cooperative_prompt_system_addition`, `build_cooperative_prompt_user_front`
-- Pattern: `hybrid` mode (default) — full tool definitions appended to system/user[0] as `<<<BEGIN_AGENT_TOOLS>>>` block; recency reminder with per-tool signatures lands on every last user turn. `user_front` — scaffold on last user message. `passthrough` — no injection (benchmark control).
+**Tool-call extraction:**
+- `extract_tool_calls_and_text` walks the response left-to-right for ```json
+  fences and uses `_scan_balanced_json` (not regex) to find the matching
+  closing brace, so argument strings containing backticks/nested fences do
+  not truncate. Parsing uses `json.loads(..., strict=False)` for embedded
+  control characters; misshaped calls with a known `name` but no `arguments`
+  get a tolerant top-level lift. Blocks that fail to parse are left in text.
 
-**Runtime override (`harness:write_runtime_override`):**
-- Purpose: Compose-layer configuration that is regenerated per invocation rather than committed
-- Pattern: `state/.harness-runtime.yml` carries `PUBLISH_OLLAMA_PORT`, per-service `HARNESS_FIREWALL_DISABLED`, and ephemeral `PROXY_PROMPT_MODE`; deleted when all three sources are empty
+## Container Topology
 
-**MCP compose merge (`harness:mcp_compose_files`):**
-- Purpose: Splice enabled MCP service compose snippets into every `docker compose` invocation
-- Pattern: Each enabled `state/mcp/<name>/compose.yml` is added as `-f <path>` to the compose args; snippets reference `harness_harness-net` as `external`
+`docker-compose.yml` defines two services on one bridge network
+(`harness-net`):
 
-## Entry Points
+- **proxy** (`docker-compose.yml:24-80`) — builds `proxy/Dockerfile`, image
+  `harness-proxy:latest`. Entrypoint runs `init-firewall.sh` then
+  `python3 proxy.py`. `cap_add: NET_ADMIN, NET_RAW`, IPv6 disabled via
+  `sysctls`, `restart: unless-stopped`, healthcheck on `/health`. The only
+  long-running service besides enabled MCPs.
+- **agent** (`docker-compose.yml:88-113`) — builds `agents/Dockerfile`, image
+  `harness-agent:latest`, behind the `agent` compose profile so
+  `docker compose up` skips it. Launched ephemerally by the CLI via
+  `docker run`; the compose entry documents the runtime contract and supports
+  `docker compose up agent` for debugging.
+- **MCP services** — each enabled `state/mcp/<name>/compose.yml` is spliced
+  into the compose graph by `mcp_compose_files` (`harness:577`); snippets
+  reference `harness_harness-net` as `external` and sit behind the `mcp`
+  profile.
+- **firewall** — not a service; `firewall/init-firewall.sh` runs as root at
+  the top of every container entrypoint, reading the bind-mounted allowlist.
 
-**`harness` CLI:**
-- Location: `harness` (repo root)
-- Triggers: User invocation from any directory; zero args or leading `-` flag launches opencode agent
-- Responsibilities: Self-locate, load `.env`, dispatch to `cmd_*` functions, drive `docker compose` via `compose()` wrapper
+The hostname `proxy` is load-bearing: opencode's `baseURL` points at
+`http://proxy:${PROXY_PORT}/v1` (`docker-compose.yml:1-7`).
 
-**`proxy/proxy.py:main()`:**
-- Location: `proxy/proxy.py:1764`
-- Triggers: Container entrypoint (`proxy/Dockerfile` runs `python3 proxy.py`)
-- Responsibilities: Validate config, init output dir, set up prompt mode + host OS, start Flask on `PROXY_HOST:PROXY_PORT`
+## CLI Orchestration Role
 
-**`ollama/entrypoint.sh`:**
-- Location: `ollama/entrypoint.sh`
-- Triggers: ollama container startup
-- Responsibilities: Firewall init, `ollama serve` in background, model discovery, stub registration, block on ollama PID
+- **Compose wrapper** — `compose()` (`harness:758`) is the single entry point
+  for any `docker compose`/`podman compose` call. It regenerates the runtime
+  override, builds the `-f` args (main compose + override + MCP snippets), and
+  exports `INSTALL_ROOT`, `HARNESS_ALLOWLIST_PATH`, `HARNESS_PROJECTS_ROOT`,
+  and `HARNESS_HOST_OS`.
+- **Runtime override** — `write_runtime_override()` (`harness:672`)
+  regenerates `state/.harness-runtime.yml` per invocation (never tracked): a
+  per-service firewall opt-out and the ephemeral `--prompt-mode` injection.
+- **Agent launch** — `run_agent` / `cmd_shell` parse agent flags
+  (`--yolo`, `--net`, `--mount`, `-p/--print`), compute mounts, and
+  `docker run` the agent image directly (not via compose).
+- **Upstream gating** — `_probe_upstream_auth` (`harness:960`) POSTs to the
+  upstream before start and aborts on a locked/rejected key with the clickable
+  unlock URL.
+- **Diagnostics** — `cmd_doctor` (`harness:4564`, read-only) and
+  `cmd_preflight` (`harness:4869`, validates `.env`/allowlist/daemon).
 
-**`agents/entrypoint.sh`:**
-- Location: `agents/entrypoint.sh`
-- Triggers: Agent `docker run` (via `harness` CLI)
-- Responsibilities: Root-side firewall + UID remap + gosu drop; user-side git credentials, skel seed, cd to `HARNESS_HOST_CWD`, mode dispatch to `run_opencode` or `run_shell`
+## MCP Lifecycle
+
+State machine (`architecture/mcp.md`):
+
+```text
+available ──install/register──▶ installed-enabled ⇄ disable/enable ⇄ installed-disabled ──uninstall──▶ available
+```
+
+- `install` copies a repo-tracked `mcp-registry/<name>/` into
+  `state/mcp/<name>/`; `register` lands an arbitrary external source behind a
+  compose-merge validation gate (merge check, service/container_name
+  collision check, port-warning).
+- `mcp_is_installed(name)` is "compose.yml exists in the active tree" — not
+  directory existence — so `data/` survives uninstall.
+- Enabled entries reach the runtime two ways: compose merge
+  (`mcp_compose_files`, `harness:577`) and client-config merge into
+  `state/agent/home/.harness-mcp-servers.json`, folded into opencode config
+  by the agent entrypoint (`merge_opencode_mcp_servers`).
+- `harness upgrade` refreshes registry-sourced entries via
+  `directory_overwrite`, preserving `harness-meta.json` and `data/`.
+
+## Install / Upgrade Flow
+
+- `harness-install.sh` clones the repo (the clone IS the install root), seeds
+  user config and `state/`, and symlinks `harness` into `~/.local/bin`.
+- `harness update` / `harness upgrade` operate on the same clone via
+  `git pull --ff-only`. `harness upgrade` brings forward `state/` per
+  `scripts/upgrade-manifest.json`, using action functions in
+  `scripts/lib/upgrade_actions.sh` (envfile_merge / linefile_merge /
+  directory_overwrite), anchored on B3-MANAGED comment markers.
 
 ## Architectural Constraints
 
-- **Network:** All inter-container communication is by service name on `harness_harness-net` (`http://ollama:11434`, `http://proxy:8000`). `OLLAMA_REMOTES: proxy` is load-bearing — ollama allowlists `RemoteHost` on the exact literal hostname; renaming the `proxy` service requires updating `OLLAMA_REMOTES`.
-- **IPv6:** Disabled at container creation via `net.ipv6.conf.all.disable_ipv6=1` sysctl in every service; the firewall is IPv4-only and IPv6 would otherwise be unfiltered.
-- **Firewall ordering:** `init-firewall.sh` must run before any privilege drop; `NET_ADMIN`/`NET_RAW` are not preserved by `gosu`.
-- **System→user rewrite:** `_CHANGE_SYSTEM_TO_USER` is hardcoded `True` in `proxy/proxy.py` — the upstream ignores the `system` role. This is not a knob.
-- **Model passthrough:** The proxy forwards whatever model name ollama sent (`:latest` tag stripped) to upstream unchanged. `DEFAULT_MODEL_NAME` is only the fallback when no model is in the request.
-- **Global state in proxy:** `_PROMPT_MODE`, `_HOST_OS`, `_OUTPUT_DIR`, `_CHANGE_SYSTEM_TO_USER`, `_HYBRID_DETAIL_TOOLS` are module-level globals set once at startup in `main()`.
-- **Proxy is not a streaming proxy:** It receives the full upstream response before emitting NDJSON; the response is materialized in memory, then dumped to `state/output/`, then streamed to ollama.
+- **Threading:** The proxy is single-process Flask and does NOT stream from
+  upstream — it receives the full upstream response, then translates and
+  emits (`proxy/proxy.py` response-emission section). Chunks are materialized
+  to a list before streaming.
+- **Self-signed upstream:** Every upstream POST uses `verify=False`
+  (`proxy/proxy.py:1695`). The egress firewall is the trust boundary, not
+  TLS verification.
+- **System role conversion:** `_CHANGE_SYSTEM_TO_USER` is default ON — the
+  upstream silently drops the `system` role, so system messages are folded
+  into a leading user message (`proxy/proxy.py`, `translate_history_…`).
+- **Model passthrough:** `PROXY_API_URL` is a base, not a full endpoint;
+  `_normalize_api_base` (`proxy/proxy.py:72`) strips trailing
+  `/v1/chat/completions`, `/chat/completions`, or `/v1`. `DEFAULT_MODEL_NAME`
+  is REQUIRED with no hardcoded default and is only the fallback.
+- **CLI/proxy URL parity:** the CLI's `_api_base` must mirror the proxy's
+  `_normalize_api_base` — keep the two in sync.
+- **IPv4-only firewall:** containers disable kernel IPv6 at creation via
+  sysctls, or IPv6 egress would be an unfiltered hole.
 
 ## Anti-Patterns
 
-### Setting `PROXY_PROMPT_MODE` in `.env`
+### Treating `PROXY_PROMPT_MODE` as a `.env` knob
 
-**What happens:** The variable sits in `.env` but `docker-compose.yml` deliberately does NOT interpolate it into the proxy service environment.
-**Why it's wrong:** Before this was fixed, a stale `.env` value silently overrode the proxy's built-in `hybrid` default. The only correct path is `harness start/restart --prompt-mode <mode>`, which injects the value ephemerally via the runtime override (`state/.harness-runtime.yml`).
-**Do this instead:** Use `harness start --prompt-mode user_front` for a one-off; the proxy reverts to `hybrid` on the next bare restart.
+**What happens:** A stale `.env` carries `PROXY_PROMPT_MODE=...` and someone
+assumes it controls the proxy.
+**Why it's wrong:** `docker-compose.yml` deliberately no longer interpolates
+it, so the value is inert; only the runtime override
+(`harness start/restart --prompt-mode`) reaches the proxy now.
+**Do this instead:** Use `--prompt-mode <hybrid|user_front|passthrough>` on
+`start`/`restart`; the validator falls back to `hybrid` for any other value.
 
-### Renaming the `proxy` service in `docker-compose.yml` without updating `OLLAMA_REMOTES`
+### Adding a fixed model id at the proxy
 
-**What happens:** ollama's `RemoteHost` allowlist check uses exact string matching on the hostname portion of the URL. If the service is renamed to (e.g.) `translator`, `OLLAMA_REMOTES` must change from `proxy` to `translator`.
-**Why it's wrong:** ollama silently refuses to forward to a host not in `OLLAMA_REMOTES`, causing all agent requests to 404/hang.
-**Do this instead:** Change both the service name in `docker-compose.yml` and the `OLLAMA_REMOTES` value in the same commit.
+**What happens:** Hardcoding a model id instead of forwarding the requested
+one.
+**Why it's wrong:** The requested model flows opencode -> proxy -> upstream
+unchanged; that passthrough is what lets a user switch models from opencode
+(`proxy/proxy.py:1664-1669`).
+**Do this instead:** Forward `model_name or DEFAULT_MODEL_NAME`; treat
+`DEFAULT_MODEL_NAME` only as the no-model-specified fallback.
 
-### Running docker-based tests locally from an agent invocation
+### Parsing tool-call JSON with regex
 
-**What happens:** Tests such as `harness test` (whole suite), `proxy_test.sh`, `harness_test.sh`, `full_pipeline_test.sh` require Docker and significant disk.
-**Why it's wrong:** These can exhaust runner disk and hang the agent. CI runs the full matrix on every push.
-**Do this instead:** Run only `bash -n` on touched shell scripts, `scripts/check_runtime_calls.sh`, advisory `shellcheck`, and `harness test unit` (the docker-free unit suite).
+**What happens:** A lazy regex match on ```json fences terminates on the
+first inner ``` inside an argument string.
+**Why it's wrong:** It truncates JSON whose arguments contain backticks or
+nested code fences.
+**Do this instead:** Use `_scan_balanced_json` (`proxy/proxy.py:752`), which
+tracks string boundaries and escapes.
 
 ## Error Handling
 
-**Strategy:** Fail fast at startup for missing required config; surface upstream errors as HTTP 502 with structured bodies; degrade gracefully on optional features (missing `jq`, unreachable Exa, absent `CWD` annotation).
+**Strategy:** The proxy returns OpenAI-shaped error envelopes so the AI SDK
+surfaces them to opencode; every error path writes a debug dump under
+`OUTPUT_DIR`.
 
 **Patterns:**
-- `proxy/proxy.py:_validate_config` aborts the process on startup if `PROXY_API_URL`, `PROXY_API_KEY`, or `DEFAULT_MODEL_NAME` are empty (`proxy/proxy.py:1751`)
-- `catch_all` returns `502` with `{"error": ..., "details": ...}` JSON on upstream connection errors or non-2xx upstream responses (`proxy/proxy.py:1614–1632`)
-- `ollama/entrypoint.sh`: locked-key `401` (with `unlock_url`) → print URL and `exit 1`; transient upstream failure → warn and fall back to `DEFAULT_MODEL_NAME` only
-- `harness:_gate_on_upstream_auth`: locked key or rejected key → abort agent launch and print unlock URL; `invalid_request` error type (key valid, probe request bad) → warn and continue
-- Debug dumps written to `state/output/<req_id>_*.json` for every proxy request when `OUTPUT_DIR` is set
+- Upstream request failure -> 502 + `_03_API_Error.json`
+  (`proxy/proxy.py:1698-1701`).
+- Upstream >= 400 -> 502 with the upstream status (`proxy/proxy.py:1703-1711`).
+- Unhandled exception -> 500 + `_99_Fatal_Error.json`
+  (`proxy/proxy.py:1800-1804`).
+- The CLI gates the launch on a bad/locked upstream key
+  (`_probe_upstream_auth`) so a bad key never reaches the proxy.
 
 ## Cross-Cutting Concerns
 
-**Logging:** `print()` to stdout in `proxy/proxy.py`; `echo` to stdout/stderr in bash scripts; structured debug dumps in `state/output/`. Accessed via `harness logs <service>`.
-**Validation:** `harness doctor` (read-only diagnostic) and `harness preflight` (validates `.env`, allowlist, docker daemon before start).
-**Authentication:** Bearer token (`PROXY_API_KEY`) on every upstream request; key lifecycle managed externally (locks every ~8h, expires ~1 month). `harness unlock` surfaces the `unlock_url` from a locked `401`.
+**Logging:** `print(..., flush=True)` per request in `catch_all` (req id,
+method, model, message/tool counts, rescue mode), visible via
+`harness logs proxy`. Per-request debug dumps under `state/output/`.
+**Validation:** `_validate_config` (`proxy/proxy.py:1819`) enforces the three
+REQUIRED env values at startup; `cmd_preflight` validates `.env`, allowlist,
+and daemon before `harness start`.
+**Authentication:** `Bearer PROXY_API_KEY` on every upstream call; the egress
+firewall restricts which hosts the proxy/agent can reach.
 
 ---
 

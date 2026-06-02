@@ -88,6 +88,18 @@ legacy installs from before this metadata existed continue to behave as
 enabled. The jq read uses an explicit null check (`if .enabled == null
 then "true" else ...`) because jq's `//` treats `false` as missing.
 
+All meta reads and writes here (`mcp_is_enabled`, `_mcp_set_enabled_file`,
+`mcp_print_firewall_recs`, the register provenance write) and the
+`write_agent_mcp_config` client-config merge go through `harness_jq`, not
+bare `jq`. That keeps docker the only host dependency: on a host without
+host jq they run jq in the proxy container (see harness-cli.md
+"`harness_jq` fallback"). `_mcp_set_enabled_file` flips `.enabled` through
+`harness_jq` precisely so the meta's other fields survive the toggle; only
+a missing meta (or no jq path at all) falls back to writing a minimal
+`{"enabled": <value>}`. The merge slurps its entries via
+`cat … | harness_jq -s` rather than as positional file args, because the
+container fallback maps only a single trailing file arg into the container.
+
 Writes are atomic (temp file + `mv`) so a crashed write can't leave
 half-parsed JSON.
 

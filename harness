@@ -630,17 +630,15 @@ mcp_is_enabled() {
     if [[ ! -f "$meta" ]]; then
         return 0
     fi
-    if command -v jq >/dev/null 2>&1; then
-        # NOTE: jq's `//` operator treats `false` as a missing value, so
-        # `.enabled // true` returns true even when enabled is explicitly
-        # false. Use the explicit null-check instead.
-        local v
-        v=$(jq -r 'if .enabled == null then "true" else (.enabled | tostring) end' "$meta" 2>/dev/null || echo "true")
-        [[ "$v" == "true" ]]
-    else
-        # No jq — naive grep. Treat anything but an explicit false as enabled.
-        ! grep -qE '"enabled"[[:space:]]*:[[:space:]]*false' "$meta"
-    fi
+    # NOTE: jq's `//` operator treats `false` as a missing value, so
+    # `.enabled // true` returns true even when enabled is explicitly
+    # false. Use the explicit null-check instead. Route through harness_jq
+    # (host jq when present, else the proxy container's jq) so the read is
+    # correct on a docker-only host with no host jq, instead of a fragile
+    # grep fallback. Single file arg → the container path maps it to stdin.
+    local v
+    v=$(harness_jq -r 'if .enabled == null then "true" else (.enabled | tostring) end' "$meta" 2>/dev/null || echo "true")
+    [[ "$v" == "true" ]]
 }
 
 # Set meta.enabled to "true" or "false" atomically. Creates the file if it
@@ -2237,16 +2235,21 @@ write_agent_mcp_config() {
         done
     fi
 
-    if (( ${#entries[@]} == 0 )) || ! command -v jq >/dev/null 2>&1; then
+    if (( ${#entries[@]} == 0 )); then
         rm -f "$out_file" 2>/dev/null || true
         return 0
     fi
 
     # Reduce each {"mcpServers": {...}} into a single combined object.
     # Later entries win on key collision (predictable, alphabetic order).
+    # Slurp the entries via stdin (cat | harness_jq -s) rather than as
+    # positional file args: harness_jq's container fallback can only map a
+    # single trailing file arg into the container, so multi-file args would
+    # break on a jq-less host. Concatenating to stdin works for both the
+    # host-jq and container-jq paths, so the merge runs on a docker-only host.
     mkdir -p "$(dirname "$out_file")"
-    if ! jq -s 'reduce .[] as $i ({"mcpServers": {}}; .mcpServers += ($i.mcpServers // {}))' \
-        "${entries[@]}" >"$out_file" 2>/dev/null
+    if ! cat "${entries[@]}" | harness_jq -s 'reduce .[] as $i ({"mcpServers": {}}; .mcpServers += ($i.mcpServers // {}))' \
+        >"$out_file" 2>/dev/null
     then
         # Bad json in one of the entries — don't let it stop the agent.
         rm -f "$out_file" 2>/dev/null || true
@@ -3195,14 +3198,21 @@ mcp_services_of() {
 _mcp_set_enabled_file() {
     local meta="$1" value="$2"
     mkdir -p "$(dirname "$meta")"
-    if command -v jq >/dev/null 2>&1 && [[ -f "$meta" ]]; then
+    if [[ -f "$meta" ]]; then
         local tmp="${meta}.tmp.$$"
-        if jq ".enabled = $value" "$meta" >"$tmp" 2>/dev/null; then
+        # harness_jq (host jq, else container jq) flips .enabled while
+        # PRESERVING the meta's other fields (allowed_domains, repo
+        # provenance). Single file arg → the container path maps it to
+        # stdin. Works on a docker-only host, where the printf fallback
+        # below would otherwise clobber every field but .enabled.
+        if harness_jq ".enabled = $value" "$meta" >"$tmp" 2>/dev/null; then
             mv "$tmp" "$meta"
             return 0
         fi
         rm -f "$tmp" 2>/dev/null || true
     fi
+    # Last resort: no existing meta (or neither host jq nor container jq is
+    # reachable). Write a minimal meta carrying just the enabled flag.
     printf '{"enabled": %s}\n' "$value" >"$meta"
 }
 
@@ -3213,9 +3223,10 @@ _mcp_set_enabled_file() {
 mcp_print_firewall_recs() {
     local meta="$1"
     [[ -f "$meta" ]] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
     local domains
-    domains=$(jq -r '(.allowed_domains // []) | .[]' "$meta" 2>/dev/null || true)
+    # harness_jq (host jq, else container jq) so the recommendations still
+    # print on a docker-only host. Single file arg → container path → stdin.
+    domains=$(harness_jq -r '(.allowed_domains // []) | .[]' "$meta" 2>/dev/null || true)
     [[ -n "$domains" ]] || return 0
     echo
     echo "this MCP recommends allowlisting the following domains for outbound traffic:"
@@ -3489,9 +3500,9 @@ cmd_mcp_register() {
     local name="" from="" ref="" no_enable=0 do_start=0 force=0
     while (( $# > 0 )); do
         case "$1" in
-            --from)      from="${2:-}"; shift ;;
+            --from)      shift; from="${1:-}"; [[ -z "$from" ]] && { err "--from requires a value"; exit 1; } ;;
             --from=*)    from="${1#--from=}" ;;
-            --ref)       ref="${2:-}"; shift ;;
+            --ref)       shift; ref="${1:-}"; [[ -z "$ref" ]] && { err "--ref requires a value"; exit 1; } ;;
             --ref=*)     ref="${1#--ref=}" ;;
             --no-enable) no_enable=1 ;;
             --start)     do_start=1 ;;
@@ -3631,9 +3642,12 @@ cmd_mcp_register() {
     # later re-register can see where this came from.
     if [[ "$from" == *"://"* || "$from" == git@* || "$from" == *.git ]]; then
         local meta="$staging/harness-meta.json"
-        if command -v jq >/dev/null 2>&1 && [[ -f "$meta" ]]; then
+        if [[ -f "$meta" ]]; then
             local tmp="${meta}.tmp.$$"
-            if jq --arg u "$from" --arg r "${ref:-main}" \
+            # harness_jq (host jq, else container jq) so provenance is
+            # recorded even on a docker-only host. Single file arg → the
+            # container path maps it to stdin.
+            if harness_jq --arg u "$from" --arg r "${ref:-main}" \
                  '.repo_clone_url = (.repo_clone_url // $u) | .repo_clone_ref = (.repo_clone_ref // $r)' \
                  "$meta" >"$tmp" 2>/dev/null; then
                 mv "$tmp" "$meta"

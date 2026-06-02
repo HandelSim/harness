@@ -50,6 +50,17 @@ Errors return the OpenAI `{"error":{"message":…}}` envelope (which the AI
 SDK surfaces to opencode) via `_client_error`, plus a debug dump under
 `OUTPUT_DIR`.
 
+**Content normalization.** A message's `content` may arrive as a plain
+string or as a list of content-blocks (multimodal user turns, or an
+SDK structuring an assistant turn as `parts`). `_flatten_content_to_str`
+collapses either shape to a string — block `text` fields joined with
+blank lines, non-text blocks (e.g. `image_url`) dropped — and
+`translate_history_and_apply_prompt` calls it on every inbound message
+before the role branches run, so the `.strip()`, `+=`, and
+token-estimate `join` paths never see a list. (A raw list previously
+500'd those paths.) `passthrough` mode returns messages verbatim, so the
+flatten there lives at the token-estimate join instead.
+
 ## URL base + model passthrough
 
 `PROXY_API_URL` is a **base**, not a full endpoint. `_normalize_api_base`
