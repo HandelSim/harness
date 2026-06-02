@@ -55,13 +55,13 @@ test_section() {
 
 # --- env / override generation ---------------------------------------------
 
-# Write a baseline .env file suitable for the proxy/ollama/mockupstream
+# Write a baseline .env file suitable for the proxy/mockupstream
 # integration stack. Keys after the second positional are written verbatim
 # (KEY=VAL form) and override the defaults for collisions.
 #
 # Args: <output_path> [extra_kv ...]
 # Example:
-#   test_generate_env /tmp/my.env "MOCK_SCENARIO=tool" "PUBLISH_OLLAMA_PORT=11434"
+#   test_generate_env /tmp/my.env "MOCK_SCENARIO=tool" "PROXY_TIMEOUT=10"
 test_generate_env() {
     local out="$1"; shift
     cat >"$out" <<'EOF'
@@ -72,10 +72,8 @@ PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
-OLLAMA_VERSION=0.21.2
-OLLAMA_CONTEXT_LENGTH=200000
+MODEL_CONTEXT_LENGTH=200000
 MOCK_SCENARIO=text
-PUBLISH_OLLAMA_PORT=
 EOF
     # Append/override caller-supplied keys. We don't dedupe — later wins
     # because docker compose / set -a sourcing both honor the last assignment.
@@ -129,7 +127,7 @@ EOF
 # Write a permissive-but-not-open .harness-allowlist for test usage. Includes
 # the canonical positive-case probes used by init-firewall.sh's verify step
 # (api.github.com et al.) plus any extra hosts the caller passes. The intra-
-# cluster service names (proxy, ollama, mockupstream) don't need to be on
+# cluster service names (proxy, mockupstream) don't need to be on
 # the allowlist — they're reached via the host-network bypass rule.
 #
 # Args: <output_path> [extra_host ...]

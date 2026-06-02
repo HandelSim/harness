@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 #
-# Phase 2 proxy integration test.
+# Proxy integration test.
 #
-# Brings up ollama + the real proxy + a mock upstream, then runs scenarios
-# against /api/chat through ollama:
-#   A. text     — non-streaming, verify content + usage round-trip.
-#   B. tool     — verify the tool-call markdown block is parsed and re-emitted
-#                 as a structured tool_calls field with done_reason=tool_calls.
+# Brings up the real proxy + a mock upstream, then runs scenarios against the
+# proxy's OpenAI-compatible interface (/v1/chat/completions) — the path
+# opencode talks to directly, with no ollama hop:
+#   A. text     — stream=false, verify choices[0].message.content + usage.
+#   A2. models  — GET /v1/models forwards the upstream catalog (OpenAI list).
+#   B. tool     — stream=false, verify a structured tool_calls entry with
+#                 function.name + arguments (JSON string) and
+#                 finish_reason=tool_calls.
 #   C. forward  — verify the upstream received {"model","messages"} ONLY and
-#                 the final user message contains the cooperative-prompt wrapper.
-#   D. stream   — stream=true, verify multiple NDJSON lines and a final done:true.
-# Plus scenarios against the proxy's OpenAI-compatible interface directly
-# (the path opencode uses), queried from inside the ollama container:
-#   G. openai-text — POST /v1/chat/completions stream=true; verify SSE
-#                    chat.completion.chunk framing ending in data: [DONE].
-#   H. openai-tool — verify a streamed delta.tool_calls entry with index,
-#                    id+function.name, and arguments as a JSON *string*.
+#                 the final user message carries the cooperative-prompt wrapper.
+#   E. multi    — stream=false, verify TWO tool_calls are surfaced from a
+#                 single response with unique call_ ids.
+#   F. config   — proxy startup banner reflects the env-driven config.
+#   G. stream   — stream=true, verify chat.completion.chunk SSE → data: [DONE].
+#   H. tool/sse — verify a streamed delta.tool_calls entry with index,
+#                 id+function.name, and arguments as a JSON *string*.
 #
 # Also runs proxy/test_proxy.py inside the proxy container.
+#
+# The proxy port is not published to the host; in-network HTTP scenarios curl
+# it from inside the proxy container itself (the proxy image ships curl for its
+# healthcheck), which mirrors the on-network access opencode uses.
 #
 # Always tears down compose state on exit. Uses a dedicated project name so
 # this test doesn't collide with other compose stacks.
@@ -60,8 +66,7 @@ PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
-OLLAMA_VERSION=0.21.2
-OLLAMA_CONTEXT_LENGTH=200000
+MODEL_CONTEXT_LENGTH=200000
 MOCK_SCENARIO=${scenario}
 MOCK_FIXTURES_DIR=${fixtures_dir}
 EOF
@@ -69,9 +74,6 @@ EOF
 
 cat >"${OVERRIDE_FILE}" <<'EOF'
 services:
-  ollama:
-    ports:
-      - "11434:11434"
   mockupstream:
     image: python:3.12-slim
     working_dir: /app
@@ -136,7 +138,7 @@ echo "[proxy-test] validating compose config"
 
 # --- bring up ----------------------------------------------------------------
 
-echo "[proxy-test] building and starting services (mockupstream + proxy + ollama)"
+echo "[proxy-test] building and starting services (mockupstream + proxy)"
 "${COMPOSE[@]}" up -d --build
 
 # --- wait for healthy --------------------------------------------------------
@@ -165,20 +167,25 @@ wait_healthy() {
     done
 }
 
-echo "[proxy-test] waiting up to 120s for mockupstream + proxy + ollama to be healthy"
-if ! wait_healthy 120 mockupstream proxy ollama; then
+echo "[proxy-test] waiting up to 120s for mockupstream + proxy to be healthy"
+if ! wait_healthy 120 mockupstream proxy; then
     echo "[proxy-test] ERROR: services did not become healthy" >&2
     "${COMPOSE[@]}" ps >&2 || true
     echo "--- mockupstream logs ---" >&2; "${COMPOSE[@]}" logs mockupstream >&2 || true
     echo "--- proxy logs ---"        >&2; "${COMPOSE[@]}" logs proxy        >&2 || true
-    echo "--- ollama logs ---"       >&2; "${COMPOSE[@]}" logs ollama       >&2 || true
     exit 1
 fi
 echo "[proxy-test] all services healthy"
 
 # --- helpers -----------------------------------------------------------------
 
-OLLAMA_URL="http://localhost:11434"
+PROXY_URL="http://127.0.0.1:8000"
+
+# Curl the proxy from inside the proxy container (the port isn't published to
+# the host; the proxy image ships curl for its healthcheck).
+proxy_curl() {
+    "${COMPOSE[@]}" exec -T proxy curl "$@"
+}
 
 fail() {
     local label="$1"; shift
@@ -186,7 +193,6 @@ fail() {
     if [[ $# -gt 0 ]]; then echo "[proxy-test] detail: $*" >&2; fi
     echo "--- mockupstream logs ---" >&2; "${COMPOSE[@]}" logs mockupstream >&2 || true
     echo "--- proxy logs ---"        >&2; "${COMPOSE[@]}" logs proxy        >&2 || true
-    echo "--- ollama logs ---"       >&2; "${COMPOSE[@]}" logs ollama       >&2 || true
     exit 1
 }
 
@@ -218,48 +224,37 @@ echo "[proxy-test] running proxy unit tests inside the proxy container"
 "${COMPOSE[@]}" run --rm proxy python -m unittest test_proxy.py -v \
     || fail "unit tests failed"
 
-# --- Scenario A: text round-trip --------------------------------------------
+# --- Scenario A: text round-trip (stream=false) -----------------------------
 
 echo "[proxy-test] scenario A: text round-trip (stream=false)"
 restart_mock_with_scenario "text"
 
-A_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
+A_BODY="$(proxy_curl -fsS -X POST "${PROXY_URL}/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d '{"model":"harness","messages":[{"role":"user","content":"hi"}],"stream":false}')" \
-    || fail "A: /api/chat request failed"
+    || fail "A: /v1/chat/completions request failed"
 echo "[proxy-test]   A response: ${A_BODY}"
 echo "${A_BODY}" | grep -q "Hello from mock upstream" \
     || fail "A: response did not contain upstream content" "${A_BODY}"
-# Note: prompt_eval_count no longer matches the upstream's reported
-# prompt_tokens — the proxy now overrides with a local estimate of the
-# translated conversation, so the value reflects what the agent actually
-# sent, not what the upstream charged. We assert it's present and
-# non-zero. eval_count (completion side) is still passed through from
-# upstream and should match the mock's hardcoded 7.
-echo "${A_BODY}" | grep -qE '"prompt_eval_count":[1-9][0-9]*' \
-    || fail "A: prompt_eval_count missing or zero" "${A_BODY}"
-echo "${A_BODY}" | grep -q '"eval_count":7' \
-    || fail "A: eval_count != 7 (usage not propagated)" "${A_BODY}"
-echo "${A_BODY}" | grep -q '"done_reason":"stop"' \
-    || fail "A: done_reason was not stop" "${A_BODY}"
-
-# Sub-check: stub model is registered with OLLAMA_CONTEXT_LENGTH=200000 (the
-# value written by test_generate_env / write_env above). Asserts the ollama
-# entrypoint's stub registration honors the env var.
-SHOW_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/show" \
-    -H 'Content-Type: application/json' \
-    -d '{"model":"harness"}')" \
-    || fail "A: /api/show request failed"
-echo "${SHOW_BODY}" | grep -q '200000' \
-    || fail "A: /api/show did not include the configured context length 200000" "${SHOW_BODY}"
+echo "${A_BODY}" | grep -qE '"object":[[:space:]]*"chat\.completion"' \
+    || fail "A: response is not a chat.completion object" "${A_BODY}"
+echo "${A_BODY}" | grep -qE '"finish_reason":[[:space:]]*"stop"' \
+    || fail "A: finish_reason was not stop" "${A_BODY}"
+# prompt_tokens is the proxy's local estimate of the translated conversation
+# (what the agent actually sent), so it is present and non-zero rather than
+# the upstream's reported value. completion_tokens passes through from the
+# mock upstream (hardcoded 7).
+echo "${A_BODY}" | grep -qE '"prompt_tokens":[[:space:]]*[1-9][0-9]*' \
+    || fail "A: prompt_tokens missing or zero" "${A_BODY}"
+echo "${A_BODY}" | grep -qE '"completion_tokens":[[:space:]]*7' \
+    || fail "A: completion_tokens != 7 (usage not propagated)" "${A_BODY}"
 
 # --- Scenario A2: proxy /v1/models discovery route --------------------------
 
 echo "[proxy-test] scenario A2: proxy /v1/models forwards the upstream catalog"
-# Query from inside the ollama container — the proxy port isn't published to
-# the host. The proxy forwards GET {upstream}/v1/models; the mock returns its
+# The proxy forwards GET {upstream}/v1/models; the mock returns its
 # MOCK_MODELS list (default 'harness').
-MODELS_JSON="$("${COMPOSE[@]}" exec -T ollama curl -fsS http://proxy:8000/v1/models)" \
+MODELS_JSON="$(proxy_curl -fsS "${PROXY_URL}/v1/models")" \
     || fail "A2: GET /v1/models via proxy failed"
 echo "[proxy-test]   A2 /v1/models: ${MODELS_JSON}"
 echo "${MODELS_JSON}" | grep -q '"harness"' \
@@ -267,7 +262,7 @@ echo "${MODELS_JSON}" | grep -q '"harness"' \
 echo "${MODELS_JSON}" | grep -qE '"object":[[:space:]]*"list"' \
     || fail "A2: /v1/models response is not an OpenAI list envelope" "${MODELS_JSON}"
 
-# --- Scenario B: tool call --------------------------------------------------
+# --- Scenario B: tool call (stream=false) -----------------------------------
 
 echo "[proxy-test] scenario B: tool call"
 restart_mock_with_scenario "tool"
@@ -289,19 +284,45 @@ B_REQ='{
   }],
   "stream": false
 }'
-B_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
+B_BODY="$(proxy_curl -fsS -X POST "${PROXY_URL}/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "${B_REQ}")" \
-    || fail "B: /api/chat request failed"
+    || fail "B: /v1/chat/completions request failed"
 echo "[proxy-test]   B response: ${B_BODY}"
-echo "${B_BODY}" | grep -q '"tool_calls"' \
-    || fail "B: response had no tool_calls field" "${B_BODY}"
-echo "${B_BODY}" | grep -q '"name":"get_weather"' \
-    || fail "B: tool_calls did not contain get_weather" "${B_BODY}"
-echo "${B_BODY}" | grep -q '"city":"Atlanta"' \
-    || fail "B: tool_calls arguments did not include city=Atlanta" "${B_BODY}"
-echo "${B_BODY}" | grep -q '"done_reason":"tool_calls"' \
-    || fail "B: done_reason was not tool_calls" "${B_BODY}"
+
+B_CHECK="$("${COMPOSE[@]}" exec -T proxy python -c "
+import json, sys
+body = json.loads(sys.stdin.read())
+msg = body['choices'][0]['message']
+tcs = msg.get('tool_calls')
+if not tcs:
+    print('NO_TOOL_CALLS'); sys.exit(0)
+tc = tcs[0]
+if not tc.get('id', '').startswith('call_'):
+    print('BAD_ID:' + str(tc.get('id'))); sys.exit(0)
+fn = tc.get('function') or {}
+if fn.get('name') != 'get_weather':
+    print('WRONG_NAME:' + str(fn.get('name'))); sys.exit(0)
+args = fn.get('arguments')
+if not isinstance(args, str):
+    print('ARGS_NOT_STRING:' + type(args).__name__); sys.exit(0)
+if json.loads(args).get('city') != 'Atlanta':
+    print('WRONG_CITY:' + args); sys.exit(0)
+if body['choices'][0].get('finish_reason') != 'tool_calls':
+    print('WRONG_FINISH:' + str(body['choices'][0].get('finish_reason'))); sys.exit(0)
+print('OK')
+" <<<"${B_BODY}")" || fail "B: failed to inspect response" "${B_BODY}"
+
+case "${B_CHECK}" in
+    OK*)              echo "[proxy-test]   B OK (structured tool_call; arguments is a JSON string)" ;;
+    NO_TOOL_CALLS*)   fail "B: response had no tool_calls field" "${B_BODY}" ;;
+    BAD_ID*)          fail "B: tool_call id missing or not call_-prefixed: ${B_CHECK}" "${B_BODY}" ;;
+    WRONG_NAME*)      fail "B: tool_call not named get_weather: ${B_CHECK}" "${B_BODY}" ;;
+    ARGS_NOT_STRING*) fail "B: tool_call arguments not a JSON string: ${B_CHECK}" "${B_BODY}" ;;
+    WRONG_CITY*)      fail "B: tool_call arguments did not include city=Atlanta: ${B_CHECK}" "${B_BODY}" ;;
+    WRONG_FINISH*)    fail "B: finish_reason was not tool_calls: ${B_CHECK}" "${B_BODY}" ;;
+    *)                fail "B: unexpected check output: ${B_CHECK}" "${B_BODY}" ;;
+esac
 
 # --- Scenario C: forwarded request shape ------------------------------------
 
@@ -315,10 +336,10 @@ C_REQ='{
   "tools": [{"type":"function","function":{"name":"get_weather","description":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
   "stream": false
 }'
-C_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
+C_BODY="$(proxy_curl -fsS -X POST "${PROXY_URL}/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "${C_REQ}")" \
-    || fail "C: /api/chat request failed"
+    || fail "C: /v1/chat/completions request failed"
 echo "[proxy-test]   C response (truncated): $(echo "${C_BODY}" | head -c 200)"
 
 # Inspect the upstream's logs to confirm what the proxy forwarded.
@@ -389,7 +410,7 @@ if '<<<BEGIN_AGENT_TOOLS>>>' not in head:
     print('NO_AGENT_TOOLS_IN_HEAD')
     sys.exit(0)
 # Passthrough: the forwarded model is the inbound request's model ('harness'),
-# not a fixed PROXY_API_MODEL. ollama may tag it ':latest'; the proxy strips it.
+# not a fixed PROXY_API_MODEL.
 if body['model'] != 'harness':
     print('WRONG_MODEL:' + str(body['model']))
     sys.exit(0)
@@ -414,29 +435,12 @@ case "${KEY_CHECK}" in
     *)                              fail "C: unexpected key-check output: ${KEY_CHECK}" "${FORWARDED_BODY}" ;;
 esac
 
-# --- Scenario D: streaming --------------------------------------------------
-
-echo "[proxy-test] scenario D: stream=true returns multiple NDJSON lines"
-# mockupstream still on text scenario from C
-D_RAW="$(curl -fsS -N -X POST "${OLLAMA_URL}/api/chat" \
-    -H 'Content-Type: application/json' \
-    -d '{"model":"harness","messages":[{"role":"user","content":"hi"}],"stream":true}')" \
-    || fail "D: /api/chat (stream=true) request failed"
-echo "[proxy-test]   D raw (first 300 chars): $(echo "${D_RAW}" | head -c 300)"
-
-D_LINE_COUNT="$(echo "${D_RAW}" | grep -c '"model"' || true)"
-if (( D_LINE_COUNT < 2 )); then
-    fail "D: expected at least 2 NDJSON objects, got ${D_LINE_COUNT}" "${D_RAW}"
-fi
-echo "${D_RAW}" | tail -1 | grep -q '"done":true' \
-    || fail "D: final line did not have done:true" "${D_RAW}"
-
 # --- Scenario E: multiple tool calls in one response ------------------------
 #
 # Exercises the proxy's multi-call extraction end-to-end via
 # tests/fixtures/responses/07_multi_tool_calls.json. The fixture's
 # response has TWO ```json``` blocks; the proxy must surface BOTH as
-# distinct tool_calls with unique toolu_ ids.
+# distinct tool_calls with unique call_ ids.
 
 echo "[proxy-test] scenario E: multiple tool calls in one response"
 restart_mock_with_fixtures
@@ -458,42 +462,30 @@ E_REQ='{
     }
   }]
 }'
-E_BODY="$(curl -fsS -X POST "${OLLAMA_URL}/api/chat" \
+E_BODY="$(proxy_curl -fsS -X POST "${PROXY_URL}/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "${E_REQ}")" \
-    || fail "E: /api/chat request failed"
+    || fail "E: /v1/chat/completions request failed"
 echo "[proxy-test]   E response (truncated): $(echo "${E_BODY}" | head -c 400)"
 
-# Response is NDJSON (multiple chunks); find the chunk with tool_calls.
 E_TC_CHECK="$("${COMPOSE[@]}" exec -T proxy python -c "
 import json, sys
-tool_calls = None
-for raw in sys.stdin.read().splitlines():
-    raw = raw.strip()
-    if not raw:
-        continue
-    try:
-        chunk = json.loads(raw)
-    except ValueError:
-        continue
-    tcs = chunk.get('message', {}).get('tool_calls')
-    if tcs:
-        tool_calls = tcs
-        break
-if tool_calls is None:
-    print('NO_TOOL_CALLS_CHUNK')
+body = json.loads(sys.stdin.read())
+tool_calls = body['choices'][0]['message'].get('tool_calls')
+if not tool_calls:
+    print('NO_TOOL_CALLS')
     sys.exit(0)
 if len(tool_calls) != 2:
     print(f'WRONG_COUNT:{len(tool_calls)}')
     sys.exit(0)
-p1 = tool_calls[0]['function']['arguments'].get('file_path')
-p2 = tool_calls[1]['function']['arguments'].get('file_path')
+p1 = json.loads(tool_calls[0]['function']['arguments']).get('file_path')
+p2 = json.loads(tool_calls[1]['function']['arguments']).get('file_path')
 if p1 == p2:
     print(f'SAME_PATH:{p1}')
     sys.exit(0)
 id1 = tool_calls[0].get('id', '')
 id2 = tool_calls[1].get('id', '')
-if id1 == id2 or not id1.startswith('toolu_') or not id2.startswith('toolu_'):
+if id1 == id2 or not id1.startswith('call_') or not id2.startswith('call_'):
     print(f'BAD_IDS:{id1}/{id2}')
     sys.exit(0)
 n1 = tool_calls[0]['function'].get('name', '')
@@ -506,14 +498,14 @@ print(f'OK paths={p1},{p2} ids={id1},{id2}')
 
 case "${E_TC_CHECK}" in
     OK*)                  echo "[proxy-test]   E ${E_TC_CHECK}" ;;
-    NO_TOOL_CALLS_CHUNK*) fail "E: no NDJSON chunk contained a tool_calls field" "${E_BODY}" ;;
+    NO_TOOL_CALLS*)       fail "E: response carried no tool_calls field" "${E_BODY}" ;;
     WRONG_COUNT*)         fail "E: expected 2 tool_calls, got ${E_TC_CHECK#WRONG_COUNT:}" "${E_BODY}" ;;
     SAME_PATH*)           fail "E: both tool_calls had same file_path: ${E_TC_CHECK#SAME_PATH:}" "${E_BODY}" ;;
     BAD_IDS*)             fail "E: tool_call ids missing or duplicate: ${E_TC_CHECK#BAD_IDS:}" "${E_BODY}" ;;
     WRONG_NAMES*)         fail "E: expected both tool_calls named 'Read': ${E_TC_CHECK#WRONG_NAMES:}" "${E_BODY}" ;;
     *)                    fail "E: unexpected check output: ${E_TC_CHECK}" "${E_BODY}" ;;
 esac
-echo "[proxy-test]   E OK (2 distinct Read calls, unique toolu_ ids)"
+echo "[proxy-test]   E OK (2 distinct Read calls, unique call_ ids)"
 
 # --- Scenario F: env-driven startup config ----------------------------------
 #
@@ -579,16 +571,15 @@ echo "[proxy-test]   F OK (env-driven startup banner reflects configured values)
 # --- Scenario G: OpenAI-compatible inbound (/v1/chat/completions, SSE) -------
 #
 # opencode talks to the proxy directly over the OpenAI Chat Completions
-# interface (via @ai-sdk/openai-compatible), NOT through ollama. The AI SDK
-# always sets stream:true and parses text/event-stream. Verify the proxy
-# accepts an OpenAI request and streams chat.completion.chunk objects ending
-# in `data: [DONE]`. Queried from inside the ollama container since the proxy
-# port isn't published to the host (mirrors scenario A2).
+# interface (via @ai-sdk/openai-compatible). The AI SDK always sets
+# stream:true and parses text/event-stream. Verify the proxy accepts an
+# OpenAI request and streams chat.completion.chunk objects ending in
+# `data: [DONE]`.
 
 echo "[proxy-test] scenario G: OpenAI /v1/chat/completions SSE"
 restart_mock_with_scenario "text"
 
-G_RAW="$("${COMPOSE[@]}" exec -T ollama curl -fsS -N -X POST http://proxy:8000/v1/chat/completions \
+G_RAW="$(proxy_curl -fsS -N -X POST "${PROXY_URL}/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d '{"model":"harness","messages":[{"role":"user","content":"hi"}],"stream":true}')" \
     || fail "G: POST /v1/chat/completions (stream=true) failed"
@@ -629,7 +620,7 @@ H_REQ='{
     }
   }]
 }'
-H_RAW="$("${COMPOSE[@]}" exec -T ollama curl -fsS -N -X POST http://proxy:8000/v1/chat/completions \
+H_RAW="$(proxy_curl -fsS -N -X POST "${PROXY_URL}/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "${H_REQ}")" \
     || fail "H: POST /v1/chat/completions (tool) failed"
