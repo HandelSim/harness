@@ -23,8 +23,6 @@ host                                                upstream LLM
                     |  +--------+      |              |
                     |  | proxy  |--+   |              |
                     |  +--------+  |---+--------------+
-                    |  | ollama |
-                    |  +--------+
                     |  | agent  |  <-- harness <agent> -p "<task>"
                     |  +--------+
                     +------------------+
@@ -39,7 +37,7 @@ container the adapter:
    (`PROXY_API_KEY`, `PROXY_API_URL`, `DEFAULT_MODEL_NAME`,
    `HARNESS_PROXY_SCHEME`).
 3. Runs `harness-install.sh`, which boots the docker compose stack
-   (proxy + ollama + firewall + agent).
+   (proxy + firewall + agent).
 4. If the scheme selected a `PROXY_PROMPT_MODE`, applies it with
    `harness restart --prompt-mode <mode>`. `PROXY_PROMPT_MODE` is no longer
    written to `.env` (the proxy defaults to `hybrid` and `docker-compose.yml`
@@ -259,7 +257,7 @@ Before consuming real API budget, verify the benchmark plumbing with a
 mock upstream:
 
 ```bash
-# Spin up proxy + ollama + mock-api on a private compose project,
+# Spin up proxy + mock-api on a private compose project,
 # loop over every scheme, capture per-scheme upstream requests, and
 # print a summary that proves prompt-mode switching works.
 ./tests/benchmarks/mock-smoketest.sh                  # tests schemes/*.json
@@ -389,11 +387,11 @@ These three are exactly the proxy's currently-honored `PROXY_PROMPT_MODE`
 values — one scheme per mode. Any other mode name falls back to
 `hybrid`, the default (see `architecture/proxy.md`).
 
-The passthrough caveat to be aware of: ollama-format tool schemas typically
-aren't honored by non-ollama upstreams. Most A/B runs using passthrough
-will show the model failing to call tools at all — that mismatch is
-exactly the data point ("what does harness's mediation add on top of the
-raw upstream?"). See `architecture/proxy.md` for the proxy-side details.
+The passthrough caveat to be aware of: the agent's tool schemas may not be
+honored by the raw upstream. Most A/B runs using passthrough will show the
+model failing to call tools at all — that mismatch is exactly the data
+point ("what does harness's mediation add on top of the raw upstream?").
+See `architecture/proxy.md` for the proxy-side details.
 
 ---
 

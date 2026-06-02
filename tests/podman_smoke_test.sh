@@ -90,9 +90,8 @@ trap cleanup EXIT INT TERM
 ln -s "${REPO_ROOT}" "${TEST_ROOT}/harness"
 
 # Use a placeholder upstream — we don't make real upstream calls in this test.
-# The proxy's /health endpoint doesn't dial upstream; ollama's healthcheck
-# only hits its own /api/tags. So the stack reaches a stable healthy state
-# without a working API key.
+# The proxy's /health endpoint doesn't dial upstream, so the stack reaches a
+# stable healthy state without a working API key.
 cat >"${TEST_ROOT}/.env" <<'EOF'
 PROXY_API_URL=http://placeholder.invalid/v1/chat/completions
 PROXY_API_KEY=test-key-1234
@@ -101,9 +100,7 @@ PROXY_HOST=0.0.0.0
 PROXY_PORT=8000
 OUTPUT_DIR=
 PROXY_TIMEOUT=30
-OLLAMA_VERSION=0.21.2
-OLLAMA_CONTEXT_LENGTH=200000
-PUBLISH_OLLAMA_PORT=
+MODEL_CONTEXT_LENGTH=200000
 EOF
 
 cat >"${TEST_ROOT}/.harness-allowlist" <<'EOF'
@@ -140,29 +137,24 @@ if ! grep -Eq 'podman\s+runtime' /tmp/podman-smoke-preflight.txt; then
 fi
 echo "[podman-smoke] T1 OK"
 
-# --- Test 2: harness start brings up proxy + ollama -------------------------
+# --- Test 2: harness start brings up proxy ----------------------------------
 
 echo "[podman-smoke] T2: harness start (build + up under podman, takes a few minutes)"
 "${HARNESS_BIN}" start >/dev/null
 deadline=$(( $(date +%s) + 180 ))
 proxy_ok=0
-ollama_ok=0
 while (( $(date +%s) < deadline )); do
     proxy_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" ps -q proxy 2>/dev/null || true)
-    ollama_id=$(harness_docker compose --project-name "${PROJECT_NAME}" \
-        -f "${REPO_ROOT}/docker-compose.yml" ps -q ollama 2>/dev/null || true)
-    if [[ -n "${proxy_id}" && -n "${ollama_id}" ]]; then
+    if [[ -n "${proxy_id}" ]]; then
         proxy_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${proxy_id}" 2>/dev/null || echo "none")
-        ollama_status=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${ollama_id}" 2>/dev/null || echo "none")
         [[ "${proxy_status}" == "healthy" ]] && proxy_ok=1
-        [[ "${ollama_status}" == "healthy" ]] && ollama_ok=1
-        if (( proxy_ok && ollama_ok )); then break; fi
+        if (( proxy_ok )); then break; fi
     fi
     sleep 3
 done
-if (( ! proxy_ok || ! ollama_ok )); then
-    echo "[podman-smoke] T2 FAIL: services did not reach healthy state" >&2
+if (( ! proxy_ok )); then
+    echo "[podman-smoke] T2 FAIL: proxy did not reach healthy state" >&2
     harness_docker compose --project-name "${PROJECT_NAME}" \
         -f "${REPO_ROOT}/docker-compose.yml" ps >&2 || true
     [[ -n "${proxy_id}" ]] && harness_docker logs "${proxy_id}" 2>&1 | tail -50 >&2 || true

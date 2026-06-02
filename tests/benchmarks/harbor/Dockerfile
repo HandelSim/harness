@@ -45,7 +45,7 @@ RUN apt-get update \
 RUN pip install --no-cache-dir "harbor==${HARBOR_VERSION}"
 
 # --- universal egress firewall ---------------------------------------------
-# Same init script used by proxy/ollama/agents — harbor uses the shared
+# Same init script used by proxy/agents — harbor uses the shared
 # .harness-allowlist (mounted at /etc/harness/allowlist by harbor.sh) so
 # harbor's outbound is restricted the same way as the rest of the stack.
 COPY firewall/init-firewall.sh /usr/local/bin/init-firewall.sh

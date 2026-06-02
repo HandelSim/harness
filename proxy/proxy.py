@@ -1224,8 +1224,8 @@ def translate_history_and_apply_prompt(
                         tool_names_by_id[tc_id] = name
                     pending_tool_names.append(name)
                     # OpenAI args is a JSON string; pass it through verbatim.
-                    # ollama-style clients send an object — render as compact
-                    # JSON in that case.
+                    # Some clients send an object instead — render it as
+                    # compact JSON in that case.
                     if isinstance(args, str):
                         args_json_str = args
                     else:
@@ -1598,7 +1598,7 @@ def _empty_response_rescue_text() -> str:
     message slot — once a turn no longer carries the offending content the
     upstream returns to normal, even with the trigger still present further
     back in history. The text alone unsticks the upstream filter, but a
-    text-only response makes opencode end the turn (`done_reason: stop`);
+    text-only response makes opencode end the turn (`finish_reason: stop`);
     the *real* continuation comes from pairing this text with the rescue
     bash/pwd call from `_select_rescue_tool` when a shell tool is
     available."""
@@ -1761,7 +1761,7 @@ def _select_rescue_tool(
 ) -> Optional[Dict[str, Any]]:
     """Pick a "dumb tool" call to emit alongside the empty-response rescue
     text so opencode treats the assistant turn as continuing (it sets
-    `done_reason: tool_calls`, executes the tool, and re-invokes the model
+    `finish_reason: tool_calls`, executes the tool, and re-invokes the model
     with the tool result as the new recency — which displaces the filter-
     triggering content out of the hot slot). See architecture/proxy.md →
     "Empty-response detection" (issue #117).

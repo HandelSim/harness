@@ -9,7 +9,7 @@ This document enumerates every atomic, testable behavior of the harness project.
 - **N###** — Firewall guardrails (`firewall/init-firewall.sh`, network overrides)
 - **U###** — Upgrade actions (`scripts/lib/upgrade_actions.sh`, manifest dispatch)
 - **Pe###** — Persistence (where state lives, what survives, what is regenerated)
-- **O###** — Ollama stub model (`ollama/entrypoint.sh`, model registration)
+- **O###** — *(retired — the proxy now serves the OpenAI-compatible interface directly; the separate container is gone)*
 - **I###** — Installer (`harness-install.sh`)
 
 Rows are intended to be atomic: one behavior, one row. Compound behaviors are split.
@@ -42,13 +42,13 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F020 | `harness check-updates` prints "up to date" when local matches remote |
 | F021 | `harness check-updates` prints an "update available" notice with remote SHA when behind |
 | F022 | `harness check-updates` exits non-zero on network failure if no cached value exists |
-| F023 | `harness start` launches the `ollama` and `proxy` services via `docker compose up -d` |
+| F023 | `harness start` launches the `proxy` (and `agent`) services via `docker compose up -d` |
 | F024 | `harness start` aborts when `require_runtime_config` fails |
 | F025 | `harness start` invokes `warn_if_firewall_open` and prints a banner when any host is in net-overrides |
 | F026 | `harness start` writes a runtime override file (`state/.harness-runtime.yml`) before invoking compose |
 | F027 | `harness start` gates on `_probe_upstream_auth` and prints unlock URL when upstream returns 401 |
 | F028 | `harness down` runs `docker compose down` for the harness project |
-| F029 | `harness down` does NOT remove user state under `state/agent/home` or `state/ollama-data` |
+| F029 | `harness down` does NOT remove user state under `state/agent/home` |
 | F030 | `harness restart` runs `down` then `start` |
 | F031 | `harness update` performs `git pull --ff-only` on the install root |
 | F032 | `harness update` refuses to operate on a dirty working tree |
@@ -63,8 +63,8 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F140 | `_upgrade_confirm` empty answer (Enter) resolves to the optional `default` arg: "n" aborts, "y"/unset proceeds (back-compat for existing callers) |
 | F141 | `_git_branches_diverged` returns success only when HEAD and `@{u}` have each diverged (ahead>0 AND behind>0); failure for up-to-date, behind-only, ahead-only, and no-upstream branches |
 | F142 | `harness upgrade` / `harness update` offer a `git reset --hard @{u}` recovery on a diverged-history `--ff-only` failure (defaults to N); `--no-prompt`/CI never auto-resets, and non-divergence pull failures abort unchanged |
-| F041 | `harness logs <service>` follows compose logs for the named service |
-| F042 | `harness logs` (no service) tails all services |
+| F041 | `harness logs <service>` follows compose logs for the named service (e.g., `proxy`) |
+| F042 | `harness logs` (no service) follows logs for all running services (primarily `proxy`) |
 | F043 | Bare `harness` (no command), or `harness` with a leading agent flag, launches an opencode agent in the CWD (option C dispatch); an unknown bare word still errors |
 | F044 | `harness opencode` launches the agent container with the `opencode` mode |
 | F045 | `harness shell` launches the agent container with the `shell` mode and an interactive TTY |
@@ -86,7 +86,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F148 | `_downgrade_target_tag` on the earliest tag returns non-zero with no output (no earlier tag to downgrade to) |
 | F149 | `harness downgrade` confirm defaults to N — declining leaves HEAD unchanged and exits non-zero; accepting `git reset --hard`s the branch to the target tag |
 | F056 | `harness list` lists currently running harness containers for this install root |
-| F057 | `harness stop` stops the agent container without affecting `ollama`/`proxy` |
+| F057 | `harness stop` stops the agent container without affecting `proxy` |
 | F058 | `harness stop <name>` stops the named agent container |
 | F059 | `pick_agent` prompts when multiple agents are running |
 | F060 | `pick_agent` returns the single running agent without prompting |
@@ -127,12 +127,12 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F096 | `harness doctor` reports install section: install-root path, wrapper presence |
 | F097 | `harness doctor` reports config section: `.env` and `.harness-allowlist` presence and parseability |
 | F098 | `harness doctor` reports network section: PROXY_API_URL hostname allowlisted vs not |
-| F099 | `harness doctor` reports storage section: state/output, state/agent/home, state/ollama-data writability |
+| F099 | `harness doctor` reports storage section: state/output, state/agent/home writability |
 | F100 | harness honors `HTTP_PROXY`/`HTTPS_PROXY` for host-side git calls; a non-empty value in `.env` wins, else the invoking shell's value (a blank `.env` value does not clobber the shell) |
 | F101 | `harness_docker` / `harness_docker_exec` pass the host proxy (all four spellings) through to the container runtime so `compose build` / BuildKit routes image pulls and `RUN` steps through it; running containers never get it (compose declares no proxy vars) |
 | F102 | `harness_normalize_proxy_env` mirrors the upper/lower-case proxy spellings without overwriting an explicit value |
 | F100 | `harness doctor` reports runtime section: docker/podman daemon reachable |
-| F101 | `harness doctor` reports images section: presence and age of `harness-proxy`, `harness-ollama`, `harness-agents` |
+| F101 | `harness doctor` reports images section: presence and age of `harness-proxy`, `harness-agents` |
 | F102 | `harness doctor` reports mcp section: installed MCP services and enabled/disabled state |
 | F103 | `harness doctor` reports agents section: any agent container currently running |
 | F104 | `harness preflight` validates required commands exist (docker/podman, git) |
@@ -187,7 +187,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P006 | Proxy reads `PROXY_API_KEY` from env |
 | P007 | Proxy reads `DEFAULT_MODEL_NAME` from env (fallback model when a request omits one) |
 | P008 | Proxy reads `PROXY_TIMEOUT` from env |
-| P009 | Proxy reads `OLLAMA_CONTEXT_LENGTH` from env |
+| P009 | Proxy reads `MODEL_CONTEXT_LENGTH` from env (legacy alias: `OLLAMA_CONTEXT_LENGTH`) |
 | P010 | Proxy reads `PROXY_PROMPT_MODE` from the container env (default `hybrid`); not a `.env` knob — set only via `harness --prompt-mode` for benchmarking |
 | P011 | The system→user conversion is governed by the hardcoded `_CHANGE_SYSTEM_TO_USER=True` constant (no longer read from an env var) |
 | P012 | Proxy reads `OUTPUT_DIR` from env for debug dumps |
@@ -207,35 +207,35 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P029 | Multiple consecutive user messages are merged into one |
 | P030 | With `_CHANGE_SYSTEM_TO_USER` True (always, since it is a hardcoded constant), the system message is rewritten as a user message |
 | P031 | When system→user rewrite happens, a stub assistant turn ("Understood…") is inserted so upstream sees user/assistant alternation |
-| P032 | `make_chunk` emits ollama-shaped NDJSON chunks |
-| P033 | Final NDJSON chunk includes `done: true` and `done_reason` |
-| P034 | Final NDJSON chunk includes `usage` derived from upstream usage or fallback estimate |
-| P035 | Tool-call ids emitted on the ollama side are prefixed `toolu_` and use a deterministic uuid format |
-| P036 | `_estimate_tokens` returns `len(text)//4` capped at `OLLAMA_CONTEXT_LENGTH` |
+| P032 | Streaming emits OpenAI SSE `chat.completion.chunk` objects (`data: {...}` lines) |
+| P033 | SSE stream terminates with a literal `data: [DONE]` line; `finish_reason` (`stop`/`tool_calls`) replaces the old `done`/`done_reason` fields |
+| P034 | A usage chunk (`usage` derived from upstream usage or fallback estimate) is emitted when `stream_options.include_usage` is set |
+| P035 | Tool-call ids emitted by the proxy are prefixed `call_` and are unique per call |
+| P036 | `_estimate_tokens` returns `len(text)//4` capped at `MODEL_CONTEXT_LENGTH` |
 | P037 | Upstream 401 response prints the unlock URL and forwards 401 |
 | P038 | Upstream 403 response prints the unlock URL and forwards 403 |
 | P039 | Upstream 429 response prints a rate-limit warning and forwards 429 |
 | P040 | Upstream 5xx response prints a warning and forwards the status |
-| P041 | Upstream connection failure surfaces as HTTP 502 to ollama |
-| P042 | Upstream non-JSON response surfaces as HTTP 502 to ollama |
-| P043 | When `OUTPUT_DIR` is set, request dumps go to `01_Ollama_Request_*` files |
+| P041 | Upstream connection failure surfaces as HTTP 502 to the agent |
+| P042 | Upstream non-JSON response surfaces as HTTP 502 to the agent |
+| P043 | When `OUTPUT_DIR` is set, request dumps go to `01_Inbound_Request_*` files |
 | P044 | When `OUTPUT_DIR` is set, upstream request dumps go to `02_API_Request_*` files |
 | P045 | When `OUTPUT_DIR` is set, upstream OK response dumps go to `03_API_Response_*` files |
 | P046 | When `OUTPUT_DIR` is set, upstream error dumps go to `03_API_Error_*` files |
-| P047 | When `OUTPUT_DIR` is set, ndjson output dumps go to `04_NDJSON_Response_*` files |
+| P047 | When `OUTPUT_DIR` is set, OpenAI output dumps go to `04_OpenAI_Response_*` (non-stream) / `04_OpenAI_SSE_Response_*` (stream) files |
 | P048 | When `OUTPUT_DIR` is set, fatal exceptions dump to `99_Fatal_Error_*` files |
 | P049 | Debug dump filenames embed a monotonic counter and timestamp |
 | P050 | Debug dumps are skipped silently when `OUTPUT_DIR` is unset |
-| P051 | Streaming requests yield NDJSON with one chunk per upstream delta |
-| P052 | Non-streaming requests still yield a single NDJSON line followed by the done chunk |
-| P053 | Tool-result messages in the inbound ollama payload are translated into user-role text, wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers (content never parsed; agent-agnostic) |
+| P051 | Streaming requests yield OpenAI SSE (`data: {chat.completion.chunk}` lines) terminated by `data: [DONE]` |
+| P052 | Non-streaming requests yield a single OpenAI `chat.completion` JSON object |
+| P053 | Tool-result messages in the inbound payload are translated into user-role text, wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers (content never parsed; agent-agnostic) |
 | P054 | The cooperative prompt instructs the model to use ```json fenced blocks for tool calls |
 | P055 | The cooperative prompt enumerates available tools by name and schema |
 | P056 | Proxy forwards the inbound (requested) model to upstream, stripping a `:latest` tag; falls back to `DEFAULT_MODEL_NAME` only when the request omits a model |
 | P057 | Tool-result name is resolved from metadata: explicit `tool_name`/`name` field, else `tool_call_id` correlated to the assistant `tool_calls`, else positional order, else `unknown_tool` |
 | P058 | Hybrid mode echoes the full description of the project-managed `_HYBRID_DETAIL_TOOLS` constant (`["task","skill"]`, not an env var) into the recency reminder in `<<<BEGIN_TOOL_DETAIL>>>` blocks; only present, non-empty-description tools surface |
 | P059 | The hybrid recency reminder advises the model to default to the listed tools over doing the work by hand, with concrete examples (`webfetch` vs curl/Python, `todowrite`/`todoread` vs a todo file) |
-| P060 | Proxy `GET /v1/models` proxies the upstream models catalog: forwards `{base}/v1/models` with the bearer key and returns the upstream status/body verbatim (so a locked-key 401 + `unlock_url` passes through) |
+| P060 | Proxy `GET /v1/models` proxies the upstream models catalog: forwards `{base}/v1/models` with the bearer key and returns the upstream status/body verbatim (so a locked-key 401 + `unlock_url` passes through); the agent uses this route to enumerate available models |
 | P061 | Proxy derives endpoints from `PROXY_API_URL` as a base — `{base}/v1/chat/completions` and `{base}/v1/models` — stripping a trailing `/v1/chat/completions`, `/chat/completions`, or `/v1` first |
 
 ---
@@ -255,10 +255,10 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | A009 | User-side init seeds `/etc/skel/harness/.` into `$HOME` once (`cp -an`) so it never overwrites user edits |
 | A010 | User-side init `cd`s into `HARNESS_HOST_CWD` if set |
 | A018 | `ensure_opencode_config` writes `~/.config/opencode/opencode.json` on every launch |
-| A019 | `ensure_opencode_config` configures a `harness` provider pointing at the local ollama endpoint |
+| A019 | `ensure_opencode_config` configures a `harness` provider pointing at the proxy's OpenAI-compatible endpoint |
 | A020 | `ensure_opencode_config` defines a `yolo` agent profile |
 | A035 | `ensure_opencode_config` sets the opencode provider display name to the fixed string `GenAI Harness` |
-| A036 | `ensure_opencode_config` builds the opencode model list from ollama `/api/tags` (stub names minus `:latest`), always includes `DEFAULT_MODEL_NAME`, and selects `harness/${DEFAULT_MODEL_NAME}` |
+| A036 | `ensure_opencode_config` builds the opencode model list from the proxy `GET /v1/models` response, always includes `DEFAULT_MODEL_NAME`, and selects `harness/${DEFAULT_MODEL_NAME}` |
 | A021 | `merge_opencode_mcp_servers` translates the canonical `mcpServers` JSON into opencode's mcp shape |
 | A022 | `merge_opencode_mcp_servers` distinguishes `local` (stdio) from `remote` (SSE/HTTP) entries |
 | A028 | `run_opencode` sets `OPENCODE_DISABLE_AUTOUPDATE=1` |
@@ -382,7 +382,6 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | Pe002 | `.harness-allowlist` (user config) lives at install-root and survives `down`/`restart`/`upgrade` |
 | Pe003 | `.harness-net-overrides.json` lives at install-root and survives `down` |
 | Pe004 | `state/agent/home/` is a per-install shared agent home, persisted across agent runs |
-| Pe005 | `state/ollama-data/` holds the stub model registration data and survives container restarts |
 | Pe006 | `state/output/` is the proxy debug-dump directory; never managed by upgrades |
 | Pe007 | `state/mcp/<name>/` holds installed MCP service state |
 | Pe008 | `state/mcp/<name>/harness-meta.json` holds enabled/disabled state and is preserved by `directory_overwrite` upgrades |
@@ -395,29 +394,6 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | Pe017 | `harness mcp uninstall <name>` deletes `state/mcp/<name>/` (the only path that removes state) |
 | Pe018 | `harness-meta.json` survives `directory_overwrite` even when the registry source no longer ships one |
 | Pe019 | `data/` subdirs of MCP installs survive `directory_overwrite` via the manifest `preserve` list |
-
----
-
-## Ollama stub model (O###)
-
-| ID | Behavior |
-|----|----------|
-| O001 | `ollama/entrypoint.sh` runs `init-firewall.sh` before starting ollama |
-| O002 | `ollama serve` is launched in the background and its PID captured |
-| O003 | Entrypoint polls `/api/tags` up to 60 seconds for ollama readiness |
-| O004 | Entrypoint fatally errors if ollama is not ready within 60 seconds |
-| O005 | `register_stub_model` POSTs `/api/create` with `model`, `from`, `remote_host` fields |
-| O006 | `register_stub_model` POSTs `info.context_length` matching `OLLAMA_CONTEXT_LENGTH` |
-| O007 | `register_stub_model` POSTs `parameters.num_ctx` matching `OLLAMA_CONTEXT_LENGTH` |
-| O008 | `register_stub_model` requires the response stream's final line to have `"status":"success"` |
-| O009 | Canonical `MODEL_NAME` registration is fatal on failure (exit non-zero) |
-| O019 | The registered stub model points at the proxy via `remote_host` |
-| O020 | Trap on EXIT cleans up the background ollama process |
-| O021 | Trap on INT cleans up the background ollama process |
-| O022 | Trap on TERM cleans up the background ollama process |
-| O023 | `OLLAMA_REMOTES=proxy` ensures ollama trusts the proxy as remote host |
-| O024 | Ollama healthcheck probes `/api/tags` and reports healthy when registered |
-| O025 | Ollama service `depends_on: proxy: service_healthy` blocks startup until proxy is healthy |
 
 ---
 
@@ -440,7 +416,6 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | I013 | On Windows the installer runs a `dos2unix` pass over the cloned files |
 | I014 | The installer creates `state/output/` |
 | I015 | The installer creates `state/agent/home/` |
-| I016 | The installer creates `state/ollama-data/` |
 | I017 | The installer creates `state/mcp/` |
 | I018 | If `.env` already exists in the install root, it is left untouched |
 | I019 | If `$cwd/.env` exists before install, it is moved into the install root |

@@ -1,6 +1,6 @@
 {
   "name": "passthrough",
-  "description": "No tool-use injection, no system→user rewrite, no history translation. tools are forwarded to upstream verbatim. Benchmark control baseline: isolates the harness contribution from upstream model capability. Will fail every task that requires tool calls when run against a non-ollama upstream (ollama-format tool schemas typically aren't honored) — that's the point. See architecture/proxy.md for proxy-side details.",
+  "description": "No tool-use injection, no system→user rewrite, no history translation. tools are forwarded to upstream verbatim. Benchmark control baseline: isolates the harness contribution from upstream model capability. Will fail every task that requires tool calls, because no tool-use scaffolding is injected and the raw upstream may not honor the agent's tool schemas — that's the point. See architecture/proxy.md for proxy-side details.",
   "env": {
     "HARNESS_PROXY_SCHEME": "passthrough",
     "PROXY_PROMPT_MODE": "passthrough"

@@ -10,13 +10,13 @@ Harbor's BaseInstalledAgent interface (harbor>=2.x) is async and expects:
 These adapters wrap `harness <agent> -p "<instruction>"`. The harness stack
 itself runs inside Harbor's per-task container; that container needs host
 Docker access (via /var/run/docker.sock bind mount) because harness boots
-its own docker-compose stack (proxy + ollama + firewall + agent containers).
+its own docker-compose stack (proxy + firewall + agent containers).
 
 EXECUTION MODEL
 ---------------
 Harbor (host) -> per-task container -> this adapter ->
     harness-install.sh + docker compose up -> harness <agent> -p "<task>"
-        -> ollama stub -> harness proxy -> upstream LLM API
+        -> harness proxy -> upstream LLM API
 
 ARM64 + QEMU CAVEAT
 -------------------
