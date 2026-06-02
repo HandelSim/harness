@@ -5,16 +5,21 @@
 See: .planning/PROJECT.md (updated 2026-06-02)
 
 **Core value:** A working coding agent (opencode) driving real tool calls against the user's working directory through the translating proxy — the opencode → proxy → upstream path with cooperative tool-use mediation must keep working.
-**Current focus:** Phase 3 — ollama teardown
+**Current focus:** Phase 4 — hardening (tests/docs cleanup); ollama fully removed
 
 ## Current Position
 
-Phase: 3 of 4 (delete the ollama service, image, CLI refs, firewall remotes; remove proxy's ollama /api/chat path)
+Phase: 4 of 4 (hardening — tests green, docs free of the ollama hop, install/upgrade continuity)
 Plan: direct execution (headless oak worker; not using interactive /gsd:execute-phase)
-Status: Phase 2 complete — opencode points at the proxy; Phase 3 next
-Last activity: 2026-06-02 — Phase 2 implemented (opencode cutover to proxy)
+Status: Phases 1–3 complete; Phase 4 code-complete from the worker side, final
+green is CI-gated (docker suites run in CI, not locally per CLAUDE.md). ollama
+service/image/CLI refs/firewall remotes and the proxy `/api/chat` NDJSON path
+are all deleted; the whole test catalog (proxy/harness/firewall/scheme_contract/
+full_pipeline/integration/persistence/mcp/podman + benchmarks) plus INVENTORY/
+COVERAGE are migrated to the OpenAI-only topology.
+Last activity: 2026-06-02 — Phase 3 teardown + Phase 3b/4 test+docs cleanup pushed to nollama
 
-Progress: [█████░░░░░] 50%
+Progress: [█████████░] 95%
 
 ## Performance Metrics
 
@@ -67,6 +72,21 @@ Recent decisions affecting current work:
   on the proxy/upstream being reachable at launch; falls back to
   `DEFAULT_MODEL_NAME` alone otherwise (cosmetic dropdown; selection still
   works).
+- **Phase 3 teardown:** ollama service deleted from `docker-compose.yml`,
+  `ollama/` image dir removed, proxy `/api/chat` + NDJSON emit path deleted
+  (proxy is OpenAI-only: `/v1/chat/completions`, `/v1/models`, `/health`),
+  firewall remotes for ollama dropped. `OLLAMA_CONTEXT_LENGTH` kept ONLY as a
+  legacy read-alias for the new `MODEL_CONTEXT_LENGTH` so existing `.env`
+  files keep working; `OLLAMA_AGENT_MODEL`/`PROXY_API_MODEL` collapsed into
+  `DEFAULT_MODEL_NAME`. Proxy port stays unpublished — in-network tests exec
+  `curl` inside the proxy container.
+- **Phase 3b/4 cleanup:** whole test suite + tests/INVENTORY.md +
+  tests/COVERAGE.md migrated to OpenAI shape (call_-prefixed tool ids,
+  `chat.completion`/`chat.completion.chunk`, `data: [DONE]`,
+  `04_OpenAI_Response_*`/`04_OpenAI_SSE_Response_*` dumps). Coverage losses
+  with no OpenAI analog were **deleted, not faked**, and flagged: the
+  cross-service iptables isolation check and O001 firewall-ordering block
+  (no second long-running firewalled service remains) and Pe005.
 
 ### Pending Todos
 
@@ -78,7 +98,11 @@ None yet.
 
 [Issues that affect future work]
 
-None yet.
+- **Forbidden-file stale refs (for owner, not worker-fixable):** `CLAUDE.md`
+  line ~43 and `.github/workflows/ci.yml` still mention ollama. Both are under
+  the CLAUDE.md "Forbidden from modifying" guard, so left untouched. CI does
+  **not** break — `hashFiles('ollama/**')` tolerates the now-missing dir. Owner
+  should sweep these when convenient.
 
 ## Deferred Items
 
@@ -90,6 +114,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-02 00:00
-Stopped at: GSD onboarding — roadmap and state created
+Last session: 2026-06-02
+Stopped at: Phase 3 teardown + Phase 3b/4 test+docs cleanup complete and pushed
+to `nollama`; ollama fully removed from the data path. Next: confirm CI green on
+the docker suites, then proceed to the `harness mcp register` feature
+(.planning/proposals/mcp-register.md).
 Resume file: None
