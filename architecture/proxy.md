@@ -1,46 +1,32 @@
 # `proxy/proxy.py` — translating proxy
 
-A Flask app that translates between a client wire format and the
-upstream's chat-completions format, AND injects cooperative tool-use
-prompts so models that don't natively support tool calls can produce them
-as ```json blocks that the proxy parses back into native `tool_calls`.
+A Flask app that exposes an OpenAI-compatible Chat Completions endpoint
+(`POST /v1/chat/completions`) and translates to/from the upstream's
+chat-completions format, AND injects cooperative tool-use prompts so models
+that don't natively support tool calls can produce them as ```json blocks
+that the proxy parses back into native `tool_calls`.
 
-Two inbound formats are accepted, dispatched by request path in
-`catch_all`:
-
-- **OpenAI Chat Completions** (`POST /v1/chat/completions`) — the primary
-  interface opencode speaks via the `@ai-sdk/openai-compatible` provider.
-  Replies are Server-Sent Events (`text/event-stream`) when the request
-  sets `stream: true` (the AI SDK always does), else a single
-  `chat.completion` JSON object.
-- **ollama `/api/chat`** (NDJSON `application/x-ndjson`) — the legacy
-  interface, retained as a fallback during the proxy-direct migration
-  (the ollama container is removed in a later phase).
-
-Both share one internal pipeline; only the inbound parse (the top-level
-`model`/`messages`/`tools` keys are identical across both) and the
-outbound framing differ.
+opencode speaks this endpoint directly via its `@ai-sdk/openai-compatible`
+provider (`baseURL: http://proxy:${PROXY_PORT}/v1`). Replies are Server-Sent
+Events (`text/event-stream`) when the request sets `stream: true` (the AI SDK
+always does), else a single `chat.completion` JSON object.
 
 Single-process, single file.
 
 ## Request lifecycle
 
 ```
-opencode ──/v1/chat/completions──▶ catch_all() ──┐
-ollama   ──/api/chat────────────────────────────▶├─ translate_history_and_apply_prompt()
+opencode ──/v1/chat/completions──▶ catch_all() ──┬─ translate_history_and_apply_prompt()
                                                   ├─ POST upstream
                                                   ├─ extract_tool_calls_and_text()
                                                   └─ emit: generate_openai_sse() (SSE)
                                                           / build_openai_response() (JSON)
-                                                          / generate_ndjson() (ollama NDJSON)
 ```
 
 `catch_all(path)` is the single Flask route handler that owns every
 non-health request. It:
 
-1. Sets `is_openai` from the path (`…/chat/completions` → OpenAI, else the
-   ollama fallback), then reads the JSON body (`model`, `messages`,
-   `tools`, and OpenAI `stream`).
+1. Reads the JSON body (`model`, `messages`, `tools`, and OpenAI `stream`).
 2. Builds a tools-as-text string via `format_tools_to_text`.
 3. Calls `translate_history_and_apply_prompt` to flatten the inbound
    conversation into a single-role-alternating array for the upstream
@@ -50,21 +36,19 @@ non-health request. It:
    endpoint `{base}/v1/chat/completions` (see [URL base + model
    passthrough](#url-base--model-passthrough)) with a `Bearer PROXY_API_KEY`
    header, `verify=False` (the upstream uses a self-signed cert), and
-   `timeout=PROXY_TIMEOUT`. `<requested>` is the inbound model with any
-   `:latest` tag stripped — i.e. passthrough — falling back to
-   `DEFAULT_MODEL_NAME` only when the request omits a model.
+   `timeout=PROXY_TIMEOUT`. `<requested>` is the inbound model forwarded
+   verbatim, falling back to `DEFAULT_MODEL_NAME` only when the request
+   omits a model.
 5. Extracts assistant content from the upstream response
    (`extract_assistant_content`).
 6. Parses ```json tool-call blocks out of the assistant content
    (`extract_tool_calls_and_text`).
-7. Emits in the inbound client's format: OpenAI SSE
-   (`generate_openai_sse`), OpenAI JSON (`build_openai_response`), or
-   ollama NDJSON (`generate_ndjson` + `make_chunk`).
+7. Emits OpenAI Chat Completions: SSE (`generate_openai_sse`) when
+   `stream: true`, else a single JSON object (`build_openai_response`).
 
-Errors return a structured body — the OpenAI `{"error":{"message":…}}`
-envelope (which the AI SDK surfaces to opencode) on the OpenAI path, the
-legacy flat body on the ollama path — plus a debug dump under `OUTPUT_DIR`.
-`_client_error` picks the shape from `is_openai`.
+Errors return the OpenAI `{"error":{"message":…}}` envelope (which the AI
+SDK surfaces to opencode) via `_client_error`, plus a debug dump under
+`OUTPUT_DIR`.
 
 ## URL base + model passthrough
 
@@ -75,20 +59,18 @@ module derives two endpoints once at import: `CHAT_URL` =
 `{base}/v1/chat/completions` and `MODELS_URL` = `{base}/v1/models`.
 
 `catch_all` forwards the **requested** model to upstream rather than a fixed id:
-`_strip_model_tag(model_name) or DEFAULT_MODEL_NAME`. ollama registers its stubs
-as `<id>:latest` and forwards that tagged name; `_strip_model_tag` removes only a
-`:latest` suffix (a real upstream id may contain a colon, so an arbitrary tag is
-not stripped). This is what lets a user switch between the upstream's models from
-opencode — the selected model flows opencode → ollama → proxy → upstream
-unchanged. `DEFAULT_MODEL_NAME` is only the fallback when a request carries no
-model.
+`model_name or DEFAULT_MODEL_NAME`. opencode reads the bare ids the upstream
+advertised on `/v1/models`, so the selected model flows opencode → proxy →
+upstream unchanged — this is what lets a user switch between the upstream's
+models from opencode. `DEFAULT_MODEL_NAME` is only the fallback when a request
+carries no model.
 
 The `GET /v1/models` route is a thin pass-through: it forwards `MODELS_URL` with
 the bearer key and `verify=False` and returns the upstream status + body
 verbatim, so a locked-key `401` (with its `unlock_url`) reaches the caller
 unchanged. It's declared as an explicit Flask route so it wins over `catch_all`.
-ollama's entrypoint consumes it at startup to discover and register a stub per
-upstream model (see [`containers.md`](containers.md)).
+The agent entrypoint consumes it at startup to build the opencode model dropdown
+(see [`containers.md`](containers.md)).
 
 ## Cooperative-prompt modes (`PROXY_PROMPT_MODE`)
 
@@ -163,9 +145,9 @@ validator in `_setup_prompt_mode` accepts:
   `tools` to upstream verbatim (other modes never set `tools` on the
   upstream payload). Use this to measure what harness's mediation
   contributes — the request the model sees is the request the agent sent.
-  Note that ollama-format tool schemas typically aren't honored by
-  non-ollama upstreams, so this mode often results in the model not using
-  tools at all; that mismatch IS the data point.
+  Note that the agent's OpenAI-format function-tool schemas typically aren't
+  honored by these upstreams on this endpoint, so this mode often results in
+  the model not using tools at all; that mismatch IS the data point.
 
 Invalid or absent values fall back to `hybrid` with a warning — including the
 legacy `user_front`/`user` value a stale `.env` might still carry, since the
@@ -184,8 +166,8 @@ back to `hybrid`.
 in `<<<BEGIN_TOOL_RESULT name="…">>>` / `<<<END_TOOL_RESULT>>>` markers at
 translation time, so a tool result is unambiguously bounded whether it is
 the live turn or buried in history. The `name` is resolved from metadata,
-never from the content: an explicit `tool_name` / `name` field if present
-(opencode, ollama), else the `tool_call_id` correlated against the
+never from the content: an explicit `tool_name` / `name` field if present,
+else the `tool_call_id` correlated against the
 originating assistant `tool_calls` (some agents send results keyed by id,
 not name), else positional order, else `unknown_tool`. Agents format tool
 output differently; wrapping rather than parsing keeps the proxy agnostic
@@ -507,7 +489,7 @@ empty. When both hold, the proxy substitutes a **two-part rescue**:
    `bash`-style shell tool, `_select_rescue_tool` returns a `{name,
    arguments: {"command": "pwd", "description": "Print working
    directory"}}` payload which the proxy appends to
-   `tool_call_payloads`. The NDJSON `done_reason` becomes `tool_calls`,
+   `tool_call_payloads`. The response `finish_reason` becomes `tool_calls`,
    opencode executes the no-op `pwd`, and re-invokes the model with the
    tool result as the **new** recency — which displaces the
    filter-triggering content out of the hot slot, so the next model
@@ -568,13 +550,11 @@ to empty). Diagnosis still belongs in `harness logs proxy` and
 
 ## Response emission
 
-Either inbound path runs the same upstream call and tool extraction, then
-emits in the client's format. In all cases the chunks are materialized
-into a list first and dumped to `OUTPUT_DIR` before being streamed, and
-latency is unchanged: the upstream call completed fully before emission
-began (the proxy is NOT streaming from upstream — it gets the full
-response, then translates). Memory cost is the response size — a few KB
-for typical tool-call responses.
+The chunks are materialized into a list first and dumped to `OUTPUT_DIR`
+before being streamed, and latency is unchanged: the upstream call completed
+fully before emission began (the proxy is NOT streaming from upstream — it
+gets the full response, then translates). Memory cost is the response size —
+a few KB for typical tool-call responses.
 
 ### OpenAI SSE (`generate_openai_sse`)
 
@@ -590,8 +570,8 @@ number of deltas rather than incrementally:
 - one `delta:{tool_calls:[…]}` chunk when there are tool calls — each
   entry carries `index` (always; the array key the AI SDK accumulates
   into), `id`+`function.name`, and `function.arguments` as a **JSON
-  string** (the internal payload and ollama format carry it as an object,
-  so `_openai_tool_calls` JSON-encodes it). Emitting each call complete in
+  string** (the internal payload carries it as an object, so
+  `_openai_tool_calls` JSON-encodes it). Emitting each call complete in
   one delta satisfies the SDK's "first fragment carries id+name, arguments
   accumulate to valid JSON" rule;
 - a final `delta:{}` chunk with `finish_reason` (`tool_calls` or `stop`);
@@ -603,16 +583,10 @@ All chunks share one `chatcmpl-…` id and `created` stamp.
 
 ### OpenAI JSON (`build_openai_response`)
 
-When an OpenAI-path request sets `stream: false` (manual `curl`/debug;
-opencode always streams), a single `chat.completion` object is returned
-instead — same content/tool_calls/usage, `tool_calls` without the
-streaming-only `index` field.
-
-### ollama NDJSON (`generate_ndjson`)
-
-The legacy fallback. Yields ollama-compatible chunks: a sequence of
-`{message:{role,content}}` chunks ending in `done: true`
-(`make_chunk`).
+When a request sets `stream: false` (manual `curl`/debug; opencode always
+streams), a single `chat.completion` object is returned instead — same
+content/tool_calls/usage, `tool_calls` without the streaming-only `index`
+field.
 
 ## Local token estimation
 
@@ -641,7 +615,7 @@ Module-level env reads at startup:
 PROXY_HOST=0.0.0.0          PROXY_PORT=8000
 PROXY_API_URL (REQUIRED)    PROXY_API_KEY (REQUIRED)    DEFAULT_MODEL_NAME (REQUIRED)
 PROXY_TIMEOUT=180           OUTPUT_DIR (optional)
-OLLAMA_CONTEXT_LENGTH=200000
+MODEL_CONTEXT_LENGTH=200000 (legacy alias: OLLAMA_CONTEXT_LENGTH)
 ```
 
 `DEFAULT_MODEL_NAME` (the renamed `PROXY_API_MODEL`) is the fallback model — see
@@ -670,9 +644,8 @@ writes:
 - `<req_id>_01_Inbound_Request.json`
 - `<req_id>_02_API_Request.json`
 - `<req_id>_03_API_Response.json` or `_03_API_Error.json`
-- `<req_id>_04_OpenAI_SSE_Response.json` (OpenAI streaming),
-  `_04_OpenAI_Response.json` (OpenAI non-streaming), or
-  `_04_NDJSON_Response.json` (ollama fallback)
+- `<req_id>_04_OpenAI_SSE_Response.json` (streaming) or
+  `_04_OpenAI_Response.json` (non-streaming)
 - `<req_id>_99_Fatal_Error.json` on unhandled exception
 
 `req_id` is the timestamp at request start (`%Y%m%d_%H%M%S_%f`).
@@ -681,13 +654,12 @@ writes:
 
 `tests/proxy_test.sh` (integration via the proxy container) and
 `proxy/test_proxy.py` (unit tests, run directly in the proxy container).
-Scenarios A–E/D drive the ollama `/api/chat` path; G/H drive the OpenAI
-`/v1/chat/completions` path directly (SSE framing, and a streamed
-`tool_calls` delta whose `arguments` is a JSON string). See
-[`tests.md`](tests.md).
+The scenarios drive the OpenAI `/v1/chat/completions` path — SSE framing,
+non-stream JSON, tool-call deltas whose `arguments` is a JSON string, and
+the cooperative-prompt/empty-response behaviours. See [`tests.md`](tests.md).
 
 ## Iteration loop
 
 `docker compose --project-name harness restart proxy` picks up edits in
-~10–15 s without touching ollama / agents / MCPs. Faster than
+~10–15 s without touching agents / MCPs. Faster than
 `harness restart` for the proxy-iteration loop.
