@@ -586,11 +586,36 @@ phase_3_graphify() {
     echo "[integration] Phase 3.1: agent container ready, pipx available"
 
     echo "[integration] Phase 3.2: pipx install graphifyy"
+    # init-firewall.sh snapshots allowed-host IPs once at agent startup
+    # (Phase 3.1) via a single `dig +short A`, and files.pythonhosted.org
+    # is served by Fastly with short TTL + IP rotation. When the IPs the
+    # CDN returns to pipx drift from the init-time snapshot, iptables
+    # REJECTs the connection and pipx surfaces `[Errno 113] No route to
+    # host`. Only that specific signature triggers the retry: we re-run
+    # init-firewall inside the agent (re-resolves DNS, repopulates the
+    # ipset with the *current* IPs) and retry pipx once. Any other pipx
+    # failure surfaces unchanged.
     if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             pipx install graphifyy >"${TEST_ROOT}/pipx-install.log" 2>&1; then
-        echo "[integration] Phase 3.2 FAIL: pipx install graphifyy failed" >&2
-        cat "${TEST_ROOT}/pipx-install.log" >&2
-        return 1
+        if grep -q 'No route to host' "${TEST_ROOT}/pipx-install.log"; then
+            echo "[integration] Phase 3.2: pipx hit firewall/CDN IP-mismatch; refreshing ipset via init-firewall and retrying once"
+            harness_docker exec "${GRAPHIFY_AGENT_NAME}" \
+                /usr/local/bin/init-firewall.sh \
+                >"${TEST_ROOT}/init-firewall-refresh.log" 2>&1 || true
+            if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
+                    pipx install graphifyy >"${TEST_ROOT}/pipx-install.log" 2>&1; then
+                echo "[integration] Phase 3.2 FAIL: pipx install graphifyy failed after firewall ipset refresh" >&2
+                echo "--- init-firewall refresh log ---" >&2
+                cat "${TEST_ROOT}/init-firewall-refresh.log" >&2 || true
+                echo "--- pipx install log ---" >&2
+                cat "${TEST_ROOT}/pipx-install.log" >&2
+                return 1
+            fi
+        else
+            echo "[integration] Phase 3.2 FAIL: pipx install graphifyy failed" >&2
+            cat "${TEST_ROOT}/pipx-install.log" >&2
+            return 1
+        fi
     fi
     if ! harness_docker exec --user harness "${GRAPHIFY_AGENT_NAME}" \
             test -x /home/harness/.local/bin/graphify; then
