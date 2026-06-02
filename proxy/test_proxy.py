@@ -3426,5 +3426,148 @@ class TestModelPassthrough(unittest.TestCase):
         self.assertEqual(forwarded, proxy.DEFAULT_MODEL_NAME)
 
 
+class TestOpenAIEmission(unittest.TestCase):
+    """OpenAI-compatible inbound: SSE / JSON emission and the catch_all
+    dispatch on /v1/chat/completions. The wire shape here is the contract the
+    opencode @ai-sdk/openai-compatible provider parses."""
+
+    # --- pure emitters ------------------------------------------------------
+
+    def _sse_chunks(self, lines):
+        self.assertEqual(lines[-1], "data: [DONE]\n\n")
+        out = []
+        for ln in lines[:-1]:
+            self.assertTrue(ln.startswith("data: ") and ln.endswith("\n\n"), repr(ln))
+            out.append(json.loads(ln[len("data: "):].strip()))
+        return out
+
+    def test_sse_text_only_stream(self):
+        lines = list(proxy.generate_openai_sse(
+            "m", "hello", [], {"prompt_tokens": 3, "completion_tokens": 2}))
+        chunks = self._sse_chunks(lines)
+        # stable id + chunk object across the stream
+        self.assertEqual({c["id"] for c in chunks}.__len__(), 1)
+        for c in chunks:
+            self.assertEqual(c["object"], "chat.completion.chunk")
+            self.assertIsInstance(c["created"], int)
+        self.assertEqual(chunks[0]["choices"][0]["delta"],
+                         {"role": "assistant", "content": "hello"})
+        fin = [c for c in chunks if c["choices"] and c["choices"][0]["finish_reason"]]
+        self.assertEqual(fin[0]["choices"][0]["finish_reason"], "stop")
+        usage = [c for c in chunks if c.get("usage")]
+        self.assertEqual(usage[0]["choices"], [])
+        self.assertEqual(usage[0]["usage"],
+                         {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+
+    def test_sse_tool_calls_arguments_are_json_strings(self):
+        payloads = [
+            {"name": "bash", "arguments": {"command": "ls", "description": "list"}},
+            {"name": "read", "arguments": {"path": "/x"}},
+        ]
+        chunks = self._sse_chunks(list(
+            proxy.generate_openai_sse("m", "", payloads, None)))
+        tc_delta = next(c for c in chunks
+                        if c["choices"] and "tool_calls" in c["choices"][0]["delta"])
+        tcs = tc_delta["choices"][0]["delta"]["tool_calls"]
+        self.assertEqual([t["index"] for t in tcs], [0, 1])
+        for t in tcs:
+            self.assertTrue(t["id"])
+            self.assertEqual(t["type"], "function")
+            self.assertIsInstance(t["function"]["arguments"], str)
+            json.loads(t["function"]["arguments"])  # parses to valid JSON
+        self.assertEqual(json.loads(tcs[0]["function"]["arguments"]),
+                         {"command": "ls", "description": "list"})
+        fin = [c for c in chunks if c["choices"] and c["choices"][0]["finish_reason"]]
+        self.assertEqual(fin[0]["choices"][0]["finish_reason"], "tool_calls")
+        # no usage chunk when usage is None
+        self.assertFalse(any(c.get("usage") for c in chunks))
+
+    def test_sse_tool_only_first_delta_has_role(self):
+        chunks = self._sse_chunks(list(proxy.generate_openai_sse(
+            "m", "", [{"name": "bash", "arguments": {"command": "pwd"}}], None)))
+        first = next(c for c in chunks if c["choices"] and c["choices"][0]["delta"])
+        self.assertEqual(first["choices"][0]["delta"].get("role"), "assistant")
+
+    def test_build_openai_response_non_streaming(self):
+        body = proxy.build_openai_response(
+            "m", "answer",
+            [{"name": "bash", "arguments": {"command": "ls"}}],
+            {"prompt_tokens": 4, "completion_tokens": 1})
+        self.assertEqual(body["object"], "chat.completion")
+        msg = body["choices"][0]["message"]
+        self.assertEqual(msg["content"], "answer")
+        self.assertNotIn("index", msg["tool_calls"][0])  # index is streaming-only
+        self.assertIsInstance(msg["tool_calls"][0]["function"]["arguments"], str)
+        self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(body["usage"]["total_tokens"], 5)
+
+    def test_build_openai_response_text_only_omits_tool_calls(self):
+        body = proxy.build_openai_response("m", "hi", [], {})
+        msg = body["choices"][0]["message"]
+        self.assertEqual(msg["content"], "hi")
+        self.assertNotIn("tool_calls", msg)
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+
+    # --- catch_all dispatch via the Flask test client -----------------------
+
+    def _post(self, path, body):
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return {"choices": [{"message": {"content": "Hello there"},
+                                     "finish_reason": "stop"}], "usage": {}}
+
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post", side_effect=lambda *a, **k: FakeResp()):
+            with patch.object(proxy, "save_debug_file"):
+                return client.post(path, data=json.dumps(body),
+                                   content_type="application/json")
+
+    def test_v1_chat_completions_streams_sse(self):
+        resp = self._post("/v1/chat/completions",
+                          {"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                           "stream": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.mimetype.startswith("text/event-stream"), resp.mimetype)
+        text = resp.get_data(as_text=True)
+        self.assertIn("chat.completion.chunk", text)
+        self.assertIn("Hello there", text)
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"), text[-40:])
+
+    def test_v1_chat_completions_non_stream_returns_json(self):
+        resp = self._post("/v1/chat/completions",
+                          {"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                           "stream": False})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.mimetype, "application/json")
+        body = json.loads(resp.get_data(as_text=True))
+        self.assertEqual(body["object"], "chat.completion")
+        self.assertEqual(body["choices"][0]["message"]["content"], "Hello there")
+
+    def test_ollama_path_still_ndjson(self):
+        resp = self._post("/api/chat",
+                          {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.mimetype, "application/x-ndjson")
+        last = [l for l in resp.get_data(as_text=True).splitlines() if l.strip()][-1]
+        self.assertIn('"done":true', last.replace(" ", ""))
+
+    def test_openai_error_envelope_on_upstream_failure(self):
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post",
+                          side_effect=proxy.requests.RequestException("boom")):
+            with patch.object(proxy, "save_debug_file"):
+                resp = client.post(
+                    "/v1/chat/completions",
+                    data=json.dumps({"model": "m",
+                                     "messages": [{"role": "user", "content": "hi"}]}),
+                    content_type="application/json")
+        body = json.loads(resp.get_data(as_text=True))
+        # AI SDK requires error.message; ollama path keeps the flat shape.
+        self.assertIn("message", body["error"])
+        self.assertIn("boom", body["error"]["message"])
+
+
 if __name__ == "__main__":
     unittest.main()
