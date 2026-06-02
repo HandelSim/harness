@@ -134,17 +134,17 @@ Phase → requirement mapping is filled in by `ROADMAP.md` during roadmap creati
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| REQ-001 | TBD | Active |
-| REQ-002 | TBD | Active |
-| REQ-003 | TBD | Active |
-| REQ-004 | TBD | Active |
-| REQ-005 | TBD | Active |
-| REQ-006 | TBD | Active |
-| REQ-007 | TBD | Active |
-| REQ-008 | TBD | Active |
-| REQ-009 | TBD | Active |
-| REQ-010 | TBD | Active |
-| REQ-011 | TBD | Active |
+| REQ-001 | Phase 1 | Active |
+| REQ-002 | Phase 1 | Active |
+| REQ-003 | Phase 1 | Active |
+| REQ-004 | Phase 2 | Active |
+| REQ-005 | Phase 2 | Active |
+| REQ-006 | Phase 3 | Active |
+| REQ-007 | Phase 3 | Active |
+| REQ-008 | Phase 3 | Active |
+| REQ-009 | Phase 4 | Active |
+| REQ-010 | Phase 4 | Active |
+| REQ-011 | Phase 4 | Active |
 
 ---
 *Last updated: 2026-06-02 after initialization*
