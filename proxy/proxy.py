@@ -716,8 +716,13 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         "- Operating: you act through opencode — your ```json calls really "
         "execute against the working directory mounted from the user's "
         "machine, and the results you get back are real. Call a tool by "
-        "emitting a ```json block with {\"name\": ..., \"arguments\": ...}; "
-        "you may reason before or after it. After a tool call, do not "
+        "emitting a COMPLETE ```json...``` block (fence opener, JSON body, "
+        "closing fence) whose body is `{\"name\": \"<tool>\", \"arguments\": "
+        "{...}}` — never an abbreviated identifier, never a partial fence; "
+        "any backslash inside a string must be JSON-escaped (`\\n` for a "
+        "literal newline, `\\x1e` for that byte, `\\\\` for a single "
+        "backslash) or the call will be rejected. You may reason before or "
+        "after the block. After a tool call, do not "
         "invent or narrate its result — the real result arrives next turn. "
         "Do the task with the opencode tools listed below (full descriptions "
         "in the <<<BEGIN_AGENT_TOOLS>>> section earlier in this "
@@ -790,6 +795,75 @@ def _scan_balanced_json(text, start):
                 return text[start:i + 1], i + 1
 
     return None, start
+
+
+def _diagnose_failed_tool_call(response_text: str) -> Optional[str]:
+    """When `extract_tool_calls_and_text` returns zero tool calls, classify
+    whether the response looks like a botched tool-call attempt that
+    in-proxy retry can recover (issue #121).
+
+    Returns one of:
+      - ``None`` — no recoverable signal. The response is prose, an
+        unknown failure mode, or a JSON example the model was deliberately
+        describing.
+      - ``"malformed_escape"`` — the response carries a ```json fence with
+        a brace-balanced JSON body that ``json.loads(..., strict=False)``
+        rejected with an "Invalid \\escape" error. High-confidence: the
+        model clearly attempted a tool call and only the backslash
+        escaping is wrong. Fires even if there is prose around the fence.
+      - ``"malformed_fence"`` — the response is *effectively* a ```json
+        fence with no parseable JSON body — i.e. the stripped response
+        STARTS with ```json (no prior prose), and the fence opener is
+        followed by either EOF, whitespace-to-EOF, or a non-``{`` character
+        before any other recognisable JSON object. Conservative gating:
+        only fires when the model's whole emission is the broken fence
+        (the reported ``\\`\\`\\`json_parse_or_id:todowrite}`` shape), so
+        prose describing JSON examples is NOT mistaken for a failed call.
+
+    The caller is responsible for verifying that no tool calls were
+    extracted before consulting this helper — recovery only makes sense
+    when extraction yielded nothing.
+    """
+    if not response_text:
+        return None
+    fence_pos = response_text.find("```json")
+    if fence_pos == -1:
+        return None
+    body_start = fence_pos + len("```json")
+    while body_start < len(response_text) and response_text[body_start] in " \t\n\r":
+        body_start += 1
+
+    if body_start < len(response_text) and response_text[body_start] == "{":
+        json_str, _ = _scan_balanced_json(response_text, body_start)
+        if json_str is not None:
+            try:
+                json.loads(json_str, strict=False)
+            except json.JSONDecodeError as e:
+                msg = e.msg or ""
+                # Python's json module raises with msg == "Invalid \\escape"
+                # for a `\X` where X is not in `"\\/bfnrtu`. That is the
+                # JSON spec itself flagging the bad escape, not a fuzzy
+                # heuristic — false-positive risk on a brace-balanced body
+                # after a ```json fence is near zero.
+                if "Invalid \\escape" in msg:
+                    return "malformed_escape"
+        # Brace-balanced but shape-wrong, OR brace-unbalanced after `{`:
+        # leave it to bleed (it may be prose). Don't retry.
+        return None
+
+    # Body does not begin with `{`. Only treat as a failed tool call when
+    # the stripped response IS the malformed fence — anything else (prose
+    # before the fence, or recoverable JSON later in the text) means the
+    # model isn't simply trying to call a tool.
+    if response_text.lstrip().startswith("```json"):
+        # Make sure there is no LATER balanced `{...}` after a ```json
+        # fence that we would have extracted but for a shape mismatch —
+        # if there is, the response is "model emitted some prose plus a
+        # describable JSON example", not a botched tool call.
+        next_fence = response_text.find("```json", fence_pos + 1)
+        if next_fence == -1:
+            return "malformed_fence"
+    return None
 
 
 def extract_tool_calls_and_text(response_text, available_tool_names=None):
@@ -1474,6 +1548,140 @@ _RESCUE_BASH_COMMAND = "pwd"
 _RESCUE_BASH_DESCRIPTION = "Print working directory"
 
 
+# Corrective user-role messages emitted into the augmented history when an
+# in-proxy retry fires (issue #121). The retry conversation looks like
+# `[…original history…, assistant(<bad response>), user(<correction>)]` and
+# goes through the same `translate_history_and_apply_prompt` scaffolding —
+# so the correction lands in the recency USER_REQUEST slot in hybrid mode,
+# and the model's next turn is read against the SAME tool definitions and
+# operating rules as the first attempt. The only thing the model sees that
+# is new is "your previous attempt failed for this specific reason; emit
+# the same call(s) again". Phrasing notes: (a) name the failure mode so
+# the model knows what to change, (b) include the JSON-escape examples
+# verbatim since the model will pattern-match on them, (c) tell it NOT to
+# apologise/narrate so the retry response is the corrected tool call and
+# not a prose explanation that ends the turn at `done_reason: stop`.
+_RETRY_CORRECTION_MESSAGES: Dict[str, str] = {
+    "malformed_escape": (
+        "[harness proxy — automatic correction]\n"
+        "Your previous response contained a ```json tool-call block whose "
+        "JSON had an invalid `\\escape` sequence (e.g. `\\x1e`, `\\a`, "
+        "`\\v` — any `\\X` where X is not one of `\"\\/bfnrtu`). The JSON "
+        "parser rejected it, so your tool call did NOT execute and no "
+        "result will follow. Re-emit the SAME tool call(s) now with every "
+        "backslash JSON-escaped: use `\\\\n` for a literal newline inside "
+        "a string, `\\\\x1e` for that byte, `\\\\\\\\` for a single "
+        "backslash. Do not apologise, do not explain — emit only the "
+        "corrected ```json...``` block(s)."
+    ),
+    "malformed_fence": (
+        "[harness proxy — automatic correction]\n"
+        "Your previous response started a ```json tool-call fence but the "
+        "body that followed was not a valid JSON object — it was rejected "
+        "and your tool call did NOT execute. Re-emit your tool call now "
+        "as a COMPLETE ```json...``` block whose body is "
+        "`{\"name\": \"<tool>\", \"arguments\": {...}}` — fence opener, "
+        "full JSON body, closing fence. Do not apologise, do not explain "
+        "— emit only the corrected ```json...``` block(s)."
+    ),
+}
+
+
+def _build_retry_correction_message(kind: str) -> str:
+    return _RETRY_CORRECTION_MESSAGES.get(
+        kind, _RETRY_CORRECTION_MESSAGES["malformed_fence"]
+    )
+
+
+def _retry_upstream_with_correction(
+    req_id: str,
+    original_messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    tools_text: str,
+    upstream_model: str,
+    headers: Dict[str, str],
+    bad_response_text: str,
+    kind: str,
+) -> Optional[Tuple[Dict[str, Any], str, List[Dict[str, Any]], str]]:
+    """Append `[assistant(<bad>), user(<correction>)]` to the conversation
+    and re-POST upstream once (issue #121, retry budget = 1). The retry is
+    invisible to opencode: if it succeeds, the caller swaps the retry's
+    target_json / response_text / payloads / clean_text in place of the
+    bad attempt and only the retry result is streamed back.
+
+    Returns ``(target_json, response_text, payloads, clean_text)`` on a
+    completed retry (even if the retry itself produced no recoverable
+    output — that's the caller's decision), or ``None`` if the retry call
+    itself failed (timeout, non-2xx, non-JSON body). When ``None``, the
+    caller falls back to the pre-existing bleed-into-chat behaviour for
+    the original response.
+
+    Debug dumps for the retry land under `<req_id>_02_API_Retry_Request`
+    / `<req_id>_03_API_Retry_Response` so the original `_02`/`_03` dumps
+    are preserved.
+    """
+    correction = _build_retry_correction_message(kind)
+    augmented = list(original_messages) + [
+        {"role": "assistant", "content": bad_response_text},
+        {"role": "user", "content": correction},
+    ]
+    translated = translate_history_and_apply_prompt(
+        augmented, tools_text, tools=tools
+    )
+    retry_payload: Dict[str, Any] = {
+        "model": upstream_model,
+        "messages": translated,
+    }
+    if _PROMPT_MODE == "passthrough" and tools:
+        retry_payload["tools"] = tools
+    save_debug_file(req_id, "02", "API_Retry_Request", retry_payload)
+
+    try:
+        resp = requests.post(
+            CHAT_URL,
+            headers=headers,
+            json=retry_payload,
+            verify=False,
+            timeout=PROXY_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        print(f"[{req_id}] retry upstream request failed: {e}", flush=True)
+        save_debug_file(req_id, "03", "API_Retry_Error", {"error": str(e)})
+        return None
+    if resp.status_code >= 400:
+        try:
+            err_body: Any = resp.json()
+        except Exception:
+            err_body = resp.text
+        print(
+            f"[{req_id}] retry upstream returned {resp.status_code}: "
+            f"{err_body}",
+            flush=True,
+        )
+        save_debug_file(
+            req_id,
+            "03",
+            "API_Retry_Error",
+            {"status": resp.status_code, "body": err_body},
+        )
+        return None
+    try:
+        retry_json = resp.json()
+    except ValueError as e:
+        print(f"[{req_id}] retry upstream returned non-JSON: {e}", flush=True)
+        save_debug_file(
+            req_id, "03", "API_Retry_Error", {"error": "non-json", "body": resp.text}
+        )
+        return None
+
+    save_debug_file(req_id, "03", "API_Retry_Response", retry_json)
+    retry_text = extract_assistant_content(retry_json)
+    retry_payloads, retry_clean = extract_tool_calls_and_text(
+        retry_text, available_tool_names=_collect_tool_names(tools)
+    )
+    return retry_json, retry_text, retry_payloads, retry_clean
+
+
 def _select_rescue_tool(
     available_tool_names: Iterable[str],
 ) -> Optional[Dict[str, Any]]:
@@ -1652,6 +1860,58 @@ def catch_all(path: str) -> Response:
             response_text,
             available_tool_names=_collect_tool_names(tools),
         )
+
+        # In-proxy retry for malformed tool-call attempts (issue #121).
+        # When extraction yielded zero tool calls AND the response looks
+        # like a botched tool-call attempt — either a ```json fence
+        # opener with no parseable body (the `\`\`\`json_parse_or_id:
+        # todowrite}` shape that ended the turn silently), or a complete
+        # JSON object whose strings carry invalid `\escape` characters
+        # that `json.loads(..., strict=False)` rejects — append a
+        # corrective `[assistant(<bad>), user(<correction>)]` pair to the
+        # conversation and re-POST upstream ONCE. The retry is invisible
+        # to opencode: if it produces a valid tool call (or any other
+        # non-malformed response), the retry result replaces the bad
+        # attempt and only the retry result is streamed back. If the
+        # retry fails or produces ANOTHER malformed attempt, the original
+        # bad response falls through to the bleed/empty-rescue path
+        # below — the retry is strictly additive.
+        if not tool_call_payloads:
+            kind = _diagnose_failed_tool_call(response_text)
+            if kind is not None:
+                retry_result = _retry_upstream_with_correction(
+                    req_id,
+                    original_messages,
+                    tools,
+                    tools_text,
+                    upstream_model,
+                    headers,
+                    response_text,
+                    kind,
+                )
+                if retry_result is not None:
+                    retry_json, retry_text, retry_payloads, retry_clean = retry_result
+                    # "Recovered" = the retry produced valid tool calls,
+                    # OR a response that does NOT itself diagnose as a
+                    # botched tool-call attempt. Pure prose, empty content
+                    # (handed off to the empty-response rescue below), or
+                    # a healthy tool call all count.
+                    if retry_payloads or _diagnose_failed_tool_call(retry_text) is None:
+                        target_json = retry_json
+                        response_text = retry_text
+                        tool_call_payloads = retry_payloads
+                        clean_text = retry_clean
+                        recovered = True
+                    else:
+                        recovered = False
+                else:
+                    recovered = False
+                print(
+                    f"[{req_id}] in-proxy retry for malformed tool call "
+                    f"(kind={kind}); attempt=1, "
+                    f"recovered={'yes' if recovered else 'no'}",
+                    flush=True,
+                )
 
         # Empty-response rescue (issue #117). Some upstreams silently
         # short-circuit before generation — well-formed JSON, finish_reason
