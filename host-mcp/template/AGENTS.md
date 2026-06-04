@@ -7,7 +7,7 @@ native project that lives on the **host** (typically a Windows machine with
 Visual Studio / MSVC / CMake).
 
 Read this whole file before doing anything. The files in this folder
-(`server.py`, `project.json`, `run.ps1`, `run.sh`, `requirements.txt`) are a
+(`server.py`, `project.json`, `run.sh`, `requirements.txt`) are a
 scaffold — your job is to tailor them to one specific project and hand the
 user a server they can launch.
 
@@ -72,19 +72,19 @@ You do not need to wire any of that. It is done. You tailor `server.py` and
    the API differs, fix it — do not guess.
 
 5. **Get the user to launch it.** The server runs on the **host**, not in a
-   container, and not by you (you are in the container). Tell the user to run,
-   from this folder on the host:
-   - Windows: `./run.ps1` (from a **Developer PowerShell for VS 2022**, so
-     `cmake`/`msbuild` are on PATH)
-   - Linux/macOS: `./run.sh`
-   These create a venv, install `requirements.txt`, and start the server. The
-   server must keep running while the agent works.
+   container, and not by you (you are in the container). Tell the user to run
+   `./run.sh` from this folder on the host. It is one git-bash-native script
+   for every OS — on Windows it runs from the **same Git Bash the user runs
+   `harness` in** (no PowerShell, no Developer prompt: CMake's
+   "Visual Studio 17 2022" generator locates MSVC itself; just have `cmake` on
+   PATH). It creates a venv, installs `requirements.txt`, and starts the server.
+   The server must keep running while the agent works.
 
-6. **Confirm the loop.** Once the server is up and the user has run
-   `harness net allow host.docker.internal`, the agent (in a normal
-   `harness agent` session, not you) can call the build tools. A good smoke
-   test: have the user start an agent and ask it to call `configure` then
-   `build`, and check the server's console shows the requests.
+6. **Confirm the loop.** Once the server is up, the agent (in a normal
+   `harness agent` session, not you) can call the build tools — reachability is
+   automatic, no `harness net allow` needed. A good smoke test: have the user
+   start an agent and ask it to call `configure` then `build`, and check the
+   server's console shows the requests.
 
 ## Adapting to MSBuild (no CMake)
 

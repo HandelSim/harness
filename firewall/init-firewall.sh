@@ -207,6 +207,45 @@ if (( ${#unresolvable[@]} > 0 )); then
     warn "could not resolve: ${unresolvable[*]} (DNS issue or typo)"
 fi
 
+# --- 9b. allow host MCP hosts (host.docker.internal) -------------------------
+#
+# A host MCP runs as a process on the user's own machine; the agent reaches it
+# at http://host.docker.internal:<port>/mcp. harness sets HARNESS_HOST_MCP_HOSTS
+# only when an enabled host MCP is present, so this whole block is inert for the
+# proxy, serena, and every other container — zero regression when unset.
+#
+# host.docker.internal is an /etc/hosts entry (Docker injects it; on Linux it
+# comes from harness's --add-host=...:host-gateway), NOT a DNS name. The section-9
+# loop above uses `dig`, which queries DNS and ignores /etc/hosts, so it can
+# never resolve this name. Resolve it from /etc/hosts instead (getent reads
+# /etc/hosts; awk is a fallback if getent is unavailable) and open just that IP.
+if [[ -n "${HARNESS_HOST_MCP_HOSTS:-}" ]]; then
+    hm_count=0
+    for hmhost in ${HARNESS_HOST_MCP_HOSTS//,/ }; do
+        [[ -z "$hmhost" ]] && continue
+        hm_ips=$(getent ahostsv4 "$hmhost" 2>/dev/null | awk '{print $1}' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u || true)
+        if [[ -z "$hm_ips" ]]; then
+            # getent missing or didn't read /etc/hosts; parse the file directly.
+            hm_ips=$(awk -v h="$hmhost" \
+                '($0 !~ /^[[:space:]]*#/) { for (i=2;i<=NF;i++) if ($i==h) { print $1; break } }' \
+                /etc/hosts 2>/dev/null \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u || true)
+        fi
+        if [[ -z "$hm_ips" ]]; then
+            warn "host MCP host '$hmhost' not found in /etc/hosts — agent cannot reach it"
+            continue
+        fi
+        while IFS= read -r ip; do
+            [[ -z "$ip" ]] && continue
+            ipset add allowed-domains "$ip" -exist 2>/dev/null || true
+            hm_count=$((hm_count + 1))
+            log "allowed host MCP $hmhost -> $ip"
+        done <<< "$hm_ips"
+    done
+    log "resolved $hm_count host MCP IP(s) from /etc/hosts"
+fi
+
 # --- 10. PROXY_API_URL guardrail (proxy container only) ----------------------
 #
 # The proxy refuses to start if its upstream LLM API hostname is not in the
