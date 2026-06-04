@@ -44,6 +44,12 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          # Let users WITHOUT repo write access trigger @claude. The job-level
+          # `if:` above already passes any non-Bot mention, but the action runs
+          # its own write-permission check on the triggering actor and silently
+          # skips non-collaborators unless this is set. '*' = anyone; replace
+          # with a comma-separated username list to scope it down.
+          allowed_non_write_users: '*'
           base_branch: dev
           branch_prefix: 'agent/'
           claude_args: |
