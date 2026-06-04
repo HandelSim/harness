@@ -824,6 +824,25 @@ ensure_services_up() {
     fi
 }
 
+# Tear down the shared stack (proxy + enabled MCPs, both container and host)
+# when no agent containers remain for this project. Called from the agent
+# launch paths on exit. The stack's lifecycle is bound to the agents':
+# `ensure_services_up` brings it up on launch and the last agent to exit brings
+# it down, so the control plane never lingers with no agent using it. The
+# just-exited interactive agent's own container is already gone (--rm), so a
+# zero count means it was the last one. Both interactive and print agents carry
+# the `harness.agent` label, so a concurrent agent of either kind keeps the
+# count non-zero and holds the stack up until the final interactive exit.
+stop_stack_if_last_agent() {
+    local remaining
+    remaining=$(harness_docker ps -q \
+        --filter "label=harness.project=$project_name" \
+        --filter "label=harness.agent=true" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$remaining" == "0" ]] || return 0
+    echo "[harness] last agent exited; stopping proxy/MCP" >&2
+    cmd_down >/dev/null 2>&1 || true
+}
+
 # Unique container name for one agent launch. Discovery (list/stop/picker)
 # is entirely label-based (harness.agent/tool/mount), so the name needs no
 # determinism — only uniqueness, so concurrent launches of the same tool
@@ -2681,31 +2700,23 @@ run_agent_interactive() {
     fi
     _print_agent_issue_footer
 
-    # Opt-in: when this was the LAST agent for the project, tear the shared
-    # stack (proxy + enabled MCPs) down too, so an exited agent doesn't leave
-    # the control plane running. Default OFF: the established model is "start
-    # once, launch many" — `ensure_services_up` brings the stack up on launch
-    # and it persists so subsequent launches hit the fast already-running
-    # path. With HARNESS_STOP_ON_LAST_AGENT=1 the stack's lifecycle is bound
-    # to the agents' instead (each later launch re-starts it via
-    # ensure_services_up). This agent's own container is already gone (--rm),
-    # so a zero count here means no agents remain. Scoped to interactive
-    # launches; print-mode agents are unlabeled and don't participate.
-    if [[ "${HARNESS_STOP_ON_LAST_AGENT:-0}" == "1" ]]; then
-        local remaining
-        remaining=$(harness_docker ps -q \
-            --filter "label=harness.project=$project_name" \
-            --filter "label=harness.agent=true" 2>/dev/null | wc -l | tr -d ' ')
-        if [[ "$remaining" == "0" ]]; then
-            echo "[harness] last agent exited; stopping proxy/MCP (HARNESS_STOP_ON_LAST_AGENT=1)" >&2
-            cmd_down >/dev/null 2>&1 || true
-        fi
-    fi
+    # When this was the LAST agent for the project, tear the shared stack
+    # (proxy + enabled MCPs) down too, so an exited agent never leaves the
+    # control plane running with nothing using it. `stop_stack_if_last_agent`
+    # counts remaining labeled agent containers (both interactive and print);
+    # this agent's own container is already gone (--rm), so a zero count means
+    # it was the last. Only the interactive exit triggers teardown — a print
+    # agent that outlives this one still holds the count non-zero and keeps the
+    # stack up, and print agents don't trigger teardown themselves (see
+    # run_agent_print) so a scripted `-p` loop doesn't thrash the stack.
+    stop_stack_if_last_agent
     exit "$rc"
 }
 
-# Headless single-shot agent invocation. No tmux, no detach, no labels (so
-# it doesn't appear in `harness list`). Container is auto-removed on exit.
+# Headless single-shot agent invocation. No tmux, no detach. Carries the same
+# harness.agent labels as an interactive launch (so it counts toward the
+# project's agent total and protects the shared stack while it runs — it does
+# appear in `harness list` for its duration). Container is auto-removed on exit.
 # stdin handling: -it if running on a TTY, -i otherwise — the agent needs the
 # TTY for some output formats but pipe-based callers shouldn't get a TTY.
 run_agent_print() {
@@ -2770,6 +2781,16 @@ run_agent_print() {
     fi
     docker_args+=(
         -w "$(harness_container_workdir "$mount_path")"
+        # Labelled like an interactive agent so a running print agent counts
+        # toward the project's agent total: an interactive agent exiting won't
+        # tear the shared stack out from under a concurrent `-p` run (see
+        # stop_stack_if_last_agent). Print agents don't trigger teardown
+        # themselves, so a scripted `-p` loop doesn't churn the stack. The
+        # trade-off: a `-p` agent now shows in `harness list` while it runs.
+        --label "harness.agent=true"
+        --label "harness.project=$project_name"
+        --label "harness.tool=$tool"
+        --label "harness.mount=$mount_path"
         "$image"
         "$tool"
     )

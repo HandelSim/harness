@@ -174,8 +174,10 @@ The container name carries a per-launch random suffix, so multiple agents
 can run from the same directory at once. `list`/`stop`/the picker discover
 agents by label (`harness.agent`/`tool`/`mount`), never by name, so the
 name needs no determinism — only uniqueness, to avoid Docker's unique-name
-collision. The `--print` path sets no name or labels and was already
-concurrent.
+collision. The `--print` path sets no container name but now carries the
+same `harness.agent`/`project`/`tool`/`mount` labels (so a running `-p`
+agent counts toward the project total and protects the shared stack — see
+"Last-agent stack teardown"); it was already concurrent.
 
 ### Interactive TTY resolution (Windows) — issue #82
 
@@ -260,26 +262,27 @@ is noise. Because these paths now `exit` instead of `exec`, the top-level
 `_reap_jq_sidecar` call is therefore a harmless idempotent no-op the second
 time.
 
-### Last-agent stack teardown (opt-in)
+### Last-agent stack teardown
 
-`HARNESS_STOP_ON_LAST_AGENT=1` binds the shared stack's lifecycle to the
-agents'. After an **interactive** agent exits, `run_agent_interactive`
+The shared stack's lifecycle is bound to the agents': `ensure_services_up`
+brings it up on launch, and the last agent to exit brings it down, so the
+control plane never lingers with no agent using it. After an **interactive**
+agent exits, `run_agent_interactive` calls `stop_stack_if_last_agent`, which
 counts the remaining agent containers for the project
 (`label=harness.project=<p> label=harness.agent=true`); the just-exited
 container is already gone (`--rm`), so a zero count means it was the last
-one, and the proxy + enabled MCPs are torn down via `cmd_down`.
+one, and the proxy + enabled MCPs (container **and** host) are torn down via
+`cmd_down`. This is unconditional — there is no opt-in env var.
 
-Default is **off** — the established model is "start once, launch many":
-`ensure_services_up` brings the stack up on the first launch and it persists
-so later launches hit the fast already-running path. With the flag on, each
-later launch re-starts the stack (cheap when images are already built;
-slower the first time MCP images must build). The flag is read at exit, so
-it can be set per-session or in `.env`. Scope notes: only interactive
-launches participate (`--print` agents are unlabeled, so they neither count
-nor trigger teardown — don't run print-mode agents concurrently with this
-flag set, or an interactive exit can stop the stack out from under them);
-the count is project-scoped, so concurrent interactive agents keep the stack
-up until the last one exits. This is the inverse of `cmd_down`'s own
+Scope notes: **print (`-p`) agents carry the same `harness.agent` labels**,
+so they count toward the project total. A concurrent `-p` run therefore keeps
+the count non-zero and holds the stack up — an interactive exit won't tear
+the stack out from under it. Print agents do **not** trigger teardown
+themselves (only `run_agent_interactive` calls `stop_stack_if_last_agent`),
+so a scripted `-p` loop doesn't churn the stack up and down. The trade-off:
+a `-p` agent now appears in `harness list` for the duration of its run. The
+count is project-scoped, so concurrent interactive agents likewise keep the
+stack up until the last one exits. This is the inverse of `cmd_down`'s own
 agent-stop sweep, which tears agents down when the *stack* goes down.
 
 ## Update-available banner
