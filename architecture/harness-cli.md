@@ -272,7 +272,13 @@ counts the remaining agent containers for the project
 (`label=harness.project=<p> label=harness.agent=true`); the just-exited
 container is already gone (`--rm`), so a zero count means it was the last
 one, and the proxy + enabled MCPs (container **and** host) are torn down via
-`cmd_down`. This is unconditional — there is no opt-in env var.
+`cmd_down`. This is unconditional — there is no opt-in env var. The
+`cmd_down` call is best-effort and isolated in a subshell
+(`( cmd_down ) >/dev/null 2>&1 || true`): `cmd_down` → `require_docker` can
+`exit 1` if the runtime probe fails, and a bare `|| true` catches only a
+non-zero *return*, not an `exit`. Without the subshell that `exit` would
+terminate `run_agent_interactive` before its final `exit "$rc"`, swallowing
+the container's exit code (#81).
 
 Scope notes: **print (`-p`) agents carry the same `harness.agent` labels**,
 so they count toward the project total. A concurrent `-p` run therefore keeps

@@ -844,7 +844,13 @@ stop_stack_if_last_agent() {
         --filter "label=harness.agent=true" 2>/dev/null | wc -l | tr -d ' ')
     [[ "$remaining" == "0" ]] || return 0
     echo "[harness] last agent exited; stopping proxy/MCP" >&2
-    cmd_down >/dev/null 2>&1 || true
+    # Best-effort teardown, in a subshell: cmd_down → require_docker can `exit 1`
+    # if the runtime probe fails, and a bare `cmd_down ... || true` catches only a
+    # non-zero *return*, not an `exit`. Without the subshell that `exit` would
+    # terminate run_agent_interactive before it propagates the container's exit
+    # code via `exit "$rc"` (#81). Isolating it means a failed teardown is a no-op
+    # for the caller, never a clobbered exit status.
+    ( cmd_down ) >/dev/null 2>&1 || true
 }
 
 # Unique container name for one agent launch. Discovery (list/stop/picker)
