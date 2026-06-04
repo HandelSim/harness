@@ -1824,12 +1824,14 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
                 f"unexpected guidance for absent tool {absent!r} in recency",
             )
 
-    def test_serena_mcp_tool_renders_guidance_when_passed(self):
-        """The bundled serena MCP's tools arrive keyed `serena_<tool>`
-        (opencode's `<server>_<tool>` MCP naming, NOT the `mcp__serena__*`
-        form the mock response fixtures use). When such a tool is in the
-        inbound tools list its terse guidance line must render at recency,
-        exercising the same map as the opencode built-ins."""
+    def test_mcp_tool_renders_guidance_from_recency_map(self):
+        """MCP tools arrive keyed `<server>_<tool>` (opencode's MCP naming, NOT
+        the `mcp__serena__*` form the mock response fixtures use). Their guidance
+        is NOT in `_HYBRID_TOOL_GUIDANCE` (that map is opencode's own tools); it
+        loads at startup from HARNESS_MCP_TOOL_RECENCY into `_MCP_TOOL_RECENCY`,
+        which `_format_tool_entries` consults as a fallback. When such a tool is
+        in the inbound tools list its terse line must render at recency, keyed by
+        the `<server>_<tool>` form."""
         tools = self.tools + [{"function": {
             "name": "serena_find_symbol",
             "description": "Find a symbol via the language server.",
@@ -1844,7 +1846,9 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
             },
         }}]
         tools_text = proxy.format_tools_to_text(tools)
-        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+        recency = {"serena_find_symbol": "Locate a symbol by `name_path`."}
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"), \
+                patch.object(proxy, "_MCP_TOOL_RECENCY", recency):
             out = proxy.translate_history_and_apply_prompt(
                 self.user_msgs, tools_text, tools=tools,
             )
@@ -1852,6 +1856,26 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertIn("Locate a symbol by `name_path`", c)
         # The bare `mcp__serena__*` form must NOT be how the key is matched.
         self.assertIn("serena_find_symbol", c)
+
+    def test_setup_mcp_tool_recency_parses_env(self):
+        """`_setup_mcp_tool_recency` loads HARNESS_MCP_TOOL_RECENCY (a JSON
+        `<server>_<tool>` -> str map) and keeps only str->non-empty-str entries;
+        unset/empty/unparsable/non-dict yields an empty map (MCP tools then
+        render as bare signatures, the same graceful degradation as no entry)."""
+        cases = [
+            ('{"serena_find_symbol": "do the thing", "a_b": 5, "c_d": ""}',
+             {"serena_find_symbol": "do the thing"}),
+            ("", {}),
+            ("not json", {}),
+            ("[1, 2, 3]", {}),
+            ("{}", {}),
+        ]
+        for raw, expected in cases:
+            with patch.dict(os.environ, {"HARNESS_MCP_TOOL_RECENCY": raw}):
+                proxy._setup_mcp_tool_recency()
+                self.assertEqual(proxy._MCP_TOOL_RECENCY, expected)
+        # Restore the module default so later tests see a clean map.
+        proxy._MCP_TOOL_RECENCY = {}
 
     def test_cwd_echoed_in_environment_when_system_has_working_directory(self):
         """When the inbound opencode system prompt carries a

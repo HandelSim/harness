@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "server": "serena",
+  "_comment": "Per-tool recency descriptions for the serena MCP. Keys are BARE tool names; the harness CLI prefixes them with `serena_` (opencode's <server>_<tool> form) when it merges this into HARNESS_MCP_TOOL_RECENCY for the proxy. Keep each line minimal — the recency block is budget-constrained and serena ships many tools. See architecture/mcp.md 'Tool recency descriptions'.",
+  "tools": {
+    "get_symbols_overview": "Top-level symbols of a file — orient here before reading the whole file.",
+    "find_symbol": "Locate a symbol by `name_path` (e.g. `Class/method`); set `include_body` to get its code, else you get location only.",
+    "find_referencing_symbols": "Find a symbol's callers/uses; run before renaming or deleting it.",
+    "search_for_pattern": "Project-wide regex search; for symbol lookups prefer find_symbol.",
+    "find_file": "Find files by name/glob; for file contents use search_for_pattern.",
+    "list_dir": "List a directory; `recursive` walks subtrees, default one level.",
+    "read_file": "Read a file by relative path; to read one symbol prefer find_symbol with `include_body`.",
+    "replace_symbol_body": "Replace a symbol's full body; exclude the signature line, don't re-include it.",
+    "insert_after_symbol": "Insert code right after a symbol's definition (e.g. a new method).",
+    "insert_before_symbol": "Insert code right before a symbol's definition (e.g. imports above a class).",
+    "replace_content": "In-file find/replace (regex optional); for a whole symbol use replace_symbol_body.",
+    "create_text_file": "Create/overwrite a file — overwrites silently, so confirm it's new.",
+    "execute_shell_command": "Run a shell command in the project (build/test/git); mutating commands change real files.",
+    "write_memory": "Save a project note for later sessions; one topic each, sparingly.",
+    "read_memory": "Read a memory by name; call list_memories first if unsure.",
+    "list_memories": "List saved memory names; cheap, call before read/write to avoid guessing."
+  }
+}

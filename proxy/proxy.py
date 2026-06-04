@@ -126,6 +126,19 @@ _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 #                  measure what harness's mediation contributes.
 _PROMPT_MODE: str = "hybrid"  # set in main() before serving
 
+# Hybrid mode only. Per-tool recency guidance for MCP tools, loaded at startup
+# from the HARNESS_MCP_TOOL_RECENCY env var (a JSON object keyed `<server>_<tool>`
+# -> one-line description). The harness CLI builds this by merging every enabled
+# MCP's `recency.json` (see architecture/mcp.md "Tool recency descriptions"), so
+# MCP tool guidance is DATA owned per-MCP, not code: the bundled serena reference
+# MCP ships `mcp-registry/serena/recency.json`, a custom host MCP's setup agent
+# writes one, and `harness mcp setup <name>` authors one for any other registry
+# MCP. Consulted as a fallback to `_HYBRID_TOOL_GUIDANCE` (opencode's own tools
+# stay code, the shipped harness<->opencode contract). Empty when no MCP is
+# enabled or the var is unset/unparsable — a tool with no entry renders as a bare
+# signature, exactly as before.
+_MCP_TOOL_RECENCY: Dict[str, str] = {}  # set in main() from the env var
+
 # The confirmed upstream silently drops the `system` role, so its content
 # must always be converted into a user message at the start of the
 # conversation, with a stub assistant message between to satisfy strict
@@ -260,71 +273,15 @@ _HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
         "you must `read` it first or the call fails. Don't create "
         "README/docs files unless asked."
     ),
-    # --- serena MCP (bundled reference MCP) ------------------------------
-    # opencode exposes an MCP server's tools as `<server>_<tool>`, so the
-    # serena reference MCP's tools arrive keyed `serena_*` (NOT the
-    # `mcp__serena__*` form the mock RESPONSE fixtures use — those are only
-    # ever substring-matched in tests, never executed by real opencode).
-    # These render only when serena is enabled AND opencode ships the tool
-    # for the turn (the `.get(name)` lookup is `None` otherwise, zero cost),
-    # so a disabled serena adds nothing to recency. Kept deliberately terse
-    # — the recency block is budget-constrained and serena ships many tools.
-    "serena_get_symbols_overview": (
-        "Top-level symbols of a file — orient here before reading the whole "
-        "file."
-    ),
-    "serena_find_symbol": (
-        "Locate a symbol by `name_path` (e.g. `Class/method`); set "
-        "`include_body` to get its code, else you get location only."
-    ),
-    "serena_find_referencing_symbols": (
-        "Find a symbol's callers/uses; run before renaming or deleting it."
-    ),
-    "serena_search_for_pattern": (
-        "Project-wide regex search; for symbol lookups prefer find_symbol."
-    ),
-    "serena_find_file": (
-        "Find files by name/glob; for file contents use search_for_pattern."
-    ),
-    "serena_list_dir": (
-        "List a directory; `recursive` walks subtrees, default one level."
-    ),
-    "serena_read_file": (
-        "Read a file by relative path; to read one symbol prefer "
-        "find_symbol with `include_body`."
-    ),
-    "serena_replace_symbol_body": (
-        "Replace a symbol's full body; exclude the signature line, don't "
-        "re-include it."
-    ),
-    "serena_insert_after_symbol": (
-        "Insert code right after a symbol's definition (e.g. a new method)."
-    ),
-    "serena_insert_before_symbol": (
-        "Insert code right before a symbol's definition (e.g. imports above "
-        "a class)."
-    ),
-    "serena_replace_content": (
-        "In-file find/replace (regex optional); for a whole symbol use "
-        "replace_symbol_body."
-    ),
-    "serena_create_text_file": (
-        "Create/overwrite a file — overwrites silently, so confirm it's new."
-    ),
-    "serena_execute_shell_command": (
-        "Run a shell command in the project (build/test/git); mutating "
-        "commands change real files."
-    ),
-    "serena_write_memory": (
-        "Save a project note for later sessions; one topic each, sparingly."
-    ),
-    "serena_read_memory": (
-        "Read a memory by name; call list_memories first if unsure."
-    ),
-    "serena_list_memories": (
-        "List saved memory names; cheap, call before read/write to avoid "
-        "guessing."
-    ),
+    # NOTE: MCP tool guidance is NOT here. opencode exposes an MCP server's
+    # tools as `<server>_<tool>`, and those one-liners are DATA owned per-MCP,
+    # not code — they load at startup into `_MCP_TOOL_RECENCY` from the
+    # HARNESS_MCP_TOOL_RECENCY env var (the harness CLI merges each enabled
+    # MCP's `recency.json`). The bundled serena reference MCP ships
+    # `mcp-registry/serena/recency.json`; `_format_tool_entries` consults
+    # `_MCP_TOOL_RECENCY` as a fallback to this map. This map stays the union of
+    # opencode's OWN tools (the shipped harness<->opencode contract). See
+    # architecture/mcp.md "Tool recency descriptions".
 }
 
 # opencode builds the `task` tool's description by appending a dynamic agent
@@ -390,6 +347,32 @@ def _setup_host_os() -> None:
     raw = os.environ.get("HARNESS_HOST_OS", "").strip().lower()
     _HOST_OS = raw if raw in ("linux", "macos", "windows") else ""
     print(f"[i] host OS: {_HOST_OS or '(unknown)'}", flush=True)
+
+
+def _setup_mcp_tool_recency() -> None:
+    """Read HARNESS_MCP_TOOL_RECENCY (a JSON object keyed `<server>_<tool>` ->
+    one-line description, built by the harness CLI from each enabled MCP's
+    `recency.json`) into the module global. Only str->non-empty-str entries are
+    kept; an unset, empty, or unparsable value yields an empty map (MCP tools
+    then render as bare signatures, the same graceful degradation as a tool
+    with no entry). MCP membership is fixed per launch, so reading once at
+    startup is correct — no per-request threading."""
+    global _MCP_TOOL_RECENCY
+    raw = os.environ.get("HARNESS_MCP_TOOL_RECENCY", "").strip()
+    parsed: Dict[str, str] = {}
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            parsed = {
+                k: v
+                for k, v in data.items()
+                if isinstance(k, str) and isinstance(v, str) and v.strip()
+            }
+    _MCP_TOOL_RECENCY = parsed
+    print(f"[i] MCP tool recency: {len(_MCP_TOOL_RECENCY)} entries", flush=True)
 
 
 def init_output_dir() -> Optional[str]:
@@ -647,7 +630,9 @@ def _format_tool_entries(tool_signatures, tool_details=None):
     lines = []
     for name, req, opt in tool_signatures:
         signature = _format_tool_signature(name, req, opt)
-        guidance = _HYBRID_TOOL_GUIDANCE.get(name)
+        # opencode's own tools are keyed in the code map; MCP tools (`<server>_
+        # <tool>`) load from each enabled MCP's recency.json into _MCP_TOOL_RECENCY.
+        guidance = _HYBRID_TOOL_GUIDANCE.get(name) or _MCP_TOOL_RECENCY.get(name)
         head = f"- {signature}"
         if guidance:
             head = f"{head} — {guidance}"
@@ -2177,6 +2162,7 @@ def main() -> None:
     _OUTPUT_DIR = init_output_dir()
     _setup_prompt_mode()
     _setup_host_os()
+    _setup_mcp_tool_recency()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()
     if not raw_output:
@@ -2198,6 +2184,7 @@ def main() -> None:
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"
+        f"   mcp recency:    {len(_MCP_TOOL_RECENCY)} tool(s)\n"
         f"   host OS:        {_HOST_OS or '(unknown)'}\n"
         f"   debug dumps:    {output_status}\n"
         "============================================================",

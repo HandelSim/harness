@@ -134,6 +134,51 @@ def _run(cmd: list[str], cwd: Path) -> str:
 # Keep the ones the project needs; delete the rest. Each tool's docstring is
 # what the agent reads to decide when to call it, so keep them accurate.
 
+# Orientation tool. KEEP THIS — it is what the agent calls FIRST to learn the
+# build's state before touching configure/build/test, so it stops blindly
+# calling tools against an un-scaffolded tree and reading back errors. It is
+# read-only and cheap: it inspects the filesystem, it does not run cmake.
+# Adapt what it reports to your build system (the MSBuild path checks for a
+# different marker than CMakeCache.txt), but keep one such tool.
+@mcp.tool()
+def project_state() -> str:
+    """Report what this MCP manages and the project's current build state.
+
+    CALL THIS FIRST, before configure/build/test. It tells you whether the
+    project is already configured/built or still needs scaffolding, so you act
+    on the real state instead of calling build() blind and reading back errors.
+    Read-only and cheap — it inspects the filesystem, it does not run cmake.
+    """
+    pdir = _project_dir()
+    bdir = _build_dir()
+    configured = (bdir / "CMakeCache.txt").exists()
+    allow = CFG.get("targets") or []
+    lines = [
+        f"MCP {CFG['name']}: builds a native project on this host via CMake; "
+        "the agent edits the source, this server compiles it here.",
+        f"project_dir: {pdir} ({'present' if pdir.exists() else 'MISSING'})",
+        f"build_dir:   {bdir} ({'present' if bdir.exists() else 'absent'})",
+        f"configured:  {'yes (CMakeCache.txt present)' if configured else 'NO'}",
+        f"generator:   {CFG.get('generator') or '(cmake default)'}",
+        f"config:      {CFG.get('config') or '(generator default)'}",
+        f"targets:     {', '.join(allow) if allow else '(no allowlist — any target)'}",
+    ]
+    if _LAST_BUILD_OUTPUT:
+        tail = next(
+            (ln for ln in _LAST_BUILD_OUTPUT.splitlines() if "exit code:" in ln),
+            "ran this session",
+        )
+        lines.append(f"last build:  {tail.strip()}")
+    else:
+        lines.append("last build:  none this session")
+    lines.append(
+        "next: call configure(), then build()." if not configured
+        else "next: configure() already ran — call build() (or configure() "
+        "again after editing CMakeLists)."
+    )
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def configure() -> str:
     """Run CMake configure/generate for the project (cmake -S . -B <build_dir>).

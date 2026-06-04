@@ -270,16 +270,21 @@ together. Each entry is a single bullet that combines:
    flags accidental removal (an `issubset` check, so MCP entries below are
    free to coexist).
 
-   The map also carries terse entries for the bundled **serena** reference
-   MCP, keyed `serena_<tool>` — opencode exposes an MCP server's tools as
-   `<server>_<tool>`, so serena's arrive `serena_*` (NOT the `mcp__serena__*`
-   form the mock *response* fixtures use, which is only ever substring-
-   matched in tests). They render only when serena is enabled and opencode
-   ships the tool for the turn, so a disabled serena adds nothing to
-   recency. These lines are kept shorter than the opencode ones because the
-   recency block is budget-constrained and serena ships many tools. New
-   guidance for any MCP follows the same pattern: add `<server>_<tool>`
-   keys here.
+   MCP tool guidance is **not** in this code map. `_HYBRID_TOOL_GUIDANCE`
+   covers only the opencode tools harness ships for (a shipped-code
+   contract). Per-MCP tool guidance is **data**, owned by each MCP, and
+   reaches the proxy through a second map, `_MCP_TOOL_RECENCY` (see "MCP
+   tool-recency injection" below). `_format_tool_entries` looks up
+   `_HYBRID_TOOL_GUIDANCE.get(name) or _MCP_TOOL_RECENCY.get(name)`, so a
+   tool's guidance can come from either source; opencode tools win on the
+   (impossible) key collision. Both maps key on the runtime tool name —
+   opencode exposes an MCP server's tools as `<server>_<tool>`, so the
+   bundled **serena** reference MCP's keys are `serena_*` (NOT the
+   `mcp__serena__*` form the mock *response* fixtures use, which is only ever
+   substring-matched in tests). MCP entries render only when that MCP is
+   enabled and opencode ships the tool for the turn, so a disabled MCP adds
+   nothing to recency. They are kept shorter than the opencode lines because
+   the recency block is budget-constrained and an MCP can ship many tools.
 3. **Closed-set argument values** — for tools in the project-managed
    `_HYBRID_DETAIL_TOOLS` constant (`["task", "skill"]`), the tool's
    verbatim description is inlined as an indented block UNDER the tool's
@@ -356,6 +361,34 @@ reads it into the `_HOST_OS` module global, honouring only `linux`/`macos`/
 When `_HOST_OS` is `""` the Environment line drops only the `(host OS: …)`
 parenthetical — the container/reproducibility facts still render, so the proxy
 degrades gracefully when launched outside the harness CLI.
+
+## MCP tool-recency injection
+
+Per-tool recency guidance for **MCP** tools is data the proxy receives, not
+code it ships. The proxy container reads no config files and no repo state, so
+the guidance arrives the same way the host OS does: an env var the harness CLI
+exports and `docker-compose.yml` interpolates. The CLI builds
+`HARNESS_MCP_TOOL_RECENCY` — a JSON object keyed `<server>_<tool>` — by merging
+the `recency.json` of every **enabled** MCP (`mcp_tool_recency_json` in
+`cmd_start`; see `architecture/mcp.md` "Tool recency descriptions"), and
+`docker-compose.yml` passes it to the proxy
+(`HARNESS_MCP_TOOL_RECENCY: ${HARNESS_MCP_TOOL_RECENCY:-}`).
+
+`_setup_mcp_tool_recency` runs once at startup (alongside `_setup_host_os`),
+parses the env var, and loads it into the `_MCP_TOOL_RECENCY` module global —
+keeping only string→non-empty-string entries, defaulting to `{}` on missing /
+empty / malformed JSON. The recency builder then consults it as the fallback
+guidance source for any tool not in `_HYBRID_TOOL_GUIDANCE` (see "Per-tool
+entries"). Because the value is fixed per launch (the enabled-MCP set and their
+recency files don't change mid-run), reading it once mirrors the host-OS
+treatment; a recency edit takes effect on the next `harness start`/`restart`.
+When the var is empty (no MCP enabled, or proxy launched outside the harness
+CLI) `_MCP_TOOL_RECENCY` is `{}` and MCP tools render as bare signatures —
+graceful degradation, never a hard fail.
+
+The bundled serena MCP's guidance lives in `mcp-registry/serena/recency.json`
+(it used to be hard-coded in `_HYBRID_TOOL_GUIDANCE`); migrating it out is what
+made the code/data split concrete.
 
 ## `_CHANGE_SYSTEM_TO_USER`
 

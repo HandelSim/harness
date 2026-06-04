@@ -205,6 +205,61 @@ and folds it into `~/.config/opencode/opencode.json`
 Re-merging on every container start means disable propagates without
 needing to clean up old entries.
 
+### Tool recency injection
+
+The proxy injects a terse per-tool "recency reminder" near the end of the
+agent's context each turn (see `architecture/proxy.md` "Per-tool entries").
+For opencode's own tools the one-line guidance is a code constant; for **MCP**
+tools it is **data each MCP owns**, in a `recency.json` the MCP ships.
+
+Format — `recency.json` next to the MCP's other files:
+
+```json
+{
+  "schema_version": 1,
+  "server": "<name>",
+  "tools": {
+    "<bare_tool_name>": "One terse line: the failure mode or when-to-use.",
+    ...
+  }
+}
+```
+
+Keys are **bare** tool names; the CLI prefixes them with `<server>_` to match
+how opencode names an MCP server's tools (`<server>_<tool>`). Lines are kept
+minimal — the recency block is budget-constrained and the full schema is
+already at the stable prefix.
+
+`mcp_tool_recency_json` (called once in `cmd_start`) builds the merged map. For
+every **enabled** MCP under `state/mcp/<name>/` it locates that MCP's
+`recency.json` by precedence —
+
+1. `state/mcp/<name>/recency.json` (installed tree; host MCPs and any local edit)
+2. `host-mcp/<name>/recency.json` (host-MCP scaffold authored by the setup agent)
+3. `mcp-registry/<name>/recency.json` (bundled registry entry, e.g. serena)
+
+— prefixes each entry's key with `<name>_`, drops non-string / empty values,
+and deep-merges them into one object. `cmd_start` exports the result as
+`HARNESS_MCP_TOOL_RECENCY`, which `docker-compose.yml` passes to the proxy;
+`_setup_mcp_tool_recency` loads it (see `architecture/proxy.md` "MCP
+tool-recency injection"). Disabled MCPs contribute nothing. It is computed in
+`cmd_start` rather than the `compose()` wrapper on purpose: `compose()` calls
+`write_runtime_override` and `harness_jq`'s container fallback runs `compose
+build`, so building the JSON (which uses `harness_jq`) inside `compose()` would
+risk re-entry. A recency edit takes effect on the next `harness start`/`restart`.
+
+**Where each MCP kind authors it:**
+- **Registry MCPs** (serena and friends) ship `recency.json` in their
+  `mcp-registry/<name>/` directory; `directory_overwrite` keeps it current on
+  upgrade, and it is found by precedence #3 with no copy step. serena's lives at
+  `mcp-registry/serena/recency.json`.
+- **Host MCPs** are authored by the host-setup agent, which writes
+  `recency.json` into `host-mcp/<name>/` per `host-mcp/template/AGENTS.md`
+  (one entry per kept tool, including the `project_state` orientation tool —
+  see [Host MCPs](#host-mcps-non-container)). Found by precedence #2.
+- A per-install override can drop `recency.json` straight into
+  `state/mcp/<name>/` (precedence #1) without touching the source.
+
 ## Upgrade behavior (`directory_overwrite`)
 
 `scripts/upgrade-manifest.json` declares one `directory_overwrite` action

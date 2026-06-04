@@ -652,6 +652,52 @@ mcp_is_enabled() {
     [[ "$v" == "true" ]]
 }
 
+# Build the consolidated MCP tool-recency map for the proxy. For every ENABLED
+# MCP under state/mcp/<name>/, read its recency.json (a bare `tool -> one-line
+# description` map) and emit ONE merged JSON object keyed `<name>_<tool>` — the
+# `<server>_<tool>` form opencode gives an MCP server's tools, which is how the
+# proxy's recency reminder looks them up. The proxy reads this from the
+# HARNESS_MCP_TOOL_RECENCY env var (see proxy.py:_setup_mcp_tool_recency and
+# architecture/mcp.md "Tool recency descriptions").
+#
+# Source precedence per MCP (first that exists wins):
+#   1. state/mcp/<name>/recency.json     explicit per-install override / authored
+#   2. host-mcp/<name>/recency.json      host MCP, written by its setup agent
+#   3. mcp-registry/<name>/recency.json  bundled/registry default (e.g. serena)
+#
+# Emits `{}` when nothing applies. A malformed file contributes nothing rather
+# than failing the launch. Lines are minimal by mandate — the recency block is
+# budget-constrained. Call this OUTSIDE compose() (e.g. cmd_start) so its
+# harness_jq use can't re-enter the compose() runtime-override path.
+mcp_tool_recency_json() {
+    [[ -d "$mcp_active_dir" ]] || { printf '{}'; return 0; }
+    local merged='{}' mcp_dir name src part
+    for mcp_dir in "$mcp_active_dir"/*/; do
+        [[ -d "$mcp_dir" ]] || continue
+        name=$(basename "$mcp_dir")
+        mcp_is_enabled "$name" || continue
+        src=""
+        if [[ -f "$mcp_active_dir/$name/recency.json" ]]; then
+            src="$mcp_active_dir/$name/recency.json"
+        elif [[ -f "$install_root/host-mcp/$name/recency.json" ]]; then
+            src="$install_root/host-mcp/$name/recency.json"
+        elif [[ -f "$install_root/mcp-registry/$name/recency.json" ]]; then
+            src="$install_root/mcp-registry/$name/recency.json"
+        fi
+        [[ -n "$src" ]] || continue
+        # Keep only string, non-empty descriptions, then prefix each bare tool
+        # key with "<name>_" to match opencode's exposed naming.
+        part=$(harness_jq -c --arg p "${name}_" '
+            (.tools // {})
+            | with_entries(select((.value | type) == "string" and (.value | length) > 0))
+            | with_entries(.key |= ($p + .))
+        ' "$src" 2>/dev/null) || continue
+        [[ -n "$part" && "$part" != "null" ]] || continue
+        merged=$(harness_jq -cn --argjson a "$merged" --argjson b "$part" '$a * $b' 2>/dev/null) || continue
+    done
+    printf '%s' "$merged"
+}
+
 # Set meta.enabled to "true" or "false" atomically. Creates the file if it
 # doesn't already exist.
 mcp_set_enabled() {
@@ -1416,6 +1462,13 @@ cmd_start() {
     if [[ "${HARNESS_NO_BUILD:-0}" == "1" ]]; then
         build_flag=()
     fi
+
+    # Consolidate enabled MCPs' tool-recency descriptions into one env var the
+    # proxy reads at startup. Computed here (not in compose()) and exported so
+    # docker-compose.yml interpolates it into the proxy service env, mirroring
+    # HARNESS_HOST_OS. Recomputed on every start/restart, so editing a
+    # recency.json takes effect on the next `harness restart`.
+    export HARNESS_MCP_TOOL_RECENCY="$(mcp_tool_recency_json)"
 
     # Active MCPs sit behind the `mcp` profile so they're only brought up
     # when something has been `harness mcp enable`d. Without --profile they

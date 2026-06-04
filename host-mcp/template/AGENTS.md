@@ -66,6 +66,14 @@ You do not need to wire any of that. It is done. You tailor `server.py` and
    generator, a specific test runner), add a tool for it rather than making the
    agent guess.
 
+   **Keep `project_state` — never delete it.** It is the orientation tool the
+   agent is told to call *first*, before configure/build/test, so it learns
+   whether the project is already scaffolded/configured instead of blindly
+   calling build tools and reading back errors. Adapt *what it reports* to your
+   build system — for MSBuild it should check for a built `.sln`/output marker
+   rather than `CMakeCache.txt`, and name the real next step — but keep exactly
+   one read-only state tool and keep its docstring's "CALL THIS FIRST" framing.
+
 4. **Verify the MCP SDK calls.** This template targets the `mcp` Python SDK
    (`from mcp.server.fastmcp import FastMCP`, `mcp.run(transport=
    "streamable-http")`). Run `pip show mcp` (or check `requirements.txt`) and
@@ -86,6 +94,46 @@ You do not need to wire any of that. It is done. You tailor `server.py` and
    automatic, no `harness net allow` needed. A good smoke test: have the user
    start an agent and ask it to call `configure` then `build`, and check the
    server's console shows the requests.
+
+7. **Write `recency.json`.** For each `@mcp.tool()` you kept, register a
+   minimal one-line recency description so the harness agent gets a usable hint
+   for the tool every turn (without the full schema bloating its context). See
+   "Tool recency descriptions" below.
+
+## Tool recency descriptions
+
+harness injects a short, high-attention "recency reminder" near the end of the
+agent's context each turn. For each MCP tool, it shows the tool's signature plus
+**one line** of guidance. That line comes from a `recency.json` file you write
+in THIS folder. Without it, your tools show up as a bare signature with no hint.
+
+Write `recency.json` next to `server.py` with one entry per tool you KEPT,
+keyed by the **bare tool name** (no server prefix — harness adds it):
+
+```json
+{
+  "schema_version": 1,
+  "server": "__MCP_NAME__",
+  "tools": {
+    "project_state": "Call FIRST before any other tool here: reports whether the project is configured/built so you don't call build blind.",
+    "configure": "Generate the CMake build tree; run once before build, and again after editing CMakeLists.",
+    "build": "Compile the project; pass `target` to build one target. Read get_build_errors on failure.",
+    "get_build_errors": "Return the last build's compiler errors; call after a failed build, not before."
+  }
+}
+```
+
+Rules:
+- **Minimal.** One line per tool. Say the failure mode or when-to-use, not the
+  whole docstring. The full schema is already available to the agent; this line
+  is the terse reminder it reads every turn, and the block is budget-constrained.
+- **Keep `project_state` first** and make its line say "call first" — that one
+  reminder, delivered every turn, is what gets the agent to check build state
+  before it starts calling build tools blind.
+- One entry per tool you kept. Drop entries for tools you pruned from `server.py`.
+- Bare tool names as keys. harness prefixes them with `__MCP_NAME___` to match
+  how the tools appear in the agent's tool list.
+- It takes effect on the next `harness restart` (or `harness start`).
 
 ## Adapting to MSBuild (no CMake)
 

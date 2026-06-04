@@ -51,6 +51,12 @@ services:
       # reproducible setup advice. Defaults to unknown (suppresses the host-OS
       # hint) when harness isn't the launcher.
       HARNESS_HOST_OS: ${HARNESS_HOST_OS:-unknown}
+      # Consolidated per-tool recency descriptions for ENABLED MCPs: a JSON
+      # object keyed `<server>_<tool>`. The harness CLI builds it from each
+      # MCP's recency.json (cmd_start -> mcp_tool_recency_json) and exports it;
+      # the proxy loads it into the hybrid recency reminder so MCP tools carry a
+      # one-line hint instead of a bare signature. Empty when no MCP is enabled.
+      HARNESS_MCP_TOOL_RECENCY: ${HARNESS_MCP_TOOL_RECENCY:-}
     volumes:
       # When OUTPUT_DIR is set, the proxy writes per-request debug files here.
       # On Windows users should set OUTPUT_DIR=//output to bypass MSYS path
