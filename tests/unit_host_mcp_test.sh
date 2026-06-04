@@ -8,11 +8,15 @@
 # registered as a client-config-only entry under state/mcp/<name>/ (no
 # compose.yml). See architecture/mcp.md "Host MCPs".
 #
-# Pure unit test — NO docker, NO network. It invokes the real `harness` script
-# as a subprocess with HARNESS_INSTALL_ROOT pointed at a throwaway tmpdir, so
-# clone_dir still resolves to the real repo (for the template source) while all
-# writes land in the tmpdir. host-init touches no docker; the up/down/logs host
-# guards fire BEFORE require_docker, so they are reachable here too.
+# Pure unit test — NO docker, NO network, NO real server spawn. It invokes the
+# real `harness` script as a subprocess with HARNESS_INSTALL_ROOT pointed at a
+# throwaway tmpdir, so clone_dir still resolves to the real repo (for the
+# template source) while all writes land in the tmpdir. host-init touches no
+# docker; the up/down/logs host branches route to the process supervisor BEFORE
+# require_docker, so they are reachable here too. We exercise only the branches
+# that don't spawn a server (down-when-stopped, logs-without-logfile, and up's
+# already-running short-circuit via a fake live pidfile). The real start/stop
+# path is covered by tests/host_mcp_e2e_test.sh.
 #
 # Prints "HOST MCP TEST PASSED" on success.
 
@@ -96,23 +100,38 @@ run_harness mcp status "$NAME" || fail "T3: status exited $? — $HARNESS_OUT"
 grep -q "transport: host" <<<"$HARNESS_OUT" || fail "T3: status missing 'transport: host' — $HARNESS_OUT"
 grep -q "host.docker.internal:$PORT/mcp" <<<"$HARNESS_OUT" || fail "T3: status missing endpoint — $HARNESS_OUT"
 grep -q "state:     installed-enabled" <<<"$HARNESS_OUT" || fail "T3: status not installed-enabled — $HARNESS_OUT"
-ok "T3: status reports host transport + endpoint + installed-enabled"
+# Not started yet (no supervised pidfile), so status reports the process stopped.
+grep -q "process:   stopped" <<<"$HARNESS_OUT" || fail "T3: status should show process stopped — $HARNESS_OUT"
+ok "T3: status reports host transport + endpoint + installed-enabled + process state"
 
-# --- T4: list shows it as a host runtime -------------------------------------
+# --- T4: list shows the supervised host runtime state ------------------------
 run_harness mcp list || fail "T4: list exited $? — $HARNESS_OUT"
 grep -q "$NAME" <<<"$HARNESS_OUT" || fail "T4: list missing $NAME — $HARNESS_OUT"
-grep -q "host (run on host)" <<<"$HARNESS_OUT" || fail "T4: list missing host runtime marker — $HARNESS_OUT"
-ok "T4: list shows the host MCP with host runtime marker"
+# Supervisor reports live state; stopped because nothing has started it.
+grep -q "host (stopped)" <<<"$HARNESS_OUT" || fail "T4: list missing host stopped marker — $HARNESS_OUT"
+ok "T4: list shows the host MCP with its supervised runtime state"
 
-# --- T5: up/down/logs are guarded for host MCPs (and never need docker) ------
-for verb in up down logs; do
-    if run_harness mcp "$verb" "$NAME"; then
-        fail "T5: 'mcp $verb' on a host MCP should exit non-zero — $HARNESS_OUT"
-    fi
-    grep -qi "host MCP" <<<"$HARNESS_OUT" \
-        || fail "T5: 'mcp $verb' should explain it's a host MCP — $HARNESS_OUT"
-done
-ok "T5: up/down/logs print a host-MCP guard and exit non-zero"
+# --- T5: up/down/logs route to the host-process supervisor (no docker) --------
+# down on a stopped host MCP is an idempotent no-op (exit 0, "not running"). No
+# pidfile exists yet, so nothing is killed.
+run_harness mcp down "$NAME" || fail "T5: 'mcp down' on a stopped host MCP should exit 0 — $HARNESS_OUT"
+grep -qi "not running" <<<"$HARNESS_OUT" || fail "T5: 'mcp down' should report not running — $HARNESS_OUT"
+
+# logs with no captured logfile errors clearly (and never touches docker).
+if run_harness mcp logs "$NAME"; then
+    fail "T5: 'mcp logs' with no logfile should exit non-zero — $HARNESS_OUT"
+fi
+grep -qi "no supervised log" <<<"$HARNESS_OUT" || fail "T5: 'mcp logs' should explain there's no log — $HARNESS_OUT"
+
+# up's already-running short-circuit: plant a fake pidfile pointing at THIS
+# test's PID (guaranteed alive), so `up` sees it running and returns without
+# spawning a server. Remove it immediately after so no later step kills us.
+mkdir -p "$REG"
+printf '%s\n' "$$" >"$REG/server.pid"
+run_harness mcp up "$NAME" || fail "T5: 'mcp up' on a running host MCP should exit 0 — $HARNESS_OUT"
+grep -qi "already running" <<<"$HARNESS_OUT" || fail "T5: 'mcp up' should report already running — $HARNESS_OUT"
+rm -f "$REG/server.pid"
+ok "T5: up/down/logs route to the host supervisor without docker or a real spawn"
 
 # --- T6: re-init without --force is refused; --force re-scaffolds ------------
 if run_harness mcp host-init "$NAME" --port "$PORT"; then

@@ -822,6 +822,10 @@ ensure_services_up() {
         echo "harness: services not running; starting..."
         cmd_start
     fi
+    # Reconcile host MCPs on every launch (idempotent): a host MCP may have been
+    # registered, or its process died, since the container stack came up. Cheap
+    # when they're already running (a kill -0 liveness check each).
+    host_mcp_start_enabled
 }
 
 # Tear down the shared stack (proxy + enabled MCPs, both container and host)
@@ -1433,6 +1437,10 @@ cmd_start() {
         echo "  $(harness_container_runtime) logs harness-proxy-1         # what the proxy printed on startup"
         return $up_rc
     fi
+
+    # Bring enabled host MCPs (non-container processes on the host) up alongside
+    # the container stack, so a bare `harness start` / `harness` starts them too.
+    host_mcp_start_enabled
 }
 
 cmd_down() {
@@ -1459,6 +1467,12 @@ cmd_down() {
         # shellcheck disable=SC2086
         harness_docker rm -f $agent_cids >/dev/null 2>&1 || true
     fi
+
+    # Stop supervised host MCP processes too: they have no container, so the
+    # compose teardown below never touches them. Bound to the stack's lifecycle
+    # like everything else — `harness down` (and last-agent teardown, which
+    # calls it) brings them down with the rest.
+    host_mcp_stop_all
 
     # Belt-and-suspenders: clear jq sidecars leaked by crashed harness
     # invocations. The EXIT trap and pre-exec reaps handle the common
@@ -2334,6 +2348,142 @@ emit_host_mcp_docker_args() {
     printf '%s\0' "HARNESS_HOST_MCP_HOSTS=host.docker.internal"
 }
 
+# --- host MCP process supervision -------------------------------------------
+#
+# A host MCP runs as a plain process on the host (no container), launched by its
+# run.sh — which ends in `exec python server.py`, so the PID we background and
+# record stays valid as the server process itself. harness supervises it with a
+# pidfile + logfile under the MCP's registration dir, mirroring the jq-sidecar
+# pidfile model: start is idempotent, the last agent's teardown stops it, and
+# `harness mcp up/down/logs/status` drive it directly. run.sh stays runnable
+# standalone for the host operator — this is supervision layered on top.
+
+host_mcp_src_dir() { printf '%s/host-mcp/%s' "$install_root" "$1"; }
+host_mcp_pidfile() { printf '%s/%s/server.pid' "$mcp_active_dir" "$1"; }
+host_mcp_logfile() { printf '%s/%s/server.log' "$mcp_active_dir" "$1"; }
+
+# Echo the live PID for a host MCP, or nothing. Cleans a stale pidfile whose
+# process is gone so callers see an accurate state. Always returns 0.
+host_mcp_pid() {
+    local pf pid
+    pf=$(host_mcp_pidfile "$1")
+    [[ -f "$pf" ]] || return 0
+    pid=$(tr -d ' \t\r\n' <"$pf" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        printf '%s' "$pid"
+        return 0
+    fi
+    rm -f "$pf" 2>/dev/null || true
+    return 0
+}
+
+host_mcp_running() { [[ -n "$(host_mcp_pid "$1")" ]]; }
+
+# Echo the host MCP's port from its meta, or nothing.
+host_mcp_port() {
+    local meta
+    meta=$(mcp_meta_file "$1")
+    [[ -f "$meta" ]] || return 0
+    harness_jq -r '.host_port // empty' "$meta" 2>/dev/null || true
+}
+
+# True if something is already listening on the host MCP's port — e.g. the
+# operator started it by hand with ./run.sh, or a stale instance is still up.
+# Used to keep harness from double-spawning a server it doesn't own. localhost
+# connect is instant for refused/accepted, so no timeout is needed (same
+# /dev/tcp probe the host_mcp_e2e test uses).
+host_mcp_port_open() {
+    local port
+    port=$(host_mcp_port "$1")
+    [[ -n "$port" ]] || return 1
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || return 1
+    exec 3>&- 3<&- 2>/dev/null || true
+    return 0
+}
+
+# Start a host MCP's server in the background (idempotent). Records the PID and
+# pipes stdout+stderr to the logfile. run.sh cd's into its own dir, so launching
+# it by absolute path is fine. First-run venv/pip work happens in the background;
+# the agent may launch before the server is listening — opencode connects when
+# it comes up, same as the manual-run.sh flow.
+host_mcp_start() {
+    local name="$1" src pf lf
+    src=$(host_mcp_src_dir "$name")
+    if [[ ! -f "$src/run.sh" ]]; then
+        err "host MCP $name has no run.sh at $src"
+        return 1
+    fi
+    host_mcp_running "$name" && return 0
+    # Don't fight a server already on the port (e.g. a manual ./run.sh). harness
+    # just won't have a pidfile for it; it can still reach it over the port.
+    host_mcp_port_open "$name" && return 0
+    pf=$(host_mcp_pidfile "$name")
+    lf=$(host_mcp_logfile "$name")
+    mkdir -p "$(dirname "$pf")"
+    nohup bash "$src/run.sh" >"$lf" 2>&1 &
+    printf '%s\n' "$!" >"$pf"
+}
+
+# Stop a host MCP's supervised server: TERM, brief wait, then KILL. On Windows
+# Git Bash also taskkill the tree (the exec'd/forked python may be a native
+# process MSYS `kill` can't reach). Removes the pidfile. Always returns 0.
+host_mcp_stop() {
+    local name="$1" pid pf i
+    pid=$(host_mcp_pid "$name")
+    pf=$(host_mcp_pidfile "$name")
+    if [[ -z "$pid" ]]; then
+        rm -f "$pf" 2>/dev/null || true
+        return 0
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    for i in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    if harness_is_git_bash && command -v taskkill >/dev/null 2>&1; then
+        # //T kills the child tree, //F forces it. Double-slash so MSYS doesn't
+        # rewrite the flags into paths.
+        taskkill //PID "$pid" //T //F >/dev/null 2>&1 || true
+    fi
+    rm -f "$pf" 2>/dev/null || true
+}
+
+# Start every enabled host MCP (idempotent). Folded into the start/launch paths
+# so a plain `harness` brings host MCPs up alongside the container stack.
+host_mcp_start_enabled() {
+    [[ -d "$mcp_active_dir" ]] || return 0
+    local mcp_dir name
+    for mcp_dir in "$mcp_active_dir"/*/; do
+        [[ -d "$mcp_dir" ]] || continue
+        name=$(basename "$mcp_dir")
+        mcp_is_host "$name" || continue
+        mcp_is_enabled "$name" || continue
+        # Skip if harness already supervises it, or if the port is already
+        # served (a manual ./run.sh) — host_mcp_start re-checks, but skipping
+        # here avoids the needless "starting" log line.
+        host_mcp_running "$name" && continue
+        host_mcp_port_open "$name" && continue
+        echo "[harness] starting host MCP: $name" >&2
+        host_mcp_start "$name" || err "failed to start host MCP $name (see $(host_mcp_logfile "$name"))"
+    done
+}
+
+# Stop every supervised host MCP (enabled or not). Folded into `harness down`
+# so last-agent teardown brings host MCPs down with the rest of the stack.
+host_mcp_stop_all() {
+    [[ -d "$mcp_active_dir" ]] || return 0
+    local mcp_dir name
+    for mcp_dir in "$mcp_active_dir"/*/; do
+        [[ -d "$mcp_dir" ]] || continue
+        name=$(basename "$mcp_dir")
+        mcp_is_host "$name" || continue
+        host_mcp_running "$name" || continue
+        echo "[harness] stopping host MCP: $name" >&2
+        host_mcp_stop "$name"
+    done
+}
+
 # Run an opencode agent in the current directory.
 #
 # The agent's CWD is bind-mounted at the same absolute host path inside the
@@ -3092,8 +3242,16 @@ list_active_entries() {
 # we find inside the snippet.
 mcp_runtime_status() {
     local name="$1"
-    # Host MCPs run as a process on the host, not a container harness can see.
-    if mcp_is_host "$name"; then printf -- 'host (run on host)'; return; fi
+    # Host MCPs run as a process on the host. harness supervises that process
+    # (pidfile), so report its live state the same way it does for containers.
+    if mcp_is_host "$name"; then
+        if host_mcp_running "$name"; then
+            printf -- 'host (running, pid %s)' "$(host_mcp_pid "$name")"
+        else
+            printf -- 'host (stopped)'
+        fi
+        return
+    fi
     local compose_file="$mcp_active_dir/$name/compose.yml"
     [[ -f "$compose_file" ]] || { printf -- '-'; return; }
     if ! harness_docker info >/dev/null 2>&1; then
@@ -3984,6 +4142,13 @@ cmd_mcp_uninstall() {
         done < <(mcp_services_of "$name")
     fi
 
+    # A host MCP has no container but may have a supervised process. Stop it
+    # before removing the registration dir (which holds its pidfile), or the
+    # process would be orphaned with no way to track it down.
+    if mcp_is_host "$name"; then
+        host_mcp_stop "$name"
+    fi
+
     local f
     for f in "$dest"/* "$dest"/.[!.]*; do
         [[ -e "$f" ]] || continue
@@ -4082,10 +4247,21 @@ cmd_mcp_up() {
         exit 1
     fi
     if mcp_is_host "$name"; then
-        err "$name is a host MCP — harness does not manage a container for it."
-        err "start it on the host with: cd $install_root/host-mcp/$name && ./run.sh"
-        err "(run.sh works on Linux, macOS, and Windows Git Bash)."
-        exit 1
+        # Host MCP: supervise the host process (no container). Idempotent.
+        if host_mcp_running "$name"; then
+            echo "up: $name (already running, pid $(host_mcp_pid "$name"))"
+            return
+        fi
+        if host_mcp_port_open "$name"; then
+            echo "up: $name (port $(host_mcp_port "$name") already served, e.g. by a manual ./run.sh; not starting a second instance)"
+            return
+        fi
+        if ! host_mcp_start "$name"; then
+            err "failed to start host MCP $name (see $(host_mcp_logfile "$name"))"
+            exit 1
+        fi
+        echo "up: $name (host process, pid $(host_mcp_pid "$name"); logs: $(host_mcp_logfile "$name"))"
+        return
     fi
     require_docker
 
@@ -4144,9 +4320,14 @@ cmd_mcp_down() {
         exit 1
     fi
     if mcp_is_host "$name"; then
-        err "$name is a host MCP — harness does not manage a container for it."
-        err "stop it on the host where you launched the run script (Ctrl+C)."
-        exit 1
+        # Host MCP: stop the supervised host process (no container).
+        if ! host_mcp_running "$name"; then
+            echo "down: $name (not running)"
+            return
+        fi
+        host_mcp_stop "$name"
+        echo "down: $name (host process stopped)"
+        return
     fi
     require_docker
 
@@ -4201,9 +4382,19 @@ cmd_mcp_logs() {
         exit 1
     fi
     if mcp_is_host "$name"; then
-        err "$name is a host MCP — harness does not manage a container for it."
-        err "its logs are in the terminal on the host where you ran the run script."
-        exit 1
+        # Host MCP: tail the supervised process's logfile. Only meaningful when
+        # harness started it (manual `./run.sh` logs to its own terminal).
+        local lf
+        lf=$(host_mcp_logfile "$name")
+        if [[ ! -f "$lf" ]]; then
+            err "no supervised log for host MCP $name at $lf"
+            err "(harness only captures logs for servers it started via 'harness mcp up'"
+            err " or the auto-up on 'harness start'; a manual ./run.sh logs to its terminal)."
+            exit 1
+        fi
+        # exec bypasses the EXIT trap — reap the jq sidecar before it.
+        _reap_jq_sidecar
+        exec tail -n +1 -f "$lf"
     fi
     require_docker
 
@@ -4290,7 +4481,13 @@ cmd_mcp_status() {
         printf 'transport: host (process on the host; not a container)\n'
         printf 'endpoint:  %s\n' "${url:-(unknown)}"
         printf 'project:   %s\n' "$install_root/host-mcp/$name"
-        printf 'launch:    ./run.sh in that folder (Linux, macOS, Windows Git Bash)\n'
+        printf 'launch:    harness mcp up %s (supervised), or ./run.sh in that folder\n' "$name"
+        if host_mcp_running "$name"; then
+            printf 'process:   running (pid %s, supervised by harness)\n' "$(host_mcp_pid "$name")"
+            printf 'logs:      %s  (harness mcp logs %s)\n' "$(host_mcp_logfile "$name")" "$name"
+        else
+            printf 'process:   stopped\n'
+        fi
         return
     fi
 
@@ -4441,12 +4638,19 @@ host MCP registered: $name
 next:
   1. tailor the server with an agent that reads its AGENTS.md:
        harness mcp host-setup $name
-  2. on the HOST, start the server and keep it running while you work:
-       cd "$inst" && ./run.sh
-     (run.sh works on Linux, macOS, and Windows Git Bash — the same Git Bash you
-      run harness in. cmake/ctest must be on PATH.)
-  3. start the stack ('harness', or 'harness restart' if already up); agents
-     launched after step 1 will see this MCP in their config.
+  2. start the stack ('harness', or 'harness restart' if already up). harness
+     now supervises this server for you: it starts on 'harness start' / first
+     agent launch and stops on 'harness down' (or when the last agent exits),
+     alongside the container MCPs. Agents launched after step 1 see it in their
+     config. cmake/ctest must be on PATH for the build tools to work.
+
+  manual control (all optional — supervision handles the common case):
+       harness mcp up $name      # start the supervised process now
+       harness mcp logs $name    # tail its captured log
+       harness mcp down $name    # stop it
+       cd "$inst" && ./run.sh    # run it standalone (logs to this terminal)
+     run.sh works on Linux, macOS, and Windows Git Bash — the same Git Bash you
+     run harness in.
 
   Reachability is automatic: while this host MCP is enabled, harness maps
   host.docker.internal into the agent container and allows it through the

@@ -260,10 +260,11 @@ absence of `compose.yml` is the whole mechanism:
   never tries to bring up a container for it.
 - `mcp_is_installed` was broadened to "compose.yml OR client-config.json" so a
   host MCP counts as installed (shows in `list`/`status`, blocks a name clash).
-- `mcp_is_host` ("client-config.json present, compose.yml absent") gates the
-  `up`/`down`/`logs` guards (they print "this is a host MCP, run it on the host"
-  and exit) and the `status` transport block (which prints the endpoint URL and
-  the instance folder instead of services/data).
+- `mcp_is_host` ("client-config.json present, compose.yml absent") routes
+  `up`/`down`/`logs`/`status` to the host-process supervisor (below) instead of
+  the compose path: `up` starts the host process, `down` stops it, `logs` tails
+  its captured logfile, and the `status` transport block prints the endpoint
+  URL, the instance folder, and the live process state.
 
 **Two directories per host MCP:**
 
@@ -289,7 +290,39 @@ PowerShell), `requirements.txt`, and an `AGENTS.md` that briefs the
 1. `harness mcp host-init <name> [--port <port>]` — scaffold + register.
 2. `harness mcp host-setup <name>` — agent reads `AGENTS.md`, tailors
    `server.py` + `project.json` with the user.
-3. Run the server on the host (`./run.sh`) and keep it up.
+3. `harness start` (or the next agent launch) brings the server up — harness
+   supervises it (below); no separate manual `./run.sh` step is required.
+
+**Host-process supervision.** harness manages the host MCP's process the same
+way it manages the container stack — bound to the agents' lifecycle, not left to
+the user. The supervisor (helpers grouped under "host MCP process supervision"
+in `harness`) mirrors the jq-sidecar pidfile model:
+
+- **Pidfile + logfile** live in the registration dir: `state/mcp/<name>/server.pid`
+  and `server.log`. `host_mcp_start` launches `nohup bash host-mcp/<name>/run.sh`
+  backgrounded, writes `$!` to the pidfile, and redirects output to the logfile.
+  `run.sh` ends in `exec python server.py`, so the recorded PID stays valid *as*
+  the server process. `host_mcp_pid` reports the live PID via `kill -0` and
+  cleans a stale pidfile; `host_mcp_running` is the boolean form.
+- **Lifecycle hooks.** `host_mcp_start_enabled` (start every enabled host MCP,
+  idempotent) is folded into `cmd_start` and `ensure_services_up`, so a bare
+  `harness` / `harness start` / any agent launch reconciles host MCPs alongside
+  the containers. `host_mcp_stop_all` is folded into `cmd_down`, so `harness down`
+  — and the unconditional last-agent teardown that calls it (see
+  `harness-cli.md`, "Last-agent stack teardown") — stops them with the rest of
+  the stack. `run.sh` stays runnable standalone for a host operator who wants to
+  run it by hand (it logs to its own terminal then, not the captured logfile).
+- **Don't fight a manual server.** Before spawning, the start paths check
+  `host_mcp_port_open` (a `/dev/tcp` probe of the meta `host_port`). If the port
+  is already served — the operator ran `./run.sh` by hand, or a prior instance
+  is still up — harness skips the spawn (it has no pidfile for that process but
+  can still reach it). `harness mcp up` says so explicitly. This is what keeps
+  the `host_mcp_e2e` flow (manual `./run.sh` + `harness start`) single-instance.
+- **Teardown** is `host_mcp_stop`: `SIGTERM`, a brief wait, then `SIGKILL`. On
+  Windows Git Bash it also `taskkill //PID <pid> //T //F`s the process tree,
+  because the `exec`'d native python may be a process MSYS `kill` can't reach.
+  *This Windows path needs verification on a real Windows host* — the POSIX path
+  (Linux/macOS) is the tested one.
 
 **Reachability is automatic.** While at least one host MCP is enabled,
 `run_agent_*` / `cmd_shell` inject `--add-host=host.docker.internal:host-gateway`
