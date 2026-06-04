@@ -177,7 +177,10 @@ the main `docker-compose.yml` and the runtime override. Each snippet
 references `harness_harness-net` as external, so the network must be
 already up — that is, `harness start` must have brought the main compose
 up first. `any_mcp_active` decides whether `harness start` adds
-`--profile mcp` to its `up` command.
+`--profile mcp` to its `up` command **and whether `harness down` adds it to
+the teardown** — a bare `compose down` leaves the profiled MCP container
+running (the `-f` snippet is on the argv but the profile gates it out), which
+then blocks network removal ("resource is still in use").
 
 ### Client config merge
 

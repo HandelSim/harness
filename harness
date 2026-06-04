@@ -1435,7 +1435,15 @@ cmd_down() {
     # cases; this catches the rest on an explicit teardown.
     _sweep_stale_jq_sidecars
 
-    compose down "$@"
+    # Active MCPs sit behind the `mcp` profile (mirrors cmd_start). Without
+    # --profile they're silently ignored even though their -f file is on the
+    # compose argv, so a bare `down` orphans the enabled MCP container and the
+    # network teardown then fails ("resource is still in use").
+    if any_mcp_active; then
+        compose --profile mcp down "$@"
+    else
+        compose down "$@"
+    fi
 }
 
 # Restart core services. Convenience for the common "I edited .env or
@@ -2616,6 +2624,27 @@ run_agent_interactive() {
         harness_docker "${docker_args[@]}" || rc=$?
     fi
     _print_agent_issue_footer
+
+    # Opt-in: when this was the LAST agent for the project, tear the shared
+    # stack (proxy + enabled MCPs) down too, so an exited agent doesn't leave
+    # the control plane running. Default OFF: the established model is "start
+    # once, launch many" — `ensure_services_up` brings the stack up on launch
+    # and it persists so subsequent launches hit the fast already-running
+    # path. With HARNESS_STOP_ON_LAST_AGENT=1 the stack's lifecycle is bound
+    # to the agents' instead (each later launch re-starts it via
+    # ensure_services_up). This agent's own container is already gone (--rm),
+    # so a zero count here means no agents remain. Scoped to interactive
+    # launches; print-mode agents are unlabeled and don't participate.
+    if [[ "${HARNESS_STOP_ON_LAST_AGENT:-0}" == "1" ]]; then
+        local remaining
+        remaining=$(harness_docker ps -q \
+            --filter "label=harness.project=$project_name" \
+            --filter "label=harness.agent=true" 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$remaining" == "0" ]]; then
+            echo "[harness] last agent exited; stopping proxy/MCP (HARNESS_STOP_ON_LAST_AGENT=1)" >&2
+            cmd_down >/dev/null 2>&1 || true
+        fi
+    fi
     exit "$rc"
 }
 

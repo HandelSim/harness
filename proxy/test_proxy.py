@@ -1824,6 +1824,35 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
                 f"unexpected guidance for absent tool {absent!r} in recency",
             )
 
+    def test_serena_mcp_tool_renders_guidance_when_passed(self):
+        """The bundled serena MCP's tools arrive keyed `serena_<tool>`
+        (opencode's `<server>_<tool>` MCP naming, NOT the `mcp__serena__*`
+        form the mock response fixtures use). When such a tool is in the
+        inbound tools list its terse guidance line must render at recency,
+        exercising the same map as the opencode built-ins."""
+        tools = self.tools + [{"function": {
+            "name": "serena_find_symbol",
+            "description": "Find a symbol via the language server.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name_path": {"type": "string"},
+                    "relative_path": {"type": "string"},
+                    "include_body": {"type": "boolean"},
+                },
+                "required": ["name_path"],
+            },
+        }}]
+        tools_text = proxy.format_tools_to_text(tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(
+                self.user_msgs, tools_text, tools=tools,
+            )
+        c = out[-1]["content"]
+        self.assertIn("Locate a symbol by `name_path`", c)
+        # The bare `mcp__serena__*` form must NOT be how the key is matched.
+        self.assertIn("serena_find_symbol", c)
+
     def test_cwd_echoed_in_environment_when_system_has_working_directory(self):
         """When the inbound opencode system prompt carries a
         `Working directory: <path>` line in its `<env>` block, the recency
@@ -2593,13 +2622,14 @@ class TestEmptyResponseDetection(unittest.TestCase):
     """Issue #117. Some upstreams return a well-formed response with
     finish_reason=stop, 0 completion_tokens, and no content/tool_calls —
     silently short-circuiting before generation when something in the
-    most-recent message trips a content/safety filter. The proxy substitutes
-    a minimal rescue text in the assistant slot, AND if a `bash`-style shell
-    tool is available in the inbound tools, also emits a no-op `pwd` call to
-    it so opencode (a) executes the tool and (b) re-invokes the model with
-    the tool result as the new recency, displacing the trigger out of the
-    hot slot and letting the conversation continue without user
-    intervention."""
+    most-recent message trips a content/safety filter. When a `bash`-style
+    shell tool is available in the inbound tools, the proxy emits a no-op
+    `pwd` call to it (and NO substitute assistant text — a tool-only turn is
+    well-formed) so opencode (a) executes the tool and (b) re-invokes the
+    model with the tool result as the new recency, displacing the trigger
+    out of the hot slot and letting the conversation continue without user
+    intervention. Only when no shell tool is exposed does it fall back to a
+    minimal `"Understood."` text in the assistant slot."""
 
     _BASH_TOOL = {
         "type": "function",
@@ -2657,9 +2687,10 @@ class TestEmptyResponseDetection(unittest.TestCase):
 
     def test_empty_content_with_bash_emits_rescue_pwd_call(self):
         """The flagship issue #117 path: empty upstream content + bash is
-        available → emit "Understood." text PLUS a no-op `pwd` call via the
-        bash tool, so finish_reason is `tool_calls` and the agent continues
-        the turn by executing the (read-only) command."""
+        available → emit a no-op `pwd` call via the bash tool and NO
+        substitute assistant text (a tool-only turn is well-formed), so
+        finish_reason is `tool_calls` and the agent continues the turn by
+        executing the (read-only) command."""
         resp = self._post(
             {
                 "choices": [{
@@ -2674,7 +2705,9 @@ class TestEmptyResponseDetection(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
         body = self._body(resp)
-        self.assertEqual(self._content(body).strip(), "Understood.")
+        # Tool-only rescue: assistant text stays empty (no "Understood.").
+        self.assertEqual(self._content(body).strip(), "")
+        self.assertNotIn("Understood.", self._content(body))
         tcs = self._tool_calls(body)
         self.assertEqual(len(tcs), 1, f"expected 1 rescue tool call, got {tcs}")
         self.assertEqual(tcs[0]["function"]["name"], "bash")
@@ -2751,7 +2784,9 @@ class TestEmptyResponseDetection(unittest.TestCase):
             tools=[self._BASH_TOOL],
         )
         body = self._body(resp)
-        self.assertEqual(self._content(body).strip(), "Understood.")
+        # Tool-only rescue: assistant text stays empty (no "Understood.").
+        self.assertEqual(self._content(body).strip(), "")
+        self.assertNotIn("Understood.", self._content(body))
         self.assertEqual(len(self._tool_calls(body)), 1)
 
     def test_real_content_does_not_trigger_rescue(self):
@@ -2833,7 +2868,9 @@ class TestEmptyResponseDetection(unittest.TestCase):
             tools=[self._BASH_TOOL],
         )
         body = self._body(resp)
-        self.assertEqual(self._content(body).strip(), "Understood.")
+        # Tool-only rescue: assistant text stays empty (no "Understood.").
+        self.assertEqual(self._content(body).strip(), "")
+        self.assertNotIn("Understood.", self._content(body))
         self.assertEqual(len(self._tool_calls(body)), 1)
 
     def test_rescue_text_helper_returns_minimal_text(self):
@@ -3238,19 +3275,23 @@ class TestMalformedToolCallRetry(unittest.TestCase):
     def test_empty_response_still_triggers_rescue_not_retry(self):
         """An empty upstream response (issue #117 shape) goes to the
         empty-response rescue, not the malformed-tool-call retry — the
-        diagnose helper returns None for empty content."""
+        diagnose helper returns None for empty content.
+
+        With a shell tool available the rescue is the `pwd` tool call alone
+        and NO substitute assistant text, so `"Understood."` must NOT appear
+        on the streaming path either (the positive tool-only assertions live
+        in TestEmptyResponseDetection's non-streaming tests)."""
         responses = [
             self._resp(""),
         ]
         resp, calls = self._post_with_sequential_responses(
             responses, tools=[self._BASH_TOOL]
         )
-        # Only one upstream POST — no retry was triggered. The empty-
-        # response rescue handles this case (Understood. + pwd).
+        # Only one upstream POST — no retry was triggered.
         self.assertEqual(calls["count"], 1)
         chunks = self._chunks(resp)
         joined = self._content_joined(chunks)
-        self.assertIn("Understood.", joined)
+        self.assertNotIn("Understood.", joined)
 
     def test_retry_upstream_error_falls_through_to_bleed(self):
         """If the retry POST itself errors (timeout, non-2xx), the proxy

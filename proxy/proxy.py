@@ -260,6 +260,71 @@ _HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
         "you must `read` it first or the call fails. Don't create "
         "README/docs files unless asked."
     ),
+    # --- serena MCP (bundled reference MCP) ------------------------------
+    # opencode exposes an MCP server's tools as `<server>_<tool>`, so the
+    # serena reference MCP's tools arrive keyed `serena_*` (NOT the
+    # `mcp__serena__*` form the mock RESPONSE fixtures use — those are only
+    # ever substring-matched in tests, never executed by real opencode).
+    # These render only when serena is enabled AND opencode ships the tool
+    # for the turn (the `.get(name)` lookup is `None` otherwise, zero cost),
+    # so a disabled serena adds nothing to recency. Kept deliberately terse
+    # — the recency block is budget-constrained and serena ships many tools.
+    "serena_get_symbols_overview": (
+        "Top-level symbols of a file — orient here before reading the whole "
+        "file."
+    ),
+    "serena_find_symbol": (
+        "Locate a symbol by `name_path` (e.g. `Class/method`); set "
+        "`include_body` to get its code, else you get location only."
+    ),
+    "serena_find_referencing_symbols": (
+        "Find a symbol's callers/uses; run before renaming or deleting it."
+    ),
+    "serena_search_for_pattern": (
+        "Project-wide regex search; for symbol lookups prefer find_symbol."
+    ),
+    "serena_find_file": (
+        "Find files by name/glob; for file contents use search_for_pattern."
+    ),
+    "serena_list_dir": (
+        "List a directory; `recursive` walks subtrees, default one level."
+    ),
+    "serena_read_file": (
+        "Read a file by relative path; to read one symbol prefer "
+        "find_symbol with `include_body`."
+    ),
+    "serena_replace_symbol_body": (
+        "Replace a symbol's full body; exclude the signature line, don't "
+        "re-include it."
+    ),
+    "serena_insert_after_symbol": (
+        "Insert code right after a symbol's definition (e.g. a new method)."
+    ),
+    "serena_insert_before_symbol": (
+        "Insert code right before a symbol's definition (e.g. imports above "
+        "a class)."
+    ),
+    "serena_replace_content": (
+        "In-file find/replace (regex optional); for a whole symbol use "
+        "replace_symbol_body."
+    ),
+    "serena_create_text_file": (
+        "Create/overwrite a file — overwrites silently, so confirm it's new."
+    ),
+    "serena_execute_shell_command": (
+        "Run a shell command in the project (build/test/git); mutating "
+        "commands change real files."
+    ),
+    "serena_write_memory": (
+        "Save a project note for later sessions; one topic each, sparingly."
+    ),
+    "serena_read_memory": (
+        "Read a memory by name; call list_memories first if unsure."
+    ),
+    "serena_list_memories": (
+        "List saved memory names; cheap, call before read/write to avoid "
+        "guessing."
+    ),
 }
 
 # opencode builds the `task` tool's description by appending a dynamic agent
@@ -1599,14 +1664,18 @@ def _empty_response_rescue_text() -> str:
     well-formed response with no content and no tool calls. See
     architecture/proxy.md → "Empty-response detection" (issue #117).
 
+    Used ONLY as the no-shell-tool fallback. When a shell tool is exposed
+    the rescue is the `pwd` tool call from `_select_rescue_tool` alone (no
+    substitute text); this text is what keeps the response non-empty when
+    there is no tool to call.
+
     The trigger for the empty response is confined to the **most-recent**
     message slot — once a turn no longer carries the offending content the
     upstream returns to normal, even with the trigger still present further
     back in history. The text alone unsticks the upstream filter, but a
-    text-only response makes opencode end the turn (`finish_reason: stop`);
-    the *real* continuation comes from pairing this text with the rescue
-    bash/pwd call from `_select_rescue_tool` when a shell tool is
-    available."""
+    text-only response makes opencode end the turn (`finish_reason: stop`),
+    so it cannot auto-continue the loop — which is why the tool-call rescue
+    is preferred whenever a shell tool is available."""
     return "Understood."
 
 
@@ -2002,31 +2071,33 @@ def catch_all(path: str) -> Response:
         # the turn; the user types "continue" and the same content is still
         # the recency, so the same empty response keeps coming back.
         #
-        # The fix has two parts. (1) Substitute a minimal assistant text
-        # ("Understood.") so the response isn't empty. (2) If a shell tool
-        # is available in the inbound tools (`bash`/`Bash`), also emit a
-        # no-op call to it (running `pwd`) — that forces `finish_reason:
-        # tool_calls`, so opencode executes the tool and
-        # re-invokes the model with the tool result as the new recency,
-        # which displaces the filter-triggering content out of the hot
-        # slot and the next turn proceeds normally. Without the tool call
-        # the turn just ends at "Understood.", which the user observed in
-        # issue #117 — the upstream is unstuck but the agent loop stalls.
+        # The fix: if a shell tool is available in the inbound tools
+        # (`bash`/`Bash`), emit a no-op call to it (running `pwd`) — that
+        # forces `finish_reason: tool_calls`, so opencode executes the tool
+        # and re-invokes the model with the tool result as the new recency,
+        # which displaces the filter-triggering content out of the hot slot
+        # and the next turn proceeds normally. The tool call alone carries
+        # the rescue: the assistant text is left empty (a tool-only turn is
+        # well-formed), so no content-free filler line lands in the
+        # transcript. ONLY when no shell tool is exposed do we fall back to a
+        # minimal assistant text ("Understood.") so the response isn't empty
+        # — that still unsticks the upstream on the user's next prompt, just
+        # without the auto-continuation (the stall the user saw in #117).
         if not clean_text.strip() and not tool_call_payloads:
             finish_reason = _extract_finish_reason(target_json)
             rescue_payload = _select_rescue_tool(_collect_tool_names(tools))
             if rescue_payload is not None:
                 tool_call_payloads = [rescue_payload]
-                rescue_mode = f"text+tool({rescue_payload['name']})"
+                rescue_mode = f"tool({rescue_payload['name']})"
             else:
                 rescue_mode = "text-only"
+                clean_text = _empty_response_rescue_text()
             print(
                 f"[{req_id}] upstream returned empty content "
                 f"(finish_reason={finish_reason or 'unknown'}); "
                 f"substituting rescue [{rescue_mode}]",
                 flush=True,
             )
-            clean_text = _empty_response_rescue_text()
 
         # Compute prompt_tokens from the translated conversation directly.
         # Upstream's `prompt_tokens` is unreliable for context tracking against

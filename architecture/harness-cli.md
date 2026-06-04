@@ -244,6 +244,28 @@ is noise. Because these paths now `exit` instead of `exec`, the top-level
 `_reap_jq_sidecar` call is therefore a harmless idempotent no-op the second
 time.
 
+### Last-agent stack teardown (opt-in)
+
+`HARNESS_STOP_ON_LAST_AGENT=1` binds the shared stack's lifecycle to the
+agents'. After an **interactive** agent exits, `run_agent_interactive`
+counts the remaining agent containers for the project
+(`label=harness.project=<p> label=harness.agent=true`); the just-exited
+container is already gone (`--rm`), so a zero count means it was the last
+one, and the proxy + enabled MCPs are torn down via `cmd_down`.
+
+Default is **off** — the established model is "start once, launch many":
+`ensure_services_up` brings the stack up on the first launch and it persists
+so later launches hit the fast already-running path. With the flag on, each
+later launch re-starts the stack (cheap when images are already built;
+slower the first time MCP images must build). The flag is read at exit, so
+it can be set per-session or in `.env`. Scope notes: only interactive
+launches participate (`--print` agents are unlabeled, so they neither count
+nor trigger teardown — don't run print-mode agents concurrently with this
+flag set, or an interactive exit can stop the stack out from under them);
+the count is project-scoped, so concurrent interactive agents keep the stack
+up until the last one exits. This is the inverse of `cmd_down`'s own
+agent-stop sweep, which tears agents down when the *stack* goes down.
+
 ## Update-available banner
 
 `_update_check_and_banner` runs synchronously on every agent launch with
