@@ -53,6 +53,7 @@ jobs:
           base_branch: dev
           branch_prefix: 'agent/'
           claude_args: |
-            --model claude-opus-4-7
+            --model claude-opus-4-8
+            --effort high
             --dangerously-skip-permissions
             --allowedTools "Bash,Read,Edit,Write,MultiEdit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,NotebookRead,NotebookEdit"
