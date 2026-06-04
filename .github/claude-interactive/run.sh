@@ -63,6 +63,7 @@ log "claude: $CLAUDE_BIN $("$CLAUDE_BIN" --version 2>&1 | head -1)"
 mkdir -p "$HOME/.claude"
 cat > "$HOME/.claude/settings.json" <<EOF
 {
+  "skipDangerousModePermissionPrompt": true,
   "hooks": {
     "Stop": [
       { "matcher": "", "hooks": [ { "type": "command", "command": "touch '$DONE'" } ] }

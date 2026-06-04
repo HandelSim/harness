@@ -62,7 +62,7 @@ jobs:
         run: |
           n="${{ github.event.issue.number || github.event.inputs.issue_number }}"
           if [ -z "$n" ] && [ -f .github/claude-interactive/TEST_TRIGGER ]; then
-            n="$(tr -dc '0-9' < .github/claude-interactive/TEST_TRIGGER)"
+            n="$(head -n1 .github/claude-interactive/TEST_TRIGGER | tr -dc '0-9')"
           fi
           echo "ISSUE_NUMBER=$n" >> "$GITHUB_ENV"
 
