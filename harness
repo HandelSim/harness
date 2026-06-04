@@ -2811,16 +2811,15 @@ run_agent_interactive() {
     ah_host=$(harness_docker_path "$agent_home")
     alp_host=$(harness_docker_path "$allowlist_path")
 
-    docker_args+=(
-        # CWD bind-mounted at the same absolute host path inside the
-        # container. The agent's `pwd` then equals the host path the user
-        # launched from (e.g. /home/me/proj or /c/Users/you/proj).
-        -v "$mp_host:$mount_path"
-        -v "$ah_host:/home/harness"
-        # Universal firewall allowlist, read-only. The init script aborts the
-        # container if this is missing.
-        -v "$alp_host:/etc/harness/allowlist:ro"
-    )
+    # CWD bind-mounted at the same absolute host path inside the container,
+    # the harness home, and the read-only firewall allowlist. Emitted via
+    # harness_add_bind_mount so Windows gets the `--mount` form that survives
+    # MSYS/winpty path-list conversion (issue #112); Linux/macOS get `-v`.
+    harness_add_bind_mount docker_args "$mp_host" "$mount_path"
+    harness_add_bind_mount docker_args "$ah_host" "/home/harness"
+    # Universal firewall allowlist, read-only. The init script aborts the
+    # container if this is missing.
+    harness_add_bind_mount docker_args "$alp_host" "/etc/harness/allowlist" ro
     # Extra --mount entries land at their own host paths too. Docker handles
     # nested bind mounts (e.g. /c/user mounted alongside /c/user/handel)
     # by applying the more-specific mount within its target subtree.
@@ -2828,7 +2827,7 @@ run_agent_interactive() {
         local em em_host
         for em in "${extra_mounts[@]}"; do
             em_host=$(harness_docker_path "$em")
-            docker_args+=(-v "$em_host:$em")
+            harness_add_bind_mount docker_args "$em_host" "$em"
         done
     fi
     docker_args+=(
@@ -2923,16 +2922,17 @@ run_agent_print() {
 
     docker_args+=(
         -e "HARNESS_PRINT_MODE=1"
-        # See run_agent_interactive for why we mount at $mount_path.
-        -v "$mp_host:$mount_path"
-        -v "$ah_host:/home/harness"
-        -v "$alp_host:/etc/harness/allowlist:ro"
     )
+    # See run_agent_interactive for why we mount at $mount_path and why these
+    # go through harness_add_bind_mount (Windows `--mount` form, issue #112).
+    harness_add_bind_mount docker_args "$mp_host" "$mount_path"
+    harness_add_bind_mount docker_args "$ah_host" "/home/harness"
+    harness_add_bind_mount docker_args "$alp_host" "/etc/harness/allowlist" ro
     if (( ${#extra_mounts[@]} > 0 )); then
         local em em_host
         for em in "${extra_mounts[@]}"; do
             em_host=$(harness_docker_path "$em")
-            docker_args+=(-v "$em_host:$em")
+            harness_add_bind_mount docker_args "$em_host" "$em"
         done
     fi
     docker_args+=(
@@ -3089,12 +3089,13 @@ cmd_shell() {
         -e "HOST_GID=$(id -g)"
         -e "HARNESS_HOST_CWD=$mount_path"
         "${fw_args[@]}"
-        # CWD at its host path inside the container — same parity contract
-        # as run_agent_interactive.
-        -v "$mp_host:$mount_path"
-        -v "$ah_host:/home/harness"
-        -v "$alp_host:/etc/harness/allowlist:ro"
     )
+    # CWD at its host path inside the container — same parity contract as
+    # run_agent_interactive. harness_add_bind_mount emits the Windows
+    # `--mount` form that survives MSYS/winpty conversion (issue #112).
+    harness_add_bind_mount shell_args "$mp_host" "$mount_path"
+    harness_add_bind_mount shell_args "$ah_host" "/home/harness"
+    harness_add_bind_mount shell_args "$alp_host" "/etc/harness/allowlist" ro
     # Same host MCP reachability wiring as the agent launch, so `harness shell`
     # can reach an enabled host MCP (e.g. to curl it while debugging). No-op
     # when no host MCP is enabled.
@@ -3106,7 +3107,7 @@ cmd_shell() {
         local em em_host
         for em in "${resolved_mounts[@]}"; do
             em_host=$(harness_docker_path "$em")
-            shell_args+=(-v "$em_host:$em")
+            harness_add_bind_mount shell_args "$em_host" "$em"
         done
     fi
     shell_args+=(
@@ -5356,6 +5357,14 @@ cmd_doctor() {
         if dx_mp=$(harness_abs_path "$PWD" 2>/dev/null) && [[ -n "$dx_mp" ]]; then
             dx_w=$(harness_container_workdir "$dx_mp")
             doctor_check ok "container workdir" "$dx_mp (docker -w $dx_w)"
+            # Issue #112 (third failure mode): show the CWD bind-mount arg
+            # docker actually receives. On Windows this must be the single
+            # `--mount=type=bind,...` token, not `-v src:tgt` (which MSYS /
+            # winpty path-list-convert into `invalid mode: …`).
+            local dx_src dx_bind=()
+            dx_src=$(harness_docker_path "$dx_mp")
+            harness_add_bind_mount dx_bind "$dx_src" "$dx_mp"
+            doctor_check ok "container bind mount" "${dx_bind[*]}"
         else
             doctor_check warn "container workdir" "could not resolve \$PWD ($PWD)"
         fi

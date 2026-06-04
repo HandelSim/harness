@@ -435,6 +435,40 @@ harness_container_workdir() {
     echo "//${p}"
 }
 
+# Append one bind-mount's docker-run tokens to a caller-named array.
+# Issue #112 (third failure mode).
+#
+# On Linux/macOS this appends the classic two tokens `-v` and
+# `<src>:<tgt>[:ro]`. On Windows Git Bash that `-v src:tgt` composite is
+# destroyed by MSYS/winpty path-list conversion: the embedded `:` plus
+# forward slashes make the converter treat the whole arg as a PATH-style
+# list, rewrite each half to backslashed Windows form, and rejoin with `;`
+# → `C:\src;C:\tgt`. docker's volume parser then splits on `:`, sees three
+# fields, and rejects the trailing one as a mount mode (`invalid mode: …`).
+#
+# The `--mount type=bind,source=,target=` form is a single comma-delimited
+# token with no bare `:` for the converter to latch onto, so it survives
+# BOTH the wrapper's env-var toggles AND winpty (the env toggles alone are
+# not enough on the winpty path — see harness_docker_winpty). The source is
+# kept in Windows mixed form (`C:/...`, from harness_docker_path) because
+# Docker Desktop's WSL2 backend mounts that reliably where a raw `/c/...`
+# source can come up empty — the same reason harness_docker_path exists.
+#
+# Args: <array_name> <host_src> <container_target> [ro]
+harness_add_bind_mount() {
+    local -n _arr="$1"
+    local src="$2" tgt="$3" ro="${4:-}"
+    if [[ "$(harness_detect_os)" == "windows" ]]; then
+        local spec="type=bind,source=${src},target=${tgt}"
+        [[ "$ro" == "ro" ]] && spec+=",readonly"
+        _arr+=("--mount=$spec")
+    else
+        local vol="${src}:${tgt}"
+        [[ "$ro" == "ro" ]] && vol+=":${ro}"
+        _arr+=(-v "$vol")
+    fi
+}
+
 # Validate a user-supplied --mount path. The path must resolve (relative
 # paths are accepted), must exist as a directory, and must not shadow
 # in-container infrastructure the harness depends on (/etc, /usr, the
