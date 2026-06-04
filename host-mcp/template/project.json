@@ -1,0 +1,12 @@
+{
+  "name": "__MCP_NAME__",
+  "host": "0.0.0.0",
+  "port": __MCP_PORT__,
+  "project_dir": "C:/path/to/your/project",
+  "build_dir": "build",
+  "generator": "Visual Studio 17 2022",
+  "config": "Debug",
+  "targets": [],
+  "max_output_bytes": 60000,
+  "timeout_seconds": 1800
+}

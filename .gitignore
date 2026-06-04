@@ -9,6 +9,13 @@
 # and the .harness-runtime.yml compose override.
 state/
 
+# Host MCP instances scaffolded by `harness mcp host-init` live under
+# host-mcp/<name>/ (in prod install_root == the repo). They are user-specific
+# build servers, not part of the repo — ignore them, but keep the git-tracked
+# template they are copied from.
+/host-mcp/*
+!/host-mcp/template/
+
 # harness is distributed via direct git clone — no zip build artifact.
 
 # Python / editor / OS

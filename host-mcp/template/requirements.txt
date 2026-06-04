@@ -1,0 +1,4 @@
+# Host build MCP dependencies.
+# The MCP Python SDK provides mcp.server.fastmcp.FastMCP and the
+# streamable-http transport. Pin/raise as needed; verify with `pip show mcp`.
+mcp>=1.27
