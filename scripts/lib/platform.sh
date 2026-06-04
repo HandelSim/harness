@@ -133,17 +133,32 @@ harness_runtime_is_podman() {
 
 # === Container runtime invocation wrappers ===
 #
-# Git Bash on Windows (MSYS) auto-translates UNIX-style paths in arguments
-# when calling native Windows binaries like docker.exe. That is fine for
-# host paths (/c/Users/foo becomes C:\Users\foo, which docker can mount)
-# but breaks for *container-internal* arguments like `--entrypoint /bin/bash`
-# (which gets mangled to C:/Program Files/Git/usr/bin/bash, a path that
-# doesn't exist inside the container).
+# Git Bash on Windows (MSYS) rewrites Unix-form path arguments to Windows
+# form when calling native `.exe` binaries: `/c/Users/foo` in argv becomes
+# `C:/Users/foo`, and the `-v C:/foo:/c/foo` composite is treated as a
+# path *list* and joined with `;`, producing `C:\foo;C:\foo`. That breaks
+# both `-w` (Linux daemon rejects a non-Linux absolute path) and `-v`
+# (docker's volume parser sees the `;` and reports `invalid mode: …`).
+# See architecture/harness-cli.md "Windows container working directory —
+# issue #112" for the full failure mode.
 #
-# harness_docker wraps the runtime call with MSYS_NO_PATHCONV=1 on Windows
-# so that no path translation happens. Use this any time runtime args
-# include an in-container UNIX path. On Linux/macOS this is a transparent
-# passthrough.
+# To suppress conversion, MSYS_NO_PATHCONV=1 AND MSYS2_ARG_CONV_EXCL='*'
+# must both be in *bash's own* environment at the moment it execs the
+# child — the inline `VAR=val cmd` prefix in some MSYS versions sets the
+# child env after conversion already ran, so it does not reliably suppress
+# the rewrite. Using `local -x` (or plain `export` in the exec helper)
+# puts the variables in bash's env during the function body, which is
+# what MSYS consults during argv conversion. Auto-restored on function
+# return so the rest of the shell environment is unaffected.
+#
+# MSYS_NO_PATHCONV is the older Git for Windows toggle (covers most
+# single-path conversions). MSYS2_ARG_CONV_EXCL='*' is the modern MSYS2
+# escape hatch that additionally covers path-LIST conversion (the `-v
+# src:tgt` failure mode). Setting both makes the wrapper safe across
+# every Git for Windows / MSYS2 vintage we have field reports for.
+#
+# Use this any time runtime args include an in-container UNIX path. On
+# Linux/macOS this is a transparent passthrough.
 #
 # Despite the name, this wrapper routes through whichever container runtime
 # harness_container_runtime resolved (docker or podman). The name is kept as
@@ -166,7 +181,9 @@ harness_docker() {
     local rt
     rt=$(harness_container_runtime)
     if [[ "$(harness_detect_os)" == "windows" ]]; then
-        MSYS_NO_PATHCONV=1 "$rt" "$@"
+        local -x MSYS_NO_PATHCONV=1
+        local -x MSYS2_ARG_CONV_EXCL='*'
+        "$rt" "$@"
     else
         "$rt" "$@"
     fi
@@ -177,14 +194,17 @@ harness_docker() {
 # (run_agent_print's foreground launch, attach paths, etc.) so that
 # signals and exit codes flow through cleanly. `exec harness_docker ...`
 # does not work because `exec` requires an external program, not a shell
-# function — calling this helper instead preserves exec semantics by
-# wrapping `env MSYS_NO_PATHCONV=1 <runtime>` into the exec'd process on
-# Windows.
+# function — calling this helper instead preserves exec semantics. On
+# Windows the same MSYS conversion suppression as `harness_docker` is
+# applied via plain `export` (the function never returns, so there's
+# nothing to restore).
 harness_docker_exec() {
     local rt
     rt=$(harness_container_runtime)
     if [[ "$(harness_detect_os)" == "windows" ]]; then
-        exec env MSYS_NO_PATHCONV=1 "$rt" "$@"
+        export MSYS_NO_PATHCONV=1
+        export MSYS2_ARG_CONV_EXCL='*'
+        exec "$rt" "$@"
     else
         exec "$rt" "$@"
     fi
@@ -223,7 +243,13 @@ harness_runtime_tty_ok() {
     local image="$1" rt
     [[ -n "$image" ]] || return 1
     rt=$(harness_container_runtime)
-    MSYS_NO_PATHCONV=1 "$rt" run --rm -it --entrypoint true "$image" >/dev/null 2>&1
+    if [[ "$(harness_detect_os)" == "windows" ]]; then
+        local -x MSYS_NO_PATHCONV=1
+        local -x MSYS2_ARG_CONV_EXCL='*'
+        "$rt" run --rm -it --entrypoint true "$image" >/dev/null 2>&1
+    else
+        "$rt" run --rm -it --entrypoint true "$image" >/dev/null 2>&1
+    fi
 }
 
 # True if winpty is on PATH (ships with Git for Windows).
@@ -238,7 +264,11 @@ harness_winpty_available() {
 harness_docker_winpty() {
     local rt
     rt=$(harness_container_runtime)
-    MSYS_NO_PATHCONV=1 winpty "$rt" "$@"
+    # Windows-only path (winpty isn't on Linux/macOS). Same MSYS conversion
+    # suppression as harness_docker — see that helper's comment block.
+    local -x MSYS_NO_PATHCONV=1
+    local -x MSYS2_ARG_CONV_EXCL='*'
+    winpty "$rt" "$@"
 }
 
 # Pure decision: pick the interactive TTY strategy from explicit facts. No I/O,
@@ -380,19 +410,15 @@ harness_abs_path() {
 # Escape a container working-directory path so MSYS does not rewrite it
 # during the docker.exe argv conversion on Windows Git Bash. Issue #112.
 #
-# Bash on MSYS converts `/c/Users/foo`-shape argv to `C:/Users/foo` before
-# the child docker.exe starts (the inline `MSYS_NO_PATHCONV=1` prefix on
-# `harness_docker` / `harness_docker_winpty` reaches the child's env, but
-# the conversion has already happened in bash by then). The Linux docker
-# daemon then rejects `-w C:/Users/foo` with *"the working directory is
-# invalid, it needs to be an absolute path"* — it is not a Linux absolute
-# path. MSYS leaves args starting with `//` alone (UNC-style escape), and
-# Linux normalises a leading `//foo` to `/foo` on chdir, so the container
-# working directory still matches the bind-mount target.
-#
-# Only the `-w` arg trips this — the bind-mount source is already in
-# Windows form (`harness_docker_path`), and `-v src:tgt` is not a single
-# unix-looking arg so MSYS leaves it alone.
+# Defense-in-depth for the `-w` arg: `harness_docker` /
+# `harness_docker_winpty` now `local -x`-export both MSYS_NO_PATHCONV=1
+# AND MSYS2_ARG_CONV_EXCL='*' so MSYS skips argv conversion on the whole
+# call, which is the actual root-cause fix. This helper remains because
+# the `//`-prefix UNC escape works independently of the env-var toggle
+# (MSYS unconditionally leaves args starting with `//` alone) and keeps
+# the `-w` arg safe if a future MSYS vintage stops honouring those vars.
+# Linux's chdir collapses a leading `//foo` to `/foo` on entry, so the
+# container's working directory still matches the bind-mount target.
 #
 # Args: <unix-form abs path>
 # Echoes: same path on Linux/macOS; `//c/...` form on Windows.
