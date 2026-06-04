@@ -616,9 +616,20 @@ mcp_meta_file() {
     printf '%s/%s/harness-meta.json' "$mcp_active_dir" "$1"
 }
 
-# True iff an MCP is installed (i.e., has compose.yml in the active tree).
+# True iff an MCP is installed. An installed entry has EITHER a compose.yml
+# (a normal container MCP) OR a client-config.json (a host MCP, which runs as
+# a process on the host and has no compose snippet — see mcp_is_host). data/
+# survives uninstall, so a bare-directory check would refuse a clean re-install.
 mcp_is_installed() {
-    [[ -f "$mcp_active_dir/$1/compose.yml" ]]
+    [[ -f "$mcp_active_dir/$1/compose.yml" || -f "$mcp_active_dir/$1/client-config.json" ]]
+}
+
+# True iff an MCP is a "host MCP": it has a client-config.json (so it is wired
+# into the agent's MCP config) but NO compose.yml (so harness does not manage a
+# container for it — the user runs the server on the host). The agent reaches it
+# at the host.docker.internal URL recorded in its client-config.json.
+mcp_is_host() {
+    [[ ! -f "$mcp_active_dir/$1/compose.yml" && -f "$mcp_active_dir/$1/client-config.json" ]]
 }
 
 # True iff an MCP is enabled. Returns 0 when meta file is missing so legacy
@@ -3002,6 +3013,8 @@ list_active_entries() {
 # we find inside the snippet.
 mcp_runtime_status() {
     local name="$1"
+    # Host MCPs run as a process on the host, not a container harness can see.
+    if mcp_is_host "$name"; then printf -- 'host (run on host)'; return; fi
     local compose_file="$mcp_active_dir/$name/compose.yml"
     [[ -f "$compose_file" ]] || { printf -- '-'; return; }
     if ! harness_docker info >/dev/null 2>&1; then
@@ -3080,6 +3093,17 @@ subcommands:
   down <name>                   stop an installed MCP container
   logs <name>                   follow logs for a single MCP
   status <name>                 per-MCP diagnostic
+  host-init <name> [--port <port>] [--force]
+                                scaffold a HOST MCP (a build server that runs on
+                                  the host, not in a container — e.g. MSVC/CMake
+                                  on Windows) from the in-repo template and
+                                  register it so agents get its URL. Default
+                                  port 9100. No compose.yml; you run the server
+                                  on the host. up/down/logs do not apply.
+  host-setup <name> [agent flags...]
+                                launch an agent inside the host MCP's folder so
+                                  it reads AGENTS.md and helps you tailor the
+                                  server (server.py + project.json).
 
 state diagram:
   available --install/register--> installed-enabled <-> installed-disabled
@@ -3978,6 +4002,12 @@ cmd_mcp_up() {
         err "$name is not installed"
         exit 1
     fi
+    if mcp_is_host "$name"; then
+        err "$name is a host MCP — harness does not manage a container for it."
+        err "start it on the host with the run script in $install_root/host-mcp/$name/"
+        err "(run.ps1 on Windows, run.sh on Linux/macOS)."
+        exit 1
+    fi
     require_docker
 
     local svc_list=()
@@ -4034,6 +4064,11 @@ cmd_mcp_down() {
         err "$name is not installed"
         exit 1
     fi
+    if mcp_is_host "$name"; then
+        err "$name is a host MCP — harness does not manage a container for it."
+        err "stop it on the host where you launched the run script (Ctrl+C)."
+        exit 1
+    fi
     require_docker
 
     local svc_list=()
@@ -4084,6 +4119,11 @@ cmd_mcp_logs() {
     fi
     if ! mcp_is_installed "$name"; then
         err "$name is not installed"
+        exit 1
+    fi
+    if mcp_is_host "$name"; then
+        err "$name is a host MCP — harness does not manage a container for it."
+        err "its logs are in the terminal on the host where you ran the run script."
         exit 1
     fi
     require_docker
@@ -4160,6 +4200,21 @@ cmd_mcp_status() {
     printf 'enabled:   %s\n' "$enabled"
     printf 'runtime:   %s\n' "$runtime"
     printf 'install:   %s\n' "$mcp_active_dir/$name"
+
+    # Host MCPs have no compose snippet and no container — surface the
+    # transport, the URL the agent uses, and where the server source lives
+    # instead of the (nonexistent) services/data dirs.
+    if mcp_is_host "$name"; then
+        local url
+        url=$(harness_jq -r '(.mcpServers // {}) | to_entries | (.[0].value.url // "")' \
+            "$mcp_active_dir/$name/client-config.json" 2>/dev/null || true)
+        printf 'transport: host (process on the host; not a container)\n'
+        printf 'endpoint:  %s\n' "${url:-(unknown)}"
+        printf 'project:   %s\n' "$install_root/host-mcp/$name"
+        printf 'launch:    run.ps1 (Windows) / run.sh (Linux/macOS) in that folder\n'
+        return
+    fi
+
     printf 'data:      %s\n' "$mcp_active_dir/$name/data"
     if [[ -f "$registry_dir/$name/compose.yml" ]]; then
         printf 'origin:    registry (%s)\n' "$registry_dir/$name"
@@ -4171,6 +4226,177 @@ cmd_mcp_status() {
     local svcs
     svcs=$(mcp_services_of "$name" | paste -sd, -)
     printf 'services:  %s\n' "${svcs:-(none)}"
+}
+
+# --- host MCP (non-container) -----------------------------------------------
+#
+# A "host MCP" runs as a plain process ON THE HOST (e.g. a Windows machine with
+# Visual Studio) and exposes build/test/run tools the containerized agent calls
+# over HTTP at host.docker.internal:<port>/mcp. It is NOT a docker service: it
+# has no compose.yml, so `harness start`/`up`/`down`/`logs` never touch it. It
+# is registered as a client-config-only entry under state/mcp/<name>/ — the
+# agent-config merge keys off client-config.json presence (not compose.yml), so
+# the URL is wired into every agent launched after registration.
+#
+# Validate a host MCP name as a safe directory + service token. Rejects path
+# traversal (no '/' or '.'), the reserved template dir, and bad first chars.
+_mcp_host_validate_name() {
+    local name="$1"
+    if ! [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+        err "invalid name '$name'; use lowercase letters, digits, '-' and '_' (must start alphanumeric)"
+        return 1
+    fi
+    if [[ "$name" == "template" ]]; then
+        err "'template' is reserved (it is the source scaffold under host-mcp/)"
+        return 1
+    fi
+    return 0
+}
+
+# host-init: scaffold a host MCP from the in-repo template and register it.
+cmd_mcp_host_init() {
+    local name="" port="" force=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --port)   shift; port="${1:-}" ;;
+            --port=*) port="${1#--port=}" ;;
+            --force)  force=1 ;;
+            -*)       err "unknown flag '$1'"; exit 1 ;;
+            *)
+                if [[ -z "$name" ]]; then
+                    name="$1"
+                else
+                    err "unexpected extra argument '$1'"; exit 1
+                fi
+                ;;
+        esac
+        shift
+    done
+    if [[ -z "$name" ]]; then
+        err "usage: harness mcp host-init <name> [--port <port>] [--force]"
+        exit 1
+    fi
+    _mcp_host_validate_name "$name" || exit 1
+
+    local tmpl="$clone_dir/host-mcp/template"
+    if [[ ! -d "$tmpl" ]]; then
+        err "host MCP template not found at $tmpl"
+        exit 1
+    fi
+
+    # Default port. The MCP streamable-http default is 8000; pick 9100 to dodge
+    # common dev servers, and let --port override.
+    port="${port:-9100}"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        err "invalid --port '$port'; must be 1-65535"
+        exit 1
+    fi
+
+    local inst="$install_root/host-mcp/$name"
+    local reg="$mcp_active_dir/$name"
+
+    if mcp_is_installed "$name" && (( ! force )); then
+        err "$name is already registered (use --force to overwrite its registration)"
+        exit 1
+    fi
+    if [[ -d "$inst" ]] && (( ! force )); then
+        err "instance dir already exists: $inst (use --force to re-scaffold; this overwrites server.py/project.json)"
+        exit 1
+    fi
+
+    # Scaffold: copy the template, then substitute the name/port placeholders
+    # in the files that carry them. sed-to-temp + mv (no -i) for GNU/BSD
+    # portability; name+port are validated above, so they're sed-safe.
+    mkdir -p "$inst"
+    local f
+    for f in "$tmpl"/* "$tmpl"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        cp -a "$f" "$inst/"
+    done
+    local base target subst
+    for base in server.py project.json; do
+        target="$inst/$base"
+        [[ -f "$target" ]] || continue
+        subst="$target.tmp.$$"
+        sed -e "s/__MCP_NAME__/$name/g" -e "s/__MCP_PORT__/$port/g" "$target" >"$subst"
+        mv "$subst" "$target"
+    done
+
+    # Register a client-config-only entry (no compose.yml ⇒ mcp_is_host). The
+    # agent-config merge keys off client-config.json, so this wires the URL
+    # into every agent launched after now. Atomic writes (temp + mv).
+    mkdir -p "$reg"
+    local cc="$reg/client-config.json" meta="$reg/harness-meta.json"
+    local cc_tmp="$cc.tmp.$$" meta_tmp="$meta.tmp.$$"
+    cat >"$cc_tmp" <<EOF
+{
+  "mcpServers": {
+    "$name": {
+      "url": "http://host.docker.internal:$port/mcp"
+    }
+  }
+}
+EOF
+    mv "$cc_tmp" "$cc"
+    cat >"$meta_tmp" <<EOF
+{
+  "enabled": true,
+  "transport": "host",
+  "host_port": $port,
+  "allowed_domains": ["host.docker.internal"]
+}
+EOF
+    mv "$meta_tmp" "$meta"
+
+    cat <<EOF
+host MCP registered: $name
+  endpoint (agent -> host): http://host.docker.internal:$port/mcp
+  server source:            $inst
+  registration:             $reg
+
+next:
+  1. tailor the server with an agent that reads its AGENTS.md:
+       harness mcp host-setup $name
+  2. let the agent reach the host (run once):
+       harness net allow host.docker.internal
+     (Linux hosts also need --add-host=host.docker.internal:host-gateway on the
+      agent container; on Docker Desktop / Windows the name resolves on its own.)
+  3. on the HOST, start the server and keep it running while you work:
+       Windows:     cd "$inst"; ./run.ps1   (from a Developer PowerShell for VS 2022)
+       Linux/macOS: cd "$inst" && ./run.sh
+  4. start the stack ('harness', or 'harness restart' if already up); agents
+     launched after step 1 will see this MCP in their config.
+EOF
+}
+
+# host-setup: launch an agent INSIDE the host MCP's instance folder so opencode
+# auto-loads its AGENTS.md and helps the user tailor server.py + project.json.
+cmd_mcp_host_setup() {
+    local name="${1:-}"
+    if [[ -z "$name" || "$name" == -* ]]; then
+        err "usage: harness mcp host-setup <name> [agent flags...]"
+        exit 1
+    fi
+    shift
+    _mcp_host_validate_name "$name" || exit 1
+
+    local inst="$install_root/host-mcp/$name"
+    if [[ ! -d "$inst" ]]; then
+        err "no host MCP scaffold at $inst"
+        err "create one first: harness mcp host-init $name"
+        exit 1
+    fi
+    if [[ ! -f "$inst/AGENTS.md" ]]; then
+        err "$inst has no AGENTS.md; re-scaffold with: harness mcp host-init $name --force"
+        exit 1
+    fi
+
+    # run_agent bind-mounts $PWD and sets it as the workdir; opencode auto-reads
+    # AGENTS.md from cwd. cd into the instance folder (same shell process, so
+    # the change is visible to run_agent), then launch the agent normally.
+    cd "$inst" || { err "cannot enter $inst"; exit 1; }
+    echo "launching setup agent in $inst (it will read AGENTS.md)..." >&2
+    run_agent opencode "$@"
 }
 
 cmd_mcp() {
@@ -4188,6 +4414,8 @@ cmd_mcp() {
         down)           cmd_mcp_down "$@" ;;
         logs)           cmd_mcp_logs "$@" ;;
         status)         cmd_mcp_status "$@" ;;
+        host-init)      cmd_mcp_host_init "$@" ;;
+        host-setup)     cmd_mcp_host_setup "$@" ;;
         *)
             err "unknown mcp subcommand '$sub'"
             cmd_mcp_help >&2

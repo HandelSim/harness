@@ -85,6 +85,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Test / bench | `test`, `benchmark` |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
 | MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
+| MCP (host, non-container) | `mcp host-init`, `mcp host-setup` — scaffold + register a host build MCP (a process on the host, e.g. MSVC/CMake) and launch the agent that tailors it. See [`mcp.md`](mcp.md) "Host MCPs". `host-setup` `cd`s into `host-mcp/<name>/` and calls the normal `run_agent` so opencode auto-loads that folder's `AGENTS.md`. |
 
 ### Bare `harness` launches the agent
 

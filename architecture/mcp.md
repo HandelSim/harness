@@ -70,6 +70,8 @@ both install and register — there is no separate `unregister`.
 | `harness mcp logs <name>`             | `compose logs -f` for the MCP's services. |
 | `harness mcp status <name>`           | Print state, enabled flag, runtime status, paths, services. |
 | `harness mcp list [--available]`      | Installed (and registry-not-yet-installed with `--available`). |
+| `harness mcp host-init <name> [--port <port>] [--force]` | Scaffold a **host MCP** from `host-mcp/template/` into `host-mcp/<name>/` and register a client-config-only entry. Default port `9100`. See [Host MCPs](#host-mcps-non-container). |
+| `harness mcp host-setup <name> [agent flags...]` | Launch an agent inside `host-mcp/<name>/` so it reads that folder's `AGENTS.md` and tailors the server with the user. |
 
 ## State storage: `harness-meta.json`
 
@@ -79,9 +81,17 @@ both install and register — there is no separate `unregister`.
 {"enabled": true | false, "repo_clone_url": "...", "repo_clone_ref": "..."}
 ```
 
-`mcp_is_installed(name)` is "compose.yml exists in the active tree" —
-not "the directory exists". `data/` survives uninstall, so a directory-
-existence check would refuse a clean re-install after an uninstall.
+`mcp_is_installed(name)` is "compose.yml **or** client-config.json exists
+in the active tree" — not "the directory exists". The compose.yml arm
+covers normal container MCPs; the client-config.json arm covers host MCPs
+(see [Host MCPs](#host-mcps-non-container) below), which have no compose
+snippet. `data/` survives uninstall, so a directory-existence check would
+refuse a clean re-install after an uninstall.
+
+`mcp_is_host(name)` is "client-config.json present **and** compose.yml
+absent" — the test that distinguishes a host MCP from a container MCP. It
+gates the `up`/`down`/`logs` host-message guards and the `status` transport
+block.
 
 `mcp_is_enabled(name)` returns true when the meta file is missing so
 legacy installs from before this metadata existed continue to behave as
@@ -226,9 +236,75 @@ what they actually want. This is deliberate: MCPs are third-party code,
 and the security posture is "the operator explicitly opens the egress
 they need."
 
+## Host MCPs (non-container)
+
+A **host MCP** runs as a plain process on the host machine, not in a
+container harness manages. The motivating case: a harness agent runs in a
+Linux container but the project needs a host-only toolchain to build (e.g.
+Visual Studio / MSVC / CMake on Windows). The agent edits the source (the
+project is bind-mounted into the container) and calls build/test/run tools
+over HTTP at `http://host.docker.internal:<port>/mcp`; the host process runs
+the real compiler and returns the output.
+
+**It is not a docker service.** A host MCP's `state/mcp/<name>/` has a
+`client-config.json` and a `harness-meta.json` but **no `compose.yml`**. The
+absence of `compose.yml` is the whole mechanism:
+
+- The client-config merge (`write_agent_mcp_config`) enumerates by
+  `client-config.json` presence (+ `mcp_is_enabled`), so the host MCP's URL is
+  wired into every agent launched after registration — automatically, with no
+  new code. The URL form (`{"url": "..."}`, no `command`) makes the agent
+  entrypoint translate it to opencode's `{"type": "remote", ...}`.
+- `mcp_compose_files` / `any_mcp_active` require `compose.yml`, so a host MCP
+  is invisible to `harness start`'s compose merge and profile decision — harness
+  never tries to bring up a container for it.
+- `mcp_is_installed` was broadened to "compose.yml OR client-config.json" so a
+  host MCP counts as installed (shows in `list`/`status`, blocks a name clash).
+- `mcp_is_host` ("client-config.json present, compose.yml absent") gates the
+  `up`/`down`/`logs` guards (they print "this is a host MCP, run it on the host"
+  and exit) and the `status` transport block (which prints the endpoint URL and
+  the instance folder instead of services/data).
+
+**Two directories per host MCP:**
+
+- `host-mcp/<name>/` — the server source (copied from `host-mcp/template/`,
+  with `__MCP_NAME__`/`__MCP_PORT__` substituted). In production
+  `install_root == clone_dir`, so this lives in the repo; it is **gitignored**
+  (`/host-mcp/*` with `!/host-mcp/template/`) because each instance is
+  user-specific. This is what the user runs on the host and what `host-setup`
+  bind-mounts for the tailoring agent.
+- `state/mcp/<name>/` — the registration (`client-config.json` +
+  `harness-meta.json`, `transport: "host"`, `host_port`,
+  `allowed_domains: ["host.docker.internal"]`). No `data/`, no `compose.yml`.
+
+**The template** (`host-mcp/template/`, git-tracked) is a FastMCP
+streamable-http server (`mcp.server.fastmcp.FastMCP`, endpoint `/mcp`) with
+stub CMake/CTest build tools, a `project.json`, `run.ps1`/`run.sh` launchers,
+`requirements.txt`, and an `AGENTS.md` that briefs the `host-setup` agent on
+how to interview the user and prune the tools.
+
+**Setup flow** (the goal is one short, guided path):
+
+1. `harness mcp host-init <name> [--port <port>]` — scaffold + register.
+2. `harness mcp host-setup <name>` — agent reads `AGENTS.md`, tailors
+   `server.py` + `project.json` with the user.
+3. `harness net allow host.docker.internal` — open egress so the agent
+   container can reach the host. On **Linux** hosts the agent container also
+   needs `--add-host=host.docker.internal:host-gateway`; on Docker Desktop /
+   Windows that name resolves automatically.
+4. Run the server on the host (`run.ps1` / `run.sh`) and keep it up.
+
+**Uninstall** removes `state/mcp/<name>/` (the registration); the container-
+teardown step is gated on `compose.yml` so it is skipped. The `host-mcp/<name>/`
+server source is **left in place** (it is the user's customized code; remove it
+by hand if you want it gone). `harness upgrade`'s `directory_overwrite` only
+fires for registry-sourced entries, so it never touches a host MCP.
+
 ## Adding a new MCP
 
-Currently supported: HTTP/SSE MCPs in Docker containers (Pattern A).
+Currently supported: HTTP/SSE MCPs in Docker containers (Pattern A), and
+**host MCPs** (non-container processes on the host — see
+[Host MCPs](#host-mcps-non-container)).
 
 - **Vetted / shared:** fork the repo and add `mcp-registry/<name>/`
   containing the four files listed above (see `mcp-registry/serena/` as the
