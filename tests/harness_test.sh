@@ -2159,7 +2159,13 @@ if (( t29b_rc != 0 )); then
     echo "[harness-test] T29 FAIL [#76]: run_agent_interactive errored on repeat same-dir launch (rc=${t29b_rc})" >&2
     cat "${t29_calls}" >&2; exit 1
 fi
-t29_runs=$(grep -c . "${t29_calls}" || true)
+# Count only the actual `docker run` launches. run_agent_interactive now also
+# calls stop_stack_if_last_agent on exit (#94b2b20), which fires several more
+# harness_docker calls (ps/info/compose down) per launch; those are recorded by
+# the stub too, so a bare line count would be the launch count times the
+# per-launch call count. The run launches are the lines carrying the container
+# --name.
+t29_runs=$(grep -c -- '--name harness-opencode-' "${t29_calls}" || true)
 if (( t29_runs != 2 )); then
     echo "[harness-test] T29 FAIL [#76,F055]: expected 2 interactive launches to reach docker run, got ${t29_runs}" >&2
     cat "${t29_calls}" >&2; exit 1
