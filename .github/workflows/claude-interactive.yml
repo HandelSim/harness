@@ -1,0 +1,60 @@
+name: Claude (interactive)
+
+# Interactive replacement for the `claude -p` GitHub Action. Drives a genuine
+# interactive Claude Code REPL in tmux so usage bills against the subscription
+# interactive pool rather than the capped Agent SDK monthly credit.
+#
+# NOTE: `issues` / `issue_comment` triggers only run from the DEFAULT branch.
+# While this lives on `dev`, exercise it with `workflow_dispatch` (it accepts an
+# issue_number input). It becomes the live issue handler only once merged to the
+# default branch, at which point the old `claude.yml` should be removed to avoid
+# a double response.
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to respond to"
+        required: true
+  issues:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: claude-int-${{ github.event.issue.number || github.event.inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  claude:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.sender.type != 'Bot' &&
+        (
+          (github.event_name == 'issues' &&
+            contains(github.event.issue.body, '@claude')) ||
+          (github.event_name == 'issue_comment' &&
+            contains(github.event.comment.body, '@claude'))
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+
+      - name: Respond via interactive Claude
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ secrets.CLAUDE_WORKFLOW_PAT }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+          CLAUDE_MODEL: claude-opus-4-7
+        run: bash .github/claude-interactive/run.sh
