@@ -3042,13 +3042,13 @@ class TestMalformedToolCallRetry(unittest.TestCase):
         """Drive the catch_all flow with a queue of `responses` — each
         FakeResp is dequeued on successive `requests.post` calls. Returns
         (flask_response, post_call_count)."""
-        ollama_request = {
+        request_body = {
             "model": "GenAI",
             "messages": messages or [{"role": "user", "content": "hello"}],
             "stream": False,
         }
         if tools is not None:
-            ollama_request["tools"] = tools
+            request_body["tools"] = tools
 
         calls = {"count": 0, "payloads": []}
 
@@ -3067,8 +3067,8 @@ class TestMalformedToolCallRetry(unittest.TestCase):
         with patch.object(proxy.requests, "post", side_effect=fake_post):
             with patch.object(proxy, "save_debug_file"):
                 resp = client.post(
-                    "/api/chat",
-                    data=json.dumps(ollama_request),
+                    "/v1/chat/completions",
+                    data=json.dumps(request_body),
                     content_type="application/json",
                 )
         return resp, calls
@@ -3088,24 +3088,14 @@ class TestMalformedToolCallRetry(unittest.TestCase):
                 }
         return FakeResp()
 
-    def _chunks(self, resp):
-        return [
-            json.loads(l)
-            for l in resp.get_data(as_text=True).split("\n")
-            if l.strip()
-        ]
+    def _body(self, resp):
+        return json.loads(resp.get_data(as_text=True))
 
-    def _content_joined(self, chunks):
-        return "".join(
-            (c.get("message") or {}).get("content") or "" for c in chunks
-        )
+    def _content(self, body):
+        return body["choices"][0]["message"].get("content") or ""
 
-    def _tool_calls(self, chunks):
-        out = []
-        for c in chunks:
-            tcs = (c.get("message") or {}).get("tool_calls") or []
-            out.extend(tcs)
-        return out
+    def _tool_calls(self, body):
+        return body["choices"][0]["message"].get("tool_calls") or []
 
     def test_malformed_fence_recovered_on_retry(self):
         """The exact issue #121 shape: first response is the bare broken
@@ -3125,11 +3115,11 @@ class TestMalformedToolCallRetry(unittest.TestCase):
             responses, tools=[self._TODOWRITE_TOOL]
         )
         self.assertEqual(calls["count"], 2, "must POST twice (bad + retry)")
-        chunks = self._chunks(resp)
-        tcs = self._tool_calls(chunks)
+        body = self._body(resp)
+        tcs = self._tool_calls(body)
         self.assertEqual(len(tcs), 1)
         self.assertEqual(tcs[0]["function"]["name"], "todowrite")
-        joined = self._content_joined(chunks)
+        joined = self._content(body)
         # The broken fence and the proxy's corrective scaffolding must
         # NOT bleed into the assistant content the user sees.
         self.assertNotIn("json_parse_or_id", joined)
@@ -3156,12 +3146,12 @@ class TestMalformedToolCallRetry(unittest.TestCase):
             responses, tools=[self._WRITE_TOOL]
         )
         self.assertEqual(calls["count"], 2)
-        chunks = self._chunks(resp)
-        tcs = self._tool_calls(chunks)
+        body = self._body(resp)
+        tcs = self._tool_calls(body)
         self.assertEqual(len(tcs), 1)
         self.assertEqual(tcs[0]["function"]["name"], "write")
         self.assertEqual(
-            tcs[0]["function"]["arguments"]["content"], "a\\x1eb"
+            json.loads(tcs[0]["function"]["arguments"])["content"], "a\\x1eb"
         )
 
     def test_retry_carries_assistant_bad_and_user_correction(self):
@@ -3208,10 +3198,10 @@ class TestMalformedToolCallRetry(unittest.TestCase):
         )
         # Exactly two upstream calls — no third attempt.
         self.assertEqual(calls["count"], 2)
-        chunks = self._chunks(resp)
-        self.assertEqual(self._tool_calls(chunks), [])
+        body = self._body(resp)
+        self.assertEqual(self._tool_calls(body), [])
         # Bleed: the bad text reaches opencode as assistant content.
-        joined = self._content_joined(chunks)
+        joined = self._content(body)
         self.assertIn("json_parse_or_id", joined)
 
     def test_retry_recovers_with_pure_text_response(self):
@@ -3226,9 +3216,9 @@ class TestMalformedToolCallRetry(unittest.TestCase):
             responses, tools=[self._TODOWRITE_TOOL]
         )
         self.assertEqual(calls["count"], 2)
-        chunks = self._chunks(resp)
-        self.assertEqual(self._tool_calls(chunks), [])
-        joined = self._content_joined(chunks)
+        body = self._body(resp)
+        self.assertEqual(self._tool_calls(body), [])
+        joined = self._content(body)
         self.assertIn(prose_reply, joined)
         self.assertNotIn("json_parse_or_id", joined)
 
@@ -3246,8 +3236,8 @@ class TestMalformedToolCallRetry(unittest.TestCase):
             responses, tools=[self._BASH_TOOL]
         )
         self.assertEqual(calls["count"], 1)
-        chunks = self._chunks(resp)
-        tcs = self._tool_calls(chunks)
+        body = self._body(resp)
+        tcs = self._tool_calls(body)
         self.assertEqual(len(tcs), 1)
         self.assertEqual(tcs[0]["function"]["name"], "bash")
 
@@ -3267,9 +3257,9 @@ class TestMalformedToolCallRetry(unittest.TestCase):
             responses, tools=[self._WRITE_TOOL]
         )
         self.assertEqual(calls["count"], 1, "must NOT retry on described JSON")
-        chunks = self._chunks(resp)
-        self.assertEqual(self._tool_calls(chunks), [])
-        joined = self._content_joined(chunks)
+        body = self._body(resp)
+        self.assertEqual(self._tool_calls(body), [])
+        joined = self._content(body)
         self.assertIn("not a tool call", joined)
 
     def test_empty_response_still_triggers_rescue_not_retry(self):
@@ -3289,8 +3279,8 @@ class TestMalformedToolCallRetry(unittest.TestCase):
         )
         # Only one upstream POST — no retry was triggered.
         self.assertEqual(calls["count"], 1)
-        chunks = self._chunks(resp)
-        joined = self._content_joined(chunks)
+        body = self._body(resp)
+        joined = self._content(body)
         self.assertNotIn("Understood.", joined)
 
     def test_retry_upstream_error_falls_through_to_bleed(self):
@@ -3313,8 +3303,8 @@ class TestMalformedToolCallRetry(unittest.TestCase):
         # Original response still returned 200 — the retry's failure is
         # invisible to opencode; bad text bleeds as before.
         self.assertEqual(resp.status_code, 200)
-        chunks = self._chunks(resp)
-        joined = self._content_joined(chunks)
+        body = self._body(resp)
+        joined = self._content(body)
         self.assertIn("json_parse_or_id", joined)
 
     # --- Correction-message constants ------------------------------------
