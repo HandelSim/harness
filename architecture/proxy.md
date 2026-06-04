@@ -267,7 +267,19 @@ together. Each entry is a single bullet that combines:
    *missing* entry the moment a tool starts shipping is a bare signature
    with no failure-mode hint at recency. `TestHybridConsolidatedRecency
    ::test_guidance_map_covers_known_opencode_tools` is the canary that
-   flags accidental removal.
+   flags accidental removal (an `issubset` check, so MCP entries below are
+   free to coexist).
+
+   The map also carries terse entries for the bundled **serena** reference
+   MCP, keyed `serena_<tool>` — opencode exposes an MCP server's tools as
+   `<server>_<tool>`, so serena's arrive `serena_*` (NOT the `mcp__serena__*`
+   form the mock *response* fixtures use, which is only ever substring-
+   matched in tests). They render only when serena is enabled and opencode
+   ships the tool for the turn, so a disabled serena adds nothing to
+   recency. These lines are kept shorter than the opencode ones because the
+   recency block is budget-constrained and serena ships many tools. New
+   guidance for any MCP follows the same pattern: add `<server>_<tool>`
+   keys here.
 3. **Closed-set argument values** — for tools in the project-managed
    `_HYBRID_DETAIL_TOOLS` constant (`["task", "skill"]`), the tool's
    verbatim description is inlined as an indented block UNDER the tool's
@@ -488,30 +500,36 @@ to normal, even with the trigger still present further back in history.
 
 After `extract_tool_calls_and_text` runs in `catch_all`, the proxy checks
 whether `clean_text` is empty/whitespace-only AND `tool_call_payloads` is
-empty. When both hold, the proxy substitutes a **two-part rescue**:
+empty. When both hold, the proxy substitutes a rescue. The shape depends on
+whether a shell tool is exposed:
 
-1. **Rescue text** — `_empty_response_rescue_text` returns the single
-   word `"Understood."` which replaces the empty `clean_text`. The text
-   alone is enough to unstick the upstream filter on the next request
-   (the user's prompt displaces the trigger), but a text-only assistant
-   reply makes opencode end the turn with `done_reason: stop`. The user
-   then has to type something for the conversation to continue.
-2. **Rescue tool call** — when the inbound tools list contains a
-   `bash`-style shell tool, `_select_rescue_tool` returns a `{name,
+1. **Tool-call rescue (preferred)** — when the inbound tools list contains
+   a `bash`-style shell tool, `_select_rescue_tool` returns a `{name,
    arguments: {"command": "pwd", "description": "Print working
-   directory"}}` payload which the proxy appends to
-   `tool_call_payloads`. The response `finish_reason` becomes `tool_calls`,
-   opencode executes the no-op `pwd`, and re-invokes the model with the
-   tool result as the **new** recency — which displaces the
-   filter-triggering content out of the hot slot, so the next model
-   turn returns real content without user intervention.
+   directory"}}` payload which becomes the sole `tool_call_payloads` entry.
+   The assistant text is left **empty** — a tool-only turn is well-formed,
+   so no substitute text is needed and none is emitted (a bare
+   `"Understood."` would just be a content-free filler line in the
+   transcript). The response `finish_reason` becomes `tool_calls`, opencode
+   executes the no-op `pwd`, and re-invokes the model with the tool result
+   as the **new** recency — which displaces the filter-triggering content
+   out of the hot slot, so the next model turn returns real content without
+   user intervention.
+2. **Text-only fallback** — ONLY when no shell tool is exposed,
+   `_empty_response_rescue_text` returns the single word `"Understood."` to
+   keep the response non-empty. The text unsticks the upstream filter on
+   the next request (the user's prompt displaces the trigger), but a
+   text-only assistant reply makes opencode end the turn with `done_reason:
+   stop`, so the user has to type something for the conversation to
+   continue — no auto-continuation. This is the degraded mode; the
+   tool-call rescue above is what runs for every coding agent in practice.
 
 The detector deliberately does NOT gate on `completion_tokens` or
 `finish_reason` value — the user-facing symptom (visible stall) is the
 same regardless of the upstream's exact bookkeeping, so the rule is just
 "no text, no tool calls". A `print()` line at the call site logs the
 `finish_reason`, the `req_id`, and which rescue mode fired
-(`text+tool(<name>)` or `text-only`), so the event remains visible in
+(`tool(<name>)` or `text-only`), so the event remains visible in
 `harness logs proxy` for diagnosis.
 
 ### Why `bash` running `pwd`
@@ -526,9 +544,11 @@ tiny and can't itself re-trigger the upstream filter.
 so `bash` and `Bash` both match; the emitted call echoes the inbound
 name verbatim so the agent's router can dispatch it. The arguments
 shape `{"command": "pwd", "description": "Print working directory"}`
-satisfies the required-fields contract of both schemas. When no shell
-tool is exposed for the turn, the rescue degrades to text-only — the
-upstream still unsticks on the user's next prompt; only the
+satisfies the required-fields contract of both schemas. The tool call
+carries the rescue by itself — the assistant text stays empty — so when
+a shell tool is present there is no `"Understood."` line at all. When no
+shell tool is exposed for the turn, the rescue degrades to text-only —
+the upstream still unsticks on the user's next prompt; only the
 auto-continuation is lost.
 
 ### Earlier iterations
