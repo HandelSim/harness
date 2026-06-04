@@ -25,11 +25,12 @@ How it connects:
 - The agent container reaches it at `http://host.docker.internal:<port>/mcp`
   (harness already wrote that URL into the agent's MCP config when the user
   ran `harness mcp host-init`).
-- The firewall in the agent container blocks egress by default. The user must
-  run `harness net allow host.docker.internal` once so the agent can reach the
-  host. (On Linux hosts the agent container also needs
-  `--add-host=host.docker.internal:host-gateway`; on Docker Desktop / Windows
-  that name resolves automatically.)
+- Reachability is automatic. While this host MCP is enabled, harness maps
+  `host.docker.internal` into the agent container and opens it through the
+  firewall — it injects `--add-host=host.docker.internal:host-gateway` on Linux
+  hosts (where Docker does not provide that name; on Docker Desktop / Windows it
+  resolves on its own) and signals the firewall to allow it. No
+  `harness net allow` and no manual `--add-host` are needed.
 
 You do not need to wire any of that. It is done. You tailor `server.py` and
 `project.json`.
