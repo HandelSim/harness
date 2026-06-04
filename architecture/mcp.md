@@ -279,20 +279,29 @@ absence of `compose.yml` is the whole mechanism:
 
 **The template** (`host-mcp/template/`, git-tracked) is a FastMCP
 streamable-http server (`mcp.server.fastmcp.FastMCP`, endpoint `/mcp`) with
-stub CMake/CTest build tools, a `project.json`, `run.ps1`/`run.sh` launchers,
-`requirements.txt`, and an `AGENTS.md` that briefs the `host-setup` agent on
-how to interview the user and prune the tools.
+stub CMake/CTest build tools, a `project.json`, a single git-bash-native
+`run.sh` launcher (one script for Linux, macOS, and Windows Git Bash — no
+PowerShell), `requirements.txt`, and an `AGENTS.md` that briefs the
+`host-setup` agent on how to interview the user and prune the tools.
 
 **Setup flow** (the goal is one short, guided path):
 
 1. `harness mcp host-init <name> [--port <port>]` — scaffold + register.
 2. `harness mcp host-setup <name>` — agent reads `AGENTS.md`, tailors
    `server.py` + `project.json` with the user.
-3. `harness net allow host.docker.internal` — open egress so the agent
-   container can reach the host. On **Linux** hosts the agent container also
-   needs `--add-host=host.docker.internal:host-gateway`; on Docker Desktop /
-   Windows that name resolves automatically.
-4. Run the server on the host (`run.ps1` / `run.sh`) and keep it up.
+3. Run the server on the host (`./run.sh`) and keep it up.
+
+**Reachability is automatic.** While at least one host MCP is enabled,
+`run_agent_*` / `cmd_shell` inject `--add-host=host.docker.internal:host-gateway`
+(so the name resolves on plain Linux docker, which — unlike Docker Desktop —
+does not provide it) plus `-e HARNESS_HOST_MCP_HOSTS=host.docker.internal`.
+The in-container firewall (`init-firewall.sh` section 9b) reads that env var and
+opens just the resolved host IP. It resolves the name from **/etc/hosts**
+(`getent ahostsv4`, awk fallback), not `dig` — the section-9 allowlist path uses
+`dig`, which queries DNS and cannot see the `/etc/hosts` entry Docker injects.
+The wiring is gated on an enabled host MCP being present, so it is inert (zero
+egress change) for the proxy, serena, and every other container. No
+`harness net allow` and no manual `--add-host` are needed.
 
 **Uninstall** removes `state/mcp/<name>/` (the registration); the container-
 teardown step is gated on `compose.yml` so it is skipped. The `host-mcp/<name>/`

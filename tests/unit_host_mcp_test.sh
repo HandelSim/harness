@@ -61,7 +61,10 @@ run_harness mcp host-init "$NAME" --port "$PORT" || fail "T1: host-init exited $
 [[ -f "$INST/project.json" ]]   || fail "T1: instance project.json missing"
 [[ -f "$INST/AGENTS.md" ]]      || fail "T1: instance AGENTS.md missing"
 [[ -f "$INST/requirements.txt" ]] || fail "T1: instance requirements.txt missing"
-[[ -f "$INST/run.ps1" && -f "$INST/run.sh" ]] || fail "T1: run scripts missing"
+[[ -f "$INST/run.sh" ]] || fail "T1: run.sh missing"
+# run.sh is the single git-bash-native launcher; PowerShell was removed, so the
+# scaffold must NOT carry a run.ps1.
+[[ -e "$INST/run.ps1" ]] && fail "T1: run.ps1 should not be scaffolded (PowerShell removed)"
 ok "T1: instance scaffolded at $INST"
 
 grep -q "__MCP_NAME__" "$INST/server.py" "$INST/project.json" \

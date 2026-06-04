@@ -17,15 +17,12 @@ harness mcp host-setup <name>     # launch a setup agent inside host-mcp/<name>/
 Then, on the host, in `host-mcp/<name>/`:
 
 ```
-./run.ps1     # Windows, from a Developer PowerShell for VS 2022
-./run.sh      # Linux/macOS
+./run.sh      # Linux, macOS, and Windows Git Bash (the same Git Bash you run harness in)
 ```
 
-And once, so the agent's firewall lets it reach the host:
-
-```
-harness net allow host.docker.internal
-```
+That is all. Reachability is automatic: while the host MCP is enabled, harness
+maps `host.docker.internal` into the agent container and opens it through the
+firewall. No `harness net allow` and no `--add-host` are needed.
 
 ## How it fits together
 
@@ -49,7 +46,8 @@ agent container  --HTTP-->  host.docker.internal:<port>/mcp  -->  this server  -
 - `project.json` — project paths, CMake generator, config, target allowlist,
   output/timeout caps. Filled in during host-setup.
 - `requirements.txt` — the `mcp` Python SDK.
-- `run.ps1` / `run.sh` — venv + install + launch.
+- `run.sh` — venv + install + launch. One git-bash-native script for Linux,
+  macOS, and Windows Git Bash (no PowerShell).
 - `AGENTS.md` — instructions the host-setup agent reads.
 
 ## Notes

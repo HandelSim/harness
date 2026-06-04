@@ -2276,6 +2276,45 @@ write_agent_mcp_config() {
     fi
 }
 
+# True if at least one installed-and-enabled MCP is a host MCP (runs as a
+# process on the host, reached at http://host.docker.internal:<port>/mcp).
+# Used to gate the host.docker.internal reachability wiring below so we never
+# widen the agent's egress to the host when no host MCP is in play.
+any_host_mcp_enabled() {
+    [[ -d "$mcp_active_dir" ]] || return 1
+    local mcp_dir name
+    for mcp_dir in "$mcp_active_dir"/*/; do
+        [[ -f "$mcp_dir/client-config.json" ]] || continue
+        name=$(basename "$mcp_dir")
+        mcp_is_host "$name" || continue
+        mcp_is_enabled "$name" || continue
+        return 0
+    done
+    return 1
+}
+
+# Emit (NUL-delimited) the extra `docker run` args that make an enabled host
+# MCP reachable from the agent container. A host MCP runs on the host, so two
+# things are needed and NEITHER is automatic on Linux:
+#   1. --add-host=host.docker.internal:host-gateway so the name resolves to the
+#      host. Docker Desktop (Windows/macOS) injects this name already; a plain
+#      Linux docker engine does not, so the agent can't even resolve it.
+#   2. A signal to the in-container firewall to allow that host. The firewall
+#      resolves allowlist hosts with `dig`, which queries DNS and ignores
+#      /etc/hosts — so host.docker.internal can't ride the normal allowlist.
+#      We pass it via HARNESS_HOST_MCP_HOSTS and init-firewall.sh resolves it
+#      from /etc/hosts and opens just that IP.
+# Honors the owner's intent that an enabled MCP be reachable by default with no
+# manual `harness net allow` / --add-host. Narrow on purpose: host loopback to
+# the user's own machine, only while a host MCP is enabled — it does not relax
+# the "operator opens third-party egress deliberately" rule for other domains.
+emit_host_mcp_docker_args() {
+    any_host_mcp_enabled || return 0
+    printf '%s\0' "--add-host=host.docker.internal:host-gateway"
+    printf '%s\0' "-e"
+    printf '%s\0' "HARNESS_HOST_MCP_HOSTS=host.docker.internal"
+}
+
 # Run an opencode agent in the current directory.
 #
 # The agent's CWD is bind-mounted at the same absolute host path inside the
@@ -2582,6 +2621,12 @@ run_agent_interactive() {
         docker_args+=("$env_line")
     done < <(collect_agent_env "$tool" "$yolo" "$net_open" "$mount_path")
 
+    # If an enabled host MCP is present, map host.docker.internal into the
+    # container and tell the firewall to open it. No-op otherwise.
+    while IFS= read -r -d '' env_line; do
+        docker_args+=("$env_line")
+    done < <(emit_host_mcp_docker_args)
+
     # Normalize host bind-mount sources for Windows Docker Desktop.
     # On Linux/macOS these are passthrough; on Windows they're rewritten
     # to C:/Users/... form which Docker Desktop's WSL2 backend mounts
@@ -2696,6 +2741,12 @@ run_agent_print() {
     while IFS= read -r -d '' env_line; do
         docker_args+=("$env_line")
     done < <(collect_agent_env "$tool" "$yolo" "$net_open" "$mount_path")
+
+    # See run_agent_interactive: map host.docker.internal + signal the firewall
+    # when an enabled host MCP is present. No-op otherwise.
+    while IFS= read -r -d '' env_line; do
+        docker_args+=("$env_line")
+    done < <(emit_host_mcp_docker_args)
 
     # See run_agent_interactive for the harness_docker_path rationale.
     local mp_host ah_host alp_host
@@ -2867,6 +2918,13 @@ cmd_shell() {
         -v "$ah_host:/home/harness"
         -v "$alp_host:/etc/harness/allowlist:ro"
     )
+    # Same host MCP reachability wiring as the agent launch, so `harness shell`
+    # can reach an enabled host MCP (e.g. to curl it while debugging). No-op
+    # when no host MCP is enabled.
+    local hm_arg
+    while IFS= read -r -d '' hm_arg; do
+        shell_args+=("$hm_arg")
+    done < <(emit_host_mcp_docker_args)
     if (( ${#resolved_mounts[@]} > 0 )); then
         local em em_host
         for em in "${resolved_mounts[@]}"; do
@@ -4004,8 +4062,8 @@ cmd_mcp_up() {
     fi
     if mcp_is_host "$name"; then
         err "$name is a host MCP — harness does not manage a container for it."
-        err "start it on the host with the run script in $install_root/host-mcp/$name/"
-        err "(run.ps1 on Windows, run.sh on Linux/macOS)."
+        err "start it on the host with: cd $install_root/host-mcp/$name && ./run.sh"
+        err "(run.sh works on Linux, macOS, and Windows Git Bash)."
         exit 1
     fi
     require_docker
@@ -4211,7 +4269,7 @@ cmd_mcp_status() {
         printf 'transport: host (process on the host; not a container)\n'
         printf 'endpoint:  %s\n' "${url:-(unknown)}"
         printf 'project:   %s\n' "$install_root/host-mcp/$name"
-        printf 'launch:    run.ps1 (Windows) / run.sh (Linux/macOS) in that folder\n'
+        printf 'launch:    ./run.sh in that folder (Linux, macOS, Windows Git Bash)\n'
         return
     fi
 
@@ -4338,12 +4396,17 @@ cmd_mcp_host_init() {
 }
 EOF
     mv "$cc_tmp" "$cc"
+    # allowed_domains is intentionally empty: a host MCP's reachability is wired
+    # automatically (see emit_host_mcp_docker_args + init-firewall.sh 9b). Listing
+    # host.docker.internal here would make mcp_print_firewall_recs tell the user
+    # to `harness net allow host.docker.internal`, which is both unnecessary and
+    # unresolvable by the dig-based allowlist path (it's an /etc/hosts name).
     cat >"$meta_tmp" <<EOF
 {
   "enabled": true,
   "transport": "host",
   "host_port": $port,
-  "allowed_domains": ["host.docker.internal"]
+  "allowed_domains": []
 }
 EOF
     mv "$meta_tmp" "$meta"
@@ -4357,15 +4420,16 @@ host MCP registered: $name
 next:
   1. tailor the server with an agent that reads its AGENTS.md:
        harness mcp host-setup $name
-  2. let the agent reach the host (run once):
-       harness net allow host.docker.internal
-     (Linux hosts also need --add-host=host.docker.internal:host-gateway on the
-      agent container; on Docker Desktop / Windows the name resolves on its own.)
-  3. on the HOST, start the server and keep it running while you work:
-       Windows:     cd "$inst"; ./run.ps1   (from a Developer PowerShell for VS 2022)
-       Linux/macOS: cd "$inst" && ./run.sh
-  4. start the stack ('harness', or 'harness restart' if already up); agents
+  2. on the HOST, start the server and keep it running while you work:
+       cd "$inst" && ./run.sh
+     (run.sh works on Linux, macOS, and Windows Git Bash — the same Git Bash you
+      run harness in. cmake/ctest must be on PATH.)
+  3. start the stack ('harness', or 'harness restart' if already up); agents
      launched after step 1 will see this MCP in their config.
+
+  Reachability is automatic: while this host MCP is enabled, harness maps
+  host.docker.internal into the agent container and allows it through the
+  firewall. No 'harness net allow' or --add-host needed.
 EOF
 }
 
