@@ -129,5 +129,85 @@ for input in "C:/Folder" "c:\\Folder" "/c/Folder"; do
 done
 ok "T4: full pipeline (abs_path → container_workdir) → //c/Folder on Windows"
 
+# --- T5: docker wrappers export MSYS conv toggles on Windows -----------------
+#
+# Issue #112 follow-up: the bind-mount `-v C:/foo:/c/foo` was being
+# path-list-converted by MSYS to `C:\foo;C:\foo`, breaking docker's volume
+# parser. Root-cause fix is to put MSYS_NO_PATHCONV=1 AND
+# MSYS2_ARG_CONV_EXCL='*' into bash's *own* env (via `local -x`) for the
+# duration of the wrapper call, so MSYS sees them at the moment of argv
+# conversion. The old inline `VAR=val cmd` pattern set them in the child's
+# env but conversion had already happened in the parent shell.
+#
+# This test asserts the wiring: on Windows the wrappers spawn the runtime
+# with both vars set; on non-Windows neither is exported (no leakage).
+
+recorder_dir=$(mktemp -d)
+trap 'rm -rf "$fake_cygpath_dir" "$recorder_dir"' EXIT
+cat >"$recorder_dir/fake-runtime" <<'REC'
+#!/usr/bin/env bash
+{
+    echo "MSYS_NO_PATHCONV=${MSYS_NO_PATHCONV:-<unset>}"
+    echo "MSYS2_ARG_CONV_EXCL=${MSYS2_ARG_CONV_EXCL:-<unset>}"
+} >"$RECORD_FILE"
+REC
+chmod +x "$recorder_dir/fake-runtime"
+
+harness_container_runtime() { printf '%s' "$recorder_dir/fake-runtime"; }
+export -f harness_container_runtime
+unset _harness_runtime_cache
+export RECORD_FILE="$recorder_dir/out"
+
+# Windows pin → both vars must reach the child.
+harness_detect_os() { printf '%s' windows; }
+export -f harness_detect_os
+unset MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL
+: >"$RECORD_FILE"
+harness_docker run --rm alpine sh
+got=$(<"$RECORD_FILE")
+[[ "$got" == *"MSYS_NO_PATHCONV=1"* ]] \
+    || fail "T5: harness_docker on Windows should set MSYS_NO_PATHCONV=1; recorder saw: $got"
+[[ "$got" == *"MSYS2_ARG_CONV_EXCL=*"* ]] \
+    || fail "T5: harness_docker on Windows should set MSYS2_ARG_CONV_EXCL='*'; recorder saw: $got"
+ok "T5: harness_docker exports both MSYS conv toggles on Windows"
+
+# `local -x` scope: vars must NOT leak into the caller's shell after return.
+[[ -z "${MSYS_NO_PATHCONV:-}" ]] \
+    || fail "T5: MSYS_NO_PATHCONV leaked out of harness_docker into the test shell"
+[[ -z "${MSYS2_ARG_CONV_EXCL:-}" ]] \
+    || fail "T5: MSYS2_ARG_CONV_EXCL leaked out of harness_docker into the test shell"
+ok "T5: harness_docker does not leak MSYS conv vars into the caller (local -x scope)"
+
+# Non-Windows pin → neither var is set by the wrapper.
+harness_detect_os() { printf '%s' linux; }
+export -f harness_detect_os
+unset MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL
+: >"$RECORD_FILE"
+harness_docker run --rm alpine sh
+got=$(<"$RECORD_FILE")
+[[ "$got" == *"MSYS_NO_PATHCONV=<unset>"* ]] \
+    || fail "T5: harness_docker on Linux should not set MSYS_NO_PATHCONV; recorder saw: $got"
+[[ "$got" == *"MSYS2_ARG_CONV_EXCL=<unset>"* ]] \
+    || fail "T5: harness_docker on Linux should not set MSYS2_ARG_CONV_EXCL; recorder saw: $got"
+ok "T5: harness_docker is pass-through on non-Windows (no MSYS env leakage)"
+
+# harness_docker_winpty: same expectation (Windows-only callers).
+harness_detect_os() { printf '%s' windows; }
+export -f harness_detect_os
+# Stub winpty so we don't depend on it being installed in CI.
+cat >"$recorder_dir/winpty" <<'WP'
+#!/usr/bin/env bash
+exec "$@"
+WP
+chmod +x "$recorder_dir/winpty"
+PATH="$recorder_dir:$PATH"
+unset MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL
+: >"$RECORD_FILE"
+harness_docker_winpty run --rm alpine sh
+got=$(<"$RECORD_FILE")
+[[ "$got" == *"MSYS_NO_PATHCONV=1"* && "$got" == *"MSYS2_ARG_CONV_EXCL=*"* ]] \
+    || fail "T5: harness_docker_winpty should set both MSYS toggles; recorder saw: $got"
+ok "T5: harness_docker_winpty exports both MSYS conv toggles"
+
 echo
 echo "WORKDIR TEST PASSED"
