@@ -209,5 +209,57 @@ got=$(<"$RECORD_FILE")
     || fail "T5: harness_docker_winpty should set both MSYS toggles; recorder saw: $got"
 ok "T5: harness_docker_winpty exports both MSYS conv toggles"
 
+# --- T6: harness_add_bind_mount emits --mount on Windows, -v elsewhere -------
+#
+# Issue #112 (third failure mode): the `-v C:/foo:/c/foo` composite is
+# path-list-converted by MSYS *and* winpty into `C:\foo;C:\foo`, which
+# docker's volume parser rejects with `invalid mode: \foo`. The env-var
+# toggles (T5) fix the plain `harness_docker` path but NOT the winpty path,
+# so the bind-mount arg itself is reshaped to the single-token
+# `--mount=type=bind,source=,target=` form, which has no bare `:` for the
+# converter to latch onto. This test asserts the arg shape on each OS.
+
+# Linux/macOS → classic `-v src:tgt` (two tokens), `:ro` suffix for readonly.
+harness_detect_os() { printf '%s' linux; }
+export -f harness_detect_os
+
+bm=()
+harness_add_bind_mount bm "/host/proj" "/host/proj"
+[[ "${bm[*]}" == "-v /host/proj:/host/proj" ]] \
+    || fail "T6: linux rw mount expected '-v /host/proj:/host/proj', got '${bm[*]}'"
+ok "T6: linux read-write mount → -v src:tgt"
+
+bm=()
+harness_add_bind_mount bm "/host/allow" "/etc/harness/allowlist" ro
+[[ "${bm[*]}" == "-v /host/allow:/etc/harness/allowlist:ro" ]] \
+    || fail "T6: linux ro mount expected '-v …:ro', got '${bm[*]}'"
+ok "T6: linux read-only mount → -v src:tgt:ro"
+
+# Windows → single `--mount=type=bind,…` token (no bare `:` to convert),
+# source kept in Windows mixed form, `,readonly` for read-only.
+harness_detect_os() { printf '%s' windows; }
+export -f harness_detect_os
+
+bm=()
+harness_add_bind_mount bm "C:/Developer/folder/share" "/c/Developer/folder/share"
+[[ ${#bm[@]} -eq 1 ]] \
+    || fail "T6: windows mount should be a single token, got ${#bm[@]}: '${bm[*]}'"
+[[ "${bm[0]}" == "--mount=type=bind,source=C:/Developer/folder/share,target=/c/Developer/folder/share" ]] \
+    || fail "T6: windows rw mount unexpected, got '${bm[0]}'"
+# No bare colon-joined `src:tgt` composite for MSYS/winpty to path-list-convert.
+[[ "${bm[0]}" != *":/c/"* ]] \
+    || fail "T6: windows mount must not contain a ':/c/' composite, got '${bm[0]}'"
+ok "T6: windows read-write mount → single --mount=type=bind token"
+
+bm=()
+harness_add_bind_mount bm "C:/Developer/HandelAI/harness/.harness-allowlist" "/etc/harness/allowlist" ro
+[[ "${bm[0]}" == "--mount=type=bind,source=C:/Developer/HandelAI/harness/.harness-allowlist,target=/etc/harness/allowlist,readonly" ]] \
+    || fail "T6: windows ro mount expected ',readonly' suffix, got '${bm[0]}'"
+ok "T6: windows read-only mount → --mount=…,readonly"
+
+# Reset the OS stub so nothing downstream inherits the Windows pin.
+harness_detect_os() { printf '%s' linux; }
+export -f harness_detect_os
+
 echo
 echo "WORKDIR TEST PASSED"

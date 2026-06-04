@@ -242,9 +242,28 @@ toggle). The Linux kernel collapses `//foo` → `/foo` on `chdir`, so the
 container working directory still matches the bind-mount target. The
 three docker launch sites (`run_agent_interactive`, `run_agent_print`,
 `cmd_shell`) pass `-w "$(harness_container_workdir "$mount_path")"`.
-`harness doctor`'s Windows `[runtime]` block surfaces both the resolved
-`mount_path` and the escaped `-w` form so the failure mode is one-line
-diagnosable.
+
+**Bind mounts — the `winpty` path needs more than the env toggles.** The
+env-var toggles fix the `harness_docker` path, but the interactive launch
+routes through `harness_docker_winpty` (`winpty docker …`), and `winpty`
+does its *own* argv path-list conversion that the bash-level toggles do
+not reach. So `-v C:/foo:/c/foo` still gets rewritten to `C:\foo;C:\foo`,
+and docker reports `invalid mode: \foo`. The escape that survives both
+layers is to drop the `-v src:tgt` composite entirely in favour of the
+comma-delimited `--mount type=bind,source=<src>,target=<tgt>[,readonly]`
+form — a single token with no bare `:` for either converter to latch
+onto. `harness_add_bind_mount <array> <src> <tgt> [ro]`
+(`scripts/lib/platform.sh`) appends `--mount=…` on Windows and the
+classic `-v` on Linux/macOS; all bind mounts at the three launch sites
+(CWD, `/home/harness`, the read-only allowlist, and every `--mount` /
+`HARNESS_EXTRA_MOUNTS` extra) go through it. The mount **source** stays in
+Windows mixed form (`C:/…` via `harness_docker_path`) because Docker
+Desktop's WSL2 backend mounts that reliably where a raw `/c/…` source can
+come up empty.
+
+`harness doctor`'s Windows `[runtime]` block surfaces the resolved
+`mount_path`, the escaped `-w` form, **and** the CWD `--mount` bind-mount
+arg so all three failure modes are one-line diagnosable.
 
 ### Post-run issue footer (interactive only)
 

@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 372 IDs (F=146, P=58, A=24, M=23, N=30, U=29, Pe=16, O=0, I=44).
+Inventory total: 373 IDs (F=146, P=58, A=24, M=23, N=30, U=29, Pe=16, O=0, I=45).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -59,10 +59,10 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   243 |   66.3% |
+| green    |   244 |   66.5% |
 | yellow   |     5 |    1.4% |
 | red      |   118 |   32.2% |
-| **total**|   366 |  100.0% |
+| **total**|   367 |  100.0% |
 
 Per-prefix breakdown:
 
@@ -76,7 +76,7 @@ Per-prefix breakdown:
 | U      |    29 |    22 |      0 |   7 |
 | Pe     |    16 |    13 |      1 |   2 |
 | O      |     0 |     0 |      0 |   0 |
-| I      |    44 |    28 |      1 |  15 |
+| I      |    45 |    29 |      1 |  15 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -542,6 +542,7 @@ non-green rows — the gap.
 | I048 | green  | tests/full_pipeline_test.sh (T0b)           | T0b drops a `.env` beside the installer with `HTTPS_PROXY` set and asserts the installer prints `using HTTPS_PROXY from .* for the clone`. | |
 | I049 | green  | tests/unit_workdir_test.sh (T1, T2, T4)     | T1 asserts pass-through on linux/macos; T2 asserts windows produces `//c/...` (including idempotence and slash-collapse); T4 covers the full `harness_abs_path` → `harness_container_workdir` pipeline that feeds docker `-w` (issue #112). | |
 | I050 | green  | tests/unit_workdir_test.sh (T5)             | OS pinned to `windows` with a fake-runtime recorder: `harness_docker` and `harness_docker_winpty` both spawn the runtime with MSYS_NO_PATHCONV=1 AND MSYS2_ARG_CONV_EXCL='*' set; `local -x` scope confirmed (vars don't leak into caller); pass-through on non-Windows (no env leakage). Issue #112 root-cause fix. | |
+| I051 | green  | tests/unit_workdir_test.sh (T6)             | OS pinned both ways: linux emits `-v src:tgt` and `-v src:tgt:ro`; windows emits a single `--mount=type=bind,source=,target=[,readonly]` token with no `:/c/` composite. Covers the issue #112 winpty path where `-v` is mangled to `invalid mode: …`. | |
 
 ---
 
