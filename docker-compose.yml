@@ -57,6 +57,17 @@ services:
       # the proxy loads it into the hybrid recency reminder so MCP tools carry a
       # one-line hint instead of a bare signature. Empty when no MCP is enabled.
       HARNESS_MCP_TOOL_RECENCY: ${HARNESS_MCP_TOOL_RECENCY:-}
+      # Companion to the recency map: a JSON array of `<server>_<tool>` names an
+      # enabled MCP flagged `state_check` in its recency.json (state-mutating
+      # tools). The proxy marks them [state-check] and adds an orient-first
+      # reminder so the agent checks state before mutating. Empty when none.
+      HARNESS_MCP_STATE_CHECK: ${HARNESS_MCP_STATE_CHECK:-}
+      # Cooperative tool-search (default off). Set to 1 to advertise the
+      # synthetic tool_search/tool_list meta-tools the proxy serves itself from
+      # the per-request tool list (full schemas stay at the stable prefix; this
+      # is the mechanism the schema-migration decision is gated on). See
+      # architecture/proxy.md "Cooperative tool-search".
+      HARNESS_TOOL_SEARCH: ${HARNESS_TOOL_SEARCH:-0}
     volumes:
       # When OUTPUT_DIR is set, the proxy writes per-request debug files here.
       # On Windows users should set OUTPUT_DIR=//output to bypass MSYS path

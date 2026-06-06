@@ -390,6 +390,77 @@ The bundled serena MCP's guidance lives in `mcp-registry/serena/recency.json`
 (it used to be hard-coded in `_HYBRID_TOOL_GUIDANCE`); migrating it out is what
 made the code/data split concrete.
 
+## State-check marker + orient-first rule
+
+An MCP can flag a tool as **state-mutating** so the agent is told to orient
+before calling it. The flag is data, like the recency line: a tool's
+`recency.json` value may be an object `{"line": "...", "state_check": true}`
+instead of a bare string (see `architecture/mcp.md` "Tool recency
+descriptions"). The harness CLI collects the flagged tools into a JSON array
+(`mcp_state_check_json` → `HARNESS_MCP_STATE_CHECK`), `docker-compose.yml`
+passes it, and `_setup_state_check_tools` loads it into the
+`_MCP_STATE_CHECK_TOOLS` set at startup (same once-per-launch treatment as the
+recency map).
+
+`_format_tool_entries` appends a ` [state-check]` marker to a flagged tool's
+recency entry, and — **only when at least one flagged tool is in the current
+turn's toolset** — adds an orient-first line to the recency legend: *"a tool
+marked [state-check] mutates state — call the server's read-only
+state/orientation tool first."* This is the orient-first rule the council
+placed "at AGENTS.md altitude": the harness ships no runtime AGENTS.md for the
+opencode agent, so its standing-instruction channel is the always-injected
+recency reminder. Empty set ⇒ no markers, no extra line — graceful degradation.
+
+## Cooperative tool-search
+
+`HARNESS_TOOL_SEARCH=1` (default **off**) enables a hand-built analog of native
+deferred-schema tool search, which is unavailable behind a non-first-party
+proxy. It advertises two synthetic meta-tools the **proxy serves itself**:
+
+- `tool_list()` — every available tool's signature + one-line purpose.
+- `tool_search({"query": "..."})` — full signature + description for tools whose
+  name or description matches the query.
+
+The **registry is the inbound `tools` array, rebuilt every request** — there is
+no cross-request cache, so there is nothing to go stale when an MCP restarts
+mid-session (the schema-staleness gap the council flagged dissolves under
+per-request indexing). `_meta_tool_list` / `_meta_tool_search` are pure
+functions over that array; `_is_meta_tool_call` recognises a meta call and
+**yields to a real opencode tool of the same name** (the name must be a
+meta-tool AND absent from the inbound tools).
+
+When enabled, `build_cooperative_prompt_system_addition` appends a small
+`<<<BEGIN_META_TOOLS>>>` advertisement after `<<<END_AGENT_TOOLS>>>`, and the
+recency legend gains a one-line pointer. When the model emits a meta call,
+`catch_all` routes to `_serve_meta_tools`: it appends `[assistant(<meta call>),
+user(<framed result>)]` (the result wrapped in `<<<BEGIN_TOOL_RESULT>>>`
+markers, exactly like a real tool result) and re-POSTs upstream, looping until
+the model emits a real response — bounded by `_META_TOOL_SERVE_BUDGET` (3). This
+mirrors the malformed-tool-call retry loop. **opencode never sees a meta call**:
+if a turn's calls are all-meta the loop runs and only the real follow-up is
+streamed; if serving fails or the budget is exhausted the meta calls are
+dropped (never forwarded — opencode has no such tool); a turn that mixes meta +
+real calls keeps only the real ones. Debug dumps land at
+`<req_id>_02_API_ToolSearch_Request_NN` / `_03_API_ToolSearch_Response_NN`.
+
+**Scope (the council's "build the mechanism, gate the migration").** The full
+schemas still ship at the stable prefix when this is on — no schema is migrated
+behind search. The flag builds the mechanism so it is ready; the decision to
+actually thin the prefix is gated on the catalog-size instrumentation below
+crossing a measured threshold. Default-off means a normal launch is byte-for-
+byte unchanged, and the integration (the serve loop against a live upstream) is
+validated before it ever touches the daily-driver path.
+
+## Catalog-size instrumentation
+
+`catch_all` logs one line per request — `[req_id] catalog: tools=N
+schema_tokens=M` — where `tools` ≈ the recency line count (one entry per tool)
+and `schema_tokens` is the local token estimate of the full schemas at the
+stable prefix. This is the measured signal that decides when migrating schemas
+behind `tool_search` is worth its complexity: until the prefix is genuinely
+large the migration buys little (the proxy re-injects every turn, so prefix
+loss is largely self-healing for the small push layer).
+
 ## `_CHANGE_SYSTEM_TO_USER`
 
 Default ON. Some upstreams silently drop the `system` role; the

@@ -685,15 +685,56 @@ mcp_tool_recency_json() {
             src="$install_root/mcp-registry/$name/recency.json"
         fi
         [[ -n "$src" ]] || continue
-        # Keep only string, non-empty descriptions, then prefix each bare tool
-        # key with "<name>_" to match opencode's exposed naming.
+        # A tool value is either a plain string (the line) or an object
+        # {"line": "...", "state_check": true}; normalize both to the line,
+        # keep only non-empty ones, then prefix each bare tool key with
+        # "<name>_" to match opencode's exposed naming.
         part=$(harness_jq -c --arg p "${name}_" '
             (.tools // {})
+            | with_entries(
+                .value |= (if type == "string" then .
+                           elif type == "object" then (.line // "")
+                           else "" end))
             | with_entries(select((.value | type) == "string" and (.value | length) > 0))
             | with_entries(.key |= ($p + .))
         ' "$src" 2>/dev/null) || continue
         [[ -n "$part" && "$part" != "null" ]] || continue
         merged=$(harness_jq -cn --argjson a "$merged" --argjson b "$part" '$a * $b' 2>/dev/null) || continue
+    done
+    printf '%s' "$merged"
+}
+
+# Build a JSON array of `<server>_<tool>` names that an enabled MCP marked
+# `state_check: true` in its recency.json — state-mutating tools the agent
+# should orient before calling. Mirrors mcp_tool_recency_json's source
+# precedence and prefixing; exported as HARNESS_MCP_STATE_CHECK, which the proxy
+# renders as a `[state-check]` marker plus an orient-first reminder line. A tool
+# whose recency value is a plain string contributes nothing here (only the
+# object form carries the flag). Emits `[]` when nothing applies.
+mcp_state_check_json() {
+    [[ -d "$mcp_active_dir" ]] || { printf '[]'; return 0; }
+    local merged='[]' mcp_dir name src part
+    for mcp_dir in "$mcp_active_dir"/*/; do
+        [[ -d "$mcp_dir" ]] || continue
+        name=$(basename "$mcp_dir")
+        mcp_is_enabled "$name" || continue
+        src=""
+        if [[ -f "$mcp_active_dir/$name/recency.json" ]]; then
+            src="$mcp_active_dir/$name/recency.json"
+        elif [[ -f "$install_root/host-mcp/$name/recency.json" ]]; then
+            src="$install_root/host-mcp/$name/recency.json"
+        elif [[ -f "$install_root/mcp-registry/$name/recency.json" ]]; then
+            src="$install_root/mcp-registry/$name/recency.json"
+        fi
+        [[ -n "$src" ]] || continue
+        part=$(harness_jq -c --arg p "${name}_" '
+            (.tools // {})
+            | to_entries
+            | map(select((.value | type) == "object" and (.value.state_check == true)))
+            | map($p + .key)
+        ' "$src" 2>/dev/null) || continue
+        [[ -n "$part" && "$part" != "null" ]] || continue
+        merged=$(harness_jq -cn --argjson a "$merged" --argjson b "$part" '$a + $b | unique' 2>/dev/null) || continue
     done
     printf '%s' "$merged"
 }
@@ -1469,6 +1510,10 @@ cmd_start() {
     # HARNESS_HOST_OS. Recomputed on every start/restart, so editing a
     # recency.json takes effect on the next `harness restart`.
     export HARNESS_MCP_TOOL_RECENCY="$(mcp_tool_recency_json)"
+    # Companion array: tools flagged state_check in recency.json. The proxy marks
+    # them [state-check] and adds an orient-first reminder. Same per-start
+    # recompute as the recency map above.
+    export HARNESS_MCP_STATE_CHECK="$(mcp_state_check_json)"
 
     # Active MCPs sit behind the `mcp` profile so they're only brought up
     # when something has been `harness mcp enable`d. Without --profile they

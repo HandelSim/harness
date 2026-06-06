@@ -139,6 +139,29 @@ _PROMPT_MODE: str = "hybrid"  # set in main() before serving
 # signature, exactly as before.
 _MCP_TOOL_RECENCY: Dict[str, str] = {}  # set in main() from the env var
 
+# Tools (runtime names, `<server>_<tool>`) an enabled MCP marked `state_check`
+# in its recency.json — state-mutating tools the agent should orient before
+# calling. Loaded once at startup from HARNESS_MCP_STATE_CHECK (a JSON array the
+# harness CLI builds alongside HARNESS_MCP_TOOL_RECENCY). Drives the
+# `[state-check]` marker on a tool's recency entry and the orient-first line in
+# the reminder. Empty (the default) renders neither — graceful degradation.
+_MCP_STATE_CHECK_TOOLS: set = set()
+
+# Cooperative tool-search (the hand-built analog of native deferred-schema tool
+# search, which is unavailable behind a non-first-party proxy). Default OFF:
+# HARNESS_TOOL_SEARCH=1 advertises two synthetic meta-tools — `tool_search` and
+# `tool_list` — that the PROXY serves from the current request's tool array
+# (never forwarded to opencode), so the model can retrieve a tool's signature on
+# demand. The full schemas still ship at the stable prefix (no migration); this
+# is the mechanism the schema-migration decision is gated on once the catalog-
+# size instrumentation shows the prefix is large enough to be worth thinning.
+# See architecture/proxy.md "Cooperative tool-search".
+_TOOL_SEARCH_ENABLED: bool = False
+_META_TOOL_NAMES = ("tool_search", "tool_list")
+# Max upstream round-trips the proxy will spend serving back-to-back meta-tool
+# calls before giving up the loop (a runaway model that only ever searches).
+_META_TOOL_SERVE_BUDGET = 3
+
 # The confirmed upstream silently drops the `system` role, so its content
 # must always be converted into a user message at the start of the
 # conversation, with a stub assistant message between to satisfy strict
@@ -375,6 +398,42 @@ def _setup_mcp_tool_recency() -> None:
     print(f"[i] MCP tool recency: {len(_MCP_TOOL_RECENCY)} entries", flush=True)
 
 
+def _setup_state_check_tools() -> None:
+    """Read HARNESS_MCP_STATE_CHECK (a JSON array of `<server>_<tool>` names the
+    harness CLI collected from enabled MCPs' recency.json `state_check` flags)
+    into the module global. Non-string / empty entries are dropped; an unset,
+    empty, or unparsable value yields an empty set (no `[state-check]` markers
+    and no orient-first line — the same graceful degradation as a tool with no
+    recency entry). Fixed per launch, like the recency map."""
+    global _MCP_STATE_CHECK_TOOLS
+    raw = os.environ.get("HARNESS_MCP_STATE_CHECK", "").strip()
+    names: set = set()
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, list):
+            names = {x for x in data if isinstance(x, str) and x.strip()}
+    _MCP_STATE_CHECK_TOOLS = names
+    print(f"[i] MCP state-check tools: {len(_MCP_STATE_CHECK_TOOLS)}", flush=True)
+
+
+def _setup_tool_search() -> None:
+    """Read HARNESS_TOOL_SEARCH into the module global. Truthy values
+    (1/true/yes/on, case-insensitive) enable the cooperative tool-search
+    meta-tools; anything else (the default) leaves them off so the prompt and
+    the dispatch path are byte-for-byte unchanged from before the feature
+    existed."""
+    global _TOOL_SEARCH_ENABLED
+    raw = os.environ.get("HARNESS_TOOL_SEARCH", "").strip().lower()
+    _TOOL_SEARCH_ENABLED = raw in ("1", "true", "yes", "on")
+    print(
+        f"[i] cooperative tool-search: {'on' if _TOOL_SEARCH_ENABLED else 'off'}",
+        flush=True,
+    )
+
+
 def init_output_dir() -> Optional[str]:
     raw = os.environ.get("OUTPUT_DIR", "").strip()
     if not raw:
@@ -567,11 +626,27 @@ You may explain your thought process before or after the JSON block. If NO furth
 """
 
 
+_META_TOOLS_PROMPT_BLOCK = """
+<<<BEGIN_META_TOOLS>>>
+Two extra tools let you look up tool details on demand. They are answered here, in the proxy, from the live tool list — calling one returns information only, never a side effect on the workspace, and the result comes back the same way a normal tool result does:
+- tool_list() — list every available tool name with a one-line purpose.
+- tool_search({"query": "..."}) — return the full signature and description of the tools whose name or description matches the query.
+Call them with the same ```json envelope as any tool. Use them when you are unsure whether a tool exists or need a tool's exact parameters; the full schemas in <<<BEGIN_AGENT_TOOLS>>> above remain authoritative.
+<<<END_META_TOOLS>>>
+"""
+
+
 def build_cooperative_prompt_system_addition(tools_text):
     """Returns the cooperative-prompt scaffolding to APPEND to the system
     message in modes 'system' and 'hybrid'. Static across all turns; safe
     to set once on the system message rather than re-sending per turn.
+
+    When cooperative tool-search is enabled (_TOOL_SEARCH_ENABLED) a small
+    <<<BEGIN_META_TOOLS>>> block is appended advertising the proxy-served
+    tool_search/tool_list meta-tools; off by default, so the prefix is
+    unchanged for a normal launch.
     """
+    meta_block = _META_TOOLS_PROMPT_BLOCK if _TOOL_SEARCH_ENABLED else ""
     return f"""
 
 ### Tool Usage Instructions
@@ -589,7 +664,7 @@ The following are the only tools available for use in this conversation. Any oth
 
 {tools_text}
 <<<END_AGENT_TOOLS>>>
-"""
+{meta_block}"""
 
 
 def _format_tool_signature(name, required, optional):
@@ -634,6 +709,10 @@ def _format_tool_entries(tool_signatures, tool_details=None):
         # <tool>`) load from each enabled MCP's recency.json into _MCP_TOOL_RECENCY.
         guidance = _HYBRID_TOOL_GUIDANCE.get(name) or _MCP_TOOL_RECENCY.get(name)
         head = f"- {signature}"
+        if name in _MCP_STATE_CHECK_TOOLS:
+            # Marks a state-mutating tool; the legend below tells the model to
+            # orient (call the server's read-only state tool) before calling it.
+            head = f"{head} [state-check]"
         if guidance:
             head = f"{head} — {guidance}"
         detail = details_by_name.get(name)
@@ -655,6 +734,22 @@ def _format_tool_entries(tool_signatures, tool_details=None):
         "are unavailable; parameter names must match exactly (e.g. "
         "`filename` fails where `filePath` is required)."
     )
+    if any(name in _MCP_STATE_CHECK_TOOLS for name, _, _ in tool_signatures):
+        # Orient-first rule, surfaced only when a state-check tool is actually in
+        # this turn's toolset. This is the standing "call state first" policy at
+        # the always-injected altitude (the harness ships no runtime AGENTS.md;
+        # the recency reminder is its standing-instruction channel).
+        legend += (
+            " A tool marked [state-check] mutates state — before calling it, "
+            "call the server's read-only state/orientation tool first to see "
+            "current state; don't mutate blind."
+        )
+    if _TOOL_SEARCH_ENABLED:
+        legend += (
+            " You can also call tool_list() to list every tool, or "
+            "tool_search({\"query\": \"...\"}) to fetch a tool's full signature "
+            "and description on demand."
+        )
     return f"\n\n{legend}\n" + "\n".join(lines)
 
 
@@ -1815,6 +1910,178 @@ def _retry_upstream_with_correction(
     return retry_json, retry_text, retry_payloads, retry_clean
 
 
+# ---------------------------------------------------------------------------
+# Cooperative tool-search (default off; HARNESS_TOOL_SEARCH=1)
+# ---------------------------------------------------------------------------
+#
+# The proxy advertises two synthetic meta-tools — tool_list / tool_search — and
+# serves them itself from the CURRENT request's tool array. The registry is the
+# inbound `tools` array, rebuilt every request, so there is no cache to go stale
+# when an MCP restarts mid-session (the schema-staleness gap the council flagged
+# dissolves under per-request indexing). opencode never sees a meta call: when
+# the model emits one, the proxy answers it and re-POSTs upstream until a real
+# response, exactly like the malformed-tool-call retry loop above.
+
+
+def _meta_tool_list(tools: Optional[List[Dict[str, Any]]]) -> str:
+    """Render tool_list() output: one line per available tool — its signature
+    plus the first line of its description. Pure function of the inbound tools
+    array (the per-request registry)."""
+    sigs = _extract_tool_signatures(tools, "")
+    if not sigs:
+        return "No tools available."
+    by_desc: Dict[str, str] = {}
+    for tool in tools or []:
+        func = tool.get("function", {}) if "function" in tool else tool
+        nm = func.get("name")
+        if nm:
+            by_desc[nm] = (func.get("description") or "").strip()
+    lines = []
+    for name, req, opt in sigs:
+        sig = _format_tool_signature(name, req, opt)
+        first = by_desc.get(name, "").split("\n", 1)[0].strip()
+        lines.append(f"- {sig}" + (f" — {first}" if first else ""))
+    return "Available tools:\n" + "\n".join(lines)
+
+
+def _meta_tool_search(query: str, tools: Optional[List[Dict[str, Any]]]) -> str:
+    """Render tool_search(query) output: full signature + description for tools
+    whose name or description contains the query (case-insensitive). An empty
+    query matches nothing (so a bare call doesn't dump the whole catalog —
+    tool_list() is the explicit way to do that). Pure function of the inbound
+    tools array."""
+    q = (query or "").strip().lower()
+    if not q:
+        return "Provide a non-empty query, or call tool_list() to see all tools."
+    matches = []
+    for tool in tools or []:
+        func = tool.get("function", {}) if "function" in tool else tool
+        name = func.get("name")
+        if not name:
+            continue
+        desc = func.get("description") or ""
+        if q in name.lower() or q in desc.lower():
+            req, opt = _split_schema_params(func.get("parameters") or {})
+            block = f"Tool: {_format_tool_signature(name, req, opt)}"
+            if desc.strip():
+                block += f"\n{desc.strip()}"
+            matches.append(block)
+    if not matches:
+        return f'No tools match "{query}". Call tool_list() to see all tools.'
+    return "\n\n".join(matches)
+
+
+def _is_meta_tool_call(payload: Any, real_tool_names: Iterable[str]) -> bool:
+    """True when a parsed tool call is a synthetic meta-tool the proxy serves
+    itself: its name is tool_search/tool_list AND that name is NOT a real tool
+    this turn. The second clause is the safety yield — if opencode ever ships a
+    real tool by one of these names, the real one wins and the proxy forwards
+    it untouched."""
+    if not isinstance(payload, dict):
+        return False
+    name = payload.get("name")
+    return name in _META_TOOL_NAMES and name not in set(real_tool_names or ())
+
+
+def _run_meta_tool(payload: Dict[str, Any], tools: Optional[List[Dict[str, Any]]]) -> str:
+    name = payload.get("name")
+    args = payload.get("arguments")
+    if name == "tool_list":
+        return _meta_tool_list(tools)
+    if name == "tool_search":
+        query = args.get("query", "") if isinstance(args, dict) else ""
+        return _meta_tool_search(query, tools)
+    return ""
+
+
+def _serve_meta_tools(
+    req_id: str,
+    original_messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    tools_text: str,
+    upstream_model: str,
+    headers: Dict[str, str],
+    assistant_text: str,
+    meta_payloads: List[Dict[str, Any]],
+) -> Optional[Tuple[Dict[str, Any], str, List[Dict[str, Any]], str]]:
+    """Serve one or more synthetic meta-tool calls and continue the upstream
+    conversation until the model emits a real (non-meta) response. The loop runs
+    entirely in the proxy — opencode never sees the meta call or its result.
+
+    Each round appends `[assistant(<meta call text>), user(<framed result>)]`
+    to the conversation (the result wrapped in the same <<<BEGIN_TOOL_RESULT>>>
+    markers a real tool result carries) and re-POSTs upstream. Bounded by
+    `_META_TOOL_SERVE_BUDGET` so a model that only ever searches can't loop
+    forever.
+
+    Returns `(target_json, response_text, payloads, clean_text)` for the first
+    non-meta response (real tool calls, prose, or empty — any stray meta call
+    mixed into it is stripped), or `None` if an upstream call failed or the
+    budget was exhausted still on meta calls. On `None` the caller drops the
+    meta calls rather than forwarding an unrunnable tool to opencode."""
+    real_names = _collect_tool_names(tools)
+    convo = list(original_messages)
+    text = assistant_text
+    payloads = meta_payloads
+    for attempt in range(1, _META_TOOL_SERVE_BUDGET + 1):
+        results = []
+        for p in payloads:
+            out = _run_meta_tool(p, tools)
+            results.append(
+                f'<<<BEGIN_TOOL_RESULT name="{p.get("name")}">>>\n'
+                f"{out}\n<<<END_TOOL_RESULT>>>"
+            )
+        convo = convo + [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": "\n\n".join(results)},
+        ]
+        translated = translate_history_and_apply_prompt(
+            convo, tools_text, tools=tools
+        )
+        payload: Dict[str, Any] = {"model": upstream_model, "messages": translated}
+        if _PROMPT_MODE == "passthrough" and tools:
+            payload["tools"] = tools
+        save_debug_file(req_id, "02", f"API_ToolSearch_Request_{attempt:02d}", payload)
+        try:
+            resp = requests.post(
+                CHAT_URL, headers=headers, json=payload,
+                verify=False, timeout=PROXY_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            print(f"[{req_id}] tool-search upstream request failed: {e}", flush=True)
+            save_debug_file(req_id, "03", f"API_ToolSearch_Error_{attempt:02d}", {"error": str(e)})
+            return None
+        if resp.status_code >= 400:
+            try:
+                err_body: Any = resp.json()
+            except Exception:
+                err_body = resp.text
+            print(f"[{req_id}] tool-search upstream returned {resp.status_code}: {err_body}", flush=True)
+            save_debug_file(req_id, "03", f"API_ToolSearch_Error_{attempt:02d}", {"status": resp.status_code, "body": err_body})
+            return None
+        try:
+            target_json = resp.json()
+        except ValueError as e:
+            print(f"[{req_id}] tool-search upstream returned non-JSON: {e}", flush=True)
+            save_debug_file(req_id, "03", f"API_ToolSearch_Error_{attempt:02d}", {"error": "non-json", "body": resp.text})
+            return None
+        save_debug_file(req_id, "03", f"API_ToolSearch_Response_{attempt:02d}", target_json)
+        text = extract_assistant_content(target_json)
+        new_payloads, new_clean = extract_tool_calls_and_text(
+            text, available_tool_names=real_names
+        )
+        meta = [p for p in new_payloads if _is_meta_tool_call(p, real_names)]
+        if meta and len(meta) == len(new_payloads):
+            # Still all meta — serve again next round (bounded by the budget).
+            payloads = meta
+            continue
+        final_payloads = [
+            p for p in new_payloads if not _is_meta_tool_call(p, real_names)
+        ]
+        return target_json, text, final_payloads, new_clean
+    return None
+
+
 def _select_rescue_tool(
     available_tool_names: Iterable[str],
 ) -> Optional[Dict[str, Any]]:
@@ -1927,6 +2194,17 @@ def catch_all(path: str) -> Response:
 
         tools_text = format_tools_to_text(tools)
         translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=tools)
+
+        # Catalog-size instrumentation (council gate-trigger). `tools` ≈ recency
+        # line count (one entry per tool); `schema_tokens` is what the full
+        # schemas at the stable prefix cost. Logged each request so the decision
+        # to migrate schemas behind tool-search is a measured number, not a
+        # guess. See architecture/proxy.md "Catalog-size instrumentation".
+        print(
+            f"[{req_id}] catalog: tools={len(_collect_tool_names(tools))} "
+            f"schema_tokens={_estimate_tokens(tools_text)}",
+            flush=True,
+        )
 
         # Forward whatever model the request asked for so the user can switch
         # between the upstream's models from opencode. opencode reads the bare
@@ -2047,6 +2325,42 @@ def catch_all(path: str) -> Response:
                     flush=True,
                 )
 
+        # Cooperative tool-search (default off; HARNESS_TOOL_SEARCH=1). When the
+        # model calls a synthetic meta-tool (tool_search/tool_list), the proxy
+        # serves it from the per-request tool registry and continues upstream
+        # until a real response — opencode never sees the meta call. A meta call
+        # is NEVER forwarded to opencode (it has no such tool): if serving fails
+        # it is dropped, and a turn that mixed meta + real calls keeps only the
+        # real ones. See architecture/proxy.md "Cooperative tool-search".
+        if _TOOL_SEARCH_ENABLED and tool_call_payloads:
+            real_names = _collect_tool_names(tools)
+            meta_payloads = [
+                p for p in tool_call_payloads if _is_meta_tool_call(p, real_names)
+            ]
+            if meta_payloads and len(meta_payloads) == len(tool_call_payloads):
+                served = _serve_meta_tools(
+                    req_id, original_messages, tools, tools_text,
+                    upstream_model, headers, response_text, meta_payloads,
+                )
+                if served is not None:
+                    target_json, response_text, tool_call_payloads, clean_text = served
+                    print(
+                        f"[{req_id}] served cooperative tool-search; continued "
+                        f"to real response (tool_calls={len(tool_call_payloads)})",
+                        flush=True,
+                    )
+                else:
+                    tool_call_payloads = []
+                    print(
+                        f"[{req_id}] cooperative tool-search did not resolve; "
+                        f"dropped meta call(s)",
+                        flush=True,
+                    )
+            elif meta_payloads:
+                tool_call_payloads = [
+                    p for p in tool_call_payloads if p not in meta_payloads
+                ]
+
         # Empty-response rescue (issue #117). Some upstreams silently
         # short-circuit before generation — well-formed JSON, finish_reason
         # "stop", zero completion tokens, no thinking, no safety fields —
@@ -2163,6 +2477,8 @@ def main() -> None:
     _setup_prompt_mode()
     _setup_host_os()
     _setup_mcp_tool_recency()
+    _setup_state_check_tools()
+    _setup_tool_search()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()
     if not raw_output:
@@ -2185,6 +2501,8 @@ def main() -> None:
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"
         f"   mcp recency:    {len(_MCP_TOOL_RECENCY)} tool(s)\n"
+        f"   state-check:    {len(_MCP_STATE_CHECK_TOOLS)} tool(s)\n"
+        f"   tool-search:    {'on' if _TOOL_SEARCH_ENABLED else 'off'}\n"
         f"   host OS:        {_HOST_OS or '(unknown)'}\n"
         f"   debug dumps:    {output_status}\n"
         "============================================================",

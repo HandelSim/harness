@@ -3561,5 +3561,162 @@ class TestOpenAIEmission(unittest.TestCase):
         self.assertIn("boom", body["error"]["message"])
 
 
+class TestCooperativeToolSearch(unittest.TestCase):
+    """Pure-function coverage for the cooperative tool-search build
+    (HARNESS_TOOL_SEARCH). The serve loop (`_serve_meta_tools`) is exercised
+    end-to-end by the docker proxy suite under CI; these cover the per-request
+    registry rendering and dispatch the loop is built on."""
+
+    TOOLS = [
+        {"function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "number"},
+                },
+                "required": ["command"],
+            },
+        }},
+        {"function": {
+            "name": "read",
+            "description": "Read a file from disk.",
+            "parameters": {
+                "type": "object",
+                "properties": {"filePath": {"type": "string"}},
+                "required": ["filePath"],
+            },
+        }},
+    ]
+
+    def test_tool_list_renders_one_line_per_tool(self):
+        out = proxy._meta_tool_list(self.TOOLS)
+        self.assertTrue(out.startswith("Available tools:\n"))
+        self.assertIn("- bash(command, [timeout])", out)
+        self.assertIn("Run a shell command.", out)
+        self.assertIn("- read(filePath)", out)
+        self.assertIn("Read a file from disk.", out)
+
+    def test_tool_list_empty_when_no_tools(self):
+        self.assertEqual(proxy._meta_tool_list(None), "No tools available.")
+        self.assertEqual(proxy._meta_tool_list([]), "No tools available.")
+
+    def test_tool_search_matches_name(self):
+        out = proxy._meta_tool_search("bash", self.TOOLS)
+        self.assertIn("Tool: bash(command, [timeout])", out)
+        self.assertIn("Run a shell command.", out)
+        self.assertNotIn("read(filePath)", out)
+
+    def test_tool_search_matches_description_case_insensitive(self):
+        out = proxy._meta_tool_search("FILE", self.TOOLS)
+        self.assertIn("Tool: read(filePath)", out)
+        self.assertNotIn("bash(command", out)
+
+    def test_tool_search_empty_query_does_not_dump_catalog(self):
+        out = proxy._meta_tool_search("", self.TOOLS)
+        self.assertNotIn("Tool:", out)
+        self.assertIn("tool_list()", out)
+
+    def test_tool_search_no_match_points_at_tool_list(self):
+        out = proxy._meta_tool_search("nonexistent_xyz", self.TOOLS)
+        self.assertIn("No tools match", out)
+        self.assertIn("tool_list()", out)
+
+    def test_is_meta_tool_call_true_for_synthetic_name(self):
+        self.assertTrue(
+            proxy._is_meta_tool_call({"name": "tool_list"}, {"bash", "read"}))
+        self.assertTrue(
+            proxy._is_meta_tool_call({"name": "tool_search"}, {"bash"}))
+
+    def test_is_meta_tool_call_yields_to_real_tool_of_same_name(self):
+        # Safety yield: if opencode ever ships a real tool by this name, the
+        # real one wins and the proxy forwards it untouched.
+        self.assertFalse(
+            proxy._is_meta_tool_call({"name": "tool_list"}, {"tool_list"}))
+
+    def test_is_meta_tool_call_false_for_real_and_non_dict(self):
+        self.assertFalse(proxy._is_meta_tool_call({"name": "bash"}, {"bash"}))
+        self.assertFalse(proxy._is_meta_tool_call("not a dict", set()))
+
+    def test_run_meta_tool_dispatch(self):
+        self.assertEqual(
+            proxy._run_meta_tool({"name": "tool_list", "arguments": {}}, self.TOOLS),
+            proxy._meta_tool_list(self.TOOLS),
+        )
+        self.assertEqual(
+            proxy._run_meta_tool(
+                {"name": "tool_search", "arguments": {"query": "bash"}}, self.TOOLS),
+            proxy._meta_tool_search("bash", self.TOOLS),
+        )
+        self.assertEqual(proxy._run_meta_tool({"name": "other"}, self.TOOLS), "")
+
+
+class TestStateCheckRendering(unittest.TestCase):
+    """`_format_tool_entries` marks state-mutating tools `[state-check]` and,
+    when one is present, appends the orient-first rule to the legend. Driven by
+    the `_MCP_STATE_CHECK_TOOLS` global (loaded from HARNESS_MCP_STATE_CHECK)."""
+
+    def test_state_check_marker_and_orient_legend(self):
+        sigs = [("host_build", ["target"], []), ("host_state", [], [])]
+        with patch.object(proxy, "_MCP_STATE_CHECK_TOOLS", {"host_build"}), \
+                patch.object(proxy, "_MCP_TOOL_RECENCY", {}), \
+                patch.object(proxy, "_TOOL_SEARCH_ENABLED", False):
+            out = proxy._format_tool_entries(sigs)
+        self.assertIn("- host_build(target) [state-check]", out)
+        self.assertIn("- host_state", out)
+        self.assertNotIn("host_state(", out)  # zero-param tool renders bare
+        self.assertIn("[state-check] mutates state", out)
+
+    def test_no_orient_legend_without_state_check_tool(self):
+        sigs = [("host_state", [], [])]
+        with patch.object(proxy, "_MCP_STATE_CHECK_TOOLS", set()), \
+                patch.object(proxy, "_MCP_TOOL_RECENCY", {}), \
+                patch.object(proxy, "_TOOL_SEARCH_ENABLED", False):
+            out = proxy._format_tool_entries(sigs)
+        self.assertNotIn("[state-check]", out)
+        self.assertNotIn("mutates state", out)
+
+    def test_tool_search_legend_appended_when_enabled(self):
+        sigs = [("host_state", [], [])]
+        with patch.object(proxy, "_MCP_STATE_CHECK_TOOLS", set()), \
+                patch.object(proxy, "_MCP_TOOL_RECENCY", {}), \
+                patch.object(proxy, "_TOOL_SEARCH_ENABLED", True):
+            out = proxy._format_tool_entries(sigs)
+        self.assertIn("tool_list()", out)
+        self.assertIn("tool_search(", out)
+
+
+class TestSetupStateCheckAndToolSearch(unittest.TestCase):
+    """Env parsing for the two new setup functions, mirroring
+    `_setup_mcp_tool_recency`'s graceful-degradation contract."""
+
+    def test_setup_state_check_parses_json_array(self):
+        cases = [
+            ('["a_b", "c_d"]', {"a_b", "c_d"}),
+            ("", set()),
+            ("not json", set()),
+            ('{"a": 1}', set()),
+            ("[]", set()),
+            ('["a_b", 5, ""]', {"a_b"}),
+        ]
+        for raw, expected in cases:
+            with patch.dict(os.environ, {"HARNESS_MCP_STATE_CHECK": raw}):
+                proxy._setup_state_check_tools()
+                self.assertEqual(proxy._MCP_STATE_CHECK_TOOLS, expected)
+        proxy._MCP_STATE_CHECK_TOOLS = set()
+
+    def test_setup_tool_search_truthy_values(self):
+        for raw, expected in [
+            ("1", True), ("true", True), ("yes", True), ("on", True),
+            ("0", False), ("false", False), ("", False), ("nope", False),
+        ]:
+            with patch.dict(os.environ, {"HARNESS_TOOL_SEARCH": raw}):
+                proxy._setup_tool_search()
+                self.assertEqual(proxy._TOOL_SEARCH_ENABLED, expected)
+        proxy._TOOL_SEARCH_ENABLED = False
+
+
 if __name__ == "__main__":
     unittest.main()

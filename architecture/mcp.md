@@ -220,6 +220,7 @@ Format — `recency.json` next to the MCP's other files:
   "server": "<name>",
   "tools": {
     "<bare_tool_name>": "One terse line: the failure mode or when-to-use.",
+    "<mutating_tool>": {"line": "One terse line.", "state_check": true},
     ...
   }
 }
@@ -229,6 +230,18 @@ Keys are **bare** tool names; the CLI prefixes them with `<server>_` to match
 how opencode names an MCP server's tools (`<server>_<tool>`). Lines are kept
 minimal — the recency block is budget-constrained and the full schema is
 already at the stable prefix.
+
+A tool's value is **either** a plain string (the line) **or** an object
+`{"line": "...", "state_check": true}`. The string form is the common case. The
+object form's `state_check: true` flags a **state-mutating** tool: the proxy
+renders a `[state-check]` marker on that tool's recency entry and, when any
+flagged tool is in the turn's toolset, adds an orient-first line telling the
+agent to call the server's read-only state/orientation tool before mutating
+(see `architecture/proxy.md` "State-check marker + orient-first rule"). The CLI
+collects the flagged tools into `HARNESS_MCP_STATE_CHECK` via
+`mcp_state_check_json`, the mirror of `mcp_tool_recency_json` (same source
+precedence and `<server>_` prefixing); a string-valued tool contributes only to
+the recency map, never to the state-check array.
 
 `mcp_tool_recency_json` (called once in `cmd_start`) builds the merged map. For
 every **enabled** MCP under `state/mcp/<name>/` it locates that MCP's

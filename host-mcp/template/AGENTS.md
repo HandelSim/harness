@@ -116,20 +116,31 @@ keyed by the **bare tool name** (no server prefix — harness adds it):
   "server": "__MCP_NAME__",
   "tools": {
     "project_state": "Call FIRST before any other tool here: reports whether the project is configured/built so you don't call build blind.",
-    "configure": "Generate the CMake build tree; run once before build, and again after editing CMakeLists.",
-    "build": "Compile the project; pass `target` to build one target. Read get_build_errors on failure.",
+    "configure": {"line": "Generate the CMake build tree; run once before build, and again after editing CMakeLists.", "state_check": true},
+    "build": {"line": "Compile the project; pass `target` to build one target. Read get_build_errors on failure.", "state_check": true},
     "get_build_errors": "Return the last build's compiler errors; call after a failed build, not before."
   }
 }
 ```
 
+A tool's value is **either** a plain string (the line) **or** an object
+`{"line": "...", "state_check": true}`. Use the object form with
+`state_check: true` for **state-mutating** tools (`configure`, `build`,
+`clean`, `run_target` — anything that changes the build tree or runs a
+target). harness then marks those tools `[state-check]` in the agent's recency
+reminder and, when one is present, adds a line telling the agent to call
+`project_state` first. Read-only tools (`project_state`, `get_build_errors`,
+`list_targets`) stay plain strings.
+
 Rules:
-- **Minimal.** One line per tool. Say the failure mode or when-to-use, not the
-  whole docstring. The full schema is already available to the agent; this line
-  is the terse reminder it reads every turn, and the block is budget-constrained.
+- **Minimal.** One line per tool (the string, or the object's `line`). Say the
+  failure mode or when-to-use, not the whole docstring. The full schema is
+  already available to the agent; this line is the terse reminder it reads every
+  turn, and the block is budget-constrained.
 - **Keep `project_state` first** and make its line say "call first" — that one
   reminder, delivered every turn, is what gets the agent to check build state
-  before it starts calling build tools blind.
+  before it starts calling build tools blind. Flag the mutating tools
+  `state_check: true` so the orient-first line backs it up structurally.
 - One entry per tool you kept. Drop entries for tools you pruned from `server.py`.
 - Bare tool names as keys. harness prefixes them with `__MCP_NAME___` to match
   how the tools appear in the agent's tool list.
