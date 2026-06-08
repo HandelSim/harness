@@ -24,6 +24,12 @@ egress firewall. Agents are short-lived containers spawned by `harness` /
 `harness opencode` / `harness shell`; they join the same network for the
 duration of an invocation.
 
+There is also a containerless mode: `harness host` runs the proxy and opencode
+as plain host processes (no docker, no images) for a lighter footprint. It
+trades away the egress firewall and container isolation — which are
+container-bound — so it gates every launch behind a mandatory confirmation. See
+[`harness-cli.md`](harness-cli.md) → "Host mode".
+
 ## Repo IS the install root
 
 The clone of this repo IS the install root. Code, user config (`.env`,

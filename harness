@@ -512,15 +512,26 @@ _check_and_offer_config_merge() {
 # platform.sh:harness_require_docker when the library is available; falls
 # back to the original probe-only check if not.
 require_docker() {
-    if declare -f harness_require_docker >/dev/null 2>&1; then
-        harness_require_docker
-        return 0
+    # Container subcommands need a runtime; host mode (harness host) does not.
+    # Replicate harness_require_docker's reach/auto-start logic so we can append
+    # the host-mode hint to its failure path (the library helper exits with its
+    # own message, leaving no place to add the pointer).
+    if declare -f harness_docker_running >/dev/null 2>&1; then
+        harness_docker_running && return 0
+        if declare -f harness_start_docker_desktop >/dev/null 2>&1 \
+            && harness_start_docker_desktop; then
+            return 0
+        fi
+        err "container runtime is required for this command but is not available."
+        err "for a containerless run (no docker), use 'harness host'."
+        exit 1
     fi
     # Fallback when platform.sh wasn't sourced — try docker first, then podman.
     if docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1; then
         return 0
     fi
     err "container runtime (docker or podman) is not reachable; is it running?"
+    err "for a containerless run (no docker), use 'harness host'."
     exit 1
 }
 
@@ -1360,6 +1371,14 @@ commands:
   logs [service ...]    follow compose logs (no args = all services)
   opencode [args]       launch an opencode agent in the current directory
                         (same as running bare 'harness')
+  host [args]           run CONTAINERLESS: proxy + opencode as plain host
+                        processes, no docker. Lighter footprint (no daemon,
+                        no images), but there is NO egress firewall and the
+                        agent runs as your full host user, so every launch
+                        prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip
+                        in automation). Accepts --yolo and -p like a normal
+                        launch. Needs Node >= 20, opencode, python3, jq on the
+                        host. 'harness host down' stops the host proxy.
   shell [--mount PATH]... drop into a bash shell inside the agent container
                         (for installing skills, debugging — shares the home
                         directory with agent launches)
@@ -2586,6 +2605,436 @@ host_mcp_stop_all() {
         echo "[harness] stopping host MCP: $name" >&2
         host_mcp_stop "$name"
     done
+}
+
+# --- host mode (containerless) ----------------------------------------------
+#
+# `harness host` runs the whole stack as plain host processes — no docker, no
+# containers. The translating proxy runs from a lazily-built venv under
+# state/host/; opencode runs directly off the host PATH against it. This is the
+# light-footprint mode: it drops the docker daemon and the multi-GB images, at
+# the cost of the egress firewall — which is container-bound (it lays a
+# host-global iptables default-deny that cannot be scoped to one process) and so
+# is simply ABSENT here. Because there is no firewall and the agent runs as the
+# full host user, every launch is gated behind an explicit confirmation
+# (host_confirm_gate), worded harder than --net. v1 is deliberately minimal:
+# single CWD, no host-MCP wiring, Linux/macOS only.
+# See architecture/harness-cli.md (Host mode).
+
+host_state_dir()       { printf '%s/host' "$state_root"; }
+host_venv_dir()        { printf '%s/host/venv' "$state_root"; }
+host_proxy_pidfile()   { printf '%s/host/proxy.pid' "$state_root"; }
+host_proxy_logfile()   { printf '%s/host/proxy.log' "$state_root"; }
+host_opencode_config() { printf '%s/host/opencode.json' "$state_root"; }
+host_proxy_port()      { printf '%s' "${PROXY_PORT:-8000}"; }
+
+# Echo the live PID for the host proxy, or nothing. Cleans a stale pidfile whose
+# process is gone. Mirrors host_mcp_pid. Always returns 0.
+host_proxy_pid() {
+    local pf pid
+    pf=$(host_proxy_pidfile)
+    [[ -f "$pf" ]] || return 0
+    pid=$(tr -d ' \t\r\n' <"$pf" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        printf '%s' "$pid"
+        return 0
+    fi
+    rm -f "$pf" 2>/dev/null || true
+    return 0
+}
+
+host_proxy_running() { [[ -n "$(host_proxy_pid)" ]]; }
+
+# Verify the host can run containerless mode. Unlike container mode, host mode
+# cannot fall back to the jq-in-proxy-image sidecar (no docker), so host jq is
+# required outright. python3 runs the proxy; Node >= 20 + opencode are the agent
+# runtime. Prints exact install hints and returns non-zero if anything is
+# missing — we never auto-install Node or a package manager for the user.
+host_preflight() {
+    local missing_dep=0
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        err "host mode needs python3 (runs the translating proxy); not found in PATH"
+        missing_dep=1
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        err "host mode needs 'jq' on the host (no docker fallback in host mode); not found in PATH"
+        err "  install: apt-get install jq  |  brew install jq"
+        missing_dep=1
+    fi
+
+    if ! command -v node >/dev/null 2>&1; then
+        err "host mode needs Node.js >= 20 (opencode runtime); not found in PATH"
+        err "  install: https://nodejs.org/  (or: nvm install 20)"
+        missing_dep=1
+    else
+        local major
+        major=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
+        if [[ -z "$major" ]] || (( major < 20 )); then
+            err "host mode needs Node.js >= 20; found $(node --version 2>/dev/null)"
+            err "  upgrade: https://nodejs.org/  (or: nvm install 20)"
+            missing_dep=1
+        fi
+    fi
+
+    if ! command -v opencode >/dev/null 2>&1; then
+        err "host mode needs the 'opencode' CLI; not found in PATH"
+        err "  install: npm i -g opencode-ai@1.15.7 @ai-sdk/openai-compatible@2.0.47"
+        missing_dep=1
+    fi
+
+    (( missing_dep == 0 ))
+}
+
+# Lighter sibling of require_runtime_config: host mode reads the same three
+# REQUIRED proxy vars but has no firewall allowlist to validate (the allowlist
+# only governs container mode). .env is already sourced into this shell.
+host_require_config() {
+    if [[ ! -f "$env_file" ]]; then
+        err "missing $env_file"
+        err "  cp $clone_dir/.env.example $env_file"
+        err "  then set PROXY_API_URL / PROXY_API_KEY / DEFAULT_MODEL_NAME"
+        exit 1
+    fi
+    local missing=() v
+    for v in PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME; do
+        [[ -z "${!v:-}" ]] && missing+=("$v")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        err "required value(s) empty in $env_file: ${missing[*]}"
+        err "edit $env_file and set them, then re-run."
+        exit 1
+    fi
+}
+
+# Mandatory pre-launch gate for host mode. Host mode runs opencode as the full
+# host user with no egress firewall — a strictly bigger blast radius than --net
+# — so this fires on EVERY launch (unlike --net's per-invocation flag). Worded
+# harder than warn_if_firewall_open accordingly. HARNESS_HOST_CONFIRM=1 bypasses
+# it (automation); refuses non-interactive without /dev/tty.
+host_confirm_gate() {
+    local yolo="${1:-0}"
+    echo >&2
+    echo "WARNING: HOST MODE RUNS WITH NO CONTAINER ISOLATION" >&2
+    echo >&2
+    echo "  ! opencode runs as your full host user ($(id -un)) — it can read and" >&2
+    echo "    write every file your account can, including ~/.ssh, ~/.aws, ~/.config." >&2
+    echo "  ! There is NO egress firewall. Outbound network is UNRESTRICTED (the" >&2
+    echo "    harness allowlist only applies to container mode)." >&2
+    if [[ "$yolo" == "1" ]]; then
+        echo "  ! --yolo auto-approves every edit and shell command with no prompt." >&2
+    fi
+    echo >&2
+    echo "  This is a bigger blast radius than 'harness --net'. Only continue on a" >&2
+    echo "  machine and in a directory where you accept that." >&2
+    echo >&2
+
+    if [[ "${HARNESS_HOST_CONFIRM:-0}" == "1" ]]; then
+        echo "  (auto-confirmed via HARNESS_HOST_CONFIRM=1)" >&2
+        return 0
+    fi
+    if [[ ! -e /dev/tty ]]; then
+        err "non-interactive shell without /dev/tty; refusing to launch host mode"
+        err "set HARNESS_HOST_CONFIRM=1 to skip this prompt in automation"
+        return 1
+    fi
+    local ans
+    printf 'Continue launching host-mode opencode? [y/n]: ' >&2
+    if ! IFS= read -r ans </dev/tty; then
+        err "no input received; aborting"
+        return 1
+    fi
+    case "${ans:-}" in
+        y|Y|yes|YES) return 0 ;;
+        *) err "aborted by user"; return 1 ;;
+    esac
+}
+
+# Build (once) the lazy venv that runs the proxy and install its two pure-python
+# deps (flask, requests) from proxy/requirements.txt. A stamp keyed on the
+# requirements file's hash means pip only re-runs when that file changes.
+host_proxy_ensure_venv() {
+    local venv reqs stamp want
+    venv=$(host_venv_dir)
+    reqs="$clone_dir/proxy/requirements.txt"
+    stamp="$venv/.harness-reqs-sha"
+    want=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        want=$(sha256sum "$reqs" 2>/dev/null | cut -d' ' -f1)
+    fi
+    if [[ -x "$venv/bin/python" && -n "$want" && -f "$stamp" \
+          && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
+        return 0
+    fi
+    if [[ ! -x "$venv/bin/python" ]]; then
+        echo "[harness] host mode: creating proxy venv (one-time)..." >&2
+        if ! python3 -m venv "$venv"; then
+            err "failed to create venv at $venv (is the python3 venv module installed?)"
+            return 1
+        fi
+    fi
+    echo "[harness] host mode: installing proxy deps (flask, requests)..." >&2
+    if ! "$venv/bin/python" -m pip install --quiet --disable-pip-version-check -r "$reqs"; then
+        err "pip install of proxy deps failed (see output above)"
+        return 1
+    fi
+    [[ -n "$want" ]] && printf '%s\n' "$want" >"$stamp" 2>/dev/null || true
+    return 0
+}
+
+# Start the host proxy in the background (idempotent). Binds 127.0.0.1 only —
+# the host proxy must never be reachable off-box. The proxy reads its REQUIRED
+# env (PROXY_API_URL/KEY, DEFAULT_MODEL_NAME, etc.) straight from this shell,
+# which sourced .env with `set -a`, so only the host-specific overrides are set
+# here. Records the PID; pipes stdout+stderr to the logfile.
+host_proxy_start() {
+    host_proxy_running && return 0
+    host_proxy_ensure_venv || return 1
+    local venv port pf lf
+    venv=$(host_venv_dir)
+    port=$(host_proxy_port)
+    pf=$(host_proxy_pidfile)
+    lf=$(host_proxy_logfile)
+    mkdir -p "$(host_state_dir)"
+    echo "[harness] host mode: starting proxy on 127.0.0.1:$port" >&2
+    PROXY_HOST=127.0.0.1 \
+        PROXY_PORT="$port" \
+        OUTPUT_DIR="$state_root/output" \
+        HARNESS_HOST_OS="$(harness_detect_os)" \
+        nohup "$venv/bin/python" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
+    printf '%s\n' "$!" >"$pf"
+}
+
+# Wait for the host proxy to accept connections on its loopback port. The proxy
+# calls app.run() last (after all config validation), so an accepted connect
+# means it is serving. A plain /dev/tcp probe avoids a curl dependency (mirrors
+# host_mcp_port_open). Surfaces the proxy log on failure — the common cause is a
+# config error that made _validate_config sys.exit(1).
+host_proxy_wait_ready() {
+    local port i=0
+    port=$(host_proxy_port)
+    while (( i < 50 )); do
+        if ! host_proxy_running; then
+            err "host proxy exited during startup; last log lines:"
+            tail -n 20 "$(host_proxy_logfile)" >&2 2>/dev/null || true
+            return 1
+        fi
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+            exec 3>&- 3<&- 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.2
+        i=$((i+1))
+    done
+    err "host proxy did not start listening on 127.0.0.1:$port within ~10s"
+    tail -n 20 "$(host_proxy_logfile)" >&2 2>/dev/null || true
+    return 1
+}
+
+# Stop the supervised host proxy: TERM, brief wait, then KILL. Removes the
+# pidfile. Mirrors host_mcp_stop. Always returns 0.
+host_proxy_stop() {
+    local pid pf i
+    pid=$(host_proxy_pid)
+    pf=$(host_proxy_pidfile)
+    if [[ -z "$pid" ]]; then
+        rm -f "$pf" 2>/dev/null || true
+        return 0
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    for i in 1 2 3 4 5; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    rm -f "$pf" 2>/dev/null || true
+}
+
+# Write the host opencode config to a scoped file and point OPENCODE_CONFIG at
+# it (done by the caller) so the user's global ~/.config/opencode/opencode.json
+# is never touched. Same shape as the container entrypoint's
+# ensure_opencode_config, but baseURL → 127.0.0.1 and built with harness_jq.
+# curl is optional: the model dropdown comes from the proxy's /v1/models when
+# curl is present, else falls back to DEFAULT_MODEL_NAME alone.
+host_write_opencode_config() {
+    local config_file port proxy_url default_model ctx
+    config_file=$(host_opencode_config)
+    mkdir -p "$(dirname "$config_file")"
+    port=$(host_proxy_port)
+    proxy_url="http://127.0.0.1:${port}/v1"
+    default_model="${DEFAULT_MODEL_NAME:-}"
+    ctx="${MODEL_CONTEXT_LENGTH:-${OLLAMA_CONTEXT_LENGTH:-200000}}"
+
+    local model_ids=() catalog
+    if command -v curl >/dev/null 2>&1; then
+        catalog=$(curl -fsS --max-time 10 "${proxy_url}/models" 2>/dev/null || true)
+        if [[ -n "$catalog" ]]; then
+            mapfile -t model_ids < <(printf '%s' "$catalog" \
+                | harness_jq -r '.data[]?.id' 2>/dev/null | sort -u || true)
+        fi
+    fi
+    if [[ -n "$default_model" ]]; then
+        local found=0 m
+        for m in "${model_ids[@]}"; do [[ "$m" == "$default_model" ]] && found=1; done
+        (( found == 0 )) && model_ids+=("$default_model")
+    fi
+    if (( ${#model_ids[@]} == 0 )); then
+        model_ids=("${default_model:-default}")
+    fi
+
+    local selected="$default_model"
+    [[ -z "$selected" ]] && selected="${model_ids[0]}"
+
+    local models_json
+    models_json=$(printf '%s\n' "${model_ids[@]}" | harness_jq -R . | harness_jq -s \
+        --argjson ctx "$ctx" \
+        'map({key: ., value: {name: ., limit: {context: $ctx, output: 8192}}}) | from_entries')
+
+    harness_jq -n \
+        --arg provider_name "GenAI Harness" \
+        --arg proxy_url "$proxy_url" \
+        --arg selected "harness/${selected}" \
+        --argjson models "$models_json" \
+        '{
+          "$schema": "https://opencode.ai/config.json",
+          "provider": {
+            "harness": {
+              "npm": "@ai-sdk/openai-compatible",
+              "name": $provider_name,
+              "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy"},
+              "models": $models
+            }
+          },
+          "model": $selected,
+          "small_model": $selected,
+          "agent": {
+            "yolo": {
+              "description": "Auto-approve all permissions; harness yolo mode",
+              "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": "allow", "websearch": "allow"}
+            }
+          }
+        }' > "$config_file"
+}
+
+# Launch opencode against the host proxy. Mirrors agents/entrypoint.sh
+# run_opencode (provider env, --agent yolo, and the headless `-p` json-events +
+# `opencode export` dance that dodges opencode 1.15.x's render race). Interactive
+# runs as a child (not exec) so the proxy is torn down on exit; print mode leaves
+# the proxy up so a scripted `-p` loop doesn't thrash it (`harness host down`
+# stops it).
+host_run_opencode() {
+    local yolo="$1" print_mode="$2"; shift 2
+    local pass_args=("$@")
+
+    export OPENCODE_CONFIG="$(host_opencode_config)"
+    export OPENCODE_DISABLE_AUTOUPDATE=1
+    export OPENCODE_ENABLE_EXA=1
+
+    local args=()
+    [[ "$yolo" == "1" ]] && args+=(--agent yolo)
+
+    echo "============================================================" >&2
+    echo " harness host (opencode, containerless)" >&2
+    echo "   provider: GenAI Harness" >&2
+    echo "   model:    harness/${DEFAULT_MODEL_NAME:-default}" >&2
+    echo "   proxy:    http://127.0.0.1:$(host_proxy_port)/v1" >&2
+    echo "   yolo:     ${yolo}" >&2
+    echo "   print:    ${print_mode}" >&2
+    echo "============================================================" >&2
+
+    if [[ "$print_mode" == "1" ]]; then
+        # opencode has no -p flag — strip a leading -p/--print and hand the rest
+        # to `opencode run`. Same as the container entrypoint.
+        local op_args=() seen_p=0 arg
+        if (( ${#pass_args[@]} )); then
+            for arg in "${pass_args[@]}"; do
+                if [[ "$seen_p" == "0" && ( "$arg" == "-p" || "$arg" == "--print" ) ]]; then
+                    seen_p=1
+                    continue
+                fi
+                op_args+=("$arg")
+            done
+        fi
+
+        local events_file rc sid text
+        events_file="$(mktemp)"
+        local -a runcmd=(opencode run --format json)
+        (( ${#args[@]} )) && runcmd+=("${args[@]}")
+        (( ${#op_args[@]} )) && runcmd+=("${op_args[@]}")
+        rc=0
+        "${runcmd[@]}" >"${events_file}" || rc=$?
+        sid="$(harness_jq -rs 'map(select(.sessionID))[0].sessionID // empty' "${events_file}" 2>/dev/null || true)"
+        if [[ -z "${sid}" ]]; then
+            sid="$(opencode session list --format json 2>/dev/null \
+                | harness_jq -r --arg dir "$PWD" '((map(select(.directory==$dir)) | max_by(.created) | .id) // (max_by(.created) | .id)) // empty' 2>/dev/null || true)"
+        fi
+        text=""
+        if [[ -n "${sid}" ]]; then
+            text="$(opencode export "${sid}" 2>/dev/null \
+                | harness_jq -r '([.messages[] | select(.info.role=="assistant")] | last | (.parts[]? | select(.type=="text") | .text)) // empty' 2>/dev/null || true)"
+        fi
+        if [[ -z "${text}" ]]; then
+            text="$(harness_jq -rs '[.[] | select(.type=="text") | .part.text] | join("")' "${events_file}" 2>/dev/null || true)"
+        fi
+        [[ -n "${text}" ]] && printf '%s\n' "${text}"
+        rm -f "${events_file}"
+        return "${rc}"
+    fi
+
+    # Interactive: child process (not exec) so we can stop the proxy after.
+    local -a cmd=(opencode)
+    (( ${#args[@]} )) && cmd+=("${args[@]}")
+    (( ${#pass_args[@]} )) && cmd+=("${pass_args[@]}")
+    local rc=0
+    "${cmd[@]}" || rc=$?
+    host_proxy_stop
+    return "$rc"
+}
+
+# `harness host` — containerless launch. `harness host down` stops the proxy.
+cmd_host() {
+    if [[ "${1:-}" == "down" ]]; then
+        cmd_host_down
+        return
+    fi
+
+    local yolo=0 print_mode=0
+    local pass_args=()
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --yolo)      yolo=1 ;;
+            -p|--print)  print_mode=1; pass_args+=("$arg") ;;
+            *)           pass_args+=("$arg") ;;
+        esac
+    done
+
+    host_preflight || exit 1
+    host_require_config
+    host_confirm_gate "$yolo" || exit 1
+
+    ensure_dirs
+    host_proxy_start || exit 1
+    host_proxy_wait_ready || { host_proxy_stop; exit 1; }
+    host_write_opencode_config
+
+    local rc=0
+    if (( ${#pass_args[@]} )); then
+        host_run_opencode "$yolo" "$print_mode" "${pass_args[@]}" || rc=$?
+    else
+        host_run_opencode "$yolo" "$print_mode" || rc=$?
+    fi
+    exit "$rc"
+}
+
+cmd_host_down() {
+    if host_proxy_running; then
+        echo "[harness] host mode: stopping proxy" >&2
+        host_proxy_stop
+    else
+        echo "[harness] host mode: no proxy running" >&2
+    fi
 }
 
 # Run an opencode agent in the current directory.
@@ -6118,6 +6567,7 @@ main() {
         check-updates)              cmd_check_updates "$@" ;;
         logs)                       cmd_logs "$@" ;;
         opencode)                   run_agent opencode "$@" ;;
+        host)                       cmd_host "$@" ;;
         shell)                      cmd_shell "$@" ;;
         list)                       cmd_list ;;
         stop)                       cmd_stop "$@" ;;

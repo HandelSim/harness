@@ -10,9 +10,16 @@ run from an empty directory. Stages:
 
 1. **Preflight.** Inline-defined `_inline_*` helpers (so the script
    works pre-clone, when `scripts/lib/platform.sh` isn't local yet)
-   check: container runtime present (docker or podman), runtime reachable
-   (`docker info`), required commands available. Failures abort with a
-   clear message.
+   check `git`, disk space, write access, and a free clone dir; failures
+   abort with a clear message. The **container runtime is optional**: harness
+   has a containerless `host` mode (`harness host` — see
+   [`harness-cli.md`](harness-cli.md) → "Host mode"), so a missing/unreachable
+   docker or podman is a warning, not an abort. When neither runtime is found,
+   preflight sets a `HOST_ONLY` flag and the closing message tells the user to
+   use `harness host` and that container subcommands will need docker installed
+   later. (When a runtime *is* present, compose-availability and reachability
+   are still reported, but as warnings — container mode needs them, `harness
+   host` does not.)
 2. **Intent prompts.** Prints what the install will do, then asks whether to
    add a `harness` wrapper to PATH and offers to capture an upstream API key
    now (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves

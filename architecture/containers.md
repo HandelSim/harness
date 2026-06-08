@@ -214,6 +214,19 @@ configured `PROXY_API_URL` host, and allowlist entries.
 requires the user to type `I understand the risks` on a TTY; scripts
 cannot bypass.
 
+### Host mode has no firewall
+
+This firewall is genuinely container-bound: it lays a host-global iptables
+default-deny that only stays scoped because each agent/proxy runs in its own
+network namespace. There is no per-process equivalent — applied to a bare host
+process it would set default-DROP for the entire machine. So `harness host`
+(the containerless mode — see [`harness-cli.md`](harness-cli.md) → "Host mode")
+runs **without any egress confinement**: the proxy and opencode are ordinary host
+processes with unfiltered network, and opencode runs as the full host user. That
+is a strictly bigger blast radius than `--net` (which only drops the firewall but
+keeps container/user isolation), which is why `harness host` gates **every**
+launch behind a mandatory confirmation rather than a per-invocation flag.
+
 ### Host proxy reaches builds, never running containers
 
 `HTTP_PROXY`/`HTTPS_PROXY` (see [`harness-cli.md`](harness-cli.md)) are

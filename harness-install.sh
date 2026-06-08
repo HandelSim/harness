@@ -279,35 +279,44 @@ preflight() {
     title "preflight checks"
 
     _inline_check_command git "git" || errors=$((errors+1))
-    _inline_check_either_command docker podman "container runtime (docker or podman)" \
-        || errors=$((errors+1))
 
-    local rt
-    rt=$(_inline_container_runtime)
+    # Container runtime is OPTIONAL. harness has a containerless 'host' mode
+    # ('harness host') that needs no docker, so a missing/unreachable runtime is
+    # no longer a hard failure: we install host-only and say so. Container
+    # subcommands (start/opencode/shell) then tell the user to install docker or
+    # use 'harness host'. HOST_ONLY (global, this function isn't called twice)
+    # is read by the closing messages to tailor next-steps.
+    HOST_ONLY=0
+    if command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1; then
+        local rt
+        rt=$(_inline_container_runtime)
 
-    if ! "$rt" compose version >/dev/null 2>&1; then
-        echo "  ✗ $rt compose — 'compose' subcommand not available"
-        if [[ "$rt" == "docker" ]]; then
-            echo "    (you may have docker, but need compose v2 specifically)"
+        if ! "$rt" compose version >/dev/null 2>&1; then
+            echo "  ⚠ $rt compose — 'compose' subcommand not available"
+            if [[ "$rt" == "docker" ]]; then
+                echo "    (you may have docker, but container mode needs compose v2; 'harness host' still works)"
+            else
+                echo "    (podman 4.0+ is required for 'podman compose'; 'harness host' still works)"
+            fi
         else
-            echo "    (podman 4.0+ is required for the built-in 'podman compose' subcommand)"
+            echo "  ✓ $rt compose"
         fi
-        errors=$((errors+1))
-    else
-        echo "  ✓ $rt compose"
-    fi
 
-    # Container runtime (with auto-start attempt on Win/Mac)
-    if _inline_docker_running; then
-        echo "  ✓ $rt runtime"
-    else
-        echo "  - $rt runtime not reachable; attempting auto-start..."
-        if _inline_start_docker; then
-            echo "  ✓ $rt runtime (started)"
+        # Container runtime (with auto-start attempt on Win/Mac)
+        if _inline_docker_running; then
+            echo "  ✓ $rt runtime"
         else
-            echo "  ✗ $rt runtime not running"
-            errors=$((errors+1))
+            echo "  - $rt runtime not reachable; attempting auto-start..."
+            if _inline_start_docker; then
+                echo "  ✓ $rt runtime (started)"
+            else
+                echo "  ⚠ $rt runtime not running — start it for container mode; 'harness host' works without it"
+            fi
         fi
+    else
+        HOST_ONLY=1
+        echo "  ⚠ no container runtime (docker/podman) found — installing host-only"
+        echo "    'harness host' runs containerless; 'harness start/opencode/shell' will need docker"
     fi
 
     # Disk space (5GB recommended for fresh install + image pulls)
@@ -875,12 +884,30 @@ else
 EOF
 fi
 
+if (( ${HOST_ONLY:-0} == 1 )); then
+cat <<EOF
+
+No container runtime was found, so this is a HOST-ONLY install. Use the
+containerless mode:
+  cd into any project directory and run: harness host [agent flags...]
+
+'harness host' runs the proxy + opencode as plain host processes (needs Node
+>= 20, opencode, python3, jq). It has NO egress firewall and runs as your full
+host user, so it prompts to confirm on every launch. Install docker/podman
+later if you want the sandboxed container mode ('harness start/opencode').
+EOF
+else
 cat <<EOF
 
 Running 'harness' with no command launches an opencode agent in the current
 directory ('harness opencode' does the same). The FIRST run builds the
 container images (proxy + agent), so expect it to take a few minutes;
 every run afterward starts in seconds.
+
+Prefer a lighter footprint with no docker? 'harness host' runs the proxy +
+opencode as plain host processes (no daemon, no images). It trades away the
+egress firewall and container isolation, so it prompts to confirm on every
+launch.
 
 Common agent flags (examples, not the full set):
   --yolo         auto-approve / skip-permissions
@@ -894,5 +921,6 @@ Tip: don't install the 'serena' MCP up front — it adds a slow image build to
 your first run. Add it later with 'harness mcp install serena', and only if
 you understand it and know you need it.
 EOF
+fi
 
 exit_or_return 0

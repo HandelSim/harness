@@ -81,6 +81,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Lifecycle | `start`, `down`, `restart`, `logs`, `unlock` |
 | Update / upgrade | `update`, `upgrade`, `downgrade`, `check-updates` |
 | Agent launch | `opencode`, `shell`, `list`, `stop` |
+| Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Diagnostics | `doctor`, `preflight`, `help` |
 | Test / bench | `test`, `benchmark` |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
@@ -309,6 +310,66 @@ a `-p` agent now appears in `harness list` for the duration of its run. The
 count is project-scoped, so concurrent interactive agents likewise keep the
 stack up until the last one exits. This is the inverse of `cmd_down`'s own
 agent-stop sweep, which tears agents down when the *stack* goes down.
+
+## Host mode (containerless)
+
+`harness host` runs the whole stack as plain host processes — no docker, no
+containers — for a lighter footprint (no daemon, no multi-GB images). `cmd_host`
+orchestrates it; `harness host down` (`cmd_host_down`) stops the proxy. All
+host-mode helpers live in the "host mode (containerless)" block alongside the
+host-MCP supervision they reuse the shape of.
+
+What it does, in order:
+
+1. **`host_preflight`** — host mode cannot fall back to the jq-in-proxy-image
+   sidecar (no docker), so it requires host `jq` outright, plus `python3` (runs
+   the proxy), Node >= 20 + `opencode` (the agent runtime). Missing deps print
+   exact install hints and abort. Node is never auto-installed.
+2. **`host_require_config`** — a lighter `require_runtime_config`: the same three
+   REQUIRED proxy vars (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`,
+   read from the already-sourced `.env`), but **no allowlist check** — the
+   firewall allowlist only governs container mode.
+3. **`host_confirm_gate`** — mandatory on **every** launch (unlike `--net`'s
+   per-invocation flag), worded harder: host mode has no egress firewall and
+   runs opencode as the full host user (full filesystem incl. `~/.ssh`/`~/.aws`,
+   unfiltered network), a strictly bigger blast radius than `--net`.
+   `HARNESS_HOST_CONFIRM=1` bypasses it for automation; refuses non-interactive
+   without `/dev/tty`. This is why host mode exists as a separate, gated command
+   rather than a flag on the normal launch.
+4. **Proxy supervision** — `host_proxy_start` lazily builds a venv under
+   `state/host/venv` (`host_proxy_ensure_venv`: `python3 -m venv` + `pip install`
+   of `proxy/requirements.txt`'s two pure-python wheels, re-pip only when the
+   requirements hash changes), then `nohup`s `proxy/proxy.py` with a pidfile +
+   logfile under `state/host/`, mirroring the host-MCP pidfile model. **It binds
+   `127.0.0.1` only** (`PROXY_HOST=127.0.0.1`) so the host proxy is never
+   reachable off-box; the proxy reads its REQUIRED env straight from this shell.
+   `host_proxy_wait_ready` polls the loopback port via `/dev/tcp` (the proxy
+   calls `app.run()` last, so an accepted connect means it is serving) and tails
+   the log on failure (the common cause is `_validate_config` `sys.exit(1)`).
+5. **Scoped opencode config** — `host_write_opencode_config` writes the same
+   provider config shape as the container entrypoint's `ensure_opencode_config`,
+   but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
+   **scoped** file (`state/host/opencode.json`). The caller exports
+   `OPENCODE_CONFIG` to point at it, so the user's global
+   `~/.config/opencode/opencode.json` is never touched. `curl` is optional: the
+   model dropdown comes from the proxy's `/v1/models` when present, else falls
+   back to `DEFAULT_MODEL_NAME` alone.
+6. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
+   (provider env, `--agent yolo`, and the headless `-p` json-events +
+   `opencode export` dance that dodges opencode 1.15.x's render race).
+   Interactive runs opencode as a **child** (not `exec`) so the proxy is torn
+   down on exit; print mode leaves the proxy up so a scripted `-p` loop doesn't
+   thrash it (`harness host down` stops it) — the same interactive-vs-print
+   teardown split as container mode.
+
+v1 is deliberately minimal: single CWD, no host-MCP wiring, Linux/macOS only.
+The egress firewall is genuinely container-bound (it lays a host-global iptables
+default-deny that cannot be scoped to one process), so it is simply absent here —
+see [`containers.md`](containers.md) → "Host mode has no firewall".
+
+Container subcommands (`start`/`opencode`/`shell`) go through `require_docker`,
+which now appends a "for a containerless run, use `harness host`" hint to its
+unreachable-runtime failure so a host-only install points the user the right way.
 
 ## Update-available banner
 
