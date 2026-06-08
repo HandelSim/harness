@@ -371,6 +371,28 @@ Container subcommands (`start`/`opencode`/`shell`) go through `require_docker`,
 which now appends a "for a containerless run, use `harness host`" hint to its
 unreachable-runtime failure so a host-only install points the user the right way.
 
+`harness host -h`/`--help` prints host-mode usage and returns **before** any
+preflight, confirm, or proxy-start side effect, so the help text is safe to
+read on a box that can't actually launch.
+
+**Host-only install detection.** `harness_runtime_installed` (`command -v
+docker || command -v podman` — a *binary* presence check, distinct from
+`harness_docker_running`'s daemon-reachability probe) is what lets the
+maintenance subcommands behave on a box that never installed a runtime:
+`cmd_upgrade` runs its docker-free path (see
+[`install-and-upgrade.md`](install-and-upgrade.md) → "Host-only upgrade"),
+`cmd_down` stops the host proxy + host MCPs and returns without
+`require_docker`, and `cmd_restart` points the user at `harness host down &&
+harness host` instead of erroring. A container install with the daemon merely
+stopped still has the binary, so it does **not** take these paths — it hits
+`require_docker` and is told to start the daemon.
+
+**Debug breadcrumbs.** Host launches print the proxy log path
+(`host mode: proxy log -> …`) on start, and `host_proxy_wait_ready` prints the
+full log path on **both** failure branches (proxy exited during startup, or
+never began listening) so a failed launch always points at the log that
+explains why.
+
 ## Update-available banner
 
 `_update_check_and_banner` runs synchronously on every agent launch with
@@ -427,9 +449,19 @@ breaks the recursion.
   that probes whether `docker.exe` accepts `-t` in the current terminal and
   whether winpty is needed/present (see "Interactive TTY resolution" below) —
   the probe is a throwaway `--rm` container, so doctor stays read-only.
+  **Host-only awareness:** when `harness_runtime_installed` is false, the
+  runtime/compose checks downgrade `fail` → `warn` (and the allowlist-missing
+  check reads `n/a (host-only)`) so doctor exits 0 on a valid containerless
+  box, and a dedicated `[host]` section reports the host-mode prerequisites
+  (`python3`/`jq`/`node`/`opencode`, Node >= 20) plus whether the host venv
+  exists and whether the host proxy is currently running (pid/port/log).
 - `cmd_preflight` — validates `.env`, allowlist, and docker daemon
   reachability BEFORE `harness start`. Fails loudly on config errors so
-  the user doesn't get an opaque compose error.
+  the user doesn't get an opaque compose error. On a host-only box it
+  prints an `ⓘ … validating host mode` note, checks the host-mode prereqs
+  (`python3`/`jq`/`node`/`opencode`, Node >= 20) instead of the daemon, and
+  skips the allowlist file-exists and `PROXY_API_URL`-in-allowlist checks
+  (the firewall allowlist only governs container mode).
 
 ## Shared libraries under `scripts/lib/`
 

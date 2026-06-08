@@ -535,6 +535,18 @@ require_docker() {
     exit 1
 }
 
+# True if a container runtime BINARY is installed (docker or podman on PATH),
+# regardless of whether its daemon is currently reachable. This distinguishes a
+# HOST-ONLY install (no runtime installed at all — 'harness host' is the
+# intended path, and container subcommands must adapt rather than hard-fail)
+# from a normal container install whose daemon merely isn't running (which
+# should be started, not silently downgraded to host mode). harness-install.sh
+# allows installing with no runtime present, so this is the post-install signal
+# of which world we're in. Cheap, no daemon round-trip.
+harness_runtime_installed() {
+    command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1
+}
+
 # Validate runtime configuration (.env presence, required vars) before
 # bringing services up. Lightweight subset of `harness preflight` so users
 # get a clear error before docker compose churns through a build/up cycle
@@ -1389,9 +1401,13 @@ commands:
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
   unlock                probe the upstream and print the unlock URL if the
                         key is locked
-  doctor                run runtime diagnostics (read-only)
-  preflight             validate config (.env, allowlist, docker daemon)
-                        before the stack starts
+  doctor                run runtime diagnostics (read-only). Reports container
+                        AND host-mode state; on a host-only box (no runtime) it
+                        warns instead of failing on the missing daemon.
+  preflight             validate config + prerequisites before launch: .env
+                        always, plus the container runtime + allowlist, OR the
+                        host-mode deps (python3/jq/node>=20/opencode) on a
+                        host-only box
   test [section]        run the harness test suite (glob-discovered).
                         sections: all (default), unit, integration,
                         or a prefix like 'mcp' or 'firewall'.
@@ -1567,6 +1583,19 @@ cmd_start() {
 }
 
 cmd_down() {
+    # The host proxy (harness host) runs outside the container stack, so tear it
+    # down here too — a no-op when nothing is running. Done before require_docker
+    # so both a host-only box (no runtime) and a leftover 'harness host -p' proxy
+    # on a container box get cleaned up by the muscle-memory teardown verb.
+    host_proxy_stop
+
+    # Host-only install: there is no container stack to tear down. Stop any host
+    # MCP processes and return rather than hard-failing on require_docker.
+    if ! harness_runtime_installed; then
+        host_mcp_stop_all
+        return 0
+    fi
+
     require_docker
 
     # Stop any agent containers attached to this project's network. They were
@@ -1619,6 +1648,14 @@ cmd_down() {
 # inherited automatically.
 cmd_restart() {
     _parse_prompt_mode_flag "$@"
+    # 'restart' manages the container stack; it has no meaning on a host-only
+    # box, where host mode is launched directly. Give clear guidance instead of
+    # hard-failing on require_docker with a generic docker-required error.
+    if ! harness_runtime_installed; then
+        err "no container runtime: 'restart' manages the container stack."
+        err "for host mode, stop and relaunch directly: harness host down && harness host"
+        return 1
+    fi
     require_docker
     cmd_down
     # prompt_mode_override is already set as a global; cmd_start re-parses an
@@ -1823,7 +1860,21 @@ EOF
         shift
     done
 
-    require_docker
+    # Host-only installs (no container runtime present) can't rebuild images or
+    # restart a container stack, and must NOT abort on require_docker the way the
+    # container path does. Detect that here and take a host-aware path: still
+    # pull code + merge config, but skip the image rebuild / container restart
+    # and point the user at 'harness host'. The proxy runs from the (updated)
+    # clone and its venv refreshes lazily on the next launch, so there is
+    # genuinely nothing to rebuild. A --check preview is runtime-agnostic.
+    local host_only=0
+    if (( ! check_only )) && ! harness_runtime_installed; then
+        host_only=1
+        echo "harness: no container runtime found — running a host-only upgrade"
+        echo "         (pull + config merge; no image rebuild or container restart)."
+    elif (( ! check_only )); then
+        require_docker
+    fi
 
     if (( ! check_only )); then
         # HARNESS_UPGRADE_SKIP_PULL lets tests run the upgrade flow without
@@ -1882,7 +1933,7 @@ EOF
     local lib="$clone_dir/scripts/lib/upgrade_actions.sh"
     if [[ ! -f "$manifest" || ! -f "$lib" ]]; then
         err "no upgrade manifest or actions library found; falling back to legacy upgrade"
-        if (( ! no_restart && ! check_only )); then
+        if (( ! host_only && ! no_restart && ! check_only )); then
             cmd_down --remove-orphans 2>/dev/null || true
             cmd_start
         fi
@@ -1909,45 +1960,76 @@ EOF
     # prechecks (.env / .harness-allowlist) are pure bash + awk — no jq, no
     # container — so when nothing changed we skip the prompt AND the jq-backed
     # merges entirely, instead of prompting + running jq on every upgrade.
-    local needed_ids
-    needed_ids=$(_upgrade_actions_needing_work "$manifest")
-
-    # Declining the prompt skips only the file merges — the rebuild +
-    # restart still run. Nothing about applying the manifest gates the
-    # rest of the upgrade, and the git pull has already happened, so a
-    # decline that aborts everything just leaves the user on new code
-    # with stale images. Ctrl-C is the way to bail out entirely.
+    local needed_ids=""
     local skip_actions=0
-    if [[ -z "$needed_ids" ]]; then
+    if (( host_only )) && ! command -v jq >/dev/null 2>&1; then
+        # The manifest merge runs through harness_jq, which on a jq-less host
+        # falls back to a docker jq sidecar. A host-only box has no docker, so
+        # without host jq the merge can't run. The pull already succeeded (code
+        # is updated), so skip the config merges rather than hard-fail.
         echo
-        echo "Configuration files are up to date — no merges needed."
+        echo "harness: 'jq' not found on the host; skipping config-file merges."
+        echo "         Code is updated. Install jq and re-run 'harness upgrade'"
+        echo "         to pick up any new .env variables."
         skip_actions=1
     else
-        echo
-        echo "Updates available for:"
-        local nid
-        while IFS= read -r nid; do
-            [[ -n "$nid" ]] || continue
-            harness_jq -r --arg id "$nid" \
-                '(.actions[]?, .registry_actions[]?) | select(.id == $id) | "  - \(.id): \(.description)"' \
-                "$manifest"
-        done <<<"$needed_ids"
-        echo
-        if (( ! no_prompt )); then
-            if [[ -t 0 ]]; then
-                if ! _upgrade_confirm "Apply these upgrade actions? [y/n] (n skips the merges; upgrade still rebuilds + restarts): "; then
-                    skip_actions=1
-                    echo "harness: skipping upgrade actions; continuing with rebuild + restart"
+        needed_ids=$(_upgrade_actions_needing_work "$manifest")
+
+        # Declining the prompt skips only the file merges — the rest of the
+        # upgrade still runs. Nothing about applying the manifest gates the
+        # rest of the upgrade, and the git pull has already happened, so a
+        # decline that aborts everything just leaves the user on new code with
+        # stale images. Ctrl-C is the way to bail out entirely.
+        if [[ -z "$needed_ids" ]]; then
+            echo
+            echo "Configuration files are up to date — no merges needed."
+            skip_actions=1
+        else
+            echo
+            echo "Updates available for:"
+            local nid
+            while IFS= read -r nid; do
+                [[ -n "$nid" ]] || continue
+                harness_jq -r --arg id "$nid" \
+                    '(.actions[]?, .registry_actions[]?) | select(.id == $id) | "  - \(.id): \(.description)"' \
+                    "$manifest"
+            done <<<"$needed_ids"
+            echo
+            if (( ! no_prompt )); then
+                if [[ -t 0 ]]; then
+                    if ! _upgrade_confirm "Apply these upgrade actions? [y/n] (n skips the merges; the rest of the upgrade continues): "; then
+                        skip_actions=1
+                        echo "harness: skipping upgrade actions; continuing with the rest of the upgrade"
+                    fi
+                else
+                    err "non-interactive shell; pass --no-prompt to apply without confirmation"
+                    exit 1
                 fi
-            else
-                err "non-interactive shell; pass --no-prompt to apply without confirmation"
-                exit 1
             fi
         fi
     fi
 
     if (( ! skip_actions )); then
         apply_upgrade_actions "$manifest" 0 "$needed_ids"
+    fi
+
+    # Container path rebuilds images + restarts the stack so image-level changes
+    # take effect. A host-only install has neither: the proxy runs from the
+    # now-updated clone and its venv refreshes lazily on the next 'harness host',
+    # so there is nothing to rebuild — report and point the user at the relaunch.
+    if (( host_only )); then
+        echo
+        echo "[harness] host-only upgrade complete."
+        echo "  Code is updated. proxy.py runs from the clone; the host proxy venv"
+        echo "  refreshes automatically on your next 'harness host' if"
+        echo "  proxy/requirements.txt changed."
+        if host_proxy_running; then
+            echo "  A host proxy is currently running — restart it to pick up the new"
+            echo "  code:  harness host down  &&  harness host"
+        else
+            echo "  Run 'harness host' to use the new code."
+        fi
+        return 0
     fi
 
     if (( ! no_restart )); then
@@ -2798,6 +2880,7 @@ host_proxy_start() {
     lf=$(host_proxy_logfile)
     mkdir -p "$(host_state_dir)"
     echo "[harness] host mode: starting proxy on 127.0.0.1:$port" >&2
+    echo "[harness] host mode: proxy log -> $lf" >&2
     PROXY_HOST=127.0.0.1 \
         PROXY_PORT="$port" \
         OUTPUT_DIR="$state_root/output" \
@@ -2818,6 +2901,7 @@ host_proxy_wait_ready() {
         if ! host_proxy_running; then
             err "host proxy exited during startup; last log lines:"
             tail -n 20 "$(host_proxy_logfile)" >&2 2>/dev/null || true
+            err "  full log: $(host_proxy_logfile)"
             return 1
         fi
         if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
@@ -2829,6 +2913,7 @@ host_proxy_wait_ready() {
     done
     err "host proxy did not start listening on 127.0.0.1:$port within ~10s"
     tail -n 20 "$(host_proxy_logfile)" >&2 2>/dev/null || true
+    err "  full log: $(host_proxy_logfile)"
     return 1
 }
 
@@ -2998,6 +3083,28 @@ cmd_host() {
         cmd_host_down
         return
     fi
+
+    # Intercept -h/--help BEFORE any side effects (preflight, confirm gate,
+    # proxy start). Without this, 'harness host --help' would fall through to
+    # opencode and only print its help after launching the proxy.
+    case "${1:-}" in
+        -h|--help)
+            cat <<'EOF'
+harness host — run CONTAINERLESS: the proxy + opencode as plain host processes.
+
+usage:
+  harness host [--yolo] [-p "PROMPT"] [agent flags...]
+  harness host down            stop the background host proxy
+
+No docker, no images, no egress firewall; opencode runs as your full host user,
+so every launch prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip it in
+automation). Needs Node >= 20, opencode, python3, and jq on the host. The proxy
+binds 127.0.0.1 only; its log lives at state/host/proxy.log. Any other flag is
+forwarded to opencode unchanged.
+EOF
+            return 0
+            ;;
+    esac
 
     local yolo=0 print_mode=0
     local pass_args=()
@@ -5679,12 +5786,22 @@ cmd_doctor() {
     doctor_errors=0
     doctor_warnings=0
 
+    # On a host-only box (no container runtime installed at all), 'harness host'
+    # is the intended path — so the missing daemon is expected, not a fault.
+    # Downgrade the container checks to warnings in that case so 'harness doctor'
+    # returns 0 on a correctly set-up host-only install instead of reporting
+    # spurious hard failures.
+    local host_only=0
+    harness_runtime_installed || host_only=1
+
     # ---------------- [deps] ----------------
     doctor_section deps
     local rt
     rt=$(harness_container_runtime)
     if harness_docker info >/dev/null 2>&1; then
         doctor_check ok "$rt runtime" "reachable"
+    elif (( host_only )); then
+        doctor_check warn "$rt runtime" "not installed (host-only box; use 'harness host')"
     else
         doctor_check fail "$rt runtime" "not reachable; is it running?"
     fi
@@ -5693,6 +5810,8 @@ cmd_doctor() {
         local v
         v=$(harness_docker compose version 2>/dev/null | head -1)
         doctor_check ok "$rt compose" "${v}"
+    elif (( host_only )); then
+        doctor_check warn "$rt compose" "n/a (host-only box, no container runtime)"
     else
         doctor_check fail "$rt compose" "compose subcommand not available"
     fi
@@ -5803,6 +5922,8 @@ cmd_doctor() {
                 fi
             fi
         fi
+    elif (( host_only )); then
+        doctor_check ok "allowlist" "n/a (host-only; host mode has no egress firewall)"
     else
         doctor_check fail "allowlist" "$allowlist_path missing"
     fi
@@ -5972,6 +6093,47 @@ cmd_doctor() {
     running=$(harness_docker ps --filter "label=harness.agent=true" --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
     doctor_check ok "running" "${running} agent container(s)"
 
+    # ---------------- [host] ----------------
+    # Containerless mode (harness host). Surface its prerequisites and proxy
+    # state when this looks like a host-mode box — no runtime, or a host proxy /
+    # venv already present — so 'harness doctor' is actually useful on a
+    # host-only install instead of only reporting container facts. Deps are
+    # warn-not-fail: they don't gate a container install, and a host-only box
+    # that's missing one still wants a 0 exit with a visible nudge.
+    local host_venv
+    host_venv=$(host_venv_dir)
+    if (( host_only )) || host_proxy_running || [[ -d "$host_venv" ]]; then
+        doctor_section host
+        local dep
+        for dep in python3 jq node opencode; do
+            if command -v "$dep" >/dev/null 2>&1; then
+                doctor_check ok "$dep" "$(command -v "$dep")"
+            else
+                doctor_check warn "$dep" "not on PATH (needed for 'harness host')"
+            fi
+        done
+        if command -v node >/dev/null 2>&1; then
+            local nmaj
+            nmaj=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
+            if [[ -n "$nmaj" ]] && (( nmaj >= 20 )); then
+                doctor_check ok "node version" "$(node --version 2>/dev/null)"
+            else
+                doctor_check warn "node version" "$(node --version 2>/dev/null) (host mode needs >= 20)"
+            fi
+        fi
+        if [[ -x "$host_venv/bin/python" ]]; then
+            doctor_check ok "host venv" "$host_venv"
+        else
+            doctor_check ok "host venv" "not built yet (created on first 'harness host')"
+        fi
+        if host_proxy_running; then
+            doctor_check ok "host proxy" "running (pid $(host_proxy_pid), 127.0.0.1:$(host_proxy_port))"
+            doctor_check ok "host proxy log" "$(host_proxy_logfile)"
+        else
+            doctor_check ok "host proxy" "not running"
+        fi
+    fi
+
     # ---------------- summary ---------------
     printf '\n%d errors, %d warnings\n' "$doctor_errors" "$doctor_warnings"
     if (( doctor_errors > 0 )); then
@@ -5992,6 +6154,12 @@ cmd_preflight() {
     local errors=0
     echo "[harness] preflight..."
 
+    # Host-only box (no container runtime installed): validate the host-mode
+    # prerequisites instead of the container daemon + firewall allowlist, which
+    # don't apply to 'harness host'. Detect it up front so each check branches.
+    local host_only=0
+    harness_runtime_installed || host_only=1
+
     # Container runtime (docker/podman) with auto-start attempt on Win/Mac
     # via platform.sh
     local rt
@@ -6000,7 +6168,9 @@ cmd_preflight() {
     else
         rt="docker"
     fi
-    if declare -f harness_docker_running >/dev/null 2>&1 && harness_docker_running; then
+    if (( host_only )); then
+        echo "  ⓘ no container runtime installed — validating host mode ('harness host')"
+    elif declare -f harness_docker_running >/dev/null 2>&1 && harness_docker_running; then
         echo "  ✓ $rt runtime"
     elif declare -f harness_docker_running >/dev/null 2>&1; then
         echo "  - $rt runtime not reachable; attempting auto-start..."
@@ -6019,13 +6189,40 @@ cmd_preflight() {
         fi
     fi
 
-    # Configuration files
+    # Host-mode prerequisites (only checked on a host-only box). Container mode
+    # gets these from inside the image, so they're irrelevant there.
+    if (( host_only )); then
+        local hdep
+        for hdep in python3 jq node opencode; do
+            if command -v "$hdep" >/dev/null 2>&1; then
+                echo "  ✓ $hdep"
+            else
+                echo "  ✗ $hdep not found (required for 'harness host')"
+                errors=$((errors+1))
+            fi
+        done
+        if command -v node >/dev/null 2>&1; then
+            local pnmaj
+            pnmaj=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
+            if [[ -z "$pnmaj" ]] || (( pnmaj < 20 )); then
+                echo "  ✗ node $(node --version 2>/dev/null) is too old (host mode needs >= 20)"
+                errors=$((errors+1))
+            fi
+        fi
+    fi
+
+    # Configuration files. .env is required for both modes; the firewall
+    # allowlist only governs container mode, so skip it on a host-only box.
     if declare -f harness_check_file_exists >/dev/null 2>&1; then
         harness_check_file_exists "$env_file" true ".env config file" || errors=$((errors+1))
-        harness_check_file_exists "$allowlist_path" true "firewall allowlist" || errors=$((errors+1))
+        if (( ! host_only )); then
+            harness_check_file_exists "$allowlist_path" true "firewall allowlist" || errors=$((errors+1))
+        fi
     else
         [[ -f "$env_file" ]] || { echo "  ✗ .env not found at $env_file"; errors=$((errors+1)); }
-        [[ -f "$allowlist_path" ]] || { echo "  ✗ allowlist not found at $allowlist_path"; errors=$((errors+1)); }
+        if (( ! host_only )); then
+            [[ -f "$allowlist_path" ]] || { echo "  ✗ allowlist not found at $allowlist_path"; errors=$((errors+1)); }
+        fi
     fi
 
     # Required env vars (parsed from .env, not the live shell — env vars
@@ -6057,8 +6254,9 @@ cmd_preflight() {
         fi
 
         # PROXY_API_URL hostname must be in the allowlist or container egress
-        # will be blocked by the firewall.
-        if [[ -n "$proxy_url" && -f "$allowlist_path" ]]; then
+        # will be blocked by the firewall. Host mode has no firewall, so this
+        # cross-check is container-only.
+        if (( ! host_only )) && [[ -n "$proxy_url" && -f "$allowlist_path" ]]; then
             local proxy_host
             proxy_host=$(echo "$proxy_url" | awk -F[/:] '{print $4}')
             if [[ -n "$proxy_host" ]]; then

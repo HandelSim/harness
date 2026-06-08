@@ -1,424 +1,346 @@
 # Codebase Concerns
 
-**Analysis Date:** 2026-06-02
+**Analysis Date:** 2026-06-08
 
-Scope: the current post-migration `harness` codebase on branch `nollama`.
-ollama is fully removed from the data path (no ollama service in
-`docker-compose.yml`, no `ollama/` image dir, no `/api/chat`/NDJSON path).
-opencode talks directly to the Flask proxy over `/v1/chat/completions`.
-The concerns below are the live ones for that topology, not the migration.
+Scope: current `harness` codebase on branch `dev`, with focus on the newly
+added containerless `harness host` mode (commit 5f38a83) and how it integrates
+with the docker-coupled rest of the system. Every concern below cites a
+file:line that was read directly. Concerns are ranked by severity within each
+section; the highest-severity items are at the top.
 
-## Tech Debt
-
-**`proxy/proxy.py` is a single-file monolith:**
-- Issue: All proxy behavior (config read, prompt builders, tool-call
-  extraction, SSE/JSON emission, debug dumps, Flask routes, token
-  estimation) lives in one module.
-- Files: `proxy/proxy.py` (1870 lines, confirmed `wc -l`).
-- Impact: Every proxy change touches one large file; the cooperative-prompt
-  builders, the wire translation, and the Flask plumbing have no module
-  boundary, so unrelated edits collide and the test file mirrors the same
-  monolith. Architecture doc itself calls it "single-process, single file"
-  (`architecture/proxy.md:14`).
-- Fix approach: Split into modules behind the Flask app — e.g.
-  `prompt_builders.py`, `toolcalls.py`, `wire.py` (SSE/JSON emit),
-  `config.py`. Keep `proxy.py` as the route + orchestration layer. Do this
-  only when a change forces it; a gratuitous split churns the prompt text
-  that is deliberately tuned (`proxy/proxy.py:358-365`).
-
-**`harness` CLI is a 5481-line bash monolith:**
-- Issue: The entire management CLI (self-locate, env load, all `cmd_*`
-  subcommands, compose wrapper, runtime override, agent launch, jq sidecar,
-  doctor/preflight, net, mcp) is one bash file.
-- Files: `harness` (5481 lines, confirmed `wc -l`). Architecture doc still
-  says "~4200 lines" (`architecture/harness-cli.md:5`) — stale by ~1300
-  lines, itself a doc-drift item.
-- Impact: One file holds every code path; bash has no namespacing, so
-  helper-name collisions and accidental global-var reuse are real risks.
-  Hard to unit-test in isolation (the suite sources the whole file via
-  `HARNESS_SOURCE_ONLY=1`). The line-count claim in the doc should be
-  corrected.
-- Fix approach: Continue migrating cohesive groups into `scripts/lib/`
-  (the pattern already exists: `platform.sh`, `net_helpers.sh`,
-  `upgrade_actions.sh`). MCP and doctor are the next candidates. Update the
-  line-count note in `architecture/harness-cli.md:5` in the same commit as
-  any structural change.
-
-**`OLLAMA_CONTEXT_LENGTH` legacy alias survives as naming debt:**
-- Issue: The env knob is `MODEL_CONTEXT_LENGTH`, but the proxy and agent
-  entrypoint still read `OLLAMA_CONTEXT_LENGTH` as a fallback to avoid
-  breaking pre-migration `.env` files. The dead vendor name persists in
-  config, code, and docs.
-- Files: `proxy/proxy.py:63-67` (the `or os.environ.get("OLLAMA_CONTEXT_LENGTH")`
-  fallback), `agents/entrypoint.sh:138-139`
-  (`${MODEL_CONTEXT_LENGTH:-${OLLAMA_CONTEXT_LENGTH:-200000}}`),
-  `.env.example:67-68` (documents the alias), `architecture/proxy.md:546`,
-  `tests/INVENTORY.md:190`, `tests/COVERAGE.md:284`.
-- Impact: Misleading — implies an ollama dependency that no longer exists.
-  Every reader of `.env.example` and the proxy config has to be told "this
-  is just a legacy alias." Low functional risk, real comprehension cost.
-- Fix approach: Keep the fallback for one more upgrade cycle (it is the only
-  thing protecting existing `.env` files), then drop the
-  `OLLAMA_CONTEXT_LENGTH` read once a `harness upgrade` has had time to
-  rewrite installs to `MODEL_CONTEXT_LENGTH`. Track as a dated removal, not
-  an indefinite carry.
-
-**`_normalize_api_base` is duplicated between proxy and CLI with a manual sync rule:**
-- Issue: The URL-base normalization (strip trailing `/v1/chat/completions`,
-  `/chat/completions`, `/v1`) exists twice in two languages, with only a
-  comment enforcing parity.
-- Files: `proxy/proxy.py:72` (`def _normalize_api_base`) and `harness:933`
-  (`_api_base()`). Both `harness:929-932` and `architecture/harness-cli.md:46`
-  explicitly say "keep the two in sync."
-- Impact: If one is changed (e.g. to also strip `/v1/`-with-trailing-slash or
-  a new endpoint shape) and the other is not, the CLI auth/model probe and
-  the proxy's actual request would derive different endpoints from the same
-  `PROXY_API_URL` — the probe could pass while real requests 404, or vice
-  versa. The drift is silent until a malformed base value hits it.
-- Fix approach: There is no shared runtime between bash and Python here, so a
-  literal shared function is hard. Mitigate with a parity test: a single
-  fixture table of `(input, expected_base)` pairs asserted against both
-  `_api_base` (sourced bash) and `_normalize_api_base` (imported Python).
-  That converts "keep in sync" from a comment into a CI gate.
-
-**Residual ollama references that are now dead or misleading:**
-- Issue: After teardown, `ollama` still appears in a few tracked files.
-- Files and dispositions:
-  - `CLAUDE.md:43` — the architecture-router table still lists `ollama/` as a
-    path that maps to `containers.md`. The dir no longer exists. **Under the
-    do-not-modify guard** (CLAUDE.md is owner-only); flag for HandelSim, do
-    not edit.
-  - `.github/workflows/ci.yml:99,122,163,186,216,246,284` — buildx cache keys
-    and comments still hash/reference `ollama/Dockerfile` and
-    "proxy+ollama+agent image set." The `hashFiles('...ollama/Dockerfile')`
-    entries are now no-ops (the path is gone, so it contributes nothing to
-    the hash) but the comments are misleading. **Under the do-not-modify
-    guard** (`.github/`); flag for owner.
-  - `architecture/containers.md:31,79` — "there is no ollama hop" is correct
-    and intentional (reassures the reader). Leave.
-  - `.planning/PROJECT.md`, `.planning/ROADMAP.md`, `.planning/STATE.md` —
-    heavy ollama references, but these are the GSD migration planning
-    artifacts describing the completed milestone, not runtime. Out of scope
-    for a code sweep; they document history by design.
-- Impact: The two guarded files (`CLAUDE.md`, `ci.yml`) actively mislead a
-  reader into thinking an ollama image still builds. Functionally inert.
-- Fix approach: Owner (HandelSim) removes the stale `ollama/` row from
-  `CLAUDE.md:43` and the `ollama/Dockerfile` tokens from the ci.yml cache
-  keys/comments. Agents must not touch either file unguarded.
-
-## Known Bugs / Fragile Areas
-
-**Debug-dump directory (`state/output/`) is never rotated or pruned:**
-- Issue: Every request writes 4-5 JSON files to `OUTPUT_DIR` and nothing
-  ever deletes them.
-- Files: `proxy/proxy.py:346-355` (`save_debug_file` — open-and-write only,
-  no cleanup), call sites throughout `catch_all`. No rotation/prune logic
-  exists anywhere (`grep` for rotate/cleanup/prune in `proxy.py` and
-  `harness` finds none).
-- Impact: On a long-lived install with dumps enabled, `state/output/`
-  grows unbounded — one set per request, each containing the full
-  conversation. Disk fills silently. This is the same disk-exhaustion class
-  the project's own CLAUDE.md warns about for CI runners.
-- Fix approach: Add a size- or age-based cap (e.g. keep the last N req_ids,
-  or delete dumps older than M hours) on proxy startup and/or per-write.
-  Dumps default to disabled (`OUTPUT_DIR` optional, `proxy.py:331-342`), so
-  this only bites operators who turned them on — but those are exactly the
-  long-debugging sessions where it bites hardest.
-
-**opencode 1.15.x headless stdout race:**
-- Issue: In `-p`/`--print` (non-TTY) mode, opencode's `run` renderer drops
-  the assistant body (and on ~10% of fast runs the entire json stream,
-  including `step_start`) when the session goes idle before the text event
-  is processed.
-- Files: `agents/entrypoint.sh:317-340` (the `HARNESS_PRINT_MODE` recovery
-  branch), documented at `architecture/containers.md:123-152` and
-  `agents/Dockerfile:73-81`.
-- Impact: Without the workaround, `-p` output is empty on fast replies (mock
-  upstream, cached models). This already forced an opencode rollback (issue
-  #86) and a `full_pipeline_test` T10 failure.
-- Fix approach: The current mitigation (run `--format json` to a temp file,
-  read session id from `step_start` else fall back to newest persisted
-  session via `opencode session list`, then `opencode export`) is in place
-  and works. The fragility is that it is wholly contingent on opencode
-  internals; revisit when opencode fixes the renderer (track
-  anomalyco/opencode#20755 and the version note in `agents/Dockerfile`).
-
-**`_pare_task_description` is fragile to an opencode header rename:**
-- Issue: The hybrid prompt pares opencode's `task` tool description by
-  anchoring on the literal header
-  `Available agent types and the tools they have access to:`
-  (`_OPENCODE_TASK_AGENTS_HEADER`).
-- Files: `proxy/proxy.py:265-272` (header constant + parsing rationale),
-  `architecture/proxy.md:274-288`.
-- Impact: If a future opencode renames that header, the anchor misses. The
-  design degrades gracefully (falls back to the **full** description — more
-  tokens, never a silent loss of the agent list), so it is fragile but not
-  data-losing. The canary is `proxy/test_proxy.py`
-  `TestTaskDescriptionParing`.
-- Fix approach: No action needed beyond keeping the canary green. If the
-  fallback starts firing in practice (tokens balloon), update the header
-  constant to match the new opencode string.
-
-**opencode version coupling is spread across multiple files:**
-- Issue: The pinned opencode version and its known-behavior workarounds are
-  referenced in several places that must move together on a bump.
-- Files: `agents/Dockerfile:103` (the `ARG OPENCODE_VERSION=1.15.7` source of
-  truth) plus behavior notes/assumptions in `agents/Dockerfile:73-81`,
-  `agents/entrypoint.sh:317-340`, `proxy/proxy.py:272` (header verified
-  "1.14.41 and 1.15.7"), `architecture/proxy.md:283-284`,
-  `architecture/containers.md:125-147`.
-- Impact: A version bump that changes the renderer race, the json-stream
-  behavior, or the `task` header requires re-verifying and updating all of
-  these. The bump checklist lives only in the `OPENCODE_VERSION` comment in
-  `agents/Dockerfile` — easy to miss the proxy-side coupling.
-- Fix approach: Keep the bump checklist in `agents/Dockerfile` authoritative
-  and have it explicitly enumerate the proxy-side header check
-  (`proxy/proxy.py:272`) and the entrypoint print-mode branch. The
-  `TestTaskDescriptionParing` and `full_pipeline_test` T10 canaries catch
-  the two most likely regressions.
-
-**The Flask development server runs the production listener:**
-- Issue: The proxy is served by Flask's built-in `app.run()`, which is a
-  single-threaded WSGI dev server not intended for production.
-- Files: `proxy/proxy.py:1866` (`app.run(host=PROXY_HOST, port=PROXY_PORT,
-  debug=False)`), `proxy/proxy.py:1588` (`app = Flask(__name__)`).
-- Impact: `app.run` warns it is not for production. It is effectively
-  single-request-at-a-time; one slow upstream call (up to `PROXY_TIMEOUT`,
-  default 180s) blocks any concurrent agent request. For a
-  single-user/single-agent harness this is tolerable; with multiple agents
-  on one proxy it serializes them.
-- Fix approach: Front with a real WSGI server (gunicorn/waitress) with a
-  small worker count, or document the single-flight limitation explicitly.
-  See Dependencies at Risk.
-
-**`verify=False` on every upstream TLS call:**
-- Issue: TLS certificate verification is disabled on all requests to the
-  upstream.
-- Files: `proxy/proxy.py:1616`, `proxy/proxy.py:1695` (chat + models calls),
-  rationale at `proxy/proxy.py:45` and `architecture/proxy.md:38`.
-- Impact: The upstream uses a self-signed cert, so `verify=True` would fail.
-  But `verify=False` accepts any cert, so a network MITM between proxy and
-  upstream is undetectable at the TLS layer. Mitigated in practice by the
-  egress firewall pinning the allowed host, but not by certificate identity.
-- Fix approach: Pin the upstream's specific self-signed cert (pass its CA/leaf
-  to `verify=<path>`) instead of disabling verification wholesale. That keeps
-  the self-signed cert working while restoring MITM detection.
-
-## Security Considerations
-
-**Disabled upstream TLS verification:**
-- Risk: `verify=False` (see Fragile Areas above) means no cert-identity check
-  on the proxy-to-upstream hop.
-- Files: `proxy/proxy.py:1616,1695`.
-- Current mitigation: Egress firewall restricts the proxy to the configured
-  `PROXY_API_URL` host (`architecture/containers.md:213-215`).
-- Recommendation: Pin the self-signed cert rather than disabling verification.
-
-**Debug dumps contain full conversation content:**
-- Risk: When `OUTPUT_DIR` is set, the proxy writes the entire inbound request
-  and the translated upstream payload (all messages, tool results, file
-  contents the agent read) to plaintext JSON on the host.
-- Files: `proxy/proxy.py:1683` (`save_debug_file(req_id, "02", "API_Request",
-  upstream_payload)` — `upstream_payload` is `{model, messages: translated}`),
-  plus the `01_Inbound_Request` / `03_API_Response` / `04` dumps; sink at
-  `proxy/proxy.py:346-355`; bind-mounted to `state/output/`
-  (`architecture/README.md:50`, `architecture/proxy.md:567-579`).
-- Current mitigation: Dumps default OFF (`OUTPUT_DIR` optional). Combined with
-  the no-rotation issue above, when on they accumulate sensitive content
-  indefinitely.
-- Recommendation: Document that enabling dumps persists full conversation
-  content (including any secrets the agent handled) to disk; add the rotation
-  cap from the Known Bugs section so the exposure window is bounded.
-
-**The API key is NOT written to debug dumps (good):**
-- Note: The `02_API_Request` dump payload is `upstream_payload`
-  (`proxy/proxy.py:1670-1683`), which is `{model, messages}` only. The
-  `Authorization: Bearer {PROXY_API_KEY}` header is built separately at
-  `proxy/proxy.py:1685-1688` and `1611` and is never passed to
-  `save_debug_file`. So the upstream key does not land on disk in the dumps.
-  Startup logging also redacts via `_redact_key` (`architecture/proxy.md:553`).
-  This is the correct posture; flagged here so a future refactor that starts
-  dumping headers is recognized as a regression.
-
-**Inbound proxy auth is effectively unauthenticated:**
-- Risk: opencode sends a `Bearer harness-dummy`-style header, but the proxy
-  does not read or validate any inbound `Authorization` header — there is no
-  `request.headers.get("Authorization")` check in `catch_all` (confirmed by
-  grep). Anything that can reach `proxy:8000` on `harness-net` can drive the
-  proxy and burn the real upstream key.
-- Files: `proxy/proxy.py` `catch_all` (no inbound auth read); the only auth is
-  the proxy-to-upstream `Bearer PROXY_API_KEY` at `proxy/proxy.py:1611,1687`.
-- Current mitigation: The proxy listens only on the internal `harness-net`
-  bridge, and the egress firewall constrains who is on that network. No host
-  port is published for the proxy in `docker-compose.yml`.
-- Recommendation: Acceptable given the network isolation (a single-tenant,
-  internal bridge). If the proxy is ever exposed beyond `harness-net`, add a
-  shared-secret check on the inbound header before trusting requests. Treat
-  "proxy on a published port" as the trigger to add inbound auth.
-
-**`HARNESS_FIREWALL_DISABLED` bypasses egress filtering:**
-- Risk: Setting `HARNESS_FIREWALL_DISABLED=1` short-circuits
-  `init-firewall.sh` and grants the container unrestricted egress.
-- Files: firewall init referenced at `architecture/containers.md:208-213`;
-  set by `harness net open <service>` (stamped into the runtime override) and
-  `--net` per launch.
-- Current mitigation: `harness net open` requires the operator to type
-  `I understand the risks` on a TTY (`architecture/containers.md:228-230`);
-  scripts cannot bypass. A loud bypass message is logged.
-- Recommendation: This is an intentional, gated escape hatch — keep the
-  human-in-the-loop confirmation. No change needed; documented so it is not
-  mistaken for an accidental hole.
-
-## Performance Bottlenecks
-
-**No streaming from upstream — full buffer, then emit:**
-- Problem: The proxy waits for the complete upstream response before it
-  begins emitting SSE to opencode. There is no token-by-token passthrough.
-- Files: `proxy/proxy.py` response-emission path; documented at
-  `architecture/proxy.md:480-485` ("the proxy is NOT streaming from upstream
-  — it gets the full response, then translates").
-- Cause: Tool-call extraction needs the whole assistant message to scan for
-  balanced ```json blocks (`extract_tool_calls_and_text`,
-  `proxy/proxy.py` `_scan_balanced_json`), so it cannot emit deltas
-  incrementally without re-architecting the parser to be streaming-aware.
-- Improvement path: For pure-text turns (no tool calls), a streaming
-  passthrough would cut time-to-first-token. But that requires detecting
-  tool-call intent mid-stream, which the balanced-brace scan can't do
-  half-buffered. Low priority: latency is "unchanged" per the doc because the
-  upstream call dominates and memory cost is a few KB. Revisit only if
-  perceived latency on long text replies becomes a complaint.
-
-**`_estimate_tokens` uses a fixed `len(text) // 3` divisor:**
-- Problem: Local token estimation hardcodes chars/3.
-- Files: `proxy/proxy.py:1357-1361` (`n = max(1, len(text) // 3)`), call
-  sites `proxy/proxy.py:1777,1780`. Rationale at `architecture/proxy.md:520-536`.
-- Cause: Upstream `prompt_tokens` is unreliable (non-monotonic, sliding-window
-  truncation), so the proxy estimates locally for a stable context bar.
-  chars/3 is a deliberate tuning for code/JSON-dense agent turns (vs the
-  chars/4 prose rule of thumb).
-- Improvement path: The divisor is a heuristic, not a tokenizer. It will be
-  wrong (high or low) for unusual content mixes (heavy CJK, base64 blobs).
-  Accuracy is bounded by design — the goal is monotonic growth for
-  auto-compaction, not exactness. Only worth replacing with a real BPE
-  tokenizer if compaction visibly fires too early/late in practice; that adds
-  a heavy dependency for marginal gain.
-
-## Scaling Limits
-
-**Single upstream key locks every ~8h and expires ~monthly, with no rotation:**
-- Current capacity: One `PROXY_API_KEY` drives every request from every agent.
-- Limit: The upstream locks the key every ~8 hours and expires it after
-  ~1 month (`architecture/upstream-api.md:57-62`). A locked key returns `401`
-  with an `unlock_url`; unlocking requires a signed-in **browser** session and
-  cannot be automated by the harness (`architecture/upstream-api.md:64-84`).
-- Scaling path: There is no key pool and no auto-rotation — by upstream design
-  (unlock needs a human browser). The harness surfaces the lock cleanly (the
-  CLI auth probe gates the launch and prints the clickable unlock URL —
-  `architecture/harness-cli.md:46-54`; `harness unlock` exists), but recovery
-  is manual. The only documented future option (pull a session key from a
-  logged-in browser) is uncommitted. For now the system is inherently
-  single-key, single-user, with periodic manual unlocks. Multi-user or
-  always-on operation is not supported without solving upstream key automation.
-
-## Dependencies at Risk
-
-**opencode is pinned and tightly coupled to harness-side workarounds:**
-- Risk: `OPENCODE_VERSION` is pinned to `1.15.7`
-  (`agents/Dockerfile:103`); harness ships behavior workarounds keyed to
-  this exact version (the headless stdout race, the `task` header parse, the
-  json-stream empty-run fallback).
-- Impact: An opencode upgrade can break the `-p` recovery path, the prompt
-  paring, or model discovery. opencode self-update is disabled
-  (`OPENCODE_DISABLE_AUTOUPDATE=1`, `architecture/containers.md:95`) so the
-  pin holds, but staying pinned means missing upstream fixes.
-- Migration plan: Bump deliberately, re-verify against the checklist in the
-  `OPENCODE_VERSION` note in `agents/Dockerfile`, and run
-  `full_pipeline_test` (T10) plus `TestTaskDescriptionParing` before
-  shipping a bump. Treat any unverified bump as a known regression risk.
-
-**Flask built-in server is not a production WSGI stack:**
-- Risk: `app.run()` (`proxy/proxy.py:1866`) is the dev server.
-- Impact: Single-flight request handling; one slow upstream call blocks
-  concurrent requests for up to `PROXY_TIMEOUT` (180s default). No graceful
-  worker model. Flask itself prints a "do not use in production" warning.
-- Migration plan: Wrap with gunicorn or waitress (a few workers, matched to
-  the single-key single-flight reality so workers don't all stall on the same
-  locked key). Until then, document the serialization as a known limit.
-
-## Test Coverage Gaps
-
-Current red/yellow items are taken from `tests/COVERAGE.md` (as of this
-audit: 243 green, 5 yellow, 118 red of 366 IDs — 66.3% green,
-`tests/COVERAGE.md:60-65`). The former `O###` ollama section is gone (0 IDs,
-`tests/COVERAGE.md:78`). The largest gaps below are the ones most likely to
-hide a real regression in the post-migration topology.
-
-**Upstream HTTP error handling is entirely untested (proxy):**
-- What's not tested: P037-P042 (`tests/COVERAGE.md:309-314`) — upstream `401`
-  unlock-URL forwarding, `403`, `429`, `5xx`, connection-failure→502, and
-  non-JSON→502. All red.
-- Files: `proxy/proxy.py` upstream-call + error path (the `requests.post`
-  around `proxy/proxy.py:1690-1695` and its `_client_error` envelope).
-- Risk: The key-lock flow is the single most operationally important error
-  path (it fires every ~8h) and nothing asserts the proxy forwards the
-  `401` + `unlock_url` shape, or that an unreachable upstream becomes a clean
-  `502` rather than a 500/stacktrace.
-- Priority: High — this is the live failure mode users hit most.
-
-**Debug-dump file contents are unverified (proxy):**
-- What's not tested: P043-P049 (`tests/COVERAGE.md:315-321`) — no test reads
-  back any of the `01`/`02`/`03`/`04`/`99` dump files or the filename
-  pattern. All red.
-- Files: `proxy/proxy.py:346-355` (`save_debug_file`) and its call sites.
-- Risk: A refactor could start dumping the `Authorization` header (currently
-  excluded — see Security) or corrupt the dump format, and no test would
-  catch it. Given the key-not-in-dumps invariant is a security property,
-  this gap is more than cosmetic.
-- Priority: Medium-High — add at least one assertion that the `02` dump has
-  no `Authorization`/`Bearer` string.
-
-**Agent entrypoint idempotency and launch flags (agent):**
-- What's not tested: A005 "entrypoint run twice is a no-op for UID remap"
-  (`tests/COVERAGE.md:343`) and the agent-launch flag matrix — F045
-  (`harness shell`), F046 (`--yolo` pass-through), F047 (`--net`), F050
-  (multiple `--mount`), F052 (`--print` long form)
-  (`tests/COVERAGE.md:166-173`). All red. The A prefix is the worst-covered
-  agent area (10/22 green, `tests/COVERAGE.md:73`).
-- Files: `agents/entrypoint.sh`, agent-launch path in `harness`
-  (`run_agent`/`cmd_shell`).
-- Risk: The entrypoint runs firewall + UID remap + gosu drop on every launch;
-  a re-run regression (e.g. re-seeding the home, re-chowning) would be silent.
-  Launch-flag regressions would mis-wire the container.
-- Priority: Medium — these are interactive/TTY-heavy paths that are hard to
-  assert, which is why they are red; `full_pipeline_test` exercises the happy
-  path end-to-end.
-
-**Net subcommand surface (CLI):**
-- What's not tested: F078-F092 (`tests/COVERAGE.md:205-219`) — `net deny`
-  no-op, `net edit`, `net open` confirmation phrase and mismatch rejection,
-  `net close` and its idempotency/JSON-key-drop, unknown-service handling,
-  `harness unlock` against mocked/unreachable upstream. All red. N prefix is
-  6/30 green (`tests/COVERAGE.md:75`).
-- Files: `scripts/lib/net_helpers.sh`, `cmd_net_*` and `cmd_unlock` in
-  `harness`.
-- Risk: The firewall override flow is a security boundary (`net open` grants
-  unrestricted egress); its confirmation-phrase gate and the override
-  JSON-key cleanup are unasserted.
-- Priority: Medium-High for the `net open`/`net close` override paths
-  (security-relevant); lower for `net edit`/unlock (require `$EDITOR`/network
-  mocking).
-
-**jq-less fallback and upgrade `--rebuild` (CLI):**
-- What's not tested: F016 (`tests/COVERAGE.md:134`) — host-jq-absent docker
-  fallback never forced; F038 (`tests/COVERAGE.md:156`) — `harness upgrade
-  --rebuild`; F032 (`tests/COVERAGE.md:150`) — `harness update` refusing a
-  dirty tree. All red.
-- Files: `harness_jq`/`_ensure_jq_sidecar` and `cmd_upgrade` in `harness`.
-- Risk: The jq sidecar fallback (`architecture/harness-cli.md:260-293`) is a
-  fragile lifecycle (sweep/reap of `harness-jq-$$` containers) used on every
-  jq-less install; its docker branch is the one not exercised.
-- Priority: Medium.
+Verified vs inferred is called out per item. "Verified" = read the code path
+end to end. "Inferred" = read the relevant code but did not execute it.
 
 ---
 
-*Concerns audit: 2026-06-02*
+## CRITICAL
+
+### C1 — `harness upgrade` is unusable on a host-only install (no docker)
+
+- **Concern:** `cmd_upgrade` calls `require_docker` unconditionally before doing
+  any work (`harness:1820`). The installer now explicitly supports a host-only
+  install with NO container runtime (`harness-install.sh:317-319`, sets
+  `HOST_ONLY=1`), and tells the user "install host-only … `harness host` runs
+  containerless." But the only documented way to update that install — `harness
+  upgrade` — hard-exits at `require_docker` (`harness:1820` → `harness:525-527`
+  / `530-535`) because no runtime is reachable. The host-only user is told to
+  use `harness host` for running, but has no working upgrade path.
+- **Impact:** Host-only installs cannot upgrade. They are stranded on whatever
+  code they installed unless the user manually runs `harness update` (a bare
+  `git pull --ff-only`, `cmd_update`) and skips the manifest-apply + config-merge
+  that `upgrade` performs. New `.env`/allowlist keys never get merged; the
+  install silently drifts.
+- **Severity:** CRITICAL — it breaks the maintenance story for a mode the
+  installer actively offers.
+- **Verified.** (`harness:1820`, `harness:514-536`, `harness-install.sh:317-319`.)
+- **Remediation:** Split upgrade into "code/config" (git pull + manifest apply +
+  config merge — no docker) and "rebuild/restart" (docker). Gate only the
+  rebuild/restart half behind `require_docker`, mirroring how `cmd_downgrade`
+  already guards rebuild with `if (( ! no_restart )); then require_docker; fi`
+  (`harness:2069-2071`). A host-only upgrade should run the manifest + merge and
+  then no-op the image rebuild with an informational message, not abort. (Note:
+  the orchestrator was already told this is being fixed; left here as the
+  primary item for completeness and to anchor the related gaps below.)
+
+---
+
+## HIGH
+
+### H1 — `harness doctor` has zero host-mode awareness and mis-reports a healthy host install as broken
+
+- **Concern:** `cmd_doctor` opens its `[deps]` section by probing the container
+  runtime and printing `fail` when it is not reachable (`harness:5679-5683`),
+  then checks `$rt compose` (`harness:5685-5691`). The `[network]` section hard-
+  requires the firewall allowlist and prints `fail` when it is missing
+  (`harness:5776`, `5800`) — but host mode has no allowlist by design
+  (`harness:2684-2686`, the comment on `host_require_config`). The `[runtime]`
+  section inspects the docker network and proxy container health
+  (`harness:5847-5870`). None of it knows about `state/host/` — the host proxy
+  pidfile/venv/logfile (`harness:2618-2622`) — so a perfectly working host
+  install reports multiple `fail`s and no host diagnostics at all.
+- **Impact:** A host-only user running `harness doctor` to debug a problem gets a
+  wall of red that describes container mode they never use, and gets zero signal
+  about the thing that's actually running (host proxy up? venv built? port
+  listening? logfile tail?). Doctor is advertised as the diagnostic entry point
+  (`harness:1386`, `cmd_help`), so this actively misleads.
+- **Severity:** HIGH — diagnostics that lie are worse than no diagnostics.
+- **Verified.** (`harness:5671-5870`, `harness:2618-2622`, `harness:2684-2686`.)
+- **Remediation:** Add a `[host]` doctor section that reports `host_proxy_running`,
+  the venv stamp state, the configured port, and the last lines of
+  `host_proxy_logfile`. Demote the container-runtime/compose/network/allowlist
+  checks from `fail` to `skip`/`warn` ("container mode; not configured") when no
+  runtime is reachable, instead of `fail`.
+
+### H2 — `harness preflight` is container-only and reports a healthy host install as failing
+
+- **Concern:** `cmd_preflight` increments `errors` when no container runtime is
+  reachable (`harness:5995-5996`, `6002-6003`) and treats a missing firewall
+  allowlist as an error (`harness:6010`, `6013`), plus requires the
+  `PROXY_API_URL` host to be in that allowlist (`harness:6046-6058`). Host mode
+  requires none of this. `cmd_help` even describes preflight as "validate config
+  (.env, allowlist, docker daemon)" (`harness:1387-1388`) — there is no host-mode
+  preflight surfaced to users (`host_preflight` exists at `harness:2647` but is
+  only reachable via `cmd_host`, never as a standalone `harness preflight host`).
+- **Impact:** Same failure shape as H1 for the pre-launch validator: a host user
+  cannot run `harness preflight` to sanity-check their setup; it will always
+  report errors for docker + allowlist they intentionally don't have.
+- **Severity:** HIGH.
+- **Verified.** (`harness:5976-6058`, `harness:2647-2682`, `harness:1387-1388`.)
+- **Remediation:** Either accept a `harness preflight host` subcommand that calls
+  `host_preflight` + `host_require_config`, or auto-detect host-only and switch
+  the runtime/allowlist checks to advisory. Update the `cmd_help` one-liner.
+
+### H3 — Host mode unconditionally enables debug dumps; container mode defaults them OFF
+
+- **Concern:** `host_proxy_start` always sets `OUTPUT_DIR="$state_root/output"`
+  (`harness:2797`). The proxy writes a per-request JSON debug file for every
+  pipeline stage when `OUTPUT_DIR` is set (`proxy.py:453-461`, `init_output_dir`
+  at `proxy.py:437-450`; 20 `save_debug_file` call sites). These payloads are the
+  full request/response bodies — i.e. complete prompts, file contents the agent
+  read, and model output. Container mode deliberately defaults this OFF and makes
+  it opt-in (`docker-compose.yml:39-42`, `OUTPUT_DIR: ${OUTPUT_DIR:-}` with the
+  comment "empty by default (no debug dumps). Users opt in").
+- **Impact:** (1) Behavior divergence: the same proxy silently logs everything in
+  host mode but nothing in container mode, which will confuse anyone comparing the
+  two. (2) Privacy/disk: host mode is the *less* sandboxed mode (full host user,
+  no firewall), and it's the one that unconditionally writes every prompt — which
+  may contain secrets the agent read from `~/.ssh`/`~/.aws` — to
+  `state/host/../output/` as plaintext JSON, unbounded, with no rotation. The
+  gate warning (`host_confirm_gate`, `harness:2710-2746`) never mentions this.
+- **Severity:** HIGH — unexpected plaintext capture of sensitive prompt data in
+  the highest-blast-radius mode.
+- **Verified.** (`harness:2797`, `proxy.py:437-461`, `docker-compose.yml:39-42`.)
+- **Remediation:** Make host mode honor the same opt-in: pass `OUTPUT_DIR`
+  through from `.env` (default empty) instead of force-setting it. If a default
+  dump location is wanted for host debugging, mention it in `host_confirm_gate`
+  and add cleanup/rotation.
+
+### H4 — No tests at all for containerless host mode
+
+- **Concern:** A repo-wide grep for `harness host` / `cmd_host` / `host_proxy_*`
+  / `host_confirm_gate` / `host_preflight` / `host_run_opencode` /
+  `host_write_opencode_config` across `tests/` returns nothing. (The `host_mcp_*`
+  test files are for the unrelated host-MCP feature, not containerless mode.)
+- **Impact:** The entire new command path — preflight, config validation, the
+  confirm gate, venv build, proxy supervision (start/wait/stop), opencode config
+  generation, and the `-p` print-mode export dance (`harness:2940-2977`) — ships
+  with zero automated coverage. This is the most error-prone area (process
+  supervision, JSON generation via `harness_jq`, the `-p` session-export
+  fallback chain) and a regression in any of it would be invisible to CI.
+- **Severity:** HIGH.
+- **Verified.** (grep over `/home/opc/repos/harness/tests/` returned no
+  containerless-host matches; `tests/upgrade_test.sh` "host" hits are host-MCP.)
+- **Remediation:** Add a docker-free `unit_host_test.sh`: assert `host_preflight`
+  fails with clear messages when node/jq/python3/opencode are absent; assert
+  `host_require_config` rejects empty required vars; assert `host_confirm_gate`
+  refuses without `/dev/tty` and honors `HARNESS_HOST_CONFIRM=1`; assert
+  `host_write_opencode_config` emits valid JSON with `baseURL` →
+  `127.0.0.1`. The proxy-process lifecycle can be smoke-tested with a stub
+  `proxy.py` that just binds the port.
+
+---
+
+## MEDIUM
+
+### M1 — `harness host -p` (print mode) leaves the proxy running indefinitely with no reaper
+
+- **Concern:** In print mode, `host_run_opencode` deliberately does NOT call
+  `host_proxy_stop` (only the interactive branch does, `harness:2985`); the
+  docstring says this is to avoid thrashing a scripted `-p` loop
+  (`harness:2916-2919`). The only way to stop it is `harness host down`
+  (`cmd_host_down`, `harness:3025-3032`). There is no EXIT trap, no idle timeout,
+  and no PID-ownership check — a user who runs one `harness host -p "..."` and
+  walks away leaves a Flask server bound to 127.0.0.1:8000 forever.
+- **Impact:** Orphaned proxy holding the port. A subsequent container-mode
+  `harness start` that also wants 8000, or a second host launch after the user
+  forgot, collides. `host_proxy_running` keys only on the pidfile
+  (`harness:2627-2640`), so a manually-killed proxy with a stale pidfile is
+  handled, but a still-running orphan from a prior `-p` is silently reused — fine
+  if config is unchanged, wrong if `.env`/port changed since (see M2).
+- **Severity:** MEDIUM.
+- **Verified.** (`harness:2916-2987`, `harness:3025-3032`, `harness:2627-2640`.)
+- **Remediation:** Document the lifecycle in `cmd_help` (the host help block at
+  `harness:1368-1375` doesn't mention that `-p` leaves the proxy up), and
+  consider an idle-timeout or a note printed after `-p` runs telling the user to
+  `harness host down`.
+
+### M2 — Reused host proxy ignores changed config / port
+
+- **Concern:** `host_proxy_start` short-circuits with `host_proxy_running &&
+  return 0` (`harness:2786`) keyed purely on a live PID in the pidfile. The
+  running proxy captured its `.env` (PROXY_API_URL/KEY, DEFAULT_MODEL_NAME) and
+  `PROXY_PORT` at the moment it started (`harness:2795-2799`). If the user edits
+  `.env` (new key, new model, new `PROXY_PORT`) and re-runs `harness host`, the
+  stale proxy is reused with the OLD config, while `host_write_opencode_config`
+  regenerates the opencode config from the NEW `.env` (`harness:2854-2911`) and
+  `host_proxy_wait_ready` probes `host_proxy_port` from the NEW `PROXY_PORT`
+  (`harness:2808-2810`). On a port change the probe waits on a port nothing is
+  listening on and fails after ~10s with a confusing "did not start" error.
+- **Impact:** Silent stale-config use (best case) or a confusing timeout on a
+  port change (worse case). No "config changed, restarting proxy" detection.
+- **Severity:** MEDIUM — inferred for the port-mismatch failure (read the paths,
+  did not run); the stale-config reuse is directly verifiable from the code.
+- **Verified/Inferred.** (`harness:2785-2801`, `2808-2810`, `2854-2911`; the
+  timeout outcome on a port change is inferred.)
+- **Remediation:** Record the config fingerprint (port + a hash of the required
+  vars) alongside the pidfile; if it differs from the current `.env`, stop and
+  restart the proxy instead of reusing it.
+
+### M3 — `proxy.py` defaults to binding `0.0.0.0`; host-mode safety relies entirely on one env var
+
+- **Concern:** `PROXY_HOST` defaults to `0.0.0.0` (`proxy.py:56`), i.e. all
+  interfaces. Host-mode loopback-only binding is enforced solely by
+  `host_proxy_start` exporting `PROXY_HOST=127.0.0.1` (`harness:2795`). There is
+  no defense-in-depth in the proxy itself: if that single export is ever dropped,
+  reordered, or overridden (e.g. a user sets `PROXY_HOST` in `.env`, which is
+  sourced with `set -a` into the same shell — `host_proxy_start`'s inline
+  assignment does win, but `.env` precedence here is subtle and untested per H4),
+  the host proxy — which fronts the upstream API key in its `Authorization`
+  header (`proxy.py:2145`, `2232`) and has no auth of its own — would be exposed
+  on the LAN.
+- **Impact:** A one-line regression in the launch path turns the host proxy into
+  an open, unauthenticated relay to the paid upstream, reachable by anyone on the
+  network. The egress firewall that would normally contain this does not exist in
+  host mode (by design, `harness:2610-2612`).
+- **Severity:** MEDIUM (low likelihood, high impact; mitigated today by the
+  hardcoded export, but with no second layer).
+- **Verified.** (`proxy.py:56`, `proxy.py:2509-2512`, `harness:2795`,
+  `proxy.py:2145`/`2232`.)
+- **Remediation:** Add a `HARNESS_FORCE_LOOPBACK=1` (or similar) that
+  `proxy.py:_validate_config` honors to refuse any non-loopback `PROXY_HOST`,
+  and have `host_proxy_start` set it. Belt-and-suspenders for the no-firewall
+  mode. Alternatively change the proxy default to `127.0.0.1` and have
+  container mode opt into `0.0.0.0` explicitly.
+
+### M4 — `harness_jq` is reachable from a host-mode path that ran preflight, but the dependency contract is fragile
+
+- **Concern:** `host_write_opencode_config` and the `-p` export logic call
+  `harness_jq` (`harness:2868`, `2884`, `2888`, `2961`, `2964`, `2969`, `2972`).
+  `harness_jq` falls back to a docker sidecar when host `jq` is absent
+  (`harness:206-229`, `_ensure_jq_sidecar:247-320`), which in host-only mode has
+  no docker and would fail with the "jq required … runtime isn't installed
+  either" error (`harness:252-258`). This is currently *prevented* because
+  `host_preflight` hard-requires host `jq` before any of these run
+  (`harness:2655-2659`, called first in `cmd_host` at `harness:3007`). So the
+  path is safe today — but only by that single ordering invariant.
+- **Impact:** Low today (preflight guards it). The risk is latent: any future
+  host-mode code that calls `harness_jq` *before* `host_preflight`, or any
+  refactor that makes preflight non-fatal, silently reintroduces a docker
+  dependency into the "no docker" mode. The two are 350+ lines apart and the
+  coupling is implicit.
+- **Severity:** MEDIUM (latent, not live).
+- **Verified.** (`harness:2647-2682`, `harness:3007-3009`, `harness:206-258`.)
+- **Remediation:** In host mode, prefer a direct `jq` invocation (preflight
+  guarantees it's present) or add an assertion in `host_write_opencode_config`
+  that `command -v jq` succeeds, so the docker-sidecar fallback can never be
+  reached from host paths. Document the ordering invariant next to
+  `host_preflight`.
+
+### M5 — Installer's host-only path validates none of the host-mode prerequisites
+
+- **Concern:** The installer's `HOST_ONLY` branch (`harness-install.sh:317-319`,
+  final summary `887-896`) tells the user `harness host` "needs Node >= 20,
+  opencode, python3, jq" but never *checks* for them at install time — it only
+  verifies git/disk/write-access in `preflight()`. The actual check happens later
+  in `host_preflight` (`harness:2647`) on first `harness host` run.
+- **Impact:** A user does a host-only install, it reports success, and then the
+  *first* `harness host` fails on missing node/opencode. The failure is deferred
+  from install to first use, with no early signal. Not catastrophic (the error
+  messages in `host_preflight` are good and actionable), but it undercuts the
+  point of an installer preflight.
+- **Severity:** MEDIUM.
+- **Verified.** (`harness-install.sh:270-360`, `887-896`; `harness:2647-2682`.)
+- **Remediation:** When `HOST_ONLY=1`, have the installer additionally probe
+  node>=20 / python3 / jq / opencode and warn (not fail) so the user knows
+  before first launch.
+
+---
+
+## LOW
+
+### L1 — `proxy/proxy.py` is a 2516-line single-file monolith
+
+- **Concern:** All proxy behavior — config read (`proxy.py:56-67`), prompt-mode
+  setup, the cooperative-prompt builders, tool-call extraction, SSE/JSON
+  emission, debug dumps (`453-461`), Flask routes (`2127`, `2156`, `2438`),
+  validation (`2459`), and `main()` (`2472`) — lives in one module
+  (`wc -l` = 2516).
+- **Impact:** Every proxy change touches one large file; unrelated edits collide;
+  there's no module boundary between wire-translation and Flask plumbing. The
+  test file mirrors the same shape. Now that host mode runs the *same* proxy
+  unchanged, both modes share this single blast radius.
+- **Severity:** LOW (works correctly; maintainability cost only).
+- **Verified.** (`proxy/proxy.py`, 2516 lines.)
+- **Remediation:** Extract config, prompt-builders, wire-translation, and Flask
+  app into separate modules with a thin `main`. Not urgent; do it opportunistically.
+
+### L2 — `harness` CLI is a 6589-line bash monolith
+
+- **Concern:** The single `harness` script is 6589 lines and holds the entire
+  CLI: dispatch (`harness:6519`), upgrade/downgrade machinery, net/firewall,
+  MCP (container + host), doctor/preflight, and now the host-mode block
+  (`harness:2604-3032`).
+- **Impact:** High cognitive load; the docker-coupling gaps in H1/H2 partly stem
+  from new modes being bolted onto functions (`cmd_doctor`, `cmd_preflight`,
+  `cmd_upgrade`) that assume the container world. Cross-cutting changes are
+  error-prone at this size.
+- **Severity:** LOW (functional; maintainability cost).
+- **Verified.** (`harness`, 6589 lines.)
+- **Remediation:** Continue extracting cohesive blocks into `scripts/lib/*.sh`
+  (the pattern already started with `platform.sh` / `upgrade_actions.sh`). A
+  `host.sh` library would isolate the host-mode block and make its
+  docker-independence enforceable.
+
+### L3 — `cmd_help` host block omits the `-p`-leaves-proxy-running and config-merge caveats
+
+- **Concern:** The `host` help entry (`harness:1368-1375`) covers the firewall
+  warning and dependency list but does not mention: (a) that `-p` leaves the
+  proxy running (M1), (b) that there's no `harness upgrade` path for host-only
+  installs (C1), or (c) that host mode is "v1: single CWD, no host-MCP wiring,
+  Linux/macOS only" — a limitation documented in the code comment
+  (`harness:2614-2615`) and architecture doc (`harness-cli.md:340`) but not
+  surfaced to users in `--help`.
+- **Impact:** Users discover these limits by hitting them. Minor.
+- **Severity:** LOW.
+- **Verified.** (`harness:1368-1375`, `harness:2614-2615`,
+  `architecture/harness-cli.md:340`.)
+- **Remediation:** Add one line each to the host help block.
+
+### L4 — Host opencode config bakes `apiKey: "harness-dummy"` and `OPENCODE_ENABLE_EXA=1` with no comment on why
+
+- **Concern:** `host_write_opencode_config` writes `"apiKey": "harness-dummy"`
+  (`harness:2899`) and `host_run_opencode` exports `OPENCODE_ENABLE_EXA=1`
+  (`harness:2926`). The dummy key is correct (the real key lives in the proxy,
+  not opencode) but undocumented at the call site, and the Exa flag silently
+  enables a web-search provider in a mode that has *no egress firewall* — exactly
+  the mode where unrestricted outbound is most concerning.
+- **Impact:** Minor; the Exa enablement in firewall-less mode is worth a conscious
+  decision rather than an unremarked copy from the container entrypoint.
+- **Severity:** LOW.
+- **Verified.** (`harness:2899`, `harness:2920-2926`.)
+- **Remediation:** Comment the dummy-key rationale; confirm `OPENCODE_ENABLE_EXA`
+  in firewall-less host mode is intended (it likely is, for parity, but the
+  no-firewall context makes it worth an explicit note).
+
+---
+
+## Areas checked and found sound (no action)
+
+- **Host proxy supervision lifecycle** (`host_proxy_pid`/`running`/`stop`,
+  `harness:2627-2846`): stale-pidfile cleanup, TERM-then-KILL, and idempotent
+  stop are correct and mirror the host-MCP model.
+- **`host_confirm_gate`** (`harness:2710-2746`): correctly refuses non-interactive
+  without `/dev/tty`, honors `HARNESS_HOST_CONFIRM=1`, and the warning text is
+  appropriately blunt about the no-isolation blast radius.
+- **`require_docker` host hint** (`harness:525-527`, `533-534`): both failure
+  paths now point users at `harness host`, which is the right nudge.
+- **`host_proxy_ensure_venv` stamp** (`harness:2751-2778`): the
+  requirements-hash stamp correctly avoids re-running pip on every launch.
+- **Secret redaction in proxy startup banner** (`proxy.py:2498`, `_redact_key`):
+  the upstream key is redacted in the proxy's own stdout banner, and `cmd_doctor`
+  redacts `PROXY_API_KEY` (`harness:5762`). The host proxy logfile
+  (`host_proxy_logfile`) captures this redacted banner, not the raw key.
+
+---
+
+*Concerns audit: 2026-06-08*

@@ -82,7 +82,9 @@ run from an empty directory. Stages:
    line never runs in fresh sessions. The bridge preserves an existing
    `~/.profile` when it has to create `~/.bash_profile`.
 9. **Final message.** Tells the user to edit `.env` (set
-   `PROXY_API_KEY` etc.) and `cd` into a project to run `harness`.
+   `PROXY_API_KEY` etc.) and `cd` into a project to run the agent. The
+   printed run command is host-aware: on a `HOST_ONLY` install (no runtime
+   detected) the "Next" steps say `harness host`, otherwise `harness`.
 
 Uninstall is `rm -rf <install-root> && rm ~/.local/bin/harness`.
 
@@ -134,6 +136,27 @@ helper with `harness upgrade`.
 
 `--check` is the exception: it lists every action and dry-runs them all
 (full preview), bypassing the precheck.
+
+**Host-only upgrade.** When no container runtime is installed
+(`harness_runtime_installed` is false — `command -v docker || command -v
+podman`, a binary check, not a daemon-reachability check), `cmd_upgrade`
+takes a docker-free path instead of aborting at `require_docker`. It still
+pulls code (step 1, the only part `harness host` actually needs — `proxy.py`
+runs from the updated clone) and still merges `.env`/allowlist (steps 2–3),
+then prints `[harness] host-only upgrade complete.` and `return`s **before**
+the rebuild/restart block (step 4 is a no-op with no images to rebuild or
+containers to restart). The host venv is not touched here: it refreshes
+lazily on the next `harness host` (it is sha-stamped against
+`proxy/requirements.txt`). If a proxy is already running, the completion
+message tells the user to bounce it with `harness host down && harness host`.
+The config merge needs jq; on a host-only box without jq the merge step is
+skipped with a warning (the pull still applies) rather than failing. A
+container install with the daemon merely stopped is NOT treated as host-only
+— it still hits `require_docker`, which tells the user to start the daemon,
+so a transient docker outage never silently downgrades the upgrade. The same
+`harness_runtime_installed` gate makes `harness down` a host-proxy/MCP stop
+(no `require_docker`) and makes `harness restart` point host users at
+`harness host down && harness host` instead of erroring on a missing runtime.
 
 Declining the `[y/n]` confirmation skips step 3 (the file merges) but
 still runs step 4 — the git pull has already happened, so the rebuild +

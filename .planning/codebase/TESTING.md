@@ -1,387 +1,103 @@
 # Testing Patterns
 
-**Analysis Date:** 2026-06-02
+**Analysis Date:** 2026-06-08
 
-The test suite targets the OpenAI-only topology: the proxy
-(`proxy/proxy.py`) serves an OpenAI-compatible interface that opencode talks
-to directly, with no ollama hop (`tests/proxy_test.sh:7`). Tests assert
-`call_`-prefixed tool-call ids, `chat.completion` / `chat.completion.chunk`
-object shapes, `data: [DONE]` stream termination, and the
-`04_OpenAI_Response_*` / `04_OpenAI_SSE_Response_*` debug-dump prefixes. The
-former ollama entrypoint inventory (`O###`) is retired with zero rows; the
-only `ollama` strings remaining in `tests/` are retirement comments and the
-`OLLAMA_CONTEXT_LENGTH` legacy-alias mention.
+Tests live under `tests/`. Two canonical maps live beside the suites and must be kept current when behavior changes:
+- `tests/INVENTORY.md` — every atomic testable behavior, one stable ID per row (F### CLI, P### proxy, A### agent entrypoint, M### MCP, N### firewall, U### upgrade, Pe### persistence, I### installer). 372 IDs as of this audit.
+- `tests/COVERAGE.md` — maps each inventory ID to the test(s) that exercise it with green/yellow/red status, file:line evidence, and a per-prefix breakdown. Current headline: **243 green (66.3%), 5 yellow, 118 red (32.2%)**. Includes a spot-check log (introduce a regression, confirm RED, revert, confirm GREEN) proving selected assertions are load-bearing.
 
 ## Test Framework
 
-**Runner:**
-- Bash test scripts executed directly via `bash tests/<name>_test.sh`
-- Python unit tests via `python -m unittest` (proxy only)
-- `harness test [section]` is the unified runner entry point (`cmd_test` at
-  `harness:5030`). It globs `tests/*_test.sh`, so a new
-  `tests/<name>_test.sh` is auto-discovered with no wrapper edit
-  (`architecture/tests.md:32-34`).
+**Bash suites:** no framework. Each `tests/*_test.sh` is a self-contained `#!/usr/bin/env bash` + `set -euo pipefail` script with local `fail()`/`ok()` helpers (`fail() { echo "[<suite>] FAIL: $*" >&2; exit 1; }`, `tests/unit_host_mcp_test.sh:33-34`) and a terminal success banner (`echo "HOST MCP TEST PASSED"`). A non-zero exit = failure; first `fail` aborts the script.
 
-**Assertion style:**
-- Bash: `[[ ... ]]` conditionals, `grep -q`, `grep -qE`, inline `fail()` /
-  `{ echo FAIL >&2; exit 1; }` helpers
-- Python: `unittest.TestCase` methods (`assertEqual`, `assertIn`,
-  `assertTrue`, `assertRaises`)
-- No external assertion frameworks (no bats, no pytest)
+**Python:** `proxy/test_proxy.py` (~1017 lines) uses the stdlib `unittest` module (`TestXxx` classes, `test_<behavior>` methods), driven via `python -m unittest`. `tests/proxy_test.sh` Scenario delegates to it.
 
-**Run Commands:**
-```bash
-harness test                        # all CI-runnable tests (*_test.sh glob)
-harness test unit                   # docker-free: upgrade_test.sh + unit_*_test.sh
-harness test proxy                  # tests/proxy*_test.sh (docker required)
-harness test --pattern 'mcp*'       # explicit glob under tests/ (overrides section)
-harness test integration --slow     # sets HARNESS_RUN_SLOW=1 (docker required)
-bash tests/<name>_test.sh           # run one script directly
-bash ./harness test unit            # equivalent without an installed wrapper
-```
+**Shared fixtures:** `tests/lib/test_helpers.sh` (sourceable; no assertions) supplies `require_docker`, `test_generate_env`, `test_generate_mockupstream_override`, `test_wait_for_healthy`, and sources `scripts/lib/platform.sh` so suites inherit `harness_docker` etc. Extracted to kill setup duplication across `proxy_test.sh` / `firewall_test.sh` / `full_pipeline_test.sh`.
 
-## Test File Organization
+**Mock upstream:** `tests/mock_upstream.py` is a fake chat-completions server used as a compose sidecar by docker-based suites. It returns only 200 — error-path behaviors (P037-P042) are red because it can't yet emit 401/403/429/5xx.
 
-**Location:** All bash test scripts live under `tests/`. The one Python unit
-test is co-located with its target: `proxy/test_proxy.py`.
-
-**Naming:**
-- `tests/<name>_test.sh` — top-level bash scripts (one per area)
-- `tests/unit_<name>_test.sh` — docker-free unit tests, run by
-  `harness test unit`
-- `proxy/test_proxy.py` — Python unit tests for the pure-Python functions in
-  `proxy/proxy.py`
-
-**Directory layout:**
-```
-tests/
-├── INVENTORY.md            # Stable-ID flat list of all testable behaviors
-├── COVERAGE.md             # Per-ID coverage map (green/yellow/red + evidence)
-├── README.md               # Quick start + links to architecture/tests.md
-├── lib/
-│   └── test_helpers.sh     # Shared bash toolkit (311 lines): require_docker,
-│                           #   test_section, test_generate_env, test_cleanup,
-│                           #   test_wait_for_healthy, mockupstream helpers
-├── fixtures/
-│   ├── responses/          # Mock-upstream JSON fixtures (NN_slug.json)
-│   └── test-project/       # Calculator package used by integration_test.sh
-├── mock_upstream.py        # Flask LLM-API stand-in (fixture dispatch + legacy)
-├── harness_test.sh         # CLI surface, doctor, preflight, net, upgrade flags (1452 lines)
-├── proxy_test.sh           # Proxy round-trip black-box + delegates to test_proxy.py (514 lines)
-├── persistence_test.sh     # State persistence across agent runs
-├── mcp_test.sh             # MCP lifecycle + register validation gate (1103 lines)
-├── firewall_test.sh        # Egress firewall guardrails (324 lines)
-├── full_pipeline_test.sh   # End-to-end install → start → agent → down
-├── integration_test.sh     # Serena MCP, --mount paths (900 lines, slow-gated)
-├── scheme_contract_test.sh # Per-prompt-mode proxy contract (456 lines)
-├── upgrade_test.sh         # Upgrade action library (586 lines, NO docker)
-├── unit_workdir_test.sh    # Cross-platform path helpers (NO docker)
-├── unit_platform_timer_test.sh  # Timer/timeout helpers (NO docker)
-├── benchmarks/             # Harbor agent benchmarks (NEVER run in CI)
-└── podman_smoke_test.sh    # Manual podman runtime smoke (238 lines, NOT in CI)
-proxy/
-└── test_proxy.py           # Pure-Python unittest for proxy.py helpers (1017 lines)
-```
-
-## Sections / Tiers
-
-`harness test [SECTION]` selects a group (`architecture/tests.md:36-49`):
-
-| Section | What runs | Docker |
-|---------|-----------|--------|
-| `all` (default) | every `tests/*_test.sh` | mixed |
-| `unit` | `upgrade_test.sh` + every `unit_*_test.sh` (glob-discovered) | **No** |
-| `integration` | docker-based tests; `--slow` adds `integration_test.sh` | Yes |
-| `<prefix>` | `tests/<prefix>*_test.sh` (e.g. `proxy`, `mcp`) | per script |
-
-### Docker requirement per script
-
-| Script | Docker | CI job | Slow gate |
-|--------|--------|--------|-----------|
-| `upgrade_test.sh` | No | `unit` | No |
-| `unit_workdir_test.sh` | No | `unit` | No |
-| `unit_platform_timer_test.sh` | No | `unit` | No |
-| `harness_test.sh` | Yes | `docker-tests` matrix | No |
-| `proxy_test.sh` | Yes | `docker-tests` matrix | No |
-| `persistence_test.sh` | Yes | `docker-tests` matrix | No |
-| `mcp_test.sh` | Yes | `docker-tests` matrix | No |
-| `firewall_test.sh` | Yes | `docker-tests` matrix | No |
-| `full_pipeline_test.sh` | Yes | `pipeline` | No |
-| `integration_test.sh` | Yes | `integration` | `HARNESS_RUN_SLOW=1` |
-| `scheme_contract_test.sh` | Yes | `scheme_contract` | No |
-| `podman_smoke_test.sh` | Yes (podman) | not in CI | manual only |
-
-The docker-free tier (`unit`) is the only thing issue-handling agents run
-locally; every docker-based section is left to CI (CLAUDE.md, "Local testing
-during issue work").
-
-## Test Structure
-
-### Bash Test Scripts
-
-**Suite organization:** Sequential numbered sections `T0`, `T1`, ...
-(`mcp_test.sh` uses `TR1`–`TR10` for the `register` block). Sections are
-announced by the shared `test_section` helper from
-`tests/lib/test_helpers.sh`:
+## Run Commands
 
 ```bash
-test_section "T3: harness logs (timeout 5s)"
+harness test                 # all tests/*_test.sh (docker-heavy; CI-style)
+harness test unit            # docker-FREE slice only (see classification below)
+harness test mcp             # prefix mode: tests/mcp_test.sh + tests/mcp*_test.sh
+harness test --pattern 'tests/firewall_*'   # explicit glob, relative to repo root
+harness test --slow          # exports HARNESS_RUN_SLOW=1 for the run
+bash tests/<name>_test.sh    # run a single suite directly
+python -m unittest proxy.test_proxy   # proxy pure-Python units
 ```
 
-**Setup:**
-```bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-source "${REPO_ROOT}/scripts/lib/platform.sh"   # or tests/lib/test_helpers.sh
+The runner is `cmd_test` (`harness:6137-6308`): it globs `$clone_dir/tests/*_test.sh`, runs each in a subshell from `clone_dir`, prints a `passed/failed` summary, and returns 1 if any failed. `--pattern` and `--slow` are the only flags; sections are positional (`all`, `unit`, `integration`, or a `<prefix>`).
 
-TEST_ROOT="$(mktemp -d -t harness-<name>.XXXXXX)"
-cleanup() { : ; }     # docker compose down + rm -rf $TEST_ROOT
-trap cleanup EXIT INT TERM
-```
+## Docker-free vs Docker-based (critical split)
 
-**Assertion pattern** (assert on structure, not exit-code-only or non-empty):
-```bash
-out=$(some_command 2>&1)
-rc=0; some_command || rc=$?
-[[ $rc -ne 0 ]] || { echo "FAIL: expected non-zero" >&2; exit 1; }
-grep -q 'expected substring' <<<"$out" || { echo "FAIL: not found" >&2; exit 1; }
-```
+This split is the single most important testing fact: issue-handling agents run only the docker-free slice locally and let CI run the rest.
 
-Real assertions use `[[ "$x" == "$y" ]]`, `grep -q '<specific>'`,
-`grep -qE '<pattern>'`. Always-pass forms like `[[ -n "$x" ]]` against any
-non-empty output are explicitly disallowed
-(`architecture/tests.md:119-122`).
+**Docker-FREE (`harness test unit` → globs `tests/unit_*_test.sh` plus `tests/upgrade_test.sh`, `harness:6214-6227`):**
+- `tests/upgrade_test.sh` (no docker) — `envfile_merge`, `linefile_merge`, `directory_overwrite`, `_upgrade_confirm`, `_git_branches_diverged`, synthetic N→N+1 upgrade, rsync fallback, standalone `harness_jq`.
+- `tests/unit_platform_timer_test.sh` — `harness_start_docker_desktop` poll-timeout logic with stubbed daemon probes.
+- `tests/unit_workdir_test.sh` — Git Bash path translation (`harness_abs_path`, `harness_container_workdir`, MSYS env guards, issue #112).
+- `tests/unit_host_mcp_test.sh` — host-MCP CLI surface (`mcp host-init`/`host-setup`, register, list/status/up/down/logs host branches) against a tmp `HARNESS_INSTALL_ROOT`, no docker / no real server spawn.
+- `tests/unit_host_mcp_net_test.sh` — docker-free host-MCP net helpers.
+- Also docker-free but NOT in the `unit` glob (run via `bash` directly or as their own CI section): `tests/harness_test.sh` sources the wrapper under `HARNESS_SOURCE_ONLY=1` and stubs `ensure_services_up`, so most of its CLI/doctor/net/upgrade-flag tests run without docker.
 
-### Python Unit Tests (`proxy/test_proxy.py`)
+**Docker-BASED (CI only; never run from an issue agent per CLAUDE.md):** `tests/proxy_test.sh`, `tests/harness_test.sh` (its container assertions), `tests/persistence_test.sh`, `tests/mcp_test.sh`, `tests/firewall_test.sh`, `tests/scheme_contract_test.sh`. These bring up compose + mock upstream.
 
-**One `TestCase` per logical feature area:** `TestFormatTools`,
-`TestExtractToolCall`, `TestExtractToolCallScanner`, `TestTranslateHistory`,
-`TestMakeChunk`, `TestPromptInjectionModes`, `TestChangeSystemToUser`,
-`TestUsageOverride`, `TestToolResultDelimiting`, `TestHybridDetailTools`,
-`TestConfigHelpers`, `TestModelPassthrough`, `TestHostOsSetup`.
+**Slow / gated (`HARNESS_RUN_SLOW=1`):** `tests/integration_test.sh` (Serena MCP, Graphify pipx, `--mount` rejection), `tests/full_pipeline_test.sh` (install → start → agent → mcp → down → update, builds the full image set), `tests/host_mcp_e2e_test.sh` (real host-MCP spawn — skips with "skipped (set HARNESS_RUN_SLOW=1 to run)" otherwise). `harness benchmark` targets refuse to run when `$CI` is set (`cmd_benchmark`, `harness:6359`).
 
-**Module import requires env first:**
-```python
-os.environ.setdefault("PROXY_API_URL", "http://example.invalid")
-os.environ.setdefault("PROXY_API_KEY", "test-key-1234")
-os.environ.setdefault("DEFAULT_MODEL_NAME", "test-model")
-import proxy  # noqa: E402
-```
+## How CI Runs (`.github/workflows/ci.yml`)
 
-**Patch project-managed constants, not env vars:**
-```python
-with patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True):
-    result = proxy.translate_history_and_apply_prompt(...)
-with patch.object(proxy, "_PROMPT_MODE", "user_front"):
-    ...
-```
+Parallel jobs, each its own GitHub Actions job:
+1. **lint** — `bash -n` on all shell scripts (blocking), `scripts/check_runtime_calls.sh` (no raw `docker` calls), `shellcheck` (advisory, `additional_files` list).
+2. **unit** — `bash ./harness test unit` (the docker-free slice).
+3. **docker / ${{ matrix.test }}** — matrix of docker-based suites, each `bash tests/${{ matrix.test }}.sh`. Relocates the Docker data-root to `/mnt` (66 GB vs ~8 GB) and caches Buildx layers because images are multi-GB.
+4. **full_pipeline_test** — own job, full image build.
+5. **integration (slow)** — own job with `HARNESS_RUN_SLOW: "1"` + pipx.
+6. **scheme_contract** — own job.
+7. **Auto-fix on failure (triage)** — opens a `ci-failure` issue.
 
-`proxy_test.sh` delegates to this file via `python -m unittest` after its own
-black-box round-trip scenarios.
+CI runs the full matrix on every push/PR to `dev`/`main`. The reason the docker-free/docker-based split matters: the runner can exhaust disk on local docker builds, so local verification is intentionally limited to the unit slice + linters.
 
-## Mocking
+## Test File Organization & Structure
 
-### Bash: function-level stubbing in subshells
+- **Naming:** `tests/<area>_test.sh`. The `unit_` prefix marks docker-free (`unit_workdir_test.sh`, `unit_host_mcp_test.sh`). Python units co-locate with the code under test (`proxy/test_proxy.py`).
+- **Structure:** numbered cases `T1`, `T2`, … (`TR1`-`TR10` for MCP register; `T2b`, `T23.4b` for sub-cases; `T26pm` etc.). Each prints `--- Tn: description ---`, runs the path, asserts, and `ok`s. The inventory ID(s) a case covers are named in the assertion message and in `COVERAGE.md`.
+- **Isolation:** every suite points `HARNESS_INSTALL_ROOT` (and friends — `HARNESS_ALLOWLIST_PATH`, `HARNESS_NET_OVERRIDES_PATH`, `HARNESS_REGISTRY_DIR`, `HARNESS_PROJECT_NAME`) at a `mktemp -d` tmpdir, with `trap 'rm -rf "$TMP_ROOT"' EXIT`. clone_dir still resolves to the real repo so template sources load while all writes land in the tmp.
+- **Invocation seam:** unit tests run the real `harness` as a subprocess capturing combined output (`HARNESS_OUT=$( ... 2>&1 ) || rc=$?`, `tests/unit_host_mcp_test.sh:46-54`); deeper function tests `source` the wrapper under `HARNESS_SOURCE_ONLY=1` and call functions directly (`tests/harness_test.sh`).
 
-Tests source the wrapper with `HARNESS_SOURCE_ONLY=1` and override functions in
-the same subshell so stubs never leak between cases:
+## Mocking / Stubbing Patterns
 
-```bash
-(
-    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
-    _probe_upstream_auth() { return 1; }     # stub: locked key
-    require_docker() { :; }                   # no-op
-    ensure_services_up() { echo "SENTINEL"; }
-    run_agent opencode 2>&1
-) || rc=$?
-```
+- **Function shadowing:** redefine a bash function after sourcing the wrapper to intercept it — stub `harness_docker` to record args or fail loudly (`tests/harness_test.sh` T19b/T19c, F015/F131/F133), stub `ensure_services_up` as a sentinel (F094), stub `curl` with locked-key/200/401/500 fixtures (T0.4), shadow `command -v rsync` to force the shell-loop fallback (`tests/upgrade_test.sh` T7).
+- **Fake pidfile / live-PID trick:** plant `server.pid` containing `$$` (the test's own guaranteed-alive PID) so `mcp up`'s already-running short-circuit fires without spawning a server, then remove it immediately (`tests/unit_host_mcp_test.sh:129-133`).
+- **Git fixtures:** real local origin+clone repos with crafted tag/divergence history for `_downgrade_target_tag` and `_git_branches_diverged` (`tests/harness_test.sh` T32, `tests/upgrade_test.sh` T11).
+- **OS pinning:** override `harness_detect_os` + stub `cygpath` to exercise Windows paths on Linux CI (`tests/unit_workdir_test.sh`).
+- **Source-grep assertions:** where behavior can't be driven end-to-end, suites grep the installed artifact for a load-bearing literal (e.g. `git pull --ff-only`, the hard-coded install-root in the wrapper, `_self_path` + realpath fallback). Used heavily in `full_pipeline_test.sh`.
 
-Capturing `harness_docker` args (used for the compose-threading tests, F131/F133):
-```bash
-(
-    HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
-    recorded_args=()
-    harness_docker() { recorded_args+=("$@"); }
-    compose ps --sentinel-token-d19c
-    grep -q 'sentinel-token-d19c' <<<"${recorded_args[*]}"
-)
-```
+## What's Tested vs Gaps (from COVERAGE.md)
 
-### Python: `unittest.mock.patch`
+Strong (green): proxy translation core (P019-P036, ~all of `test_proxy.py`), CLI surface/doctor/preflight/net-allow/upgrade-actions (F, U prefixes), MCP lifecycle incl. dynamic `register` (M/TR1-TR10), installer layout + platform primitives (I).
 
-`patch.object(proxy, "_PROMPT_MODE", ...)` and
-`patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", ...)` (see above).
+Persistent red clusters (don't assume coverage exists):
+- **Proxy error forwarding P037-P042** (401/403/429/5xx/502) and **debug-dump files P043-P050** — entirely red; the mock upstream only returns 200 and `OUTPUT_DIR` is set empty to bypass dumps.
+- **Firewall rule introspection N002-N011, N015-N016, N019-N028** — mostly red; no test reads back iptables/ipset state from a clean init. Only bypass (N001/N017) and one negative (N018) are covered.
+- **Interactive/401-gated CLI surfaces** F045 (`shell`), F057-F061 (`stop`/`pick_agent`), F081-F092 (`net open`/`close`/`unlock`) — red, hard to drive without a TTY or 401 mock.
 
-### Docker-level: the mock upstream
+## Host-Mode (`harness host`) Coverage — GAP, flag this
 
-Every docker-based test wires the proxy to `tests/mock_upstream.py` instead of
-a real LLM API (`architecture/tests.md:126-128`). Two dispatch modes, fixture
-taking precedence:
+The containerless launch mode added in the most recent commit (`Add containerless 'harness host' mode (P1)`) is **not yet covered by any test.** Verified by grepping `tests/` for the function names: **zero hits** for `host_preflight`, `host_confirm_gate`, `host_proxy_ensure_venv`, `host_proxy_start`, `host_proxy_stop`, `cmd_host`, `cmd_host_down`, or `harness host`.
 
-**Fixture dispatch (preferred, multi-response):** set
-`MOCK_FIXTURES_DIR=/fixtures` and mount `tests/fixtures/responses/`. The mock
-loads every `*.json` lexicographically and matches the latest user message
-against each fixture's `match` regex; first match wins; `99_default.json` is
-the catch-all (`tests/mock_upstream.py:8-30`,
-`tests/fixtures/responses/README.md`). The proxy's cooperative-prompt
-scaffolding (tool-schema dump) is stripped before matching, so a fixture regex
-only ever sees the user's actual request or a tool result.
+Do not confuse this with the host-**MCP** tests. `tests/unit_host_mcp_test.sh`, `tests/unit_host_mcp_net_test.sh`, and `tests/host_mcp_e2e_test.sh` cover `harness mcp host-init`/`host-setup` (non-container MCP *registration*) — a different subsystem. The `harness host` launch path (`harness:2606-3030`) has no inventory IDs in `tests/INVENTORY.md` and no rows in `tests/COVERAGE.md`.
 
-**Legacy `MOCK_SCENARIO` (fallback, single-response):**
-`MOCK_SCENARIO=text|tool` picks one canned response when no fixture matches or
-`MOCK_FIXTURES_DIR` is unset (`tests/mock_upstream.py:32-57`). Used by
-`proxy_test.sh` and `firewall_test.sh` where one response is enough.
+Untested host-mode behaviors that warrant coverage (all in `harness`):
+- `host_preflight` (`:2647`) — the python3 / jq / Node >= 20 / opencode dependency checks and the Node-version parse (`node --version | sed -E 's/^v?([0-9]+).*/\1/'`, fails when `major < 20`). No docker needed → a docker-free unit test is feasible by stubbing `command -v`/`node`.
+- `host_confirm_gate` (`:2710`) — the mandatory no-isolation warning, `HARNESS_HOST_CONFIRM=1` bypass, `--yolo` line, and the `/dev/tty`-absent refusal. Directly unit-testable (mirror `_upgrade_confirm`'s test pattern, which is green).
+- `host_require_config` (`:2687`) — the three-required-var check (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`) and missing-`.env` abort.
+- `host_proxy_ensure_venv` (`:2751`) — the sha256-stamped lazy venv build (only the pip-skip-when-stamp-matches branch is unit-friendly; the venv create is slow).
+- `cmd_host` / `cmd_host_down` (`:2990`, `:3025`) dispatch, including the `harness host down` proxy-stop path.
 
-The `test_generate_mockupstream_override` helper writes a compose override that
-attaches the `mockupstream` service to `harness-net`. For
-`integration_test.sh` (real `harness start`), the mock is attached via a
-`--network-alias mockupstream` run.
-
-## Fixtures and Factories
-
-- **Env files:** `test_generate_env <path> [extra_kv...]`
-  (`tests/lib/test_helpers.sh`).
-- **Allowlist files:** `test_generate_allowlist <path> [extra_host...]`.
-- **Compose overrides:** `test_generate_mockupstream_override <path>`.
-- **Mock response fixtures:** `tests/fixtures/responses/NN_short_slug.json`
-  with `match` (regex on the stripped last user message) and `response`
-  (`tests/fixtures/responses/README.md`).
-- **Test workdirs:** always `$(mktemp -d -t harness-<name>.XXXXXX)`, removed by
-  `trap cleanup EXIT`.
-- **Fake install roots:** `harness_test.sh` exports
-  `HARNESS_INSTALL_ROOT=$TEST_ROOT` + `HARNESS_PROJECT_NAME=...` to isolate
-  from any real instance, and sources the wrapper under `HARNESS_SOURCE_ONLY=1`.
-- **Fake MCP registries:** `mcp_test.sh` builds a synthetic `FAKE_REGISTRY` and
-  exports `HARNESS_REGISTRY_DIR=$FAKE_REGISTRY`.
-
-## Inventory & Coverage (stable-ID system)
-
-`tests/INVENTORY.md` enumerates every atomic testable behavior with a stable,
-never-reused ID grouped by prefix:
-
-| Prefix | Domain |
-|--------|--------|
-| `F###` | CLI commands/flags (the `harness` wrapper) |
-| `P###` | Proxy translation (`proxy/proxy.py`) |
-| `A###` | Agent entrypoint (`agents/entrypoint.sh`) |
-| `M###` | MCP lifecycle (`harness mcp …`, compose, registry) |
-| `N###` | Firewall guardrails (`firewall/init-firewall.sh`, net overrides) |
-| `U###` | Upgrade actions (`scripts/lib/upgrade_actions.sh`) |
-| `Pe###` | Persistence (what survives lifecycle/upgrade) |
-| `I###` | Installer (`harness-install.sh`) + `platform.sh` primitives |
-| `O###` | **Retired** — ollama entrypoint gone; zero rows |
-
-`tests/COVERAGE.md` maps each ID to its test file/line with a status:
-
-- **green** — a test exists AND its assertions check the claimed behavior
-  (evidence quotes a real assertion at a real `file:line`).
-- **yellow** — the code path runs but only a weak check (return code / non-empty /
-  "no crash"); the weak assertion is quoted.
-- **red** — no test exercises the behavior.
-
-**Current counts.** `tests/INVENTORY.md:14` states 372 inventory IDs
-(F=146, P=58, A=24, M=23, N=30, U=29, Pe=16, O=0, I=44). The
-`tests/COVERAGE.md:58-65` summary table totals 366 rows: **243 green
-(66.3%), 5 yellow (1.4%), 118 red (32.2%)**. (The two figures do not fully
-reconcile — the audit's own per-prefix table at `COVERAGE.md:69-79` lists
-F=146 / P=56 / A=22 / M=23 / N=30 / U=29 / Pe=16 / O=0 / I=44 = 366. Treat
-the COVERAGE.md status table as the live coverage figure and the small
-inventory-vs-audit delta as a known accounting drift, not new untested
-behavior.) The five yellows are F102, F142, P008, Pe006, I044 —
-indirect-evidence rows.
-
-No enforced coverage threshold in CI; coverage is tracked by manual audit, not
-an automated tool. Regression-detection spot-checks (inject a deliberate bug,
-confirm RED, revert, confirm GREEN) are logged at `COVERAGE.md:616-700`.
-
-## Current Coverage Gaps
-
-From `COVERAGE.md:704-721`:
-
-- **Debug-dump infrastructure (P043-P050) is entirely red.** Test scaffolding
-  sets `OUTPUT_DIR=` empty to bypass it; no test points `OUTPUT_DIR` at a
-  tmpdir and asserts the `01_Inbound_Request_*` … `04_OpenAI_Response_*` /
-  `04_OpenAI_SSE_Response_*` / `99_Fatal_Error_*` prefixes appear. `Pe006`
-  (`state/output/`) is correspondingly yellow.
-- **Upstream HTTP error forwarding (P037-P042) is entirely red.**
-  `mock_upstream.py` returns only 200; asserting 401/403/429/5xx/502 behavior
-  needs an error-injecting mode.
-- **Firewall/iptables rule state (N002-N011, N013-N016, N019-N028) is mostly
-  red.** No test reads back actual `iptables`/`ipset` state from a clean
-  firewall init; only bypass (N001, N017) and a focused negative (N018) are
-  covered.
-- **Interactive / auth-gated CLI paths are red** (F045 `shell`, F057-F061
-  `pick_agent`/`stop`, F081-F092 `net open`/`net close`/`unlock`). These need
-  TTY mocking or a 401-mocked upstream the current harness can't yet drive.
-- **Several agent-config assertions are red** (A019/A020/A021/A022/A028/A029)
-  — opencode provider/yolo/mcp-merge details are exercised only at the
-  boot-smoke level (A018, A035, A036), not field-by-field.
-
-## CI Matrix
-
-All jobs in `.github/workflows/ci.yml`; run on push/PR to `dev` and `main`:
-
-| Job | What runs | Docker |
-|-----|-----------|--------|
-| `lint` | `bash -n` over all shell scripts; `scripts/check_runtime_calls.sh`; advisory `shellcheck` (`continue-on-error`) | No |
-| `unit` | `harness test unit` (`upgrade_test.sh` + `unit_*_test.sh`) | No |
-| `docker-tests` | matrix: `harness_test`, `proxy_test`, `persistence_test`, `mcp_test`, `firewall_test` (`.github/workflows/ci.yml:90-95`) | Yes |
-| `pipeline` | `tests/full_pipeline_test.sh` (T9 boot-smoke also asserts A018) | Yes |
-| `integration` | `HARNESS_RUN_SLOW=1 tests/integration_test.sh` | Yes |
-| `scheme_contract` | `tests/scheme_contract_test.sh` (per-`PROXY_PROMPT_MODE` body capture) | Yes |
-
-Benchmarks (`harness benchmark …`) NEVER run in CI — they need an upstream API
-key, hours of wall-clock, and large disk (`tests/benchmarks/README.md`).
-`podman_smoke_test.sh` is not in CI (no podman on `ubuntu-latest`); run it
-manually on Linux when touching the runtime wrapper.
-
-## Adding a New Test
-
-1. Drop `tests/<name>_test.sh`; `cmd_test` glob-discovery picks it up — no
-   wrapper edit. Add the script to the `docker-tests` matrix in
-   `.github/workflows/ci.yml` by hand if it needs docker (CI uses an explicit
-   matrix so a new docker test triggers review).
-2. `#!/usr/bin/env bash` + `set -euo pipefail`; source
-   `tests/lib/test_helpers.sh`; call `require_docker` at the top for
-   docker-based tests.
-3. `test_section "..."` before each block; register `test_cleanup` on
-   `EXIT`/`ERR`.
-4. Assert on structure (`grep -q '<specific>'`), never `[[ -n "$output" ]]`.
-5. Wire mock upstream via `test_generate_mockupstream_override` (or a fixture
-   under `tests/fixtures/responses/`) — never hit a real LLM API.
-6. Gate slow tests (> ~60 s or heavy image) behind
-   `[[ "${HARNESS_RUN_SLOW:-0}" == "1" ]] || exit 0`.
-7. Add behaviors to `tests/INVENTORY.md` with new stable IDs; add coverage rows
-   to `tests/COVERAGE.md` with quoted assertion evidence.
-
-## Common Patterns
-
-**Waiting for healthy containers** (the proxy plus `mockupstream`, not
-ollama):
-```bash
-test_wait_for_healthy "$PROJECT" mockupstream proxy 120
-```
-
-**Cleanup of test stacks:**
-```bash
-test_cleanup "$PROJECT" "$ENV_FILE" "$OVERRIDE_FILE"
-```
-
-**Process exit-code assertion:**
-```bash
-rc=0; some_command 2>/dev/null || rc=$?
-[[ $rc -eq 1 ]] || { echo "FAIL: expected rc=1, got $rc" >&2; exit 1; }
-```
-
-**Python error testing:**
-```python
-with self.assertRaises(SystemExit):
-    proxy.some_function_that_exits()
-```
-
-Python async testing is not used; `proxy.py` is synchronous Flask.
+Recommended: add a `tests/unit_host_mode_test.sh` (docker-free, picked up by `harness test unit` via the `unit_*_test.sh` glob) covering `host_preflight` and `host_confirm_gate` at minimum, and add F-prefix inventory rows so `COVERAGE.md` tracks the new surface. Until then, host mode is shipping untested.
 
 ---
 
-*Testing analysis: 2026-06-02*
+*Testing analysis: 2026-06-08*

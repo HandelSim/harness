@@ -1,109 +1,222 @@
 # External Integrations
 
-**Analysis Date:** 2026-06-02
+**Analysis Date:** 2026-06-08
+
+> Terminology note: two unrelated "host" concepts exist.
+> - **`harness host`** = the containerless full-stack runtime (proxy + opencode
+>   as host processes). Covered under "Runtime paths".
+> - **host MCP** = an MCP server run as a supervised process on the host machine
+>   and wired into *container-mode* agents over the docker bridge. Covered under
+>   "MCP integration".
 
 ## APIs & External Services
 
-**Upstream LLM API (the only mandatory external dependency):**
-- A Gemini Enterprise chat product exposed behind a chat-completions-shaped HTTP API (`architecture/upstream-api.md:9-14`). It is a general chat assistant, not a coding-agent API.
-- What harness talks to it with: the proxy (`proxy/proxy.py`) POSTs to a derived `{base}/v1/chat/completions` endpoint and GETs `{base}/v1/models`. `PROXY_API_URL` is treated as a BASE, normalized by `_normalize_api_base` (strips a trailing `/v1/chat/completions`, `/chat/completions`, or `/v1`); `CHAT_URL` and `MODELS_URL` are derived once at import (`architecture/proxy.md:53-73`).
-- Auth: `Authorization: Bearer ${PROXY_API_KEY}` header on every upstream request (`architecture/proxy.md:38-39`). The same bearer is used for `/v1/models`.
-- TLS: the upstream uses a self-signed cert, so the proxy calls with `verify=False` (`architecture/proxy.md:38-39`).
-- Multi-model passthrough: the upstream honors the request's `model` field and advertises an OpenAI-style `/v1/models` catalog. The proxy forwards the model opencode selected verbatim, falling back to `DEFAULT_MODEL_NAME` only when a request omits a model (`architecture/proxy.md:61-66`, `architecture/upstream-api.md:16-22`).
-- Config knobs: `PROXY_API_URL` (REQUIRED base), `PROXY_API_KEY` (REQUIRED bearer), `DEFAULT_MODEL_NAME` (REQUIRED fallback id), `PROXY_TIMEOUT` (request timeout, default 180s) (`.env.example:19-42`).
-- Known upstream quirks the proxy is built around (`architecture/upstream-api.md:30-54`): no native tool support (the proxy injects cooperative-prompt tool-use), a hidden/uncontrollable system prompt (so the proxy always converts the `system` role to `user`), no model-side web access, consecutive `user` messages collapse, and unreliable `usage` (so the proxy estimates tokens locally).
-- Failure modes: HTTP `400/401/403/404/429/500/502` (`architecture/upstream-api.md:146-156`). A `401` with an `unlock_url` body means the key is locked (see Authentication below); an empty/unknown-type `401`/`403` is treated as a rejected key. Empty-response short-circuits (well-formed `stop` with zero completion tokens) trigger the proxy's two-part rescue (`Understood.` text plus an optional `bash pwd` rescue tool call) (`architecture/proxy.md:391-449`).
+**Upstream LLM API (the core integration):**
+- A third-party, **non-Anthropic, OpenAI-compatible chat-completions API**.
+  The proxy is the only component that talks to it.
+  - Base URL: `PROXY_API_URL` (REQUIRED). The proxy normalizes it to
+    `scheme://host[/prefix]` and derives endpoints itself:
+    - chat: `POST {base}/v1/chat/completions` (`proxy/proxy.py:95`)
+    - models: `GET {base}/v1/models` (`proxy/proxy.py:96`, `proxy.py:2130`)
+    - Normalization strips a trailing `/v1/chat/completions`,
+      `/chat/completions`, or `/v1` so a base OR a full chat URL both work
+      (`_normalize_api_base`, `proxy/proxy.py:71-91`). The harness bash CLI
+      mirrors this in `_api_base`.
+  - Auth: `PROXY_API_KEY` (REQUIRED), sent as `Authorization: Bearer <key>`
+    (`proxy/proxy.py:2145`).
+  - Model: forwarded passthrough — whatever model the request asks for is sent
+    upstream; `DEFAULT_MODEL_NAME` is only the fallback when a request omits a
+    model (`.env.example:33-39`). opencode's model dropdown is built from the
+    upstream `/v1/models` catalog (`proxy/proxy.py:2132-2134`).
 
-**opencode coding agent:**
-- The agent that drives the work, running in the agent container (`harness-agent:latest`). It speaks to the proxy directly over the proxy's OpenAI-compatible interface; there is no ollama hop (`architecture/containers.md:74-90`).
-- How harness talks to it: the agent entrypoint writes `~/.config/opencode/opencode.json` with a harness provider block (display name `GenAI Harness`) whose `@ai-sdk/openai-compatible` `baseURL` is `http://proxy:${PROXY_PORT}/v1` (`architecture/containers.md:74-90`, `architecture/proxy.md:9-12`). The model dropdown is built from the proxy's `GET /v1/models` pass-through; `DEFAULT_MODEL_NAME` is always included and is the default selection.
-- Config knobs: `PROXY_PORT` (passed into the agent container as `-e` so a custom port resolves), `DEFAULT_MODEL_NAME`, `--yolo` (grants `edit`/`bash`/`webfetch`/`websearch` permissions), `OPENCODE_ENABLE_EXA` (conditionally exported to surface opencode's `websearch` tool).
-- Failure modes: if the proxy is unreachable or its key is locked, the model list falls back to `DEFAULT_MODEL_NAME` alone (`architecture/containers.md:84-87`). The headless `-p` path recovers the final assistant text from the persisted session because opencode's non-TTY renderer can race and drop stdout (`architecture/containers.md:123-152`).
+**Upstream contract quirks (verified in `proxy/proxy.py`):**
+- **Self-signed TLS.** All upstream calls use `verify=False`; the
+  `InsecureRequestWarning` is suppressed at import (`proxy.py:46-50`).
+- **Streaming.** Responses are re-emitted as OpenAI-style SSE
+  (`text/event-stream`, `data: {chunk}\n\n` … `data: [DONE]`) when
+  `stream:true`, else a single `chat.completion` JSON (`proxy.py:1-9`).
+- **Cooperative tool use.** Upstream models may not natively support tool
+  calls, so the proxy injects tool-use prompting (mode `hybrid` default /
+  `user_front` / `passthrough`, `proxy.py:344-359`), then parses ```json tool
+  blocks out of the response and re-emits native `tool_calls`. It also rewrites
+  the `system` role into a `user` message (upstream drops `system`).
+- **Key lifecycle / locked-key unlock.** A locked key returns upstream `401`
+  carrying an `unlock_url`; the proxy passes the upstream status+body through
+  verbatim (both on chat and `/v1/models`) so the unlock flow reaches opencode
+  unchanged (`proxy.py:2138-2142`).
+- **Timeout.** `PROXY_TIMEOUT` seconds (default 180).
+- See `architecture/upstream-api.md` for the authoritative contract.
 
-**Exa hosted MCP (`mcp.exa.ai`) — opencode `websearch`:**
-- opencode's built-in `websearch` tool hits Exa's hosted MCP. The egress firewall blocks it by design with no allowlist entry — websearch belongs to the firewall-down / `--net` use case (`architecture/containers.md:97-103`).
-- Reachability gate: opencode's MCP startup is synchronous, so with the firewall up the TCP REJECT is instant (harmless); with the firewall down the entrypoint probes Exa with a 1s connect / 2s overall `curl` before exporting `OPENCODE_ENABLE_EXA=1`, skipping registration if Exa is slow so the TUI still starts (`architecture/containers.md:105-120`).
+**Proxy's own surface (what opencode calls):**
+- `GET /health` → `{"status":"ok"}` (`proxy.py:2125`); the docker healthcheck
+  curls it (`docker-compose.yml:92-97`).
+- `GET /v1/models` → upstream catalog passthrough (`proxy.py:2130`).
+- `POST /v1/chat/completions` (via `catch_all`, `proxy.py:2175-2177`) — the
+  translated chat endpoint.
+- Errors use the `{"error":{"message":...}}` envelope the AI SDK parses
+  (`proxy.py:2168-2172`).
+
+**Agent → proxy wiring:**
+- opencode uses the `@ai-sdk/openai-compatible` provider with
+  `baseURL = http://proxy:${PROXY_PORT:-8000}/v1` and a dummy apiKey
+  (`agents/entrypoint.sh:135,189-191`). The compose service name `proxy` is
+  load-bearing — renaming it breaks this URL (`docker-compose.yml:3-7`).
+- In **host mode** the proxy binds `127.0.0.1:${PROXY_PORT}` instead, and the
+  host opencode config points there (`harness:2794-2799`).
+
+## Runtime Paths (how components are composed)
+
+**Container mode (default) — docker / podman + compose:**
+- Orchestrated by `docker compose` over `docker-compose.yml`. Runtime is docker
+  or podman, auto-detected unless `HARNESS_CONTAINER_RUNTIME` pins it
+  (`.env.example:189-197`, `harness:529-530`).
+- Services on a single user-defined bridge network `harness-net`
+  (`docker-compose.yml:13-16`); services reach each other by service name.
+- `proxy` service: built from `proxy/Dockerfile`, healthchecked, `restart:
+  unless-stopped`, `NET_ADMIN`+`NET_RAW` for the firewall, IPv6 disabled via
+  sysctl (`docker-compose.yml:24-97`).
+- `agent` service: built from `agents/Dockerfile`, in the `agent` compose
+  profile so `compose up` skips it; launched ephemerally per-invocation via
+  `docker run` by the CLI (`docker-compose.yml:105-131`). Entrypoint dispatches
+  on a mode arg (`opencode` / `shell`); does uid/gid remap + `gosu` drop and
+  same-path CWD bind-mounts.
+
+**Host mode (`harness host`, containerless):**
+- No docker, no compose, no firewall. Proxy runs from a lazy venv at
+  `state/host/venv` (built once from `proxy/requirements.txt`,
+  `harness:2748-2778`); started with `nohup`, bound to `127.0.0.1`, PID tracked
+  at `state/host/proxy.pid`, logs at `state/host/proxy.log`
+  (`harness:2780-2801`). opencode runs off the host PATH.
+- Mandatory per-launch confirmation gate (`host_confirm_gate`, `harness:2710`)
+  — runs as the full host user with unrestricted egress; `HARNESS_HOST_CONFIRM=1`
+  bypasses for automation. `harness host down` stops the proxy
+  (`harness:3025`). No host-MCP wiring in host mode (v1, `harness:2615`).
 
 ## Data Storage
 
-**Databases:**
-- None. harness runs no database.
+**Databases:** None. No DB/ORM in the stack.
 
-**File Storage:**
-- Local filesystem only. The host CWD is bind-mounted into the agent at the SAME absolute path (no `/workspace` indirection), so `pwd` round-trips host↔container (`architecture/containers.md:161-188`). Extra folders via `--mount` / `HARNESS_EXTRA_MOUNTS`.
-- Persistent agent home: `<install-root>/state/agent/home/` backs every agent invocation; anything a user installs inside an agent survives rebuilds (`architecture/containers.md:190-198`).
-- Proxy debug dumps: when `OUTPUT_DIR` is set, per-request JSON dumps land in `<install-root>/state/output/` (`architecture/proxy.md:567-579`).
+**File storage / runtime state:**
+- All runtime state under `<install-root>/state/` (gitignored):
+  - `state/output/` — proxy debug dumps when `OUTPUT_DIR` is set
+    (`docker-compose.yml:75`, `.env.example:71-90`).
+  - `state/agent/home/` — shared persistent agent `/home/harness`
+    (`harness:11-19`).
+  - `state/mcp/<name>/` — active MCP services + clones/data.
+  - `state/host/` — host-mode venv, proxy pidfile/logfile, opencode config.
+- Agent file access: same-path host↔container bind mounts of the CWD, plus
+  optional `HARNESS_EXTRA_MOUNTS` / `--mount` (`.env.example:108-131`).
 
-**Caching:**
-- None.
+**Caching:** None (no Redis/Memcached). opencode session state persists in the
+agent home; proxy is stateless.
 
 ## Authentication & Identity
 
-**Upstream API key lifecycle:**
-- The key (`PROXY_API_KEY`) is a long-lived bearer with a lock/expiry lifecycle (`architecture/upstream-api.md:57-84`): keys lock roughly every 8 hours (measure point unverified), expire after ~1 month, and usage is effectively unlimited (though `429` is still possible).
-- Lock flow: a locked key returns `401` with `{"error":{"type":"unauthorized","message":"API key locked...","unlock_url":"https://.../unlock/<id>"}}`. Visiting `unlock_url` in a signed-in browser re-enables it. Unlocking CANNOT be automated by harness because it needs a signed-in browser session (`architecture/upstream-api.md:65-84`).
-- Launch gating: `harness` runs `_probe_upstream_auth` (POST to `{base}/v1/chat/completions`) before starting the stack and aborts on a locked or rejected key, printing the clickable unlock URL. An `invalid_request`-family error (key fine, request bad) warns and continues. Honors `HARNESS_SKIP_AUTH_PROBE=1` (`architecture/harness-cli.md:43-59`). `harness unlock` is a dedicated subcommand (`architecture/harness-cli.md:81`).
-- Storage: `PROXY_API_KEY` lives in the gitignored `.env`. The installer can capture it at install time with a masked prompt and write only that line (`architecture/install-and-upgrade.md:18-23`). Logs redact it via `_redact_key` (`architecture/proxy.md:550-553`).
-
-**Git push credentials (agent containers):**
-- `configure-git-credentials.sh` sets `credential.helper=/bin/false` globally, then enables the `store` helper only for allowlist hosts annotated `# git-push` (`architecture/containers.md:57-61`, `.harness-allowlist.example` GitHub section). Without the annotation, pull works but push fails.
+- **Upstream auth:** bearer token `PROXY_API_KEY` (proxy → upstream only).
+- **Agent → proxy:** no real auth; a dummy apiKey (`agents/entrypoint.sh:191`).
+  The proxy is only reachable on `harness-net` (container) or loopback (host).
+- **Git credentials (agents):** `configure-git-credentials.sh` sets
+  `credential.helper=/bin/false` by default; `git push` is blocked unless a
+  host is annotated `# git-push` in the allowlist; interactive prompts disabled
+  via `GIT_TERMINAL_PROMPT=0` / `GIT_ASKPASS=/bin/false`
+  (`agents/Dockerfile:135-140`, `firewall/init-firewall.sh` step 5).
 
 ## Monitoring & Observability
 
-**Error Tracking:**
-- None (no Sentry/Datadog/etc.).
+- **Error tracking:** None (no Sentry/etc.). Proxy prints `[req_id] ...` lines
+  to stdout (`proxy.py:2160`); per-request debug dumps when `OUTPUT_DIR` set.
+- **Logs:** container logs via `docker logs`; host-mode proxy log at
+  `state/host/proxy.log`. Firewall logs `[harness-firewall]` lines
+  (`firewall/init-firewall.sh:28-40`).
+- **Health:** `GET /health` (compose healthcheck).
 
-**Logs:**
-- Plain stdout/stderr from each container, surfaced via `harness logs proxy` / `harness logs` and `harness mcp logs <name>`. The proxy `print()`s startup config (key redacted) and per-event diagnostics like the empty-response rescue mode (`architecture/proxy.md:429-432`, `:550-553`).
-- Optional per-request debug dumps under `state/output/` when `OUTPUT_DIR` is set (`architecture/proxy.md:567-579`).
+## Network / Egress Firewall
+
+- **Universal egress firewall** (`firewall/init-firewall.sh`) runs at container
+  startup as root (needs `NET_ADMIN`/`NET_RAW`), laying a default-deny iptables
+  policy with an allowed-host ipset.
+- Allowlist read from `/etc/harness/allowlist`, mounted from
+  `<install-root>/.harness-allowlist` (`docker-compose.yml:77`,
+  `.harness-allowlist.example`). One host per line; `# git-push` annotation
+  enables push to that host.
+- **Proxy-specific check:** the firewall validates `PROXY_API_URL`'s hostname
+  is on the allowlist and aborts otherwise — the upstream LLM host MUST be added
+  to the allowlist (`firewall/init-firewall.sh:11-14`,
+  `.harness-allowlist.example:29-35`).
+- IPv4-only (iptables + `dig +short A` + inet ipset); IPv6 disabled in-container
+  via sysctl to close the unfiltered v6 path (`docker-compose.yml:82-88`).
+- Bypass: `harness --net` (per-invocation) or `harness net open` (per-service)
+  set `HARNESS_FIREWALL_DISABLED=1`, logged loudly (`init-firewall.sh:42-50`).
+- **Host mode has NO firewall** — egress is unrestricted (`harness:2610-2613`).
+
+## MCP Integration
+
+**Registry:** `mcp-registry/` holds vetted, container-based MCP definitions.
+- Current entry: **Serena** (semantic code analysis, SSE transport).
+  - `mcp-registry/serena/compose.yml` — merged into the harness compose graph
+    via extra `-f` args; image `harness-serena:v0.1`, built host-side from a
+    local clone at `state/mcp/serena/repo` (build context, not a git-URL, to
+    dodge Windows path bugs).
+  - Agents reach it at `http://serena:9121/sse` on `harness-net`
+    (`mcp-registry/serena/client-config.json`).
+  - Mounts the user's project root read-only at `/workspaces/projects`
+    (`HARNESS_PROJECTS_ROOT`, default host `$HOME`); optional dashboard publish
+    via `SERENA_DASHBOARD_PORT` (`.env.example:96-138`).
+- Per-MCP metadata: `client-config.json` (opencode MCP wiring),
+  `harness-meta.json.template` (clone URL etc.), `recency.json` (per-tool hints
+  + `state_check` flags surfaced to the proxy via `HARNESS_MCP_TOOL_RECENCY` /
+  `HARNESS_MCP_STATE_CHECK`, `docker-compose.yml:54-64`).
+
+**Host MCP (`host-mcp/`):** MCP servers run as supervised host *processes*
+(no container) but wired into *container-mode* agents.
+- harness supervises them: pidfile/logfile under `state/mcp/<name>/`,
+  started/stopped with the stack (`host_mcp_start_enabled`/`host_mcp_stop_all`,
+  `harness:926,1560,1588-1592,2472-2500`).
+- Template at `host-mcp/template/` uses the **MCP Python SDK** (`mcp>=1.27`,
+  `FastMCP` + streamable-http transport, `host-mcp/template/server.py`,
+  `requirements.txt`); `run.sh` builds a `.venv` and launches the server,
+  portable across Linux/macOS/Windows Git Bash. Use case: a host-side build MCP
+  that shells out to `cmake`/`ctest` (`host-mcp/template/project.json`,
+  `AGENTS.md`).
+- Container agents reach a host MCP over the docker bridge; harness injects the
+  required `docker run` args (`emit_host_mcp_docker_args`, `harness:2461`).
+- Recency metadata sourced from `host-mcp/<name>/recency.json`
+  (`harness:693-694,735-736`).
 
 ## CI/CD & Deployment
 
-**Hosting:**
-- None. harness is a locally-installed tool on a laptop/host; the git clone IS the install root (`architecture/README.md:27-53`). There is no remote deploy target.
+**Hosting:** Self-hosted only; the install root is a git clone. No PaaS.
 
-**CI Pipeline:**
-- GitHub Actions runs the full test matrix on every push/PR to `dev`/`main` (project `CLAUDE.md`). The docker-based suites (`proxy`, `harness`, `persistence`, `mcp`, `firewall`, `scheme_contract`), `--slow`, integration, full-pipeline, and benchmarks run in CI, not from issue agents.
+**Install / upgrade:**
+- `harness-install.sh` (38KB) clones the repo and symlinks the CLI into
+  `~/.local/bin/harness`. Upgrades via `harness update`/`upgrade` (git pull +
+  `scripts/upgrade-manifest.json` + `scripts/lib/upgrade_actions.sh`).
+- Host-side corporate proxy support: `HTTP_PROXY`/`HTTPS_PROXY` apply to the
+  install clone, `harness update`, `mcp install`, and image builds (BuildKit) —
+  but are NEVER injected into running containers (`.env.example:150-183`).
+
+**CI Pipeline:** GitHub Actions (`.github/`). CI runs the full test matrix
+(unit + docker-based: proxy, harness, persistence, mcp, firewall,
+scheme_contract) on every push/PR to `dev`/`main` (per CLAUDE.md). Agents
+verify docker-free locally; CI runs the heavy suites.
 
 ## Environment Configuration
 
-**Required env vars:**
-- `PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME` (`.env.example:19-39`). The stack refuses to start without them (`require_runtime_config` in the CLI; `_validate_config` in the proxy).
+**Required env vars (both runtimes):**
+- `PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME`
+  (`.env.example:27,30,39`; host-mode validates the same set, `harness:2695`).
 
 **Secrets location:**
-- `.env` at the install root, gitignored. `PROXY_API_KEY` and any credentialed `HTTP_PROXY`/`HTTPS_PROXY` URL are the sensitive entries (`.env.example:29`, `:180-181`). Never committed; redacted in proxy logs.
+- `.env` at install root (gitignored). Contains `PROXY_API_KEY` and possibly a
+  credentialed `HTTP_PROXY` URL. Never committed; never echoed by agents.
 
 ## Webhooks & Callbacks
 
-**Incoming:**
-- None. The proxy's only inbound surface is the OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`, `/health`) reachable only on the internal `harness-net` bridge — the host does not publish the port (`.env.example:58-60`).
+**Incoming:** None.
 
-**Outgoing:**
-- The proxy's upstream chat/models calls (above). No other outgoing webhooks.
-
-## Networking & Egress Firewall
-
-**`harness-net` bridge:**
-- All long-running services (proxy, any enabled MCP) join `harness_harness-net` and reach each other by service name (`http://proxy:8000`, `http://harness-serena:9121/sse`). Agent `docker run` invocations attach to the same network (`architecture/containers.md:247-254`).
-
-**Universal egress firewall:**
-- `firewall/init-firewall.sh` runs as root at the top of every container entrypoint (proxy and agent). It reads `/etc/harness/allowlist` (bind-mounted from `<install-root>/.harness-allowlist`) and drops all egress except DNS, the `PROXY_API_URL` host, and allowlisted hosts (`architecture/containers.md:200-225`).
-- The proxy entrypoint additionally validates that `PROXY_API_URL`'s host is on the allowlist before applying rules; if not, the proxy aborts (`proxy/entrypoint.sh`, `architecture/containers.md:213-215`). The allowlist example seeds package registries and GitHub but leaves the upstream LLM host for the user to add (`.harness-allowlist.example`).
-- IPv4-only: rules use `iptables` + `dig +short A` + an `inet` ipset, so containers disable IPv6 via the `net.ipv6.conf.all.disable_ipv6=1` sysctl to close the v6 hole (`architecture/containers.md:216-224`).
-- Knobs / failure modes: `HARNESS_FIREWALL_DISABLED=1` short-circuits the firewall with a loud bypass message (set by `harness net open <service>` and `--net`). `harness net` subcommands (`list`/`allow`/`deny`/`edit`/`status`/`open`/`close`) manage the allowlist; `net open` requires typing `I understand the risks` on a TTY (`architecture/containers.md:210-230`).
-
-**Host corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`):**
-- Optional. Exported into the harness process so host-side git (clone, `update`/`upgrade` pull, `mcp install`) and `docker compose build` route through it (BuildKit reads them). They are NOT injected into running containers — runtime egress stays on the firewall path (`architecture/harness-cli.md:61-72`, `architecture/containers.md:233-245`). A credentialed proxy URL ends up stored in the gitignored `.env` (`.env.example:180-181`).
-
-## MCP Servers
-
-- Long-running MCP services live under `mcp-registry/<name>/` (vetted, in-repo) and `state/mcp/<name>/` (per-install, active). `mcp-registry/serena/` is the reference entry, pinned to upstream tag `v1.3.0` (`architecture/mcp.md:32-44`, `mcp-registry/serena/harness-meta.json.template`).
-- How harness wires them in: each registry entry ships `compose.yml` (merged into the runtime graph via extra `-f` flags), `client-config.json` (the canonical `{"mcpServers": {...}}` shape, translated to opencode's `{"mcp": {...}}` on each agent launch), an optional `harness-meta.json[.template]`, and a `README.md` (`architecture/mcp.md:10-44`, `:157-181`).
-- Lifecycle: `harness mcp install|register|uninstall|enable|disable|up|down|logs|status|list`. `install` copies a repo-tracked entry; `register --from <dir|git-url>` lands an external source behind a compose-merge + service/container-name-collision validation gate (`architecture/mcp.md:47-155`). Enabled entries with a `compose.yml` auto-start with `harness start`.
-- Config knobs: per-MCP env vars in `.env` (e.g. `HARNESS_PROJECTS_ROOT`, `SERENA_DASHBOARD_PORT`); `repo_clone_url`/`repo_clone_ref` in `harness-meta.json` drive a host-side clone into `state/mcp/<name>/repo/` as the build context (`.env.example:96-138`, `architecture/mcp.md:22-30`).
-- Egress: an MCP's `allowed_domains` is surfaced as recommended `harness net allow` commands; the allowlist is never modified automatically (`architecture/mcp.md:204-212`).
-- Failure mode: a snippet that fails to merge would take the whole `docker compose up` (proxy + agent) down — which is exactly why `register` validates the merge before arming (`architecture/mcp.md:130-147`).
+**Outgoing:** None beyond the proxy→upstream chat/models calls and agents'
+allowlisted git/package-registry traffic.
 
 ---
 
-*Integration audit: 2026-06-02*
+*Integration audit: 2026-06-08*

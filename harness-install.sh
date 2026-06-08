@@ -871,16 +871,22 @@ done
 
 echo
 title "Next"
+# A HOST_ONLY install has no container runtime, so bare 'harness' (which starts
+# the container stack) would hard-fail with "container runtime is required". The
+# working launch verb for these users is 'harness host', so the primary "Next"
+# instruction must point there, not at bare 'harness'.
+run_cmd="harness"
+(( ${HOST_ONLY:-0} == 1 )) && run_cmd="harness host"
 if (( ${#missing_required[@]} > 0 )); then
     cat <<EOF
   1. Edit $install_root/.env and set these still-empty REQUIRED value(s):
        ${C_YELLOW}${missing_required[*]}${C_RESET}
-  2. cd into any project directory and run: harness [agent flags...]
+  2. cd into any project directory and run: $run_cmd [agent flags...]
 EOF
 else
     cat <<EOF
   ${C_GREEN}✓${C_RESET} all REQUIRED values in .env are set
-  Just one step: cd into any project directory and run: harness [agent flags...]
+  Just one step: cd into any project directory and run: $run_cmd [agent flags...]
 EOF
 fi
 
