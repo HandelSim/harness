@@ -15,6 +15,9 @@ re-emits as native tool_calls.
 Environment variables (see README / .env.example):
     PROXY_HOST           bind address (default 0.0.0.0)
     PROXY_PORT           bind port (default 8000)
+    HARNESS_FORCE_LOOPBACK  when truthy, refuse to bind a non-loopback
+                         PROXY_HOST (set by `harness host`; defense-in-depth
+                         for the firewall-less host mode)
     PROXY_API_URL        upstream base URL (REQUIRED). The proxy derives the
                          chat endpoint ({base}/v1/chat/completions) and the
                          models endpoint ({base}/v1/models) from it; a trailing
@@ -2466,6 +2469,21 @@ def _validate_config() -> None:
         missing.append("DEFAULT_MODEL_NAME")
     if missing:
         print(f"[!] FATAL: required env vars missing or empty: {', '.join(missing)}", flush=True)
+        sys.exit(1)
+
+    # Defense-in-depth for containerless host mode, which has no egress firewall
+    # and fronts the upstream API key with no auth of its own. `harness host`
+    # sets HARNESS_FORCE_LOOPBACK=1; when set, refuse to bind anything but a
+    # loopback address, so a regression in the launch path can never expose the
+    # keyed proxy on the LAN. Container mode does not set it (it binds 0.0.0.0
+    # behind the firewall on purpose).
+    force_loopback = os.environ.get("HARNESS_FORCE_LOOPBACK", "").strip().lower() in ("1", "true", "yes")
+    if force_loopback and PROXY_HOST not in ("127.0.0.1", "::1", "localhost"):
+        print(
+            f"[!] FATAL: HARNESS_FORCE_LOOPBACK is set but PROXY_HOST='{PROXY_HOST}' is not a "
+            "loopback address; refusing to expose the host-mode proxy off-box",
+            flush=True,
+        )
         sys.exit(1)
 
 

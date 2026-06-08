@@ -751,6 +751,7 @@ PROXY_HOST=0.0.0.0          PROXY_PORT=8000
 PROXY_API_URL (REQUIRED)    PROXY_API_KEY (REQUIRED)    DEFAULT_MODEL_NAME (REQUIRED)
 PROXY_TIMEOUT=180           OUTPUT_DIR (optional)
 MODEL_CONTEXT_LENGTH=200000 (legacy alias: OLLAMA_CONTEXT_LENGTH)
+HARNESS_FORCE_LOOPBACK (optional; host mode sets it — see below)
 ```
 
 `DEFAULT_MODEL_NAME` (the renamed `PROXY_API_MODEL`) is the fallback model — see
@@ -758,6 +759,16 @@ MODEL_CONTEXT_LENGTH=200000 (legacy alias: OLLAMA_CONTEXT_LENGTH)
 in `main()` enforces the three REQUIRED values are non-empty and `PROXY_API_URL`
 parses; the process exits with a clear message if not. `_redact_key` is used in
 startup logging so logs show something like `sk-abc...xyz`.
+
+`_validate_config` also honors **`HARNESS_FORCE_LOOPBACK`** (set by the
+containerless `harness host` launcher — see [`harness-cli.md`](harness-cli.md) →
+"Host mode"). When that env var is truthy (`1`/`true`/`yes`) and `PROXY_HOST` is
+not a loopback address (`127.0.0.1`, `::1`, `localhost`), the process exits
+fatally rather than binding a publicly-reachable socket. Container mode keeps the
+firewall sidecar; host mode has no firewall, so this guard is the backstop that
+keeps a misconfigured `.env` (`PROXY_HOST=0.0.0.0`) from exposing the host-mode
+proxy off-box. The launcher sets the var; the proxy enforces it (defense in
+depth).
 
 `_setup_prompt_mode` runs from `main()` and resolves `PROXY_PROMPT_MODE` (read
 from the *container* env — see [Cooperative-prompt

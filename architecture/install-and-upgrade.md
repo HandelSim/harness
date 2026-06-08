@@ -19,7 +19,12 @@ run from an empty directory. Stages:
    use `harness host` and that container subcommands will need docker installed
    later. (When a runtime *is* present, compose-availability and reachability
    are still reported, but as warnings — container mode needs them, `harness
-   host` does not.)
+   host` does not.) On the `HOST_ONLY` path the installer also **probes the
+   host-mode prerequisites** (`python3`, `jq`, `node` >= 20, `opencode`) and
+   **warns** per missing one with the same install hints `host_preflight` prints
+   — warn, not fail, so the install still completes; the user can add the
+   missing tool before the first `harness host`. The node-major check parses
+   `node --version` and only warns when it can read a major < 20.
 2. **Intent prompts.** Prints what the install will do, then asks whether to
    add a `harness` wrapper to PATH and offers to capture an upstream API key
    now (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves

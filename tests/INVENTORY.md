@@ -11,6 +11,7 @@ This document enumerates every atomic, testable behavior of the harness project.
 - **Pe###** — Persistence (where state lives, what survives, what is regenerated)
 - **O###** — *(retired — the proxy now serves the OpenAI-compatible interface directly; the separate container is gone)*
 - **I###** — Installer (`harness-install.sh`)
+- **Ho###** — Host mode, containerless (`harness host`, the `host_*` helpers)
 
 Rows are intended to be atomic: one behavior, one row. Compound behaviors are split.
 
@@ -461,3 +462,18 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | I049 | `harness_container_workdir` is a pass-through on Linux/macOS and prefixes with `//` on Windows Git Bash so MSYS does not rewrite the docker `-w` arg (issue #112) |
 | I050 | The docker wrappers (`harness_docker`, `harness_docker_winpty`, `harness_docker_exec`, `harness_runtime_tty_ok`) export MSYS_NO_PATHCONV=1 AND MSYS2_ARG_CONV_EXCL='*' into bash's own env (via `local -x` / `export`) on Windows so MSYS argv conversion does not rewrite container-internal paths or path-list-convert `-v src:tgt` composites; pass-through on Linux/macOS (issue #112 root cause) |
 | I051 | `harness_add_bind_mount` appends a single `--mount=type=bind,source=,target=[,readonly]` token on Windows (no bare `:` composite for MSYS/winpty path-list conversion to mangle into `invalid mode: …`) and the classic `-v src:tgt[:ro]` two tokens on Linux/macOS; used for all agent/shell bind mounts at the three launch sites (issue #112 winpty path) |
+
+## Host mode — containerless (Ho###)
+
+Behaviors of the `harness host` path (host_* helpers in `harness`). These run
+without docker, network, or a real proxy/opencode spawn.
+
+| ID | Behavior |
+|----|----------|
+| Ho001 | `host_require_config` fails (exit 1) when a required var (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`) is empty, naming the missing var |
+| Ho002 | `host_require_config` passes when all three required vars are set |
+| Ho003 | `host_confirm_gate` auto-confirms (no prompt) when `HARNESS_HOST_CONFIRM=1`, printing an "auto-confirmed" notice |
+| Ho004 | `host_preflight` fails and names every missing host dependency (`python3`, `jq`, `node`, `opencode`) when they are absent from PATH |
+| Ho005 | `host_write_opencode_config` emits valid JSON with `baseURL` pointed at `http://127.0.0.1:<port>/v1`, the `harness-dummy` placeholder apiKey, and the default model in the models map |
+| Ho006 | `host_write_opencode_config` refuses (non-zero) when `jq` is absent rather than falling back to the docker jq sidecar (M4 guard) |
+| Ho007 | `host_proxy_fingerprint` is stable across identical config and changes when `PROXY_PORT` or `PROXY_API_KEY` changes (drives config-change proxy restart, M2) |

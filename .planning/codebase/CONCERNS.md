@@ -13,9 +13,26 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ---
 
+## Resolution status (updated 2026-06-08)
+
+This audit drove two fix commits. Per-item status is repeated inline below.
+
+- **Fixed in commit 4fe4361** ("Make host-only installs upgrade and transition
+  correctly; refresh gsd map"): C1, H1, H2.
+- **Fixed in this commit**: H3, H4, M1, M2, M3, M4, M5, L3, L4.
+- **Deliberately deferred** (not bugs; large refactors flagged "do
+  opportunistically" in the audit itself): L1 (proxy.py monolith split), L2
+  (harness CLI monolith split). Left open on purpose.
+
+---
+
 ## CRITICAL
 
 ### C1 — `harness upgrade` is unusable on a host-only install (no docker)
+
+> **RESOLVED (commit 4fe4361).** `cmd_upgrade` now splits code/config (git pull
+> + manifest apply + config merge, no docker) from rebuild/restart; the host-only
+> path runs the merge and no-ops the rebuild with an informational message.
 
 - **Concern:** `cmd_upgrade` calls `require_docker` unconditionally before doing
   any work (`harness:1820`). The installer now explicitly supports a host-only
@@ -48,6 +65,10 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ### H1 — `harness doctor` has zero host-mode awareness and mis-reports a healthy host install as broken
 
+> **RESOLVED (commit 4fe4361).** Added a `[host]` doctor section (proxy running,
+> venv stamp, port, logfile tail) and demoted the container/compose/allowlist
+> checks to skip/warn when no runtime is reachable.
+
 - **Concern:** `cmd_doctor` opens its `[deps]` section by probing the container
   runtime and printing `fail` when it is not reachable (`harness:5679-5683`),
   then checks `$rt compose` (`harness:5685-5691`). The `[network]` section hard-
@@ -73,6 +94,9 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ### H2 — `harness preflight` is container-only and reports a healthy host install as failing
 
+> **RESOLVED (commit 4fe4361).** Host-mode preflight is reachable and the
+> runtime/allowlist checks are advisory on a host-only install.
+
 - **Concern:** `cmd_preflight` increments `errors` when no container runtime is
   reachable (`harness:5995-5996`, `6002-6003`) and treats a missing firewall
   allowlist as an error (`harness:6010`, `6013`), plus requires the
@@ -91,6 +115,11 @@ end to end. "Inferred" = read the relevant code but did not execute it.
   the runtime/allowlist checks to advisory. Update the `cmd_help` one-liner.
 
 ### H3 — Host mode unconditionally enables debug dumps; container mode defaults them OFF
+
+> **RESOLVED (this commit).** `host_proxy_start` no longer force-sets
+> `OUTPUT_DIR`; host mode now honors the same opt-in as container mode (default
+> empty = no dumps), passing `OUTPUT_DIR` through from `.env`. The opt-in value is
+> part of the config fingerprint (M2), so toggling it restarts the proxy.
 
 - **Concern:** `host_proxy_start` always sets `OUTPUT_DIR="$state_root/output"`
   (`harness:2797`). The proxy writes a per-request JSON debug file for every
@@ -116,6 +145,12 @@ end to end. "Inferred" = read the relevant code but did not execute it.
   and add cleanup/rotation.
 
 ### H4 — No tests at all for containerless host mode
+
+> **RESOLVED (this commit).** Added docker-free `tests/unit_host_test.sh` (7
+> tests, auto-discovered by `harness test unit`): `host_require_config` rejection,
+> `host_confirm_gate` auto-confirm, `host_preflight` missing-dep reporting,
+> `host_write_opencode_config` JSON shape + jq guard, `host_proxy_fingerprint`
+> stability. Catalogued as Ho001–Ho007 in INVENTORY.md / COVERAGE.md.
 
 - **Concern:** A repo-wide grep for `harness host` / `cmd_host` / `host_proxy_*`
   / `host_confirm_gate` / `host_preflight` / `host_run_opencode` /
@@ -144,6 +179,11 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ### M1 — `harness host -p` (print mode) leaves the proxy running indefinitely with no reaper
 
+> **RESOLVED (this commit).** Print mode now prints a stderr reminder after the
+> run naming the live proxy pid/port and the `harness host down` stop command;
+> the lifecycle (interactive stops, `-p` leaves up) is documented in `cmd_host
+> --help` and the `cmd_help` host entry.
+
 - **Concern:** In print mode, `host_run_opencode` deliberately does NOT call
   `host_proxy_stop` (only the interactive branch does, `harness:2985`); the
   docstring says this is to avoid thrashing a scripted `-p` loop
@@ -166,6 +206,13 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ### M2 — Reused host proxy ignores changed config / port
 
+> **RESOLVED (this commit).** `host_proxy_start` now writes a config fingerprint
+> (`host_proxy_fingerprint` over port + url + key + model + output) to
+> `state/host/proxy.fp` beside the pidfile. On relaunch it compares the live
+> fingerprint to the current `.env`; on mismatch it prints ".env changed since the
+> proxy started; restarting it" and restarts instead of reusing the stale proxy.
+> `host_proxy_stop` removes the fp file too.
+
 - **Concern:** `host_proxy_start` short-circuits with `host_proxy_running &&
   return 0` (`harness:2786`) keyed purely on a live PID in the pidfile. The
   running proxy captured its `.env` (PROXY_API_URL/KEY, DEFAULT_MODEL_NAME) and
@@ -187,6 +234,12 @@ end to end. "Inferred" = read the relevant code but did not execute it.
   restart the proxy instead of reusing it.
 
 ### M3 — `proxy.py` defaults to binding `0.0.0.0`; host-mode safety relies entirely on one env var
+
+> **RESOLVED (this commit).** Added defense-in-depth: `proxy.py:_validate_config`
+> now honors `HARNESS_FORCE_LOOPBACK` and exits fatally if it is set while
+> `PROXY_HOST` is non-loopback. `host_proxy_start` sets `HARNESS_FORCE_LOOPBACK=1`
+> alongside `PROXY_HOST=127.0.0.1`, so a dropped/overridden bind cannot expose the
+> firewall-less host proxy off-box.
 
 - **Concern:** `PROXY_HOST` defaults to `0.0.0.0` (`proxy.py:56`), i.e. all
   interfaces. Host-mode loopback-only binding is enforced solely by
@@ -214,6 +267,11 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ### M4 — `harness_jq` is reachable from a host-mode path that ran preflight, but the dependency contract is fragile
 
+> **RESOLVED (this commit).** `host_write_opencode_config` now asserts `command
+> -v jq` up front and fails with a clear message if jq is absent, so the
+> docker-sidecar fallback can never be reached from a host path even if the
+> preflight ordering invariant is ever broken. Covered by test Ho006.
+
 - **Concern:** `host_write_opencode_config` and the `-p` export logic call
   `harness_jq` (`harness:2868`, `2884`, `2888`, `2961`, `2964`, `2969`, `2972`).
   `harness_jq` falls back to a docker sidecar when host `jq` is absent
@@ -238,6 +296,11 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ### M5 — Installer's host-only path validates none of the host-mode prerequisites
 
+> **RESOLVED (this commit).** The installer's `HOST_ONLY` branch now probes
+> `python3`, `jq`, `node` (>= 20), and `opencode` and warns (not fails) per
+> missing one with the same install hints `host_preflight` prints, so the user
+> learns before first `harness host` instead of at first launch.
+
 - **Concern:** The installer's `HOST_ONLY` branch (`harness-install.sh:317-319`,
   final summary `887-896`) tells the user `harness host` "needs Node >= 20,
   opencode, python3, jq" but never *checks* for them at install time — it only
@@ -260,6 +323,9 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ### L1 — `proxy/proxy.py` is a 2516-line single-file monolith
 
+> **DEFERRED (intentional).** A large refactor with no behavior change; the audit
+> itself marks it "not urgent; do it opportunistically." Left open.
+
 - **Concern:** All proxy behavior — config read (`proxy.py:56-67`), prompt-mode
   setup, the cooperative-prompt builders, tool-call extraction, SSE/JSON
   emission, debug dumps (`453-461`), Flask routes (`2127`, `2156`, `2438`),
@@ -275,6 +341,9 @@ end to end. "Inferred" = read the relevant code but did not execute it.
   app into separate modules with a thin `main`. Not urgent; do it opportunistically.
 
 ### L2 — `harness` CLI is a 6589-line bash monolith
+
+> **DEFERRED (intentional).** Same class as L1: a multi-file extraction with no
+> behavior change. Left open for an opportunistic pass.
 
 - **Concern:** The single `harness` script is 6589 lines and holds the entire
   CLI: dispatch (`harness:6519`), upgrade/downgrade machinery, net/firewall,
@@ -293,6 +362,11 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 
 ### L3 — `cmd_help` host block omits the `-p`-leaves-proxy-running and config-merge caveats
 
+> **RESOLVED (this commit).** `cmd_host --help` gained a "notes:" block (v1
+> single CWD, Linux/macOS only; debug dumps opt-in via `OUTPUT_DIR`; interactive
+> stops the proxy, `-p` leaves it; host-only upgrade via `harness upgrade`), and
+> the `cmd_help` host entry now points at `harness host --help`.
+
 - **Concern:** The `host` help entry (`harness:1368-1375`) covers the firewall
   warning and dependency list but does not mention: (a) that `-p` leaves the
   proxy running (M1), (b) that there's no `harness upgrade` path for host-only
@@ -307,6 +381,10 @@ end to end. "Inferred" = read the relevant code but did not execute it.
 - **Remediation:** Add one line each to the host help block.
 
 ### L4 — Host opencode config bakes `apiKey: "harness-dummy"` and `OPENCODE_ENABLE_EXA=1` with no comment on why
+
+> **RESOLVED (this commit).** Added a comment at the dummy-key call site (the real
+> key lives in the proxy) and above the `OPENCODE_ENABLE_EXA=1` export noting it is
+> a conscious parity choice in the firewall-less host mode.
 
 - **Concern:** `host_write_opencode_config` writes `"apiKey": "harness-dummy"`
   (`harness:2899`) and `host_run_opencode` exports `OPENCODE_ENABLE_EXA=1`

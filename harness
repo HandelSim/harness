@@ -1390,7 +1390,9 @@ commands:
                         prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip
                         in automation). Accepts --yolo and -p like a normal
                         launch. Needs Node >= 20, opencode, python3, jq on the
-                        host. 'harness host down' stops the host proxy.
+                        host. v1: single CWD, Linux/macOS only. Interactive
+                        runs stop the proxy on exit; -p leaves it up (stop it
+                        with 'harness host down'). See 'harness host --help'.
   shell [--mount PATH]... drop into a bash shell inside the agent container
                         (for installing skills, debugging — shares the home
                         directory with agent launches)
@@ -2706,9 +2708,28 @@ host_mcp_stop_all() {
 host_state_dir()       { printf '%s/host' "$state_root"; }
 host_venv_dir()        { printf '%s/host/venv' "$state_root"; }
 host_proxy_pidfile()   { printf '%s/host/proxy.pid' "$state_root"; }
+host_proxy_fpfile()    { printf '%s/host/proxy.fp' "$state_root"; }
 host_proxy_logfile()   { printf '%s/host/proxy.log' "$state_root"; }
 host_opencode_config() { printf '%s/host/opencode.json' "$state_root"; }
 host_proxy_port()      { printf '%s' "${PROXY_PORT:-8000}"; }
+
+# A fingerprint of the config the running proxy captured when it started: the
+# bind port plus the required upstream vars and the opt-in OUTPUT_DIR. Stored
+# beside the pidfile; host_proxy_start compares it against the current .env so
+# an edited config (new port / url / key / model) restarts the proxy instead of
+# silently reusing a stale one — and a port change can't strand the readiness
+# probe on a port nothing is listening on (CONCERNS M2).
+host_proxy_fingerprint() {
+    local data
+    data=$(printf 'port=%s\nurl=%s\nkey=%s\nmodel=%s\noutput=%s\n' \
+        "$(host_proxy_port)" "${PROXY_API_URL:-}" "${PROXY_API_KEY:-}" \
+        "${DEFAULT_MODEL_NAME:-}" "${OUTPUT_DIR:-}")
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$data" | sha256sum | cut -d' ' -f1
+    else
+        printf '%s' "$data" | cksum | tr -d ' '
+    fi
+}
 
 # Echo the live PID for the host proxy, or nothing. Cleans a stale pidfile whose
 # process is gone. Mirrors host_mcp_pid. Always returns 0.
@@ -2871,9 +2892,19 @@ host_proxy_ensure_venv() {
 # which sourced .env with `set -a`, so only the host-specific overrides are set
 # here. Records the PID; pipes stdout+stderr to the logfile.
 host_proxy_start() {
-    host_proxy_running && return 0
+    local venv port pf fpf lf cur_fp
+    fpf=$(host_proxy_fpfile)
+    cur_fp=$(host_proxy_fingerprint)
+    # Reuse a live proxy only when its captured config still matches .env.
+    # Otherwise restart it so an edited port/url/key/model takes effect (M2).
+    if host_proxy_running; then
+        if [[ -f "$fpf" && "$(cat "$fpf" 2>/dev/null)" == "$cur_fp" ]]; then
+            return 0
+        fi
+        echo "[harness] host mode: .env changed since the proxy started; restarting it" >&2
+        host_proxy_stop
+    fi
     host_proxy_ensure_venv || return 1
-    local venv port pf lf
     venv=$(host_venv_dir)
     port=$(host_proxy_port)
     pf=$(host_proxy_pidfile)
@@ -2881,12 +2912,23 @@ host_proxy_start() {
     mkdir -p "$(host_state_dir)"
     echo "[harness] host mode: starting proxy on 127.0.0.1:$port" >&2
     echo "[harness] host mode: proxy log -> $lf" >&2
+    # Debug dumps are OPT-IN, same as container mode (docker-compose.yml passes
+    # OUTPUT_DIR=${OUTPUT_DIR:-}). We do NOT force OUTPUT_DIR here: the proxy
+    # inherits it from .env (sourced with set -a) only when the user opts in,
+    # and writes nothing by default. Host mode is the higher-blast-radius mode
+    # (full host user, no firewall); it must not silently capture every prompt
+    # to disk as plaintext (CONCERNS H3).
+    # HARNESS_FORCE_LOOPBACK is belt-and-suspenders for the no-firewall mode:
+    # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
+    # one-line regression in this launch path can't expose the keyed proxy on
+    # the LAN (CONCERNS M3).
     PROXY_HOST=127.0.0.1 \
+        HARNESS_FORCE_LOOPBACK=1 \
         PROXY_PORT="$port" \
-        OUTPUT_DIR="$state_root/output" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
         nohup "$venv/bin/python" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
+    printf '%s\n' "$cur_fp" >"$fpf"
 }
 
 # Wait for the host proxy to accept connections on its loopback port. The proxy
@@ -2924,7 +2966,7 @@ host_proxy_stop() {
     pid=$(host_proxy_pid)
     pf=$(host_proxy_pidfile)
     if [[ -z "$pid" ]]; then
-        rm -f "$pf" 2>/dev/null || true
+        rm -f "$pf" "$(host_proxy_fpfile)" 2>/dev/null || true
         return 0
     fi
     kill -TERM "$pid" 2>/dev/null || true
@@ -2933,7 +2975,7 @@ host_proxy_stop() {
         sleep 0.2
     done
     kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
-    rm -f "$pf" 2>/dev/null || true
+    rm -f "$pf" "$(host_proxy_fpfile)" 2>/dev/null || true
 }
 
 # Write the host opencode config to a scoped file and point OPENCODE_CONFIG at
@@ -2943,6 +2985,16 @@ host_proxy_stop() {
 # curl is optional: the model dropdown comes from the proxy's /v1/models when
 # curl is present, else falls back to DEFAULT_MODEL_NAME alone.
 host_write_opencode_config() {
+    # host_preflight (run first in cmd_host) guarantees host jq is present, so
+    # the harness_jq calls below resolve to bare jq, never the docker sidecar —
+    # which would fail in the no-docker mode. Assert it directly so any future
+    # caller that reaches here without preflight, or a refactor that makes
+    # preflight non-fatal, fails loud instead of silently pulling in docker
+    # (CONCERNS M4).
+    command -v jq >/dev/null 2>&1 || {
+        err "host mode: 'jq' not found on host; cannot build the opencode config"
+        return 1
+    }
     local config_file port proxy_url default_model ctx
     config_file=$(host_opencode_config)
     mkdir -p "$(dirname "$config_file")"
@@ -2976,6 +3028,10 @@ host_write_opencode_config() {
         --argjson ctx "$ctx" \
         'map({key: ., value: {name: ., limit: {context: $ctx, output: 8192}}}) | from_entries')
 
+    # apiKey is a deliberate dummy: the real upstream key lives in the proxy's
+    # Authorization header, never in opencode's config. opencode requires the
+    # field to be non-empty, so we pass a placeholder it never sends anywhere
+    # (the proxy talks to upstream; opencode only talks to 127.0.0.1).
     harness_jq -n \
         --arg provider_name "GenAI Harness" \
         --arg proxy_url "$proxy_url" \
@@ -3014,6 +3070,10 @@ host_run_opencode() {
 
     export OPENCODE_CONFIG="$(host_opencode_config)"
     export OPENCODE_DISABLE_AUTOUPDATE=1
+    # Exa web-search parity with container mode. Intentional in host mode too:
+    # host mode already runs with NO egress firewall (the confirm gate makes
+    # that explicit), so enabling a web-search provider adds no new exposure
+    # beyond the unrestricted outbound the user already accepted (CONCERNS L4).
     export OPENCODE_ENABLE_EXA=1
 
     local args=()
@@ -3064,6 +3124,12 @@ host_run_opencode() {
         fi
         [[ -n "${text}" ]] && printf '%s\n' "${text}"
         rm -f "${events_file}"
+        # Print mode deliberately leaves the proxy up so a scripted `-p` loop
+        # doesn't thrash it. Remind the user it is now orphaned, since nothing
+        # reaps it (CONCERNS M1). Goes to stderr so it never pollutes -p stdout.
+        if host_proxy_running; then
+            err "[harness] host proxy still running on 127.0.0.1:$(host_proxy_port) (pid $(host_proxy_pid)); stop it with: harness host down"
+        fi
         return "${rc}"
     fi
 
@@ -3101,6 +3167,15 @@ so every launch prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip it in
 automation). Needs Node >= 20, opencode, python3, and jq on the host. The proxy
 binds 127.0.0.1 only; its log lives at state/host/proxy.log. Any other flag is
 forwarded to opencode unchanged.
+
+notes:
+  - v1: single CWD, no host-MCP wiring, Linux/macOS only.
+  - debug dumps are OFF by default (opt in via OUTPUT_DIR in .env, same as
+    container mode).
+  - interactive runs stop the proxy on exit; `-p` (print mode) leaves it
+    running for scripted loops — stop it with `harness host down`.
+  - host-only installs (no docker) upgrade with `harness upgrade`, which pulls
+    code + merges .env and skips the image rebuild.
 EOF
             return 0
             ;;

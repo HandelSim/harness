@@ -317,6 +317,37 @@ preflight() {
         HOST_ONLY=1
         echo "  ⚠ no container runtime (docker/podman) found — installing host-only"
         echo "    'harness host' runs containerless; 'harness start/opencode/shell' will need docker"
+
+        # Probe the host-mode prerequisites NOW (warn, don't fail) so the user
+        # learns about a missing node/python3/jq/opencode at install time rather
+        # than on the first 'harness host'. host_preflight re-checks these at
+        # launch with the same install hints; this is just an early signal.
+        if command -v python3 >/dev/null 2>&1; then
+            echo "  ✓ python3 (host proxy runtime)"
+        else
+            echo "  ⚠ python3 not found — 'harness host' needs it (the translating proxy)"
+        fi
+        if command -v jq >/dev/null 2>&1; then
+            echo "  ✓ jq"
+        else
+            echo "  ⚠ jq not found — 'harness host' needs it (no docker fallback). apt-get install jq | brew install jq"
+        fi
+        if command -v node >/dev/null 2>&1; then
+            local node_major
+            node_major=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
+            if [[ -n "$node_major" ]] && (( node_major >= 20 )); then
+                echo "  ✓ node $(node --version 2>/dev/null) (opencode runtime)"
+            else
+                echo "  ⚠ node $(node --version 2>/dev/null) is < 20 — 'harness host' needs Node >= 20 (nvm install 20)"
+            fi
+        else
+            echo "  ⚠ node not found — 'harness host' needs Node >= 20 (https://nodejs.org/)"
+        fi
+        if command -v opencode >/dev/null 2>&1; then
+            echo "  ✓ opencode CLI"
+        else
+            echo "  ⚠ opencode not found — 'harness host' needs it. npm i -g opencode-ai@1.15.7 @ai-sdk/openai-compatible@2.0.47"
+        fi
     fi
 
     # Disk space (5GB recommended for fresh install + image pulls)

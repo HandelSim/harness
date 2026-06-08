@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 373 IDs (F=146, P=58, A=24, M=23, N=30, U=29, Pe=16, O=0, I=45).
+Inventory total: 380 IDs (F=146, P=58, A=24, M=23, N=30, U=29, Pe=16, O=0, I=45, Ho=7).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -53,16 +53,20 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   harness_jq fallback consumed by `_upg_json_array` / `_upg_json_str`).
 - `tests/podman_smoke_test.sh` (238 lines, manual-run) — `HARNESS_CONTAINER_RUNTIME=podman`
   smoke. Useful corroboration for I032/N017.
+- `tests/unit_host_test.sh` (118 lines, no docker) — containerless `harness host`
+  helpers, sourced via `HARNESS_SOURCE_ONLY=1`: `host_require_config`,
+  `host_confirm_gate`, `host_preflight`, `host_write_opencode_config` (JSON shape +
+  jq guard), `host_proxy_fingerprint`. Covers Ho001–Ho007.
 - `tests/lib/test_helpers.sh` (311 lines) — shared fixtures only (no assertions).
 
 ## Summary stats
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   244 |   66.5% |
-| yellow   |     5 |    1.4% |
-| red      |   118 |   32.2% |
-| **total**|   367 |  100.0% |
+| green    |   251 |   67.1% |
+| yellow   |     5 |    1.3% |
+| red      |   118 |   31.6% |
+| **total**|   374 |  100.0% |
 
 Per-prefix breakdown:
 
@@ -77,6 +81,7 @@ Per-prefix breakdown:
 | Pe     |    16 |    13 |      1 |   2 |
 | O      |     0 |     0 |      0 |   0 |
 | I      |    45 |    29 |      1 |  15 |
+| Ho     |     7 |     7 |      0 |   0 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -543,6 +548,18 @@ non-green rows — the gap.
 | I049 | green  | tests/unit_workdir_test.sh (T1, T2, T4)     | T1 asserts pass-through on linux/macos; T2 asserts windows produces `//c/...` (including idempotence and slash-collapse); T4 covers the full `harness_abs_path` → `harness_container_workdir` pipeline that feeds docker `-w` (issue #112). | |
 | I050 | green  | tests/unit_workdir_test.sh (T5)             | OS pinned to `windows` with a fake-runtime recorder: `harness_docker` and `harness_docker_winpty` both spawn the runtime with MSYS_NO_PATHCONV=1 AND MSYS2_ARG_CONV_EXCL='*' set; `local -x` scope confirmed (vars don't leak into caller); pass-through on non-Windows (no env leakage). Issue #112 root-cause fix. | |
 | I051 | green  | tests/unit_workdir_test.sh (T6)             | OS pinned both ways: linux emits `-v src:tgt` and `-v src:tgt:ro`; windows emits a single `--mount=type=bind,source=,target=[,readonly]` token with no `:/c/` composite. Covers the issue #112 winpty path where `-v` is mangled to `invalid mode: …`. | |
+
+## Ho — Host mode, containerless (7 IDs)
+
+| ID    | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
+|-------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
+| Ho001 | green  | tests/unit_host_test.sh:52-59 (T1)          | Subshell with `PROXY_API_URL=""` runs `host_require_config`; asserts non-zero exit AND that the error names `PROXY_API_URL`. | |
+| Ho002 | green  | tests/unit_host_test.sh:61-65 (T2)          | All three required vars set → `host_require_config` returns 0. | |
+| Ho003 | green  | tests/unit_host_test.sh:67-73 (T3)          | `HARNESS_HOST_CONFIRM=1 host_confirm_gate 0` returns 0 and prints an "auto-confirmed" notice (no TTY prompt). | |
+| Ho004 | green  | tests/unit_host_test.sh:75-84 (T4)          | `PATH="/nonexistent-dir" host_preflight` returns non-zero and the output names each of `python3`, `jq`, `node`, `opencode`. | |
+| Ho005 | green  | tests/unit_host_test.sh:86-98 (T5)          | `host_write_opencode_config` (PORT=8123, model=test-model) writes valid JSON; asserts `baseURL == http://127.0.0.1:8123/v1`, `apiKey == harness-dummy`, and the models map has `test-model`. | |
+| Ho006 | green  | tests/unit_host_test.sh:100-104 (T6)        | With `PATH` stripped (no jq), `host_write_opencode_config` returns non-zero rather than reaching the docker jq sidecar (M4 guard). | |
+| Ho007 | green  | tests/unit_host_test.sh:106-114 (T7)        | `host_proxy_fingerprint` is identical across two runs of the same config and differs when `PROXY_PORT` or `PROXY_API_KEY` changes (M2 config-change restart trigger). | |
 
 ---
 

@@ -342,14 +342,28 @@ What it does, in order:
    requirements hash changes), then `nohup`s `proxy/proxy.py` with a pidfile +
    logfile under `state/host/`, mirroring the host-MCP pidfile model. **It binds
    `127.0.0.1` only** (`PROXY_HOST=127.0.0.1`) so the host proxy is never
-   reachable off-box; the proxy reads its REQUIRED env straight from this shell.
-   `host_proxy_wait_ready` polls the loopback port via `/dev/tcp` (the proxy
-   calls `app.run()` last, so an accepted connect means it is serving) and tails
-   the log on failure (the common cause is `_validate_config` `sys.exit(1)`).
+   reachable off-box; it also exports `HARNESS_FORCE_LOOPBACK=1`, which makes
+   `proxy.py` refuse to bind any non-loopback `PROXY_HOST` — a second layer so a
+   regression in this launch line can't expose the keyed proxy on the LAN in the
+   firewall-less mode. The proxy reads its REQUIRED env straight from this shell.
+   **Debug dumps are opt-in, same as container mode:** `host_proxy_start` does
+   NOT force `OUTPUT_DIR`; the proxy inherits it from `.env` (default empty, no
+   dumps), so the higher-blast-radius host mode never silently writes every
+   prompt to disk. **Config-change detection:** the reuse short-circuit
+   (`host_proxy_running`) is gated on a fingerprint (`host_proxy_fingerprint`:
+   port + the required upstream vars + `OUTPUT_DIR`, stored at
+   `state/host/proxy.fp`); if `.env` changed since the proxy started, the stale
+   proxy is stopped and restarted rather than reused with old config (which on a
+   port change would otherwise strand the readiness probe). `host_proxy_wait_ready`
+   polls the loopback port via `/dev/tcp` (the proxy calls `app.run()` last, so
+   an accepted connect means it is serving) and tails the log on failure (the
+   common cause is `_validate_config` `sys.exit(1)`).
 5. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`,
    but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
-   **scoped** file (`state/host/opencode.json`). The caller exports
+   **scoped** file (`state/host/opencode.json`). It asserts host `jq` is present
+   up front (`host_preflight` guarantees it) so the `harness_jq` docker-sidecar
+   fallback can never be reached from this no-docker path. The caller exports
    `OPENCODE_CONFIG` to point at it, so the user's global
    `~/.config/opencode/opencode.json` is never touched. `curl` is optional: the
    model dropdown comes from the proxy's `/v1/models` when present, else falls
@@ -360,7 +374,15 @@ What it does, in order:
    Interactive runs opencode as a **child** (not `exec`) so the proxy is torn
    down on exit; print mode leaves the proxy up so a scripted `-p` loop doesn't
    thrash it (`harness host down` stops it) — the same interactive-vs-print
-   teardown split as container mode.
+   teardown split as container mode. Because nothing reaps a `-p` proxy, print
+   mode prints a stderr reminder after the run naming the live pid and the
+   `harness host down` stop command.
+
+The host helpers have docker-free unit coverage in `tests/unit_host_test.sh`
+(sourced via `HARNESS_SOURCE_ONLY=1`): `host_require_config` rejection,
+`host_confirm_gate` auto-confirm, `host_preflight` missing-dep reporting,
+`host_write_opencode_config` JSON shape + jq guard, and `host_proxy_fingerprint`
+stability.
 
 v1 is deliberately minimal: single CWD, no host-MCP wiring, Linux/macOS only.
 The egress firewall is genuinely container-bound (it lays a host-global iptables
