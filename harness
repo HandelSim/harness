@@ -1389,8 +1389,9 @@ commands:
                         agent runs as your full host user, so every launch
                         prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip
                         in automation). Accepts --yolo and -p like a normal
-                        launch. Needs Node >= 20, opencode, python3, jq on the
-                        host. v1: single CWD, Linux/macOS only. Interactive
+                        launch. Auto-provisions Node, opencode, and jq into
+                        state/host/toolchain on first run; needs only python3
+                        on the host. v1: single CWD, Linux/macOS only. Interactive
                         runs stop the proxy on exit; -p leaves it up (stop it
                         with 'harness host down'). See 'harness host --help'.
   shell [--mount PATH]... drop into a bash shell inside the agent container
@@ -2714,6 +2715,35 @@ host_proxy_logfile()   { printf '%s/host/proxy.log' "$state_root"; }
 host_opencode_config() { printf '%s/host/opencode.json' "$state_root"; }
 host_proxy_port()      { printf '%s' "${PROXY_PORT:-8000}"; }
 
+# --- host toolchain auto-provisioning --------------------------------------
+#
+# Goal: a user runs `harness install` then `harness host` with nothing else
+# installed but python3. python3 is irreducible (it bootstraps the proxy venv);
+# the other three host-mode deps — jq, Node, opencode — are fetched on first
+# `harness host` into state/host/toolchain and put on PATH for the launch.
+#
+# Pins mirror the container (agents/Dockerfile) so the host runs the same
+# opencode + provider the container suite is validated against; a unit test
+# asserts the opencode/provider pins stay in sync with the Dockerfile ARGs.
+# This makes host mode self-installing, NOT offline or fully reproducible:
+# opencode still fetches its provider over the (unfirewalled) network on first
+# use, exactly as the container does on its first run.
+#
+# jq and Node prefer a satisfactory host binary when present (jq any version;
+# Node major >= 20). opencode is preferred from the host ONLY when its version
+# equals the pin — host_run_opencode's `opencode export` / `session list
+# --format json` handling is version-fragile (see agents/Dockerfile), so an
+# arbitrary system opencode can silently break print mode.
+HARNESS_HOST_JQ_VERSION="${HARNESS_HOST_JQ_VERSION:-1.7.1}"
+HARNESS_HOST_NODE_VERSION="${HARNESS_HOST_NODE_VERSION:-20.20.2}"
+HARNESS_HOST_OPENCODE_VERSION="${HARNESS_HOST_OPENCODE_VERSION:-1.15.7}"
+HARNESS_HOST_OPENAI_COMPAT_VERSION="${HARNESS_HOST_OPENAI_COMPAT_VERSION:-2.0.47}"
+
+host_tool_dir()     { printf '%s/host/toolchain' "$state_root"; }
+host_tool_bin_dir() { printf '%s/host/toolchain/bin' "$state_root"; }   # holds vendored jq; prepended to PATH
+host_node_dir()     { printf '%s/host/toolchain/node' "$state_root"; }  # extracted Node tarball lives under here
+host_opencode_dir() { printf '%s/host/toolchain/opencode' "$state_root"; } # npm --prefix target for opencode
+
 # A fingerprint of the config the running proxy captured when it started: the
 # bind port plus the required upstream vars and the opt-in OUTPUT_DIR. Stored
 # beside the pidfile; host_proxy_start compares it against the current .env so
@@ -2749,11 +2779,229 @@ host_proxy_pid() {
 
 host_proxy_running() { [[ -n "$(host_proxy_pid)" ]]; }
 
-# Verify the host can run containerless mode. Unlike container mode, host mode
-# cannot fall back to the jq-in-proxy-image sidecar (no docker), so host jq is
-# required outright. python3 runs the proxy; Node >= 20 + opencode are the agent
-# runtime. Prints exact install hints and returns non-zero if anything is
-# missing — we never auto-install Node or a package manager for the user.
+# --- toolchain fetch primitives --------------------------------------------
+
+# Verify $1's sha256 equals hex $2. Uses sha256sum (Linux) or shasum (macOS).
+host_sha256_check() {
+    local f="$1" want="$2" got=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        got=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+    elif command -v shasum >/dev/null 2>&1; then
+        got=$(shasum -a 256 "$f" 2>/dev/null | cut -d' ' -f1)
+    else
+        err "host mode: no sha256 tool (sha256sum/shasum) available to verify downloads"
+        return 1
+    fi
+    [[ -n "$got" && "$got" == "$want" ]]
+}
+
+# Download $1 -> $2, verifying sha256 $3 when given. Atomic: a partial or
+# checksum-mismatched download never lands at the destination path.
+host_fetch() {
+    local url="$1" dest="$2" want="${3:-}" tmp
+    command -v curl >/dev/null 2>&1 || { err "host mode: curl required to download dependencies"; return 1; }
+    tmp="${dest}.part.$$"
+    if ! curl -fsSL --max-time 300 -o "$tmp" "$url"; then
+        err "host mode: download failed: $url"; rm -f "$tmp"; return 1
+    fi
+    if [[ -n "$want" ]] && ! host_sha256_check "$tmp" "$want"; then
+        err "host mode: checksum mismatch for $url (refusing to install)"; rm -f "$tmp"; return 1
+    fi
+    mv -f "$tmp" "$dest"
+}
+
+# Fetch a `<sha256>  <filename>` manifest at $1 and echo the hash for entry $2.
+# Used for jq's sha256sum.txt and Node's SHASUMS256.txt (same format).
+host_sha_from_manifest() {
+    local url="$1" name="$2" line
+    command -v curl >/dev/null 2>&1 || return 1
+    line=$(curl -fsSL --max-time 60 "$url" 2>/dev/null | grep -E "[[:space:]]\*?${name}\$" | head -1 || true)
+    [[ -n "$line" ]] || return 1
+    printf '%s' "${line%%[[:space:]]*}"
+}
+
+# Map uname -m to the arch token each upstream uses. "unsupported" otherwise.
+host_jq_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *) echo unsupported ;;
+    esac
+}
+host_node_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo x64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *) echo unsupported ;;
+    esac
+}
+# Echo the os-arch platform token, or fail (return 1) on an unsupported combo.
+host_jq_platform() {
+    local os arch; os=$(harness_detect_os); arch=$(host_jq_arch)
+    [[ "$arch" == unsupported ]] && return 1
+    case "$os" in
+        linux) printf 'linux-%s' "$arch" ;;
+        macos) printf 'macos-%s' "$arch" ;;
+        *) return 1 ;;
+    esac
+}
+host_node_platform() {
+    local os arch; os=$(harness_detect_os); arch=$(host_node_arch)
+    [[ "$arch" == unsupported ]] && return 1
+    case "$os" in
+        linux) printf 'linux-%s' "$arch" ;;
+        macos) printf 'darwin-%s' "$arch" ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- per-tool provisioners (idempotent; stamp gated on a --version smoke run) ---
+
+# Vendor jq into toolchain/bin/jq unless a host jq is already present.
+host_ensure_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+    local ver plat bin stamp base sha
+    ver="$HARNESS_HOST_JQ_VERSION"
+    plat=$(host_jq_platform) || { err "host mode: cannot vendor jq for $(harness_detect_os)/$(uname -m)"; return 1; }
+    bin="$(host_tool_bin_dir)/jq"
+    stamp="$(host_tool_dir)/.stamp-jq"
+    if [[ -x "$bin" && -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$ver-$plat" ]] \
+       && "$bin" --version >/dev/null 2>&1; then
+        return 0
+    fi
+    mkdir -p "$(host_tool_bin_dir)"
+    base="https://github.com/jqlang/jq/releases/download/jq-${ver}"
+    sha=$(host_sha_from_manifest "$base/sha256sum.txt" "jq-${plat}") \
+        || { err "host mode: could not resolve jq checksum from $base/sha256sum.txt"; return 1; }
+    echo "[harness] host mode: fetching jq ${ver} (${plat}, ~1 MB)..." >&2
+    host_fetch "$base/jq-${plat}" "$bin" "$sha" || return 1
+    chmod +x "$bin"
+    if ! "$bin" --version >/dev/null 2>&1; then
+        err "host mode: vendored jq failed to run ($bin)"; rm -f "$bin"; return 1
+    fi
+    printf '%s\n' "$ver-$plat" >"$stamp" 2>/dev/null || true
+}
+
+# Vendor Node into toolchain/node/node-v<ver>-<plat>/ unless a host Node >= 20
+# is already present. Node is the install-time runtime for opencode's npm
+# install (and its launcher); the pin tracks the container's `FROM node:NN`.
+host_ensure_node() {
+    if command -v node >/dev/null 2>&1; then
+        local maj; maj=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
+        [[ -n "$maj" ]] && (( maj >= 20 )) && return 0
+    fi
+    local ver plat root stamp base tarball sha tmp
+    ver="$HARNESS_HOST_NODE_VERSION"
+    plat=$(host_node_platform) || { err "host mode: cannot vendor Node for $(harness_detect_os)/$(uname -m)"; return 1; }
+    root="$(host_node_dir)/node-v${ver}-${plat}"
+    stamp="$(host_tool_dir)/.stamp-node"
+    if [[ -x "$root/bin/node" && -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$ver-$plat" ]] \
+       && "$root/bin/node" --version >/dev/null 2>&1; then
+        return 0
+    fi
+    command -v tar >/dev/null 2>&1 || { err "host mode: 'tar' required to unpack Node"; return 1; }
+    mkdir -p "$(host_node_dir)"
+    rm -rf "$root"   # clear any partial/older tree so a crashed prior run can't be trusted
+    base="https://nodejs.org/dist/v${ver}"
+    tarball="node-v${ver}-${plat}.tar.gz"
+    sha=$(host_sha_from_manifest "$base/SHASUMS256.txt" "$tarball") \
+        || { err "host mode: could not resolve Node checksum from $base/SHASUMS256.txt"; return 1; }
+    tmp="$(host_node_dir)/$tarball"
+    echo "[harness] host mode: fetching Node ${ver} (${plat}, ~30 MB download / ~150 MB unpacked)..." >&2
+    host_fetch "$base/$tarball" "$tmp" "$sha" || return 1
+    echo "[harness] host mode: unpacking Node..." >&2
+    if ! tar -xzf "$tmp" -C "$(host_node_dir)"; then
+        err "host mode: Node tarball failed to extract"; rm -f "$tmp"; rm -rf "$root"; return 1
+    fi
+    rm -f "$tmp"
+    if [[ ! -x "$root/bin/node" ]] || ! "$root/bin/node" --version >/dev/null 2>&1; then
+        err "host mode: Node did not unpack to $root/bin/node"; rm -rf "$root"; return 1
+    fi
+    printf '%s\n' "$ver-$plat" >"$stamp" 2>/dev/null || true
+}
+
+# Install opencode (+ the openai-compatible provider, mirroring the container)
+# into toolchain/opencode via npm, unless a host opencode of the pinned version
+# is already present. Requires npm on PATH — host_ensure_toolchain prepends the
+# vendored Node before calling this.
+host_ensure_opencode() {
+    local ver compat prefix stamp bin sv
+    ver="$HARNESS_HOST_OPENCODE_VERSION"
+    compat="$HARNESS_HOST_OPENAI_COMPAT_VERSION"
+    if command -v opencode >/dev/null 2>&1; then
+        sv=$(opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+        [[ "$sv" == "$ver" ]] && return 0
+    fi
+    prefix="$(host_opencode_dir)"
+    stamp="$(host_tool_dir)/.stamp-opencode"
+    bin="$prefix/bin/opencode"
+    if [[ -x "$bin" && -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$ver-$compat" ]] \
+       && "$bin" --version >/dev/null 2>&1; then
+        return 0
+    fi
+    command -v npm >/dev/null 2>&1 || { err "host mode: npm unavailable to install opencode (Node provisioning failed?)"; return 1; }
+    mkdir -p "$prefix"
+    echo "[harness] host mode: installing opencode ${ver} + provider via npm (one-time, a few hundred MB)..." >&2
+    if ! npm install -g --prefix "$prefix" "opencode-ai@${ver}" "@ai-sdk/openai-compatible@${compat}" >&2; then
+        err "host mode: npm install of opencode failed (see output above)"; return 1
+    fi
+    if [[ ! -x "$bin" ]] || ! "$bin" --version >/dev/null 2>&1; then
+        err "host mode: opencode did not install to $bin"; return 1
+    fi
+    printf '%s\n' "$ver-$compat" >"$stamp" 2>/dev/null || true
+}
+
+# Echo the colon-joined PATH prefix for whatever tools we vendored (existing
+# binaries only). Referenced by exact version-named dirs — never a glob — so a
+# leftover older Node tree can't sneak onto PATH after a version bump.
+host_toolchain_path_prefix() {
+    local dirs=() np node_bin
+    [[ -x "$(host_tool_bin_dir)/jq" ]] && dirs+=("$(host_tool_bin_dir)")
+    if np=$(host_node_platform 2>/dev/null); then
+        node_bin="$(host_node_dir)/node-v${HARNESS_HOST_NODE_VERSION}-${np}/bin"
+        [[ -x "$node_bin/node" ]] && dirs+=("$node_bin")
+    fi
+    [[ -x "$(host_opencode_dir)/bin/opencode" ]] && dirs+=("$(host_opencode_dir)/bin")
+    local IFS=:
+    printf '%s' "${dirs[*]}"
+}
+
+# Provision every host-mode dependency (jq, Node, opencode) and prepend the
+# vendored dirs to PATH for the rest of this invocation. Each provisioner is a
+# no-op (silent) once its tool is satisfied, so re-runs only re-wire PATH.
+# Linux/macOS only — host mode itself is.
+host_ensure_toolchain() {
+    local os; os=$(harness_detect_os)
+    if [[ "$os" != linux && "$os" != macos ]]; then
+        err "host mode: automatic dependency provisioning supports Linux/macOS only (got $os)"
+        return 1
+    fi
+    host_ensure_jq   || return 1
+    host_ensure_node || return 1
+    # opencode's npm install needs node/npm visible; prepend what we have so far.
+    local tp
+    tp=$(host_toolchain_path_prefix); [[ -n "$tp" ]] && export PATH="$tp:$PATH"
+    host_ensure_opencode || return 1
+    tp=$(host_toolchain_path_prefix); [[ -n "$tp" ]] && export PATH="$tp:$PATH"
+    return 0
+}
+
+# python3 is the one host-mode dependency harness does NOT auto-provision: it
+# bootstraps the proxy venv, so it must already exist to fetch anything. Checked
+# early (before the confirm gate) so a python3-less host fails fast without
+# prompting or downloading.
+host_require_python3() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        err "host mode needs python3 (runs the translating proxy and bootstraps its venv); not found in PATH"
+        err "  install python3 from your OS package manager, then re-run."
+        return 1
+    fi
+}
+
+# Verify host mode's deps are satisfied. python3 is the user's responsibility;
+# jq / Node / opencode are auto-provisioned by host_ensure_toolchain and on PATH
+# by the time this runs, so this is a post-provision assertion (each must both
+# resolve AND execute). Names every missing dep. Returns non-zero if any fail.
 host_preflight() {
     local missing_dep=0
 
@@ -2762,29 +3010,18 @@ host_preflight() {
         missing_dep=1
     fi
 
-    if ! command -v jq >/dev/null 2>&1; then
-        err "host mode needs 'jq' on the host (no docker fallback in host mode); not found in PATH"
-        err "  install: apt-get install jq  |  brew install jq"
+    if ! command -v jq >/dev/null 2>&1 || ! jq --version >/dev/null 2>&1; then
+        err "host mode: jq unavailable after provisioning (looked in state/host/toolchain and PATH)"
         missing_dep=1
     fi
 
-    if ! command -v node >/dev/null 2>&1; then
-        err "host mode needs Node.js >= 20 (opencode runtime); not found in PATH"
-        err "  install: https://nodejs.org/  (or: nvm install 20)"
+    if ! command -v node >/dev/null 2>&1 || ! node --version >/dev/null 2>&1; then
+        err "host mode: node unavailable after provisioning (looked in state/host/toolchain and PATH)"
         missing_dep=1
-    else
-        local major
-        major=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
-        if [[ -z "$major" ]] || (( major < 20 )); then
-            err "host mode needs Node.js >= 20; found $(node --version 2>/dev/null)"
-            err "  upgrade: https://nodejs.org/  (or: nvm install 20)"
-            missing_dep=1
-        fi
     fi
 
-    if ! command -v opencode >/dev/null 2>&1; then
-        err "host mode needs the 'opencode' CLI; not found in PATH"
-        err "  install: npm i -g opencode-ai@1.15.7 @ai-sdk/openai-compatible@2.0.47"
+    if ! command -v opencode >/dev/null 2>&1 || ! opencode --version >/dev/null 2>&1; then
+        err "host mode: opencode unavailable after provisioning (looked in state/host/toolchain and PATH)"
         missing_dep=1
     fi
 
@@ -3165,9 +3402,10 @@ usage:
 
 No docker, no images, no egress firewall; opencode runs as your full host user,
 so every launch prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip it in
-automation). Needs Node >= 20, opencode, python3, and jq on the host. The proxy
-binds 127.0.0.1 only; its log lives at state/host/proxy.log. Any other flag is
-forwarded to opencode unchanged.
+automation). Only python3 is required on the host: jq, Node >= 20, and opencode
+are fetched automatically on first run into state/host/toolchain (a satisfactory
+host jq/Node/opencode is reused instead). The proxy binds 127.0.0.1 only; its log
+lives at state/host/proxy.log. Any other flag is forwarded to opencode unchanged.
 
 notes:
   - v1: single CWD, no host-MCP wiring, Linux/macOS only.
@@ -3193,11 +3431,13 @@ EOF
         esac
     done
 
-    host_preflight || exit 1
+    host_require_python3 || exit 1
     host_require_config
     host_confirm_gate "$yolo" || exit 1
 
     ensure_dirs
+    host_ensure_toolchain || exit 1   # fetch jq/Node/opencode (downloads happen here, post-confirm)
+    host_preflight || exit 1          # verify the toolchain resolves before launching
     host_proxy_start || exit 1
     host_proxy_wait_ready || { host_proxy_stop; exit 1; }
     host_write_opencode_config

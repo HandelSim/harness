@@ -20,11 +20,15 @@ run from an empty directory. Stages:
    later. (When a runtime *is* present, compose-availability and reachability
    are still reported, but as warnings — container mode needs them, `harness
    host` does not.) On the `HOST_ONLY` path the installer also **probes the
-   host-mode prerequisites** (`python3`, `jq`, `node` >= 20, `opencode`) and
-   **warns** per missing one with the same install hints `host_preflight` prints
-   — warn, not fail, so the install still completes; the user can add the
-   missing tool before the first `harness host`. The node-major check parses
-   `node --version` and only warns when it can read a major < 20.
+   host-mode prerequisites**, but only `python3` is a real requirement (it
+   bootstraps the proxy venv, so harness can't fetch anything without it) — a
+   missing `python3` warns. `jq`, `node` >= 20, and `opencode` are **not**
+   warned about: `harness host` auto-provisions them into `state/host/toolchain`
+   on first run (`host_ensure_toolchain` — see [`harness-cli.md`](harness-cli.md)
+   → "Host mode"), so the probe reports a present host binary as "reused" and an
+   absent one as "harness fetches it automatically", informational either way.
+   The node-major check parses `node --version` and notes a major < 20 will be
+   superseded by the vendored Node, not an error.
 2. **Intent prompts.** Prints what the install will do, then asks whether to
    add a `harness` wrapper to PATH and offers to capture an upstream API key
    now (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves
@@ -152,8 +156,12 @@ then prints `[harness] host-only upgrade complete.` and `return`s **before**
 the rebuild/restart block (step 4 is a no-op with no images to rebuild or
 containers to restart). The host venv is not touched here: it refreshes
 lazily on the next `harness host` (it is sha-stamped against
-`proxy/requirements.txt`). If a proxy is already running, the completion
-message tells the user to bounce it with `harness host down && harness host`.
+`proxy/requirements.txt`). The host toolchain (`state/host/toolchain`) is
+likewise untouched at upgrade time and re-provisions lazily on the next
+`harness host` only if the pulled code bumped a `HARNESS_HOST_*_VERSION` pin
+(each tool is stamped against its pinned version). If a proxy is already
+running, the completion message tells the user to bounce it with `harness host
+down && harness host`.
 The config merge needs jq; on a host-only box without jq the merge step is
 skipped with a warning (the pull still applies) rather than failing. A
 container install with the daemon merely stopped is NOT treated as host-only

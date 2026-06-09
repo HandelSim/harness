@@ -480,3 +480,9 @@ without docker, network, or a real proxy/opencode spawn.
 | Ho006 | `host_write_opencode_config` refuses (non-zero) when `jq` is absent rather than falling back to the docker jq sidecar (M4 guard) |
 | Ho007 | `host_proxy_fingerprint` is stable across identical config and changes when `PROXY_PORT` or `PROXY_API_KEY` changes (drives config-change proxy restart, M2) |
 | Ho008 | `harness upgrade` on a host-only install (no container runtime) takes a host-aware path: it does NOT abort on `require_docker` and does NOT rebuild images or restart a container stack, prints `[harness] host-only upgrade complete.`, and returns 0; a runtime-present install still goes through `require_docker` |
+| Ho009 | `host_jq_platform`/`host_node_platform` produce well-formed, arch-consistent os-arch tokens for the running host (jq `linux/macos-amd64/arm64`, node `linux/darwin-x64/arm64`) |
+| Ho010 | `host_sha_from_manifest` extracts the correct hash from a `<sha256>  <filename>` manifest and is end-anchored (no match for an absent or prefix-only name) |
+| Ho011 | `host_sha256_check` accepts a file's real sha256 and rejects a wrong one |
+| Ho012 | `host_toolchain_path_prefix` is empty when nothing is vendored and lists exactly the vendored jq, Node, and opencode bin dirs (in that order) once they exist |
+| Ho013 | `host_ensure_toolchain` refuses on a non-Linux/macOS host and, on a supported host, prepends the vendored toolchain dirs to `PATH` |
+| Ho014 | host toolchain version pins (`HARNESS_HOST_OPENCODE_VERSION`, `HARNESS_HOST_OPENAI_COMPAT_VERSION`, `HARNESS_HOST_NODE_VERSION` major) stay in sync with `agents/Dockerfile` (drift guard) |

@@ -60,6 +60,12 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 - `tests/unit_host_upgrade_test.sh` (no docker) — host-only upgrade transition
   (`cmd_upgrade` with no container runtime: host-aware path, no `require_docker`,
   no rebuild/restart, returns 0). Sourced via `HARNESS_SOURCE_ONLY=1`. Covers Ho008.
+- `tests/unit_host_toolchain_test.sh` (no docker, no network) — host-mode
+  dependency auto-provisioner (`host_ensure_toolchain` and helpers): platform
+  mapping, `host_sha_from_manifest` parsing (curl stubbed), `host_sha256_check`,
+  `host_toolchain_path_prefix` assembly, OS guard + PATH wiring, and the
+  pins-match-`agents/Dockerfile` drift guard. Sourced via `HARNESS_SOURCE_ONLY=1`.
+  Covers Ho009–Ho014.
 - `tests/unit_net_open_test.sh` (no docker) — `cmd_net_open` service-membership
   validation: the captured-list + here-string match that fixed the pipefail/SIGPIPE
   false-reject. Covers F089, F151.
@@ -569,6 +575,12 @@ non-green rows — the gap.
 | Ho006 | green  | tests/unit_host_test.sh:100-104 (T6)        | With `PATH` stripped (no jq), `host_write_opencode_config` returns non-zero rather than reaching the docker jq sidecar (M4 guard). | |
 | Ho007 | green  | tests/unit_host_test.sh:106-114 (T7)        | `host_proxy_fingerprint` is identical across two runs of the same config and differs when `PROXY_PORT` or `PROXY_API_KEY` changes (M2 config-change restart trigger). | |
 | Ho008 | green  | tests/unit_host_upgrade_test.sh:T1,T2        | T1: with `harness_runtime_installed`→1 and `jq` hidden, `cmd_upgrade --no-prompt` (HARNESS_UPGRADE_SKIP_PULL=1) returns 0, prints "no container runtime found" and "[harness] host-only upgrade complete.", and never reaches the require_docker/cmd_down/cmd_start sentinels. T2: with a runtime present it exits via the require_docker sentinel (rc 91) and does NOT print the host-only completion. | |
+| Ho009 | green  | tests/unit_host_toolchain_test.sh:T1         | `host_jq_platform`/`host_node_platform` return well-formed tokens (`linux\|macos-amd64\|arm64`, `linux\|darwin-x64\|arm64`) that agree with `uname -m`. | |
+| Ho010 | green  | tests/unit_host_toolchain_test.sh:T2         | `host_sha_from_manifest` (curl stubbed with a fixture) returns the correct hash for a `<sha>  <file>` entry and fails (no match) for an absent or non-end-anchored name. | |
+| Ho011 | green  | tests/unit_host_toolchain_test.sh:T3         | `host_sha256_check` accepts a file's real sha256 and rejects a wrong one. | |
+| Ho012 | green  | tests/unit_host_toolchain_test.sh:T4         | `host_toolchain_path_prefix` is empty with nothing vendored and lists exactly `tool_bin:node-bin:opencode-bin` (in order) once stub binaries exist. | |
+| Ho013 | green  | tests/unit_host_toolchain_test.sh:T5         | `host_ensure_toolchain` returns non-zero on a stubbed `harness_detect_os`→windows, and on linux (provisioners stubbed) prepends the vendored bin dir to PATH. | |
+| Ho014 | green  | tests/unit_host_toolchain_test.sh:T6         | `HARNESS_HOST_OPENCODE_VERSION`/`HARNESS_HOST_OPENAI_COMPAT_VERSION` equal `agents/Dockerfile` ARG defaults and `HARNESS_HOST_NODE_VERSION` major equals the Dockerfile `FROM node:NN` major (pin drift guard). | |
 
 ---
 

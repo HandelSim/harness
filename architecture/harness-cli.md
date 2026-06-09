@@ -321,10 +321,10 @@ host-MCP supervision they reuse the shape of.
 
 What it does, in order:
 
-1. **`host_preflight`** — host mode cannot fall back to the jq-in-proxy-image
-   sidecar (no docker), so it requires host `jq` outright, plus `python3` (runs
-   the proxy), Node >= 20 + `opencode` (the agent runtime). Missing deps print
-   exact install hints and abort. Node is never auto-installed.
+1. **`host_require_python3`** — `python3` is the one host-mode dependency harness
+   does **not** auto-provision: it bootstraps the proxy venv, so it must already
+   exist before harness can fetch anything else. Checked **before** the confirm
+   gate so a python3-less host fails fast without prompting or downloading.
 2. **`host_require_config`** — a lighter `require_runtime_config`: the same three
    REQUIRED proxy vars (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`,
    read from the already-sourced `.env`), but **no allowlist check** — the
@@ -336,7 +336,26 @@ What it does, in order:
    `HARNESS_HOST_CONFIRM=1` bypasses it for automation; refuses non-interactive
    without `/dev/tty`. This is why host mode exists as a separate, gated command
    rather than a flag on the normal launch.
-4. **Proxy supervision** — `host_proxy_start` lazily builds a venv under
+4. **`host_ensure_toolchain`** (after the gate, so no download happens before
+   consent) — provisions the other three deps (`jq`, Node >= 20, `opencode`) into
+   `state/host/toolchain/` and prepends the vendored dirs to `PATH` for the rest
+   of the launch. Each provisioner prefers a satisfactory **host** binary (jq any
+   version; Node major >= 20; opencode only when its version equals the pin,
+   since `host_run_opencode`'s `opencode export` shapes are version-fragile);
+   otherwise it downloads: jq's static release binary and Node's `.tar.gz` are
+   sha256-verified against the upstream `sha256sum.txt` / `SHASUMS256.txt`, and
+   `opencode-ai` + `@ai-sdk/openai-compatible` are `npm install`ed into a scoped
+   prefix (using the vendored Node). Pins (`HARNESS_HOST_{JQ,NODE,OPENCODE,OPENAI_COMPAT}_VERSION`,
+   all env-overridable) mirror `agents/Dockerfile` so host runs the same opencode
+   + provider the container suite validates; a unit test guards that the opencode
+   / provider pins stay in sync with the Dockerfile ARGs. Stamps (`.stamp-jq`
+   etc.) are written **only after** a `--version` smoke run succeeds, so a
+   corrupt or half-extracted tool is never trusted on the next run. This makes
+   host mode **self-installing, not offline**: opencode still fetches its provider
+   over the (unfirewalled) network on first use, exactly as the container does.
+   `host_preflight` then runs as a post-provision assertion — each of `python3`,
+   `jq`, Node, `opencode` must both resolve **and** execute, naming any that fail.
+5. **Proxy supervision** — `host_proxy_start` lazily builds a venv under
    `state/host/venv` (`host_proxy_ensure_venv`: `python3 -m venv` + `pip install`
    of `proxy/requirements.txt`'s two pure-python wheels, re-pip only when the
    requirements hash changes), then `nohup`s `proxy/proxy.py` with a pidfile +
@@ -358,7 +377,7 @@ What it does, in order:
    polls the loopback port via `/dev/tcp` (the proxy calls `app.run()` last, so
    an accepted connect means it is serving) and tails the log on failure (the
    common cause is `_validate_config` `sys.exit(1)`).
-5. **Scoped opencode config** — `host_write_opencode_config` writes the same
+6. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`,
    but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
    **scoped** file (`state/host/opencode.json`). It asserts host `jq` is present
@@ -368,7 +387,7 @@ What it does, in order:
    `~/.config/opencode/opencode.json` is never touched. `curl` is optional: the
    model dropdown comes from the proxy's `/v1/models` when present, else falls
    back to `DEFAULT_MODEL_NAME` alone.
-6. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
+7. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
    (provider env, `--agent yolo`, and the headless `-p` json-events +
    `opencode export` dance that dodges opencode 1.15.x's render race).
    Interactive runs opencode as a **child** (not `exec`) so the proxy is torn
@@ -382,7 +401,11 @@ The host helpers have docker-free unit coverage in `tests/unit_host_test.sh`
 (sourced via `HARNESS_SOURCE_ONLY=1`): `host_require_config` rejection,
 `host_confirm_gate` auto-confirm, `host_preflight` missing-dep reporting,
 `host_write_opencode_config` JSON shape + jq guard, and `host_proxy_fingerprint`
-stability.
+stability. The toolchain provisioner has its own docker-free coverage in
+`tests/unit_host_toolchain_test.sh` (download-free): arch/platform mapping,
+`host_sha_from_manifest` parsing, `host_sha256_check`, stamp-gated idempotency
+and PATH assembly with stubbed binaries, and the pins-match-`agents/Dockerfile`
+drift guard.
 
 v1 is deliberately minimal: single CWD, no host-MCP wiring, Linux/macOS only.
 The egress firewall is genuinely container-bound (it lays a host-global iptables

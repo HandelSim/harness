@@ -318,35 +318,35 @@ preflight() {
         echo "  ⚠ no container runtime (docker/podman) found — installing host-only"
         echo "    'harness host' runs containerless; 'harness start/opencode/shell' will need docker"
 
-        # Probe the host-mode prerequisites NOW (warn, don't fail) so the user
-        # learns about a missing node/python3/jq/opencode at install time rather
-        # than on the first 'harness host'. host_preflight re-checks these at
-        # launch with the same install hints; this is just an early signal.
+        # python3 is the only host-mode dep the user must supply: it bootstraps
+        # the proxy venv, so it has to exist before harness can fetch anything.
+        # jq, Node, and opencode are auto-provisioned on the first 'harness host'
+        # (into state/host/toolchain), so they're informational here, not blockers.
         if command -v python3 >/dev/null 2>&1; then
             echo "  ✓ python3 (host proxy runtime)"
         else
-            echo "  ⚠ python3 not found — 'harness host' needs it (the translating proxy)"
+            echo "  ⚠ python3 not found — 'harness host' needs it (the translating proxy); install it from your OS package manager"
         fi
         if command -v jq >/dev/null 2>&1; then
-            echo "  ✓ jq"
+            echo "  ✓ jq (host binary; harness will reuse it)"
         else
-            echo "  ⚠ jq not found — 'harness host' needs it (no docker fallback). apt-get install jq | brew install jq"
+            echo "  · jq not found — harness fetches it automatically on first 'harness host'"
         fi
         if command -v node >/dev/null 2>&1; then
             local node_major
             node_major=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
             if [[ -n "$node_major" ]] && (( node_major >= 20 )); then
-                echo "  ✓ node $(node --version 2>/dev/null) (opencode runtime)"
+                echo "  ✓ node $(node --version 2>/dev/null) (host binary; harness will reuse it)"
             else
-                echo "  ⚠ node $(node --version 2>/dev/null) is < 20 — 'harness host' needs Node >= 20 (nvm install 20)"
+                echo "  · node $(node --version 2>/dev/null) is < 20 — harness fetches Node >= 20 automatically on first 'harness host'"
             fi
         else
-            echo "  ⚠ node not found — 'harness host' needs Node >= 20 (https://nodejs.org/)"
+            echo "  · node not found — harness fetches Node automatically on first 'harness host'"
         fi
         if command -v opencode >/dev/null 2>&1; then
-            echo "  ✓ opencode CLI"
+            echo "  ✓ opencode CLI (host binary; reused if it matches the pinned version)"
         else
-            echo "  ⚠ opencode not found — 'harness host' needs it. npm i -g opencode-ai@1.15.7 @ai-sdk/openai-compatible@2.0.47"
+            echo "  · opencode not found — harness installs it automatically on first 'harness host'"
         fi
     fi
 
@@ -928,10 +928,12 @@ No container runtime was found, so this is a HOST-ONLY install. Use the
 containerless mode:
   cd into any project directory and run: harness host [agent flags...]
 
-'harness host' runs the proxy + opencode as plain host processes (needs Node
->= 20, opencode, python3, jq). It has NO egress firewall and runs as your full
-host user, so it prompts to confirm on every launch. Install docker/podman
-later if you want the sandboxed container mode ('harness start/opencode').
+'harness host' runs the proxy + opencode as plain host processes. The first run
+fetches its dependencies (jq, Node >= 20, opencode) automatically into
+state/host/toolchain — you only need python3. It has NO egress firewall and runs
+as your full host user, so it prompts to confirm on every launch. Install
+docker/podman later if you want the sandboxed container mode ('harness
+start/opencode').
 EOF
 else
 cat <<EOF
