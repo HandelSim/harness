@@ -321,10 +321,14 @@ host-MCP supervision they reuse the shape of.
 
 What it does, in order:
 
-1. **`host_require_python3`** — `python3` is the one host-mode dependency harness
+1. **`host_require_python3`** — Python 3 is the one host-mode dependency harness
    does **not** auto-provision: it bootstraps the proxy venv, so it must already
    exist before harness can fetch anything else. Checked **before** the confirm
-   gate so a python3-less host fails fast without prompting or downloading.
+   gate so a Python-less host fails fast without prompting or downloading. The
+   interpreter is resolved by `host_python_bin` (used everywhere harness needs to
+   call Python): `python3`, then a `python` that reports `Python 3`, then `py -3`
+   — because Windows Git Bash often has no `python3` (python.org ships `python` /
+   the `py` launcher; only the MS Store build provides `python3`).
 2. **`host_require_config`** — a lighter `require_runtime_config`: the same three
    REQUIRED proxy vars (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`,
    read from the already-sourced `.env`), but **no allowlist check** — the
@@ -342,10 +346,18 @@ What it does, in order:
    of the launch. Each provisioner prefers a satisfactory **host** binary (jq any
    version; Node major >= 20; opencode only when its version equals the pin,
    since `host_run_opencode`'s `opencode export` shapes are version-fragile);
-   otherwise it downloads: jq's static release binary and Node's `.tar.gz` are
+   otherwise it downloads: jq's static release binary and Node's archive are
    sha256-verified against the upstream `sha256sum.txt` / `SHASUMS256.txt`, and
    `opencode-ai` + `@ai-sdk/openai-compatible` are `npm install`ed into a scoped
-   prefix (using the vendored Node). Pins (`HARNESS_HOST_{JQ,NODE,OPENCODE,OPENAI_COMPAT}_VERSION`,
+   prefix (using the vendored Node). **Per-OS layout** is routed through
+   `harness_detect_os` so one code path serves all three: the exe suffix
+   (`host_exe_suffix` → `.exe` on Windows), the Node archive kind
+   (`host_extract_archive` unpacks Windows' `.zip` via bsdtar/`unzip`, else
+   `.tar.gz`), and where the binaries land after extraction — Node's `node.exe`
+   and npm's `opencode` shim sit at the **root** of their dirs on Windows
+   (`host_node_exe` / `host_opencode_exe`), under `bin/` on Linux/macOS. jq has
+   no Windows arm64 build upstream, so `host_jq_platform` fails closed there;
+   Windows host support targets x64. Pins (`HARNESS_HOST_{JQ,NODE,OPENCODE,OPENAI_COMPAT}_VERSION`,
    all env-overridable) mirror `agents/Dockerfile` so host runs the same opencode
    + provider the container suite validates; a unit test guards that the opencode
    / provider pins stay in sync with the Dockerfile ARGs. Stamps (`.stamp-jq`
@@ -356,9 +368,11 @@ What it does, in order:
    `host_preflight` then runs as a post-provision assertion — each of `python3`,
    `jq`, Node, `opencode` must both resolve **and** execute, naming any that fail.
 5. **Proxy supervision** — `host_proxy_start` lazily builds a venv under
-   `state/host/venv` (`host_proxy_ensure_venv`: `python3 -m venv` + `pip install`
-   of `proxy/requirements.txt`'s two pure-python wheels, re-pip only when the
-   requirements hash changes), then `nohup`s `proxy/proxy.py` with a pidfile +
+   `state/host/venv` (`host_proxy_ensure_venv`: `$(host_python_bin) -m venv` +
+   `pip install` of `proxy/requirements.txt`'s two pure-python wheels, re-pip only
+   when the requirements hash changes), then `nohup`s `proxy/proxy.py` with the
+   venv interpreter (`host_venv_python` → `Scripts/python.exe` on Windows,
+   `bin/python` elsewhere) and a pidfile +
    logfile under `state/host/`, mirroring the host-MCP pidfile model. **It binds
    `127.0.0.1` only** (`PROXY_HOST=127.0.0.1`) so the host proxy is never
    reachable off-box; it also exports `HARNESS_FORCE_LOOPBACK=1`, which makes
@@ -404,10 +418,14 @@ The host helpers have docker-free unit coverage in `tests/unit_host_test.sh`
 stability. The toolchain provisioner has its own docker-free coverage in
 `tests/unit_host_toolchain_test.sh` (download-free): arch/platform mapping,
 `host_sha_from_manifest` parsing, `host_sha256_check`, stamp-gated idempotency
-and PATH assembly with stubbed binaries, and the pins-match-`agents/Dockerfile`
-drift guard.
+and PATH assembly with stubbed binaries, the pins-match-`agents/Dockerfile`
+drift guard, the Windows (Git Bash) layout branch (`.exe` tokens, root-level
+node/opencode, `Scripts` venv, win-arm64 jq guarded — exercised on Linux by
+stubbing `harness_detect_os`/`uname`), and `host_extract_archive` kind dispatch.
 
-v1 is deliberately minimal: single CWD, no host-MCP wiring, Linux/macOS only.
+v1 is deliberately minimal: single CWD, no host-MCP wiring. It runs on Linux,
+macOS, and Windows under Git Bash (MSYS); see [`WINDOWS.md`](../docs/WINDOWS.md)
+→ "Host mode on Windows" for the opencode-under-Git-Bash caveats.
 The egress firewall is genuinely container-bound (it lays a host-global iptables
 default-deny that cannot be scoped to one process), so it is simply absent here —
 see [`containers.md`](containers.md) → "Host mode has no firewall".

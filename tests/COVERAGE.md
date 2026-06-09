@@ -63,9 +63,10 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 - `tests/unit_host_toolchain_test.sh` (no docker, no network) — host-mode
   dependency auto-provisioner (`host_ensure_toolchain` and helpers): platform
   mapping, `host_sha_from_manifest` parsing (curl stubbed), `host_sha256_check`,
-  `host_toolchain_path_prefix` assembly, OS guard + PATH wiring, and the
-  pins-match-`agents/Dockerfile` drift guard. Sourced via `HARNESS_SOURCE_ONLY=1`.
-  Covers Ho009–Ho014.
+  `host_toolchain_path_prefix` assembly, OS guard + PATH wiring, the
+  pins-match-`agents/Dockerfile` drift guard, the Windows (Git Bash) layout
+  branch (stubbing `harness_detect_os`/`uname`), and `host_extract_archive` kind
+  dispatch. Sourced via `HARNESS_SOURCE_ONLY=1`. Covers Ho009–Ho017.
 - `tests/unit_net_open_test.sh` (no docker) — `cmd_net_open` service-membership
   validation: the captured-list + here-string match that fixed the pipefail/SIGPIPE
   false-reject. Covers F089, F151.
@@ -579,8 +580,11 @@ non-green rows — the gap.
 | Ho010 | green  | tests/unit_host_toolchain_test.sh:T2         | `host_sha_from_manifest` (curl stubbed with a fixture) returns the correct hash for a `<sha>  <file>` entry and fails (no match) for an absent or non-end-anchored name. | |
 | Ho011 | green  | tests/unit_host_toolchain_test.sh:T3         | `host_sha256_check` accepts a file's real sha256 and rejects a wrong one. | |
 | Ho012 | green  | tests/unit_host_toolchain_test.sh:T4         | `host_toolchain_path_prefix` is empty with nothing vendored and lists exactly `tool_bin:node-bin:opencode-bin` (in order) once stub binaries exist. | |
-| Ho013 | green  | tests/unit_host_toolchain_test.sh:T5         | `host_ensure_toolchain` returns non-zero on a stubbed `harness_detect_os`→windows, and on linux (provisioners stubbed) prepends the vendored bin dir to PATH. | |
+| Ho013 | green  | tests/unit_host_toolchain_test.sh:T5         | `host_ensure_toolchain` returns non-zero on a stubbed unsupported OS (`harness_detect_os`→freebsd) before any download, and on linux (provisioners stubbed) prepends the vendored bin dir to PATH. | |
 | Ho014 | green  | tests/unit_host_toolchain_test.sh:T6         | `HARNESS_HOST_OPENCODE_VERSION`/`HARNESS_HOST_OPENAI_COMPAT_VERSION` equal `agents/Dockerfile` ARG defaults and `HARNESS_HOST_NODE_VERSION` major equals the Dockerfile `FROM node:NN` major (pin drift guard). | |
+| Ho015 | green  | tests/unit_host_toolchain_test.sh:T7         | Windows (Git Bash) layout: stubbing `harness_detect_os`→windows + `uname`, `host_jq_platform`=windows-amd64, `host_node_platform`=win-x64, `host_exe_suffix`=.exe, vendored jq is `jq.exe`, the jq asset is `jq-windows-amd64.exe`, `node.exe`/opencode shim resolve at the dir **root** (not `bin/`), the venv is `Scripts/python.exe`; win-arm64 resolves Node but `host_jq_platform` fails closed (no upstream build). | |
+| Ho016 | green  | tests/unit_host_toolchain_test.sh:T8         | `host_toolchain_path_prefix` under a stubbed Windows OS orders the dirs `tool_bin:node-root:opencode-root` (Windows layout, stub binaries at the root). | |
+| Ho017 | green  | tests/unit_host_toolchain_test.sh:T9         | `host_extract_archive` extracts a real `.tar.gz` (and a `.zip` round-trip when `zip`/`unzip` are present), and rejects an unknown archive kind. | |
 
 ---
 

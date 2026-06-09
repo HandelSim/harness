@@ -318,14 +318,21 @@ preflight() {
         echo "  ⚠ no container runtime (docker/podman) found — installing host-only"
         echo "    'harness host' runs containerless; 'harness start/opencode/shell' will need docker"
 
-        # python3 is the only host-mode dep the user must supply: it bootstraps
+        # Python 3 is the only host-mode dep the user must supply: it bootstraps
         # the proxy venv, so it has to exist before harness can fetch anything.
         # jq, Node, and opencode are auto-provisioned on the first 'harness host'
         # (into state/host/toolchain), so they're informational here, not blockers.
+        # Resolve like harness's host_python_bin: python3, then a python that is
+        # Python 3, then the 'py -3' launcher — Windows Git Bash usually has no
+        # 'python3' (python.org ships 'python'/'py'; only MS Store ships python3).
         if command -v python3 >/dev/null 2>&1; then
             echo "  ✓ python3 (host proxy runtime)"
+        elif command -v python >/dev/null 2>&1 && python --version 2>&1 | grep -q 'Python 3'; then
+            echo "  ✓ python (Python 3; host proxy runtime)"
+        elif command -v py >/dev/null 2>&1 && py -3 --version >/dev/null 2>&1; then
+            echo "  ✓ py -3 (host proxy runtime)"
         else
-            echo "  ⚠ python3 not found — 'harness host' needs it (the translating proxy); install it from your OS package manager"
+            echo "  ⚠ Python 3 not found — 'harness host' needs it (the translating proxy); install it from your OS package manager (Windows: python.org provides 'python'/'py')"
         fi
         if command -v jq >/dev/null 2>&1; then
             echo "  ✓ jq (host binary; harness will reuse it)"
@@ -930,7 +937,8 @@ containerless mode:
 
 'harness host' runs the proxy + opencode as plain host processes. The first run
 fetches its dependencies (jq, Node >= 20, opencode) automatically into
-state/host/toolchain — you only need python3. It has NO egress firewall and runs
+state/host/toolchain — you only need Python 3 (python3/python/py). It has NO
+egress firewall and runs
 as your full host user, so it prompts to confirm on every launch. Install
 docker/podman later if you want the sandboxed container mode ('harness
 start/opencode').

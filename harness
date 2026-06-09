@@ -1390,10 +1390,11 @@ commands:
                         prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip
                         in automation). Accepts --yolo and -p like a normal
                         launch. Auto-provisions Node, opencode, and jq into
-                        state/host/toolchain on first run; needs only python3
-                        on the host. v1: single CWD, Linux/macOS only. Interactive
-                        runs stop the proxy on exit; -p leaves it up (stop it
-                        with 'harness host down'). See 'harness host --help'.
+                        state/host/toolchain on first run; needs only Python 3
+                        on the host. v1: single CWD; Linux, macOS, and Windows
+                        (Git Bash). Interactive runs stop the proxy on exit; -p
+                        leaves it up (stop it with 'harness host down'). See
+                        'harness host --help'.
   shell [--mount PATH]... drop into a bash shell inside the agent container
                         (for installing skills, debugging — shares the home
                         directory with agent launches)
@@ -2704,7 +2705,10 @@ host_mcp_stop_all() {
 # is simply ABSENT here. Because there is no firewall and the agent runs as the
 # full host user, every launch is gated behind an explicit confirmation
 # (host_confirm_gate), worded harder than --net. v1 is deliberately minimal:
-# single CWD, no host-MCP wiring, Linux/macOS only.
+# single CWD, no host-MCP wiring. Runs on Linux, macOS, and Windows (Git Bash /
+# MSYS); on Windows the toolchain provisioner fetches the windows jq.exe, the
+# Node .zip, and the npm opencode shim, but opencode's own Git Bash support is
+# rough (see docs/WINDOWS.md "Host mode on Windows").
 # See architecture/harness-cli.md (Host mode).
 
 host_state_dir()       { printf '%s/host' "$state_root"; }
@@ -3071,9 +3075,10 @@ host_ensure_toolchain() {
 # early (before the confirm gate) so a python3-less host fails fast without
 # prompting or downloading.
 host_require_python3() {
-    if ! command -v python3 >/dev/null 2>&1; then
-        err "host mode needs python3 (runs the translating proxy and bootstraps its venv); not found in PATH"
-        err "  install python3 from your OS package manager, then re-run."
+    if ! host_python_bin >/dev/null 2>&1; then
+        err "host mode needs Python 3 (runs the translating proxy and bootstraps its venv); none found in PATH"
+        err "  install Python 3 (python3 / python / py) from your OS package manager, then re-run."
+        err "  on Windows (Git Bash) the python.org installer provides 'python' and 'py'."
         return 1
     fi
 }
@@ -3176,27 +3181,31 @@ host_confirm_gate() {
 # deps (flask, requests) from proxy/requirements.txt. A stamp keyed on the
 # requirements file's hash means pip only re-runs when that file changes.
 host_proxy_ensure_venv() {
-    local venv reqs stamp want
+    local venv reqs stamp want vpy py
     venv=$(host_venv_dir)
     reqs="$clone_dir/proxy/requirements.txt"
     stamp="$venv/.harness-reqs-sha"
+    vpy="$(host_venv_python)"   # …/bin/python on unix, …/Scripts/python.exe on Windows
     want=""
     if command -v sha256sum >/dev/null 2>&1; then
         want=$(sha256sum "$reqs" 2>/dev/null | cut -d' ' -f1)
     fi
-    if [[ -x "$venv/bin/python" && -n "$want" && -f "$stamp" \
+    if [[ -x "$vpy" && -n "$want" && -f "$stamp" \
           && "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
         return 0
     fi
-    if [[ ! -x "$venv/bin/python" ]]; then
+    if [[ ! -x "$vpy" ]]; then
+        py=$(host_python_bin) || { err "host mode: no Python 3 interpreter found to create the proxy venv"; return 1; }
         echo "[harness] host mode: creating proxy venv (one-time)..." >&2
-        if ! python3 -m venv "$venv"; then
+        # $py may be the two-token `py -3` on Windows; intentional word-split.
+        # shellcheck disable=SC2086
+        if ! $py -m venv "$venv"; then
             err "failed to create venv at $venv (is the python3 venv module installed?)"
             return 1
         fi
     fi
     echo "[harness] host mode: installing proxy deps (flask, requests)..." >&2
-    if ! "$venv/bin/python" -m pip install --quiet --disable-pip-version-check -r "$reqs"; then
+    if ! "$vpy" -m pip install --quiet --disable-pip-version-check -r "$reqs"; then
         err "pip install of proxy deps failed (see output above)"
         return 1
     fi
@@ -3244,7 +3253,7 @@ host_proxy_start() {
         HARNESS_FORCE_LOOPBACK=1 \
         PROXY_PORT="$port" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
-        nohup "$venv/bin/python" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
+        nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"
 }
@@ -3482,13 +3491,16 @@ usage:
 
 No docker, no images, no egress firewall; opencode runs as your full host user,
 so every launch prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip it in
-automation). Only python3 is required on the host: jq, Node >= 20, and opencode
+automation). Only Python 3 is required on the host: jq, Node >= 20, and opencode
 are fetched automatically on first run into state/host/toolchain (a satisfactory
 host jq/Node/opencode is reused instead). The proxy binds 127.0.0.1 only; its log
 lives at state/host/proxy.log. Any other flag is forwarded to opencode unchanged.
 
 notes:
-  - v1: single CWD, no host-MCP wiring, Linux/macOS only.
+  - v1: single CWD, no host-MCP wiring. Runs on Linux, macOS, and Windows
+    (Git Bash). On Windows, Python 3 is 'python'/'py' (the python.org build);
+    opencode's own Git Bash support is rough — see docs/WINDOWS.md "Host mode
+    on Windows" before relying on it.
   - debug dumps are OFF by default (opt in via OUTPUT_DIR in .env, same as
     container mode).
   - interactive runs stop the proxy on exit; `-p` (print mode) leaves it
@@ -6509,12 +6521,22 @@ cmd_doctor() {
     host_venv=$(host_venv_dir)
     if (( host_only )) || host_proxy_running || [[ -d "$host_venv" ]]; then
         doctor_section host
+        # python3 is the one dep the user must supply; on Windows (Git Bash) it
+        # may be 'python' or 'py -3', so resolve it rather than probing python3.
+        local pybin
+        if pybin=$(host_python_bin 2>/dev/null); then
+            doctor_check ok "python3" "$pybin"
+        else
+            doctor_check warn "python3" "no Python 3 (python3/python/py) on PATH (needed for 'harness host')"
+        fi
+        # jq / node / opencode are auto-provisioned on first run, so a miss here
+        # is informational, not a hard requirement.
         local dep
-        for dep in python3 jq node opencode; do
+        for dep in jq node opencode; do
             if command -v "$dep" >/dev/null 2>&1; then
                 doctor_check ok "$dep" "$(command -v "$dep")"
             else
-                doctor_check warn "$dep" "not on PATH (needed for 'harness host')"
+                doctor_check warn "$dep" "not on PATH (auto-provisioned on first 'harness host')"
             fi
         done
         if command -v node >/dev/null 2>&1; then
@@ -6526,7 +6548,7 @@ cmd_doctor() {
                 doctor_check warn "node version" "$(node --version 2>/dev/null) (host mode needs >= 20)"
             fi
         fi
-        if [[ -x "$host_venv/bin/python" ]]; then
+        if [[ -x "$(host_venv_python)" ]]; then
             doctor_check ok "host venv" "$host_venv"
         else
             doctor_check ok "host venv" "not built yet (created on first 'harness host')"

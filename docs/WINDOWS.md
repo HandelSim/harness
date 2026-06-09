@@ -137,6 +137,21 @@ displays correctly.
 - File ownership tests (the `--user` flag, `chown` behavior) are non-meaningful on Windows because NTFS doesn't have POSIX UIDs. Files created in mounted volumes are owned by your Windows user automatically; the harness UID-remap logic that's necessary on Linux has no effect on Windows.
 - Tmux is not used anywhere in the harness runtime. Phase 18 dropped the wrapping from agent launch and Phase 19 removed the dead-code helpers and the test driver.
 
+## Host mode on Windows (`harness host`)
+
+`harness host` runs the proxy and opencode as plain host processes with no docker. It runs on Windows under Git Bash, and self-provisions its toolchain (jq, Node >= 20, opencode) into `state/host/toolchain/` on first launch, picking the Windows builds automatically:
+
+- **Only Python 3 must already be installed.** harness resolves the interpreter as `python3`, then a `python` reporting `Python 3`, then the `py -3` launcher. The python.org installer ships `python` and `py` (not `python3`), so a stock python.org install works; you do not need to create a `python3` alias.
+- **x64 only.** jq has no Windows arm64 release upstream, so host mode targets 64-bit x86. On a win-arm64 box the jq fetch fails by design (Node would resolve, jq won't).
+- **No firewall.** Same as on Linux/macOS: host mode has no egress firewall, runs opencode as your full Windows user, and gates every launch behind a confirmation prompt (`HARNESS_HOST_CONFIRM=1` to bypass in automation).
+
+**opencode under Git Bash is rough — prefer WSL2 if host mode misbehaves.** harness provisions and launches opencode correctly, but two limitations live in opencode itself and are outside harness's control:
+
+- **TUI rendering** (opencode [#7539](https://github.com/sst/opencode/issues/7539)): the interactive TUI can render poorly under MinTTY / Git Bash on the pinned opencode version. If the interactive UI is garbled, run print mode (`harness host -p '...'`) or use Windows Terminal / WSL2.
+- **Path remapping** (opencode [#4379](https://github.com/sst/opencode/issues/4379)): Git Bash's `/c/Users/...` path translation can break opencode's own bash-tool file operations (`cd`/`cp`/`mv`/`mkdir`). This affects opencode's internal tooling, not harness.
+
+If you hit either, the supported fallback is to run harness host mode inside WSL2, where opencode runs as a native Linux process.
+
 ## OUTPUT_DIR (proxy debug dumps)
 
 The proxy supports an optional `OUTPUT_DIR` env var that captures every

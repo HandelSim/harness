@@ -12,6 +12,10 @@
 #   - host_toolchain_path_prefix PATH assembly from stubbed vendored binaries
 #   - host_ensure_toolchain os guard + PATH wiring (ensure_* stubbed)
 #   - drift guard: harness HARNESS_HOST_* pins stay in sync with agents/Dockerfile
+#   - Windows (Git Bash) platform branch: jq.exe / node.exe-at-root / npm-root
+#     opencode shim / Scripts venv tokens + paths, stubbing harness_detect_os
+#     and uname so the Windows code runs deterministically on a Linux host
+#   - host_extract_archive kind dispatch (tar.gz + zip round-trip, unknown kind)
 #
 # It deliberately does NOT exercise the real download/extract/npm path (that
 # needs network); it tests the parsing/assembly/guard logic those steps depend
@@ -123,9 +127,12 @@ prefix="$(host_toolchain_path_prefix)"
 ok "T4: host_toolchain_path_prefix lists vendored dirs (jq, node, opencode) in order"
 
 # --- T5: host_ensure_toolchain rejects unsupported OS, wires PATH otherwise --
-( harness_detect_os() { echo windows; }
+# Use a genuinely unsupported token: linux/macos/windows are all valid now, so
+# the guard must reject something else (e.g. an unknown/BSD OS) up front, before
+# any download is attempted.
+( harness_detect_os() { echo freebsd; }
   if host_ensure_toolchain >/dev/null 2>&1; then exit 1; fi ) \
-    || fail "T5: host_ensure_toolchain did not reject a non-Linux/macOS host"
+    || fail "T5: host_ensure_toolchain did not reject an unsupported (non Linux/macOS/Windows) host"
 # Happy path with the provisioners stubbed: PATH must gain the vendored dirs.
 out="$(
   harness_detect_os() { echo linux; }
@@ -155,6 +162,70 @@ df_node_major="$(grep -E '^FROM node:' "$DF" | head -1 | sed -E 's/^FROM node:([
 [[ "${HARNESS_HOST_NODE_VERSION%%.*}" == "$df_node_major" ]] \
     || fail "T6: Node major drift — harness=$HARNESS_HOST_NODE_VERSION dockerfile major=$df_node_major"
 ok "T6: host toolchain pins match agents/Dockerfile (opencode $df_opencode, provider $df_compat, node major $df_node_major)"
+
+# --- T7: Windows (Git Bash) platform branch resolves correct tokens/paths ----
+# Stub harness_detect_os -> windows and uname so the Windows code paths run on
+# this Linux host. jq ships only windows-amd64 (no arm64); Node ships a .zip
+# with node.exe at the ROOT; npm puts the opencode shim at the prefix root; a
+# venv is Scripts/python.exe. All must reflect that.
+(
+  harness_detect_os() { echo windows; }
+  uname() { case "${1:-}" in -m) echo x86_64;; -s) echo MINGW64_NT-10.0;; *) command uname "$@";; esac; }
+  rc=0
+  [[ "$(host_jq_platform)"   == windows-amd64 ]] || { echo "  jq_platform=$(host_jq_platform)";   rc=1; }
+  [[ "$(host_node_platform)" == win-x64       ]] || { echo "  node_platform=$(host_node_platform)"; rc=1; }
+  [[ "$(host_exe_suffix)"    == .exe          ]] || { echo "  exe_suffix=$(host_exe_suffix)";      rc=1; }
+  [[ "$(host_jq_vendored)"   == *"/bin/jq.exe" ]] || { echo "  jq_vendored=$(host_jq_vendored)";    rc=1; }
+  asset="jq-$(host_jq_platform)$(host_exe_suffix)"
+  [[ "$asset" == "jq-windows-amd64.exe" ]] || { echo "  jq_asset=$asset"; rc=1; }
+  wroot="$(host_node_dir)/node-v${HARNESS_HOST_NODE_VERSION}-$(host_node_platform)"
+  [[ "$(host_node_exe "$wroot")"     == "$wroot/node.exe" ]] || { echo "  node_exe=$(host_node_exe "$wroot")"; rc=1; }
+  [[ "$(host_node_exe_dir "$wroot")" == "$wroot"          ]] || { echo "  node_exe_dir=$(host_node_exe_dir "$wroot")"; rc=1; }
+  [[ "$(host_opencode_exe)"     == "$(host_opencode_dir)/opencode" ]] || { echo "  opencode_exe=$(host_opencode_exe)"; rc=1; }
+  [[ "$(host_opencode_exe_dir)" == "$(host_opencode_dir)"          ]] || { echo "  opencode_exe_dir=$(host_opencode_exe_dir)"; rc=1; }
+  [[ "$(host_venv_python)"      == *"/Scripts/python.exe"          ]] || { echo "  venv_python=$(host_venv_python)"; rc=1; }
+  # arm64 Windows: Node has win-arm64 but jq has no build, so jq must fail.
+  uname() { case "${1:-}" in -m) echo aarch64;; *) command uname "$@";; esac; }
+  [[ "$(host_node_platform)" == win-arm64 ]] || { echo "  win-arm64 node_platform=$(host_node_platform)"; rc=1; }
+  if host_jq_platform >/dev/null 2>&1; then echo "  jq_platform should be unsupported on win-arm64"; rc=1; fi
+  exit $rc
+) || fail "T7: Windows platform tokens/paths incorrect (see diagnostics above)"
+ok "T7: Windows tokens + layout (jq.exe, node.exe at root, npm-root opencode shim, Scripts venv; win-arm64 jq guarded)"
+
+# --- T8: host_toolchain_path_prefix assembles Windows-layout dirs ------------
+(
+  harness_detect_os() { echo windows; }
+  uname() { case "${1:-}" in -m) echo x86_64;; *) command uname "$@";; esac; }
+  mk_exe_w() { mkdir -p "$(dirname "$1")"; printf '#!/bin/sh\necho stub\n' >"$1"; chmod +x "$1"; }
+  mk_exe_w "$(host_jq_vendored)"
+  wroot="$(host_node_dir)/node-v${HARNESS_HOST_NODE_VERSION}-$(host_node_platform)"
+  mk_exe_w "$(host_node_exe "$wroot")"
+  mk_exe_w "$(host_opencode_exe)"
+  pfx="$(host_toolchain_path_prefix)"
+  want="$(host_tool_bin_dir):$wroot:$(host_opencode_dir)"
+  [[ "$pfx" == "$want" ]] || { echo "  got:  $pfx"; echo "  want: $want"; exit 1; }
+) || fail "T8: Windows PATH prefix order wrong (see diagnostics above)"
+ok "T8: host_toolchain_path_prefix orders Windows dirs (jq bin, node root, opencode prefix root)"
+
+# --- T9: host_extract_archive dispatches by kind -----------------------------
+EX="$TMP_ROOT/ex"; mkdir -p "$EX/src/sub"
+printf 'hello' >"$EX/src/sub/file.txt"
+( cd "$EX/src" && tar -czf "$EX/a.tar.gz" sub )
+mkdir -p "$EX/out_gz"
+host_extract_archive "$EX/a.tar.gz" "$EX/out_gz" tar.gz || fail "T9: tar.gz extract failed"
+[[ -f "$EX/out_gz/sub/file.txt" ]] || fail "T9: tar.gz did not extract expected file"
+if host_extract_archive "$EX/a.tar.gz" "$EX/out_gz" bogus >/dev/null 2>&1; then
+    fail "T9: host_extract_archive accepted an unknown kind"
+fi
+if command -v zip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+    ( cd "$EX/src" && zip -qr "$EX/a.zip" sub )
+    mkdir -p "$EX/out_zip"
+    host_extract_archive "$EX/a.zip" "$EX/out_zip" zip || fail "T9: zip extract failed"
+    [[ -f "$EX/out_zip/sub/file.txt" ]] || fail "T9: zip did not extract expected file"
+    ok "T9: host_extract_archive handles tar.gz + zip, rejects unknown kinds"
+else
+    ok "T9: host_extract_archive handles tar.gz, rejects unknown kinds (zip round-trip skipped: no zip/unzip on host)"
+fi
 
 echo
 echo "HOST TOOLCHAIN TEST PASSED"
