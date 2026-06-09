@@ -119,6 +119,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F087 | `harness net close <service>` is idempotent (not open: silent no-op) |
 | F088 | `net_known_services` returns the list of services that have net-override support |
 | F089 | `harness net open <unknown-svc>` errors with the known-services list |
+| F151 | `harness net open <known-svc>` accepts the service: membership validation captures `net_known_services` once and matches with a here-string, so a slow producer (real `docker compose config`) does not SIGPIPE under `set -o pipefail` and falsely reject the first-listed service (e.g. `proxy`) |
 | F090 | `harness unlock` prints the upstream unlock URL when probe returns 401 |
 | F091 | `harness unlock` prints "already authorized" when probe returns 200 |
 | F092 | `harness unlock` reports error when probe is unreachable |

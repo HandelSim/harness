@@ -1416,7 +1416,8 @@ commands:
                         flags: --pattern GLOB, --slow.
                         See 'harness test --help'.
   benchmark [target]    run a benchmark suite. targets: smoketest (default),
-                        terminal-bench, swe-bench-lite, compare-schemes, all.
+                        prefetch, terminal-bench, swe-bench-lite,
+                        compare-schemes, all.
                         flags: --task-ids, --schemes, --agents,
                         --n-concurrent, --no-smoketest.
                         Refuses to run when $CI is set.
@@ -5736,8 +5737,17 @@ cmd_net_open() {
         err "       services: $(net_known_services | paste -sd, -)"
         exit 1
     fi
-    if ! net_known_services | grep -qx -- "$svc"; then
-        err "unknown service '$svc' (services: $(net_known_services | paste -sd, -))"
+    # Capture the service list once, then match against it with a here-string
+    # rather than a `net_known_services | grep -q` pipe. Under `set -o pipefail`
+    # the pipe is a trap: grep -q exits on the first match and SIGPIPEs the
+    # still-writing producer (net_known_services shells out to a slow
+    # `docker compose config`), so the producer dies 141 and pipefail reports
+    # the whole pipeline as failed — turning a real match into a false
+    # "unknown service" for any service that isn't the last line emitted.
+    local known_services
+    known_services=$(net_known_services)
+    if ! grep -qx -- "$svc" <<<"$known_services"; then
+        err "unknown service '$svc' (services: $(paste -sd, - <<<"$known_services"))"
         exit 1
     fi
     if netlib_overrides_is_open "$svc"; then
