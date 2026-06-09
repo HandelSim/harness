@@ -239,6 +239,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P059 | The hybrid recency reminder advises the model to default to the listed tools over doing the work by hand, with concrete examples (`webfetch` vs curl/Python, `todowrite`/`todoread` vs a todo file) |
 | P060 | Proxy `GET /v1/models` proxies the upstream models catalog: forwards `{base}/v1/models` with the bearer key and returns the upstream status/body verbatim (so a locked-key 401 + `unlock_url` passes through); the agent uses this route to enumerate available models |
 | P061 | Proxy derives endpoints from `PROXY_API_URL` as a base — `{base}/v1/chat/completions` and `{base}/v1/models` — stripping a trailing `/v1/chat/completions`, `/chat/completions`, or `/v1` first |
+| P062 | `_validate_config` refuses to start (exit 1) when `HARNESS_FORCE_LOOPBACK` is truthy (`1`/`true`/`yes`) but `PROXY_HOST` is not a loopback address (`127.0.0.1`/`::1`/`localhost`); container mode (var unset/falsey) may bind `0.0.0.0`. Belt-and-suspenders that host mode never exposes the keyed, firewall-less proxy off-box |
 
 ---
 
@@ -478,3 +479,4 @@ without docker, network, or a real proxy/opencode spawn.
 | Ho005 | `host_write_opencode_config` emits valid JSON with `baseURL` pointed at `http://127.0.0.1:<port>/v1`, the `harness-dummy` placeholder apiKey, and the default model in the models map |
 | Ho006 | `host_write_opencode_config` refuses (non-zero) when `jq` is absent rather than falling back to the docker jq sidecar (M4 guard) |
 | Ho007 | `host_proxy_fingerprint` is stable across identical config and changes when `PROXY_PORT` or `PROXY_API_KEY` changes (drives config-change proxy restart, M2) |
+| Ho008 | `harness upgrade` on a host-only install (no container runtime) takes a host-aware path: it does NOT abort on `require_docker` and does NOT rebuild images or restart a container stack, prints `[harness] host-only upgrade complete.`, and returns 0; a runtime-present install still goes through `require_docker` |

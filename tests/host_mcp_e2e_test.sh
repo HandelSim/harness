@@ -31,7 +31,8 @@
 # (proxy/proxy.py extract_tool_calls_and_text), and opencode registers an MCP
 # server's tools as <server>_<tool> — NOT the mcp__<server>__<tool> form the
 # RESPONSE fixtures use, which is only ever substring-matched, never executed
-# (proxy/proxy.py:264-267; architecture/proxy.md; proxy/test_proxy.py:1827).
+# (see proxy/proxy.py extract_tool_calls_and_text and architecture/proxy.md;
+# line numbers omitted deliberately so this note does not drift).
 # If Phase 6 fails, inspect state/output/ for the real advertised tool name and
 # update MCP_TOOL_FQN.
 

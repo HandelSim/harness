@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 380 IDs (F=146, P=58, A=24, M=23, N=30, U=29, Pe=16, O=0, I=45, Ho=7).
+Inventory total: 402 rows (F=153, P=59, A=24, M=33, N=30, U=29, Pe=16, O=0, I=50, Ho=8). 399 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -53,35 +53,41 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   harness_jq fallback consumed by `_upg_json_array` / `_upg_json_str`).
 - `tests/podman_smoke_test.sh` (238 lines, manual-run) — `HARNESS_CONTAINER_RUNTIME=podman`
   smoke. Useful corroboration for I032/N017.
-- `tests/unit_host_test.sh` (118 lines, no docker) — containerless `harness host`
+- `tests/unit_host_test.sh` (no docker) — containerless `harness host`
   helpers, sourced via `HARNESS_SOURCE_ONLY=1`: `host_require_config`,
   `host_confirm_gate`, `host_preflight`, `host_write_opencode_config` (JSON shape +
   jq guard), `host_proxy_fingerprint`. Covers Ho001–Ho007.
+- `tests/unit_host_upgrade_test.sh` (no docker) — host-only upgrade transition
+  (`cmd_upgrade` with no container runtime: host-aware path, no `require_docker`,
+  no rebuild/restart, returns 0). Sourced via `HARNESS_SOURCE_ONLY=1`. Covers Ho008.
+- `tests/unit_net_open_test.sh` (no docker) — `cmd_net_open` service-membership
+  validation: the captured-list + here-string match that fixed the pipefail/SIGPIPE
+  false-reject. Covers F089, F151.
 - `tests/lib/test_helpers.sh` (311 lines) — shared fixtures only (no assertions).
 
 ## Summary stats
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   251 |   67.1% |
-| yellow   |     5 |    1.3% |
-| red      |   118 |   31.6% |
-| **total**|   374 |  100.0% |
+| green    |   281 |   69.9% |
+| yellow   |     5 |    1.2% |
+| red      |   116 |   28.9% |
+| **total**|   402 |  100.0% |
 
 Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
-| F      |   146 |   104 |      2 |  40 |
-| P      |    56 |    42 |      1 |  13 |
-| A      |    22 |    10 |      0 |  12 |
-| M      |    23 |    18 |      0 |   5 |
+| F      |   153 |   112 |      2 |  39 |
+| P      |    59 |    45 |      1 |  13 |
+| A      |    24 |    12 |      0 |  12 |
+| M      |    33 |    28 |      0 |   5 |
 | N      |    30 |     6 |      0 |  24 |
 | U      |    29 |    22 |      0 |   7 |
 | Pe     |    16 |    13 |      1 |   2 |
 | O      |     0 |     0 |      0 |   0 |
-| I      |    45 |    29 |      1 |  15 |
-| Ho     |     7 |     7 |      0 |   0 |
+| I      |    50 |    35 |      1 |  14 |
+| Ho     |     8 |     8 |      0 |   0 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -117,7 +123,7 @@ test file and line range carrying the strongest assertion, a one-line
 evidence note (quoting real assertion text where possible), and — for
 non-green rows — the gap.
 
-## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (141 IDs)
+## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (153 rows)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -275,7 +281,7 @@ non-green rows — the gap.
 | F139 | green  | tests/full_pipeline_test.sh:317-324         | T5 captures `start.log` and explicitly asserts `! grep -q "NETWORK FIREWALL IS DISABLED"` — silence is now a hard assertion when `.harness-net-overrides.json` is absent. | |
 | F150 | green  | tests/harness_test.sh (T26pm)               | T26pm: `_parse_prompt_mode_flag` accepts `--prompt-mode <m>` and `--prompt-mode=<m>`, rejects invalid value + unknown option (non-zero); `write_runtime_override` emits a standalone `proxy:` block with `PROXY_PROMPT_MODE`, and folds into the proxy firewall opt-out block (single `proxy:` mapping with both env entries) when both apply. | |
 
-## P — Proxy (56 IDs)
+## P — Proxy (59 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -337,8 +343,9 @@ non-green rows — the gap.
 | P059 | green  | proxy/test_proxy.py:test_mode_hybrid_reminder_advises_default_to_tools (+_concurrent_task_agents/_has_honesty_rules/_has_environment_context/_drops_stale_value_parenthetical/_injects_known_host_os/_omits_host_os_when_unknown) | Asserts the labelled recency reminder: Workflow line (prefer a listed tool + `webfetch`/`todowrite`/`todoread` + concurrent `task` agents), Honesty line (anti-fabrication), Environment line (Linux container / mounted workdir / reproducibility), the dropped stale "which agent types…" parenthetical, host-OS parenthetical rendered when `_HOST_OS` set and omitted when empty, and that guidance sits OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap. TestHostOsSetup covers `HARNESS_HOST_OS` parse/normalise/default. | |
 | P060 | green  | tests/proxy_test.sh (Scenario A2)            | Scenario A2 GETs `http://proxy:8000/v1/models` from the agent container and asserts the response lists the mock model `harness` and is an OpenAI `"object":"list"` envelope. | |
 | P061 | green  | proxy/test_proxy.py (TestConfigHelpers)      | test_normalize_* asserts `_normalize_api_base` strips `/v1/chat/completions`, `/chat/completions`, and a trailing `/v1` (and preserves a non-`/v1` prefix); chat/models URLs derive from the base. | |
+| P062 | green  | proxy/test_proxy.py (TestForceLoopbackGuard) | test_refuses_non_loopback_when_forced asserts `_validate_config()` raises SystemExit for `HARNESS_FORCE_LOOPBACK` in {1,true,yes} crossed with `PROXY_HOST` in {0.0.0.0,192.168.1.10,::}; test_allows_loopback_when_forced passes for 127.0.0.1/::1/localhost; test_allows_any_host_when_not_forced passes for 0.0.0.0 when the var is unset/0/false (container mode). | |
 
-## A — Agent runtime (init, configs, run-opencode/shell) (22 IDs)
+## A — Agent runtime (init, configs, run-opencode/shell) (24 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -474,7 +481,7 @@ non-green rows — the gap.
 | U028 | red    | —                                           | —                                                                                                     | No test runs `registry_actions` with `condition: installed` against a not-installed MCP entry. |
 | U029 | green  | tests/upgrade_test.sh:227-354               | T6 manifest includes a failing action; final `apply_upgrade_actions` rc != 0. | |
 
-## Pe — Persistence (paths that must survive lifecycle/upgrade) (17 IDs)
+## Pe — Persistence (paths that must survive lifecycle/upgrade) (16 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -495,7 +502,7 @@ non-green rows — the gap.
 | Pe018 | green  | tests/upgrade_test.sh:146-174               | T4 (DEALBREAKER): harness-meta.json with `.enabled == false` survives directory_overwrite even when source has it as true. | |
 | Pe019 | green  | tests/upgrade_test.sh:146-174               | T4: `data/` subdir preserved (`data/user.txt == "user-state"`). | |
 
-## I — Installer + platform.sh primitives (44 IDs)
+## I — Installer + platform.sh primitives (50 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -550,7 +557,7 @@ non-green rows — the gap.
 | I050 | green  | tests/unit_workdir_test.sh (T5)             | OS pinned to `windows` with a fake-runtime recorder: `harness_docker` and `harness_docker_winpty` both spawn the runtime with MSYS_NO_PATHCONV=1 AND MSYS2_ARG_CONV_EXCL='*' set; `local -x` scope confirmed (vars don't leak into caller); pass-through on non-Windows (no env leakage). Issue #112 root-cause fix. | |
 | I051 | green  | tests/unit_workdir_test.sh (T6)             | OS pinned both ways: linux emits `-v src:tgt` and `-v src:tgt:ro`; windows emits a single `--mount=type=bind,source=,target=[,readonly]` token with no `:/c/` composite. Covers the issue #112 winpty path where `-v` is mangled to `invalid mode: …`. | |
 
-## Ho — Host mode, containerless (7 IDs)
+## Ho — Host mode, containerless (8 IDs)
 
 | ID    | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |-------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -561,6 +568,7 @@ non-green rows — the gap.
 | Ho005 | green  | tests/unit_host_test.sh:86-98 (T5)          | `host_write_opencode_config` (PORT=8123, model=test-model) writes valid JSON; asserts `baseURL == http://127.0.0.1:8123/v1`, `apiKey == harness-dummy`, and the models map has `test-model`. | |
 | Ho006 | green  | tests/unit_host_test.sh:100-104 (T6)        | With `PATH` stripped (no jq), `host_write_opencode_config` returns non-zero rather than reaching the docker jq sidecar (M4 guard). | |
 | Ho007 | green  | tests/unit_host_test.sh:106-114 (T7)        | `host_proxy_fingerprint` is identical across two runs of the same config and differs when `PROXY_PORT` or `PROXY_API_KEY` changes (M2 config-change restart trigger). | |
+| Ho008 | green  | tests/unit_host_upgrade_test.sh:T1,T2        | T1: with `harness_runtime_installed`→1 and `jq` hidden, `cmd_upgrade --no-prompt` (HARNESS_UPGRADE_SKIP_PULL=1) returns 0, prints "no container runtime found" and "[harness] host-only upgrade complete.", and never reaches the require_docker/cmd_down/cmd_start sentinels. T2: with a runtime present it exits via the require_docker sentinel (rc 91) and does NOT print the host-only completion. | |
 
 ---
 

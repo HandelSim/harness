@@ -3718,5 +3718,44 @@ class TestSetupStateCheckAndToolSearch(unittest.TestCase):
         proxy._TOOL_SEARCH_ENABLED = False
 
 
+class TestForceLoopbackGuard(unittest.TestCase):
+    """HARNESS_FORCE_LOOPBACK refuses a non-loopback bind in host mode.
+
+    Guards proxy.py:_validate_config. Containerless host mode has no egress
+    firewall and fronts the upstream key with no auth of its own, so a
+    regression that bound the proxy off-loopback would expose a keyed endpoint
+    on the LAN. `harness host` sets HARNESS_FORCE_LOOPBACK=1; container mode
+    never sets it and may bind 0.0.0.0 on purpose behind the firewall.
+    """
+
+    def _run_validate(self, host, force_val):
+        # force_val: string to set HARNESS_FORCE_LOOPBACK to, or None to unset.
+        # patch.dict restores os.environ on exit, so the pop is safe.
+        overrides = {}
+        if force_val is not None:
+            overrides["HARNESS_FORCE_LOOPBACK"] = force_val
+        with patch.object(proxy, "PROXY_HOST", host), \
+                patch.dict(os.environ, overrides, clear=False):
+            if force_val is None:
+                os.environ.pop("HARNESS_FORCE_LOOPBACK", None)
+            proxy._validate_config()
+
+    def test_refuses_non_loopback_when_forced(self):
+        for host in ("0.0.0.0", "192.168.1.10", "::"):
+            for truthy in ("1", "true", "yes"):
+                with self.assertRaises(SystemExit):
+                    self._run_validate(host, truthy)
+
+    def test_allows_loopback_when_forced(self):
+        for host in ("127.0.0.1", "::1", "localhost"):
+            self._run_validate(host, "1")  # must not raise
+
+    def test_allows_any_host_when_not_forced(self):
+        # Container mode: var unset or falsey, a 0.0.0.0 bind is allowed.
+        self._run_validate("0.0.0.0", None)
+        self._run_validate("0.0.0.0", "0")
+        self._run_validate("0.0.0.0", "false")
+
+
 if __name__ == "__main__":
     unittest.main()
