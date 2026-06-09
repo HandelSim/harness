@@ -113,5 +113,42 @@ fp_key=$( PROXY_PORT=8000 PROXY_API_URL=u PROXY_API_KEY=DIFFERENT DEFAULT_MODEL_
 [[ "$fp_key" != "$fp1" ]] || fail "T7: fingerprint should change when PROXY_API_KEY changes"
 ok "T7: host_proxy_fingerprint is stable and changes on port/key edits"
 
+# --- T8: host_python_bin verifies the interpreter, not just command -v ------
+# Regression for the Windows trap: an App-execution-alias stub named python3
+# sits on PATH and prints "Python was not found..." instead of running. A bare
+# `command -v python3` picks it, then `python3 -m venv` fails as if Python were
+# missing — even though a real `python` is present. host_python_bin must probe
+# --version and fall through to the working interpreter.
+PYBIN_DIR="$TMP_ROOT/pybin"; mkdir -p "$PYBIN_DIR"
+make_py() { # $1=name  $2=version-output (empty => behave like the Windows stub)
+    local f="$PYBIN_DIR/$1"
+    if [[ -n "$2" ]]; then
+        printf '#!/bin/sh\necho "%s"\n' "$2" >"$f"
+    else
+        # Mimic the alias stub: ignores args, prints the not-found notice, exits 9009.
+        printf '#!/bin/sh\necho "Python was not found; run without arguments to install from the Microsoft Store"\nexit 9009\n' >"$f"
+    fi
+    chmod +x "$f"
+}
+
+# Case A: python3 is the dead stub, python is a real Python 3 -> must pick python.
+make_py python3 ""
+make_py python "Python 3.12.4"
+got=$( PATH="$PYBIN_DIR:$PATH" host_python_bin )
+[[ "$got" == "python" ]] || fail "T8a: stub python3 not rejected; host_python_bin returned '$got' (want 'python')"
+
+# Case B: a real python3 -> preferred over python.
+make_py python3 "Python 3.11.9"
+got=$( PATH="$PYBIN_DIR:$PATH" host_python_bin )
+[[ "$got" == "python3" ]] || fail "T8b: real python3 not chosen; got '$got'"
+
+# Case C: nothing resolves (both stubs) -> non-zero, no output.
+make_py python3 ""
+make_py python ""
+if got=$( PATH="$PYBIN_DIR:$PATH" host_python_bin ); then
+    fail "T8c: host_python_bin succeeded with only dead stubs (returned '$got')"
+fi
+ok "T8: host_python_bin probes --version (rejects the Windows alias stub, falls through to python)"
+
 echo
 echo "HOST TEST PASSED"

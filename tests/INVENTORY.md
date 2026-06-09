@@ -489,3 +489,4 @@ without docker, network, or a real proxy/opencode spawn.
 | Ho015 | Windows (Git Bash) toolchain layout: jq=`windows-amd64` exe, node=`win-x64`, `.exe` suffix, `node.exe`/opencode shim at dir root (not `bin/`), venv at `Scripts/python.exe`; win-arm64 resolves Node but jq fails closed (no upstream build) |
 | Ho016 | `host_toolchain_path_prefix` on Windows orders the dirs `tool_bin:node-root:opencode-root` (root-level layout) |
 | Ho017 | `host_extract_archive` extracts `.tar.gz` (and `.zip` when `zip`/`unzip` available) and rejects an unknown archive kind |
+| Ho018 | `host_python_bin` verifies each candidate by running `--version` (not `command -v` alone): rejects a dead `python3` App-execution-alias stub and falls through to a real `python`; prefers a real `python3`; returns non-zero when only stubs exist |

@@ -56,7 +56,8 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 - `tests/unit_host_test.sh` (no docker) — containerless `harness host`
   helpers, sourced via `HARNESS_SOURCE_ONLY=1`: `host_require_config`,
   `host_confirm_gate`, `host_preflight`, `host_write_opencode_config` (JSON shape +
-  jq guard), `host_proxy_fingerprint`. Covers Ho001–Ho007.
+  jq guard), `host_proxy_fingerprint`, and `host_python_bin` interpreter
+  verification (Windows alias-stub rejection). Covers Ho001–Ho007, Ho018.
 - `tests/unit_host_upgrade_test.sh` (no docker) — host-only upgrade transition
   (`cmd_upgrade` with no container runtime: host-aware path, no `require_docker`,
   no rebuild/restart, returns 0). Sourced via `HARNESS_SOURCE_ONLY=1`. Covers Ho008.
@@ -575,6 +576,7 @@ non-green rows — the gap.
 | Ho005 | green  | tests/unit_host_test.sh:86-98 (T5)          | `host_write_opencode_config` (PORT=8123, model=test-model) writes valid JSON; asserts `baseURL == http://127.0.0.1:8123/v1`, `apiKey == harness-dummy`, and the models map has `test-model`. | |
 | Ho006 | green  | tests/unit_host_test.sh:100-104 (T6)        | With `PATH` stripped (no jq), `host_write_opencode_config` returns non-zero rather than reaching the docker jq sidecar (M4 guard). | |
 | Ho007 | green  | tests/unit_host_test.sh:106-114 (T7)        | `host_proxy_fingerprint` is identical across two runs of the same config and differs when `PROXY_PORT` or `PROXY_API_KEY` changes (M2 config-change restart trigger). | |
+| Ho018 | green  | tests/unit_host_test.sh:116-150 (T8)        | `host_python_bin` verifies each candidate via `--version` (not `command -v` alone): a dead `python3` stub that prints "Python was not found" (Windows App-execution-alias) is rejected and it falls through to a real `python`; a real `python3` is preferred; only dead stubs → non-zero. | |
 | Ho008 | green  | tests/unit_host_upgrade_test.sh:T1,T2        | T1: with `harness_runtime_installed`→1 and `jq` hidden, `cmd_upgrade --no-prompt` (HARNESS_UPGRADE_SKIP_PULL=1) returns 0, prints "no container runtime found" and "[harness] host-only upgrade complete.", and never reaches the require_docker/cmd_down/cmd_start sentinels. T2: with a runtime present it exits via the require_docker sentinel (rc 91) and does NOT print the host-only completion. | |
 | Ho009 | green  | tests/unit_host_toolchain_test.sh:T1         | `host_jq_platform`/`host_node_platform` return well-formed tokens (`linux\|macos-amd64\|arm64`, `linux\|darwin-x64\|arm64`) that agree with `uname -m`. | |
 | Ho010 | green  | tests/unit_host_toolchain_test.sh:T2         | `host_sha_from_manifest` (curl stubbed with a fixture) returns the correct hash for a `<sha>  <file>` entry and fails (no match) for an absent or non-end-anchored name. | |

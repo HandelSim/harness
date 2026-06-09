@@ -325,11 +325,14 @@ preflight() {
         # Resolve like harness's host_python_bin: python3, then a python that is
         # Python 3, then the 'py -3' launcher — Windows Git Bash usually has no
         # 'python3' (python.org ships 'python'/'py'; only MS Store ships python3).
-        if command -v python3 >/dev/null 2>&1; then
+        # Verify each by running --version, not just `command -v`: Windows puts an
+        # App-execution-alias stub named python3.exe on PATH that reports "Python
+        # was not found" instead of running, so a bare command -v picks the stub.
+        if command -v python3 >/dev/null 2>&1 && python3 --version 2>&1 | grep -q '^Python 3'; then
             echo "  ✓ python3 (host proxy runtime)"
-        elif command -v python >/dev/null 2>&1 && python --version 2>&1 | grep -q 'Python 3'; then
+        elif command -v python >/dev/null 2>&1 && python --version 2>&1 | grep -q '^Python 3'; then
             echo "  ✓ python (Python 3; host proxy runtime)"
-        elif command -v py >/dev/null 2>&1 && py -3 --version >/dev/null 2>&1; then
+        elif command -v py >/dev/null 2>&1 && py -3 --version 2>&1 | grep -q '^Python 3'; then
             echo "  ✓ py -3 (host proxy runtime)"
         else
             echo "  ⚠ Python 3 not found — 'harness host' needs it (the translating proxy); install it from your OS package manager (Windows: python.org provides 'python'/'py')"

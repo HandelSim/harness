@@ -326,9 +326,15 @@ What it does, in order:
    exist before harness can fetch anything else. Checked **before** the confirm
    gate so a Python-less host fails fast without prompting or downloading. The
    interpreter is resolved by `host_python_bin` (used everywhere harness needs to
-   call Python): `python3`, then a `python` that reports `Python 3`, then `py -3`
-   — because Windows Git Bash often has no `python3` (python.org ships `python` /
-   the `py` launcher; only the MS Store build provides `python3`).
+   call Python): `python3`, then `python`, then `py -3` — because Windows Git
+   Bash often has no `python3` (python.org ships `python` / the `py` launcher;
+   only the MS Store build provides `python3`). Each candidate is **verified by
+   running `--version`** and confirming it reports `Python 3`, not trusted on
+   `command -v` alone: Windows puts an App-execution-alias stub named
+   `python3.exe` on `PATH` by default that prints "Python was not found…" instead
+   of running, so a bare `command -v python3` would pick the stub and the later
+   `python3 -m venv` would fail as if Python were absent even with a working
+   `python` present. Probing `--version` rejects the stub and falls through.
 2. **`host_require_config`** — a lighter `require_runtime_config`: the same three
    REQUIRED proxy vars (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`,
    read from the already-sourced `.env`), but **no allowlist check** — the

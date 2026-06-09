@@ -2920,10 +2920,25 @@ host_opencode_exe() { printf '%s/opencode' "$(host_opencode_exe_dir)"; }
 # Resolve a Python 3 interpreter command. python3 on Linux/macOS; on Windows
 # (Git Bash) the python.org build ships `python`/`py` rather than `python3`, so
 # fall back. Echoes an invocable command word (may be the two-token `py -3`).
+#
+# Every candidate is VERIFIED by actually running `--version` and confirming it
+# reports Python 3 — `command -v` alone is not enough on Windows, where an
+# "App execution alias" stub named python3.exe (and python.exe) sits on PATH by
+# default and, when Python is installed under a different name, prints "Python
+# was not found..." instead of running. Trusting `command -v python3` there
+# picks the stub, and the later `python3 -m venv` fails as if Python were
+# missing even though a real `python` is right there. Probing `--version`
+# rejects the stub and falls through to the interpreter that actually works.
 host_python_bin() {
-    if command -v python3 >/dev/null 2>&1; then printf 'python3'; return 0; fi
-    if command -v python  >/dev/null 2>&1 && python --version 2>&1 | grep -q 'Python 3'; then printf 'python'; return 0; fi
-    if command -v py >/dev/null 2>&1 && py -3 --version >/dev/null 2>&1; then printf 'py -3'; return 0; fi
+    local c
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" --version 2>&1 | grep -q '^Python 3'; then
+            printf '%s' "$c"; return 0
+        fi
+    done
+    if command -v py >/dev/null 2>&1 && py -3 --version 2>&1 | grep -q '^Python 3'; then
+        printf 'py -3'; return 0
+    fi
     return 1
 }
 
