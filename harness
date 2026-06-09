@@ -2810,6 +2810,30 @@ host_fetch() {
     mv -f "$tmp" "$dest"
 }
 
+# Extract archive $1 into dir $2. $3 is the kind: `tar.gz` (Linux/macOS Node
+# tarball) or `zip` (the Windows Node distribution). zip prefers `unzip`, then
+# falls back to `tar -xf` — Git for Windows ships bsdtar as `tar`, which reads
+# zip natively, so no extra tool is needed on a stock Git Bash.
+host_extract_archive() {
+    local file="$1" dest="$2" kind="$3"
+    case "$kind" in
+        zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -q -o "$file" -d "$dest"
+            elif command -v tar >/dev/null 2>&1; then
+                tar -xf "$file" -C "$dest"
+            else
+                err "host mode: need 'unzip' or 'tar' to unpack $file"; return 1
+            fi
+            ;;
+        tar.gz|tgz)
+            command -v tar >/dev/null 2>&1 || { err "host mode: 'tar' required to unpack $file"; return 1; }
+            tar -xzf "$file" -C "$dest"
+            ;;
+        *) err "host mode: unknown archive kind '$kind'"; return 1 ;;
+    esac
+}
+
 # Fetch a `<sha256>  <filename>` manifest at $1 and echo the hash for entry $2.
 # Used for jq's sha256sum.txt and Node's SHASUMS256.txt (same format).
 host_sha_from_manifest() {
@@ -2842,6 +2866,8 @@ host_jq_platform() {
     case "$os" in
         linux) printf 'linux-%s' "$arch" ;;
         macos) printf 'macos-%s' "$arch" ;;
+        # jq 1.7.1 ships only windows-amd64 / windows-i386 — no arm64 build.
+        windows) [[ "$arch" == amd64 ]] && printf 'windows-amd64' || return 1 ;;
         *) return 1 ;;
     esac
 }
@@ -2851,8 +2877,59 @@ host_node_platform() {
     case "$os" in
         linux) printf 'linux-%s' "$arch" ;;
         macos) printf 'darwin-%s' "$arch" ;;
+        windows) printf 'win-%s' "$arch" ;;   # win-x64 / win-arm64
         *) return 1 ;;
     esac
+}
+
+# --- per-OS executable layout helpers ---------------------------------------
+# Everything routes through harness_detect_os so a single stub flips the whole
+# platform in tests. On Windows the user runs harness under Git Bash (MSYS):
+# binaries carry a .exe suffix, the Node zip lays node.exe at its ROOT (no bin/
+# subdir), npm puts global shims in the prefix root rather than bin/, and a venv
+# is Scripts/python.exe rather than bin/python.
+
+# Executable suffix for native binaries we download (jq, node): ".exe" on
+# Windows, empty elsewhere. (opencode's npm shim is an extensionless sh wrapper,
+# so it does NOT take this suffix.)
+host_exe_suffix() { [[ "$(harness_detect_os)" == windows ]] && printf '.exe' || printf ''; }
+
+# Full path to the vendored jq binary (…/bin/jq or …/bin/jq.exe).
+host_jq_vendored() { printf '%s/jq%s' "$(host_tool_bin_dir)" "$(host_exe_suffix)"; }
+
+# Given an extracted Node root, the dir that holds node/npm on this OS (…/bin on
+# unix, the root itself on Windows) and the node binary's full path.
+host_node_exe_dir() {
+    local root="$1"
+    [[ "$(harness_detect_os)" == windows ]] && printf '%s' "$root" || printf '%s/bin' "$root"
+}
+host_node_exe() { printf '%s/node%s' "$(host_node_exe_dir "$1")" "$(host_exe_suffix)"; }
+
+# opencode install layout: npm links the global shim into <prefix>/bin on unix,
+# into the <prefix> root on Windows (npm's documented per-OS global-folders
+# rule). The shim is `opencode` (sh wrapper) on both — no .exe suffix.
+host_opencode_exe_dir() {
+    [[ "$(harness_detect_os)" == windows ]] && printf '%s' "$(host_opencode_dir)" || printf '%s/bin' "$(host_opencode_dir)"
+}
+host_opencode_exe() { printf '%s/opencode' "$(host_opencode_exe_dir)"; }
+
+# Resolve a Python 3 interpreter command. python3 on Linux/macOS; on Windows
+# (Git Bash) the python.org build ships `python`/`py` rather than `python3`, so
+# fall back. Echoes an invocable command word (may be the two-token `py -3`).
+host_python_bin() {
+    if command -v python3 >/dev/null 2>&1; then printf 'python3'; return 0; fi
+    if command -v python  >/dev/null 2>&1 && python --version 2>&1 | grep -q 'Python 3'; then printf 'python'; return 0; fi
+    if command -v py >/dev/null 2>&1 && py -3 --version >/dev/null 2>&1; then printf 'py -3'; return 0; fi
+    return 1
+}
+
+# Path to the venv's python interpreter for this OS.
+host_venv_python() {
+    if [[ "$(harness_detect_os)" == windows ]]; then
+        printf '%s/Scripts/python.exe' "$(host_venv_dir)"
+    else
+        printf '%s/bin/python' "$(host_venv_dir)"
+    fi
 }
 
 # --- per-tool provisioners (idempotent; stamp gated on a --version smoke run) ---
@@ -2860,10 +2937,11 @@ host_node_platform() {
 # Vendor jq into toolchain/bin/jq unless a host jq is already present.
 host_ensure_jq() {
     command -v jq >/dev/null 2>&1 && return 0
-    local ver plat bin stamp base sha
+    local ver plat asset bin stamp base sha
     ver="$HARNESS_HOST_JQ_VERSION"
     plat=$(host_jq_platform) || { err "host mode: cannot vendor jq for $(harness_detect_os)/$(uname -m)"; return 1; }
-    bin="$(host_tool_bin_dir)/jq"
+    asset="jq-${plat}$(host_exe_suffix)"   # jq-linux-amd64 | jq-windows-amd64.exe
+    bin="$(host_jq_vendored)"
     stamp="$(host_tool_dir)/.stamp-jq"
     if [[ -x "$bin" && -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$ver-$plat" ]] \
        && "$bin" --version >/dev/null 2>&1; then
@@ -2871,11 +2949,11 @@ host_ensure_jq() {
     fi
     mkdir -p "$(host_tool_bin_dir)"
     base="https://github.com/jqlang/jq/releases/download/jq-${ver}"
-    sha=$(host_sha_from_manifest "$base/sha256sum.txt" "jq-${plat}") \
+    sha=$(host_sha_from_manifest "$base/sha256sum.txt" "$asset") \
         || { err "host mode: could not resolve jq checksum from $base/sha256sum.txt"; return 1; }
     echo "[harness] host mode: fetching jq ${ver} (${plat}, ~1 MB)..." >&2
-    host_fetch "$base/jq-${plat}" "$bin" "$sha" || return 1
-    chmod +x "$bin"
+    host_fetch "$base/$asset" "$bin" "$sha" || return 1
+    chmod +x "$bin" 2>/dev/null || true
     if ! "$bin" --version >/dev/null 2>&1; then
         err "host mode: vendored jq failed to run ($bin)"; rm -f "$bin"; return 1
     fi
@@ -2890,32 +2968,34 @@ host_ensure_node() {
         local maj; maj=$(node --version 2>/dev/null | sed -E 's/^v?([0-9]+).*/\1/')
         [[ -n "$maj" ]] && (( maj >= 20 )) && return 0
     fi
-    local ver plat root stamp base tarball sha tmp
+    local ver plat root stamp base ext archive sha tmp nodeexe
     ver="$HARNESS_HOST_NODE_VERSION"
     plat=$(host_node_platform) || { err "host mode: cannot vendor Node for $(harness_detect_os)/$(uname -m)"; return 1; }
     root="$(host_node_dir)/node-v${ver}-${plat}"
     stamp="$(host_tool_dir)/.stamp-node"
-    if [[ -x "$root/bin/node" && -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$ver-$plat" ]] \
-       && "$root/bin/node" --version >/dev/null 2>&1; then
+    nodeexe="$(host_node_exe "$root")"   # …/bin/node on unix, …/node.exe on Windows
+    if [[ -x "$nodeexe" && -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$ver-$plat" ]] \
+       && "$nodeexe" --version >/dev/null 2>&1; then
         return 0
     fi
-    command -v tar >/dev/null 2>&1 || { err "host mode: 'tar' required to unpack Node"; return 1; }
     mkdir -p "$(host_node_dir)"
     rm -rf "$root"   # clear any partial/older tree so a crashed prior run can't be trusted
     base="https://nodejs.org/dist/v${ver}"
-    tarball="node-v${ver}-${plat}.tar.gz"
-    sha=$(host_sha_from_manifest "$base/SHASUMS256.txt" "$tarball") \
+    # Windows ships a .zip (node.exe + npm at the root); Linux/macOS a .tar.gz.
+    if [[ "$(harness_detect_os)" == windows ]]; then ext="zip"; else ext="tar.gz"; fi
+    archive="node-v${ver}-${plat}.${ext}"
+    sha=$(host_sha_from_manifest "$base/SHASUMS256.txt" "$archive") \
         || { err "host mode: could not resolve Node checksum from $base/SHASUMS256.txt"; return 1; }
-    tmp="$(host_node_dir)/$tarball"
+    tmp="$(host_node_dir)/$archive"
     echo "[harness] host mode: fetching Node ${ver} (${plat}, ~30 MB download / ~150 MB unpacked)..." >&2
-    host_fetch "$base/$tarball" "$tmp" "$sha" || return 1
+    host_fetch "$base/$archive" "$tmp" "$sha" || return 1
     echo "[harness] host mode: unpacking Node..." >&2
-    if ! tar -xzf "$tmp" -C "$(host_node_dir)"; then
-        err "host mode: Node tarball failed to extract"; rm -f "$tmp"; rm -rf "$root"; return 1
+    if ! host_extract_archive "$tmp" "$(host_node_dir)" "$ext"; then
+        err "host mode: Node archive failed to extract"; rm -f "$tmp"; rm -rf "$root"; return 1
     fi
     rm -f "$tmp"
-    if [[ ! -x "$root/bin/node" ]] || ! "$root/bin/node" --version >/dev/null 2>&1; then
-        err "host mode: Node did not unpack to $root/bin/node"; rm -rf "$root"; return 1
+    if [[ ! -x "$nodeexe" ]] || ! "$nodeexe" --version >/dev/null 2>&1; then
+        err "host mode: Node did not unpack to $nodeexe"; rm -rf "$root"; return 1
     fi
     printf '%s\n' "$ver-$plat" >"$stamp" 2>/dev/null || true
 }
@@ -2934,7 +3014,7 @@ host_ensure_opencode() {
     fi
     prefix="$(host_opencode_dir)"
     stamp="$(host_tool_dir)/.stamp-opencode"
-    bin="$prefix/bin/opencode"
+    bin="$(host_opencode_exe)"   # …/bin/opencode on unix, …/opencode shim at prefix root on Windows
     if [[ -x "$bin" && -f "$stamp" && "$(cat "$stamp" 2>/dev/null)" == "$ver-$compat" ]] \
        && "$bin" --version >/dev/null 2>&1; then
         return 0
@@ -2955,13 +3035,13 @@ host_ensure_opencode() {
 # binaries only). Referenced by exact version-named dirs — never a glob — so a
 # leftover older Node tree can't sneak onto PATH after a version bump.
 host_toolchain_path_prefix() {
-    local dirs=() np node_bin
-    [[ -x "$(host_tool_bin_dir)/jq" ]] && dirs+=("$(host_tool_bin_dir)")
+    local dirs=() np node_root
+    [[ -x "$(host_jq_vendored)" ]] && dirs+=("$(host_tool_bin_dir)")
     if np=$(host_node_platform 2>/dev/null); then
-        node_bin="$(host_node_dir)/node-v${HARNESS_HOST_NODE_VERSION}-${np}/bin"
-        [[ -x "$node_bin/node" ]] && dirs+=("$node_bin")
+        node_root="$(host_node_dir)/node-v${HARNESS_HOST_NODE_VERSION}-${np}"
+        [[ -x "$(host_node_exe "$node_root")" ]] && dirs+=("$(host_node_exe_dir "$node_root")")
     fi
-    [[ -x "$(host_opencode_dir)/bin/opencode" ]] && dirs+=("$(host_opencode_dir)/bin")
+    [[ -x "$(host_opencode_exe)" ]] && dirs+=("$(host_opencode_exe_dir)")
     local IFS=:
     printf '%s' "${dirs[*]}"
 }
@@ -2969,11 +3049,11 @@ host_toolchain_path_prefix() {
 # Provision every host-mode dependency (jq, Node, opencode) and prepend the
 # vendored dirs to PATH for the rest of this invocation. Each provisioner is a
 # no-op (silent) once its tool is satisfied, so re-runs only re-wire PATH.
-# Linux/macOS only — host mode itself is.
+# Linux, macOS, and Windows (Git Bash / MSYS).
 host_ensure_toolchain() {
     local os; os=$(harness_detect_os)
-    if [[ "$os" != linux && "$os" != macos ]]; then
-        err "host mode: automatic dependency provisioning supports Linux/macOS only (got $os)"
+    if [[ "$os" != linux && "$os" != macos && "$os" != windows ]]; then
+        err "host mode: automatic dependency provisioning supports Linux, macOS, and Windows (Git Bash); got $os"
         return 1
     fi
     host_ensure_jq   || return 1
