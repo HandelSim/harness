@@ -3083,15 +3083,17 @@ host_require_python3() {
     fi
 }
 
-# Verify host mode's deps are satisfied. python3 is the user's responsibility;
+# Verify host mode's deps are satisfied. Python 3 is the user's responsibility;
 # jq / Node / opencode are auto-provisioned by host_ensure_toolchain and on PATH
 # by the time this runs, so this is a post-provision assertion (each must both
 # resolve AND execute). Names every missing dep. Returns non-zero if any fail.
 host_preflight() {
     local missing_dep=0
 
-    if ! command -v python3 >/dev/null 2>&1; then
-        err "host mode needs python3 (runs the translating proxy); not found in PATH"
+    # host_python_bin resolves python3 / a Python-3 'python' / 'py -3', so a
+    # Windows Git Bash box without a literal 'python3' still passes.
+    if ! host_python_bin >/dev/null 2>&1; then
+        err "host mode needs Python 3 (python3/python/py; runs the translating proxy); not found in PATH"
         missing_dep=1
     fi
 

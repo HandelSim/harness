@@ -484,5 +484,8 @@ without docker, network, or a real proxy/opencode spawn.
 | Ho010 | `host_sha_from_manifest` extracts the correct hash from a `<sha256>  <filename>` manifest and is end-anchored (no match for an absent or prefix-only name) |
 | Ho011 | `host_sha256_check` accepts a file's real sha256 and rejects a wrong one |
 | Ho012 | `host_toolchain_path_prefix` is empty when nothing is vendored and lists exactly the vendored jq, Node, and opencode bin dirs (in that order) once they exist |
-| Ho013 | `host_ensure_toolchain` refuses on a non-Linux/macOS host and, on a supported host, prepends the vendored toolchain dirs to `PATH` |
+| Ho013 | `host_ensure_toolchain` refuses on an unsupported host (not Linux/macOS/Windows) before downloading and, on a supported host, prepends the vendored toolchain dirs to `PATH` |
 | Ho014 | host toolchain version pins (`HARNESS_HOST_OPENCODE_VERSION`, `HARNESS_HOST_OPENAI_COMPAT_VERSION`, `HARNESS_HOST_NODE_VERSION` major) stay in sync with `agents/Dockerfile` (drift guard) |
+| Ho015 | Windows (Git Bash) toolchain layout: jq=`windows-amd64` exe, node=`win-x64`, `.exe` suffix, `node.exe`/opencode shim at dir root (not `bin/`), venv at `Scripts/python.exe`; win-arm64 resolves Node but jq fails closed (no upstream build) |
+| Ho016 | `host_toolchain_path_prefix` on Windows orders the dirs `tool_bin:node-root:opencode-root` (root-level layout) |
+| Ho017 | `host_extract_archive` extracts `.tar.gz` (and `.zip` when `zip`/`unzip` available) and rejects an unknown archive kind |
