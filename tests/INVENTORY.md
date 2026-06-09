@@ -240,6 +240,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P060 | Proxy `GET /v1/models` proxies the upstream models catalog: forwards `{base}/v1/models` with the bearer key and returns the upstream status/body verbatim (so a locked-key 401 + `unlock_url` passes through); the agent uses this route to enumerate available models |
 | P061 | Proxy derives endpoints from `PROXY_API_URL` as a base — `{base}/v1/chat/completions` and `{base}/v1/models` — stripping a trailing `/v1/chat/completions`, `/chat/completions`, or `/v1` first |
 | P062 | `_validate_config` refuses to start (exit 1) when `HARNESS_FORCE_LOOPBACK` is truthy (`1`/`true`/`yes`) but `PROXY_HOST` is not a loopback address (`127.0.0.1`/`::1`/`localhost`); container mode (var unset/falsey) may bind `0.0.0.0`. Belt-and-suspenders that host mode never exposes the keyed, firewall-less proxy off-box |
+| P063 | `_force_utf8_stdio` (called first in `main()`) reconfigures stdout/stderr to `encoding="utf-8", errors="backslashreplace"` so a non-ASCII print can never crash the proxy. Regression for the Windows host-mode crash: redirected stdout defaults to cp1252, which cannot encode the `→` (U+2192) in the `sys→user:` startup banner, so `print` raised `UnicodeEncodeError` and killed the proxy at startup. No-op on streams already UTF-8 or lacking `reconfigure` (Python < 3.7) |
 
 ---
 

@@ -2487,9 +2487,33 @@ def _validate_config() -> None:
         sys.exit(1)
 
 
+def _force_utf8_stdio() -> None:
+    """Make stdout/stderr encode as UTF-8 so the proxy never dies printing a
+    non-ASCII character.
+
+    The proxy prints a U+2192 arrow in its startup banner (`sys→user:`) and, on
+    the error paths, echoes upstream error bodies, model names, and tracebacks
+    that can hold arbitrary Unicode. On Windows a redirected/piped stdout (host
+    mode `nohup`s the proxy to a logfile, so it is not a console) defaults to the
+    legacy cp1252 code page, which cannot encode `→` and much else; `print`
+    raised UnicodeEncodeError and killed the proxy at startup. UTF-8 encodes
+    every code point, so this removes the whole crash class; `backslashreplace`
+    keeps even a stray surrogate from ever raising on a log write. No-op where
+    the stream is already UTF-8 or predates `reconfigure` (Python < 3.7)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError):
+            pass
+
+
 def main() -> None:
     global _OUTPUT_DIR
 
+    _force_utf8_stdio()
     _validate_config()
     _OUTPUT_DIR = init_output_dir()
     _setup_prompt_mode()

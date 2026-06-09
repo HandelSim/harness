@@ -4,6 +4,7 @@ Run inside the proxy container:
     docker compose run --rm proxy python -m unittest test_proxy.py
 """
 
+import io
 import json
 import os
 import unittest
@@ -3755,6 +3756,57 @@ class TestForceLoopbackGuard(unittest.TestCase):
         self._run_validate("0.0.0.0", None)
         self._run_validate("0.0.0.0", "0")
         self._run_validate("0.0.0.0", "false")
+
+
+class TestForceUtf8Stdio(unittest.TestCase):
+    """_force_utf8_stdio makes stdout/stderr UTF-8 so a non-ASCII print cannot
+    crash the proxy.
+
+    Regression for the Windows host-mode crash: with stdout redirected to the
+    host-mode logfile, Python uses the legacy cp1252 code page, and printing the
+    U+2192 arrow in the startup banner (`sys->user:`) raised
+    `UnicodeEncodeError: 'charmap' codec can't encode character '\\u2192'`,
+    killing the proxy at startup.
+    """
+
+    @staticmethod
+    def _cp1252_stream():
+        # What Python hands proxy.py for a redirected stdout on Windows: a text
+        # stream over bytes, encoding cp1252 with strict errors.
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+
+    def test_arrow_crashes_on_cp1252_baseline(self):
+        # The exact failure the user hit: the arrow does not fit in cp1252.
+        out = self._cp1252_stream()
+        with self.assertRaises(UnicodeEncodeError):
+            out.write("sys→user")
+            out.flush()
+
+    def test_reconfigures_to_utf8_and_arrow_survives(self):
+        out = self._cp1252_stream()
+        err = self._cp1252_stream()
+        with patch.object(proxy.sys, "stdout", out), \
+                patch.object(proxy.sys, "stderr", err):
+            proxy._force_utf8_stdio()
+            # Same writes that crashed before must now succeed on both streams.
+            print("sys→user", file=proxy.sys.stdout, flush=True)
+            print("err→", file=proxy.sys.stderr, flush=True)
+
+        self.assertEqual(out.encoding.lower().replace("-", ""), "utf8")
+        self.assertEqual(err.encoding.lower().replace("-", ""), "utf8")
+        # The arrow round-trips as UTF-8 bytes in the underlying buffer.
+        self.assertIn("→".encode("utf-8"), out.buffer.getvalue())
+        self.assertIn("→".encode("utf-8"), err.buffer.getvalue())
+
+    def test_noop_when_stream_lacks_reconfigure(self):
+        # Pre-3.7 / exotic streams without reconfigure() must be tolerated, not
+        # crash the proxy before it can serve.
+        class _Bare:
+            pass
+
+        with patch.object(proxy.sys, "stdout", _Bare()), \
+                patch.object(proxy.sys, "stderr", _Bare()):
+            proxy._force_utf8_stdio()  # must not raise
 
 
 if __name__ == "__main__":

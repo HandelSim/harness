@@ -760,6 +760,18 @@ in `main()` enforces the three REQUIRED values are non-empty and `PROXY_API_URL`
 parses; the process exits with a clear message if not. `_redact_key` is used in
 startup logging so logs show something like `sk-abc...xyz`.
 
+`main()` calls `_force_utf8_stdio()` **first**, before `_validate_config`, so
+stdout/stderr are reconfigured to `encoding="utf-8", errors="backslashreplace"`.
+The proxy prints a U+2192 arrow in its startup banner (`sys→user:`) and echoes
+upstream error bodies, model names, and tracebacks (arbitrary Unicode) on the
+error paths. In `harness host` mode the launcher `nohup`s the proxy with stdout
+redirected to a logfile, so on Windows the stream defaults to the legacy cp1252
+code page, which cannot encode `→` and much else — `print` raised
+`UnicodeEncodeError` and killed the proxy at startup. UTF-8 encodes every code
+point, removing the whole crash class; `backslashreplace` keeps even a stray
+surrogate from raising on a log write. No-op where the stream is already UTF-8 or
+predates `reconfigure` (Python < 3.7).
+
 `_validate_config` also honors **`HARNESS_FORCE_LOOPBACK`** (set by the
 containerless `harness host` launcher — see [`harness-cli.md`](harness-cli.md) →
 "Host mode"). When that env var is truthy (`1`/`true`/`yes`) and `PROXY_HOST` is

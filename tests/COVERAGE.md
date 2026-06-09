@@ -289,7 +289,7 @@ non-green rows — the gap.
 | F139 | green  | tests/full_pipeline_test.sh:317-324         | T5 captures `start.log` and explicitly asserts `! grep -q "NETWORK FIREWALL IS DISABLED"` — silence is now a hard assertion when `.harness-net-overrides.json` is absent. | |
 | F150 | green  | tests/harness_test.sh (T26pm)               | T26pm: `_parse_prompt_mode_flag` accepts `--prompt-mode <m>` and `--prompt-mode=<m>`, rejects invalid value + unknown option (non-zero); `write_runtime_override` emits a standalone `proxy:` block with `PROXY_PROMPT_MODE`, and folds into the proxy firewall opt-out block (single `proxy:` mapping with both env entries) when both apply. | |
 
-## P — Proxy (59 IDs)
+## P — Proxy (60 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -352,6 +352,7 @@ non-green rows — the gap.
 | P060 | green  | tests/proxy_test.sh (Scenario A2)            | Scenario A2 GETs `http://proxy:8000/v1/models` from the agent container and asserts the response lists the mock model `harness` and is an OpenAI `"object":"list"` envelope. | |
 | P061 | green  | proxy/test_proxy.py (TestConfigHelpers)      | test_normalize_* asserts `_normalize_api_base` strips `/v1/chat/completions`, `/chat/completions`, and a trailing `/v1` (and preserves a non-`/v1` prefix); chat/models URLs derive from the base. | |
 | P062 | green  | proxy/test_proxy.py (TestForceLoopbackGuard) | test_refuses_non_loopback_when_forced asserts `_validate_config()` raises SystemExit for `HARNESS_FORCE_LOOPBACK` in {1,true,yes} crossed with `PROXY_HOST` in {0.0.0.0,192.168.1.10,::}; test_allows_loopback_when_forced passes for 127.0.0.1/::1/localhost; test_allows_any_host_when_not_forced passes for 0.0.0.0 when the var is unset/0/false (container mode). | |
+| P063 | green  | proxy/test_proxy.py (TestForceUtf8Stdio)    | test_arrow_crashes_on_cp1252_baseline reproduces the user's crash (writing `sys→user` to a cp1252 `TextIOWrapper` raises `UnicodeEncodeError`); test_reconfigures_to_utf8_and_arrow_survives patches `proxy.sys.stdout`/`stderr` to fresh cp1252 streams, calls `proxy._force_utf8_stdio()`, then asserts `print("sys→user")` to both succeeds, `.encoding` is utf-8, and the UTF-8 bytes of `→` land in the underlying buffer; test_noop_when_stream_lacks_reconfigure asserts a stream without `reconfigure` is tolerated (no raise). | |
 
 ## A — Agent runtime (init, configs, run-opencode/shell) (24 IDs)
 
