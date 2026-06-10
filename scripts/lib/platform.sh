@@ -331,6 +331,33 @@ harness_resolve_interactive_tty() {
     printf '%s' "$strategy"
 }
 
+# Detect the HOST-side clipboard "write" command (text on stdin -> OS clipboard).
+# Echoes the command, with any args, on stdout; returns 1 (no output) if none is
+# found. Used by the opencode clipboard bridge (HARNESS_CLIPBOARD=1) to push
+# container-copied text onto the host clipboard. These are the same OS-native
+# tools a terminal would use; no new dependency is introduced.
+harness_host_clipboard_cmd() {
+    local os
+    os=$(harness_detect_os)
+    case "$os" in
+        windows)
+            command -v clip.exe >/dev/null 2>&1 && { echo "clip.exe"; return 0; }
+            command -v clip     >/dev/null 2>&1 && { echo "clip"; return 0; }
+            ;;
+        macos)
+            command -v pbcopy >/dev/null 2>&1 && { echo "pbcopy"; return 0; }
+            ;;
+        *)
+            if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null 2>&1; then
+                echo "wl-copy"; return 0
+            fi
+            command -v xclip >/dev/null 2>&1 && { echo "xclip -selection clipboard"; return 0; }
+            command -v xsel  >/dev/null 2>&1 && { echo "xsel --clipboard --input"; return 0; }
+            ;;
+    esac
+    return 1
+}
+
 # Mirror the upper/lower-case spellings of the proxy env vars so git's libcurl
 # picks them up regardless of which it checks (libcurl special-cases lowercase
 # `http_proxy`; HTTPS honors either case). Fills a missing side from a present

@@ -129,6 +129,39 @@ where forwarding the raw host `TERM` would not be. They are deliberately NOT
 listed in `.env.example` (kept out of the default `.env`); set them inline when
 needed. Typical use: `OPENTUI_FORCE_EXPLICIT_WIDTH=0 harness opencode`.
 
+### Clipboard bridge (container copy -> host clipboard)
+
+opencode copies by emitting OSC 52 **and** shelling out to a native clipboard
+binary (`xclip`/`xsel`/`wl-copy`). Inside the container the native path has no
+clipboard to write to (no display, no tool), and the OSC 52 path only reaches
+the host clipboard if the terminal honors OSC 52 write (on Windows it survives
+the ConPTY `-it` path but not the winpty fallback used by plain Git Bash). The
+clipboard bridge gives a terminal-independent path for the copy direction.
+
+It is **opt-in** (`HARNESS_CLIPBOARD=1 harness opencode`) and off by default
+because it lets the container write the host clipboard. Design is deliberately
+minimal: no network, no daemon, no firewall change, no new runtime dependency.
+
+- **Container side** (`agents/clipboard-bridge.sh`, baked into the image and
+  symlinked as `xclip`/`xsel`/`wl-copy`): opencode's native copy lands here; the
+  shim base64-encodes the text to a single line and overwrites the bridge file
+  at `$HARNESS_CLIPBOARD_FILE` (`/run/harness-clipboard`). Truncate-write keeps
+  the single-file bind mount's inode (a rename would break it). Paste/read
+  invocations (`-o`, `wl-paste`) are a no-op success. With no
+  `HARNESS_CLIPBOARD_FILE` set (bridge off) the shim swallows stdin and exits 0,
+  so default container behavior is unchanged.
+- **Host side** (`run_agent_interactive` + `_harness_clip_reader` in `harness`,
+  `harness_host_clipboard_cmd` in `scripts/lib/platform.sh`): when opted in and a
+  host clipboard tool exists (`clip.exe` Windows / `pbcopy` macOS /
+  `xclip`/`wl-copy` Linux), harness `mktemp`s the bridge file, bind-mounts it at
+  `/run/harness-clipboard`, sets `HARNESS_CLIPBOARD_FILE`, and starts a
+  background reader that polls the file and pipes each new value to the host
+  clipboard command. The reader self-terminates when the parent harness PID dies
+  (never orphans) and removes the temp file on exit; harness also kills it and
+  removes the file on normal session exit. Only the interactive launch wires
+  this in (print/`-p` mode is headless). The feature needs the agent image
+  rebuilt (`harness upgrade`) to pick up the shim.
+
 ### Headless `-p` output recovery
 
 `run_opencode`'s `HARNESS_PRINT_MODE` branch (`harness -p` / `harness

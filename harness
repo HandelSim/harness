@@ -3832,6 +3832,32 @@ _print_agent_issue_footer() {
     echo "  https://github.com/HandelSim/harness/issues" >&2
 }
 
+# Clipboard bridge, host side. Background loop that watches the shared bridge
+# file the container shim writes to (base64, one line) and pushes each new
+# value onto the host clipboard via the OS-native command. Self-terminates when
+# the parent harness PID dies (so it can never orphan), and removes the bridge
+# file on exit. Started only for an opt-in interactive launch; see
+# run_agent_interactive and architecture/containers.md.
+# Args: <bridge_file> <parent_pid> <clip_cmd> [clip_args...]
+_harness_clip_reader() {
+    local file="$1" parent="$2"; shift 2
+    local clip=("$@")
+    trap 'rm -f "$file" 2>/dev/null' EXIT
+    local prev="" cur dec
+    while sleep 0.3; do
+        kill -0 "$parent" 2>/dev/null || exit 0
+        [[ -s "$file" ]] || continue
+        cur=$(cat "$file" 2>/dev/null) || continue
+        [[ "$cur" == "$prev" ]] && continue
+        # Decode the whole frame; a half-written file fails to decode and is
+        # retried on the next tick rather than pushing a truncated value.
+        dec=$(printf '%s' "$cur" | base64 -d 2>/dev/null) || continue
+        [[ -n "$dec" ]] || continue
+        printf '%s' "$dec" | "${clip[@]}" >/dev/null 2>&1 || true
+        prev="$cur"
+    done
+}
+
 run_agent_interactive() {
     local tool="$1" yolo="$2" net_open="$3" mount_path="$4" image="$5"
     local agent_home="$6" network="$7" mounts_blob="$8"
@@ -3928,6 +3954,26 @@ run_agent_interactive() {
             harness_add_bind_mount docker_args "$em_host" "$em"
         done
     fi
+    # Optional clipboard bridge (opt-in: HARNESS_CLIPBOARD=1). Routes opencode's
+    # in-container copy onto the HOST clipboard through a single bind-mounted
+    # file plus a host reader, with no network and no firewall change. Off by
+    # default because it lets the container write the host clipboard; enable per
+    # launch (`HARNESS_CLIPBOARD=1 harness opencode`). See architecture/containers.md.
+    local _clip_file="" _clip_pid="" _clip_cmd
+    if [[ "${HARNESS_CLIPBOARD:-}" == "1" ]]; then
+        if _clip_cmd=$(harness_host_clipboard_cmd); then
+            _clip_file=$(mktemp "${TMPDIR:-/tmp}/harness-clip.XXXXXX")
+            local _clip_src
+            _clip_src=$(harness_docker_path "$_clip_file")
+            harness_add_bind_mount docker_args "$_clip_src" "/run/harness-clipboard"
+            docker_args+=(-e "HARNESS_CLIPBOARD_FILE=/run/harness-clipboard")
+            # shellcheck disable=SC2086
+            _harness_clip_reader "$_clip_file" "$$" $_clip_cmd &
+            _clip_pid=$!
+        else
+            echo "[harness] HARNESS_CLIPBOARD=1 but no host clipboard tool found (need clip.exe on Windows, pbcopy on macOS, or xclip/wl-copy on Linux). Clipboard bridge disabled." >&2
+        fi
+    fi
     docker_args+=(
         -w "$(harness_container_workdir "$mount_path")"
         --label "harness.agent=true"
@@ -3951,6 +3997,14 @@ run_agent_interactive() {
     else
         harness_docker "${docker_args[@]}" || rc=$?
     fi
+    # Tear down the clipboard bridge reader (if started) and drop its temp file.
+    # The reader also self-exits on parent death and rms the file via its own
+    # trap; this is the clean-exit path.
+    if [[ -n "$_clip_pid" ]]; then
+        kill "$_clip_pid" 2>/dev/null || true
+        wait "$_clip_pid" 2>/dev/null || true
+    fi
+    [[ -n "$_clip_file" ]] && rm -f "$_clip_file" 2>/dev/null
     _print_agent_issue_footer
 
     # When this was the LAST agent for the project, tear the shared stack
