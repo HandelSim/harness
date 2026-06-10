@@ -1,6 +1,11 @@
+---
+last_mapped_commit: 4ebbb2c
+last_mapped_date: 2026-06-10
+---
+
 # Coding Conventions
 
-**Analysis Date:** 2026-06-08
+**Analysis Date:** 2026-06-10
 
 Two languages dominate: Bash (the ~6500-line `harness` CLI plus `scripts/lib/*.sh`, `agents/*.sh`, `firewall/*.sh`, installer) and Python (`proxy/proxy.py`, the Flask translating proxy, plus `tests/mock_upstream.py`). Conventions below are split where the two diverge. All claims verified against current files unless marked *(inferred)*.
 
@@ -98,4 +103,4 @@ Checked in CI and/or repo policy — hard constraints when writing code:
 
 ---
 
-*Convention analysis: 2026-06-08*
+*Convention analysis: 2026-06-10*

@@ -1,13 +1,13 @@
 # Codebase Structure
 
-**Analysis Date:** 2026-06-08
+**Analysis Date:** 2026-06-10
 
 ## Directory Layout
 
 ```text
 harness/                         the git clone — IS the install root
-├── harness                      management CLI (one ~6589-line bash script)
-├── harness-install.sh           bootstrap installer
+├── harness                      management CLI (one ~7421-line bash script)
+├── harness-install.sh           bootstrap installer (~41K, one-shot setup)
 ├── docker-compose.yml           proxy + agent service definitions (131 lines)
 ├── .env.example                 documented user config template
 ├── .harness-allowlist.example   egress allowlist template
@@ -32,217 +32,189 @@ harness/                         the git clone — IS the install root
     ├── mcp/<name>/              active container-MCP services (compose + data)
     └── host/                    host-mode runtime state
         ├── venv/                lazy proxy venv (`harness host`)
+        ├── toolchain/           host-mode deps (jq, node, opencode)
         ├── proxy.pid            host proxy pidfile
         ├── proxy.log            host proxy logfile
-        └── opencode.json        scoped opencode config (OPENCODE_CONFIG target)
+        ├── opencode.json        scoped opencode config (OPENCODE_CONFIG target)
+        └── proxy.fp             host proxy config fingerprint
 ```
 
 ## Directory Purposes
 
 **`proxy/`:**
 - Purpose: The translating proxy that fronts the upstream API.
-- Contains: `proxy.py` (the Flask app, ~2516 lines), `Dockerfile`,
-  `entrypoint.sh` (runs `init-firewall.sh` then `python3 proxy.py`),
-  `requirements.txt` (two pure-python wheels — also installed into the host-mode
-  venv), `test_proxy.py` (unit tests run inside the proxy container).
+- Contains: `proxy.py` (the Flask app, ~2558 lines), `Dockerfile`, `entrypoint.sh` (runs `init-firewall.sh` then `python3 proxy.py`), `requirements.txt` (two pure-python wheels — also installed into the host-mode venv), `test_proxy.py` (unit tests run inside the proxy container).
 - Key files: `proxy/proxy.py`, `proxy/test_proxy.py`.
 
 **`agents/`:**
-- Purpose: The single image backing both agent modes (opencode, shell).
-- Contains: `Dockerfile` (pins `OPENCODE_VERSION`), `entrypoint.sh` (firewall,
-  UID remap, gosu drop, git creds, skel seed, mode dispatch, opencode config).
+- Purpose: The unified agent container image (opencode and/or shell mode).
+- Contains: `Dockerfile` (builds the image, pins opencode + Node + jq versions), `entrypoint.sh` (~372 lines, the runtime dispatch point — firewall, UID remap, gosu drop, config, mode dispatch), `clipboard-bridge.sh` (OSC 52 clipboard bridge shim), `requirements.txt` (Python deps for opencode compatibility).
 - Key files: `agents/Dockerfile`, `agents/entrypoint.sh`.
+- Note: Single image backs both `opencode` and `shell` modes; mode is selected at runtime.
 
 **`firewall/`:**
-- Purpose: Universal egress allowlist gate run at the top of every container
-  (container mode only — absent in host mode).
-- Contains: `init-firewall.sh` (iptables/ipset rules from the allowlist),
-  `configure-git-credentials.sh`, `README.md`.
+- Purpose: Universal egress firewall + git credentials integration.
+- Contains: `init-firewall.sh` (~329 lines, iptables/ipset rules at container startup), `configure-git-credentials.sh` (git credential helper + git-push-enabled hosts), `clipboard-bridge.sh` (OSC 52 copy bridge shim).
 - Key files: `firewall/init-firewall.sh`.
+- Note: Container-bound; host mode has no firewall (defense-in-depth is loopback-only binding).
 
-**`mcp-registry/<name>/`:**
-- Purpose: Vetted, repo-tracked container-MCP definitions.
-- Contains per entry: `compose.yml`, `client-config.json`,
-  `harness-meta.json.template`, `recency.json` (per-tool recency + state-check
-  data), `README.md`. `mcp-registry/serena/` is the reference example.
+**`mcp-registry/`:**
+- Purpose: Versioned, in-repo MCP service definitions.
+- Contains: Per-service directories (e.g. `serena/`), each with:
+  - `compose.yml` — partial compose snippet (joins `harness_harness-net` as external)
+  - `client-config.json` — opencode MCP client config
+  - `harness-meta.json.template` — metadata (repo_clone_url, repo_clone_ref, allowed_domains)
+  - `recency.json` — per-tool one-line guidance (for the hybrid-mode recency reminder)
+  - `README.md` — operator-facing docs
+- Key files: `mcp-registry/serena/` (reference implementation).
 
 **`host-mcp/`:**
-- Purpose: Host (non-container) build MCPs — a process on the host (e.g.
-  MSVC/CMake) the agent can drive. New top-level concern.
-- Contains: `template/` (`project.json`, `server.py`, `run.sh`,
-  `requirements.txt`, `AGENTS.md`, `README.md`) copied by `harness mcp
-  host-init`; per-name instance dirs created by `host-setup` (gitignored).
+- Purpose: Host (non-container) MCP scaffold and instances.
+- Contains: `template/` (scaffold for new host MCPs — `mcp host-init` copies this), `<name>/` (active host MCP instances, gitignored — user-customized servers).
+- Key files: `host-mcp/template/server.py`, `host-mcp/template/AGENTS.md`.
 
 **`scripts/`:**
-- Purpose: Shared bash libraries and the upgrade manifest.
-- Contains: `check_runtime_calls.sh` (lint), `upgrade-manifest.json`, and `lib/`
-  with `platform.sh` (OS/runtime detection, portable realpath, jq helpers, TTY
-  resolution), `net_helpers.sh` (allowlist/overrides JSON, lazily sourced),
-  `upgrade_actions.sh` (envfile_merge / linefile_merge / directory_overwrite).
+- Purpose: Shared bash utility libraries and metadata.
+- Contains:
+  - `lib/platform.sh` — OS detection, container runtime detection, portable realpath, jq helpers, Windows path handling
+  - `lib/net_helpers.sh` — allowlist + override JSON manipulation (lazily sourced)
+  - `lib/upgrade_actions.sh` — actions called by `harness upgrade` (envfile_merge, linefile_merge, directory_overwrite)
+  - `upgrade-manifest.json` — what gets upgraded and how (registry_actions, etc.)
+- Key files: `scripts/lib/platform.sh`, `scripts/upgrade-manifest.json`.
 
 **`tests/`:**
-- Purpose: The full test suite, mostly bash, plus the proxy unit tests.
-- Contains: per-area `*_test.sh`, `mock_upstream.py`, `fixtures/`, `lib/`,
-  `benchmarks/`, and the `INVENTORY.md` / `COVERAGE.md` inventories.
+- Purpose: Test suite (docker-free + docker-based paths).
+- Contains: `harness_test.sh`, `unit_host_test.sh`, `unit_host_toolchain_test.sh` (bash unit tests), `proxy_test.sh` (integration via proxy container), `proxy/test_proxy.py` (Python unit tests in the proxy container), fixtures, benchmarks.
+- Key files: `tests/harness_test.sh`, `tests/unit_host_test.sh`, `tests/proxy_test.sh`.
+- Note: See `tests/INVENTORY.md` and `tests/COVERAGE.md` for detailed coverage.
 
 **`architecture/`:**
-- Purpose: Short, structural per-module docs kept honest with the code.
-- Key files: `README.md` (index), `proxy.md`, `containers.md`, `harness-cli.md`
-  (includes the "Host mode" section), `mcp.md`, `upstream-api.md`,
-  `install-and-upgrade.md`, `tests.md`.
+- Purpose: Per-module detailed architecture docs (referenced from `.CLAUDE.md` workflow router).
+- Contains: `README.md`, `harness-cli.md`, `proxy.md`, `containers.md`, `mcp.md`, `upstream-api.md`, `install-and-upgrade.md`, `tests.md`.
+- Loaded by the agent during issue work to understand the system being modified.
 
 **`docs/`:**
-- Purpose: Runtime-specific operator notes (`PODMAN.md`, `WINDOWS.md`).
+- Purpose: Runtime-specific operator notes.
+- Contains: `PODMAN.md` (podman-specific setup), `WINDOWS.md` (Windows / Git Bash notes), `hybrid-mode-consolidation/` (historical docs on prompt-mode refactor).
 
-**`.planning/`:**
-- Purpose: GSD planning artifacts and this codebase map (`codebase/*.md`).
-
-**`state/` (gitignored, created at install):**
-- Purpose: All runtime state. `output/` (proxy debug dumps), `agent/home/`
-  (persistent agent home bind mount), `mcp/<name>/` (active container-MCP
-  trees), `host/` (host-mode venv + proxy pidfile/logfile + scoped opencode
-  config), plus generated files `.harness-runtime.yml`,
-  `.harness-net-overrides.json`, `.harness-update-check`.
+**`state/`:**
+- Purpose: Runtime state (gitignored).
+- Contains:
+  - `output/` — proxy per-request debug dumps (when `OUTPUT_DIR` is set)
+  - `agent/home/` — shared agent home (bind-mounted into every agent; survives rebuilds)
+  - `mcp/<name>/` — active MCP services (compose snippets, client config, enabled flag, data directory)
+  - `host/` — host-mode runtime state (proxy venv, toolchain, pids, logs, opencode config)
 
 ## Key File Locations
 
 **Entry Points:**
-- `harness`: the management CLI; `main()` at `harness:6519`. Bare invocation or
-  a leading agent flag launches an opencode agent (container mode).
-- `proxy/proxy.py`: the Flask app; `main()` at `proxy/proxy.py:2472`, request
-  handler `catch_all` at `proxy/proxy.py:2177`, models passthrough `list_models`
-  at `proxy/proxy.py:2131`.
-- `agents/entrypoint.sh`: agent container entrypoint, dispatches opencode/shell.
-- `harness-install.sh`: bootstrap installer.
+- `harness` — CLI entry point (bash); spawned by user or orchestrator
+- `proxy/proxy.py` — Proxy entry point (Python); module load runs config validation, Flask routes setup
+- `agents/entrypoint.sh` — Container entry point (bash); firewall + privilege drop + mode dispatch
 
 **Configuration:**
-- `docker-compose.yml`: proxy + agent services, harness-net, cap_add, sysctls.
-- `.env` (gitignored; `.env.example` is the template): user config
-  (`PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME`, mounts, etc.).
-- `.harness-allowlist` (gitignored; `.harness-allowlist.example`): egress hosts.
-- `scripts/upgrade-manifest.json`: how `harness upgrade` brings forward state.
-- `state/host/opencode.json`: scoped opencode config for host mode
-  (`OPENCODE_CONFIG` target; the user's global config is never touched).
+- `.env` — User env config (gitignored; created from `.env.example`)
+- `.harness-allowlist` — Egress allowlist (gitignored; created from `.harness-allowlist.example`)
+- `docker-compose.yml` — Service definitions (tracked; read at `harness start` time)
+- `scripts/upgrade-manifest.json` — Upgrade actions (tracked; read by `harness upgrade`)
 
 **Core Logic:**
-- `proxy/proxy.py`: translation, cooperative-prompt injection, tool-call
-  extraction, meta-tool serving, malformed/empty-response recovery, SSE/JSON
-  emission.
-- `harness`: orchestration — compose wrapper (`compose()`, `harness:865`),
-  runtime override (`write_runtime_override()`, `harness:779`), container agent
-  launch (`run_agent`, `harness:3047`; `cmd_shell`, `harness:3508`), host mode
-  (`cmd_host`, `harness:2990`; `host_*` helpers `harness:2618`–`2988`).
-- `scripts/lib/*.sh`: cross-cutting bash helpers.
+- `harness` — CLI dispatch, service lifecycle, agent launch (7421 lines)
+- `proxy/proxy.py` — OpenAI-compat endpoint, upstream translation, tool injection (2558 lines)
+- `agents/entrypoint.sh` — Container setup, mode dispatch (372 lines)
+- `firewall/init-firewall.sh` — Iptables/ipset rules (329 lines)
 
 **Testing:**
-- `tests/*_test.sh`: per-area suites (proxy, harness, firewall, mcp,
-  persistence, scheme_contract, integration, full_pipeline, upgrade, podman).
-- `proxy/test_proxy.py`: proxy unit tests.
-- `tests/mock_upstream.py`, `tests/fixtures/`, `tests/lib/`.
+- `tests/harness_test.sh` — CLI unit tests (docker-free)
+- `tests/unit_host_test.sh` — Host-mode unit tests (docker-free)
+- `tests/unit_host_toolchain_test.sh` — Toolchain provisioner tests (docker-free)
+- `proxy/test_proxy.py` — Proxy unit tests (run in proxy container)
+- `tests/proxy_test.sh` — Proxy integration tests
 
 ## Naming Conventions
 
 **Files:**
-- CLI subcommand handlers: `cmd_<name>()` inside `harness`.
-- Host-mode helpers: `host_<verb>()` (`host_preflight`, `host_proxy_start`,
-  `host_write_opencode_config`); host path accessors return their path
-  (`host_proxy_pidfile`, `host_opencode_config`, `host_venv_dir`).
-- Proxy private helpers: leading underscore (`_normalize_api_base`,
-  `_scan_balanced_json`, `_setup_prompt_mode`, `_serve_meta_tools`).
-- Test suites: `<area>_test.sh`; unit suites `unit_<area>_test.sh`.
-- Architecture docs: lowercase-hyphen `.md` matching the module.
+- `harness` — main CLI (no suffix)
+- `<cmd>_test.sh` — test file (bash)
+- `test_<module>.py` — test file (Python)
+- `init-<service>.sh` — initialization script (entry point)
+- `*.template` — template file (substitution happens at install time)
+- `compose.yml` — compose snippet (lowercase `.yml`)
 
 **Directories:**
-- Per-module top-level dirs named for their artifact (`proxy/`, `agents/`,
-  `firewall/`, `host-mcp/`).
-- Per-entry MCP dirs keyed by service name (`mcp-registry/serena/`,
-  `state/mcp/<name>/`, `host-mcp/<name>/`).
+- `mcp-registry/<name>/` — MCP service (kebab-case; matches service name in compose)
+- `host-mcp/<name>/` — Host MCP instance (kebab-case; user-defined name)
+- `state/mcp/<name>/` — Active (installed) MCP directory (kebab-case; matches `mcp-registry/<name>/`)
+- `state/output/` — Debug output (per-request files named `<req_id>_<seqnum>_<purpose>.json`)
+
+**Functions (bash):**
+- `cmd_<name>` — Subcommand handler (e.g. `cmd_start`, `cmd_opencode`)
+- `run_<thing>` — Runner/launch function (e.g. `run_agent`, `host_run_opencode`)
+- `<verb>_<noun>` — Action function (e.g. `ensure_services_up`, `stop_stack_if_last_agent`)
+- `_<name>` — Internal helper (leading underscore)
+
+**Functions (Python):**
+- `catch_all(path)` — Flask route handler (catch-all, *not* named after HTTP verb)
+- `translate_<thing>` — Transformation function
+- `extract_<thing>` — Parser/extractor function
+- `format_<thing>` — Formatter function
+- `_<name>` — Internal helper (leading underscore)
+
+**Environment Variables:**
+- `UPPERCASE_SNAKE_CASE` — Config (e.g. `PROXY_API_URL`, `DEFAULT_MODEL_NAME`)
+- `HARNESS_*` — Harness-specific (e.g. `HARNESS_FIREWALL_DISABLED`, `HARNESS_HOST_OS`)
 
 ## Where to Add New Code
 
-**New proxy behavior (translation, prompt mode, tool handling):**
-- Primary code: `proxy/proxy.py` (single file by design).
-- Tests: `proxy/test_proxy.py` (unit) and/or `tests/proxy_test.sh` (integration).
-- Update `architecture/proxy.md` in the same commit if behavior changes.
+**New Feature:**
+- If it's a CLI subcommand: add a `cmd_<name>` function in `harness`
+- If it's proxy logic (endpoint, tool handling, etc.): add to `proxy/proxy.py`
+- If it's agent behavior: modify `agents/entrypoint.sh` or the agent image's `Dockerfile`
 
-**New CLI subcommand or flag:**
-- Implementation: a `cmd_<name>()` in `harness`; register it in `cmd_help`
-  (`harness:1326`, the canonical subcommand list) and the dispatch in `main()`
-  (`harness:6519`).
-- Tests: `tests/harness_test.sh` (or a new `tests/harness_*_test.sh`).
-- Update `architecture/harness-cli.md`.
+**New MCP Service (vetted):**
+- Create `mcp-registry/<name>/` with the four-file contract (`compose.yml`, `client-config.json`, `harness-meta.json.template`, `recency.json`, `README.md`)
+- Add entry to `scripts/upgrade-manifest.json` (if it should auto-upgrade)
 
-**New host-mode behavior:**
-- Add a `host_*` helper alongside the existing block (`harness:2608`+); reuse
-  the pidfile/logfile/venv path accessors. Host mode is deliberately minimal
-  (single CWD, no host-MCP wiring beyond setup, Linux/macOS only) — keep new
-  surface gated by `host_confirm_gate`. Update `architecture/harness-cli.md`
-  ("Host mode") and `architecture/containers.md` ("Host mode has no firewall").
+**New Test:**
+- Docker-free (preferred for CI speed): add to `tests/harness_test.sh` or `tests/unit_host_test.sh`
+- Docker-based: add to `tests/proxy_test.sh` or `proxy/test_proxy.py`
+- See `tests/INVENTORY.md` for test organization
 
-**New shared bash helper:**
-- Add to the matching `scripts/lib/*.sh` (`platform.sh`, `net_helpers.sh`,
-  `upgrade_actions.sh`), keeping `net_helpers.sh` lazily sourced.
+**Utility Library:**
+- Bash helpers: add function to `scripts/lib/platform.sh` (platform-specific) or `scripts/lib/net_helpers.sh` (network/firewall)
+- Python utilities: keep them in-file in `proxy/proxy.py` (single-file design; no module split)
 
-**New container MCP service:**
-- Vetted/shared: `mcp-registry/<name>/` with the file contract (`compose.yml`,
-  `client-config.json`, `harness-meta.json.template`, `recency.json`,
-  `README.md`); add a `registry_actions` entry to
-  `scripts/upgrade-manifest.json`.
-- One-off/private: `harness mcp register <name> --from <dir|git-url>`. See
-  `architecture/mcp.md`.
-
-**New host MCP:**
-- `harness mcp host-init <name>` scaffolds from `host-mcp/template/`;
-  `harness mcp host-setup <name>` launches the agent that tailors it. See
-  `architecture/mcp.md` "Host MCPs".
-
-**New container service:**
-- Add to `docker-compose.yml`; attach to `harness-net`; apply the firewall
-  contract (`cap_add: NET_ADMIN, NET_RAW`, IPv6-disable sysctl, allowlist
-  mount). Update `architecture/containers.md`.
+**Architecture Documentation:**
+- Per-module deep-dive: edit the relevant file in `architecture/` (e.g. `architecture/harness-cli.md`)
+- System overview: edit `architecture/README.md`
+- Update the doc **in the same commit** as the code change (see `CLAUDE.md` → "Doc-update rule")
 
 ## Special Directories
 
-**`state/`:**
-- Purpose: All runtime state and generated config.
-- Generated: Yes (created at install; many files regenerated per invocation).
-- Committed: No (gitignored).
+**`state/output/`:**
+- Purpose: Proxy per-request debug dumps (when `OUTPUT_DIR` is set in `.env`)
+- Generated: Yes (by `proxy/proxy.py` on each request)
+- Committed: No (gitignored)
+- Format: JSON dumps named `<req_id>_<seqnum>_<purpose>.json` (e.g. `20260610_123456_789_01_Inbound_Request.json`)
 
 **`state/agent/home/`:**
-- Purpose: The single persistent agent home bind-mounted into every agent.
-- Generated: Yes (seeded from `/etc/skel/harness/` on first run).
-- Committed: No.
+- Purpose: Shared agent home directory (persistent across container rebuilds)
+- Generated: Yes (on first agent launch; seeded from `/etc/skel/harness/` in the image)
+- Committed: No (gitignored)
+- Lifecycle: Survives container rebuilds; shared across all agent invocations
+
+**`state/mcp/<name>/`:**
+- Purpose: Active (installed/registered) MCP service directory
+- Generated: Yes (by `harness mcp install` or `harness mcp register`)
+- Committed: No (gitignored)
+- Contains: `compose.yml`, `client-config.json`, `harness-meta.json` (metadata), `data/` (per-MCP runtime state), `repo/` (cloned source if from git)
 
 **`state/host/`:**
-- Purpose: Host-mode runtime — lazy proxy venv, proxy pidfile/logfile, scoped
-  `opencode.json`.
-- Generated: Yes (created on first `harness host`; venv re-pipped on
-  requirements hash change).
-- Committed: No.
-
-**`mcp-registry/`:**
-- Purpose: Repo-tracked container-MCP definitions (source for `mcp install`).
-- Generated: No. Committed: Yes.
-
-**`host-mcp/template/`:**
-- Purpose: Repo-tracked scaffold for host build MCPs.
-- Generated: No. Committed: Yes (per-name instance dirs under `host-mcp/` are
-  gitignored).
-
-## Monolith Note
-
-Two files carry most of the system and are intentionally single-file:
-
-- `harness` — ~6589 lines. One bash script: self-locate, env load, compose
-  wrapper, runtime override, container agent launch, host mode, net, MCP,
-  doctor/preflight, update/upgrade. `cmd_help` is the canonical subcommand list.
-- `proxy/proxy.py` — ~2516 lines. One Flask app: translation, cooperative-prompt
-  modes, tool-call extraction, meta-tool serving, malformed/empty-response
-  recovery, SSE/JSON emission, config validation, debug dumps.
-
-When adding to either, follow the existing in-file section ordering rather than
-splitting the file.
+- Purpose: Host-mode (`harness host`) runtime state
+- Generated: Yes (on first host launch or when config changes)
+- Committed: No (gitignored)
+- Contains: `venv/` (Python venv for proxy), `toolchain/` (vendored jq, node, opencode), `proxy.pid`, `proxy.log`, `proxy.fp` (config fingerprint), `opencode.json` (scoped config)
 
 ---
 
-*Structure analysis: 2026-06-08*
+*Structure analysis: 2026-06-10*

@@ -1,10 +1,15 @@
+---
+last_mapped_commit: 4ebbb2c
+last_mapped_date: 2026-06-10
+---
+
 # Testing Patterns
 
-**Analysis Date:** 2026-06-08
+**Analysis Date:** 2026-06-10
 
 Tests live under `tests/`. Two canonical maps live beside the suites and must be kept current when behavior changes:
-- `tests/INVENTORY.md` — every atomic testable behavior, one stable ID per row (F### CLI, P### proxy, A### agent entrypoint, M### MCP, N### firewall, U### upgrade, Pe### persistence, I### installer). 372 IDs as of this audit.
-- `tests/COVERAGE.md` — maps each inventory ID to the test(s) that exercise it with green/yellow/red status, file:line evidence, and a per-prefix breakdown. Current headline: **243 green (66.3%), 5 yellow, 118 red (32.2%)**. Includes a spot-check log (introduce a regression, confirm RED, revert, confirm GREEN) proving selected assertions are load-bearing.
+- `tests/INVENTORY.md` — every atomic testable behavior, one stable ID per row (F### CLI, P### proxy, A### agent entrypoint, M### MCP, N### firewall, U### upgrade, Pe### persistence, I### installer). 372 IDs as of 2026-06-08 audit.
+- `tests/COVERAGE.md` — maps each inventory ID to the test(s) that exercise it with green/yellow/red status, file:line evidence, and a per-prefix breakdown. Includes a spot-check log (introduce a regression, confirm RED, revert, confirm GREEN) proving selected assertions are load-bearing.
 
 ## Test Framework
 
@@ -12,7 +17,7 @@ Tests live under `tests/`. Two canonical maps live beside the suites and must be
 
 **Python:** `proxy/test_proxy.py` (~1017 lines) uses the stdlib `unittest` module (`TestXxx` classes, `test_<behavior>` methods), driven via `python -m unittest`. `tests/proxy_test.sh` Scenario delegates to it.
 
-**Shared fixtures:** `tests/lib/test_helpers.sh` (sourceable; no assertions) supplies `require_docker`, `test_generate_env`, `test_generate_mockupstream_override`, `test_wait_for_healthy`, and sources `scripts/lib/platform.sh` so suites inherit `harness_docker` etc. Extracted to kill setup duplication across `proxy_test.sh` / `firewall_test.sh` / `full_pipeline_test.sh`.
+**Shared fixtures:** `tests/lib/test_helpers.sh` (sourceable; no assertions) supplies `require_docker`, `test_section`, `test_generate_env`, `test_generate_mockupstream_override`, `test_generate_allowlist`, `test_start_mockupstream`, `test_wait_for_healthy`, and sources `scripts/lib/platform.sh` so suites inherit `harness_docker` etc. Extracted to kill setup duplication across `proxy_test.sh` / `firewall_test.sh` / `full_pipeline_test.sh` / `harness_test.sh`.
 
 **Mock upstream:** `tests/mock_upstream.py` is a fake chat-completions server used as a compose sidecar by docker-based suites. It returns only 200 — error-path behaviors (P037-P042) are red because it can't yet emit 401/403/429/5xx.
 
@@ -38,8 +43,13 @@ This split is the single most important testing fact: issue-handling agents run 
 - `tests/upgrade_test.sh` (no docker) — `envfile_merge`, `linefile_merge`, `directory_overwrite`, `_upgrade_confirm`, `_git_branches_diverged`, synthetic N→N+1 upgrade, rsync fallback, standalone `harness_jq`.
 - `tests/unit_platform_timer_test.sh` — `harness_start_docker_desktop` poll-timeout logic with stubbed daemon probes.
 - `tests/unit_workdir_test.sh` — Git Bash path translation (`harness_abs_path`, `harness_container_workdir`, MSYS env guards, issue #112).
+- `tests/unit_host_test.sh` — host-mode CLI surface, proxy startup, loopback-only binding, model-list discovery.
+- `tests/unit_host_toolchain_test.sh` — host-mode dependency checks (`host_preflight`), node-version parsing, jq/Node/opencode vendoring + venv provisioning.
+- `tests/unit_host_upgrade_test.sh` — host-mode upgrade safety (`.harness-state.json` migration, venv preservation).
 - `tests/unit_host_mcp_test.sh` — host-MCP CLI surface (`mcp host-init`/`host-setup`, register, list/status/up/down/logs host branches) against a tmp `HARNESS_INSTALL_ROOT`, no docker / no real server spawn.
 - `tests/unit_host_mcp_net_test.sh` — docker-free host-MCP net helpers.
+- `tests/unit_clipboard_test.sh` — clipboard bridge enable/disable, copy-to-host container escape path.
+- `tests/unit_net_open_test.sh` — firewall opt-out (`net open`/`net close`), JSON override file manipulation.
 - Also docker-free but NOT in the `unit` glob (run via `bash` directly or as their own CI section): `tests/harness_test.sh` sources the wrapper under `HARNESS_SOURCE_ONLY=1` and stubs `ensure_services_up`, so most of its CLI/doctor/net/upgrade-flag tests run without docker.
 
 **Docker-BASED (CI only; never run from an issue agent per CLAUDE.md):** `tests/proxy_test.sh`, `tests/harness_test.sh` (its container assertions), `tests/persistence_test.sh`, `tests/mcp_test.sh`, `tests/firewall_test.sh`, `tests/scheme_contract_test.sh`. These bring up compose + mock upstream.
@@ -51,7 +61,7 @@ This split is the single most important testing fact: issue-handling agents run 
 Parallel jobs, each its own GitHub Actions job:
 1. **lint** — `bash -n` on all shell scripts (blocking), `scripts/check_runtime_calls.sh` (no raw `docker` calls), `shellcheck` (advisory, `additional_files` list).
 2. **unit** — `bash ./harness test unit` (the docker-free slice).
-3. **docker / ${{ matrix.test }}** — matrix of docker-based suites, each `bash tests/${{ matrix.test }}.sh`. Relocates the Docker data-root to `/mnt` (66 GB vs ~8 GB) and caches Buildx layers because images are multi-GB.
+3. **docker / ${{ matrix.test }}** — matrix of docker-based suites, each `bash tests/${{ matrix.test }}.sh`. Relocates the Docker data-root to `/mnt` (66 GB vs ~8 GB) and caches Buildx layers because images are multi-GB. Matrix includes: `harness_test`, `proxy_test`, `persistence_test`, `mcp_test`, `firewall_test`.
 4. **full_pipeline_test** — own job, full image build.
 5. **integration (slow)** — own job with `HARNESS_RUN_SLOW: "1"` + pipx.
 6. **scheme_contract** — own job.
@@ -76,28 +86,13 @@ CI runs the full matrix on every push/PR to `dev`/`main`. The reason the docker-
 
 ## What's Tested vs Gaps (from COVERAGE.md)
 
-Strong (green): proxy translation core (P019-P036, ~all of `test_proxy.py`), CLI surface/doctor/preflight/net-allow/upgrade-actions (F, U prefixes), MCP lifecycle incl. dynamic `register` (M/TR1-TR10), installer layout + platform primitives (I).
+Strong (green): proxy translation core (P019-P036, ~all of `test_proxy.py`), CLI surface/doctor/preflight/net-allow/upgrade-actions (F, U prefixes), MCP lifecycle incl. dynamic `register` (M/TR1-TR10), installer layout + platform primitives (I), new host-mode (host_preflight, host_confirm_gate, host_proxy_ensure_venv, cmd_host covered by unit tests added 2026-06-08+).
 
 Persistent red clusters (don't assume coverage exists):
 - **Proxy error forwarding P037-P042** (401/403/429/5xx/502) and **debug-dump files P043-P050** — entirely red; the mock upstream only returns 200 and `OUTPUT_DIR` is set empty to bypass dumps.
 - **Firewall rule introspection N002-N011, N015-N016, N019-N028** — mostly red; no test reads back iptables/ipset state from a clean init. Only bypass (N001/N017) and one negative (N018) are covered.
-- **Interactive/401-gated CLI surfaces** F045 (`shell`), F057-F061 (`stop`/`pick_agent`), F081-F092 (`net open`/`close`/`unlock`) — red, hard to drive without a TTY or 401 mock.
-
-## Host-Mode (`harness host`) Coverage — GAP, flag this
-
-The containerless launch mode added in the most recent commit (`Add containerless 'harness host' mode (P1)`) is **not yet covered by any test.** Verified by grepping `tests/` for the function names: **zero hits** for `host_preflight`, `host_confirm_gate`, `host_proxy_ensure_venv`, `host_proxy_start`, `host_proxy_stop`, `cmd_host`, `cmd_host_down`, or `harness host`.
-
-Do not confuse this with the host-**MCP** tests. `tests/unit_host_mcp_test.sh`, `tests/unit_host_mcp_net_test.sh`, and `tests/host_mcp_e2e_test.sh` cover `harness mcp host-init`/`host-setup` (non-container MCP *registration*) — a different subsystem. The `harness host` launch path (`harness:2606-3030`) has no inventory IDs in `tests/INVENTORY.md` and no rows in `tests/COVERAGE.md`.
-
-Untested host-mode behaviors that warrant coverage (all in `harness`):
-- `host_preflight` (`:2647`) — the python3 / jq / Node >= 20 / opencode dependency checks and the Node-version parse (`node --version | sed -E 's/^v?([0-9]+).*/\1/'`, fails when `major < 20`). No docker needed → a docker-free unit test is feasible by stubbing `command -v`/`node`.
-- `host_confirm_gate` (`:2710`) — the mandatory no-isolation warning, `HARNESS_HOST_CONFIRM=1` bypass, `--yolo` line, and the `/dev/tty`-absent refusal. Directly unit-testable (mirror `_upgrade_confirm`'s test pattern, which is green).
-- `host_require_config` (`:2687`) — the three-required-var check (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`) and missing-`.env` abort.
-- `host_proxy_ensure_venv` (`:2751`) — the sha256-stamped lazy venv build (only the pip-skip-when-stamp-matches branch is unit-friendly; the venv create is slow).
-- `cmd_host` / `cmd_host_down` (`:2990`, `:3025`) dispatch, including the `harness host down` proxy-stop path.
-
-Recommended: add a `tests/unit_host_mode_test.sh` (docker-free, picked up by `harness test unit` via the `unit_*_test.sh` glob) covering `host_preflight` and `host_confirm_gate` at minimum, and add F-prefix inventory rows so `COVERAGE.md` tracks the new surface. Until then, host mode is shipping untested.
+- **Interactive/401-gated CLI surfaces** F045 (`shell`), F057-F061 (`stop`/`pick_agent`), F081-F092 (`net open`/`close`/`unlock` interactive) — red, hard to drive without a TTY or 401 mock.
 
 ---
 
-*Testing analysis: 2026-06-08*
+*Testing analysis: 2026-06-10*
