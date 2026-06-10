@@ -117,7 +117,9 @@ validator in `_setup_prompt_mode` accepts:
   you to run" persona, issue #109; the JSON envelope and the
   no-fabricated-results rule; prefer-a-listed-tool guidance with
   `webfetch` over curl as the worked example; track non-trivial work with
-  `todowrite`; launch `task` agents in parallel when independent; pointer
+  `todowrite`; launch `task` agents in parallel when independent (capped
+  at 8 concurrent, each briefed in full since a sub-agent does not share
+  the parent's context); pointer
   back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions),
   **Honesty** (anti-fabrication: no invented names/paths/signatures/
   citations; **plus** the addition from issue #110: any claim about the

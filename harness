@@ -2769,16 +2769,23 @@ host_node_dir()     { printf '%s/host/toolchain/node' "$state_root"; }  # extrac
 host_opencode_dir() { printf '%s/host/toolchain/opencode' "$state_root"; } # npm --prefix target for opencode
 
 # A fingerprint of the config the running proxy captured when it started: the
-# bind port plus the required upstream vars and the opt-in OUTPUT_DIR. Stored
-# beside the pidfile; host_proxy_start compares it against the current .env so
-# an edited config (new port / url / key / model) restarts the proxy instead of
-# silently reusing a stale one — and a port change can't strand the readiness
-# probe on a port nothing is listening on (CONCERNS M2).
+# bind port plus the required upstream vars, the opt-in OUTPUT_DIR, and the
+# proxy's requirements.txt content. Stored beside the pidfile; host_proxy_start
+# compares it against the current state so an edited config (new port / url /
+# key / model) restarts the proxy instead of silently reusing a stale one, and a
+# port change can't strand the readiness probe on a port nothing is listening on
+# (CONCERNS M2). The requirements content is folded in so an `upgrade` that bumps
+# a proxy dep (flask/requests) restarts the proxy too: the reuse short-circuit in
+# host_proxy_start returns BEFORE host_proxy_ensure_venv runs, so without this a
+# running proxy keeps serving the old venv even after the pin changed. (upgrade
+# already stops a running proxy as a separate safeguard; folding reqs in here
+# makes deps-change-restart self-contained and independent of that contract.)
 host_proxy_fingerprint() {
     local data
-    data=$(printf 'port=%s\nurl=%s\nkey=%s\nmodel=%s\noutput=%s\n' \
+    data=$(printf 'port=%s\nurl=%s\nkey=%s\nmodel=%s\noutput=%s\nreqs=%s\n' \
         "$(host_proxy_port)" "${PROXY_API_URL:-}" "${PROXY_API_KEY:-}" \
-        "${DEFAULT_MODEL_NAME:-}" "${OUTPUT_DIR:-}")
+        "${DEFAULT_MODEL_NAME:-}" "${OUTPUT_DIR:-}" \
+        "$(cat "$clone_dir/proxy/requirements.txt" 2>/dev/null)")
     if command -v sha256sum >/dev/null 2>&1; then
         printf '%s' "$data" | sha256sum | cut -d' ' -f1
     else

@@ -271,9 +271,12 @@ _HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
     ),
     "task": (
         "Launch a sub-agent. `subagent_type` must match the closed list "
-        "below. Sub-agent output is invisible to the user — summarise it "
-        "back. Launch independent agents in parallel (multiple calls in one "
-        "message)."
+        "below. A sub-agent does NOT share your context — it starts blind, "
+        "so write a self-contained, detailed prompt: state the goal, the "
+        "relevant files/paths, the constraints, and exactly what to return. "
+        "Sub-agent output is invisible to the user — summarise it back. "
+        "Launch independent agents in parallel (multiple calls in one "
+        "message), but spawn at most 8 at a time."
     ),
     "todowrite": (
         "Maintain a structured todo list across the turn. Each item is "
@@ -816,7 +819,8 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
       - "prefer a listed tool over hand-work"
       - "don't downgrade to listing commands for the user to run"
       - "track non-trivial work with `todowrite`; Launch `task` agents
-        in parallel when independent"
+        in parallel when independent, at most 8 at a time, briefing each
+        in full since a sub-agent does not share the parent's context"
       - "if no listed tool fits, just ask or answer"
       - a pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions
 
@@ -880,8 +884,10 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         "(e.g. use `webfetch` for a URL instead of curl or a script), and "
         "don't downgrade to listing commands for the user to run. Track "
         "non-trivial work with `todowrite`. Launch `task` agents — several "
-        "concurrently when the work allows — to parallelize and conserve "
-        "your context. If no opencode tool fits, just ask or answer.\n"
+        "concurrently when the work allows, at most 8 at a time — to "
+        "parallelize and conserve your context; brief each one in full "
+        "because a sub-agent does not share your context. If no opencode "
+        "tool fits, just ask or answer.\n"
         "- Honesty: never fabricate. Do not present guesses as facts — no "
         "invented function names, file paths, signatures, config keys, or "
         "citations. Any claim about the working directory, its contents, or "
