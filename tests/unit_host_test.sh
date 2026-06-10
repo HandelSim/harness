@@ -15,7 +15,7 @@
 #   - host_preflight                fails clearly when deps are absent
 #   - host_write_opencode_config    emits valid JSON, baseURL -> 127.0.0.1,
 #                                   dummy apiKey; and refuses without jq (M4)
-#   - host_proxy_fingerprint        stable, and sensitive to port/key changes (M2)
+#   - host_proxy_fingerprint        stable, and sensitive to port/key/reqs changes (M2)
 #
 # Prints "HOST TEST PASSED" on success.
 
@@ -111,7 +111,18 @@ fp_port=$( PROXY_PORT=9999 PROXY_API_URL=u PROXY_API_KEY=k DEFAULT_MODEL_NAME=m 
 [[ "$fp_port" != "$fp1" ]] || fail "T7: fingerprint should change when PROXY_PORT changes"
 fp_key=$( PROXY_PORT=8000 PROXY_API_URL=u PROXY_API_KEY=DIFFERENT DEFAULT_MODEL_NAME=m host_proxy_fingerprint )
 [[ "$fp_key" != "$fp1" ]] || fail "T7: fingerprint should change when PROXY_API_KEY changes"
-ok "T7: host_proxy_fingerprint is stable and changes on port/key edits"
+# The fingerprint folds in proxy/requirements.txt so a deps-only change (an
+# upgrade that bumps flask/requests) restarts the proxy instead of reusing the
+# stale venv. Override clone_dir per-call (it is a plain sourced global) to point
+# at a fake requirements file; the assignment is discarded with the $(...)
+# subshell, so it never leaks into later tests.
+FAKE_CLONE="$TMP_ROOT/fakeclone"; mkdir -p "$FAKE_CLONE/proxy"
+printf 'flask\nrequests\n' >"$FAKE_CLONE/proxy/requirements.txt"
+fp_r1=$( clone_dir="$FAKE_CLONE" PROXY_PORT=8000 PROXY_API_URL=u PROXY_API_KEY=k DEFAULT_MODEL_NAME=m host_proxy_fingerprint )
+printf 'flask\nrequests\nnewdep==1.0\n' >"$FAKE_CLONE/proxy/requirements.txt"
+fp_r2=$( clone_dir="$FAKE_CLONE" PROXY_PORT=8000 PROXY_API_URL=u PROXY_API_KEY=k DEFAULT_MODEL_NAME=m host_proxy_fingerprint )
+[[ -n "$fp_r1" && "$fp_r1" != "$fp_r2" ]] || fail "T7: fingerprint should change when requirements.txt changes ($fp_r1 / $fp_r2)"
+ok "T7: host_proxy_fingerprint is stable and changes on port/key/requirements edits"
 
 # --- T8: host_python_bin verifies the interpreter, not just command -v ------
 # Regression for the Windows trap: an App-execution-alias stub named python3

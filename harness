@@ -3394,6 +3394,13 @@ host_proxy_stop() {
         sleep 0.2
     done
     kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    if harness_is_git_bash && command -v taskkill >/dev/null 2>&1; then
+        # //T kills the child tree, //F forces it. Double-slash so MSYS doesn't
+        # rewrite the flags into paths. The nohup'd proxy.py is a native Windows
+        # python process MSYS `kill` can't always reach, so without this
+        # `harness host down` can orphan it (mirrors the host_mcp_stop branch).
+        taskkill //PID "$pid" //T //F >/dev/null 2>&1 || true
+    fi
     rm -f "$pf" "$(host_proxy_fpfile)" 2>/dev/null || true
 }
 

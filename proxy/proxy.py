@@ -47,6 +47,13 @@ from flask import Flask, Response, request
 
 # verify=False is required because the upstream uses a self-signed cert.
 # Suppress the noisy InsecureRequestWarning at module load.
+#
+# Security boundary: every upstream call below uses verify=False, so this assumes
+# the network path to PROXY_API_URL is trusted. In container mode the egress
+# firewall allowlists the upstream host, constraining that hop; in host mode
+# there is no firewall, so a network-level MITM on the route to PROXY_API_URL
+# could intercept or alter upstream responses. Cert pinning would require
+# shipping the upstream CA as a runtime artifact and is not done today.
 requests.packages.urllib3.disable_warnings(
     requests.packages.urllib3.exceptions.InsecureRequestWarning
 )

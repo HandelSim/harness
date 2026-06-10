@@ -443,10 +443,14 @@ What it does, in order:
    dumps), so the higher-blast-radius host mode never silently writes every
    prompt to disk. **Config-change detection:** the reuse short-circuit
    (`host_proxy_running`) is gated on a fingerprint (`host_proxy_fingerprint`:
-   port + the required upstream vars + `OUTPUT_DIR`, stored at
-   `state/host/proxy.fp`); if `.env` changed since the proxy started, the stale
-   proxy is stopped and restarted rather than reused with old config (which on a
-   port change would otherwise strand the readiness probe). `host_proxy_wait_ready`
+   port + the required upstream vars + `OUTPUT_DIR` + `proxy/requirements.txt`
+   content, stored at `state/host/proxy.fp`); if any of those changed since the
+   proxy started, the stale proxy is stopped and restarted rather than reused
+   with old config (which on a port change would otherwise strand the readiness
+   probe). Folding the requirements content in matters because the reuse
+   short-circuit returns *before* `host_proxy_ensure_venv`, so an `upgrade` that
+   bumps a proxy dep restarts the running proxy onto the rebuilt venv instead of
+   leaving it on stale deps. `host_proxy_wait_ready`
    polls the loopback port via `/dev/tcp` (the proxy calls `app.run()` last, so
    an accepted connect means it is serving) and tails the log on failure (the
    common cause is `_validate_config` `sys.exit(1)`).
