@@ -150,5 +150,69 @@ if got=$( PATH="$PYBIN_DIR:$PATH" host_python_bin ); then
 fi
 ok "T8: host_python_bin probes --version (rejects the Windows alias stub, falls through to python)"
 
+# --- T9: cmd_host gates on the upstream auth probe like container mode -------
+# Regression: host mode skipped _gate_on_upstream_auth / _print_upstream_models,
+# so a LOCKED key launched opencode anyway. cmd_host must now run the same gate
+# container mode runs in cmd_start, aborting BEFORE host_proxy_start when the key
+# is locked. Mirrors harness_test.sh T0.2/T0.3 (run_agent gate), but for cmd_host.
+#
+# Every pre-gate step is stubbed to a no-op so a non-zero exit can only come from
+# the gate, and host_proxy_start is a sentinel that proves whether the launch
+# advanced past the gate. cmd_host calls `exit`, so each case runs in a subshell.
+host_stub_pregate() {
+    host_require_python3() { :; }
+    host_require_config()  { :; }
+    host_confirm_gate()    { :; }
+    ensure_dirs()          { :; }
+    host_ensure_toolchain() { :; }
+    host_preflight()       { :; }
+}
+
+# T9.1 — locked key (gate rc=1): cmd_host aborts non-zero and never starts the proxy.
+locked_rc=0
+locked_out=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" source "$HARNESS" >/dev/null 2>&1
+    host_stub_pregate
+    _gate_on_upstream_auth() { return 1; }
+    _print_upstream_models() { echo "MODELS_PULLED"; }
+    host_proxy_start() { echo "PROXY_STARTED"; }
+    cmd_host 2>&1
+) || locked_rc=$?
+(( locked_rc != 0 )) || fail "T9.1: cmd_host should exit non-zero when the auth gate returns 1"
+if grep -qE 'PROXY_STARTED|MODELS_PULLED' <<<"$locked_out"; then
+    fail "T9.1: cmd_host advanced past a locked gate (started proxy / pulled models): $locked_out"
+fi
+ok "T9.1: cmd_host aborts before host_proxy_start when the key is locked"
+
+# T9.2 — valid key (gate rc=0): cmd_host advances through the model pull into
+# host_proxy_start (sentinel exits 43 to mark arrival).
+pass_rc=0
+pass_out=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" source "$HARNESS" >/dev/null 2>&1
+    host_stub_pregate
+    _gate_on_upstream_auth() { return 0; }
+    _print_upstream_models() { echo "MODELS_PULLED"; return 0; }
+    host_proxy_start() { echo "PROXY_STARTED"; exit 43; }
+    cmd_host 2>&1
+) || pass_rc=$?
+(( pass_rc == 43 )) || fail "T9.2: expected cmd_host to reach host_proxy_start (rc=43), got $pass_rc — $pass_out"
+grep -q 'MODELS_PULLED' <<<"$pass_out" || fail "T9.2: cmd_host did not pull the model catalog after a passing gate — $pass_out"
+grep -q 'PROXY_STARTED' <<<"$pass_out" || fail "T9.2: cmd_host did not reach host_proxy_start after a passing gate — $pass_out"
+ok "T9.2: cmd_host pulls models and starts the proxy when the key is valid"
+
+# T9.3 — HARNESS_SKIP_AUTH_PROBE=1 bypasses the gate (CI / offline), still launching.
+skip_rc=0
+skip_out=$(
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" source "$HARNESS" >/dev/null 2>&1
+    host_stub_pregate
+    export HARNESS_SKIP_AUTH_PROBE=1
+    # Real gate/print run here; both must short-circuit to success on the skip env
+    # without any curl call. host_proxy_start sentinel marks arrival.
+    host_proxy_start() { echo "PROXY_STARTED"; exit 43; }
+    cmd_host 2>&1
+) || skip_rc=$?
+(( skip_rc == 43 )) || fail "T9.3: HARNESS_SKIP_AUTH_PROBE=1 should bypass the gate and reach the proxy (rc=43), got $skip_rc — $skip_out"
+ok "T9.3: HARNESS_SKIP_AUTH_PROBE=1 bypasses the host auth gate"
+
 echo
 echo "HOST TEST PASSED"

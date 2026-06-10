@@ -3547,6 +3547,21 @@ EOF
     ensure_dirs
     host_ensure_toolchain || exit 1   # fetch jq/Node/opencode (downloads happen here, post-confirm)
     host_preflight || exit 1          # verify the toolchain resolves before launching
+
+    # Same upstream protections container mode applies in cmd_start. Host mode
+    # used to skip both, so a LOCKED key launched opencode anyway and every
+    # request then failed deep inside the proxy with no unlock URL surfaced.
+    # Gate the launch here, AFTER host_preflight so the vendored host jq is on
+    # PATH (the probe prefers jq to recover the unlock URL / catalog, though
+    # _probe_upstream_auth keeps a grep fallback) and BEFORE host_proxy_start so
+    # a dead key never spins up the proxy. Both honor HARNESS_SKIP_AUTH_PROBE=1.
+    _gate_on_upstream_auth || exit 1
+    # Pull + print the upstream model catalog (best-effort; aborts only on a
+    # locked key). This is host mode's equivalent of cmd_start's model pull; with
+    # a valid key the proxy's /v1/models then feeds the opencode model dropdown
+    # in host_write_opencode_config below.
+    _print_upstream_models || exit 1
+
     host_proxy_start || exit 1
     host_proxy_wait_ready || { host_proxy_stop; exit 1; }
     host_write_opencode_config

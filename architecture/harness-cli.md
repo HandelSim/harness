@@ -373,7 +373,20 @@ What it does, in order:
    over the (unfirewalled) network on first use, exactly as the container does.
    `host_preflight` then runs as a post-provision assertion — each of `python3`,
    `jq`, Node, `opencode` must both resolve **and** execute, naming any that fail.
-5. **Proxy supervision** — `host_proxy_start` lazily builds a venv under
+5. **Upstream auth gate + model catalog** — the same two checks container mode
+   runs in `cmd_start`, which host mode previously skipped: `_gate_on_upstream_auth`
+   aborts the launch on a **locked or rejected** key (printing the unlock URL),
+   and `_print_upstream_models` pulls and prints the upstream `/v1/models` catalog
+   (best-effort; also aborts on a locked key). Both run **after** `host_preflight`
+   so the vendored host `jq` is on `PATH` for unlock-URL / catalog parsing
+   (`_probe_upstream_auth` keeps a `grep` fallback regardless) and **before**
+   `host_proxy_start` so a dead key never spins up the proxy — closing the gap
+   where host mode launched opencode against a locked key and every request then
+   failed deep in the proxy with no unlock URL surfaced. Both honor
+   `HARNESS_SKIP_AUTH_PROBE=1` (CI / offline), and both no-op cleanly when `curl`
+   is absent. The catalog print is the upstream-direct pull; the opencode model
+   dropdown is built separately from the *proxy's* `/v1/models` in step 7.
+6. **Proxy supervision** — `host_proxy_start` lazily builds a venv under
    `state/host/venv` (`host_proxy_ensure_venv`: `$(host_python_bin) -m venv` +
    `pip install` of `proxy/requirements.txt`'s two pure-python wheels, re-pip only
    when the requirements hash changes), then `nohup`s `proxy/proxy.py` with the
@@ -397,7 +410,7 @@ What it does, in order:
    polls the loopback port via `/dev/tcp` (the proxy calls `app.run()` last, so
    an accepted connect means it is serving) and tails the log on failure (the
    common cause is `_validate_config` `sys.exit(1)`).
-6. **Scoped opencode config** — `host_write_opencode_config` writes the same
+7. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`,
    but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
    **scoped** file (`state/host/opencode.json`). It asserts host `jq` is present
@@ -407,7 +420,7 @@ What it does, in order:
    `~/.config/opencode/opencode.json` is never touched. `curl` is optional: the
    model dropdown comes from the proxy's `/v1/models` when present, else falls
    back to `DEFAULT_MODEL_NAME` alone.
-7. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
+8. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
    (provider env, `--agent yolo`, and the headless `-p` json-events +
    `opencode export` dance that dodges opencode 1.15.x's render race).
    Interactive runs opencode as a **child** (not `exec`) so the proxy is torn
@@ -420,8 +433,11 @@ What it does, in order:
 The host helpers have docker-free unit coverage in `tests/unit_host_test.sh`
 (sourced via `HARNESS_SOURCE_ONLY=1`): `host_require_config` rejection,
 `host_confirm_gate` auto-confirm, `host_preflight` missing-dep reporting,
-`host_write_opencode_config` JSON shape + jq guard, and `host_proxy_fingerprint`
-stability. The toolchain provisioner has its own docker-free coverage in
+`host_write_opencode_config` JSON shape + jq guard, `host_proxy_fingerprint`
+stability, and (T9) that `cmd_host` runs the upstream auth gate like container
+mode — aborting before `host_proxy_start` on a locked key, advancing through the
+model pull into the proxy on a valid key, and bypassing the gate under
+`HARNESS_SKIP_AUTH_PROBE=1`. The toolchain provisioner has its own docker-free coverage in
 `tests/unit_host_toolchain_test.sh` (download-free): arch/platform mapping,
 `host_sha_from_manifest` parsing, `host_sha256_check`, stamp-gated idempotency
 and PATH assembly with stubbed binaries, the pins-match-`agents/Dockerfile`
