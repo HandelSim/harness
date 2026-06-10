@@ -71,6 +71,21 @@ prevented from clobbering a proxy the invoking shell already exported by
 capturing the shell values first and restoring any `.env` left empty.
 `harness_normalize_proxy_env` then mirrors the upper/lower-case spellings.
 
+**Host-mode (`harness host`) toolchain pulls honor the proxy too.** The
+containerless launch fetches its deps on the host: jq + the Node archive +
+checksum manifests via `host_fetch` (curl, which reads `*_PROXY` from the
+env directly), `opencode` via `npm`, and the proxy venv via `pip`. npm and
+pip honor those env vars only as config *defaults*, so an ambient
+`~/.npmrc` / `pip.conf` proxy could override them; `host_proxy_flags`
+(`npm`/`pip` dialects) passes the `.env` proxy as a CLI flag — top of both
+tools' config precedence — so `.env` wins regardless, keyed off
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`. The one curl host mode aims at the
+**local** proxy (the `/v1/models` dropdown pull in step 7) passes
+`--noproxy 127.0.0.1,localhost` so a corporate `HTTP_PROXY` never hijacks
+the loopback call and silently collapses the dropdown to
+`DEFAULT_MODEL_NAME`; the upstream pulls (auth gate, `_print_upstream_models`)
+keep using the proxy.
+
 ## Subcommand surface
 
 `cmd_help` is the source of truth for the user-facing subcommand list.

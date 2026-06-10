@@ -2814,6 +2814,40 @@ host_fetch() {
     mv -f "$tmp" "$dest"
 }
 
+# Echo the CLI flags that pin a host-mode package pull to the corporate proxy
+# from .env (HTTP_PROXY/HTTPS_PROXY/NO_PROXY, either case — the env loader at
+# the top of this script exports both spellings). The downloads host mode runs
+# split three ways on proxy handling:
+#   - curl (jq binary, Node archive, checksum manifests via host_fetch) honors
+#     the *_PROXY env vars on its own, so those need nothing.
+#   - npm (opencode) and pip (the proxy venv) ALSO honor them as config
+#     defaults, but an ambient ~/.npmrc / pip.conf carrying its own proxy=
+#     would override that default. Passing the proxy as a CLI flag sits at the
+#     top of both tools' config precedence, so .env wins regardless.
+# Output is word-split into the command line by the caller (hence SC2086 at the
+# call sites); empty output (no proxy configured) adds nothing. $1 picks the
+# tool's flag dialect: `npm` or `pip`.
+host_proxy_flags() {
+    local tool="$1" httpp httpsp nop
+    httpp="${HTTP_PROXY:-${http_proxy:-}}"
+    httpsp="${HTTPS_PROXY:-${https_proxy:-$httpp}}"   # fall back to the http proxy
+    nop="${NO_PROXY:-${no_proxy:-}}"
+    case "$tool" in
+        npm)
+            [[ -n "$httpp" ]]  && printf ' --proxy %s'       "$httpp"
+            [[ -n "$httpsp" ]] && printf ' --https-proxy %s' "$httpsp"
+            [[ -n "$nop" ]]    && printf ' --noproxy %s'     "$nop"
+            ;;
+        pip)
+            # pip takes a single --proxy for all schemes; prefer the HTTPS one
+            # (PyPI is https). It has no per-call NO_PROXY flag, but reads
+            # NO_PROXY straight from the env, which is already exported.
+            [[ -n "$httpsp" ]] && printf ' --proxy %s' "$httpsp"
+            ;;
+    esac
+    return 0
+}
+
 # Extract archive $1 into dir $2. $3 is the kind: `tar.gz` (Linux/macOS Node
 # tarball) or `zip` (the Windows Node distribution). zip prefers `unzip`, then
 # falls back to `tar -xf` — Git for Windows ships bsdtar as `tar`, which reads
@@ -3041,7 +3075,8 @@ host_ensure_opencode() {
     command -v npm >/dev/null 2>&1 || { err "host mode: npm unavailable to install opencode (Node provisioning failed?)"; return 1; }
     mkdir -p "$prefix"
     echo "[harness] host mode: installing opencode ${ver} + provider via npm (one-time, a few hundred MB)..." >&2
-    if ! npm install -g --prefix "$prefix" "opencode-ai@${ver}" "@ai-sdk/openai-compatible@${compat}" >&2; then
+    # shellcheck disable=SC2046  # intentional word-split of the proxy flags
+    if ! npm install -g --prefix "$prefix" $(host_proxy_flags npm) "opencode-ai@${ver}" "@ai-sdk/openai-compatible@${compat}" >&2; then
         err "host mode: npm install of opencode failed (see output above)"; return 1
     fi
     if [[ ! -x "$bin" ]] || ! "$bin" --version >/dev/null 2>&1; then
@@ -3222,7 +3257,8 @@ host_proxy_ensure_venv() {
         fi
     fi
     echo "[harness] host mode: installing proxy deps (flask, requests)..." >&2
-    if ! "$vpy" -m pip install --quiet --disable-pip-version-check -r "$reqs"; then
+    # shellcheck disable=SC2046  # intentional word-split of the proxy flags
+    if ! "$vpy" -m pip install --quiet --disable-pip-version-check $(host_proxy_flags pip) -r "$reqs"; then
         err "pip install of proxy deps failed (see output above)"
         return 1
     fi
@@ -3349,7 +3385,12 @@ host_write_opencode_config() {
 
     local model_ids=() catalog
     if command -v curl >/dev/null 2>&1; then
-        catalog=$(curl -fsS --max-time 10 "${proxy_url}/models" 2>/dev/null || true)
+        # --noproxy: this hits the LOCAL proxy on 127.0.0.1. With a corporate
+        # HTTP_PROXY set in .env, curl would otherwise route loopback through
+        # the corp proxy (which can't reach this box) and the dropdown would
+        # silently collapse to DEFAULT_MODEL_NAME. The upstream pulls
+        # (_print_upstream_models / the auth probe) keep using the proxy.
+        catalog=$(curl -fsS --noproxy '127.0.0.1,localhost' --max-time 10 "${proxy_url}/models" 2>/dev/null || true)
         if [[ -n "$catalog" ]]; then
             mapfile -t model_ids < <(printf '%s' "$catalog" \
                 | harness_jq -r '.data[]?.id' 2>/dev/null | sort -u || true)

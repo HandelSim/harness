@@ -214,5 +214,36 @@ skip_out=$(
 (( skip_rc == 43 )) || fail "T9.3: HARNESS_SKIP_AUTH_PROBE=1 should bypass the gate and reach the proxy (rc=43), got $skip_rc — $skip_out"
 ok "T9.3: HARNESS_SKIP_AUTH_PROBE=1 bypasses the host auth gate"
 
+# --- T10: host_proxy_flags pins npm/pip pulls to the .env proxy --------------
+# host mode fetches jq/Node (curl), opencode (npm), and the proxy venv (pip) on
+# the host; npm/pip get the .env proxy as an explicit CLI flag so an ambient
+# .npmrc/pip.conf cannot override it. curl honors *_PROXY from the env on its
+# own and needs no flag. host_proxy_flags is already in scope from the
+# top-level HARNESS_SOURCE_ONLY source above.
+
+# T10.1 — no proxy set: both dialects emit nothing.
+unset HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy 2>/dev/null || true
+[[ -z "$(host_proxy_flags npm)" ]] || fail "T10.1: host_proxy_flags npm should be empty with no proxy set"
+[[ -z "$(host_proxy_flags pip)" ]] || fail "T10.1: host_proxy_flags pip should be empty with no proxy set"
+ok "T10.1: host_proxy_flags emits nothing when no proxy is configured"
+
+# T10.2 — full proxy set: npm gets --proxy/--https-proxy/--noproxy, pip gets one --proxy.
+export HTTP_PROXY="http://corp:3128" HTTPS_PROXY="http://corp:3129" NO_PROXY="internal.example"
+npm_flags="$(host_proxy_flags npm)"
+grep -q -- '--proxy http://corp:3128'        <<<"$npm_flags" || fail "T10.2: npm flags missing --proxy: $npm_flags"
+grep -q -- '--https-proxy http://corp:3129'  <<<"$npm_flags" || fail "T10.2: npm flags missing --https-proxy: $npm_flags"
+grep -q -- '--noproxy internal.example'       <<<"$npm_flags" || fail "T10.2: npm flags missing --noproxy: $npm_flags"
+pip_flags="$(host_proxy_flags pip)"
+grep -q -- '--proxy http://corp:3129' <<<"$pip_flags" || fail "T10.2: pip flags should use the https proxy: $pip_flags"
+[[ "$(grep -o -- '--proxy' <<<"$pip_flags" | wc -l | tr -d ' ')" == 1 ]] || fail "T10.2: pip should emit exactly one --proxy: $pip_flags"
+ok "T10.2: host_proxy_flags pins npm and pip to the .env proxy"
+
+# T10.3 — only HTTP_PROXY set: pip still gets a --proxy (falls back to the http one).
+unset HTTPS_PROXY NO_PROXY
+export HTTP_PROXY="http://corp:3128"
+grep -q -- '--proxy http://corp:3128' <<<"$(host_proxy_flags pip)" || fail "T10.3: pip should fall back to HTTP_PROXY when HTTPS_PROXY is unset"
+ok "T10.3: host_proxy_flags pip falls back to HTTP_PROXY"
+unset HTTP_PROXY
+
 echo
 echo "HOST TEST PASSED"
