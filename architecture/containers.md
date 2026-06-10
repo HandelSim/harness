@@ -125,8 +125,9 @@ can never reach opencode). It is a no-op by default — emits no extra `-e` flag
 and never alters rendering on a healthy terminal — so it is a pure opt-in escape
 hatch. These are opencode-internal vars (read directly by opentui, no terminfo
 lookup), which is why forwarding them is safe in both opencode and shell modes
-where forwarding the raw host `TERM` would not be. Documented for users in
-`.env.example`. Typical use: `OPENTUI_FORCE_EXPLICIT_WIDTH=0 harness opencode`.
+where forwarding the raw host `TERM` would not be. They are deliberately NOT
+listed in `.env.example` (kept out of the default `.env`); set them inline when
+needed. Typical use: `OPENTUI_FORCE_EXPLICIT_WIDTH=0 harness opencode`.
 
 ### Headless `-p` output recovery
 
