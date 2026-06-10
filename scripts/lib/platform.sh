@@ -333,7 +333,7 @@ harness_resolve_interactive_tty() {
 
 # Detect the HOST-side clipboard "write" command (text on stdin -> OS clipboard).
 # Echoes the command, with any args, on stdout; returns 1 (no output) if none is
-# found. Used by the opencode clipboard bridge (HARNESS_CLIPBOARD=1) to push
+# found. Used by the opencode clipboard bridge (on by default) to push
 # container-copied text onto the host clipboard. These are the same OS-native
 # tools a terminal would use; no new dependency is introduced.
 harness_host_clipboard_cmd() {

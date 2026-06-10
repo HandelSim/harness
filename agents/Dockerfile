@@ -159,10 +159,10 @@ RUN chmod +x /usr/local/bin/agent-entrypoint.sh
 # Clipboard bridge (container side). opencode's TUI copies by shelling out to
 # xclip/xsel/wl-copy, none of which work in this image (no display). This shim
 # stands in for them and forwards the copied text to the host-shared bridge
-# file, which the harness host process pushes onto the real host clipboard, but
-# only when the launch opted in (HARNESS_CLIPBOARD=1, which sets
-# HARNESS_CLIPBOARD_FILE). Without that env it is an inert no-op, so default
-# behavior is unchanged. See architecture/containers.md.
+# file, which the harness host process pushes onto the real host clipboard. The
+# bridge is on by default: harness sets HARNESS_CLIPBOARD_FILE whenever the host
+# has a clipboard tool. With no such file set the shim is an inert no-op. See
+# architecture/containers.md.
 COPY agents/clipboard-bridge.sh /usr/local/bin/harness-clipboard-bridge
 RUN chmod +x /usr/local/bin/harness-clipboard-bridge \
     && for _n in xclip xsel wl-copy; do \

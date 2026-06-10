@@ -28,10 +28,10 @@ for _a in "$@"; do
     esac
 done
 
-# Bridge disabled (launch without HARNESS_CLIPBOARD=1 sets no file): swallow
-# stdin so opencode's copy is a silent no-op, exactly as before this shim
-# existed. opencode also emits OSC 52 independently, so a terminal that
-# supports it still copies regardless of this shim.
+# No bridge file in the env (host had no clipboard tool, so harness wired
+# nothing): swallow stdin so opencode's copy is a silent no-op, exactly as
+# before this shim existed. opencode also emits OSC 52 independently, so a
+# terminal that supports it still copies regardless of this shim.
 if [[ -z "${HARNESS_CLIPBOARD_FILE:-}" ]]; then
     cat >/dev/null 2>&1
     exit 0

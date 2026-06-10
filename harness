@@ -3954,25 +3954,21 @@ run_agent_interactive() {
             harness_add_bind_mount docker_args "$em_host" "$em"
         done
     fi
-    # Optional clipboard bridge (opt-in: HARNESS_CLIPBOARD=1). Routes opencode's
-    # in-container copy onto the HOST clipboard through a single bind-mounted
-    # file plus a host reader, with no network and no firewall change. Off by
-    # default because it lets the container write the host clipboard; enable per
-    # launch (`HARNESS_CLIPBOARD=1 harness opencode`). See architecture/containers.md.
+    # Clipboard bridge (on by default). Routes opencode's in-container copy onto
+    # the HOST clipboard through a single bind-mounted file plus a host reader,
+    # with no network and no firewall change. Wired automatically whenever the
+    # host has a clipboard tool (clip.exe / pbcopy / xclip / wl-copy); if none is
+    # found it degrades silently to a no-op. See architecture/containers.md.
     local _clip_file="" _clip_pid="" _clip_cmd
-    if [[ "${HARNESS_CLIPBOARD:-}" == "1" ]]; then
-        if _clip_cmd=$(harness_host_clipboard_cmd); then
-            _clip_file=$(mktemp "${TMPDIR:-/tmp}/harness-clip.XXXXXX")
-            local _clip_src
-            _clip_src=$(harness_docker_path "$_clip_file")
-            harness_add_bind_mount docker_args "$_clip_src" "/run/harness-clipboard"
-            docker_args+=(-e "HARNESS_CLIPBOARD_FILE=/run/harness-clipboard")
-            # shellcheck disable=SC2086
-            _harness_clip_reader "$_clip_file" "$$" $_clip_cmd &
-            _clip_pid=$!
-        else
-            echo "[harness] HARNESS_CLIPBOARD=1 but no host clipboard tool found (need clip.exe on Windows, pbcopy on macOS, or xclip/wl-copy on Linux). Clipboard bridge disabled." >&2
-        fi
+    if _clip_cmd=$(harness_host_clipboard_cmd); then
+        _clip_file=$(mktemp "${TMPDIR:-/tmp}/harness-clip.XXXXXX")
+        local _clip_src
+        _clip_src=$(harness_docker_path "$_clip_file")
+        harness_add_bind_mount docker_args "$_clip_src" "/run/harness-clipboard"
+        docker_args+=(-e "HARNESS_CLIPBOARD_FILE=/run/harness-clipboard")
+        # shellcheck disable=SC2086
+        _harness_clip_reader "$_clip_file" "$$" $_clip_cmd &
+        _clip_pid=$!
     fi
     docker_args+=(
         -w "$(harness_container_workdir "$mount_path")"
