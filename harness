@@ -3789,6 +3789,25 @@ agent_common_env() {
         # the environment can't accidentally re-enable the bypass.
         printf -- '-e\nHARNESS_FIREWALL_DISABLED=1\n'
     fi
+    # Terminal-rendering escape hatch. opencode's TUI (opentui) does runtime
+    # terminal capability detection; on a terminal that misreports its
+    # width/grapheme protocol support — e.g. older GNOME Terminal on RHEL,
+    # where the TUI renders garbled (opencode issue #4320) — opentui exposes
+    # override knobs to force a different width strategy. There is no ASCII-only
+    # glyph mode to fall back to, so these width overrides are the only lever.
+    # We forward each ONLY when the launching environment sets it, so this is a
+    # no-op by default and never alters rendering on a healthy terminal. They
+    # are opencode-internal env vars (opentui reads them directly; no terminfo
+    # lookup), so forwarding is safe for both opencode and shell modes. The user
+    # sets them inline (OPENTUI_FORCE_WCWIDTH=1 harness opencode) or via .env.
+    # See architecture/containers.md and .env.example.
+    local _rvar
+    for _rvar in OPENTUI_FORCE_EXPLICIT_WIDTH OPENTUI_FORCE_WCWIDTH \
+                 OPENTUI_FORCE_UNICODE OPENTUI_FORCE_NOZWJ OPENTUI_GRAPHICS; do
+        if [[ -n "${!_rvar:-}" ]]; then
+            printf -- '-e\n%s=%s\n' "$_rvar" "${!_rvar}"
+        fi
+    done
 }
 
 # Build the env-flag array from agent_common_env's newline-delimited output.

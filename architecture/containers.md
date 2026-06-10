@@ -104,6 +104,30 @@ separate allowlist entry — websearch belongs to the same firewall-down /
 the env var is harmless: websearch surfaces in the tool list, and calls
 return a network error at use time — the right failure mode.
 
+### Terminal-rendering env passthrough
+
+opencode's TUI (the Zig-native **opentui** renderer in 1.15.x) draws Unicode
+box-drawing/indicator glyphs unconditionally — there is no ASCII-only glyph
+mode. Correct rendering is therefore a property of the **terminal emulator**
+(UTF-8 decode + a font with the glyphs + a correct width/grapheme escape
+protocol), not something the container can force. The image already pins the
+locale to `C.UTF-8` (`agents/Dockerfile`), which fixes the POSIX→ASCII-fallback
+case for the majority of terminals.
+
+For the residual failure class — terminals that *misreport* their width support
+and render garbled (e.g. older GNOME Terminal on RHEL, opencode issue #4320) —
+opentui exposes width-strategy override knobs. `agent_common_env` (host
+`harness`) forwards `OPENTUI_FORCE_EXPLICIT_WIDTH`, `OPENTUI_FORCE_WCWIDTH`,
+`OPENTUI_FORCE_UNICODE`, `OPENTUI_FORCE_NOZWJ`, and `OPENTUI_GRAPHICS` into the
+agent container **only when the launching environment sets one** (the container
+does not inherit the host shell env, so without this passthrough the workaround
+can never reach opencode). It is a no-op by default — emits no extra `-e` flags
+and never alters rendering on a healthy terminal — so it is a pure opt-in escape
+hatch. These are opencode-internal vars (read directly by opentui, no terminfo
+lookup), which is why forwarding them is safe in both opencode and shell modes
+where forwarding the raw host `TERM` would not be. Documented for users in
+`.env.example`. Typical use: `OPENTUI_FORCE_EXPLICIT_WIDTH=0 harness opencode`.
+
 ### Headless `-p` output recovery
 
 `run_opencode`'s `HARNESS_PRINT_MODE` branch (`harness -p` / `harness
