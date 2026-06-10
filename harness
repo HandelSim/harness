@@ -2018,6 +2018,23 @@ EOF
         apply_upgrade_actions "$manifest" 0 "$needed_ids"
     fi
 
+    # Stop a running host proxy so the next 'harness host' relaunches on the
+    # freshly pulled code. The proxy serves proxy.py from memory, and its restart
+    # fingerprint tracks only port/url/key/model (NOT code) — so without this a
+    # plain 'harness host' after an upgrade REUSES the stale-code proxy and the
+    # update silently does not take effect. This is the host analog of the
+    # container restart below (which tears down and rebuilds the stack); host
+    # opencode is an interactive foreground launch, so the user's next
+    # 'harness host' is the relaunch. Gated on --no-restart, like the container
+    # path. Runs before the host_only/container split so a container install with
+    # a stray host proxy gets it cleaned too.
+    local host_proxy_was_running=0
+    if (( ! no_restart )) && host_proxy_running; then
+        host_proxy_was_running=1
+        echo "[harness] stopping the running host proxy so your next 'harness host' uses the new code"
+        host_proxy_stop
+    fi
+
     # Container path rebuilds images + restarts the stack so image-level changes
     # take effect. A host-only install has neither: the proxy runs from the
     # now-updated clone and its venv refreshes lazily on the next 'harness host',
@@ -2028,9 +2045,12 @@ EOF
         echo "  Code is updated. proxy.py runs from the clone; the host proxy venv"
         echo "  refreshes automatically on your next 'harness host' if"
         echo "  proxy/requirements.txt changed."
-        if host_proxy_running; then
-            echo "  A host proxy is currently running — restart it to pick up the new"
-            echo "  code:  harness host down  &&  harness host"
+        if (( host_proxy_was_running )); then
+            echo "  Stopped the running host proxy; run 'harness host' to relaunch it"
+            echo "  on the new code."
+        elif host_proxy_running; then
+            echo "  A host proxy is running (left up by --no-restart) — restart it to"
+            echo "  pick up the new code:  harness host down  &&  harness host"
         else
             echo "  Run 'harness host' to use the new code."
         fi
@@ -3302,26 +3322,23 @@ host_proxy_start() {
     # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
     # one-line regression in this launch path can't expose the keyed proxy on
     # the LAN (CONCERNS M3).
-    # Scrub the corporate proxy vars from the proxy's OWN environment so its
-    # upstream API call goes DIRECT, exactly as in container mode. proxy.py
-    # calls the upstream with python `requests`, which trusts the environment
-    # (trust_env defaults True) and would route every chat completion through
-    # HTTP_PROXY/HTTPS_PROXY when present. docker-compose.yml's proxy service
-    # declares no proxy vars, so the containerized proxy never does this; host
-    # mode inherits this shell's env (sourced from .env with set -a), which DOES
-    # carry them — they are wanted for the host-side toolchain pulls above
-    # (npm/pip/curl), NOT for the proxy's upstream hop. Without this, host mode
-    # 504s (gateway timeout) when the corp proxy can't reach the upstream, while
-    # container mode works. The vars stay set in this shell, so the toolchain
-    # pulls keep using them; `env -u` scrubs only the proxy.py child. Both cases
-    # of each spelling are scrubbed since requests reads either.
+    # The proxy INHERITS the corporate proxy vars (HTTP_PROXY/HTTPS_PROXY) from
+    # this shell on purpose: proxy.py forwards your chat to the upstream
+    # (PROXY_API_URL) with python `requests`, which trusts the environment
+    # (trust_env defaults True), and on a host that reaches the internet only
+    # through a corp proxy that hop MUST go through it. This is the one hop that
+    # legitimately wants the proxy. Container mode differs by necessity: the
+    # container network reaches the upstream directly, so docker-compose.yml's
+    # proxy service carries no proxy vars; the host has no such egress and needs
+    # the corp proxy here. (An earlier version scrubbed these to mirror the
+    # container and 504'd: the host can't reach the upstream directly.) The hop
+    # that must BYPASS the corp proxy is opencode's own loopback call to this
+    # proxy, handled in host_run_opencode via NO_PROXY — not here.
     PROXY_HOST=127.0.0.1 \
         HARNESS_FORCE_LOOPBACK=1 \
         PROXY_PORT="$port" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
-        nohup env -u HTTP_PROXY -u HTTPS_PROXY -u NO_PROXY \
-            -u http_proxy -u https_proxy -u no_proxy \
-            "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
+        nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"
 }
@@ -3475,6 +3492,24 @@ host_run_opencode() {
     # that explicit), so enabling a web-search provider adds no new exposure
     # beyond the unrestricted outbound the user already accepted (CONCERNS L4).
     export OPENCODE_ENABLE_EXA=1
+    # Exempt the loopback proxy from the corp HTTP_PROXY. opencode's provider
+    # baseURL is the LOCAL proxy at http://127.0.0.1:PORT/v1, and opencode runs
+    # on Bun, whose native fetch honors HTTP_PROXY/HTTPS_PROXY. With a corporate
+    # proxy set in .env, opencode would otherwise route this loopback call
+    # through the corp proxy (which can't reach this box) and every chat would
+    # 504. NO_PROXY for loopback is opencode's own documented, required fix
+    # (https://opencode.ai/docs/network/), so the provider hop goes DIRECT while
+    # any other opencode egress (e.g. Exa web search) still uses the corp proxy.
+    # Bare hosts, no port, so the match holds regardless of PORT; ::1 covers IPv6
+    # loopback. Merge with any NO_PROXY already in .env. This mirrors the curl
+    # --noproxy guard host_write_opencode_config already uses for the model list.
+    local _loopback_noproxy='127.0.0.1,localhost,::1'
+    if [[ -n "${NO_PROXY:-}" ]]; then
+        export NO_PROXY="${NO_PROXY},${_loopback_noproxy}"
+    else
+        export NO_PROXY="$_loopback_noproxy"
+    fi
+    export no_proxy="$NO_PROXY"
 
     local args=()
     [[ "$yolo" == "1" ]] && args+=(--agent yolo)

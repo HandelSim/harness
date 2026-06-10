@@ -245,23 +245,52 @@ grep -q -- '--proxy http://corp:3128' <<<"$(host_proxy_flags pip)" || fail "T10.
 ok "T10.3: host_proxy_flags pip falls back to HTTP_PROXY"
 unset HTTP_PROXY
 
-# --- T11: host_proxy_start scrubs the proxy vars from proxy.py's env ----------
+# --- T11: host_proxy_start does NOT scrub the proxy vars (upstream uses proxy) -
 # The host proxy's upstream call (python requests, trust_env=True) must go
-# DIRECT like container mode, whose compose service declares no proxy vars.
-# Host mode inherits this shell's proxy env (wanted for toolchain pulls), so the
-# launch must `env -u` them off the proxy.py child or every chat completion
-# tunnels through the corp proxy and 504s. Assert the scrub is present for all
-# six spellings (regression guard for the gateway-timeout fix).
+# THROUGH the corp proxy on a host that reaches the internet only via it — the
+# opposite of container mode, whose network reaches the upstream directly (so
+# its compose service carries no proxy vars). The launch must INHERIT this
+# shell's proxy env, not scrub it. (An earlier version `env -u`'d the vars to
+# mirror the container and 504'd: the host can't reach the upstream directly.)
+# Regression guard: assert no scrub wrapper survives on the proxy.py launch.
 launch_def="$(declare -f host_proxy_start)"
-for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
-    grep -q -- "-u $v" <<<"$launch_def" \
-        || fail "T11: host_proxy_start does not scrub $v from proxy.py's env (env -u $v missing)"
-done
-# The scrub runs via `env` on the proxy.py launch (defense against a refactor
-# that drops the env wrapper but leaves a stray -u token elsewhere).
-grep -q 'nohup env' <<<"$launch_def" || fail "T11: proxy.py is not launched via 'nohup env' (scrub wrapper missing)"
-grep -q 'proxy\.py'  <<<"$launch_def" || fail "T11: host_proxy_start no longer launches proxy.py?"
-ok "T11: host_proxy_start scrubs HTTP(S)_PROXY/NO_PROXY so the upstream hop goes direct"
+grep -q 'proxy\.py' <<<"$launch_def" || fail "T11: host_proxy_start no longer launches proxy.py?"
+if grep -qE 'env[[:space:]]+-u|nohup env' <<<"$launch_def"; then
+    fail "T11: host_proxy_start scrubs the proxy env (env -u); proxy.py must INHERIT it for the upstream hop"
+fi
+ok "T11: host_proxy_start lets proxy.py inherit the corp proxy for the upstream hop (no scrub)"
+
+# --- T12: host_run_opencode exempts the loopback proxy via NO_PROXY -----------
+# opencode runs on Bun, whose native fetch honors HTTP_PROXY/HTTPS_PROXY, and its
+# provider baseURL is the LOCAL proxy at 127.0.0.1. With a corp proxy in .env the
+# loopback call would tunnel through it (which can't reach this box) and every
+# chat would 504. host_run_opencode must add 127.0.0.1/localhost to NO_PROXY so
+# the provider hop goes DIRECT, while KEEPING HTTP_PROXY for other egress (Exa).
+# Behavioral check: stub opencode to record the env it is launched with.
+OCSTUB_DIR="$TMP_ROOT/ocstub"; mkdir -p "$OCSTUB_DIR"
+NOPROXY_REC="$TMP_ROOT/oc_noproxy.txt"
+cat >"$OCSTUB_DIR/opencode" <<EOF
+#!/bin/sh
+printf 'NO_PROXY=%s\n' "\$NO_PROXY" >> "$NOPROXY_REC"
+printf 'HTTP_PROXY=%s\n' "\$HTTP_PROXY" >> "$NOPROXY_REC"
+exit 0
+EOF
+chmod +x "$OCSTUB_DIR/opencode"
+: >"$NOPROXY_REC"
+(
+    PATH="$OCSTUB_DIR:$PATH"
+    export HTTP_PROXY="http://corp:3128" NO_PROXY="internal.example"
+    PROXY_PORT=8123 DEFAULT_MODEL_NAME="m" host_run_opencode 0 1 >/dev/null 2>&1
+) || true
+grep -q 'NO_PROXY=.*127\.0\.0\.1' "$NOPROXY_REC" \
+    || fail "T12: opencode child NO_PROXY missing loopback 127.0.0.1 — $(cat "$NOPROXY_REC")"
+grep -q 'NO_PROXY=.*localhost' "$NOPROXY_REC" \
+    || fail "T12: opencode child NO_PROXY missing localhost — $(cat "$NOPROXY_REC")"
+grep -q 'NO_PROXY=.*internal\.example' "$NOPROXY_REC" \
+    || fail "T12: opencode NO_PROXY dropped the pre-existing .env entry — $(cat "$NOPROXY_REC")"
+grep -q 'HTTP_PROXY=http://corp:3128' "$NOPROXY_REC" \
+    || fail "T12: HTTP_PROXY must stay set so non-loopback egress (Exa) keeps the proxy — $(cat "$NOPROXY_REC")"
+ok "T12: host_run_opencode exempts loopback via NO_PROXY and keeps HTTP_PROXY for other egress"
 
 echo
 echo "HOST TEST PASSED"

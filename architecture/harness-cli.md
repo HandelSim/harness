@@ -86,18 +86,30 @@ the loopback call and silently collapses the dropdown to
 `DEFAULT_MODEL_NAME`; the upstream pulls (auth gate, `_print_upstream_models`)
 keep using the proxy.
 
-**The host proxy's own upstream hop goes direct, mirroring the container.**
-`proxy.py` forwards chat completions to the upstream with python `requests`,
-which trusts the environment (`trust_env` defaults `True`) and would tunnel
-every call through `HTTP_PROXY`/`HTTPS_PROXY` when present. The container proxy
-never does this because `docker-compose.yml`'s proxy service declares no proxy
-vars; host mode otherwise *would*, since `host_proxy_start` inherits this
-shell's env (which carries the proxy vars for the toolchain pulls above). So the
-launch `env -u`'s all six spellings (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, both
-cases) off the `proxy.py` child only — the vars stay set in the shell, so the
-toolchain pulls keep using them. Without the scrub, host mode returns gateway
-timeouts (504) when the corp proxy can't reach the upstream, while container
-mode works. Regression-guarded by `unit_host_test.sh` T11.
+**On a corp-proxy host the two request hops route oppositely: the proxy's
+upstream hop USES the corp proxy, opencode's loopback hop does NOT.** A host
+behind a corporate proxy reaches the internet only through it, so:
+
+- `proxy.py`'s UPSTREAM hop (the chat completions it forwards to
+  `PROXY_API_URL`) goes THROUGH the corp proxy. It uses python `requests`
+  (`trust_env` defaults `True`), and `host_proxy_start` lets it inherit this
+  shell's proxy env on purpose — the host has no other egress. The container
+  differs by necessity: its network reaches the upstream directly, so
+  `docker-compose.yml`'s proxy service carries no proxy vars. (An earlier host
+  version `env -u`'d the vars to mirror the container and 504'd — the host
+  *can't* reach the upstream directly.)
+- opencode's LOOPBACK hop to the host proxy (its provider baseURL is
+  `http://127.0.0.1:PORT/v1`) must BYPASS the corp proxy. opencode runs on Bun,
+  whose native fetch honors `HTTP_PROXY`/`HTTPS_PROXY`, so a corp proxy would
+  otherwise tunnel the loopback call (which can't reach this box) and every chat
+  would 504. `host_run_opencode` sets `NO_PROXY=127.0.0.1,localhost,::1` (merged
+  with any `.env` value) — opencode's own documented loopback bypass
+  (opencode.ai/docs/network) — so the provider call goes direct while other
+  opencode egress (e.g. Exa web search) still uses the proxy. This mirrors the
+  `--noproxy 127.0.0.1,localhost` curl guard for the `/v1/models` dropdown pull.
+
+Regression-guarded by `unit_host_test.sh` T11 (no scrub on `proxy.py`) and T12
+(opencode loopback `NO_PROXY`).
 
 ## Subcommand surface
 
