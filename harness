@@ -3302,11 +3302,26 @@ host_proxy_start() {
     # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
     # one-line regression in this launch path can't expose the keyed proxy on
     # the LAN (CONCERNS M3).
+    # Scrub the corporate proxy vars from the proxy's OWN environment so its
+    # upstream API call goes DIRECT, exactly as in container mode. proxy.py
+    # calls the upstream with python `requests`, which trusts the environment
+    # (trust_env defaults True) and would route every chat completion through
+    # HTTP_PROXY/HTTPS_PROXY when present. docker-compose.yml's proxy service
+    # declares no proxy vars, so the containerized proxy never does this; host
+    # mode inherits this shell's env (sourced from .env with set -a), which DOES
+    # carry them — they are wanted for the host-side toolchain pulls above
+    # (npm/pip/curl), NOT for the proxy's upstream hop. Without this, host mode
+    # 504s (gateway timeout) when the corp proxy can't reach the upstream, while
+    # container mode works. The vars stay set in this shell, so the toolchain
+    # pulls keep using them; `env -u` scrubs only the proxy.py child. Both cases
+    # of each spelling are scrubbed since requests reads either.
     PROXY_HOST=127.0.0.1 \
         HARNESS_FORCE_LOOPBACK=1 \
         PROXY_PORT="$port" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
-        nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
+        nohup env -u HTTP_PROXY -u HTTPS_PROXY -u NO_PROXY \
+            -u http_proxy -u https_proxy -u no_proxy \
+            "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"
 }

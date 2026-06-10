@@ -86,6 +86,19 @@ the loopback call and silently collapses the dropdown to
 `DEFAULT_MODEL_NAME`; the upstream pulls (auth gate, `_print_upstream_models`)
 keep using the proxy.
 
+**The host proxy's own upstream hop goes direct, mirroring the container.**
+`proxy.py` forwards chat completions to the upstream with python `requests`,
+which trusts the environment (`trust_env` defaults `True`) and would tunnel
+every call through `HTTP_PROXY`/`HTTPS_PROXY` when present. The container proxy
+never does this because `docker-compose.yml`'s proxy service declares no proxy
+vars; host mode otherwise *would*, since `host_proxy_start` inherits this
+shell's env (which carries the proxy vars for the toolchain pulls above). So the
+launch `env -u`'s all six spellings (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, both
+cases) off the `proxy.py` child only — the vars stay set in the shell, so the
+toolchain pulls keep using them. Without the scrub, host mode returns gateway
+timeouts (504) when the corp proxy can't reach the upstream, while container
+mode works. Regression-guarded by `unit_host_test.sh` T11.
+
 ## Subcommand surface
 
 `cmd_help` is the source of truth for the user-facing subcommand list.

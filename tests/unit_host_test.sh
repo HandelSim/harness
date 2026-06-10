@@ -245,5 +245,23 @@ grep -q -- '--proxy http://corp:3128' <<<"$(host_proxy_flags pip)" || fail "T10.
 ok "T10.3: host_proxy_flags pip falls back to HTTP_PROXY"
 unset HTTP_PROXY
 
+# --- T11: host_proxy_start scrubs the proxy vars from proxy.py's env ----------
+# The host proxy's upstream call (python requests, trust_env=True) must go
+# DIRECT like container mode, whose compose service declares no proxy vars.
+# Host mode inherits this shell's proxy env (wanted for toolchain pulls), so the
+# launch must `env -u` them off the proxy.py child or every chat completion
+# tunnels through the corp proxy and 504s. Assert the scrub is present for all
+# six spellings (regression guard for the gateway-timeout fix).
+launch_def="$(declare -f host_proxy_start)"
+for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    grep -q -- "-u $v" <<<"$launch_def" \
+        || fail "T11: host_proxy_start does not scrub $v from proxy.py's env (env -u $v missing)"
+done
+# The scrub runs via `env` on the proxy.py launch (defense against a refactor
+# that drops the env wrapper but leaves a stray -u token elsewhere).
+grep -q 'nohup env' <<<"$launch_def" || fail "T11: proxy.py is not launched via 'nohup env' (scrub wrapper missing)"
+grep -q 'proxy\.py'  <<<"$launch_def" || fail "T11: host_proxy_start no longer launches proxy.py?"
+ok "T11: host_proxy_start scrubs HTTP(S)_PROXY/NO_PROXY so the upstream hop goes direct"
+
 echo
 echo "HOST TEST PASSED"
