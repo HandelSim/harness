@@ -116,8 +116,9 @@ validator in `_setup_prompt_mode` accepts:
   ~20% reversion to the upstream's "I can't execute, here are commands for
   you to run" persona, issue #109; the JSON envelope and the
   no-fabricated-results rule; prefer-a-listed-tool guidance with
-  `webfetch` over curl as the worked example; track non-trivial work with
-  `todowrite`; launch `task` agents in parallel when independent (capped
+  `webfetch` over curl as the worked example; keep a `todowrite` todo list for
+  multi-step work, laid out up front and updated as you go so the plan survives
+  a context compaction; launch `task` agents in parallel when independent (capped
   at 8 concurrent, each briefed in full since a sub-agent does not share
   the parent's context); pointer
   back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions),
@@ -799,7 +800,9 @@ detail-tools set is tied to the opencode tools we ship for. There are no longer
 
 When `OUTPUT_DIR` is set (typical: `/output` inside the container,
 bind-mounted to `<install-root>/state/output/` on the host), each request
-writes:
+writes (`harness host` has no bind mount, so it remaps the same `/output` to
+`state/output/` on the host before launching the proxy — see
+[`harness-cli.md`](harness-cli.md) → "Host mode"):
 
 - `<req_id>_01_Inbound_Request.json`
 - `<req_id>_02_API_Request.json`

@@ -293,7 +293,9 @@ _HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
         "`'pending'`/`'in_progress'`/`'completed'`/`'cancelled'`. Use only "
         "for ≥3 non-trivial steps. Exactly ONE item may be `in_progress`. "
         "Flip an item to `completed` immediately after finishing it — not at "
-        "end-of-turn, and not in the same call that starts it."
+        "end-of-turn, and not in the same call that starts it. The list is also "
+        "your memory across a context compaction: keep it accurate so you can "
+        "resume on track if earlier turns are summarized away."
     ),
     "webfetch": (
         "Fetch a URL and convert to markdown/text/html. Read-only. If the "
@@ -825,8 +827,9 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
       - the JSON envelope and the no-fabricated-results rule
       - "prefer a listed tool over hand-work"
       - "don't downgrade to listing commands for the user to run"
-      - "track non-trivial work with `todowrite`; Launch `task` agents
-        in parallel when independent, at most 8 at a time, briefing each
+      - "keep a `todowrite` todo list for multi-step work, updated as you go
+        so the plan and progress survive a context compaction; Launch `task`
+        agents in parallel when independent, at most 8 at a time, briefing each
         in full since a sub-agent does not share the parent's context"
       - "if no listed tool fits, just ask or answer"
       - a pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions
@@ -889,8 +892,12 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         "in the <<<BEGIN_AGENT_TOOLS>>> section earlier in this "
         "conversation); prefer a listed tool over doing the work by hand "
         "(e.g. use `webfetch` for a URL instead of curl or a script), and "
-        "don't downgrade to listing commands for the user to run. Track "
-        "non-trivial work with `todowrite`. Launch `task` agents — several "
+        "don't downgrade to listing commands for the user to run. Keep a "
+        "`todowrite` todo list for any multi-step task: lay out the steps "
+        "before you start and keep it updated as you go (mark items "
+        "in_progress / completed, add steps you discover), so your plan and "
+        "progress survive a context compaction and keep you on track. Launch "
+        "`task` agents — several "
         "concurrently when the work allows, at most 8 at a time — to "
         "parallelize and conserve your context; brief each one in full "
         "because a sub-agent does not share your context. If no opencode "

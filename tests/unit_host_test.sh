@@ -303,5 +303,33 @@ grep -q 'HTTP_PROXY=http://corp:3128' "$NOPROXY_REC" \
     || fail "T12: HTTP_PROXY must stay set so non-loopback egress (Exa) keeps the proxy — $(cat "$NOPROXY_REC")"
 ok "T12: host_run_opencode exempts loopback via NO_PROXY and keeps HTTP_PROXY for other egress"
 
+# --- T13: host_output_dir_resolve remaps the container target for host mode ---
+# Debug dumps in host mode were silently disabled: the documented OUTPUT_DIR
+# value is the CONTAINER target `/output` (.env.example), which container mode
+# bind-mounts to ./state/output but host mode has no bind mount for — so the
+# proxy tried to mkdir `/output` at the host root, failed its writability probe,
+# and wrote nothing. host_output_dir_resolve maps `/output` (and the Windows
+# `//output` form) to $state_root/output so dumps land in the same place in both
+# modes, leaves an empty value empty (opt-in stays off, CONCERNS H3), and passes
+# a deliberate absolute host path through unchanged.
+[[ "$(type -t host_output_dir_resolve)" == "function" ]] || fail "T13: host_output_dir_resolve not sourced"
+
+got=$(host_output_dir_resolve "/output")
+[[ "$got" == "$state_root/output" ]] || fail "T13: /output should remap to \$state_root/output, got '$got'"
+
+got=$(host_output_dir_resolve "//output")
+[[ "$got" == "$state_root/output" ]] || fail "T13: //output (Windows form) should remap to \$state_root/output, got '$got'"
+
+got=$(host_output_dir_resolve "")
+[[ -z "$got" ]] || fail "T13: empty OUTPUT_DIR must stay empty (dumps off), got '$got'"
+
+got=$(host_output_dir_resolve "/home/me/dumps")
+[[ "$got" == "/home/me/dumps" ]] || fail "T13: a deliberate host path must pass through unchanged, got '$got'"
+
+# A path that merely contains 'output' but is not the container target is untouched.
+got=$(host_output_dir_resolve "/var/output-logs")
+[[ "$got" == "/var/output-logs" ]] || fail "T13: only the exact /output target remaps, got '$got'"
+ok "T13: host_output_dir_resolve remaps /output to state/output, keeps empty off, passes host paths through"
+
 echo
 echo "HOST TEST PASSED"

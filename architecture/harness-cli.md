@@ -438,10 +438,17 @@ What it does, in order:
    `proxy.py` refuse to bind any non-loopback `PROXY_HOST` — a second layer so a
    regression in this launch line can't expose the keyed proxy on the LAN in the
    firewall-less mode. The proxy reads its REQUIRED env straight from this shell.
-   **Debug dumps are opt-in, same as container mode:** `host_proxy_start` does
-   NOT force `OUTPUT_DIR`; the proxy inherits it from `.env` (default empty, no
-   dumps), so the higher-blast-radius host mode never silently writes every
-   prompt to disk. **Config-change detection:** the reuse short-circuit
+   **Debug dumps are opt-in, same as container mode:** the proxy inherits
+   `OUTPUT_DIR` from `.env` (default empty, no dumps), so the higher-blast-radius
+   host mode never silently writes every prompt to disk. The documented value is
+   the container target `/output`, which container mode bind-mounts to
+   `state/output/`. Host mode has no bind mount, so `host_proxy_start` remaps
+   `/output` (and the Windows `//output`) to `state/output/` and passes the
+   result explicitly on the launch. Without the remap a literal `/output` made
+   the proxy try to create it at the host filesystem root, fail its writability
+   probe, and silently disable dumps (a reported bug: `harness host` wrote
+   nothing even with `OUTPUT_DIR` set). A deliberate absolute host path passes
+   through unchanged. **Config-change detection:** the reuse short-circuit
    (`host_proxy_running`) is gated on a fingerprint (`host_proxy_fingerprint`:
    port + the required upstream vars + `OUTPUT_DIR` + `proxy/requirements.txt`
    content, stored at `state/host/proxy.fp`); if any of those changed since the

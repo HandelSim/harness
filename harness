@@ -3293,6 +3293,27 @@ host_proxy_ensure_venv() {
     return 0
 }
 
+# Resolve OUTPUT_DIR for host mode (debug dumps). Pure function, no side
+# effects, so it is unit-testable (tests/unit_host_test.sh). Debug dumps are
+# opt-in: an empty value stays empty (off), and host mode is the
+# higher-blast-radius mode (full host user, no firewall) that must not silently
+# capture every prompt to disk (CONCERNS H3). The documented/recommended value
+# is the CONTAINER target `/output` (.env.example), which container mode
+# bind-mounts to ./state/output. Host mode has no bind mount: a literal
+# `/output` would make the proxy try to create `/output` at the host filesystem
+# ROOT, fail its writability probe, and silently disable dumps (the reported
+# bug: `harness host` wrote nothing even with OUTPUT_DIR set). So map the
+# documented container target (`/output`, or the Windows `//output` form) to its
+# documented host equivalent, $state_root/output. A deliberate absolute host
+# path is returned unchanged. Echoes the resolved value (possibly empty).
+host_output_dir_resolve() {
+    local raw="${1-}"
+    case "$raw" in
+        /output|//output) printf '%s\n' "$state_root/output" ;;
+        *)                 printf '%s\n' "$raw" ;;
+    esac
+}
+
 # Start the host proxy in the background (idempotent). Binds 127.0.0.1 only —
 # the host proxy must never be reachable off-box. The proxy reads its REQUIRED
 # env (PROXY_API_URL/KEY, DEFAULT_MODEL_NAME, etc.) straight from this shell,
@@ -3320,11 +3341,14 @@ host_proxy_start() {
     echo "[harness] host mode: starting proxy on 127.0.0.1:$port" >&2
     echo "[harness] host mode: proxy log -> $lf" >&2
     # Debug dumps are OPT-IN, same as container mode (docker-compose.yml passes
-    # OUTPUT_DIR=${OUTPUT_DIR:-}). We do NOT force OUTPUT_DIR here: the proxy
-    # inherits it from .env (sourced with set -a) only when the user opts in,
-    # and writes nothing by default. Host mode is the higher-blast-radius mode
-    # (full host user, no firewall); it must not silently capture every prompt
-    # to disk as plaintext (CONCERNS H3).
+    # OUTPUT_DIR=${OUTPUT_DIR:-}). The proxy inherits OUTPUT_DIR from .env
+    # (sourced with set -a); host_output_dir_resolve remaps the documented
+    # container target `/output` to the host's $state_root/output (the proxy has
+    # no bind mount on the host) and leaves an empty value off. Passed
+    # explicitly on the launch below so the remapped value wins over the
+    # inherited .env one.
+    local host_output_dir
+    host_output_dir=$(host_output_dir_resolve "${OUTPUT_DIR:-}")
     # HARNESS_FORCE_LOOPBACK is belt-and-suspenders for the no-firewall mode:
     # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
     # one-line regression in this launch path can't expose the keyed proxy on
@@ -3344,6 +3368,7 @@ host_proxy_start() {
     PROXY_HOST=127.0.0.1 \
         HARNESS_FORCE_LOOPBACK=1 \
         PROXY_PORT="$port" \
+        OUTPUT_DIR="$host_output_dir" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
         nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
