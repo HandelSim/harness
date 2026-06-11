@@ -29,6 +29,20 @@ run from an empty directory. Stages:
    absent one as "harness fetches it automatically", informational either way.
    The node-major check parses `node --version` and notes a major < 20 will be
    superseded by the vendored Node, not an error.
+1a. **Host-only risk-acceptance gate.** On the `HOST_ONLY` path, immediately
+   after preflight and **before any disk write or other prompt** (so a decline
+   leaves nothing cloned or written), the installer runs `host_only_risk_gate`.
+   It states the host-mode blast radius (no egress firewall; opencode runs as
+   the full host user with full filesystem + unfiltered network), **recommends
+   installing a container runtime instead**, and **requires explicit acceptance
+   to proceed**. It is the install-time analog of harness's launch-time
+   `host_confirm_gate` and shares its discipline: `HARNESS_HOST_CONFIRM=1`
+   auto-accepts (for automation), and a non-interactive install with no
+   `/dev/tty` and no bypass aborts rather than silently proceeding. Declining
+   aborts the install with a hint to install docker/podman and re-run. A
+   container install (any runtime present) skips the gate entirely. The gate is
+   a function that returns non-zero to abort; the top-level caller runs the
+   terminating `return`/`exit` (same sourced-script constraint as preflight).
 2. **Intent prompts.** Prints what the install will do, then asks whether to
    add a `harness` wrapper to PATH and offers to capture an upstream API key
    now (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves

@@ -400,6 +400,73 @@ preflight() {
     echo
 }
 
+# --- host-only risk acceptance ----------------------------------------------
+#
+# A HOST_ONLY install (no docker/podman found) can only launch via 'harness
+# host', which runs the proxy + opencode as plain host processes: NO egress
+# firewall, opencode running as the full host user. That is a real blast
+# radius, so before the installer writes anything to disk we (a) recommend
+# installing a container runtime instead and (b) REQUIRE the user to accept
+# the risks explicitly. This is the install-time analog of harness's
+# launch-time host_confirm_gate and shares its HARNESS_HOST_CONFIRM=1
+# automation bypass and /dev/tty discipline. Container installs skip it.
+# Returns 0 to proceed, 1 to abort; the top-level caller performs the actual
+# abort, because a `return` inside a helper can't end a sourced script (see
+# exit_or_return / fail).
+host_only_risk_gate() {
+    (( ${HOST_ONLY:-0} == 1 )) || return 0   # container runtime present: nothing to accept
+
+    local host_user
+    host_user=$(id -un 2>/dev/null || echo "${USER:-your account}")
+
+    echo
+    title "no container runtime found: host-only install"
+    cat <<EOF
+
+docker/podman were not found, so this install can only run harness in
+containerless ${C_BOLD}host mode${C_RESET} ('harness host'). Host mode trades away the
+sandbox:
+
+  ${C_YELLOW}!${C_RESET} opencode runs as your full host user ($host_user) — it can read and
+    write every file your account can, including ~/.ssh, ~/.aws, ~/.config.
+  ${C_YELLOW}!${C_RESET} There is NO egress firewall. Outbound network is UNRESTRICTED (the
+    harness allowlist only constrains container mode).
+
+${C_BOLD}Recommended:${C_RESET} install docker or podman and re-run this installer. Container
+mode sandboxes the agent inside an image behind the egress allowlist, a much
+smaller blast radius. Run with docker whenever you can; host mode is the
+fallback, not the default.
+
+(Host mode also re-confirms this on every launch; accepting here does not
+suppress that.)
+EOF
+    echo
+
+    if [[ "${HARNESS_HOST_CONFIRM:-0}" == "1" ]]; then
+        echo "  (host-only risks auto-accepted via HARNESS_HOST_CONFIRM=1)"
+        return 0
+    fi
+    if [[ ! -e /dev/tty ]]; then
+        fail "non-interactive install without /dev/tty; refusing a silent host-only install"
+        fail "install docker/podman and re-run, or set HARNESS_HOST_CONFIRM=1 to accept the risks in automation"
+        return 1
+    fi
+    local ans
+    printf 'Proceed with a host-only install and accept these risks? [y/n]: ' >&2
+    if ! IFS= read -r ans </dev/tty; then
+        fail "no input received; aborting"
+        return 1
+    fi
+    case "${ans:-}" in
+        y|Y|yes|YES) return 0 ;;
+        *)
+            fail "aborted: host-only risks not accepted"
+            echo "  Install docker or podman for sandboxed container mode, then re-run." >&2
+            return 1
+            ;;
+    esac
+}
+
 # --- intent -----------------------------------------------------------------
 
 cat <<EOF
@@ -434,10 +501,22 @@ if ! preflight; then
     exit 1
 fi
 
+# --- host-only risk acceptance (before any writes) --------------------------
+#
+# On a HOST_ONLY install, require explicit acceptance of the no-sandbox risks
+# (and recommend docker) before the clone or any disk write, so declining
+# leaves the disk untouched. No-op for container installs.
+if ! host_only_risk_gate; then
+    (( HARNESS_INSTALL_SOURCED )) && return 1
+    exit 1
+fi
+
 # --- prompts ----------------------------------------------------------------
 #
-# No "continue?" gate here: the next prompt (PATH) is the first thing the user
-# answers, so the intent text above still gets a beat of consideration, and
+# No generic "continue?" gate here: for a container install the next prompt
+# (PATH) is the first thing the user answers, so the intent text above still
+# gets a beat of consideration (a HOST_ONLY install stops earlier, at the
+# host-only risk-acceptance gate above), and
 # Ctrl-C aborts at any prompt. A prior confirm prompt was also broken when the
 # script is sourced (the README-recommended path) — its abort ran
 # `exit_or_return 0`, whose `return` only leaves that helper function, not the
@@ -942,9 +1021,9 @@ containerless mode:
 fetches its dependencies (jq, Node >= 20, opencode) automatically into
 state/host/toolchain — you only need Python 3 (python3/python/py). It has NO
 egress firewall and runs
-as your full host user, so it prompts to confirm on every launch. Install
-docker/podman later if you want the sandboxed container mode ('harness
-start/opencode').
+as your full host user, so it prompts to confirm on every launch. Recommended:
+install docker/podman and use the sandboxed container mode ('harness
+start/opencode') whenever you can; host mode is the fallback, not the default.
 EOF
 else
 cat <<EOF
