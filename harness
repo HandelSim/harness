@@ -1300,11 +1300,27 @@ _print_upstream_models() {
     body=$(sed 's/__HTTP_STATUS__[0-9]*$//' <<<"$response")
 
     if [[ -n "$status" && "${status:0:1}" == "2" ]]; then
-        local ids=""
+        # Build a readable, sanitized list of the advertised model ids. Drop
+        # null/blank ids (a catalog entry with no "id") and strip control
+        # characters (CR, tabs, stray bytes) and surrounding whitespace so a
+        # ragged catalog entry can't garble the line. Print one id per line
+        # under a counted header instead of a single space-joined line, which
+        # wraps into an unreadable block when the upstream advertises many
+        # models. jq is a JSON filter, so the HTTP status marker stripped into
+        # $body above can never reach this list.
+        local -a model_ids=()
         if command -v jq >/dev/null 2>&1; then
-            ids=$(jq -r '.data[].id // empty' <<<"$body" 2>/dev/null | paste -sd ' ' - || true)
+            mapfile -t model_ids < <(
+                jq -r '.data[]?.id // empty' <<<"$body" 2>/dev/null \
+                    | tr -d '\000-\011\013-\037\177' \
+                    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+                    | grep -v '^$' || true
+            )
         fi
-        [[ -n "$ids" ]] && echo "[harness] upstream models available: $ids"
+        if (( ${#model_ids[@]} > 0 )); then
+            echo "[harness] upstream models available (${#model_ids[@]}):"
+            printf '[harness]   %s\n' "${model_ids[@]}"
+        fi
         return 0
     fi
 
@@ -3464,7 +3480,7 @@ host_write_opencode_config() {
         catalog=$(curl -fsS --noproxy '127.0.0.1,localhost' --max-time 10 "${proxy_url}/models" 2>/dev/null || true)
         if [[ -n "$catalog" ]]; then
             mapfile -t model_ids < <(printf '%s' "$catalog" \
-                | harness_jq -r '.data[]?.id' 2>/dev/null | sort -u || true)
+                | harness_jq -r '.data[]?.id // empty' 2>/dev/null | sort -u || true)
         fi
     fi
     if [[ -n "$default_model" ]]; then

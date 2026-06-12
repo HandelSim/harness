@@ -150,7 +150,7 @@ ensure_opencode_config() {
     catalog=$(curl -fsS --max-time 10 "${proxy_url}/models" 2>/dev/null || true)
     if [[ -n "$catalog" ]]; then
         mapfile -t model_ids < <(printf '%s' "$catalog" \
-            | jq -r '.data[]?.id' 2>/dev/null | sort -u || true)
+            | jq -r '.data[]?.id // empty' 2>/dev/null | sort -u || true)
     fi
     # Ensure the default model is always present (it's the default selection).
     if [[ -n "$default_model" ]]; then
