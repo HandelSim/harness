@@ -331,5 +331,39 @@ got=$(host_output_dir_resolve "/var/output-logs")
 [[ "$got" == "/var/output-logs" ]] || fail "T13: only the exact /output target remaps, got '$got'"
 ok "T13: host_output_dir_resolve remaps /output to state/output, keeps empty off, passes host paths through"
 
+# --- T14: host_reset_terminal undoes opencode's leaked mouse-tracking --------
+# opencode's TUI enables xterm mouse-tracking but a crash/abrupt exit can leave
+# it on, so afterwards every mouse move dumps raw report bytes (e.g. 35;77;12M)
+# into the host shell. host_reset_terminal re-sends the DECRST disables on the
+# interactive host exit path. Two invariants:
+#   - the byte sequence disables the tracking + report-encoding modes (the leak)
+#     and shows the cursor, and
+#   - the TTY guard means a NON-tty stdout (pipe/redirect, as in this test and in
+#     any captured/-p run) receives NOTHING — escape bytes must never leak into
+#     non-terminal output.
+[[ "$(type -t host_terminal_reset_seq)" == "function" ]] || fail "T14: host_terminal_reset_seq not sourced"
+[[ "$(type -t host_reset_terminal)"    == "function" ]] || fail "T14: host_reset_terminal not sourced"
+
+seq_out="$(host_terminal_reset_seq)"
+# The modes that actually cause the leak: button/drag/any-motion tracking and
+# the SGR/urxvt report encodings, all disabled (low 'l'), plus cursor-show.
+for code in '1000l' '1002l' '1003l' '1006l' '1015l' '25h'; do
+    case "$seq_out" in
+        *$'\033'"[?$code"*) : ;;
+        *) fail "T14: reset sequence missing ESC[?$code — got $(printf '%q' "$seq_out")" ;;
+    esac
+done
+# It must NOT touch the alt-screen buffer (?1049) — opencode restores that on a
+# normal exit and re-disabling it could clobber scrollback.
+case "$seq_out" in
+    *'1049'*) fail "T14: reset sequence must not touch alt-screen (?1049) — $(printf '%q' "$seq_out")" ;;
+esac
+
+# TTY guard: stdout here is a command substitution (a pipe, not a tty), so the
+# guarded entry point must emit nothing.
+guarded="$(host_reset_terminal)"
+[[ -z "$guarded" ]] || fail "T14: host_reset_terminal leaked bytes to a non-tty stdout — $(printf '%q' "$guarded")"
+ok "T14: host_reset_terminal disables leaked mouse-tracking and is a no-op on non-tty stdout"
+
 echo
 echo "HOST TEST PASSED"

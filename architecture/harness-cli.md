@@ -479,7 +479,20 @@ What it does, in order:
    thrash it (`harness host down` stops it) — the same interactive-vs-print
    teardown split as container mode. Because nothing reaps a `-p` proxy, print
    mode prints a stderr reminder after the run naming the live pid and the
-   `harness host down` stop command.
+   `harness host down` stop command. **Terminal reset on interactive exit:** after
+   the interactive child returns (before `host_proxy_stop`), `host_reset_terminal`
+   re-sends the xterm DECRST disables for mouse-tracking (`?1000`/`?1002`/`?1003`
+   + the `?1005`/`?1006`/`?1015` report encodings), focus-reporting (`?1004`) and
+   bracketed-paste (`?2004`), plus a cursor-show (`?25h`). opencode's TUI enables
+   mouse-tracking but a crash or abrupt exit can return without disabling it,
+   leaving the host terminal reporting — every later mouse move then dumps raw
+   bytes (e.g. `35;77;12M`) into the shell. opencode owns the bug; harness owns
+   the launch, so it cleans up on the way out. Container mode never hits this (the
+   shell dies with the container), so this is host-interactive only. It is guarded
+   to a real TTY on stdout (`[[ -t 1 ]]`) so a piped run never receives escape
+   bytes, and print mode (`-p`) skips it (its stdout is data); DECRST is
+   idempotent, so a clean opencode exit is a no-op. Alt-screen (`?1049`) is left
+   untouched because opencode restores it on normal exit.
 
 The host helpers have docker-free unit coverage in `tests/unit_host_test.sh`
 (sourced via `HARNESS_SOURCE_ONLY=1`): `host_require_config` rejection,

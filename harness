@@ -3629,8 +3629,36 @@ host_run_opencode() {
     (( ${#pass_args[@]} )) && cmd+=("${pass_args[@]}")
     local rc=0
     "${cmd[@]}" || rc=$?
+    host_reset_terminal
     host_proxy_stop
     return "$rc"
+}
+
+# Undo terminal modes opencode's TUI may leave enabled after an interactive host
+# run. opencode turns on xterm mouse-tracking (DECSET ?1000 button, ?1002
+# button-event/drag, ?1003 any-motion, with ?1006/?1015 SGR/urxvt report
+# encodings) but a crash or abrupt exit can return without sending the matching
+# disables, so the host terminal keeps reporting: every mouse move then dumps raw
+# report bytes (e.g. `35;77;12M`) into the shell prompt. opencode owns the bug;
+# harness owns the launch, so on the way out we re-send the DECRST disables plus
+# a cursor-show to restore a sane terminal. Container mode never hits this (the
+# shell dies with the container), so this is the host-interactive path only.
+#
+# Guarded to a real TTY on stdout: a piped or redirected run must never receive
+# escape bytes, and print mode (-p) skips this entirely since its stdout is data.
+# DECRST is idempotent, so a clean opencode exit (modes already off) is a no-op.
+# Alt-screen (?1049) is intentionally left untouched: opencode restores it on a
+# normal exit and re-sending the disable could clobber scrollback.
+#
+# Split in two so the byte sequence is unit-testable without faking a TTY:
+# host_terminal_reset_seq emits the bytes unconditionally; host_reset_terminal
+# applies the TTY guard then delegates.
+host_terminal_reset_seq() {
+    printf '\033[?1000l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l\033[?2004l\033[?25h'
+}
+host_reset_terminal() {
+    [[ -t 1 ]] || return 0
+    host_terminal_reset_seq
 }
 
 # `harness host` — containerless launch. `harness host down` stops the proxy.
