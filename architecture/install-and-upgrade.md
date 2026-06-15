@@ -3,6 +3,55 @@
 How a host gets from "fresh shell" to "running harness", and how an
 existing install moves forward as the repo evolves.
 
+## `harness-bootstrap.sh` — thin, version-stable entrypoint
+
+A redistribution problem: a distributor who ships a config bundle
+(`harness-install.sh` + a pre-edited `.env` + `.harness-allowlist`) pins the
+installer at bundle time, so it goes stale as the install procedure evolves
+(new prompts, new state dirs, new seeding logic). The clone would still pull
+current *code*, but the install *logic* would run from the stale bundled
+script.
+
+`harness-bootstrap.sh` solves this by inverting what gets bundled. It is a
+thin entrypoint that carries only the minimal pre-clone step and then hands
+off to a freshly fetched installer:
+
+1. Resolve its own directory (the bundle dir holding `.env` +
+   `.harness-allowlist`) from `BASH_SOURCE`, falling back to `$PWD`.
+2. Read `HTTP_PROXY`/`HTTPS_PROXY` from the bundled `.env` and export them
+   (both upper- and lower-case, for libcurl) so the fetch below works behind a
+   corp proxy. Same precedence as the installer: a blank/absent value leaves
+   the host's exported proxy untouched. The installer then re-reads the same
+   `.env` for its own clone and persists it, so `.env` stays the single source
+   of truth.
+3. Fetch the **current** `harness-install.sh`. A local-path `HARNESS_REPO_URL`
+   (tests, local installs) is copied straight out of the tree; otherwise the
+   raw script is fetched from `raw.githubusercontent.com/<slug>/<ref>/` via
+   curl or wget. `HARNESS_INSTALL_REF` pins a ref (default `main`). The fetched
+   file is shebang-checked (a captive-portal HTML 200 is rejected) before use;
+   on any fetch/validation failure the bootstrap falls back to a bundled
+   `harness-install.sh` if one is present, else aborts.
+4. Hand off. The fetched installer lands **in the bundle dir** (as
+   `.harness-install.fetched.sh`), so its `$script_dir` resolves to the bundle
+   dir and it finds `.env`/`.harness-allowlist` beside it exactly as a direct
+   run would. If the bootstrap was **sourced**, it `source`s the installer (so
+   the installer's PATH export reaches the user's shell) and returns its rc;
+   if **executed**, it runs the installer as a child and exits its rc. The
+   fetched temp is removed afterward (never a bundled copy). Like the
+   installer, the bootstrap only enables `set -euo pipefail` when executed, so
+   a sourced run never mutates the user's interactive shell options.
+
+So a distributor maintains three files (`harness-bootstrap.sh` + `.env` +
+`.harness-allowlist`); the bootstrap basically never changes, and the install
+procedure is always whatever is on the fetched ref. New `.env` variables added
+upstream do not need to enter the bundle — `harness upgrade` and the
+agent-launch config merge append them from `.env.example` (see below), so the
+bundle only carries the distributor's own customized values. The
+cross-version contract is just that `harness-install.sh` keeps reading config
+from `$script_dir` (already load-bearing) and stays at a stable raw URL; the
+bootstrap adds no new flag to the installer. Covered by
+`tests/unit_bootstrap_test.sh` (docker-free).
+
 ## `harness-install.sh`
 
 A standalone bash script users download from the repo's `main` branch and

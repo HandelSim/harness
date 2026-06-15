@@ -45,6 +45,29 @@ it — the installer copies them into the install root (the originals are left
 in place, so you can ship `harness-install.sh` + `.env` + `.harness-allowlist`
 as a single folder).
 
+### Distributing a config bundle that stays current
+
+If you redistribute harness with a pre-edited `.env` + `.harness-allowlist`,
+bundle **`harness-bootstrap.sh`** instead of a pinned `harness-install.sh`.
+The bootstrap is a thin, version-stable entrypoint: it reads any
+`HTTP_PROXY`/`HTTPS_PROXY` from your bundled `.env`, fetches the *current*
+`harness-install.sh` from the repo, and hands off to it. The install logic is
+always up to date even though your bundle never changes — you maintain three
+small files (`harness-bootstrap.sh` + `.env` + `.harness-allowlist`) and the
+clone, config seeding, and PATH setup come from upstream at install time.
+
+```bash
+# in the folder holding your .env + .harness-allowlist + harness-bootstrap.sh
+source ./harness-bootstrap.sh           # or: bash ./harness-bootstrap.sh
+HARNESS_INSTALL_REF=v1.0 source ./harness-bootstrap.sh   # pin a release
+```
+
+New `.env` variables added upstream do not need to go into your bundle:
+`harness upgrade` (and the config-merge offered at each agent launch) append
+them from `.env.example` without touching your custom values, so you only edit
+the bundle to change one of *your own* values. See
+[architecture/install-and-upgrade.md](architecture/install-and-upgrade.md).
+
 (On Windows, use Git Bash. See [docs/WINDOWS.md](docs/WINDOWS.md) for
 Windows-specific setup. To run with Podman instead of Docker, see
 [docs/PODMAN.md](docs/PODMAN.md).)
@@ -72,7 +95,8 @@ rm ~/.local/bin/harness
 ```
 harness/
 ├── harness                  management CLI
-├── harness-install.sh       bootstrap installer (run once after cloning)
+├── harness-bootstrap.sh     thin version-stable entrypoint: fetches + runs the current installer
+├── harness-install.sh       installer (clone + seed config + PATH); run once
 ├── docker-compose.yml       services: proxy, agents
 ├── .env.example             documented env variables (copy to ./.env at the install root)
 ├── proxy/                   the translating proxy

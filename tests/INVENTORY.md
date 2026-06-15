@@ -466,6 +466,26 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | I050 | The docker wrappers (`harness_docker`, `harness_docker_winpty`, `harness_docker_exec`, `harness_runtime_tty_ok`) export MSYS_NO_PATHCONV=1 AND MSYS2_ARG_CONV_EXCL='*' into bash's own env (via `local -x` / `export`) on Windows so MSYS argv conversion does not rewrite container-internal paths or path-list-convert `-v src:tgt` composites; pass-through on Linux/macOS (issue #112 root cause) |
 | I051 | `harness_add_bind_mount` appends a single `--mount=type=bind,source=,target=[,readonly]` token on Windows (no bare `:` composite for MSYS/winpty path-list conversion to mangle into `invalid mode: …`) and the classic `-v src:tgt[:ro]` two tokens on Linux/macOS; used for all agent/shell bind mounts at the three launch sites (issue #112 winpty path) |
 
+## Bootstrap (B###)
+
+Behaviors of `harness-bootstrap.sh`, the thin version-stable entrypoint that
+fetches the current `harness-install.sh` and hands off to it. Driven
+docker-free and network-free by pointing `HARNESS_REPO_URL` at a local stub
+"repo".
+
+| ID | Behavior |
+|----|----------|
+| B001 | Resolves its own directory (the bundle dir holding `.env`/`.harness-allowlist`) from `BASH_SOURCE`, falling back to `$PWD` |
+| B002 | Reads `HTTP_PROXY`/`HTTPS_PROXY` from the bundled `.env` and exports them (upper- and lower-case) for the fetch; a blank/absent value leaves the host's exported proxy untouched |
+| B003 | Fetches the current `harness-install.sh`: copies straight out of the tree when `HARNESS_REPO_URL` is a local path, else fetches the raw script from `raw.githubusercontent.com/<slug>/<ref>/` via curl or wget |
+| B004 | `HARNESS_INSTALL_REF` pins the fetched ref (default `main`); `HARNESS_REPO_URL` overrides the repo/fork |
+| B005 | Shebang sanity check: a fetched file whose first line is not `#!` (e.g. a captive-portal HTML 200) is rejected |
+| B006 | On fetch/validation failure, falls back to a bundled `harness-install.sh` if present (printing a notice), else aborts; the abort terminates a sourced run too (`return`/`exit` at top level) |
+| B007 | The fetched installer lands in the bundle dir (as `.harness-install.fetched.sh`) so its `$script_dir` resolves to the bundle dir and it finds `.env`/`.harness-allowlist` beside it |
+| B008 | Hands off by `source`ing the installer when itself sourced (PATH export reaches the user's shell) and returns its rc; executes it as a child and exits its rc otherwise |
+| B009 | Only enables `set -euo pipefail` when executed; a sourced run does not leak strict mode into the user's interactive shell |
+| B010 | Removes the fetched temp after handoff; never removes a bundled `harness-install.sh` (name does not match the temp) |
+
 ## Host mode — containerless (Ho###)
 
 Behaviors of the `harness host` path (host_* helpers in `harness`). These run
