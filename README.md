@@ -1,484 +1,227 @@
 # harness
 
-A container-runtime-based system that lets you launch a coding agent
-(opencode) against a third-party API endpoint, transparently.
-The agent runs in a container and talks to a translating proxy over an
-OpenAI-compatible interface; the proxy calls the upstream API.
-
-Supported runtimes: **Docker** (default) and **Podman** (Linux, rootless).
-See [docs/PODMAN.md](docs/PODMAN.md) for podman-specific notes. The runtime
-is auto-detected (docker first, then podman), and overridable via
-`HARNESS_CONTAINER_RUNTIME` in `.env` or the environment.
+Run a coding agent (opencode) against any third-party LLM API, sandboxed.
+The agent runs in a container and speaks an OpenAI-compatible wire format to
+a local translating proxy; the proxy calls your upstream API and adapts the
+request/response (including injecting tool-use instructions and parsing tool
+calls back out, since most upstreams don't support tools natively).
 
 ```
 agent container ──► proxy ──► upstream API
-
-  • proxy:  exposes an OpenAI-compatible endpoint opencode talks to directly,
-            translates between that wire format and the upstream's, AND
-            injects tool-use instructions / parses tool calls (since the
-            upstream doesn't natively support tool calls)
+                    (translates wire format + tool calls)
 ```
 
-This repo is the source for the harness runtime AND the installer. The
-installer clones the repo into `./harness/` (the install root); code,
-user config, and runtime state all live inside it.
+Everything lives in one self-contained folder: the installer clones this repo
+into `./harness/`, and that clone is the install root. Code, your config, and
+runtime state all live inside it.
 
-## Installation
+Runtimes: **Docker** (default) or **Podman** (Linux, rootless). Auto-detected
+(docker first), overridable with `HARNESS_CONTAINER_RUNTIME`. See
+[docs/PODMAN.md](docs/PODMAN.md). No container runtime at all? See
+[host mode](#host-mode-no-container-runtime).
 
-Download `harness-install.sh` and run it from an empty directory:
+## Install
+
+Run the installer from the directory where you want `./harness/` created:
 
 ```bash
-mkdir -p ~/harness-install && cd ~/harness-install
 curl -fsSL -o harness-install.sh https://raw.githubusercontent.com/HandelSim/harness/main/harness-install.sh
 bash harness-install.sh
 ```
 
-The installer clones the repo into `./harness/` (the install root), seeds
-`.env` and `.harness-allowlist` from their `.example` templates, and writes
-a `harness` wrapper to `~/.local/bin/harness`. It also offers to capture your
-upstream API key and write it into `PROXY_API_KEY` for you (decline to set it
-manually later).
+It runs preflight checks, clones the repo into `./harness/`, seeds `.env` and
+`.harness-allowlist` from their `.example` templates, and installs a `harness`
+wrapper into `~/.local/bin`. It offers to capture your upstream API key (or set
+`PROXY_API_KEY` in `.env` yourself afterward).
 
-To skip the post-install config edit entirely, drop a pre-edited `.env`
-and/or `.harness-allowlist` **next to `harness-install.sh`** before running
-it — the installer copies them into the install root (the originals are left
-in place, so you can ship `harness-install.sh` + `.env` + `.harness-allowlist`
-as a single folder).
+On Windows, run it from Git Bash ([docs/WINDOWS.md](docs/WINDOWS.md)).
 
-### Distributing a config bundle that stays current
+**Then:**
 
-If you redistribute harness with a pre-edited `.env` + `.harness-allowlist`,
-bundle **`harness-bootstrap.sh`** instead of a pinned `harness-install.sh`.
-The bootstrap is a thin, version-stable entrypoint: it reads any
+1. Set the three REQUIRED values in `./harness/.env` if they aren't already:
+   `PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME`.
+2. `cd` into any project and run `harness`. The first run builds the container
+   images (a few minutes); later runs start in seconds.
+
+Uninstall: `rm -rf ./harness && rm ~/.local/bin/harness`.
+
+### Shipping a pre-configured bundle
+
+To redistribute harness with a pre-edited `.env` + `.harness-allowlist`, bundle
+**`harness-bootstrap.sh`** instead of a pinned `harness-install.sh`. The
+bootstrap is a thin, version-stable entrypoint: it reads any
 `HTTP_PROXY`/`HTTPS_PROXY` from your bundled `.env`, fetches the *current*
-`harness-install.sh` from the repo, and hands off to it. The install logic is
-always up to date even though your bundle never changes — you maintain three
-small files (`harness-bootstrap.sh` + `.env` + `.harness-allowlist`) and the
-clone, config seeding, and PATH setup come from upstream at install time.
+`harness-install.sh` from the repo, and hands off to it. Your bundle never goes
+stale because the install logic always comes from upstream.
 
 ```bash
-# in the folder holding your .env + .harness-allowlist + harness-bootstrap.sh
-source ./harness-bootstrap.sh           # or: bash ./harness-bootstrap.sh
+# in the folder holding harness-bootstrap.sh + .env + .harness-allowlist
+source ./harness-bootstrap.sh                            # or: bash ./harness-bootstrap.sh
 HARNESS_INSTALL_REF=v1.0 source ./harness-bootstrap.sh   # pin a release
+HARNESS_REPO_URL=https://github.com/you/harness source ./harness-bootstrap.sh   # fork/mirror
 ```
 
-New `.env` variables added upstream do not need to go into your bundle:
-`harness upgrade` (and the config-merge offered at each agent launch) append
-them from `.env.example` without touching your custom values, so you only edit
-the bundle to change one of *your own* values. See
+If the fetch fails (offline, bad ref), it falls back to a bundled
+`harness-install.sh` if you ship one, else aborts cleanly. New upstream `.env`
+variables do not need to enter your bundle: `harness upgrade` merges them in
+from `.env.example` without touching your values, so you only edit the bundle to
+change your *own* values. Details:
 [architecture/install-and-upgrade.md](architecture/install-and-upgrade.md).
 
-(On Windows, use Git Bash. See [docs/WINDOWS.md](docs/WINDOWS.md) for
-Windows-specific setup. To run with Podman instead of Docker, see
-[docs/PODMAN.md](docs/PODMAN.md).)
+## Running
 
-After install:
-1. If you didn't enter an API key at the prompt (or pre-place a `.env`),
-   edit `~/harness-install/harness/.env` and set `PROXY_API_KEY` (and any
-   other required values for your upstream).
-2. cd into a project directory and run `harness` (or, equivalently,
-   `harness opencode`).
-   The folder you launch from is bind-mounted into the container at the
-   same absolute path, so `pwd` inside the agent matches your host shell.
-   Pass `--mount /some/host/path` (repeatable) to bind-mount additional
-   folders at their host paths; `HARNESS_EXTRA_MOUNTS` in `.env` makes
-   the list sticky.
+Bare `harness` (or `harness opencode`) launches an opencode agent in the current
+directory. The directory you launch from is bind-mounted into the container at
+the **same absolute path**, so `pwd` inside the agent matches your host shell and
+absolute paths in code and logs round-trip cleanly.
 
-To uninstall:
+Mount extra folders (repeatable, mounted at their same host path):
+
 ```bash
-rm -rf ~/harness-install/harness
-rm ~/.local/bin/harness
-```
-
-## Repo structure
-
-```
-harness/
-├── harness                  management CLI
-├── harness-bootstrap.sh     thin version-stable entrypoint: fetches + runs the current installer
-├── harness-install.sh       installer (clone + seed config + PATH); run once
-├── docker-compose.yml       services: proxy, agents
-├── .env.example             documented env variables (copy to ./.env at the install root)
-├── proxy/                   the translating proxy
-├── agents/                  agent image (Dockerfile + entrypoint
-│                            with mode dispatch: opencode, shell)
-├── mcp-registry/            vetted MCP service definitions
-└── scripts/
-    ├── proxy_test.sh        proxy translation tests (OpenAI-compatible chat-completions)
-    ├── harness_test.sh      management script tests
-    ├── persistence_test.sh  persistent home + skel-seed test
-    ├── mcp_test.sh          MCP install/enable/disable/uninstall lifecycle test
-    ├── firewall_test.sh     firewall guardrail (negative) + bypass
-    ├── upgrade_test.sh      upgrade actions library + synthetic version transition
-    ├── full_pipeline_test.sh end-to-end install → run → print-mode round-trip
-    ├── integration_test.sh  end-to-end Serena MCP + Graphify skill (HARNESS_RUN_SLOW=1)
-    ├── lib/                 sourceable test toolkits (test_helpers, net_helpers)
-    └── fixtures/
-        ├── responses/       mock_upstream fixture dispatch table
-        └── test-project/    small Python calculator package used by integration_test.sh
-```
-
-## Persistent agent home
-
-A single bind-mounted home — `<install-root>/state/agent/home/` — backs
-every agent invocation (opencode, shell). Anything a user installs
-inside an agent (`pipx install graphifyy`, `pip install --user requests`,
-custom dotfiles) is visible across all modes and survives container
-rebuilds. The image's build-time home contents are snapshotted into
-`/etc/skel/harness/`, and the entrypoint copies them into an empty bind
-mount on first run, marking with `~/.harness-home-initialized` so
-subsequent runs skip the seed.
-
-## Mounts: same-path host ↔ container
-
-The folder you run `harness` / `harness opencode` / `harness shell`
-from is bind-mounted into the container at the **same absolute path** —
-no `/workspace` indirection. `pwd` inside the agent matches your host
-shell, which means absolute paths in code, log files, and tool output
-round-trip cleanly.
-
-### `--mount` (extra folders, repeatable)
-
-```
 harness --mount /home/me/refs --mount /home/me/data
 ```
 
-Each `--mount` adds another host folder bind-mounted at its same
-absolute path inside the container. Rules:
+Paths must exist and be directories; the CWD is always mounted and is always the
+start dir; container infrastructure paths (`/etc`, `/usr`, ...) are refused. For
+a sticky list, set `HARNESS_EXTRA_MOUNTS=/path/a:/path/b` (colon-separated) in
+`.env`. More: [architecture/containers.md](architecture/containers.md).
 
-- Path must exist as a directory at launch time. Missing paths produce a
-  hard error before the container starts.
-- Relative paths are resolved against the current directory.
-- The CWD is ALWAYS mounted regardless of `--mount` flags, and the agent
-  always starts in the CWD — extras never override the starting dir.
-- Nested mounts are fine: running `harness` from
-  `/home/me/proj/sub` while passing `--mount /home/me/proj` is valid;
-  Docker layers the mounts at their respective targets and both are
-  readable. Duplicate paths (or passing the CWD as `--mount`) are
-  deduped.
-- Paths under container infrastructure (`/etc`, `/usr`, `/home/harness`,
-  `/var`, etc.) are refused with a clear error so you can't accidentally
-  shadow the agent image.
-
-### `HARNESS_EXTRA_MOUNTS` (sticky, .env)
-
-For setups that always want the same extras, put them in
-`<install-root>/.env`:
+### Common commands
 
 ```
-HARNESS_EXTRA_MOUNTS=/home/me/refs:/home/me/data
+harness [flags]        launch opencode in the CWD (default command)
+harness shell          bash shell inside the agent container (same home as opencode)
+harness host           containerless mode (see below)
+harness --net          this launch only: full outbound network, firewall off
+harness --yolo         pass-through: auto-approve / skip permissions
+
+harness start|down|restart    manage the shared stack (proxy + enabled MCPs)
+harness update                fast-forward git pull, code only
+harness upgrade               git pull + migrate config + restart
+harness mcp ...               manage MCP servers (see MCPs)
+harness net ...               manage the egress allowlist (see Firewall)
+harness doctor                environment + network diagnostics
+harness preflight             validate .env and allowlist
+harness test [section]        run the test suite
 ```
 
-Colon-separated list. Merged with any per-launch `--mount` flags;
-deduped. Same validation rules as `--mount`.
+Any flag harness doesn't recognize is passed straight through to opencode.
 
-### Windows note
+### Host mode (no container runtime)
 
-Git Bash uses MSYS-style absolute paths (`/c/Users/you/proj`). Inside
-the container the same form is used, so `pwd` inside the agent matches
-what you see in your host Git Bash session. (`harness_docker_path` in
-`scripts/lib/platform.sh` rewrites the source side of `-v` to the
-mixed-form Windows path Docker Desktop expects; the target side is
-untouched.)
+`harness host` runs the proxy + opencode as plain host processes, no docker. The
+first run auto-fetches its deps (jq, Node >= 20, opencode) into
+`state/host/toolchain/`; you only need Python 3. Host mode has **no egress
+firewall** and runs as your full host user, so it prompts to confirm on every
+launch (`HARNESS_HOST_CONFIRM=1` to skip in automation). Prefer the sandboxed
+container mode; host mode is the fallback.
 
-## MCP registry
+## Egress firewall
 
-Long-running MCP servers — Serena, etc. — are described by a small set of
-files under `mcp-registry/<name>/`:
-
-- `compose.yml` — partial compose snippet defining the service. References
-  the `harness_harness-net` network as external so it merges cleanly with
-  the main `docker-compose.yml`. Lives behind the `mcp` profile so
-  `docker compose up` without the profile leaves it alone.
-- `client-config.json` — the entry that gets merged into the agent's MCP
-  config. Uses the `{"mcpServers": {"<name>": {...}}}` shape.
-- `README.md` — what the service does, what it mounts, security notes.
-
-### Lifecycle
-
-The MCP lifecycle has four state-changing verbs and a few inspection verbs.
-The state diagram is:
+Every container on `harness-net` boots with iptables/ipset rules that drop all
+egress except DNS, the `PROXY_API_URL` host, and the hosts in
+`<install-root>/.harness-allowlist` (one per line; a trailing `# git-push` also
+opens that host's git ports).
 
 ```
-available ──install──► installed-enabled ⇄ disable / enable ⇄ installed-disabled ──uninstall──► available
+harness net list                         show every allowed host
+harness net allow github.com --git-push  add a host
+harness net deny example.com             remove a host
+harness net status                       allowlist size + open services
+harness net open <service>               disable the firewall for one service
+harness net close <service>              restore it
 ```
 
-Per-install state lives in `<install-root>/state/mcp/<name>/harness-meta.json`
-(`{"enabled": true|false}`).
+`net open` requires typing `I understand the risks` on a TTY. `--net` disables
+the firewall for a single agent launch only and prints a loud warning. Run
+`harness restart` after editing the allowlist.
 
-| Verb                                  | What it does                                                                 |
-| ------------------------------------- | ---------------------------------------------------------------------------- |
-| `harness mcp install <name>`          | Copy registry entry → active tree, set `enabled: true`. Re-install needs `--force`. |
-| `harness mcp uninstall <name> --force` | Remove the active entry. `data/` is preserved.                              |
-| `harness mcp enable <name>`           | State toggle: set `enabled: true`. Included the next time the stack starts.  |
-| `harness mcp disable <name>`          | State toggle: set `enabled: false`. Files stay; skipped the next time the stack starts. |
-| `harness mcp up <name>`               | Manually start the container (works even if disabled).                       |
-| `harness mcp down <name>`             | Manually stop the container without flipping `enabled`.                      |
-| `harness mcp logs <name>`             | `docker compose logs -f` for the MCP's services.                             |
-| `harness mcp status <name>`           | Print state, enabled flag, runtime status, paths, services.                  |
-| `harness mcp list`                    | Installed entries with `STATE` column.                                       |
-| `harness mcp list --available`        | Installed entries plus registry entries not yet installed.                   |
+## MCPs
 
-The four lifecycle verbs (`install` / `uninstall` / `enable` / `disable`)
-are distinct and idempotent. `enable`/`disable` only flip the auto-start
-flag on an already-installed entry; they do not install or uninstall.
-
-### Adding new MCPs
-
-Currently supported: HTTP/SSE MCPs in Docker containers (Pattern A). To
-add a new MCP, fork the repo and add a directory under `mcp-registry/<name>/`
-containing:
-
-- `compose.yml` — partial compose snippet defining the service. References
-  the `harness_harness-net` network as external so it merges cleanly with
-  the main `docker-compose.yml`. Lives behind the `mcp` profile so
-  `docker compose up` without the profile leaves it alone.
-- `client-config.json` — the entry that gets merged into the agent's MCP
-  config. Uses the `{"mcpServers": {"<name>": {...}}}` shape.
-- `harness-meta.json.template` — metadata. Materialized into the active
-  tree as `harness-meta.json` on install. Optional `repo_clone_url`
-  (and `repo_clone_ref`, defaulting to `main`) cause `harness mcp install`
-  to git-clone the upstream repo into `state/mcp/<name>/repo/`; the
-  compose snippet then uses `${INSTALL_ROOT}/state/mcp/<name>/repo` as
-  the build context. (Avoids docker's git-URL build-context handling,
-  which fails on Windows.) `repo_clone_ref` may be a branch name, a tag,
-  or a full 40-character commit SHA; short SHAs are not supported (git's
-  smart-http fetch protocol rejects them).
-- `README.md` — what the MCP does and any required env vars.
-
-See `mcp-registry/serena/` as the reference example. Submit a PR to add
-to the official registry. For private/internal MCPs, fork the repo and
-maintain your own registry entry.
-
-### Installing skills (graphify, etc.)
-
-Skills are CLI tools the agent invokes. To install one:
-
-**Easy way (recommended):** ask the agent. From inside `harness`:
-
-> Please install graphify by running `pipx install graphifyy` and then
-> `graphify install`.
-
-The agent runs the commands inside the container, registers the skill,
-and confirms.
-
-**Direct way:** run `harness shell` to drop into a bash shell inside the
-agent container. Run the install commands yourself, exit. The shell
-shares the same persistent home as `harness` / `harness opencode`, so the
-install is available everywhere.
-
-Either way, the install persists across container restarts and
-`harness upgrade`.
-
-## Universal egress firewall
-
-Every container on `harness-net` boots with iptables/ipset rules that drop
-egress except to:
-
-- DNS (UDP/53)
-- the configured `PROXY_API_URL` host (resolved at boot)
-- entries in `<install-root>/.harness-allowlist` (one host per line; lines
-  ending `# git-push` are also allowed to reach the SSH/HTTPS git ports of
-  that host)
-
-The image built from `firewall/init-firewall.sh` runs as a privileged
-init-container per service (`NET_ADMIN`, `NET_RAW`). The seed allowlist
-ships as `.harness-allowlist.example`; `harness-install.sh` copies it to
-`<install-root>/.harness-allowlist` on first run.
-
-### `harness net` — managing the allowlist + bypass overrides
+Long-running MCP servers (Serena, etc.) are defined under `mcp-registry/<name>/`
+and managed with:
 
 ```
-harness net list                        # show every host (pull/push)
-harness net allow github.com --git-push # add a host
-harness net deny example.com            # remove a host
-harness net edit                        # open in $EDITOR
-harness net status                      # allowlist size + open services
-harness net open <service>              # disable firewall for one service
-harness net close <service>             # restore the firewall
+harness mcp list [--available]   installed entries (and registry entries not yet installed)
+harness mcp install <name>       copy registry entry into the active tree, enabled
+harness mcp uninstall <name> --force   remove it (data/ preserved)
+harness mcp enable|disable <name>      flip auto-start without (un)installing
+harness mcp up|down <name>             start/stop manually
+harness mcp status|logs <name>         inspect
 ```
 
-`net open` requires you to type the literal phrase `I understand the risks`
-on a TTY prompt — scripts cannot bypass this. `<service>` is one of
-`proxy`, `agent`, or any installed MCP service. State lives in
-`<install-root>/.harness-net-overrides.json` (managed by the script;
-override the path via `HARNESS_NET_OVERRIDES_PATH` for tests). Run
-`harness restart` after any mutation to apply it to live containers.
+`enable`/`disable` only toggle whether an installed MCP auto-starts with the
+stack. Authoring new registry entries and the lifecycle state machine:
+[architecture/mcp.md](architecture/mcp.md).
 
-### `--net` per-launch bypass
-
-```
-harness --net             # this launch only — full outbound network
-```
-
-Sets `HARNESS_FIREWALL_DISABLED=1` for the agent container only; the next
-launch (without `--net`) goes back to the universal firewall. A loud
-warning prints to stderr when the flag is in effect.
-
-### `harness doctor [network]`
-
-`harness doctor` reports a `[network]` section listing the allowlist path,
-host count, whether `PROXY_API_URL`'s host is on the list, and any
-services with active overrides.
-
-### MCP `allowed_domains`
-
-If a registry MCP's `harness-meta.json.template` declares
-`allowed_domains: ["api.example.com", ...]`, `harness mcp install` prints a
-recommendation block with the matching `harness net allow` commands. The
-allowlist is **never** modified automatically — the user copy-pastes what
-they actually want.
-
-## Layout
-
-The clone IS the install root. Code, user config, and runtime state all
-live inside it; user config and `state/` are gitignored:
-
-```
-<install-root>/                 the git clone (e.g. ~/harness/)
-├── .git/                       managed by `harness update` / `harness upgrade`
-├── harness-install.sh, harness, docker-compose.yml, ...   tracked code
-├── .env                        your config (gitignored)
-├── .harness-allowlist          egress allowlist (gitignored)
-├── .harness-net-overrides.json firewall overrides (gitignored)
-└── state/                      runtime state (gitignored)
-    ├── output/                 proxy debug dumps
-    ├── agent/home/             shared /home/harness for every agent
-    └── mcp/<name>/             active MCP services (compose.yml + data)
-```
-
-To uninstall: `rm -rf <install-root> && rm ~/.local/bin/harness`.
-
-## Local development
-
-The `.env` file lives inside the clone:
-
-```
-$ cp .env.example .env
-$ $EDITOR .env          # fill in PROXY_API_URL / PROXY_API_KEY / DEFAULT_MODEL_NAME
-$ docker compose --env-file .env up --build
-```
-
-### Iterating on the proxy
-
-If you're modifying `proxy/proxy.py` to debug or refine its behavior, you
-can rebuild and restart just the proxy service without touching anything
-else:
-
-```bash
-docker compose --project-name harness restart proxy
-```
-
-This picks up your edits in ~10-15 seconds without affecting agents or MCP
-services. Faster than `harness restart` for the proxy-iteration loop.
+**Installing skills** (graphify, etc.): ask the agent to run the install inside
+`harness`, or `harness shell` and run it yourself. Either way it lands in the
+shared agent home (`state/agent/home/`) and persists across rebuilds and
+upgrades.
 
 ## Updating
 
-`harness update` runs a fast-forward `git pull` in the clone. Use this when
-all you want is the latest harness code with no side effects.
-
-`harness upgrade` runs the full upgrade flow:
-
-1. `git pull --ff-only` in the clone
-2. Apply upgrade actions from `scripts/upgrade-manifest.json` to your install
-   root
-3. `harness down --remove-orphans` and `harness start`
-
-Upgrade actions are conservative: they add new env variables, new allowlist
-hostnames, and new config keys WITHOUT overwriting your customizations.
-Each newly-introduced item is annotated with a marker comment
-(`# Added by harness upgrade on YYYY-MM-DD`) so you can spot what changed.
+- `harness update` — fast-forward `git pull` only. Latest code, no side effects.
+- `harness upgrade` — `git pull --ff-only`, then migrate your config from the
+  upgrade manifest (adds new `.env` vars, allowlist hosts, and MCP definition
+  updates **without** overwriting your values), then restart the stack.
 
 ```
-$ harness upgrade --check         # preview only (no git pull, no writes)
-$ harness upgrade --no-prompt     # apply without the [y/n] prompt
-$ harness upgrade --no-restart    # apply without down/start (e.g. CI)
+harness upgrade --check       preview, no writes
+harness upgrade --no-prompt    apply without the [y/n] prompt
+harness upgrade --no-restart   apply without down/start (e.g. CI)
 ```
 
-### How the manifest works
+How the manifest and merge actions work:
+[architecture/install-and-upgrade.md](architecture/install-and-upgrade.md).
 
-The manifest at `scripts/upgrade-manifest.json` is the contract between the
-upstream repo and your local install root. Since B4 the install root IS the
-clone, so "managed files" means files harness writes inside the clone that
-aren't tracked git content (`.env`, `.harness-allowlist`,
-`state/mcp/<name>/`). Every `B3-MANAGED:` comment in the codebase has a
-matching manifest entry (see audit step in Phase B3 docs).
+## Layout
 
-Action types:
-
-- **envfile_merge** — appends new `KEY=VALUE` entries from the source to the
-  target, preserving existing values and surfacing the source's preceding
-  comments for context. Used for `.env`.
-- **linefile_merge** — appends new entries (one per line, `#` comments
-  ignored). If an entry exists in both files but with different inline
-  annotations (e.g. `# git-push`), the user's line is preserved and a
-  warning is emitted. Used for `.harness-allowlist`.
-- **directory_overwrite** — refreshes a managed directory tree, with an
-  explicit `preserve` list for paths inside the directory that are user or
-  system state (typically `harness-meta.json`, `data/`). Files in target
-  that don't exist in source are left in place. Used for installed MCP
-  registry definitions.
-
-Files harness manages (covered by the manifest):
-
-- `.env` — env vars merged in (preserves your values)
-- `.harness-allowlist` — new hosts appended (preserves your entries and
-  any `# git-push` annotations)
-- `state/mcp/<name>/` — definition files (`compose.yml`, `client-config.json`,
-  `README.md`) updated (preserves `harness-meta.json` enable state and
-  `data/` indexed state)
-
-Files purely user-managed (not in the manifest):
-
-- `.harness-net-overrides.json` — controlled by `harness net open/close`
-- `state/output/` — proxy debug dumps
-- **User-installed skills and `pipx` packages** under `state/agent/home/`
-  (e.g., `state/agent/home/.local/bin/graphify`).
-  These live entirely inside the bind-mounted agent home and are never
-  touched by upgrade actions. The skel-seed step in the agent entrypoint
-  only runs once per home (gated by `~/.harness-home-initialized`), so
-  reinstalling the image during `harness upgrade` does not re-seed over
-  user files.
-- **User-added MCPs** dropped manually under `state/mcp/<name>/` (i.e. an
-  MCP that did not come from the registry). The `directory_overwrite`
-  action only fires for entries that have a corresponding source under
-  `mcp-registry/<name>/`; with no source present the user dir is left
-  alone. Discovery is directory-driven — `harness mcp list` and the
-  compose merge scan `state/mcp/*/` regardless of registry origin, so a
-  custom MCP shows up alongside the registry-installed ones.
-
-To force a full reset of a harness-managed file (and lose customizations):
-delete the file in your install root, then run `harness upgrade`. The
-target-missing branch of each action will recreate it from source.
-
-## Tests
-
-Tests live under `tests/`. See `tests/README.md` for the testing guide.
-
-Quick commands:
+The clone IS the install root; your config and `state/` are gitignored:
 
 ```
-harness test              # all CI-runnable tests
-harness test proxy        # only proxy tests
-harness test unit         # fast no-docker tests
-harness test integration --slow   # full slow integration test
-
-harness benchmark smoketest          # 3-5 small tasks; verifies wiring
-harness benchmark terminal-bench     # full TB 2.0 run; 6-12 hrs
+<install-root>/                 the git clone (e.g. ~/harness/)
+├── harness                     management CLI
+├── harness-install.sh          installer (clone + seed config + PATH)
+├── harness-bootstrap.sh        version-stable entrypoint: fetches + runs the current installer
+├── docker-compose.yml          services: proxy, agent
+├── proxy/                      the translating proxy
+├── agents/                     agent image (Dockerfile + entrypoint)
+├── mcp-registry/               vetted MCP service definitions
+├── firewall/                   egress-firewall init container
+├── scripts/lib/                sourceable shell libraries (platform.sh, upgrade_actions.sh)
+├── tests/                      test suite (see tests/README.md)
+├── architecture/               per-module design docs
+├── .env                        your config (gitignored)
+├── .harness-allowlist          egress allowlist (gitignored)
+└── state/                      runtime state (gitignored): output/, agent/home/, mcp/, host/
 ```
 
-Benchmarks NEVER run in CI. They require an upstream API key and
-sufficient disk; see `tests/benchmarks/README.md`.
+## Development and tests
 
-CI runs the lint, unit, docker-tests, pipeline, integration, and
-scheme_contract jobs on every push to `dev` and `main`.
+Run the stack from a checkout without installing:
 
-## Test coverage
+```bash
+cp .env.example .env && $EDITOR .env
+docker compose --env-file .env up --build
+```
 
-| Status | Count | %    |
-|--------|-------|------|
-| Green  | 249   | 62.7 |
-| Yellow | 3     | 0.8  |
-| Red    | 145   | 36.5 |
+Tests live in `tests/` ([tests/README.md](tests/README.md)):
 
-See `tests/COVERAGE.md` for the per-item table.
+```
+harness test                  all CI-runnable tests
+harness test unit             fast, no-docker
+harness test proxy            proxy translation tests
+harness test integration --slow   full slow integration test
+```
+
+Benchmarks (`harness benchmark smoketest|terminal-bench`) need an upstream API
+key and disk, and never run in CI. CI runs lint, unit, docker-tests, pipeline,
+integration, and scheme_contract on every push to `dev`/`main`.
+
+Per-module design docs are in [architecture/](architecture/) (CLI, proxy,
+containers, MCP, install/upgrade, upstream API, tests). Live test coverage is
+tracked in [tests/COVERAGE.md](tests/COVERAGE.md).
+
+Found a bug or have an improvement, however small?
+<https://github.com/HandelSim/harness/issues>
