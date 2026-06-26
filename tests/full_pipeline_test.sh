@@ -211,11 +211,13 @@ MODEL_CONTEXT_LENGTH=200000
 MOCK_SCENARIO=text
 EOF
 
-# harness-install.sh prompts: add to PATH? [y/n], enter API key? [y/n], then
-# (on y) the key itself. Send: y, y, <key>. Supplying the key here exercises
-# issue #67's PROXY_API_KEY rewrite — the prompt value wins over the pre-placed
-# .env's PROXY_API_KEY=test-key-1234 (mock upstream ignores the key, so the
-# downstream round-trip is unaffected).
+# harness-install.sh prompts, in order: add to PATH? [y/n], enter upstream API
+# URL (Enter to skip), enter API key? [y/n], then (on y) the key itself. Send:
+# y, <blank>, y, <key>. The blank URL answer leaves the pre-placed
+# PROXY_API_URL=http://mockupstream:9000/... intact (asserted in T2), while the
+# key answer exercises issue #67's PROXY_API_KEY rewrite — the prompt value wins
+# over the pre-placed .env's PROXY_API_KEY=test-key-1234 (mock upstream ignores
+# the key, so the downstream round-trip is unaffected).
 # harness-install.sh installs into $(pwd) — must cd into TEST_ROOT first.
 # Issue #68: a corp proxy exported in the installing shell must be persisted
 # into the seeded .env (host-side — honored for host git AND for the docker
@@ -228,7 +230,7 @@ PIPE_PROXY="http://pipeline-corp-proxy.invalid:3128"
 (
     cd "${TEST_ROOT}"
     HOME="${FAKE_HOME}" HARNESS_REPO_URL="${REPO_ROOT}" HTTPS_PROXY="${PIPE_PROXY}" \
-        bash "${TEST_ROOT}/harness-install.sh" <<<$'y\ny\nharness-pipeline-prompt-key\n' >"${TEST_ROOT}/install.log" 2>&1
+        bash "${TEST_ROOT}/harness-install.sh" <<<$'y\n\ny\nharness-pipeline-prompt-key\n' >"${TEST_ROOT}/install.log" 2>&1
 )
 
 # harness-install.sh clones HEAD of the local repo, but the pipeline test is
