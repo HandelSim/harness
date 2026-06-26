@@ -93,10 +93,11 @@ run from an empty directory. Stages:
    a function that returns non-zero to abort; the top-level caller runs the
    terminating `return`/`exit` (same sourced-script constraint as preflight).
 2. **Intent prompts.** Prints what the install will do, then asks whether to
-   add a `harness` wrapper to PATH and offers to capture an upstream API key
-   now (written into `PROXY_API_KEY` in `.env` after seeding; declining leaves
-   it for the user to edit manually). No key validation — whatever is
-   pasted is accepted verbatim. The key prompt (`_read_secret_masked`) echoes
+   add a `harness` wrapper to PATH, prompts for the upstream API URL (written
+   into `PROXY_API_URL` in `.env` after seeding; blank skips), and offers to
+   capture an upstream API key now (written into `PROXY_API_KEY` in `.env` after
+   seeding; declining leaves it for the user to edit manually). No key
+   validation — whatever is pasted is accepted verbatim. The key prompt (`_read_secret_masked`) echoes
    one `*` per character instead of hiding input entirely, so a wrong/blank
    paste is visible by length without revealing the value (backspace works; it
    falls back to a fully hidden read off a tty). There is no separate "continue?" gate: the
@@ -110,8 +111,9 @@ run from an empty directory. Stages:
    the script's **top level**; a `return` buried in a helper (`fail`,
    `exit_or_return`) can't end a sourced script, which was the root cause of
    #105/#106.
-3. **Clone.** `git clone` into the install dir. **The clone IS the
-   install root** — there's no separate config dir. A failed clone (no
+3. **Clone.** `git clone` into the install dir (`--branch <name>` is added
+   when `-b/--branch` was passed, so a distributor can install off a non-default
+   branch). **The clone IS the install root** — there's no separate config dir. A failed clone (no
    network, unreachable git host, corp proxy not exported) is caught by
    checking git's exit code and aborts with an actionable message — the
    installer never proceeds past a broken clone. The clone's proxy is
@@ -144,6 +146,18 @@ run from an empty directory. Stages:
    env vars). `harness` later exports them so `docker compose build` runs
    through the proxy too; they are not forwarded into running containers (see
    [`containers.md`](containers.md)).
+7a. **Default model.** After seeding config, the installer runs the shared
+   model-menu helper: it reads `PROXY_API_URL`/`PROXY_API_KEY` from `.env`,
+   `GET`s `<url>/v1/models`, lists the returned model ids (jq if present, else a
+   grep/sed fallback), and writes the chosen one to `DEFAULT_MODEL_NAME=` (a
+   numeric pick, a typed name, or Enter to keep the current value). If the list
+   can't be fetched (missing url/key, no curl, or an error) it falls back to a
+   free-text `DEFAULT_MODEL_NAME` prompt. The same helper backs the `-m` flag
+   below.
+7b. **Allowlist auto-add.** The hostname from `PROXY_API_URL` (scheme/path/port
+   stripped) is appended to `.harness-allowlist` if not already present, so the
+   container egress firewall doesn't silently block the LLM provider — the most
+   common fresh-install failure. A blank `PROXY_API_URL` warns instead.
 8. **PATH wrapper.** Writes a `harness` script wrapper to
    `~/.local/bin/harness` that `exec`s into `<install-root>/harness`.
    Prints a one-line "add to PATH" reminder if `~/.local/bin` isn't
@@ -158,7 +172,31 @@ run from an empty directory. Stages:
    printed run command is host-aware: on a `HOST_ONLY` install (no runtime
    detected) the "Next" steps say `harness host`, otherwise `harness`.
 
-Uninstall is `rm -rf <install-root> && rm ~/.local/bin/harness`.
+Uninstall is `rm -rf <install-root> && rm ~/.local/bin/harness`, or the `-u`
+flag below.
+
+### Standalone flag modes
+
+Argument parsing at the top of the script recognizes four flags. `-b/--branch`
+only feeds the clone (stage 3); the other three each **short-circuit the normal
+install** (they run before preflight is called, locate the existing install root
+by probing `$install_root`, `$cwd`, then `$script_dir` for a `.env`, act, and
+exit):
+
+- **`-m` / `--model-menu`** — re-run the stage-7a model menu against an existing
+  install to change `DEFAULT_MODEL_NAME`. No reinstall.
+- **`-c` / `--check`** — host-side connectivity diagnostics for a configured
+  install (no container needed): confirms the API host is in
+  `.harness-allowlist`, does a `GET /v1/models` with SSL verification, retries
+  with `-k` on failure to distinguish a network error from an untrusted
+  certificate (common on internal CAs — points the user at `PROXY_API_CACERT`),
+  reports the HTTP status, and validates `DEFAULT_MODEL_NAME` against the
+  returned list.
+- **`-u` / `--uninstall`** — show exactly what will be removed, confirm
+  (`type 'yes'`), stop the project's containers (`<runtime> compose ... down
+  --remove-orphans --volumes`), wipe `state/` first (Docker Desktop on Windows
+  can hold handles and recreate the skeleton after `rm -rf`), then remove the
+  install root and the PATH wrapper.
 
 ## `harness update` — code-only
 

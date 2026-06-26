@@ -79,6 +79,39 @@ REPO_URL="${HARNESS_REPO_URL:-https://github.com/HandelSim/harness}"
 CLONE_DIR="harness"
 PROGRAM_NAME="harness"
 LOCAL_BIN="$HOME/.local/bin"
+BRANCH=""
+MODEL_MENU=0
+CONN_CHECK=0
+UNINSTALL=0
+
+# --- argument parsing -------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--branch)
+            [[ -z "${2:-}" ]] && { fail "-b requires a branch name"; (( HARNESS_INSTALL_SOURCED )) && return 1; exit 1; }
+            BRANCH="$2"
+            shift 2
+            ;;
+        -m|--model-menu)
+            MODEL_MENU=1
+            shift
+            ;;
+        -c|--check)
+            CONN_CHECK=1
+            shift
+            ;;
+        -u|--uninstall)
+            UNINSTALL=1
+            shift
+            ;;
+        *)
+            fail "unknown option: $1"
+            (( HARNESS_INSTALL_SOURCED )) && return 1
+            exit 1
+            ;;
+    esac
+done
 
 # --- ANSI colors ------------------------------------------------------------
 # Disabled if stdout is not a tty.
@@ -265,6 +298,252 @@ _inline_check_either_command() {
     fi
     echo "  ✗ $desc — neither '$cmd_a' nor '$cmd_b' found in PATH"
     return 1
+}
+
+# --- model menu helper ------------------------------------------------------
+#
+# Shared by the -m / --model-menu standalone mode and the "configuring default
+# model" step during a normal install. Reads PROXY_API_URL and PROXY_API_KEY
+# from $install_root/.env, queries GET /v1/models, and writes the chosen model
+# to DEFAULT_MODEL_NAME. Pressing Enter without a value skips the write.
+
+_run_model_menu() {
+    local env_file="$install_root/.env"
+    echo "  reading $env_file"
+    local api_url api_key cur_model
+    api_url=$(grep  -E '^PROXY_API_URL='       "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+    api_key=$(grep  -E '^PROXY_API_KEY='       "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+    cur_model=$(grep -E '^DEFAULT_MODEL_NAME=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+
+    local -a model_list=()
+
+    if [[ -n "$api_url" && -n "$api_key" ]] && command -v curl >/dev/null 2>&1; then
+        local models_url="${api_url%/}/v1/models"
+        echo "  querying ${models_url}..."
+        local response
+        response=$(curl -sf --max-time 10 \
+            -H "Authorization: Bearer ${api_key}" \
+            -H "Content-Type: application/json" \
+            "$models_url" 2>/dev/null) || response=""
+
+        if [[ -n "$response" ]]; then
+            local m
+            if command -v jq >/dev/null 2>&1; then
+                while IFS= read -r m; do
+                    if [[ -n "$m" ]]; then model_list+=("$m"); fi
+                done < <(printf '%s' "$response" | jq -r '.data[].id' 2>/dev/null)
+            else
+                # Portable grep+sed fallback when jq is absent
+                while IFS= read -r m; do
+                    if [[ -n "$m" ]]; then model_list+=("$m"); fi
+                done < <(printf '%s' "$response" \
+                    | grep -o '"id":"[^"]*"' \
+                    | sed 's/^"id":"//;s/"$//')
+            fi
+        fi
+    fi
+
+    local selected_model=""
+    if (( ${#model_list[@]} > 0 )); then
+        echo "  Available models:"
+        local i=1 m
+        for m in "${model_list[@]}"; do
+            printf '    %2d) %s\n' "$i" "$m"
+            i=$((i + 1))
+        done
+        if [[ -n "$cur_model" ]]; then echo "  (current: $cur_model)"; fi
+        echo
+        local choice
+        while true; do
+            read -rp "  select a model (1-${#model_list[@]}) or type a name [Enter to keep current]: " choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#model_list[@]} )); then
+                selected_model="${model_list[$((choice - 1))]}"
+                break
+            elif [[ -n "$choice" ]]; then
+                selected_model="$choice"
+                break
+            else
+                break  # empty input → skip
+            fi
+        done
+    else
+        if [[ -z "$api_url" || -z "$api_key" ]]; then
+            warn "cannot fetch model list — missing value(s) in $env_file:"
+            [[ -z "$api_url" ]] && echo "  PROXY_API_URL is blank — edit $env_file and set it" >&2
+            [[ -z "$api_key" ]] && echo "  PROXY_API_KEY is blank — edit $env_file and set it" >&2
+        elif ! command -v curl >/dev/null 2>&1; then
+            warn "curl not found; cannot fetch model list"
+        else
+            warn "could not fetch models from ${api_url%/}/v1/models"
+        fi
+        if [[ -n "$cur_model" ]]; then echo "  (current: $cur_model)"; fi
+        read -rp "  enter DEFAULT_MODEL_NAME (e.g. gpt-4o) or press Enter to keep current: " selected_model
+    fi
+
+    if [[ -n "$selected_model" ]]; then
+        local model_tmp="$env_file.tmp.$$"
+        local key_written=0 line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*DEFAULT_MODEL_NAME= ]]; then
+                printf 'DEFAULT_MODEL_NAME=%s\n' "$selected_model"
+                key_written=1
+            else
+                printf '%s\n' "$line"
+            fi
+        done <"$env_file" >"$model_tmp"
+        if (( ! key_written )); then
+            printf 'DEFAULT_MODEL_NAME=%s\n' "$selected_model" >>"$model_tmp"
+        fi
+        mv -f "$model_tmp" "$env_file"
+        ok "set DEFAULT_MODEL_NAME=$selected_model in $env_file"
+    else
+        if [[ -z "$cur_model" ]]; then
+            warn "DEFAULT_MODEL_NAME not set; edit $env_file before running harness"
+        else
+            ok "DEFAULT_MODEL_NAME unchanged ($cur_model)"
+        fi
+    fi
+}
+
+# --- connectivity check helper ----------------------------------------------
+#
+# Used by -c / --check mode. Runs from the HOST (not inside the container) to
+# validate credentials and URL format before debugging the container stack.
+# Tests:
+#   1. Allowlist — is the API hostname present?
+#   2. HTTPS with SSL verification — reports HTTP status or curl error.
+#   3. HTTPS without SSL (-k) — if step 2 timed out/errored, distinguishes a
+#      network failure from an untrusted certificate (very common on .mil/.gov
+#      domains with internal CAs).
+#   4. Model list — shows available models and validates DEFAULT_MODEL_NAME.
+
+_run_conn_check() {
+    local env_file="$install_root/.env"
+    echo "  .env: $env_file"
+
+    local api_url api_key model
+    api_url=$(grep -E '^PROXY_API_URL='       "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+    api_key=$(grep -E '^PROXY_API_KEY='       "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+    model=$(grep   -E '^DEFAULT_MODEL_NAME='  "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+
+    echo
+    printf '  %-22s %s\n' "PROXY_API_URL:"      "${api_url:-(not set)}"
+    printf '  %-22s %s\n' "PROXY_API_KEY:"      "${api_key:+(set, ${#api_key} chars)}${api_key:-(not set)}"
+    printf '  %-22s %s\n' "DEFAULT_MODEL_NAME:" "${model:-(not set)}"
+    echo
+
+    local abort=0
+    [[ -z "$api_url" ]] && { fail "PROXY_API_URL is blank — edit $env_file"; abort=1; }
+    [[ -z "$api_key" ]] && { fail "PROXY_API_KEY is blank — edit $env_file"; abort=1; }
+    if (( abort )); then return 1; fi
+
+    # --- 1. allowlist -------------------------------------------------------
+    local api_host
+    api_host=$(printf '%s' "$api_url" \
+        | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||;s|[/?#].*||;s|:.*||')
+    local allowlist="$install_root/.harness-allowlist"
+    if [[ -f "$allowlist" ]]; then
+        if grep -qxF "$api_host" "$allowlist" 2>/dev/null; then
+            ok "$api_host is in .harness-allowlist"
+        else
+            warn "$api_host is NOT in .harness-allowlist — container egress will be blocked"
+            echo "  Fix: printf '%s\\n' \"$api_host\" >> \"$allowlist\"" >&2
+        fi
+    else
+        warn ".harness-allowlist not found at $allowlist"
+    fi
+    echo
+
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl not found; skipping HTTP tests"
+        return 0
+    fi
+
+    # --- 2. HTTPS with SSL verification -------------------------------------
+    local models_url="${api_url%/}/v1/models"
+    echo "  [1/2] GET $models_url  (SSL on)"
+    local http_code body curl_stderr_file
+    curl_stderr_file=$(mktemp /tmp/harness_curl_XXXXXX 2>/dev/null || echo "/tmp/harness_curl_$$")
+    body=$(curl -sS --max-time 15 \
+        -H "Authorization: Bearer ${api_key}" \
+        -H "Content-Type: application/json" \
+        -w '\n__STATUS__%{http_code}' \
+        "$models_url" 2>"$curl_stderr_file") || true
+    http_code=$(printf '%s' "$body" | grep '__STATUS__' | sed 's/.*__STATUS__//')
+    body=$(printf '%s' "$body" | grep -v '__STATUS__')
+    local curl_err
+    curl_err=$(cat "$curl_stderr_file" 2>/dev/null); rm -f "$curl_stderr_file"
+
+    case "${http_code:-000}" in
+        200)
+            ok "HTTP 200 — connected (SSL verified, credentials accepted)"
+            ;;
+        000)
+            fail "no response — connection failed or SSL certificate rejected"
+            [[ -n "$curl_err" ]] && echo "  detail: $curl_err" >&2
+            echo
+            echo "  [1b/2] retrying without SSL certificate verification (-k)..."
+            local http_nossl
+            http_nossl=$(curl -sk --max-time 15 \
+                -H "Authorization: Bearer ${api_key}" \
+                -o /dev/null -w '%{http_code}' \
+                "$models_url" 2>/dev/null) || http_nossl="000"
+            if [[ "$http_nossl" == "000" ]]; then
+                fail "still unreachable — check PROXY_API_URL and network/VPN access"
+            else
+                warn "HTTP $http_nossl reached with SSL disabled"
+                warn "SSL certificate for $api_host is NOT trusted by this host"
+                echo >&2
+                echo "  The proxy container will have the same problem. To fix:" >&2
+                echo "    1. Obtain the CA certificate bundle for $api_host" >&2
+                echo "    2. Add  PROXY_API_CACERT=/path/to/ca.pem  to $env_file" >&2
+                echo "    3. Mount it into the proxy container (docker-compose.override.yml)" >&2
+            fi
+            return 1
+            ;;
+        401|403)
+            fail "HTTP $http_code — authentication rejected; check PROXY_API_KEY in $env_file"
+            ;;
+        404)
+            fail "HTTP $http_code — endpoint not found: $models_url"
+            echo "  PROXY_API_URL may need /v1 appended or removed. Currently: $api_url" >&2
+            ;;
+        *)
+            warn "HTTP ${http_code} — unexpected status"
+            [[ -n "$body" ]] && printf '  response: %s\n' "${body:0:300}" >&2
+            ;;
+    esac
+
+    # --- 3. model list + DEFAULT_MODEL_NAME check ---------------------------
+    if [[ "${http_code:-000}" == "200" ]]; then
+        echo
+        echo "  [2/2] available models:"
+        local model_ids=""
+        if command -v jq >/dev/null 2>&1; then
+            model_ids=$(printf '%s' "$body" | jq -r '.data[].id' 2>/dev/null)
+        else
+            model_ids=$(printf '%s' "$body" \
+                | grep -o '"id":"[^"]*"' \
+                | sed 's/^"id":"//;s/"$//')
+        fi
+        if [[ -n "$model_ids" ]]; then
+            printf '%s\n' "$model_ids" | sed 's/^/    /'
+            echo
+            if [[ -n "$model" ]]; then
+                if printf '%s\n' "$model_ids" | grep -qxF "$model"; then
+                    ok "DEFAULT_MODEL_NAME '$model' is valid"
+                else
+                    warn "DEFAULT_MODEL_NAME '$model' not found in the model list above"
+                    echo "  Run: ./harness-install.sh -m  to pick a valid model" >&2
+                fi
+            else
+                warn "DEFAULT_MODEL_NAME is not set — run: ./harness-install.sh -m"
+            fi
+        else
+            warn "model list was empty or could not be parsed"
+            [[ -n "$body" ]] && printf '  raw response: %s\n' "${body:0:300}" >&2
+        fi
+    fi
 }
 
 # --- preflight --------------------------------------------------------------
@@ -467,6 +746,141 @@ EOF
     esac
 }
 
+# --- model-menu mode --------------------------------------------------------
+#
+# When -m / --model-menu is given the full install is skipped. The harness
+# directory must already exist. We read the existing .env, fetch the model
+# list from the upstream API, show the selection menu, and update
+# DEFAULT_MODEL_NAME in place.
+
+if (( MODEL_MENU )); then
+    title "update default model"
+    # Locate the install root. The user may run this script from the parent
+    # directory (install_root = $cwd/harness) OR from inside the install root
+    # itself — e.g. the script lives at <root>/harness-install.sh and the
+    # .env is in the same directory. Try each candidate and use the first
+    # that contains a readable .env.
+    _mm_root=""
+    for _candidate in "$install_root" "$cwd" "$script_dir"; do
+        if [[ -f "$_candidate/.env" ]]; then
+            _mm_root="$_candidate"
+            break
+        fi
+    done
+    if [[ -z "$_mm_root" ]]; then
+        fail "no harness install found — run harness-install.sh without -m to install first"
+        echo "  searched: $install_root" >&2
+        echo "            $cwd" >&2
+        echo "            $script_dir" >&2
+        (( HARNESS_INSTALL_SOURCED )) && return 1
+        exit 1
+    fi
+    install_root="$_mm_root"
+    ok "found install at $install_root"
+    _run_model_menu
+    exit_or_return 0
+fi
+
+# --- connectivity-check mode ------------------------------------------------
+#
+# When -c / --check is given the full install is skipped. Reads the existing
+# .env, then runs staged curl tests to diagnose why the AI is unreachable:
+# allowlist, SSL certificate trust, HTTP status, and model-name validity.
+
+if (( CONN_CHECK )); then
+    title "connectivity check"
+    _cc_root=""
+    for _candidate in "$install_root" "$cwd" "$script_dir"; do
+        if [[ -f "$_candidate/.env" ]]; then
+            _cc_root="$_candidate"
+            break
+        fi
+    done
+    if [[ -z "$_cc_root" ]]; then
+        fail "no harness install found — run harness-install.sh without flags to install first"
+        echo "  searched: $install_root" >&2
+        echo "            $cwd" >&2
+        echo "            $script_dir" >&2
+        (( HARNESS_INSTALL_SOURCED )) && return 1
+        exit 1
+    fi
+    install_root="$_cc_root"
+    ok "found install at $install_root"
+    echo
+    _run_conn_check
+    exit_or_return 0
+fi
+
+# --- uninstall mode ---------------------------------------------------------
+#
+# When -u / --uninstall is given the full install is skipped. Locates the
+# install root, shows exactly what will be removed, prompts for confirmation,
+# then deletes the install directory and the PATH wrapper.
+
+if (( UNINSTALL )); then
+    title "uninstall harness"
+    _un_root=""
+    for _candidate in "$install_root" "$cwd" "$script_dir"; do
+        if [[ -f "$_candidate/.env" ]]; then
+            _un_root="$_candidate"
+            break
+        fi
+    done
+    if [[ -z "$_un_root" ]]; then
+        fail "no harness install found"
+        echo "  searched: $install_root" >&2
+        echo "            $cwd" >&2
+        echo "            $script_dir" >&2
+        (( HARNESS_INSTALL_SOURCED )) && return 1
+        exit 1
+    fi
+    install_root="$_un_root"
+    _wrapper="$LOCAL_BIN/$PROGRAM_NAME"
+    echo
+    echo "  The following will be permanently deleted:"
+    echo "    ${C_YELLOW}$install_root${C_RESET}   (install directory — code, config, state)"
+    [[ -f "$_wrapper" ]] && \
+        echo "    ${C_YELLOW}$_wrapper${C_RESET}   (PATH wrapper)"
+    echo
+    read -rp "  type 'yes' to confirm uninstall, anything else to cancel: " _un_ans
+    if [[ "${_un_ans:-}" != "yes" ]]; then
+        echo "  cancelled."
+        exit_or_return 0
+    fi
+    echo
+    # Stop running containers. Show output so the user can confirm they stopped.
+    # --volumes removes anonymous Docker volumes tied to this project.
+    _un_rt=$(_inline_container_runtime)
+    if command -v "$_un_rt" >/dev/null 2>&1 && "$_un_rt" info >/dev/null 2>&1; then
+        echo "  stopping harness containers..."
+        (cd "$install_root" && "$_un_rt" compose --project-name harness down \
+            --remove-orphans --volumes) || true
+        ok "containers stopped"
+    fi
+    echo
+    # Wipe the bind-mounted state directory first. Docker Desktop on Windows
+    # can hold handles on bind-mounted paths and recreate the directory skeleton
+    # after rm -rf, leaving stale opencode state that causes EEXIST on reinstall.
+    if [[ -d "$install_root/state" ]]; then
+        rm -rf "$install_root/state"
+        ok "cleared state/"
+    fi
+    rm -rf "$install_root"
+    if [[ -d "$install_root" ]]; then
+        warn "could not fully remove $install_root — some files may still be locked by Docker"
+        echo "  Close Docker Desktop and retry: rm -rf \"$install_root\"" >&2
+    else
+        ok "removed $install_root"
+    fi
+    if [[ -f "$_wrapper" ]]; then
+        rm -f "$_wrapper"
+        ok "removed $_wrapper"
+    fi
+    echo
+    warn "If PATH still shows 'harness', open a new terminal or run:  hash -r"
+    exit_or_return 0
+fi
+
 # --- intent -----------------------------------------------------------------
 
 cat <<EOF
@@ -483,14 +897,15 @@ and runtime state all live inside it. To uninstall later:
 Steps:
   1. Run preflight checks (git, docker, disk space, write access).
   2. Refuse if $install_root already exists.
-  3. Clone $REPO_URL into $install_root
+  3. Clone $REPO_URL into $install_root${BRANCH:+ (branch: $BRANCH)}
   4. Create runtime state directories under $install_root/state/
   5. Seed .env (from a pre-edited .env beside this installer if present, else
      from .env.example).
   6. Seed .harness-allowlist (from one beside this installer if present, else
      from .harness-allowlist.example).
   7. Optionally install a 'harness' wrapper into $LOCAL_BIN and update PATH.
-  8. Optionally accept an upstream API key to write into PROXY_API_KEY in .env.
+  8. Optionally accept the upstream API URL and key (PROXY_API_URL, PROXY_API_KEY in .env).
+  9. Query the upstream API for available models and set DEFAULT_MODEL_NAME in .env.
 
 EOF
 
@@ -527,6 +942,18 @@ case "${path_ans:-}" in
     n|N|no|NO) want_path=0 ;;
     *) want_path=1 ;;
 esac
+
+# Upstream API URL. The proxy needs PROXY_API_URL in .env to know where to
+# forward requests. Prompt for it now so the user doesn't have to hand-edit
+# .env afterward. A blank answer is fine — the user can set it manually.
+api_url_value=""
+echo
+echo "The proxy needs an upstream API URL (PROXY_API_URL in .env)."
+echo "This is the base URL of your LLM provider, e.g. https://api.openai.com"
+read -rp "enter upstream API URL (or press Enter to skip): " api_url_value
+if [[ -z "$api_url_value" ]]; then
+    echo "  skipping; remember to set PROXY_API_URL in .env manually."
+fi
 
 # Read a secret with each character echoed as '*' (not hidden entirely). Sets
 # the global REPLY_SECRET. The point is diagnostic: the user sees the LENGTH and
@@ -631,8 +1058,10 @@ apply_preclone_proxy
 # script is sourced (the README-recommended path) strict mode is off, so an
 # unchecked failure would fall through to the ok() below and leave a broken
 # half-install (the original #106 report). Check the exit code directly.
-if ! git clone "$REPO_URL" "$install_root"; then
-    fail "git clone of $REPO_URL failed."
+clone_args=()
+[[ -n "$BRANCH" ]] && clone_args+=(--branch "$BRANCH")
+if ! git clone "${clone_args[@]}" "$REPO_URL" "$install_root"; then
+    fail "git clone of $REPO_URL failed.${BRANCH:+ (branch: $BRANCH)}"
     echo "  - Check network/VPN connectivity to the git host." >&2
     echo "  - Behind a corporate proxy? Export it before running, e.g." >&2
     echo "      HTTPS_PROXY=http://proxy.example:8080 source harness-install.sh" >&2
@@ -708,7 +1137,7 @@ elif [[ -f "$script_dir/.env" ]]; then
 else
     cp "$install_root/.env.example" "$install_root/.env"
     ok "seeded $install_root/.env from .env.example"
-    warn "edit $install_root/.env and fill in PROXY_API_KEY (and any other blank required values)"
+    warn "edit $install_root/.env and fill in PROXY_API_URL, PROXY_API_KEY (and any other blank required values)"
 fi
 
 # If the user supplied an API key at the prompt, write it into the freshly
@@ -735,6 +1164,25 @@ if (( want_api_key )) && [[ -n "$api_key_value" ]]; then
     fi
     mv -f "$env_tmp" "$env_target"
     ok "wrote PROXY_API_KEY from prompt input into $install_root/.env"
+fi
+
+if [[ -n "$api_url_value" ]]; then
+    env_target="$install_root/.env"
+    env_tmp="$env_target.tmp.$$"
+    key_written=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*PROXY_API_URL= ]]; then
+            printf 'PROXY_API_URL=%s\n' "$api_url_value"
+            key_written=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$env_target" >"$env_tmp"
+    if (( ! key_written )); then
+        printf 'PROXY_API_URL=%s\n' "$api_url_value" >>"$env_tmp"
+    fi
+    mv -f "$env_tmp" "$env_target"
+    ok "wrote PROXY_API_URL from prompt input into $install_root/.env"
 fi
 
 # Persist any corp proxy exported in the installing shell into the .env so
@@ -769,6 +1217,11 @@ for pk in HTTP_PROXY HTTPS_PROXY; do
     ok "persisted $pk from your shell into $install_root/.env"
 done
 
+# --- default model selection ------------------------------------------------
+
+title "configuring default model"
+_run_model_menu
+
 # --- firewall allowlist -----------------------------------------------------
 #
 # Every harness container reads its egress allowlist from
@@ -792,9 +1245,28 @@ elif [[ -f "$script_dir/.harness-allowlist" ]]; then
 elif [[ -f "$install_root/.harness-allowlist.example" ]]; then
     cp "$install_root/.harness-allowlist.example" "$install_root/.harness-allowlist"
     ok "seeded $install_root/.harness-allowlist from .harness-allowlist.example"
-    warn "edit $install_root/.harness-allowlist and add your upstream LLM API hostname (must match PROXY_API_URL)"
 else
     warn "no .harness-allowlist.example bundled; create $install_root/.harness-allowlist before running harness"
+fi
+
+# Auto-add the upstream API hostname to the allowlist so the proxy container
+# can reach the LLM provider. This is the most common reason AI requests
+# silently fail on a fresh install — the container firewall blocks the egress.
+# Extract the hostname from PROXY_API_URL by stripping scheme, path, and port.
+_api_host=$(grep -E '^PROXY_API_URL=' "$install_root/.env" 2>/dev/null \
+    | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r' \
+    | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||;s|[/?#].*||;s|:.*||')
+if [[ -n "$_api_host" ]]; then
+    if [[ -f "$install_root/.harness-allowlist" ]]; then
+        if grep -qxF "$_api_host" "$install_root/.harness-allowlist" 2>/dev/null; then
+            ok "$_api_host already in .harness-allowlist"
+        else
+            printf '%s\n' "$_api_host" >> "$install_root/.harness-allowlist"
+            ok "added $_api_host to .harness-allowlist (from PROXY_API_URL)"
+        fi
+    fi
+else
+    warn "PROXY_API_URL not set — add your LLM provider hostname to $install_root/.harness-allowlist before running harness"
 fi
 
 # --- PATH setup -------------------------------------------------------------
@@ -960,8 +1432,11 @@ EOF
 cat <<EOF
 
 Uninstall harness:
+  cd "$install_root" && <runtime> compose down --remove-orphans   # stop containers first (runtime: docker or podman)
   rm -rf "$install_root"
   rm "\$HOME/.local/bin/harness"
+
+  (or run: ./harness-install.sh -u)
 EOF
 
 if (( want_path )); then
