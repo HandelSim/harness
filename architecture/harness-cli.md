@@ -121,6 +121,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Lifecycle | `start`, `down`, `restart`, `logs`, `unlock` |
 | Update / upgrade | `update`, `upgrade`, `downgrade`, `check-updates` |
 | Agent launch | `opencode`, `shell`, `list`, `stop` |
+| Config / setup | `config` (get/set/list + interactive picker), `model` (pick `DEFAULT_MODEL_NAME` from the live catalog), `uninstall` — see "Config and setup commands" below. |
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Diagnostics | `doctor`, `preflight`, `help` |
 | Test / bench | `test`, `benchmark` |
@@ -141,6 +142,45 @@ like `harness statt` is caught instead of silently launching an agent).
 Agent-launch flags (`--yolo`, `--net`, `--mount`, `-p/--print`) are parsed
 inside `run_agent` (opencode) / `cmd_shell` rather than centrally; they
 decide the `docker run` invocation, not compose flags.
+
+### Config and setup commands
+
+`harness-install.sh` is fetched once and **frozen** at install time, so
+anything a user re-runs after install lives in this (upgradeable) CLI, not the
+installer. Three commands cover post-install setup:
+
+- **`cmd_config`** — view and change `.env` values.
+  - Bare `harness config` opens an interactive **picker** of the common
+    settings (so you don't have to memorize `.env` keys). The curated set comes
+    from `_config_editable_keys` (`KEY|description` pairs). Picking
+    `DEFAULT_MODEL_NAME` delegates to `cmd_model`.
+  - `config get [KEY]` / `config list` print values; `config set KEY VALUE`
+    writes one. **Not a whitelist** — `set` writes any key; the picker/`get`
+    just surface the common ones.
+  - Reads use `_config_read_key` (straight from `$env_file`, so they reflect
+    on-disk state). Writes use `_config_write_key` — the same atomic
+    temp-file + `mv` read-loop the installer uses (no `sed`, so values with
+    `/ & : @` need no escaping; appends the key if absent).
+  - Secret-ish keys (name matches `*KEY*|*SECRET*|*TOKEN*|*PASSWORD*` via
+    `_config_is_secret`) are shown masked (`(set, N chars)`) and prompted with
+    a hidden read.
+  - Setting `PROXY_API_URL` also adds its host to the egress allowlist
+    (`_config_sync_allowlist_from_url` → `load_net_helpers` +
+    `netlib_add_host`), since an upstream missing from the allowlist is the
+    top "AI silently unreachable on a fresh URL" cause. Degrades to a printed
+    hint when `net_helpers.sh` isn't reachable.
+- **`cmd_model`** — pick `DEFAULT_MODEL_NAME` from the upstream's live
+  `/v1/models` catalog (same logic the installer runs at "configuring default
+  model", now re-runnable). Curls the catalog via `_api_base`, shows a numbered
+  menu (jq parse, grep/sed fallback), and falls back to free-text entry when
+  the catalog can't be fetched. Writes via `_config_write_key`.
+- **`cmd_uninstall`** — tear down this install: stop containers
+  (`<runtime> compose … down --remove-orphans --volumes`, best-effort), then
+  remove `state/`, the install root, and the `$HOME/.local/bin/harness`
+  wrapper. **Prompts for a typed `yes` first** (via `/dev/tty`, or
+  `HARNESS_CONFIRM_FROM_STDIN=1` in tests); `--yes`/`-y` skips the prompt for
+  automation. Refuses to run when `install_root` is empty or `/`. This is the
+  everyday replacement for the installer's `-u` recovery path.
 
 ## Compose wrapper (`compose()`)
 
@@ -604,6 +644,15 @@ breaks the recursion.
   box, and a dedicated `[host]` section reports the host-mode prerequisites
   (`python3`/`jq`/`node`/`opencode`, Node >= 20) plus whether the host venv
   exists and whether the host proxy is currently running (pid/port/log).
+  The final `[upstream]` section is doctor's one **live network probe**: it
+  curls the upstream `/v1/models` from the host (bounded timeouts) so a user
+  diagnosing "the AI never responds" gets the real reachability verdict.
+  `2xx` → ok; `401`/`403` (key rejected) and `404` (wrong endpoint) → `fail`;
+  no response retries with `-k` to tell a dead network (warn) from an untrusted
+  TLS cert (warn, with a `PROXY_API_CACERT` hint) apart. **Network-down is a
+  warn, not a fail**, so `harness doctor` still exits 0 when merely offline.
+  Skipped when `PROXY_API_URL`/`PROXY_API_KEY` is unset, `curl` is missing, or
+  `HARNESS_SKIP_AUTH_PROBE=1`.
 - `cmd_preflight` — validates `.env`, allowlist, and docker daemon
   reachability BEFORE `harness start`. Fails loudly on config errors so
   the user doesn't get an opaque compose error. On a host-only box it

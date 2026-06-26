@@ -84,35 +84,6 @@ MODEL_MENU=0
 CONN_CHECK=0
 UNINSTALL=0
 
-# --- argument parsing -------------------------------------------------------
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -b|--branch)
-            [[ -z "${2:-}" ]] && { fail "-b requires a branch name"; (( HARNESS_INSTALL_SOURCED )) && return 1; exit 1; }
-            BRANCH="$2"
-            shift 2
-            ;;
-        -m|--model-menu)
-            MODEL_MENU=1
-            shift
-            ;;
-        -c|--check)
-            CONN_CHECK=1
-            shift
-            ;;
-        -u|--uninstall)
-            UNINSTALL=1
-            shift
-            ;;
-        *)
-            fail "unknown option: $1"
-            (( HARNESS_INSTALL_SOURCED )) && return 1
-            exit 1
-            ;;
-    esac
-done
-
 # --- ANSI colors ------------------------------------------------------------
 # Disabled if stdout is not a tty.
 
@@ -137,6 +108,40 @@ warn()  { printf '%s!%s %s\n'  "$C_YELLOW" "$C_RESET" "$*"; }
 # top-level idiom: `(( HARNESS_INSTALL_SOURCED )) && return 1; exit 1`.
 fail()  { printf '%sx%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; }
 title() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+
+# --- argument parsing -------------------------------------------------------
+# Runs after the color + fail/title helpers are defined so a bad flag prints its
+# real message (not "fail: command not found") before aborting.
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--branch)
+            [[ -z "${2:-}" ]] && { fail "-b requires a branch name (main or dev)"; (( HARNESS_INSTALL_SOURCED )) && return 1; exit 1; }
+            case "$2" in
+                main|dev) BRANCH="$2" ;;
+                *) fail "-b must be 'main' or 'dev' (got: $2)"; (( HARNESS_INSTALL_SOURCED )) && return 1; exit 1 ;;
+            esac
+            shift 2
+            ;;
+        -m|--model-menu)
+            MODEL_MENU=1
+            shift
+            ;;
+        -c|--check)
+            CONN_CHECK=1
+            shift
+            ;;
+        -u|--uninstall)
+            UNINSTALL=1
+            shift
+            ;;
+        *)
+            fail "unknown option: $1"
+            (( HARNESS_INSTALL_SOURCED )) && return 1
+            exit 1
+            ;;
+    esac
+done
 
 cwd=$(pwd)
 install_root="$cwd/$CLONE_DIR"
@@ -891,8 +896,7 @@ This will install the harness runtime into a single self-contained folder:
 
 That folder is both the git clone and the install root — code, user config,
 and runtime state all live inside it. To uninstall later:
-  rm -rf $install_root
-  rm $LOCAL_BIN/$PROGRAM_NAME
+  harness uninstall          (prompts for confirmation)
 
 Steps:
   1. Run preflight checks (git, docker, disk space, write access).
@@ -936,6 +940,26 @@ fi
 # script is sourced (the README-recommended path) — its abort ran
 # `exit_or_return 0`, whose `return` only leaves that helper function, not the
 # sourced script, so answering "n" continued the install anyway.
+
+# Which branch this install tracks. Only two channels for now: main (stable)
+# and dev (latest). The clone checks this out, and 'harness update'/'upgrade'
+# follow the checked-out branch's upstream, so this is the upgrade channel.
+# A -b/--branch flag (already validated to main|dev) skips this prompt for
+# non-interactive installs; without a tty we leave BRANCH empty and clone the
+# remote's default branch (preserves the previous non-interactive behavior).
+if [[ -z "$BRANCH" && -t 0 ]]; then
+    echo
+    echo "Which branch should this install track for updates?"
+    echo "  1) main  — stable releases (recommended)"
+    echo "  2) dev   — latest changes, less battle-tested"
+    read -rp "select [1-2, Enter for main]: " branch_ans
+    case "${branch_ans:-}" in
+        2) BRANCH="dev" ;;
+        ""|1) BRANCH="main" ;;
+        *) echo "  unrecognized choice '${branch_ans}'; using main"; BRANCH="main" ;;
+    esac
+    echo "  tracking branch: $BRANCH"
+fi
 
 read -rp "add 'harness' to PATH (recommended)? [y/n]: " path_ans
 case "${path_ans:-}" in
@@ -1432,11 +1456,8 @@ EOF
 cat <<EOF
 
 Uninstall harness:
-  cd "$install_root" && <runtime> compose down --remove-orphans   # stop containers first (runtime: docker or podman)
-  rm -rf "$install_root"
-  rm "\$HOME/.local/bin/harness"
-
-  (or run: ./harness-install.sh -u)
+  harness uninstall          # stops containers, removes state/, the install
+                             # root, and the PATH wrapper (prompts to confirm)
 EOF
 
 if (( want_path )); then

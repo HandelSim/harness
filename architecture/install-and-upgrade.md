@@ -111,9 +111,15 @@ run from an empty directory. Stages:
    the script's **top level**; a `return` buried in a helper (`fail`,
    `exit_or_return`) can't end a sourced script, which was the root cause of
    #105/#106.
-3. **Clone.** `git clone` into the install dir (`--branch <name>` is added
-   when `-b/--branch` was passed, so a distributor can install off a non-default
-   branch). **The clone IS the install root** — there's no separate config dir. A failed clone (no
+3. **Clone.** `git clone` into the install dir. The branch is chosen by an
+   interactive prompt during the prompts stage — **`main`** (stable, default)
+   or **`dev`** (latest); those are the only two channels for now. The choice
+   becomes `--branch <name>` on the clone, and since `harness update`/`upgrade`
+   follow the checked-out branch's upstream, it is the install's upgrade
+   channel. `-b/--branch main|dev` (validated to those two) skips the prompt for
+   non-interactive installs; with no flag and no tty, no `--branch` is passed
+   and the clone takes the remote's default branch (the prior behavior).
+   **The clone IS the install root** — there's no separate config dir. A failed clone (no
    network, unreachable git host, corp proxy not exported) is caught by
    checking git's exit code and aborts with an actionable message — the
    installer never proceeds past a broken clone. The clone's proxy is
@@ -172,16 +178,21 @@ run from an empty directory. Stages:
    printed run command is host-aware: on a `HOST_ONLY` install (no runtime
    detected) the "Next" steps say `harness host`, otherwise `harness`.
 
-Uninstall is `rm -rf <install-root> && rm ~/.local/bin/harness`, or the `-u`
-flag below.
+Uninstall is **`harness uninstall`** (in the CLI, prompts to confirm; see
+[`harness-cli.md`](harness-cli.md) "Config and setup commands"), or the
+installer's `-u` flag below for recovery before the CLI is on `PATH`.
 
 ### Standalone flag modes
 
-Argument parsing at the top of the script recognizes four flags. `-b/--branch`
-only feeds the clone (stage 3); the other three each **short-circuit the normal
-install** (they run before preflight is called, locate the existing install root
-by probing `$install_root`, `$cwd`, then `$script_dir` for a `.env`, act, and
-exit):
+Argument parsing recognizes four flags (parsed after the color/`fail`/`title`
+helpers are defined, so a bad flag — e.g. `-b production` — prints its real
+message and exits non-zero rather than `fail: command not found`). `-b/--branch`
+(restricted to `main`/`dev`) only feeds the clone (stage 3); the other three
+each **short-circuit the normal install** (they run before preflight is called,
+locate the existing install root by probing `$install_root`, `$cwd`, then
+`$script_dir` for a `.env`, act, and exit). Post-install, the CLI's `harness
+model` / `harness doctor` / `harness uninstall` supersede `-m` / `-c` / `-u`;
+the installer flags remain for recovery before the CLI is reachable:
 
 - **`-m` / `--model-menu`** — re-run the stage-7a model menu against an existing
   install to change `DEFAULT_MODEL_NAME`. No reinstall.

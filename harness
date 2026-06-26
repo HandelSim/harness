@@ -1357,6 +1357,382 @@ cmd_unlock() {
     return 1
 }
 
+# --- config / model / uninstall (post-install setup, in the versioned CLI) ---
+#
+# harness-install.sh is fetched once and frozen at install time, so anything a
+# user re-runs after install belongs in this (upgradeable) CLI, not the
+# installer. These three commands cover it: 'config' edits .env values, 'model'
+# picks a default from the live upstream catalog, 'uninstall' tears the install
+# down. See architecture/harness-cli.md (Config and setup commands).
+
+# The curated set of .env keys 'harness config' lists in its picker, so you
+# don't have to memorize .env. NOT a whitelist: 'harness config set <ANY_KEY>
+# <value>' writes any key; the picker just surfaces the ones most people change.
+# Format: KEY|one-line description.
+_config_editable_keys() {
+    cat <<'EOF'
+PROXY_API_URL|upstream API base URL the proxy forwards to (e.g. https://api.openai.com)
+PROXY_API_KEY|upstream API key (secret; shown masked)
+DEFAULT_MODEL_NAME|default model id opencode selects (live picker via 'harness model')
+MODEL_CONTEXT_LENGTH|context-window size the agent advertises (tokens)
+PROXY_TIMEOUT|upstream request timeout in seconds
+HARNESS_EXTRA_MOUNTS|sticky extra bind-mounts for agent launches (colon-separated)
+HTTP_PROXY|corporate HTTP proxy for host-side git/pulls
+HTTPS_PROXY|corporate HTTPS proxy for host-side git/pulls
+NO_PROXY|comma-separated hosts that bypass the proxy
+EOF
+}
+
+# A value for a secret-ish key (name contains KEY/SECRET/TOKEN/PASSWORD) is
+# shown as "(set, N chars)" rather than printed in the clear.
+_config_is_secret() {
+    case "$1" in
+        *KEY*|*SECRET*|*TOKEN*|*PASSWORD*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_config_display_value() {
+    local key="$1" val="$2"
+    if [[ -z "$val" ]]; then
+        printf '(not set)'
+    elif _config_is_secret "$key"; then
+        printf '(set, %d chars)' "${#val}"
+    else
+        printf '%s' "$val"
+    fi
+}
+
+# Read a key's raw value straight from $env_file (not the sourced shell var, so
+# it reflects on-disk state and works for keys harness doesn't export). Strips
+# surrounding quotes and a trailing CR. Empty if absent.
+_config_read_key() {
+    local key="$1"
+    [[ -f "$env_file" ]] || return 0
+    grep -E "^[[:space:]]*${key}=" "$env_file" 2>/dev/null \
+        | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r'
+}
+
+# Atomically rewrite (or append) KEY=VALUE in $env_file. A bash read-loop, not
+# sed, so values containing / & : @ need no escaping. Mirrors the env-write
+# convention in harness-install.sh.
+_config_write_key() {
+    local key="$1" value="$2"
+    if [[ ! -f "$env_file" ]]; then
+        err "no .env at $env_file; run 'harness preflight' or reinstall"
+        return 1
+    fi
+    local tmp="$env_file.tmp.$$" line written=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*${key}= ]]; then
+            printf '%s=%s\n' "$key" "$value"
+            written=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$env_file" >"$tmp"
+    (( written )) || printf '%s=%s\n' "$key" "$value" >>"$tmp"
+    mv -f "$tmp" "$env_file"
+}
+
+# Add a URL's hostname to the egress allowlist if absent — a derived side-effect
+# of setting PROXY_API_URL, since an upstream missing from the allowlist is the
+# #1 "AI silently unreachable on a fresh URL" cause (the firewall blocks it).
+# No-op when the host is already present or unparseable; degrades to a printed
+# hint when net_helpers isn't available (partial install / source-only test).
+_config_sync_allowlist_from_url() {
+    local url="$1"
+    [[ -n "$url" ]] || return 0
+    local host
+    host=$(printf '%s' "$url" | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||;s|[/?#].*||;s|:.*||')
+    [[ -n "$host" ]] || return 0
+    if [[ ! -f "$clone_dir/scripts/lib/net_helpers.sh" ]]; then
+        echo "harness: add $host to $allowlist_path so the proxy can reach it"
+        return 0
+    fi
+    load_net_helpers
+    if netlib_has_host "$host"; then
+        echo "harness: $host already on the egress allowlist"
+    elif netlib_add_host "$host"; then
+        echo "harness: added $host to the egress allowlist (from PROXY_API_URL)"
+    else
+        err "could not add $host to the allowlist; add it with 'harness net allow $host'"
+    fi
+}
+
+_config_help() {
+    cat <<'EOF'
+harness config — view and change .env settings.
+
+usage:
+  harness config                 interactive picker of common settings
+  harness config get [KEY]       print one KEY (or the common set with no KEY)
+  harness config list            alias for 'config get' with no KEY
+  harness config set KEY VALUE   set KEY to VALUE (any key; VALUE may be empty)
+
+Secrets (PROXY_API_KEY and the like) are shown masked. Setting PROXY_API_URL
+also adds its hostname to the egress allowlist so the proxy can reach it.
+Picking DEFAULT_MODEL_NAME opens the live model picker ('harness model').
+EOF
+}
+
+# Print one key (KEY=value) or, with no key, the curated common set with current
+# values. Secret values are masked. The single-key form goes to stdout so it is
+# scriptable.
+_config_get() {
+    if [[ -n "${1:-}" ]]; then
+        local key="$1" val
+        val=$(_config_read_key "$key")
+        printf '%s=%s\n' "$key" "$(_config_display_value "$key" "$val")"
+        return 0
+    fi
+    local key desc val
+    while IFS='|' read -r key desc; do
+        [[ -n "$key" ]] || continue
+        val=$(_config_read_key "$key")
+        printf '  %-22s %s\n' "$key" "$(_config_display_value "$key" "$val")"
+    done < <(_config_editable_keys)
+}
+
+_config_set() {
+    local key="${1:-}"
+    if [[ -z "$key" ]]; then
+        err "usage: harness config set <KEY> <value>"
+        return 1
+    fi
+    shift
+    local value="$*"
+    _config_write_key "$key" "$value" || return 1
+    echo "harness: set $key in $env_file"
+    [[ "$key" == "PROXY_API_URL" ]] && _config_sync_allowlist_from_url "$value"
+    return 0
+}
+
+# The interactive var picker: list the common settings with current values, let
+# the user pick one by number, prompt for a new value, write it. Secret keys are
+# read hidden; DEFAULT_MODEL_NAME defers to the live catalog picker.
+_config_picker() {
+    if [[ ! -f "$env_file" ]]; then
+        err "no .env at $env_file; run 'harness preflight' or reinstall"
+        return 1
+    fi
+    if [[ ! -t 0 ]]; then
+        err "'harness config' with no args is interactive; use 'harness config set <KEY> <value>'"
+        return 1
+    fi
+    local -a keys=() descs=()
+    local key desc
+    while IFS='|' read -r key desc; do
+        [[ -n "$key" ]] || continue
+        keys+=("$key"); descs+=("$desc")
+    done < <(_config_editable_keys)
+
+    echo "harness config — pick a setting to change:"
+    local i val
+    for i in "${!keys[@]}"; do
+        val=$(_config_read_key "${keys[$i]}")
+        printf '  %2d) %-22s %s\n' "$((i + 1))" "${keys[$i]}" "$(_config_display_value "${keys[$i]}" "$val")"
+        printf '      %s\n' "${descs[$i]}"
+    done
+    echo
+    local choice
+    read -rp "select [1-${#keys[@]}] (Enter to cancel): " choice </dev/tty
+    [[ -n "$choice" ]] || { echo "cancelled."; return 0; }
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#keys[@]} )); then
+        err "invalid selection"
+        return 1
+    fi
+    local sel="${keys[$((choice - 1))]}"
+
+    # DEFAULT_MODEL_NAME gets the live upstream catalog instead of free text.
+    if [[ "$sel" == "DEFAULT_MODEL_NAME" ]]; then
+        cmd_model
+        return $?
+    fi
+
+    local cur newval
+    cur=$(_config_read_key "$sel")
+    if _config_is_secret "$sel"; then
+        printf 'enter new value for %s (input hidden, Enter to keep current): ' "$sel"
+        read -rs newval </dev/tty
+        printf '\n'
+    else
+        printf 'current %s: %s\n' "$sel" "$(_config_display_value "$sel" "$cur")"
+        read -rp "new value (Enter to keep current): " newval </dev/tty
+    fi
+    [[ -n "$newval" ]] || { echo "unchanged."; return 0; }
+    _config_write_key "$sel" "$newval" || return 1
+    echo "harness: set $sel in $env_file"
+    [[ "$sel" == "PROXY_API_URL" ]] && _config_sync_allowlist_from_url "$newval"
+    return 0
+}
+
+cmd_config() {
+    local sub="${1:-}"
+    case "$sub" in
+        ""|pick|menu)   _config_picker ;;
+        get)            shift; _config_get "$@" ;;
+        list)           _config_get ;;
+        set)            shift; _config_set "$@" ;;
+        -h|--help|help) _config_help ;;
+        *)
+            err "unknown 'harness config' subcommand: $sub"
+            _config_help >&2
+            return 1
+            ;;
+    esac
+}
+
+# Pick DEFAULT_MODEL_NAME from the upstream's live /v1/models catalog. Reads the
+# URL/key from .env, queries the catalog, shows a numbered menu (or free-text
+# entry when the catalog can't be fetched), and writes the choice. Same logic
+# the installer runs at "configuring default model", now re-runnable any time.
+cmd_model() {
+    if [[ ! -f "$env_file" ]]; then
+        err "no .env at $env_file; run 'harness preflight' or reinstall"
+        return 1
+    fi
+    local api_url api_key cur_model
+    api_url=$(_config_read_key PROXY_API_URL)
+    api_key=$(_config_read_key PROXY_API_KEY)
+    cur_model=$(_config_read_key DEFAULT_MODEL_NAME)
+
+    local -a model_list=()
+    if [[ -n "$api_url" && -n "$api_key" ]] && command -v curl >/dev/null 2>&1; then
+        local base models_url response m
+        base=$(PROXY_API_URL="$api_url" _api_base)
+        models_url="${base}/v1/models"
+        echo "querying ${models_url}..."
+        response=$(curl -sf --max-time 10 \
+            -H "Authorization: Bearer ${api_key}" \
+            -H "Content-Type: application/json" \
+            "$models_url" 2>/dev/null) || response=""
+        if [[ -n "$response" ]]; then
+            if command -v jq >/dev/null 2>&1; then
+                while IFS= read -r m; do [[ -n "$m" ]] && model_list+=("$m"); done \
+                    < <(printf '%s' "$response" | jq -r '.data[]?.id // empty' 2>/dev/null)
+            else
+                while IFS= read -r m; do [[ -n "$m" ]] && model_list+=("$m"); done \
+                    < <(printf '%s' "$response" | grep -o '"id":"[^"]*"' | sed 's/^"id":"//;s/"$//')
+            fi
+        fi
+    fi
+
+    local selected=""
+    if (( ${#model_list[@]} > 0 )); then
+        echo "available models:"
+        local i=1 m
+        for m in "${model_list[@]}"; do printf '  %2d) %s\n' "$i" "$m"; i=$((i + 1)); done
+        [[ -n "$cur_model" ]] && echo "  (current: $cur_model)"
+        if [[ ! -t 0 ]]; then
+            err "non-interactive; set it with 'harness config set DEFAULT_MODEL_NAME <id>'"
+            return 1
+        fi
+        local choice
+        read -rp "select a model (1-${#model_list[@]}) or type a name [Enter to keep current]: " choice </dev/tty
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#model_list[@]} )); then
+            selected="${model_list[$((choice - 1))]}"
+        elif [[ -n "$choice" ]]; then
+            selected="$choice"
+        fi
+    else
+        if [[ -z "$api_url" || -z "$api_key" ]]; then
+            err "cannot fetch the model list — PROXY_API_URL and/or PROXY_API_KEY not set in $env_file"
+        elif ! command -v curl >/dev/null 2>&1; then
+            err "curl not found; cannot fetch the model list"
+        else
+            err "could not fetch models from the upstream; check connectivity with 'harness doctor'"
+        fi
+        [[ -n "$cur_model" ]] && echo "  (current: $cur_model)"
+        [[ -t 0 ]] || return 1
+        read -rp "enter DEFAULT_MODEL_NAME (e.g. gpt-4o) or Enter to keep current: " selected </dev/tty
+    fi
+
+    if [[ -n "$selected" ]]; then
+        _config_write_key DEFAULT_MODEL_NAME "$selected" || return 1
+        echo "harness: set DEFAULT_MODEL_NAME=$selected in $env_file"
+    elif [[ -z "$cur_model" ]]; then
+        err "DEFAULT_MODEL_NAME still unset; set it before launching"
+    else
+        echo "harness: DEFAULT_MODEL_NAME unchanged ($cur_model)"
+    fi
+    return 0
+}
+
+# Tear down this install: stop containers, remove state/, the install root, and
+# the PATH wrapper. Prompts for an explicit typed 'yes' first (the owner asked
+# for a confirmation gate); --yes skips it for automation. Mirrors the
+# installer's -u recovery path, but as the everyday 'harness uninstall'.
+cmd_uninstall() {
+    local assume_yes=0
+    while (( $# )); do
+        case "$1" in
+            -y|--yes)  assume_yes=1; shift ;;
+            -h|--help) echo "usage: harness uninstall [--yes]"; return 0 ;;
+            *) err "unknown option '$1' (uninstall accepts --yes)"; return 1 ;;
+        esac
+    done
+
+    # Defense-in-depth: never let a blank/root install_root reach rm -rf.
+    if [[ -z "$install_root" || "$install_root" == "/" ]]; then
+        err "refusing to uninstall: install_root is unset or '/'"
+        return 1
+    fi
+
+    local wrapper="$HOME/.local/bin/harness"
+    echo "The following will be permanently deleted:"
+    echo "  $install_root   (install directory — code, config, state)"
+    [[ -f "$wrapper" ]] && echo "  $wrapper   (PATH wrapper)"
+    echo
+
+    if (( ! assume_yes )); then
+        local ans
+        if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
+            IFS= read -rp "type 'yes' to confirm uninstall, anything else to cancel: " ans || ans=""
+        elif [[ -e /dev/tty ]]; then
+            IFS= read -rp "type 'yes' to confirm uninstall, anything else to cancel: " ans </dev/tty
+        else
+            err "uninstall needs confirmation but no terminal is attached; re-run with --yes"
+            return 1
+        fi
+        ans=${ans%$'\r'}
+        if [[ "$ans" != "yes" ]]; then
+            echo "cancelled."
+            return 0
+        fi
+    fi
+
+    echo
+    # Stop running containers (best-effort). --volumes removes anonymous volumes.
+    local rt
+    rt=$(harness_container_runtime 2>/dev/null || echo docker)
+    if command -v "$rt" >/dev/null 2>&1 && "$rt" info >/dev/null 2>&1; then
+        echo "stopping harness containers..."
+        (cd "$install_root" && "$rt" compose --project-name "$project_name" down \
+            --remove-orphans --volumes) || true
+    fi
+
+    # Wipe bind-mounted state first: Docker Desktop on Windows can hold handles
+    # and recreate the skeleton after rm -rf, leaving stale opencode state.
+    if [[ -d "$state_root" ]]; then
+        rm -rf "$state_root"
+        echo "cleared $state_root"
+    fi
+    rm -rf "$install_root"
+    if [[ -d "$install_root" ]]; then
+        err "could not fully remove $install_root — files may be locked (close Docker Desktop and retry)"
+    else
+        echo "removed $install_root"
+    fi
+    if [[ -f "$wrapper" ]]; then
+        rm -f "$wrapper"
+        echo "removed $wrapper"
+    fi
+    echo
+    echo "If your shell still finds 'harness', open a new terminal or run: hash -r"
+    return 0
+}
+
 cmd_help() {
     cat <<'EOF'
 harness — manage the harness runtime.
@@ -1421,6 +1797,18 @@ commands:
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
   unlock                probe the upstream and print the unlock URL if the
                         key is locked
+  config [get|set|...]  view and change .env settings. Bare 'harness config'
+                        opens an interactive picker of common settings so you
+                        don't have to memorize .env; 'config get [KEY]',
+                        'config set KEY VALUE', 'config list'. Setting
+                        PROXY_API_URL also allowlists its host. Secrets shown
+                        masked. See 'harness config --help'.
+  model                 pick DEFAULT_MODEL_NAME from the upstream's live
+                        /v1/models catalog (free-text entry if it can't be
+                        fetched) and write it to .env
+  uninstall [--yes]     remove this install: stop containers, delete state/,
+                        the install root, and the PATH wrapper. Prompts for a
+                        typed 'yes' first; --yes skips the prompt.
   doctor                run runtime diagnostics (read-only). Reports container
                         AND host-mode state; on a host-only box (no runtime) it
                         warns instead of failing on the missing daemon.
@@ -6836,6 +7224,51 @@ cmd_doctor() {
         fi
     fi
 
+    # ---------------- [upstream] ------------
+    #
+    # The one live network probe in doctor: hit the upstream /v1/models from the
+    # HOST (not the container) so a user diagnosing "the AI never responds" gets
+    # the actual reachability verdict — credentials, URL, and SSL trust — instead
+    # of only the static .env/allowlist facts above. Bounded by a short timeout;
+    # skipped when creds or curl are missing. Network-down is a warn (not a fault
+    # of the install), a rejected key or wrong endpoint is a fail.
+    doctor_section upstream
+    if [[ "${HARNESS_SKIP_AUTH_PROBE:-0}" == "1" ]]; then
+        doctor_check skip "upstream" "probe skipped (HARNESS_SKIP_AUTH_PROBE=1)"
+    elif [[ -z "${PROXY_API_URL:-}" || -z "${PROXY_API_KEY:-}" ]]; then
+        doctor_check skip "upstream" "PROXY_API_URL/PROXY_API_KEY not set; nothing to probe"
+    elif ! command -v curl >/dev/null 2>&1; then
+        doctor_check skip "upstream" "curl not found; cannot probe"
+    else
+        local up_url up_code
+        up_url="$(_api_base)/v1/models"
+        up_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --connect-timeout 5 --max-time 15 \
+            -H "Authorization: Bearer ${PROXY_API_KEY}" \
+            "$up_url" 2>/dev/null) || up_code="000"
+        case "$up_code" in
+            2??) doctor_check ok   "upstream" "HTTP $up_code from $up_url (reachable, key accepted)" ;;
+            401|403) doctor_check fail "upstream" "HTTP $up_code — key rejected; check PROXY_API_KEY ('harness unlock' if locked)" ;;
+            404) doctor_check fail "upstream" "HTTP $up_code — endpoint not found; check PROXY_API_URL ($up_url)" ;;
+            000)
+                # No HTTP response: a dead network or an untrusted TLS cert look
+                # the same to a verifying curl. Retry with -k to tell them apart
+                # (internal CAs on .gov/.mil are a common cause).
+                local up_nossl
+                up_nossl=$(curl -sk -o /dev/null -w '%{http_code}' \
+                    --connect-timeout 5 --max-time 15 \
+                    -H "Authorization: Bearer ${PROXY_API_KEY}" \
+                    "$up_url" 2>/dev/null) || up_nossl="000"
+                if [[ "$up_nossl" == "000" ]]; then
+                    doctor_check warn "upstream" "no response from $up_url — network/VPN unreachable"
+                else
+                    doctor_check warn "upstream" "TLS cert for the upstream is untrusted (HTTP $up_nossl with -k); set PROXY_API_CACERT in .env"
+                fi
+                ;;
+            *) doctor_check warn "upstream" "HTTP $up_code from $up_url (unexpected)" ;;
+        esac
+    fi
+
     # ---------------- summary ---------------
     printf '\n%d errors, %d warnings\n' "$doctor_errors" "$doctor_warnings"
     if (( doctor_errors > 0 )); then
@@ -7474,6 +7907,9 @@ main() {
         net)                        cmd_net "$@" ;;
         mcp)                        cmd_mcp "$@" ;;
         unlock)                     cmd_unlock "$@" ;;
+        config)                     cmd_config "$@" ;;
+        model)                      cmd_model "$@" ;;
+        uninstall)                  cmd_uninstall "$@" ;;
         doctor)                     cmd_doctor ;;
         preflight)                  cmd_preflight ;;
         test)                       cmd_test "$@" ;;
