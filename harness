@@ -1719,27 +1719,37 @@ cmd_uninstall() {
     fi
 
     echo
-    # Tear down all harness containers and images (best-effort). Agent containers
-    # are launched via 'docker run' (not compose), so remove those by label
-    # first; then 'compose down --rmi all' stops the compose services and deletes
-    # the images they build (harness-proxy, harness-agent). --volumes drops
-    # anonymous volumes; --remove-orphans sweeps stragglers.
+    # Tear down all harness containers and images (best-effort). Remove the
+    # containers FIRST so image removal isn't blocked by an in-use image, then
+    # drop the images. Two kinds of container exist: agents launched via
+    # 'docker run' (labelled harness.project + harness.agent) and the compose
+    # services such as the proxy (labelled com.docker.compose.project). We sweep
+    # both by label directly because 'compose down' alone skips containers whose
+    # compose working-dir labels don't match this invocation. Then
+    # 'compose down --rmi all' removes the built images (harness-proxy,
+    # harness-agent), volumes, network, and orphans; a final 'rmi -f' covers any
+    # image compose left behind (compose file unreadable, old project name).
     local rt
     rt=$(harness_container_runtime 2>/dev/null || echo docker)
     if command -v "$rt" >/dev/null 2>&1 && "$rt" info >/dev/null 2>&1; then
-        echo "removing harness agent containers..."
+        echo "removing harness containers..."
         local cid
+        # Agent containers (docker run): harness.project + harness.agent.
         while IFS= read -r cid; do
             [[ -n "$cid" ]] || continue
-            "$rt" rm -f "$cid" >/dev/null 2>&1 || true
+            "$rt" rm -f -v "$cid" >/dev/null 2>&1 || true
         done < <("$rt" ps -aq \
             --filter "label=harness.project=$project_name" \
             --filter "label=harness.agent=true" 2>/dev/null || true)
-        echo "stopping harness containers and removing images..."
+        # Compose services (proxy, etc.): the compose project label.
+        while IFS= read -r cid; do
+            [[ -n "$cid" ]] || continue
+            "$rt" rm -f -v "$cid" >/dev/null 2>&1 || true
+        done < <("$rt" ps -aq \
+            --filter "label=com.docker.compose.project=$project_name" 2>/dev/null || true)
+        echo "removing harness images, volumes, and network..."
         (cd "$install_root" && "$rt" compose --project-name "$project_name" down \
             --rmi all --remove-orphans --volumes) || true
-        # Belt-and-suspenders: drop the named images if compose left them behind
-        # (compose file unreadable, or images orphaned from an old project name).
         local img
         for img in harness-proxy:latest harness-agent:latest; do
             if "$rt" image inspect "$img" >/dev/null 2>&1; then
@@ -1842,9 +1852,10 @@ commands:
   model                 pick DEFAULT_MODEL_NAME from the upstream's live
                         /v1/models catalog (free-text entry if it can't be
                         fetched) and write it to .env
-  uninstall [--yes]     remove this install: stop containers, delete state/,
-                        the install root, and the PATH wrapper. Prompts for a
-                        typed 'yes' first; --yes skips the prompt.
+  uninstall [--yes]     remove this install: delete the harness containers and
+                        images (harness-proxy, harness-agent), then state/, the
+                        install root, and the PATH wrapper. Prompts for a typed
+                        'yes' first; --yes skips the prompt.
   doctor                run runtime diagnostics (read-only). Reports container
                         AND host-mode state; on a host-only box (no runtime) it
                         warns instead of failing on the missing daemon.

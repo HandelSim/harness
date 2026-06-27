@@ -17,7 +17,8 @@
 #     drive it, then the current values (no-tty branch of the picker)
 #   - cmd_uninstall: cancels on a non-"yes" answer (leaves files), tears down on
 #     --yes, refuses a "/" install root, and (with a stubbed runtime) removes the
-#     agent containers, compose images (--rmi all), and the named built images
+#     agent + compose containers by label, the compose images (--rmi all), and
+#     the named built images
 #
 # Prints "CONFIG TEST PASSED" on success.
 
@@ -190,12 +191,13 @@ mk_install
 : >"$RT_LOG"
 out="$(cmd_uninstall --yes)" || fail "T12: uninstall --yes returned non-zero"
 grep -q 'harness.agent=true'  "$RT_LOG" || fail "T12: agent containers not enumerated — $(cat "$RT_LOG")"
-grep -q 'rm -f agentcid123'   "$RT_LOG" || fail "T12: agent container not removed — $(cat "$RT_LOG")"
+grep -q 'com.docker.compose.project=harness' "$RT_LOG" || fail "T12: compose containers not enumerated — $(cat "$RT_LOG")"
+grep -q 'rm -f -v agentcid123' "$RT_LOG" || fail "T12: container not removed — $(cat "$RT_LOG")"
 grep -q 'down --rmi all'      "$RT_LOG" || fail "T12: compose down missing --rmi all — $(cat "$RT_LOG")"
 grep -q 'rmi -f harness-proxy:latest' "$RT_LOG" || fail "T12: harness-proxy image not removed — $(cat "$RT_LOG")"
 grep -q 'rmi -f harness-agent:latest' "$RT_LOG" || fail "T12: harness-agent image not removed — $(cat "$RT_LOG")"
 [[ ! -d "$TMP_ROOT" ]] || fail "T12: install root not removed"
-ok "T12: --yes removes agent containers, compose images, and the named images"
+ok "T12: --yes removes agent + compose containers, compose images, and named images"
 
 echo
 echo "CONFIG TEST PASSED"

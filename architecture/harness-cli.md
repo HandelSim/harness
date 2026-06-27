@@ -178,18 +178,23 @@ installer. Three commands cover post-install setup:
   menu (jq parse, grep/sed fallback), and falls back to free-text entry when
   the catalog can't be fetched. Writes via `_config_write_key`.
 - **`cmd_uninstall`** — tear down this install completely. Best-effort, in
-  order: remove the project's agent containers (launched via `docker run`, not
-  compose, so matched by `label=harness.project=$project_name` +
-  `label=harness.agent=true`); `<runtime> compose … down --rmi all
-  --remove-orphans --volumes` to stop the compose services and delete their
-  built images (`harness-proxy`, `harness-agent`) plus anonymous volumes; then
-  an explicit `rmi -f harness-proxy:latest harness-agent:latest` as a fallback
-  if compose left either behind. Finally removes `state/`, the install root, and
-  the `$HOME/.local/bin/harness` wrapper. **Prompts for a typed `yes` first**
-  (via `/dev/tty`, or `HARNESS_CONFIRM_FROM_STDIN=1` in tests); `--yes`/`-y`
-  skips the prompt for automation. Refuses to run when `install_root` is empty
-  or `/`. This is the everyday replacement for the installer's `-u` recovery
-  path, which performs the same container+image teardown.
+  order: **(1)** remove the containers *first* (so an in-use image can't block
+  image removal) — agent containers launched via `docker run`
+  (`label=harness.project=$project_name` + `label=harness.agent=true`) and the
+  compose services such as the proxy (`label=com.docker.compose.project=$project_name`),
+  each swept by label with `rm -f -v`. Both sweeps are needed because
+  `compose down` alone skips containers whose compose working-dir labels don't
+  match this invocation (verified: a relabelled container survives a bare
+  `compose down`). **(2)** `<runtime> compose … down --rmi all --remove-orphans
+  --volumes` to delete the built images (`harness-proxy`, `harness-agent`),
+  volumes, and network. **(3)** an explicit `rmi -f harness-proxy:latest
+  harness-agent:latest` fallback for any image compose left behind. Finally
+  removes `state/`, the install root, and the `$HOME/.local/bin/harness`
+  wrapper. **Prompts for a typed `yes` first** (via `/dev/tty`, or
+  `HARNESS_CONFIRM_FROM_STDIN=1` in tests); `--yes`/`-y` skips the prompt for
+  automation. Refuses to run when `install_root` is empty or `/`. This is the
+  everyday replacement for the installer's `-u` recovery path, which performs
+  the same container+image teardown.
 
 ## Compose wrapper (`compose()`)
 

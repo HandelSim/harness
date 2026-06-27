@@ -855,19 +855,28 @@ if (( UNINSTALL )); then
     fi
     echo
     # Tear down containers and images. Show output so the user can confirm.
-    # Agent containers run via 'docker run' (not compose), so remove those by
-    # label first; then 'compose down --rmi all' stops the services and deletes
-    # the built images. --volumes drops anonymous volumes tied to this project.
+    # Remove the containers first (so image removal isn't blocked by an in-use
+    # image): agents via 'docker run' (harness.project + harness.agent) and the
+    # compose services such as the proxy (com.docker.compose.project). We sweep
+    # both by label because 'compose down' alone skips containers whose compose
+    # working-dir labels don't match this invocation. Then 'compose down --rmi
+    # all' drops the built images, volumes, and network; an explicit 'rmi -f'
+    # fallback covers anything compose left behind.
     _un_rt=$(_inline_container_runtime)
     if command -v "$_un_rt" >/dev/null 2>&1 && "$_un_rt" info >/dev/null 2>&1; then
-        echo "  removing harness agent containers..."
+        echo "  removing harness containers..."
         while IFS= read -r _un_cid; do
             [[ -n "$_un_cid" ]] || continue
-            "$_un_rt" rm -f "$_un_cid" >/dev/null 2>&1 || true
+            "$_un_rt" rm -f -v "$_un_cid" >/dev/null 2>&1 || true
         done < <("$_un_rt" ps -aq \
             --filter "label=harness.project=harness" \
             --filter "label=harness.agent=true" 2>/dev/null || true)
-        echo "  stopping harness containers and removing images..."
+        while IFS= read -r _un_cid; do
+            [[ -n "$_un_cid" ]] || continue
+            "$_un_rt" rm -f -v "$_un_cid" >/dev/null 2>&1 || true
+        done < <("$_un_rt" ps -aq \
+            --filter "label=com.docker.compose.project=harness" 2>/dev/null || true)
+        echo "  removing harness images, volumes, and network..."
         (cd "$install_root" && "$_un_rt" compose --project-name harness down \
             --rmi all --remove-orphans --volumes) || true
         for _un_img in harness-proxy:latest harness-agent:latest; do
@@ -1471,8 +1480,8 @@ EOF
 cat <<EOF
 
 Uninstall harness:
-  harness uninstall          # stops containers, removes state/, the install
-                             # root, and the PATH wrapper (prompts to confirm)
+  harness uninstall          # removes the harness containers + images, state/,
+                             # the install root, and the PATH wrapper (prompts)
 EOF
 
 if (( want_path )); then
