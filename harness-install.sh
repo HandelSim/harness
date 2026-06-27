@@ -846,6 +846,7 @@ if (( UNINSTALL )); then
     echo "    ${C_YELLOW}$install_root${C_RESET}   (install directory — code, config, state)"
     [[ -f "$_wrapper" ]] && \
         echo "    ${C_YELLOW}$_wrapper${C_RESET}   (PATH wrapper)"
+    echo "    harness containers, images (harness-proxy, harness-agent), and volumes"
     echo
     read -rp "  type 'yes' to confirm uninstall, anything else to cancel: " _un_ans
     if [[ "${_un_ans:-}" != "yes" ]]; then
@@ -853,14 +854,28 @@ if (( UNINSTALL )); then
         exit_or_return 0
     fi
     echo
-    # Stop running containers. Show output so the user can confirm they stopped.
-    # --volumes removes anonymous Docker volumes tied to this project.
+    # Tear down containers and images. Show output so the user can confirm.
+    # Agent containers run via 'docker run' (not compose), so remove those by
+    # label first; then 'compose down --rmi all' stops the services and deletes
+    # the built images. --volumes drops anonymous volumes tied to this project.
     _un_rt=$(_inline_container_runtime)
     if command -v "$_un_rt" >/dev/null 2>&1 && "$_un_rt" info >/dev/null 2>&1; then
-        echo "  stopping harness containers..."
+        echo "  removing harness agent containers..."
+        while IFS= read -r _un_cid; do
+            [[ -n "$_un_cid" ]] || continue
+            "$_un_rt" rm -f "$_un_cid" >/dev/null 2>&1 || true
+        done < <("$_un_rt" ps -aq \
+            --filter "label=harness.project=harness" \
+            --filter "label=harness.agent=true" 2>/dev/null || true)
+        echo "  stopping harness containers and removing images..."
         (cd "$install_root" && "$_un_rt" compose --project-name harness down \
-            --remove-orphans --volumes) || true
-        ok "containers stopped"
+            --rmi all --remove-orphans --volumes) || true
+        for _un_img in harness-proxy:latest harness-agent:latest; do
+            if "$_un_rt" image inspect "$_un_img" >/dev/null 2>&1; then
+                "$_un_rt" rmi -f "$_un_img" >/dev/null 2>&1 || true
+            fi
+        done
+        ok "containers and images removed"
     fi
     echo
     # Wipe the bind-mounted state directory first. Docker Desktop on Windows

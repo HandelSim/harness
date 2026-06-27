@@ -13,8 +13,11 @@
 #   - _config_get: masks secret keys, prints plain values otherwise
 #   - _config_set PROXY_API_URL: writes the key AND adds the host to the
 #     allowlist (the firewall sync side-effect)
+#   - cmd_config (no args): prints the subcommand usage so the user learns how to
+#     drive it, then the current values (no-tty branch of the picker)
 #   - cmd_uninstall: cancels on a non-"yes" answer (leaves files), tears down on
-#     --yes, and refuses a "/" install root
+#     --yes, refuses a "/" install root, and (with a stubbed runtime) removes the
+#     agent containers, compose images (--rmi all), and the named built images
 #
 # Prints "CONFIG TEST PASSED" on success.
 
@@ -146,6 +149,53 @@ ok "T9: --yes stops, clears state, removes the install root and wrapper"
 # --- T10: refuses a root install_root ---------------------------------------
 ( install_root="/"; cmd_uninstall --yes ) && fail "T10: should refuse install_root=/"
 ok "T10: refuses to uninstall when install_root is '/'"
+
+# --- T11: bare 'harness config' lists the subcommands -----------------------
+# No args, no tty (the test runner's stdin is not a terminal) -> _config_overview
+# prints the usage/subcommand block then the current values, instead of erroring.
+mkdir -p "$TMP_ROOT"
+cat >"$TMP_ROOT/.env" <<'EOF'
+PROXY_API_URL=https://h.example.com
+DEFAULT_MODEL_NAME=gpt-4
+EOF
+out="$(cmd_config </dev/null)" || fail "T11: bare cmd_config returned non-zero"
+grep -q 'harness config get'  <<<"$out" || fail "T11: usage missing 'config get' — $out"
+grep -q 'harness config set'  <<<"$out" || fail "T11: usage missing 'config set' — $out"
+grep -q 'harness config list' <<<"$out" || fail "T11: usage missing 'config list' — $out"
+grep -q 'DEFAULT_MODEL_NAME'  <<<"$out" || fail "T11: current values not shown — $out"
+ok "T11: bare 'config' lists the subcommands then the current values"
+
+# --- T12: uninstall removes agent containers + compose images + named images -
+# Stub the runtime to a fake binary that LOGS every call, so the docker-free run
+# can assert the teardown issues the container/image removals (not just state).
+# RT_LOG must live outside the install root, since uninstall deletes the root
+# (and everything under it) before these assertions run.
+RT_LOG="$FAKE_HOME/rt.log"
+FAKE_RT="$FAKE_HOME/fakebin/rt"
+mkdir -p "$FAKE_HOME/fakebin"
+cat >"$FAKE_RT" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >>"$RT_LOG"
+case "\$1" in
+    info)  exit 0 ;;          # daemon reachable -> enter the teardown block
+    ps)    echo "agentcid123" ;;   # one agent container to remove
+    image) exit 0 ;;          # 'image inspect' -> image exists -> rmi runs
+    *)     exit 0 ;;
+esac
+EOF
+chmod +x "$FAKE_RT"
+harness_container_runtime() { echo "$FAKE_RT"; }
+
+mk_install
+: >"$RT_LOG"
+out="$(cmd_uninstall --yes)" || fail "T12: uninstall --yes returned non-zero"
+grep -q 'harness.agent=true'  "$RT_LOG" || fail "T12: agent containers not enumerated — $(cat "$RT_LOG")"
+grep -q 'rm -f agentcid123'   "$RT_LOG" || fail "T12: agent container not removed — $(cat "$RT_LOG")"
+grep -q 'down --rmi all'      "$RT_LOG" || fail "T12: compose down missing --rmi all — $(cat "$RT_LOG")"
+grep -q 'rmi -f harness-proxy:latest' "$RT_LOG" || fail "T12: harness-proxy image not removed — $(cat "$RT_LOG")"
+grep -q 'rmi -f harness-agent:latest' "$RT_LOG" || fail "T12: harness-agent image not removed — $(cat "$RT_LOG")"
+[[ ! -d "$TMP_ROOT" ]] || fail "T12: install root not removed"
+ok "T12: --yes removes agent containers, compose images, and the named images"
 
 echo
 echo "CONFIG TEST PASSED"

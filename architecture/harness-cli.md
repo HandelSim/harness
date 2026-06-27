@@ -150,9 +150,12 @@ anything a user re-runs after install lives in this (upgradeable) CLI, not the
 installer. Three commands cover post-install setup:
 
 - **`cmd_config`** — view and change `.env` values.
-  - Bare `harness config` opens an interactive **picker** of the common
-    settings (so you don't have to memorize `.env` keys). The curated set comes
-    from `_config_editable_keys` (`KEY|description` pairs). Picking
+  - Bare `harness config` first prints the subcommand usage (`_config_help`, so
+    you learn `get`/`set`/`list` without `--help`), then — on a tty — opens an
+    interactive **picker** of the common settings (so you don't have to memorize
+    `.env` keys); with no tty it prints the current values instead of erroring.
+    This bare path runs through `_config_overview`. The curated set comes from
+    `_config_editable_keys` (`KEY|description` pairs). Picking
     `DEFAULT_MODEL_NAME` delegates to `cmd_model`.
   - `config get [KEY]` / `config list` print values; `config set KEY VALUE`
     writes one. **Not a whitelist** — `set` writes any key; the picker/`get`
@@ -174,13 +177,19 @@ installer. Three commands cover post-install setup:
   model", now re-runnable). Curls the catalog via `_api_base`, shows a numbered
   menu (jq parse, grep/sed fallback), and falls back to free-text entry when
   the catalog can't be fetched. Writes via `_config_write_key`.
-- **`cmd_uninstall`** — tear down this install: stop containers
-  (`<runtime> compose … down --remove-orphans --volumes`, best-effort), then
-  remove `state/`, the install root, and the `$HOME/.local/bin/harness`
-  wrapper. **Prompts for a typed `yes` first** (via `/dev/tty`, or
-  `HARNESS_CONFIRM_FROM_STDIN=1` in tests); `--yes`/`-y` skips the prompt for
-  automation. Refuses to run when `install_root` is empty or `/`. This is the
-  everyday replacement for the installer's `-u` recovery path.
+- **`cmd_uninstall`** — tear down this install completely. Best-effort, in
+  order: remove the project's agent containers (launched via `docker run`, not
+  compose, so matched by `label=harness.project=$project_name` +
+  `label=harness.agent=true`); `<runtime> compose … down --rmi all
+  --remove-orphans --volumes` to stop the compose services and delete their
+  built images (`harness-proxy`, `harness-agent`) plus anonymous volumes; then
+  an explicit `rmi -f harness-proxy:latest harness-agent:latest` as a fallback
+  if compose left either behind. Finally removes `state/`, the install root, and
+  the `$HOME/.local/bin/harness` wrapper. **Prompts for a typed `yes` first**
+  (via `/dev/tty`, or `HARNESS_CONFIRM_FROM_STDIN=1` in tests); `--yes`/`-y`
+  skips the prompt for automation. Refuses to run when `install_root` is empty
+  or `/`. This is the everyday replacement for the installer's `-u` recovery
+  path, which performs the same container+image teardown.
 
 ## Compose wrapper (`compose()`)
 

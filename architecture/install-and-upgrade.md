@@ -204,10 +204,14 @@ the installer flags remain for recovery before the CLI is reachable:
   reports the HTTP status, and validates `DEFAULT_MODEL_NAME` against the
   returned list.
 - **`-u` / `--uninstall`** — show exactly what will be removed, confirm
-  (`type 'yes'`), stop the project's containers (`<runtime> compose ... down
-  --remove-orphans --volumes`), wipe `state/` first (Docker Desktop on Windows
-  can hold handles and recreate the skeleton after `rm -rf`), then remove the
-  install root and the PATH wrapper.
+  (`type 'yes'`), then tear down containers and images: remove the project's
+  agent containers by label, `<runtime> compose ... down --rmi all
+  --remove-orphans --volumes` to stop the services and delete their built
+  images (`harness-proxy`, `harness-agent`) and volumes, and an explicit
+  `rmi -f` fallback for either named image left behind. Then wipe `state/`
+  first (Docker Desktop on Windows can hold handles and recreate the skeleton
+  after `rm -rf`), then remove the install root and the PATH wrapper. This is
+  the same teardown the CLI's `harness uninstall` performs.
 
 ## `harness update` — code-only
 

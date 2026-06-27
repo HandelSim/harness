@@ -1567,10 +1567,25 @@ _config_picker() {
     return 0
 }
 
+# Bare `harness config`: first list the subcommands so the user learns how to
+# drive it, then drop into the interactive picker. With no tty (scripts, pipes)
+# there is nothing to pick, so print the current values instead of erroring.
+_config_overview() {
+    _config_help
+    echo
+    if [[ -t 0 ]]; then
+        _config_picker
+    else
+        echo "current settings:"
+        _config_get
+    fi
+}
+
 cmd_config() {
     local sub="${1:-}"
     case "$sub" in
-        ""|pick|menu)   _config_picker ;;
+        "")             _config_overview ;;
+        pick|menu)      _config_picker ;;
         get)            shift; _config_get "$@" ;;
         list)           _config_get ;;
         set)            shift; _config_set "$@" ;;
@@ -1683,6 +1698,7 @@ cmd_uninstall() {
     echo "The following will be permanently deleted:"
     echo "  $install_root   (install directory — code, config, state)"
     [[ -f "$wrapper" ]] && echo "  $wrapper   (PATH wrapper)"
+    echo "  harness containers, images (harness-proxy, harness-agent), and volumes"
     echo
 
     if (( ! assume_yes )); then
@@ -1703,13 +1719,33 @@ cmd_uninstall() {
     fi
 
     echo
-    # Stop running containers (best-effort). --volumes removes anonymous volumes.
+    # Tear down all harness containers and images (best-effort). Agent containers
+    # are launched via 'docker run' (not compose), so remove those by label
+    # first; then 'compose down --rmi all' stops the compose services and deletes
+    # the images they build (harness-proxy, harness-agent). --volumes drops
+    # anonymous volumes; --remove-orphans sweeps stragglers.
     local rt
     rt=$(harness_container_runtime 2>/dev/null || echo docker)
     if command -v "$rt" >/dev/null 2>&1 && "$rt" info >/dev/null 2>&1; then
-        echo "stopping harness containers..."
+        echo "removing harness agent containers..."
+        local cid
+        while IFS= read -r cid; do
+            [[ -n "$cid" ]] || continue
+            "$rt" rm -f "$cid" >/dev/null 2>&1 || true
+        done < <("$rt" ps -aq \
+            --filter "label=harness.project=$project_name" \
+            --filter "label=harness.agent=true" 2>/dev/null || true)
+        echo "stopping harness containers and removing images..."
         (cd "$install_root" && "$rt" compose --project-name "$project_name" down \
-            --remove-orphans --volumes) || true
+            --rmi all --remove-orphans --volumes) || true
+        # Belt-and-suspenders: drop the named images if compose left them behind
+        # (compose file unreadable, or images orphaned from an old project name).
+        local img
+        for img in harness-proxy:latest harness-agent:latest; do
+            if "$rt" image inspect "$img" >/dev/null 2>&1; then
+                "$rt" rmi -f "$img" >/dev/null 2>&1 || true
+            fi
+        done
     fi
 
     # Wipe bind-mounted state first: Docker Desktop on Windows can hold handles
