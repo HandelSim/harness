@@ -3,6 +3,8 @@
 .env
 .harness-allowlist
 .harness-net-overrides.json
+# Recency-reminder prose, seeded from proxy/reminder.md by `harness start`.
+.harness-reminder.md
 
 # Runtime state — bind-mounted into containers; not part of the repo.
 # Includes output/, agent/home/, mcp/<name>/,

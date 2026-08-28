@@ -108,7 +108,9 @@ validator in `_setup_prompt_mode` accepts:
   index 0, the "stable prefix" position). A consolidated recency block lands
   on the last user message, organised so the **live user request comes FIRST**
   (wrapped in `<<<BEGIN_USER_REQUEST>>>` markers — issue #110), then a short
-  reminder follows. The reminder has three labelled bullets —
+  reminder follows. The reminder's WORDING lives in an editable file, not
+  in proxy.py — see "Editable reminder prose" below. It has three labelled
+  bullets —
   **Operating** (the merged Agency/Tools/Workflow bullet from the earlier
   format: positive assertion that the model acts through opencode and its
   ```json calls really execute against the working directory mounted from
@@ -244,6 +246,66 @@ agent types, a `skill`'s names): those reach recency INLINED under each
 tool's own entry — see "Per-tool entries" below. This is additive — token
 cost is ~150–250 tokens/turn with the three bullets + Environment context;
 hybrid's lighter-than-user_front recency profile is preserved.
+
+### Editable reminder prose (`.harness-reminder.md`)
+
+The three bullets' **wording is data, not code**. It lives in a file the
+user owns, so rewording the standing instructions is an edit + `harness
+restart`, never a code change. This matters because the hybrid reminder is
+the harness's only standing-instruction channel for the opencode agent (no
+runtime AGENTS.md ships).
+
+- **Tracked default** — `proxy/reminder.md`. Also `COPY`d into the proxy
+  image at `/app/reminder.md`, so a container launched without the mount
+  still has a working reminder.
+- **User copy** — `<install-root>/.harness-reminder.md`, gitignored and
+  seeded from the tracked default by `seed_reminder_file` on every
+  `harness start` / `harness host` (no-op once it exists). Gitignoring it
+  is what keeps an edit from colliding with `harness update`'s
+  `git pull --ff-only`.
+- **How the proxy finds it** — `_reminder_template_path()`: (1)
+  `HARNESS_REMINDER_PATH` if set, else (2) `reminder.md` next to `proxy.py`.
+  `cmd_start` exports `HARNESS_REMINDER_PATH` when the user copy exists, and
+  compose mounts it over `/app/reminder.md`; `host_proxy_start` passes the
+  same var directly, since host mode runs `proxy.py` straight from the clone
+  with no mount to swap. The compose **default** is the tracked
+  `./proxy/reminder.md`, not the user copy, so a bare `docker compose up`
+  (what the docker test suites do) always has a real mount source — a missing
+  source makes docker create a *directory* there and the proxy would silently
+  drop to its fallback. Read-only, and a plain file mount, so an edit takes
+  effect on `harness restart` — no rebuild.
+- **Load** — `_setup_reminder_template()` at startup (the builder also
+  lazy-loads, so importing `proxy.py` in tests needs no `main()`). Fixed for
+  the life of a launch, like the recency map. The startup banner prints the
+  resolved path and the loaded size.
+- **Tokens** — `{{HOST_OS}}`, `{{CWD}}`, `{{TOOL_ENTRIES}}`, substituted by
+  `str.replace`, deliberately not `str.format`/`string.Template`: the prose
+  is full of braces (`{"name": ..., "arguments": {...}}`) and backslashes,
+  and a user edit must never be able to raise. An unknown token is left
+  literal; a deleted token just drops its clause.
+- **Header** — a `<!-- ... -->` block at the very top of the file documents
+  the tokens and is stripped before injection (anchored at the start, so a
+  `<!--` in the prose survives). A trailing newline is stripped too, so the
+  reminder ends at `]` regardless of how the editor saved it.
+- **Degradation** — a missing, unreadable, or empty file is not fatal: the
+  proxy logs `[!]` and uses `_REMINDER_FALLBACK`, a minimal built-in that
+  keeps the tool-call envelope (and so tool calling itself) alive. It is
+  deliberately NOT a copy of the prose — duplicating it would let the two
+  drift. The realistic trigger is a bad `HARNESS_REMINDER_PATH`, where
+  docker mounts an empty *directory* over the file; `seed_reminder_file`
+  `rmdir`s such a leftover before seeding. The fallback keeps only the
+  tool-call envelope and the honesty line, so tool calling survives but the
+  workflow guidance (todo list, parallel `task` agents, environment
+  reproducibility) is gone — treat a `[!]` in the banner as a real outage.
+
+Editing the file is unvalidated by design — the user owns the result. Two
+test suites do assert on a handful of load-bearing phrases in it:
+`proxy/test_proxy.py` (`TestHybridConsolidatedRecency`, against the shipped
+default) and `tests/scheme_contract_test.sh` (`Reminder`, `do not invent`, and
+`<<<BEGIN_AGENT_TOOLS>>>` come from the file; its other assertion,
+`Tools — one entry per tool`, is the code-generated per-tool legend and is
+unaffected by an edit). Rewording those phrases out is what makes them
+fail.
 
 ### Per-tool entries
 

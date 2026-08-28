@@ -174,6 +174,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F138 | `warn_if_firewall_open` prints a yellow warning when any service is in net-overrides |
 | F139 | `warn_if_firewall_open` is silent when net-overrides is empty or absent |
 | F150 | `harness start/restart --prompt-mode <mode>` validates `hybrid`/`user_front`/`passthrough` (`_parse_prompt_mode_flag`) and injects `PROXY_PROMPT_MODE` onto the proxy via `write_runtime_override` (ephemeral, not persisted); folds into the proxy's firewall opt-out block when both apply |
+| F152 | `seed_reminder_file` (called by `cmd_start` and `host_proxy_start`) copies the tracked `proxy/reminder.md` to the gitignored `<install_root>/.harness-reminder.md` when it is missing, never overwriting an edited copy, and `rmdir`s an empty directory docker left at that path from a prior missing-mount-source `up`. `cmd_start` then exports `HARNESS_REMINDER_PATH` at the user copy; `host_proxy_start` passes it in the `nohup` env. The compose default stays the tracked file so a bare `docker compose up` always has a real mount source |
 
 ---
 
@@ -241,6 +242,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P061 | Proxy derives endpoints from `PROXY_API_URL` as a base — `{base}/v1/chat/completions` and `{base}/v1/models` — stripping a trailing `/v1/chat/completions`, `/chat/completions`, or `/v1` first |
 | P062 | `_validate_config` refuses to start (exit 1) when `HARNESS_FORCE_LOOPBACK` is truthy (`1`/`true`/`yes`) but `PROXY_HOST` is not a loopback address (`127.0.0.1`/`::1`/`localhost`); container mode (var unset/falsey) may bind `0.0.0.0`. Belt-and-suspenders that host mode never exposes the keyed, firewall-less proxy off-box |
 | P063 | `_force_utf8_stdio` (called first in `main()`) reconfigures stdout/stderr to `encoding="utf-8", errors="backslashreplace"` so a non-ASCII print can never crash the proxy. Regression for the Windows host-mode crash: redirected stdout defaults to cp1252, which cannot encode the `→` (U+2192) in the `sys→user:` startup banner, so `print` raised `UnicodeEncodeError` and killed the proxy at startup. No-op on streams already UTF-8 or lacking `reconfigure` (Python < 3.7) |
+| P064 | The hybrid recency reminder's prose is loaded from a FILE, not a literal: `_setup_reminder_template` reads `_reminder_template_path()` (`HARNESS_REMINDER_PATH`, else `reminder.md` beside `proxy.py`), strips a leading `<!-- -->` header block and trailing newlines, and `build_cooperative_prompt_hybrid_reminder` substitutes `{{HOST_OS}}` / `{{CWD}}` / `{{TOOL_ENTRIES}}` by `str.replace` (never `format`, so a user edit cannot raise; unknown tokens stay literal). A missing, directory-shadowed, or empty file logs `[!]` and falls back to `_REMINDER_FALLBACK`, which keeps the tool-call envelope so tool calling still works |
 
 ---
 

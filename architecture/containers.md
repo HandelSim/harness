@@ -32,6 +32,16 @@ there is no ollama hop. See [`proxy.md`](proxy.md) for behavior.
 
 Healthcheck: `curl -fsS http://127.0.0.1:${PROXY_PORT:-8000}/health`.
 
+Two read-only bind mounts carry user-owned data into the image: the egress
+allowlist at `/etc/harness/allowlist`, and the hybrid recency reminder's
+prose at `/app/reminder.md`
+(`${HARNESS_REMINDER_PATH:-./proxy/reminder.md}`). The Dockerfile bakes a
+copy of `proxy/reminder.md` at that path too, so an unmounted container
+still starts; `harness start` seeds and points at the gitignored user copy
+`.harness-reminder.md`. Because it is a mount and not a build input,
+rewording the reminder needs `harness restart`, not a rebuild — see
+[`proxy.md`](proxy.md) → "Editable reminder prose".
+
 ## agent containers (`agents/Dockerfile` + `agents/entrypoint.sh`)
 
 A single image backs both modes (`opencode`, `shell`) with

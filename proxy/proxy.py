@@ -350,6 +350,57 @@ _OPENCODE_TASK_AGENTS_RE = re.compile(
 # host-OS parenthetical — the rest of the Environment line is host-independent.
 _HOST_OS: str = ""
 
+# Hybrid mode only. The recency reminder's prose lives in a FILE, not in a
+# string literal here, so it is editable without a code change: edit the file,
+# `harness restart`, done.
+#
+# Two rungs, both resolving to the user's copy in a normal install:
+#   1. HARNESS_REMINDER_PATH — set by `harness host` (host mode runs proxy.py
+#      straight from the clone, so there is no mount to override anything).
+#   2. reminder.md next to proxy.py — /app/reminder.md in the container, which
+#      docker-compose bind-mounts the user's `.harness-reminder.md` over. The
+#      Dockerfile also COPYs the tracked default there, so a container with no
+#      mount still has a working reminder.
+# Loaded once at startup like the recency map: the file is fixed for a launch.
+def _reminder_template_path() -> str:
+    env_path = os.environ.get("HARNESS_REMINDER_PATH", "").strip()
+    if env_path:
+        return env_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminder.md")
+
+# Substituted into the template per turn. Deliberately `{{NAME}}` + str.replace
+# rather than str.format/Template: the reminder prose is full of braces
+# (`{"name": ..., "arguments": {...}}`) and backslashes, and a user-edited file
+# must never be able to raise on a stray character. An unknown token is simply
+# left alone.
+_REMINDER_TOKEN_HOST_OS = "{{HOST_OS}}"
+_REMINDER_TOKEN_CWD = "{{CWD}}"
+_REMINDER_TOKEN_TOOL_ENTRIES = "{{TOOL_ENTRIES}}"
+
+# Only a comment block at the very TOP of the file is stripped (that is where
+# the file documents its own tokens). Anchored at \A so a `<!--` appearing in
+# the prose is left alone.
+_REMINDER_HEADER_RE = re.compile(r"\A\s*<!--.*?-->[ \t]*\n?", re.DOTALL)
+
+# Emergency fallback, used only when reminder.md is missing or unreadable (a
+# bad bind-mount path — docker silently mounts a directory there). Deliberately
+# NOT a copy of the file: duplicating the prose would let the two drift. It
+# carries only the mechanically load-bearing part, the tool-call envelope,
+# without which tool calling breaks outright, plus the tool entries.
+_REMINDER_FALLBACK = (
+    "[Reminder — operating rules for this turn.\n"
+    "- Operating: you act through opencode. Call a tool by emitting a "
+    "COMPLETE ```json...``` block whose body is `{\"name\": \"<tool>\", "
+    "\"arguments\": {...}}`. After a tool call, do not invent or narrate its "
+    "result — the real result arrives next turn.\n"
+    "- Honesty: never fabricate; no invented paths, signatures, or results."
+    "{{TOOL_ENTRIES}}]"
+)
+
+# Set by _setup_reminder_template(). None means "not loaded yet"; the builder
+# lazy-loads so importing proxy.py in tests works without calling main().
+_REMINDER_TEMPLATE: Optional[str] = None
+
 
 # ---------------------------------------------------------------------------
 # OUTPUT_DIR handling
@@ -432,6 +483,43 @@ def _setup_state_check_tools() -> None:
             names = {x for x in data if isinstance(x, str) and x.strip()}
     _MCP_STATE_CHECK_TOOLS = names
     print(f"[i] MCP state-check tools: {len(_MCP_STATE_CHECK_TOOLS)}", flush=True)
+
+
+def _setup_reminder_template() -> None:
+    """Load the hybrid recency reminder's prose from the file
+    `_reminder_template_path()` resolves to, stripping the leading comment
+    block the file uses to document its own tokens and the trailing newline a
+    text editor adds (the reminder ends at `]`).
+
+    An unreadable or empty file is NOT fatal: the proxy logs a loud `[!]` and
+    falls back to `_REMINDER_FALLBACK`, which keeps the tool-call envelope (and
+    so tool calling itself) working while making the misconfiguration obvious
+    in the startup banner. The realistic cause is a bad
+    `HARNESS_REMINDER_PATH`, where docker mounts a directory over the file."""
+    global _REMINDER_TEMPLATE
+    path = _reminder_template_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        print(
+            f"[!] reminder template unreadable at {path} ({exc}); "
+            "using the built-in fallback",
+            flush=True,
+        )
+        _REMINDER_TEMPLATE = _REMINDER_FALLBACK
+        return
+    body = _REMINDER_HEADER_RE.sub("", raw).rstrip("\n")
+    if not body.strip():
+        print(
+            f"[!] reminder template at {path} is empty; using the built-in "
+            "fallback",
+            flush=True,
+        )
+        _REMINDER_TEMPLATE = _REMINDER_FALLBACK
+        return
+    _REMINDER_TEMPLATE = body
+    print(f"[i] reminder template: {len(body)} chars from {path}", flush=True)
 
 
 def _setup_tool_search() -> None:
@@ -819,24 +907,15 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     USER_REQUEST wrap — the TOOL_RESULT markers already delimit the live
     "ask" of the turn.
 
-    Operating consolidates the prior Agency/Tools/Workflow bullets into
-    one paragraph. It still carries:
-      - "you act through opencode — calls really execute, results are real"
-        (issue #109's anchor against the upstream's "I can't execute, here
-        are commands for you to run" persona reversion)
-      - the JSON envelope and the no-fabricated-results rule
-      - "prefer a listed tool over hand-work"
-      - "don't downgrade to listing commands for the user to run"
-      - "keep a `todowrite` todo list for multi-step work, updated as you go
-        so the plan and progress survive a context compaction; Launch `task`
-        agents in parallel when independent, at most 8 at a time, briefing each
-        in full since a sub-agent does not share the parent's context"
-      - "if no listed tool fits, just ask or answer"
-      - a pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions
-
-    Honesty (anti-fabrication) and Environment (Linux container + host-OS
-    parenthetical) keep their own bullets — both are short, orthogonal to
-    Operating, and worth keeping scannable on their own.
+    The three bullets' PROSE is not here: it is user-owned data, loaded from
+    `.harness-reminder.md` by `_setup_reminder_template`. This function only
+    substitutes the three tokens the file documents — `{{HOST_OS}}`,
+    `{{CWD}}`, `{{TOOL_ENTRIES}}` — into it. Read the shipped default at
+    `proxy/reminder.md` for the wording and why each rule is there (the
+    Operating bullet's "you act through opencode, calls really execute" is
+    issue #109's anchor against the upstream's "I can't execute, here are
+    commands for you to run" persona reversion). A user who rewrites the file
+    owns the result; nothing here validates the prose.
 
     The per-tool entries below the bullets carry all three things that
     used to be split across the prior recency block — signature, shortened
@@ -875,49 +954,14 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     else:
         cwd_clause = ""
     tool_entries = _format_tool_entries(tool_signatures, tool_details)
+    if _REMINDER_TEMPLATE is None:
+        # Lazy load so importing proxy.py (tests) needs no main() call.
+        _setup_reminder_template()
     reminder = (
-        "[Reminder — operating rules for this turn.\n"
-        "- Operating: you act through opencode — your ```json calls really "
-        "execute against the working directory mounted from the user's "
-        "machine, and the results you get back are real. Call a tool by "
-        "emitting a COMPLETE ```json...``` block (fence opener, JSON body, "
-        "closing fence) whose body is `{\"name\": \"<tool>\", \"arguments\": "
-        "{...}}` — never an abbreviated identifier, never a partial fence; "
-        "any backslash inside a string must be JSON-escaped (`\\n` for a "
-        "literal newline, `\\x1e` for that byte, `\\\\` for a single "
-        "backslash) or the call will be rejected. You may reason before or "
-        "after the block. After a tool call, do not "
-        "invent or narrate its result — the real result arrives next turn. "
-        "Do the task with the opencode tools listed below (full descriptions "
-        "in the <<<BEGIN_AGENT_TOOLS>>> section earlier in this "
-        "conversation); prefer a listed tool over doing the work by hand "
-        "(e.g. use `webfetch` for a URL instead of curl or a script), and "
-        "don't downgrade to listing commands for the user to run. Keep a "
-        "`todowrite` todo list for any multi-step task: lay out the steps "
-        "before you start and keep it updated as you go (mark items "
-        "in_progress / completed, add steps you discover), so your plan and "
-        "progress survive a context compaction and keep you on track. Launch "
-        "`task` agents — several "
-        "concurrently when the work allows, at most 8 at a time — to "
-        "parallelize and conserve your context; brief each one in full "
-        "because a sub-agent does not share your context. If no opencode "
-        "tool fits, just ask or answer.\n"
-        "- Honesty: never fabricate. Do not present guesses as facts — no "
-        "invented function names, file paths, signatures, config keys, or "
-        "citations. Any claim about the working directory, its contents, or "
-        "local filesystem state must come from a tool result in this "
-        "conversation — if no tool produced it, you don't know. "
-        "\"I don't know\" or \"I'd need to check X\" are valid answers — "
-        "then check.\n"
-        "- Environment: you run in a Linux container with the current working "
-        f"directory mounted from the host{host_os_clause}.{cwd_clause} Your "
-        "work must reproduce in the user's environment, not this container — "
-        "anything installed only here (e.g. a global/system venv) the user "
-        "cannot run. Put reproducible setup in the working directory (e.g. a "
-        "project-local venv + requirements.txt); a venv built here is "
-        "Linux-native, so on a non-Linux host the user may need to recreate "
-        "it (python -m venv .venv && pip install -r requirements.txt)."
-        f"{tool_entries}]"
+        (_REMINDER_TEMPLATE or "")
+        .replace(_REMINDER_TOKEN_HOST_OS, host_os_clause)
+        .replace(_REMINDER_TOKEN_CWD, cwd_clause)
+        .replace(_REMINDER_TOKEN_TOOL_ENTRIES, tool_entries)
     )
     return f"{wrapped}\n\n{reminder}"
 
@@ -2541,6 +2585,7 @@ def main() -> None:
     _setup_mcp_tool_recency()
     _setup_state_check_tools()
     _setup_tool_search()
+    _setup_reminder_template()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()
     if not raw_output:
@@ -2566,6 +2611,7 @@ def main() -> None:
         f"   state-check:    {len(_MCP_STATE_CHECK_TOOLS)} tool(s)\n"
         f"   tool-search:    {'on' if _TOOL_SEARCH_ENABLED else 'off'}\n"
         f"   host OS:        {_HOST_OS or '(unknown)'}\n"
+        f"   reminder:       {_reminder_template_path()}\n"
         f"   debug dumps:    {output_status}\n"
         "============================================================",
         flush=True,

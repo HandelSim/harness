@@ -7,6 +7,7 @@ Run inside the proxy container:
 import io
 import json
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -3807,6 +3808,174 @@ class TestForceUtf8Stdio(unittest.TestCase):
         with patch.object(proxy.sys, "stdout", _Bare()), \
                 patch.object(proxy.sys, "stderr", _Bare()):
             proxy._force_utf8_stdio()  # must not raise
+
+
+class TestReminderTemplateFile(unittest.TestCase):
+    """The hybrid recency reminder's prose is user-owned DATA loaded from a
+    file (`_setup_reminder_template`), not a literal in proxy.py, so an
+    operator can reword it and `harness restart` without a code change.
+
+    These tests cover the loader's contract. The reminder's actual WORDING is
+    asserted by TestHybridConsolidatedRecency against the shipped default in
+    proxy/reminder.md — reword that file and those tests are what fails."""
+
+    @classmethod
+    def setUpClass(cls):
+        # The shipped default, so tearDown can put the global back for the
+        # rest of the suite (which asserts on the real prose).
+        if proxy._REMINDER_TEMPLATE is None:
+            proxy._setup_reminder_template()
+        cls.shipped = proxy._REMINDER_TEMPLATE
+
+    def tearDown(self):
+        proxy._REMINDER_TEMPLATE = self.shipped
+
+    def _load(self, text, tmpdir=None):
+        """Write `text` to a temp reminder file, point HARNESS_REMINDER_PATH
+        at it, load it, and return (template, stdout)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "reminder.md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            buf = io.StringIO()
+            with patch.dict(os.environ, {"HARNESS_REMINDER_PATH": path}), \
+                    patch("sys.stdout", buf):
+                proxy._setup_reminder_template()
+            return proxy._REMINDER_TEMPLATE, buf.getvalue(), path
+
+    # -- loading -----------------------------------------------------------
+
+    def test_env_path_overrides_the_adjacent_default(self):
+        # `harness host` runs proxy.py straight from the clone, where there is
+        # no bind-mount to swap reminder.md — HARNESS_REMINDER_PATH is how the
+        # user's editable copy is reached in that mode.
+        tmpl, _, _ = self._load("just this")
+        self.assertEqual(tmpl, "just this")
+
+    def test_leading_comment_block_is_stripped(self):
+        # The file documents its own tokens in a top-of-file HTML comment;
+        # that is authoring metadata, not prompt text, so it must not reach
+        # the model (and must not burn tokens every turn).
+        tmpl, _, _ = self._load(
+            "<!-- docs for the editor\n   spanning lines -->\n[Reminder body]\n"
+        )
+        self.assertEqual(tmpl, "[Reminder body]")
+
+    def test_only_a_leading_comment_is_stripped(self):
+        # Anchored at the start: a `<!--` inside the prose is the user's text.
+        tmpl, _, _ = self._load("[Reminder <!-- kept --> body]\n")
+        self.assertEqual(tmpl, "[Reminder <!-- kept --> body]")
+
+    def test_trailing_newlines_are_stripped(self):
+        # Editors add a final newline; the reminder must end at `]` so the
+        # rendered prompt is unchanged by how the file was saved.
+        tmpl, _, _ = self._load("[Reminder]\n\n\n")
+        self.assertEqual(tmpl, "[Reminder]")
+
+    def test_shipped_default_loads_and_carries_every_token(self):
+        # Guards proxy/reminder.md itself: dropping a token there would
+        # silently strand host-OS / cwd / tool entries out of the prompt.
+        env_no_var = {k: v for k, v in os.environ.items()
+                      if k != "HARNESS_REMINDER_PATH"}
+        with patch.dict(os.environ, env_no_var, clear=True):
+            self.assertTrue(proxy._reminder_template_path().endswith(
+                os.path.join("proxy", "reminder.md")))
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                proxy._setup_reminder_template()
+        tmpl = proxy._REMINDER_TEMPLATE
+        self.assertNotEqual(tmpl, proxy._REMINDER_FALLBACK)
+        for token in (proxy._REMINDER_TOKEN_HOST_OS,
+                      proxy._REMINDER_TOKEN_CWD,
+                      proxy._REMINDER_TOKEN_TOOL_ENTRIES):
+            self.assertIn(token, tmpl)
+        self.assertTrue(tmpl.startswith("[Reminder"))
+        self.assertTrue(tmpl.endswith("]"))
+
+    # -- degradation -------------------------------------------------------
+
+    def test_missing_file_falls_back_loudly(self):
+        # The realistic cause is a bad HARNESS_REMINDER_PATH / bind-mount,
+        # where docker mounts an empty DIRECTORY over the file. Falling back
+        # keeps the tool-call envelope alive; the `[!]` makes it visible.
+        with tempfile.TemporaryDirectory() as td:
+            missing = os.path.join(td, "nope.md")
+            buf = io.StringIO()
+            with patch.dict(os.environ, {"HARNESS_REMINDER_PATH": missing}), \
+                    patch("sys.stdout", buf):
+                proxy._setup_reminder_template()
+            self.assertEqual(proxy._REMINDER_TEMPLATE, proxy._REMINDER_FALLBACK)
+            self.assertIn("[!]", buf.getvalue())
+            self.assertIn(missing, buf.getvalue())
+
+    def test_directory_at_the_path_falls_back(self):
+        # Exactly what docker leaves behind for a missing mount source.
+        with tempfile.TemporaryDirectory() as td:
+            buf = io.StringIO()
+            with patch.dict(os.environ, {"HARNESS_REMINDER_PATH": td}), \
+                    patch("sys.stdout", buf):
+                proxy._setup_reminder_template()
+            self.assertEqual(proxy._REMINDER_TEMPLATE, proxy._REMINDER_FALLBACK)
+            self.assertIn("[!]", buf.getvalue())
+
+    def test_empty_and_comment_only_files_fall_back(self):
+        for raw in ("", "   \n\n", "<!-- only the header -->\n"):
+            tmpl, out, _ = self._load(raw)
+            self.assertEqual(tmpl, proxy._REMINDER_FALLBACK, repr(raw))
+            self.assertIn("[!]", out)
+
+    def test_fallback_keeps_the_tool_call_envelope(self):
+        # The fallback is deliberately NOT a copy of the prose (it would
+        # drift), but it must keep the mechanically load-bearing part or tool
+        # calling breaks outright.
+        self.assertIn('"name"', proxy._REMINDER_FALLBACK)
+        self.assertIn('"arguments"', proxy._REMINDER_FALLBACK)
+        self.assertIn(proxy._REMINDER_TOKEN_TOOL_ENTRIES,
+                      proxy._REMINDER_FALLBACK)
+
+    # -- substitution ------------------------------------------------------
+
+    def test_tokens_are_substituted_into_the_rendered_reminder(self):
+        self._load(
+            "[Reminder host={{HOST_OS}} cwd={{CWD}} tools={{TOOL_ENTRIES}}]"
+        )
+        with patch.object(proxy, "_HOST_OS", "macos"):
+            out = proxy.build_cooperative_prompt_hybrid_reminder(
+                "do it", [("read", ["path"], [])],
+                working_directory="/w/x")
+        self.assertIn("host= (host OS: macos)", out)
+        self.assertIn("/w/x", out)
+        self.assertIn("read(path)", out)
+        self.assertNotIn("{{", out)
+
+    def test_unknown_tokens_and_stray_braces_are_left_literal(self):
+        # str.replace, not str.format/Template: a user edit must never be able
+        # to raise, and the prose legitimately contains `{...}` and
+        # backslashes.
+        self._load('[Reminder {{NOPE}} {"a": {"b": 1}} \\n {}]')
+        out = proxy.build_cooperative_prompt_hybrid_reminder("hi", [])
+        self.assertIn("{{NOPE}}", out)
+        self.assertIn('{"a": {"b": 1}}', out)
+
+    def test_absent_optional_tokens_render_nothing_extra(self):
+        # A user who deletes {{CWD}} / {{HOST_OS}} just loses those clauses;
+        # the reminder still renders.
+        self._load("[Reminder only {{TOOL_ENTRIES}}]")
+        out = proxy.build_cooperative_prompt_hybrid_reminder(
+            "hi", [], working_directory="/w/x")
+        self.assertIn("[Reminder only", out)
+        self.assertNotIn("/w/x", out)
+
+    def test_builder_lazy_loads_when_main_never_ran(self):
+        # Importing proxy.py (tests, host mode helpers) must not require
+        # main(); the builder loads the template on first use.
+        proxy._REMINDER_TEMPLATE = None
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            out = proxy.build_cooperative_prompt_hybrid_reminder("hi", [])
+        self.assertIsNotNone(proxy._REMINDER_TEMPLATE)
+        self.assertIn("[Reminder", out)
+
 
 
 if __name__ == "__main__":

@@ -25,6 +25,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY proxy/proxy.py .
 COPY proxy/test_proxy.py .
 
+# Shipped default for the hybrid recency reminder. docker-compose bind-mounts
+# the user's editable copy (<install root>/.harness-reminder.md) over this
+# path; the baked copy is what a container launched without that mount uses.
+COPY proxy/reminder.md .
+
 # Universal egress firewall.
 COPY firewall/init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod +x /usr/local/bin/init-firewall.sh

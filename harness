@@ -675,6 +675,47 @@ mcp_is_enabled() {
     [[ "$v" == "true" ]]
 }
 
+# Seed the user's editable recency-reminder file from the tracked default.
+#
+# The reminder's prose is data, not code: <install root>/.harness-reminder.md is
+# gitignored and user-owned, docker-compose bind-mounts it over the container's
+# /app/reminder.md, and the proxy loads it at startup. Seeding here (rather than
+# only in harness-install.sh) means an existing install picks the file up on its
+# next `harness start`, with no upgrade action needed.
+#
+# Only ever creates a MISSING file — an edited copy is never overwritten, so a
+# later `harness upgrade` cannot clobber the user's wording. The consequence is
+# the standard user-config tradeoff: improvements to the shipped default do not
+# reach an install that already has a copy. Delete .harness-reminder.md to take
+# the new default.
+seed_reminder_file() {
+    local user_copy="$install_root/.harness-reminder.md"
+    local shipped="$clone_dir/proxy/reminder.md"
+    # A compose bind-mount whose source is missing makes docker CREATE an empty
+    # directory there. Left in place that directory looks like "already seeded"
+    # forever and mounts a directory over the file, so the proxy silently runs
+    # on its built-in fallback. rmdir only removes it while it is empty.
+    if [[ -d "$user_copy" ]]; then
+        rmdir "$user_copy" 2>/dev/null || {
+            err "$user_copy is a non-empty directory; expected the reminder file."
+            err "Remove it, then re-run 'harness start' to seed the reminder."
+            return 0
+        }
+    fi
+    [[ -e "$user_copy" ]] && return 0
+    if [[ ! -f "$shipped" ]]; then
+        err "proxy/reminder.md missing from the clone; the proxy falls back to"
+        err "its built-in reminder. Run 'harness update' to restore it."
+        return 0
+    fi
+    if cp "$shipped" "$user_copy" 2>/dev/null; then
+        err "seeded .harness-reminder.md — edit it to change the agent's"
+        err "        per-turn reminder, then 'harness restart'"
+    else
+        err "could not write $user_copy; the proxy uses the image's default"
+    fi
+}
+
 # Build the consolidated MCP tool-recency map for the proxy. For every ENABLED
 # MCP under state/mcp/<name>/, read its recency.json (a bare `tool -> one-line
 # description` map) and emit ONE merged JSON object keyed `<name>_<tool>` — the
@@ -2000,6 +2041,16 @@ cmd_start() {
     # docker-compose.yml interpolates it into the proxy service env, mirroring
     # HARNESS_HOST_OS. Recomputed on every start/restart, so editing a
     # recency.json takes effect on the next `harness restart`.
+    # The reminder file is a compose bind-mount source, so it must exist before
+    # `up` — docker would otherwise create a directory in its place.
+    seed_reminder_file
+    # Point compose at the user copy when it exists. Unset otherwise, so the
+    # mount falls back to the tracked proxy/reminder.md rather than to a path
+    # docker would have to invent.
+    if [[ -f "$install_root/.harness-reminder.md" ]]; then
+        export HARNESS_REMINDER_PATH="$install_root/.harness-reminder.md"
+    fi
+
     export HARNESS_MCP_TOOL_RECENCY="$(mcp_tool_recency_json)"
     # Companion array: tools flagged state_check in recency.json. The proxy marks
     # them [state-check] and adds an orient-first reminder. Same per-start
@@ -3800,6 +3851,15 @@ host_proxy_start() {
     # inherited .env one.
     local host_output_dir
     host_output_dir=$(host_output_dir_resolve "${OUTPUT_DIR:-}")
+    # Host mode runs proxy.py straight from the clone, so there is no compose
+    # bind-mount to put the user's reminder file in proxy.py's default spot.
+    # Point the proxy at it explicitly. Empty when seeding failed: proxy.py then
+    # falls back to the tracked default sitting next to it in the clone.
+    seed_reminder_file
+    local host_reminder=""
+    if [[ -f "$install_root/.harness-reminder.md" ]]; then
+        host_reminder="$install_root/.harness-reminder.md"
+    fi
     # HARNESS_FORCE_LOOPBACK is belt-and-suspenders for the no-firewall mode:
     # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
     # one-line regression in this launch path can't expose the keyed proxy on
@@ -3821,6 +3881,7 @@ host_proxy_start() {
         PROXY_PORT="$port" \
         OUTPUT_DIR="$host_output_dir" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
+        HARNESS_REMINDER_PATH="$host_reminder" \
         nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"

@@ -75,6 +75,17 @@ services:
       - ./state/output:/output
       # Universal egress firewall reads its allowlist from this path.
       - ${HARNESS_ALLOWLIST_PATH:-./.harness-allowlist}:/etc/harness/allowlist:ro
+      # The hybrid recency reminder's prose — user-editable data, not code.
+      # `harness start` seeds the gitignored user copy (.harness-reminder.md)
+      # and points HARNESS_REMINDER_PATH at it; gitignoring it is what keeps an
+      # edit from colliding with `harness update`'s fast-forward pull. The
+      # default is the TRACKED file, not the user copy, so a bare
+      # `docker compose up` (what the test suites do) always has a real source
+      # — a missing bind-mount source makes docker create a DIRECTORY here and
+      # the proxy would silently drop to its built-in fallback. Mounted over
+      # the copy the image baked in, so an edit needs `harness restart`, no
+      # rebuild.
+      - ${HARNESS_REMINDER_PATH:-./proxy/reminder.md}:/app/reminder.md:ro
     # init-firewall.sh requires NET_ADMIN and NET_RAW to manage iptables/ipset.
     cap_add:
       - NET_ADMIN
