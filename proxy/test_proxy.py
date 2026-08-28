@@ -3878,8 +3878,16 @@ class TestReminderTemplateFile(unittest.TestCase):
         env_no_var = {k: v for k, v in os.environ.items()
                       if k != "HARNESS_REMINDER_PATH"}
         with patch.dict(os.environ, env_no_var, clear=True):
-            self.assertTrue(proxy._reminder_template_path().endswith(
-                os.path.join("proxy", "reminder.md")))
+            # With no env override the default is reminder.md sitting next to
+            # proxy.py. Assert that layout-independently: in a checkout that
+            # dir is proxy/, but the proxy_test suite runs this inside the
+            # container where the Dockerfile COPYs proxy.py to /app, so a
+            # hardcoded proxy/ parent would (and did) fail there.
+            default_path = proxy._reminder_template_path()
+            self.assertEqual(os.path.basename(default_path), "reminder.md")
+            self.assertEqual(
+                os.path.dirname(default_path),
+                os.path.dirname(os.path.abspath(proxy.__file__)))
             buf = io.StringIO()
             with patch("sys.stdout", buf):
                 proxy._setup_reminder_template()
