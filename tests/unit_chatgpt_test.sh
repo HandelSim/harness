@@ -69,7 +69,8 @@ HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" HARNESS_ALLOWLIST_PATH="$
 clone_dir="$REPO_ROOT"
 
 for fn in _backend_is_chatgpt _effective_default_model cmd_chatgpt \
-          _running_proxy_backend write_runtime_override require_runtime_config \
+          _running_proxy_backend _running_proxy_fp _chatgpt_config_fingerprint \
+          write_runtime_override require_runtime_config \
           host_require_config host_proxy_fingerprint ensure_services_up; do
     [[ "$(type -t "$fn")" == "function" ]] || fail "$fn not sourced"
 done
@@ -94,7 +95,12 @@ write_runtime_override
 grep -q 'PROXY_BACKEND: "chatgpt"' "$runtime_override" \
     || fail "T2: PROXY_BACKEND missing — $(cat "$runtime_override")"
 grep -q '^  proxy:' "$runtime_override" || fail "T2: no proxy service block"
-ok "T2: backend_override emits PROXY_BACKEND on the proxy service"
+grep -q "HARNESS_PROXY_FP: \"$(_chatgpt_config_fingerprint)\"" "$runtime_override" \
+    || fail "T2: HARNESS_PROXY_FP missing — $(cat "$runtime_override")"
+# The override file lands on disk under state/; only the hash may appear in it.
+grep -q "$CHATGPT_COOKIE_STRING" "$runtime_override" \
+    && fail "T2: the cookie leaked into the compose override file"
+ok "T2: backend_override emits PROXY_BACKEND and the config fingerprint"
 
 # --- T3: backend + prompt-mode share ONE proxy: mapping ---------------------
 # Duplicate top-level service keys are invalid compose YAML, so both ephemeral
@@ -139,16 +145,29 @@ ok "T5: require_runtime_config swaps required vars per backend"
 ok "T6: host_require_config swaps required vars per backend"
 
 # --- T7: the auth probe and catalog pull are skipped for chatgpt ------------
-# Both are bearer-key/OpenAI-catalog specific. Stub the underlying probe to
-# fail loudly: if the early return regresses, these calls turn non-zero.
+# Both are bearer-key/OpenAI-catalog specific. The chatgpt backend has no
+# bearer key and no /v1/models catalog, so reaching either one is the bug.
 _probe_upstream_auth() { return 1; }
 ( backend_override="chatgpt"; HARNESS_SKIP_AUTH_PROBE=0
   _gate_on_upstream_auth ) >/dev/null 2>&1 \
     || fail "T7: _gate_on_upstream_auth must no-op for chatgpt"
+# _print_upstream_models swallows curl failures with `|| true`, so a non-zero
+# return can't detect a regression. Trip a marker instead: the early return is
+# what must stop it before the catalog request goes out.
+CURL_MARKER="$TMP_ROOT/t7-curl-was-called"
+rm -f "$CURL_MARKER"
+curl() { : >"$CURL_MARKER"; return 1; }
 ( backend_override="chatgpt"; HARNESS_SKIP_AUTH_PROBE=0
-  _print_upstream_models ) >/dev/null 2>&1 \
-    || fail "T7: _print_upstream_models must no-op for chatgpt"
-unset -f _probe_upstream_auth
+  _print_upstream_models ) >/dev/null 2>&1 || true
+[[ ! -e "$CURL_MARKER" ]] || fail "T7: _print_upstream_models hit the catalog on the chatgpt backend"
+# Control: with the openai backend and a URL+key set, it DOES reach curl, so
+# the assertion above is testing the guard and not a dead code path.
+( backend_override=""; HARNESS_SKIP_AUTH_PROBE=0
+  PROXY_API_URL="https://api.example.com"; PROXY_API_KEY="sk-test"
+  _print_upstream_models ) >/dev/null 2>&1 || true
+[[ -e "$CURL_MARKER" ]] || fail "T7: the openai backend must still pull the catalog"
+rm -f "$CURL_MARKER"
+unset -f curl _probe_upstream_auth
 ok "T7: chatgpt skips the bearer-key probe and the model-catalog pull"
 
 # --- T8: the host fingerprint covers backend + all three CHATGPT_* ----------
@@ -175,6 +194,14 @@ harness_docker() { printf 'PATH=/usr/bin\nPROXY_BACKEND=chatgpt\nPROXY_PORT=8000
 harness_docker() { printf 'PATH=/usr/bin\nPROXY_PORT=8000\n'; }
 [[ "$(_running_proxy_backend)" == "openai" ]] \
     || fail "T9: a proxy with no PROXY_BACKEND must report the openai default"
+[[ -z "$(_running_proxy_fp)" ]] || fail "T9: a proxy with no HARNESS_PROXY_FP must report nothing"
+harness_docker() { printf 'PATH=/usr/bin\nHARNESS_PROXY_FP=deadbeefcafe0001\nPROXY_PORT=8000\n'; }
+[[ "$(_running_proxy_fp)" == "deadbeefcafe0001" ]] \
+    || fail "T9: fingerprint not read from container env"
+# The cookie sits next to the fingerprint in the real container env; the reader
+# must not surface it.
+harness_docker() { printf 'CHATGPT_COOKIE_STRING=leakme\nHARNESS_PROXY_FP=deadbeefcafe0001\n'; }
+_running_proxy_fp | grep -q leakme && fail "T9: the cookie leaked out of the env reader"
 compose() { echo ""; }
 _running_proxy_backend >/dev/null 2>&1 && fail "T9: no proxy must be reported as not running"
 ok "T9: _running_proxy_backend reports the running container's dialect"
@@ -199,10 +226,25 @@ backend_override="chatgpt"; ensure_services_up >/dev/null
 
 : >"$START_LOG"
 _running_proxy_backend() { printf 'chatgpt'; }
+_running_proxy_fp() { _chatgpt_config_fingerprint; }
 backend_override="chatgpt"; ensure_services_up >/dev/null
 [[ ! -s "$START_LOG" ]] || fail "T10: matching chatgpt backend must not restart"
+
+# Rotating an expired cookie is the routine maintenance action for this
+# backend, and compose won't replace a running container over an .env edit.
+: >"$START_LOG"
+_running_proxy_fp() { printf 'staleeeeeeeeeeee'; }
+backend_override="chatgpt"; ensure_services_up >/dev/null
+[[ -s "$START_LOG" ]] || fail "T10: a rotated cookie must restart the proxy"
+
+# The openai backend carries no fingerprint; it must not restart on its absence.
+: >"$START_LOG"
+_running_proxy_backend() { printf 'openai'; }
+_running_proxy_fp() { printf ''; }
+backend_override=""; ensure_services_up >/dev/null
+[[ ! -s "$START_LOG" ]] || fail "T10: the openai backend must not restart on a missing fingerprint"
 backend_override=""
-ok "T10: ensure_services_up restarts a proxy serving the other backend"
+ok "T10: ensure_services_up restarts on a changed backend or changed chatgpt credentials"
 
 # --- T11: the cookie is a secret and never printed in the clear -------------
 _config_is_secret CHATGPT_COOKIE_STRING || fail "T11: cookie not classified secret"
@@ -251,7 +293,23 @@ cmd_chatgpt host -p 'hi'
 [[ "$(cat "$DISPATCH_LOG")" == "cmd_host:-p hi" ]] \
     || fail "T14: host form did not delegate to cmd_host — $(cat "$DISPATCH_LOG")"
 [[ "$backend_override" == "chatgpt" ]] || fail "T14: backend not selected for the host form"
-ok "T14: cmd_chatgpt dispatches both forms with the backend selected"
+
+# doctor/preflight must run with the backend selected, or they check the other
+# backend's vars and report a valid chatgpt-only install as broken.
+cmd_doctor()    { echo "cmd_doctor:$*"    >>"$DISPATCH_LOG"; }
+cmd_preflight() { echo "cmd_preflight:$*" >>"$DISPATCH_LOG"; }
+backend_override=""; : >"$DISPATCH_LOG"
+cmd_chatgpt doctor
+[[ "$(cat "$DISPATCH_LOG")" == "cmd_doctor:" ]] \
+    || fail "T14: doctor did not delegate to cmd_doctor — $(cat "$DISPATCH_LOG")"
+[[ "$backend_override" == "chatgpt" ]] || fail "T14: backend not selected for doctor"
+backend_override=""; : >"$DISPATCH_LOG"
+cmd_chatgpt preflight
+[[ "$(cat "$DISPATCH_LOG")" == "cmd_preflight:" ]] \
+    || fail "T14: preflight did not delegate to cmd_preflight — $(cat "$DISPATCH_LOG")"
+[[ "$backend_override" == "chatgpt" ]] || fail "T14: backend not selected for preflight"
+unset -f cmd_doctor cmd_preflight
+ok "T14: cmd_chatgpt dispatches every form with the backend selected"
 
 # --- T15: wired into main()'s dispatch and the help text --------------------
 grep -qE '^ *chatgpt\)  *cmd_chatgpt "\$@" ;;' "$HARNESS" \
@@ -265,7 +323,7 @@ ok "T15: 'harness chatgpt' is dispatched and documented in 'harness help'"
 # "oai-did=..." as a command, killing every harness invocation.
 cookie='__Secure-next-auth.session-token=eyJhbGci.OiJk-x_y; oai-did=9f2b-4c; _puid=abc%3D'
 _config_write_key CHATGPT_COOKIE_STRING "$cookie" || fail "T16: write returned non-zero"
-grep -q '^CHATGPT_COOKIE_STRING="' "$TMP_ROOT/.env" || fail "T16: cookie not quoted on disk"
+grep -q "^CHATGPT_COOKIE_STRING='" "$TMP_ROOT/.env" || fail "T16: cookie not quoted on disk"
 [[ "$(_config_read_key CHATGPT_COOKIE_STRING)" == "$cookie" ]] \
     || fail "T16: cookie mangled: got $(_config_read_key CHATGPT_COOKIE_STRING)"
 sourced=$(bash -c 'set -euo pipefail; set -a; . "$1"; set +a; printf %s "$CHATGPT_COOKIE_STRING"' \
@@ -276,6 +334,21 @@ _config_write_key CHATGPT_MODEL_NAME gpt-5.6-terra
 grep -q '^CHATGPT_MODEL_NAME=gpt-5.6-terra$' "$TMP_ROOT/.env" \
     || fail "T16: a bare value was needlessly quoted"
 ok "T16: a semicolon-bearing cookie round-trips and .env stays sourceable"
+
+# A value containing a single quote can't use the single-quote form, so the
+# writer falls back to double quotes + escapes and _config_read_key has to be
+# the exact inverse. This is the path that silently corrupted PROXY_API_KEY
+# when only the writer had been updated.
+tricky='it'"'"'s $HOME `x` "q" \\ done'
+_config_write_key CHATGPT_COOKIE_STRING "$tricky" || fail "T17: write returned non-zero"
+grep -q '^CHATGPT_COOKIE_STRING="' "$TMP_ROOT/.env" || fail "T17: expected the double-quote form"
+[[ "$(_config_read_key CHATGPT_COOKIE_STRING)" == "$tricky" ]] \
+    || fail "T17: read is not the inverse of write: got $(_config_read_key CHATGPT_COOKIE_STRING)"
+sourced=$(bash -c 'set -euo pipefail; set -a; . "$1"; set +a; printf %s "$CHATGPT_COOKIE_STRING"' \
+    _ "$TMP_ROOT/.env") || fail "T17: sourcing the rewritten .env aborted"
+[[ "$sourced" == "$tricky" ]] || fail "T17: sourced value differs: $sourced"
+_config_write_key CHATGPT_COOKIE_STRING "$cookie"
+ok "T17: a quote/dollar/backtick-bearing value round-trips through the escaped form"
 
 echo
 echo "CHATGPT TEST PASSED"

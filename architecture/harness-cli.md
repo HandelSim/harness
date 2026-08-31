@@ -617,10 +617,18 @@ Everything the backend changes hangs off that one global:
 | `require_runtime_config`, `host_require_config` | required-var set swaps to `CHATGPT_BASE_URL` / `CHATGPT_MODEL_NAME` / `CHATGPT_COOKIE_STRING`; the `PROXY_API_*` + `DEFAULT_MODEL_NAME` trio is not required |
 | `_gate_on_upstream_auth`, `_print_upstream_models` | early return — cookie auth has no bearer probe and the backend-api has no catalog |
 | `_effective_default_model` | returns `CHATGPT_MODEL_NAME`; feeds `agent_model` (container) and `host_write_opencode_config` (host) |
-| `write_runtime_override` | emits `PROXY_BACKEND: "chatgpt"` on the proxy service, folded into the **same** `proxy:` mapping as `PROXY_PROMPT_MODE` |
+| `write_runtime_override` | emits `PROXY_BACKEND: "chatgpt"` and `HARNESS_PROXY_FP` on the proxy service, folded into the **same** `proxy:` mapping as `PROXY_PROMPT_MODE` |
 | `host_proxy_start` | passes `PROXY_BACKEND` in the launch env prefix |
 | `host_proxy_fingerprint` | hashes the backend plus all three `CHATGPT_*` values |
 | `firewall/init-firewall.sh` | guards `CHATGPT_BASE_URL`'s host against the allowlist instead of `PROXY_API_URL`'s |
+| `cmd_doctor`, `cmd_preflight` | check/report the `CHATGPT_*` trio and allowlist `CHATGPT_BASE_URL`'s host; the upstream probe is skipped (no catalog endpoint) |
+
+`harness chatgpt doctor` and `harness chatgpt preflight` exist only to set that
+global before delegating — the diagnostics are otherwise the same code. Bare
+`harness doctor` still checks the OpenAI trio, because that is what bare
+`harness` uses; when those are unset but `CHATGPT_BASE_URL` is set it prints a
+pointer to `harness chatgpt doctor` rather than silently reporting three
+failures.
 
 **One proxy, one dialect.** Two landmines follow from the proxy being a single
 shared service, and both are handled explicitly:
@@ -632,6 +640,17 @@ shared service, and both are handled explicitly:
   reports) and `ensure_services_up` calls `cmd_start` on a mismatch. That
   restart drops a concurrent agent on the other backend; there is only one
   proxy, and answering from the wrong upstream is worse.
+
+  The same no-op hides a *credential* change. Compose will not replace a
+  running container just because `.env` was edited, so rotating an expired
+  cookie — the one routine maintenance action for this backend — would keep
+  serving the stale one. `_chatgpt_config_fingerprint` hashes the three
+  `CHATGPT_*` values, `write_runtime_override` injects it as `HARNESS_PROXY_FP`
+  on the proxy service, and `_running_proxy_fp` reads it back out of the
+  running container; a mismatch restarts. Only the hash crosses that boundary
+  (the reader filters the env dump inside the pipeline), so the cookie never
+  lands in a shell variable or in `state/.harness-runtime.yml`. The openai
+  backend writes no fingerprint and is unaffected.
 - *Host mode.* There is one pidfile, so the two host modes cannot coexist.
   Folding the backend and the `CHATGPT_*` values into `host_proxy_fingerprint`
   makes the existing config-change restart path handle the switch.
@@ -641,14 +660,25 @@ matches `*COOKIE*` and `harness config` masks it. `harness config set
 CHATGPT_BASE_URL <url>` syncs the egress allowlist, exactly like
 `PROXY_API_URL`.
 
-A cookie also forced a fix in `_config_write_key`: it now double-quotes any
-value that is not a bare word (`[^A-Za-z0-9_./:@=+,%~-]`), escaping `\ $ ` "`.
-The wrapper sources `.env` under `set -euo pipefail`, so an unquoted
-`a=1; oai-did=2` truncates at the semicolon and then runs `oai-did=2` as a
-command — every `harness` invocation would die with "command not found".
-`_config_read_key` already stripped quotes, so the round-trip is unchanged, and
-bare values are still written bare (no churn for existing keys). This also
-fixes the pre-existing case of a `PROXY_API_URL` containing `&`.
+A cookie also forced a fix in `_config_write_key`: it now quotes any value that
+is not a bare word (`[^A-Za-z0-9_./:@=+,%~-]`). The wrapper sources `.env` under
+`set -euo pipefail`, so an unquoted `a=1; oai-did=2` truncates at the semicolon
+and then runs `oai-did=2` as a command — every `harness` invocation would die
+with "command not found".
+
+**Single quotes are preferred** because they are literal in both bash and
+compose's dotenv parser: no escape processing, no `${...}` interpolation, so
+what is written is exactly what both readers see. A value that itself contains a
+single quote can't use that form, so it falls back to double quotes with
+`\ $ ` "` escaped. `_config_read_key` is the **exact inverse** of this — it
+unwraps single quotes literally and undoes the escapes for double quotes. That
+symmetry is load-bearing: the old reader stripped every quote byte without
+undoing escapes, which corrupted any `PROXY_API_KEY` containing a `$`. `cmd_preflight`
+reads through `_config_read_key` for the same reason.
+
+Bare values are still written bare, so existing keys see no churn. Note this
+covers values written by `harness config`; `harness-install.sh` writes `.env`
+directly and still emits unquoted values.
 
 Covered by `tests/unit_chatgpt_test.sh` (docker-free) and the ChatGPT classes in
 `proxy/test_proxy.py`.

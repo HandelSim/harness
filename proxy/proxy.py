@@ -51,6 +51,7 @@ import os
 import re
 import sys
 import traceback
+import urllib.parse
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -66,6 +67,14 @@ from flask import Flask, Response, request
 # there is no firewall, so a network-level MITM on the route to PROXY_API_URL
 # could intercept or alter upstream responses. Cert pinning would require
 # shipping the upstream CA as a runtime artifact and is not done today.
+#
+# This covers CHATGPT_BASE_URL too, and there the stake is higher: that request
+# carries a full browser session cookie, not an API grant, so a MITM on the
+# route takes the account rather than a key. It is deliberate — the reference
+# client this backend was ported from disables verification because the base
+# URL points at a private mirror with its own cert, and turning verification on
+# would break the configuration that is known to work. Point CHATGPT_BASE_URL
+# only at a host whose route you trust.
 requests.packages.urllib3.disable_warnings(
     requests.packages.urllib3.exceptions.InsecureRequestWarning
 )
@@ -178,10 +187,15 @@ class _SyntheticResponse:
         self.status_code = status_code
         self._body = body
         self.text = json.dumps(body)
+        self.content = self.text.encode("utf-8")
+        self.ok = status_code < 400
         self.headers: Dict[str, str] = {"Content-Type": "application/json"}
 
     def json(self) -> Dict[str, Any]:
         return self._body
+
+    def close(self) -> None:  # parity with requests.Response
+        return None
 
 
 _CHATGPT_ROLE_LABELS = {
@@ -203,8 +217,9 @@ def _chatgpt_flatten_messages(messages: List[Dict[str, Any]]) -> str:
     request and carrying the whole history in one user message is exactly the
     shape the reference client verified; a multi-message array is not, and if
     the endpoint honored only its last entry the history loss would be silent.
-    A single-message history is passed through verbatim so the common
-    first-turn case is byte-identical to the reference client.
+    A single-message history is passed through verbatim. Note this is the
+    bare-`curl` case only: opencode's first turn already translates to several
+    messages, so the labelled form is what the agent actually sends.
     """
     parts: List[Tuple[str, str]] = []
     for m in messages:
@@ -220,22 +235,55 @@ def _chatgpt_flatten_messages(messages: List[Dict[str, Any]]) -> str:
     return "\n\n".join(f"{label}: {text}" for label, text in parts)
 
 
-def _chatgpt_collect_stream(resp: Any) -> str:
-    """Consume the backend-api SSE stream into the complete assistant text.
+def _chatgpt_origin() -> str:
+    """Origin/Referer value for the backend-api call.
+
+    An Origin is scheme://host[:port]; CHATGPT_BASE_URL may legitimately carry
+    a path prefix, which is not valid there. Computed per call rather than at
+    import so the value tracks CHATGPT_BASE_URL.
+    """
+    if not CHATGPT_BASE_URL:
+        return ""
+    split = urllib.parse.urlsplit(CHATGPT_BASE_URL)
+    if not split.scheme or not split.netloc:
+        return CHATGPT_BASE_URL
+    return f"{split.scheme}://{split.netloc}"
+
+
+def _chatgpt_collect_stream(resp: Any) -> Tuple[str, int, str]:
+    """Consume the backend-api SSE stream.
+
+    Returns `(text, events, prefix)`: the assistant text, how many `data:`
+    events were seen, and the first bytes of the raw body. The event count is
+    what separates "the model answered with nothing" from "this 200 was not an
+    event stream at all" (a login page, an HTML error, a redirect landing) —
+    without it both look like an empty completion, and an empty completion
+    sends the agent into the empty-response rescue on every turn forever.
 
     Two delta shapes are emitted and both are handled, mirroring the reference
     client: incremental `{"type": "message_delta", "delta": "..."}` events, and
     `message.content.parts` snapshots that are CUMULATIVE (each event repeats
     everything so far), from which only the newly added suffix is taken.
+    Snapshots of anything that is not the assistant's text answer (reasoning /
+    `thoughts`, tool or system messages) are skipped: the cumulative rule is
+    "longest wins", so one long non-answer message would otherwise replace the
+    answer outright. A message that states no role or content_type is kept —
+    the reference client filtered on neither, and dropping unlabelled events
+    would break the shape it verified.
     """
     text = ""
+    events = 0
+    prefix = ""
     for raw in resp.iter_lines():
         if not raw:
             continue
         line = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else raw
-        if not line.startswith("data: "):
+        if len(prefix) < 500:
+            prefix += line[:500] + "\n"
+        if not line.startswith("data:"):
             continue
-        chunk = line[6:].strip()
+        events += 1
+        chunk = line[5:].strip()
         if chunk == "[DONE]":
             break
         try:
@@ -252,8 +300,16 @@ def _chatgpt_collect_stream(resp: Any) -> str:
         message = data.get("message")
         if not isinstance(message, dict):
             continue
+        author = message.get("author")
+        if isinstance(author, dict):
+            role = author.get("role")
+            if isinstance(role, str) and role != "assistant":
+                continue
         content = message.get("content")
         if not isinstance(content, dict):
+            continue
+        ctype = content.get("content_type")
+        if isinstance(ctype, str) and ctype != "text":
             continue
         chunk_parts = content.get("parts") or []
         if not isinstance(chunk_parts, list):
@@ -261,7 +317,7 @@ def _chatgpt_collect_stream(resp: Any) -> str:
         snapshot = "".join(p for p in chunk_parts if isinstance(p, str))
         if len(snapshot) > len(text):
             text = snapshot
-    return text
+    return text, events, prefix
 
 
 def _chatgpt_post(payload: Dict[str, Any]) -> _SyntheticResponse:
@@ -287,10 +343,15 @@ def _chatgpt_post(payload: Dict[str, Any]) -> _SyntheticResponse:
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
         "User-Agent": CHATGPT_USER_AGENT,
-        "Origin": CHATGPT_BASE_URL,
-        "Referer": f"{CHATGPT_BASE_URL}/",
+        "Origin": _chatgpt_origin(),
+        "Referer": f"{_chatgpt_origin()}/",
         "Cookie": CHATGPT_COOKIE_STRING,
     }
+    # allow_redirects=False on purpose. requests drops the Cookie header on
+    # every redirect hop and turns a 302 POST into a GET, so a followed
+    # redirect arrives unauthenticated and comes back 200 with a login page —
+    # indistinguishable, downstream, from the model answering with nothing.
+    # Fail on the 3xx instead and say so.
     resp = requests.post(
         CHATGPT_STREAM_URL,
         headers=headers,
@@ -298,23 +359,36 @@ def _chatgpt_post(payload: Dict[str, Any]) -> _SyntheticResponse:
         verify=False,
         timeout=PROXY_TIMEOUT,
         stream=True,
+        allow_redirects=False,
     )
     try:
-        if resp.status_code >= 400:
+        if resp.status_code >= 300:
             # Surface the upstream body so a stale cookie (the expected
             # failure) reaches the caller's error path instead of a bare code.
             try:
                 detail = resp.text[:2000]
             except Exception:
                 detail = ""
+            if resp.status_code < 400:
+                detail = (f"chatgpt backend redirected ({resp.status_code}) to "
+                          f"{resp.headers.get('Location', '?')} — the session cookie is "
+                          f"probably expired. {detail}")
             return _SyntheticResponse(
-                resp.status_code,
+                resp.status_code if resp.status_code >= 400 else 502,
                 {"error": {"message": detail or f"chatgpt backend returned {resp.status_code}",
                            "type": "chatgpt_backend_error"}},
             )
-        text = _chatgpt_collect_stream(resp)
+        text, events, prefix = _chatgpt_collect_stream(resp)
     finally:
         resp.close()
+    if events == 0:
+        return _SyntheticResponse(
+            502,
+            {"error": {"message": "chatgpt backend returned 200 but no SSE events; the "
+                                  "session cookie is probably expired. First bytes: "
+                                  + prefix[:500],
+                       "type": "chatgpt_backend_error"}},
+        )
     return _SyntheticResponse(
         200,
         {
@@ -2783,6 +2857,19 @@ def _validate_config() -> None:
             missing.append("CHATGPT_MODEL_NAME")
         if not CHATGPT_COOKIE_STRING:
             missing.append("CHATGPT_COOKIE_STRING")
+        # passthrough forwards the raw `tools` array and leaves the history
+        # structured. The backend-api takes neither: it has no tools field and
+        # one text part, so every tool schema and every tool result would be
+        # dropped on the floor and the run would look like it worked. Refuse
+        # instead of producing quietly wrong output.
+        if _PROMPT_MODE == "passthrough":
+            print(
+                "[!] FATAL: PROXY_PROMPT_MODE=passthrough is not supported on the chatgpt "
+                "backend (it has no tools field; tool schemas and tool results would be "
+                "silently dropped)",
+                flush=True,
+            )
+            sys.exit(1)
     else:
         if not PROXY_API_URL:
             missing.append("PROXY_API_URL")
@@ -2860,11 +2947,14 @@ def main() -> None:
     if PROXY_BACKEND == "chatgpt":
         banner_chat_url = CHATGPT_STREAM_URL
         banner_models_url = "(synthesized from CHATGPT_MODEL_NAME)"
-        banner_auth = f"cookie (set, {len(CHATGPT_COOKIE_STRING)} chars)"
+        banner_auth = f"   upstream cookie: (set, {len(CHATGPT_COOKIE_STRING)} chars)\n"
     else:
         banner_chat_url = CHAT_URL
         banner_models_url = MODELS_URL
-        banner_auth = _redact_key(PROXY_API_KEY)
+        # Label kept verbatim: tests/proxy_test.sh greps for "upstream key:"
+        # both to confirm the redaction AND, negatively, to catch a raw key
+        # leak. Renaming it silently disarms the second grep.
+        banner_auth = f"   upstream key:   {_redact_key(PROXY_API_KEY)}\n"
 
     print(
         "============================================================\n"
@@ -2874,7 +2964,7 @@ def main() -> None:
         f"   chat URL:       {banner_chat_url}\n"
         f"   models URL:     {banner_models_url}\n"
         f"   default model:  {DEFAULT_MODEL_NAME}\n"
-        f"   upstream auth:  {banner_auth}\n"
+        f"{banner_auth}"
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"

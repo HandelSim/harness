@@ -3994,10 +3994,11 @@ class TestReminderTemplateFile(unittest.TestCase):
 class _FakeStreamResp:
     """Stand-in for the streaming `requests.Response` the backend-api returns."""
 
-    def __init__(self, lines, status_code=200, text=""):
+    def __init__(self, lines, status_code=200, text="", headers=None):
         self._lines = lines
         self.status_code = status_code
         self.text = text
+        self.headers = headers or {}
         self.closed = False
 
     def iter_lines(self):
@@ -4062,7 +4063,7 @@ class TestChatGPTCollectStream(unittest.TestCase):
             {"type": "message_delta", "delta": "world"},
             "data: [DONE]",
         ))
-        self.assertEqual(proxy._chatgpt_collect_stream(resp), "Hello world")
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "Hello world")
 
     def test_cumulative_parts_take_only_the_new_suffix(self):
         # message.content.parts repeats everything so far on every event.
@@ -4072,7 +4073,7 @@ class TestChatGPTCollectStream(unittest.TestCase):
             {"message": {"id": "m1", "content": {"parts": ["Hello world"]}}},
             "data: [DONE]",
         ))
-        self.assertEqual(proxy._chatgpt_collect_stream(resp), "Hello world")
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "Hello world")
 
     def test_done_terminates_the_stream(self):
         resp = _FakeStreamResp(_sse(
@@ -4080,7 +4081,7 @@ class TestChatGPTCollectStream(unittest.TestCase):
             "data: [DONE]",
             {"type": "message_delta", "delta": "dropped"},
         ))
-        self.assertEqual(proxy._chatgpt_collect_stream(resp), "kept")
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "kept")
 
     def test_non_data_and_malformed_lines_are_skipped(self):
         resp = _FakeStreamResp([
@@ -4090,18 +4091,69 @@ class TestChatGPTCollectStream(unittest.TestCase):
             'data: {"type": "message_delta", "delta": "ok"}',
             "data: [DONE]",
         ])
-        self.assertEqual(proxy._chatgpt_collect_stream(resp), "ok")
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "ok")
 
     def test_bytes_lines_are_decoded(self):
         resp = _FakeStreamResp([
             b'data: {"type": "message_delta", "delta": "bytes"}',
             b"data: [DONE]",
         ])
-        self.assertEqual(proxy._chatgpt_collect_stream(resp), "bytes")
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "bytes")
+
+    def test_data_without_a_space_is_still_an_event(self):
+        # "data:{...}" is legal SSE; the reference client's startswith("data: ")
+        # dropped it silently.
+        resp = _FakeStreamResp([
+            'data:{"type": "message_delta", "delta": "tight"}',
+            "data:[DONE]",
+        ])
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "tight")
+
+    def test_event_count_separates_no_stream_from_an_empty_answer(self):
+        # A 200 carrying a login page has zero events; a stream that really
+        # said nothing has some. Downstream they must not look alike.
+        html = _FakeStreamResp(["<!doctype html>", "<title>Sign in</title>"])
+        self.assertEqual(proxy._chatgpt_collect_stream(html)[1], 0)
+        empty = _FakeStreamResp(["data: [DONE]"])
+        text, events, _ = proxy._chatgpt_collect_stream(empty)
+        self.assertEqual(text, "")
+        self.assertEqual(events, 1)
+
+    def test_non_assistant_snapshot_cannot_clobber_the_answer(self):
+        # "longest wins" applied blindly lets one long reasoning or tool
+        # message replace the assistant's actual reply.
+        resp = _FakeStreamResp(_sse(
+            {"type": "message_delta", "delta": "Hello"},
+            {"message": {"id": "m2", "author": {"role": "tool"},
+                         "content": {"parts": ["a very long tool result indeed"]}}},
+            {"type": "message_delta", "delta": " world"},
+            "data: [DONE]",
+        ))
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "Hello world")
+
+    def test_non_text_content_type_snapshot_is_skipped(self):
+        resp = _FakeStreamResp(_sse(
+            {"type": "message_delta", "delta": "answer"},
+            {"message": {"id": "m3", "author": {"role": "assistant"},
+                         "content": {"content_type": "thoughts",
+                                     "parts": ["let me think about this at length"]}}},
+            "data: [DONE]",
+        ))
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "answer")
+
+    def test_unlabelled_snapshot_is_still_accepted(self):
+        # The reference client filtered on neither role nor content_type;
+        # dropping unlabelled events would break the shape it verified.
+        resp = _FakeStreamResp(_sse(
+            {"message": {"id": "m4", "content": {"parts": ["plain snapshot"]}}},
+            "data: [DONE]",
+        ))
+        self.assertEqual(proxy._chatgpt_collect_stream(resp)[0], "plain snapshot")
 
 
 class TestChatGPTPost(unittest.TestCase):
-    def _post(self, lines, status_code=200, text=""):
+    def _post(self, lines, status_code=200, text="", resp_headers=None,
+              base_url="https://chat.example.com"):
         captured = {}
 
         def fake_post(url, headers=None, json=None, **kwargs):
@@ -4109,9 +4161,10 @@ class TestChatGPTPost(unittest.TestCase):
             captured["headers"] = headers
             captured["body"] = json
             captured["kwargs"] = kwargs
-            return _FakeStreamResp(lines, status_code=status_code, text=text)
+            return _FakeStreamResp(lines, status_code=status_code, text=text,
+                                   headers=resp_headers)
 
-        with patch.object(proxy, "CHATGPT_BASE_URL", "https://chat.example.com"), \
+        with patch.object(proxy, "CHATGPT_BASE_URL", base_url), \
              patch.object(proxy, "CHATGPT_STREAM_URL",
                           "https://chat.example.com/backend-api/conversation/stream"), \
              patch.object(proxy, "CHATGPT_MODEL_NAME", "gpt-5.6-terra"), \
@@ -4174,6 +4227,39 @@ class TestChatGPTPost(unittest.TestCase):
         _, resp = self._post([], status_code=403, text="cookie expired")
         self.assertEqual(resp.status_code, 403)
         self.assertIn("cookie expired", resp.json()["error"]["message"])
+
+    def test_redirects_are_not_followed(self):
+        # requests drops the Cookie header across a redirect and turns the POST
+        # into a GET, so a followed redirect lands unauthenticated and returns
+        # a 200 login page.
+        captured, _ = self._post(_sse("data: [DONE]"))
+        self.assertIs(captured["kwargs"].get("allow_redirects"), False)
+
+    def test_a_redirect_is_an_error_not_an_empty_answer(self):
+        _, resp = self._post([], status_code=302, text="",
+                             resp_headers={"Location": "/auth/login"})
+        self.assertEqual(resp.status_code, 502)
+        msg = resp.json()["error"]["message"]
+        self.assertIn("redirected", msg)
+        self.assertIn("/auth/login", msg)
+
+    def test_a_200_that_is_not_an_event_stream_is_an_error(self):
+        # Without this the agent gets an empty completion, hits the
+        # empty-response rescue, and loops on the rescue tool forever.
+        _, resp = self._post(["<!doctype html>", "<title>Sign in</title>"])
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("no SSE events", resp.json()["error"]["message"])
+
+    def test_a_stream_that_genuinely_said_nothing_is_still_a_200(self):
+        _, resp = self._post(_sse("data: [DONE]"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(proxy.extract_assistant_content(resp.json()), "")
+
+    def test_origin_strips_a_path_prefix_from_the_base_url(self):
+        captured, _ = self._post(_sse("data: [DONE]"),
+                                 base_url="https://chat.example.com/api")
+        self.assertEqual(captured["headers"]["Origin"], "https://chat.example.com")
+        self.assertEqual(captured["headers"]["Referer"], "https://chat.example.com/")
 
 
 class TestUpstreamPostRouting(unittest.TestCase):
@@ -4318,9 +4404,32 @@ class TestChatGPTValidateConfig(unittest.TestCase):
     def test_openai_backend_still_requires_its_trio(self):
         with patch.object(proxy, "PROXY_BACKEND", "openai"), \
              patch.object(proxy, "PROXY_API_URL", ""), \
+             patch.object(proxy, "PROXY_API_KEY", "sk-x"), \
+             patch.object(proxy, "DEFAULT_MODEL_NAME", "m"), \
              patch("sys.stdout", io.StringIO()):
             with self.assertRaises(SystemExit):
                 proxy._validate_config()
+
+    def test_passthrough_is_rejected_on_the_chatgpt_backend(self):
+        # The backend-api has no tools field: passthrough would drop every
+        # tool schema and tool result and look like it worked.
+        with patch.object(proxy, "PROXY_BACKEND", "chatgpt"), \
+             patch.object(proxy, "CHATGPT_BASE_URL", "https://chat.example.com"), \
+             patch.object(proxy, "CHATGPT_MODEL_NAME", "gpt-5.6-terra"), \
+             patch.object(proxy, "CHATGPT_COOKIE_STRING", "session=abc"), \
+             patch.object(proxy, "_PROMPT_MODE", "passthrough"), \
+             patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                proxy._validate_config()
+
+    def test_passthrough_is_still_fine_on_the_openai_backend(self):
+        with patch.object(proxy, "PROXY_BACKEND", "openai"), \
+             patch.object(proxy, "PROXY_API_URL", "https://api.example.com/v1"), \
+             patch.object(proxy, "PROXY_API_KEY", "sk-x"), \
+             patch.object(proxy, "DEFAULT_MODEL_NAME", "m"), \
+             patch.object(proxy, "_PROMPT_MODE", "passthrough"), \
+             patch("sys.stdout", io.StringIO()):
+            proxy._validate_config()  # must not raise SystemExit
 
 
 if __name__ == "__main__":

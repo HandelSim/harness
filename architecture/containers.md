@@ -274,7 +274,9 @@ configured `PROXY_API_URL` host, and allowlist entries.
   `PROXY_API_URL`'s by default, `CHATGPT_BASE_URL`'s when the proxy was started
   with `PROXY_BACKEND=chatgpt` (see [`harness-cli.md`](harness-cli.md) →
   ChatGPT backend). The proxy service also carries the three `CHATGPT_*` values
-  from `.env`; they are inert on a normal launch.
+  from `.env`; they are inert on a normal launch. A set-but-unparseable upstream
+  URL (no scheme, so no hostname comes out of the parse) is also fatal — it used
+  to skip the guard silently and surface later as an opaque connect error.
 - The rules are IPv4-only (`iptables` + `dig +short A` + an `inet` ipset), so
   every harness container is created with the kernel IPv6 stack disabled via
   the `net.ipv6.conf.all.disable_ipv6=1` sysctl (`sysctls:` in

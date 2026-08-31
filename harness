@@ -164,6 +164,25 @@ _backend_is_chatgpt() {
     [[ "$backend_override" == "chatgpt" ]]
 }
 
+# A short hash of the chatgpt backend's credential config, injected into the
+# proxy container as HARNESS_PROXY_FP by write_runtime_override. The container
+# captures CHATGPT_* at `up` time and compose will not replace a running
+# container just because .env changed, so rotating an expired cookie — the one
+# documented maintenance action for this backend — would otherwise keep serving
+# the stale one. `ensure_services_up` compares this hash and restarts on a
+# mismatch. Only the hash is ever stored, compared, or written into the compose
+# override; the cookie itself never leaves this pipeline.
+_chatgpt_config_fingerprint() {
+    local data
+    data=$(printf '%s\n%s\n%s\n' \
+        "${CHATGPT_BASE_URL:-}" "${CHATGPT_MODEL_NAME:-}" "${CHATGPT_COOKIE_STRING:-}")
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$data" | sha256sum | cut -c1-16
+    else
+        printf '%s' "$data" | cksum | tr -d ' '
+    fi
+}
+
 # The model id opencode should default to for this launch. Each backend carries
 # its own model var; there is no shared one, because the ids are drawn from
 # different catalogs.
@@ -908,6 +927,9 @@ write_runtime_override() {
             fi
             if [[ "$svc" == "proxy" && -n "$backend_override" ]]; then
                 body+="      PROXY_BACKEND: \"${backend_override}\""$'\n'
+                if _backend_is_chatgpt; then
+                    body+="      HARNESS_PROXY_FP: \"$(_chatgpt_config_fingerprint)\""$'\n'
+                fi
                 proxy_emitted=1
             fi
         done < <(harness_jq -r '
@@ -930,6 +952,9 @@ write_runtime_override() {
         fi
         if [[ -n "$backend_override" ]]; then
             body+="      PROXY_BACKEND: \"${backend_override}\""$'\n'
+            if _backend_is_chatgpt; then
+                body+="      HARNESS_PROXY_FP: \"$(_chatgpt_config_fingerprint)\""$'\n'
+            fi
         fi
     fi
 
@@ -1023,6 +1048,23 @@ _running_proxy_backend() {
     printf '%s' "${val:-openai}"
 }
 
+# Echo the HARNESS_PROXY_FP the RUNNING proxy container was started with, or
+# nothing when it carries none (an openai-backend container, or one built
+# before the chatgpt backend existed). Empty output and rc 1 when no proxy is
+# running. The inspect dump is filtered by `sed` inside the pipeline, so only
+# the hash — never the cookie sitting next to it in the container env — is ever
+# captured into a shell variable.
+_running_proxy_fp() {
+    local proxy_id val
+    proxy_id=$(compose ps -q proxy 2>/dev/null || true)
+    [[ -n "$proxy_id" ]] || return 1
+    val=$(harness_docker inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' "$proxy_id" 2>/dev/null \
+        | sed -n 's/^HARNESS_PROXY_FP=//p' | tail -n1)
+    val=${val%$'\r'}
+    printf '%s' "$val"
+}
+
 # Bring services up if they aren't already. Used before launching agents.
 #
 # The proxy is a single shared service that speaks ONE upstream dialect at a
@@ -1039,6 +1081,13 @@ ensure_services_up() {
         cmd_start
     elif have=$(_running_proxy_backend) && [[ "$have" != "$want" ]]; then
         echo "harness: proxy is running the '$have' backend; restarting it for '$want'"
+        cmd_start
+    elif _backend_is_chatgpt && [[ "$(_running_proxy_fp)" != "$(_chatgpt_config_fingerprint)" ]]; then
+        # Same backend, different credentials: the running container captured
+        # the old CHATGPT_* at `up` time. Rotating an expired cookie is the one
+        # routine maintenance action here, and compose won't replace a running
+        # container over an .env edit, so reconcile it explicitly.
+        echo "harness: chatgpt config changed since the proxy started; restarting it"
         cmd_start
     fi
     # Reconcile host MCPs on every launch (idempotent): a host MCP may have been
@@ -1530,8 +1579,24 @@ _config_display_value() {
 _config_read_key() {
     local key="$1"
     [[ -f "$env_file" ]] || return 0
-    grep -E "^[[:space:]]*${key}=" "$env_file" 2>/dev/null \
-        | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r'
+    local raw
+    raw=$(grep -E "^[[:space:]]*${key}=" "$env_file" 2>/dev/null \
+        | head -1 | cut -d= -f2- | tr -d '\r')
+    # Strip ONE matched surrounding quote pair and undo the escapes
+    # _config_write_key adds, so the reader is the exact inverse of the writer.
+    # A blanket `tr -d` (what this used to do) eats quotes that are part of the
+    # value and leaves every backslash behind, which then lands verbatim in
+    # e.g. the Bearer header `cmd_model` builds from PROXY_API_KEY.
+    if (( ${#raw} >= 2 )) && [[ "$raw" == \'*\' ]]; then
+        raw="${raw:1:${#raw}-2}"
+    elif (( ${#raw} >= 2 )) && [[ "$raw" == \"*\" ]]; then
+        raw="${raw:1:${#raw}-2}"
+        raw="${raw//\\\"/\"}"
+        raw="${raw//\\\$/\$}"
+        raw="${raw//\\\`/\`}"
+        raw="${raw//\\\\/\\}"
+    fi
+    printf '%s\n' "$raw"
 }
 
 # Atomically rewrite (or append) KEY=VALUE in $env_file. A bash read-loop, not
@@ -1543,21 +1608,29 @@ _config_write_key() {
         err "no .env at $env_file; run 'harness preflight' or reinstall"
         return 1
     fi
-    # Anything that is not a bare word gets double-quoted. harness sources .env
-    # under `set -euo pipefail`, so an unquoted value containing a space, ';'
-    # or '&' truncates the assignment and then runs the remainder as a command
-    # — a raw CHATGPT_COOKIE_STRING ("a=1; oai-did=2") would abort every
-    # harness command with "oai-did: command not found". bash and docker
-    # compose's dotenv parser both strip the quotes and honour the backslash
-    # escapes, so the value round-trips through either reader unchanged.
+    # Anything that is not a bare word gets quoted. harness sources .env under
+    # `set -euo pipefail`, so an unquoted value containing a space, ';' or '&'
+    # truncates the assignment and then runs the remainder as a command — a raw
+    # CHATGPT_COOKIE_STRING ("a=1; oai-did=2") would abort every harness
+    # command with "oai-did: command not found".
+    #
+    # SINGLE quotes by preference: both bash and docker compose's dotenv parser
+    # treat a single-quoted value as a literal, with no escape processing and
+    # no ${...} interpolation — so the value reaches the proxy container byte
+    # for byte. Double quotes plus escapes are the fallback for the rare value
+    # that itself contains a single quote. `_config_read_key` is the inverse.
     local emit="$value"
     if [[ -n "$value" && "$value" =~ [^A-Za-z0-9_./:@=+,%~-] ]]; then
-        local esc="$value"
-        esc="${esc//\\/\\\\}"
-        esc="${esc//\$/\\\$}"
-        esc="${esc//\`/\\\`}"
-        esc="${esc//\"/\\\"}"
-        emit="\"$esc\""
+        if [[ "$value" != *\'* ]]; then
+            emit="'$value'"
+        else
+            local esc="$value"
+            esc="${esc//\\/\\\\}"
+            esc="${esc//\$/\\\$}"
+            esc="${esc//\`/\\\`}"
+            esc="${esc//\"/\\\"}"
+            emit="\"$esc\""
+        fi
     fi
     local tmp="$env_file.tmp.$$" line written=0
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -1579,6 +1652,10 @@ _config_write_key() {
 # hint when net_helpers isn't available (partial install / source-only test).
 _config_sync_allowlist_from_url() {
     local url="$1"
+    # $2 names the key that triggered the sync, for the confirmation line. Two
+    # keys feed this now (PROXY_API_URL and CHATGPT_BASE_URL), so hardcoding
+    # one of them would misattribute the other.
+    local from_key="${2:-PROXY_API_URL}"
     [[ -n "$url" ]] || return 0
     local host
     host=$(printf '%s' "$url" | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||;s|[/?#].*||;s|:.*||')
@@ -1591,7 +1668,7 @@ _config_sync_allowlist_from_url() {
     if netlib_has_host "$host"; then
         echo "harness: $host already on the egress allowlist"
     elif netlib_add_host "$host"; then
-        echo "harness: added $host to the egress allowlist (from PROXY_API_URL)"
+        echo "harness: added $host to the egress allowlist (from $from_key)"
     else
         err "could not add $host to the allowlist; add it with 'harness net allow $host'"
     fi
@@ -1642,7 +1719,7 @@ _config_set() {
     _config_write_key "$key" "$value" || return 1
     echo "harness: set $key in $env_file"
     case "$key" in
-        PROXY_API_URL|CHATGPT_BASE_URL) _config_sync_allowlist_from_url "$value" ;;
+        PROXY_API_URL|CHATGPT_BASE_URL) _config_sync_allowlist_from_url "$value" "$key" ;;
     esac
     return 0
 }
@@ -1703,7 +1780,7 @@ _config_picker() {
     _config_write_key "$sel" "$newval" || return 1
     echo "harness: set $sel in $env_file"
     case "$sel" in
-        PROXY_API_URL|CHATGPT_BASE_URL) _config_sync_allowlist_from_url "$newval" ;;
+        PROXY_API_URL|CHATGPT_BASE_URL) _config_sync_allowlist_from_url "$newval" "$sel" ;;
     esac
     return 0
 }
@@ -3392,12 +3469,18 @@ host_opencode_dir() { printf '%s/host/toolchain/opencode' "$state_root"; } # npm
 # makes deps-change-restart self-contained and independent of that contract.)
 host_proxy_fingerprint() {
     local data
-    data=$(printf 'port=%s\nurl=%s\nkey=%s\nmodel=%s\noutput=%s\nbackend=%s\ncgurl=%s\ncgmodel=%s\ncgcookie=%s\nreqs=%s\n' \
+    data=$(printf 'port=%s\nurl=%s\nkey=%s\nmodel=%s\noutput=%s\nreqs=%s\n' \
         "$(host_proxy_port)" "${PROXY_API_URL:-}" "${PROXY_API_KEY:-}" \
         "${DEFAULT_MODEL_NAME:-}" "${OUTPUT_DIR:-}" \
-        "${backend_override:-openai}" "${CHATGPT_BASE_URL:-}" \
-        "${CHATGPT_MODEL_NAME:-}" "${CHATGPT_COOKIE_STRING:-}" \
         "$(cat "$clone_dir/proxy/requirements.txt" 2>/dev/null)")
+    # Appended only on the chatgpt backend, so the openai fingerprint stays
+    # byte-identical to the pre-backend-switch one — otherwise every existing
+    # host-mode user's first launch after upgrading would kill a healthy proxy
+    # and claim ".env changed" when nothing had.
+    if _backend_is_chatgpt; then
+        data+=$(printf '\nbackend=chatgpt\ncgurl=%s\ncgmodel=%s\ncgcookie=%s\n' \
+            "${CHATGPT_BASE_URL:-}" "${CHATGPT_MODEL_NAME:-}" "${CHATGPT_COOKIE_STRING:-}")
+    fi
     if command -v sha256sum >/dev/null 2>&1; then
         printf '%s' "$data" | sha256sum | cut -d' ' -f1
     else
@@ -3945,7 +4028,10 @@ host_proxy_start() {
         if [[ -f "$fpf" && "$(cat "$fpf" 2>/dev/null)" == "$cur_fp" ]]; then
             return 0
         fi
-        echo "[harness] host mode: .env changed since the proxy started; restarting it" >&2
+        # The fingerprint covers the backend as well as .env, so say "config"
+        # rather than ".env" — a `harness host` -> `harness chatgpt host`
+        # switch trips this with .env untouched.
+        echo "[harness] host mode: config changed since the proxy started; restarting it" >&2
         host_proxy_stop
     fi
     host_proxy_ensure_venv || return 1
@@ -4400,6 +4486,8 @@ usage:
                                 but the proxy talks to the ChatGPT backend-api)
   harness chatgpt host [args]   CONTAINERLESS (same as 'harness host')
   harness chatgpt host down     stop the host-mode proxy
+  harness chatgpt doctor        'harness doctor' against this backend's config
+  harness chatgpt preflight     'harness preflight' against this backend's config
 
 Config (.env) — these three replace PROXY_API_URL / PROXY_API_KEY /
 DEFAULT_MODEL_NAME for this backend; nothing else is configurable:
@@ -4417,7 +4505,9 @@ Notes:
   * The backend-api keeps conversation state server-side; this proxy is
     stateless, so each request opens a fresh conversation carrying the full
     translated history. Tool use, prompt modes and MCPs work as usual.
-  * Accepts --yolo, -p/--print, --net and --mount like a normal launch.
+  * 'harness chatgpt' accepts --yolo, -p/--print, --net and --mount like a
+    normal launch. 'harness chatgpt host' takes the flags 'harness host'
+    takes: --net and --mount are container-only and do not apply there.
 EOF
             return 0
             ;;
@@ -4428,6 +4518,11 @@ EOF
 
     case "${1:-}" in
         host) shift; cmd_host "$@" ;;
+        # Diagnostics need to know which backend they're diagnosing: the two
+        # config sets are disjoint, so bare `harness doctor` reports a valid
+        # chatgpt-only install as broken. Route them with the backend selected.
+        doctor)    shift; cmd_doctor "$@" ;;
+        preflight) shift; cmd_preflight "$@" ;;
         *)    run_agent opencode "$@" ;;
     esac
 }
@@ -7244,22 +7339,54 @@ cmd_doctor() {
     else
         doctor_check ok ".env" "$env_file"
 
-        if [[ -n "${PROXY_API_URL:-}" ]]; then
-            doctor_check ok "PROXY_API_URL" "$PROXY_API_URL"
-        else
-            doctor_check fail "PROXY_API_URL" "unset"
-        fi
+        # The two backends need disjoint config, so check the one this
+        # invocation is about: `harness chatgpt doctor` sets backend_override.
+        # Reporting PROXY_API_* as failures on a valid chatgpt-only install
+        # (or the reverse) would be a false alarm.
+        if _backend_is_chatgpt; then
+            if [[ -n "${CHATGPT_BASE_URL:-}" ]]; then
+                doctor_check ok "CHATGPT_BASE_URL" "$CHATGPT_BASE_URL"
+            else
+                doctor_check fail "CHATGPT_BASE_URL" "unset"
+            fi
 
-        if [[ -n "${PROXY_API_KEY:-}" ]]; then
-            doctor_check ok "PROXY_API_KEY" "$(doctor_redact "$PROXY_API_KEY")"
-        else
-            doctor_check fail "PROXY_API_KEY" "unset"
-        fi
+            if [[ -n "${CHATGPT_COOKIE_STRING:-}" ]]; then
+                doctor_check ok "CHATGPT_COOKIE_STRING" \
+                    "set, ${#CHATGPT_COOKIE_STRING} chars"
+            else
+                doctor_check fail "CHATGPT_COOKIE_STRING" "unset"
+            fi
 
-        if [[ -n "${agent_model}" ]]; then
-            doctor_check ok "DEFAULT_MODEL_NAME" "$agent_model"
+            if [[ -n "${CHATGPT_MODEL_NAME:-}" ]]; then
+                doctor_check ok "CHATGPT_MODEL_NAME" "$CHATGPT_MODEL_NAME"
+            else
+                doctor_check fail "CHATGPT_MODEL_NAME" "unset"
+            fi
         else
-            doctor_check fail "DEFAULT_MODEL_NAME" "unset"
+            if [[ -n "${PROXY_API_URL:-}" ]]; then
+                doctor_check ok "PROXY_API_URL" "$PROXY_API_URL"
+            else
+                doctor_check fail "PROXY_API_URL" "unset"
+            fi
+
+            if [[ -n "${PROXY_API_KEY:-}" ]]; then
+                doctor_check ok "PROXY_API_KEY" "$(doctor_redact "$PROXY_API_KEY")"
+            else
+                doctor_check fail "PROXY_API_KEY" "unset"
+            fi
+
+            if [[ -n "${agent_model}" ]]; then
+                doctor_check ok "DEFAULT_MODEL_NAME" "$agent_model"
+            else
+                doctor_check fail "DEFAULT_MODEL_NAME" "unset"
+            fi
+
+            # A chatgpt-only install fails all three above; point at the
+            # invocation that actually checks what it configured.
+            if [[ -z "${PROXY_API_URL:-}" && -n "${CHATGPT_BASE_URL:-}" ]]; then
+                doctor_check ok "backend" \
+                    "CHATGPT_* is configured; run 'harness chatgpt doctor' to check that backend"
+            fi
         fi
     fi
 
@@ -7276,14 +7403,24 @@ cmd_doctor() {
         # the single most common misconfiguration (entry missing or typo'd)
         # and the firewall guardrail will refuse to start the proxy without
         # it. Surfacing it here gives the user a fast diagnosis.
-        if [[ -n "${PROXY_API_URL:-}" ]]; then
-            local proxy_host
-            proxy_host=$(printf '%s' "$PROXY_API_URL" | awk -F'[/:]' '{print $4}')
-            if [[ -n "$proxy_host" && "$proxy_host" == *.* ]]; then
+        # The firewall guards whichever upstream the active backend calls,
+        # so check that one (see firewall/init-firewall.sh section 10).
+        local upstream_var upstream_url proxy_host
+        if _backend_is_chatgpt; then
+            upstream_var="CHATGPT_BASE_URL"; upstream_url="${CHATGPT_BASE_URL:-}"
+        else
+            upstream_var="PROXY_API_URL"; upstream_url="${PROXY_API_URL:-}"
+        fi
+        if [[ -n "$upstream_url" ]]; then
+            proxy_host=$(printf '%s' "$upstream_url" | awk -F'[/:]' '{print $4}')
+            if [[ -z "$proxy_host" ]]; then
+                doctor_check fail "$upstream_var host" \
+                    "no hostname in '$upstream_url' (needs a scheme; proxy will refuse to start)"
+            elif [[ "$proxy_host" == *.* ]]; then
                 if netlib_has_host "$proxy_host"; then
-                    doctor_check ok "PROXY_API_URL host" "$proxy_host on allowlist"
+                    doctor_check ok "$upstream_var host" "$proxy_host on allowlist"
                 else
-                    doctor_check fail "PROXY_API_URL host" \
+                    doctor_check fail "$upstream_var host" \
                         "$proxy_host NOT on allowlist (proxy will refuse to start)"
                 fi
             fi
@@ -7521,6 +7658,12 @@ cmd_doctor() {
     doctor_section upstream
     if [[ "${HARNESS_SKIP_AUTH_PROBE:-0}" == "1" ]]; then
         doctor_check skip "upstream" "probe skipped (HARNESS_SKIP_AUTH_PROBE=1)"
+    elif _backend_is_chatgpt; then
+        # The backend-api exposes no catalog endpoint, and its only real
+        # endpoint is the streaming POST — probing that would start an actual
+        # conversation and burn a turn. There is nothing cheap to check here.
+        doctor_check skip "upstream" \
+            "chatgpt backend-api has no catalog endpoint; probing it would start a real conversation"
     elif [[ -z "${PROXY_API_URL:-}" || -z "${PROXY_API_KEY:-}" ]]; then
         doctor_check skip "upstream" "PROXY_API_URL/PROXY_API_KEY not set; nothing to probe"
     elif ! command -v curl >/dev/null 2>&1; then
@@ -7650,44 +7793,58 @@ cmd_preflight() {
     # are only sourced if the file exists, but this also works as a sanity
     # check when the file is malformed and source would silently no-op).
     if [[ -f "$env_file" ]]; then
-        local proxy_url proxy_key proxy_model
-        proxy_url=$(grep -E '^PROXY_API_URL=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
-        proxy_key=$(grep -E '^PROXY_API_KEY=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
-        proxy_model=$(grep -E '^DEFAULT_MODEL_NAME=' "$env_file" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+        local proxy_url
+        # Read through _config_read_key, which is the exact inverse of
+        # _config_write_key's quoting. Stripping every quote byte instead
+        # would corrupt any value that legitimately contains one.
+        #
+        # Which keys are required depends on the backend: `harness chatgpt
+        # preflight` sets backend_override, and the two sets are disjoint, so
+        # checking the wrong one fails a perfectly valid install.
+        local -a req_keys=()
+        local url_key rk rv
+        if _backend_is_chatgpt; then
+            req_keys=(
+                "CHATGPT_BASE_URL|backend-api base URL"
+                "CHATGPT_COOKIE_STRING|session cookie"
+                "CHATGPT_MODEL_NAME|model id to request"
+            )
+            url_key="CHATGPT_BASE_URL"
+        else
+            req_keys=(
+                "PROXY_API_URL|upstream API base URL"
+                "PROXY_API_KEY|upstream API bearer token"
+                "DEFAULT_MODEL_NAME|default/fallback upstream model id"
+            )
+            url_key="PROXY_API_URL"
+        fi
+        for rk in "${req_keys[@]}"; do
+            rv=$(_config_read_key "${rk%%|*}")
+            if [[ -z "$rv" ]]; then
+                echo "  ✗ ${rk%%|*} is empty in $env_file (required: ${rk#*|})"
+                errors=$((errors+1))
+            else
+                echo "  ✓ ${rk%%|*} is set"
+            fi
+        done
+        proxy_url=$(_config_read_key "$url_key")
 
-        if [[ -z "$proxy_url" ]]; then
-            echo "  ✗ PROXY_API_URL is empty in $env_file (required: upstream API base URL)"
-            errors=$((errors+1))
-        else
-            echo "  ✓ PROXY_API_URL is set"
-        fi
-        if [[ -z "$proxy_key" ]]; then
-            echo "  ✗ PROXY_API_KEY is empty in $env_file (required: upstream API bearer token)"
-            errors=$((errors+1))
-        else
-            echo "  ✓ PROXY_API_KEY is set"
-        fi
-        if [[ -z "$proxy_model" ]]; then
-            echo "  ✗ DEFAULT_MODEL_NAME is empty in $env_file (required: default/fallback upstream model id)"
-            errors=$((errors+1))
-        else
-            echo "  ✓ DEFAULT_MODEL_NAME is set"
-        fi
-
-        # PROXY_API_URL hostname must be in the allowlist or container egress
+        # The upstream hostname must be in the allowlist or container egress
         # will be blocked by the firewall. Host mode has no firewall, so this
         # cross-check is container-only.
         if (( ! host_only )) && [[ -n "$proxy_url" && -f "$allowlist_path" ]]; then
             local proxy_host
             proxy_host=$(echo "$proxy_url" | awk -F[/:] '{print $4}')
-            if [[ -n "$proxy_host" ]]; then
-                if ! grep -qE "^[[:space:]]*${proxy_host}([[:space:]]|#|\$)" "$allowlist_path"; then
-                    echo "  ✗ PROXY_API_URL hostname '$proxy_host' is NOT in $allowlist_path"
-                    echo "    Add it with:  harness net allow $proxy_host"
-                    errors=$((errors+1))
-                else
-                    echo "  ✓ PROXY_API_URL hostname is in allowlist"
-                fi
+            if [[ -z "$proxy_host" ]]; then
+                echo "  ✗ $url_key='$proxy_url' has no parseable hostname (needs a scheme, e.g. https://)"
+                echo "    The proxy's firewall guard will refuse to start it."
+                errors=$((errors+1))
+            elif ! grep -qE "^[[:space:]]*${proxy_host}([[:space:]]|#|\$)" "$allowlist_path"; then
+                echo "  ✗ $url_key hostname '$proxy_host' is NOT in $allowlist_path"
+                echo "    Add it with:  harness net allow $proxy_host"
+                errors=$((errors+1))
+            else
+                echo "  ✓ $url_key hostname is in allowlist"
             fi
         fi
     fi

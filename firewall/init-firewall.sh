@@ -267,6 +267,20 @@ fi
 
 if [[ -n "$guard_url" ]]; then
     api_host=$(echo "$guard_url" | awk -F[/:] '{print $4}')
+    if [[ -z "$api_host" ]]; then
+        # The parse assumes a scheme://host form. A scheme-less value
+        # ("api.example.com/v1") yields nothing, which used to skip the
+        # guardrail silently — the proxy then started with an unallowlisted
+        # upstream and failed at request time with an opaque connect error.
+        # A configured-but-unparseable upstream is a misconfiguration; say so.
+        cat >&2 <<EOF
+[harness-firewall] FATAL: could not parse a hostname out of ${guard_var}='${guard_url}'.
+[harness-firewall] It must include a scheme, e.g. https://api.example.com/v1.
+[harness-firewall] Fix it with:
+[harness-firewall]     harness config set ${guard_var} <url>
+EOF
+        exit 1
+    fi
     if [[ -n "$api_host" ]]; then
         # Only enforce for non-intra-cluster hosts. A bare hostname with no
         # dots (mockupstream) is intra-cluster and lives behind the
