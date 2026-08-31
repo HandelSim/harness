@@ -92,6 +92,10 @@ a sticky list, set `HARNESS_EXTRA_MOUNTS=/path/a:/path/b` (colon-separated) in
 harness [flags]        launch opencode in the CWD (default command)
 harness shell          bash shell inside the agent container (same home as opencode)
 harness host           containerless mode (see below)
+harness chatgpt        launch against the ChatGPT backend-api instead of the
+                       default upstream ('harness chatgpt host' for the
+                       containerless form). Needs CHATGPT_BASE_URL,
+                       CHATGPT_MODEL_NAME and CHATGPT_COOKIE_STRING in .env.
 harness --net          this launch only: full outbound network, firewall off
 harness --yolo         pass-through: auto-approve / skip permissions
 

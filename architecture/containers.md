@@ -268,9 +268,13 @@ configured `PROXY_API_URL` host, and allowlist entries.
 - `HARNESS_FIREWALL_DISABLED=1` short-circuits the script and logs a loud
   bypass message. Set by `harness net open <service>` (stamped into the
   runtime override) and by `--net` per launch (set on the `docker run` env).
-- The proxy container additionally validates `PROXY_API_URL`'s host is
-  on the allowlist before applying rules; otherwise the proxy cannot
-  reach upstream and there's no point continuing.
+- The proxy container additionally validates its upstream host is on the
+  allowlist before applying rules; otherwise the proxy cannot reach upstream
+  and there's no point continuing. Which host that is depends on the backend:
+  `PROXY_API_URL`'s by default, `CHATGPT_BASE_URL`'s when the proxy was started
+  with `PROXY_BACKEND=chatgpt` (see [`harness-cli.md`](harness-cli.md) →
+  ChatGPT backend). The proxy service also carries the three `CHATGPT_*` values
+  from `.env`; they are inert on a normal launch.
 - The rules are IPv4-only (`iptables` + `dig +short A` + an `inet` ipset), so
   every harness container is created with the kernel IPv6 stack disabled via
   the `net.ipv6.conf.all.disable_ipv6=1` sysctl (`sysctls:` in

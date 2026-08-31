@@ -53,6 +53,35 @@ These are the load-bearing behaviors the proxy is built around:
   It cannot be used for context tracking — the proxy estimates tokens
   locally instead (see "Local token estimation" in [`proxy.md`](proxy.md)).
 
+## A second backend: the ChatGPT backend-api
+
+Everything above describes the **default** upstream (`PROXY_BACKEND=openai`).
+`harness chatgpt` points the same proxy at an unrelated API instead. It is not
+OpenAI-compatible and shares none of the contract above.
+
+- **Endpoint.** One path, `POST {CHATGPT_BASE_URL}/backend-api/conversation/stream`.
+  Hardcoded in the proxy; only the base URL is configurable.
+- **Auth.** A browser session cookie (`CHATGPT_COOKIE_STRING`), not a bearer
+  key. There is no probe endpoint and no unlock URL, so `harness` skips the
+  auth probe entirely for this backend. The cookie expires; the failure mode is
+  a 4xx from the stream endpoint, surfaced to the agent as a 502 carrying the
+  upstream body.
+- **No catalog.** There is no `/v1/models`. `CHATGPT_MODEL_NAME` is both the
+  requested model and the entire list the proxy synthesizes for opencode.
+- **Request shape.** `{"action": "next", "model", "timezone",
+  "timezone_offset_min", "messages": [{"author": {"role"}, "content":
+  {"content_type": "text", "parts": [...]}}]}`.
+- **Response shape.** SSE, `data: ` lines terminated by `data: [DONE]`. Two
+  delta shapes are emitted and both occur: incremental
+  `{"type": "message_delta", "delta": "..."}` events, and
+  `message.content.parts` snapshots that are **cumulative** (each event repeats
+  everything so far).
+- **Server-side conversation state.** `conversation_id` / `parent_message_id`
+  carry history between turns. The proxy does not use them — see
+  [`proxy.md`](proxy.md) → Upstream backends.
+- **No tool support**, same as the default upstream, so the cooperative-prompt
+  machinery applies unchanged.
+
 ## API key lifecycle
 
 - **Keys lock every 8 hours.** Unclear whether the 8h is measured from

@@ -817,6 +817,9 @@ PROXY_API_URL (REQUIRED)    PROXY_API_KEY (REQUIRED)    DEFAULT_MODEL_NAME (REQU
 PROXY_TIMEOUT=180           OUTPUT_DIR (optional)
 MODEL_CONTEXT_LENGTH=200000 (legacy alias: OLLAMA_CONTEXT_LENGTH)
 HARNESS_FORCE_LOOPBACK (optional; host mode sets it — see below)
+PROXY_BACKEND=openai        (optional; `harness chatgpt` sets it — see below)
+CHATGPT_BASE_URL / CHATGPT_MODEL_NAME / CHATGPT_COOKIE_STRING
+                            (REQUIRED only when PROXY_BACKEND=chatgpt)
 ```
 
 `DEFAULT_MODEL_NAME` (the renamed `PROXY_API_MODEL`) is the fallback model — see
@@ -836,6 +839,52 @@ code page, which cannot encode `→` and much else — `print` raised
 point, removing the whole crash class; `backslashreplace` keeps even a stray
 surrogate from raising on a log write. No-op where the stream is already UTF-8 or
 predates `reconfigure` (Python < 3.7).
+
+### Upstream backends
+
+The proxy speaks **one** upstream dialect per process, selected by
+`PROXY_BACKEND`:
+
+| Value | Upstream | Auth | Catalog |
+|---|---|---|---|
+| `openai` (default) | `{PROXY_API_URL}/v1/chat/completions` | `Authorization: Bearer PROXY_API_KEY` | proxied from `{base}/v1/models` |
+| `chatgpt` | `{CHATGPT_BASE_URL}/backend-api/conversation/stream` | `Cookie: CHATGPT_COOKIE_STRING` | synthesized, one entry: `CHATGPT_MODEL_NAME` |
+
+`PROXY_BACKEND` is deliberately **not** a `.env` key. `harness chatgpt` injects
+it for a single launch — container mode through the generated compose runtime
+override, host mode through the proxy's launch env — so a default install is
+byte-identical to before. Only the three `CHATGPT_*` values live in `.env`.
+
+The splice point is one function, `_upstream_post(headers, payload)`, which all
+three outbound chat call sites (`catch_all`, the malformed-tool-call retry, the
+meta-tool loop) go through. This works because the proxy **never streams from
+upstream** — it materializes the full upstream response, then translates. The
+chatgpt branch therefore only has to hand back an OpenAI-shaped response object:
+`_chatgpt_post` consumes the backend-api's SSE stream and returns a
+`_SyntheticResponse` exposing the `.status_code` / `.text` / `.json()` trio the
+call sites use. Everything downstream (error triage, tool-call extraction, the
+retry and meta-tool loops, the empty-response rescue, both emitters) is
+dialect-agnostic and untouched.
+
+Three details of the chatgpt dialect are **hardcoded**, not configurable: the
+stream path `/backend-api/conversation/stream`, `timezone`/`timezone_offset_min`
+(`America/Chicago` / 300), and the browser `User-Agent`.
+
+**No server-side conversation state.** The backend-api keeps history under
+`conversation_id`/`parent_message_id` and expects only the newest turn. This
+proxy is stateless and re-sends the whole history every request, so reusing
+that state would duplicate the transcript. `_chatgpt_flatten_messages` instead
+starts a fresh conversation per request and renders the translated history into
+the single user message the endpoint takes: a one-message history passes
+through verbatim (identical to the reference client), a longer one is joined
+with `Role: text` labels. A multi-message array was rejected because if the
+endpoint honored only its last entry the history loss would be silent.
+
+`_validate_config` branches on the backend: `chatgpt` requires the three
+`CHATGPT_*` values and ignores the `PROXY_API_*` / `DEFAULT_MODEL_NAME` trio;
+any value other than `openai` or `chatgpt` is fatal. The startup banner reports
+the backend and, for chatgpt, the cookie's length only (never a prefix, unlike
+`_redact_key` on a bearer token).
 
 `_validate_config` also honors **`HARNESS_FORCE_LOOPBACK`** (set by the
 containerless `harness host` launcher — see [`harness-cli.md`](harness-cli.md) →

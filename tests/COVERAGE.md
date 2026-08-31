@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 402 rows (F=153, P=59, A=24, M=33, N=30, U=29, Pe=16, O=0, I=50, Ho=8). 399 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
+Inventory total: 446 rows (F=153, P=76, A=24, M=33, N=30, U=29, Pe=16, O=0, I=50, Ho=8, C=26). 443 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -31,7 +31,18 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   P003/P004/P006/P012/P050 log-scrape of the proxy startup banner.
 - `proxy/test_proxy.py` (1017 lines) — pure-Python unit tests for `format_tools_to_text`,
   `extract_tool_calls_and_text`, `_scan_balanced_json`, `translate_history_and_apply_prompt`,
-  `make_chunk`, prompt-injection modes, system→user rewrite, usage override.
+  `make_chunk`, prompt-injection modes, system→user rewrite, usage override. Also carries
+  the ChatGPT backend-api classes (`TestChatGPTFlatten`, `TestChatGPTCollectStream`,
+  `TestChatGPTPost`, `TestUpstreamPostRouting`, `TestChatGPTEndToEnd`,
+  `TestChatGPTModelCatalog`, `TestChatGPTValidateConfig`) covering P065-P081.
+- `tests/unit_chatgpt_test.sh` (no docker) — CLI-side `harness chatgpt` / `harness chatgpt
+  host`: backend selection (`_backend_is_chatgpt`/`_effective_default_model`), the shared
+  `proxy:` runtime-override mapping, per-backend required-config swap
+  (`require_runtime_config`/`host_require_config`), the auth-probe/model-catalog no-ops,
+  `host_proxy_fingerprint` backend/CHATGPT_* coverage, `_running_proxy_backend` +
+  `ensure_services_up` restart-on-mismatch, cookie secrecy + config-picker + allowlist sync,
+  and `cmd_chatgpt` dispatch/help/wiring. Sourced via `HARNESS_SOURCE_ONLY=1`. Covers
+  C001-C026.
 - `tests/scheme_contract_test.sh` (456 lines, Track E) — per-scheme proxy contract test.
   Brings up proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
   a probe through the proxy's OpenAI-compatible interface; asserts forwarded-body structure.
@@ -77,17 +88,17 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   281 |   69.9% |
-| yellow   |     5 |    1.2% |
-| red      |   116 |   28.9% |
-| **total**|   402 |  100.0% |
+| green    |   325 |   72.9% |
+| yellow   |     5 |    1.1% |
+| red      |   116 |   26.0% |
+| **total**|   446 |  100.0% |
 
 Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
 | F      |   153 |   112 |      2 |  39 |
-| P      |    59 |    45 |      1 |  13 |
+| P      |    76 |    62 |      1 |  13 |
 | A      |    24 |    12 |      0 |  12 |
 | M      |    33 |    28 |      0 |   5 |
 | N      |    30 |     6 |      0 |  24 |
@@ -96,6 +107,7 @@ Per-prefix breakdown:
 | O      |     0 |     0 |      0 |   0 |
 | I      |    50 |    35 |      1 |  14 |
 | Ho     |     8 |     8 |      0 |   0 |
+| C      |    26 |    26 |      0 |   0 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -353,6 +365,23 @@ non-green rows — the gap.
 | P061 | green  | proxy/test_proxy.py (TestConfigHelpers)      | test_normalize_* asserts `_normalize_api_base` strips `/v1/chat/completions`, `/chat/completions`, and a trailing `/v1` (and preserves a non-`/v1` prefix); chat/models URLs derive from the base. | |
 | P062 | green  | proxy/test_proxy.py (TestForceLoopbackGuard) | test_refuses_non_loopback_when_forced asserts `_validate_config()` raises SystemExit for `HARNESS_FORCE_LOOPBACK` in {1,true,yes} crossed with `PROXY_HOST` in {0.0.0.0,192.168.1.10,::}; test_allows_loopback_when_forced passes for 127.0.0.1/::1/localhost; test_allows_any_host_when_not_forced passes for 0.0.0.0 when the var is unset/0/false (container mode). | |
 | P063 | green  | proxy/test_proxy.py (TestForceUtf8Stdio)    | test_arrow_crashes_on_cp1252_baseline reproduces the user's crash (writing `sys→user` to a cp1252 `TextIOWrapper` raises `UnicodeEncodeError`); test_reconfigures_to_utf8_and_arrow_survives patches `proxy.sys.stdout`/`stderr` to fresh cp1252 streams, calls `proxy._force_utf8_stdio()`, then asserts `print("sys→user")` to both succeeds, `.encoding` is utf-8, and the UTF-8 bytes of `→` land in the underlying buffer; test_noop_when_stream_lacks_reconfigure asserts a stream without `reconfigure` is tolerated (no raise). | |
+| P065 | green  | proxy/test_proxy.py:4010-4047 (TestChatGPTFlatten) | test_single_message_passes_through_verbatim: `out == "hello"`; test_multi_turn_history_is_labeled_not_dropped asserts `"User: first"`/`"Assistant: second"`/`"User: third"` all present and in order; test_blank_messages_are_dropped, test_empty_history_is_empty_string, and test_list_content_is_flattened_not_crashed cover the remaining edge cases. | |
+| P066 | green  | proxy/test_proxy.py:4050-4058 (TestChatGPTCollectStream) | test_message_delta_chunks_accumulate: three `message_delta` chunks (`"Hel"`,`"lo "`,`"world"`) collect to `"Hello world"`. | |
+| P067 | green  | proxy/test_proxy.py:4059-4067 (TestChatGPTCollectStream) | test_cumulative_parts_take_only_the_new_suffix: three cumulative `content.parts` events (`"Hel"`→`"Hello"`→`"Hello world"`) collect to `"Hello world"`, not the concatenation of all three. | |
+| P068 | green  | proxy/test_proxy.py:4069-4075 (TestChatGPTCollectStream) | test_done_terminates_the_stream: a `message_delta` after `data: [DONE]` is dropped; result is `"kept"`. | |
+| P069 | green  | proxy/test_proxy.py:4077-4085 (TestChatGPTCollectStream) | test_non_data_and_malformed_lines_are_skipped: blank line, `event: ping`, and `data: {not json` are all tolerated; result is `"ok"`. | |
+| P070 | green  | proxy/test_proxy.py:4087-4092 (TestChatGPTCollectStream) | test_bytes_lines_are_decoded: `b'data: {...}'` / `b"data: [DONE]"` (bytes, not str) collect to `"bytes"`. | |
+| P071 | green  | proxy/test_proxy.py:4118-4125 (TestChatGPTPost) | test_posts_to_the_hardcoded_stream_endpoint: `captured["url"] == "https://chat.example.com/backend-api/conversation/stream"` and `captured["kwargs"].get("stream")` is truthy. | |
+| P072 | green  | proxy/test_proxy.py:4127-4136 (TestChatGPTPost) | test_payload_matches_the_backend_api_dialect asserts `body["action"] == "next"`, `body["model"] == "gpt-5.6-terra"`, `body["timezone"] == "America/Chicago"`, `body["timezone_offset_min"] == 300`, `body["messages"][0]["author"] == {"role": "user"}`, and `content.content_type == "text"` / `content.parts == ["hi"]`. | |
+| P073 | green  | proxy/test_proxy.py:4138-4143 (TestChatGPTPost) | test_no_server_side_conversation_state_is_reused: `assertNotIn("conversation_id", ...)` and `assertNotIn("parent_message_id", ...)`. | |
+| P074 | green  | proxy/test_proxy.py:4145-4152 (TestChatGPTPost) | test_headers_carry_cookie_origin_and_referer asserts `Cookie == "session=abc"`, `Accept == "text/event-stream"`, `Origin`/`Referer` derived from `CHATGPT_BASE_URL`, and `"Chrome/152"` in `User-Agent`. | |
+| P075 | green  | proxy/test_proxy.py:4154-4163 (TestChatGPTPost) | test_returns_an_openai_shaped_response: `extract_assistant_content(body) == "answer"`, `_extract_finish_reason(body) == "stop"`, and `json.loads(resp.text)["object"] == "chat.completion"`. | |
+| P076 | green  | proxy/test_proxy.py:4165-4168 (TestChatGPTPost) | test_error_status_is_surfaced_with_the_upstream_body: `resp.status_code == 403` and `"cookie expired" in resp.json()["error"]["message"]`. | |
+| P077 | green  | proxy/test_proxy.py:4172-4182 (TestUpstreamPostRouting) | test_openai_backend_posts_to_chat_url: with `PROXY_BACKEND=openai`, `_upstream_post` posts to `proxy.CHAT_URL`. | |
+| P078 | green  | proxy/test_proxy.py:4184-4190 (TestUpstreamPostRouting) | test_chatgpt_backend_routes_to_the_chatgpt_client: with `PROXY_BACKEND=chatgpt`, `_upstream_post` returns whatever a patched `_chatgpt_post` returns and is called exactly once. | |
+| P079 | green  | proxy/test_proxy.py:4193-4252 (TestChatGPTEndToEnd) | test_plain_answer_reaches_the_client (`content == "42"`), test_cooperative_tool_calls_are_still_extracted (fenced ```json``` tool call still parsed into `tool_calls`), test_upstream_error_becomes_a_502_for_the_client (`resp.status_code == 502`) — all driven through `client.post("/v1/chat/completions", ...)`. | |
+| P080 | green  | proxy/test_proxy.py:4256-4280 (TestChatGPTModelCatalog) | test_catalog_is_synthesized_without_calling_upstream: `requests.get` patched to raise if called, `GET /v1/models` still returns 200 with `data == [{"id": "gpt-5.6-terra"}]`-shaped list; test_openai_backend_still_proxies_the_catalog asserts the openai backend's response still carries `"upstream-model"`. | |
+| P081 | green  | proxy/test_proxy.py:4284-4315 (TestChatGPTValidateConfig) | test_chatgpt_requires_only_its_own_three_vars: `_validate_config()` does not raise with the openai trio empty; test_missing_cookie_is_fatal and test_unknown_backend_is_fatal both assert `SystemExit`; test_openai_backend_still_requires_its_trio asserts the openai backend still raises `SystemExit` when its trio is empty. | |
 
 ## A — Agent runtime (init, configs, run-opencode/shell) (24 IDs)
 
@@ -603,6 +632,37 @@ non-green rows — the gap.
 | Ho015 | green  | tests/unit_host_toolchain_test.sh:T7         | Windows (Git Bash) layout: stubbing `harness_detect_os`→windows + `uname`, `host_jq_platform`=windows-amd64, `host_node_platform`=win-x64, `host_exe_suffix`=.exe, vendored jq is `jq.exe`, the jq asset is `jq-windows-amd64.exe`, `node.exe`/opencode shim resolve at the dir **root** (not `bin/`), the venv is `Scripts/python.exe`; win-arm64 resolves Node but `host_jq_platform` fails closed (no upstream build). | |
 | Ho016 | green  | tests/unit_host_toolchain_test.sh:T8         | `host_toolchain_path_prefix` under a stubbed Windows OS orders the dirs `tool_bin:node-root:opencode-root` (Windows layout, stub binaries at the root). | |
 | Ho017 | green  | tests/unit_host_toolchain_test.sh:T9         | `host_extract_archive` extracts a real `.tar.gz` (and a `.zip` round-trip when `zip`/`unzip` are present), and rejects an unknown archive kind. | |
+
+## C — ChatGPT backend, CLI side (25 IDs)
+
+| ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
+|------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
+| C001 | green  | tests/unit_chatgpt_test.sh:77-80 (T1)       | `backend_override=""; _backend_is_chatgpt && fail ...` — asserts the predicate fails (bash false) with no override set. | |
+| C002 | green  | tests/unit_chatgpt_test.sh:81-82 (T1)       | `backend_override="chatgpt"; _backend_is_chatgpt \|\| fail ...` — asserts the predicate succeeds once selected. | |
+| C003 | green  | tests/unit_chatgpt_test.sh:79-84 (T1)       | Asserts `_effective_default_model` returns `"openai-model"` (from `DEFAULT_MODEL_NAME`) by default and `"gpt-5.6-terra"` (from `CHATGPT_MODEL_NAME`) once `backend_override=chatgpt`. | |
+| C004 | green  | tests/unit_chatgpt_test.sh:89-95 (T2)       | `grep -q 'PROXY_BACKEND: "chatgpt"' "$runtime_override"` and `grep -q '^  proxy:' "$runtime_override"` after `write_runtime_override` with `backend_override=chatgpt`. | |
+| C005 | green  | tests/unit_chatgpt_test.sh:100-106 (T3)     | `[[ "$(grep -c '^  proxy:' "$runtime_override")" == "1" ]]` with both `backend_override` and `prompt_mode_override` set — a single `proxy:` block carries both `PROXY_BACKEND` and `PROXY_PROMPT_MODE`. | |
+| C006 | green  | tests/unit_chatgpt_test.sh:109-112 (T4)     | `backend_override=""; prompt_mode_override=""; write_runtime_override; [[ ! -f "$runtime_override" ]]`. | |
+| C007 | green  | tests/unit_chatgpt_test.sh:117-120 (T5)     | Subshell with `backend_override=chatgpt` and the openai trio blanked still passes `require_runtime_config`. | |
+| C008 | green  | tests/unit_chatgpt_test.sh:124-126 (T5)     | Subshell with `backend_override=""` and the `CHATGPT_*` trio blanked still passes `require_runtime_config`; the paired assertion at 121-123 confirms a missing `CHATGPT_COOKIE_STRING` still aborts when `backend_override=chatgpt`. | |
+| C009 | green  | tests/unit_chatgpt_test.sh:130-137 (T6)     | Same swap re-driven against `host_require_config`: chatgpt backend tolerates a blanked openai trio (130-133) but still aborts on a missing `CHATGPT_BASE_URL` (134-136). | |
+| C010 | green  | tests/unit_chatgpt_test.sh:142-145 (T7)     | `_probe_upstream_auth` stubbed to `return 1`; `_gate_on_upstream_auth` with `backend_override=chatgpt` still exits 0 — proves the early return skips the probe entirely. | |
+| C011 | green  | tests/unit_chatgpt_test.sh:146-148 (T7)     | Same stub-fails-loudly pattern for `_print_upstream_models` — exits 0 with `backend_override=chatgpt`. | |
+| C012 | green  | tests/unit_chatgpt_test.sh:153-158 (T8)     | `base_fp="$(host_proxy_fingerprint)"` under the default backend differs from `cg_fp` computed under `backend_override=chatgpt`. | |
+| C013 | green  | tests/unit_chatgpt_test.sh:159-164 (T8)     | Loop over `CHATGPT_BASE_URL`/`CHATGPT_MODEL_NAME`/`CHATGPT_COOKIE_STRING`: changing any one value changes `host_proxy_fingerprint`'s output versus `cg_fp`. | |
+| C014 | green  | tests/unit_chatgpt_test.sh:170-175 (T9)     | `harness_docker` stubbed to emit `PROXY_BACKEND=chatgpt` → `_running_proxy_backend` returns `chatgpt`; stubbed with no `PROXY_BACKEND` line → returns `openai`. | |
+| C015 | green  | tests/unit_chatgpt_test.sh:176-177 (T9)     | `compose() { echo ""; }` (no running container) → `_running_proxy_backend` exits non-zero. | |
+| C016 | green  | tests/unit_chatgpt_test.sh:194-196 (T10)    | `_running_proxy_backend` stubbed to `openai`, `backend_override=chatgpt` → `ensure_services_up` writes to `$START_LOG` (stack restarted). | |
+| C017 | green  | tests/unit_chatgpt_test.sh:189-192,198-201 (T10) | Matching-backend cases (`openai`/`openai` and `chatgpt`/`chatgpt`) both leave `$START_LOG` empty — `[[ ! -s "$START_LOG" ]]`. | |
+| C018 | green  | tests/unit_chatgpt_test.sh:206-209 (T11)    | `_config_is_secret CHATGPT_COOKIE_STRING` succeeds; `_config_get` output matches `'set,'` and does NOT contain the raw cookie value `abcdefghijklmnop`. | |
+| C019 | green  | tests/unit_chatgpt_test.sh:210-212 (T11)    | `_config_editable_keys \| grep -q '^CHATGPT_BASE_URL\|'` (and the same for `CHATGPT_MODEL_NAME`/`CHATGPT_COOKIE_STRING`). | |
+| C020 | green  | tests/unit_chatgpt_test.sh:217-222 (T12)    | `_config_set CHATGPT_BASE_URL "https://chat.newhost.example:8443"` then `_config_read_key` round-trips the URL AND `grep -q '^chat.newhost.example' "$ALLOWLIST"`. | |
+| C021 | green  | tests/unit_chatgpt_test.sh:227-230 (T13)    | `cmd_chatgpt --help` output matches `'harness chatgpt host'` and `'CHATGPT_COOKIE_STRING'`; `[[ -z "$backend_override" ]]` afterward confirms no side effect. | |
+| C022 | green  | tests/unit_chatgpt_test.sh:241-245 (T14)    | `cmd_chatgpt --yolo` (stubbed `run_agent`) logs `run_agent:opencode --yolo`; asserts `backend_override == "chatgpt"` and `agent_model == "gpt-5.6-terra"`. | |
+| C023 | green  | tests/unit_chatgpt_test.sh:248-251 (T14)    | `cmd_chatgpt host -p 'hi'` (stubbed `cmd_host`) logs `cmd_host:-p hi`; asserts `backend_override == "chatgpt"`. | |
+| C024 | green  | tests/unit_chatgpt_test.sh:255-256 (T15)    | `grep -qE '^ *chatgpt\)  *cmd_chatgpt "\$@" ;;' "$HARNESS"` — source-grep of the wrapper's `main()` dispatch table. | |
+| C025 | green  | tests/unit_chatgpt_test.sh:257 (T15)        | `grep -q 'chatgpt \[host\] \[args\]' "$HARNESS"` — source-grep of `cmd_help`'s text. | |
+| C026 | green  | tests/unit_chatgpt_test.sh:260-276 (T16)    | Writes a cookie with `; ` separators, asserts `grep -q '^CHATGPT_COOKIE_STRING="'`, `_config_read_key` equality, and that a child `bash -c 'set -euo pipefail; set -a; . .env'` both succeeds and yields the exact cookie; then asserts `grep -q '^CHATGPT_MODEL_NAME=gpt-5.6-terra$'` for the no-churn case. | |
 
 ---
 

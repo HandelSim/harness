@@ -22,6 +22,8 @@
 #     CHATGPT_BASE_URL syncs the egress allowlist
 #   - cmd_chatgpt: --help prints without side effects; bare form launches an
 #     agent, `host` form delegates to cmd_host, both with the backend set
+#   - _config_write_key: a cookie with '; ' separators is quoted on disk, so
+#     the rewritten .env still sources cleanly (harness sources it under -e)
 #   - the subcommand is wired into main()'s dispatch and cmd_help
 #
 # Prints "CHATGPT TEST PASSED" on success.
@@ -256,6 +258,24 @@ grep -qE '^ *chatgpt\)  *cmd_chatgpt "\$@" ;;' "$HARNESS" \
     || fail "T15: 'chatgpt' missing from main()'s command dispatch"
 grep -q 'chatgpt \[host\] \[args\]' "$HARNESS" || fail "T15: chatgpt missing from cmd_help"
 ok "T15: 'harness chatgpt' is dispatched and documented in 'harness help'"
+
+# --- T16: a real cookie survives the .env write AND re-sourcing -------------
+# Cookies carry '; ' separators. harness sources .env under `set -euo
+# pipefail`, so an unquoted value would truncate at the first ';' and then run
+# "oai-did=..." as a command, killing every harness invocation.
+cookie='__Secure-next-auth.session-token=eyJhbGci.OiJk-x_y; oai-did=9f2b-4c; _puid=abc%3D'
+_config_write_key CHATGPT_COOKIE_STRING "$cookie" || fail "T16: write returned non-zero"
+grep -q '^CHATGPT_COOKIE_STRING="' "$TMP_ROOT/.env" || fail "T16: cookie not quoted on disk"
+[[ "$(_config_read_key CHATGPT_COOKIE_STRING)" == "$cookie" ]] \
+    || fail "T16: cookie mangled: got $(_config_read_key CHATGPT_COOKIE_STRING)"
+sourced=$(bash -c 'set -euo pipefail; set -a; . "$1"; set +a; printf %s "$CHATGPT_COOKIE_STRING"' \
+    _ "$TMP_ROOT/.env") || fail "T16: sourcing the rewritten .env aborted"
+[[ "$sourced" == "$cookie" ]] || fail "T16: sourced cookie differs: $sourced"
+# Bare words stay bare — no churn for the keys that never needed quoting.
+_config_write_key CHATGPT_MODEL_NAME gpt-5.6-terra
+grep -q '^CHATGPT_MODEL_NAME=gpt-5.6-terra$' "$TMP_ROOT/.env" \
+    || fail "T16: a bare value was needlessly quoted"
+ok "T16: a semicolon-bearing cookie round-trips and .env stays sourceable"
 
 echo
 echo "CHATGPT TEST PASSED"

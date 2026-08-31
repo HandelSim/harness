@@ -123,6 +123,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Agent launch | `opencode`, `shell`, `list`, `stop` |
 | Config / setup | `config` (get/set/list + interactive picker), `model` (pick `DEFAULT_MODEL_NAME` from the live catalog), `uninstall` — see "Config and setup commands" below. |
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
+| Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
 | Diagnostics | `doctor`, `preflight`, `help` |
 | Test / bench | `test`, `benchmark` |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
@@ -600,6 +601,57 @@ stopped still has the binary, so it does **not** take these paths — it hits
 full log path on **both** failure branches (proxy exited during startup, or
 never began listening) so a failed launch always points at the log that
 explains why.
+
+## ChatGPT backend (`harness chatgpt`)
+
+`cmd_chatgpt` is a **front door, not a parallel launch path**. It sets the
+`backend_override` global to `chatgpt` and then delegates to the exact code the
+default launch uses: `run_agent opencode` for the bare form, `cmd_host` for
+`harness chatgpt host` (so `harness chatgpt host down` works too). `-h/--help`
+is intercepted before the global is set, so help has no side effects.
+
+Everything the backend changes hangs off that one global:
+
+| Site | Behavior when `backend_override=chatgpt` |
+|---|---|
+| `require_runtime_config`, `host_require_config` | required-var set swaps to `CHATGPT_BASE_URL` / `CHATGPT_MODEL_NAME` / `CHATGPT_COOKIE_STRING`; the `PROXY_API_*` + `DEFAULT_MODEL_NAME` trio is not required |
+| `_gate_on_upstream_auth`, `_print_upstream_models` | early return — cookie auth has no bearer probe and the backend-api has no catalog |
+| `_effective_default_model` | returns `CHATGPT_MODEL_NAME`; feeds `agent_model` (container) and `host_write_opencode_config` (host) |
+| `write_runtime_override` | emits `PROXY_BACKEND: "chatgpt"` on the proxy service, folded into the **same** `proxy:` mapping as `PROXY_PROMPT_MODE` |
+| `host_proxy_start` | passes `PROXY_BACKEND` in the launch env prefix |
+| `host_proxy_fingerprint` | hashes the backend plus all three `CHATGPT_*` values |
+| `firewall/init-firewall.sh` | guards `CHATGPT_BASE_URL`'s host against the allowlist instead of `PROXY_API_URL`'s |
+
+**One proxy, one dialect.** Two landmines follow from the proxy being a single
+shared service, and both are handled explicitly:
+
+- *Container mode.* `ensure_services_up` is a no-op when the proxy is already
+  up, so a backend flag would silently not take effect after a normal launch.
+  `_running_proxy_backend` reads `PROXY_BACKEND` out of the running container's
+  env (defaulting to `openai`, which is also what every pre-existing container
+  reports) and `ensure_services_up` calls `cmd_start` on a mismatch. That
+  restart drops a concurrent agent on the other backend; there is only one
+  proxy, and answering from the wrong upstream is worse.
+- *Host mode.* There is one pidfile, so the two host modes cannot coexist.
+  Folding the backend and the `CHATGPT_*` values into `host_proxy_fingerprint`
+  makes the existing config-change restart path handle the switch.
+
+`CHATGPT_COOKIE_STRING` is a full session credential, so `_config_is_secret`
+matches `*COOKIE*` and `harness config` masks it. `harness config set
+CHATGPT_BASE_URL <url>` syncs the egress allowlist, exactly like
+`PROXY_API_URL`.
+
+A cookie also forced a fix in `_config_write_key`: it now double-quotes any
+value that is not a bare word (`[^A-Za-z0-9_./:@=+,%~-]`), escaping `\ $ ` "`.
+The wrapper sources `.env` under `set -euo pipefail`, so an unquoted
+`a=1; oai-did=2` truncates at the semicolon and then runs `oai-did=2` as a
+command — every `harness` invocation would die with "command not found".
+`_config_read_key` already stripped quotes, so the round-trip is unchanged, and
+bare values are still written bare (no churn for existing keys). This also
+fixes the pre-existing case of a `PROXY_API_URL` containing `&`.
+
+Covered by `tests/unit_chatgpt_test.sh` (docker-free) and the ChatGPT classes in
+`proxy/test_proxy.py`.
 
 ## Update-available banner
 

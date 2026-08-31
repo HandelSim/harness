@@ -12,6 +12,7 @@ This document enumerates every atomic, testable behavior of the harness project.
 - **O###** — *(retired — the proxy now serves the OpenAI-compatible interface directly; the separate container is gone)*
 - **I###** — Installer (`harness-install.sh`)
 - **Ho###** — Host mode, containerless (`harness host`, the `host_*` helpers)
+- **C###** — ChatGPT backend, CLI side (`harness chatgpt`, backend selection, per-backend config/fingerprint/dispatch helpers in the `harness` wrapper)
 
 Rows are intended to be atomic: one behavior, one row. Compound behaviors are split.
 
@@ -243,6 +244,23 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P062 | `_validate_config` refuses to start (exit 1) when `HARNESS_FORCE_LOOPBACK` is truthy (`1`/`true`/`yes`) but `PROXY_HOST` is not a loopback address (`127.0.0.1`/`::1`/`localhost`); container mode (var unset/falsey) may bind `0.0.0.0`. Belt-and-suspenders that host mode never exposes the keyed, firewall-less proxy off-box |
 | P063 | `_force_utf8_stdio` (called first in `main()`) reconfigures stdout/stderr to `encoding="utf-8", errors="backslashreplace"` so a non-ASCII print can never crash the proxy. Regression for the Windows host-mode crash: redirected stdout defaults to cp1252, which cannot encode the `→` (U+2192) in the `sys→user:` startup banner, so `print` raised `UnicodeEncodeError` and killed the proxy at startup. No-op on streams already UTF-8 or lacking `reconfigure` (Python < 3.7) |
 | P064 | The hybrid recency reminder's prose is loaded from a FILE, not a literal: `_setup_reminder_template` reads `_reminder_template_path()` (`HARNESS_REMINDER_PATH`, else `reminder.md` beside `proxy.py`), strips a leading `<!-- -->` header block and trailing newlines, and `build_cooperative_prompt_hybrid_reminder` substitutes `{{HOST_OS}}` / `{{CWD}}` / `{{TOOL_ENTRIES}}` by `str.replace` (never `format`, so a user edit cannot raise; unknown tokens stay literal). A missing, directory-shadowed, or empty file logs `[!]` and falls back to `_REMINDER_FALLBACK`, which keeps the tool-call envelope so tool calling still works |
+| P065 | `_chatgpt_flatten_messages` renders the OpenAI-shaped history into the backend-api's single-message dialect: a lone user turn passes through verbatim, multi-turn history is labeled `User:`/`Assistant:` (not dropped) and order-preserved, blank messages are dropped, an empty history yields `""`, and list-shaped `content` blocks are flattened rather than crashing |
+| P066 | `_chatgpt_collect_stream` accumulates `message_delta.delta` chunks across the SSE stream into the final answer text |
+| P067 | `_chatgpt_collect_stream` treats `message.content.parts` as cumulative (each event repeats everything so far) and takes only the new suffix, rather than duplicating it |
+| P068 | `_chatgpt_collect_stream` stops at a literal `data: [DONE]` line, discarding anything sent after it |
+| P069 | `_chatgpt_collect_stream` skips blank lines, non-`data:` lines (e.g. `event: ping`), and malformed JSON payloads without raising |
+| P070 | `_chatgpt_collect_stream` decodes `bytes` SSE lines the same as `str` lines |
+| P071 | `_chatgpt_post` POSTs to the hardcoded backend-api conversation-stream endpoint (`CHATGPT_STREAM_URL`) with `stream=True` |
+| P072 | `_chatgpt_post`'s request body matches the backend-api dialect: `action: "next"`, `model` from `CHATGPT_MODEL_NAME`, a hardcoded `timezone`/`timezone_offset_min`, and the flattened history as a single `author: {"role": "user"}` message with `content.content_type: "text"` |
+| P073 | `_chatgpt_post` never sends `conversation_id`/`parent_message_id` — the proxy is stateless and resends the full history every turn, so no server-side conversation state is carried forward |
+| P074 | `_chatgpt_post` sends the cookie, `Origin`, `Referer`, and a browser `User-Agent` header (impersonating the web client) alongside `Accept: text/event-stream` |
+| P075 | `_chatgpt_post` returns an OpenAI-shaped `chat.completion` response object (real JSON in both `.json()` and `.text`) so downstream extraction (`extract_assistant_content`, `_extract_finish_reason`) works unchanged |
+| P076 | `_chatgpt_post` surfaces a non-200 upstream status with the upstream response body folded into `error.message` |
+| P077 | `_upstream_post` routes to the OpenAI `CHAT_URL` when `PROXY_BACKEND=openai` (unchanged default path) |
+| P078 | `_upstream_post` routes to `_chatgpt_post` when `PROXY_BACKEND=chatgpt` |
+| P079 | The chatgpt backend only replaces the outbound call: end-to-end through `/v1/chat/completions`, a plain chatgpt-backend answer reaches the client, cooperative fenced tool calls are still extracted, and an upstream error becomes a 502 |
+| P080 | `GET /v1/models` on the chatgpt backend synthesizes a one-model catalog from `CHATGPT_MODEL_NAME` without calling upstream; the openai backend still proxies the real upstream catalog |
+| P081 | `_validate_config` for `PROXY_BACKEND=chatgpt` requires only `CHATGPT_BASE_URL`/`CHATGPT_MODEL_NAME`/`CHATGPT_COOKIE_STRING` (not the openai `PROXY_API_*`/`DEFAULT_MODEL_NAME` trio); a missing cookie is fatal, an unknown `PROXY_BACKEND` value is fatal, and the openai backend still requires its own trio |
 
 ---
 
@@ -513,3 +531,39 @@ without docker, network, or a real proxy/opencode spawn.
 | Ho016 | `host_toolchain_path_prefix` on Windows orders the dirs `tool_bin:node-root:opencode-root` (root-level layout) |
 | Ho017 | `host_extract_archive` extracts `.tar.gz` (and `.zip` when `zip`/`unzip` available) and rejects an unknown archive kind |
 | Ho018 | `host_python_bin` verifies each candidate by running `--version` (not `command -v` alone): rejects a dead `python3` App-execution-alias stub and falls through to a real `python`; prefers a real `python3`; returns non-zero when only stubs exist |
+
+## ChatGPT backend — CLI side (C###)
+
+Behaviors of the `harness chatgpt` path: backend selection (`backend_override`),
+the per-backend config/fingerprint/dispatch helpers it threads through in the
+`harness` wrapper. Docker-free, sourced via `HARNESS_SOURCE_ONLY=1`. (The
+proxy-side ChatGPT backend-api translation lives under P065–P081.)
+
+| ID | Behavior |
+|----|----------|
+| C001 | `_backend_is_chatgpt` is false with no `backend_override` set (the default/openai backend) |
+| C002 | `backend_override=chatgpt` makes `_backend_is_chatgpt` true |
+| C003 | `_effective_default_model` returns `DEFAULT_MODEL_NAME` for the default backend and `CHATGPT_MODEL_NAME` for the chatgpt backend |
+| C004 | `write_runtime_override` with `backend_override=chatgpt` injects `PROXY_BACKEND: "chatgpt"` onto the `proxy:` service block of the runtime override |
+| C005 | The backend and prompt-mode overrides share a single `proxy:` mapping in the runtime override — no duplicate top-level `proxy:` keys (duplicate keys are invalid compose YAML) |
+| C006 | `write_runtime_override` with neither `backend_override` nor `prompt_mode_override` active leaves no runtime override file behind |
+| C007 | `require_runtime_config` swaps the required-var set to `CHATGPT_BASE_URL`/`CHATGPT_MODEL_NAME`/`CHATGPT_COOKIE_STRING` when `backend_override=chatgpt`, and does NOT require the openai `PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME` trio |
+| C008 | `require_runtime_config` does NOT require the `CHATGPT_*` trio for the default backend |
+| C009 | `host_require_config` (host mode's lighter sibling of `require_runtime_config`) applies the same per-backend required-var swap |
+| C010 | `_gate_on_upstream_auth` no-ops for the chatgpt backend (cookie auth has no bearer-key probe) |
+| C011 | `_print_upstream_models` no-ops for the chatgpt backend (the backend-api has no model catalog to pull) |
+| C012 | `host_proxy_fingerprint` changes when the backend switches, so a running host proxy serving the other backend is detected as stale |
+| C013 | `host_proxy_fingerprint` changes when any of the three `CHATGPT_*` values changes (each is part of the fingerprint) |
+| C014 | `_running_proxy_backend` reads `PROXY_BACKEND` from the running proxy container's env, reporting the `openai` default when the var is absent from an otherwise-running container |
+| C015 | `_running_proxy_backend` fails/reports nothing when no proxy container is running |
+| C016 | `ensure_services_up` restarts the stack when the running proxy serves a different backend than the one requested for this launch |
+| C017 | `ensure_services_up` does NOT restart the stack when the running proxy already serves the requested backend |
+| C018 | `_config_is_secret CHATGPT_COOKIE_STRING` classifies the cookie as a secret; `_config_get`/`_config_read_key` never print it in the clear (masked as `set, ...`) |
+| C019 | `_config_editable_keys` lists `CHATGPT_BASE_URL`, `CHATGPT_MODEL_NAME`, and `CHATGPT_COOKIE_STRING` in the config picker |
+| C020 | `_config_set CHATGPT_BASE_URL <url>` writes the value AND syncs the egress allowlist with the new host (so the firewall permits it) |
+| C021 | `cmd_chatgpt --help` documents both the bare and `host` forms and the `CHATGPT_*` config keys, without selecting the backend (side-effect free) |
+| C022 | `cmd_chatgpt` (bare form) selects the chatgpt backend, sets `agent_model` from `CHATGPT_MODEL_NAME`, and launches an agent |
+| C023 | `cmd_chatgpt host …` selects the chatgpt backend and delegates the remaining args to `cmd_host` |
+| C024 | `harness chatgpt` is wired into `main()`'s top-level command dispatch |
+| C025 | `harness chatgpt [host] [args]` is documented in `cmd_help` |
+| C026 | `_config_write_key` double-quotes any value that is not a bare word, so a `CHATGPT_COOKIE_STRING` carrying `; ` separators round-trips and the rewritten `.env` still sources cleanly under `set -euo pipefail`; bare values stay unquoted |

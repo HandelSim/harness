@@ -1535,24 +1535,40 @@ _config_read_key() {
 }
 
 # Atomically rewrite (or append) KEY=VALUE in $env_file. A bash read-loop, not
-# sed, so values containing / & : @ need no escaping. Mirrors the env-write
-# convention in harness-install.sh.
+# sed, so values containing / & : @ need no escaping on the way in. Mirrors the
+# env-write convention in harness-install.sh.
 _config_write_key() {
     local key="$1" value="$2"
     if [[ ! -f "$env_file" ]]; then
         err "no .env at $env_file; run 'harness preflight' or reinstall"
         return 1
     fi
+    # Anything that is not a bare word gets double-quoted. harness sources .env
+    # under `set -euo pipefail`, so an unquoted value containing a space, ';'
+    # or '&' truncates the assignment and then runs the remainder as a command
+    # — a raw CHATGPT_COOKIE_STRING ("a=1; oai-did=2") would abort every
+    # harness command with "oai-did: command not found". bash and docker
+    # compose's dotenv parser both strip the quotes and honour the backslash
+    # escapes, so the value round-trips through either reader unchanged.
+    local emit="$value"
+    if [[ -n "$value" && "$value" =~ [^A-Za-z0-9_./:@=+,%~-] ]]; then
+        local esc="$value"
+        esc="${esc//\\/\\\\}"
+        esc="${esc//\$/\\\$}"
+        esc="${esc//\`/\\\`}"
+        esc="${esc//\"/\\\"}"
+        emit="\"$esc\""
+    fi
     local tmp="$env_file.tmp.$$" line written=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ ^[[:space:]]*${key}= ]]; then
-            printf '%s=%s\n' "$key" "$value"
+            printf '%s=%s\n' "$key" "$emit"
             written=1
         else
             printf '%s\n' "$line"
         fi
     done <"$env_file" >"$tmp"
-    (( written )) || printf '%s=%s\n' "$key" "$value" >>"$tmp"
+    (( written )) || printf '%s=%s\n' "$key" "$emit" >>"$tmp"
     mv -f "$tmp" "$env_file"
 }
 
