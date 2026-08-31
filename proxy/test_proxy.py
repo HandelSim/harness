@@ -3986,5 +3986,342 @@ class TestReminderTemplateFile(unittest.TestCase):
 
 
 
+# ---------------------------------------------------------------------------
+# ChatGPT backend-api
+# ---------------------------------------------------------------------------
+
+
+class _FakeStreamResp:
+    """Stand-in for the streaming `requests.Response` the backend-api returns."""
+
+    def __init__(self, lines, status_code=200, text=""):
+        self._lines = lines
+        self.status_code = status_code
+        self.text = text
+        self.closed = False
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def close(self):
+        self.closed = True
+
+
+def _sse(*objs):
+    """Render dicts (or raw strings) as the `data: ` lines of an SSE body."""
+    out = []
+    for o in objs:
+        out.append(o if isinstance(o, str) else "data: " + json.dumps(o))
+    return out
+
+
+class TestChatGPTFlatten(unittest.TestCase):
+    """The stateless proxy re-sends the whole history each turn, so the
+    backend-api's single user message has to carry all of it."""
+
+    def test_single_message_passes_through_verbatim(self):
+        # The common first turn must be byte-identical to the reference client.
+        out = proxy._chatgpt_flatten_messages([{"role": "user", "content": "hello"}])
+        self.assertEqual(out, "hello")
+
+    def test_multi_turn_history_is_labeled_not_dropped(self):
+        out = proxy._chatgpt_flatten_messages([
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"},
+        ])
+        self.assertIn("User: first", out)
+        self.assertIn("Assistant: second", out)
+        self.assertIn("User: third", out)
+        # Order preserved.
+        self.assertLess(out.index("first"), out.index("second"))
+        self.assertLess(out.index("second"), out.index("third"))
+
+    def test_blank_messages_are_dropped(self):
+        out = proxy._chatgpt_flatten_messages([
+            {"role": "system", "content": "   "},
+            {"role": "user", "content": "only this"},
+        ])
+        self.assertEqual(out, "only this")
+
+    def test_empty_history_is_empty_string(self):
+        self.assertEqual(proxy._chatgpt_flatten_messages([]), "")
+
+    def test_list_content_is_flattened_not_crashed(self):
+        out = proxy._chatgpt_flatten_messages(
+            [{"role": "user", "content": [{"type": "text", "text": "block"}]}]
+        )
+        self.assertIn("block", out)
+
+
+class TestChatGPTCollectStream(unittest.TestCase):
+    def test_message_delta_chunks_accumulate(self):
+        resp = _FakeStreamResp(_sse(
+            {"type": "message_delta", "delta": "Hel"},
+            {"type": "message_delta", "delta": "lo "},
+            {"type": "message_delta", "delta": "world"},
+            "data: [DONE]",
+        ))
+        self.assertEqual(proxy._chatgpt_collect_stream(resp), "Hello world")
+
+    def test_cumulative_parts_take_only_the_new_suffix(self):
+        # message.content.parts repeats everything so far on every event.
+        resp = _FakeStreamResp(_sse(
+            {"message": {"id": "m1", "content": {"parts": ["Hel"]}}},
+            {"message": {"id": "m1", "content": {"parts": ["Hello"]}}},
+            {"message": {"id": "m1", "content": {"parts": ["Hello world"]}}},
+            "data: [DONE]",
+        ))
+        self.assertEqual(proxy._chatgpt_collect_stream(resp), "Hello world")
+
+    def test_done_terminates_the_stream(self):
+        resp = _FakeStreamResp(_sse(
+            {"type": "message_delta", "delta": "kept"},
+            "data: [DONE]",
+            {"type": "message_delta", "delta": "dropped"},
+        ))
+        self.assertEqual(proxy._chatgpt_collect_stream(resp), "kept")
+
+    def test_non_data_and_malformed_lines_are_skipped(self):
+        resp = _FakeStreamResp([
+            "",
+            "event: ping",
+            "data: {not json",
+            'data: {"type": "message_delta", "delta": "ok"}',
+            "data: [DONE]",
+        ])
+        self.assertEqual(proxy._chatgpt_collect_stream(resp), "ok")
+
+    def test_bytes_lines_are_decoded(self):
+        resp = _FakeStreamResp([
+            b'data: {"type": "message_delta", "delta": "bytes"}',
+            b"data: [DONE]",
+        ])
+        self.assertEqual(proxy._chatgpt_collect_stream(resp), "bytes")
+
+
+class TestChatGPTPost(unittest.TestCase):
+    def _post(self, lines, status_code=200, text=""):
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, **kwargs):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = json
+            captured["kwargs"] = kwargs
+            return _FakeStreamResp(lines, status_code=status_code, text=text)
+
+        with patch.object(proxy, "CHATGPT_BASE_URL", "https://chat.example.com"), \
+             patch.object(proxy, "CHATGPT_STREAM_URL",
+                          "https://chat.example.com/backend-api/conversation/stream"), \
+             patch.object(proxy, "CHATGPT_MODEL_NAME", "gpt-5.6-terra"), \
+             patch.object(proxy, "CHATGPT_COOKIE_STRING", "session=abc"), \
+             patch.object(proxy.requests, "post", side_effect=fake_post):
+            resp = proxy._chatgpt_post(
+                {"model": "ignored-by-backend",
+                 "messages": [{"role": "user", "content": "hi"}]}
+            )
+        return captured, resp
+
+    def test_posts_to_the_hardcoded_stream_endpoint(self):
+        captured, _ = self._post(_sse({"type": "message_delta", "delta": "x"},
+                                      "data: [DONE]"))
+        self.assertEqual(
+            captured["url"],
+            "https://chat.example.com/backend-api/conversation/stream",
+        )
+        self.assertTrue(captured["kwargs"].get("stream"))
+
+    def test_payload_matches_the_backend_api_dialect(self):
+        captured, _ = self._post(_sse("data: [DONE]"))
+        body = captured["body"]
+        self.assertEqual(body["action"], "next")
+        self.assertEqual(body["model"], "gpt-5.6-terra")
+        self.assertEqual(body["timezone"], "America/Chicago")
+        self.assertEqual(body["timezone_offset_min"], 300)
+        self.assertEqual(body["messages"][0]["author"], {"role": "user"})
+        self.assertEqual(body["messages"][0]["content"]["content_type"], "text")
+        self.assertEqual(body["messages"][0]["content"]["parts"], ["hi"])
+
+    def test_no_server_side_conversation_state_is_reused(self):
+        # The proxy is stateless and re-sends the full history, so carrying
+        # conversation_id/parent_message_id forward would duplicate it.
+        captured, _ = self._post(_sse("data: [DONE]"))
+        self.assertNotIn("conversation_id", captured["body"])
+        self.assertNotIn("parent_message_id", captured["body"])
+
+    def test_headers_carry_cookie_origin_and_referer(self):
+        captured, _ = self._post(_sse("data: [DONE]"))
+        h = captured["headers"]
+        self.assertEqual(h["Cookie"], "session=abc")
+        self.assertEqual(h["Accept"], "text/event-stream")
+        self.assertEqual(h["Origin"], "https://chat.example.com")
+        self.assertEqual(h["Referer"], "https://chat.example.com/")
+        self.assertIn("Chrome/152", h["User-Agent"])
+
+    def test_returns_an_openai_shaped_response(self):
+        _, resp = self._post(_sse({"type": "message_delta", "delta": "answer"},
+                                  "data: [DONE]"))
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(proxy.extract_assistant_content(body), "answer")
+        self.assertEqual(proxy._extract_finish_reason(body), "stop")
+        self.assertEqual(body["model"], "gpt-5.6-terra")
+        # `.text` has to be real JSON: the error paths dump it.
+        self.assertEqual(json.loads(resp.text)["object"], "chat.completion")
+
+    def test_error_status_is_surfaced_with_the_upstream_body(self):
+        _, resp = self._post([], status_code=403, text="cookie expired")
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("cookie expired", resp.json()["error"]["message"])
+
+
+class TestUpstreamPostRouting(unittest.TestCase):
+    def test_openai_backend_posts_to_chat_url(self):
+        seen = {}
+
+        def fake_post(url, **kwargs):
+            seen["url"] = url
+            return _FakeStreamResp([])
+
+        with patch.object(proxy, "PROXY_BACKEND", "openai"), \
+             patch.object(proxy.requests, "post", side_effect=fake_post):
+            proxy._upstream_post({}, {"model": "m", "messages": []})
+        self.assertEqual(seen["url"], proxy.CHAT_URL)
+
+    def test_chatgpt_backend_routes_to_the_chatgpt_client(self):
+        with patch.object(proxy, "PROXY_BACKEND", "chatgpt"), \
+             patch.object(proxy, "_chatgpt_post",
+                          return_value="sentinel") as spy:
+            out = proxy._upstream_post({}, {"model": "m", "messages": []})
+        self.assertEqual(out, "sentinel")
+        spy.assert_called_once()
+
+
+class TestChatGPTEndToEnd(unittest.TestCase):
+    """The chatgpt branch only replaces the outbound call; everything
+    downstream (tool-call extraction, both emitters) must be unchanged."""
+
+    def _request(self, lines, body):
+        def fake_post(url, headers=None, json=None, **kwargs):
+            return _FakeStreamResp(lines)
+
+        client = proxy.app.test_client()
+        with patch.object(proxy, "PROXY_BACKEND", "chatgpt"), \
+             patch.object(proxy, "CHATGPT_MODEL_NAME", "gpt-5.6-terra"), \
+             patch.object(proxy, "CHATGPT_COOKIE_STRING", "session=abc"), \
+             patch.object(proxy.requests, "post", side_effect=fake_post), \
+             patch.object(proxy, "save_debug_file"):
+            return client.post(
+                "/v1/chat/completions",
+                data=json.dumps(body),
+                content_type="application/json",
+            )
+
+    def test_plain_answer_reaches_the_client(self):
+        resp = self._request(
+            _sse({"type": "message_delta", "delta": "42"}, "data: [DONE]"),
+            {"model": "gpt-5.6-terra", "stream": False,
+             "messages": [{"role": "user", "content": "answer?"}]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        out = json.loads(resp.data)
+        self.assertEqual(out["choices"][0]["message"]["content"], "42")
+
+    def test_cooperative_tool_calls_are_still_extracted(self):
+        fence = "```json\n" + json.dumps(
+            {"name": "bash", "arguments": {"command": "pwd"}}
+        ) + "\n```"
+        resp = self._request(
+            _sse({"type": "message_delta", "delta": fence}, "data: [DONE]"),
+            {"model": "gpt-5.6-terra", "stream": False,
+             "messages": [{"role": "user", "content": "run pwd"}],
+             "tools": [{"type": "function", "function": {"name": "bash"}}]},
+        )
+        out = json.loads(resp.data)
+        calls = out["choices"][0]["message"].get("tool_calls") or []
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "bash")
+
+    def test_upstream_error_becomes_a_502_for_the_client(self):
+        def fake_post(url, headers=None, json=None, **kwargs):
+            return _FakeStreamResp([], status_code=401, text="bad cookie")
+
+        client = proxy.app.test_client()
+        with patch.object(proxy, "PROXY_BACKEND", "chatgpt"), \
+             patch.object(proxy.requests, "post", side_effect=fake_post), \
+             patch.object(proxy, "save_debug_file"):
+            resp = client.post(
+                "/v1/chat/completions",
+                data=json.dumps({"model": "m", "stream": False,
+                                 "messages": [{"role": "user", "content": "hi"}]}),
+                content_type="application/json",
+            )
+        self.assertEqual(resp.status_code, 502)
+
+
+class TestChatGPTModelCatalog(unittest.TestCase):
+    def test_catalog_is_synthesized_without_calling_upstream(self):
+        client = proxy.app.test_client()
+
+        def boom(*a, **k):
+            raise AssertionError("chatgpt backend must not GET a models endpoint")
+
+        with patch.object(proxy, "PROXY_BACKEND", "chatgpt"), \
+             patch.object(proxy, "CHATGPT_MODEL_NAME", "gpt-5.6-terra"), \
+             patch.object(proxy.requests, "get", side_effect=boom):
+            resp = client.get("/v1/models")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)["data"]
+        self.assertEqual([m["id"] for m in data], ["gpt-5.6-terra"])
+
+    def test_openai_backend_still_proxies_the_catalog(self):
+        class FakeResp:
+            status_code = 200
+            text = '{"data": [{"id": "upstream-model"}]}'
+            headers = {"Content-Type": "application/json"}
+
+        client = proxy.app.test_client()
+        with patch.object(proxy, "PROXY_BACKEND", "openai"), \
+             patch.object(proxy.requests, "get", return_value=FakeResp()):
+            resp = client.get("/v1/models")
+        self.assertIn("upstream-model", resp.data.decode())
+
+
+class TestChatGPTValidateConfig(unittest.TestCase):
+    def test_chatgpt_requires_only_its_own_three_vars(self):
+        with patch.object(proxy, "PROXY_BACKEND", "chatgpt"), \
+             patch.object(proxy, "CHATGPT_BASE_URL", "https://chat.example.com"), \
+             patch.object(proxy, "CHATGPT_MODEL_NAME", "gpt-5.6-terra"), \
+             patch.object(proxy, "CHATGPT_COOKIE_STRING", "session=abc"), \
+             patch.object(proxy, "PROXY_API_URL", ""), \
+             patch.object(proxy, "PROXY_API_KEY", ""), \
+             patch.object(proxy, "DEFAULT_MODEL_NAME", ""), \
+             patch("sys.stdout", io.StringIO()):
+            proxy._validate_config()  # must not raise SystemExit
+
+    def test_missing_cookie_is_fatal(self):
+        with patch.object(proxy, "PROXY_BACKEND", "chatgpt"), \
+             patch.object(proxy, "CHATGPT_BASE_URL", "https://chat.example.com"), \
+             patch.object(proxy, "CHATGPT_MODEL_NAME", "gpt-5.6-terra"), \
+             patch.object(proxy, "CHATGPT_COOKIE_STRING", ""), \
+             patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                proxy._validate_config()
+
+    def test_unknown_backend_is_fatal(self):
+        with patch.object(proxy, "PROXY_BACKEND", "gemini"), \
+             patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                proxy._validate_config()
+
+    def test_openai_backend_still_requires_its_trio(self):
+        with patch.object(proxy, "PROXY_BACKEND", "openai"), \
+             patch.object(proxy, "PROXY_API_URL", ""), \
+             patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                proxy._validate_config()
+
+
 if __name__ == "__main__":
     unittest.main()
