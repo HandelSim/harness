@@ -246,7 +246,7 @@ if [[ -n "${HARNESS_HOST_MCP_HOSTS:-}" ]]; then
     log "resolved $hm_count host MCP IP(s) from /etc/hosts"
 fi
 
-# --- 10. PROXY_API_URL guardrail (proxy container only) ----------------------
+# --- 10. upstream-URL guardrail (proxy container only) -----------------------
 #
 # The proxy refuses to start if its upstream LLM API hostname is not in the
 # allowlist. Catches the most common misconfiguration before the user sees
@@ -255,8 +255,18 @@ fi
 # whose hostname is not expected to be in the allowlist — those skip the
 # guardrail.
 
-if [[ -n "${PROXY_API_URL:-}" ]]; then
-    api_host=$(echo "$PROXY_API_URL" | awk -F[/:] '{print $4}')
+# The proxy speaks one backend at a time. Under PROXY_BACKEND=chatgpt the
+# upstream is CHATGPT_BASE_URL and PROXY_API_URL is unused, so guard whichever
+# one this proxy will actually call.
+guard_url="${PROXY_API_URL:-}"
+guard_var="PROXY_API_URL"
+if [[ "${PROXY_BACKEND:-}" == "chatgpt" ]]; then
+    guard_url="${CHATGPT_BASE_URL:-}"
+    guard_var="CHATGPT_BASE_URL"
+fi
+
+if [[ -n "$guard_url" ]]; then
+    api_host=$(echo "$guard_url" | awk -F[/:] '{print $4}')
     if [[ -n "$api_host" ]]; then
         # Only enforce for non-intra-cluster hosts. A bare hostname with no
         # dots (mockupstream) is intra-cluster and lives behind the
@@ -264,7 +274,7 @@ if [[ -n "${PROXY_API_URL:-}" ]]; then
         if [[ "$api_host" == *.* ]]; then
             if ! grep -qE "^[[:space:]]*${api_host}([[:space:]]|#|\$)" "$ALLOWLIST_FILE"; then
                 cat >&2 <<EOF
-[harness-firewall] FATAL: PROXY_API_URL hostname '${api_host}' is not in $ALLOWLIST_FILE.
+[harness-firewall] FATAL: ${guard_var} hostname '${api_host}' is not in $ALLOWLIST_FILE.
 [harness-firewall] The proxy cannot reach its upstream. Add it with:
 [harness-firewall]     harness net allow ${api_host}
 [harness-firewall] (or edit <install-root>/.harness-allowlist directly, then 'harness restart').

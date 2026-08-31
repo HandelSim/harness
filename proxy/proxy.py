@@ -29,6 +29,18 @@ Environment variables (see README / .env.example):
                          falls back to this when the request omits a model.
     MODEL_CONTEXT_LENGTH context-window cap for the local token estimate
                          (default 200000; legacy alias OLLAMA_CONTEXT_LENGTH).
+    PROXY_BACKEND        which upstream dialect to speak: "openai" (default)
+                         or "chatgpt". NOT a .env key -- `harness chatgpt`
+                         injects it for one launch. With "chatgpt" the
+                         PROXY_API_* / DEFAULT_MODEL_NAME trio is unused and
+                         the three CHATGPT_* vars below are REQUIRED instead.
+    CHATGPT_BASE_URL     ChatGPT backend-api base URL (REQUIRED for chatgpt).
+                         The stream path, timezone and user agent are
+                         hardcoded; only this base is configurable.
+    CHATGPT_MODEL_NAME   model id the chatgpt backend serves (REQUIRED for
+                         chatgpt). Also the whole synthesized /v1/models list.
+    CHATGPT_COOKIE_STRING  session cookie the chatgpt backend authenticates
+                         with (REQUIRED for chatgpt; secret).
     OUTPUT_DIR           debug-dump directory (optional)
     PROXY_TIMEOUT        upstream request timeout, seconds (default 180)
 """
@@ -104,6 +116,240 @@ def _normalize_api_base(url: str) -> str:
 _API_BASE: str = _normalize_api_base(PROXY_API_URL)
 CHAT_URL: str = f"{_API_BASE}/v1/chat/completions"
 MODELS_URL: str = f"{_API_BASE}/v1/models"
+
+
+# ---------------------------------------------------------------------------
+# Upstream backend selection
+# ---------------------------------------------------------------------------
+#
+# The proxy speaks ONE upstream dialect at a time, chosen by PROXY_BACKEND:
+#
+#   openai   (default) the OpenAI-compatible contract in
+#                      architecture/upstream-api.md: bearer key, POST
+#                      {base}/v1/chat/completions, GET {base}/v1/models.
+#   chatgpt            the ChatGPT web backend-api: cookie auth, one SSE
+#                      stream endpoint, no model catalog.
+#
+# PROXY_BACKEND is NOT a .env key. `harness chatgpt` injects it for a single
+# launch (container mode via the generated compose runtime override, host mode
+# via the proxy's launch env); only the three CHATGPT_* values below live in
+# .env. That keeps the default install byte-identical to before.
+#
+# The client-facing surface is identical either way. proxy.py never streams
+# FROM upstream -- it materializes the whole upstream response, then translates
+# -- so the chatgpt branch only has to hand `catch_all` an OpenAI-shaped dict.
+# Everything downstream (error triage, tool-call extraction, the malformed
+# tool-call retry, the meta-tool loop, the empty-response rescue, both
+# emitters) is dialect-agnostic and untouched.
+PROXY_BACKEND: str = os.environ.get("PROXY_BACKEND", "").strip().lower() or "openai"
+
+CHATGPT_BASE_URL: str = os.environ.get("CHATGPT_BASE_URL", "").strip().rstrip("/")
+CHATGPT_MODEL_NAME: str = os.environ.get("CHATGPT_MODEL_NAME", "").strip()
+CHATGPT_COOKIE_STRING: str = os.environ.get("CHATGPT_COOKIE_STRING", "").strip()
+
+# Hardcoded on purpose: properties of the backend-api dialect, not user
+# configuration. Values match the reference client this port was derived from.
+CHATGPT_STREAM_ENDPOINT: str = "/backend-api/conversation/stream"
+CHATGPT_TIMEZONE: str = "America/Chicago"
+CHATGPT_TIMEZONE_OFFSET_MIN: int = 300
+CHATGPT_USER_AGENT: str = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+)
+CHATGPT_STREAM_URL: str = f"{CHATGPT_BASE_URL}{CHATGPT_STREAM_ENDPOINT}"
+
+# DEFAULT_MODEL_NAME is the openai-backend knob and is neither required nor
+# set on a chatgpt-only install; CHATGPT_MODEL_NAME stands in for it so the
+# request-omits-a-model fallback and the /v1/models catalog agree.
+if PROXY_BACKEND == "chatgpt" and CHATGPT_MODEL_NAME:
+    DEFAULT_MODEL_NAME = CHATGPT_MODEL_NAME
+
+
+class _SyntheticResponse:
+    """Minimal `requests.Response` stand-in for a non-OpenAI backend.
+
+    Every upstream POST site consumes exactly `.status_code`, `.text` and
+    `.json()`. Handing them one of these lets a backend with a different wire
+    format reuse the entire downstream pipeline unchanged, so adding a dialect
+    costs one function instead of a second copy of `catch_all`.
+    """
+
+    def __init__(self, status_code: int, body: Dict[str, Any]) -> None:
+        self.status_code = status_code
+        self._body = body
+        self.text = json.dumps(body)
+        self.headers: Dict[str, str] = {"Content-Type": "application/json"}
+
+    def json(self) -> Dict[str, Any]:
+        return self._body
+
+
+_CHATGPT_ROLE_LABELS = {
+    "system": "System",
+    "user": "User",
+    "assistant": "Assistant",
+    "tool": "Tool",
+}
+
+
+def _chatgpt_flatten_messages(messages: List[Dict[str, Any]]) -> str:
+    """Render the translated OpenAI history as the single user turn the
+    backend-api takes.
+
+    The backend-api keeps conversation state server-side (conversation_id /
+    parent_message_id) and expects only the newest turn. This proxy is
+    stateless and re-sends the full history on every request, so reusing that
+    state would duplicate the transcript. Starting a fresh conversation per
+    request and carrying the whole history in one user message is exactly the
+    shape the reference client verified; a multi-message array is not, and if
+    the endpoint honored only its last entry the history loss would be silent.
+    A single-message history is passed through verbatim so the common
+    first-turn case is byte-identical to the reference client.
+    """
+    parts: List[Tuple[str, str]] = []
+    for m in messages:
+        text = _flatten_content_to_str(m.get("content", "") or "")
+        if not text.strip():
+            continue
+        role = str(m.get("role", "user")).strip().lower()
+        parts.append((_CHATGPT_ROLE_LABELS.get(role, role.title() or "User"), text))
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0][1]
+    return "\n\n".join(f"{label}: {text}" for label, text in parts)
+
+
+def _chatgpt_collect_stream(resp: Any) -> str:
+    """Consume the backend-api SSE stream into the complete assistant text.
+
+    Two delta shapes are emitted and both are handled, mirroring the reference
+    client: incremental `{"type": "message_delta", "delta": "..."}` events, and
+    `message.content.parts` snapshots that are CUMULATIVE (each event repeats
+    everything so far), from which only the newly added suffix is taken.
+    """
+    text = ""
+    for raw in resp.iter_lines():
+        if not raw:
+            continue
+        line = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else raw
+        if not line.startswith("data: "):
+            continue
+        chunk = line[6:].strip()
+        if chunk == "[DONE]":
+            break
+        try:
+            data = json.loads(chunk)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("type") == "message_delta":
+            delta = data.get("delta")
+            if isinstance(delta, str):
+                text += delta
+            continue
+        message = data.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, dict):
+            continue
+        chunk_parts = content.get("parts") or []
+        if not isinstance(chunk_parts, list):
+            continue
+        snapshot = "".join(p for p in chunk_parts if isinstance(p, str))
+        if len(snapshot) > len(text):
+            text = snapshot
+    return text
+
+
+def _chatgpt_post(payload: Dict[str, Any]) -> _SyntheticResponse:
+    """Run one chat turn against the ChatGPT backend-api and return it in the
+    OpenAI chat-completion shape the rest of the proxy expects."""
+    model = CHATGPT_MODEL_NAME or payload.get("model") or ""
+    body = {
+        "action": "next",
+        "model": model,
+        "timezone_offset_min": CHATGPT_TIMEZONE_OFFSET_MIN,
+        "timezone": CHATGPT_TIMEZONE,
+        "messages": [
+            {
+                "author": {"role": "user"},
+                "content": {
+                    "content_type": "text",
+                    "parts": [_chatgpt_flatten_messages(payload.get("messages") or [])],
+                },
+            }
+        ],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": CHATGPT_USER_AGENT,
+        "Origin": CHATGPT_BASE_URL,
+        "Referer": f"{CHATGPT_BASE_URL}/",
+        "Cookie": CHATGPT_COOKIE_STRING,
+    }
+    resp = requests.post(
+        CHATGPT_STREAM_URL,
+        headers=headers,
+        json=body,
+        verify=False,
+        timeout=PROXY_TIMEOUT,
+        stream=True,
+    )
+    try:
+        if resp.status_code >= 400:
+            # Surface the upstream body so a stale cookie (the expected
+            # failure) reaches the caller's error path instead of a bare code.
+            try:
+                detail = resp.text[:2000]
+            except Exception:
+                detail = ""
+            return _SyntheticResponse(
+                resp.status_code,
+                {"error": {"message": detail or f"chatgpt backend returned {resp.status_code}",
+                           "type": "chatgpt_backend_error"}},
+            )
+        text = _chatgpt_collect_stream(resp)
+    finally:
+        resp.close()
+    return _SyntheticResponse(
+        200,
+        {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(datetime.datetime.now().timestamp()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {},
+        },
+    )
+
+
+def _upstream_post(headers: Dict[str, str], payload: Dict[str, Any]) -> Any:
+    """The single outbound chat call, routed to the configured backend.
+
+    Returns a `requests.Response` for the openai backend and a
+    `_SyntheticResponse` for chatgpt; callers only touch `.status_code`,
+    `.text` and `.json()`, which both provide.
+    """
+    if PROXY_BACKEND == "chatgpt":
+        return _chatgpt_post(payload)
+    return requests.post(
+        CHAT_URL,
+        headers=headers,
+        json=payload,
+        verify=False,
+        timeout=PROXY_TIMEOUT,
+    )
 
 
 _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
@@ -1932,13 +2178,7 @@ def _retry_upstream_with_correction(
     save_debug_file(req_id, "02", "API_Retry_Request", retry_payload)
 
     try:
-        resp = requests.post(
-            CHAT_URL,
-            headers=headers,
-            json=retry_payload,
-            verify=False,
-            timeout=PROXY_TIMEOUT,
-        )
+        resp = _upstream_post(headers, retry_payload)
     except requests.RequestException as e:
         print(f"[{req_id}] retry upstream request failed: {e}", flush=True)
         save_debug_file(req_id, "03", "API_Retry_Error", {"error": str(e)})
@@ -2110,10 +2350,7 @@ def _serve_meta_tools(
             payload["tools"] = tools
         save_debug_file(req_id, "02", f"API_ToolSearch_Request_{attempt:02d}", payload)
         try:
-            resp = requests.post(
-                CHAT_URL, headers=headers, json=payload,
-                verify=False, timeout=PROXY_TIMEOUT,
-            )
+            resp = _upstream_post(headers, payload)
         except requests.RequestException as e:
             print(f"[{req_id}] tool-search upstream request failed: {e}", flush=True)
             save_debug_file(req_id, "03", f"API_ToolSearch_Error_{attempt:02d}", {"error": str(e)})
@@ -2209,6 +2446,16 @@ def list_models() -> Response:
     which would otherwise treat the GET as a (body-less) chat request.
     """
     req_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    # The chatgpt backend-api has no catalog endpoint. Synthesize a one-entry
+    # list from CHATGPT_MODEL_NAME so opencode's model dropdown (built from
+    # this route) offers exactly the model that backend will actually serve.
+    if PROXY_BACKEND == "chatgpt":
+        body = {
+            "object": "list",
+            "data": [{"id": CHATGPT_MODEL_NAME, "object": "model", "owned_by": "chatgpt"}],
+        }
+        print(f"[{req_id}] GET /v1/models -> synthesized chatgpt catalog", flush=True)
+        return Response(json.dumps(body), status=200, mimetype="application/json")
     headers = {"Authorization": f"Bearer {PROXY_API_KEY}"}
     try:
         resp = requests.get(
@@ -2300,13 +2547,7 @@ def catch_all(path: str) -> Response:
         }
 
         try:
-            resp = requests.post(
-                CHAT_URL,
-                headers=headers,
-                json=upstream_payload,
-                verify=False,
-                timeout=PROXY_TIMEOUT,
-            )
+            resp = _upstream_post(headers, upstream_payload)
         except requests.RequestException as e:
             print(f"[{req_id}] upstream request failed: {e}", flush=True)
             save_debug_file(req_id, "03", "API_Error", {"error": str(e)})
@@ -2524,13 +2765,31 @@ def _redact_key(key: str) -> str:
 
 
 def _validate_config() -> None:
+    if PROXY_BACKEND not in ("openai", "chatgpt"):
+        print(
+            f"[!] FATAL: unknown PROXY_BACKEND '{PROXY_BACKEND}' "
+            "(expected 'openai' or 'chatgpt')",
+            flush=True,
+        )
+        sys.exit(1)
+
     missing = []
-    if not PROXY_API_URL:
-        missing.append("PROXY_API_URL")
-    if not PROXY_API_KEY:
-        missing.append("PROXY_API_KEY")
-    if not DEFAULT_MODEL_NAME:
-        missing.append("DEFAULT_MODEL_NAME")
+    if PROXY_BACKEND == "chatgpt":
+        # Cookie auth against a fixed stream endpoint; the openai-backend
+        # PROXY_API_* / DEFAULT_MODEL_NAME trio is unused and not required.
+        if not CHATGPT_BASE_URL:
+            missing.append("CHATGPT_BASE_URL")
+        if not CHATGPT_MODEL_NAME:
+            missing.append("CHATGPT_MODEL_NAME")
+        if not CHATGPT_COOKIE_STRING:
+            missing.append("CHATGPT_COOKIE_STRING")
+    else:
+        if not PROXY_API_URL:
+            missing.append("PROXY_API_URL")
+        if not PROXY_API_KEY:
+            missing.append("PROXY_API_KEY")
+        if not DEFAULT_MODEL_NAME:
+            missing.append("DEFAULT_MODEL_NAME")
     if missing:
         print(f"[!] FATAL: required env vars missing or empty: {', '.join(missing)}", flush=True)
         sys.exit(1)
@@ -2595,14 +2854,27 @@ def main() -> None:
     else:
         output_status = f"enabled at '{_OUTPUT_DIR}'"
 
+    # Backend-aware banner lines. The chatgpt cookie is never partially
+    # printed the way _redact_key prints a bearer key: a cookie's leading
+    # bytes carry session structure, so only its length is reported.
+    if PROXY_BACKEND == "chatgpt":
+        banner_chat_url = CHATGPT_STREAM_URL
+        banner_models_url = "(synthesized from CHATGPT_MODEL_NAME)"
+        banner_auth = f"cookie (set, {len(CHATGPT_COOKIE_STRING)} chars)"
+    else:
+        banner_chat_url = CHAT_URL
+        banner_models_url = MODELS_URL
+        banner_auth = _redact_key(PROXY_API_KEY)
+
     print(
         "============================================================\n"
         " harness translating proxy\n"
         f"   listening on:   {PROXY_HOST}:{PROXY_PORT}\n"
-        f"   chat URL:       {CHAT_URL}\n"
-        f"   models URL:     {MODELS_URL}\n"
+        f"   backend:        {PROXY_BACKEND}\n"
+        f"   chat URL:       {banner_chat_url}\n"
+        f"   models URL:     {banner_models_url}\n"
         f"   default model:  {DEFAULT_MODEL_NAME}\n"
-        f"   upstream key:   {_redact_key(PROXY_API_KEY)}\n"
+        f"   upstream auth:  {banner_auth}\n"
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"

@@ -36,6 +36,17 @@ services:
       PROXY_HOST: ${PROXY_HOST:-0.0.0.0}
       PROXY_PORT: ${PROXY_PORT:-8000}
       PROXY_TIMEOUT: ${PROXY_TIMEOUT:-180}
+      # ChatGPT backend-api config, used ONLY when the proxy runs with
+      # PROXY_BACKEND=chatgpt. That switch is never a .env key: `harness
+      # chatgpt` injects it through the generated compose runtime override
+      # (state/.harness-runtime.yml) for a single launch, exactly like
+      # --prompt-mode. These three are inert on a normal launch, so an install
+      # that never uses the backend is unaffected by their presence. The
+      # firewall init-script also reads CHATGPT_BASE_URL to enforce the
+      # allowlist guardrail against the right host.
+      CHATGPT_BASE_URL: ${CHATGPT_BASE_URL:-}
+      CHATGPT_MODEL_NAME: ${CHATGPT_MODEL_NAME:-}
+      CHATGPT_COOKIE_STRING: ${CHATGPT_COOKIE_STRING:-}
       # OUTPUT_DIR is optional — empty by default (no debug dumps).
       # Users opt in by setting OUTPUT_DIR=/output in .env, then bind-mount
       # the host path of their choice via the volume below.

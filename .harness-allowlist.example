@@ -34,6 +34,10 @@ objects.githubusercontent.com
 # api.openai.com
 # generativelanguage.googleapis.com
 
+# If you use `harness chatgpt`, the host portion of CHATGPT_BASE_URL must be
+# here too — the firewall guards whichever upstream the proxy was started for.
+# `harness config set CHATGPT_BASE_URL <url>` adds it for you.
+
 # === ADD YOUR SELF-HOSTED GIT REMOTES HERE (with `# git-push` if needed) ===
 # my-gitlab.example.com   # git-push
 # git.internal.corp       # git-push

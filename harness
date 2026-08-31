@@ -80,6 +80,13 @@ runtime_override="$state_root/.harness-runtime.yml"
 # the proxy to its built-in "hybrid" default. See _parse_prompt_mode_flag.
 prompt_mode_override=""
 
+# Which upstream dialect the proxy speaks for THIS invocation. Empty leaves the
+# proxy on its built-in "openai" default (the OpenAI-compatible contract);
+# `harness chatgpt` sets it to "chatgpt" and it is injected as PROXY_BACKEND
+# into the proxy env (container: write_runtime_override; host: host_proxy_start).
+# Never persisted and never a .env key — only the three CHATGPT_* values are.
+backend_override=""
+
 # Universal egress firewall allowlist. Bind-mounted into every harness
 # container at /etc/harness/allowlist. install.sh seeds this from
 # .harness-allowlist.example on a fresh install. Tests can override by
@@ -148,6 +155,25 @@ unset _harness_proxy_keys _k _sv
 # default.
 # See architecture/harness-cli.md (Env loading).
 agent_model="${DEFAULT_MODEL_NAME:-}"
+
+# True when this invocation targets the ChatGPT backend-api instead of the
+# OpenAI-compatible upstream. The two use disjoint config: PROXY_API_URL /
+# PROXY_API_KEY / DEFAULT_MODEL_NAME vs CHATGPT_BASE_URL / CHATGPT_COOKIE_STRING
+# / CHATGPT_MODEL_NAME, so every gate keyed on the former has to defer here.
+_backend_is_chatgpt() {
+    [[ "$backend_override" == "chatgpt" ]]
+}
+
+# The model id opencode should default to for this launch. Each backend carries
+# its own model var; there is no shared one, because the ids are drawn from
+# different catalogs.
+_effective_default_model() {
+    if _backend_is_chatgpt; then
+        printf '%s' "${CHATGPT_MODEL_NAME:-}"
+    else
+        printf '%s' "${DEFAULT_MODEL_NAME:-}"
+    fi
+}
 
 # --- net helpers (lazy load) ------------------------------------------------
 #
@@ -561,7 +587,11 @@ require_runtime_config() {
 
     local missing=()
     local v
-    for v in PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME; do
+    local -a required=(PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME)
+    if _backend_is_chatgpt; then
+        required=(CHATGPT_BASE_URL CHATGPT_MODEL_NAME CHATGPT_COOKIE_STRING)
+    fi
+    for v in "${required[@]}"; do
         local val="${!v:-}"
         if [[ -z "$val" ]]; then
             missing+=("$v")
@@ -817,7 +847,7 @@ mcp_set_enabled() {
 # `harness net open/close` propagates immediately on the next
 # `harness start` / `harness restart`.
 #
-# Two pieces of state can land in the override:
+# Three pieces of state can land in the override:
 #   1. .harness-net-overrides.json — per-service `firewall_disabled: true`
 #      becomes an environment block on that service that the firewall
 #      init-script honors as an opt-out.
@@ -825,8 +855,11 @@ mcp_set_enabled() {
 #      start/restart invocation, injected as PROXY_PROMPT_MODE on the proxy
 #      service. Folded into the proxy block from (1) when proxy also has a
 #      firewall opt-out, so only one `proxy:` mapping is emitted.
+#   3. backend_override — the upstream dialect for this launch, injected as
+#      PROXY_BACKEND on the proxy service. Set only by `harness chatgpt`;
+#      folded into the same single `proxy:` mapping as (2).
 #
-# When both are empty the override file is removed entirely (compose
+# When all are empty the override file is removed entirely (compose
 # is invoked without the -f flag). This keeps `harness start` exactly as it
 # was for installs that don't use any of these features.
 write_runtime_override() {
@@ -873,6 +906,10 @@ write_runtime_override() {
                 body+="      PROXY_PROMPT_MODE: \"${prompt_mode_override}\""$'\n'
                 proxy_emitted=1
             fi
+            if [[ "$svc" == "proxy" && -n "$backend_override" ]]; then
+                body+="      PROXY_BACKEND: \"${backend_override}\""$'\n'
+                proxy_emitted=1
+            fi
         done < <(harness_jq -r '
             (.services // {})
             | to_entries[]
@@ -885,10 +922,15 @@ write_runtime_override() {
     # Injected into the proxy container env for this launch only. If the
     # firewall loop above already emitted a `proxy:` block we appended it
     # there; otherwise emit a standalone block here.
-    if [[ -n "$prompt_mode_override" && "$proxy_emitted" -eq 0 ]]; then
+    if [[ ( -n "$prompt_mode_override" || -n "$backend_override" ) && "$proxy_emitted" -eq 0 ]]; then
         body+="  proxy:"$'\n'
         body+="    environment:"$'\n'
-        body+="      PROXY_PROMPT_MODE: \"${prompt_mode_override}\""$'\n'
+        if [[ -n "$prompt_mode_override" ]]; then
+            body+="      PROXY_PROMPT_MODE: \"${prompt_mode_override}\""$'\n'
+        fi
+        if [[ -n "$backend_override" ]]; then
+            body+="      PROXY_BACKEND: \"${backend_override}\""$'\n'
+        fi
     fi
 
     if [[ -z "$body" ]]; then
@@ -967,10 +1009,36 @@ services_up() {
     return 0
 }
 
+# Echo the PROXY_BACKEND the RUNNING proxy container was started with, or
+# "openai" when it carries none (the default, and every container built before
+# the chatgpt backend existed). Empty output and rc 1 when no proxy is running.
+_running_proxy_backend() {
+    local proxy_id val
+    proxy_id=$(compose ps -q proxy 2>/dev/null || true)
+    [[ -n "$proxy_id" ]] || return 1
+    val=$(harness_docker inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' "$proxy_id" 2>/dev/null \
+        | sed -n 's/^PROXY_BACKEND=//p' | tail -n1)
+    val=${val%$'\r'}
+    printf '%s' "${val:-openai}"
+}
+
 # Bring services up if they aren't already. Used before launching agents.
+#
+# The proxy is a single shared service that speaks ONE upstream dialect at a
+# time, and this function is a no-op when it is already up — so switching
+# between `harness` and `harness chatgpt` would otherwise silently keep serving
+# the previous backend. Restart the stack when the running proxy's backend
+# differs from this launch's. Restarting is disruptive to a concurrent agent on
+# the other backend, but there is only one proxy: sharing it across dialects is
+# not possible, and quietly answering from the wrong upstream is worse.
 ensure_services_up() {
+    local want="${backend_override:-openai}" have
     if ! services_up; then
         echo "harness: services not running; starting..."
+        cmd_start
+    elif have=$(_running_proxy_backend) && [[ "$have" != "$want" ]]; then
+        echo "harness: proxy is running the '$have' backend; restarting it for '$want'"
         cmd_start
     fi
     # Reconcile host MCPs on every launch (idempotent): a host MCP may have been
@@ -1311,6 +1379,11 @@ _gate_on_upstream_auth() {
     if [[ "${HARNESS_SKIP_AUTH_PROBE:-0}" == "1" ]]; then
         return 0
     fi
+    # The chatgpt backend authenticates with a session cookie against a stream
+    # endpoint, not a bearer key against /v1/chat/completions. There is nothing
+    # this probe can validate and no unlock URL to surface; a stale cookie shows
+    # up as the proxy's first upstream error instead.
+    _backend_is_chatgpt && return 0
     local probe_rc=0
     _probe_upstream_auth || probe_rc=$?
     if (( probe_rc == 1 )); then
@@ -1328,6 +1401,9 @@ _gate_on_upstream_auth() {
 # bypasses it.
 _print_upstream_models() {
     [[ "${HARNESS_SKIP_AUTH_PROBE:-0}" == "1" ]] && return 0
+    # The chatgpt backend-api has no catalog endpoint; the proxy synthesizes a
+    # one-entry /v1/models from CHATGPT_MODEL_NAME. Nothing to fetch.
+    _backend_is_chatgpt && return 0
     [[ -z "${PROXY_API_URL:-}" || -z "${PROXY_API_KEY:-}" ]] && return 0
     command -v curl >/dev/null 2>&1 || return 0
 
@@ -1421,14 +1497,18 @@ HARNESS_EXTRA_MOUNTS|sticky extra bind-mounts for agent launches (colon-separate
 HTTP_PROXY|corporate HTTP proxy for host-side git/pulls
 HTTPS_PROXY|corporate HTTPS proxy for host-side git/pulls
 NO_PROXY|comma-separated hosts that bypass the proxy
+CHATGPT_BASE_URL|ChatGPT backend-api base URL, used only by 'harness chatgpt'
+CHATGPT_MODEL_NAME|model id the ChatGPT backend serves (e.g. gpt-5.6-terra)
+CHATGPT_COOKIE_STRING|ChatGPT session cookie (secret; shown masked)
 EOF
 }
 
-# A value for a secret-ish key (name contains KEY/SECRET/TOKEN/PASSWORD) is
-# shown as "(set, N chars)" rather than printed in the clear.
+# A value for a secret-ish key (name contains KEY/SECRET/TOKEN/PASSWORD/COOKIE)
+# is shown as "(set, N chars)" rather than printed in the clear. COOKIE is here
+# for CHATGPT_COOKIE_STRING, which is a full session credential.
 _config_is_secret() {
     case "$1" in
-        *KEY*|*SECRET*|*TOKEN*|*PASSWORD*) return 0 ;;
+        *KEY*|*SECRET*|*TOKEN*|*PASSWORD*|*COOKIE*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1545,7 +1625,9 @@ _config_set() {
     local value="$*"
     _config_write_key "$key" "$value" || return 1
     echo "harness: set $key in $env_file"
-    [[ "$key" == "PROXY_API_URL" ]] && _config_sync_allowlist_from_url "$value"
+    case "$key" in
+        PROXY_API_URL|CHATGPT_BASE_URL) _config_sync_allowlist_from_url "$value" ;;
+    esac
     return 0
 }
 
@@ -1604,7 +1686,9 @@ _config_picker() {
     [[ -n "$newval" ]] || { echo "unchanged."; return 0; }
     _config_write_key "$sel" "$newval" || return 1
     echo "harness: set $sel in $env_file"
-    [[ "$sel" == "PROXY_API_URL" ]] && _config_sync_allowlist_from_url "$newval"
+    case "$sel" in
+        PROXY_API_URL|CHATGPT_BASE_URL) _config_sync_allowlist_from_url "$newval" ;;
+    esac
     return 0
 }
 
@@ -1874,6 +1958,14 @@ commands:
                         (Git Bash). Interactive runs stop the proxy on exit; -p
                         leaves it up (stop it with 'harness host down'). See
                         'harness host --help'.
+  chatgpt [host] [args] launch against the ChatGPT backend-api instead of the
+                        OpenAI-compatible upstream. Reads CHATGPT_BASE_URL,
+                        CHATGPT_MODEL_NAME and CHATGPT_COOKIE_STRING from .env
+                        (PROXY_API_* and DEFAULT_MODEL_NAME are unused). Bare
+                        'harness chatgpt' is the containerized launch; add
+                        'host' for the containerless one. The proxy serves one
+                        backend at a time, so switching restarts it. See
+                        'harness chatgpt --help'.
   shell [--mount PATH]... drop into a bash shell inside the agent container
                         (for installing skills, debugging — shares the home
                         directory with agent launches)
@@ -3284,9 +3376,11 @@ host_opencode_dir() { printf '%s/host/toolchain/opencode' "$state_root"; } # npm
 # makes deps-change-restart self-contained and independent of that contract.)
 host_proxy_fingerprint() {
     local data
-    data=$(printf 'port=%s\nurl=%s\nkey=%s\nmodel=%s\noutput=%s\nreqs=%s\n' \
+    data=$(printf 'port=%s\nurl=%s\nkey=%s\nmodel=%s\noutput=%s\nbackend=%s\ncgurl=%s\ncgmodel=%s\ncgcookie=%s\nreqs=%s\n' \
         "$(host_proxy_port)" "${PROXY_API_URL:-}" "${PROXY_API_KEY:-}" \
         "${DEFAULT_MODEL_NAME:-}" "${OUTPUT_DIR:-}" \
+        "${backend_override:-openai}" "${CHATGPT_BASE_URL:-}" \
+        "${CHATGPT_MODEL_NAME:-}" "${CHATGPT_COOKIE_STRING:-}" \
         "$(cat "$clone_dir/proxy/requirements.txt" 2>/dev/null)")
     if command -v sha256sum >/dev/null 2>&1; then
         printf '%s' "$data" | sha256sum | cut -d' ' -f1
@@ -3705,7 +3799,11 @@ host_require_config() {
         exit 1
     fi
     local missing=() v
-    for v in PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME; do
+    local -a required=(PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME)
+    if _backend_is_chatgpt; then
+        required=(CHATGPT_BASE_URL CHATGPT_MODEL_NAME CHATGPT_COOKIE_STRING)
+    fi
+    for v in "${required[@]}"; do
         [[ -z "${!v:-}" ]] && missing+=("$v")
     done
     if (( ${#missing[@]} > 0 )); then
@@ -3879,6 +3977,7 @@ host_proxy_start() {
     PROXY_HOST=127.0.0.1 \
         HARNESS_FORCE_LOOPBACK=1 \
         PROXY_PORT="$port" \
+        PROXY_BACKEND="${backend_override:-}" \
         OUTPUT_DIR="$host_output_dir" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
         HARNESS_REMINDER_PATH="$host_reminder" \
@@ -3963,7 +4062,7 @@ host_write_opencode_config() {
     mkdir -p "$(dirname "$config_file")"
     port=$(host_proxy_port)
     proxy_url="http://127.0.0.1:${port}/v1"
-    default_model="${DEFAULT_MODEL_NAME:-}"
+    default_model=$(_effective_default_model)
     ctx="${MODEL_CONTEXT_LENGTH:-${OLLAMA_CONTEXT_LENGTH:-200000}}"
 
     local model_ids=() catalog
@@ -4252,6 +4351,69 @@ cmd_host_down() {
     else
         echo "[harness] host mode: no proxy running" >&2
     fi
+}
+
+# `harness chatgpt [host] [args]` — run a launch against the ChatGPT
+# backend-api instead of the OpenAI-compatible upstream.
+#
+# This is a thin front-door, not a parallel launch path: it sets the
+# backend_override global and then delegates to the exact same code the
+# default launch uses (run_agent for container mode, cmd_host for host mode).
+# Everything the backend changes is downstream of that global:
+#
+#   * require_runtime_config / host_require_config demand the three CHATGPT_*
+#     values instead of the PROXY_API_* / DEFAULT_MODEL_NAME trio,
+#   * the bearer-key auth probe and the upstream model pull are skipped (the
+#     backend-api has neither a probe endpoint nor a catalog),
+#   * PROXY_BACKEND=chatgpt reaches the proxy — via the generated compose
+#     runtime override in container mode, via the launch env in host mode —
+#     and proxy.py speaks the backend-api dialect for that process,
+#   * opencode's default model comes from CHATGPT_MODEL_NAME.
+#
+# The proxy serves one dialect at a time, so ensure_services_up restarts a
+# container-mode proxy that is running the other backend, and
+# host_proxy_fingerprint covers the same switch in host mode.
+cmd_chatgpt() {
+    case "${1:-}" in
+        -h|--help|help)
+            cat <<'EOF'
+harness chatgpt — launch against the ChatGPT backend-api
+
+usage:
+  harness chatgpt [args]        containerized agent (same as bare 'harness',
+                                but the proxy talks to the ChatGPT backend-api)
+  harness chatgpt host [args]   CONTAINERLESS (same as 'harness host')
+  harness chatgpt host down     stop the host-mode proxy
+
+Config (.env) — these three replace PROXY_API_URL / PROXY_API_KEY /
+DEFAULT_MODEL_NAME for this backend; nothing else is configurable:
+  CHATGPT_BASE_URL       backend-api base URL
+  CHATGPT_MODEL_NAME     model id to request (also the whole model dropdown)
+  CHATGPT_COOKIE_STRING  session cookie (secret)
+
+The stream path (/backend-api/conversation/stream), timezone and user agent
+are hardcoded. 'harness config set CHATGPT_BASE_URL <url>' also allowlists the
+host for the container-mode egress firewall.
+
+Notes:
+  * The proxy speaks ONE backend at a time. Switching between 'harness' and
+    'harness chatgpt' restarts it, which drops any agent using the other one.
+  * The backend-api keeps conversation state server-side; this proxy is
+    stateless, so each request opens a fresh conversation carrying the full
+    translated history. Tool use, prompt modes and MCPs work as usual.
+  * Accepts --yolo, -p/--print, --net and --mount like a normal launch.
+EOF
+            return 0
+            ;;
+    esac
+
+    backend_override="chatgpt"
+    agent_model=$(_effective_default_model)
+
+    case "${1:-}" in
+        host) shift; cmd_host "$@" ;;
+        *)    run_agent opencode "$@" ;;
+    esac
 }
 
 # Run an opencode agent in the current directory.
@@ -8009,6 +8171,7 @@ main() {
         logs)                       cmd_logs "$@" ;;
         opencode)                   run_agent opencode "$@" ;;
         host)                       cmd_host "$@" ;;
+        chatgpt)                    cmd_chatgpt "$@" ;;
         shell)                      cmd_shell "$@" ;;
         list)                       cmd_list ;;
         stop)                       cmd_stop "$@" ;;
