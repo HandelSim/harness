@@ -2056,9 +2056,11 @@ commands:
                         CHATGPT_MODEL_NAME and CHATGPT_COOKIE_STRING from .env
                         (PROXY_API_* and DEFAULT_MODEL_NAME are unused). Bare
                         'harness chatgpt' is the containerized launch; add
-                        'host' for the containerless one. The proxy serves one
-                        backend at a time, so switching restarts it. See
-                        'harness chatgpt --help'.
+                        'host' for the containerless one. 'harness chatgpt
+                        doctor|preflight' runs those diagnostics against this
+                        backend's config. The proxy serves one backend at a
+                        time, so switching restarts it, as does rotating the
+                        cookie. See 'harness chatgpt --help'.
   shell [--mount PATH]... drop into a bash shell inside the agent container
                         (for installing skills, debugging — shares the home
                         directory with agent launches)
