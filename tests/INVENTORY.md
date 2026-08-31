@@ -12,6 +12,7 @@ This document enumerates every atomic, testable behavior of the harness project.
 - **O###** — *(retired — the proxy now serves the OpenAI-compatible interface directly; the separate container is gone)*
 - **I###** — Installer (`harness-install.sh`)
 - **Ho###** — Host mode, containerless (`harness host`, the `host_*` helpers)
+- **B###** — Bootstrap (`harness-bootstrap.sh`, the version-stable fetch/handoff entrypoint)
 - **C###** — ChatGPT backend, CLI side (`harness chatgpt`, backend selection, per-backend config/fingerprint/dispatch helpers in the `harness` wrapper)
 
 Rows are intended to be atomic: one behavior, one row. Compound behaviors are split.
@@ -235,7 +236,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P053 | Tool-result messages in the inbound payload are translated into user-role text, wrapped verbatim in `<<<BEGIN_TOOL_RESULT>>>` markers (content never parsed; agent-agnostic) |
 | P054 | The cooperative prompt instructs the model to use ```json fenced blocks for tool calls |
 | P055 | The cooperative prompt enumerates available tools by name and schema |
-| P056 | Proxy forwards the inbound (requested) model to upstream, stripping a `:latest` tag; falls back to `DEFAULT_MODEL_NAME` only when the request omits a model |
+| P056 | Proxy forwards the inbound (requested) model to upstream VERBATIM (no tag stripping — `gpt-4:latest` goes out as `gpt-4:latest`); falls back to `DEFAULT_MODEL_NAME` only when the request omits a model |
 | P057 | Tool-result name is resolved from metadata: explicit `tool_name`/`name` field, else `tool_call_id` correlated to the assistant `tool_calls`, else positional order, else `unknown_tool` |
 | P058 | Hybrid mode echoes the full description of the project-managed `_HYBRID_DETAIL_TOOLS` constant (`["task","skill"]`, not an env var) into the recency reminder in `<<<BEGIN_TOOL_DETAIL>>>` blocks; only present, non-empty-description tools surface |
 | P059 | The hybrid recency reminder advises the model to default to the listed tools over doing the work by hand, with concrete examples (`webfetch` vs curl/Python, `todowrite`/`todoread` vs a todo file) |
@@ -261,6 +262,16 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | P079 | The chatgpt backend only replaces the outbound call: end-to-end through `/v1/chat/completions`, a plain chatgpt-backend answer reaches the client, cooperative fenced tool calls are still extracted, and an upstream error becomes a 502 |
 | P080 | `GET /v1/models` on the chatgpt backend synthesizes a one-model catalog from `CHATGPT_MODEL_NAME` without calling upstream; the openai backend still proxies the real upstream catalog |
 | P081 | `_validate_config` for `PROXY_BACKEND=chatgpt` requires only `CHATGPT_BASE_URL`/`CHATGPT_MODEL_NAME`/`CHATGPT_COOKIE_STRING` (not the openai `PROXY_API_*`/`DEFAULT_MODEL_NAME` trio); a missing cookie is fatal, an unknown `PROXY_BACKEND` value is fatal, and the openai backend still requires its own trio |
+| P082 | `_chatgpt_collect_stream` accepts `data:` with no following space as a valid SSE event (`data:{...}` is legal SSE; a `startswith("data: ")` test dropped it silently) |
+| P083 | `_chatgpt_collect_stream` returns `(text, events, prefix)` — the event COUNT distinguishes "this 200 was not an event stream at all" (zero events) from "the model genuinely said nothing" (events seen, empty text) |
+| P084 | A snapshot event whose `message.author.role` is not `assistant` cannot clobber the accumulated answer (blind "longest wins" let a long tool/reasoning message replace the real reply) |
+| P085 | A snapshot event whose `message.content.content_type` is not `text` (e.g. `thoughts`) is skipped |
+| P086 | An unlabelled snapshot — no `author.role` and no `content_type` — is still accepted (the reference client filtered on neither, so dropping these would break the shape it verified) |
+| P087 | `_chatgpt_post` passes `allow_redirects=False` and surfaces a 3xx as a 502 naming the `Location`, rather than following it: `requests` strips the `Cookie` header across a redirect and turns the POST into a GET, so a followed redirect arrives unauthenticated |
+| P088 | A 200 that is not an event stream (a login/interstitial page) is a 502 naming the response prefix, not an empty completion — an empty completion drove the agent into its empty-response rescue loop |
+| P089 | A stream that genuinely produced events but no text is still a 200 with an empty assistant message (not conflated with P088's zero-event case) |
+| P090 | `_chatgpt_origin()` is computed per call from `CHATGPT_BASE_URL` (so it tracks a changed base URL) and strips any path prefix: `https://chat.example.com/api` yields `Origin: https://chat.example.com` and `Referer: https://chat.example.com/` |
+| P091 | `PROXY_PROMPT_MODE=passthrough` is fatal on the chatgpt backend (`_validate_config` exits) because the backend-api dialect has no tools field — passthrough would silently drop every tool schema and tool result; the openai backend still accepts it |
 
 ---
 
@@ -369,6 +380,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | N028 | `netlib_add_host` writes via atomic `mktemp + mv` to prevent partial allowlist files |
 | N029 | `netlib_add_host` upgrading from pull to push rewrites the line with `# git-push` annotation |
 | N030 | `netlib_remove_host` removes the entire line including any inline annotation |
+| N031 | `init-firewall.sh` is FATAL when the active upstream URL var is set but no hostname parses out of it (a scheme-less value such as `api.example.com/v1`): it names the variable and the `harness config set <var> <url>` fix and exits 1, instead of silently skipping the allowlist guard and failing later with an opaque connect error |
 
 ---
 
@@ -566,4 +578,12 @@ proxy-side ChatGPT backend-api translation lives under P065–P081.)
 | C023 | `cmd_chatgpt host …` selects the chatgpt backend and delegates the remaining args to `cmd_host` |
 | C024 | `harness chatgpt` is wired into `main()`'s top-level command dispatch |
 | C025 | `harness chatgpt [host] [args]` is documented in `cmd_help` |
-| C026 | `_config_write_key` double-quotes any value that is not a bare word, so a `CHATGPT_COOKIE_STRING` carrying `; ` separators round-trips and the rewritten `.env` still sources cleanly under `set -euo pipefail`; bare values stay unquoted |
+| C026 | `_config_write_key` quotes any value that is not a bare word, so a `CHATGPT_COOKIE_STRING` carrying `; ` separators round-trips and the rewritten `.env` still sources cleanly under `set -euo pipefail`; bare values stay unquoted |
+| C027 | `_config_write_key` prefers SINGLE quotes for a non-bare-word value (a single-quoted value is literal to both bash and compose's dotenv parser — no escape processing, no `${...}` interpolation), and falls back to double quotes plus backslash-escaping of backslash, `$`, backtick and `"` only when the value itself contains a single quote |
+| C028 | `_config_read_key` is the exact inverse of `_config_write_key`: it strips ONE matched surrounding quote pair, unwrapping a single-quoted value literally and undoing the backslash, `$`, backtick and `"` escapes for the double-quoted form (the old blanket quote-strip silently corrupted any value containing `$`, a backtick, or a backslash) |
+| C029 | `_chatgpt_config_fingerprint` hashes the three `CHATGPT_*` values, and `write_runtime_override` injects that hash as `HARNESS_PROXY_FP` on the `proxy:` service block — only the hash crosses the boundary, the cookie itself never appears in the on-disk compose override |
+| C030 | `_running_proxy_fp` reads `HARNESS_PROXY_FP` back out of the running proxy container's env (empty when the var is absent) and does not surface the cookie sitting next to it in that env |
+| C031 | `ensure_services_up` restarts the proxy when the chatgpt credentials changed (rotated cookie → fingerprint mismatch) even though the running backend already matches the requested one — compose will not replace a running container over an `.env` edit |
+| C032 | `ensure_services_up` does NOT restart the openai backend on a missing fingerprint (the fingerprint check is gated on `_backend_is_chatgpt`, so an openai container that carries no `HARNESS_PROXY_FP` is left alone) |
+| C033 | `cmd_chatgpt doctor` and `cmd_chatgpt preflight` delegate to `cmd_doctor`/`cmd_preflight` with `backend_override=chatgpt` already set, so the diagnostics check this backend's vars instead of reporting a valid chatgpt-only install as broken |
+| C034 | `_print_upstream_models` DOES reach the upstream catalog request on the openai backend — the positive control that proves C011's chatgpt early-return is guarding a live code path, not a dead one |

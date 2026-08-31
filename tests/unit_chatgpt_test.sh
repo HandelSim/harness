@@ -335,6 +335,7 @@ grep -q '^CHATGPT_MODEL_NAME=gpt-5.6-terra$' "$TMP_ROOT/.env" \
     || fail "T16: a bare value was needlessly quoted"
 ok "T16: a semicolon-bearing cookie round-trips and .env stays sourceable"
 
+# --- T17: the double-quote fallback is exactly inverted on read -------------
 # A value containing a single quote can't use the single-quote form, so the
 # writer falls back to double quotes + escapes and _config_read_key has to be
 # the exact inverse. This is the path that silently corrupted PROXY_API_KEY
