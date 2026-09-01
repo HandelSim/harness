@@ -551,6 +551,7 @@ without docker, network, or a real proxy/opencode spawn.
 | Ho016 | `host_toolchain_path_prefix` on Windows orders the dirs `tool_bin:node-root:opencode-root` (root-level layout) |
 | Ho017 | `host_extract_archive` extracts `.tar.gz` (and `.zip` when `zip`/`unzip` available) and rejects an unknown archive kind |
 | Ho018 | `host_python_bin` verifies each candidate by running `--version` (not `command -v` alone): rejects a dead `python3` App-execution-alias stub and falls through to a real `python`; prefers a real `python3`; returns non-zero when only stubs exist |
+| Ho019 | The loopback `/dev/tcp` probes (`host_proxy_wait_ready`, `host_mcp_port_open`) leave the calling shell's stderr intact — a successful probe must not redirect fd 2, or every later `err()`/banner write disappears |
 
 ## ChatGPT backend — CLI side (C###)
 

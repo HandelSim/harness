@@ -621,6 +621,16 @@ full log path on **both** failure branches (proxy exited during startup, or
 never began listening) so a failed launch always points at the log that
 explains why.
 
+**The probe must not eat stderr.** Both loopback probes
+(`host_proxy_wait_ready`, and `host_mcp_port_open` in mcp.md) run
+`(exec 3<>/dev/tcp/…)` in a **subshell**, so the probe fd is opened and closed
+there and the caller never holds it — there is nothing to clean up afterwards.
+A command-less `exec` redirects the *current* shell permanently, so the
+`exec 3>&- 3<&- 2>/dev/null` that used to follow the successful probe silenced
+harness for the rest of the run: an interactive `harness host` printed nothing
+after the confirm gate (no launch banner, no `err()`, none of opencode's own
+stderr), which reads as a hang. Never re-add an fd cleanup there.
+
 ## ChatGPT backend (`harness chatgpt`)
 
 `cmd_chatgpt` is a **front door, not a parallel launch path**. It sets the

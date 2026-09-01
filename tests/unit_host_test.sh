@@ -16,6 +16,8 @@
 #   - host_write_opencode_config    emits valid JSON, baseURL -> 127.0.0.1,
 #                                   dummy apiKey; and refuses without jq (M4)
 #   - host_proxy_fingerprint        stable, and sensitive to port/key/reqs changes (M2)
+#   - host_proxy_wait_ready /       the loopback /dev/tcp probes leave the
+#     host_mcp_port_open            shell's own stderr intact
 #
 # Prints "HOST TEST PASSED" on success.
 
@@ -364,6 +366,59 @@ esac
 guarded="$(host_reset_terminal)"
 [[ -z "$guarded" ]] || fail "T14: host_reset_terminal leaked bytes to a non-tty stdout — $(printf '%q' "$guarded")"
 ok "T14: host_reset_terminal disables leaked mouse-tracking and is a no-op on non-tty stdout"
+
+# --- T15: the loopback port probes must not silence the shell's stderr -------
+# Regression: both /dev/tcp probes used to "clean up" the probe fd with
+#   exec 3>&- 3<&- 2>/dev/null || true
+# A command-less `exec` applies its redirections to the CURRENT shell and they
+# STICK, so the trailing 2>/dev/null muted every later stderr write. In
+# host_proxy_wait_ready that hit on the success path of an ordinary launch:
+# `harness host` went dead silent from the moment the proxy answered — no launch
+# banner, no err(), nothing from opencode's stderr — which reads as a hang. The
+# copy in host_mcp_port_open did the same to any launch that reuses a host MCP.
+# Both probes run in a SUBSHELL, so fd 3 is never open in the caller and there
+# is nothing to close; the assertion here is simply that stderr still works
+# after each probe returns.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[host-test] SKIP: T15 needs python3 to open a listening port"
+else
+    cat >"$TMP_ROOT/listener.py" <<'PYEOF'
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(8)
+with open(sys.argv[1], "w") as fh:
+    fh.write(str(s.getsockname()[1]))
+time.sleep(30)
+PYEOF
+    portfile="$TMP_ROOT/listener.port"
+    python3 "$TMP_ROOT/listener.py" "$portfile" &
+    listener_pid=$!
+    for _ in $(seq 1 50); do [[ -s "$portfile" ]] && break; sleep 0.1; done
+    listener_port="$(cat "$portfile" 2>/dev/null || true)"
+    [[ -n "$listener_port" ]] || fail "T15: test listener never reported a port"
+
+    # host_proxy_wait_ready needs a live pid in the pidfile AND an answering port.
+    mkdir -p "$(host_state_dir)"
+    printf '%s\n' "$listener_pid" >"$(host_proxy_pidfile)"
+    got=$( ( PROXY_PORT="$listener_port"; host_proxy_wait_ready && echo "STDERR-ALIVE" >&2 ) 2>&1 >/dev/null )
+    [[ "$got" == *STDERR-ALIVE* ]] \
+        || fail "T15a: host_proxy_wait_ready left stderr redirected (nothing printed after it returned)"
+    ok "T15a: host_proxy_wait_ready leaves the shell's stderr intact"
+
+    # host_mcp_port_open reads the port from the MCP's meta file.
+    mkdir -p "$mcp_active_dir/probe"
+    printf '{"host_port": %s}\n' "$listener_port" >"$(mcp_meta_file probe)"
+    got=$( ( host_mcp_port_open probe && echo "STDERR-ALIVE" >&2 ) 2>&1 >/dev/null )
+    [[ "$got" == *STDERR-ALIVE* ]] \
+        || fail "T15b: host_mcp_port_open left stderr redirected (nothing printed after it returned)"
+    ok "T15b: host_mcp_port_open leaves the shell's stderr intact"
+
+    kill "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+    rm -f "$(host_proxy_pidfile)"
+fi
 
 echo
 echo "HOST TEST PASSED"

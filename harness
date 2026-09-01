@@ -3487,8 +3487,12 @@ host_mcp_port_open() {
     local port
     port=$(host_mcp_port "$1")
     [[ -n "$port" ]] || return 1
+    # The probe runs in a SUBSHELL, so fd 3 is opened and closed there and the
+    # parent never holds it. Do NOT "clean up" with `exec 3>&- 3<&-` here: an
+    # `exec` with no command applies its redirections to THIS shell permanently,
+    # and the 2>/dev/null that used to ride along silenced every later stderr
+    # write for the rest of the run (the harness banner, every err()).
     (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || return 1
-    exec 3>&- 3<&- 2>/dev/null || true
     return 0
 }
 
@@ -4274,8 +4278,13 @@ host_proxy_wait_ready() {
             err "  full log: $(host_proxy_logfile)"
             return 1
         fi
+        # Subshell probe: fd 3 belongs to the subshell and dies with it, so
+        # there is nothing to close here. An `exec 3>&- 3<&- 2>/dev/null` used
+        # to follow, and because a command-less `exec` redirects the CURRENT
+        # shell for good, its 2>/dev/null muted harness from this point on —
+        # the launch banner and every later err() vanished, so an interactive
+        # `harness host` went silent right after the confirm gate.
         if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
-            exec 3>&- 3<&- 2>/dev/null || true
             return 0
         fi
         sleep 0.2
