@@ -614,7 +614,7 @@ _upg_is_preserved() {
 #
 # Offer to replace ONE user-owned data file with the tracked default it was
 # seeded from. Used for the reminder's two prompt-data files
-# (.harness-data/reminder.md, .harness-data/tool-guidance.json), which
+# (<install root>/reminder.md, <install root>/tool-guidance.json), which
 # `harness start` seeds once and then never touches again: without this the
 # shipped wording can improve for years and an install that already has a copy
 # would never see it.

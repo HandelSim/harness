@@ -872,8 +872,8 @@ ok "T12: _upgrade_confirm honors default-N (Enter aborts) without breaking defau
 
 # === Test 13: userfile_sync (the reminder / tool-guidance question) ========
 #
-# U0xx in the inventory. `.harness-data/reminder.md` and
-# `.harness-data/tool-guidance.json` are seeded once and then owned by the
+# U0xx in the inventory. `<install root>/reminder.md` and
+# `<install root>/tool-guidance.json` are seeded once and then owned by the
 # user, so upgrade can never just overwrite them. This action asks — once per
 # file, and ONLY when the bytes actually differ. The contract under test:
 #

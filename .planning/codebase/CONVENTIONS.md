@@ -24,7 +24,7 @@ Two languages dominate: Bash (the ~6500-line `harness` CLI plus `scripts/lib/*.s
 
 **Bash variables:**
 - Locals are `lower_snake_case`, always declared `local` inside functions (`local section="all"`, `local missing_dep=0`).
-- Environment / config knobs are `UPPER_SNAKE_CASE` and namespaced `HARNESS_*` (`HARNESS_INSTALL_ROOT`, `HARNESS_ALLOWLIST_PATH`, `HARNESS_DATA_DIR`, `HARNESS_NET_OVERRIDES_PATH`, `HARNESS_REGISTRY_DIR`, `HARNESS_PROJECT_NAME`, `HARNESS_SOURCE_ONLY`, `HARNESS_YOLO`, `HARNESS_HOST_CONFIRM`, `HARNESS_RUN_SLOW`, `HARNESS_CONTAINER_RUNTIME`). Proxy/upstream knobs use `PROXY_*` and a few legacy names (`PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME`, `MODEL_CONTEXT_LENGTH` with legacy alias `OLLAMA_CONTEXT_LENGTH`).
+- Environment / config knobs are `UPPER_SNAKE_CASE` and namespaced `HARNESS_*` (`HARNESS_INSTALL_ROOT`, `HARNESS_ALLOWLIST_PATH`, `HARNESS_NET_OVERRIDES_PATH`, `HARNESS_REGISTRY_DIR`, `HARNESS_PROJECT_NAME`, `HARNESS_SOURCE_ONLY`, `HARNESS_YOLO`, `HARNESS_HOST_CONFIRM`, `HARNESS_RUN_SLOW`, `HARNESS_CONTAINER_RUNTIME`). Proxy/upstream knobs use `PROXY_*` and a few legacy names (`PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME`, `MODEL_CONTEXT_LENGTH` with legacy alias `OLLAMA_CONTEXT_LENGTH`).
 
 **Python (`proxy/proxy.py`):**
 - Functions `lower_snake_case` (`extract_tool_calls_and_text`, `translate_history_and_apply_prompt`, `format_tools_to_text`, `make_chunk`, `_scan_balanced_json`, `_estimate_tokens`).

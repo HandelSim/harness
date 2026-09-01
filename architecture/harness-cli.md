@@ -12,7 +12,7 @@ realpath (so it works on Windows Git Bash too) to find:
 - **`clone_dir`** — where the code lives (this script + `docker-compose.yml`
   + `scripts/`).
 - **`install_root`** — where user config (`.env`, `.harness-allowlist`,
-  `.harness-data/`) and runtime state (`state/`) live.
+  `reminder.md`, `tool-guidance.json`) and runtime state (`state/`) live.
 
 In production these are the same directory: `harness-install.sh` clones
 the repo and that clone IS the install root. Tests set
@@ -229,14 +229,14 @@ compose` invocation. It:
    recency reminder's Environment line (see `architecture/proxy.md` →
    Host-OS injection); `docker-compose.yml` defaults it to `unknown` when
    harness isn't the launcher. `cmd_start` separately seeds the user's two
-   editable reminder-data files into `<install_root>/.harness-data/` —
+   editable reminder-data files into `<install_root>/` —
    `seed_reminder_file` → `reminder.md` (from the tracked
    `proxy/reminder.md`) and `seed_tool_guidance_file` → `tool-guidance.json`
    (from `proxy/tool-guidance.json`), both thin wrappers over
-   `seed_user_data_file`, which also migrates a pre-`.harness-data` copy from
-   the install root — and exports `HARNESS_DATA_DIR` at that directory. One
-   variable covers both files because they keep their tracked basenames, so
-   an edit to either takes effect on `harness restart` with no rebuild — see
+   `seed_user_data_file`, which also migrates a copy left by either earlier
+   layout. They ride on the `INSTALL_ROOT` export above rather than a
+   variable of their own, because they keep their tracked basenames; an edit
+   to either takes effect on `harness restart` with no rebuild — see
    `architecture/proxy.md` → "Editable reminder data".
 4. Invokes the detected container runtime (`docker` or `podman`, per
    `scripts/lib/platform.sh:harness_container_runtime`).

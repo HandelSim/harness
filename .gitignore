@@ -3,10 +3,14 @@
 .env
 .harness-allowlist
 .harness-net-overrides.json
-# The reminder's user-editable data — reminder.md and tool-guidance.json,
-# seeded from their proxy/ defaults by `harness start`. (.harness-reminder.md
-# and .harness-tool-guidance.json are the pre-.harness-data/ locations; kept
-# ignored so an install that hasn't started since the move stays clean.)
+# The reminder's user-editable data, seeded from the proxy/ defaults by
+# `harness start`. The leading slash is load-bearing: these keep their tracked
+# basenames, and only the copies AT THE INSTALL ROOT are ignored — proxy/
+# reminder.md and proxy/tool-guidance.json stay tracked. (.harness-data/ and
+# the two .harness-* names are earlier locations, kept ignored so an install
+# that hasn't started since the move stays clean.)
+/reminder.md
+/tool-guidance.json
 .harness-data/
 .harness-reminder.md
 .harness-tool-guidance.json

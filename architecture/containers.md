@@ -34,13 +34,14 @@ Healthcheck: `curl -fsS http://127.0.0.1:${PROXY_PORT:-8000}/health`.
 
 Three read-only bind mounts carry user-owned data into the image: the egress
 allowlist at `/etc/harness/allowlist`, the hybrid recency reminder's prose at
-`/app/reminder.md` (`${HARNESS_DATA_DIR:-./proxy}/reminder.md`), and that
+`/app/reminder.md` (`${INSTALL_ROOT:-./proxy}/reminder.md`), and that
 reminder's per-tool entries at `/app/tool-guidance.json`
-(`${HARNESS_DATA_DIR:-./proxy}/tool-guidance.json`). One variable serves both
-because it names a *directory* and the user copies keep their tracked
-basenames. The Dockerfile bakes a copy of each tracked default at its path
-too, so an unmounted container still starts; `harness start` seeds and points
-at the gitignored user copies under `<install root>/.harness-data/`. Because
+(`${INSTALL_ROOT:-./proxy}/tool-guidance.json`). Neither needs a path variable
+of its own: `INSTALL_ROOT` is already exported by `compose()`, it names a
+*directory*, and the user copies keep their tracked basenames. The Dockerfile
+bakes a copy of each tracked default at its path too, so an unmounted
+container still starts; `harness start` seeds the gitignored user copies to
+`<install root>/`, next to `.env` and `.harness-allowlist`. Because
 they are mounts and not build inputs, rewording the reminder or retuning a
 tool's one-line guidance needs `harness restart`, not a rebuild — see
 [`proxy.md`](proxy.md) → "Editable reminder data".

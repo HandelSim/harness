@@ -588,22 +588,26 @@ _HOST_OS: str = ""
 # are editable without a code change: edit the file, `harness restart`, done.
 #
 # Two rungs, both resolving to the user's copy in a normal install:
-#   1. $HARNESS_DATA_DIR/<name> — `harness host` points this at
-#      <install root>/.harness-data, the directory both user copies are seeded
-#      into. Host mode runs proxy.py straight from the clone, so there is no
-#      bind-mount to override anything.
+#   1. $INSTALL_ROOT/<name> — the install root is where `harness start` seeds
+#      both user copies, next to .env. Only `harness host` sets the variable
+#      for the proxy: host mode runs proxy.py straight from the clone, so
+#      there is no bind-mount to override anything. It wins outright when set,
+#      rather than falling through on a missing file, so a copy that is
+#      missing or shadowed by a directory degrades LOUDLY (`[!]`) instead of
+#      quietly reading a different file than the one the user edits.
 #   2. <name> next to proxy.py — /app/<name> in the container, which
 #      docker-compose bind-mounts the user's copy over. The Dockerfile also
 #      COPYs the tracked default there, so a container with no mount still
 #      has a working file.
-# ONE variable covers both files rather than one variable per file: the copies
-# are seeded into the same directory under their tracked basenames, so a second
-# variable would carry no information the first one doesn't. Resolved off
-# `__file__`, never a hardcoded `proxy/`: the image flattens the repo into /app.
+# Neither file gets a path variable of its own: both copies keep their tracked
+# basenames under the install root, so INSTALL_ROOT (which harness exports for
+# compose anyway) already says everything a per-file variable would. Rung 2 is
+# resolved off `__file__`, never a hardcoded `proxy/`: the image flattens the
+# repo into /app.
 def _user_data_path(basename: str) -> str:
-    data_dir = os.environ.get("HARNESS_DATA_DIR", "").strip()
-    if data_dir:
-        return os.path.join(data_dir, basename)
+    install_root = os.environ.get("INSTALL_ROOT", "").strip()
+    if install_root:
+        return os.path.join(install_root, basename)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), basename)
 
 
@@ -1342,7 +1346,7 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     "ask" of the turn.
 
     The three bullets' PROSE is not here: it is user-owned data, loaded from
-    `.harness-data/reminder.md` by `_setup_reminder_template`. This function only
+    `<install root>/reminder.md` by `_setup_reminder_template`. This function only
     substitutes the three tokens the file documents — `{{HOST_OS}}`,
     `{{CWD}}`, `{{TOOL_ENTRIES}}` — into it. Read the shipped default at
     `proxy/reminder.md` for the wording and why each rule is there (the

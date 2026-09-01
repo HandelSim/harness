@@ -247,7 +247,7 @@ tool's own entry — see "Per-tool entries" below. This is additive — token
 cost is ~150–250 tokens/turn with the three bullets + Environment context;
 hybrid's lighter-than-user_front recency profile is preserved.
 
-### Editable reminder data (`.harness-data/`)
+### Editable reminder data (`reminder.md`, `tool-guidance.json`)
 
 The reminder's **wording is data, not code** — all of it. It lives in two
 files the user owns, so rewording the standing instructions is an edit +
@@ -268,27 +268,36 @@ contract, described once below.
 - **Tracked defaults** — `proxy/reminder.md` and `proxy/tool-guidance.json`.
   Both `COPY`d into the proxy image at `/app/`, so a container launched
   without the mounts still has a working reminder.
-- **User copies** — `<install-root>/.harness-data/reminder.md` and
-  `<install-root>/.harness-data/tool-guidance.json`, gitignored and seeded
-  from the tracked defaults by `seed_reminder_file` /
-  `seed_tool_guidance_file` (both thin wrappers over `seed_user_data_file`)
-  on every `harness start` / `harness host` (no-op once the file exists).
-  Gitignoring them is what keeps an edit from colliding with `harness
-  update`'s `git pull --ff-only`. One directory, and the copies keep their
-  tracked basenames — that is what lets **one** env var address both files.
-  A pre-`.harness-data` install kept them at `<install-root>/.harness-*`;
-  `seed_user_data_file` *moves* such a copy in (edits and all) on the next
-  start, so the migration needs no upgrade action.
+- **User copies** — `<install-root>/reminder.md` and
+  `<install-root>/tool-guidance.json`, sitting with the rest of the user's
+  config (`.env`, `.harness-allowlist`), gitignored and seeded from the
+  tracked defaults by `seed_reminder_file` / `seed_tool_guidance_file` (both
+  thin wrappers over `seed_user_data_file`) on every `harness start` /
+  `harness host` (no-op once the file exists). Gitignoring them is what keeps
+  an edit from colliding with `harness update`'s `git pull --ff-only` — note
+  the ignore rules are **anchored** (`/reminder.md`), or they would also
+  ignore the tracked `proxy/` defaults. The copies keep their tracked
+  basenames, which is what lets `$INSTALL_ROOT` address both files with no
+  per-file path variable. Two earlier layouts exist in the wild
+  (`<install-root>/.harness-reminder.md`, then a `.harness-data/`
+  subdirectory); `seed_user_data_file` *moves* such a copy to the current
+  path (edits and all) on the next start, so the migration needs no upgrade
+  action.
 - **How the proxy finds them** — `_user_data_path(basename)`, wrapped by
   `_reminder_template_path()` / `_tool_guidance_path()`: (1)
-  `$HARNESS_DATA_DIR/<basename>` if that var is set, else (2) the file next
+  `$INSTALL_ROOT/<basename>` if that var is set, else (2) the file next
   to `proxy.py` (resolved off `__file__`, never a hardcoded `proxy/` — the
-  image flattens the repo into `/app`). The variable names the **directory**,
-  not a path per file: a second variable would carry no information the first
-  one doesn't. `cmd_start` exports it when the directory exists, and compose
-  mounts both files over the baked copies; `host_proxy_start` passes it
-  directly, since host mode runs `proxy.py` straight from the clone with no
-  mount to swap. The compose **default** is `./proxy`, i.e. the tracked
+  image flattens the repo into `/app`). No new variable exists for this:
+  `INSTALL_ROOT` is the one `compose()` already exports for the MCP compose
+  fragments, it names the **directory**, and the copies keep their tracked
+  basenames, so a path variable per file would carry no information. Rung 1
+  wins outright when the var is set — it does not fall through on a missing
+  file, so a copy that is missing or shadowed by a directory degrades
+  *loudly* rather than quietly reading a different file than the one the user
+  edits. Compose interpolates the same variable into the two mounts, which
+  land over the baked copies; `host_proxy_start` passes it in the proxy's
+  environment, since host mode runs `proxy.py` straight from the clone with
+  no mount to swap. The compose **default** is `./proxy`, i.e. the tracked
   defaults, not the user copies, so a bare `docker compose up` (what the
   docker test suites do) always has a real mount source — a missing source
   makes docker create a *directory* there and the proxy would silently drop

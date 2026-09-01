@@ -771,26 +771,22 @@ mcp_is_enabled() {
     [[ "$v" == "true" ]]
 }
 
-# The directory holding the user's editable copies of the prompt-data files.
-# One directory, one env var (HARNESS_DATA_DIR), and the copies keep their
-# tracked basenames — that is what lets compose mount both files off a single
-# variable instead of one path variable per file. A function, not a top-level
-# assignment, so it re-reads $install_root: the source-only unit tests
-# repoint install_root after sourcing.
-user_data_dir() {
-    printf '%s\n' "$install_root/.harness-data"
-}
-
 # Seed a user-editable prompt-data file from its tracked default.
 #
-# Two files use this: the recency reminder's prose (.harness-data/reminder.md
-# from proxy/reminder.md) and the per-tool entries
-# (.harness-data/tool-guidance.json from proxy/tool-guidance.json). Both are
-# data, not code: the user copy is gitignored and user-owned, docker-compose
-# bind-mounts it over the container's /app copy, and the proxy loads it at
-# startup. Seeding here (rather than only in harness-install.sh) means an
-# existing install picks the file up on its next `harness start`, with no
-# upgrade action needed.
+# Two files use this: the recency reminder's prose (reminder.md from
+# proxy/reminder.md) and the per-tool entries (tool-guidance.json from
+# proxy/tool-guidance.json). The user copies sit at the install root next to
+# .env and .harness-allowlist, under their TRACKED basenames — which is what
+# lets compose mount them off $INSTALL_ROOT (compose() already exports it for
+# the MCP compose fragments) with no path variable of their own, while the
+# unset-INSTALL_ROOT default still resolves to the tracked ./proxy/<base> a
+# bare `docker compose up` needs.
+#
+# Both are data, not code: the user copy is gitignored and user-owned,
+# docker-compose bind-mounts it over the container's /app copy, and the proxy
+# loads it at startup. Seeding here (rather than only in harness-install.sh)
+# means an existing install picks the file up on its next `harness start`,
+# with no upgrade action needed.
 #
 # Only ever creates a MISSING file — an edited copy is never overwritten here,
 # so a start can never clobber the user's wording. Replacing an edited copy
@@ -800,29 +796,30 @@ user_data_dir() {
 # Args: <basename, shared by the tracked default and the user copy>
 #       <repo-relative path of the tracked default>
 #       <what editing it changes, for the seeded-it hint>
-#       [legacy basename at the install root, migrated in if present]
 seed_user_data_file() {
-    local base="$1" shipped_rel="$2" what="$3" legacy="${4:-}"
-    local data_dir
-    data_dir=$(user_data_dir)
-    local user_copy="$data_dir/$base"
+    local base="$1" shipped_rel="$2" what="$3"
+    local user_copy="$install_root/$base"
     local shipped="$clone_dir/$shipped_rel"
-    mkdir -p "$data_dir" 2>/dev/null || true
-    # Pre-.harness-data installs kept these copies at the install root under
-    # dotted names. Move an existing one in rather than silently seeding a
-    # fresh default over the top of it — this runs on every start, so an
-    # install that never runs `harness upgrade` still migrates.
-    if [[ -n "$legacy" && -e "$install_root/$legacy" ]]; then
-        if [[ -f "$install_root/$legacy" && ! -e "$user_copy" ]]; then
-            if mv "$install_root/$legacy" "$user_copy" 2>/dev/null; then
-                err "moved $legacy -> .harness-data/$base (your edits came with it)"
+    # Earlier layouts put these copies at the install root under a dotted name
+    # (.harness-reminder.md), then briefly in a .harness-data/ subdirectory.
+    # Move an existing one to the current path rather than seeding a fresh
+    # default over the top of it — this runs on every start, so an install
+    # that never runs `harness upgrade` still migrates. Newest layout first.
+    local legacy old
+    for legacy in ".harness-data/$base" ".harness-$base"; do
+        old="$install_root/$legacy"
+        [[ -e "$old" ]] || continue
+        if [[ -f "$old" && ! -e "$user_copy" ]]; then
+            if mv "$old" "$user_copy" 2>/dev/null; then
+                err "moved $legacy -> $base (your edits came with it)"
             fi
-        elif [[ -d "$install_root/$legacy" ]]; then
+        elif [[ -d "$old" ]]; then
             # Empty dir left by a bind-mount against the old layout; harmless
             # but confusing to leave behind. Non-empty ones are the user's.
-            rmdir "$install_root/$legacy" 2>/dev/null || true
+            rmdir "$old" 2>/dev/null || true
         fi
-    fi
+    done
+    rmdir "$install_root/.harness-data" 2>/dev/null || true
     # A compose bind-mount whose source is missing makes docker CREATE an empty
     # directory there. Left in place that directory looks like "already seeded"
     # forever and mounts a directory over the file, so the proxy silently runs
@@ -841,22 +838,22 @@ seed_user_data_file() {
         return 0
     fi
     if cp "$shipped" "$user_copy" 2>/dev/null; then
-        err "seeded .harness-data/$base — edit it to change $what,"
+        err "seeded $base — edit it to change $what,"
         err "        then 'harness restart'"
     else
-        err "could not write $user_copy; the proxy uses the image's default"
+        err "could not write $user_copy; the proxy falls back to its default"
     fi
 }
 
 # Back-compat wrappers so the call sites (and tests) name the file they seed.
 seed_reminder_file() {
     seed_user_data_file reminder.md proxy/reminder.md \
-        "the agent's per-turn reminder" .harness-reminder.md
+        "the agent's per-turn reminder"
 }
 
 seed_tool_guidance_file() {
     seed_user_data_file tool-guidance.json proxy/tool-guidance.json \
-        "the per-tool entries in that reminder" .harness-tool-guidance.json
+        "the per-tool entries in that reminder"
 }
 
 # Build the consolidated MCP tool-recency map for the proxy. For every ENABLED
@@ -2382,14 +2379,9 @@ cmd_start() {
     # recency.json takes effect on the next `harness restart`.
     # Both prompt-data files are compose bind-mount sources, so they must exist
     # before `up` — docker would otherwise create a directory in their place.
+    # compose() exports INSTALL_ROOT, which is what the two mounts interpolate.
     seed_reminder_file
     seed_tool_guidance_file
-    # Point compose at the directory holding the user copies. Left unset when
-    # seeding didn't produce it, so both mounts fall back to the tracked
-    # defaults in proxy/ rather than to a path docker would have to invent.
-    if [[ -d "$(user_data_dir)" ]]; then
-        export HARNESS_DATA_DIR="$(user_data_dir)"
-    fi
 
     export HARNESS_MCP_TOOL_RECENCY="$(mcp_tool_recency_json)"
     # Companion array: tools flagged state_check in recency.json. The proxy marks
@@ -4235,15 +4227,10 @@ host_proxy_start() {
     host_output_dir=$(host_output_dir_resolve "${OUTPUT_DIR:-}")
     # Host mode runs proxy.py straight from the clone, so there is no compose
     # bind-mount to put the user's reminder / tool-guidance files in proxy.py's
-    # default spot. Point the proxy at the directory holding them. Empty when
-    # seeding failed: proxy.py then falls back to the tracked defaults sitting
-    # next to it in the clone.
+    # default spot. INSTALL_ROOT below is how the proxy finds them instead —
+    # the same variable compose interpolates into the two bind-mounts.
     seed_reminder_file
     seed_tool_guidance_file
-    local host_data_dir=""
-    if [[ -d "$(user_data_dir)" ]]; then
-        host_data_dir=$(user_data_dir)
-    fi
     # HARNESS_FORCE_LOOPBACK is belt-and-suspenders for the no-firewall mode:
     # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
     # one-line regression in this launch path can't expose the keyed proxy on
@@ -4266,7 +4253,7 @@ host_proxy_start() {
         PROXY_BACKEND="${backend_override:-}" \
         OUTPUT_DIR="$host_output_dir" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
-        HARNESS_DATA_DIR="$host_data_dir" \
+        INSTALL_ROOT="$install_root" \
         nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"

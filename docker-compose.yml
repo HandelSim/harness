@@ -89,20 +89,21 @@ services:
       # The hybrid recency reminder's two data files — its prose, and the
       # per-tool entries (legend, each tool's one-line guidance, which tools
       # get their full description echoed). User-editable data, not code.
-      # `harness start` seeds the gitignored user copies into
-      # <install root>/.harness-data/ and points HARNESS_DATA_DIR at that
-      # directory; gitignoring them is what keeps an edit from colliding with
-      # `harness update`'s fast-forward pull. ONE variable covers both files
-      # because the copies keep their tracked basenames — the default is
-      # ./proxy, the directory of the TRACKED defaults, so a bare
-      # `docker compose up` (what the test suites do) always has real sources.
-      # A missing bind-mount source makes docker create a DIRECTORY here and
-      # the proxy would silently drop to its built-in fallback. Mounted over
-      # the copies the image baked in, so an edit needs `harness restart`, no
-      # rebuild. The proxy parses the JSON one key at a time, so a typo in one
+      # `harness start` seeds the gitignored user copies to the install root,
+      # next to .env and .harness-allowlist; gitignoring them is what keeps an
+      # edit from colliding with `harness update`'s fast-forward pull. They
+      # need no path variable of their own: they keep their TRACKED basenames
+      # under $INSTALL_ROOT, which compose() already exports (the MCP compose
+      # fragments use it too). With it unset the mounts fall back to ./proxy,
+      # the directory of the tracked defaults, so a bare `docker compose up`
+      # (what the test suites do) always has real sources — a missing
+      # bind-mount source makes docker create a DIRECTORY here and the proxy
+      # would silently drop to its built-in fallback. Mounted over the copies
+      # the image baked in, so an edit needs `harness restart`, no rebuild.
+      # The proxy parses the JSON one key at a time, so a typo in one
       # description costs that description, not the block.
-      - ${HARNESS_DATA_DIR:-./proxy}/reminder.md:/app/reminder.md:ro
-      - ${HARNESS_DATA_DIR:-./proxy}/tool-guidance.json:/app/tool-guidance.json:ro
+      - ${INSTALL_ROOT:-./proxy}/reminder.md:/app/reminder.md:ro
+      - ${INSTALL_ROOT:-./proxy}/tool-guidance.json:/app/tool-guidance.json:ro
     # init-firewall.sh requires NET_ADMIN and NET_RAW to manage iptables/ipset.
     cap_add:
       - NET_ADMIN
