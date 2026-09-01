@@ -199,5 +199,46 @@ grep -q 'rmi -f harness-agent:latest' "$RT_LOG" || fail "T12: harness-agent imag
 [[ ! -d "$TMP_ROOT" ]] || fail "T12: install root not removed"
 ok "T12: --yes removes agent + compose containers, compose images, and named images"
 
+# --- T13: _warn_unquoted_env_values names values `source` cannot read back ---
+# An unquoted value carrying a space or a shell metacharacter is truncated by
+# `source` (and its tail is run as a command); compose reads the whole line, so
+# the two consumers of .env disagree. The scan must name exactly the offenders
+# and stay silent on every legitimate line shape.
+WARN_ENV="$FAKE_HOME/warn.env"
+cat >"$WARN_ENV" <<'EOF'
+# a comment with spaces ; and & in it
+PROXY_API_URL=https://ok.example.com
+PROXY_API_KEY=sk-fine_123
+  export EXPORTED=bar
+QUOTED_S='has spaces; and semis'
+QUOTED_D="has spaces; too"
+INLINE=bar # trailing comment
+EMPTY=
+DOLLAR=$HOME
+BAD_SPACE=a b
+BAD_SEMI=a=1; oai-did=2
+BAD_AMP=a&b
+EOF
+warn_out="$(_warn_unquoted_env_values "$WARN_ENV" 2>&1 || true)"
+for k in BAD_SPACE BAD_SEMI BAD_AMP; do
+    grep -q "$k" <<<"$warn_out" || fail "T13: $k not reported — $warn_out"
+done
+for k in PROXY_API_URL PROXY_API_KEY EXPORTED QUOTED_S QUOTED_D INLINE EMPTY DOLLAR; do
+    grep -q "$k" <<<"$warn_out" && fail "T13: false positive on $k — $warn_out"
+done
+grep -q 'single quotes' <<<"$warn_out" || fail "T13: warning gives no fix — $warn_out"
+printf 'A=1\nB=plain\n' >"$WARN_ENV"
+[[ -z "$(_warn_unquoted_env_values "$WARN_ENV" 2>&1 || true)" ]] \
+    || fail "T13: clean .env produced output"
+ok "T13: unquoted values with shell metacharacters are named before sourcing"
+
+# --- T14: _config_value_truncated is the prefix test, not an inequality test -
+_config_value_truncated 'a=1' 'a=1; b=2' || fail "T14: prefix not flagged"
+_config_value_truncated 'a=1' 'a=1'      && fail "T14: identical values flagged"
+_config_value_truncated 'a=1' 'z=9; a=1' && fail "T14: non-prefix difference flagged"
+_config_value_truncated ''    'a=1; b=2' && fail "T14: empty sourced value flagged"
+_config_value_truncated 'a=1' ''         && fail "T14: empty on-disk value flagged"
+ok "T14: _config_value_truncated fires only on a strict prefix of the on-disk value"
+
 echo
 echo "CONFIG TEST PASSED"

@@ -30,6 +30,21 @@ so it can read values like `DEFAULT_MODEL_NAME`, `HARNESS_EXTRA_MOUNTS`
 for its own logic. `docker compose` gets `.env` separately via
 `--env-file`. The two consumers are independent.
 
+Independent, but not equivalent: compose's dotenv parser reads an unquoted
+value to end of line, while `source` ends the assignment at the first space or
+shell metacharacter and treats the remainder as a command. A hand-pasted
+`CHATGPT_COOKIE_STRING=a=1; oai-did=2` therefore either kills every harness
+command (`oai-did=2: command not found`, exit 127) or — when the remainder
+parses as an assignment, or the separator is `&` — is silently cut down to the
+first cookie pair, and the proxy authenticates with half a cookie for an
+unexplained upstream 401. `_warn_unquoted_env_values` scans the file **before**
+sourcing and names the offending keys, so the cause prints above the symptom.
+It warns rather than aborts: `harness config set` is the documented repair and
+has to stay reachable. `_config_value_truncated` is the same fault seen from
+the other side — the sourced value is a strict prefix of what
+`_config_read_key` reads off disk — and turns `harness chatgpt doctor`'s cookie
+line from a green "set, N chars" into a fail that names the real length.
+
 `DEFAULT_MODEL_NAME` (which replaced the old `PROXY_API_MODEL` +
 `OLLAMA_AGENT_MODEL`) is the default/fallback model id and is **REQUIRED with no
 hardcoded default** — once the selected model passes through to the upstream, a

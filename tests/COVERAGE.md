@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 492 rows (F=154, P=88, A=24, M=33, N=31, U=29, Pe=16, O=0, I=50, B=10, Ho=18, C=39). 489 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
+Inventory total: 494 rows (F=155, P=88, A=24, M=33, N=31, U=29, Pe=16, O=0, I=50, B=10, Ho=18, C=40). 491 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -48,6 +48,10 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   `HARNESS_PROXY_FP` credential fingerprint. Sourced via `HARNESS_SOURCE_ONLY=1`.
   Covers C001-C039 (T1-T20). T18-T20 also pin the cost/behaviour guarantees for
   installs that never configured this backend.
+- `tests/unit_config_test.sh` (no docker) — `harness config` read/write/list plus the
+  `harness uninstall` confirm gate and teardown, and the two `.env` quoting guards:
+  `_warn_unquoted_env_values` (F153) and `_config_value_truncated` (C040). Sourced via
+  `HARNESS_SOURCE_ONLY=1` against a throwaway install root.
 - `tests/scheme_contract_test.sh` (407 lines, Track E) — per-scheme proxy contract test.
   Brings up proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
   a probe through the proxy's OpenAI-compatible interface; asserts forwarded-body structure.
@@ -108,7 +112,7 @@ Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
-| F      |   154 |   113 |      2 |  39 |
+| F      |   155 |   114 |      2 |  39 |
 | P      |    88 |    74 |      1 |  13 |
 | A      |    24 |    12 |      0 |  12 |
 | M      |    33 |    28 |      0 |   5 |
@@ -119,8 +123,8 @@ Per-prefix breakdown:
 | I      |    50 |    35 |      1 |  14 |
 | B      |    10 |    10 |      0 |   0 |
 | Ho     |    18 |    18 |      0 |   0 |
-| C      |    39 |    39 |      0 |   0 |
-| **all**|   492 |   370 |      5 | 117 |
+| C      |    40 |    40 |      0 |   0 |
+| **all**|   494 |   372 |      5 | 117 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -156,7 +160,7 @@ test file and line range carrying the strongest assertion, a one-line
 evidence note (quoting real assertion text where possible), and — for
 non-green rows — the gap.
 
-## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (154 rows)
+## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (155 rows)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -314,6 +318,7 @@ non-green rows — the gap.
 | F139 | green  | tests/full_pipeline_test.sh:317-324         | T5 captures `start.log` and explicitly asserts `! grep -q "NETWORK FIREWALL IS DISABLED"` — silence is now a hard assertion when `.harness-net-overrides.json` is absent. | |
 | F150 | green  | tests/harness_test.sh (T26pm)               | T26pm: `_parse_prompt_mode_flag` accepts `--prompt-mode <m>` and `--prompt-mode=<m>`, rejects invalid value + unknown option (non-zero); `write_runtime_override` emits a standalone `proxy:` block with `PROXY_PROMPT_MODE`, and folds into the proxy firewall opt-out block (single `proxy:` mapping with both env entries) when both apply. | |
 | F152 | green  | tests/unit_reminder_seed_test.sh (T1-T5)    | T1: a missing `.harness-reminder.md` is created and `cmp`s byte-for-byte with the tracked `proxy/reminder.md`; T2: an edited copy survives a second `seed_reminder_file` untouched; T3: an EMPTY directory at that path is `rmdir`'d and replaced by the seeded file; T4: a NON-empty directory is left intact, its contents preserved, and a warning naming it is printed; T5: a missing `proxy/reminder.md` warns and returns 0 without creating anything. | `cmd_start`'s `HARNESS_REMINDER_PATH` export and `host_proxy_start`'s `nohup` env are not asserted by this test — only the seeding helper is. |
+| F153 | green  | tests/unit_config_test.sh (T13)             | A fixture `.env` mixing eight legitimate line shapes (comment with `;`/`&`, plain values, `export KEY=`, single- and double-quoted values with spaces and semicolons, an inline `# comment`, an empty value, `$HOME`) with three offenders (`BAD_SPACE=a b`, `BAD_SEMI=a=1; oai-did=2`, `BAD_AMP=a&b`): all three are named, none of the eight is, the warning names the fix, and a clean `.env` produces no output at all. | The call site (the scan runs before `source` on every invocation) is exercised end-to-end only by running the CLI, not asserted here. |
 
 ## P — Proxy (88 IDs)
 
@@ -659,7 +664,7 @@ non-green rows — the gap.
 | Ho016 | green  | tests/unit_host_toolchain_test.sh:T8         | `host_toolchain_path_prefix` under a stubbed Windows OS orders the dirs `tool_bin:node-root:opencode-root` (Windows layout, stub binaries at the root). | |
 | Ho017 | green  | tests/unit_host_toolchain_test.sh:T9         | `host_extract_archive` extracts a real `.tar.gz` (and a `.zip` round-trip when `zip`/`unzip` are present), and rejects an unknown archive kind. | |
 
-## C — ChatGPT backend, CLI side (39 IDs)
+## C — ChatGPT backend, CLI side (40 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -702,6 +707,7 @@ non-green rows — the gap.
 | C037 | green  | tests/unit_chatgpt_test.sh (T19)            | `_running_proxy_backend`/`cmd_down`/`cmd_start` stubbed to append to `$ORDER_LOG`; `cmd_restart` must produce exactly `read\ndown\nstart:chatgpt`. | |
 | C038 | green  | tests/unit_chatgpt_test.sh (T18)            | `_running_proxy_backend`/`_running_proxy_fp` stubbed to append to `$PROBE_LOG`. With `CHATGPT_BASE_URL=""` and no `backend_override` the log stays empty (and no restart fires); restoring the key, and separately setting `backend_override=chatgpt` with the key blank, each make it non-empty. | |
 | C039 | green  | tests/unit_chatgpt_test.sh (T20)            | `.env` rewritten to the CHATGPT_* trio only; `cmd_preflight` output must match `harness chatgpt preflight`. The original `.env` is restored and the same grep must NOT match. | |
+| C040 | green  | tests/unit_config_test.sh (T14)             | `_config_value_truncated` is asserted true for `('a=1', 'a=1; b=2')` and false for identical values, a non-prefix difference (`'a=1'` vs `'z=9; a=1'`), an empty sourced value, and an empty on-disk value. | The `doctor_check fail` rendering that consumes the predicate is verified by hand, not by a test: `cmd_doctor` needs `harness_container_runtime`, which `HARNESS_SOURCE_ONLY=1` does not load. |
 
 ---
 

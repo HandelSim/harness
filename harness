@@ -127,7 +127,47 @@ for _k in "${_harness_proxy_keys[@]}"; do
     printf -v "_harness_shell_$_k" '%s' "${!_k:-}"
 done
 
+# A .env value that carries a space or a shell metacharacter but is NOT quoted
+# does not survive `source`: bash ends the assignment at that character and
+# treats the rest of the line as a command. For a pasted browser cookie
+# ("a=1; oai-did=2") that is either a hard stop ("oai-did=2: command not
+# found", exit 127 — every harness command, including the one that would fix
+# it) or, when the remainder happens to parse as an assignment or starts with
+# '&', a SILENT truncation to the first pair. docker compose's own dotenv
+# parser reads the whole line either way, so the file's two consumers disagree
+# and the proxy authenticates with half a cookie: a 401 with nothing on screen
+# to explain it. Name the offending keys before sourcing so the cause is
+# printed above the symptom. A warning, not a hard error: `harness config set
+# KEY VALUE` quotes the value correctly and is the documented repair, so it has
+# to stay reachable with a broken .env.
+_warn_unquoted_env_values() {
+    local file="$1" line key value
+    local -a bad=()
+    [[ -r "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        key="${line%%=*}"
+        key="${key##*[[:space:]]}"
+        value="${line#*=}"
+        # An already-quoted value is read back intact; nothing to warn about.
+        [[ "$value" == \'* || "$value" == \"* ]] && continue
+        # bash treats ' #...' as a comment, so it never reaches the value.
+        value="${value%%[[:space:]]#*}"
+        if [[ "$value" == *[[:space:]]* || "$value" == *[\;\&\|\<\>\(\)]* || "$value" == *'`'* ]]; then
+            bad+=("$key")
+        fi
+    done <"$file"
+    (( ${#bad[@]} )) || return 0
+    printf '[harness] WARNING: unquoted value(s) in %s: %s\n' "$file" "${bad[*]}" >&2
+    printf '[harness]   A value containing a space or ; & | ( ) < > ` must be quoted, or\n' >&2
+    printf '[harness]   bash cuts it off there (and may run the remainder as a command).\n' >&2
+    printf "[harness]   Fix: wrap it in single quotes in .env — KEY='a=1; oai-did=2'\n" >&2
+    printf "[harness]   ('harness config set KEY VALUE' quotes it for you, once .env parses).\n" >&2
+}
+
 if [[ -f "$env_file" ]]; then
+    _warn_unquoted_env_values "$env_file"
     set -a
     # shellcheck disable=SC1090
     source "$env_file"
@@ -1650,6 +1690,16 @@ _config_read_key() {
         raw="${raw//\\\\/\\}"
     fi
     printf '%s\n' "$raw"
+}
+
+# True when the value this shell sourced ($1) is a strict prefix of the value
+# on disk ($2) — the signature of an unquoted .env line that `source` cut short
+# at a space or ';'. A quoted line round-trips exactly, so the two agree and
+# this is false. Both non-empty is required: an absent key is "unset", not
+# truncated. See _warn_unquoted_env_values for why the two ever diverge.
+_config_value_truncated() {
+    local cur="$1" disk="$2"
+    [[ -n "$cur" && -n "$disk" && "$disk" != "$cur" && "$disk" == "$cur"* ]]
 }
 
 # Atomically rewrite (or append) KEY=VALUE in $env_file. A bash read-loop, not
@@ -7440,11 +7490,24 @@ cmd_doctor() {
                 doctor_check fail "CHATGPT_BASE_URL" "unset"
             fi
 
-            if [[ -n "${CHATGPT_COOKIE_STRING:-}" ]]; then
+            # Compare the sourced value against the raw .env line. They differ
+            # only when the on-disk value is unquoted and `source` cut it short
+            # (a prefix of the real one) — the shape that reaches the upstream
+            # as half a cookie and comes back 401. Reporting the truncated
+            # length as a green ✓ is what made that failure unreadable.
+            local ck_disk
+            ck_disk=$(_config_read_key CHATGPT_COOKIE_STRING)
+            if [[ -z "${CHATGPT_COOKIE_STRING:-}" ]]; then
+                doctor_check fail "CHATGPT_COOKIE_STRING" "unset"
+            elif _config_value_truncated "${CHATGPT_COOKIE_STRING}" "$ck_disk"; then
+                doctor_check fail "CHATGPT_COOKIE_STRING" \
+                    "truncated: ${#CHATGPT_COOKIE_STRING} of ${#ck_disk} chars survive .env"
+                echo "    ⓘ the .env value is unquoted, so bash cuts it at the first space"
+                echo "      or ';' and the proxy sends a partial cookie (upstream 401)."
+                echo "      Fix: harness config set CHATGPT_COOKIE_STRING '<paste>'"
+            else
                 doctor_check ok "CHATGPT_COOKIE_STRING" \
                     "set, ${#CHATGPT_COOKIE_STRING} chars"
-            else
-                doctor_check fail "CHATGPT_COOKIE_STRING" "unset"
             fi
 
             if [[ -n "${CHATGPT_MODEL_NAME:-}" ]]; then
