@@ -97,6 +97,12 @@ services:
       # the copy the image baked in, so an edit needs `harness restart`, no
       # rebuild.
       - ${HARNESS_REMINDER_PATH:-./proxy/reminder.md}:/app/reminder.md:ro
+      # The reminder's per-tool entries — legend, each tool's one-line
+      # guidance, and which tools get their full description echoed. Same
+      # seed/gitignore/default-to-the-tracked-file contract as the prose above;
+      # the proxy parses it with json.loads and degrades per key, so a typo in
+      # one description costs that description, not the block.
+      - ${HARNESS_TOOL_GUIDANCE_PATH:-./proxy/tool-guidance.json}:/app/tool-guidance.json:ro
     # init-firewall.sh requires NET_ADMIN and NET_RAW to manage iptables/ipset.
     cap_add:
       - NET_ADMIN

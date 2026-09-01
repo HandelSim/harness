@@ -30,6 +30,11 @@ COPY proxy/test_proxy.py .
 # path; the baked copy is what a container launched without that mount uses.
 COPY proxy/reminder.md .
 
+# Shipped default for the reminder's per-tool entries (legend, per-tool
+# guidance, detail-tool list). Same deal: docker-compose bind-mounts the user's
+# editable copy (<install root>/.harness-tool-guidance.json) over this path.
+COPY proxy/tool-guidance.json .
+
 # Universal egress firewall.
 COPY firewall/init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod +x /usr/local/bin/init-firewall.sh

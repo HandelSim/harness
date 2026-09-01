@@ -28,7 +28,7 @@ Two languages dominate: Bash (the ~6500-line `harness` CLI plus `scripts/lib/*.s
 
 **Python (`proxy/proxy.py`):**
 - Functions `lower_snake_case` (`extract_tool_calls_and_text`, `translate_history_and_apply_prompt`, `format_tools_to_text`, `make_chunk`, `_scan_balanced_json`, `_estimate_tokens`).
-- Module-level config constants `UPPER_SNAKE_CASE` with leading underscore when internal/hardcoded: `_CHANGE_SYSTEM_TO_USER=True`, `_HYBRID_DETAIL_TOOLS=["task","skill"]`, `_HOST_OS`. These are deliberately *not* env knobs — see `proxy/test_proxy.py` `test_detail_tools_is_project_managed_constant`.
+- Module-level config constants `UPPER_SNAKE_CASE` with leading underscore when internal/hardcoded: `_CHANGE_SYSTEM_TO_USER=True`, `_HOST_OS`. These are deliberately *not* env knobs. Reminder wording (`_HYBRID_LEGEND`, `_HYBRID_TOOL_GUIDANCE`, `_HYBRID_DETAIL_TOOLS`) uses the same naming but is loaded from `proxy/tool-guidance.json` at import — see `proxy/test_proxy.py` `TestToolGuidanceFile`.
 - Test classes `TestXxx` (unittest), test methods `test_<behavior>` (`proxy/test_proxy.py`).
 
 ## Code Style

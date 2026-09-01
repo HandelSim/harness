@@ -12,7 +12,8 @@ realpath (so it works on Windows Git Bash too) to find:
 - **`clone_dir`** — where the code lives (this script + `docker-compose.yml`
   + `scripts/`).
 - **`install_root`** — where user config (`.env`, `.harness-allowlist`,
-  `.harness-reminder.md`) and runtime state (`state/`) live.
+  `.harness-reminder.md`, `.harness-tool-guidance.json`) and runtime state
+  (`state/`) live.
 
 In production these are the same directory: `harness-install.sh` clones
 the repo and that clone IS the install root. Tests set
@@ -228,12 +229,15 @@ compose` invocation. It:
    service learns the host platform. The proxy injects it into the hybrid
    recency reminder's Environment line (see `architecture/proxy.md` →
    Host-OS injection); `docker-compose.yml` defaults it to `unknown` when
-   harness isn't the launcher. `cmd_start` separately seeds the user's
-   editable recency-reminder file (`seed_reminder_file` →
-   `.harness-reminder.md`, from the tracked `proxy/reminder.md`) and exports
-   `HARNESS_REMINDER_PATH` at it, so a reminder edit takes effect on
+   harness isn't the launcher. `cmd_start` separately seeds the user's two
+   editable reminder-data files — `seed_reminder_file` →
+   `.harness-reminder.md` (from the tracked `proxy/reminder.md`) and
+   `seed_tool_guidance_file` → `.harness-tool-guidance.json` (from
+   `proxy/tool-guidance.json`), both thin wrappers over
+   `seed_user_data_file` — and exports `HARNESS_REMINDER_PATH` /
+   `HARNESS_TOOL_GUIDANCE_PATH` at them, so an edit to either takes effect on
    `harness restart` with no rebuild — see `architecture/proxy.md` →
-   "Editable reminder prose".
+   "Editable reminder data".
 4. Invokes the detected container runtime (`docker` or `podman`, per
    `scripts/lib/platform.sh:harness_container_runtime`).
 

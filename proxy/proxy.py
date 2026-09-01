@@ -502,145 +502,58 @@ _META_TOOL_SERVE_BUDGET = 3
 # path for tests.
 _CHANGE_SYSTEM_TO_USER: bool = True
 
-# Hybrid mode only. Tool names whose FULL description is echoed verbatim under
-# the tool's own entry in the recency reminder. These are the tools whose valid
-# argument *values* are an unguessable closed set that opencode documents only
-# as prose inside the tool description — `task` (the valid `subagent_type`
-# agent names) and `skill` (the valid skill names). The per-tool signature
-# carries the parameter keys but not those values, so the whole description has
-# to reach recency. The description used to live in a separate
-# `<<<BEGIN_TOOL_DETAIL>>>` block; the consolidated recency format inlines it
-# under the tool's own entry so every fact about a tool (signature, guidance,
-# valid argument values) sits in one place. This is a project-managed
-# constant, not a user knob — the closed set is tied to the opencode tools we
-# ship for, so there is nothing for a user to tune.
-_HYBRID_DETAIL_TOOLS: List[str] = ["task", "skill"]
+# Hybrid mode only. The per-tool entries block — the legend, each tool's
+# one-line guidance, and the list of "detail" tools whose full description is
+# echoed — is DATA loaded from a file, not literals here, exactly like the
+# reminder prose in reminder.md: edit the file, `harness restart`, done. The
+# module globals below hold the shipped defaults' loaded values; see
+# `_tool_guidance_path` / `_load_tool_guidance` for the file contract.
+#
+# Tool names whose FULL description is echoed verbatim under the tool's own
+# entry. These are the tools whose valid argument *values* are an unguessable
+# closed set that opencode documents only as prose inside the tool description
+# — `task` (the valid `subagent_type` agent names) and `skill` (the valid skill
+# names). The per-tool signature carries the parameter keys but not those
+# values, so the whole description has to reach recency. The descriptions are
+# large, so this list is worth keeping short.
+_HYBRID_DETAIL_TOOLS: List[str] = []
 
-# Hybrid mode only. One-line guidance per tool — the failure mode the upstream
-# description warns about that the model still misses with the full schema in
-# context (e.g. `todowrite` being called repeatedly with the same item in
-# progress, `edit` called without a prior `read`). The string is appended after
-# the tool's signature on its recency entry — the "shortened description" that
-# replaces the multi-KB schema for the agent's read-at-each-turn budget. Tools
-# absent from this map render as bare `name(signature)` with no guidance, so
-# adding a custom MCP tool degrades gracefully — and equivalently, a tool with
-# an entry here renders only when opencode actually passes it for the turn.
-# This is why the map covers the union of opencode tools we know about
-# (including situational/optional ones like `websearch`, `lsp`, `apply_patch`,
+# One-line guidance per tool — the failure mode the upstream description warns
+# about that the model still misses with the full schema in context (e.g.
+# `todowrite` being called repeatedly with the same item in progress, `edit`
+# called without a prior `read`). The string is appended after the tool's
+# signature on its recency entry — the "shortened description" that replaces
+# the multi-KB schema for the agent's read-at-each-turn budget. Tools absent
+# from this map render as bare `name(signature)` with no guidance, so deleting
+# an entry is a supported edit and adding a custom MCP tool degrades
+# gracefully — and equivalently, a tool with an entry here renders only when
+# opencode actually passes it for the turn. That is why the shipped default
+# covers the union of opencode tools we know about (including
+# situational/optional ones like `websearch`, `lsp`, `apply_patch`,
 # `repo_clone`/`repo_overview`, `question`, `plan-enter`/`plan-exit`) even
 # though many turns won't ship most of them: the cost of a stale entry is zero
 # (`get` returns `None`, the line never renders), and the cost of missing an
 # entry the moment a tool does ship is a bare signature with no failure-mode
-# hint. Project-managed constant tied to the opencode tools we ship for; not a
-# user knob.
-_HYBRID_TOOL_GUIDANCE: Dict[str, str] = {
-    "apply_patch": (
-        "Apply a multi-file diff in one envelope. Wrap in `*** Begin Patch` "
-        "/ `*** End Patch`. Each file needs an `Add File:`/`Update File:`/"
-        "`Delete File:` header. Existing files must be `read` first, same "
-        "as `edit`."
-    ),
-    "bash": (
-        "Run a shell command (terminal: git, npm, docker, etc.). Pass "
-        "`description` (short verb phrase). Use `workdir`, not "
-        "`cd <dir> && …`. For file ops use read/edit/write, not "
-        "cat/sed/echo."
-    ),
-    "edit": (
-        "Exact-string replacement in a file. `read` the file first. "
-        "`oldString` must occur exactly once — add surrounding context or "
-        "pass `replaceAll: true`. Do not include the `N: ` line-number "
-        "prefix in `oldString`/`newString`."
-    ),
-    "glob": (
-        "Find files by name pattern (e.g. `**/*.ts`), sorted by mtime. For "
-        "file *contents* use `grep`. Batch independent patterns in parallel."
-    ),
-    "grep": (
-        "Regex search across file contents (not names). Use `include` to "
-        "scope (`\"*.ts\"`). For match counts use `bash` + `rg`."
-    ),
-    "lsp": (
-        "Language-server operations (defs, refs, hover, symbols). `line` "
-        "and `character` are 1-based. Use only when you need symbol-level "
-        "navigation; for plain text search, `grep`/`glob` are faster."
-    ),
-    "plan-enter": (
-        "Switch into the plan agent. Only call when the user has actually "
-        "asked to plan; not for simple/direct asks."
-    ),
-    "plan-exit": (
-        "Switch out of the plan agent into build. Only call after the plan "
-        "file is complete and the user is ready to implement."
-    ),
-    "question": (
-        "Ask the user a clarifying question with options. Ask BEFORE "
-        "acting, not after. Don't ask for info the user has already "
-        "supplied this turn."
-    ),
-    "read": (
-        "Read a file (or list a directory) by absolute path. Param is "
-        "`filePath`, not `filename`/`path`. Prefer one larger read over many "
-        "small re-reads."
-    ),
-    "repo_clone": (
-        "Clone an external repo into opencode's cache. For *external* repos "
-        "only — your working dir is already mounted. The cache is read-only "
-        "research material; don't try to modify it."
-    ),
-    "repo_overview": (
-        "Summarise structure/entrypoints of a cloned repo. Run after "
-        "`repo_clone` to orient. Don't re-call within the same task."
-    ),
-    "skill": (
-        "Load a named skill's instructions into context. `name` must match "
-        "exactly one of the skills listed below (closed set)."
-    ),
-    "task": (
-        "Launch a sub-agent. `subagent_type` must match the closed list "
-        "below. A sub-agent does NOT share your context — it starts blind, "
-        "so write a self-contained, detailed prompt: state the goal, the "
-        "relevant files/paths, the constraints, and exactly what to return. "
-        "Sub-agent output is invisible to the user — summarise it back. "
-        "Launch independent agents in parallel (multiple calls in one "
-        "message), but spawn at most 8 at a time."
-    ),
-    "todowrite": (
-        "Maintain a structured todo list across the turn. Each item is "
-        "`{content, status, priority}` — `priority` is the string "
-        "`'high'`/`'medium'`/`'low'` (NOT an int, NOT omitted), `content` is "
-        "the task text (NOT `description`/`subject`), `status` is "
-        "`'pending'`/`'in_progress'`/`'completed'`/`'cancelled'`. Use only "
-        "for ≥3 non-trivial steps. Exactly ONE item may be `in_progress`. "
-        "Flip an item to `completed` immediately after finishing it — not at "
-        "end-of-turn, and not in the same call that starts it. The list is also "
-        "your memory across a context compaction: keep it accurate so you can "
-        "resume on track if earlier turns are summarized away."
-    ),
-    "webfetch": (
-        "Fetch a URL and convert to markdown/text/html. Read-only. If the "
-        "fetch fails or is empty, say so — never invent the page contents."
-    ),
-    "websearch": (
-        "Live web search via the session's web search provider. Use the "
-        "current year in queries (avoid stale-year framing). If you already "
-        "have the URL, prefer `webfetch`."
-    ),
-    "write": (
-        "Create or overwrite a file at a path. If the file already exists "
-        "you must `read` it first or the call fails. Don't create "
-        "README/docs files unless asked."
-    ),
-    # NOTE: MCP tool guidance is NOT here. opencode exposes an MCP server's
-    # tools as `<server>_<tool>`, and those one-liners are DATA owned per-MCP,
-    # not code — they load at startup into `_MCP_TOOL_RECENCY` from the
-    # HARNESS_MCP_TOOL_RECENCY env var (the harness CLI merges each enabled
-    # MCP's `recency.json`). The bundled serena reference MCP ships
-    # `mcp-registry/serena/recency.json`; `_format_tool_entries` consults
-    # `_MCP_TOOL_RECENCY` as a fallback to this map. This map stays the union of
-    # opencode's OWN tools (the shipped harness<->opencode contract). See
-    # architecture/mcp.md "Tool recency descriptions".
-}
+# hint.
+#
+# NOTE: MCP tool guidance is NOT here. opencode exposes an MCP server's tools
+# as `<server>_<tool>`, and those one-liners are DATA owned per-MCP — they load
+# at startup into `_MCP_TOOL_RECENCY` from the HARNESS_MCP_TOOL_RECENCY env var
+# (the harness CLI merges each enabled MCP's `recency.json`). The bundled
+# serena reference MCP ships `mcp-registry/serena/recency.json`;
+# `_format_tool_entries` consults `_MCP_TOOL_RECENCY` as a fallback to this
+# map. This map stays opencode's OWN tools, which is why it ships as one file
+# with the harness rather than per-MCP. See architecture/mcp.md.
+_HYBRID_TOOL_GUIDANCE: Dict[str, str] = {}
+
+# The legend rendered above the per-tool entries, plus the two sentences
+# appended to it conditionally: `_HYBRID_STATE_CHECK_NOTE` only when a tool in
+# this turn's toolset carries a `[state-check]` marker, and
+# `_HYBRID_TOOL_SEARCH_NOTE` only when cooperative tool-search is enabled.
+# Loaded from the same file; each falls back on its own.
+_HYBRID_LEGEND: str = ""
+_HYBRID_STATE_CHECK_NOTE: str = ""
+_HYBRID_TOOL_SEARCH_NOTE: str = ""
 
 # opencode builds the `task` tool's description by appending a dynamic agent
 # list onto a block of static boilerplate ("when to use Task", usage notes).
@@ -720,6 +633,59 @@ _REMINDER_FALLBACK = (
 # Set by _setup_reminder_template(). None means "not loaded yet"; the builder
 # lazy-loads so importing proxy.py in tests works without calling main().
 _REMINDER_TEMPLATE: Optional[str] = None
+
+
+# Hybrid mode only. The per-tool entries block's data (legend, per-tool
+# guidance, detail-tool list) lives in a FILE for the same reason the reminder
+# prose does: it is wording, not logic, and an operator must be able to retune
+# a tool's one-liner without a code change.
+#
+# Two rungs, mirroring `_reminder_template_path`:
+#   1. HARNESS_TOOL_GUIDANCE_PATH — set by `harness host` (host mode runs
+#      proxy.py straight from the clone, so there is no mount to override
+#      anything).
+#   2. tool-guidance.json next to proxy.py — /app/tool-guidance.json in the
+#      container, which docker-compose bind-mounts the user's
+#      `.harness-tool-guidance.json` over. The Dockerfile also COPYs the
+#      tracked default there, so a container with no mount still has guidance.
+# Resolved off `__file__`, never a hardcoded `proxy/`: the image flattens the
+# repo layout into /app.
+def _tool_guidance_path() -> str:
+    env_path = os.environ.get("HARNESS_TOOL_GUIDANCE_PATH", "").strip()
+    if env_path:
+        return env_path
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "tool-guidance.json"
+    )
+
+
+# Emergency fallbacks, used per-section when the file is missing, unreadable,
+# not a JSON object, or that one key is missing/the wrong type. Deliberately
+# NOT copies of the shipped file: duplicating the wording would let the two
+# drift, and the whole point of the file is that it is the single place the
+# wording lives. They carry only the mechanically load-bearing part — what the
+# signature syntax means, and what the two conditional markers mean — because
+# without those the entries are an unexplained list. There is deliberately NO
+# fallback guidance map: with the file gone, tools render as bare signatures,
+# which `_format_tool_entries` already handles as its normal
+# unknown-tool path.
+_HYBRID_LEGEND_FALLBACK = (
+    "Tools — signature format: name(required, [optional]); bracketed = "
+    "optional; names not listed are unavailable; parameter names must match "
+    "exactly. Full schemas are at <<<BEGIN_AGENT_TOOLS>>>."
+)
+_HYBRID_STATE_CHECK_NOTE_FALLBACK = (
+    " A tool marked [state-check] mutates state — orient with the server's "
+    "read-only state tool before calling it."
+)
+_HYBRID_TOOL_SEARCH_NOTE_FALLBACK = (
+    " You can also call tool_list() or tool_search({\"query\": \"...\"}) to "
+    "fetch a tool's full signature on demand."
+)
+# The detail-tool list is structure, not wording, so unlike the guidance map it
+# does get a built-in fallback: losing it would strand `task`'s valid agent
+# names and `skill`'s valid skill names, which the signature alone cannot carry.
+_HYBRID_DETAIL_TOOLS_FALLBACK: List[str] = ["task", "skill"]
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +806,171 @@ def _setup_reminder_template() -> None:
         return
     _REMINDER_TEMPLATE = body
     print(f"[i] reminder template: {len(body)} chars from {path}", flush=True)
+
+
+def _load_tool_guidance(path: str):
+    """Parse the per-tool entries file and return
+    `(values, warnings)` — a pure function so tests can exercise every
+    degradation path without patching stdout.
+
+    `values` always has all five keys (`legend`, `state_check_note`,
+    `tool_search_note`, `detail_tools`, `tools`) with usable types.
+    `warnings` is a list of human-readable strings the caller logs with `[!]`.
+
+    Every failure degrades PER SECTION rather than losing the file: the point
+    of moving this data out of proxy.py is that an operator hand-edits it, and
+    a typo in one tool's description must not silently blank the legend and
+    the other seventeen. Only a failure that prevents parsing at all (missing
+    file, malformed JSON, non-object top level) costs every section — and even
+    then each one falls back to a built-in, so the reminder still renders.
+    Keys the file does not define are simply not overridden; keys starting
+    with `_` are ignored, which is what lets the shipped file carry its own
+    `_README`.
+    """
+    warnings: List[str] = []
+    values = {
+        "legend": _HYBRID_LEGEND_FALLBACK,
+        "state_check_note": _HYBRID_STATE_CHECK_NOTE_FALLBACK,
+        "tool_search_note": _HYBRID_TOOL_SEARCH_NOTE_FALLBACK,
+        "detail_tools": list(_HYBRID_DETAIL_TOOLS_FALLBACK),
+        "tools": {},
+    }
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        warnings.append(
+            f"tool guidance unreadable at {path} ({exc}); using built-in "
+            "defaults (tools render as bare signatures)"
+        )
+        return values, warnings
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        # json.JSONDecodeError carries lineno/colno; naming them is the whole
+        # ergonomic point of a hand-edited config file.
+        where = ""
+        if getattr(exc, "lineno", None) is not None:
+            where = f" at line {exc.lineno} column {exc.colno}"
+        warnings.append(
+            f"tool guidance at {path} is not valid JSON{where}: {exc}; using "
+            "built-in defaults (tools render as bare signatures)"
+        )
+        return values, warnings
+    if not isinstance(data, dict):
+        warnings.append(
+            f"tool guidance at {path} must be a JSON object, got "
+            f"{type(data).__name__}; using built-in defaults"
+        )
+        return values, warnings
+
+    for key in ("legend", "state_check_note", "tool_search_note"):
+        if key not in data:
+            continue
+        val = data[key]
+        if not isinstance(val, str):
+            warnings.append(
+                f"tool guidance: '{key}' must be a string, got "
+                f"{type(val).__name__}; keeping the built-in default"
+            )
+            continue
+        # An empty string is a deliberate edit ("suppress this sentence"), so
+        # it is honoured for the two optional notes. An empty legend would
+        # leave the tool list unexplained, so that one falls back.
+        if key == "legend" and not val.strip():
+            warnings.append(
+                "tool guidance: 'legend' is empty; keeping the built-in default"
+            )
+            continue
+        values[key] = val
+
+    if "detail_tools" in data:
+        val = data["detail_tools"]
+        if isinstance(val, list):
+            kept = [x for x in val if isinstance(x, str) and x.strip()]
+            dropped = len(val) - len(kept)
+            if dropped:
+                warnings.append(
+                    f"tool guidance: dropped {dropped} non-string/empty entry"
+                    f"{'' if dropped == 1 else 'ies'} from 'detail_tools'"
+                )
+            # An explicit empty list is a valid edit: echo no full descriptions.
+            values["detail_tools"] = kept
+        else:
+            warnings.append(
+                "tool guidance: 'detail_tools' must be a list, got "
+                f"{type(val).__name__}; keeping the built-in default"
+            )
+
+    if "tools" in data:
+        val = data["tools"]
+        if isinstance(val, dict):
+            kept = {}
+            bad = []
+            for k, v in val.items():
+                if isinstance(k, str) and isinstance(v, str) and v.strip():
+                    kept[k] = v
+                else:
+                    bad.append(str(k))
+            if bad:
+                # Name the offending keys: with ~18 entries, "one of them is
+                # wrong" is not an actionable message.
+                warnings.append(
+                    "tool guidance: dropped non-string/empty description(s) "
+                    f"for {', '.join(sorted(bad))}"
+                )
+            values["tools"] = kept
+        else:
+            warnings.append(
+                "tool guidance: 'tools' must be a JSON object, got "
+                f"{type(val).__name__}; no per-tool guidance will render"
+            )
+    return values, warnings
+
+
+def _setup_tool_guidance() -> None:
+    """Load the per-tool entries file into the module globals and log the
+    result. Called once from `main()`; also called at import (silently, via
+    `_load_tool_guidance`) so importing proxy.py in tests needs no `main()`.
+
+    Every problem is logged with a loud `[!]` naming the file and, for a JSON
+    syntax error, the line and column — but nothing here is fatal. The
+    guidance is a prompt-quality aid; losing it costs the model its
+    failure-mode hints, not its ability to call tools."""
+    global _HYBRID_LEGEND, _HYBRID_STATE_CHECK_NOTE, _HYBRID_TOOL_SEARCH_NOTE
+    global _HYBRID_DETAIL_TOOLS, _HYBRID_TOOL_GUIDANCE
+    path = _tool_guidance_path()
+    values, warnings = _load_tool_guidance(path)
+    for msg in warnings:
+        print(f"[!] {msg}", flush=True)
+    _HYBRID_LEGEND = values["legend"]
+    _HYBRID_STATE_CHECK_NOTE = values["state_check_note"]
+    _HYBRID_TOOL_SEARCH_NOTE = values["tool_search_note"]
+    _HYBRID_DETAIL_TOOLS = values["detail_tools"]
+    _HYBRID_TOOL_GUIDANCE = values["tools"]
+    print(
+        f"[i] tool guidance: {len(_HYBRID_TOOL_GUIDANCE)} tool(s), "
+        f"{len(_HYBRID_DETAIL_TOOLS)} detail tool(s) from {path}",
+        flush=True,
+    )
+
+
+# Populate the globals at import so `_format_tool_entries` works in a test that
+# never calls main(). Silent by design — main() re-runs `_setup_tool_guidance`
+# and it is that call that prints the banner line and any `[!]`. Loading here
+# rather than lazily on first render also keeps the globals patchable: a test
+# that patches `_HYBRID_DETAIL_TOOLS` is never clobbered mid-request by a
+# first-use load.
+(
+    _tg_values,
+    _tg_warnings,
+) = _load_tool_guidance(_tool_guidance_path())
+_HYBRID_LEGEND = _tg_values["legend"]
+_HYBRID_STATE_CHECK_NOTE = _tg_values["state_check_note"]
+_HYBRID_TOOL_SEARCH_NOTE = _tg_values["tool_search_note"]
+_HYBRID_DETAIL_TOOLS = _tg_values["detail_tools"]
+_HYBRID_TOOL_GUIDANCE = _tg_values["tools"]
+del _tg_values, _tg_warnings
 
 
 def _setup_tool_search() -> None:
@@ -1108,8 +1239,9 @@ def _format_tool_signature(name, required, optional):
 
 def _format_tool_entries(tool_signatures, tool_details=None):
     """Render the per-tool block of the hybrid recency reminder. One entry per
-    tool — signature + the one-line guidance from `_HYBRID_TOOL_GUIDANCE` for
-    well-known tools + (for detail tools) the verbatim description from
+    tool — signature + the one-line guidance from `_HYBRID_TOOL_GUIDANCE`
+    (loaded from tool-guidance.json) + (for detail tools) the verbatim
+    description from
     `_extract_tool_details`. Consolidates information that used to be split
     across three places (signature line, no per-tool guidance, separate
     `<<<BEGIN_TOOL_DETAIL>>>` blocks) into a single entry per tool so the
@@ -1149,30 +1281,17 @@ def _format_tool_entries(tool_signatures, tool_details=None):
             lines.append(f"{head}\n{indented}")
         else:
             lines.append(head)
-    legend = (
-        "Tools — one entry per tool, all info for a tool in one place "
-        "(signature, guidance, and any closed-set argument values). Full "
-        "schemas are at <<<BEGIN_AGENT_TOOLS>>>. Signature format: "
-        "name(required, [optional]); bracketed = optional; names not listed "
-        "are unavailable; parameter names must match exactly (e.g. "
-        "`filename` fails where `filePath` is required)."
-    )
+    # Legend and its two conditional sentences are user-editable data loaded
+    # from tool-guidance.json, same as the per-tool guidance above.
+    legend = _HYBRID_LEGEND
     if any(name in _MCP_STATE_CHECK_TOOLS for name, _, _ in tool_signatures):
         # Orient-first rule, surfaced only when a state-check tool is actually in
         # this turn's toolset. This is the standing "call state first" policy at
         # the always-injected altitude (the harness ships no runtime AGENTS.md;
         # the recency reminder is its standing-instruction channel).
-        legend += (
-            " A tool marked [state-check] mutates state — before calling it, "
-            "call the server's read-only state/orientation tool first to see "
-            "current state; don't mutate blind."
-        )
+        legend += _HYBRID_STATE_CHECK_NOTE
     if _TOOL_SEARCH_ENABLED:
-        legend += (
-            " You can also call tool_list() to list every tool, or "
-            "tool_search({\"query\": \"...\"}) to fetch a tool's full signature "
-            "and description on demand."
-        )
+        legend += _HYBRID_TOOL_SEARCH_NOTE
     return f"\n\n{legend}\n" + "\n".join(lines)
 
 
@@ -2931,6 +3050,7 @@ def main() -> None:
     _setup_mcp_tool_recency()
     _setup_state_check_tools()
     _setup_tool_search()
+    _setup_tool_guidance()
     _setup_reminder_template()
 
     raw_output = os.environ.get("OUTPUT_DIR", "").strip()
@@ -2974,6 +3094,7 @@ def main() -> None:
         f"   tool-search:    {'on' if _TOOL_SEARCH_ENABLED else 'off'}\n"
         f"   host OS:        {_HOST_OS or '(unknown)'}\n"
         f"   reminder:       {_reminder_template_path()}\n"
+        f"   tool guidance:  {_tool_guidance_path()}\n"
         f"   debug dumps:    {output_status}\n"
         "============================================================",
         flush=True,

@@ -771,45 +771,62 @@ mcp_is_enabled() {
     [[ "$v" == "true" ]]
 }
 
-# Seed the user's editable recency-reminder file from the tracked default.
+# Seed a user-editable prompt-data file from its tracked default.
 #
-# The reminder's prose is data, not code: <install root>/.harness-reminder.md is
+# Two files use this: the recency reminder's prose (.harness-reminder.md from
+# proxy/reminder.md) and the per-tool entries (.harness-tool-guidance.json from
+# proxy/tool-guidance.json). Both are data, not code: the user copy is
 # gitignored and user-owned, docker-compose bind-mounts it over the container's
-# /app/reminder.md, and the proxy loads it at startup. Seeding here (rather than
-# only in harness-install.sh) means an existing install picks the file up on its
-# next `harness start`, with no upgrade action needed.
+# /app copy, and the proxy loads it at startup. Seeding here (rather than only
+# in harness-install.sh) means an existing install picks the file up on its next
+# `harness start`, with no upgrade action needed.
 #
 # Only ever creates a MISSING file — an edited copy is never overwritten, so a
 # later `harness upgrade` cannot clobber the user's wording. The consequence is
 # the standard user-config tradeoff: improvements to the shipped default do not
-# reach an install that already has a copy. Delete .harness-reminder.md to take
-# the new default.
-seed_reminder_file() {
-    local user_copy="$install_root/.harness-reminder.md"
-    local shipped="$clone_dir/proxy/reminder.md"
+# reach an install that already has a copy. Delete the user copy to take the
+# new default.
+#
+# Args: <basename of the user copy> <repo-relative path of the tracked default>
+#       <what editing it changes, for the seeded-it hint>
+seed_user_data_file() {
+    local base="$1" shipped_rel="$2" what="$3"
+    local user_copy="$install_root/$base"
+    local shipped="$clone_dir/$shipped_rel"
     # A compose bind-mount whose source is missing makes docker CREATE an empty
     # directory there. Left in place that directory looks like "already seeded"
     # forever and mounts a directory over the file, so the proxy silently runs
     # on its built-in fallback. rmdir only removes it while it is empty.
     if [[ -d "$user_copy" ]]; then
         rmdir "$user_copy" 2>/dev/null || {
-            err "$user_copy is a non-empty directory; expected the reminder file."
-            err "Remove it, then re-run 'harness start' to seed the reminder."
+            err "$user_copy is a non-empty directory; expected a file."
+            err "Remove it, then re-run 'harness start' to seed it."
             return 0
         }
     fi
     [[ -e "$user_copy" ]] && return 0
     if [[ ! -f "$shipped" ]]; then
-        err "proxy/reminder.md missing from the clone; the proxy falls back to"
-        err "its built-in reminder. Run 'harness update' to restore it."
+        err "$shipped_rel missing from the clone; the proxy falls back to its"
+        err "built-in default. Run 'harness update' to restore it."
         return 0
     fi
     if cp "$shipped" "$user_copy" 2>/dev/null; then
-        err "seeded .harness-reminder.md — edit it to change the agent's"
-        err "        per-turn reminder, then 'harness restart'"
+        err "seeded $base — edit it to change $what,"
+        err "        then 'harness restart'"
     else
         err "could not write $user_copy; the proxy uses the image's default"
     fi
+}
+
+# Back-compat wrappers so the call sites (and tests) name the file they seed.
+seed_reminder_file() {
+    seed_user_data_file .harness-reminder.md proxy/reminder.md \
+        "the agent's per-turn reminder"
+}
+
+seed_tool_guidance_file() {
+    seed_user_data_file .harness-tool-guidance.json proxy/tool-guidance.json \
+        "the per-tool entries in that reminder"
 }
 
 # Build the consolidated MCP tool-recency map for the proxy. For every ENABLED
@@ -2336,11 +2353,15 @@ cmd_start() {
     # The reminder file is a compose bind-mount source, so it must exist before
     # `up` — docker would otherwise create a directory in its place.
     seed_reminder_file
-    # Point compose at the user copy when it exists. Unset otherwise, so the
-    # mount falls back to the tracked proxy/reminder.md rather than to a path
+    seed_tool_guidance_file
+    # Point compose at the user copies when they exist. Unset otherwise, so each
+    # mount falls back to its tracked default in proxy/ rather than to a path
     # docker would have to invent.
     if [[ -f "$install_root/.harness-reminder.md" ]]; then
         export HARNESS_REMINDER_PATH="$install_root/.harness-reminder.md"
+    fi
+    if [[ -f "$install_root/.harness-tool-guidance.json" ]]; then
+        export HARNESS_TOOL_GUIDANCE_PATH="$install_root/.harness-tool-guidance.json"
     fi
 
     export HARNESS_MCP_TOOL_RECENCY="$(mcp_tool_recency_json)"
@@ -4174,13 +4195,18 @@ host_proxy_start() {
     local host_output_dir
     host_output_dir=$(host_output_dir_resolve "${OUTPUT_DIR:-}")
     # Host mode runs proxy.py straight from the clone, so there is no compose
-    # bind-mount to put the user's reminder file in proxy.py's default spot.
-    # Point the proxy at it explicitly. Empty when seeding failed: proxy.py then
-    # falls back to the tracked default sitting next to it in the clone.
+    # bind-mount to put the user's reminder / tool-guidance files in proxy.py's
+    # default spot. Point the proxy at them explicitly. Empty when seeding
+    # failed: proxy.py then falls back to the tracked defaults sitting next to
+    # it in the clone.
     seed_reminder_file
-    local host_reminder=""
+    seed_tool_guidance_file
+    local host_reminder="" host_tool_guidance=""
     if [[ -f "$install_root/.harness-reminder.md" ]]; then
         host_reminder="$install_root/.harness-reminder.md"
+    fi
+    if [[ -f "$install_root/.harness-tool-guidance.json" ]]; then
+        host_tool_guidance="$install_root/.harness-tool-guidance.json"
     fi
     # HARNESS_FORCE_LOOPBACK is belt-and-suspenders for the no-firewall mode:
     # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
@@ -4205,6 +4231,7 @@ host_proxy_start() {
         OUTPUT_DIR="$host_output_dir" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
         HARNESS_REMINDER_PATH="$host_reminder" \
+        HARNESS_TOOL_GUIDANCE_PATH="$host_tool_guidance" \
         nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"

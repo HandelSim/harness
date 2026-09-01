@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
-# tests/unit_reminder_seed_test.sh — exercise seed_reminder_file, the helper
-# that puts the user's editable recency-reminder file in place.
+# tests/unit_reminder_seed_test.sh — exercise seed_reminder_file and
+# seed_tool_guidance_file, the two wrappers over seed_user_data_file that put
+# the user's editable prompt-data files in place.
 #
-# The hybrid reminder's prose is DATA, not code: the tracked default lives at
-# proxy/reminder.md and is copied once to <install_root>/.harness-reminder.md,
-# which is gitignored and user-owned. The invariants that matter:
+# The hybrid reminder's prose and its per-tool entries are DATA, not code: the
+# tracked defaults live at proxy/reminder.md and proxy/tool-guidance.json and
+# are copied once to <install_root>/.harness-reminder.md and
+# <install_root>/.harness-tool-guidance.json, which are gitignored and
+# user-owned. The invariants that matter:
 #
 #   - it seeds when the file is missing (so an existing install picks the
 #     feature up on its next `harness start`, no upgrade action needed);
@@ -15,6 +18,10 @@
 #     whose source is missing makes docker create one; left in place it looks
 #     like "already seeded" forever and mounts a directory over the file, so
 #     the proxy silently runs on its built-in fallback (see F152, P064).
+#
+# T1-T5 cover the shared helper through the reminder wrapper; T6-T8 cover the
+# tool-guidance wrapper, which must seed a SEPARATE file with the same rules
+# (see F154, P092).
 #
 # Runs without docker: `harness` is sourced with HARNESS_SOURCE_ONLY=1 so
 # main() never runs, and install_root/clone_dir are pointed at a tmpdir.
@@ -42,12 +49,14 @@ TMP_ROOT="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_ROOT"; }
 trap cleanup EXIT
 
-# Fresh install_root + clone_dir per case; seed_reminder_file reads both.
+# Fresh install_root + clone_dir per case; the seeders read both.
 new_case() {
     local d="$TMP_ROOT/$1"
     mkdir -p "$d/root" "$d/clone/proxy"
     printf '%s\n' "<!-- header -->" "[Reminder shipped default]" \
         >"$d/clone/proxy/reminder.md"
+    printf '%s\n' '{"tools": {"bash": "shipped default line"}}' \
+        >"$d/clone/proxy/tool-guidance.json"
     install_root="$d/root"
     clone_dir="$d/clone"
 }
@@ -104,6 +113,39 @@ out=$(seed_reminder_file 2>&1) || fail "T5: seed_reminder_file returned non-zero
 grep -q "proxy/reminder.md missing" <<<"$out" \
     || fail "T5: expected a warning about the missing default, got: $out"
 ok "T5: a missing proxy/reminder.md warns and returns cleanly"
+
+# --- T6: the tool-guidance file is seeded independently of the reminder ------
+new_case t6
+seed_tool_guidance_file 2>/dev/null
+[[ -f "$install_root/.harness-tool-guidance.json" ]] \
+    || fail "T6: .harness-tool-guidance.json was not created"
+diff -q "$clone_dir/proxy/tool-guidance.json" \
+    "$install_root/.harness-tool-guidance.json" >/dev/null \
+    || fail "T6: seeded copy differs from proxy/tool-guidance.json"
+[[ ! -e "$install_root/.harness-reminder.md" ]] \
+    || fail "T6: the guidance seeder must not touch the reminder file"
+ok "T6: missing tool-guidance file is seeded byte-for-byte, on its own"
+
+# --- T7: an edited tool-guidance copy is never overwritten -------------------
+# Same upgrade-safety contract as the reminder: a `harness upgrade` must not
+# discard retuned per-tool descriptions.
+new_case t7
+printf '%s\n' '{"tools": {"bash": "MY OWN LINE"}}' \
+    >"$install_root/.harness-tool-guidance.json"
+seed_tool_guidance_file 2>/dev/null
+grep -q "MY OWN LINE" "$install_root/.harness-tool-guidance.json" \
+    || fail "T7: seeding clobbered the user's edited guidance"
+ok "T7: an existing tool-guidance copy is left untouched (upgrade-safe)"
+
+# --- T8: docker's empty-directory artifact is handled here too ---------------
+new_case t8
+mkdir "$install_root/.harness-tool-guidance.json"
+seed_tool_guidance_file 2>/dev/null
+[[ -f "$install_root/.harness-tool-guidance.json" ]] \
+    || fail "T8: empty directory was not replaced by the seeded file"
+grep -q "shipped default line" "$install_root/.harness-tool-guidance.json" \
+    || fail "T8: replacement file does not carry the shipped default"
+ok "T8: docker's empty-directory artifact is rmdir'd, then seeded"
 
 echo "------------------------------------------------------------"
 echo "REMINDER SEED TEST PASSED (${pass} checks)"

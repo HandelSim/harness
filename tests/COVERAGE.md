@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 494 rows (F=155, P=88, A=24, M=33, N=31, U=29, Pe=16, O=0, I=50, B=10, Ho=18, C=40). 491 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
+Inventory total: 496 rows (F=156, P=89, A=24, M=33, N=31, U=29, Pe=16, O=0, I=50, B=10, Ho=18, C=40). 493 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -34,8 +34,8 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   `make_chunk`, prompt-injection modes, system→user rewrite, usage override. Also carries
   the ChatGPT backend-api classes (`TestChatGPTFlatten`, `TestChatGPTCollectStream`,
   `TestChatGPTPost`, `TestUpstreamPostRouting`, `TestChatGPTEndToEnd`,
-  `TestChatGPTModelCatalog`, `TestChatGPTValidateConfig`) covering P065-P091, and
-  `TestReminderTemplateFile` covering P064.
+  `TestChatGPTModelCatalog`, `TestChatGPTValidateConfig`) covering P065-P091,
+  `TestReminderTemplateFile` covering P064, and `TestToolGuidanceFile` covering P092.
 - `tests/unit_chatgpt_test.sh` (no docker) — CLI-side `harness chatgpt` / `harness chatgpt
   host`: backend selection (`_backend_is_chatgpt`/`_effective_default_model`), the shared
   `proxy:` runtime-override mapping, per-backend required-config swap
@@ -73,11 +73,13 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   harness_jq fallback consumed by `_upg_json_array` / `_upg_json_str`).
 - `tests/podman_smoke_test.sh` (229 lines, manual-run) — `HARNESS_CONTAINER_RUNTIME=podman`
   smoke. Useful corroboration for I032/N017.
-- `tests/unit_reminder_seed_test.sh` (no docker) — `seed_reminder_file`: seeds the
-  gitignored `<install_root>/.harness-reminder.md` from the tracked
-  `proxy/reminder.md`, never overwrites an edited copy, `rmdir`s docker's
-  empty-directory artifact, leaves a non-empty directory alone with a warning,
-  and tolerates a missing tracked default. Sourced via `HARNESS_SOURCE_ONLY=1`.
+- `tests/unit_reminder_seed_test.sh` (no docker) — `seed_reminder_file` (T1-T5) and
+  `seed_tool_guidance_file` (T6-T8), the two wrappers over `seed_user_data_file`:
+  each seeds its gitignored `<install_root>` copy from the tracked
+  `proxy/reminder.md` / `proxy/tool-guidance.json`, never overwrites an edited
+  copy, and `rmdir`s docker's empty-directory artifact; the shared helper's
+  non-empty-directory warning and missing-tracked-default tolerance are covered
+  once, through the reminder wrapper. Sourced via `HARNESS_SOURCE_ONLY=1`.
   Covers F152 (T1-T5).
 - `tests/unit_host_test.sh` (no docker) — containerless `harness host`
   helpers, sourced via `HARNESS_SOURCE_ONLY=1`: `host_require_config`,
@@ -103,17 +105,17 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   370 |  75.20% |
-| yellow   |     5 |   1.02% |
-| red      |   117 |  23.78% |
-| **total**|   492 | 100.00% |
+| green    |   372 |  75.30% |
+| yellow   |     5 |   1.01% |
+| red      |   117 |  23.68% |
+| **total**|   494 | 100.00% |
 
 Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
-| F      |   155 |   114 |      2 |  39 |
-| P      |    88 |    74 |      1 |  13 |
+| F      |   156 |   115 |      2 |  39 |
+| P      |    89 |    75 |      1 |  13 |
 | A      |    24 |    12 |      0 |  12 |
 | M      |    33 |    28 |      0 |   5 |
 | N      |    31 |     6 |      0 |  25 |
@@ -124,7 +126,7 @@ Per-prefix breakdown:
 | B      |    10 |    10 |      0 |   0 |
 | Ho     |    18 |    18 |      0 |   0 |
 | C      |    40 |    40 |      0 |   0 |
-| **all**|   494 |   372 |      5 | 117 |
+| **all**|   496 |   374 |      5 | 117 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -160,7 +162,7 @@ test file and line range carrying the strongest assertion, a one-line
 evidence note (quoting real assertion text where possible), and — for
 non-green rows — the gap.
 
-## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (155 rows)
+## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (156 rows)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -319,8 +321,9 @@ non-green rows — the gap.
 | F150 | green  | tests/harness_test.sh (T26pm)               | T26pm: `_parse_prompt_mode_flag` accepts `--prompt-mode <m>` and `--prompt-mode=<m>`, rejects invalid value + unknown option (non-zero); `write_runtime_override` emits a standalone `proxy:` block with `PROXY_PROMPT_MODE`, and folds into the proxy firewall opt-out block (single `proxy:` mapping with both env entries) when both apply. | |
 | F152 | green  | tests/unit_reminder_seed_test.sh (T1-T5)    | T1: a missing `.harness-reminder.md` is created and `cmp`s byte-for-byte with the tracked `proxy/reminder.md`; T2: an edited copy survives a second `seed_reminder_file` untouched; T3: an EMPTY directory at that path is `rmdir`'d and replaced by the seeded file; T4: a NON-empty directory is left intact, its contents preserved, and a warning naming it is printed; T5: a missing `proxy/reminder.md` warns and returns 0 without creating anything. | `cmd_start`'s `HARNESS_REMINDER_PATH` export and `host_proxy_start`'s `nohup` env are not asserted by this test — only the seeding helper is. |
 | F153 | green  | tests/unit_config_test.sh (T13)             | A fixture `.env` mixing eight legitimate line shapes (comment with `;`/`&`, plain values, `export KEY=`, single- and double-quoted values with spaces and semicolons, an inline `# comment`, an empty value, `$HOME`) with three offenders (`BAD_SPACE=a b`, `BAD_SEMI=a=1; oai-did=2`, `BAD_AMP=a&b`): all three are named, none of the eight is, the warning names the fix, and a clean `.env` produces no output at all. | The call site (the scan runs before `source` on every invocation) is exercised end-to-end only by running the CLI, not asserted here. |
+| F154 | green  | tests/unit_reminder_seed_test.sh (T6-T8)    | T6: a missing `.harness-tool-guidance.json` is created, `diff`s byte-for-byte with the tracked `proxy/tool-guidance.json`, and the reminder file is NOT created as a side effect; T7: an edited copy survives a second `seed_tool_guidance_file` untouched; T8: an EMPTY directory at that path is `rmdir`'d and replaced by the seeded file. | Same gap as F152: `cmd_start`'s `HARNESS_TOOL_GUIDANCE_PATH` export and `host_proxy_start`'s `nohup` env are not asserted — only the seeding helper is. The non-empty-directory and missing-default paths are covered once, through the reminder wrapper (T4/T5), since both wrappers share `seed_user_data_file`. |
 
-## P — Proxy (88 IDs)
+## P — Proxy (89 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -378,7 +381,7 @@ non-green rows — the gap.
 | P055 | green  | proxy/test_proxy.py:26-131                  | TestFormatTools asserts each tool's name, schema, and arguments enumerated. | |
 | P056 | green  | tests/proxy_test.sh (Scenario C) + proxy/test_proxy.py (TestModelPassthrough) | Scenario C asserts the forwarded body's `model == 'harness'` (the passed-through request model, not a fixed id); test_requested_model_passes_through_verbatim asserts `gpt-4:latest` is forwarded unchanged (no tag stripping). | |
 | P057 | green  | proxy/test_proxy.py:939-1004                | test_tool_result_name_resolved_via_tool_call_id / _falls_back_to_positional_order / _prefers_explicit_field / _unknown_when_no_metadata: name resolution chain (field → id → positional → `unknown_tool`). | |
-| P058 | green  | proxy/test_proxy.py (TestHybridDetailTools) | test_detail_inlined_under_flagged_task_tool_entry asserts the `<<<BEGIN_TOOL_DETAIL name="task">>>` block + verbatim agent types reach the last user message; test_detail_inlined_block_sits_inside_reminder_after_request asserts placement; test_no_inlined_detail_for_unflagged_tool / test_inlined_detail_only_for_present_flagged_tools / test_empty_flagged_set_disables_inlined_detail cover the gating; test_detail_tools_is_project_managed_constant asserts `_HYBRID_DETAIL_TOOLS == ["task","skill"]` (the env-parse tests were removed with `_setup_hybrid_detail_tools`). | |
+| P058 | green  | proxy/test_proxy.py (TestHybridDetailTools) | test_detail_inlined_under_flagged_task_tool_entry asserts the `<<<BEGIN_TOOL_DETAIL name="task">>>` block + verbatim agent types reach the last user message; test_detail_inlined_block_sits_inside_reminder_after_request asserts placement; test_no_inlined_detail_for_unflagged_tool / test_inlined_detail_only_for_present_flagged_tools / test_empty_flagged_set_disables_inlined_detail cover the gating; test_shipped_detail_tools_are_task_and_skill asserts the SHIPPED `_HYBRID_DETAIL_TOOLS == ["task","skill"]` (the list now comes from `tool-guidance.json`'s `detail_tools`, see P092; the env-parse tests were removed with `_setup_hybrid_detail_tools`). | |
 | P059 | green  | proxy/test_proxy.py:test_mode_hybrid_reminder_advises_default_to_tools (+_concurrent_task_agents/_has_honesty_rules/_has_environment_context/_drops_stale_value_parenthetical/_injects_known_host_os/_omits_host_os_when_unknown) | Asserts the labelled recency reminder: Workflow line (prefer a listed tool + `webfetch`/`todowrite`/`todoread` + concurrent `task` agents), Honesty line (anti-fabrication), Environment line (Linux container / mounted workdir / reproducibility), the dropped stale "which agent types…" parenthetical, host-OS parenthetical rendered when `_HOST_OS` set and omitted when empty, and that guidance sits OUTSIDE the `<<<BEGIN_USER_MESSAGE>>>` wrap. TestHostOsSetup covers `HARNESS_HOST_OS` parse/normalise/default. | |
 | P060 | green  | tests/proxy_test.sh (Scenario A2)            | Scenario A2 GETs `http://proxy:8000/v1/models` from the agent container and asserts the response lists the mock model `harness` and is an OpenAI `"object":"list"` envelope. | |
 | P061 | green  | proxy/test_proxy.py (TestConfigHelpers)      | test_normalize_* asserts `_normalize_api_base` strips `/v1/chat/completions`, `/chat/completions`, and a trailing `/v1` (and preserves a non-`/v1` prefix); chat/models URLs derive from the base. | |
@@ -412,6 +415,7 @@ non-green rows — the gap.
 | P089 | green  | proxy/test_proxy.py (TestChatGPTPost)       | test_a_stream_that_genuinely_said_nothing_is_still_a_200: a bare `data: [DONE]` stream yields `resp.status_code == 200` and `extract_assistant_content(resp.json()) == ""` (the positive control that keeps P088 from over-firing). | |
 | P090 | green  | proxy/test_proxy.py (TestChatGPTPost)       | test_origin_strips_a_path_prefix_from_the_base_url: with `base_url="https://chat.example.com/api"`, `headers["Origin"] == "https://chat.example.com"` and `headers["Referer"] == "https://chat.example.com/"`. | |
 | P091 | green  | proxy/test_proxy.py (TestChatGPTValidateConfig) | test_passthrough_is_rejected_on_the_chatgpt_backend: `_PROMPT_MODE="passthrough"` + `PROXY_BACKEND="chatgpt"` (with a complete CHATGPT_* trio) raises `SystemExit` from `_validate_config()`; test_passthrough_is_still_fine_on_the_openai_backend asserts the same mode does NOT raise on `PROXY_BACKEND="openai"`. | |
+| P092 | green  | proxy/test_proxy.py (TestToolGuidanceFile) | test_env_path_overrides_the_adjacent_default / test_default_path_sits_next_to_proxy_py (resolved off `proxy.__file__`, so it holds in the container where the Dockerfile flattens to /app); test_shipped_default_loads_every_section asserts the real `proxy/tool-guidance.json` loads with zero warnings and carries a legend, both notes, `detail_tools == ["task","skill"]` and >=18 non-empty descriptions; test_one_bad_description_does_not_cost_the_others asserts `{"bash": "...", "edit": 5, "read": ""}` keeps `bash` and names `edit`/`read` in one warning; test_a_missing_key_keeps_the_built_in_default / test_wrong_types_fall_back_per_key_and_name_the_key / test_empty_notes_are_honoured_but_an_empty_legend_is_not / test_explicit_empty_detail_tools_is_honoured / test_non_string_detail_tool_entries_are_dropped cover per-key degradation; test_malformed_json_names_line_and_column asserts the JSONDecodeError position reaches the message; test_missing_file_falls_back_loudly / test_directory_at_the_path_falls_back / test_non_object_top_level_falls_back assert the whole-file fallback; test_setup_logs_warnings_and_a_count covers `_setup_tool_guidance`'s `[!]` + count line; test_edited_file_reaches_the_rendered_block / test_a_tool_dropped_from_the_file_renders_a_bare_signature / test_notes_only_render_when_their_condition_holds assert the edit reaches `_format_tool_entries`. | |
 
 ## A — Agent runtime (init, configs, run-opencode/shell) (24 IDs)
 

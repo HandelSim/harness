@@ -55,7 +55,7 @@ last_mapped_commit: 4ebbb2c
 - Synthetic meta-tools (opt-in, `HARNESS_TOOL_SEARCH=1`): `tool_search`, `tool_list` — let model retrieve tool schemas on demand
 
 **Tool Guidance (Recency System):**
-- Core tools have guidance built into `_HYBRID_TOOL_GUIDANCE` map in `proxy/proxy.py:200-291`.
+- Core tools have guidance in `proxy/tool-guidance.json`, loaded into the `_HYBRID_TOOL_GUIDANCE` map by `proxy/proxy.py:_setup_tool_guidance`.
 - MCP tools have guidance from `recency.json` files in `mcp-registry/<name>/` and `state/mcp/<name>/` (host MCPs).
 - Guidance merged by harness CLI at startup into `HARNESS_MCP_TOOL_RECENCY` JSON object (env var), injected into proxy.
 - State-check (mutating) tools flagged in `recency.json` `state_check` field, merged into `HARNESS_MCP_STATE_CHECK` array, injected into proxy.

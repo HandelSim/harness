@@ -32,15 +32,17 @@ there is no ollama hop. See [`proxy.md`](proxy.md) for behavior.
 
 Healthcheck: `curl -fsS http://127.0.0.1:${PROXY_PORT:-8000}/health`.
 
-Two read-only bind mounts carry user-owned data into the image: the egress
-allowlist at `/etc/harness/allowlist`, and the hybrid recency reminder's
-prose at `/app/reminder.md`
-(`${HARNESS_REMINDER_PATH:-./proxy/reminder.md}`). The Dockerfile bakes a
-copy of `proxy/reminder.md` at that path too, so an unmounted container
-still starts; `harness start` seeds and points at the gitignored user copy
-`.harness-reminder.md`. Because it is a mount and not a build input,
-rewording the reminder needs `harness restart`, not a rebuild — see
-[`proxy.md`](proxy.md) → "Editable reminder prose".
+Three read-only bind mounts carry user-owned data into the image: the egress
+allowlist at `/etc/harness/allowlist`, the hybrid recency reminder's prose at
+`/app/reminder.md` (`${HARNESS_REMINDER_PATH:-./proxy/reminder.md}`), and that
+reminder's per-tool entries at `/app/tool-guidance.json`
+(`${HARNESS_TOOL_GUIDANCE_PATH:-./proxy/tool-guidance.json}`). The Dockerfile
+bakes a copy of each tracked default at its path too, so an unmounted
+container still starts; `harness start` seeds and points at the gitignored
+user copies `.harness-reminder.md` and `.harness-tool-guidance.json`. Because
+they are mounts and not build inputs, rewording the reminder or retuning a
+tool's one-line guidance needs `harness restart`, not a rebuild — see
+[`proxy.md`](proxy.md) → "Editable reminder data".
 
 ## agent containers (`agents/Dockerfile` + `agents/entrypoint.sh`)
 

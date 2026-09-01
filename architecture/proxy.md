@@ -108,8 +108,8 @@ validator in `_setup_prompt_mode` accepts:
   index 0, the "stable prefix" position). A consolidated recency block lands
   on the last user message, organised so the **live user request comes FIRST**
   (wrapped in `<<<BEGIN_USER_REQUEST>>>` markers — issue #110), then a short
-  reminder follows. The reminder's WORDING lives in an editable file, not
-  in proxy.py — see "Editable reminder prose" below. It has three labelled
+  reminder follows. The reminder's WORDING lives in editable files, not
+  in proxy.py — see "Editable reminder data" below. It has three labelled
   bullets —
   **Operating** (the merged Agency/Tools/Workflow bullet from the earlier
   format: positive assertion that the model acts through opencode and its
@@ -247,65 +247,115 @@ tool's own entry — see "Per-tool entries" below. This is additive — token
 cost is ~150–250 tokens/turn with the three bullets + Environment context;
 hybrid's lighter-than-user_front recency profile is preserved.
 
-### Editable reminder prose (`.harness-reminder.md`)
+### Editable reminder data (`.harness-reminder.md`, `.harness-tool-guidance.json`)
 
-The three bullets' **wording is data, not code**. It lives in a file the
-user owns, so rewording the standing instructions is an edit + `harness
-restart`, never a code change. This matters because the hybrid reminder is
-the harness's only standing-instruction channel for the opencode agent (no
-runtime AGENTS.md ships).
+The reminder's **wording is data, not code** — all of it. It lives in two
+files the user owns, so rewording the standing instructions is an edit +
+`harness restart`, never a code change. This matters because the hybrid
+reminder is the harness's only standing-instruction channel for the opencode
+agent (no runtime AGENTS.md ships).
 
-- **Tracked default** — `proxy/reminder.md`. Also `COPY`d into the proxy
-  image at `/app/reminder.md`, so a container launched without the mount
-  still has a working reminder.
-- **User copy** — `<install-root>/.harness-reminder.md`, gitignored and
-  seeded from the tracked default by `seed_reminder_file` on every
-  `harness start` / `harness host` (no-op once it exists). Gitignoring it
-  is what keeps an edit from colliding with `harness update`'s
-  `git pull --ff-only`.
-- **How the proxy finds it** — `_reminder_template_path()`: (1)
-  `HARNESS_REMINDER_PATH` if set, else (2) `reminder.md` next to `proxy.py`.
-  `cmd_start` exports `HARNESS_REMINDER_PATH` when the user copy exists, and
-  compose mounts it over `/app/reminder.md`; `host_proxy_start` passes the
-  same var directly, since host mode runs `proxy.py` straight from the clone
-  with no mount to swap. The compose **default** is the tracked
-  `./proxy/reminder.md`, not the user copy, so a bare `docker compose up`
+The split is by format, not by importance. `proxy/reminder.md` is the three
+bullets' **prose** — one block, injected verbatim. `proxy/tool-guidance.json`
+is the **per-tool entries** the `{{TOOL_ENTRIES}}` token expands to: the
+legend, its two conditional sentences, the detail-tool list, and each tool's
+one-line guidance. Those are pulled and assembled separately per turn, so they
+need a structured format — a hand edit to one tool's description must not be
+able to corrupt the other seventeen. Both files follow the same
+tracked-default / seeded-user-copy / bind-mount / per-section-fallback
+contract, described once below.
+
+- **Tracked defaults** — `proxy/reminder.md` and `proxy/tool-guidance.json`.
+  Both `COPY`d into the proxy image at `/app/`, so a container launched
+  without the mounts still has a working reminder.
+- **User copies** — `<install-root>/.harness-reminder.md` and
+  `<install-root>/.harness-tool-guidance.json`, gitignored and seeded from
+  the tracked defaults by `seed_reminder_file` / `seed_tool_guidance_file`
+  (both thin wrappers over `seed_user_data_file`) on every `harness start` /
+  `harness host` (no-op once the file exists). Gitignoring them is what keeps
+  an edit from colliding with `harness update`'s `git pull --ff-only`.
+- **How the proxy finds them** — `_reminder_template_path()` /
+  `_tool_guidance_path()`: (1) `HARNESS_REMINDER_PATH` /
+  `HARNESS_TOOL_GUIDANCE_PATH` if set, else (2) the file next to `proxy.py`
+  (resolved off `__file__`, never a hardcoded `proxy/` — the image flattens
+  the repo into `/app`). `cmd_start` exports each var when its user copy
+  exists, and compose mounts it over the baked copy; `host_proxy_start`
+  passes both vars directly, since host mode runs `proxy.py` straight from
+  the clone with no mount to swap. The compose **defaults** are the tracked
+  `./proxy/…` files, not the user copies, so a bare `docker compose up`
   (what the docker test suites do) always has a real mount source — a missing
   source makes docker create a *directory* there and the proxy would silently
-  drop to its fallback. Read-only, and a plain file mount, so an edit takes
+  drop to its fallback. Read-only, and plain file mounts, so an edit takes
   effect on `harness restart` — no rebuild.
-- **Load** — `_setup_reminder_template()` at startup (the builder also
-  lazy-loads, so importing `proxy.py` in tests needs no `main()`). Fixed for
-  the life of a launch, like the recency map. The startup banner prints the
-  resolved path and the loaded size.
-- **Tokens** — `{{HOST_OS}}`, `{{CWD}}`, `{{TOOL_ENTRIES}}`, substituted by
+- **Load** — `_setup_reminder_template()` / `_setup_tool_guidance()` at
+  startup. Both are also loaded without `main()` so importing `proxy.py` in
+  tests works: the reminder lazy-loads in the builder, the guidance loads at
+  import (eagerly, because a lazy first-use load would clobber a test that
+  patched `_HYBRID_DETAIL_TOOLS`). Fixed for the life of a launch, like the
+  recency map. The startup banner prints both resolved paths, the reminder's
+  loaded size, and the guidance's tool count.
+- **Tokens** (`reminder.md`) — `{{HOST_OS}}`, `{{CWD}}`, `{{TOOL_ENTRIES}}`, substituted by
   `str.replace`, deliberately not `str.format`/`string.Template`: the prose
   is full of braces (`{"name": ..., "arguments": {...}}`) and backslashes,
   and a user edit must never be able to raise. An unknown token is left
   literal; a deleted token just drops its clause.
-- **Header** — a `<!-- ... -->` block at the very top of the file documents
-  the tokens and is stripped before injection (anchored at the start, so a
-  `<!--` in the prose survives). A trailing newline is stripped too, so the
-  reminder ends at `]` regardless of how the editor saved it.
-- **Degradation** — a missing, unreadable, or empty file is not fatal: the
-  proxy logs `[!]` and uses `_REMINDER_FALLBACK`, a minimal built-in that
-  keeps the tool-call envelope (and so tool calling itself) alive. It is
-  deliberately NOT a copy of the prose — duplicating it would let the two
-  drift. The realistic trigger is a bad `HARNESS_REMINDER_PATH`, where
-  docker mounts an empty *directory* over the file; `seed_reminder_file`
-  `rmdir`s such a leftover before seeding. The fallback keeps only the
-  tool-call envelope and the honesty line, so tool calling survives but the
-  workflow guidance (todo list, parallel `task` agents, environment
-  reproducibility) is gone — treat a `[!]` in the banner as a real outage.
+- **Keys** (`tool-guidance.json`) — `legend`, `state_check_note`,
+  `tool_search_note`, `detail_tools`, `tools`. Every key is optional and
+  every one falls back **on its own**: a wrong type, an empty legend, or a
+  non-string description drops just that piece and logs a `[!]` naming it.
+  `tools` is filtered entry-by-entry, so one bad description costs one
+  description — that per-key independence is the reason this data is JSON
+  and not a second prose file. An empty `state_check_note` /
+  `tool_search_note` is honoured (a deliberate "stop saying that"); an empty
+  `legend` is not, since it would leave the tool list unexplained.
+- **Self-documentation** — `reminder.md` carries a `<!-- ... -->` block at
+  the very top documenting its tokens; it is stripped before injection
+  (anchored at the start, so a `<!--` in the prose survives), and a trailing
+  newline is stripped too so the reminder ends at `]` regardless of how the
+  editor saved it. JSON has no comment syntax, so `tool-guidance.json` uses a
+  `_README` key holding the same kind of block as an array of lines; the
+  loader ignores every key it does not name, so `_README` costs nothing at
+  runtime and cannot leak into the prompt.
+- **Degradation** — a missing, unreadable, empty, or (for the JSON)
+  unparsable file is not fatal; the proxy logs a loud `[!]` and carries on.
+  The reminder falls back to `_REMINDER_FALLBACK`, a minimal built-in that
+  keeps the tool-call envelope (and so tool calling itself) alive; the
+  guidance falls back to `_HYBRID_LEGEND_FALLBACK` + the two note fallbacks
+  + `_HYBRID_DETAIL_TOOLS_FALLBACK`, with **no** guidance map, so every tool
+  renders as a bare signature — the same path a tool with no entry already
+  takes. Both fallbacks are deliberately NOT copies of the shipped wording:
+  duplicating it would let the two drift, so they carry only the
+  mechanically load-bearing part (the tool-call envelope; what the signature
+  syntax and the `[state-check]` marker mean). `detail_tools` is the one
+  exception — it is structure, not wording, and losing it would strand
+  `task`'s valid agent names. A JSON syntax error is reported with its
+  **line and column**, which is the point of a hand-edited config file. The
+  realistic trigger for a whole-file loss is a bad `HARNESS_*_PATH`, where
+  docker mounts an empty *directory* over the file; `seed_user_data_file`
+  `rmdir`s such a leftover before seeding. Treat a `[!]` in the banner as a
+  real outage: with the reminder gone the workflow guidance (todo list,
+  parallel `task` agents, environment reproducibility) is gone, and with the
+  guidance gone the model gets signatures with no failure-mode hints.
 
-Editing the file is unvalidated by design — the user owns the result. Two
-test suites do assert on a handful of load-bearing phrases in it:
-`proxy/test_proxy.py` (`TestHybridConsolidatedRecency`, against the shipped
-default) and `tests/scheme_contract_test.sh` (`Reminder`, `do not invent`, and
-`<<<BEGIN_AGENT_TOOLS>>>` come from the file; its other assertion,
-`Tools — one entry per tool`, is the code-generated per-tool legend and is
-unaffected by an edit). Rewording those phrases out is what makes them
-fail.
+Editing either file is unvalidated by design — the user owns the result; the
+JSON loader checks types and JSON syntax, never wording. Three test suites
+assert on load-bearing phrases: `proxy/test_proxy.py`
+(`TestHybridConsolidatedRecency`, against both shipped defaults, plus
+`TestToolGuidanceFile` for the loader contract), `tests/proxy_test.sh`
+(`Tools — one entry per tool`), and `tests/scheme_contract_test.sh`
+(`Reminder`, `do not invent`, and `<<<BEGIN_AGENT_TOOLS>>>` from
+`reminder.md`, plus `Tools — one entry per tool` — which now comes from
+`tool-guidance.json`'s `legend`, so rewording the legend breaks it too).
+Rewording those phrases out is what makes them fail.
+
+**Upgrade tradeoff.** The seeders never overwrite an existing copy, so
+improvements to a shipped default do not reach an install that already has
+one. For the prose that is the whole point. For the guidance it also means a
+tool opencode adds later renders as a bare signature until the user takes the
+new default (delete `.harness-tool-guidance.json`, then `harness restart`) or
+adds the entry by hand. That is a deliberate trade of freshness for never
+clobbering an edit, and it is graceful in both directions: an unknown tool and
+a stale entry each cost nothing but a missing hint.
 
 ### Per-tool entries
 
@@ -316,13 +366,15 @@ together. Each entry is a single bullet that combines:
 1. **Signature** — `name(required, [optional])` per tool, the recency
    anchor for parameter keys models most often guess wrong (e.g.
    `read({"filename": ...})` vs `read({"filePath": ...})`).
-2. **Guidance** — the one-line failure-mode reminder from the project-
-   managed `_HYBRID_TOOL_GUIDANCE` map (the "shortened description" the
-   model reads each turn instead of the multi-KB schema at the prefix).
-   Tools absent from the map render as a bare `- name(signature)` with no
-   guidance, so adding a custom MCP tool degrades gracefully. The map is a
-   code constant, not an env var — keyed to the opencode tools we ship for.
-   The map deliberately covers the **union** of tools harness knows about,
+2. **Guidance** — the one-line failure-mode reminder from the
+   `_HYBRID_TOOL_GUIDANCE` map (the "shortened description" the model reads
+   each turn instead of the multi-KB schema at the prefix). Tools absent
+   from the map render as a bare `- name(signature)` with no guidance, so
+   deleting an entry is a supported edit and adding a custom MCP tool
+   degrades gracefully. The map is the `tools` key of
+   `tool-guidance.json` — user-editable data loaded at import, not a code
+   constant and not an env var (see "Editable reminder data" above).
+   The shipped default deliberately covers the **union** of tools harness knows about,
    not just the always-shipped subset: situational/optional opencode tools
    (`websearch` — gated by `OPENCODE_ENABLE_EXA`; `lsp`, `apply_patch`,
    `question`, `repo_clone`/`repo_overview`, `plan-enter`/`plan-exit` —
@@ -332,14 +384,17 @@ together. Each entry is a single bullet that combines:
    *missing* entry the moment a tool starts shipping is a bare signature
    with no failure-mode hint at recency. `TestHybridConsolidatedRecency
    ::test_guidance_map_covers_known_opencode_tools` is the canary that
-   flags accidental removal (an `issubset` check, so MCP entries below are
-   free to coexist).
+   flags accidental removal from the shipped file (an `issubset` check, so
+   MCP entries below are free to coexist).
 
-   MCP tool guidance is **not** in this code map. `_HYBRID_TOOL_GUIDANCE`
-   covers only the opencode tools harness ships for (a shipped-code
-   contract). Per-MCP tool guidance is **data**, owned by each MCP, and
-   reaches the proxy through a second map, `_MCP_TOOL_RECENCY` (see "MCP
-   tool-recency injection" below). `_format_tool_entries` looks up
+   MCP tool guidance is **not** in this map. Both are data now, but they are
+   owned by different parties: `tool-guidance.json` is opencode's own tools
+   (one file, shipped with the harness, edited by the operator), while
+   per-MCP tool guidance is owned by each MCP and reaches the proxy through
+   a second map, `_MCP_TOOL_RECENCY`, built from every enabled MCP's own
+   `recency.json` (see "MCP tool-recency injection" below). They also arrive
+   by different transports — a bind-mounted file versus an env var — because
+   the enabled-MCP set is assembled per launch by the CLI. `_format_tool_entries` looks up
    `_HYBRID_TOOL_GUIDANCE.get(name) or _MCP_TOOL_RECENCY.get(name)`, so a
    tool's guidance can come from either source; opencode tools win on the
    (impossible) key collision. Both maps key on the runtime tool name —
@@ -350,8 +405,9 @@ together. Each entry is a single bullet that combines:
    enabled and opencode ships the tool for the turn, so a disabled MCP adds
    nothing to recency. They are kept shorter than the opencode lines because
    the recency block is budget-constrained and an MCP can ship many tools.
-3. **Closed-set argument values** — for tools in the project-managed
-   `_HYBRID_DETAIL_TOOLS` constant (`["task", "skill"]`), the tool's
+3. **Closed-set argument values** — for tools in `_HYBRID_DETAIL_TOOLS`
+   (`tool-guidance.json`'s `detail_tools`; shipped default
+   `["task", "skill"]`), the tool's
    verbatim description is inlined as an indented block UNDER the tool's
    entry. These are the tools whose valid argument *values* are an
    unguessable closed set opencode documents only as prose in the
@@ -453,7 +509,9 @@ graceful degradation, never a hard fail.
 
 The bundled serena MCP's guidance lives in `mcp-registry/serena/recency.json`
 (it used to be hard-coded in `_HYBRID_TOOL_GUIDANCE`); migrating it out is what
-made the code/data split concrete.
+made the code/data split concrete. `_HYBRID_TOOL_GUIDANCE` itself later
+followed, into `proxy/tool-guidance.json`, so both maps are now data and the
+remaining distinction is ownership and transport rather than code-vs-data.
 
 ## State-check marker + orient-first rule
 
@@ -900,12 +958,14 @@ depth).
 from the *container* env — see [Cooperative-prompt
 modes](#cooperative-prompt-modes-proxy_prompt_mode); absent on a normal launch,
 so it lands on the `hybrid` default) into a module global. The
-system→user conversion (`_CHANGE_SYSTEM_TO_USER`) and the hybrid "detail tools"
-(`_HYBRID_DETAIL_TOOLS`, `["task", "skill"]`) are project-managed code
-constants, not env reads: the upstream takes no system prompt (so the
-conversion always runs — see [`upstream-api.md`](upstream-api.md)) and the
-detail-tools set is tied to the opencode tools we ship for. There are no longer
-`_setup_change_system_to_user` / `_setup_hybrid_detail_tools` functions.
+system→user conversion (`_CHANGE_SYSTEM_TO_USER`) is a project-managed code
+constant, not an env read: the upstream takes no system prompt, so the
+conversion always runs (see [`upstream-api.md`](upstream-api.md)). The hybrid
+"detail tools" (`_HYBRID_DETAIL_TOOLS`, shipped default `["task", "skill"]`)
+are no longer a constant either — `_setup_tool_guidance` loads them from
+`tool-guidance.json`'s `detail_tools`. There are still no
+`_setup_change_system_to_user` / `_setup_hybrid_detail_tools` functions: the
+detail-tools list moved into a mounted file, not back into an env knob.
 
 ## Debug dumps
 

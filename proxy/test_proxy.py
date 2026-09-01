@@ -1334,9 +1334,11 @@ class TestHybridDetailTools(unittest.TestCase):
                 self.user_msgs, tools_text, tools=tools,
             )
 
-    def test_detail_tools_is_project_managed_constant(self):
-        # The detail-tools set is no longer read from an env var; it is a
-        # project-managed constant tied to the opencode tools we ship for.
+    def test_shipped_detail_tools_are_task_and_skill(self):
+        # The detail-tools list is never an env var. It is now the
+        # `detail_tools` key of proxy/tool-guidance.json (user-editable data,
+        # loaded at import); this asserts the SHIPPED default, which is what
+        # the rest of the suite renders against.
         self.assertEqual(proxy._HYBRID_DETAIL_TOOLS, ["task", "skill"])
 
     def test_extract_tool_details_returns_flagged_pairs_in_order(self):
@@ -1756,15 +1758,16 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertLess(c.index("<<<END_TOOL_RESULT>>>"), c.index("Reminder"))
 
     def test_guidance_map_covers_known_opencode_tools(self):
-        """The `_HYBRID_TOOL_GUIDANCE` map is the union of tools harness
-        knows about — including situational/optional ones opencode ships
+        """The `_HYBRID_TOOL_GUIDANCE` map — the `tools` key of the shipped
+        proxy/tool-guidance.json, loaded at import — is the union of tools
+        harness knows about, including situational/optional ones opencode ships
         only when enabled (`websearch`, `lsp`, `apply_patch`, `question`,
         `repo_clone`/`repo_overview`, `plan-enter`/`plan-exit`). The cost
         of a stale entry is zero (it never renders unless the tool is
         passed for the turn), and the cost of missing an entry the moment
         a tool starts shipping is a bare signature with no failure-mode
         hint — so the map errs toward broader coverage. This test is the
-        canary that flags accidental removal."""
+        canary that flags accidental removal from the shipped file."""
         required = {
             "apply_patch", "bash", "edit", "glob", "grep", "lsp",
             "plan-enter", "plan-exit", "question", "read", "repo_clone",
@@ -4431,6 +4434,242 @@ class TestChatGPTValidateConfig(unittest.TestCase):
              patch("sys.stdout", io.StringIO()):
             proxy._validate_config()  # must not raise SystemExit
 
+class TestToolGuidanceFile(unittest.TestCase):
+    """The per-tool entries block's data — the legend, its two conditional
+    sentences, the detail-tool list, and every tool's one-line guidance — is
+    user-owned DATA loaded from proxy/tool-guidance.json, not literals in
+    proxy.py, so an operator can retune a tool's one-liner and `harness
+    restart` without a code change.
+
+    These tests cover the loader's contract. The guidance WORDING is asserted
+    by TestHybridConsolidatedRecency against the shipped default — reword that
+    file and those tests are what fails.
+
+    The load is per-section on purpose: the whole point of a hand-edited file
+    with ~18 separately-pulled descriptions is that a typo in one of them must
+    not blank the other seventeen."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.shipped = (
+            proxy._HYBRID_LEGEND,
+            proxy._HYBRID_STATE_CHECK_NOTE,
+            proxy._HYBRID_TOOL_SEARCH_NOTE,
+            list(proxy._HYBRID_DETAIL_TOOLS),
+            dict(proxy._HYBRID_TOOL_GUIDANCE),
+        )
+
+    def tearDown(self):
+        (proxy._HYBRID_LEGEND, proxy._HYBRID_STATE_CHECK_NOTE,
+         proxy._HYBRID_TOOL_SEARCH_NOTE, proxy._HYBRID_DETAIL_TOOLS,
+         proxy._HYBRID_TOOL_GUIDANCE) = (
+            self.shipped[0], self.shipped[1], self.shipped[2],
+            list(self.shipped[3]), dict(self.shipped[4]))
+
+    def _load(self, text):
+        """Write `text` to a temp guidance file and return (values, warnings)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "tool-guidance.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            return proxy._load_tool_guidance(path)
+
+    def _setup(self, text):
+        """As _load, but through _setup_tool_guidance so the globals and the
+        printed output are what get asserted."""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "tool-guidance.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            buf = io.StringIO()
+            with patch.dict(os.environ,
+                            {"HARNESS_TOOL_GUIDANCE_PATH": path}), \
+                    patch("sys.stdout", buf):
+                proxy._setup_tool_guidance()
+            return buf.getvalue(), path
+
+    # --- path resolution ---------------------------------------------------
+
+    def test_env_path_overrides_the_adjacent_default(self):
+        with patch.dict(os.environ,
+                        {"HARNESS_TOOL_GUIDANCE_PATH": "/x/custom.json"}):
+            self.assertEqual(proxy._tool_guidance_path(), "/x/custom.json")
+
+    def test_default_path_sits_next_to_proxy_py(self):
+        # Layout-independent on purpose: in a checkout that dir is proxy/, but
+        # the proxy_test suite runs inside the container where the Dockerfile
+        # COPYs proxy.py to /app.
+        env = {k: v for k, v in os.environ.items()
+               if k != "HARNESS_TOOL_GUIDANCE_PATH"}
+        with patch.dict(os.environ, env, clear=True):
+            path = proxy._tool_guidance_path()
+        self.assertEqual(os.path.basename(path), "tool-guidance.json")
+        self.assertEqual(os.path.dirname(path),
+                         os.path.dirname(os.path.abspath(proxy.__file__)))
+
+    # --- the shipped default ----------------------------------------------
+
+    def test_shipped_default_loads_every_section(self):
+        # Guards proxy/tool-guidance.json itself: dropping a key there would
+        # silently strand the legend or the whole guidance map out of the
+        # prompt with only an `[!]` line to show for it.
+        env = {k: v for k, v in os.environ.items()
+               if k != "HARNESS_TOOL_GUIDANCE_PATH"}
+        with patch.dict(os.environ, env, clear=True):
+            values, warnings = proxy._load_tool_guidance(
+                proxy._tool_guidance_path())
+        self.assertEqual(warnings, [])
+        self.assertNotEqual(values["legend"], proxy._HYBRID_LEGEND_FALLBACK)
+        self.assertIn("Signature format: name(required, [optional])",
+                      values["legend"])
+        self.assertIn("[state-check]", values["state_check_note"])
+        self.assertIn("tool_search(", values["tool_search_note"])
+        self.assertEqual(values["detail_tools"], ["task", "skill"])
+        self.assertGreaterEqual(len(values["tools"]), 18)
+        for name, line in values["tools"].items():
+            self.assertIsInstance(line, str, name)
+            self.assertTrue(line.strip(), name)
+
+    def test_shipped_default_readme_key_is_ignored(self):
+        # The file documents itself in a `_README` key because JSON has no
+        # comment syntax; it must never leak into the rendered block.
+        with open(os.path.join(
+                os.path.dirname(os.path.abspath(proxy.__file__)),
+                "tool-guidance.json"), encoding="utf-8") as fh:
+            raw = json.load(fh)
+        self.assertIn("_README", raw)
+        self.assertNotIn("_README", raw["tools"])
+        values, _ = proxy._load_tool_guidance(proxy._tool_guidance_path())
+        self.assertNotIn("_README", values)
+
+    # --- per-section degradation ------------------------------------------
+
+    def test_one_bad_description_does_not_cost_the_others(self):
+        # This is the whole reason the format is structured: the descriptions
+        # are pulled separately, so a typo in one is a one-entry loss.
+        values, warnings = self._load(json.dumps({
+            "tools": {"bash": "run a command", "edit": 5, "read": ""},
+        }))
+        self.assertEqual(values["tools"], {"bash": "run a command"})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("edit", warnings[0])
+        self.assertIn("read", warnings[0])
+
+    def test_a_missing_key_keeps_the_built_in_default(self):
+        values, warnings = self._load(json.dumps({"tools": {"bash": "x"}}))
+        self.assertEqual(warnings, [])
+        self.assertEqual(values["legend"], proxy._HYBRID_LEGEND_FALLBACK)
+        self.assertEqual(values["detail_tools"],
+                         proxy._HYBRID_DETAIL_TOOLS_FALLBACK)
+
+    def test_empty_notes_are_honoured_but_an_empty_legend_is_not(self):
+        # Blanking a conditional sentence is a real edit ("stop saying that");
+        # blanking the legend would leave the tool list unexplained.
+        values, warnings = self._load(json.dumps({
+            "legend": "   ", "state_check_note": "", "tool_search_note": "",
+        }))
+        self.assertEqual(values["legend"], proxy._HYBRID_LEGEND_FALLBACK)
+        self.assertEqual(values["state_check_note"], "")
+        self.assertEqual(values["tool_search_note"], "")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("legend", warnings[0])
+
+    def test_wrong_types_fall_back_per_key_and_name_the_key(self):
+        values, warnings = self._load(json.dumps({
+            "legend": 42, "detail_tools": "task", "tools": ["bash"],
+        }))
+        self.assertEqual(values["legend"], proxy._HYBRID_LEGEND_FALLBACK)
+        self.assertEqual(values["detail_tools"],
+                         proxy._HYBRID_DETAIL_TOOLS_FALLBACK)
+        self.assertEqual(values["tools"], {})
+        joined = " ".join(warnings)
+        for key in ("legend", "detail_tools", "tools"):
+            self.assertIn(key, joined)
+
+    def test_explicit_empty_detail_tools_is_honoured(self):
+        values, warnings = self._load(json.dumps({"detail_tools": []}))
+        self.assertEqual(values["detail_tools"], [])
+        self.assertEqual(warnings, [])
+
+    def test_non_string_detail_tool_entries_are_dropped(self):
+        values, warnings = self._load(
+            json.dumps({"detail_tools": ["task", 7, "", "skill"]}))
+        self.assertEqual(values["detail_tools"], ["task", "skill"])
+        self.assertEqual(len(warnings), 1)
+
+    # --- whole-file failures ----------------------------------------------
+
+    def test_malformed_json_names_line_and_column(self):
+        values, warnings = self._load('{"tools": {"bash": "x",}}')
+        self.assertEqual(values["tools"], {})
+        self.assertEqual(values["legend"], proxy._HYBRID_LEGEND_FALLBACK)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("line", warnings[0])
+        self.assertIn("column", warnings[0])
+
+    def test_missing_file_falls_back_loudly(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "nope.json")
+            values, warnings = proxy._load_tool_guidance(path)
+        self.assertEqual(values["tools"], {})
+        self.assertEqual(values["legend"], proxy._HYBRID_LEGEND_FALLBACK)
+        self.assertIn(path, warnings[0])
+
+    def test_directory_at_the_path_falls_back(self):
+        # A compose bind-mount whose source is missing makes docker create a
+        # DIRECTORY at the mount point.
+        with tempfile.TemporaryDirectory() as td:
+            values, warnings = proxy._load_tool_guidance(td)
+        self.assertEqual(values["tools"], {})
+        self.assertTrue(warnings)
+
+    def test_non_object_top_level_falls_back(self):
+        for text in ('[]', '"a string"', 'null', '3'):
+            values, warnings = self._load(text)
+            self.assertEqual(values["tools"], {}, text)
+            self.assertTrue(warnings, text)
+
+    def test_setup_logs_warnings_and_a_count(self):
+        out, path = self._setup('{"tools": {"bash": "x", "edit": 5}}')
+        self.assertIn("[!]", out)
+        self.assertIn("edit", out)
+        self.assertIn("[i] tool guidance: 1 tool(s)", out)
+        self.assertIn(path, out)
+        self.assertEqual(proxy._HYBRID_TOOL_GUIDANCE, {"bash": "x"})
+
+    # --- end-to-end rendering ---------------------------------------------
+
+    def test_edited_file_reaches_the_rendered_block(self):
+        self._setup(json.dumps({
+            "legend": "MY LEGEND.",
+            "state_check_note": " MY STATE NOTE.",
+            "tool_search_note": " MY SEARCH NOTE.",
+            "tools": {"bash": "my bash line"},
+        }))
+        with patch.object(proxy, "_MCP_STATE_CHECK_TOOLS", {"bash"}), \
+                patch.object(proxy, "_TOOL_SEARCH_ENABLED", True):
+            out = proxy._format_tool_entries([("bash", ["command"], [])])
+        self.assertIn("MY LEGEND. MY STATE NOTE. MY SEARCH NOTE.", out)
+        self.assertIn("- bash(command) [state-check] — my bash line", out)
+
+    def test_a_tool_dropped_from_the_file_renders_a_bare_signature(self):
+        self._setup(json.dumps({"legend": "L.", "tools": {}}))
+        with patch.object(proxy, "_MCP_TOOL_RECENCY", {}):
+            out = proxy._format_tool_entries([("bash", ["command"], [])])
+        self.assertIn("- bash(command)", out)
+        self.assertNotIn("—", out.split("\n")[-1])
+
+    def test_notes_only_render_when_their_condition_holds(self):
+        self._setup(json.dumps({
+            "legend": "L.", "state_check_note": " SC.",
+            "tool_search_note": " TS.", "tools": {},
+        }))
+        with patch.object(proxy, "_MCP_STATE_CHECK_TOOLS", set()), \
+                patch.object(proxy, "_TOOL_SEARCH_ENABLED", False):
+            out = proxy._format_tool_entries([("bash", [], [])])
+        self.assertIn("L.", out)
+        self.assertNotIn("SC.", out)
+        self.assertNotIn("TS.", out)
 
 if __name__ == "__main__":
     unittest.main()
