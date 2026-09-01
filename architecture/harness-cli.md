@@ -607,8 +607,16 @@ explains why.
 `cmd_chatgpt` is a **front door, not a parallel launch path**. It sets the
 `backend_override` global to `chatgpt` and then delegates to the exact code the
 default launch uses: `run_agent opencode` for the bare form, `cmd_host` for
-`harness chatgpt host` (so `harness chatgpt host down` works too). `-h/--help`
-is intercepted before the global is set, so help has no side effects.
+`harness chatgpt host` (so `harness chatgpt host down` works too), plus
+`cmd_doctor` / `cmd_preflight` and the stack-lifecycle verbs
+`start` / `restart` / `down`. `-h/--help` is intercepted before the global is
+set, so help has no side effects.
+
+Routing the lifecycle verbs is not cosmetic. `cmd_start` calls
+`require_runtime_config`, which on a chatgpt-only install fails the OpenAI trio;
+and any word `cmd_chatgpt` does not recognize falls through to `run_agent`, so
+an unrouted `harness chatgpt restart` would launch an agent with a stray
+argument.
 
 Everything the backend changes hangs off that one global:
 
@@ -628,13 +636,30 @@ global before delegating — the diagnostics are otherwise the same code. Bare
 `harness doctor` still checks the OpenAI trio, because that is what bare
 `harness` uses; when those are unset but `CHATGPT_BASE_URL` is set it prints a
 pointer to `harness chatgpt doctor` rather than silently reporting three
-failures.
+failures. `cmd_preflight` prints the same pointer, and
+`require_runtime_config`'s abort adds one naming `harness chatgpt ...`.
+
+**Restart-in-place adopts the running dialect.** `cmd_restart` and `cmd_upgrade`
+(and therefore `cmd_downgrade`, which delegates to it) are down-then-start, so
+without help they always come back on the OpenAI dialect — on a chatgpt-only
+install that means the stack is torn down and `cmd_start` then aborts naming
+three keys the user deliberately never set. `_adopt_running_backend` reads
+`_running_proxy_backend` **before** the teardown and sets `backend_override`.
+It adopts only `chatgpt`: leaving the global empty for `openai` is what keeps
+`write_runtime_override`'s output byte-identical for every pre-existing install.
 
 **One proxy, one dialect.** Two landmines follow from the proxy being a single
 shared service, and both are handled explicitly:
 
 - *Container mode.* `ensure_services_up` is a no-op when the proxy is already
   up, so a backend flag would silently not take effect after a normal launch.
+  The whole reconciliation block below is gated on `_chatgpt_in_play`
+  (`backend_override` set, or `CHATGPT_BASE_URL` configured): an install that
+  never configured this backend cannot have a chatgpt proxy running, and the
+  probes cost a `compose ps` plus a `docker inspect` each — with `compose`
+  regenerating the runtime override on every call. That gate is what keeps a
+  pre-existing OpenAI launch exactly as cheap as it was before this backend
+  existed.
   `_running_proxy_backend` reads `PROXY_BACKEND` out of the running container's
   env (defaulting to `openai`, which is also what every pre-existing container
   reports) and `ensure_services_up` calls `cmd_start` on a mismatch. That

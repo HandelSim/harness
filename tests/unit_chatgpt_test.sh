@@ -24,6 +24,9 @@
 #     agent, `host` form delegates to cmd_host, both with the backend set
 #   - _config_write_key: a cookie with '; ' separators is quoted on disk, so
 #     the rewritten .env still sources cleanly (harness sources it under -e)
+#   - cmd_chatgpt also routes start/restart/down, and restart/upgrade adopt the
+#     running proxy's dialect so a chatgpt-only install can restart at all
+#   - an install with no chatgpt config skips the reconciliation probes entirely
 #   - the subcommand is wired into main()'s dispatch and cmd_help
 #
 # Prints "CHATGPT TEST PASSED" on success.
@@ -296,6 +299,7 @@ cmd_chatgpt host -p 'hi'
 
 # doctor/preflight must run with the backend selected, or they check the other
 # backend's vars and report a valid chatgpt-only install as broken.
+real_cmd_preflight="$(declare -f cmd_preflight)"
 cmd_doctor()    { echo "cmd_doctor:$*"    >>"$DISPATCH_LOG"; }
 cmd_preflight() { echo "cmd_preflight:$*" >>"$DISPATCH_LOG"; }
 backend_override=""; : >"$DISPATCH_LOG"
@@ -308,7 +312,26 @@ cmd_chatgpt preflight
 [[ "$(cat "$DISPATCH_LOG")" == "cmd_preflight:" ]] \
     || fail "T14: preflight did not delegate to cmd_preflight — $(cat "$DISPATCH_LOG")"
 [[ "$backend_override" == "chatgpt" ]] || fail "T14: backend not selected for preflight"
-unset -f cmd_doctor cmd_preflight
+
+# Stack lifecycle. Without these labels the words fall through to `*)` and
+# launch an agent with a stray argument, and `harness start` on a chatgpt-only
+# install aborts in require_runtime_config on the openai trio.
+# Saved, not unset: T19 exercises the real cmd_restart, and `unset -f` on a
+# stub would take the real definition with it.
+real_cmd_restart="$(declare -f cmd_restart)"
+real_cmd_down="$(declare -f cmd_down)"
+cmd_start()   { echo "cmd_start:$*"   >>"$DISPATCH_LOG"; }
+cmd_restart() { echo "cmd_restart:$*" >>"$DISPATCH_LOG"; }
+cmd_down()    { echo "cmd_down:$*"    >>"$DISPATCH_LOG"; }
+for verb in start restart down; do
+    backend_override=""; : >"$DISPATCH_LOG"
+    cmd_chatgpt "$verb"
+    [[ "$(cat "$DISPATCH_LOG")" == "cmd_${verb}:" ]] \
+        || fail "T14: '$verb' did not delegate to cmd_$verb — $(cat "$DISPATCH_LOG")"
+    [[ "$backend_override" == "chatgpt" ]] || fail "T14: backend not selected for $verb"
+done
+unset -f cmd_doctor
+eval "$real_cmd_preflight"; eval "$real_cmd_restart"; eval "$real_cmd_down"
 ok "T14: cmd_chatgpt dispatches every form with the backend selected"
 
 # --- T15: wired into main()'s dispatch and the help text --------------------
@@ -350,6 +373,104 @@ sourced=$(bash -c 'set -euo pipefail; set -a; . "$1"; set +a; printf %s "$CHATGP
 [[ "$sourced" == "$tricky" ]] || fail "T17: sourced value differs: $sourced"
 _config_write_key CHATGPT_COOKIE_STRING "$cookie"
 ok "T17: a quote/dollar/backtick-bearing value round-trips through the escaped form"
+
+# --- T18: a pure-openai install pays nothing for the chatgpt reconciliation --
+# _running_proxy_backend/_running_proxy_fp each cost a `compose ps` plus a
+# `docker inspect`, and `compose` regenerates the runtime override every call.
+# An install that never configured CHATGPT_BASE_URL can never have started a
+# chatgpt proxy, so that whole block must be skipped — this is what keeps a
+# pre-existing openai launch exactly as cheap as it was before this backend.
+PROBE_LOG="$TMP_ROOT/probe.log"
+services_up() { return 0; }
+host_mcp_start_enabled() { :; }
+cmd_start() { echo "started" >>"$START_LOG"; }
+_running_proxy_backend() { echo "backend" >>"$PROBE_LOG"; printf 'openai'; }
+_running_proxy_fp()      { echo "fp"      >>"$PROBE_LOG"; printf ''; }
+
+: >"$PROBE_LOG"; : >"$START_LOG"
+saved_base="$CHATGPT_BASE_URL"; CHATGPT_BASE_URL=""
+backend_override=""; ensure_services_up >/dev/null
+[[ ! -s "$PROBE_LOG" ]] || fail "T18: an openai-only install must not probe the running proxy"
+[[ ! -s "$START_LOG" ]] || fail "T18: an openai-only install must not restart"
+
+# ... but once the backend is configured, or this launch selects it, the
+# reconciliation is back on.
+: >"$PROBE_LOG"
+CHATGPT_BASE_URL="$saved_base"
+backend_override=""; ensure_services_up >/dev/null
+[[ -s "$PROBE_LOG" ]] || fail "T18: a chatgpt-configured install must still reconcile"
+
+: >"$PROBE_LOG"; CHATGPT_BASE_URL=""
+backend_override="chatgpt"; ensure_services_up >/dev/null
+[[ -s "$PROBE_LOG" ]] || fail "T18: an explicit chatgpt launch must reconcile regardless"
+CHATGPT_BASE_URL="$saved_base"; backend_override=""
+ok "T18: reconciliation is skipped entirely on an install with no chatgpt config"
+
+# --- T19: restart/upgrade come back up on the running backend ---------------
+# cmd_restart is down + start. Without adopting the running dialect first, a
+# chatgpt-only install gets its stack torn down and then cmd_start dies in
+# require_runtime_config naming the three openai keys it never set.
+backend_override=""; agent_model=""
+_running_proxy_backend() { printf 'chatgpt'; }
+_adopt_running_backend
+[[ "$backend_override" == "chatgpt" ]] || fail "T19: a running chatgpt proxy was not adopted"
+[[ "$agent_model" == "gpt-5.6-terra" ]] || fail "T19: agent_model not refreshed on adopt"
+
+# openai is left as the empty default on purpose: an explicit PROXY_BACKEND
+# would change write_runtime_override's output for every pre-existing user.
+backend_override=""; _running_proxy_backend() { printf 'openai'; }
+_adopt_running_backend
+[[ -z "$backend_override" ]] || fail "T19: openai must stay the implicit default"
+
+# An install with no chatgpt config never probes at all.
+: >"$PROBE_LOG"
+_running_proxy_backend() { echo "backend" >>"$PROBE_LOG"; printf 'chatgpt'; }
+backend_override=""; CHATGPT_BASE_URL=""
+_adopt_running_backend
+[[ ! -s "$PROBE_LOG" ]] || fail "T19: an openai-only install must not probe on adopt"
+CHATGPT_BASE_URL="$saved_base"
+
+# An explicit selection is never overwritten.
+backend_override="chatgpt"; _running_proxy_backend() { printf 'openai'; }
+_adopt_running_backend
+[[ "$backend_override" == "chatgpt" ]] || fail "T19: an explicit selection was clobbered"
+backend_override=""
+
+# Order matters: the read has to happen while the container still exists.
+ORDER_LOG="$TMP_ROOT/order.log"
+harness_runtime_installed() { return 0; }
+require_docker() { :; }
+_running_proxy_backend() { echo "read" >>"$ORDER_LOG"; printf 'chatgpt'; }
+cmd_down()  { echo "down"  >>"$ORDER_LOG"; }
+cmd_start() { echo "start:${backend_override}" >>"$ORDER_LOG"; }
+: >"$ORDER_LOG"; backend_override=""
+cmd_restart
+[[ "$(cat "$ORDER_LOG")" == "read
+down
+start:chatgpt" ]] || fail "T19: cmd_restart order/backend wrong — $(cat "$ORDER_LOG")"
+backend_override=""
+unset -f harness_runtime_installed require_docker cmd_down cmd_start
+ok "T19: restart adopts the running dialect before tearing the stack down"
+
+# --- T20: bare diagnostics point at the other entry point -------------------
+# A chatgpt-only install run through bare `harness preflight` fails all three
+# openai keys. Without a pointer that reads as "your install is broken".
+saved_env="$(cat "$TMP_ROOT/.env")"
+cat >"$TMP_ROOT/.env" <<'EOF'
+CHATGPT_BASE_URL=https://chat.example.com
+CHATGPT_MODEL_NAME=gpt-5.6-terra
+CHATGPT_COOKIE_STRING=session=abcdefghijklmnop
+EOF
+backend_override=""
+pre_out=$( (host_only=1; cmd_preflight) 2>&1 || true )
+grep -q "harness chatgpt preflight" <<<"$pre_out" \
+    || fail "T20: bare preflight gave no pointer to the chatgpt backend — $pre_out"
+# ... and the pointer must NOT appear when the openai keys are the ones in use.
+printf '%s\n' "$saved_env" >"$TMP_ROOT/.env"
+pre_out=$( (host_only=1; cmd_preflight) 2>&1 || true )
+grep -q "harness chatgpt preflight" <<<"$pre_out" \
+    && fail "T20: the pointer must not fire on a configured openai install"
+ok "T20: bare preflight points a chatgpt-only install at 'harness chatgpt preflight'"
 
 echo
 echo "CHATGPT TEST PASSED"

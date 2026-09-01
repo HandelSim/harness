@@ -618,6 +618,13 @@ require_runtime_config() {
     done
     if (( ${#missing[@]} > 0 )); then
         err "required value(s) empty in $env_file: ${missing[*]}"
+        if ! _backend_is_chatgpt && [[ -n "${CHATGPT_BASE_URL:-}" ]]; then
+            # The two config sets are disjoint. A chatgpt-only install reaching
+            # the openai branch means the wrong entry point was used; naming the
+            # keys alone reads as "your install is broken".
+            err "the CHATGPT_* keys are set: to use that backend run 'harness chatgpt ...'"
+            err "(e.g. 'harness chatgpt', 'harness chatgpt start', 'harness chatgpt restart')"
+        fi
         err "edit $env_file and set them, then re-run. See 'harness preflight' for details."
         exit 1
     fi
@@ -1065,6 +1072,34 @@ _running_proxy_fp() {
     printf '%s' "$val"
 }
 
+# True when the chatgpt backend is in play at all: either this invocation
+# selected it, or the install has it configured and so may have a chatgpt proxy
+# running. An install that never set CHATGPT_BASE_URL can never have started
+# one, so every chatgpt reconciliation path is skipped there.
+_chatgpt_in_play() {
+    [[ -n "${backend_override:-}" || -n "${CHATGPT_BASE_URL:-}" ]]
+}
+
+# Adopt the RUNNING proxy's backend into `backend_override` for commands that
+# tear the stack down and bring it straight back up (restart, upgrade,
+# downgrade). Without this they always come back on the openai dialect, so on a
+# chatgpt-only install `harness restart` would down the stack and then die in
+# require_runtime_config naming three keys the user deliberately never set.
+# Only a chatgpt proxy is adopted: leaving `backend_override` empty for openai
+# keeps that path's compose override byte-identical to what it has always been.
+_adopt_running_backend() {
+    [[ -z "${backend_override:-}" ]] || return 0
+    _chatgpt_in_play || return 0
+    # `compose` shells out to the container runtime and rewrites the runtime
+    # override as a side effect; skip both on a host-only box.
+    harness_runtime_installed || return 0
+    local have
+    have=$(_running_proxy_backend) || return 0
+    [[ "$have" == "chatgpt" ]] || return 0
+    backend_override="chatgpt"
+    agent_model=$(_effective_default_model)
+}
+
 # Bring services up if they aren't already. Used before launching agents.
 #
 # The proxy is a single shared service that speaks ONE upstream dialect at a
@@ -1079,16 +1114,23 @@ ensure_services_up() {
     if ! services_up; then
         echo "harness: services not running; starting..."
         cmd_start
-    elif have=$(_running_proxy_backend) && [[ "$have" != "$want" ]]; then
-        echo "harness: proxy is running the '$have' backend; restarting it for '$want'"
-        cmd_start
-    elif _backend_is_chatgpt && [[ "$(_running_proxy_fp)" != "$(_chatgpt_config_fingerprint)" ]]; then
-        # Same backend, different credentials: the running container captured
-        # the old CHATGPT_* at `up` time. Rotating an expired cookie is the one
-        # routine maintenance action here, and compose won't replace a running
-        # container over an .env edit, so reconcile it explicitly.
-        echo "harness: chatgpt config changed since the proxy started; restarting it"
-        cmd_start
+    elif _chatgpt_in_play; then
+        # Reconciliation costs two `compose ps` plus a `docker inspect` on every
+        # launch, so it is skipped entirely on an install that has never
+        # configured the chatgpt backend — there is nothing to reconcile there,
+        # and that path stays exactly as cheap as it was before this backend
+        # existed.
+        if have=$(_running_proxy_backend) && [[ "$have" != "$want" ]]; then
+            echo "harness: proxy is running the '$have' backend; restarting it for '$want'"
+            cmd_start
+        elif _backend_is_chatgpt && [[ "$(_running_proxy_fp)" != "$(_chatgpt_config_fingerprint)" ]]; then
+            # Same backend, different credentials: the running container captured
+            # the old CHATGPT_* at `up` time. Rotating an expired cookie is the one
+            # routine maintenance action here, and compose won't replace a running
+            # container over an .env edit, so reconcile it explicitly.
+            echo "harness: chatgpt config changed since the proxy started; restarting it"
+            cmd_start
+        fi
     fi
     # Reconcile host MCPs on every launch (idempotent): a host MCP may have been
     # registered, or its process died, since the container stack came up. Cheap
@@ -1516,6 +1558,17 @@ cmd_unlock() {
     # On success, prints "key OK". Useful for mid-session lockouts: user
     # runs this, sees the URL, unlocks in the browser, and the agent's
     # next request goes through.
+    if [[ -z "${PROXY_API_URL:-}" || -z "${PROXY_API_KEY:-}" ]]; then
+        # _probe_upstream_auth returns 0 when there is nothing to probe, which
+        # would otherwise read as "your key is fine". The chatgpt backend
+        # authenticates with a cookie and has no unlock flow at all.
+        echo "[harness] no PROXY_API_URL/PROXY_API_KEY configured; nothing to unlock"
+        if [[ -n "${CHATGPT_BASE_URL:-}" ]]; then
+            echo "[harness] (the chatgpt backend authenticates by cookie; rotate it with"
+            echo "[harness]  'harness config set CHATGPT_COOKIE_STRING <value>')"
+        fi
+        return 0
+    fi
     if _probe_upstream_auth; then
         echo "[harness] upstream API key is OK; no unlock needed"
         return 0
@@ -2057,10 +2110,12 @@ commands:
                         (PROXY_API_* and DEFAULT_MODEL_NAME are unused). Bare
                         'harness chatgpt' is the containerized launch; add
                         'host' for the containerless one. 'harness chatgpt
-                        doctor|preflight' runs those diagnostics against this
-                        backend's config. The proxy serves one backend at a
-                        time, so switching restarts it, as does rotating the
-                        cookie. See 'harness chatgpt --help'.
+                        doctor|preflight' runs those diagnostics, and 'harness
+                        chatgpt start|restart|down' the stack lifecycle, against
+                        this backend. The proxy serves one backend at a time, so
+                        switching restarts it, as does rotating the cookie;
+                        'restart'/'upgrade'/'downgrade' come back up on whichever
+                        backend was running. See 'harness chatgpt --help'.
   shell [--mount PATH]... drop into a bash shell inside the agent container
                         (for installing skills, debugging — shares the home
                         directory with agent launches)
@@ -2261,7 +2316,11 @@ cmd_start() {
     if (( up_rc != 0 )); then
         echo
         echo "[harness] start failed (exit $up_rc). Common causes:"
-        echo "  - PROXY_API_URL or PROXY_API_KEY missing/wrong in .env"
+        if _backend_is_chatgpt; then
+            echo "  - CHATGPT_BASE_URL or CHATGPT_COOKIE_STRING missing/wrong in .env"
+        else
+            echo "  - PROXY_API_URL or PROXY_API_KEY missing/wrong in .env"
+        fi
         echo "  - Upstream API hostname not in .harness-allowlist"
         echo "  - Stale Docker resources (try: harness down)"
         echo
@@ -2351,6 +2410,10 @@ cmd_restart() {
         return 1
     fi
     require_docker
+    # Come back up on the dialect that was actually running (see
+    # _adopt_running_backend); must be read before cmd_down destroys the
+    # container that carries it.
+    _adopt_running_backend
     cmd_down
     # prompt_mode_override is already set as a global; cmd_start re-parses an
     # empty arg list (a no-op that leaves the global intact).
@@ -2628,6 +2691,9 @@ EOF
     if [[ ! -f "$manifest" || ! -f "$lib" ]]; then
         err "no upgrade manifest or actions library found; falling back to legacy upgrade"
         if (( ! host_only && ! no_restart && ! check_only )); then
+            # Come back up on the dialect that is running, not always openai
+            # (see _adopt_running_backend). Must be read before the teardown.
+            _adopt_running_backend
             cmd_down --remove-orphans 2>/dev/null || true
             cmd_start
         fi
@@ -2747,6 +2813,10 @@ EOF
     fi
 
     if (( ! no_restart )); then
+        # Come back up on the dialect that is running, not always openai (see
+        # _adopt_running_backend). Must be read before the teardown destroys
+        # the container that carries it.
+        _adopt_running_backend
         cmd_down --remove-orphans 2>/dev/null || true
 
         # Rebuild images so image-level changes (Dockerfile, proxy.py, agent
@@ -4271,7 +4341,12 @@ host_run_opencode() {
     echo "============================================================" >&2
     echo " harness host (opencode, containerless)" >&2
     echo "   provider: GenAI Harness" >&2
-    echo "   model:    harness/${DEFAULT_MODEL_NAME:-default}" >&2
+    # _effective_default_model, not $DEFAULT_MODEL_NAME: host_write_opencode_config
+    # already selects CHATGPT_MODEL_NAME under `harness chatgpt host`, so the raw
+    # var would print a model this launch is not using. The :-default fallback is
+    # the pre-existing behaviour for an unset value.
+    local banner_model; banner_model=$(_effective_default_model)
+    echo "   model:    harness/${banner_model:-default}" >&2
     echo "   proxy:    http://127.0.0.1:$(host_proxy_port)/v1" >&2
     echo "   yolo:     ${yolo}" >&2
     echo "   print:    ${print_mode}" >&2
@@ -4490,6 +4565,9 @@ usage:
   harness chatgpt host down     stop the host-mode proxy
   harness chatgpt doctor        'harness doctor' against this backend's config
   harness chatgpt preflight     'harness preflight' against this backend's config
+  harness chatgpt start         bring the stack up on this backend
+  harness chatgpt restart       down + start on this backend
+  harness chatgpt down          stop the stack (same as 'harness down')
 
 Config (.env) — these three replace PROXY_API_URL / PROXY_API_KEY /
 DEFAULT_MODEL_NAME for this backend; nothing else is configurable:
@@ -4504,6 +4582,9 @@ host for the container-mode egress firewall.
 Notes:
   * The proxy speaks ONE backend at a time. Switching between 'harness' and
     'harness chatgpt' restarts it, which drops any agent using the other one.
+  * 'harness restart', 'harness upgrade' and 'harness downgrade' read the
+    running proxy's backend first and bring the stack back up on it, so they
+    need no 'chatgpt' prefix once the stack is up.
   * The backend-api keeps conversation state server-side; this proxy is
     stateless, so each request opens a fresh conversation carrying the full
     translated history. Tool use, prompt modes and MCPs work as usual.
@@ -4525,6 +4606,13 @@ EOF
         # chatgpt-only install as broken. Route them with the backend selected.
         doctor)    shift; cmd_doctor "$@" ;;
         preflight) shift; cmd_preflight "$@" ;;
+        # Stack lifecycle. `harness start`/`restart` require the openai trio, so
+        # on a chatgpt-only install they abort; and without these labels the
+        # words would fall through to `*)` and launch an agent with a stray
+        # argument. `down` is dialect-agnostic but routed for symmetry.
+        start)     shift; cmd_start "$@" ;;
+        restart)   shift; cmd_restart "$@" ;;
+        down)      shift; cmd_down "$@" ;;
         *)    run_agent opencode "$@" ;;
     esac
 }
@@ -7829,6 +7917,13 @@ cmd_preflight() {
                 echo "  ✓ ${rk%%|*} is set"
             fi
         done
+        # Same pointer cmd_doctor prints: a chatgpt-only install checked with
+        # bare `harness preflight` fails all three openai keys with no hint
+        # that the other entry point exists.
+        if ! _backend_is_chatgpt && [[ -z "$(_config_read_key PROXY_API_URL)" ]] \
+           && [[ -n "$(_config_read_key CHATGPT_BASE_URL)" ]]; then
+            echo "  ℹ CHATGPT_* is configured; run 'harness chatgpt preflight' to check that backend"
+        fi
         proxy_url=$(_config_read_key "$url_key")
 
         # The upstream hostname must be in the allowlist or container egress

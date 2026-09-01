@@ -281,20 +281,18 @@ if [[ -n "$guard_url" ]]; then
 EOF
         exit 1
     fi
-    if [[ -n "$api_host" ]]; then
-        # Only enforce for non-intra-cluster hosts. A bare hostname with no
-        # dots (mockupstream) is intra-cluster and lives behind the
-        # host-network rule above.
-        if [[ "$api_host" == *.* ]]; then
-            if ! grep -qE "^[[:space:]]*${api_host}([[:space:]]|#|\$)" "$ALLOWLIST_FILE"; then
-                cat >&2 <<EOF
+    # Only enforce for non-intra-cluster hosts. A bare hostname with no dots
+    # (mockupstream) is intra-cluster and lives behind the host-network rule
+    # above. $api_host is non-empty here: the parse failure above exits.
+    if [[ "$api_host" == *.* ]]; then
+        if ! grep -qE "^[[:space:]]*${api_host}([[:space:]]|#|\$)" "$ALLOWLIST_FILE"; then
+            cat >&2 <<EOF
 [harness-firewall] FATAL: ${guard_var} hostname '${api_host}' is not in $ALLOWLIST_FILE.
 [harness-firewall] The proxy cannot reach its upstream. Add it with:
 [harness-firewall]     harness net allow ${api_host}
 [harness-firewall] (or edit <install-root>/.harness-allowlist directly, then 'harness restart').
 EOF
-                exit 1
-            fi
+            exit 1
         fi
     fi
 fi

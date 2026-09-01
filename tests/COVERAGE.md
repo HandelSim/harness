@@ -11,7 +11,7 @@ with a status flag based on the actual assertion strength.
   output non-empty, "no crash", etc.). Evidence quotes the weak assertion verbatim.
 - **red** — no test exercises this behavior.
 
-Inventory total: 487 rows (F=154, P=88, A=24, M=33, N=31, U=29, Pe=16, O=0, I=50, B=10, Ho=18, C=34). 484 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
+Inventory total: 492 rows (F=154, P=88, A=24, M=33, N=31, U=29, Pe=16, O=0, I=50, B=10, Ho=18, C=39). 489 distinct IDs — F100/F101/F102 are each used for two rows (a pre-existing numbering collision present identically in INVENTORY.md and here).
 
 Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
@@ -42,10 +42,12 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   (`require_runtime_config`/`host_require_config`), the auth-probe/model-catalog no-ops,
   `host_proxy_fingerprint` backend/CHATGPT_* coverage, `_running_proxy_backend` +
   `ensure_services_up` restart-on-mismatch, cookie secrecy + config-picker + allowlist sync,
-  `cmd_chatgpt` dispatch/help/wiring (including `doctor`/`preflight`), the
+  `cmd_chatgpt` dispatch/help/wiring (including `doctor`/`preflight` and the
+  `start`/`restart`/`down` lifecycle verbs), `_adopt_running_backend`, the
   `_config_write_key`/`_config_read_key` quoting round-trip, and the
   `HARNESS_PROXY_FP` credential fingerprint. Sourced via `HARNESS_SOURCE_ONLY=1`.
-  Covers C001-C034 (T1-T17).
+  Covers C001-C039 (T1-T20). T18-T20 also pin the cost/behaviour guarantees for
+  installs that never configured this backend.
 - `tests/scheme_contract_test.sh` (407 lines, Track E) — per-scheme proxy contract test.
   Brings up proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
   a probe through the proxy's OpenAI-compatible interface; asserts forwarded-body structure.
@@ -97,10 +99,10 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   365 |  74.95% |
-| yellow   |     5 |   1.03% |
-| red      |   117 |  24.02% |
-| **total**|   487 | 100.00% |
+| green    |   370 |  75.20% |
+| yellow   |     5 |   1.02% |
+| red      |   117 |  23.78% |
+| **total**|   492 | 100.00% |
 
 Per-prefix breakdown:
 
@@ -117,8 +119,8 @@ Per-prefix breakdown:
 | I      |    50 |    35 |      1 |  14 |
 | B      |    10 |    10 |      0 |   0 |
 | Ho     |    18 |    18 |      0 |   0 |
-| C      |    34 |    34 |      0 |   0 |
-| **all**|   487 |   365 |      5 | 117 |
+| C      |    39 |    39 |      0 |   0 |
+| **all**|   492 |   370 |      5 | 117 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -657,7 +659,7 @@ non-green rows — the gap.
 | Ho016 | green  | tests/unit_host_toolchain_test.sh:T8         | `host_toolchain_path_prefix` under a stubbed Windows OS orders the dirs `tool_bin:node-root:opencode-root` (Windows layout, stub binaries at the root). | |
 | Ho017 | green  | tests/unit_host_toolchain_test.sh:T9         | `host_extract_archive` extracts a real `.tar.gz` (and a `.zip` round-trip when `zip`/`unzip` are present), and rejects an unknown archive kind. | |
 
-## C — ChatGPT backend, CLI side (34 IDs)
+## C — ChatGPT backend, CLI side (39 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -695,6 +697,11 @@ non-green rows — the gap.
 | C032 | green  | tests/unit_chatgpt_test.sh (T10)            | `_running_proxy_backend`→`openai`, `_running_proxy_fp`→`''`, `backend_override=""` → `[[ ! -s "$START_LOG" ]] \|\| fail "T10: the openai backend must not restart on a missing fingerprint"`. | |
 | C033 | green  | tests/unit_chatgpt_test.sh (T14)            | `cmd_doctor`/`cmd_preflight` stubbed to log; `cmd_chatgpt doctor` logs `cmd_doctor:` and `cmd_chatgpt preflight` logs `cmd_preflight:`, and after each `[[ "$backend_override" == "chatgpt" ]]` is asserted. | |
 | C034 | green  | tests/unit_chatgpt_test.sh (T7)             | `curl` stubbed to touch `$CURL_MARKER`; with `backend_override=""`, `PROXY_API_URL`/`PROXY_API_KEY` set, `_print_upstream_models` leaves the marker present — `[[ -e "$CURL_MARKER" ]] \|\| fail "T7: the openai backend must still pull the catalog"`. The chatgpt half (C011) asserts the marker is absent. | |
+| C035 | green  | tests/unit_chatgpt_test.sh (T14)            | `cmd_start`/`cmd_restart`/`cmd_down` stubbed to log; the loop over `start restart down` asserts each logs `cmd_<verb>:` and that `backend_override == chatgpt` after. The real `cmd_restart`/`cmd_down`/`cmd_preflight` are saved with `declare -f` and restored, since T19/T20 exercise them. | |
+| C036 | green  | tests/unit_chatgpt_test.sh (T19)            | Four cases: running `chatgpt` sets `backend_override`+`agent_model`; running `openai` leaves it empty; a pre-set `chatgpt` survives a running `openai`; with `CHATGPT_BASE_URL=""` the stubbed `_running_proxy_backend` writes nothing to `$PROBE_LOG`. | |
+| C037 | green  | tests/unit_chatgpt_test.sh (T19)            | `_running_proxy_backend`/`cmd_down`/`cmd_start` stubbed to append to `$ORDER_LOG`; `cmd_restart` must produce exactly `read\ndown\nstart:chatgpt`. | |
+| C038 | green  | tests/unit_chatgpt_test.sh (T18)            | `_running_proxy_backend`/`_running_proxy_fp` stubbed to append to `$PROBE_LOG`. With `CHATGPT_BASE_URL=""` and no `backend_override` the log stays empty (and no restart fires); restoring the key, and separately setting `backend_override=chatgpt` with the key blank, each make it non-empty. | |
+| C039 | green  | tests/unit_chatgpt_test.sh (T20)            | `.env` rewritten to the CHATGPT_* trio only; `cmd_preflight` output must match `harness chatgpt preflight`. The original `.env` is restored and the same grep must NOT match. | |
 
 ---
 
