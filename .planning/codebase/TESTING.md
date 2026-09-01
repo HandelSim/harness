@@ -40,7 +40,7 @@ The runner is `cmd_test` (`harness:6137-6308`): it globs `$clone_dir/tests/*_tes
 This split is the single most important testing fact: issue-handling agents run only the docker-free slice locally and let CI run the rest.
 
 **Docker-FREE (`harness test unit` → globs `tests/unit_*_test.sh` plus `tests/upgrade_test.sh`, `harness:6214-6227`):**
-- `tests/upgrade_test.sh` (no docker) — `envfile_merge`, `linefile_merge`, `directory_overwrite`, `_upgrade_confirm`, `_git_branches_diverged`, synthetic N→N+1 upgrade, rsync fallback, standalone `harness_jq`.
+- `tests/upgrade_test.sh` (no docker) — `envfile_merge`, `linefile_merge`, `directory_overwrite`, `userfile_sync`, `_upgrade_confirm`, `_git_branches_diverged`, synthetic N→N+1 upgrade, rsync fallback, standalone `harness_jq`.
 - `tests/unit_platform_timer_test.sh` — `harness_start_docker_desktop` poll-timeout logic with stubbed daemon probes.
 - `tests/unit_workdir_test.sh` — Git Bash path translation (`harness_abs_path`, `harness_container_workdir`, MSYS env guards, issue #112).
 - `tests/unit_host_test.sh` — host-mode CLI surface, proxy startup, loopback-only binding, model-list discovery.

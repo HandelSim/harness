@@ -3834,24 +3834,26 @@ class TestReminderTemplateFile(unittest.TestCase):
         proxy._REMINDER_TEMPLATE = self.shipped
 
     def _load(self, text, tmpdir=None):
-        """Write `text` to a temp reminder file, point HARNESS_REMINDER_PATH
-        at it, load it, and return (template, stdout)."""
+        """Write `text` to reminder.md in a temp dir, point HARNESS_DATA_DIR
+        at that dir, load it, and return (template, stdout, path)."""
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "reminder.md")
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text)
             buf = io.StringIO()
-            with patch.dict(os.environ, {"HARNESS_REMINDER_PATH": path}), \
+            with patch.dict(os.environ, {"HARNESS_DATA_DIR": td}), \
                     patch("sys.stdout", buf):
                 proxy._setup_reminder_template()
             return proxy._REMINDER_TEMPLATE, buf.getvalue(), path
 
     # -- loading -----------------------------------------------------------
 
-    def test_env_path_overrides_the_adjacent_default(self):
+    def test_data_dir_overrides_the_adjacent_default(self):
         # `harness host` runs proxy.py straight from the clone, where there is
-        # no bind-mount to swap reminder.md — HARNESS_REMINDER_PATH is how the
-        # user's editable copy is reached in that mode.
+        # no bind-mount to swap reminder.md — HARNESS_DATA_DIR is how the
+        # user's editable copy (in <install root>/.harness-data/) is reached in
+        # that mode. It names the DIRECTORY, and the copy keeps the tracked
+        # basename, so one variable serves this file and tool-guidance.json.
         tmpl, _, _ = self._load("just this")
         self.assertEqual(tmpl, "just this")
 
@@ -3879,7 +3881,7 @@ class TestReminderTemplateFile(unittest.TestCase):
         # Guards proxy/reminder.md itself: dropping a token there would
         # silently strand host-OS / cwd / tool entries out of the prompt.
         env_no_var = {k: v for k, v in os.environ.items()
-                      if k != "HARNESS_REMINDER_PATH"}
+                      if k != "HARNESS_DATA_DIR"}
         with patch.dict(os.environ, env_no_var, clear=True):
             # With no env override the default is reminder.md sitting next to
             # proxy.py. Assert that layout-independently: in a checkout that
@@ -3906,13 +3908,14 @@ class TestReminderTemplateFile(unittest.TestCase):
     # -- degradation -------------------------------------------------------
 
     def test_missing_file_falls_back_loudly(self):
-        # The realistic cause is a bad HARNESS_REMINDER_PATH / bind-mount,
-        # where docker mounts an empty DIRECTORY over the file. Falling back
-        # keeps the tool-call envelope alive; the `[!]` makes it visible.
+        # The realistic cause is a HARNESS_DATA_DIR with no reminder.md in it
+        # (an un-seeded install), or a bind-mount whose source is missing.
+        # Falling back keeps the tool-call envelope alive; `[!]` makes it
+        # visible.
         with tempfile.TemporaryDirectory() as td:
-            missing = os.path.join(td, "nope.md")
+            missing = os.path.join(td, "reminder.md")
             buf = io.StringIO()
-            with patch.dict(os.environ, {"HARNESS_REMINDER_PATH": missing}), \
+            with patch.dict(os.environ, {"HARNESS_DATA_DIR": td}), \
                     patch("sys.stdout", buf):
                 proxy._setup_reminder_template()
             self.assertEqual(proxy._REMINDER_TEMPLATE, proxy._REMINDER_FALLBACK)
@@ -3920,10 +3923,12 @@ class TestReminderTemplateFile(unittest.TestCase):
             self.assertIn(missing, buf.getvalue())
 
     def test_directory_at_the_path_falls_back(self):
-        # Exactly what docker leaves behind for a missing mount source.
+        # Exactly what docker leaves behind for a missing mount source: a
+        # DIRECTORY named reminder.md mounted over the file.
         with tempfile.TemporaryDirectory() as td:
+            os.mkdir(os.path.join(td, "reminder.md"))
             buf = io.StringIO()
-            with patch.dict(os.environ, {"HARNESS_REMINDER_PATH": td}), \
+            with patch.dict(os.environ, {"HARNESS_DATA_DIR": td}), \
                     patch("sys.stdout", buf):
                 proxy._setup_reminder_template()
             self.assertEqual(proxy._REMINDER_TEMPLATE, proxy._REMINDER_FALLBACK)
@@ -4482,25 +4487,29 @@ class TestToolGuidanceFile(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text)
             buf = io.StringIO()
-            with patch.dict(os.environ,
-                            {"HARNESS_TOOL_GUIDANCE_PATH": path}), \
+            with patch.dict(os.environ, {"HARNESS_DATA_DIR": td}), \
                     patch("sys.stdout", buf):
                 proxy._setup_tool_guidance()
             return buf.getvalue(), path
 
     # --- path resolution ---------------------------------------------------
 
-    def test_env_path_overrides_the_adjacent_default(self):
-        with patch.dict(os.environ,
-                        {"HARNESS_TOOL_GUIDANCE_PATH": "/x/custom.json"}):
-            self.assertEqual(proxy._tool_guidance_path(), "/x/custom.json")
+    def test_data_dir_overrides_the_adjacent_default(self):
+        # One variable names the DIRECTORY holding both user-editable prompt
+        # files; each keeps its tracked basename, so there is no second
+        # per-file path variable to keep in sync.
+        with patch.dict(os.environ, {"HARNESS_DATA_DIR": "/x/data"}):
+            self.assertEqual(proxy._tool_guidance_path(),
+                             "/x/data/tool-guidance.json")
+            self.assertEqual(proxy._reminder_template_path(),
+                             "/x/data/reminder.md")
 
     def test_default_path_sits_next_to_proxy_py(self):
         # Layout-independent on purpose: in a checkout that dir is proxy/, but
         # the proxy_test suite runs inside the container where the Dockerfile
         # COPYs proxy.py to /app.
         env = {k: v for k, v in os.environ.items()
-               if k != "HARNESS_TOOL_GUIDANCE_PATH"}
+               if k != "HARNESS_DATA_DIR"}
         with patch.dict(os.environ, env, clear=True):
             path = proxy._tool_guidance_path()
         self.assertEqual(os.path.basename(path), "tool-guidance.json")
@@ -4514,7 +4523,7 @@ class TestToolGuidanceFile(unittest.TestCase):
         # silently strand the legend or the whole guidance map out of the
         # prompt with only an `[!]` line to show for it.
         env = {k: v for k, v in os.environ.items()
-               if k != "HARNESS_TOOL_GUIDANCE_PATH"}
+               if k != "HARNESS_DATA_DIR"}
         with patch.dict(os.environ, env, clear=True):
             values, warnings = proxy._load_tool_guidance(
                 proxy._tool_guidance_path())

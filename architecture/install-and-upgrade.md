@@ -381,7 +381,8 @@ but not by this launch path until the helper is extended.
 The contract between this repo and a user's install root. Since the
 install root IS the clone, "managed files" means files harness writes
 inside the clone that aren't tracked git content: `.env`,
-`.harness-allowlist`, and per-MCP state under `state/mcp/<name>/`.
+`.harness-allowlist`, the user's prompt data under `.harness-data/`, and
+per-MCP state under `state/mcp/<name>/`.
 
 Every `B3-MANAGED:` comment in the codebase has a matching manifest
 entry. The comments anchor in:
@@ -397,7 +398,7 @@ list.
 
 ## Action types (`scripts/lib/upgrade_actions.sh`)
 
-Three action types, each implemented as a bash function. The harness
+Four action types, each implemented as a bash function. The harness
 script dispatches per manifest entry, each emits one JSON-line summary,
 and `cmd_upgrade` aggregates with jq.
 
@@ -426,9 +427,35 @@ source are left in place. The `condition: installed` field gates this
 on `mcp_is_installed(name)` so registry entries the user never opted
 into don't get auto-installed.
 
+### `userfile_sync`
+
+Used for the two files whose contents are the user's own prose:
+`.harness-data/reminder.md` and `.harness-data/tool-guidance.json`
+(see `architecture/proxy.md` → "Editable reminder data"). Seeding
+deliberately never overwrites an existing copy, which would otherwise
+strand an install on whatever default it was first seeded with; this
+action is the way back, and it works by **asking** rather than merging —
+prose has no key-by-key structure to merge on.
+
+`upgrade_userfile_sync <source> <target> [dry_run] [allow_prompt]`
+compares the bytes and does nothing at all unless they differ, so a user
+who never edited anything is never asked. When they differ it prints both
+paths and the line delta and asks once, defaulting to **no**; a `y`
+copies the user's version to `<target>.bak` and installs the shipped one
+atomically. Every other outcome is a skip with a reason: `identical`,
+`target_missing` (seeding creates it on the next `harness start` — there
+is nothing to ask about yet), `source_missing`, `dry_run` (`--check`),
+`declined`, `not_prompted`, `backup_failed`.
+
+`allow_prompt` is 0 under `--no-prompt`, and a run with no tty skips too:
+an unattended upgrade must never replace hand-edited prose on the user's
+behalf. The `upgrade_userfile_needs_sync` precheck mirrors the same
+"both exist and differ" rule, so the aggregate `harness upgrade` prompt
+lists the file only when a question is actually coming.
+
 ## Atomic writes
 
-All three action functions write via `.tmp + rename` so an interrupted
+All four action functions write via `.tmp + rename` so an interrupted
 upgrade can never leave a half-written config behind. The harness
 script's per-call jq round-trips also use the same pattern.
 

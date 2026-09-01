@@ -26,13 +26,15 @@ COPY proxy/proxy.py .
 COPY proxy/test_proxy.py .
 
 # Shipped default for the hybrid recency reminder. docker-compose bind-mounts
-# the user's editable copy (<install root>/.harness-reminder.md) over this
-# path; the baked copy is what a container launched without that mount uses.
+# the user's editable copy (<install root>/.harness-data/reminder.md) over
+# this path; the baked copy is what a container launched without that mount
+# uses.
 COPY proxy/reminder.md .
 
 # Shipped default for the reminder's per-tool entries (legend, per-tool
 # guidance, detail-tool list). Same deal: docker-compose bind-mounts the user's
-# editable copy (<install root>/.harness-tool-guidance.json) over this path.
+# editable copy (<install root>/.harness-data/tool-guidance.json) over this
+# path.
 COPY proxy/tool-guidance.json .
 
 # Universal egress firewall.

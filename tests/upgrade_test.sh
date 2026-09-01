@@ -870,6 +870,126 @@ confirm_default_case "n"     y 1 "n + default y → abort"
 unset HARNESS_CONFIRM_FROM_STDIN
 ok "T12: _upgrade_confirm honors default-N (Enter aborts) without breaking default-Y callers"
 
+# === Test 13: userfile_sync (the reminder / tool-guidance question) ========
+#
+# U0xx in the inventory. `.harness-data/reminder.md` and
+# `.harness-data/tool-guidance.json` are seeded once and then owned by the
+# user, so upgrade can never just overwrite them. This action asks — once per
+# file, and ONLY when the bytes actually differ. The contract under test:
+#
+#   - identical files ask nothing (reason "identical"), so a user who never
+#     edited anything sees no new prompts;
+#   - a differing file asks, and "no" leaves it byte-identical;
+#   - "yes" replaces it and keeps the old one at <name>.bak, so a mistaken
+#     yes is recoverable;
+#   - --dry-run (`--check`) and non-interactive runs (`--no-prompt`, no tty)
+#     never write: an unattended upgrade must not discard hand-edited prose;
+#   - a MISSING target is not "work" — seeding creates it on the next
+#     `harness start`, and asking about a file that does not exist yet would
+#     be nonsense.
+#
+# T8/T12 already source `harness`, so `_upgrade_confirm` here is the real one
+# and HARNESS_CONFIRM_FROM_STDIN lets the answer come from a heredoc.
+
+echo
+echo "--- T13: userfile_sync ---"
+T13_DIR="${WORK}/t13"
+mkdir -p "${T13_DIR}"
+export HARNESS_CONFIRM_FROM_STDIN=1
+
+# The lib must carry its own _upgrade_confirm fallback (same pattern as
+# harness_jq in T9): actions run from `harness upgrade`, but the lib is also
+# sourced standalone, and a userfile_sync that called an undefined function
+# would die mid-upgrade.
+bash -c "source '${REPO_ROOT}/scripts/lib/upgrade_actions.sh'; declare -F _upgrade_confirm >/dev/null" \
+    || fail "T13: upgrade_actions.sh does not define an _upgrade_confirm fallback"
+
+t13_reset() {
+    printf '%s\n' "[Reminder shipped default]" >"${T13_DIR}/shipped.md"
+    printf '%s\n' "[Reminder MY OWN WORDING]" >"${T13_DIR}/user.md"
+    rm -f "${T13_DIR}/user.md.bak"
+}
+
+# -- identical: silent, no question, no write ------------------------------
+t13_reset
+cp "${T13_DIR}/shipped.md" "${T13_DIR}/user.md"
+if upgrade_userfile_needs_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md"; then
+    fail "T13: identical files reported as needing a sync"
+fi
+out=$(upgrade_userfile_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" 0 1 </dev/null 2>/dev/null)
+[[ "$(json_field reason "$out")" == "identical" ]] \
+    || fail "T13: identical files gave reason $(json_field reason "$out")"
+[[ ! -e "${T13_DIR}/user.md.bak" ]] || fail "T13: identical files wrote a backup"
+
+# -- differs + declined: not one byte changes ------------------------------
+t13_reset
+upgrade_userfile_needs_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" \
+    || fail "T13: differing files not reported as needing a sync"
+out=$(upgrade_userfile_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" 0 1 <<<"n" 2>/dev/null)
+[[ "$(json_field reason "$out")" == "declined" ]] \
+    || fail "T13: declining gave reason $(json_field reason "$out")"
+grep -q "MY OWN WORDING" "${T13_DIR}/user.md" \
+    || fail "T13: declining still overwrote the user's file"
+[[ ! -e "${T13_DIR}/user.md.bak" ]] || fail "T13: declining wrote a backup"
+
+# -- differs + Enter: the default is NO ------------------------------------
+t13_reset
+out=$(upgrade_userfile_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" 0 1 <<<"" 2>/dev/null)
+[[ "$(json_field reason "$out")" == "declined" ]] \
+    || fail "T13: Enter did not default to keeping the user's file"
+grep -q "MY OWN WORDING" "${T13_DIR}/user.md" \
+    || fail "T13: Enter overwrote the user's file"
+
+# -- differs + accepted: replaced, with the old one preserved --------------
+t13_reset
+out=$(upgrade_userfile_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" 0 1 <<<"y" 2>/dev/null)
+[[ "$(json_field 'files_updated[0]' "$out")" == "user.md" ]] \
+    || fail "T13: accepting did not report user.md in files_updated: $out"
+diff -q "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" >/dev/null \
+    || fail "T13: accepting did not install the shipped default"
+grep -q "MY OWN WORDING" "${T13_DIR}/user.md.bak" \
+    || fail "T13: the user's version was not preserved at user.md.bak"
+
+# -- dry run: asks nothing, writes nothing ---------------------------------
+t13_reset
+out=$(upgrade_userfile_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" 1 1 </dev/null 2>/dev/null)
+[[ "$(json_field reason "$out")" == "dry_run" ]] \
+    || fail "T13: dry run gave reason $(json_field reason "$out")"
+grep -q "MY OWN WORDING" "${T13_DIR}/user.md" || fail "T13: dry run wrote to the file"
+
+# -- allow_prompt=0 (`--no-prompt`): keeps the user's copy -----------------
+t13_reset
+out=$(upgrade_userfile_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" 0 0 </dev/null 2>/dev/null)
+[[ "$(json_field reason "$out")" == "not_prompted" ]] \
+    || fail "T13: --no-prompt gave reason $(json_field reason "$out")"
+grep -q "MY OWN WORDING" "${T13_DIR}/user.md" \
+    || fail "T13: an unattended upgrade overwrote the user's file"
+
+# -- missing target / missing source: not work, never an error -------------
+t13_reset
+rm -f "${T13_DIR}/user.md"
+if upgrade_userfile_needs_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md"; then
+    fail "T13: a missing target was reported as needing a sync"
+fi
+out=$(upgrade_userfile_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" 0 1 </dev/null 2>/dev/null)
+[[ "$(json_field reason "$out")" == "target_missing" ]] \
+    || fail "T13: missing target gave reason $(json_field reason "$out")"
+[[ ! -e "${T13_DIR}/user.md" ]] || fail "T13: missing target was created behind seeding's back"
+
+t13_reset
+rm -f "${T13_DIR}/shipped.md"
+if upgrade_userfile_needs_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md"; then
+    fail "T13: a missing source was reported as needing a sync"
+fi
+out=$(upgrade_userfile_sync "${T13_DIR}/shipped.md" "${T13_DIR}/user.md" 0 1 </dev/null 2>/dev/null)
+[[ "$(json_field reason "$out")" == "source_missing" ]] \
+    || fail "T13: missing source gave reason $(json_field reason "$out")"
+grep -q "MY OWN WORDING" "${T13_DIR}/user.md" \
+    || fail "T13: missing source damaged the user's file"
+
+unset HARNESS_CONFIRM_FROM_STDIN
+ok "T13: userfile_sync asks only on a real difference, and 'no' is the default"
+
 echo
 echo "============================================================"
 echo " UPGRADE TEST PASSED"

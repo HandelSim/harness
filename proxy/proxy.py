@@ -583,23 +583,33 @@ _OPENCODE_TASK_AGENTS_RE = re.compile(
 # host-OS parenthetical — the rest of the Environment line is host-independent.
 _HOST_OS: str = ""
 
-# Hybrid mode only. The recency reminder's prose lives in a FILE, not in a
-# string literal here, so it is editable without a code change: edit the file,
-# `harness restart`, done.
+# Hybrid mode only. Both files the reminder is built from — its prose and the
+# per-tool entries' data — live in FILES, not in string literals here, so they
+# are editable without a code change: edit the file, `harness restart`, done.
 #
 # Two rungs, both resolving to the user's copy in a normal install:
-#   1. HARNESS_REMINDER_PATH — set by `harness host` (host mode runs proxy.py
-#      straight from the clone, so there is no mount to override anything).
-#   2. reminder.md next to proxy.py — /app/reminder.md in the container, which
-#      docker-compose bind-mounts the user's `.harness-reminder.md` over. The
-#      Dockerfile also COPYs the tracked default there, so a container with no
-#      mount still has a working reminder.
+#   1. $HARNESS_DATA_DIR/<name> — `harness host` points this at
+#      <install root>/.harness-data, the directory both user copies are seeded
+#      into. Host mode runs proxy.py straight from the clone, so there is no
+#      bind-mount to override anything.
+#   2. <name> next to proxy.py — /app/<name> in the container, which
+#      docker-compose bind-mounts the user's copy over. The Dockerfile also
+#      COPYs the tracked default there, so a container with no mount still
+#      has a working file.
+# ONE variable covers both files rather than one variable per file: the copies
+# are seeded into the same directory under their tracked basenames, so a second
+# variable would carry no information the first one doesn't. Resolved off
+# `__file__`, never a hardcoded `proxy/`: the image flattens the repo into /app.
+def _user_data_path(basename: str) -> str:
+    data_dir = os.environ.get("HARNESS_DATA_DIR", "").strip()
+    if data_dir:
+        return os.path.join(data_dir, basename)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), basename)
+
+
 # Loaded once at startup like the recency map: the file is fixed for a launch.
 def _reminder_template_path() -> str:
-    env_path = os.environ.get("HARNESS_REMINDER_PATH", "").strip()
-    if env_path:
-        return env_path
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminder.md")
+    return _user_data_path("reminder.md")
 
 # Substituted into the template per turn. Deliberately `{{NAME}}` + str.replace
 # rather than str.format/Template: the reminder prose is full of braces
@@ -638,25 +648,10 @@ _REMINDER_TEMPLATE: Optional[str] = None
 # Hybrid mode only. The per-tool entries block's data (legend, per-tool
 # guidance, detail-tool list) lives in a FILE for the same reason the reminder
 # prose does: it is wording, not logic, and an operator must be able to retune
-# a tool's one-liner without a code change.
-#
-# Two rungs, mirroring `_reminder_template_path`:
-#   1. HARNESS_TOOL_GUIDANCE_PATH — set by `harness host` (host mode runs
-#      proxy.py straight from the clone, so there is no mount to override
-#      anything).
-#   2. tool-guidance.json next to proxy.py — /app/tool-guidance.json in the
-#      container, which docker-compose bind-mounts the user's
-#      `.harness-tool-guidance.json` over. The Dockerfile also COPYs the
-#      tracked default there, so a container with no mount still has guidance.
-# Resolved off `__file__`, never a hardcoded `proxy/`: the image flattens the
-# repo layout into /app.
+# a tool's one-liner without a code change. Same two rungs, same directory —
+# see `_user_data_path`.
 def _tool_guidance_path() -> str:
-    env_path = os.environ.get("HARNESS_TOOL_GUIDANCE_PATH", "").strip()
-    if env_path:
-        return env_path
-    return os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "tool-guidance.json"
-    )
+    return _user_data_path("tool-guidance.json")
 
 
 # Emergency fallbacks, used per-section when the file is missing, unreadable,
@@ -780,8 +775,8 @@ def _setup_reminder_template() -> None:
     An unreadable or empty file is NOT fatal: the proxy logs a loud `[!]` and
     falls back to `_REMINDER_FALLBACK`, which keeps the tool-call envelope (and
     so tool calling itself) working while making the misconfiguration obvious
-    in the startup banner. The realistic cause is a bad
-    `HARNESS_REMINDER_PATH`, where docker mounts a directory over the file."""
+    in the startup banner. The realistic cause is a bad bind-mount source,
+    where docker mounts a directory over the file."""
     global _REMINDER_TEMPLATE
     path = _reminder_template_path()
     try:
@@ -1347,7 +1342,7 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     "ask" of the turn.
 
     The three bullets' PROSE is not here: it is user-owned data, loaded from
-    `.harness-reminder.md` by `_setup_reminder_template`. This function only
+    `.harness-data/reminder.md` by `_setup_reminder_template`. This function only
     substitutes the three tokens the file documents — `{{HOST_OS}}`,
     `{{CWD}}`, `{{TOOL_ENTRIES}}` — into it. Read the shipped default at
     `proxy/reminder.md` for the wording and why each rule is there (the

@@ -81,8 +81,8 @@ Read the relevant one(s) before changing code in that area:
 - [`install-and-upgrade.md`](install-and-upgrade.md) — `harness-install.sh`
   (clone → seed → wrapper), the upgrade manifest at
   `scripts/upgrade-manifest.json`, and `scripts/lib/upgrade_actions.sh`
-  (envfile_merge / linefile_merge / directory_overwrite). Where the
-  B3-MANAGED comment markers anchor.
+  (envfile_merge / linefile_merge / directory_overwrite /
+  userfile_sync). Where the B3-MANAGED comment markers anchor.
 - [`tests.md`](tests.md) — test layout and conventions. The detailed
   inventory and coverage tables live alongside the tests at
   `tests/INVENTORY.md` and `tests/COVERAGE.md`.

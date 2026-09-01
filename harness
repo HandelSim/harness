@@ -771,28 +771,58 @@ mcp_is_enabled() {
     [[ "$v" == "true" ]]
 }
 
+# The directory holding the user's editable copies of the prompt-data files.
+# One directory, one env var (HARNESS_DATA_DIR), and the copies keep their
+# tracked basenames — that is what lets compose mount both files off a single
+# variable instead of one path variable per file. A function, not a top-level
+# assignment, so it re-reads $install_root: the source-only unit tests
+# repoint install_root after sourcing.
+user_data_dir() {
+    printf '%s\n' "$install_root/.harness-data"
+}
+
 # Seed a user-editable prompt-data file from its tracked default.
 #
-# Two files use this: the recency reminder's prose (.harness-reminder.md from
-# proxy/reminder.md) and the per-tool entries (.harness-tool-guidance.json from
-# proxy/tool-guidance.json). Both are data, not code: the user copy is
-# gitignored and user-owned, docker-compose bind-mounts it over the container's
-# /app copy, and the proxy loads it at startup. Seeding here (rather than only
-# in harness-install.sh) means an existing install picks the file up on its next
-# `harness start`, with no upgrade action needed.
+# Two files use this: the recency reminder's prose (.harness-data/reminder.md
+# from proxy/reminder.md) and the per-tool entries
+# (.harness-data/tool-guidance.json from proxy/tool-guidance.json). Both are
+# data, not code: the user copy is gitignored and user-owned, docker-compose
+# bind-mounts it over the container's /app copy, and the proxy loads it at
+# startup. Seeding here (rather than only in harness-install.sh) means an
+# existing install picks the file up on its next `harness start`, with no
+# upgrade action needed.
 #
-# Only ever creates a MISSING file — an edited copy is never overwritten, so a
-# later `harness upgrade` cannot clobber the user's wording. The consequence is
-# the standard user-config tradeoff: improvements to the shipped default do not
-# reach an install that already has a copy. Delete the user copy to take the
-# new default.
+# Only ever creates a MISSING file — an edited copy is never overwritten here,
+# so a start can never clobber the user's wording. Replacing an edited copy
+# with a newer shipped default is `harness upgrade`'s job, and it asks first
+# (the userfile_sync manifest actions).
 #
-# Args: <basename of the user copy> <repo-relative path of the tracked default>
+# Args: <basename, shared by the tracked default and the user copy>
+#       <repo-relative path of the tracked default>
 #       <what editing it changes, for the seeded-it hint>
+#       [legacy basename at the install root, migrated in if present]
 seed_user_data_file() {
-    local base="$1" shipped_rel="$2" what="$3"
-    local user_copy="$install_root/$base"
+    local base="$1" shipped_rel="$2" what="$3" legacy="${4:-}"
+    local data_dir
+    data_dir=$(user_data_dir)
+    local user_copy="$data_dir/$base"
     local shipped="$clone_dir/$shipped_rel"
+    mkdir -p "$data_dir" 2>/dev/null || true
+    # Pre-.harness-data installs kept these copies at the install root under
+    # dotted names. Move an existing one in rather than silently seeding a
+    # fresh default over the top of it — this runs on every start, so an
+    # install that never runs `harness upgrade` still migrates.
+    if [[ -n "$legacy" && -e "$install_root/$legacy" ]]; then
+        if [[ -f "$install_root/$legacy" && ! -e "$user_copy" ]]; then
+            if mv "$install_root/$legacy" "$user_copy" 2>/dev/null; then
+                err "moved $legacy -> .harness-data/$base (your edits came with it)"
+            fi
+        elif [[ -d "$install_root/$legacy" ]]; then
+            # Empty dir left by a bind-mount against the old layout; harmless
+            # but confusing to leave behind. Non-empty ones are the user's.
+            rmdir "$install_root/$legacy" 2>/dev/null || true
+        fi
+    fi
     # A compose bind-mount whose source is missing makes docker CREATE an empty
     # directory there. Left in place that directory looks like "already seeded"
     # forever and mounts a directory over the file, so the proxy silently runs
@@ -811,7 +841,7 @@ seed_user_data_file() {
         return 0
     fi
     if cp "$shipped" "$user_copy" 2>/dev/null; then
-        err "seeded $base — edit it to change $what,"
+        err "seeded .harness-data/$base — edit it to change $what,"
         err "        then 'harness restart'"
     else
         err "could not write $user_copy; the proxy uses the image's default"
@@ -820,13 +850,13 @@ seed_user_data_file() {
 
 # Back-compat wrappers so the call sites (and tests) name the file they seed.
 seed_reminder_file() {
-    seed_user_data_file .harness-reminder.md proxy/reminder.md \
-        "the agent's per-turn reminder"
+    seed_user_data_file reminder.md proxy/reminder.md \
+        "the agent's per-turn reminder" .harness-reminder.md
 }
 
 seed_tool_guidance_file() {
-    seed_user_data_file .harness-tool-guidance.json proxy/tool-guidance.json \
-        "the per-tool entries in that reminder"
+    seed_user_data_file tool-guidance.json proxy/tool-guidance.json \
+        "the per-tool entries in that reminder" .harness-tool-guidance.json
 }
 
 # Build the consolidated MCP tool-recency map for the proxy. For every ENABLED
@@ -2350,18 +2380,15 @@ cmd_start() {
     # docker-compose.yml interpolates it into the proxy service env, mirroring
     # HARNESS_HOST_OS. Recomputed on every start/restart, so editing a
     # recency.json takes effect on the next `harness restart`.
-    # The reminder file is a compose bind-mount source, so it must exist before
-    # `up` — docker would otherwise create a directory in its place.
+    # Both prompt-data files are compose bind-mount sources, so they must exist
+    # before `up` — docker would otherwise create a directory in their place.
     seed_reminder_file
     seed_tool_guidance_file
-    # Point compose at the user copies when they exist. Unset otherwise, so each
-    # mount falls back to its tracked default in proxy/ rather than to a path
-    # docker would have to invent.
-    if [[ -f "$install_root/.harness-reminder.md" ]]; then
-        export HARNESS_REMINDER_PATH="$install_root/.harness-reminder.md"
-    fi
-    if [[ -f "$install_root/.harness-tool-guidance.json" ]]; then
-        export HARNESS_TOOL_GUIDANCE_PATH="$install_root/.harness-tool-guidance.json"
+    # Point compose at the directory holding the user copies. Left unset when
+    # seeding didn't produce it, so both mounts fall back to the tracked
+    # defaults in proxy/ rather than to a path docker would have to invent.
+    if [[ -d "$(user_data_dir)" ]]; then
+        export HARNESS_DATA_DIR="$(user_data_dir)"
     fi
 
     export HARNESS_MCP_TOOL_RECENCY="$(mcp_tool_recency_json)"
@@ -2783,7 +2810,7 @@ EOF
         echo
         echo "(--check: dry-run; no changes will be made)"
         echo
-        apply_upgrade_actions "$manifest" 1
+        apply_upgrade_actions "$manifest" 1 "" 0
         return 0
     fi
 
@@ -2841,7 +2868,9 @@ EOF
     fi
 
     if (( ! skip_actions )); then
-        apply_upgrade_actions "$manifest" 0 "$needed_ids"
+        local action_prompt=1
+        (( no_prompt )) && action_prompt=0
+        apply_upgrade_actions "$manifest" 0 "$needed_ids" "$action_prompt"
     fi
 
     # Stop a running host proxy so the next 'harness host' relaunches on the
@@ -3106,6 +3135,9 @@ _upgrade_actions_needing_work() {
             linefile_merge)
                 upgrade_linefile_needs_merge "$src" "$target" && printf '%s\n' "$id"
                 ;;
+            userfile_sync)
+                upgrade_userfile_needs_sync "$src" "$target" && printf '%s\n' "$id"
+                ;;
         esac
     done < <(harness_jq -c '.actions[]?' "$manifest")
 
@@ -3129,14 +3161,18 @@ _upgrade_actions_needing_work() {
 # right upgrade_* function in scripts/lib/upgrade_actions.sh, accumulate
 # JSON results, and print a final summary.
 #
-# Args: <manifest_path> <dry_run_int> [filter_ids]
+# Args: <manifest_path> <dry_run_int> [filter_ids] [allow_prompt]
 # filter_ids: optional newline-delimited set of action IDs. When non-empty,
 # actions whose id is not in the set are skipped (used by cmd_upgrade to run
 # only the actions the precheck flagged). Empty/unset runs every action.
+# allow_prompt: 1 (default) lets an action ask the user a question of its own.
+# Only userfile_sync does; cmd_upgrade passes 0 under --no-prompt so an
+# automated upgrade never replaces a hand-edited file on the user's behalf.
 apply_upgrade_actions() {
     local manifest="$1"
     local dry_run="$2"
     local filter_ids="${3:-}"
+    local allow_prompt="${4:-1}"
     local results="[]"
     local failed=0
 
@@ -3166,6 +3202,9 @@ apply_upgrade_actions() {
                 ;;
             linefile_merge)
                 result=$(upgrade_linefile_merge "$src" "$target" "$dry_run") || rc=$?
+                ;;
+            userfile_sync)
+                result=$(upgrade_userfile_sync "$src" "$target" "$dry_run" "$allow_prompt") || rc=$?
                 ;;
             *)
                 err "[$id] unknown action type '$type'; skipping"
@@ -4196,17 +4235,14 @@ host_proxy_start() {
     host_output_dir=$(host_output_dir_resolve "${OUTPUT_DIR:-}")
     # Host mode runs proxy.py straight from the clone, so there is no compose
     # bind-mount to put the user's reminder / tool-guidance files in proxy.py's
-    # default spot. Point the proxy at them explicitly. Empty when seeding
-    # failed: proxy.py then falls back to the tracked defaults sitting next to
-    # it in the clone.
+    # default spot. Point the proxy at the directory holding them. Empty when
+    # seeding failed: proxy.py then falls back to the tracked defaults sitting
+    # next to it in the clone.
     seed_reminder_file
     seed_tool_guidance_file
-    local host_reminder="" host_tool_guidance=""
-    if [[ -f "$install_root/.harness-reminder.md" ]]; then
-        host_reminder="$install_root/.harness-reminder.md"
-    fi
-    if [[ -f "$install_root/.harness-tool-guidance.json" ]]; then
-        host_tool_guidance="$install_root/.harness-tool-guidance.json"
+    local host_data_dir=""
+    if [[ -d "$(user_data_dir)" ]]; then
+        host_data_dir=$(user_data_dir)
     fi
     # HARNESS_FORCE_LOOPBACK is belt-and-suspenders for the no-firewall mode:
     # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
@@ -4230,8 +4266,7 @@ host_proxy_start() {
         PROXY_BACKEND="${backend_override:-}" \
         OUTPUT_DIR="$host_output_dir" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
-        HARNESS_REMINDER_PATH="$host_reminder" \
-        HARNESS_TOOL_GUIDANCE_PATH="$host_tool_guidance" \
+        HARNESS_DATA_DIR="$host_data_dir" \
         nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"

@@ -78,7 +78,7 @@ harness/                         the git clone — IS the install root
 - Contains:
   - `lib/platform.sh` — OS detection, container runtime detection, portable realpath, jq helpers, Windows path handling
   - `lib/net_helpers.sh` — allowlist + override JSON manipulation (lazily sourced)
-  - `lib/upgrade_actions.sh` — actions called by `harness upgrade` (envfile_merge, linefile_merge, directory_overwrite)
+  - `lib/upgrade_actions.sh` — actions called by `harness upgrade` (envfile_merge, linefile_merge, directory_overwrite, userfile_sync)
   - `upgrade-manifest.json` — what gets upgraded and how (registry_actions, etc.)
 - Key files: `scripts/lib/platform.sh`, `scripts/upgrade-manifest.json`.
 

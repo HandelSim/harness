@@ -3,9 +3,12 @@
 .env
 .harness-allowlist
 .harness-net-overrides.json
-# Recency-reminder prose, seeded from proxy/reminder.md by `harness start`.
+# The reminder's user-editable data — reminder.md and tool-guidance.json,
+# seeded from their proxy/ defaults by `harness start`. (.harness-reminder.md
+# and .harness-tool-guidance.json are the pre-.harness-data/ locations; kept
+# ignored so an install that hasn't started since the move stays clean.)
+.harness-data/
 .harness-reminder.md
-# Reminder per-tool entries, seeded from proxy/tool-guidance.json by `harness start`.
 .harness-tool-guidance.json
 
 # Runtime state — bind-mounted into containers; not part of the repo.

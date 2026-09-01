@@ -10,8 +10,9 @@
 #   upgrade_envfile_merge       <source> <target> [dry_run]
 #   upgrade_linefile_merge      <source> <target> [dry_run]
 #   upgrade_directory_overwrite <source> <target> <dry_run> [preserve...]
+#   upgrade_userfile_sync       <source> <target> <dry_run> [allow_prompt]
 #
-# All three return 0 on success, 1 on a hard error. Each emits exactly one
+# All four return 0 on success, 1 on a hard error. Each emits exactly one
 # JSON object on stdout summarizing what changed; the runner aggregates these
 # with jq for the final upgrade report. Atomic writes via .tmp + rename are
 # used everywhere so an interrupted upgrade can never leave a half-written
@@ -22,6 +23,33 @@ if [[ -n "${HARNESS_UPGRADE_ACTIONS_LOADED:-}" ]]; then
     return 0 2>/dev/null || true
 fi
 HARNESS_UPGRADE_ACTIONS_LOADED=1
+
+# Same fallback treatment for the y/n prompt reader: the harness script
+# defines _upgrade_confirm (reads /dev/tty, honors HARNESS_CONFIRM_FROM_STDIN)
+# and we must not override it. Standalone users of this library (upgrade_test.sh)
+# get this minimal stand-in, which they can override with their own stub to
+# script an answer.
+if ! declare -F _upgrade_confirm >/dev/null 2>&1; then
+    _upgrade_confirm() {
+        local prompt="$1" default="${2:-y}" ans
+        if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
+            IFS= read -rp "$prompt" ans || ans=""
+        else
+            IFS= read -rp "$prompt" ans </dev/tty || ans=""
+        fi
+        ans=${ans%$'\r'}
+        if [[ -z "${ans:-}" ]]; then
+            case "$default" in
+                n|N) return 1 ;;
+                *)   return 0 ;;
+            esac
+        fi
+        case "$ans" in
+            y|Y|yes|YES) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+fi
 
 # Define harness_jq as a fallback for standalone use (e.g. upgrade_test.sh
 # sources us directly without the full harness script). When sourced from
@@ -580,4 +608,111 @@ _upg_is_preserved() {
         fi
     done
     return 1
+}
+
+# --- userfile_sync ---------------------------------------------------------
+#
+# Offer to replace ONE user-owned data file with the tracked default it was
+# seeded from. Used for the reminder's two prompt-data files
+# (.harness-data/reminder.md, .harness-data/tool-guidance.json), which
+# `harness start` seeds once and then never touches again: without this the
+# shipped wording can improve for years and an install that already has a copy
+# would never see it.
+#
+# The user's file is NEVER replaced silently. The action only speaks up when
+# the two files actually differ, asks per file (defaulting to N — keep mine),
+# and copies the current version to <target>.bak before overwriting. A missing
+# target is seeding's job, not ours; identical files say nothing at all.
+#
+# Non-interactive runs (`harness upgrade --no-prompt`, no terminal) skip with
+# a reason instead of deciding for the user: a silent overwrite of hand-edited
+# prose is exactly what this file's whole gitignore-and-seed dance exists to
+# prevent.
+#
+# Output: {"action":"userfile_sync","files_updated":[...],"target":"...",
+#          "skipped":bool,"reason":"..."}
+upgrade_userfile_sync() {
+    local source="$1"
+    local target="$2"
+    local dry_run="${3:-0}"
+    local allow_prompt="${4:-1}"
+    local name
+    name=$(basename "$target")
+
+    if [[ ! -f "$source" ]]; then
+        _upg_log "userfile_sync: source $source does not exist; skipping"
+        printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"source_missing"}\n' \
+            "$(_upg_json_str "$target")"
+        return 0
+    fi
+    if [[ ! -f "$target" ]]; then
+        # Nothing to ask about: `harness start` seeds a missing copy from this
+        # same source on the next launch.
+        printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"target_missing"}\n' \
+            "$(_upg_json_str "$target")"
+        return 0
+    fi
+    if cmp -s "$source" "$target"; then
+        printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"identical"}\n' \
+            "$(_upg_json_str "$target")"
+        return 0
+    fi
+
+    # How different, in whole lines, so the question carries some weight.
+    local delta=""
+    if command -v diff >/dev/null 2>&1; then
+        delta=$(diff "$target" "$source" 2>/dev/null | grep -c '^[<>]' || true)
+        [[ "$delta" =~ ^[0-9]+$ ]] || delta=""
+    fi
+    local delta_note=""
+    [[ -n "$delta" ]] && delta_note=" ($delta line(s) differ)"
+
+    if (( dry_run )); then
+        _upg_log "userfile_sync: $name differs from the shipped default${delta_note}; would ask whether to replace it"
+        printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"dry_run"}\n' \
+            "$(_upg_json_str "$target")"
+        return 0
+    fi
+
+    if (( ! allow_prompt )) || { [[ ! -t 0 ]] && [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" != "1" ]]; }; then
+        _upg_log "userfile_sync: $name differs from the shipped default${delta_note}; keeping yours (nothing to confirm on)"
+        _upg_log "userfile_sync: re-run 'harness upgrade' interactively to review it"
+        printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"not_prompted"}\n' \
+            "$(_upg_json_str "$target")"
+        return 0
+    fi
+
+    _upg_log "$name differs from the shipped default${delta_note}:"
+    _upg_log "  yours:   $target"
+    _upg_log "  shipped: $source"
+    if ! _upgrade_confirm "Replace your $name with the shipped version? Yours is kept at $name.bak [y/N] " n; then
+        _upg_log "userfile_sync: keeping your $name"
+        printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"declined"}\n' \
+            "$(_upg_json_str "$target")"
+        return 0
+    fi
+
+    if ! cp "$target" "$target.bak" 2>/dev/null; then
+        _upg_log "userfile_sync: could not write $target.bak; leaving your $name alone"
+        printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"backup_failed"}\n' \
+            "$(_upg_json_str "$target")"
+        return 1
+    fi
+    cp "$source" "$target.tmp.$$"
+    _upg_atomic_mv "$target.tmp.$$" "$target" 0
+    _upg_log "userfile_sync: replaced $name with the shipped default (yours: $target.bak)"
+    printf '{"action":"userfile_sync","files_updated":%s,"target":%s}\n' \
+        "$(_upg_json_array "$name")" \
+        "$(_upg_json_str "$target")"
+    return 0
+}
+
+# userfile: there is something to ask about only when BOTH files exist and
+# their bytes differ. A missing target is seeding's job (see
+# seed_user_data_file in `harness`), and identical files are silent.
+upgrade_userfile_needs_sync() {
+    local source="$1" target="$2"
+    [[ -f "$source" && -f "$target" ]] || return 1
+    cmp -s "$source" "$target" && return 1
+    return 0
 }

@@ -247,7 +247,7 @@ tool's own entry — see "Per-tool entries" below. This is additive — token
 cost is ~150–250 tokens/turn with the three bullets + Environment context;
 hybrid's lighter-than-user_front recency profile is preserved.
 
-### Editable reminder data (`.harness-reminder.md`, `.harness-tool-guidance.json`)
+### Editable reminder data (`.harness-data/`)
 
 The reminder's **wording is data, not code** — all of it. It lives in two
 files the user owns, so rewording the standing instructions is an edit +
@@ -268,25 +268,32 @@ contract, described once below.
 - **Tracked defaults** — `proxy/reminder.md` and `proxy/tool-guidance.json`.
   Both `COPY`d into the proxy image at `/app/`, so a container launched
   without the mounts still has a working reminder.
-- **User copies** — `<install-root>/.harness-reminder.md` and
-  `<install-root>/.harness-tool-guidance.json`, gitignored and seeded from
-  the tracked defaults by `seed_reminder_file` / `seed_tool_guidance_file`
-  (both thin wrappers over `seed_user_data_file`) on every `harness start` /
-  `harness host` (no-op once the file exists). Gitignoring them is what keeps
-  an edit from colliding with `harness update`'s `git pull --ff-only`.
-- **How the proxy finds them** — `_reminder_template_path()` /
-  `_tool_guidance_path()`: (1) `HARNESS_REMINDER_PATH` /
-  `HARNESS_TOOL_GUIDANCE_PATH` if set, else (2) the file next to `proxy.py`
-  (resolved off `__file__`, never a hardcoded `proxy/` — the image flattens
-  the repo into `/app`). `cmd_start` exports each var when its user copy
-  exists, and compose mounts it over the baked copy; `host_proxy_start`
-  passes both vars directly, since host mode runs `proxy.py` straight from
-  the clone with no mount to swap. The compose **defaults** are the tracked
-  `./proxy/…` files, not the user copies, so a bare `docker compose up`
-  (what the docker test suites do) always has a real mount source — a missing
-  source makes docker create a *directory* there and the proxy would silently
-  drop to its fallback. Read-only, and plain file mounts, so an edit takes
-  effect on `harness restart` — no rebuild.
+- **User copies** — `<install-root>/.harness-data/reminder.md` and
+  `<install-root>/.harness-data/tool-guidance.json`, gitignored and seeded
+  from the tracked defaults by `seed_reminder_file` /
+  `seed_tool_guidance_file` (both thin wrappers over `seed_user_data_file`)
+  on every `harness start` / `harness host` (no-op once the file exists).
+  Gitignoring them is what keeps an edit from colliding with `harness
+  update`'s `git pull --ff-only`. One directory, and the copies keep their
+  tracked basenames — that is what lets **one** env var address both files.
+  A pre-`.harness-data` install kept them at `<install-root>/.harness-*`;
+  `seed_user_data_file` *moves* such a copy in (edits and all) on the next
+  start, so the migration needs no upgrade action.
+- **How the proxy finds them** — `_user_data_path(basename)`, wrapped by
+  `_reminder_template_path()` / `_tool_guidance_path()`: (1)
+  `$HARNESS_DATA_DIR/<basename>` if that var is set, else (2) the file next
+  to `proxy.py` (resolved off `__file__`, never a hardcoded `proxy/` — the
+  image flattens the repo into `/app`). The variable names the **directory**,
+  not a path per file: a second variable would carry no information the first
+  one doesn't. `cmd_start` exports it when the directory exists, and compose
+  mounts both files over the baked copies; `host_proxy_start` passes it
+  directly, since host mode runs `proxy.py` straight from the clone with no
+  mount to swap. The compose **default** is `./proxy`, i.e. the tracked
+  defaults, not the user copies, so a bare `docker compose up` (what the
+  docker test suites do) always has a real mount source — a missing source
+  makes docker create a *directory* there and the proxy would silently drop
+  to its fallback. Read-only, and plain file mounts, so an edit takes effect
+  on `harness restart` — no rebuild.
 - **Load** — `_setup_reminder_template()` / `_setup_tool_guidance()` at
   startup. Both are also loaded without `main()` so importing `proxy.py` in
   tests works: the reminder lazy-loads in the builder, the guidance loads at
@@ -330,8 +337,8 @@ contract, described once below.
   exception — it is structure, not wording, and losing it would strand
   `task`'s valid agent names. A JSON syntax error is reported with its
   **line and column**, which is the point of a hand-edited config file. The
-  realistic trigger for a whole-file loss is a bad `HARNESS_*_PATH`, where
-  docker mounts an empty *directory* over the file; `seed_user_data_file`
+  realistic trigger for a whole-file loss is a bind-mount source that does
+  not exist, where docker mounts an empty *directory* over the file; `seed_user_data_file`
   `rmdir`s such a leftover before seeding. Treat a `[!]` in the banner as a
   real outage: with the reminder gone the workflow guidance (todo list,
   parallel `task` agents, environment reproducibility) is gone, and with the
@@ -348,14 +355,21 @@ assert on load-bearing phrases: `proxy/test_proxy.py`
 `tool-guidance.json`'s `legend`, so rewording the legend breaks it too).
 Rewording those phrases out is what makes them fail.
 
-**Upgrade tradeoff.** The seeders never overwrite an existing copy, so
-improvements to a shipped default do not reach an install that already has
-one. For the prose that is the whole point. For the guidance it also means a
-tool opencode adds later renders as a bare signature until the user takes the
-new default (delete `.harness-tool-guidance.json`, then `harness restart`) or
-adds the entry by hand. That is a deliberate trade of freshness for never
-clobbering an edit, and it is graceful in both directions: an unknown tool and
-a stale entry each cost nothing but a missing hint.
+**Staying current with the shipped defaults.** The seeders never overwrite an
+existing copy, so improvements to a shipped default cannot reach an install by
+themselves — for the prose that is the whole point, but it also means a tool
+opencode adds later renders as a bare signature forever. `harness upgrade`
+closes that gap by *asking*: one `userfile_sync` action per file (see
+`architecture/install-and-upgrade.md`) compares the tracked default with the
+user copy and, only when the bytes differ, offers to replace it. The default
+answer is no, the old copy is kept at `<name>.bak`, and `--no-prompt` /
+non-interactive runs skip the question entirely rather than guess. Nothing is
+ever replaced without a `y`. Note the flip side: while a copy differs at all
+— including edits the user means to keep — the question comes back on every
+upgrade, because "differs from shipped" is the only signal tracked (no
+baseline hash is stored). Declining is one keystroke, and everything degrades
+gracefully in the meantime: an unknown tool and a stale entry each cost
+nothing but a missing hint.
 
 ### Per-tool entries
 
