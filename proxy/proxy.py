@@ -562,7 +562,8 @@ _HYBRID_TOOL_SEARCH_NOTE: str = ""
 # under the tool's entry is pared to the agent-list section — everything from
 # this header onward. The header is the seam in opencode's
 # ToolRegistry.describeTask and has been byte-identical across releases
-# (verified 1.14.41 and 1.15.7). If a future opencode renames it, the parse
+# (verified 1.14.41, 1.15.7 and 1.18.23). If a future opencode renames it,
+# the parse
 # falls back to the full description — no closed-set values are ever dropped —
 # and TestTaskDescriptionParing is the canary that flags the drift. `skill`'s
 # description is short and left verbatim.
@@ -626,6 +627,21 @@ _REMINDER_TOKEN_CWD = "{{CWD}}"
 _REMINDER_TOKEN_TOOL_ENTRIES = "{{TOOL_ENTRIES}}"
 _REMINDER_TOKEN_ENVIRONMENT = "{{ENVIRONMENT}}"
 _REMINDER_TOKEN_TODOS = "{{TODOS}}"
+
+# Matches exactly the five tokens above and nothing else, so an unknown
+# {{...}} in a user-edited reminder.md stays literal, as it always has.
+_REMINDER_TOKEN_RE = re.compile(
+    "|".join(
+        re.escape(t)
+        for t in (
+            _REMINDER_TOKEN_HOST_OS,
+            _REMINDER_TOKEN_CWD,
+            _REMINDER_TOKEN_TOOL_ENTRIES,
+            _REMINDER_TOKEN_ENVIRONMENT,
+            _REMINDER_TOKEN_TODOS,
+        )
+    )
+)
 
 # Only a comment block at the very TOP of the file is stripped (that is where
 # the file documents its own tokens). Anchored at \A so a `<!--` appearing in
@@ -825,6 +841,23 @@ def _setup_reminder_template() -> None:
         return
     _REMINDER_TEMPLATE = body
     print(f"[i] reminder template: {len(body)} chars from {path}", flush=True)
+    # Seeding never overwrites a user's existing copy, so an install that
+    # predates a new token keeps running with the old prose and silently loses
+    # the feature. In host mode that is worse than a missing feature: the old
+    # Environment sentence asserts a Linux container that is not there. Name
+    # the gap in the banner instead of leaving it invisible.
+    missing = [
+        tok
+        for tok in (_REMINDER_TOKEN_ENVIRONMENT, _REMINDER_TOKEN_TODOS)
+        if tok not in body
+    ]
+    if missing:
+        print(
+            f"[!] reminder template at {path} predates {' and '.join(missing)}"
+            "; delete it and re-run `harness restart` to pick up the shipped "
+            "default, or add the token(s) to your copy",
+            flush=True,
+        )
 
 
 def _load_tool_guidance(path: str):
@@ -1258,7 +1291,7 @@ def _format_tool_signature(name, required, optional):
 
 # --- Reminder token expansions composed in code -----------------------------
 #
-# Two of the reminder's tokens expand to whole sentences rather than a word,
+# Three of the reminder's tokens expand to whole sentences rather than a word,
 # because what they say depends on runtime state the prose file cannot see.
 # `{{CWD}}` already worked this way; `{{ENVIRONMENT}}` and `{{TODOS}}` follow
 # the same precedent. A user who wants literal control over either can simply
@@ -1268,7 +1301,8 @@ def _format_tool_signature(name, required, optional):
 # How many todo items the replay may carry, and how wide one line may get.
 # The reminder is a per-turn tax on every request, so the list is bounded even
 # when the model writes a fifty-step plan; completed items are the first to go
-# because they are the ones the model no longer needs to act on.
+# because they are the ones the model no longer needs to act on; past that,
+# the tail goes, so the model always keeps its NEXT steps.
 _TODOS_MAX_ITEMS = 15
 _TODOS_MAX_CONTENT = 140
 
@@ -1365,37 +1399,59 @@ def _format_todos_block(todos) -> str:
         content = str(todo.get("content") or "").strip().replace("\n", " ")
         if not content:
             continue
+        # The model wrote this text and it is being replayed into a prompt
+        # whose structure depends on the <<<...>>> markers. Defang the opener
+        # so a todo item can never close a section it is nested inside.
+        content = content.replace("<<<", "<<\u200b<")
         if len(content) > _TODOS_MAX_CONTENT:
             content = content[: _TODOS_MAX_CONTENT - 1].rstrip() + "\u2026"
         status = str(todo.get("status") or "pending").strip().lower()
+        # Any status outside opencode's four is a client bug, not a fifth
+        # state. Normalise it to pending rather than rendering a marker the
+        # legend does not explain — and so the cap logic below can still
+        # classify it.
+        if status not in _TODO_STATUS_MARK:
+            status = "pending"
         items.append((status, content))
 
     if not items:
         return (
-            "\n  YOU HAVE NO TODO LIST. Before you do anything else this turn, "
-            "call `todowrite` with a detailed, step-by-step breakdown of the "
-            "user's request — every step you can foresee, not a three-line "
-            "sketch. That list is the only memory you get."
+            "\n  YOU HAVE NO TODO LIST. Unless this request is a single "
+            "trivial step, your first action this turn is `todowrite` with a "
+            "detailed, step-by-step breakdown of the user's request — every "
+            "step you can foresee, not a three-line sketch. That list is the "
+            "only memory you get."
         )
 
-    # Over the cap, completed items are dropped first (oldest first): they are
-    # history, and the pending ones are what the model still has to act on.
-    dropped = 0
+    # Over the cap, finished items go first (oldest first): they are history,
+    # and the unfinished ones are what the model still has to act on. Once
+    # they run out, drop from the TAIL — the far end of the plan — so the
+    # model keeps its NEXT steps. Never drop from the head: those are the
+    # actions it is about to take. The two counts are reported separately
+    # because telling the model a pending step was "finished" is precisely
+    # the confusion this whole feature exists to prevent.
+    dropped_done = 0
+    dropped_later = 0
     while len(items) > _TODOS_MAX_ITEMS:
         for i, (status, _) in enumerate(items):
             if status in ("completed", "cancelled"):
                 del items[i]
-                dropped += 1
+                dropped_done += 1
                 break
         else:
-            del items[0]
-            dropped += 1
+            del items[-1]
+            dropped_later += 1
 
     lines = "\n".join(
-        f"    [{_TODO_STATUS_MARK.get(status, '?')}] {content}"
+        f"    [{_TODO_STATUS_MARK[status]}] {content}"
         for status, content in items
     )
-    elided = f"\n    (+{dropped} finished item(s) not shown)" if dropped else ""
+    notes = []
+    if dropped_done:
+        notes.append(f"+{dropped_done} finished item(s) not shown")
+    if dropped_later:
+        notes.append(f"+{dropped_later} later item(s) not shown")
+    elided = f"\n    ({', '.join(notes)})" if notes else ""
     return (
         "\n  Your todo list, replayed from your last `todowrite` "
         "([ ]=pending, [~]=in_progress, [x]=completed, [-]=cancelled). This "
@@ -1498,8 +1554,13 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
       <<<END_USER_REQUEST>>>
 
       [Reminder — operating rules for this turn.
-       - Operating: ... (merged Agency/Tools/Workflow)
-       - Honesty:   ...
+       - Amnesia: ...
+       - Act, don't describe: ...
+       - Use the tools: ...
+       - Call format: ...
+       - Todo list: ...            (+ the replayed {{TODOS}} block)
+       - Delegate: ...
+       - Honesty: ...
        - Environment: ...
 
        Tools — one entry per tool ...
@@ -1515,12 +1576,14 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     USER_REQUEST wrap — the TOOL_RESULT markers already delimit the live
     "ask" of the turn.
 
-    The three bullets' PROSE is not here: it is user-owned data, loaded from
+    The bullets' PROSE is not here: it is user-owned data, loaded from
     `<install root>/reminder.md` by `_setup_reminder_template`. This function only
-    substitutes the three tokens the file documents — `{{HOST_OS}}`,
-    `{{CWD}}`, `{{TOOL_ENTRIES}}` — into it. Read the shipped default at
+    substitutes the five tokens the file documents — `{{HOST_OS}}`,
+    `{{CWD}}`, `{{ENVIRONMENT}}`, `{{TODOS}}`, `{{TOOL_ENTRIES}}` — into it,
+    in ONE pass, so a token appearing inside a substituted value (a todo item
+    the model wrote, say) stays literal. Read the shipped default at
     `proxy/reminder.md` for the wording and why each rule is there (the
-    Operating bullet's "you act through opencode, calls really execute" is
+    "Act, don't describe" bullet's "you act through opencode, calls really execute" is
     issue #109's anchor against the upstream's "I can't execute, here are
     commands for you to run" persona reversion). A user who rewrites the file
     owns the result; nothing here validates the prose.
@@ -1565,16 +1628,26 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     if _REMINDER_TEMPLATE is None:
         # Lazy load so importing proxy.py (tests) needs no main() call.
         _setup_reminder_template()
-    reminder = (
-        (_REMINDER_TEMPLATE or "")
-        # {{HOST_OS}} predates {{ENVIRONMENT}} and keeps working on its own:
-        # a reminder.md seeded before this change still carries only the old
-        # token, and seeding never overwrites a user's copy.
-        .replace(_REMINDER_TOKEN_HOST_OS, host_os_clause)
-        .replace(_REMINDER_TOKEN_CWD, cwd_clause)
-        .replace(_REMINDER_TOKEN_ENVIRONMENT, _format_environment_clause())
-        .replace(_REMINDER_TOKEN_TODOS, _format_todos_block(todos))
-        .replace(_REMINDER_TOKEN_TOOL_ENTRIES, tool_entries)
+    # One pass, not five chained .replace() calls. Chaining rescans each
+    # substituted value for the tokens that have not run yet, and two of the
+    # values carry text the proxy does not author: the todo list is written by
+    # the model, and {{CWD}} comes from the inbound <env> block. A todo item
+    # reading "do a thing {{TOOL_ENTRIES}}" would otherwise expand the whole
+    # tool block a second time. re.sub visits each span once, so a token that
+    # appears inside a substituted value stays literal.
+    #
+    # {{HOST_OS}} predates {{ENVIRONMENT}} and keeps working on its own: a
+    # reminder.md seeded before this change still carries only the old token,
+    # and seeding never overwrites a user's copy.
+    expansions = {
+        _REMINDER_TOKEN_HOST_OS: host_os_clause,
+        _REMINDER_TOKEN_CWD: cwd_clause,
+        _REMINDER_TOKEN_ENVIRONMENT: _format_environment_clause(),
+        _REMINDER_TOKEN_TODOS: _format_todos_block(todos),
+        _REMINDER_TOKEN_TOOL_ENTRIES: tool_entries,
+    }
+    reminder = _REMINDER_TOKEN_RE.sub(
+        lambda m: expansions[m.group(0)], _REMINDER_TEMPLATE or ""
     )
     return f"{wrapped}\n\n{reminder}"
 

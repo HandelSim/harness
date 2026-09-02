@@ -43,7 +43,7 @@ last_mapped_commit: 4ebbb2c
 
 ## Agent & Tool Execution
 
-**Local Tools (opencode-ai 1.15.7):**
+**Local Tools (opencode-ai 1.18.23):**
 - `read` — Read file contents
 - `edit` — Modify files (proxy guidance: "read first")
 - `bash` — Execute shell commands

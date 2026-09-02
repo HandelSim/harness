@@ -109,32 +109,43 @@ validator in `_setup_prompt_mode` accepts:
   on the last user message, organised so the **live user request comes FIRST**
   (wrapped in `<<<BEGIN_USER_REQUEST>>>` markers — issue #110), then a short
   reminder follows. The reminder's WORDING lives in editable files, not
-  in proxy.py — see "Editable reminder data" below. It has three labelled
-  bullets —
-  **Operating** (the merged Agency/Tools/Workflow bullet from the earlier
-  format: positive assertion that the model acts through opencode and its
-  ```json calls really execute against the working directory mounted from
-  the user's machine with results that are real — named target for the
-  ~20% reversion to the upstream's "I can't execute, here are commands for
-  you to run" persona, issue #109; the JSON envelope and the
-  no-fabricated-results rule; prefer-a-listed-tool guidance with
-  `webfetch` over curl as the worked example; keep a `todowrite` todo list for
-  multi-step work, laid out up front and updated as you go so the plan survives
-  a context compaction; launch `task` agents in parallel when independent (capped
-  at 8 concurrent, each briefed in full since a sub-agent does not share
-  the parent's context); pointer
-  back to `<<<BEGIN_AGENT_TOOLS>>>` for full descriptions),
+  in proxy.py — see "Editable reminder data" below. It has eight labelled
+  bullets. The labels are imperatives rather than category headings, so each
+  one reads as an instruction: an earlier three-bullet form
+  (Operating/Honesty/Environment) merged them, and the split back apart was
+  driven by the amnesia framing needing its own opener.
+  **Amnesia** (the premise the rest rests on: history is silently truncated
+  mid-task, so nothing above this block can be trusted and the standing rules
+  are re-sent every turn. Carries two recovery rules — the todo list is the
+  model's memory, and if no AGENTS.md content is visible in the conversation
+  it was injected on the first turn and has since been dropped, so `read` it
+  again),
+  **Act, don't describe** (positive assertion that the model acts through
+  opencode and its ```json calls really execute with results that are real —
+  named target for the ~20% reversion to the upstream's "I can't execute,
+  here are commands for you to run" persona, issue #109),
+  **Use the tools** (issue #110's rule that any claim about the working
+  directory or local filesystem state must come from a tool result — see
+  [Working-directory echo](#working-directory-echo) for why — then
+  prefer-a-listed-tool guidance with `webfetch` over curl as the worked
+  example, the pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full
+  descriptions, and the legitimate fallback when nothing fits),
+  **Call format** (the JSON envelope: one complete fenced block, the
+  `{"name", "arguments"}` body shape, backslash escaping, and the
+  no-fabricated-results rule),
+  **Todo list** (keep one always and keep it detailed, exactly one item
+  `in_progress`, flip to `completed` immediately, add steps as discovered —
+  followed by `{{TODOS}}`, the model's own list replayed back to it, see
+  [Todo replay](#todo-replay)),
+  **Delegate** (launch `task` agents in parallel when independent, capped at
+  8 concurrent, each briefed in full since a sub-agent does not share the
+  parent's context),
   **Honesty** (anti-fabrication: no invented names/paths/signatures/
-  citations; **plus** the addition from issue #110: any claim about the
-  working directory, its contents, or local filesystem state must come
-  from a tool result — see [Working-directory echo](#working-directory-echo)
-  for why), and
-  **Environment** (the proxy runs in a Linux container with the working
-  directory mounted from the host — host OS named when known, see
-  [Host-OS injection](#host-os-injection); the live host CWD is echoed
-  inline so "this folder" / "here" resolve to the real path, see
-  [Working-directory echo](#working-directory-echo) — so reproducible
-  setup must live in the working directory, not the container). Below the
+  citations), and
+  **Environment** (`{{ENVIRONMENT}}`, whose body depends on run mode — see
+  [Run-mode environment clause](#run-mode-environment-clause) — followed by
+  the live host CWD echoed inline so "this folder" / "here" resolve to the
+  real path, see [Working-directory echo](#working-directory-echo)). Below the
   bullets is **one entry per tool** — signature, one-line guidance from
   `_HYBRID_TOOL_GUIDANCE`, and (for "detail tools") the verbatim closed-set
   argument values inlined under the same entry. This is the
@@ -237,15 +248,15 @@ turn (placed at the FRONT of the recency block, before the reminder), and
   rules. Tool-result-converted-to-user turns skip this wrap (the TOOL_RESULT
   markers already delimit the live content).
 
-The reminder (`build_cooperative_prompt_hybrid_reminder`) Operating bullet
-points at `<<<BEGIN_AGENT_TOOLS>>>` for **full tool descriptions only**, so
-that when attention to `messages[0]` dilutes on long conversations the
-model still has a named target to retrieve. It deliberately does NOT claim
+The reminder's (`build_cooperative_prompt_hybrid_reminder`) "Use the tools"
+bullet points at `<<<BEGIN_AGENT_TOOLS>>>` for **full tool descriptions
+only**, so that when attention to `messages[0]` dilutes on long conversations
+the model still has a named target to retrieve. It deliberately does NOT claim
 that section is where to find parameter-*value* constraints (a `task`'s
 agent types, a `skill`'s names): those reach recency INLINED under each
-tool's own entry — see "Per-tool entries" below. This is additive — token
-cost is ~150–250 tokens/turn with the three bullets + Environment context;
-hybrid's lighter-than-user_front recency profile is preserved.
+tool's own entry — see "Per-tool entries" below. This is additive — the bullet
+prose is ~800 tokens/turn, plus the replayed todo list; hybrid's
+lighter-than-user_front recency profile is preserved.
 
 ### Editable reminder data (`reminder.md`, `tool-guidance.json`)
 
@@ -255,7 +266,7 @@ files the user owns, so rewording the standing instructions is an edit +
 reminder is the harness's only standing-instruction channel for the opencode
 agent (no runtime AGENTS.md ships).
 
-The split is by format, not by importance. `proxy/reminder.md` is the three
+The split is by format, not by importance. `proxy/reminder.md` is the
 bullets' **prose** — one block, injected verbatim. `proxy/tool-guidance.json`
 is the **per-tool entries** the `{{TOOL_ENTRIES}}` token expands to: the
 legend, its two conditional sentences, the detail-tool list, and each tool's
@@ -310,11 +321,32 @@ contract, described once below.
   patched `_HYBRID_DETAIL_TOOLS`). Fixed for the life of a launch, like the
   recency map. The startup banner prints both resolved paths, the reminder's
   loaded size, and the guidance's tool count.
-- **Tokens** (`reminder.md`) — `{{HOST_OS}}`, `{{CWD}}`, `{{TOOL_ENTRIES}}`, substituted by
-  `str.replace`, deliberately not `str.format`/`string.Template`: the prose
+- **Tokens** (`reminder.md`) — `{{ENVIRONMENT}}`, `{{TODOS}}`, `{{HOST_OS}}`,
+  `{{CWD}}`, `{{TOOL_ENTRIES}}`, substituted in ONE `re.sub` pass over an
+  alternation of exactly those five, deliberately not
+  `str.format`/`string.Template` and not chained `str.replace` calls. Not
+  `format`/`Template` because the prose
   is full of braces (`{"name": ..., "arguments": {...}}`) and backslashes,
   and a user edit must never be able to raise. An unknown token is left
-  literal; a deleted token just drops its clause.
+  literal; a deleted token just drops its clause. Not chained `replace`
+  because that rescans each substituted value for the tokens that have not run
+  yet, and two of the values are not proxy-authored: the todo list is written
+  by the model and `{{CWD}}` comes from the inbound `<env>` block. One pass
+  visits each span once, so a token inside a substituted value stays literal.
+  Three of the five expand to
+  whole sentences composed in code rather than to a word, because what they
+  say depends on runtime state the prose file cannot see: `{{CWD}}` (this
+  turn's working directory), `{{ENVIRONMENT}}` (see
+  [Run-mode environment clause](#run-mode-environment-clause)) and
+  `{{TODOS}}` (see [Todo replay](#todo-replay)). A user who wants literal
+  control over any of them deletes the token and writes their own text.
+  New tokens are strictly additive — `{{HOST_OS}}` still renders even though
+  the shipped default no longer uses it, because seeding never overwrites a
+  user's copy. That same rule is why `_setup_reminder_template` prints a `[!]`
+  naming `{{ENVIRONMENT}}`/`{{TODOS}}` when the loaded template predates them:
+  an install that keeps its old copy silently loses the feature, and in host
+  mode its old Environment sentence asserts a Linux container that is not
+  there.
 - **Keys** (`tool-guidance.json`) — `legend`, `state_check_note`,
   `tool_search_note`, `detail_tools`, `tools`. Every key is optional and
   every one falls back **on its own**: a wrong type, an empty legend, or a
@@ -382,7 +414,7 @@ nothing but a missing hint.
 
 ### Per-tool entries
 
-Below the three reminder bullets is **one entry per tool** — the
+Below the reminder bullets is **one entry per tool** — the
 consolidated recency format (issue #110) that puts every fact about a tool
 together. Each entry is a single bullet that combines:
 
@@ -452,8 +484,8 @@ dynamic agent list, the latter introduced by the literal header
 and is already present verbatim at the stable prefix, so
 `_pare_task_description` (anchored on `_OPENCODE_TASK_AGENTS_HEADER`) keeps
 only that header onward — the agent names and their one-line descriptions.
-The header is byte-stable across opencode releases (verified 1.14.41 and
-1.15.7); if a future opencode renames it the parse falls back to the
+The header is byte-stable across opencode releases (verified 1.14.41,
+1.15.7 and 1.18.23); if a future opencode renames it the parse falls back to the
 **full** description (degrade to more tokens, never a silent loss of the
 agent list), and `proxy/test_proxy.py` `TestTaskDescriptionParing` is the
 canary that flags the drift. Every other detail tool, including `skill`
@@ -469,7 +501,7 @@ described **where** the working directory came from (host bind-mount) but
 not **which path it was**, which let the upstream's pretrained sense of
 its own sandbox win — `/home/bard`, `/home/user`, `/workspace`, etc. —
 when asked "what's in this folder?". Pairing the positive anchor with
-Honesty's filesystem-claims rule (any claim about the working directory,
+the Use-the-tools bullet's filesystem-claims rule (any claim about the working directory,
 its contents, or filesystem state must come from a tool result) closes
 both sides: here's the right answer, and here's what not to claim
 without checking.
@@ -482,29 +514,98 @@ sees the inbound agent prompt — opencode's `<env>` block carries this
 line at a stable label. If the label is missing or unparsable (a future
 opencode rename, a non-opencode upstream), the Environment line falls
 back to the prior wording (host OS only) — graceful degradation, never
-a hard fail. Honesty's filesystem-claims clause renders unconditionally
+a hard fail. The Use-the-tools filesystem-claims clause renders unconditionally
 because it's load-bearing whether or not the CWD anchor was found.
 
-## Host-OS injection
+## Run-mode environment clause
 
-The hybrid reminder's **Environment** line tells the agent it runs in a Linux
-container with the working directory bind-mounted from the host, so any setup
-done only inside the container (a global/system venv, etc.) won't reproduce in
-the user's environment — reproducible setup belongs in the working directory
-(e.g. a project-local venv). Knowing the host OS family lets the agent give a
-host-appropriate caveat (a Linux-native venv may need recreating on a
-non-Linux host).
+The hybrid reminder's **Environment** bullet is `{{ENVIRONMENT}}`, and what it
+expands to depends on how the agent was launched. The two modes are genuinely
+different machines, and stating the wrong one gives the model a false premise
+it then reasons from (wrong path separators, wrong shell, advice to rebuild a
+venv that never needed rebuilding).
+
+- **container** — the agent runs in a Linux image with the working directory
+  bind-mounted from the host. Anything installed only inside the container (a
+  global/system venv, etc.) won't reproduce in the user's environment, so
+  reproducible setup belongs in the working directory (e.g. a project-local
+  venv). A Linux-native venv may need recreating on a non-Linux host.
+- **host** — `harness host` runs opencode directly on the user's own machine,
+  which is frequently macOS or Windows. There is no container, nothing is
+  throwaway, and the container prose is simply false there. This variant says
+  so, tells the model not to assume Linux, and notes that installs land on the
+  user's real system.
+
+`HARNESS_RUN_MODE` selects between them. Only the host-mode proxy launch sets
+it (`HARNESS_RUN_MODE=host`, alongside `HARNESS_FORCE_LOOPBACK=1` and
+`HARNESS_HOST_OS`); container mode leaves it unset. `_setup_run_mode` reads it
+into `_RUN_MODE` at startup, normalising anything unrecognised — unset, empty,
+an older compose file — to `container`, which is what every deployment did
+before the var existed. It deliberately does NOT key off
+`HARNESS_FORCE_LOOPBACK` (which is also host-only): that flag is a security
+binding, and coupling prompt wording to it would break the wording silently if
+the binding ever changed for another reason.
+
+## Host-OS injection
 
 The host OS is fixed per install and the proxy is long-running, so it is read
 once at startup, not threaded per-request. The harness CLI exports
 `HARNESS_HOST_OS="$(harness_detect_os)"` in its `compose()` wrapper (see
 `architecture/harness-cli.md`); `docker-compose.yml` passes it to the proxy
-service (`HARNESS_HOST_OS: ${HARNESS_HOST_OS:-unknown}`); `_setup_host_os`
-reads it into the `_HOST_OS` module global, honouring only `linux`/`macos`/
-`windows` and normalising anything else (unset, empty, `unknown`) to `""`.
-When `_HOST_OS` is `""` the Environment line drops only the `(host OS: …)`
-parenthetical — the container/reproducibility facts still render, so the proxy
-degrades gracefully when launched outside the harness CLI.
+service (`HARNESS_HOST_OS: ${HARNESS_HOST_OS:-unknown}`); `harness host`
+exports it directly. `_setup_host_os` reads it into the `_HOST_OS` module
+global, honouring only `linux`/`macos`/`windows` and normalising anything else
+(unset, empty, `unknown`) to `""`.
+
+`{{ENVIRONMENT}}` names the host OS inline in BOTH modes, so the shipped
+`reminder.md` does not also carry `{{HOST_OS}}`. When `_HOST_OS` is `""` only
+the `(host OS: …)` parenthetical drops — the rest of the clause still renders,
+so the proxy degrades gracefully when launched outside the harness CLI. The
+standalone `{{HOST_OS}}` token is still substituted, because seeding never
+overwrites a user's `reminder.md`: a copy written before `{{ENVIRONMENT}}`
+existed carries only the old token and must keep working.
+
+## Todo replay
+
+opencode has **no `todoread`** — it was deleted upstream — so the model cannot
+look up its own todo list. The list exists in two places: opencode's local
+SQLite (which the proxy cannot reach), and the `todowrite` tool_calls sitting
+in the history opencode re-sends on every request. The proxy reads the second
+and replays it into the reminder as `{{TODOS}}`, under the **Todo list**
+bullet.
+
+That is what makes it worth doing. The proxy always receives opencode's full
+history; it is the *upstream* that drops the conversation, and the model with
+it. Replaying the list onto the last user message puts the plan back in front
+of the model at recency, in the one place the upstream cannot have forgotten.
+
+`_extract_latest_todos` walks the raw inbound messages and keeps the LAST
+`todowrite` arguments (string- or object-shaped; unparsable calls are skipped,
+never raised on). An explicit empty `todos` wins over an earlier non-empty one
+— clearing the list is a real state. There is **no cache**: the proxy is
+stateless per request and has no session key it could cache under that would
+stay correct across concurrent sessions, so the list is re-derived every turn.
+
+`_format_todos_block` renders it, and never returns `""`:
+
+- **list present** — one `[status] content` line per item, capped at
+  `_TODOS_MAX_ITEMS` with each line trimmed to `_TODOS_MAX_CONTENT`, newlines
+  flattened and `<<<` defanged (the text is model-authored and lands inside a
+  marker-delimited prompt). A status outside opencode's four normalises to
+  `pending` rather than rendering a marker the legend does not explain. The
+  block is a per-turn tax on every request, so it is bounded; over the cap,
+  completed and cancelled items are dropped first (they are history — the
+  unfinished ones are what the model still has to act on), and once those run
+  out the **tail** goes, never the head: the head is the model's next steps,
+  which are the worst possible items to lose. The two counts are reported
+  separately (`+N finished`, `+N later`) because telling the model a pending
+  step was finished is the exact confusion this feature exists to prevent.
+  The block says explicitly that it is a read-only
+  copy and that changes go through `todowrite`, whose every call REPLACES the
+  whole list (`Todo.update` deletes the session's rows and re-inserts).
+- **no list** — an explicit "you have no todo list, make a detailed one before
+  anything else" instruction. An empty expansion is precisely the case where
+  the model most needs to be told what to do.
 
 ## MCP tool-recency injection
 
@@ -725,8 +826,9 @@ land at `<req_id>_02_API_Retry_Request.json` /
 `<req_id>_03_API_Retry_Response.json` (or `_03_API_Retry_Error.json` if
 the retry POST failed) alongside the original `_02`/`_03` dumps.
 
-The cooperative-prompt reminder's **Operating** bullet was tightened in
-the same change: the tool-call instruction now requires a **complete**
+The cooperative-prompt reminder's tool-call bullet was tightened in
+the same change (that bullet was named **Operating** then; it is
+**Call format** since the eight-bullet split): the tool-call instruction now requires a **complete**
 ```json...``` block (opener + body + closing fence, never an abbreviated
 identifier or partial fence) and names valid JSON `\escape` sequences
 (`\n`, `\x1e`, `\\`) so the bad-escape failure mode is less likely to

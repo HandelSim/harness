@@ -28,7 +28,7 @@ last_mapped_commit: 4ebbb2c
 
 **Package managers:**
 - **pip** — proxy Python deps (`proxy/Dockerfile:23`; host venv via `pip install -r proxy/requirements.txt`, `harness:3255-3281`).
-- **npm** — global install of `opencode-ai` + `@ai-sdk/openai-compatible` in the agent image (`agents/Dockerfile:106-108`).
+- **npm** — global install of `opencode-ai` + `@ai-sdk/openai-compatible` in the agent image (`agents/Dockerfile:110-113`).
 - **pipx / apt** — inside the agent image for user-installed tools (`agents/Dockerfile:52`).
 - **git** — `harness update`/`upgrade`/`mcp install` use git; the install root IS the git clone.
 - Lockfiles: none. Python deps are exact-pinned in `proxy/requirements.txt`; npm packages pinned via Dockerfile ARGs (no `package.json`/lockfile in repo).
@@ -40,7 +40,7 @@ last_mapped_commit: 4ebbb2c
 - **requests 2.32.3** — upstream HTTP client (`proxy/requirements.txt:2`). Note `verify=False` — upstream uses a self-signed cert (`proxy/proxy.py:48-51`). Verified at `/home/opc/repos/harness/proxy/proxy.py:1871,2049,2150,2239`.
 
 **Agent:**
-- **opencode** (`opencode-ai@1.15.7`) — the coding agent CLI. Pinned in `agents/Dockerfile:103` ARG OPENCODE_VERSION.
+- **opencode** (`opencode-ai@1.18.23`) — the coding agent CLI. Pinned in `agents/Dockerfile:107` ARG OPENCODE_VERSION.
 - **@ai-sdk/openai-compatible@2.0.47** — opencode's provider adapter that speaks to the proxy at `http://proxy:${PROXY_PORT}/v1` on the harness-net bridge. Pinned in `agents/Dockerfile:104`.
 
 **Host MCP (optional, separate):**
@@ -57,7 +57,7 @@ last_mapped_commit: 4ebbb2c
 - These two are the ONLY Python runtime deps; the host-mode venv installs exactly these.
 
 **Critical (agent, ARG-pinned in image):**
-- `opencode-ai@1.15.7` (`agents/Dockerfile:103`) — agent CLI. Version is load-bearing: opencode's headless-stdout render race (fixed at 1.15.7) and tool-description parsing are documented and worked around per-version (`agents/Dockerfile:70-102`). Bumping requires re-verifying `full_pipeline_test.sh` T9/T10 and the proxy's `task`-tool parsing canary (proxy/test_proxy.py).
+- `opencode-ai@1.18.23` (`agents/Dockerfile:107`) — agent CLI. Version is load-bearing: opencode's headless-stdout render race (still unfixed upstream, worked around in entrypoint.sh) and tool-description parsing are documented and worked around per-version (`agents/Dockerfile:70-106`). Bumping requires re-verifying `full_pipeline_test.sh` T9/T10 and the proxy's `task`-tool parsing canary (proxy/test_proxy.py).
 - `@ai-sdk/openai-compatible@2.0.47` (`agents/Dockerfile:104`) — provider adapter.
 
 **Infrastructure (agent image, apt):**
