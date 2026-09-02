@@ -450,9 +450,10 @@ prose has no key-by-key structure to merge on.
 `upgrade_userfile_sync <source> <target> [dry_run] [allow_prompt]`
 compares the bytes and does nothing at all unless they differ, so a user
 who never edited anything is never asked. When they differ it prints both
-paths and the line delta and asks once, defaulting to **no**; a `y`
-copies the user's version to `<target>.bak` and installs the shipped one
-atomically. Every other outcome is a skip with a reason: `identical`,
+paths and the line delta and asks; a `y` copies the user's version to
+`<target>.bak` and installs the shipped one atomically. This is the one
+prompt that passes `require` as its default: nothing typed is not taken as
+"no" here (see "Reading the answer" below). Every other outcome is a skip with a reason: `identical`,
 `target_missing` (seeding creates it on the next `harness start` — there
 is nothing to ask about yet), `source_missing`, `dry_run` (`--check`),
 `declined`, `not_prompted`, `backup_failed`.
@@ -472,6 +473,26 @@ that same condition, which is why the suite missed it; both loops now read
 the manifest on FD 3, so FD 0 stays free for prompts and a scripted answer
 exercises the production shape. `tests/upgrade_test.sh` T14 is the
 regression guard and uses a real pty rather than the hook.
+
+### Reading the answer
+
+`_upgrade_confirm` (in `harness`, mirrored as a fallback in the library)
+takes `y`/`yes` or `n`/`no` in any case, ignoring blanks around the answer
+and **every** CR in it, not just a trailing one. Anything else — including
+an empty line when the caller passed `require` as the default — is
+re-asked rather than classified as a refusal, up to three reads; after that
+the caller gets the same refusal it would have gotten on the first one, and
+a read that fails after an answer we already rejected ends it immediately.
+
+That exists because of the second shipped bug on this prompt, reported from
+Windows Git Bash after the FD 0 fix above landed: the user typed `y`, saw it
+echoed, and still got "keeping your reminder.md". The `docker.exe` that the
+jq fallback shells out to sits on the console immediately before this read
+(the same interaction that made FD 0 hang, which is why the prompt reads
+`/dev/tty` at all), and what `read` returns can be a line the user never
+typed, with the real answer behind it. Taking one unusable line as "no"
+silently discards the user's yes; asking again does not. `tests/upgrade_test.sh`
+T8 covers the classification and T14c the end-to-end shape at a real pty.
 
 The `upgrade_userfile_needs_sync` precheck mirrors the same "both exist and
 differ" rule, so `harness upgrade` lists the file only when a question is

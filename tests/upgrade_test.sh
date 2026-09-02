@@ -529,8 +529,37 @@ confirm_case $'yes\r' 0 "yes with trailing CR"
 # Bare CR (empty after strip) defaults to proceed.
 confirm_case $'\r'    0 "bare CR (empty after strip)"
 
+# A CR anywhere, and blanks around the answer: the second Windows report on
+# this prompt was a typed "y" that came back from the terminal as something
+# else and got classified as "no". Only the trailing CR used to be stripped.
+confirm_case $'\ry'   0 "leading CR"
+confirm_case "  y  "  0 "y padded with blanks"
+confirm_case "Yes"    0 "mixed case yes"
+confirm_case $'  n\r' 1 "n padded and CR"
+
+# An answer we cannot read is re-asked, not taken as a refusal. Everything
+# the terminal invents ahead of the user is one of these.
+confirm_case $'zz\ny' 0 "unrecognized answer, then y"
+confirm_case $'zz\nn' 1 "unrecognized answer, then n"
+confirm_case "zz"     1 "unrecognized answer and nothing more"
+confirm_case $'a\nb\nc' 1 "three unusable answers give up"
+
+# default="require": an empty answer is not an answer either. Used by the
+# userfile_sync prompt, where a silent decline is the bug being fixed.
+require_case() {
+    local input="$1" expected="$2" label="$3"
+    local rc=0
+    _upgrade_confirm "test? " require <<<"$input" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == "$expected" ]] \
+        || fail "T8 [$label]: input=$(printf '%q' "$input") expected rc=$expected, got rc=$rc"
+}
+require_case $'\ny'  0 "require: blank line, then y"
+require_case ""      1 "require: nothing to say keeps the refusal"
+require_case "y"     0 "require: plain y"
+require_case "n"     1 "require: plain n"
+
 unset HARNESS_CONFIRM_FROM_STDIN
-ok "T8: _upgrade_confirm correctly classifies y/n inputs and strips CR"
+ok "T8: _upgrade_confirm classifies y/n, normalizes CR and blanks, and re-asks"
 
 # === Test 9: harness_jq fallback wired inside upgrade_actions.sh =========
 #
@@ -1057,6 +1086,30 @@ T14_DRIVE
     grep -q "MY OWN WORDING" "${T14_DIR}/install/reminder.md.bak" \
         || fail "T14: reminder.md.bak does not hold the user's original wording"
     ok "T14: a 'y' at a real terminal replaces the file, and .bak keeps the original"
+
+    # --- T14c: a first answer the terminal made up must not eat the real one
+    #
+    # The second Windows report on this prompt: the user typed `y`, saw it
+    # echoed, and still got "keeping your reminder.md". On Git Bash the
+    # docker.exe that the jq fallback shells out to sits on the console
+    # immediately before this read, and what comes back can be a line the
+    # user never typed (empty, or noise) with the real answer behind it.
+    # A prompt that classifies that as "no" loses the answer silently, so
+    # an unusable answer is re-asked. Same real pty as T14 — the stdin hook
+    # cannot express "the terminal answered first".
+    mkdir -p "${T14_DIR}/install2"
+    printf 'MY OWN WORDING\n' > "${T14_DIR}/install2/reminder.md"
+    sed "s|${T14_DIR}/install|${T14_DIR}/install2|g" "${T14_DIR}/drive.sh" \
+        > "${T14_DIR}/drive2.sh"
+    # An empty line (the shape a console left mid-reset hands back), then
+    # the y the user actually typed.
+    printf '\ny\n' | script -qec "bash '${T14_DIR}/drive2.sh'" /dev/null >/dev/null 2>&1 || true
+
+    grep -q "shipped wording" "${T14_DIR}/install2/reminder.md" \
+        || fail "T14c: a stray first line ate the user's 'y' and the file was not replaced"
+    grep -q "MY OWN WORDING" "${T14_DIR}/install2/reminder.md.bak" \
+        || fail "T14c: reminder.md.bak does not hold the user's original wording"
+    ok "T14c: a stray line before the answer is re-asked, not read as a refusal"
 fi
 
 # --- T14b: _upg_can_prompt is not fooled by a redirected FD 0 -------------

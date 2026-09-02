@@ -2534,31 +2534,64 @@ cmd_update() {
 # HARNESS_CONFIRM_FROM_STDIN=1 reads from FD 0 instead of /dev/tty; this
 # is a test hook only — production callers must leave it unset.
 #
-# Returns 0 to proceed, 1 to abort. y/Y/yes/YES proceed; n/N/no/NO and any
-# other keystroke abort. An empty answer (Enter) resolves to the optional
-# second argument `default`: "y" → proceed (the historical behavior, kept
-# for existing callers), "n" → abort (used by destructive prompts like the
-# divergence reset). Defaults to "y" so callers that omit it are unchanged.
+# Returns 0 to proceed, 1 to abort. y/yes proceed, n/no abort, in any case
+# and with surrounding blanks or CRs ignored. An empty answer (Enter)
+# resolves to the optional second argument `default`: "y" → proceed (the
+# historical behavior, kept for existing callers), "n" → abort (used by
+# destructive prompts like the divergence reset), "require" → not an answer
+# at all: ask again. Defaults to "y" so callers that omit it are unchanged.
+#
+# Anything else is re-asked rather than taken as a refusal, up to three
+# reads. Same Windows reason as above, one failure later: routing the read
+# through /dev/tty stopped the hang, but the answer can still arrive
+# mangled (a stray byte from the console docker.exe just touched, a CR in
+# the middle of the line), and a mangled "y" used to be silently classified
+# as "no" — the user answered yes and watched their file not get replaced.
+# An answer we don't recognize is now a question we ask again, and the
+# rejected text is echoed so terminal noise is visible rather than fatal.
+# After three unusable answers the caller gets the refusal it would have
+# gotten on the first one.
 _upgrade_confirm() {
     local prompt="$1"
     local default="${2:-y}"
-    local ans
-    if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
-        IFS= read -rp "$prompt" ans || ans=""
-    else
-        IFS= read -rp "$prompt" ans </dev/tty
-    fi
-    ans=${ans%$'\r'}
-    if [[ -z "${ans:-}" ]]; then
-        case "$default" in
-            n|N) return 1 ;;
-            *)   return 0 ;;
+    local ans try read_rc
+    for try in 1 2 3; do
+        ans=""
+        read_rc=0
+        if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
+            IFS= read -rp "$prompt" ans || read_rc=$?
+        else
+            IFS= read -rp "$prompt" ans </dev/tty || read_rc=$?
+        fi
+        # A terminal with nothing left to say is not a fresh answer: after
+        # one we already rejected, stop asking and keep the refusal (an
+        # unrecognized answer has meant "no" since this prompt existed).
+        if (( read_rc != 0 && try > 1 )); then
+            return 1
+        fi
+        # Every CR, not just a trailing one, plus surrounding blanks: MSYS
+        # line endings and stray terminal bytes both land in here.
+        ans=${ans//$'\r'/}
+        ans=${ans#"${ans%%[![:space:]]*}"}
+        ans=${ans%"${ans##*[![:space:]]}"}
+        case "$ans" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo])     return 1 ;;
+            "")
+                if [[ "$default" != "require" ]]; then
+                    case "$default" in
+                        n|N) return 1 ;;
+                        *)   return 0 ;;
+                    esac
+                fi
+                printf 'harness: no answer read; type y or n\n' >&2
+                ;;
+            *)
+                printf 'harness: unrecognized answer %q; type y or n\n' "$ans" >&2
+                ;;
         esac
-    fi
-    case "$ans" in
-        y|Y|yes|YES) return 0 ;;
-        *) return 1 ;;
-    esac
+    done
+    return 1
 }
 
 # Read one per-action upgrade answer and store the normalized choice in the
@@ -2585,7 +2618,11 @@ _upgrade_choice() {
     else
         IFS= read -rp "$__choice_prompt" __choice_ans </dev/tty || __choice_ans=""
     fi
-    __choice_ans=${__choice_ans%$'\r'}
+    # Same normalization as _upgrade_confirm: a CR anywhere, and blanks
+    # around the answer, must not turn a "y" into an "n".
+    __choice_ans=${__choice_ans//$'\r'/}
+    __choice_ans=${__choice_ans#"${__choice_ans%%[![:space:]]*}"}
+    __choice_ans=${__choice_ans%"${__choice_ans##*[![:space:]]}"}
     case "$__choice_ans" in
         ""|y|Y|yes|YES) __choice_ans=y ;;
         a|A|all|ALL)    __choice_ans=a ;;

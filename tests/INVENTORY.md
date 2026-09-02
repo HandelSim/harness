@@ -64,6 +64,8 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F039 | `_upgrade_confirm` returns success when stdin says "y" |
 | F040 | `_upgrade_confirm` returns failure when stdin says "n" or empty default |
 | F140 | `_upgrade_confirm` empty answer (Enter) resolves to the optional `default` arg: "n" aborts, "y"/unset proceeds (back-compat for existing callers) |
+| F156 | `_upgrade_confirm` accepts `y`/`yes`/`n`/`no` in any case, ignoring blanks around the answer and every CR in it (not just a trailing one), so a Windows terminal that mangles the line cannot turn a yes into a no |
+| F157 | `_upgrade_confirm` re-asks an answer it does not recognize (up to three reads) instead of classifying it as a refusal, echoing the rejected text; `default="require"` makes an empty answer unrecognized too. Three unusable answers, or a failed read after a rejected one, give the caller the refusal it would have gotten immediately |
 | F141 | `_git_branches_diverged` returns success only when HEAD and `@{u}` have each diverged (ahead>0 AND behind>0); failure for up-to-date, behind-only, ahead-only, and no-upstream branches |
 | F142 | `harness upgrade` / `harness update` offer a `git reset --hard @{u}` recovery on a diverged-history `--ff-only` failure (defaults to N); `--no-prompt`/CI never auto-resets, and non-divergence pull failures abort unchanged |
 | F041 | `harness logs <service>` follows compose logs for the named service (e.g., `proxy`) |
@@ -424,11 +426,12 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | U028 | `registry_actions` with `condition: installed` skip when the MCP entry is not installed |
 | U029 | `apply_upgrade_actions` returns non-zero when any action returns non-zero |
 | U030 | `upgrade_userfile_sync` asks nothing and reports `skipped`/`identical` when the shipped source and the user's target are byte-identical, so a user who never edited the file sees no new upgrade question |
-| U031 | `upgrade_userfile_sync` asks once when the bytes differ (printing both paths and the line delta), defaults to NO (bare Enter keeps the user's copy), and leaves the target byte-identical on a decline (`skipped`/`declined`, no `.bak` written) |
+| U031 | `upgrade_userfile_sync` asks when the bytes differ (printing both paths and the line delta) and leaves the target byte-identical on a decline (`skipped`/`declined`, no `.bak` written). The prompt passes `require`, so a terminal with nothing to say ends as a decline rather than a bare Enter being read as one |
 | U032 | `upgrade_userfile_sync` on an explicit yes copies the target to `<target>.bak` first, then installs the source atomically (`.tmp` + rename), and reports the basename in `files_updated`; a failed backup aborts the replacement (`backup_failed`, rc 1) |
 | U033 | `upgrade_userfile_sync` never writes without an interactive yes: `dry_run` (`--check`), `allow_prompt=0` (`--no-prompt`) or `_upg_can_prompt` false, `target_missing` (seeding's job), and `source_missing` each skip with that reason. `upgrade_userfile_needs_sync` mirrors the same both-exist-and-differ rule so `harness upgrade` lists the file only when a question is coming |
 | U034 | `upgrade_userfile_sync` actually reaches its prompt through the real `apply_upgrade_actions` loop at a real terminal: "can I ask?" is `_upg_can_prompt` (`/dev/tty` openable), NOT `[[ -t 0 ]]`, which was false inside every action because the loop drove itself with `done < <(...)`; both loops now read the manifest on FD 3 so FD 0 stays free for the prompt. A `y` at a pty replaces the file and writes `.bak`; a process with no controlling terminal reports it cannot prompt instead of hanging |
 | U035 | `_upgrade_select_actions` asks about each prechecked upgrade action ONE AT A TIME and echoes the accepted subset, so a user can take one merge without the others: Enter/`y` accepts, `n` skips, `a` accepts every remaining action, `q` clears the whole selection, and an unrecognized answer is a decline. `userfile_sync` actions pass through unasked (they carry their own richer question) but `q` still drops them |
+| U036 | `upgrade_userfile_sync` does not lose an answer the terminal spoke over: at a real pty, a stray line ahead of the user's `y` is re-asked and the file is still replaced (`.bak` keeps the original). The Windows Git Bash report behind it — `docker.exe` on the console immediately before the read, a typed `y` classified as "no" |
 
 ---
 

@@ -30,24 +30,43 @@ HARNESS_UPGRADE_ACTIONS_LOADED=1
 # get this minimal stand-in, which they can override with their own stub to
 # script an answer.
 if ! declare -F _upgrade_confirm >/dev/null 2>&1; then
+    # Kept in step with the harness copy (see the long comment there): an
+    # answer we don't recognize is re-asked, not read as a refusal, and
+    # default="require" makes an empty answer unrecognized too.
     _upgrade_confirm() {
-        local prompt="$1" default="${2:-y}" ans
-        if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
-            IFS= read -rp "$prompt" ans || ans=""
-        else
-            IFS= read -rp "$prompt" ans </dev/tty || ans=""
-        fi
-        ans=${ans%$'\r'}
-        if [[ -z "${ans:-}" ]]; then
-            case "$default" in
-                n|N) return 1 ;;
-                *)   return 0 ;;
+        local prompt="$1" default="${2:-y}" ans try read_rc
+        for try in 1 2 3; do
+            ans=""
+            read_rc=0
+            if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
+                IFS= read -rp "$prompt" ans || read_rc=$?
+            else
+                IFS= read -rp "$prompt" ans </dev/tty || read_rc=$?
+            fi
+            if (( read_rc != 0 && try > 1 )); then
+                return 1
+            fi
+            ans=${ans//$'\r'/}
+            ans=${ans#"${ans%%[![:space:]]*}"}
+            ans=${ans%"${ans##*[![:space:]]}"}
+            case "$ans" in
+                [Yy]|[Yy][Ee][Ss]) return 0 ;;
+                [Nn]|[Nn][Oo])     return 1 ;;
+                "")
+                    if [[ "$default" != "require" ]]; then
+                        case "$default" in
+                            n|N) return 1 ;;
+                            *)   return 0 ;;
+                        esac
+                    fi
+                    printf 'harness: no answer read; type y or n\n' >&2
+                    ;;
+                *)
+                    printf 'harness: unrecognized answer %q; type y or n\n' "$ans" >&2
+                    ;;
             esac
-        fi
-        case "$ans" in
-            y|Y|yes|YES) return 0 ;;
-            *) return 1 ;;
-        esac
+        done
+        return 1
     }
 fi
 
@@ -706,7 +725,13 @@ upgrade_userfile_sync() {
     _upg_log "$name differs from the shipped default${delta_note}:"
     _upg_log "  yours:   $target"
     _upg_log "  shipped: $source"
-    if ! _upgrade_confirm "Replace your $name with the shipped version? Yours is kept at $name.bak [y/N] " n; then
+    # "require", not "n": on this prompt a silent decline is the failure
+    # mode we keep getting bug reports about (a Windows terminal that hands
+    # `read` an empty line eats the user's "y"), and the answer decides
+    # whether an edited file is replaced. Nothing typed is not an answer
+    # here — ask again, and only keep their copy once the terminal has
+    # proved it has nothing to say.
+    if ! _upgrade_confirm "Replace your $name with the shipped version? Yours is kept at $name.bak [y/n] " require; then
         _upg_log "userfile_sync: keeping your $name"
         printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"declined"}\n' \
             "$(_upg_json_str "$target")"
