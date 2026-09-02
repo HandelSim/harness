@@ -77,9 +77,13 @@ ENV LC_ALL=C.UTF-8
 # and the body is dropped (`opencode run "say hello"` exits 0 with no
 # assistant content). This previously broke `harness -p` / `harness opencode
 # -p` (full_pipeline_test.sh T9/T10, integration_test.sh smoke) and forced a
-# rollback at 1.15.7 (issue #86). `--format json` does NOT dodge the race
-# (verified on 1.15.7: on a race-loss only `step_start` is emitted, and ~10% of
-# fast runs emit an entirely empty stream — zero bytes, no id). The headless
+# rollback at 1.15.7 (harness issue #86). `--format json` does NOT dodge the
+# race (verified on 1.15.7: on a race-loss only `step_start` is emitted, and
+# ~10% of fast runs emit an entirely empty stream — zero bytes, no id). Still
+# unfixed at 1.18.23: opencode #31435 is open, and the idle-break inside
+# `run.ts`'s `loop()` is byte-identical at v1.15.7 and v1.18.23. (v1.17.0's
+# `0a7cb20e6` "await run event loop" only fixes truncation at process
+# teardown, not this race.) The headless
 # `-p` path in agents/entrypoint.sh therefore recovers the final assistant text
 # from the persisted session via `opencode export <session>`, which is
 # independent of the render race; when the stream carries no session id it finds
@@ -100,7 +104,7 @@ ENV LC_ALL=C.UTF-8
 #      proxy/test_proxy.py TestTaskDescriptionParing is the canary — refresh
 #      its fixture from the bumped binary and fix the header constant if it
 #      drifts.
-ARG OPENCODE_VERSION=1.15.7
+ARG OPENCODE_VERSION=1.18.23
 ARG OPENAI_COMPAT_VERSION=2.0.47
 
 RUN npm install -g \

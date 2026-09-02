@@ -582,6 +582,7 @@ _OPENCODE_TASK_AGENTS_RE = re.compile(
 # environment. Empty/unrecognised (including "unknown") suppresses only the
 # host-OS parenthetical — the rest of the Environment line is host-independent.
 _HOST_OS: str = ""
+_RUN_MODE: str = "container"
 
 # Hybrid mode only. Both files the reminder is built from — its prose and the
 # per-tool entries' data — live in FILES, not in string literals here, so they
@@ -623,6 +624,8 @@ def _reminder_template_path() -> str:
 _REMINDER_TOKEN_HOST_OS = "{{HOST_OS}}"
 _REMINDER_TOKEN_CWD = "{{CWD}}"
 _REMINDER_TOKEN_TOOL_ENTRIES = "{{TOOL_ENTRIES}}"
+_REMINDER_TOKEN_ENVIRONMENT = "{{ENVIRONMENT}}"
+_REMINDER_TOKEN_TODOS = "{{TODOS}}"
 
 # Only a comment block at the very TOP of the file is stripped (that is where
 # the file documents its own tokens). Anchored at \A so a `<!--` appearing in
@@ -721,6 +724,23 @@ def _setup_host_os() -> None:
     raw = os.environ.get("HARNESS_HOST_OS", "").strip().lower()
     _HOST_OS = raw if raw in ("linux", "macos", "windows") else ""
     print(f"[i] host OS: {_HOST_OS or '(unknown)'}", flush=True)
+
+
+def _setup_run_mode() -> None:
+    """Read HARNESS_RUN_MODE into the module global. Only `harness host` sets
+    it (to "host"); container mode leaves it unset, so anything unrecognised —
+    including an older compose file that predates this var — falls back to
+    "container", which is what every deployment did before this existed.
+
+    The reminder's Environment bullet is the only consumer. In container mode
+    the agent runs in a Linux image with the working directory bind-mounted; in
+    host mode opencode runs directly on the user's own machine, which is often
+    NOT Linux, so the container/reproducibility prose is actively wrong there.
+    Run mode is fixed for a launch, so reading it once at startup is correct."""
+    global _RUN_MODE
+    raw = os.environ.get("HARNESS_RUN_MODE", "").strip().lower()
+    _RUN_MODE = raw if raw in ("host", "container") else "container"
+    print(f"[i] run mode: {_RUN_MODE}", flush=True)
 
 
 def _setup_mcp_tool_recency() -> None:
@@ -1236,6 +1256,156 @@ def _format_tool_signature(name, required, optional):
     return f"{name}({', '.join(parts)})"
 
 
+# --- Reminder token expansions composed in code -----------------------------
+#
+# Two of the reminder's tokens expand to whole sentences rather than a word,
+# because what they say depends on runtime state the prose file cannot see.
+# `{{CWD}}` already worked this way; `{{ENVIRONMENT}}` and `{{TODOS}}` follow
+# the same precedent. A user who wants literal control over either can simply
+# delete the token from their reminder.md and write their own text — unknown
+# and absent tokens are both non-events.
+
+# How many todo items the replay may carry, and how wide one line may get.
+# The reminder is a per-turn tax on every request, so the list is bounded even
+# when the model writes a fifty-step plan; completed items are the first to go
+# because they are the ones the model no longer needs to act on.
+_TODOS_MAX_ITEMS = 15
+_TODOS_MAX_CONTENT = 140
+
+_TODO_STATUS_MARK = {
+    "completed": "x",
+    "in_progress": "~",
+    "cancelled": "-",
+    "pending": " ",
+}
+
+
+def _format_environment_clause() -> str:
+    """The Environment bullet's body, chosen by run mode.
+
+    Container mode keeps the long-standing wording: a Linux image with the
+    working directory bind-mounted, and the reproducibility caveat that
+    follows from the agent's filesystem not being the user's. Host mode is the
+    opposite situation — opencode runs directly on the user's machine, which
+    is frequently macOS or Windows — so claiming a Linux container there is a
+    false statement the model then reasons from (wrong path separators, wrong
+    shell, advice to rebuild a venv that never needed rebuilding)."""
+    host_os = f" (host OS: {_HOST_OS})" if _HOST_OS else ""
+    if _RUN_MODE == "host":
+        return (
+            "you run directly on the user's own machine" + host_os + ", in "
+            "their real filesystem — there is no container between you and "
+            "their system. Do not assume Linux: paths, shell, and installed "
+            "toolchain are theirs, and if you need to know one, check with a "
+            "tool instead of guessing. Anything you install lands on their "
+            "machine, so keep setup project-local (e.g. a venv inside the "
+            "working directory + requirements.txt) rather than installing "
+            "globally."
+        )
+    return (
+        "you run in a Linux container with the current working directory "
+        "mounted from the host" + host_os + ". Your work must reproduce in "
+        "the user's environment, not this container — anything installed only "
+        "here (e.g. a global/system venv) the user cannot run. Put "
+        "reproducible setup in the working directory (e.g. a project-local "
+        "venv + requirements.txt); a venv built here is Linux-native, so on a "
+        "non-Linux host the user may need to recreate it (python -m venv "
+        ".venv && pip install -r requirements.txt)."
+    )
+
+
+def _extract_latest_todos(messages):
+    """Return the `todos` array from the LAST `todowrite` call in the inbound
+    history, or None if the model has not written one this session.
+
+    opencode has no `todoread` — it was deleted upstream — so the model cannot
+    look its own list up. The list only exists in two places: opencode's local
+    SQLite, which the proxy has no access to, and the `todowrite` tool_calls
+    sitting in the history opencode sends on every request. The second is the
+    one harness can reach, so the list is re-derived from scratch each turn
+    rather than cached: the proxy is stateless per request, and a cache keyed
+    on anything available here would be wrong across concurrent sessions.
+
+    This is what makes the replay survive the upstream forgetting: opencode
+    keeps sending the full history, so even when the upstream has dropped
+    everything but the last message, that last message still carries the list.
+    """
+    latest = None
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            func = tc.get("function") or {}
+            if func.get("name") != "todowrite":
+                continue
+            args = func.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (ValueError, TypeError):
+                    continue
+            if not isinstance(args, dict):
+                continue
+            todos = args.get("todos")
+            # An explicit empty list is a real state (the model cleared the
+            # list), so it wins over an earlier non-empty one.
+            if isinstance(todos, list):
+                latest = todos
+    return latest
+
+
+def _format_todos_block(todos) -> str:
+    """Render `{{TODOS}}`: either the live list, or the instruction to create
+    one. Never returns "" — an empty expansion is precisely the case where the
+    model most needs to be told what to do."""
+    items = []
+    for todo in todos or []:
+        if not isinstance(todo, dict):
+            continue
+        content = str(todo.get("content") or "").strip().replace("\n", " ")
+        if not content:
+            continue
+        if len(content) > _TODOS_MAX_CONTENT:
+            content = content[: _TODOS_MAX_CONTENT - 1].rstrip() + "\u2026"
+        status = str(todo.get("status") or "pending").strip().lower()
+        items.append((status, content))
+
+    if not items:
+        return (
+            "\n  YOU HAVE NO TODO LIST. Before you do anything else this turn, "
+            "call `todowrite` with a detailed, step-by-step breakdown of the "
+            "user's request — every step you can foresee, not a three-line "
+            "sketch. That list is the only memory you get."
+        )
+
+    # Over the cap, completed items are dropped first (oldest first): they are
+    # history, and the pending ones are what the model still has to act on.
+    dropped = 0
+    while len(items) > _TODOS_MAX_ITEMS:
+        for i, (status, _) in enumerate(items):
+            if status in ("completed", "cancelled"):
+                del items[i]
+                dropped += 1
+                break
+        else:
+            del items[0]
+            dropped += 1
+
+    lines = "\n".join(
+        f"    [{_TODO_STATUS_MARK.get(status, '?')}] {content}"
+        for status, content in items
+    )
+    elided = f"\n    (+{dropped} finished item(s) not shown)" if dropped else ""
+    return (
+        "\n  Your todo list, replayed from your last `todowrite` "
+        "([ ]=pending, [~]=in_progress, [x]=completed, [-]=cancelled). This "
+        "is a copy for reading, not the live list — to change anything, call "
+        "`todowrite` with the FULL updated list:\n"
+        + lines
+        + elided
+    )
+
+
 def _format_tool_entries(tool_signatures, tool_details=None):
     """Render the per-tool block of the hybrid recency reminder. One entry per
     tool — signature + the one-line guidance from `_HYBRID_TOOL_GUIDANCE`
@@ -1317,7 +1487,7 @@ def _extract_working_directory(system_content):
     return m.group(1).strip() or None
 
 
-def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None, working_directory=None):
+def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None, working_directory=None, todos=None):
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). The recency message that lands on the LAST user
@@ -1397,8 +1567,13 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         _setup_reminder_template()
     reminder = (
         (_REMINDER_TEMPLATE or "")
+        # {{HOST_OS}} predates {{ENVIRONMENT}} and keeps working on its own:
+        # a reminder.md seeded before this change still carries only the old
+        # token, and seeding never overwrites a user's copy.
         .replace(_REMINDER_TOKEN_HOST_OS, host_os_clause)
         .replace(_REMINDER_TOKEN_CWD, cwd_clause)
+        .replace(_REMINDER_TOKEN_ENVIRONMENT, _format_environment_clause())
+        .replace(_REMINDER_TOKEN_TODOS, _format_todos_block(todos))
         .replace(_REMINDER_TOKEN_TOOL_ENTRIES, tool_entries)
     )
     return f"{wrapped}\n\n{reminder}"
@@ -2039,11 +2214,17 @@ def translate_history_and_apply_prompt(
                     else ""
                 )
                 working_directory = _extract_working_directory(system_content)
+                # Replayed from the raw inbound history (tool_calls are
+                # flattened into prose in `messages` by this point), so the
+                # list reaches recency even when the upstream has dropped
+                # every earlier turn.
+                todos = _extract_latest_todos(original_messages)
                 messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
                     live_content,
                     signatures,
                     details,
                     working_directory=working_directory,
+                    todos=todos,
                 )
 
     # Convert system role to user role if configured. Some upstream APIs
@@ -3046,6 +3227,7 @@ def main() -> None:
     _OUTPUT_DIR = init_output_dir()
     _setup_prompt_mode()
     _setup_host_os()
+    _setup_run_mode()
     _setup_mcp_tool_recency()
     _setup_state_check_tools()
     _setup_tool_search()

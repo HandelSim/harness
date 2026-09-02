@@ -815,23 +815,24 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertNotIn('"required"', last_user)
 
     def test_mode_hybrid_reminder_advises_default_to_tools(self):
-        """The Operating bullet nudges the model to reach for a dedicated tool
-        rather than improvising by hand, and to track work with `todowrite`."""
+        """The "Use the tools" bullet nudges the model to reach for a
+        dedicated tool rather than improvising by hand, and the "Todo list"
+        bullet names `todowrite`."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        self.assertIn("prefer a listed tool over doing the work by hand", last_user)
+        self.assertIn("Prefer a listed tool over doing the work by hand", last_user)
         # Concrete examples the user asked for.
         self.assertIn("webfetch", last_user)
         self.assertIn("todowrite", last_user)
         # The guidance is part of the reminder (proxy stage-direction),
         # which now sits AFTER the wrapped user request.
         self.assertGreater(
-            last_user.index("prefer a listed tool over doing the work by hand"),
+            last_user.index("Prefer a listed tool over doing the work by hand"),
             last_user.index("<<<END_USER_REQUEST>>>"),
         )
 
     def test_mode_hybrid_reminder_advises_concurrent_task_agents(self):
-        """The Operating bullet tells the model to launch task agents, several
+        """The Delegate bullet tells the model to launch task agents, several
         concurrently when possible, to parallelize and conserve context."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
@@ -848,13 +849,13 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("I don't know", last_user)
 
     def test_mode_hybrid_reminder_has_agency_assertion(self):
-        """The Operating bullet asserts that tool calls really execute against
-        the working directory mounted from the user's machine and results are
-        real — the missing anchor for issue #109's reversion to "I can't
-        execute, here are commands you should run" right after a tool call."""
+        """The "Act, don't describe" bullet asserts that tool calls really
+        execute against the working directory and results are real — the
+        missing anchor for issue #109's reversion to "I can't execute, here
+        are commands you should run" right after a tool call."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        self.assertIn("Operating:", last_user)
+        self.assertIn("- Act, don't describe:", last_user)
         self.assertIn("really execute", last_user)
         self.assertIn("results you get back are real", last_user)
         # Don't downgrade to handing the user commands.
@@ -873,34 +874,32 @@ class TestPromptInjectionModes(unittest.TestCase):
         # referent for what to call.
         self.assertIn("opencode tools", last_user)
 
-    def test_mode_hybrid_reminder_operating_points_at_agent_tools(self):
-        """The Operating bullet tells the model the tools are listed below
-        in this reminder AND in <<<BEGIN_AGENT_TOOLS>>> earlier in the
+    def test_mode_hybrid_reminder_points_at_agent_tools(self):
+        """The "Use the tools" bullet tells the model the tools are listed
+        below in this reminder AND in <<<BEGIN_AGENT_TOOLS>>> earlier in the
         conversation (authoritative copy that may have drifted out of
         attention on long conversations)."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        operating_start = last_user.index("- Operating:")
-        operating_block = last_user[
-            operating_start:last_user.index("- Honesty:", operating_start)
-        ]
-        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", operating_block)
+        start = last_user.index("- Use the tools:")
+        block = last_user[start:last_user.index("- Call format:", start)]
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", block)
         # "listed below" pointer to the per-tool entries that follow.
-        self.assertIn("below", operating_block)
+        self.assertIn("below", block)
 
-    def test_mode_hybrid_reminder_operating_is_first_label(self):
-        """Operating is the merged Agency/Tools/Workflow bullet and is the
-        premise for everything else, so it sits first — before Honesty and
-        Environment. Tools/Workflow/Agency labels no longer exist as
-        separate lines."""
+    def test_mode_hybrid_reminder_bullet_order(self):
+        """Amnesia leads: it is the premise the rest of the reminder rests on
+        (the model cannot trust anything above this block, so the standing
+        rules are re-sent here). Environment is last — it is context, not an
+        instruction. Todo list precedes Delegate so the plan is written before
+        work is fanned out."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
-        last_user = result[-1]["content"]
-        self.assertLess(last_user.index("- Operating:"), last_user.index("- Honesty:"))
-        self.assertLess(last_user.index("- Operating:"), last_user.index("- Environment:"))
-        # The old separate labels are gone.
-        self.assertNotIn("- Agency:", last_user)
-        self.assertNotIn("- Tools:", last_user)
-        self.assertNotIn("- Workflow:", last_user)
+        c = result[-1]["content"]
+        order = ["- Amnesia:", "- Act, don't describe:", "- Use the tools:",
+                 "- Call format:", "- Todo list:", "- Delegate:",
+                 "- Honesty:", "- Environment:"]
+        positions = [c.index(label) for label in order]
+        self.assertEqual(positions, sorted(positions))
 
     def test_mode_hybrid_reminder_lives_after_user_request(self):
         """The reminder is proxy stage-direction; with the user-request-first
@@ -910,7 +909,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         last_user = result[-1]["content"]
         self.assertLess(
             last_user.index("<<<END_USER_REQUEST>>>"),
-            last_user.index("Operating:"),
+            last_user.index("- Amnesia:"),
         )
 
     def test_mode_hybrid_reminder_has_environment_context(self):
@@ -1562,48 +1561,62 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertNotIn("<<<BEGIN_USER_MESSAGE>>>", c)
         self.assertNotIn("<<<END_USER_MESSAGE>>>", c)
 
-    def test_three_bullets_only_no_agency_tools_workflow_labels(self):
-        """Agency/Tools/Workflow are merged into one Operating bullet, so the
-        old separate labels are gone. Honesty/Environment keep their own
-        bullets."""
+    def test_bullet_labels_are_the_current_set(self):
+        """The reminder's labels. The earlier three-bullet form (one merged
+        Operating bullet + Honesty + Environment) was split apart: an
+        imperative label per rule reads as an instruction rather than as a
+        category heading, and the amnesia framing needed its own opener.
+        The pre-merge Agency/Tools/Workflow labels stay gone."""
         c = self._translate()[-1]["content"]
-        self.assertIn("- Operating:", c)
-        self.assertIn("- Honesty:", c)
-        self.assertIn("- Environment:", c)
-        self.assertNotIn("- Agency:", c)
-        self.assertNotIn("- Tools:", c)
-        self.assertNotIn("- Workflow:", c)
+        for label in ("- Amnesia:", "- Act, don't describe:", "- Use the tools:",
+                      "- Call format:", "- Todo list:", "- Delegate:",
+                      "- Honesty:", "- Environment:"):
+            self.assertIn(label, c)
+        for gone in ("- Agency:", "- Tools:", "- Workflow:", "- Operating:"):
+            self.assertNotIn(gone, c)
 
-    def test_operating_carries_merged_agency_tools_workflow_content(self):
-        """The Operating bullet must preserve the load-bearing content from
-        each of the three merged bullets — losing any of these is a real
-        regression."""
+    def test_load_bearing_content_survives_the_bullet_split(self):
+        """Every load-bearing clause the old merged Operating bullet carried
+        still renders, in whichever bullet now owns it. Losing any of these is
+        a real regression, so they are asserted by content and located by
+        bullet rather than assumed to sit together."""
         c = self._translate()[-1]["content"]
-        operating = c[c.index("- Operating:"):c.index("- Honesty:")]
-        # Agency content: tools really execute, results are real,
-        # don't downgrade to listing commands, opencode named.
-        self.assertIn("really execute", operating)
-        self.assertIn("results you get back are real", operating)
-        self.assertIn("don't downgrade to listing commands", operating)
-        self.assertIn("opencode", operating)
-        # Tools content: JSON envelope (the tool-call body shape and the
-        # complete-block requirement from issue #121) + no-fabricated-
-        # results. Phrasing tightened in #121 to ban abbreviated/partial
-        # fences and require valid JSON \escape on backslashes.
-        self.assertIn('"name": "<tool>"', operating)
-        self.assertIn('"arguments": {...}', operating)
-        self.assertIn("COMPLETE ```json", operating)
-        self.assertIn("JSON-escaped", operating)
-        self.assertIn("do not invent", operating)
-        # Workflow content: prefer listed tool, todowrite, task agents,
-        # parallel/concurrent.
-        self.assertIn("prefer a listed tool", operating)
-        self.assertIn("todowrite", operating)
-        self.assertIn("Launch `task` agents", operating)
-        self.assertIn("concurrently", operating)
-        # Fallback ("ask or answer") + AGENT_TOOLS pointer survive.
-        self.assertIn("just ask or answer", operating)
-        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", operating)
+
+        def bullet(label, next_label):
+            return c[c.index(label):c.index(next_label)]
+
+        agency = bullet("- Act, don't describe:", "- Use the tools:")
+        # Agency: tools really execute, results are real, don't hand back
+        # commands, opencode named as the disambiguator from the upstream's
+        # own phantom tooling.
+        self.assertIn("really execute", agency)
+        self.assertIn("results you get back are real", agency)
+        self.assertIn("don't downgrade to listing commands", agency)
+        self.assertIn("opencode", agency)
+
+        tools = bullet("- Use the tools:", "- Call format:")
+        # Tool-preference guidance + the AGENT_TOOLS pointer + the legitimate
+        # fallback when nothing fits.
+        self.assertIn("Prefer a listed tool", tools)
+        self.assertIn("webfetch", tools)
+        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", tools)
+        self.assertIn("just ask or answer", tools)
+
+        fmt = bullet("- Call format:", "- Todo list:")
+        # The JSON envelope: body shape, complete-block requirement (issue
+        # #121), backslash escaping, and no-fabricated-results.
+        self.assertIn('"name": "<tool>"', fmt)
+        self.assertIn('"arguments": {...}', fmt)
+        self.assertIn("COMPLETE ```json", fmt)
+        self.assertIn("JSON-escaped", fmt)
+        self.assertIn("do not invent", fmt)
+
+        todo = bullet("- Todo list:", "- Delegate:")
+        self.assertIn("todowrite", todo)
+
+        delegate = bullet("- Delegate:", "- Honesty:")
+        self.assertIn("Launch `task` agents", delegate)
+        self.assertIn("concurrently", delegate)
 
     def test_per_tool_entry_format_with_guidance(self):
         """Tools in `_HYBRID_TOOL_GUIDANCE` get one entry: signature + ` — `
@@ -1936,22 +1949,24 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertIn("- Environment:", c)
         self.assertIn("mounted from the host", c)
 
-    def test_honesty_filesystem_clause_unconditional(self):
-        """The Honesty addition (filesystem-claims must come from tool
-        results) renders even when no CWD is found — it's load-bearing
-        whether or not the positive anchor was extractable. The companion
-        "don't name a remembered training path" clause was removed per
-        user feedback on issue #110; only the positive filesystem-claim
-        rule remains. Same baseline message set as `_translate()` (no
-        `Working directory:` in `self.user_msgs`)."""
+    def test_filesystem_claims_clause_unconditional(self):
+        """The issue #110 addition (filesystem claims must come from tool
+        results) renders even when no CWD is found — it's load-bearing whether
+        or not the positive anchor was extractable. It now opens the "Use the
+        tools" bullet rather than sitting under Honesty: the rule's job is to
+        make the model reach for a tool, and it reads as the premise for that
+        bullet. The companion "don't name a remembered training path" clause
+        was removed per user feedback on issue #110; only the positive
+        filesystem-claim rule remains. Same baseline message set as
+        `_translate()` (no `Working directory:` in `self.user_msgs`)."""
         c = self._translate()[-1]["content"]
-        honesty = c[c.index("- Honesty:"):c.index("- Environment:")]
-        self.assertIn("must come from a tool result", honesty)
+        tools = c[c.index("- Use the tools:"):c.index("- Call format:")]
+        self.assertIn("must come from a tool result", tools)
         # Companion training-path clause is gone — verify it stays gone so
         # nobody re-adds it without re-opening the conversation.
-        self.assertNotIn("training", honesty)
-        self.assertNotIn("/home/<name>", honesty)
-        self.assertNotIn("/sandbox", honesty)
+        self.assertNotIn("training", tools)
+        self.assertNotIn("/home/<name>", tools)
+        self.assertNotIn("/sandbox", tools)
 
 
 class TestExtractWorkingDirectory(unittest.TestCase):
@@ -2038,8 +2053,9 @@ class TestTaskDescriptionParing(unittest.TestCase):
     left whole.
 
     REAL_TASK_DESCRIPTION below is a faithful copy of what opencode hands the
-    proxy: static boilerplate, then the dynamic agent list. The opening lines
-    are verbatim from opencode's bundled task prompt (var `an`) and the list
+    proxy: static boilerplate, then the dynamic agent list. The boilerplate is
+    verbatim `packages/opencode/src/tool/task.txt` as shipped in opencode
+    1.18.23 (2305 bytes, md5 de4e9d3881762b9a421627e2ac207ecb) and the list
     rows follow describeTask's `- <name>: <description>` shape.
 
     CANARY: this fixture is the cross-version guard the issue asked for. On every
@@ -2056,19 +2072,55 @@ class TestTaskDescriptionParing(unittest.TestCase):
     """
 
     REAL_TASK_DESCRIPTION = (
-        "Launch a new agent to handle complex, multistep tasks autonomously.\n\n"
-        "When using the Task tool, you must specify a subagent_type parameter "
-        "to select which agent type to use.\n\n"
+        "Launch a new agent to handle complex, multistep tasks "
+        "autonomously.\n"
+        "\n"
+        "When using the Task tool, you must specify a subagent_type "
+        "parameter to select which agent type to use.\n"
+        "\n"
         "When NOT to use the Task tool:\n"
-        "- If you want to read a specific file path, use the Read or Glob tool "
-        "instead of the Task tool, to find the match more quickly\n"
-        "- If no available agent is a good fit for the task, use other tools "
-        "directly\n\n\n"
+        "- If you want to read a specific file path, use the Read or "
+        "Glob tool instead of the Task tool, to find the match more "
+        "quickly\n"
+        "- If you are searching for a specific class definition like "
+        "\"class Foo\", use the Grep tool instead, to find the match more "
+        "quickly\n"
+        "- If you are searching for code within a specific file or set "
+        "of 2-3 files, use the Read tool instead of the Task tool, to "
+        "find the match more quickly\n"
+        "- If no available agent is a good fit for the task, use other "
+        "tools directly\n"
+        "\n"
+        "\n"
         "Usage notes:\n"
-        "1. Launch multiple agents concurrently whenever possible, to maximize "
-        "performance; to do that, use a single message with multiple tool uses\n"
-        "2. When the agent is done, it will return a single message back to "
-        "you.\n\n"
+        "1. Launch multiple agents concurrently whenever possible, to "
+        "maximize performance; to do that, use a single message with "
+        "multiple tool uses\n"
+        "2. Once you have delegated work to an agent, do not duplicate "
+        "that work yourself. Continue with non-overlapping tasks, or "
+        "wait for the result. For background tasks, you will be "
+        "notified automatically when the result is ready.\n"
+        "3. When the agent is done, it will return a single message "
+        "back to you. The result returned by the agent is not visible "
+        "to the user. To show the user the result, you should send a "
+        "text message back to the user with a concise summary of the "
+        "result. The output includes a task_id you can reuse later to "
+        "continue the same subagent session.\n"
+        "4. Each agent invocation starts with a fresh context unless "
+        "you provide task_id to resume the same subagent session (which "
+        "continues with its previous messages and tool outputs). When "
+        "starting fresh, your prompt should contain a highly detailed "
+        "task description for the agent to perform autonomously and you "
+        "should specify exactly what information the agent should "
+        "return back to you in its final and only message to you.\n"
+        "5. The agent's outputs should generally be trusted\n"
+        "6. Clearly tell the agent whether you expect it to write code "
+        "or just to do research (search, file reads, web fetches, "
+        "etc.), since it is not aware of the user's intent. Tell it how "
+        "to verify its work if possible (e.g., relevant test commands).\n"
+        "7. If the agent description mentions that it should be used "
+        "proactively, then you should try your best to use it without "
+        "the user having to ask for it first. Use your judgement.\n"
         "Available agent types and the tools they have access to:\n"
         "- Explore: fast read-only code search\n"
         "- general-purpose: research and multi-step tasks\n"
@@ -3898,10 +3950,18 @@ class TestReminderTemplateFile(unittest.TestCase):
                 proxy._setup_reminder_template()
         tmpl = proxy._REMINDER_TEMPLATE
         self.assertNotEqual(tmpl, proxy._REMINDER_FALLBACK)
-        for token in (proxy._REMINDER_TOKEN_HOST_OS,
+        # The tokens the SHIPPED default uses. {{HOST_OS}} is deliberately
+        # not among them: {{ENVIRONMENT}} names the host OS inline, so the
+        # shipped prose would render it twice. {{HOST_OS}} is still
+        # substituted for the sake of user copies seeded before
+        # {{ENVIRONMENT}} existed — see
+        # test_host_os_token_still_substitutes_for_older_user_copies.
+        for token in (proxy._REMINDER_TOKEN_ENVIRONMENT,
+                      proxy._REMINDER_TOKEN_TODOS,
                       proxy._REMINDER_TOKEN_CWD,
                       proxy._REMINDER_TOKEN_TOOL_ENTRIES):
             self.assertIn(token, tmpl)
+        self.assertNotIn(proxy._REMINDER_TOKEN_HOST_OS, tmpl)
         self.assertTrue(tmpl.startswith("[Reminder"))
         self.assertTrue(tmpl.endswith("]"))
 

@@ -3625,7 +3625,7 @@ host_proxy_port()      { printf '%s' "${PROXY_PORT:-8000}"; }
 # arbitrary system opencode can silently break print mode.
 HARNESS_HOST_JQ_VERSION="${HARNESS_HOST_JQ_VERSION:-1.7.1}"
 HARNESS_HOST_NODE_VERSION="${HARNESS_HOST_NODE_VERSION:-20.20.2}"
-HARNESS_HOST_OPENCODE_VERSION="${HARNESS_HOST_OPENCODE_VERSION:-1.15.7}"
+HARNESS_HOST_OPENCODE_VERSION="${HARNESS_HOST_OPENCODE_VERSION:-1.18.23}"
 HARNESS_HOST_OPENAI_COMPAT_VERSION="${HARNESS_HOST_OPENAI_COMPAT_VERSION:-2.0.47}"
 
 host_tool_dir()     { printf '%s/host/toolchain' "$state_root"; }
@@ -4251,12 +4251,19 @@ host_proxy_start() {
     # container and 504'd: the host can't reach the upstream directly.) The hop
     # that must BYPASS the corp proxy is opencode's own loopback call to this
     # proxy, handled in host_run_opencode via NO_PROXY — not here.
+    # HARNESS_RUN_MODE tells the proxy which Environment prose to inject into
+    # the recency reminder. Host mode runs opencode on the user's own machine —
+    # frequently macOS or Windows — so the container wording the proxy defaults
+    # to would be a false statement the model then reasons from. Only host mode
+    # sets this; unset means container, which is what every deployment did
+    # before the var existed.
     PROXY_HOST=127.0.0.1 \
         HARNESS_FORCE_LOOPBACK=1 \
         PROXY_PORT="$port" \
         PROXY_BACKEND="${backend_override:-}" \
         OUTPUT_DIR="$host_output_dir" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
+        HARNESS_RUN_MODE=host \
         INSTALL_ROOT="$install_root" \
         nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
