@@ -1568,7 +1568,9 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
        - tool1(...) — guidance line
        - tool2(...) — guidance line
          <verbatim description if tool2 is a detail tool>
-       ...]
+       ...
+
+       Before you end this turn: ...]
 
     The live user request is placed FIRST, before the reminder, so the
     model's most-recent attention isn't on a wall of operating rules but

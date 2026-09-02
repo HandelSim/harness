@@ -895,9 +895,59 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("really execute", last_user)
         self.assertIn("results you get back are real", last_user)
         # Don't downgrade to handing the user commands.
-        self.assertIn("don't downgrade to listing commands", last_user)
+        self.assertIn("downgrade to listing commands", last_user)
         # The legitimate fallback (when no tool fits) stays available.
         self.assertIn("just ask or answer", last_user)
+
+    def test_agency_bullet_names_the_trigger_and_the_replacement(self):
+        """The reported failure is the model answering with a how-to instead
+        of running the work. Asserting "you are running this" was not enough
+        on its own: the bullet also has to name the observable moment the
+        slip happens (a numbered how-to, a non-json fence of shell commands,
+        "you can run") and say what to emit instead, because a rule the model
+        cannot recognise itself breaking does not fire."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("that moment IS the failure", last_user)
+        self.assertIn("you can run", last_user)
+        self.assertIn("exact command as a ```json tool call", last_user)
+        # The worked rewrite: prose step -> the call that performs it.
+        self.assertIn("`bash` call running `ls src`", last_user)
+        # Handing back a plan and waiting is the same failure wearing a hat.
+        self.assertIn("don't ask permission for a step the request already covers",
+                      last_user)
+
+    def test_no_tool_fits_is_not_an_excuse_to_hand_back_instructions(self):
+        """The "just ask or answer" fallback is legitimate but is the nearest
+        available excuse for advising, so it is qualified in place rather
+        than removed."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("just ask or answer", last_user)
+        self.assertIn("not a license to hand the work back as instructions",
+                      last_user)
+
+    def test_reminder_closes_with_the_end_of_turn_check(self):
+        """The end-of-turn check sits AFTER the per-tool entries, in the last
+        slot before generation — the strongest position in the block, and the
+        one that matches what it guards (ending a turn with prose while the
+        task is unfinished). It states the mechanism, not just the rule: a
+        turn with no tool call is `finish_reason: stop`, so opencode ends the
+        run and the task dies there. The finished-work branch stays, or the
+        rule would demand a reflex tool call after the final report."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        closer = "Before you end this turn:"
+        self.assertIn(closer, last_user)
+        self.assertIn("There is no third option", last_user)
+        # The mechanism, not just the rule: a text-only turn ends the run.
+        self.assertIn("opencode STOPS the run", last_user)
+        self.assertIn("unless the work is genuinely done", last_user)
+        # After the tool entries, and last in the block.
+        self.assertLess(last_user.index("Tools — one entry per tool"),
+                        last_user.index(closer))
+        self.assertTrue(last_user.rstrip().endswith("Make it now.]"),
+                        last_user[-200:])
 
     def test_mode_hybrid_reminder_agency_names_opencode(self):
         """The Operating bullet names opencode as the disambiguator from the
@@ -1635,7 +1685,7 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         # own phantom tooling.
         self.assertIn("really execute", agency)
         self.assertIn("results you get back are real", agency)
-        self.assertIn("don't downgrade to listing commands", agency)
+        self.assertIn("downgrade to listing commands", agency)
         self.assertIn("opencode", agency)
 
         tools = bullet("- Use the tools:", "- Call format:")

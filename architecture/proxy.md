@@ -125,13 +125,20 @@ validator in `_setup_prompt_mode` accepts:
   **Act, don't describe** (positive assertion that the model acts through
   opencode and its ```json calls really execute with results that are real —
   named target for the ~20% reversion to the upstream's "I can't execute,
-  here are commands for you to run" persona, issue #109),
+  here are commands for you to run" persona, issue #109. The assertion alone
+  did not hold, so the bullet also names the observable moment of the slip —
+  a numbered how-to, a plain non-json fence of shell commands, "you can run",
+  a request for permission to do a step the task already covers — and gives
+  the rewrite: emit that exact command as the tool call that performs it. A
+  rule the model cannot catch itself breaking does not fire),
   **Use the tools** (issue #110's rule that any claim about the working
   directory or local filesystem state must come from a tool result — see
   [Working-directory echo](#working-directory-echo) for why — then
   prefer-a-listed-tool guidance with `webfetch` over curl as the worked
   example, the claim that the listed set is complete for this turn, and the
-  legitimate fallback when nothing fits),
+  legitimate fallback when nothing fits — qualified as being for a question
+  no tool can settle, since it is otherwise the nearest available excuse for
+  handing the work back as instructions),
   **Call format** (the JSON envelope: one complete fenced block, the
   `{"name", "arguments"}` body shape, backslash escaping, and the
   no-fabricated-results rule),
@@ -170,7 +177,19 @@ validator in `_setup_prompt_mode` accepts:
   `task`'s `subagent_type` agents, a `skill`'s skill names), the tool's
   description is inlined directly under its entry (whole for `skill`; pared
   to the agent-list section for `task`) — see
-  [Hybrid delimiters](#hybrid-delimiters). Hybrid additionally delimits four
+  [Hybrid delimiters](#hybrid-delimiters).
+
+  **The block closes with an end-of-turn check**, deliberately placed AFTER
+  the per-tool entries: it is the last text before generation, the strongest
+  slot in the message, and what it guards is precisely the end of a turn. It
+  states the mechanism rather than only the rule — a turn ends either with a
+  tool call or with the final report on finished work, and a turn with
+  neither comes back as `finish_reason: stop`, so opencode ends the run and
+  the task dies with the model's advice as its last word (the same property
+  that makes the text-only [empty-response
+  rescue](#empty-response-detection) unable to continue the loop). The
+  finished-work branch is kept on purpose: without it the rule would demand a
+  reflex tool call after the final report. Hybrid additionally delimits four
   content categories so each is addressable by name and the model can't
   conflate them with the upstream gateway's own system prompt/tools — again
   see [Hybrid delimiters](#hybrid-delimiters) below.
