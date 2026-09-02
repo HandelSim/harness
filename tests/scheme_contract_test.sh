@@ -327,9 +327,10 @@ if "do not invent" not in c:
     print("REMINDER_MISSING_DO_NOT_INVENT"); sys.exit(0)
 if "Tools — one entry per tool" not in c:
     print("REMINDER_MISSING_TOOLS_LEGEND"); sys.exit(0)
-# The reminder points the model back at the AGENT_TOOLS section by name.
-if "<<<BEGIN_AGENT_TOOLS>>>" not in c:
-    print("REMINDER_MISSING_AGENT_TOOLS_POINTER"); sys.exit(0)
+# The reminder must NOT name the AGENT_TOOLS section: it lives in the head,
+# which is what an upstream drops first, so the pointer dies when it matters.
+if "<<<BEGIN_AGENT_TOOLS>>>" in c:
+    print("REMINDER_STILL_POINTS_AT_AGENT_TOOLS"); sys.exit(0)
 if "scheme-probe-text" not in c:
     print("PROBE_MISSING_FROM_LAST_USER"); sys.exit(0)
 # The probe (live user request) is wrapped in USER_REQUEST markers and
@@ -340,8 +341,8 @@ if "<<<BEGIN_USER_REQUEST>>>" not in c:
 if c.index("Reminder") <= c.index("<<<END_USER_REQUEST>>>"):
     print("REMINDER_NOT_AFTER_USER_REQUEST"); sys.exit(0)
 # The full tool list / instructions header MUST NOT be on the last user
-# message — those go in the head (system) under hybrid. (The reminder
-# only *references* the AGENT_TOOLS marker; the block itself is in head.)
+# message — those go in the head (system) under hybrid. (The block itself
+# stays in the head; the reminder no longer references it at all.)
 if "<<<END_AGENT_TOOLS>>>" in c:
     print("FULL_TOOL_LIST_ON_LAST_USER"); sys.exit(0)
 if "### Tool Usage Instructions" in c:

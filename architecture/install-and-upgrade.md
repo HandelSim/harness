@@ -253,9 +253,17 @@ helper with `harness upgrade`.
    awk, no jq and no container (see `upgrade_envfile_needs_merge` /
    `upgrade_linefile_needs_merge`). If nothing needs merging, print
    "Configuration files are up to date — no merges needed." and skip BOTH
-   the prompt and the merges. Otherwise list only the files that need
-   updating and prompt once (all-or-nothing). This is why a no-op upgrade
-   no longer prompts or spins jq for every config file.
+   the prompt and the merges. Otherwise list the files that need
+   updating and ask about the actions ONE AT A TIME
+   (`_upgrade_select_actions`), so a user can take the new `.env` variables
+   without also taking a reminder rewrite: Enter accepts, `n` skips this
+   one, `a` accepts every remaining action, `q` skips them all. The answers
+   become the ID filter `apply_upgrade_actions` then runs. `userfile_sync`
+   actions pass through unasked here because they carry their own, more
+   informative question (see below) — asking twice about the same file
+   helps nobody; `q` still drops them, since it means "apply nothing".
+   This is why a no-op upgrade no longer prompts or spins jq for every
+   config file.
 3. Apply the flagged upgrade actions from `scripts/upgrade-manifest.json`
    to the install root (`apply_upgrade_actions` takes an optional ID
    filter so only the prechecked actions run).
@@ -365,7 +373,9 @@ It is deliberately cheap and non-blocking:
 - The precheck is the pure-bash `upgrade_*_needs_merge` against the two
   fixed config paths — no jq, no manifest read, no container. When nothing
   changed it's a silent sub-10ms no-op on every launch.
-- One prompt, all-or-nothing (matches `harness upgrade`).
+- One prompt, all-or-nothing. (`harness upgrade` asks per action; this
+  precheck does not, because it covers only the two fixed config files and
+  an agent launch is not the place for a questionnaire.)
 - It NEVER gates the launch: headless `-p`/`--print` mode is skipped
   entirely, a missing terminal falls through with a "run `harness upgrade`"
   hint, and declining continues to the agent. `HARNESS_SKIP_CONFIG_MERGE=1`
@@ -447,11 +457,25 @@ atomically. Every other outcome is a skip with a reason: `identical`,
 is nothing to ask about yet), `source_missing`, `dry_run` (`--check`),
 `declined`, `not_prompted`, `backup_failed`.
 
-`allow_prompt` is 0 under `--no-prompt`, and a run with no tty skips too:
-an unattended upgrade must never replace hand-edited prose on the user's
-behalf. The `upgrade_userfile_needs_sync` precheck mirrors the same
-"both exist and differ" rule, so the aggregate `harness upgrade` prompt
-lists the file only when a question is actually coming.
+`allow_prompt` is 0 under `--no-prompt`, and a run that cannot ask skips
+too: an unattended upgrade must never replace hand-edited prose on the
+user's behalf. "Can ask" is `_upg_can_prompt`, which tests that `/dev/tty`
+is **openable** — NOT `[[ -t 0 ]]`. That distinction was a shipped bug:
+`apply_upgrade_actions` drove its action loop with
+`done < <(harness_jq ...)`, which rebinds FD 0 to a pipe for the whole loop
+body, so `-t 0` was false inside every action even on a fully interactive
+upgrade. The prompt therefore never fired for anyone — `reminder.md` and
+`tool-guidance.json` could not be updated, while the skip message told the
+user to "re-run `harness upgrade` interactively", which is exactly what
+they were already doing. `HARNESS_CONFIRM_FROM_STDIN=1` short-circuited
+that same condition, which is why the suite missed it; both loops now read
+the manifest on FD 3, so FD 0 stays free for prompts and a scripted answer
+exercises the production shape. `tests/upgrade_test.sh` T14 is the
+regression guard and uses a real pty rather than the hook.
+
+The `upgrade_userfile_needs_sync` precheck mirrors the same "both exist and
+differ" rule, so `harness upgrade` lists the file only when a question is
+actually coming.
 
 ## Atomic writes
 

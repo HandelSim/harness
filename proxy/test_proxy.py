@@ -840,6 +840,42 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("concurrently", last_user)
         self.assertIn("conserve your context", last_user)
 
+    def test_mode_hybrid_reminder_demands_the_smallest_diff(self):
+        """The Smallest change bullet. This is maintained software and every
+        line lands in a human review; a large diff gets skimmed rather than
+        read, which is how bugs ride in. So the bullet names the specific
+        habits that inflate a diff, and says to raise other problems rather
+        than fix them unasked."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("smallest change that does the job", last_user)
+        self.assertIn("no drive-by refactors", last_user.lower())
+        self.assertIn("let the user decide", last_user)
+
+    def test_mode_hybrid_reminder_plans_through_to_verified(self):
+        """The Todo list bullet requires the plan to reach a verified end:
+        build/run/test steps belong IN the list at creation time, and the
+        model runs them itself rather than handing them back. Without this
+        the model edits, reports, and stops — leaving the loop early."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("Plan through to VERIFIED", last_user)
+        self.assertIn("build / run / test step", last_user)
+        self.assertIn("never hand a build or a test back to the user", last_user)
+
+    def test_amnesia_bullet_makes_the_agents_md_check_recurring(self):
+        """The AGENTS.md rule is a per-turn check, not a one-time todo item.
+        The earlier wording ("read AGENTS.md now") was satisfied once, at the
+        top of the first todo list, and never revisited — so the file went out
+        of context and stayed out. The bullet now says what to look at (the
+        text, above), rejects the todo item as evidence, and says the check
+        repeats."""
+        result = self._translate_with_mode("hybrid", pass_tools=True)
+        last_user = result[-1]["content"]
+        self.assertIn("check, right now", last_user)
+        self.assertIn("a checked-off item is not the file", last_user)
+        self.assertIn("repeat on every turn", last_user)
+
     def test_mode_hybrid_reminder_has_honesty_rules(self):
         """The Honesty bullet carries the anti-fabrication guidance."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
@@ -874,16 +910,22 @@ class TestPromptInjectionModes(unittest.TestCase):
         # referent for what to call.
         self.assertIn("opencode tools", last_user)
 
-    def test_mode_hybrid_reminder_points_at_agent_tools(self):
-        """The "Use the tools" bullet tells the model the tools are listed
-        below in this reminder AND in <<<BEGIN_AGENT_TOOLS>>> earlier in the
-        conversation (authoritative copy that may have drifted out of
-        attention on long conversations)."""
+    def test_mode_hybrid_reminder_does_not_point_at_agent_tools(self):
+        """The "Use the tools" bullet must NOT send the model to
+        <<<BEGIN_AGENT_TOOLS>>>.
+
+        That block rides on the system message at index 0 — the first thing
+        an upstream that truncates oldest-first drops — while the reminder is
+        re-appended to the LAST user message every turn. So the pointer goes
+        dead exactly when the amnesia it was meant to cover actually bites,
+        and it sends the model looking for a section that is no longer there.
+        The per-tool entries carried in the reminder itself are the live copy;
+        the block stays in the head, only the pointer at it is gone."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
         start = last_user.index("- Use the tools:")
         block = last_user[start:last_user.index("- Call format:", start)]
-        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", block)
+        self.assertNotIn("<<<BEGIN_AGENT_TOOLS>>>", block)
         # "listed below" pointer to the per-tool entries that follow.
         self.assertIn("below", block)
 
@@ -897,7 +939,7 @@ class TestPromptInjectionModes(unittest.TestCase):
         c = result[-1]["content"]
         order = ["- Amnesia:", "- Act, don't describe:", "- Use the tools:",
                  "- Call format:", "- Todo list:", "- Delegate:",
-                 "- Honesty:", "- Environment:"]
+                 "- Smallest change:", "- Honesty:", "- Environment:"]
         positions = [c.index(label) for label in order]
         self.assertEqual(positions, sorted(positions))
 
@@ -1206,12 +1248,14 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertNotIn("<<<BEGIN_USER_MESSAGE>>>", tool_result["content"])
         self.assertIn('<<<BEGIN_TOOL_RESULT name="get_weather">>>', tool_result["content"])
 
-    def test_mode_hybrid_reminder_references_agent_tools_marker(self):
-        """The recency reminder points the model back at the AGENT_TOOLS
-        section by literal name."""
+    def test_mode_hybrid_reminder_never_names_the_agent_tools_marker(self):
+        """Nowhere in the reminder — not the bullets, not the tool legend —
+        names <<<BEGIN_AGENT_TOOLS>>>. Whole-message check, so a pointer
+        cannot creep back in via the legend in tool-guidance.json (which is
+        where one of the two originally lived)."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", last_user)
+        self.assertNotIn("<<<BEGIN_AGENT_TOOLS>>>", last_user)
 
     def test_mode_hybrid_tools_block_contains_disambiguation_sentence(self):
         """The AGENT_TOOLS block tells the model these are the only tools and
@@ -1570,7 +1614,7 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         c = self._translate()[-1]["content"]
         for label in ("- Amnesia:", "- Act, don't describe:", "- Use the tools:",
                       "- Call format:", "- Todo list:", "- Delegate:",
-                      "- Honesty:", "- Environment:"):
+                      "- Smallest change:", "- Honesty:", "- Environment:"):
             self.assertIn(label, c)
         for gone in ("- Agency:", "- Tools:", "- Workflow:", "- Operating:"):
             self.assertNotIn(gone, c)
@@ -1595,11 +1639,11 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertIn("opencode", agency)
 
         tools = bullet("- Use the tools:", "- Call format:")
-        # Tool-preference guidance + the AGENT_TOOLS pointer + the legitimate
-        # fallback when nothing fits.
+        # Tool-preference guidance + the completeness claim that replaced the
+        # AGENT_TOOLS pointer + the legitimate fallback when nothing fits.
         self.assertIn("Prefer a listed tool", tools)
         self.assertIn("webfetch", tools)
-        self.assertIn("<<<BEGIN_AGENT_TOOLS>>>", tools)
+        self.assertIn("complete for this turn", tools)
         self.assertIn("just ask or answer", tools)
 
         fmt = bullet("- Call format:", "- Todo list:")

@@ -990,6 +990,185 @@ grep -q "MY OWN WORDING" "${T13_DIR}/user.md" \
 unset HARNESS_CONFIRM_FROM_STDIN
 ok "T13: userfile_sync asks only on a real difference, and 'no' is the default"
 
+# === Test 14: userfile_sync actually prompts at a REAL terminal ============
+#
+# The regression this exists for: userfile_sync gated its prompt on
+# `[[ -t 0 ]]`, but apply_upgrade_actions drove its action loop with
+# `done < <(harness_jq ...)`, which rebinds FD 0 to a pipe for the entire loop
+# body. So `-t 0` was false inside every action even on a fully interactive
+# `harness upgrade`, the action took its "nothing to confirm on" path every
+# single time, and reminder.md / tool-guidance.json could never be updated —
+# while telling the user to "re-run 'harness upgrade' interactively", which is
+# exactly what they were already doing.
+#
+# Every other test in T13 sets HARNESS_CONFIRM_FROM_STDIN=1, and that variable
+# short-circuited the very condition that was broken. That is why the bug
+# shipped. So this test must NOT use the hook: it allocates a real pty with
+# `script`, runs the real apply_upgrade_actions over a real manifest, and
+# types `y`. Nothing less would have caught it.
+echo
+echo "--- T14: userfile_sync prompts at a real tty, through apply_upgrade_actions ---"
+
+if ! command -v script >/dev/null 2>&1; then
+    ok "T14: SKIPPED (no 'script' to allocate a pty)"
+elif ! command -v jq >/dev/null 2>&1; then
+    # harness_jq would fall back to a docker sidecar; this suite is docker-free.
+    ok "T14: SKIPPED (no host jq)"
+else
+    T14_DIR="${WORK}/t14"
+    mkdir -p "${T14_DIR}/clone/proxy" "${T14_DIR}/install"
+    printf 'shipped wording, line one\nshipped wording, line two\n' \
+        > "${T14_DIR}/clone/proxy/reminder.md"
+    printf 'MY OWN WORDING\n' > "${T14_DIR}/install/reminder.md"
+    cat > "${T14_DIR}/clone/manifest.json" <<'T14_MANIFEST'
+{
+  "version": 1,
+  "actions": [
+    {
+      "id": "reminder_prose",
+      "type": "userfile_sync",
+      "source": "proxy/reminder.md",
+      "target_relative": "reminder.md",
+      "description": "sync the reminder prose"
+    }
+  ],
+  "registry_actions": []
+}
+T14_MANIFEST
+
+    # Run in a child shell so the pty and the sourced harness stay contained.
+    cat > "${T14_DIR}/drive.sh" <<T14_DRIVE
+set -euo pipefail
+export HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="${T14_DIR}/install"
+# Deliberately NOT setting HARNESS_CONFIRM_FROM_STDIN: the point is the tty.
+source "${REPO_ROOT}/harness"
+source "${REPO_ROOT}/scripts/lib/upgrade_actions.sh"
+clone_dir="${T14_DIR}/clone"
+install_root="${T14_DIR}/install"
+apply_upgrade_actions "${T14_DIR}/clone/manifest.json" 0 "reminder_prose" 1
+T14_DRIVE
+
+    printf 'y\n' | script -qec "bash '${T14_DIR}/drive.sh'" /dev/null >/dev/null 2>&1 || true
+
+    grep -q "shipped wording" "${T14_DIR}/install/reminder.md" \
+        || fail "T14: answering 'y' at a real tty did NOT replace the user's file (the shipped bug)"
+    [[ -f "${T14_DIR}/install/reminder.md.bak" ]] \
+        || fail "T14: the replaced file was not backed up to reminder.md.bak"
+    grep -q "MY OWN WORDING" "${T14_DIR}/install/reminder.md.bak" \
+        || fail "T14: reminder.md.bak does not hold the user's original wording"
+    ok "T14: a 'y' at a real terminal replaces the file, and .bak keeps the original"
+fi
+
+# --- T14b: _upg_can_prompt is not fooled by a redirected FD 0 -------------
+# The unit-level statement of the same thing, and the part that runs even
+# where `script` is unavailable: with no controlling terminal it must report
+# "cannot prompt" rather than hanging or guessing.
+if ! declare -F _upg_can_prompt >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/scripts/lib/upgrade_actions.sh"
+fi
+declare -F _upg_can_prompt >/dev/null 2>&1 \
+    || fail "T14b: _upg_can_prompt is not defined by the actions library"
+
+(
+    export HARNESS_CONFIRM_FROM_STDIN=1
+    while IFS= read -r _line <&3; do
+        _upg_can_prompt || exit 1
+    done 3<<<"one"
+) || fail "T14b: the HARNESS_CONFIRM_FROM_STDIN hook does not enable prompting"
+
+if setsid true 2>/dev/null; then
+    if setsid bash -c "
+        source '${REPO_ROOT}/scripts/lib/upgrade_actions.sh'
+        _upg_can_prompt && exit 1
+        exit 0
+    " </dev/null >/dev/null 2>&1; then
+        ok "T14b: _upg_can_prompt says no when there is no controlling terminal"
+    else
+        fail "T14b: _upg_can_prompt claimed it could prompt with no controlling terminal"
+    fi
+else
+    ok "T14b: SKIPPED the no-tty half (no setsid)"
+fi
+
+# === Test 15: per-action upgrade selection =================================
+#
+# `harness upgrade` used to ask ONE aggregate "Apply these upgrade actions?",
+# which made the whole manifest all-or-nothing: a user who wanted the new .env
+# variables but not a reminder rewrite had to accept both or neither.
+# _upgrade_select_actions asks per action and echoes the accepted subset.
+#
+# userfile_sync entries are passed through unasked on purpose — they carry
+# their own, more informative question (both paths, the line delta, the .bak
+# promise), so asking here too would prompt twice for the same file. `q` still
+# drops them, because it means "apply nothing".
+echo
+echo "--- T15: per-action upgrade selection ---"
+
+declare -F _upgrade_select_actions >/dev/null 2>&1 \
+    || fail "T15: _upgrade_select_actions not defined after sourcing harness"
+
+T15_DIR="${WORK}/t15"
+mkdir -p "${T15_DIR}"
+cat > "${T15_DIR}/manifest.json" <<'T15_MANIFEST'
+{
+  "version": 1,
+  "actions": [
+    {"id": "env_vars",   "type": "envfile_merge",  "source": "a", "target_relative": "b", "description": "d"},
+    {"id": "allow_list", "type": "linefile_merge", "source": "a", "target_relative": "b", "description": "d"},
+    {"id": "reminder",   "type": "userfile_sync",  "source": "a", "target_relative": "b", "description": "d"}
+  ],
+  "registry_actions": [
+    {"id": "mcp_x", "type": "directory_overwrite", "source": "a", "target_relative": "b", "condition": "installed", "description": "d"}
+  ]
+}
+T15_MANIFEST
+
+T15_IDS=$'env_vars\nallow_list\nreminder\nmcp_x'
+
+t15_select() {
+    # $1 = newline-separated answers. Answers arrive on FD 0; the candidate
+    # list is read on FD 3, so an answer can never be eaten as an action id.
+    HARNESS_CONFIRM_FROM_STDIN=1 \
+        _upgrade_select_actions "${T15_DIR}/manifest.json" "${T15_IDS}" \
+        <<<"$1" 2>/dev/null | tr '\n' ',' | sed 's/,$//'
+}
+
+got=$(t15_select $'y\ny\ny')
+[[ "$got" == "env_vars,allow_list,reminder,mcp_x" ]] \
+    || fail "T15: accepting everything gave [$got]"
+
+# The whole point: take one merge, refuse the other.
+got=$(t15_select $'n\ny\ny')
+[[ "$got" == "allow_list,reminder,mcp_x" ]] \
+    || fail "T15: declining only env_vars gave [$got]"
+
+got=$(t15_select $'y\nn\nn')
+[[ "$got" == "env_vars,reminder" ]] \
+    || fail "T15: declining allow_list and mcp_x gave [$got]"
+
+# Enter means yes, matching the [Y/n] default shown in the prompt.
+got=$(t15_select $'\n\n\n')
+[[ "$got" == "env_vars,allow_list,reminder,mcp_x" ]] \
+    || fail "T15: bare Enter is not treated as yes; gave [$got]"
+
+# 'a' accepts the rest without asking again: one answer covers three prompts.
+got=$(t15_select $'a')
+[[ "$got" == "env_vars,allow_list,reminder,mcp_x" ]] \
+    || fail "T15: 'a' did not accept every remaining action; gave [$got]"
+
+# 'q' means apply nothing — including the userfile_sync entries that are
+# otherwise passed through unasked.
+got=$(t15_select $'q')
+[[ -z "$got" ]] || fail "T15: 'q' did not clear the selection; gave [$got]"
+
+# An unrecognized answer is a decline, matching _upgrade_confirm.
+got=$(t15_select $'wat\nn\nn')
+[[ "$got" == "reminder" ]] \
+    || fail "T15: an unrecognized answer was not treated as 'no'; gave [$got]"
+
+ok "T15: upgrade actions are chosen one at a time, with a/q shortcuts"
+
 echo
 echo "============================================================"
 echo " UPGRADE TEST PASSED"

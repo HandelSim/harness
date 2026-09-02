@@ -2561,6 +2561,40 @@ _upgrade_confirm() {
     esac
 }
 
+# Read one per-action upgrade answer and store the normalized choice in the
+# variable named by $2:
+#   y  apply this action            (also the answer for a bare Enter)
+#   n  skip this action
+#   a  apply this and every action still to be asked about
+#   q  skip this and every action still to be asked about
+# Anything unrecognized is n, matching _upgrade_confirm's "only yes means yes".
+#
+# The answer comes from /dev/tty for the same reason _upgrade_confirm reads it,
+# plus one more: the caller drives its loop from a herestring, which rebinds
+# FD 0. `read -rp` writes the prompt to stderr, so the question is still
+# visible when the caller captures the function's stdout.
+_upgrade_choice() {
+    # Every local is __-prefixed: `printf -v "$2"` assigns in THIS scope, so a
+    # local named the same as the caller's output variable would shadow it and
+    # the caller would read an unset name.
+    local __choice_prompt="$1"
+    local __choice_var="$2"
+    local __choice_ans
+    if [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]]; then
+        IFS= read -rp "$__choice_prompt" __choice_ans || __choice_ans=""
+    else
+        IFS= read -rp "$__choice_prompt" __choice_ans </dev/tty || __choice_ans=""
+    fi
+    __choice_ans=${__choice_ans%$'\r'}
+    case "$__choice_ans" in
+        ""|y|Y|yes|YES) __choice_ans=y ;;
+        a|A|all|ALL)    __choice_ans=a ;;
+        q|Q|none|NONE)  __choice_ans=q ;;
+        *)              __choice_ans=n ;;
+    esac
+    printf -v "$__choice_var" '%s' "$__choice_ans"
+}
+
 # Resolve the upstream tracking ref of the clone's current branch (e.g.
 # "origin/dev"), or empty if the branch has no upstream configured.
 _git_upstream_ref() {
@@ -2670,14 +2704,20 @@ usage:
 flags:
   --check         preview the upgrade actions in dry-run mode without
                   performing 'git pull' or any file modifications.
-  --no-prompt     skip the interactive "apply?" prompt (CI / automation).
+  --no-prompt     skip the interactive per-action prompts (CI / automation).
+                  Config merges still apply; hand-edited prompt-data files
+                  (reminder.md, tool-guidance.json) are always left alone,
+                  since replacing your prose unattended is never safe.
   --no-restart    apply upgrade actions but skip the build/down/start cycle.
   --rebuild       force a clean rebuild (compose build --no-cache). Slower
                   but bypasses any cache-poisoning from earlier failed
                   builds.
 
-Declining the "apply?" prompt skips only the file merges — the upgrade
-still rebuilds images and restarts. Use Ctrl-C to abort entirely.
+Upgrade actions are offered ONE AT A TIME, so you can take the new .env
+variables without taking a reminder rewrite. Enter accepts, 'a' accepts
+every remaining action, 'q' skips them all. Declining skips only the file
+merges — the upgrade still rebuilds images and restarts. Use Ctrl-C to
+abort entirely.
 
 If 'git pull' can't fast-forward because the clone's branch has diverged
 from its upstream (e.g. the remote was rebased), upgrade offers a
@@ -2825,11 +2865,11 @@ EOF
     else
         needed_ids=$(_upgrade_actions_needing_work "$manifest")
 
-        # Declining the prompt skips only the file merges — the rest of the
-        # upgrade still runs. Nothing about applying the manifest gates the
-        # rest of the upgrade, and the git pull has already happened, so a
-        # decline that aborts everything just leaves the user on new code with
-        # stale images. Ctrl-C is the way to bail out entirely.
+        # Declining skips only the file merges — the rest of the upgrade still
+        # runs. Nothing about applying the manifest gates the rest of the
+        # upgrade, and the git pull has already happened, so a decline that
+        # aborts everything just leaves the user on new code with stale
+        # images. Ctrl-C is the way to bail out entirely.
         if [[ -z "$needed_ids" ]]; then
             echo
             echo "Configuration files are up to date — no merges needed."
@@ -2846,10 +2886,18 @@ EOF
             done <<<"$needed_ids"
             echo
             if (( ! no_prompt )); then
-                if [[ -t 0 ]]; then
-                    if ! _upgrade_confirm "Apply these upgrade actions? [y/n] (n skips the merges; the rest of the upgrade continues): "; then
+                # _upg_can_prompt, not `[[ -t 0 ]]`: the prompts read
+                # /dev/tty, so a controlling terminal is what they actually
+                # need. A run with stdin redirected but a terminal attached
+                # used to hard-fail here for no reason.
+                if _upg_can_prompt; then
+                    echo "Asked one at a time. Enter = yes; a = all remaining; q = none."
+                    # Per action, not one aggregate question: the old single
+                    # prompt made the whole manifest all-or-nothing.
+                    needed_ids=$(_upgrade_select_actions "$manifest" "$needed_ids")
+                    if [[ -z "$needed_ids" ]]; then
                         skip_actions=1
-                        echo "harness: skipping upgrade actions; continuing with the rest of the upgrade"
+                        echo "harness: no upgrade actions selected; continuing with the rest of the upgrade"
                     fi
                 else
                     err "non-interactive shell; pass --no-prompt to apply without confirmation"
@@ -3149,6 +3197,61 @@ _upgrade_actions_needing_work() {
     done < <(harness_jq -c '.registry_actions[]?' "$manifest")
 }
 
+# Ask which of the prechecked upgrade actions to apply, ONE AT A TIME, and
+# echo the newline-delimited subset the user accepted (the filter that
+# apply_upgrade_actions then runs).
+#
+# Why per action: the old single "Apply these upgrade actions?" was
+# all-or-nothing, so a user who wanted the new .env variables but not a
+# reminder-prose rewrite had to accept both or neither. `a` and `q` keep the
+# one-keystroke "yes to everything" / "no to everything" paths that prompt
+# was good at.
+#
+# userfile_sync entries are deliberately NOT asked about here. They carry
+# their own, better question: upgrade_userfile_sync names both file paths and
+# how many lines differ, and states that the user's copy is kept at .bak.
+# Asking a generic question here too would prompt twice for the same file. So
+# they pass through and the action itself asks. `q` still drops them, because
+# it means "apply nothing" — it clears the whole selection rather than
+# stopping mid-list.
+_upgrade_select_actions() {
+    local manifest="$1"
+    local candidates="$2"
+    local types id type all=0
+    local ans=""
+    local -a chosen=()
+
+    # One jq call for every id->type pair rather than one per action: on a
+    # jq-less host each harness_jq call is a docker round-trip.
+    types=$(_upg_strip_cr "$(harness_jq -r \
+        '(.actions[]?, .registry_actions[]?) | "\(.id)\t\(.type)"' "$manifest")")
+
+    # FD 3 for the candidate list: _upgrade_choice reads FD 0 under
+    # HARNESS_CONFIRM_FROM_STDIN, and a `<<<` on FD 0 here would feed it the
+    # next action id as the user's answer.
+    while IFS= read -r id <&3; do
+        id=${id%$'\r'}
+        [[ -n "$id" ]] || continue
+        type=$(awk -F'\t' -v want="$id" '$1 == want { print $2; exit }' <<<"$types")
+        if [[ "$type" == "userfile_sync" ]] || (( all )); then
+            chosen+=("$id")
+            continue
+        fi
+        _upgrade_choice "  apply $id? [Y/n/a=all/q=none] " ans
+        case "$ans" in
+            y) chosen+=("$id") ;;
+            a) all=1; chosen+=("$id") ;;
+            q) chosen=(); break ;;
+            *) ;;
+        esac
+    done 3<<<"$candidates"
+
+    if (( ${#chosen[@]} > 0 )); then
+        printf '%s\n' "${chosen[@]}"
+    fi
+    return 0
+}
+
 # Iterate the manifest's actions and registry_actions, dispatch to the
 # right upgrade_* function in scripts/lib/upgrade_actions.sh, accumulate
 # JSON results, and print a final summary.
@@ -3168,8 +3271,17 @@ apply_upgrade_actions() {
     local results="[]"
     local failed=0
 
+    # Both loops below read the manifest on FD 3, not FD 0. `done < <(...)`
+    # would rebind FD 0 to the pipe for the whole loop body, which leaves any
+    # action that wants to ask the user a question reading from the manifest
+    # stream instead of the terminal — and made `[[ -t 0 ]]` false inside
+    # every action even on a fully interactive upgrade. Keeping FD 0 alone
+    # also makes HARNESS_CONFIRM_FROM_STDIN behave here the way it does
+    # everywhere else, so a test that scripts an answer exercises the real
+    # code path rather than a shape the production loop never has.
+
     # 1. Unconditional actions.
-    while IFS= read -r action_json; do
+    while IFS= read -r action_json <&3; do
         action_json=${action_json%$'\r'}
         local id type src_rel src target_rel target result rc fields acc
         # One jq call pulls all four manifest fields as a TSV row instead
@@ -3218,10 +3330,10 @@ apply_upgrade_actions() {
            acc=$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results" 2>/dev/null); then
             results=$(_upg_strip_cr "$acc")
         fi
-    done < <(harness_jq -c '.actions[]?' "$manifest")
+    done 3< <(harness_jq -c '.actions[]?' "$manifest")
 
     # 2. Registry actions (gated on `condition`).
-    while IFS= read -r action_json; do
+    while IFS= read -r action_json <&3; do
         action_json=${action_json%$'\r'}
         local id type src_rel src target_rel target cond result rc fields acc
         # One jq call for all five scalar manifest fields (see the
@@ -3273,7 +3385,7 @@ apply_upgrade_actions() {
            acc=$(harness_jq --argjson r "$result" --arg id "$id" '. + [($r + {id: $id})]' <<<"$results" 2>/dev/null); then
             results=$(_upg_strip_cr "$acc")
         fi
-    done < <(harness_jq -c '.registry_actions[]?' "$manifest")
+    done 3< <(harness_jq -c '.registry_actions[]?' "$manifest")
 
     # 3. Forward-compat: warn if the manifest declares a newer schema
     # version than this runner knows how to handle. We only reach this

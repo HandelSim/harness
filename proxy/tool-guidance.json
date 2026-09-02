@@ -44,7 +44,7 @@
     "tests to fail until you update them too."
   ],
   "schema_version": 1,
-  "legend": "Tools — one entry per tool, all info for a tool in one place (signature, guidance, and any closed-set argument values). Full schemas are at <<<BEGIN_AGENT_TOOLS>>>. Signature format: name(required, [optional]); bracketed = optional; names not listed are unavailable; parameter names must match exactly (e.g. `filename` fails where `filePath` is required).",
+  "legend": "Tools — one entry per tool, all info for a tool in one place (signature, guidance, and any closed-set argument values). Signature format: name(required, [optional]); bracketed = optional; names not listed are unavailable; parameter names must match exactly (e.g. `filename` fails where `filePath` is required).",
   "state_check_note": " A tool marked [state-check] mutates state — before calling it, call the server's read-only state/orientation tool first to see current state; don't mutate blind.",
   "tool_search_note": " You can also call tool_list() to list every tool, or tool_search({\"query\": \"...\"}) to fetch a tool's full signature and description on demand.",
   "detail_tools": [

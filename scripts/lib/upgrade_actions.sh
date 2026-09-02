@@ -51,6 +51,27 @@ if ! declare -F _upgrade_confirm >/dev/null 2>&1; then
     }
 fi
 
+# Can an action ask the user a question right now?
+#
+# NOT `[[ -t 0 ]]`. apply_upgrade_actions drives its action loop with
+# `done < <(harness_jq ...)`, and that redirect rebinds FD 0 to a pipe for the
+# whole loop body — so `-t 0` is FALSE inside every action even on a fully
+# interactive `harness upgrade`. userfile_sync gated its prompt on `-t 0` and
+# therefore never once asked in production: it took the "nothing to confirm on"
+# path every time and silently kept the user's file. The test suite missed it
+# because HARNESS_CONFIRM_FROM_STDIN=1 short-circuits that same condition.
+#
+# _upgrade_confirm reads /dev/tty, so /dev/tty being *openable* is the real
+# capability to test. It is a property of the process (its controlling
+# terminal), not of FD 0, so a redirected loop does not affect it, and a
+# session with no controlling terminal (CI, cron, a detached shell) fails the
+# open and correctly reports that it cannot prompt.
+_upg_can_prompt() {
+    # The test hook feeds answers on FD 0 instead of /dev/tty.
+    [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" == "1" ]] && return 0
+    ( : </dev/tty ) 2>/dev/null
+}
+
 # Define harness_jq as a fallback for standalone use (e.g. upgrade_test.sh
 # sources us directly without the full harness script). When sourced from
 # the harness script, harness_jq is already defined and we don't override.
@@ -674,7 +695,7 @@ upgrade_userfile_sync() {
         return 0
     fi
 
-    if (( ! allow_prompt )) || { [[ ! -t 0 ]] && [[ "${HARNESS_CONFIRM_FROM_STDIN:-0}" != "1" ]]; }; then
+    if (( ! allow_prompt )) || ! _upg_can_prompt; then
         _upg_log "userfile_sync: $name differs from the shipped default${delta_note}; keeping yours (nothing to confirm on)"
         _upg_log "userfile_sync: re-run 'harness upgrade' interactively to review it"
         printf '{"action":"userfile_sync","files_updated":[],"target":%s,"skipped":true,"reason":"not_prompted"}\n' \

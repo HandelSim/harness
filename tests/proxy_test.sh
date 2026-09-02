@@ -381,9 +381,12 @@ if 'do not invent' not in last_content:
 if 'Tools — one entry per tool' not in last_content:
     print('REMINDER_MISSING_TOOLS_LEGEND')
     sys.exit(0)
-# The reminder points the model back at the AGENT_TOOLS block by name.
-if '<<<BEGIN_AGENT_TOOLS>>>' not in last_content:
-    print('REMINDER_MISSING_AGENT_TOOLS_POINTER')
+# The reminder must NOT point at the AGENT_TOOLS block: that block sits on
+# the head message, which an upstream that truncates oldest-first drops first,
+# so the pointer goes dead exactly when it would matter. The reminder's own
+# per-tool entries are the live copy.
+if '<<<BEGIN_AGENT_TOOLS>>>' in last_content:
+    print('REMINDER_STILL_POINTS_AT_AGENT_TOOLS')
     sys.exit(0)
 # The probe (live user request) is wrapped in USER_REQUEST markers and placed
 # FIRST under hybrid; the reminder sits AFTER the wrap.
@@ -425,7 +428,7 @@ case "${KEY_CHECK}" in
     *NO_REMINDER_PREFIX*)          fail "C: hybrid last user message is missing the [Reminder …] prefix" "${FORWARDED_BODY}" ;;
     *REMINDER_MISSING_DO_NOT_INVENT*) fail "C: hybrid reminder is missing the 'do not invent' rule" "${FORWARDED_BODY}" ;;
     *REMINDER_MISSING_TOOLS_LEGEND*) fail "C: hybrid reminder is missing the 'Tools — one entry per tool' legend" "${FORWARDED_BODY}" ;;
-    *REMINDER_MISSING_AGENT_TOOLS_POINTER*) fail "C: hybrid reminder does not point back at <<<BEGIN_AGENT_TOOLS>>>" "${FORWARDED_BODY}" ;;
+    *REMINDER_STILL_POINTS_AT_AGENT_TOOLS*) fail "C: hybrid reminder still names <<<BEGIN_AGENT_TOOLS>>> (dead pointer once the head is truncated)" "${FORWARDED_BODY}" ;;
     *NO_USER_REQUEST_WRAP*)        fail "C: hybrid probe is not wrapped in <<<BEGIN_USER_REQUEST>>> markers" "${FORWARDED_BODY}" ;;
     *REMINDER_NOT_AFTER_USER_REQUEST*) fail "C: hybrid reminder should sit AFTER the USER_REQUEST wrap (live ask comes first)" "${FORWARDED_BODY}" ;;
     *FULL_INSTRUCTIONS_ON_LAST_USER*) fail "C: full tool instructions leaked onto the last user message (should be in head)" "${FORWARDED_BODY}" ;;

@@ -109,7 +109,7 @@ validator in `_setup_prompt_mode` accepts:
   on the last user message, organised so the **live user request comes FIRST**
   (wrapped in `<<<BEGIN_USER_REQUEST>>>` markers — issue #110), then a short
   reminder follows. The reminder's WORDING lives in editable files, not
-  in proxy.py — see "Editable reminder data" below. It has eight labelled
+  in proxy.py — see "Editable reminder data" below. It has nine labelled
   bullets. The labels are imperatives rather than category headings, so each
   one reads as an instruction: an earlier three-bullet form
   (Operating/Honesty/Environment) merged them, and the split back apart was
@@ -117,9 +117,11 @@ validator in `_setup_prompt_mode` accepts:
   **Amnesia** (the premise the rest rests on: history is silently truncated
   mid-task, so nothing above this block can be trusted and the standing rules
   are re-sent every turn. Carries two recovery rules — the todo list is the
-  model's memory, and if no AGENTS.md content is visible in the conversation
-  it was injected on the first turn and has since been dropped, so `read` it
-  again),
+  model's memory, and a per-turn check that the TEXT of AGENTS.md is still
+  visible — it is injected on the first turn and dropped like everything
+  else, and a checked-off "read AGENTS.md" todo item is explicitly not
+  evidence that it is still there, because the one-time wording produced
+  exactly that: one read at the top of the first list and never again),
   **Act, don't describe** (positive assertion that the model acts through
   opencode and its ```json calls really execute with results that are real —
   named target for the ~20% reversion to the upstream's "I can't execute,
@@ -128,18 +130,25 @@ validator in `_setup_prompt_mode` accepts:
   directory or local filesystem state must come from a tool result — see
   [Working-directory echo](#working-directory-echo) for why — then
   prefer-a-listed-tool guidance with `webfetch` over curl as the worked
-  example, the pointer back to `<<<BEGIN_AGENT_TOOLS>>>` for full
-  descriptions, and the legitimate fallback when nothing fits),
+  example, the claim that the listed set is complete for this turn, and the
+  legitimate fallback when nothing fits),
   **Call format** (the JSON envelope: one complete fenced block, the
   `{"name", "arguments"}` body shape, backslash escaping, and the
   no-fabricated-results rule),
-  **Todo list** (keep one always and keep it detailed, exactly one item
+  **Todo list** (keep one always and keep it detailed, plan through to
+  VERIFIED rather than to edited — build/run/test steps belong in the list at
+  creation time and are run by the model, not handed back — exactly one item
   `in_progress`, flip to `completed` immediately, add steps as discovered —
   followed by `{{TODOS}}`, the model's own list replayed back to it, see
   [Todo replay](#todo-replay)),
   **Delegate** (launch `task` agents in parallel when independent, capped at
   8 concurrent, each briefed in full since a sub-agent does not share the
   parent's context),
+  **Smallest change** (the diff a human has to review is the constraint:
+  change only what the request requires, no drive-by refactors or
+  reformatting or speculative abstraction, prefer editing over adding and
+  deleting over building, and raise anything else rather than fixing it
+  unasked),
   **Honesty** (anti-fabrication: no invented names/paths/signatures/
   citations), and
   **Environment** (`{{ENVIRONMENT}}`, whose body depends on run mode — see
@@ -248,15 +257,19 @@ turn (placed at the FRONT of the recency block, before the reminder), and
   rules. Tool-result-converted-to-user turns skip this wrap (the TOOL_RESULT
   markers already delimit the live content).
 
-The reminder's (`build_cooperative_prompt_hybrid_reminder`) "Use the tools"
-bullet points at `<<<BEGIN_AGENT_TOOLS>>>` for **full tool descriptions
-only**, so that when attention to `messages[0]` dilutes on long conversations
-the model still has a named target to retrieve. It deliberately does NOT claim
-that section is where to find parameter-*value* constraints (a `task`'s
-agent types, a `skill`'s names): those reach recency INLINED under each
-tool's own entry — see "Per-tool entries" below. This is additive — the bullet
-prose is ~800 tokens/turn, plus the replayed todo list; hybrid's
-lighter-than-user_front recency profile is preserved.
+The reminder (`build_cooperative_prompt_hybrid_reminder`) deliberately does
+NOT point at `<<<BEGIN_AGENT_TOOLS>>>`. That block lives in the
+`system_addition` on `messages[0]` — the OLDEST message, and so the first
+thing an upstream that truncates oldest-first drops — while the reminder is
+re-appended to the LAST user message every turn. The pointer therefore went
+dead exactly on the long conversations it was meant to help. The "Use the
+tools" bullet instead states that the listed set is complete for this turn,
+which is true of the reminder's own per-tool entries regardless of what
+survived above. Parameter-*value* constraints (a `task`'s agent types, a
+`skill`'s names) reach recency INLINED under each tool's own entry — see
+"Per-tool entries" below. The bullet prose is ~800 tokens/turn, plus the
+replayed todo list; hybrid's lighter-than-user_front recency profile is
+preserved.
 
 ### Editable reminder data (`reminder.md`, `tool-guidance.json`)
 
@@ -391,9 +404,10 @@ assert on load-bearing phrases: `proxy/test_proxy.py`
 (`TestHybridConsolidatedRecency`, against both shipped defaults, plus
 `TestToolGuidanceFile` for the loader contract), `tests/proxy_test.sh`
 (`Tools — one entry per tool`), and `tests/scheme_contract_test.sh`
-(`Reminder`, `do not invent`, and `<<<BEGIN_AGENT_TOOLS>>>` from
-`reminder.md`, plus `Tools — one entry per tool` — which now comes from
-`tool-guidance.json`'s `legend`, so rewording the legend breaks it too).
+(`Reminder` and `do not invent` from `reminder.md`, plus an assertion that
+the reminder does NOT name `<<<BEGIN_AGENT_TOOLS>>>`, and `Tools — one entry
+per tool` — which now comes from `tool-guidance.json`'s `legend`, so rewording
+the legend breaks it too).
 Rewording those phrases out is what makes them fail.
 
 **Staying current with the shipped defaults.** The seeders never overwrite an

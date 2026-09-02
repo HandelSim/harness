@@ -690,7 +690,7 @@ def _tool_guidance_path() -> str:
 _HYBRID_LEGEND_FALLBACK = (
     "Tools — signature format: name(required, [optional]); bracketed = "
     "optional; names not listed are unavailable; parameter names must match "
-    "exactly. Full schemas are at <<<BEGIN_AGENT_TOOLS>>>."
+    "exactly."
 )
 _HYBRID_STATE_CHECK_NOTE_FALLBACK = (
     " A tool marked [state-check] mutates state — orient with the server's "
@@ -1560,6 +1560,7 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
        - Call format: ...
        - Todo list: ...            (+ the replayed {{TODOS}} block)
        - Delegate: ...
+       - Smallest change: ...
        - Honesty: ...
        - Environment: ...
 
