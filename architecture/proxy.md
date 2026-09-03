@@ -109,59 +109,54 @@ validator in `_setup_prompt_mode` accepts:
   on the last user message, organised so the **live user request comes FIRST**
   (wrapped in `<<<BEGIN_USER_REQUEST>>>` markers — issue #110), then a short
   reminder follows. The reminder's WORDING lives in editable files, not
-  in proxy.py — see "Editable reminder data" below. It has nine labelled
-  bullets. The labels are imperatives rather than category headings, so each
-  one reads as an instruction: an earlier three-bullet form
-  (Operating/Honesty/Environment) merged them, and the split back apart was
-  driven by the amnesia framing needing its own opener.
-  **Amnesia** (the premise the rest rests on: history is silently truncated
-  mid-task, so nothing above this block can be trusted and the standing rules
-  are re-sent every turn. Carries two recovery rules — the todo list is the
-  model's memory, and a per-turn check that the TEXT of AGENTS.md is still
-  visible — it is injected on the first turn and dropped like everything
-  else, and a checked-off "read AGENTS.md" todo item is explicitly not
-  evidence that it is still there, because the one-time wording produced
-  exactly that: one read at the top of the first list and never again),
-  **Act, don't describe** (positive assertion that the model acts through
-  opencode and its ```json calls really execute with results that are real —
-  named target for the ~20% reversion to the upstream's "I can't execute,
-  here are commands for you to run" persona, issue #109. The assertion alone
-  did not hold, so the bullet also names the observable moment of the slip —
-  a numbered how-to, a plain non-json fence of shell commands, "you can run",
-  a request for permission to do a step the task already covers — and gives
-  the rewrite: emit that exact command as the tool call that performs it. A
-  rule the model cannot catch itself breaking does not fire),
+  in proxy.py — see "Editable reminder data" below. It has eight labelled
+  bullets, deliberately terse: the block is re-sent every turn, and a long
+  one dilutes the rule that matters most (the model ending its turn with
+  advice instead of a tool call), so each bullet is trimmed to the clauses
+  that name a failure and its fix. The labels are imperatives rather than
+  category headings, so each one reads as an instruction.
+  **Act, don't describe** leads — primacy for the failure the block exists to
+  stop: the model reverting to the upstream's "I can't execute, here are
+  commands for you to run" persona (issue #109). The positive assertion (it
+  acts through opencode; its ```json calls really execute and the results are
+  real) did not hold on its own, so the bullet names the observable moment of
+  the slip — a how-to, a plain non-json fence of shell commands, "you can
+  run", announcing "I'll go do X" with no call beside it, a request for
+  permission to do a step the task already covers — and gives the rewrite:
+  emit that exact command as the tool call that performs it, in the same
+  message. A rule the model cannot catch itself breaking does not fire. It
+  ends with the legitimate no-tool-fits fallback, qualified in place because
+  it is otherwise the nearest available excuse for handing the work back.
+  **Amnesia** (the premise for re-sending the rules at all: history is
+  silently truncated mid-task, so nothing above this block can be trusted.
+  Carries the per-turn check that the TEXT of AGENTS.md is still visible — a
+  checked-off "read AGENTS.md" todo item is explicitly not evidence, because
+  the earlier one-time wording produced exactly that: one read at the top of
+  the first list and never again),
+  **Todo list** (for anything past a trivial step the first call is
+  `todowrite`, planned through to VERIFIED rather than to edited —
+  build/run/test steps belong in the list and are run by the model, not
+  handed back — exactly one item `in_progress`; followed by `{{TODOS}}`, the
+  model's own list replayed back to it, see [Todo replay](#todo-replay)),
   **Use the tools** (issue #110's rule that any claim about the working
   directory or local filesystem state must come from a tool result — see
-  [Working-directory echo](#working-directory-echo) for why — then
-  prefer-a-listed-tool guidance with `webfetch` over curl as the worked
-  example, the claim that the listed set is complete for this turn, and the
-  legitimate fallback when nothing fits — qualified as being for a question
-  no tool can settle, since it is otherwise the nearest available excuse for
-  handing the work back as instructions),
+  [Working-directory echo](#working-directory-echo) — then prefer-a-listed-
+  tool guidance, the claim that the listed set is all that exists this turn,
+  and the delegation clause: `task` agents for independent legs, capped at 8
+  concurrent, each briefed in full since a sub-agent does not share the
+  parent's context. Delegation had its own **Delegate** label before the
+  block was condensed),
   **Call format** (the JSON envelope: one complete fenced block, the
   `{"name", "arguments"}` body shape, backslash escaping, and the
   no-fabricated-results rule),
-  **Todo list** (keep one always and keep it detailed, plan through to
-  VERIFIED rather than to edited — build/run/test steps belong in the list at
-  creation time and are run by the model, not handed back — exactly one item
-  `in_progress`, flip to `completed` immediately, add steps as discovered —
-  followed by `{{TODOS}}`, the model's own list replayed back to it, see
-  [Todo replay](#todo-replay)),
-  **Delegate** (launch `task` agents in parallel when independent, capped at
-  8 concurrent, each briefed in full since a sub-agent does not share the
-  parent's context),
   **Smallest change** (the diff a human has to review is the constraint:
   change only what the request requires, no drive-by refactors or
-  reformatting or speculative abstraction, prefer editing over adding and
-  deleting over building, and raise anything else rather than fixing it
-  unasked),
+  reformatting, and raise anything else rather than fixing it unasked),
   **Honesty** (anti-fabrication: no invented names/paths/signatures/
   citations), and
   **Environment** (`{{ENVIRONMENT}}`, whose body depends on run mode — see
   [Run-mode environment clause](#run-mode-environment-clause) — followed by
   the live host CWD echoed inline so "this folder" / "here" resolve to the
-  real path, see [Working-directory echo](#working-directory-echo)). Below the
   bullets is **one entry per tool** — signature, one-line guidance from
   `_HYBRID_TOOL_GUIDANCE`, and (for "detail tools") the verbatim closed-set
   argument values inlined under the same entry. This is the

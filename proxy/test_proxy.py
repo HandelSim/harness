@@ -832,12 +832,13 @@ class TestPromptInjectionModes(unittest.TestCase):
         )
 
     def test_mode_hybrid_reminder_advises_concurrent_task_agents(self):
-        """The Delegate bullet tells the model to launch task agents, several
-        concurrently when possible, to parallelize and conserve context."""
+        """Delegation rides in the "Use the tools" bullet (it lost its own
+        label when the reminder was condensed): task agents, several at a
+        time, to conserve context."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        self.assertIn("Launch `task` agents", last_user)
-        self.assertIn("concurrently", last_user)
+        self.assertIn("`task` agents", last_user)
+        self.assertIn("concurrent", last_user)
         self.assertIn("conserve your context", last_user)
 
     def test_mode_hybrid_reminder_demands_the_smallest_diff(self):
@@ -894,8 +895,9 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("- Act, don't describe:", last_user)
         self.assertIn("really execute", last_user)
         self.assertIn("results you get back are real", last_user)
-        # Don't downgrade to handing the user commands.
-        self.assertIn("downgrade to listing commands", last_user)
+        # Announcing the work without the call in the same message is the
+        # second reported failure mode, named in place.
+        self.assertIn("with no call beside it", last_user)
         # The legitimate fallback (when no tool fits) stays available.
         self.assertIn("just ask or answer", last_user)
 
@@ -980,15 +982,16 @@ class TestPromptInjectionModes(unittest.TestCase):
         self.assertIn("below", block)
 
     def test_mode_hybrid_reminder_bullet_order(self):
-        """Amnesia leads: it is the premise the rest of the reminder rests on
-        (the model cannot trust anything above this block, so the standing
-        rules are re-sent here). Environment is last — it is context, not an
-        instruction. Todo list precedes Delegate so the plan is written before
-        work is fanned out."""
+        """"Act, don't describe" leads and the end-of-turn check closes: the
+        reported failure is the model ending a turn with advice, so it gets
+        both the primacy and the recency slot. Amnesia follows as the premise
+        for re-sending the rules at all, then the todo list (written before
+        work is fanned out), then the mechanical bullets. Environment is
+        last — it is context, not an instruction."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         c = result[-1]["content"]
-        order = ["- Amnesia:", "- Act, don't describe:", "- Use the tools:",
-                 "- Call format:", "- Todo list:", "- Delegate:",
+        order = ["- Act, don't describe:", "- Amnesia:", "- Todo list:",
+                 "- Use the tools:", "- Call format:",
                  "- Smallest change:", "- Honesty:", "- Environment:"]
         positions = [c.index(label) for label in order]
         self.assertEqual(positions, sorted(positions))
@@ -1663,10 +1666,13 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         The pre-merge Agency/Tools/Workflow labels stay gone."""
         c = self._translate()[-1]["content"]
         for label in ("- Amnesia:", "- Act, don't describe:", "- Use the tools:",
-                      "- Call format:", "- Todo list:", "- Delegate:",
+                      "- Call format:", "- Todo list:",
                       "- Smallest change:", "- Honesty:", "- Environment:"):
             self.assertIn(label, c)
-        for gone in ("- Agency:", "- Tools:", "- Workflow:", "- Operating:"):
+        # "- Delegate:" lost its own label when the reminder was condensed;
+        # its content moved into "- Use the tools:".
+        for gone in ("- Agency:", "- Tools:", "- Workflow:", "- Operating:",
+                     "- Delegate:"):
             self.assertNotIn(gone, c)
 
     def test_load_bearing_content_survives_the_bullet_split(self):
@@ -1679,38 +1685,37 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         def bullet(label, next_label):
             return c[c.index(label):c.index(next_label)]
 
-        agency = bullet("- Act, don't describe:", "- Use the tools:")
+        agency = bullet("- Act, don't describe:", "- Amnesia:")
         # Agency: tools really execute, results are real, don't hand back
         # commands, opencode named as the disambiguator from the upstream's
         # own phantom tooling.
         self.assertIn("really execute", agency)
         self.assertIn("results you get back are real", agency)
-        self.assertIn("downgrade to listing commands", agency)
+        self.assertIn("with no call beside it", agency)
         self.assertIn("opencode", agency)
+        # The legitimate fallback when nothing fits, qualified in place.
+        self.assertIn("just ask or answer", agency)
 
         tools = bullet("- Use the tools:", "- Call format:")
-        # Tool-preference guidance + the completeness claim that replaced the
-        # AGENT_TOOLS pointer + the legitimate fallback when nothing fits.
+        # Tool-preference guidance, the completeness claim that replaced the
+        # AGENT_TOOLS pointer, and the delegation clause.
         self.assertIn("Prefer a listed tool", tools)
         self.assertIn("webfetch", tools)
-        self.assertIn("complete for this turn", tools)
-        self.assertIn("just ask or answer", tools)
+        self.assertIn("all that exist this turn", tools)
+        self.assertIn("`task` agents", tools)
+        self.assertIn("concurrent", tools)
 
-        fmt = bullet("- Call format:", "- Todo list:")
+        fmt = bullet("- Call format:", "- Smallest change:")
         # The JSON envelope: body shape, complete-block requirement (issue
         # #121), backslash escaping, and no-fabricated-results.
         self.assertIn('"name": "<tool>"', fmt)
         self.assertIn('"arguments": {...}', fmt)
         self.assertIn("COMPLETE ```json", fmt)
-        self.assertIn("JSON-escaped", fmt)
+        self.assertIn("JSON-escape", fmt)
         self.assertIn("do not invent", fmt)
 
-        todo = bullet("- Todo list:", "- Delegate:")
+        todo = bullet("- Todo list:", "- Use the tools:")
         self.assertIn("todowrite", todo)
-
-        delegate = bullet("- Delegate:", "- Honesty:")
-        self.assertIn("Launch `task` agents", delegate)
-        self.assertIn("concurrently", delegate)
 
     def test_per_tool_entry_format_with_guidance(self):
         """Tools in `_HYBRID_TOOL_GUIDANCE` get one entry: signature + ` — `
