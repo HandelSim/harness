@@ -184,7 +184,16 @@ validator in `_setup_prompt_mode` accepts:
   that makes the text-only [empty-response
   rescue](#empty-response-detection) unable to continue the loop). The
   finished-work branch is kept on purpose: without it the rule would demand a
-  reflex tool call after the final report. Hybrid additionally delimits four
+  reflex tool call after the final report. The closer then restates the rules
+  it guards in a blunt imperative voice (read AGENTS.md now; do the work with
+  your tools instead of handing back instructions; verify rather than assume)
+  and ends with a worked ```json `bash` call for the model to emit if it
+  doubts its tools work at all. A model that believes it cannot act will still
+  copy a block it has been handed, and `extract_tool_calls_and_text` scans the
+  whole response, so the copy becomes a real call and the loop restarts —
+  provided the model expands the `\n` escapes in the example; a verbatim copy
+  of the backslashes does not parse and stays as text.
+  Hybrid additionally delimits four
   content categories so each is addressable by name and the model can't
   conflate them with the upstream gateway's own system prompt/tools — again
   see [Hybrid delimiters](#hybrid-delimiters) below.

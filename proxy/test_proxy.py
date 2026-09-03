@@ -948,7 +948,18 @@ class TestPromptInjectionModes(unittest.TestCase):
         # After the tool entries, and last in the block.
         self.assertLess(last_user.index("Tools — one entry per tool"),
                         last_user.index(closer))
-        self.assertTrue(last_user.rstrip().endswith("Make it now.]"),
+        # The closer runs to the very end of the reminder. It repeats the two
+        # rules in the model's own imperative voice, because the calm version
+        # further up was being read and not obeyed, and it ends with a worked
+        # example of the call to emit when the model doubts its tools work at
+        # all — a model that believes it cannot act will copy a block it has
+        # been handed verbatim, and the extractor turns that copy into a real
+        # `bash` call.
+        self.assertIn("Immediately read AGENTS.md", last_user)
+        self.assertIn("Do not give me instructions, do it yourself with your tools",
+                      last_user)
+        self.assertIn("do not assume anything", last_user)
+        self.assertTrue(last_user.rstrip().endswith(r'```\n\n"]'),
                         last_user[-200:])
 
     def test_mode_hybrid_reminder_agency_names_opencode(self):
