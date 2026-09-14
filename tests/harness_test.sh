@@ -1926,18 +1926,18 @@ echo "[harness-test] T27 OK"
 #
 # `harness start/restart --prompt-mode <mode>` is the ephemeral replacement
 # for the removed PROXY_PROMPT_MODE .env knob. It must (a) validate the mode
-# in _parse_prompt_mode_flag, and (b) inject PROXY_PROMPT_MODE onto the proxy
+# in _parse_start_flags, and (b) inject PROXY_PROMPT_MODE onto the proxy
 # service via write_runtime_override — folded into a single proxy: block when
 # the proxy also has a firewall opt-out.
 echo "[harness-test] T26pm: --prompt-mode flag (#91)"
 
-# Case 1: _parse_prompt_mode_flag accepts both forms and rejects bad input.
+# Case 1: _parse_start_flags accepts both forms and rejects bad input.
 t26pm_parse=$(
     HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
-    _parse_prompt_mode_flag --prompt-mode passthrough
+    _parse_start_flags --prompt-mode passthrough
     echo "space=${prompt_mode_override}"
     prompt_mode_override=""
-    _parse_prompt_mode_flag --prompt-mode=user_front
+    _parse_start_flags --prompt-mode=user_front
     echo "equals=${prompt_mode_override}"
 )
 if ! grep -q 'space=passthrough' <<<"${t26pm_parse}"; then
@@ -1951,13 +1951,13 @@ fi
 # Invalid mode and unknown option must both abort non-zero.
 t26pm_bad_rc=0
 ( HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
-  _parse_prompt_mode_flag --prompt-mode bogus ) >/dev/null 2>&1 || t26pm_bad_rc=$?
+  _parse_start_flags --prompt-mode bogus ) >/dev/null 2>&1 || t26pm_bad_rc=$?
 if (( t26pm_bad_rc == 0 )); then
     echo "[harness-test] T26pm FAIL: invalid --prompt-mode value was accepted" >&2; exit 1
 fi
 t26pm_unknown_rc=0
 ( HARNESS_SOURCE_ONLY=1 source "${HARNESS_BIN}" >/dev/null 2>&1
-  _parse_prompt_mode_flag --frobnicate ) >/dev/null 2>&1 || t26pm_unknown_rc=$?
+  _parse_start_flags --frobnicate ) >/dev/null 2>&1 || t26pm_unknown_rc=$?
 if (( t26pm_unknown_rc == 0 )); then
     echo "[harness-test] T26pm FAIL: unknown start/restart option was accepted" >&2; exit 1
 fi

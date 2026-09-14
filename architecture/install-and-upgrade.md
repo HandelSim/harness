@@ -392,7 +392,8 @@ The contract between this repo and a user's install root. Since the
 install root IS the clone, "managed files" means files harness writes
 inside the clone that aren't tracked git content: `.env`,
 `.harness-allowlist`, the user's prompt data (`reminder.md`,
-`tool-guidance.json`), and per-MCP state under `state/mcp/<name>/`.
+`reminder-require-tool.md`, `tool-guidance.json`), and per-MCP state under
+`state/mcp/<name>/`.
 
 Every `B3-MANAGED:` comment in the codebase has a matching manifest
 entry. The comments anchor in:
@@ -439,8 +440,9 @@ into don't get auto-installed.
 
 ### `userfile_sync`
 
-Used for the two files whose contents are the user's own prose:
-`<install-root>/reminder.md` and `<install-root>/tool-guidance.json`
+Used for the three files whose contents are the user's own prose:
+`<install-root>/reminder.md`, `<install-root>/reminder-require-tool.md` and
+`<install-root>/tool-guidance.json`
 (see `architecture/proxy.md` → "Editable reminder data"). Seeding
 deliberately never overwrites an existing copy, which would otherwise
 strand an install on whatever default it was first seeded with; this

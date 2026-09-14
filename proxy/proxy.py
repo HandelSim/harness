@@ -492,6 +492,20 @@ _META_TOOL_NAMES = ("tool_search", "tool_list")
 # calls before giving up the loop (a runaway model that only ever searches).
 _META_TOOL_SERVE_BUDGET = 3
 
+# Require-tool mode (default OFF: `harness start/restart/host --require-tool`
+# sets HARNESS_REQUIRE_TOOL=1). When on, EVERY assistant message must carry a
+# tool call, and the only way to end a turn is a call to the synthetic `finish`
+# tool the proxy serves itself — a text-only message is rejected in-proxy and
+# the model is asked again, so it can no longer end a run by handing back advice.
+# `finish`'s `summary` becomes the assistant text opencode shows the user, so
+# the final report still arrives; it just has to be a deliberate act.
+# See architecture/proxy.md "Require-tool mode".
+_REQUIRE_TOOL_ENABLED: bool = False
+_FINISH_TOOL_NAME = "finish"
+# Max corrective upstream round-trips spent asking for a tool call before the
+# proxy gives up and forwards the text anyway. Never hangs the turn.
+_REQUIRE_TOOL_SERVE_BUDGET = 3
+
 # The confirmed upstream silently drops the `system` role, so its content
 # must always be converted into a user message at the start of the
 # conversation, with a stub assistant message between to satisfy strict
@@ -614,7 +628,14 @@ def _user_data_path(basename: str) -> str:
 
 
 # Loaded once at startup like the recency map: the file is fixed for a launch.
+# Require-tool mode reads a SEPARATE file. The two are near-copies, and the
+# duplication is deliberate: the normal file's closer ("a turn ends with a tool
+# call or with your final report") is a false statement under require-tool,
+# where a report with no call is rejected. A token inside one file would have
+# left the untouched copies of every existing install asserting the wrong rule.
 def _reminder_template_path() -> str:
+    if _REQUIRE_TOOL_ENABLED:
+        return _user_data_path("reminder-require-tool.md")
     return _user_data_path("reminder.md")
 
 # Substituted into the template per turn. Deliberately `{{NAME}}` + str.replace
@@ -1024,6 +1045,61 @@ _HYBRID_DETAIL_TOOLS = _tg_values["detail_tools"]
 _HYBRID_TOOL_GUIDANCE = _tg_values["tools"]
 del _tg_values, _tg_warnings
 
+# The synthetic `finish` tool require-tool mode advertises. Injected into the
+# per-request tools array before the prompt is built, so it flows through
+# `format_tools_to_text` (full schema at the stable prefix) and
+# `_extract_tool_signatures` (one recency entry) exactly like a real tool —
+# no second rendering path to keep in sync. opencode never sees it: the proxy
+# consumes the call and turns the `summary` into the assistant's text.
+_FINISH_TOOL_SCHEMA: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": _FINISH_TOOL_NAME,
+        "description": (
+            "End your turn and hand the work back. This is the ONLY way to "
+            "end a turn: every message you send must contain a tool call, so "
+            "when you have nothing left to run, you call this instead of "
+            "replying with plain text. The text you pass as `summary` is "
+            "exactly what the user reads, and it is the last thing that "
+            "happens in the run — nothing you plan to do after it will "
+            "happen. Call it when the task is complete AND you have verified "
+            "it with tool output you actually read, or when you genuinely "
+            "cannot continue without an answer only the user has (put the "
+            "question in `summary`). Do not call it to report progress, to "
+            "describe what you are about to do, or to hand back instructions "
+            "for the user to run — run them yourself instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "The final message the user reads: what you did, what "
+                        "you verified and how, and anything still outstanding. "
+                        "Or, if you are stopping to ask, the question itself."
+                    ),
+                },
+            },
+            "required": ["summary"],
+        },
+    },
+}
+
+# Recency one-liners for tools the PROXY invents. Consulted as the last
+# fallback in `_format_tool_entries`, after the user-editable
+# tool-guidance.json and the MCP recency map — deliberately a code constant so
+# that turning the feature on does not require every existing install to
+# re-accept a changed tool-guidance.json on its next `harness upgrade`. A user
+# who wants different wording can still add the key to their own copy of the
+# file and it wins.
+_SYNTHETIC_TOOL_GUIDANCE: Dict[str, str] = {
+    _FINISH_TOOL_NAME: (
+        "the only way to end your turn; `summary` is what the user reads. "
+        "Only when the work is done and verified, or you must ask"
+    ),
+}
+
 
 def _setup_tool_search() -> None:
     """Read HARNESS_TOOL_SEARCH into the module global. Truthy values
@@ -1036,6 +1112,35 @@ def _setup_tool_search() -> None:
     _TOOL_SEARCH_ENABLED = raw in ("1", "true", "yes", "on")
     print(
         f"[i] cooperative tool-search: {'on' if _TOOL_SEARCH_ENABLED else 'off'}",
+        flush=True,
+    )
+
+
+def _setup_require_tool() -> None:
+    """Read HARNESS_REQUIRE_TOOL into the module global. Same truthy set as
+    `_setup_tool_search` (1/true/yes/on, case-insensitive); anything else —
+    the default — leaves the prompt, the tool array and the dispatch path
+    byte-for-byte unchanged from before the feature existed.
+
+    Forced off in passthrough mode: passthrough is the benchmark control that
+    forwards the agent's own `tools` array upstream and injects nothing, so a
+    synthetic tool the proxy invented (and a correction loop that quotes the
+    cooperative call format) would be exactly the mediation that mode exists
+    to remove. `_setup_prompt_mode` runs first in `main`, so the check is
+    against a settled value."""
+    global _REQUIRE_TOOL_ENABLED
+    raw = os.environ.get("HARNESS_REQUIRE_TOOL", "").strip().lower()
+    _REQUIRE_TOOL_ENABLED = raw in ("1", "true", "yes", "on")
+    if _REQUIRE_TOOL_ENABLED and _PROMPT_MODE == "passthrough":
+        _REQUIRE_TOOL_ENABLED = False
+        print(
+            "[!] require-tool is incompatible with prompt mode 'passthrough' "
+            "(which forwards tools upstream unmediated); leaving it off",
+            flush=True,
+        )
+        return
+    print(
+        f"[i] require-tool: {'on' if _REQUIRE_TOOL_ENABLED else 'off'}",
         flush=True,
     )
 
@@ -1242,6 +1347,14 @@ Call them with the same ```json envelope as any tool. Use them when you are unsu
 """
 
 
+_REQUIRE_TOOL_PROMPT_BLOCK = """
+<<<BEGIN_REQUIRE_TOOL>>>
+This session runs in require-tool mode, which overrides the sentence above about answering normally when no tool is needed. Here, EVERY message you send must contain at least one ```json tool call, in the body of the message. A message with no tool call is rejected by the proxy, is never delivered to the user, and comes straight back to you — it is a wasted turn, not an ending.
+The only way to end your turn is the `finish` tool. Calling it stops the run and shows the user whatever you passed as `summary`; nothing you planned to do after it will happen. Call it when the work is complete and you have verified it with tool output you read, or when you cannot continue without an answer only the user has. To keep working, just call the tool that does the next piece of work.
+<<<END_REQUIRE_TOOL>>>
+"""
+
+
 def build_cooperative_prompt_system_addition(tools_text):
     """Returns the cooperative-prompt scaffolding to APPEND to the system
     message in modes 'system' and 'hybrid'. Static across all turns; safe
@@ -1250,9 +1363,15 @@ def build_cooperative_prompt_system_addition(tools_text):
     When cooperative tool-search is enabled (_TOOL_SEARCH_ENABLED) a small
     <<<BEGIN_META_TOOLS>>> block is appended advertising the proxy-served
     tool_search/tool_list meta-tools; off by default, so the prefix is
-    unchanged for a normal launch.
+    unchanged for a normal launch. Require-tool mode (_REQUIRE_TOOL_ENABLED)
+    appends a <<<BEGIN_REQUIRE_TOOL>>> block the same way, correcting the
+    "if no tools are needed, answer normally" sentence above it.
     """
     meta_block = _META_TOOLS_PROMPT_BLOCK if _TOOL_SEARCH_ENABLED else ""
+    # Appended last so it is the final word on how a turn may end; the
+    # instructions above explicitly permit a plain answer, which require-tool
+    # mode does not.
+    require_block = _REQUIRE_TOOL_PROMPT_BLOCK if _REQUIRE_TOOL_ENABLED else ""
     return f"""
 
 ### Tool Usage Instructions
@@ -1270,7 +1389,7 @@ The following are the only tools available for use in this conversation. Any oth
 
 {tools_text}
 <<<END_AGENT_TOOLS>>>
-{meta_block}"""
+{meta_block}{require_block}"""
 
 
 def _format_tool_signature(name, required, optional):
@@ -1487,7 +1606,11 @@ def _format_tool_entries(tool_signatures, tool_details=None):
         signature = _format_tool_signature(name, req, opt)
         # opencode's own tools are keyed in the code map; MCP tools (`<server>_
         # <tool>`) load from each enabled MCP's recency.json into _MCP_TOOL_RECENCY.
-        guidance = _HYBRID_TOOL_GUIDANCE.get(name) or _MCP_TOOL_RECENCY.get(name)
+        guidance = (
+            _HYBRID_TOOL_GUIDANCE.get(name)
+            or _MCP_TOOL_RECENCY.get(name)
+            or _SYNTHETIC_TOOL_GUIDANCE.get(name)
+        )
         head = f"- {signature}"
         if name in _MCP_STATE_CHECK_TOOLS:
             # Marks a state-mutating tool; the legend below tells the model to
@@ -2834,6 +2957,290 @@ def _serve_meta_tools(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Require-tool mode (default off; HARNESS_REQUIRE_TOOL=1)
+# ---------------------------------------------------------------------------
+#
+# The problem: opencode ends a run the moment the model returns a message with
+# no tool call, so a model that decides to hand back advice instead of doing
+# the work silently kills the task, and its advice is the last word. The
+# reminder has argued against that for several revisions; require-tool mode
+# stops arguing and makes it mechanically impossible.
+#
+# When on, the proxy advertises one extra synthetic tool, `finish`, and rejects
+# any assistant message that carries no tool call — appending
+# `[assistant(<rejected text>), user(<correction>)]` and re-POSTing, the same
+# in-proxy correction shape the malformed-tool-call retry and the meta-tool
+# serve loop already use. opencode never sees the rejected message. `finish` is
+# consumed here too: its `summary` argument becomes the assistant text, so the
+# model's final report still reaches the user, but only as a deliberate act.
+#
+# Deliberately fail-open everywhere: an exhausted budget, a failed upstream
+# call, or a request the feature can't apply to falls through to exactly the
+# behaviour of a launch without the flag. A stuck turn would be worse than the
+# problem being solved.
+
+# The correction the model gets when its message carried no tool call. A code
+# constant rather than a third user-editable data file, following
+# `_RETRY_CORRECTION_MESSAGES`: it is not prose the operator tunes, it is the
+# mechanical contract — the moment its description of the call format drifts
+# from what `extract_tool_calls_and_text` actually parses, it stops working.
+# Shown when `finish` carried no usable summary at all. The turn still has to
+# say something: opencode renders an empty assistant message as nothing, which
+# looks to the user exactly like the silent stop this mode prevents.
+_REQUIRE_TOOL_EMPTY_FINISH_TEXT = (
+    "(the agent ended its turn with `finish` but wrote no summary)"
+)
+
+_REQUIRE_TOOL_CORRECTION = """[harness — your last message was REJECTED and was NOT delivered. The user never saw it, and nothing you described in it happened.
+
+Why: this session runs in require-tool mode. EVERY message you send must contain at least one tool call. Yours contained none, so it was discarded and you are being asked again.
+
+How a tool call is made: write a COMPLETE fenced ```json block INSIDE THE BODY of this message, exactly like this:
+
+```json
+{"name": "bash", "arguments": {"command": "ls", "description": "list files"}}
+```
+
+That block IS the tool call. There is no separate `tool_calls` field or channel to put it in — the proxy reads the ```json block out of your message text, and a call you only describe in prose did not happen. Use the ```json fence, not a bare ``` fence and not another language tag. Prose around the block is fine; the block has to be there. One complete block per call, and you may emit several.
+
+How to end your turn: you end a turn by calling the `finish` tool, and that is the ONLY way to end it.
+
+```json
+{"name": "finish", "arguments": {"summary": "<the final message you want the user to read>"}}
+```
+
+Whatever you pass as `summary` is what the user sees, and it is the last thing that happens in this run — anything you were planning to do afterwards will not happen. So call `finish` only when the work is genuinely complete AND you have verified it with tool output you actually read, or when you truly cannot continue without an answer only the user has.
+
+Right now, pick one:
+1. The work is NOT finished — emit the next real tool call (read, edit, bash, grep, task, ...) in this message and keep going. This is almost always the right choice.
+2. You were about to hand the user commands or steps to run — run them yourself instead, as a `bash` call, in this message.
+3. You need information only the user has — call `finish` with your question as the `summary`.
+4. The work IS finished and verified — call `finish` with your final report as the `summary`.
+
+Send your response again now, with the tool call in it.]"""
+
+# Appended on the second and later attempts. Repeating the identical correction
+# verbatim is what teaches a model that the channel is noise; naming the count
+# is what makes it read the rule again.
+_REQUIRE_TOOL_ESCALATION = """
+
+[This is attempt {attempt} of {budget}. Your previous message still contained no ```json tool call. Emit one now — literally a line beginning with ```json, then the JSON object, then a closing ``` line. If you have nothing left to run, that call is `finish`.]"""
+
+# Sent when the model calls `finish` while its own todo list still has open
+# items. Bounced ONCE, then let through: an open item is strong evidence the
+# run is ending early (the exact complaint this mode exists for), but it is not
+# proof — stopping to ask a question is legitimate, and so is a list the model
+# has decided it no longer needs. So this is a prompt with a stated way past
+# it, never a wall.
+_REQUIRE_TOOL_FINISH_TODOS_CORRECTION = """[harness — your `finish` call was held back and the user has not seen it. Nothing has ended yet.
+
+Your own todo list still has {open_count} item(s) that are not completed. The next one is:
+
+  {next_item}
+
+Finishing now ends the run permanently with that work undone, and it is exactly the early exit this session is configured to catch. So, before anything else, answer honestly: is that item actually done, or were you about to hand it back?
+
+- If it is NOT done — do it now. Emit the next real tool call in this message. Do not call `finish`.
+- If the list is stale (the item is done, or no longer needed) — call `todowrite` in this message to bring the list up to date, and finish on the turn after.
+- If you are genuinely blocked, or stopping to ask the user a question — call `finish` again with the same or a better `summary`, and it will go through this time. Say in the `summary` what is left and why you stopped.
+
+Remember: every message needs a tool call, including this one.]"""
+
+
+def _require_tool_active(tools: Optional[List[Dict[str, Any]]]) -> bool:
+    """Whether require-tool enforcement applies to THIS request.
+
+    Three yields on top of the global flag, each one a case where enforcing
+    would be wrong rather than merely strict:
+
+    * No inbound tools. `format_tools_to_text([])` is truthy ("No tools
+      available."), so a tool-less auxiliary call — title generation,
+      summarisation — otherwise gets `finish` advertised as its only tool and
+      burns the whole correction budget before answering in prose. A request
+      with no tools has no turn to continue; let it answer.
+    * `finish` is already a real tool this turn. Same safety yield as
+      `_is_meta_tool_call`: the real tool wins, is forwarded untouched, and
+      the proxy must not consume its calls.
+    * Passthrough mode, which `_setup_require_tool` already refuses at
+      startup; re-checked here because `_PROMPT_MODE` is patched per-test.
+    """
+    if not _REQUIRE_TOOL_ENABLED or _PROMPT_MODE == "passthrough":
+        return False
+    if not tools:
+        return False
+    return _FINISH_TOOL_NAME not in _collect_tool_names(tools)
+
+
+def _augment_tools_with_finish(
+    tools: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """The tools array as the MODEL sees it: the inbound array plus `finish`.
+    Everything prompt-facing (schemas at the stable prefix, the recency
+    entries, the extraction allow-list) is built from this; the inbound array
+    stays untouched for everything opencode-facing."""
+    return list(tools or []) + [_FINISH_TOOL_SCHEMA]
+
+
+def _pop_finish_call(
+    payloads: List[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split parsed payloads into `(first finish call, everything else)`.
+
+    Real tool calls win: a turn that emits work AND `finish` is a model
+    hedging, and the work is the part worth keeping — the caller drops the
+    `finish` and lets the run continue, which is the safe direction (the model
+    can always finish next turn; it cannot un-end a run)."""
+    finish: Optional[Dict[str, Any]] = None
+    rest: List[Dict[str, Any]] = []
+    for p in payloads:
+        if (
+            finish is None
+            and isinstance(p, dict)
+            and p.get("name") == _FINISH_TOOL_NAME
+        ):
+            finish = p
+            continue
+        rest.append(p)
+    return finish, rest
+
+
+# Argument keys accepted as the final report, in order. `summary` is what the
+# schema asks for; the rest are the shapes models reach for anyway, and the
+# cost of not accepting them is the user losing the final message entirely.
+_FINISH_SUMMARY_KEYS = ("summary", "message", "text", "content", "result")
+
+
+def _finish_summary_text(payload: Dict[str, Any]) -> str:
+    """The user-visible text carried by a `finish` call. Tolerant by design:
+    `extract_tool_calls_and_text` guarantees an `arguments` key but not its
+    type, so a bare string (`"arguments": "all done"`) is taken as the summary
+    and a dict is searched for any of the accepted keys."""
+    args = payload.get("arguments")
+    if isinstance(args, str):
+        return args.strip()
+    if isinstance(args, dict):
+        for key in _FINISH_SUMMARY_KEYS:
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return ""
+
+
+def _open_todo_items(messages: List[Dict[str, Any]]) -> List[str]:
+    """Contents of the model's own todo items that are not `completed`, from
+    the same replay `{{TODOS}}` uses. Empty when there is no list — a model
+    that never wrote one is not evidence of anything."""
+    todos = _extract_latest_todos(messages)
+    if not isinstance(todos, list):
+        return []
+    open_items = []
+    for item in todos:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status", "")).strip().lower() == "completed":
+            continue
+        content = str(item.get("content", "")).strip()
+        open_items.append(content or "(unnamed item)")
+    return open_items
+
+
+def _serve_require_tool_correction(
+    req_id: str,
+    original_messages: List[Dict[str, Any]],
+    prompt_tools: List[Dict[str, Any]],
+    prompt_tools_text: str,
+    upstream_model: str,
+    headers: Dict[str, str],
+    assistant_text: str,
+    correction: str,
+    budget: int,
+) -> Optional[Tuple[Dict[str, Any], str, List[Dict[str, Any]], str]]:
+    """Reject a message and ask for one with a tool call, up to `budget`
+    rounds. Each round appends `[assistant(<rejected>), user(<correction>)]`
+    and re-POSTs; the loop stops at the first response carrying a usable tool
+    call.
+
+    "Usable" is deliberately stricter than "non-empty": meta-tool calls are
+    stripped first (they are never forwarded to opencode, so a model that
+    answers "call a tool" with `tool_search` has not satisfied anything), and a
+    round whose text diagnoses as a botched tool-call attempt counts as a
+    failure rather than passing malformed output through. Without both filters
+    the loop terminates on output the rest of `catch_all` would have caught.
+
+    Returns `(target_json, response_text, payloads, clean_text)` for the first
+    satisfying round, or `None` when the budget runs out or an upstream call
+    fails — the caller then forwards the original response unchanged, so the
+    worst case is today's behaviour plus some latency, never a hung turn."""
+    real_names = _collect_tool_names(prompt_tools)
+    convo = list(original_messages)
+    text = assistant_text
+    for attempt in range(1, budget + 1):
+        message = correction
+        if attempt > 1:
+            message += _REQUIRE_TOOL_ESCALATION.format(
+                attempt=attempt, budget=budget
+            )
+        convo = convo + [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": message},
+        ]
+        translated = translate_history_and_apply_prompt(
+            convo, prompt_tools_text, tools=prompt_tools
+        )
+        payload: Dict[str, Any] = {
+            "model": upstream_model,
+            "messages": translated,
+        }
+        save_debug_file(
+            req_id, "02", f"API_RequireTool_Request_{attempt:02d}", payload
+        )
+        try:
+            resp = _upstream_post(headers, payload)
+        except requests.RequestException as e:
+            print(f"[{req_id}] require-tool upstream request failed: {e}", flush=True)
+            save_debug_file(
+                req_id, "03", f"API_RequireTool_Error_{attempt:02d}",
+                {"error": str(e)},
+            )
+            return None
+        if resp.status_code >= 400:
+            try:
+                err_body: Any = resp.json()
+            except Exception:
+                err_body = resp.text
+            print(
+                f"[{req_id}] require-tool upstream returned "
+                f"{resp.status_code}: {err_body}",
+                flush=True,
+            )
+            save_debug_file(
+                req_id, "03", f"API_RequireTool_Error_{attempt:02d}",
+                {"status": resp.status_code, "body": err_body},
+            )
+            return None
+        try:
+            target_json = resp.json()
+        except ValueError as e:
+            print(f"[{req_id}] require-tool upstream returned non-JSON: {e}", flush=True)
+            save_debug_file(
+                req_id, "03", f"API_RequireTool_Error_{attempt:02d}",
+                {"error": "non-json", "body": resp.text},
+            )
+            return None
+        save_debug_file(
+            req_id, "03", f"API_RequireTool_Response_{attempt:02d}", target_json
+        )
+        text = extract_assistant_content(target_json)
+        payloads, clean = extract_tool_calls_and_text(
+            text, available_tool_names=real_names
+        )
+        payloads = [p for p in payloads if not _is_meta_tool_call(p, real_names)]
+        if payloads and _diagnose_failed_tool_call(text) is None:
+            return target_json, text, payloads, clean
+    return None
+
+
 def _select_rescue_tool(
     available_tool_names: Iterable[str],
 ) -> Optional[Dict[str, Any]]:
@@ -2954,8 +3361,16 @@ def catch_all(path: str) -> Response:
 
         print(f"[{req_id}] {request.method} /{path} model={model_name} messages={len(original_messages)} tools={len(tools)}", flush=True)
 
-        tools_text = format_tools_to_text(tools)
-        translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=tools)
+        # Require-tool mode shows the model one extra tool, `finish`, and
+        # everything prompt-facing is built from the augmented array so the
+        # synthetic tool flows through the normal schema + recency rendering.
+        # `tools` itself stays the inbound array: it is what opencode can
+        # actually run, and what every opencode-facing decision is made from.
+        require_tool = _require_tool_active(tools)
+        prompt_tools = _augment_tools_with_finish(tools) if require_tool else tools
+
+        tools_text = format_tools_to_text(prompt_tools)
+        translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=prompt_tools)
 
         # Catalog-size instrumentation (council gate-trigger). `tools` ≈ recency
         # line count (one entry per tool); `schema_tokens` is what the full
@@ -3026,7 +3441,7 @@ def catch_all(path: str) -> Response:
         # (see its docstring; issue #118).
         tool_call_payloads, clean_text = extract_tool_calls_and_text(
             response_text,
-            available_tool_names=_collect_tool_names(tools),
+            available_tool_names=_collect_tool_names(prompt_tools),
         )
 
         # In-proxy retry for malformed tool-call attempts (issue #121).
@@ -3044,13 +3459,15 @@ def catch_all(path: str) -> Response:
         # retry fails or produces ANOTHER malformed attempt, the original
         # bad response falls through to the bleed/empty-rescue path
         # below — the retry is strictly additive.
+        retry_rounds_used = 0
+        served_meta = False
         if not tool_call_payloads:
             kind = _diagnose_failed_tool_call(response_text)
             if kind is not None:
                 retry_result = _retry_upstream_with_correction(
                     req_id,
                     original_messages,
-                    tools,
+                    prompt_tools,
                     tools_text,
                     upstream_model,
                     headers,
@@ -3074,6 +3491,7 @@ def catch_all(path: str) -> Response:
                         recovered = False
                 else:
                     recovered = False
+                retry_rounds_used = 1
                 print(
                     f"[{req_id}] in-proxy retry for malformed tool call "
                     f"(kind={kind}); attempt=1, "
@@ -3089,15 +3507,16 @@ def catch_all(path: str) -> Response:
         # it is dropped, and a turn that mixed meta + real calls keeps only the
         # real ones. See architecture/proxy.md "Cooperative tool-search".
         if _TOOL_SEARCH_ENABLED and tool_call_payloads:
-            real_names = _collect_tool_names(tools)
+            real_names = _collect_tool_names(prompt_tools)
             meta_payloads = [
                 p for p in tool_call_payloads if _is_meta_tool_call(p, real_names)
             ]
             if meta_payloads and len(meta_payloads) == len(tool_call_payloads):
                 served = _serve_meta_tools(
-                    req_id, original_messages, tools, tools_text,
+                    req_id, original_messages, prompt_tools, tools_text,
                     upstream_model, headers, response_text, meta_payloads,
                 )
+                served_meta = True
                 if served is not None:
                     target_json, response_text, tool_call_payloads, clean_text = served
                     print(
@@ -3116,6 +3535,111 @@ def catch_all(path: str) -> Response:
                 tool_call_payloads = [
                     p for p in tool_call_payloads if p not in meta_payloads
                 ]
+
+        # Require-tool enforcement (default off; HARNESS_REQUIRE_TOOL=1).
+        # Two jobs, in order.
+        #
+        # (a) A message with no tool call is rejected in-proxy and the model is
+        # asked again, so opencode never sees the turn that would have ended
+        # the run. Bounded three ways so a turn can never hang: the per-request
+        # budget below, a fail-open `None` from the loop, and the fact that an
+        # exhausted budget forwards the original response exactly as a launch
+        # without the flag would have. The budget is shared with the other two
+        # in-proxy loops — the malformed-tool-call retry spends one round of
+        # it, and a request that already ran the meta-tool serve loop spends
+        # all of it — because the failure the user feels is a turn that stalls
+        # for minutes, and three independent budgets multiply into that.
+        #
+        # (b) `finish` is consumed here rather than forwarded: opencode has no
+        # such tool. Its `summary` becomes the assistant text, and the turn
+        # goes out with no tool calls, which is the one path to `finish_reason:
+        # stop` this mode leaves open.
+        finished = False
+        if require_tool:
+            budget = 0 if served_meta else max(
+                0, _REQUIRE_TOOL_SERVE_BUDGET - retry_rounds_used
+            )
+            if not tool_call_payloads and clean_text.strip():
+                if budget:
+                    served = _serve_require_tool_correction(
+                        req_id, original_messages, prompt_tools, tools_text,
+                        upstream_model, headers, response_text,
+                        _REQUIRE_TOOL_CORRECTION, budget,
+                    )
+                else:
+                    served = None
+                if served is not None:
+                    target_json, response_text, tool_call_payloads, clean_text = served
+                    print(
+                        f"[{req_id}] require-tool: rejected a tool-less "
+                        f"message; recovered "
+                        f"(tool_calls={len(tool_call_payloads)})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[{req_id}] require-tool: could not obtain a tool "
+                        f"call (budget={budget}); forwarding the message "
+                        f"unchanged",
+                        flush=True,
+                    )
+
+            finish_payload, tool_call_payloads = _pop_finish_call(
+                tool_call_payloads
+            )
+            if finish_payload is not None and tool_call_payloads:
+                # Hedged turn: real work plus a stop button. Keep the work.
+                print(
+                    f"[{req_id}] require-tool: dropped a `finish` call that "
+                    f"came alongside {len(tool_call_payloads)} real call(s)",
+                    flush=True,
+                )
+                finish_payload = None
+
+            # The early-exit check this mode exists for. A `finish` while the
+            # model's own todo list still has open items is bounced ONCE, with
+            # the open item named; a model that is genuinely blocked or asking
+            # a question calls `finish` again and it goes through. Skipped
+            # entirely when there is no list or every item is complete, so a
+            # normal finish costs nothing.
+            if finish_payload is not None:
+                open_items = _open_todo_items(original_messages)
+                if open_items:
+                    served = _serve_require_tool_correction(
+                        req_id, original_messages, prompt_tools, tools_text,
+                        upstream_model, headers, response_text,
+                        _REQUIRE_TOOL_FINISH_TODOS_CORRECTION.format(
+                            open_count=len(open_items),
+                            next_item=open_items[0],
+                        ),
+                        1,
+                    )
+                    print(
+                        f"[{req_id}] require-tool: bounced `finish` with "
+                        f"{len(open_items)} open todo item(s); "
+                        f"{'model continued' if served is not None else 'kept the finish'}",
+                        flush=True,
+                    )
+                    if served is not None:
+                        target_json, response_text, tool_call_payloads, clean_text = served
+                        finish_payload, tool_call_payloads = _pop_finish_call(
+                            tool_call_payloads
+                        )
+                        if finish_payload is not None and tool_call_payloads:
+                            finish_payload = None
+
+            if finish_payload is not None:
+                summary = _finish_summary_text(finish_payload)
+                if summary:
+                    # Replaces rather than appends: the prose around the call
+                    # is the model's reasoning, the summary is the report it
+                    # wrote for the user, and appending reliably showed the
+                    # same answer twice.
+                    clean_text = summary
+                elif not clean_text.strip():
+                    clean_text = _REQUIRE_TOOL_EMPTY_FINISH_TEXT
+                finished = True
+                print(f"[{req_id}] require-tool: consumed `finish`", flush=True)
 
         # Empty-response rescue (issue #117). Some upstreams silently
         # short-circuit before generation — well-formed JSON, finish_reason
@@ -3138,7 +3662,7 @@ def catch_all(path: str) -> Response:
         # minimal assistant text ("Understood.") so the response isn't empty
         # — that still unsticks the upstream on the user's next prompt, just
         # without the auto-continuation (the stall the user saw in #117).
-        if not clean_text.strip() and not tool_call_payloads:
+        if not clean_text.strip() and not tool_call_payloads and not finished:
             finish_reason = _extract_finish_reason(target_json)
             rescue_payload = _select_rescue_tool(_collect_tool_names(tools))
             if rescue_payload is not None:
@@ -3306,6 +3830,10 @@ def main() -> None:
     _setup_mcp_tool_recency()
     _setup_state_check_tools()
     _setup_tool_search()
+    # Before _setup_reminder_template: it decides WHICH reminder file is
+    # loaded (require-tool mode reads reminder-require-tool.md), and after
+    # _setup_prompt_mode, which it checks for the passthrough refusal.
+    _setup_require_tool()
     _setup_tool_guidance()
     _setup_reminder_template()
 
@@ -3348,6 +3876,7 @@ def main() -> None:
         f"   mcp recency:    {len(_MCP_TOOL_RECENCY)} tool(s)\n"
         f"   state-check:    {len(_MCP_STATE_CHECK_TOOLS)} tool(s)\n"
         f"   tool-search:    {'on' if _TOOL_SEARCH_ENABLED else 'off'}\n"
+        f"   require-tool:   {'on' if _REQUIRE_TOOL_ENABLED else 'off'}\n"
         f"   host OS:        {_HOST_OS or '(unknown)'}\n"
         f"   reminder:       {_reminder_template_path()}\n"
         f"   tool guidance:  {_tool_guidance_path()}\n"

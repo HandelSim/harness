@@ -228,13 +228,17 @@ compose` invocation. It:
    service learns the host platform. The proxy injects it into the hybrid
    recency reminder's Environment line (see `architecture/proxy.md` →
    Host-OS injection); `docker-compose.yml` defaults it to `unknown` when
-   harness isn't the launcher. `cmd_start` separately seeds the user's two
+   harness isn't the launcher. `cmd_start` separately seeds the user's three
    editable reminder-data files into `<install_root>/` —
    `seed_reminder_file` → `reminder.md` (from the tracked
-   `proxy/reminder.md`) and `seed_tool_guidance_file` → `tool-guidance.json`
-   (from `proxy/tool-guidance.json`), both thin wrappers over
-   `seed_user_data_file`, which also migrates a copy left by either earlier
-   layout. They ride on the `INSTALL_ROOT` export above rather than a
+   `proxy/reminder.md`), `seed_require_tool_reminder_file` →
+   `reminder-require-tool.md`, and `seed_tool_guidance_file` →
+   `tool-guidance.json` (from `proxy/tool-guidance.json`), all thin wrappers
+   over `seed_user_data_file`, which also migrates a copy left by either
+   earlier layout. The require-tool variant is seeded unconditionally, not
+   only under `--require-tool`, because its compose bind-mount is
+   unconditional and a missing mount source makes docker create a directory
+   there. They ride on the `INSTALL_ROOT` export above rather than a
    variable of their own, because they keep their tracked basenames; an edit
    to either takes effect on `harness restart` with no rebuild — see
    `architecture/proxy.md` → "Editable reminder data".
@@ -256,7 +260,7 @@ and never tracked. It carries two things:
    firewall init script short-circuits on that variable. We never replace
    the service's entrypoint or remove its `cap_add`.
 2. **Ephemeral `--prompt-mode`** — `harness start/restart --prompt-mode
-   <mode>` (`_parse_prompt_mode_flag` validates `hybrid`/`user_front`/
+   <mode>` (`_parse_start_flags` validates `hybrid`/`user_front`/
    `passthrough`) sets the `prompt_mode_override` global, which adds
    `environment: PROXY_PROMPT_MODE: "<mode>"` onto the proxy service. This is
    the only path that sets `PROXY_PROMPT_MODE` for the proxy now that
@@ -266,13 +270,23 @@ and never tracked. It carries two things:
    When the proxy *also* has a firewall opt-out (1), the prompt mode is folded
    into that same `proxy:` block rather than emitted as a second mapping
    (duplicate top-level service keys are invalid compose YAML).
+3. **Ephemeral `--require-tool`** — `harness start/restart --require-tool`
+   (parsed by the same `_parse_start_flags`) sets the `require_tool_override`
+   global, which adds `environment: HARNESS_REQUIRE_TOOL: "1"` onto the proxy
+   service, folded into the same single `proxy:` block as (1) and (2). Unlike
+   `--prompt-mode` this one has a persistent twin:
+   `docker-compose.yml` interpolates `HARNESS_REQUIRE_TOOL` from `.env`
+   (default `0`), so the flag is a one-shot override of that key rather than
+   the only path. Persisting matters because `harness upgrade` and the other
+   internal `cmd_start` callers do not carry the flag. See
+   `architecture/proxy.md` → "Require-tool mode".
 
 The `agent` pseudo-service is filtered out: agent containers are launched
 by direct `docker run` from `run_agent` (opencode) / `cmd_shell`,
 not by compose. The agent launch path reads `.harness-net-overrides.json`
 directly.
 
-If all three sources are empty, the file is deleted rather than written empty
+If every source is empty, the file is deleted rather than written empty
 so compose doesn't see a phantom services block.
 
 ## Agent launch path
@@ -458,6 +472,13 @@ What it does, in order:
    REQUIRED proxy vars (`PROXY_API_URL`/`PROXY_API_KEY`/`DEFAULT_MODEL_NAME`,
    read from the already-sourced `.env`), but **no allowlist check** — the
    firewall allowlist only governs container mode.
+   `cmd_host` also takes **`--require-tool`**, consumed by its argument loop
+   and never forwarded (opencode rejects unknown flags). It sets the same
+   `require_tool_override` global container mode uses; `host_proxy_start`
+   passes `HARNESS_REQUIRE_TOOL` in the proxy's environment, normalised
+   through `_require_tool_on` so the value handed to the proxy matches the one
+   the fingerprint hashed and a literal `HARNESS_REQUIRE_TOOL=0` in `.env`
+   counts as off. See `architecture/proxy.md` → "Require-tool mode".
 3. **`host_confirm_gate`** — mandatory on **every** launch (unlike `--net`'s
    per-invocation flag), worded harder: host mode has no egress firewall and
    runs opencode as the full host user (full filesystem incl. `~/.ssh`/`~/.aws`,
@@ -533,7 +554,14 @@ What it does, in order:
    content, stored at `state/host/proxy.fp`); if any of those changed since the
    proxy started, the stale proxy is stopped and restarted rather than reused
    with old config (which on a port change would otherwise strand the readiness
-   probe). Folding the requirements content in matters because the reuse
+   probe). Two things are folded in **conditionally** so an install that uses
+   neither hashes byte-identically to the pre-feature harness (otherwise every
+   existing host user's first launch after upgrading kills a healthy proxy and
+   blames `.env`): the chatgpt backend block, and `requiretool=1` when
+   `_require_tool_on` is true. Folding require-tool in at all is what makes
+   `harness host --require-tool` restart a proxy that is already running —
+   without it the reuse short-circuit returns first and the flag silently does
+   nothing. Folding the requirements content in matters because the reuse
    short-circuit returns *before* `host_proxy_ensure_venv`, so an `upgrade` that
    bumps a proxy dep restarts the running proxy onto the rebuilt venv instead of
    leaving it on stale deps. `host_proxy_wait_ready`

@@ -31,6 +31,12 @@ COPY proxy/test_proxy.py .
 # uses.
 COPY proxy/reminder.md .
 
+# Shipped default for the require-tool reminder variant (loaded in place of
+# reminder.md when HARNESS_REQUIRE_TOOL is on). Same bind-mount deal as the
+# other two: the user's editable copy lives at
+# <install root>/reminder-require-tool.md.
+COPY proxy/reminder-require-tool.md .
+
 # Shipped default for the reminder's per-tool entries (legend, per-tool
 # guidance, detail-tool list). Same deal: docker-compose bind-mounts the user's
 # editable copy (<install root>/tool-guidance.json) over this

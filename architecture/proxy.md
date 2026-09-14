@@ -184,7 +184,10 @@ validator in `_setup_prompt_mode` accepts:
   that makes the text-only [empty-response
   rescue](#empty-response-detection) unable to continue the loop). The
   finished-work branch is kept on purpose: without it the rule would demand a
-  reflex tool call after the final report. The closer then restates the rules
+  reflex tool call after the final report. (Under
+  [require-tool mode](#require-tool-mode-harness_require_tool) that branch is
+  gone — the proxy rejects a text-only turn outright — which is why the mode
+  loads its own reminder file with a different closer.) The closer then restates the rules
   it guards in a blunt imperative voice (read AGENTS.md now; do the work with
   your tools instead of handing back instructions; verify rather than assume)
   and ends with a worked ```json `bash` call for the model to emit if it
@@ -296,7 +299,7 @@ preserved.
 
 ### Editable reminder data (`reminder.md`, `tool-guidance.json`)
 
-The reminder's **wording is data, not code** — all of it. It lives in two
+The reminder's **wording is data, not code** — all of it. It lives in the
 files the user owns, so rewording the standing instructions is an edit +
 `harness restart`, never a code change. This matters because the hybrid
 reminder is the harness's only standing-instruction channel for the opencode
@@ -312,15 +315,20 @@ able to corrupt the other seventeen. Both files follow the same
 tracked-default / seeded-user-copy / bind-mount / per-section-fallback
 contract, described once below.
 
-- **Tracked defaults** — `proxy/reminder.md` and `proxy/tool-guidance.json`.
-  Both `COPY`d into the proxy image at `/app/`, so a container launched
-  without the mounts still has a working reminder.
-- **User copies** — `<install-root>/reminder.md` and
+- **Tracked defaults** — `proxy/reminder.md`,
+  `proxy/reminder-require-tool.md` and `proxy/tool-guidance.json`. All three
+  `COPY`d into the proxy image at `/app/`, so a container launched without the
+  mounts still has a working reminder.
+- **User copies** — `<install-root>/reminder.md`,
+  `<install-root>/reminder-require-tool.md` and
   `<install-root>/tool-guidance.json`, sitting with the rest of the user's
   config (`.env`, `.harness-allowlist`), gitignored and seeded from the
-  tracked defaults by `seed_reminder_file` / `seed_tool_guidance_file` (both
-  thin wrappers over `seed_user_data_file`) on every `harness start` /
-  `harness host` (no-op once the file exists). Gitignoring them is what keeps
+  tracked defaults by `seed_reminder_file` /
+  `seed_require_tool_reminder_file` / `seed_tool_guidance_file` (all thin
+  wrappers over `seed_user_data_file`) on every `harness start` /
+  `harness host` (no-op once the file exists). All three are seeded and
+  mounted unconditionally, whether or not require-tool is on, so flipping the
+  flag needs no re-seed and no compose change. Gitignoring them is what keeps
   an edit from colliding with `harness update`'s `git pull --ff-only` — note
   the ignore rules are **anchored** (`/reminder.md`), or they would also
   ignore the tracked `proxy/` defaults. The copies keep their tracked
@@ -331,7 +339,10 @@ contract, described once below.
   path (edits and all) on the next start, so the migration needs no upgrade
   action.
 - **How the proxy finds them** — `_user_data_path(basename)`, wrapped by
-  `_reminder_template_path()` / `_tool_guidance_path()`: (1)
+  `_reminder_template_path()` / `_tool_guidance_path()`
+  (`_reminder_template_path` picks the basename, returning
+  `reminder-require-tool.md` when
+  [require-tool mode](#require-tool-mode-harness_require_tool) is on): (1)
   `$INSTALL_ROOT/<basename>` if that var is set, else (2) the file next
   to `proxy.py` (resolved off `__file__`, never a hardcoded `proxy/` — the
   image flattens the repo into `/app`). No new variable exists for this:
@@ -357,7 +368,15 @@ contract, described once below.
   patched `_HYBRID_DETAIL_TOOLS`). Fixed for the life of a launch, like the
   recency map. The startup banner prints both resolved paths, the reminder's
   loaded size, and the guidance's tool count.
-- **Tokens** (`reminder.md`) — `{{ENVIRONMENT}}`, `{{TODOS}}`, `{{HOST_OS}}`,
+- **The require-tool variant** — `reminder-require-tool.md` is a near-copy of
+  `reminder.md`: the same bullets, the same five tokens, one extra leading
+  bullet ("every message needs a tool call"), and a rewritten closer, because
+  the shipped one's "a turn ends either with a tool call or with your final
+  report" is a false statement under that mode. It is a **separate file**
+  rather than a `{{CLOSING}}` token in the one file so that either prose can
+  be reworded without touching the other; the cost is a second copy of the
+  seeding, mount, ignore and `userfile_sync` plumbing.
+- **Tokens** (both reminder files) — `{{ENVIRONMENT}}`, `{{TODOS}}`, `{{HOST_OS}}`,
   `{{CWD}}`, `{{TOOL_ENTRIES}}`, substituted in ONE `re.sub` pass over an
   alternation of exactly those five, deliberately not
   `str.format`/`string.Template` and not chained `str.replace` calls. Not
@@ -870,6 +889,115 @@ the same change (that bullet was named **Operating** then; it is
 identifier or partial fence) and names valid JSON `\escape` sequences
 (`\n`, `\x1e`, `\\`) so the bad-escape failure mode is less likely to
 arise in the first place. Retry catches the cases that slip through.
+
+## Require-tool mode (`HARNESS_REQUIRE_TOOL`)
+
+Default off. When on, **every** assistant message must carry a tool call,
+and the only way to end a turn is a call to a synthetic `finish` tool the
+proxy serves itself. Turned on for one launch with `harness start
+--require-tool` / `harness restart --require-tool` / `harness host
+--require-tool`, or persistently with `HARNESS_REQUIRE_TOOL=1` in `.env`.
+
+**The problem it solves.** opencode ends a run the moment the model returns a
+message with no tool call. A model that decides to hand back advice instead of
+doing the work therefore kills the task silently, with its advice as the last
+word — the same property that makes the text-only
+[empty-response rescue](#empty-response-detection) unable to continue the
+loop. The reminder's closer has argued against that for several revisions;
+this mode stops arguing and makes it mechanically impossible.
+
+**What changes on the request path** (`catch_all`):
+
+- `_require_tool_active(tools)` decides per request. On top of the global
+  flag it yields in three cases, each one where enforcing would be wrong
+  rather than merely strict: **no inbound tools** (a title-generation or
+  summarisation call has no turn to continue, and `format_tools_to_text([])`
+  is truthy, so it would otherwise get `finish` as its only tool and burn the
+  budget before answering); a **real `finish` tool** already in the inbound
+  array (same safety yield as `_is_meta_tool_call` — the real tool wins);
+  and **passthrough** mode, which `_setup_require_tool` already refuses at
+  startup, since enforcing would silently stop it being a control.
+- `_augment_tools_with_finish` builds `prompt_tools` = the inbound array plus
+  `_FINISH_TOOL_SCHEMA`. Everything **prompt-facing** is built from that —
+  schemas at the stable prefix, the `{{TOOL_ENTRIES}}` recency block, the
+  extraction allow-list, and both existing in-proxy correction loops. The
+  inbound array stays untouched for everything opencode-facing.
+- `finish`'s one-line recency guidance is `_SYNTHETIC_TOOL_GUIDANCE`, a code
+  constant rather than a `tool-guidance.json` key, so an existing user copy
+  needs no edit and `harness upgrade` raises no diff prompt for it.
+- `build_cooperative_prompt_system_addition` appends a
+  `<<<BEGIN_REQUIRE_TOOL>>>` block, which explicitly overrides the base
+  scaffold's "if NO tools are needed, simply answer the user normally".
+
+**What changes on the response path**, in order, immediately before the
+empty-response rescue:
+
+1. **No tool call + non-empty text** → `_serve_require_tool_correction`
+   appends `[assistant(<rejected text>), user(_REQUIRE_TOOL_CORRECTION)]` and
+   re-POSTs, the same in-proxy shape the malformed-tool-call retry and the
+   meta-tool serve loop use. opencode never sees the rejected message. The
+   correction states that the message was discarded, shows a complete ```json
+   block, says outright that there is **no separate `tool_calls` field or
+   channel** (the proxy reads the block out of the message text), shows the
+   `finish` form, and ends with a numbered four-way choice — keep going, run
+   it yourself as `bash`, `finish` with your question, `finish` with your
+   report. Attempts 2+ append `_REQUIRE_TOOL_ESCALATION` naming the attempt
+   count; repeating an identical correction verbatim is what teaches a model
+   that the channel is noise. A round only counts as recovered if it yields a
+   **non-meta** tool call and its text does not diagnose as a botched
+   tool-call attempt, or the loop would terminate on output the rest of
+   `catch_all` would have caught.
+2. **`finish` alongside real work** → the `finish` is dropped and the work is
+   forwarded. A hedged turn's work is the part worth keeping: the model can
+   always finish next turn, it cannot un-end a run.
+3. **`finish` while the model's own todo list has open items** → bounced
+   **once**, with the open item named, via
+   `_REQUIRE_TOOL_FINISH_TODOS_CORRECTION`. An open item is strong evidence of
+   the early exit this mode exists for, but it is not proof — stopping to ask
+   a question is legitimate, and so is a stale list — so the correction states
+   the way past it (call `finish` again, or `todowrite` the list current) and
+   a second `finish` goes through. The list comes from the same
+   [todo replay](#todo-replay) `{{TODOS}}` uses, so a model that never wrote
+   one costs nothing.
+4. **`finish` accepted** → consumed, never forwarded (opencode has no such
+   tool). `_finish_summary_text` takes its `summary` — tolerating a bare-string
+   `arguments` and the `message`/`text`/`content`/`result` aliases models
+   reach for — and it **replaces** `clean_text` rather than appending, since
+   appending reliably showed the user the same answer twice. An empty summary
+   falls back to a placeholder line, because opencode renders an empty
+   assistant message as nothing, which looks exactly like the silent stop this
+   mode prevents. The turn goes out with no tool calls: the one path to
+   `finish_reason: stop` the mode leaves open.
+
+**Budget.** `_REQUIRE_TOOL_SERVE_BUDGET = 3` correction rounds, **shared**
+with the other two in-proxy loops: the malformed-tool-call retry spends one
+round of it, and a request that already ran the meta-tool serve loop spends
+all of it (`budget = 0 if served_meta else BUDGET - retry_rounds_used`). The
+failure a user actually feels is a turn that stalls for minutes, and three
+independent budgets multiply into that. Worst case is five upstream calls
+(1 original + 1 malformed retry + 2 corrections + 1 todo bounce), or four when
+the meta loop ran.
+
+**Fail-open everywhere.** An exhausted budget, a failed upstream call, or a
+request the mode does not apply to falls through to exactly the behaviour of a
+launch without the flag — the model's text is forwarded unchanged. A stuck
+turn would be worse than the problem being solved.
+
+**Reminder.** The mode loads `reminder-require-tool.md` instead of
+`reminder.md` (`_reminder_template_path` branches on the flag), because the
+shipped closer's "a turn ends either with a tool call or with your final
+report" is a false statement here. See
+[Editable reminder data](#editable-reminder-data-remindermd-tool-guidancejson).
+
+**Observability.** `catch_all` logs one line per event
+(`require-tool: rejected a tool-less message; recovered (tool_calls=N)`,
+`could not obtain a tool call (budget=N)`, `dropped a \`finish\` call that came
+alongside N real call(s)`, `bounced \`finish\` with N open todo item(s)`,
+`consumed \`finish\``), the startup banner carries a `require-tool: on|off`
+line, and the correction rounds dump to
+`<req_id>_02_API_RequireTool_Request_NN.json` /
+`_03_API_RequireTool_Response_NN.json` (or `_Error_NN`), named apart from the
+malformed-retry dumps so the two loops never collide in one directory.
 
 ## Empty-response detection
 

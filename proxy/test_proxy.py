@@ -5191,5 +5191,374 @@ class TestToolGuidanceFile(unittest.TestCase):
         self.assertNotIn("SC.", out)
         self.assertNotIn("TS.", out)
 
+
+class TestRequireToolMode(unittest.TestCase):
+    """Require-tool mode: every assistant message must carry a tool call, and
+    the synthetic `finish` tool is the only way to end a turn.
+
+    The mode exists because opencode ends a run on the first message with no
+    tool call, so a model that hands back advice kills the task silently. The
+    contract these tests pin down is that the enforcement is real but always
+    fail-open: an exhausted budget, a tool-less request, or a real `finish`
+    tool in the inbound array each fall back to exactly the behaviour of a
+    launch without the flag."""
+
+    _BASH_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {"command": {"type": "string"}},
+            },
+        },
+    }
+
+    # -- setup / activation -------------------------------------------------
+
+    def test_setup_require_tool_truthy_values(self):
+        for raw, expected in [
+            ("1", True), ("true", True), ("TRUE", True), ("yes", True),
+            ("on", True), ("0", False), ("false", False), ("", False),
+            ("nope", False),
+        ]:
+            with patch.dict(os.environ, {"HARNESS_REQUIRE_TOOL": raw}), \
+                    patch("sys.stdout", io.StringIO()):
+                proxy._setup_require_tool()
+            self.assertEqual(proxy._REQUIRE_TOOL_ENABLED, expected, raw)
+        proxy._REQUIRE_TOOL_ENABLED = False
+
+    def test_passthrough_mode_forces_require_tool_off(self):
+        """Passthrough is the benchmark control: zero mediation, tools
+        forwarded verbatim. Enforcing here would silently stop being a
+        control, so the flag loses and says so."""
+        buf = io.StringIO()
+        with patch.dict(os.environ, {"HARNESS_REQUIRE_TOOL": "1"}), \
+                patch.object(proxy, "_PROMPT_MODE", "passthrough"), \
+                patch("sys.stdout", buf):
+            proxy._setup_require_tool()
+        self.assertFalse(proxy._REQUIRE_TOOL_ENABLED)
+        self.assertIn("[!]", buf.getvalue())
+        proxy._REQUIRE_TOOL_ENABLED = False
+
+    def test_require_tool_active_yields(self):
+        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", False):
+            self.assertFalse(proxy._require_tool_active([self._BASH_TOOL]))
+        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", True):
+            # A tool-less auxiliary call (title generation, summarisation) has
+            # no turn to continue; enforcing would burn the whole budget before
+            # letting it answer in prose.
+            self.assertFalse(proxy._require_tool_active([]))
+            self.assertFalse(proxy._require_tool_active(None))
+            # A REAL `finish` tool wins: the proxy must not shadow or consume
+            # calls to a tool opencode can actually run.
+            real_finish = {"type": "function", "function": {"name": "finish"}}
+            self.assertFalse(proxy._require_tool_active([real_finish]))
+            with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+                self.assertFalse(proxy._require_tool_active([self._BASH_TOOL]))
+            self.assertTrue(proxy._require_tool_active([self._BASH_TOOL]))
+
+    def test_augment_tools_appends_finish_without_mutating_the_inbound_array(self):
+        inbound = [self._BASH_TOOL]
+        out = proxy._augment_tools_with_finish(inbound)
+        self.assertEqual(len(inbound), 1, "the inbound array must stay untouched")
+        self.assertEqual(
+            [f["function"]["name"] for f in out], ["bash", "finish"])
+
+    # -- parsing helpers ----------------------------------------------------
+
+    def test_pop_finish_call_splits_the_payloads(self):
+        payloads = [
+            {"name": "bash", "arguments": {"command": "ls"}},
+            {"name": "finish", "arguments": {"summary": "done"}},
+            {"name": "finish", "arguments": {"summary": "again"}},
+        ]
+        finish, rest = proxy._pop_finish_call(payloads)
+        self.assertEqual(finish["arguments"]["summary"], "done")
+        self.assertEqual([p["name"] for p in rest], ["bash", "finish"])
+        finish, rest = proxy._pop_finish_call(
+            [{"name": "bash", "arguments": {}}])
+        self.assertIsNone(finish)
+        self.assertEqual(len(rest), 1)
+
+    def test_finish_summary_text_tolerates_the_shapes_models_emit(self):
+        cases = [
+            ({"summary": "  all done  "}, "all done"),
+            ({"message": "via alias"}, "via alias"),
+            ({"text": "via text"}, "via text"),
+            ("a bare string", "a bare string"),
+            ({"summary": "   "}, ""),
+            ({}, ""),
+            (None, ""),
+        ]
+        for args, expected in cases:
+            self.assertEqual(
+                proxy._finish_summary_text({"name": "finish", "arguments": args}),
+                expected, args)
+
+    def test_open_todo_items_reads_the_models_own_list(self):
+        def hist(todos):
+            return [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "function": {
+                        "name": "todowrite",
+                        "arguments": json.dumps({"todos": todos}),
+                    },
+                }],
+            }]
+        self.assertEqual(proxy._open_todo_items([]), [])
+        self.assertEqual(proxy._open_todo_items(hist([
+            {"content": "done thing", "status": "completed"},
+        ])), [])
+        self.assertEqual(proxy._open_todo_items(hist([
+            {"content": "done thing", "status": "completed"},
+            {"content": "run the tests", "status": "in_progress"},
+            {"content": "push", "status": "pending"},
+        ])), ["run the tests", "push"])
+
+    # -- prompt surface -----------------------------------------------------
+
+    def test_the_prompt_block_appears_only_when_the_mode_is_on(self):
+        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", False):
+            off = proxy.build_cooperative_prompt_system_addition("tools text")
+        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", True):
+            on = proxy.build_cooperative_prompt_system_addition("tools text")
+        self.assertNotIn("<<<BEGIN_REQUIRE_TOOL>>>", off)
+        self.assertIn("<<<BEGIN_REQUIRE_TOOL>>>", on)
+        self.assertIn("<<<END_REQUIRE_TOOL>>>", on)
+        # The base scaffold tells the model it may answer without a tool; the
+        # block has to override that explicitly or the two contradict.
+        self.assertIn("finish", on)
+
+    def test_finish_renders_in_the_recency_tool_entries(self):
+        """The model only learns `finish` exists from the reminder's per-tool
+        block, and its guidance is a CODE constant so an existing
+        tool-guidance.json copy needs no edit (and no upgrade prompt)."""
+        out = proxy._format_tool_entries([("finish", ["summary"], [])])
+        self.assertIn("- finish(summary)", out)
+        self.assertIn("only way to end your turn", out)
+
+    def test_the_mode_swaps_in_its_own_reminder_file(self):
+        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", False):
+            self.assertTrue(
+                proxy._reminder_template_path().endswith("reminder.md"))
+            self.assertFalse(
+                proxy._reminder_template_path().endswith(
+                    "reminder-require-tool.md"))
+        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", True):
+            self.assertTrue(
+                proxy._reminder_template_path().endswith(
+                    "reminder-require-tool.md"))
+
+    def test_the_shipped_require_tool_reminder_carries_the_same_tokens(self):
+        """It is a near-copy of reminder.md, so it must substitute the same
+        five tokens — a dropped token degrades to literal `{{...}}` in the
+        prompt rather than erroring, which is exactly the silent failure the
+        loader's warning exists to catch."""
+        here = os.path.dirname(os.path.abspath(proxy.__file__))
+        with open(os.path.join(here, "reminder-require-tool.md"),
+                  encoding="utf-8") as fh:
+            text = fh.read()
+        for token in ("{{ENVIRONMENT}}", "{{TODOS}}", "{{CWD}}",
+                      "{{TOOL_ENTRIES}}"):
+            self.assertIn(token, text)
+        self.assertIn("finish", text)
+
+    # -- end to end ---------------------------------------------------------
+
+    def _post(self, responses, tools=None, messages=None, enabled=True):
+        """Drive catch_all with a queue of upstream responses under the flag.
+        Returns (parsed body, upstream call count)."""
+        request_body = {
+            "model": "GenAI",
+            "messages": messages or [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+        if tools is not None:
+            request_body["tools"] = tools
+        calls = {"count": 0}
+
+        def fake_post(url, headers=None, json=None, **kwargs):
+            calls["count"] += 1
+            try:
+                return responses.pop(0)
+            except IndexError:
+                self.fail("upstream called more times than expected")
+
+        client = proxy.app.test_client()
+        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", enabled), \
+                patch.object(proxy.requests, "post", side_effect=fake_post), \
+                patch.object(proxy, "save_debug_file"), \
+                patch("sys.stdout", io.StringIO()):
+            resp = client.post(
+                "/v1/chat/completions",
+                data=json.dumps(request_body),
+                content_type="application/json",
+            )
+        return json.loads(resp.get_data(as_text=True)), calls["count"]
+
+    @staticmethod
+    def _resp(content):
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return {
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": content},
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+        return FakeResp()
+
+    @staticmethod
+    def _call(name, **args):
+        return ('```json\n'
+                + json.dumps({"name": name, "arguments": args})
+                + '\n```')
+
+    def _msg(self, body):
+        return body["choices"][0]["message"]
+
+    def test_a_tool_less_message_is_rejected_and_re_asked(self):
+        """The whole point: the turn that would have ended the run never
+        reaches opencode, and the model's advice does not become the last
+        word."""
+        body, count = self._post(
+            [self._resp("You should run the tests yourself."),
+             self._resp(self._call("bash", command="pytest"))],
+            tools=[self._BASH_TOOL],
+        )
+        self.assertEqual(count, 2, "must reject and re-POST")
+        self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+        tcs = self._msg(body).get("tool_calls") or []
+        self.assertEqual(len(tcs), 1)
+        self.assertEqual(tcs[0]["function"]["name"], "bash")
+        self.assertNotIn("You should run", self._msg(body).get("content") or "")
+
+    def test_finish_is_consumed_and_its_summary_becomes_the_message(self):
+        body, count = self._post(
+            [self._resp("Wrapping up.\n"
+                        + self._call("finish", summary="All done, tests pass."))],
+            tools=[self._BASH_TOOL],
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+        # Replaces the prose rather than appending to it: appending reliably
+        # showed the user the same answer twice.
+        self.assertEqual(self._msg(body)["content"], "All done, tests pass.")
+        self.assertFalse(self._msg(body).get("tool_calls"))
+
+    def test_finish_is_never_forwarded_to_opencode(self):
+        """opencode has no `finish` tool; forwarding the call would make it
+        error on an unknown tool instead of ending cleanly."""
+        body, _ = self._post(
+            [self._resp(self._call("finish", summary="done"))],
+            tools=[self._BASH_TOOL],
+        )
+        names = [tc["function"]["name"]
+                 for tc in (self._msg(body).get("tool_calls") or [])]
+        self.assertNotIn("finish", names)
+
+    def test_work_wins_over_a_hedged_finish(self):
+        """A model that emits real work AND `finish` in one message is
+        hedging. Keep the work: it can always finish next turn, it cannot
+        un-end a run."""
+        body, count = self._post(
+            [self._resp(self._call("bash", command="ls")
+                        + "\n"
+                        + self._call("finish", summary="and done"))],
+            tools=[self._BASH_TOOL],
+        )
+        self.assertEqual(count, 1)
+        tcs = self._msg(body).get("tool_calls") or []
+        self.assertEqual([tc["function"]["name"] for tc in tcs], ["bash"])
+        self.assertNotEqual(self._msg(body).get("content"), "and done")
+
+    def test_finish_with_open_todos_is_bounced_once(self):
+        history = [
+            {"role": "user", "content": "do the thing"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "1", "type": "function",
+                "function": {
+                    "name": "todowrite",
+                    "arguments": json.dumps({"todos": [
+                        {"content": "write it", "status": "completed"},
+                        {"content": "run the tests", "status": "pending"},
+                    ]}),
+                },
+            }]},
+            {"role": "tool", "tool_call_id": "1", "content": "ok"},
+        ]
+        body, count = self._post(
+            [self._resp(self._call("finish", summary="done enough")),
+             self._resp(self._call("bash", command="pytest"))],
+            tools=[self._BASH_TOOL], messages=history,
+        )
+        self.assertEqual(count, 2, "the premature finish must be re-asked")
+        tcs = self._msg(body).get("tool_calls") or []
+        self.assertEqual([tc["function"]["name"] for tc in tcs], ["bash"])
+
+    def test_a_model_that_insists_on_finishing_gets_through(self):
+        """The todo bounce is a prompt with a stated way past it, never a
+        wall: stopping to ask a question is legitimate, and a stale list is
+        not proof of anything."""
+        history = [
+            {"role": "user", "content": "do the thing"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "1", "type": "function",
+                "function": {
+                    "name": "todowrite",
+                    "arguments": json.dumps({"todos": [
+                        {"content": "run the tests", "status": "pending"},
+                    ]}),
+                },
+            }]},
+            {"role": "tool", "tool_call_id": "1", "content": "ok"},
+        ]
+        body, count = self._post(
+            [self._resp(self._call("finish", summary="blocked: need a password")),
+             self._resp(self._call("finish", summary="blocked: need a password"))],
+            tools=[self._BASH_TOOL], messages=history,
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(self._msg(body)["content"], "blocked: need a password")
+
+    def test_an_exhausted_budget_forwards_the_original_message(self):
+        """Fail-open. A stuck turn would be worse than the problem being
+        solved, so once the budget is spent the model's text goes out exactly
+        as a launch without the flag would have sent it."""
+        responses = [self._resp("nope") for _ in range(4)]
+        body, count = self._post(responses, tools=[self._BASH_TOOL])
+        self.assertEqual(count, 4, "one original + three correction rounds")
+        self.assertEqual(self._msg(body)["content"], "nope")
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+
+    def test_the_flag_off_changes_nothing(self):
+        body, count = self._post(
+            [self._resp("just text")], tools=[self._BASH_TOOL], enabled=False)
+        self.assertEqual(count, 1)
+        self.assertEqual(self._msg(body)["content"], "just text")
+
+    def test_a_tool_less_request_is_answered_in_prose(self):
+        """Title generation and other auxiliary calls arrive with no tools;
+        enforcing there would spend the budget before answering."""
+        body, count = self._post([self._resp("A short title")], tools=None)
+        self.assertEqual(count, 1)
+        self.assertEqual(self._msg(body)["content"], "A short title")
+
+    def test_an_empty_finish_summary_still_says_something(self):
+        """opencode renders an empty assistant message as nothing, which looks
+        to the user exactly like the silent stop this mode prevents."""
+        body, _ = self._post(
+            [self._resp(self._call("finish"))], tools=[self._BASH_TOOL])
+        self.assertTrue((self._msg(body)["content"] or "").strip())
+
+
 if __name__ == "__main__":
     unittest.main()

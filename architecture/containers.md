@@ -32,19 +32,24 @@ there is no ollama hop. See [`proxy.md`](proxy.md) for behavior.
 
 Healthcheck: `curl -fsS http://127.0.0.1:${PROXY_PORT:-8000}/health`.
 
-Three read-only bind mounts carry user-owned data into the image: the egress
+Four read-only bind mounts carry user-owned data into the image: the egress
 allowlist at `/etc/harness/allowlist`, the hybrid recency reminder's prose at
-`/app/reminder.md` (`${INSTALL_ROOT:-./proxy}/reminder.md`), and that
-reminder's per-tool entries at `/app/tool-guidance.json`
-(`${INSTALL_ROOT:-./proxy}/tool-guidance.json`). Neither needs a path variable
-of its own: `INSTALL_ROOT` is already exported by `compose()`, it names a
+`/app/reminder.md` (`${INSTALL_ROOT:-./proxy}/reminder.md`), the variant that
+prose is swapped for under require-tool mode at
+`/app/reminder-require-tool.md`, and that reminder's per-tool entries at
+`/app/tool-guidance.json` (`${INSTALL_ROOT:-./proxy}/tool-guidance.json`).
+None needs a path variable of its own: `INSTALL_ROOT` is already exported by `compose()`, it names a
 *directory*, and the user copies keep their tracked basenames. The Dockerfile
 bakes a copy of each tracked default at its path too, so an unmounted
 container still starts; `harness start` seeds the gitignored user copies to
 `<install root>/`, next to `.env` and `.harness-allowlist`. Because
 they are mounts and not build inputs, rewording the reminder or retuning a
 tool's one-line guidance needs `harness restart`, not a rebuild — see
-[`proxy.md`](proxy.md) → "Editable reminder data".
+[`proxy.md`](proxy.md) → "Editable reminder data". The require-tool mount is
+unconditional, like the other two — the proxy decides which reminder to load
+from `HARNESS_REQUIRE_TOOL` (interpolated from `.env`, default `0`, or set for
+one launch by `harness start --require-tool` through the runtime override), so
+flipping the mode on never needs a compose change.
 
 ## agent containers (`agents/Dockerfile` + `agents/entrypoint.sh`)
 
