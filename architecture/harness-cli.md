@@ -155,9 +155,11 @@ as a subcommand: known ones dispatch; an unknown word errors (so a typo
 like `harness statt` is caught instead of silently launching an agent).
 `harness opencode` remains as an explicit alias for the bare form.
 
-Agent-launch flags (`--yolo`, `--net`, `--mount`, `-p/--print`) are parsed
-inside `run_agent` (opencode) / `cmd_shell` rather than centrally; they
-decide the `docker run` invocation, not compose flags.
+Agent-launch flags (`--yolo`, `--net`, `--mount`, `--require-tool`,
+`-p/--print`) are parsed inside `run_agent` (opencode) / `cmd_shell` rather
+than centrally; they decide the `docker run` invocation, not compose flags.
+`--require-tool` is the exception that proves the rule: it configures the
+proxy, so `run_agent` consumes it and it never reaches the container.
 
 ### Config and setup commands
 
@@ -271,8 +273,10 @@ and never tracked. It carries two things:
    into that same `proxy:` block rather than emitted as a second mapping
    (duplicate top-level service keys are invalid compose YAML).
 3. **Ephemeral `--require-tool`** — `harness start/restart --require-tool`
-   (parsed by the same `_parse_start_flags`) sets the `require_tool_override`
-   global, which adds `environment: HARNESS_REQUIRE_TOOL: "1"` onto the proxy
+   (parsed by the same `_parse_start_flags`), `harness host --require-tool`,
+   and a bare agent launch (`harness --require-tool`, see "Agent launch path")
+   all set the `require_tool_override` global, which adds
+   `environment: HARNESS_REQUIRE_TOOL: "1"` onto the proxy
    service, folded into the same single `proxy:` block as (1) and (2). Unlike
    `--prompt-mode` this one has a persistent twin:
    `docker-compose.yml` interpolates `HARNESS_REQUIRE_TOOL` from `.env`
@@ -294,7 +298,8 @@ so compose doesn't see a phantom services block.
 `run_agent` (opencode) / `cmd_shell` do NOT go through compose.
 They each:
 
-1. Parse agent flags (`--yolo`, `--net`, `--mount`, `-p/--print`).
+1. Parse agent flags (`--yolo`, `--net`, `--mount`, `--require-tool`,
+   `-p/--print`).
 2. Compute mounts: CWD at the same absolute path, plus extras from
    `--mount` and `HARNESS_EXTRA_MOUNTS` (deduped, validated, refused if
    under container infra paths like `/etc`, `/usr`, `/home/harness`).
@@ -312,6 +317,38 @@ collision. The `--print` path sets no container name but now carries the
 same `harness.agent`/`project`/`tool`/`mount` labels (so a running `-p`
 agent counts toward the project total and protects the shared stack — see
 "Last-agent stack teardown"); it was already concurrent.
+
+### `--require-tool` on a bare launch
+
+`--require-tool` configures the **proxy**, not opencode, so `run_agent`'s flag
+loop consumes it into `require_tool_override` and it is never appended to
+`pass_args`. Forwarding it was the bug: opencode aborts on an unknown option,
+so `harness --require-tool` printed an opencode usage error and no agent
+started, while `harness host --require-tool` (a different arg loop) worked.
+
+The override reaches the proxy through the normal path — `ensure_services_up`
+→ `cmd_start` → `write_runtime_override`, which is override (3) above. But
+`ensure_services_up` is a no-op when the proxy is already up (a concurrent
+agent, or a `-p` run that left the stack standing), and the container captured
+`HARNESS_REQUIRE_TOOL` at `up` time, so without help the flag would silently do
+nothing. `_running_proxy_require_tool` reads that value back out of the running
+container and normalises it through `_require_tool_truthy` — the proxy's own
+truthy set (`1|true|yes|on`), so a container from before the feature reports
+`0` — and `ensure_services_up` restarts the proxy on a mismatch.
+
+Same shape as the chatgpt reconciliation under "One proxy, one dialect", with
+the same gate and one deliberate asymmetry:
+
+- The probe runs **only when this launch asks for require-tool**
+  (`_require_tool_on`), and only when this call did not just start the stack
+  itself. An install that never passes the flag and never sets the `.env` key
+  pays no `compose ps` / `docker inspect`.
+- Only the off→on direction is reconciled. A plain launch against a
+  require-tool proxy leaves it alone, which is both what keeps a plain
+  `harness` from restarting the proxy out from under a concurrent
+  `--require-tool` agent, and the same "ephemeral lasts as long as that proxy"
+  rule `--prompt-mode` follows. The escape hatch is `harness restart`, or the
+  last agent exiting (see "Last-agent stack teardown").
 
 ### Interactive TTY resolution (Windows) — issue #82
 

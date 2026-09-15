@@ -1182,6 +1182,40 @@ _running_proxy_fp() {
     printf '%s' "$val"
 }
 
+# True when <value> is one the proxy itself reads as require-tool ON. Kept in
+# one place because three callers have to agree with proxy.py's truthy set, or
+# a user who wrote HARNESS_REQUIRE_TOOL=0 gets restarts for a feature that is
+# not even on. `tr`, not `${v,,}`: macOS still ships bash 3.2.
+_require_tool_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Resolves require-tool for THIS invocation, in both run modes: the one-shot
+# --require-tool flag wins (start/restart, host, and a bare agent launch), else
+# the persistent HARNESS_REQUIRE_TOOL key in .env. Read by ensure_services_up
+# (container) and by host_proxy_fingerprint / host_proxy_start (host).
+_require_tool_on() {
+    _require_tool_truthy "${require_tool_override:-${HARNESS_REQUIRE_TOOL:-}}"
+}
+
+# Echo 1 or 0 for the require-tool state the RUNNING proxy container captured
+# at `up` time — from the runtime override a --require-tool launch wrote, or
+# from the HARNESS_REQUIRE_TOOL key compose interpolates out of .env. Empty
+# output and rc 1 when no proxy is running.
+_running_proxy_require_tool() {
+    local proxy_id val
+    proxy_id=$(compose ps -q proxy 2>/dev/null || true)
+    [[ -n "$proxy_id" ]] || return 1
+    val=$(harness_docker inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' "$proxy_id" 2>/dev/null \
+        | sed -n 's/^HARNESS_REQUIRE_TOOL=//p' | tail -n1)
+    val=${val%$'\r'}
+    if _require_tool_truthy "$val"; then printf '1'; else printf '0'; fi
+}
+
 # True when the chatgpt backend is in play at all: either this invocation
 # selected it, or the install has it configured and so may have a chatgpt proxy
 # running. An install that never set CHATGPT_BASE_URL can never have started
@@ -1221,9 +1255,11 @@ _adopt_running_backend() {
 # not possible, and quietly answering from the wrong upstream is worse.
 ensure_services_up() {
     local want="${backend_override:-openai}" have
+    local started=0
     if ! services_up; then
         echo "harness: services not running; starting..."
         cmd_start
+        started=1
     elif _chatgpt_in_play; then
         # Reconciliation costs two `compose ps` plus a `docker inspect` on every
         # launch, so it is skipped entirely on an install that has never
@@ -1233,6 +1269,7 @@ ensure_services_up() {
         if have=$(_running_proxy_backend) && [[ "$have" != "$want" ]]; then
             echo "harness: proxy is running the '$have' backend; restarting it for '$want'"
             cmd_start
+            started=1
         elif _backend_is_chatgpt && [[ "$(_running_proxy_fp)" != "$(_chatgpt_config_fingerprint)" ]]; then
             # Same backend, different credentials: the running container captured
             # the old CHATGPT_* at `up` time. Rotating an expired cookie is the one
@@ -1240,7 +1277,22 @@ ensure_services_up() {
             # container over an .env edit, so reconcile it explicitly.
             echo "harness: chatgpt config changed since the proxy started; restarting it"
             cmd_start
+            started=1
         fi
+    fi
+    # Require-tool is captured by the proxy container at `up` time too, so a
+    # `harness --require-tool` launch that finds the proxy already up (another
+    # agent is running, or a `-p` run left it behind) would otherwise be a
+    # silent no-op — the flag's whole job is to change how that proxy answers.
+    # Probed ONLY when this launch asks for the mode: an install that never
+    # passes the flag and never sets the .env key pays nothing, and a plain
+    # launch never restarts the proxy out from under a concurrent
+    # --require-tool agent. The reverse direction is deliberately not
+    # reconciled: like --prompt-mode, the mode lasts as long as the proxy it
+    # started with, and the last agent to exit takes that proxy down.
+    if (( ! started )) && _require_tool_on && [[ "$(_running_proxy_require_tool)" != "1" ]]; then
+        echo "harness: proxy is running without require-tool; restarting it with it on"
+        cmd_start
     fi
     # Reconcile host MCPs on every launch (idempotent): a host MCP may have been
     # registered, or its process died, since the container stack came up. Cheap
@@ -2179,7 +2231,8 @@ usage:
   harness <command> [args...]  run a management command
 
 Running 'harness' with no command — or with only agent flags such as --yolo,
---net, --mount, or -p — launches an opencode agent in the current directory.
+--net, --mount, --require-tool, or -p — launches an opencode agent in the
+current directory.
 
 commands:
   start [--prompt-mode M] [--require-tool]
@@ -2299,6 +2352,16 @@ agent flags:
                         defaults via HARNESS_EXTRA_MOUNTS in .env (colon-
                         separated). The CWD is always mounted, regardless
                         of --mount; the agent always starts in the CWD.
+  --require-tool        make every assistant message carry a tool call: a
+                        message without one is rejected by the proxy and the
+                        model is asked again, and the only way to end a turn
+                        is the synthetic 'finish' tool. Use it when the agent
+                        keeps stopping early with advice instead of doing the
+                        work. This is proxy config, not an opencode flag, so
+                        it restarts a proxy that is already up without it.
+                        Ephemeral, like 'start --require-tool': it lasts as
+                        long as that proxy (the last agent to exit stops it).
+                        Set HARNESS_REQUIRE_TOOL=1 in .env to make it stick.
   -p, --print "PROMPT"  headless single-shot invocation; runs `opencode run`
                         inside the container
 
@@ -3821,20 +3884,6 @@ host_tool_bin_dir() { printf '%s/host/toolchain/bin' "$state_root"; }   # holds 
 host_node_dir()     { printf '%s/host/toolchain/node' "$state_root"; }  # extracted Node tarball lives under here
 host_opencode_dir() { printf '%s/host/toolchain/opencode' "$state_root"; } # npm --prefix target for opencode
 
-# Resolves require-tool for host mode: the one-shot --require-tool flag wins,
-# else the persistent HARNESS_REQUIRE_TOOL key in .env. True only for a value
-# the proxy itself reads as truthy, so someone who wrote HARNESS_REQUIRE_TOOL=0
-# is off everywhere — including in the fingerprint below, which has to stay
-# byte-identical for them. `tr`, not `${v,,}`: macOS still ships bash 3.2.
-_require_tool_on() {
-    local v
-    v=$(printf '%s' "${require_tool_override:-${HARNESS_REQUIRE_TOOL:-}}" | tr '[:upper:]' '[:lower:]')
-    case "$v" in
-        1|true|yes|on) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 # A fingerprint of the config the running proxy captured when it started: the
 # bind port plus the required upstream vars, the opt-in OUTPUT_DIR, and the
 # proxy's requirements.txt content. Stored beside the pidfile; host_proxy_start
@@ -4976,10 +5025,10 @@ EOF
 run_agent() {
     local tool="$1"; shift
 
-    # Parse --yolo, --net, --mount, and -p/--print. --yolo and --net can
-    # appear anywhere; -p/--print is preserved in pass_args (opencode's
-    # entrypoint detects it and switches to `opencode run`). --mount takes
-    # a path argument and is
+    # Parse --yolo, --net, --mount, --require-tool and -p/--print. --yolo,
+    # --net and --require-tool can appear anywhere; -p/--print is preserved
+    # in pass_args (opencode's entrypoint detects it and switches to
+    # `opencode run`). --mount takes a path argument and is
     # repeatable; the path is resolved+validated here (relative paths
     # become absolute, missing paths error out) and never reaches the
     # agent CLI.
@@ -5012,6 +5061,13 @@ run_agent() {
                 ;;
             --mount=*)
                 extra_mounts+=("${arg#--mount=}")
+                ;;
+            --require-tool)
+                # Consumed here, never forwarded: it configures the PROXY (the
+                # same global `harness start/restart/host --require-tool` sets),
+                # and opencode aborts on an unknown flag. ensure_services_up
+                # below restarts a proxy that is already up without it.
+                require_tool_override=1
                 ;;
             -p|--print)
                 print_mode=1
