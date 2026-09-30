@@ -138,7 +138,11 @@ validator in `_setup_prompt_mode` accepts:
   the earlier one-time wording produced exactly that: one read at the top of
   the first list and never again),
   **Todo list** (for anything past a trivial step the first call is
-  `todowrite`, planned through to VERIFIED rather than to edited —
+  `todowrite`, with every detail the user gave — paths, names, values,
+  constraints, what done looks like — written into the steps, since the
+  replayed list is the only record that survives a truncation (the user's
+  request goes with the rest of the history); planned through to VERIFIED
+  rather than to edited —
   build/run/test steps belong in the list and are run by the model, not
   handed back — exactly one item `in_progress`; followed by `{{TODOS}}`, the
   model's own list replayed back to it, see [Todo replay](#todo-replay)),
@@ -639,7 +643,9 @@ stay correct across concurrent sessions, so the list is re-derived every turn.
 `_format_todos_block` renders it, and never returns `""`:
 
 - **list present** — one `[status] content` line per item, capped at
-  `_TODOS_MAX_ITEMS` with each line trimmed to `_TODOS_MAX_CONTENT`, newlines
+  `_TODOS_MAX_ITEMS` (15) with each line trimmed to `_TODOS_MAX_CONTENT` (400
+  characters: wide enough for a step that carries its own paths and values,
+  which the reminder asks for), newlines
   flattened and `<<<` defanged (the text is model-authored and lands inside a
   marker-delimited prompt). A status outside opencode's four normalises to
   `pending` rather than rendering a marker the legend does not explain. The
@@ -654,7 +660,8 @@ stay correct across concurrent sessions, so the list is re-derived every turn.
   copy and that changes go through `todowrite`, whose every call REPLACES the
   whole list (`Todo.update` deletes the session's rows and re-inserts).
 - **no list** — an explicit "you have no todo list, make a detailed one before
-  anything else" instruction. An empty expansion is precisely the case where
+  anything else" instruction, which also asks for every detail of the request
+  to be written into the steps, since the request itself is lost on truncation. An empty expansion is precisely the case where
   the model most needs to be told what to do.
 
 ## MCP tool-recency injection

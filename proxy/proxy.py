@@ -1408,9 +1408,12 @@ def _format_tool_signature(name, required, optional):
 # The reminder is a per-turn tax on every request, so the list is bounded even
 # when the model writes a fifty-step plan; completed items are the first to go
 # because they are the ones the model no longer needs to act on; past that,
-# the tail goes, so the model always keeps its NEXT steps.
+# the tail goes, so the model always keeps its NEXT steps. The item width is
+# generous on purpose: the reminder tells the model to write every detail of
+# the request (paths, values, constraints) into the steps, because this replay
+# is all that survives a truncation, and a detail cut off here is lost.
 _TODOS_MAX_ITEMS = 15
-_TODOS_MAX_CONTENT = 140
+_TODOS_MAX_CONTENT = 400
 
 _TODO_STATUS_MARK = {
     "completed": "x",
@@ -1525,8 +1528,11 @@ def _format_todos_block(todos) -> str:
             "\n  YOU HAVE NO TODO LIST. Unless this request is a single "
             "trivial step, your first action this turn is `todowrite` with a "
             "detailed, step-by-step breakdown of the user's request — every "
-            "step you can foresee, not a three-line sketch. That list is the "
-            "only memory you get."
+            "step you can foresee, not a three-line sketch, with every detail "
+            "the user gave (paths, names, values, commands, constraints, what "
+            "done looks like) written into the steps. That list is the only "
+            "memory you get: once your history is truncated, the request "
+            "itself is gone."
         )
 
     # Over the cap, finished items go first (oldest first): they are history,

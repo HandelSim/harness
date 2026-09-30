@@ -1732,6 +1732,11 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
 
         todo = bullet("- Todo list:", "- Use the tools:")
         self.assertIn("todowrite", todo)
+        # The replayed list is all that survives a truncation, so the
+        # request's details have to be written into it, not just the steps.
+        self.assertIn("EVERY detail the user gave goes into the steps", todo)
+        self.assertIn("the user's request is lost with it", todo)
+        self.assertIn("`todowrite` it into the list before you act on it", todo)
 
     def test_per_tool_entry_format_with_guidance(self):
         """Tools in `_HYBRID_TOOL_GUIDANCE` get one entry: signature + ` — `
@@ -2203,6 +2208,7 @@ class TestTodoReplay(unittest.TestCase):
             block = proxy._format_todos_block(todos)
             self.assertIn("YOU HAVE NO TODO LIST", block)
             self.assertIn("todowrite", block)
+            self.assertIn("with every detail the user gave", block)
 
     def test_present_list_renders_with_status_markers(self):
         block = proxy._format_todos_block([
@@ -2235,10 +2241,25 @@ class TestTodoReplay(unittest.TestCase):
         self.assertNotIn("a string", block)
 
     def test_long_content_is_truncated(self):
+        n = proxy._TODOS_MAX_CONTENT * 3
         block = proxy._format_todos_block(
-            [{"content": "z" * 400, "status": "pending"}])
-        self.assertLess(len(block), 400)
-        self.assertIn("\u2026", block)
+            [{"content": "z" * n, "status": "pending"}])
+        self.assertIn("z" * (proxy._TODOS_MAX_CONTENT - 1) + "\u2026", block)
+        self.assertNotIn("z" * proxy._TODOS_MAX_CONTENT, block)
+
+    def test_a_detailed_step_survives_whole(self):
+        """The reminder asks for every detail of the request to be written
+        into the steps, because the replay is all that survives a truncation.
+        A step carrying its own paths and values must come back intact, not
+        cut at the path."""
+        step = ("set request_timeout=30 and retries=5 in "
+                "services/billing/config/production.yaml, leave every other key "
+                "alone, keep the comments, then run `make test-billing` and "
+                "confirm test_timeout_is_applied passes; the user said NOT to "
+                "touch staging.yaml or the Helm chart")
+        self.assertGreater(len(step), 140)
+        block = proxy._format_todos_block([{"content": step, "status": "pending"}])
+        self.assertIn("[ ] " + step, block)
 
     def test_newlines_in_content_do_not_break_the_line_layout(self):
         block = proxy._format_todos_block(
