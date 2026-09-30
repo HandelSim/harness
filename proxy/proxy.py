@@ -492,8 +492,9 @@ _META_TOOL_NAMES = ("tool_search", "tool_list")
 # calls before giving up the loop (a runaway model that only ever searches).
 _META_TOOL_SERVE_BUDGET = 3
 
-# Require-tool mode (default OFF: `harness start/restart/host --require-tool`
-# sets HARNESS_REQUIRE_TOOL=1). When on, EVERY assistant message must carry a
+# Require-tool mode (always on except in the passthrough prompt mode; set by
+# `_setup_require_tool` at startup — the False here is only the import-time
+# value unit tests start from). When on, EVERY assistant message must carry a
 # tool call, and the only way to end a turn is a call to the synthetic `finish`
 # tool the proxy serves itself — a text-only message is rejected in-proxy and
 # the model is asked again, so it can no longer end a run by handing back advice.
@@ -628,14 +629,10 @@ def _user_data_path(basename: str) -> str:
 
 
 # Loaded once at startup like the recency map: the file is fixed for a launch.
-# Require-tool mode reads a SEPARATE file. The two are near-copies, and the
-# duplication is deliberate: the normal file's closer ("a turn ends with a tool
-# call or with your final report") is a false statement under require-tool,
-# where a report with no call is rejected. A token inside one file would have
-# left the untouched copies of every existing install asserting the wrong rule.
+# Its prose is written for require-tool mode (every message carries a call,
+# `finish` ends the turn), which is on for every launch but passthrough, and
+# passthrough injects no reminder at all.
 def _reminder_template_path() -> str:
-    if _REQUIRE_TOOL_ENABLED:
-        return _user_data_path("reminder-require-tool.md")
     return _user_data_path("reminder.md")
 
 # Substituted into the template per turn. Deliberately `{{NAME}}` + str.replace
@@ -1117,10 +1114,8 @@ def _setup_tool_search() -> None:
 
 
 def _setup_require_tool() -> None:
-    """Read HARNESS_REQUIRE_TOOL into the module global. Same truthy set as
-    `_setup_tool_search` (1/true/yes/on, case-insensitive); anything else —
-    the default — leaves the prompt, the tool array and the dispatch path
-    byte-for-byte unchanged from before the feature existed.
+    """Turn require-tool mode on. It is the default for every launch and has
+    no off switch, except one:
 
     Forced off in passthrough mode: passthrough is the benchmark control that
     forwards the agent's own `tools` array upstream and injects nothing, so a
@@ -1129,13 +1124,11 @@ def _setup_require_tool() -> None:
     to remove. `_setup_prompt_mode` runs first in `main`, so the check is
     against a settled value."""
     global _REQUIRE_TOOL_ENABLED
-    raw = os.environ.get("HARNESS_REQUIRE_TOOL", "").strip().lower()
-    _REQUIRE_TOOL_ENABLED = raw in ("1", "true", "yes", "on")
-    if _REQUIRE_TOOL_ENABLED and _PROMPT_MODE == "passthrough":
-        _REQUIRE_TOOL_ENABLED = False
+    _REQUIRE_TOOL_ENABLED = _PROMPT_MODE != "passthrough"
+    if not _REQUIRE_TOOL_ENABLED:
         print(
-            "[!] require-tool is incompatible with prompt mode 'passthrough' "
-            "(which forwards tools upstream unmediated); leaving it off",
+            "[i] require-tool is off in prompt mode 'passthrough' "
+            "(which forwards tools upstream unmediated)",
             flush=True,
         )
         return
@@ -1363,8 +1356,8 @@ def build_cooperative_prompt_system_addition(tools_text):
     When cooperative tool-search is enabled (_TOOL_SEARCH_ENABLED) a small
     <<<BEGIN_META_TOOLS>>> block is appended advertising the proxy-served
     tool_search/tool_list meta-tools; off by default, so the prefix is
-    unchanged for a normal launch. Require-tool mode (_REQUIRE_TOOL_ENABLED)
-    appends a <<<BEGIN_REQUIRE_TOOL>>> block the same way, correcting the
+    unchanged for a normal launch. Require-tool mode (_REQUIRE_TOOL_ENABLED,
+    on outside passthrough) appends a <<<BEGIN_REQUIRE_TOOL>>> block the same way, correcting the
     "if no tools are needed, answer normally" sentence above it.
     """
     meta_block = _META_TOOLS_PROMPT_BLOCK if _TOOL_SEARCH_ENABLED else ""
@@ -2958,7 +2951,7 @@ def _serve_meta_tools(
 
 
 # ---------------------------------------------------------------------------
-# Require-tool mode (default off; HARNESS_REQUIRE_TOOL=1)
+# Require-tool mode (on for every launch except the passthrough prompt mode)
 # ---------------------------------------------------------------------------
 #
 # The problem: opencode ends a run the moment the model returns a message with
@@ -2977,7 +2970,7 @@ def _serve_meta_tools(
 #
 # Deliberately fail-open everywhere: an exhausted budget, a failed upstream
 # call, or a request the feature can't apply to falls through to exactly the
-# behaviour of a launch without the flag. A stuck turn would be worse than the
+# behaviour of a launch without the mode. A stuck turn would be worse than the
 # problem being solved.
 
 # The correction the model gets when its message carried no tool call. A code
@@ -3536,7 +3529,7 @@ def catch_all(path: str) -> Response:
                     p for p in tool_call_payloads if p not in meta_payloads
                 ]
 
-        # Require-tool enforcement (default off; HARNESS_REQUIRE_TOOL=1).
+        # Require-tool enforcement (on outside passthrough).
         # Two jobs, in order.
         #
         # (a) A message with no tool call is rejected in-proxy and the model is
@@ -3544,7 +3537,7 @@ def catch_all(path: str) -> Response:
         # the run. Bounded three ways so a turn can never hang: the per-request
         # budget below, a fail-open `None` from the loop, and the fact that an
         # exhausted budget forwards the original response exactly as a launch
-        # without the flag would have. The budget is shared with the other two
+        # without the mode would have. The budget is shared with the other two
         # in-proxy loops — the malformed-tool-call retry spends one round of
         # it, and a request that already ran the meta-tool serve loop spends
         # all of it — because the failure the user feels is a turn that stalls
@@ -3830,9 +3823,7 @@ def main() -> None:
     _setup_mcp_tool_recency()
     _setup_state_check_tools()
     _setup_tool_search()
-    # Before _setup_reminder_template: it decides WHICH reminder file is
-    # loaded (require-tool mode reads reminder-require-tool.md), and after
-    # _setup_prompt_mode, which it checks for the passthrough refusal.
+    # After _setup_prompt_mode, which it checks for the passthrough refusal.
     _setup_require_tool()
     _setup_tool_guidance()
     _setup_reminder_template()

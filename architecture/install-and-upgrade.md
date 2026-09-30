@@ -65,8 +65,10 @@ run from an empty directory. Stages:
    [`harness-cli.md`](harness-cli.md) → "Host mode"), so a missing/unreachable
    docker or podman is a warning, not an abort. When neither runtime is found,
    preflight sets a `HOST_ONLY` flag and the closing message tells the user to
-   use `harness host` and that container subcommands will need docker installed
-   later. (When a runtime *is* present, compose-availability and reachability
+   use `harness host` (bare `harness` also falls back to host mode when no
+   docker/podman is installed — see [`harness-cli.md`](harness-cli.md) →
+   "No-docker fallback"), while `harness start`/`shell` will need docker
+   installed later. (When a runtime *is* present, compose-availability and reachability
    are still reported, but as warnings — container mode needs them, `harness
    host` does not.) On the `HOST_ONLY` path the installer also **probes the
    host-mode prerequisites**, but only `python3` is a real requirement (it
@@ -176,7 +178,8 @@ run from an empty directory. Stages:
 9. **Final message.** Tells the user to edit `.env` (set
    `PROXY_API_KEY` etc.) and `cd` into a project to run the agent. The
    printed run command is host-aware: on a `HOST_ONLY` install (no runtime
-   detected) the "Next" steps say `harness host`, otherwise `harness`.
+   detected) the "Next" steps say `harness host` (noting that bare `harness`
+   falls back to it there), otherwise `harness`.
 
 Uninstall is **`harness uninstall`** (in the CLI, prompts to confirm; see
 [`harness-cli.md`](harness-cli.md) "Config and setup commands"), or the
@@ -392,7 +395,7 @@ The contract between this repo and a user's install root. Since the
 install root IS the clone, "managed files" means files harness writes
 inside the clone that aren't tracked git content: `.env`,
 `.harness-allowlist`, the user's prompt data (`reminder.md`,
-`reminder-require-tool.md`, `tool-guidance.json`), and per-MCP state under
+`tool-guidance.json`), and per-MCP state under
 `state/mcp/<name>/`.
 
 Every `B3-MANAGED:` comment in the codebase has a matching manifest
@@ -440,9 +443,8 @@ into don't get auto-installed.
 
 ### `userfile_sync`
 
-Used for the three files whose contents are the user's own prose:
-`<install-root>/reminder.md`, `<install-root>/reminder-require-tool.md` and
-`<install-root>/tool-guidance.json`
+Used for the two files whose contents are the user's own prose:
+`<install-root>/reminder.md` and `<install-root>/tool-guidance.json`
 (see `architecture/proxy.md` → "Editable reminder data"). Seeding
 deliberately never overwrites an existing copy, which would otherwise
 strand an install on whatever default it was first seeded with; this

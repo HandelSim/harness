@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
-# tests/unit_reminder_seed_test.sh — exercise seed_reminder_file,
-# seed_tool_guidance_file and seed_require_tool_reminder_file, the three
-# wrappers over seed_user_data_file that put the user's editable prompt-data
+# tests/unit_reminder_seed_test.sh — exercise seed_reminder_file and
+# seed_tool_guidance_file, the two wrappers over seed_user_data_file that put the user's editable prompt-data
 # files in place.
 #
 # The hybrid reminder's prose and its per-tool entries are DATA, not code: the
@@ -29,10 +28,8 @@
 #
 # T1-T5 cover the shared helper through the reminder wrapper; T6-T8 cover the
 # tool-guidance wrapper, which must seed a SEPARATE file with the same rules
-# (see F154, P092); T9-T11 cover the legacy-layout migrations; T12-T13 cover
-# the require-tool reminder variant, which is seeded unconditionally (whether
-# or not --require-tool is in play) so flipping HARNESS_REQUIRE_TOOL on never
-# needs a re-seed, and which has no legacy layout to migrate from.
+# (see F154, P092); T9-T11 cover the legacy-layout migrations; T12 checks the
+# retired require-tool reminder variant is no longer seeded.
 #
 # Runs without docker: `harness` is sourced with HARNESS_SOURCE_ONLY=1 so
 # main() never runs, and install_root/clone_dir are pointed at a tmpdir.
@@ -68,8 +65,6 @@ new_case() {
         >"$d/clone/proxy/reminder.md"
     printf '%s\n' '{"tools": {"bash": "shipped default line"}}' \
         >"$d/clone/proxy/tool-guidance.json"
-    printf '%s\n' "<!-- header -->" "[Reminder require-tool default]" \
-        >"$d/clone/proxy/reminder-require-tool.md"
     install_root="$d/root"
     clone_dir="$d/clone"
 }
@@ -203,29 +198,17 @@ grep -q "DATA DIR WORDING" "$install_root/reminder.md" \
     || fail "T11: the emptied .harness-data directory was left behind"
 ok "T11: a .harness-data/ copy moves up and the empty directory is rmdir'd"
 
-# --- T12: the require-tool reminder variant is seeded on its own -------------
-# Seeded on every `harness start` and `harness host`, not only under
-# --require-tool: the compose bind-mount for it is unconditional, and a missing
-# source is what makes docker create the empty directory T3 exists to clean up.
+# --- T12: the retired require-tool variant is not seeded ---------------------
+# Require-tool is the default now and reminder.md carries its prose, so no
+# launch path seeds reminder-require-tool.md any more.
 new_case t12
-seed_require_tool_reminder_file 2>/dev/null
-[[ -f "$install_root/reminder-require-tool.md" ]] \
-    || fail "T12: reminder-require-tool.md was not created at the install root"
-diff -q "$clone_dir/proxy/reminder-require-tool.md" \
-    "$install_root/reminder-require-tool.md" >/dev/null \
-    || fail "T12: seeded copy differs from proxy/reminder-require-tool.md"
-[[ ! -e "$install_root/reminder.md" ]] \
-    || fail "T12: the require-tool seeder must not touch the normal reminder"
-ok "T12: missing require-tool reminder is seeded byte-for-byte, on its own"
-
-# --- T13: an edited require-tool reminder copy is never overwritten ----------
-new_case t13
-printf '%s\n' "[Reminder MY REQUIRE-TOOL WORDING]" \
-    >"$install_root/reminder-require-tool.md"
-seed_require_tool_reminder_file 2>/dev/null
-grep -q "MY REQUIRE-TOOL WORDING" "$install_root/reminder-require-tool.md" \
-    || fail "T13: seeding clobbered the user's edited require-tool reminder"
-ok "T13: an existing require-tool copy is left untouched (upgrade-safe)"
+[[ "$(type -t seed_require_tool_reminder_file)" != "function" ]] \
+    || fail "T12: seed_require_tool_reminder_file still exists"
+seed_reminder_file 2>/dev/null
+seed_tool_guidance_file 2>/dev/null
+[[ ! -e "$install_root/reminder-require-tool.md" ]] \
+    || fail "T12: reminder-require-tool.md was seeded"
+ok "T12: only reminder.md and tool-guidance.json are seeded"
 
 echo "------------------------------------------------------------"
 echo "REMINDER SEED TEST PASSED (${pass} checks)"

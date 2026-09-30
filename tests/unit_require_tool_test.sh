@@ -1,32 +1,26 @@
 #!/usr/bin/env bash
 #
 # tests/unit_require_tool_test.sh — exercise the CLI half of require-tool mode
-# (`harness start/restart --require-tool`, `harness host --require-tool`,
-# `harness --require-tool`),
-# docker-free.
+# and the no-docker fallback of a bare launch, docker-free.
 #
-# Require-tool mode itself lives in the proxy (see proxy/test_proxy.py); this
-# file covers only the plumbing that has to get HARNESS_REQUIRE_TOOL=1 from a
-# flag to the proxy process, in both run modes:
+# Require-tool mode itself lives in the proxy (see proxy/test_proxy.py), where
+# it is always on outside the passthrough prompt mode. It used to be opt-in via
+# a `--require-tool` flag and a HARNESS_REQUIRE_TOOL .env key; both are gone as
+# switches. What the CLI still owes:
 #
-#   - _parse_start_flags: the shared start/restart parser now takes a second
-#     flag, still rejects unknown options, and takes both flags together
-#   - write_runtime_override: HARNESS_REQUIRE_TOOL lands on the proxy service
-#     and SHARES the one `proxy:` mapping with the other ephemeral overrides
-#     (duplicate top-level service keys are invalid compose YAML), including
-#     when the firewall loop emitted that block first
-#   - _require_tool_on: the flag beats .env, and only a value the proxy itself
-#     reads as truthy counts — HARNESS_REQUIRE_TOOL=0 is off
-#   - host_proxy_fingerprint: folding require-tool in is what makes
-#     `harness host --require-tool` restart a proxy that is already running,
-#     and an off/0 install's fingerprint must stay byte-identical to the
-#     pre-feature one or every host user's next launch kills a healthy proxy
-#   - cmd_host: the flag is consumed, never forwarded to opencode
-#   - run_agent: the same for a bare `harness --require-tool` launch, which
-#     used to forward the flag to opencode (which then refused to start)
-#   - _running_proxy_require_tool / ensure_services_up: the container-mode
-#     reconciliation that makes the flag take effect against a proxy that is
-#     already up, and leaves one alone when this launch does not ask for it
+#   - _parse_start_flags: `--require-tool` is still ACCEPTED (old scripts pass
+#     it) but sets nothing, and the parser still rejects typos
+#   - write_runtime_override: never emits HARNESS_REQUIRE_TOOL, and a launch
+#     with no other override still leaves no compose override behind
+#   - host_proxy_fingerprint: carries the require-tool marker unconditionally
+#     (so a host proxy started before the default flipped is restarted once),
+#     and a leftover HARNESS_REQUIRE_TOOL=0 in .env cannot perturb it
+#   - cmd_host / run_agent: `--require-tool` is consumed, never forwarded to
+#     opencode, which aborts on an unknown flag
+#   - run_agent on a box with no container runtime installed: says docker is
+#     not available and hands off to cmd_host with the host-meaningful flags;
+#     with a runtime installed it does NOT fall back
+#   - neither help text advertises the flag any more
 #
 # Sources `harness` with HARNESS_SOURCE_ONLY=1 so main() never runs, pointed at
 # a throwaway install root.
@@ -40,7 +34,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HARNESS="${REPO_ROOT}/harness"
 
 echo "============================================================"
-echo " require-tool flag (CLI) unit test"
+echo " require-tool default + no-docker fallback (CLI) unit test"
 echo "============================================================"
 
 pass=0
@@ -69,120 +63,60 @@ HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" HARNESS_ALLOWLIST_PATH="$
 # host_proxy_fingerprint finds proxy/requirements.txt.
 clone_dir="$REPO_ROOT"
 
-for fn in _parse_start_flags _require_tool_on write_runtime_override \
-          host_proxy_fingerprint seed_require_tool_reminder_file cmd_host; do
+for fn in _parse_start_flags write_runtime_override host_proxy_fingerprint \
+          cmd_host run_agent harness_runtime_installed; do
     [[ "$(type -t "$fn")" == "function" ]] || fail "$fn not sourced"
 done
-ok "require-tool functions sourced"
+for fn in _require_tool_on _require_tool_truthy _running_proxy_require_tool \
+          seed_require_tool_reminder_file; do
+    [[ "$(type -t "$fn")" != "function" ]] || fail "$fn should be gone"
+done
+grep -q 'HARNESS_REQUIRE_TOOL' "$HARNESS" \
+    && fail "harness still references HARNESS_REQUIRE_TOOL"
+ok "functions sourced; the opt-in plumbing is gone"
 
-# --- T1: _parse_start_flags takes --require-tool, alone and combined ---------
+# --- T1: _parse_start_flags accepts --require-tool as a no-op ---------------
 t1=$(
     HARNESS_SOURCE_ONLY=1 source "$HARNESS" >/dev/null 2>&1
     _parse_start_flags --require-tool
-    echo "alone=${require_tool_override}"
+    echo "alone=[${prompt_mode_override}]"
     _parse_start_flags --require-tool --prompt-mode user_front
-    echo "both=${require_tool_override}/${prompt_mode_override}"
+    echo "both=[${prompt_mode_override}]"
 )
-grep -q 'alone=1' <<<"$t1" || fail "T1: --require-tool did not set the override — $t1"
-grep -q 'both=1/user_front' <<<"$t1" \
+grep -q 'alone=\[\]' <<<"$t1" || fail "T1: --require-tool alone was not a no-op — $t1"
+grep -q 'both=\[user_front\]' <<<"$t1" \
     || fail "T1: --require-tool and --prompt-mode are not accepted together — $t1"
-# The parser is still strict: an unknown option must abort non-zero.
 t1_rc=0
 ( HARNESS_SOURCE_ONLY=1 source "$HARNESS" >/dev/null 2>&1
   _parse_start_flags --require-tools ) >/dev/null 2>&1 || t1_rc=$?
 (( t1_rc != 0 )) || fail "T1: a misspelled --require-tools was accepted"
-ok "T1: _parse_start_flags accepts --require-tool and still rejects typos"
+ok "T1: _parse_start_flags accepts --require-tool as a no-op and still rejects typos"
 
-# --- T2: write_runtime_override injects HARNESS_REQUIRE_TOOL ----------------
-require_tool_override=1; prompt_mode_override=""; backend_override=""
+# --- T2: write_runtime_override never emits HARNESS_REQUIRE_TOOL ------------
+prompt_mode_override="user_front"; backend_override=""
 write_runtime_override
 [[ -f "$runtime_override" ]] || fail "T2: override file not written"
-grep -q 'HARNESS_REQUIRE_TOOL: "1"' "$runtime_override" \
-    || fail "T2: HARNESS_REQUIRE_TOOL missing — $(cat "$runtime_override")"
-grep -q '^  proxy:' "$runtime_override" || fail "T2: no proxy service block"
-ok "T2: --require-tool emits HARNESS_REQUIRE_TOOL on the proxy service"
-
-# --- T3: require-tool and prompt-mode share ONE proxy: mapping --------------
-prompt_mode_override="user_front"
+grep -q 'HARNESS_REQUIRE_TOOL' "$runtime_override" \
+    && fail "T2: HARNESS_REQUIRE_TOOL emitted — $(cat "$runtime_override")"
+prompt_mode_override=""
 write_runtime_override
-[[ "$(grep -c '^  proxy:' "$runtime_override")" == "1" ]] \
-    || fail "T3: duplicate proxy: block — $(cat "$runtime_override")"
-grep -q 'HARNESS_REQUIRE_TOOL: "1"' "$runtime_override" || fail "T3: require-tool dropped"
-grep -q 'PROXY_PROMPT_MODE: "user_front"' "$runtime_override" || fail "T3: prompt mode dropped"
-ok "T3: require-tool and prompt-mode share a single proxy: mapping"
+[[ ! -f "$runtime_override" ]] || fail "T2: override file survived an empty body"
+ok "T2: the runtime override carries no require-tool key"
 
-# --- T4: no override active still removes the file --------------------------
-require_tool_override=""; prompt_mode_override=""
-write_runtime_override
-[[ ! -f "$runtime_override" ]] || fail "T4: override file survived an empty body"
-ok "T4: a launch with no overrides leaves no compose override behind"
-
-# --- T5: the firewall loop's proxy: block absorbs it, no second mapping -----
-# `harness net open proxy` makes write_runtime_override emit a proxy: block of
-# its own first; the ephemeral overrides must be appended to THAT block.
-if command -v jq >/dev/null 2>&1; then
-    printf '%s\n' '{"services": {"proxy": {"firewall_disabled": true}}}' \
-        >"$net_overrides_path"
-    require_tool_override=1; prompt_mode_override=""
-    write_runtime_override
-    [[ "$(grep -c '^  proxy:' "$runtime_override")" == "1" ]] \
-        || fail "T5: duplicate proxy: block with a firewall opt-out — $(cat "$runtime_override")"
-    grep -q 'HARNESS_FIREWALL_DISABLED: "1"' "$runtime_override" \
-        || fail "T5: firewall opt-out lost — $(cat "$runtime_override")"
-    grep -q 'HARNESS_REQUIRE_TOOL: "1"' "$runtime_override" \
-        || fail "T5: require-tool lost — $(cat "$runtime_override")"
-    rm -f "$net_overrides_path"
-    require_tool_override=""; write_runtime_override
-    ok "T5: a firewall-opt-out proxy: block absorbs HARNESS_REQUIRE_TOOL"
-else
-    echo "[require-tool] SKIP: T5 needs jq"
-fi
-
-# --- T6: _require_tool_on — flag beats .env, and 0 means off ----------------
-# The proxy reads 1/true/yes/on as on and everything else as off; the CLI must
-# agree, or a user with HARNESS_REQUIRE_TOOL=0 in .env gets a changed host
-# fingerprint (T7) for a feature that is not even on.
-t6_case() {  # <flag> <env> <expect on|off>
-    local got=off
-    ( require_tool_override="$1"; HARNESS_REQUIRE_TOOL="$2"; _require_tool_on ) && got=on
-    [[ "$got" == "$3" ]] \
-        || fail "T6: flag='$1' env='$2' expected $3, got $got"
-}
-t6_case ""  ""      off
-t6_case ""  "0"     off
-t6_case ""  "no"    off
-t6_case ""  "false" off
-t6_case ""  "1"     on
-t6_case ""  "true"  on
-t6_case ""  "TRUE"  on
-t6_case ""  "Yes"   on
-t6_case ""  "on"    on
-t6_case "1" ""      on
-t6_case "1" "0"     on     # the one-shot flag overrides an off .env
-ok "T6: _require_tool_on matches the proxy's truthy set and the flag wins"
-
-# --- T7: host_proxy_fingerprint ---------------------------------------------
-# Off and explicitly-0 installs must hash IDENTICALLY to a pre-feature harness,
-# or the first launch after upgrading kills a healthy proxy and blames .env.
-# Turning it on must change the hash, which is what restarts the proxy.
-require_tool_override=""; unset HARNESS_REQUIRE_TOOL
-fp_off=$(host_proxy_fingerprint)
+# --- T3: host_proxy_fingerprint ---------------------------------------------
+# The marker is always hashed, so a host proxy left running from before the
+# default flipped (its fingerprint lacks it) is restarted instead of reused.
+fp=$(host_proxy_fingerprint)
 fp_zero=$(HARNESS_REQUIRE_TOOL=0 host_proxy_fingerprint)
-[[ "$fp_off" == "$fp_zero" ]] \
-    || fail "T7: HARNESS_REQUIRE_TOOL=0 perturbed the fingerprint"
-fp_flag=$(require_tool_override=1 host_proxy_fingerprint)
-[[ "$fp_flag" != "$fp_off" ]] \
-    || fail "T7: --require-tool did not change the fingerprint (the reuse short-circuit would swallow the flag)"
-fp_env=$(HARNESS_REQUIRE_TOOL=1 host_proxy_fingerprint)
-[[ "$fp_env" == "$fp_flag" ]] \
-    || fail "T7: the .env key and the flag must produce the same fingerprint"
-ok "T7: require-tool is folded into the host fingerprint only when it is on"
+[[ "$fp" == "$fp_zero" ]] \
+    || fail "T3: a leftover HARNESS_REQUIRE_TOOL=0 perturbed the fingerprint"
+grep -q "requiretool=1" < <(sed -n '/^host_proxy_fingerprint()/,/^}/p' "$HARNESS") \
+    || fail "T3: host_proxy_fingerprint no longer hashes the require-tool marker"
+ok "T3: the host fingerprint always carries require-tool and ignores the old key"
 
-# --- T8: cmd_host consumes --require-tool and never forwards it -------------
-# opencode rejects unknown flags, so the arg must be eaten by the loop; and it
-# must reach host_proxy_start as require_tool_override.
-t8_rc=0
-t8_out=$(
+# --- T4: cmd_host consumes --require-tool and never forwards it -------------
+t4_rc=0
+t4_out=$(
     HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" source "$HARNESS" >/dev/null 2>&1
     host_require_python3()  { :; }
     host_require_config()   { :; }
@@ -193,31 +127,27 @@ t8_out=$(
     _gate_on_upstream_auth() { return 0; }
     _print_upstream_models() { return 0; }
     host_proxy_start() {
-        echo "OVERRIDE=${require_tool_override}"
         echo "PASSARGS=${pass_args[*]-}"
         exit 43
     }
     cmd_host --require-tool 2>&1
-) || t8_rc=$?
-(( t8_rc == 43 )) || fail "T8: cmd_host did not reach host_proxy_start (rc=$t8_rc) — $t8_out"
-grep -q 'OVERRIDE=1' <<<"$t8_out" \
-    || fail "T8: cmd_host --require-tool did not set require_tool_override — $t8_out"
-grep -q 'PASSARGS=$' <<<"$t8_out" \
-    || fail "T8: --require-tool was forwarded to opencode — $t8_out"
-ok "T8: cmd_host --require-tool is consumed, not passed through to opencode"
+) || t4_rc=$?
+(( t4_rc == 43 )) || fail "T4: cmd_host did not reach host_proxy_start (rc=$t4_rc) — $t4_out"
+grep -q 'PASSARGS=$' <<<"$t4_out" \
+    || fail "T4: --require-tool was forwarded to opencode — $t4_out"
+ok "T4: cmd_host --require-tool is consumed, not passed through to opencode"
 
-# --- T10: run_agent consumes --require-tool and never forwards it -----------
-# The bug this covers: bare `harness --require-tool` fell through run_agent's
-# flag loop into pass_args, so opencode got an unknown flag and refused to
-# start, and the proxy never saw the mode. The flag must be eaten here and
-# land in require_tool_override, exactly as cmd_host does it (T8).
-t10_rc=0
-t10_out=$(
+# --- T5: run_agent consumes --require-tool and never forwards it ------------
+# With a runtime installed the launch stays in container mode (no fallback).
+t5_rc=0
+t5_out=$(
     HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" HARNESS_ALLOWLIST_PATH="$ALLOWLIST" \
         source "$HARNESS" >/dev/null 2>&1
+    harness_runtime_installed()  { return 0; }
+    cmd_host()                   { echo "FELL_BACK"; exit 44; }
     require_docker()             { :; }
     _gate_on_upstream_auth()     { return 0; }
-    ensure_services_up()         { echo "ENSURE=${require_tool_override}"; }
+    ensure_services_up()         { :; }
     ensure_dirs()                { :; }
     _update_check_and_banner()   { :; }
     _check_and_offer_config_merge() { :; }
@@ -233,82 +163,49 @@ t10_out=$(
         exit 45
     }
     run_agent opencode --require-tool --yolo 2>&1
-) || t10_rc=$?
-(( t10_rc == 45 )) || fail "T10: run_agent did not reach the launcher (rc=$t10_rc) — $t10_out"
-grep -q 'ENSURE=1' <<<"$t10_out" \
-    || fail "T10: --require-tool did not set require_tool_override before launch — $t10_out"
-grep -q 'PASSARGS=\[\]$' <<<"$t10_out" \
-    || fail "T10: --require-tool was forwarded to opencode — $t10_out"
-ok "T10: bare 'harness --require-tool' is consumed, not passed through to opencode"
+) || t5_rc=$?
+(( t5_rc == 45 )) || fail "T5: run_agent did not reach the container launcher (rc=$t5_rc) — $t5_out"
+grep -q 'PASSARGS=\[\]$' <<<"$t5_out" \
+    || fail "T5: --require-tool was forwarded to opencode — $t5_out"
+ok "T5: 'harness --require-tool' is consumed, and a runtime box stays in container mode"
 
-# --- T11: _running_proxy_require_tool reads the container env ---------------
-# The running proxy captured HARNESS_REQUIRE_TOOL at `up` time; the reader has
-# to agree with the proxy's truthy set, and report 0 (not an error) for a
-# container built before the key existed.
-# `harness_docker` lives in scripts/lib/platform.sh and is not defined in a
-# sourced-only shell, so both saves have to tolerate an empty result.
-t11_compose_saved=$(declare -f compose || true)
-t11_docker_saved=$(declare -f harness_docker || true)
-compose() { echo "proxycid123"; }
-harness_docker() { printf 'PATH=/usr/bin\nHARNESS_REQUIRE_TOOL=1\nPROXY_PORT=8000\n'; }
-[[ "$(_running_proxy_require_tool)" == "1" ]] || fail "T11: an on proxy must read as 1"
-harness_docker() { printf 'PATH=/usr/bin\nHARNESS_REQUIRE_TOOL=TRUE\n'; }
-[[ "$(_running_proxy_require_tool)" == "1" ]] || fail "T11: TRUE must read as 1"
-harness_docker() { printf 'PATH=/usr/bin\nHARNESS_REQUIRE_TOOL=0\n'; }
-[[ "$(_running_proxy_require_tool)" == "0" ]] || fail "T11: 0 must read as 0"
-harness_docker() { printf 'PATH=/usr/bin\nPROXY_PORT=8000\n'; }
-[[ "$(_running_proxy_require_tool)" == "0" ]] \
-    || fail "T11: a pre-feature container with no key must read as 0"
-compose() { echo ""; }
-_running_proxy_require_tool >/dev/null 2>&1 && fail "T11: no proxy must report not-running"
-if [[ -n "$t11_compose_saved" ]]; then eval "$t11_compose_saved"; else unset -f compose; fi
-if [[ -n "$t11_docker_saved" ]]; then eval "$t11_docker_saved"; else unset -f harness_docker; fi
-ok "T11: _running_proxy_require_tool reports the running container's mode"
-
-# --- T12: ensure_services_up restarts a proxy that lacks require-tool -------
-# ensure_services_up is a no-op when the proxy is already up, so without this
-# `harness --require-tool` against a running proxy (another agent, or a `-p`
-# run that left it behind) would silently do nothing. The reverse direction is
-# deliberately NOT reconciled: a plain launch must not restart the proxy out
-# from under a concurrent --require-tool agent.
-START_LOG="$TMP_ROOT/start.log"
-t12() {  # <flag> <env> <running> <expect restart|no-restart> <label>
-    local got=no-restart out
-    : >"$START_LOG"
-    out=$(
-        services_up()               { return 0; }
-        _chatgpt_in_play()          { return 1; }
-        host_mcp_start_enabled()    { :; }
-        cmd_start()                 { echo started >>"$START_LOG"; }
-        eval "_running_proxy_require_tool() { printf '%s' '$3'; }"
-        require_tool_override="$1"
-        HARNESS_REQUIRE_TOOL="$2"
-        ensure_services_up 2>&1
-    )
-    [[ -s "$START_LOG" ]] && got=restart
-    [[ "$got" == "$4" ]] || fail "T12: $5 — expected $4, got $got ($out)"
+# --- T6: no runtime installed -> announce and fall back to cmd_host ----------
+t6_launch() {
+    HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" HARNESS_ALLOWLIST_PATH="$ALLOWLIST" \
+        source "$HARNESS" >/dev/null 2>&1
+    harness_runtime_installed() { return 1; }
+    require_docker()            { echo "REQUIRE_DOCKER_REACHED"; exit 1; }
+    cmd_host() { echo "HOSTARGS=[$*] BACKEND=[${backend_override:-}]"; exit 46; }
+    run_agent opencode "$@" 2>&1
 }
-t12 1  ""  0 restart    "--require-tool against a proxy without it"
-t12 1  ""  1 no-restart "--require-tool against a proxy that already has it"
-t12 "" ""  1 no-restart "a plain launch leaves a require-tool proxy alone"
-t12 "" ""  0 no-restart "a plain launch against a plain proxy"
-t12 "" "1" 0 restart    "HARNESS_REQUIRE_TOOL=1 in .env reconciles a stale proxy"
-t12 "" "0" 0 no-restart "HARNESS_REQUIRE_TOOL=0 never restarts"
-rm -f "$START_LOG"
-ok "T12: ensure_services_up brings a running proxy into require-tool mode"
+t6_rc=0
+t6_out=$(t6_launch --yolo --net --mount /nonexistent -p "do it" --require-tool) || t6_rc=$?
+(( t6_rc == 46 )) || fail "T6: run_agent did not hand off to cmd_host (rc=$t6_rc) — $t6_out"
+grep -q "docker is not available" <<<"$t6_out" \
+    || fail "T6: no 'docker is not available' notice — $t6_out"
+grep -q "defaulting to 'harness host'" <<<"$t6_out" \
+    || fail "T6: the notice does not say it is defaulting to host mode — $t6_out"
+grep -q 'HOSTARGS=\[--yolo -p do it\]' <<<"$t6_out" \
+    || fail "T6: wrong args handed to cmd_host (--yolo/-p kept, --net/--mount/--require-tool dropped) — $t6_out"
+grep -q "ignoring --mount" <<<"$t6_out" || fail "T6: dropped --mount not reported — $t6_out"
+t6_rc=0
+t6_out=$(t6_launch) || t6_rc=$?
+(( t6_rc == 46 )) && grep -q 'HOSTARGS=\[\]' <<<"$t6_out" \
+    || fail "T6: a bare 'harness' did not fall back with no args (rc=$t6_rc) — $t6_out"
+ok "T6: with no docker/podman installed, 'harness' says so and runs 'harness host'"
 
-# --- T9: the flag is documented in both help texts --------------------------
+# --- T7: help no longer advertises the flag ---------------------------------
 help_out=$(HARNESS_SOURCE_ONLY=1 source "$HARNESS" >/dev/null 2>&1; cmd_help 2>&1)
-grep -q -- '--require-tool' <<<"$help_out" \
-    || fail "T9: cmd_help does not mention --require-tool"
-# It is an agent flag now too (bare `harness --require-tool`), so it has to be
-# listed with the other ones and not only under `start`.
 sed -n '/^agent flags:/,$p' <<<"$help_out" | grep -q -- '--require-tool' \
-    || fail "T9: --require-tool is missing from the agent flags list"
+    && fail "T7: --require-tool is still listed as an agent flag"
+grep -q "falls back\|runs 'harness host' instead" <<<"$help_out" \
+    || fail "T7: cmd_help does not mention the no-docker fallback"
 host_help=$(HARNESS_SOURCE_ONLY=1 source "$HARNESS" >/dev/null 2>&1; cmd_host --help 2>&1)
-grep -q -- '--require-tool' <<<"$host_help" \
-    || fail "T9: 'harness host --help' does not mention --require-tool"
-ok "T9: --require-tool is documented in 'harness help' and 'harness host --help'"
+grep -q -- '\[--require-tool\]' <<<"$host_help" \
+    && fail "T7: 'harness host --help' still lists --require-tool in its usage"
+grep -q "finish" <<<"$host_help" \
+    || fail "T7: 'harness host --help' does not explain the finish-only ending"
+ok "T7: help reflects require-tool as the default and documents the fallback"
 
 echo "------------------------------------------------------------"
 echo "REQUIRE-TOOL TEST PASSED (${pass} checks)"

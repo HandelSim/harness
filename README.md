@@ -120,7 +120,8 @@ first run auto-fetches its deps (jq, Node >= 20, opencode) into
 `state/host/toolchain/`; you only need Python 3. Host mode has **no egress
 firewall** and runs as your full host user, so it prompts to confirm on every
 launch (`HARNESS_HOST_CONFIRM=1` to skip in automation). Prefer the sandboxed
-container mode; host mode is the fallback.
+container mode; host mode is the fallback. With no docker or podman installed,
+a bare `harness` says so and runs `harness host` for you.
 
 ## Egress firewall
 

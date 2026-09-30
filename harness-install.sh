@@ -600,7 +600,7 @@ preflight() {
     else
         HOST_ONLY=1
         echo "  ⚠ no container runtime (docker/podman) found — installing host-only"
-        echo "    'harness host' runs containerless; 'harness start/opencode/shell' will need docker"
+        echo "    'harness host' runs containerless (bare 'harness' falls back to it); 'harness start/shell' need docker"
 
         # Python 3 is the only host-mode dep the user must supply: it bootstraps
         # the proxy venv, so it has to exist before harness can fetch anything.
@@ -1511,10 +1511,9 @@ done
 
 echo
 title "Next"
-# A HOST_ONLY install has no container runtime, so bare 'harness' (which starts
-# the container stack) would hard-fail with "container runtime is required". The
-# working launch verb for these users is 'harness host', so the primary "Next"
-# instruction must point there, not at bare 'harness'.
+# A HOST_ONLY install has no container runtime. Bare 'harness' notices that and
+# falls back to host mode with a notice, but 'harness host' is the verb that
+# says what actually runs, so the primary "Next" instruction points there.
 run_cmd="harness"
 (( ${HOST_ONLY:-0} == 1 )) && run_cmd="harness host"
 if (( ${#missing_required[@]} > 0 )); then
@@ -1536,6 +1535,8 @@ cat <<EOF
 No container runtime was found, so this is a HOST-ONLY install. Use the
 containerless mode:
   cd into any project directory and run: harness host [agent flags...]
+(Bare 'harness' does the same here: with no docker it says so and falls back
+to host mode.)
 
 'harness host' runs the proxy + opencode as plain host processes. The first run
 fetches its dependencies (jq, Node >= 20, opencode) automatically into

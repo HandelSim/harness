@@ -79,14 +79,6 @@ services:
       # is the mechanism the schema-migration decision is gated on). See
       # architecture/proxy.md "Cooperative tool-search".
       HARNESS_TOOL_SEARCH: ${HARNESS_TOOL_SEARCH:-0}
-      # Require-tool mode (default off). Set to 1 so every assistant
-      # message must carry a tool call and the only way to end a turn is
-      # the synthetic `finish` tool the proxy serves itself; a text-only
-      # reply is rejected in-proxy and never reaches opencode. `harness
-      # start --require-tool` sets it for one launch via the runtime
-      # override; this key is how you make it stick. See
-      # architecture/proxy.md "Require-tool mode".
-      HARNESS_REQUIRE_TOOL: ${HARNESS_REQUIRE_TOOL:-0}
     volumes:
       # When OUTPUT_DIR is set, the proxy writes per-request debug files here.
       # On Windows users should set OUTPUT_DIR=//output to bypass MSYS path
@@ -112,10 +104,6 @@ services:
       # description costs that description, not the block.
       - ${INSTALL_ROOT:-./proxy}/reminder.md:/app/reminder.md:ro
       - ${INSTALL_ROOT:-./proxy}/tool-guidance.json:/app/tool-guidance.json:ro
-      # The reminder variant require-tool mode loads instead of
-      # reminder.md. Seeded and mounted unconditionally so flipping
-      # HARNESS_REQUIRE_TOOL on needs no compose change.
-      - ${INSTALL_ROOT:-./proxy}/reminder-require-tool.md:/app/reminder-require-tool.md:ro
     # init-firewall.sh requires NET_ADMIN and NET_RAW to manage iptables/ipset.
     cap_add:
       - NET_ADMIN

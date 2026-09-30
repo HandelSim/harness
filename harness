@@ -80,16 +80,6 @@ runtime_override="$state_root/.harness-runtime.yml"
 # the proxy to its built-in "hybrid" default. See _parse_start_flags.
 prompt_mode_override=""
 
-# Ephemeral require-tool mode for this invocation. Empty unless
-# `harness start/restart/host --require-tool` was passed; when set it is
-# injected as HARNESS_REQUIRE_TOOL=1 (proxy container env via
-# write_runtime_override, or the host proxy's env prefix in host_proxy_start)
-# and the proxy then refuses any assistant message that carries no tool call.
-# Like --prompt-mode it is NOT persisted, so an internal restart (the one
-# `harness upgrade` runs, say) drops it; the persistent form is the
-# HARNESS_REQUIRE_TOOL key in .env, which this flag overrides for one launch.
-require_tool_override=""
-
 # Which upstream dialect the proxy speaks for THIS invocation. Empty leaves the
 # proxy on its built-in "openai" default (the OpenAI-compatible contract);
 # `harness chatgpt` sets it to "chatgpt" and it is injected as PROXY_BACKEND
@@ -866,15 +856,6 @@ seed_tool_guidance_file() {
         "the per-tool entries in that reminder"
 }
 
-# The require-tool variant of the reminder. Seeded unconditionally, not only
-# when --require-tool is passed: it is a compose bind-mount source, and docker
-# creates a DIRECTORY in place of a missing source, which mounts a directory
-# over the file and silently drops the proxy to its built-in fallback.
-seed_require_tool_reminder_file() {
-    seed_user_data_file reminder-require-tool.md proxy/reminder-require-tool.md \
-        "the per-turn reminder used under --require-tool"
-}
-
 # Build the consolidated MCP tool-recency map for the proxy. For every ENABLED
 # MCP under state/mcp/<name>/, read its recency.json (a bare `tool -> one-line
 # description` map) and emit ONE merged JSON object keyed `<name>_<tool>` — the
@@ -1035,10 +1016,6 @@ write_runtime_override() {
                 body+="      PROXY_PROMPT_MODE: \"${prompt_mode_override}\""$'\n'
                 proxy_emitted=1
             fi
-            if [[ "$svc" == "proxy" && -n "$require_tool_override" ]]; then
-                body+="      HARNESS_REQUIRE_TOOL: \"1\""$'\n'
-                proxy_emitted=1
-            fi
             if [[ "$svc" == "proxy" && -n "$backend_override" ]]; then
                 body+="      PROXY_BACKEND: \"${backend_override}\""$'\n'
                 if _backend_is_chatgpt; then
@@ -1054,18 +1031,15 @@ write_runtime_override() {
         ' "$net_overrides_path" 2>/dev/null || true)
     fi
 
-    # 2. Ephemeral proxy overrides (`start/restart --prompt-mode`,
-    # `--require-tool`). Injected into the proxy container env for this launch
+    # 2. Ephemeral proxy overrides (`start/restart --prompt-mode`, the
+    # chatgpt backend). Injected into the proxy container env for this launch
     # only. If the firewall loop above already emitted a `proxy:` block we
     # appended them there; otherwise emit a standalone block here.
-    if [[ ( -n "$prompt_mode_override" || -n "$require_tool_override" || -n "$backend_override" ) && "$proxy_emitted" -eq 0 ]]; then
+    if [[ ( -n "$prompt_mode_override" || -n "$backend_override" ) && "$proxy_emitted" -eq 0 ]]; then
         body+="  proxy:"$'\n'
         body+="    environment:"$'\n'
         if [[ -n "$prompt_mode_override" ]]; then
             body+="      PROXY_PROMPT_MODE: \"${prompt_mode_override}\""$'\n'
-        fi
-        if [[ -n "$require_tool_override" ]]; then
-            body+="      HARNESS_REQUIRE_TOOL: \"1\""$'\n'
         fi
         if [[ -n "$backend_override" ]]; then
             body+="      PROXY_BACKEND: \"${backend_override}\""$'\n'
@@ -1182,40 +1156,6 @@ _running_proxy_fp() {
     printf '%s' "$val"
 }
 
-# True when <value> is one the proxy itself reads as require-tool ON. Kept in
-# one place because three callers have to agree with proxy.py's truthy set, or
-# a user who wrote HARNESS_REQUIRE_TOOL=0 gets restarts for a feature that is
-# not even on. `tr`, not `${v,,}`: macOS still ships bash 3.2.
-_require_tool_truthy() {
-    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-        1|true|yes|on) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# Resolves require-tool for THIS invocation, in both run modes: the one-shot
-# --require-tool flag wins (start/restart, host, and a bare agent launch), else
-# the persistent HARNESS_REQUIRE_TOOL key in .env. Read by ensure_services_up
-# (container) and by host_proxy_fingerprint / host_proxy_start (host).
-_require_tool_on() {
-    _require_tool_truthy "${require_tool_override:-${HARNESS_REQUIRE_TOOL:-}}"
-}
-
-# Echo 1 or 0 for the require-tool state the RUNNING proxy container captured
-# at `up` time — from the runtime override a --require-tool launch wrote, or
-# from the HARNESS_REQUIRE_TOOL key compose interpolates out of .env. Empty
-# output and rc 1 when no proxy is running.
-_running_proxy_require_tool() {
-    local proxy_id val
-    proxy_id=$(compose ps -q proxy 2>/dev/null || true)
-    [[ -n "$proxy_id" ]] || return 1
-    val=$(harness_docker inspect \
-        --format '{{range .Config.Env}}{{println .}}{{end}}' "$proxy_id" 2>/dev/null \
-        | sed -n 's/^HARNESS_REQUIRE_TOOL=//p' | tail -n1)
-    val=${val%$'\r'}
-    if _require_tool_truthy "$val"; then printf '1'; else printf '0'; fi
-}
-
 # True when the chatgpt backend is in play at all: either this invocation
 # selected it, or the install has it configured and so may have a chatgpt proxy
 # running. An install that never set CHATGPT_BASE_URL can never have started
@@ -1255,11 +1195,9 @@ _adopt_running_backend() {
 # not possible, and quietly answering from the wrong upstream is worse.
 ensure_services_up() {
     local want="${backend_override:-openai}" have
-    local started=0
     if ! services_up; then
         echo "harness: services not running; starting..."
         cmd_start
-        started=1
     elif _chatgpt_in_play; then
         # Reconciliation costs two `compose ps` plus a `docker inspect` on every
         # launch, so it is skipped entirely on an install that has never
@@ -1269,7 +1207,6 @@ ensure_services_up() {
         if have=$(_running_proxy_backend) && [[ "$have" != "$want" ]]; then
             echo "harness: proxy is running the '$have' backend; restarting it for '$want'"
             cmd_start
-            started=1
         elif _backend_is_chatgpt && [[ "$(_running_proxy_fp)" != "$(_chatgpt_config_fingerprint)" ]]; then
             # Same backend, different credentials: the running container captured
             # the old CHATGPT_* at `up` time. Rotating an expired cookie is the one
@@ -1277,22 +1214,7 @@ ensure_services_up() {
             # container over an .env edit, so reconcile it explicitly.
             echo "harness: chatgpt config changed since the proxy started; restarting it"
             cmd_start
-            started=1
         fi
-    fi
-    # Require-tool is captured by the proxy container at `up` time too, so a
-    # `harness --require-tool` launch that finds the proxy already up (another
-    # agent is running, or a `-p` run left it behind) would otherwise be a
-    # silent no-op — the flag's whole job is to change how that proxy answers.
-    # Probed ONLY when this launch asks for the mode: an install that never
-    # passes the flag and never sets the .env key pays nothing, and a plain
-    # launch never restarts the proxy out from under a concurrent
-    # --require-tool agent. The reverse direction is deliberately not
-    # reconciled: like --prompt-mode, the mode lasts as long as the proxy it
-    # started with, and the last agent to exit takes that proxy down.
-    if (( ! started )) && _require_tool_on && [[ "$(_running_proxy_require_tool)" != "1" ]]; then
-        echo "harness: proxy is running without require-tool; restarting it with it on"
-        cmd_start
     fi
     # Reconcile host MCPs on every launch (idempotent): a host MCP may have been
     # registered, or its process died, since the container stack came up. Cheap
@@ -2231,26 +2153,23 @@ usage:
   harness <command> [args...]  run a management command
 
 Running 'harness' with no command — or with only agent flags such as --yolo,
---net, --mount, --require-tool, or -p — launches an opencode agent in the
-current directory.
+--net, --mount, or -p — launches an opencode agent in the current directory.
+With no docker or podman installed it says so and runs 'harness host' instead.
 
 commands:
-  start [--prompt-mode M] [--require-tool]
+  start [--prompt-mode M]
                         build and bring up the proxy service.
                         Run automatically by bare 'harness'; rarely needed
                         by hand. --prompt-mode sets the proxy's cooperative-
                         prompt mode (hybrid (default) / user_front /
                         passthrough) for THIS launch only — ephemeral, for
                         benchmarking/power use; a later bare start reverts to
-                        hybrid. --require-tool makes every assistant message
-                        carry a tool call: a message without one is rejected
-                        by the proxy and the model is asked again, and the
-                        only way to end a turn is the synthetic 'finish'
-                        tool. Use it when the agent keeps stopping early with
-                        advice instead of doing the work. Also ephemeral —
-                        set HARNESS_REQUIRE_TOOL=1 in .env to make it stick.
+                        hybrid. The proxy always runs in require-tool mode
+                        (except under passthrough): every assistant message
+                        must carry a tool call, and the only way to end a
+                        turn is the synthetic 'finish' tool.
   down                  stop the proxy service (does NOT touch agents)
-  restart [--prompt-mode M] [--require-tool]
+  restart [--prompt-mode M]
                         down + start (preserves per-invocation state).
                         Accepts the same flags as start.
   update                git pull --ff-only in the clone
@@ -2352,16 +2271,6 @@ agent flags:
                         defaults via HARNESS_EXTRA_MOUNTS in .env (colon-
                         separated). The CWD is always mounted, regardless
                         of --mount; the agent always starts in the CWD.
-  --require-tool        make every assistant message carry a tool call: a
-                        message without one is rejected by the proxy and the
-                        model is asked again, and the only way to end a turn
-                        is the synthetic 'finish' tool. Use it when the agent
-                        keeps stopping early with advice instead of doing the
-                        work. This is proxy config, not an opencode flag, so
-                        it restarts a proxy that is already up without it.
-                        Ephemeral, like 'start --require-tool': it lasts as
-                        long as that proxy (the last agent to exit stops it).
-                        Set HARNESS_REQUIRE_TOOL=1 in .env to make it stick.
   -p, --print "PROMPT"  headless single-shot invocation; runs `opencode run`
                         inside the container
 
@@ -2399,10 +2308,11 @@ notes:
 EOF
 }
 
-# Parse start/restart's two optional flags and set the matching globals:
-# `--prompt-mode <mode>` (validated against the three modes the proxy accepts)
-# and `--require-tool`. Both are ephemeral — see prompt_mode_override /
-# require_tool_override and write_runtime_override. Any other argument is
+# Parse start/restart's optional flag and set the matching global:
+# `--prompt-mode <mode>` (validated against the three modes the proxy accepts).
+# Ephemeral — see prompt_mode_override and write_runtime_override.
+# `--require-tool` is still accepted and ignored: it is the default now, and
+# scripts written when it was opt-in keep working. Any other argument is
 # rejected so a typo doesn't pass silently. Accepts both `--prompt-mode hybrid`
 # and `--prompt-mode=hybrid`.
 _parse_start_flags() {
@@ -2420,10 +2330,9 @@ _parse_start_flags() {
                 prompt_mode_override="${1#--prompt-mode=}"
                 ;;
             --require-tool)
-                require_tool_override=1
                 ;;
             *)
-                err "unknown option '$1' (start/restart accept only --prompt-mode <mode> and --require-tool)"
+                err "unknown option '$1' (start/restart accept only --prompt-mode <mode>)"
                 exit 1
                 ;;
         esac
@@ -2482,7 +2391,6 @@ cmd_start() {
     # before `up` — docker would otherwise create a directory in their place.
     # compose() exports INSTALL_ROOT, which is what the two mounts interpolate.
     seed_reminder_file
-    seed_require_tool_reminder_file
     seed_tool_guidance_file
 
     export HARNESS_MCP_TOOL_RECENCY="$(mcp_tool_recency_json)"
@@ -3910,15 +3818,11 @@ host_proxy_fingerprint() {
         data+=$(printf '\nbackend=chatgpt\ncgurl=%s\ncgmodel=%s\ncgcookie=%s\n' \
             "${CHATGPT_BASE_URL:-}" "${CHATGPT_MODEL_NAME:-}" "${CHATGPT_COOKIE_STRING:-}")
     fi
-    # Appended only when require-tool is on, for the same reason the chatgpt
-    # block is: an existing host-mode user's fingerprint stays byte-identical,
-    # so their first launch after upgrading does not kill a healthy proxy and
-    # claim ".env changed". Folding it in at all is what makes `harness host
-    # --require-tool` restart a proxy that is already running — without it the
-    # reuse short-circuit returns first and the flag silently does nothing.
-    if _require_tool_on; then
-        data+=$(printf '\nrequiretool=1\n')
-    fi
+    # Require-tool is always on now. Kept in the fingerprint so a host proxy
+    # left running from before it became the default (started without it, so
+    # its fingerprint lacks this line) is restarted once instead of reused,
+    # while one already started with the old --require-tool flag still matches.
+    data+=$(printf '\nrequiretool=1\n')
     if command -v sha256sum >/dev/null 2>&1; then
         printf '%s' "$data" | sha256sum | cut -d' ' -f1
     else
@@ -4489,16 +4393,11 @@ host_proxy_start() {
     # inherited .env one.
     local host_output_dir
     host_output_dir=$(host_output_dir_resolve "${OUTPUT_DIR:-}")
-    # Normalised once here so the value handed to the proxy matches the one the
-    # fingerprint above hashed; an untruthy .env value passes through as empty.
-    local require_tool_env=""
-    if _require_tool_on; then require_tool_env=1; fi
     # Host mode runs proxy.py straight from the clone, so there is no compose
     # bind-mount to put the user's reminder / tool-guidance files in proxy.py's
     # default spot. INSTALL_ROOT below is how the proxy finds them instead —
     # the same variable compose interpolates into the two bind-mounts.
     seed_reminder_file
-    seed_require_tool_reminder_file
     seed_tool_guidance_file
     # HARNESS_FORCE_LOOPBACK is belt-and-suspenders for the no-firewall mode:
     # proxy.py refuses to bind a non-loopback PROXY_HOST when it is set, so a
@@ -4524,7 +4423,6 @@ host_proxy_start() {
     # before the var existed.
     PROXY_HOST=127.0.0.1 \
         HARNESS_FORCE_LOOPBACK=1 \
-        HARNESS_REQUIRE_TOOL="$require_tool_env" \
         PROXY_PORT="$port" \
         PROXY_BACKEND="${backend_override:-}" \
         OUTPUT_DIR="$host_output_dir" \
@@ -4832,7 +4730,7 @@ cmd_host() {
 harness host — run CONTAINERLESS: the proxy + opencode as plain host processes.
 
 usage:
-  harness host [--yolo] [--require-tool] [-p "PROMPT"] [agent flags...]
+  harness host [--yolo] [-p "PROMPT"] [agent flags...]
   harness host down            stop the background host proxy
 
 No docker, no images, no egress firewall; opencode runs as your full host user,
@@ -4842,12 +4740,9 @@ are fetched automatically on first run into state/host/toolchain (a satisfactory
 host jq/Node/opencode is reused instead). The proxy binds 127.0.0.1 only; its log
 lives at state/host/proxy.log. Any other flag is forwarded to opencode unchanged.
 
---require-tool makes the proxy reject any assistant message that carries no
-tool call, so the only way the agent can end a turn is the synthetic 'finish'
-tool. Use it when the agent keeps stopping early with advice instead of doing
-the work. It is part of the running proxy's config, so passing (or dropping)
-it restarts a proxy that is already up. Set HARNESS_REQUIRE_TOOL=1 in .env to
-make it the default.
+The proxy rejects any assistant message that carries no tool call, so the only
+way the agent can end a turn is the synthetic 'finish' tool (require-tool mode,
+always on).
 
 notes:
   - v1: single CWD, no host-MCP wiring. Runs on Linux, macOS, and Windows
@@ -4871,10 +4766,9 @@ EOF
     for arg in "$@"; do
         case "$arg" in
             --yolo)      yolo=1 ;;
-            # Consumed here, never forwarded: it configures the host PROXY, and
-            # opencode would reject an unknown flag. Everything else still
-            # falls through to opencode, as the help text promises.
-            --require-tool) require_tool_override=1 ;;
+            # The default now; still consumed so an old invocation carrying it
+            # is not forwarded to opencode, which rejects an unknown flag.
+            --require-tool) ;;
             -p|--print)  print_mode=1; pass_args+=("$arg") ;;
             *)           pass_args+=("$arg") ;;
         esac
@@ -5063,11 +4957,9 @@ run_agent() {
                 extra_mounts+=("${arg#--mount=}")
                 ;;
             --require-tool)
-                # Consumed here, never forwarded: it configures the PROXY (the
-                # same global `harness start/restart/host --require-tool` sets),
-                # and opencode aborts on an unknown flag. ensure_services_up
-                # below restarts a proxy that is already up without it.
-                require_tool_override=1
+                # The default now (the proxy always runs require-tool mode);
+                # still consumed, never forwarded, because opencode aborts on
+                # an unknown flag and older invocations may carry it.
                 ;;
             -p|--print)
                 print_mode=1
@@ -5081,6 +4973,30 @@ run_agent() {
     if (( expecting_mount_arg )); then
         err "--mount requires a path argument"
         exit 1
+    fi
+
+    # No container runtime installed at all (a host-only install): containerless
+    # host mode is the only way this launch can run, so say so and hand off to
+    # it — its own confirm gate still asks before anything starts. A runtime that
+    # is installed but not running is NOT downgraded: require_docker below tries
+    # to start it and otherwise fails with a pointer to 'harness host', because
+    # silently dropping the sandbox and firewall over a stopped daemon is worse
+    # than an error. --net and --mount have no host-mode meaning (no firewall,
+    # the whole filesystem is visible), so they are dropped with a note.
+    if ! harness_runtime_installed; then
+        echo "harness: docker is not available (no docker or podman installed); defaulting to 'harness host'" >&2
+        if (( ${#extra_mounts[@]} )); then
+            echo "harness: ignoring --mount: host mode already sees your whole filesystem" >&2
+        fi
+        local host_args=()
+        (( yolo )) && host_args+=(--yolo)
+        (( ${#pass_args[@]} )) && host_args+=("${pass_args[@]}")
+        if (( ${#host_args[@]} )); then
+            cmd_host "${host_args[@]}"
+        else
+            cmd_host
+        fi
+        return
     fi
 
     require_docker

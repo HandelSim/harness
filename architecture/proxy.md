@@ -109,13 +109,16 @@ validator in `_setup_prompt_mode` accepts:
   on the last user message, organised so the **live user request comes FIRST**
   (wrapped in `<<<BEGIN_USER_REQUEST>>>` markers — issue #110), then a short
   reminder follows. The reminder's WORDING lives in editable files, not
-  in proxy.py — see "Editable reminder data" below. It has eight labelled
+  in proxy.py — see "Editable reminder data" below. It has nine labelled
   bullets, deliberately terse: the block is re-sent every turn, and a long
   one dilutes the rule that matters most (the model ending its turn with
   advice instead of a tool call), so each bullet is trimmed to the clauses
   that name a failure and its fix. The labels are imperatives rather than
   category headings, so each one reads as an instruction.
-  **Act, don't describe** leads — primacy for the failure the block exists to
+  **Every message needs a tool call** opens it (the
+  [require-tool](#require-tool-mode) contract: a text-only message is
+  rejected, so anything the model wants to say goes in a call's `summary`).
+  **Act, don't describe** follows — primacy for the failure the block exists to
   stop: the model reverting to the upstream's "I can't execute, here are
   commands for you to run" persona (issue #109). The positive assertion (it
   acts through opencode; its ```json calls really execute and the results are
@@ -125,8 +128,9 @@ validator in `_setup_prompt_mode` accepts:
   permission to do a step the task already covers — and gives the rewrite:
   emit that exact command as the tool call that performs it, in the same
   message. A rule the model cannot catch itself breaking does not fire. It
-  ends with the legitimate no-tool-fits fallback, qualified in place because
-  it is otherwise the nearest available excuse for handing the work back.
+  ends with the legitimate no-tool-fits fallback (ask the question as the
+  `summary` of a `finish` call), qualified in place because it is otherwise
+  the nearest available excuse for handing the work back.
   **Amnesia** (the premise for re-sending the rules at all: history is
   silently truncated mid-task, so nothing above this block can be trusted.
   Carries the per-turn check that the TEXT of AGENTS.md is still visible — a
@@ -147,7 +151,8 @@ validator in `_setup_prompt_mode` accepts:
   parent's context. Delegation had its own **Delegate** label before the
   block was condensed),
   **Call format** (the JSON envelope: one complete fenced block, the
-  `{"name", "arguments"}` body shape, backslash escaping, and the
+  `{"name", "arguments"}` body shape, that the block goes in the message body
+  because there is no separate tool-calls channel, backslash escaping, and the
   no-fabricated-results rule),
   **Smallest change** (the diff a human has to review is the constraint:
   change only what the request requires, no drive-by refactors or
@@ -177,17 +182,13 @@ validator in `_setup_prompt_mode` accepts:
   **The block closes with an end-of-turn check**, deliberately placed AFTER
   the per-tool entries: it is the last text before generation, the strongest
   slot in the message, and what it guards is precisely the end of a turn. It
-  states the mechanism rather than only the rule — a turn ends either with a
-  tool call or with the final report on finished work, and a turn with
-  neither comes back as `finish_reason: stop`, so opencode ends the run and
-  the task dies with the model's advice as its last word (the same property
-  that makes the text-only [empty-response
-  rescue](#empty-response-detection) unable to continue the loop). The
-  finished-work branch is kept on purpose: without it the rule would demand a
-  reflex tool call after the final report. (Under
-  [require-tool mode](#require-tool-mode-harness_require_tool) that branch is
-  gone — the proxy rejects a text-only turn outright — which is why the mode
-  loads its own reminder file with a different closer.) The closer then restates the rules
+  states the [require-tool](#require-tool-mode) mechanism rather than only
+  the rule — the turn cannot end with text; it ends either with a call to a
+  working tool, which continues the run, or with a call to `finish`, which
+  stops it and shows the user its `summary`, and anything else is rejected
+  and comes straight back. The `finish` branch is kept on purpose (asked as
+  "is the work genuinely done AND verified?"): without it the rule would
+  demand a reflex tool call after the work is done. The closer then restates the rules
   it guards in a blunt imperative voice (read AGENTS.md now; do the work with
   your tools instead of handing back instructions; verify rather than assume)
   and ends with a worked ```json `bash` call for the model to emit if it
@@ -315,20 +316,18 @@ able to corrupt the other seventeen. Both files follow the same
 tracked-default / seeded-user-copy / bind-mount / per-section-fallback
 contract, described once below.
 
-- **Tracked defaults** — `proxy/reminder.md`,
-  `proxy/reminder-require-tool.md` and `proxy/tool-guidance.json`. All three
+- **Tracked defaults** — `proxy/reminder.md` and
+  `proxy/tool-guidance.json`. Both
   `COPY`d into the proxy image at `/app/`, so a container launched without the
   mounts still has a working reminder.
-- **User copies** — `<install-root>/reminder.md`,
-  `<install-root>/reminder-require-tool.md` and
+- **User copies** — `<install-root>/reminder.md` and
   `<install-root>/tool-guidance.json`, sitting with the rest of the user's
   config (`.env`, `.harness-allowlist`), gitignored and seeded from the
-  tracked defaults by `seed_reminder_file` /
-  `seed_require_tool_reminder_file` / `seed_tool_guidance_file` (all thin
+  tracked defaults by `seed_reminder_file` / `seed_tool_guidance_file` (thin
   wrappers over `seed_user_data_file`) on every `harness start` /
-  `harness host` (no-op once the file exists). All three are seeded and
-  mounted unconditionally, whether or not require-tool is on, so flipping the
-  flag needs no re-seed and no compose change. Gitignoring them is what keeps
+  `harness host` (no-op once the file exists). A `reminder-require-tool.md`
+  left at the root of an older install is no longer seeded, mounted or read
+  (it is still gitignored so it stays out of `git status`). Gitignoring them is what keeps
   an edit from colliding with `harness update`'s `git pull --ff-only` — note
   the ignore rules are **anchored** (`/reminder.md`), or they would also
   ignore the tracked `proxy/` defaults. The copies keep their tracked
@@ -339,10 +338,7 @@ contract, described once below.
   path (edits and all) on the next start, so the migration needs no upgrade
   action.
 - **How the proxy finds them** — `_user_data_path(basename)`, wrapped by
-  `_reminder_template_path()` / `_tool_guidance_path()`
-  (`_reminder_template_path` picks the basename, returning
-  `reminder-require-tool.md` when
-  [require-tool mode](#require-tool-mode-harness_require_tool) is on): (1)
+  `_reminder_template_path()` / `_tool_guidance_path()`: (1)
   `$INSTALL_ROOT/<basename>` if that var is set, else (2) the file next
   to `proxy.py` (resolved off `__file__`, never a hardcoded `proxy/` — the
   image flattens the repo into `/app`). No new variable exists for this:
@@ -368,15 +364,13 @@ contract, described once below.
   patched `_HYBRID_DETAIL_TOOLS`). Fixed for the life of a launch, like the
   recency map. The startup banner prints both resolved paths, the reminder's
   loaded size, and the guidance's tool count.
-- **The require-tool variant** — `reminder-require-tool.md` is a near-copy of
-  `reminder.md`: the same bullets, the same five tokens, one extra leading
-  bullet ("every message needs a tool call"), and a rewritten closer, because
-  the shipped one's "a turn ends either with a tool call or with your final
-  report" is a false statement under that mode. It is a **separate file**
-  rather than a `{{CLOSING}}` token in the one file so that either prose can
-  be reworded without touching the other; the cost is a second copy of the
-  seeding, mount, ignore and `userfile_sync` plumbing.
-- **Tokens** (both reminder files) — `{{ENVIRONMENT}}`, `{{TODOS}}`, `{{HOST_OS}}`,
+- **One reminder file** — there used to be a second,
+  `reminder-require-tool.md`, loaded while require-tool was opt-in. With the
+  mode on for every launch that injects a reminder (passthrough injects
+  none), `reminder.md` carries that prose — the leading "every message needs
+  a tool call" bullet and the `finish` closer — and the variant, its seeder,
+  mount, `COPY` and `userfile_sync` entry are gone.
+- **Tokens** — `{{ENVIRONMENT}}`, `{{TODOS}}`, `{{HOST_OS}}`,
   `{{CWD}}`, `{{TOOL_ENTRIES}}`, substituted in ONE `re.sub` pass over an
   alternation of exactly those five, deliberately not
   `str.format`/`string.Template` and not chained `str.replace` calls. Not
@@ -890,13 +884,16 @@ identifier or partial fence) and names valid JSON `\escape` sequences
 (`\n`, `\x1e`, `\\`) so the bad-escape failure mode is less likely to
 arise in the first place. Retry catches the cases that slip through.
 
-## Require-tool mode (`HARNESS_REQUIRE_TOOL`)
+## Require-tool mode
 
-Default off. When on, **every** assistant message must carry a tool call,
-and the only way to end a turn is a call to a synthetic `finish` tool the
-proxy serves itself. Turned on for one launch with `harness start
---require-tool` / `harness restart --require-tool` / `harness host
---require-tool`, or persistently with `HARNESS_REQUIRE_TOOL=1` in `.env`.
+Always on, except in the `passthrough` prompt mode. **Every** assistant
+message must carry a tool call, and the only way to end a turn is a call to a
+synthetic `finish` tool the proxy serves itself. There is no switch:
+`_setup_require_tool` sets `_REQUIRE_TOOL_ENABLED = _PROMPT_MODE !=
+"passthrough"` at startup (printing an `[i]` line when passthrough leaves it
+off) and no longer reads `HARNESS_REQUIRE_TOOL`, so a leftover key in an old
+`.env` is ignored. The `--require-tool` flag the CLI still accepts is a no-op
+kept for old invocations (see [`harness-cli.md`](harness-cli.md)).
 
 **The problem it solves.** opencode ends a run the moment the model returns a
 message with no tool call. A model that decides to hand back advice instead of
@@ -915,7 +912,7 @@ this mode stops arguing and makes it mechanically impossible.
   is truthy, so it would otherwise get `finish` as its only tool and burn the
   budget before answering); a **real `finish` tool** already in the inbound
   array (same safety yield as `_is_meta_tool_call` — the real tool wins);
-  and **passthrough** mode, which `_setup_require_tool` already refuses at
+  and **passthrough** mode, which `_setup_require_tool` already leaves off at
   startup, since enforcing would silently stop it being a control.
 - `_augment_tools_with_finish` builds `prompt_tools` = the inbound array plus
   `_FINISH_TOOL_SCHEMA`. Everything **prompt-facing** is built from that —
@@ -980,13 +977,12 @@ the meta loop ran.
 
 **Fail-open everywhere.** An exhausted budget, a failed upstream call, or a
 request the mode does not apply to falls through to exactly the behaviour of a
-launch without the flag — the model's text is forwarded unchanged. A stuck
+launch without the mode — the model's text is forwarded unchanged. A stuck
 turn would be worse than the problem being solved.
 
-**Reminder.** The mode loads `reminder-require-tool.md` instead of
-`reminder.md` (`_reminder_template_path` branches on the flag), because the
-shipped closer's "a turn ends either with a tool call or with your final
-report" is a false statement here. See
+**Reminder.** `reminder.md` is written for this mode (its closer: a turn ends
+only with a working tool call or with `finish`); there is no separate
+variant file any more. See
 [Editable reminder data](#editable-reminder-data-remindermd-tool-guidancejson).
 
 **Observability.** `catch_all` logs one line per event

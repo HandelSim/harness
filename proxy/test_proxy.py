@@ -898,8 +898,10 @@ class TestPromptInjectionModes(unittest.TestCase):
         # Announcing the work without the call in the same message is the
         # second reported failure mode, named in place.
         self.assertIn("with no call beside it", last_user)
-        # The legitimate fallback (when no tool fits) stays available.
-        self.assertIn("just ask or answer", last_user)
+        # The legitimate fallback (when no tool fits) stays available, routed
+        # through `finish` since a plain-text answer is rejected.
+        self.assertIn("ask your question as the `summary` of a `finish` call",
+                      last_user)
 
     def test_agency_bullet_names_the_trigger_and_the_replacement(self):
         """The reported failure is the model answering with a how-to instead
@@ -920,12 +922,13 @@ class TestPromptInjectionModes(unittest.TestCase):
                       last_user)
 
     def test_no_tool_fits_is_not_an_excuse_to_hand_back_instructions(self):
-        """The "just ask or answer" fallback is legitimate but is the nearest
+        """The ask-via-`finish` fallback is legitimate but is the nearest
         available excuse for advising, so it is qualified in place rather
         than removed."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
-        self.assertIn("just ask or answer", last_user)
+        self.assertIn("ask your question as the `summary` of a `finish` call",
+                      last_user)
         self.assertIn("not a license to hand the work back as instructions",
                       last_user)
 
@@ -933,18 +936,19 @@ class TestPromptInjectionModes(unittest.TestCase):
         """The end-of-turn check sits AFTER the per-tool entries, in the last
         slot before generation — the strongest position in the block, and the
         one that matches what it guards (ending a turn with prose while the
-        task is unfinished). It states the mechanism, not just the rule: a
-        turn with no tool call is `finish_reason: stop`, so opencode ends the
-        run and the task dies there. The finished-work branch stays, or the
-        rule would demand a reflex tool call after the final report."""
+        task is unfinished). It states the require-tool mechanism, not just
+        the rule: text alone is rejected, and the only two endings are a
+        working tool call or `finish`. The finished-work branch (`finish`)
+        stays, or the rule would demand a reflex tool call after the work is
+        done."""
         result = self._translate_with_mode("hybrid", pass_tools=True)
         last_user = result[-1]["content"]
         closer = "Before you end this turn:"
         self.assertIn(closer, last_user)
-        self.assertIn("There is no third option", last_user)
-        # The mechanism, not just the rule: a text-only turn ends the run.
-        self.assertIn("opencode STOPS the run", last_user)
-        self.assertIn("unless the work is genuinely done", last_user)
+        self.assertIn("you cannot end it with text", last_user)
+        # The mechanism, not just the rule: two endings, anything else bounces.
+        self.assertIn("a ```json call to `finish`, which stops it", last_user)
+        self.assertIn("is the work genuinely done AND verified", last_user)
         # After the tool entries, and last in the block.
         self.assertLess(last_user.index("Tools — one entry per tool"),
                         last_user.index(closer))
@@ -1705,7 +1709,8 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertIn("with no call beside it", agency)
         self.assertIn("opencode", agency)
         # The legitimate fallback when nothing fits, qualified in place.
-        self.assertIn("just ask or answer", agency)
+        self.assertIn("ask your question as the `summary` of a `finish` call",
+                      agency)
 
         tools = bullet("- Use the tools:", "- Call format:")
         # Tool-preference guidance, the completeness claim that replaced the
@@ -5218,29 +5223,27 @@ class TestRequireToolMode(unittest.TestCase):
 
     # -- setup / activation -------------------------------------------------
 
-    def test_setup_require_tool_truthy_values(self):
-        for raw, expected in [
-            ("1", True), ("true", True), ("TRUE", True), ("yes", True),
-            ("on", True), ("0", False), ("false", False), ("", False),
-            ("nope", False),
-        ]:
-            with patch.dict(os.environ, {"HARNESS_REQUIRE_TOOL": raw}), \
+    def test_setup_turns_it_on_in_every_mediated_mode(self):
+        """It is the default, with no env switch: a leftover
+        HARNESS_REQUIRE_TOOL=0 from an older .env must not turn it off."""
+        for mode in ("hybrid", "user_front"):
+            with patch.dict(os.environ, {"HARNESS_REQUIRE_TOOL": "0"}), \
+                    patch.object(proxy, "_PROMPT_MODE", mode), \
                     patch("sys.stdout", io.StringIO()):
                 proxy._setup_require_tool()
-            self.assertEqual(proxy._REQUIRE_TOOL_ENABLED, expected, raw)
+            self.assertTrue(proxy._REQUIRE_TOOL_ENABLED, mode)
         proxy._REQUIRE_TOOL_ENABLED = False
 
     def test_passthrough_mode_forces_require_tool_off(self):
         """Passthrough is the benchmark control: zero mediation, tools
         forwarded verbatim. Enforcing here would silently stop being a
-        control, so the flag loses and says so."""
+        control, so the mode stays off there and says so."""
         buf = io.StringIO()
-        with patch.dict(os.environ, {"HARNESS_REQUIRE_TOOL": "1"}), \
-                patch.object(proxy, "_PROMPT_MODE", "passthrough"), \
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"), \
                 patch("sys.stdout", buf):
             proxy._setup_require_tool()
         self.assertFalse(proxy._REQUIRE_TOOL_ENABLED)
-        self.assertIn("[!]", buf.getvalue())
+        self.assertIn("passthrough", buf.getvalue())
         proxy._REQUIRE_TOOL_ENABLED = False
 
     def test_require_tool_active_yields(self):
@@ -5341,31 +5344,22 @@ class TestRequireToolMode(unittest.TestCase):
         self.assertIn("- finish(summary)", out)
         self.assertIn("only way to end your turn", out)
 
-    def test_the_mode_swaps_in_its_own_reminder_file(self):
-        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", False):
-            self.assertTrue(
-                proxy._reminder_template_path().endswith("reminder.md"))
-            self.assertFalse(
-                proxy._reminder_template_path().endswith(
-                    "reminder-require-tool.md"))
-        with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", True):
-            self.assertTrue(
-                proxy._reminder_template_path().endswith(
-                    "reminder-require-tool.md"))
+    def test_there_is_one_reminder_file(self):
+        """The require-tool variant file is gone: reminder.md carries its
+        prose, and the mode no longer swaps files."""
+        for enabled in (False, True):
+            with patch.object(proxy, "_REQUIRE_TOOL_ENABLED", enabled):
+                self.assertEqual(
+                    os.path.basename(proxy._reminder_template_path()),
+                    "reminder.md")
 
-    def test_the_shipped_require_tool_reminder_carries_the_same_tokens(self):
-        """It is a near-copy of reminder.md, so it must substitute the same
-        five tokens — a dropped token degrades to literal `{{...}}` in the
-        prompt rather than erroring, which is exactly the silent failure the
-        loader's warning exists to catch."""
+    def test_the_shipped_reminder_teaches_finish(self):
+        """The model only ends a turn by calling `finish`, so the shipped
+        reminder has to say so in its closer."""
         here = os.path.dirname(os.path.abspath(proxy.__file__))
-        with open(os.path.join(here, "reminder-require-tool.md"),
-                  encoding="utf-8") as fh:
+        with open(os.path.join(here, "reminder.md"), encoding="utf-8") as fh:
             text = fh.read()
-        for token in ("{{ENVIRONMENT}}", "{{TODOS}}", "{{CWD}}",
-                      "{{TOOL_ENTRIES}}"):
-            self.assertIn(token, text)
-        self.assertIn("finish", text)
+        self.assertIn("a ```json call to `finish`", text)
 
     # -- end to end ---------------------------------------------------------
 

@@ -8,7 +8,9 @@
 # basenames, and only the copies AT THE INSTALL ROOT are ignored — the
 # tracked defaults under proxy/ stay tracked. (.harness-data/ and
 # the two .harness-* names are earlier locations, kept ignored so an install
-# that hasn't started since the move stays clean.)
+# that hasn't started since the move stays clean. /reminder-require-tool.md is
+# retired too: require-tool became the default and reminder.md took its prose,
+# so installs seeded before that still carry an unused copy at the root.)
 /reminder.md
 /reminder-require-tool.md
 /tool-guidance.json
