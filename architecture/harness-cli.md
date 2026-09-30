@@ -546,6 +546,10 @@ What it does, in order:
    over the (unfirewalled) network on first use, exactly as the container does.
    `host_preflight` then runs as a post-provision assertion — each of `python3`,
    `jq`, Node, `opencode` must both resolve **and** execute, naming any that fail.
+   If provisioning or that assertion fails on Windows and the install root is
+   outside the user profile, `host_win_location_hint` adds a note naming that as
+   the likely cause (managed PCs often run programs only from inside the
+   profile) with the commands to move the install and re-point the PATH wrapper.
 5. **Upstream auth gate + model catalog** — the same two checks container mode
    runs in `cmd_start`, which host mode previously skipped: `_gate_on_upstream_auth`
    aborts the launch on a **locked or rejected** key (printing the unlock URL),

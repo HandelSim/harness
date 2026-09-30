@@ -666,7 +666,7 @@ preflight() {
 
     # Existing harness/ in CWD
     if [[ -d "$cwd/$CLONE_DIR" ]]; then
-        echo "  ✗ ./$CLONE_DIR/ already exists; remove it or run install in a different parent directory"
+        echo "  ✗ $cwd/$CLONE_DIR already exists; remove it or install into a different parent directory"
         errors=$((errors+1))
     fi
 
@@ -936,6 +936,60 @@ Steps:
   9. Query the upstream API for available models and set DEFAULT_MODEL_NAME in .env.
 
 EOF
+
+# --- Windows: keep the install inside the user folder -------------------------
+#
+# Managed Windows PCs often let programs run only from inside the user's
+# profile (AppLocker/SRP path rules, or endpoint security that blocks and then
+# deletes the .exe). 'harness host' runs everything it downloads (jq, Node,
+# opencode, the proxy's Python venv) from <install-root>/state/host, so an
+# install under e.g. C:\SomeFolder is unusable in host mode on such a PC.
+# Offer the profile instead; without a tty, warn and keep the location.
+
+# Echo the Windows user profile as a Git Bash path (/c/Users/me). Non-zero
+# when USERPROFILE is unset.
+_inline_win_profile_dir() {
+    local p="${USERPROFILE:-}"
+    [[ -n "$p" ]] || return 1
+    if command -v cygpath >/dev/null 2>&1; then
+        p=$(cygpath -u "$p")
+    else
+        p="${p//\\//}"
+        if [[ "$p" =~ ^([A-Za-z]):(.*)$ ]]; then
+            p="/$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')${BASH_REMATCH[2]}"
+        fi
+    fi
+    printf '%s' "${p%/}"
+}
+
+# True when $1 is $2 or inside it. Case-insensitive: Windows paths are.
+_inline_path_within() {
+    local path dir
+    path=$(printf '%s' "${1%/}" | tr '[:upper:]' '[:lower:]')
+    dir=$(printf '%s' "${2%/}" | tr '[:upper:]' '[:lower:]')
+    [[ "$path" == "$dir" || "$path" == "$dir"/* ]]
+}
+
+if [[ "$(_inline_detect_os)" == windows ]] && _win_profile=$(_inline_win_profile_dir) \
+   && ! _inline_path_within "$cwd" "$_win_profile"; then
+    echo
+    echo "  ⚠ $install_root is outside your Windows user folder ($USERPROFILE)."
+    echo "    Many managed PCs only let programs run from inside the user folder, and"
+    echo "    'harness host' runs the tools it downloads (jq, Node, opencode) from the"
+    echo "    install folder. Here they may be blocked, or deleted by security software."
+    if [[ -t 0 ]]; then
+        read -rp "install into $USERPROFILE\\$CLONE_DIR instead (recommended)? [Y/n]: " _loc_ans
+        case "${_loc_ans:-}" in
+            n|N|no|NO) echo "  keeping $install_root" ;;
+            *) cwd="$_win_profile"; install_root="$cwd/$CLONE_DIR"
+               echo "  installing to $install_root" ;;
+        esac
+    else
+        echo "    (no terminal to ask; keeping $install_root. To install in your user"
+        echo "    folder, run the installer from there.)"
+    fi
+fi
+unset _win_profile _loc_ans
 
 # --- preflight (fail fast, before any prompts) ------------------------------
 

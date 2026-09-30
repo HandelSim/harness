@@ -71,6 +71,16 @@ args and prompts for the branch itself.) Covered by
 A standalone bash script users download from the repo's `main` branch and
 run from an empty directory. Stages:
 
+0. **Windows install location.** Before preflight, on Windows Git Bash, if the
+   install root (`<cwd>/harness`) is outside the user profile (`USERPROFILE`,
+   compared case-insensitively as a Git Bash path), the installer warns: managed
+   PCs often run programs only from inside the profile (AppLocker/SRP path
+   rules, or endpoint security that blocks and then deletes the `.exe`), and
+   `harness host` runs jq, Node, opencode and the proxy venv from
+   `<install-root>/state/host`. On a tty it offers `<profile>/harness` instead
+   (`[Y/n]`, Enter accepts; it only changes `cwd`/`install_root`, so the
+   `.env`/`.harness-allowlist` beside the installer are still picked up);
+   without a tty it warns and keeps the location.
 1. **Preflight.** Inline-defined `_inline_*` helpers (so the script
    works pre-clone, when `scripts/lib/platform.sh` isn't local yet)
    check `git`, disk space, write access, and a free clone dir; failures

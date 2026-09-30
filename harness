@@ -4122,6 +4122,49 @@ host_ensure_jq() {
     printf '%s\n' "$ver-$plat" >"$stamp" 2>/dev/null || true
 }
 
+# Echo the Windows user profile as a Git Bash path (/c/Users/me). Non-zero
+# when USERPROFILE is unset. (harness-install.sh inlines the same helper.)
+host_win_profile_dir() {
+    local p="${USERPROFILE:-}"
+    [[ -n "$p" ]] || return 1
+    if command -v cygpath >/dev/null 2>&1; then
+        p=$(cygpath -u "$p")
+    else
+        p="${p//\\//}"
+        if [[ "$p" =~ ^([A-Za-z]):(.*)$ ]]; then
+            p="/$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')${BASH_REMATCH[2]}"
+        fi
+    fi
+    printf '%s' "${p%/}"
+}
+
+# True when $1 is $2 or inside it. Case-insensitive: Windows paths are.
+host_path_within() {
+    local path dir
+    path=$(printf '%s' "${1%/}" | tr '[:upper:]' '[:lower:]')
+    dir=$(printf '%s' "${2%/}" | tr '[:upper:]' '[:lower:]')
+    [[ "$path" == "$dir" || "$path" == "$dir"/* ]]
+}
+
+# After a host-mode tool failed to provision or run: on Windows, when the
+# install sits outside the user profile, say that is the likely cause and how
+# to move it. Managed PCs often run programs only from inside the profile, and
+# everything host mode downloads runs from $install_root/state/host.
+host_win_location_hint() {
+    local prof
+    [[ "$(harness_detect_os)" == windows ]] || return 0
+    prof=$(host_win_profile_dir) || return 0
+    host_path_within "$install_root" "$prof" && return 0
+    err ""
+    err "note: harness is installed outside your Windows user folder ($install_root)."
+    err "  Many managed PCs only let programs run from inside the user folder, and host"
+    err "  mode runs jq, Node and opencode from the install folder. To move it there:"
+    err "    harness down"
+    err "    mv \"$install_root\" \"$prof/harness\""
+    err "    printf '#!/usr/bin/env bash\\nexec \"%s/harness\" \"\$@\"\\n' \"$prof/harness\" > ~/.local/bin/harness"
+    return 0
+}
+
 # Best-guess cause for a downloaded jq that won't execute, from its exit code
 # and output. Advisory lines only; the caller still fails. Returns 3 when a jq
 # of the user's own wouldn't help either (so the caller skips that workaround).
@@ -4899,8 +4942,10 @@ EOF
     host_confirm_gate "$yolo" || exit 1
 
     ensure_dirs
-    host_ensure_toolchain || exit 1   # fetch jq/Node/opencode (downloads happen here, post-confirm)
-    host_preflight || exit 1          # verify the toolchain resolves before launching
+    # fetch jq/Node/opencode (downloads happen here, post-confirm), then verify
+    # the toolchain resolves before launching
+    host_ensure_toolchain || { host_win_location_hint; exit 1; }
+    host_preflight        || { host_win_location_hint; exit 1; }
 
     # Same upstream protections container mode applies in cmd_start. Host mode
     # used to skip both, so a LOCKED key launched opencode anyway and every

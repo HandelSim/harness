@@ -102,6 +102,9 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   pins-match-`agents/Dockerfile` drift guard, the Windows (Git Bash) layout
   branch (stubbing `harness_detect_os`/`uname`), and `host_extract_archive` kind
   dispatch. Sourced via `HARNESS_SOURCE_ONLY=1`. Covers Ho009–Ho017, Ho022.
+- `tests/unit_win_location_test.sh` (no docker, no network) — Windows install
+  location: the installer's out-of-profile warning/offer (block eval'd with stubs,
+  pty via `script` for the prompt) and `host_win_location_hint`. Covers I052, Ho023.
 - `tests/unit_net_open_test.sh` (no docker) — `cmd_net_open` service-membership
   validation: the captured-list + here-string match that fixed the pipefail/SIGPIPE
   false-reject. Covers F089, F151.
@@ -128,11 +131,11 @@ Per-prefix breakdown:
 | U      |    33 |    26 |      0 |   7 |
 | Pe     |    16 |    13 |      1 |   2 |
 | O      |     0 |     0 |      0 |   0 |
-| I      |    50 |    35 |      1 |  14 |
+| I      |    51 |    36 |      1 |  14 |
 | B      |    12 |    12 |      0 |   0 |
-| Ho     |    22 |    22 |      0 |   0 |
+| Ho     |    23 |    23 |      0 |   0 |
 | C      |    40 |    40 |      0 |   0 |
-| **all**|   508 |   386 |      5 | 117 |
+| **all**|   510 |   388 |      5 | 117 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -601,7 +604,7 @@ non-green rows — the gap.
 | Pe018 | green  | tests/upgrade_test.sh:146-174               | T4 (DEALBREAKER): harness-meta.json with `.enabled == false` survives directory_overwrite even when source has it as true. | |
 | Pe019 | green  | tests/upgrade_test.sh:146-174               | T4: `data/` subdir preserved (`data/user.txt == "user-state"`). | |
 
-## I — Installer + platform.sh primitives (50 IDs)
+## I — Installer + platform.sh primitives (51 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -655,6 +658,7 @@ non-green rows — the gap.
 | I049 | green  | tests/unit_workdir_test.sh (T1, T2, T4)     | T1 asserts pass-through on linux/macos; T2 asserts windows produces `//c/...` (including idempotence and slash-collapse); T4 covers the full `harness_abs_path` → `harness_container_workdir` pipeline that feeds docker `-w` (issue #112). | |
 | I050 | green  | tests/unit_workdir_test.sh (T5)             | OS pinned to `windows` with a fake-runtime recorder: `harness_docker` and `harness_docker_winpty` both spawn the runtime with MSYS_NO_PATHCONV=1 AND MSYS2_ARG_CONV_EXCL='*' set; `local -x` scope confirmed (vars don't leak into caller); pass-through on non-Windows (no env leakage). Issue #112 root-cause fix. | |
 | I051 | green  | tests/unit_workdir_test.sh (T6)             | OS pinned both ways: linux emits `-v src:tgt` and `-v src:tgt:ro`; windows emits a single `--mount=type=bind,source=,target=[,readonly]` token with no `:/c/` composite. Covers the issue #112 winpty path where `-v` is mangled to `invalid mode: …`. | |
+| I052 | green  | tests/unit_win_location_test.sh (T1-T3)     | The installer's location block is cut out and eval'd with `_inline_detect_os`/`USERPROFILE`/`cwd` stubbed and cygpath hidden: T1 checks `C:\Users\Me\` → `/c/Users/Me` and containment (other case matches, `/c/Users/Me2` does not); T2 without a tty warns and keeps `/c/HandelAI/harness`, and is silent inside the profile and on linux; T3 under a `script` pty answers Enter and asserts the root becomes `/c/Users/Me/harness`. | The real installer run end to end on Windows is not exercised; T3 is skipped without util-linux `script`. |
 
 ## B — Bootstrap (`harness-bootstrap.sh`, 12 IDs)
 
@@ -673,7 +677,7 @@ non-green rows — the gap.
 | B011 | green  | tests/unit_bootstrap_test.sh:T6             | T6 makes the bundle dir read-only: with no bundled installer it asserts a non-zero exit, the `cannot write to` message and no mention of network; with one it asserts the bundled installer runs. Skipped as root. | |
 | B012 | green  | tests/unit_bootstrap_test.sh:T3             | T3 sources the bootstrap (a good run, then a bad `-b`) and asserts `compgen` finds no `_hb_*` variable/function and no `cleanup` function afterward, and that the bad run returns 1 without killing the shell. | |
 
-## Ho — Host mode, containerless (18 IDs)
+## Ho — Host mode, containerless (23 IDs)
 
 | ID    | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |-------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -699,6 +703,7 @@ non-green rows — the gap.
 | Ho016 | green  | tests/unit_host_toolchain_test.sh:T8         | `host_toolchain_path_prefix` under a stubbed Windows OS orders the dirs `tool_bin:node-root:opencode-root` (Windows layout, stub binaries at the root). | |
 | Ho017 | green  | tests/unit_host_toolchain_test.sh:T9         | `host_extract_archive` extracts a real `.tar.gz` (and a `.zip` round-trip when `zip`/`unzip` are present), and rejects an unknown archive kind. | |
 | Ho022 | green  | tests/unit_host_toolchain_test.sh:T10        | `host_ensure_jq` with `command -v jq` forced to miss and `host_fetch` stubbed to write a fake jq: a Linux exec-format failure (exit 126) returns 1 and prints the exit code, `it said: cannot execute binary file`, the CPU-mismatch cause and the workaround, and removes the binary; a Windows `Access is denied.` names the unsigned-program block; with a stubbed `cmd.exe`, its reason is printed as `Windows says:` and an Application Control message picks the app-control cause, a `blocked by group policy` message picks AppLocker/SRP, names the state folder and omits the install-jq workaround, and a virus message picks the antivirus cause; a jq that deletes itself is reported as quarantined; a jq that fails once then runs succeeds on the retry and writes `.stamp-jq`. | The noexec-mount and killed (137) hints are not exercised; the real `cmd.exe //d //c` call is only exercised on Windows. |
+| Ho023 | green  | tests/unit_win_location_test.sh (T4)        | `host_win_location_hint` with `harness_detect_os`/`USERPROFILE`/`install_root` stubbed: outside the profile it prints the note, `mv "/c/HandelAI/harness" "/c/Users/Me/harness"` and the wrapper rewrite; inside (other case) and on linux it prints nothing; `cmd_host`'s provisioning and preflight failure paths call it (source grep). | The `cmd_host` wiring is a source grep, not an executed failure. |
 
 ## C — ChatGPT backend, CLI side (40 IDs)
 
