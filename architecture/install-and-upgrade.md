@@ -372,7 +372,7 @@ Flow:
 Flags mirror `upgrade`: `--no-prompt` (skip the confirm — required for a
 non-interactive run), `--no-restart` (pure git reset, no rebuild; the only
 path that doesn't require docker), `--rebuild` (`--no-cache`). Because the
-branch is intentionally left behind the tip, the `main` update banner will
+branch is intentionally left behind the tip, the update banner will
 report "update available" after a downgrade — expected, not a bug.
 
 ## Agent-launch config merge

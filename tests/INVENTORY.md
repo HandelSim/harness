@@ -39,9 +39,9 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F014 | `require_runtime_config` fails fast when `.harness-allowlist` is missing under the install root |
 | F015 | `harness_jq` uses the host `jq` binary when present |
 | F016 | `harness_jq` falls back to a containerized `jq` when host `jq` is absent — via a per-invocation `docker exec` sidecar (`_ensure_jq_sidecar`), reaped on exit / before exec (`_reap_jq_sidecar`) and swept when stale (`_sweep_stale_jq_sidecars`) |
-| F017 | `_update_check_and_banner` prints a banner when the local install is behind `origin/main` |
+| F017 | `_update_check_and_banner` prints a banner when the local install is behind `origin/<the branch it is on>` |
 | F018 | `_update_check_and_banner` honors a short timeout on `git ls-remote` so it never blocks the CLI indefinitely |
-| F019 | `_update_check_and_banner` falls back to a cached value when the network probe fails |
+| F019 | `_update_check_and_banner` falls back to a cached value (from the same branch) when the network probe fails |
 | F020 | `harness check-updates` prints "up to date" when local matches remote |
 | F021 | `harness check-updates` prints an "update available" notice with remote SHA when behind |
 | F022 | `harness check-updates` exits non-zero on network failure if no cached value exists |
@@ -66,6 +66,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F140 | `_upgrade_confirm` empty answer (Enter) resolves to the optional `default` arg: "n" aborts, "y"/unset proceeds (back-compat for existing callers) |
 | F156 | `_upgrade_confirm` accepts `y`/`yes`/`n`/`no` in any case, ignoring blanks around the answer and every CR in it (not just a trailing one), so a Windows terminal that mangles the line cannot turn a yes into a no |
 | F157 | `_upgrade_confirm` re-asks an answer it does not recognize (up to three reads) instead of classifying it as a refusal, echoing the rejected text; `default="require"` makes an empty answer unrecognized too. Three unusable answers, or a failed read after a rejected one, give the caller the refusal it would have gotten immediately |
+| F158 | The update banner and `check-updates` follow the branch the clone is on (e.g. `dev`), not only `main`: the cache is keyed by branch (a legacy bare-SHA cache counts as `main`), a remote commit already contained in HEAD (local ahead) is not an update, and a branch origin lacks never shows a banner |
 | F141 | `_git_branches_diverged` returns success only when HEAD and `@{u}` have each diverged (ahead>0 AND behind>0); failure for up-to-date, behind-only, ahead-only, and no-upstream branches |
 | F142 | `harness upgrade` / `harness update` offer a `git reset --hard @{u}` recovery on a diverged-history `--ff-only` failure (defaults to N); `--no-prompt`/CI never auto-resets, and non-divergence pull failures abort unchanged |
 | F041 | `harness logs <service>` follows compose logs for the named service (e.g., `proxy`) |

@@ -120,7 +120,7 @@ Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
-| F      |   157 |   116 |      2 |  39 |
+| F      |   158 |   117 |      2 |  39 |
 | P      |    89 |    75 |      1 |  13 |
 | A      |    24 |    12 |      0 |  12 |
 | M      |    33 |    28 |      0 |   5 |
@@ -132,7 +132,7 @@ Per-prefix breakdown:
 | B      |    12 |    12 |      0 |   0 |
 | Ho     |    18 |    18 |      0 |   0 |
 | C      |    40 |    40 |      0 |   0 |
-| **all**|   503 |   381 |      5 | 117 |
+| **all**|   504 |   382 |      5 | 117 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -168,7 +168,7 @@ test file and line range carrying the strongest assertion, a one-line
 evidence note (quoting real assertion text where possible), and — for
 non-green rows — the gap.
 
-## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (157 rows)
+## F — CLI surface, lifecycle, net, upgrade, doctor, preflight, mcp dispatch (158 rows)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -215,6 +215,7 @@ non-green rows — the gap.
 | F140 | green  | tests/upgrade_test.sh:865-901 (T12)         | T12: `_upgrade_confirm "test? " n <<<""` returns rc 1 (Enter aborts); `<<<"y"` returns 0; default-y cases assert `""`→0, `n`→1 (back-compat). | |
 | F156 | green  | tests/upgrade_test.sh:476-562 (T8)          | T8 adds a leading CR, an answer padded with blanks, mixed-case `Yes`, and `  n\r`: the first three proceed, the last aborts. Under the shipped code all three yes-shapes aborted (only a trailing CR was stripped). | |
 | F157 | green  | tests/upgrade_test.sh:476-562 (T8)          | T8 feeds `zz` then `y` (rc 0), `zz` then `n` (rc 1), `zz` alone (rc 1 — a failed read after a rejected answer ends it), and three unusable answers (rc 1). `require_case` covers `default="require"`: a blank line then `y` is rc 0, nothing at all is rc 1. | The rejected-answer text printed to stderr is not asserted. |
+| F158 | green  | tests/unit_update_check_test.sh (T1-T5)     | A dev clone behind origin/dev gets the banner and a `dev <sha>` cache, and `check-updates` agrees (T1); up to date gives none (T2); unpushed local commits give none (T3); offline, a dev cache gives no banner on main while a legacy bare-SHA cache still does (T4); a local-only branch gives none (T5). | |
 | F141 | green  | tests/upgrade_test.sh:721-834               | T11: real origin+clone git fixtures — diverged (ahead+behind)→rc 0; up-to-date / behind-only / ahead-only / no-upstream→rc 1. | |
 | F142 | yellow | tests/upgrade_test.sh:750-901               | Decision logic covered via building blocks (T11 `_git_branches_diverged` + T12 default-N `_upgrade_confirm`); the end-to-end `_upgrade_pull_or_reset` (reset-on-divergence, --no-prompt abort) is not driven through its TTY path in CI. | The TTY/`reset --hard` path is exercised manually, not in the unit suite. |
 | F041 | green  | tests/harness_test.sh:268-282               | T3: `timeout 5 ${HARNESS_WRAPPER} logs proxy` produces output containing `proxy`-service log lines. | |
