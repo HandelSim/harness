@@ -212,20 +212,31 @@ EOF
         -d "${body}"
 }
 
-# Capture the most recent forwarded body from mockupstream logs and
-# return it on stdout. The mock logs every request as
-# `[mock-upstream] POST /v1/chat/completions body=<json>`; we grep for
-# that and pull the body= prefix off.
+# Capture the FIRST forwarded body from mockupstream logs and return it on
+# stdout. The mock logs every request as
+# `[mock-upstream] POST /v1/chat/completions body=<json>`; we grep for that
+# and pull the body= prefix off.
+#
+# We want the *first* request, not the last: require-tool mode (the default
+# for every non-passthrough prompt mode) rejects a tool-less upstream reply
+# and re-POSTs up to _REQUIRE_TOOL_SERVE_BUDGET times, each round appending
+# an `[assistant(<rejected>), user(<correction>)]` pair. The text fixture
+# returns plain text with no tool call, so it exhausts that budget and the
+# mock logs several requests; every retry's last user message is the
+# require-tool correction, not the probe. The first forwarded request is the
+# faithful transform of the incoming client request — the one whose scheme
+# scaffolding this test asserts on. (The mock is force-recreated per scheme,
+# so its log holds only this scheme's requests, text probe first.)
 capture_forwarded_body() {
-    local logs last
+    local logs first
     logs="$("${COMPOSE[@]}" logs --tail=500 mockupstream 2>&1 || true)"
-    last="$(echo "${logs}" | grep -E '\[mock-upstream\] (POST|PUT) /v1/chat/completions ' | tail -1)"
-    if [[ -z "${last}" ]]; then
+    first="$(echo "${logs}" | grep -E '\[mock-upstream\] (POST|PUT) /v1/chat/completions ' | head -1)"
+    if [[ -z "${first}" ]]; then
         echo "__NO_FORWARDED_BODY__"
         return 1
     fi
     # Trim everything up to and including `body=`.
-    echo "${last#*body=}"
+    echo "${first#*body=}"
 }
 
 # Run a python check inside the proxy container against the forwarded
