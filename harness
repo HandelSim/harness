@@ -4098,10 +4098,59 @@ host_ensure_jq() {
     echo "[harness] host mode: fetching jq ${ver} (${plat}, ~1 MB)..." >&2
     host_fetch "$base/$asset" "$bin" "$sha" || return 1
     chmod +x "$bin" 2>/dev/null || true
-    if ! "$bin" --version >/dev/null 2>&1; then
-        err "host mode: vendored jq failed to run ($bin)"; rm -f "$bin"; return 1
+    # One retry after a beat: on Windows, antivirus can hold a freshly written
+    # .exe for a moment while it scans it.
+    local out rc=0
+    out=$("$bin" --version 2>&1) || rc=$?
+    if (( rc != 0 )); then
+        sleep 1; rc=0
+        out=$("$bin" --version 2>&1) || rc=$?
+    fi
+    if (( rc != 0 )); then
+        # The download passed its checksum, so the file is the real jq; this
+        # host just won't execute it. Say why, not only that it failed.
+        err "host mode: vendored jq failed to run ($bin, exit $rc)"
+        [[ -n "$out" ]] && err "  it said: $(printf '%s' "$out" | head -3 | tr '\r\n' '  ')"
+        host_jq_run_hint "$rc" "$out" "$bin"
+        err "  workaround: install jq yourself and re-run; harness uses a jq on PATH and skips the download"
+        err "    (Windows: winget install jqlang.jq   macOS: brew install jq   Linux: your package manager)"
+        rm -f "$bin"; return 1
     fi
     printf '%s\n' "$ver-$plat" >"$stamp" 2>/dev/null || true
+}
+
+# Best-guess cause for a downloaded jq that won't execute, from its exit code
+# and output. Advisory lines only; the caller still fails.
+host_jq_run_hint() {
+    local rc="$1" out="$2" bin="$3" mnt
+    case "$out" in
+        *"Bad CPU type"*|*"Exec format error"*|*"cannot execute binary"*)
+            err "  cause: this build doesn't match the CPU. uname -m says '$(uname -m)'; on an Apple"
+            err "  Silicon Mac a shell running under Rosetta reports x86_64 and Rosetta must be installed"
+            return 0 ;;
+    esac
+    if [[ "$(harness_detect_os)" == windows ]]; then
+        err "  likely cause: Windows blocked an unsigned program (jq.exe is unsigned upstream):"
+        err "  AppLocker/WDAC policy, Smart App Control, or antivirus. Check Windows Security's"
+        err "  protection history, or have IT allow jq, or use the workaround below"
+        return 0
+    fi
+    if (( rc == 126 )) || [[ "$out" == *"ermission denied"* ]]; then
+        mnt=$(df -P "$(dirname "$bin")" 2>/dev/null | awk 'NR==2 {print $6}')
+        if [[ -n "$mnt" ]] && awk -v m="$mnt" '$2 == m && $4 ~ /(^|,)noexec(,|$)/ { f=1 } END { exit !f }' /proc/mounts 2>/dev/null; then
+            err "  cause: $mnt is mounted noexec, so nothing under the install root can run;"
+            err "  install harness on a filesystem that allows executables"
+        else
+            err "  likely cause: the install dir's filesystem is mounted noexec, or security"
+            err "  software is blocking programs there"
+        fi
+        return 0
+    fi
+    if (( rc == 137 )) || [[ "$out" == *"Killed"* ]]; then
+        err "  likely cause: the OS or security software killed it (on macOS, code-signing or"
+        err "  endpoint policy)"
+    fi
+    return 0
 }
 
 # Vendor Node into toolchain/node/node-v<ver>-<plat>/ unless a host Node >= 20

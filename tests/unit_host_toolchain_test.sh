@@ -16,6 +16,8 @@
 #     opencode shim / Scripts venv tokens + paths, stubbing harness_detect_os
 #     and uname so the Windows code runs deterministically on a Linux host
 #   - host_extract_archive kind dispatch (tar.gz + zip round-trip, unknown kind)
+#   - host_ensure_jq when the downloaded jq won't run: one retry, then the
+#     exit code, jq's own output, a likely cause and a workaround
 #
 # It deliberately does NOT exercise the real download/extract/npm path (that
 # needs network); it tests the parsing/assembly/guard logic those steps depend
@@ -226,6 +228,45 @@ if command -v zip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
 else
     ok "T9: host_extract_archive handles tar.gz, rejects unknown kinds (zip round-trip skipped: no zip/unzip on host)"
 fi
+
+# --- T10: a vendored jq that won't run: say why; retry once first ---------------
+# No download: host_fetch is stubbed to write a script standing in for the
+# jq binary, and `command -v jq` is made to miss so the vendoring path runs.
+jq_case() {  # $1 = os token, $2 = body of the fake jq; prints output + RC=
+    # Distinct names: bash scoping is dynamic, and host_jq_platform has its own
+    # `local os` that would shadow ours inside the stub.
+    local _jc_os="$1" _jc_body="$2"
+    (
+      command() { [[ "${1:-} ${2:-}" == "-v jq" ]] && return 1; builtin command "$@"; }
+      harness_detect_os() { echo "$_jc_os"; }
+      uname() { if [[ "${1:-}" == -m ]]; then echo x86_64; else builtin command uname "$@"; fi; }
+      sleep() { :; }
+      host_sha_from_manifest() { echo deadbeef; }
+      host_fetch() { printf '#!/usr/bin/env bash\n%s\n' "$_jc_body" >"$2"; }
+      rc=0; host_ensure_jq 2>&1 || rc=$?
+      echo "RC=$rc"
+    )
+}
+rm -rf "$(host_tool_dir)"
+out="$(jq_case linux 'echo "cannot execute binary file: Exec format error" >&2; exit 126')"
+grep -q "RC=1" <<<"$out" || fail "T10: a jq that won't run should fail host_ensure_jq — $out"
+grep -q "vendored jq failed to run (.*exit 126)" <<<"$out" || fail "T10: missing exit code — $out"
+grep -q "it said: cannot execute binary file" <<<"$out" || fail "T10: jq's own error not shown — $out"
+grep -q "doesn't match the CPU" <<<"$out" || fail "T10: no CPU-mismatch hint — $out"
+grep -q "workaround: install jq yourself" <<<"$out" || fail "T10: no workaround line — $out"
+[[ ! -e "$(host_jq_vendored)" ]] || fail "T10: the unrunnable jq was left in place"
+
+out="$(jq_case windows 'echo "Access is denied." >&2; exit 126')"
+grep -q "Windows blocked an unsigned program" <<<"$out" || fail "T10: no Windows policy hint — $out"
+rm -rf "$(host_tool_dir)"
+
+# Fails the first time only (an antivirus scan holding the file), then runs.
+flag="$TMP_ROOT/jq-ran-once"
+out="$(jq_case linux "if [[ -e '$flag' ]]; then echo jq-1.7.1; else : >'$flag'; exit 126; fi")"
+grep -q "RC=0" <<<"$out" || fail "T10: the retry did not recover a first-run failure — $out"
+[[ -f "$(host_tool_dir)/.stamp-jq" ]] || fail "T10: stamp not written after the retry succeeded"
+rm -rf "$(host_tool_dir)"
+ok "T10: an unrunnable vendored jq reports exit code, its output, a likely cause and a workaround; one retry"
 
 echo
 echo "HOST TOOLCHAIN TEST PASSED"

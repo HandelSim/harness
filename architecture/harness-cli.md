@@ -529,7 +529,12 @@ What it does, in order:
    + provider the container suite validates; a unit test guards that the opencode
    / provider pins stay in sync with the Dockerfile ARGs. Stamps (`.stamp-jq`
    etc.) are written **only after** a `--version` smoke run succeeds, so a
-   corrupt or half-extracted tool is never trusted on the next run. This makes
+   corrupt or half-extracted tool is never trusted on the next run. A vendored jq
+   that fails its smoke run is retried once (antivirus can hold a fresh `.exe`
+   while scanning), then reported with its exit code, its own output and a likely
+   cause from `host_jq_run_hint` (CPU mismatch, Windows blocking the unsigned
+   upstream `jq.exe`, a `noexec` mount, killed by security software), plus the
+   workaround of installing jq on `PATH`, which skips the download. This makes
    host mode **self-installing, not offline**: opencode still fetches its provider
    over the (unfirewalled) network on first use, exactly as the container does.
    `host_preflight` then runs as a post-provision assertion — each of `python3`,

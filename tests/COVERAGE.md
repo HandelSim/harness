@@ -101,7 +101,7 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   `host_toolchain_path_prefix` assembly, OS guard + PATH wiring, the
   pins-match-`agents/Dockerfile` drift guard, the Windows (Git Bash) layout
   branch (stubbing `harness_detect_os`/`uname`), and `host_extract_archive` kind
-  dispatch. Sourced via `HARNESS_SOURCE_ONLY=1`. Covers Ho009–Ho017.
+  dispatch. Sourced via `HARNESS_SOURCE_ONLY=1`. Covers Ho009–Ho017, Ho022.
 - `tests/unit_net_open_test.sh` (no docker) — `cmd_net_open` service-membership
   validation: the captured-list + here-string match that fixed the pipefail/SIGPIPE
   false-reject. Covers F089, F151.
@@ -130,9 +130,9 @@ Per-prefix breakdown:
 | O      |     0 |     0 |      0 |   0 |
 | I      |    50 |    35 |      1 |  14 |
 | B      |    12 |    12 |      0 |   0 |
-| Ho     |    18 |    18 |      0 |   0 |
+| Ho     |    22 |    22 |      0 |   0 |
 | C      |    40 |    40 |      0 |   0 |
-| **all**|   504 |   382 |      5 | 117 |
+| **all**|   508 |   386 |      5 | 117 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -698,6 +698,7 @@ non-green rows — the gap.
 | Ho015 | green  | tests/unit_host_toolchain_test.sh:T7         | Windows (Git Bash) layout: stubbing `harness_detect_os`→windows + `uname`, `host_jq_platform`=windows-amd64, `host_node_platform`=win-x64, `host_exe_suffix`=.exe, vendored jq is `jq.exe`, the jq asset is `jq-windows-amd64.exe`, `node.exe`/opencode shim resolve at the dir **root** (not `bin/`), the venv is `Scripts/python.exe`; win-arm64 resolves Node but `host_jq_platform` fails closed (no upstream build). | |
 | Ho016 | green  | tests/unit_host_toolchain_test.sh:T8         | `host_toolchain_path_prefix` under a stubbed Windows OS orders the dirs `tool_bin:node-root:opencode-root` (Windows layout, stub binaries at the root). | |
 | Ho017 | green  | tests/unit_host_toolchain_test.sh:T9         | `host_extract_archive` extracts a real `.tar.gz` (and a `.zip` round-trip when `zip`/`unzip` are present), and rejects an unknown archive kind. | |
+| Ho022 | green  | tests/unit_host_toolchain_test.sh:T10        | `host_ensure_jq` with `command -v jq` forced to miss and `host_fetch` stubbed to write a fake jq: a Linux exec-format failure (exit 126) returns 1 and prints the exit code, `it said: cannot execute binary file`, the CPU-mismatch cause and the workaround, and removes the binary; a Windows `Access is denied.` names the unsigned-program block; a jq that fails once then runs succeeds on the retry and writes `.stamp-jq`. | The noexec-mount and killed (137) hints are not exercised. |
 
 ## C — ChatGPT backend, CLI side (40 IDs)
 
