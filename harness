@@ -4129,10 +4129,35 @@ host_jq_run_hint() {
             err "  Silicon Mac a shell running under Rosetta reports x86_64 and Rosetta must be installed"
             return 0 ;;
     esac
+    if [[ ! -e "$bin" ]]; then
+        err "  cause: jq disappeared right after the download: security software quarantined"
+        err "  it. Check its quarantine (on Windows: Windows Security > Protection history)"
+        return 0
+    fi
     if [[ "$(harness_detect_os)" == windows ]]; then
-        err "  likely cause: Windows blocked an unsigned program (jq.exe is unsigned upstream):"
-        err "  AppLocker/WDAC policy, Smart App Control, or antivirus. Check Windows Security's"
-        err "  protection history, or have IT allow jq, or use the workaround below"
+        # Git Bash reports every Windows refusal to start a program as
+        # "Permission denied"; cmd.exe prints Windows' own reason instead.
+        local why=""
+        if command -v cmd.exe >/dev/null 2>&1; then
+            why=$(cd "$(dirname "$bin")" && cmd.exe //d //c "$(basename "$bin")" --version 2>&1 \
+                  | tr -d '\r' | head -2 | tr '\n' ' ') || true
+            [[ -n "$why" ]] && err "  Windows says: $why"
+        fi
+        case "$why" in
+            *"Application Control"*|*"group policy"*|*"blocked by"*)
+                err "  cause: a Windows app-control policy (Smart App Control, WDAC or AppLocker)"
+                err "  blocks jq.exe, which is unsigned upstream. It is per machine, which is why"
+                err "  another PC can work. Smart App Control lives under Windows Security > App &"
+                err "  browser control; on a managed PC ask IT to allow jq. Other harness tools"
+                err "  in this folder (opencode) may hit the same block" ;;
+            *virus*|*"unwanted software"*)
+                err "  cause: antivirus flagged jq.exe. Allow it in Windows Security's Protection"
+                err "  history (or your antivirus' quarantine), then re-run" ;;
+            *)
+                err "  likely cause: Windows blocked an unsigned program (jq.exe is unsigned upstream):"
+                err "  AppLocker/WDAC policy, Smart App Control, or antivirus. Check Windows Security's"
+                err "  protection history, or have IT allow jq, or use the workaround below" ;;
+        esac
         return 0
     fi
     if (( rc == 126 )) || [[ "$out" == *"ermission denied"* ]]; then

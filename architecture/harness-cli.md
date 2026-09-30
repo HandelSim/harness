@@ -533,7 +533,11 @@ What it does, in order:
    that fails its smoke run is retried once (antivirus can hold a fresh `.exe`
    while scanning), then reported with its exit code, its own output and a likely
    cause from `host_jq_run_hint` (CPU mismatch, Windows blocking the unsigned
-   upstream `jq.exe`, a `noexec` mount, killed by security software), plus the
+   upstream `jq.exe`, a `noexec` mount, killed by security software, a file
+   quarantined right after download). On Windows, Git Bash reports every refusal
+   to start a program as "Permission denied", so the hint runs the file through
+   `cmd.exe`, prints Windows' own reason and names the matching cause
+   (app-control policy vs antivirus), plus the
    workaround of installing jq on `PATH`, which skips the download. This makes
    host mode **self-installing, not offline**: opencode still fetches its provider
    over the (unfirewalled) network on first use, exactly as the container does.

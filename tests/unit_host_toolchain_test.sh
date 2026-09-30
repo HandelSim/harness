@@ -260,6 +260,23 @@ out="$(jq_case windows 'echo "Access is denied." >&2; exit 126')"
 grep -q "Windows blocked an unsigned program" <<<"$out" || fail "T10: no Windows policy hint — $out"
 rm -rf "$(host_tool_dir)"
 
+# Windows with cmd.exe: its reason is shown and picks the specific cause.
+cmd.exe() { echo "An Application Control policy has blocked this file."; return 1; }
+out="$(jq_case windows 'exit 126')"
+grep -q "Windows says: An Application Control policy has blocked this file" <<<"$out" \
+    || fail "T10: cmd.exe's reason not shown — $out"
+grep -q "a Windows app-control policy" <<<"$out" || fail "T10: no app-control cause — $out"
+cmd.exe() { echo "Operation did not complete successfully because the file contains a virus or potentially unwanted software."; return 1; }
+out="$(jq_case windows 'exit 126')"
+grep -q "antivirus flagged jq.exe" <<<"$out" || fail "T10: no antivirus cause — $out"
+unset -f cmd.exe
+rm -rf "$(host_tool_dir)"
+
+# The file vanished after the download (quarantined): say so.
+out="$(jq_case windows 'rm -f "$0"; exit 126')"
+grep -q "disappeared right after the download" <<<"$out" || fail "T10: quarantine not detected — $out"
+rm -rf "$(host_tool_dir)"
+
 # Fails the first time only (an antivirus scan holding the file), then runs.
 flag="$TMP_ROOT/jq-ran-once"
 out="$(jq_case linux "if [[ -e '$flag' ]]; then echo jq-1.7.1; else : >'$flag'; exit 126; fi")"
