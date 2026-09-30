@@ -266,6 +266,14 @@ out="$(jq_case windows 'exit 126')"
 grep -q "Windows says: An Application Control policy has blocked this file" <<<"$out" \
     || fail "T10: cmd.exe's reason not shown — $out"
 grep -q "a Windows app-control policy" <<<"$out" || fail "T10: no app-control cause — $out"
+# Error 1260 (AppLocker / SRP): names the policy and the state folder, and drops
+# the install-jq workaround, which a path rule would block too.
+cmd.exe() { echo "This program is blocked by group policy. For more information, contact your system administrator."; return 1; }
+out="$(jq_case windows 'exit 126')"
+grep -q "RC=1" <<<"$out" || fail "T10: a group-policy block should still fail — $out"
+grep -q "AppLocker or Software Restriction Policies" <<<"$out" || fail "T10: no AppLocker cause — $out"
+grep -q "installs from .*host," <<<"$out" || fail "T10: the state folder is not named — $out"
+! grep -q "workaround: install jq yourself" <<<"$out" || fail "T10: install-jq workaround shown for a path policy — $out"
 cmd.exe() { echo "Operation did not complete successfully because the file contains a virus or potentially unwanted software."; return 1; }
 out="$(jq_case windows 'exit 126')"
 grep -q "antivirus flagged jq.exe" <<<"$out" || fail "T10: no antivirus cause — $out"

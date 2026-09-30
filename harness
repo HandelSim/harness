@@ -4111,16 +4111,20 @@ host_ensure_jq() {
         # host just won't execute it. Say why, not only that it failed.
         err "host mode: vendored jq failed to run ($bin, exit $rc)"
         [[ -n "$out" ]] && err "  it said: $(printf '%s' "$out" | head -3 | tr '\r\n' '  ')"
-        host_jq_run_hint "$rc" "$out" "$bin"
-        err "  workaround: install jq yourself and re-run; harness uses a jq on PATH and skips the download"
-        err "    (Windows: winget install jqlang.jq   macOS: brew install jq   Linux: your package manager)"
+        local hrc=0
+        host_jq_run_hint "$rc" "$out" "$bin" || hrc=$?
+        if (( hrc != 3 )); then   # 3: the hint says a jq of your own won't help
+            err "  workaround: install jq yourself and re-run; harness uses a jq on PATH and skips the download"
+            err "    (Windows: winget install jqlang.jq   macOS: brew install jq   Linux: your package manager)"
+        fi
         rm -f "$bin"; return 1
     fi
     printf '%s\n' "$ver-$plat" >"$stamp" 2>/dev/null || true
 }
 
 # Best-guess cause for a downloaded jq that won't execute, from its exit code
-# and output. Advisory lines only; the caller still fails.
+# and output. Advisory lines only; the caller still fails. Returns 3 when a jq
+# of the user's own wouldn't help either (so the caller skips that workaround).
 host_jq_run_hint() {
     local rc="$1" out="$2" bin="$3" mnt
     case "$out" in
@@ -4144,8 +4148,23 @@ host_jq_run_hint() {
             [[ -n "$why" ]] && err "  Windows says: $why"
         fi
         case "$why" in
-            *"Application Control"*|*"group policy"*|*"blocked by"*)
-                err "  cause: a Windows app-control policy (Smart App Control, WDAC or AppLocker)"
+            *"group policy"*)
+                # ERROR_ACCESS_DISABLED_BY_POLICY (1260): AppLocker or Software
+                # Restriction Policies, usually path rules, so everything host
+                # mode runs from this folder (jq, Node, opencode, the venv's
+                # python) is blocked, and a jq from a user-scope install too.
+                local sd; sd=$(host_state_dir)
+                command -v cygpath >/dev/null 2>&1 && sd=$(cygpath -w "$sd")
+                err "  cause: AppLocker or Software Restriction Policies (Group Policy) block"
+                err "  programs in this folder. It is per machine, which is why another PC can"
+                err "  work. Host mode runs everything it installs from $sd,"
+                err "  so the fix is an allow rule for that folder (ask IT if you don't manage"
+                err "  the policy). To see which rule blocked it, in PowerShell:"
+                err "    Get-WinEvent -LogName 'Microsoft-Windows-AppLocker/EXE and DLL' -MaxEvents 3 | fl TimeCreated,Message"
+                err "  Installing jq yourself won't get past it: Node and opencode run from there too"
+                return 3 ;;
+            *"Application Control"*|*"blocked by"*)
+                err "  cause: a Windows app-control policy (Smart App Control or WDAC)"
                 err "  blocks jq.exe, which is unsigned upstream. It is per machine, which is why"
                 err "  another PC can work. Smart App Control lives under Windows Security > App &"
                 err "  browser control; on a managed PC ask IT to allow jq. Other harness tools"

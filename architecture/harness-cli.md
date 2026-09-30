@@ -537,7 +537,10 @@ What it does, in order:
    quarantined right after download). On Windows, Git Bash reports every refusal
    to start a program as "Permission denied", so the hint runs the file through
    `cmd.exe`, prints Windows' own reason and names the matching cause
-   (app-control policy vs antivirus), plus the
+   (Group Policy AppLocker/SRP, WDAC/Smart App Control, antivirus). A Group
+   Policy block (error 1260) is usually a path rule covering all of
+   `state/host`, so that case drops the install-jq workaround and points at an
+   allow rule for the folder instead. Otherwise the message ends with the
    workaround of installing jq on `PATH`, which skips the download. This makes
    host mode **self-installing, not offline**: opencode still fetches its provider
    over the (unfirewalled) network on first use, exactly as the container does.
