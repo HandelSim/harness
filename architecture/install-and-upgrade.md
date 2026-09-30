@@ -18,20 +18,30 @@ off to a freshly fetched installer:
 
 1. Resolve its own directory (the bundle dir holding `.env` +
    `.harness-allowlist`) from `BASH_SOURCE`, falling back to `$PWD`.
-2. Read `HTTP_PROXY`/`HTTPS_PROXY` from the bundled `.env` and export them
+2. Pick the branch: `main` or `dev`. A `-b/--branch` in its args is used as
+   given; otherwise it asks on a tty (Enter = `main`) and defaults to `main`
+   without one. Anything but `main`/`dev` aborts. The branch selects **both**
+   the installer that is fetched and the branch the clone starts on (it is
+   forwarded to the installer as `--branch`), so the install logic always
+   matches the code it installs. It is not persisted: `update`/`upgrade`
+   follow whatever branch the clone is on.
+3. Read `HTTP_PROXY`/`HTTPS_PROXY` from the bundled `.env` and export them
    (both upper- and lower-case, for libcurl) so the fetch below works behind a
-   corp proxy. Same precedence as the installer: a blank/absent value leaves
-   the host's exported proxy untouched. The installer then re-reads the same
-   `.env` for its own clone and persists it, so `.env` stays the single source
-   of truth.
-3. Fetch the **current** `harness-install.sh`. A local-path `HARNESS_REPO_URL`
-   (tests, local installs) is copied straight out of the tree; otherwise the
-   raw script is fetched from `raw.githubusercontent.com/<slug>/<ref>/` via
-   curl or wget. `HARNESS_INSTALL_REF` pins a ref (default `main`). The fetched
+   corp proxy. A trailing CR (a `.env` saved on Windows) and one pair of
+   surrounding quotes are stripped, as compose does. Same precedence as the
+   installer: a blank/absent value leaves the host's exported proxy untouched.
+   The installer then re-reads the same `.env` for its own clone and persists
+   it, so `.env` stays the single source of truth.
+4. Fetch the **current** `harness-install.sh` for that branch. A local-path
+   `HARNESS_REPO_URL` (tests, local installs) is copied straight out of the
+   tree; otherwise the raw script is fetched from
+   `raw.githubusercontent.com/<slug>/<branch>/` via curl or wget. The fetched
    file is shebang-checked (a captive-portal HTML 200 is rejected) before use;
    on any fetch/validation failure the bootstrap falls back to a bundled
-   `harness-install.sh` if one is present, else aborts.
-4. Hand off. The fetched installer lands **in the bundle dir** (as
+   `harness-install.sh` if one is present, else aborts. A bundle dir that is
+   not writable (a mounted image, a share) is reported as such, not as a
+   fetch failure, and takes the same bundled-copy fallback.
+5. Hand off, forwarding all of its args (plus the `--branch` it added). The fetched installer lands **in the bundle dir** (as
    `.harness-install.fetched.sh`), so its `$script_dir` resolves to the bundle
    dir and it finds `.env`/`.harness-allowlist` beside it exactly as a direct
    run would. If the bootstrap was **sourced**, it `source`s the installer (so
@@ -39,7 +49,10 @@ off to a freshly fetched installer:
    if **executed**, it runs the installer as a child and exits its rc. The
    fetched temp is removed afterward (never a bundled copy). Like the
    installer, the bootstrap only enables `set -euo pipefail` when executed, so
-   a sourced run never mutates the user's interactive shell options.
+   a sourced run never mutates the user's interactive shell options, and every
+   name it defines is `_hb_`-prefixed and unset before it returns, so nothing
+   leaks into the sourcing shell. The scripts are bash-only; from zsh, run it
+   with `bash` rather than sourcing it.
 
 So a distributor maintains three files (`harness-bootstrap.sh` + `.env` +
 `.harness-allowlist`); the bootstrap basically never changes, and the install
@@ -48,8 +61,9 @@ upstream do not need to enter the bundle — `harness upgrade` and the
 agent-launch config merge append them from `.env.example` (see below), so the
 bundle only carries the distributor's own customized values. The
 cross-version contract is just that `harness-install.sh` keeps reading config
-from `$script_dir` (already load-bearing) and stays at a stable raw URL; the
-bootstrap adds no new flag to the installer. Covered by
+from `$script_dir` (already load-bearing), accepts `--branch main|dev`, and
+stays at a stable raw URL. (An installer that predates `--branch` ignores its
+args and prompts for the branch itself.) Covered by
 `tests/unit_bootstrap_test.sh` (docker-free).
 
 ## `harness-install.sh`
@@ -127,8 +141,9 @@ run from an empty directory. Stages:
    installer never proceeds past a broken clone. The clone's proxy is
    resolved first: `HTTP_PROXY`/`HTTPS_PROXY` set in a `.env` dropped beside
    the installer are exported for it (both upper- and lower-case, since git's
-   libcurl gives the lower-case name precedence); a blank/absent value there
-   leaves the host's exported proxy untouched.
+   libcurl gives the lower-case name precedence); a trailing CR and one pair
+   of surrounding quotes are stripped, and a blank/absent value there leaves
+   the host's exported proxy untouched.
 4. **Source full `platform.sh`** now that it's local. Subsequent helpers
    come from the library.
 5. **dos2unix on Windows.** Defense-in-depth: ensures bash scripts have

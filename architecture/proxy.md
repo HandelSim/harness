@@ -1159,7 +1159,7 @@ Module-level env reads at startup:
 PROXY_HOST=0.0.0.0          PROXY_PORT=8000
 PROXY_API_URL (REQUIRED)    PROXY_API_KEY (REQUIRED)    DEFAULT_MODEL_NAME (REQUIRED)
 PROXY_TIMEOUT=180           OUTPUT_DIR (optional)
-MODEL_CONTEXT_LENGTH=200000 (legacy alias: OLLAMA_CONTEXT_LENGTH)
+MODEL_CONTEXT_LENGTH=200000
 HARNESS_FORCE_LOOPBACK (optional; host mode sets it — see below)
 PROXY_BACKEND=openai        (optional; `harness chatgpt` sets it — see below)
 CHATGPT_BASE_URL / CHATGPT_MODEL_NAME / CHATGPT_COOKIE_STRING

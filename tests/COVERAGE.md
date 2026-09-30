@@ -129,10 +129,10 @@ Per-prefix breakdown:
 | Pe     |    16 |    13 |      1 |   2 |
 | O      |     0 |     0 |      0 |   0 |
 | I      |    50 |    35 |      1 |  14 |
-| B      |    10 |    10 |      0 |   0 |
+| B      |    12 |    12 |      0 |   0 |
 | Ho     |    18 |    18 |      0 |   0 |
 | C      |    40 |    40 |      0 |   0 |
-| **all**|   501 |   379 |      5 | 117 |
+| **all**|   503 |   381 |      5 | 117 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -347,7 +347,7 @@ non-green rows — the gap.
 | P006 | green  | tests/proxy_test.sh:480-490                 | Scenario F sets `PROXY_API_KEY=test-key-1234`, asserts banner shows redacted form `test...1234` AND raw key is NOT printed (regression guard against accidental key leak). | |
 | P007 | green  | proxy/test_proxy.py (TestModelPassthrough)  | test_missing_model_falls_back_to_default asserts the proxy forwards `DEFAULT_MODEL_NAME` when the request omits a model. | |
 | P008 | yellow | tests/proxy_test.sh:56                      | `PROXY_TIMEOUT=30` set; no assertion on actual timeout behavior. | No test simulates a slow upstream to exercise the timeout. |
-| P009 | green  | proxy/test_proxy.py:2448-2480               | `test_prompt_tokens_overridden_with_local_estimate` asserts the proxy replaces upstream `prompt_tokens` with its local estimate, which `_estimate_tokens` caps at `MODEL_CONTEXT_LENGTH` (proxy.py:1362; legacy alias `OLLAMA_CONTEXT_LENGTH`). The env knob itself is config-only — no test flips the var and re-reads the cap. | |
+| P009 | green  | proxy/test_proxy.py:2448-2480               | `test_prompt_tokens_overridden_with_local_estimate` asserts the proxy replaces upstream `prompt_tokens` with its local estimate, which `_estimate_tokens` caps at `MODEL_CONTEXT_LENGTH` (proxy.py:1362). The env knob itself is config-only — no test flips the var and re-reads the cap. | |
 | P010 | green  | proxy/test_proxy.py:601-771 + tests/scheme_contract_test.sh | TestPromptInjectionModes covers `hybrid` as default via test_default_mode_is_hybrid (PROXY_PROMPT_MODE absent → hybrid). The scheme contract test adds end-to-end assertions for each cooperative scheme (`user_front`, `hybrid`) via mock-upstream body capture, re-injecting the mode through its own compose override. | |
 | P011 | green  | proxy/test_proxy.py:774-919                 | TestChangeSystemToUser stubs the now-hardcoded constant via `patch.object(proxy, "_CHANGE_SYSTEM_TO_USER", True)`; the env-parse path was removed with `_setup_change_system_to_user`. | |
 | P012 | green  | tests/proxy_test.sh:491-507                 | Scenario F asserts `grep -qE 'debug dumps:[[:space:]]+disabled \(OUTPUT_DIR not set\)'` — proxy banner reports OUTPUT_DIR consumption explicitly. | |
@@ -655,20 +655,22 @@ non-green rows — the gap.
 | I050 | green  | tests/unit_workdir_test.sh (T5)             | OS pinned to `windows` with a fake-runtime recorder: `harness_docker` and `harness_docker_winpty` both spawn the runtime with MSYS_NO_PATHCONV=1 AND MSYS2_ARG_CONV_EXCL='*' set; `local -x` scope confirmed (vars don't leak into caller); pass-through on non-Windows (no env leakage). Issue #112 root-cause fix. | |
 | I051 | green  | tests/unit_workdir_test.sh (T6)             | OS pinned both ways: linux emits `-v src:tgt` and `-v src:tgt:ro`; windows emits a single `--mount=type=bind,source=,target=[,readonly]` token with no `:/c/` composite. Covers the issue #112 winpty path where `-v` is mangled to `invalid mode: …`. | |
 
-## B — Bootstrap (`harness-bootstrap.sh`, 10 IDs)
+## B — Bootstrap (`harness-bootstrap.sh`, 12 IDs)
 
 | ID    | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |-------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
 | B001 | green  | tests/unit_bootstrap_test.sh:T1             | T1 asserts the fetched stub installer's `$script_dir` (resolved from its own `BASH_SOURCE`) equals the bundle dir, which is the bootstrap's own resolved dir. | |
-| B002 | green  | tests/unit_bootstrap_test.sh:T1,T3          | T1 puts `HTTPS_PROXY` in the bundled `.env` and asserts the handed-off installer saw it; T3 uses a blank `HTTPS_PROXY=` and asserts the run does not crash (host env left as-is). | |
+| B002 | green  | tests/unit_bootstrap_test.sh:T1,T3,T5       | T1 puts `HTTPS_PROXY` in the bundled `.env` and asserts the handed-off installer saw it; T3 uses a blank `HTTPS_PROXY=` and asserts the run does not crash (host env left as-is); T5 uses a quoted, CRLF-terminated value and asserts both cases arrive clean. | |
 | B003 | green  | tests/unit_bootstrap_test.sh:T1 + T4        | T1 drives the local-path branch (`HARNESS_REPO_URL` → stub repo dir, copied, no network); T4 source-greps for the `raw.githubusercontent.com` remote-fetch path. | |
-| B004 | green  | tests/unit_bootstrap_test.sh:T4             | T4 source-greps for `HARNESS_INSTALL_REF` and `HARNESS_REPO_URL` wiring. | |
+| B004 | green  | tests/unit_bootstrap_test.sh:T1,T1b,T1c,T4  | T1 (no tty) asserts the installer gets `--branch main`; T1b asserts `-b dev` arrives unchanged with no added `--branch`; T1c asserts `--branch production` aborts non-zero before the installer runs; T4 source-greps `HARNESS_REPO_URL`. | The interactive main/dev question is not driven (every run has stdin on /dev/null). |
 | B005 | green  | tests/unit_bootstrap_test.sh:T2             | T2 points the fetch at a non-`#!` HTML file and asserts it is rejected (does not run as the installer). | |
-| B006 | green  | tests/unit_bootstrap_test.sh:T2             | T2 asserts the "falling back to the bundled" notice and that the bundled `harness-install.sh` runs (`BUNDLED_FALLBACK_RAN`) when the fetch is rejected. | No positive test of the no-bundled-copy abort branch (the `return/exit` path); covered by source-grep only. |
+| B006 | green  | tests/unit_bootstrap_test.sh:T2             | T2 asserts the "falling back to the bundled" notice and that the bundled `harness-install.sh` runs (`BUNDLED_FALLBACK_RAN`) when the fetch is rejected. | No positive test of the fetch-failure abort branch; the same `return/exit` abort is driven by T1c, T3 and T6. |
 | B007 | green  | tests/unit_bootstrap_test.sh:T1             | T1 asserts the fetched installer's `$script_dir` is the bundle dir (so it would find `.env`/`.harness-allowlist` beside it). | |
-| B008 | green  | tests/unit_bootstrap_test.sh:T1,T3          | T1 (executed) asserts the child installer ran and rc propagated; T3 (sourced) asserts the installer ran in-shell and `SOURCED_RC=0` is returned. | |
+| B008 | green  | tests/unit_bootstrap_test.sh:T1,T3          | T1 (executed) asserts the child installer ran with the caller's flags and rc propagated; T3 (sourced) asserts the installer ran in-shell with `-b dev` and `SOURCED_RC=0` is returned. | |
 | B009 | green  | tests/unit_bootstrap_test.sh:T3 + T4        | T3 sources the bootstrap then references an unset var and asserts no abort (no leaked `set -u`); T4 source-greps the sourced-vs-executed detection. | |
 | B010 | green  | tests/unit_bootstrap_test.sh:T1             | T1 asserts `.harness-install.fetched.sh` is gone after the run; T2 implicitly preserves the bundled copy (its name does not match the temp). | |
+| B011 | green  | tests/unit_bootstrap_test.sh:T6             | T6 makes the bundle dir read-only: with no bundled installer it asserts a non-zero exit, the `cannot write to` message and no mention of network; with one it asserts the bundled installer runs. Skipped as root. | |
+| B012 | green  | tests/unit_bootstrap_test.sh:T3             | T3 sources the bootstrap (a good run, then a bad `-b`) and asserts `compgen` finds no `_hb_*` variable/function and no `cleanup` function afterward, and that the bad run returns 1 without killing the shell. | |
 
 ## Ho — Host mode, containerless (18 IDs)
 

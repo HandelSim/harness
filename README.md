@@ -43,26 +43,29 @@ On Windows, run it from Git Bash ([docs/WINDOWS.md](docs/WINDOWS.md)).
 2. `cd` into any project and run `harness`. The first run builds the container
    images (a few minutes); later runs start in seconds.
 
-Uninstall: `rm -rf ./harness && rm ~/.local/bin/harness`.
+Uninstall: `harness uninstall` (removes `./harness/`, the `~/.local/bin/harness`
+wrapper, and the harness containers and images; it asks first).
 
 ### Shipping a pre-configured bundle
 
 To redistribute harness with a pre-edited `.env` + `.harness-allowlist`, bundle
 **`harness-bootstrap.sh`** instead of a pinned `harness-install.sh`. The
-bootstrap is a thin, version-stable entrypoint: it reads any
-`HTTP_PROXY`/`HTTPS_PROXY` from your bundled `.env`, fetches the *current*
-`harness-install.sh` from the repo, and hands off to it. Your bundle never goes
-stale because the install logic always comes from upstream.
+bootstrap is a thin, version-stable entrypoint: it asks whether to install
+`main` (stable) or `dev` (latest), reads any `HTTP_PROXY`/`HTTPS_PROXY` from
+your bundled `.env`, fetches that branch's *current* `harness-install.sh`, and
+hands off to it, and the clone starts on the same branch. Your bundle never
+goes stale because the install logic always comes from upstream.
 
 ```bash
-# in the folder holding harness-bootstrap.sh + .env + .harness-allowlist
-source ./harness-bootstrap.sh                            # or: bash ./harness-bootstrap.sh
-HARNESS_INSTALL_REF=v1.0 source ./harness-bootstrap.sh   # pin a release
-HARNESS_REPO_URL=https://github.com/you/harness source ./harness-bootstrap.sh   # fork/mirror
+# run from the folder you want ./harness/ created in
+source /path/to/bundle/harness-bootstrap.sh     # or: bash /path/to/bundle/harness-bootstrap.sh
+bash /path/to/bundle/harness-bootstrap.sh -b dev   # skip the question (main or dev)
+HARNESS_REPO_URL=https://github.com/you/harness bash /path/to/bundle/harness-bootstrap.sh   # fork/mirror
 ```
 
-If the fetch fails (offline, bad ref), it falls back to a bundled
-`harness-install.sh` if you ship one, else aborts cleanly. New upstream `.env`
+From zsh (the macOS default shell), run it with `bash`, not `source`: the
+installer is bash-only. If the fetch fails (offline, blocked), it falls back to
+a bundled `harness-install.sh` if you ship one, else aborts cleanly. New upstream `.env`
 variables do not need to enter your bundle: `harness upgrade` merges them in
 from `.env.example` without touching your values, so you only edit the bundle to
 change your *own* values. Details:

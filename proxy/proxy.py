@@ -28,7 +28,7 @@ Environment variables (see README / .env.example):
                          forwards whatever model the request asked for and only
                          falls back to this when the request omits a model.
     MODEL_CONTEXT_LENGTH context-window cap for the local token estimate
-                         (default 200000; legacy alias OLLAMA_CONTEXT_LENGTH).
+                         (default 200000).
     PROXY_BACKEND        which upstream dialect to speak: "openai" (default)
                          or "chatgpt". NOT a .env key -- `harness chatgpt`
                          injects it for one launch. With "chatgpt" the
@@ -90,14 +90,8 @@ PROXY_API_URL: str = os.environ.get("PROXY_API_URL", "").strip()
 PROXY_API_KEY: str = os.environ.get("PROXY_API_KEY", "").strip()
 DEFAULT_MODEL_NAME: str = os.environ.get("DEFAULT_MODEL_NAME", "").strip()
 PROXY_TIMEOUT: int = int(os.environ.get("PROXY_TIMEOUT", "180"))
-# Context-window cap used to bound the local token estimate. Reads the new
-# MODEL_CONTEXT_LENGTH env var, falling back to the legacy OLLAMA_CONTEXT_LENGTH
-# name so existing .env files keep working across the ollama removal.
-MODEL_CONTEXT_LENGTH: int = int(
-    os.environ.get("MODEL_CONTEXT_LENGTH")
-    or os.environ.get("OLLAMA_CONTEXT_LENGTH")
-    or "200000"
-)
+# Context-window cap used to bound the local token estimate.
+MODEL_CONTEXT_LENGTH: int = int(os.environ.get("MODEL_CONTEXT_LENGTH") or "200000")
 
 
 def _normalize_api_base(url: str) -> str:

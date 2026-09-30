@@ -45,8 +45,7 @@ the other side — the sourced value is a strict prefix of what
 `_config_read_key` reads off disk — and turns `harness chatgpt doctor`'s cookie
 line from a green "set, N chars" into a fail that names the real length.
 
-`DEFAULT_MODEL_NAME` (which replaced the old `PROXY_API_MODEL` +
-`OLLAMA_AGENT_MODEL`) is the default/fallback model id and is **REQUIRED with no
+`DEFAULT_MODEL_NAME` (which replaced the old `PROXY_API_MODEL`) is the default/fallback model id and is **REQUIRED with no
 hardcoded default** — once the selected model passes through to the upstream, a
 cosmetic default would be a real upstream id we can't know. `agent_model` reads
 it (empty when unset) and `require_runtime_config` enforces it's set before any

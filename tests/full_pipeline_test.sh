@@ -211,8 +211,8 @@ MODEL_CONTEXT_LENGTH=200000
 MOCK_SCENARIO=text
 EOF
 
-# harness-install.sh prompts, in order: add to PATH? [y/n], enter upstream API
-# URL (Enter to skip), enter API key? [y/n], then (on y) the key itself. Send:
+# harness-install.sh prompts, in order: add to PATH? [Y/n], enter upstream API
+# URL (Enter to skip), enter API key? [y/N], then (on y) the key itself. Send:
 # y, <blank>, y, <key>. The blank URL answer leaves the pre-placed
 # PROXY_API_URL=http://mockupstream:9000/... intact (asserted in T2), while the
 # key answer exercises issue #67's PROXY_API_KEY rewrite — the prompt value wins

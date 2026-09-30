@@ -20,8 +20,8 @@
 #       mcp/<name>/                        active MCP services
 #
 # To uninstall later:
-#   rm -rf <install-root>
-#   rm ~/.local/bin/harness
+#   harness uninstall     (removes the install root, the PATH wrapper, and the
+#                          harness containers/images; prompts first)
 
 # Detect whether we were sourced (so the PATH update inside this script
 # takes effect in the caller's shell) vs executed as a subprocess. Behavior
@@ -736,7 +736,7 @@ EOF
         return 1
     fi
     local ans
-    printf 'Proceed with a host-only install and accept these risks? [y/n]: ' >&2
+    printf 'Proceed with a host-only install and accept these risks? [y/N]: ' >&2
     if ! IFS= read -r ans </dev/tty; then
         fail "no input received; aborting"
         return 1
@@ -985,7 +985,7 @@ if [[ -z "$BRANCH" && -t 0 ]]; then
     echo "  tracking branch: $BRANCH"
 fi
 
-read -rp "add 'harness' to PATH (recommended)? [y/n]: " path_ans
+read -rp "add 'harness' to PATH (recommended)? [Y/n]: " path_ans
 case "${path_ans:-}" in
     n|N|no|NO) want_path=0 ;;
     *) want_path=1 ;;
@@ -1009,9 +1009,9 @@ fi
 # obvious from the count of stars, while the value itself stays off-screen.
 # Backspace works (DEL 0x7f and BS 0x08). Char-by-char masking needs a real tty;
 # when stdin isn't one (piped/non-interactive install) we fall back to a plain
-# hidden read, matching the previous behavior. This must be the LAST interactive
-# stdin read in the installer, so a multi-line clipboard that stops at the first
-# newline can't bleed into a later prompt.
+# hidden read, matching the previous behavior. Input stops at the first
+# newline, so the rest of a multi-line paste stays queued for the next read:
+# the model menu's prompt, after the clone. Keep new prompts ahead of this one.
 _read_secret_masked() {
     local prompt="$1"
     REPLY_SECRET=""
@@ -1047,7 +1047,7 @@ api_key_value=""
 echo
 echo "The proxy needs an upstream API key (PROXY_API_KEY in .env)."
 echo "If you skip this, edit .env and set PROXY_API_KEY before running harness."
-read -rp "enter an upstream API key now? [y/n]: " key_ans
+read -rp "enter an upstream API key now? [y/N]: " key_ans
 case "${key_ans:-}" in
     y|Y|yes|YES)
         want_api_key=1
@@ -1084,6 +1084,12 @@ apply_preclone_proxy() {
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ "$line" =~ ^[[:space:]]*${pk}=(.*)$ ]] && val="${BASH_REMATCH[1]}"
         done <"$env_file"
+        # A CR (a .env saved on Windows) and one pair of surrounding quotes
+        # are stripped, as compose does, so neither lands inside the proxy URL.
+        val="${val%$'\r'}"
+        if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then
+            val="${val:1:${#val}-2}"
+        fi
         [[ -z "$val" ]] && continue   # unset/blank in .env → keep host env
         lk=$(printf '%s' "$pk" | tr '[:upper:]' '[:lower:]')
         export "$pk"="$val" "$lk"="$val"

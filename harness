@@ -577,7 +577,7 @@ _check_and_offer_config_merge() {
         return 0
     fi
 
-    if _upgrade_confirm "merge now? [y/n] (n continues launch; run 'harness upgrade' later): "; then
+    if _upgrade_confirm "merge now? [Y/n] (n continues launch; run 'harness upgrade' later): "; then
         if (( need_env )); then
             upgrade_envfile_merge "$env_src" "$env_tgt" 0 >/dev/null || true
         fi
@@ -1319,7 +1319,7 @@ warn_if_firewall_open() {
     fi
 
     local ans
-    printf 'Continue starting %s? [y/n]: ' "$tool" >&2
+    printf 'Continue starting %s? [y/N]: ' "$tool" >&2
     if ! IFS= read -r ans </dev/tty; then
         err "no input received; aborting"
         return 1
@@ -4286,7 +4286,7 @@ host_confirm_gate() {
         return 1
     fi
     local ans
-    printf 'Continue launching host-mode opencode? [y/n]: ' >&2
+    printf 'Continue launching host-mode opencode? [y/N]: ' >&2
     if ! IFS= read -r ans </dev/tty; then
         err "no input received; aborting"
         return 1
@@ -4516,7 +4516,7 @@ host_write_opencode_config() {
     port=$(host_proxy_port)
     proxy_url="http://127.0.0.1:${port}/v1"
     default_model=$(_effective_default_model)
-    ctx="${MODEL_CONTEXT_LENGTH:-${OLLAMA_CONTEXT_LENGTH:-200000}}"
+    ctx="${MODEL_CONTEXT_LENGTH:-200000}"
 
     local model_ids=() catalog
     if command -v curl >/dev/null 2>&1; then
@@ -5136,9 +5136,8 @@ agent_common_env() {
     # PROXY_PORT is sourced from .env into this shell; default 8000.
     printf -- '-e\nPROXY_PORT=%s\n' "${PROXY_PORT:-8000}"
     # Declared context window for opencode's model config. The same knob caps
-    # the proxy's local token estimate. Legacy alias OLLAMA_CONTEXT_LENGTH is
-    # honored as a fallback so existing .env files keep working.
-    printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-${OLLAMA_CONTEXT_LENGTH:-200000}}"
+    # the proxy's local token estimate.
+    printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-200000}"
     # Container CWD is also bind-mounted at this exact path; the entrypoint
     # cd's here after the gosu drop. Surfaced as an env var so agents (and
     # any user scripts inside the container) can identify the host launch
@@ -6635,7 +6634,7 @@ cmd_mcp_uninstall() {
     if (( ! force )); then
         local ans
         printf 'this will stop and remove the active config for %s. ' "$name" >&2
-        printf 'data dir at %s/data will be preserved. continue? [y/n]: ' "$dest" >&2
+        printf 'data dir at %s/data will be preserved. continue? [y/N]: ' "$dest" >&2
         if [[ -t 0 ]]; then
             read -r ans </dev/tty
         else
