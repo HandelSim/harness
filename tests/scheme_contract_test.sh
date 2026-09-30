@@ -212,20 +212,30 @@ EOF
         -d "${body}"
 }
 
-# Capture the most recent forwarded body from mockupstream logs and
-# return it on stdout. The mock logs every request as
-# `[mock-upstream] POST /v1/chat/completions body=<json>`; we grep for
-# that and pull the body= prefix off.
+# Capture the FIRST forwarded body from mockupstream logs and return it on
+# stdout. The mock logs every request as
+# `[mock-upstream] POST /v1/chat/completions body=<json>`; we grep for that
+# and pull the body= prefix off.
+#
+# It must be the first, not the last: require-tool mode (on by default for
+# every scheme except passthrough) re-POSTs upstream up to three times when a
+# response carries no tool call. The scheme fixtures return plain text, so a
+# text probe triggers those retries, and each retry's last user message is the
+# require-tool correction — not the original probe. The scheme contract is
+# about how the proxy wraps the *client's* request, which is the first
+# upstream call; the retries wrap the correction and are orthogonal. mockupstream
+# is force-recreated per scheme (fresh log), so the first POST here is always
+# the original probe.
 capture_forwarded_body() {
-    local logs last
+    local logs first
     logs="$("${COMPOSE[@]}" logs --tail=500 mockupstream 2>&1 || true)"
-    last="$(echo "${logs}" | grep -E '\[mock-upstream\] (POST|PUT) /v1/chat/completions ' | tail -1)"
-    if [[ -z "${last}" ]]; then
+    first="$(echo "${logs}" | grep -E '\[mock-upstream\] (POST|PUT) /v1/chat/completions ' | head -1)"
+    if [[ -z "${first}" ]]; then
         echo "__NO_FORWARDED_BODY__"
         return 1
     fi
     # Trim everything up to and including `body=`.
-    echo "${last#*body=}"
+    echo "${first#*body=}"
 }
 
 # Run a python check inside the proxy container against the forwarded
