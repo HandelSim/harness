@@ -46,6 +46,10 @@ _COMMON_HOST_LABELS = {
     "api", "www", "com", "net", "org", "io", "ai", "app", "dev", "co", "cloud",
     "v1", "v2", "gateway", "prod", "staging", "internal", "local", "localhost",
     "chat", "llm", "proxy", "edu", "gov", "us", "eu", "uk", "de",
+    # Vendor/product words: redacting these would mangle model ids
+    # ("gemini-2.5-flash") and response keys without hiding anything.
+    "gemini", "google", "googleapis", "openai", "anthropic", "claude", "azure",
+    "vertex", "aiplatform", "enterprise", "models", "inference", "openrouter",
 }
 
 
@@ -168,6 +172,19 @@ class Resp:
         return "HTTP %s %s" % (self.status, red(" ".join(str(msg).split()))[:200])
 
 
+_SECRET_FIELDS = {"assist_token", "session", "unlock_url", "api_key", "key", "token", "access_token"}
+
+
+def _scrub(obj):
+    """Blank values of fields that carry session/auth material, recursively."""
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if k.lower() in _SECRET_FIELDS and obj[k] else _scrub(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub(v) for v in obj]
+    return obj
+
+
 def _content_to_text(c):
     if c is None:
         return ""
@@ -207,7 +224,8 @@ def _norm_tool_call(tc):
 
 
 class Client:
-    def __init__(self, base, key, timeout, log):
+    def __init__(self, base, key, timeout, log, red):
+        self.red = red
         self.base = base
         self.key = key
         self.timeout = timeout
@@ -385,17 +403,35 @@ class Client:
     def _log(self, label, body, raw, r):
         if not self.log:
             return
-        req = body if body is not None else (raw[:300] if isinstance(raw, str) else "<raw>")
-        req_s = json.dumps(req)
+        req = body if body is not None else (raw if isinstance(raw, str) else "<raw>")
+        # Redact before any truncation (a cut can split a secret).
+        req_s = self.red(json.dumps(req))
         if len(req_s) > 6000:
             req_s = req_s[:3000] + " ...<%d chars>... " % len(req_s) + req_s[-1500:]
+        if r.is_sse:
+            # Never log raw SSE: a secret split across two chunks would slip
+            # past the redactor. Log the reassembled stream instead.
+            first = r.events[0] if r.events else {}
+            resp_s = json.dumps(_scrub({
+                "sse_events": r.event_count, "done": r.done_seen, "finish": r.finish,
+                "first_event_keys": sorted(first.keys()) if isinstance(first, dict) else None,
+                "content": r.content, "reasoning": r.reasoning,
+                "tool_calls": [{k: t[k] for k in ("id", "type", "name", "arguments")} for t in r.tool_calls],
+                "usage": r.usage, "extra_keys": r.extra_keys, "error_event": r.json}))
+        elif r.json is not None:
+            resp_s = json.dumps(_scrub(r.json))
+        else:
+            resp_s = r.text
+        resp_s = self.red(resp_s)
+        if len(resp_s) > 5000:
+            resp_s = resp_s[:5000] + " ...<%d chars>" % len(resp_s)
         rec = [
             "### #%d %s" % (self.n, label),
             "status=%s elapsed=%.2fs ttfb=%s ctype=%s sse=%s events=%d done=%s err=%s"
             % (r.status, r.elapsed, "%.2f" % r.ttfb if r.ttfb is not None else "-", r.ctype,
                r.is_sse, r.event_count, r.done_seen, r.error),
             "request: " + req_s,
-            "response: " + (r.text[:5000] + (" ...<%d chars>" % len(r.text) if len(r.text) > 5000 else "")),
+            "response: " + resp_s,
             "",
         ]
         self.log("\n".join(rec))
@@ -551,12 +587,15 @@ class Prober:
         self.out(self.red(s))
 
     def excerpt(self, s, n=150):
-        s = " ".join(str(s or "").split())
+        # Redact BEFORE truncating: a cut can split a secret into a prefix
+        # the redactor no longer recognizes (e.g. "127.0..." or "tok_AB...").
+        s = " ".join(self.red(s or "").split())
         if len(s) > n:
             s = s[:n] + "..."
         return '"' + s + '"'
 
     def rec(self, tid, title, verdict, note="", r=None, ex=None, exn=150):
+        note = self.red(note)
         self.results[tid] = (verdict, note)
         parts = ["%-4s %-4s %s" % (tid, verdict, title)]
         if note:
@@ -597,13 +636,12 @@ class Prober:
     def fail_note(self, r):
         return r.short_err(self.red)
 
-    @staticmethod
-    def calls_desc(r, n=3):
+    def calls_desc(self, r, n=3):
         out = []
         for tc in r.tool_calls[:n]:
             a = tc["arguments"]
             a = a if isinstance(a, str) else json.dumps(a)
-            out.append("%s(%s)" % (tc["name"], " ".join(str(a).split())[:70]))
+            out.append("%s(%s)" % (self.red(tc["name"]), " ".join(self.red(a).split())[:70]))
         if len(r.tool_calls) > n:
             out.append("+%d more" % (len(r.tool_calls) - n))
         return "; ".join(out)
@@ -623,7 +661,7 @@ class Prober:
         t_start = time.monotonic()
         self.p("=== harness probe v%s (redacted; safe to paste) ===" % VERSION)
         self.p("date_utc=%s python=%s os=%s model=%s repeat=%d"
-               % (datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%MZ"), platform.python_version(),
+               % (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), platform.python_version(),
                   platform.system(), self.model, self.a.repeat))
         self.p("legend: PASS/FAIL = expected behavior seen or not; PART = some of N repeats; "
                "INFO = observation; ERR = request error")
@@ -654,12 +692,14 @@ class Prober:
         if r.ok and isinstance(r.json, dict):
             catalog = [m.get("id") for m in (r.json.get("data") or []) if isinstance(m, dict) and m.get("id")]
             self.rec("A01", "GET /v1/models", "INFO",
-                     "%d models, default %s in catalog: %s" % (len(catalog), "IS" if self.model in catalog else "NOT", ", ".join(catalog))[:600], r)
+                     self.red("%d models, default %s in catalog: %s" % (len(catalog), "IS" if self.model in catalog else "NOT", ", ".join(catalog)))[:600], r)
         else:
             self.rec("A01", "GET /v1/models", "ERR", self.fail_note(r), r)
 
         r = self.c.request("/v1/models", method="GET", verify_tls=True, label="A02 tls-verify")
-        if r.status is not None:
+        if not self.c.base.lower().startswith("https"):
+            self.rec("A02", "TLS cert verifies with system CAs (direct clients need this)", "SKIP", "base URL is not https")
+        elif r.status is not None:
             self.rec("A02", "TLS cert verifies with system CAs (direct clients need this)", "PASS", "", r)
         else:
             self.rec("A02", "TLS cert verifies with system CAs (direct clients need this)", "FAIL",
@@ -844,7 +884,7 @@ class Prober:
         self.rec("B14", "self-report: identity", "INFO", "", r, r.content if r.ok else self.fail_note(r), 200)
 
         r = self.chat([{"role": "user", "content": "What is today's date in YYYY-MM-DD? If you do not know, reply UNKNOWN."}], "B15 date")
-        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         self.rec("B15", "date awareness", "INFO", "actual=%s" % today, r, r.content if r.ok else self.fail_note(r), 80)
 
         r = self.chat([{"role": "user", "content": "Can you browse the web or run code yourself during this conversation? Answer 'web: yes/no, code: yes/no' then one sentence."}],
@@ -1085,12 +1125,11 @@ class Prober:
             msgs = msgs + [{"role": "assistant", "content": r.content or None, "tool_calls": hist}] + results
         return True, trace, final, r
 
-    @staticmethod
-    def _trace_desc(trace, final):
+    def _trace_desc(self, trace, final):
         steps = []
         for name, args, valid in trace[:8]:
-            a = json.dumps(args)
-            steps.append("%s%s(%s)" % (name, "" if valid else "[BAD-JSON]", " ".join(a.split())[:60]))
+            a = self.red(json.dumps(args))
+            steps.append("%s%s(%s)" % (self.red(name), "" if valid else "[BAD-JSON]", " ".join(a.split())[:60]))
         return " -> ".join(steps) + (" -> text" if final else " -> (no final text)")
 
     def _d_agent_loops(self):
@@ -1331,7 +1370,7 @@ class Prober:
             r = self.chat([{"role": "user", "content": "Reply with exactly: PROBE-OK"}], "G %s chat" % m, model=m)
             res.append(r.ok and "PROBE-OK" in r.content)
             if r.status is not None and not r.ok:
-                self.p("%-34s ERR %s" % (m[:34], self.fail_note(r)))
+                self.p("%-34s ERR %s" % (self.red(m)[:34], self.fail_note(r)))
                 continue
             r = self.chat([{"role": "system", "content": "Session facts: the secret codeword for this session is ZEBRA-7731."},
                            {"role": "user", "content": "What is the secret codeword for this session? Reply with just the codeword, or NONE."}], "G %s sys" % m, model=m)
@@ -1357,7 +1396,7 @@ class Prober:
                            {"role": "user", "content": "Run the test suite for this project and tell me what fails."}], "G %s act" % m, model=m, tools=OPENCODE_TOOLS)
             res.append(r.ok and bool(r.tool_calls))
             cells = ["%-5s" % ("yes" if x else "no") for x in res] + ["%-5d" % int(time.monotonic() - t0)]
-            self.p("%-34s %s" % (m[:34], " ".join(cells)))
+            self.p("%-34s %s" % (self.red(m)[:34], " ".join(cells)))
         self.p("cols: chat=basic reply, sys=system content reaches model, obey=system instruction obeyed, tool=native tool call, "
                "tstrm=streamed tool call, rtrip=tool result round trip, json=json_schema, act=coding agent calls a tool instead of describing")
 
@@ -1370,7 +1409,8 @@ class Prober:
             for i in ids:
                 v = g(i)
                 if v:
-                    vals.append("%s=%s%s" % (i, v[0], (" (" + v[1][:40] + ")") if v[1] and v[0] in ("PASS", "PART", "FAIL") and "/" in v[1][:5] else ""))
+                    kn = re.match(r"^(\d+/\d+)", v[1] or "")
+                    vals.append("%s=%s%s" % (i, v[0], (" " + kn.group(1)) if kn else ""))
             self.p("  %-46s %s" % (label, ", ".join(vals) if vals else "n/a"))
 
         self.p("")
@@ -1447,7 +1487,7 @@ def main():
     def out(s):
         print(s, flush=True)
 
-    client = Client(base, key, a.timeout, log if log_fh else None)
+    client = Client(base, key, a.timeout, log if log_fh else None, red)
     prober = Prober(a, client, red, out)
     rc = 0
     try:
@@ -1459,7 +1499,11 @@ def main():
         else:
             raise
     except KeyboardInterrupt:
-        out("interrupted")
+        out("interrupted; findings so far:")
+        try:
+            prober.summary(0)
+        except Exception:
+            pass
         rc = 130
     finally:
         if log_fh:

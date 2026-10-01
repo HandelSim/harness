@@ -1703,7 +1703,8 @@ usage: harness probe [--model ID] [--skip-long] [--no-matrix] [--repeat N]
 Characterize the upstream API directly (bypassing the proxy): system prompt
 reach/obedience, history handling, native tool calls (stream, round trips,
 parallel, agent loops, schema keywords), response_format, and a per-model
-matrix. Takes ~10-30 minutes; prints one line per check.
+matrix. Expect roughly 20-60 minutes (about 120 requests plus 8 per catalog
+model; --skip-long and --no-matrix cut it down). Prints one line per check.
 
 Output is redacted (API key, URL, host, emails, IPs, bearer tokens,
 projects/... paths) and safe to paste. Add more terms to strip with

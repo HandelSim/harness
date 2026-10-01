@@ -167,8 +167,8 @@ start_mock() {
     rm -f "$TMP_ROOT/port"
     python3 "$TMP_ROOT/mock.py" "$TMP_ROOT/port" "$PREFIX" "$1" &
     MOCK_PID=$!
-    local i
-    for i in $(seq 1 50); do
+    local _
+    for _ in $(seq 1 50); do
         [[ -s "$TMP_ROOT/port" ]] && break
         sleep 0.1
     done
@@ -214,7 +214,9 @@ ok "T3 full run exits 0 with all sections and expected PASS lines"
 log=$(ls "$TMP_ROOT"/state/output/probe-*.log 2>/dev/null | head -1)
 [[ -n "$log" && -s "$log" ]] || fail "T4 no log written under state/output"
 for f in "$TMP_ROOT/stdout.txt" "$log"; do
-    for secret in "$KEY" "PROBEKEY" "$PREFIX" "secretcorp" "10.1.2.3" "127.0.0.1" ":${PORT}" \
+    # Partial forms too ("127.0", "tok_PROB", "admin"): an excerpt cut before
+    # redaction leaves a secret prefix the redactor no longer matches.
+    for secret in "$KEY" "PROBEKEY" "tok_PROB" "$PREFIX" "secretcorp" "admin" "10.1." "127.0" ":${PORT}" \
                   "p-123456" "ASSISTSECRET" "$ORG" "unlock.secret"; do
         if grep -qiF -- "$secret" "$f"; then
             grep -niF -- "$secret" "$f" | head -3 >&2
@@ -222,7 +224,9 @@ for f in "$TMP_ROOT/stdout.txt" "$log"; do
         fi
     done
 done
-grep -qF "<key>" "$log" || fail "T4 expected <key> placeholder in the log (mock echoes the key)"
+grep -qF "Bearer <redacted>" "$log" || fail "T4 expected 'Bearer <redacted>' in the log (mock echoes the auth header)"
+grep -qF "<key-fragment>" "$log" || fail "T4 expected <key-fragment> in the log (mock echoes part of the key)"
+grep -qF '"assist_token": "<redacted>"' "$log" || fail "T4 assist_token value not scrubbed in the log"
 ok "T4 no secrets in stdout or log"
 
 # --- T5: relative log path ---
