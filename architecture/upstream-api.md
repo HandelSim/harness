@@ -34,9 +34,12 @@ These are the load-bearing behaviors the proxy is built around:
   ignored and the response never contained `tool_calls`. This is *why* the
   proxy does cooperative-prompt tool-use; see [`proxy.md`](proxy.md).
   - As of 2026-10 the vendor documents OpenAI-style native `tools` /
-    `tool_calls` / `role:"tool"` and `response_format` (`json_schema` with
-    `strict`). This is **unverified** against the live endpoint. Run
-    `harness probe` (see [`harness-cli.md`](harness-cli.md)) to measure it.
+    `tool_calls` / `role:"tool"` and `response_format`. `harness probe`
+    (2026-10-01, all 6 catalog models) found **none of it live**: `tools`,
+    `tool_choice`, `parallel_tool_calls` and legacy `functions` are ignored,
+    no reply carries `tool_calls`, and `response_format` (`json_schema` or
+    `json_object`) is ignored (markdown comes back). Re-run `harness probe`
+    when the vendor says it is enabled (see [`harness-cli.md`](harness-cli.md)).
   - The proxy still ignores native `tool_calls` in replies
     (`extract_assistant_content` reads only `message.content`).
 - **Hidden, uncontrollable system prompt.** The upstream runs its own
@@ -54,10 +57,35 @@ These are the load-bearing behaviors the proxy is built around:
   concatenated, or a stub `assistant` message inserted between them, to
   preserve role alternation — see `translate_history_and_apply_prompt`
   in [`proxy.md`](proxy.md).
+- **Earlier turns may be dropped entirely.** `harness probe` (2026-10-01,
+  one sample each) failed every multi-message recall test even with clean
+  alternation: `user, assistant, user` lost the fact from the first user
+  turn (C01), a prior `assistant` turn was not treated as history (C03),
+  and a `role:"tool"` result never informed the answer (D03). A fact in the
+  same single user message is always seen (B03, C05). If this holds, only
+  the last user message reaches the model, so the hybrid layout (tool
+  definitions folded into message 0, history as alternating turns) loses
+  the tool definitions and every earlier turn; what survives is the
+  recency block on the last user message. Unconfirmed beyond the probe.
 - **Unreliable `usage`.** `usage.total_tokens` is per-request (the most
   recent request + response only), not cumulative for the conversation.
   It cannot be used for context tracking — the proxy estimates tokens
   locally instead (see "Local token estimation" in [`proxy.md`](proxy.md)).
+  Responses now mark it `"is_estimated": true`.
+- **Sampling and shape parameters are ignored.** `max_tokens` (8 gave ~300
+  words), `stop`, `temperature` (0 is not deterministic), `n` (always one
+  choice) and `image_url` content parts have no effect. Array-of-text
+  `content` parts are accepted.
+- **Request size ceiling.** One 200k-char message (~56k upstream-estimated
+  prompt tokens) worked; 600k chars returned `502 upstream_error`. The real
+  ceiling is somewhere in between and unmeasured. `MODEL_CONTEXT_LENGTH`
+  defaults to 200000 tokens, above that range, so a long session can hit
+  502s before opencode compacts.
+- **Streaming is coarse.** SSE arrives in a handful of large chunks (6
+  events for a ~120-token reply) after a multi-second first byte.
+- **TLS now verifies** against system CAs (the proxy still sends
+  `verify=False`). `gemini_enterprise.thinking[]` came back empty on
+  `gemini-3.8-flash`.
 
 ## A second backend: the ChatGPT backend-api
 
@@ -183,11 +211,11 @@ key-lock behavior — a locked key returns the `401` + `unlock_url` shape above.
 |------|---------|
 | `400` | Bad Request — invalid request body or parameters |
 | `401` | Unauthorized — invalid/missing API key, **or key locked** (see unlock flow) |
-| `403` | Forbidden — key lacks permission for this endpoint |
+| `403` | Forbidden — key lacks permission; also `type=forbidden` for a model the team cannot use ("Your team does not have access to this model") and for an unparseable body ("restricted to specific models") |
 | `404` | Not Found — resource does not exist (e.g. model not enabled) |
 | `429` | Too Many Requests — rate limit exceeded |
 | `500` | Internal Server Error — server error |
-| `502` | Bad Gateway — upstream LLM backend failure |
+| `502` | Bad Gateway — `upstream_error` catch-all: backend failure, missing `messages`, empty user content, or an oversized request |
 
 A `401`/`403` carries an `error.type` that distinguishes *why* it failed, and
 the harness auth probe keys off it (see [`harness-cli.md`](harness-cli.md) →
@@ -198,6 +226,9 @@ type) means the **key** was rejected — e.g. a mis-pasted key produced
 (#108). `invalid_request` means the **request** was malformed but the key is
 valid (e.g. a bad model id) — the probe warns and continues (#43). A locked key
 is the `unauthorized` + `unlock_url` shape above and aborts with the unlock URL.
+As of 2026-10-01 a model the team cannot use returns `403 type=forbidden`
+instead, so a bad `DEFAULT_MODEL_NAME` now aborts the launch under the
+"key rejected" banner; the dumped body shows the real reason.
 
 ## Self-reported internals (unverified)
 
