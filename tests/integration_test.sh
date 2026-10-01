@@ -229,7 +229,7 @@ phase_1_stack_setup() {
     echo "[integration] Phase 1.5: smoke test (harness -p \"say hello\")"
     local out rc
     set +e
-    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 90 \
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 90 \
         bash -c "HOME='${FAKE_HOME}' HARNESS_PROJECT_NAME='${PROJECT_NAME}' '${TEST_INSTALL}/harness' -p \"say hello\" 2>&1 < /dev/null")
     rc=$?
     set -e
@@ -343,7 +343,7 @@ phase_2_serena() {
     # agent to refresh it, then assert serena is present. (Output is
     # discarded; we only care about the side-file side effect.)
     set +e
-    cd "${TEST_WORKSPACE}/test-project" && timeout 60 \
+    cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 60 \
         bash -c "HOME='${FAKE_HOME}' HARNESS_PROJECT_NAME='${PROJECT_NAME}' '${TEST_INSTALL}/harness' opencode -p \"say hello\" >/dev/null 2>&1 < /dev/null"
     cd "${REPO_ROOT}"
     set -e
@@ -429,7 +429,7 @@ phase_2_tui_test() {
     # stdout stream.
     local out rc
     set +e
-    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 120 \
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 120 \
         env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
         "${TEST_INSTALL}/harness" -p \
         "Use serena to find the Calculator class symbol in this project" \
@@ -833,7 +833,7 @@ phase_5_mount() {
     local ws_target out rc
     ws_target=$(harness_abs_path "${TEST_WORKSPACE}/test-project")
     set +e
-    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 90 \
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 90 \
         env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
         "${TEST_INSTALL}/harness" -p \
         "Use bash to print exactly the value of pwd, then list /workspace if it exists, then exit." \
@@ -903,7 +903,7 @@ phase_5_mount() {
 
     echo "[integration] Phase 5.3: --mount /etc rejected with clear error"
     set +e
-    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 30 \
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 30 \
         env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
         "${TEST_INSTALL}/harness" --mount /etc -p "noop" 2>&1 < /dev/null)
     rc=$?
@@ -921,7 +921,7 @@ phase_5_mount() {
 
     echo "[integration] Phase 5.4: --mount /nonexistent/abc rejected"
     set +e
-    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout 30 \
+    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 30 \
         env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
         "${TEST_INSTALL}/harness" --mount /nonexistent/abc -p "noop" 2>&1 < /dev/null)
     rc=$?

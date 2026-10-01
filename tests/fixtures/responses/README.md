@@ -10,6 +10,9 @@ the user message with — is stripped before matching (the mock unwraps the
 `<<<BEGIN_USER_REQUEST>>>` / `<<<BEGIN_TOOL_RESULT>>>` markers). So a
 `match` regex only ever sees the user's real request or a tool result;
 don't write a regex expecting to target the injected tool descriptions.
+User messages the proxy authors itself (require-tool rejections and retry
+corrections, all starting with `[harness`) are skipped too: the mock matches
+the user turn before them, so a correction never selects a fixture of its own.
 
 Mount this directory into the mock container at `/fixtures` and set
 `MOCK_FIXTURES_DIR=/fixtures` to enable the dispatch path. Without that env

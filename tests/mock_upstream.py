@@ -239,6 +239,11 @@ def unwrap_proxy_scaffolding(content: str) -> str:
     return content
 
 
+# Every user message the proxy writes itself (require-tool rejection,
+# retry correction) starts with this; see proxy.py _REQUIRE_TOOL_CORRECTION.
+PROXY_CORRECTION_PREFIX = "[harness"
+
+
 def extract_user_prompt(body: Any) -> str:
     """Pull the most recent user-message content out of a forwarded body.
 
@@ -262,16 +267,25 @@ def extract_user_prompt(body: Any) -> str:
             continue
         content = msg.get("content", "")
         if isinstance(content, str):
-            return unwrap_proxy_scaffolding(content)
+            text = unwrap_proxy_scaffolding(content)
         # Some clients send content as a list of {"type":"text","text":...}
         # parts. Concatenate the text parts so fixtures can match either.
-        if isinstance(content, list):
-            joined = "\n".join(
+        elif isinstance(content, list):
+            text = unwrap_proxy_scaffolding("\n".join(
                 part.get("text", "")
                 for part in content
                 if isinstance(part, dict) and part.get("type") == "text"
-            )
-            return unwrap_proxy_scaffolding(joined)
+            ))
+        else:
+            continue
+        # Skip the proxy's own correction turns (require-tool rejections and
+        # retry corrections all start with "[harness"): answer the turn being
+        # corrected instead. Matching the correction itself is wrong; its
+        # example bash call says "list files", which hit 03_list_files and
+        # sent `harness -p "say hello"` into an endless `ls` tool loop.
+        if text.lstrip().startswith(PROXY_CORRECTION_PREFIX):
+            continue
+        return text
     return ""
 
 

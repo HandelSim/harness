@@ -111,6 +111,10 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 - `tests/unit_win_location_test.sh` (no docker, no network) — Windows install
   location: the installer's out-of-profile warning/offer (block eval'd with stubs,
   pty via `script` for the prompt) and `host_win_location_hint`. Covers I052, Ho023.
+- `tests/unit_mock_upstream_test.sh` (no docker) — test infrastructure, not a product
+  behavior: the mock upstream's fixture dispatch skips the proxy's `[harness` correction
+  turns (raw, marker-wrapped, escalated, list-of-parts, after a tool result), and every
+  proxy-authored correction constant starts with that prefix (read from `proxy.py`'s AST).
 - `tests/unit_net_open_test.sh` (no docker) — `cmd_net_open` service-membership
   validation: the captured-list + here-string match that fixed the pipefail/SIGPIPE
   false-reject. Covers F089, F151.

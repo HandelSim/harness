@@ -145,7 +145,12 @@ uses. Two modes:
   catch-all. The proxy's cooperative-prompt scaffolding (the tool-schema
   dump it pads the user message with) is stripped before matching, so a
   fixture regex only ever sees the user's actual request or a tool
-  result — never the injected tool descriptions.
+  result — never the injected tool descriptions. User turns the proxy
+  writes itself (require-tool rejections and retry corrections, all
+  starting with `[harness`) are skipped, so a correction round gets the
+  same answer as the turn it corrects and require-tool fails open as in
+  production; matching the correction text sent `harness -p "say hello"`
+  into an endless `ls` loop (`unit_mock_upstream_test.sh`).
 
 See `tests/fixtures/responses/README.md` for the file shape, naming
 convention (`NN_short_slug.json` with reserved priority ranges per
