@@ -188,11 +188,14 @@ FIXTURES: list[Fixture] = load_fixtures(FIXTURES_DIR) if FIXTURES_DIR else []
 
 # Marker pairs the proxy's cooperative-prompt builders wrap real content in
 # (see proxy/proxy.py). The user's actual request lands inside
-# <<<BEGIN_USER_REQUEST>>> markers; a tool-result turn's output lands inside
+# <<<BEGIN_USER_REQUEST>>> markers, earlier user turns in the history inside
+# <<<BEGIN_USER_MESSAGE>>> markers; a tool-result turn's output lands inside
 # <<<BEGIN_TOOL_RESULT name="...">>> markers. Everything else in the message
 # is proxy scaffolding — tool-schema dumps and instruction boilerplate.
 _USER_REQUEST_OPEN = "<<<BEGIN_USER_REQUEST>>>"
 _USER_REQUEST_CLOSE = "<<<END_USER_REQUEST>>>"
+_USER_MESSAGE_OPEN = "<<<BEGIN_USER_MESSAGE>>>"
+_USER_MESSAGE_CLOSE = "<<<END_USER_MESSAGE>>>"
 _TOOL_RESULT_OPEN = "<<<BEGIN_TOOL_RESULT"
 _TOOL_RESULT_CLOSE = "<<<END_TOOL_RESULT>>>"
 
@@ -216,14 +219,17 @@ def unwrap_proxy_scaffolding(content: str) -> str:
     with only a short reminder prefix, or a request that never went
     through the proxy).
     """
-    open_idx = content.find(_USER_REQUEST_OPEN)
-    if open_idx != -1:
-        body_start = open_idx + len(_USER_REQUEST_OPEN)
+    for opener, closer in ((_USER_REQUEST_OPEN, _USER_REQUEST_CLOSE),
+                           (_USER_MESSAGE_OPEN, _USER_MESSAGE_CLOSE)):
+        open_idx = content.find(opener)
+        if open_idx == -1:
+            continue
+        body_start = open_idx + len(opener)
         # First close marker only — defensive against any future
         # bookend-style scheme that emits two request blocks with the
         # tool-schema dump *between* them. Spanning to the last close
         # marker would re-include the scaffolding.
-        close_idx = content.find(_USER_REQUEST_CLOSE, body_start)
+        close_idx = content.find(closer, body_start)
         if close_idx != -1:
             return content[body_start:close_idx].strip()
     open_idx = content.find(_TOOL_RESULT_OPEN)

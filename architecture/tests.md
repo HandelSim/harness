@@ -147,10 +147,13 @@ uses. Two modes:
   fixture regex only ever sees the user's actual request or a tool
   result — never the injected tool descriptions. User turns the proxy
   writes itself (require-tool rejections and retry corrections, all
-  starting with `[harness`) are skipped, so a correction round gets the
-  same answer as the turn it corrects and require-tool fails open as in
-  production; matching the correction text sent `harness -p "say hello"`
-  into an endless `ls` loop (`unit_mock_upstream_test.sh`).
+  starting with `[harness`, also when wrapped in the
+  `<<<BEGIN_USER_MESSAGE>>>` markers earlier turns carry) are skipped, so
+  a correction round gets the same answer as the turn it corrects and
+  require-tool fails open as in production; matching the correction text
+  sent `harness -p "say hello"` into an endless `ls` loop.
+  `unit_mock_upstream_test.sh` drives the proxy's real correction loop
+  against the mock, docker-free.
 
 See `tests/fixtures/responses/README.md` for the file shape, naming
 convention (`NN_short_slug.json` with reserved priority ranges per

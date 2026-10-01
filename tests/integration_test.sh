@@ -190,6 +190,22 @@ harness_call() {
         "${TEST_INSTALL}/harness" "$@"
 }
 
+# Run an agent command bounded by $1 seconds and print its output. The
+# output goes through a file, not straight into the caller's $(...) pipe: a
+# process that outlives the kill (a docker client the kill does not reach)
+# would otherwise hold the pipe open and hang the test until the CI job
+# timeout, with nothing in the log. -k 10 follows SIGTERM with SIGKILL.
+agent_run() {
+    local secs="$1"; shift
+    local log rc
+    log=$(mktemp "${TEST_ROOT}/agent-run.XXXXXX")
+    timeout -k 10 "${secs}" "$@" >"${log}" 2>&1 < /dev/null
+    rc=$?
+    cat "${log}"
+    rm -f "${log}"
+    return "${rc}"
+}
+
 # Copy the test project fixture into the workspace. Serena and Graphify
 # both look at /workspace/test-project/ when an agent runs there.
 cp -a "${REPO_ROOT}/tests/fixtures/test-project" "${TEST_WORKSPACE}/"
@@ -229,7 +245,7 @@ phase_1_stack_setup() {
     echo "[integration] Phase 1.5: smoke test (harness -p \"say hello\")"
     local out rc
     set +e
-    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 90 \
+    out=$(cd "${TEST_WORKSPACE}/test-project" && agent_run 90 \
         bash -c "HOME='${FAKE_HOME}' HARNESS_PROJECT_NAME='${PROJECT_NAME}' '${TEST_INSTALL}/harness' -p \"say hello\" 2>&1 < /dev/null")
     rc=$?
     set -e
@@ -429,7 +445,7 @@ phase_2_tui_test() {
     # stdout stream.
     local out rc
     set +e
-    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 120 \
+    out=$(cd "${TEST_WORKSPACE}/test-project" && agent_run 120 \
         env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
         "${TEST_INSTALL}/harness" -p \
         "Use serena to find the Calculator class symbol in this project" \
@@ -833,7 +849,7 @@ phase_5_mount() {
     local ws_target out rc
     ws_target=$(harness_abs_path "${TEST_WORKSPACE}/test-project")
     set +e
-    out=$(cd "${TEST_WORKSPACE}/test-project" && timeout -k 10 90 \
+    out=$(cd "${TEST_WORKSPACE}/test-project" && agent_run 90 \
         env HOME="${FAKE_HOME}" HARNESS_PROJECT_NAME="${PROJECT_NAME}" \
         "${TEST_INSTALL}/harness" -p \
         "Use bash to print exactly the value of pwd, then list /workspace if it exists, then exit." \

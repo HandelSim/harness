@@ -7,7 +7,8 @@ matches the **most recent user-message content** against each fixture's
 
 The proxy's cooperative-prompt scaffolding — the tool-schema dump it pads
 the user message with — is stripped before matching (the mock unwraps the
-`<<<BEGIN_USER_REQUEST>>>` / `<<<BEGIN_TOOL_RESULT>>>` markers). So a
+`<<<BEGIN_USER_REQUEST>>>` / `<<<BEGIN_USER_MESSAGE>>>` /
+`<<<BEGIN_TOOL_RESULT>>>` markers). So a
 `match` regex only ever sees the user's real request or a tool result;
 don't write a regex expecting to target the injected tool descriptions.
 User messages the proxy authors itself (require-tool rejections and retry
