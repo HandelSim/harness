@@ -138,7 +138,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Config / setup | `config` (get/set/list + interactive picker), `model` (pick `DEFAULT_MODEL_NAME` from the live catalog), `uninstall` — see "Config and setup commands" below. |
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
-| Diagnostics | `doctor`, `preflight`, `help` |
+| Diagnostics | `doctor`, `preflight`, `probe`, `help` |
 | Test / bench | `test`, `benchmark` |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
 | MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
@@ -887,6 +887,46 @@ breaks the recursion.
   (`python3`/`jq`/`node`/`opencode`, Node >= 20) instead of the daemon, and
   skips the allowlist file-exists and `PROXY_API_URL`-in-allowlist checks
   (the firewall allowlist only governs container mode).
+
+## `probe`
+
+`cmd_probe` runs `scripts/probe_upstream.py` (stdlib-only Python) straight
+against `PROXY_API_URL` with `PROXY_API_KEY`. The proxy is not involved. It
+characterizes the upstream for the question "could an agent talk to it
+directly?". Sections:
+
+- **A:** transport, SSE shape, parameters, errors.
+- **B:** whether `system` content reaches and steers the model, plus the
+  model's self-reports of its hidden prompt, tools and identity.
+- **C:** history handling (consecutive roles, images, statelessness,
+  long-context needles).
+- **D:** native `tools`: non-stream and stream, round trips, `tool_choice`,
+  parallel calls, simulated opencode-style agent loops, act-vs-describe,
+  schema keywords, tool-name formats, catalogs of 40, 130 and 300 tools.
+- **E:** `response_format`.
+- **G:** a per-model matrix over `/v1/models`.
+
+It prints one line per check plus a key-findings block.
+
+**Redaction is the contract.** Every printed and logged string goes through
+`Redactor`, which removes:
+
+- the key and any 10+ char fragment of it;
+- the base URL, host and distinctive host labels;
+- all URLs, emails, IPv4s and bearer tokens;
+- `projects/...` paths;
+- `HARNESS_PROBE_REDACT` terms.
+
+`gemini_enterprise` values are summarized, never dumped. The output is meant
+to be pasted into an issue without editing. A full redacted request log goes
+to `state/output/probe-<ts>.log`, printed by relative path only.
+
+Interpreter: it uses `host_python_bin` (Windows paths go through
+`cygpath -m`). With no host Python it falls back to
+`harness_docker run --entrypoint python harness-proxy:latest -`, passing env
+by name only. A locked key aborts with a pointer to `harness unlock`, and the
+unlock URL is not echoed. `tests/unit_probe_test.sh` drives it against a
+secret-echoing mock.
 
 ## Shared libraries under `scripts/lib/`
 

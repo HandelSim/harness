@@ -30,9 +30,15 @@ authoritative values.
 
 These are the load-bearing behaviors the proxy is built around:
 
-- **No tool support.** A `tools` field in the request is ignored; the
-  response never contains `tool_calls`. This is *why* the proxy does
-  cooperative-prompt tool-use — see [`proxy.md`](proxy.md).
+- **No tool support** (historically). A `tools` field in the request was
+  ignored and the response never contained `tool_calls`. This is *why* the
+  proxy does cooperative-prompt tool-use; see [`proxy.md`](proxy.md).
+  - As of 2026-10 the vendor documents OpenAI-style native `tools` /
+    `tool_calls` / `role:"tool"` and `response_format` (`json_schema` with
+    `strict`). This is **unverified** against the live endpoint. Run
+    `harness probe` (see [`harness-cli.md`](harness-cli.md)) to measure it.
+  - The proxy still ignores native `tool_calls` in replies
+    (`extract_assistant_content` reads only `message.content`).
 - **Hidden, uncontrollable system prompt.** The upstream runs its own
   system prompt that we can neither see nor override. A `system`-role
   message in the request is **quietly ignored** (no error). Its prompt is

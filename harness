@@ -1687,6 +1687,80 @@ cmd_unlock() {
     return 1
 }
 
+# 'harness probe': run scripts/probe_upstream.py straight against the upstream
+# (no proxy) to characterize it — system-prompt handling, native tool calls,
+# streaming, response_format, per-model matrix. Output is redacted (key, URL,
+# host, emails, IPs, projects/... paths, HARNESS_PROBE_REDACT terms) so it can
+# be pasted back as-is. Runs on the host's python3; falls back to the proxy
+# image's python when the host has none. See architecture/harness-cli.md.
+cmd_probe() {
+    case "${1:-}" in
+        -h|--help)
+            cat <<'EOF'
+usage: harness probe [--model ID] [--skip-long] [--no-matrix] [--repeat N]
+                     [--timeout SECS] [--only SECTIONS]
+
+Characterize the upstream API directly (bypassing the proxy): system prompt
+reach/obedience, history handling, native tool calls (stream, round trips,
+parallel, agent loops, schema keywords), response_format, and a per-model
+matrix. Takes ~10-30 minutes; prints one line per check.
+
+Output is redacted (API key, URL, host, emails, IPs, bearer tokens,
+projects/... paths) and safe to paste. Add more terms to strip with
+HARNESS_PROBE_REDACT=term1,term2. A full redacted request log is written
+under state/output/.
+
+  --model ID      model for the full suite (default: DEFAULT_MODEL_NAME)
+  --skip-long     skip the long-context needle tests (40k..1.2M chars)
+  --no-matrix     skip the per-model matrix over the /v1/models catalog
+  --repeat N      repeats for the stochastic key checks (default 3)
+  --timeout SECS  per-request timeout (default 120)
+  --only SECTIONS run only these sections, e.g. BD (A always runs)
+EOF
+            return 0
+            ;;
+    esac
+    if [[ -z "${PROXY_API_URL:-}" || -z "${PROXY_API_KEY:-}" ]]; then
+        err "PROXY_API_URL and PROXY_API_KEY must be set ('harness config set ...')"
+        return 1
+    fi
+    local script="$install_root/scripts/probe_upstream.py"
+    if [[ ! -f "$script" ]]; then
+        err "missing $script; run 'harness upgrade'"
+        return 1
+    fi
+    local py
+    if py=$(host_python_bin); then
+        local rel log
+        rel="state/output/probe-$(date -u +%Y%m%dT%H%M%SZ).log"
+        log="$install_root/$rel"
+        mkdir -p "$install_root/state/output"
+        local pyscript="$script"
+        # Windows python wants C:/... paths, not Git Bash's /c/...
+        if command -v cygpath >/dev/null 2>&1; then
+            pyscript=$(cygpath -m "$script"); log=$(cygpath -m "$log")
+        fi
+        # $py is unquoted on purpose: on Windows it can be 'py -3'.
+        # shellcheck disable=SC2086
+        $py "$pyscript" --log "$log" --log-display "$rel" "$@"
+        return
+    fi
+    # No host python: borrow the proxy image's. Values pass by name (-e VAR),
+    # never on the command line, so the key never shows up in `ps`.
+    if ! harness_docker image inspect harness-proxy:latest >/dev/null 2>&1; then
+        err "no Python 3 on the host and the harness-proxy image isn't built;"
+        err "install Python 3, or run 'harness start' once, then retry"
+        return 1
+    fi
+    local -a envs=(-e PROXY_API_URL -e PROXY_API_KEY -e DEFAULT_MODEL_NAME -e HARNESS_PROBE_REDACT)
+    local v
+    for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+        [[ -n "${!v:-}" ]] && envs+=(-e "$v")
+    done
+    harness_docker run --rm -i "${envs[@]}" --entrypoint python \
+        harness-proxy:latest - "$@" <"$script"
+}
+
 # --- config / model / uninstall (post-install setup, in the versioned CLI) ---
 #
 # harness-install.sh is fetched once and frozen at install time, so anything a
@@ -2253,6 +2327,10 @@ commands:
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
   unlock                probe the upstream and print the unlock URL if the
                         key is locked
+  probe [--skip-long]   test the upstream API directly (system prompt, native
+                        tools, streaming, response_format, every model) and
+                        print a redacted report that is safe to paste. See
+                        'harness probe --help'.
   config [get|set|...]  view and change .env settings. Bare 'harness config'
                         opens an interactive picker of common settings so you
                         don't have to memorize .env; 'config get [KEY]',
@@ -8940,6 +9018,7 @@ main() {
         net)                        cmd_net "$@" ;;
         mcp)                        cmd_mcp "$@" ;;
         unlock)                     cmd_unlock "$@" ;;
+        probe)                      cmd_probe "$@" ;;
         config)                     cmd_config "$@" ;;
         model)                      cmd_model "$@" ;;
         uninstall)                  cmd_uninstall "$@" ;;

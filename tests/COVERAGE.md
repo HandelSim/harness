@@ -52,6 +52,12 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   `harness uninstall` confirm gate and teardown, and the two `.env` quoting guards:
   `_warn_unquoted_env_values` (F153) and `_config_value_truncated` (C040). Sourced via
   `HARNESS_SOURCE_ONLY=1` against a throwaway install root.
+- `tests/unit_probe_test.sh` (no docker) — `harness probe`: `--help`, the missing-config
+  error, a full run against a stdlib mock upstream (JSON + SSE, native tool_calls,
+  streamed tool-call deltas, response_format), and redaction of every secret the mock
+  echoes back (key and key fragments, URL/host/port, emails, IPs, `projects/...`,
+  assist token, `HARNESS_PROBE_REDACT` terms) in both stdout and the log. Also covers
+  the locked-key abort.
 - `tests/scheme_contract_test.sh` (407 lines, Track E) — per-scheme proxy contract test.
   Brings up proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
   a probe through the proxy's OpenAI-compatible interface; asserts forwarded-body structure.
