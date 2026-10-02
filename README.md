@@ -68,7 +68,7 @@ installer is bash-only. If the fetch fails (offline, blocked), it falls back to
 a bundled `harness-install.sh` if you ship one, else aborts cleanly. New upstream `.env`
 variables do not need to enter your bundle: `harness upgrade` merges them in
 from `.env.example` without touching your values, so you only edit the bundle to
-change your *own* values. Details:
+change your *own* values. Short steps: [docs/INSTALL.md](docs/INSTALL.md). Details:
 [architecture/install-and-upgrade.md](architecture/install-and-upgrade.md).
 
 ## Running
