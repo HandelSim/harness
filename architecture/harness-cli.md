@@ -891,9 +891,13 @@ breaks the recursion.
 ## `probe`
 
 `cmd_probe` runs `scripts/probe_upstream.py` (stdlib-only Python) straight
-against `PROXY_API_URL` with `PROXY_API_KEY`. The proxy is not involved. It
-characterizes the upstream for the question "could an agent talk to it
-directly?". Sections:
+against `PROXY_API_URL` with `PROXY_API_KEY`. The proxy is not involved.
+Subcommands: `full` (the default; bare `harness probe`), `memory`, and
+`help` (lists them); `<subcommand> --help` gives that suite's options. The
+subcommand reaches the script as `--suite full|memory`.
+
+The full suite characterizes the upstream for the question "could an agent
+talk to it directly?". Sections:
 
 - **A:** transport, SSE shape, parameters, errors.
 - **B:** whether `system` content reaches and steers the model, plus the
@@ -907,6 +911,24 @@ directly?". Sections:
 - **G:** a per-model matrix over `/v1/models`.
 
 It prints one line per check plus a key-findings block.
+
+**`harness probe memory`** (`MemProber`, a `Prober` subclass in the same
+file) maps what the upstream remembers: which messages of a request, and of
+earlier requests, reach the model, and what (turn count, role layout, size,
+time, session) changes that. Every request plants fresh random crate labels
+in chosen messages and asks for them back; the reply's labels are a bitmap
+of what the model saw, and a label from an earlier request coming back is
+counted as server-side state. Sections 1-9: reach (an earlier request vs
+this request's history), turn count, layout, single-message capacity (size
+ladder to the error edge, bisect, multibyte text, confirmation reps), history
+vs padding size, folded transcript, an agent-like growing session, a
+per-model check, and server-side memory (delays, session pass-back, `user`
+field; `--long-term` opts into the product's saved memory and deletes it
+after). A 3-turn canary runs after every section. The log adds a layout line
+per request (role, chars and planted labels per message, wire bytes) and the
+reply, thinking trace and usage, capped at 20k chars; session ids appear
+only as a short hash, and pass-back fields (`session`, `session_id`,
+`conversation_id`) are scrubbed. Log: `state/output/probe-memory-<ts>.log`.
 
 **Redaction is the contract.** Every printed and logged string goes through
 `Redactor`, which removes:
@@ -924,7 +946,9 @@ to `state/output/probe-<ts>.log`, printed by relative path only.
 Interpreter: it uses `host_python_bin` (Windows paths go through
 `cygpath -m`). With no host Python it falls back to
 `harness_docker run --entrypoint python harness-proxy:latest -`, passing env
-by name only. A locked key aborts with a pointer to `harness unlock`, and the
+by name only; the script must stay one file for this. In that fallback the
+log is written to the container's stderr and redirected into the host log
+file. A locked key aborts with a pointer to `harness unlock`, and the
 unlock URL is not echoed. `tests/unit_probe_test.sh` drives it against a
 secret-echoing mock.
 

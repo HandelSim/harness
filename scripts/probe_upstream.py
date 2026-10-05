@@ -10,6 +10,10 @@ per-model matrix. The goal is to learn, in one run, whether a coding agent
 (opencode, etc.) could talk to the upstream directly and what still needs the
 harness proxy.
 
+`--suite memory` ('harness probe memory') runs only the memory suite
+(MemProber): how much of a request's history, and of earlier requests, the
+model actually sees, and at what sizes that changes.
+
 Output is designed to be pasted back verbatim: every printed line passes
 through Redactor, which removes the API key (and any 10+ char fragment of it),
 the base URL and its host, every URL, emails, IPs, bearer tokens, `projects/...`
@@ -173,7 +177,8 @@ class Resp:
         return "HTTP %s %s" % (self.status, red(" ".join(str(msg).split()))[:200])
 
 
-_SECRET_FIELDS = {"assist_token", "session", "unlock_url", "api_key", "key", "token", "access_token"}
+_SECRET_FIELDS = {"assist_token", "session", "session_id", "conversation_id", "unlock_url", "api_key",
+                  "key", "token", "access_token"}
 
 
 def _scrub(obj):
@@ -1437,18 +1442,898 @@ class Prober:
         self.p("requests=%d elapsed=%ds" % (self.c.n, int(secs)))
 
 
+# --------------------------------------------------------------------------
+# Memory suite ('harness probe memory')
+# --------------------------------------------------------------------------
+#
+# Question: which parts of a request (and of earlier requests) reach the
+# model, and what decides when earlier turns are dropped? Every request plants
+# fresh random crate labels ("QXV-382") in chosen messages and asks for them
+# back, so a reply shows exactly which messages the model saw. Labels are new
+# on every request, so server-side memory can never fake a recall; a label
+# from an EARLIER request showing up in a reply is counted as a leak instead.
+# The neutral "crate label" wording avoids the secret/password framing a chat
+# model may refuse to repeat.
+
+_LABEL_CHARS = "BCDFGHJKLMNPQRSTVWXZ"
+_LABEL_RE = re.compile(r"\b[BCDFGHJKLMNPQRSTVWXZ]{3}-\d{3}\b")
+_QUESTION = ("List every crate label mentioned anywhere in this conversation, including in this message, "
+             "one per line as `crate N: LABEL`, copying each label exactly. Leave out any crate you cannot "
+             "see; do not guess or invent labels.")
+_WORDS = ["parser", "cache", "router", "ledger", "socket", "buffer", "worker", "schema", "tensor", "bucket",
+          "queue", "shard", "token", "lexer", "vector", "matrix", "client", "config", "loader", "bridge"]
+_CJK = "数据处理完成记录状态更新服务器请求响应缓存队列任务进程线程文件目录配置模块接口测试结果错误日志"
+
+
+def _norm(s):
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
+def code_filler(n_chars, seed=0):
+    """Varied code / JSON / log / list text, so a needle is not trivially easy
+    to spot and tokenization looks like a real agent's tool output. Lowercase
+    identifiers only, so it never forms a crate-label pattern."""
+    rnd = random.Random(seed)
+    out = []
+    total = 0
+    i = 0
+    while total < n_chars:
+        w1, w2, w3 = rnd.choice(_WORDS), rnd.choice(_WORDS), rnd.choice(_WORDS)
+        k = i % 4
+        if k == 0:
+            b = ('def handle_%s_%d(req, ctx):\n    """Process the %s for one %s."""\n'
+                 '    items = ctx.load("%s", limit=%d)\n    for it in items:\n'
+                 '        if it.status == "%s_ready":\n            ctx.emit(it.id, it.value * %d)\n'
+                 '    return len(items)\n\n' % (w1, i, w2, w3, w1, rnd.randint(10, 999), w2, rnd.randint(2, 9)))
+        elif k == 1:
+            b = ('{"id": %d, "path": "src/%s/%s_%d.py", "size": %d, "kind": "%s", "dirty": %s}\n'
+                 % (i, w1, w2, i, rnd.randint(100, 99999), w3, "true" if i % 3 else "false"))
+        elif k == 2:
+            b = ("2026-10-%02d 12:%02d:%02d info %s[%d] processed %s batch %d in %dms\n"
+                 % (1 + i % 28, i % 60, (i * 7) % 60, w1, rnd.randint(1, 64), w2, i, rnd.randint(1, 900)))
+        else:
+            b = "- [%s] step %d: update the %s %s in %s/%s.ts\n" % ("x" if i % 2 else " ", i, w1, w2, w3, w1)
+        out.append(b)
+        total += len(b)
+        i += 1
+    return "".join(out)[:n_chars]
+
+
+def cjk_filler(n_chars, seed=0):
+    rnd = random.Random(seed)
+    out = []
+    total = 0
+    while total < n_chars:
+        line = "".join(rnd.choice(_CJK) for _ in range(30)) + " %d\n" % rnd.randint(0, 9999)
+        out.append(line)
+        total += len(line)
+    return "".join(out)[:n_chars]
+
+
+def tooldefs_filler(n_chars, seed=0):
+    """Text shaped like the proxy's folded tool definitions (message 0)."""
+    rnd = random.Random(seed)
+    out = ["You have these tools. Call one by replying with a ```json block {\"name\": ..., \"arguments\": {...}}.\n\n"]
+    total = len(out[0])
+    i = 0
+    while total < n_chars:
+        w1, w2 = rnd.choice(_WORDS), rnd.choice(_WORDS)
+        b = json.dumps({"name": "%s_%s_%d" % (w1, w2, i),
+                        "description": "Reads or updates the %s %s. Use it when the task needs the %s state." % (w1, w2, w1),
+                        "parameters": {"type": "object", "properties": {
+                            "path": {"type": "string", "description": "path of the %s" % w2},
+                            "limit": {"type": "number", "description": "max %s entries" % w1}},
+                            "required": ["path"]}}, indent=1) + "\n"
+        out.append(b)
+        total += len(b)
+        i += 1
+    return "".join(out)[:n_chars]
+
+
+def _kfmt(n):
+    return "%dk" % (n // 1000) if n >= 1000 else str(n)
+
+
+class MR:
+    """One memory-suite exchange: which planted labels came back."""
+
+    def __init__(self, r, facts, chars_total, chars_last, wire=0):
+        self.r = r
+        self.wire = wire  # request body bytes as sent (JSON, non-ASCII escaped like the proxy's)
+        self.facts = facts  # [(name, label)]
+        self.hits = {}
+        self.leaks = []
+        self.foreign = []
+        self.sess = "-"
+        self.sess_raw = None
+        self.chars_total = chars_total
+        self.chars_last = chars_last
+
+    def hit(self, name):
+        return self.hits.get(name, False)
+
+    def bitmap(self, names):
+        return "".join("#" if self.hits.get(n) else "." for n in names)
+
+
+class MemProber(Prober):
+    def __init__(self, args, client, red, out):
+        Prober.__init__(self, args, client, red, out)
+        self.issued = {}  # label -> request label it was planted in
+        self.samples = []  # dicts for the verdict
+        self.sessions = []  # (label, session hash)
+        self.leaks = []  # (request label, leaked label, planted in)
+        self.foreign = []
+        self.ctrl_seen = 0
+        self.ctrl_total = 0
+        self.r502 = []  # (chars, elapsed)
+        self.notes = {}
+        self.catalog = []
+        quick = args.quick
+        self.R = 1 if quick else max(1, args.repeat)
+        self.maxc = args.max_chars
+
+    # ---- labels ----
+    def lab(self, where):
+        while True:
+            c = "".join(random.choice(_LABEL_CHARS) for _ in range(3)) + "-%03d" % random.randint(0, 999)
+            if c not in self.issued:
+                self.issued[c] = where
+                return c
+
+    @staticmethod
+    def fact(i, label):
+        return "Shipment note: crate %s carries label %s." % (i, label)
+
+    def final(self, ctrl, extra=""):
+        return "%s%s\n\n%s" % ((extra + "\n\n") if extra else "", self.fact("Z", ctrl), _QUESTION)
+
+    # ---- request ----
+    def _session_of(self, r):
+        cands = []
+        if isinstance(r.json, dict):
+            cands.append(r.json)
+        cands.extend(e for e in r.events if isinstance(e, dict))
+        for ev in cands:
+            ge = ev.get("gemini_enterprise")
+            if isinstance(ge, dict) and ge.get("session"):
+                return str(ge["session"])
+        return None
+
+    def _thought(self, r):
+        cands = [r.json] if isinstance(r.json, dict) else []
+        cands.extend(e for e in r.events if isinstance(e, dict))
+        for ev in cands:
+            ge = ev.get("gemini_enterprise")
+            if isinstance(ge, dict) and isinstance(ge.get("thinking"), list) and ge["thinking"]:
+                return " / ".join(str(t) for t in ge["thinking"])
+        return ""
+
+    def mchat(self, messages, label, facts, model=None, stream=False, timeout=None, **kw):
+        """Send, then score which planted labels came back. `facts` lists every
+        (name, label) planted in this request; name 'ctrl' is the control in
+        the last message."""
+        contents = [_content_to_text(m.get("content")) for m in messages]
+        total = sum(len(c) for c in contents)
+        last = len(contents[-1]) if contents else 0
+        wire = len(json.dumps({"model": model or self.model, "messages": messages}))
+        if self.c.log:
+            lay = []
+            for i, (m, c) in enumerate(zip(messages, contents)):
+                inside = [n for n, l in facts if l in c]
+                lay.append("[%d %s %dc%s]" % (i, m.get("role"), len(c), (" " + ",".join(inside)) if inside else ""))
+            self.c.log("### layout %s: total=%dc (~%d proxy-est tokens) wire=%dB last=%dc model=%s extra=%s\n%s\n"
+                       % (label, total, total // 3, wire, last, model or self.model,
+                          sorted(kw.keys()), " ".join(lay)))
+        r = self.chat(messages, label, model=model, stream=stream,
+                      timeout=timeout or self.a.timeout, **kw)
+        m = MR(r, facts, total, last, wire)
+        sent = _norm(" ".join(contents))
+        reply = _norm(r.content)
+        for n, l in facts:
+            m.hits[n] = bool(r.ok and _norm(l) in reply)
+        if r.ok:
+            for l, where in self.issued.items():
+                if _norm(l) in reply and _norm(l) not in sent:
+                    m.leaks.append(l)
+                    self.leaks.append((label, l, where))
+            for l in set(_LABEL_RE.findall((r.content or "").upper())):
+                if l not in self.issued:
+                    m.foreign.append(l)
+                    self.foreign.append((label, l))
+        raw = self._session_of(r)
+        m.sess_raw = raw
+        m.sess = hashlib.sha256(raw.encode()).hexdigest()[:8] if raw else "-"
+        self.sessions.append((label, m.sess))
+        if any(n == "ctrl" for n, _ in facts) and r.ok:
+            self.ctrl_total += 1
+            self.ctrl_seen += 1 if m.hit("ctrl") else 0
+        if r.status == 502:
+            self.r502.append((total, r.elapsed))
+        if self.c.log:
+            th = self._thought(r)
+            self.c.log("### score %s: status=%s hits=%s leaks=%s foreign=%s session=%s elapsed=%.1fs usage=%s\n"
+                       "thinking: %s\n"
+                       % (label, r.status, {n: m.hits[n] for n, _ in facts}, m.leaks, m.foreign, m.sess,
+                          r.elapsed, json.dumps(r.usage), th[:4000] if th else "(none)"))
+        return m
+
+    def mrec(self, tid, title, m, names=None, verdict=None, note=""):
+        r = m.r
+        if not r.ok:
+            self.rec(tid, title, "ERR", "%s total=%s wire=%sB" % (self.fail_note(r), _kfmt(m.chars_total), _kfmt(m.wire)), r)
+            return
+        parts = []
+        if names:
+            parts.append("hist=%s" % m.bitmap(names))
+        if any(n == "ctrl" for n, _ in m.facts):
+            parts.append("ctrl=%s" % ("ok" if m.hit("ctrl") else "MISS"))
+        parts.append("total=%s wire=%sB" % (_kfmt(m.chars_total), _kfmt(m.wire)))
+        pt = (r.usage or {}).get("prompt_tokens") if isinstance(r.usage, dict) else None
+        parts.append("ptok=%s" % (pt if pt is not None else "-"))
+        parts.append("sess=%s" % m.sess)
+        if m.leaks:
+            parts.append("LEAK=%s" % ",".join(m.leaks))
+        if note:
+            parts.append(note)
+        if verdict is None:
+            if names:
+                k = sum(1 for n in names if m.hit(n))
+                verdict = "ALL" if k == len(names) else ("NONE" if k == 0 else "SOME")
+            else:
+                verdict = "INFO"
+        self.rec(tid, title, verdict, " ".join(parts), r, r.content, 110)
+
+    def sample(self, sec, cfg, m, names, kind, **extra):
+        d = {"sec": sec, "cfg": cfg, "kind": kind, "ok": m.r.ok, "status": m.r.status,
+             "names": list(names), "hits": [m.hit(n) for n in names], "ctrl": m.hit("ctrl"),
+             "total": m.chars_total, "last": m.chars_last, "wire": m.wire, "sess": m.sess, "elapsed": m.r.elapsed}
+        d.update(extra)
+        self.samples.append(d)
+        return d
+
+    # ---- conversation builders ----
+    def turns_user_facts(self, n, tag):
+        msgs, facts = [], []
+        for i in range(1, n + 1):
+            l = self.lab(tag)
+            facts.append(("h%d" % i, l))
+            msgs.append({"role": "user", "content": self.fact(i, l) + " Reply OK."})
+            msgs.append({"role": "assistant", "content": "OK."})
+        ctrl = self.lab(tag)
+        facts.append(("ctrl", ctrl))
+        msgs.append({"role": "user", "content": self.final(ctrl)})
+        return msgs, facts
+
+    def folded(self, n, tag, pad_each=0, seed=0):
+        lines, facts = [], []
+        for i in range(1, n + 1):
+            l = self.lab(tag)
+            facts.append(("h%d" % i, l))
+            pad = ("\n" + code_filler(pad_each, seed + i)) if pad_each else ""
+            lines.append("USER: %s Reply OK.%s\nASSISTANT: OK." % (self.fact(i, l), pad))
+        ctrl = self.lab(tag)
+        facts.append(("ctrl", ctrl))
+        body = ("Here is our conversation so far, oldest first:\n\n%s\n\n--- end of earlier conversation ---\n\n%s"
+                % ("\n\n".join(lines), self.final(ctrl)))
+        return [{"role": "user", "content": body}], facts
+
+    # ------------------------------------------------------------------
+    def run(self):
+        t0 = time.monotonic()
+        self.c.resp_max = 20000
+        self.p("=== harness probe memory v%s (redacted; safe to paste) ===" % VERSION)
+        self.p("date_utc=%s python=%s os=%s model=%s repeat=%d quick=%s max_chars=%s"
+               % (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), platform.python_version(),
+                  platform.system(), self.model, self.R, self.a.quick, _kfmt(self.maxc)))
+        self.p("legend: hist=#/. per planted earlier fact, oldest first (# = came back); ctrl = the fact in the "
+               "last message; total = request chars; ptok = upstream prompt_tokens (may be a gateway estimate); "
+               "sess = hash of the returned session id")
+        self.setup()
+        self.canary("start")
+        sel = self.a.only
+        plan = [("1", self.sec_reach), ("2", self.sec_turns), ("3", self.sec_layout),
+                ("4", self.sec_capacity), ("5", self.sec_hist_size), ("6", self.sec_folded),
+                ("7", self.sec_agent), ("8", self.sec_models), ("9", self.sec_server)]
+        for key, fn in plan:
+            if sel and key not in sel:
+                continue
+            if key == "8" and self.a.no_matrix:
+                continue
+            fn()
+            self.canary("after %s" % key)
+        self.verdict(time.monotonic() - t0)
+
+    def setup(self):
+        self.section("0. setup")
+        r = self.c.request("/v1/models", method="GET", label="M0 models")
+        if r.status in (401, 403) and "unlock" in (r.text or "").lower():
+            raise SystemExit("aborting: the API key is LOCKED. Run 'harness unlock', unlock it in the "
+                             "browser, then re-run 'harness probe memory'.")
+        if r.ok and isinstance(r.json, dict):
+            self.catalog = [m.get("id") for m in (r.json.get("data") or []) if isinstance(m, dict) and m.get("id")]
+        self.rec("M0", "catalog", "INFO" if r.ok else "ERR",
+                 ("%d models: %s" % (len(self.catalog), ", ".join(self.catalog))) if r.ok else self.fail_note(r), r)
+        for size in (2000, 20000, 80000):
+            l = self.lab("M0")
+            body = code_filler(size, seed=size) + "\n" + self.fact(1, l) + "\n" + _QUESTION
+            m = self.mchat([{"role": "user", "content": body}], "M0 calib %s" % _kfmt(size), [("ctrl", l)])
+            self.mrec("M0b", "one message, %s chars: prompt_tokens calibration" % _kfmt(size), m,
+                      note="chars/ptok=%s" % (("%.2f" % (len(body) / m.r.usage["prompt_tokens"]))
+                                              if isinstance(m.r.usage, dict) and m.r.usage.get("prompt_tokens") else "-"))
+            if not m.r.ok and m.r.status is None:
+                break
+
+    def canary(self, when):
+        msgs, facts = self.turns_user_facts(3, "canary")
+        names = ["h1", "h2", "h3"]
+        m = self.mchat(msgs, "canary %s" % when, facts)
+        self.mrec("CAN", "canary (%s): 3 earlier user turns" % when, m, names)
+        self.sample("canary", "n3", m, names, "multi", when=when)
+
+    # ------------------------------------------------------------------
+    def sec_reach(self):
+        self.section("1. does request history reach the model at all")
+        # Conflict: a separate earlier request says RED, this request's history
+        # says BLUE. BLUE = model reads the request history; RED = it reads a
+        # server-side session; neither = it sees only the last message.
+        out = {"history": 0, "server": 0, "neither": 0, "both": 0, "err": 0}
+        for i in range(2 if self.a.quick else max(self.R, 4)):
+            red_l, blue_l = self.lab("M1 conflict red"), self.lab("M1 conflict blue")
+            ra = self.mchat([{"role": "user", "content": self.fact(7, red_l) + " Reply OK."}],
+                            "M1 conflict #%d plant" % (i + 1), [("red", red_l)])
+            msgs = [{"role": "user", "content": self.fact(7, blue_l) + " Reply OK."},
+                    {"role": "assistant", "content": "OK."},
+                    {"role": "user", "content": "What label does crate 7 carry? Reply with just the label, or NONE "
+                                                "if no crate 7 was mentioned."}]
+            m = self.mchat(msgs, "M1 conflict #%d ask" % (i + 1), [("red", red_l), ("blue", blue_l)])
+            if not m.r.ok or not ra.r.ok:
+                out["err"] += 1
+                kind = "err"
+            else:
+                b, rd = m.hit("blue"), m.hit("red")
+                kind = "both" if (b and rd) else ("history" if b else ("server" if rd else "neither"))
+                out[kind] += 1
+            self.mrec("M1a", "conflict #%d: earlier request says A, this request's history says B" % (i + 1), m,
+                      verdict=kind.upper(), note="same_session_as_plant=%s" % (m.sess != "-" and m.sess == ra.sess))
+            self.sample("1", "conflict", m, ["blue"], "multi", outcome=kind)
+        self.notes["conflict"] = out
+        self.p("     conflict totals: %s  (HISTORY = request history read; SERVER = server-side memory; "
+               "NEITHER = only the last message)" % out)
+
+        for i in range(self.R):
+            tag = "%s-%03d" % ("".join(random.choice(_LABEL_CHARS) for _ in range(3)), random.randint(0, 999))
+            self.issued[tag] = "M1 instruction"
+            msgs = [{"role": "user", "content": "For the rest of this conversation, end every reply with the tag %s "
+                                                "on its own line. Reply OK." % tag},
+                    {"role": "assistant", "content": "OK."},
+                    {"role": "user", "content": "Name one primary color."}]
+            m = self.mchat(msgs, "M1 instruction #%d" % (i + 1), [("instr", tag)])
+            self.mrec("M1b", "instruction given in an earlier turn is followed (no recall asked)", m,
+                      verdict="SEEN" if m.hit("instr") else ("ERR" if not m.r.ok else "MISS"))
+            self.sample("1", "instruction", m, ["instr"], "multi")
+
+        for i in range(self.R):
+            right = self.lab("M1 choice")
+            opts = [right] + [self.lab("M1 decoy") for _ in range(3)]
+            random.shuffle(opts)
+            letters = "ABCD"
+            msgs = [{"role": "user", "content": self.fact(3, right) + " Reply OK."},
+                    {"role": "assistant", "content": "OK."},
+                    {"role": "user", "content": "Which label does crate 3 carry? %s. Answer with the letter and the "
+                                                "label. If you were never told, still pick the most likely one."
+                                                % ", ".join("%s) %s" % (letters[k], o) for k, o in enumerate(opts))}]
+            m = self.mchat(msgs, "M1 choice #%d" % (i + 1), [("right", right)] +
+                           [("decoy%d" % k, o) for k, o in enumerate(opts) if o != right])
+            # Every option is in the last message, so score only which one was picked.
+            picked = [o for o in opts if _norm(o) in _norm(m.r.content)]
+            ok = picked == [right]
+            self.mrec("M1c", "4-way forced choice on an earlier fact (chance = 25%)", m,
+                      verdict="RIGHT" if ok else ("ERR" if not m.r.ok else "WRONG"), note="picked=%d" % len(picked))
+            self.sample("1", "choice", m, [], "multi", right=ok)
+
+    # ------------------------------------------------------------------
+    def sec_turns(self):
+        self.section("2. turn count: N earlier user turns (with 'OK.' replies), which survive")
+        ns = [1, 2, 4, 8, 16] if self.a.quick else [1, 2, 3, 4, 6, 8, 12, 16, 24, 32]
+        for n in ns:
+            for i in range(self.R):
+                msgs, facts = self.turns_user_facts(n, "M2 n=%d" % n)
+                names = ["h%d" % k for k in range(1, n + 1)]
+                m = self.mchat(msgs, "M2 n=%d #%d" % (n, i + 1), facts)
+                self.mrec("M2", "N=%d earlier turns (%d messages) #%d" % (n, len(msgs), i + 1), m, names)
+                self.sample("2", "n=%d" % n, m, names, "multi", n=n)
+
+    # ------------------------------------------------------------------
+    def sec_layout(self):
+        self.section("3. layout and roles (6 earlier facts each)")
+        n = 6
+        names = ["h%d" % k for k in range(1, n + 1)]
+
+        def run(cfg, title, build, reps=None, **kw):
+            for i in range(reps or self.R):
+                msgs, facts = build("M3 " + cfg)
+                m = self.mchat(msgs, "M3 %s #%d" % (cfg, i + 1), facts, **kw)
+                self.mrec("M3", "%s #%d" % (title, i + 1), m, names)
+                self.sample("3", cfg, m, names, "folded" if cfg == "folded" else "multi")
+
+        def asst(tag):
+            msgs, facts = [], []
+            for i in range(1, n + 1):
+                l = self.lab(tag)
+                facts.append(("h%d" % i, l))
+                msgs.append({"role": "user", "content": "What label does crate %d carry?" % i})
+                msgs.append({"role": "assistant", "content": self.fact(i, l)})
+            ctrl = self.lab(tag)
+            facts.append(("ctrl", ctrl))
+            msgs.append({"role": "user", "content": self.final(ctrl)})
+            return msgs, facts
+
+        def consec(tag):
+            msgs, facts = [], []
+            for i in range(1, n + 1):
+                l = self.lab(tag)
+                facts.append(("h%d" % i, l))
+                msgs.append({"role": "user", "content": self.fact(i, l)})
+            ctrl = self.lab(tag)
+            facts.append(("ctrl", ctrl))
+            msgs.append({"role": "user", "content": self.final(ctrl)})
+            return msgs, facts
+
+        def system(tag):
+            facts = [("h%d" % i, self.lab(tag)) for i in range(1, n + 1)]
+            ctrl = self.lab(tag)
+            return ([{"role": "system", "content": " ".join(self.fact(i, l) for i, (_, l) in enumerate(facts, 1))},
+                     {"role": "user", "content": self.final(ctrl)}], facts + [("ctrl", ctrl)])
+
+        def first_only(tag):
+            facts = [("h%d" % i, self.lab(tag)) for i in range(1, n + 1)]
+            msgs = [{"role": "user", "content": "Project notes:\n" + "\n".join(self.fact(i, l) for i, (_, l) in enumerate(facts, 1))
+                     + "\nReply OK."}, {"role": "assistant", "content": "OK."}]
+            for i in range(5):
+                msgs.append({"role": "user", "content": "Step %d done. Reply OK." % (i + 1)})
+                msgs.append({"role": "assistant", "content": "OK."})
+            ctrl = self.lab(tag)
+            msgs.append({"role": "user", "content": self.final(ctrl)})
+            return msgs, facts + [("ctrl", ctrl)]
+
+        run("assistant", "facts only in assistant turns", asst)
+        run("consecutive", "7 consecutive user messages, facts in the first 6", consec)
+        run("system", "facts in a system message", system)
+        run("first-msg", "facts all in message 0, then 5 filler turns (proxy puts tool defs there)", first_only)
+        run("folded", "same 6 turns folded into the last user message as a transcript",
+            lambda tag: self.folded(n, tag))
+        run("stream", "user-turn facts with stream=true", lambda tag: self.turns_user_facts(n, tag), reps=1, stream=True)
+
+    # ------------------------------------------------------------------
+    def hist_seen(self):
+        """True if any multi-message sample so far recalled an earlier fact."""
+        return any(any(s["hits"]) for s in self.samples if s["kind"] == "multi" and s["names"]
+                   and s["cfg"] not in ("instruction",))
+
+    def sec_hist_size(self):
+        self.section("5. history vs size: facts before AND after a padding block")
+        sizes = [0, 32000, 300000] if self.a.quick else [0, 8000, 32000, 128000, 300000]
+        edge = self.notes.get("edge_fail")
+        sizes = [s for s in sizes if s + 2000 <= self.maxc and (edge is None or s < edge * 0.9)]
+        if not self.hist_seen():
+            sizes = sizes[:1] + sizes[-1:] if len(sizes) > 2 else sizes
+            self.p("     (no earlier turn has come back so far; running only %s as a check)"
+                   % ", ".join(_kfmt(s) for s in sizes))
+        reps = min(self.R, 2)
+        for p in sizes:
+            for i in range(reps):
+                a, b, ctrl = self.lab("M5"), self.lab("M5"), self.lab("M5")
+                msgs = [{"role": "user", "content": self.fact(1, a) + " Reply OK."},
+                        {"role": "assistant", "content": "OK."}]
+                if p:
+                    msgs += [{"role": "user", "content": "Reference output to keep in mind:\n" + code_filler(p, seed=p + i)},
+                             {"role": "assistant", "content": "OK."}]
+                msgs += [{"role": "user", "content": self.fact(2, b) + " Reply OK."},
+                         {"role": "assistant", "content": "OK."},
+                         {"role": "user", "content": self.final(ctrl)}]
+                m = self.mchat(msgs, "M5 mid pad=%s #%d" % (_kfmt(p), i + 1), [("before", a), ("after", b), ("ctrl", ctrl)])
+                self.mrec("M5a", "pad %s in a middle turn (before,after) #%d" % (_kfmt(p), i + 1), m, ["before", "after"])
+                self.sample("5", "mid %d" % p, m, ["before", "after"], "multi", pad=p)
+        for p in sizes:
+            if not p:
+                continue
+            for i in range(reps):
+                a, ctrl = self.lab("M5"), self.lab("M5")
+                msgs = [{"role": "user", "content": self.fact(1, a) + " Reply OK."},
+                        {"role": "assistant", "content": "OK."},
+                        {"role": "user", "content": self.final(ctrl, "Reference output:\n" + code_filler(p, seed=p + 7 + i))}]
+                m = self.mchat(msgs, "M5 last pad=%s #%d" % (_kfmt(p), i + 1), [("before", a), ("ctrl", ctrl)])
+                self.mrec("M5b", "pad %s in the LAST message, earlier fact kept? #%d" % (_kfmt(p), i + 1), m, ["before"])
+                self.sample("5", "last %d" % p, m, ["before"], "multi", pad=p)
+
+    # ------------------------------------------------------------------
+    def needle_msg(self, size, tag, seed=0, filler=code_filler):
+        """One user message of ~size chars, needles at 0/25/50/75/100%."""
+        labs = [self.lab(tag) for _ in range(5)]
+        body_len = max(0, size - 700)
+        chunk = body_len // 4
+        parts = []
+        for k in range(5):
+            parts.append(self.fact("P%d" % (k * 25), labs[k]))
+            if k < 4:
+                parts.append(filler(chunk, seed=seed * 10 + k))
+        text = "\n".join(parts) + "\n\n" + _QUESTION
+        names = ["p0", "p25", "p50", "p75", "p100"]
+        return [{"role": "user", "content": text}], list(zip(names, labs)), names
+
+    def sec_capacity(self):
+        self.section("4. single-message capacity: 5 needles at 0/25/50/75/100%")
+        ladder = [32000, 128000, 300000, 500000, 700000] if self.a.quick else \
+            [8000, 32000, 64000, 128000, 200000, 300000, 400000, 500000, 600000, 700000]
+        ladder = [s for s in ladder if s <= self.maxc]
+        ok_max, full_max, fail_min, loss_min = 0, 0, None, None
+
+        def one(size, why, seed):
+            nonlocal ok_max, full_max, fail_min, loss_min
+            msgs, facts, names = self.needle_msg(size, "M4", seed=seed)
+            m = self.mchat(msgs, "M4 %s %s" % (why, _kfmt(size)), facts, timeout=max(self.a.timeout, 300))
+            self.mrec("M4", "%s %s chars (~%dk proxy-est tokens)" % (why, _kfmt(size), size // 3000), m, names,
+                      note="" if m.r.ok else "elapsed_to_error=%.0fs" % m.r.elapsed)
+            self.sample("4", "single %d" % size, m, names, "single", size=size)
+            if m.r.ok:
+                ok_max = max(ok_max, size)
+                if all(m.hit(n) for n in names):
+                    full_max = max(full_max, size)
+                elif loss_min is None or size < loss_min:
+                    loss_min = size
+            return m
+
+        flaky = []
+        for size in ladder:
+            m = one(size, "ladder", size)
+            if m.r.status is None:
+                self.p("     (network error; stopping the ladder)")
+                break
+            if not m.r.ok:
+                if one(size, "retry", size + 1).r.ok:  # flake, or a real limit?
+                    flaky.append(size)
+                    continue
+                fail_min = size
+                break
+        self.notes["flaky"] = flaky
+        if fail_min is not None and ok_max < fail_min:
+            lo, hi = ok_max, fail_min
+            for _ in range(2 if self.a.quick else 4):
+                mid = (lo + hi) // 2
+                if hi - lo < 15000:
+                    break
+                m = one(mid, "bisect", mid)
+                if m.r.ok:
+                    lo = mid
+                elif m.r.status is None:
+                    break
+                else:
+                    hi = mid
+                    fail_min = mid
+            self.notes["edge_ok"], self.notes["edge_fail"] = lo, hi
+            self.p("     request-size edge: OK at %s chars, error at %s chars" % (_kfmt(lo), _kfmt(hi)))
+            if self.r502:
+                self.p("     elapsed before each 502: %s (similar times = a timeout, not a size limit)"
+                       % ", ".join("%s:%.0fs" % (_kfmt(c), e) for c, e in self.r502))
+            # Units: the same edge in multibyte text. A CJK char is 1 char, 3
+            # UTF-8 bytes, 6 wire bytes (JSON \u escape, as the proxy sends it)
+            # and roughly one token, against ~3-4 chars per token for code.
+            # Which of these fail shows what the limit counts.
+            units = []
+            for frac in (0.15, 0.3, 0.6):
+                size = int(lo * frac)
+                msgs, facts, names = self.needle_msg(size, "M4 cjk", seed=size, filler=cjk_filler)
+                m = self.mchat(msgs, "M4 cjk %s" % _kfmt(size), facts, timeout=max(self.a.timeout, 300))
+                self.mrec("M4u", "multibyte text %s chars = %s UTF-8 bytes (code edge: %s chars)"
+                          % (_kfmt(size), _kfmt(len(msgs[0]["content"].encode("utf-8"))), _kfmt(lo)), m, names)
+                self.sample("4", "cjk %d" % size, m, names, "single", size=size, cjk=True)
+                if m.r.status is not None:
+                    units.append((size, m.wire, m.r.ok))
+            self.notes["units"] = units
+            # Does history count toward the same ceiling? Split ~1.3x the
+            # failing size across earlier turns, keep the last message small.
+            tot = int(hi * 1.3)
+            if tot <= self.maxc * 1.5:
+                msgs, facts = [], []
+                for k in range(4):
+                    l = self.lab("M4 hist")
+                    facts.append(("h%d" % (k + 1), l))
+                    msgs.append({"role": "user", "content": self.fact(k + 1, l) + "\n" + code_filler(tot // 4, seed=k)})
+                    msgs.append({"role": "assistant", "content": "OK."})
+                ctrl = self.lab("M4 hist")
+                msgs.append({"role": "user", "content": self.final(ctrl)})
+                facts.append(("ctrl", ctrl))
+                m = self.mchat(msgs, "M4 history over edge", facts, timeout=max(self.a.timeout, 300))
+                self.mrec("M4h", "%s chars split over 4 earlier turns (above the edge): accepted?" % _kfmt(tot), m,
+                          ["h1", "h2", "h3", "h4"],
+                          note="(HTTP 200 here = history is cut before the size check)" if m.r.ok else "")
+                self.sample("4", "hist-over-edge", m, ["h1", "h2", "h3", "h4"], "multi", size=tot)
+        cand = min([x for x in (fail_min, loss_min) if x] or [full_max])
+        if fail_min or loss_min:
+            cand = min(int(cand * 0.8), full_max) if full_max else int(cand * 0.8)
+        self.notes.update(ok_max=ok_max, full_max=full_max, fail_min=fail_min, loss_min=loss_min)
+        if cand >= 8000:
+            n = 3 if self.a.quick else self.a.confirm
+            good = 0
+            for i in range(n):
+                msgs, facts, names = self.needle_msg(cand, "M4 confirm", seed=9000 + i)
+                m = self.mchat(msgs, "M4 confirm %s #%d" % (_kfmt(cand), i + 1), facts, timeout=max(self.a.timeout, 300))
+                self.mrec("M4c", "confirm %s chars #%d" % (_kfmt(cand), i + 1), m, names)
+                self.sample("4", "confirm %d" % cand, m, names, "single", size=cand)
+                good += 1 if (m.r.ok and all(m.hit(x) for x in names)) else 0
+            self.notes["confirm"] = (cand, good, n)
+            self.p("     confirm at %s chars: %d/%d fully recalled" % (_kfmt(cand), good, n))
+
+    # ------------------------------------------------------------------
+    def sec_folded(self):
+        self.section("6. a whole conversation folded into one message: capacity")
+        edge = self.notes.get("edge_ok") or self.notes.get("full_max") or self.maxc
+        sizes = sorted({s for s in (64000, 200000, int(edge * 0.9)) if 8000 <= s <= min(edge, self.maxc)})
+        if self.a.quick:
+            sizes = sizes[-2:]
+        for size in sizes:
+            n = 10
+            msgs, facts = self.folded(n, "M6", pad_each=max(0, size // n - 200), seed=size)
+            names = ["h%d" % k for k in range(1, n + 1)]
+            m = self.mchat(msgs, "M6 folded %s" % _kfmt(size), facts, timeout=max(self.a.timeout, 300))
+            self.mrec("M6", "10-turn transcript folded into one message, %s chars" % _kfmt(m.chars_total), m, names)
+            self.sample("6", "folded %d" % size, m, names, "folded", size=m.chars_total)
+
+    # ------------------------------------------------------------------
+    def sec_agent(self):
+        self.section("7. agent-like session: one conversation grows a turn per request")
+        steps = 6 if self.a.quick else self.a.steps
+        for mode in ("alone", "interleaved"):
+            if mode == "interleaved" and self.a.quick:
+                break
+            n = steps if mode == "alone" else max(3, steps // 2)
+            head, tail = self.lab("M7"), self.lab("M7")
+            msg0 = (self.fact("H", head) + "\n" + tooldefs_filler(30000, seed=8) + "\n" + self.fact("T", tail)
+                    + "\n\nTask: refactor the worker module. Keep notes of every crate label you see.")
+            hist = [{"role": "user", "content": msg0}, {"role": "assistant", "content": "Starting. ```json\n{\"name\": \"read\", \"arguments\": {\"path\": \"src/worker.py\"}}\n```"}]
+            facts = [("H", head), ("T", tail)]
+            prev_sess = None
+            lost_at = {}
+            for k in range(1, n + 1):
+                l = self.lab("M7")
+                facts.append(("s%d" % k, l))
+                ctrl = self.lab("M7")
+                out = "Tool output (step %d):\n%s\n%s" % (k, code_filler(6000, seed=k * 31), self.fact("S%d" % k, l))
+                msgs = hist + [{"role": "user", "content": self.final(ctrl, out)}]
+                names = [x for x, _ in facts]
+                m = self.mchat(msgs, "M7 %s step %d" % (mode, k), facts + [("ctrl", ctrl)])
+                changed = prev_sess is not None and m.sess != prev_sess
+                prev_sess = m.sess
+                for x in names:
+                    if not m.hit(x) and x not in lost_at:
+                        lost_at[x] = k
+                self.mrec("M7", "%s step %d (%d msgs)" % (mode, k, len(msgs)), m, names,
+                          note="session_changed" if changed else "")
+                self.sample("7", "%s %d" % (mode, k), m, names[:-1], "multi", step=k, mode=mode)
+                reply = m.r.content if m.r.ok else "Continuing."
+                hist = msgs[:-1] + [{"role": "user", "content": out}, {"role": "assistant", "content": reply or "OK."}]
+                if mode == "interleaved":
+                    t = self.mchat([{"role": "user", "content": "Write a 5-word title for: refactor the %s module."
+                                     % random.choice(_WORDS)}], "M7 interleaved side request %d" % k, [])
+                    if not t.r.ok and t.r.status is None:
+                        break
+            self.notes["agent_" + mode] = lost_at
+
+    # ------------------------------------------------------------------
+    def sec_server(self):
+        self.section("9. server-side memory across requests")
+        delays = [0, 20] if self.a.quick else [0, 0, 20, 60]
+        for d in delays:
+            l = self.lab("M9 plant")
+            ra = self.mchat([{"role": "user", "content": self.fact(5, l) + " Reply OK."}], "M9 plant d=%d" % d, [("x", l)])
+            if d:
+                time.sleep(d * self.a.delay_scale)
+            m = self.mchat([{"role": "user", "content": "Earlier I told you which label crate 5 carries. What was it? "
+                                                        "Reply with just the label, or NONE if you have no earlier message from me."}],
+                           "M9 ask d=%d" % d, [("x", l)])
+            self.mrec("M9a", "fact from a separate request %ds earlier comes back" % d, m,
+                      verdict="LEAK" if m.hit("x") else ("ERR" if not m.r.ok else "NO"),
+                      note="same_session=%s" % (m.sess != "-" and m.sess == ra.sess))
+
+        msgs, facts = self.turns_user_facts(2, "M9 same")
+        m1 = self.mchat(msgs, "M9 same request #1", facts)
+        m2 = self.mchat(msgs, "M9 same request #2", facts)
+        self.rec("M9b", "identical request twice: same session id?", "INFO",
+                 "sess %s / %s -> %s" % (m1.sess, m2.sess, "SAME" if m1.sess == m2.sess and m1.sess != "-" else "different"))
+
+        def passback(name, build):
+            l = self.lab("M9 passback")
+            ra = self.mchat([{"role": "user", "content": self.fact(6, l) + " Reply OK."}], "M9 %s plant" % name, [("x", l)])
+            extra = build(ra)
+            if extra is None:
+                self.rec("M9c", "pass back via %s" % name, "SKIP", "no session id in the reply")
+                return
+            m = self.mchat([{"role": "user", "content": "Which label does crate 6 carry? Reply with just the label, "
+                                                        "or NONE if you were never told."}],
+                           "M9 %s ask" % name, [("x", l)], **extra)
+            self.mrec("M9c", "continue the planting request via %s" % name, m,
+                      verdict="RECALL" if m.hit("x") else ("ERR" if not m.r.ok else "NO"),
+                      note="same_session=%s" % (m.sess != "-" and m.sess == ra.sess))
+
+        passback("top-level session", lambda ra: {"session": ra.sess_raw} if ra.sess_raw else None)
+        passback("gemini_enterprise.session", lambda ra: {"gemini_enterprise": {"session": ra.sess_raw}} if ra.sess_raw else None)
+        passback("session_id", lambda ra: {"session_id": ra.sess_raw} if ra.sess_raw else None)
+        passback("conversation_id", lambda ra: {"conversation_id": ra.sess_raw} if ra.sess_raw else None)
+        user_id = "harness-probe-%06d" % random.randint(0, 999999)
+        l = self.lab("M9 user")
+        self.mchat([{"role": "user", "content": self.fact(8, l) + " Reply OK."}], "M9 user plant", [("x", l)], user=user_id)
+        m = self.mchat([{"role": "user", "content": "Which label does crate 8 carry? Reply with just the label, or NONE "
+                                                    "if you were never told."}], "M9 user ask", [("x", l)], user=user_id)
+        self.mrec("M9d", "same OpenAI 'user' field on both requests", m,
+                  verdict="RECALL" if m.hit("x") else ("ERR" if not m.r.ok else "NO"))
+
+        if self.a.long_term:
+            self.p("     --long-term: asking the product to save a fact to the account's long-term memory, "
+                   "then asking it to delete it again")
+            l = self.lab("M9 longterm")
+            self.mchat([{"role": "user", "content": "Please save this to your long-term memory about me: my crate "
+                                                    "label is %s." % l}], "M9 longterm save", [("x", l)])
+            for d in (0, 30):
+                if d:
+                    time.sleep(d * self.a.delay_scale)
+                m = self.mchat([{"role": "user", "content": "Do you have a saved memory of my crate label? Reply with "
+                                                            "just the label, or NONE."}], "M9 longterm ask d=%d" % d, [("x", l)])
+                self.mrec("M9e", "long-term memory recall after %ds" % d, m,
+                          verdict="RECALL" if m.hit("x") else ("ERR" if not m.r.ok else "NO"))
+            r = self.chat([{"role": "user", "content": "Please delete every saved memory about my crate label."}],
+                          "M9 longterm cleanup")
+            self.rec("M9f", "cleanup request", "INFO" if r.ok else "ERR", "" if r.ok else self.fail_note(r), r, r.content, 100)
+
+    # ------------------------------------------------------------------
+    def sec_models(self):
+        self.section("8. per-model: canary + folded + conflict on every catalog model")
+        for model in self.catalog:
+            msgs, facts = self.turns_user_facts(3, "M8 %s" % model)
+            m = self.mchat(msgs, "M8 %s turns" % model, facts, model=model)
+            self.mrec("M8", "%s: 3 earlier turns" % model, m, ["h1", "h2", "h3"])
+            self.sample("8", "turns", m, ["h1", "h2", "h3"], "multi", model=model)
+            msgs, facts = self.folded(3, "M8 %s" % model)
+            m = self.mchat(msgs, "M8 %s folded" % model, facts, model=model)
+            self.mrec("M8", "%s: same folded" % model, m, ["h1", "h2", "h3"])
+            self.sample("8", "folded", m, ["h1", "h2", "h3"], "folded", model=model)
+            if not m.r.ok and m.r.status is None:
+                break
+
+    # ------------------------------------------------------------------
+    def summary(self, secs):
+        self.verdict(secs)
+
+    def verdict(self, secs):
+        S = self.samples
+        self.p("")
+        self.p("=== memory verdict (heuristic; the log has the evidence) ===")
+        self.p("  last message seen (control fact): %d/%d" % (self.ctrl_seen, self.ctrl_total))
+
+        def rate(rows):
+            n = sum(len(s["hits"]) for s in rows)
+            k = sum(sum(1 for h in s["hits"] if h) for s in rows)
+            return k, n
+
+        multi = [s for s in S if s["ok"] and s["kind"] == "multi" and s["names"] and s["cfg"] != "instruction"]
+        k, n = rate(multi)
+        self.p("  earlier facts recalled from separate messages: %d/%d over %d requests" % (k, n, len(multi)))
+        if multi:
+            full = sum(1 for s in multi if all(s["hits"]))
+            none = sum(1 for s in multi if not any(s["hits"]))
+            self.p("    requests with all / some / none of their earlier facts: %d / %d / %d"
+                   % (full, len(multi) - full - none, none))
+        conf = self.notes.get("conflict")
+        if conf:
+            self.p("  conflict test (which source answers): %s" % conf)
+        by_n = {}
+        for s in S:
+            if s["ok"] and s["sec"] == "2":
+                by_n.setdefault(s["n"], []).append(s)
+        if by_n:
+            row = []
+            for nn in sorted(by_n):
+                kk, tt = rate(by_n[nn])
+                row.append("N=%d:%d/%d" % (nn, kk, tt))
+            self.p("  by turn count: %s" % " ".join(row))
+            suffix = []
+            for s in (x for v in by_n.values() for x in v):
+                h = s["hits"]
+                kept = sum(h)
+                if kept and h == [False] * (len(h) - kept) + [True] * kept:
+                    suffix.append(kept)
+            if suffix:
+                self.p("  recalls that were exactly the newest K turns: K=%s" % sorted(suffix))
+        rows4 = [s for s in S if s["ok"] and s["sec"] == "5"]
+        if rows4:
+            self.p("  by padding size: %s" % " ".join(
+                "%s:%s" % (s["cfg"].replace(" ", "@"), "".join("#" if h else "." for h in s["hits"])) for s in rows4))
+        fold = [s for s in S if s["ok"] and s["kind"] == "folded"]
+        if fold:
+            k2, n2 = rate(fold)
+            self.p("  facts recalled when folded into the last message: %d/%d" % (k2, n2))
+        nt = self.notes
+        if "full_max" in nt:
+            self.p("  single message: largest fully recalled %s chars; first recall loss %s; first error %s"
+                   % (_kfmt(nt["full_max"]), _kfmt(nt["loss_min"]) if nt.get("loss_min") else "none",
+                      _kfmt(nt["fail_min"]) if nt.get("fail_min") else "none up to %s" % _kfmt(self.maxc)))
+        if "confirm" in nt:
+            c, g, t = nt["confirm"]
+            self.p("  confirmation at %s chars (~%dk proxy-est tokens): %d/%d fully recalled" % (_kfmt(c), c // 3000, g, t))
+        if nt.get("flaky"):
+            self.p("  sizes that failed once then passed on retry: %s" % ", ".join(_kfmt(x) for x in nt["flaky"]))
+        if self.r502:
+            self.p("  elapsed before each 502: %s" % ", ".join("%s:%.0fs" % (_kfmt(c), e) for c, e in self.r502))
+        if nt.get("edge_ok"):
+            w = {x["size"]: x["wire"] for x in S if x.get("size") and x["sec"] == "4" and not x.get("cjk")}
+            self.p("  request-size edge (code text): OK %s chars / %sB wire, error %s chars / %sB wire"
+                   % (_kfmt(nt["edge_ok"]), _kfmt(w.get(nt["edge_ok"], 0)), _kfmt(nt["edge_fail"]),
+                      _kfmt(w.get(nt["edge_fail"], 0))))
+        if nt.get("units"):
+            u = nt["units"]
+            self.p("  multibyte text: %s" % ", ".join("%s chars/%sB wire %s" % (_kfmt(c), _kfmt(b), "ok" if k else "ERR")
+                                                      for c, b, k in u))
+            if all(k for _, _, k in u):
+                self.p("    -> the limit is not in wire bytes or tokens; it counts characters (or is higher for this text)")
+            else:
+                self.p("    -> not plain characters; compare the passing sizes with the code edge in chars, wire bytes "
+                       "and ~tokens to see which matches")
+        for mode in ("alone", "interleaved"):
+            la = nt.get("agent_" + mode)
+            if la is not None:
+                self.p("  agent session (%s): first step each fact was missing: %s"
+                       % (mode, ", ".join("%s@%d" % (x, s) for x, s in sorted(la.items(), key=lambda p: p[1])) or "never"))
+        hashes = [h for _, h in self.sessions if h != "-"]
+        self.p("  session ids: %d requests carried one, %d distinct" % (len(hashes), len(set(hashes))))
+        self.p("  labels from an earlier request that came back (server-side state): %d%s"
+               % (len(self.leaks), (" e.g. " + "; ".join("%s <- %s" % (a, w) for a, _, w in self.leaks[:5])) if self.leaks else ""))
+        self.p("  unexplained label-like strings in replies: %d" % len(self.foreign))
+        cans = [s for s in S if s["sec"] == "canary" and s["ok"]]
+        if cans:
+            self.p("  canary over time: %s" % " ".join("".join("#" if h else "." for h in s["hits"]) for s in cans))
+
+        self.p("")
+        self.p("=== reading ===")
+        hist_any = k > 0 if multi else None
+        if hist_any is False and (not conf or conf.get("history", 0) == 0):
+            self.p("  Separate earlier messages never reached the model: the upstream answers from the last")
+            self.p("  message only. To keep context, fold history INTO the last user message.")
+        elif hist_any and multi and all(all(s["hits"]) for s in multi):
+            self.p("  Earlier messages always reached the model in this run; the forgetting did not reproduce.")
+        elif hist_any:
+            self.p("  Earlier messages reached the model only sometimes. Compare the turn-count, padding and")
+            self.p("  agent-session lines above for a threshold, and the canary line for drift over time.")
+        if self.leaks:
+            self.p("  Facts leaked between independent requests: there IS server-side state.")
+        budget = nt.get("confirm")
+        if budget and budget[1] == budget[2]:
+            self.p("  Safe single-message size seen: %s chars (~%dk tokens by the proxy's chars/3 estimate)."
+                   % (_kfmt(budget[0]), budget[0] // 3000))
+        self.p("requests=%d elapsed=%ds" % (self.c.n, int(secs)))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="harness probe", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--model", default=os.environ.get("DEFAULT_MODEL_NAME", ""), help="model for the full suite (default: DEFAULT_MODEL_NAME)")
+    ap.add_argument("--suite", choices=("full", "memory"), default="full", help="which suite to run (default full)")
+    ap.add_argument("--model", default=os.environ.get("DEFAULT_MODEL_NAME", ""), help="model for the suite (default: DEFAULT_MODEL_NAME)")
     ap.add_argument("--repeat", type=int, default=3, help="repeats for the stochastic key checks (default 3)")
-    ap.add_argument("--timeout", type=int, default=120, help="per-request timeout seconds (default 120)")
+    ap.add_argument("--timeout", type=int, default=None, help="per-request timeout seconds (default 120; memory 240)")
     ap.add_argument("--skip-long", action="store_true", help="skip the long-context needle tests")
     ap.add_argument("--no-matrix", action="store_true", help="skip the per-model matrix")
-    ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs)")
+    ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs); memory: digits, e.g. '124'")
+    ap.add_argument("--quick", action="store_true", help="memory: fewer sizes and repeats")
+    ap.add_argument("--confirm", type=int, default=8, help="memory: repeats at the candidate safe size (default 8)")
+    ap.add_argument("--steps", type=int, default=12, help="memory: turns in the agent-like session (default 12)")
+    ap.add_argument("--max-chars", type=int, default=700000, help="memory: largest request to send (default 700000)")
+    ap.add_argument("--long-term", action="store_true",
+                    help="memory: also test the product's long-term memory (writes to the account's saved memory)")
     ap.add_argument("--log", default="", help="write a redacted per-request log here")
     ap.add_argument("--log-display", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--delay-scale", type=float, default=1.0, help=argparse.SUPPRESS)  # tests: skip waits
     a = ap.parse_args()
     a.only = a.only.upper()
+    if a.timeout is None:
+        a.timeout = 240 if a.suite == "memory" else 120
 
     url = os.environ.get("PROXY_API_URL", "").strip()
     key = os.environ.get("PROXY_API_KEY", "").strip()
@@ -1491,7 +2376,7 @@ def main():
         print(s, flush=True)
 
     client = Client(base, key, a.timeout, log if log_fh else None, red)
-    prober = Prober(a, client, red, out)
+    prober = (MemProber if a.suite == "memory" else Prober)(a, client, red, out)
     rc = 0
     try:
         prober.run()

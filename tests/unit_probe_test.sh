@@ -16,6 +16,12 @@
 #   T4 none of the secrets appear in stdout or in the redacted log
 #   T5 the log path is printed relative (state/output/...), not absolute
 #   T6 a locked key (401 + unlock_url) aborts early without printing the URL
+#   T7 'harness probe help' lists the subcommands; 'memory --help' works;
+#      an unknown subcommand errors
+#   T8 'harness probe memory --quick' exits 0 with every section and the
+#      verdict (the mock sees only the last message and 502s above 100 KB)
+#   T9 none of the secrets appear in the memory suite's stdout or log, and
+#      the session id it passes back is scrubbed in the log
 #
 # Prints "PROBE TEST PASSED" on success.
 
@@ -51,7 +57,7 @@ PREFIX="zqsecretprefix"
 ORG="AcmeInternalOrg"
 
 cat >"$TMP_ROOT/mock.py" <<'PYEOF'
-import json, sys, time
+import json, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PREFIX = "/" + sys.argv[2]
@@ -108,6 +114,9 @@ class H(BaseHTTPRequestHandler):
         msgs = req.get("messages")
         if not isinstance(msgs, list):
             return self.send(400, {"error": {"type": "invalid_request", "message": "messages required"}})
+        if len(raw) > 100000:
+            # A size ceiling, like the real upstream's 502 on large requests.
+            return self.send(502, {"error": {"type": "bad_gateway", "message": "upstream too large"}})
         if req.get("model") == "probe-nonexistent-model-xyz":
             return self.send(400, {"error": {"type": "invalid_request_model", "message": "unknown model"}})
         tools = req.get("tools") or []
@@ -115,6 +124,11 @@ class H(BaseHTTPRequestHandler):
         text_all = json.dumps(msgs)
         tool_calls = None
         content = "PROBE-OK ZEBRA-7731 " + leak(self)
+        last_text = last.get("content") if isinstance(last.get("content"), str) else ""
+        if "crate" in last_text:
+            # Memory suite: behave like an upstream that sees only the last
+            # message (echo the crate labels found there).
+            content = " ".join(re.findall(r"[B-Z]{3}-[0-9]{3}", last_text)) + " " + leak(self)
         if tools and last.get("role") == "user" and req.get("tool_choice") != "none":
             names = [t["function"]["name"] for t in tools]
             name = names[-1] if "probe" in text_all else names[0]
@@ -243,5 +257,49 @@ stop_mock
 [[ $rc -ne 0 && "$out" == *"harness unlock"* ]] || fail "T6 locked: rc=$rc out=$out"
 [[ "$out" != *secretcorp* && "$out" != *PROBEKEY* ]] || fail "T6 locked output leaked the unlock URL/key"
 ok "T6 locked key aborts with a redacted hint"
+
+# --- T7: subcommand help ---
+out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe help 2>&1); rc=$?
+[[ $rc -eq 0 && "$out" == *"full "* && "$out" == *"memory "* && "$out" == *"help "* ]] \
+    || fail "T7 'probe help': rc=$rc out=$out"
+out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe memory --help 2>&1); rc=$?
+[[ $rc -eq 0 && "$out" == *"usage: harness probe memory"* && "$out" == *"--long-term"* ]] \
+    || fail "T7 'probe memory --help': rc=$rc out=$out"
+out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe bogus 2>&1); rc=$?
+[[ $rc -ne 0 && "$out" == *"unknown probe subcommand"* ]] || fail "T7 unknown subcommand: rc=$rc out=$out"
+ok "T7 probe help / memory --help / unknown subcommand"
+
+# --- T8: memory suite against the mock ---
+rm -f "$TMP_ROOT"/state/output/probe-*.log
+start_mock ok
+URL="http://127.0.0.1:${PORT}/${PREFIX}"
+out=$(PROXY_API_URL="$URL" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" HARNESS_PROBE_REDACT="$ORG" \
+      cmd_probe memory --quick --max-chars 200000 --delay-scale 0 --timeout 20 2>&1); rc=$?
+stop_mock
+echo "$out" >"$TMP_ROOT/stdout-mem.txt"
+[[ $rc -eq 0 ]] || { echo "$out" | tail -30; fail "T8 memory probe exited $rc"; }
+for want in "=== harness probe memory v" "--- 1. " "--- 2. " "--- 3. " "--- 4. " "--- 5. " "--- 6. " \
+            "--- 7. " "--- 8. " "--- 9. " "=== memory verdict" "earlier facts recalled from separate messages: 0/" \
+            "never reached the model" "request-size edge (code text)" "M3   ALL" "M9c" "mock-b" \
+            "full redacted request log: state/output/probe-memory-" "=== end harness probe ==="; do
+    [[ "$out" == *"$want"* ]] || { echo "$out" | tail -40; fail "T8 missing '$want' in output"; }
+done
+ok "T8 memory suite exits 0 with all sections and a verdict"
+
+# --- T9: memory suite redaction ---
+log=$(ls "$TMP_ROOT"/state/output/probe-memory-*.log 2>/dev/null | head -1)
+[[ -n "$log" && -s "$log" ]] || fail "T9 no memory log written under state/output"
+for f in "$TMP_ROOT/stdout-mem.txt" "$log"; do
+    for secret in "$KEY" "PROBEKEY" "tok_PROB" "$PREFIX" "secretcorp" "admin" "10.1." "127.0" ":${PORT}" \
+                  "p-123456" "ASSISTSECRET" "$ORG" "unlock.secret"; do
+        if grep -qiF -- "$secret" "$f"; then
+            grep -niF -- "$secret" "$f" | head -3 >&2
+            fail "T9 secret '$secret' leaked into $(basename "$f")"
+        fi
+    done
+done
+grep -qF '"session_id": "<redacted>"' "$log" || fail "T9 passed-back session id not scrubbed in the log"
+grep -qF '### layout ' "$log" || fail "T9 memory log lacks the per-request layout lines"
+ok "T9 no secrets in the memory suite's stdout or log"
 
 echo "PROBE TEST PASSED"

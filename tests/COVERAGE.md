@@ -57,7 +57,9 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   streamed tool-call deltas, response_format), and redaction of every secret the mock
   echoes back (key and key fragments, URL/host/port, emails, IPs, `projects/...`,
   assist token, `HARNESS_PROBE_REDACT` terms) in both stdout and the log. Also covers
-  the locked-key abort.
+  the locked-key abort, `harness probe help` / `memory --help` / an unknown subcommand,
+  and a `harness probe memory --quick` run (the mock sees only the last message and
+  502s above 100 KB) with the same redaction checks plus the scrubbed session pass-back.
 - `tests/scheme_contract_test.sh` (407 lines, Track E) — per-scheme proxy contract test.
   Brings up proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
   a probe through the proxy's OpenAI-compatible interface; asserts forwarded-body structure.

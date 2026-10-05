@@ -66,7 +66,9 @@ These are the load-bearing behaviors the proxy is built around:
   the last user message reaches the model, so the hybrid layout (tool
   definitions folded into message 0, history as alternating turns) loses
   the tool definitions and every earlier turn; what survives is the
-  recency block on the last user message. Unconfirmed beyond the probe.
+  recency block on the last user message. Unconfirmed beyond the probe;
+  `harness probe memory` measures this (turn count, layout, size, server-side
+  session) with repeats.
 - **Unreliable `usage`.** `usage.total_tokens` is per-request (the most
   recent request + response only), not cumulative for the conversation.
   It cannot be used for context tracking — the proxy estimates tokens

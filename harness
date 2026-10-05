@@ -1710,8 +1710,8 @@ subcommands:
   memory    map the upstream's conversation memory: which earlier turns reach
             the model, and what (turn count, size, role layout, server-side
             session, time) decides when they are dropped, plus the largest
-            request that is kept whole. About 60-120 minutes; --quick cuts it
-            to about 20.
+            request that is kept whole. About 30-90 minutes; --quick sends
+            about a third as many requests.
   help      this list
 
 'harness probe <subcommand> --help' lists that subcommand's options.
@@ -1746,41 +1746,57 @@ EOF
 _probe_memory_help() {
     cat <<'EOF'
 usage: harness probe memory [--model ID] [--quick] [--repeat N] [--only SECTIONS]
-                            [--max-chars N] [--no-matrix] [--timeout SECS]
+                            [--max-chars N] [--confirm N] [--steps N]
+                            [--no-matrix] [--long-term] [--timeout SECS]
 
 Map the upstream's conversation memory. Every request plants fresh random
-codes in chosen messages and asks for them back, so each reply shows exactly
-which parts of the request reached the model. Sections:
+crate labels in chosen messages and asks for them back, so each reply shows
+exactly which messages reached the model; a label from an EARLIER request
+coming back is reported as server-side state. Sections:
 
-  1  visibility: the model lists the messages it can see
-  2  turn count: 1..32 earlier turns, which ones survive
-  3  layout: user vs assistant turns, consecutive users, system role,
-     first message only, history folded into the last message, streaming
-  4  history size: earlier turn kept as padding grows (middle or last msg)
-  5  single-message capacity: 5 needles from 8k chars up to the 502 edge
+  1  reach: does request history reach the model at all (conflict test:
+     an earlier request says A, this request's history says B), an
+     instruction given in an earlier turn, 4-way forced choice
+  2  turn count: 1..32 earlier turns, which ones survive (oldest first)
+  3  layout: facts in assistant turns, consecutive user messages, system
+     role, message 0 only, history folded into the last message, streaming
+  4  single-message capacity: 5 needles from 8k chars up to the error edge,
+     bisected; multibyte text (chars vs bytes vs tokens); history above the
+     edge; repeated confirmation at the candidate safe size
+  5  history vs size: facts before and after a padding block, padding in a
+     middle turn or in the last message
   6  folded transcript capacity: a whole conversation inside one message
-  7  server-side memory: leaks across requests, "remember this", delays,
-     passing the returned session id back
-  8  proxy-shaped replay: big message 0 + long history + recency block
-  9  per-model matrix of the key checks over /v1/models
+  7  agent-like session: one conversation grows a turn per request (tool
+     definitions in message 0, tool output each turn), alone and with
+     unrelated requests interleaved
+  8  per-model check over /v1/models (skip with --no-matrix)
+  9  server-side memory: earlier request recalled after 0-60 s, session id
+     on identical requests, passing the session id back, the 'user' field
 
-A canary runs at the start and the end to catch drift. The verdict block at
-the end states the rule it found and a safe request budget. Expect about
-60-120 minutes and 150-250 requests; large requests take 30-90 s each.
+A 3-turn canary runs at the start and after every section to catch drift.
+The verdict block at the end summarizes what was seen and the largest size
+that was recalled whole on every confirmation run. Expect 150-200 requests
+(30-90 minutes; large requests take 30-90 s each); --quick sends about 70.
 
 Output is redacted (API key, URL, host, emails, IPs, bearer tokens,
-projects/... paths, session ids) and safe to paste; add terms with
-HARNESS_PROBE_REDACT=term1,term2. The full redacted request log (every
-request's layout and the full reply, thinking traces and usage) is written to
-state/output/probe-memory-<time>.log; send that file for analysis.
+projects/... paths; session ids are shown only as a short hash) and safe to
+paste; add terms with HARNESS_PROBE_REDACT=term1,term2. The full redacted
+request log (each request's message layout, the full reply, thinking trace
+and usage) is written to state/output/probe-memory-<time>.log; send that file
+for analysis.
 
   --model ID      model to probe (default: DEFAULT_MODEL_NAME)
-  --quick         one repeat and fewer sizes (about 20 minutes)
+  --quick         one repeat and fewer sizes and steps
   --repeat N      repeats per configuration (default 3; --quick sets 1)
   --only SECTIONS run only these sections, e.g. 25 (setup + canary always run)
   --max-chars N   largest request to send (default 700000 chars)
-  --no-matrix     skip section 9
-  --timeout SECS  per-request timeout (default 240)
+  --confirm N     repeats at the candidate safe size (default 8; --quick 3)
+  --steps N       turns in the agent-like session (default 12; --quick 6)
+  --no-matrix     skip section 8
+  --long-term     also ask the product to save a label to its long-term
+                  memory, check recall, then ask it to delete it. Off by
+                  default: it writes to the account's real saved memory.
+  --timeout SECS  per-request timeout (default 240; capacity tests use 300+)
 EOF
 }
 
