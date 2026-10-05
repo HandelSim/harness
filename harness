@@ -1688,16 +1688,39 @@ cmd_unlock() {
 }
 
 # 'harness probe': run scripts/probe_upstream.py straight against the upstream
-# (no proxy) to characterize it — system-prompt handling, native tool calls,
-# streaming, response_format, per-model matrix. Output is redacted (key, URL,
-# host, emails, IPs, projects/... paths, HARNESS_PROBE_REDACT terms) so it can
-# be pasted back as-is. Runs on the host's python3; falls back to the proxy
-# image's python when the host has none. See architecture/harness-cli.md.
-cmd_probe() {
-    case "${1:-}" in
-        -h|--help)
-            cat <<'EOF'
-usage: harness probe [--model ID] [--skip-long] [--no-matrix] [--repeat N]
+# (no proxy) to characterize it. Two suites: 'full' (system prompt, native
+# tools, streaming, response_format, per-model matrix; bare 'harness probe')
+# and 'memory' (which earlier turns reach the model and what decides when they
+# are dropped). Output is redacted (key, URL, host, emails, IPs, projects/...
+# paths, HARNESS_PROBE_REDACT terms) so it can be pasted back as-is. Runs on
+# the host's python3; falls back to the proxy image's python when the host has
+# none. See architecture/harness-cli.md.
+_probe_help() {
+    cat <<'EOF'
+usage: harness probe [SUBCOMMAND] [OPTIONS]
+
+Test the upstream API directly (bypassing the proxy) and print a redacted
+report that is safe to paste. Every run also writes a full redacted request
+log under state/output/.
+
+subcommands:
+  full      the whole characterization suite: system prompt, history, native
+            tool calls, response_format, per-model matrix. Bare
+            'harness probe' runs this. About 20-60 minutes.
+  memory    map the upstream's conversation memory: which earlier turns reach
+            the model, and what (turn count, size, role layout, server-side
+            session, time) decides when they are dropped, plus the largest
+            request that is kept whole. About 60-120 minutes; --quick cuts it
+            to about 20.
+  help      this list
+
+'harness probe <subcommand> --help' lists that subcommand's options.
+EOF
+}
+
+_probe_full_help() {
+    cat <<'EOF'
+usage: harness probe [full] [--model ID] [--skip-long] [--no-matrix] [--repeat N]
                      [--timeout SECS] [--only SECTIONS]
 
 Characterize the upstream API directly (bypassing the proxy): system prompt
@@ -1718,6 +1741,66 @@ under state/output/.
   --timeout SECS  per-request timeout (default 120)
   --only SECTIONS run only these sections, e.g. BD (A always runs)
 EOF
+}
+
+_probe_memory_help() {
+    cat <<'EOF'
+usage: harness probe memory [--model ID] [--quick] [--repeat N] [--only SECTIONS]
+                            [--max-chars N] [--no-matrix] [--timeout SECS]
+
+Map the upstream's conversation memory. Every request plants fresh random
+codes in chosen messages and asks for them back, so each reply shows exactly
+which parts of the request reached the model. Sections:
+
+  1  visibility: the model lists the messages it can see
+  2  turn count: 1..32 earlier turns, which ones survive
+  3  layout: user vs assistant turns, consecutive users, system role,
+     first message only, history folded into the last message, streaming
+  4  history size: earlier turn kept as padding grows (middle or last msg)
+  5  single-message capacity: 5 needles from 8k chars up to the 502 edge
+  6  folded transcript capacity: a whole conversation inside one message
+  7  server-side memory: leaks across requests, "remember this", delays,
+     passing the returned session id back
+  8  proxy-shaped replay: big message 0 + long history + recency block
+  9  per-model matrix of the key checks over /v1/models
+
+A canary runs at the start and the end to catch drift. The verdict block at
+the end states the rule it found and a safe request budget. Expect about
+60-120 minutes and 150-250 requests; large requests take 30-90 s each.
+
+Output is redacted (API key, URL, host, emails, IPs, bearer tokens,
+projects/... paths, session ids) and safe to paste; add terms with
+HARNESS_PROBE_REDACT=term1,term2. The full redacted request log (every
+request's layout and the full reply, thinking traces and usage) is written to
+state/output/probe-memory-<time>.log; send that file for analysis.
+
+  --model ID      model to probe (default: DEFAULT_MODEL_NAME)
+  --quick         one repeat and fewer sizes (about 20 minutes)
+  --repeat N      repeats per configuration (default 3; --quick sets 1)
+  --only SECTIONS run only these sections, e.g. 25 (setup + canary always run)
+  --max-chars N   largest request to send (default 700000 chars)
+  --no-matrix     skip section 9
+  --timeout SECS  per-request timeout (default 240)
+EOF
+}
+
+cmd_probe() {
+    local suite=full
+    case "${1:-}" in
+        help) _probe_help; return 0 ;;
+        -h|--help) _probe_help; echo; _probe_full_help; return 0 ;;
+        full) shift ;;
+        memory) suite=memory; shift ;;
+        ""|-*) ;;
+        *)
+            err "unknown probe subcommand '$1'"
+            _probe_help >&2
+            return 1
+            ;;
+    esac
+    case "${1:-}" in
+        -h|--help|help)
+            if [[ $suite == memory ]]; then _probe_memory_help; else _probe_full_help; fi
             return 0
             ;;
     esac
@@ -1730,12 +1813,14 @@ EOF
         err "missing $script; run 'harness upgrade'"
         return 1
     fi
+    local stem=probe
+    [[ $suite == memory ]] && stem=probe-memory
+    local rel log
+    rel="state/output/${stem}-$(date -u +%Y%m%dT%H%M%SZ).log"
+    log="$install_root/$rel"
+    mkdir -p "$install_root/state/output"
     local py
     if py=$(host_python_bin); then
-        local rel log
-        rel="state/output/probe-$(date -u +%Y%m%dT%H%M%SZ).log"
-        log="$install_root/$rel"
-        mkdir -p "$install_root/state/output"
         local pyscript="$script"
         # Windows python wants C:/... paths, not Git Bash's /c/...
         if command -v cygpath >/dev/null 2>&1; then
@@ -1743,11 +1828,13 @@ EOF
         fi
         # $py is unquoted on purpose: on Windows it can be 'py -3'.
         # shellcheck disable=SC2086
-        $py "$pyscript" --log "$log" --log-display "$rel" "$@"
+        $py "$pyscript" --suite "$suite" --log "$log" --log-display "$rel" "$@"
         return
     fi
     # No host python: borrow the proxy image's. Values pass by name (-e VAR),
-    # never on the command line, so the key never shows up in `ps`.
+    # never on the command line, so the key never shows up in `ps`. The log
+    # goes to the container's stderr, which lands in the log file; the report
+    # itself is stdout.
     if ! harness_docker image inspect harness-proxy:latest >/dev/null 2>&1; then
         err "no Python 3 on the host and the harness-proxy image isn't built;"
         err "install Python 3, or run 'harness start' once, then retry"
@@ -1759,7 +1846,12 @@ EOF
         [[ -n "${!v:-}" ]] && envs+=(-e "$v")
     done
     harness_docker run --rm -i "${envs[@]}" --entrypoint python \
-        harness-proxy:latest - "$@" <"$script"
+        harness-proxy:latest - --suite "$suite" --log /dev/stderr --log-display "$rel" "$@" \
+        <"$script" 2>"$log"
+    local rc=$?
+    # A container that never started reports only on stderr, i.e. in the log.
+    (( rc == 0 )) || err "probe exited $rc; errors, if any, are at the end of $rel"
+    return "$rc"
 }
 
 # --- config / model / uninstall (post-install setup, in the versioned CLI) ---
@@ -2328,10 +2420,12 @@ commands:
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
   unlock                probe the upstream and print the unlock URL if the
                         key is locked
-  probe [--skip-long]   test the upstream API directly (system prompt, native
-                        tools, streaming, response_format, every model) and
-                        print a redacted report that is safe to paste. See
-                        'harness probe --help'.
+  probe [full|memory]   test the upstream API directly and print a redacted
+                        report that is safe to paste. 'full' (the default)
+                        covers system prompt, native tools, streaming,
+                        response_format and every model; 'memory' maps which
+                        earlier turns reach the model and when they are
+                        dropped. 'harness probe help' lists the subcommands.
   config [get|set|...]  view and change .env settings. Bare 'harness config'
                         opens an interactive picker of common settings so you
                         don't have to memorize .env; 'config get [KEY]',

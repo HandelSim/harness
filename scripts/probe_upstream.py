@@ -23,6 +23,7 @@ See architecture/harness-cli.md -> "probe".
 import argparse
 import base64
 import datetime
+import hashlib
 import json
 import os
 import platform
@@ -234,6 +235,7 @@ class Client:
         self.insecure.check_hostname = False
         self.insecure.verify_mode = ssl.CERT_NONE
         self.n = 0
+        self.resp_max = 5000
 
     def request(self, path, body=None, raw=None, method="POST", stream=False,
                 timeout=None, verify_tls=False, key=None, label=""):
@@ -404,8 +406,9 @@ class Client:
         if not self.log:
             return
         req = body if body is not None else (raw if isinstance(raw, str) else "<raw>")
-        # Redact before any truncation (a cut can split a secret).
-        req_s = self.red(json.dumps(req))
+        # Redact before any truncation (a cut can split a secret). Session ids
+        # the memory suite passes back are scrubbed like the response's.
+        req_s = self.red(json.dumps(_scrub(req)))
         if len(req_s) > 6000:
             req_s = req_s[:3000] + " ...<%d chars>... " % len(req_s) + req_s[-1500:]
         if r.is_sse:
@@ -423,8 +426,8 @@ class Client:
         else:
             resp_s = r.text
         resp_s = self.red(resp_s)
-        if len(resp_s) > 5000:
-            resp_s = resp_s[:5000] + " ...<%d chars>" % len(resp_s)
+        if len(resp_s) > self.resp_max:
+            resp_s = resp_s[:self.resp_max] + " ...<%d chars>" % len(resp_s)
         rec = [
             "### #%d %s" % (self.n, label),
             "status=%s elapsed=%.2fs ttfb=%s ctype=%s sse=%s events=%d done=%s err=%s"
