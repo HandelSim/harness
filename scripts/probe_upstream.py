@@ -1540,6 +1540,10 @@ class MR:
     def __init__(self, r, facts, chars_total, chars_last, wire=0):
         self.r = r
         self.wire = wire  # request body bytes as sent (JSON, non-ASCII escaped like the proxy's)
+        # A usable reply: HTTP 2xx with content and no error body. A 200 that
+        # carries an error or nothing must not score as "forgot everything".
+        self.ok = bool(r.ok and (r.content or "").strip()
+                       and not (isinstance(r.json, dict) and r.json.get("error")))
         self.facts = facts  # [(name, label)]
         self.hits = {}
         self.leaks = []
@@ -1563,6 +1567,7 @@ class MemProber(Prober):
         self.samples = []  # dicts for the verdict
         self.sessions = []  # (label, session hash)
         self.leaks = []  # (request label, leaked label, planted in)
+        self.optin_recalls = []  # same, from requests that deliberately continue one
         self.foreign = []
         self.ctrl_seen = 0
         self.ctrl_total = 0
@@ -1609,10 +1614,12 @@ class MemProber(Prober):
                 return " / ".join(str(t) for t in ge["thinking"])
         return ""
 
-    def mchat(self, messages, label, facts, model=None, stream=False, timeout=None, **kw):
+    def mchat(self, messages, label, facts, model=None, stream=False, timeout=None, optin=False, **kw):
         """Send, then score which planted labels came back. `facts` lists every
         (name, label) planted in this request; name 'ctrl' is the control in
-        the last message."""
+        the last message. optin: this request deliberately continues an earlier
+        one (session pass-back, 'user', long-term memory), so a recall is not
+        an unprompted leak."""
         contents = [_content_to_text(m.get("content")) for m in messages]
         total = sum(len(c) for c in contents)
         last = len(contents[-1]) if contents else 0
@@ -1631,21 +1638,25 @@ class MemProber(Prober):
         sent = _norm(" ".join(contents))
         reply = _norm(r.content)
         for n, l in facts:
-            m.hits[n] = bool(r.ok and _norm(l) in reply)
-        if r.ok:
+            m.hits[n] = bool(m.ok and _norm(l) in reply)
+        if m.ok:
             for l, where in self.issued.items():
                 if _norm(l) in reply and _norm(l) not in sent:
                     m.leaks.append(l)
-                    self.leaks.append((label, l, where))
+                    (self.optin_recalls if optin else self.leaks).append((label, l, where))
             for l in set(_LABEL_RE.findall((r.content or "").upper())):
                 if l not in self.issued:
                     m.foreign.append(l)
                     self.foreign.append((label, l))
         raw = self._session_of(r)
+        if raw and len(raw) >= 8 and all(lit != raw for lit, _ in self.red.literals):
+            # Teach the redactor the exact id, whatever its shape or field name.
+            self.red.literals.append((raw, "<session>"))
+            self.red.literals.sort(key=lambda p: -len(p[0]))
         m.sess_raw = raw
         m.sess = hashlib.sha256(raw.encode()).hexdigest()[:8] if raw else "-"
         self.sessions.append((label, m.sess))
-        if any(n == "ctrl" for n, _ in facts) and r.ok:
+        if any(n == "ctrl" for n, _ in facts) and m.ok:
             self.ctrl_total += 1
             self.ctrl_seen += 1 if m.hit("ctrl") else 0
         if r.status == 502:
@@ -1660,7 +1671,11 @@ class MemProber(Prober):
 
     def mrec(self, tid, title, m, names=None, verdict=None, note=""):
         r = m.r
-        if not r.ok:
+        if not m.ok:
+            if r.ok:
+                self.rec(tid, title, "ERR", "HTTP %s but an error or empty body total=%s wire=%sB"
+                         % (r.status, _kfmt(m.chars_total), _kfmt(m.wire)), r, r.text, 200)
+                return
             self.rec(tid, title, "ERR", "%s total=%s wire=%sB" % (self.fail_note(r), _kfmt(m.chars_total), _kfmt(m.wire)), r)
             return
         parts = []
@@ -1685,8 +1700,9 @@ class MemProber(Prober):
         self.rec(tid, title, verdict, " ".join(parts), r, r.content, 110)
 
     def sample(self, sec, cfg, m, names, kind, **extra):
-        d = {"sec": sec, "cfg": cfg, "kind": kind, "ok": m.r.ok, "status": m.r.status,
+        d = {"sec": sec, "cfg": cfg, "kind": kind, "ok": m.ok, "status": m.r.status,
              "names": list(names), "hits": [m.hit(n) for n in names], "ctrl": m.hit("ctrl"),
+             "has_ctrl": any(n == "ctrl" for n, _ in m.facts),
              "total": m.chars_total, "last": m.chars_last, "wire": m.wire, "sess": m.sess, "elapsed": m.r.elapsed}
         d.update(extra)
         self.samples.append(d)
@@ -1740,7 +1756,12 @@ class MemProber(Prober):
                 continue
             if key == "8" and self.a.no_matrix:
                 continue
-            fn()
+            try:
+                fn()
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except Exception as e:
+                self.p("     section %s stopped by a probe error: %s: %s" % (key, type(e).__name__, str(e)[:200]))
             self.canary("after %s" % key)
         self.verdict(time.monotonic() - t0)
 
@@ -1754,14 +1775,14 @@ class MemProber(Prober):
             self.catalog = [m.get("id") for m in (r.json.get("data") or []) if isinstance(m, dict) and m.get("id")]
         self.rec("M0", "catalog", "INFO" if r.ok else "ERR",
                  ("%d models: %s" % (len(self.catalog), ", ".join(self.catalog))) if r.ok else self.fail_note(r), r)
-        for size in (2000, 20000, 80000):
+        for size in (x for x in (2000, 20000, 80000) if x <= self.maxc):
             l = self.lab("M0")
             body = code_filler(size, seed=size) + "\n" + self.fact(1, l) + "\n" + _QUESTION
             m = self.mchat([{"role": "user", "content": body}], "M0 calib %s" % _kfmt(size), [("ctrl", l)])
+            pt = m.r.usage.get("prompt_tokens") if isinstance(m.r.usage, dict) else None
             self.mrec("M0b", "one message, %s chars: prompt_tokens calibration" % _kfmt(size), m,
-                      note="chars/ptok=%s" % (("%.2f" % (len(body) / m.r.usage["prompt_tokens"]))
-                                              if isinstance(m.r.usage, dict) and m.r.usage.get("prompt_tokens") else "-"))
-            if not m.r.ok and m.r.status is None:
+                      note="chars/ptok=%s" % (("%.2f" % (len(body) / pt)) if isinstance(pt, (int, float)) and pt > 0 else "-"))
+            if not m.ok and m.r.status is None:
                 break
 
     def canary(self, when):
@@ -1787,7 +1808,7 @@ class MemProber(Prober):
                     {"role": "user", "content": "What label does crate 7 carry? Reply with just the label, or NONE "
                                                 "if no crate 7 was mentioned."}]
             m = self.mchat(msgs, "M1 conflict #%d ask" % (i + 1), [("red", red_l), ("blue", blue_l)])
-            if not m.r.ok or not ra.r.ok:
+            if not m.ok or not ra.ok:
                 out["err"] += 1
                 kind = "err"
             else:
@@ -1810,7 +1831,7 @@ class MemProber(Prober):
                     {"role": "user", "content": "Name one primary color."}]
             m = self.mchat(msgs, "M1 instruction #%d" % (i + 1), [("instr", tag)])
             self.mrec("M1b", "instruction given in an earlier turn is followed (no recall asked)", m,
-                      verdict="SEEN" if m.hit("instr") else ("ERR" if not m.r.ok else "MISS"))
+                      verdict="SEEN" if m.hit("instr") else ("ERR" if not m.ok else "MISS"))
             self.sample("1", "instruction", m, ["instr"], "multi")
 
         for i in range(self.R):
@@ -1829,7 +1850,7 @@ class MemProber(Prober):
             picked = [o for o in opts if _norm(o) in _norm(m.r.content)]
             ok = picked == [right]
             self.mrec("M1c", "4-way forced choice on an earlier fact (chance = 25%)", m,
-                      verdict="RIGHT" if ok else ("ERR" if not m.r.ok else "WRONG"), note="picked=%d" % len(picked))
+                      verdict="RIGHT" if ok else ("ERR" if not m.ok else "WRONG"), note="picked=%d" % len(picked))
             self.sample("1", "choice", m, [], "multi", right=ok)
 
     # ------------------------------------------------------------------
@@ -1974,9 +1995,9 @@ class MemProber(Prober):
             msgs, facts, names = self.needle_msg(size, "M4", seed=seed)
             m = self.mchat(msgs, "M4 %s %s" % (why, _kfmt(size)), facts, timeout=max(self.a.timeout, 300))
             self.mrec("M4", "%s %s chars (~%dk proxy-est tokens)" % (why, _kfmt(size), size // 3000), m, names,
-                      note="" if m.r.ok else "elapsed_to_error=%.0fs" % m.r.elapsed)
+                      note="" if m.ok else "elapsed_to_error=%.0fs" % m.r.elapsed)
             self.sample("4", "single %d" % size, m, names, "single", size=size)
-            if m.r.ok:
+            if m.ok:
                 ok_max = max(ok_max, size)
                 if all(m.hit(n) for n in names):
                     full_max = max(full_max, size)
@@ -1990,8 +2011,8 @@ class MemProber(Prober):
             if m.r.status is None:
                 self.p("     (network error; stopping the ladder)")
                 break
-            if not m.r.ok:
-                if one(size, "retry", size + 1).r.ok:  # flake, or a real limit?
+            if not m.ok:
+                if one(size, "retry", size + 1).ok:  # flake, or a real limit?
                     flaky.append(size)
                     continue
                 fail_min = size
@@ -2004,7 +2025,7 @@ class MemProber(Prober):
                 if hi - lo < 15000:
                     break
                 m = one(mid, "bisect", mid)
-                if m.r.ok:
+                if m.ok:
                     lo = mid
                 elif m.r.status is None:
                     break
@@ -2016,12 +2037,14 @@ class MemProber(Prober):
             if self.r502:
                 self.p("     elapsed before each 502: %s (similar times = a timeout, not a size limit)"
                        % ", ".join("%s:%.0fs" % (_kfmt(c), e) for c, e in self.r502))
+            if lo < 8000:
+                self.p("     (no size under the error edge passed; skipping the multibyte and history checks)")
             # Units: the same edge in multibyte text. A CJK char is 1 char, 3
             # UTF-8 bytes, 6 wire bytes (JSON \u escape, as the proxy sends it)
             # and roughly one token, against ~3-4 chars per token for code.
             # Which of these fail shows what the limit counts.
             units = []
-            for frac in (0.15, 0.3, 0.6):
+            for frac in ((0.15, 0.3, 0.6) if lo >= 8000 else ()):
                 size = int(lo * frac)
                 msgs, facts, names = self.needle_msg(size, "M4 cjk", seed=size, filler=cjk_filler)
                 m = self.mchat(msgs, "M4 cjk %s" % _kfmt(size), facts, timeout=max(self.a.timeout, 300))
@@ -2029,12 +2052,12 @@ class MemProber(Prober):
                           % (_kfmt(size), _kfmt(len(msgs[0]["content"].encode("utf-8"))), _kfmt(lo)), m, names)
                 self.sample("4", "cjk %d" % size, m, names, "single", size=size, cjk=True)
                 if m.r.status is not None:
-                    units.append((size, m.wire, m.r.ok))
+                    units.append((size, m.wire, m.ok))
             self.notes["units"] = units
             # Does history count toward the same ceiling? Split ~1.3x the
             # failing size across earlier turns, keep the last message small.
             tot = int(hi * 1.3)
-            if tot <= self.maxc * 1.5:
+            if lo >= 8000 and tot <= self.maxc * 1.5:
                 msgs, facts = [], []
                 for k in range(4):
                     l = self.lab("M4 hist")
@@ -2047,7 +2070,7 @@ class MemProber(Prober):
                 m = self.mchat(msgs, "M4 history over edge", facts, timeout=max(self.a.timeout, 300))
                 self.mrec("M4h", "%s chars split over 4 earlier turns (above the edge): accepted?" % _kfmt(tot), m,
                           ["h1", "h2", "h3", "h4"],
-                          note="(HTTP 200 here = history is cut before the size check)" if m.r.ok else "")
+                          note="(HTTP 200 here = history is cut before the size check)" if m.ok else "")
                 self.sample("4", "hist-over-edge", m, ["h1", "h2", "h3", "h4"], "multi", size=tot)
         cand = min([x for x in (fail_min, loss_min) if x] or [full_max])
         if fail_min or loss_min:
@@ -2061,7 +2084,7 @@ class MemProber(Prober):
                 m = self.mchat(msgs, "M4 confirm %s #%d" % (_kfmt(cand), i + 1), facts, timeout=max(self.a.timeout, 300))
                 self.mrec("M4c", "confirm %s chars #%d" % (_kfmt(cand), i + 1), m, names)
                 self.sample("4", "confirm %d" % cand, m, names, "single", size=cand)
-                good += 1 if (m.r.ok and all(m.hit(x) for x in names)) else 0
+                good += 1 if (m.ok and all(m.hit(x) for x in names)) else 0
             self.notes["confirm"] = (cand, good, n)
             self.p("     confirm at %s chars: %d/%d fully recalled" % (_kfmt(cand), good, n))
 
@@ -2095,28 +2118,37 @@ class MemProber(Prober):
             facts = [("H", head), ("T", tail)]
             prev_sess = None
             lost_at = {}
+            cap = min(self.maxc, self.notes.get("edge_fail") or self.maxc)
             for k in range(1, n + 1):
                 l = self.lab("M7")
                 facts.append(("s%d" % k, l))
                 ctrl = self.lab("M7")
                 out = "Tool output (step %d):\n%s\n%s" % (k, code_filler(6000, seed=k * 31), self.fact("S%d" % k, l))
                 msgs = hist + [{"role": "user", "content": self.final(ctrl, out)}]
+                if sum(len(_content_to_text(x.get("content"))) for x in msgs) > cap:
+                    self.p("     (%s: step %d would exceed %s chars; stopping)" % (mode, k, _kfmt(cap)))
+                    break
                 names = [x for x, _ in facts]
                 m = self.mchat(msgs, "M7 %s step %d" % (mode, k), facts + [("ctrl", ctrl)])
                 changed = prev_sess is not None and m.sess != prev_sess
                 prev_sess = m.sess
-                for x in names:
-                    if not m.hit(x) and x not in lost_at:
-                        lost_at[x] = k
-                self.mrec("M7", "%s step %d (%d msgs)" % (mode, k, len(msgs)), m, names,
-                          note="session_changed" if changed else "")
+                if m.ok:
+                    for x in names:
+                        if not m.hit(x) and x not in lost_at:
+                            lost_at[x] = k
+                self.mrec("M7", "%s step %d (%d msgs)" % (mode, k, len(msgs)), m, names[:-1],
+                          note="this-step=%s%s" % ("ok" if m.hit(names[-1]) else "MISS",
+                                                    " session_changed" if changed else ""))
                 self.sample("7", "%s %d" % (mode, k), m, names[:-1], "multi", step=k, mode=mode)
-                reply = m.r.content if m.r.ok else "Continuing."
-                hist = msgs[:-1] + [{"role": "user", "content": out}, {"role": "assistant", "content": reply or "OK."}]
+                if not m.ok:
+                    if m.r.status is not None:
+                        self.notes["agent_err_" + mode] = k
+                    break
+                hist = msgs[:-1] + [{"role": "user", "content": out}, {"role": "assistant", "content": m.r.content}]
                 if mode == "interleaved":
                     t = self.mchat([{"role": "user", "content": "Write a 5-word title for: refactor the %s module."
                                      % random.choice(_WORDS)}], "M7 interleaved side request %d" % k, [])
-                    if not t.r.ok and t.r.status is None:
+                    if not t.ok and t.r.status is None:
                         break
             self.notes["agent_" + mode] = lost_at
 
@@ -2133,7 +2165,7 @@ class MemProber(Prober):
                                                         "Reply with just the label, or NONE if you have no earlier message from me."}],
                            "M9 ask d=%d" % d, [("x", l)])
             self.mrec("M9a", "fact from a separate request %ds earlier comes back" % d, m,
-                      verdict="LEAK" if m.hit("x") else ("ERR" if not m.r.ok else "NO"),
+                      verdict="LEAK" if m.hit("x") else ("ERR" if not m.ok else "NO"),
                       note="same_session=%s" % (m.sess != "-" and m.sess == ra.sess))
 
         msgs, facts = self.turns_user_facts(2, "M9 same")
@@ -2151,9 +2183,9 @@ class MemProber(Prober):
                 return
             m = self.mchat([{"role": "user", "content": "Which label does crate 6 carry? Reply with just the label, "
                                                         "or NONE if you were never told."}],
-                           "M9 %s ask" % name, [("x", l)], **extra)
+                           "M9 %s ask" % name, [("x", l)], optin=True, **extra)
             self.mrec("M9c", "continue the planting request via %s" % name, m,
-                      verdict="RECALL" if m.hit("x") else ("ERR" if not m.r.ok else "NO"),
+                      verdict="RECALL" if m.hit("x") else ("ERR" if not m.ok else "NO"),
                       note="same_session=%s" % (m.sess != "-" and m.sess == ra.sess))
 
         passback("top-level session", lambda ra: {"session": ra.sess_raw} if ra.sess_raw else None)
@@ -2164,9 +2196,9 @@ class MemProber(Prober):
         l = self.lab("M9 user")
         self.mchat([{"role": "user", "content": self.fact(8, l) + " Reply OK."}], "M9 user plant", [("x", l)], user=user_id)
         m = self.mchat([{"role": "user", "content": "Which label does crate 8 carry? Reply with just the label, or NONE "
-                                                    "if you were never told."}], "M9 user ask", [("x", l)], user=user_id)
+                                                    "if you were never told."}], "M9 user ask", [("x", l)], optin=True, user=user_id)
         self.mrec("M9d", "same OpenAI 'user' field on both requests", m,
-                  verdict="RECALL" if m.hit("x") else ("ERR" if not m.r.ok else "NO"))
+                  verdict="RECALL" if m.hit("x") else ("ERR" if not m.ok else "NO"))
 
         if self.a.long_term:
             self.p("     --long-term: asking the product to save a fact to the account's long-term memory, "
@@ -2178,9 +2210,9 @@ class MemProber(Prober):
                 if d:
                     time.sleep(d * self.a.delay_scale)
                 m = self.mchat([{"role": "user", "content": "Do you have a saved memory of my crate label? Reply with "
-                                                            "just the label, or NONE."}], "M9 longterm ask d=%d" % d, [("x", l)])
+                                                            "just the label, or NONE."}], "M9 longterm ask d=%d" % d, [("x", l)], optin=True)
                 self.mrec("M9e", "long-term memory recall after %ds" % d, m,
-                          verdict="RECALL" if m.hit("x") else ("ERR" if not m.r.ok else "NO"))
+                          verdict="RECALL" if m.hit("x") else ("ERR" if not m.ok else "NO"))
             r = self.chat([{"role": "user", "content": "Please delete every saved memory about my crate label."}],
                           "M9 longterm cleanup")
             self.rec("M9f", "cleanup request", "INFO" if r.ok else "ERR", "" if r.ok else self.fail_note(r), r, r.content, 100)
@@ -2197,7 +2229,7 @@ class MemProber(Prober):
             m = self.mchat(msgs, "M8 %s folded" % model, facts, model=model)
             self.mrec("M8", "%s: same folded" % model, m, ["h1", "h2", "h3"])
             self.sample("8", "folded", m, ["h1", "h2", "h3"], "folded", model=model)
-            if not m.r.ok and m.r.status is None:
+            if not m.ok and m.r.status is None:
                 break
 
     # ------------------------------------------------------------------
@@ -2215,7 +2247,12 @@ class MemProber(Prober):
             k = sum(sum(1 for h in s["hits"] if h) for s in rows)
             return k, n
 
-        multi = [s for s in S if s["ok"] and s["kind"] == "multi" and s["names"] and s["cfg"] != "instruction"]
+        # Section 7 repeats labels across requests, so server-side memory could
+        # also explain a recall there; it is reported on its own line. A
+        # request whose control (last-message) fact was missed is not
+        # evidence about history either.
+        multi = [s for s in S if s["ok"] and s["kind"] == "multi" and s["names"] and s["cfg"] != "instruction"
+                 and s["sec"] != "7" and (s["ctrl"] or not s["has_ctrl"])]
         k, n = rate(multi)
         self.p("  earlier facts recalled from separate messages: %d/%d over %d requests" % (k, n, len(multi)))
         if multi:
@@ -2281,12 +2318,17 @@ class MemProber(Prober):
         for mode in ("alone", "interleaved"):
             la = nt.get("agent_" + mode)
             if la is not None:
-                self.p("  agent session (%s): first step each fact was missing: %s"
-                       % (mode, ", ".join("%s@%d" % (x, s) for x, s in sorted(la.items(), key=lambda p: p[1])) or "never"))
+                self.p("  agent session (%s): first step each fact was missing: %s%s"
+                       % (mode, ", ".join("%s@%d" % (x, s) for x, s in sorted(la.items(), key=lambda p: p[1])) or "never",
+                          ("; HTTP error at step %d" % nt["agent_err_" + mode]) if nt.get("agent_err_" + mode) else ""))
+                self.p("    (labels repeat across these requests, so server-side memory can also explain a recall here)")
         hashes = [h for _, h in self.sessions if h != "-"]
         self.p("  session ids: %d requests carried one, %d distinct" % (len(hashes), len(set(hashes))))
         self.p("  labels from an earlier request that came back (server-side state): %d%s"
                % (len(self.leaks), (" e.g. " + "; ".join("%s <- %s" % (a, w) for a, _, w in self.leaks[:5])) if self.leaks else ""))
+        self.p("  recalls from deliberately continued requests (session pass-back, 'user', long-term): %d%s"
+               % (len(self.optin_recalls), (" via " + "; ".join(a for a, _, _ in self.optin_recalls[:5]))
+                  if self.optin_recalls else ""))
         self.p("  unexplained label-like strings in replies: %d" % len(self.foreign))
         cans = [s for s in S if s["sec"] == "canary" and s["ok"]]
         if cans:
@@ -2305,6 +2347,8 @@ class MemProber(Prober):
             self.p("  agent-session lines above for a threshold, and the canary line for drift over time.")
         if self.leaks:
             self.p("  Facts leaked between independent requests: there IS server-side state.")
+        if self.optin_recalls:
+            self.p("  A deliberately continued request recalled an earlier one: see the M9c/M9d/M9e lines.")
         budget = nt.get("confirm")
         if budget and budget[1] == budget[2]:
             self.p("  Safe single-message size seen: %s chars (~%dk tokens by the proxy's chars/3 estimate)."
@@ -2384,6 +2428,11 @@ def main():
         if isinstance(e.code, str):
             out(red(e.code))
             rc = 3
+            if isinstance(prober, MemProber) and prober.samples:
+                try:
+                    prober.verdict(0)
+                except Exception:
+                    pass
         else:
             raise
     except KeyboardInterrupt:
