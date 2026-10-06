@@ -120,9 +120,10 @@ hostname are redacted too.
 
 ## Caveats
 
-- **Setup costs**: a trial's time is the whole `harness host` run. So the
-  first trial of a run also includes the auth probe (and the proxy venv setup
-  if there is no venv yet). The first trial of each block also includes a
+- **Setup costs**: before trial 1, an untimed warm-up provisions the host
+  toolchain and proxy venv (downloads happen only if they are missing; no
+  model call). A trial's time is the whole `harness host` run, so the first
+  trial of a run also includes the auth probe. The first trial of each block also includes a
   proxy restart, a few seconds. Restarts hit both modes equally. The one-off
   probe falls on the baseline's first trial, which is negligible over 36 trials.
 - **Statistical power**: 3 repeats is low power for pass-rate differences.
