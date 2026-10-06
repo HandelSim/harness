@@ -17,7 +17,7 @@ So a mock run drives the real proxy, the real opencode and the real checker
 end to end, in both modes, with no network beyond loopback. It proves the
 wiring, not the model.
 
-Usage: mock_upstream.py --port N --tasks-dir DIR [--log FILE]
+Usage: mock_upstream.py --port N --tasks-dir DIR [--log FILE] [--delay SEC]
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -59,18 +60,22 @@ def current_turn(messages: list[dict]) -> str:
     return last[i:] if i >= 0 else last
 
 
+_CATALOG_WITH_BASH = re.compile(r"<<<BEGIN_AGENT_TOOLS>>>(?:(?!<<<END_AGENT_TOOLS>>>).)*?\bbash\b", re.DOTALL)
+
+
 def tool_call(name: str, arguments: dict) -> str:
     return "```json\n" + json.dumps({"name": name, "arguments": arguments}) + "\n```"
 
 
 def reply_for(messages: list[dict], tasks: list[tuple[str, str]]) -> str:
     whole = "\n".join(_text(m.get("content")) for m in messages)
-    if "<<<BEGIN_AGENT_TOOLS>>>" not in whole:
+    if not _CATALOG_WITH_BASH.search(whole):  # opencode's title request has no tools
         return "Benchmark task"
     if "<<<BEGIN_TOOL_RESULT" in current_turn(messages):
         return tool_call("finish", {"summary": "Done."})
     for prompt, solution in tasks:
-        if prompt in whole:
+        # A prefix, not the whole prompt: quotes later in a prompt arrive escaped.
+        if prompt[:60] in whole:
             return tool_call("bash", {"command": solution, "description": "Apply the change"})
     return tool_call("finish", {"summary": "No matching task."})
 
@@ -79,6 +84,7 @@ class Handler(BaseHTTPRequestHandler):
     tasks: list[tuple[str, str]] = []
     log_lock = threading.Lock()
     log_path = ""
+    delay = 0.0
 
     def log_message(self, fmt, *args):  # quiet; we keep our own log
         pass
@@ -112,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         messages = req.get("messages") or []
         content = reply_for(messages, self.tasks)
+        if self.delay:
+            time.sleep(self.delay)
         self._log(f"POST messages={len(messages)} -> {content[:60]!r}")
         cid = "chatcmpl-" + uuid.uuid4().hex[:12]
         if req.get("stream"):
@@ -135,9 +143,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--tasks-dir", required=True)
     ap.add_argument("--log", default="")
+    ap.add_argument("--delay", type=float, default=0.0, help="seconds to stall each chat reply (timeout tests)")
     a = ap.parse_args()
     Handler.tasks = load_tasks(a.tasks_dir)
     Handler.log_path = a.log
+    Handler.delay = a.delay
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     print(f"mock upstream on 127.0.0.1:{a.port} ({len(Handler.tasks)} tasks)", file=sys.stderr, flush=True)
     try:

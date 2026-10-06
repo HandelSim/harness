@@ -9023,6 +9023,15 @@ targets:
   compare-schemes   compare prompting/agent schemes against each other
   all               run every runner in tests/benchmarks/runners/
 
+  --test-modes      A/B the proxy's normal (hybrid) prompt mode against
+                    --single-message on a built-in task set, docker-free
+                    (harness host per trial). Takes its own options:
+                    --repeats N (3), --modes LIST (hybrid,single),
+                    --task-ids LIST, --timeout SEC (900), --mock (dry run
+                    against a local scripted upstream), --resume DIR,
+                    --report DIR, --list. See tests/benchmarks/modes/README.md
+                    and 'harness benchmark --test-modes --help'.
+
 options:
   --task-ids LIST       comma-separated task ids (HARNESS_BENCH_TASK_IDS)
   --schemes LIST        comma-separated scheme names (HARNESS_BENCH_SCHEMES)
@@ -9039,6 +9048,28 @@ This subcommand will refuse to run when $CI is set.
 EOF
 }
 
+# `harness benchmark --test-modes [opts]`: run tests/benchmarks/modes/run.py,
+# which drives `harness host` trials in hybrid and single mode and writes a
+# paired report under tests/benchmarks/runs/. HARNESS_BIN and
+# HARNESS_BENCH_INSTALL_ROOT tell it which harness to launch and whose .env and
+# toolchain to share (it runs trials under a private install root beside it).
+_harness_bench_test_modes() {
+    local args=() a py
+    for a in "$@"; do
+        [[ "$a" == "--test-modes" ]] || args+=("$a")
+    done
+    py=$(host_python_bin) || { err "harness benchmark --test-modes: Python 3 is required"; return 1; }
+    # $py may be the two-token `py -3` on Windows; intentional word-split.
+    # shellcheck disable=SC2086
+    if (( ${#args[@]} )); then
+        HARNESS_BIN="$clone_dir/harness" HARNESS_BENCH_INSTALL_ROOT="$install_root" \
+            $py "$clone_dir/tests/benchmarks/modes/run.py" "${args[@]}"
+    else
+        HARNESS_BIN="$clone_dir/harness" HARNESS_BENCH_INSTALL_ROOT="$install_root" \
+            $py "$clone_dir/tests/benchmarks/modes/run.py"
+    fi
+}
+
 cmd_benchmark() {
     # Defense-in-depth CI guard. The runners (track G) also check $CI,
     # but checking here means a misconfigured runner or an accidental
@@ -9047,6 +9078,16 @@ cmd_benchmark() {
         echo "Refusing to run benchmarks in CI environment." >&2
         return 1
     fi
+
+    # --test-modes is its own runner (python, host mode, no harbor/docker):
+    # hand it every other argument unchanged.
+    local _bench_arg
+    for _bench_arg in "$@"; do
+        if [[ "$_bench_arg" == "--test-modes" ]]; then
+            _harness_bench_test_modes "$@"
+            return $?
+        fi
+    done
 
     local target="smoketest"
     local no_smoketest=0

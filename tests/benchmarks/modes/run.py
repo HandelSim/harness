@@ -14,7 +14,8 @@ Isolation and egress (what leaves the machine):
     global opencode config, plugins, MCP servers and sessions are not used.
   * HARNESS_HOST_NO_WEB=1: no webfetch/websearch tools, no Exa, sharing off.
     OPENCODE_DISABLE_MODELS_FETCH / _AUTOUPDATE / _SHARE / _LSP_DOWNLOAD /
-    _CLAUDE_CODE are set and OTEL_* is cleared.
+    _CLAUDE_CODE / _DEFAULT_PLUGINS are set (no ~/.claude instructions, no
+    auth-plugin installs) and OTEL_* is cleared.
   * So the task traffic goes only to the upstream API (PROXY_API_URL). The
     one-time public downloads (Node/opencode/jq/pip deps if missing, opencode's
     plugin package from npm on its first start in the private config dir,
@@ -317,6 +318,7 @@ def child_env(bench_root: str, port: int, mock: bool, first: bool) -> dict:
         "OPENCODE_DISABLE_SHARE": "1",
         "OPENCODE_DISABLE_LSP_DOWNLOAD": "1",
         "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+        "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
     })
     if not first:
         env["HARNESS_SKIP_AUTH_PROBE"] = "1"
@@ -692,7 +694,8 @@ def main(argv: list[str]) -> int:
             mport = free_port()
             mock_proc = subprocess.Popen(
                 [sys.executable, os.path.join(HERE, "mock_upstream.py"), "--port", str(mport),
-                 "--tasks-dir", TASKS_DIR, "--log", os.path.join(out, "mock.log")],
+                 "--tasks-dir", TASKS_DIR, "--log", os.path.join(out, "mock.log"),
+                 "--delay", os.environ.get("HARNESS_BENCH_MOCK_DELAY", "0")],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for _ in range(50):
                 try:
