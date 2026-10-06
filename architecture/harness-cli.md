@@ -139,7 +139,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
 | Diagnostics | `doctor`, `preflight`, `probe`, `help` |
-| Test / bench | `test`, `benchmark` |
+| Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
 | MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
 | MCP (host, non-container) | `mcp host-init`, `mcp host-setup` — scaffold + register a host build MCP (a process on the host, e.g. MSVC/CMake) and launch the agent that tailors it. See [`mcp.md`](mcp.md) "Host MCPs". `host-setup` `cd`s into `host-mcp/<name>/` and calls the normal `run_agent` so opencode auto-loads that folder's `AGENTS.md`. |
@@ -621,7 +621,12 @@ What it does, in order:
    `OPENCODE_CONFIG` to point at it, so the user's global
    `~/.config/opencode/opencode.json` is never touched. `curl` is optional: the
    model dropdown comes from the proxy's `/v1/models` when present, else falls
-   back to `DEFAULT_MODEL_NAME` alone.
+   back to `DEFAULT_MODEL_NAME` alone. The proxy port is `host_proxy_port`:
+   `HARNESS_HOST_PORT`, else `.env`'s `PROXY_PORT`, else 8000 (the override
+   lets the benchmark run its own proxy beside a user's). With
+   `HARNESS_HOST_NO_WEB=1` the yolo agent's `webfetch`/`websearch` become
+   `deny` and the config gains `share: "disabled"`; unset, the config is
+   byte-identical to before (no `share` key).
 8. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
    (provider env, `--agent yolo`, and the headless `-p` json-events +
    `opencode export` dance that dodges opencode 1.15.x's render race).
@@ -630,7 +635,8 @@ What it does, in order:
    thrash it (`harness host down` stops it) — the same interactive-vs-print
    teardown split as container mode. Because nothing reaps a `-p` proxy, print
    mode prints a stderr reminder after the run naming the live pid and the
-   `harness host down` stop command. **Terminal reset on interactive exit:** after
+   `harness host down` stop command. `host_run_opencode` exports
+   `OPENCODE_ENABLE_EXA=1` (Exa web search) unless `HARNESS_HOST_NO_WEB=1`. **Terminal reset on interactive exit:** after
    the interactive child returns (before `host_proxy_stop`), `host_reset_terminal`
    re-sends the xterm DECRST disables for mouse-tracking (`?1000`/`?1002`/`?1003`
    + the `?1005`/`?1006`/`?1015` report encodings), focus-reporting (`?1004`) and
@@ -1020,6 +1026,21 @@ secret-echoing mock.
   `cmd_net_*`.
 - `upgrade_actions.sh` — the action functions called by `cmd_upgrade`.
   See [`install-and-upgrade.md`](install-and-upgrade.md).
+
+## `benchmark --test-modes` (prompt-mode A/B, docker-free)
+
+`cmd_benchmark` routes any argv containing `--test-modes` to
+`_harness_bench_test_modes`, which drops the flag and runs
+`tests/benchmarks/modes/run.py` under the host proxy venv's python
+(`host_python_bin`), passing `HARNESS_BIN` and the install root. The runner
+drives real `harness host --yolo [--single-message] -p` trials under a private
+install root (`state/bench-modes/root/`, `.env` symlinked) with
+`HARNESS_HOST_PORT` (a free port), `HARNESS_HOST_NO_WEB=1`, private opencode
+XDG dirs and the `OPENCODE_DISABLE_*` switches, so it never touches the user's
+running proxy or opencode config and the only task egress is the upstream API.
+`--mock` swaps the upstream for a loopback scripted mock. Usage, report and
+egress list: `tests/benchmarks/modes/README.md`. Covered by
+`tests/unit_bench_modes_test.sh`.
 
 ## Tests
 

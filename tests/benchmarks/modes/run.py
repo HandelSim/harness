@@ -17,9 +17,8 @@ Isolation and egress (what leaves the machine):
     _CLAUDE_CODE / _DEFAULT_PLUGINS are set (no ~/.claude instructions, no
     auth-plugin installs) and OTEL_* is cleared.
   * So the task traffic goes only to the upstream API (PROXY_API_URL). The
-    one-time public downloads (Node/opencode/jq/pip deps if missing, opencode's
-    plugin package from npm on its first start in the private config dir,
-    ripgrep if absent) fetch public packages and send no task or user data.
+    one-time public downloads (Node/opencode/jq/pip deps if missing, ripgrep
+    if absent) fetch public packages and send no task or user data.
   * Results hold task ids, modes, pass/fail, timings and counts. The per-trial
     logs (agent output and launcher stderr tails) pass through the probe's
     redactor (key, URL, host, IPs, emails) plus home dir / user / hostname.

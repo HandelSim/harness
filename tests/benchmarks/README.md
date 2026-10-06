@@ -7,6 +7,14 @@ directory for run artifacts.
 Benchmarks are **never** run in CI. Each runner refuses to start when
 `$CI` is set.
 
+**Comparing the proxy's prompt modes (hybrid vs `--single-message`)?** Use
+`harness benchmark --test-modes`, the docker-free A/B in [`modes/`](modes/README.md).
+It needs no harbor or docker, and its only task egress is the upstream API.
+Known issues with the harbor path below, as of the mode-A/B work: harbor's
+`job.log` can record the upstream API key, and the per-task containers run
+with open network. Treat harbor run directories as secret and do not share
+them.
+
 ---
 
 ## Execution model

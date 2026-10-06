@@ -787,6 +787,11 @@ behind `tool_search` is worth its complexity: until the prefix is genuinely
 large the migration buys little (the proxy re-injects every turn, so prefix
 loss is largely self-healing for the small push layer).
 
+Right after it, `[req_id] upstream shape: mode=M messages=N chars=C` records
+the effective prompt mode and the size of what is actually sent upstream
+(after folding). `harness benchmark --test-modes` reads it to prove each
+trial ran in the intended mode (single must show `messages=1`).
+
 ## `_CHANGE_SYSTEM_TO_USER`
 
 Default ON. Some upstreams silently drop the `system` role; the
