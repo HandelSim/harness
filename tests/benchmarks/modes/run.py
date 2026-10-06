@@ -52,6 +52,9 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 TASKS_DIR = os.path.join(HERE, "tasks")
 RUNS_DIR = os.path.join(REPO, "tests", "benchmarks", "runs")
 IS_WINDOWS = os.name == "nt"
+# Resolved via PATH: a bare "bash" on Windows can hit System32's WSL launcher
+# before Git Bash.
+BASH = shutil.which("bash") or "bash"
 
 KNOWN_MODES = ("hybrid", "single", "user_front", "passthrough")
 LOG_TAIL_CHARS = 4000
@@ -144,13 +147,14 @@ _RE_POST = re.compile(r"^\[(\w+)\] POST /\S*chat/completions .*?messages=(\d+) t
 _RE_SHAPE = re.compile(r"^\[(\w+)\] upstream shape: mode=(\w+) messages=(\d+) chars=(\d+)")
 _RE_ERR = re.compile(r"^\[\w+\] upstream (?:returned (\d{3})|request failed|returned non-JSON)")
 _RE_ANY_STATUS = re.compile(r"upstream returned (\d{3})")
+_RE_ID = re.compile(r"^\[(\w+)\] ")
 
 
 def parse_proxy_log(text: str) -> dict:
     agent_ids, title_ids = set(), set()
     shapes = {}
-    c = {"errors": 0, "auth_errors": 0, "malformed_retries": 0, "reasks": 0,
-         "finishes": 0, "fatal": 0}
+    c = {"errors": 0, "transient_errors": 0, "auth_errors": 0, "malformed_retries": 0,
+         "reasks": 0, "finishes": 0, "fatal": 0}
     for line in text.splitlines():
         m = _RE_POST.match(line)
         if m:
@@ -160,9 +164,19 @@ def parse_proxy_log(text: str) -> dict:
         if m:
             shapes[m.group(1)] = (m.group(2), int(m.group(3)), int(m.group(4)))
             continue
+        # Count a request's later lines only if its POST is in this window: a
+        # request left over from a killed trial must not score against the next.
+        m = _RE_ID.match(line)
+        if m and m.group(1) not in agent_ids and m.group(1) not in title_ids:
+            continue
         m = _RE_ERR.match(line)
         if m:
             c["errors"] += 1
+            code = m.group(1)
+            # 5xx / 429 / network / garbled: the upstream's trouble, not the
+            # prompt's. Other 4xx (e.g. a too-long single message) stay real.
+            if code is None or code == "429" or code.startswith("5"):
+                c["transient_errors"] += 1
         m = _RE_ANY_STATUS.search(line)
         if m and m.group(1) in ("401", "403"):
             c["auth_errors"] += 1
@@ -216,6 +230,12 @@ def make_redactor():
     home = os.path.expanduser("~")
     if len(home) > 1:
         literals.append((home, "~"))
+        fwd = home.replace("\\", "/")  # Windows: C:/Users/x, and Git Bash's /c/Users/x
+        literals.append((fwd, "~"))
+        if re.match(r"^[A-Za-z]:/", fwd):
+            literals.append(("/" + fwd[0].lower() + fwd[2:], "~"))
+        if len(os.path.basename(home)) >= 3:
+            literals.append((os.path.basename(home), "<user>"))
     for v, rep in ((_safe(getpass.getuser), "<user>"), (_safe(socket.gethostname), "<host>")):
         if v and len(v) >= 3:
             literals.append((v, rep))
@@ -339,7 +359,7 @@ def warm_up(harness_bin: str, env: dict) -> None:
     log("preparing the host toolchain and proxy venv (one-time downloads only if missing)")
     env = dict(env, HARNESS_BIN=harness_bin)
     try:
-        r = subprocess.run(["bash", "-c", WARM_UP], env=env, stdin=subprocess.DEVNULL,
+        r = subprocess.run([BASH, "-c", WARM_UP], env=env, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=1800)
         if r.returncode != 0:
             log(f"warning: warm-up exited {r.returncode}; the first trial will retry it")
@@ -423,7 +443,7 @@ def run_trial(task: dict, mode: str, repeat: int, ctx: dict) -> dict:
         cmd += ["--prompt-mode", mode]
     cmd += ["-p", task["prompt"]]
     if IS_WINDOWS:
-        cmd = ["bash"] + cmd
+        cmd = [BASH] + cmd
 
     env = child_env(bench_root, ctx["port"], ctx["mock"], first=ctx["first"])
     t0 = time.monotonic()
@@ -437,6 +457,10 @@ def run_trial(task: dict, mode: str, repeat: int, ctx: dict) -> dict:
             timed_out = True
             _kill_tree(proc)
             rc = proc.returncode if proc.returncode is not None else -9
+        except BaseException:  # Ctrl-C: the child is in its own session, so stop it here
+            _kill_tree(proc)
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise
     secs = time.monotonic() - t0
 
     # A restarted proxy (mode switch, or the kill above) truncates its log.
@@ -460,12 +484,18 @@ def run_trial(task: dict, mode: str, repeat: int, ctx: dict) -> dict:
 
     infra = ""
     err_tail = _tail(err_path)
-    if counters["auth_errors"] or re.search(r"(?i)unlock_url|key (?:is )?locked|key rejected", err_tail):
+    if counters["auth_errors"] or re.search(
+            r"(?i)unlock_url|key (?:is )?locked|key rejected|rejected the API key", err_tail):
         infra = "auth"
     elif counters["requests"] == 0:
         # Nothing reached the proxy (even if it then timed out, e.g. a hung
         # auth probe), so the prompt mode cannot be what failed.
         infra = "launch"
+    elif not passed and counters["transient_errors"] and (
+            timed_out or counters["transient_errors"] >= counters["requests"]):
+        # An upstream outage (5xx/429/network) sank this trial; whichever mode
+        # happened to be running would have failed. Excluded and retried.
+        infra = "upstream"
 
     red = ctx["redact"]
     trial_id = f"r{repeat}-{mode}-{task['id']}"
@@ -700,7 +730,7 @@ def main(argv: list[str]) -> int:
            "timeout": a.timeout, "redact": red, "out": out, "keep": a.keep_workdirs, "first": True}
 
     def stop_proxy():
-        subprocess.run(([] if not IS_WINDOWS else ["bash"]) + [harness_bin, "host", "down"],
+        subprocess.run(([] if not IS_WINDOWS else [BASH]) + [harness_bin, "host", "down"],
                        env=child_env(bench_root, port, a.mock, first=False),
                        capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
 
@@ -712,13 +742,20 @@ def main(argv: list[str]) -> int:
         "sharing, model-list fetch, autoupdate and telemetry are off")
     by_id = {t["id"]: t for t in tasks}
     aborted = ""
+    # --resume rebuilds the plan from the options, so the hint repeats them.
+    resume = (f"harness benchmark --test-modes --resume {out} --repeats {a.repeats} --modes {','.join(modes)}"
+              + (f" --task-ids {a.task_ids}" if a.task_ids else "")
+              + (f" --timeout {a.timeout}" if a.timeout != 900 else "")
+              + (" --mock" if a.mock else ""))
+    upstream_streak = 0
     try:
         if a.mock:
             mport = free_port()
             mock_proc = subprocess.Popen(
                 [sys.executable, os.path.join(HERE, "mock_upstream.py"), "--port", str(mport),
                  "--tasks-dir", TASKS_DIR, "--log", os.path.join(out, "mock.log"),
-                 "--delay", os.environ.get("HARNESS_BENCH_MOCK_DELAY", "0")],
+                 "--delay", os.environ.get("HARNESS_BENCH_MOCK_DELAY", "0"),
+                 "--status", os.environ.get("HARNESS_BENCH_MOCK_STATUS", "0")],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for _ in range(50):
                 try:
@@ -753,16 +790,21 @@ def main(argv: list[str]) -> int:
                 + (" TIMEOUT" if r["timed_out"] else ""))
             if r["infra"] == "auth":
                 aborted = ("the upstream rejected the key (locked or invalid). Unlock it (harness doctor shows "
-                           f"the unlock URL), then continue with: harness benchmark --test-modes --resume {out}")
+                           f"the unlock URL), then continue with: {resume}")
                 break
             if r["infra"] == "launch" and i <= 2:
                 aborted = (f"harness host did not start the agent; see {os.path.join(out, 'trials')} "
                            "for the redacted launcher output")
                 break
+            upstream_streak = upstream_streak + 1 if r["infra"] == "upstream" else 0
+            if upstream_streak >= 3:
+                aborted = ("3 trials in a row lost to upstream errors (5xx/429/network); the upstream looks "
+                           f"down. Continue later with: {resume}")
+                break
             if not r["infra"]:
                 ctx["first"] = False
     except KeyboardInterrupt:
-        aborted = f"interrupted. Continue with: harness benchmark --test-modes --resume {out}"
+        aborted = f"interrupted. Continue with: {resume}"
     finally:
         try:
             stop_proxy()

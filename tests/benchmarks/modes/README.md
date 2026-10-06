@@ -75,12 +75,23 @@ the day across both modes and keeps proxy restarts to two per repeat.
 
 Infra failures are listed and excluded from the stats:
 
-- `auth`: a 401/403 or a "locked" key.
-- `launch`: no request reached the proxy.
+- `auth`: a 401/403, or a locked or rejected key.
+- `launch`: no request reached the proxy, even if the trial then timed out.
+- `upstream`: a failed trial sunk by upstream 5xx/429/network errors (it
+  timed out with one, or every request errored). Other 4xx errors, such as
+  the upstream refusing an oversized single message, count against the mode.
 
-An auth failure, a launch failure in the first two trials, or Ctrl-C stops the
-run with exit code 2 and prints the `--resume` command. `--resume` skips
-finished trials and reruns the infra-failed ones.
+These stop the run with exit code 2:
+
+- an auth failure;
+- a launch failure in the first two trials;
+- 3 upstream failures in a row;
+- Ctrl-C, which also kills the running trial.
+
+On a stop, the runner prints the full `--resume` command with the same
+options. `--resume` builds its plan from the options you pass, so keep them
+the same, or raise `--repeats` to extend a finished run. It skips finished
+trials and reruns the infra-failed ones.
 
 ## Output (`tests/benchmarks/runs/modes[-mock]-<stamp>/`, gitignored)
 

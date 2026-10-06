@@ -99,6 +99,24 @@ class TestProxyLog(unittest.TestCase):
         self.assertTrue(run.mode_verified("single", c))
         self.assertFalse(run.mode_verified("hybrid", c))
 
+    def test_transient_errors_and_attribution(self):
+        log = ("[old] upstream returned 401: late line from a killed trial\n"
+               "[old] require-tool: consumed `finish`\n"
+               "[a] POST /v1/chat/completions model=m messages=2 tools=9\n"
+               "[a] upstream shape: mode=single messages=1 chars=100\n"
+               "[a] upstream returned 503: busy\n"
+               "[b] POST /v1/chat/completions model=m messages=3 tools=9\n"
+               "[b] upstream shape: mode=single messages=1 chars=200\n"
+               "[b] upstream returned 400: context too long\n"
+               "[c] POST /v1/chat/completions model=m messages=4 tools=9\n"
+               "[c] upstream request failed: timeout\n"
+               "[c] retry upstream returned 429: slow down\n")
+        c = run.parse_proxy_log(log)
+        self.assertEqual(c["auth_errors"], 0)  # [old] is outside this window
+        self.assertEqual(c["finishes"], 0)
+        self.assertEqual(c["errors"], 3)  # 503, 400, request failed (retry lines are not _RE_ERR)
+        self.assertEqual(c["transient_errors"], 2)  # 503 + request failed; the 400 is real
+
     def test_auth_error_and_hybrid(self):
         log = ("[a] POST /v1/chat/completions model=m messages=2 tools=9\n"
                "[a] upstream shape: mode=hybrid messages=3 chars=100\n"
@@ -195,6 +213,9 @@ class TestEnvAndRedaction(unittest.TestCase):
             os.environ["PROXY_API_KEY"] = "sk-abcdef0123456789xyz"
             os.environ["PROXY_API_URL"] = "https://gw.secretcorp.example.com"
             red = run.make_redactor()
+            fwd = os.path.expanduser("~").replace("\\", "/")
+            if len(fwd) > 1:
+                self.assertNotIn(fwd, red(f"cd {fwd}/proj"))
             home = os.path.expanduser("~")
             s = red(f"key sk-abcdef0123456789xyz at https://gw.secretcorp.example.com/v1 in {home}/x")
             self.assertNotIn("sk-abcdef", s)

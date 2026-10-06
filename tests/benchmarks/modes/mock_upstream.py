@@ -17,7 +17,7 @@ So a mock run drives the real proxy, the real opencode and the real checker
 end to end, in both modes, with no network beyond loopback. It proves the
 wiring, not the model.
 
-Usage: mock_upstream.py --port N --tasks-dir DIR [--log FILE] [--delay SEC]
+Usage: mock_upstream.py --port N --tasks-dir DIR [--log FILE] [--delay SEC] [--status CODE]
 """
 
 from __future__ import annotations
@@ -85,6 +85,7 @@ class Handler(BaseHTTPRequestHandler):
     log_lock = threading.Lock()
     log_path = ""
     delay = 0.0
+    status = 0
 
     def log_message(self, fmt, *args):  # quiet; we keep our own log
         pass
@@ -117,6 +118,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b'{"error": {"type": "invalid_request"}}', "application/json")
             return
         messages = req.get("messages") or []
+        if self.status:  # outage drill: fail every chat call
+            self._log(f"POST messages={len(messages)} -> HTTP {self.status}")
+            self._send(self.status, b'{"error": {"type": "mock_outage"}}', "application/json")
+            return
         content = reply_for(messages, self.tasks)
         if self.delay:
             time.sleep(self.delay)
@@ -144,10 +149,12 @@ def main() -> int:
     ap.add_argument("--tasks-dir", required=True)
     ap.add_argument("--log", default="")
     ap.add_argument("--delay", type=float, default=0.0, help="seconds to stall each chat reply (timeout tests)")
+    ap.add_argument("--status", type=int, default=0, help="answer every chat call with this HTTP status (outage tests)")
     a = ap.parse_args()
     Handler.tasks = load_tasks(a.tasks_dir)
     Handler.log_path = a.log
     Handler.delay = a.delay
+    Handler.status = a.status
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     print(f"mock upstream on 127.0.0.1:{a.port} ({len(Handler.tasks)} tasks)", file=sys.stderr, flush=True)
     try:
