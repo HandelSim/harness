@@ -440,7 +440,9 @@ def run_trial(task: dict, mode: str, repeat: int, ctx: dict) -> dict:
     err_tail = _tail(err_path)
     if counters["auth_errors"] or re.search(r"(?i)unlock_url|key (?:is )?locked|key rejected", err_tail):
         infra = "auth"
-    elif counters["requests"] == 0 and not timed_out:
+    elif counters["requests"] == 0:
+        # Nothing reached the proxy (even if it then timed out, e.g. a hung
+        # auth probe), so the prompt mode cannot be what failed.
         infra = "launch"
 
     red = ctx["redact"]
@@ -710,6 +712,13 @@ def main(argv: list[str]) -> int:
         # Restart from a clean proxy so a stale one from an earlier run (other
         # port, other mode) is never reused.
         stop_proxy()
+        # Drop the stopped proxy's log too: a trial that dies before its own
+        # proxy starts would otherwise count an earlier run's requests.
+        for stale in ("proxy.log", "proxy.pid"):
+            try:
+                os.remove(os.path.join(bench_root, "state", "host", stale))
+            except OSError:
+                pass
 
         for i, (rep, mode, tid) in enumerate(todo, 1):
             r = run_trial(by_id[tid], mode, rep, ctx)
