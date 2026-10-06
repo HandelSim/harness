@@ -349,20 +349,21 @@ def child_env(bench_root: str, port: int, mock: bool, first: bool) -> dict:
 # untimed, so a first-ever host-mode run does not charge those downloads to the
 # first trial's mode. No model API call: these only fetch public packages.
 WARM_UP = (
-    'HARNESS_SOURCE_ONLY=1 source "$HARNESS_BIN" >/dev/null || exit 1; '
+    'HARNESS_SOURCE_ONLY=1 source "$0" >/dev/null || exit 1; '
     "host_require_python3 && ensure_dirs && host_ensure_toolchain && host_preflight "
     "&& host_proxy_ensure_venv"
 )
 
 
-def warm_up(harness_bin: str, env: dict) -> None:
+def warm_up(harness_bin: str, env: dict, redact) -> None:
     log("preparing the host toolchain and proxy venv (one-time downloads only if missing)")
-    env = dict(env, HARNESS_BIN=harness_bin)
     try:
-        r = subprocess.run([BASH, "-c", WARM_UP], env=env, stdin=subprocess.DEVNULL,
+        # $0 = the harness script: it locates its clone (and scripts/lib) from $0.
+        r = subprocess.run([BASH, "-c", WARM_UP, harness_bin], env=env, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=1800)
         if r.returncode != 0:
-            log(f"warning: warm-up exited {r.returncode}; the first trial will retry it")
+            tail = (r.stderr.strip().splitlines() or [""])[-1]
+            log(f"warning: warm-up exited {r.returncode} ({redact(tail)[:200]}); the first trial will retry it")
     except subprocess.TimeoutExpired:
         log("warning: warm-up timed out; the first trial will retry it")
 
@@ -778,7 +779,7 @@ def main(argv: list[str]) -> int:
                 os.remove(os.path.join(bench_root, "state", "host", stale))
             except OSError:
                 pass
-        warm_up(harness_bin, child_env(bench_root, port, a.mock, first=False))
+        warm_up(harness_bin, child_env(bench_root, port, a.mock, first=False), red)
 
         for i, (rep, mode, tid) in enumerate(todo, 1):
             r = run_trial(by_id[tid], mode, rep, ctx)
