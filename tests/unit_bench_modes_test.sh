@@ -48,6 +48,7 @@ src() {
     # shellcheck disable=SC1090
     HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" \
         HARNESS_ALLOWLIST_PATH="$TMP_ROOT/.harness-allowlist" source "$HARNESS" >/dev/null 2>&1
+    clone_dir="$REPO_ROOT"
 }
 
 # --- T2: routing ---------------------------------------------------------------
