@@ -66,9 +66,12 @@ These are the load-bearing behaviors the proxy is built around:
   the last user message reaches the model, so the hybrid layout (tool
   definitions folded into message 0, history as alternating turns) loses
   the tool definitions and every earlier turn; what survives is the
-  recency block on the last user message. Unconfirmed beyond the probe;
-  `harness probe memory` measures this (turn count, layout, size, server-side
-  session) with repeats.
+  recency block on the last user message. Confirmed by `harness probe
+  memory` (2026-10-05): 0 of 461 facts in earlier messages came back, while
+  the same facts folded into the last message came back 63/63, and one
+  message was recalled whole up to 700k chars. `harness probe
+  optimize-single` measures which join format, size and framing work best
+  for a whole chat folded into that one message.
 - **Unreliable `usage`.** `usage.total_tokens` is per-request (the most
   recent request + response only), not cumulative for the conversation.
   It cannot be used for context tracking — the proxy estimates tokens

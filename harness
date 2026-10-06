@@ -1688,10 +1688,11 @@ cmd_unlock() {
 }
 
 # 'harness probe': run scripts/probe_upstream.py straight against the upstream
-# (no proxy) to characterize it. Two suites: 'full' (system prompt, native
-# tools, streaming, response_format, per-model matrix; bare 'harness probe')
-# and 'memory' (which earlier turns reach the model and what decides when they
-# are dropped). Output is redacted (key, URL, host, emails, IPs, projects/...
+# (no proxy) to characterize it. Three suites: 'full' (system prompt, native
+# tools, streaming, response_format, per-model matrix; bare 'harness probe'),
+# 'memory' (which earlier turns reach the model and what decides when they
+# are dropped) and 'optimize-single' (which size, join format and framing of
+# a chat folded into one message the model answers best from). Output is redacted (key, URL, host, emails, IPs, projects/...
 # paths, HARNESS_PROBE_REDACT terms) so it can be pasted back as-is. Runs on
 # the host's python3; falls back to the proxy image's python when the host has
 # none. See architecture/harness-cli.md.
@@ -1712,6 +1713,11 @@ subcommands:
             session, time) decides when they are dropped, plus the largest
             request that is kept whole. About 30-90 minutes; --quick sends
             about a third as many requests.
+  optimize-single
+            fold a whole agent chat into ONE message and find the join
+            format, size and framing the model answers best from (recall
+            by depth, updates, instructions, injections). Also accepted as
+            --optimize-single. About an hour; --quick about 10 minutes.
   help      this list
 
 'harness probe <subcommand> --help' lists that subcommand's options.
@@ -1800,6 +1806,60 @@ for analysis.
 EOF
 }
 
+_probe_single_help() {
+    cat <<'EOF'
+usage: harness probe optimize-single [--quick] [--reps N] [--sizes LIST]
+                                     [--formats LIST] [--framings LIST]
+                                     [--framing-sizes LIST] [--stage A|B|AB]
+                                     [--facts N] [--tpm N] [--parallel N]
+                                     [--seed N] [--max-chars N] [--model ID]
+                                     [--timeout SECS]
+
+Find the best way to send a whole chat as ONE user message (the upstream
+answers from the last message only). Each request is a synthetic agent
+session (instructions + tool definitions, user / assistant / tool-result
+turns, the user's current message) folded into one message, carrying:
+
+  - 24 crate labels planted at spread-out depths in user, assistant and
+    tool-result turns (recall by position: where the model forgets)
+  - a port stated early and changed later (does it use the newest value)
+  - a last-line rule in the instructions block (instruction following)
+  - an instruction hidden in a tool result (does it obey injected text)
+
+Stage A crosses join formats (plain, xml, markers, markdown, json) with
+sizes (16k..600k chars); stage B tries framings (end, instr-last, recap,
+sandwich) on the stage-A winner. Requests are shuffled and repeated so
+each cell is a real sample; the verdict prints 95% intervals, recall by
+depth, and a suggested format / size / framing for a future
+'--single-message' mode.
+
+Default run: about 230 requests, ~17M tokens, about an hour, paced under
+the upstream's tokens-per-minute limit (429s are waited out and retried).
+Start with --quick (about 40 requests, ~10 minutes).
+
+The full redacted log (each request's layout, score and reply, one whole
+example message per format, and a '### results' line with every sample)
+is written to state/output/probe-single-<time>.log; send that file for
+analysis.
+
+  --quick              sizes 32k,128k,400k, 2 reps, stage B at 128k
+  --reps N             requests per cell (default 6)
+  --sizes LIST         stage-A sizes in chars, e.g. 16k,64k,256k
+  --formats LIST       join formats to compare (default all five)
+  --framings LIST      framings for stage B (default all four)
+  --framing-sizes LIST stage-B sizes (default 128k,400k)
+  --stage A|B|AB       which stages to run (default AB; B alone uses the
+                       first --formats entry)
+  --facts N            labels planted per request (default 24)
+  --tpm N              tokens/minute to pace to (default 400000; 0 = off)
+  --parallel N         requests in flight (default 2, max 4)
+  --seed N             content seed (default time-based; printed)
+  --max-chars N        drop sizes above this (default 700000)
+  --model ID           model to probe (default: DEFAULT_MODEL_NAME)
+  --timeout SECS       per-request timeout (default 300)
+EOF
+}
+
 cmd_probe() {
     local suite=full
     case "${1:-}" in
@@ -1807,6 +1867,7 @@ cmd_probe() {
         -h|--help) _probe_help; echo; _probe_full_help; return 0 ;;
         full) shift ;;
         memory) suite=memory; shift ;;
+        optimize-single|--optimize-single) suite=single; shift ;;
         ""|-*) ;;
         *)
             err "unknown probe subcommand '$1'"
@@ -1816,7 +1877,11 @@ cmd_probe() {
     esac
     case "${1:-}" in
         -h|--help|help)
-            if [[ $suite == memory ]]; then _probe_memory_help; else _probe_full_help; fi
+            case $suite in
+                memory) _probe_memory_help ;;
+                single) _probe_single_help ;;
+                *) _probe_full_help ;;
+            esac
             return 0
             ;;
     esac
@@ -1831,6 +1896,7 @@ cmd_probe() {
     fi
     local stem=probe
     [[ $suite == memory ]] && stem=probe-memory
+    [[ $suite == single ]] && stem=probe-single
     local rel log
     rel="state/output/${stem}-$(date -u +%Y%m%dT%H%M%SZ).log"
     log="$install_root/$rel"

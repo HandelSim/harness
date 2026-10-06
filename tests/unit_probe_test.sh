@@ -22,6 +22,12 @@
 #      verdict (the mock sees only the last message and 502s above 100 KB)
 #   T9 none of the secrets appear in the memory suite's stdout or log, and
 #      the session id it passes back is scrubbed in the log
+#   T10 'harness probe optimize-single' (small sizes, 1 rep) exits 0 with both
+#      stages, the verdict tables and a recommendation; it waits out and
+#      retries a 429 (the mock answers the first single-suite request with
+#      one), and scores the mock's recall/port/ack correctly
+#   T11 none of the secrets appear in its stdout or log; the log has the
+#      layouts, one whole example message and the '### results' line
 #
 # Prints "PROBE TEST PASSED" on success.
 
@@ -63,6 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PREFIX = "/" + sys.argv[2]
 LOCKED = sys.argv[3] == "locked"
 PORT_FILE = sys.argv[1]
+SEEN = {"single": 0}
 
 
 def leak(h):
@@ -125,7 +132,24 @@ class H(BaseHTTPRequestHandler):
         tool_calls = None
         content = "PROBE-OK ZEBRA-7731 " + leak(self)
         last_text = last.get("content") if isinstance(last.get("content"), str) else ""
-        if "crate" in last_text:
+        if "ack: " in last_text and "carries label" in last_text:
+            # Single-message suite. First request: a tokens/minute 429 like the
+            # real upstream's. Then: drop labels in the middle fifth (a
+            # lost-in-the-middle model), report the newest port, obey the
+            # last-line rule.
+            SEEN["single"] += 1
+            if SEEN["single"] == 1:
+                return self.send(429, {"error": {"type": "rate_limit_exceeded", "retry_after_seconds": 0,
+                                                 "message": "You've reached the 500000 tokens/minute limit"}})
+            n = float(len(last_text))
+            lines = ["LABELS:"] + ["crate %s: %s" % (m.group(1), m.group(2))
+                                   for m in re.finditer(r"crate (\d+) carries label ([B-Z]{3}-[0-9]{3})", last_text)
+                                   if not 0.4 < m.start() / n < 0.6]
+            ports = re.findall(r"port (?:changed from \d+ to )?(\d{5})", last_text)
+            ack = re.search(r"`ack: ([a-z]+-[0-9]+)`", last_text)
+            content = "\n".join(lines + ["PORT: " + (ports[-1] if ports else "?"), leak(self),
+                                          "ack: " + (ack.group(1) if ack else "?")])
+        elif "crate" in last_text:
             # Memory suite: behave like an upstream that sees only the last
             # message (echo the crate labels found there).
             content = " ".join(re.findall(r"[B-Z]{3}-[0-9]{3}", last_text)) + " " + leak(self)
@@ -260,14 +284,17 @@ ok "T6 locked key aborts with a redacted hint"
 
 # --- T7: subcommand help ---
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe help 2>&1); rc=$?
-[[ $rc -eq 0 && "$out" == *"full "* && "$out" == *"memory "* && "$out" == *"help "* ]] \
+[[ $rc -eq 0 && "$out" == *"full "* && "$out" == *"memory "* && "$out" == *"optimize-single"* && "$out" == *"help "* ]] \
     || fail "T7 'probe help': rc=$rc out=$out"
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe memory --help 2>&1); rc=$?
 [[ $rc -eq 0 && "$out" == *"usage: harness probe memory"* && "$out" == *"--long-term"* ]] \
     || fail "T7 'probe memory --help': rc=$rc out=$out"
+out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe --optimize-single --help 2>&1); rc=$?
+[[ $rc -eq 0 && "$out" == *"usage: harness probe optimize-single"* && "$out" == *"--framings"* ]] \
+    || fail "T7 'probe --optimize-single --help': rc=$rc out=$out"
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe bogus 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"unknown probe subcommand"* ]] || fail "T7 unknown subcommand: rc=$rc out=$out"
-ok "T7 probe help / memory --help / unknown subcommand"
+ok "T7 probe help / memory --help / --optimize-single --help / unknown subcommand"
 
 # --- T8: memory suite against the mock ---
 rm -f "$TMP_ROOT"/state/output/probe-*.log
@@ -301,5 +328,46 @@ done
 grep -qF '"session_id": "<redacted>"' "$log" || fail "T9 passed-back session id not scrubbed in the log"
 grep -qF '### layout ' "$log" || fail "T9 memory log lacks the per-request layout lines"
 ok "T9 no secrets in the memory suite's stdout or log"
+
+# --- T10: single-message suite against the mock ---
+rm -f "$TMP_ROOT"/state/output/probe-*.log
+start_mock ok
+URL="http://127.0.0.1:${PORT}/${PREFIX}"
+out=$(PROXY_API_URL="$URL" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" HARNESS_PROBE_REDACT="$ORG" \
+      cmd_probe optimize-single --sizes 8k,32k --framing-sizes 16k --reps 1 --seed 7 --delay-scale 0 \
+      --timeout 20 2>&1); rc=$?
+stop_mock
+echo "$out" >"$TMP_ROOT/stdout-single.txt"
+[[ $rc -eq 0 ]] || { echo "$out" | tail -30; fail "T10 single probe exited $rc"; }
+for want in "=== harness probe optimize-single v" "--- A. join format x size" "--- B. framing x size" \
+            "rate limited (429), retrying" "port=ok" "ack=last" "inj=no" "=== single-message verdict ===" \
+            "by join format" "recall by depth in the message" "recall by the turn" "port update" \
+            "by framing" "=== recommendation for a future --single-message mode ===" "weak zone: " \
+            "suggested: format=" "full redacted request log: state/output/probe-single-" \
+            "=== end harness probe ==="; do
+    [[ "$out" == *"$want"* ]] || { echo "$out" | tail -60; fail "T10 missing '$want' in output"; }
+done
+# 5 formats x 2 sizes + 4 framings x 1 size, every one scored (the 429 was retried).
+n=$(grep -c ' | recall ' "$TMP_ROOT/stdout-single.txt")
+[[ $n -eq 14 ]] || { echo "$out" | tail -40; fail "T10 expected 14 scored requests, got $n"; }
+[[ "$out" != *" | ERR "* ]] || fail "T10 a request was recorded as an error"
+ok "T10 single-message suite exits 0 with both stages, verdict and recommendation"
+
+# --- T11: single suite redaction and log content ---
+log=$(ls "$TMP_ROOT"/state/output/probe-single-*.log 2>/dev/null | head -1)
+[[ -n "$log" && -s "$log" ]] || fail "T11 no single-suite log written under state/output"
+for f in "$TMP_ROOT/stdout-single.txt" "$log"; do
+    for secret in "$KEY" "PROBEKEY" "tok_PROB" "$PREFIX" "secretcorp" "admin" "10.1." "127.0" ":${PORT}" \
+                  "p-123456" "ASSISTSECRET" "$ORG" "unlock.secret"; do
+        if grep -qiF -- "$secret" "$f"; then
+            grep -niF -- "$secret" "$f" | head -3 >&2
+            fail "T11 secret '$secret' leaked into $(basename "$f")"
+        fi
+    done
+done
+for want in '### layout ' '### score ' '### example ' '### results ['; do
+    grep -qF -- "$want" "$log" || fail "T11 log lacks '$want'"
+done
+ok "T11 no secrets in the single suite's stdout or log; log has layouts, an example and results"
 
 echo "PROBE TEST PASSED"

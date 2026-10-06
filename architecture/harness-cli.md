@@ -892,9 +892,10 @@ breaks the recursion.
 
 `cmd_probe` runs `scripts/probe_upstream.py` (stdlib-only Python) straight
 against `PROXY_API_URL` with `PROXY_API_KEY`. The proxy is not involved.
-Subcommands: `full` (the default; bare `harness probe`), `memory`, and
-`help` (lists them); `<subcommand> --help` gives that suite's options. The
-subcommand reaches the script as `--suite full|memory`.
+Subcommands: `full` (the default; bare `harness probe`), `memory`,
+`optimize-single` (alias `--optimize-single`), and `help` (lists them);
+`<subcommand> --help` gives that suite's options. The subcommand reaches the
+script as `--suite full|memory|single`.
 
 The full suite characterizes the upstream for the question "could an agent
 talk to it directly?". Sections:
@@ -929,6 +930,41 @@ per request (role, chars and planted labels per message, wire bytes) and the
 reply, thinking trace and usage, capped at 20k chars; session ids appear
 only as a short hash, and pass-back fields (`session`, `session_id`,
 `conversation_id`) are scrubbed. Log: `state/output/probe-memory-<ts>.log`.
+
+**`harness probe optimize-single`** (`SingleProber`) tunes the input for a
+future single-message mode (the whole chat folded into one user message, since
+the upstream reads only the last one). Each request is a synthetic agent
+session rendered as ONE message: preamble, an instructions block (coding
+system prompt, a last-line `ack: <word>` rule, tool definitions), the
+transcript (user / assistant-with-tool-call / tool-result turns, tool output
+sized to hit the target length), and the current request. Planted in it: 24
+crate labels at stratified depths rotating across the three roles, a port
+stated early and changed at 30-95% depth, and an instruction inside a tool
+result. The reply is scored for label recall (and crate-number pairing), the
+newest port, the `ack` rule (anywhere / last line), obeying the injection, and
+foreign labels; composite = mean(recall, port ok, ack, not injected). Each
+fact's actual position is recorded as a fraction of the message.
+
+- **Stage A:** join formats `plain`, `xml`, `markers` (the proxy's
+  `<<<BEGIN_...>>>` delimiters), `markdown`, `json` (one object per turn) x
+  sizes (default 16k-600k chars) x `--reps` (default 6), shuffled per rep.
+- **Stage B:** framings on the stage-A winner: `end` (instructions,
+  chat, request), `instr-last`, `recap` (a short rules reminder before the
+  request, like the hybrid recency block), `sandwich` (request also first).
+
+Requests are independent and run `--parallel` (default 2) on threads, paced by
+`Pacer` to `--tpm` estimated tokens (chars/3) per 60 s; a 429 is waited out
+for its `retry_after_seconds` and retried (up to 6), a 5xx or timeout once,
+then counted as an error and left out of the quality stats. The verdict
+prints per-format and per-size tables with 95% intervals (normal for means,
+Wilson for rates), format x size grids, recall by depth decile x size, by
+role, port update by depth, the framing table, and a recommendation: best
+format (ties within 2 SE go to `markers`), the largest size within
+max(0.03, 2 SE) of the best size's composite, the best framing (ties go to
+`end`), weak depth bands, and a trimming order. The log has a layout and
+score line per request, one whole example message per format (smallest size,
+first rep), and a final `### results` JSON line with every sample. Log:
+`state/output/probe-single-<ts>.log`.
 
 **Redaction is the contract.** Every printed and logged string goes through
 `Redactor`, which removes:
