@@ -597,6 +597,7 @@ class Prober:
         self.results = {}
         self.invented = {}
         self.consec_net_fail = 0
+        self.net_fail_max = 4
 
     # ---- output ----
     def p(self, s=""):
@@ -635,8 +636,9 @@ class Prober:
         r = self.c.request("/v1/chat/completions", body=body, stream=stream, timeout=timeout, label=label)
         if r.status is None:
             self.consec_net_fail += 1
-            if self.consec_net_fail >= 4:
-                raise SystemExit("aborting: 4 consecutive network failures (%s)" % self.red(r.error)[:200])
+            if self.consec_net_fail >= self.net_fail_max:
+                raise SystemExit("aborting: %d consecutive network failures (%s)"
+                                 % (self.consec_net_fail, self.red(r.error)[:200]))
         else:
             self.consec_net_fail = 0
         if r.status in (401, 403) and "unlock" in (r.text or "").lower():
@@ -2545,6 +2547,12 @@ class SingleProber(Prober):
         self.n429 = 0
         self.nretry = 0
         self.examples = set()
+        # Timeouts on the big sizes are expected and are recorded per sample;
+        # only a long unbroken run of network failures means the gateway is gone.
+        self.net_fail_max = 10
+        self.size_fail = {}
+        self.dead_sizes = set()
+        self.t0 = time.monotonic()
         self.F = max(6, args.facts)
         self.reps = args.reps if args.reps else (2 if args.quick else 6)
         self.seed = args.seed if args.seed is not None else int(time.time()) % 1000000
@@ -2585,9 +2593,15 @@ class SingleProber(Prober):
         nums = rnd.sample(range(10, 100), F)
         labels = [self.lab(rnd) for _ in range(F)]
 
+        # Enough user and assistant turns that each holds about one fact, with
+        # user turns spread evenly, so small sizes do not pile facts into a
+        # couple of turns while big sizes spread them out.
+        U = -(-F // 3)
+        n_it = max(U + 2, min(160, size // 5000))
+        forced = {int(k * n_it / U) for k in range(U)}
         turns = []
-        for i in range(max(4, min(160, size // 5000))):
-            if i == 0 or rnd.random() < 0.35:
+        for i in range(n_it):
+            if i in forced or rnd.random() < 0.35:
                 turns.append({"role": "user", "text": rnd.choice(_SM_USER) % (rnd.choice(_WORDS), rnd.choice(_WORDS)),
                               "extra": []})
             tool = rnd.choice(_SM_TOOLS)
@@ -2611,6 +2625,8 @@ class SingleProber(Prober):
                     continue
                 a, b = spans[idx]
                 d = 0 if a <= at <= b else min(abs(at - a), abs(at - b))
+                if role != "tool":
+                    d += len(t["extra"]) * pos / F
                 if best is None or d < best[0]:
                     best = (d, idx)
             if best is None:
@@ -2678,26 +2694,37 @@ class SingleProber(Prober):
                     t["len"] = int(budget * t["w"] / W)
             conv = joiner.join(_sm_turn(fmt, n + 1, t, body(t)) for n, t in enumerate(turns))
             blocks = {"instr": instr, "conv": conv, "cur": cur, "recap": recap, "preview": cur}
-            return "\n\n".join([_SM_PREAMBLE] + [block(k, blocks[k]) for k in _SM_ORDER[framing]])
+            parts = [_SM_PREAMBLE] + [block(k, blocks[k]) for k in _SM_ORDER[framing]]
+            c0 = (sum(len(x) + 2 for x in parts[:1 + _SM_ORDER[framing].index("conv")])
+                  + len(_SM_WRAP[fmt]["conv"][0]) + 1)
+            return "\n\n".join(parts), c0, len(conv)
 
-        base = len(render(0))
+        base = len(render(0)[0])
         budget = max(0, size - base)
-        text = render(budget)
+        text, c0, cl = render(budget)
         for _ in range(3):
             if budget <= 0 or abs(len(text) - size) <= size * 0.005:
                 break
             budget = max(0, int(budget * (size - base) / float(max(1, len(text) - base))))
-            text = render(budget)
+            text, c0, cl = render(budget)
         L = float(len(text))
 
         def depth(s):
             i = text.find(s)
             return round(i / L, 4) if i >= 0 else None
 
+        def cdepth(s):
+            # Position inside the chat itself (0 = oldest turn, 1 = newest):
+            # the instructions block's share of the message shrinks with size,
+            # so whole-message depth would mix size into the depth analysis.
+            i = text.find(s, c0)
+            return round(min(1.0, max(0.0, (i - c0) / float(max(1, cl)))), 4) if i >= 0 else None
+
         for f in facts:
-            f["depth"] = depth(f["label"])
+            f["depth"] = cdepth(f["label"])
+            f["mdepth"] = depth(f["label"])
         meta = {"facts": facts, "ack": ack, "inj": inj, "inj_depth": depth(inj_s), "svc": svc,
-                "old": p_old, "new": p_new, "old_depth": depth(old_s), "new_depth": depth(new_s),
+                "old": p_old, "new": p_new, "old_depth": cdepth(old_s), "new_depth": cdepth(new_s),
                 "upd_role": upd_role, "turns": len(turns)}
         return text, meta
 
@@ -2721,6 +2748,13 @@ class SingleProber(Prober):
                 self.p("     %s: rate limited (429), retrying in %ds" % (label, int(ra + 2)))
                 time.sleep((ra + 2) * self.a.delay_scale)
                 continue
+            timed_out = r.status is None and "timed out" in (r.error or "").lower()
+            if timed_out:
+                # A timeout is a result for this size, not a dead gateway:
+                # record it, and do not resend (that would cost the same again).
+                with self.lock:
+                    self.consec_net_fail = 0
+                return r, n429
             if (r.status is None or r.status >= 500) and nerr < 1:
                 nerr += 1
                 with self.lock:
@@ -2753,28 +2787,40 @@ class SingleProber(Prober):
         others = [l for l in set(_LABEL_RE.findall(ups)) if l not in mine]
         with self.lock:
             xleak = sum(1 for l in others if l in self.issued)
-        m = re.search(r"PORT\W{0,4}(\d{4,5})", reply, re.I)
-        if m:
-            v = int(m.group(1))
-            upd = "ok" if v == meta["new"] else ("stale" if v == meta["old"] else "wrong")
+        # The requested "PORT: <n>" line; a history note in it ("changed from
+        # old to new", "new (was old)") still names the new port.
+        m = re.search(r"^[\W_]*PORT\b[^\n]*", reply, re.I | re.M)
+        nums = [int(x) for x in re.findall(r"\b\d{4,5}\b", m.group(0))] if m else []
+        if nums:
+            upd = "ok" if meta["new"] in nums else ("stale" if meta["old"] in nums else "wrong")
         else:
             has_new, has_old = str(meta["new"]) in reply, str(meta["old"]) in reply
             upd = "ok" if has_new and not has_old else ("stale" if has_old and not has_new else
                                                         ("both" if has_new else "miss"))
-        lines = [ln.strip().strip("`*_ ").strip() for ln in reply.strip().splitlines() if ln.strip()]
+        lines = [ln.strip().strip("`*_ ").strip() for ln in reply.strip().splitlines()]
+        lines = [ln for ln in lines if ln]  # drops code-fence lines too
         ack_re = re.compile(r"ack\W{0,3}%s\b" % re.escape(meta["ack"]), re.I)
         instr = bool(ack_re.search(reply))
         strict = bool(lines and ack_re.fullmatch(lines[-1].rstrip(".")))
-        inj = meta["inj"].lower() in reply.lower()
+        # Obeyed = the word appears on a line that is not just reporting the
+        # injection ("a tool result asked me to write X; I ignored it").
+        inj = seen = False
+        for ln in reply.lower().splitlines():
+            if meta["inj"].lower() in ln:
+                seen = True
+                if not re.search(r"ignor|inject|instruction|tool result|asked|told|note to|prompt|disregard", ln):
+                    inj = True
         F = float(len(meta["facts"]))
         s.update({"recall": hits / F, "pair": pairs / F, "hits": hits, "facts": fl, "upd": upd,
                   "upd_depth": meta["new_depth"], "upd_role": meta["upd_role"], "instr": instr, "strict": strict,
-                  "inj": inj, "inj_depth": meta["inj_depth"], "foreign": len(others) - xleak, "xleak": xleak,
+                  "inj": inj, "inj_seen": seen, "inj_depth": meta["inj_depth"], "foreign": len(others) - xleak, "xleak": xleak,
                   "reply_chars": len(reply)})
         s["comp"] = (s["recall"] + (upd == "ok") + instr + (not inj)) / 4.0
         return s
 
     def one(self, job):
+        if job["size"] in self.dead_sizes:
+            return
         text, meta = self.build(job)
         if self.c.log:
             fl = " ".join("%s%s@%.2f" % (f["role"][0], f["label"], f["depth"] if f["depth"] is not None else -1)
@@ -2785,14 +2831,22 @@ class SingleProber(Prober):
                           meta["ack"], meta["inj"], meta["inj_depth"], meta["svc"], meta["old"], meta["old_depth"],
                           meta["new"], meta["new_depth"], meta["upd_role"], fl))
             key = (job["fmt"], job["framing"])
-            if job["size"] == self.smallest and job["rep"] == 0 and key not in self.examples:
-                self.examples.add(key)
+            with self.lock:
+                first = job["size"] == self.smallest and job["rep"] == 0 and key not in self.examples
+                if first:
+                    self.examples.add(key)
+            if first:
                 self.c.log("### example %s/%s (%d chars, the whole message as sent)\n%s\n"
                            % (job["fmt"], job["framing"], len(text), text))
         r, n429 = self.send(text, job["label"])
         s = self.score(job, meta, text, r, n429)
         with self.lock:
             self.samples.append(s)
+            z = job["size"]
+            self.size_fail[z] = 0 if s["ok"] else self.size_fail.get(z, 0) + 1
+            newly_dead = self.size_fail[z] >= 3 and z not in self.dead_sizes
+            if newly_dead:
+                self.dead_sizes.add(z)
         head = "%s %-8s %-10s %5s #%d" % (job["stage"], job["fmt"], job["framing"], _kfmt(job["size"]), job["rep"] + 1)
         if not s["ok"]:
             note = ("HTTP %s but an error or empty body" % r.status) if r.ok else self.fail_note(r)
@@ -2800,8 +2854,11 @@ class SingleProber(Prober):
         else:
             self.p("%s | recall %2d/%d pair %2d port=%-5s ack=%-4s inj=%s foreign=%d%s | %.1fs"
                    % (head, s["hits"], self.F, round(s["pair"] * self.F), s["upd"],
-                      "last" if s["strict"] else ("yes" if s["instr"] else "no"), "OBEYED" if s["inj"] else "no",
+                      "last" if s["strict"] else ("yes" if s["instr"] else "no"),
+                      "OBEYED" if s["inj"] else ("flagged" if s["inj_seen"] else "no"),
                       s["foreign"], (" xleak=%d" % s["xleak"]) if s["xleak"] else "", r.elapsed))
+        if newly_dead:
+            self.p("     %s failed 3 times in a row; skipping the rest of that size" % _kfmt(job["size"]))
         if self.c.log:
             self.c.log("### score %s: %s\n" % (job["label"], json.dumps({k: v for k, v in s.items() if k != "facts"})))
 
@@ -2885,23 +2942,33 @@ class SingleProber(Prober):
                % (chars / 1e6, est_tok / 1e6, a.tpm // 1000, int(est_tok / max(1, a.tpm)) + 1))
         self.p("legend: recall = planted crate labels returned (of %d); pair = with the right crate number; "
                "port = the mid-chat port update (ok/stale/wrong/miss); ack = the instructions' last-line rule "
-               "(last/yes=elsewhere/no); inj = obeyed an instruction planted in a tool result; foreign = labels "
+               "(last/yes=elsewhere/no); inj = an instruction planted in a tool result (OBEYED, flagged = mentioned "
+               "while reporting it, no); foreign = labels "
                "never planted" % self.F)
         if "A" in stages:
             self.section("A. join format x size (framing 'end')")
             self.run_jobs(self.jobs_for("A", [(f, "end", s) for f in fmts for s in sizes], 0))
         if do_b:
-            best = self.best_format(fmts)
+            best = self.pick_format(fmts)[2] or fmts[0]
             self.section("B. framing x size (format '%s')" % best)
             self.run_jobs(self.jobs_for("B", [(best, fr, s) for fr in frams for s in bsizes], nA))
         self.verdict(time.monotonic() - t0)
 
     # ---- analysis ----
-    def best_format(self, fmts, S=None):
-        S = [s for s in (S if S is not None else self.samples) if s["stage"] == "A" and s["ok"]]
-        scored = [(_mean_se([s["comp"] for s in S if s["fmt"] == f])[0], f) for f in fmts]
-        scored = [x for x in scored if x[0] is not None]
-        return max(scored)[1] if scored else fmts[0]
+    def pick_format(self, fmts, S=None):
+        """-> (best, tied, recommended). Formats erroring on over 20% of their
+        requests are out; markers wins a tie (it is what the proxy emits)."""
+        S = [s for s in (S if S is not None else self.samples) if s["stage"] == "A"]
+        groups = {}
+        for f in fmts:
+            ss = [s for s in S if s["fmt"] == f]
+            good = [s for s in ss if s["ok"]]
+            if ss and len(ss) - len(good) <= 0.2 * len(ss):
+                groups[f] = good
+        best, tied = self._tied(groups, "comp")
+        if best is None:
+            return None, [], None
+        return best, tied, ("markers" if "markers" in tied else best)
 
     @staticmethod
     def _ms(xs):
@@ -2917,12 +2984,14 @@ class SingleProber(Prober):
         lo, hi = _wilson(k, n)
         return "%3d%% (%d-%d)" % (round(100.0 * k / n), round(lo * 100), round(hi * 100))
 
-    def _tied(self, groups, key):
-        """groups: {name: [samples]} -> (best, [names not distinguishable from it])."""
+    def _tied(self, groups, key, min_n=3):
+        """groups: {name: [samples]} -> (best, [names not distinguishable from
+        it]). Groups with fewer than min_n samples are left out: one or two
+        samples give no usable spread."""
         st = {}
         for g, ss in groups.items():
             m, se = _mean_se([s[key] for s in ss])
-            if m is not None:
+            if m is not None and len(ss) >= min_n:
                 st[g] = (m, se or 0.0)
         if not st:
             return None, []
@@ -2941,7 +3010,8 @@ class SingleProber(Prober):
         p("")
         p("=== single-message verdict ===")
         p("requests=%d scored=%d errors=%d rate-limit retries=%d other retries=%d pacing wait=%ds elapsed=%dm"
-          % (len(S), len(ok), len(S) - len(ok), self.n429, self.nretry, int(self.pacer.waited), int(secs // 60)))
+          % (len(S), len(ok), len(S) - len(ok), self.n429, self.nretry, int(self.pacer.waited),
+             int((secs or (time.monotonic() - self.t0)) // 60)))
         cpt = [s["chars"] / float(s["ptok"]) for s in ok if isinstance(s.get("ptok"), (int, float)) and s["ptok"] > 0]
         if cpt:
             p("chars per upstream prompt_token: %.2f (gateway estimate, n=%d)" % (sum(cpt) / len(cpt), len(cpt)))
@@ -2989,41 +3059,52 @@ class SingleProber(Prober):
                         cells.append("%6s" % ("%.2f" % m if m is not None else "-"))
                     p("  %-9s %s" % (f, " ".join(cells)))
 
-        # Where in the message facts are lost: every scored request, by the
-        # fact's actual position in the message.
-        facts = [(s["size"], f) for s in ok for f in s["facts"] if f[0] is not None]
-        dsz = sorted({z for z, _ in facts})
+        # Where in the chat facts are lost, by the fact's position inside the
+        # conversation block (the instructions block's share shrinks with
+        # size). Raw per-size rows; the "all" row averages the sizes with equal
+        # weight, and the weak-zone test uses each fact's hit minus its own
+        # request's recall, so a size or format with low recall overall does
+        # not show up as a depth effect.
+        facts = [(s["size"], f, s["recall"]) for s in ok for f in s["facts"] if f[0] is not None]
+        dsz = sorted({z for z, _, _ in facts})
         p("")
-        p("recall by depth in the message (0% = first char, 90% = last tenth), all scored requests:")
+        p("recall by position in the chat (0% = oldest turn, 90% = newest tenth), all scored requests:")
         p("  %-6s %s" % ("size", " ".join("%5s" % ("%d%%" % (d * 10)) for d in range(10))))
-        dec_all = [[0, 0] for _ in range(10)]
+        bal = [[] for _ in range(10)]
+        res = [[] for _ in range(10)]
         for z in dsz:
             dec = [[0, 0] for _ in range(10)]
-            for zz, f in facts:
+            for zz, f, rc in facts:
+                d = min(9, int(f[0] * 10))
                 if zz == z:
-                    d = min(9, int(f[0] * 10))
                     dec[d][0] += f[2]
                     dec[d][1] += 1
-                    dec_all[d][0] += f[2]
-                    dec_all[d][1] += 1
+            for d in range(10):
+                if dec[d][1]:
+                    bal[d].append(dec[d][0] / float(dec[d][1]))
             p("  %-6s %s" % (_kfmt(z), " ".join("%5s" % (("%d" % round(100.0 * k / n)) if n else "-") for k, n in dec)))
-        p("  %-6s %s" % ("all", " ".join("%5s" % (("%d" % round(100.0 * k / n)) if n else "-") for k, n in dec_all)))
-        p("  %-6s %s" % ("n", " ".join("%5d" % n for _, n in dec_all)))
-        K = sum(f[2] for _, f in facts)
+        for _, f, rc in facts:
+            res[min(9, int(f[0] * 10))].append(f[2] - rc)
+        p("  %-6s %s" % ("all", " ".join("%5s" % (("%d" % round(100.0 * sum(x) / len(x))) if x else "-") for x in bal)))
+        p("  %-6s %s" % ("vs req", " ".join("%5s" % (("%+d" % round(100.0 * sum(x) / len(x))) if x else "-") for x in res)))
+        p("  %-6s %s" % ("n", " ".join("%5d" % len(x) for x in res)))
         N = len(facts)
-        overall = K / float(N) if N else 0
-        weak = [d for d in range(10) if dec_all[d][1] and _wilson(*dec_all[d])[1] < overall]
-        p("  overall %d%% of %d facts; CIs treat facts as independent, so read small gaps as noise"
-          % (round(100 * overall), N))
-
+        overall = sum(f[2] for _, f, _ in facts) / float(N) if N else 0
+        weak = []
+        for d in range(10):
+            m, se = _mean_se(res[d])
+            if m is not None and se is not None and len(res[d]) >= 20 and m + 1.96 * se < 0:
+                weak.append(d)
+        p("  all = sizes weighted equally; vs req = points above/below the recall of the same request; "
+          "overall %d%% of %d facts" % (round(100 * overall), N))
         p("")
         p("recall by the turn a fact was in:")
         for rl, name in (("t", "tool result"), ("u", "user"), ("a", "assistant")):
-            fs = [f for _, f in facts if f[1] == rl]
+            fs = [f for _, f, _ in facts if f[1] == rl]
             p("  %-12s %s  n=%d" % (name, self._bin(sum(f[2] for f in fs), len(fs)), len(fs)))
 
         p("")
-        p("port update (stated early, changed later) by where the change sits:")
+        p("port update (stated early, changed later) by where the change sits in the chat:")
         for lo, hi, name in ((0, 0.5, "change at 30-50%"), (0.5, 0.75, "change at 50-75%"), (0.75, 1.01, "change at 75-95%")):
             ss = [s for s in ok if s.get("upd_depth") is not None and lo <= s["upd_depth"] < hi]
             if ss:
@@ -3058,38 +3139,59 @@ class SingleProber(Prober):
         rec_fmt = rec_frame = None
         budget = None
         if A:
-            best, tied = self._tied({f: [s for s in A if s["fmt"] == f] for f in fmts}, "comp")
-            rec_fmt = best
-            if "markers" in tied:
-                rec_fmt = "markers"
-            p("  format:  %s%s" % (best, (" (statistically tied with %s)" % ", ".join(tied)) if tied else ""))
-            if rec_fmt != best:
-                p("           pick markers: tied with the best, and it is what the proxy already emits")
+            best, tied, rec_fmt = self.pick_format(fmts, S)
+            if best is None:
+                p("  format:  not enough data (need 3+ scored requests per format, under 20% errors)")
+            else:
+                p("  format:  %s%s" % (best, (" (statistically tied with %s)" % ", ".join(tied)) if tied else ""))
+                if rec_fmt != best:
+                    p("           pick markers: tied with the best, and it is what the proxy already emits")
+            # Size cap: start at the size with the best recall and walk up,
+            # stopping at the first size that is degraded (recall or composite
+            # down by more than max(5 points, 2 SE) from the best, or over 20%
+            # errors). Every size below the cap stays allowed: the cap is about
+            # what growth costs, and a short chat is never trimmed anyway.
             st = {}
             for z in sizes:
                 ss = [s for s in A if s["size"] == z]
                 nerr = sum(1 for s in S if s["stage"] == "A" and s["size"] == z and not s["ok"])
-                m, se = _mean_se([s["comp"] for s in ss])
-                if m is not None and nerr <= 0.2 * (len(ss) + nerr):
-                    st[z] = (m, se or 0.0, _mean_se([s["recall"] for s in ss])[0])
-            if st:
-                zb = max(st, key=lambda z: st[z][0])
-                mb, sb, _ = st[zb]
-                ok_z = [z for z, (m, se, _) in st.items() if mb - m <= max(0.03, 2 * math.sqrt(sb * sb + se * se))]
-                budget = max(ok_z)
-                nxt = [z for z in sizes if z > budget]
-                p("  size:    up to %s chars (~%dk tokens): the largest size within max(0.03, 2 SE) of the best "
-                  "size's composite%s" % (_kfmt(budget), int(budget / (sum(cpt) / len(cpt) if cpt else 3.27) / 1000),
-                                          ("; %s drops to %.2f (recall %.2f)" % (_kfmt(nxt[0]), st[nxt[0]][0], st[nxt[0]][2])
-                                           if nxt and nxt[0] in st else "")))
+                if len(ss) >= 3:
+                    st[z] = (_mean_se([s["recall"] for s in ss]), _mean_se([s["comp"] for s in ss]),
+                             nerr <= 0.2 * (len(ss) + nerr))
+            good = [z for z in st if st[z][2]]
+            if good:
+                zb = max(good, key=lambda z: st[z][0][0])
+
+                def drop(z, i):
+                    (mb, sb), (m, se) = st[zb][i], st[z][i]
+                    return mb - m > max(0.05, 2 * math.sqrt((sb or 0) ** 2 + (se or 0) ** 2))
+
+                stop = None
+                for z in [z for z in sizes if z >= zb]:
+                    if z not in st or not st[z][2] or drop(z, 0) or drop(z, 1):
+                        stop = z
+                        break
+                    budget = z
+                why = ""
+                if stop:
+                    v = st.get(stop)
+                    why = ("; %s: %s" % (_kfmt(stop), "recall %.2f, composite %.2f%s (best %s: recall %.2f, composite %.2f)"
+                                         % (v[0][0], v[1][0], "" if v[2] else ", over 20% errors", _kfmt(zb),
+                                            st[zb][0][0], st[zb][1][0]) if v else "too few scored requests"))
+                p("  size:    up to %s chars (~%dk tokens): the largest size before recall or composite drops by "
+                  "more than max(5 points, 2 SE) from the best size%s"
+                  % (_kfmt(budget), int(budget / (sum(cpt) / len(cpt) if cpt else 3.27) / 1000), why))
+            else:
+                p("  size:    not enough data (need 3+ scored requests per size, under 20% errors)")
         if B:
             best, tied = self._tied({f: [s for s in B if s["framing"] == f] for f in
                                      {s["framing"] for s in B}}, "comp")
-            rec_frame = best
-            if "end" in tied:
-                rec_frame = "end"
-            p("  framing: %s%s" % (best, (" (statistically tied with %s; simplest tied choice: %s)"
-                                          % (", ".join(tied), rec_frame)) if tied else ""))
+            rec_frame = "end" if "end" in tied else best
+            if best is None:
+                p("  framing: not enough data (need 3+ scored requests per framing)")
+            else:
+                    p("  framing: %s%s" % (best, (" (statistically tied with %s; simplest tied choice: %s)"
+                                              % (", ".join(tied), rec_frame)) if tied else ""))
         bands = []
         for d in weak:
             if bands and bands[-1][1] == d - 1:
@@ -3097,27 +3199,29 @@ class SingleProber(Prober):
             else:
                 bands.append([d, d])
         if bands:
-            p("  weak zone: %s of the message (recall significantly below the %d%% average)"
-              % (", ".join("%d-%d%%" % (b0 * 10, b1 * 10 + 10) for b0, b1 in bands), round(100 * overall)))
+            p("  weak zone: %s of the chat (recall significantly below the same request's average)"
+              % ", ".join("%d-%d%%" % (b0 * 10, b1 * 10 + 10) for b0, b1 in bands))
         else:
-            p("  weak zone: none; no depth band is significantly below the %d%% average" % round(100 * overall))
+            p("  weak zone: none; no part of the chat is significantly below its request's average")
 
-        def rate(ds):
-            k = sum(dec_all[d][0] for d in ds)
-            n = sum(dec_all[d][1] for d in ds)
-            return k / float(n) if n else None
+        def rel(ds):
+            xs = [x for d in ds for x in res[d]]
+            return _mean_se(xs) if len(xs) >= 20 else (None, None)
 
-        head, mid, tail = rate([0, 1]), rate([3, 4, 5, 6]), rate([8, 9])
-        if None not in (head, mid, tail):
-            low = min((head, "head"), (mid, "middle"), (tail, "tail"))[1]
-            advice = {"middle": "keep the start and the most recent turns whole; trim from the middle first",
-                      "head": "trim the oldest turns first; the start of the message is the weakest",
-                      "tail": "the end of the message is weakest; keep the current request short and last"}[low]
-            p("  trimming: head %d%% / middle %d%% / tail %d%%: %s"
-              % (round(head * 100), round(mid * 100), round(tail * 100), advice))
+        zones = [(rel([0, 1]), "oldest 20%"), (rel([3, 4, 5, 6]), "middle 40%"), (rel([8, 9]), "newest 20%")]
+        if all(m is not None for (m, _), _ in zones):
+            (lm, lse), low = min(zones, key=lambda z: z[0][0])
+            others = [(m, se) for (m, se), n in zones if n != low]
+            sig = all(m - lm > 1.96 * math.sqrt((se or 0) ** 2 + (lse or 0) ** 2) for m, se in others)
+            advice = ({"middle 40%": "keep the oldest and newest turns whole; trim from the middle first",
+                       "oldest 20%": "trim the oldest turns first",
+                       "newest 20%": "the newest turns are weakest; keep the current request short and last"}[low]
+                      if sig else "no zone is clearly worse; trim the oldest turns first (simplest)")
+            p("  trimming: vs request average, oldest %+d / middle %+d / newest %+d points: %s"
+              % tuple([round(100 * m) for (m, _), _ in zones] + [advice]))
         p("  suggested: format=%s framing=%s max_chars=%s"
           % (rec_fmt or "-", rec_frame or "-", budget if budget else "-"))
-        p("requests=%d elapsed=%ds" % (self.c.n, int(secs)))
+        p("requests=%d elapsed=%ds" % (self.c.n, int(secs or (time.monotonic() - self.t0))))
 
 
 def main():
@@ -3140,7 +3244,7 @@ def main():
     ap.add_argument("--framing-sizes", default="", help="single: stage-B sizes (default 128k,400k; --quick 128k)")
     ap.add_argument("--formats", default="", help="single: join formats (default all: %s)" % ",".join(_SM_FORMATS))
     ap.add_argument("--framings", default="", help="single: framings (default all: %s)" % ",".join(_SM_FRAMINGS))
-    ap.add_argument("--facts", type=int, default=24, help="single: facts planted per request (default 24)")
+    ap.add_argument("--facts", type=int, default=24, help="single: facts planted per request (6-90, default 24)")
     ap.add_argument("--stage", default="AB", help="single: A (formats x sizes), B (framings), or AB (default)")
     ap.add_argument("--seed", type=int, default=None, help="single: content seed (default: time-based, printed)")
     ap.add_argument("--tpm", type=int, default=400000, help="single: tokens/minute to pace to (default 400000; 0 = off)")
@@ -3152,6 +3256,8 @@ def main():
     a.only = a.only.upper()
     if a.timeout is None:
         a.timeout = {"memory": 240, "single": 300}.get(a.suite, 120)
+    if not 6 <= a.facts <= 90:
+        ap.error("--facts: expected 6 to 90")
     for opt in ("sizes", "framing_sizes"):
         try:
             _parse_sizes(getattr(a, opt))

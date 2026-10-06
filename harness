@@ -1830,7 +1830,7 @@ Stage A crosses join formats (plain, xml, markers, markdown, json) with
 sizes (16k..600k chars); stage B tries framings (end, instr-last, recap,
 sandwich) on the stage-A winner. Requests are shuffled and repeated so
 each cell is a real sample; the verdict prints 95% intervals, recall by
-depth, and a suggested format / size / framing for a future
+position in the chat, and a suggested format / size / framing for a future
 '--single-message' mode.
 
 Default run: about 230 requests, ~17M tokens, about an hour, paced under

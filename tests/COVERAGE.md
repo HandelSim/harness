@@ -62,7 +62,9 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   502s above 100 KB) with the same redaction checks plus the scrubbed session pass-back,
   and a `harness probe optimize-single` run at small sizes (the mock 429s once, drops
   labels in the middle fifth, reports the newest port and obeys the `ack` rule) checking
-  both stages, the 429 retry, the verdict and recommendation, and redaction.
+  both stages, the 429 retry, the verdict (a weak zone found, every pick made) and
+  redaction, plus the single-suite scorer on tricky replies (port line with history,
+  fenced ack, an injection reported rather than obeyed).
 - `tests/scheme_contract_test.sh` (407 lines, Track E) — per-scheme proxy contract test.
   Brings up proxy + mock upstream and for each `PROXY_PROMPT_MODE` value drives
   a probe through the proxy's OpenAI-compatible interface; asserts forwarded-body structure.

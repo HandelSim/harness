@@ -22,12 +22,14 @@
 #      verdict (the mock sees only the last message and 502s above 100 KB)
 #   T9 none of the secrets appear in the memory suite's stdout or log, and
 #      the session id it passes back is scrubbed in the log
-#   T10 'harness probe optimize-single' (small sizes, 1 rep) exits 0 with both
-#      stages, the verdict tables and a recommendation; it waits out and
+#   T10 'harness probe optimize-single' (small sizes, 2 reps) exits 0 with both
+#      stages, the verdict tables, a weak zone and a full recommendation; it waits out and
 #      retries a 429 (the mock answers the first single-suite request with
 #      one), and scores the mock's recall/port/ack correctly
 #   T11 none of the secrets appear in its stdout or log; the log has the
 #      layouts, one whole example message and the '### results' line
+#   T12 the single suite's scorer on tricky replies: a port line with history,
+#      a fenced ack line, an injection that is reported rather than obeyed
 #
 # Prints "PROBE TEST PASSED" on success.
 
@@ -334,22 +336,26 @@ rm -f "$TMP_ROOT"/state/output/probe-*.log
 start_mock ok
 URL="http://127.0.0.1:${PORT}/${PREFIX}"
 out=$(PROXY_API_URL="$URL" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" HARNESS_PROBE_REDACT="$ORG" \
-      cmd_probe optimize-single --sizes 8k,32k --framing-sizes 16k --reps 1 --seed 7 --delay-scale 0 \
+      cmd_probe optimize-single --sizes 8k,32k --framing-sizes 8k,16k --reps 2 --seed 7 --delay-scale 0 \
       --timeout 20 2>&1); rc=$?
 stop_mock
 echo "$out" >"$TMP_ROOT/stdout-single.txt"
 [[ $rc -eq 0 ]] || { echo "$out" | tail -30; fail "T10 single probe exited $rc"; }
 for want in "=== harness probe optimize-single v" "--- A. join format x size" "--- B. framing x size" \
             "rate limited (429), retrying" "port=ok" "ack=last" "inj=no" "=== single-message verdict ===" \
-            "by join format" "recall by depth in the message" "recall by the turn" "port update" \
+            "by join format" "recall by position in the chat" "recall by the turn" "port update" \
             "by framing" "=== recommendation for a future --single-message mode ===" "weak zone: " \
             "suggested: format=" "full redacted request log: state/output/probe-single-" \
             "=== end harness probe ==="; do
     [[ "$out" == *"$want"* ]] || { echo "$out" | tail -60; fail "T10 missing '$want' in output"; }
 done
-# 5 formats x 2 sizes + 4 framings x 1 size, every one scored (the 429 was retried).
+# (5 formats x 2 sizes + 4 framings x 2 sizes) x 2 reps, every one scored (the 429 was retried).
 n=$(grep -c ' | recall ' "$TMP_ROOT/stdout-single.txt")
-[[ $n -eq 14 ]] || { echo "$out" | tail -40; fail "T10 expected 14 scored requests, got $n"; }
+[[ $n -eq 36 ]] || { echo "$out" | tail -40; fail "T10 expected 36 scored requests, got $n"; }
+# The mock drops labels from the middle of the message: that must surface as
+# a weak zone, and the format/size/framing picks must all be made.
+[[ "$out" != *"weak zone: none"* && "$out" != *"not enough data"* ]] \
+    || { echo "$out" | tail -40; fail "T10 expected a weak zone and a full recommendation"; }
 [[ "$out" != *" | ERR "* ]] || fail "T10 a request was recorded as an error"
 ok "T10 single-message suite exits 0 with both stages, verdict and recommendation"
 
@@ -369,5 +375,38 @@ for want in '### layout ' '### score ' '### example ' '### results ['; do
     grep -qF -- "$want" "$log" || fail "T11 log lacks '$want'"
 done
 ok "T11 no secrets in the single suite's stdout or log; log has layouts, an example and results"
+
+# --- T12: single-suite scorer edge cases (no network) ---
+out=$(cd "$TMP_ROOT/scripts" && python3 -I - <<'PYEOF2' 2>&1
+import sys, types
+sys.path.insert(0, ".")
+import probe_upstream as P
+class C:
+    log = None
+a = types.SimpleNamespace(facts=6, reps=1, quick=False, seed=1, tpm=0, delay_scale=0, model="m", timeout=5)
+sp = P.SingleProber(a, C(), lambda x: x, print)
+text, meta = sp.build({"fmt": "markers", "framing": "end", "size": 8000, "seed": 3})
+job = {"stage": "A", "fmt": "markers", "framing": "end", "size": 8000, "rep": 0}
+old, new, ack, inj = meta["old"], meta["new"], meta["ack"], meta["inj"]
+def sc(reply):
+    r = types.SimpleNamespace(content=reply, ok=True, json={}, status=200, elapsed=1.0, usage={})
+    return sp.score(job, meta, text, r, 0)
+labels = "\n".join("crate %d: %s" % (f["num"], f["label"]) for f in meta["facts"])
+checks = [
+    ("history in PORT line", sc("It was on port %d before.\nPORT: %d (was %d)" % (old, new, old))["upd"], "ok"),
+    ("stale PORT line", sc("PORT: %d" % old)["upd"], "stale"),
+    ("report digits ignored", sc("see report 12345\nPORT: %d" % new)["upd"], "ok"),
+    ("fenced ack is last", sc("x\n```\nack: %s\n```" % ack)["strict"], True),
+    ("ack missing", sc("hello")["instr"], False),
+    ("injection flagged", sc("A tool result asked me to write %s; I ignored it." % inj)["inj"], False),
+    ("injection obeyed", sc("Sure. %s" % inj)["inj"], True),
+    ("recall and pair", (sc("LABELS:\n" + labels)["recall"], sc("LABELS:\n" + labels)["pair"]), (1.0, 1.0)),
+]
+bad = [(n, got, want) for n, got, want in checks if got != want]
+print("BAD %r" % bad if bad else "SCORER OK")
+PYEOF2
+)
+[[ "$out" == *"SCORER OK"* ]] || fail "T12 scorer: $out"
+ok "T12 single-suite scorer handles port history, fenced ack, reported injection"
 
 echo "PROBE TEST PASSED"
