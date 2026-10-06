@@ -93,7 +93,7 @@ separate `build_cooperative_prompt_*` functions, plus one bypass mode.
 `PROXY_PROMPT_MODE` is **not a user `.env` knob**. The proxy defaults to
 `hybrid` and `docker-compose.yml` no longer interpolates the var (so a stale
 `.env` can't silently override the default). It is still honored from the
-proxy's *container* env so all three modes stay reachable for benchmarking and
+proxy's *container* env (host mode: the host proxy's env) so every mode stays reachable for benchmarking and
 power use: `harness start/restart --prompt-mode <mode>` injects it ephemerally
 via the runtime override (see [`harness-cli.md`](harness-cli.md)), and the
 benchmark stack supplies it through its own compose overrides / the same flag
@@ -215,8 +215,30 @@ validator in `_setup_prompt_mode` accepts:
   Note that the agent's OpenAI-format function-tool schemas typically aren't
   honored by these upstreams on this endpoint, so this mode often results in
   the model not using tools at all; that mismatch IS the data point.
+- **`single`** — opt-in experiment (`--single-message`, = `--prompt-mode
+  single` on `harness host/start/restart`). Builds exactly the hybrid content
+  (same branch of `translate_history_and_apply_prompt`), then
+  `_fold_single_message` returns ONE user message instead of the
+  multi-message array, skipping the sys→user stub. Why: the upstream shows the
+  model only the last message ([`upstream-api.md`](upstream-api.md)), so
+  hybrid's message-0 tool block and all earlier turns never reach it. Layout
+  is the one `harness probe optimize-single` measured best: a
+  `[request <12 hex>]` line (fresh per request; the gateway keys its hidden
+  session on message 0, so without it benchmark repeats that open with the
+  same turn would share a server session), a short preamble,
+  `<instructions>` (hybrid message 0 verbatim), `<conversation>` (each
+  history message verbatim inside `<turn n=".." role="user|assistant|tool">`,
+  oldest first; omitted on the first turn), then `<current_turn>` (the
+  hybrid recency block). Bodies keep their markers and ```json tool calls,
+  so the A/B against hybrid compares packaging only. Above
+  `_SINGLE_MAX_CHARS` (600000, env `PROXY_SINGLE_MAX_CHARS`) the oldest turns
+  are dropped first behind an `[N earlier turn(s) omitted ...]` note;
+  instructions and the current turn are never cut. Retries and require-tool
+  re-asks go through the same translate, so they fold too. Require-tool stays
+  on. Compare against hybrid with `harness benchmark --test-modes`.
 
-Invalid or absent values fall back to `hybrid` with a warning — including the
+Invalid values fall back to `hybrid` with a warning (absent or empty is
+silently `hybrid`; host mode always passes the var, blank by default) — including the
 legacy `user_front`/`user` value a stale `.env` might still carry, since the
 var is no longer fed to the proxy from `.env`. Three older modes (`user`,
 `system`, `user_bookend`) were removed in the hybrid-consolidation refactor

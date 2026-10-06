@@ -258,8 +258,9 @@ and never tracked. It carries two things:
    firewall init script short-circuits on that variable. We never replace
    the service's entrypoint or remove its `cap_add`.
 2. **Ephemeral `--prompt-mode`** — `harness start/restart --prompt-mode
-   <mode>` (`_parse_start_flags` validates `hybrid`/`user_front`/
-   `passthrough`) sets the `prompt_mode_override` global, which adds
+   <mode>` (`_parse_start_flags` → `_validate_prompt_mode_override` accepts
+   `hybrid`/`user_front`/`passthrough`/`single`; `--single-message` is
+   shorthand for `--prompt-mode single`) sets the `prompt_mode_override` global, which adds
    `environment: PROXY_PROMPT_MODE: "<mode>"` onto the proxy service. This is
    the only path that sets `PROXY_PROMPT_MODE` for the proxy now that
    `docker-compose.yml` no longer interpolates it (a stale `.env` value is
@@ -599,7 +600,12 @@ What it does, in order:
    running from before it became the default (whose fingerprint lacks the
    line) is restarted once instead of reused, while one started with the old
    `--require-tool` flag still matches. A leftover `HARNESS_REQUIRE_TOOL` in
-   `.env` does not affect it. Folding the requirements content in matters because the reuse
+   `.env` does not affect it. A `promptmode=<mode>` line is appended **only**
+   when `harness host --single-message` / `--prompt-mode M` set
+   `prompt_mode_override` (exported to the host proxy as `PROXY_PROMPT_MODE`,
+   blank by default), so a default launch hashes as before, while switching
+   modes in either direction restarts the proxy; a plain `harness host` after a
+   `--single-message` run therefore comes back on hybrid. Folding the requirements content in matters because the reuse
    short-circuit returns *before* `host_proxy_ensure_venv`, so an `upgrade` that
    bumps a proxy dep restarts the running proxy onto the rebuilt venv instead of
    leaving it on stale deps. `host_proxy_wait_ready`

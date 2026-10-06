@@ -448,7 +448,23 @@ _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 #                  rewrite, no history translation. Forwards tools to
 #                  upstream verbatim. Not a cooperative mode; used to
 #                  measure what harness's mediation contributes.
+#   "single"     — Opt-in experiment (`--single-message`). Builds exactly the
+#                  hybrid content (instructions + tool block, wrapped history,
+#                  recency reminder), then folds it into ONE user message
+#                  (see _fold_single_message). The upstream only shows the
+#                  model the last message (architecture/upstream-api.md), so
+#                  hybrid's message 0 tools and earlier turns never reach it;
+#                  single puts them all in the message that does.
 _PROMPT_MODE: str = "hybrid"  # set in main() before serving
+_PROMPT_MODES = ("hybrid", "user_front", "passthrough", "single")
+
+# Single mode only. Above this many characters the fold drops the OLDEST
+# conversation turns first (instructions and the current turn are always
+# kept). `harness probe optimize-single` saw whole-message recall hold to
+# 700k chars and its first misses from ~256k in other formats; 600k keeps
+# a margin under the largest size it verified. Override with
+# PROXY_SINGLE_MAX_CHARS (a positive integer).
+_SINGLE_MAX_CHARS: int = 600000
 
 # Hybrid mode only. Per-tool recency guidance for MCP tools, loaded at startup
 # from the HARNESS_MCP_TOOL_RECENCY env var (a JSON object keyed `<server>_<tool>`
@@ -729,8 +745,10 @@ def _setup_prompt_mode() -> None:
     when `harness start/restart --prompt-mode <mode>` injects it for a
     benchmark/power launch. Invalid or absent values fall back to 'hybrid'."""
     global _PROMPT_MODE
-    raw = os.environ.get("PROXY_PROMPT_MODE", "hybrid").strip().lower()
-    valid = ("hybrid", "user_front", "passthrough")
+    global _SINGLE_MAX_CHARS
+    # Empty counts as unset: host mode always passes the var, blank by default.
+    raw = (os.environ.get("PROXY_PROMPT_MODE", "") or "hybrid").strip().lower() or "hybrid"
+    valid = _PROMPT_MODES
     if raw not in valid:
         print(
             f"[!] PROXY_PROMPT_MODE='{raw}' is not one of "
@@ -739,6 +757,18 @@ def _setup_prompt_mode() -> None:
         )
         raw = "hybrid"
     _PROMPT_MODE = raw
+    cap = os.environ.get("PROXY_SINGLE_MAX_CHARS", "").strip()
+    if cap:
+        try:
+            if int(cap) <= 0:
+                raise ValueError
+            _SINGLE_MAX_CHARS = int(cap)
+        except ValueError:
+            print(
+                f"[!] PROXY_SINGLE_MAX_CHARS='{cap}' is not a positive integer; "
+                f"keeping {_SINGLE_MAX_CHARS}",
+                flush=True,
+            )
 
 
 def _setup_host_os() -> None:
@@ -2164,6 +2194,84 @@ def _flatten_content_to_str(content):
     return str(content)
 
 
+_SINGLE_PREAMBLE = (
+    "You are an AI coding assistant continuing a session. This single message holds "
+    "your instructions, the whole conversation so far, and the current turn (a user "
+    "message or a tool result). Earlier turns are context; respond only to the "
+    "current turn, following the instructions."
+)
+
+
+def _fold_single_message(messages: List[Dict[str, Any]]) -> str:
+    """Single mode: fold the translated hybrid history into one user message.
+
+    Layout is what `harness probe optimize-single` measured best: xml join
+    format, "end" framing (instructions, then the conversation oldest first,
+    then the current turn). `messages` is the hybrid output before the
+    sys→user post-pass: an optional system message at index 0 (agent
+    instructions + harness tool block), the history, and the last user-role
+    message carrying the recency reminder. Turn bodies are kept verbatim, so
+    the markers the instructions and reminder refer to (USER_MESSAGE,
+    TOOL_RESULT, ```json tool calls) are unchanged.
+
+    A fresh request id leads the message. The gateway keys its hidden
+    session on message 0, so without it two runs that open with the same
+    first turn (benchmark repeats) would resume one server session.
+
+    Above _SINGLE_MAX_CHARS the oldest turns are dropped first and a note
+    says how many; instructions and the current turn are never cut.
+    """
+    msgs = list(messages)
+    instructions = ""
+    if msgs and msgs[0]["role"] == "system":
+        instructions = _flatten_content_to_str(msgs[0]["content"])
+        msgs = msgs[1:]
+    current = ""
+    if msgs and msgs[-1]["role"] == "user":
+        current = _flatten_content_to_str(msgs[-1]["content"])
+        msgs = msgs[:-1]
+
+    turns = []
+    for n, m in enumerate(msgs, 1):
+        body = _flatten_content_to_str(m["content"])
+        role = m["role"]
+        if role == "user" and body.startswith("<<<BEGIN_TOOL_RESULT"):
+            role = "tool"
+        turns.append(f'<turn n="{n}" role="{role}">\n{body}\n</turn>')
+
+    head = f"[request {uuid.uuid4().hex[:12]}]\n{_SINGLE_PREAMBLE}"
+
+    def render(kept: List[str], dropped: int) -> str:
+        parts = [head]
+        if instructions.strip():
+            parts.append(f"<instructions>\n{instructions}\n</instructions>")
+        if kept or dropped:
+            conv = list(kept)
+            if dropped:
+                conv.insert(0, f"[{dropped} earlier turn(s) omitted to fit the size limit]")
+            parts.append("<conversation>\n" + "\n\n".join(conv) + "\n</conversation>")
+        if current:
+            parts.append(f"<current_turn>\n{current}\n</current_turn>")
+        return "\n\n".join(parts)
+
+    text = render(turns, 0)
+    if len(text) <= _SINGLE_MAX_CHARS:
+        return text
+    # Drop from the oldest end until it fits. Lengths are summed rather than
+    # re-rendered per step so a long history stays linear.
+    fixed = len(render([], 1))
+    budget = _SINGLE_MAX_CHARS - fixed
+    keep_from = len(turns)
+    used = 0
+    while keep_from > 0:
+        cost = len(turns[keep_from - 1]) + 2
+        if used + cost > budget:
+            break
+        used += cost
+        keep_from -= 1
+    return render(turns[keep_from:], keep_from)
+
+
 def translate_history_and_apply_prompt(
     original_messages: List[Dict[str, Any]],
     tools_text: str,
@@ -2310,7 +2418,9 @@ def translate_history_and_apply_prompt(
                     messages[-1]["content"] = build_cooperative_prompt_tool_front(final_content, tools_text)
                 else:
                     messages[-1]["content"] = build_cooperative_prompt_user_front(final_content, tools_text)
-        elif _PROMPT_MODE == "hybrid":
+        elif _PROMPT_MODE in ("hybrid", "single"):
+            # Single mode builds this same hybrid content and only folds it
+            # into one message at the end (_fold_single_message).
             # Hybrid: full tool definitions go on the system message (stable
             # prefix). Tool-result-converted role:"tool" entries already became
             # user messages wrapped in <<<BEGIN_TOOL_RESULT>>> markers above;
@@ -2417,6 +2527,9 @@ def translate_history_and_apply_prompt(
                     working_directory=working_directory,
                     todos=todos,
                 )
+
+    if _PROMPT_MODE == "single":
+        return [{"role": "user", "content": _fold_single_message(messages)}]
 
     # Convert system role to user role if configured. Some upstream APIs
     # silently drop the system role; this rewrites system content as a

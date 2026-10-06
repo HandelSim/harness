@@ -2433,19 +2433,22 @@ Running 'harness' with no command — or with only agent flags such as --yolo,
 With no docker or podman installed it says so and runs 'harness host' instead.
 
 commands:
-  start [--prompt-mode M]
+  start [--prompt-mode M | --single-message]
                         build and bring up the proxy service.
                         Run automatically by bare 'harness'; rarely needed
                         by hand. --prompt-mode sets the proxy's cooperative-
                         prompt mode (hybrid (default) / user_front /
-                        passthrough) for THIS launch only — ephemeral, for
-                        benchmarking/power use; a later bare start reverts to
-                        hybrid. The proxy always runs in require-tool mode
+                        passthrough / single) for THIS launch only — ephemeral,
+                        for benchmarking/power use; a later bare start reverts
+                        to hybrid. --single-message = --prompt-mode single:
+                        the whole chat folded into one upstream message
+                        (experimental; compare with 'harness benchmark
+                        --test-modes'). The proxy always runs in require-tool mode
                         (except under passthrough): every assistant message
                         must carry a tool call, and the only way to end a
                         turn is the synthetic 'finish' tool.
   down                  stop the proxy service (does NOT touch agents)
-  restart [--prompt-mode M]
+  restart [--prompt-mode M | --single-message]
                         down + start (preserves per-invocation state).
                         Accepts the same flags as start.
   update                git pull --ff-only in the clone
@@ -2591,7 +2594,8 @@ EOF
 }
 
 # Parse start/restart's optional flag and set the matching global:
-# `--prompt-mode <mode>` (validated against the three modes the proxy accepts).
+# `--prompt-mode <mode>` (validated against the four modes the proxy accepts);
+# `--single-message` is shorthand for `--prompt-mode single`.
 # Ephemeral — see prompt_mode_override and write_runtime_override.
 # `--require-tool` is still accepted and ignored: it is the default now, and
 # scripts written when it was opt-in keep working. Any other argument is
@@ -2604,29 +2608,37 @@ _parse_start_flags() {
                 shift
                 prompt_mode_override="${1:-}"
                 if [[ -z "$prompt_mode_override" ]]; then
-                    err "--prompt-mode requires a value (hybrid, user_front, or passthrough)"
+                    err "--prompt-mode requires a value (hybrid, user_front, passthrough, or single)"
                     exit 1
                 fi
                 ;;
             --prompt-mode=*)
                 prompt_mode_override="${1#--prompt-mode=}"
                 ;;
+            --single-message)
+                prompt_mode_override="single"
+                ;;
             --require-tool)
                 ;;
             *)
-                err "unknown option '$1' (start/restart accept only --prompt-mode <mode>)"
+                err "unknown option '$1' (start/restart accept only --prompt-mode <mode> or --single-message)"
                 exit 1
                 ;;
         esac
         shift
     done
+    _validate_prompt_mode_override || exit 1
+}
+
+# Validate prompt_mode_override against the modes the proxy accepts. Shared by
+# start/restart and `harness host`. `single` is the opt-in single-message fold
+# (`--single-message`); hybrid stays the default when nothing is passed.
+_validate_prompt_mode_override() {
     case "$prompt_mode_override" in
-        ""|hybrid|user_front|passthrough) ;;
-        *)
-            err "invalid --prompt-mode '$prompt_mode_override' (expected hybrid, user_front, or passthrough)"
-            exit 1
-            ;;
+        ""|hybrid|user_front|passthrough|single) return 0 ;;
     esac
+    err "invalid --prompt-mode '$prompt_mode_override' (expected hybrid, user_front, passthrough, or single)"
+    return 1
 }
 
 cmd_start() {
@@ -4105,6 +4117,12 @@ host_proxy_fingerprint() {
     # its fingerprint lacks this line) is restarted once instead of reused,
     # while one already started with the old --require-tool flag still matches.
     data+=$(printf '\nrequiretool=1\n')
+    # Only an explicit --prompt-mode/--single-message is hashed, so a default
+    # launch keeps the fingerprint it always had and is not restarted; switching
+    # modes in either direction restarts the proxy.
+    if [[ -n "${prompt_mode_override:-}" ]]; then
+        data+=$(printf '\npromptmode=%s\n' "$prompt_mode_override")
+    fi
     if command -v sha256sum >/dev/null 2>&1; then
         printf '%s' "$data" | sha256sum | cut -d' ' -f1
     else
@@ -4843,6 +4861,7 @@ host_proxy_start() {
         HARNESS_FORCE_LOOPBACK=1 \
         PROXY_PORT="$port" \
         PROXY_BACKEND="${backend_override:-}" \
+        PROXY_PROMPT_MODE="${prompt_mode_override:-}" \
         OUTPUT_DIR="$host_output_dir" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
         HARNESS_RUN_MODE=host \
@@ -5148,8 +5167,14 @@ cmd_host() {
 harness host — run CONTAINERLESS: the proxy + opencode as plain host processes.
 
 usage:
-  harness host [--yolo] [-p "PROMPT"] [agent flags...]
+  harness host [--yolo] [--single-message | --prompt-mode M] [-p "PROMPT"] [agent flags...]
   harness host down            stop the background host proxy
+
+--single-message (= --prompt-mode single) folds the whole chat into ONE
+upstream message instead of the default multi-message (hybrid) layout. It is
+experimental and only active when passed; a launch without it uses hybrid
+(and restarts a proxy left running in another mode). Compare the two with
+'harness benchmark --test-modes'.
 
 No docker, no images, no egress firewall; opencode runs as your full host user,
 so every launch prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip it in
@@ -5180,10 +5205,16 @@ EOF
 
     local yolo=0 print_mode=0
     local pass_args=()
-    local arg
+    local arg want_mode=0
     for arg in "$@"; do
+        if (( want_mode )); then
+            prompt_mode_override="$arg"; want_mode=0; continue
+        fi
         case "$arg" in
             --yolo)      yolo=1 ;;
+            --single-message) prompt_mode_override="single" ;;
+            --prompt-mode)    want_mode=1 ;;
+            --prompt-mode=*)  prompt_mode_override="${arg#--prompt-mode=}" ;;
             # The default now; still consumed so an old invocation carrying it
             # is not forwarded to opencode, which rejects an unknown flag.
             --require-tool) ;;
@@ -5191,6 +5222,12 @@ EOF
             *)           pass_args+=("$arg") ;;
         esac
     done
+
+    if (( want_mode )); then
+        err "--prompt-mode requires a value (hybrid, user_front, passthrough, or single)"
+        exit 1
+    fi
+    _validate_prompt_mode_override || exit 1
 
     host_require_python3 || exit 1
     host_require_config

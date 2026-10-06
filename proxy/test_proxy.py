@@ -5575,5 +5575,143 @@ class TestRequireToolMode(unittest.TestCase):
         self.assertTrue((self._msg(body)["content"] or "").strip())
 
 
+class TestSinglePromptMode(unittest.TestCase):
+    """PROXY_PROMPT_MODE=single (`--single-message`): the hybrid content folded
+    into ONE user message (xml join, instructions / conversation / current
+    turn), with a per-request id and oldest-first trimming. Hybrid itself
+    must be untouched by the new mode."""
+
+    TOOLS = [{"type": "function", "function": {
+        "name": "bash", "description": "Run shell command",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}, "description": {"type": "string"}},
+            "required": ["command"]}}}]
+
+    def setUp(self):
+        self.history = [
+            {"role": "system", "content": "You are a coding agent.\n<env>\n  Working directory: /w\n</env>"},
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "Listing.", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "a.py\nb.py"},
+            {"role": "assistant", "content": "Two files."},
+            {"role": "user", "content": "now count them"},
+        ]
+        self.tools_text = proxy.format_tools_to_text(self.TOOLS)
+
+    def _run(self, mode, msgs=None):
+        with patch.object(proxy, "_PROMPT_MODE", mode):
+            return proxy.translate_history_and_apply_prompt(
+                msgs or self.history, self.tools_text, tools=self.TOOLS)
+
+    def test_single_is_one_user_message(self):
+        out = self._run("single")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["role"], "user")
+
+    def test_single_layout_end_framing(self):
+        text = self._run("single")[0]["content"]
+        self.assertRegex(text, r"^\[request [0-9a-f]{12}\]\n")
+        i, c, t = (text.index("<instructions>"), text.index("<conversation>"),
+                   text.index("<current_turn>"))
+        self.assertLess(i, c)
+        self.assertLess(c, t)
+        self.assertTrue(text.rstrip().endswith("</current_turn>"))
+        # Instructions = hybrid's message 0: agent prompt + harness tool block.
+        instr = text[i:c]
+        self.assertIn("<<<BEGIN_AGENT_INSTRUCTIONS>>>", instr)
+        self.assertIn("You are a coding agent.", instr)
+        self.assertIn("Run shell command", instr)
+        # History turns are numbered and role-tagged; the tool call keeps the
+        # ```json envelope the model is asked to emit.
+        conv = text[c:t]
+        self.assertIn('<turn n="1" role="user">', conv)
+        self.assertIn('<turn n="2" role="assistant">', conv)
+        self.assertIn('"name": "bash"', conv)
+        self.assertIn('<turn n="3" role="tool">', conv)
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="bash">>>', conv)
+        # The live request sits in the current turn with the recency reminder.
+        cur = text[t:]
+        self.assertIn("now count them", cur)
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>", cur)
+        self.assertNotIn("I understand the instructions above.", text)
+
+    def test_single_matches_hybrid_content(self):
+        """Every hybrid message body appears verbatim in the fold, so the A/B
+        compares packaging only. The request id and the reminder's per-call
+        nonce-free text make the bodies directly comparable."""
+        hyb = self._run("hybrid")
+        text = self._run("single")[0]["content"]
+        for m in hyb:
+            if m["content"] == "I understand the instructions above.":
+                continue
+            self.assertIn(m["content"], text)
+
+    def test_hybrid_unchanged_by_single(self):
+        """Default mode stays multi-message with the sys->user stub."""
+        out = self._run("hybrid")
+        self.assertGreater(len(out), 1)
+        self.assertEqual(out[1]["content"], "I understand the instructions above.")
+        self.assertNotIn("<current_turn>", json.dumps(out))
+
+    def test_single_request_id_unique(self):
+        a = self._run("single")[0]["content"].split("\n", 1)[0]
+        b = self._run("single")[0]["content"].split("\n", 1)[0]
+        self.assertNotEqual(a, b)
+
+    def test_single_first_turn_has_no_conversation(self):
+        text = self._run("single", self.history[:2])[0]["content"]
+        self.assertNotIn("<conversation>", text)
+        self.assertIn("list the files", text[text.index("<current_turn>"):])
+
+    def test_single_tool_result_current_turn(self):
+        text = self._run("single", self.history[:4])[0]["content"]
+        cur = text[text.index("<current_turn>"):]
+        self.assertIn('<<<BEGIN_TOOL_RESULT name="bash">>>', cur)
+
+    def test_single_trims_oldest_first(self):
+        msgs = [self.history[0]]
+        for n in range(40):
+            msgs.append({"role": "user", "content": "OLD%02d " % n + "x" * 2000})
+            msgs.append({"role": "assistant", "content": "ok %02d" % n})
+        msgs.append({"role": "user", "content": "the live ask"})
+        full = self._run("single", msgs)[0]["content"]
+        with patch.object(proxy, "_SINGLE_MAX_CHARS", len(full) // 2):
+            text = self._run("single", msgs)[0]["content"]
+        self.assertLessEqual(len(text), len(full) // 2)
+        self.assertNotIn("OLD00", text)
+        self.assertIn("OLD39", text)
+        self.assertRegex(text, r"\[\d+ earlier turn\(s\) omitted")
+        self.assertIn("the live ask", text)
+        self.assertIn("You are a coding agent.", text)
+
+    def test_single_no_trim_under_cap(self):
+        text = self._run("single")[0]["content"]
+        self.assertNotIn("omitted to fit", text)
+
+    def test_setup_accepts_single_and_cap(self):
+        with patch.dict(os.environ, {"PROXY_PROMPT_MODE": "single",
+                                     "PROXY_SINGLE_MAX_CHARS": "1234"}):
+            with patch.object(proxy, "_SINGLE_MAX_CHARS", 600000):
+                proxy._setup_prompt_mode()
+                self.assertEqual(proxy._PROMPT_MODE, "single")
+                self.assertEqual(proxy._SINGLE_MAX_CHARS, 1234)
+        with patch.dict(os.environ, {"PROXY_PROMPT_MODE": "single",
+                                     "PROXY_SINGLE_MAX_CHARS": "nope"}):
+            with patch.object(proxy, "_SINGLE_MAX_CHARS", 600000):
+                proxy._setup_prompt_mode()
+                self.assertEqual(proxy._SINGLE_MAX_CHARS, 600000)
+        env = {k: v for k, v in os.environ.items() if k != "PROXY_PROMPT_MODE"}
+        with patch.dict(os.environ, env, clear=True):
+            proxy._setup_prompt_mode()
+        self.assertEqual(proxy._PROMPT_MODE, "hybrid")
+
+    def test_single_require_tool_stays_on(self):
+        with patch.object(proxy, "_PROMPT_MODE", "single"):
+            proxy._setup_require_tool()
+            self.assertTrue(proxy._REQUIRE_TOOL_ENABLED)
+
+
 if __name__ == "__main__":
     unittest.main()
