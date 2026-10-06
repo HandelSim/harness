@@ -1,0 +1,4 @@
+{
+  "prompt": "Implement slugify in text_utils.py so it follows its docstring exactly (including the doctest examples). Check your implementation by running it before you finish.",
+  "mock_solution": "python3 - <<'EOF'\nimport re\ns=open('text_utils.py').read().replace('    raise NotImplementedError', '    import re\\n    s = re.sub(r\"[^a-z0-9]+\", \"-\", text.lower()).strip(\"-\")\\n    return s or \"n-a\"')\nopen('text_utils.py','w').write(s)\nEOF"
+}

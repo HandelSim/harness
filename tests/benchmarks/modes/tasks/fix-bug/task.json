@@ -1,0 +1,4 @@
+{
+  "prompt": "The tests in test_stats.py fail. Find and fix the bug in stats.py without changing test_stats.py, then run the tests (python3 test_stats.py) to confirm they pass.",
+  "mock_solution": "sed -i.bak 's/return total \\/ (len(values) + 1)/return total \\/ len(values)/' stats.py && rm -f stats.py.bak"
+}

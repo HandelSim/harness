@@ -1,0 +1,4 @@
+{
+  "prompt": "Do this in three steps. Step 1: read config/settings.ini. Step 2: read the files in notes/ one at a time (one read per file) and keep track of how many of them contain the word \"blocker\". Do not read config/settings.ini again after step 1. Step 3: create report.txt containing exactly two lines: code=<the release_code value from settings.ini> and blockers=<the number of notes files that contain \"blocker\">.",
+  "mock_solution": "printf 'code=KX-4417-QV\\nblockers=3\\n' > report.txt"
+}

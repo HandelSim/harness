@@ -1,0 +1,4 @@
+{
+  "prompt": "Important rule for this whole task: every file you create must start with the exact line `# owner: bench-7731` as its first line. Now: (1) create primes.py with a function primes_below(n) returning the list of primes below n, and when run as a script print primes_below(30) as a Python list; (2) run it to check the output; (3) create test_primes.py with a few asserts for primes_below and run it; (4) create NOTES.md with a short description of both files.",
+  "mock_solution": "printf '# owner: bench-7731\\ndef primes_below(n):\\n    return [p for p in range(2, n) if all(p %% d for d in range(2, p))]\\n\\nif __name__ == \"__main__\":\\n    print(primes_below(30))\\n' > primes.py && printf '# owner: bench-7731\\nfrom primes import primes_below\\nassert primes_below(10) == [2, 3, 5, 7]\\n' > test_primes.py && printf '# owner: bench-7731\\nprimes.py and test_primes.py\\n' > NOTES.md"
+}

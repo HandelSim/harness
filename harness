@@ -4055,7 +4055,10 @@ host_proxy_pidfile()   { printf '%s/host/proxy.pid' "$state_root"; }
 host_proxy_fpfile()    { printf '%s/host/proxy.fp' "$state_root"; }
 host_proxy_logfile()   { printf '%s/host/proxy.log' "$state_root"; }
 host_opencode_config() { printf '%s/host/opencode.json' "$state_root"; }
-host_proxy_port()      { printf '%s' "${PROXY_PORT:-8000}"; }
+# HARNESS_HOST_PORT wins over .env's PROXY_PORT (which `set -a` sourcing would
+# otherwise force) so a scripted caller, e.g. `harness benchmark --test-modes`,
+# can put its proxy on a free port beside a normal one on 8000.
+host_proxy_port()      { printf '%s' "${HARNESS_HOST_PORT:-${PROXY_PORT:-8000}}"; }
 
 # --- host toolchain auto-provisioning --------------------------------------
 #
@@ -4980,6 +4983,14 @@ host_write_opencode_config() {
     local selected="$default_model"
     [[ -z "$selected" ]] && selected="${model_ids[0]}"
 
+    # HARNESS_HOST_NO_WEB=1 (set by `harness benchmark --test-modes`) keeps
+    # opencode off the network except for the loopback proxy: the yolo agent
+    # loses webfetch/websearch and session sharing is disabled.
+    local web_perm="allow" share=""
+    if [[ "${HARNESS_HOST_NO_WEB:-0}" == "1" ]]; then
+        web_perm="deny"; share="disabled"
+    fi
+
     local models_json
     models_json=$(printf '%s\n' "${model_ids[@]}" | harness_jq -R . | harness_jq -s \
         --argjson ctx "$ctx" \
@@ -4994,6 +5005,8 @@ host_write_opencode_config() {
         --arg proxy_url "$proxy_url" \
         --arg selected "harness/${selected}" \
         --argjson models "$models_json" \
+        --arg web "$web_perm" \
+        --arg share "$share" \
         '{
           "$schema": "https://opencode.ai/config.json",
           "provider": {
@@ -5009,10 +5022,10 @@ host_write_opencode_config() {
           "agent": {
             "yolo": {
               "description": "Auto-approve all permissions; harness yolo mode",
-              "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": "allow", "websearch": "allow"}
+              "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": $web, "websearch": $web}
             }
           }
-        }' > "$config_file"
+        } + (if $share == "" then {} else {share: $share} end)' > "$config_file"
 }
 
 # Launch opencode against the host proxy. Mirrors agents/entrypoint.sh
@@ -5032,6 +5045,8 @@ host_run_opencode() {
     # that explicit), so enabling a web-search provider adds no new exposure
     # beyond the unrestricted outbound the user already accepted (CONCERNS L4).
     export OPENCODE_ENABLE_EXA=1
+    # ...except under HARNESS_HOST_NO_WEB=1 (see host_write_opencode_config).
+    [[ "${HARNESS_HOST_NO_WEB:-0}" == "1" ]] && unset OPENCODE_ENABLE_EXA
     # Exempt the loopback proxy from the corp HTTP_PROXY. opencode's provider
     # baseURL is the LOCAL proxy at http://127.0.0.1:PORT/v1, and opencode runs
     # on Bun, whose native fetch honors HTTP_PROXY/HTTPS_PROXY. With a corporate

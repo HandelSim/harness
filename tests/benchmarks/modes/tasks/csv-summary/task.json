@@ -1,0 +1,4 @@
+{
+  "prompt": "expenses.csv lists expenses with a category and an integer amount. Create summary.json: a JSON object mapping each category to the total amount for that category (integers), plus a key \"total\" with the grand total. Verify the numbers before you finish.",
+  "mock_solution": "python3 -c \"import csv,json;t={};[t.__setitem__(r['category'],t.get(r['category'],0)+int(r['amount'])) for r in csv.DictReader(open('expenses.csv'))];t['total']=sum(t.values());json.dump(t,open('summary.json','w'))\""
+}

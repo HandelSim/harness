@@ -1,0 +1,4 @@
+{
+  "prompt": "Rename the function get_usr to get_user everywhere in this project (its definition and every call site), so that python3 run_tests.py passes. Do not keep an alias for the old name. Run the tests to confirm.",
+  "mock_solution": "for f in app/users.py app/greet.py app/report.py; do sed -i.bak 's/get_usr\\b/get_user/g' \"$f\" && rm -f \"$f.bak\"; done"
+}

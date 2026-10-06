@@ -3488,6 +3488,15 @@ def catch_all(path: str) -> Response:
             f"schema_tokens={_estimate_tokens(tools_text)}",
             flush=True,
         )
+        # Shape of what goes upstream (counts only). `harness benchmark
+        # --test-modes` reads this to confirm each mode actually took effect
+        # (single sends exactly one message).
+        print(
+            f"[{req_id}] upstream shape: mode={_PROMPT_MODE} "
+            f"messages={len(translated)} "
+            f"chars={sum(len(_flatten_content_to_str(m.get('content') or '')) for m in translated)}",
+            flush=True,
+        )
 
         # Forward whatever model the request asked for so the user can switch
         # between the upstream's models from opencode. opencode reads the bare
