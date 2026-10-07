@@ -109,4 +109,18 @@ grep -q 'HARNESS_HOST_NO_WEB:-0}" == "1" ]] && unset OPENCODE_ENABLE_EXA' \
     || fail "T5: host_run_opencode keeps Exa on under HARNESS_HOST_NO_WEB"
 ok "T5: HARNESS_HOST_NO_WEB turns off web tools, Exa and sharing; default unchanged"
 
+# --- T6: a Windows-form HARNESS_INSTALL_ROOT ----------------------------------------
+# The runner (a Windows python) passes C:/... ; the drive colon would split the
+# toolchain dirs host mode prepends to PATH, so jq "vanishes" after provisioning.
+t6dir=$(mktemp -d); printf '#!/bin/sh\necho MINGW64_NT-10.0\n' >"$t6dir/uname"; chmod +x "$t6dir/uname"
+t6=$(PATH="$t6dir:$PATH" HARNESS_INSTALL_ROOT='C:/Users/me/h\state\bench-modes\root' HARNESS_SOURCE_ONLY=1 \
+    bash -c 'source "$1" >/dev/null 2>&1; printf "%s|%s" "$install_root" "$(host_tool_bin_dir)"' _ "$HARNESS")
+t6l=$(HARNESS_INSTALL_ROOT='/srv/h' HARNESS_SOURCE_ONLY=1 \
+    bash -c 'source "$1" >/dev/null 2>&1; printf "%s" "$install_root"' _ "$HARNESS")
+rm -rf "$t6dir"
+[[ "$t6" == "/c/Users/me/h/state/bench-modes/root|/c/Users/me/h/state/bench-modes/root/state/host/toolchain/bin" ]] \
+    || fail "T6: Windows install root not normalized — got [$t6]"
+[[ "$t6l" == "/srv/h" ]] || fail "T6: a Linux install root changed — got [$t6l]"
+ok "T6: a C:/... HARNESS_INSTALL_ROOT becomes /c/... on Windows (no drive colon in PATH)"
+
 echo "[bench-modes] all $pass checks passed"

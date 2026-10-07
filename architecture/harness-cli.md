@@ -17,7 +17,11 @@ realpath (so it works on Windows Git Bash too) to find:
 In production these are the same directory: `harness-install.sh` clones
 the repo and that clone IS the install root. Tests set
 `HARNESS_INSTALL_ROOT` to a tmpdir to keep `clone_dir` resolved to the
-real repo while pointing `install_root` somewhere disposable.
+real repo while pointing `install_root` somewhere disposable. On Windows a
+`C:\...` or `C:/...` `HARNESS_INSTALL_ROOT` (as a Windows program such as the
+`--test-modes` runner passes it) is normalized to Git Bash's `/c/...` form
+(`harness_posix_path`): a drive colon would split the vendored toolchain dirs
+host mode prepends to the `:`-separated `PATH`.
 
 The portable resolver is duplicated inline here rather than depending on
 `realpath`; the full equivalent lives in `scripts/lib/platform.sh` as
@@ -550,8 +554,7 @@ What it does, in order:
    `host_preflight` then runs as a post-provision assertion — each of `python3`,
    `jq`, Node, `opencode` must both resolve **and** execute, naming any that fail.
    If provisioning or that assertion fails on Windows and the install root is
-   outside the user profile (compared in `cygpath -u` form, so a `C:/...`
-   `HARNESS_INSTALL_ROOT` matches), `host_win_location_hint` adds a note naming that as
+   outside the user profile, `host_win_location_hint` adds a note naming that as
    the likely cause (managed PCs often run programs only from inside the
    profile) with the commands to move the install and re-point the PATH wrapper.
 5. **Upstream auth gate + model catalog** — the same two checks container mode

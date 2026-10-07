@@ -68,7 +68,25 @@ if [[ -f "$clone_dir/scripts/lib/platform.sh" ]]; then
     # shellcheck disable=SC1091
     source "$clone_dir/scripts/lib/platform.sh"
 fi
+# Echo a Windows path (C:\x or C:/x) in Git Bash's /c/x form; other paths unchanged.
+harness_posix_path() {
+    local p="$1"
+    [[ "$p" =~ ^[A-Za-z]:[\\/] ]] || { printf '%s' "$p"; return 0; }
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$p"
+    else
+        p="${p//\\//}"
+        printf '/%s%s' "$(printf '%s' "${p:0:1}" | tr '[:upper:]' '[:lower:]')" "${p:2}"
+    fi
+}
+
 install_root="${HARNESS_INSTALL_ROOT:-$clone_dir}"
+# A Windows program (the --test-modes runner, or a user's own launcher) can set
+# HARNESS_INSTALL_ROOT as C:/...; the drive colon would split the vendored tool
+# dirs host mode prepends to the ':'-separated PATH. Use the /c/... form.
+if [[ "$(harness_detect_os 2>/dev/null)" == windows ]]; then
+    install_root=$(harness_posix_path "$install_root")
+fi
 state_root="$install_root/state"
 env_file="$install_root/.env"
 runtime_override="$state_root/.harness-runtime.yml"
@@ -4437,11 +4455,7 @@ host_win_location_hint() {
     local prof
     [[ "$(harness_detect_os)" == windows ]] || return 0
     prof=$(host_win_profile_dir) || return 0
-    # install_root can arrive as C:/... or C:\... (HARNESS_INSTALL_ROOT set by a
-    # Windows program); compare it in the same /c/... form as $prof.
-    local root="$install_root"
-    command -v cygpath >/dev/null 2>&1 && root=$(cygpath -u "$root" 2>/dev/null || printf '%s' "$root")
-    host_path_within "$root" "$prof" && return 0
+    host_path_within "$install_root" "$prof" && return 0
     err ""
     err "note: harness is installed outside your Windows user folder ($install_root)."
     err "  Many managed PCs only let programs run from inside the user folder, and host"
