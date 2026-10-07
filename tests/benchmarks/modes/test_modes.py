@@ -251,9 +251,13 @@ class TestSetup(unittest.TestCase):
             os.makedirs(os.path.join(real, "state", "host", "toolchain", "bin"))
             with open(os.path.join(real, ".env"), "w") as f:
                 f.write("X=1\n")
+            # An earlier run left a real, unshared toolchain dir in the bench root.
+            stale = os.path.join(bench, "state", "host", "toolchain")
+            os.makedirs(os.path.join(stale, "bin"))
             run.prepare_root(real, bench, None)
             run.prepare_root(real, bench, None)  # idempotent
-            self.assertTrue(os.path.isdir(os.path.join(bench, "state", "host", "toolchain", "bin")))
+            self.assertTrue(os.path.samefile(stale, os.path.join(real, "state", "host", "toolchain")))
+            self.assertEqual(len([n for n in os.listdir(os.path.dirname(stale)) if ".bench-local-" in n]), 1)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

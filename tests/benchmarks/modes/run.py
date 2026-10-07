@@ -275,30 +275,39 @@ def free_port() -> int:
 
 
 def _link_or_copy(src: str, dst: str, copy_ok: bool) -> None:
+    aside = ""
     if os.path.lexists(dst):
+        try:
+            if os.path.samefile(src, dst):
+                return  # already shared (symlink or Windows junction)
+        except OSError:
+            pass
         if os.path.islink(dst) or os.path.isfile(dst):
             os.remove(dst)
         else:
-            return  # a real directory the bench built itself (e.g. its own venv); keep it
+            # A real directory the bench provisioned itself (an earlier run
+            # whose link failed). Move it aside, never delete it, and share yours.
+            aside = f"{dst}.bench-local-{int(time.time())}"
+            os.rename(dst, aside)
     try:
         os.symlink(src, dst)
-        return
     except OSError:
-        pass
-    if copy_ok and os.path.isfile(src):
-        shutil.copy2(src, dst)
-    elif IS_WINDOWS and os.path.isdir(src):
-        # Windows symlinks need Developer Mode or admin; a directory junction
-        # needs neither. Without one the bench root gets an empty toolchain and
-        # re-downloads (and re-verifies) everything.
-        try:
-            import _winapi
-            _winapi.CreateJunction(os.path.abspath(src), dst)
-        except (ImportError, AttributeError, OSError):
-            subprocess.run(["cmd", "/c", "mklink", "/J", dst, os.path.abspath(src)],
-                           capture_output=True, stdin=subprocess.DEVNULL)
-        if not os.path.isdir(dst):
-            log(f"warning: could not link {src} into the bench root; it will be provisioned separately")
+        if copy_ok and os.path.isfile(src):
+            shutil.copy2(src, dst)
+        elif IS_WINDOWS and os.path.isdir(src):
+            # Windows symlinks need Developer Mode or admin; a directory junction
+            # needs neither. Without one the bench root gets an empty toolchain
+            # and re-downloads (and re-verifies) everything.
+            try:
+                import _winapi
+                _winapi.CreateJunction(os.path.abspath(src), dst)
+            except (ImportError, AttributeError, OSError):
+                subprocess.run(["cmd", "/c", "mklink", "/J", dst, os.path.abspath(src)],
+                               capture_output=True, stdin=subprocess.DEVNULL)
+    if os.path.isdir(src) and not os.path.isdir(dst):
+        if aside:
+            os.rename(aside, dst)
+        log(f"warning: could not link {src} into the bench root; the bench provisions its own copy")
 
 
 def prepare_root(real_root: str, bench_root: str, mock_env: str | None) -> None:
