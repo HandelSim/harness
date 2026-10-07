@@ -244,6 +244,16 @@ class TestSetup(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_python3_shim_runs_the_interpreter(self):
+        d = tempfile.mkdtemp()
+        try:
+            shim = run.write_python3_shim(os.path.join(d, "bin"), sys.executable)
+            r = subprocess.run(["sh", os.path.join(shim, "python3"), "-"], input="print(6*7)\n",
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.stdout.strip(), "42")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_prepare_root_shares_toolchain(self):
         d = tempfile.mkdtemp()
         try:

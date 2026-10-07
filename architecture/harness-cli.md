@@ -1047,7 +1047,9 @@ running proxy or opencode config and the only task egress is the upstream API.
 The bench root shares the real install's `state/host/toolchain` and `venv`
 (symlink, or a directory junction on Windows, where symlinks need Developer
 Mode), so nothing is downloaded twice; an untimed warm-up provisions them, and a
-warm-up failure stops the run before trial 1 with the redacted error.
+warm-up failure stops the run before trial 1 with the redacted error. On
+Windows, trials get a `python3` shim on `PATH` (Git Bash's `python3` is usually
+the Microsoft Store stub).
 `--mock` swaps the upstream for a loopback scripted mock. Usage, report and
 egress list: `tests/benchmarks/modes/README.md`. Covered by
 `tests/unit_bench_modes_test.sh`.

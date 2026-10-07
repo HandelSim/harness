@@ -128,6 +128,10 @@ hostname are redacted too.
 - **One-time downloads**: if the toolchain is missing, the warm-up fetches
   public packages: Node, opencode, jq, the proxy's pip deps, and ripgrep if it
   is absent. These carry no task or user data.
+- **Windows `python3`**: Git Bash usually resolves `python3` to the Microsoft
+  Store stub, which fails. Trials get a `python3` shim on `PATH` that runs the
+  Python harness found, so neither mode spends turns working out which
+  `python` exists.
 - **`--mock`**: the upstream env (`PROXY_*`) is removed from the child
   environment. The mock never sees your key, and nothing leaves loopback.
 

@@ -336,6 +336,16 @@ def prepare_root(real_root: str, bench_root: str, mock_env: str | None) -> None:
         _link_or_copy(venv, os.path.join(host, "venv"), copy_ok=False)
 
 
+def write_python3_shim(shim_dir: str, exe: str) -> str:
+    """A `python3` that runs `exe`. Git Bash on Windows usually resolves
+    `python3` to the Microsoft Store stub, which fails, so agents (and the mock's
+    scripted solutions) burn turns finding `python`; trials get this on PATH."""
+    os.makedirs(shim_dir, exist_ok=True)
+    with open(os.path.join(shim_dir, "python3"), "w", encoding="utf-8", newline="\n") as f:
+        f.write('#!/bin/sh\nexec "%s" "$@"\n' % exe.replace("\\", "/"))
+    return shim_dir
+
+
 def child_env(bench_root: str, port: int, mock: bool, first: bool) -> dict:
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("OPENCODE_", "OTEL_", "HARNESS_HOST_"))}
@@ -363,6 +373,9 @@ def child_env(bench_root: str, port: int, mock: bool, first: bool) -> dict:
         "OPENCODE_DISABLE_CLAUDE_CODE": "1",
         "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
     })
+    if IS_WINDOWS:
+        shim = write_python3_shim(os.path.join(bench_root, "bin"), sys.executable)
+        env["PATH"] = shim + os.pathsep + env.get("PATH", "")
     if not first:
         env["HARNESS_SKIP_AUTH_PROBE"] = "1"
     env.pop("CI", None)
