@@ -282,9 +282,23 @@ def _link_or_copy(src: str, dst: str, copy_ok: bool) -> None:
             return  # a real directory the bench built itself (e.g. its own venv); keep it
     try:
         os.symlink(src, dst)
+        return
     except OSError:
-        if copy_ok and os.path.isfile(src):
-            shutil.copy2(src, dst)
+        pass
+    if copy_ok and os.path.isfile(src):
+        shutil.copy2(src, dst)
+    elif IS_WINDOWS and os.path.isdir(src):
+        # Windows symlinks need Developer Mode or admin; a directory junction
+        # needs neither. Without one the bench root gets an empty toolchain and
+        # re-downloads (and re-verifies) everything.
+        try:
+            import _winapi
+            _winapi.CreateJunction(os.path.abspath(src), dst)
+        except (ImportError, AttributeError, OSError):
+            subprocess.run(["cmd", "/c", "mklink", "/J", dst, os.path.abspath(src)],
+                           capture_output=True, stdin=subprocess.DEVNULL)
+        if not os.path.isdir(dst):
+            log(f"warning: could not link {src} into the bench root; it will be provisioned separately")
 
 
 def prepare_root(real_root: str, bench_root: str, mock_env: str | None) -> None:
@@ -324,7 +338,8 @@ def child_env(bench_root: str, port: int, mock: bool, first: bool) -> dict:
         env["NO_PROXY"] = env["no_proxy"] = (np + "," if np else "") + "127.0.0.1,localhost"
     xdg = os.path.join(bench_root, "xdg")
     env.update({
-        "HARNESS_INSTALL_ROOT": bench_root,
+        # Forward slashes: valid for Windows and Git Bash alike (bash reads it).
+        "HARNESS_INSTALL_ROOT": bench_root.replace("\\", "/") if IS_WINDOWS else bench_root,
         "HARNESS_HOST_PORT": str(port),
         "HARNESS_HOST_NO_WEB": "1",
         "HARNESS_HOST_CONFIRM": "1",
@@ -355,17 +370,21 @@ WARM_UP = (
 )
 
 
-def warm_up(harness_bin: str, env: dict, redact) -> None:
+def warm_up(harness_bin: str, env: dict, redact) -> str:
+    """Return "" when ready, else why not (redacted). A failure here is the
+    same failure every trial would hit, so the caller stops before trial 1."""
     log("preparing the host toolchain and proxy venv (one-time downloads only if missing)")
     try:
         # $0 = the harness script: it locates its clone (and scripts/lib) from $0.
         r = subprocess.run([BASH, "-c", WARM_UP, harness_bin], env=env, stdin=subprocess.DEVNULL,
                            capture_output=True, text=True, timeout=1800)
-        if r.returncode != 0:
-            tail = (r.stderr.strip().splitlines() or [""])[-1]
-            log(f"warning: warm-up exited {r.returncode} ({redact(tail)[:200]}); the first trial will retry it")
     except subprocess.TimeoutExpired:
-        log("warning: warm-up timed out; the first trial will retry it")
+        return "the toolchain/venv setup timed out after 30 min (slow or blocked downloads)"
+    if r.returncode == 0:
+        return ""
+    lines = [ln for ln in r.stderr.splitlines() if ln.strip()][-12:]
+    return (f"the toolchain/venv setup failed (exit {r.returncode}), so no trial could start:\n"
+            + "\n".join("    " + redact(ln) for ln in lines))
 
 
 def inside_repo(path: str) -> str | None:
@@ -779,9 +798,11 @@ def main(argv: list[str]) -> int:
                 os.remove(os.path.join(bench_root, "state", "host", stale))
             except OSError:
                 pass
-        warm_up(harness_bin, child_env(bench_root, port, a.mock, first=False), red)
+        aborted = warm_up(harness_bin, child_env(bench_root, port, a.mock, first=False), red)
+        if aborted:
+            aborted += f"\n  Fix that, then continue with: {resume}"
 
-        for i, (rep, mode, tid) in enumerate(todo, 1):
+        for i, (rep, mode, tid) in enumerate([] if aborted else todo, 1):
             r = run_trial(by_id[tid], mode, rep, ctx)
             with open(results_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(r) + "\n")
@@ -795,7 +816,7 @@ def main(argv: list[str]) -> int:
                 break
             if r["infra"] == "launch" and i <= 2:
                 aborted = (f"harness host did not start the agent; see {os.path.join(out, 'trials')} "
-                           "for the redacted launcher output")
+                           f"for the redacted launcher output. Fix that, then continue with: {resume}")
                 break
             upstream_streak = upstream_streak + 1 if r["infra"] == "upstream" else 0
             if upstream_streak >= 3:

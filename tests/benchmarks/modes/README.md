@@ -113,7 +113,9 @@ hostname are redacted too.
   (`mock-root/` for `--mock`) via `HARNESS_INSTALL_ROOT`. Its `.env` is a
   symlink to yours, and it gets a free port (`HARNESS_HOST_PORT`). The bench
   proxy has its own pid, log and port, and never touches a `harness host`
-  proxy you have running.
+  proxy you have running. It shares your install's host toolchain and proxy
+  venv (a symlink, or a directory junction on Windows), so nothing is
+  downloaded twice.
 - **Private opencode dirs**: opencode gets private XDG config, data, cache and
   state dirs there. Your global opencode config, plugins, MCP servers and
   sessions are not loaded.
@@ -123,7 +125,7 @@ hostname are redacted too.
   `_DEFAULT_PLUGINS`, and clears `OTEL_*`.
 - **Task traffic**: the only place task traffic goes is the upstream API
   (`PROXY_API_URL`), through the local proxy.
-- **One-time downloads**: if the toolchain is missing, the first trial fetches
+- **One-time downloads**: if the toolchain is missing, the warm-up fetches
   public packages: Node, opencode, jq, the proxy's pip deps, and ripgrep if it
   is absent. These carry no task or user data.
 - **`--mock`**: the upstream env (`PROXY_*`) is removed from the child
@@ -133,7 +135,8 @@ hostname are redacted too.
 
 - **Setup costs**: before trial 1, an untimed warm-up provisions the host
   toolchain and proxy venv (downloads happen only if they are missing; no
-  model call). A trial's time is the whole `harness host` run, so the first
+  model call). If the warm-up fails, the run stops before trial 1 and prints
+  the redacted error and the resume command. A trial's time is the whole `harness host` run, so the first
   trial of a run also includes the auth probe. The first trial of each block also includes a
   proxy restart, a few seconds. Restarts hit both modes equally. The one-off
   probe falls on the baseline's first trial, which is negligible over 36 trials.

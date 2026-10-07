@@ -227,6 +227,37 @@ class TestEnvAndRedaction(unittest.TestCase):
             os.environ.update(saved)
 
 
+class TestSetup(unittest.TestCase):
+    def test_warm_up_failure_is_reported_redacted(self):
+        d = tempfile.mkdtemp()
+        try:
+            fake = os.path.join(d, "harness")
+            with open(fake, "w") as f:
+                f.write('echo "host mode: checksum mismatch for $HOME/x" >&2; return 3\n')
+            msg = run.warm_up(fake, dict(os.environ), lambda s: s.replace(os.path.expanduser("~"), "~"))
+            self.assertIn("failed (exit 1)", msg)
+            self.assertIn("checksum mismatch for ~/x", msg)
+            with open(fake, "w") as f:
+                f.write("host_require_python3() { :; }; ensure_dirs() { :; }; host_ensure_toolchain() { :; }\n"
+                        "host_preflight() { :; }; host_proxy_ensure_venv() { :; }\n")
+            self.assertEqual(run.warm_up(fake, dict(os.environ), str), "")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_prepare_root_shares_toolchain(self):
+        d = tempfile.mkdtemp()
+        try:
+            real, bench = os.path.join(d, "real"), os.path.join(d, "bench")
+            os.makedirs(os.path.join(real, "state", "host", "toolchain", "bin"))
+            with open(os.path.join(real, ".env"), "w") as f:
+                f.write("X=1\n")
+            run.prepare_root(real, bench, None)
+            run.prepare_root(real, bench, None)  # idempotent
+            self.assertTrue(os.path.isdir(os.path.join(bench, "state", "host", "toolchain", "bin")))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class TestReport(unittest.TestCase):
     def _r(self, task, mode, rep, passed, secs=10.0, req=3, infra=""):
         return {"task": task, "mode": mode, "repeat": rep, "passed": passed, "secs": secs,

@@ -4176,7 +4176,14 @@ host_fetch() {
         err "host mode: download failed: $url"; rm -f "$tmp"; return 1
     fi
     if [[ -n "$want" ]] && ! host_sha256_check "$tmp" "$want"; then
-        err "host mode: checksum mismatch for $url (refusing to install)"; rm -f "$tmp"; return 1
+        err "host mode: checksum mismatch for $url (refusing to install)"
+        # A web filter or TLS-inspecting proxy often answers a blocked binary
+        # with its own HTML page; say so instead of leaving a bare mismatch.
+        if head -c 512 "$tmp" 2>/dev/null | grep -qi '<html\|<!doctype'; then
+            err "  the download is an HTML page, not the file: a proxy or web filter replaced it"
+            err "  workaround: install the tool yourself so harness finds it on PATH (jq on Windows: winget install jqlang.jq)"
+        fi
+        rm -f "$tmp"; return 1
     fi
     mv -f "$tmp" "$dest"
 }
@@ -4430,7 +4437,11 @@ host_win_location_hint() {
     local prof
     [[ "$(harness_detect_os)" == windows ]] || return 0
     prof=$(host_win_profile_dir) || return 0
-    host_path_within "$install_root" "$prof" && return 0
+    # install_root can arrive as C:/... or C:\... (HARNESS_INSTALL_ROOT set by a
+    # Windows program); compare it in the same /c/... form as $prof.
+    local root="$install_root"
+    command -v cygpath >/dev/null 2>&1 && root=$(cygpath -u "$root" 2>/dev/null || printf '%s' "$root")
+    host_path_within "$root" "$prof" && return 0
     err ""
     err "note: harness is installed outside your Windows user folder ($install_root)."
     err "  Many managed PCs only let programs run from inside the user folder, and host"

@@ -530,7 +530,9 @@ What it does, in order:
    + provider the container suite validates; a unit test guards that the opencode
    / provider pins stay in sync with the Dockerfile ARGs. Stamps (`.stamp-jq`
    etc.) are written **only after** a `--version` smoke run succeeds, so a
-   corrupt or half-extracted tool is never trusted on the next run. A vendored jq
+   corrupt or half-extracted tool is never trusted on the next run. A checksum
+   mismatch whose download is an HTML page is reported as a proxy/web filter
+   replacing the file (`host_fetch`). A vendored jq
    that fails its smoke run is retried once (antivirus can hold a fresh `.exe`
    while scanning), then reported with its exit code, its own output and a likely
    cause from `host_jq_run_hint` (CPU mismatch, Windows blocking the unsigned
@@ -548,7 +550,8 @@ What it does, in order:
    `host_preflight` then runs as a post-provision assertion — each of `python3`,
    `jq`, Node, `opencode` must both resolve **and** execute, naming any that fail.
    If provisioning or that assertion fails on Windows and the install root is
-   outside the user profile, `host_win_location_hint` adds a note naming that as
+   outside the user profile (compared in `cygpath -u` form, so a `C:/...`
+   `HARNESS_INSTALL_ROOT` matches), `host_win_location_hint` adds a note naming that as
    the likely cause (managed PCs often run programs only from inside the
    profile) with the commands to move the install and re-point the PATH wrapper.
 5. **Upstream auth gate + model catalog** — the same two checks container mode
@@ -1038,6 +1041,10 @@ install root (`state/bench-modes/root/`, `.env` symlinked) with
 `HARNESS_HOST_PORT` (a free port), `HARNESS_HOST_NO_WEB=1`, private opencode
 XDG dirs and the `OPENCODE_DISABLE_*` switches, so it never touches the user's
 running proxy or opencode config and the only task egress is the upstream API.
+The bench root shares the real install's `state/host/toolchain` and `venv`
+(symlink, or a directory junction on Windows, where symlinks need Developer
+Mode), so nothing is downloaded twice; an untimed warm-up provisions them, and a
+warm-up failure stops the run before trial 1 with the redacted error.
 `--mock` swaps the upstream for a loopback scripted mock. Usage, report and
 egress list: `tests/benchmarks/modes/README.md`. Covered by
 `tests/unit_bench_modes_test.sh`.
