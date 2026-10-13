@@ -24,7 +24,9 @@ opencode ──/v1/chat/completions──▶ catch_all() ──┬─ translate_
 ```
 
 `catch_all(path)` is the single Flask route handler that owns every
-non-health request. It:
+non-health request. A model that matches the native-tools patterns leaves
+right after step 1 for `_native_passthrough` (see [Native tool
+models](#native-tool-models)); every other model takes the cooperative path:
 
 1. Reads the JSON body (`model`, `messages`, `tools`, and OpenAI `stream`).
 2. Builds a tools-as-text string via `format_tools_to_text`.
@@ -60,6 +62,31 @@ before the role branches run, so the `.strip()`, `+=`, and
 token-estimate `join` paths never see a list. (A raw list previously
 500'd those paths.) `passthrough` mode returns messages verbatim, so the
 flatten there lives at the token-estimate join instead.
+
+## Native tool models
+
+The upstream's `-withtools` models speak the standard tools contract
+([`upstream-api.md`](upstream-api.md) → Native-tools models), so for them the
+proxy does no mediation. `_native_passthrough` POSTs the inbound body
+verbatim (only `model` filled in) and relays the upstream reply unchanged:
+SSE byte-for-byte when `stream: true` (upstream called with `stream=True`),
+else the JSON body. opencode's `tools`, `tool_choice`, assistant
+`tool_calls` (with any `extra_content` thought signature) and `role:"tool"`
+results all reach the upstream as sent. None of the cooperative machinery
+runs: no prompt injection, system→user rewrite, history translation,
+require-tool, tool-search, todo replay, malformed-call retry, empty-response
+rescue or local token estimate (upstream `usage` is passed through). Upstream
+4xx keep their status and carry the upstream message; 5xx become 502. A
+stream that breaks mid-way ends with an `{"error":…}` SSE event.
+
+Routing: `_is_native_tool_model` matches the model id against
+`PROXY_NATIVE_TOOL_MODELS`, comma-separated fnmatch patterns (empty → the
+default `*-withtools`; `off` disables). The route is also off when
+`PROXY_PROMPT_MODE` is set (an explicit `harness start/restart --prompt-mode
+<mode>` means "use that cooperative mode on every model", which is how the
+old behavior and the mode benchmarks stay reachable on `-withtools` models)
+and on the chatgpt backend. The startup banner prints the result as `native
+tools:`. Log line: `upstream shape: mode=native`.
 
 ## URL base + model passthrough
 
@@ -1196,6 +1223,7 @@ PROXY_TIMEOUT=180           OUTPUT_DIR (optional)
 MODEL_CONTEXT_LENGTH=200000
 HARNESS_FORCE_LOOPBACK (optional; host mode sets it — see below)
 PROXY_BACKEND=openai        (optional; `harness chatgpt` sets it — see below)
+PROXY_NATIVE_TOOL_MODELS    (optional; default `*-withtools` — see Native tool models)
 CHATGPT_BASE_URL / CHATGPT_MODEL_NAME / CHATGPT_COOKIE_STRING
                             (REQUIRED only when PROXY_BACKEND=chatgpt)
 ```

@@ -1549,6 +1549,25 @@ _probe_upstream_auth() {
                 return 2
             fi
 
+            # The key works but DEFAULT_MODEL_NAME is not one this team may
+            # use (e.g. the upstream retired it). Name the model, not the key.
+            if [[ "$err_message" == *"access to this model"* ]]; then
+                echo "" >&2
+                echo "================================================================" >&2
+                echo " ERROR: Upstream refused model '$api_model' (HTTP $status_code)" >&2
+                echo "================================================================" >&2
+                echo " upstream message:    $err_message" >&2
+                echo "" >&2
+                echo " The API key is fine; DEFAULT_MODEL_NAME names a model your key" >&2
+                echo " cannot use (it may have been retired). Pick one from the live" >&2
+                echo " catalog with 'harness model', then start again." >&2
+                echo "" >&2
+                echo " To bypass this probe, set HARNESS_SKIP_AUTH_PROBE=1." >&2
+                echo "================================================================" >&2
+                echo "" >&2
+                return 1
+            fi
+
             # Rejected key (#108): a 401/403 with no unlock URL and no
             # key-is-fine error type. Abort with an actionable banner instead of
             # warning and dropping the user into an agent with no models.

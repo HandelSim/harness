@@ -5713,5 +5713,128 @@ class TestSinglePromptMode(unittest.TestCase):
             self.assertTrue(proxy._REQUIRE_TOOL_ENABLED)
 
 
+class TestNativeToolPassthrough(unittest.TestCase):
+    """`-withtools` models bypass the cooperative pipeline: the request goes
+    upstream verbatim and the reply is relayed unchanged."""
+
+    TOOLS = [{"type": "function", "function": {
+        "name": "bash", "parameters": {"type": "object", "properties": {}}}}]
+
+    class FakeResp:
+        def __init__(self, status, body, chunks=None):
+            self.status_code = status
+            self._body = body
+            self._chunks = chunks or []
+            self.content = body.encode("utf-8")
+            self.text = body
+            self.closed = False
+
+        def json(self):
+            return json.loads(self._body)
+
+        def iter_content(self, chunk_size=None):
+            yield from self._chunks
+
+        def close(self):
+            self.closed = True
+
+    def _post(self, body, fake):
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post", return_value=fake) as mock_post, \
+                patch.object(proxy, "save_debug_file"), \
+                patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)), \
+                patch("sys.stdout", io.StringIO()):
+            resp = client.post("/v1/chat/completions", data=json.dumps(body),
+                               content_type="application/json")
+            data = resp.get_data()
+        return resp, data, mock_post
+
+    def test_request_forwarded_verbatim(self):
+        msgs = [
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "run ls"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "bash", "arguments": "{}"},
+                "extra_content": {"google": {"thought_signature": "SIG"}}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"},
+        ]
+        body = {"model": "gemini-x-withtools", "messages": msgs, "tools": self.TOOLS,
+                "tool_choice": "auto", "temperature": 0}
+        upstream = {"choices": [{"message": {"role": "assistant", "content": "done"},
+                                 "finish_reason": "stop"}]}
+        resp, data, mock_post = self._post(body, self.FakeResp(200, json.dumps(upstream)))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(json.loads(data), upstream)
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent, body)
+        self.assertFalse(mock_post.call_args.kwargs["stream"])
+
+    def test_native_tool_calls_relayed_unchanged(self):
+        upstream = {"choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "tool_calls": [{
+                "id": "call_9", "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"},
+                "extra_content": {"google": {"thought_signature": "SIG"}}}]}}]}
+        body = {"model": "gemini-x-withtools", "tools": self.TOOLS,
+                "messages": [{"role": "user", "content": "ls"}]}
+        _, data, _ = self._post(body, self.FakeResp(200, json.dumps(upstream)))
+        self.assertEqual(json.loads(data), upstream)
+
+    def test_stream_relayed_byte_for_byte(self):
+        chunks = [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n', b"data: [DONE]\n\n"]
+        body = {"model": "gemini-x-withtools", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}
+        resp, data, mock_post = self._post(body, self.FakeResp(200, "", chunks))
+        self.assertEqual(resp.mimetype, "text/event-stream")
+        self.assertEqual(data, b"".join(chunks))
+        self.assertTrue(mock_post.call_args.kwargs["stream"])
+
+    def test_upstream_4xx_keeps_status_and_message(self):
+        err = {"error": {"message": "Your team does not have access to this model.",
+                         "type": "forbidden"}}
+        body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
+        resp, data, _ = self._post(body, self.FakeResp(403, json.dumps(err)))
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("does not have access", json.loads(data)["error"]["message"])
+
+    def test_upstream_5xx_becomes_502(self):
+        body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
+        resp, _, _ = self._post(body, self.FakeResp(500, "boom"))
+        self.assertEqual(resp.status_code, 502)
+
+    def test_other_models_stay_cooperative(self):
+        body = {"model": "gemini-plain", "tools": self.TOOLS,
+                "messages": [{"role": "user", "content": "ls"}]}
+        upstream = {"choices": [{"message": {"content": "ok"}}]}
+        _, _, mock_post = self._post(body, self.FakeResp(200, json.dumps(upstream)))
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertNotIn("tools", sent)
+        self.assertNotEqual(sent["messages"], body["messages"])
+
+    def test_setup_patterns(self):
+        cases = [
+            ({}, ("*-withtools",)),
+            ({"PROXY_NATIVE_TOOL_MODELS": "a-*, b"}, ("a-*", "b")),
+            ({"PROXY_NATIVE_TOOL_MODELS": "off"}, ()),
+            ({"PROXY_PROMPT_MODE": "hybrid"}, ()),
+        ]
+        for env, want in cases:
+            clean = {k: v for k, v in os.environ.items()
+                     if k not in ("PROXY_NATIVE_TOOL_MODELS", "PROXY_PROMPT_MODE")}
+            clean.update(env)
+            with patch.dict(os.environ, clean, clear=True), \
+                    patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ()), \
+                    patch.object(proxy, "_NATIVE_TOOL_STATUS", ""):
+                proxy._setup_native_tools()
+                self.assertEqual(proxy._NATIVE_TOOL_PATTERNS, want, env)
+
+    def test_model_matching(self):
+        with patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)):
+            self.assertTrue(proxy._is_native_tool_model("gemini-3.8-flash-withtools"))
+            self.assertFalse(proxy._is_native_tool_model("gemini-3.8-flash"))
+            self.assertFalse(proxy._is_native_tool_model(""))
+
+
 if __name__ == "__main__":
     unittest.main()

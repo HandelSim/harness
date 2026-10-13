@@ -308,6 +308,15 @@ probe_case "401 empty-type no-URL → rc=1 (abort)" "401" "$BARE_401_BODY" "1" \
     "ERROR: Upstream rejected the API key" \
     "HARNESS_SKIP_AUTH_PROBE=1"
 
+# 403 "no access to this model" → rc=1 with a model banner, not the key
+# banner: the key works, DEFAULT_MODEL_NAME names a model the team cannot use
+# (the upstream retired its plain models when the -withtools ones shipped).
+MODEL_BODY='{"error":{"message":"Your team does not have access to this model. Contact your team admin.","type":"forbidden"}}'
+probe_case "403 model access → rc=1 (model banner)" "403" "$MODEL_BODY" "1" \
+    "ERROR: Upstream refused model" \
+    "harness model" \
+    "HARNESS_SKIP_AUTH_PROBE=1"
+
 # Top-level unlock_url (alt provider shape) also triggers the rc=1 path.
 TOP_LEVEL_BODY='{"unlock_url":"https://example.test/unlock/top","message":"locked"}'
 probe_case "401 top-level unlock_url → rc=1" "401" "$TOP_LEVEL_BODY" "1" \

@@ -40,8 +40,9 @@ These are the load-bearing behaviors the proxy is built around:
     no reply carries `tool_calls`, and `response_format` (`json_schema` or
     `json_object`) is ignored (markdown comes back). Re-run `harness probe`
     when the vendor says it is enabled (see [`harness-cli.md`](harness-cli.md)).
-  - The proxy still ignores native `tool_calls` in replies
-    (`extract_assistant_content` reads only `message.content`).
+  - **2026-10-13: the `-withtools` models are live and standard.** See
+    [Native-tools models](#native-tools-models--withtools). Everything else
+    in this section describes the plain models and the cooperative path.
 - **Hidden, uncontrollable system prompt.** The upstream runs its own
   system prompt that we can neither see nor override. A `system`-role
   message in the request is **quietly ignored** (no error). Its prompt is
@@ -91,6 +92,38 @@ These are the load-bearing behaviors the proxy is built around:
 - **TLS now verifies** against system CAs (the proxy still sends
   `verify=False`). `gemini_enterprise.thinking[]` came back empty on
   `gemini-3.8-flash`.
+
+## Native-tools models (`-withtools`)
+
+`harness probe` on `gemini-3.8-flash-withtools` (2026-10-13, one sample each)
+found a standard OpenAI chat-completions contract, unlike the plain models:
+
+- **Catalog.** `/v1/models` now lists only `*-withtools` ids (plus
+  `gemini-embedding-2`), each with a `capabilities` object (it says
+  `tools:false`, which is wrong), `lane`, `pool` and `credit_weights`;
+  `owned_by` is `stark-proxy`. Whether the old plain ids still answer was not
+  probed; a model the team cannot use returns `403 forbidden` "Your team does
+  not have access to this model", which the startup auth probe now reports as
+  a model problem, not a key problem.
+- **Tools work.** `tools` + `tool_choice` (`auto`/`none`/`required`/named)
+  return `message.tool_calls` with `finish_reason: tool_calls`, streamed as
+  standard deltas. Parallel calls work (`parallel_tool_calls:false` is
+  ignored). `role:"tool"` results, multi-step chains, an 11-tool opencode-like
+  loop, nested/typed arguments, odd tool names (dots, dashes, 64 chars,
+  `mcp__x__y`), 300-tool catalogs and the legacy `functions` API all worked.
+- **System prompts and history are honored** (B01-B10, C01-C04), unlike the
+  plain models.
+- **Gemini response shape.** `tool_calls[].extra_content.google.thought_signature`,
+  `usage.completion_tokens_details.reasoning_tokens`,
+  `usage.extra_properties.google.traffic_type`, `system_fingerprint`; the
+  response `model` is the base id (no `-withtools`). Round trips that omit
+  the thought signature still worked.
+- **Parameters now apply.** `max_tokens` (truncates, `finish_reason:
+  length`), `stop` and `stream_options.include_usage` work. `temperature:0`
+  is still not deterministic and `n` still returns one choice.
+
+The proxy forwards these models natively; see [`proxy.md`](proxy.md) →
+Native tool models.
 
 ## A second backend: the ChatGPT backend-api
 

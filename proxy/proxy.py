@@ -46,6 +46,7 @@ Environment variables (see README / .env.example):
 """
 
 import datetime
+import fnmatch
 import json
 import os
 import re
@@ -418,6 +419,136 @@ def _upstream_post(headers: Dict[str, str], payload: Dict[str, Any]) -> Any:
         verify=False,
         timeout=PROXY_TIMEOUT,
     )
+
+
+# Native tool-calling models. The upstream's `-withtools` family speaks the
+# standard OpenAI tools contract (tools/tool_choice in, tool_calls out, role
+# "tool" results, system prompts and full history honored; see
+# architecture/upstream-api.md), so for those models the proxy forwards the
+# request verbatim and relays the reply byte-for-byte instead of running the
+# cooperative-prompt pipeline. PROXY_NATIVE_TOOL_MODELS is a comma-separated
+# list of fnmatch patterns (empty means the default below; "off" disables the
+# route). An explicit `--prompt-mode` (PROXY_PROMPT_MODE set) also disables it,
+# so a benchmark or power launch that names a cooperative mode gets that mode
+# on every model.
+_NATIVE_TOOL_MODELS_DEFAULT = "*-withtools"
+_NATIVE_TOOL_PATTERNS: Tuple[str, ...] = (_NATIVE_TOOL_MODELS_DEFAULT,)  # set in main()
+_NATIVE_TOOL_STATUS: str = _NATIVE_TOOL_MODELS_DEFAULT  # banner text, set in main()
+
+
+def _setup_native_tools() -> None:
+    global _NATIVE_TOOL_PATTERNS
+    global _NATIVE_TOOL_STATUS
+    raw = os.environ.get("PROXY_NATIVE_TOOL_MODELS", "").strip()
+    if raw.lower() in ("off", "none", "0", "false"):
+        _NATIVE_TOOL_PATTERNS = ()
+        _NATIVE_TOOL_STATUS = "off (PROXY_NATIVE_TOOL_MODELS)"
+    elif os.environ.get("PROXY_PROMPT_MODE", "").strip():
+        _NATIVE_TOOL_PATTERNS = ()
+        _NATIVE_TOOL_STATUS = "off (--prompt-mode set)"
+    elif PROXY_BACKEND == "chatgpt":
+        _NATIVE_TOOL_PATTERNS = ()
+        _NATIVE_TOOL_STATUS = "off (chatgpt backend)"
+    else:
+        _NATIVE_TOOL_PATTERNS = tuple(
+            p.strip() for p in (raw or _NATIVE_TOOL_MODELS_DEFAULT).split(",") if p.strip()
+        )
+        _NATIVE_TOOL_STATUS = ", ".join(_NATIVE_TOOL_PATTERNS) or "off"
+
+
+def _is_native_tool_model(model: str) -> bool:
+    return bool(model) and any(fnmatch.fnmatchcase(model, p) for p in _NATIVE_TOOL_PATTERNS)
+
+
+def _native_passthrough(
+    req_id: str, inbound_request: Dict[str, Any], model_name: str, want_stream: bool
+) -> Response:
+    """Forward a native-tools request upstream unchanged and relay the reply.
+
+    Nothing is rewritten in either direction: opencode's tools, tool_choice,
+    assistant tool_calls (including any Gemini `extra_content` thought
+    signature it echoes back) and tool results reach the upstream as sent, and
+    the upstream's SSE stream or JSON body comes back as-is. Upstream 4xx keep
+    their status (so the AI SDK does not retry a deterministic rejection, and
+    does retry a 429); 5xx become 502 as on the cooperative path."""
+    payload = dict(inbound_request)
+    payload["model"] = model_name
+    messages = payload.get("messages") or []
+    print(
+        f"[{req_id}] upstream shape: mode=native messages={len(messages)} "
+        f"chars={sum(len(_flatten_content_to_str(m.get('content') or '')) for m in messages if isinstance(m, dict))}",
+        flush=True,
+    )
+    save_debug_file(req_id, "02", "API_Request", payload)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {PROXY_API_KEY}",
+    }
+    try:
+        resp = requests.post(
+            CHAT_URL,
+            headers=headers,
+            json=payload,
+            verify=False,
+            timeout=PROXY_TIMEOUT,
+            stream=want_stream,
+        )
+    except requests.RequestException as e:
+        print(f"[{req_id}] upstream request failed: {e}", flush=True)
+        save_debug_file(req_id, "03", "API_Error", {"error": str(e)})
+        return _client_error(f"upstream request failed: {e}", 502)
+
+    if resp.status_code >= 400:
+        err_body: Any
+        try:
+            err_body = resp.json()
+        except ValueError:
+            err_body = resp.text
+        resp.close()
+        print(f"[{req_id}] upstream returned {resp.status_code}: {err_body}", flush=True)
+        save_debug_file(req_id, "03", "API_Error", {"status": resp.status_code, "body": err_body})
+        detail = ""
+        if isinstance(err_body, dict) and isinstance(err_body.get("error"), dict):
+            detail = str(err_body["error"].get("message") or "")
+        status = resp.status_code if resp.status_code < 500 else 502
+        message = f"upstream returned status {resp.status_code}" + (f": {detail}" if detail else "")
+        return _client_error(message, status)
+
+    if not want_stream:
+        body = resp.content
+        resp.close()
+        try:
+            save_debug_file(req_id, "03", "API_Response", json.loads(body))
+        except ValueError:
+            save_debug_file(req_id, "03", "API_Response", {"raw": body.decode("utf-8", "replace")})
+        print(f"[{req_id}] upstream OK; relayed native JSON", flush=True)
+        return Response(body, status=200, mimetype="application/json")
+
+    def relay() -> Iterable[bytes]:
+        captured: Optional[List[bytes]] = [] if _OUTPUT_DIR is not None else None
+        try:
+            for chunk in resp.iter_content(chunk_size=None):
+                if not chunk:
+                    continue
+                if captured is not None:
+                    captured.append(chunk)
+                yield chunk
+        except requests.RequestException as e:
+            # The client already has a 200 and part of the stream; an error
+            # event is the only way left to tell the AI SDK the turn broke.
+            print(f"[{req_id}] upstream stream broke: {e}", flush=True)
+            err = {"error": {"message": f"upstream stream broke: {e}", "type": "proxy_error"}}
+            yield f"data: {json.dumps(err)}\n\n".encode("utf-8")
+        finally:
+            resp.close()
+            if captured is not None:
+                save_debug_file(
+                    req_id, "04", "Native_SSE_Response",
+                    {"raw": b"".join(captured).decode("utf-8", "replace")},
+                )
+            print(f"[{req_id}] upstream OK; relayed native SSE", flush=True)
+
+    return Response(relay(), status=200, mimetype="text/event-stream")
 
 
 _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
@@ -3467,6 +3598,10 @@ def catch_all(path: str) -> Response:
 
         print(f"[{req_id}] {request.method} /{path} model={model_name} messages={len(original_messages)} tools={len(tools)}", flush=True)
 
+        # Native tool-calling models skip the cooperative pipeline entirely.
+        if _is_native_tool_model(model_name):
+            return _native_passthrough(req_id, inbound_request, model_name, want_stream)
+
         # Require-tool mode shows the model one extra tool, `finish`, and
         # everything prompt-facing is built from the augmented array so the
         # synthetic tool flows through the normal schema + recency rendering.
@@ -3940,6 +4075,8 @@ def main() -> None:
     _validate_config()
     _OUTPUT_DIR = init_output_dir()
     _setup_prompt_mode()
+    # After _setup_prompt_mode: an explicit --prompt-mode turns the native route off.
+    _setup_native_tools()
     _setup_host_os()
     _setup_run_mode()
     _setup_mcp_tool_recency()
@@ -3984,6 +4121,7 @@ def main() -> None:
         f"{banner_auth}"
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
+        f"   native tools:   {_NATIVE_TOOL_STATUS}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"
         f"   mcp recency:    {len(_MCP_TOOL_RECENCY)} tool(s)\n"
