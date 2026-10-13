@@ -1378,7 +1378,7 @@ class Prober:
         if not catalog:
             self.p("G    SKIP no catalog from /v1/models")
             return
-        cols = ["chat", "sys", "obey", "tool", "tstrm", "rtrip", "json", "act", "secs"]
+        cols = ["chat", "sys", "obey", "hist", "tool", "tstrm", "rtrip", "json", "act", "secs"]
         self.p("%-34s %s" % ("model", " ".join("%-5s" % c for c in cols)))
         sch = {"type": "json_schema", "json_schema": {"name": "n", "strict": True, "schema": {
             "type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"], "additionalProperties": False}}}
@@ -1396,6 +1396,10 @@ class Prober:
             r = self.chat([{"role": "system", "content": "Reply to every message with exactly the single word PINEAPPLE and nothing else."},
                            {"role": "user", "content": "What is 2+2?"}], "G %s obey" % m, model=m)
             res.append(r.ok and r.content.strip().strip(".!").upper() == "PINEAPPLE")
+            r = self.chat([{"role": "user", "content": "My favorite color is TEAL-492. Just acknowledge."},
+                           {"role": "assistant", "content": "Noted."},
+                           {"role": "user", "content": "What is my favorite color? Just the value."}], "G %s hist" % m, model=m)
+            res.append(r.ok and "TEAL-492" in r.content.upper())
             q = [{"role": "user", "content": "What is the weather in Paris right now?"}]
             r = self.chat(q, "G %s tool" % m, model=m, tools=[WEATHER])
             res.append(r.ok and bool(r.tool_calls) and r.tool_calls[0]["name"] == "get_current_weather")
@@ -1416,7 +1420,7 @@ class Prober:
             cells = ["%-5s" % ("yes" if x else "no") for x in res] + ["%-5d" % int(time.monotonic() - t0)]
             self.p("%-34s %s" % (self.red(m)[:34], " ".join(cells)))
         self.p("cols: chat=basic reply, sys=system content reaches model, obey=system instruction obeyed, tool=native tool call, "
-               "tstrm=streamed tool call, rtrip=tool result round trip, json=json_schema, act=coding agent calls a tool instead of describing")
+               "hist=earlier turn recalled, tstrm=streamed tool call, rtrip=tool result round trip, json=json_schema, act=coding agent calls a tool instead of describing")
 
     # ------------------------------------------------------------------
     def summary(self, secs):
@@ -1442,6 +1446,7 @@ class Prober:
         line("acts instead of describing", "D14", "D14b", "D14c", "D14d")
         line("system content reaches model", "B02", "B04", "B05", "B06", "B09", "B10")
         line("system instruction obeyed", "B01", "B07", "B08", "B17")
+        line("earlier turns kept (history)", "C01", "C03")
         line("consecutive same-role messages", "C02", "C04")
         line("stateless across requests", "C07")
         line("schema keywords accepted", "D20", "D20b", "D20c", "D20d", "D20e", "D20f", "D20g", "D20h", "D20i")
