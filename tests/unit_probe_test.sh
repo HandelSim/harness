@@ -22,6 +22,9 @@
 #      verdict (the mock sees only the last message and 502s above 100 KB)
 #   T9 none of the secrets appear in the memory suite's stdout or log, and
 #      the session id it passes back is scrubbed in the log
+#   T9b memory --budget stops a section before a request that would pass it
+#   T9c a 429 "Daily credit limit exceeded" stops the full and memory suites
+#      at once (rc 3, findings so far, redacted) instead of sending more
 #   T10 'harness probe optimize-single' (small sizes, 2 reps) exits 0 with both
 #      stages, the verdict tables, a weak zone and a full recommendation; it waits out and
 #      retries a 429 (the mock answers the first single-suite request with
@@ -70,6 +73,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PREFIX = "/" + sys.argv[2]
 LOCKED = sys.argv[3] == "locked"
+QUOTA = sys.argv[3] == "quota"
 PORT_FILE = sys.argv[1]
 SEEN = {"single": 0}
 
@@ -126,6 +130,10 @@ class H(BaseHTTPRequestHandler):
         if len(raw) > 100000:
             # A size ceiling, like the real upstream's 502 on large requests.
             return self.send(502, {"error": {"type": "bad_gateway", "message": "upstream too large"}})
+        if QUOTA:
+            # The real upstream's answer once the key's daily credits are spent.
+            return self.send(429, {"error": {"type": "rate_limit_exceeded", "retry_after_seconds": 88390,
+                                             "message": "Daily credit limit exceeded. " + leak(self)}})
         if req.get("model") == "probe-nonexistent-model-xyz":
             return self.send(400, {"error": {"type": "invalid_request_model", "message": "unknown model"}})
         tools = req.get("tools") or []
@@ -169,7 +177,9 @@ class H(BaseHTTPRequestHandler):
             content = json.dumps({"title": "Dune", "author": "Frank Herbert", "publication_year": 1965})
         ge = {"assist_token": "ASSISTSECRET123456", "session": "projects/p-123456/locations/global/sessions/9",
               "thinking": ["thought about it " + leak(self)]}
-        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        pt, rt = max(10, len(raw) // 3), 0 if req.get("reasoning_effort") == "none" else 20
+        usage = {"prompt_tokens": pt, "completion_tokens": 5, "total_tokens": pt + 5 + rt,
+                 "completion_tokens_details": {"reasoning_tokens": rt}}
         if req.get("stream"):
             evs = []
             base = {"id": "c1", "object": "chat.completion.chunk", "model": req.get("model")}
@@ -308,11 +318,16 @@ stop_mock
 echo "$out" >"$TMP_ROOT/stdout-mem.txt"
 [[ $rc -eq 0 ]] || { echo "$out" | tail -30; fail "T8 memory probe exited $rc"; }
 for want in "=== harness probe memory v" "--- 1. " "--- 2. " "--- 3. " "--- 4. " "--- 5. " "--- 6. " \
-            "--- 7. " "--- 8. " "--- 9. " "=== memory verdict" "earlier facts recalled from separate messages: 0/" \
-            "never reached the model" "request-size edge (code text)" "M3   ALL" "M9c" "mock-b" \
+            "--- 7. " "=== memory verdict" "earlier facts recalled from separate messages: 0/" \
+            "never reached the model" "M4c" "M5   NONE" "agent session (native tools)" \
+            "by padding size: mid@0:" "reasoning_effort -> reasoning_tokens: absent:20, none:0, low:20, high:20" \
+            "tokens used (as reported): prompt" \
+            "section 1 used ~" "mock-b" \
             "full redacted request log: state/output/probe-memory-" "=== end harness probe ==="; do
     [[ "$out" == *"$want"* ]] || { echo "$out" | tail -40; fail "T8 missing '$want' in output"; }
 done
+[[ "$out" != *"--- 8. "* && "$out" != *"probe error"* && "$out" != *"Traceback"* ]] \
+    || { echo "$out" | tail -40; fail "T8 unexpected section 8 or a probe error"; }
 ok "T8 memory suite exits 0 with all sections and a verdict"
 
 # --- T9: memory suite redaction ---
@@ -330,6 +345,39 @@ done
 grep -qF '"session_id": "<redacted>"' "$log" || fail "T9 passed-back session id not scrubbed in the log"
 grep -qF '### layout ' "$log" || fail "T9 memory log lacks the per-request layout lines"
 ok "T9 no secrets in the memory suite's stdout or log"
+
+# --- T9b: --budget stops a section before an expensive request ---
+start_mock ok
+URL="http://127.0.0.1:${PORT}/${PREFIX}"
+out=$(PROXY_API_URL="$URL" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" \
+      cmd_probe memory --quick --only 6 --budget 15000 --max-chars 200000 --delay-scale 0 --timeout 20 2>&1); rc=$?
+stop_mock
+[[ $rc -eq 0 && "$out" == *"section 6 stopped: the next request"* && "$out" == *"--only 6 --budget 1000000"* \
+   && "$out" == *"stopped by --budget: 6"* && "$out" == *"M6a  NONE pad 0 "* && "$out" != *"M6a  NONE pad 32k"* ]] \
+    || { echo "$out" | tail -30; fail "T9b budget: rc=$rc"; }
+ok "T9b --budget stops section 6 before its 32k request and says how to rerun it"
+
+# --- T9c: an exhausted daily credit quota stops the run at once ---
+for suite in full memory; do
+    start_mock quota
+    URL="http://127.0.0.1:${PORT}/${PREFIX}"
+    args=(--skip-long --repeat 1)
+    [[ $suite == memory ]] && args=(memory --quick --delay-scale 0)
+    out=$(PROXY_API_URL="$URL" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" HARNESS_PROBE_REDACT="$ORG" \
+          cmd_probe "${args[@]}" --timeout 20 2>&1); rc=$?
+    stop_mock
+    [[ $rc -eq 3 && "$out" == *"credit quota is used up"* && "$out" == *"=== end harness probe ==="* ]] \
+        || { echo "$out" | tail -30; fail "T9c $suite quota: rc=$rc"; }
+    want="=== key findings ==="
+    [[ $suite == memory ]] && want="=== memory verdict"
+    n=$(sed -n 's/^requests=\([0-9]*\) .*/\1/p' <<<"$out")
+    [[ "$out" == *"$want"* && -n "$n" && $n -le 4 ]] \
+        || { echo "$out" | tail -30; fail "T9c $suite quota: no findings block, or kept sending (requests=$n)"; }
+    for secret in "$KEY" "PROBEKEY" "tok_PROB" "$PREFIX" "secretcorp" "admin" "10.1." "127.0" "$ORG"; do
+        [[ "$out" != *"$secret"* ]] || fail "T9c $suite quota output leaked '$secret'"
+    done
+done
+ok "T9c a spent daily credit quota stops full and memory runs at once (rc 3, findings so far, redacted)"
 
 # --- T10: single-message suite against the mock ---
 rm -f "$TMP_ROOT"/state/output/probe-*.log

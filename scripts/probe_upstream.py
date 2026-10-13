@@ -587,6 +587,26 @@ def filler(n_chars, needle=None, seed=0):
 # --------------------------------------------------------------------------
 
 
+class QuotaExhausted(SystemExit):
+    """The key's credit quota is used up: every further request would fail
+    the same way, so the run stops and reports what it has."""
+
+
+def _quota_note(r):
+    """The upstream's message when a 429 is an exhausted credit quota (resets
+    in hours) rather than a per-minute limit worth waiting out; else None."""
+    if r.status != 429 or not isinstance(r.json, dict):
+        return None
+    e = r.json.get("error") if isinstance(r.json.get("error"), dict) else r.json
+    msg = str(e.get("message") or "")
+    ra = e.get("retry_after_seconds")
+    # "Daily credit limit exceeded" with retry_after ~a day; a per-minute
+    # limit says neither and asks for seconds.
+    if "daily" in msg.lower() or (isinstance(ra, (int, float)) and ra > 3600):
+        return msg or "retry after %ss" % ra
+    return None
+
+
 class Prober:
     def __init__(self, args, client, red, out):
         self.a = args
@@ -598,6 +618,11 @@ class Prober:
         self.invented = {}
         self.consec_net_fail = 0
         self.net_fail_max = 4
+        # Token use as the upstream reported it, and credits by the catalog's
+        # credit_weights (reasoning counted as output: an upper estimate).
+        self.tok = {"in": 0, "out": 0, "think": 0}
+        self.credits = 0
+        self.weights = {}  # model -> (input weight, output weight)
 
     # ---- output ----
     def p(self, s=""):
@@ -644,12 +669,42 @@ class Prober:
         if r.status in (401, 403) and "unlock" in (r.text or "").lower():
             raise SystemExit("aborting: the API key is LOCKED. Run 'harness unlock', unlock it in the "
                              "browser, then re-run 'harness probe'.")
-        provided = {((t.get("function") or {}).get("name")) for t in (kw.get("tools") or [])}
+        q = _quota_note(r)
+        if q:
+            raise QuotaExhausted("aborting: the key's credit quota is used up (%s). Every further request would "
+                                 "fail the same way; findings so far are below." % self.red(q)[:200])
+        self.count_usage(body["model"], r.usage)
+        provided ={((t.get("function") or {}).get("name")) for t in (kw.get("tools") or [])}
         provided |= {f.get("name") for f in (kw.get("functions") or [])}
         for tc in r.tool_calls:
             if tc["name"] and tc["name"] not in provided:
                 self.invented[tc["name"]] = self.invented.get(tc["name"], 0) + 1
         return r
+
+    def count_usage(self, model, u):
+        if not isinstance(u, dict):
+            return
+        pt, ct = u.get("prompt_tokens") or 0, u.get("completion_tokens") or 0
+        rt = (u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        if not all(isinstance(x, (int, float)) for x in (pt, ct, rt)):
+            return
+        self.tok["in"] += pt
+        self.tok["out"] += ct
+        self.tok["think"] += rt
+        wi, wo = self.weights.get(model, (1, 1))
+        self.credits += pt * wi + (ct + rt) * wo
+
+    def read_weights(self, r):
+        """Remember each catalog model's credit_weights from a /v1/models reply."""
+        for m in ((r.json or {}).get("data") or []) if isinstance(r.json, dict) else []:
+            w = m.get("credit_weights") if isinstance(m, dict) else None
+            if isinstance(w, dict) and isinstance(w.get("input"), (int, float)) and isinstance(w.get("output"), (int, float)):
+                self.weights[m.get("id")] = (w["input"], w["output"])
+
+    def usage_line(self):
+        return ("tokens used (as reported): prompt %s, output %s, reasoning %s; ~%s credits by the catalog's "
+                "credit_weights, reasoning counted as output"
+                % (_kfmt(self.tok["in"]), _kfmt(self.tok["out"]), _kfmt(self.tok["think"]), _kfmt(self.credits)))
 
     def fail_note(self, r):
         return r.short_err(self.red)
@@ -709,7 +764,8 @@ class Prober:
                              "browser, then re-run 'harness probe'.")
         if r.ok and isinstance(r.json, dict):
             catalog = [m.get("id") for m in (r.json.get("data") or []) if isinstance(m, dict) and m.get("id")]
-            self.rec("A01", "GET /v1/models", "INFO",
+            self.read_weights(r)
+            self.rec("A01","GET /v1/models", "INFO",
                      self.red("%d models, default %s in catalog: %s" % (len(catalog), "IS" if self.model in catalog else "NOT", ", ".join(catalog)))[:600], r)
         else:
             self.rec("A01", "GET /v1/models", "ERR", self.fail_note(r), r)
@@ -1454,6 +1510,7 @@ class Prober:
         line("large tool catalogs", "D22", "D22b", "D22c")
         line("structured output", "E01", "E02", "E03", "E04", "E05")
         line("invented tool names", "D34")
+        self.p("  " + self.usage_line())
         self.p("requests=%d elapsed=%ds" % (self.c.n, int(secs)))
 
 
@@ -1477,7 +1534,6 @@ _QUESTION = ("List every crate label mentioned anywhere in this conversation, in
              "see; do not guess or invent labels.")
 _WORDS = ["parser", "cache", "router", "ledger", "socket", "buffer", "worker", "schema", "tensor", "bucket",
           "queue", "shard", "token", "lexer", "vector", "matrix", "client", "config", "loader", "bridge"]
-_CJK = "数据处理完成记录状态更新服务器请求响应缓存队列任务进程线程文件目录配置模块接口测试结果错误日志"
 
 
 def _norm(s):
@@ -1511,17 +1567,6 @@ def code_filler(n_chars, seed=0):
         out.append(b)
         total += len(b)
         i += 1
-    return "".join(out)[:n_chars]
-
-
-def cjk_filler(n_chars, seed=0):
-    rnd = random.Random(seed)
-    out = []
-    total = 0
-    while total < n_chars:
-        line = "".join(rnd.choice(_CJK) for _ in range(30)) + " %d\n" % rnd.randint(0, 9999)
-        out.append(line)
-        total += len(line)
     return "".join(out)[:n_chars]
 
 
@@ -1575,6 +1620,10 @@ class MR:
         return "".join("#" if self.hits.get(n) else "." for n in names)
 
 
+class OverBudget(Exception):
+    """The next memory-suite request would take the run past --budget credits."""
+
+
 class MemProber(Prober):
     def __init__(self, args, client, red, out):
         Prober.__init__(self, args, client, red, out)
@@ -1592,6 +1641,8 @@ class MemProber(Prober):
         quick = args.quick
         self.R = 1 if quick else max(1, args.repeat)
         self.maxc = args.max_chars
+        self.budget = args.budget
+        self.cpt = 2.5  # chars per prompt token for code-like text; setup measures it
 
     # ---- labels ----
     def lab(self, where):
@@ -1638,7 +1689,14 @@ class MemProber(Prober):
         contents = [_content_to_text(m.get("content")) for m in messages]
         total = sum(len(c) for c in contents)
         last = len(contents[-1]) if contents else 0
-        wire = len(json.dumps({"model": model or self.model, "messages": messages}))
+        wire = len(json.dumps(dict({"model": model or self.model, "messages": messages}, **kw)))
+        # Refuse a request that would take the run past --budget: prompt by
+        # the measured chars/token, plus ~800 output+reasoning tokens (a
+        # short recall reply averaged ~450 with reasoning on).
+        wi, wo = self.weights.get(model or self.model, (1, 1))
+        est = int(wire / self.cpt * wi + 800 * wo)
+        if self.budget and self.credits + est > self.budget:
+            raise OverBudget(est)
         if self.c.log:
             lay = []
             for i, (m, c) in enumerate(zip(messages, contents)):
@@ -1736,49 +1794,50 @@ class MemProber(Prober):
         msgs.append({"role": "user", "content": self.final(ctrl)})
         return msgs, facts
 
-    def folded(self, n, tag, pad_each=0, seed=0):
-        lines, facts = [], []
-        for i in range(1, n + 1):
-            l = self.lab(tag)
-            facts.append(("h%d" % i, l))
-            pad = ("\n" + code_filler(pad_each, seed + i)) if pad_each else ""
-            lines.append("USER: %s Reply OK.%s\nASSISTANT: OK." % (self.fact(i, l), pad))
-        ctrl = self.lab(tag)
-        facts.append(("ctrl", ctrl))
-        body = ("Here is our conversation so far, oldest first:\n\n%s\n\n--- end of earlier conversation ---\n\n%s"
-                % ("\n\n".join(lines), self.final(ctrl)))
-        return [{"role": "user", "content": body}], facts
-
     # ------------------------------------------------------------------
     def run(self):
         t0 = time.monotonic()
         self.c.resp_max = 20000
         self.p("=== harness probe memory v%s (redacted; safe to paste) ===" % VERSION)
-        self.p("date_utc=%s python=%s os=%s model=%s repeat=%d quick=%s max_chars=%s"
+        self.p("date_utc=%s python=%s os=%s model=%s repeat=%d quick=%s max_chars=%s budget=%s credits"
                % (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), platform.python_version(),
-                  platform.system(), self.model, self.R, self.a.quick, _kfmt(self.maxc)))
+                  platform.system(), self.model, self.R, self.a.quick, _kfmt(self.maxc), _kfmt(self.budget)))
         self.p("legend: hist=#/. per planted earlier fact, oldest first (# = came back); ctrl = the fact in the "
-               "last message; total = request chars; ptok = upstream prompt_tokens (may be a gateway estimate); "
+               "last message; total = request chars; ptok = upstream prompt_tokens; "
                "sess = hash of the returned session id")
-        self.setup()
-        self.canary("start")
+        self.guarded("setup", self.setup)
+        self.guarded("canary", lambda: self.canary("start"))
         sel = self.a.only
+        # Cheapest first, so a short budget or quota still answers the most.
         plan = [("1", self.sec_reach), ("2", self.sec_turns), ("3", self.sec_layout),
-                ("4", self.sec_capacity), ("5", self.sec_hist_size), ("6", self.sec_folded),
-                ("7", self.sec_agent), ("8", self.sec_models), ("9", self.sec_server)]
+                ("4", self.sec_server), ("5", self.sec_agent), ("6", self.sec_hist_size), ("7", self.sec_models)]
         for key, fn in plan:
             if sel and key not in sel:
                 continue
-            if key == "8" and self.a.no_matrix:
+            if key == "7" and self.a.no_matrix:
                 continue
-            try:
-                fn()
-            except (SystemExit, KeyboardInterrupt):
-                raise
-            except Exception as e:
-                self.p("     section %s stopped by a probe error: %s: %s" % (key, type(e).__name__, str(e)[:200]))
-            self.canary("after %s" % key)
+            c0 = self.credits
+            if self.guarded(key, fn):
+                self.p("     section %s used ~%s credits" % (key, _kfmt(self.credits - c0)))
+            self.guarded("canary", lambda: self.canary("after %s" % key))
         self.verdict(time.monotonic() - t0)
+
+    def guarded(self, key, fn):
+        """Run one section; a budget stop or probe bug ends that section only."""
+        try:
+            fn()
+            return True
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except OverBudget as e:
+            self.notes.setdefault("over_budget", []).append(key)
+            self.p("     %s stopped: the next request (~%s credits) would pass --budget %s (%s used)%s"
+                   % ("section " + key if key.isdigit() else key, _kfmt(e.args[0]), _kfmt(self.budget),
+                      _kfmt(self.credits), "" if not key.isdigit() else
+                      ". Rerun it alone with e.g. --only %s --budget %d" % (key, max(2 * self.budget, 1000000))))
+        except Exception as e:
+            self.p("     section %s stopped by a probe error: %s: %s" % (key, type(e).__name__, str(e)[:200]))
+        return False
 
     def setup(self):
         self.section("0. setup")
@@ -1787,18 +1846,41 @@ class MemProber(Prober):
             raise SystemExit("aborting: the API key is LOCKED. Run 'harness unlock', unlock it in the "
                              "browser, then re-run 'harness probe memory'.")
         if r.ok and isinstance(r.json, dict):
-            self.catalog = [m.get("id") for m in (r.json.get("data") or []) if isinstance(m, dict) and m.get("id")]
+            data = [m for m in (r.json.get("data") or []) if isinstance(m, dict) and m.get("id")]
+            # Models the catalog marks as not chat (embeddings) cannot answer a recall test.
+            self.catalog = [m["id"] for m in data if (m.get("capabilities") or {}).get("chat", True) is not False]
+            self.read_weights(r)
         self.rec("M0", "catalog", "INFO" if r.ok else "ERR",
-                 ("%d models: %s" % (len(self.catalog), ", ".join(self.catalog))) if r.ok else self.fail_note(r), r)
-        for size in (x for x in (2000, 20000, 80000) if x <= self.maxc):
+                 ("%d chat models: %s; credit weights in/out for %s: %s"
+                  % (len(self.catalog), ", ".join(self.catalog), self.model, "%s/%s" % self.weights.get(self.model, (1, 1))))
+                 if r.ok else self.fail_note(r), r)
+        ratios = []
+        for size in (x for x in (2000, 20000) if x <= self.maxc):
             l = self.lab("M0")
             body = code_filler(size, seed=size) + "\n" + self.fact(1, l) + "\n" + _QUESTION
             m = self.mchat([{"role": "user", "content": body}], "M0 calib %s" % _kfmt(size), [("ctrl", l)])
             pt = m.r.usage.get("prompt_tokens") if isinstance(m.r.usage, dict) else None
-            self.mrec("M0b", "one message, %s chars: prompt_tokens calibration" % _kfmt(size), m,
+            if isinstance(pt, (int, float)) and pt > 0:
+                ratios.append(len(body) / pt)
+            self.mrec("M0b", "one message, %s chars: chars per prompt token" % _kfmt(size), m,
                       note="chars/ptok=%s" % (("%.2f" % (len(body) / pt)) if isinstance(pt, (int, float)) and pt > 0 else "-"))
             if not m.ok and m.r.status is None:
                 break
+        if ratios:
+            # Clamped: a gateway that reports a flat or made-up count must not
+            # turn the --budget estimate into nonsense.
+            self.cpt = min(4.0, max(1.5, min(ratios)))
+        # Reasoning tokens bill as output; see whether the upstream lets a client turn them down.
+        for eff in (None, "none", "low", "high"):
+            kw = {"reasoning_effort": eff} if eff else {}
+            r = self.chat([{"role": "user", "content": "What is 17 + 25? Reply with just the number."}],
+                          "M0r reasoning_effort=%s" % (eff or "absent"), **kw)
+            u = r.usage if isinstance(r.usage, dict) else {}
+            rt = (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            self.rec("M0r", "reasoning_effort %s" % (eff or "absent"), "INFO" if r.ok else "ERR",
+                     ("reasoning_tokens=%s completion_tokens=%s" % (rt if rt is not None else "-", u.get("completion_tokens", "-")))
+                     if r.ok else self.fail_note(r), r, r.content, 40)
+            self.notes.setdefault("effort", []).append((eff or "absent", r.status, rt))
 
     def canary(self, when):
         msgs, facts = self.turns_user_facts(3, "canary")
@@ -1891,7 +1973,7 @@ class MemProber(Prober):
                 msgs, facts = build("M3 " + cfg)
                 m = self.mchat(msgs, "M3 %s #%d" % (cfg, i + 1), facts, **kw)
                 self.mrec("M3", "%s #%d" % (title, i + 1), m, names)
-                self.sample("3", cfg, m, names, "folded" if cfg == "folded" else "multi")
+                self.sample("3", cfg, m, names, "multi")
 
         def asst(tag):
             msgs, facts = [], []
@@ -1937,8 +2019,6 @@ class MemProber(Prober):
         run("consecutive", "7 consecutive user messages, facts in the first 6", consec)
         run("system", "facts in a system message", system)
         run("first-msg", "facts all in message 0, then 5 filler turns (proxy puts tool defs there)", first_only)
-        run("folded", "same 6 turns folded into the last user message as a transcript",
-            lambda tag: self.folded(n, tag))
         run("stream", "user-turn facts with stream=true", lambda tag: self.turns_user_facts(n, tag), reps=1, stream=True)
 
     # ------------------------------------------------------------------
@@ -1948,18 +2028,19 @@ class MemProber(Prober):
                    and s["cfg"] not in ("instruction",))
 
     def sec_hist_size(self):
-        self.section("5. history vs size: facts before AND after a padding block")
-        sizes = [0, 32000, 300000] if self.a.quick else [0, 8000, 32000, 128000, 300000]
-        edge = self.notes.get("edge_fail")
-        sizes = [s for s in sizes if s + 2000 <= self.maxc and (edge is None or s < edge * 0.9)]
+        self.section("6. conversation size: facts before AND after a padding turn, growing until it fails")
+        sizes = [0, 32000, 128000] if self.a.quick else [0, 8000, 32000, 128000, 300000, 500000]
+        sizes = [s for s in sizes if s + 2000 <= self.maxc]
         if not self.hist_seen():
-            sizes = sizes[:1] + sizes[-1:] if len(sizes) > 2 else sizes
+            sizes = sizes[:2]
             self.p("     (no earlier turn has come back so far; running only %s as a check)"
                    % ", ".join(_kfmt(s) for s in sizes))
-        reps = min(self.R, 2)
         for p in sizes:
+            reps = min(self.R, 2) if p < 128000 else 1
+            tok = "~%sk tokens" % int(p / self.cpt / 1000) if p else "no padding"
+            stop = False
             for i in range(reps):
-                a, b, ctrl = self.lab("M5"), self.lab("M5"), self.lab("M5")
+                a, b, ctrl = self.lab("M6"), self.lab("M6"), self.lab("M6")
                 msgs = [{"role": "user", "content": self.fact(1, a) + " Reply OK."},
                         {"role": "assistant", "content": "OK."}]
                 if p:
@@ -1968,238 +2049,128 @@ class MemProber(Prober):
                 msgs += [{"role": "user", "content": self.fact(2, b) + " Reply OK."},
                          {"role": "assistant", "content": "OK."},
                          {"role": "user", "content": self.final(ctrl)}]
-                m = self.mchat(msgs, "M5 mid pad=%s #%d" % (_kfmt(p), i + 1), [("before", a), ("after", b), ("ctrl", ctrl)])
-                self.mrec("M5a", "pad %s in a middle turn (before,after) #%d" % (_kfmt(p), i + 1), m, ["before", "after"])
-                self.sample("5", "mid %d" % p, m, ["before", "after"], "multi", pad=p)
-        for p in sizes:
-            if not p:
-                continue
-            for i in range(reps):
-                a, ctrl = self.lab("M5"), self.lab("M5")
-                msgs = [{"role": "user", "content": self.fact(1, a) + " Reply OK."},
-                        {"role": "assistant", "content": "OK."},
-                        {"role": "user", "content": self.final(ctrl, "Reference output:\n" + code_filler(p, seed=p + 7 + i))}]
-                m = self.mchat(msgs, "M5 last pad=%s #%d" % (_kfmt(p), i + 1), [("before", a), ("ctrl", ctrl)])
-                self.mrec("M5b", "pad %s in the LAST message, earlier fact kept? #%d" % (_kfmt(p), i + 1), m, ["before"])
-                self.sample("5", "last %d" % p, m, ["before"], "multi", pad=p)
-
-    # ------------------------------------------------------------------
-    def needle_msg(self, size, tag, seed=0, filler=code_filler):
-        """One user message of ~size chars, needles at 0/25/50/75/100%."""
-        labs = [self.lab(tag) for _ in range(5)]
-        body_len = max(0, size - 700)
-        chunk = body_len // 4
-        parts = []
-        for k in range(5):
-            parts.append(self.fact("P%d" % (k * 25), labs[k]))
-            if k < 4:
-                parts.append(filler(chunk, seed=seed * 10 + k))
-        text = "\n".join(parts) + "\n\n" + _QUESTION
-        names = ["p0", "p25", "p50", "p75", "p100"]
-        return [{"role": "user", "content": text}], list(zip(names, labs)), names
-
-    def sec_capacity(self):
-        self.section("4. single-message capacity: 5 needles at 0/25/50/75/100%")
-        ladder = [32000, 128000, 300000, 500000, 700000] if self.a.quick else \
-            [8000, 32000, 64000, 128000, 200000, 300000, 400000, 500000, 600000, 700000]
-        ladder = [s for s in ladder if s <= self.maxc]
-        ok_max, full_max, fail_min, loss_min = 0, 0, None, None
-
-        def one(size, why, seed):
-            nonlocal ok_max, full_max, fail_min, loss_min
-            msgs, facts, names = self.needle_msg(size, "M4", seed=seed)
-            m = self.mchat(msgs, "M4 %s %s" % (why, _kfmt(size)), facts, timeout=max(self.a.timeout, 300))
-            self.mrec("M4", "%s %s chars (~%dk proxy-est tokens)" % (why, _kfmt(size), size // 3000), m, names,
-                      note="" if m.ok else "elapsed_to_error=%.0fs" % m.r.elapsed)
-            self.sample("4", "single %d" % size, m, names, "single", size=size)
-            if m.ok:
-                ok_max = max(ok_max, size)
-                if all(m.hit(n) for n in names):
-                    full_max = max(full_max, size)
-                elif loss_min is None or size < loss_min:
-                    loss_min = size
-            return m
-
-        flaky = []
-        for size in ladder:
-            m = one(size, "ladder", size)
-            if m.r.status is None:
-                self.p("     (network error; stopping the ladder)")
-                break
-            if not m.ok:
-                if one(size, "retry", size + 1).ok:  # flake, or a real limit?
-                    flaky.append(size)
-                    continue
-                fail_min = size
-                break
-        self.notes["flaky"] = flaky
-        if fail_min is not None and ok_max < fail_min:
-            lo, hi = ok_max, fail_min
-            for _ in range(2 if self.a.quick else 4):
-                mid = (lo + hi) // 2
-                if hi - lo < 15000:
-                    break
-                m = one(mid, "bisect", mid)
-                if m.ok:
-                    lo = mid
-                elif m.r.status is None:
-                    break
-                else:
-                    hi = mid
-                    fail_min = mid
-            self.notes["edge_ok"], self.notes["edge_fail"] = lo, hi
-            self.p("     request-size edge: OK at %s chars, error at %s chars" % (_kfmt(lo), _kfmt(hi)))
-            if self.r502:
-                self.p("     elapsed before each 502: %s (similar times = a timeout, not a size limit)"
-                       % ", ".join("%s:%.0fs" % (_kfmt(c), e) for c, e in self.r502))
-            if lo < 8000:
-                self.p("     (no size under the error edge passed; skipping the multibyte and history checks)")
-            # Units: the same edge in multibyte text. A CJK char is 1 char, 3
-            # UTF-8 bytes, 6 wire bytes (JSON \u escape, as the proxy sends it)
-            # and roughly one token, against ~3-4 chars per token for code.
-            # Which of these fail shows what the limit counts.
-            units = []
-            for frac in ((0.15, 0.3, 0.6) if lo >= 8000 else ()):
-                size = int(lo * frac)
-                msgs, facts, names = self.needle_msg(size, "M4 cjk", seed=size, filler=cjk_filler)
-                m = self.mchat(msgs, "M4 cjk %s" % _kfmt(size), facts, timeout=max(self.a.timeout, 300))
-                self.mrec("M4u", "multibyte text %s chars = %s UTF-8 bytes (code edge: %s chars)"
-                          % (_kfmt(size), _kfmt(len(msgs[0]["content"].encode("utf-8"))), _kfmt(lo)), m, names)
-                self.sample("4", "cjk %d" % size, m, names, "single", size=size, cjk=True)
-                if m.r.status is not None:
-                    units.append((size, m.wire, m.ok))
-            self.notes["units"] = units
-            # Does history count toward the same ceiling? Split ~1.3x the
-            # failing size across earlier turns, keep the last message small.
-            tot = int(hi * 1.3)
-            if lo >= 8000 and tot <= self.maxc * 1.5:
-                msgs, facts = [], []
-                for k in range(4):
-                    l = self.lab("M4 hist")
-                    facts.append(("h%d" % (k + 1), l))
-                    msgs.append({"role": "user", "content": self.fact(k + 1, l) + "\n" + code_filler(tot // 4, seed=k)})
-                    msgs.append({"role": "assistant", "content": "OK."})
-                ctrl = self.lab("M4 hist")
-                msgs.append({"role": "user", "content": self.final(ctrl)})
-                facts.append(("ctrl", ctrl))
-                m = self.mchat(msgs, "M4 history over edge", facts, timeout=max(self.a.timeout, 300))
-                self.mrec("M4h", "%s chars split over 4 earlier turns (above the edge): accepted?" % _kfmt(tot), m,
-                          ["h1", "h2", "h3", "h4"],
-                          note="(HTTP 200 here = history is cut before the size check)" if m.ok else "")
-                self.sample("4", "hist-over-edge", m, ["h1", "h2", "h3", "h4"], "multi", size=tot)
-        cand = min([x for x in (fail_min, loss_min) if x] or [full_max])
-        if fail_min or loss_min:
-            cand = min(int(cand * 0.8), full_max) if full_max else int(cand * 0.8)
-        self.notes.update(ok_max=ok_max, full_max=full_max, fail_min=fail_min, loss_min=loss_min)
-        if cand >= 8000:
-            n = 3 if self.a.quick else self.a.confirm
-            good = 0
-            for i in range(n):
-                msgs, facts, names = self.needle_msg(cand, "M4 confirm", seed=9000 + i)
-                m = self.mchat(msgs, "M4 confirm %s #%d" % (_kfmt(cand), i + 1), facts, timeout=max(self.a.timeout, 300))
-                self.mrec("M4c", "confirm %s chars #%d" % (_kfmt(cand), i + 1), m, names)
-                self.sample("4", "confirm %d" % cand, m, names, "single", size=cand)
-                good += 1 if (m.ok and all(m.hit(x) for x in names)) else 0
-            self.notes["confirm"] = (cand, good, n)
-            self.p("     confirm at %s chars: %d/%d fully recalled" % (_kfmt(cand), good, n))
-
-    # ------------------------------------------------------------------
-    def sec_folded(self):
-        self.section("6. a whole conversation folded into one message: capacity")
-        edge = self.notes.get("edge_ok") or self.notes.get("full_max") or self.maxc
-        sizes = sorted({s for s in (64000, 200000, int(edge * 0.9)) if 8000 <= s <= min(edge, self.maxc)})
-        if self.a.quick:
-            sizes = sizes[-2:]
-        for size in sizes:
-            n = 10
-            msgs, facts = self.folded(n, "M6", pad_each=max(0, size // n - 200), seed=size)
-            names = ["h%d" % k for k in range(1, n + 1)]
-            m = self.mchat(msgs, "M6 folded %s" % _kfmt(size), facts, timeout=max(self.a.timeout, 300))
-            self.mrec("M6", "10-turn transcript folded into one message, %s chars" % _kfmt(m.chars_total), m, names)
-            self.sample("6", "folded %d" % size, m, names, "folded", size=m.chars_total)
-
-    # ------------------------------------------------------------------
-    def sec_agent(self):
-        self.section("7. agent-like session: one conversation grows a turn per request")
-        steps = 6 if self.a.quick else self.a.steps
-        for mode in ("alone", "interleaved"):
-            if mode == "interleaved" and self.a.quick:
-                break
-            n = steps if mode == "alone" else max(3, steps // 2)
-            head, tail = self.lab("M7"), self.lab("M7")
-            msg0 = (self.fact("H", head) + "\n" + tooldefs_filler(30000, seed=8) + "\n" + self.fact("T", tail)
-                    + "\n\nTask: refactor the worker module. Keep notes of every crate label you see.")
-            hist = [{"role": "user", "content": msg0}, {"role": "assistant", "content": "Starting. ```json\n{\"name\": \"read\", \"arguments\": {\"path\": \"src/worker.py\"}}\n```"}]
-            facts = [("H", head), ("T", tail)]
-            prev_sess = None
-            lost_at = {}
-            cap = min(self.maxc, self.notes.get("edge_fail") or self.maxc)
-            for k in range(1, n + 1):
-                l = self.lab("M7")
-                facts.append(("s%d" % k, l))
-                ctrl = self.lab("M7")
-                out = "Tool output (step %d):\n%s\n%s" % (k, code_filler(6000, seed=k * 31), self.fact("S%d" % k, l))
-                msgs = hist + [{"role": "user", "content": self.final(ctrl, out)}]
-                if sum(len(_content_to_text(x.get("content"))) for x in msgs) > cap:
-                    self.p("     (%s: step %d would exceed %s chars; stopping)" % (mode, k, _kfmt(cap)))
-                    break
-                names = [x for x, _ in facts]
-                m = self.mchat(msgs, "M7 %s step %d" % (mode, k), facts + [("ctrl", ctrl)])
-                changed = prev_sess is not None and m.sess != prev_sess
-                prev_sess = m.sess
-                if m.ok:
-                    for x in names:
-                        if not m.hit(x) and x not in lost_at:
-                            lost_at[x] = k
-                self.mrec("M7", "%s step %d (%d msgs)" % (mode, k, len(msgs)), m, names[:-1],
-                          note="this-step=%s%s" % ("ok" if m.hit(names[-1]) else "MISS",
-                                                    " session_changed" if changed else ""))
-                self.sample("7", "%s %d" % (mode, k), m, names[:-1], "multi", step=k, mode=mode)
+                m = self.mchat(msgs, "M6 mid pad=%s #%d" % (_kfmt(p), i + 1), [("before", a), ("after", b), ("ctrl", ctrl)],
+                               timeout=max(self.a.timeout, 300))
+                self.mrec("M6a", "pad %s (%s) in a middle turn (before,after) #%d" % (_kfmt(p), tok, i + 1), m,
+                          ["before", "after"])
+                self.sample("6", "mid %d" % p, m, ["before", "after"], "multi", pad=p)
                 if not m.ok:
-                    if m.r.status is not None:
-                        self.notes["agent_err_" + mode] = k
+                    self.notes["size_fail"] = (m.chars_total, m.r.status)
+                    stop = True
                     break
-                hist = msgs[:-1] + [{"role": "user", "content": out}, {"role": "assistant", "content": m.r.content}]
-                if mode == "interleaved":
-                    t = self.mchat([{"role": "user", "content": "Write a 5-word title for: refactor the %s module."
-                                     % random.choice(_WORDS)}], "M7 interleaved side request %d" % k, [])
-                    if not t.ok and t.r.status is None:
-                        break
-            self.notes["agent_" + mode] = lost_at
+                if all(m.hits.get(x) for x in ("before", "after", "ctrl")):
+                    self.notes["size_ok"] = max(self.notes.get("size_ok", 0), m.chars_total)
+            if stop:
+                self.p("     (stopping: %s chars failed; larger sizes would fail the same way)" % _kfmt(m.chars_total))
+                break
+            if not p or p > 128000:
+                continue
+            a, ctrl = self.lab("M6"), self.lab("M6")
+            msgs = [{"role": "user", "content": self.fact(1, a) + " Reply OK."},
+                    {"role": "assistant", "content": "OK."},
+                    {"role": "user", "content": self.final(ctrl, "Reference output:\n" + code_filler(p, seed=p + 7))}]
+            m = self.mchat(msgs, "M6 last pad=%s" % _kfmt(p), [("before", a), ("ctrl", ctrl)])
+            self.mrec("M6b", "pad %s in the LAST message, earlier fact kept?" % _kfmt(p), m, ["before"])
+            self.sample("6", "last %d" % p, m, ["before"], "multi", pad=p)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def agent_tools(n_chars=16000):
+        """Native tool definitions about the size of a coding agent's list."""
+        rnd = random.Random(8)
+        tools, total, i = [], 0, 0
+        while total < n_chars:
+            w1, w2 = rnd.choice(_WORDS), rnd.choice(_WORDS)
+            t = {"type": "function", "function": {
+                "name": "read" if i == 0 else "%s_%s_%d" % (w1, w2, i),
+                "description": "Reads or updates the %s %s. Use it when the task needs the %s state." % (w1, w2, w1),
+                "parameters": {"type": "object", "properties": {
+                    "path": {"type": "string", "description": "path of the %s" % w2},
+                    "limit": {"type": "number", "description": "max %s entries" % w1}},
+                    "required": ["path"]}}}
+            tools.append(t)
+            total += len(json.dumps(t))
+            i += 1
+        return tools
+
+    def sec_agent(self):
+        self.section("5. agent session with native tools: one conversation grows a tool round per request")
+        steps = 6 if self.a.quick else self.a.steps
+        tools = self.agent_tools()
+        tchars = len(json.dumps(tools))
+        head, tail = self.lab("M5"), self.lab("M5")
+        hist = [{"role": "system", "content": "You are a coding agent working in a repository. " + self.fact("H", head)},
+                {"role": "user", "content": "Task: refactor the worker module. " + self.fact("T", tail)
+                 + " Keep notes of every crate label you see."}]
+        facts = [("H", head), ("T", tail)]
+        prev_sess = None
+        lost_at = {}
+        for k in range(1, steps + 1):
+            l = self.lab("M5")
+            facts.append(("s%d" % k, l))
+            ctrl = self.lab("M5")
+            cid = "call_%d" % k
+            hist = hist + [
+                {"role": "assistant", "content": None, "tool_calls": [{"id": cid, "type": "function", "function": {
+                    "name": "read", "arguments": json.dumps({"path": "src/worker_%d.py" % k})}}]},
+                {"role": "tool", "tool_call_id": cid,
+                 "content": "%s\n%s" % (code_filler(4000, seed=k * 31), self.fact("S%d" % k, l))}]
+            msgs = hist + [{"role": "user", "content": self.final(ctrl)}]
+            if tchars + sum(len(_content_to_text(x.get("content"))) for x in msgs) > self.maxc:
+                self.p("     (step %d would exceed %s chars; stopping)" % (k, _kfmt(self.maxc)))
+                break
+            names = [x for x, _ in facts]
+            # tool_choice none: the question is answered in text, not with another call.
+            m = self.mchat(msgs, "M5 step %d" % k, facts + [("ctrl", ctrl)], tools=tools, tool_choice="none")
+            changed = prev_sess is not None and m.sess != prev_sess
+            prev_sess = m.sess
+            if m.ok:
+                for x in names:
+                    if not m.hit(x) and x not in lost_at:
+                        lost_at[x] = k
+            self.mrec("M5", "step %d (%d msgs + %s chars of tools)" % (k, len(msgs), _kfmt(tchars)), m, names[:-1],
+                      note="this-step=%s%s" % ("ok" if m.hit(names[-1]) else "MISS",
+                                                " session_changed" if changed else ""))
+            self.sample("5", "step %d" % k, m, names[:-1], "multi", step=k)
+            if not m.ok:
+                if m.r.status is not None:
+                    self.notes["agent_err"] = (k, m.r.status)
+                break
+        self.notes["agent"] = lost_at
 
     # ------------------------------------------------------------------
     def sec_server(self):
-        self.section("9. server-side memory across requests")
+        self.section("4. server-side memory across requests")
         delays = [0, 20] if self.a.quick else [0, 0, 20, 60]
         for d in delays:
-            l = self.lab("M9 plant")
-            ra = self.mchat([{"role": "user", "content": self.fact(5, l) + " Reply OK."}], "M9 plant d=%d" % d, [("x", l)])
+            l = self.lab("M4 plant")
+            ra = self.mchat([{"role": "user", "content": self.fact(5, l) + " Reply OK."}], "M4 plant d=%d" % d, [("x", l)])
             if d:
                 time.sleep(d * self.a.delay_scale)
             m = self.mchat([{"role": "user", "content": "Earlier I told you which label crate 5 carries. What was it? "
                                                         "Reply with just the label, or NONE if you have no earlier message from me."}],
-                           "M9 ask d=%d" % d, [("x", l)])
-            self.mrec("M9a", "fact from a separate request %ds earlier comes back" % d, m,
+                           "M4 ask d=%d" % d, [("x", l)])
+            self.mrec("M4a", "fact from a separate request %ds earlier comes back" % d, m,
                       verdict="LEAK" if m.hit("x") else ("ERR" if not m.ok else "NO"),
                       note="same_session=%s" % (m.sess != "-" and m.sess == ra.sess))
 
-        msgs, facts = self.turns_user_facts(2, "M9 same")
-        m1 = self.mchat(msgs, "M9 same request #1", facts)
-        m2 = self.mchat(msgs, "M9 same request #2", facts)
-        self.rec("M9b", "identical request twice: same session id?", "INFO",
+        msgs, facts = self.turns_user_facts(2, "M4 same")
+        m1 = self.mchat(msgs, "M4 same request #1", facts)
+        m2 = self.mchat(msgs, "M4 same request #2", facts)
+        self.rec("M4b", "identical request twice: same session id?", "INFO",
                  "sess %s / %s -> %s" % (m1.sess, m2.sess, "SAME" if m1.sess == m2.sess and m1.sess != "-" else "different"))
 
         def passback(name, build):
-            l = self.lab("M9 passback")
-            ra = self.mchat([{"role": "user", "content": self.fact(6, l) + " Reply OK."}], "M9 %s plant" % name, [("x", l)])
+            l = self.lab("M4 passback")
+            ra = self.mchat([{"role": "user", "content": self.fact(6, l) + " Reply OK."}], "M4 %s plant" % name, [("x", l)])
             extra = build(ra)
             if extra is None:
-                self.rec("M9c", "pass back via %s" % name, "SKIP", "no session id in the reply")
+                self.rec("M4c", "pass back via %s" % name, "SKIP", "no session id in the reply")
                 return
             m = self.mchat([{"role": "user", "content": "Which label does crate 6 carry? Reply with just the label, "
                                                         "or NONE if you were never told."}],
-                           "M9 %s ask" % name, [("x", l)], optin=True, **extra)
-            self.mrec("M9c", "continue the planting request via %s" % name, m,
+                           "M4 %s ask" % name, [("x", l)], optin=True, **extra)
+            self.mrec("M4c", "continue the planting request via %s" % name, m,
                       verdict="RECALL" if m.hit("x") else ("ERR" if not m.ok else "NO"),
                       note="same_session=%s" % (m.sess != "-" and m.sess == ra.sess))
 
@@ -2208,42 +2179,38 @@ class MemProber(Prober):
         passback("session_id", lambda ra: {"session_id": ra.sess_raw} if ra.sess_raw else None)
         passback("conversation_id", lambda ra: {"conversation_id": ra.sess_raw} if ra.sess_raw else None)
         user_id = "harness-probe-%06d" % random.randint(0, 999999)
-        l = self.lab("M9 user")
-        self.mchat([{"role": "user", "content": self.fact(8, l) + " Reply OK."}], "M9 user plant", [("x", l)], user=user_id)
+        l = self.lab("M4 user")
+        self.mchat([{"role": "user", "content": self.fact(8, l) + " Reply OK."}], "M4 user plant", [("x", l)], user=user_id)
         m = self.mchat([{"role": "user", "content": "Which label does crate 8 carry? Reply with just the label, or NONE "
-                                                    "if you were never told."}], "M9 user ask", [("x", l)], optin=True, user=user_id)
-        self.mrec("M9d", "same OpenAI 'user' field on both requests", m,
+                                                    "if you were never told."}], "M4 user ask", [("x", l)], optin=True, user=user_id)
+        self.mrec("M4d", "same OpenAI 'user' field on both requests", m,
                   verdict="RECALL" if m.hit("x") else ("ERR" if not m.ok else "NO"))
 
         if self.a.long_term:
             self.p("     --long-term: asking the product to save a fact to the account's long-term memory, "
                    "then asking it to delete it again")
-            l = self.lab("M9 longterm")
+            l = self.lab("M4 longterm")
             self.mchat([{"role": "user", "content": "Please save this to your long-term memory about me: my crate "
-                                                    "label is %s." % l}], "M9 longterm save", [("x", l)])
+                                                    "label is %s." % l}], "M4 longterm save", [("x", l)])
             for d in (0, 30):
                 if d:
                     time.sleep(d * self.a.delay_scale)
                 m = self.mchat([{"role": "user", "content": "Do you have a saved memory of my crate label? Reply with "
-                                                            "just the label, or NONE."}], "M9 longterm ask d=%d" % d, [("x", l)], optin=True)
-                self.mrec("M9e", "long-term memory recall after %ds" % d, m,
+                                                            "just the label, or NONE."}], "M4 longterm ask d=%d" % d, [("x", l)], optin=True)
+                self.mrec("M4e", "long-term memory recall after %ds" % d, m,
                           verdict="RECALL" if m.hit("x") else ("ERR" if not m.ok else "NO"))
             r = self.chat([{"role": "user", "content": "Please delete every saved memory about my crate label."}],
-                          "M9 longterm cleanup")
-            self.rec("M9f", "cleanup request", "INFO" if r.ok else "ERR", "" if r.ok else self.fail_note(r), r, r.content, 100)
+                          "M4 longterm cleanup")
+            self.rec("M4f", "cleanup request", "INFO" if r.ok else "ERR", "" if r.ok else self.fail_note(r), r, r.content, 100)
 
     # ------------------------------------------------------------------
     def sec_models(self):
-        self.section("8. per-model: canary + folded + conflict on every catalog model")
+        self.section("7. per-model: 3 earlier turns on every chat model in the catalog")
         for model in self.catalog:
-            msgs, facts = self.turns_user_facts(3, "M8 %s" % model)
-            m = self.mchat(msgs, "M8 %s turns" % model, facts, model=model)
-            self.mrec("M8", "%s: 3 earlier turns" % model, m, ["h1", "h2", "h3"])
-            self.sample("8", "turns", m, ["h1", "h2", "h3"], "multi", model=model)
-            msgs, facts = self.folded(3, "M8 %s" % model)
-            m = self.mchat(msgs, "M8 %s folded" % model, facts, model=model)
-            self.mrec("M8", "%s: same folded" % model, m, ["h1", "h2", "h3"])
-            self.sample("8", "folded", m, ["h1", "h2", "h3"], "folded", model=model)
+            msgs, facts = self.turns_user_facts(3, "M7 %s" % model)
+            m = self.mchat(msgs, "M7 %s turns" % model, facts, model=model)
+            self.mrec("M7", "%s: 3 earlier turns" % model, m, ["h1", "h2", "h3"])
+            self.sample("7", "turns", m, ["h1", "h2", "h3"], "multi", model=model)
             if not m.ok and m.r.status is None:
                 break
 
@@ -2262,12 +2229,12 @@ class MemProber(Prober):
             k = sum(sum(1 for h in s["hits"] if h) for s in rows)
             return k, n
 
-        # Section 7 repeats labels across requests, so server-side memory could
+        # Section 5 repeats labels across requests, so server-side memory could
         # also explain a recall there; it is reported on its own line. A
         # request whose control (last-message) fact was missed is not
         # evidence about history either.
         multi = [s for s in S if s["ok"] and s["kind"] == "multi" and s["names"] and s["cfg"] != "instruction"
-                 and s["sec"] != "7" and (s["ctrl"] or not s["has_ctrl"])]
+                 and s["sec"] != "5" and (s["ctrl"] or not s["has_ctrl"])]
         k, n = rate(multi)
         self.p("  earlier facts recalled from separate messages: %d/%d over %d requests" % (k, n, len(multi)))
         if multi:
@@ -2296,47 +2263,27 @@ class MemProber(Prober):
                     suffix.append(kept)
             if suffix:
                 self.p("  recalls that were exactly the newest K turns: K=%s" % sorted(suffix))
-        rows4 = [s for s in S if s["ok"] and s["sec"] == "5"]
-        if rows4:
-            self.p("  by padding size: %s" % " ".join(
-                "%s:%s" % (s["cfg"].replace(" ", "@"), "".join("#" if h else "." for h in s["hits"])) for s in rows4))
-        fold = [s for s in S if s["ok"] and s["kind"] == "folded"]
-        if fold:
-            k2, n2 = rate(fold)
-            self.p("  facts recalled when folded into the last message: %d/%d" % (k2, n2))
         nt = self.notes
-        if "full_max" in nt:
-            self.p("  single message: largest fully recalled %s chars; first recall loss %s; first error %s"
-                   % (_kfmt(nt["full_max"]), _kfmt(nt["loss_min"]) if nt.get("loss_min") else "none",
-                      _kfmt(nt["fail_min"]) if nt.get("fail_min") else "none up to %s" % _kfmt(self.maxc)))
-        if "confirm" in nt:
-            c, g, t = nt["confirm"]
-            self.p("  confirmation at %s chars (~%dk proxy-est tokens): %d/%d fully recalled" % (_kfmt(c), c // 3000, g, t))
-        if nt.get("flaky"):
-            self.p("  sizes that failed once then passed on retry: %s" % ", ".join(_kfmt(x) for x in nt["flaky"]))
+        rows6 = [s for s in S if s["ok"] and s["sec"] == "6"]
+        if rows6:
+            self.p("  by padding size: %s" % " ".join(
+                "%s:%s" % (s["cfg"].replace(" ", "@"), "".join("#" if h else "." for h in s["hits"])) for s in rows6))
+        if "size_ok" in nt or "size_fail" in nt:
+            ok = nt.get("size_ok")
+            self.p("  largest conversation recalled whole: %s" % (
+                ("%s chars (~%dk tokens at %.1f chars/token)" % (_kfmt(ok), ok / self.cpt / 1000, self.cpt)) if ok else "none"))
+            if nt.get("size_fail"):
+                c, st = nt["size_fail"]
+                self.p("  first failed size: %s chars (HTTP %s)" % (_kfmt(c), st if st is not None else "none/timeout"))
         if self.r502:
             self.p("  elapsed before each 502: %s" % ", ".join("%s:%.0fs" % (_kfmt(c), e) for c, e in self.r502))
-        if nt.get("edge_ok"):
-            w = {x["size"]: x["wire"] for x in S if x.get("size") and x["sec"] == "4" and not x.get("cjk")}
-            self.p("  request-size edge (code text): OK %s chars / %sB wire, error %s chars / %sB wire"
-                   % (_kfmt(nt["edge_ok"]), _kfmt(w.get(nt["edge_ok"], 0)), _kfmt(nt["edge_fail"]),
-                      _kfmt(w.get(nt["edge_fail"], 0))))
-        if nt.get("units"):
-            u = nt["units"]
-            self.p("  multibyte text: %s" % ", ".join("%s chars/%sB wire %s" % (_kfmt(c), _kfmt(b), "ok" if k else "ERR")
-                                                      for c, b, k in u))
-            if all(k for _, _, k in u):
-                self.p("    -> the limit is not in wire bytes or tokens; it counts characters (or is higher for this text)")
-            else:
-                self.p("    -> not plain characters; compare the passing sizes with the code edge in chars, wire bytes "
-                       "and ~tokens to see which matches")
-        for mode in ("alone", "interleaved"):
-            la = nt.get("agent_" + mode)
-            if la is not None:
-                self.p("  agent session (%s): first step each fact was missing: %s%s"
-                       % (mode, ", ".join("%s@%d" % (x, s) for x, s in sorted(la.items(), key=lambda p: p[1])) or "never",
-                          ("; HTTP error at step %d" % nt["agent_err_" + mode]) if nt.get("agent_err_" + mode) else ""))
-                self.p("    (labels repeat across these requests, so server-side memory can also explain a recall here)")
+        la = nt.get("agent")
+        if la is not None:
+            err = nt.get("agent_err")
+            self.p("  agent session (native tools): first step each fact was missing: %s%s"
+                   % (", ".join("%s@%d" % (x, s) for x, s in sorted(la.items(), key=lambda p: p[1])) or "never",
+                      ("; HTTP %s at step %d" % (err[1], err[0])) if err else ""))
+            self.p("    (labels repeat across these requests, so server-side memory can also explain a recall here)")
         hashes = [h for _, h in self.sessions if h != "-"]
         self.p("  session ids: %d requests carried one, %d distinct" % (len(hashes), len(set(hashes))))
         self.p("  labels from an earlier request that came back (server-side state): %d%s"
@@ -2348,13 +2295,20 @@ class MemProber(Prober):
         cans = [s for s in S if s["sec"] == "canary" and s["ok"]]
         if cans:
             self.p("  canary over time: %s" % " ".join("".join("#" if h else "." for h in s["hits"]) for s in cans))
+        if nt.get("effort"):
+            self.p("  reasoning_effort -> reasoning_tokens: %s" % ", ".join(
+                "%s:%s" % (e, ("HTTP %s" % st) if not (st and 200 <= st < 300) else (rt if rt is not None else "-"))
+                for e, st, rt in nt["effort"]))
+        self.p("  " + self.usage_line())
+        if nt.get("over_budget"):
+            self.p("  stopped by --budget: %s" % ", ".join(nt["over_budget"]))
 
         self.p("")
         self.p("=== reading ===")
         hist_any = k > 0 if multi else None
         if hist_any is False and (not conf or conf.get("history", 0) == 0):
             self.p("  Separate earlier messages never reached the model: the upstream answers from the last")
-            self.p("  message only. To keep context, fold history INTO the last user message.")
+            self.p("  message only.")
         elif hist_any and multi and all(all(s["hits"]) for s in multi):
             self.p("  Earlier messages always reached the model in this run; the forgetting did not reproduce.")
         elif hist_any:
@@ -2363,13 +2317,8 @@ class MemProber(Prober):
         if self.leaks:
             self.p("  Facts leaked between independent requests: there IS server-side state.")
         if self.optin_recalls:
-            self.p("  A deliberately continued request recalled an earlier one: see the M9c/M9d/M9e lines.")
-        budget = nt.get("confirm")
-        if budget and budget[1] == budget[2]:
-            self.p("  Safe single-message size seen: %s chars (~%dk tokens by the proxy's chars/3 estimate)."
-                   % (_kfmt(budget[0]), budget[0] // 3000))
+            self.p("  A deliberately continued request recalled an earlier one: see the M4c/M4d/M4e lines.")
         self.p("requests=%d elapsed=%ds" % (self.c.n, int(secs)))
-
 
 # --------------------------------------------------------------------------
 # Single-message suite: which size, layout and framing of a whole chat folded
@@ -3239,7 +3188,8 @@ def main():
     ap.add_argument("--no-matrix", action="store_true", help="skip the per-model matrix")
     ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs); memory: digits, e.g. '124'")
     ap.add_argument("--quick", action="store_true", help="memory/single: fewer sizes and repeats")
-    ap.add_argument("--confirm", type=int, default=8, help="memory: repeats at the candidate safe size (default 8)")
+    ap.add_argument("--budget", type=int, default=500000,
+                    help="memory: stop a section before the run passes this many credits (default 500000; 0 = no cap)")
     ap.add_argument("--steps", type=int, default=12, help="memory: turns in the agent-like session (default 12)")
     ap.add_argument("--max-chars", type=int, default=700000, help="memory/single: largest request to send (default 700000)")
     ap.add_argument("--long-term", action="store_true",
@@ -3318,11 +3268,13 @@ def main():
         if isinstance(e.code, str):
             out(red(e.code))
             rc = 3
-            if getattr(prober, "samples", None):
-                try:
+            try:
+                if getattr(prober, "samples", None):
                     prober.verdict(0)
-                except Exception:
-                    pass
+                elif isinstance(e, QuotaExhausted) and a.suite != "single":
+                    prober.summary(0)
+            except Exception:
+                pass
         else:
             raise
     except KeyboardInterrupt:

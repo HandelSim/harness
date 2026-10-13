@@ -937,13 +937,22 @@ earlier requests, reach the model, and what (turn count, role layout, size,
 time, session) changes that. Every request plants fresh random crate labels
 in chosen messages and asks for them back; the reply's labels are a bitmap
 of what the model saw, and a label from an earlier request coming back is
-counted as server-side state. Sections 1-9: reach (an earlier request vs
-this request's history), turn count, layout, single-message capacity (size
-ladder to the error edge, bisect, multibyte text, confirmation reps), history
-vs padding size, folded transcript, an agent-like growing session, a
-per-model check, and server-side memory (delays, session pass-back, `user`
-field; `--long-term` opts into the product's saved memory and deletes it
-after). A 3-turn canary runs after every section. The log adds a layout line
+counted as server-side state. Setup reads `credit_weights` from
+`/v1/models`, measures chars per prompt token and records `reasoning_tokens`
+per `reasoning_effort`. Sections 1-7, cheapest first: reach (an earlier
+request vs this request's history), turn count, layout, server-side memory
+(delays, session pass-back, `user` field; `--long-term` opts into the
+product's saved memory and deletes it after), an agent session with native
+`tools` (assistant `tool_calls` + `role: tool` results, the question sent
+with `tool_choice: "none"`), conversation size (a padding turn of 0-500k
+chars, stopping at the first error), and a per-model check over the chat
+models. A 3-turn canary runs after every section. Cost control: `Prober`
+totals reported usage into credits (reasoning billed as output, an upper
+estimate); `MemProber.mchat` raises `OverBudget` before a request that would
+pass `--budget` (default 500k credits), which ends only that section; and a
+429 that names the daily credit quota (or a retry-after over an hour) raises
+`QuotaExhausted`, which stops every suite at once and prints the findings so
+far, rc 3. The log adds a layout line
 per request (role, chars and planted labels per message, wire bytes) and the
 reply, thinking trace and usage, capped at 20k chars; session ids appear
 only as a short hash, and pass-back fields (`session`, `session_id`,

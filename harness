@@ -1747,9 +1747,10 @@ subcommands:
             'harness probe' runs this. About 20-60 minutes.
   memory    map the upstream's conversation memory: which earlier turns reach
             the model, and what (turn count, size, role layout, server-side
-            session, time) decides when they are dropped, plus the largest
-            request that is kept whole. About 30-90 minutes; --quick sends
-            about a third as many requests.
+            session, a native-tools agent session) decides when they are
+            dropped, plus the largest conversation kept whole. About 15-30
+            minutes, capped by --budget credits; --quick sends about half
+            as many requests.
   optimize-single
             fold a whole agent chat into ONE message and find the join
             format, size and framing the model answers best from (recall
@@ -1789,37 +1790,44 @@ EOF
 _probe_memory_help() {
     cat <<'EOF'
 usage: harness probe memory [--model ID] [--quick] [--repeat N] [--only SECTIONS]
-                            [--max-chars N] [--confirm N] [--steps N]
+                            [--budget CREDITS] [--max-chars N] [--steps N]
                             [--no-matrix] [--long-term] [--timeout SECS]
 
 Map the upstream's conversation memory. Every request plants fresh random
 crate labels in chosen messages and asks for them back, so each reply shows
 exactly which messages reached the model; a label from an EARLIER request
-coming back is reported as server-side state. Sections:
+coming back is reported as server-side state. Setup reads the catalog's
+credit weights, measures chars per token and checks reasoning_effort.
+Sections, cheapest first:
 
   1  reach: does request history reach the model at all (conflict test:
      an earlier request says A, this request's history says B), an
      instruction given in an earlier turn, 4-way forced choice
   2  turn count: 1..32 earlier turns, which ones survive (oldest first)
   3  layout: facts in assistant turns, consecutive user messages, system
-     role, message 0 only, history folded into the last message, streaming
-  4  single-message capacity: 5 needles from 8k chars up to the error edge,
-     bisected; multibyte text (chars vs bytes vs tokens); history above the
-     edge; repeated confirmation at the candidate safe size
-  5  history vs size: facts before and after a padding block, padding in a
-     middle turn or in the last message
-  6  folded transcript capacity: a whole conversation inside one message
-  7  agent-like session: one conversation grows a turn per request (tool
-     definitions in message 0, tool output each turn), alone and with
-     unrelated requests interleaved
-  8  per-model check over /v1/models (skip with --no-matrix)
-  9  server-side memory: earlier request recalled after 0-60 s, session id
+     role, message 0 only, streaming
+  4  server-side memory: earlier request recalled after 0-60 s, session id
      on identical requests, passing the session id back, the 'user' field
+  5  agent session with native tools: one conversation grows a tool call
+     and a ~4k-char tool result per request, ~16k chars of tool definitions
+  6  conversation size: facts before and after a padding turn of 0 to 500k
+     chars, stopping at the first size that errors
+  7  per-model check over the chat models in /v1/models (skip with
+     --no-matrix)
 
 A 3-turn canary runs at the start and after every section to catch drift.
-The verdict block at the end summarizes what was seen and the largest size
-that was recalled whole on every confirmation run. Expect 150-200 requests
-(30-90 minutes; large requests take 30-90 s each); --quick sends about 70.
+The verdict block at the end summarizes what was seen, the largest
+conversation recalled whole, and the tokens and credits the run used.
+Expect about 120 requests (15-30 minutes; large requests take 30-90 s
+each); --quick sends about 60.
+
+Cost: the run stops a section before it would pass --budget credits
+(prompt tokens x input weight + output and reasoning tokens x output
+weight, from /v1/models), and prints how to rerun just that section. The
+default 500k covers sections 1-5 and conversation sizes up to ~128k
+chars; the 300k and 500k sizes need about --only 6 --budget 1000000. If
+the key's daily credit quota runs out mid-run, the probe stops at once
+and prints what it has instead of sending requests that cannot succeed.
 
 Output is redacted (API key, URL, host, emails, IPs, bearer tokens,
 projects/... paths; session ids are shown only as a short hash) and safe to
@@ -1828,18 +1836,18 @@ request log (each request's message layout, the full reply, thinking trace
 and usage) is written to state/output/probe-memory-<time>.log; send that file
 for analysis.
 
-  --model ID      model to probe (default: DEFAULT_MODEL_NAME)
-  --quick         one repeat and fewer sizes and steps
-  --repeat N      repeats per configuration (default 3; --quick sets 1)
-  --only SECTIONS run only these sections, e.g. 25 (setup + canary always run)
-  --max-chars N   largest request to send (default 700000 chars)
-  --confirm N     repeats at the candidate safe size (default 8; --quick 3)
-  --steps N       turns in the agent-like session (default 12; --quick 6)
-  --no-matrix     skip section 8
-  --long-term     also ask the product to save a label to its long-term
-                  memory, check recall, then ask it to delete it. Off by
-                  default: it writes to the account's real saved memory.
-  --timeout SECS  per-request timeout (default 240; capacity tests use 300+)
+  --model ID        model to probe (default: DEFAULT_MODEL_NAME)
+  --quick           one repeat and fewer sizes and steps
+  --repeat N        repeats per configuration (default 3; --quick sets 1)
+  --only SECTIONS   run only these sections, e.g. 25 (setup + canary always run)
+  --budget CREDITS  credits the run may spend (default 500000; 0 = no cap)
+  --max-chars N     largest request to send (default 700000 chars)
+  --steps N         steps in the agent session (default 12; --quick 6)
+  --no-matrix       skip section 7
+  --long-term       also ask the product to save a label to its long-term
+                    memory, check recall, then ask it to delete it. Off by
+                    default: it writes to the account's real saved memory.
+  --timeout SECS    per-request timeout (default 240; sizes above 32k use 300+)
 EOF
 }
 
