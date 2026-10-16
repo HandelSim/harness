@@ -2516,7 +2516,7 @@ class TestTaskDescriptionParing(unittest.TestCase):
     REAL_TASK_DESCRIPTION below is a faithful copy of what opencode hands the
     proxy: static boilerplate, then the dynamic agent list. The boilerplate is
     verbatim `packages/opencode/src/tool/task.txt` as shipped in opencode
-    1.18.23 (2305 bytes, md5 de4e9d3881762b9a421627e2ac207ecb) and the list
+    1.18.23 and 1.19.3 (2305 bytes, md5 de4e9d3881762b9a421627e2ac207ecb) and the list
     rows follow describeTask's `- <name>: <description>` shape.
 
     CANARY: this fixture is the cross-version guard the issue asked for. On every
@@ -5871,6 +5871,23 @@ class TestNativeToolPassthrough(unittest.TestCase):
             proxy._setup_native_reminders()
             self.assertFalse(proxy._NATIVE_REMINDERS)
             self.assertEqual(proxy._TASK_TOKEN_WARN, 7)
+
+    def test_step_cap_forces_tool_choice_none(self):
+        tools = [{"type": "function", "function": {"name": "read", "parameters": {}}}]
+        cap = {"role": "assistant", "content": "CRITICAL - MAXIMUM STEPS REACHED\n\nThe maximum..."}
+        body = {"model": "gemini-x-withtools", "tools": tools,
+                "messages": [{"role": "user", "content": "x"}, cap]}
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), reminders=True)
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent["tool_choice"], "none")
+        self.assertEqual(sent["messages"], body["messages"])  # no reminder on the cap step
+        body["messages"] = [{"role": "user", "content": "x"},
+                            {"role": "assistant", "content": [{"type": "text", "text": cap["content"]}]}]
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"))
+        self.assertEqual(mock_post.call_args.kwargs["json"]["tool_choice"], "none")
+        body["messages"] = [{"role": "user", "content": "x"}]
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"))
+        self.assertNotIn("tool_choice", mock_post.call_args.kwargs["json"])
 
     def test_daily_quota_429_sets_retry_after_to_reset(self):
         err = {"error": {"message": "You've used 50097465 of your 50000000 token allowance for "

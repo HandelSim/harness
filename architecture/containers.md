@@ -99,8 +99,8 @@ After the drop, still in the entrypoint:
   `.data[].id` with no tag to strip) so opencode lists exactly the models the
   upstream advertises; `DEFAULT_MODEL_NAME` is always included and is the
   default selection (`harness/<DEFAULT_MODEL_NAME>`). Provider options set
-  `includeUsage: true` (opencode's token counter, and so auto-compaction,
-  depends on the usage chunk); a catalog entry's `credit_weights` becomes
+  `includeUsage: true` (opencode's default anyway; its token counter, and so
+  auto-compaction, depends on the usage chunk); a catalog entry's `credit_weights` becomes
   that model's `cost`, so opencode's "$" is millions of credits;
   `compaction.prune` is on; the `build`, `plan`, `general`, `explore` and
   `yolo` agents get `steps: $HARNESS_AGENT_MAX_STEPS` (default 100, `0` =

@@ -710,6 +710,20 @@ full log path on **both** failure branches (proxy exited during startup, or
 never began listening) so a failed launch always points at the log that
 explains why.
 
+**Resuming a stopped task.** Two cases, neither needing new code:
+- *Daily credit quota spent.* The proxy answers that 429 with `Retry-After`
+  set to the reset time plus a minute (see [`proxy.md`](proxy.md) → Native
+  tool models). opencode's retry honours it (any length, up to 5 attempts),
+  shows `[retrying in 9h 10m attempt #1]`, and continues the same session
+  after the reset as long as the process and the proxy stay up. A headless
+  `-p` run therefore just sits until then, which is the intent for overnight
+  or weekend runs.
+- *Process gone* (reboot, closed terminal). opencode keeps sessions on disk;
+  `harness host --continue` (TUI) or `harness host -p --continue "continue"`
+  (headless) passes `--continue` through `pass_args` to opencode, which
+  reopens the most recent session in that directory; `--session <id>` picks
+  a specific one. The step counter starts again at the new prompt.
+
 **The probe must not eat stderr.** Both loopback probes
 (`host_proxy_wait_ready`, and `host_mcp_port_open` in mcp.md) run
 `(exec 3<>/dev/tcp/…)` in a **subshell**, so the probe fd is opened and closed

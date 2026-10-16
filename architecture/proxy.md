@@ -76,14 +76,16 @@ results all reach the upstream as sent. None of the cooperative machinery
 runs: no prompt injection, system→user rewrite, history translation,
 require-tool, tool-search, malformed-call retry, empty-response rescue or
 local token estimate (upstream `usage` is passed through). A stream that
-breaks mid-way ends with an `{"error":…}` SSE event. Four small additions
+breaks mid-way ends with an `{"error":…}` SSE event. A few small additions
 are the only changes made to the request or the reply:
 
 - **Usage.** A streamed request gets `stream_options.include_usage=true`,
-  so the upstream ends the stream with a usage chunk. Without it opencode
-  counts 0 tokens per step, never reaches its compaction threshold
-  (`context - output`), and the conversation grows until the day's budget
-  is gone. opencode's provider config also sets `includeUsage: true`
+  so the upstream ends the stream with a usage chunk. opencode already asks
+  for it (its bundled openai-compatible provider defaults `includeUsage` to
+  true), so this is belt-and-braces for other clients. Usage matters: with
+  no usage chunk opencode counts 0 tokens, never reaches its compaction
+  threshold (`context - output`), and the conversation grows until the
+  day's budget is gone. opencode's provider config also sets `includeUsage: true`
   ([`harness-cli.md`](harness-cli.md)). Each request logs one line
   `usage: model=… prompt=… completion=… reasoning=… credits_day_left=…`
   (or `usage: none reported`) read from the end of the stream or body.
@@ -100,6 +102,11 @@ are the only changes made to the request or the reply:
   `apply_patch`) a nudge to act, after 40 a "STOP EXPLORING" order; past
   `PROXY_TASK_TOKEN_WARN` estimated tokens (default 5,000,000) an order to
   finish the current item and report.
+- **Hard step cap.** When opencode hits an agent's `steps` cap it ends the
+  request with an assistant message starting "CRITICAL - MAXIMUM STEPS
+  REACHED" but still sends the tools. `_at_step_cap` spots it and the proxy
+  sets `tool_choice: "none"` (and skips the reminder), so that step has to
+  answer in text.
 - **Errors.** 4xx keep their status and upstream message; 5xx become 502.
   `Retry-After`, `Retry-After-Ms`, `X-RateLimit-*`, `x-request-id`,
   `Deprecation`, `Sunset` and `Link` are relayed (opencode's retry honours
@@ -621,7 +628,7 @@ and is already present verbatim at the stable prefix, so
 `_pare_task_description` (anchored on `_OPENCODE_TASK_AGENTS_HEADER`) keeps
 only that header onward — the agent names and their one-line descriptions.
 The header is byte-stable across opencode releases (verified 1.14.41,
-1.15.7 and 1.18.23); if a future opencode renames it the parse falls back to the
+1.15.7, 1.18.23 and 1.19.3); if a future opencode renames it the parse falls back to the
 **full** description (degrade to more tokens, never a silent loss of the
 agent list), and `proxy/test_proxy.py` `TestTaskDescriptionParing` is the
 canary that flags the drift. Every other detail tool, including `skill`

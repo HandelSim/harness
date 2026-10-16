@@ -125,9 +125,9 @@ found a standard OpenAI chat-completions contract, unlike the plain models:
   the thought signature still worked.
 - **Parameters now apply.** `max_tokens` (truncates, `finish_reason:
   length`), `stop` and `stream_options.include_usage` work (without the
-  latter a stream has no usage chunk at all, which in 2026-10 left opencode
-  counting 0 tokens, never compacting, and a single prompt spending the
-  50M daily allowance). `temperature:0`
+  latter a stream has no usage chunk at all, and opencode then counts 0
+  tokens and never compacts; opencode does send it by default).
+  `temperature:0`
   is still not deterministic and `n` still returns one choice.
 
 The proxy forwards these models natively; see [`proxy.md`](proxy.md) →
@@ -190,9 +190,10 @@ integer weights from {1, 2, 5, 10, 25, 50}, per model in the catalog's
 
 **Every request re-bills the whole conversation.** A chat-completions agent
 resends the full history on every step, so one task costs roughly
-`steps x average context`: 300 steps at ~150k tokens is ~45M. That (most
-likely, plus context that never compacted) is how one opencode prompt spent a
-50M daily allowance on 2026-10-16, not a change in tokenization. See [`proxy.md`](proxy.md) → Native tool models for
+`steps x average context`: 300 steps at ~150k tokens is ~45M. That is the
+most likely way one opencode prompt spent a 50M daily allowance on
+2026-10-16 (an explore loop with no step cap and no on-track nudges on the
+native route), not a change in tokenization. See [`proxy.md`](proxy.md) → Native tool models for
 what the proxy does about it.
 
 **Limits.** Three dimensions, metered together:

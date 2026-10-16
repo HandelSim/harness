@@ -81,7 +81,8 @@ ENV LC_ALL=C.UTF-8
 # race (verified on 1.15.7: on a race-loss only `step_start` is emitted, and
 # ~10% of fast runs emit an entirely empty stream — zero bytes, no id). Still
 # unfixed at 1.18.23: opencode #31435 is open, and the idle-break inside
-# `run.ts`'s `loop()` is byte-identical at v1.15.7 and v1.18.23. (v1.17.0's
+# `run.ts`'s `loop()` is byte-identical at v1.15.7, v1.18.23 and v1.19.3
+# (1.19's only run.ts change retires `--share`). (v1.17.0's
 # `0a7cb20e6` "await run event loop" only fixes truncation at process
 # teardown, not this race.) The headless
 # `-p` path in agents/entrypoint.sh therefore recovers the final assistant text
@@ -104,7 +105,10 @@ ENV LC_ALL=C.UTF-8
 #      proxy/test_proxy.py TestTaskDescriptionParing is the canary — refresh
 #      its fixture from the bumped binary and fix the header constant if it
 #      drifts.
-ARG OPENCODE_VERSION=1.18.23
+# 1.18.27+ also gives every provider a 5-minute default headerTimeout /
+# chunkTimeout; the proxy's own upstream timeout (PROXY_TIMEOUT, 180 s) is
+# shorter, so harness leaves them at the default.
+ARG OPENCODE_VERSION=1.19.3
 ARG OPENAI_COMPAT_VERSION=2.0.47
 
 RUN npm install -g \

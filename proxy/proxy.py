@@ -588,6 +588,22 @@ def _append_to_last_message(messages: List[Dict[str, Any]], text: str) -> List[D
     return list(messages[:-1]) + [last]
 
 
+_MAX_STEPS_MARK = "CRITICAL - MAXIMUM STEPS REACHED"
+
+
+def _at_step_cap(messages: List[Dict[str, Any]]) -> bool:
+    """True when opencode has hit an agent's `steps` cap: it then ends the
+    request with an assistant message starting "CRITICAL - MAXIMUM STEPS
+    REACHED" but still sends the tools, so a model can keep calling them."""
+    last = messages[-1] if messages else None
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        return False
+    content = last.get("content")
+    if isinstance(content, list):
+        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return isinstance(content, str) and content.lstrip().startswith(_MAX_STEPS_MARK)
+
+
 # Rate-limit / deprecation headers worth handing back to the client, so the AI
 # SDK and opencode see the upstream's Retry-After instead of guessing a delay.
 _RELAY_HEADERS = ("retry-after", "retry-after-ms", "x-request-id", "deprecation", "sunset", "link")
@@ -694,11 +710,14 @@ def _native_passthrough(
     payload["model"] = model_name
     messages = payload.get("messages") or []
     if want_stream:
-        # opencode's provider only asks for usage when its config sets
-        # includeUsage; without a usage chunk it counts 0 tokens and never
-        # auto-compacts. Ask for it here so every client gets it.
+        # Without a usage chunk opencode counts 0 tokens and never
+        # auto-compacts. opencode asks for usage by default; ask here too so
+        # every client gets it.
         payload["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}
-    if _NATIVE_REMINDERS and payload.get("tools") and messages:
+    if payload.get("tools") and _at_step_cap(messages):
+        # Make the step cap hard: the upstream honours tool_choice "none".
+        payload["tool_choice"] = "none"
+    elif _NATIVE_REMINDERS and payload.get("tools") and messages:
         payload["messages"] = messages = _append_to_last_message(
             messages, _native_reminder(messages, payload.get("tools") or [])
         )
@@ -973,7 +992,7 @@ _HYBRID_TOOL_SEARCH_NOTE: str = ""
 # under the tool's entry is pared to the agent-list section — everything from
 # this header onward. The header is the seam in opencode's
 # ToolRegistry.describeTask and has been byte-identical across releases
-# (verified 1.14.41, 1.15.7 and 1.18.23). If a future opencode renames it,
+# (verified 1.14.41, 1.15.7, 1.18.23 and 1.19.3). If a future opencode renames it,
 # the parse
 # falls back to the full description — no closed-set values are ever dropped —
 # and TestTaskDescriptionParing is the canary that flags the drift. `skill`'s

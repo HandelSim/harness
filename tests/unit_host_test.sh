@@ -100,8 +100,8 @@ jq -e '.provider.harness.models | has("test-model")' "$cfg" >/dev/null 2>&1 \
 ok "T5: opencode config is valid JSON, loopback baseURL, dummy key, default model present"
 
 # --- T5b: usage reporting, step cap and pruning reach opencode's config -----
-# includeUsage is what makes opencode's token counter (and so auto-compaction)
-# work on the native tools route; the step cap is the per-prompt circuit
+# includeUsage (opencode's default, pinned explicitly) keeps opencode's token
+# counter (and so auto-compaction) working on the native tools route; the step cap is the per-prompt circuit
 # breaker against a run that only reads and greps.
 jq -e '.provider.harness.options.includeUsage == true' "$cfg" >/dev/null 2>&1 \
     || fail "T5b: provider options should set includeUsage=true"
