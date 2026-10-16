@@ -460,6 +460,225 @@ def _is_native_tool_model(model: str) -> bool:
     return bool(model) and any(fnmatch.fnmatchcase(model, p) for p in _NATIVE_TOOL_PATTERNS)
 
 
+# Native-path reminder. The native route skips the cooperative pipeline, and
+# with it the todo replay and the nudges that kept the agent moving; on a
+# metered model an agent that keeps reading and grepping burns the daily
+# budget (every step re-sends the whole conversation). So each native request
+# that carries tools gets one short <system-reminder> appended to its LAST
+# message: the step count and estimated tokens for this task, the todo list
+# (or the instruction to write one), and escalating nudges when many steps
+# pass without a file change or the task grows expensive. It is rebuilt from
+# the history on every request (the proxy is stateless) and never accumulates:
+# opencode re-sends its own copy of the history, which does not carry it.
+# PROXY_NATIVE_REMINDERS=0 turns it off; PROXY_TASK_TOKEN_WARN sets the
+# estimated task size (tokens) past which the reminder says to wrap up.
+_NATIVE_REMINDERS = True  # set in main()
+_TASK_TOKEN_WARN = 5_000_000  # set in main()
+_NATIVE_EDIT_TOOLS = frozenset({"edit", "write", "patch", "multiedit", "apply_patch"})
+_NATIVE_TODO_AFTER = 3        # steps with no todo list before it is demanded
+_NATIVE_NO_EDIT_NUDGE = 20    # steps without a file change before the first nudge
+_NATIVE_NO_EDIT_STOP = 40     # ... before the reminder says to stop and report
+
+
+def _setup_native_reminders() -> None:
+    global _NATIVE_REMINDERS
+    global _TASK_TOKEN_WARN
+    _NATIVE_REMINDERS = os.environ.get("PROXY_NATIVE_REMINDERS", "1").strip().lower() not in (
+        "0", "off", "false", "no",
+    )
+    raw = os.environ.get("PROXY_TASK_TOKEN_WARN", "").strip()
+    if raw:
+        try:
+            _TASK_TOKEN_WARN = max(0, int(raw))
+        except ValueError:
+            print(f"WARN: PROXY_TASK_TOKEN_WARN={raw!r} is not an integer; using {_TASK_TOKEN_WARN}", flush=True)
+
+
+def _native_task_stats(messages: List[Dict[str, Any]], tools: List[Any]) -> Dict[str, Any]:
+    """Count this task's steps from the history: assistant turns since the last
+    user message, how many of them changed a file, how many have passed since
+    the last change, and an estimate of the tokens the task has cost so far
+    (each step's request carried every message before it plus the tool
+    schemas). The estimate divides characters by 3, like `_estimate_tokens`."""
+    last_user = -1
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user = i
+    tools_chars = len(json.dumps(tools, ensure_ascii=False)) if tools else 0
+    prefix = [0]
+    for m in messages:
+        prefix.append(prefix[-1] + len(json.dumps(m, ensure_ascii=False, default=str)))
+    steps = edits = since_edit = 0
+    chars = prefix[len(messages)] + tools_chars  # the request being sent now
+    for j in range(last_user + 1, len(messages)):
+        m = messages[j]
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        steps += 1
+        chars += prefix[j] + tools_chars
+        names = {((tc or {}).get("function") or {}).get("name") for tc in m.get("tool_calls") or []}
+        if names & _NATIVE_EDIT_TOOLS:
+            edits += 1
+            since_edit = 0
+        else:
+            since_edit += 1
+    return {"steps": steps, "edits": edits, "since_edit": since_edit, "tokens": chars // 3}
+
+
+def _native_reminder(messages: List[Dict[str, Any]], tools: List[Any]) -> str:
+    """Build the per-request reminder text for a native-tools request."""
+    st = _native_task_stats(messages, tools)
+    lines = [
+        f"harness: step {st['steps']} of this task, about {st['tokens']:,} tokens so far. "
+        "Every step re-sends the whole conversation and the user's daily token budget "
+        "is metered, so work in as few steps as you can: narrow searches (grep for a "
+        "specific symbol, read only the line ranges you need), never re-read a file "
+        "already in this conversation, and make the change as soon as you know it."
+    ]
+    todos = _extract_latest_todos(messages)
+    has_todowrite = any(
+        isinstance(t, dict) and (t.get("function") or {}).get("name") == "todowrite"
+        for t in tools or []
+    )
+    if todos:
+        lines.append(_format_todos_block(todos).strip())
+        lines.append("Keep it current with `todowrite` as you finish each item.")
+    elif has_todowrite and st["steps"] >= _NATIVE_TODO_AFTER:
+        lines.append(
+            "You have no todo list. Call `todowrite` now with the concrete steps of the "
+            "user's request, including the change itself and how you will verify it, "
+            "then work through it."
+        )
+    elif has_todowrite:
+        lines.append("For a task with more than two steps, start with `todowrite`.")
+    if st["since_edit"] >= _NATIVE_NO_EDIT_STOP:
+        lines.append(
+            f"STOP EXPLORING. {st['since_edit']} steps have passed without changing a file. "
+            "In this turn either make the change, answer the question, or stop and tell "
+            "the user exactly what blocks you and what you found. Do not run another search."
+        )
+    elif st["since_edit"] >= _NATIVE_NO_EDIT_NUDGE:
+        lines.append(
+            f"{st['since_edit']} steps have passed without changing a file. If the task needs "
+            "a change, you have very likely read enough: make it now. If it is a question, "
+            "answer it now."
+        )
+    if _TASK_TOKEN_WARN and st["tokens"] >= _TASK_TOKEN_WARN:
+        lines.append(
+            f"This task has passed its token budget (~{_TASK_TOKEN_WARN:,}). Finish the item "
+            "in progress, then stop and report what is done and what remains."
+        )
+    return "<system-reminder>\n" + "\n".join(lines) + "\n</system-reminder>"
+
+
+def _append_to_last_message(messages: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+    """Return a copy of `messages` with `text` appended to the last message's
+    content (string content gets a blank-line join, list content a text part).
+    The inbound list and its dicts are not mutated."""
+    if not messages or not isinstance(messages[-1], dict):
+        return messages
+    last = dict(messages[-1])
+    content = last.get("content")
+    if isinstance(content, list):
+        last["content"] = list(content) + [{"type": "text", "text": text}]
+    elif content:
+        last["content"] = f"{content}\n\n{text}"
+    else:
+        last["content"] = text
+    return list(messages[:-1]) + [last]
+
+
+# Rate-limit / deprecation headers worth handing back to the client, so the AI
+# SDK and opencode see the upstream's Retry-After instead of guessing a delay.
+_RELAY_HEADERS = ("retry-after", "retry-after-ms", "x-request-id", "deprecation", "sunset", "link")
+_DEPRECATION_WARNED: set = set()
+
+
+def _relay_headers(resp: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k, v in (getattr(resp, "headers", None) or {}).items():
+        lk = k.lower()
+        if lk in _RELAY_HEADERS or lk.startswith("x-ratelimit-"):
+            out[k] = v
+    return out
+
+
+def _daily_quota_reset_seconds(status: int, headers: Dict[str, str], body: Any) -> Optional[int]:
+    """Seconds until the 24 h budget frees up, when a 429 is the daily budget
+    (not a per-minute limit worth retrying in seconds); else None. Read from
+    X-RateLimit-Reset-Credits-Day, the "resets in 9h 19m" message, or a
+    retry_after over an hour, in that order (the vendor's own example pairs a
+    daily message with Retry-After: 42, so Retry-After alone is not trusted)."""
+    if status != 429:
+        return None
+    err = body.get("error") if isinstance(body, dict) and isinstance(body.get("error"), dict) else (
+        body if isinstance(body, dict) else {}
+    )
+    msg = str(err.get("message") or (body if isinstance(body, str) else "")).lower()
+    hdr = {k.lower(): v for k, v in headers.items()}
+    daily_words = any(w in msg for w in ("daily", "24-hour", "24 hour", "allowance", "credit"))
+    remaining = hdr.get("x-ratelimit-remaining-credits-day")
+    reset = hdr.get("x-ratelimit-reset-credits-day")
+    if reset is not None and (daily_words or str(remaining).strip() == "0"):
+        try:
+            return max(0, int(float(reset)))
+        except ValueError:
+            pass
+    m = re.search(r"resets in\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?", msg)
+    if m and (m.group(1) or m.group(2)):
+        return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60
+    ra = err.get("retry_after_seconds")
+    if isinstance(ra, (int, float)) and ra > 3600:
+        return int(ra)
+    return None
+
+
+def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, str]) -> None:
+    """One log line per native request with the usage the upstream reported
+    (from the JSON body or the stream's usage chunk) and the remaining-quota
+    headers, so a runaway session is visible in the proxy log as it happens."""
+    usage: Optional[Dict[str, Any]] = None
+    text = raw.decode("utf-8", "replace")
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if '"usage"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
+            usage = obj["usage"]
+            break
+    hdr = {k.lower(): v for k, v in headers.items()}
+    left = hdr.get("x-ratelimit-remaining-credits-day")
+    tail = f" credits_day_left={left}" if left is not None else ""
+    if usage is None:
+        print(f"[{req_id}] usage: none reported by upstream{tail}", flush=True)
+        return
+    rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    print(
+        f"[{req_id}] usage: model={model} prompt={usage.get('prompt_tokens')} "
+        f"completion={usage.get('completion_tokens')} reasoning={rt}{tail}",
+        flush=True,
+    )
+
+
+def _warn_deprecation(req_id: str, model: str, headers: Dict[str, str]) -> None:
+    hdr = {k.lower(): v for k, v in headers.items()}
+    if model in _DEPRECATION_WARNED or not (hdr.get("deprecation") or hdr.get("sunset")):
+        return
+    _DEPRECATION_WARNED.add(model)
+    print(
+        f"[{req_id}] WARN: upstream marks model '{model}' deprecated "
+        f"(Sunset: {hdr.get('sunset', '?')}; successor: {hdr.get('link', '?')}). "
+        "Switch DEFAULT_MODEL_NAME and PROXY_NATIVE_TOOL_MODELS before it returns 410.",
+        flush=True,
+    )
+
+
 def _native_passthrough(
     req_id: str, inbound_request: Dict[str, Any], model_name: str, want_stream: bool
 ) -> Response:
@@ -474,6 +693,15 @@ def _native_passthrough(
     payload = dict(inbound_request)
     payload["model"] = model_name
     messages = payload.get("messages") or []
+    if want_stream:
+        # opencode's provider only asks for usage when its config sets
+        # includeUsage; without a usage chunk it counts 0 tokens and never
+        # auto-compacts. Ask for it here so every client gets it.
+        payload["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}
+    if _NATIVE_REMINDERS and payload.get("tools") and messages:
+        payload["messages"] = messages = _append_to_last_message(
+            messages, _native_reminder(messages, payload.get("tools") or [])
+        )
     print(
         f"[{req_id}] upstream shape: mode=native messages={len(messages)} "
         f"chars={sum(len(_flatten_content_to_str(m.get('content') or '')) for m in messages if isinstance(m, dict))}",
@@ -510,10 +738,31 @@ def _native_passthrough(
         detail = ""
         if isinstance(err_body, dict) and isinstance(err_body.get("error"), dict):
             detail = str(err_body["error"].get("message") or "")
+        elif isinstance(err_body, str):
+            detail = err_body.strip()[:500]
         status = resp.status_code if resp.status_code < 500 else 502
         message = f"upstream returned status {resp.status_code}" + (f": {detail}" if detail else "")
-        return _client_error(message, status)
+        out_headers = _relay_headers(resp) if status < 500 else {}
+        reset = _daily_quota_reset_seconds(resp.status_code, out_headers, err_body)
+        if reset is not None:
+            # A spent daily budget: tell opencode to wait until it resets
+            # (its retry honours Retry-After at any length), so the session
+            # sleeps and then carries on by itself instead of failing now.
+            out_headers = {k: v for k, v in out_headers.items() if k.lower() not in ("retry-after", "retry-after-ms")}
+            out_headers["Retry-After"] = str(reset + 60)
+            when = (datetime.datetime.now() + datetime.timedelta(seconds=reset + 60)).strftime("%a %H:%M")
+            message += f" [harness: daily budget spent; the session will retry by itself at about {when}]"
+            print(f"[{req_id}] daily budget spent; Retry-After {reset + 60}s (about {when})", flush=True)
+        elif resp.status_code == 410 and isinstance(err_body, dict):
+            err = err_body.get("error") if isinstance(err_body.get("error"), dict) else err_body
+            repl = err.get("replacement_model")
+            if repl:
+                message += (f" [harness: model '{model_name}' is retired; set DEFAULT_MODEL_NAME={repl}"
+                            " and make sure PROXY_NATIVE_TOOL_MODELS matches it, then restart]")
+        return _client_error(message, status, out_headers)
 
+    ok_headers = _relay_headers(resp)
+    _warn_deprecation(req_id, model_name, ok_headers)
     if not want_stream:
         body = resp.content
         resp.close()
@@ -522,16 +771,21 @@ def _native_passthrough(
         except ValueError:
             save_debug_file(req_id, "03", "API_Response", {"raw": body.decode("utf-8", "replace")})
         print(f"[{req_id}] upstream OK; relayed native JSON", flush=True)
+        _log_native_usage(req_id, model_name, body, ok_headers)
         return Response(body, status=200, mimetype="application/json")
 
     def relay() -> Iterable[bytes]:
         captured: Optional[List[bytes]] = [] if _OUTPUT_DIR is not None else None
+        # The tail of the stream, kept for the usage log line (the usage
+        # chunk is the last data event before [DONE]).
+        tail = b""
         try:
             for chunk in resp.iter_content(chunk_size=None):
                 if not chunk:
                     continue
                 if captured is not None:
                     captured.append(chunk)
+                tail = (tail + chunk)[-16384:]
                 yield chunk
         except requests.RequestException as e:
             # The client already has a 200 and part of the stream; an error
@@ -547,6 +801,7 @@ def _native_passthrough(
                     {"raw": b"".join(captured).decode("utf-8", "replace")},
                 )
             print(f"[{req_id}] upstream OK; relayed native SSE", flush=True)
+            _log_native_usage(req_id, model_name, tail, ok_headers)
 
     return Response(relay(), status=200, mimetype="text/event-stream")
 
@@ -3571,11 +3826,12 @@ def list_models() -> Response:
     )
 
 
-def _client_error(message: str, status: int) -> Response:
+def _client_error(message: str, status: int, headers: Optional[Dict[str, str]] = None) -> Response:
     """Error response in the `{"error": {"message": ...}}` envelope the AI SDK
-    parses (only `message` is required; it is surfaced to opencode)."""
+    parses (only `message` is required; it is surfaced to opencode). `headers`
+    carries Retry-After and friends on the native path."""
     body: Dict[str, Any] = {"error": {"message": message, "type": "proxy_error"}}
-    return Response(json.dumps(body), status=status, mimetype="application/json")
+    return Response(json.dumps(body), status=status, mimetype="application/json", headers=headers or None)
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -4077,6 +4333,7 @@ def main() -> None:
     _setup_prompt_mode()
     # After _setup_prompt_mode: an explicit --prompt-mode turns the native route off.
     _setup_native_tools()
+    _setup_native_reminders()
     _setup_host_os()
     _setup_run_mode()
     _setup_mcp_tool_recency()
@@ -4122,6 +4379,7 @@ def main() -> None:
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   native tools:   {_NATIVE_TOOL_STATUS}\n"
+        f"   native nudges:  {'on' if _NATIVE_REMINDERS else 'off (PROXY_NATIVE_REMINDERS=0)'}; task token warning at {_TASK_TOKEN_WARN:,}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"
         f"   mcp recency:    {len(_MCP_TOOL_RECENCY)} tool(s)\n"

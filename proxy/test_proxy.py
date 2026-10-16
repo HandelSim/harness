@@ -5721,10 +5721,11 @@ class TestNativeToolPassthrough(unittest.TestCase):
         "name": "bash", "parameters": {"type": "object", "properties": {}}}}]
 
     class FakeResp:
-        def __init__(self, status, body, chunks=None):
+        def __init__(self, status, body, chunks=None, headers=None):
             self.status_code = status
             self._body = body
             self._chunks = chunks or []
+            self.headers = headers or {}
             self.content = body.encode("utf-8")
             self.text = body
             self.closed = False
@@ -5738,12 +5739,14 @@ class TestNativeToolPassthrough(unittest.TestCase):
         def close(self):
             self.closed = True
 
-    def _post(self, body, fake):
+    def _post(self, body, fake, reminders=False):
         client = proxy.app.test_client()
+        self.log = io.StringIO()
         with patch.object(proxy.requests, "post", return_value=fake) as mock_post, \
                 patch.object(proxy, "save_debug_file"), \
                 patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)), \
-                patch("sys.stdout", io.StringIO()):
+                patch.object(proxy, "_NATIVE_REMINDERS", reminders), \
+                patch("sys.stdout", self.log):
             resp = client.post("/v1/chat/completions", data=json.dumps(body),
                                content_type="application/json")
             data = resp.get_data()
@@ -5789,6 +5792,123 @@ class TestNativeToolPassthrough(unittest.TestCase):
         self.assertEqual(resp.mimetype, "text/event-stream")
         self.assertEqual(data, b"".join(chunks))
         self.assertTrue(mock_post.call_args.kwargs["stream"])
+
+    def test_stream_requests_usage(self):
+        # Without a usage chunk opencode counts 0 tokens and never compacts.
+        chunks = [b'data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":30}}\n\n',
+                  b"data: [DONE]\n\n"]
+        body = {"model": "gemini-x-withtools", "stream": True,
+                "stream_options": {"foo": 1},
+                "messages": [{"role": "user", "content": "hi"}]}
+        _, data, mock_post = self._post(body, self.FakeResp(
+            200, "", chunks, {"X-RateLimit-Remaining-Credits-Day": "123"}))
+        self.assertEqual(data, b"".join(chunks))
+        self.assertEqual(mock_post.call_args.kwargs["json"]["stream_options"],
+                         {"foo": 1, "include_usage": True})
+        self.assertIn("prompt=1200 completion=30", self.log.getvalue())
+        self.assertIn("credits_day_left=123", self.log.getvalue())
+
+    def test_reminder_appended_to_last_message_only(self):
+        msgs = [{"role": "user", "content": "fix the bug"}]
+        for i in range(25):
+            msgs.append({"role": "assistant", "content": None, "tool_calls": [{
+                "id": f"c{i}", "type": "function",
+                "function": {"name": "grep", "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "hit"})
+        tools = self.TOOLS + [{"type": "function", "function": {"name": "todowrite"}}]
+        body = {"model": "gemini-x-withtools", "messages": msgs, "tools": tools}
+        upstream = {"choices": [{"message": {"content": "ok"}}]}
+        _, _, mock_post = self._post(body, self.FakeResp(200, json.dumps(upstream)),
+                                     reminders=True)
+        sent = mock_post.call_args.kwargs["json"]["messages"]
+        self.assertEqual(sent[:-1], msgs[:-1])
+        last = sent[-1]["content"]
+        self.assertTrue(last.startswith("hit\n\n<system-reminder>"), last)
+        self.assertIn("step 25 of this task", last)
+        self.assertIn("no todo list", last)
+        self.assertIn("25 steps have passed without changing a file", last)
+        self.assertNotIn("STOP EXPLORING", last)
+        self.assertEqual(msgs[-1]["content"], "hit")  # inbound not mutated
+
+    def test_reminder_replays_todos_and_counts_edits(self):
+        todo = {"todos": [{"content": "patch parser", "status": "in_progress"}]}
+        msgs = [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "tool_calls": [{"id": "t", "type": "function", "function": {
+                "name": "todowrite", "arguments": json.dumps(todo)}}]},
+            {"role": "tool", "tool_call_id": "t", "content": "ok"},
+            {"role": "assistant", "tool_calls": [{"id": "e", "type": "function", "function": {
+                "name": "edit", "arguments": "{}"}}]},
+            {"role": "user", "content": [{"type": "text", "text": "and the tests?"}]},
+        ]
+        body = {"model": "gemini-x-withtools", "messages": msgs, "tools": self.TOOLS}
+        _, _, mock_post = self._post(
+            body, self.FakeResp(200, json.dumps({"choices": []})), reminders=True)
+        last = mock_post.call_args.kwargs["json"]["messages"][-1]["content"]
+        self.assertEqual(last[0], {"type": "text", "text": "and the tests?"})
+        text = last[1]["text"]
+        self.assertIn("step 0 of this task", text)  # counted from the latest user message
+        self.assertIn("[~] patch parser", text)
+
+    def test_reminder_escalates(self):
+        msgs = [{"role": "user", "content": "x"}] + [
+            {"role": "assistant", "tool_calls": [{"id": str(i), "type": "function",
+                                                  "function": {"name": "read", "arguments": "{}"}}]}
+            for i in range(45)]
+        with patch.object(proxy, "_TASK_TOKEN_WARN", 10):
+            text = proxy._native_reminder(msgs, self.TOOLS)
+        self.assertIn("STOP EXPLORING. 45 steps", text)
+        self.assertIn("passed its token budget", text)
+        self.assertNotIn("todowrite", text)  # no todowrite tool offered: no todo demand
+
+    def test_no_reminder_without_tools_or_when_off(self):
+        body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), reminders=True)
+        self.assertEqual(mock_post.call_args.kwargs["json"]["messages"], body["messages"])
+        with patch.dict(os.environ, {"PROXY_NATIVE_REMINDERS": "0", "PROXY_TASK_TOKEN_WARN": "7"}), \
+                patch.object(proxy, "_NATIVE_REMINDERS", True), \
+                patch.object(proxy, "_TASK_TOKEN_WARN", 1):
+            proxy._setup_native_reminders()
+            self.assertFalse(proxy._NATIVE_REMINDERS)
+            self.assertEqual(proxy._TASK_TOKEN_WARN, 7)
+
+    def test_daily_quota_429_sets_retry_after_to_reset(self):
+        err = {"error": {"message": "You've used 50097465 of your 50000000 token allowance for "
+                                    "this 24-hour window. Your limit resets in 9h 19m.",
+                         "type": "rate_limit_exceeded"}}
+        body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
+        resp, data, _ = self._post(body, self.FakeResp(
+            429, json.dumps(err), headers={"Retry-After": "42", "X-RateLimit-Limit-Credits-Day": "50000000"}))
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.headers["Retry-After"], str(9 * 3600 + 19 * 60 + 60))
+        self.assertEqual(resp.headers["X-RateLimit-Limit-Credits-Day"], "50000000")
+        msg = json.loads(data)["error"]["message"]
+        self.assertIn("token allowance", msg)
+        self.assertIn("retry by itself", msg)
+
+    def test_minute_429_keeps_upstream_retry_after(self):
+        err = {"error": {"message": "Rate limit exceeded: tokens per minute.",
+                         "type": "rate_limit_exceeded", "retry_after_seconds": 42}}
+        body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
+        resp, _, _ = self._post(body, self.FakeResp(429, json.dumps(err), headers={"Retry-After": "42"}))
+        self.assertEqual(resp.headers["Retry-After"], "42")
+
+    def test_daily_reset_sources(self):
+        f = proxy._daily_quota_reset_seconds
+        self.assertEqual(f(429, {"X-RateLimit-Reset-Credits-Day": "5000",
+                                 "X-RateLimit-Remaining-Credits-Day": "0"}, {"error": {}}), 5000)
+        self.assertEqual(f(429, {}, {"error": {"message": "Daily credit limit", "retry_after_seconds": 88390}}), 88390)
+        self.assertEqual(f(429, {}, {"error": {"message": "limit resets in 45m"}}), 45 * 60)
+        self.assertIsNone(f(429, {}, {"error": {"message": "slow down", "retry_after_seconds": 30}}))
+        self.assertIsNone(f(403, {}, {"error": {"message": "daily"}}))
+
+    def test_410_names_replacement(self):
+        err = {"error": {"message": "Model retired.", "type": "model_retired",
+                         "replacement_model": "gemini-3.5-flash"}}
+        body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
+        resp, data, _ = self._post(body, self.FakeResp(410, json.dumps(err)))
+        self.assertEqual(resp.status_code, 410)
+        self.assertIn("DEFAULT_MODEL_NAME=gemini-3.5-flash", json.loads(data)["error"]["message"])
 
     def test_upstream_4xx_keeps_status_and_message(self):
         err = {"error": {"message": "Your team does not have access to this model.",

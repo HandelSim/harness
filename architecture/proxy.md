@@ -74,10 +74,43 @@ else the JSON body. opencode's `tools`, `tool_choice`, assistant
 `tool_calls` (with any `extra_content` thought signature) and `role:"tool"`
 results all reach the upstream as sent. None of the cooperative machinery
 runs: no prompt injection, system→user rewrite, history translation,
-require-tool, tool-search, todo replay, malformed-call retry, empty-response
-rescue or local token estimate (upstream `usage` is passed through). Upstream
-4xx keep their status and carry the upstream message; 5xx become 502. A
-stream that breaks mid-way ends with an `{"error":…}` SSE event.
+require-tool, tool-search, malformed-call retry, empty-response rescue or
+local token estimate (upstream `usage` is passed through). A stream that
+breaks mid-way ends with an `{"error":…}` SSE event. Four small additions
+are the only changes made to the request or the reply:
+
+- **Usage.** A streamed request gets `stream_options.include_usage=true`,
+  so the upstream ends the stream with a usage chunk. Without it opencode
+  counts 0 tokens per step, never reaches its compaction threshold
+  (`context - output`), and the conversation grows until the day's budget
+  is gone. opencode's provider config also sets `includeUsage: true`
+  ([`harness-cli.md`](harness-cli.md)). Each request logs one line
+  `usage: model=… prompt=… completion=… reasoning=… credits_day_left=…`
+  (or `usage: none reported`) read from the end of the stream or body.
+- **Native reminder** (`PROXY_NATIVE_REMINDERS`, default on; `0` turns it
+  off). When the request carries tools, `_native_reminder` appends one
+  `<system-reminder>` to the LAST message (a copy: the inbound list is not
+  mutated, and opencode's history never holds it, so it cannot pile up).
+  It is rebuilt statelessly from the history: the step count since the
+  latest user message and an estimate of the tokens the task has cost
+  (each step re-sends its whole prefix; chars/3); the todo list replayed
+  from the last `todowrite` (same `_format_todos_block` as the cooperative
+  replay), or after 3 steps with none, an order to write one; after 20
+  steps without an edit-type call (`edit`, `write`, `patch`, `multiedit`,
+  `apply_patch`) a nudge to act, after 40 a "STOP EXPLORING" order; past
+  `PROXY_TASK_TOKEN_WARN` estimated tokens (default 5,000,000) an order to
+  finish the current item and report.
+- **Errors.** 4xx keep their status and upstream message; 5xx become 502.
+  `Retry-After`, `Retry-After-Ms`, `X-RateLimit-*`, `x-request-id`,
+  `Deprecation`, `Sunset` and `Link` are relayed (opencode's retry honours
+  `Retry-After` at any length, up to 5 retries). A 429 that
+  `_daily_quota_reset_seconds` reads as the daily budget (from
+  `X-RateLimit-Reset-Credits-Day`, a "resets in 9h 19m" message, or
+  `retry_after_seconds` over an hour) gets `Retry-After` = reset + 60 s, so
+  the opencode session waits and resumes by itself when the budget resets.
+  A 410 with `replacement_model` names the model to switch to.
+- **Deprecation.** A success carrying `Deprecation`/`Sunset` logs one
+  WARN per model per proxy run.
 
 Routing: `_is_native_tool_model` matches the model id against
 `PROXY_NATIVE_TOOL_MODELS`, comma-separated fnmatch patterns (empty → the

@@ -136,6 +136,12 @@ ensure_opencode_config() {
     # One knob — MODEL_CONTEXT_LENGTH — drives both the proxy's token-estimate
     # cap and opencode's declared context window.
     local ctx="${MODEL_CONTEXT_LENGTH:-200000}"
+    # Hard per-turn step cap for the agent and its subagents (opencode's
+    # agent `steps`): on the last step opencode makes the model stop and
+    # summarize instead of calling more tools, so one prompt can no longer
+    # spend a whole day's token budget exploring. 0 = no cap.
+    local steps="${HARNESS_AGENT_MAX_STEPS:-100}"
+    [[ "$steps" =~ ^[0-9]+$ ]] || steps=100
 
     # Build the opencode model dropdown from the proxy's /v1/models catalog
     # (a verbatim pass-through of the upstream's OpenAI-format model list), so
@@ -169,9 +175,18 @@ ensure_opencode_config() {
 
     # provider.models map: {"<id>": {"name": "<id>", "limit": {...}}, ...}
     local models_json
+    # The catalog's credit_weights (when it lists them) become opencode's
+    # per-model cost, so its "$" readout is millions of upstream credits.
+    local weights_json
+    weights_json=$(printf '%s' "${catalog:-{}}" | jq -c \
+        '[.data[]? | select(.id and (.credit_weights | type) == "object")
+          | {key: .id, value: .credit_weights}] | from_entries' 2>/dev/null || true)
+    [[ -n "$weights_json" ]] || weights_json='{}'
     models_json=$(printf '%s\n' "${model_ids[@]}" | jq -R . | jq -s \
-        --argjson ctx "$ctx" \
-        'map({key: ., value: {name: ., limit: {context: $ctx, output: 8192}}}) | from_entries')
+        --argjson ctx "$ctx" --argjson w "$weights_json" \
+        'map({key: ., value: ({name: ., limit: {context: $ctx, output: 8192}}
+            + (if $w[.] then {cost: {input: ($w[.].input // 1), output: ($w[.].output // 1)}} else {} end))})
+         | from_entries')
 
     # Always (re)write the harness-managed block — the model set may have
     # changed between launches. Built with jq so the models map is dynamic and
@@ -181,24 +196,29 @@ ensure_opencode_config() {
         --arg proxy_url "$proxy_url" \
         --arg selected "harness/${selected}" \
         --argjson models "$models_json" \
+        --argjson steps "$steps" \
         '{
           "$schema": "https://opencode.ai/config.json",
           "provider": {
             "harness": {
               "npm": "@ai-sdk/openai-compatible",
               "name": $provider_name,
-              "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy"},
+              "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy", "includeUsage": true},
               "models": $models
             }
           },
           "model": $selected,
           "small_model": $selected,
-          "agent": {
-            "yolo": {
+          "compaction": {"prune": true},
+          "agent": ((if $steps > 0 then
+              {"build": {"steps": $steps}, "plan": {"steps": $steps},
+               "general": {"steps": $steps}, "explore": {"steps": $steps}}
+            else {} end) + {
+            "yolo": ({
               "description": "Auto-approve all permissions; harness yolo mode",
               "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": "allow", "websearch": "allow"}
-            }
-          }
+            } + (if $steps > 0 then {"steps": $steps} else {} end))
+          })
         }' > "$config_file"
 }
 

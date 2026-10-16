@@ -99,6 +99,21 @@ jq -e '.provider.harness.models | has("test-model")' "$cfg" >/dev/null 2>&1 \
     || fail "T5: models map should include the default model"
 ok "T5: opencode config is valid JSON, loopback baseURL, dummy key, default model present"
 
+# --- T5b: usage reporting, step cap and pruning reach opencode's config -----
+# includeUsage is what makes opencode's token counter (and so auto-compaction)
+# work on the native tools route; the step cap is the per-prompt circuit
+# breaker against a run that only reads and greps.
+jq -e '.provider.harness.options.includeUsage == true' "$cfg" >/dev/null 2>&1 \
+    || fail "T5b: provider options should set includeUsage=true"
+jq -e '.compaction.prune == true and .agent.build.steps == 100 and .agent.yolo.steps == 100
+       and .agent.general.steps == 100 and (.agent.yolo.permission.edit == "allow")' "$cfg" >/dev/null 2>&1 \
+    || fail "T5b: default step cap 100 on build/yolo/general and prune=true expected — $(cat "$cfg")"
+( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; HARNESS_AGENT_MAX_STEPS=0; host_write_opencode_config ) \
+    || fail "T5b: host_write_opencode_config returned non-zero with steps=0"
+jq -e '(.agent | has("build") | not) and (.agent.yolo | has("steps") | not)' "$cfg" >/dev/null 2>&1 \
+    || fail "T5b: HARNESS_AGENT_MAX_STEPS=0 should drop the cap"
+ok "T5b: includeUsage, compaction.prune and the agent step cap (0 = none) are written"
+
 # --- T6: host_write_opencode_config refuses when jq is absent (M4 guard) ----
 if ( PATH="/nonexistent-dir"; PROXY_PORT=8123; DEFAULT_MODEL_NAME="m"; host_write_opencode_config ) >/dev/null 2>&1; then
     fail "T6: host_write_opencode_config should fail without jq, not reach the docker sidecar"

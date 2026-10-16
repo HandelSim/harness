@@ -606,7 +606,11 @@ What it does, in order:
    running from before it became the default (whose fingerprint lacks the
    line) is restarted once instead of reused, while one started with the old
    `--require-tool` flag still matches. A leftover `HARNESS_REQUIRE_TOOL` in
-   `.env` does not affect it. A `promptmode=<mode>` line is appended **only**
+   `.env` does not affect it. A `code=` line (cksum of `proxy/proxy.py`) and a
+   `native=` line (`PROXY_NATIVE_TOOL_MODELS`, `PROXY_NATIVE_REMINDERS`,
+   `PROXY_TASK_TOKEN_WARN`, `MODEL_CONTEXT_LENGTH`) are appended
+   unconditionally, so a host proxy left running across an upgrade or a knob
+   change is restarted instead of serving old code. A `promptmode=<mode>` line is appended **only**
    when `harness host --single-message` / `--prompt-mode M` set
    `prompt_mode_override` (exported to the host proxy as `PROXY_PROMPT_MODE`,
    blank by default), so a default launch hashes as before, while switching
@@ -619,8 +623,9 @@ What it does, in order:
    an accepted connect means it is serving) and tails the log on failure (the
    common cause is `_validate_config` `sys.exit(1)`).
 7. **Scoped opencode config** — `host_write_opencode_config` writes the same
-   provider config shape as the container entrypoint's `ensure_opencode_config`,
-   but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
+   provider config shape as the container entrypoint's `ensure_opencode_config`
+   (`includeUsage`, credit-weight `cost`, `compaction.prune`, agent `steps`
+   cap; see [`containers.md`](containers.md)), but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
    **scoped** file (`state/host/opencode.json`). It asserts host `jq` is present
    up front (`host_preflight` guarantees it) so the `harness_jq` docker-sidecar
    fallback can never be reached from this no-docker path. The caller exports

@@ -147,8 +147,9 @@ hostname are redacted too.
 - **Statistical power**: 3 repeats is low power for pass-rate differences.
   Use the time and request differences as the main signal, and add repeats if
   the pass rates are close.
-- **Key locks**: the key locks every 8 h, which stops a run partway. Resume it
-  after the unlock.
+- **Key locks and quota**: the key locks 14 days after its last unlock, and a
+  metered model can spend the 24 h credit budget mid-run (429). Either stops a
+  run partway. Resume it after the unlock or the budget reset.
 - **No upstream cache sharing**: in hybrid mode, message 0 contains the trial's
   unique workdir, so no upstream session or cache is shared across trials.
 - **Mock results**: a `--mock` run proves the plumbing, not model quality.

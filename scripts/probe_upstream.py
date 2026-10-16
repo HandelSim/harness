@@ -600,9 +600,12 @@ def _quota_note(r):
     e = r.json.get("error") if isinstance(r.json.get("error"), dict) else r.json
     msg = str(e.get("message") or "")
     ra = e.get("retry_after_seconds")
-    # "Daily credit limit exceeded" with retry_after ~a day; a per-minute
-    # limit says neither and asks for seconds.
-    if "daily" in msg.lower() or (isinstance(ra, (int, float)) and ra > 3600):
+    # "Daily credit limit exceeded" or "...of your N token allowance for this
+    # 24-hour window" (a not-yet-migrated key), with retry_after ~hours; a
+    # per-minute limit says none of that and asks for seconds.
+    low = msg.lower()
+    if ("daily" in low or "24-hour" in low or "allowance" in low
+            or (isinstance(ra, (int, float)) and ra > 3600)):
         return msg or "retry after %ss" % ra
     return None
 

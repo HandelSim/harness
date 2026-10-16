@@ -4165,6 +4165,13 @@ host_proxy_fingerprint() {
     # its fingerprint lacks this line) is restarted once instead of reused,
     # while one already started with the old --require-tool flag still matches.
     data+=$(printf '\nrequiretool=1\n')
+    # The proxy's own code and the native-route knobs: a host proxy left
+    # running across a `git pull`/upgrade would otherwise keep serving the old
+    # proxy.py until something else forced a restart.
+    data+=$(printf '\ncode=%s\nnative=%s|%s|%s|%s\n' \
+        "$(cksum <"$clone_dir/proxy/proxy.py" 2>/dev/null)" \
+        "${PROXY_NATIVE_TOOL_MODELS:-}" "${PROXY_NATIVE_REMINDERS:-}" \
+        "${PROXY_TASK_TOKEN_WARN:-}" "${MODEL_CONTEXT_LENGTH:-}")
     # Only an explicit --prompt-mode/--single-message is hashed, so a default
     # launch keeps the fingerprint it always had and is not restarted; switching
     # modes in either direction restarts the proxy.
@@ -5009,6 +5016,12 @@ host_write_opencode_config() {
     proxy_url="http://127.0.0.1:${port}/v1"
     default_model=$(_effective_default_model)
     ctx="${MODEL_CONTEXT_LENGTH:-200000}"
+    # Hard per-turn step cap for the agent and its subagents (opencode's
+    # agent `steps`): on the last step opencode makes the model stop and
+    # summarize instead of calling more tools, so one prompt can no longer
+    # spend a whole day's token budget exploring. 0 = no cap.
+    local steps="${HARNESS_AGENT_MAX_STEPS:-100}"
+    [[ "$steps" =~ ^[0-9]+$ ]] || steps=100
 
     local model_ids=() catalog
     if command -v curl >/dev/null 2>&1; then
@@ -5044,9 +5057,18 @@ host_write_opencode_config() {
     fi
 
     local models_json
+    # The catalog's credit_weights (when it lists them) become opencode's
+    # per-model cost, so its "$" readout is millions of upstream credits.
+    local weights_json
+    weights_json=$(printf '%s' "${catalog:-{}}" | harness_jq -c \
+        '[.data[]? | select(.id and (.credit_weights | type) == "object")
+          | {key: .id, value: .credit_weights}] | from_entries' 2>/dev/null || true)
+    [[ -n "$weights_json" ]] || weights_json='{}'
     models_json=$(printf '%s\n' "${model_ids[@]}" | harness_jq -R . | harness_jq -s \
-        --argjson ctx "$ctx" \
-        'map({key: ., value: {name: ., limit: {context: $ctx, output: 8192}}}) | from_entries')
+        --argjson ctx "$ctx" --argjson w "$weights_json" \
+        'map({key: ., value: ({name: ., limit: {context: $ctx, output: 8192}}
+            + (if $w[.] then {cost: {input: ($w[.].input // 1), output: ($w[.].output // 1)}} else {} end))})
+         | from_entries')
 
     # apiKey is a deliberate dummy: the real upstream key lives in the proxy's
     # Authorization header, never in opencode's config. opencode requires the
@@ -5057,6 +5079,7 @@ host_write_opencode_config() {
         --arg proxy_url "$proxy_url" \
         --arg selected "harness/${selected}" \
         --argjson models "$models_json" \
+        --argjson steps "$steps" \
         --arg web "$web_perm" \
         --arg share "$share" \
         '{
@@ -5065,18 +5088,22 @@ host_write_opencode_config() {
             "harness": {
               "npm": "@ai-sdk/openai-compatible",
               "name": $provider_name,
-              "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy"},
+              "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy", "includeUsage": true},
               "models": $models
             }
           },
           "model": $selected,
           "small_model": $selected,
-          "agent": {
-            "yolo": {
+          "compaction": {"prune": true},
+          "agent": ((if $steps > 0 then
+              {"build": {"steps": $steps}, "plan": {"steps": $steps},
+               "general": {"steps": $steps}, "explore": {"steps": $steps}}
+            else {} end) + {
+            "yolo": ({
               "description": "Auto-approve all permissions; harness yolo mode",
               "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": $web, "websearch": $web}
-            }
-          }
+            } + (if $steps > 0 then {"steps": $steps} else {} end))
+          })
         } + (if $share == "" then {} else {share: $share} end)' > "$config_file"
 }
 
@@ -5662,6 +5689,8 @@ agent_common_env() {
     # Declared context window for opencode's model config. The same knob caps
     # the proxy's local token estimate.
     printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-200000}"
+    # Per-prompt step cap written into opencode's agents (0 = none).
+    printf -- '-e\nHARNESS_AGENT_MAX_STEPS=%s\n' "${HARNESS_AGENT_MAX_STEPS:-100}"
     # Container CWD is also bind-mounted at this exact path; the entrypoint
     # cd's here after the gosu drop. Surfaced as an env var so agents (and
     # any user scripts inside the container) can identify the host launch

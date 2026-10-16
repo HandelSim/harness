@@ -78,6 +78,11 @@ These are the load-bearing behaviors the proxy is built around:
   It cannot be used for context tracking — the proxy estimates tokens
   locally instead (see "Local token estimation" in [`proxy.md`](proxy.md)).
   Responses now mark it `"is_estimated": true`.
+  On the `-withtools` models `usage` is per-request and is exactly what an
+  agent needs: the request's prompt size is the conversation size, which
+  is what opencode compares against its compaction threshold. A stream only
+  carries it when the request sets `stream_options.include_usage`, which
+  the proxy now always does on the native route.
 - **Sampling and shape parameters are ignored.** `max_tokens` (8 gave ~300
   words), `stop`, `temperature` (0 is not deterministic), `n` (always one
   choice) and `image_url` content parts have no effect. Array-of-text
@@ -119,7 +124,10 @@ found a standard OpenAI chat-completions contract, unlike the plain models:
   response `model` is the base id (no `-withtools`). Round trips that omit
   the thought signature still worked.
 - **Parameters now apply.** `max_tokens` (truncates, `finish_reason:
-  length`), `stop` and `stream_options.include_usage` work. `temperature:0`
+  length`), `stop` and `stream_options.include_usage` work (without the
+  latter a stream has no usage chunk at all, which in 2026-10 left opencode
+  counting 0 tokens, never compacting, and a single prompt spending the
+  50M daily allowance). `temperature:0`
   is still not deterministic and `n` still returns one choice.
 
 The proxy forwards these models natively; see [`proxy.md`](proxy.md) →
@@ -154,13 +162,96 @@ OpenAI-compatible and shares none of the contract above.
 - **No tool support**, same as the default upstream, so the cooperative-prompt
   machinery applies unchanged.
 
+## Lanes, credits and rate limits (vendor docs, 2026-10-16)
+
+Usage is **metered** now. The earlier "effectively unlimited" no longer holds.
+
+**Lanes.** The model id picks a routing lane, and the lane decides billing
+and behavior:
+
+| Lane | Ids | Credits | Tools / system prompt |
+|------|-----|---------|-----------------------|
+| Standard | `gemini-3.5-flash`, `gemini-3.5-pro`, `gemini-2.5-*` in the capability matrix; `-withtools` aliases | metered, see weights | honored |
+| Assist ("Gemini Enterprise") | `*-assist` (e.g. `gemini-3.5-pro-assist`), legacy `gemini-enterprise` | 0 (free; still TPM/RPM limited) | **system messages dropped, tools ignored** (sending tools "can lead to empty responses") |
+
+The assist lane is the behavior the cooperative path was built for (hidden
+system prompt, no tools), so the proxy's cooperative path is the way to use
+it; it only costs TPM/RPM. The vendor docs contradict themselves on plain ids:
+the capability matrix lists `gemini-3.5-flash` as Standard (1x/2x, tools),
+while the "taxonomy" section says plain ids route to the zero-credit lane and
+tool calling needs `-withtools`. Trust `/v1/models` (`lane`, `credit_weights`)
+and `harness probe`, not either page.
+
+**Credits.** `credits = prompt_tokens x W_in + completion_tokens x W_out`,
+integer weights from {1, 2, 5, 10, 25, 50}, per model in the catalog's
+`credit_weights`. Documented: flash 1x in / 2x out, pro 2x / 5x, embeddings
+1x / 0x, assist 0x. Whether reasoning tokens bill as output is undocumented
+(`harness probe` assumes yes, an upper estimate).
+
+**Every request re-bills the whole conversation.** A chat-completions agent
+resends the full history on every step, so one task costs roughly
+`steps x average context`: 300 steps at ~150k tokens is ~45M. That (most
+likely, plus context that never compacted) is how one opencode prompt spent a
+50M daily allowance on 2026-10-16, not a change in tokenization. See [`proxy.md`](proxy.md) → Native tool models for
+what the proxy does about it.
+
+**Limits.** Three dimensions, metered together:
+
+- **TPM** (rolling 60 s, prompt + completion): throttling lasts seconds; honor
+  `Retry-After`.
+- **RPM** (rolling 60 s).
+- **Daily budget** (rolling 24 h): frees up as the window rolls.
+
+Documented tiers: Tier 0 default 2,000,000 credits/day, 200k TPM, 60 RPM;
+Tier 1 5-10M credits/day, 500k TPM, 120 RPM. Rollout is phased; an account
+not yet migrated keeps its old limit. Observed 2026-10-16 on a not-yet-migrated
+key, a **token** allowance, not credits:
+
+```
+upstream returned status 429: You've used 50097465 of your 50000000 token
+allowance for this 24-hour window. Your limit resets in 9h 19m.
+```
+
+At Tier 0 (2M credits) a metered agent session gets only a few dozen
+100k-token steps a day, so the free assist lane matters more after cutover.
+
+**Headers.** Every response carries `X-RateLimit-Limit-*` /
+`X-RateLimit-Remaining-*` / `X-RateLimit-Reset-*` for `Credits-Day` and
+`Tokens-Minute`, plus `x-request-id` (quote it in support tickets). A 429
+carries `Retry-After` and a body with `error.type: rate_limit_exceeded`,
+`error.message` and `error.retry_after_seconds`. The vendor's own example
+pairs a daily-budget message with `Retry-After: 42`, so the proxy reads the
+reset time from `X-RateLimit-Reset-Credits-Day` or the message, not
+`Retry-After`, for a daily 429. `X-Usage-Recording-Failed: true` means
+metering lagged; the request itself succeeded.
+
+**Model alias retirement.** Capability suffixes such as `-withtools` are
+deprecated on a 60-day window: during it, responses carry `Deprecation`,
+`Sunset` and `Link: <...>; rel="successor-version"` headers; after it the
+alias returns `410 Gone` with `error.code: model_retired` and
+`error.details.replacement_model`. The vendor's example retires
+`gemini-3.5-flash-withtools` on 2026-11-25 in favor of `gemini-3.5-flash`.
+Until the canonical cutover is scheduled, tool calling still needs
+`-withtools`. When it lands, add the canonical ids to
+`PROXY_NATIVE_TOOL_MODELS` (the proxy routes by that pattern list).
+
+## Endpoints (Phase 0)
+
+`POST /v1/chat/completions` (unary + SSE, vision, structured output, tools),
+`POST /v1/embeddings`, `GET /v1/models`, and `POST /v1/messages` (Anthropic
+Messages compatibility; not used by the harness). `POST /v1/responses` is
+planned (Phase 3); `POST /v1/completions` is retired. Browser-origin calls
+fail CORS preflight with `401`, so clients must be server-side (the proxy is).
+
 ## API key lifecycle
 
-- **Keys lock every 8 hours.** Unclear whether the 8h is measured from
-  last use or from last unlock — **needs testing.**
-- **Keys expire after ~1 month.**
-- **Usage is effectively unlimited** — no rate-limit concern for now
-  (though the API can still return `429`, see status codes below).
+- **Keys lock 14 days (336 h) after creation or the last unlock** (vendor
+  docs, 2026-10-16; earlier docs and observations said 8 h). A personal key
+  unlocks self-service via the `unlock_url`; a **team** key needs an
+  administrator to unlock it in the portal.
+- **Keys expire** on a fixed lifecycle date. An expired key is permanently
+  dead (unlike a lock). Rotate before expiry: create a new key, deploy it to
+  `.env`, verify traffic, revoke the old one.
 
 ### Lock / unlock flow
 
@@ -251,7 +342,8 @@ key-lock behavior — a locked key returns the `401` + `unlock_url` shape above.
 | `401` | Unauthorized — invalid/missing API key, **or key locked** (see unlock flow) |
 | `403` | Forbidden — key lacks permission; also `type=forbidden` for a model the team cannot use ("Your team does not have access to this model") and for an unparseable body ("restricted to specific models") |
 | `404` | Not Found — resource does not exist (e.g. model not enabled) |
-| `429` | Too Many Requests — rate limit exceeded |
+| `410` | Gone — a retired model alias past its 60-day window; body names `details.replacement_model`, `Link` header names the successor |
+| `429` | Too Many Requests — TPM/RPM burst limit (wait `Retry-After` seconds) **or** the 24 h budget is spent (wait hours); see "Lanes, credits and rate limits" |
 | `500` | Internal Server Error — server error |
 | `502` | Bad Gateway — `upstream_error` catch-all: backend failure, missing `messages`, empty user content, or an oversized request |
 
