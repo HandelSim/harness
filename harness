@@ -2550,6 +2550,9 @@ commands:
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
   unlock                probe the upstream and print the unlock URL if the
                         key is locked
+  usage [--hours N]     total the tokens the upstream reported for the last N
+                        hours (default 24) from state/output/usage.jsonl, per
+                        model, plus the upstream's remaining-quota headers
   probe [full|memory]   test the upstream API directly and print a redacted
                         report that is safe to paste. 'full' (the default)
                         covers system prompt, native tools, streaming,
@@ -3837,6 +3840,92 @@ cmd_logs() {
     compose logs -f "$@"
 }
 
+# `harness usage [--hours N]`: total the upstream's own usage figures from the
+# ledger both proxies append to (PROXY_USAGE_LEDGER, one JSON line per reply,
+# pruned to 48h on proxy start). Read-only; needs no running proxy.
+cmd_usage() {
+    local hours=24
+    while (( $# )); do
+        case "$1" in
+            --hours) hours="${2:-}"; shift 2 || { err "--hours needs a number"; return 1; } ;;
+            --hours=*) hours="${1#--hours=}"; shift ;;
+            -h|--help)
+                echo "usage: harness usage [--hours N]   (default 24, ledger keeps 48)"
+                echo "Totals the token usage the upstream reported for every reply the proxy"
+                echo "relayed (state/output/usage.jsonl), per model, plus the latest"
+                echo "X-RateLimit-Remaining-* values the upstream sent."
+                return 0 ;;
+            *) err "unknown option '$1' (see 'harness usage --help')"; return 1 ;;
+        esac
+    done
+    if ! [[ "$hours" =~ ^[0-9]+$ ]] || (( hours < 1 )); then
+        err "--hours must be a whole number of hours, got '$hours'"
+        return 1
+    fi
+    local ledger py
+    ledger=$(host_usage_ledger)
+    if [[ ! -s "$ledger" ]]; then
+        echo "[harness] no usage recorded yet ($ledger is empty or missing)."
+        echo "[harness] the proxy writes it from this version on; restart it with 'harness restart'."
+        return 0
+    fi
+    if ! py=$(host_python_bin); then
+        err "'harness usage' needs Python 3 on the host"
+        return 1
+    fi
+    command -v cygpath >/dev/null 2>&1 && ledger=$(cygpath -m "$ledger")
+    # $py is unquoted on purpose: on Windows it can be 'py -3'.
+    # shellcheck disable=SC2086
+    $py - "$ledger" "$hours" <<'PY'
+import json, sys, time
+path, hours = sys.argv[1], int(sys.argv[2])
+now = time.time()
+since = now - hours * 3600
+rows = []
+with open(path, encoding="utf-8") as f:
+    for line in f:
+        try:
+            r = json.loads(line)
+            if float(r.get("ts", 0)) >= since:
+                rows.append(r)
+        except (ValueError, TypeError, AttributeError):
+            continue
+def n(v):
+    return v if isinstance(v, int) else 0
+def fmt(v):
+    return f"{v:,}"
+print(f"[harness] upstream-reported usage, last {hours}h ({path})")
+if not rows:
+    print("  no replies in that window")
+    sys.exit(0)
+models = {}
+for r in rows:
+    m = models.setdefault(r.get("model") or "?", [0, 0, 0, 0, 0])
+    m[0] += 1
+    m[1] += n(r.get("prompt"))
+    m[2] += n(r.get("completion"))
+    m[3] += n(r.get("reasoning"))
+    m[4] += n(r.get("cached"))
+tot = [sum(m[i] for m in models.values()) for i in range(5)]
+hour = sum(n(r.get("prompt")) + n(r.get("completion")) for r in rows if r["ts"] >= now - 3600)
+print(f"  replies:     {fmt(tot[0])}")
+print(f"  prompt:      {fmt(tot[1])}" + (f"  (upstream says {fmt(tot[4])} of it was cached)" if tot[4] else ""))
+print(f"  completion:  {fmt(tot[2])}" + (f"  (reasoning reported: {fmt(tot[3])})" if tot[3] else ""))
+print(f"  total:       {fmt(tot[1] + tot[2])} tokens; last hour {fmt(hour)}")
+if tot[0]:
+    print(f"  per reply:   {fmt((tot[1] + tot[2]) // tot[0])} tokens on average")
+if len(models) > 1:
+    print("  by model:")
+    for name, m in sorted(models.items(), key=lambda kv: -(kv[1][1] + kv[1][2])):
+        print(f"    {name}: {fmt(m[0])} replies, {fmt(m[1] + m[2])} tokens")
+last = next((r for r in reversed(rows) if r.get("remaining")), None)
+if last:
+    ago = int((now - last["ts"]) // 60)
+    rem = ", ".join(f"{k}={v}" for k, v in sorted(last["remaining"].items()))
+    print(f"  upstream remaining ({ago} min ago): {rem}")
+PY
+}
+
 # Single shared agent image and home directory.
 #
 # The agent image and persistent home are shared across modes. The
@@ -4099,6 +4188,20 @@ host_venv_dir()        { printf '%s/host/venv' "$state_root"; }
 host_proxy_pidfile()   { printf '%s/host/proxy.pid' "$state_root"; }
 host_proxy_fpfile()    { printf '%s/host/proxy.fp' "$state_root"; }
 host_proxy_logfile()   { printf '%s/host/proxy.log' "$state_root"; }
+# Both proxies write the same file: compose mounts state/output at /output.
+host_usage_ledger()    { printf '%s/output/usage.jsonl' "$state_root"; }
+# The same jq program agents/entrypoint.sh runs inline (keep both in step):
+# model ids -> opencode provider.models, with cost per HARNESS_COST_UNIT.
+opencode_models_jq() {
+    cat <<'JQ'
+def price($i; $o): {input: $i, output: $o, cache_read: $i, cache_write: $i};
+map({key: ., value: ({name: ., limit: {context: $ctx, output: 8192}}
+    + (if $unit == "credits"
+       then (if $w[.] then {cost: price($w[.].input // 1; $w[.].output // 1)} else {} end)
+       else {cost: price(1; 1)} end))})
+| from_entries
+JQ
+}
 host_opencode_config() { printf '%s/host/opencode.json' "$state_root"; }
 # HARNESS_HOST_PORT wins over .env's PROXY_PORT (which `set -a` sourcing would
 # otherwise force) so a scripted caller, e.g. `harness benchmark --test-modes`,
@@ -4168,10 +4271,11 @@ host_proxy_fingerprint() {
     # The proxy's own code and the native-route knobs: a host proxy left
     # running across a `git pull`/upgrade would otherwise keep serving the old
     # proxy.py until something else forced a restart.
-    data+=$(printf '\ncode=%s\nnative=%s|%s|%s|%s\n' \
+    data+=$(printf '\ncode=%s\nnative=%s|%s|%s|%s|%s\n' \
         "$(cksum <"$clone_dir/proxy/proxy.py" 2>/dev/null)" \
         "${PROXY_NATIVE_TOOL_MODELS:-}" "${PROXY_NATIVE_REMINDERS:-}" \
-        "${PROXY_TASK_TOKEN_WARN:-}" "${MODEL_CONTEXT_LENGTH:-}")
+        "${PROXY_TASK_TOKEN_WARN:-}" "${MODEL_CONTEXT_LENGTH:-}" \
+        "${PROXY_TOOL_OUTPUT_KEEP:-}")
     # Only an explicit --prompt-mode/--single-message is hashed, so a default
     # launch keeps the fingerprint it always had and is not restarted; switching
     # modes in either direction restarts the proxy.
@@ -4879,7 +4983,7 @@ host_proxy_start() {
     port=$(host_proxy_port)
     pf=$(host_proxy_pidfile)
     lf=$(host_proxy_logfile)
-    mkdir -p "$(host_state_dir)"
+    mkdir -p "$(host_state_dir)" "$state_root/output"
     echo "[harness] host mode: starting proxy on 127.0.0.1:$port" >&2
     echo "[harness] host mode: proxy log -> $lf" >&2
     # Debug dumps are OPT-IN, same as container mode (docker-compose.yml passes
@@ -4925,6 +5029,7 @@ host_proxy_start() {
         PROXY_BACKEND="${backend_override:-}" \
         PROXY_PROMPT_MODE="${prompt_mode_override:-}" \
         OUTPUT_DIR="$host_output_dir" \
+        PROXY_USAGE_LEDGER="$(host_usage_ledger)" \
         HARNESS_HOST_OS="$(harness_detect_os)" \
         HARNESS_RUN_MODE=host \
         INSTALL_ROOT="$install_root" \
@@ -5020,7 +5125,7 @@ host_write_opencode_config() {
     # agent `steps`): on the last step opencode makes the model stop and
     # summarize instead of calling more tools, so one prompt can no longer
     # spend a whole day's token budget exploring. 0 = no cap.
-    local steps="${HARNESS_AGENT_MAX_STEPS:-100}"
+    local steps="${HARNESS_AGENT_MAX_STEPS:-0}"
     [[ "$steps" =~ ^[0-9]+$ ]] || steps=100
 
     local model_ids=() catalog
@@ -5057,18 +5162,18 @@ host_write_opencode_config() {
     fi
 
     local models_json
-    # The catalog's credit_weights (when it lists them) become opencode's
-    # per-model cost, so its "$" readout is millions of upstream credits.
+    # opencode's "$" readout, in millions: HARNESS_COST_UNIT=tokens (default)
+    # prices every token at 1, so it reads millions of tokens, the unit of a
+    # token allowance; =credits uses the catalog's credit_weights. Cached
+    # prompt tokens are priced like the rest (opencode would count them free).
     local weights_json
     weights_json=$(printf '%s' "${catalog:-{}}" | harness_jq -c \
         '[.data[]? | select(.id and (.credit_weights | type) == "object")
           | {key: .id, value: .credit_weights}] | from_entries' 2>/dev/null || true)
     [[ -n "$weights_json" ]] || weights_json='{}'
     models_json=$(printf '%s\n' "${model_ids[@]}" | harness_jq -R . | harness_jq -s \
-        --argjson ctx "$ctx" --argjson w "$weights_json" \
-        'map({key: ., value: ({name: ., limit: {context: $ctx, output: 8192}}
-            + (if $w[.] then {cost: {input: ($w[.].input // 1), output: ($w[.].output // 1)}} else {} end))})
-         | from_entries')
+        --argjson ctx "$ctx" --argjson w "$weights_json" --arg unit "${HARNESS_COST_UNIT:-tokens}" \
+        "$(opencode_models_jq)")
 
     # apiKey is a deliberate dummy: the real upstream key lives in the proxy's
     # Authorization header, never in opencode's config. opencode requires the
@@ -5690,7 +5795,9 @@ agent_common_env() {
     # the proxy's local token estimate.
     printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-200000}"
     # Per-prompt step cap written into opencode's agents (0 = none).
-    printf -- '-e\nHARNESS_AGENT_MAX_STEPS=%s\n' "${HARNESS_AGENT_MAX_STEPS:-100}"
+    printf -- '-e\nHARNESS_AGENT_MAX_STEPS=%s\n' "${HARNESS_AGENT_MAX_STEPS:-0}"
+    # Unit of opencode's cost readout: tokens (1 per token) or credits.
+    printf -- '-e\nHARNESS_COST_UNIT=%s\n' "${HARNESS_COST_UNIT:-tokens}"
     # Container CWD is also bind-mounted at this exact path; the entrypoint
     # cd's here after the gosu drop. Surfaced as an env var so agents (and
     # any user scripts inside the container) can identify the host launch
@@ -9360,6 +9467,7 @@ main() {
         downgrade)                  cmd_downgrade "$@" ;;
         check-updates)              cmd_check_updates "$@" ;;
         logs)                       cmd_logs "$@" ;;
+        usage)                      cmd_usage "$@" ;;
         opencode)                   run_agent opencode "$@" ;;
         host)                       cmd_host "$@" ;;
         chatgpt)                    cmd_chatgpt "$@" ;;

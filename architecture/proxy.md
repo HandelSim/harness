@@ -89,19 +89,45 @@ are the only changes made to the request or the reply:
   ([`harness-cli.md`](harness-cli.md)). Each request logs one line
   `usage: model=… prompt=… completion=… reasoning=… credits_day_left=…`
   (or `usage: none reported`) read from the end of the stream or body.
+- **Usage ledger** (`PROXY_USAGE_LEDGER`). `_record_usage` appends one JSON
+  line per upstream reply, native and cooperative alike, with the upstream's
+  own `prompt`/`completion`/`reasoning`/`cached` counts (never the proxy's
+  estimate) and every `X-RateLimit-Remaining-*` header. Compose sets
+  `/output/usage.jsonl`, host mode `state/output/usage.jsonl`: the same host
+  file. Lines older than 48 h are pruned once per proxy start; a write
+  failure warns once and turns the ledger off until restart. `harness usage`
+  reads it ([`harness-cli.md`](harness-cli.md)). Cooperative retries and
+  require-tool re-asks are not recorded, so that route reads slightly low.
+- **Old tool output trimmed** (`PROXY_TOOL_OUTPUT_KEEP`, default 40,000
+  tokens; `0` off). Every native step re-bills the whole history, and most
+  of it is tool output. `_trim_old_tool_outputs` walks the history newest
+  first and keeps tool results whole until about `KEEP × 3` chars are
+  counted; older results over 1,500 chars are cut to their first 500 plus a
+  note to re-run the tool. Results after the last assistant message (the
+  ones the model has not seen yet) are never cut. Copies, so opencode's own
+  history is untouched; the trim is opencode's `compaction.prune` applied
+  on every step instead of only after a prompt finishes, and the usage the
+  upstream then reports (and opencode compacts on) is the trimmed size.
 - **Native reminder** (`PROXY_NATIVE_REMINDERS`, default on; `0` turns it
   off). When the request carries tools, `_native_reminder` appends one
   `<system-reminder>` to the LAST message (a copy: the inbound list is not
   mutated, and opencode's history never holds it, so it cannot pile up).
-  It is rebuilt statelessly from the history: the step count since the
-  latest user message and an estimate of the tokens the task has cost
-  (each step re-sends its whole prefix; chars/3); the todo list replayed
-  from the last `todowrite` (same `_format_todos_block` as the cooperative
-  replay), or after 3 steps with none, an order to write one; after 20
-  steps without an edit-type call (`edit`, `write`, `patch`, `multiedit`,
-  `apply_patch`) a nudge to act, after 40 a "STOP EXPLORING" order; past
-  `PROXY_TASK_TOKEN_WARN` estimated tokens (default 5,000,000) an order to
-  finish the current item and report.
+  It is rebuilt from the history: the step count since the latest user
+  message, an estimate of the tokens the task has cost (each step re-sends
+  its whole prefix; chars/3), and a line not to re-read what is still in
+  the conversation; the todo list replayed from the last `todowrite` (same
+  `_format_todos_block` as the cooperative replay), or after 3 steps with
+  none, an order to write one, and after 25 steps without a `todowrite` a
+  prompt to update it. After a compaction the history no longer holds the
+  list, so the latest one is also kept per `x-opencode-session-id` header
+  (`_SESSION_TODOS`, 64 sessions, in memory) and replayed from there. Calls
+  repeated 3+ times with the same name and arguments are named with an
+  order to use the earlier result. After 30 steps without an edit-type
+  call (`edit`, `write`, `patch`, `multiedit`, `apply_patch`) a soft line
+  says to start changing files unless the current item needs more
+  research. Nothing caps or stops a long task: hard tasks may run long.
+  `PROXY_TASK_TOKEN_WARN` (off by default) adds an order to finish the
+  current item and report past that many estimated tokens.
 - **Hard step cap.** When opencode hits an agent's `steps` cap it ends the
   request with an assistant message starting "CRITICAL - MAXIMUM STEPS
   REACHED" but still sends the tools. `_at_step_cap` spots it and the proxy

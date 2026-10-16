@@ -86,6 +86,10 @@ services:
       PROXY_NATIVE_TOOL_MODELS: ${PROXY_NATIVE_TOOL_MODELS:-}
       PROXY_NATIVE_REMINDERS: ${PROXY_NATIVE_REMINDERS:-}
       PROXY_TASK_TOKEN_WARN: ${PROXY_TASK_TOKEN_WARN:-}
+      PROXY_TOOL_OUTPUT_KEEP: ${PROXY_TOOL_OUTPUT_KEEP:-}
+      # Per-reply upstream usage, read by `harness usage` (host side:
+      # state/output/usage.jsonl via the /output mount below).
+      PROXY_USAGE_LEDGER: /output/usage.jsonl
     volumes:
       # When OUTPUT_DIR is set, the proxy writes per-request debug files here.
       # On Windows users should set OUTPUT_DIR=//output to bypass MSYS path

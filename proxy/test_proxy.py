@@ -5813,7 +5813,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
         for i in range(25):
             msgs.append({"role": "assistant", "content": None, "tool_calls": [{
                 "id": f"c{i}", "type": "function",
-                "function": {"name": "grep", "arguments": "{}"}}]})
+                "function": {"name": "grep", "arguments": json.dumps({"pattern": f"p{i}"})}}]})
             msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "hit"})
         tools = self.TOOLS + [{"type": "function", "function": {"name": "todowrite"}}]
         body = {"model": "gemini-x-withtools", "messages": msgs, "tools": tools}
@@ -5826,8 +5826,8 @@ class TestNativeToolPassthrough(unittest.TestCase):
         self.assertTrue(last.startswith("hit\n\n<system-reminder>"), last)
         self.assertIn("step 25 of this task", last)
         self.assertIn("no todo list", last)
-        self.assertIn("25 steps have passed without changing a file", last)
-        self.assertNotIn("STOP EXPLORING", last)
+        self.assertNotIn("without changing a file", last)  # nudge starts at 30
+        self.assertNotIn("more than once", last)  # every grep was different
         self.assertEqual(msgs[-1]["content"], "hit")  # inbound not mutated
 
     def test_reminder_replays_todos_and_counts_edits(self):
@@ -5850,16 +5850,106 @@ class TestNativeToolPassthrough(unittest.TestCase):
         self.assertIn("step 0 of this task", text)  # counted from the latest user message
         self.assertIn("[~] patch parser", text)
 
-    def test_reminder_escalates(self):
+    def test_reminder_names_repeats_and_budget(self):
         msgs = [{"role": "user", "content": "x"}] + [
-            {"role": "assistant", "tool_calls": [{"id": str(i), "type": "function",
-                                                  "function": {"name": "read", "arguments": "{}"}}]}
+            {"role": "assistant", "tool_calls": [{"id": str(i), "type": "function", "function": {
+                "name": "read", "arguments": json.dumps({"filePath": "a.py" if i % 3 else "b.py"})}}]}
             for i in range(45)]
-        with patch.object(proxy, "_TASK_TOKEN_WARN", 10):
-            text = proxy._native_reminder(msgs, self.TOOLS)
-        self.assertIn("STOP EXPLORING. 45 steps", text)
-        self.assertIn("passed its token budget", text)
+        text = proxy._native_reminder(msgs, self.TOOLS)
+        self.assertIn('read {"filePath": "a.py"} (x30); read {"filePath": "b.py"} (x15)', text)
+        self.assertIn("45 steps without changing a file", text)
+        self.assertNotIn("STOP", text)  # no hard stop: long tasks may keep going
+        self.assertNotIn("passed its token budget", text)  # off by default
         self.assertNotIn("todowrite", text)  # no todowrite tool offered: no todo demand
+        with patch.object(proxy, "_TASK_TOKEN_WARN", 10):
+            self.assertIn("passed its token budget", proxy._native_reminder(msgs, self.TOOLS))
+
+    def test_reminder_stale_todos_and_session_memory(self):
+        todo = {"todos": [{"content": "patch parser", "status": "in_progress"}]}
+        write = {"role": "assistant", "tool_calls": [{"id": "t", "type": "function", "function": {
+            "name": "todowrite", "arguments": json.dumps(todo)}}]}
+        steps = [{"role": "assistant", "tool_calls": [{"id": str(i), "type": "function", "function": {
+            "name": "grep", "arguments": json.dumps({"pattern": str(i)})}}]} for i in range(26)]
+        with patch.object(proxy, "_SESSION_TODOS", {}):
+            text = proxy._native_reminder([{"role": "user", "content": "x"}, write] + steps,
+                                          self.TOOLS, "ses_1")
+            self.assertIn("26 steps since you last updated the list", text)
+            # After a compaction the todowrite call is gone from the history.
+            compacted = [{"role": "user", "content": "summary"}, {"role": "user", "content": "go on"}]
+            self.assertIn("[~] patch parser", proxy._native_reminder(compacted, self.TOOLS, "ses_1"))
+            self.assertNotIn("patch parser", proxy._native_reminder(compacted, self.TOOLS, "ses_2"))
+            self.assertNotIn("patch parser", proxy._native_reminder(compacted, self.TOOLS))
+
+    def test_old_tool_output_trimmed(self):
+        big = "x" * 9000
+        msgs = [{"role": "user", "content": "go"}]
+        for i in range(6):
+            msgs.append({"role": "assistant", "tool_calls": [{"id": str(i), "type": "function",
+                                                              "function": {"name": "read", "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": str(i), "content": big})
+        msgs.append({"role": "tool", "tool_call_id": "z", "content": "y" * 50000})  # not yet seen
+        msgs.append({"role": "tool", "tool_call_id": "s", "content": "short"})
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 6000):  # 18,000 chars
+            out, dropped = proxy._trim_old_tool_outputs(msgs)
+        self.assertEqual(out[-2]["content"], "y" * 50000)  # after the last assistant: kept
+        self.assertEqual(out[-1]["content"], "short")
+        tools_out = [m["content"] for m in out[:-2] if m.get("role") == "tool"]
+        self.assertEqual(tools_out[-1], big)  # the latest step's own result
+        self.assertTrue(all(c.startswith("x" * 500) and "were dropped" in c for c in tools_out[:-1]))
+        self.assertEqual(dropped, 5 * 8500)
+        self.assertEqual(msgs[2]["content"], big)  # inbound not mutated
+        msgs = msgs[:-2]
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 6000):
+            out, dropped = proxy._trim_old_tool_outputs(msgs)
+        self.assertEqual([m["content"] == big for m in out if m.get("role") == "tool"],
+                         [False, False, False, False, True, True])
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 0):
+            self.assertEqual(proxy._trim_old_tool_outputs(msgs), (msgs, 0))
+
+    def test_trim_applies_to_forwarded_request(self):
+        msgs = [{"role": "user", "content": "go"},
+                {"role": "assistant", "tool_calls": [{"id": "a", "type": "function",
+                                                      "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "a", "content": "q" * 9000},
+                {"role": "assistant", "tool_calls": [{"id": "b", "type": "function",
+                                                      "function": {"name": "read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "b", "content": "r" * 9000}]
+        body = {"model": "gemini-x-withtools", "messages": msgs, "tools": self.TOOLS}
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 1000):
+            _, _, mock_post = self._post(body, self.FakeResp(200, "{}"))
+        sent = mock_post.call_args.kwargs["json"]["messages"]
+        self.assertIn("were dropped", sent[2]["content"])
+        self.assertEqual(sent[4]["content"], "r" * 9000)
+        self.assertIn("trimmed 8,500 chars", self.log.getvalue())
+
+    def test_usage_ledger_appends_upstream_usage_and_prunes(self):
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "usage.jsonl")
+            old = {"ts": 1.0, "model": "m", "prompt": 5}
+            with open(ledger, "w") as f:
+                f.write(json.dumps(old) + "\n" + "not json\n")
+            with patch.dict(os.environ, {"PROXY_USAGE_LEDGER": ledger}), \
+                    patch.object(proxy, "_USAGE_LEDGER", ""):
+                proxy._setup_usage_ledger()
+                with open(ledger) as f:
+                    self.assertEqual(f.read(), "")  # >48h old and junk dropped
+                upstream = {"choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                            "usage": {"prompt_tokens": 1200, "completion_tokens": 30,
+                                      "completion_tokens_details": {"reasoning_tokens": 9}}}
+                body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
+                self._post(body, self.FakeResp(200, json.dumps(upstream), headers={
+                    "X-RateLimit-Remaining-Credits-Day": "777", "Content-Type": "application/json"}))
+                chunks = [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+                          b'data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":2}}\n\n',
+                          b"data: [DONE]\n\n"]
+                self._post(dict(body, stream=True), self.FakeResp(200, "", chunks=chunks))
+            with open(ledger) as f:
+                rows = [json.loads(line) for line in f]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["prompt"], rows[0]["completion"], rows[0]["reasoning"]), (1200, 30, 9))
+        self.assertEqual(rows[0]["remaining"], {"credits-day": "777"})
+        self.assertEqual((rows[0]["model"], rows[0]["route"]), ("gemini-x-withtools", "native"))
+        self.assertEqual(rows[1]["prompt"], 50)
 
     def test_no_reminder_without_tools_or_when_off(self):
         body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}

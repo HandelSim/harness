@@ -473,31 +473,100 @@ def _is_native_tool_model(model: str) -> bool:
 # PROXY_NATIVE_REMINDERS=0 turns it off; PROXY_TASK_TOKEN_WARN sets the
 # estimated task size (tokens) past which the reminder says to wrap up.
 _NATIVE_REMINDERS = True  # set in main()
-_TASK_TOKEN_WARN = 5_000_000  # set in main()
+_TASK_TOKEN_WARN = 0  # set in main(); 0 = no per-task budget line
+_TOOL_OUTPUT_KEEP = 40_000  # set in main(); tokens of newest tool output sent verbatim, 0 = all
+_TOOL_OUTPUT_TRIM_MIN = 1_500  # chars: shorter old tool outputs are left alone
+_TOOL_OUTPUT_HEAD = 500        # chars of a trimmed tool output that are kept
 _NATIVE_EDIT_TOOLS = frozenset({"edit", "write", "patch", "multiedit", "apply_patch"})
 _NATIVE_TODO_AFTER = 3        # steps with no todo list before it is demanded
-_NATIVE_NO_EDIT_NUDGE = 20    # steps without a file change before the first nudge
-_NATIVE_NO_EDIT_STOP = 40     # ... before the reminder says to stop and report
+_NATIVE_TODO_STALE = 25       # steps without a todowrite before the list must be updated
+_NATIVE_NO_EDIT_NUDGE = 30    # steps without a file change before a nudge
+_NATIVE_REPEAT_AT = 3         # identical tool calls in one task before they are named
+# Latest todo list per opencode session (x-opencode-session-id), so the replay
+# survives a compaction that drops the todowrite calls from the history.
+_SESSION_TODOS: "Dict[str, Any]" = {}
+_SESSION_TODOS_MAX = 64
 
 
 def _setup_native_reminders() -> None:
     global _NATIVE_REMINDERS
     global _TASK_TOKEN_WARN
+    global _TOOL_OUTPUT_KEEP
     _NATIVE_REMINDERS = os.environ.get("PROXY_NATIVE_REMINDERS", "1").strip().lower() not in (
         "0", "off", "false", "no",
     )
-    raw = os.environ.get("PROXY_TASK_TOKEN_WARN", "").strip()
-    if raw:
+    for name, current in (("PROXY_TASK_TOKEN_WARN", _TASK_TOKEN_WARN), ("PROXY_TOOL_OUTPUT_KEEP", _TOOL_OUTPUT_KEEP)):
+        raw = os.environ.get(name, "").strip()
+        value = current
+        if raw:
+            try:
+                value = max(0, int(raw))
+            except ValueError:
+                print(f"WARN: {name}={raw!r} is not an integer; using {current}", flush=True)
+        if name == "PROXY_TASK_TOKEN_WARN":
+            _TASK_TOKEN_WARN = value
+        else:
+            _TOOL_OUTPUT_KEEP = value
+
+
+def _trim_old_tool_outputs(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """Shorten old tool results before they are re-sent upstream.
+
+    Every step re-sends (and re-bills) the whole conversation, and in an agent
+    session most of it is tool output: file reads, grep hits, command logs.
+    opencode's own prune does the same thing but only between user prompts,
+    never inside one long task. Walking back from the newest message, tool
+    results are kept whole until about `_TOOL_OUTPUT_KEEP` tokens (chars / 3)
+    of them have been seen; older results longer than `_TOOL_OUTPUT_TRIM_MIN`
+    chars keep their first `_TOOL_OUTPUT_HEAD` chars plus a note. Results after
+    the last assistant message (the ones the model is about to read) are never
+    trimmed. opencode's stored history is untouched; only this request shrinks,
+    and the upstream's usage (so opencode's compaction counter) follows it.
+    Returns the new list (a copy where changed) and the characters dropped."""
+    if not _TOOL_OUTPUT_KEEP or not messages:
+        return messages, 0
+    last_assistant = max(
+        (i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"),
+        default=-1,
+    )
+    budget = _TOOL_OUTPUT_KEEP * 3
+    seen = 0
+    out = list(messages)
+    dropped = 0
+    for i in range(len(out) - 1, -1, -1):
+        m = out[i]
+        if not isinstance(m, dict) or m.get("role") != "tool":
+            continue
+        text = _flatten_content_to_str(m.get("content") or "")
+        seen += len(text)
+        if i > last_assistant or seen <= budget or len(text) <= _TOOL_OUTPUT_TRIM_MIN:
+            continue
+        cut = len(text) - _TOOL_OUTPUT_HEAD
+        out[i] = {**m, "content": (
+            text[:_TOOL_OUTPUT_HEAD]
+            + f"\n[harness: {cut:,} more chars of this older tool output were dropped to save "
+            "tokens. Run the tool again if you need them.]"
+        )}
+        dropped += cut
+    return (out if dropped else messages), dropped
+
+
+def _tool_call_key(tc: Dict[str, Any]) -> str:
+    func = (tc or {}).get("function") or {}
+    args = func.get("arguments")
+    if isinstance(args, str):
         try:
-            _TASK_TOKEN_WARN = max(0, int(raw))
-        except ValueError:
-            print(f"WARN: PROXY_TASK_TOKEN_WARN={raw!r} is not an integer; using {_TASK_TOKEN_WARN}", flush=True)
+            args = json.loads(args)
+        except (ValueError, TypeError):
+            pass
+    return f"{func.get('name')} {json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
 
 
 def _native_task_stats(messages: List[Dict[str, Any]], tools: List[Any]) -> Dict[str, Any]:
     """Count this task's steps from the history: assistant turns since the last
     user message, how many of them changed a file, how many have passed since
-    the last change, and an estimate of the tokens the task has cost so far
+    the last change and since the last `todowrite`, which identical tool calls
+    were repeated, and an estimate of the tokens the task has cost so far
     (each step's request carried every message before it plus the tool
     schemas). The estimate divides characters by 3, like `_estimate_tokens`."""
     last_user = -1
@@ -509,6 +578,8 @@ def _native_task_stats(messages: List[Dict[str, Any]], tools: List[Any]) -> Dict
     for m in messages:
         prefix.append(prefix[-1] + len(json.dumps(m, ensure_ascii=False, default=str)))
     steps = edits = since_edit = 0
+    since_todo = None
+    calls: Dict[str, int] = {}
     chars = prefix[len(messages)] + tools_chars  # the request being sent now
     for j in range(last_user + 1, len(messages)):
         m = messages[j]
@@ -516,33 +587,66 @@ def _native_task_stats(messages: List[Dict[str, Any]], tools: List[Any]) -> Dict
             continue
         steps += 1
         chars += prefix[j] + tools_chars
-        names = {((tc or {}).get("function") or {}).get("name") for tc in m.get("tool_calls") or []}
+        tcs = [tc for tc in m.get("tool_calls") or [] if isinstance(tc, dict)]
+        names = {(tc.get("function") or {}).get("name") for tc in tcs}
+        for tc in tcs:
+            key = _tool_call_key(tc)
+            calls[key] = calls.get(key, 0) + 1
         if names & _NATIVE_EDIT_TOOLS:
             edits += 1
             since_edit = 0
         else:
             since_edit += 1
-    return {"steps": steps, "edits": edits, "since_edit": since_edit, "tokens": chars // 3}
+        if "todowrite" in names:
+            since_todo = 0
+        elif since_todo is not None:
+            since_todo += 1
+    repeats = sorted(((n, k) for k, n in calls.items() if n >= _NATIVE_REPEAT_AT), reverse=True)
+    return {
+        "steps": steps, "edits": edits, "since_edit": since_edit, "since_todo": since_todo,
+        "repeats": repeats, "tokens": chars // 3,
+    }
 
 
-def _native_reminder(messages: List[Dict[str, Any]], tools: List[Any]) -> str:
-    """Build the per-request reminder text for a native-tools request."""
+def _native_reminder(messages: List[Dict[str, Any]], tools: List[Any], session_id: str = "") -> str:
+    """Build the per-request reminder text for a native-tools request.
+
+    It keeps the agent tied to its goal rather than capping its length: the
+    todo list is replayed every step (from the history, or after a compaction
+    from the last list this session wrote), a missing or stale list is called
+    out, and so are identical tool calls repeated within the task, the clearest
+    sign of a run that has lost its goal."""
     st = _native_task_stats(messages, tools)
     lines = [
         f"harness: step {st['steps']} of this task, about {st['tokens']:,} tokens so far. "
         "Every step re-sends the whole conversation and the user's daily token budget "
         "is metered, so work in as few steps as you can: narrow searches (grep for a "
-        "specific symbol, read only the line ranges you need), never re-read a file "
-        "already in this conversation, and make the change as soon as you know it."
+        "specific symbol, read only the line ranges you need), do not re-read what is "
+        "still in this conversation, and make the change as soon as you know it."
     ]
     todos = _extract_latest_todos(messages)
+    if session_id:
+        if todos:
+            _SESSION_TODOS.pop(session_id, None)
+            _SESSION_TODOS[session_id] = todos
+            while len(_SESSION_TODOS) > _SESSION_TODOS_MAX:
+                _SESSION_TODOS.pop(next(iter(_SESSION_TODOS)))
+        else:
+            todos = _SESSION_TODOS.get(session_id)
     has_todowrite = any(
         isinstance(t, dict) and (t.get("function") or {}).get("name") == "todowrite"
         for t in tools or []
     )
     if todos:
         lines.append(_format_todos_block(todos).strip())
-        lines.append("Keep it current with `todowrite` as you finish each item.")
+        if st["since_todo"] is not None and st["since_todo"] >= _NATIVE_TODO_STALE:
+            lines.append(
+                f"{st['since_todo']} steps since you last updated the list. Call `todowrite` "
+                "now: mark what is done, keep one item in progress, and add anything new "
+                "you found. If you are stuck on the current item, say what blocks you."
+            )
+        else:
+            lines.append("Keep it current with `todowrite` as you finish each item.")
     elif has_todowrite and st["steps"] >= _NATIVE_TODO_AFTER:
         lines.append(
             "You have no todo list. Call `todowrite` now with the concrete steps of the "
@@ -551,17 +655,18 @@ def _native_reminder(messages: List[Dict[str, Any]], tools: List[Any]) -> str:
         )
     elif has_todowrite:
         lines.append("For a task with more than two steps, start with `todowrite`.")
-    if st["since_edit"] >= _NATIVE_NO_EDIT_STOP:
+    if st["repeats"]:
+        shown = "; ".join(f"{k[:160]} (x{n})" for n, k in st["repeats"][:3])
         lines.append(
-            f"STOP EXPLORING. {st['since_edit']} steps have passed without changing a file. "
-            "In this turn either make the change, answer the question, or stop and tell "
-            "the user exactly what blocks you and what you found. Do not run another search."
+            f"You have made these exact tool calls more than once in this task: {shown}. "
+            "Their results are already in this conversation unless marked as dropped. "
+            "Do not repeat a call to get the same answer; use what you have or try "
+            "something different."
         )
-    elif st["since_edit"] >= _NATIVE_NO_EDIT_NUDGE:
+    if st["since_edit"] >= _NATIVE_NO_EDIT_NUDGE:
         lines.append(
-            f"{st['since_edit']} steps have passed without changing a file. If the task needs "
-            "a change, you have very likely read enough: make it now. If it is a question, "
-            "answer it now."
+            f"{st['since_edit']} steps without changing a file. That is fine while the "
+            "current todo item needs research; if it needs a change, make it now."
         )
     if _TASK_TOKEN_WARN and st["tokens"] >= _TASK_TOKEN_WARN:
         lines.append(
@@ -649,6 +754,84 @@ def _daily_quota_reset_seconds(status: int, headers: Dict[str, str], body: Any) 
     return None
 
 
+_USAGE_LEDGER = ""
+_USAGE_LEDGER_KEEP_S = 48 * 3600
+
+
+def _setup_usage_ledger() -> None:
+    """PROXY_USAGE_LEDGER names a JSONL file that gets one line per upstream
+    reply with the usage it reported, so `harness usage` can total a rolling
+    day across proxy restarts (the proxy log is overwritten on every start).
+    Entries older than 48h are dropped here, once per start."""
+    global _USAGE_LEDGER
+    _USAGE_LEDGER = os.environ.get("PROXY_USAGE_LEDGER", "").strip()
+    if not _USAGE_LEDGER or not os.path.exists(_USAGE_LEDGER):
+        return
+    cutoff = datetime.datetime.now(datetime.timezone.utc).timestamp() - _USAGE_LEDGER_KEEP_S
+    try:
+        with open(_USAGE_LEDGER, encoding="utf-8") as f:
+            lines = f.readlines()
+        keep = []
+        for line in lines:
+            try:
+                if float(json.loads(line).get("ts", 0)) >= cutoff:
+                    keep.append(line)
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if len(keep) != len(lines):
+            tmp = _USAGE_LEDGER + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+            os.replace(tmp, _USAGE_LEDGER)
+    except OSError as e:
+        print(f"WARN: usage ledger {_USAGE_LEDGER} not pruned: {e}", flush=True)
+
+
+def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
+                  headers: Any, route: str) -> None:
+    """Log the usage the upstream reported for one reply and append it to the
+    ledger. `usage` is the upstream's own figure, never the proxy's estimate,
+    so the ledger counts what the upstream counts."""
+    try:
+        hdr = {str(k).lower(): v for k, v in dict(headers or {}).items()}
+    except (TypeError, ValueError):
+        hdr = {}
+    left = hdr.get("x-ratelimit-remaining-credits-day")
+    tail = f" credits_day_left={left}" if left is not None else ""
+    if not isinstance(usage, dict) or not usage:
+        print(f"[{req_id}] usage: none reported by upstream{tail}", flush=True)
+        return
+    rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    print(
+        f"[{req_id}] usage: model={model} prompt={usage.get('prompt_tokens')} "
+        f"completion={usage.get('completion_tokens')} reasoning={rt}{tail}",
+        flush=True,
+    )
+    if not _USAGE_LEDGER:
+        return
+    entry = {
+        "ts": round(datetime.datetime.now(datetime.timezone.utc).timestamp(), 3),
+        "model": model,
+        "route": route,
+        "prompt": usage.get("prompt_tokens"),
+        "completion": usage.get("completion_tokens"),
+        "reasoning": rt,
+        "cached": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+        "remaining": {k[len("x-ratelimit-remaining-"):]: v for k, v in hdr.items()
+                      if k.startswith("x-ratelimit-remaining-")},
+    }
+    try:
+        with open(_USAGE_LEDGER, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        # Warn once and stop: a file left root-owned by the container proxy
+        # is not writable by a later host-mode proxy, and a warning on every
+        # request would bury the log.
+        print(f"[{req_id}] WARN: usage ledger write failed, ledger off until restart: {e}",
+              flush=True)
+        globals()["_USAGE_LEDGER"] = ""
+
+
 def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, str]) -> None:
     """One log line per native request with the usage the upstream reported
     (from the JSON body or the stream's usage chunk) and the remaining-quota
@@ -668,18 +851,7 @@ def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, st
         if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
             usage = obj["usage"]
             break
-    hdr = {k.lower(): v for k, v in headers.items()}
-    left = hdr.get("x-ratelimit-remaining-credits-day")
-    tail = f" credits_day_left={left}" if left is not None else ""
-    if usage is None:
-        print(f"[{req_id}] usage: none reported by upstream{tail}", flush=True)
-        return
-    rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-    print(
-        f"[{req_id}] usage: model={model} prompt={usage.get('prompt_tokens')} "
-        f"completion={usage.get('completion_tokens')} reasoning={rt}{tail}",
-        flush=True,
-    )
+    _record_usage(req_id, model, usage, headers, "native")
 
 
 def _warn_deprecation(req_id: str, model: str, headers: Dict[str, str]) -> None:
@@ -696,7 +868,8 @@ def _warn_deprecation(req_id: str, model: str, headers: Dict[str, str]) -> None:
 
 
 def _native_passthrough(
-    req_id: str, inbound_request: Dict[str, Any], model_name: str, want_stream: bool
+    req_id: str, inbound_request: Dict[str, Any], model_name: str, want_stream: bool,
+    session_id: str = "",
 ) -> Response:
     """Forward a native-tools request upstream unchanged and relay the reply.
 
@@ -714,12 +887,16 @@ def _native_passthrough(
         # auto-compacts. opencode asks for usage by default; ask here too so
         # every client gets it.
         payload["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}
+    messages, trimmed = _trim_old_tool_outputs(messages)
+    if trimmed:
+        payload["messages"] = messages
+        print(f"[{req_id}] trimmed {trimmed:,} chars of old tool output", flush=True)
     if payload.get("tools") and _at_step_cap(messages):
         # Make the step cap hard: the upstream honours tool_choice "none".
         payload["tool_choice"] = "none"
     elif _NATIVE_REMINDERS and payload.get("tools") and messages:
         payload["messages"] = messages = _append_to_last_message(
-            messages, _native_reminder(messages, payload.get("tools") or [])
+            messages, _native_reminder(messages, payload.get("tools") or [], session_id)
         )
     print(
         f"[{req_id}] upstream shape: mode=native messages={len(messages)} "
@@ -3875,7 +4052,10 @@ def catch_all(path: str) -> Response:
 
         # Native tool-calling models skip the cooperative pipeline entirely.
         if _is_native_tool_model(model_name):
-            return _native_passthrough(req_id, inbound_request, model_name, want_stream)
+            return _native_passthrough(
+                req_id, inbound_request, model_name, want_stream,
+                request.headers.get("x-opencode-session-id", ""),
+            )
 
         # Require-tool mode shows the model one extra tool, `finish`, and
         # everything prompt-facing is built from the augmented array so the
@@ -3959,6 +4139,9 @@ def catch_all(path: str) -> Response:
             return _client_error(f"upstream returned non-JSON: {e}", 502)
 
         save_debug_file(req_id, "03", "API_Response", target_json)
+        if isinstance(target_json, dict):
+            _record_usage(req_id, upstream_model, target_json.get("usage"),
+                          getattr(resp, "headers", None), "cooperative")
 
         response_text = extract_assistant_content(target_json)
         # Names currently exposed to the model — used to gate the
@@ -4353,6 +4536,7 @@ def main() -> None:
     # After _setup_prompt_mode: an explicit --prompt-mode turns the native route off.
     _setup_native_tools()
     _setup_native_reminders()
+    _setup_usage_ledger()
     _setup_host_os()
     _setup_run_mode()
     _setup_mcp_tool_recency()
@@ -4398,7 +4582,9 @@ def main() -> None:
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   native tools:   {_NATIVE_TOOL_STATUS}\n"
-        f"   native nudges:  {'on' if _NATIVE_REMINDERS else 'off (PROXY_NATIVE_REMINDERS=0)'}; task token warning at {_TASK_TOKEN_WARN:,}\n"
+        f"   native nudges:  {'on' if _NATIVE_REMINDERS else 'off (PROXY_NATIVE_REMINDERS=0)'}; task token warning {f'at {_TASK_TOKEN_WARN:,}' if _TASK_TOKEN_WARN else 'off'}\n"
+        f"   tool output:    {f'newest ~{_TOOL_OUTPUT_KEEP:,} tokens sent whole, older trimmed' if _TOOL_OUTPUT_KEEP else 'sent whole (PROXY_TOOL_OUTPUT_KEEP=0)'}\n"
+        f"   usage ledger:   {_USAGE_LEDGER or 'off (PROXY_USAGE_LEDGER unset)'}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"
         f"   mcp recency:    {len(_MCP_TOOL_RECENCY)} tool(s)\n"

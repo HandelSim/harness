@@ -142,7 +142,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Config / setup | `config` (get/set/list + interactive picker), `model` (pick `DEFAULT_MODEL_NAME` from the live catalog), `uninstall` — see "Config and setup commands" below. |
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
-| Diagnostics | `doctor`, `preflight`, `probe`, `help` |
+| Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help` |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
 | MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
@@ -608,7 +608,7 @@ What it does, in order:
    `--require-tool` flag still matches. A leftover `HARNESS_REQUIRE_TOOL` in
    `.env` does not affect it. A `code=` line (cksum of `proxy/proxy.py`) and a
    `native=` line (`PROXY_NATIVE_TOOL_MODELS`, `PROXY_NATIVE_REMINDERS`,
-   `PROXY_TASK_TOKEN_WARN`, `MODEL_CONTEXT_LENGTH`) are appended
+   `PROXY_TASK_TOKEN_WARN`, `MODEL_CONTEXT_LENGTH`, `PROXY_TOOL_OUTPUT_KEEP`) are appended
    unconditionally, so a host proxy left running across an upgrade or a knob
    change is restarted instead of serving old code. A `promptmode=<mode>` line is appended **only**
    when `harness host --single-message` / `--prompt-mode M` set
@@ -624,7 +624,7 @@ What it does, in order:
    common cause is `_validate_config` `sys.exit(1)`).
 7. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`
-   (`includeUsage`, credit-weight `cost`, `compaction.prune`, agent `steps`
+   (`includeUsage`, `cost` per `HARNESS_COST_UNIT` via `opencode_models_jq`, `compaction.prune`, opt-in agent `steps`
    cap; see [`containers.md`](containers.md)), but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
    **scoped** file (`state/host/opencode.json`). It asserts host `jq` is present
    up front (`host_preflight` guarantees it) so the `harness_jq` docker-sidecar
@@ -1048,6 +1048,17 @@ log is written to the container's stderr and redirected into the host log
 file. A locked key aborts with a pointer to `harness unlock`, and the
 unlock URL is not echoed. `tests/unit_probe_test.sh` drives it against a
 secret-echoing mock.
+
+## `usage`
+
+`cmd_usage [--hours N]` (default 24; the ledger keeps 48) reads the JSONL
+ledger both proxies append to (`host_usage_ledger`,
+`state/output/usage.jsonl`; see [`proxy.md`](proxy.md) "Usage ledger") with
+host Python and prints the upstream-reported prompt, completion, reasoning
+and cached totals, the last hour, the average per reply, a per-model split,
+and the newest `X-RateLimit-Remaining-*` values. It needs no running proxy
+and no docker. `tests/unit_host_test.sh` T16 covers the window and the
+per-model totals.
 
 ## Shared libraries under `scripts/lib/`
 

@@ -100,11 +100,16 @@ After the drop, still in the entrypoint:
   upstream advertises; `DEFAULT_MODEL_NAME` is always included and is the
   default selection (`harness/<DEFAULT_MODEL_NAME>`). Provider options set
   `includeUsage: true` (opencode's default anyway; its token counter, and so
-  auto-compaction, depends on the usage chunk); a catalog entry's `credit_weights` becomes
-  that model's `cost`, so opencode's "$" is millions of credits;
-  `compaction.prune` is on; the `build`, `plan`, `general`, `explore` and
-  `yolo` agents get `steps: $HARNESS_AGENT_MAX_STEPS` (default 100, `0` =
-  no cap), a per-prompt circuit breaker. Built with `jq` and
+  auto-compaction, depends on the usage chunk); each model's `cost` follows
+  `HARNESS_COST_UNIT`: `tokens` (default) prices every token at 1, so
+  opencode's "$" reads millions of tokens, and `credits` uses the catalog's
+  `credit_weights` (models without weights get no cost). `cache_read` and
+  `cache_write` are set to the input price because opencode subtracts
+  cached tokens from input and would otherwise show them free (the same jq
+  program as `opencode_models_jq` in the harness script);
+  `compaction.prune` is on; with `HARNESS_AGENT_MAX_STEPS` set above 0 the
+  `build`, `plan`, `general`, `explore` and `yolo` agents get that
+  `steps` cap (default 0, no cap: hard tasks may run long). Built with `jq` and
   re-written every launch because the model set may have changed. Falls back
   to `DEFAULT_MODEL_NAME` alone if the proxy isn't reachable (or its key is
   locked). The yolo agent's

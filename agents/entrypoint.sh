@@ -140,7 +140,7 @@ ensure_opencode_config() {
     # agent `steps`): on the last step opencode makes the model stop and
     # summarize instead of calling more tools, so one prompt can no longer
     # spend a whole day's token budget exploring. 0 = no cap.
-    local steps="${HARNESS_AGENT_MAX_STEPS:-100}"
+    local steps="${HARNESS_AGENT_MAX_STEPS:-0}"
     [[ "$steps" =~ ^[0-9]+$ ]] || steps=100
 
     # Build the opencode model dropdown from the proxy's /v1/models catalog
@@ -175,17 +175,23 @@ ensure_opencode_config() {
 
     # provider.models map: {"<id>": {"name": "<id>", "limit": {...}}, ...}
     local models_json
-    # The catalog's credit_weights (when it lists them) become opencode's
-    # per-model cost, so its "$" readout is millions of upstream credits.
+    # opencode's "$" readout, in millions: HARNESS_COST_UNIT=tokens (default)
+    # prices every token at 1, so it reads millions of tokens, the unit of a
+    # token allowance; =credits uses the catalog's credit_weights. Cached
+    # prompt tokens are priced like the rest (opencode would count them free).
+    # Same program as opencode_models_jq in the harness script (host mode).
     local weights_json
     weights_json=$(printf '%s' "${catalog:-{}}" | jq -c \
         '[.data[]? | select(.id and (.credit_weights | type) == "object")
           | {key: .id, value: .credit_weights}] | from_entries' 2>/dev/null || true)
     [[ -n "$weights_json" ]] || weights_json='{}'
     models_json=$(printf '%s\n' "${model_ids[@]}" | jq -R . | jq -s \
-        --argjson ctx "$ctx" --argjson w "$weights_json" \
-        'map({key: ., value: ({name: ., limit: {context: $ctx, output: 8192}}
-            + (if $w[.] then {cost: {input: ($w[.].input // 1), output: ($w[.].output // 1)}} else {} end))})
+        --argjson ctx "$ctx" --argjson w "$weights_json" --arg unit "${HARNESS_COST_UNIT:-tokens}" \
+        'def price($i; $o): {input: $i, output: $o, cache_read: $i, cache_write: $i};
+         map({key: ., value: ({name: ., limit: {context: $ctx, output: 8192}}
+             + (if $unit == "credits"
+                then (if $w[.] then {cost: price($w[.].input // 1; $w[.].output // 1)} else {} end)
+                else {cost: price(1; 1)} end))})
          | from_entries')
 
     # Always (re)write the harness-managed block — the model set may have

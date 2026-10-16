@@ -101,18 +101,34 @@ ok "T5: opencode config is valid JSON, loopback baseURL, dummy key, default mode
 
 # --- T5b: usage reporting, step cap and pruning reach opencode's config -----
 # includeUsage (opencode's default, pinned explicitly) keeps opencode's token
-# counter (and so auto-compaction) working on the native tools route; the step cap is the per-prompt circuit
-# breaker against a run that only reads and greps.
+# counter (and so auto-compaction) working on the native tools route. The step
+# cap is opt-in (HARNESS_AGENT_MAX_STEPS): hard tasks may legitimately run long.
 jq -e '.provider.harness.options.includeUsage == true' "$cfg" >/dev/null 2>&1 \
     || fail "T5b: provider options should set includeUsage=true"
-jq -e '.compaction.prune == true and .agent.build.steps == 100 and .agent.yolo.steps == 100
-       and .agent.general.steps == 100 and (.agent.yolo.permission.edit == "allow")' "$cfg" >/dev/null 2>&1 \
-    || fail "T5b: default step cap 100 on build/yolo/general and prune=true expected — $(cat "$cfg")"
-( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; HARNESS_AGENT_MAX_STEPS=0; host_write_opencode_config ) \
-    || fail "T5b: host_write_opencode_config returned non-zero with steps=0"
-jq -e '(.agent | has("build") | not) and (.agent.yolo | has("steps") | not)' "$cfg" >/dev/null 2>&1 \
-    || fail "T5b: HARNESS_AGENT_MAX_STEPS=0 should drop the cap"
-ok "T5b: includeUsage, compaction.prune and the agent step cap (0 = none) are written"
+jq -e '.compaction.prune == true and (.agent | has("build") | not) and (.agent.yolo | has("steps") | not)
+       and (.agent.yolo.permission.edit == "allow")' "$cfg" >/dev/null 2>&1 \
+    || fail "T5b: no step cap by default and prune=true expected — $(cat "$cfg")"
+( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; HARNESS_AGENT_MAX_STEPS=150; host_write_opencode_config ) \
+    || fail "T5b: host_write_opencode_config returned non-zero with steps=150"
+jq -e '.agent.build.steps == 150 and .agent.yolo.steps == 150 and .agent.general.steps == 150' "$cfg" >/dev/null 2>&1 \
+    || fail "T5b: HARNESS_AGENT_MAX_STEPS=150 should cap build/yolo/general"
+ok "T5b: includeUsage, compaction.prune and the opt-in agent step cap are written"
+
+# --- T5c: opencode's cost readout counts tokens, cached ones included -------
+( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; host_write_opencode_config ) \
+    || fail "T5c: host_write_opencode_config returned non-zero"
+jq -e '.provider.harness.models["test-model"].cost
+       == {input: 1, output: 1, cache_read: 1, cache_write: 1}' "$cfg" >/dev/null 2>&1 \
+    || fail "T5c: default HARNESS_COST_UNIT=tokens should price every token at 1 — $(cat "$cfg")"
+( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; HARNESS_COST_UNIT=credits; host_write_opencode_config ) \
+    || fail "T5c: host_write_opencode_config returned non-zero with credits"
+jq -e '.provider.harness.models["test-model"] | has("cost") | not' "$cfg" >/dev/null 2>&1 \
+    || fail "T5c: credits with no catalog weights should leave cost unset"
+w='{"test-model": {"input": 2, "output": 5}}'
+got=$(printf '"test-model"\n' | jq -s --argjson ctx 1000 --argjson w "$w" --arg unit credits "$(opencode_models_jq)")
+jq -e '.["test-model"].cost == {input: 2, output: 5, cache_read: 2, cache_write: 2}' <<<"$got" >/dev/null \
+    || fail "T5c: credits should use the catalog weights, cached input at the input weight — $got"
+ok "T5c: cost readout is tokens by default, catalog credits on request, cached input not free"
 
 # --- T6: host_write_opencode_config refuses when jq is absent (M4 guard) ----
 if ( PATH="/nonexistent-dir"; PROXY_PORT=8123; DEFAULT_MODEL_NAME="m"; host_write_opencode_config ) >/dev/null 2>&1; then
@@ -433,6 +449,26 @@ PYEOF
     kill "$listener_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
     rm -f "$(host_proxy_pidfile)"
+fi
+
+# --- T16: harness usage totals the proxy's ledger -------------------------
+if command -v python3 >/dev/null 2>&1; then
+    mkdir -p "$state_root/output"
+    now=$(date +%s)
+    {
+        printf '{"ts": %s, "model": "a-withtools", "prompt": 1000, "completion": 50, "remaining": {"credits-day": "9"}}\n' "$now"
+        printf '{"ts": %s, "model": "b-assist", "prompt": 200, "completion": 10, "cached": 100}\n' "$now"
+        printf '{"ts": %s, "model": "a-withtools", "prompt": 99999, "completion": 1}\n' "$((now - 30 * 3600))"
+        printf 'garbage\n'
+    } >"$(host_usage_ledger)"
+    out=$(cmd_usage 2>&1) || fail "T16: cmd_usage failed — $out"
+    grep -q "total:       1,260 tokens" <<<"$out" || fail "T16: 24h total should skip the 30h-old row — $out"
+    grep -q "a-withtools: 1 replies, 1,050 tokens" <<<"$out" || fail "T16: per-model line missing — $out"
+    grep -q "credits-day=9" <<<"$out" || fail "T16: remaining header missing — $out"
+    out=$(cmd_usage --hours 48 2>&1) || fail "T16: --hours 48 failed — $out"
+    grep -q "total:       101,260 tokens" <<<"$out" || fail "T16: 48h total wrong — $out"
+    if cmd_usage --hours x >/dev/null 2>&1; then fail "T16: bad --hours accepted"; fi
+    ok "T16: harness usage totals the ledger by window and model"
 fi
 
 echo

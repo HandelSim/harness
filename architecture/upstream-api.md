@@ -190,11 +190,15 @@ integer weights from {1, 2, 5, 10, 25, 50}, per model in the catalog's
 
 **Every request re-bills the whole conversation.** A chat-completions agent
 resends the full history on every step, so one task costs roughly
-`steps x average context`: 300 steps at ~150k tokens is ~45M. That is the
-most likely way one opencode prompt spent a 50M daily allowance on
-2026-10-16 (an explore loop with no step cap and no on-track nudges on the
-native route), not a change in tokenization. See [`proxy.md`](proxy.md) → Native tool models for
-what the proxy does about it.
+`steps x average context`: 300 steps at ~150k tokens is ~45M. On 2026-10-16
+one opencode prompt spent a 50M daily allowance in about 30 minutes; a fast
+native step rate times a large re-sent context accounts for that without any
+loop. The old plain models kept only the last message (above), so if they
+were billed for what reached the model (unverified: the old path discarded
+upstream usage) a step cost a few thousand tokens, not ~150k, which fits
+hours of old-harness use costing a few million. `harness usage` totals what
+the upstream reports per reply. See [`proxy.md`](proxy.md) → Native tool
+models for the per-step trimming and the usage ledger.
 
 **Limits.** Three dimensions, metered together:
 
