@@ -143,6 +143,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
 | Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help` |
+| Vaults | `vault` (list), `vault add`, `vault use`, `vault off`, `vault remove` — see "Vaults" below. |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
 | MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
@@ -368,6 +369,31 @@ nothing here applies: opencode's own system prompt and tool descriptions
 are sent, and the proxy forwards native requests as is (its reminder and
 old-output trim run only on the slim header). Slim has no tuning knobs; its
 values are proxy constants, and comparing settings is done with a probe.
+
+### Vaults
+
+A vault is a git repo of notes and docs the agent works from (the "brain").
+`cmd_vault` keeps a registry at `state/vaults.list` (`name<TAB>url` per
+line) and the active name at `state/vault.active`; there is no `.env`
+setting. `add` registers (the first vault becomes active), `use` switches,
+`off` clears, `remove` unregisters and never deletes the clone.
+
+At launch `vault_prepare` (from `run_agent` after the no-docker fallback,
+and from `cmd_host` before `host_run_opencode`) clones the active vault into
+`state/vaults/<name>` if it is missing, otherwise runs `git pull --ff-only`
+with no credential prompt and a 30s limit; a failed pull or clone warns and
+never blocks the launch. It sets the `harness_vault_dir` global, which
+`vault_opencode_config` turns into overlay keys: `instructions` with the
+vault's `AGENTS.md` (or `CLAUDE.md`), which opencode sends as "Instructions
+from: <path>" so the model knows where the vault is, and
+`permission.external_directory` `"<vault>/*": "allow"` so reading and writing
+there needs no approval. `harness_opencode_overlay` deep-merges that with the
+`--slim` overlay into the one `OPENCODE_CONFIG_CONTENT`. Container mode also
+appends the vault to the extra mounts (same absolute path, deduped against
+the CWD). Committing and pushing vault changes is the agent's job, as in any
+repo. Clones live under `state/`, so `uninstall` deletes them; it first names
+any clone with uncommitted or unpushed work. `tests/unit_vault_test.sh`
+covers the registry, clone, fast-forward, offline fallback and the overlay.
 
 ### Interactive TTY resolution (Windows) — issue #82
 

@@ -35,6 +35,11 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 # shellcheck disable=SC1090
 HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT/install" source "$HARNESS" 2>/dev/null
 [[ "$(type -t cmd_vault)" == "function" ]] || fail "cmd_vault not sourced"
+# Sourced from a test, clone_dir resolves off $0 and platform.sh is skipped;
+# point both at the repo.
+clone_dir="$REPO_ROOT"
+# shellcheck disable=SC1091
+source "$REPO_ROOT/scripts/lib/platform.sh"
 mkdir -p "$state_root"
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
