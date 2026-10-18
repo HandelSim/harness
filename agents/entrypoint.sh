@@ -222,6 +222,7 @@ ensure_opencode_config() {
             else {} end) + {
             "yolo": ({
               "description": "Auto-approve all permissions; harness yolo mode",
+              "mode": "primary",
               "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": "allow", "websearch": "allow"}
             } + (if $steps > 0 then {"steps": $steps} else {} end))
           })

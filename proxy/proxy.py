@@ -479,7 +479,7 @@ _TOOL_OUTPUT_TRIM_MIN = 1_500  # chars: shorter old tool outputs are left alone
 _TOOL_OUTPUT_HEAD = 500        # chars of a trimmed tool output that are kept
 _NATIVE_EDIT_TOOLS = frozenset({"edit", "write", "patch", "multiedit", "apply_patch"})
 _NATIVE_TODO_AFTER = 3        # steps with no todo list before it is demanded
-_NATIVE_TODO_STALE = 25       # steps without a todowrite before the list must be updated
+_NATIVE_TODO_STALE = 12       # steps without a todowrite before the list must be updated
 _NATIVE_NO_EDIT_NUDGE = 30    # steps without a file change before a nudge
 _NATIVE_REPEAT_AT = 3         # identical tool calls in one task before they are named
 # Latest todo list per opencode session (x-opencode-session-id), so the replay
@@ -608,22 +608,26 @@ def _native_task_stats(messages: List[Dict[str, Any]], tools: List[Any]) -> Dict
     }
 
 
-def _native_reminder(messages: List[Dict[str, Any]], tools: List[Any], session_id: str = "") -> str:
+def _native_reminder(
+    messages: List[Dict[str, Any]], tools: List[Any], session_id: str = "", slim: bool = False,
+) -> str:
     """Build the per-request reminder text for a native-tools request.
 
     It keeps the agent tied to its goal rather than capping its length: the
     todo list is replayed every step (from the history, or after a compaction
     from the last list this session wrote), a missing or stale list is called
     out, and so are identical tool calls repeated within the task, the clearest
-    sign of a run that has lost its goal."""
+    sign of a run that has lost its goal. Under `slim` the standing advice on
+    working in few steps is left out: the slim system prompt already carries it."""
     st = _native_task_stats(messages, tools)
-    lines = [
-        f"harness: step {st['steps']} of this task, about {st['tokens']:,} tokens so far. "
-        "Every step re-sends the whole conversation and the user's daily token budget "
-        "is metered, so work in as few steps as you can: narrow searches (grep for a "
-        "specific symbol, read only the line ranges you need), do not re-read what is "
-        "still in this conversation, and make the change as soon as you know it."
-    ]
+    lines = [f"harness: step {st['steps']} of this task, about {st['tokens']:,} tokens so far."]
+    if not slim:
+        lines[0] += (
+            " Every step re-sends the whole conversation and the user's daily token budget "
+            "is metered, so work in as few steps as you can: narrow searches (grep for a "
+            "specific symbol, read only the line ranges you need), do not re-read what is "
+            "still in this conversation, and make the change as soon as you know it."
+        )
     todos = _extract_latest_todos(messages)
     if session_id:
         if todos:
@@ -646,7 +650,7 @@ def _native_reminder(messages: List[Dict[str, Any]], tools: List[Any], session_i
                 "you found. If you are stuck on the current item, say what blocks you."
             )
         else:
-            lines.append("Keep it current with `todowrite` as you finish each item.")
+            lines.append(_todo_focus(todos))
     elif has_todowrite and st["steps"] >= _NATIVE_TODO_AFTER:
         lines.append(
             "You have no todo list. Call `todowrite` now with the concrete steps of the "
@@ -654,7 +658,10 @@ def _native_reminder(messages: List[Dict[str, Any]], tools: List[Any], session_i
             "then work through it."
         )
     elif has_todowrite:
-        lines.append("For a task with more than two steps, start with `todowrite`.")
+        lines.append(
+            "Unless this is a single trivial step, your first call is `todowrite` with every "
+            "step of the request, including how you will verify the change."
+        )
     if st["repeats"]:
         shown = "; ".join(f"{k[:160]} (x{n})" for n, k in st["repeats"][:3])
         lines.append(
@@ -676,6 +683,27 @@ def _native_reminder(messages: List[Dict[str, Any]], tools: List[Any], session_i
     return "<system-reminder>\n" + "\n".join(lines) + "\n</system-reminder>"
 
 
+def _todo_focus(todos: List[Any]) -> str:
+    """The line under a replayed todo list that keeps the agent on its current
+    item: names the item in progress, or says what to do when none is."""
+    items = [t for t in todos if isinstance(t, dict) and str(t.get("content") or "").strip()]
+    status = [str(t.get("status") or "pending").strip().lower() for t in items]
+    current = next((t for t, s in zip(items, status) if s == "in_progress"), None)
+    if current is not None:
+        text = str(current.get("content")).strip().replace("\n", " ")[:_TODOS_MAX_CONTENT]
+        return (
+            f"Current item: {text}. Stay on it until it is done and verified, then mark it "
+            "completed with `todowrite` and start the next. Do not drift into work that is "
+            "not on the list; add it to the list first."
+        )
+    if "pending" in status:
+        return "No item is in progress: mark the next one in_progress with `todowrite` and work on it."
+    return (
+        "Every item is finished. If the request is fully done and verified, report the result; "
+        "if anything is left, add it to the list first."
+    )
+
+
 def _append_to_last_message(messages: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
     """Return a copy of `messages` with `text` appended to the last message's
     content (string content gets a blank-line join, list content a text part).
@@ -691,6 +719,93 @@ def _append_to_last_message(messages: List[Dict[str, Any]], text: str) -> List[D
     else:
         last["content"] = text
     return list(messages[:-1]) + [last]
+
+
+# Slim mode (`harness --slim`): opencode then sends `x-harness-slim: 1` (a
+# provider header the --slim config overlay adds) and the native path swaps the
+# long built-in tool descriptions (about 24k chars for opencode's 12 tools)
+# for these short ones. Parameter schemas are untouched and a tool not listed
+# here (an MCP tool, a newer opencode tool) keeps its own description. Without
+# the header nothing changes.
+_SLIM_HEADER = "x-harness-slim"
+_SLIM_TOOL_DESCRIPTIONS: Dict[str, str] = {
+    "bash": (
+        "Run a shell command (git, build, test, package managers). Pass a short `description` of what "
+        "it does. Use `workdir` instead of `cd <dir> && ...`. Times out after 120000 ms unless `timeout` "
+        "is set. Quote paths with spaces. Use /tmp/opencode for scratch files. For reading, searching or "
+        "editing files use read/grep/glob/edit/write, not cat/grep/find/sed/echo."
+    ),
+    "read": (
+        "Read a file (or list a directory) by absolute `filePath`. Returns up to 2000 lines as "
+        "`<line>: <content>`; use `offset` (1-based) and `limit` for a range. Read the range you need in "
+        "one call rather than many small slices. Also reads images and PDFs."
+    ),
+    "edit": (
+        "Replace an exact string in a file. `read` the file first. `oldString` must match exactly once "
+        "(add surrounding lines to make it unique) unless `replaceAll` is true. Do not include the "
+        "`N: ` line-number prefix from `read` output. Keep the file's indentation."
+    ),
+    "write": (
+        "Create or overwrite a file at absolute `filePath`. An existing file must be `read` first. "
+        "Prefer `edit` for changes to existing files; do not create docs or README files unless asked."
+    ),
+    "glob": "Find files by name pattern (e.g. `**/*.ts`) under `path`; results sorted by modification time.",
+    "grep": (
+        "Regex search of file contents under `path`; `include` filters files (e.g. `*.{ts,tsx}`). "
+        "Returns paths, line numbers and matching lines. For match counts use bash with `rg`."
+    ),
+    "todowrite": (
+        "Write your todo list. Every call REPLACES the whole list, so send every item. Each item is "
+        "{content, status, priority}: status pending|in_progress|completed|cancelled, priority "
+        "high|medium|low. Keep exactly one item in_progress; mark an item completed as soon as it is "
+        "done and verified. The list is replayed to you every step."
+    ),
+    "task": (
+        "Launch a subagent in its own fresh context; only its final report comes back to you, so the "
+        "files and output it reads never fill your context. It starts blind: the `prompt` must state "
+        "the goal, relevant paths, constraints, whether to edit or only research, and exactly what to "
+        "return. `description` is 3-5 words. Several `task` calls in one message run in parallel. Pass "
+        "`task_id` to continue an earlier subagent. Its output is not shown to the user."
+    ),
+    "skill": (
+        "Load a skill's instructions into the conversation. `name` must be one of the skills listed in "
+        "the system prompt; load one when the task matches its description."
+    ),
+    "webfetch": (
+        "Fetch a URL (http is upgraded to https) and return it as markdown (default), text or html. "
+        "Read-only. If the fetch fails or is empty, say so; never invent page content."
+    ),
+    "websearch": (
+        "Search the web. Put the current year in queries about recent things. If you already have the "
+        "URL, use `webfetch`."
+    ),
+    "question": (
+        "Ask the user a question with options. Only for a real ambiguity that changes the result; never "
+        "for something the request already answers."
+    ),
+}
+# opencode appends the subagent list to the `task` description after this line;
+# the slim description keeps that part, since `subagent_type` must match it.
+_TASK_AGENTS_MARK = "Available agent types and the tools they have access to:"
+
+
+def _slim_tools(tools: List[Any]) -> List[Any]:
+    """Return a copy of `tools` with the descriptions of opencode's built-in
+    tools replaced by the short `_SLIM_TOOL_DESCRIPTIONS`. Unknown tools and
+    every parameter schema are passed through unchanged."""
+    out = []
+    for t in tools:
+        func = t.get("function") if isinstance(t, dict) else None
+        name = func.get("name") if isinstance(func, dict) else None
+        short = _SLIM_TOOL_DESCRIPTIONS.get(name) if isinstance(name, str) else None
+        if short is None:
+            out.append(t)
+            continue
+        desc = func.get("description")
+        if name == "task" and isinstance(desc, str) and _TASK_AGENTS_MARK in desc:
+            short += "\n\n" + desc[desc.index(_TASK_AGENTS_MARK):]
+        out.append({**t, "function": {**func, "description": short}})
+    return out
 
 
 _MAX_STEPS_MARK = "CRITICAL - MAXIMUM STEPS REACHED"
@@ -869,7 +984,7 @@ def _warn_deprecation(req_id: str, model: str, headers: Dict[str, str]) -> None:
 
 def _native_passthrough(
     req_id: str, inbound_request: Dict[str, Any], model_name: str, want_stream: bool,
-    session_id: str = "",
+    session_id: str = "", slim: bool = False,
 ) -> Response:
     """Forward a native-tools request upstream unchanged and relay the reply.
 
@@ -878,10 +993,13 @@ def _native_passthrough(
     signature it echoes back) and tool results reach the upstream as sent, and
     the upstream's SSE stream or JSON body comes back as-is. Upstream 4xx keep
     their status (so the AI SDK does not retry a deterministic rejection, and
-    does retry a 429); 5xx become 502 as on the cooperative path."""
+    does retry a 429); 5xx become 502 as on the cooperative path. Under `slim`
+    (see `_SLIM_HEADER`) the built-in tools' descriptions are shortened."""
     payload = dict(inbound_request)
     payload["model"] = model_name
     messages = payload.get("messages") or []
+    if slim and payload.get("tools"):
+        payload["tools"] = _slim_tools(payload["tools"])
     if want_stream:
         # Without a usage chunk opencode counts 0 tokens and never
         # auto-compacts. opencode asks for usage by default; ask here too so
@@ -896,10 +1014,10 @@ def _native_passthrough(
         payload["tool_choice"] = "none"
     elif _NATIVE_REMINDERS and payload.get("tools") and messages:
         payload["messages"] = messages = _append_to_last_message(
-            messages, _native_reminder(messages, payload.get("tools") or [], session_id)
+            messages, _native_reminder(messages, payload.get("tools") or [], session_id, slim)
         )
     print(
-        f"[{req_id}] upstream shape: mode=native messages={len(messages)} "
+        f"[{req_id}] upstream shape: mode=native{'/slim' if slim else ''} messages={len(messages)} "
         f"chars={sum(len(_flatten_content_to_str(m.get('content') or '')) for m in messages if isinstance(m, dict))}",
         flush=True,
     )
@@ -4055,6 +4173,7 @@ def catch_all(path: str) -> Response:
             return _native_passthrough(
                 req_id, inbound_request, model_name, want_stream,
                 request.headers.get("x-opencode-session-id", ""),
+                request.headers.get(_SLIM_HEADER, "") == "1",
             )
 
         # Require-tool mode shows the model one extra tool, `finish`, and

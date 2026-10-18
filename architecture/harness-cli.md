@@ -158,7 +158,7 @@ as a subcommand: known ones dispatch; an unknown word errors (so a typo
 like `harness statt` is caught instead of silently launching an agent).
 `harness opencode` remains as an explicit alias for the bare form.
 
-Agent-launch flags (`--yolo`, `--net`, `--mount`, `-p/--print`) are parsed
+Agent-launch flags (`--yolo`, `--slim`, `--net`, `--mount`, `-p/--print`) are parsed
 inside `run_agent` (opencode) / `cmd_shell` rather than centrally; they decide
 the `docker run` invocation, not compose flags. `run_agent` also still accepts
 the retired `--require-tool` and drops it as a no-op (see "`--require-tool` on
@@ -293,7 +293,7 @@ so compose doesn't see a phantom services block.
 `run_agent` (opencode) / `cmd_shell` do NOT go through compose.
 They each:
 
-1. Parse agent flags (`--yolo`, `--net`, `--mount`, `-p/--print`; the
+1. Parse agent flags (`--yolo`, `--slim`, `--net`, `--mount`, `-p/--print`; the
    retired `--require-tool` is consumed and ignored). In `run_agent`, if no
    container runtime is installed at all, hand off to host mode here — see
    "No-docker fallback" below.
@@ -321,8 +321,8 @@ When `harness_runtime_installed` is false — neither a `docker` nor a `podman`
 binary on `PATH`, i.e. a host-only install — `run_agent` (bare `harness`,
 `harness opencode`, `harness <agent flags>`, `harness chatgpt`) prints
 `harness: docker is not available (no docker or podman installed); defaulting
-to 'harness host'` to stderr and calls `cmd_host` with `--yolo` (if given)
-plus the pass-through args (e.g. `-p PROMPT`). `--net` and `--mount` have no
+to 'harness host'` to stderr and calls `cmd_host` with `--yolo` (if given;
+`--slim` carries over as the `HARNESS_SLIM` global) plus the pass-through args (e.g. `-p PROMPT`). `--net` and `--mount` have no
 host-mode meaning (no firewall; the whole filesystem is visible) and are
 dropped, with a note for `--mount`. Host mode's own confirm gate still applies.
 
@@ -340,6 +340,33 @@ compatibility**. `run_agent`'s flag loop (like `cmd_host`'s and
 opencode aborts on an unknown option, so forwarding it would stop the agent
 starting. Nothing is reconciled against the running proxy any more, and the
 help texts no longer advertise the flag.
+
+### `--slim`
+
+`--slim` (sticky: `HARNESS_SLIM=1` in `.env`; `run_agent` and `cmd_host` set
+the global) makes the launch send less per request. `slim_opencode_config`
+prints a one-line JSON overlay that goes to opencode as
+`OPENCODE_CONFIG_CONTENT` (a `-e` from `agent_common_env` in container mode,
+an export in `host_run_opencode`); opencode deep-merges it over every other
+config layer, so the harness-written config is otherwise unchanged. It:
+
+- sets the `prompt` of the `build`, `plan` and `yolo` agents to
+  `agents/slim-prompt.md` (about 3.6k chars instead of opencode's 15k
+  `gemini.txt`: delegate to `task` subagents to keep context small, todo-list
+  discipline, act don't describe, smallest change, honesty) and of the
+  `general` subagent to `agents/slim-subagent-prompt.md` (it has no `task`
+  or `todowrite`). `explore` keeps opencode's own short prompt. opencode
+  still appends its environment block, AGENTS.md/instructions and the skills
+  list, and the `skill` and `task` tools stay.
+- adds the provider header `x-harness-slim: 1`, on which the proxy shortens
+  the built-in tools' descriptions on the native route
+  ([`proxy.md`](proxy.md)).
+
+The prompt files are read from the clone at launch (no image rebuild). If
+one is missing the launch warns and runs without slim. Without `--slim`
+nothing here applies: opencode's own system prompt and tool descriptions
+are sent (the proxy's native reminder and tool-output trim still run;
+`PROXY_NATIVE_REMINDERS=0` / `PROXY_TOOL_OUTPUT_KEEP=0` turn those off).
 
 ### Interactive TTY resolution (Windows) — issue #82
 

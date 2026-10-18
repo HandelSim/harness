@@ -115,10 +115,12 @@ are the only changes made to the request or the reply:
   It is rebuilt from the history: the step count since the latest user
   message, an estimate of the tokens the task has cost (each step re-sends
   its whole prefix; chars/3), and a line not to re-read what is still in
-  the conversation; the todo list replayed from the last `todowrite` (same
-  `_format_todos_block` as the cooperative replay), or after 3 steps with
-  none, an order to write one, and after 25 steps without a `todowrite` a
-  prompt to update it. After a compaction the history no longer holds the
+  the conversation (left out under slim, whose system prompt carries it);
+  the todo list replayed from the last `todowrite` (same
+  `_format_todos_block` as the cooperative replay) with a line naming the
+  item in progress and telling the model to stay on it (`_todo_focus`), or,
+  with no list, an order to start with one (and a firmer one after 3
+  steps), and after 12 steps without a `todowrite` a prompt to update it. After a compaction the history no longer holds the
   list, so the latest one is also kept per `x-opencode-session-id` header
   (`_SESSION_TODOS`, 64 sessions, in memory) and replayed from there. Calls
   repeated 3+ times with the same name and arguments are named with an
@@ -128,6 +130,17 @@ are the only changes made to the request or the reply:
   research. Nothing caps or stops a long task: hard tasks may run long.
   `PROXY_TASK_TOKEN_WARN` (off by default) adds an order to finish the
   current item and report past that many estimated tokens.
+- **Slim tool descriptions** (`harness --slim`). The `--slim` opencode
+  overlay adds the provider header `x-harness-slim: 1`; on it,
+  `_slim_tools` replaces the descriptions of opencode's built-in tools
+  (`bash`, `read`, `edit`, `write`, `glob`, `grep`, `todowrite`, `task`,
+  `skill`, `webfetch`, `websearch`, `question`; about 24k chars of stock
+  text) with the short ones in `_SLIM_TOOL_DESCRIPTIONS`. Parameter schemas
+  are untouched; `task` keeps opencode's appended subagent list (from
+  `_TASK_AGENTS_MARK`); any other tool (MCP, a newer opencode tool) keeps
+  its own description. Without the header the tools pass through as sent.
+  The slim system prompts themselves are opencode agent prompts, set by the
+  CLI ([`harness-cli.md`](harness-cli.md)).
 - **Hard step cap.** When opencode hits an agent's `steps` cap it ends the
   request with an assistant message starting "CRITICAL - MAXIMUM STEPS
   REACHED" but still sends the tools. `_at_step_cap` spots it and the proxy

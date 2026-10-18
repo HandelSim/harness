@@ -112,10 +112,15 @@ After the drop, still in the entrypoint:
   `steps` cap (default 0, no cap: hard tasks may run long). Built with `jq` and
   re-written every launch because the model set may have changed. Falls back
   to `DEFAULT_MODEL_NAME` alone if the proxy isn't reachable (or its key is
-  locked). The yolo agent's
+  locked). The yolo agent is `mode: "primary"` (opencode's default `all`
+  would also list it as a `task` subagent, letting any agent spawn an
+  auto-approving one); its
   `permission` block grants `edit`, `bash` (all commands), `webfetch`, and
   `websearch` — matching the set of tools the agent ships so yolo mode
   doesn't trip on the new ones.
+- Under `harness --slim` the launch also passes `OPENCODE_CONFIG_CONTENT`
+  (slim agent prompts + the `x-harness-slim` provider header), which opencode
+  merges over this file; see [`harness-cli.md`](harness-cli.md) "`--slim`".
 - `merge_opencode_mcp_servers` translates the canonical `{"mcpServers": {...}}`
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.

@@ -5880,6 +5880,54 @@ class TestNativeToolPassthrough(unittest.TestCase):
             self.assertNotIn("patch parser", proxy._native_reminder(compacted, self.TOOLS, "ses_2"))
             self.assertNotIn("patch parser", proxy._native_reminder(compacted, self.TOOLS))
 
+    def test_reminder_names_current_item(self):
+        todo = {"todos": [{"content": "patch parser", "status": "completed", "priority": "high"},
+                          {"content": "run tests", "status": "in_progress", "priority": "high"}]}
+        msgs = [{"role": "user", "content": "x"},
+                {"role": "assistant", "tool_calls": [{"id": "t", "type": "function", "function": {
+                    "name": "todowrite", "arguments": json.dumps(todo)}}]}]
+        self.assertIn("Current item: run tests.", proxy._native_reminder(msgs, self.TOOLS))
+        todo["todos"][1]["status"] = "pending"
+        msgs[1]["tool_calls"][0]["function"]["arguments"] = json.dumps(todo)
+        self.assertIn("No item is in progress", proxy._native_reminder(msgs, self.TOOLS))
+
+    def test_slim_header_shortens_builtin_tool_descriptions(self):
+        task_desc = ("Launch a new agent... long text\n\n" + proxy._TASK_AGENTS_MARK
+                     + "\n- explore: Fast agent\n- general: General-purpose agent")
+        params = {"type": "object", "properties": {"command": {"type": "string"}}}
+        tools = [
+            {"type": "function", "function": {"name": "bash", "description": "x" * 5000, "parameters": params}},
+            {"type": "function", "function": {"name": "task", "description": task_desc, "parameters": {}}},
+            {"type": "function", "function": {"name": "jira_search", "description": "MCP tool", "parameters": {}}},
+        ]
+        body = {"model": "gemini-x-withtools", "tools": tools,
+                "messages": [{"role": "user", "content": "x"}]}
+        client = proxy.app.test_client()
+        for slim in (True, False):
+            with patch.object(proxy.requests, "post", return_value=self.FakeResp(200, "{}")) as mock_post, \
+                    patch.object(proxy, "save_debug_file"), \
+                    patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)), \
+                    patch.object(proxy, "_NATIVE_REMINDERS", True), \
+                    patch("sys.stdout", io.StringIO()):
+                client.post("/v1/chat/completions", data=json.dumps(body), content_type="application/json",
+                            headers={"x-harness-slim": "1"} if slim else {})
+            sent = mock_post.call_args.kwargs["json"]
+            if not slim:
+                self.assertEqual(sent["tools"], tools)  # stock opencode descriptions
+                self.assertIn("work in as few steps", sent["messages"][-1]["content"])
+                continue
+            bash, task, mcp = (t["function"] for t in sent["tools"])
+            self.assertEqual(bash["description"], proxy._SLIM_TOOL_DESCRIPTIONS["bash"])
+            self.assertEqual(bash["parameters"], params)
+            self.assertTrue(task["description"].startswith(proxy._SLIM_TOOL_DESCRIPTIONS["task"]))
+            self.assertTrue(task["description"].endswith("- general: General-purpose agent"))
+            self.assertNotIn("long text", task["description"])
+            self.assertEqual(mcp["description"], "MCP tool")
+            # the slim system prompt carries the standing advice; the reminder stays dynamic
+            self.assertIn("step 0 of this task", sent["messages"][-1]["content"])
+            self.assertNotIn("work in as few steps", sent["messages"][-1]["content"])
+        self.assertEqual(tools[0]["function"]["description"], "x" * 5000)  # inbound not mutated
+
     def test_old_tool_output_trimmed(self):
         big = "x" * 9000
         msgs = [{"role": "user", "content": "go"}]

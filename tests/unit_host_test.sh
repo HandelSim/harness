@@ -114,6 +114,23 @@ jq -e '.agent.build.steps == 150 and .agent.yolo.steps == 150 and .agent.general
     || fail "T5b: HARNESS_AGENT_MAX_STEPS=150 should cap build/yolo/general"
 ok "T5b: includeUsage, compaction.prune and the opt-in agent step cap are written"
 
+# --- T5d: yolo is a primary agent; --slim builds the opencode overlay ------
+# Without mode "primary" opencode defaults an agent to "all", which lists the
+# auto-approving yolo agent as a `task` subagent any agent could spawn.
+jq -e '.agent.yolo.mode == "primary"' "$cfg" >/dev/null 2>&1 \
+    || fail "T5d: the yolo agent must be mode=primary — $(cat "$cfg")"
+# Sourced from a test, clone_dir resolves off $0; point it at the repo.
+[[ -z "$(clone_dir="$REPO_ROOT" HARNESS_SLIM=0 slim_opencode_config)" ]] || fail "T5d: no overlay without --slim"
+overlay=$(clone_dir="$REPO_ROOT" HARNESS_SLIM=1 slim_opencode_config)
+[[ "$overlay" != *$'\n'* ]] || fail "T5d: overlay must be one line (it travels as a docker -e value)"
+jq -e --rawfile main "$REPO_ROOT/agents/slim-prompt.md" --rawfile sub "$REPO_ROOT/agents/slim-subagent-prompt.md" '
+    .provider.harness.options.headers["x-harness-slim"] == "1"
+    and .agent.build.prompt == ($main | rtrimstr("\n")) and .agent.yolo.prompt == .agent.build.prompt
+    and .agent.plan.prompt == .agent.build.prompt and .agent.general.prompt == ($sub | rtrimstr("\n"))
+    and (.agent | has("explore") | not) and (.provider.harness.options | has("baseURL") | not)' \
+    <<<"$overlay" >/dev/null 2>&1 || fail "T5d: slim overlay has the wrong shape — $overlay"
+ok "T5d: yolo is primary-only; --slim overlay sets the slim prompts and the proxy header"
+
 # --- T5c: opencode's cost readout counts tokens, cached ones included -------
 ( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; host_write_opencode_config ) \
     || fail "T5c: host_write_opencode_config returned non-zero"
