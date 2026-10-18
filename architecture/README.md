@@ -56,7 +56,8 @@ clone. User config and `state/` are gitignored. `harness update` and
     ├── output/                 proxy debug dumps
     ├── agent/home/             shared /home/harness bind-mounted into every agent
     ├── mcp/<name>/             active MCP services (compose + data)
-    └── vaults/<name>/          vault clones (`harness vault`; registry in vaults.list)
+    ├── vaults/<name>/          vault clones (`harness vault`; registry in vaults.list)
+    └── serve/                  `harness serve` opencode web password + logs
 ```
 
 ## Per-module architecture docs

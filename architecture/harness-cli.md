@@ -144,6 +144,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
 | Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help` |
 | Vaults | `vault` (list), `vault add`, `vault use`, `vault off`, `vault remove` — see "Vaults" below. |
+| Pub page | `serve` — the vault's pub pages plus opencode web, loopback only. See "`serve`" below. |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
 | MCP (long-running services) | `mcp list`, `mcp install`, `mcp uninstall`, `mcp enable`, `mcp disable`, `mcp up`, `mcp down`, `mcp logs`, `mcp status` |
@@ -787,6 +788,49 @@ A command-less `exec` redirects the *current* shell permanently, so the
 harness for the rest of the run: an interactive `harness host` printed nothing
 after the confirm gate (no launch banner, no `err()`, none of opencode's own
 stderr), which reads as a hang. Never re-add an fd cleanup there.
+
+## `serve`
+
+`cmd_serve` is single-user and loopback-only. It runs the same preamble as
+`cmd_host` (python, config, confirm gate, toolchain, preflight, upstream
+gate, `host_proxy_start`, `host_write_opencode_config`, `vault_prepare`) and
+then starts two foreground children:
+
+- `serve/pub.py` (stdlib) on `127.0.0.1:N` (default 8780). `/` is an index
+  of the active vault's `pub/**/*.html` (title from `<title>`, newest first,
+  dot paths skipped) plus a Services list; `/pub/<rel>` serves the file,
+  realpath-confined to `pub/`. With no vault active the index still comes up
+  with no pages.
+- `opencode serve` on `127.0.0.1:N+1`, with `host_opencode_env` (shared with
+  `host_run_opencode`, so the config, overlay and NO_PROXY match `harness
+  host`), cwd the vault (else `$HOME`), and `OPENCODE_SERVER_PASSWORD` from
+  `state/serve/opencode-password` (random, made once by
+  `serve_password_file`, mode 600). The index links to it as
+  `?auth_token=base64(opencode:<pw>)`, which opencode accepts in place of
+  Basic auth.
+
+Because the index carries that login link, `pub.py` has two guards. The
+`Host` header must be `127.0.0.1|localhost|[::1]:N` or a `--allow-host`
+value (421 otherwise), against DNS rebinding. Every `/pub/` response carries
+`Content-Security-Policy: sandbox allow-scripts allow-popups` (no
+`allow-same-origin`), so a vault page, often agent-written, runs with an
+opaque origin and cannot read the index or call opencode, whose CORS always
+admits `http://localhost:*` and `http://127.0.0.1:*`. Do not add a gateway
+that injects opencode's credentials: anything that can reach it would then
+be logged in.
+
+Remote access is out of scope for serve itself: `ssh -L` both ports, or a
+reverse proxy the deployer runs, with its own auth, that sets
+`Authorization: Basic …` upstream to opencode and passes `--allow-host` for
+the pub vhost. Through a reverse proxy the index's opencode link still
+points at `<host>:N+1`, so give opencode its own vhost. opencode web runs as
+the invoking user with a shell, like `harness host`; serve is not
+multi-user. Ctrl-C stops both children (the EXIT trap also reaps the jq
+sidecar, since it replaces main's) and leaves the proxy up; `wait -n` exits
+1 if either child dies. Logs: `state/serve/{pub,opencode}.log`.
+`tests/unit_serve_test.sh` runs `serve/test_pub.py` (index, Host check,
+sandbox header, path escape, no-vault mode), plus option errors and the
+password file.
 
 ## ChatGPT backend (`harness chatgpt`)
 
