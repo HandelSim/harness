@@ -322,7 +322,7 @@ binary on `PATH`, i.e. a host-only install — `run_agent` (bare `harness`,
 `harness opencode`, `harness <agent flags>`, `harness chatgpt`) prints
 `harness: docker is not available (no docker or podman installed); defaulting
 to 'harness host'` to stderr and calls `cmd_host` with `--yolo` (if given;
-`--slim` carries over as the `HARNESS_SLIM` global) plus the pass-through args (e.g. `-p PROMPT`). `--net` and `--mount` have no
+`--slim` carries over as the `harness_slim` global) plus the pass-through args (e.g. `-p PROMPT`). `--net` and `--mount` have no
 host-mode meaning (no firewall; the whole filesystem is visible) and are
 dropped, with a note for `--mount`. Host mode's own confirm gate still applies.
 
@@ -343,8 +343,8 @@ help texts no longer advertise the flag.
 
 ### `--slim`
 
-`--slim` (sticky: `HARNESS_SLIM=1` in `.env`; `run_agent` and `cmd_host` set
-the global) makes the launch send less per request. `slim_opencode_config`
+`--slim` (`run_agent` and `cmd_host` set the `harness_slim` shell global; it
+is a flag only, not an `.env` setting) makes the launch send less per request. `slim_opencode_config`
 prints a one-line JSON overlay that goes to opencode as
 `OPENCODE_CONFIG_CONTENT` (a `-e` from `agent_common_env` in container mode,
 an export in `host_run_opencode`); opencode deep-merges it over every other
@@ -365,8 +365,9 @@ config layer, so the harness-written config is otherwise unchanged. It:
 The prompt files are read from the clone at launch (no image rebuild). If
 one is missing the launch warns and runs without slim. Without `--slim`
 nothing here applies: opencode's own system prompt and tool descriptions
-are sent (the proxy's native reminder and tool-output trim still run;
-`PROXY_NATIVE_REMINDERS=0` / `PROXY_TOOL_OUTPUT_KEEP=0` turn those off).
+are sent, and the proxy forwards native requests as is (its reminder and
+old-output trim run only on the slim header). Slim has no tuning knobs; its
+values are proxy constants, and comparing settings is done with a probe.
 
 ### Interactive TTY resolution (Windows) — issue #82
 
@@ -634,8 +635,7 @@ What it does, in order:
    line) is restarted once instead of reused, while one started with the old
    `--require-tool` flag still matches. A leftover `HARNESS_REQUIRE_TOOL` in
    `.env` does not affect it. A `code=` line (cksum of `proxy/proxy.py`) and a
-   `native=` line (`PROXY_NATIVE_TOOL_MODELS`, `PROXY_NATIVE_REMINDERS`,
-   `PROXY_TASK_TOKEN_WARN`, `MODEL_CONTEXT_LENGTH`, `PROXY_TOOL_OUTPUT_KEEP`) are appended
+   `native=` line (`PROXY_NATIVE_TOOL_MODELS`, `MODEL_CONTEXT_LENGTH`) are appended
    unconditionally, so a host proxy left running across an upgrade or a knob
    change is restarted instead of serving old code. A `promptmode=<mode>` line is appended **only**
    when `harness host --single-message` / `--prompt-mode M` set
@@ -651,7 +651,7 @@ What it does, in order:
    common cause is `_validate_config` `sys.exit(1)`).
 7. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`
-   (`includeUsage`, `cost` per `HARNESS_COST_UNIT` via `opencode_models_jq`, `compaction.prune`, opt-in agent `steps`
+   (`includeUsage`, token `cost` via `opencode_models_jq`, `compaction.prune`, no agent `steps`
    cap; see [`containers.md`](containers.md)), but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
    **scoped** file (`state/host/opencode.json`). It asserts host `jq` is present
    up front (`host_preflight` guarantees it) so the `harness_jq` docker-sidecar

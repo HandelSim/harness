@@ -2599,7 +2599,6 @@ agent flags:
                         leans on subagents and the todo list, and short tool
                         descriptions (native -withtools models). Without it
                         opencode's own prompt and tool descriptions are sent.
-                        Sticky default: HARNESS_SLIM=1 in .env.
   --net                 disable the per-container firewall for THIS launch
                         only (full outbound network). Audit-logged on stderr.
   --mount PATH          bind-mount an additional host folder into the agent
@@ -4196,14 +4195,13 @@ host_proxy_logfile()   { printf '%s/host/proxy.log' "$state_root"; }
 # Both proxies write the same file: compose mounts state/output at /output.
 host_usage_ledger()    { printf '%s/output/usage.jsonl' "$state_root"; }
 # The same jq program agents/entrypoint.sh runs inline (keep both in step):
-# model ids -> opencode provider.models, with cost per HARNESS_COST_UNIT.
+# model ids -> opencode provider.models. Every token costs 1, so opencode's
+# "$" readout is millions of tokens, the unit of a token allowance (cached
+# prompt tokens included; opencode would count them free).
 opencode_models_jq() {
     cat <<'JQ'
-def price($i; $o): {input: $i, output: $o, cache_read: $i, cache_write: $i};
-map({key: ., value: ({name: ., limit: {context: $ctx, output: 8192}}
-    + (if $unit == "credits"
-       then (if $w[.] then {cost: price($w[.].input // 1; $w[.].output // 1)} else {} end)
-       else {cost: price(1; 1)} end))})
+map({key: ., value: {name: ., limit: {context: $ctx, output: 8192},
+    cost: {input: 1, output: 1, cache_read: 1, cache_write: 1}}})
 | from_entries
 JQ
 }
@@ -4276,11 +4274,9 @@ host_proxy_fingerprint() {
     # The proxy's own code and the native-route knobs: a host proxy left
     # running across a `git pull`/upgrade would otherwise keep serving the old
     # proxy.py until something else forced a restart.
-    data+=$(printf '\ncode=%s\nnative=%s|%s|%s|%s|%s\n' \
+    data+=$(printf '\ncode=%s\nnative=%s|%s\n' \
         "$(cksum <"$clone_dir/proxy/proxy.py" 2>/dev/null)" \
-        "${PROXY_NATIVE_TOOL_MODELS:-}" "${PROXY_NATIVE_REMINDERS:-}" \
-        "${PROXY_TASK_TOKEN_WARN:-}" "${MODEL_CONTEXT_LENGTH:-}" \
-        "${PROXY_TOOL_OUTPUT_KEEP:-}")
+        "${PROXY_NATIVE_TOOL_MODELS:-}" "${MODEL_CONTEXT_LENGTH:-}")
     # Only an explicit --prompt-mode/--single-message is hashed, so a default
     # launch keeps the fingerprint it always had and is not restarted; switching
     # modes in either direction restarts the proxy.
@@ -5126,12 +5122,6 @@ host_write_opencode_config() {
     proxy_url="http://127.0.0.1:${port}/v1"
     default_model=$(_effective_default_model)
     ctx="${MODEL_CONTEXT_LENGTH:-200000}"
-    # Hard per-turn step cap for the agent and its subagents (opencode's
-    # agent `steps`): on the last step opencode makes the model stop and
-    # summarize instead of calling more tools, so one prompt can no longer
-    # spend a whole day's token budget exploring. 0 = no cap.
-    local steps="${HARNESS_AGENT_MAX_STEPS:-0}"
-    [[ "$steps" =~ ^[0-9]+$ ]] || steps=100
 
     local model_ids=() catalog
     if command -v curl >/dev/null 2>&1; then
@@ -5167,18 +5157,8 @@ host_write_opencode_config() {
     fi
 
     local models_json
-    # opencode's "$" readout, in millions: HARNESS_COST_UNIT=tokens (default)
-    # prices every token at 1, so it reads millions of tokens, the unit of a
-    # token allowance; =credits uses the catalog's credit_weights. Cached
-    # prompt tokens are priced like the rest (opencode would count them free).
-    local weights_json
-    weights_json=$(printf '%s' "${catalog:-{}}" | harness_jq -c \
-        '[.data[]? | select(.id and (.credit_weights | type) == "object")
-          | {key: .id, value: .credit_weights}] | from_entries' 2>/dev/null || true)
-    [[ -n "$weights_json" ]] || weights_json='{}'
     models_json=$(printf '%s\n' "${model_ids[@]}" | harness_jq -R . | harness_jq -s \
-        --argjson ctx "$ctx" --argjson w "$weights_json" --arg unit "${HARNESS_COST_UNIT:-tokens}" \
-        "$(opencode_models_jq)")
+        --argjson ctx "$ctx" "$(opencode_models_jq)")
 
     # apiKey is a deliberate dummy: the real upstream key lives in the proxy's
     # Authorization header, never in opencode's config. opencode requires the
@@ -5189,7 +5169,6 @@ host_write_opencode_config() {
         --arg proxy_url "$proxy_url" \
         --arg selected "harness/${selected}" \
         --argjson models "$models_json" \
-        --argjson steps "$steps" \
         --arg web "$web_perm" \
         --arg share "$share" \
         '{
@@ -5205,20 +5184,17 @@ host_write_opencode_config() {
           "model": $selected,
           "small_model": $selected,
           "compaction": {"prune": true},
-          "agent": ((if $steps > 0 then
-              {"build": {"steps": $steps}, "plan": {"steps": $steps},
-               "general": {"steps": $steps}, "explore": {"steps": $steps}}
-            else {} end) + {
-            "yolo": ({
+          "agent": {
+            "yolo": {
               "description": "Auto-approve all permissions; harness yolo mode",
               "mode": "primary",
               "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": $web, "websearch": $web}
-            } + (if $steps > 0 then {"steps": $steps} else {} end))
-          })
+            }
+          }
         } + (if $share == "" then {} else {share: $share} end)' > "$config_file"
 }
 
-# `--slim` (or HARNESS_SLIM=1): the opencode config overlay, as one line of
+# `--slim`: the opencode config overlay, as one line of
 # JSON for OPENCODE_CONFIG_CONTENT, which opencode deep-merges over every other
 # config layer. It replaces the system prompt of the build, plan and yolo
 # agents with agents/slim-prompt.md and of the general subagent with
@@ -5227,7 +5203,7 @@ host_write_opencode_config() {
 # the built-in tools' long descriptions for short ones. Prints nothing when
 # slim is off or a prompt file is missing (that launch is then a normal one).
 slim_opencode_config() {
-    [[ "${HARNESS_SLIM:-0}" == "1" ]] || return 0
+    [[ "${harness_slim:-0}" == "1" ]] || return 0
     local main_prompt="$clone_dir/agents/slim-prompt.md"
     local sub_prompt="$clone_dir/agents/slim-subagent-prompt.md"
     if [[ ! -f "$main_prompt" || ! -f "$sub_prompt" ]]; then
@@ -5445,7 +5421,7 @@ EOF
         fi
         case "$arg" in
             --yolo)      yolo=1 ;;
-            --slim)      HARNESS_SLIM=1 ;;
+            --slim)      harness_slim=1 ;;
             --single-message) prompt_mode_override="single" ;;
             --prompt-mode)    want_mode=1 ;;
             --prompt-mode=*)  prompt_mode_override="${arg#--prompt-mode=}" ;;
@@ -5636,7 +5612,7 @@ run_agent() {
             --slim)
                 # Read by agent_common_env (and by cmd_host on the no-docker
                 # fallback below), which turn it into the opencode overlay.
-                HARNESS_SLIM=1
+                harness_slim=1
                 ;;
             --net)
                 # Per-invocation firewall opt-out. Loud audit log on stderr
@@ -5834,10 +5810,6 @@ agent_common_env() {
     # Declared context window for opencode's model config. The same knob caps
     # the proxy's local token estimate.
     printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-200000}"
-    # Per-prompt step cap written into opencode's agents (0 = none).
-    printf -- '-e\nHARNESS_AGENT_MAX_STEPS=%s\n' "${HARNESS_AGENT_MAX_STEPS:-0}"
-    # Unit of opencode's cost readout: tokens (1 per token) or credits.
-    printf -- '-e\nHARNESS_COST_UNIT=%s\n' "${HARNESS_COST_UNIT:-tokens}"
     # --slim: the opencode overlay (slim prompts + header), one line of JSON.
     local slim_config
     slim_config=$(slim_opencode_config)

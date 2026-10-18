@@ -84,9 +84,6 @@ services:
       # proxy's default (*-withtools); "off" sends every model through the
       # cooperative path. See architecture/proxy.md "Native tool models".
       PROXY_NATIVE_TOOL_MODELS: ${PROXY_NATIVE_TOOL_MODELS:-}
-      PROXY_NATIVE_REMINDERS: ${PROXY_NATIVE_REMINDERS:-}
-      PROXY_TASK_TOKEN_WARN: ${PROXY_TASK_TOKEN_WARN:-}
-      PROXY_TOOL_OUTPUT_KEEP: ${PROXY_TOOL_OUTPUT_KEEP:-}
       # Per-reply upstream usage, read by `harness usage` (host side:
       # state/output/usage.jsonl via the /output mount below).
       PROXY_USAGE_LEDGER: /output/usage.jsonl

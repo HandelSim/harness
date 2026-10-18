@@ -98,8 +98,8 @@ are the only changes made to the request or the reply:
   failure warns once and turns the ledger off until restart. `harness usage`
   reads it ([`harness-cli.md`](harness-cli.md)). Cooperative retries and
   require-tool re-asks are not recorded, so that route reads slightly low.
-- **Old tool output trimmed** (`PROXY_TOOL_OUTPUT_KEEP`, default 40,000
-  tokens; `0` off). Every native step re-bills the whole history, and most
+- **Old tool output trimmed** (slim only: `x-harness-slim: 1`;
+  `_TOOL_OUTPUT_KEEP` = 40,000 tokens). Every native step re-bills the whole history, and most
   of it is tool output. `_trim_old_tool_outputs` walks the history newest
   first and keeps tool results whole until about `KEEP × 3` chars are
   counted; older results over 1,500 chars are cut to their first 500 plus a
@@ -108,15 +108,13 @@ are the only changes made to the request or the reply:
   history is untouched; the trim is opencode's `compaction.prune` applied
   on every step instead of only after a prompt finishes, and the usage the
   upstream then reports (and opencode compacts on) is the trimmed size.
-- **Native reminder** (`PROXY_NATIVE_REMINDERS`, default on; `0` turns it
-  off). When the request carries tools, `_native_reminder` appends one
+- **Native reminder** (slim only). When a slim request carries tools, `_native_reminder` appends one
   `<system-reminder>` to the LAST message (a copy: the inbound list is not
   mutated, and opencode's history never holds it, so it cannot pile up).
   It is rebuilt from the history: the step count since the latest user
   message, an estimate of the tokens the task has cost (each step re-sends
-  its whole prefix; chars/3), and a line not to re-read what is still in
-  the conversation (left out under slim, whose system prompt carries it);
-  the todo list replayed from the last `todowrite` (same
+  its whole prefix; chars/3; the standing advice on working in few steps
+  is in the slim system prompt, not here); the todo list replayed from the last `todowrite` (same
   `_format_todos_block` as the cooperative replay) with a line naming the
   item in progress and telling the model to stay on it (`_todo_focus`), or,
   with no list, an order to start with one (and a firmer one after 3
@@ -128,8 +126,9 @@ are the only changes made to the request or the reply:
   call (`edit`, `write`, `patch`, `multiedit`, `apply_patch`) a soft line
   says to start changing files unless the current item needs more
   research. Nothing caps or stops a long task: hard tasks may run long.
-  `PROXY_TASK_TOKEN_WARN` (off by default) adds an order to finish the
-  current item and report past that many estimated tokens.
+  The thresholds are module constants (`_NATIVE_TODO_*`,
+  `_NATIVE_NO_EDIT_NUDGE`, `_NATIVE_REPEAT_AT`), not env knobs: tuning them
+  is a probe's job, not the user's.
 - **Slim tool descriptions** (`harness --slim`). The `--slim` opencode
   overlay adds the provider header `x-harness-slim: 1`; on it,
   `_slim_tools` replaces the descriptions of opencode's built-in tools
@@ -140,12 +139,15 @@ are the only changes made to the request or the reply:
   `_TASK_AGENTS_MARK`); any other tool (MCP, a newer opencode tool) keeps
   its own description. Without the header the tools pass through as sent.
   The slim system prompts themselves are opencode agent prompts, set by the
-  CLI ([`harness-cli.md`](harness-cli.md)).
+  CLI ([`harness-cli.md`](harness-cli.md)). Without the header the native
+  route sends opencode's request as is (no trim, no reminder): stock
+  opencode.
 - **Hard step cap.** When opencode hits an agent's `steps` cap it ends the
   request with an assistant message starting "CRITICAL - MAXIMUM STEPS
   REACHED" but still sends the tools. `_at_step_cap` spots it and the proxy
   sets `tool_choice: "none"` (and skips the reminder), so that step has to
-  answer in text.
+  answer in text. harness sets no `steps` cap itself; this only matters
+  when the user's own opencode config sets one.
 - **Errors.** 4xx keep their status and upstream message; 5xx become 502.
   `Retry-After`, `Retry-After-Ms`, `X-RateLimit-*`, `x-request-id`,
   `Deprecation`, `Sunset` and `Link` are relayed (opencode's retry honours

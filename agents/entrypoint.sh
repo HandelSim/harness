@@ -136,12 +136,6 @@ ensure_opencode_config() {
     # One knob — MODEL_CONTEXT_LENGTH — drives both the proxy's token-estimate
     # cap and opencode's declared context window.
     local ctx="${MODEL_CONTEXT_LENGTH:-200000}"
-    # Hard per-turn step cap for the agent and its subagents (opencode's
-    # agent `steps`): on the last step opencode makes the model stop and
-    # summarize instead of calling more tools, so one prompt can no longer
-    # spend a whole day's token budget exploring. 0 = no cap.
-    local steps="${HARNESS_AGENT_MAX_STEPS:-0}"
-    [[ "$steps" =~ ^[0-9]+$ ]] || steps=100
 
     # Build the opencode model dropdown from the proxy's /v1/models catalog
     # (a verbatim pass-through of the upstream's OpenAI-format model list), so
@@ -175,23 +169,14 @@ ensure_opencode_config() {
 
     # provider.models map: {"<id>": {"name": "<id>", "limit": {...}}, ...}
     local models_json
-    # opencode's "$" readout, in millions: HARNESS_COST_UNIT=tokens (default)
-    # prices every token at 1, so it reads millions of tokens, the unit of a
-    # token allowance; =credits uses the catalog's credit_weights. Cached
-    # prompt tokens are priced like the rest (opencode would count them free).
-    # Same program as opencode_models_jq in the harness script (host mode).
-    local weights_json
-    weights_json=$(printf '%s' "${catalog:-{}}" | jq -c \
-        '[.data[]? | select(.id and (.credit_weights | type) == "object")
-          | {key: .id, value: .credit_weights}] | from_entries' 2>/dev/null || true)
-    [[ -n "$weights_json" ]] || weights_json='{}'
+    # Every token costs 1, so opencode's "$" readout is millions of tokens,
+    # the unit of a token allowance (cached prompt tokens included; opencode
+    # would count them free). Same program as opencode_models_jq in the
+    # harness script (host mode).
     models_json=$(printf '%s\n' "${model_ids[@]}" | jq -R . | jq -s \
-        --argjson ctx "$ctx" --argjson w "$weights_json" --arg unit "${HARNESS_COST_UNIT:-tokens}" \
-        'def price($i; $o): {input: $i, output: $o, cache_read: $i, cache_write: $i};
-         map({key: ., value: ({name: ., limit: {context: $ctx, output: 8192}}
-             + (if $unit == "credits"
-                then (if $w[.] then {cost: price($w[.].input // 1; $w[.].output // 1)} else {} end)
-                else {cost: price(1; 1)} end))})
+        --argjson ctx "$ctx" \
+        'map({key: ., value: {name: ., limit: {context: $ctx, output: 8192},
+             cost: {input: 1, output: 1, cache_read: 1, cache_write: 1}}})
          | from_entries')
 
     # Always (re)write the harness-managed block — the model set may have
@@ -202,7 +187,6 @@ ensure_opencode_config() {
         --arg proxy_url "$proxy_url" \
         --arg selected "harness/${selected}" \
         --argjson models "$models_json" \
-        --argjson steps "$steps" \
         '{
           "$schema": "https://opencode.ai/config.json",
           "provider": {
@@ -216,16 +200,13 @@ ensure_opencode_config() {
           "model": $selected,
           "small_model": $selected,
           "compaction": {"prune": true},
-          "agent": ((if $steps > 0 then
-              {"build": {"steps": $steps}, "plan": {"steps": $steps},
-               "general": {"steps": $steps}, "explore": {"steps": $steps}}
-            else {} end) + {
-            "yolo": ({
+          "agent": {
+            "yolo": {
               "description": "Auto-approve all permissions; harness yolo mode",
               "mode": "primary",
               "permission": {"edit": "allow", "bash": {"*": "allow"}, "webfetch": "allow", "websearch": "allow"}
-            } + (if $steps > 0 then {"steps": $steps} else {} end))
-          })
+            }
+          }
         }' > "$config_file"
 }
 

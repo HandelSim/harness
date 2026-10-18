@@ -5739,16 +5739,16 @@ class TestNativeToolPassthrough(unittest.TestCase):
         def close(self):
             self.closed = True
 
-    def _post(self, body, fake, reminders=False):
+    def _post(self, body, fake, slim=False):
         client = proxy.app.test_client()
         self.log = io.StringIO()
         with patch.object(proxy.requests, "post", return_value=fake) as mock_post, \
                 patch.object(proxy, "save_debug_file"), \
                 patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)), \
-                patch.object(proxy, "_NATIVE_REMINDERS", reminders), \
                 patch("sys.stdout", self.log):
             resp = client.post("/v1/chat/completions", data=json.dumps(body),
-                               content_type="application/json")
+                               content_type="application/json",
+                               headers={"x-harness-slim": "1"} if slim else {})
             data = resp.get_data()
         return resp, data, mock_post
 
@@ -5819,7 +5819,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
         body = {"model": "gemini-x-withtools", "messages": msgs, "tools": tools}
         upstream = {"choices": [{"message": {"content": "ok"}}]}
         _, _, mock_post = self._post(body, self.FakeResp(200, json.dumps(upstream)),
-                                     reminders=True)
+                                     slim=True)
         sent = mock_post.call_args.kwargs["json"]["messages"]
         self.assertEqual(sent[:-1], msgs[:-1])
         last = sent[-1]["content"]
@@ -5843,14 +5843,14 @@ class TestNativeToolPassthrough(unittest.TestCase):
         ]
         body = {"model": "gemini-x-withtools", "messages": msgs, "tools": self.TOOLS}
         _, _, mock_post = self._post(
-            body, self.FakeResp(200, json.dumps({"choices": []})), reminders=True)
+            body, self.FakeResp(200, json.dumps({"choices": []})), slim=True)
         last = mock_post.call_args.kwargs["json"]["messages"][-1]["content"]
         self.assertEqual(last[0], {"type": "text", "text": "and the tests?"})
         text = last[1]["text"]
         self.assertIn("step 0 of this task", text)  # counted from the latest user message
         self.assertIn("[~] patch parser", text)
 
-    def test_reminder_names_repeats_and_budget(self):
+    def test_reminder_names_repeats(self):
         msgs = [{"role": "user", "content": "x"}] + [
             {"role": "assistant", "tool_calls": [{"id": str(i), "type": "function", "function": {
                 "name": "read", "arguments": json.dumps({"filePath": "a.py" if i % 3 else "b.py"})}}]}
@@ -5859,10 +5859,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
         self.assertIn('read {"filePath": "a.py"} (x30); read {"filePath": "b.py"} (x15)', text)
         self.assertIn("45 steps without changing a file", text)
         self.assertNotIn("STOP", text)  # no hard stop: long tasks may keep going
-        self.assertNotIn("passed its token budget", text)  # off by default
         self.assertNotIn("todowrite", text)  # no todowrite tool offered: no todo demand
-        with patch.object(proxy, "_TASK_TOKEN_WARN", 10):
-            self.assertIn("passed its token budget", proxy._native_reminder(msgs, self.TOOLS))
 
     def test_reminder_stale_todos_and_session_memory(self):
         todo = {"todos": [{"content": "patch parser", "status": "in_progress"}]}
@@ -5907,14 +5904,12 @@ class TestNativeToolPassthrough(unittest.TestCase):
             with patch.object(proxy.requests, "post", return_value=self.FakeResp(200, "{}")) as mock_post, \
                     patch.object(proxy, "save_debug_file"), \
                     patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)), \
-                    patch.object(proxy, "_NATIVE_REMINDERS", True), \
                     patch("sys.stdout", io.StringIO()):
                 client.post("/v1/chat/completions", data=json.dumps(body), content_type="application/json",
                             headers={"x-harness-slim": "1"} if slim else {})
             sent = mock_post.call_args.kwargs["json"]
             if not slim:
-                self.assertEqual(sent["tools"], tools)  # stock opencode descriptions
-                self.assertIn("work in as few steps", sent["messages"][-1]["content"])
+                self.assertEqual(sent, body)  # stock opencode: no reminder, stock descriptions
                 continue
             bash, task, mcp = (t["function"] for t in sent["tools"])
             self.assertEqual(bash["description"], proxy._SLIM_TOOL_DESCRIPTIONS["bash"])
@@ -5923,9 +5918,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
             self.assertTrue(task["description"].endswith("- general: General-purpose agent"))
             self.assertNotIn("long text", task["description"])
             self.assertEqual(mcp["description"], "MCP tool")
-            # the slim system prompt carries the standing advice; the reminder stays dynamic
             self.assertIn("step 0 of this task", sent["messages"][-1]["content"])
-            self.assertNotIn("work in as few steps", sent["messages"][-1]["content"])
         self.assertEqual(tools[0]["function"]["description"], "x" * 5000)  # inbound not mutated
 
     def test_old_tool_output_trimmed(self):
@@ -5951,8 +5944,6 @@ class TestNativeToolPassthrough(unittest.TestCase):
             out, dropped = proxy._trim_old_tool_outputs(msgs)
         self.assertEqual([m["content"] == big for m in out if m.get("role") == "tool"],
                          [False, False, False, False, True, True])
-        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 0):
-            self.assertEqual(proxy._trim_old_tool_outputs(msgs), (msgs, 0))
 
     def test_trim_applies_to_forwarded_request(self):
         msgs = [{"role": "user", "content": "go"},
@@ -5965,9 +5956,11 @@ class TestNativeToolPassthrough(unittest.TestCase):
         body = {"model": "gemini-x-withtools", "messages": msgs, "tools": self.TOOLS}
         with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 1000):
             _, _, mock_post = self._post(body, self.FakeResp(200, "{}"))
+            self.assertEqual(mock_post.call_args.kwargs["json"], body)  # not slim: untouched
+            _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), slim=True)
         sent = mock_post.call_args.kwargs["json"]["messages"]
         self.assertIn("were dropped", sent[2]["content"])
-        self.assertEqual(sent[4]["content"], "r" * 9000)
+        self.assertTrue(sent[4]["content"].startswith("r" * 9000 + "\n\n<system-reminder>"))
         self.assertIn("trimmed 8,500 chars", self.log.getvalue())
 
     def test_usage_ledger_appends_upstream_usage_and_prunes(self):
@@ -5999,23 +5992,20 @@ class TestNativeToolPassthrough(unittest.TestCase):
         self.assertEqual((rows[0]["model"], rows[0]["route"]), ("gemini-x-withtools", "native"))
         self.assertEqual(rows[1]["prompt"], 50)
 
-    def test_no_reminder_without_tools_or_when_off(self):
+    def test_no_reminder_without_tools_or_slim(self):
         body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
-        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), reminders=True)
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), slim=True)
         self.assertEqual(mock_post.call_args.kwargs["json"]["messages"], body["messages"])
-        with patch.dict(os.environ, {"PROXY_NATIVE_REMINDERS": "0", "PROXY_TASK_TOKEN_WARN": "7"}), \
-                patch.object(proxy, "_NATIVE_REMINDERS", True), \
-                patch.object(proxy, "_TASK_TOKEN_WARN", 1):
-            proxy._setup_native_reminders()
-            self.assertFalse(proxy._NATIVE_REMINDERS)
-            self.assertEqual(proxy._TASK_TOKEN_WARN, 7)
+        body["tools"] = self.TOOLS
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"))
+        self.assertEqual(mock_post.call_args.kwargs["json"]["messages"], body["messages"])
 
     def test_step_cap_forces_tool_choice_none(self):
         tools = [{"type": "function", "function": {"name": "read", "parameters": {}}}]
         cap = {"role": "assistant", "content": "CRITICAL - MAXIMUM STEPS REACHED\n\nThe maximum..."}
         body = {"model": "gemini-x-withtools", "tools": tools,
                 "messages": [{"role": "user", "content": "x"}, cap]}
-        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), reminders=True)
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), slim=True)
         sent = mock_post.call_args.kwargs["json"]
         self.assertEqual(sent["tool_choice"], "none")
         self.assertEqual(sent["messages"], body["messages"])  # no reminder on the cap step

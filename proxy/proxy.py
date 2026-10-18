@@ -460,21 +460,18 @@ def _is_native_tool_model(model: str) -> bool:
     return bool(model) and any(fnmatch.fnmatchcase(model, p) for p in _NATIVE_TOOL_PATTERNS)
 
 
-# Native-path reminder. The native route skips the cooperative pipeline, and
-# with it the todo replay and the nudges that kept the agent moving; on a
-# metered model an agent that keeps reading and grepping burns the daily
-# budget (every step re-sends the whole conversation). So each native request
-# that carries tools gets one short <system-reminder> appended to its LAST
-# message: the step count and estimated tokens for this task, the todo list
-# (or the instruction to write one), and escalating nudges when many steps
-# pass without a file change or the task grows expensive. It is rebuilt from
-# the history on every request (the proxy is stateless) and never accumulates:
-# opencode re-sends its own copy of the history, which does not carry it.
-# PROXY_NATIVE_REMINDERS=0 turns it off; PROXY_TASK_TOKEN_WARN sets the
-# estimated task size (tokens) past which the reminder says to wrap up.
-_NATIVE_REMINDERS = True  # set in main()
-_TASK_TOKEN_WARN = 0  # set in main(); 0 = no per-task budget line
-_TOOL_OUTPUT_KEEP = 40_000  # set in main(); tokens of newest tool output sent verbatim, 0 = all
+# Native-path reminder (slim only). The native route skips the cooperative
+# pipeline, and with it the todo replay and the nudges that kept the agent
+# moving; on a metered model an agent that keeps reading and grepping burns the
+# daily budget (every step re-sends the whole conversation). So under `--slim`
+# each native request that carries tools gets one short <system-reminder>
+# appended to its LAST message: the step count and estimated tokens for this
+# task, the todo list (or the instruction to write one), and nudges when the
+# list goes stale, calls repeat, or many steps pass without a file change. It
+# is rebuilt from the history on every request and never accumulates: opencode
+# re-sends its own copy of the history, which does not carry it. Without
+# `--slim` the native route sends opencode's request as is.
+_TOOL_OUTPUT_KEEP = 40_000  # slim: tokens of newest tool output sent verbatim
 _TOOL_OUTPUT_TRIM_MIN = 1_500  # chars: shorter old tool outputs are left alone
 _TOOL_OUTPUT_HEAD = 500        # chars of a trimmed tool output that are kept
 _NATIVE_EDIT_TOOLS = frozenset({"edit", "write", "patch", "multiedit", "apply_patch"})
@@ -486,27 +483,6 @@ _NATIVE_REPEAT_AT = 3         # identical tool calls in one task before they are
 # survives a compaction that drops the todowrite calls from the history.
 _SESSION_TODOS: "Dict[str, Any]" = {}
 _SESSION_TODOS_MAX = 64
-
-
-def _setup_native_reminders() -> None:
-    global _NATIVE_REMINDERS
-    global _TASK_TOKEN_WARN
-    global _TOOL_OUTPUT_KEEP
-    _NATIVE_REMINDERS = os.environ.get("PROXY_NATIVE_REMINDERS", "1").strip().lower() not in (
-        "0", "off", "false", "no",
-    )
-    for name, current in (("PROXY_TASK_TOKEN_WARN", _TASK_TOKEN_WARN), ("PROXY_TOOL_OUTPUT_KEEP", _TOOL_OUTPUT_KEEP)):
-        raw = os.environ.get(name, "").strip()
-        value = current
-        if raw:
-            try:
-                value = max(0, int(raw))
-            except ValueError:
-                print(f"WARN: {name}={raw!r} is not an integer; using {current}", flush=True)
-        if name == "PROXY_TASK_TOKEN_WARN":
-            _TASK_TOKEN_WARN = value
-        else:
-            _TOOL_OUTPUT_KEEP = value
 
 
 def _trim_old_tool_outputs(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
@@ -523,7 +499,7 @@ def _trim_old_tool_outputs(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[st
     trimmed. opencode's stored history is untouched; only this request shrinks,
     and the upstream's usage (so opencode's compaction counter) follows it.
     Returns the new list (a copy where changed) and the characters dropped."""
-    if not _TOOL_OUTPUT_KEEP or not messages:
+    if not messages:
         return messages, 0
     last_assistant = max(
         (i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"),
@@ -609,7 +585,7 @@ def _native_task_stats(messages: List[Dict[str, Any]], tools: List[Any]) -> Dict
 
 
 def _native_reminder(
-    messages: List[Dict[str, Any]], tools: List[Any], session_id: str = "", slim: bool = False,
+    messages: List[Dict[str, Any]], tools: List[Any], session_id: str = "",
 ) -> str:
     """Build the per-request reminder text for a native-tools request.
 
@@ -617,17 +593,10 @@ def _native_reminder(
     todo list is replayed every step (from the history, or after a compaction
     from the last list this session wrote), a missing or stale list is called
     out, and so are identical tool calls repeated within the task, the clearest
-    sign of a run that has lost its goal. Under `slim` the standing advice on
-    working in few steps is left out: the slim system prompt already carries it."""
+    sign of a run that has lost its goal. The standing advice on working in
+    few steps lives in the slim system prompt, not here."""
     st = _native_task_stats(messages, tools)
     lines = [f"harness: step {st['steps']} of this task, about {st['tokens']:,} tokens so far."]
-    if not slim:
-        lines[0] += (
-            " Every step re-sends the whole conversation and the user's daily token budget "
-            "is metered, so work in as few steps as you can: narrow searches (grep for a "
-            "specific symbol, read only the line ranges you need), do not re-read what is "
-            "still in this conversation, and make the change as soon as you know it."
-        )
     todos = _extract_latest_todos(messages)
     if session_id:
         if todos:
@@ -674,11 +643,6 @@ def _native_reminder(
         lines.append(
             f"{st['since_edit']} steps without changing a file. That is fine while the "
             "current todo item needs research; if it needs a change, make it now."
-        )
-    if _TASK_TOKEN_WARN and st["tokens"] >= _TASK_TOKEN_WARN:
-        lines.append(
-            f"This task has passed its token budget (~{_TASK_TOKEN_WARN:,}). Finish the item "
-            "in progress, then stop and report what is done and what remains."
         )
     return "<system-reminder>\n" + "\n".join(lines) + "\n</system-reminder>"
 
@@ -994,7 +958,9 @@ def _native_passthrough(
     the upstream's SSE stream or JSON body comes back as-is. Upstream 4xx keep
     their status (so the AI SDK does not retry a deterministic rejection, and
     does retry a 429); 5xx become 502 as on the cooperative path. Under `slim`
-    (see `_SLIM_HEADER`) the built-in tools' descriptions are shortened."""
+    (see `_SLIM_HEADER`) the built-in tools' descriptions are shortened, old
+    tool output is trimmed and the reminder is appended; otherwise the request
+    is opencode's own."""
     payload = dict(inbound_request)
     payload["model"] = model_name
     messages = payload.get("messages") or []
@@ -1005,16 +971,17 @@ def _native_passthrough(
         # auto-compacts. opencode asks for usage by default; ask here too so
         # every client gets it.
         payload["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}
-    messages, trimmed = _trim_old_tool_outputs(messages)
-    if trimmed:
-        payload["messages"] = messages
-        print(f"[{req_id}] trimmed {trimmed:,} chars of old tool output", flush=True)
+    if slim:
+        messages, trimmed = _trim_old_tool_outputs(messages)
+        if trimmed:
+            payload["messages"] = messages
+            print(f"[{req_id}] trimmed {trimmed:,} chars of old tool output", flush=True)
     if payload.get("tools") and _at_step_cap(messages):
         # Make the step cap hard: the upstream honours tool_choice "none".
         payload["tool_choice"] = "none"
-    elif _NATIVE_REMINDERS and payload.get("tools") and messages:
+    elif slim and payload.get("tools") and messages:
         payload["messages"] = messages = _append_to_last_message(
-            messages, _native_reminder(messages, payload.get("tools") or [], session_id, slim)
+            messages, _native_reminder(messages, payload.get("tools") or [], session_id)
         )
     print(
         f"[{req_id}] upstream shape: mode=native{'/slim' if slim else ''} messages={len(messages)} "
@@ -4654,7 +4621,6 @@ def main() -> None:
     _setup_prompt_mode()
     # After _setup_prompt_mode: an explicit --prompt-mode turns the native route off.
     _setup_native_tools()
-    _setup_native_reminders()
     _setup_usage_ledger()
     _setup_host_os()
     _setup_run_mode()
@@ -4701,8 +4667,7 @@ def main() -> None:
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   native tools:   {_NATIVE_TOOL_STATUS}\n"
-        f"   native nudges:  {'on' if _NATIVE_REMINDERS else 'off (PROXY_NATIVE_REMINDERS=0)'}; task token warning {f'at {_TASK_TOKEN_WARN:,}' if _TASK_TOKEN_WARN else 'off'}\n"
-        f"   tool output:    {f'newest ~{_TOOL_OUTPUT_KEEP:,} tokens sent whole, older trimmed' if _TOOL_OUTPUT_KEEP else 'sent whole (PROXY_TOOL_OUTPUT_KEEP=0)'}\n"
+        f"   slim requests:  short tool descriptions, reminder, older tool output trimmed (newest ~{_TOOL_OUTPUT_KEEP:,} tokens whole)\n"
         f"   usage ledger:   {_USAGE_LEDGER or 'off (PROXY_USAGE_LEDGER unset)'}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"

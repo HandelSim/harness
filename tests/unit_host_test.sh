@@ -99,20 +99,16 @@ jq -e '.provider.harness.models | has("test-model")' "$cfg" >/dev/null 2>&1 \
     || fail "T5: models map should include the default model"
 ok "T5: opencode config is valid JSON, loopback baseURL, dummy key, default model present"
 
-# --- T5b: usage reporting, step cap and pruning reach opencode's config -----
+# --- T5b: usage reporting and pruning reach opencode's config, no step cap --
 # includeUsage (opencode's default, pinned explicitly) keeps opencode's token
-# counter (and so auto-compaction) working on the native tools route. The step
-# cap is opt-in (HARNESS_AGENT_MAX_STEPS): hard tasks may legitimately run long.
+# counter (and so auto-compaction) working on the native tools route. No agent
+# gets a step cap: hard tasks may legitimately run long.
 jq -e '.provider.harness.options.includeUsage == true' "$cfg" >/dev/null 2>&1 \
     || fail "T5b: provider options should set includeUsage=true"
 jq -e '.compaction.prune == true and (.agent | has("build") | not) and (.agent.yolo | has("steps") | not)
        and (.agent.yolo.permission.edit == "allow")' "$cfg" >/dev/null 2>&1 \
-    || fail "T5b: no step cap by default and prune=true expected — $(cat "$cfg")"
-( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; HARNESS_AGENT_MAX_STEPS=150; host_write_opencode_config ) \
-    || fail "T5b: host_write_opencode_config returned non-zero with steps=150"
-jq -e '.agent.build.steps == 150 and .agent.yolo.steps == 150 and .agent.general.steps == 150' "$cfg" >/dev/null 2>&1 \
-    || fail "T5b: HARNESS_AGENT_MAX_STEPS=150 should cap build/yolo/general"
-ok "T5b: includeUsage, compaction.prune and the opt-in agent step cap are written"
+    || fail "T5b: no step cap and prune=true expected — $(cat "$cfg")"
+ok "T5b: includeUsage and compaction.prune are written, no agent step cap"
 
 # --- T5d: yolo is a primary agent; --slim builds the opencode overlay ------
 # Without mode "primary" opencode defaults an agent to "all", which lists the
@@ -120,8 +116,8 @@ ok "T5b: includeUsage, compaction.prune and the opt-in agent step cap are writte
 jq -e '.agent.yolo.mode == "primary"' "$cfg" >/dev/null 2>&1 \
     || fail "T5d: the yolo agent must be mode=primary — $(cat "$cfg")"
 # Sourced from a test, clone_dir resolves off $0; point it at the repo.
-[[ -z "$(clone_dir="$REPO_ROOT" HARNESS_SLIM=0 slim_opencode_config)" ]] || fail "T5d: no overlay without --slim"
-overlay=$(clone_dir="$REPO_ROOT" HARNESS_SLIM=1 slim_opencode_config)
+[[ -z "$(clone_dir="$REPO_ROOT" harness_slim=0 slim_opencode_config)" ]] || fail "T5d: no overlay without --slim"
+overlay=$(clone_dir="$REPO_ROOT" harness_slim=1 slim_opencode_config)
 [[ "$overlay" != *$'\n'* ]] || fail "T5d: overlay must be one line (it travels as a docker -e value)"
 jq -e --rawfile main "$REPO_ROOT/agents/slim-prompt.md" --rawfile sub "$REPO_ROOT/agents/slim-subagent-prompt.md" '
     .provider.harness.options.headers["x-harness-slim"] == "1"
@@ -136,16 +132,8 @@ ok "T5d: yolo is primary-only; --slim overlay sets the slim prompts and the prox
     || fail "T5c: host_write_opencode_config returned non-zero"
 jq -e '.provider.harness.models["test-model"].cost
        == {input: 1, output: 1, cache_read: 1, cache_write: 1}' "$cfg" >/dev/null 2>&1 \
-    || fail "T5c: default HARNESS_COST_UNIT=tokens should price every token at 1 — $(cat "$cfg")"
-( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; HARNESS_COST_UNIT=credits; host_write_opencode_config ) \
-    || fail "T5c: host_write_opencode_config returned non-zero with credits"
-jq -e '.provider.harness.models["test-model"] | has("cost") | not' "$cfg" >/dev/null 2>&1 \
-    || fail "T5c: credits with no catalog weights should leave cost unset"
-w='{"test-model": {"input": 2, "output": 5}}'
-got=$(printf '"test-model"\n' | jq -s --argjson ctx 1000 --argjson w "$w" --arg unit credits "$(opencode_models_jq)")
-jq -e '.["test-model"].cost == {input: 2, output: 5, cache_read: 2, cache_write: 2}' <<<"$got" >/dev/null \
-    || fail "T5c: credits should use the catalog weights, cached input at the input weight — $got"
-ok "T5c: cost readout is tokens by default, catalog credits on request, cached input not free"
+    || fail "T5c: every token should be priced at 1 — $(cat "$cfg")"
+ok "T5c: cost readout counts tokens, cached input not free"
 
 # --- T6: host_write_opencode_config refuses when jq is absent (M4 guard) ----
 if ( PATH="/nonexistent-dir"; PROXY_PORT=8123; DEFAULT_MODEL_NAME="m"; host_write_opencode_config ) >/dev/null 2>&1; then
