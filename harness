@@ -2385,6 +2385,16 @@ cmd_uninstall() {
     echo "  $install_root   (install directory — code, config, state)"
     [[ -f "$wrapper" ]] && echo "  $wrapper   (PATH wrapper)"
     echo "  harness containers, images (harness-proxy, harness-agent), and volumes"
+    # Vault clones live under state/ and go with it. Name any that hold work
+    # their remote does not have yet.
+    local vdir
+    for vdir in "$state_root"/vaults/*/; do
+        [[ -d "$vdir.git" ]] || continue
+        if [[ -n "$(git -C "$vdir" status --porcelain 2>/dev/null)" ]] \
+            || [[ "$(git -C "$vdir" rev-list --count '@{u}..' 2>/dev/null || echo 1)" != "0" ]]; then
+            echo "  WARNING: vault clone ${vdir%/} has uncommitted or unpushed work"
+        fi
+    done
     echo
 
     if (( ! assume_yes )); then
@@ -2548,6 +2558,10 @@ commands:
   net <subcmd>          manage the egress allowlist + per-service firewall
                         overrides (see 'harness net')
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
+  vault [subcmd]        register git repos as vaults (the agent's notes and
+                        docs) and pick the active one; launches clone it into
+                        state/vaults/<name>, keep it current, and give the
+                        agent its AGENTS.md (see 'harness vault --help')
   unlock                probe the upstream and print the unlock URL if the
                         key is locked
   usage [--hours N]     total the tokens the upstream reported for the last N
@@ -5219,6 +5233,193 @@ slim_opencode_config() {
     }'
 }
 
+# === Vaults (the brain) ===
+#
+# A vault is a git repo of notes and docs the agent works from. `harness vault
+# add <name> <url>` registers one in state/vaults.list (name<TAB>url per line)
+# and `harness vault use <name>` picks the active one (state/vault.active). A
+# launch with an active vault clones it into state/vaults/<name> if it is not
+# there yet, otherwise fast-forwards it (best effort, never blocks the launch),
+# then hands opencode the overlay from vault_opencode_config. Container mode
+# also bind-mounts the clone at the same absolute path, so one path works on
+# both sides.
+
+_vault_valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+# URL registered for <name>; returns 1 when <name> is not registered.
+_vault_url() {
+    local name="$1" n u
+    [[ -f "$state_root/vaults.list" ]] || return 1
+    while IFS=$'\t' read -r n u; do
+        [[ "$n" == "$name" ]] && { printf '%s\n' "$u"; return 0; }
+    done < "$state_root/vaults.list"
+    return 1
+}
+
+# Name of the active vault, empty when none is set or it was unregistered.
+vault_active_name() {
+    local name=""
+    [[ -f "$state_root/vault.active" ]] && name=$(tr -d '\r\n' < "$state_root/vault.active")
+    [[ -n "$name" ]] && _vault_url "$name" >/dev/null && printf '%s\n' "$name"
+    return 0
+}
+
+# Run git with a time limit where `timeout` exists (it is missing on macOS).
+_vault_git() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 30 git "$@"
+    else
+        git "$@"
+    fi
+}
+
+# Clone or fast-forward the active vault and echo its absolute path. Prints
+# nothing (and the launch goes on without a vault) when none is active or the
+# clone fails. A failed pull only warns: the agent then works on the local copy.
+vault_prepare() {
+    local name url dir
+    name=$(vault_active_name)
+    [[ -n "$name" ]] || return 0
+    url=$(_vault_url "$name")
+    dir="$state_root/vaults/$name"
+    if ! command -v git >/dev/null 2>&1; then
+        err "vault '$name': git is not installed; launching without the vault"
+        return 0
+    fi
+    if [[ ! -d "$dir/.git" ]]; then
+        echo "[harness] vault '$name': cloning $url" >&2
+        mkdir -p "$state_root/vaults"
+        if ! git clone -q "$url" "$dir" >&2; then
+            err "vault '$name': clone failed; launching without the vault"
+            return 0
+        fi
+    elif ! GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" pull -q --ff-only >/dev/null 2>&1; then
+        err "vault '$name': could not fast-forward from its remote (offline, or local commits); using the local copy"
+    fi
+    harness_abs_path "$dir"
+}
+
+# The vault part of the opencode overlay: the vault's AGENTS.md (or CLAUDE.md)
+# as an instruction file, which opencode sends as "Instructions from: <path>"
+# so the model learns where the vault is, and an external_directory allow so
+# reading and writing under it needs no approval. Prints nothing without a
+# vault.
+vault_opencode_config() {
+    local dir="${harness_vault_dir:-}" f instr=""
+    [[ -n "$dir" ]] || return 0
+    for f in AGENTS.md CLAUDE.md; do
+        [[ -f "$dir/$f" ]] && { instr="$dir/$f"; break; }
+    done
+    [[ -n "$instr" ]] || err "vault at $dir has no AGENTS.md or CLAUDE.md; the agent is not told about it"
+    harness_jq -cn --arg dir "$dir" --arg instr "$instr" '
+      {"permission": {"external_directory": {($dir + "/*"): "allow"}}}
+      + (if $instr == "" then {} else {"instructions": [$instr]} end)'
+}
+
+# OPENCODE_CONFIG_CONTENT for a launch: the --slim and vault overlays deep-
+# merged (their keys do not overlap). Prints nothing when neither applies.
+harness_opencode_overlay() {
+    local slim vault
+    slim=$(slim_opencode_config)
+    vault=$(vault_opencode_config)
+    if [[ -n "$slim" && -n "$vault" ]]; then
+        harness_jq -cn --argjson a "$slim" --argjson b "$vault" '$a * $b'
+    else
+        printf '%s' "$slim$vault"
+    fi
+}
+
+cmd_vault() {
+    local sub="${1:-list}"
+    (( $# )) && shift
+    local list="$state_root/vaults.list" name url active
+    case "$sub" in
+        -h|--help|help)
+            cat <<'HELP'
+usage:
+  harness vault                    list vaults (* marks the active one)
+  harness vault add <name> <url>   register a git repo as a vault; the first
+                                   one added becomes active
+  harness vault use <name>         make <name> the active vault
+  harness vault off                launch without a vault
+  harness vault remove <name>      unregister <name>; its clone stays on disk
+
+A launch (harness, harness host, harness chatgpt) with an active vault clones
+it into state/vaults/<name> the first time and fast-forwards it after that.
+The agent gets the vault's AGENTS.md (or CLAUDE.md) as instructions and may
+read and write under the vault without approval; container launches mount it
+at the same path. Committing and pushing vault changes is the agent's (or
+your) job, as in any repo.
+HELP
+            ;;
+        list|ls)
+            active=$(vault_active_name)
+            if [[ ! -s "$list" ]]; then
+                echo "no vaults registered; add one with: harness vault add <name> <git-url>"
+                return 0
+            fi
+            while IFS=$'\t' read -r name url; do
+                local mark=" " where="not cloned yet"
+                [[ "$name" == "$active" ]] && mark="*"
+                [[ -d "$state_root/vaults/$name/.git" ]] && where="$state_root/vaults/$name"
+                printf '%s %s  %s  (%s)\n' "$mark" "$name" "$url" "$where"
+            done < "$list"
+            [[ -n "$active" ]] || echo "(no active vault; pick one with: harness vault use <name>)"
+            ;;
+        add)
+            name="${1:-}" url="${2:-}"
+            if [[ -z "$name" || -z "$url" || $# -gt 2 ]]; then
+                err "usage: harness vault add <name> <git-url>"; return 1
+            fi
+            _vault_valid_name "$name" || { err "vault name '$name': use letters, digits, '.', '_' or '-'"; return 1; }
+            [[ "$url" == *$'\t'* || "$url" == *$'\n'* ]] && { err "vault url has a tab or newline"; return 1; }
+            if _vault_url "$name" >/dev/null; then
+                err "vault '$name' is already registered ($(_vault_url "$name")); remove it first to change its url"
+                return 1
+            fi
+            mkdir -p "$state_root"
+            printf '%s\t%s\n' "$name" "$url" >> "$list"
+            echo "registered vault '$name'"
+            if [[ -z "$(vault_active_name)" ]]; then
+                printf '%s\n' "$name" > "$state_root/vault.active"
+                echo "'$name' is now the active vault; the next launch clones it"
+            fi
+            ;;
+        use)
+            name="${1:-}"
+            [[ -n "$name" && $# -eq 1 ]] || { err "usage: harness vault use <name>"; return 1; }
+            _vault_url "$name" >/dev/null || { err "no vault named '$name' (see: harness vault)"; return 1; }
+            printf '%s\n' "$name" > "$state_root/vault.active"
+            echo "active vault: $name"
+            ;;
+        off)
+            rm -f "$state_root/vault.active"
+            echo "no active vault; launches run without one"
+            ;;
+        remove|rm)
+            name="${1:-}"
+            [[ -n "$name" && $# -eq 1 ]] || { err "usage: harness vault remove <name>"; return 1; }
+            _vault_url "$name" >/dev/null || { err "no vault named '$name'"; return 1; }
+            active=$(vault_active_name)
+            local tmp="$list.tmp" n u
+            : > "$tmp"
+            while IFS=$'\t' read -r n u; do
+                [[ "$n" == "$name" ]] || printf '%s\t%s\n' "$n" "$u" >> "$tmp"
+            done < "$list"
+            mv "$tmp" "$list"
+            [[ "$active" == "$name" ]] && rm -f "$state_root/vault.active"
+            echo "unregistered vault '$name'"
+            [[ -d "$state_root/vaults/$name" ]] && echo "its clone is kept at $state_root/vaults/$name (delete it yourself if you no longer need it)"
+            ;;
+        *)
+            err "unknown vault command '$sub' (see: harness vault --help)"
+            return 1
+            ;;
+    esac
+}
+
 # Launch opencode against the host proxy. Mirrors agents/entrypoint.sh
 # run_opencode (provider env, --agent yolo, and the headless `-p` json-events +
 # `opencode export` dance that dodges opencode 1.15.x's render race). Interactive
@@ -5231,9 +5432,9 @@ host_run_opencode() {
 
     export OPENCODE_CONFIG="$(host_opencode_config)"
     export OPENCODE_DISABLE_AUTOUPDATE=1
-    local slim_config
-    slim_config=$(slim_opencode_config)
-    [[ -n "$slim_config" ]] && export OPENCODE_CONFIG_CONTENT="$slim_config"
+    local overlay
+    overlay=$(harness_opencode_overlay)
+    [[ -n "$overlay" ]] && export OPENCODE_CONFIG_CONTENT="$overlay"
     # Exa web-search parity with container mode. Intentional in host mode too:
     # host mode already runs with NO egress firewall (the confirm gate makes
     # that explicit), so enabling a web-search provider adds no new exposure
@@ -5466,6 +5667,7 @@ EOF
     host_proxy_start || exit 1
     host_proxy_wait_ready || { host_proxy_stop; exit 1; }
     host_write_opencode_config
+    harness_vault_dir=$(vault_prepare)
 
     local rc=0
     if (( ${#pass_args[@]} )); then
@@ -5721,6 +5923,11 @@ run_agent() {
         exit 1
     }
 
+    # The active vault rides along as one more mount (deduped below like any
+    # other, so launching from inside the vault is fine).
+    harness_vault_dir=$(vault_prepare)
+    [[ -n "$harness_vault_dir" ]] && extra_mounts+=("$harness_vault_dir")
+
     # Merge --mount flags with HARNESS_EXTRA_MOUNTS (colon-separated, like
     # PATH). Validate each entry: must exist as a directory; rejected if
     # under container infrastructure (/etc, /usr, /home/harness, ...).
@@ -5810,11 +6017,12 @@ agent_common_env() {
     # Declared context window for opencode's model config. The same knob caps
     # the proxy's local token estimate.
     printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-200000}"
-    # --slim: the opencode overlay (slim prompts + header), one line of JSON.
-    local slim_config
-    slim_config=$(slim_opencode_config)
-    if [[ -n "$slim_config" ]]; then
-        printf -- '-e\nOPENCODE_CONFIG_CONTENT=%s\n' "$slim_config"
+    # The opencode overlay (--slim prompts + header, the active vault), one
+    # line of JSON.
+    local overlay
+    overlay=$(harness_opencode_overlay)
+    if [[ -n "$overlay" ]]; then
+        printf -- '-e\nOPENCODE_CONFIG_CONTENT=%s\n' "$overlay"
     fi
     # Container CWD is also bind-mounted at this exact path; the entrypoint
     # cd's here after the gosu drop. Surfaced as an env var so agents (and
@@ -9494,6 +9702,7 @@ main() {
         stop)                       cmd_stop "$@" ;;
         net)                        cmd_net "$@" ;;
         mcp)                        cmd_mcp "$@" ;;
+        vault)                      cmd_vault "$@" ;;
         unlock)                     cmd_unlock "$@" ;;
         probe)                      cmd_probe "$@" ;;
         config)                     cmd_config "$@" ;;
