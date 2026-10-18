@@ -5351,7 +5351,8 @@ it into state/vaults/<name> the first time and fast-forwards it after that.
 The agent gets the vault's AGENTS.md (or CLAUDE.md) as instructions and may
 read and write under the vault without approval; container launches mount it
 at the same path. Committing and pushing vault changes is the agent's (or
-your) job, as in any repo.
+your) job, as in any repo; from a container that needs the vault's git host
+marked '# git-push' in .harness-allowlist (see 'harness net').
 HELP
             ;;
         list|ls)

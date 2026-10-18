@@ -391,7 +391,8 @@ there needs no approval. `harness_opencode_overlay` deep-merges that with the
 `--slim` overlay into the one `OPENCODE_CONFIG_CONTENT`. Container mode also
 appends the vault to the extra mounts (same absolute path, deduped against
 the CWD). Committing and pushing vault changes is the agent's job, as in any
-repo. Clones live under `state/`, so `uninstall` deletes them; it first names
+repo; inside a container the push needs the vault's git host marked
+`# git-push` in the allowlist (`firewall/configure-git-credentials.sh`). Clones live under `state/`, so `uninstall` deletes them; it first names
 any clone with uncommitted or unpushed work. `tests/unit_vault_test.sh`
 covers the registry, clone, fast-forward, offline fallback and the overlay.
 
