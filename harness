@@ -5735,7 +5735,9 @@ host down' stops it). With no vault active the pub page still comes up, with
 no pages. Reach it from another machine with ssh port forwarding:
   ssh -L 8780:127.0.0.1:8780 -L 8781:127.0.0.1:8781 <this host>
 --allow-host NAME accepts that Host header too (NAME is host:port as the
-browser sends it), for a reverse proxy in front of the pub page.
+browser sends it), for a reverse proxy in front of the pub page. The pub
+page links opencode as <that host>:N+1, so behind a reverse proxy give
+opencode its own name, with the proxy doing the login.
 
 opencode web runs as your user with a shell, like 'harness host'.
 HELP
