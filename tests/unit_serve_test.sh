@@ -34,6 +34,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" source "$HARNESS" 2>/dev/null
 # Sourced from a test, clone_dir resolves off $0 and platform.sh is skipped;
 # point both at the repo.
+# shellcheck disable=SC2034  # read by the sourced harness functions
 clone_dir="$REPO_ROOT"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/scripts/lib/platform.sh"
