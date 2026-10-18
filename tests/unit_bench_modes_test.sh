@@ -105,8 +105,10 @@ else
     echo "[bench-modes] (jq not installed; config half of T5 skipped)"
 fi
 grep -q 'HARNESS_HOST_NO_WEB:-0}" == "1" ]] && unset OPENCODE_ENABLE_EXA' \
-    < <(sed -n '/^host_run_opencode()/,/^}/p' "$HARNESS") \
-    || fail "T5: host_run_opencode keeps Exa on under HARNESS_HOST_NO_WEB"
+    < <(sed -n '/^host_opencode_env()/,/^}/p' "$HARNESS") \
+    || fail "T5: host_opencode_env keeps Exa on under HARNESS_HOST_NO_WEB"
+sed -n '/^host_run_opencode()/,/^}/p' "$HARNESS" | grep -q '^    host_opencode_env$' \
+    || fail "T5: host_run_opencode no longer calls host_opencode_env"
 ok "T5: HARNESS_HOST_NO_WEB turns off web tools, Exa and sharing; default unchanged"
 
 # --- T6: a Windows-form HARNESS_INSTALL_ROOT ----------------------------------------
