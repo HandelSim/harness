@@ -2558,6 +2558,9 @@ commands:
   net <subcmd>          manage the egress allowlist + per-service firewall
                         overrides (see 'harness net')
   mcp <subcmd>          manage long-running MCP services (see 'harness mcp')
+  serve [--port N]      serve the pub page (the active vault's pub/*.html and
+                        service links) and opencode web on 127.0.0.1, over the
+                        host-mode proxy (see 'harness serve --help')
   vault [subcmd]        register git repos as vaults (the agent's notes and
                         docs) and pick the active one; launches clone it into
                         state/vaults/<name>, keep it current, and give the
@@ -5421,16 +5424,9 @@ HELP
     esac
 }
 
-# Launch opencode against the host proxy. Mirrors agents/entrypoint.sh
-# run_opencode (provider env, --agent yolo, and the headless `-p` json-events +
-# `opencode export` dance that dodges opencode 1.15.x's render race). Interactive
-# runs as a child (not exec) so the proxy is torn down on exit; print mode leaves
-# the proxy up so a scripted `-p` loop doesn't thrash it (`harness host down`
-# stops it).
-host_run_opencode() {
-    local yolo="$1" print_mode="$2"; shift 2
-    local pass_args=("$@")
-
+# The opencode environment for a host launch (interactive, -p and `harness
+# serve`): config file, overlay, web search, and the loopback NO_PROXY.
+host_opencode_env() {
     export OPENCODE_CONFIG="$(host_opencode_config)"
     export OPENCODE_DISABLE_AUTOUPDATE=1
     local overlay
@@ -5461,6 +5457,19 @@ host_run_opencode() {
         export NO_PROXY="$_loopback_noproxy"
     fi
     export no_proxy="$NO_PROXY"
+}
+
+# Launch opencode against the host proxy. Mirrors agents/entrypoint.sh
+# run_opencode (provider env, --agent yolo, and the headless `-p` json-events +
+# `opencode export` dance that dodges opencode 1.15.x's render race). Interactive
+# runs as a child (not exec) so the proxy is torn down on exit; print mode leaves
+# the proxy up so a scripted `-p` loop doesn't thrash it (`harness host down`
+# stops it).
+host_run_opencode() {
+    local yolo="$1" print_mode="$2"; shift 2
+    local pass_args=("$@")
+
+    host_opencode_env
 
     local args=()
     [[ "$yolo" == "1" ]] && args+=(--agent yolo)
@@ -5677,6 +5686,124 @@ EOF
         host_run_opencode "$yolo" "$print_mode" || rc=$?
     fi
     exit "$rc"
+}
+
+# === harness serve ===
+#
+# The pub page (serve/pub.py: the active vault's pub/*.html plus service
+# links) and opencode web (`opencode serve`), both on 127.0.0.1, on top of the
+# host-mode proxy. Runs in the foreground; Ctrl-C stops both and leaves the
+# proxy up (`harness host down` stops it). Exposure beyond loopback is the
+# deployer's reverse proxy (`--allow-host` names it); serve itself never binds
+# a public interface.
+
+# opencode web's password: random, made once, kept in state/serve (mode 600).
+serve_password_file() {
+    local f="$state_root/serve/opencode-password" py
+    if [[ ! -s "$f" ]]; then
+        mkdir -p "$state_root/serve"
+        py=$(host_python_bin) || return 1
+        ( umask 077; $py -c 'import secrets; print(secrets.token_urlsafe(24))' > "$f" ) || return 1
+    fi
+    printf '%s' "$f"
+}
+
+cmd_serve() {
+    local port=8780 arg want=""
+    local allow_hosts=()
+    for arg in "$@"; do
+        if [[ -n "$want" ]]; then
+            case "$want" in
+                port) port="$arg" ;;
+                host) allow_hosts+=(--allow-host "$arg") ;;
+            esac
+            want=""; continue
+        fi
+        case "$arg" in
+            -h|--help|help)
+                cat <<'HELP'
+usage: harness serve [--port N] [--allow-host NAME]
+
+Serves, on 127.0.0.1 only:
+  http://127.0.0.1:N/     the pub page: the active vault's pub/**/*.html and
+                          links to the services below (default N = 8780)
+  http://127.0.0.1:N+1/   opencode web, logged in from the pub page's link
+                          (password in state/serve/opencode-password)
+It starts the host-mode proxy if needed (same as 'harness host') and runs in
+the foreground; Ctrl-C stops both servers and leaves the proxy up ('harness
+host down' stops it). With no vault active the pub page still comes up, with
+no pages. Reach it from another machine with ssh port forwarding:
+  ssh -L 8780:127.0.0.1:8780 -L 8781:127.0.0.1:8781 <this host>
+--allow-host NAME accepts that Host header too (NAME is host:port as the
+browser sends it), for a reverse proxy in front of the pub page.
+
+opencode web runs as your user with a shell, like 'harness host'.
+HELP
+                return 0 ;;
+            --port) want=port ;;
+            --port=*) port="${arg#--port=}" ;;
+            --allow-host) want=host ;;
+            --allow-host=*) allow_hosts+=(--allow-host "${arg#--allow-host=}") ;;
+            *) err "unknown serve option '$arg' (see: harness serve --help)"; return 1 ;;
+        esac
+    done
+    [[ -z "$want" ]] || { err "--$want needs a value"; return 1; }
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65534 )); then
+        err "--port must be a number from 1 to 65534"; return 1
+    fi
+    local oc_port=$((port + 1))
+
+    host_require_python3 || exit 1
+    host_require_config
+    host_confirm_gate 0 || exit 1
+    ensure_dirs
+    host_ensure_toolchain || { host_win_location_hint; exit 1; }
+    host_preflight        || { host_win_location_hint; exit 1; }
+    _gate_on_upstream_auth || exit 1
+    _print_upstream_models || exit 1
+    host_proxy_start || exit 1
+    host_proxy_wait_ready || { host_proxy_stop; exit 1; }
+    host_write_opencode_config
+    harness_vault_dir=$(vault_prepare)
+
+    local pwfile
+    pwfile=$(serve_password_file) || { err "serve: cannot create the opencode web password"; exit 1; }
+    local logdir="$state_root/serve" workdir="${harness_vault_dir:-$HOME}"
+    mkdir -p "$logdir"
+
+    local oc_pid pub_pid
+    (
+        host_opencode_env
+        OPENCODE_SERVER_PASSWORD=$(cat "$pwfile")
+        export OPENCODE_SERVER_PASSWORD
+        cd "$workdir" || exit 1
+        exec opencode serve --hostname 127.0.0.1 --port "$oc_port"
+    ) >"$logdir/opencode.log" 2>&1 &
+    oc_pid=$!
+    # shellcheck disable=SC2086  # host_python_bin may be the two words 'py -3'
+    $(host_python_bin) "$clone_dir/serve/pub.py" --port "$port" \
+        --vault "${harness_vault_dir:-}" --vault-name "$(vault_active_name)" \
+        --opencode-port "$oc_port" --password-file "$pwfile" \
+        ${allow_hosts[@]+"${allow_hosts[@]}"} 2>"$logdir/pub.log" &
+    pub_pid=$!
+    # shellcheck disable=SC2064  # expand the pids now
+    # Replaces main's EXIT trap, so it reaps the jq sidecar too.
+    trap "kill $oc_pid $pub_pid 2>/dev/null; wait $oc_pid $pub_pid 2>/dev/null; _reap_jq_sidecar" EXIT
+    trap 'exit 130' INT TERM
+
+    echo "============================================================" >&2
+    echo " harness serve" >&2
+    echo "   pub page:     http://127.0.0.1:$port/" >&2
+    echo "   opencode web: http://127.0.0.1:$oc_port/ (open it from the pub page)" >&2
+    echo "   vault:        ${harness_vault_dir:-none}" >&2
+    echo "   logs:         $logdir/{pub,opencode}.log" >&2
+    echo "   Ctrl-C stops serve; the proxy stays up ('harness host down')" >&2
+    echo "============================================================" >&2
+
+    local rc=0
+    wait -n "$oc_pid" "$pub_pid" || rc=$?
+    err "serve: a server exited (status $rc); see $logdir/pub.log and $logdir/opencode.log"
+    exit 1
 }
 
 cmd_host_down() {
@@ -9704,6 +9831,7 @@ main() {
         net)                        cmd_net "$@" ;;
         mcp)                        cmd_mcp "$@" ;;
         vault)                      cmd_vault "$@" ;;
+        serve)                      cmd_serve "$@" ;;
         unlock)                     cmd_unlock "$@" ;;
         probe)                      cmd_probe "$@" ;;
         config)                     cmd_config "$@" ;;
