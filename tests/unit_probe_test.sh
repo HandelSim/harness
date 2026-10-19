@@ -16,7 +16,8 @@
 #   T4 none of the secrets appear in stdout or in the redacted log
 #   T5 the log path is printed relative (state/output/...), not absolute
 #   T6 a locked key (401 + unlock_url) aborts early without printing the URL
-#   T7 'harness probe help' lists the subcommands; 'memory --help' works;
+#   T7 'harness probe help' lists the subcommands; 'memory --help' works
+#      (and 'thinking --help', 'slim --help');
 #      an unknown subcommand errors
 #   T8 'harness probe memory --quick' exits 0 with every section and the
 #      verdict (the mock sees only the last message and 502s above 100 KB)
@@ -38,6 +39,21 @@
 #      400 on both controls, signatures echoed/omitted/corrupted, history
 #      billing, and a credits-header fit (the mock bills reasoning)
 #   T14 none of the secrets appear in the thinking suite's stdout or log
+#   T15 the log carries the report: a 'headers:' line per request (with the
+#      credits header, no auth headers) and 'report: ' lines equal to stdout
+#   T16 the thinking log has T5s's per-event SSE layout (delta keys, text)
+#   T17 'probe_upstream.py --suite slim' runs all 3 arms against a scripted
+#      mock agent (task subagent, read, edit, pytest), solves the simulated
+#      bug in each, prints per-arm metrics and the slim verdict, no secrets
+#   T18 the mock's received requests: arm 1 echoes no extra_content, arms 2
+#      and 3 echo every signature (main and subagent), arm 3 uses the candidate
+#   T19 --only 13 --repeat 2 picks arms; a missing --candidate or repo errors
+#      cleanly (rc 2) before any request; piped on stdin with --root it runs,
+#      and without proxy/proxy.py it says the slim descriptions fell back
+#   T20 a model that never stops (mock 'slimloop') is bounded: subagent step
+#      cap, then the 60-request cap, "(cap hit" printed
+#   T21 'harness probe slim' passes the launch clone as --root and logs to
+#      state/output/probe-slim-<ts>.log
 #
 # Prints "PROBE TEST PASSED" on success.
 
@@ -73,13 +89,15 @@ PREFIX="zqsecretprefix"
 ORG="AcmeInternalOrg"
 
 cat >"$TMP_ROOT/mock.py" <<'PYEOF'
-import json, re, sys, time
+import json, os, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PREFIX = "/" + sys.argv[2]
 LOCKED = sys.argv[3] == "locked"
 QUOTA = sys.argv[3] == "quota"
+SLIMLOOP = sys.argv[3] == "slimloop"
 PORT_FILE = sys.argv[1]
+SLIM_REC = os.path.join(os.path.dirname(PORT_FILE), "slim-rec.txt")
 SEEN = {"single": 0}
 CREDITS = {"left": 10000000}
 LEVEL_TOKENS = {"minimal": 4, "low": 40, "medium": 160, "high": 640}
@@ -89,6 +107,52 @@ def leak(h):
     # Everything the probe must never print.
     return ("auth=%s frag=tok_PROBEKEY-9f8e7d host=%s mail=admin@secretcorp.example ip=10.1.2.3 "
             "see https://unlock.secretcorp.example/u?k=1 org AcmeInternalOrg" % (h.headers.get("Authorization"), h.headers.get("Host")))
+
+
+def slim_turn(msgs, h):
+    """The slim suite's scripted agent: (tool_calls, content) or None when the
+    request is not one of its loops. Main: read the test, ask an explore
+    subagent, read average.py, edit it, run pytest, answer. Subagent: grep,
+    answer. Logs what each request carried to slim-rec.txt."""
+    sysm = msgs[0].get("content") if msgs and msgs[0].get("role") == "system" else ""
+    user = next((m.get("content") for m in msgs if m.get("role") == "user"), "") or ""
+    if "tests/test_average.py fails" in user:
+        kind = "main"
+    elif user.startswith("Find the definition of mean"):
+        kind = "sub"
+    else:
+        return None
+    step = sum(1 for m in msgs if m.get("role") == "assistant")
+    hist = [c for m in msgs if m.get("role") == "assistant" for c in m.get("tool_calls") or []]
+    sigs = sum(1 for c in hist if c.get("extra_content"))
+    which = ("candidate" if "Trust their reports" in sysm else "current") if kind == "main" else \
+        ("explore" if "file search specialist" in sysm else "general" if "You are a subagent" in sysm else "?")
+    with open(SLIM_REC, "a") as f:
+        f.write("%s sys=%s step=%d tcs=%d sigs=%d\n" % (kind, which, step, len(hist), sigs))
+    last = str(msgs[-1].get("content") or "")
+    def call(name, args):
+        return [{"id": "call_s%d" % step, "type": "function", "function": {"name": name, "arguments": json.dumps(args)},
+                 "extra_content": {"google": {"thought_signature": "SIGslim%d" % step}}}]
+    if kind == "sub":
+        if SLIMLOOP or step == 0:
+            if SLIMLOOP:
+                return call("read", {"filePath": "/work/proj/src/stats/util.py"}), None
+            return call("grep", {"pattern": "def mean", "path": "/work/proj/src"}), None
+        return None, "mean is defined at %s " % ("/work/proj/src/stats/average.py:7" if "average.py:7:" in last else "?") + leak(h)
+    if SLIMLOOP:
+        return call("task", {"description": "find mean", "subagent_type": "explore",
+                             "prompt": "Find the definition of mean under /work/proj/src and return file:line."}), None
+    script = [("read", {"filePath": "/work/proj/tests/test_average.py"}),
+              ("task", {"description": "find mean", "subagent_type": "explore",
+                        "prompt": "Find the definition of mean under /work/proj/src and return file:line."}),
+              ("read", {"filePath": "/work/proj/src/stats/average.py"}),
+              ("edit", {"filePath": "/work/proj/src/stats/average.py", "oldString": "return sum(xs) / (len(xs) - 1)",
+                        "newString": "return sum(xs) / len(xs)"}),
+              ("bash", {"command": "python -m pytest -q", "description": "Run the tests"})]
+    if step < len(script):
+        return call(*script[step]), None
+    return None, "Fixed mean in src/stats/average.py; pytest: %s " % (
+        "6 passed" if "6 passed" in last else "NOT PASSED") + leak(h)
 
 
 class H(BaseHTTPRequestHandler):
@@ -188,7 +252,10 @@ class H(BaseHTTPRequestHandler):
             # Memory suite: behave like an upstream that sees only the last
             # message (echo the crate labels found there).
             content = " ".join(re.findall(r"[B-Z]{3}-[0-9]{3}", last_text)) + " " + leak(self)
-        if tools and last.get("role") == "user" and req.get("tool_choice") != "none":
+        slim = slim_turn(msgs, self) if tools else None
+        if slim is not None:
+            tool_calls, content = slim
+        elif tools and last.get("role") == "user" and req.get("tool_choice") != "none":
             names = [t["function"]["name"] for t in tools]
             name = names[-1] if "probe" in text_all else names[0]
             if "get_current_weather" in names:
@@ -209,7 +276,7 @@ class H(BaseHTTPRequestHandler):
         CREDITS["left"] -= pt + 5 + rt
         if tool_calls:
             for i, tc in enumerate(tool_calls):
-                tc["extra_content"] = {"google": {"thought_signature": "SIGmock%d" % i}}
+                tc.setdefault("extra_content", {"google": {"thought_signature": "SIGmock%d" % i}})
         usage = {"prompt_tokens": pt, "completion_tokens": 5, "total_tokens": pt + 5 + rt,
                  "completion_tokens_details": {"reasoning_tokens": rt}}
         if req.get("stream"):
@@ -330,7 +397,7 @@ ok "T6 locked key aborts with a redacted hint"
 # --- T7: subcommand help ---
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe help 2>&1); rc=$?
 [[ $rc -eq 0 && "$out" == *"full "* && "$out" == *"memory "* && "$out" == *"optimize-single"* && "$out" == *"thinking "* \
-   && "$out" == *"help "* ]] \
+   && "$out" == *"slim "* && "$out" == *"help "* ]] \
     || fail "T7 'probe help': rc=$rc out=$out"
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe memory --help 2>&1); rc=$?
 [[ $rc -eq 0 && "$out" == *"usage: harness probe memory"* && "$out" == *"--long-term"* ]] \
@@ -341,9 +408,12 @@ out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe --optimize-single --help 2>&1)
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe thinking --help 2>&1); rc=$?
 [[ $rc -eq 0 && "$out" == *"usage: harness probe thinking"* && "$out" == *"thought signatures"* ]] \
     || fail "T7 'probe thinking --help': rc=$rc out=$out"
+out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe slim --help 2>&1); rc=$?
+[[ $rc -eq 0 && "$out" == *"usage: harness probe slim"* && "$out" == *"--candidate"* ]] \
+    || fail "T7 'probe slim --help': rc=$rc out=$out"
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe bogus 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"unknown probe subcommand"* ]] || fail "T7 unknown subcommand: rc=$rc out=$out"
-ok "T7 probe help / memory --help / --optimize-single --help / thinking --help / unknown subcommand"
+ok "T7 probe help / memory --help / --optimize-single --help / thinking --help / slim --help / unknown subcommand"
 
 # --- T8: memory suite against the mock ---
 rm -f "$TMP_ROOT"/state/output/probe-*.log
@@ -527,5 +597,142 @@ for f in "$TMP_ROOT/stdout-think.txt" "$log"; do
     done
 done
 ok "T14 no secrets in the thinking suite's stdout or log"
+
+# --- T15: the log carries the report (headers and report lines) ---
+log=$(ls "$TMP_ROOT"/state/output/probe-thinking-*.log 2>/dev/null | head -1)
+n_req=$(grep -c '^### #' "$log"); n_hdr=$(grep -c '^headers: {' "$log")
+[[ $n_req -gt 10 && $n_hdr -eq $n_req ]] || fail "T15 expected one 'headers:' line per request ($n_hdr of $n_req)"
+grep '^headers: ' "$log" | grep -qF '"x-ratelimit-remaining-credits-day": "' \
+    || fail "T15 'headers:' lines lack the credits header"
+! grep '^headers: ' "$log" | grep -qiE 'authorization|cookie' || fail "T15 'headers:' lines carry auth/cookie headers"
+for want in "report: === harness probe thinking v" "report: === thinking verdict ===" "report: === end harness probe ==="; do
+    grep -qF -- "$want" "$log" || fail "T15 thinking log lacks '$want'"
+done
+# Every report line in the log is a stdout line, in the same order.
+sed -n 's/^report: //p' "$log" >"$TMP_ROOT/think-report.txt"
+python3 - "$TMP_ROOT/think-report.txt" "$TMP_ROOT/stdout-think.txt" <<'PYEOF3' || fail "T15 thinking report lines are not stdout's lines in order"
+import sys
+rep = open(sys.argv[1]).read().split("\n")[:-1]
+out = iter(open(sys.argv[2]).read().split("\n"))
+sys.exit(0 if len(rep) > 30 and all(any(l == o for o in out) for l in rep) else 1)
+PYEOF3
+ok "T15 the log has a headers line per request (credits header, no auth) and the report in order"
+
+# --- T16: thinking stream section logs the per-event SSE layout ---
+grep -qE '^### T5s sse events \([0-9]+ of [0-9]+ kept\)' "$log" || fail "T16 no '### T5s sse events' block in the log"
+grep -qE '^ev0: c0 \[content\] "<thought>' "$log" || { grep -n '^ev' "$log" | head -5 >&2; fail "T16 ev0 layout line"; }
+grep -qE '^ev[0-9]+: c0 \[\] finish=stop top=\[gemini_enterprise\]' "$log" || fail "T16 finish event layout line"
+ok "T16 thinking log shows the T5s per-event SSE layout"
+
+# --- T17: slim suite, all arms ---
+mkdir -p "$TMP_ROOT/agents" "$TMP_ROOT/proxy"
+cp "$REPO_ROOT/agents/slim-prompt.md" "$REPO_ROOT/agents/slim-subagent-prompt.md" "$TMP_ROOT/agents/"
+cp "$REPO_ROOT/proxy/proxy.py" "$TMP_ROOT/proxy/"
+cp "$REPO_ROOT/scripts/probe_slim_candidate.md" "$TMP_ROOT/scripts/"
+slim() {  # slim MOCK_MODE ARGS...: run the slim suite directly (stdout to $TMP_ROOT/slim-out.txt)
+    local mode=$1; shift
+    rm -f "$TMP_ROOT/slim-rec.txt"
+    start_mock "$mode"
+    PROXY_API_URL="http://127.0.0.1:${PORT}/${PREFIX}" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" \
+        HARNESS_PROBE_REDACT="$ORG" timeout 120 python3 "$TMP_ROOT/scripts/probe_upstream.py" --suite slim \
+        --timeout 20 --delay-scale 0 "$@" >"$TMP_ROOT/slim-out.txt" 2>"$TMP_ROOT/slim-err.txt"
+    rc=$?
+    stop_mock
+    out=$(cat "$TMP_ROOT/slim-out.txt")
+}
+slim ok --log "$TMP_ROOT/slim.log"
+[[ $rc -eq 0 ]] || { tail -30 "$TMP_ROOT/slim-out.txt" "$TMP_ROOT/slim-err.txt"; fail "T17 slim exited $rc"; }
+for want in "=== harness probe slim v" "per-step reminder and old-output trim are NOT applied" \
+            "tool descriptions: slim, from proxy/proxy.py _SLIM_TOOL_DESCRIPTIONS" \
+            "bounds: main 30 steps, subagent 15 steps, 60 requests per run" \
+            "--- 1. current, sigs dropped ---" "--- 2. current, sigs kept ---" "--- 3. candidate, sigs kept ---" \
+            "S1   PASS current, sigs dropped, run 1/1" "S2   PASS current, sigs kept, run 1/1" \
+            "S3   PASS candidate, sigs kept, run 1/1" \
+            "solved=yes steps=6+2 tools=6 reads=2 grep+glob=1 reread=0 bash=1 edits=1 task=1(inner 1) todo=0" \
+            "requests=8" "trace: read tests/test_average.py -> task:explore[grep] -> read src/stats/average.py" \
+            "final: \"Fixed mean in src/stats/average.py; pytest: 6 passed" \
+            "=== slim verdict ===" "medians over 1/1/1 run(s) per arm" "keeping signatures (arm 1 -> 2): solved 1/1 -> 1/1" \
+            "candidate prompt (arm 2 -> 3): solved 1/1 -> 1/1" "caution: fewer than 3 runs per arm" \
+            "tokens used (as reported): prompt" "=== end harness probe ==="; do
+    [[ "$out" == *"$want"* ]] || { echo "$out" | tail -40; fail "T17 missing '$want' in output"; }
+done
+[[ "$out" != *"cap hit"* && "$out" != *Traceback* && ! -s "$TMP_ROOT/slim-err.txt" ]] \
+    || { echo "$out" | tail -30; cat "$TMP_ROOT/slim-err.txt"; fail "T17 unexpected cap hit, traceback or stderr"; }
+[[ $(grep -c '^### #' "$TMP_ROOT/slim.log") -eq 25 ]] || fail "T17 expected 25 requests (1 models + 3 x 8)"
+for f in "$TMP_ROOT/slim-out.txt" "$TMP_ROOT/slim.log"; do
+    for secret in "$KEY" "PROBEKEY" "tok_PROB" "$PREFIX" "secretcorp" "admin" "10.1." "127.0" ":${PORT}" \
+                  "p-123456" "ASSISTSECRET" "$ORG" "unlock.secret"; do
+        if grep -qiF -- "$secret" "$f"; then
+            grep -niF -- "$secret" "$f" | head -3 >&2
+            fail "T17 secret '$secret' leaked into $(basename "$f")"
+        fi
+    done
+done
+# The log alone carries the slim report: its report lines are exactly stdout.
+sed -n 's/^report: //p' "$TMP_ROOT/slim.log" | diff - "$TMP_ROOT/slim-out.txt" >/dev/null \
+    || fail "T17/T15 slim log's report lines differ from stdout"
+grep -qE '^### sent S2 main step6: history tool_calls=5 with extra_content=5$' "$TMP_ROOT/slim.log" \
+    || fail "T17 log lacks the per-request signature line"
+grep -qF '### tool S1 main: edit ' "$TMP_ROOT/slim.log" || fail "T17 log lacks the per-tool line"
+ok "T17 slim suite runs 3 arms to a PASS each, with metrics, a verdict and no secrets"
+
+# --- T18: signatures as the mock received them ---
+rec="$TMP_ROOT/slim-rec.txt"
+[[ $(wc -l <"$rec") -eq 24 ]] || { cat "$rec"; fail "T18 expected 24 slim requests at the mock"; }
+# Arm order: 8 requests each (main 0,1, sub 0,1, main 2..5).
+sed -n '1,8p' "$rec" | grep -qvE 'sigs=0$' && { sed -n '1,8p' "$rec"; fail "T18 arm 1 sent extra_content"; }
+sed -n '9,24p' "$rec" | awk '{split($4,a,"=");split($5,b,"="); if (a[2]!=b[2]) bad=1} END {exit bad}' \
+    || { sed -n '9,24p' "$rec"; fail "T18 arms 2/3 did not echo every signature"; }
+grep -qE '^main sys=current step=5 tcs=5 sigs=5$' "$rec" || fail "T18 arm 2 main history"
+grep -qE '^sub sys=explore step=1 tcs=1 sigs=1$' "$rec" || fail "T18 subagent history kept no signature"
+[[ $(sed -n '1,16p' "$rec" | grep -c '^main sys=current') -eq 12 && $(sed -n '17,24p' "$rec" | grep -c '^main sys=candidate') -eq 6 ]] \
+    || { cat "$rec"; fail "T18 arms 1/2 should use the current prompt and arm 3 the candidate"; }
+ok "T18 arm 1 echoes no extra_content, arms 2/3 echo all (main and subagent); arm 3 uses the candidate"
+
+# --- T19: --only, --repeat, bad --candidate / repo, stdin + --root, fallback descriptions ---
+slim ok --only 13 --repeat 2
+[[ $rc -eq 0 && $(grep -c '^S1   PASS' <<<"$out") -eq 2 && $(grep -c '^S3   PASS' <<<"$out") -eq 2 \
+   && "$out" != *"--- 2. "* && "$out" == *"medians over 2/2 run(s) per arm"* \
+   && "$out" == *"candidate prompt + signatures (arm 1 -> 3)"* && $(wc -l <"$TMP_ROOT/slim-rec.txt") -eq 32 ]] \
+    || { echo "$out" | tail -30; fail "T19 --only 13 --repeat 2: rc=$rc"; }
+slim ok --candidate "$TMP_ROOT/nope.md"
+[[ $rc -eq 2 && "$(cat "$TMP_ROOT/slim-err.txt")" == *"--candidate: no such file"* && ! -s "$TMP_ROOT/slim-out.txt" \
+   && ! -e "$TMP_ROOT/slim-rec.txt" ]] || fail "T19 missing --candidate: rc=$rc err=$(cat "$TMP_ROOT/slim-err.txt")"
+slim ok --candidate "$TMP_ROOT/nope.md" --only 1
+[[ $rc -eq 0 && "$out" == *"S1   PASS"* ]] || fail "T19 --only 1 should not need the candidate (rc=$rc)"
+mkdir -p "$TMP_ROOT/noproxy/agents"
+cp "$TMP_ROOT/agents/"*.md "$TMP_ROOT/noproxy/agents/"
+start_mock ok
+out=$(PROXY_API_URL="http://127.0.0.1:${PORT}/${PREFIX}" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" \
+      timeout 60 python3 - --suite slim --only 1 --timeout 20 <"$TMP_ROOT/scripts/probe_upstream.py" 2>&1); rc=$?
+[[ $rc -eq 2 && "$out" == *"slim suite needs the harness repo; pass --root"* ]] \
+    || { stop_mock; fail "T19 stdin without --root: rc=$rc out=$out"; }
+out=$(PROXY_API_URL="http://127.0.0.1:${PORT}/${PREFIX}" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" \
+      timeout 60 python3 - --suite slim --only 1 --timeout 20 --root "$TMP_ROOT/noproxy" \
+      <"$TMP_ROOT/scripts/probe_upstream.py" 2>&1); rc=$?
+stop_mock
+[[ $rc -eq 0 && "$out" == *"S1   PASS"* \
+   && "$out" == *"tool descriptions: the probe's own (could not extract the proxy's slim descriptions: FileNotFoundError"* ]] \
+    || { echo "$out" | tail -20; fail "T19 stdin + --root without proxy.py: rc=$rc"; }
+[[ "$out" != *"$TMP_ROOT"* ]] || fail "T19 the install path leaked into the report"
+ok "T19 --only/--repeat pick arms; a bad --candidate or missing repo errors (rc 2); stdin + --root runs with fallback"
+
+# --- T20: a model that never stops is bounded ---
+slim slimloop --only 2
+[[ $rc -eq 0 && "$out" == *"S2   FAIL"* && "$out" == *"requests=60 "* && "$out" == *"(cap hit: request cap 60)"* \
+   && "$out" == *"(cap hit x1)"* && $(wc -l <"$TMP_ROOT/slim-rec.txt") -eq 60 \
+   && $(grep -c '^sub ' "$TMP_ROOT/slim-rec.txt") -eq 56 ]] \
+    || { echo "$out" | tail -20; fail "T20 slimloop: rc=$rc requests at mock=$(wc -l <"$TMP_ROOT/slim-rec.txt")"; }
+ok "T20 a never-ending agent stops at the subagent step cap and the 60-request cap"
+
+# --- T21: 'harness probe slim' hands the clone to the suite as --root ---
+start_mock ok
+out=$(clone_dir="$TMP_ROOT/noproxy" PROXY_API_URL="http://127.0.0.1:${PORT}/${PREFIX}" PROXY_API_KEY="$KEY" \
+      DEFAULT_MODEL_NAME="mock-a" cmd_probe slim --only 1 --timeout 20 --delay-scale 0 2>&1); rc=$?
+stop_mock
+[[ $rc -eq 0 && "$out" == *"S1   PASS"* && "$out" == *"tool descriptions: the probe's own"* \
+   && -n "$(ls "$TMP_ROOT"/state/output/probe-slim-*.log 2>/dev/null)" ]] \
+    || { echo "$out" | tail -20; fail "T21 'harness probe slim': rc=$rc"; }
+ok "T21 'harness probe slim' runs the suite against the launch clone and logs to state/output/probe-slim-*"
 
 echo "PROBE TEST PASSED"

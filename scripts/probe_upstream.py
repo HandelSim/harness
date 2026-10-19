@@ -26,6 +26,14 @@ thinking_config in several wire shapes), where thought text comes back, Gemini
 thought signatures across a tool round trip, whether reasoning text sent back
 in history is billed as prompt, and whether reasoning tokens cost credits.
 
+`--suite slim` ('harness probe slim') runs only SlimProber: one fixed coding
+task in a simulated repo through a simulated opencode-like agent loop (with
+`task` subagents), comparing harness's slim prompt with Gemini thought
+signatures dropped vs echoed, and a candidate prompt (--candidate), on tool
+calls, re-reads, steps and tokens. It reads the prompts and the proxy's slim
+tool descriptions from the harness repo (--root). The proxy's per-step
+reminder and old-output trim are not applied.
+
 Output is designed to be pasted back verbatim: every printed line passes
 through Redactor, which removes the API key (and any 10+ char fragment of it),
 the base URL and its host, every URL, emails, IPs, bearer tokens, `projects/...`
@@ -37,8 +45,12 @@ See architecture/harness-cli.md -> "probe".
 """
 
 import argparse
+import ast
 import base64
+import copy
 import datetime
+import difflib
+import fnmatch
 import hashlib
 import json
 import math
@@ -46,6 +58,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import ssl
 import struct
 import sys
@@ -194,6 +207,9 @@ class Resp:
 
 _SECRET_FIELDS = {"assist_token", "session", "session_id", "conversation_id", "unlock_url", "api_key",
                   "key", "token", "access_token"}
+
+
+_SENSITIVE_HEADER = re.compile(r"cookie|authorization|authenticate|token|secret|api-key|apikey|session", re.I)
 
 
 def _scrub(obj):
@@ -449,11 +465,16 @@ class Client:
         resp_s = self.red(resp_s)
         if len(resp_s) > self.resp_max:
             resp_s = resp_s[:self.resp_max] + " ...<%d chars>" % len(resp_s)
+        # Every response header but auth/cookie/session ones: the credits and
+        # rate-limit headers answer billing questions from the log alone.
+        hdr = {k: self.red(v)[:300] for k, v in sorted((r.headers or {}).items())
+               if not _SENSITIVE_HEADER.search(k)}
         rec = [
             "### #%d %s" % (self.n, label),
             "status=%s elapsed=%.2fs ttfb=%s ctype=%s sse=%s events=%d done=%s err=%s"
             % (r.status, r.elapsed, "%.2f" % r.ttfb if r.ttfb is not None else "-", r.ctype,
                r.is_sse, r.event_count, r.done_seen, r.error),
+            "headers: " + self.red(json.dumps(hdr)),
             "request: " + req_s,
             "response: " + resp_s,
             "",
@@ -3214,6 +3235,52 @@ def _think_answer(text):
     return int(nums[-1]) if nums else None
 
 
+_SSE_STD_TOP = ("id", "object", "created", "model", "choices", "system_fingerprint")
+
+
+def _sse_layout(events, red, n=80):
+    """One compact line per SSE event: the delta keys it carried (content,
+    reasoning_content, reasoning, tool_calls and their extra_content, any
+    thought-ish key), other top-level keys, finish_reason, and the first `n`
+    chars of its text. Survives the log's response truncation, so the log
+    shows how thoughts are separated from the answer. A secret can straddle
+    events, where redacting one chunk misses it: a chunk's text is shown only
+    if it survives redaction of the whole stream unchanged."""
+    def txt(d):
+        return (_content_to_text(d.get("content")) or str(d.get("reasoning_content") or d.get("reasoning") or "")
+                if isinstance(d, dict) else "")
+    whole = red("".join(txt(ch.get("delta") or ch.get("message") or {}) for ev in events if isinstance(ev, dict)
+                        for ch in ev.get("choices") or [] if isinstance(ch, dict)))
+    out = []
+    for i, ev in enumerate(events):
+        if not isinstance(ev, dict):
+            out.append("ev%d: %s" % (i, type(ev).__name__))
+            continue
+        segs = []
+        for ch in ev.get("choices") or []:
+            if not isinstance(ch, dict):
+                continue
+            d = ch.get("delta") or ch.get("message") or {}
+            keys = [k for k in d if k != "role" and d[k] not in (None, "", [], {})] if isinstance(d, dict) else []
+            for tc in (d.get("tool_calls") or []) if isinstance(d, dict) else []:
+                for k in (tc if isinstance(tc, dict) else {}):
+                    if k in ("extra_content",) or re.search(r"thought|reason", k):
+                        keys.append("tool_calls.%s" % k)
+            if isinstance(d, dict) and isinstance(d.get("extra_content"), dict):
+                keys.append("extra_content{%s}" % ",".join(sorted(d["extra_content"])))
+            text = txt(d)
+            seg = "c%s [%s]" % (ch.get("index", 0), ",".join(keys))
+            if ch.get("finish_reason"):
+                seg += " finish=%s" % ch["finish_reason"]
+            if text:
+                seg += " " + (json.dumps(text[:n]) if text in whole and red(text) == text
+                              else "(%d chars, part of a redacted span)" % len(text))
+            segs.append(seg)
+        top = [k for k in ev if k not in _SSE_STD_TOP]
+        out.append("ev%d: %s%s" % (i, "; ".join(segs) or "no choices", (" top=[%s]" % ",".join(top)) if top else ""))
+    return out
+
+
 def _median(xs):
     xs = sorted(x for x in xs if isinstance(x, (int, float)))
     if not xs:
@@ -3450,6 +3517,9 @@ class ThinkProber(Prober):
         self.line("T5", "reasoning_effort=low + thinking_config together", r, ok)
         self.f["conflict"] = self.fail_note(r) if not r.ok else "HTTP %s, accepted" % r.status
         r, ok = self.ask("T5s stream thoughts", stream=True, **self.think_kw(include_thoughts=True, thinking_level="medium"))
+        if self.c.log:
+            lay = _sse_layout(r.events, self.red)
+            self.c.log("### T5s sse events (%d of %d kept)\n%s\n" % (len(lay), r.event_count, "\n".join(lay)))
         evs = []
         for ev in r.events:
             for ch in (ev.get("choices") or []) if isinstance(ev, dict) else []:
@@ -3646,15 +3716,877 @@ class ThinkProber(Prober):
         self.p("elapsed %.0fs" % secs)
 
 
+# --------------------------------------------------------------------------
+# Slim-prompt suite ('harness probe slim')
+# --------------------------------------------------------------------------
+
+_SLIM_ROOT = "/work/proj"
+_SLIM_TASK = "tests/test_average.py fails. Find the bug and fix it."
+# The fake project the simulated tools act on: average.py's mean divides by
+# len(xs) - 1 (the bug), median.py is correct, util.py is a distractor.
+_SLIM_REPO = {
+    "AGENTS.md": (
+        "# stats: agent notes\n\n"
+        "- Python 3.8+, standard library only: no new dependencies.\n"
+        "- Package code is in src/stats/, tests in tests/ (pytest).\n"
+        "- Run the tests with `python -m pytest -q` from the repo root.\n"
+        "- Fix the code, not the tests, unless a test is wrong.\n"
+        "- Public functions keep type hints and a one-line docstring.\n"),
+    "README.md": "# stats\n\nTiny statistics helpers: `mean` and `median`.\n\n```\npython -m pytest -q\n```\n",
+    "pyproject.toml": ('[project]\nname = "stats"\nversion = "0.1.0"\nrequires-python = ">=3.8"\n\n'
+                       '[tool.pytest.ini_options]\npythonpath = ["src"]\ntestpaths = ["tests"]\n'),
+    "src/stats/__init__.py": ('"""Tiny statistics helpers."""\nfrom .average import mean\nfrom .median import median\n\n'
+                              '__all__ = ["mean", "median"]\n'),
+    "src/stats/average.py": ('"""Arithmetic mean."""\nfrom typing import Sequence\n\nfrom .util import check_numbers\n\n\n'
+                             'def mean(xs: Sequence[float]) -> float:\n    """Return the arithmetic mean of xs."""\n'
+                             '    check_numbers(xs)\n    return sum(xs) / (len(xs) - 1)\n'),
+    "src/stats/median.py": ('"""Median."""\nfrom typing import Sequence\n\nfrom .util import check_numbers\n\n\n'
+                            'def median(xs: Sequence[float]) -> float:\n    """Return the median of xs."""\n'
+                            '    check_numbers(xs)\n    s = sorted(xs)\n    mid = len(s) // 2\n    if len(s) % 2:\n'
+                            '        return s[mid]\n    return (s[mid - 1] + s[mid]) / 2\n'),
+    "src/stats/util.py": ('"""Shared helpers."""\nfrom typing import Sequence\n\n\n'
+                          'def check_numbers(xs: Sequence[float]) -> None:\n'
+                          '    """Raise unless xs is a non-empty sequence of numbers."""\n'
+                          '    if len(xs) == 0:\n        raise ValueError("need at least one number")\n'
+                          '    for x in xs:\n        if not isinstance(x, (int, float)):\n'
+                          '            raise TypeError("not a number: %r" % (x,))\n\n\n'
+                          'def clamp(x: float, lo: float, hi: float) -> float:\n'
+                          '    """Limit x to the range [lo, hi]."""\n    return max(lo, min(hi, x))\n'),
+    "tests/test_average.py": ('import pytest\n\nfrom stats import mean\n\n\ndef test_mean_simple():\n'
+                              '    assert mean([1, 2, 3, 4]) == 2.5\n\n\ndef test_mean_single():\n'
+                              '    assert mean([7]) == 7\n\n\ndef test_mean_empty():\n'
+                              '    with pytest.raises(ValueError):\n        mean([])\n'),
+    "tests/test_median.py": ('import pytest\n\nfrom stats import median\n\n\ndef test_median_odd():\n'
+                             '    assert median([3, 1, 2]) == 2\n\n\ndef test_median_even():\n'
+                             '    assert median([4, 1, 3, 2]) == 2.5\n\n\ndef test_median_empty():\n'
+                             '    with pytest.raises(ValueError):\n        median([])\n'),
+}
+# Stand-in for opencode's `explore` subagent prompt: opencode's real one ships
+# inside opencode, not in this repo (harness leaves explore's prompt alone).
+_SLIM_EXPLORE_PROMPT = (
+    "You are a file search specialist subagent. Answer the task you were given with read-only searches of "
+    "the codebase (glob, grep, list, read). Do not create or modify files. Prefer one targeted search over "
+    "many reads. Your final message is the only thing the calling agent receives: give the answer with "
+    "absolute paths and line numbers, short and complete.")
+# opencode appends its subagent list to the `task` description (the proxy's
+# slim description keeps that part). Paraphrased: the exact text is opencode's.
+_SLIM_AGENTS_LIST = (
+    "Available agent types and the tools they have access to:\n"
+    "- general: General-purpose agent for researching complex questions and executing multi-step tasks, "
+    "including edits. (Tools: read, grep, glob, list, edit, write, bash)\n"
+    "- explore: Fast read-only agent for exploring codebases: find files by pattern, search code for "
+    "keywords, answer questions about the code. (Tools: read, grep, glob, list)")
+_SLIM_TOOLSETS = {
+    "main": ("read", "grep", "glob", "list", "edit", "write", "bash", "todowrite", "task"),
+    "general": ("read", "grep", "glob", "list", "edit", "write", "bash"),
+    "explore": ("read", "grep", "glob", "list"),
+}
+# (digit, title, prompt, echo thought signatures)
+_SLIM_ARMS = (("1", "current, sigs dropped", "current", False),
+              ("2", "current, sigs kept", "current", True),
+              ("3", "candidate, sigs kept", "candidate", True))
+
+
+def _slim_descriptions(path):
+    """The proxy's `_SLIM_TOOL_DESCRIPTIONS` dict, read from proxy.py's text
+    with ast (never imported: the proxy needs flask). (dict, "") or (None, why)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+    except OSError as e:  # no absolute path in the report
+        return None, "%s: %s: proxy/proxy.py" % (type(e).__name__, e.strerror)
+    except (SyntaxError, ValueError) as e:
+        return None, "%s parsing proxy/proxy.py" % type(e).__name__
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if value is None or not any(isinstance(t, ast.Name) and t.id == "_SLIM_TOOL_DESCRIPTIONS" for t in targets):
+            continue
+        try:
+            d = ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError) as e:
+            return None, "_SLIM_TOOL_DESCRIPTIONS is not a literal (%s)" % e
+        if isinstance(d, dict) and d and all(isinstance(k, str) and isinstance(v, str) for k, v in d.items()):
+            return d, ""
+        return None, "_SLIM_TOOL_DESCRIPTIONS is not a dict of strings"
+    return None, "_SLIM_TOOL_DESCRIPTIONS not found"
+
+
+def _as_int(v, d):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return d
+
+
+def _brace(pat):
+    m = re.search(r"\{([^{}]*)\}", pat)
+    if not m:
+        return [pat]
+    return [x for alt in m.group(1).split(",") for x in _brace(pat[:m.start()] + alt + pat[m.end():])]
+
+
+def _glob_rx(pat):
+    out, i = "", 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pat.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pat[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pat[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(pat[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def _glob_match(pat, rel):
+    """`rel` (a path relative to the search dir, or absolute for an absolute
+    pattern) against a glob with ** and {a,b}; a pattern without '/' matches
+    the basename anywhere, like rg --glob."""
+    return any(_glob_rx(p).match(rel if "/" in p else rel.rsplit("/", 1)[-1]) for p in _brace(str(pat)))
+
+
+def _slim_rel(p):
+    return p[len(_SLIM_ROOT) + 1:] if p.startswith(_SLIM_ROOT + "/") else p
+
+
+def _lineno(text, needle, d="?"):
+    for i, ln in enumerate((text or "").split("\n"), 1):
+        if needle in ln:
+            return i
+    return d
+
+
+class _SlimEnv:
+    """The fake project in memory, and opencode-shaped tool results over it.
+    Edits must follow a read of the file in the same session (opencode's
+    FileTime check), so a subagent's read does not cover the main agent."""
+
+    _BUG = re.compile(r"len\(\s*xs\s*\)\s*-\s*1")
+
+    def __init__(self):
+        self.files = {_SLIM_ROOT + "/" + k: v for k, v in _SLIM_REPO.items()}
+        self.orig = dict(self.files)
+        self.ver = dict.fromkeys(self.files, 0)
+
+    # ---- paths ----
+    def path(self, p, cwd=_SLIM_ROOT):
+        p = str(p or "").strip() or cwd
+        if not p.startswith("/"):
+            p = cwd.rstrip("/") + "/" + p
+        parts = []
+        for seg in p.split("/"):
+            if seg == "..":
+                if parts:
+                    parts.pop()
+            elif seg not in ("", "."):
+                parts.append(seg)
+        return "/" + "/".join(parts)
+
+    def is_dir(self, p):
+        return any(f.startswith(p.rstrip("/") + "/") for f in self.files)
+
+    def under(self, p):
+        if p in self.files:
+            return [p]
+        return sorted(f for f in self.files if f.startswith(p.rstrip("/") + "/"))
+
+    def entries(self, p):
+        pre = p.rstrip("/") + "/"
+        return sorted({f[len(pre):].split("/")[0] + ("/" if "/" in f[len(pre):] else "")
+                       for f in self.files if f.startswith(pre)})
+
+    # ---- state ----
+    def fixed(self):
+        """mean no longer divides by len(xs) - 1 but by len(xs) (or a name
+        bound to it, or the statistics module). Judged on the text: the probe
+        never runs model-written code."""
+        t = self.files.get(_SLIM_ROOT + "/src/stats/average.py", "")
+        if "def mean" not in t or self._BUG.search(t):
+            return False
+        if re.search(r"/\s*\(?\s*len\(\s*xs\s*\)\s*\)?", t) or re.search(r"\bstatistics\.f?mean\(", t):
+            return True
+        m = re.search(r"^\s*(\w+)\s*=\s*len\(\s*xs\s*\)\s*$", t, re.M)
+        return bool(m and re.search(r"/\s*\(?\s*%s\b(?!\s*-)" % re.escape(m.group(1)), t))
+
+    def solved(self):
+        tests = [_SLIM_ROOT + "/tests/test_average.py", _SLIM_ROOT + "/tests/test_median.py"]
+        return self.fixed() and all(self.files.get(p) == self.orig[p] for p in tests)
+
+    def stale(self, p, ctx):
+        if p not in ctx["read"]:
+            return "Error: You must read file %s before overwriting it. Use the Read tool first" % p
+        if ctx["read"][p] != self.ver.get(p):
+            return ("Error: File %s has been modified since it was last read.\nLast modification: now\n"
+                    "Please read the file again before modifying it." % p)
+        return ""
+
+    def put(self, p, text, ctx):
+        self.files[p] = text
+        self.ver[p] = self.ver.get(p, -1) + 1
+        ctx["read"][p] = self.ver[p]
+
+    # ---- tools ----
+    def t_read(self, a, ctx):
+        p = self.path(a.get("filePath"))
+        if p not in self.files:
+            if self.is_dir(p):
+                ents = self.entries(p)
+                return "<path>%s</path>\n<type>directory</type>\n<entries>\n%s\n\n(%d entries)\n</entries>" % (
+                    p, "\n".join(ents), len(ents))
+            return "Error: File not found: %s" % p
+        lines = self.files[p].split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        off = max(1, _as_int(a.get("offset"), 1))
+        lim = max(1, _as_int(a.get("limit"), 2000))
+        if off > len(lines):
+            return "Error: Offset %d is out of range for this file (%d lines)" % (off, len(lines))
+        chunk = lines[off - 1:off - 1 + lim]
+        end = off - 1 + len(chunk)
+        tail = ("(File has more lines. Use 'offset' parameter to read beyond line %d)" % end if end < len(lines)
+                else "(End of file - total %d lines)" % len(lines))
+        ctx["read"][p] = self.ver[p]
+        return "<path>%s</path>\n<type>file</type>\n<content>\n%s\n\n%s\n</content>" % (
+            p, "\n".join("%d: %s" % (off + i, ln) for i, ln in enumerate(chunk)), tail)
+
+    def t_edit(self, a, ctx):
+        p = self.path(a.get("filePath"))
+        old, new = a.get("oldString"), a.get("newString")
+        if not isinstance(old, str) or not isinstance(new, str):
+            return "Error: oldString and newString must be strings"
+        if old == new:
+            return "Error: oldString and newString must be different"
+        if old == "":
+            return self.t_write({"filePath": p, "content": new}, ctx)
+        if p not in self.files:
+            return "Error: File %s not found" % p
+        err = self.stale(p, ctx)
+        if err:
+            return err
+        t = self.files[p]
+        n = t.count(old)
+        if n == 1 or (n > 1 and a.get("replaceAll")):
+            self.put(p, t.replace(old, new) if a.get("replaceAll") else t.replace(old, new, 1), ctx)
+            return "Edit applied successfully."
+        if n > 1:
+            return ("Error: Found multiple matches for oldString. Provide more surrounding lines in oldString "
+                    "to identify the correct match.")
+        # One of opencode's fallbacks: the same lines, ignoring each line's
+        # leading/trailing whitespace.
+        tl, ol = t.split("\n"), old.split("\n")
+        while ol and not ol[-1].strip():
+            ol.pop()
+        hits = [i for i in range(len(tl) - len(ol) + 1)
+                if ol and all(tl[i + j].strip() == ol[j].strip() for j in range(len(ol)))]
+        if len(hits) == 1:
+            i = hits[0]
+            self.put(p, "\n".join(tl[:i] + [new.rstrip("\n")] + tl[i + len(ol):]), ctx)
+            return "Edit applied successfully."
+        return "Error: oldString not found in content"
+
+    def t_write(self, a, ctx):
+        p = self.path(a.get("filePath"))
+        c = a.get("content")
+        if not isinstance(c, str):
+            return "Error: content must be a string"
+        if p in self.files:
+            err = self.stale(p, ctx)
+            if err:
+                return err
+        self.put(p, c, ctx)
+        return "Wrote file successfully."
+
+    def t_grep(self, a):
+        try:
+            rx = re.compile(str(a.get("pattern") or ""))
+        except re.error as e:
+            return "Error: invalid regex: %s" % e
+        base = self.path(a.get("path"))
+        inc = a.get("include")
+        hits = []
+        for f in self.under(base):
+            if inc and not _glob_match(inc, f[len(base.rstrip("/")) + 1:] if f != base else f):
+                continue
+            for i, ln in enumerate(self.files[f].split("\n"), 1):
+                if rx.search(ln):
+                    hits.append("%s:%d: %s" % (f, i, ln))
+        if not hits:
+            return "No files found"
+        more = "\n\n(Results are truncated. Consider using a more specific path or pattern.)" if len(hits) > 100 else ""
+        return "Found %d matches\n%s%s" % (len(hits), "\n".join(hits[:100]), more)
+
+    def t_glob(self, a):
+        base = self.path(a.get("path"))
+        pat = str(a.get("pattern") or "")
+        got = [f for f in self.under(base)
+               if _glob_match(pat, f if pat.startswith("/") else f[len(base.rstrip("/")) + 1:])]
+        return "\n".join(got) if got else "No files found"
+
+    def t_list(self, a):
+        base = self.path(a.get("path"))
+        if not self.is_dir(base):
+            return "Error: %s is not a directory" % base
+        out = [base.rstrip("/") + "/"]
+
+        def walk(d, depth):
+            for e in self.entries(d):
+                out.append("  " * depth + e)
+                if e.endswith("/"):
+                    walk(d.rstrip("/") + "/" + e[:-1], depth + 1)
+        walk(base, 1)
+        return "\n".join(out)
+
+    def t_bash(self, a):
+        cmd = str(a.get("command") or "")
+        cwd = self.path(a.get("workdir")) if a.get("workdir") else _SLIM_ROOT
+        if "pytest" in cmd:
+            return self.pytest(cmd)
+        outs = []
+        for seg in re.split(r"&&|\|\||;", cmd):
+            seg = seg.split("|")[0].strip()  # a pipeline runs its first command only
+            try:
+                argv = shlex.split(seg)
+            except ValueError:
+                argv = seg.split()
+            if not argv:
+                continue
+            if argv[0] == "cd":
+                cwd = self.path(argv[1] if len(argv) > 1 else _SLIM_ROOT, cwd)
+                continue
+            o = self.sh(argv, cwd)
+            if o:
+                outs.append(o)
+        return "\n".join(outs) or "(no output)"
+
+    def sh(self, argv, cwd):
+        """Plausible minimal output for the commands a model reaches for;
+        anything else prints nothing."""
+        cmd, args = argv[0], argv[1:]
+        files = [x for x in args if not x.startswith("-")]
+        if cmd in ("cat", "head", "tail", "wc", "sed"):
+            n = 10
+            for i, x in enumerate(args):
+                if x == "-n" and i + 1 < len(args):
+                    n = _as_int(args[i + 1], 10)
+                elif re.match(r"^-n?\d+$", x):
+                    n = _as_int(x.lstrip("-n"), 10)
+            rng = None
+            if cmd == "sed":
+                m = re.match(r"^(\d+)(?:,(\d+))?p$", files[0]) if files else None
+                if not m:
+                    return ""
+                rng, files = (int(m.group(1)), int(m.group(2) or m.group(1))), files[1:]
+            out = []
+            for f in files:
+                if cmd in ("head", "tail") and str(n) == f:
+                    continue
+                p = self.path(f, cwd)
+                if p not in self.files:
+                    out.append("%s: %s: No such file or directory" % (cmd, f))
+                    continue
+                lines = self.files[p].split("\n")[:-1] if self.files[p].endswith("\n") else self.files[p].split("\n")
+                if cmd == "wc":
+                    out.append("%d %s" % (len(lines), f))
+                else:
+                    sel = (lines[:n] if cmd == "head" else lines[-n:] if cmd == "tail"
+                           else lines[rng[0] - 1:rng[1]] if rng else lines)
+                    out.append("\n".join(sel))
+            return "\n".join(out)
+        if cmd == "ls":
+            out = []
+            for f in files or ["."]:
+                p = self.path(f, cwd)
+                out.append(f if p in self.files else "\n".join(e.rstrip("/") for e in self.entries(p))
+                           if self.is_dir(p) else "ls: cannot access '%s': No such file or directory" % f)
+            return "\n".join(out)
+        if cmd in ("grep", "rg"):
+            flags, rest, inc, i = "", [], None, 0
+            while i < len(args):
+                x = args[i]
+                if x in ("-e", "--regexp") and i + 1 < len(args):
+                    rest.insert(0, args[i + 1])
+                    i += 1
+                elif x.startswith("--include=") or x.startswith("--glob="):
+                    inc = x.split("=", 1)[1]
+                elif x in ("-g", "--glob", "--include") and i + 1 < len(args):
+                    inc, i = args[i + 1], i + 1
+                elif x.startswith("--"):
+                    pass
+                elif x.startswith("-") and len(x) > 1:
+                    flags += x[1:]
+                else:
+                    rest.append(x)
+                i += 1
+            if not rest:
+                return ""
+            pat = re.escape(rest[0]) if "F" in flags else rest[0]
+            try:
+                rx = re.compile(pat, re.I if "i" in flags else 0)
+            except re.error:
+                return "%s: invalid regex" % cmd
+            show_n = cmd == "rg" or "n" in flags
+            out = []
+            for f in rest[1:] or ["."]:
+                base = self.path(f, cwd)
+                for p in self.under(base):
+                    if inc and not _glob_match(inc, p[len(cwd) + 1:] if p.startswith(cwd + "/") else p):
+                        continue
+                    shown = p if f.startswith("/") else (p[len(cwd) + 1:] if p.startswith(cwd + "/") else p)
+                    hits = [(k, ln) for k, ln in enumerate(self.files[p].split("\n"), 1) if rx.search(ln)]
+                    if hits and "l" in flags:
+                        out.append(shown)
+                    else:
+                        out += ["%s:%s%s" % (shown, ("%d:" % k) if show_n else "", ln) for k, ln in hits]
+            return "\n".join(out)
+        if cmd == "find":
+            base = files[0] if files else "."
+            name = args[args.index("-name") + 1] if "-name" in args and args.index("-name") + 1 < len(args) else "*"
+            root = self.path(base, cwd)
+            return "\n".join((base.rstrip("/") + p[len(root):]) for p in self.under(root)
+                             if fnmatch.fnmatch(p.rsplit("/", 1)[-1], name))
+        if cmd == "git":
+            sub = files[0] if files else ""
+            changed = sorted(p for p in self.files if self.files[p] != self.orig.get(p))
+            if sub == "status":
+                if not changed:
+                    return "On branch main\nnothing to commit, working tree clean"
+                return "On branch main\nChanges not staged for commit:\n" + "\n".join(
+                    "\t%s:   %s" % ("modified" if p in self.orig else "new file", _slim_rel(p)) for p in changed)
+            if sub == "diff":
+                return "".join("diff --git a/%s b/%s\n" % (_slim_rel(p), _slim_rel(p)) + "".join(difflib.unified_diff(
+                    self.orig.get(p, "").splitlines(True), self.files[p].splitlines(True),
+                    "a/" + _slim_rel(p), "b/" + _slim_rel(p))) for p in changed)
+            if sub == "log":
+                return "3f2c1ab (HEAD -> main) Add mean and median"
+            return ""
+        if cmd == "echo":
+            return " ".join(args)
+        return ""
+
+    def pytest(self, cmd):
+        """A simulated pytest run: average.py's tests pass once the bug is
+        fixed (judged on the text), else a realistic failure."""
+        av, med = _SLIM_ROOT + "/tests/test_average.py", _SLIM_ROOT + "/tests/test_median.py"
+        sel = [("tests/test_average.py", av), ("tests/test_median.py", med)]
+        if "test_median" in cmd and "test_average" not in cmd:
+            sel = sel[1:]
+        elif "test_average" in cmd and "test_median" not in cmd:
+            sel = sel[:1]
+        ok = self.fixed() or all(n != "tests/test_average.py" for n, _ in sel)
+        head = ("============================= test session starts ==============================\n"
+                "platform linux -- Python 3.11.9, pytest-8.3.2, pluggy-1.5.0\nrootdir: %s\n"
+                "configfile: pyproject.toml\ncollected %d items\n\n" % (_SLIM_ROOT, 3 * len(sel)))
+        prog = []
+        for k, (name, _) in enumerate(sel):
+            marks = "..." if ok or name != "tests/test_average.py" else ("FF." if self._BUG.search(
+                self.files.get(_SLIM_ROOT + "/src/stats/average.py", "")) else "F..")
+            prog.append("%s %s%s[%3d%%]" % (name, marks, " " * (72 - len(name) - len(marks)), 100 * (k + 1) // len(sel)))
+        if ok:
+            n = 3 * len(sel)
+            return head + "\n".join(prog) + "\n\n" + ("=" * 30 + " %d passed in 0.02s " % n + "=" * 31)
+        src = self.files.get(_SLIM_ROOT + "/src/stats/average.py", "")
+        ta = self.files.get(av, "")
+        l1, l2 = _lineno(ta, "assert mean([1, 2, 3, 4])"), _lineno(ta, "assert mean([7])")
+        if self._BUG.search(src):
+            lb = _lineno(src, "len(xs) - 1")
+            fail = ("_______________________________ test_mean_simple _______________________________\n\n"
+                    "    def test_mean_simple():\n>       assert mean([1, 2, 3, 4]) == 2.5\n"
+                    "E       assert 3.3333333333333335 == 2.5\nE        +  where 3.3333333333333335 = mean([1, 2, 3, 4])\n\n"
+                    "tests/test_average.py:%s: AssertionError\n"
+                    "_______________________________ test_mean_single _______________________________\n\n"
+                    "    def test_mean_single():\n>       assert mean([7]) == 7\n\ntests/test_average.py:%s: \n"
+                    "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\nxs = [7]\n\n"
+                    "    def mean(xs: Sequence[float]) -> float:\n        \"\"\"Return the arithmetic mean of xs.\"\"\"\n"
+                    "        check_numbers(xs)\n>       return sum(xs) / (len(xs) - 1)\n"
+                    "E       ZeroDivisionError: division by zero\n\nsrc/stats/average.py:%s: ZeroDivisionError\n"
+                    "=========================== short test summary info ============================\n"
+                    "FAILED tests/test_average.py::test_mean_simple - assert 3.3333333333333335 == 2.5\n"
+                    "FAILED tests/test_average.py::test_mean_single - ZeroDivisionError: division by zero\n"
+                    "========================= 2 failed, %d passed in 0.03s ==========================" % (
+                        l1, l2, lb, 3 * len(sel) - 2))
+        else:
+            fail = ("_______________________________ test_mean_simple _______________________________\n\n"
+                    "    def test_mean_simple():\n>       assert mean([1, 2, 3, 4]) == 2.5\nE       AssertionError\n\n"
+                    "tests/test_average.py:%s: AssertionError\n"
+                    "=========================== short test summary info ============================\n"
+                    "FAILED tests/test_average.py::test_mean_simple - AssertionError\n"
+                    "========================= 1 failed, %d passed in 0.03s ==========================" % (
+                        l1, 3 * len(sel) - 1))
+        return (head + "\n".join(prog) + "\n\n=================================== FAILURES ==================================="
+                "\n" + fail)
+
+
+class SlimProber(Prober):
+    """Does harness's slim system prompt make the model over-read/over-grep,
+    and does dropping Gemini thought signatures between tool steps (what
+    opencode does) change behaviour? One fixed coding task ("tests fail, fix
+    the bug") in a simulated repo, through a simulated opencode-like agent
+    loop with `task` subagents, under three arms: the current prompt with
+    signatures dropped, the same with signatures echoed, and a candidate
+    prompt with signatures echoed. Requests go straight to the upstream,
+    non-streamed: the proxy's per-step reminder and old-output trim are NOT
+    applied, so absolute numbers understate a real slim session; the
+    comparison between arms is what it measures."""
+
+    MAIN_STEPS, SUB_STEPS, REQ_CAP = 30, 15, 60
+    KEYS = ("steps", "sub_steps", "tools", "reads", "greps", "rereads", "bash", "edits", "tasks", "inner",
+            "pt", "rt", "ct", "requests", "wall", "credits")
+
+    def __init__(self, args, client, red, out):
+        super().__init__(args, client, red, out)
+        self.root = args.root
+        self.runs = {}       # arm digit -> [run dict, ...]
+        self.left = None     # last x-ratelimit-remaining-credits-day seen
+        self.prompts = {}
+        self.tools, self.desc_note = self.build_tools()
+
+    def on(self, s):
+        return not self.a.only or s in self.a.only
+
+    def rel(self, p):
+        p = os.path.abspath(p)
+        r = os.path.relpath(p, os.path.abspath(self.root))
+        return r if not r.startswith("..") else os.path.basename(p)
+
+    def build_tools(self):
+        by = {t["function"]["name"]: t for t in OPENCODE_TOOLS}
+        tools = {n: copy.deepcopy(by[n]) for n in _SLIM_TOOLSETS["main"]}
+        tools["bash"]["function"]["parameters"]["properties"]["workdir"] = {
+            "type": "string", "description": "The working directory to run the command in (default: the project root)"}
+        tools["read"]["function"]["parameters"]["properties"]["offset"]["description"] = \
+            "The line number to start reading from (1-based)"
+        desc, why = _slim_descriptions(os.path.join(self.root, "proxy", "proxy.py"))
+        if desc:
+            n = 0
+            for name, t in tools.items():
+                if name in desc:
+                    t["function"]["description"] = desc[name]
+                    n += 1
+            note = "slim, from proxy/proxy.py _SLIM_TOOL_DESCRIPTIONS (%d of %d tools)" % (n, len(tools))
+        else:
+            note = "the probe's own (could not extract the proxy's slim descriptions: %s)" % why
+        tools["task"]["function"]["description"] += "\n\n" + _SLIM_AGENTS_LIST
+        return tools, note
+
+    def system(self, run, kind):
+        prompt = {"main": self.prompts.get(run["prompt"], ""), "general": self.prompts.get("sub", ""),
+                  "explore": _SLIM_EXPLORE_PROMPT}[kind]
+        env = ("Here is some useful information about the environment you are running in:\n<env>\n"
+               "  Working directory: %s\n  Is directory a git repo: yes\n  Platform: linux\n  Today's date: %s\n</env>"
+               % (_SLIM_ROOT, datetime.date.today().strftime("%a %b %d %Y")))
+        return "\n\n".join([prompt.strip(), env, "Instructions from: %s/AGENTS.md\n%s" % (_SLIM_ROOT, _SLIM_REPO["AGENTS.md"])])
+
+    @staticmethod
+    def extras(r):
+        """extra_content per tool call (by position) and on the message, as received."""
+        if not isinstance(r.json, dict):
+            return [], None
+        ch = (r.json.get("choices") or [{}])[0]
+        msg = (ch.get("message") or {}) if isinstance(ch, dict) else {}
+        return [(tc.get("extra_content") if isinstance(tc, dict) else None)
+                for tc in msg.get("tool_calls") or []], msg.get("extra_content")
+
+    # ---- run ----
+    def run(self):
+        t0 = time.monotonic()
+        arms = [a for a in _SLIM_ARMS if self.on(a[0])]
+        for key, path in (("current", os.path.join(self.root, "agents", "slim-prompt.md")),
+                          ("candidate", self.a.candidate),
+                          ("sub", os.path.join(self.root, "agents", "slim-subagent-prompt.md"))):
+            if key == "sub" or any(a[2] == key for a in arms):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        self.prompts[key] = fh.read()
+                except OSError as e:
+                    raise SystemExit("slim: cannot read the %s prompt %s: %s" % (key, self.rel(path), e.strerror))
+        self.p("=== harness probe slim v%s (redacted; safe to paste) ===" % VERSION)
+        self.p("date_utc=%s python=%s model=%s repeat=%d arms=%s"
+               % (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
+                  platform.python_version(), self.model, self.a.repeat, "".join(a[0] for a in arms)))
+        self.p("task: %s (simulated %d-file Python project at %s; mean divides by len(xs) - 1)"
+               % (self.excerpt(_SLIM_TASK), len(_SLIM_REPO), _SLIM_ROOT))
+        self.p("NOTE: direct upstream, non-streamed: the proxy's per-step reminder and old-output trim are NOT "
+               "applied, so absolute numbers understate a real slim session; the comparison between arms is what "
+               "this measures")
+        self.p("system prompt = the arm's prompt + an opencode-style <env> block + AGENTS.md as opencode appends it; "
+               "subagents: general = agents/slim-subagent-prompt.md, explore = a stand-in (opencode's own explore "
+               "prompt is not in this repo)")
+        self.p("prompts: current=agents/slim-prompt.md candidate=%s" % self.rel(self.a.candidate))
+        self.p("tool descriptions: %s" % self.desc_note)
+        self.p("bounds: main %d steps, subagent %d steps, %d requests per run"
+               % (self.MAIN_STEPS, self.SUB_STEPS, self.REQ_CAP))
+        self.p("counts: main + subagent tool calls; reread = a file read again anywhere in the run; "
+               "edits = edit + write; steps = main+subagent requests")
+        r = self.c.request("/v1/models", method="GET", label="S0 models")
+        if r.status in (401, 403) and "unlock" in (r.text or "").lower():
+            raise SystemExit("aborting: the API key is LOCKED. Run 'harness unlock', unlock it in the "
+                             "browser, then re-run 'harness probe slim'.")
+        if r.ok:
+            self.read_weights(r)
+        self.left = ThinkProber.credits_left(self, r)
+        for d, title, prompt, keep in arms:
+            self.section("%s. %s" % (d, title))
+            for i in range(max(1, self.a.repeat)):
+                run = self.run_arm(d, prompt, keep)
+                self.runs.setdefault(d, []).append(run)
+                self.show(run, title, i, max(1, self.a.repeat))
+        self.summary(time.monotonic() - t0)
+
+    def run_arm(self, d, prompt, keep):
+        run = dict.fromkeys(self.KEYS, 0)
+        run.update({"tid": "S%s" % d, "prompt": prompt, "keep": keep, "env": _SlimEnv(), "seen": set(),
+                    "trace": [], "ids": 0, "n_sub": 0, "subcap": 0, "edit_fail": 0, "todo": 0, "cap": "",
+                    "err": "", "final": "", "sigs_sent": (0, 0), "credits": None})
+        left0 = self.left
+        t0 = time.monotonic()
+        final = self.agent(run, "main", _SLIM_TASK, run["trace"])
+        run["wall"] = time.monotonic() - t0
+        run["final"] = final or ""
+        run["solved"] = run["env"].solved()
+        if left0 is not None and self.left is not None:
+            run["credits"] = left0 - self.left
+        if self.c.log:
+            self.c.log("### %s run end: solved=%s cap=%s err=%s\nfinal: %s\naverage.py now:\n%s\n" % (
+                run["tid"], run["solved"], run["cap"], run["err"], run["final"],
+                run["env"].files.get(_SLIM_ROOT + "/src/stats/average.py", "(deleted)")))
+        return run
+
+    def req(self, run, msgs, tools, label):
+        tcs = [c for m in msgs if m.get("role") == "assistant" for c in m.get("tool_calls") or []]
+        sent = (len(tcs), sum(1 for c in tcs if c.get("extra_content")))
+        run["sigs_sent"] = max(run["sigs_sent"], sent)
+        if self.c.log:
+            self.c.log("### sent %s: history tool_calls=%d with extra_content=%d" % ((label,) + sent))
+        r = None
+        for attempt in range(3):
+            if run["requests"] >= self.REQ_CAP:
+                break
+            run["requests"] += 1
+            r = self.chat(msgs, label + (" retry%d" % attempt if attempt else ""), tools=tools)
+            run["pt"] += ThinkProber.utok(r, "prompt_tokens") or 0
+            run["ct"] += ThinkProber.utok(r, "completion_tokens") or 0
+            run["rt"] += ThinkProber.rtok(r) or 0
+            left = ThinkProber.credits_left(self, r)
+            if left is not None:
+                self.left = left
+            if r.ok or not (r.status is None or r.status == 429 or r.status >= 500):
+                return r
+            e = (r.json.get("error") if isinstance(r.json, dict) else None) or {}
+            ra = _as_int((e.get("retry_after_seconds") if isinstance(e, dict) else None)
+                         or (r.headers or {}).get("retry-after"), 5 * (attempt + 1))
+            time.sleep(min(60, max(1, ra)) * self.a.delay_scale)
+        return r
+
+    def agent(self, run, kind, user, trace):
+        """One agent loop (main or a `task` subagent). Returns its final text,
+        or None when the run stopped (request error, cap)."""
+        sub = kind != "main"
+        msgs = [{"role": "system", "content": self.system(run, kind)}, {"role": "user", "content": user}]
+        tools = [self.tools[n] for n in _SLIM_TOOLSETS[kind]]
+        ctx = {"read": {}, "kind": kind}
+        cap = self.SUB_STEPS if sub else self.MAIN_STEPS
+        for step in range(cap):
+            if run["err"] or run["cap"]:
+                return None
+            if run["requests"] >= self.REQ_CAP:
+                run["cap"] = "request cap %d" % self.REQ_CAP
+                return None
+            r = self.req(run, msgs, tools, "%s %s step%d" % (run["tid"], ("%s#%d" % (kind, run["n_sub"])) if sub else kind,
+                                                            step + 1))
+            run["sub_steps" if sub else "steps"] += 1
+            if r is None or not r.ok:
+                if r is None:
+                    run["cap"] = "request cap %d" % self.REQ_CAP
+                else:
+                    run["err"] = self.fail_note(r)
+                return None
+            if not r.tool_calls:
+                return r.content or ""
+            extras, mextra = self.extras(r)
+            calls, results = [], []
+            for i, tc in enumerate(r.tool_calls):
+                run["ids"] += 1
+                # Keep the upstream's id (real ones are unique strings).
+                cid = tc["id"] or "call_%s_%d" % (run["tid"].lower(), run["ids"])
+                arg_s = tc["arguments"] if isinstance(tc["arguments"], str) else json.dumps(tc["arguments"])
+                call = {"id": cid, "type": "function", "function": {"name": tc["name"], "arguments": arg_s}}
+                if run["keep"] and i < len(extras) and extras[i]:
+                    call["extra_content"] = extras[i]
+                calls.append(call)
+                args = tc["args"] if isinstance(tc["args"], dict) else None
+                out = self.tool(run, ctx, tc["name"] or "", args, trace)
+                if self.c.log:
+                    o = self.red(out)
+                    self.c.log("### tool %s %s: %s %s -> %d chars: %s" % (
+                        run["tid"], kind, tc["name"], self.red(arg_s)[:300], len(out), json.dumps(o[:160])))
+                results.append({"role": "tool", "tool_call_id": cid, "content": out})
+            am = {"role": "assistant", "content": r.content or None, "tool_calls": calls}
+            if run["keep"] and mextra:
+                am["extra_content"] = mextra
+            msgs = msgs + [am] + results
+        if sub:
+            run["subcap"] += 1
+            return "(the subagent hit its %d-step limit before finishing)" % cap
+        run["cap"] = run["cap"] or "main step cap %d" % cap
+        return None
+
+    def tool(self, run, ctx, name, args, trace):
+        env, kind = run["env"], ctx["kind"]
+        run["tools"] += 1
+        if kind != "main":
+            run["inner"] += 1
+        if name not in _SLIM_TOOLSETS[kind]:
+            trace.append("%s?" % name)
+            return "Error: tool '%s' is not available. Available tools: %s" % (name, ", ".join(_SLIM_TOOLSETS[kind]))
+        if args is None:
+            trace.append("%s[BAD-JSON]" % name)
+            return "Error: the arguments for tool '%s' are not valid JSON" % name
+        if name == "read":
+            run["reads"] += 1
+            p = env.path(args.get("filePath"))
+            if p in env.files:
+                run["rereads"] += 1 if p in run["seen"] else 0
+                run["seen"].add(p)
+            trace.append("read %s%s" % (_slim_rel(p), ("@%s" % args["offset"]) if args.get("offset") else ""))
+            return env.t_read(args, ctx)
+        if name in ("grep", "glob"):
+            run["greps"] += 1
+            trace.append("%s %s" % (name, json.dumps(str(args.get("pattern") or ""))[:40]))
+            return env.t_grep(args) if name == "grep" else env.t_glob(args)
+        if name == "list":
+            trace.append("list %s" % _slim_rel(env.path(args.get("path"))))
+            return env.t_list(args)
+        if name in ("edit", "write"):
+            run["edits"] += 1
+            out = env.t_edit(args, ctx) if name == "edit" else env.t_write(args, ctx)
+            run["edit_fail"] += 1 if out.startswith("Error") else 0
+            trace.append("%s %s%s" % (name, _slim_rel(env.path(args.get("filePath"))),
+                                      "[ERR]" if out.startswith("Error") else ""))
+            return out
+        if name == "bash":
+            run["bash"] += 1
+            trace.append("bash %s" % json.dumps(str(args.get("command") or ""))[:50])
+            return env.t_bash(args)
+        if name == "todowrite":
+            run["todo"] += 1
+            trace.append("todo")
+            return json.dumps(args.get("todos") or [], indent=2)
+        # task
+        run["tasks"] += 1
+        sk = str(args.get("subagent_type") or "")
+        if sk not in ("explore", "general"):
+            trace.append("task:%s?" % sk)
+            return "Error: Unknown agent type: %s is not a valid agent type" % sk
+        run["n_sub"] += 1
+        inner = []
+        res = self.agent(run, sk, str(args.get("prompt") or ""), inner)
+        trace.append("task:%s[%s]" % (sk, ",".join(t.split(" ")[0] for t in inner)))
+        if res is None:
+            return "(the subagent stopped: %s)" % (run["err"] or run["cap"] or "unknown")
+        return "%s\n\n<task_metadata>\nsession_id: ses_probe%d\n</task_metadata>" % (res, run["n_sub"])
+
+    # ---- report ----
+    @staticmethod
+    def num(v):
+        if v is None:
+            return "-"
+        if isinstance(v, float) and v != int(v):
+            return "%.1f" % v
+        v = int(v)
+        return "%.1fk" % (v / 1000.0) if abs(v) >= 10000 else str(v)
+
+    def show(self, run, title, i, n):
+        verdict = "ERR" if run["err"] else ("PASS" if run["solved"] else "FAIL")
+        capped = run["cap"] or ("subagent step cap x%d" % run["subcap"] if run["subcap"] else "")
+        note = ("solved=%s steps=%d+%d tools=%d reads=%d grep+glob=%d reread=%d bash=%d edits=%d%s task=%d(inner %d) "
+                "todo=%d prompt=%s reasoning=%s completion=%s requests=%d credits~%s wall=%.0fs sigs-sent=%d/%d%s"
+                % ("yes" if run["solved"] else "no", run["steps"], run["sub_steps"], run["tools"], run["reads"],
+                   run["greps"], run["rereads"], run["bash"], run["edits"],
+                   (" (%d failed)" % run["edit_fail"]) if run["edit_fail"] else "", run["tasks"], run["inner"],
+                   run["todo"], self.num(run["pt"]), self.num(run["rt"]), self.num(run["ct"]), run["requests"],
+                   self.num(run["credits"]), run["wall"], run["sigs_sent"][1], run["sigs_sent"][0],
+                   (" (cap hit: %s)" % capped) if capped else ""))
+        self.rec(run["tid"], "%s, run %d/%d" % (title, i + 1, n), verdict, note)
+        tr = " -> ".join(run["trace"]) + (" -> text" if run["final"] else " -> (no final text)")
+        self.p("       trace: %s" % (tr if len(tr) <= 600 else tr[:600] + "..."))
+        if run["err"]:
+            self.p("       error: %s" % run["err"])
+        if run["final"]:
+            self.p("       final: %s" % self.excerpt(run["final"], 200))
+
+    def med(self, d):
+        runs = self.runs.get(d) or []
+        m = {k: _median([r[k] for r in runs]) for k in self.KEYS}
+        m["solved"] = (sum(1 for r in runs if r["solved"]), len(runs))
+        m["errs"] = [r["err"] for r in runs if r["err"]]
+        m["caps"] = sum(1 for r in runs if r["cap"] or r["subcap"])
+        return m
+
+    def cmp(self, a, b, what):
+        A, B = self.med(a), self.med(b)
+        parts = []
+        for k, name in (("steps", "steps"), ("tools", "tools"), ("reads", "reads"), ("greps", "grep+glob"),
+                        ("rereads", "reread"), ("tasks", "task"), ("pt", "prompt tok")):
+            x, y = A[k], B[k]
+            delta = (" (%s%s)" % ("+" if y - x > 0 else "", self.num(y - x))) if x is not None and y is not None else ""
+            parts.append("%s %s->%s%s" % (name, self.num(x), self.num(y), delta))
+        self.p("%s (arm %s -> %s): solved %d/%d -> %d/%d; %s" % (what, a, b, A["solved"][0], A["solved"][1],
+                                                                B["solved"][0], B["solved"][1], "; ".join(parts)))
+
+    def summary(self, secs):
+        self.p("")
+        self.p("=== slim verdict ===")
+        rows = [(d, t) for d, t, _, _ in _SLIM_ARMS if self.runs.get(d)]
+        if not rows:
+            self.p("no arm completed a run")
+        else:
+            self.p("medians over %s run(s) per arm" % "/".join(str(len(self.runs[d])) for d, _ in rows))
+            cols = (("steps", "steps"), ("sub_steps", "sub"), ("tools", "tools"), ("reads", "reads"),
+                    ("greps", "grep+glob"), ("rereads", "reread"), ("bash", "bash"), ("edits", "edits"),
+                    ("tasks", "task"), ("inner", "inner"), ("pt", "prompt"), ("rt", "reasoning"),
+                    ("ct", "completion"), ("requests", "reqs"), ("credits", "credits~"), ("wall", "wall_s"))
+            self.p("%-24s %-6s " % ("arm", "solved") + " ".join("%*s" % (max(5, len(h)), h) for _, h in cols))
+            for d, t in rows:
+                m = self.med(d)
+                self.p("%-24s %-6s " % ("%s %s" % (d, t), "%d/%d" % m["solved"])
+                       + " ".join("%*s" % (max(5, len(h)), self.num(m[k])) for k, h in cols)
+                       + (" (cap hit x%d)" % m["caps"] if m["caps"] else ""))
+                if m["errs"]:
+                    sig = any("signature" in e.lower() for e in m["errs"])
+                    self.p("  arm %s: %d run(s) ended in a request error: %s%s" % (
+                        d, len(m["errs"]), m["errs"][0],
+                        " -> the upstream REJECTS this history (thought signatures)" if sig else ""))
+            have = {d for d, _ in rows}
+            if {"1", "2"} <= have:
+                self.cmp("1", "2", "keeping signatures")
+            if {"2", "3"} <= have:
+                self.cmp("2", "3", "candidate prompt")
+            elif {"1", "3"} <= have:
+                self.cmp("1", "3", "candidate prompt + signatures")
+            if len(have) > 1 and min(len(self.runs[d]) for d in have) < 3:
+                self.p("caution: fewer than 3 runs per arm; a difference of 1-2 tool calls is within run-to-run "
+                       "noise (use --repeat 3 or more)")
+        self.p(self.usage_line())
+        self.p("elapsed %.0fs" % secs)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="harness probe", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--suite", choices=("full", "memory", "single", "thinking"), default="full", help="which suite to run (default full)")
+    ap.add_argument("--suite", choices=("full", "memory", "single", "thinking", "slim"), default="full", help="which suite to run (default full)")
     ap.add_argument("--model", default=os.environ.get("DEFAULT_MODEL_NAME", ""), help="model for the suite (default: DEFAULT_MODEL_NAME)")
-    ap.add_argument("--repeat", type=int, default=None, help="repeats for the stochastic key checks (default 3; thinking 2)")
-    ap.add_argument("--timeout", type=int, default=None, help="per-request timeout seconds (default 120; memory 240; single 300)")
+    ap.add_argument("--repeat", type=int, default=None, help="repeats for the stochastic key checks (default 3; thinking 2); slim: runs per arm (default 1)")
+    ap.add_argument("--timeout", type=int, default=None, help="per-request timeout seconds (default 120; memory 240; single 300; slim 120)")
     ap.add_argument("--skip-long", action="store_true", help="skip the long-context needle tests")
     ap.add_argument("--no-matrix", action="store_true", help="skip the per-model matrix")
-    ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs); memory/thinking: digits, e.g. '124'")
+    ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs); memory/thinking/slim: digits, e.g. '124' (slim arms 1-3)")
     ap.add_argument("--quick", action="store_true", help="memory/single: fewer sizes and repeats")
     ap.add_argument("--budget", type=int, default=500000,
                     help="memory: stop a section before the run passes this many credits (default 500000; 0 = no cap)")
@@ -3672,13 +4604,18 @@ def main():
     ap.add_argument("--seed", type=int, default=None, help="single: content seed (default: time-based, printed)")
     ap.add_argument("--tpm", type=int, default=400000, help="single: tokens/minute to pace to (default 400000; 0 = off)")
     ap.add_argument("--parallel", type=int, default=2, help="single: requests in flight (default 2, max 4)")
+    ap.add_argument("--candidate", default="",
+                    help="slim: the candidate system prompt for arm 3 (default <root>/scripts/probe_slim_candidate.md)")
+    ap.add_argument("--root", default="",
+                    help="slim: the harness repo to read agents/ and proxy/ from (default this script's "
+                         "parent directory's parent)")
     ap.add_argument("--log", default="", help="write a redacted per-request log here")
     ap.add_argument("--log-display", default="", help=argparse.SUPPRESS)
     ap.add_argument("--delay-scale", type=float, default=1.0, help=argparse.SUPPRESS)  # tests: skip waits
     a = ap.parse_args()
     a.only = a.only.upper()
     if a.repeat is None:
-        a.repeat = 2 if a.suite == "thinking" else 3
+        a.repeat = {"thinking": 2, "slim": 1}.get(a.suite, 3)
     if a.timeout is None:
         a.timeout = {"memory": 240, "single": 300}.get(a.suite, 120)
     if not 6 <= a.facts <= 90:
@@ -3688,6 +4625,22 @@ def main():
             _parse_sizes(getattr(a, opt))
         except ValueError:
             ap.error("--%s: expected sizes like 16k,64k,128000" % opt.replace("_", "-"))
+    if a.suite == "slim":
+        # Piped in on stdin (the docker fallback) __file__ is "<stdin>", not
+        # a path: the caller must mount the repo and pass --root.
+        here = globals().get("__file__") or ""
+        a.root = (a.root
+                  or (os.path.dirname(os.path.dirname(os.path.abspath(here))) if os.path.isfile(here) else ""))
+        need = [os.path.join("agents", "slim-prompt.md"), os.path.join("agents", "slim-subagent-prompt.md")]
+        miss = [n for n in need if not a.root or not os.path.isfile(os.path.join(a.root, n))]
+        if miss:
+            print("harness probe: slim suite needs the harness repo; pass --root (missing: %s%s)"
+                  % (", ".join(miss), (" under %s" % a.root) if a.root else ""), file=sys.stderr)
+            return 2
+        a.candidate = a.candidate or os.path.join(a.root, "scripts", "probe_slim_candidate.md")
+        if (not a.only or "3" in a.only) and not os.path.isfile(a.candidate):
+            print("harness probe: --candidate: no such file: %s" % a.candidate, file=sys.stderr)
+            return 2
 
     url = os.environ.get("PROXY_API_URL", "").strip()
     key = os.environ.get("PROXY_API_KEY", "").strip()
@@ -3716,10 +4669,13 @@ def main():
         except OSError as e:
             print("harness probe: cannot open log: %s" % e, file=sys.stderr)
 
+    log_lock = threading.Lock()
+
     def log(s):
         if log_fh:
-            log_fh.write(red(s) + "\n")
-            log_fh.flush()
+            with log_lock:
+                log_fh.write(red(s) + "\n")
+                log_fh.flush()
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -3727,10 +4683,15 @@ def main():
         pass
 
     def out(s):
+        # The one report print path: tee every line into the log too, so the
+        # log alone carries the report (in order with the request records).
         print(s, flush=True)
+        if log_fh:
+            log("\n".join("report: " + ln for ln in str(s).split("\n")))
 
     client = Client(base, key, a.timeout, log if log_fh else None, red)
-    prober = {"memory": MemProber, "single": SingleProber, "thinking": ThinkProber}.get(a.suite, Prober)(a, client, red, out)
+    prober = {"memory": MemProber, "single": SingleProber, "thinking": ThinkProber,
+              "slim": SlimProber}.get(a.suite, Prober)(a, client, red, out)
     rc = 0
     try:
         prober.run()
@@ -3756,9 +4717,11 @@ def main():
         rc = 130
     finally:
         if log_fh:
-            log_fh.close()
             out("full redacted request log: %s" % (a.log_display or "(written)"))
         out("=== end harness probe ===")
+        if log_fh:
+            fh, log_fh = log_fh, None
+            fh.close()
     return rc
 
 
