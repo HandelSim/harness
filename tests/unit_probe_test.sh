@@ -61,7 +61,7 @@ TMP_ROOT="$(mktemp -d)"
 MOCK_PID=""
 cleanup() {
     [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
-    rm -rf "$TMP_ROOT"
+    [[ -n "${KEEP_TMP:-}" ]] || rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
 
@@ -209,7 +209,8 @@ class H(BaseHTTPRequestHandler):
         CREDITS["left"] -= pt + 5 + rt
         if tool_calls:
             for i, tc in enumerate(tool_calls):
-                tc["extra_content"] = {"google": {"thought_signature": "SIGmock%d" % i}}        usage = {"prompt_tokens": pt, "completion_tokens": 5, "total_tokens": pt + 5 + rt,
+                tc["extra_content"] = {"google": {"thought_signature": "SIGmock%d" % i}}
+        usage = {"prompt_tokens": pt, "completion_tokens": 5, "total_tokens": pt + 5 + rt,
                  "completion_tokens_details": {"reasoning_tokens": rt}}
         if req.get("stream"):
             evs = []
@@ -502,9 +503,9 @@ stop_mock
 echo "$out" >"$TMP_ROOT/stdout-think.txt"
 [[ $rc -eq 0 ]] || { echo "$out" | tail -30; fail "T13 thinking probe exited $rc"; }
 for want in "=== harness probe thinking v" "--- 1. " "--- 2. " "--- 3. " "--- 4. " "--- 5. " "--- 6. " \
-            "--- 7. " "--- 8. " "=== thinking verdict ===" "answer right" "thoughts: content <thought> leading" \
-            "thinking_config shape that returned thoughts: extra_body.google.thinking_config" \
-            "thinking_level: minimal: 4 tok" "high: 640 tok" "together: HTTP 400" \
+            "--- 7. " "--- 8. " "=== thinking verdict ===" "answer right" "thoughts: content <thought> leading" "layout=[open, thought x" "TAG SPLIT ACROSS EVENTS" \
+            "thinking_config shape that returned thoughts: extra_body.google.thinking_config" "(top level)=200;" \
+            "thinking_level: minimal: 4 tok" "high: 640 tok" "together: HTTP 400 type=invalid_request" \
             "thought signatures: json=1 streamed=1" "echoed=HTTP 200 ok" "omitted=HTTP 200 ok" "corrupted=HTTP 400" \
             "reasoning_content 6k chars=" "reasoning billing: best fit: reasoning BILLED" \
             "full redacted request log: state/output/probe-thinking-" "=== end harness probe ==="; do

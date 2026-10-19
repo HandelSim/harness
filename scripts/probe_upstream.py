@@ -3275,6 +3275,12 @@ class ThinkProber(Prober):
         return out
 
     @staticmethod
+    def visible(r):
+        """Thought text came back where a client can show it: a tag in
+        content or reasoning_content (not the gemini_enterprise side channel)."""
+        return bool(_THINK_TAG.search(r.content or "") or r.reasoning)
+
+    @staticmethod
     def thought_text(r):
         m = _THINK_TAG.search(r.content or "")
         return (m.group(2) if m else "") or r.reasoning or ""
@@ -3399,7 +3405,7 @@ class ThinkProber(Prober):
         for name, build in shapes:
             r, ok = self.ask("T3 %s" % name, **build(tc))
             self.line("T3", name, r, ok)
-            got = r.ok and bool(self.where(r))
+            got = r.ok and self.visible(r)
             res.append((name, r.status, got))
             if got and not self.shape:
                 self.shape = (name, build)
@@ -3431,7 +3437,7 @@ class ThinkProber(Prober):
         self.f["levels"] = levels
         r, ok = self.ask("T4h high without thoughts", **self.think_kw(include_thoughts=False, thinking_level="high"))
         self.line("T4h", "thinking_level=high, include_thoughts=false", r, ok)
-        self.f["high_hidden"] = (r.status, self.rtok(r), bool(self.where(r)))
+        self.f["high_hidden"] = (r.status, self.rtok(r), self.visible(r))
         for b in (0, 4096):
             r, ok = self.ask("T4b budget=%d" % b, **self.think_kw(include_thoughts=True, thinking_budget=b))
             self.line("T4b", "thinking_budget=%d (instead of a level)" % b, r, ok)
@@ -3442,32 +3448,36 @@ class ThinkProber(Prober):
         self.section("5. both controls at once; thoughts in a stream")
         r, ok = self.ask("T5 both", reasoning_effort="low", **self.think_kw(include_thoughts=True, thinking_level="low"))
         self.line("T5", "reasoning_effort=low + thinking_config together", r, ok)
-        self.f["conflict"] = (r.status, "" if r.ok else self.fail_note(r))
+        self.f["conflict"] = self.fail_note(r) if not r.ok else "HTTP %s, accepted" % r.status
         r, ok = self.ask("T5s stream thoughts", stream=True, **self.think_kw(include_thoughts=True, thinking_level="medium"))
         evs = []
         for ev in r.events:
             for ch in (ev.get("choices") or []) if isinstance(ev, dict) else []:
                 d = ch.get("delta") or {}
                 evs.append((_content_to_text(d.get("content")), d.get("reasoning_content") or d.get("reasoning") or ""))
-        layout = []
+        # Label each event by where it falls: inside the thought block, the
+        # event that completes the open or close tag, answer text after it,
+        # or a reasoning_content delta. A tag completed by an event that does
+        # not hold the whole tag was split across events.
+        layout, joined, split = [], "", False
         for c, rc in evs:
-            tags = []
-            if _THINK_OPEN.search(c):
-                tags.append("open")
-            if re.search(r"</(think|thought|thinking)>", c):
-                tags.append("close")
+            before, joined = joined, joined + c
+            t = ""
             if rc:
-                tags.append("reasoning_content")
-            if c and not tags:
-                tags.append("text")
-            t = "+".join(tags)
+                t = "reasoning_content"
+            if c:
+                for kind, rx in (("open", _THINK_OPEN), ("close", re.compile(r"</(think|thought|thinking)>"))):
+                    if rx.search(joined) and not rx.search(before):
+                        t = (t + "+" if t else "") + kind
+                        split = split or not rx.search(c)
+                if not t:
+                    inside = _THINK_OPEN.search(before) and not re.search(r"</(think|thought|thinking)>", before)
+                    t = "thought" if inside else "text"
             if t and layout and layout[-1][0] == t:
                 layout[-1][1] += 1
             elif t:
                 layout.append([t, 1])
         layout = ["%s x%d" % (t, n) if n > 1 else t for t, n in layout]
-        joined = "".join(c for c, _ in evs)
-        split = bool(_THINK_OPEN.search(joined)) and not any(_THINK_OPEN.search(c) for c, _ in evs)
         self.line("T5s", "streamed, thinking_level=medium", r, ok,
                   "events=%d layout=[%s]%s" % (r.event_count, ", ".join(layout[:16]), " TAG SPLIT ACROSS EVENTS" if split else ""))
         self.f["stream"] = (r.status, r.event_count, ", ".join(layout[:16]), split, bool(self.where(r)))
@@ -3614,8 +3624,7 @@ class ThinkProber(Prober):
         if "budget" in f:
             self.p("thinking_budget: " + "; ".join("%d -> HTTP %s, %s tok" % b for b in f["budget"]))
         if "conflict" in f:
-            st, err = f["conflict"]
-            self.p("reasoning_effort + thinking_config together: HTTP %s %s" % (st, err))
+            self.p("reasoning_effort + thinking_config together: %s" % f["conflict"])
         if "stream" in f:
             st, ne, lay, split, vis = f["stream"]
             self.p("streamed thoughts: HTTP %s, %d events, layout [%s]%s" % (st, ne, lay, ", tag split across events" if split else ""))

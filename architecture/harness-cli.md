@@ -1051,9 +1051,9 @@ breaks the recursion.
 `cmd_probe` runs `scripts/probe_upstream.py` (stdlib-only Python) straight
 against `PROXY_API_URL` with `PROXY_API_KEY`. The proxy is not involved.
 Subcommands: `full` (the default; bare `harness probe`), `memory`,
-`optimize-single` (alias `--optimize-single`), and `help` (lists them);
-`<subcommand> --help` gives that suite's options. The subcommand reaches the
-script as `--suite full|memory|single`.
+`optimize-single` (alias `--optimize-single`), `thinking`, and `help` (lists
+them); `<subcommand> --help` gives that suite's options. The subcommand
+reaches the script as `--suite full|memory|single|thinking`.
 
 The full suite characterizes the upstream for the question "could an agent
 talk to it directly?". Sections:
@@ -1147,6 +1147,22 @@ come from the "vs req" residuals. The log has a layout and
 score line per request, one whole example message per format (smallest size,
 first rep), and a final `### results` JSON line with every sample. Log:
 `state/output/probe-single-<ts>.log`.
+
+**`harness probe thinking`** (`ThinkProber`) maps the reasoning controls.
+Scored requests are short arithmetic puzzles with one right answer, so each
+line gives reasoning tokens, correctness, latency and where thought text came
+back (a `<think>`/`<thought>` tag in content, `reasoning_content`, or the
+`gemini_enterprise` side channel). Sections (digits for `--only`):
+1 default; 2 the `reasoning_effort` ladder; 3 which `thinking_config` wire
+shape returns visible thoughts; 4 `thinking_level` and `thinking_budget`
+through that shape; 5 both controls at once, and how a stream splits the
+thought block across events; 6 Gemini `extra_content.google.thought_signature`
+on a tool call, then step 2 with it echoed, omitted and corrupted; 7 whether
+reasoning text sent back in history raises `prompt_tokens`; 8 whether
+reasoning tokens cost credits, fitting drops in the
+`x-ratelimit-remaining-credits-day` header (captured on every `Resp`) to the
+catalog's `credit_weights` with and without reasoning. `--repeat` defaults to
+2 here. Log: `state/output/probe-thinking-<ts>.log`.
 
 **Redaction is the contract.** Every printed and logged string goes through
 `Redactor`, which removes:
