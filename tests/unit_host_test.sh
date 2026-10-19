@@ -110,13 +110,16 @@ jq -e '.compaction.prune == true and (.agent | has("build") | not) and (.agent.y
     || fail "T5b: no step cap and prune=true expected — $(cat "$cfg")"
 ok "T5b: includeUsage and compaction.prune are written, no agent step cap"
 
-# --- T5d: yolo is a primary agent; --slim builds the opencode overlay ------
+# --- T5d: yolo is a primary agent; slim (default) builds the opencode overlay
 # Without mode "primary" opencode defaults an agent to "all", which lists the
 # auto-approving yolo agent as a `task` subagent any agent could spawn.
 jq -e '.agent.yolo.mode == "primary"' "$cfg" >/dev/null 2>&1 \
     || fail "T5d: the yolo agent must be mode=primary — $(cat "$cfg")"
 # Sourced from a test, clone_dir resolves off $0; point it at the repo.
-[[ -z "$(clone_dir="$REPO_ROOT" harness_slim=0 slim_opencode_config)" ]] || fail "T5d: no overlay without --slim"
+[[ -z "$(clone_dir="$REPO_ROOT" harness_slim=0 slim_opencode_config)" ]] || fail "T5d: no overlay under --normal"
+# Slim is the default: an unset harness_slim builds the same overlay as --slim.
+[[ "$(unset harness_slim; clone_dir="$REPO_ROOT" slim_opencode_config)" == "$(clone_dir="$REPO_ROOT" harness_slim=1 slim_opencode_config)" ]] \
+    || fail "T5d: slim must be the default when harness_slim is unset"
 overlay=$(clone_dir="$REPO_ROOT" harness_slim=1 slim_opencode_config)
 [[ "$overlay" != *$'\n'* ]] || fail "T5d: overlay must be one line (it travels as a docker -e value)"
 jq -e --rawfile main "$REPO_ROOT/agents/slim-prompt.md" --rawfile sub "$REPO_ROOT/agents/slim-subagent-prompt.md" '
@@ -125,7 +128,7 @@ jq -e --rawfile main "$REPO_ROOT/agents/slim-prompt.md" --rawfile sub "$REPO_ROO
     and .agent.plan.prompt == .agent.build.prompt and .agent.general.prompt == ($sub | rtrimstr("\n"))
     and (.agent | has("explore") | not) and (.provider.harness.options | has("baseURL") | not)' \
     <<<"$overlay" >/dev/null 2>&1 || fail "T5d: slim overlay has the wrong shape — $overlay"
-ok "T5d: yolo is primary-only; --slim overlay sets the slim prompts and the proxy header"
+ok "T5d: yolo is primary-only; slim is the default; its overlay sets the slim prompts and the proxy header"
 
 # --- T5c: opencode's cost readout counts tokens, cached ones included -------
 ( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; host_write_opencode_config ) \

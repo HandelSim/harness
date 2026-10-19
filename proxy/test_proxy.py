@@ -5930,7 +5930,8 @@ class TestNativeToolPassthrough(unittest.TestCase):
             msgs.append({"role": "tool", "tool_call_id": str(i), "content": big})
         msgs.append({"role": "tool", "tool_call_id": "z", "content": "y" * 50000})  # not yet seen
         msgs.append({"role": "tool", "tool_call_id": "s", "content": "short"})
-        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 6000):  # 18,000 chars
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 6000), \
+                patch.object(proxy, "_TOOL_OUTPUT_TRIM_STEP", 1):  # 18,000 chars, unquantized
             out, dropped = proxy._trim_old_tool_outputs(msgs)
         self.assertEqual(out[-2]["content"], "y" * 50000)  # after the last assistant: kept
         self.assertEqual(out[-1]["content"], "short")
@@ -5940,7 +5941,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
         self.assertEqual(dropped, 5 * 8500)
         self.assertEqual(msgs[2]["content"], big)  # inbound not mutated
         msgs = msgs[:-2]
-        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 6000):
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 6000), patch.object(proxy, "_TOOL_OUTPUT_TRIM_STEP", 1):
             out, dropped = proxy._trim_old_tool_outputs(msgs)
         self.assertEqual([m["content"] == big for m in out if m.get("role") == "tool"],
                          [False, False, False, False, True, True])
@@ -5954,7 +5955,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
                                                       "function": {"name": "read", "arguments": "{}"}}]},
                 {"role": "tool", "tool_call_id": "b", "content": "r" * 9000}]
         body = {"model": "gemini-x-withtools", "messages": msgs, "tools": self.TOOLS}
-        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 1000):
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 1000), patch.object(proxy, "_TOOL_OUTPUT_TRIM_STEP", 1):
             _, _, mock_post = self._post(body, self.FakeResp(200, "{}"))
             self.assertEqual(mock_post.call_args.kwargs["json"], body)  # not slim: untouched
             _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), slim=True)
@@ -6099,6 +6100,221 @@ class TestNativeToolPassthrough(unittest.TestCase):
             self.assertTrue(proxy._is_native_tool_model("gemini-3.8-flash-withtools"))
             self.assertFalse(proxy._is_native_tool_model("gemini-3.8-flash"))
             self.assertFalse(proxy._is_native_tool_model(""))
+
+
+class TestOaiUpstream(unittest.TestCase):
+    """OAI_MODELS go to the OAI upstream natively: chat requests get the
+    reasoning-model fixes and a cache key, and /v1/responses is relayed with
+    the slim changes."""
+
+    TOOLS = [{"type": "function", "function": {
+        "name": "bash", "description": "long", "parameters": {"type": "object", "properties": {}}}}]
+    FLAT_TOOLS = [{"type": "function", "name": "bash", "description": "long",
+                   "parameters": {"type": "object", "properties": {}}, "strict": False}]
+    FakeResp = TestNativeToolPassthrough.FakeResp
+
+    def _patches(self, post):
+        return [patch.object(proxy.requests, "post", side_effect=post),
+                patch.object(proxy, "save_debug_file"),
+                patch.object(proxy, "OAI_BASE", "https://oai.example/openai/v1"),
+                patch.object(proxy, "OAI_CHAT_URL", "https://oai.example/openai/v1/chat/completions"),
+                patch.object(proxy, "OAI_RESPONSES_URL", "https://oai.example/openai/v1/responses"),
+                patch.object(proxy, "OAI_API_KEY", "oai-key-5678"),
+                patch.object(proxy, "OAI_MODELS", ("gpt-5.6-sol",)),
+                patch.object(proxy, "_OAI_TOOLS_NO_REASONING", set()),
+                patch.object(proxy, "_OAI_NO_CACHE_KEY", set()),
+                patch.object(proxy, "_SESSION_TODOS", {})]
+
+    def _post(self, path, body, replies, headers=None):
+        replies = list(replies)
+        calls = []
+
+        def post(url, **kw):
+            calls.append((url, json.loads(json.dumps(kw["json"])), kw["headers"]))
+            return replies.pop(0)
+        client = proxy.app.test_client()
+        self.log = io.StringIO()
+        ps = self._patches(post)
+        for p in ps:
+            p.start()
+        try:
+            with patch("sys.stdout", self.log):
+                resp = client.post(path, data=json.dumps(body), content_type="application/json",
+                                   headers=headers or {})
+                data = resp.get_data()
+        finally:
+            for p in reversed(ps):
+                p.stop()
+        return resp, data, calls
+
+    def test_chat_goes_to_oai_with_fixes(self):
+        body = {"model": "gpt-5.6-sol", "max_tokens": 32000, "reasoning_effort": "medium",
+                "messages": [{"role": "user", "content": "hi"}], "tools": self.TOOLS}
+        ok = self.FakeResp(200, json.dumps({"choices": []}))
+        resp, _, calls = self._post("/v1/chat/completions", body, [ok], {"X-Session-Id": "ses_1"})
+        self.assertEqual(resp.status_code, 200)
+        url, sent, headers = calls[0]
+        self.assertEqual(url, "https://oai.example/openai/v1/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer oai-key-5678")
+        self.assertNotIn("max_tokens", sent)
+        self.assertEqual(sent["max_completion_tokens"], 32000)
+        self.assertEqual(sent["prompt_cache_key"], "ses_1")
+        self.assertEqual(sent["tools"], self.TOOLS)  # not slim: untouched
+
+    def test_chat_reasoning_with_tools_retried_without_reasoning(self):
+        err = self.FakeResp(400, json.dumps({"error": {"message":
+              "Function tools with reasoning_effort are not supported for gpt-5.6-sol in "
+              "/v1/chat/completions. To use function tools, use /v1/responses or set "
+              "reasoning_effort to 'none'."}}))
+        ok = self.FakeResp(200, json.dumps({"choices": []}))
+        body = {"model": "gpt-5.6-sol", "reasoning_effort": "medium",
+                "messages": [{"role": "user", "content": "hi"}], "tools": self.TOOLS}
+        resp, _, calls = self._post("/v1/chat/completions", body, [err, ok])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1]["reasoning_effort"], "medium")
+        self.assertEqual(calls[1][1]["reasoning_effort"], "none")
+
+    def test_chat_unknown_cache_key_dropped(self):
+        err = self.FakeResp(400, json.dumps({"error": {"message": "Unrecognized request argument supplied: prompt_cache_key"}}))
+        ok = self.FakeResp(200, json.dumps({"choices": []}))
+        body = {"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}]}
+        resp, _, calls = self._post("/v1/chat/completions", body, [err, ok], {"X-Session-Id": "s"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("prompt_cache_key", calls[1][1])
+
+    def test_other_400_not_retried(self):
+        err = self.FakeResp(400, json.dumps({"error": {"message": "bad input"}}))
+        body = {"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}]}
+        resp, _, calls = self._post("/v1/chat/completions", body, [err])
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(len(calls), 1)
+
+    def test_responses_relayed_with_cache_key(self):
+        upstream = {"output": [], "usage": {"input_tokens": 3000, "output_tokens": 10,
+                                            "input_tokens_details": {"cached_tokens": 2048}}}
+        body = {"model": "gpt-5.6-sol", "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "tools": self.FLAT_TOOLS, "store": False}
+        resp, data, calls = self._post("/v1/responses", body, [self.FakeResp(200, json.dumps(upstream))],
+                                       {"X-Session-Id": "ses_2"})
+        self.assertEqual(json.loads(data), upstream)
+        url, sent, _ = calls[0]
+        self.assertEqual(url, "https://oai.example/openai/v1/responses")
+        self.assertEqual(sent, {**body, "prompt_cache_key": "ses_2"})  # not slim: otherwise untouched
+        self.assertIn("prompt=3000 cached=2048 completion=10", self.log.getvalue())
+
+    def test_responses_slim(self):
+        big = "x" * 9000
+        items = [{"role": "user", "content": [{"type": "input_text", "text": "go"}]}]
+        for i in range(3):
+            items += [{"type": "reasoning", "id": f"r{i}", "encrypted_content": "E", "summary": []},
+                      {"type": "function_call", "call_id": f"c{i}", "name": "bash", "arguments": "{}"},
+                      {"type": "function_call_output", "call_id": f"c{i}", "output": big}]
+        body = {"model": "gpt-5.6-sol", "input": items, "tools": self.FLAT_TOOLS, "stream": True}
+        chunks = [b'event: response.completed\ndata: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"'
+                  + b"z" * 40000 + b'"}]}],"usage":{"input_tokens":50,"output_tokens":7,"input_tokens_details":{"cached_tokens":0}}}}\n\n']
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 1000), patch.object(proxy, "_TOOL_OUTPUT_TRIM_STEP", 1):
+            resp, data, calls = self._post("/v1/responses", body, [self.FakeResp(200, "", chunks)],
+                                           {"x-harness-slim": "1", "X-Session-Id": "s"})
+        self.assertEqual(data, b"".join(chunks))
+        sent = calls[0][1]
+        self.assertNotIn("stream_options", sent)
+        self.assertNotEqual(sent["tools"][0]["description"], "long")
+        self.assertEqual(sent["tools"][0]["name"], "bash")
+        outs = [it["output"] for it in sent["input"] if it.get("type") == "function_call_output"]
+        self.assertIn("were dropped", outs[0])
+        self.assertIn("were dropped", outs[1])
+        self.assertTrue(outs[2].startswith(big + "\n\n<system-reminder>\nharness: step 3 of this task"))
+        self.assertIn("prompt=50 cached=0 completion=7", self.log.getvalue())
+
+    def test_responses_step_cap(self):
+        items = [{"role": "user", "content": "go"},
+                 {"role": "assistant", "content": [{"type": "output_text", "text": "CRITICAL - MAXIMUM STEPS REACHED ..."}]}]
+        body = {"model": "gpt-5.6-sol", "input": items, "tools": self.FLAT_TOOLS}
+        _, _, calls = self._post("/v1/responses", body, [self.FakeResp(200, "{}")], {"x-harness-slim": "1"})
+        self.assertEqual(calls[0][1]["tool_choice"], "none")
+        self.assertEqual(calls[0][1]["input"], items)
+
+    def test_responses_rejects_non_oai_model(self):
+        resp, _, calls = self._post("/v1/responses", {"model": "gemini-x", "input": "hi"}, [])
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(calls, [])
+
+    def test_chat_view(self):
+        items = [{"role": "system", "content": "sys"},
+                 {"role": "user", "content": [{"type": "input_text", "text": "a"}]},
+                 {"type": "reasoning", "id": "r", "summary": []},
+                 {"role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+                 {"type": "function_call", "call_id": "c1", "name": "todowrite", "arguments": "{}"},
+                 {"type": "function_call", "call_id": "c2", "name": "bash", "arguments": "{}"},
+                 {"type": "function_call_output", "call_id": "c1", "output": "t"},
+                 {"type": "function_call_output", "call_id": "c2", "output": [{"type": "input_text", "text": "u"}]}]
+        view = proxy._responses_chat_view(items)
+        self.assertEqual([m["role"] for m in view], ["system", "user", "assistant", "tool", "tool"])
+        self.assertEqual(view[2]["content"], "ok")
+        self.assertEqual([tc["function"]["name"] for tc in view[2]["tool_calls"]], ["todowrite", "bash"])
+        self.assertEqual(view[4]["content"], "u")
+
+    def test_models_lists_oai_models(self):
+        client = proxy.app.test_client()
+        vendor = self.FakeResp(200, json.dumps({"object": "list", "data": [{"id": "gemini-x"}]}))
+        ps = self._patches(lambda *a, **k: None)
+        for p in ps:
+            p.start()
+        try:
+            with patch.object(proxy.requests, "get", return_value=vendor), patch("sys.stdout", io.StringIO()):
+                ids = [d["id"] for d in client.get("/v1/models").get_json()["data"]]
+                self.assertEqual(ids, ["gemini-x", "gpt-5.6-sol"])
+                with patch.object(proxy, "PROXY_API_URL", ""):
+                    ids = [d["id"] for d in client.get("/v1/models").get_json()["data"]]
+                self.assertEqual(ids, ["gpt-5.6-sol"])
+                locked = self.FakeResp(401, json.dumps({"error": "locked", "unlock_url": "u"}))
+                with patch.object(proxy.requests, "get", return_value=locked):
+                    r = client.get("/v1/models")
+                self.assertEqual((r.status_code, r.get_json()["unlock_url"]), (401, "u"))
+        finally:
+            for p in reversed(ps):
+                p.stop()
+
+    def test_trim_cut_is_cache_stable(self):
+        # Growing the history by one small step must not change which older
+        # outputs are trimmed until the cut crosses a step boundary.
+        def history(n):
+            msgs = [{"role": "user", "content": "go"}]
+            for i in range(n):
+                msgs += [{"role": "assistant", "tool_calls": [{"id": str(i), "type": "function",
+                          "function": {"name": "read", "arguments": "{}"}}]},
+                         {"role": "tool", "tool_call_id": str(i), "content": "x" * 9000}]
+            return msgs
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 10_000):
+            a, _ = proxy._trim_old_tool_outputs(history(20))
+            b, _ = proxy._trim_old_tool_outputs(history(21))
+        self.assertEqual(a, b[:len(a)])
+
+    def test_validate_config(self):
+        env = {"OAI_API_URL": "https://oai.example/openai/v1"}
+        cases = [
+            (dict(PROXY_API_URL="", PROXY_API_KEY="", OAI_API_KEY="k", OAI_MODELS=("m",), DEFAULT_MODEL_NAME="m"), env, None),
+            (dict(PROXY_API_URL="", PROXY_API_KEY="", OAI_API_KEY="", OAI_MODELS=("m",), DEFAULT_MODEL_NAME="m"), env, "OAI_API_KEY"),
+            (dict(PROXY_API_URL="", PROXY_API_KEY="", OAI_API_KEY="", OAI_MODELS=(), DEFAULT_MODEL_NAME="m"), {"OAI_API_URL": ""}, "PROXY_API_URL"),
+            (dict(PROXY_API_URL="u", PROXY_API_KEY="", OAI_API_KEY="k", OAI_MODELS=("m",), DEFAULT_MODEL_NAME="m"), env, "PROXY_API_KEY"),
+        ]
+        for attrs, e, missing in cases:
+            out = io.StringIO()
+            ps = [patch.object(proxy, k, v) for k, v in attrs.items()]
+            ps += [patch.object(proxy, "PROXY_BACKEND", "openai"), patch.dict(os.environ, e), patch("sys.stdout", out)]
+            for p in ps:
+                p.start()
+            try:
+                if missing is None:
+                    proxy._validate_config()
+                else:
+                    with self.assertRaises(SystemExit):
+                        proxy._validate_config()
+                    self.assertIn(missing, out.getvalue())
+            finally:
+                for p in reversed(ps):
+                    p.stop()
 
 
 if __name__ == "__main__":

@@ -122,6 +122,37 @@ CHAT_URL: str = f"{_API_BASE}/v1/chat/completions"
 MODELS_URL: str = f"{_API_BASE}/v1/models"
 
 
+# Second upstream: a standard OpenAI-format API (Azure OpenAI's v1 surface,
+# OpenAI itself). OAI_API_URL follows the OpenAI SDK convention (the base
+# includes /v1, e.g. https://RES.openai.azure.us/openai/v1); a trailing
+# /chat/completions or /responses is stripped. OAI_MODELS names the models
+# (Azure: deployment names) served from it: Azure's /models lists base models,
+# not deployments, so they are configured, not discovered. Every OAI model is
+# a native tool model. opencode reaches them over /v1/responses in host mode
+# (the Responses API: reasoning with tools, encrypted reasoning carried across
+# turns); /v1/chat/completions also works, with the fixes in
+# `_native_passthrough`. Both upstreams can be set at once; the model name
+# picks the upstream.
+OAI_API_KEY: str = os.environ.get("OAI_API_KEY", "").strip()
+OAI_MODELS: Tuple[str, ...] = tuple(
+    m.strip() for m in os.environ.get("OAI_MODELS", "").split(",") if m.strip()
+)
+
+
+def _normalize_oai_base(url: str) -> str:
+    base = url.strip().rstrip("/")
+    for suffix in ("/chat/completions", "/responses"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base.rstrip("/")
+
+
+OAI_BASE: str = _normalize_oai_base(os.environ.get("OAI_API_URL", ""))
+OAI_CHAT_URL: str = f"{OAI_BASE}/chat/completions"
+OAI_RESPONSES_URL: str = f"{OAI_BASE}/responses"
+
+
 # ---------------------------------------------------------------------------
 # Upstream backend selection
 # ---------------------------------------------------------------------------
@@ -167,6 +198,24 @@ CHATGPT_STREAM_URL: str = f"{CHATGPT_BASE_URL}{CHATGPT_STREAM_ENDPOINT}"
 # request-omits-a-model fallback and the /v1/models catalog agree.
 if PROXY_BACKEND == "chatgpt" and CHATGPT_MODEL_NAME:
     DEFAULT_MODEL_NAME = CHATGPT_MODEL_NAME
+# An OAI-only install sets no vendor model; the first OAI model stands in.
+if PROXY_BACKEND != "chatgpt" and not DEFAULT_MODEL_NAME and OAI_MODELS:
+    DEFAULT_MODEL_NAME = OAI_MODELS[0]
+
+
+def _is_oai_model(model: str) -> bool:
+    return PROXY_BACKEND != "chatgpt" and bool(OAI_BASE) and model in OAI_MODELS
+
+
+def _session_id(headers: Any) -> str:
+    """The opencode session a request belongs to. opencode sends X-Session-Id
+    (and x-session-affinity) to every non-opencode provider; the
+    x-opencode-session-id name is kept for clients that set it."""
+    for name in ("x-opencode-session-id", "x-session-id", "x-session-affinity"):
+        v = headers.get(name, "")
+        if v:
+            return str(v)
+    return ""
 
 
 class _SyntheticResponse:
@@ -474,15 +523,55 @@ def _is_native_tool_model(model: str) -> bool:
 _TOOL_OUTPUT_KEEP = 40_000  # slim: tokens of newest tool output sent verbatim
 _TOOL_OUTPUT_TRIM_MIN = 1_500  # chars: shorter old tool outputs are left alone
 _TOOL_OUTPUT_HEAD = 500        # chars of a trimmed tool output that are kept
+_TOOL_OUTPUT_TRIM_STEP = 60_000  # chars: the trim cut moves in steps this big (prompt cache)
 _NATIVE_EDIT_TOOLS = frozenset({"edit", "write", "patch", "multiedit", "apply_patch"})
 _NATIVE_TODO_AFTER = 3        # steps with no todo list before it is demanded
 _NATIVE_TODO_STALE = 12       # steps without a todowrite before the list must be updated
 _NATIVE_NO_EDIT_NUDGE = 30    # steps without a file change before a nudge
 _NATIVE_REPEAT_AT = 3         # identical tool calls in one task before they are named
-# Latest todo list per opencode session (x-opencode-session-id), so the replay
+# Latest todo list per opencode session (see `_session_id`), so the replay
 # survives a compaction that drops the todowrite calls from the history.
 _SESSION_TODOS: "Dict[str, Any]" = {}
 _SESSION_TODOS_MAX = 64
+
+
+def _trim_plan(outputs: List[Tuple[int, str, bool]]) -> List[int]:
+    """Pick the tool results to shorten. `outputs` is (index, text, eligible)
+    per tool result, oldest first; returns the indices to trim.
+
+    The newest `_TOOL_OUTPUT_KEEP` tokens (chars / 3) of tool output stay
+    whole; older results longer than `_TOOL_OUTPUT_TRIM_MIN` chars are
+    trimmed. The cut is placed by position from the START of the history and
+    only advances in `_TOOL_OUTPUT_TRIM_STEP`-char steps, so between steps
+    every request repeats the previous request's prefix byte for byte and the
+    upstream's prompt cache keeps hitting. (A cut measured from the newest
+    output moved on every step and rewrote a result in the middle of the
+    history each time, so nothing after it was ever a cache hit.) The price is
+    up to one step of extra output kept whole."""
+    budget = _TOOL_OUTPUT_KEEP * 3
+    total = sum(len(text) for _, text, _ in outputs)
+    if total <= budget:
+        return []
+    step = max(1, _TOOL_OUTPUT_TRIM_STEP)
+    boundary = (total - budget) // step * step
+    picked = []
+    seen = 0
+    for i, text, eligible in outputs:
+        seen += len(text)
+        if seen > boundary:
+            break
+        if eligible and len(text) > _TOOL_OUTPUT_TRIM_MIN:
+            picked.append(i)
+    return picked
+
+
+def _trimmed_tool_text(text: str) -> str:
+    cut = len(text) - _TOOL_OUTPUT_HEAD
+    return (
+        text[:_TOOL_OUTPUT_HEAD]
+        + f"\n[harness: {cut:,} more chars of this older tool output were dropped to save "
+        "tokens. Run the tool again if you need them.]"
+    )
 
 
 def _trim_old_tool_outputs(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
@@ -491,11 +580,9 @@ def _trim_old_tool_outputs(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[st
     Every step re-sends (and re-bills) the whole conversation, and in an agent
     session most of it is tool output: file reads, grep hits, command logs.
     opencode's own prune does the same thing but only between user prompts,
-    never inside one long task. Walking back from the newest message, tool
-    results are kept whole until about `_TOOL_OUTPUT_KEEP` tokens (chars / 3)
-    of them have been seen; older results longer than `_TOOL_OUTPUT_TRIM_MIN`
-    chars keep their first `_TOOL_OUTPUT_HEAD` chars plus a note. Results after
-    the last assistant message (the ones the model is about to read) are never
+    never inside one long task. `_trim_plan` picks the results; a trimmed one
+    keeps its first `_TOOL_OUTPUT_HEAD` chars plus a note. Results after the
+    last assistant message (the ones the model is about to read) are never
     trimmed. opencode's stored history is untouched; only this request shrinks,
     and the upstream's usage (so opencode's compaction counter) follows it.
     Returns the new list (a copy where changed) and the characters dropped."""
@@ -505,26 +592,21 @@ def _trim_old_tool_outputs(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[st
         (i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"),
         default=-1,
     )
-    budget = _TOOL_OUTPUT_KEEP * 3
-    seen = 0
+    outputs = [
+        (i, _flatten_content_to_str(m.get("content") or ""), i < last_assistant)
+        for i, m in enumerate(messages)
+        if isinstance(m, dict) and m.get("role") == "tool"
+    ]
+    picked = _trim_plan(outputs)
+    if not picked:
+        return messages, 0
+    texts = {i: text for i, text, _ in outputs}
     out = list(messages)
     dropped = 0
-    for i in range(len(out) - 1, -1, -1):
-        m = out[i]
-        if not isinstance(m, dict) or m.get("role") != "tool":
-            continue
-        text = _flatten_content_to_str(m.get("content") or "")
-        seen += len(text)
-        if i > last_assistant or seen <= budget or len(text) <= _TOOL_OUTPUT_TRIM_MIN:
-            continue
-        cut = len(text) - _TOOL_OUTPUT_HEAD
-        out[i] = {**m, "content": (
-            text[:_TOOL_OUTPUT_HEAD]
-            + f"\n[harness: {cut:,} more chars of this older tool output were dropped to save "
-            "tokens. Run the tool again if you need them.]"
-        )}
-        dropped += cut
-    return (out if dropped else messages), dropped
+    for i in picked:
+        out[i] = {**out[i], "content": _trimmed_tool_text(texts[i])}
+        dropped += len(texts[i]) - _TOOL_OUTPUT_HEAD
+    return out, dropped
 
 
 def _tool_call_key(tc: Dict[str, Any]) -> str:
@@ -685,8 +767,9 @@ def _append_to_last_message(messages: List[Dict[str, Any]], text: str) -> List[D
     return list(messages[:-1]) + [last]
 
 
-# Slim mode (`harness --slim`): opencode then sends `x-harness-slim: 1` (a
-# provider header the --slim config overlay adds) and the native path swaps the
+# Slim mode (the default; off under `harness --normal`): opencode then sends
+# `x-harness-slim: 1` (a provider header the slim config overlay adds) and the
+# native path swaps the
 # long built-in tool descriptions (about 24k chars for opencode's 12 tools)
 # for these short ones. Parameter schemas are untouched and a tool not listed
 # here (an MCP tool, a newer opencode tool) keeps its own description. Without
@@ -760,6 +843,9 @@ def _slim_tools(tools: List[Any]) -> List[Any]:
     out = []
     for t in tools:
         func = t.get("function") if isinstance(t, dict) else None
+        flat = isinstance(t, dict) and func is None  # Responses API: name at top level
+        if flat:
+            func = t
         name = func.get("name") if isinstance(func, dict) else None
         short = _SLIM_TOOL_DESCRIPTIONS.get(name) if isinstance(name, str) else None
         if short is None:
@@ -768,7 +854,7 @@ def _slim_tools(tools: List[Any]) -> List[Any]:
         desc = func.get("description")
         if name == "task" and isinstance(desc, str) and _TASK_AGENTS_MARK in desc:
             short += "\n\n" + desc[desc.index(_TASK_AGENTS_MARK):]
-        out.append({**t, "function": {**func, "description": short}})
+        out.append({**t, "description": short} if flat else {**t, "function": {**func, "description": short}})
     return out
 
 
@@ -866,6 +952,20 @@ def _setup_usage_ledger() -> None:
         print(f"WARN: usage ledger {_USAGE_LEDGER} not pruned: {e}", flush=True)
 
 
+def _chat_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    """A Responses API usage object (input_tokens, output_tokens and their
+    *_details) in Chat Completions keys; a chat usage object as-is."""
+    if "prompt_tokens" in usage or "input_tokens" not in usage:
+        return usage
+    return {
+        "prompt_tokens": usage.get("input_tokens"),
+        "completion_tokens": usage.get("output_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "prompt_tokens_details": usage.get("input_tokens_details") or {},
+        "completion_tokens_details": usage.get("output_tokens_details") or {},
+    }
+
+
 def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
                   headers: Any, route: str) -> None:
     """Log the usage the upstream reported for one reply and append it to the
@@ -880,10 +980,12 @@ def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
     if not isinstance(usage, dict) or not usage:
         print(f"[{req_id}] usage: none reported by upstream{tail}", flush=True)
         return
+    usage = _chat_usage(usage)
     rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
     print(
         f"[{req_id}] usage: model={model} prompt={usage.get('prompt_tokens')} "
-        f"completion={usage.get('completion_tokens')} reasoning={rt}{tail}",
+        f"cached={cached} completion={usage.get('completion_tokens')} reasoning={rt}{tail}",
         flush=True,
     )
     if not _USAGE_LEDGER:
@@ -895,7 +997,7 @@ def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
         "prompt": usage.get("prompt_tokens"),
         "completion": usage.get("completion_tokens"),
         "reasoning": rt,
-        "cached": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+        "cached": cached,
         "remaining": {k[len("x-ratelimit-remaining-"):]: v for k, v in hdr.items()
                       if k.startswith("x-ratelimit-remaining-")},
     }
@@ -913,8 +1015,9 @@ def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
 
 def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, str]) -> None:
     """One log line per native request with the usage the upstream reported
-    (from the JSON body or the stream's usage chunk) and the remaining-quota
-    headers, so a runaway session is visible in the proxy log as it happens."""
+    (from the JSON body or the stream's usage chunk; for the Responses API
+    the `response.completed` event) and the remaining-quota headers, so a
+    runaway session is visible in the proxy log as it happens."""
     usage: Optional[Dict[str, Any]] = None
     text = raw.decode("utf-8", "replace")
     for line in reversed(text.splitlines()):
@@ -927,10 +1030,32 @@ def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, st
             obj = json.loads(line)
         except ValueError:
             continue
+        if isinstance(obj, dict) and isinstance(obj.get("response"), dict):
+            obj = obj["response"]
         if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
             usage = obj["usage"]
             break
     _record_usage(req_id, model, usage, headers, "native")
+
+
+class _UsageLine:
+    """Keeps the last whole SSE line of a stream that mentions "usage". A
+    fixed-size tail is not enough for the Responses API: its final
+    `response.completed` event repeats the whole reply on one line."""
+
+    def __init__(self) -> None:
+        self.partial = b""
+        self.line = b""
+
+    def feed(self, chunk: bytes) -> None:
+        lines = (self.partial + chunk).split(b"\n")
+        self.partial = lines.pop()
+        for ln in lines:
+            if b'"usage"' in ln:
+                self.line = ln
+
+    def value(self) -> bytes:
+        return self.partial if b'"usage"' in self.partial else self.line
 
 
 def _warn_deprecation(req_id: str, model: str, headers: Dict[str, str]) -> None:
@@ -946,9 +1071,50 @@ def _warn_deprecation(req_id: str, model: str, headers: Dict[str, str]) -> None:
     )
 
 
+# OAI chat-route fixes learned from an upstream 400, per model, so later
+# requests skip the failing attempt. Azure rejects function tools together with
+# reasoning on /chat/completions for gpt-5.6 ("use /v1/responses or set
+# reasoning_effort to 'none'"); a server that does not know prompt_cache_key
+# rejects it.
+_OAI_TOOLS_NO_REASONING: set = set()
+_OAI_NO_CACHE_KEY: set = set()
+
+
+def _oai_chat_payload(payload: Dict[str, Any], model: str, session_id: str) -> None:
+    """Shape a chat request for the OAI upstream, in place. opencode's
+    openai-compatible provider sends `max_tokens`, which reasoning models
+    reject (they take `max_completion_tokens`), and no cache key; the session
+    id becomes `prompt_cache_key` so one session's requests share a cache."""
+    if "max_tokens" in payload:
+        mt = payload.pop("max_tokens")
+        payload.setdefault("max_completion_tokens", mt)
+    if session_id and model not in _OAI_NO_CACHE_KEY:
+        payload.setdefault("prompt_cache_key", session_id)
+    if payload.get("tools") and model in _OAI_TOOLS_NO_REASONING:
+        payload["reasoning_effort"] = "none"
+
+
+def _oai_chat_retry(req_id: str, payload: Dict[str, Any], model: str, detail: str) -> bool:
+    """After an OAI 400, change `payload` so a retry can pass and remember the
+    change for this model. False when the error is not one of these."""
+    low = detail.lower()
+    if "reasoning_effort" in low and payload.get("tools") and payload.get("reasoning_effort") != "none":
+        _OAI_TOOLS_NO_REASONING.add(model)
+        payload["reasoning_effort"] = "none"
+        print(f"[{req_id}] WARN: '{model}' takes no reasoning with tools on /chat/completions; "
+              "retrying with reasoning_effort=none (the /v1/responses route keeps reasoning)", flush=True)
+        return True
+    if "prompt_cache_key" in low and "prompt_cache_key" in payload:
+        _OAI_NO_CACHE_KEY.add(model)
+        payload.pop("prompt_cache_key")
+        print(f"[{req_id}] WARN: upstream rejects prompt_cache_key for '{model}'; retrying without it", flush=True)
+        return True
+    return False
+
+
 def _native_passthrough(
     req_id: str, inbound_request: Dict[str, Any], model_name: str, want_stream: bool,
-    session_id: str = "", slim: bool = False,
+    session_id: str = "", slim: bool = False, oai: bool = False,
 ) -> Response:
     """Forward a native-tools request upstream unchanged and relay the reply.
 
@@ -960,10 +1126,13 @@ def _native_passthrough(
     does retry a 429); 5xx become 502 as on the cooperative path. Under `slim`
     (see `_SLIM_HEADER`) the built-in tools' descriptions are shortened, old
     tool output is trimmed and the reminder is appended; otherwise the request
-    is opencode's own."""
+    is opencode's own. `oai` sends it to the OAI upstream instead, after
+    `_oai_chat_payload`."""
     payload = dict(inbound_request)
     payload["model"] = model_name
     messages = payload.get("messages") or []
+    if oai:
+        _oai_chat_payload(payload, model_name, session_id)
     if slim and payload.get("tools"):
         payload["tools"] = _slim_tools(payload["tools"])
     if want_stream:
@@ -989,25 +1158,196 @@ def _native_passthrough(
         flush=True,
     )
     save_debug_file(req_id, "02", "API_Request", payload)
+    return _native_send(req_id, OAI_CHAT_URL if oai else CHAT_URL, OAI_API_KEY if oai else PROXY_API_KEY,
+                        payload, model_name, want_stream,
+                        (lambda d: _oai_chat_retry(req_id, payload, model_name, d)) if oai else None)
+
+
+def _resp_output_text(output: Any) -> str:
+    """The text of a Responses `function_call_output` item's `output` (a
+    string, or a list of input_text parts)."""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        return "".join(p.get("text", "") for p in output if isinstance(p, dict))
+    return ""
+
+
+def _resp_item_text(content: Any) -> str:
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return content if isinstance(content, str) else ""
+
+
+def _responses_chat_view(items: List[Any]) -> List[Dict[str, Any]]:
+    """Responses API input items as Chat Completions messages, for the slim
+    bookkeeping (step count, todo replay, repeats, step cap) that reads chat
+    messages. The items of one model step (reasoning, the assistant message,
+    function calls) become one assistant message."""
+    out: List[Dict[str, Any]] = []
+    step: Optional[Dict[str, Any]] = None
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        kind, role = it.get("type"), it.get("role")
+        if kind in ("function_call", "reasoning") or role == "assistant":
+            if step is None:
+                step = {"role": "assistant", "content": "", "tool_calls": []}
+                out.append(step)
+            if kind == "function_call":
+                step["tool_calls"].append({
+                    "id": it.get("call_id"), "type": "function",
+                    "function": {"name": it.get("name"), "arguments": it.get("arguments") or ""},
+                })
+            elif role == "assistant":
+                step["content"] += _resp_item_text(it.get("content"))
+            continue
+        step = None
+        if kind == "function_call_output":
+            out.append({"role": "tool", "tool_call_id": it.get("call_id"),
+                        "content": _resp_output_text(it.get("output"))})
+        elif role:
+            out.append({"role": role, "content": _resp_item_text(it.get("content"))})
+    for m in out:
+        if m.get("role") == "assistant" and not m.get("tool_calls"):
+            m.pop("tool_calls", None)
+    return out
+
+
+def _trim_old_response_outputs(items: List[Any]) -> Tuple[List[Any], int]:
+    """`_trim_old_tool_outputs` for Responses input items: shortens old
+    `function_call_output` items, by the same `_trim_plan`."""
+    last_step = max(
+        (i for i, it in enumerate(items) if isinstance(it, dict)
+         and (it.get("type") in ("function_call", "reasoning") or it.get("role") == "assistant")),
+        default=-1,
+    )
+    outputs = [
+        (i, _resp_output_text(it.get("output")), i < last_step)
+        for i, it in enumerate(items)
+        if isinstance(it, dict) and it.get("type") == "function_call_output"
+    ]
+    picked = _trim_plan(outputs)
+    if not picked:
+        return items, 0
+    texts = {i: text for i, text, _ in outputs}
+    out = list(items)
+    dropped = 0
+    for i in picked:
+        out[i] = {**out[i], "output": _trimmed_tool_text(texts[i])}
+        dropped += len(texts[i]) - _TOOL_OUTPUT_HEAD
+    return out, dropped
+
+
+def _append_to_last_item(items: List[Any], text: str) -> List[Any]:
+    """`_append_to_last_message` for Responses input items: the text goes on
+    the last tool output or user message, else in a new user message."""
+    last = items[-1] if items else None
+    if isinstance(last, dict) and last.get("type") == "function_call_output":
+        out = last.get("output")
+        if isinstance(out, list):
+            new = {**last, "output": list(out) + [{"type": "input_text", "text": text}]}
+        else:
+            new = {**last, "output": f"{_resp_output_text(out)}\n\n{text}"}
+        return list(items[:-1]) + [new]
+    if isinstance(last, dict) and last.get("role") == "user" and last.get("type", "message") == "message":
+        content = last.get("content")
+        if isinstance(content, list):
+            new = {**last, "content": list(content) + [{"type": "input_text", "text": text}]}
+        else:
+            new = {**last, "content": f"{content}\n\n{text}" if content else text}
+        return list(items[:-1]) + [new]
+    return list(items) + [{"role": "user", "content": [{"type": "input_text", "text": text}]}]
+
+
+def _oai_responses_retry(req_id: str, payload: Dict[str, Any], model: str, detail: str) -> bool:
+    if "prompt_cache_key" in detail.lower() and "prompt_cache_key" in payload:
+        _OAI_NO_CACHE_KEY.add(model)
+        payload.pop("prompt_cache_key")
+        print(f"[{req_id}] WARN: upstream rejects prompt_cache_key for '{model}'; retrying without it", flush=True)
+        return True
+    return False
+
+
+def _responses_passthrough(
+    req_id: str, inbound_request: Dict[str, Any], model_name: str, want_stream: bool,
+    session_id: str = "", slim: bool = False,
+) -> Response:
+    """`_native_passthrough` for the OpenAI Responses API (`POST /v1/responses`,
+    what opencode's `@ai-sdk/openai` provider sends), to the OAI upstream
+    only. The reply is relayed as-is. The request gets a `prompt_cache_key`
+    (the session) when it has none, and under `slim` the same changes as the
+    chat route: short tool descriptions, old tool output trimmed, the reminder
+    on the last input item, and the step cap made hard."""
+    payload = dict(inbound_request)
+    payload["model"] = model_name
+    items = payload.get("input")
+    if isinstance(items, str):
+        items = [{"role": "user", "content": items}]
+    items = items if isinstance(items, list) else []
+    if session_id and model_name not in _OAI_NO_CACHE_KEY:
+        payload.setdefault("prompt_cache_key", session_id)
+    if slim and payload.get("tools"):
+        payload["tools"] = _slim_tools(payload["tools"])
+    if slim:
+        items, trimmed = _trim_old_response_outputs(items)
+        if trimmed:
+            payload["input"] = items
+            print(f"[{req_id}] trimmed {trimmed:,} chars of old tool output", flush=True)
+    view = _responses_chat_view(items)
+    if payload.get("tools") and _at_step_cap(view):
+        payload["tool_choice"] = "none"
+    elif slim and payload.get("tools") and items:
+        chat_tools = [{"type": "function", "function": {"name": t.get("name")}}
+                      for t in payload["tools"] if isinstance(t, dict)]
+        payload["input"] = items = _append_to_last_item(items, _native_reminder(view, chat_tools, session_id))
+    print(
+        f"[{req_id}] upstream shape: mode=responses{'/slim' if slim else ''} items={len(items)} "
+        f"chars={len(json.dumps(items, ensure_ascii=False))}",
+        flush=True,
+    )
+    save_debug_file(req_id, "02", "API_Request", payload)
+    return _native_send(req_id, OAI_RESPONSES_URL, OAI_API_KEY, payload, model_name, want_stream,
+                        lambda d: _oai_responses_retry(req_id, payload, model_name, d))
+
+
+def _upstream_error_detail(err_body: Any) -> str:
+    if isinstance(err_body, dict) and isinstance(err_body.get("error"), dict):
+        return str(err_body["error"].get("message") or "")
+    if isinstance(err_body, str):
+        return err_body.strip()[:500]
+    return ""
+
+
+def _native_send(
+    req_id: str, url: str, key: str, payload: Dict[str, Any], model_name: str, want_stream: bool,
+    retry: Any = None,
+) -> Response:
+    """POST a native request and relay the reply: the upstream's SSE stream or
+    JSON body as-is, 4xx with their status (so the AI SDK does not retry a
+    deterministic rejection, and does retry a 429), 5xx as 502. `retry`, given
+    an upstream 400's message, may fix the payload and return True to send it
+    once more (twice at most)."""
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {PROXY_API_KEY}",
+        "Authorization": f"Bearer {key}",
     }
-    try:
-        resp = requests.post(
-            CHAT_URL,
-            headers=headers,
-            json=payload,
-            verify=False,
-            timeout=PROXY_TIMEOUT,
-            stream=want_stream,
-        )
-    except requests.RequestException as e:
-        print(f"[{req_id}] upstream request failed: {e}", flush=True)
-        save_debug_file(req_id, "03", "API_Error", {"error": str(e)})
-        return _client_error(f"upstream request failed: {e}", 502)
-
-    if resp.status_code >= 400:
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                verify=False,
+                timeout=PROXY_TIMEOUT,
+                stream=want_stream,
+            )
+        except requests.RequestException as e:
+            print(f"[{req_id}] upstream request failed: {e}", flush=True)
+            save_debug_file(req_id, "03", "API_Error", {"error": str(e)})
+            return _client_error(f"upstream request failed: {e}", 502)
+        if resp.status_code < 400:
+            break
         err_body: Any
         try:
             err_body = resp.json()
@@ -1016,11 +1356,9 @@ def _native_passthrough(
         resp.close()
         print(f"[{req_id}] upstream returned {resp.status_code}: {err_body}", flush=True)
         save_debug_file(req_id, "03", "API_Error", {"status": resp.status_code, "body": err_body})
-        detail = ""
-        if isinstance(err_body, dict) and isinstance(err_body.get("error"), dict):
-            detail = str(err_body["error"].get("message") or "")
-        elif isinstance(err_body, str):
-            detail = err_body.strip()[:500]
+        detail = _upstream_error_detail(err_body)
+        if resp.status_code == 400 and retry is not None and attempt < 2 and retry(detail):
+            continue
         status = resp.status_code if resp.status_code < 500 else 502
         message = f"upstream returned status {resp.status_code}" + (f": {detail}" if detail else "")
         out_headers = _relay_headers(resp) if status < 500 else {}
@@ -1057,16 +1395,15 @@ def _native_passthrough(
 
     def relay() -> Iterable[bytes]:
         captured: Optional[List[bytes]] = [] if _OUTPUT_DIR is not None else None
-        # The tail of the stream, kept for the usage log line (the usage
-        # chunk is the last data event before [DONE]).
-        tail = b""
+        # The stream's usage line, kept for the usage log line.
+        usage_line = _UsageLine()
         try:
             for chunk in resp.iter_content(chunk_size=None):
                 if not chunk:
                     continue
                 if captured is not None:
                     captured.append(chunk)
-                tail = (tail + chunk)[-16384:]
+                usage_line.feed(chunk)
                 yield chunk
         except requests.RequestException as e:
             # The client already has a 200 and part of the stream; an error
@@ -1082,7 +1419,7 @@ def _native_passthrough(
                     {"raw": b"".join(captured).decode("utf-8", "replace")},
                 )
             print(f"[{req_id}] upstream OK; relayed native SSE", flush=True)
-            _log_native_usage(req_id, model_name, tail, ok_headers)
+            _log_native_usage(req_id, model_name, usage_line.value(), ok_headers)
 
     return Response(relay(), status=200, mimetype="text/event-stream")
 
@@ -4084,6 +4421,13 @@ def list_models() -> Response:
         }
         print(f"[{req_id}] GET /v1/models -> synthesized chatgpt catalog", flush=True)
         return Response(json.dumps(body), status=200, mimetype="application/json")
+    # The OAI models are listed from OAI_MODELS, not fetched: Azure's /models
+    # lists base models, not the deployment names requests use.
+    oai_entries = [{"id": m, "object": "model", "owned_by": "oai"} for m in OAI_MODELS] if OAI_BASE else []
+    if not PROXY_API_URL:
+        print(f"[{req_id}] GET /v1/models -> OAI_MODELS only (no vendor upstream)", flush=True)
+        return Response(json.dumps({"object": "list", "data": oai_entries}), status=200,
+                        mimetype="application/json")
     headers = {"Authorization": f"Bearer {PROXY_API_KEY}"}
     try:
         resp = requests.get(
@@ -4100,11 +4444,45 @@ def list_models() -> Response:
             mimetype="application/json",
         )
     print(f"[{req_id}] GET /v1/models -> upstream {resp.status_code}", flush=True)
+    if oai_entries and resp.status_code == 200:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and isinstance(body.get("data"), list):
+            have = {d.get("id") for d in body["data"] if isinstance(d, dict)}
+            body["data"] = body["data"] + [e for e in oai_entries if e["id"] not in have]
+            return Response(json.dumps(body), status=200, mimetype="application/json")
     return Response(
         resp.text,
         status=resp.status_code,
         mimetype=resp.headers.get("Content-Type", "application/json"),
     )
+
+
+@app.route("/v1/responses", methods=["POST"])
+def responses() -> Response:
+    """The OpenAI Responses API, for OAI models (opencode's `harness-oai`
+    provider). Explicit so it wins over catch_all."""
+    req_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    try:
+        inbound_request = request.get_json(silent=True) or {}
+        save_debug_file(req_id, "01", "Inbound_Request", inbound_request)
+        model_name = inbound_request.get("model") or DEFAULT_MODEL_NAME
+        want_stream = bool(inbound_request.get("stream", False))
+        print(f"[{req_id}] POST /v1/responses model={model_name} "
+              f"tools={len(inbound_request.get('tools') or [])}", flush=True)
+        if not _is_oai_model(model_name):
+            return _client_error(
+                f"/v1/responses serves only the OAI_MODELS models; '{model_name}' is not one", 400)
+        return _responses_passthrough(
+            req_id, inbound_request, model_name, want_stream,
+            _session_id(request.headers) or str(inbound_request.get("prompt_cache_key") or ""),
+            request.headers.get(_SLIM_HEADER, "") == "1",
+        )
+    except Exception as e:  # noqa: BLE001 - one bad request must not kill the proxy
+        print(f"[{req_id}] /v1/responses failed: {e}", flush=True)
+        return _client_error(f"proxy error: {e}", 500)
 
 
 def _client_error(message: str, status: int, headers: Optional[Dict[str, str]] = None) -> Response:
@@ -4136,12 +4514,18 @@ def catch_all(path: str) -> Response:
         print(f"[{req_id}] {request.method} /{path} model={model_name} messages={len(original_messages)} tools={len(tools)}", flush=True)
 
         # Native tool-calling models skip the cooperative pipeline entirely.
-        if _is_native_tool_model(model_name):
+        # OAI models are always native, on their own upstream.
+        if _is_oai_model(model_name) or _is_native_tool_model(model_name):
             return _native_passthrough(
                 req_id, inbound_request, model_name, want_stream,
-                request.headers.get("x-opencode-session-id", ""),
+                _session_id(request.headers),
                 request.headers.get(_SLIM_HEADER, "") == "1",
+                oai=_is_oai_model(model_name),
             )
+        if not _API_BASE and PROXY_BACKEND != "chatgpt":
+            return _client_error(
+                f"model '{model_name}' is not in OAI_MODELS and no vendor upstream "
+                "(PROXY_API_URL) is set", 400)
 
         # Require-tool mode shows the model one extra tool, `finish`, and
         # everything prompt-facing is built from the augmented array so the
@@ -4563,10 +4947,18 @@ def _validate_config() -> None:
             )
             sys.exit(1)
     else:
-        if not PROXY_API_URL:
-            missing.append("PROXY_API_URL")
-        if not PROXY_API_KEY:
-            missing.append("PROXY_API_KEY")
+        # A vendor upstream (PROXY_API_URL + key), an OAI upstream (OAI_API_URL
+        # + key + models), or both. A half-set upstream is an error either way.
+        oai_raw = os.environ.get("OAI_API_URL", "").strip()
+        oai_set = [n for n, v in (("OAI_API_URL", oai_raw), ("OAI_API_KEY", OAI_API_KEY),
+                                  ("OAI_MODELS", ",".join(OAI_MODELS))) if v]
+        if oai_set and len(oai_set) < 3:
+            missing += [n for n in ("OAI_API_URL", "OAI_API_KEY", "OAI_MODELS") if n not in oai_set]
+        if PROXY_API_URL or PROXY_API_KEY or not oai_set:
+            if not PROXY_API_URL:
+                missing.append("PROXY_API_URL")
+            if not PROXY_API_KEY:
+                missing.append("PROXY_API_KEY")
         if not DEFAULT_MODEL_NAME:
             missing.append("DEFAULT_MODEL_NAME")
     if missing:
@@ -4654,6 +5046,13 @@ def main() -> None:
         # both to confirm the redaction AND, negatively, to catch a raw key
         # leak. Renaming it silently disarms the second grep.
         banner_auth = f"   upstream key:   {_redact_key(PROXY_API_KEY)}\n"
+        if not PROXY_API_URL:
+            banner_chat_url = banner_models_url = "(no vendor upstream)"
+            banner_auth = ""
+        if OAI_BASE:
+            banner_auth += (f"   oai upstream:   {OAI_BASE} ({', '.join(OAI_MODELS)}; "
+                            f"/chat/completions and /responses)\n"
+                            f"   oai key:        {_redact_key(OAI_API_KEY)}\n")
 
     print(
         "============================================================\n"

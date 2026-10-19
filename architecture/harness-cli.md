@@ -160,7 +160,7 @@ as a subcommand: known ones dispatch; an unknown word errors (so a typo
 like `harness statt` is caught instead of silently launching an agent).
 `harness opencode` remains as an explicit alias for the bare form.
 
-Agent-launch flags (`--yolo`, `--slim`, `--net`, `--mount`, `-p/--print`) are parsed
+Agent-launch flags (`--yolo`, `--normal`, `--net`, `--mount`, `-p/--print`) are parsed
 inside `run_agent` (opencode) / `cmd_shell` rather than centrally; they decide
 the `docker run` invocation, not compose flags. `run_agent` also still accepts
 the retired `--require-tool` and drops it as a no-op (see "`--require-tool` on
@@ -295,7 +295,7 @@ so compose doesn't see a phantom services block.
 `run_agent` (opencode) / `cmd_shell` do NOT go through compose.
 They each:
 
-1. Parse agent flags (`--yolo`, `--slim`, `--net`, `--mount`, `-p/--print`; the
+1. Parse agent flags (`--yolo`, `--normal`, `--net`, `--mount`, `-p/--print`; the
    retired `--require-tool` is consumed and ignored). In `run_agent`, if no
    container runtime is installed at all, hand off to host mode here — see
    "No-docker fallback" below.
@@ -324,7 +324,7 @@ binary on `PATH`, i.e. a host-only install — `run_agent` (bare `harness`,
 `harness opencode`, `harness <agent flags>`, `harness chatgpt`) prints
 `harness: docker is not available (no docker or podman installed); defaulting
 to 'harness host'` to stderr and calls `cmd_host` with `--yolo` (if given;
-`--slim` carries over as the `harness_slim` global) plus the pass-through args (e.g. `-p PROMPT`). `--net` and `--mount` have no
+`--normal` carries over as the `harness_slim` global) plus the pass-through args (e.g. `-p PROMPT`). `--net` and `--mount` have no
 host-mode meaning (no firewall; the whole filesystem is visible) and are
 dropped, with a note for `--mount`. Host mode's own confirm gate still applies.
 
@@ -343,10 +343,12 @@ opencode aborts on an unknown option, so forwarding it would stop the agent
 starting. Nothing is reconciled against the running proxy any more, and the
 help texts no longer advertise the flag.
 
-### `--slim`
+### Slim (default) and `--normal`
 
-`--slim` (`run_agent` and `cmd_host` set the `harness_slim` shell global; it
-is a flag only, not an `.env` setting) makes the launch send less per request. `slim_opencode_config`
+Every launch is slim unless `--normal` is given (`run_agent`, `cmd_host` and
+`cmd_serve` set the `harness_slim` shell global to 0; unset means 1; `--slim`
+is still accepted and sets 1). It is a flag only, not an `.env` setting.
+Slim makes the launch send less per request. `slim_opencode_config`
 prints a one-line JSON overlay that goes to opencode as
 `OPENCODE_CONFIG_CONTENT` (a `-e` from `agent_common_env` in container mode,
 an export in `host_run_opencode`); opencode deep-merges it over every other
@@ -365,7 +367,7 @@ config layer, so the harness-written config is otherwise unchanged. It:
   ([`proxy.md`](proxy.md)).
 
 The prompt files are read from the clone at launch (no image rebuild). If
-one is missing the launch warns and runs without slim. Without `--slim`
+one is missing the launch warns and runs without slim. Under `--normal`
 nothing here applies: opencode's own system prompt and tool descriptions
 are sent, and the proxy forwards native requests as is (its reminder and
 old-output trim run only on the slim header). Slim has no tuning knobs; its
@@ -389,7 +391,7 @@ vault's `AGENTS.md` (or `CLAUDE.md`), which opencode sends as "Instructions
 from: <path>" so the model knows where the vault is, and
 `permission.external_directory` `"<vault>/*": "allow"` so reading and writing
 there needs no approval. `harness_opencode_overlay` deep-merges that with the
-`--slim` overlay into the one `OPENCODE_CONFIG_CONTENT`. Container mode also
+slim overlay into the one `OPENCODE_CONFIG_CONTENT`. Container mode also
 appends the vault to the extra mounts (same absolute path, deduped against
 the CWD). Committing and pushing vault changes is the agent's job, as in any
 repo; inside a container the push needs the vault's git host marked

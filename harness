@@ -2612,10 +2612,13 @@ commands:
 
 agent flags:
   --yolo                pass auto-approve / skip-permissions to the agent
-  --slim                smaller requests: a short harness system prompt that
-                        leans on subagents and the todo list, and short tool
-                        descriptions (native -withtools models). Without it
-                        opencode's own prompt and tool descriptions are sent.
+  --normal              stock opencode requests: opencode's own system prompt
+                        and tool descriptions, sent as opencode builds them.
+                        The default is slim: a short harness system prompt
+                        that leans on subagents and the todo list, short tool
+                        descriptions, older tool output trimmed and a step
+                        reminder (native tool models). --slim is accepted and
+                        changes nothing.
   --net                 disable the per-container firewall for THIS launch
                         only (full outbound network). Audit-logged on stderr.
   --mount PATH          bind-mount an additional host folder into the agent
@@ -5211,7 +5214,7 @@ host_write_opencode_config() {
         } + (if $share == "" then {} else {share: $share} end)' > "$config_file"
 }
 
-# `--slim`: the opencode config overlay, as one line of
+# Slim (the default; `--normal` turns it off): the opencode config overlay, as one line of
 # JSON for OPENCODE_CONFIG_CONTENT, which opencode deep-merges over every other
 # config layer. It replaces the system prompt of the build, plan and yolo
 # agents with agents/slim-prompt.md and of the general subagent with
@@ -5220,11 +5223,11 @@ host_write_opencode_config() {
 # the built-in tools' long descriptions for short ones. Prints nothing when
 # slim is off or a prompt file is missing (that launch is then a normal one).
 slim_opencode_config() {
-    [[ "${harness_slim:-0}" == "1" ]] || return 0
+    [[ "${harness_slim:-1}" == "1" ]] || return 0
     local main_prompt="$clone_dir/agents/slim-prompt.md"
     local sub_prompt="$clone_dir/agents/slim-subagent-prompt.md"
     if [[ ! -f "$main_prompt" || ! -f "$sub_prompt" ]]; then
-        err "--slim: agents/slim-prompt.md or agents/slim-subagent-prompt.md is missing; launching without slim"
+        err "slim: agents/slim-prompt.md or agents/slim-subagent-prompt.md is missing; launching without slim"
         return 0
     fi
     harness_jq -cn --arg main "$(cat "$main_prompt")" --arg sub "$(cat "$sub_prompt")" '{
@@ -5587,7 +5590,7 @@ cmd_host() {
 harness host — run CONTAINERLESS: the proxy + opencode as plain host processes.
 
 usage:
-  harness host [--yolo] [--slim] [--single-message | --prompt-mode M] [-p "PROMPT"] [agent flags...]
+  harness host [--yolo] [--normal] [--single-message | --prompt-mode M] [-p "PROMPT"] [agent flags...]
   harness host down            stop the background host proxy
 
 --single-message (= --prompt-mode single) folds the whole chat into ONE
@@ -5633,6 +5636,7 @@ EOF
         case "$arg" in
             --yolo)      yolo=1 ;;
             --slim)      harness_slim=1 ;;
+            --normal)    harness_slim=0 ;;
             --single-message) prompt_mode_override="single" ;;
             --prompt-mode)    want_mode=1 ;;
             --prompt-mode=*)  prompt_mode_override="${arg#--prompt-mode=}" ;;
@@ -5722,7 +5726,7 @@ cmd_serve() {
         case "$arg" in
             -h|--help|help)
                 cat <<'HELP'
-usage: harness serve [--port N] [--allow-host NAME]
+usage: harness serve [--port N] [--allow-host NAME] [--normal]
 
 Serves, on 127.0.0.1 only:
   http://127.0.0.1:N/     the pub page: the active vault's pub/**/*.html and
@@ -5739,13 +5743,16 @@ browser sends it), for a reverse proxy in front of the pub page. The pub
 page links opencode as <that host>:N+1, so behind a reverse proxy give
 opencode its own name, with the proxy doing the login.
 
-opencode web runs as your user with a shell, like 'harness host'.
+opencode web runs as your user with a shell, like 'harness host'. Its
+requests are slim unless --normal is given (see 'harness help').
 HELP
                 return 0 ;;
             --port) want=port ;;
             --port=*) port="${arg#--port=}" ;;
             --allow-host) want=host ;;
             --allow-host=*) allow_hosts+=(--allow-host "${arg#--allow-host=}") ;;
+            --normal) harness_slim=0 ;;
+            --slim) harness_slim=1 ;;
             *) err "unknown serve option '$arg' (see: harness serve --help)"; return 1 ;;
         esac
     done
@@ -5873,7 +5880,7 @@ Notes:
   * The backend-api keeps conversation state server-side; this proxy is
     stateless, so each request opens a fresh conversation carrying the full
     translated history. Tool use, prompt modes and MCPs work as usual.
-  * 'harness chatgpt' accepts --yolo, --slim, -p/--print, --net and --mount like a
+  * 'harness chatgpt' accepts --yolo, --normal, -p/--print, --net and --mount like a
     normal launch. 'harness chatgpt host' takes the flags 'harness host'
     takes: --net and --mount are container-only and do not apply there.
 EOF
@@ -5941,10 +5948,11 @@ run_agent() {
             --yolo)
                 yolo=1
                 ;;
-            --slim)
+            --slim|--normal)
                 # Read by agent_common_env (and by cmd_host on the no-docker
                 # fallback below), which turn it into the opencode overlay.
-                harness_slim=1
+                # Slim is the default; --slim is kept so old invocations work.
+                [[ "$arg" == "--normal" ]] && harness_slim=0 || harness_slim=1
                 ;;
             --net)
                 # Per-invocation firewall opt-out. Loud audit log on stderr
@@ -6147,7 +6155,7 @@ agent_common_env() {
     # Declared context window for opencode's model config. The same knob caps
     # the proxy's local token estimate.
     printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-200000}"
-    # The opencode overlay (--slim prompts + header, the active vault), one
+    # The opencode overlay (slim prompts + header unless --normal, the active vault), one
     # line of JSON.
     local overlay
     overlay=$(harness_opencode_overlay)

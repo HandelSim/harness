@@ -115,9 +115,9 @@ After the drop, still in the entrypoint:
   `permission` block grants `edit`, `bash` (all commands), `webfetch`, and
   `websearch` — matching the set of tools the agent ships so yolo mode
   doesn't trip on the new ones.
-- Under `harness --slim` the launch also passes `OPENCODE_CONFIG_CONTENT`
+- Unless the launch is `--normal` it also passes `OPENCODE_CONFIG_CONTENT`
   (slim agent prompts + the `x-harness-slim` provider header), which opencode
-  merges over this file; see [`harness-cli.md`](harness-cli.md) "`--slim`".
+  merges over this file; see [`harness-cli.md`](harness-cli.md) "Slim (default) and `--normal`".
 - `merge_opencode_mcp_servers` translates the canonical `{"mcpServers": {...}}`
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.

@@ -129,7 +129,7 @@ are the only changes made to the request or the reply:
   The thresholds are module constants (`_NATIVE_TODO_*`,
   `_NATIVE_NO_EDIT_NUDGE`, `_NATIVE_REPEAT_AT`), not env knobs: tuning them
   is a probe's job, not the user's.
-- **Slim tool descriptions** (`harness --slim`). The `--slim` opencode
+- **Slim tool descriptions** (the default; off under `harness --normal`). The slim opencode
   overlay adds the provider header `x-harness-slim: 1`; on it,
   `_slim_tools` replaces the descriptions of opencode's built-in tools
   (`bash`, `read`, `edit`, `write`, `glob`, `grep`, `todowrite`, `task`,
