@@ -1794,8 +1794,9 @@ cmd_unlock() {
 # (no proxy) to characterize it. Three suites: 'full' (system prompt, native
 # tools, streaming, response_format, per-model matrix; bare 'harness probe'),
 # 'memory' (which earlier turns reach the model and what decides when they
-# are dropped) and 'optimize-single' (which size, join format and framing of
-# a chat folded into one message the model answers best from). Output is redacted (key, URL, host, emails, IPs, projects/...
+# are dropped), 'optimize-single' (which size, join format and framing of
+# a chat folded into one message the model answers best from) and 'thinking'
+# (reasoning controls, thought text, thought signatures, reasoning billing). Output is redacted (key, URL, host, emails, IPs, projects/...
 # paths, HARNESS_PROBE_REDACT terms) so it can be pasted back as-is. Runs on
 # the host's python3; falls back to the proxy image's python when the host has
 # none. See architecture/harness-cli.md.
@@ -1822,6 +1823,10 @@ subcommands:
             format, size and framing the model answers best from (recall
             by depth, updates, instructions, injections). Also accepted as
             --optimize-single. About an hour; --quick about 10 minutes.
+  thinking  what the upstream does with reasoning controls
+            (reasoning_effort, thinking_config levels), where thought
+            text comes back, thought signatures on tool calls, and
+            whether reasoning is billed. About 45 requests, 10-20 minutes.
   help      this list
 
 'harness probe <subcommand> --help' lists that subcommand's options.
@@ -1917,6 +1922,38 @@ for analysis.
 EOF
 }
 
+_probe_thinking_help() {
+    cat <<'EOF'
+usage: harness probe thinking [--model ID] [--repeat N] [--only SECTIONS]
+                              [--timeout SECS]
+
+Map the upstream's reasoning ("thinking") controls. Each scored request is a
+short arithmetic puzzle with one right answer, so every line shows reasoning
+tokens, whether the answer was right, latency, and where any thought text
+came back. Sections:
+
+  1  default: no reasoning controls
+  2  reasoning_effort none/minimal/low/medium/high
+  3  thinking_config wire shapes (which one returns thoughts)
+  4  thinking_level minimal/low/medium/high, thoughts hidden, thinking_budget
+  5  reasoning_effort and thinking_config together; thoughts in a stream
+  6  thought signatures on a tool call: echoed, omitted, corrupted
+  7  reasoning text sent back in history: is it billed as prompt
+  8  are reasoning tokens billed (reads the credits header; do not use
+     this key elsewhere while it runs)
+
+About 45 requests, 10-20 minutes, roughly 100-200k tokens (the report ends
+with the measured total).
+The full redacted log is written to state/output/probe-thinking-<time>.log;
+send that file for analysis.
+
+  --model ID       model to probe (default: DEFAULT_MODEL_NAME)
+  --repeat N       requests per setting in sections 1, 2 and 4 (default 2)
+  --only SECTIONS  run only these sections, e.g. 368
+  --timeout SECS   per-request timeout (default 120)
+EOF
+}
+
 _probe_single_help() {
     cat <<'EOF'
 usage: harness probe optimize-single [--quick] [--reps N] [--sizes LIST]
@@ -1979,6 +2016,7 @@ cmd_probe() {
         full) shift ;;
         memory) suite=memory; shift ;;
         optimize-single|--optimize-single) suite=single; shift ;;
+        thinking) suite=thinking; shift ;;
         ""|-*) ;;
         *)
             err "unknown probe subcommand '$1'"
@@ -1991,6 +2029,7 @@ cmd_probe() {
             case $suite in
                 memory) _probe_memory_help ;;
                 single) _probe_single_help ;;
+                thinking) _probe_thinking_help ;;
                 *) _probe_full_help ;;
             esac
             return 0
@@ -2008,6 +2047,7 @@ cmd_probe() {
     local stem=probe
     [[ $suite == memory ]] && stem=probe-memory
     [[ $suite == single ]] && stem=probe-single
+    [[ $suite == thinking ]] && stem=probe-thinking
     local rel log
     rel="state/output/${stem}-$(date -u +%Y%m%dT%H%M%SZ).log"
     log="$install_root/$rel"

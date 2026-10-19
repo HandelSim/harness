@@ -20,6 +20,12 @@ and framing, scored on recall by depth, a mid-chat update, instruction
 following and a planted injection. It picks the settings for a future
 single-message mode.
 
+`--suite thinking` ('harness probe thinking') runs only ThinkProber: what the
+upstream does with reasoning controls (reasoning_effort, Google's
+thinking_config in several wire shapes), where thought text comes back, Gemini
+thought signatures across a tool round trip, whether reasoning text sent back
+in history is billed as prompt, and whether reasoning tokens cost credits.
+
 Output is designed to be pasted back verbatim: every printed line passes
 through Redactor, which removes the API key (and any 10+ char fragment of it),
 the base URL and its host, every URL, emails, IPs, bearer tokens, `projects/...`
@@ -165,6 +171,7 @@ class Resp:
         self.tc_delta_count = 0
         self.tc_args_types = set()
         self.reasoning = ""
+        self.headers = {}
 
     @property
     def ok(self):
@@ -279,6 +286,7 @@ class Client:
             return r
         try:
             r.status = getattr(fh, "status", None) or fh.getcode()
+            r.headers = {k.lower(): v for k, v in fh.headers.items()}
             r.ctype = (fh.headers.get("Content-Type") or "").lower()
             if "event-stream" in r.ctype:
                 self._read_sse(fh, r, t0)
@@ -3181,15 +3189,463 @@ class SingleProber(Prober):
         p("requests=%d elapsed=%ds" % (self.c.n, int(secs or (time.monotonic() - self.t0))))
 
 
+# --------------------------------------------------------------------------
+# Thinking suite ('harness probe thinking')
+# --------------------------------------------------------------------------
+
+_THINK_TAG = re.compile(r"<(think|thought|thinking)>(.*?)</\1>", re.S)
+_THINK_OPEN = re.compile(r"<(think|thought|thinking)>")
+
+
+def _think_puzzle(seed):
+    """A short arithmetic chain with one checkable answer: easy to state,
+    and the model needs to reason (or get lucky) to land it."""
+    rnd = random.Random(seed)
+    xs = [rnd.randint(11, 99) for _ in range(9)]
+    ans = sum(a * b for a, b in zip(xs, xs[1:])) % 97
+    q = ("Numbers: %s. Multiply each adjacent pair, add up the products, and give the total modulo 97. "
+         "Reply with only the final number." % ", ".join(map(str, xs)))
+    return q, ans
+
+
+def _think_answer(text):
+    """The last integer in the visible answer (thought blocks removed)."""
+    nums = re.findall(r"-?\d+", _THINK_TAG.sub("", text or ""))
+    return int(nums[-1]) if nums else None
+
+
+def _median(xs):
+    xs = sorted(x for x in xs if isinstance(x, (int, float)))
+    if not xs:
+        return None
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
+
+
+class ThinkProber(Prober):
+    """What the upstream does with reasoning controls: reasoning_effort,
+    Google's thinking_config (several wire shapes), where thought text comes
+    back, Gemini thought signatures on tool calls, whether reasoning text sent
+    back in history is billed as prompt, and whether reasoning tokens cost
+    credits (from the x-ratelimit-remaining-credits-day header)."""
+
+    def __init__(self, args, client, red, out):
+        super().__init__(args, client, red, out)
+        self.seed = int(time.time())
+        self.n = 0
+        self.f = {}          # findings for the verdict
+        self.shape = None    # (name, builder) of the thinking_config shape that returned thoughts
+
+    # ---- helpers ----
+    def ask(self, label, stream=False, **kw):
+        self.n += 1
+        q, ans = _think_puzzle(self.seed + self.n)
+        if stream:
+            kw.setdefault("stream_options", {"include_usage": True})
+        r = self.chat([{"role": "user", "content": q}], label, stream=stream, **kw)
+        return r, (_think_answer(r.content) == ans) if r.ok else None
+
+    @staticmethod
+    def rtok(r):
+        u = r.usage if isinstance(r.usage, dict) else {}
+        v = (u.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        return v if isinstance(v, (int, float)) else None
+
+    @staticmethod
+    def utok(r, k):
+        u = r.usage if isinstance(r.usage, dict) else {}
+        v = u.get(k)
+        return v if isinstance(v, (int, float)) else None
+
+    @staticmethod
+    def where(r):
+        """Where thought text came back: a tag in content, reasoning_content,
+        the gemini_enterprise.thinking array, or nowhere."""
+        out = []
+        m = _THINK_TAG.search(r.content or "")
+        if m:
+            lead = (r.content or "")[:m.start()].strip() == ""
+            out.append("content <%s> %s, %d chars" % (m.group(1), "leading" if lead else "mid-text", len(m.group(2))))
+        elif _THINK_OPEN.search(r.content or ""):
+            out.append("content: unclosed <%s>" % _THINK_OPEN.search(r.content).group(1))
+        if r.reasoning:
+            out.append("reasoning_content %d chars" % len(r.reasoning))
+        if r.thinking:
+            out.append("gemini_enterprise.thinking x%d" % r.thinking)
+        return out
+
+    @staticmethod
+    def thought_text(r):
+        m = _THINK_TAG.search(r.content or "")
+        return (m.group(2) if m else "") or r.reasoning or ""
+
+    @staticmethod
+    def sigs(r):
+        """Gemini thought signatures in the reply: on tool calls and on the
+        message, from the JSON body or any SSE event."""
+        found = {"tool_call": [], "message": 0}
+        msgs = []
+        if isinstance(r.json, dict):
+            msgs += [(c.get("message") or {}) for c in (r.json.get("choices") or []) if isinstance(c, dict)]
+        for ev in r.events:
+            if isinstance(ev, dict):
+                msgs += [(c.get("delta") or {}) for c in (ev.get("choices") or []) if isinstance(c, dict)]
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if ((m.get("extra_content") or {}).get("google") or {}).get("thought_signature"):
+                found["message"] += 1
+            for tc in m.get("tool_calls") or []:
+                s = ((tc.get("extra_content") or {}).get("google") or {}).get("thought_signature")
+                if s:
+                    found["tool_call"].append((tc.get("id"), tc.get("index"), s))
+        return found
+
+    def credits_left(self, r):
+        h = getattr(r, "headers", {}) or {}
+        v = h.get("x-ratelimit-remaining-credits-day")
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def line(self, tid, title, r, ok=None, extra=""):
+        if not r.ok:
+            self.rec(tid, title, "ERR", self.fail_note(r), r)
+            return
+        bits = ["reasoning=%s" % self.rtok(r), "completion=%s" % self.utok(r, "completion_tokens")]
+        if ok is not None:
+            bits.append("answer " + ("right" if ok else "wrong"))
+        w = self.where(r)
+        bits.append("thoughts: " + ("; ".join(w) if w else "none"))
+        if extra:
+            bits.append(extra)
+        self.rec(tid, title, "INFO", " ".join(bits), r)
+        t = self.thought_text(r)
+        if t:
+            self.p("       thought excerpt: %s" % self.excerpt(t, 160))
+
+    def on(self, s):
+        return not self.a.only or s in self.a.only
+
+    # ---- run ----
+    def run(self):
+        t0 = time.monotonic()
+        self.p("=== harness probe thinking v%s (redacted; safe to paste) ===" % VERSION)
+        self.p("date_utc=%s python=%s model=%s repeat=%d"
+               % (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
+                  platform.python_version(), self.model, self.a.repeat))
+        self.p("each puzzle is a 9-number arithmetic chain with one right answer; 'reasoning' is "
+               "usage.completion_tokens_details.reasoning_tokens")
+        r = self.c.request("/v1/models", method="GET", label="T0 models")
+        if r.status in (401, 403) and "unlock" in (r.text or "").lower():
+            raise SystemExit("aborting: the API key is LOCKED. Run 'harness unlock', unlock it in the "
+                             "browser, then re-run 'harness probe thinking'.")
+        if r.ok:
+            self.read_weights(r)
+        self.p("credit weights in/out for %s: %s" % (self.model, "%s/%s" % self.weights.get(self.model, ("?", "?"))))
+        for s, fn in (("1", self.sec_default), ("2", self.sec_effort), ("3", self.sec_shapes),
+                      ("4", self.sec_levels), ("5", self.sec_conflict_stream), ("6", self.sec_signatures),
+                      ("7", self.sec_history), ("8", self.sec_billing)):
+            if self.on(s):
+                fn()
+        self.summary(time.monotonic() - t0)
+
+    # 1. no reasoning controls at all
+    def sec_default(self):
+        self.section("1. default (no reasoning controls)")
+        rts, oks = [], []
+        for i in range(self.a.repeat):
+            r, ok = self.ask("T1 default #%d" % (i + 1))
+            self.line("T1", "default #%d" % (i + 1), r, ok)
+            rts.append(self.rtok(r))
+            oks.append(ok)
+        r, ok = self.ask("T1s default stream", stream=True)
+        self.line("T1s", "default, streamed", r, ok, "events=%d" % r.event_count)
+        self.f["default"] = (_median(rts), sum(1 for o in oks if o), len(oks))
+
+    # 2. reasoning_effort ladder
+    def sec_effort(self):
+        self.section("2. reasoning_effort")
+        ladder = {}
+        for eff in ("none", "minimal", "low", "medium", "high"):
+            rts, oks, secs, errs = [], [], [], []
+            for i in range(self.a.repeat):
+                r, ok = self.ask("T2 reasoning_effort=%s #%d" % (eff, i + 1), reasoning_effort=eff)
+                self.line("T2", "reasoning_effort=%s #%d" % (eff, i + 1), r, ok)
+                if r.ok:
+                    rts.append(self.rtok(r))
+                    oks.append(ok)
+                    secs.append(r.elapsed)
+                else:
+                    errs.append(r.status)
+                    break
+            ladder[eff] = (_median(rts), sum(1 for o in oks if o), len(oks), _median(secs), errs)
+        self.f["effort"] = ladder
+
+    # 3. which thinking_config wire shape is honored
+    def sec_shapes(self):
+        self.section("3. thinking_config wire shapes (include_thoughts, level low)")
+        tc = {"include_thoughts": True, "thinking_level": "low"}
+        shapes = [
+            ("extra_body.google.thinking_config", lambda c: {"extra_body": {"google": {"thinking_config": c}}}),
+            ("google.thinking_config (top level)", lambda c: {"google": {"thinking_config": c}}),
+            ("extra_body.google.thinkingConfig (camelCase)", lambda c: {"extra_body": {"google": {"thinkingConfig": {
+                ("includeThoughts" if k == "include_thoughts" else "thinkingLevel" if k == "thinking_level"
+                 else "thinkingBudget" if k == "thinking_budget" else k): v for k, v in c.items()}}}}),
+            ("thinking_config (top level)", lambda c: {"thinking_config": c}),
+        ]
+        res = []
+        for name, build in shapes:
+            r, ok = self.ask("T3 %s" % name, **build(tc))
+            self.line("T3", name, r, ok)
+            got = r.ok and bool(self.where(r))
+            res.append((name, r.status, got))
+            if got and not self.shape:
+                self.shape = (name, build)
+        self.f["shapes"] = res
+
+    def think_kw(self, **c):
+        build = self.shape[1] if self.shape else (lambda x: {"extra_body": {"google": {"thinking_config": x}}})
+        return build(c)
+
+    # 4. levels and budgets through the honored shape
+    def sec_levels(self):
+        name = self.shape[0] if self.shape else "extra_body.google.thinking_config (no shape returned thoughts)"
+        self.section("4. thinking levels via %s" % name)
+        levels = {}
+        for lvl in ("minimal", "low", "medium", "high"):
+            rts, oks, secs, tl, errs = [], [], [], [], []
+            for i in range(self.a.repeat):
+                r, ok = self.ask("T4 level=%s #%d" % (lvl, i + 1), **self.think_kw(include_thoughts=True, thinking_level=lvl))
+                self.line("T4", "thinking_level=%s #%d" % (lvl, i + 1), r, ok)
+                if r.ok:
+                    rts.append(self.rtok(r))
+                    oks.append(ok)
+                    secs.append(r.elapsed)
+                    tl.append(len(self.thought_text(r)))
+                else:
+                    errs.append(r.status)
+                    break
+            levels[lvl] = (_median(rts), sum(1 for o in oks if o), len(oks), _median(secs), _median(tl), errs)
+        self.f["levels"] = levels
+        r, ok = self.ask("T4h high without thoughts", **self.think_kw(include_thoughts=False, thinking_level="high"))
+        self.line("T4h", "thinking_level=high, include_thoughts=false", r, ok)
+        self.f["high_hidden"] = (r.status, self.rtok(r), bool(self.where(r)))
+        for b in (0, 4096):
+            r, ok = self.ask("T4b budget=%d" % b, **self.think_kw(include_thoughts=True, thinking_budget=b))
+            self.line("T4b", "thinking_budget=%d (instead of a level)" % b, r, ok)
+            self.f.setdefault("budget", []).append((b, r.status, self.rtok(r)))
+
+    # 5. reasoning_effort + thinking_config together; streamed thoughts
+    def sec_conflict_stream(self):
+        self.section("5. both controls at once; thoughts in a stream")
+        r, ok = self.ask("T5 both", reasoning_effort="low", **self.think_kw(include_thoughts=True, thinking_level="low"))
+        self.line("T5", "reasoning_effort=low + thinking_config together", r, ok)
+        self.f["conflict"] = (r.status, "" if r.ok else self.fail_note(r))
+        r, ok = self.ask("T5s stream thoughts", stream=True, **self.think_kw(include_thoughts=True, thinking_level="medium"))
+        evs = []
+        for ev in r.events:
+            for ch in (ev.get("choices") or []) if isinstance(ev, dict) else []:
+                d = ch.get("delta") or {}
+                evs.append((_content_to_text(d.get("content")), d.get("reasoning_content") or d.get("reasoning") or ""))
+        layout = []
+        for c, rc in evs:
+            tags = []
+            if _THINK_OPEN.search(c):
+                tags.append("open")
+            if re.search(r"</(think|thought|thinking)>", c):
+                tags.append("close")
+            if rc:
+                tags.append("reasoning_content")
+            if c and not tags:
+                tags.append("text")
+            t = "+".join(tags)
+            if t and layout and layout[-1][0] == t:
+                layout[-1][1] += 1
+            elif t:
+                layout.append([t, 1])
+        layout = ["%s x%d" % (t, n) if n > 1 else t for t, n in layout]
+        joined = "".join(c for c, _ in evs)
+        split = bool(_THINK_OPEN.search(joined)) and not any(_THINK_OPEN.search(c) for c, _ in evs)
+        self.line("T5s", "streamed, thinking_level=medium", r, ok,
+                  "events=%d layout=[%s]%s" % (r.event_count, ", ".join(layout[:16]), " TAG SPLIT ACROSS EVENTS" if split else ""))
+        self.f["stream"] = (r.status, r.event_count, ", ".join(layout[:16]), split, bool(self.where(r)))
+
+    # 6. thought signatures across a tool round trip
+    def sec_signatures(self):
+        self.section("6. thought signatures on tool calls")
+        code = "FALCON-%04d" % random.Random(self.seed).randint(1000, 9999)
+        tools = [fn_tool("lookup_code", "Look up the access code for a named project.",
+                         {"name": {"type": "string", "description": "project name"}}, ["name"])]
+        user = {"role": "user", "content": "Use lookup_code to get the access code for project falcon, "
+                                           "then reply with the code only."}
+        res = {}
+        for stream in (False, True):
+            r = self.chat([user], "T6 step1 %s" % ("stream" if stream else "json"), stream=stream, tools=tools,
+                          **({"stream_options": {"include_usage": True}} if stream else {}))
+            s = self.sigs(r)
+            ok = r.ok and bool(r.tool_calls)
+            self.rec("T6%s" % ("s" if stream else ""), "step 1 tool call (%s)" % ("streamed" if stream else "json"),
+                     "INFO" if ok else ("ERR" if not r.ok else "FAIL"),
+                     ("calls=%s signatures on tool calls=%d on message=%d"
+                      % (self.calls_desc(r), len(s["tool_call"]), s["message"])) if r.ok else self.fail_note(r), r)
+            res["sig_" + ("stream" if stream else "json")] = len(s["tool_call"])
+            if not stream:
+                first, sig = r, s
+        if not (first.ok and first.tool_calls):
+            self.f["sig"] = res
+            return
+        tc = first.tool_calls[0]
+        sig_val = sig["tool_call"][0][2] if sig["tool_call"] else None
+        bogus = base64.b64encode(os.urandom(48)).decode()
+
+        def step2(variant):
+            call = {"id": tc["id"] or "call_1", "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"] if isinstance(tc["arguments"], str)
+                                 else json.dumps(tc["arguments"])}}
+            if variant == "echoed" and sig_val:
+                call["extra_content"] = {"google": {"thought_signature": sig_val}}
+            if variant == "corrupted":
+                call["extra_content"] = {"google": {"thought_signature": bogus}}
+            msgs = [user, {"role": "assistant", "content": None, "tool_calls": [call]},
+                    {"role": "tool", "tool_call_id": call["id"], "content": json.dumps({"code": code})}]
+            r = self.chat(msgs, "T6 step2 %s" % variant, tools=tools)
+            good = r.ok and code in (r.content or "")
+            self.rec("T6b", "step 2 with the signature %s" % variant, "INFO" if r.ok else "ERR",
+                     ("answer %s, reasoning=%s" % ("has the code" if good else "missing the code", self.rtok(r)))
+                     if r.ok else self.fail_note(r), r, r.content, 80)
+            return r.status, good
+
+        for v in (("echoed", "omitted", "corrupted") if sig_val else ("omitted", "corrupted")):
+            res[v] = step2(v)
+        self.f["sig"] = res
+
+    # 7. is reasoning text sent back in history billed as prompt?
+    def sec_history(self):
+        self.section("7. reasoning text sent back in history")
+        pad = filler(6000, seed=self.seed)
+        base = [{"role": "user", "content": "Name a primary color."},
+                {"role": "assistant", "content": "Red."},
+                {"role": "user", "content": "Reply with OK."}]
+        variants = [("plain", base),
+                    ("reasoning_content 6k chars", [base[0], dict(base[1], reasoning_content=pad), base[2]]),
+                    ("<think> 6k chars in content", [base[0], dict(base[1], content="<think>%s</think>Red." % pad), base[2]])]
+        pts = {}
+        for name, msgs in variants:
+            r = self.chat(msgs, "T7 %s" % name)
+            pts[name] = self.utok(r, "prompt_tokens") if r.ok else None
+            self.rec("T7", "history with %s" % name, "INFO" if r.ok else "ERR",
+                     ("prompt_tokens=%s" % pts[name]) if r.ok else self.fail_note(r), r)
+        self.f["history"] = pts
+
+    # 8. do reasoning tokens cost credits?
+    def sec_billing(self):
+        self.section("8. are reasoning tokens billed? (credits header)")
+        wi, wo = self.weights.get(self.model, (None, None))
+        hi = self.think_kw(include_thoughts=False, thinking_level="high")
+        seq = []
+        for label in ("ping", "heavy", "ping", "heavy", "ping", "heavy", "ping"):
+            if label == "ping":
+                r = self.chat([{"role": "user", "content": "Reply with OK."}], "T8 ping")
+            else:
+                r, _ = self.ask("T8 heavy", **hi)
+            left = self.credits_left(r)
+            pt, ct, rt = self.utok(r, "prompt_tokens") or 0, self.utok(r, "completion_tokens") or 0, self.rtok(r) or 0
+            free = (pt * wi + ct * wo) if wi is not None else None
+            billed = (free + rt * wo) if free is not None else None
+            seq.append((left, free, billed))
+            self.rec("T8", label, "INFO" if r.ok else "ERR",
+                     ("credits left=%s; prompt=%s completion=%s reasoning=%s; charge if reasoning free=%s, if billed=%s"
+                      % (left, pt, ct, rt, free, billed)) if r.ok else self.fail_note(r), r)
+            if not r.ok:
+                break
+        if len(seq) < 7 or any(x[0] is None for x in seq):
+            self.rec("T8", "verdict", "INFO", "x-ratelimit-remaining-credits-day missing (or a request failed); not measured")
+            self.f["billing"] = None
+            return
+        drops = [seq[i - 1][0] - seq[i][0] for i in range(1, len(seq))]
+        if wi is None:
+            self.f["billing"] = ("no credit_weights in /v1/models for this model; drops %s" % drops, None)
+            return
+        # The header can report the balance after this request (drop i = charge
+        # of request i) or before it (drop i = charge of request i-1); try both.
+        best = None
+        for align, off in (("after", 0), ("before", 1)):
+            for model, k in (("free", 1), ("billed", 2)):
+                exp = [seq[i - off][k] for i in range(1, len(seq))]
+                err = sum(abs(d - e) for d, e in zip(drops, exp)) / max(1, sum(exp))
+                if best is None or err < best[0]:
+                    best = (err, model, align, exp)
+        err, model, align, exp = best
+        note = ("best fit: reasoning %s (header shows the balance %s the request), mean miss %.0f%%; drops %s vs "
+                "expected %s" % ("BILLED" if model == "billed" else "FREE", align, err * 100, drops, exp))
+        if err > 0.3:
+            note = "no clean fit (other use of this key during the run?); " + note
+        self.rec("T8", "verdict", "INFO", note)
+        self.f["billing"] = (note, model)
+
+    # ---- verdict ----
+    def summary(self, secs):
+        f = self.f
+        self.p("")
+        self.p("=== thinking verdict ===")
+        if "default" in f:
+            rt, k, n = f["default"]
+            self.p("default: median reasoning tokens %s, %d/%d right" % (rt, k, n))
+        if "effort" in f:
+            parts = []
+            for eff, (rt, k, n, s, errs) in f["effort"].items():
+                parts.append("%s: %s" % (eff, ("HTTP %s" % errs[0]) if errs and not n
+                                          else "%s tok %d/%d right %.1fs" % (rt, k, n, s or 0)))
+            self.p("reasoning_effort: " + "; ".join(parts))
+        if "shapes" in f:
+            ok = [n for n, st, got in f["shapes"] if got]
+            self.p("thinking_config shape that returned thoughts: %s" % (", ".join(ok) if ok else "NONE"))
+            self.p("  all: " + "; ".join("%s=%s%s" % (n, st, "+thoughts" if got else "") for n, st, got in f["shapes"]))
+        if "levels" in f:
+            self.p("thinking_level: " + "; ".join(
+                "%s: %s" % (l, ("HTTP %s" % e[0]) if e and not n else "%s tok %d/%d right %.1fs thoughts~%s chars"
+                            % (rt, k, n, s or 0, tl))
+                for l, (rt, k, n, s, tl, e) in f["levels"].items()))
+        if "high_hidden" in f:
+            st, rt, vis = f["high_hidden"]
+            self.p("high with include_thoughts=false: HTTP %s, reasoning %s, thoughts %s" % (st, rt, "shown" if vis else "hidden"))
+        if "budget" in f:
+            self.p("thinking_budget: " + "; ".join("%d -> HTTP %s, %s tok" % b for b in f["budget"]))
+        if "conflict" in f:
+            st, err = f["conflict"]
+            self.p("reasoning_effort + thinking_config together: HTTP %s %s" % (st, err))
+        if "stream" in f:
+            st, ne, lay, split, vis = f["stream"]
+            self.p("streamed thoughts: HTTP %s, %d events, layout [%s]%s" % (st, ne, lay, ", tag split across events" if split else ""))
+        if "sig" in f:
+            s = f["sig"]
+            self.p("thought signatures: json=%s streamed=%s; step 2: %s" % (
+                s.get("sig_json"), s.get("sig_stream"),
+                "; ".join("%s=HTTP %s %s" % (v, s[v][0], "ok" if s[v][1] else "no-answer")
+                          for v in ("echoed", "omitted", "corrupted") if v in s)))
+        if "history" in f:
+            h = f["history"]
+            base = h.get("plain")
+            self.p("history prompt_tokens: " + "; ".join(
+                "%s=%s%s" % (k, v, (" (+%s)" % (v - base)) if isinstance(v, (int, float)) and isinstance(base, (int, float)) and k != "plain" else "")
+                for k, v in h.items()))
+        if "billing" in f:
+            self.p("reasoning billing: " + (f["billing"][0] if f["billing"] else "no credits header, not measured"))
+        self.p(self.usage_line())
+        self.p("elapsed %.0fs" % secs)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="harness probe", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--suite", choices=("full", "memory", "single"), default="full", help="which suite to run (default full)")
+    ap.add_argument("--suite", choices=("full", "memory", "single", "thinking"), default="full", help="which suite to run (default full)")
     ap.add_argument("--model", default=os.environ.get("DEFAULT_MODEL_NAME", ""), help="model for the suite (default: DEFAULT_MODEL_NAME)")
-    ap.add_argument("--repeat", type=int, default=3, help="repeats for the stochastic key checks (default 3)")
+    ap.add_argument("--repeat", type=int, default=None, help="repeats for the stochastic key checks (default 3; thinking 2)")
     ap.add_argument("--timeout", type=int, default=None, help="per-request timeout seconds (default 120; memory 240; single 300)")
     ap.add_argument("--skip-long", action="store_true", help="skip the long-context needle tests")
     ap.add_argument("--no-matrix", action="store_true", help="skip the per-model matrix")
-    ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs); memory: digits, e.g. '124'")
+    ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs); memory/thinking: digits, e.g. '124'")
     ap.add_argument("--quick", action="store_true", help="memory/single: fewer sizes and repeats")
     ap.add_argument("--budget", type=int, default=500000,
                     help="memory: stop a section before the run passes this many credits (default 500000; 0 = no cap)")
@@ -3212,6 +3668,8 @@ def main():
     ap.add_argument("--delay-scale", type=float, default=1.0, help=argparse.SUPPRESS)  # tests: skip waits
     a = ap.parse_args()
     a.only = a.only.upper()
+    if a.repeat is None:
+        a.repeat = 2 if a.suite == "thinking" else 3
     if a.timeout is None:
         a.timeout = {"memory": 240, "single": 300}.get(a.suite, 120)
     if not 6 <= a.facts <= 90:
@@ -3263,7 +3721,7 @@ def main():
         print(s, flush=True)
 
     client = Client(base, key, a.timeout, log if log_fh else None, red)
-    prober = {"memory": MemProber, "single": SingleProber}.get(a.suite, Prober)(a, client, red, out)
+    prober = {"memory": MemProber, "single": SingleProber, "thinking": ThinkProber}.get(a.suite, Prober)(a, client, red, out)
     rc = 0
     try:
         prober.run()

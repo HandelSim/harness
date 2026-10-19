@@ -33,6 +33,11 @@
 #      layouts, one whole example message and the '### results' line
 #   T12 the single suite's scorer on tricky replies: a port line with history,
 #      a fenced ack line, an injection that is reported rather than obeyed
+#   T13 'harness probe thinking' exits 0 with every section and the verdict:
+#      the honored thinking_config shape, thoughts split out of content, the
+#      400 on both controls, signatures echoed/omitted/corrupted, history
+#      billing, and a credits-header fit (the mock bills reasoning)
+#   T14 none of the secrets appear in the thinking suite's stdout or log
 #
 # Prints "PROBE TEST PASSED" on success.
 
@@ -76,6 +81,8 @@ LOCKED = sys.argv[3] == "locked"
 QUOTA = sys.argv[3] == "quota"
 PORT_FILE = sys.argv[1]
 SEEN = {"single": 0}
+CREDITS = {"left": 10000000}
+LEVEL_TOKENS = {"minimal": 4, "low": 40, "medium": 160, "high": 640}
 
 
 def leak(h):
@@ -95,6 +102,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("x-ratelimit-remaining-credits-day", str(CREDITS["left"]))
         self.end_headers()
         self.wfile.write(body)
 
@@ -110,7 +118,8 @@ class H(BaseHTTPRequestHandler):
             return
         if self.path != PREFIX + "/v1/models":
             return self.send(404, {"error": {"type": "not_found", "message": leak(self)}})
-        self.send(200, {"object": "list", "data": [{"id": "mock-a"}, {"id": "mock-b"}],
+        self.send(200, {"object": "list", "data": [{"id": "mock-a", "credit_weights": {"input": 1, "output": 1}},
+                                                   {"id": "mock-b"}],
                         "note": leak(self)})
 
     def do_POST(self):
@@ -136,6 +145,15 @@ class H(BaseHTTPRequestHandler):
                                              "message": "Daily credit limit exceeded. " + leak(self)}})
         if req.get("model") == "probe-nonexistent-model-xyz":
             return self.send(400, {"error": {"type": "invalid_request_model", "message": "unknown model"}})
+        tc_cfg = ((req.get("extra_body") or {}).get("google") or {}).get("thinking_config") or {}
+        if tc_cfg and req.get("reasoning_effort"):
+            # Like the real upstream: both reasoning controls at once is a 400.
+            return self.send(400, {"error": {"type": "invalid_request", "message": "reasoning_effort and thinking_config both set"}})
+        for m in msgs:
+            for c in (m.get("tool_calls") or []) if isinstance(m, dict) else []:
+                sig = ((c.get("extra_content") or {}).get("google") or {}).get("thought_signature")
+                if sig is not None and not sig.startswith("SIG"):
+                    return self.send(400, {"error": {"type": "invalid_request", "message": "Corrupted thought signature."}})
         tools = req.get("tools") or []
         last = msgs[-1] if msgs else {}
         text_all = json.dumps(msgs)
@@ -159,6 +177,13 @@ class H(BaseHTTPRequestHandler):
             ack = re.search(r"`ack: ([a-z]+-[0-9]+)`", last_text)
             content = "\n".join(lines + ["PORT: " + (ports[-1] if ports else "?"), leak(self),
                                           "ack: " + (ack.group(1) if ack else "?")])
+        elif "Multiply each adjacent pair" in last_text:
+            # Thinking suite puzzle: answer it, with a thought block in front
+            # when thoughts are asked for.
+            xs = [int(x) for x in re.search(r"Numbers: ([\d, ]+)\.", last_text).group(1).split(", ")]
+            content = str(sum(a * b for a, b in zip(xs, xs[1:])) % 97)
+            if tc_cfg.get("include_thoughts"):
+                content = "<thought>**Adding the products** pairwise, then mod 97. %s</thought>%s" % (leak(self), content)
         elif "crate" in last_text:
             # Memory suite: behave like an upstream that sees only the last
             # message (echo the crate labels found there).
@@ -173,12 +198,18 @@ class H(BaseHTTPRequestHandler):
             content = None
         elif last.get("role") == "tool":
             content = "It is 18 degrees. " + leak(self)
+            if "FALCON-" in str(last.get("content")):
+                content = re.search(r"FALCON-\d+", last["content"]).group(0)
         if req.get("response_format"):
             content = json.dumps({"title": "Dune", "author": "Frank Herbert", "publication_year": 1965})
         ge = {"assist_token": "ASSISTSECRET123456", "session": "projects/p-123456/locations/global/sessions/9",
               "thinking": ["thought about it " + leak(self)]}
         pt, rt = max(10, len(raw) // 3), 0 if req.get("reasoning_effort") == "none" else 20
-        usage = {"prompt_tokens": pt, "completion_tokens": 5, "total_tokens": pt + 5 + rt,
+        rt = LEVEL_TOKENS.get(tc_cfg.get("thinking_level"), rt)
+        CREDITS["left"] -= pt + 5 + rt
+        if tool_calls:
+            for i, tc in enumerate(tool_calls):
+                tc["extra_content"] = {"google": {"thought_signature": "SIGmock%d" % i}}        usage = {"prompt_tokens": pt, "completion_tokens": 5, "total_tokens": pt + 5 + rt,
                  "completion_tokens_details": {"reasoning_tokens": rt}}
         if req.get("stream"):
             evs = []
@@ -186,7 +217,8 @@ class H(BaseHTTPRequestHandler):
             if tool_calls:
                 tc = tool_calls[0]
                 evs.append(dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "tool_calls": [
-                    {"index": 0, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": ""}}]}}]))
+                    {"index": 0, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": ""},
+                     "extra_content": tc["extra_content"]}]}}]))
                 a = tc["function"]["arguments"]
                 for i in range(0, len(a), 7):
                     evs.append(dict(base, choices=[{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": a[i:i + 7]}}]}}]))
@@ -296,7 +328,8 @@ ok "T6 locked key aborts with a redacted hint"
 
 # --- T7: subcommand help ---
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe help 2>&1); rc=$?
-[[ $rc -eq 0 && "$out" == *"full "* && "$out" == *"memory "* && "$out" == *"optimize-single"* && "$out" == *"help "* ]] \
+[[ $rc -eq 0 && "$out" == *"full "* && "$out" == *"memory "* && "$out" == *"optimize-single"* && "$out" == *"thinking "* \
+   && "$out" == *"help "* ]] \
     || fail "T7 'probe help': rc=$rc out=$out"
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe memory --help 2>&1); rc=$?
 [[ $rc -eq 0 && "$out" == *"usage: harness probe memory"* && "$out" == *"--long-term"* ]] \
@@ -304,9 +337,12 @@ out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe memory --help 2>&1); rc=$?
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe --optimize-single --help 2>&1); rc=$?
 [[ $rc -eq 0 && "$out" == *"usage: harness probe optimize-single"* && "$out" == *"--framings"* ]] \
     || fail "T7 'probe --optimize-single --help': rc=$rc out=$out"
+out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe thinking --help 2>&1); rc=$?
+[[ $rc -eq 0 && "$out" == *"usage: harness probe thinking"* && "$out" == *"thought signatures"* ]] \
+    || fail "T7 'probe thinking --help': rc=$rc out=$out"
 out=$(PROXY_API_URL="" PROXY_API_KEY="" cmd_probe bogus 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"unknown probe subcommand"* ]] || fail "T7 unknown subcommand: rc=$rc out=$out"
-ok "T7 probe help / memory --help / --optimize-single --help / unknown subcommand"
+ok "T7 probe help / memory --help / --optimize-single --help / thinking --help / unknown subcommand"
 
 # --- T8: memory suite against the mock ---
 rm -f "$TMP_ROOT"/state/output/probe-*.log
@@ -456,5 +492,39 @@ PYEOF2
 )
 [[ "$out" == *"SCORER OK"* ]] || fail "T12 scorer: $out"
 ok "T12 single-suite scorer handles port history, fenced ack, reported injection"
+
+# --- T13: thinking suite against the mock ---
+start_mock ok
+URL="http://127.0.0.1:${PORT}/${PREFIX}"
+out=$(PROXY_API_URL="$URL" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" HARNESS_PROBE_REDACT="$ORG" \
+      cmd_probe thinking --repeat 1 --timeout 20 2>&1); rc=$?
+stop_mock
+echo "$out" >"$TMP_ROOT/stdout-think.txt"
+[[ $rc -eq 0 ]] || { echo "$out" | tail -30; fail "T13 thinking probe exited $rc"; }
+for want in "=== harness probe thinking v" "--- 1. " "--- 2. " "--- 3. " "--- 4. " "--- 5. " "--- 6. " \
+            "--- 7. " "--- 8. " "=== thinking verdict ===" "answer right" "thoughts: content <thought> leading" \
+            "thinking_config shape that returned thoughts: extra_body.google.thinking_config" \
+            "thinking_level: minimal: 4 tok" "high: 640 tok" "together: HTTP 400" \
+            "thought signatures: json=1 streamed=1" "echoed=HTTP 200 ok" "omitted=HTTP 200 ok" "corrupted=HTTP 400" \
+            "reasoning_content 6k chars=" "reasoning billing: best fit: reasoning BILLED" \
+            "full redacted request log: state/output/probe-thinking-" "=== end harness probe ==="; do
+    [[ "$out" == *"$want"* ]] || { echo "$out" | tail -40; fail "T13 missing '$want' in output"; }
+done
+[[ "$out" == *"default: median reasoning tokens 20, 1/1 right"* ]] || { echo "$out" | tail -40; fail "T13 default line"; }
+ok "T13 thinking suite exits 0 with all sections and a verdict"
+
+# --- T14: thinking suite redaction ---
+log=$(ls "$TMP_ROOT"/state/output/probe-thinking-*.log 2>/dev/null | head -1)
+[[ -n "$log" && -s "$log" ]] || fail "T14 no thinking log written under state/output"
+for f in "$TMP_ROOT/stdout-think.txt" "$log"; do
+    for secret in "$KEY" "PROBEKEY" "tok_PROB" "$PREFIX" "secretcorp" "admin" "10.1." "127.0" ":${PORT}" \
+                  "p-123456" "ASSISTSECRET" "$ORG" "unlock.secret"; do
+        if grep -qiF -- "$secret" "$f"; then
+            grep -niF -- "$secret" "$f" | head -3 >&2
+            fail "T14 secret '$secret' leaked into $(basename "$f")"
+        fi
+    done
+done
+ok "T14 no secrets in the thinking suite's stdout or log"
 
 echo "PROBE TEST PASSED"
