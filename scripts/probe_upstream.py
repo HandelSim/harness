@@ -209,7 +209,9 @@ _SECRET_FIELDS = {"assist_token", "session", "session_id", "conversation_id", "u
                   "key", "token", "access_token"}
 
 
-_SENSITIVE_HEADER = re.compile(r"cookie|authorization|authenticate|token|secret|api-key|apikey|session", re.I)
+# x-ratelimit-*-tokens is a count, not a credential, and is kept.
+_SENSITIVE_HEADER = re.compile(r"^(?!x-ratelimit-).*(cookie|authorization|authenticate|token|secret|api-key|apikey|session)",
+                               re.I)
 
 
 def _scrub(obj):

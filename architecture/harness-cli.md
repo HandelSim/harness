@@ -1064,9 +1064,9 @@ breaks the recursion.
 `cmd_probe` runs `scripts/probe_upstream.py` (stdlib-only Python) straight
 against `PROXY_API_URL` with `PROXY_API_KEY`. The proxy is not involved.
 Subcommands: `full` (the default; bare `harness probe`), `memory`,
-`optimize-single` (alias `--optimize-single`), `thinking`, and `help` (lists
-them); `<subcommand> --help` gives that suite's options. The subcommand
-reaches the script as `--suite full|memory|single|thinking`.
+`optimize-single` (alias `--optimize-single`), `thinking`, `slim`, and `help`
+(lists them); `<subcommand> --help` gives that suite's options. The
+subcommand reaches the script as `--suite full|memory|single|thinking|slim`.
 
 The full suite characterizes the upstream for the question "could an agent
 talk to it directly?". Sections:
@@ -1169,13 +1169,33 @@ back (a `<think>`/`<thought>` tag in content, `reasoning_content`, or the
 1 default; 2 the `reasoning_effort` ladder; 3 which `thinking_config` wire
 shape returns visible thoughts; 4 `thinking_level` and `thinking_budget`
 through that shape; 5 both controls at once, and how a stream splits the
-thought block across events; 6 Gemini `extra_content.google.thought_signature`
+thought block across events (the log has one layout line per event); 6 Gemini `extra_content.google.thought_signature`
 on a tool call, then step 2 with it echoed, omitted and corrupted; 7 whether
 reasoning text sent back in history raises `prompt_tokens`; 8 whether
 reasoning tokens cost credits, fitting drops in the
 `x-ratelimit-remaining-credits-day` header (captured on every `Resp`) to the
 catalog's `credit_weights` with and without reasoning. `--repeat` defaults to
 2 here. Log: `state/output/probe-thinking-<ts>.log`.
+
+**`harness probe slim`** (`SlimProber`) measures how much the slim agent
+reads and greps per task, to tune `agents/slim-prompt.md` from numbers
+rather than by hand. It plays an opencode-style session against the
+upstream with the probe as the tools (`_SlimEnv`: read, grep, glob, list,
+edit, write, bash, todowrite, task, over a small fake repo with one bug; a
+pytest run is judged from the file text, model code never runs). The
+system prompts come from the clone (`--root`, which `cmd_probe` sets to
+`clone_dir`, mounting it read-only at `/harness` in the docker fallback),
+the tool descriptions from proxy.py's `_SLIM_TOOL_DESCRIPTIONS` via `ast`.
+`task` runs a nested loop with `agents/slim-subagent-prompt.md` (`general`)
+or a stand-in `explore` prompt (opencode's is not in the repo). Arms
+(digits for `--only`): 1 current prompt with thought signatures dropped (what
+opencode alone sends), 2 current prompt with signatures echoed (what the
+proxy now does), 3 `--candidate` (default `scripts/probe_slim_candidate.md`)
+with signatures echoed. Each run reports solved, steps, reads, greps,
+re-reads, bash, edits, tasks and tokens; a verdict compares the arms'
+medians. Bounds: 30 main steps, 15 per subagent, 60 requests per run.
+The proxy's per-step reminder and old-output trim are not simulated.
+`--repeat` defaults to 1. Log: `state/output/probe-slim-<ts>.log`.
 
 **Redaction is the contract.** Every printed and logged string goes through
 `Redactor`, which removes:
@@ -1188,14 +1208,18 @@ catalog's `credit_weights` with and without reasoning. `--repeat` defaults to
 
 `gemini_enterprise` values are summarized, never dumped. The output is meant
 to be pasted into an issue without editing. A full redacted request log goes
-to `state/output/probe-<ts>.log`, printed by relative path only.
+to `state/output/probe-<ts>.log`, printed by relative path only. It is
+self-contained: each request's record has a `headers:` line (every response
+header but cookie/auth/token/session ones; rate-limit counts are kept), and
+every report line is also written to it as `report: <line>`, in order.
 
 Interpreter: it uses `host_python_bin` (Windows paths go through
 `cygpath -m`). With no host Python it falls back to
 `harness_docker run --entrypoint python harness-proxy:latest -`, passing env
 by name only; the script must stay one file for this. In that fallback the
 log is written to the container's stderr and redirected into the host log
-file. A locked key aborts with a pointer to `harness unlock`, and the
+file; `__file__` is then `<stdin>`, which is why the slim suite takes
+`--root`. A locked key aborts with a pointer to `harness unlock`, and the
 unlock URL is not echoed. `tests/unit_probe_test.sh` drives it against a
 secret-echoing mock.
 

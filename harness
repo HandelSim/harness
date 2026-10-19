@@ -1983,7 +1983,7 @@ send that file for analysis.
   --repeat N        sessions per arm (default 1)
   --candidate PATH  candidate prompt (default scripts/probe_slim_candidate.md)
   --model ID        model to probe (default: DEFAULT_MODEL_NAME)
-  --timeout SECS    per-request timeout
+  --timeout SECS    per-request timeout (default 120)
 EOF
 }
 
