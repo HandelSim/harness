@@ -6102,6 +6102,155 @@ class TestNativeToolPassthrough(unittest.TestCase):
             self.assertFalse(proxy._is_native_tool_model(""))
 
 
+class TestThoughtSignaturesAndThoughts(unittest.TestCase):
+    """Native route: thought signatures opencode drops are put back, and
+    `x-harness-thoughts` moves thought summaries into reasoning_content."""
+
+    FakeResp = TestNativeToolPassthrough.FakeResp
+    SIG = {"google": {"thought_signature": "SIGabc"}}
+
+    def setUp(self):
+        proxy._SIGNATURES.clear()
+        proxy._SIGNATURES_OFF.clear()
+
+    def tearDown(self):
+        proxy._SIGNATURES.clear()
+        proxy._SIGNATURES_OFF.clear()
+
+    def _post(self, body, fakes, headers=None):
+        client = proxy.app.test_client()
+        self.log = io.StringIO()
+        fakes = fakes if isinstance(fakes, list) else [fakes]
+        with patch.object(proxy.requests, "post", side_effect=fakes) as mock_post, \
+                patch.object(proxy, "save_debug_file"), \
+                patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)), \
+                patch("sys.stdout", self.log):
+            resp = client.post("/v1/chat/completions", data=json.dumps(body),
+                               content_type="application/json", headers=headers or {})
+            data = resp.get_data()
+        return resp, data, mock_post
+
+    def _call(self, sig=True, cid="up-1"):
+        tc = {"id": cid, "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+        if sig:
+            tc["extra_content"] = self.SIG
+        return tc
+
+    def _followup(self, cid="up-1"):
+        return {"model": "gemini-x-withtools", "messages": [
+            {"role": "user", "content": "run ls"},
+            {"role": "assistant", "content": None, "tool_calls": [self._call(sig=False, cid=cid)]},
+            {"role": "tool", "tool_call_id": cid, "content": "a.txt"}]}
+
+    def _ok(self):
+        return self.FakeResp(200, json.dumps({"choices": [{"message": {"content": "done"}}]}))
+
+    def test_json_signature_reattached(self):
+        reply = {"choices": [{"finish_reason": "tool_calls", "message": {"tool_calls": [self._call()]}}]}
+        self._post({"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "ls"}]},
+                   self.FakeResp(200, json.dumps(reply)))
+        body = self._followup()
+        _, _, mock_post = self._post(body, self._ok())
+        sent = mock_post.call_args.kwargs["json"]["messages"]
+        self.assertEqual(sent[1]["tool_calls"][0]["extra_content"], self.SIG)
+        self.assertNotIn("extra_content", body["messages"][1]["tool_calls"][0])  # inbound not mutated
+        self.assertIn("signatures_reattached=1", self.log.getvalue())
+
+    def test_sse_signature_reattached(self):
+        ev = json.dumps({"choices": [{"index": 0, "delta": {"tool_calls": [dict(self._call(), index=0)]}}]})
+        raw = f"data: {ev}\n\ndata: [DONE]\n\n".encode()
+        chunks = [raw[:40], raw[40:]]  # an event split across chunks
+        self._post({"model": "gemini-x-withtools", "stream": True,
+                    "messages": [{"role": "user", "content": "ls"}]}, self.FakeResp(200, "", chunks))
+        _, _, mock_post = self._post(self._followup(), self._ok())
+        self.assertEqual(mock_post.call_args.kwargs["json"]["messages"][1]["tool_calls"][0]["extra_content"],
+                         self.SIG)
+
+    def test_unknown_or_signed_calls_left_alone(self):
+        proxy._remember_signatures([self._call(cid="other")])
+        body = self._followup()
+        body["messages"][1]["tool_calls"].append(
+            {**self._call(cid="other"), "extra_content": {"google": {"thought_signature": "OWN"}}})
+        _, _, mock_post = self._post(body, self._ok())
+        tcs = mock_post.call_args.kwargs["json"]["messages"][1]["tool_calls"]
+        self.assertNotIn("extra_content", tcs[0])
+        self.assertEqual(tcs[1]["extra_content"]["google"]["thought_signature"], "OWN")
+        self.assertNotIn("signatures_reattached", self.log.getvalue())
+
+    def test_refused_signature_retried_without_then_off(self):
+        proxy._remember_signatures([self._call()])
+        bad = self.FakeResp(400, json.dumps({"error": {"message": "The request was invalid."}}))
+        resp, _, mock_post = self._post(self._followup(), [bad, self._ok()])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertNotIn("extra_content", mock_post.call_args.kwargs["json"]["messages"][1]["tool_calls"][0])
+        self.assertIn("gemini-x-withtools", proxy._SIGNATURES_OFF)
+        _, _, mock_post = self._post(self._followup(), self._ok())
+        self.assertNotIn("extra_content", mock_post.call_args.kwargs["json"]["messages"][1]["tool_calls"][0])
+
+    def test_400_without_reattach_not_retried(self):
+        bad = self.FakeResp(400, json.dumps({"error": {"message": "bad"}}))
+        resp, _, mock_post = self._post(self._followup(), [bad])
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(proxy._SIGNATURES_OFF, set())
+
+    def test_cache_bounded(self):
+        with patch.object(proxy, "_SIGNATURES_MAX", 3):
+            for i in range(5):
+                proxy._remember_signatures([self._call(cid=f"c{i}")])
+            self.assertEqual(len(proxy._SIGNATURES), 3)
+            self.assertNotIn(proxy._signature_key(self._call(cid="c0")), proxy._SIGNATURES)
+
+    def test_thoughts_json_split(self):
+        reply = {"choices": [{"message": {"role": "assistant", "content": "<think>\n**Plan**\nadd</think>\n\n3"},
+                              "finish_reason": "stop"}]}
+        body = {"model": "gemini-x-withtools", "reasoning_effort": "high",
+                "messages": [{"role": "user", "content": "sum"}]}
+        _, data, mock_post = self._post(body, self.FakeResp(200, json.dumps(reply)),
+                                        {"x-harness-thoughts": "1"})
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertNotIn("reasoning_effort", sent)
+        self.assertEqual(sent["extra_body"]["google"]["thinking_config"],
+                         {"include_thoughts": True, "thinking_level": "high"})
+        msg = json.loads(data)["choices"][0]["message"]
+        self.assertEqual(msg["content"], "3")
+        self.assertEqual(msg["reasoning_content"], "**Plan**\nadd")
+
+    def test_thoughts_stream_synthesized_from_json(self):
+        reply = {"id": "r1", "model": "m", "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+                 "choices": [{"finish_reason": "tool_calls", "message": {
+                     "content": "<think>T</think>", "tool_calls": [self._call()]}}]}
+        body = {"model": "gemini-x-withtools", "stream": True, "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "ls"}]}
+        resp, data, mock_post = self._post(body, self.FakeResp(200, json.dumps(reply)),
+                                           {"x-harness-thoughts": "1"})
+        self.assertFalse(mock_post.call_args.kwargs["stream"])
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertFalse(sent["stream"])
+        self.assertNotIn("stream_options", sent)
+        self.assertEqual(resp.mimetype, "text/event-stream")
+        lines = [ln[6:] for ln in data.decode().split("\n\n") if ln.startswith("data: ")]
+        self.assertEqual(lines[-1], "[DONE]")
+        events = [json.loads(ln) for ln in lines[:-1]]
+        deltas = [e["choices"][0]["delta"] for e in events if e["choices"]]
+        self.assertIn({"reasoning_content": "T"}, deltas)
+        self.assertFalse(any("content" in d for d in deltas))  # the think block was the whole content
+        tc = [d["tool_calls"][0] for d in deltas if "tool_calls" in d][0]
+        self.assertEqual((tc["index"], tc["id"], tc["extra_content"]), (0, "up-1", self.SIG))
+        self.assertEqual([e["choices"][0].get("finish_reason") for e in events if e["choices"]][-1], "tool_calls")
+        self.assertEqual(events[-1]["usage"]["prompt_tokens"], 5)
+        self.assertIn(proxy._signature_key(self._call()), proxy._SIGNATURES)
+
+    def test_no_thoughts_header_no_change(self):
+        body = {"model": "gemini-x-withtools", "reasoning_effort": "low",
+                "messages": [{"role": "user", "content": "sum"}]}
+        reply = {"choices": [{"message": {"content": "<think>T</think>3"}}]}
+        _, data, mock_post = self._post(body, self.FakeResp(200, json.dumps(reply)))
+        self.assertEqual(mock_post.call_args.kwargs["json"], body)
+        self.assertEqual(json.loads(data), reply)
+
+
 class TestOaiUpstream(unittest.TestCase):
     """OAI_MODELS go to the OAI upstream natively: chat requests get the
     reasoning-model fixes and a cache key, and /v1/responses is relayed with

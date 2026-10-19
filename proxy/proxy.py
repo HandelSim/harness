@@ -1112,9 +1112,195 @@ def _oai_chat_retry(req_id: str, payload: Dict[str, Any], model: str, detail: st
     return False
 
 
+# Gemini thought signatures by tool call. The upstream puts one on each tool
+# call (`extra_content.google.thought_signature`); sent back with that call it
+# brings the model's earlier reasoning back into context (billed as input).
+# opencode's openai-compatible provider stores it under the provider's own name
+# but reads it back only under `google`, so for provider `harness` it never
+# returns. The proxy keeps each one by call id and name, from JSON and SSE
+# replies alike, and puts it back on the assistant tool call when it comes
+# back without one. Bounded, oldest out first.
+_SIGNATURES: "Dict[str, Any]" = {}
+_SIGNATURES_MAX = 2048
+# Models whose upstream refused reattached signatures (a 400 that went away
+# without them): no more reattaching for them.
+_SIGNATURES_OFF: set = set()
+
+
+def _signature_key(tc: Dict[str, Any]) -> str:
+    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+    return f"{tc.get('id')}\x00{fn.get('name') or tc.get('name') or ''}"
+
+
+def _remember_signatures(tool_calls: Iterable[Any]) -> int:
+    n = 0
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict) or not tc.get("id"):
+            continue
+        extra = tc.get("extra_content")
+        if not (isinstance(extra, dict) and (extra.get("google") or {}).get("thought_signature")):
+            continue
+        key = _signature_key(tc)
+        _SIGNATURES.pop(key, None)
+        _SIGNATURES[key] = extra
+        n += 1
+    while len(_SIGNATURES) > _SIGNATURES_MAX:
+        _SIGNATURES.pop(next(iter(_SIGNATURES)), None)
+    return n
+
+
+def _remember_json_signatures(body: Any) -> None:
+    for ch in (body.get("choices") or []) if isinstance(body, dict) else []:
+        if isinstance(ch, dict) and isinstance(ch.get("message"), dict):
+            _remember_signatures(ch["message"].get("tool_calls") or [])
+
+
+def _reattach_signatures(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """`messages` with each known signature put back on the assistant tool
+    call that came back without one, and how many were put back. The inbound
+    messages are not mutated."""
+    out: List[Dict[str, Any]] = []
+    n = 0
+    for m in messages:
+        tcs = m.get("tool_calls") if isinstance(m, dict) and m.get("role") == "assistant" else None
+        if not isinstance(tcs, list) or not any(
+            isinstance(tc, dict) and not tc.get("extra_content") and _signature_key(tc) in _SIGNATURES for tc in tcs
+        ):
+            out.append(m)
+            continue
+        new_tcs = []
+        for tc in tcs:
+            extra = _SIGNATURES.get(_signature_key(tc)) if isinstance(tc, dict) and not tc.get("extra_content") else None
+            if extra:
+                tc = {**tc, "extra_content": extra}
+                n += 1
+            new_tcs.append(tc)
+        out.append({**m, "tool_calls": new_tcs})
+    return out, n
+
+
+class _SignatureTap:
+    """Collects the tool calls of a chat SSE stream as it is relayed (id and
+    name from the first delta of each index, `extra_content` from whichever
+    delta carries it) so their signatures can be kept when it ends."""
+
+    def __init__(self) -> None:
+        self.partial = b""
+        self.calls: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+    def feed(self, chunk: bytes) -> None:
+        lines = (self.partial + chunk).split(b"\n")
+        self.partial = lines.pop()
+        for ln in lines:
+            if b"tool_calls" not in ln:
+                continue
+            ln = ln.strip()
+            if ln.startswith(b"data:"):
+                ln = ln[5:].strip()
+            try:
+                obj = json.loads(ln)
+            except ValueError:
+                continue
+            for ch in (obj.get("choices") or []) if isinstance(obj, dict) else []:
+                delta = ch.get("delta") if isinstance(ch, dict) else None
+                for tc in (delta or {}).get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    slot = self.calls.setdefault((ch.get("index", 0), tc.get("index", 0)), {"function": {}})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    name = (tc.get("function") or {}).get("name") if isinstance(tc.get("function"), dict) else None
+                    if name:
+                        slot["function"]["name"] = name
+                    if tc.get("extra_content"):
+                        slot["extra_content"] = tc["extra_content"]
+
+    def remember(self) -> int:
+        self.feed(b"\n")
+        return _remember_signatures(self.calls.values())
+
+
+# `harness --thoughts`: opencode then sends `x-harness-thoughts: 1` and a
+# vendor native model is asked for its thought summaries. The upstream puts
+# them at the start of the reply's content as `<think>...</think>`; the proxy
+# moves them to `reasoning_content`, where opencode shows them as thinking and
+# from where they are not billed again (the upstream ignores reasoning_content
+# in the history, while a `<think>` block left in content is re-sent as
+# input). A stream carries the thoughts as plain content with no tags, so the
+# proxy asks the upstream for JSON and sends opencode the reply as SSE.
+_THOUGHTS_HEADER = "x-harness-thoughts"
+_THINK_BLOCK = re.compile(r"\A\s*<think>(.*?)</think>\s*", re.S)
+# reasoning_effort and thinking_config together are a 400; an effort becomes
+# the matching thinking_level (the upstream takes low, medium and high).
+_THINKING_LEVELS = {"none": "low", "minimal": "low", "low": "low", "medium": "medium", "high": "high"}
+
+
+def _thoughts_payload(payload: Dict[str, Any]) -> None:
+    """Ask for thought summaries, in place."""
+    extra = dict(payload.get("extra_body") or {})
+    google = dict(extra.get("google") or {})
+    cfg = {**(google.get("thinking_config") or {}), "include_thoughts": True}
+    level = _THINKING_LEVELS.get(str(payload.pop("reasoning_effort", "")).lower())
+    if level:
+        cfg.setdefault("thinking_level", level)
+    google["thinking_config"] = cfg
+    extra["google"] = google
+    payload["extra_body"] = extra
+    payload["stream"] = False
+    payload.pop("stream_options", None)
+
+
+def _split_thoughts(body: Any) -> Any:
+    """Move a leading `<think>` block of each choice's content into its
+    `reasoning_content`."""
+    for ch in (body.get("choices") or []) if isinstance(body, dict) else []:
+        msg = ch.get("message") if isinstance(ch, dict) else None
+        if not isinstance(msg, dict) or not isinstance(msg.get("content"), str):
+            continue
+        m = _THINK_BLOCK.match(msg["content"])
+        if m:
+            msg["reasoning_content"] = (msg.get("reasoning_content") or "") + m.group(1).strip()
+            msg["content"] = msg["content"][m.end():]
+    return body
+
+
+def _chat_json_to_sse(body: Dict[str, Any]) -> bytes:
+    """A chat.completion JSON body as the SSE stream opencode asked for:
+    reasoning, content and each complete tool call (with its signature) as one
+    delta each, the finish reason, then usage."""
+    base = {
+        "id": body.get("id") or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion.chunk",
+        "created": body.get("created") or int(datetime.datetime.now(datetime.timezone.utc).timestamp()),
+        "model": body.get("model") or "",
+    }
+    out: List[str] = []
+
+    def emit(choices: List[Any], **extra: Any) -> None:
+        out.append("data: " + json.dumps({**base, "choices": choices, **extra}) + "\n\n")
+
+    for ch in body.get("choices") or []:
+        if not isinstance(ch, dict):
+            continue
+        i = ch.get("index", 0)
+        msg = ch.get("message") or {}
+        emit([{"index": i, "delta": {"role": "assistant"}}])
+        for key in ("reasoning_content", "content"):
+            if msg.get(key):
+                emit([{"index": i, "delta": {key: msg[key]}}])
+        tcs = [tc for tc in msg.get("tool_calls") or [] if isinstance(tc, dict)]
+        for n, tc in enumerate(tcs):
+            emit([{"index": i, "delta": {"tool_calls": [{**tc, "index": n}]}}])
+        emit([{"index": i, "delta": {}, "finish_reason": ch.get("finish_reason") or ("tool_calls" if tcs else "stop")}])
+    if isinstance(body.get("usage"), dict):
+        emit([], usage=body["usage"])
+    out.append("data: [DONE]\n\n")
+    return "".join(out).encode("utf-8")
+
+
 def _native_passthrough(
     req_id: str, inbound_request: Dict[str, Any], model_name: str, want_stream: bool,
-    session_id: str = "", slim: bool = False, oai: bool = False,
+    session_id: str = "", slim: bool = False, oai: bool = False, thoughts: bool = False,
 ) -> Response:
     """Forward a native-tools request upstream unchanged and relay the reply.
 
@@ -1127,7 +1313,9 @@ def _native_passthrough(
     (see `_SLIM_HEADER`) the built-in tools' descriptions are shortened, old
     tool output is trimmed and the reminder is appended; otherwise the request
     is opencode's own. `oai` sends it to the OAI upstream instead, after
-    `_oai_chat_payload`."""
+    `_oai_chat_payload`. In every mode, thought signatures opencode dropped
+    are put back (`_SIGNATURES`), and `thoughts` asks a vendor model for its
+    thought summaries (`_THOUGHTS_HEADER`)."""
     payload = dict(inbound_request)
     payload["model"] = model_name
     messages = payload.get("messages") or []
@@ -1152,15 +1340,46 @@ def _native_passthrough(
         payload["messages"] = messages = _append_to_last_message(
             messages, _native_reminder(messages, payload.get("tools") or [], session_id)
         )
+    unsigned = messages
+    attached = 0
+    if model_name not in _SIGNATURES_OFF:
+        messages, attached = _reattach_signatures(messages)
+        if attached:
+            payload["messages"] = messages
+    thoughts = thoughts and not oai
+    if thoughts:
+        _thoughts_payload(payload)
     print(
-        f"[{req_id}] upstream shape: mode=native{'/slim' if slim else ''} messages={len(messages)} "
-        f"chars={sum(len(_flatten_content_to_str(m.get('content') or '')) for m in messages if isinstance(m, dict))}",
+        f"[{req_id}] upstream shape: mode=native{'/slim' if slim else ''}{'/thoughts' if thoughts else ''} "
+        f"messages={len(messages)} "
+        f"chars={sum(len(_flatten_content_to_str(m.get('content') or '')) for m in messages if isinstance(m, dict))}"
+        + (f" signatures_reattached={attached}" if attached else ""),
         flush=True,
     )
     save_debug_file(req_id, "02", "API_Request", payload)
-    return _native_send(req_id, OAI_CHAT_URL if oai else CHAT_URL, OAI_API_KEY if oai else PROXY_API_KEY,
-                        payload, model_name, want_stream,
-                        (lambda d: _oai_chat_retry(req_id, payload, model_name, d)) if oai else None)
+    unsigned_retry = {"done": False}
+
+    def retry(detail: str) -> bool:
+        if oai and _oai_chat_retry(req_id, payload, model_name, detail):
+            return True
+        if attached and not unsigned_retry["done"]:
+            # The 400 may be the upstream refusing a signature it did not
+            # issue for this call; try once as opencode sent it.
+            unsigned_retry["done"] = True
+            payload["messages"] = unsigned
+            print(f"[{req_id}] WARN: retrying without the {attached} reattached thought signature(s)", flush=True)
+            return True
+        return False
+
+    resp = _native_send(req_id, OAI_CHAT_URL if oai else CHAT_URL, OAI_API_KEY if oai else PROXY_API_KEY,
+                        payload, model_name, False if thoughts else want_stream, retry,
+                        json_hook=_split_thoughts if thoughts else None,
+                        as_sse=thoughts and want_stream)
+    if unsigned_retry["done"] and resp.status_code < 400:
+        _SIGNATURES_OFF.add(model_name)
+        print(f"[{req_id}] WARN: '{model_name}' refuses reattached thought signatures; no longer reattaching them",
+              flush=True)
+    return resp
 
 
 def _resp_output_text(output: Any) -> str:
@@ -1321,13 +1540,15 @@ def _upstream_error_detail(err_body: Any) -> str:
 
 def _native_send(
     req_id: str, url: str, key: str, payload: Dict[str, Any], model_name: str, want_stream: bool,
-    retry: Any = None,
+    retry: Any = None, json_hook: Any = None, as_sse: bool = False,
 ) -> Response:
     """POST a native request and relay the reply: the upstream's SSE stream or
     JSON body as-is, 4xx with their status (so the AI SDK does not retry a
     deterministic rejection, and does retry a 429), 5xx as 502. `retry`, given
     an upstream 400's message, may fix the payload and return True to send it
-    once more (twice at most)."""
+    once more (twice at most). A JSON reply goes through `json_hook` (the
+    parsed body in, the body to send out) and, with `as_sse`, is sent as an
+    SSE stream. Thought signatures in the reply are kept (`_SIGNATURES`)."""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {key}",
@@ -1385,18 +1606,28 @@ def _native_send(
     if not want_stream:
         body = resp.content
         resp.close()
+        parsed: Any = None
         try:
-            save_debug_file(req_id, "03", "API_Response", json.loads(body))
+            parsed = json.loads(body)
+            save_debug_file(req_id, "03", "API_Response", parsed)
         except ValueError:
             save_debug_file(req_id, "03", "API_Response", {"raw": body.decode("utf-8", "replace")})
-        print(f"[{req_id}] upstream OK; relayed native JSON", flush=True)
+        _remember_json_signatures(parsed)
         _log_native_usage(req_id, model_name, body, ok_headers)
+        if json_hook is not None and isinstance(parsed, dict):
+            parsed = json_hook(parsed)
+            body = json.dumps(parsed).encode("utf-8")
+        if as_sse and isinstance(parsed, dict):
+            print(f"[{req_id}] upstream OK; relayed native JSON as SSE", flush=True)
+            return Response(_chat_json_to_sse(parsed), status=200, mimetype="text/event-stream")
+        print(f"[{req_id}] upstream OK; relayed native JSON", flush=True)
         return Response(body, status=200, mimetype="application/json")
 
     def relay() -> Iterable[bytes]:
         captured: Optional[List[bytes]] = [] if _OUTPUT_DIR is not None else None
         # The stream's usage line, kept for the usage log line.
         usage_line = _UsageLine()
+        sigs = _SignatureTap()
         try:
             for chunk in resp.iter_content(chunk_size=None):
                 if not chunk:
@@ -1404,6 +1635,7 @@ def _native_send(
                 if captured is not None:
                     captured.append(chunk)
                 usage_line.feed(chunk)
+                sigs.feed(chunk)
                 yield chunk
         except requests.RequestException as e:
             # The client already has a 200 and part of the stream; an error
@@ -1418,6 +1650,7 @@ def _native_send(
                     req_id, "04", "Native_SSE_Response",
                     {"raw": b"".join(captured).decode("utf-8", "replace")},
                 )
+            sigs.remember()
             print(f"[{req_id}] upstream OK; relayed native SSE", flush=True)
             _log_native_usage(req_id, model_name, usage_line.value(), ok_headers)
 
@@ -4521,6 +4754,7 @@ def catch_all(path: str) -> Response:
                 _session_id(request.headers),
                 request.headers.get(_SLIM_HEADER, "") == "1",
                 oai=_is_oai_model(model_name),
+                thoughts=request.headers.get(_THOUGHTS_HEADER, "") == "1",
             )
         if not _API_BASE and PROXY_BACKEND != "chatgpt":
             return _client_error(
