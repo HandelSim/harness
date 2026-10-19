@@ -2728,6 +2728,10 @@ agent flags:
                         descriptions, older tool output trimmed and a step
                         reminder (native tool models). --slim is accepted and
                         changes nothing.
+  --thoughts            show the model's thought summaries in opencode's
+                        thinking block (vendor native tool models; off by
+                        default). Replies then arrive whole rather than
+                        streamed token by token.
   --net                 disable the per-container firewall for THIS launch
                         only (full outbound network). Audit-logged on stderr.
   --mount PATH          bind-mount an additional host folder into the agent
@@ -5394,6 +5398,15 @@ slim_opencode_config() {
     }'
 }
 
+# `--thoughts` (off by default): the `x-harness-thoughts: 1` provider header,
+# on which the proxy asks a vendor native model for its thought summaries and
+# hands them to opencode as reasoning, which it shows as thinking. Normal and
+# slim alike; OAI models are not affected.
+thoughts_opencode_config() {
+    [[ "${harness_thoughts:-0}" == "1" ]] || return 0
+    printf '%s' '{"provider":{"harness":{"options":{"headers":{"x-harness-thoughts":"1"}}}}}'
+}
+
 # === Vaults (the brain) ===
 #
 # A vault is a git repo of notes and docs the agent works from. `harness vault
@@ -5479,18 +5492,20 @@ vault_opencode_config() {
       + (if $instr == "" then {} else {"instructions": [$instr]} end)'
 }
 
-# OPENCODE_CONFIG_CONTENT for a launch: the slim and vault overlays deep-
-# merged (their keys do not overlap). Prints nothing when neither applies.
-# `oai` (a host launch with an OAI upstream) is passed on to slim_opencode_config.
+# OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts and vault overlays
+# deep-merged. Prints nothing when none applies. `oai` (a host launch with an
+# OAI upstream) is passed on to slim_opencode_config.
 harness_opencode_overlay() {
-    local slim vault
-    slim=$(slim_opencode_config "${1:-}")
-    vault=$(vault_opencode_config)
-    if [[ -n "$slim" && -n "$vault" ]]; then
-        harness_jq -cn --argjson a "$slim" --argjson b "$vault" '$a * $b'
-    else
-        printf '%s' "$slim$vault"
-    fi
+    local part out=""
+    for part in "$(slim_opencode_config "${1:-}")" "$(thoughts_opencode_config)" "$(vault_opencode_config)"; do
+        [[ -n "$part" ]] || continue
+        if [[ -z "$out" ]]; then
+            out="$part"
+        else
+            out=$(harness_jq -cn --argjson a "$out" --argjson b "$part" '$a * $b')
+        fi
+    done
+    printf '%s' "$out"
 }
 
 cmd_vault() {
@@ -5746,7 +5761,7 @@ cmd_host() {
 harness host — run CONTAINERLESS: the proxy + opencode as plain host processes.
 
 usage:
-  harness host [--yolo] [--normal] [--single-message | --prompt-mode M] [-p "PROMPT"] [agent flags...]
+  harness host [--yolo] [--normal] [--thoughts] [--single-message | --prompt-mode M] [-p "PROMPT"] [agent flags...]
   harness host down            stop the background host proxy
 
 --single-message (= --prompt-mode single) folds the whole chat into ONE
@@ -5793,6 +5808,7 @@ EOF
             --yolo)      yolo=1 ;;
             --slim)      harness_slim=1 ;;
             --normal)    harness_slim=0 ;;
+            --thoughts)  harness_thoughts=1 ;;
             --single-message) prompt_mode_override="single" ;;
             --prompt-mode)    want_mode=1 ;;
             --prompt-mode=*)  prompt_mode_override="${arg#--prompt-mode=}" ;;
@@ -5882,7 +5898,7 @@ cmd_serve() {
         case "$arg" in
             -h|--help|help)
                 cat <<'HELP'
-usage: harness serve [--port N] [--allow-host NAME] [--normal]
+usage: harness serve [--port N] [--allow-host NAME] [--normal] [--thoughts]
 
 Serves, on 127.0.0.1 only:
   http://127.0.0.1:N/     the pub page: the active vault's pub/**/*.html and
@@ -5900,7 +5916,8 @@ page links opencode as <that host>:N+1, so behind a reverse proxy give
 opencode its own name, with the proxy doing the login.
 
 opencode web runs as your user with a shell, like 'harness host'. Its
-requests are slim unless --normal is given (see 'harness help').
+requests are slim unless --normal is given, and --thoughts shows thought
+summaries (see 'harness help').
 HELP
                 return 0 ;;
             --port) want=port ;;
@@ -5909,6 +5926,7 @@ HELP
             --allow-host=*) allow_hosts+=(--allow-host "${arg#--allow-host=}") ;;
             --normal) harness_slim=0 ;;
             --slim) harness_slim=1 ;;
+            --thoughts) harness_thoughts=1 ;;
             *) err "unknown serve option '$arg' (see: harness serve --help)"; return 1 ;;
         esac
     done
@@ -6109,6 +6127,10 @@ run_agent() {
                 # fallback below), which turn it into the opencode overlay.
                 # Slim is the default; --slim is kept so old invocations work.
                 [[ "$arg" == "--normal" ]] && harness_slim=0 || harness_slim=1
+                ;;
+            --thoughts)
+                # Read by agent_common_env / cmd_host like --normal.
+                harness_thoughts=1
                 ;;
             --net)
                 # Per-invocation firewall opt-out. Loud audit log on stderr

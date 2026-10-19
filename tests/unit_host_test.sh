@@ -168,6 +168,18 @@ jq -e '.provider.harness.options.headers["x-harness-slim"] == "1"
     || fail "T5e: without oai the overlay must not name harness-oai"
 ok "T5e: OAI models get the harness-oai provider; slim header on both"
 
+# --- T5g: --thoughts adds its proxy header, in slim and normal alike --------
+[[ -z "$(unset harness_thoughts; thoughts_opencode_config)" ]] || fail "T5g: thoughts must be off by default"
+overlay=$(clone_dir="$REPO_ROOT" harness_slim=1 harness_thoughts=1 harness_vault_dir="" harness_opencode_overlay oai)
+jq -e '.provider.harness.options.headers == {"x-harness-slim": "1", "x-harness-thoughts": "1"}
+       and .provider["harness-oai"].options.headers == {"x-harness-slim": "1"}
+       and .agent.build.prompt' <<<"$overlay" >/dev/null 2>&1 \
+    || fail "T5g: slim + thoughts overlay has the wrong shape — $overlay"
+overlay=$(clone_dir="$REPO_ROOT" harness_slim=0 harness_thoughts=1 harness_vault_dir="" harness_opencode_overlay)
+[[ "$overlay" == '{"provider":{"harness":{"options":{"headers":{"x-harness-thoughts":"1"}}}}}' ]] \
+    || fail "T5g: --normal --thoughts must be the thoughts header alone — $overlay"
+ok "T5g: --thoughts sets x-harness-thoughts on the vendor provider only, with or without slim"
+
 # --- T5f: required config is the vendor trio, the OAI trio, or both ---------
 ( PROXY_API_URL=""; PROXY_API_KEY=""; DEFAULT_MODEL_NAME=""; OAI_API_URL="u"; OAI_API_KEY="k"; OAI_MODELS="m";
   host_require_config ) >/dev/null 2>&1 || fail "T5f: an OAI-only config must pass"
