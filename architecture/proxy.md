@@ -71,8 +71,8 @@ proxy does no mediation. `_native_passthrough` POSTs the inbound body
 verbatim (only `model` filled in) and relays the upstream reply unchanged:
 SSE byte-for-byte when `stream: true` (upstream called with `stream=True`),
 else the JSON body. opencode's `tools`, `tool_choice`, assistant
-`tool_calls` (with any `extra_content` thought signature) and `role:"tool"`
-results all reach the upstream as sent. None of the cooperative machinery
+`tool_calls` and `role:"tool"` results all reach the upstream as sent (a
+thought signature opencode dropped is put back; see below). None of the cooperative machinery
 runs: no prompt injection, system→user rewrite, history translation,
 require-tool, tool-search, malformed-call retry, empty-response rescue or
 local token estimate (upstream `usage` is passed through). A stream that
@@ -168,6 +168,38 @@ are the only changes made to the request or the reply:
   A 410 with `replacement_model` names the model to switch to.
 - **Deprecation.** A success carrying `Deprecation`/`Sunset` logs one
   WARN per model per proxy run.
+- **Thought signatures put back** (every mode). The upstream puts a
+  signature on each tool call (`extra_content.google.thought_signature`);
+  sent back with that call it brings the model's earlier reasoning back
+  into context (a probe saw prompt tokens rise by exactly the earlier
+  step's reasoning tokens). opencode's openai-compatible provider stores it
+  under the provider's name but reads it back only under `google`, so for
+  provider `harness` it is always dropped and the model starts each tool
+  step without its reasoning. `_remember_signatures` keeps each one by call
+  id + name (`_SIGNATURES`, 2,048, oldest out) from JSON replies and, via
+  `_SignatureTap`, from SSE streams as they are relayed;
+  `_reattach_signatures` puts it back on an assistant tool call that comes
+  back without `extra_content` (a copy; calls that carry one are left
+  alone). The upstream answers a signature it refuses with a bare 400, so a
+  400 on a request with reattached signatures is retried once without them;
+  if that passes, the model goes in `_SIGNATURES_OFF` for the proxy run.
+  Cost: each step re-bills the turn's earlier reasoning as input. Log:
+  `signatures_reattached=N` on the `upstream shape` line.
+- **Thought summaries** (`harness --thoughts`: header `x-harness-thoughts: 1`;
+  vendor models only, OAI ignored). `_thoughts_payload` adds
+  `extra_body.google.thinking_config.include_thoughts` and turns a
+  `reasoning_effort` (a 400 alongside thinking_config) into the matching
+  `thinking_level` (none/minimal become low; the upstream rejects
+  minimal). The upstream returns the summary as a leading
+  `<think>...</think>` in content; `_split_thoughts` moves it to
+  `reasoning_content`, which opencode shows as thinking and which the
+  upstream ignores when it comes back in the history (left in content it
+  would be re-billed every step). A stream carries the summary as plain
+  content with no tags, so under thoughts the upstream is always asked for
+  JSON and a streaming client gets it re-emitted as SSE
+  (`_chat_json_to_sse`: reasoning, content, each whole tool call with its
+  signature, finish reason, usage, `[DONE]`); the reply then arrives whole.
+  Log: `mode=native/thoughts`.
 
 Routing: `_is_native_tool_model` matches the model id against
 `PROXY_NATIVE_TOOL_MODELS`, comma-separated fnmatch patterns (empty → the
@@ -176,7 +208,8 @@ default `*-withtools`; `off` disables). The route is also off when
 <mode>` means "use that cooperative mode on every model", which is how the
 old behavior and the mode benchmarks stay reachable on `-withtools` models)
 and on the chatgpt backend. The startup banner prints the result as `native
-tools:`. Log line: `upstream shape: mode=native`.
+tools:`. Log line: `upstream shape: mode=native` (`/slim`, `/thoughts` appended
+when on; `signatures_reattached=N` when any were put back).
 
 ## OAI upstream (`OAI_*`)
 

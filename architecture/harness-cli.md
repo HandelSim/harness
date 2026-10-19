@@ -170,7 +170,7 @@ as a subcommand: known ones dispatch; an unknown word errors (so a typo
 like `harness statt` is caught instead of silently launching an agent).
 `harness opencode` remains as an explicit alias for the bare form.
 
-Agent-launch flags (`--yolo`, `--normal`, `--net`, `--mount`, `-p/--print`) are parsed
+Agent-launch flags (`--yolo`, `--normal`, `--thoughts`, `--net`, `--mount`, `-p/--print`) are parsed
 inside `run_agent` (opencode) / `cmd_shell` rather than centrally; they decide
 the `docker run` invocation, not compose flags. `run_agent` also still accepts
 the retired `--require-tool` and drops it as a no-op (see "`--require-tool` on
@@ -305,7 +305,7 @@ so compose doesn't see a phantom services block.
 `run_agent` (opencode) / `cmd_shell` do NOT go through compose.
 They each:
 
-1. Parse agent flags (`--yolo`, `--normal`, `--net`, `--mount`, `-p/--print`; the
+1. Parse agent flags (`--yolo`, `--normal`, `--thoughts`, `--net`, `--mount`, `-p/--print`; the
    retired `--require-tool` is consumed and ignored). In `run_agent`, if no
    container runtime is installed at all, hand off to host mode here — see
    "No-docker fallback" below.
@@ -334,7 +334,8 @@ binary on `PATH`, i.e. a host-only install — `run_agent` (bare `harness`,
 `harness opencode`, `harness <agent flags>`, `harness chatgpt`) prints
 `harness: docker is not available (no docker or podman installed); defaulting
 to 'harness host'` to stderr and calls `cmd_host` with `--yolo` (if given;
-`--normal` carries over as the `harness_slim` global) plus the pass-through args (e.g. `-p PROMPT`). `--net` and `--mount` have no
+`--normal` and `--thoughts` carry over as the `harness_slim` and
+`harness_thoughts` globals) plus the pass-through args (e.g. `-p PROMPT`). `--net` and `--mount` have no
 host-mode meaning (no firewall; the whole filesystem is visible) and are
 dropped, with a note for `--mount`. Host mode's own confirm gate still applies.
 
@@ -382,6 +383,18 @@ nothing here applies: opencode's own system prompt and tool descriptions
 are sent, and the proxy forwards native requests as is (its reminder and
 old-output trim run only on the slim header). Slim has no tuning knobs; its
 values are proxy constants, and comparing settings is done with a probe.
+
+### `--thoughts`
+
+Off by default, in slim and `--normal` alike (`run_agent`, `cmd_host` and
+`cmd_serve` set the `harness_thoughts` global to 1). `thoughts_opencode_config`
+adds the header `x-harness-thoughts: 1` to the `harness` provider only (not
+`harness-oai`); `harness_opencode_overlay` deep-merges it with the slim and
+vault parts. On that header the proxy asks the upstream for thought
+summaries and hands them to opencode as `reasoning_content`, so they show
+in opencode's thinking block ([`proxy.md`](proxy.md)). Replies then arrive
+whole rather than token by token, since a stream carries the summary as
+untagged content.
 
 ### Vaults
 

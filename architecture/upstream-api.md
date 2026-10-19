@@ -123,6 +123,16 @@ found a standard OpenAI chat-completions contract, unlike the plain models:
   `usage.extra_properties.google.traffic_type`, `system_fingerprint`; the
   response `model` is the base id (no `-withtools`). Round trips that omit
   the thought signature still worked.
+- **Thinking** (`harness probe thinking`). Echoing a call's thought signature
+  brings that step's reasoning back: step 2's `prompt_tokens` rose by step
+  1's `reasoning_tokens`, so it is billed as input. A corrupted signature
+  gets a bare 400 ("The request was invalid..."). Reasoning text sent back in
+  history (`reasoning_content`) is ignored. Thought summaries come back only
+  with `google.thinking_config.include_thoughts` (top level or in
+  `extra_body`, snake or camel case) and `thinking_level` low/medium/high;
+  `minimal` or a 0 budget is a 400, and so is `reasoning_effort` alongside
+  `thinking_config`. Non-stream, the summary leads `content` as
+  `<think>...</think>`; streamed, it arrives as plain content with no tags.
 - **Parameters now apply.** `max_tokens` (truncates, `finish_reason:
   length`), `stop` and `stream_options.include_usage` work (without the
   latter a stream has no usage chunk at all, and opencode then counts 0
