@@ -33,6 +33,12 @@ services:
       # Fallback model when a request omits one; the proxy otherwise forwards
       # whatever model the request asked for (passthrough).
       DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-}
+      # Optional OpenAI-format upstream for native-tools models (see .env.example).
+      # Container mode reaches it on /chat/completions; its host must be in the
+      # firewall allowlist.
+      OAI_API_URL: ${OAI_API_URL:-}
+      OAI_API_KEY: ${OAI_API_KEY:-}
+      OAI_MODELS: ${OAI_MODELS:-}
       PROXY_HOST: ${PROXY_HOST:-0.0.0.0}
       PROXY_PORT: ${PROXY_PORT:-8000}
       PROXY_TIMEOUT: ${PROXY_TIMEOUT:-180}

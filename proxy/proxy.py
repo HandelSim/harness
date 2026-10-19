@@ -985,7 +985,7 @@ def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
     cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
     print(
         f"[{req_id}] usage: model={model} prompt={usage.get('prompt_tokens')} "
-        f"cached={cached} completion={usage.get('completion_tokens')} reasoning={rt}{tail}",
+        f"completion={usage.get('completion_tokens')} reasoning={rt} cached={cached}{tail}",
         flush=True,
     )
     if not _USAGE_LEDGER:

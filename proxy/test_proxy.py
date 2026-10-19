@@ -6201,7 +6201,7 @@ class TestOaiUpstream(unittest.TestCase):
         url, sent, _ = calls[0]
         self.assertEqual(url, "https://oai.example/openai/v1/responses")
         self.assertEqual(sent, {**body, "prompt_cache_key": "ses_2"})  # not slim: otherwise untouched
-        self.assertIn("prompt=3000 cached=2048 completion=10", self.log.getvalue())
+        self.assertIn("prompt=3000 completion=10 reasoning=None cached=2048", self.log.getvalue())
 
     def test_responses_slim(self):
         big = "x" * 9000
@@ -6225,7 +6225,7 @@ class TestOaiUpstream(unittest.TestCase):
         self.assertIn("were dropped", outs[0])
         self.assertIn("were dropped", outs[1])
         self.assertTrue(outs[2].startswith(big + "\n\n<system-reminder>\nharness: step 3 of this task"))
-        self.assertIn("prompt=50 cached=0 completion=7", self.log.getvalue())
+        self.assertIn("prompt=50 completion=7 reasoning=None cached=0", self.log.getvalue())
 
     def test_responses_step_cap(self):
         items = [{"role": "user", "content": "go"},

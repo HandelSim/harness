@@ -247,9 +247,52 @@ _chatgpt_config_fingerprint() {
 _effective_default_model() {
     if _backend_is_chatgpt; then
         printf '%s' "${CHATGPT_MODEL_NAME:-}"
+    elif [[ -n "${DEFAULT_MODEL_NAME:-}" ]]; then
+        printf '%s' "$DEFAULT_MODEL_NAME"
     else
-        printf '%s' "${DEFAULT_MODEL_NAME:-}"
+        # An OAI-only install: the first OAI model, as the proxy defaults.
+        local -a oai=()
+        mapfile -t oai < <(_oai_models)
+        printf '%s' "${oai[0]:-}"
     fi
+}
+
+# The OAI upstream (OAI_API_URL + OAI_API_KEY + OAI_MODELS): an OpenAI-format
+# API whose models take native tool calls under their own names, beside or
+# instead of the vendor upstream (PROXY_API_*). Not OPENAI_API_KEY: `set -a`
+# exports .env, and opencode and codex pick that name up by themselves.
+_oai_configured() {
+    ! _backend_is_chatgpt && [[ -n "${OAI_API_URL:-}" && -n "${OAI_API_KEY:-}" && -n "${OAI_MODELS:-}" ]]
+}
+
+# OAI_MODELS one id per line (comma-separated in .env, blanks dropped).
+_oai_models() {
+    _oai_configured || return 0
+    local m
+    tr ',' '\n' <<<"$OAI_MODELS" | while IFS= read -r m; do
+        m="${m#"${m%%[![:space:]]*}"}"; m="${m%"${m##*[![:space:]]}"}"
+        [[ -n "$m" ]] && printf '%s\n' "$m"
+    done
+}
+
+# The empty required keys of the openai backend, one per line: the vendor trio
+# (PROXY_API_URL, PROXY_API_KEY, DEFAULT_MODEL_NAME), the OAI trio, or both
+# when both are partly set. DEFAULT_MODEL_NAME is optional with an OAI
+# upstream (the first OAI model stands in). Mirrors the proxy's
+# _validate_config.
+_openai_backend_missing() {
+    local -a req=()
+    local v any_oai=0
+    [[ -n "${OAI_API_URL:-}${OAI_API_KEY:-}${OAI_MODELS:-}" ]] && any_oai=1
+    (( any_oai )) && req+=(OAI_API_URL OAI_API_KEY OAI_MODELS)
+    if [[ -n "${PROXY_API_URL:-}${PROXY_API_KEY:-}" ]] || (( ! any_oai )); then
+        req+=(PROXY_API_URL PROXY_API_KEY)
+        (( any_oai )) || req+=(DEFAULT_MODEL_NAME)
+    fi
+    for v in "${req[@]}"; do
+        [[ -z "${!v:-}" ]] && printf '%s\n' "$v"
+    done
+    return 0
 }
 
 # --- net helpers (lazy load) ------------------------------------------------
@@ -691,16 +734,13 @@ require_runtime_config() {
 
     local missing=()
     local v
-    local -a required=(PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME)
     if _backend_is_chatgpt; then
-        required=(CHATGPT_BASE_URL CHATGPT_MODEL_NAME CHATGPT_COOKIE_STRING)
+        for v in CHATGPT_BASE_URL CHATGPT_MODEL_NAME CHATGPT_COOKIE_STRING; do
+            [[ -z "${!v:-}" ]] && missing+=("$v")
+        done
+    else
+        mapfile -t missing < <(_openai_backend_missing)
     fi
-    for v in "${required[@]}"; do
-        local val="${!v:-}"
-        if [[ -z "$val" ]]; then
-            missing+=("$v")
-        fi
-    done
     if (( ${#missing[@]} > 0 )); then
         err "required value(s) empty in $env_file: ${missing[*]}"
         if ! _backend_is_chatgpt && [[ -n "${CHATGPT_BASE_URL:-}" ]]; then
@@ -1628,7 +1668,33 @@ _gate_on_upstream_auth() {
     if (( probe_rc == 1 )); then
         return 1
     fi
+    probe_rc=0
+    _probe_oai_auth || probe_rc=$?
+    (( probe_rc == 1 )) && return 1
     return 0
+}
+
+# The OAI upstream's key check: GET {OAI_API_URL}/models, which costs no
+# tokens. 401/403 returns 1 (the launch aborts); anything else that is not
+# 2xx only warns (rc 2), since some OpenAI-format servers have no /models.
+_probe_oai_auth() {
+    _oai_configured || return 0
+    command -v curl >/dev/null 2>&1 || return 2
+    local base="${OAI_API_URL%/}" code
+    base="${base%/chat/completions}"; base="${base%/responses}"
+    code=$(curl -sS -k -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 20 \
+        -H "Authorization: Bearer ${OAI_API_KEY}" "$base/models" 2>/dev/null) || code="000"
+    case "$code" in
+        2*) return 0 ;;
+        401|403)
+            echo "[harness] ERROR: the OAI upstream rejected OAI_API_KEY ($base/models returned $code)." >&2
+            return 1
+            ;;
+        *)
+            echo "[harness] WARN: OAI upstream $base/models returned $code; starting anyway" >&2
+            return 2
+            ;;
+    esac
 }
 
 # Best-effort: print the upstream's model catalog at start so the user sees
@@ -1997,6 +2063,9 @@ _config_editable_keys() {
     cat <<'EOF'
 PROXY_API_URL|upstream API base URL the proxy forwards to (e.g. https://api.openai.com)
 PROXY_API_KEY|upstream API key (secret; shown masked)
+OAI_API_URL|OpenAI-format API base URL, e.g. https://<name>.openai.azure.us/openai/v1
+OAI_API_KEY|OpenAI-format API key (secret; shown masked)
+OAI_MODELS|comma-separated model ids OAI_API_URL serves (native tools, no -withtools)
 DEFAULT_MODEL_NAME|default model id opencode selects (live picker via 'harness model')
 MODEL_CONTEXT_LENGTH|context-window size the agent advertises (tokens)
 PROXY_TIMEOUT|upstream request timeout in seconds
@@ -4303,6 +4372,11 @@ host_proxy_fingerprint() {
     if [[ -n "${prompt_mode_override:-}" ]]; then
         data+=$(printf '\npromptmode=%s\n' "$prompt_mode_override")
     fi
+    # Only when set, so an install without an OAI upstream keeps its fingerprint.
+    if [[ -n "${OAI_API_URL:-}${OAI_API_KEY:-}${OAI_MODELS:-}" ]]; then
+        data+=$(printf '\noai=%s\noaikey=%s\noaimodels=%s\n' \
+            "${OAI_API_URL:-}" "${OAI_API_KEY:-}" "${OAI_MODELS:-}")
+    fi
     if command -v sha256sum >/dev/null 2>&1; then
         printf '%s' "$data" | sha256sum | cut -d' ' -f1
     else
@@ -4859,17 +4933,17 @@ host_require_config() {
     if [[ ! -f "$env_file" ]]; then
         err "missing $env_file"
         err "  cp $clone_dir/.env.example $env_file"
-        err "  then set PROXY_API_URL / PROXY_API_KEY / DEFAULT_MODEL_NAME"
+        err "  then set PROXY_API_URL / PROXY_API_KEY / DEFAULT_MODEL_NAME, or OAI_API_URL / OAI_API_KEY / OAI_MODELS"
         exit 1
     fi
     local missing=() v
-    local -a required=(PROXY_API_URL PROXY_API_KEY DEFAULT_MODEL_NAME)
     if _backend_is_chatgpt; then
-        required=(CHATGPT_BASE_URL CHATGPT_MODEL_NAME CHATGPT_COOKIE_STRING)
+        for v in CHATGPT_BASE_URL CHATGPT_MODEL_NAME CHATGPT_COOKIE_STRING; do
+            [[ -z "${!v:-}" ]] && missing+=("$v")
+        done
+    else
+        mapfile -t missing < <(_openai_backend_missing)
     fi
-    for v in "${required[@]}"; do
-        [[ -z "${!v:-}" ]] && missing+=("$v")
-    done
     if (( ${#missing[@]} > 0 )); then
         err "required value(s) empty in $env_file: ${missing[*]}"
         err "edit $env_file and set them, then re-run."
@@ -5156,17 +5230,35 @@ host_write_opencode_config() {
                 | harness_jq -r '.data[]?.id // empty' 2>/dev/null | sort -u || true)
         fi
     fi
-    if [[ -n "$default_model" ]]; then
-        local found=0 m
+    # OAI models get their own provider, `harness-oai`: opencode's
+    # @ai-sdk/openai package speaks the Responses API (POST {baseURL}/responses,
+    # which the proxy relays to the OAI upstream), the API on which these
+    # models take tools and reasoning together. opencode also gives that
+    # package a per-session prompt_cache_key. The `harness` provider keeps
+    # every other model.
+    local -a oai_ids=()
+    mapfile -t oai_ids < <(_oai_models)
+    local -A is_oai=()
+    local m
+    for m in "${oai_ids[@]}"; do is_oai["$m"]=1; done
+    local -a vendor_ids=()
+    for m in "${model_ids[@]}"; do [[ -n "${is_oai[$m]:-}" ]] || vendor_ids+=("$m"); done
+    model_ids=("${vendor_ids[@]}")
+    if [[ -n "$default_model" && -z "${is_oai[$default_model]:-}" ]]; then
+        local found=0
         for m in "${model_ids[@]}"; do [[ "$m" == "$default_model" ]] && found=1; done
         (( found == 0 )) && model_ids+=("$default_model")
     fi
-    if (( ${#model_ids[@]} == 0 )); then
+    if (( ${#model_ids[@]} == 0 && ${#oai_ids[@]} == 0 )); then
         model_ids=("${default_model:-default}")
     fi
 
-    local selected="$default_model"
-    [[ -z "$selected" ]] && selected="${model_ids[0]}"
+    local selected="harness/$default_model"
+    if [[ -n "$default_model" && -n "${is_oai[$default_model]:-}" ]]; then
+        selected="harness-oai/$default_model"
+    elif [[ -z "$default_model" ]]; then
+        selected="harness/${model_ids[0]}"
+    fi
 
     # HARNESS_HOST_NO_WEB=1 (set by `harness benchmark --test-modes`) keeps
     # opencode off the network except for the loopback proxy: the yolo agent
@@ -5176,9 +5268,20 @@ host_write_opencode_config() {
         web_perm="deny"; share="disabled"
     fi
 
-    local models_json
-    models_json=$(printf '%s\n' "${model_ids[@]}" | harness_jq -R . | harness_jq -s \
-        --argjson ctx "$ctx" "$(opencode_models_jq)")
+    local models_json oai_json='{}'
+    models_json='{}'
+    if (( ${#model_ids[@]} > 0 )); then
+        models_json=$(printf '%s\n' "${model_ids[@]}" | harness_jq -R . | harness_jq -s \
+            --argjson ctx "$ctx" "$(opencode_models_jq)")
+    fi
+    if (( ${#oai_ids[@]} > 0 )); then
+        # reasoning: true turns on opencode's reasoning options (effort,
+        # encrypted reasoning carried between steps); the output limit is
+        # what opencode sends as max_output_tokens, reasoning included.
+        oai_json=$(printf '%s\n' "${oai_ids[@]}" | harness_jq -R . | harness_jq -s \
+            --argjson ctx "$ctx" "$(opencode_models_jq)
+            | map_values(. + {reasoning: true, tool_call: true, limit: {context: \$ctx, output: 32000}})")
+    fi
 
     # apiKey is a deliberate dummy: the real upstream key lives in the proxy's
     # Authorization header, never in opencode's config. opencode requires the
@@ -5187,20 +5290,28 @@ host_write_opencode_config() {
     harness_jq -n \
         --arg provider_name "GenAI Harness" \
         --arg proxy_url "$proxy_url" \
-        --arg selected "harness/${selected}" \
+        --arg selected "$selected" \
         --argjson models "$models_json" \
+        --argjson oai_models "$oai_json" \
         --arg web "$web_perm" \
         --arg share "$share" \
         '{
           "$schema": "https://opencode.ai/config.json",
-          "provider": {
+          "provider": ((if $models == {} then {} else {
             "harness": {
               "npm": "@ai-sdk/openai-compatible",
               "name": $provider_name,
               "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy", "includeUsage": true},
               "models": $models
             }
-          },
+          } end) + (if $oai_models == {} then {} else {
+            "harness-oai": {
+              "npm": "@ai-sdk/openai",
+              "name": ($provider_name + " (OpenAI API)"),
+              "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy"},
+              "models": $oai_models
+            }
+          } end)),
           "model": $selected,
           "small_model": $selected,
           "compaction": {"prune": true},
@@ -5220,8 +5331,10 @@ host_write_opencode_config() {
 # agents with agents/slim-prompt.md and of the general subagent with
 # agents/slim-subagent-prompt.md (explore keeps opencode's own short prompt),
 # and adds the `x-harness-slim: 1` provider header, on which the proxy swaps
-# the built-in tools' long descriptions for short ones. Prints nothing when
-# slim is off or a prompt file is missing (that launch is then a normal one).
+# the built-in tools' long descriptions for short ones. With the argument `oai`
+# (a host launch with an OAI upstream) the header goes on the harness-oai
+# provider too. Prints nothing when slim is off or a prompt file is missing
+# (that launch is then a normal one).
 slim_opencode_config() {
     [[ "${harness_slim:-1}" == "1" ]] || return 0
     local main_prompt="$clone_dir/agents/slim-prompt.md"
@@ -5230,8 +5343,10 @@ slim_opencode_config() {
         err "slim: agents/slim-prompt.md or agents/slim-subagent-prompt.md is missing; launching without slim"
         return 0
     fi
-    harness_jq -cn --arg main "$(cat "$main_prompt")" --arg sub "$(cat "$sub_prompt")" '{
-      "provider": {"harness": {"options": {"headers": {"x-harness-slim": "1"}}}},
+    harness_jq -cn --arg main "$(cat "$main_prompt")" --arg sub "$(cat "$sub_prompt")" \
+        --arg oai "${1:-}" '{
+      "provider": ({"harness": {"options": {"headers": {"x-harness-slim": "1"}}}}
+        + (if $oai == "oai" then {"harness-oai": {"options": {"headers": {"x-harness-slim": "1"}}}} else {} end)),
       "agent": {
         "build": {"prompt": $main}, "plan": {"prompt": $main}, "yolo": {"prompt": $main},
         "general": {"prompt": $sub}
@@ -5324,11 +5439,12 @@ vault_opencode_config() {
       + (if $instr == "" then {} else {"instructions": [$instr]} end)'
 }
 
-# OPENCODE_CONFIG_CONTENT for a launch: the --slim and vault overlays deep-
+# OPENCODE_CONFIG_CONTENT for a launch: the slim and vault overlays deep-
 # merged (their keys do not overlap). Prints nothing when neither applies.
+# `oai` (a host launch with an OAI upstream) is passed on to slim_opencode_config.
 harness_opencode_overlay() {
     local slim vault
-    slim=$(slim_opencode_config)
+    slim=$(slim_opencode_config "${1:-}")
     vault=$(vault_opencode_config)
     if [[ -n "$slim" && -n "$vault" ]]; then
         harness_jq -cn --argjson a "$slim" --argjson b "$vault" '$a * $b'
@@ -5433,7 +5549,7 @@ host_opencode_env() {
     export OPENCODE_CONFIG="$(host_opencode_config)"
     export OPENCODE_DISABLE_AUTOUPDATE=1
     local overlay
-    overlay=$(harness_opencode_overlay)
+    overlay=$(harness_opencode_overlay "$(_oai_configured && echo oai)")
     [[ -n "$overlay" ]] && export OPENCODE_CONFIG_CONTENT="$overlay"
     # Exa web-search parity with container mode. Intentional in host mode too:
     # host mode already runs with NO egress firewall (the confirm gate makes
@@ -8804,19 +8920,39 @@ cmd_doctor() {
                 doctor_check fail "CHATGPT_MODEL_NAME" "unset"
             fi
         else
-            if [[ -n "${PROXY_API_URL:-}" ]]; then
+            local oai_any=0
+            [[ -n "${OAI_API_URL:-}${OAI_API_KEY:-}${OAI_MODELS:-}" ]] && oai_any=1
+            if (( oai_any )); then
+                local ok_key
+                for ok_key in OAI_API_URL OAI_API_KEY OAI_MODELS; do
+                    if [[ -z "${!ok_key:-}" ]]; then
+                        doctor_check fail "$ok_key" "unset (the OAI upstream needs all three OAI_* keys)"
+                    elif [[ "$ok_key" == OAI_API_KEY ]]; then
+                        doctor_check ok "$ok_key" "$(doctor_redact "$OAI_API_KEY")"
+                    else
+                        doctor_check ok "$ok_key" "${!ok_key}"
+                    fi
+                done
+            fi
+            if (( oai_any )) && [[ -z "${PROXY_API_URL:-}${PROXY_API_KEY:-}" ]]; then
+                doctor_check skip "PROXY_API_URL" "no vendor upstream; OAI_MODELS only"
+            elif [[ -n "${PROXY_API_URL:-}" ]]; then
                 doctor_check ok "PROXY_API_URL" "$PROXY_API_URL"
             else
                 doctor_check fail "PROXY_API_URL" "unset"
             fi
 
-            if [[ -n "${PROXY_API_KEY:-}" ]]; then
+            if (( oai_any )) && [[ -z "${PROXY_API_URL:-}${PROXY_API_KEY:-}" ]]; then
+                :
+            elif [[ -n "${PROXY_API_KEY:-}" ]]; then
                 doctor_check ok "PROXY_API_KEY" "$(doctor_redact "$PROXY_API_KEY")"
             else
                 doctor_check fail "PROXY_API_KEY" "unset"
             fi
 
-            if [[ -n "${agent_model}" ]]; then
+            if (( oai_any )) && [[ -z "${agent_model}" ]]; then
+                doctor_check ok "DEFAULT_MODEL_NAME" "unset; the first OAI_MODELS model is the default"
+            elif [[ -n "${agent_model}" ]]; then
                 doctor_check ok "DEFAULT_MODEL_NAME" "$agent_model"
             else
                 doctor_check fail "DEFAULT_MODEL_NAME" "unset"
@@ -9252,12 +9388,23 @@ cmd_preflight() {
             )
             url_key="CHATGPT_BASE_URL"
         else
-            req_keys=(
-                "PROXY_API_URL|upstream API base URL"
-                "PROXY_API_KEY|upstream API bearer token"
-                "DEFAULT_MODEL_NAME|default/fallback upstream model id"
+            # The vendor trio, the OAI trio, or both (see _openai_backend_missing).
+            local oai_any=0
+            [[ -n "$(_config_read_key OAI_API_URL)$(_config_read_key OAI_API_KEY)$(_config_read_key OAI_MODELS)" ]] && oai_any=1
+            (( oai_any )) && req_keys+=(
+                "OAI_API_URL|OpenAI-format API base URL"
+                "OAI_API_KEY|OpenAI-format API key"
+                "OAI_MODELS|comma-separated model ids served by OAI_API_URL"
             )
+            if (( ! oai_any )) || [[ -n "$(_config_read_key PROXY_API_URL)$(_config_read_key PROXY_API_KEY)" ]]; then
+                req_keys+=(
+                    "PROXY_API_URL|upstream API base URL"
+                    "PROXY_API_KEY|upstream API bearer token"
+                )
+                (( oai_any )) || req_keys+=("DEFAULT_MODEL_NAME|default/fallback upstream model id")
+            fi
             url_key="PROXY_API_URL"
+            [[ -z "$(_config_read_key PROXY_API_URL)" ]] && (( oai_any )) && url_key="OAI_API_URL"
         fi
         for rk in "${req_keys[@]}"; do
             rv=$(_config_read_key "${rk%%|*}")
