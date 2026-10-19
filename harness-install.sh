@@ -418,8 +418,8 @@ _run_model_menu() {
 #   1. Allowlist — is the API hostname present?
 #   2. HTTPS with SSL verification — reports HTTP status or curl error.
 #   3. HTTPS without SSL (-k) — if step 2 timed out/errored, distinguishes a
-#      network failure from an untrusted certificate (very common on .mil/.gov
-#      domains with internal CAs).
+#      network failure from an untrusted certificate (very common on networks
+#      with internal CAs).
 #   4. Model list — shows available models and validates DEFAULT_MODEL_NAME.
 
 _run_conn_check() {

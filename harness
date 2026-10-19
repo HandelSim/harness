@@ -9259,7 +9259,7 @@ cmd_doctor() {
             000)
                 # No HTTP response: a dead network or an untrusted TLS cert look
                 # the same to a verifying curl. Retry with -k to tell them apart
-                # (internal CAs on .gov/.mil are a common cause).
+                # (internal corporate CAs are a common cause).
                 local up_nossl
                 up_nossl=$(curl -sk -o /dev/null -w '%{http_code}' \
                     --connect-timeout 5 --max-time 15 \
