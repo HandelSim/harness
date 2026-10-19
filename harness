@@ -2109,7 +2109,7 @@ cmd_probe() {
     fi
     local -a mnt=()
     if [[ $suite == slim ]]; then
-        mnt=(-v "$(harness_docker_path "$clone_dir"):/harness:ro")
+        harness_add_bind_mount mnt "$(harness_docker_path "$clone_dir")" /harness ro
         set -- --root /harness "$@"
     fi
     # No host python: borrow the proxy image's. Values pass by name (-e VAR),
