@@ -87,8 +87,11 @@ are the only changes made to the request or the reply:
   threshold (`context - output`), and the conversation grows until the
   day's budget is gone. opencode's provider config also sets `includeUsage: true`
   ([`harness-cli.md`](harness-cli.md)). Each request logs one line
-  `usage: model=… prompt=… completion=… reasoning=… credits_day_left=…`
-  (or `usage: none reported`) read from the end of the stream or body.
+  `usage: model=… prompt=… completion=… reasoning=… cached=… credits_day_left=…`
+  (or `usage: none reported`) read from the stream's last line that carries
+  `usage` (`_UsageLine`; a Responses `response.completed` event repeats the
+  whole reply, so a fixed tail is not enough) or from the body. Responses
+  usage (`input_tokens`, ...) is mapped to the chat keys (`_chat_usage`).
 - **Usage ledger** (`PROXY_USAGE_LEDGER`). `_record_usage` appends one JSON
   line per upstream reply, native and cooperative alike, with the upstream's
   own `prompt`/`completion`/`reasoning`/`cached` counts (never the proxy's
@@ -100,10 +103,14 @@ are the only changes made to the request or the reply:
   require-tool re-asks are not recorded, so that route reads slightly low.
 - **Old tool output trimmed** (slim only: `x-harness-slim: 1`;
   `_TOOL_OUTPUT_KEEP` = 40,000 tokens). Every native step re-bills the whole history, and most
-  of it is tool output. `_trim_old_tool_outputs` walks the history newest
-  first and keeps tool results whole until about `KEEP × 3` chars are
-  counted; older results over 1,500 chars are cut to their first 500 plus a
-  note to re-run the tool. Results after the last assistant message (the
+  of it is tool output. `_trim_plan` keeps about the newest `KEEP × 3` chars
+  of tool output whole; older results over 1,500 chars are cut to their
+  first 500 plus a note to re-run the tool. The cut is placed from the
+  start of the history and moves only in `_TOOL_OUTPUT_TRIM_STEP` (60,000
+  char) steps, so between steps each request repeats the previous one's
+  prefix byte for byte and the upstream prompt cache keeps hitting (a cut
+  measured from the newest output moved every step and broke the cache at
+  the first rewritten result). Results after the last assistant message (the
   ones the model has not seen yet) are never cut. Copies, so opencode's own
   history is untouched; the trim is opencode's `compaction.prune` applied
   on every step instead of only after a prompt finishes, and the usage the
@@ -119,8 +126,10 @@ are the only changes made to the request or the reply:
   item in progress and telling the model to stay on it (`_todo_focus`), or,
   with no list, an order to start with one (and a firmer one after 3
   steps), and after 12 steps without a `todowrite` a prompt to update it. After a compaction the history no longer holds the
-  list, so the latest one is also kept per `x-opencode-session-id` header
-  (`_SESSION_TODOS`, 64 sessions, in memory) and replayed from there. Calls
+  list, so the latest one is also kept per session (`_session_id`: opencode
+  sends `X-Session-Id`/`x-session-affinity` to custom providers, never
+  `x-opencode-session-id`, which is still read first; `_SESSION_TODOS`, 64
+  sessions, in memory) and replayed from there. Calls
   repeated 3+ times with the same name and arguments are named with an
   order to use the earlier result. After 30 steps without an edit-type
   call (`edit`, `write`, `patch`, `multiedit`, `apply_patch`) a soft line
@@ -168,6 +177,37 @@ default `*-withtools`; `off` disables). The route is also off when
 old behavior and the mode benchmarks stay reachable on `-withtools` models)
 and on the chatgpt backend. The startup banner prints the result as `native
 tools:`. Log line: `upstream shape: mode=native`.
+
+## OAI upstream (`OAI_*`)
+
+`OAI_MODELS` ids are always native (`_is_oai_model`, checked before the
+`-withtools` patterns and not turned off by `--prompt-mode`) and go to
+`OAI_API_URL` with `OAI_API_KEY` ([`upstream-api.md`](upstream-api.md) → A
+second upstream). Two inbound routes reach it:
+
+- **`POST /v1/chat/completions`** (container mode, other clients):
+  `_native_passthrough(..., oai=True)`. `_oai_chat_payload` renames
+  `max_tokens` to `max_completion_tokens` and adds `prompt_cache_key` = the
+  session id. `_native_send` retries a 400 once per fix, and remembers the fix
+  per model: a `reasoning_effort` error with tools present resends with
+  `reasoning_effort: "none"` (Azure gpt-5.6 takes no tools with reasoning on
+  this route); a `prompt_cache_key` error drops the key.
+- **`POST /v1/responses`** (host mode's `harness-oai` provider): OAI models
+  only (anything else is a 400). `_responses_passthrough` adds
+  `prompt_cache_key` when absent and relays the reply as-is (no
+  `stream_options`: Responses streams always end with usage). Under slim it
+  does what the chat route does, on Responses shapes: `_slim_tools` on the
+  flat tool format, `_trim_old_response_outputs` on `function_call_output`
+  items (same `_trim_plan`), the reminder built from `_responses_chat_view`
+  (one model step's reasoning, message and function_call items become one
+  assistant message) and appended by `_append_to_last_item`, and the step
+  cap as `tool_choice: "none"`.
+
+`/v1/models` appends the `OAI_MODELS` entries to the vendor catalog (only on
+a 200; a vendor error, such as the locked-key 401, is still returned
+verbatim) or, with no vendor upstream, returns them alone. With no vendor
+upstream a non-OAI model gets a 400 naming both settings. Log line:
+`upstream shape: mode=responses[/slim]`.
 
 ## URL base + model passthrough
 
@@ -1299,7 +1339,8 @@ Module-level env reads at startup:
 
 ```
 PROXY_HOST=0.0.0.0          PROXY_PORT=8000
-PROXY_API_URL (REQUIRED)    PROXY_API_KEY (REQUIRED)    DEFAULT_MODEL_NAME (REQUIRED)
+PROXY_API_URL               PROXY_API_KEY               DEFAULT_MODEL_NAME
+OAI_API_URL / OAI_API_KEY / OAI_MODELS   (see OAI upstream)
 PROXY_TIMEOUT=180           OUTPUT_DIR (optional)
 MODEL_CONTEXT_LENGTH=200000
 HARNESS_FORCE_LOOPBACK (optional; host mode sets it — see below)
@@ -1311,8 +1352,11 @@ CHATGPT_BASE_URL / CHATGPT_MODEL_NAME / CHATGPT_COOKIE_STRING
 
 `DEFAULT_MODEL_NAME` (the renamed `PROXY_API_MODEL`) is the fallback model — see
 [URL base + model passthrough](#url-base--model-passthrough). `_validate_config`
-in `main()` enforces the three REQUIRED values are non-empty and `PROXY_API_URL`
-parses; the process exits with a clear message if not. `_redact_key` is used in
+in `main()` requires the vendor pair (`PROXY_API_URL` + key), the OAI trio, or
+both; a half-set upstream is fatal, and `DEFAULT_MODEL_NAME` is required only
+without an OAI upstream (it then defaults to the first `OAI_MODELS` id). The
+process exits with a clear message if not. The banner adds `oai upstream:` and
+a redacted `oai key:`. `_redact_key` is used in
 startup logging so logs show something like `sk-abc...xyz`.
 
 `main()` calls `_force_utf8_stdio()` **first**, before `_validate_config`, so

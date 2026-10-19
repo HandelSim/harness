@@ -49,7 +49,17 @@ the other side — the sourced value is a strict prefix of what
 `_config_read_key` reads off disk — and turns `harness chatgpt doctor`'s cookie
 line from a green "set, N chars" into a fail that names the real length.
 
-`DEFAULT_MODEL_NAME` (which replaced the old `PROXY_API_MODEL`) is the default/fallback model id and is **REQUIRED with no
+Required config (`_openai_backend_missing`, used by `require_runtime_config`,
+`host_require_config` and mirrored by preflight/doctor): the vendor trio
+(`PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME`), the OAI trio
+(`OAI_API_URL`, `OAI_API_KEY`, `OAI_MODELS`; [`upstream-api.md`](upstream-api.md)),
+or both. With an OAI upstream `DEFAULT_MODEL_NAME` may be empty and
+`_effective_default_model` falls back to the first OAI model. Not
+`OPENAI_API_KEY`: `.env` is exported and opencode and codex would pick it up.
+`_probe_oai_auth` (in `_gate_on_upstream_auth`) GETs `{OAI_API_URL}/models`,
+which costs nothing: 401/403 aborts the launch, anything else only warns.
+
+`DEFAULT_MODEL_NAME` (which replaced the old `PROXY_API_MODEL`) is the default/fallback model id and, on a vendor-only install, is **REQUIRED with no
 hardcoded default** — once the selected model passes through to the upstream, a
 cosmetic default would be a real upstream id we can't know. `agent_model` reads
 it (empty when unset) and `require_runtime_config` enforces it's set before any
@@ -694,7 +704,18 @@ What it does, in order:
    lets the benchmark run its own proxy beside a user's). With
    `HARNESS_HOST_NO_WEB=1` the yolo agent's `webfetch`/`websearch` become
    `deny` and the config gains `share: "disabled"`; unset, the config is
-   byte-identical to before (no `share` key).
+   byte-identical to before (no `share` key). With an OAI upstream the
+   `OAI_MODELS` ids move to a second provider, `harness-oai` (npm
+   `@ai-sdk/openai`, same loopback baseURL and dummy key, `reasoning: true`,
+   output 32000), because that package speaks the Responses API
+   (`/v1/responses` on the proxy), where these models take tools and reasoning
+   together, and opencode gives it a per-session `prompt_cache_key`; the
+   `harness` provider is omitted when no other model is left, and
+   `model`/`small_model` become `harness-oai/<id>` when the default is an OAI
+   model. `host_opencode_env` passes `oai` to the overlay so the slim header
+   is set on both providers. Container mode keeps one provider; there OAI
+   models use the proxy's chat route. The fingerprint gains an `oai` line
+   only when an `OAI_*` key is set.
 8. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
    (provider env, `--agent yolo`, and the headless `-p` json-events +
    `opencode export` dance that dodges opencode 1.15.x's render race).

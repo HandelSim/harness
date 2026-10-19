@@ -138,6 +138,51 @@ jq -e '.provider.harness.models["test-model"].cost
     || fail "T5c: every token should be priced at 1 — $(cat "$cfg")"
 ok "T5c: cost readout counts tokens, cached input not free"
 
+# --- T5e: an OAI upstream gets its own Responses-API provider ---------------
+# OAI_MODELS go on `harness-oai` (@ai-sdk/openai, same loopback baseURL), not
+# on `harness`; an OAI-only install selects the first OAI model and writes no
+# `harness` provider; slim puts its header on both providers in host mode.
+( PROXY_PORT=8123; DEFAULT_MODEL_NAME=""; PROXY_API_URL=""; PROXY_API_KEY="";
+  OAI_API_URL="https://oai.example/openai/v1"; OAI_API_KEY="k"; OAI_MODELS="gpt-a, gpt-b";
+  host_write_opencode_config ) || fail "T5e: host_write_opencode_config returned non-zero"
+jq -e '(.provider | has("harness") | not)
+       and .provider["harness-oai"].npm == "@ai-sdk/openai"
+       and .provider["harness-oai"].options.baseURL == "http://127.0.0.1:8123/v1"
+       and .provider["harness-oai"].options.apiKey == "harness-dummy"
+       and (.provider["harness-oai"].models | keys) == ["gpt-a", "gpt-b"]
+       and .provider["harness-oai"].models["gpt-a"].reasoning == true
+       and .model == "harness-oai/gpt-a"' "$cfg" >/dev/null 2>&1 \
+    || fail "T5e: OAI-only config has the wrong shape — $(cat "$cfg")"
+( PROXY_PORT=8123; DEFAULT_MODEL_NAME="vendor-m"; PROXY_API_URL="http://x"; PROXY_API_KEY="k";
+  OAI_API_URL="https://oai.example/openai/v1"; OAI_API_KEY="k"; OAI_MODELS="gpt-a";
+  host_write_opencode_config ) || fail "T5e: host_write_opencode_config returned non-zero"
+jq -e '(.provider.harness.models | keys) == ["vendor-m"]
+       and (.provider["harness-oai"].models | keys) == ["gpt-a"]
+       and .model == "harness/vendor-m"' "$cfg" >/dev/null 2>&1 \
+    || fail "T5e: vendor + OAI config has the wrong shape — $(cat "$cfg")"
+overlay=$(clone_dir="$REPO_ROOT" harness_slim=1 slim_opencode_config oai)
+jq -e '.provider.harness.options.headers["x-harness-slim"] == "1"
+       and .provider["harness-oai"].options.headers["x-harness-slim"] == "1"' <<<"$overlay" >/dev/null 2>&1 \
+    || fail "T5e: the oai slim overlay must set the header on both providers — $overlay"
+[[ "$(clone_dir="$REPO_ROOT" harness_slim=1 slim_opencode_config | jq -c '.provider | keys')" == '["harness"]' ]] \
+    || fail "T5e: without oai the overlay must not name harness-oai"
+ok "T5e: OAI models get the harness-oai provider; slim header on both"
+
+# --- T5f: required config is the vendor trio, the OAI trio, or both ---------
+( PROXY_API_URL=""; PROXY_API_KEY=""; DEFAULT_MODEL_NAME=""; OAI_API_URL="u"; OAI_API_KEY="k"; OAI_MODELS="m";
+  host_require_config ) >/dev/null 2>&1 || fail "T5f: an OAI-only config must pass"
+out=$( ( PROXY_API_URL=""; PROXY_API_KEY=""; DEFAULT_MODEL_NAME=""; OAI_API_URL="u"; OAI_API_KEY=""; OAI_MODELS="m";
+  host_require_config ) 2>&1 || true )
+grep -q "OAI_API_KEY" <<<"$out" && ! grep -q "PROXY_API_URL" <<<"$out" \
+    || fail "T5f: a half-set OAI upstream must name only the missing OAI key — $out"
+out=$( ( PROXY_API_URL="http://x"; PROXY_API_KEY=""; DEFAULT_MODEL_NAME=""; OAI_API_URL="u"; OAI_API_KEY="k"; OAI_MODELS="m";
+  host_require_config ) 2>&1 || true )
+grep -q "PROXY_API_KEY" <<<"$out" && ! grep -q "DEFAULT_MODEL_NAME" <<<"$out" \
+    || fail "T5f: a half-set vendor beside OAI must name PROXY_API_KEY only — $out"
+[[ "$(DEFAULT_MODEL_NAME=""; OAI_API_URL="u"; OAI_API_KEY="k"; OAI_MODELS=" m1 ,m2"; _effective_default_model)" == "m1" ]] \
+    || fail "T5f: the first OAI model is the default when DEFAULT_MODEL_NAME is empty"
+ok "T5f: required config accepts vendor, OAI or both; OAI default model"
+
 # --- T6: host_write_opencode_config refuses when jq is absent (M4 guard) ----
 if ( PATH="/nonexistent-dir"; PROXY_PORT=8123; DEFAULT_MODEL_NAME="m"; host_write_opencode_config ) >/dev/null 2>&1; then
     fail "T6: host_write_opencode_config should fail without jq, not reach the docker sidecar"

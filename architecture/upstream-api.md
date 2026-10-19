@@ -133,6 +133,35 @@ found a standard OpenAI chat-completions contract, unlike the plain models:
 The proxy forwards these models natively; see [`proxy.md`](proxy.md) →
 Native tool models.
 
+## A second upstream: an OpenAI-format API (`OAI_*`)
+
+`OAI_API_URL` + `OAI_API_KEY` + `OAI_MODELS` add a real OpenAI-format API
+(OpenAI, or Azure OpenAI's v1 surface `https://<resource>.openai.azure.us/openai/v1`)
+beside the vendor upstream or instead of it. Its models take tools under their
+own names (no `-withtools`). Facts the proxy is built on (Azure docs and
+issue reports, 2026-10; not yet checked against the live Gov endpoint):
+
+- **Paths** hang off the base: `{base}/chat/completions`, `{base}/responses`,
+  `{base}/models`. Auth is `Authorization: Bearer <key>` (Azure v1 also takes
+  `api-key`; send one, not both).
+- **`/models` lists base models, not deployments**, so the ids requests use
+  (Azure: deployment names) come from `OAI_MODELS`, never discovery.
+- **Reasoning models reject `max_tokens`** (Chat takes
+  `max_completion_tokens`, Responses `max_output_tokens`) and the sampling
+  knobs (temperature, top_p, penalties).
+- **gpt-5.6 on Azure rejects tools + reasoning on `/chat/completions`**:
+  "Function tools with reasoning_effort are not supported ... use
+  /v1/responses or set reasoning_effort to 'none'". Reasoning defaults to
+  medium, so plain tools trip it. The Responses API takes both.
+- **Prompt caching is automatic** from 1024 prompt tokens (prefix match; 5.6:
+  30+ min retention). `prompt_cache_key` routes one session's requests to the
+  same cache; `prompt_cache_retention` is deprecated on 5.6 and not sent.
+  Hits are reported as `usage.prompt_tokens_details.cached_tokens` (Chat) or
+  `usage.input_tokens_details.cached_tokens` (Responses).
+
+How the proxy and opencode use it: [`proxy.md`](proxy.md) → OAI upstream and
+[`harness-cli.md`](harness-cli.md) → Host mode.
+
 ## A second backend: the ChatGPT backend-api
 
 Everything above describes the **default** upstream (`PROXY_BACKEND=openai`).
