@@ -1796,7 +1796,8 @@ cmd_unlock() {
 # 'memory' (which earlier turns reach the model and what decides when they
 # are dropped), 'optimize-single' (which size, join format and framing of
 # a chat folded into one message the model answers best from) and 'thinking'
-# (reasoning controls, thought text, thought signatures, reasoning billing). Output is redacted (key, URL, host, emails, IPs, projects/...
+# (reasoning controls, thought text, thought signatures, reasoning billing)
+# and 'slim' (reads and greps per task, prompt and signature arms). Output is redacted (key, URL, host, emails, IPs, projects/...
 # paths, HARNESS_PROBE_REDACT terms) so it can be pasted back as-is. Runs on
 # the host's python3; falls back to the proxy image's python when the host has
 # none. See architecture/harness-cli.md.
@@ -1827,6 +1828,9 @@ subcommands:
             (reasoning_effort, thinking_config levels), where thought
             text comes back, thought signatures on tool calls, and
             whether reasoning is billed. About 45 requests, 10-20 minutes.
+  slim      how much the slim agent reads and greps per task: the
+            current prompt with thought signatures dropped and kept, and
+            a candidate prompt. Up to about 60 requests per arm.
   help      this list
 
 'harness probe <subcommand> --help' lists that subcommand's options.
@@ -1954,6 +1958,35 @@ send that file for analysis.
 EOF
 }
 
+_probe_slim_help() {
+    cat <<'EOF'
+usage: harness probe slim [--only ARMS] [--repeat N] [--candidate PATH]
+                          [--model ID] [--timeout SECS]
+
+Measure how much the slim agent reads and greps per task. A simulated
+opencode session (slim prompt, slim tool descriptions, a small repo with
+one bug to fix) is played against the upstream, with the probe acting as
+the tools. Arms (digits for --only):
+
+  1  current slim prompt, thought signatures dropped (what opencode sends)
+  2  current slim prompt, thought signatures kept (what the proxy now does)
+  3  candidate prompt, thought signatures kept
+
+Each arm reports solved or not, steps, reads, greps, re-reads and tokens,
+then a verdict comparing them.
+
+About 60 requests per arm at most (30 main steps, 15 per subagent).
+The full redacted log is written to state/output/probe-slim-<time>.log;
+send that file for analysis.
+
+  --only ARMS       run only these arms, e.g. 13
+  --repeat N        sessions per arm (default 1)
+  --candidate PATH  candidate prompt (default scripts/probe_slim_candidate.md)
+  --model ID        model to probe (default: DEFAULT_MODEL_NAME)
+  --timeout SECS    per-request timeout
+EOF
+}
+
 _probe_single_help() {
     cat <<'EOF'
 usage: harness probe optimize-single [--quick] [--reps N] [--sizes LIST]
@@ -2017,6 +2050,7 @@ cmd_probe() {
         memory) suite=memory; shift ;;
         optimize-single|--optimize-single) suite=single; shift ;;
         thinking) suite=thinking; shift ;;
+        slim) suite=slim; shift ;;
         ""|-*) ;;
         *)
             err "unknown probe subcommand '$1'"
@@ -2030,6 +2064,7 @@ cmd_probe() {
                 memory) _probe_memory_help ;;
                 single) _probe_single_help ;;
                 thinking) _probe_thinking_help ;;
+                slim) _probe_slim_help ;;
                 *) _probe_full_help ;;
             esac
             return 0
@@ -2048,6 +2083,7 @@ cmd_probe() {
     [[ $suite == memory ]] && stem=probe-memory
     [[ $suite == single ]] && stem=probe-single
     [[ $suite == thinking ]] && stem=probe-thinking
+    [[ $suite == slim ]] && stem=probe-slim
     local rel log
     rel="state/output/${stem}-$(date -u +%Y%m%dT%H%M%SZ).log"
     log="$install_root/$rel"
@@ -2059,10 +2095,22 @@ cmd_probe() {
         if command -v cygpath >/dev/null 2>&1; then
             pyscript=$(cygpath -m "$script"); log=$(cygpath -m "$log")
         fi
+        # The slim suite reads the prompts and proxy.py from the clone the
+        # launch uses.
+        if [[ $suite == slim ]]; then
+            local root="$clone_dir"
+            command -v cygpath >/dev/null 2>&1 && root=$(cygpath -m "$root")
+            set -- --root "$root" "$@"
+        fi
         # $py is unquoted on purpose: on Windows it can be 'py -3'.
         # shellcheck disable=SC2086
         $py "$pyscript" --suite "$suite" --log "$log" --log-display "$rel" "$@"
         return
+    fi
+    local -a mnt=()
+    if [[ $suite == slim ]]; then
+        mnt=(-v "$(harness_docker_path "$clone_dir"):/harness:ro")
+        set -- --root /harness "$@"
     fi
     # No host python: borrow the proxy image's. Values pass by name (-e VAR),
     # never on the command line, so the key never shows up in `ps`. The log
@@ -2078,7 +2126,7 @@ cmd_probe() {
     for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
         [[ -n "${!v:-}" ]] && envs+=(-e "$v")
     done
-    harness_docker run --rm -i "${envs[@]}" --entrypoint python \
+    harness_docker run --rm -i "${envs[@]}" ${mnt[@]+"${mnt[@]}"} --entrypoint python \
         harness-proxy:latest - --suite "$suite" --log /dev/stderr --log-display "$rel" "$@" \
         <"$script" 2>"$log"
     local rc=$?
