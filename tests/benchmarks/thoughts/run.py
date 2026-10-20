@@ -417,7 +417,7 @@ def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, e
                        0 if c["tokens_estimated"] else c["tokens"], ctx["next_pair"])
     oc = opencode_metrics(ctx["oc_db"], env["src"], t0w, time.time(), ctx["needles"])
     patch = swe_env.capture_diff(env)
-    with open(os.path.join(tdir, tid + ".patch"), "w", encoding="utf-8", newline="") as f:
+    with open(os.path.join(tdir, tid + ".patch"), "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
         f.write(patch)
     ev = swe_env.evaluate(env, row, patch, log_path=os.path.join(tdir, tid + ".eval.log")) if patch.strip() \
         else {"resolved": False, "applied": True, "empty_patch": True}

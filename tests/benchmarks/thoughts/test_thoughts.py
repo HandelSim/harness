@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -351,7 +352,15 @@ class Checkout(unittest.TestCase):
         self.assertTrue(p["gate"].startswith(os.path.join(self.d, "cache", "data") + os.sep))
 
 
-@unittest.skipIf(not shutil.which("git"), "needs git")
+def _git_version():
+    try:
+        out = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
+        return tuple(int(x) for x in out.split()[2].split(".")[:2])
+    except (OSError, IndexError, ValueError):
+        return (0, 0)
+
+
+@unittest.skipIf(_git_version() < (2, 32), "needs git >= 2.32 (GIT_CONFIG_GLOBAL)")
 class Portability(unittest.TestCase):
     """What broke on Windows: the checkout went through `bash -c "git archive |
     tar -x -C 'C:/...'"`, and Git for Windows' core.autocrlf=true turns the
@@ -411,6 +420,25 @@ class Portability(unittest.TestCase):
         # Rebuilds remove git's read-only object files too.
         swe_env._rmtree(src)
         self.assertFalse(os.path.exists(src))
+
+    @unittest.skipIf(os.name == "nt", "posix process groups")
+    def test_timeout_kills_the_whole_tree(self):
+        pidf = os.path.join(self.d, "pid")
+        child = f"import os, time; open({pidf!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+        t0 = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            swe_env._run(f"{sys.executable} -c \"{child}\"; echo done", timeout=2, nice=False)
+        self.assertLess(time.monotonic() - t0, 20)
+        with open(pidf) as f:
+            pid = int(f.read())
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the test runner under bash outlived the timeout")
 
     def test_windows_venv_layout(self):
         was = swe_env.IS_WINDOWS

@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -37,7 +38,6 @@ IS_WINDOWS = os.name == "nt"
 BASH = shutil.which("bash") or "bash"
 # Windows has no nice; children start at below-normal priority instead.
 NICE = [] if IS_WINDOWS else ["nice", "-n", "19"] + (["ionice", "-c", "3"] if shutil.which("ionice") else [])
-_LOW_PRIO = {"creationflags": subprocess.BELOW_NORMAL_PRIORITY_CLASS} if IS_WINDOWS else {}
 
 # runtests.py and bin/test run through the venv python rather than their
 # `#!/usr/bin/env python` shebang: the same interpreter, and Windows cannot exec one.
@@ -303,14 +303,42 @@ def grade(status: dict, f2p: list[str], p2p: list[str]) -> dict:
 # --------------------------------------------------------------------------
 
 
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """The whole tree, not just bash: an orphaned test runner keeps running,
+    and on Windows keeps the pipes open so collecting output never returns."""
+    try:
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                           stdin=subprocess.DEVNULL, timeout=60)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        proc.kill()
+
+
 def _run(cmd, cwd=None, timeout=1800, env=None, check=True, nice=True, raw=False) -> subprocess.CompletedProcess:
     """`raw` keeps stdout as bytes (a diff whose CRs must survive); otherwise
-    UTF-8 text whatever the locale (Windows defaults to cp1252)."""
+    UTF-8 text whatever the locale (Windows defaults to cp1252). On a timeout
+    or interrupt the child's whole process tree is killed."""
     if isinstance(cmd, str):
         cmd = [BASH, "-c", cmd]
     text = {} if raw else {"encoding": "utf-8", "errors": "replace"}
-    r = subprocess.run((NICE if nice else []) + cmd, cwd=cwd, env=env, capture_output=True, timeout=timeout,
-                       stdin=subprocess.DEVNULL, **text, **(_LOW_PRIO if nice else {}))
+    if IS_WINDOWS:
+        kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+              | (subprocess.BELOW_NORMAL_PRIORITY_CLASS if nice else 0)}
+    else:
+        kw = {"start_new_session": True}
+    with subprocess.Popen((NICE if nice else []) + cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, **text, **kw) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except BaseException as e:
+            _kill_tree(proc)
+            out, err = proc.communicate()
+            if isinstance(e, subprocess.TimeoutExpired):
+                raise subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err) from None
+            raise
+    r = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
     if check and r.returncode != 0:
         err = r.stderr or r.stdout
         err = err.decode("utf-8", "replace") if raw else err
@@ -340,7 +368,7 @@ def _py_launcher(v: str) -> str:
     if not (IS_WINDOWS and shutil.which("py")):
         return ""
     r = subprocess.run(["py", f"-{v}", "-c", "import sys; print(sys.executable)"], capture_output=True,
-                       text=True, stdin=subprocess.DEVNULL)
+                       text=True, stdin=subprocess.DEVNULL, timeout=60)
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
@@ -511,7 +539,7 @@ def capture_diff(env: dict) -> str:
     _run(g + ["add", "-A"], nice=False)
     r = _run(g + ["diff", "--cached", "--binary", "pristine"], nice=False, raw=True)
     _run(g + ["reset", "-q"], nice=False)
-    return r.stdout.decode("utf-8", "replace")
+    return r.stdout.decode("utf-8", "surrogateescape")
 
 
 def evaluate(env: dict, row: dict, patch: str, timeout: int = 1800, log_path: str = "") -> dict:
@@ -525,7 +553,7 @@ def evaluate(env: dict, row: dict, patch: str, timeout: int = 1800, log_path: st
     try:
         if patch.strip():
             pf = os.path.join(tmp, "model.patch")
-            with open(pf, "w", encoding="utf-8", newline="") as f:
+            with open(pf, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
                 f.write(patch)
             r = _run(["git", "-C", env["src"], "apply", "--whitespace=nowarn", pf], check=False, nice=False)
             if r.returncode != 0 and shutil.which("patch"):
@@ -546,6 +574,9 @@ def evaluate(env: dict, row: dict, patch: str, timeout: int = 1800, log_path: st
                     PATH=venv_bin(env["venv"]) + os.pathsep + os.environ.get("PATH", ""))
         for k in [k for k in envv if k.startswith(("PYTEST_", "PYTHON"))]:
             envv.pop(k)
+        if IS_WINDOWS:
+            # Piped stdout is cp1252 there; a non-cp1252 test name would kill the runner.
+            envv["PYTHONUTF8"] = "1"
         envv.update(s.get("eval_env", {}))
         cmd = s["test_cmd"] + " " + " ".join(test_directives(row))
         t0 = time.monotonic()
