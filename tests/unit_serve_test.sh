@@ -94,7 +94,22 @@ unset PROXY_NATIVE_TOOL_MODELS
 harness_slim=0
 [[ "$(serve_opencode_config)" == '{"share":"disabled"}' ]] || fail "S4: --normal means no aliases (stock opencode)"
 [[ -n "$(thoughts_opencode_config)" ]] || fail "S4: --normal --thoughts keeps the provider-wide header"
-harness_slim=1; unset harness_serve harness_thoughts
+harness_slim=1; harness_serve=1
+# The merged launch overlay: per-model headers only, and OAI keeps its slim header.
+out=$(harness_opencode_overlay oai)
+[[ "$(jq -c '.provider.harness.options.headers // {}' <<<"$out")" == '{}' ]] \
+    || fail "S4: under serve the harness provider must carry no provider-wide mode header"
+[[ "$(jq -r '.provider["harness-oai"].options.headers["x-harness-slim"]' <<<"$out")" == 1 ]] \
+    || fail "S4: OAI models keep the slim header under serve"
+jq -e '.provider.harness.models["nat-withtools:stock"] and .agent.build.prompt and .share == "disabled"' <<<"$out" >/dev/null \
+    || fail "S4: the merged overlay lost the aliases, the slim prompts or share"
+# The variable is trimmed first, as the proxy does.
+PROXY_NATIVE_TOOL_MODELS='  '
+jq -e '.provider.harness.models["nat-withtools:stock"]' <<<"$(serve_opencode_config)" >/dev/null \
+    || fail "S4: a blank PROXY_NATIVE_TOOL_MODELS means the default patterns"
+PROXY_NATIVE_TOOL_MODELS=' OFF '
+[[ "$(serve_opencode_config)" == '{"share":"disabled"}' ]] || fail "S4: ' OFF ' turns the native route off"
+unset PROXY_NATIVE_TOOL_MODELS harness_serve harness_thoughts
 ok "S4: prompt-mode aliases only for native-route models, sharing off"
 
 # --- S5: the key stays off curl's argv and out of opencode's env -------------
@@ -107,9 +122,29 @@ cfg=$(_curl_auth_config 'k"e\y')
     env | grep -qE '^(PROXY_API_KEY|OAI_API_KEY|CHATGPT_COOKIE_STRING)=' && exit 1
     exit 0
 ) || fail "S5: host_opencode_env must drop the upstream secrets"
-if grep -nE 'curl[^|]*-H "Authorization: Bearer' "$HARNESS"; then
-    fail "S5: a curl call puts the key on its command line; pipe _curl_auth_config to curl -K - instead"
-fi
+# The scrub must not hide the OAI upstream from the overlay: its models keep
+# the slim header (host mode decides before the unset, serve via harness_oai).
+for how in host serve; do
+    (
+        unset harness_oai harness_serve OPENCODE_CONFIG_CONTENT
+        OAI_API_URL=http://127.0.0.1:9 OAI_API_KEY=secret OAI_MODELS=m
+        export OAI_API_URL OAI_API_KEY OAI_MODELS
+        if [[ "$how" == serve ]]; then
+            harness_oai=$(_oai_configured && echo oai)
+            unset OAI_API_KEY
+        fi
+        host_opencode_env >/dev/null 2>&1 || true
+        jq -e '.provider["harness-oai"].options.headers["x-harness-slim"] == "1"' \
+            <<<"${OPENCODE_CONFIG_CONTENT:-null}" >/dev/null
+    ) || fail "S5: $how: the OAI slim header was lost with the key scrub"
+done
+# The only Authorization header in the CLI is the one _curl_auth_config
+# writes; any other (curl -H, a wget header, a continuation line) would put
+# the key on a command line.
+hits=$(grep -nE 'Authorization: (Bearer|Basic)' "$HARNESS" | grep -vE '^[0-9]+:[[:space:]]*#')
+[[ "$hits" == *'printf '\''header = "Authorization: Bearer %s"'* && $(wc -l <<<"$hits") -eq 1 ]] \
+    || fail "S5: an Authorization header outside _curl_auth_config; pipe _curl_auth_config to curl -K - instead:
+$hits"
 ok "S5: key via curl -K stdin, scrubbed from opencode's env"
 
 echo "SERVE TEST PASSED"

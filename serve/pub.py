@@ -240,24 +240,40 @@ class AccessCodes:
 
 
 class Sessions:
-    """Server-side sessions: random id -> [name, code digest, idle deadline]."""
+    """Server-side sessions: random id -> [name, code digest, idle deadline,
+    view id]. The view id is a second random id that only unlocks GET /pub/
+    (see Config.view_cookie)."""
 
     def __init__(self, codes, ttl=SESSION_TTL):
         self.codes = codes
         self.ttl = ttl
         self.lock = threading.Lock()
         self.data = {}
+        self.views = {}
 
     def create(self, name, digest):
-        sid = secrets.token_urlsafe(32)
+        """(session id, view id) for a new session."""
+        sid, vid = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         now = time.monotonic()
         with self.lock:
             for k in [k for k, s in self.data.items() if s[2] < now]:
-                del self.data[k]
+                self._del(k)
             while len(self.data) >= MAX_SESSIONS:
-                del self.data[min(self.data, key=lambda k: self.data[k][2])]
-            self.data[sid] = [name, digest, now + self.ttl]
-        return sid
+                self._del(min(self.data, key=lambda k: self.data[k][2]))
+            self.data[sid] = [name, digest, now + self.ttl, vid]
+            self.views[vid] = sid
+        return sid, vid
+
+    def _del(self, sid):
+        s = self.data.pop(sid, None)
+        if s is not None:
+            self.views.pop(s[3], None)
+
+    def lookup_view(self, vid):
+        """The name behind a view id, under the same rules as lookup."""
+        with self.lock:
+            sid = self.views.get(vid) if vid else None
+        return self.lookup(sid)
 
     def lookup(self, sid):
         """The name behind sid if it is live and its code is still in the file; slides the deadline."""
@@ -270,14 +286,14 @@ class Sessions:
             if s is None:
                 return None
             if s[2] < now or (s[0], s[1]) not in live:
-                del self.data[sid]
+                self._del(sid)
                 return None
             s[2] = now + self.ttl
             return s[0]
 
     def drop(self, sid):
         with self.lock:
-            self.data.pop(sid, None)
+            self._del(sid)
 
 
 class FailLimiter:
@@ -495,6 +511,7 @@ class Config:
         self.limiter = FailLimiter()
         self.secure_cookie = secure_cookie
         self.cookie_name = "__Host-harness_pub" if secure_cookie else "harness_pub"
+        self.view_cookie_name = "__Secure-harness_pub_view" if secure_cookie else "harness_pub_view"
         self.opencode_url = opencode_url
         self.proxy_url = proxy_url
         self.modes = list(modes)
@@ -519,6 +536,20 @@ class Config:
         if self.secure_cookie:
             attrs += "; Secure"
         return f"{self.cookie_name}={value}{attrs}"
+
+    def view_cookie(self, value, clear=False):
+        """The /pub/-only cookie. A /pub/ page runs sandboxed with an opaque
+        origin, so browsers treat its image/style/script loads and its links
+        to other /pub/ pages as cross-site and withhold SameSite=Strict (and,
+        for subresources, Lax) cookies. This one is SameSite=None so those
+        loads still authenticate; it is scoped to Path=/pub/ and accepted only
+        for GET/HEAD /pub/, which changes nothing and whose responses another
+        site cannot read (no CORS). None requires Secure; browsers accept a
+        Secure cookie over plain http only on 127.0.0.1/localhost."""
+        attrs = "; Path=/pub/; HttpOnly; SameSite=None; Secure"
+        if clear:
+            attrs += "; Max-Age=0"
+        return f"{self.view_cookie_name}={value}{attrs}"
 
 
 STYLE = """
@@ -693,13 +724,16 @@ def make_handler(cfg):
         def log_message(self, fmt, *args):
             sys.stderr.write("[pub] %s %s\n" % (self.address_string(), fmt % args))
 
-        def send(self, code, body, ctype="text/plain; charset=utf-8", extra=None, head=False):
+        def send(self, code, body, ctype="text/plain; charset=utf-8", extra=None, head=False,
+                 cookies=()):
             hdrs = {"Content-Type": ctype, "Content-Length": str(len(body)),
                     "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
             hdrs.update(extra or {})
             self.send_response(code)
             for k, v in hdrs.items():
                 self.send_header(k, v)
+            for c in cookies:
+                self.send_header("Set-Cookie", c)
             self.end_headers()
             if not head:
                 self.wfile.write(body)
@@ -713,10 +747,9 @@ def make_handler(cfg):
             hdrs.update(extra or {})
             self.send(code, body, "text/html; charset=utf-8", hdrs, head)
 
-        def redirect(self, location, extra=None, head=False):
-            hdrs = {"Location": location, "Cache-Control": "no-store"}
-            hdrs.update(extra or {})
-            self.send(303, b"", extra=hdrs, head=head)
+        def redirect(self, location, head=False, cookies=()):
+            self.send(303, b"", extra={"Location": location, "Cache-Control": "no-store"},
+                      head=head, cookies=cookies)
 
         def host_ok(self, head):
             if (self.headers.get("Host") or "").lower() in cfg.allowed:
@@ -753,6 +786,11 @@ def make_handler(cfg):
             # X-Harness-User is only ever set here, from the session; an
             # inbound one is never read.
             sid, user = self.session()
+            if cfg.codes and not user and path.startswith("/pub/"):
+                for vid in cookie_values(self.headers, cfg.view_cookie_name):
+                    user = cfg.sessions.lookup_view(vid)
+                    if user:
+                        break
             if path == "/_auth":
                 if not cfg.codes:
                     self.send(200, b"ok\n", extra={"Cache-Control": "no-store"}, head=head)
@@ -823,7 +861,8 @@ def make_handler(cfg):
             if path == "/logout":
                 for sid in cookie_values(self.headers, cfg.cookie_name):
                     cfg.sessions.drop(sid)
-                self.redirect("/login", {"Set-Cookie": cfg.cookie("", clear=True)})
+                self.redirect("/login", cookies=(cfg.cookie("", clear=True),
+                                                 cfg.view_cookie("", clear=True)))
                 return
             client = self.client()
             wait = cfg.limiter.retry_after(client)
@@ -848,9 +887,9 @@ def make_handler(cfg):
                 sys.stderr.write(f"[pub] sign-in failed from {client}\n")
                 self.send_page(401, render_login(cfg, "That code is not valid."))
                 return
-            sid = cfg.sessions.create(*hit)
+            sid, vid = cfg.sessions.create(*hit)
             sys.stderr.write(f"[pub] signed in: {hit[0]} from {client}\n")
-            self.redirect("/", {"Set-Cookie": cfg.cookie(sid)})
+            self.redirect("/", cookies=(cfg.cookie(sid), cfg.view_cookie(vid)))
 
         def do_GET(self):
             self.handle_get(False)

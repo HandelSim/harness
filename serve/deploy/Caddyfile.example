@@ -1,0 +1,74 @@
+# harness serve behind Caddy v2: TLS, the access-code gate, and opencode web
+# logged in by the proxy instead of by a token in a link. Copy, set the two
+# names, and validate with:
+#   caddy adapt --config Caddyfile --adapter caddyfile
+#
+# Two sites, because pub.py's session cookie is host-only (__Host- prefix):
+#   PUB  (e.g. harness.example.com) -> the pub page, 127.0.0.1:8780
+#   CODE (e.g. code.example.com)    -> opencode web,  127.0.0.1:8781, gated
+#                                      by pub.py's /_auth (forward_auth)
+# Each site has its own /login, so a user signs in once per name.
+#
+# Add at least one code first ('harness serve code add NAME'), then run
+#   harness serve --allow-host harness.example.com --allow-host code.example.com \
+#     --secure-cookie --opencode-url https://code.example.com/
+# (pub.py needs both names in --allow-host: Caddy, forward_auth included,
+# passes the client's Host through). --secure-cookie also makes pub.py rate-
+# limit sign-ins by the last X-Forwarded-For entry, which is the real client
+# here: Caddy replaces X-Forwarded-For from untrusted clients.
+#
+# Caddy's environment must hold HARNESS_OPENCODE_BASIC, base64 of
+# "opencode:<password>", the password being state/serve/opencode-password:
+#   printf 'opencode:%s' "$(cat state/serve/opencode-password)" | base64 -w0
+# It is read per request ({env.*}), so it never lands in the adapted config or
+# the admin API; keep it out of the Caddyfile itself. (Use {$VAR} only for
+# non-secrets: those are substituted into the config at load time.)
+#
+# Security truth: whoever passes the gate on CODE gets opencode web, which
+# has a terminal (a PTY over a websocket under /pty, proxied like any other
+# request): a shell on this host as the user running harness serve. If that
+# user can sudo or reach docker, every code holder is root.
+
+(harness_headers) {
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Frame-Options DENY
+		# Added alongside any CSP the upstream sends; browsers enforce both.
+		+Content-Security-Policy "frame-ancestors 'none'"
+	}
+}
+
+{$HARNESS_PUB_HOST:harness.example.com} {
+	import harness_headers
+	reverse_proxy 127.0.0.1:8780
+}
+
+{$HARNESS_CODE_HOST:code.example.com} {
+	import harness_headers
+
+	# pub.py's sign-in form, served on this name so its cookie is set here.
+	@signin path /login /logout
+	handle @signin {
+		reverse_proxy 127.0.0.1:8780
+	}
+
+	handle {
+		# route keeps this order; the default directive order would run
+		# request_header after forward_auth and strip the copied user header.
+		route {
+			# Never let a client supply these.
+			request_header -X-Harness-User
+			request_header -Authorization
+			# 2xx from /_auth: pass, copying X-Harness-User upstream.
+			# Anything else (401 with a "Sign in" link) goes back to the client.
+			forward_auth 127.0.0.1:8780 {
+				uri /_auth
+				copy_headers X-Harness-User
+			}
+			reverse_proxy 127.0.0.1:8781 {
+				header_up Authorization "Basic {env.HARNESS_OPENCODE_BASIC}"
+			}
+		}
+	}
+}

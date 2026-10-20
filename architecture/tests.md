@@ -18,7 +18,7 @@ and coverage map, see `tests/INVENTORY.md` and `tests/COVERAGE.md`
 | `tests/fixtures/`          | Test fixtures. `fixtures/responses/` holds mock-upstream response fixtures (see `fixtures/responses/README.md`); `fixtures/test-project/` is the small Python calculator package used by `integration_test.sh`. |
 | `tests/mock_upstream.py`   | Mock upstream LLM API used by every docker-based test. Two modes: legacy `MOCK_SCENARIO=text\|tool` and fixture dispatch (`MOCK_FIXTURES_DIR=/fixtures`). |
 | `tests/*_test.sh`          | Top-level test scripts (one per area: `proxy`, `harness`, `persistence`, `mcp`, `firewall`, `upgrade`, `full_pipeline`, `integration`, `scheme_contract`, `podman_smoke`). Plus docker-free `unit_*_test.sh` (e.g. `unit_platform_timer_test.sh`). |
-| `tests/benchmarks/`        | Harbor-based agent benchmarks (Terminal-Bench 2.0, SWE-bench Lite). Adapters under `benchmarks/adapters/`, schemes under `benchmarks/schemes/`, runners under `benchmarks/runners/`. The docker-free prompt-mode A/B lives in `benchmarks/modes/` (`harness benchmark --test-modes`). Benchmarks NEVER run in CI. See `tests/benchmarks/README.md`. |
+| `tests/benchmarks/`        | Harbor-based agent benchmarks (Terminal-Bench 2.0, SWE-bench Lite). Adapters under `benchmarks/adapters/`, schemes under `benchmarks/schemes/`, runners under `benchmarks/runners/`. The docker-free prompt-mode A/B lives in `benchmarks/modes/` (`harness benchmark --test-modes`), the `--thoughts` A/B in `benchmarks/thoughts/` (`harness probe thoughts`). Benchmarks NEVER run in CI. See `tests/benchmarks/README.md`. |
 
 ## Quick start
 
@@ -106,6 +106,11 @@ Benchmarks are NOT regular tests; they're driven by `harness benchmark
   `tests/benchmarks/modes/tasks/`, paired stats in `report.txt`. `--mock`
   dry-runs it against a loopback mock upstream. See
   `tests/benchmarks/modes/README.md`.
+- `harness probe thoughts` — docker-free paired A/B of `--thoughts` on 38
+  SWE-bench Verified tasks (`tests/benchmarks/thoughts/`), token-capped at
+  20M by default; `--gate-only` builds the tasks and checks the gold
+  patches with no model calls. Its unit tests run in `harness test unit` via
+  `tests/unit_thoughts_test.sh`. See `tests/benchmarks/thoughts/README.md`.
 
 See `tests/benchmarks/README.md` for the full reference: installation,
 docker socket caveat, smoketest-first guidance, adding a new scheme,

@@ -1846,6 +1846,11 @@ subcommands:
   slim      how much the slim agent reads and greps per task: the
             current prompt with thought signatures dropped and kept, and
             a candidate prompt. Up to about 60 requests per arm.
+  thoughts  whether --thoughts helps the agent: paired runs of 'harness
+            host --yolo -p' with and without it on 38 SWE-bench Verified
+            tasks, graded by their tests, stopped at --budget tokens
+            (default 20M). Start with --gate-only (builds the tasks, no
+            model calls). 'harness probe thoughts --help' for its options.
   help      this list
 
 'harness probe <subcommand> --help' lists that subcommand's options.
@@ -2066,6 +2071,7 @@ cmd_probe() {
         optimize-single|--optimize-single) suite=single; shift ;;
         thinking) suite=thinking; shift ;;
         slim) suite=slim; shift ;;
+        thoughts) shift; _probe_thoughts "$@"; return ;;
         ""|-*) ;;
         *)
             err "unknown probe subcommand '$1'"
@@ -2148,6 +2154,20 @@ cmd_probe() {
     # A container that never started reports only on stderr, i.e. in the log.
     (( rc == 0 )) || err "probe exited $rc; errors, if any, are at the end of $rel"
     return "$rc"
+}
+
+# `harness probe thoughts [opts]`: tests/benchmarks/thoughts/run.py, a paired
+# A/B of `harness host --yolo -p` with and without --thoughts on SWE-bench
+# Verified tasks (docker-free; tests/benchmarks/thoughts/README.md). Like
+# _harness_bench_test_modes, HARNESS_BIN and HARNESS_BENCH_INSTALL_ROOT tell it
+# which harness to launch and whose .env to use.
+_probe_thoughts() {
+    local py
+    py=$(host_python_bin) || { err "harness probe thoughts: Python 3 is required"; return 1; }
+    # $py may be the two-token `py -3` on Windows; intentional word-split.
+    # shellcheck disable=SC2086
+    HARNESS_BIN="$clone_dir/harness" HARNESS_BENCH_INSTALL_ROOT="$install_root" \
+        $py "$clone_dir/tests/benchmarks/thoughts/run.py" "$@"
 }
 
 # --- config / model / uninstall (post-install setup, in the versioned CLI) ---
@@ -5576,6 +5596,7 @@ serve_opencode_config() {
     local cfg pats raw m p ids native=()
     cfg=$(host_opencode_config)
     raw="${PROXY_NATIVE_TOOL_MODELS:-}"
+    raw="${raw#"${raw%%[![:space:]]*}"}"; raw="${raw%"${raw##*[![:space:]]}"}"
     case "${raw,,}" in off|none|0|false) printf '%s' "$base"; return 0 ;; esac
     IFS=, read -ra pats <<< "${raw:-*-withtools}"
     ids=$(harness_jq -r '.provider.harness.models // {} | keys[]' "$cfg" 2>/dev/null | tr -d '\r')
@@ -5722,11 +5743,14 @@ HELP
 # to the proxy), so the agent's shells do not carry them; the callers start
 # the proxy first and need no key after this.
 host_opencode_env() {
+    # Decided before the unset, which empties OAI_API_KEY (cmd_serve, which
+    # unsets earlier, sets harness_oai itself).
+    local oai="${harness_oai-$(_oai_configured && echo oai)}"
     unset "${_harness_secret_vars[@]}"
     export OPENCODE_CONFIG="$(host_opencode_config)"
     export OPENCODE_DISABLE_AUTOUPDATE=1
     local overlay
-    overlay=$(harness_opencode_overlay "$(_oai_configured && echo oai)")
+    overlay=$(harness_opencode_overlay "$oai")
     [[ -n "$overlay" ]] && export OPENCODE_CONFIG_CONTENT="$overlay"
     # Exa web-search parity with container mode. Intentional in host mode too:
     # host mode already runs with NO egress firewall (the confirm gate makes
@@ -6019,15 +6043,21 @@ serve_code() {
             host_require_python3 || return 1
             mkdir -p "$state_root/serve"
             py=$(host_python_bin) || return 1
+            local had=0
+            [[ -e "$f" ]] && had=1
             # shellcheck disable=SC2086  # host_python_bin may be the two words 'py -3'
-            $py "$clone_dir/serve/pub.py" "$sub-code" --access-codes "$f" "$name"
+            $py "$clone_dir/serve/pub.py" "$sub-code" --access-codes "$f" "$name" || return
+            # A running serve reads the file live, but only if it started gated.
+            (( had )) || echo "the pub page now asks for a code; restart a running 'harness serve' to apply it" >&2
             ;;
         list)
-            if [[ ! -s "$f" ]]; then
+            if [[ ! -e "$f" ]]; then
                 echo "no access codes: the pub page is open to anyone who reaches it"
                 return 0
             fi
             grep -Ev '^[[:space:]]*(#|$)' "$f" | cut -d: -f1
+            grep -Eqv '^[[:space:]]*(#|$)' "$f" \
+                || echo "no codes left: nobody can sign in (delete $f to open the page)"
             ;;
         *) err "unknown serve code command '$sub' (add NAME, remove NAME, list)"; return 1 ;;
     esac
@@ -6068,12 +6098,14 @@ browser sends it), for a reverse proxy in front of the pub page. The pub
 page links opencode as <that host>:N+1, so behind a reverse proxy give
 opencode its own name, with the proxy doing the login, and pass that URL
 as --opencode-url (the link then carries no password). --secure-cookie
-is for a reverse proxy that serves the pub page over HTTPS.
+is for a reverse proxy that serves the pub page over HTTPS; the pub page
+then trusts its X-Forwarded-For for the sign-in rate limit.
 
 Access codes: 'harness serve code add NAME' prints a new code for NAME
-once (only its hash is kept, in state/serve/access-codes). With any code
-set, the pub page asks for one and remembers the person in a cookie;
-'code remove NAME' revokes it at once. The page's /_auth answers a
+once (only its hash is kept, in state/serve/access-codes). Once that file
+exists the pub page asks for a code and remembers the person in a cookie;
+'code remove NAME' revokes it at once (delete the file to open the page
+again). The page's /_auth answers a
 reverse proxy's forward_auth (serve/deploy/ has a Caddy example). A code
 gates the pub page only: opencode web has its own password, so put
 opencode behind the same reverse proxy before giving anyone a code.
@@ -6109,6 +6141,9 @@ HELP
     if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65534 )); then
         err "--port must be a number from 1 to 65534"; return 1
     fi
+    if [[ -n "$opencode_url" && ! "$opencode_url" =~ ^https?://[^[:space:]]+$ ]]; then
+        err "--opencode-url must be an http:// or https:// URL"; return 1
+    fi
     local oc_port=$((port + 1))
 
     host_require_python3 || exit 1
@@ -6124,14 +6159,23 @@ HELP
     host_write_opencode_config
     harness_vault_dir=$(vault_prepare)
     harness_serve=1
+    harness_oai=$(_oai_configured && echo oai)
     # The proxy is up with its own copy of the key; neither server needs it.
     unset "${_harness_secret_vars[@]}"
 
     local pub_args=(--proxy-url "http://127.0.0.1:$(host_proxy_port)"
         --usage-ledger "$(host_usage_ledger)")
-    [[ -s "$(serve_codes_file)" ]] && pub_args+=(--access-codes "$(serve_codes_file)")
+    # Gated as long as the file exists, even with no codes left in it (then
+    # nobody can sign in): deleting the file is the one way to open the page.
+    if [[ -e "$(serve_codes_file)" ]]; then
+        pub_args+=(--access-codes "$(serve_codes_file)")
+        grep -Eqv '^[[:space:]]*(#|$)' "$(serve_codes_file)" 2>/dev/null \
+            || err "warning: serve: $(serve_codes_file) has no codes, so nobody can sign in to the pub page ('harness serve code add NAME', or delete the file to open the page)"
+    fi
     [[ -n "$opencode_url" ]] && pub_args+=(--opencode-url "$opencode_url")
-    (( secure_cookie )) && pub_args+=(--secure-cookie)
+    # Behind a TLS reverse proxy every client is 127.0.0.1, so pub.py takes
+    # the client from the proxy's X-Forwarded-For for its sign-in rate limit.
+    (( secure_cookie )) && pub_args+=(--secure-cookie --trust-forwarded-for)
     if [[ "${harness_slim:-1}" == "1" ]]; then
         pub_args+=(--mode "slim=short tool descriptions, old tool output trimmed, a step reminder"
             --mode "stock=the proxy changes nothing; with the stock agent, opencode as shipped"

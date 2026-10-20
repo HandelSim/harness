@@ -34,10 +34,11 @@ so it can read values like `DEFAULT_MODEL_NAME`, `HARNESS_EXTRA_MOUNTS`
 for its own logic. `docker compose` gets `.env` separately via
 `--env-file`. The two consumers are independent. `.env` holds the upstream
 key, so after sourcing the script drops group/other access to it
-(`chmod go-rwx`, only when the invoking user owns it). The key never goes on
-a command line: the CLI's own upstream calls (auth probe, model lists,
-doctor) hand curl the `Authorization` header as a config on stdin
-(`_curl_auth_config | curl -K -`), so it does not show in `ps`.
+(`chmod go-rwx`, only when the invoking user owns it). The CLI's own
+upstream calls (auth probe, model lists, doctor) hand curl the
+`Authorization` header as a config on stdin (`_curl_auth_config | curl -K
+-`), so the key does not show in `ps` (`harness config set PROXY_API_KEY
+<key>` still takes it as an argument).
 
 Independent, but not equivalent: compose's dotenv parser reads an unquoted
 value to end of line, while `source` ends the assignment at the first space or
@@ -857,7 +858,9 @@ two foreground children:
 - `opencode serve` on `127.0.0.1:N+1`, with `host_opencode_env` (shared with
   `host_run_opencode`, so the config, overlay and NO_PROXY match `harness
   host`; it unsets `_harness_secret_vars` too, since opencode reaches the
-  upstream only through the proxy), cwd the vault (else `$HOME`), and
+  upstream only through the proxy, after deciding whether the OAI provider
+  is configured: under serve, from `harness_oai`, which `cmd_serve` sets
+  before its own unset), cwd the vault (else `$HOME`), and
   `OPENCODE_SERVER_PASSWORD` from `state/serve/opencode-password` (random,
   made once by `serve_password_file`, mode 600). Without `--opencode-url`
   the index links to it as `?auth_token=base64(opencode:<pw>)`, which
@@ -870,15 +873,17 @@ two foreground children:
 `harness_opencode_overlay`, empty outside serve) turns each launch-mode
 switch into a choice in opencode's model picker, per message. For every
 `harness` model that the proxy sends on its native route (the
-`PROXY_NATIVE_TOOL_MODELS` patterns, default `*-withtools`), the model's own
+`PROXY_NATIVE_TOOL_MODELS` patterns, trimmed, default `*-withtools`;
+the shell match covers the fnmatch subset `*`, `?`, `[...]`, `[!...]`), the model's own
 entry carries the launch mode's headers (`x-harness-slim`, plus
 `x-harness-thoughts` with `--thoughts`) and three aliases are added with the
 same `id` and limits: `m:stock` (no harness header), `m:thoughts`
 (thoughts only), and `m:slim+thoughts` (or `m:slim` when the launch already
 has thoughts). The provider-wide slim and thoughts headers are then left
 out. Aliases are made only where the proxy honors the headers: none for
-cooperative-route models, under `--normal`, with a prompt mode set, on the
-chatgpt backend, or with the native route off. The headers change only the
+cooperative-route models, under `--normal`, or with the native route off.
+(The function also returns none with a prompt mode set or on the chatgpt
+backend, which `harness serve` cannot be started with today.) The headers change only the
 proxy side (tool descriptions, step reminder, old-output trim, thought
 summaries); the system prompt follows the agent, so a `stock` primary agent
 (opencode's own prompt, starting on `<default>:stock`) sits beside the slim
@@ -888,12 +893,21 @@ summaries); the system prompt follows the agent, so a `stock` primary agent
 **Access codes.** `harness serve code add|list|remove NAME` manages
 `state/serve/access-codes` (`name:sha256(code)` lines, mode 600) through
 `pub.py add-code|remove-code`; `add` prints the new code once. When the file
-has an entry, `cmd_serve` passes `--access-codes` and every pub route except
-`/login`, `/logout`, `/_auth` and `/healthz` needs a session cookie from
-`POST /login` (HttpOnly, SameSite=Strict, 12 h; `--secure-cookie` adds
-`Secure` and the `__Host-` prefix behind TLS). Failed logins are
-rate-limited per client and overall; non-GET requests need a same-host
-`Origin`; removing a name ends its sessions. `GET /_auth` answers 200 with
+exists, `cmd_serve` passes `--access-codes` (it fails closed: with no codes
+left nobody can sign in, and serve warns; deleting the file opens the page)
+and every pub route except `/login`, `/logout`, `/_auth` and `/healthz`
+needs a session cookie from `POST /login` (HttpOnly, SameSite=Strict, 12 h;
+`--secure-cookie` adds `Secure` and the `__Host-` prefix behind TLS). pub.py
+reads the file live, but whether to gate is decided at start, so the first
+`code add` needs a restart (`add` says so). A sandboxed `/pub/` page's
+loads and links are cross-site, so the session cookie is not sent with
+them; login also sets a second cookie (`harness_pub_view`, Path=/pub/,
+SameSite=None, Secure, HttpOnly) that is accepted only for GET/HEAD
+`/pub/`, which changes nothing. Failed logins are rate-limited per client
+and overall (`--secure-cookie` also passes `--trust-forwarded-for`, so the
+client is the last `X-Forwarded-For` entry, as set by the reverse proxy);
+non-GET requests need a same-host `Origin`; removing a name ends its
+sessions. `GET /_auth` answers 200 with
 `X-Harness-User: <name>` or 401, for a reverse proxy's `forward_auth` in
 front of opencode (`serve/deploy/`). Codes gate the pub page only; opencode
 itself still needs its Basic password, which the reverse proxy injects.
@@ -921,7 +935,10 @@ proxy up; `wait -n` exits 1 if either child dies. Logs:
 `state/serve/{pub,opencode}.log`. `tests/unit_serve_test.sh` runs
 `serve/test_pub.py` (index, Host check, sandbox header, path escape, access
 codes, `/_auth`, usage, git log, proxy status), plus option errors, the
-password file, the mode aliases and the key scrub.
+password file, the mode aliases (alone and in the merged overlay), the key
+scrub (the OAI provider keeps its slim header in host and serve) and a
+guard that the only `Authorization` header in the CLI is
+`_curl_auth_config`'s.
 
 ## ChatGPT backend (`harness chatgpt`)
 
@@ -1119,9 +1136,23 @@ breaks the recursion.
 `cmd_probe` runs `scripts/probe_upstream.py` (stdlib-only Python) straight
 against `PROXY_API_URL` with `PROXY_API_KEY`. The proxy is not involved.
 Subcommands: `full` (the default; bare `harness probe`), `memory`,
-`optimize-single` (alias `--optimize-single`), `thinking`, `slim`, and `help`
-(lists them); `<subcommand> --help` gives that suite's options. The
-subcommand reaches the script as `--suite full|memory|single|thinking|slim`.
+`optimize-single` (alias `--optimize-single`), `thinking`, `slim`,
+`thoughts`, and `help` (lists them); `<subcommand> --help` gives that
+suite's options. Except `thoughts`, the subcommand reaches the script as
+`--suite full|memory|single|thinking|slim`.
+
+**`harness probe thoughts`** is not part of `probe_upstream.py`:
+`_probe_thoughts` runs `tests/benchmarks/thoughts/run.py` with every
+argument after `thoughts` (and `HARNESS_BIN`/`HARNESS_BENCH_INSTALL_ROOT`,
+as `benchmark --test-modes` does), before the key check, since the runner
+launches real `harness host --yolo -p` trials, arm A slim and arm B slim
+plus `--thoughts`, on 38 SWE-bench Verified tasks. It is docker-free: each
+task's checkout is its own one-commit git repo with a venv beside it, under
+`state/bench-thoughts/`, and a gold gate drops tasks whose tests cannot
+discriminate before any token is spent. A budget guard (default 20M tokens,
+1.5M per trial) stops it. `tests/benchmarks/thoughts/README.md` has the
+design, the falsifier and the flags; `tests/unit_thoughts_test.sh` runs its
+unit tests and the routing.
 
 The full suite characterizes the upstream for the question "could an agent
 talk to it directly?". Sections:

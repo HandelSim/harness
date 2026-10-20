@@ -214,16 +214,21 @@ class AccessGateTest(LiveServer):
         h.update(headers or {})
         return self.req(port, "POST", "/login", h, urlencode({"code": code}), host=host)
 
-    def cookie_of(self, r):
-        return r.getheader("Set-Cookie").split(";")[0]
+    def set_cookies(self, r):
+        """{cookie name: whole Set-Cookie value}."""
+        return {c.split("=", 1)[0]: c for c in r.msg.get_all("Set-Cookie") or []}
+
+    def cookie_of(self, r, name="harness_pub"):
+        """The `name=value` pair a Cookie header would send back."""
+        return self.set_cookies(r)[name].split(";")[0]
 
     def test_login_sets_strict_httponly_cookie(self):
         port = self.gated()
         r, _ = self.login(port, self.alice)
         self.assertEqual(r.status, 303)
         self.assertEqual(r.getheader("Location"), "/")
-        sc = r.getheader("Set-Cookie")
-        self.assertTrue(sc.startswith("harness_pub="), sc)
+        self.assertEqual(set(self.set_cookies(r)), {"harness_pub", "harness_pub_view"})
+        sc = self.set_cookies(r)["harness_pub"]
         attrs = [a.strip() for a in sc.split(";")[1:]]
         for want in ("HttpOnly", "SameSite=Strict", "Path=/"):
             self.assertIn(want, attrs)
@@ -239,11 +244,11 @@ class AccessGateTest(LiveServer):
     def test_secure_cookie_uses_host_prefix(self):
         port = self.gated(secure_cookie=True)
         r, _ = self.login(port, self.alice)
-        sc = r.getheader("Set-Cookie")
-        self.assertTrue(sc.startswith("__Host-harness_pub="), sc)
+        self.assertEqual(set(self.set_cookies(r)), {"__Host-harness_pub", "__Secure-harness_pub_view"})
+        sc = self.set_cookies(r)["__Host-harness_pub"]
         self.assertIn("Secure", [a.strip() for a in sc.split(";")])
         self.assertNotIn("Domain", sc)
-        cookie = self.cookie_of(r)
+        cookie = self.cookie_of(r, "__Host-harness_pub")
         self.assertEqual(self.req(port, "GET", "/", {"Cookie": cookie})[0].status, 200)
         sid = cookie.split("=", 1)[1]
         r, _ = self.req(port, "GET", "/", {"Cookie": "harness_pub=" + sid})
@@ -356,8 +361,39 @@ class AccessGateTest(LiveServer):
         cookie = self.cookie_of(self.login(port, self.alice)[0])
         r, _ = self.req(port, "POST", "/logout", {"Cookie": cookie, "Origin": f"http://127.0.0.1:{port}"})
         self.assertEqual((r.status, r.getheader("Location")), (303, "/login"))
-        self.assertIn("Max-Age=0", r.getheader("Set-Cookie"))
+        cleared = self.set_cookies(r)
+        self.assertEqual(set(cleared), {"harness_pub", "harness_pub_view"})
+        for c in cleared.values():
+            self.assertIn("Max-Age=0", c)
         self.assertEqual(self.req(port, "GET", "/", {"Cookie": cookie})[0].status, 401)
+
+    def test_pub_view_cookie(self):
+        # A sandboxed /pub/ page's own image and link loads are cross-site to
+        # the browser, so only a SameSite=None cookie rides along (checked in
+        # headless Chromium); it unlocks GET /pub/ and nothing else.
+        port = self.gated()
+        r, _ = self.login(port, self.alice)
+        view = self.set_cookies(r)["harness_pub_view"]
+        attrs = [a.strip() for a in view.split(";")[1:]]
+        for want in ("Path=/pub/", "HttpOnly", "SameSite=None", "Secure"):
+            self.assertIn(want, attrs)
+        vc = view.split(";")[0]
+        self.assertNotEqual(vc.split("=", 1)[1], self.cookie_of(r).split("=", 1)[1])
+        r, body = self.req(port, "GET", "/pub/notes/new.html", {"Cookie": vc})
+        self.assertEqual(r.status, 200)
+        self.assertIn(b"New page", body)
+        self.assertEqual(self.req(port, "GET", "/", {"Cookie": vc})[0].status, 401)
+        self.assertEqual(self.req(port, "GET", "/_auth", {"Cookie": vc})[0].status, 401)
+        self.assertEqual(self.req(port, "GET", "/pub/old.html", {"Cookie": vc.replace("_view", "")})[0].status, 303)
+        pub.remove_code(self.codes, "alice")
+        self.assertEqual(self.req(port, "GET", "/pub/old.html", {"Cookie": vc})[0].status, 303)
+
+    def test_logout_ends_the_view_cookie_too(self):
+        port = self.gated()
+        r, _ = self.login(port, self.alice)
+        cookie, vc = self.cookie_of(r), self.cookie_of(r, "harness_pub_view")
+        self.req(port, "POST", "/logout", {"Cookie": cookie, "Origin": f"http://127.0.0.1:{port}"})
+        self.assertEqual(self.req(port, "GET", "/pub/old.html", {"Cookie": vc})[0].status, 303)
 
     def test_revoking_a_name_ends_its_sessions(self):
         port = self.gated()
@@ -382,6 +418,57 @@ class AccessGateTest(LiveServer):
         port = self.start(access_codes=os.path.join(self.tmp.name, "nope"))
         self.assertEqual(self.req(port, "GET", "/")[0].status, 401)
         self.assertEqual(self.login(port, self.alice)[0].status, 401)
+
+
+class CommandLineTest(LiveServer):
+    def test_server_starts_with_every_flag(self):
+        port = free_port()
+        codes = os.path.join(self.tmp.name, "codes")
+        code = pub.add_code(codes, "alice")
+        ledger = os.path.join(self.tmp.name, "usage.jsonl")
+        with open(ledger, "w") as f:
+            f.write(json.dumps({"ts": time.time(), "model": "m", "prompt": 3, "completion": 4}) + "\n")
+        args = [sys.executable, os.path.join(HERE, "pub.py"), "--port", str(port), "--vault", self.vault,
+                "--vault-name", "brain", "--opencode-port", str(port + 1), "--password-file", self.pwfile,
+                "--allow-host", "pub.example.test", "--access-codes", codes, "--secure-cookie",
+                "--trust-forwarded-for", "--opencode-url", "https://code.example.test/",
+                "--proxy-url", f"http://127.0.0.1:{free_port()}", "--mode", "slim=short tools",
+                "--mode", "stock=as upstream", "--usage-ledger", ledger]
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait, 10)
+        self.addCleanup(proc.terminate)
+        for _ in range(100):
+            try:
+                r, body = self.get(port, "/healthz")
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            self.fail("pub.py did not start")
+        self.assertEqual(body, b"ok\n")
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("POST", "/login", body=urlencode({"code": code}),
+                  headers={"Host": "pub.example.test", "Origin": "https://pub.example.test",
+                           "Content-Type": "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 303)
+        cookie = [v for v in r.msg.get_all("Set-Cookie") if v.startswith("__Host-")][0].split(";")[0]
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("GET", "/", headers={"Host": "pub.example.test", "Cookie": cookie})
+        text = c.getresponse().read().decode()
+        c.close()
+        for want in ("signed in as <b>alice</b>", "href='https://code.example.test/'", "<code>slim</code>",
+                     "Usage, last 24 h", "<span class='down'>down</span>"):
+            self.assertIn(want, text)
+        self.assertNotIn("auth_token", text)
+
+    def test_bad_flags_are_rejected(self):
+        for bad in (["--opencode-url", "javascript:alert(1)"], ["--proxy-url", "ftp://x"], ["--mode", "noequals"]):
+            r = subprocess.run([sys.executable, os.path.join(HERE, "pub.py"), "--port", "1", *bad],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            self.assertEqual(r.returncode, 2, bad)
 
 
 class IndexContentTest(LiveServer):
