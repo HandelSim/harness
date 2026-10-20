@@ -5745,12 +5745,12 @@ HELP
 host_opencode_env() {
     # Decided before the unset, which empties OAI_API_KEY (cmd_serve, which
     # unsets earlier, sets harness_oai itself).
-    local oai="${harness_oai-$(_oai_configured && echo oai)}"
+    local oai_provider="${harness_oai-$(_oai_configured && echo oai)}"
     unset "${_harness_secret_vars[@]}"
     export OPENCODE_CONFIG="$(host_opencode_config)"
     export OPENCODE_DISABLE_AUTOUPDATE=1
     local overlay
-    overlay=$(harness_opencode_overlay "$oai")
+    overlay=$(harness_opencode_overlay "$oai_provider")
     [[ -n "$overlay" ]] && export OPENCODE_CONFIG_CONTENT="$overlay"
     # Exa web-search parity with container mode. Intentional in host mode too:
     # host mode already runs with NO egress firewall (the confirm gate makes

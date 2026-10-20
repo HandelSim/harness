@@ -130,6 +130,7 @@ for how in host serve; do
         OAI_API_URL=http://127.0.0.1:9 OAI_API_KEY=secret OAI_MODELS=m
         export OAI_API_URL OAI_API_KEY OAI_MODELS
         if [[ "$how" == serve ]]; then
+            # shellcheck disable=SC2034  # read by host_opencode_env
             harness_oai=$(_oai_configured && echo oai)
             unset OAI_API_KEY
         fi
