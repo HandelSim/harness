@@ -20,8 +20,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -29,12 +31,20 @@ import urllib.request
 DATASET = "princeton-nlp/SWE-bench_Verified"
 ROWS_URL = ("https://datasets-server.huggingface.co/rows?dataset=princeton-nlp%2FSWE-bench_Verified"
             "&config=default&split=test&offset={offset}&length=100")
-NICE = ["nice", "-n", "19"] + (["ionice", "-c", "3"] if shutil.which("ionice") else [])
+IS_WINDOWS = os.name == "nt"
+# Resolved via PATH: a bare "bash" on Windows can hit System32's WSL launcher
+# before Git Bash.
+BASH = shutil.which("bash") or "bash"
+# Windows has no nice; children start at below-normal priority instead.
+NICE = [] if IS_WINDOWS else ["nice", "-n", "19"] + (["ionice", "-c", "3"] if shutil.which("ionice") else [])
+_LOW_PRIO = {"creationflags": subprocess.BELOW_NORMAL_PRIORITY_CLASS} if IS_WINDOWS else {}
 
-TEST_DJANGO = "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1"
+# runtests.py and bin/test run through the venv python rather than their
+# `#!/usr/bin/env python` shebang: the same interpreter, and Windows cannot exec one.
+TEST_DJANGO = "python tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1"
 TEST_PYTEST = "pytest -rA"
 TEST_SPHINX = "tox --current-env -epy39 -v --"
-TEST_SYMPY = "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose"
+TEST_SYMPY = "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' python bin/test -C --verbose"
 NON_TEST_EXTS = (".json", ".png", "csv", ".txt", ".md", ".jpg", ".jpeg", ".pkl", ".yml", ".yaml", ".toml")
 REQS_PATHS = {"django/django": ["tests/requirements/py3.txt"],
               "pylint-dev/pylint": ["requirements_test.txt"]}
@@ -293,26 +303,59 @@ def grade(status: dict, f2p: list[str], p2p: list[str]) -> dict:
 # --------------------------------------------------------------------------
 
 
-def _run(cmd, cwd=None, timeout=1800, env=None, check=True, nice=True) -> subprocess.CompletedProcess:
+def _run(cmd, cwd=None, timeout=1800, env=None, check=True, nice=True, raw=False) -> subprocess.CompletedProcess:
+    """`raw` keeps stdout as bytes (a diff whose CRs must survive); otherwise
+    UTF-8 text whatever the locale (Windows defaults to cp1252)."""
     if isinstance(cmd, str):
-        cmd = ["bash", "-c", cmd]
-    r = subprocess.run((NICE if nice else []) + cmd, cwd=cwd, env=env, capture_output=True, text=True,
-                       timeout=timeout, stdin=subprocess.DEVNULL)
+        cmd = [BASH, "-c", cmd]
+    text = {} if raw else {"encoding": "utf-8", "errors": "replace"}
+    r = subprocess.run((NICE if nice else []) + cmd, cwd=cwd, env=env, capture_output=True, timeout=timeout,
+                       stdin=subprocess.DEVNULL, **text, **(_LOW_PRIO if nice else {}))
     if check and r.returncode != 0:
-        raise RuntimeError(f"{' '.join(cmd)[:200]} -> exit {r.returncode}: {(r.stderr or r.stdout)[-800:]}")
+        err = r.stderr or r.stdout
+        err = err.decode("utf-8", "replace") if raw else err
+        raise RuntimeError(f"{' '.join(cmd)[:200]} -> exit {r.returncode}: {err[-800:]}")
     return r
+
+
+def _rmtree(path: str) -> None:
+    """rmtree that also removes read-only files (git's objects on Windows)."""
+    def onerror(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    if os.path.isdir(path):
+        shutil.rmtree(path, **({"onexc": onerror} if sys.version_info >= (3, 12) else {"onerror": onerror}))
+
+
+def venv_bin(venv: str) -> str:
+    return os.path.join(venv, "Scripts" if IS_WINDOWS else "bin")
+
+
+def venv_python(venv: str) -> str:
+    return os.path.join(venv_bin(venv), "python.exe" if IS_WINDOWS else "python")
+
+
+def _py_launcher(v: str) -> str:
+    """Windows installs register with `py -3.X`, not as python3.X on PATH."""
+    if not (IS_WINDOWS and shutil.which("py")):
+        return ""
+    r = subprocess.run(["py", f"-{v}", "-c", "import sys; print(sys.executable)"], capture_output=True,
+                       text=True, stdin=subprocess.DEVNULL)
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def find_python(want: str) -> tuple[str, str]:
     """(interpreter path, note). Uses an installed interpreter only (never
     downloads one); falls back to the nearest newer installed 3.x and says so."""
     cands = []
-    for v in [want] + [f"3.{n}" for n in range(int(want.split(".")[1]) + 1, 14)]:
-        p = shutil.which(f"python{v}")
+    for v in [want] + [f"3.{n}" for n in range(int(want.split(".")[1]) + 1, 15)]:
+        p = shutil.which(f"python{v}") or _py_launcher(v)
         if not p and shutil.which("uv"):
             r = subprocess.run(["uv", "python", "find", "--no-python-downloads", v],
                                capture_output=True, text=True, stdin=subprocess.DEVNULL)
             p = r.stdout.strip() if r.returncode == 0 else ""
+        if not p and v == "%d.%d" % sys.version_info[:2]:
+            p = sys.executable
         if p:
             cands.append((v, p))
             break
@@ -365,15 +408,30 @@ def env_paths(cache: str, iid: str) -> dict:
 
 
 _GIT_ID = ["-c", "user.name=bench", "-c", "user.email=bench@localhost", "-c", "commit.gpgsign=false"]
+# LF in every checkout whatever the user's git config (Git for Windows ships
+# core.autocrlf=true): the gold and test patches are LF and would not apply.
+_GIT_LF = (("core.autocrlf", "false"), ("core.eol", "lf"))
 
 
 def make_checkout(bare: str, commit: str, src: str) -> None:
     """`commit`'s tree in `src` as its own git repo (no history, no remote):
     opencode takes it as the project root instead of walking up to whatever
-    repo contains the cache, and the agent gets a working `git diff`."""
+    repo contains the cache, and the agent gets a working `git diff`.
+    Extracted with tarfile, not `| tar -x`: no shell quoting, and no MSYS tar
+    handed a Windows drive path."""
     os.makedirs(src, exist_ok=True)
-    _run(f"git -C '{bare}' archive {commit} | tar -x -C '{src}'", timeout=1800)
+    lf = [a for k, v in _GIT_LF for a in ("-c", f"{k}={v}")]
+    tar = os.path.join(os.path.dirname(src), "src.tar")
+    try:
+        _run(["git"] + lf + ["-C", bare, "archive", "--format=tar", "-o", tar, commit], timeout=1800)
+        with tarfile.open(tar) as tf:
+            tf.extractall(src, **({"filter": "tar"} if hasattr(tarfile, "tar_filter") else {}))
+    finally:
+        if os.path.exists(tar):
+            os.remove(tar)
     _run(["git", "-C", src, "init", "-q"], nice=False)
+    for k, v in _GIT_LF:
+        _run(["git", "-C", src, "config", k, v], nice=False)
 
 
 def commit_baseline(src: str) -> None:
@@ -392,7 +450,7 @@ def build_env(row: dict, cache: str, rebuild: bool = False, logf=print) -> dict:
     if not rebuild and os.path.isfile(p["meta"]):
         with open(p["meta"], encoding="utf-8") as f:
             return json.load(f)
-    shutil.rmtree(p["root"], ignore_errors=True)
+    _rmtree(p["root"])
     os.makedirs(p["src"])
     s = spec(row["repo"], row["version"])
     notes = []
@@ -408,7 +466,7 @@ def build_env(row: dict, cache: str, rebuild: bool = False, logf=print) -> dict:
     if note:
         notes.append(note)
     _run([py, "-m", "venv", p["venv"]])
-    vpy = os.path.join(p["venv"], "bin", "python")
+    vpy = venv_python(p["venv"])
     pip = [vpy, "-m", "pip", "install", "-q", "--disable-pip-version-check"]
     if s["reqs"]:
         reqs = requirements(bare, row["repo"], row["environment_setup_commit"])
@@ -427,7 +485,7 @@ def build_env(row: dict, cache: str, rebuild: bool = False, logf=print) -> dict:
     if s["pip"]:
         _run(pip + s["pip"], timeout=3600)
     venv_env = dict(os.environ, VIRTUAL_ENV=p["venv"],
-                    PATH=os.path.join(p["venv"], "bin") + os.pathsep + os.environ.get("PATH", ""),
+                    PATH=venv_bin(p["venv"]) + os.pathsep + os.environ.get("PATH", ""),
                     # No git history here, so setuptools_scm (pytest) would say 0.1.dev0 and
                     # the repo's own `minversion` checks fail; pin it to the task's version.
                     SETUPTOOLS_SCM_PRETEND_VERSION=row["version"] + ".0")
@@ -451,9 +509,9 @@ def capture_diff(env: dict) -> str:
     """Everything the agent changed, new files included (SWE-bench model_patch)."""
     g = ["git", "-C", env["src"]]
     _run(g + ["add", "-A"], nice=False)
-    r = _run(g + ["diff", "--cached", "--binary", "pristine"], nice=False)
+    r = _run(g + ["diff", "--cached", "--binary", "pristine"], nice=False, raw=True)
     _run(g + ["reset", "-q"], nice=False)
-    return r.stdout
+    return r.stdout.decode("utf-8", "replace")
 
 
 def evaluate(env: dict, row: dict, patch: str, timeout: int = 1800, log_path: str = "") -> dict:
@@ -467,7 +525,7 @@ def evaluate(env: dict, row: dict, patch: str, timeout: int = 1800, log_path: st
     try:
         if patch.strip():
             pf = os.path.join(tmp, "model.patch")
-            with open(pf, "w", encoding="utf-8") as f:
+            with open(pf, "w", encoding="utf-8", newline="") as f:
                 f.write(patch)
             r = _run(["git", "-C", env["src"], "apply", "--whitespace=nowarn", pf], check=False, nice=False)
             if r.returncode != 0 and shutil.which("patch"):
@@ -476,7 +534,7 @@ def evaluate(env: dict, row: dict, patch: str, timeout: int = 1800, log_path: st
                 reset(env)
                 return {"applied": False, "resolved": False, "error": "patch did not apply"}
         tf = os.path.join(tmp, "test.patch")
-        with open(tf, "w", encoding="utf-8") as f:
+        with open(tf, "w", encoding="utf-8", newline="") as f:
             f.write(row["test_patch"])
         files = test_files(row["test_patch"])
         existing = [x for x in files if _run(["git", "-C", env["src"], "cat-file", "-e", f"pristine:{x}"],
@@ -485,7 +543,7 @@ def evaluate(env: dict, row: dict, patch: str, timeout: int = 1800, log_path: st
             _run(["git", "-C", env["src"], "checkout", "pristine", "--"] + existing, nice=False)
         _run(["git", "-C", env["src"], "apply", "--whitespace=nowarn", tf], nice=False)
         envv = dict(os.environ, VIRTUAL_ENV=env["venv"],
-                    PATH=os.path.join(env["venv"], "bin") + os.pathsep + os.environ.get("PATH", ""))
+                    PATH=venv_bin(env["venv"]) + os.pathsep + os.environ.get("PATH", ""))
         for k in [k for k in envv if k.startswith(("PYTEST_", "PYTHON"))]:
             envv.pop(k)
         envv.update(s.get("eval_env", {}))
@@ -510,14 +568,21 @@ def evaluate(env: dict, row: dict, patch: str, timeout: int = 1800, log_path: st
     return out
 
 
+GATE_NO_FAIL = "every FAIL_TO_PASS test already passes without the fix"
+GATE_UNRESOLVED = "the gold patch does not resolve the task in this env"
+
+
 def gold_gate(row: dict, cache: str, rebuild: bool = False, logf=print) -> dict:
     """Build the env, then require (1) with only the test patch, at least one
     F2P test fails, and (2) with the gold patch, the task is resolved. Result
-    cached in envs/<id>/gate.json; ok=False excludes the task."""
+    cached in data/gates/<id>/gate.json; ok=False excludes the task. Only a
+    verdict is reused: an env that failed to build is retried next run."""
     p = env_paths(cache, row["instance_id"])
     if not rebuild and os.path.isfile(p["gate"]):
         with open(p["gate"], encoding="utf-8") as f:
-            return json.load(f)
+            res = json.load(f)
+        if res.get("ok") or res.get("why") in (GATE_NO_FAIL, GATE_UNRESOLVED):
+            return res
     t0 = time.monotonic()
     os.makedirs(p["gates"], exist_ok=True)
     res = {"id": row["instance_id"], "ok": False}
@@ -532,9 +597,9 @@ def gold_gate(row: dict, cache: str, rebuild: bool = False, logf=print) -> dict:
         res["gold"] = {k: gold.get(k) for k in ("resolved", "f2p_pass", "f2p", "p2p_pass", "p2p",
                                                   "f2p_failed", "p2p_failed")}
         if base.get("f2p_pass", 0) == base.get("f2p", 0):
-            res["why"] = "every FAIL_TO_PASS test already passes without the fix"
+            res["why"] = GATE_NO_FAIL
         elif not gold.get("resolved"):
-            res["why"] = "the gold patch does not resolve the task in this env"
+            res["why"] = GATE_UNRESOLVED
         else:
             res["ok"] = True
     except Exception as e:  # noqa: BLE001 - recorded, the task is excluded

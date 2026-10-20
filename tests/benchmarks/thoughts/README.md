@@ -20,6 +20,9 @@ then runs the **gold gate**. The gate requires that at least one FAIL_TO_PASS
 test fails with only the test patch applied, and that the gold patch resolves
 the task. A task that fails the gate is excluded before any token is spent. The
 grade is the same SWE-bench eval, run on the agent's `git diff`.
+Only verdicts are cached in `gate.json`. A task whose env failed to build
+(an exception, such as a failed clone) is retried on the next run, and
+`--rebuild-envs` rebuilds everything.
 
 ## Run it (owner)
 
@@ -93,6 +96,15 @@ evidence that the two arms are equal.
   floor is 3.8). The nearest installed newer Python is used instead, and this
   is recorded in the gate notes.
 - apt and locale-gen pre-install steps are skipped.
+- Windows (Git Bash) is supported:
+  - checkouts are extracted with Python's `tarfile`, and are LF whatever
+    `core.autocrlf` is set to;
+  - venvs use `Scripts\python.exe`;
+  - interpreters are found with `py -3.X`;
+  - shell steps (sed pre-steps, test commands) run under Git Bash's `bash`.
+
+  Tests that only fail on Windows fail the gate, so the gate excludes those
+  tasks; it does not grade them as wrong.
 - Builds use PyPI.
 - There is no git history in the checkouts, so `SETUPTOOLS_SCM_PRETEND_VERSION`
   pins the version.

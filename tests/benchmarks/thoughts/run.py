@@ -380,7 +380,7 @@ def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, e
         cmd = [BASH] + cmd
     cenv = modes.child_env(ctx["bench_root"], ctx["port"], False, first=ctx["first"])
     cenv["VIRTUAL_ENV"] = env["venv"]
-    cenv["PATH"] = os.path.join(env["venv"], "bin") + os.pathsep + cenv.get("PATH", "")
+    cenv["PATH"] = swe_env.venv_bin(env["venv"]) + os.pathsep + cenv.get("PATH", "")
     t0w, t0 = time.time(), time.monotonic()
     capped = timed_out = False
     inflight = os.path.join(ctx["out"], "inflight.json")
@@ -417,7 +417,7 @@ def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, e
                        0 if c["tokens_estimated"] else c["tokens"], ctx["next_pair"])
     oc = opencode_metrics(ctx["oc_db"], env["src"], t0w, time.time(), ctx["needles"])
     patch = swe_env.capture_diff(env)
-    with open(os.path.join(tdir, tid + ".patch"), "w", encoding="utf-8") as f:
+    with open(os.path.join(tdir, tid + ".patch"), "w", encoding="utf-8", newline="") as f:
         f.write(patch)
     ev = swe_env.evaluate(env, row, patch, log_path=os.path.join(tdir, tid + ".eval.log")) if patch.strip() \
         else {"resolved": False, "applied": True, "empty_patch": True}
@@ -581,8 +581,9 @@ def main(argv: list[str]) -> int:
         return 0
 
     harness_bin = a.harness_bin or os.environ.get("HARNESS_BIN") or os.path.join(REPO, "harness")
-    real_root = a.install_root or os.environ.get("HARNESS_BENCH_INSTALL_ROOT") or REPO
-    cache = a.cache_dir or os.path.join(real_root, "state", "bench-thoughts")
+    # abspath: harness hands Windows a C:/ root, and joins below add backslashes.
+    real_root = os.path.abspath(a.install_root or os.environ.get("HARNESS_BENCH_INSTALL_ROOT") or REPO)
+    cache = os.path.abspath(a.cache_dir or os.path.join(real_root, "state", "bench-thoughts"))
     data_dir = os.path.join(cache, "data")
     tasks = load_tasks([x.strip() for x in a.task_ids.split(",") if x.strip()] or None)
     if a.pairs:

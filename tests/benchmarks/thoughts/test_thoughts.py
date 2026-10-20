@@ -351,6 +351,102 @@ class Checkout(unittest.TestCase):
         self.assertTrue(p["gate"].startswith(os.path.join(self.d, "cache", "data") + os.sep))
 
 
+@unittest.skipIf(not shutil.which("git"), "needs git")
+class Portability(unittest.TestCase):
+    """What broke on Windows: the checkout went through `bash -c "git archive |
+    tar -x -C 'C:/...'"`, and Git for Windows' core.autocrlf=true turns the
+    checkout CRLF so the LF gold/test patches no longer apply."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.up = os.path.join(self.d, "up stream")
+        os.makedirs(os.path.join(self.up, "bin"))
+        with open(os.path.join(self.up, "a.py"), "w", newline="") as f:
+            f.write("x = 1\n")
+        with open(os.path.join(self.up, ".gitattributes"), "w", newline="") as f:
+            f.write("* text=auto\n")
+        with open(os.path.join(self.up, "bin", "test"), "w", newline="") as f:
+            f.write("#!/usr/bin/env python\n")
+        os.chmod(os.path.join(self.up, "bin", "test"), 0o755)
+        _git(self.up, "init", "-q")
+        _git(self.up, *swe_env._GIT_ID, "add", "-A")
+        _git(self.up, *swe_env._GIT_ID, "commit", "-qm", "c1")
+        self.base = _git(self.up, "rev-parse", "HEAD").strip()
+        # A user config the way Git for Windows installs it.
+        gc = os.path.join(self.d, "gitconfig")
+        with open(gc, "w") as f:
+            f.write("[core]\n\tautocrlf = true\n")
+        self._env = {k: os.environ.get(k) for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")}
+        os.environ.update(GIT_CONFIG_GLOBAL=gc, GIT_CONFIG_NOSYSTEM="1")
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        swe_env._rmtree(self.d)
+
+    def test_checkout_is_lf_despite_autocrlf_and_patches_apply(self):
+        # The fixture is real: plain `git archive` under this config writes CRLF.
+        tar = subprocess.run(["git", "-C", self.up, "archive", "--format=tar", self.base],
+                             capture_output=True, check=True).stdout
+        self.assertIn(b"x = 1\r\n", tar)
+        src = os.path.join(self.d, "cache", "envs", "x__y-1", "src")
+        swe_env.make_checkout(self.up, self.base, src)
+        swe_env.commit_baseline(src)
+        with open(os.path.join(src, "a.py"), "rb") as f:
+            self.assertEqual(f.read(), b"x = 1\n")
+        self.assertFalse(os.path.exists(os.path.join(src, "..", "src.tar")))
+        if os.name != "nt":
+            self.assertTrue(os.access(os.path.join(src, "bin", "test"), os.X_OK))
+        pf = os.path.join(self.d, "gold.patch")
+        with open(pf, "w", newline="") as f:
+            f.write(GOLD)
+        _git(src, "apply", "--check", pf)
+        # The agent's diff is read as UTF-8, not the locale's code page.
+        with open(os.path.join(src, "a.py"), "w", encoding="utf-8", newline="") as f:
+            f.write("x = '\u00e9'\n")
+        self.assertIn("+x = '\u00e9'\n", swe_env.capture_diff({"src": src}))
+        # Rebuilds remove git's read-only object files too.
+        swe_env._rmtree(src)
+        self.assertFalse(os.path.exists(src))
+
+    def test_windows_venv_layout(self):
+        was = swe_env.IS_WINDOWS
+        try:
+            swe_env.IS_WINDOWS = True
+            self.assertEqual(os.path.basename(swe_env.venv_bin("v")), "Scripts")
+            self.assertEqual(os.path.basename(swe_env.venv_python("v")), "python.exe")
+            swe_env.IS_WINDOWS = False
+            self.assertEqual(swe_env.venv_python("v"), os.path.join("v", "bin", "python"))
+        finally:
+            swe_env.IS_WINDOWS = was
+
+    def test_build_errors_are_retried_verdicts_are_cached(self):
+        row = {"instance_id": "x__y-1"}
+        cache = os.path.join(self.d, "cache")
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise RuntimeError("tar: Cannot open")
+        real, swe_env.build_env = swe_env.build_env, boom
+        try:
+            g = swe_env.gold_gate(row, cache, logf=lambda *_: None)
+            self.assertFalse(g["ok"])
+            self.assertIn("RuntimeError", g["why"])
+            swe_env.gold_gate(row, cache, logf=lambda *_: None)
+            self.assertEqual(len(calls), 2)
+            gate = swe_env.env_paths(cache, "x__y-1")["gate"]
+            with open(gate, "w") as f:
+                json.dump({"id": "x__y-1", "ok": False, "why": swe_env.GATE_UNRESOLVED}, f)
+            self.assertEqual(swe_env.gold_gate(row, cache, logf=lambda *_: None)["why"], swe_env.GATE_UNRESOLVED)
+            self.assertEqual(len(calls), 2)
+        finally:
+            swe_env.build_env = real
+
+
 class Contamination(unittest.TestCase):
     def test_needles_and_match(self):
         d = tempfile.mkdtemp()
