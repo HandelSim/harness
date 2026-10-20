@@ -190,6 +190,9 @@ if [[ -f "$env_file" ]]; then
     # shellcheck disable=SC1090
     source "$env_file"
     set +a
+    # .env holds the upstream key: keep it readable by its owner only (a
+    # no-op where modes mean nothing, as on Windows).
+    [[ -O "$env_file" ]] && chmod go-rwx "$env_file" 2>/dev/null || true
 fi
 
 for _k in "${_harness_proxy_keys[@]}"; do
@@ -325,6 +328,20 @@ load_net_helpers() {
 err() {
     echo "harness: $*" >&2
 }
+
+# A curl config carrying the Authorization header for the key in $1. Callers
+# pipe it to `curl -K -`, so the key is never on curl's command line, where
+# `ps` shows it to every user of the machine.
+_curl_auth_config() {
+    local k="${1//\\/\\\\}"
+    k="${k//\"/\\\"}"
+    printf 'header = "Authorization: Bearer %s"\n' "$k"
+}
+
+# The upstream secrets from .env. Every harness run exports .env, so a
+# host-mode opencode, and every shell its agent opens, would inherit them;
+# host_opencode_env drops them (the proxy, already started, holds its own copy).
+_harness_secret_vars=(PROXY_API_KEY OAI_API_KEY CHATGPT_COOKIE_STRING)
 
 # harness_jq — wrapper that uses host jq if available, else falls back to
 # the proxy container's jq. Same args/stdin/stdout/exit semantics as
@@ -1499,10 +1516,9 @@ _probe_upstream_auth() {
         "${api_model:-default}")
 
     local response status_code body
-    response=$(curl -sSL -k -w "\n__HTTP_STATUS__%{http_code}" \
+    response=$(_curl_auth_config "$api_key" | curl -K - -sSL -k -w "\n__HTTP_STATUS__%{http_code}" \
         --connect-timeout 5 --max-time 30 \
         -X POST "$api_url" \
-        -H "Authorization: Bearer $api_key" \
         -H "Content-Type: application/json" \
         -d "$probe_body" 2>&1) || true
 
@@ -1682,8 +1698,8 @@ _probe_oai_auth() {
     command -v curl >/dev/null 2>&1 || return 2
     local base="${OAI_API_URL%/}" code
     base="${base%/chat/completions}"; base="${base%/responses}"
-    code=$(curl -sS -k -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 20 \
-        -H "Authorization: Bearer ${OAI_API_KEY}" "$base/models" 2>/dev/null) || code="000"
+    code=$(_curl_auth_config "${OAI_API_KEY}" | curl -K - -sS -k -o /dev/null -w '%{http_code}' \
+        --connect-timeout 5 --max-time 20 "$base/models" 2>/dev/null) || code="000"
     case "$code" in
         2*) return 0 ;;
         401|403)
@@ -1714,9 +1730,8 @@ _print_upstream_models() {
 
     local url response status body
     url="$(_api_base)/v1/models"
-    response=$(curl -sSL -k -w $'\n__HTTP_STATUS__%{http_code}' \
+    response=$(_curl_auth_config "${PROXY_API_KEY}" | curl -K - -sSL -k -w $'\n__HTTP_STATUS__%{http_code}' \
         --connect-timeout 5 --max-time 30 \
-        -H "Authorization: Bearer ${PROXY_API_KEY}" \
         "$url" 2>&1) || true
     status=$(grep -o '__HTTP_STATUS__[0-9]*$' <<<"$response" | sed 's/__HTTP_STATUS__//')
     body=$(sed 's/__HTTP_STATUS__[0-9]*$//' <<<"$response")
@@ -2461,8 +2476,7 @@ cmd_model() {
         base=$(PROXY_API_URL="$api_url" _api_base)
         models_url="${base}/v1/models"
         echo "querying ${models_url}..."
-        response=$(curl -sf --max-time 10 \
-            -H "Authorization: Bearer ${api_key}" \
+        response=$(_curl_auth_config "${api_key}" | curl -K - -sf --max-time 10 \
             -H "Content-Type: application/json" \
             "$models_url" 2>/dev/null) || response=""
         if [[ -n "$response" ]]; then
@@ -5436,8 +5450,8 @@ slim_opencode_config() {
         return 0
     fi
     harness_jq -cn --arg main "$(cat "$main_prompt")" --arg sub "$(cat "$sub_prompt")" \
-        --arg oai "${1:-}" '{
-      "provider": ({"harness": {"options": {"headers": {"x-harness-slim": "1"}}}}
+        --arg oai "${1:-}" --arg serve "${harness_serve:-0}" '{
+      "provider": ((if $serve == "1" then {} else {"harness": {"options": {"headers": {"x-harness-slim": "1"}}}} end)
         + (if $oai == "oai" then {"harness-oai": {"options": {"headers": {"x-harness-slim": "1"}}}} else {} end)),
       "agent": {
         "build": {"prompt": $main}, "plan": {"prompt": $main}, "yolo": {"prompt": $main},
@@ -5449,9 +5463,11 @@ slim_opencode_config() {
 # `--thoughts` (off by default): the `x-harness-thoughts: 1` provider header,
 # on which the proxy asks a vendor native model for its thought summaries and
 # hands them to opencode as reasoning, which it shows as thinking. Normal and
-# slim alike; OAI models are not affected.
+# slim alike; OAI models are not affected. Under `harness serve` with slim on,
+# serve_opencode_config sets both headers per model instead.
 thoughts_opencode_config() {
     [[ "${harness_thoughts:-0}" == "1" ]] || return 0
+    [[ "${harness_serve:-0}" == "1" && "${harness_slim:-1}" == "1" ]] && return 0
     printf '%s' '{"provider":{"harness":{"options":{"headers":{"x-harness-thoughts":"1"}}}}}'
 }
 
@@ -5540,12 +5556,66 @@ vault_opencode_config() {
       + (if $instr == "" then {} else {"instructions": [$instr]} end)'
 }
 
-# OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts and vault overlays
-# deep-merged. Prints nothing when none applies. `oai` (a host launch with an
-# OAI upstream) is passed on to slim_opencode_config.
+# `harness serve` only: no session sharing (a share uploads the session to
+# opncd.ai), and, with slim on, the prompt modes as model aliases, so each
+# person picks one per message in opencode web's model picker. Every model the
+# proxy sends down its native-tool route (the only route that reads the
+# x-harness-slim and x-harness-thoughts headers) gets four entries, named
+# "<model> (slim)", "(stock)", "(thoughts)" and "(slim+thoughts)": the model's
+# own entry carries the launch's mode (slim, or slim+thoughts with
+# --thoughts) and the other three are aliases "<model>:<mode>" for the same
+# upstream id. A `stock` primary agent, with opencode's own prompt in place of
+# agents/slim-prompt.md, completes stock mode; it starts on the default
+# model's stock alias. Models on the cooperative route get no aliases.
+serve_opencode_config() {
+    [[ "${harness_serve:-0}" == "1" ]] || return 0
+    local base='{"share":"disabled"}'
+    if [[ "${harness_slim:-1}" != "1" || -n "${prompt_mode_override:-}" ]] || _backend_is_chatgpt; then
+        printf '%s' "$base"; return 0
+    fi
+    local cfg pats raw m p ids native=()
+    cfg=$(host_opencode_config)
+    raw="${PROXY_NATIVE_TOOL_MODELS:-}"
+    case "${raw,,}" in off|none|0|false) printf '%s' "$base"; return 0 ;; esac
+    IFS=, read -ra pats <<< "${raw:-*-withtools}"
+    ids=$(harness_jq -r '.provider.harness.models // {} | keys[]' "$cfg" 2>/dev/null | tr -d '\r')
+    while IFS= read -r m; do
+        [[ -n "$m" ]] || continue
+        for p in "${pats[@]}"; do
+            p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+            # shellcheck disable=SC2053  # $p is a glob, as the proxy's fnmatch
+            [[ -n "$p" && "$m" == $p ]] && { native+=("$m"); break; }
+        done
+    done <<< "$ids"
+    (( ${#native[@]} )) || { printf '%s' "$base"; return 0; }
+    harness_jq -c --argjson native "$(printf '%s\n' "${native[@]}" | harness_jq -R . | harness_jq -sc .)" \
+        --arg th "${harness_thoughts:-0}" '
+      def hdr($s; $t): (if $s then {"x-harness-slim": "1"} else {} end)
+        + (if $t then {"x-harness-thoughts": "1"} else {} end);
+      (.provider.harness.models // {}) as $models
+      | ($th == "1") as $t
+      | ((.model // "") | ltrimstr("harness/")) as $dflt
+      | [{k: "slim", s: true, t: false}, {k: "stock", s: false, t: false},
+         {k: "thoughts", s: false, t: true}, {k: "slim+thoughts", s: true, t: true}] as $modes
+      | {share: "disabled",
+         provider: {harness: {models: ([$native[] as $m | $modes[] as $o
+           | if $o.s and $o.t == $t
+             then {key: $m, value: {name: "\($m) (\($o.k))", headers: hdr(true; $t)}}
+             else {key: "\($m):\($o.k)",
+                   value: ($models[$m] + {id: $m, name: "\($m) (\($o.k))", headers: hdr($o.s; $o.t)})}
+             end] | from_entries)}},
+         agent: {stock: ({description: "opencode'"'"'s own prompt, without the harness slim prompt (stock mode)",
+                          mode: "primary"}
+                         + (if ($native | index($dflt)) then {model: "harness/\($dflt):stock"} else {} end))}}' "$cfg"
+}
+
+# OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts, serve and vault
+# overlays deep-merged. Prints nothing when none applies. `oai` (a host launch
+# with an OAI upstream) is passed on to slim_opencode_config.
 harness_opencode_overlay() {
     local part out=""
-    for part in "$(slim_opencode_config "${1:-}")" "$(thoughts_opencode_config)" "$(vault_opencode_config)"; do
+    for part in "$(slim_opencode_config "${1:-}")" "$(thoughts_opencode_config)" \
+            "$(serve_opencode_config)" "$(vault_opencode_config)"; do
         [[ -n "$part" ]] || continue
         if [[ -z "$out" ]]; then
             out="$part"
@@ -5647,8 +5717,12 @@ HELP
 }
 
 # The opencode environment for a host launch (interactive, -p and `harness
-# serve`): config file, overlay, web search, and the loopback NO_PROXY.
+# serve`): config file, overlay, web search, and the loopback NO_PROXY. It
+# also unsets the upstream secrets, which opencode never needs (it talks only
+# to the proxy), so the agent's shells do not carry them; the callers start
+# the proxy first and need no key after this.
 host_opencode_env() {
+    unset "${_harness_secret_vars[@]}"
     export OPENCODE_CONFIG="$(host_opencode_config)"
     export OPENCODE_DISABLE_AUTOUPDATE=1
     local overlay
@@ -5932,21 +6006,52 @@ serve_password_file() {
     printf '%s' "$f"
 }
 
+# The pub page's access codes (serve/pub.py: name:sha256 per line, mode 600).
+serve_codes_file() { printf '%s/serve/access-codes' "$state_root"; }
+
+# `harness serve code add|remove|list [NAME]`: the per-person access codes.
+serve_code() {
+    local sub="${1:-list}" name="${2:-}" f py
+    f=$(serve_codes_file)
+    case "$sub" in
+        add|remove)
+            [[ -n "$name" ]] || { err "usage: harness serve code $sub NAME"; return 1; }
+            host_require_python3 || return 1
+            mkdir -p "$state_root/serve"
+            py=$(host_python_bin) || return 1
+            # shellcheck disable=SC2086  # host_python_bin may be the two words 'py -3'
+            $py "$clone_dir/serve/pub.py" "$sub-code" --access-codes "$f" "$name"
+            ;;
+        list)
+            if [[ ! -s "$f" ]]; then
+                echo "no access codes: the pub page is open to anyone who reaches it"
+                return 0
+            fi
+            grep -Ev '^[[:space:]]*(#|$)' "$f" | cut -d: -f1
+            ;;
+        *) err "unknown serve code command '$sub' (add NAME, remove NAME, list)"; return 1 ;;
+    esac
+}
+
 cmd_serve() {
-    local port=8780 arg want=""
+    [[ "${1:-}" == "code" ]] && { shift; serve_code "$@"; return; }
+    local port=8780 arg want="" opencode_url="" secure_cookie=0
     local allow_hosts=()
     for arg in "$@"; do
         if [[ -n "$want" ]]; then
             case "$want" in
                 port) port="$arg" ;;
                 host) allow_hosts+=(--allow-host "$arg") ;;
+                ocurl) opencode_url="$arg" ;;
             esac
             want=""; continue
         fi
         case "$arg" in
             -h|--help|help)
                 cat <<'HELP'
-usage: harness serve [--port N] [--allow-host NAME] [--normal] [--thoughts]
+usage: harness serve [--port N] [--allow-host NAME] [--opencode-url URL]
+                     [--secure-cookie] [--normal] [--thoughts]
+       harness serve code add NAME | remove NAME | list
 
 Serves, on 127.0.0.1 only:
   http://127.0.0.1:N/     the pub page: the active vault's pub/**/*.html and
@@ -5961,7 +6066,22 @@ no pages. Reach it from another machine with ssh port forwarding:
 --allow-host NAME accepts that Host header too (NAME is host:port as the
 browser sends it), for a reverse proxy in front of the pub page. The pub
 page links opencode as <that host>:N+1, so behind a reverse proxy give
-opencode its own name, with the proxy doing the login.
+opencode its own name, with the proxy doing the login, and pass that URL
+as --opencode-url (the link then carries no password). --secure-cookie
+is for a reverse proxy that serves the pub page over HTTPS.
+
+Access codes: 'harness serve code add NAME' prints a new code for NAME
+once (only its hash is kept, in state/serve/access-codes). With any code
+set, the pub page asks for one and remembers the person in a cookie;
+'code remove NAME' revokes it at once. The page's /_auth answers a
+reverse proxy's forward_auth (serve/deploy/ has a Caddy example). A code
+gates the pub page only: opencode web has its own password, so put
+opencode behind the same reverse proxy before giving anyone a code.
+
+Prompt modes: with slim on, each model on the proxy's native-tool route
+appears in opencode web's model picker as "<model> (slim)", "(stock)",
+"(thoughts)" and "(slim+thoughts)", picked per message; the "stock"
+agent swaps the slim prompt for opencode's own.
 
 opencode web runs as your user with a shell, like 'harness host'. Its
 requests are slim unless --normal is given, and --thoughts shows thought
@@ -5972,13 +6092,20 @@ HELP
             --port=*) port="${arg#--port=}" ;;
             --allow-host) want=host ;;
             --allow-host=*) allow_hosts+=(--allow-host "${arg#--allow-host=}") ;;
+            --opencode-url) want=ocurl ;;
+            --opencode-url=*) opencode_url="${arg#--opencode-url=}" ;;
+            --secure-cookie) secure_cookie=1 ;;
             --normal) harness_slim=0 ;;
             --slim) harness_slim=1 ;;
             --thoughts) harness_thoughts=1 ;;
             *) err "unknown serve option '$arg' (see: harness serve --help)"; return 1 ;;
         esac
     done
-    [[ -z "$want" ]] || { err "--$want needs a value"; return 1; }
+    if [[ -n "$want" ]]; then
+        [[ "$want" == ocurl ]] && want=opencode-url
+        [[ "$want" == host ]] && want=allow-host
+        err "--$want needs a value"; return 1
+    fi
     if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65534 )); then
         err "--port must be a number from 1 to 65534"; return 1
     fi
@@ -5996,6 +6123,21 @@ HELP
     host_proxy_wait_ready || { host_proxy_stop; exit 1; }
     host_write_opencode_config
     harness_vault_dir=$(vault_prepare)
+    harness_serve=1
+    # The proxy is up with its own copy of the key; neither server needs it.
+    unset "${_harness_secret_vars[@]}"
+
+    local pub_args=(--proxy-url "http://127.0.0.1:$(host_proxy_port)"
+        --usage-ledger "$(host_usage_ledger)")
+    [[ -s "$(serve_codes_file)" ]] && pub_args+=(--access-codes "$(serve_codes_file)")
+    [[ -n "$opencode_url" ]] && pub_args+=(--opencode-url "$opencode_url")
+    (( secure_cookie )) && pub_args+=(--secure-cookie)
+    if [[ "${harness_slim:-1}" == "1" ]]; then
+        pub_args+=(--mode "slim=short tool descriptions, old tool output trimmed, a step reminder"
+            --mode "stock=the proxy changes nothing; with the stock agent, opencode as shipped"
+            --mode "thoughts=stock plus the model's thought summaries, shown as thinking (experimental)"
+            --mode "slim+thoughts=both")
+    fi
 
     local pwfile
     pwfile=$(serve_password_file) || { err "serve: cannot create the opencode web password"; exit 1; }
@@ -6014,7 +6156,7 @@ HELP
     # shellcheck disable=SC2086  # host_python_bin may be the two words 'py -3'
     $(host_python_bin) "$clone_dir/serve/pub.py" --port "$port" \
         --vault "${harness_vault_dir:-}" --vault-name "$(vault_active_name)" \
-        --opencode-port "$oc_port" --password-file "$pwfile" \
+        --opencode-port "$oc_port" --password-file "$pwfile" "${pub_args[@]}" \
         ${allow_hosts[@]+"${allow_hosts[@]}"} 2>"$logdir/pub.log" &
     pub_pid=$!
     # shellcheck disable=SC2064  # expand the pids now
@@ -9358,9 +9500,8 @@ cmd_doctor() {
     else
         local up_url up_code
         up_url="$(_api_base)/v1/models"
-        up_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        up_code=$(_curl_auth_config "${PROXY_API_KEY}" | curl -K - -sS -o /dev/null -w '%{http_code}' \
             --connect-timeout 5 --max-time 15 \
-            -H "Authorization: Bearer ${PROXY_API_KEY}" \
             "$up_url" 2>/dev/null) || up_code="000"
         case "$up_code" in
             2??) doctor_check ok   "upstream" "HTTP $up_code from $up_url (reachable, key accepted)" ;;
@@ -9371,9 +9512,8 @@ cmd_doctor() {
                 # the same to a verifying curl. Retry with -k to tell them apart
                 # (internal corporate CAs are a common cause).
                 local up_nossl
-                up_nossl=$(curl -sk -o /dev/null -w '%{http_code}' \
+                up_nossl=$(_curl_auth_config "${PROXY_API_KEY}" | curl -K - -sk -o /dev/null -w '%{http_code}' \
                     --connect-timeout 5 --max-time 15 \
-                    -H "Authorization: Bearer ${PROXY_API_KEY}" \
                     "$up_url" 2>/dev/null) || up_nossl="000"
                 if [[ "$up_nossl" == "000" ]]; then
                     doctor_check warn "upstream" "no response from $up_url — network/VPN unreachable"

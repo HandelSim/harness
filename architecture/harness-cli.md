@@ -32,7 +32,12 @@ The portable resolver is duplicated inline here rather than depending on
 The script sources `.env` into its own shell (`set -a; source; set +a`)
 so it can read values like `DEFAULT_MODEL_NAME`, `HARNESS_EXTRA_MOUNTS`
 for its own logic. `docker compose` gets `.env` separately via
-`--env-file`. The two consumers are independent.
+`--env-file`. The two consumers are independent. `.env` holds the upstream
+key, so after sourcing the script drops group/other access to it
+(`chmod go-rwx`, only when the invoking user owns it). The key never goes on
+a command line: the CLI's own upstream calls (auth probe, model lists,
+doctor) hand curl the `Authorization` header as a config on stdin
+(`_curl_auth_config | curl -K -`), so it does not show in `ps`.
 
 Independent, but not equivalent: compose's dotenv parser reads an unquoted
 value to end of line, while `source` ends the assignment at the first space or
@@ -383,6 +388,8 @@ nothing here applies: opencode's own system prompt and tool descriptions
 are sent, and the proxy forwards native requests as is (its reminder and
 old-output trim run only on the slim header). Slim has no tuning knobs; its
 values are proxy constants, and comparing settings is done with a probe.
+Under `serve` the provider-wide slim header is left out and set per model
+instead (see [`serve`](#serve)), so a user can switch modes in the web UI.
 
 ### `--thoughts`
 
@@ -394,7 +401,8 @@ vault parts. On that header the proxy asks the upstream for thought
 summaries and hands them to opencode as `reasoning_content`, so they show
 in opencode's thinking block ([`proxy.md`](proxy.md)). Replies then arrive
 whole rather than token by token, since a stream carries the summary as
-untagged content.
+untagged content. Under `serve` with slim on, the header is set per model
+instead (see [`serve`](#serve)).
 
 ### Vaults
 
@@ -827,46 +835,93 @@ stderr), which reads as a hang. Never re-add an fd cleanup there.
 
 ## `serve`
 
-`cmd_serve` is single-user and loopback-only. It runs the same preamble as
-`cmd_host` (python, config, confirm gate, toolchain, preflight, upstream
-gate, `host_proxy_start`, `host_write_opencode_config`, `vault_prepare`) and
-then starts two foreground children:
+`cmd_serve` is loopback-only and has one opencode server for everyone who
+gets in. It runs the same preamble as `cmd_host` (python, config, confirm
+gate, toolchain, preflight, upstream gate, `host_proxy_start`,
+`host_write_opencode_config`, `vault_prepare`), sets `harness_serve=1`,
+unsets the upstream secrets (`_harness_secret_vars`: `PROXY_API_KEY`,
+`OAI_API_KEY`, `CHATGPT_COOKIE_STRING`) from its own shell, and then starts
+two foreground children:
 
-- `serve/pub.py` (stdlib) on `127.0.0.1:N` (default 8780). `/` is an index
-  of the active vault's `pub/**/*.html` (title from `<title>`, newest first,
-  dot paths skipped) plus a Services list; `/pub/<rel>` serves the file,
-  realpath-confined to `pub/`. With no vault active the index still comes up
-  with no pages.
+- `serve/pub.py` (stdlib) on `127.0.0.1:N` (default 8780), the index page.
+  It lists the active vault's `pub/**/*.html` (title from `<title>`, newest
+  first, dot paths skipped, `?q=` filters on title or path, at most 200
+  shown) and `/pub/<rel>` serves the file, realpath-confined to `pub/`. The
+  index also shows: a Services list (the opencode web link, a note that its
+  terminal is a host shell as the server's user), the proxy's `/health`
+  (`--proxy-url`, 2 s timeout, no client headers forwarded), the prompt
+  modes (`--mode NAME=DESC`, below), last-24h usage from the proxy's ledger
+  (`--usage-ledger`, last ~5 MB read), and the vault's last 15 commits.
+  These parts are cached for a few seconds. With no vault active the index
+  still comes up with no pages. `/healthz` is a liveness check.
 - `opencode serve` on `127.0.0.1:N+1`, with `host_opencode_env` (shared with
   `host_run_opencode`, so the config, overlay and NO_PROXY match `harness
-  host`), cwd the vault (else `$HOME`), and `OPENCODE_SERVER_PASSWORD` from
-  `state/serve/opencode-password` (random, made once by
-  `serve_password_file`, mode 600). The index links to it as
-  `?auth_token=base64(opencode:<pw>)`, which opencode accepts in place of
-  Basic auth.
+  host`; it unsets `_harness_secret_vars` too, since opencode reaches the
+  upstream only through the proxy), cwd the vault (else `$HOME`), and
+  `OPENCODE_SERVER_PASSWORD` from `state/serve/opencode-password` (random,
+  made once by `serve_password_file`, mode 600). Without `--opencode-url`
+  the index links to it as `?auth_token=base64(opencode:<pw>)`, which
+  opencode accepts in place of Basic auth. With `--opencode-url URL` the link
+  is that URL with no token, for a reverse proxy that adds the Basic header
+  itself. The overlay sets `share: "disabled"`, so no session is uploaded to
+  opencode's share service.
 
-Because the index carries that login link, `pub.py` has two guards. The
-`Host` header must be `127.0.0.1|localhost|[::1]:N` or a `--allow-host`
-value (421 otherwise), against DNS rebinding. Every `/pub/` response carries
-`Content-Security-Policy: sandbox allow-scripts allow-popups` (no
-`allow-same-origin`), so a vault page, often agent-written, runs with an
-opaque origin and cannot read the index or call opencode, whose CORS always
-admits `http://localhost:*` and `http://127.0.0.1:*`. Do not add a gateway
-that injects opencode's credentials: anything that can reach it would then
-be logged in.
+**Prompt modes.** `serve_opencode_config` (part of
+`harness_opencode_overlay`, empty outside serve) turns each launch-mode
+switch into a choice in opencode's model picker, per message. For every
+`harness` model that the proxy sends on its native route (the
+`PROXY_NATIVE_TOOL_MODELS` patterns, default `*-withtools`), the model's own
+entry carries the launch mode's headers (`x-harness-slim`, plus
+`x-harness-thoughts` with `--thoughts`) and three aliases are added with the
+same `id` and limits: `m:stock` (no harness header), `m:thoughts`
+(thoughts only), and `m:slim+thoughts` (or `m:slim` when the launch already
+has thoughts). The provider-wide slim and thoughts headers are then left
+out. Aliases are made only where the proxy honors the headers: none for
+cooperative-route models, under `--normal`, with a prompt mode set, on the
+chatgpt backend, or with the native route off. The headers change only the
+proxy side (tool descriptions, step reminder, old-output trim, thought
+summaries); the system prompt follows the agent, so a `stock` primary agent
+(opencode's own prompt, starting on `<default>:stock`) sits beside the slim
+`build`/`plan`. `cmd_serve` passes the same four modes to the index as
+`--mode` lines.
 
-Remote access is out of scope for serve itself: `ssh -L` both ports, or a
-reverse proxy the deployer runs, with its own auth, that sets
-`Authorization: Basic …` upstream to opencode and passes `--allow-host` for
-the pub vhost. Through a reverse proxy the index's opencode link still
-points at `<host>:N+1`, so give opencode its own vhost. opencode web runs as
-the invoking user with a shell, like `harness host`; serve is not
-multi-user. Ctrl-C stops both children (the EXIT trap also reaps the jq
-sidecar, since it replaces main's) and leaves the proxy up; `wait -n` exits
-1 if either child dies. Logs: `state/serve/{pub,opencode}.log`.
-`tests/unit_serve_test.sh` runs `serve/test_pub.py` (index, Host check,
-sandbox header, path escape, no-vault mode), plus option errors and the
-password file.
+**Access codes.** `harness serve code add|list|remove NAME` manages
+`state/serve/access-codes` (`name:sha256(code)` lines, mode 600) through
+`pub.py add-code|remove-code`; `add` prints the new code once. When the file
+has an entry, `cmd_serve` passes `--access-codes` and every pub route except
+`/login`, `/logout`, `/_auth` and `/healthz` needs a session cookie from
+`POST /login` (HttpOnly, SameSite=Strict, 12 h; `--secure-cookie` adds
+`Secure` and the `__Host-` prefix behind TLS). Failed logins are
+rate-limited per client and overall; non-GET requests need a same-host
+`Origin`; removing a name ends its sessions. `GET /_auth` answers 200 with
+`X-Harness-User: <name>` or 401, for a reverse proxy's `forward_auth` in
+front of opencode (`serve/deploy/`). Codes gate the pub page only; opencode
+itself still needs its Basic password, which the reverse proxy injects.
+
+`pub.py` guards: the `Host` header must be `127.0.0.1|localhost|[::1]:N` or
+a `--allow-host` value (421 otherwise), against DNS rebinding. Every `/pub/`
+response carries `Content-Security-Policy: sandbox allow-scripts
+allow-popups` (no `allow-same-origin`), so a vault page, often agent-written,
+runs with an opaque origin and cannot read the index or call opencode, whose
+CORS always admits `http://localhost:*` and `http://127.0.0.1:*`. Do not add
+a gateway that injects opencode's credentials without an auth step in front
+of it: anything that can reach it would then be logged in.
+
+Remote access: `ssh -L` both ports, or a reverse proxy the deployer runs
+(`serve/deploy/` has a Caddy example using `/_auth`) with `--allow-host` for
+the public name and `--opencode-url`. Anyone logged in to opencode web has
+its terminal, a shell as the invoking user with the server's environment
+(including `OPENCODE_SERVER_PASSWORD`); on a host where that user has
+sudo or docker, that is root. The proxy runs as the same user, so an agent
+can still read `.env` or the proxy's environment: scrubbing the key from
+opencode's env stops casual leaks, not a determined agent. Real separation
+needs the proxy under its own user. Ctrl-C stops both children (the EXIT
+trap also reaps the jq sidecar, since it replaces main's) and leaves the
+proxy up; `wait -n` exits 1 if either child dies. Logs:
+`state/serve/{pub,opencode}.log`. `tests/unit_serve_test.sh` runs
+`serve/test_pub.py` (index, Host check, sandbox header, path escape, access
+codes, `/_auth`, usage, git log, proxy status), plus option errors, the
+password file, the mode aliases and the key scrub.
 
 ## ChatGPT backend (`harness chatgpt`)
 
