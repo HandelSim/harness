@@ -34,6 +34,13 @@ calls, re-reads, steps and tokens. It reads the prompts and the proxy's slim
 tool descriptions from the harness repo (--root). The proxy's per-step
 reminder and old-output trim are not applied.
 
+`--suite oai` ('harness probe oai') runs only OaiProber, against OAI_API_URL
+with OAI_API_KEY instead: prompt-cache hits over an agent-shaped /responses
+session with and without prompt_cache_key, the cache-retention controls,
+whether previous_response_id re-bills earlier turns, reasoning summaries in
+opencode's request shape, reasoning.context, the /chat/completions route's
+cache, and compaction.
+
 Output is designed to be pasted back verbatim: every printed line passes
 through Redactor, which removes the API key (and any 10+ char fragment of it),
 the base URL and its host, every URL, emails, IPs, bearer tokens, `projects/...`
@@ -262,6 +269,45 @@ def _norm_tool_call(tc):
     }
 
 
+def _responses_body(j, r):
+    """A Responses API reply object (`object: "response"`): the answer text,
+    the reasoning summary text, function calls and usage, in the Resp fields
+    a chat reply fills."""
+    if j.get("usage"):
+        r.usage = j.get("usage")
+    r.finish = str(j.get("status") or "")
+    r.extra_keys = [k for k in j if k not in ("id", "object", "created_at", "model", "output", "usage", "status")]
+    text, summary, calls = [], [], []
+    for it in j.get("output") or []:
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") == "message":
+            text += [str(c.get("text") or "") for c in it.get("content") or [] if isinstance(c, dict)]
+        elif it.get("type") == "reasoning":
+            summary += [str(c.get("text") or "") for c in it.get("summary") or [] if isinstance(c, dict)]
+        elif it.get("type") == "function_call":
+            calls.append(_norm_tool_call({"id": it.get("call_id"), "type": "function",
+                                          "function": {"name": it.get("name"), "arguments": it.get("arguments")}}))
+    r.content = "".join(text)
+    r.reasoning = "\n\n".join(t for t in summary if t)
+    r.tool_calls = calls
+
+
+def _responses_event(ev, r):
+    """One Responses API stream event: text and reasoning-summary deltas
+    accumulate; the final `response.completed` (or `.incomplete`/`.failed`)
+    carries the whole reply, which replaces them."""
+    t = ev.get("type")
+    if t == "response.output_text.delta":
+        r.content += str(ev.get("delta") or "")
+    elif t == "response.reasoning_summary_text.delta":
+        r.reasoning += str(ev.get("delta") or "")
+    elif t == "response.reasoning_summary_part.added" and r.reasoning:
+        r.reasoning += "\n\n"
+    elif t in ("response.completed", "response.incomplete", "response.failed") and isinstance(ev.get("response"), dict):
+        _responses_body(ev["response"], r)
+
+
 class Client:
     def __init__(self, base, key, timeout, log, red):
         self.red = red
@@ -376,6 +422,9 @@ class Client:
                 r.json = ev
             if ev.get("usage"):
                 r.usage = ev.get("usage")
+            if str(ev.get("type") or "").startswith("response."):
+                _responses_event(ev, r)
+                continue
             if "gemini_enterprise" in ev:
                 ge = ev.get("gemini_enterprise") or {}
                 if isinstance(ge, dict) and isinstance(ge.get("thinking"), list):
@@ -415,9 +464,13 @@ class Client:
                         acc["function"]["arguments"] = a
                 if ch.get("finish_reason"):
                     r.finish = ch["finish_reason"]
-        r.tool_calls = [_norm_tool_call(tcs[i]) for i in order]
+        if order or not r.tool_calls:  # a Responses stream set them already
+            r.tool_calls = [_norm_tool_call(tcs[i]) for i in order]
 
     def _from_json(self, j, r):
+        if j.get("object") == "response":
+            _responses_body(j, r)
+            return
         choices = j.get("choices") or []
         r.n_choices = len(choices)
         if j.get("usage"):
@@ -4580,19 +4633,490 @@ class SlimProber(Prober):
         self.p("elapsed %.0fs" % secs)
 
 
+def _oai_usage(u):
+    """Token counts from a Responses (input_tokens...) or Chat Completions
+    (prompt_tokens...) usage object; None for `in` when there is none."""
+    u = u if isinstance(u, dict) else {}
+
+    def n(d, k):
+        v = (d or {}).get(k) if isinstance(d, dict) else None
+        return v if isinstance(v, (int, float)) else 0
+
+    resp = "input_tokens" in u
+    det = u.get("input_tokens_details" if resp else "prompt_tokens_details")
+    odet = u.get("output_tokens_details" if resp else "completion_tokens_details")
+    inp = u.get("input_tokens" if resp else "prompt_tokens")
+    return {"in": inp if isinstance(inp, (int, float)) else None, "cached": n(det, "cached_tokens"),
+            "write": n(det, "cache_write_tokens"), "out": n(u, "output_tokens" if resp else "completion_tokens"),
+            "think": n(odet, "reasoning_tokens")}
+
+
+def _oai_tools(nonce, chat=False):
+    """opencode's tools in the Responses shape (or the chat shape), with the
+    run's nonce in the first description so no earlier run's cache matches."""
+    out = []
+    for i, t in enumerate(OPENCODE_TOOLS):
+        f = dict(t["function"])
+        if i == 0:
+            f["description"] = "%s (session %s)" % (f["description"], nonce)
+        out.append({"type": "function", "function": f} if chat else dict(type="function", **f))
+    return out
+
+
+def _opencode_asks_summary(model):
+    """opencode 1.19's own rule for sending reasoningSummary "auto" to an
+    @ai-sdk/openai model: the id contains gpt-5 and isn't gpt-5-chat/-pro."""
+    return "gpt-5" in model and "gpt-5-chat" not in model and "gpt-5-pro" not in model
+
+
+class OaiProber(Prober):
+    """What an OpenAI-format upstream (OAI_API_URL) does with prompt caching
+    and reasoning summaries: cache hits over an agent-shaped session on
+    /responses with and without prompt_cache_key, the cache-retention
+    controls, whether previous_response_id re-bills earlier turns, reasoning
+    summaries in opencode's request shape, reasoning.context, the
+    /chat/completions route's cache, and compaction."""
+
+    def __init__(self, args, client, red, out):
+        super().__init__(args, client, red, out)
+        self.seed = int(time.time())
+        self.tok = {"in": 0, "cached": 0, "out": 0, "think": 0}
+        self.reasoning = True   # the model takes `reasoning` (preflight says)
+        self.cache_key = True   # ... and `prompt_cache_key`
+        self.f = {}
+
+    def on(self, s):
+        return not self.a.only or s in self.a.only
+
+    def count_usage(self, model, u):
+        x = _oai_usage(u)
+        if x["in"] is None:
+            return
+        self.tok["in"] += x["in"]
+        self.tok["cached"] += x["cached"]
+        self.tok["out"] += x["out"]
+        self.tok["think"] += x["think"]
+
+    def usage_line(self):
+        return ("tokens used (as reported): input %s (%s of it cached), output %s (reasoning %s)"
+                % (_kfmt(self.tok["in"]), _kfmt(self.tok["cached"]), _kfmt(self.tok["out"]), _kfmt(self.tok["think"])))
+
+    def post(self, path, body, label, stream=False, method="POST"):
+        if stream:
+            body = dict(body, stream=True)
+        for attempt in range(3):
+            r = self.c.request(path, body=body, stream=stream, method=method, label=label)
+            if r.status != 429 or attempt == 2:
+                break
+            # A per-minute limit: wait what the upstream asks (capped), retry.
+            try:
+                wait = min(60.0, float(r.headers.get("retry-after") or 10))
+            except ValueError:
+                wait = 10.0
+            self.p("       429, waiting %.0fs" % wait)
+            time.sleep(wait * self.a.delay_scale)
+        if r.status is None:
+            self.consec_net_fail += 1
+            if self.consec_net_fail >= self.net_fail_max:
+                raise SystemExit("aborting: %d consecutive network failures (%s)"
+                                 % (self.consec_net_fail, self.red(r.error)[:200]))
+        else:
+            self.consec_net_fail = 0
+        if r.status in (401, 403):
+            raise SystemExit("aborting: the OAI key was rejected (%s); check OAI_API_KEY and OAI_API_URL"
+                             % self.fail_note(r))
+        if body:
+            self.count_usage(body.get("model"), r.usage)
+        return r
+
+    @staticmethod
+    def err_names(r, *names):
+        """The first of these parameter names a 400 reply's message mentions."""
+        if r.status != 400:
+            return None
+        msg = (r.text or "").lower()
+        return next((n for n in names if n.lower() in msg), None)
+
+    def base(self, nonce, instructions=None, tools=True, effort="low", max_out=300):
+        """A /responses body shaped like opencode's (store off, the session's
+        cache key), with this run's nonce at the head of the prefix."""
+        b = {"model": self.model, "store": False, "max_output_tokens": max_out,
+             "instructions": instructions or ("[session %s]\n%s\n\nProject notes:\n%s"
+                                              % (nonce, CODING_SYSTEM, code_filler(10000, self.seed)))}
+        if tools:
+            b["tools"] = _oai_tools(nonce)
+            b["tool_choice"] = "none"
+        if self.reasoning and effort:
+            b["reasoning"] = {"effort": effort}
+        if self.cache_key:
+            b["prompt_cache_key"] = "probe-%s" % nonce
+        return b
+
+    @staticmethod
+    def hist(nonce, steps, seed):
+        """A user turn and `steps` read calls with ~1.5k-token outputs: an
+        agent session's input, an exact prefix of the next step's."""
+        h = [{"role": "user", "content": "Read the files one at a time as I list them. For now reply with just OK."}]
+        for s in range(1, steps + 1):
+            cid = "call_%s_%d" % (nonce.replace("-", "_"), s)
+            h += [{"type": "function_call", "call_id": cid, "name": "read",
+                   "arguments": json.dumps({"filePath": "/home/user/project/src/mod_%d.py" % s})},
+                  {"type": "function_call_output", "call_id": cid, "output": code_filler(6000, seed + s)}]
+        return h
+
+    def cline(self, tid, title, r, extra=""):
+        if not r.ok:
+            self.rec(tid, title, "ERR", self.fail_note(r), r)
+            return None
+        x = _oai_usage(r.usage)
+        share = (100.0 * x["cached"] / x["in"]) if x["in"] else 0.0
+        bits = "input %s cached %s (%.0f%%)" % (x["in"], x["cached"], share)
+        if x["write"]:
+            bits += " cache_write %s" % x["write"]
+        self.rec(tid, title, "INFO", bits + ((" " + extra) if extra else ""), r)
+        return x
+
+    # ---- run ----
+    def run(self):
+        t0 = time.monotonic()
+        self.p("=== harness probe oai v%s (redacted; safe to paste) ===" % VERSION)
+        self.p("date_utc=%s python=%s model=%s seed=%d"
+               % (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
+                  platform.python_version(), self.model, self.seed))
+        self.p("'cached' is usage.input_tokens_details.cached_tokens (chat: prompt_tokens_details); "
+               "every request carries a fresh nonce, so no earlier run's cache counts")
+        for m in self.a.oai_models or [self.model]:
+            self.p("opencode asks %s for reasoning summaries on its own: %s"
+                   % (m, "yes" if _opencode_asks_summary(m) else "NO (the id has no gpt-5)"))
+        self.preflight()
+        for s, fn in (("1", self.sec_session), ("2", self.sec_controls), ("3", self.sec_stored),
+                      ("4", self.sec_summaries), ("5", self.sec_chat), ("6", self.sec_compact)):
+            if self.on(s):
+                fn()
+        self.summary(time.monotonic() - t0)
+
+    def preflight(self):
+        self.section("0. preflight")
+        body = self.base("%d-0" % self.seed, instructions="Reply with OK.", tools=False)
+        body["input"] = "Reply with OK."
+        for _ in range(3):
+            r = self.post("/responses", body, "O0 preflight")
+            bad = self.err_names(r, "prompt_cache_key", "reasoning")
+            if bad == "prompt_cache_key":
+                self.cache_key = False
+                body.pop("prompt_cache_key", None)
+            elif bad == "reasoning":
+                self.reasoning = False
+                body.pop("reasoning", None)
+            else:
+                break
+        if r.status == 404:
+            raise SystemExit("aborting: %s has no /responses (%s); is OAI_API_URL the .../openai/v1 base?"
+                             % (self.red(self.c.base), self.fail_note(r)))
+        if not r.ok:
+            self.rec("O0", "preflight", "ERR", self.fail_note(r), r)
+            raise SystemExit("aborting: the preflight request failed")
+        x = _oai_usage(r.usage)
+        self.rec("O0", "preflight", "INFO", "status=%s model=%s reasoning param %s, prompt_cache_key %s, "
+                 "reasoning tokens %s" % (r.finish, (r.json or {}).get("model") if isinstance(r.json, dict) else "?",
+                                          "taken" if self.reasoning else "REJECTED",
+                                          "taken" if self.cache_key else "REJECTED", x["think"]), r)
+        self.f["params"] = (self.reasoning, self.cache_key)
+
+    # 1. cache hits over a growing agent session
+    def sec_session(self):
+        self.section("1. agent session on /responses: cache hits per step")
+        steps = max(2, self.a.steps)
+        arms = [("key", True), ("nokey", False)] if self.cache_key else [("nokey", False)]
+        for arm, key in arms:
+            nonce = "%d-1%s" % (self.seed, arm)
+            rows = []
+            for s in range(1, steps + 1):
+                body = self.base(nonce)
+                if not key:
+                    body.pop("prompt_cache_key", None)
+                body["input"] = self.hist(nonce, s - 1, self.seed)
+                r = self.post("/responses", body, "O1 %s step %d" % (arm, s))
+                x = self.cline("O1", "%s step %d" % ("with prompt_cache_key" if key else "no prompt_cache_key", s), r)
+                if x is None:
+                    break
+                rows.append(x)
+            later = rows[1:]
+            tin = sum(x["in"] for x in later)
+            self.f["session_" + arm] = (sum(x["cached"] for x in later), tin, len(rows))
+            if rows:
+                self.f["session_last_in"] = rows[-1]["in"]
+
+    # 2. cache-retention controls
+    def sec_controls(self):
+        self.section("2. cache controls (each: a fresh prefix sent twice)")
+        out = []
+        for i, (name, extra) in enumerate((("prompt_cache_retention=24h", {"prompt_cache_retention": "24h"}),
+                                           ("prompt_cache_retention=in_memory", {"prompt_cache_retention": "in_memory"}),
+                                           ("prompt_cache_options ttl=12h", {"prompt_cache_options": {"ttl": "12h"}}),
+                                           ("prompt_cache_options ttl=30m", {"prompt_cache_options": {"ttl": "30m"}}))):
+            nonce = "%d-2%d" % (self.seed, i)
+            body = self.base(nonce)
+            body.update(extra)
+            body["input"] = self.hist(nonce, 1, self.seed)
+            r1 = self.post("/responses", body, "O2 %s first" % name)
+            x1 = self.cline("O2", name + " first", r1)
+            if x1 is None:
+                out.append((name, "rejected (%s)" % self.fail_note(r1)[:120]))
+                continue
+            x2 = self.cline("O2", name + " again", self.post("/responses", body, "O2 %s again" % name))
+            out.append((name, "taken; write %s, then cached %s of %s"
+                        % (x1["write"], x2["cached"] if x2 else "?", x2["in"] if x2 else "?")))
+        self.f["controls"] = out
+
+    # 3. stored state: does previous_response_id spare the re-billing?
+    def sec_stored(self):
+        self.section("3. store + previous_response_id")
+        nonce = "%d-3" % self.seed
+        word = "%s-%s" % (_ADJ[self.seed % 7], _NOUN[self.seed % 11])
+        a = self.base(nonce)
+        a["store"] = True
+        a["input"] = self.hist(nonce, 2, self.seed) + [
+            {"role": "user", "content": "Remember the code word %s. Reply with just OK." % word}]
+        ra = self.post("/responses", a, "O3 stored turn 1")
+        xa = self.cline("O3", "turn 1, store=true", ra)
+        rid = (ra.json or {}).get("id") if isinstance(ra.json, dict) else None
+        if xa is None or not rid:
+            self.f["stored"] = "store=true failed: %s" % (self.fail_note(ra) if not ra.ok else "no response id")
+            return
+        b = self.base(nonce)
+        b.update(store=True, previous_response_id=rid,
+                 input=[{"role": "user", "content": "What was the code word? Reply with just the word."}])
+        rb = self.post("/responses", b, "O3 stored turn 2")
+        got = word in (rb.content or "").lower()
+        xb = self.cline("O3", "turn 2, previous_response_id + only the new message", rb,
+                        "recalled the word: %s" % ("yes" if got else "no"))
+        if xb is None:
+            self.f["stored"] = "previous_response_id failed: %s" % self.fail_note(rb)
+        else:
+            self.f["stored"] = ("turn 1 input %s; turn 2 input %s (%s), %s cached; state %s"
+                                % (xa["in"], xb["in"], "earlier turns billed again" if xb["in"] >= xa["in"]
+                                   else "earlier turns NOT billed again", xb["cached"],
+                                   "kept" if got else "NOT kept"))
+        rid_b = (rb.json or {}).get("id") if isinstance(rb.json, dict) else None
+        for i in (rid, rid_b):
+            if i:
+                rd = self.post("/responses/%s" % i, None, "O3 delete", method="DELETE")
+                self.p("       delete stored response: HTTP %s" % rd.status)
+
+    # 4. reasoning summaries, and reasoning.context
+    def think_body(self, nonce, summary, **kw):
+        b = self.base(nonce, instructions="Solve the puzzle. Reply with just the final number.", tools=False,
+                      effort="medium", max_out=6000)
+        b["include"] = ["reasoning.encrypted_content"]
+        if summary:
+            b["reasoning"]["summary"] = summary
+        b.update(kw)
+        return b
+
+    def sline(self, tid, title, r, ans=None):
+        if not r.ok:
+            self.rec(tid, title, "ERR", self.fail_note(r), r)
+            return None
+        x = _oai_usage(r.usage)
+        types = {}
+        for line in (r.text or "").splitlines() if r.is_sse else []:
+            if line.startswith("data:"):
+                try:
+                    t = json.loads(line[5:]).get("type") or ""
+                except Exception:
+                    continue
+                if "reasoning" in t:
+                    types[t] = types.get(t, 0) + 1
+        bits = "reasoning tokens %s, summary %d chars" % (x["think"], len(r.reasoning))
+        if ans is not None:
+            bits += ", answer %s" % ("right" if _think_answer(r.content) == ans else "wrong")
+        if r.tool_calls:
+            bits += ", calls: %s" % self.calls_desc(r)
+        if types:
+            bits += ", events: " + " ".join("%s x%d" % (t.replace("response.", ""), n) for t, n in sorted(types.items()))
+        self.rec(tid, title, "INFO", bits, r)
+        if r.reasoning:
+            self.p("       summary excerpt: %s" % self.excerpt(r.reasoning, 200))
+        return x
+
+    def sec_summaries(self):
+        self.section("4. reasoning summaries (opencode's shape: store off, encrypted reasoning, cache key)")
+        if not self.reasoning:
+            self.rec("O4", "reasoning summaries", "INFO", "skipped: the model rejects the reasoning parameter")
+            return
+        got = {}
+        for i, (name, summary, stream) in enumerate((("no summary asked", None, False),
+                                                     ("summary=auto, streamed", "auto", True),
+                                                     ("summary=detailed", "detailed", False),
+                                                     ("summary=concise", "concise", False))):
+            q, ans = _think_puzzle(self.seed + i)
+            body = self.think_body("%d-4%d" % (self.seed, i), summary, input=q)
+            r = self.post("/responses", body, "O4 %s" % name, stream=stream)
+            x = self.sline("O4", name, r, ans)
+            got[name] = ("HTTP %s" % r.status) if x is None else ("%d chars" % len(r.reasoning))
+        # An agent step: does a summary come with a tool call?
+        nonce = "%d-4t" % self.seed
+        b = self.base(nonce, effort="medium", max_out=4000)
+        b.update(tool_choice="auto", include=["reasoning.encrypted_content"],
+                 input="Find which file under /home/user/project defines handle_cache. Use the tools.")
+        b["reasoning"]["summary"] = "auto"
+        r = self.post("/responses", b, "O4 agent step", stream=True)
+        x = self.sline("O4", "summary=auto on a tool-calling step, streamed", r)
+        got["tool step"] = ("HTTP %s" % r.status) if x is None else (
+            "%d chars with %d call(s)" % (len(r.reasoning), len(r.tool_calls)))
+        self.f["summaries"] = got
+        self.sec_context()
+
+    def sec_context(self):
+        """reasoning.context: does turn 2 bill turn 1's reasoning as input,
+        and does current_turn stop that?"""
+        q, ans = _think_puzzle(self.seed + 40)
+        nonce = "%d-4c" % self.seed
+        r1 = self.post("/responses", self.think_body(nonce, "auto", input=[{"role": "user", "content": q}]),
+                       "O4 context turn 1")
+        if not r1.ok or not isinstance(r1.json, dict):
+            self.rec("O4", "reasoning.context turn 1", "ERR", self.fail_note(r1), r1)
+            return
+        x1 = _oai_usage(r1.usage)
+        prior = []
+        for it in r1.json.get("output") or []:
+            if not isinstance(it, dict):
+                continue
+            if it.get("type") == "reasoning":
+                prior.append({k: it[k] for k in ("type", "id", "summary", "encrypted_content") if k in it})
+            elif it.get("type") == "message":
+                prior.append({"role": "assistant", "content": _content_to_text(it.get("content"))})
+        follow = [{"role": "user", "content": q}] + prior + [
+            {"role": "user", "content": "Add 7 to your answer. Reply with just the number."}]
+        self.p("       turn 1: input %s, reasoning %s tokens, %d reasoning item(s) passed back"
+               % (x1["in"], x1["think"], sum(1 for p in prior if p.get("type") == "reasoning")))
+        res = []
+        for name, ctx in (("default", None), ("current_turn", "current_turn"), ("all_turns", "all_turns")):
+            b = self.think_body(nonce, "auto", input=follow)
+            if ctx:
+                b["reasoning"]["context"] = ctx
+            r = self.post("/responses", b, "O4 context %s" % name)
+            if self.err_names(r, "item with id", "not persisted"):  # item ids refused with store off
+                b["input"] = [{k: v for k, v in it.items() if k != "id"} for it in follow]
+                r = self.post("/responses", b, "O4 context %s (no ids)" % name)
+            used = ((r.json or {}).get("reasoning") or {}).get("context") if isinstance(r.json, dict) else None
+            x = self.cline("O4", "turn 2, reasoning.context=%s" % name, r, "server says context=%s" % used)
+            res.append((name, ("HTTP %s" % r.status) if x is None else "input %s (%s cached)" % (x["in"], x["cached"])))
+        self.f["context"] = (x1["in"], x1["think"], res)
+
+    # 5. the /chat/completions route (container mode)
+    def sec_chat(self):
+        self.section("5. /chat/completions session (the route container mode uses)")
+        nonce = "%d-5" % self.seed
+        system = "[session %s]\n%s\n\nProject notes:\n%s" % (nonce, CODING_SYSTEM, code_filler(10000, self.seed))
+        msgs = [{"role": "system", "content": system},
+                {"role": "user", "content": "Read the files one at a time as I list them. For now reply with just OK."}]
+        effort = "none"
+        rows = []
+        for s in range(1, 4):
+            body = {"model": self.model, "messages": list(msgs), "tools": _oai_tools(nonce, chat=True),
+                    "tool_choice": "none", "max_completion_tokens": 300}
+            if self.cache_key:
+                body["prompt_cache_key"] = "probe-%s" % nonce
+            if self.reasoning:
+                body["reasoning_effort"] = effort
+            r = self.post("/chat/completions", body, "O5 step %d" % s)
+            if effort == "none" and self.err_names(r, "reasoning_effort", "none"):
+                effort = body["reasoning_effort"] = "low"
+                self.p("       reasoning_effort=none rejected; using low")
+                r = self.post("/chat/completions", body, "O5 step %d" % s)
+            x = self.cline("O5", "step %d" % s, r)
+            if x is None:
+                break
+            rows.append(x)
+            cid = "call_%s_%d" % (nonce.replace("-", "_"), s)
+            msgs += [{"role": "assistant", "content": None, "tool_calls": [
+                {"id": cid, "type": "function", "function": {
+                    "name": "read", "arguments": json.dumps({"filePath": "/home/user/project/src/mod_%d.py" % s})}}]},
+                {"role": "tool", "tool_call_id": cid, "content": code_filler(6000, self.seed + s)}]
+        later = rows[1:]
+        self.f["chat"] = (sum(x["cached"] for x in later), sum(x["in"] for x in later), effort)
+
+    # 6. compaction
+    def sec_compact(self):
+        self.section("6. compaction")
+        nonce = "%d-6" % self.seed
+        h = self.hist(nonce, 6, self.seed)
+        b = self.base(nonce)
+        b["input"] = h
+        x0 = self.cline("O6", "baseline: the full 6-step history", self.post("/responses", b, "O6 baseline"))
+        r = self.post("/responses/compact", {"model": self.model, "input": h}, "O6 compact")
+        res = {"baseline": x0["in"] if x0 else None}
+        if not r.ok or not isinstance(r.json, dict):
+            self.rec("O6", "POST /responses/compact", "ERR", self.fail_note(r), r)
+            res["compact"] = "HTTP %s" % r.status
+        else:
+            items = [it for it in r.json.get("output") or [] if isinstance(it, dict)]
+            kinds = sorted({str(it.get("type") or it.get("role")) for it in items})
+            self.rec("O6", "POST /responses/compact", "INFO", "%d output item(s): %s; %d chars vs %d sent"
+                     % (len(items), ",".join(kinds), len(json.dumps(items)), len(json.dumps(h))), r)
+            b2 = self.base(nonce)
+            b2["input"] = items + [{"role": "user", "content": "Reply with just OK."}]
+            x2 = self.cline("O6", "the compacted history + a new message", self.post("/responses", b2, "O6 compacted"))
+            res["compact"] = ("taken; next request input %s" % x2["in"]) if x2 else "taken; reusing it failed"
+        b3 = self.base(nonce)
+        b3.update(input=h, context_management=[{"type": "compaction", "compact_threshold": 4000}])
+        r3 = self.post("/responses", b3, "O6 context_management")
+        if r3.ok and isinstance(r3.json, dict):
+            kinds = [str(it.get("type")) for it in r3.json.get("output") or [] if isinstance(it, dict)]
+            x3 = self.cline("O6", "context_management compaction, threshold 4000", r3, "output items: " + ",".join(kinds))
+            res["context_management"] = "taken; compaction item %s, input %s" % (
+                "returned" if "compaction" in kinds else "NOT returned", x3["in"] if x3 else "?")
+        else:
+            self.rec("O6", "context_management compaction", "ERR", self.fail_note(r3), r3)
+            res["context_management"] = "HTTP %s" % r3.status
+        self.f["compact"] = res
+
+    def summary(self, secs):
+        f = self.f
+        self.p("")
+        self.p("=== oai verdict ===")
+        if "params" in f:
+            self.p("model takes reasoning: %s; prompt_cache_key: %s" % tuple("yes" if v else "NO" for v in f["params"]))
+        for arm, name in (("key", "with prompt_cache_key"), ("nokey", "without prompt_cache_key")):
+            if "session_" + arm in f:
+                c, t, n = f["session_" + arm]
+                self.p("session %s: steps 2-%d had %s of %s input cached (%.0f%%)"
+                       % (name, n, _kfmt(c), _kfmt(t), (100.0 * c / t) if t else 0))
+        for name, v in f.get("controls", []):
+            self.p("%s: %s" % (name, v))
+        if "stored" in f:
+            self.p("previous_response_id: %s" % f["stored"])
+        if "summaries" in f:
+            self.p("reasoning summary: " + "; ".join("%s: %s" % kv for kv in f["summaries"].items()))
+        if "context" in f:
+            i1, t1, res = f["context"]
+            self.p("reasoning.context (turn 1 input %s, reasoning %s): %s"
+                   % (i1, t1, "; ".join("%s: %s" % kv for kv in res)))
+        if "chat" in f:
+            c, t, eff = f["chat"]
+            self.p("/chat/completions (reasoning_effort=%s): steps 2-3 had %s of %s input cached (%.0f%%)"
+                   % (eff, _kfmt(c), _kfmt(t), (100.0 * c / t) if t else 0))
+        if "compact" in f:
+            self.p("compaction: " + "; ".join("%s: %s" % kv for kv in f["compact"].items()))
+        self.p(self.usage_line())
+        self.p("elapsed %.0fs" % secs)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="harness probe", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--suite", choices=("full", "memory", "single", "thinking", "slim"), default="full", help="which suite to run (default full)")
-    ap.add_argument("--model", default=os.environ.get("DEFAULT_MODEL_NAME", ""), help="model for the suite (default: DEFAULT_MODEL_NAME)")
+    ap.add_argument("--suite", choices=("full", "memory", "single", "thinking", "slim", "oai"), default="full", help="which suite to run (default full)")
+    ap.add_argument("--model", default="", help="model for the suite (default: DEFAULT_MODEL_NAME; oai: the first of OAI_MODELS)")
     ap.add_argument("--repeat", type=int, default=None, help="repeats for the stochastic key checks (default 3; thinking 2); slim: runs per arm (default 1)")
     ap.add_argument("--timeout", type=int, default=None, help="per-request timeout seconds (default 120; memory 240; single 300; slim 120)")
     ap.add_argument("--skip-long", action="store_true", help="skip the long-context needle tests")
     ap.add_argument("--no-matrix", action="store_true", help="skip the per-model matrix")
-    ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs); memory/thinking/slim: digits, e.g. '124' (slim arms 1-3)")
+    ap.add_argument("--only", default="", help="limit to sections, e.g. 'BD' (A always runs); memory/thinking/slim/oai: digits, e.g. '124' (slim arms 1-3)")
     ap.add_argument("--quick", action="store_true", help="memory/single: fewer sizes and repeats")
     ap.add_argument("--budget", type=int, default=500000,
                     help="memory: stop a section before the run passes this many credits (default 500000; 0 = no cap)")
-    ap.add_argument("--steps", type=int, default=12, help="memory: turns in the agent-like session (default 12)")
+    ap.add_argument("--steps", type=int, default=None, help="memory/oai: turns in the agent-like session (default 12; oai 6)")
     ap.add_argument("--max-chars", type=int, default=700000, help="memory/single: largest request to send (default 700000)")
     ap.add_argument("--long-term", action="store_true",
                     help="memory: also test the product's long-term memory (writes to the account's saved memory)")
@@ -4620,6 +5144,8 @@ def main():
         a.repeat = {"thinking": 2, "slim": 1}.get(a.suite, 3)
     if a.timeout is None:
         a.timeout = {"memory": 240, "single": 300}.get(a.suite, 120)
+    if a.steps is None:
+        a.steps = 6 if a.suite == "oai" else 12
     if not 6 <= a.facts <= 90:
         ap.error("--facts: expected 6 to 90")
     for opt in ("sizes", "framing_sizes"):
@@ -4644,24 +5170,43 @@ def main():
             print("harness probe: --candidate: no such file: %s" % a.candidate, file=sys.stderr)
             return 2
 
-    url = os.environ.get("PROXY_API_URL", "").strip()
-    key = os.environ.get("PROXY_API_KEY", "").strip()
-    if not url or not key:
-        print("harness probe: PROXY_API_URL and PROXY_API_KEY must be set (harness config set ...)", file=sys.stderr)
-        return 2
-    base = url.rstrip("/")
-    for suffix in ("/v1/chat/completions", "/chat/completions"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-    base = base.rstrip("/")
-    if base.endswith("/v1"):
-        base = base[:-3]
-    base = base.rstrip("/")
+    if a.suite == "oai":
+        # The proxy's OAI route: paths go on the base as given (.../openai/v1),
+        # less a /chat/completions or /responses the URL may end in.
+        url = os.environ.get("OAI_API_URL", "").strip()
+        key = os.environ.get("OAI_API_KEY", "").strip()
+        a.oai_models = [m.strip() for m in os.environ.get("OAI_MODELS", "").split(",") if m.strip()]
+        if not url or not key:
+            print("harness probe: OAI_API_URL and OAI_API_KEY must be set (harness config set ...)", file=sys.stderr)
+            return 2
+        a.model = a.model or (a.oai_models[0] if a.oai_models else "")
+        base = url.rstrip("/")
+        for suffix in ("/chat/completions", "/responses"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        base = base.rstrip("/")
+    else:
+        url = os.environ.get("PROXY_API_URL", "").strip()
+        key = os.environ.get("PROXY_API_KEY", "").strip()
+        if not url or not key:
+            print("harness probe: PROXY_API_URL and PROXY_API_KEY must be set (harness config set ...)", file=sys.stderr)
+            return 2
+        a.model = a.model or os.environ.get("DEFAULT_MODEL_NAME", "")
+        base = url.rstrip("/")
+        for suffix in ("/v1/chat/completions", "/chat/completions"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+        base = base.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        base = base.rstrip("/")
     red = Redactor(key, base, os.environ.get("HARNESS_PROBE_REDACT", ""))
     red.literals.append((url.rstrip("/"), "<base-url>"))
     red.literals.sort(key=lambda p: -len(p[0]))
     if not a.model:
-        print("harness probe: no model (set DEFAULT_MODEL_NAME or pass --model)", file=sys.stderr)
+        print("harness probe: no model (set %s or pass --model)"
+              % ("OAI_MODELS" if a.suite == "oai" else "DEFAULT_MODEL_NAME"), file=sys.stderr)
         return 2
 
     log_fh = None
@@ -4693,7 +5238,7 @@ def main():
 
     client = Client(base, key, a.timeout, log if log_fh else None, red)
     prober = {"memory": MemProber, "single": SingleProber, "thinking": ThinkProber,
-              "slim": SlimProber}.get(a.suite, Prober)(a, client, red, out)
+              "slim": SlimProber, "oai": OaiProber}.get(a.suite, Prober)(a, client, red, out)
     rc = 0
     try:
         prober.run()

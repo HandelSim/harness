@@ -1136,10 +1136,11 @@ breaks the recursion.
 `cmd_probe` runs `scripts/probe_upstream.py` (stdlib-only Python) straight
 against `PROXY_API_URL` with `PROXY_API_KEY`. The proxy is not involved.
 Subcommands: `full` (the default; bare `harness probe`), `memory`,
-`optimize-single` (alias `--optimize-single`), `thinking`, `slim`,
+`optimize-single` (alias `--optimize-single`), `thinking`, `slim`, `oai`,
 `thoughts`, and `help` (lists them); `<subcommand> --help` gives that
 suite's options. Except `thoughts`, the subcommand reaches the script as
-`--suite full|memory|single|thinking|slim`.
+`--suite full|memory|single|thinking|slim|oai`. `oai` alone targets
+`OAI_API_URL` with `OAI_API_KEY` instead (see below).
 
 **`harness probe thoughts`** is not part of `probe_upstream.py`:
 `_probe_thoughts` runs `tests/benchmarks/thoughts/run.py` with every
@@ -1283,6 +1284,31 @@ medians. Bounds: 30 main steps, 15 per subagent, 60 requests per run.
 The proxy's per-step reminder and old-output trim are not simulated.
 `--repeat` defaults to 1. Log: `state/output/probe-slim-<ts>.log`.
 
+**`harness probe oai`** (`OaiProber`) measures what cuts token cost on the
+OpenAI-format upstream and whether reasoning summaries come back. It needs
+`OAI_API_URL`/`OAI_API_KEY` (not `PROXY_*`); the base is normalized as the
+proxy's `_normalize_oai_base` does, and the model defaults to the first of
+`OAI_MODELS`. The `Client` parses Responses replies (JSON and SSE:
+`output_text`, reasoning `summary` text, `function_call` items) into the same
+`Resp` fields as chat replies. Every request carries a per-run nonce at the
+head of its prefix, so no earlier run's cache counts. A preflight learns
+whether the model takes `reasoning` and `prompt_cache_key`, and prints
+whether opencode would ask each `OAI_MODELS` id for summaries on its own
+(its rule: the id contains `gpt-5`, not `gpt-5-chat`/`-pro`). Sections
+(digits for `--only`): 1 an agent-shaped `/responses` session growing by a
+`read` call per step (`--steps`, default 6), input and `cached_tokens` per
+step, with and without `prompt_cache_key`; 2 `prompt_cache_retention`
+24h/in_memory and `prompt_cache_options` ttl 12h/30m, each a fresh prefix
+sent twice; 3 `store` + `previous_response_id` (are earlier turns billed
+again; both stored responses are deleted); 4 `reasoning.summary`
+none/auto (streamed)/detailed/concise and on a tool-calling step, in
+opencode's shape (store off, `reasoning.encrypted_content`), then
+`reasoning.context` default/current_turn/all_turns on a turn 2 that replays
+turn 1's reasoning; 5 a `/chat/completions` session (container mode's
+route, `reasoning_effort` none, low if refused); 6 `POST /responses/compact`
+and `context_management` compaction. A 429 is waited out (its
+`retry-after`, capped at 60s). Log: `state/output/probe-oai-<ts>.log`.
+
 **Redaction is the contract.** Every printed and logged string goes through
 `Redactor`, which removes:
 
@@ -1307,7 +1333,8 @@ log is written to the container's stderr and redirected into the host log
 file; `__file__` is then `<stdin>`, which is why the slim suite takes
 `--root`. A locked key aborts with a pointer to `harness unlock`, and the
 unlock URL is not echoed. `tests/unit_probe_test.sh` drives it against a
-secret-echoing mock.
+secret-echoing mock; `tests/unit_probe_oai_test.sh` does the same for the
+`oai` suite with a mock that simulates an exact-prefix cache.
 
 ## `usage`
 

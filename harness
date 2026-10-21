@@ -1812,7 +1812,8 @@ cmd_unlock() {
 # are dropped), 'optimize-single' (which size, join format and framing of
 # a chat folded into one message the model answers best from) and 'thinking'
 # (reasoning controls, thought text, thought signatures, reasoning billing)
-# and 'slim' (reads and greps per task, prompt and signature arms). Output is redacted (key, URL, host, emails, IPs, projects/...
+# and 'slim' (reads and greps per task, prompt and signature arms); 'oai' runs
+# against OAI_API_URL instead (prompt caching, reasoning summaries, compaction). Output is redacted (key, URL, host, emails, IPs, projects/...
 # paths, HARNESS_PROBE_REDACT terms) so it can be pasted back as-is. Runs on
 # the host's python3; falls back to the proxy image's python when the host has
 # none. See architecture/harness-cli.md.
@@ -1846,6 +1847,10 @@ subcommands:
   slim      how much the slim agent reads and greps per task: the
             current prompt with thought signatures dropped and kept, and
             a candidate prompt. Up to about 60 requests per arm.
+  oai       the OpenAI-format upstream (OAI_API_URL): prompt-cache hits
+            over an agent session, cache controls, previous_response_id,
+            reasoning summaries ("thoughts"), reasoning.context, the chat
+            route's cache, compaction. About 40 requests, 2-5 minutes.
   thoughts  whether --thoughts helps the agent: paired runs of 'harness
             host --yolo -p' with and without it on 38 SWE-bench Verified
             tasks, graded by their tests, stopped at --budget tokens
@@ -1978,6 +1983,38 @@ send that file for analysis.
 EOF
 }
 
+_probe_oai_help() {
+    cat <<'EOF'
+usage: harness probe oai [--model ID] [--steps N] [--only SECTIONS]
+                         [--timeout SECS]
+
+Probe OAI_API_URL with OAI_API_KEY (no proxy) for what cuts token cost and
+whether reasoning summaries come back. Every request carries a fresh nonce,
+so no earlier run's cache counts. Sections (a preflight always runs):
+
+  1  an agent-shaped /responses session growing by a tool call per step:
+     input and cached tokens per step, with and without prompt_cache_key
+  2  prompt_cache_retention 24h / in_memory and prompt_cache_options
+     ttl 12h / 30m: taken or rejected, cache writes, hits on a resend
+  3  store + previous_response_id: are earlier turns billed again
+  4  reasoning summaries in opencode's request shape (none / auto
+     streamed / detailed / concise / on a tool-calling step), and
+     reasoning.context default / current_turn / all_turns on turn 2
+  5  a /chat/completions session (container mode's route): cached tokens
+  6  POST /responses/compact and context_management compaction
+
+About 40 requests and 250k input tokens, most of them cached (the report
+ends with the measured total). Stored responses from section 3 are deleted.
+The full redacted log is written to state/output/probe-oai-<time>.log;
+send that file for analysis.
+
+  --model ID       deployment / model id (default: the first of OAI_MODELS)
+  --steps N        steps in the section-1 session (default 6)
+  --only SECTIONS  run only these sections, e.g. 14
+  --timeout SECS   per-request timeout (default 120)
+EOF
+}
+
 _probe_slim_help() {
     cat <<'EOF'
 usage: harness probe slim [--only ARMS] [--repeat N] [--candidate PATH]
@@ -2071,6 +2108,7 @@ cmd_probe() {
         optimize-single|--optimize-single) suite=single; shift ;;
         thinking) suite=thinking; shift ;;
         slim) suite=slim; shift ;;
+        oai) suite=oai; shift ;;
         thoughts) shift; _probe_thoughts "$@"; return ;;
         ""|-*) ;;
         *)
@@ -2086,12 +2124,18 @@ cmd_probe() {
                 single) _probe_single_help ;;
                 thinking) _probe_thinking_help ;;
                 slim) _probe_slim_help ;;
+                oai) _probe_oai_help ;;
                 *) _probe_full_help ;;
             esac
             return 0
             ;;
     esac
-    if [[ -z "${PROXY_API_URL:-}" || -z "${PROXY_API_KEY:-}" ]]; then
+    if [[ $suite == oai ]]; then
+        if [[ -z "${OAI_API_URL:-}" || -z "${OAI_API_KEY:-}" ]]; then
+            err "OAI_API_URL and OAI_API_KEY must be set ('harness config set ...')"
+            return 1
+        fi
+    elif [[ -z "${PROXY_API_URL:-}" || -z "${PROXY_API_KEY:-}" ]]; then
         err "PROXY_API_URL and PROXY_API_KEY must be set ('harness config set ...')"
         return 1
     fi
@@ -2105,6 +2149,7 @@ cmd_probe() {
     [[ $suite == single ]] && stem=probe-single
     [[ $suite == thinking ]] && stem=probe-thinking
     [[ $suite == slim ]] && stem=probe-slim
+    [[ $suite == oai ]] && stem=probe-oai
     local rel log
     rel="state/output/${stem}-$(date -u +%Y%m%dT%H%M%SZ).log"
     log="$install_root/$rel"
@@ -2142,7 +2187,8 @@ cmd_probe() {
         err "install Python 3, or run 'harness start' once, then retry"
         return 1
     fi
-    local -a envs=(-e PROXY_API_URL -e PROXY_API_KEY -e DEFAULT_MODEL_NAME -e HARNESS_PROBE_REDACT)
+    local -a envs=(-e PROXY_API_URL -e PROXY_API_KEY -e DEFAULT_MODEL_NAME -e HARNESS_PROBE_REDACT
+                   -e OAI_API_URL -e OAI_API_KEY -e OAI_MODELS)
     local v
     for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
         [[ -n "${!v:-}" ]] && envs+=(-e "$v")
