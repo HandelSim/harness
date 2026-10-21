@@ -144,7 +144,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | F103 | `harness doctor` reports agents section: any agent container currently running |
 | F104 | `harness preflight` validates required commands exist (docker/podman, git) |
 | F105 | `harness preflight` validates `.env` exists with non-empty `PROXY_API_URL`, `PROXY_API_KEY`, `DEFAULT_MODEL_NAME` |
-| F106 | `harness preflight` validates the PROXY_API_URL hostname appears on the allowlist |
+| F106 | `harness preflight` accepts an upstream host missing from the allowlist (the firewall allows it from `.env`) and fails a URL with no parseable hostname |
 | F107 | `harness preflight` exits 0 on success |
 | F108 | `harness preflight` exits non-zero with summary count on failure |
 | F109 | `harness mcp` (no subcommand) prints MCP-specific help |
@@ -321,6 +321,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | A032 | `run_shell` execs `bash -l` so login dotfiles run |
 | A033 | Entry dispatch chooses opencode/shell based on the first positional arg (default opencode) |
 | A034 | Unknown mode in dispatch errors with usage |
+| A035 | With `OAI_MODELS` passed (names only; `agent_common_env` never passes `OAI_API_KEY`), `ensure_opencode_config` puts those ids on a `harness-oai` provider (`@ai-sdk/openai`, the proxy's `/v1` baseURL, `reasoning: true`, output 32000), keeps the rest on `harness`, and selects `harness-oai/<id>` for an OAI default; the container overlay carries the slim header for `harness-oai` too |
 
 ---
 
@@ -385,7 +386,7 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | N015 | `init-firewall.sh` accepts ESTABLISHED,RELATED connections |
 | N016 | `init-firewall.sh` REJECTs with `icmp-admin-prohibited` so callers get fast failure |
 | N017 | Default OUTPUT policy is DROP |
-| N018 | `init-firewall.sh` fatally errors when `PROXY_API_URL` hostname is not on the allowlist (only for hosts with dots and not intra-cluster names) |
+| N018 | `init-firewall.sh` allows the proxy's upstream hosts from the environment without an allowlist entry: `PROXY_API_URL` and `OAI_API_URL`, or only `CHATGPT_BASE_URL` under `PROXY_BACKEND=chatgpt`; dotless (intra-cluster) hosts are skipped, IPv4 literals go in as is |
 | N019 | `init-firewall.sh` verifies `example.com` is blocked after setup |
 | N020 | `init-firewall.sh` verifies at least one of api.github.com / pypi.org / registry.npmjs.org is reachable after setup |
 | N021 | `init-firewall.sh` errors if both verification probes fail |
@@ -607,7 +608,7 @@ proxy-side ChatGPT backend-api translation lives under P065–P081.)
 | C017 | `ensure_services_up` does NOT restart the stack when the running proxy already serves the requested backend |
 | C018 | `_config_is_secret CHATGPT_COOKIE_STRING` classifies the cookie as a secret; `_config_get`/`_config_read_key` never print it in the clear (masked as `set, ...`) |
 | C019 | `_config_editable_keys` lists `CHATGPT_BASE_URL`, `CHATGPT_MODEL_NAME`, and `CHATGPT_COOKIE_STRING` in the config picker |
-| C020 | `_config_set CHATGPT_BASE_URL <url>` writes the value AND syncs the egress allowlist with the new host (so the firewall permits it) |
+| C020 | `_config_set CHATGPT_BASE_URL <url>` writes the value and leaves the allowlist alone (the firewall allows the host from `.env`) |
 | C021 | `cmd_chatgpt --help` documents both the bare and `host` forms and the `CHATGPT_*` config keys, without selecting the backend (side-effect free) |
 | C022 | `cmd_chatgpt` (bare form) selects the chatgpt backend, sets `agent_model` from `CHATGPT_MODEL_NAME`, and launches an agent |
 | C023 | `cmd_chatgpt host …` selects the chatgpt backend and delegates the remaining args to `cmd_host` |

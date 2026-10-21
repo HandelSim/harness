@@ -9,9 +9,11 @@
 #   3. GitHub IP-range fetch is best-effort: a transient failure logs a WARN
 #      rather than aborting. The per-host `dig` resolution still works for
 #      github.com hostnames in the allowlist.
-#   4. Proxy container only: PROXY_API_URL hostname is validated against the
-#      allowlist before applying rules. If absent, the script aborts with a
-#      clear message — the proxy cannot reach upstream otherwise.
+#   4. Proxy container only: the hosts of the upstream URLs the proxy will
+#      call (PROXY_API_URL and OAI_API_URL, or CHATGPT_BASE_URL under
+#      PROXY_BACKEND=chatgpt) are allowed automatically from the environment, so
+#      whatever .env points at is reachable without an allowlist edit. A set
+#      but unparseable URL aborts with a clear message.
 #   5. After firewall is up, /usr/local/bin/configure-git-credentials.sh is
 #      invoked if present (agent containers ship it; the proxy doesn't).
 #
@@ -91,6 +93,41 @@ ALLOW_HOSTS=()
 while IFS= read -r h; do
     [[ -n "$h" ]] && ALLOW_HOSTS+=("$h")
 done < <(allowlist_hosts)
+
+# --- 1b. upstream URL hosts from the environment (proxy container only) -----
+#
+# The proxy's upstreams come from .env, so their hosts are allowed from the
+# same place instead of being kept in sync with the allowlist by hand. Only the
+# URLs this proxy will actually call: PROXY_API_URL plus OAI_API_URL (when an
+# OAI upstream is configured), or only CHATGPT_BASE_URL under
+# PROXY_BACKEND=chatgpt (that backend calls neither of the other two). No other
+# container sets these; a value with
+# an intra-cluster host (http://mockupstream:8080, no dot) needs no ipset entry
+# because the host-network rule below already covers it.
+upstream_vars=(PROXY_API_URL OAI_API_URL)
+if [[ "${PROXY_BACKEND:-}" == "chatgpt" ]]; then
+    upstream_vars=(CHATGPT_BASE_URL)
+fi
+for uvar in "${upstream_vars[@]}"; do
+    uurl="${!uvar:-}"
+    [[ -z "$uurl" ]] && continue
+    uhost=$(echo "$uurl" | awk -F[/:] '{print $4}')
+    if [[ -z "$uhost" ]]; then
+        # The parse assumes a scheme://host form. A scheme-less value
+        # ("api.example.com/v1") yields nothing; the proxy would then fail at
+        # request time with an opaque connect error. Say so now instead.
+        cat >&2 <<EOF
+[harness-firewall] FATAL: could not parse a hostname out of ${uvar}='${uurl}'.
+[harness-firewall] It must include a scheme, e.g. https://api.example.com/v1.
+[harness-firewall] Fix it with:
+[harness-firewall]     harness config set ${uvar} <url>
+EOF
+        exit 1
+    fi
+    [[ "$uhost" == *.* ]] || continue
+    ALLOW_HOSTS+=("$uhost")
+    log "allowed $uhost (from $uvar)"
+done
 
 if (( ${#ALLOW_HOSTS[@]} == 0 )); then
     warn "allowlist contains no resolvable hosts — egress will be effectively closed except for DNS/loopback/host-net"
@@ -191,7 +228,11 @@ fi
 resolved_count=0
 unresolvable=()
 for host in "${ALLOW_HOSTS[@]}"; do
-    ips=$(dig +short A "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ips="$host"   # an IPv4 literal (e.g. an upstream URL by IP); dig has nothing to resolve
+    else
+        ips=$(dig +short A "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    fi
     if [[ -z "$ips" ]]; then
         unresolvable+=("$host")
         continue
@@ -246,58 +287,7 @@ if [[ -n "${HARNESS_HOST_MCP_HOSTS:-}" ]]; then
     log "resolved $hm_count host MCP IP(s) from /etc/hosts"
 fi
 
-# --- 10. upstream-URL guardrail (proxy container only) -----------------------
-#
-# The proxy refuses to start if its upstream LLM API hostname is not in the
-# allowlist. Catches the most common misconfiguration before the user sees
-# opaque connection errors at request time. Other containers either don't set
-# PROXY_API_URL or set it to an intra-cluster name (e.g. http://mockupstream:8080)
-# whose hostname is not expected to be in the allowlist — those skip the
-# guardrail.
-
-# The proxy speaks one backend at a time. Under PROXY_BACKEND=chatgpt the
-# upstream is CHATGPT_BASE_URL and PROXY_API_URL is unused, so guard whichever
-# one this proxy will actually call.
-guard_url="${PROXY_API_URL:-}"
-guard_var="PROXY_API_URL"
-if [[ "${PROXY_BACKEND:-}" == "chatgpt" ]]; then
-    guard_url="${CHATGPT_BASE_URL:-}"
-    guard_var="CHATGPT_BASE_URL"
-fi
-
-if [[ -n "$guard_url" ]]; then
-    api_host=$(echo "$guard_url" | awk -F[/:] '{print $4}')
-    if [[ -z "$api_host" ]]; then
-        # The parse assumes a scheme://host form. A scheme-less value
-        # ("api.example.com/v1") yields nothing, which used to skip the
-        # guardrail silently — the proxy then started with an unallowlisted
-        # upstream and failed at request time with an opaque connect error.
-        # A configured-but-unparseable upstream is a misconfiguration; say so.
-        cat >&2 <<EOF
-[harness-firewall] FATAL: could not parse a hostname out of ${guard_var}='${guard_url}'.
-[harness-firewall] It must include a scheme, e.g. https://api.example.com/v1.
-[harness-firewall] Fix it with:
-[harness-firewall]     harness config set ${guard_var} <url>
-EOF
-        exit 1
-    fi
-    # Only enforce for non-intra-cluster hosts. A bare hostname with no dots
-    # (mockupstream) is intra-cluster and lives behind the host-network rule
-    # above. $api_host is non-empty here: the parse failure above exits.
-    if [[ "$api_host" == *.* ]]; then
-        if ! grep -qE "^[[:space:]]*${api_host}([[:space:]]|#|\$)" "$ALLOWLIST_FILE"; then
-            cat >&2 <<EOF
-[harness-firewall] FATAL: ${guard_var} hostname '${api_host}' is not in $ALLOWLIST_FILE.
-[harness-firewall] The proxy cannot reach its upstream. Add it with:
-[harness-firewall]     harness net allow ${api_host}
-[harness-firewall] (or edit <install-root>/.harness-allowlist directly, then 'harness restart').
-EOF
-            exit 1
-        fi
-    fi
-fi
-
-# --- 11. apply firewall ------------------------------------------------------
+# --- 10. apply firewall ------------------------------------------------------
 #
 # Default deny on OUTPUT/INPUT/FORWARD; allow only what we whitelisted.
 # REJECT (rather than DROP) on the catch-all so blocked clients get an
@@ -315,7 +305,7 @@ iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
 iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
 
-# --- 12. verify --------------------------------------------------------------
+# --- 11. verify --------------------------------------------------------------
 
 log "verifying egress posture"
 
@@ -341,7 +331,7 @@ else
     log "verify ok: example.com blocked (no canonical positive-case host in allowlist; skipping positive check)"
 fi
 
-# --- 13. done ---------------------------------------------------------------
+# --- 12. done ---------------------------------------------------------------
 #
 # configure-git-credentials.sh is intentionally NOT invoked here. Agent
 # entrypoints run it themselves after the gosu drop so `git config --global`

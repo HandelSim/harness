@@ -188,9 +188,9 @@ run from an empty directory. Stages:
    free-text `DEFAULT_MODEL_NAME` prompt. The same helper backs the `-m` flag
    below.
 7b. **Allowlist auto-add.** The hostname from `PROXY_API_URL` (scheme/path/port
-   stripped) is appended to `.harness-allowlist` if not already present, so the
-   container egress firewall doesn't silently block the LLM provider — the most
-   common fresh-install failure. A blank `PROXY_API_URL` warns instead.
+   stripped) is appended to `.harness-allowlist` if not already present. The
+   proxy's firewall allows that host from `.env` anyway, so this is only a
+   visible record of it. A blank `PROXY_API_URL` warns instead.
 8. **PATH wrapper.** Writes a `harness` script wrapper to
    `~/.local/bin/harness` that `exec`s into `<install-root>/harness`.
    Prints a one-line "add to PATH" reminder if `~/.local/bin` isn't
@@ -225,8 +225,7 @@ the installer flags remain for recovery before the CLI is reachable:
 - **`-m` / `--model-menu`** — re-run the stage-7a model menu against an existing
   install to change `DEFAULT_MODEL_NAME`. No reinstall.
 - **`-c` / `--check`** — host-side connectivity diagnostics for a configured
-  install (no container needed): confirms the API host is in
-  `.harness-allowlist`, does a `GET /v1/models` with SSL verification, retries
+  install (no container needed): does a `GET /v1/models` with SSL verification, retries
   with `-k` on failure to distinguish a network error from an untrusted
   certificate (common on internal CAs — points the user at `PROXY_API_CACERT`),
   reports the HTTP status, and validates `DEFAULT_MODEL_NAME` against the

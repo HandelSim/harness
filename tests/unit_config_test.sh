@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # tests/unit_config_test.sh — exercise the post-install setup commands added to
-# the CLI: `harness config` (read/write/list/allowlist-sync) and
+# the CLI: `harness config` (read/write/list) and
 # `harness uninstall` (confirm gate + teardown), docker-free.
 #
 # Sources `harness` with HARNESS_SOURCE_ONLY=1 so main() never runs, pointed at
@@ -11,8 +11,8 @@
 #     one, preserves unrelated lines, and survives values with / & : @
 #   - _config_read_key: returns the on-disk value, strips quotes
 #   - _config_get: masks secret keys, prints plain values otherwise
-#   - _config_set PROXY_API_URL: writes the key AND adds the host to the
-#     allowlist (the firewall sync side-effect)
+#   - _config_set PROXY_API_URL: writes the key and leaves the allowlist alone
+#     (the proxy's firewall allows upstream hosts from .env itself)
 #   - cmd_config (no args): prints the subcommand usage so the user learns how to
 #     drive it, then the current values (no-tty branch of the picker)
 #   - cmd_uninstall: cancels on a non-"yes" answer (leaves files), tears down on
@@ -58,13 +58,12 @@ HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$TMP_ROOT" HARNESS_ALLOWLIST_PATH="$
 
 # When `harness` is sourced (not executed), its self-path resolves to THIS test
 # script, so clone_dir points at tests/ and the real scripts/lib/ is unreachable.
-# In a real install clone_dir IS the repo; pin it there so the allowlist-sync
-# path (which loads scripts/lib/net_helpers.sh) exercises the real add, not the
-# missing-helpers hint branch.
+# In a real install clone_dir IS the repo; pin it there so anything that loads
+# scripts/lib/ helpers finds the real ones.
 clone_dir="$REPO_ROOT"
 
 for fn in _config_read_key _config_write_key _config_get _config_set \
-          _config_sync_allowlist_from_url cmd_config cmd_uninstall; do
+          cmd_config cmd_uninstall; do
     [[ "$(type -t "$fn")" == "function" ]] || fail "$fn not sourced"
 done
 ok "config + uninstall functions sourced"
@@ -102,15 +101,15 @@ out="$(_config_get PROXY_TIMEOUT)"
 grep -q '300' <<<"$out" || fail "T5: plain value not shown — $out"
 ok "T5: _config_get masks secret keys, prints non-secret values"
 
-# --- T6: _config_set PROXY_API_URL also adds host to allowlist --------------
+# --- T6: _config_set PROXY_API_URL writes the key, not the allowlist --------
 : >"$ALLOWLIST"
 _config_set PROXY_API_URL "https://api.newhost.example:8443/v1" >/dev/null \
     || fail "T6: config set returned non-zero"
 [[ "$(_config_read_key PROXY_API_URL)" == "https://api.newhost.example:8443/v1" ]] \
     || fail "T6: URL not written"
-grep -qx 'api.newhost.example' "$ALLOWLIST" \
-    || fail "T6: host not added to allowlist — $(cat "$ALLOWLIST")"
-ok "T6: setting PROXY_API_URL writes the key and allowlists its host"
+[[ ! -s "$ALLOWLIST" ]] \
+    || fail "T6: allowlist should stay untouched — $(cat "$ALLOWLIST")"
+ok "T6: setting PROXY_API_URL writes the key and leaves the allowlist alone"
 
 # --- T7: cmd_config get with no key lists the curated set -------------------
 out="$(cmd_config get)"

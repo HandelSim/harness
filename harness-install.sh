@@ -442,22 +442,11 @@ _run_conn_check() {
     [[ -z "$api_key" ]] && { fail "PROXY_API_KEY is blank — edit $env_file"; abort=1; }
     if (( abort )); then return 1; fi
 
-    # --- 1. allowlist -------------------------------------------------------
+    # No allowlist check: the proxy's firewall allows the PROXY_API_URL host
+    # from .env at start (firewall/init-firewall.sh section 1b).
     local api_host
     api_host=$(printf '%s' "$api_url" \
         | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||;s|[/?#].*||;s|:.*||')
-    local allowlist="$install_root/.harness-allowlist"
-    if [[ -f "$allowlist" ]]; then
-        if grep -qxF "$api_host" "$allowlist" 2>/dev/null; then
-            ok "$api_host is in .harness-allowlist"
-        else
-            warn "$api_host is NOT in .harness-allowlist — container egress will be blocked"
-            echo "  Fix: printf '%s\\n' \"$api_host\" >> \"$allowlist\"" >&2
-        fi
-    else
-        warn ".harness-allowlist not found at $allowlist"
-    fi
-    echo
 
     if ! command -v curl >/dev/null 2>&1; then
         warn "curl not found; skipping HTTP tests"

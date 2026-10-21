@@ -2351,35 +2351,6 @@ _config_write_key() {
     mv -f "$tmp" "$env_file"
 }
 
-# Add a URL's hostname to the egress allowlist if absent — a derived side-effect
-# of setting PROXY_API_URL, since an upstream missing from the allowlist is the
-# #1 "AI silently unreachable on a fresh URL" cause (the firewall blocks it).
-# No-op when the host is already present or unparseable; degrades to a printed
-# hint when net_helpers isn't available (partial install / source-only test).
-_config_sync_allowlist_from_url() {
-    local url="$1"
-    # $2 names the key that triggered the sync, for the confirmation line. Two
-    # keys feed this now (PROXY_API_URL and CHATGPT_BASE_URL), so hardcoding
-    # one of them would misattribute the other.
-    local from_key="${2:-PROXY_API_URL}"
-    [[ -n "$url" ]] || return 0
-    local host
-    host=$(printf '%s' "$url" | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||;s|[/?#].*||;s|:.*||')
-    [[ -n "$host" ]] || return 0
-    if [[ ! -f "$clone_dir/scripts/lib/net_helpers.sh" ]]; then
-        echo "harness: add $host to $allowlist_path so the proxy can reach it"
-        return 0
-    fi
-    load_net_helpers
-    if netlib_has_host "$host"; then
-        echo "harness: $host already on the egress allowlist"
-    elif netlib_add_host "$host"; then
-        echo "harness: added $host to the egress allowlist (from $from_key)"
-    else
-        err "could not add $host to the allowlist; add it with 'harness net allow $host'"
-    fi
-}
-
 _config_help() {
     cat <<'EOF'
 harness config — view and change .env settings.
@@ -2390,8 +2361,9 @@ usage:
   harness config list            alias for 'config get' with no KEY
   harness config set KEY VALUE   set KEY to VALUE (any key; VALUE may be empty)
 
-Secrets (PROXY_API_KEY and the like) are shown masked. Setting PROXY_API_URL
-also adds its hostname to the egress allowlist so the proxy can reach it.
+Secrets (PROXY_API_KEY and the like) are shown masked. Upstream URL hosts
+(PROXY_API_URL, OAI_API_URL, CHATGPT_BASE_URL) need no allowlist entry: the
+proxy's firewall allows them from .env at start.
 Picking DEFAULT_MODEL_NAME opens the live model picker ('harness model').
 EOF
 }
@@ -2424,9 +2396,6 @@ _config_set() {
     local value="$*"
     _config_write_key "$key" "$value" || return 1
     echo "harness: set $key in $env_file"
-    case "$key" in
-        PROXY_API_URL|CHATGPT_BASE_URL) _config_sync_allowlist_from_url "$value" "$key" ;;
-    esac
     return 0
 }
 
@@ -2485,9 +2454,6 @@ _config_picker() {
     [[ -n "$newval" ]] || { echo "unchanged."; return 0; }
     _config_write_key "$sel" "$newval" || return 1
     echo "harness: set $sel in $env_file"
-    case "$sel" in
-        PROXY_API_URL|CHATGPT_BASE_URL) _config_sync_allowlist_from_url "$newval" "$sel" ;;
-    esac
     return 0
 }
 
@@ -3028,7 +2994,6 @@ cmd_start() {
         else
             echo "  - PROXY_API_URL or PROXY_API_KEY missing/wrong in .env"
         fi
-        echo "  - Upstream API hostname not in .harness-allowlist"
         echo "  - Stale Docker resources (try: harness down)"
         echo
         echo "To diagnose, run:"
@@ -5677,8 +5642,8 @@ serve_opencode_config() {
 }
 
 # OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts, serve and vault
-# overlays deep-merged. Prints nothing when none applies. `oai` (a host launch
-# with an OAI upstream) is passed on to slim_opencode_config.
+# overlays deep-merged. Prints nothing when none applies. `oai` (a launch with
+# an OAI upstream, host or container) is passed on to slim_opencode_config.
 harness_opencode_overlay() {
     local part out=""
     for part in "$(slim_opencode_config "${1:-}")" "$(thoughts_opencode_config)" \
@@ -6613,10 +6578,18 @@ agent_common_env() {
     # Declared context window for opencode's model config. The same knob caps
     # the proxy's local token estimate.
     printf -- '-e\nMODEL_CONTEXT_LENGTH=%s\n' "${MODEL_CONTEXT_LENGTH:-200000}"
+    # OAI model names (never the key) so the entrypoint puts them on the
+    # harness-oai provider, which reaches the proxy's /v1/responses route as
+    # in host mode.
+    local oai_provider=""
+    if _oai_configured; then
+        oai_provider=oai
+        printf -- '-e\nOAI_MODELS=%s\n' "$(_oai_models | paste -sd, -)"
+    fi
     # The opencode overlay (slim prompts + header unless --normal, the active vault), one
     # line of JSON.
     local overlay
-    overlay=$(harness_opencode_overlay)
+    overlay=$(harness_opencode_overlay "$oai_provider")
     if [[ -n "$overlay" ]]; then
         printf -- '-e\nOPENCODE_CONFIG_CONTENT=%s\n' "$overlay"
     fi
@@ -9318,32 +9291,23 @@ cmd_doctor() {
         push_count=$(netlib_list_pushable | wc -l | tr -d ' ')
         doctor_check ok "allowlist" "$allowlist_path ($total hosts, $push_count push-enabled)"
 
-        # Cross-check PROXY_API_URL hostname against the allowlist — this is
-        # the single most common misconfiguration (entry missing or typo'd)
-        # and the firewall guardrail will refuse to start the proxy without
-        # it. Surfacing it here gives the user a fast diagnosis.
-        # The firewall guards whichever upstream the active backend calls,
-        # so check that one (see firewall/init-firewall.sh section 10).
-        local upstream_var upstream_url proxy_host
-        if _backend_is_chatgpt; then
-            upstream_var="CHATGPT_BASE_URL"; upstream_url="${CHATGPT_BASE_URL:-}"
-        else
-            upstream_var="PROXY_API_URL"; upstream_url="${PROXY_API_URL:-}"
-        fi
-        if [[ -n "$upstream_url" ]]; then
+        # The firewall allows the upstream hosts straight from .env (see
+        # firewall/init-firewall.sh section 1b), so the allowlist needs no
+        # entry for them; what can still go wrong is a URL with no parseable
+        # host, which makes the firewall refuse to start the proxy.
+        local upstream_var upstream_url proxy_host upstream_vars=(PROXY_API_URL OAI_API_URL)
+        _backend_is_chatgpt && upstream_vars=(CHATGPT_BASE_URL)
+        for upstream_var in "${upstream_vars[@]}"; do
+            upstream_url="${!upstream_var:-}"
+            [[ -n "$upstream_url" ]] || continue
             proxy_host=$(printf '%s' "$upstream_url" | awk -F'[/:]' '{print $4}')
             if [[ -z "$proxy_host" ]]; then
                 doctor_check fail "$upstream_var host" \
                     "no hostname in '$upstream_url' (needs a scheme; proxy will refuse to start)"
             elif [[ "$proxy_host" == *.* ]]; then
-                if netlib_has_host "$proxy_host"; then
-                    doctor_check ok "$upstream_var host" "$proxy_host on allowlist"
-                else
-                    doctor_check fail "$upstream_var host" \
-                        "$proxy_host NOT on allowlist (proxy will refuse to start)"
-                fi
+                doctor_check ok "$upstream_var host" "$proxy_host (allowed from .env)"
             fi
-        fi
+        done
     elif (( host_only )); then
         doctor_check ok "allowlist" "n/a (host-only; host mode has no egress firewall)"
     else
@@ -9764,22 +9728,18 @@ cmd_preflight() {
         fi
         proxy_url=$(_config_read_key "$url_key")
 
-        # The upstream hostname must be in the allowlist or container egress
-        # will be blocked by the firewall. Host mode has no firewall, so this
-        # cross-check is container-only.
-        if (( ! host_only )) && [[ -n "$proxy_url" && -f "$allowlist_path" ]]; then
+        # The container firewall allows the upstream host straight from .env,
+        # but only if it can parse one out of the URL. Host mode has no
+        # firewall, so this check is container-only.
+        if (( ! host_only )) && [[ -n "$proxy_url" ]]; then
             local proxy_host
             proxy_host=$(echo "$proxy_url" | awk -F[/:] '{print $4}')
             if [[ -z "$proxy_host" ]]; then
                 echo "  ✗ $url_key='$proxy_url' has no parseable hostname (needs a scheme, e.g. https://)"
-                echo "    The proxy's firewall guard will refuse to start it."
-                errors=$((errors+1))
-            elif ! grep -qE "^[[:space:]]*${proxy_host}([[:space:]]|#|\$)" "$allowlist_path"; then
-                echo "  ✗ $url_key hostname '$proxy_host' is NOT in $allowlist_path"
-                echo "    Add it with:  harness net allow $proxy_host"
+                echo "    The proxy's firewall will refuse to start it."
                 errors=$((errors+1))
             else
-                echo "  ✓ $url_key hostname is in allowlist"
+                echo "  ✓ $url_key hostname '$proxy_host' (the firewall allows it from .env)"
             fi
         fi
     fi

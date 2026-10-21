@@ -98,7 +98,15 @@ After the drop, still in the entrypoint:
   verbatim pass-through of the upstream's OpenAI-format list, so ids come off
   `.data[].id` with no tag to strip) so opencode lists exactly the models the
   upstream advertises; `DEFAULT_MODEL_NAME` is always included and is the
-  default selection (`harness/<DEFAULT_MODEL_NAME>`). Provider options set
+  default selection (`harness/<DEFAULT_MODEL_NAME>`). With an OAI upstream the
+  harness CLI also passes `OAI_MODELS` (names only, never the key); those ids
+  move to a second provider, `harness-oai` (`@ai-sdk/openai`, bundled in
+  opencode, same baseURL), which uses the proxy's `/v1/responses` route, where
+  these models take tools and reasoning together and stream reasoning
+  summaries, exactly as in host mode. Each OAI model gets `reasoning: true`,
+  `tool_call: true` and output 32000; the selection becomes
+  `harness-oai/<id>` when the default is an OAI model, and the `harness`
+  provider is left out when there are no other models. Provider options set
   `includeUsage: true` (opencode's default anyway; its token counter, and so
   auto-compaction, depends on the usage chunk); each model's `cost` prices
   every token at 1, so opencode's "$" reads millions of tokens. `cache_read` and
@@ -116,7 +124,8 @@ After the drop, still in the entrypoint:
   `websearch` — matching the set of tools the agent ships so yolo mode
   doesn't trip on the new ones.
 - Unless the launch is `--normal` it also passes `OPENCODE_CONFIG_CONTENT`
-  (slim agent prompts + the `x-harness-slim` provider header), which opencode
+  (slim agent prompts + the `x-harness-slim` provider header, on `harness-oai`
+  too when OAI is configured), which opencode
   merges over this file; see [`harness-cli.md`](harness-cli.md) "Slim (default) and `--normal`".
 - `merge_opencode_mcp_servers` translates the canonical `{"mcpServers": {...}}`
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
@@ -280,7 +289,7 @@ mount on first run, marked with `~/.harness-home-initialized`.
 `firewall/init-firewall.sh` runs at the top of every container's
 entrypoint as root. Reads `/etc/harness/allowlist` (bind-mounted from
 `<install-root>/.harness-allowlist`) and drops egress except to DNS, the
-configured `PROXY_API_URL` host, and allowlist entries.
+proxy's upstream hosts from the environment, and allowlist entries.
 
 - `# git-push` annotation on a host in the allowlist enables `git push`
   to that host (the `store` credential helper). Without it, pull works
@@ -288,15 +297,17 @@ configured `PROXY_API_URL` host, and allowlist entries.
 - `HARNESS_FIREWALL_DISABLED=1` short-circuits the script and logs a loud
   bypass message. Set by `harness net open <service>` (stamped into the
   runtime override) and by `--net` per launch (set on the `docker run` env).
-- The proxy container additionally validates its upstream host is on the
-  allowlist before applying rules; otherwise the proxy cannot reach upstream
-  and there's no point continuing. Which host that is depends on the backend:
-  `PROXY_API_URL`'s by default, `CHATGPT_BASE_URL`'s when the proxy was started
-  with `PROXY_BACKEND=chatgpt` (see [`harness-cli.md`](harness-cli.md) →
-  ChatGPT backend). The proxy service also carries the three `CHATGPT_*` values
-  from `.env`; they are inert on a normal launch. A set-but-unparseable upstream
-  URL (no scheme, so no hostname comes out of the parse) is also fatal — it used
-  to skip the guard silently and surface later as an opaque connect error.
+- The proxy container allows its upstream hosts straight from its
+  environment (section 1b), so whatever `.env` points at is reachable with no
+  allowlist entry and nothing to keep in sync. Which hosts depends on the
+  backend: `PROXY_API_URL`'s and `OAI_API_URL`'s by default, only
+  `CHATGPT_BASE_URL`'s when the proxy was started with `PROXY_BACKEND=chatgpt`
+  (see [`harness-cli.md`](harness-cli.md) → ChatGPT backend). No other
+  container carries these vars, so the agent gets no direct upstream route.
+  Hosts without a dot (intra-cluster, e.g. `mockupstream`) are skipped; an
+  IPv4-literal host goes into the ipset as is. A set-but-unparseable upstream
+  URL (no scheme, so no hostname comes out of the parse) is fatal rather than
+  surfacing later as an opaque connect error.
 - The rules are IPv4-only (`iptables` + `dig +short A` + an `inet` ipset), so
   every harness container is created with the kernel IPv6 stack disabled via
   the `net.ipv6.conf.all.disable_ipv6=1` sysctl (`sysctls:` in

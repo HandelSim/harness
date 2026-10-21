@@ -206,11 +206,12 @@ installer. Three commands cover post-install setup:
   - Secret-ish keys (name matches `*KEY*|*SECRET*|*TOKEN*|*PASSWORD*` via
     `_config_is_secret`) are shown masked (`(set, N chars)`) and prompted with
     a hidden read.
-  - Setting `PROXY_API_URL` also adds its host to the egress allowlist
-    (`_config_sync_allowlist_from_url` → `load_net_helpers` +
-    `netlib_add_host`), since an upstream missing from the allowlist is the
-    top "AI silently unreachable on a fresh URL" cause. Degrades to a printed
-    hint when `net_helpers.sh` isn't reachable.
+  - Setting an upstream URL (`PROXY_API_URL`, `OAI_API_URL`,
+    `CHATGPT_BASE_URL`) touches only `.env`: the proxy's firewall allows those
+    hosts from its environment at start
+    ([`containers.md`](containers.md) → Universal egress firewall), so there is
+    no allowlist entry to sync. `cmd_doctor` and `cmd_preflight` still fail a
+    URL with no parseable host (no scheme), which the firewall refuses.
 - **`cmd_model`** — pick `DEFAULT_MODEL_NAME` from the upstream's live
   `/v1/models` catalog (same logic the installer runs at "configuring default
   model", now re-runnable). Curls the catalog via `_api_base`, shows a numbered
@@ -735,8 +736,10 @@ What it does, in order:
    `harness` provider is omitted when no other model is left, and
    `model`/`small_model` become `harness-oai/<id>` when the default is an OAI
    model. `host_opencode_env` passes `oai` to the overlay so the slim header
-   is set on both providers. Container mode keeps one provider; there OAI
-   models use the proxy's chat route. The fingerprint gains an `oai` line
+   is set on both providers. Container mode does the same: `agent_common_env`
+   passes `OAI_MODELS` (names only) and the `oai` overlay, and the
+   entrypoint's `ensure_opencode_config` writes the same `harness-oai`
+   provider ([`containers.md`](containers.md)). The fingerprint gains an `oai` line
    only when an `OAI_*` key is set.
 8. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
    (provider env, `--agent yolo`, and the headless `-p` json-events +
@@ -967,7 +970,7 @@ Everything the backend changes hangs off that one global:
 | `host_proxy_start` | passes `PROXY_BACKEND` in the launch env prefix |
 | `host_proxy_fingerprint` | hashes the backend plus all three `CHATGPT_*` values |
 | `firewall/init-firewall.sh` | guards `CHATGPT_BASE_URL`'s host against the allowlist instead of `PROXY_API_URL`'s |
-| `cmd_doctor`, `cmd_preflight` | check/report the `CHATGPT_*` trio and allowlist `CHATGPT_BASE_URL`'s host; the upstream probe is skipped (no catalog endpoint) |
+| `cmd_doctor`, `cmd_preflight` | check/report the `CHATGPT_*` trio and that `CHATGPT_BASE_URL` has a parseable host; the upstream probe is skipped (no catalog endpoint) |
 
 `harness chatgpt doctor` and `harness chatgpt preflight` exist only to set that
 global before delegating — the diagnostics are otherwise the same code. Bare
@@ -1019,9 +1022,9 @@ shared service, and both are handled explicitly:
   makes the existing config-change restart path handle the switch.
 
 `CHATGPT_COOKIE_STRING` is a full session credential, so `_config_is_secret`
-matches `*COOKIE*` and `harness config` masks it. `harness config set
-CHATGPT_BASE_URL <url>` syncs the egress allowlist, exactly like
-`PROXY_API_URL`.
+matches `*COOKIE*` and `harness config` masks it. Under the chatgpt backend
+the proxy's firewall allows `CHATGPT_BASE_URL`'s host from the environment, as
+it does `PROXY_API_URL`'s on the default backend.
 
 A cookie also forced a fix in `_config_write_key`: it now quotes any value that
 is not a bare word (`[^A-Za-z0-9_./:@=+,%~-]`). The wrapper sources `.env` under

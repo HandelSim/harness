@@ -151,33 +151,66 @@ ensure_opencode_config() {
         mapfile -t model_ids < <(printf '%s' "$catalog" \
             | jq -r '.data[]?.id // empty' 2>/dev/null | sort -u || true)
     fi
+    # OAI models (OAI_MODELS, names only; the harness CLI passes it when an
+    # OAI upstream is configured) get their own provider, `harness-oai`, as in
+    # host mode: opencode's @ai-sdk/openai package speaks the Responses API
+    # (POST {baseURL}/responses, which the proxy relays to the OAI upstream),
+    # the API on which these models take tools and reasoning together and
+    # stream reasoning summaries. The `harness` provider keeps every other model.
+    local -a oai_ids=()
+    local -A is_oai=()
+    local m
+    while IFS= read -r m; do
+        m="${m#"${m%%[![:space:]]*}"}"; m="${m%"${m##*[![:space:]]}"}"
+        [[ -n "$m" && -z "${is_oai[$m]:-}" ]] || continue
+        is_oai["$m"]=1; oai_ids+=("$m")
+    done < <(tr ',' '\n' <<<"${OAI_MODELS:-}")
+    local -a vendor_ids=()
+    for m in "${model_ids[@]}"; do [[ -n "${is_oai[$m]:-}" ]] || vendor_ids+=("$m"); done
+    model_ids=("${vendor_ids[@]}")
     # Ensure the default model is always present (it's the default selection).
-    if [[ -n "$default_model" ]]; then
-        local found=0 m
+    if [[ -n "$default_model" && -z "${is_oai[$default_model]:-}" ]]; then
+        local found=0
         for m in "${model_ids[@]}"; do [[ "$m" == "$default_model" ]] && found=1; done
         (( found == 0 )) && model_ids+=("$default_model")
     fi
-    if (( ${#model_ids[@]} == 0 )); then
+    if (( ${#model_ids[@]} == 0 && ${#oai_ids[@]} == 0 )); then
         model_ids=("${default_model:-default}")
     fi
 
     # Selected model: the configured default if present, else the first id.
-    local selected="$default_model"
-    if [[ -z "$selected" ]]; then
-        selected="${model_ids[0]}"
+    local selected="harness/$default_model"
+    if [[ -n "$default_model" && -n "${is_oai[$default_model]:-}" ]]; then
+        selected="harness-oai/$default_model"
+    elif [[ -z "$default_model" ]]; then
+        if (( ${#model_ids[@]} > 0 )); then
+            selected="harness/${model_ids[0]}"
+        else
+            selected="harness-oai/${oai_ids[0]}"
+        fi
     fi
 
     # provider.models map: {"<id>": {"name": "<id>", "limit": {...}}, ...}
-    local models_json
     # Every token costs 1, so opencode's "$" readout is millions of tokens,
     # the unit of a token allowance (cached prompt tokens included; opencode
     # would count them free). Same program as opencode_models_jq in the
     # harness script (host mode).
-    models_json=$(printf '%s\n' "${model_ids[@]}" | jq -R . | jq -s \
-        --argjson ctx "$ctx" \
-        'map({key: ., value: {name: ., limit: {context: $ctx, output: 8192},
+    local models_prog='map({key: ., value: {name: ., limit: {context: $ctx, output: 8192},
              cost: {input: 1, output: 1, cache_read: 1, cache_write: 1}}})
-         | from_entries')
+         | from_entries'
+    local models_json='{}' oai_json='{}'
+    if (( ${#model_ids[@]} > 0 )); then
+        models_json=$(printf '%s\n' "${model_ids[@]}" | jq -R . | jq -s \
+            --argjson ctx "$ctx" "$models_prog")
+    fi
+    if (( ${#oai_ids[@]} > 0 )); then
+        # reasoning: true turns on opencode's reasoning options (effort,
+        # summaries, encrypted reasoning carried between steps); the output
+        # limit is what opencode sends as max_output_tokens, reasoning included.
+        oai_json=$(printf '%s\n' "${oai_ids[@]}" | jq -R . | jq -s \
+            --argjson ctx "$ctx" "$models_prog
+            | map_values(. + {reasoning: true, tool_call: true, limit: {context: \$ctx, output: 32000}})")
+    fi
 
     # Always (re)write the harness-managed block — the model set may have
     # changed between launches. Built with jq so the models map is dynamic and
@@ -185,18 +218,26 @@ ensure_opencode_config() {
     jq -n \
         --arg provider_name "$provider_name" \
         --arg proxy_url "$proxy_url" \
-        --arg selected "harness/${selected}" \
+        --arg selected "$selected" \
         --argjson models "$models_json" \
+        --argjson oai_models "$oai_json" \
         '{
           "$schema": "https://opencode.ai/config.json",
-          "provider": {
+          "provider": ((if $models == {} then {} else {
             "harness": {
               "npm": "@ai-sdk/openai-compatible",
               "name": $provider_name,
               "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy", "includeUsage": true},
               "models": $models
             }
-          },
+          } end) + (if $oai_models == {} then {} else {
+            "harness-oai": {
+              "npm": "@ai-sdk/openai",
+              "name": ($provider_name + " (OpenAI API)"),
+              "options": {"baseURL": $proxy_url, "apiKey": "harness-dummy"},
+              "models": $oai_models
+            }
+          } end)),
           "model": $selected,
           "small_model": $selected,
           "compaction": {"prune": true},
@@ -269,7 +310,7 @@ run_opencode() {
     echo "============================================================"
     echo " harness-agent (opencode)"
     echo "   provider: GenAI Harness"
-    echo "   model:    harness/${DEFAULT_MODEL_NAME:-default}"
+    echo "   model:    $(jq -r '.model // empty' "${HOME}/.config/opencode/opencode.json" 2>/dev/null || true)"
     echo "   proxy:    http://proxy:${PROXY_PORT:-8000}/v1"
     echo "   yolo:     ${HARNESS_YOLO:-0}"
     echo "   print:    ${HARNESS_PRINT_MODE:-0}"

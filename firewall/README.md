@@ -53,9 +53,11 @@ Container exits 1 immediately on start, before anything useful runs?
    - **"allowlist file not found at /etc/harness/allowlist"** — the
      compose mount isn't wired up. Confirm `volumes:` in the service
      definition includes `${HARNESS_ALLOWLIST_PATH:-...}:/etc/harness/allowlist:ro`.
-   - **"PROXY_API_URL hostname '<x>' is not in /etc/harness/allowlist"** —
-     add the upstream hostname to the allowlist (B2's `harness net allow
-     <host>` will do this for you, or edit the file directly).
+   - **"could not parse a hostname out of PROXY_API_URL=..."** (or
+     `OAI_API_URL` / `CHATGPT_BASE_URL`) — the URL needs a scheme, e.g.
+     `https://api.example.com/v1`. The proxy's upstream hosts need no
+     allowlist entry: the script allows them from the environment and logs
+     `allowed <host> (from <VAR>)`.
    - **"example.com is reachable but should be blocked"** — iptables/ipset
      packages missing from the image, or the container is running without
      `NET_ADMIN`. Confirm `cap_add: [NET_ADMIN, NET_RAW]` on the service.

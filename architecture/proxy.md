@@ -218,14 +218,16 @@ when on; `signatures_reattached=N` when any were put back).
 `OAI_API_URL` with `OAI_API_KEY` ([`upstream-api.md`](upstream-api.md) → A
 second upstream). Two inbound routes reach it:
 
-- **`POST /v1/chat/completions`** (container mode, other clients):
+- **`POST /v1/chat/completions`** (other clients; opencode's `harness`
+  provider if an OAI id is ever sent there):
   `_native_passthrough(..., oai=True)`. `_oai_chat_payload` renames
   `max_tokens` to `max_completion_tokens` and adds `prompt_cache_key` = the
   session id. `_native_send` retries a 400 once per fix, and remembers the fix
   per model: a `reasoning_effort` error with tools present resends with
   `reasoning_effort: "none"` (Azure gpt-5.6 takes no tools with reasoning on
   this route); a `prompt_cache_key` error drops the key.
-- **`POST /v1/responses`** (host mode's `harness-oai` provider): OAI models
+- **`POST /v1/responses`** (opencode's `harness-oai` provider, host and
+  container mode alike): OAI models
   only (anything else is a 400). `_responses_passthrough` adds
   `prompt_cache_key` when absent and relays the reply as-is (no
   `stream_options`: Responses streams always end with usage). Under slim it

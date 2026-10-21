@@ -19,7 +19,8 @@
 #   - _running_proxy_backend / ensure_services_up: a container proxy serving
 #     the other backend is restarted rather than silently reused
 #   - _config_is_secret / _config_set: the cookie is masked and setting
-#     CHATGPT_BASE_URL syncs the egress allowlist
+#     CHATGPT_BASE_URL leaves the allowlist alone (the firewall allows it from
+#     .env)
 #   - cmd_chatgpt: --help prints without side effects; bare form launches an
 #     agent, `host` form delegates to cmd_host, both with the backend set
 #   - _config_write_key: a cookie with '; ' separators is quoted on disk, so
@@ -259,15 +260,15 @@ _config_editable_keys | grep -q '^CHATGPT_MODEL_NAME|' || fail "T11: CHATGPT_MOD
 _config_editable_keys | grep -q '^CHATGPT_COOKIE_STRING|' || fail "T11: CHATGPT_COOKIE_STRING not in the picker"
 ok "T11: the cookie is masked and all three keys are in the config picker"
 
-# --- T12: setting CHATGPT_BASE_URL syncs the egress allowlist ---------------
+# --- T12: setting CHATGPT_BASE_URL writes the key, not the allowlist --------
 : >"$ALLOWLIST"
 _config_set CHATGPT_BASE_URL "https://chat.newhost.example:8443" >/dev/null \
     || fail "T12: config set returned non-zero"
 [[ "$(_config_read_key CHATGPT_BASE_URL)" == "https://chat.newhost.example:8443" ]] \
     || fail "T12: URL not written"
-grep -q '^chat.newhost.example' "$ALLOWLIST" \
-    || fail "T12: host not added to the allowlist — $(cat "$ALLOWLIST")"
-ok "T12: 'config set CHATGPT_BASE_URL' allowlists the host for the firewall"
+[[ ! -s "$ALLOWLIST" ]] \
+    || fail "T12: allowlist should stay untouched — $(cat "$ALLOWLIST")"
+ok "T12: 'config set CHATGPT_BASE_URL' writes the key and leaves the allowlist alone"
 
 # --- T13: cmd_chatgpt --help is side-effect free ----------------------------
 backend_override=""

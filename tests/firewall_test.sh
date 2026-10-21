@@ -3,11 +3,11 @@
 # tests/firewall_test.sh — focused checks that the per-container egress
 # firewall (firewall/init-firewall.sh) is actually applied at runtime.
 #
-# Verifies firewall negative path and bypass behavior:
+# Verifies upstream auto-allow and bypass behavior:
 #
-#   Phase 2 — negative. Brings up proxy with PROXY_API_URL pointing at a
-#   host that is NOT in the allowlist; asserts the proxy refuses to start
-#   and the FATAL guardrail line appears in its logs.
+#   Phase 2 — upstream auto-allow. Brings up proxy with PROXY_API_URL and
+#   OAI_API_URL pointing at hosts that are NOT in the allowlist; asserts the
+#   firewall allows both from the environment and finishes init (no FATAL).
 #
 #   Phase 3 — bypass. Brings up proxy with HARNESS_FIREWALL_DISABLED=1;
 #   asserts the firewall init script short-circuits and OUTPUT policy stays
@@ -63,7 +63,7 @@ rm -f "$test_allow_check"
 echo "[fw] OK: test_generate_allowlist does not emit api.anthropic.com"
 
 # ============================================================================
-# Phase 2 — negative: PROXY_API_URL guardrail rejects out-of-allowlist host.
+# Phase 2 — upstream hosts from .env are allowed without an allowlist entry.
 # ============================================================================
 
 PROJECT_NEG="harness-firewall-neg"
@@ -71,16 +71,21 @@ ENV_NEG="$(mktemp -t harness-fw-neg.XXXXXX.env)"
 OVERRIDE_NEG="$(mktemp -t harness-fw-neg.XXXXXX.yml)"
 ALLOW_NEG="$(mktemp -t harness-fw-neg.XXXXXX.allow)"
 
-# .env points PROXY_API_URL at a host whose label has a dot (so the guardrail
-# enforces it) and is deliberately absent from the allowlist below.
+# Dotted hosts (so they are not treated as intra-cluster) that are absent from
+# the allowlist below. .invalid never resolves, so the firewall WARNs about
+# resolution, which is fine: the assertion is that it allowed them at all
+# instead of refusing to start.
 test_generate_env "$ENV_NEG" \
-    "PROXY_API_URL=https://blocked.example.com/v1/chat/completions"
+    "PROXY_API_URL=https://upstream.invalid/v1/chat/completions" \
+    "OAI_API_URL=https://oai-upstream.invalid:8443/openai/v1" \
+    "OAI_API_KEY=test-oai-key" \
+    "OAI_MODELS=gpt-test"
 
 # Reuse the same mockupstream override only because compose insists on
-# resolvability of `harness-net`; the proxy will fail before we use it.
+# resolvability of `harness-net`.
 test_generate_mockupstream_override "$OVERRIDE_NEG"
 
-# Allowlist deliberately omits blocked.example.com.
+# Allowlist deliberately omits both upstream hosts.
 test_generate_allowlist "$ALLOW_NEG"
 
 # harness_docker_path rewrites /tmp/... to a Docker-Desktop-mountable path on
@@ -101,26 +106,22 @@ harness_docker compose --project-name "$PROJECT_NEG" \
 COMPOSE_NEG=(harness_docker compose --project-name "$PROJECT_NEG" --env-file "$ENV_NEG" \
     -f docker-compose.yml -f "$OVERRIDE_NEG")
 
-test_section "Phase 2: PROXY_API_URL guardrail (negative)"
+test_section "Phase 2: upstream hosts auto-allowed from .env"
 
-echo "[fw] starting proxy alone with out-of-allowlist PROXY_API_URL"
-# `up -d` returns success for the create step even if the container then
-# exits — the assertion is on the proxy container's logs (looking for the
-# FATAL guardrail line), not on `up`'s exit code. We don't poll for
-# State.Status because the proxy service has restart: unless-stopped, so
-# the container flaps between "exited" and "restarting" and may briefly
-# look "running" again. Logs are persistent and definitive.
+echo "[fw] starting proxy alone with out-of-allowlist upstream URLs"
+# The assertion is on the proxy container's logs (persistent and definitive),
+# not on `up`'s exit code or a polled State.Status.
 "${COMPOSE_NEG[@]}" up -d --build proxy >/dev/null 2>&1 || true
 
-# Give the entrypoint enough time to run init-firewall.sh and emit its
-# FATAL line at least once. ~15s covers cold start on most hosts.
 deadline=$(( $(date +%s) + 30 ))
 matched=0
 while true; do
     logs=$("${COMPOSE_NEG[@]}" logs proxy 2>&1 || true)
-    if grep -q 'PROXY_API_URL hostname.*not in' <<<"$logs" \
-       && grep -q 'blocked\.example\.com' <<<"$logs"; then
+    if grep -q 'harness-firewall\] init complete' <<<"$logs"; then
         matched=1
+        break
+    fi
+    if grep -q 'harness-firewall\] FATAL' <<<"$logs"; then
         break
     fi
     if (( $(date +%s) >= deadline )); then
@@ -130,24 +131,20 @@ while true; do
 done
 
 if (( ! matched )); then
-    echo "[fw] FAIL: proxy logs did not show PROXY_API_URL guardrail FATAL line" >&2
+    echo "[fw] FAIL: firewall did not finish init with out-of-allowlist upstreams" >&2
     "${COMPOSE_NEG[@]}" logs proxy >&2 || true
     exit 1
 fi
-
-# Sanity: proxy must NOT be healthy. (It might be transiently "running"
-# during a restart cycle, but its healthcheck cannot succeed because the
-# python server never starts.)
-proxy_cid=$("${COMPOSE_NEG[@]}" ps -q proxy 2>/dev/null || true)
-if [[ -n "$proxy_cid" ]]; then
-    health=$(harness_docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$proxy_cid" 2>/dev/null || echo "none")
-    if [[ "$health" == "healthy" ]]; then
-        echo "[fw] FAIL: proxy reports healthy despite guardrail FATAL" >&2
+for want in 'allowed upstream\.invalid (from PROXY_API_URL)' \
+            'allowed oai-upstream\.invalid (from OAI_API_URL)'; do
+    if ! grep -q "$want" <<<"$logs"; then
+        echo "[fw] FAIL: proxy logs lack '$want'" >&2
+        "${COMPOSE_NEG[@]}" logs proxy >&2 || true
         exit 1
     fi
-fi
+done
 
-echo "[fw] Phase 2 OK (proxy guardrail FATAL observed in logs)"
+echo "[fw] Phase 2 OK (both upstream hosts allowed from the environment)"
 
 # Tear down phase 2 explicitly so phase 3 starts from a clean slate.
 cleanup_neg

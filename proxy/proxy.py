@@ -64,7 +64,7 @@ from flask import Flask, Response, request
 #
 # Security boundary: every upstream call below uses verify=False, so this assumes
 # the network path to PROXY_API_URL is trusted. In container mode the egress
-# firewall allowlists the upstream host, constraining that hop; in host mode
+# firewall allows only the configured upstream hosts, constraining that hop; in host mode
 # there is no firewall, so a network-level MITM on the route to PROXY_API_URL
 # could intercept or alter upstream responses. Cert pinning would require
 # shipping the upstream CA as a runtime artifact and is not done today.
@@ -128,8 +128,8 @@ MODELS_URL: str = f"{_API_BASE}/v1/models"
 # /chat/completions or /responses is stripped. OAI_MODELS names the models
 # (Azure: deployment names) served from it: Azure's /models lists base models,
 # not deployments, so they are configured, not discovered. Every OAI model is
-# a native tool model. opencode reaches them over /v1/responses in host mode
-# (the Responses API: reasoning with tools, encrypted reasoning carried across
+# a native tool model. opencode reaches them over /v1/responses, host and
+# container mode alike (the Responses API: reasoning with tools, encrypted reasoning carried across
 # turns); /v1/chat/completions also works, with the fixes in
 # `_native_passthrough`. Both upstreams can be set at once; the model name
 # picks the upstream.

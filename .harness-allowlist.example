@@ -27,16 +27,9 @@ codeload.github.com
 raw.githubusercontent.com
 objects.githubusercontent.com
 
-# === ADD YOUR UPSTREAM LLM API HOSTNAME HERE ===
-# The hostname must match the host portion of PROXY_API_URL — the firewall
-# will refuse to start if PROXY_API_URL points at a host that isn't on this
-# list. Uncomment whichever you use, or add your own.
-# api.openai.com
-# generativelanguage.googleapis.com
-
-# If you use `harness chatgpt`, the host portion of CHATGPT_BASE_URL must be
-# here too — the firewall guards whichever upstream the proxy was started for.
-# `harness config set CHATGPT_BASE_URL <url>` adds it for you.
+# === UPSTREAM LLM API HOSTNAMES ===
+# Not needed here: the proxy's firewall allows the hosts of PROXY_API_URL,
+# OAI_API_URL and CHATGPT_BASE_URL straight from .env.
 
 # === ADD YOUR SELF-HOSTED GIT REMOTES HERE (with `# git-push` if needed) ===
 # my-gitlab.example.com   # git-push

@@ -34,8 +34,8 @@ services:
       # whatever model the request asked for (passthrough).
       DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-}
       # Optional OpenAI-format upstream for native-tools models (see .env.example).
-      # Container mode reaches it on /chat/completions; its host must be in the
-      # firewall allowlist.
+      # opencode reaches it through the proxy's /v1/responses route; the
+      # firewall allows its host from this env (no allowlist entry needed).
       OAI_API_URL: ${OAI_API_URL:-}
       OAI_API_KEY: ${OAI_API_KEY:-}
       OAI_MODELS: ${OAI_MODELS:-}
@@ -48,8 +48,8 @@ services:
       # (state/.harness-runtime.yml) for a single launch, exactly like
       # --prompt-mode. These three are inert on a normal launch, so an install
       # that never uses the backend is unaffected by their presence. The
-      # firewall init-script also reads CHATGPT_BASE_URL to enforce the
-      # allowlist guardrail against the right host.
+      # firewall init-script also reads CHATGPT_BASE_URL to allow that host
+      # under the chatgpt backend.
       CHATGPT_BASE_URL: ${CHATGPT_BASE_URL:-}
       CHATGPT_MODEL_NAME: ${CHATGPT_MODEL_NAME:-}
       CHATGPT_COOKIE_STRING: ${CHATGPT_COOKIE_STRING:-}

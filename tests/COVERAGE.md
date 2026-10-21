@@ -98,6 +98,11 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   migrations. Sourced via `HARNESS_SOURCE_ONLY=1`.
   T12 asserts the retired require-tool reminder variant is no longer seeded.
   Covers F152 (T1-T5), F154 (T6-T8), F155 (T9-T11), F159 (T12).
+- `tests/unit_agent_oai_test.sh` (no docker) — container-mode OAI wiring
+  (`agent_common_env` passes `OAI_MODELS` names and the oai overlay; the
+  entrypoint's `ensure_opencode_config` writes the `harness-oai` provider) and
+  the firewall's upstream auto-allow (section 1b, extracted). Covers A035,
+  N018 (with firewall_test Phase 2), N031.
 - `tests/unit_host_test.sh` (no docker) — containerless `harness host`
   helpers, sourced via `HARNESS_SOURCE_ONLY=1`: `host_require_config`,
   `host_confirm_gate`, `host_preflight`, `host_write_opencode_config` (JSON shape +
@@ -315,7 +320,7 @@ non-green rows — the gap.
 | F103 | green  | tests/harness_test.sh:587-591               | T9 `[agents]` block (none-running case asserted). | |
 | F104 | green  | tests/harness_test.sh:1041-1067             | T20: `harness preflight` errors if `.env` missing AND mentions missing command(s). | |
 | F105 | green  | tests/harness_test.sh:1071-1095             | T21: synthetic `.env` with empty `PROXY_API_URL` -> preflight fails with `'PROXY_API_URL'` keyword. | |
-| F106 | green  | tests/harness_test.sh:1100-1118             | T22 sets PROXY_API_URL hostname not in allowlist; preflight errors with hostname + allowlist keyword. | |
+| F106 | green  | tests/harness_test.sh (T22)                 | T22: an unallowlisted `PROXY_API_URL` host gets the ✓ hostname line; a scheme-less URL makes preflight exit non-zero with "no parseable hostname". | |
 | F107 | green  | tests/harness_test.sh:1100-1118             | Inverse: when the host IS allowed, T22 ends with `[[ $rc -eq 0 ]]`. | |
 | F108 | green  | tests/harness_test.sh:1041-1095             | T20/T21 both assert non-zero rc + a final summary line such as `1 failure`. | |
 | F109 | green  | tests/mcp_test.sh:196-217                   | T1: plain `harness mcp` (no sub) prints usage with subcommand list. | |
@@ -461,7 +466,7 @@ non-green rows — the gap.
 | P098 | green  | proxy/test_proxy.py (TestRequireToolMode) | test_there_is_one_reminder_file asserts `_reminder_template_path` has basename `reminder.md` with `_REQUIRE_TOOL_ENABLED` both False and True; test_the_shipped_reminder_teaches_finish asserts the tracked `proxy/reminder.md` contains the closer phrase "a ```json call to `finish`"; test_the_prompt_block_appears_only_when_the_mode_is_on covers the `<<<BEGIN_REQUIRE_TOOL>>>` scaffold block. The rendered closer wording is asserted by test_reminder_closes_with_the_end_of_turn_check (see P059). | |
 | P099 | green  | proxy/test_proxy.py (TestSinglePromptMode) | `PROXY_PROMPT_MODE=single`: one user-role message; layout `[request <12 hex>]` line, then `<instructions>` (hybrid message 0: AGENT_INSTRUCTIONS + tool block) < `<conversation>` (`<turn n role=user/assistant/tool>`, ```json call kept, TOOL_RESULT kept) < `<current_turn>` (USER_REQUEST recency block), no sys→user stub; every hybrid message body appears verbatim in the fold; hybrid output unchanged (multi-message with stub); request id differs per call; first turn has no `<conversation>`; tool-result current turn; oldest-first trim under a patched `_SINGLE_MAX_CHARS` keeps instructions + live ask and notes the omitted count; no trim under the cap; `_setup_prompt_mode` accepts `single` and `PROXY_SINGLE_MAX_CHARS` (bad value keeps 600000); require-tool stays on. | Only a real upstream run shows whether the fold helps; that is `harness benchmark --test-modes`. |
 
-## A — Agent runtime (init, configs, run-opencode/shell) (24 IDs)
+## A — Agent runtime (init, configs, run-opencode/shell) (25 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -489,6 +494,7 @@ non-green rows — the gap.
 | A032 | red    | —                                           | —                                                                                                     | No test exercises `harness shell` (interactive). |
 | A033 | green  | tests/full_pipeline_test.sh + harness_test.sh T30 | T9 (bare `harness` → opencode) and T10 (explicit opencode) dispatch from positional mode; harness_test T30 asserts bare/flag dispatch routes to opencode and an unknown bare word errors. | |
 | A034 | red    | —                                           | —                                                                                                     | No test invokes an unknown mode and asserts the usage error. |
+| A035 | green  | tests/unit_agent_oai_test.sh (T1-T2)        | T1: `agent_common_env` emits `OAI_MODELS=gpt-a,gpt-b` (trimmed) and not the key, and an overlay with the `harness-oai` slim header; without OAI neither. T2: the extracted `ensure_opencode_config` (curl stubbed) writes `harness-oai` with the OAI ids, `@ai-sdk/openai`, `http://proxy:8000/v1`, `reasoning: true`, output 32000, and selects `harness-oai/gpt-b`; without `OAI_MODELS` only `harness`. | That opencode in the image actually streams reasoning over `/v1/responses` is not exercised (needs a live OAI upstream). |
 
 ## M — MCP framework (33 IDs)
 
@@ -549,7 +555,7 @@ non-green rows — the gap.
 | N015 | red    | —                                           | —                                                                                                     | No test inspects rules for the ESTABLISHED,RELATED match. |
 | N016 | red    | —                                           | —                                                                                                     | No test inspects rules for the REJECT `icmp-admin-prohibited`. |
 | N017 | green  | tests/firewall_test.sh:248-258 + podman_smoke_test.sh:181-194 | Phase 3: agent OUTPUT policy STILL `-P OUTPUT DROP` even with proxy bypass. Podman smoke T3 repeats the assertion under rootless podman. | |
-| N018 | green  | tests/firewall_test.sh:66-155               | Phase 2: when `PROXY_API_URL` hostname is `blocked.example.com` and not on allowlist, proxy logs `'PROXY_API_URL hostname.*not in'` + container is unhealthy. | |
+| N018 | green  | tests/firewall_test.sh (Phase 2) + tests/unit_agent_oai_test.sh (T3) | Phase 2: with `PROXY_API_URL` and `OAI_API_URL` hosts absent from the allowlist, the proxy firewall logs `allowed <host> (from <VAR>)` for both and reaches `init complete`. T3: the extracted section 1b yields the vendor + OAI hosts, only `CHATGPT_BASE_URL`'s under the chatgpt backend, skips `mockupstream`, and keeps an IPv4 host. | |
 | N019 | red    | —                                           | —                                                                                                     | No test forces the in-script verification probe that example.com is blocked (only the outer firewall test verifies block, not the internal probe message). |
 | N020 | red    | —                                           | —                                                                                                     | No test forces the positive verification probe (`api.github.com / pypi.org / registry.npmjs.org`) to be checked explicitly. |
 | N021 | red    | —                                           | —                                                                                                     | No test forces both probes to fail and asserts the script errors. |
@@ -562,7 +568,7 @@ non-green rows — the gap.
 | N028 | red    | —                                           | —                                                                                                     | No test verifies atomic-write semantics for `netlib_add_host`. |
 | N029 | green  | tests/harness_test.sh:680-686               | T11: existing pull entry upgraded by `net allow --push <host>` -> line rewritten with `# git-push`. (This is the upgrade case M075/M029.) | |
 | N030 | green  | tests/harness_test.sh:721-726               | T11: `harness net deny <host>` removes the line including annotations. | |
-| N031 | red    | —                                           | —                                                                                                     | No test sets a scheme-less upstream URL (e.g. `PROXY_API_URL=api.example.com/v1`) and asserts `init-firewall.sh` exits 1 with the "could not parse a hostname" FATAL. `tests/firewall_test.sh` Phase 2 only covers the *parsed-but-not-allowlisted* host (N018); it never drives the empty-`api_host` branch. Verified by reading `firewall/init-firewall.sh` and grepping the whole `tests/` tree — this is genuinely uncovered, not merely CI-only. |
+| N031 | green  | tests/unit_agent_oai_test.sh (T3)           | The extracted section 1b with `OAI_API_URL=oai.example/v1` exits non-zero and prints "could not parse a hostname out of OAI_API_URL". | Not driven in a real container. |
 
 ## U — Upgrade actions library (33 IDs)
 
@@ -752,7 +758,7 @@ non-green rows — the gap.
 | C017 | green  | tests/unit_chatgpt_test.sh (T10)            | Matching-backend cases (`openai`/`openai` and `chatgpt`/`chatgpt`) both leave `$START_LOG` empty — `[[ ! -s "$START_LOG" ]]`. | |
 | C018 | green  | tests/unit_chatgpt_test.sh (T11)            | `_config_is_secret CHATGPT_COOKIE_STRING` succeeds; `_config_get` output matches `'set,'` and does NOT contain the raw cookie value `abcdefghijklmnop`. | |
 | C019 | green  | tests/unit_chatgpt_test.sh (T11)            | `_config_editable_keys \| grep -q '^CHATGPT_BASE_URL\|'` (and the same for `CHATGPT_MODEL_NAME`/`CHATGPT_COOKIE_STRING`). | |
-| C020 | green  | tests/unit_chatgpt_test.sh (T12)            | `_config_set CHATGPT_BASE_URL "https://chat.newhost.example:8443"` then `_config_read_key` round-trips the URL AND `grep -q '^chat.newhost.example' "$ALLOWLIST"`. | |
+| C020 | green  | tests/unit_chatgpt_test.sh (T12)            | `_config_set CHATGPT_BASE_URL "https://chat.newhost.example:8443"` then `_config_read_key` round-trips the URL and the allowlist stays empty. | |
 | C021 | green  | tests/unit_chatgpt_test.sh (T13)            | `cmd_chatgpt --help` output matches `'harness chatgpt host'` and `'CHATGPT_COOKIE_STRING'`; `[[ -z "$backend_override" ]]` afterward confirms no side effect. | |
 | C022 | green  | tests/unit_chatgpt_test.sh (T14)            | `cmd_chatgpt --yolo` (stubbed `run_agent`) logs `run_agent:opencode --yolo`; asserts `backend_override == "chatgpt"` and `agent_model == "gpt-5.6-terra"`. | |
 | C023 | green  | tests/unit_chatgpt_test.sh (T14)            | `cmd_chatgpt host -p 'hi'` (stubbed `cmd_host`) logs `cmd_host:-p hi`; asserts `backend_override == "chatgpt"`. | |
@@ -944,14 +950,9 @@ See Track C audit.
   429/5xx behaviors.
 - Network-related N-row items (N002-N011, N015-N016, N019-N028) are mostly red because
   no test reads back actual iptables/ipset state from a clean firewall run. The two
-  branches we DO cover are bypass (N001, N017) and a focused negative (N018). Adding a
-  Phase-1-positive test (rules-present after a clean firewall init) would lift ~12 items.
-- N031 (scheme-less upstream URL is FATAL in `init-firewall.sh`) is red and was
-  verified as genuinely uncovered, not merely container-gated: `tests/firewall_test.sh`
-  Phase 2 drives only the *parsed-but-not-allowlisted* host (N018), and nothing in
-  `tests/` sets an upstream URL with no scheme. The cheapest fix is a Phase-2b case
-  that starts the stack with `PROXY_API_URL=api.example.com/v1` and asserts the
-  container logs the "could not parse a hostname" FATAL and exits 1.
+  branches we DO cover are bypass (N001, N017), the upstream auto-allow (N018) and
+  the scheme-less FATAL (N031, docker-free). Adding a Phase-1-positive test
+  (rules-present after a clean firewall init) would lift ~12 items.
 - F-row coverage gaps cluster in `net open`/`net close`/`unlock`/`pick_agent`/`shell`
   surfaces (F045, F057-F061, F081-F092). These are all interactive paths or paths
   requiring 401-mocked upstream that the existing harness can't exercise without

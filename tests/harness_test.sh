@@ -97,10 +97,9 @@ PROXY_TIMEOUT=30
 MODEL_CONTEXT_LENGTH=200000
 EOF
 
-# Firewall allowlist for the test stack. placeholder.invalid is included so
-# init-firewall.sh's PROXY_API_URL guardrail accepts it (the host won't
-# resolve, which the firewall logs WARN about, but the guardrail's allowlist-
-# membership check is satisfied).
+# Firewall allowlist for the test stack. placeholder.invalid is listed for
+# clarity only: init-firewall.sh allows the PROXY_API_URL host from the env
+# anyway (it won't resolve, which the firewall logs WARN about).
 cat >"${TEST_ROOT}/.harness-allowlist" <<'EOF'
 github.com
 api.github.com
@@ -1518,29 +1517,34 @@ if ! grep -q '✗' <<<"${pf_miss_out}"; then
 fi
 echo "[harness-test] T21 OK"
 
-# --- Test 22: harness preflight catches allowlist hostname mismatch --------
+# --- Test 22: preflight accepts an unallowlisted upstream, rejects no host -
 #
-# Edit .env so PROXY_API_URL points at a host that's not in the allowlist.
-# Preflight should report the mismatch and suggest `harness net allow`.
+# The proxy's firewall allows the upstream host straight from .env, so a
+# PROXY_API_URL host missing from the allowlist is fine; a URL with no
+# parseable host (no scheme) is what makes the firewall refuse to start.
 
-echo "[harness-test] T22: harness preflight detects allowlist mismatch"
+echo "[harness-test] T22: harness preflight upstream hostname check"
 cp "${TEST_ROOT}/.env" "${TEST_ROOT}/.env.stash22"
 sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=https://not-in-allowlist.example.org/v1|' "${TEST_ROOT}/.env"
+set +e
+pf_mm_out=$("${HARNESS_BIN}" preflight 2>&1)
+set -e
+if ! grep -q "✓ PROXY_API_URL hostname 'not-in-allowlist.example.org'" <<<"${pf_mm_out}"; then
+    echo "[harness-test] T22 FAIL: preflight didn't accept the unallowlisted upstream host" >&2
+    echo "${pf_mm_out}" >&2; mv "${TEST_ROOT}/.env.stash22" "${TEST_ROOT}/.env"; exit 1
+fi
+sed -i 's|^PROXY_API_URL=.*|PROXY_API_URL=not-a-url.example.org/v1|' "${TEST_ROOT}/.env"
 set +e
 pf_mm_out=$("${HARNESS_BIN}" preflight 2>&1)
 pf_mm_rc=$?
 set -e
 mv "${TEST_ROOT}/.env.stash22" "${TEST_ROOT}/.env"
 if (( pf_mm_rc == 0 )); then
-    echo "[harness-test] T22 FAIL: preflight unexpectedly passed with bad hostname" >&2
+    echo "[harness-test] T22 FAIL: preflight unexpectedly passed with a scheme-less URL" >&2
     echo "${pf_mm_out}" >&2; exit 1
 fi
-if ! grep -q 'not-in-allowlist.example.org' <<<"${pf_mm_out}"; then
-    echo "[harness-test] T22 FAIL: preflight didn't flag the bad hostname" >&2
-    echo "${pf_mm_out}" >&2; exit 1
-fi
-if ! grep -q 'harness net allow' <<<"${pf_mm_out}"; then
-    echo "[harness-test] T22 FAIL: preflight didn't suggest 'net allow' fix" >&2
+if ! grep -q 'no parseable hostname' <<<"${pf_mm_out}"; then
+    echo "[harness-test] T22 FAIL: preflight didn't flag the scheme-less URL" >&2
     echo "${pf_mm_out}" >&2; exit 1
 fi
 echo "[harness-test] T22 OK"
