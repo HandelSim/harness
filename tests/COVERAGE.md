@@ -101,7 +101,7 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 - `tests/unit_agent_oai_test.sh` (no docker) — container-mode OAI wiring
   (`agent_common_env` passes `OAI_MODELS` names and the oai overlay; the
   entrypoint's `ensure_opencode_config` writes the `harness-oai` provider) and
-  the firewall's upstream auto-allow (section 1b, extracted). Covers A035,
+  the firewall's upstream auto-allow (section 1b, extracted). Covers A037,
   N018 (with firewall_test Phase 2), N031.
 - `tests/unit_host_test.sh` (no docker) — containerless `harness host`
   helpers, sourced via `HARNESS_SOURCE_ONLY=1`: `host_require_config`,
@@ -466,7 +466,7 @@ non-green rows — the gap.
 | P098 | green  | proxy/test_proxy.py (TestRequireToolMode) | test_there_is_one_reminder_file asserts `_reminder_template_path` has basename `reminder.md` with `_REQUIRE_TOOL_ENABLED` both False and True; test_the_shipped_reminder_teaches_finish asserts the tracked `proxy/reminder.md` contains the closer phrase "a ```json call to `finish`"; test_the_prompt_block_appears_only_when_the_mode_is_on covers the `<<<BEGIN_REQUIRE_TOOL>>>` scaffold block. The rendered closer wording is asserted by test_reminder_closes_with_the_end_of_turn_check (see P059). | |
 | P099 | green  | proxy/test_proxy.py (TestSinglePromptMode) | `PROXY_PROMPT_MODE=single`: one user-role message; layout `[request <12 hex>]` line, then `<instructions>` (hybrid message 0: AGENT_INSTRUCTIONS + tool block) < `<conversation>` (`<turn n role=user/assistant/tool>`, ```json call kept, TOOL_RESULT kept) < `<current_turn>` (USER_REQUEST recency block), no sys→user stub; every hybrid message body appears verbatim in the fold; hybrid output unchanged (multi-message with stub); request id differs per call; first turn has no `<conversation>`; tool-result current turn; oldest-first trim under a patched `_SINGLE_MAX_CHARS` keeps instructions + live ask and notes the omitted count; no trim under the cap; `_setup_prompt_mode` accepts `single` and `PROXY_SINGLE_MAX_CHARS` (bad value keeps 600000); require-tool stays on. | Only a real upstream run shows whether the fold helps; that is `harness benchmark --test-modes`. |
 
-## A — Agent runtime (init, configs, run-opencode/shell) (25 IDs)
+## A — Agent runtime (init, configs, run-opencode/shell) (26 IDs)
 
 | ID   | Status | Test file & line                            | Evidence                                                                                              | Gap (yellow/red) |
 |------|--------|---------------------------------------------|-------------------------------------------------------------------------------------------------------|------------------|
@@ -494,7 +494,8 @@ non-green rows — the gap.
 | A032 | red    | —                                           | —                                                                                                     | No test exercises `harness shell` (interactive). |
 | A033 | green  | tests/full_pipeline_test.sh + harness_test.sh T30 | T9 (bare `harness` → opencode) and T10 (explicit opencode) dispatch from positional mode; harness_test T30 asserts bare/flag dispatch routes to opencode and an unknown bare word errors. | |
 | A034 | red    | —                                           | —                                                                                                     | No test invokes an unknown mode and asserts the usage error. |
-| A035 | green  | tests/unit_agent_oai_test.sh (T1-T2)        | T1: `agent_common_env` emits `OAI_MODELS=gpt-a,gpt-b` (trimmed) and not the key, and an overlay with the `harness-oai` slim header; without OAI neither. T2: the extracted `ensure_opencode_config` (curl stubbed) writes `harness-oai` with the OAI ids, `@ai-sdk/openai`, `http://proxy:8000/v1`, `reasoning: true`, output 32000, and selects `harness-oai/gpt-b`; without `OAI_MODELS` only `harness`. | That opencode in the image actually streams reasoning over `/v1/responses` is not exercised (needs a live OAI upstream). |
+| A037 | green  | tests/unit_agent_oai_test.sh (T1-T2)        | T1: `agent_common_env` emits `OAI_MODELS=gpt-a,gpt-b` (trimmed) and not the key, and an overlay with the `harness-oai` slim header; without OAI neither. T2: the extracted `ensure_opencode_config` (curl stubbed) writes `harness-oai` with the OAI ids, `@ai-sdk/openai`, `http://proxy:8000/v1`, `reasoning: true`, output 32000, and selects `harness-oai/gpt-b`; without `OAI_MODELS` only `harness`. | That opencode in the image actually streams reasoning over `/v1/responses` is not exercised (needs a live OAI upstream). |
+| A038 | green  | tests/unit_host_test.sh:T5c; tests/unit_agent_oai_test.sh:T2 | T5c asserts the host config's `harness` model carries `attachment: true` and the text+image modalities; T2 asserts the container config's `harness` and `harness-oai` models carry the same input modalities. The proxy side (images reach the upstream on the native route; text-only routes leave a note) is in proxy/test_proxy.py `TestNativeToolPassthrough`/`TestListContentFlattening`. | A live upstream vision request is not exercised. |
 
 ## M — MCP framework (33 IDs)
 

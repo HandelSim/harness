@@ -3408,11 +3408,23 @@ def _extract_tool_details(
     return details
 
 
+# What an image becomes on the text-only routes (cooperative prompt modes and
+# the chatgpt backend), so the model can tell the user rather than answer as
+# if it had seen it. The native route sends images upstream as they came.
+_IMAGE_BLOCK_TYPES = ("image_url", "input_image", "image")
+_IMAGE_DROPPED_NOTE = (
+    "[harness: an image was attached here, but this model runs on the proxy's text-only "
+    "route (a cooperative prompt mode or the chatgpt backend), so the image was not sent. "
+    "Tell the user to use a native tool model (-withtools) to send images.]"
+)
+
+
 def _flatten_content_to_str(content):
     """Flatten a message's `content` to a plain string. Some clients send
     content as a list of content-blocks (each a dict carrying a `text` field,
-    or a bare string); their text is joined with blank-line separators. A
-    string passes through unchanged; any other type is coerced via str().
+    or a bare string); their text is joined with blank-line separators, and
+    an image block becomes `_IMAGE_DROPPED_NOTE`. A string passes through
+    unchanged; any other type is coerced via str().
     Shared by the sys→user post-pass and the hybrid AGENT_INSTRUCTIONS /
     USER_MESSAGE wraps so all three handle list-valued content identically.
     """
@@ -3425,6 +3437,8 @@ def _flatten_content_to_str(content):
                 text = block.get("text", "")
                 if text:
                     parts.append(text)
+                elif block.get("type") in _IMAGE_BLOCK_TYPES:
+                    parts.append(_IMAGE_DROPPED_NOTE)
             elif isinstance(block, str):
                 parts.append(block)
         return "\n\n".join(parts)

@@ -321,7 +321,8 @@ Rows are intended to be atomic: one behavior, one row. Compound behaviors are sp
 | A032 | `run_shell` execs `bash -l` so login dotfiles run |
 | A033 | Entry dispatch chooses opencode/shell based on the first positional arg (default opencode) |
 | A034 | Unknown mode in dispatch errors with usage |
-| A035 | With `OAI_MODELS` passed (names only; `agent_common_env` never passes `OAI_API_KEY`), `ensure_opencode_config` puts those ids on a `harness-oai` provider (`@ai-sdk/openai`, the proxy's `/v1` baseURL, `reasoning: true`, output 32000), keeps the rest on `harness`, and selects `harness-oai/<id>` for an OAI default; the container overlay carries the slim header for `harness-oai` too |
+| A037 | With `OAI_MODELS` passed (names only; `agent_common_env` never passes `OAI_API_KEY`), `ensure_opencode_config` puts those ids on a `harness-oai` provider (`@ai-sdk/openai`, the proxy's `/v1` baseURL, `reasoning: true`, output 32000), keeps the rest on `harness`, and selects `harness-oai/<id>` for an OAI default; the container overlay carries the slim header for `harness-oai` too |
+| A038 | Every opencode model entry (host `opencode_models_jq` and the container `ensure_opencode_config`, on `harness` and `harness-oai`) declares `attachment: true` and `modalities: {input: ["text","image"], output: ["text"]}`, so opencode sends images instead of replacing them with its "model does not support image input" error |
 
 ---
 

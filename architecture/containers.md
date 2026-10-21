@@ -112,7 +112,10 @@ After the drop, still in the entrypoint:
   every token at 1, so opencode's "$" reads millions of tokens. `cache_read` and
   `cache_write` are set to the input price because opencode subtracts
   cached tokens from input and would otherwise show them free (the same jq
-  program as `opencode_models_jq` in the harness script);
+  program as `opencode_models_jq` in the harness script); each model also
+  declares `attachment: true` and `modalities` input text + image, because
+  opencode treats a model it does not know as text only and replaces every
+  pasted or read image with an error text before sending;
   `compaction.prune` is on; no agent gets a `steps` cap (hard tasks may run
   long). Built with `jq` and
   re-written every launch because the model set may have changed. Falls back

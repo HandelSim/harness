@@ -137,6 +137,11 @@ jq -e '.provider.harness.models["test-model"].cost
        == {input: 1, output: 1, cache_read: 1, cache_write: 1}' "$cfg" >/dev/null 2>&1 \
     || fail "T5c: every token should be priced at 1 — $(cat "$cfg")"
 ok "T5c: cost readout counts tokens, cached input not free"
+# opencode treats a model it does not know as text only and swaps images out.
+jq -e '.provider.harness.models["test-model"].modalities == {input: ["text", "image"], output: ["text"]}
+       and .provider.harness.models["test-model"].attachment == true' "$cfg" >/dev/null 2>&1 \
+    || fail "T5c: models must declare image input — $(cat "$cfg")"
+ok "T5c: models declare image input, so opencode sends images"
 
 # --- T5e: an OAI upstream gets its own Responses-API provider ---------------
 # OAI_MODELS go on `harness-oai` (@ai-sdk/openai, same loopback baseURL), not

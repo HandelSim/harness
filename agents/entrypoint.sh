@@ -194,9 +194,11 @@ ensure_opencode_config() {
     # Every token costs 1, so opencode's "$" readout is millions of tokens,
     # the unit of a token allowance (cached prompt tokens included; opencode
     # would count them free). Same program as opencode_models_jq in the
-    # harness script (host mode).
+    # harness script (host mode). The modalities let images through (opencode
+    # treats a model it does not know as text only).
     local models_prog='map({key: ., value: {name: ., limit: {context: $ctx, output: 8192},
-             cost: {input: 1, output: 1, cache_read: 1, cache_write: 1}}})
+             cost: {input: 1, output: 1, cache_read: 1, cache_write: 1},
+             attachment: true, modalities: {input: ["text", "image"], output: ["text"]}}})
          | from_entries'
     local models_json='{}' oai_json='{}'
     if (( ${#model_ids[@]} > 0 )); then

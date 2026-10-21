@@ -4423,11 +4423,15 @@ host_usage_ledger()    { printf '%s/output/usage.jsonl' "$state_root"; }
 # The same jq program agents/entrypoint.sh runs inline (keep both in step):
 # model ids -> opencode provider.models. Every token costs 1, so opencode's
 # "$" readout is millions of tokens, the unit of a token allowance (cached
-# prompt tokens included; opencode would count them free).
+# prompt tokens included; opencode would count them free). The modalities
+# let images through: opencode defaults a model it does not know (none of
+# ours are in models.dev) to text only and swaps every pasted or read image
+# for an error text before the request is sent.
 opencode_models_jq() {
     cat <<'JQ'
 map({key: ., value: {name: ., limit: {context: $ctx, output: 8192},
-    cost: {input: 1, output: 1, cache_read: 1, cache_write: 1}}})
+    cost: {input: 1, output: 1, cache_read: 1, cache_write: 1},
+    attachment: true, modalities: {input: ["text", "image"], output: ["text"]}}})
 | from_entries
 JQ
 }

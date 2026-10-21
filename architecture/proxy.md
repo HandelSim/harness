@@ -56,7 +56,10 @@ SDK surfaces to opencode) via `_client_error`, plus a debug dump under
 string or as a list of content-blocks (multimodal user turns, or an
 SDK structuring an assistant turn as `parts`). `_flatten_content_to_str`
 collapses either shape to a string — block `text` fields joined with
-blank lines, non-text blocks (e.g. `image_url`) dropped — and
+blank lines, an image block (`image_url`, `input_image`, `image`) replaced
+by `_IMAGE_DROPPED_NOTE` (the image cannot go upstream on this route; the
+note tells the model so it can tell the user), other non-text blocks
+dropped — and
 `translate_history_and_apply_prompt` calls it on every inbound message
 before the role branches run, so the `.strip()`, `+=`, and
 token-estimate `join` paths never see a list. (A raw list previously
@@ -72,7 +75,9 @@ verbatim (only `model` filled in) and relays the upstream reply unchanged:
 SSE byte-for-byte when `stream: true` (upstream called with `stream=True`),
 else the JSON body. opencode's `tools`, `tool_choice`, assistant
 `tool_calls` and `role:"tool"` results all reach the upstream as sent (a
-thought signature opencode dropped is put back; see below). None of the cooperative machinery
+thought signature opencode dropped is put back; see below), and so do image
+parts (`image_url`; opencode puts an image the `read` tool returns in a user
+message after the tool result), slim or not. None of the cooperative machinery
 runs: no prompt injection, system→user rewrite, history translation,
 require-tool, tool-search, malformed-call retry, empty-response rescue or
 local token estimate (upstream `usage` is passed through). A stream that

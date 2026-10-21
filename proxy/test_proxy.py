@@ -655,13 +655,18 @@ class TestListContentFlattening(unittest.TestCase):
         self.assertEqual(proxy._flatten_content_to_str(["a", "b"]), "a\n\nb")
 
     def test_flatten_skips_blocks_without_text(self):
-        # Non-text blocks (e.g. image_url) carry no `text`; they drop out
-        # rather than crashing or emitting "None".
+        # Other blocks without `text` drop out rather than crashing or
+        # emitting "None".
+        blocks = [{"type": "text", "text": "caption"}, {"type": "file", "file": {"file_data": "data:..."}}]
+        self.assertEqual(proxy._flatten_content_to_str(blocks), "caption")
+
+    def test_flatten_marks_a_dropped_image(self):
+        # The text-only routes cannot send an image; the model is told so.
         blocks = [
             {"type": "text", "text": "caption"},
             {"type": "image_url", "image_url": {"url": "data:..."}},
         ]
-        self.assertEqual(proxy._flatten_content_to_str(blocks), "caption")
+        self.assertEqual(proxy._flatten_content_to_str(blocks), "caption\n\n" + proxy._IMAGE_DROPPED_NOTE)
 
     def test_flatten_coerces_other_types_via_str(self):
         self.assertEqual(proxy._flatten_content_to_str(42), "42")
@@ -5772,6 +5777,25 @@ class TestNativeToolPassthrough(unittest.TestCase):
         sent = mock_post.call_args.kwargs["json"]
         self.assertEqual(sent, body)
         self.assertFalse(mock_post.call_args.kwargs["stream"])
+
+    def test_images_reach_the_upstream(self):
+        # opencode's shapes: a pasted image in the user turn, and a `read` of
+        # an image file moved into a user message after the tool result.
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+        msgs = [
+            {"role": "user", "content": [{"type": "text", "text": "what is this?"}, image]},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "Image read successfully"},
+            {"role": "user", "content": [{"type": "text", "text": "Attached media from tool result:"}, image]},
+        ]
+        body = {"model": "gemini-x-withtools", "messages": msgs, "tools": self.TOOLS}
+        upstream = {"choices": [{"message": {"role": "assistant", "content": "a cat"}, "finish_reason": "stop"}]}
+        for slim in (False, True):
+            _, _, mock_post = self._post(body, self.FakeResp(200, json.dumps(upstream)), slim=slim)
+            sent = mock_post.call_args.kwargs["json"]["messages"]
+            self.assertEqual(sent[0], msgs[0])
+            self.assertEqual(sent[3]["content"][:2], msgs[3]["content"], f"slim={slim}")
 
     def test_native_tool_calls_relayed_unchanged(self):
         upstream = {"choices": [{"finish_reason": "tool_calls", "message": {

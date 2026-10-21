@@ -727,7 +727,9 @@ What it does, in order:
    lets the benchmark run its own proxy beside a user's). With
    `HARNESS_HOST_NO_WEB=1` the yolo agent's `webfetch`/`websearch` become
    `deny` and the config gains `share: "disabled"`; unset, the config is
-   byte-identical to before (no `share` key). With an OAI upstream the
+   byte-identical to before (no `share` key). Every model declares image
+   input (`attachment`, `modalities`; see [`containers.md`](containers.md)),
+   so opencode sends images. With an OAI upstream the
    `OAI_MODELS` ids move to a second provider, `harness-oai` (npm
    `@ai-sdk/openai`, same loopback baseURL and dummy key, `reasoning: true`,
    output 32000), because that package speaks the Responses API

@@ -10,7 +10,8 @@
 #   - agents/entrypoint.sh ensure_opencode_config (extracted, curl stubbed)
 #     puts OAI_MODELS on the harness-oai provider (@ai-sdk/openai, the proxy's
 #     /v1 baseURL), keeps the rest on harness, and selects harness-oai/<id>
-#     for an OAI default; with no OAI_MODELS it writes harness alone
+#     for an OAI default; with no OAI_MODELS it writes harness alone; every
+#     model declares image input
 #   - firewall/init-firewall.sh section 1b (extracted) adds the hosts of
 #     PROXY_API_URL and OAI_API_URL, or CHATGPT_BASE_URL alone under
 #     PROXY_BACKEND=chatgpt, skips intra-cluster names, and aborts on a
@@ -85,6 +86,8 @@ jq -e '(.provider.harness.models | keys) == ["vendor-m"]
        and (.provider["harness-oai"].models | keys) == ["gpt-a", "gpt-b"]
        and .provider["harness-oai"].models["gpt-a"].reasoning == true
        and .provider["harness-oai"].models["gpt-a"].limit == {context: 100000, output: 32000}
+       and .provider.harness.models["vendor-m"].modalities.input == ["text", "image"]
+       and .provider["harness-oai"].models["gpt-a"].modalities.input == ["text", "image"]
        and .model == "harness-oai/gpt-b" and .small_model == "harness-oai/gpt-b"' "$cfg" >/dev/null 2>&1 \
     || fail "T2: vendor + OAI config has the wrong shape — $(cat "$cfg")"
 run_entry vendor-m "" || fail "T2: ensure_opencode_config returned non-zero"
