@@ -18,6 +18,9 @@
 #
 # Prints "AGENT OAI TEST PASSED" on success.
 
+# The variables this test sets are read by the sourced and extracted functions.
+# shellcheck disable=SC2034
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
