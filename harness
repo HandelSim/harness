@@ -5608,24 +5608,27 @@ vault_opencode_config() {
 
 # After an interactive session: copy its conversations into the vault
 # (scripts/vault_capture.py writes .raw/sessions/<date>-<session>.md from
-# opencode's database <db>, for top-level sessions updated since <since_ms>),
+# opencode's database <db>, for top-level sessions started in <project> and
+# updated since <since_ms>; the database is shared with every other project),
 # then commit everything the session changed in the vault and push it when the
 # vault has an upstream, rebasing once if the push is rejected. The agent never
 # has to remember to save or commit. Best effort: every failure is a warning
 # and the launch's exit status is unchanged.
 vault_sync() {
-    local dir="$1" since_ms="$2" db="$3" py script
+    local dir="$1" since_ms="$2" db="$3" project="$4" py script
     [[ -n "$dir" && -d "$dir/.git" ]] || return 0
     script="$clone_dir/scripts/vault_capture.py"
     if [[ -f "$db" && -f "$script" ]] && py=$(host_python_bin); then
         if command -v cygpath >/dev/null 2>&1; then
             script=$(cygpath -m "$script"); db=$(cygpath -m "$db")
             local wdir; wdir=$(cygpath -m "$dir")
+            # A container's /c/... path stays as it is; a host one becomes C:/...
+            [[ "$project" == /[a-zA-Z]/* ]] || project=$(cygpath -m "$project")
             # shellcheck disable=SC2086  # $py can be 'py -3'
-            $py "$script" "$db" "$wdir" "$since_ms" >/dev/null || true
+            $py "$script" "$db" "$wdir" "$since_ms" "$project" >/dev/null || true
         else
             # shellcheck disable=SC2086
-            $py "$script" "$db" "$dir" "$since_ms" >/dev/null || true
+            $py "$script" "$db" "$dir" "$since_ms" "$project" >/dev/null || true
         fi
     fi
     git -C "$dir" add -A >/dev/null 2>&1 || { err "vault: git add failed in $dir"; return 0; }
@@ -6006,7 +6009,7 @@ host_run_opencode() {
     host_reset_terminal
     host_proxy_stop
     vault_sync "${harness_vault_dir:-}" "$launch_ms" \
-        "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
+        "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}" "$PWD"
     return "$rc"
 }
 
@@ -6958,7 +6961,8 @@ run_agent_interactive() {
     fi
     [[ -n "$_clip_file" ]] && rm -f "$_clip_file" 2>/dev/null
     _print_agent_issue_footer
-    vault_sync "${harness_vault_dir:-}" "$launch_ms" "$agent_home/.local/share/opencode/opencode.db"
+    vault_sync "${harness_vault_dir:-}" "$launch_ms" "$agent_home/.local/share/opencode/opencode.db" \
+        "$mount_path"
 
     # When this was the LAST agent for the project, tear the shared stack
     # (proxy + enabled MCPs) down too, so an exited agent never leaves the

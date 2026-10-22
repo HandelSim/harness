@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Copy the opencode conversations of one harness launch into the active vault.
 
-Usage: vault_capture.py <opencode.db> <vault dir> <since epoch ms>
+Usage: vault_capture.py <opencode.db> <vault dir> <since epoch ms> <project dir>
 
 Reads opencode's SQLite store read-only and writes one markdown file per top
-level session updated since <since> to <vault>/.raw/sessions/, named
+level session started in <project dir> (or below it) and updated since <since>
+to <vault>/.raw/sessions/, named
 <YYYY-MM-DD>-<session id>.md, so a rerun rewrites the same file. Only the
 user's and the assistant's text is kept (no tool output, no reasoning, no
 text opencode injected), with tool calls listed by name, and anything shaped
-like a key or token is redacted. Prints the files it wrote. Never fails the
+like a key or token is redacted. The database is shared by every opencode
+session of the user (or of every harness container), so the directory filter
+is what keeps other projects' conversations out of the vault. Prints the files it wrote. Never fails the
 launch: any problem is one line on stderr and exit status 0.
 """
 import datetime
 import json
 import os
+import pathlib
 import re
 import sqlite3
 import sys
@@ -24,10 +28,13 @@ _SECRETS = [
     (re.compile(r"\b(sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "[redacted key]"),
     (re.compile(r"\b(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"), "[redacted token]"),
     (re.compile(r"\b(AKIA|ASIA)[A-Z0-9]{16}\b"), "[redacted key]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}"), "[redacted key]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted token]"),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "[redacted token]"),
     (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{16,}"), r"\1 [redacted]"),
-    (re.compile(r"(?i)\b([A-Z0-9_]*(api_?key|secret|token|password|passwd)[A-Z0-9_]*\s*[=:]\s*)"
-                r"['\"]?[^\s'\"]{8,}"), r"\1[redacted]"),
+    # NAME=value, "name": "value", x-api-key: value; not token = get_token(x).
+    (re.compile(r"(?i)\b([A-Z0-9_-]*(api[_-]?key|secret|token|password|passwd)[A-Z0-9_-]*['\"]?\s*[=:]\s*['\"]?)"
+                r"[^\s'\"()]{8,}(?=[\s'\",;})\]]|$)"), r"\1[redacted]"),
 ]
 
 
@@ -39,6 +46,19 @@ def redact(text):
 
 def _iso(ms):
     return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _norm_dir(p):
+    """Compare paths across forms: C:\\x, C:/x, /c/x from the container, //c/x."""
+    p = str(p or "").replace("\\", "/").rstrip("/")
+    while p.startswith("//"):
+        p = p[1:]
+    return p.lower() if re.match(r"^[A-Za-z]:/", p) else p
+
+
+def _in_dir(directory, want):
+    d, w = _norm_dir(directory), _norm_dir(want)
+    return bool(w) and (d == w or d.startswith(w + "/"))
 
 
 def _yaml(s):
@@ -79,28 +99,33 @@ def render(con, sess):
         body.append(f"## {'User' if role == 'user' else 'Assistant'}\n\n{block}")
     if not any(b.startswith("## User") for b in body):
         return None
+    title = redact(title or "")
     head = ["---", "type: session", "source: harness", f"session: {sid}", f"title: {_yaml(title)}",
             f"directory: {_yaml(directory)}", f"created: {_iso(created)}", f"updated: {_iso(updated)}",
             f"tokens_input: {tin or 0}", f"tokens_output: {tout or 0}", "---", "",
             f"# {title or sid}", ""]
-    return redact("\n".join(head) + "\n\n".join(body) + "\n")
+    return "\n".join(head) + redact("\n\n".join(body)) + "\n"
 
 
 def main(argv):
-    if len(argv) != 4:
-        print("usage: vault_capture.py <opencode.db> <vault dir> <since epoch ms>", file=sys.stderr)
+    if len(argv) != 5:
+        print("usage: vault_capture.py <opencode.db> <vault dir> <since epoch ms> <project dir>",
+              file=sys.stderr)
         return 0
-    db, vault, since = argv[1], argv[2], int(argv[3])
+    db, vault, since, project = argv[1], argv[2], int(argv[3]), argv[4]
     if not os.path.isfile(db):
         return 0
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        # as_uri percent-encodes spaces and the like (a Windows profile path).
+        con = sqlite3.connect(pathlib.Path(db).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
         sessions = con.execute(
             "SELECT id, title, directory, time_created, time_updated, tokens_input, tokens_output "
             "FROM session WHERE parent_id IS NULL AND time_updated >= ? ORDER BY time_created",
             (since,)).fetchall()
         out = os.path.join(vault, ".raw", "sessions")
         for sess in sessions:
+            if not _in_dir(sess[2], project):
+                continue
             text = render(con, sess)
             if text is None:
                 continue

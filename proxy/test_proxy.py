@@ -5747,7 +5747,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
 
     def setUp(self):
         # The budget guard's state is module-wide; start every test unguarded.
-        for p in (patch.dict(proxy._BUDGET, {"left": None, "ts": 0.0, "reset": None}),
+        for p in (patch.dict(proxy._BUDGET, {"left": None, "ts": 0.0, "reset": None, "seen": 0.0}),
                   patch.dict(proxy._BUDGET_INFLIGHT, clear=True)):
             p.start()
             self.addCleanup(p.stop)
@@ -6235,6 +6235,42 @@ class TestBudgetGuard(unittest.TestCase):
                     patch.object(proxy, "_USAGE_LEDGER", ""):
                 proxy._setup_usage_ledger()
         self.assertEqual((proxy._BUDGET["left"], proxy._BUDGET["reset"]), (700, 50))
+
+    def test_estimate_released_when_the_request_fails(self):
+        with patch.object(proxy.requests, "post", side_effect=proxy.requests.ConnectionError("down")), \
+                patch.object(proxy, "save_debug_file"), \
+                patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)), \
+                patch("sys.stdout", io.StringIO()):
+            resp = proxy.app.test_client().post("/v1/chat/completions", data=json.dumps(self.BODY),
+                                                content_type="application/json")
+        self.assertEqual(resp.status_code, 502)
+        resp.close()  # what the server does once the response is sent
+        self.assertEqual(proxy._BUDGET_INFLIGHT, {})
+
+    def test_an_older_reply_only_subtracts_its_cost(self):
+        hdr = lambda left: {"x-ratelimit-remaining-credits-day": str(left)}  # noqa: E731
+        proxy._BUDGET_INFLIGHT.update(a=(100.0, 0), b=(200.0, 0))
+        proxy._budget_note("b", "gemini-x-withtools", hdr(1000), {"prompt_tokens": 100})
+        self.assertEqual(proxy._BUDGET["left"], 900)
+        # a started first, so its header was read before b was billed.
+        proxy._budget_note("a", "gemini-x-withtools", hdr(5000), {"prompt_tokens": 50})
+        self.assertEqual(proxy._BUDGET["left"], 850)
+        proxy._budget_note("c", "gemini-x-withtools", hdr(3000), {"prompt_tokens": 0})
+        self.assertEqual(proxy._BUDGET["left"], 3000)
+
+    def test_slim_estimate_prices_the_shortened_tools(self):
+        body = dict(self.BODY, tools=[{"type": "function", "function": {
+            "name": "read", "description": "d" * 6000, "parameters": {}}}])
+        proxy._budget_check("a", "gemini-x-withtools", body)
+        proxy._budget_check("b", "gemini-x-withtools", body, slim=True)
+        full, slim = proxy._BUDGET_INFLIGHT["a"][1], proxy._BUDGET_INFLIGHT["b"][1]
+        self.assertLess(slim, full - 1500)
+
+    def test_malformed_ledger_rows_are_ignored(self):
+        for row in ([], {"ts": 1, "remaining": "x"}, {"ts": 1, "budget_left": 5, "reset": "soon"}):
+            proxy._budget_seed(row)
+        self.assertIsNone(proxy._BUDGET["left"])
+        self.assertIsNone(proxy._budget_check("a", "gemini-x-withtools", self.BODY))
 
     def test_models_route_notes_weights(self):
         proxy._MODEL_INFO.clear()

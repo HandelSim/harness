@@ -58,7 +58,7 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
-from flask import Flask, Response, request
+from flask import Flask, Response, g, request
 
 # verify=False is required because the upstream uses a self-signed cert.
 # Suppress the noisy InsecureRequestWarning at module load.
@@ -1054,9 +1054,11 @@ def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, st
 # and refuses a metered request whose estimated cost, plus the requests still
 # in flight, would not fit. Free models always pass, so the user can switch
 # to one and keep working. With no remaining figure seen yet (a key that does
-# not send the header) the guard does nothing.
-_BUDGET: Dict[str, Any] = {"left": None, "ts": 0.0, "reset": None}
-_BUDGET_INFLIGHT: Dict[str, Tuple[float, int]] = {}
+# not send the header) the guard does nothing. `seen` is when the request the
+# figure came from started, so an older reply that finishes later only
+# subtracts its cost instead of putting back a higher figure.
+_BUDGET: Dict[str, Any] = {"left": None, "ts": 0.0, "reset": None, "seen": 0.0}
+_BUDGET_INFLIGHT: Dict[str, Tuple[float, int]] = {}   # req_id -> (started, estimate)
 _BUDGET_LOCK = threading.Lock()
 _BUDGET_OUT_RESERVE = 8192    # output + reasoning tokens assumed per request
 _BUDGET_IMAGE_TOKENS = 1500   # per image part (base64 is not counted as text)
@@ -1129,7 +1131,7 @@ def _budget_note(req_id: str, model: str, hdr: Dict[str, Any],
     request's in-flight estimate."""
     now = datetime.datetime.now(datetime.timezone.utc).timestamp()
     with _BUDGET_LOCK:
-        _BUDGET_INFLIGHT.pop(req_id, None)
+        started = (_BUDGET_INFLIGHT.pop(req_id, None) or (now, 0))[0]
         left = hdr.get("x-ratelimit-remaining-credits-day")
         if left is None:
             return
@@ -1137,15 +1139,35 @@ def _budget_note(req_id: str, model: str, hdr: Dict[str, Any],
             left_n = int(float(left))
         except (TypeError, ValueError):
             return
-        if isinstance(usage, dict):
-            left_n -= _usage_cost(model, usage)
+        cost = _usage_cost(model, usage) if isinstance(usage, dict) else 0
+        if _BUDGET["left"] is not None and started < _BUDGET["seen"]:
+            # Overlapping requests: this header predates the figure held.
+            _BUDGET["left"] = max(0, _BUDGET["left"] - cost)
+            return
+        left_n -= cost
         reset = reset_s
         if reset is None:
             try:
                 reset = int(float(hdr["x-ratelimit-reset-credits-day"]))
             except (KeyError, TypeError, ValueError):
                 reset = None
-        _BUDGET.update(left=max(0, left_n), ts=now, reset=reset)
+        _BUDGET.update(left=max(0, left_n), ts=now, seen=started, reset=reset)
+
+
+def _budget_release(req_id: str) -> None:
+    """Drop a request's estimate however the request ended (an error, an
+    exception, a client that hung up mid-stream); no-op once noted."""
+    with _BUDGET_LOCK:
+        _BUDGET_INFLIGHT.pop(req_id, None)
+
+
+def _budget_release_on_close(resp: Response) -> Response:
+    req_id = g.get("budget_req")
+    if req_id:
+        # Runs when the server closes the response: after the last chunk of a
+        # stream, whose generator has noted the reply by then.
+        resp.call_on_close(lambda: _budget_release(req_id))
+    return resp
 
 
 def _budget_failed(req_id: str, spent_reset_s: Optional[int]) -> None:
@@ -1154,20 +1176,24 @@ def _budget_failed(req_id: str, spent_reset_s: Optional[int]) -> None:
     with _BUDGET_LOCK:
         _BUDGET_INFLIGHT.pop(req_id, None)
         if spent_reset_s is not None:
-            _BUDGET.update(left=0, ts=datetime.datetime.now(datetime.timezone.utc).timestamp(),
-                           reset=spent_reset_s)
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            _BUDGET.update(left=0, ts=now, seen=now, reset=spent_reset_s)
 
 
 def _budget_seed(entry: Dict[str, Any]) -> None:
     """Start from the newest ledger row, so a restarted proxy still guards."""
+    if not isinstance(entry, dict):
+        return
     left = entry.get("budget_left")
-    if left is None:
-        left = (entry.get("remaining") or {}).get("credits-day")
+    if left is None and isinstance(entry.get("remaining"), dict):
+        left = entry["remaining"].get("credits-day")
     if left is None:
         return
     try:
-        _BUDGET.update(left=int(float(left)), ts=float(entry.get("ts", 0)),
-                       reset=entry.get("reset"))
+        ts = float(entry.get("ts", 0))
+        reset = entry.get("reset")
+        _BUDGET.update(left=int(float(left)), ts=ts, seen=ts,
+                       reset=int(float(reset)) if reset is not None else None)
     except (TypeError, ValueError):
         pass
 
@@ -1192,26 +1218,34 @@ def _estimate_request_tokens(body: Dict[str, Any]) -> int:
     return chars // 3 + images * _BUDGET_IMAGE_TOKENS
 
 
-def _budget_check(req_id: str, model: str, body: Dict[str, Any]) -> Optional[Response]:
-    """None to let a request through, or the refusal to send instead."""
+def _budget_check(req_id: str, model: str, body: Dict[str, Any],
+                  slim: bool = False) -> Optional[Response]:
+    """None to let a request through, or the refusal to send instead. `slim`:
+    the native path will shorten the tools and old tool output before sending,
+    so the estimate prices the shortened request."""
     if PROXY_BACKEND == "chatgpt" or _is_oai_model(model):
         return None
     _load_catalog()
-    if _is_free_model(model):
-        return None
     now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-    w_in, w_out = _model_weights(model)
-    est = _estimate_request_tokens(body) * w_in + _BUDGET_OUT_RESERVE * w_out
+    free = _is_free_model(model)
+    est = 0
+    if not free:
+        if slim:
+            body = {**body, "tools": _slim_tools(body.get("tools") or []),
+                    "messages": _trim_old_tool_outputs(body.get("messages") or [])[0]}
+        w_in, w_out = _model_weights(model)
+        est = _estimate_request_tokens(body) * w_in + _BUDGET_OUT_RESERVE * w_out
     with _BUDGET_LOCK:
         for k, (t0, _) in list(_BUDGET_INFLIGHT.items()):
             if now - t0 > PROXY_TIMEOUT + 60:
                 del _BUDGET_INFLIGHT[k]
         left, ts, reset = _BUDGET["left"], _BUDGET["ts"], _BUDGET["reset"]
-        # The figure holds until the window resets (24 h when the reset is unknown).
-        if left is None or now > ts + (reset if reset is not None else 86400):
-            return None
         pending = sum(e for _, e in _BUDGET_INFLIGHT.values())
-        if est + pending <= left:
+        # The figure holds until the window resets (24 h when the reset is
+        # unknown). Every request is registered, a free one at 0, so the
+        # order of the replies' headers is known (_budget_note).
+        if free or left is None or now > ts + (reset if reset is not None else 86400) \
+                or est + pending <= left:
             _BUDGET_INFLIGHT[req_id] = (now, est)
             return None
     free = sorted(m for m, i in _MODEL_INFO.items() if i.get("chat") and _is_free_model(m))
@@ -4826,6 +4860,7 @@ def _select_rescue_tool(
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+app.after_request(_budget_release_on_close)
 
 
 @app.route("/health", methods=["GET"])
@@ -4954,9 +4989,12 @@ def catch_all(path: str) -> Response:
         want_stream = bool(inbound_request.get("stream", False))
 
         print(f"[{req_id}] {request.method} /{path} model={model_name} messages={len(original_messages)} tools={len(tools)}", flush=True)
-        refused = _budget_check(req_id, model_name, inbound_request)
+        refused = _budget_check(
+            req_id, model_name, inbound_request,
+            slim=request.headers.get(_SLIM_HEADER, "") == "1" and _is_native_tool_model(model_name))
         if refused is not None:
             return refused
+        g.budget_req = req_id
 
         # Native tool-calling models skip the cooperative pipeline entirely.
         # OAI models are always native, on their own upstream.

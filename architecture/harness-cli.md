@@ -455,11 +455,15 @@ Saving is harness's job, not the agent's. When an interactive session ends
 `scripts/vault_capture.py` on opencode's SQLite store (host:
 `${OPENCODE_DB:-${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db}`;
 container: `state/agent/home/.local/share/opencode/opencode.db`), read-only.
-Each top-level session updated since the launch started becomes
+Each top-level session started in the launch directory (host: `$PWD`;
+container: the mount path) and updated since the launch started becomes
 `.raw/sessions/<YYYY-MM-DD>-<session id>.md` (rewritten on a rerun): front
 matter, then the user's and the assistant's text only (no tool output,
 reasoning or opencode-injected text; tool calls listed by name), with
-anything shaped like a key or token redacted (best effort). Then `git add
+anything shaped like a key or token redacted (best effort). The directory filter matters: that store is shared by every
+opencode session of the user (host) or of every harness container, and
+without it other projects' conversations would be pushed to the vault's
+remote. Then `git add
 -A`, one commit for everything the session changed in the vault, and a push
 when the branch has an upstream (no credential prompt, 30s limit; on a
 rejected push one `pull --rebase` and a second push; a conflict aborts the

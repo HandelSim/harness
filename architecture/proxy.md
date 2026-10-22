@@ -116,7 +116,12 @@ are the only changes made to the request or the reply:
   a daily 429 sets it to 0 until its reset. A metered request is refused
   with a 402 (not retried by opencode) when its estimate (`chars / 3 x W_in`
   plus 1,500 tokens per image, plus 8,192 output tokens `x W_out`) plus the
-  estimates of requests still in flight exceeds that figure. The message
+  estimates of requests still in flight exceeds that figure (under slim the
+  estimate prices the request after `_slim_tools` and the tool-output trim,
+  as sent). An estimate is released when the reply is noted, or when the
+  response closes however the request ended (`_budget_release_on_close`).
+  A reply whose request started before the one the figure came from (two
+  requests overlapping) only subtracts its cost. The message
   names the free models and when metered ones return. Free models (catalog
   `lane: assist` or `credit_weights` 0/0, else a `-assist` name or
   `gemini-enterprise`) always pass, as do OAI models and the chatgpt
@@ -125,7 +130,8 @@ are the only changes made to the request or the reply:
   2/5. The figure holds until its reset (24 h when unknown), survives a
   restart through the ledger's last line, and with no header ever seen the
   guard does nothing. It cannot see other clients spending the same key
-  between two replies.
+  between two replies. Any reply that carries the header refreshes the
+  figure, a free model's included.
 - **Old tool output trimmed** (slim only: `x-harness-slim: 1`;
   `_TOOL_OUTPUT_KEEP` = 40,000 tokens). Every native step re-bills the whole history, and most
   of it is tool output. `_trim_plan` keeps about the newest `KEEP × 3` chars
