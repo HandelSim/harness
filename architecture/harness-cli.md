@@ -868,10 +868,13 @@ two foreground children:
   before its own unset), cwd the vault (else `$HOME`), and
   `OPENCODE_SERVER_PASSWORD` from `state/serve/opencode-password` (random,
   made once by `serve_password_file`, mode 600). Without `--opencode-url`
-  the index links to it as `?auth_token=base64(opencode:<pw>)`, which
-  opencode accepts in place of Basic auth. With `--opencode-url URL` the link
-  is that URL with no token, for a reverse proxy that adds the Basic header
-  itself. The overlay sets `share: "disabled"`, so no session is uploaded to
+  the index links to it as `http://opencode:<pw>@host:N+1/`: the browser
+  answers the first 401 with those credentials and caches them for the
+  app's scripts and API calls. opencode's own `?auth_token=` covers only the
+  request that carries it, so the page's assets drew a Basic prompt (and
+  adding it to the link skips the 401, so the browser never caches the
+  login). With `--opencode-url URL` the link is that URL with no login, for
+  a reverse proxy that adds the Basic header itself. The overlay sets `share: "disabled"`, so no session is uploaded to
   opencode's share service.
 
 **Prompt modes.** `serve_opencode_config` (part of

@@ -22,7 +22,6 @@ what the page links to, which includes opencode web, a shell on this host.
 """
 
 import argparse
-import base64
 import hashlib
 import hmac
 import html
@@ -519,15 +518,14 @@ class Config:
         self.trust_forwarded_for = trust_forwarded_for
         self.cache = TTLCache()
 
-    def opencode_token(self):
+    def opencode_password(self):
         if not self.password_file:
             return ""
         try:
             with open(self.password_file) as f:
-                pw = f.read().strip()
+                return f.read().strip()
         except OSError:
             return ""
-        return base64.b64encode(f"opencode:{pw}".encode()).decode()
 
     def cookie(self, value, clear=False):
         attrs = "; Path=/; HttpOnly; SameSite=Strict"
@@ -604,10 +602,15 @@ def _services(cfg, host):
         if cfg.opencode_url:
             url, where = cfg.opencode_url, urlsplit(cfg.opencode_url).netloc
         else:
-            url, where = f"http://{host}:{cfg.opencode_port}/", f"port {cfg.opencode_port}"
-            token = cfg.opencode_token()
-            if token:
-                url += "?auth_token=" + quote(token, safe="")
+            # The login rides in the URL's userinfo, not opencode's ?auth_token=: that
+            # token covers only the HTML, so its scripts and styles draw a Basic prompt.
+            # A userinfo URL draws a 401 the browser answers itself, then caches the
+            # login for the page's later requests (adding ?auth_token= would skip that
+            # 401, so the cache stays empty).
+            pw = cfg.opencode_password()
+            login = f"opencode:{quote(pw, safe='')}@" if pw else ""
+            url = f"http://{login}{host}:{cfg.opencode_port}/"
+            where = f"port {cfg.opencode_port}"
         parts.append(f"<li><a href='{esc(url)}' rel='noreferrer'>opencode web</a>"
                      f"<span class='muted'>{esc(where)}</span></li>")
         parts.append("<li><span>Terminal: inside opencode web, open a <b>New terminal</b> tab "
@@ -959,7 +962,7 @@ def main(argv=None):
                     help="rate-limit sign-ins by the last X-Forwarded-For entry (set only "
                          "behind a reverse proxy that overwrites that header)")
     ap.add_argument("--opencode-url", type=_http_url, default="",
-                    help="link opencode web here, with no auth_token (the proxy logs in)")
+                    help="link opencode web here, with no login in the link (the proxy logs in)")
     ap.add_argument("--proxy-url", type=_http_url, default="",
                     help="model proxy base URL; the index shows GET <url>/health")
     ap.add_argument("--mode", type=_mode, action="append", default=[], metavar="NAME=DESCRIPTION",

@@ -3,7 +3,6 @@
 Run: python3 -m unittest serve/test_pub.py (tests/unit_serve_test.sh does).
 """
 
-import base64
 import http.client
 import json
 import os
@@ -80,16 +79,15 @@ class PubServerTest(LiveServer):
         self.assertIn("Old &amp; page", text)
         self.assertLess(text.index("New page"), text.index("Old &amp; page"))
         self.assertNotIn("hidden", text)
-        token = base64.b64encode(b"opencode:s3cret").decode()
-        self.assertIn(f"http://127.0.0.1:{port + 1}/?auth_token=", text)
-        self.assertIn(token.replace("=", "%3D"), text)
+        self.assertIn(f"href='http://opencode:s3cret@127.0.0.1:{port + 1}/'", text)
+        self.assertNotIn("auth_token", text)
         self.assertEqual(r.getheader("Cache-Control"), "no-store")
 
     def test_wrong_host_is_refused(self):
         port = self.start()
         r, body = self.get(port, "/", host=f"evil.example:{port}")
         self.assertEqual(r.status, 421)
-        self.assertNotIn(b"auth_token", body)
+        self.assertNotIn(b"s3cret", body)
 
     def test_allow_host_accepts_a_reverse_proxy_name(self):
         port = self.start(allow=("pub.example.test",))
@@ -238,7 +236,7 @@ class AccessGateTest(LiveServer):
         self.assertEqual(r.status, 200)
         self.assertIn(b"signed in as <b>alice</b>", body)
         self.assertIn(b"New page", body)
-        self.assertIn(b"auth_token=", body)
+        self.assertIn(b"opencode:s3cret@", body)
         self.assertIn("form-action 'self'", r.getheader("Content-Security-Policy"))
 
     def test_secure_cookie_uses_host_prefix(self):
@@ -283,7 +281,7 @@ class AccessGateTest(LiveServer):
         r, body = self.req(port, "GET", "/")
         self.assertEqual(r.status, 401)
         self.assertIn(b"name='code'", body)
-        for leak in (b"auth_token", b"New page", b"brain"):
+        for leak in (b"s3cret", b"New page", b"brain"):
             self.assertNotIn(leak, body)
         for path in ("/pub/notes/new.html", "/pub/missing.html", "/nowhere", "/?q=new"):
             r, body = self.req(port, "GET", path)
@@ -462,7 +460,7 @@ class CommandLineTest(LiveServer):
         for want in ("signed in as <b>alice</b>", "href='https://code.example.test/'", "<code>slim</code>",
                      "Usage, last 24 h", "<span class='down'>down</span>"):
             self.assertIn(want, text)
-        self.assertNotIn("auth_token", text)
+        self.assertNotIn("s3cret", text)
 
     def test_bad_flags_are_rejected(self):
         for bad in (["--opencode-url", "javascript:alert(1)"], ["--proxy-url", "ftp://x"], ["--mode", "noequals"]):
@@ -481,7 +479,7 @@ class IndexContentTest(LiveServer):
         port = self.start(opencode_url="https://code.example.test/")
         text = self.text(port)
         self.assertIn("href='https://code.example.test/'", text)
-        self.assertNotIn("auth_token", text)
+        self.assertNotIn("s3cret", text)
         self.assertIn("New terminal", text)
 
     def test_filter_and_cap(self):
