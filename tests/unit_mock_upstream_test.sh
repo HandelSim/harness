@@ -47,10 +47,13 @@ os.environ["MOCK_FIXTURES_DIR"] = os.path.join(root, "tests/fixtures/responses")
 class _App:
     def __init__(self, *a, **k): pass
     def __getattr__(self, name): return lambda *a, **k: (lambda f: f)
+class _G:  # flask.g surface proxy.py uses: attribute set/get + .get()
+    def get(self, name, default=None): return getattr(self, name, default)
 try:
     import flask  # noqa: F401
 except ImportError:
-    sys.modules["flask"] = types.SimpleNamespace(Flask=_App, Response=object, request=None)
+    sys.modules["flask"] = types.SimpleNamespace(
+        Flask=_App, Response=object, g=_G(), request=None)
 try:
     import requests  # noqa: F401
 except ImportError:
