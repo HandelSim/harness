@@ -536,7 +536,7 @@ class IndexContentTest(LiveServer):
         port = self.start(usage_ledger=ledger)
         text = self.text(port)
         self.assertIn("Usage, last 24 h", text)
-        self.assertIn("<td>132</td>", text)
+        self.assertIn("<span class='v'>132</span>", text)
         self.assertIn("credits-day 99", text)
         empty = os.path.join(self.tmp.name, "empty.jsonl")
         open(empty, "w").close()

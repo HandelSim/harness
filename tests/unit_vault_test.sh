@@ -4,6 +4,8 @@
 # helpers without docker or network: the "remote" is a local bare git repo.
 #
 #   - cmd_vault add/list/use/off/remove   registry + active-vault bookkeeping
+#   - cmd_vault new                       a new vault from vault-template/ or a
+#                                         template repo, with a fresh history
 #   - vault_prepare                       clones on first use, fast-forwards
 #                                         after, warns and keeps the local copy
 #                                         when the remote is unreachable
@@ -124,5 +126,43 @@ cmd_vault remove brain >/dev/null || fail "V6: remove failed"
 _vault_url brain >/dev/null && fail "V6: brain still registered"
 _vault_url other >/dev/null || fail "V6: remove dropped the wrong vault"
 ok "V6: use/off/remove keep the registry consistent and never delete a clone"
+
+# --- V7: new makes a vault from vault-template/ or a template repo -----------
+cmd_vault use other >/dev/null
+out=$(cmd_vault new fresh) || fail "V7: new failed — $out"
+fresh="$state_root/vaults/fresh"
+for f in AGENTS.md wiki/index.md wiki/log.md .raw/.gitkeep pub/.gitkeep .gitignore; do
+    [[ -f "$fresh/$f" ]] || fail "V7: new vault is missing $f"
+done
+[[ "$(git -C "$fresh" rev-list --count HEAD)" == "1" ]] || fail "V7: new vault should have one commit"
+[[ -z "$(git -C "$fresh" status --porcelain)" ]] || fail "V7: new vault should be committed clean"
+[[ "$(_vault_url fresh)" == "local" ]] || fail "V7: new vault should be registered as local"
+[[ "$(vault_active_name)" == "other" ]] || fail "V7: new must not change an active vault"
+grep -q '^  fresh  local, no remote  ' <<<"$(cmd_vault)" || fail "V7: list should show a local vault with no remote — $(cmd_vault)"
+cmd_vault use fresh >/dev/null
+err_out=$(vault_prepare 2>&1 >/dev/null)
+[[ -z "$err_out" ]] || fail "V7: prepare of a vault with no upstream should not warn — $err_out"
+[[ "$(vault_prepare 2>/dev/null)" == "$(harness_abs_path "$fresh")" ]] || fail "V7: prepare should return the new vault"
+git -C "$fresh" remote add origin "$REMOTE"
+grep -q "^\* fresh  $REMOTE  " <<<"$(cmd_vault)" || fail "V7: list should show the origin once one is set — $(cmd_vault)"
+out=$(cmd_vault new tpl --from "file://$REMOTE") || fail "V7: new --from failed — $out"
+tpl="$state_root/vaults/tpl"
+[[ -f "$tpl/AGENTS.md" && -f "$tpl/notes.md" ]] || fail "V7: --from should copy the template's files"
+[[ "$(git -C "$tpl" rev-list --count HEAD)" == "1" ]] || fail "V7: --from should start a fresh history"
+git -C "$tpl" remote get-url origin >/dev/null 2>&1 && fail "V7: --from must not keep the template as origin"
+if cmd_vault new fresh >/dev/null 2>&1; then fail "V7: new over a registered name accepted"; fi
+cmd_vault remove tpl >/dev/null
+if cmd_vault new tpl >/dev/null 2>&1; then fail "V7: new over an existing folder accepted"; fi
+if cmd_vault new gone --from "$TMP_ROOT/nope.git" >/dev/null 2>&1; then fail "V7: new from a bad url accepted"; fi
+[[ ! -e "$state_root/vaults/gone" ]] || fail "V7: a failed new should leave no folder"
+_vault_url gone >/dev/null && fail "V7: a failed new should not register"
+if cmd_vault new x --bogus >/dev/null 2>&1; then fail "V7: unknown option accepted"; fi
+if cmd_vault add y local >/dev/null 2>&1; then fail "V7: add with the url 'local' accepted"; fi
+mv "$fresh" "$fresh.away"
+err_out=$(vault_prepare 2>&1 >/dev/null)
+[[ -z "$(vault_prepare 2>/dev/null)" ]] || fail "V7: a local vault whose folder is gone should launch without it"
+mv "$fresh.away" "$fresh"
+grep -q "is gone" <<<"$err_out" || fail "V7: a missing local vault should say so — $err_out"
+ok "V7: new makes a committed vault from the template or a repo, and launches use it"
 
 echo "VAULT TEST PASSED"

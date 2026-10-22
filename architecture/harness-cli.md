@@ -159,7 +159,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
 | Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help` |
-| Vaults | `vault` (list), `vault add`, `vault use`, `vault off`, `vault remove` — see "Vaults" below. |
+| Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove` — see "Vaults" below. |
 | Pub page | `serve` — the vault's pub pages plus opencode web, loopback only. See "`serve`" below. |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
@@ -414,11 +414,23 @@ line) and the active name at `state/vault.active`; there is no `.env`
 setting. `add` registers (the first vault becomes active), `use` switches,
 `off` clears, `remove` unregisters and never deletes the clone.
 
+`new <name> [--from <git-url>]` makes a vault in place: it copies
+`vault-template/` (or a `--depth 1` clone of the template repo, whose `.git`
+it drops), runs `git init` on `main` with one commit (signed `harness` when
+git has no identity), and registers the url `local`. A failure removes the
+folder and registers nothing. `vault-template/` is the minimal LLM-wiki
+skeleton (Karpathy's pattern): `AGENTS.md` with the layout and the
+ingest/query/lint rules, `wiki/index.md`, `wiki/log.md`, `.raw/` for
+sources, `pub/` for `serve`. A `local` vault has no remote until the user
+adds one with git; `list` shows its `origin` url once there is one.
+
 At launch `vault_prepare` (from `run_agent` after the no-docker fallback,
 and from `cmd_host` before `host_run_opencode`) clones the active vault into
 `state/vaults/<name>` if it is missing, otherwise runs `git pull --ff-only`
-with no credential prompt and a 30s limit; a failed pull or clone warns and
-never blocks the launch. It sets the `harness_vault_dir` global, which
+with no credential prompt and a 30s limit (skipped when the branch has no
+upstream, as for a new vault); a failed pull or clone warns and never
+blocks the launch, and a `local` vault whose folder is gone launches
+without a vault. It sets the `harness_vault_dir` global, which
 `vault_opencode_config` turns into overlay keys: `instructions` with the
 vault's `AGENTS.md` (or `CLAUDE.md`), which opencode sends as "Instructions
 from: <path>" so the model knows where the vault is, and
@@ -429,8 +441,9 @@ appends the vault to the extra mounts (same absolute path, deduped against
 the CWD). Committing and pushing vault changes is the agent's job, as in any
 repo; inside a container the push needs the vault's git host marked
 `# git-push` in the allowlist (`firewall/configure-git-credentials.sh`). Clones live under `state/`, so `uninstall` deletes them; it first names
-any clone with uncommitted or unpushed work. `tests/unit_vault_test.sh`
-covers the registry, clone, fast-forward, offline fallback and the overlay.
+any clone with uncommitted or unpushed work (a vault with no upstream
+counts as unpushed). `tests/unit_vault_test.sh` covers the registry, clone,
+fast-forward, offline fallback, the overlay and `new`.
 
 ### Interactive TTY resolution (Windows) — issue #82
 
@@ -853,13 +866,16 @@ two foreground children:
   It lists the active vault's `pub/**/*.html` (title from `<title>`, newest
   first, dot paths skipped, `?q=` filters on title or path, at most 200
   shown) and `/pub/<rel>` serves the file, realpath-confined to `pub/`. The
-  index also shows: a Services list (the opencode web link, a note that its
+  index also shows: a launch panel (the opencode web link, a note that its
   terminal is a host shell as the server's user), the proxy's `/health`
   (`--proxy-url`, 2 s timeout, no client headers forwarded), the prompt
   modes (`--mode NAME=DESC`, below), last-24h usage from the proxy's ledger
   (`--usage-ledger`, last ~5 MB read), and the vault's last 15 commits.
   These parts are cached for a few seconds. With no vault active the index
-  still comes up with no pages. `/healthz` is a liveness check.
+  still comes up with no pages. Layout: the launch panel on top, then pages
+  and usage beside a side column of prompt modes and vault commits (one
+  column below 820 px); inline CSS only, system fonts, light and dark from
+  `prefers-color-scheme`, since the index CSP loads nothing. `/healthz` is a liveness check.
 - `opencode serve` on `127.0.0.1:N+1`, with `host_opencode_env` (shared with
   `host_run_opencode`, so the config, overlay and NO_PROXY match `harness
   host`; it unsets `_harness_secret_vars` too, since opencode reaches the

@@ -551,23 +551,99 @@ class Config:
 
 
 STYLE = """
-:root { color-scheme: light dark; --bg: #fafafa; --fg: #1d1d1f; --muted: #6b6b70; --line: #e2e2e6; --link: #0b62d6; --ok: #18794e; --bad: #c4321c; --field: #fff; }
-@media (prefers-color-scheme: dark) { :root { --bg: #151517; --fg: #ececf0; --muted: #9a9aa2; --line: #2c2c31; --link: #6aa8ff; --ok: #4cc38a; --bad: #ff6b57; --field: #1f1f23; } }
-body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
-main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
-h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 15px; margin: 28px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-ul { list-style: none; padding: 0; margin: 0; } li { padding: 8px 0; border-bottom: 1px solid var(--line); display: flex; gap: 12px; justify-content: space-between; flex-wrap: wrap; }
-a { color: var(--link); text-decoration: none; } a:hover { text-decoration: underline; }
-.muted { color: var(--muted); font-size: 13px; } .up { color: var(--ok); } .down { color: var(--bad); }
-.bar { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+/* A console for one host: the opencode launch panel up top, then pages and usage in the main
+   column beside a rail of prompt modes and vault commits; one column on a phone. System fonts
+   only (the index CSP loads nothing). */
+:root {
+  color-scheme: light;
+  --bg: #f3f5f7; --panel: #ffffff; --sunk: #e9edf1; --ink: #14181d; --muted: #5b6672; --line: #dbe1e7;
+  --accent: #0b6e60; --accent-ink: #ffffff; --accent-soft: #d6eeea;
+  --ok: #157347; --ok-soft: #dcf1e5; --bad: #b42318; --bad-soft: #fbe3df;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --r: 10px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f1215; --panel: #171b20; --sunk: #1e242a; --ink: #e7ecf0; --muted: #96a2ad; --line: #2a3138;
+  --accent: #4cc2ab; --accent-ink: #062520; --accent-soft: #173a35;
+  --ok: #5ccf94; --ok-soft: #173326; --bad: #ff8a7a; --bad-soft: #3d1d19; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0f1215; --panel: #171b20; --sunk: #1e242a; --ink: #e7ecf0; --muted: #96a2ad; --line: #2a3138;
+  --accent: #4cc2ab; --accent-ink: #062520; --accent-soft: #173a35;
+  --ok: #5ccf94; --ok-soft: #173326; --bad: #ff8a7a; --bad-soft: #3d1d19; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); }
+main { max-width: 1100px; margin: 0 auto; padding-block: 20px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 20px; }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code { font: 0.86em var(--mono); }
+h1, h2 { margin: 0; text-wrap: balance; }
+h2 { font-size: 12px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
+.muted { color: var(--muted); font-size: 13px; }
+.err { color: var(--bad); margin: 0; }
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; min-width: 0; }
+.brand h1 { font: 700 22px/1 var(--mono); letter-spacing: -.02em; }
+.brand h1::before { content: "~$ "; color: var(--accent); }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  background: var(--sunk); color: var(--muted); font-size: 13px; }
+.chip b { color: var(--ink); font-weight: 600; }
+.who { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+.who b { color: var(--ink); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; min-width: 0;
+  display: flex; flex-direction: column; gap: 12px; }
+.launch { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px 24px; align-items: center; }
+.launch .lede { margin: 0; color: var(--muted); max-width: 62ch; }
+.launch .lede b { color: var(--ink); }
+.go { display: inline-flex; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 8px;
+  background: var(--accent); color: var(--accent-ink); font-weight: 650; white-space: nowrap; }
+.go:hover { text-decoration: none; filter: brightness(1.08); }
+.go span { font: 12px var(--mono); opacity: .8; }
+.status { grid-column: 1 / -1; display: flex; gap: 8px 10px; align-items: center; flex-wrap: wrap;
+  padding-top: 12px; border-top: 1px solid var(--line); font-size: 14px; min-width: 0; }
+.status .muted { overflow-wrap: anywhere; }
+.up, .down { display: inline-flex; align-items: center; gap: 6px; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 650; }
+.up { color: var(--ok); background: var(--ok-soft); } .down { color: var(--bad); background: var(--bad-soft); }
+.up::before, .down::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 340px); gap: 20px; align-items: start; }
+.stack { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+ul { list-style: none; padding: 0; margin: 0; }
+.list li { display: flex; justify-content: space-between; align-items: baseline; gap: 4px 16px; flex-wrap: wrap;
+  padding: 9px 0; border-top: 1px solid var(--line); }
+.list li:first-child { border-top: 0; }
+.list a { font-weight: 550; overflow-wrap: anywhere; }
+.list .muted { font: 12px var(--mono); color: var(--muted); }
+.modes li { display: flex; flex-direction: column; gap: 2px; padding: 8px 0; border-top: 1px solid var(--line); }
+.modes li:first-child { border-top: 0; }
+.modes code { font-weight: 650; color: var(--ink); }
+.row { display: flex; gap: 8px; margin: 0; }
+input, button { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; }
+input { background: var(--bg); }
+button { cursor: pointer; background: var(--sunk); } button:hover { border-color: var(--muted); }
+input[type=search], input[type=password] { flex: 1; min-width: 0; }
 form.inline { display: inline; margin: 0; }
-input, button { font: inherit; color: inherit; background: var(--field); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; }
-button { cursor: pointer; } input[type=search], input[type=password] { flex: 1; min-width: 0; }
-.row { display: flex; gap: 8px; margin: 0 0 8px; }
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.tile { background: var(--sunk); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tile .k { color: var(--muted); font-size: 12px; }
+.tile .v { font: 600 20px/1.2 var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
-th, td { text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--line); } th:first-child, td:first-child { text-align: left; }
-th { color: var(--muted); font-weight: 500; font-size: 13px; }
-code { font: 13px ui-monospace, monospace; } .log td { text-align: left; vertical-align: top; } .err { color: var(--bad); }
+th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; padding-left: 0; } th:last-child, td:last-child { padding-right: 0; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+tr:last-child td { border-bottom: 0; }
+.share { display: block; height: 3px; margin-top: 4px; border-radius: 2px; background: var(--accent); opacity: .55; }
+.log li { display: flex; flex-direction: column; gap: 2px; padding: 8px 0; border-top: 1px solid var(--line); min-width: 0; }
+.log li:first-child { border-top: 0; }
+.log .s { overflow-wrap: anywhere; }
+.log .muted { font-size: 12px; }
+.log code { color: var(--accent); }
+.signin { max-width: 400px; width: 100%; margin: 12vh auto 0; }
+@media (max-width: 820px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 560px) { .launch { grid-template-columns: minmax(0, 1fr); } .go { justify-content: center; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } .list li { flex-direction: column; gap: 2px; } }
 """
 
 esc = html.escape
@@ -584,20 +660,29 @@ def _n(v):
 
 
 def render_login(cfg, message=""):
-    parts = _head("harness: sign in") + ["<h1>harness</h1><h2>Sign in</h2>"]
+    parts = _head("harness: sign in") + [
+        "<section class='panel signin'><div class='brand'><h1>harness</h1></div><h2>Sign in</h2>"]
     if message:
         parts.append(f"<p class='err'>{esc(message)}</p>")
     parts.append("<form method='post' action='/login' class='row'>"
-                 "<input type='password' name='code' placeholder='access code' "
+                 "<input type='password' id='code' name='code' placeholder='access code' "
                  "autocomplete='current-password' required autofocus>"
                  "<button type='submit'>Sign in</button></form>"
                  "<div class='muted'>Ask whoever runs this server for an access code.</div>"
-                 "</main></body></html>")
+                 "</section></main></body></html>")
     return "".join(parts).encode()
 
 
 def _services(cfg, host):
-    parts = ["<h2>Services</h2><ul>"]
+    """The launch panel (opencode web and the model proxy's state) and the prompt modes,
+    as two lists of parts: the panel opens the page, the modes go in the side column."""
+    launch, modes = [], []
+    status = []
+    if cfg.proxy_url:
+        up, detail = cfg.cache.get(("proxy", cfg.proxy_url), lambda: proxy_status(cfg.proxy_url))
+        state = "<span class='up'>up</span>" if up else "<span class='down'>down</span>"
+        status.append(f"<div class='status'><span>model proxy {state}</span>"
+                      f"<span class='muted'>{esc(cfg.proxy_url)} ({esc(detail)})</span></div>")
     if cfg.opencode_url or cfg.opencode_port:
         if cfg.opencode_url:
             url, where = cfg.opencode_url, urlsplit(cfg.opencode_url).netloc
@@ -611,24 +696,24 @@ def _services(cfg, host):
             login = f"opencode:{quote(pw, safe='')}@" if pw else ""
             url = f"http://{login}{host}:{cfg.opencode_port}/"
             where = f"port {cfg.opencode_port}"
-        parts.append(f"<li><a href='{esc(url)}' rel='noreferrer'>opencode web</a>"
-                     f"<span class='muted'>{esc(where)}</span></li>")
-        parts.append("<li><span>Terminal: inside opencode web, open a <b>New terminal</b> tab "
-                     "(<code>ctrl+`</code>). It is a shell on this host, running as the user "
-                     "that runs <code>harness serve</code>.</span></li>")
-    if cfg.proxy_url:
-        up, detail = cfg.cache.get(("proxy", cfg.proxy_url), lambda: proxy_status(cfg.proxy_url))
-        state = "<span class='up'>up</span>" if up else "<span class='down'>down</span>"
-        parts.append(f"<li><span>model proxy {state}</span>"
-                     f"<span class='muted'>{esc(cfg.proxy_url)} ({esc(detail)})</span></li>")
-    parts.append("</ul>")
+        launch.append("<section class='panel launch'>"
+                      "<p class='lede'>Chat with the agent in <b>opencode web</b>. For a shell, open a "
+                      "<b>New terminal</b> tab there (<code>ctrl+`</code>): it runs on this host as the "
+                      "user that runs <code>harness serve</code>.</p>"
+                      f"<a class='go' href='{esc(url)}' rel='noreferrer'>Open opencode web"
+                      f"<span>{esc(where)}</span></a>")
+        launch += status
+        launch.append("</section>")
+    elif status:
+        launch += ["<section class='panel launch'>"] + status + ["</section>"]
     if cfg.modes:
-        parts.append("<h2>Prompt modes</h2><div class='muted'>Each mode is its own entry in "
-                     "opencode's model picker; pick the one you want for the session.</div><ul>")
+        modes.append("<section class='panel'><h2>Prompt modes</h2><div class='muted'>Each mode is its "
+                     "own entry in opencode's model picker; pick the one you want for the session.</div>"
+                     "<ul class='modes'>")
         for name, desc in cfg.modes:
-            parts.append(f"<li><code>{esc(name)}</code><span class='muted'>{esc(desc)}</span></li>")
-        parts.append("</ul>")
-    return parts
+            modes.append(f"<li><code>{esc(name)}</code><span class='muted'>{esc(desc)}</span></li>")
+        modes.append("</ul></section>")
+    return launch, modes
 
 
 def _usage(cfg):
@@ -638,50 +723,57 @@ def _usage(cfg):
     if not u:
         return []
     d, h = u["day"], u["hour"]
-    parts = ["<h2>Usage, last 24 h</h2><table><tr><th>replies</th><th>prompt</th>"
-             "<th>completion</th><th>total</th><th>last hour</th></tr>",
-             f"<tr><td>{_n(d['replies'])}</td><td>{_n(d['prompt'])}</td><td>{_n(d['completion'])}</td>"
-             f"<td>{_n(d['total'])}</td><td>{_n(h['total'])} ({_n(h['replies'])} replies)</td></tr></table>",
-             f"<div class='muted'>reasoning {_n(d['reasoning'])}, cached prompt {_n(d['cached'])} "
-             "(both counted inside the columns above)</div>"]
+    tiles = (("replies", d["replies"]), ("prompt tokens", d["prompt"]),
+             ("completion tokens", d["completion"]), ("total tokens", d["total"]))
+    parts = ["<section class='panel'><h2>Usage, last 24 h</h2><div class='tiles'>"]
+    for k, v in tiles:
+        parts.append(f"<div class='tile'><span class='k'>{k}</span><span class='v'>{_n(v)}</span></div>")
+    hr = "reply" if h["replies"] == 1 else "replies"
+    parts.append(f"</div><div class='muted'>Last hour: {_n(h['total'])} tokens in {_n(h['replies'])} {hr}. Reasoning "
+                 f"{_n(d['reasoning'])} and cached prompt {_n(d['cached'])} tokens are counted inside "
+                 "the totals above.</div>")
     if u["models"]:
-        parts.append("<table><tr><th>model</th><th>replies</th><th>prompt</th><th>completion</th>"
-                     "<th>total</th></tr>")
+        top = max(p + c for _, (n, p, c) in u["models"][:50]) or 1
+        parts.append("<div class='scroll'><table><tr><th>model</th><th>replies</th><th>prompt</th>"
+                     "<th>completion</th><th>total</th></tr>")
         for model, (n, p, c) in u["models"][:50]:
-            parts.append(f"<tr><td><code>{esc(model)}</code></td><td>{_n(n)}</td><td>{_n(p)}</td>"
-                         f"<td>{_n(c)}</td><td>{_n(p + c)}</td></tr>")
-        parts.append("</table>")
+            pct = round(100 * (p + c) / top)
+            parts.append(f"<tr><td><code>{esc(model)}</code><span class='share' style='width:{pct}%'></span>"
+                         f"</td><td>{_n(n)}</td><td>{_n(p)}</td><td>{_n(c)}</td><td>{_n(p + c)}</td></tr>")
+        parts.append("</table></div>")
     if u["remaining"]:
         left = ", ".join(f"{esc(k)} {esc(v)}" for k, v in u["remaining"])
         parts.append(f"<div class='muted'>upstream remaining (latest reply): {left}</div>")
+    parts.append("</section>")
     return parts
 
 
 def _pages(cfg, query):
     pages = cfg.cache.get(("pages", cfg.pub_dir), lambda: list_pages(cfg.pub_dir))
-    parts = ["<h2>Pages</h2>"]
+    parts = ["<section class='panel'><h2>Pages</h2>"]
     if not pages:
-        parts.append("<div class='muted'>no HTML pages in the vault's pub/ folder</div>")
+        parts.append("<div class='muted'>No pages yet. HTML files the agent writes under the vault's "
+                     "pub/ folder show up here.</div></section>")
         return parts
     parts.append("<form method='get' action='/' class='row'>"
-                 f"<input type='search' name='q' value='{esc(query)}' placeholder='filter by title or path'>"
+                 f"<input type='search' id='q' name='q' value='{esc(query)}' placeholder='filter by title or path'>"
                  "<button type='submit'>Filter</button></form>")
     shown = filter_pages(pages, query)
     if query:
         parts.append(f"<div class='muted'>{len(shown)} of {len(pages)} pages match "
                      f"&ldquo;{esc(query)}&rdquo; &middot; <a href='/'>clear</a></div>")
-    if not shown:
-        return parts
-    parts.append("<ul>")
-    for rel, title, mtime in shown[:PAGE_CAP]:
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
-        href = "/pub/" + quote(rel)
-        parts.append(f"<li><a href='{esc(href)}'>{esc(title)}</a>"
-                     f"<span class='muted'>{when}</span></li>")
-    parts.append("</ul>")
-    if len(shown) > PAGE_CAP:
-        parts.append(f"<div class='muted'>{len(shown) - PAGE_CAP} more not shown; "
-                     "narrow them with the filter</div>")
+    if shown:
+        parts.append("<ul class='list'>")
+        for rel, title, mtime in shown[:PAGE_CAP]:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+            href = "/pub/" + quote(rel)
+            parts.append(f"<li><a href='{esc(href)}'>{esc(title)}</a>"
+                         f"<span class='muted'>{when}</span></li>")
+        parts.append("</ul>")
+        if len(shown) > PAGE_CAP:
+            parts.append(f"<div class='muted'>{len(shown) - PAGE_CAP} more not shown; "
+                         "narrow them with the filter</div>")
+    parts.append("</section>")
     return parts
 
 
@@ -689,32 +781,36 @@ def _activity(cfg):
     rows = cfg.cache.get(("git", cfg.vault), lambda: vault_log(cfg.vault))
     if not rows:
         return []
-    parts = ["<h2>Vault activity</h2><table class='log'>"]
+    parts = ["<section class='panel'><h2>Vault activity</h2><ul class='log'>"]
     for sha, author, when, subject in rows:
-        parts.append(f"<tr><td><code>{esc(sha)}</code></td><td>{esc(subject)}</td>"
-                     f"<td class='muted'>{esc(author)}</td><td class='muted'>{esc(when)}</td></tr>")
-    parts.append("</table>")
+        parts.append(f"<li><span class='s'>{esc(subject)}</span><span class='muted'><code>{esc(sha)}</code> "
+                     f"&middot; {esc(author)} &middot; {esc(when)}</span></li>")
+    parts.append("</ul></section>")
     return parts
 
 
 def render_index(cfg, request_host, user=None, query=""):
     host = request_host.rsplit(":", 1)[0] if request_host else "127.0.0.1"
     parts = _head("harness")
-    parts.append("<div class='bar'><h1>harness</h1>")
-    if user:
-        parts.append(f"<span class='muted'>signed in as <b>{esc(user)}</b> "
-                     "<form method='post' action='/logout' class='inline'>"
-                     "<button type='submit'>Log out</button></form></span>")
-    parts.append("</div>")
+    parts.append("<header class='top'><div class='brand'><h1>harness</h1>")
     if cfg.vault:
-        parts.append(f"<div class='muted'>vault: {esc(cfg.vault_name or cfg.vault)}</div>")
+        parts.append(f"<span class='chip'>vault <b>{esc(cfg.vault_name or cfg.vault)}</b></span>")
     else:
-        parts.append("<div class='muted'>no vault selected (harness vault use &lt;name&gt;)</div>")
-    parts += _services(cfg, host)
-    parts += _usage(cfg)
-    if cfg.vault:
-        parts += _pages(cfg, query)
-        parts += _activity(cfg)
+        parts.append("<span class='chip'>no vault selected (harness vault use &lt;name&gt;)</span>")
+    parts.append("</div>")
+    if user:
+        parts.append(f"<div class='who'><span>signed in as <b>{esc(user)}</b></span>"
+                     "<form method='post' action='/logout' class='inline'>"
+                     "<button type='submit'>Log out</button></form></div>")
+    parts.append("</header>")
+    launch, modes = _services(cfg, host)
+    parts += launch
+    main = (_pages(cfg, query) if cfg.vault else []) + _usage(cfg)
+    side = modes + (_activity(cfg) if cfg.vault else [])
+    if main and side:
+        parts += ["<div class='cols'><div class='stack'>"] + main + ["</div><div class='stack'>"] + side + ["</div></div>"]
+    else:
+        parts += main + side
     parts.append("</main></body></html>")
     return "".join(parts).encode()
 

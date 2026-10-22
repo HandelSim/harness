@@ -2765,7 +2765,8 @@ commands:
                         service links) and opencode web on 127.0.0.1, over the
                         host-mode proxy (see 'harness serve --help')
   vault [subcmd]        register git repos as vaults (the agent's notes and
-                        docs) and pick the active one; launches clone it into
+                        docs) or make a new one, and pick the active one;
+                        launches clone it into
                         state/vaults/<name>, keep it current, and give the
                         agent its AGENTS.md (see 'harness vault --help')
   unlock                probe the upstream and print the unlock URL if the
@@ -5509,10 +5510,13 @@ thoughts_opencode_config() {
 # === Vaults (the brain) ===
 #
 # A vault is a git repo of notes and docs the agent works from. `harness vault
-# add <name> <url>` registers one in state/vaults.list (name<TAB>url per line)
-# and `harness vault use <name>` picks the active one (state/vault.active). A
-# launch with an active vault clones it into state/vaults/<name> if it is not
-# there yet, otherwise fast-forwards it (best effort, never blocks the launch),
+# add <name> <url>` registers one in state/vaults.list (name<TAB>url per line),
+# `harness vault new <name>` makes one in state/vaults/<name> from
+# vault-template/ (or from a template repo) and registers it with the url
+# "local", and `harness vault use <name>` picks the active one
+# (state/vault.active). A launch with an active vault clones it into
+# state/vaults/<name> if it is not there yet, otherwise fast-forwards it (when
+# it has an upstream; best effort, never blocks the launch),
 # then hands opencode the overlay from vault_opencode_config. Container mode
 # also bind-mounts the clone at the same absolute path, so one path works on
 # both sides.
@@ -5561,13 +5565,18 @@ vault_prepare() {
         err "vault '$name': git is not installed; launching without the vault"
         return 0
     fi
-    if [[ ! -d "$dir/.git" ]]; then
+    if [[ ! -d "$dir/.git" && "$url" == "local" ]]; then
+        err "vault '$name' was made by 'harness vault new' and $dir is gone; launching without the vault"
+        return 0
+    elif [[ ! -d "$dir/.git" ]]; then
         echo "[harness] vault '$name': cloning $url" >&2
         mkdir -p "$state_root/vaults"
         if ! git clone -q "$url" "$dir" >&2; then
             err "vault '$name': clone failed; launching without the vault"
             return 0
         fi
+    elif ! git -C "$dir" rev-parse -q --verify '@{u}' >/dev/null 2>&1; then
+        :   # no upstream (a new vault not pushed yet): nothing to pull
     elif ! GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" pull -q --ff-only >/dev/null 2>&1; then
         err "vault '$name': could not fast-forward from its remote (offline, or local commits); using the local copy"
     fi
@@ -5673,6 +5682,10 @@ usage:
   harness vault                    list vaults (* marks the active one)
   harness vault add <name> <url>   register a git repo as a vault; the first
                                    one added becomes active
+  harness vault new <name> [--from <git-url>]
+                                   make a new vault in state/vaults/<name> from
+                                   harness's template (or from a template repo,
+                                   without its history) and register it
   harness vault use <name>         make <name> the active vault
   harness vault off                launch without a vault
   harness vault remove <name>      unregister <name>; its clone stays on disk
@@ -5684,18 +5697,28 @@ read and write under the vault without approval; container launches mount it
 at the same path. Committing and pushing vault changes is the agent's (or
 your) job, as in any repo; from a container that needs the vault's git host
 marked '# git-push' in .harness-allowlist (see 'harness net').
+
+A new vault has no remote until you give it one (an empty repo you made on
+GitHub or elsewhere):
+  git -C state/vaults/<name> remote add origin <git-url>
+  git -C state/vaults/<name> push -u origin HEAD
+Until then it lives only under state/, which 'harness uninstall' deletes.
 HELP
             ;;
         list|ls)
             active=$(vault_active_name)
             if [[ ! -s "$list" ]]; then
-                echo "no vaults registered; add one with: harness vault add <name> <git-url>"
+                echo "no vaults registered; add one with: harness vault add <name> <git-url>, or make one with: harness vault new <name>"
                 return 0
             fi
             while IFS=$'\t' read -r name url; do
                 local mark=" " where="not cloned yet"
                 [[ "$name" == "$active" ]] && mark="*"
                 [[ -d "$state_root/vaults/$name/.git" ]] && where="$state_root/vaults/$name"
+                if [[ "$url" == "local" ]]; then
+                    url=$(git -C "$state_root/vaults/$name" remote get-url origin 2>/dev/null) \
+                        || url="local, no remote"
+                fi
                 printf '%s %s  %s  (%s)\n' "$mark" "$name" "$url" "$where"
             done < "$list"
             [[ -n "$active" ]] || echo "(no active vault; pick one with: harness vault use <name>)"
@@ -5707,6 +5730,7 @@ HELP
             fi
             _vault_valid_name "$name" || { err "vault name '$name': use letters, digits, '.', '_' or '-'"; return 1; }
             [[ "$url" == *$'\t'* || "$url" == *$'\n'* ]] && { err "vault url has a tab or newline"; return 1; }
+            [[ "$url" == "local" ]] && { err "'local' is not a git url (to make a vault here: harness vault new $name)"; return 1; }
             if _vault_url "$name" >/dev/null; then
                 err "vault '$name' is already registered ($(_vault_url "$name")); remove it first to change its url"
                 return 1
@@ -5718,6 +5742,54 @@ HELP
                 printf '%s\n' "$name" > "$state_root/vault.active"
                 echo "'$name' is now the active vault; the next launch clones it"
             fi
+            ;;
+        new)
+            local from="" dir
+            name="${1:-}"
+            (( $# )) && shift
+            if [[ "${1:-}" == "--from" && -n "${2:-}" && $# -eq 2 ]]; then
+                from="$2"
+            elif (( $# )); then
+                name=""
+            fi
+            [[ -n "$name" && "$name" != -* ]] || { err "usage: harness vault new <name> [--from <git-url>]"; return 1; }
+            _vault_valid_name "$name" || { err "vault name '$name': use letters, digits, '.', '_' or '-'"; return 1; }
+            if _vault_url "$name" >/dev/null; then
+                err "vault '$name' is already registered (see: harness vault)"; return 1
+            fi
+            command -v git >/dev/null 2>&1 || { err "harness vault new needs git"; return 1; }
+            dir="$state_root/vaults/$name"
+            [[ -e "$dir" ]] && { err "$dir already exists; move it away or pick another name"; return 1; }
+            mkdir -p "$state_root/vaults"
+            if [[ -n "$from" ]]; then
+                echo "copying template $from"
+                if ! GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 "$from" "$dir"; then
+                    rm -rf "$dir"
+                    err "could not clone $from"; return 1
+                fi
+                rm -rf "$dir/.git"
+            else
+                cp -R "$clone_dir/vault-template" "$dir" || { rm -rf "$dir"; err "could not copy vault-template/"; return 1; }
+            fi
+            [[ -f "$dir/AGENTS.md" || -f "$dir/CLAUDE.md" ]] \
+                || err "the template has no AGENTS.md or CLAUDE.md; write one so the agent knows the vault's rules"
+            # A fresh history; harness signs the first commit when git has no identity.
+            local ident=()
+            git -C "$dir" config user.email >/dev/null 2>&1 || ident=(-c user.name=harness -c user.email=harness@localhost)
+            if ! { git -C "$dir" init -q && git -C "$dir" symbolic-ref HEAD refs/heads/main \
+                    && git -C "$dir" add -A \
+                    && git ${ident[@]+"${ident[@]}"} -C "$dir" commit -q -m "new vault${from:+ from $from}"; }; then
+                rm -rf "$dir"
+                err "could not make the vault's first commit"; return 1
+            fi
+            printf '%s\tlocal\n' "$name" >> "$list"
+            echo "made vault '$name' at $dir"
+            if [[ -z "$(vault_active_name)" ]]; then
+                printf '%s\n' "$name" > "$state_root/vault.active"
+                echo "'$name' is now the active vault"
+            fi
+            echo "it has no remote yet; to back it up, make an empty repo and run:"
+            echo "  git -C '$dir' remote add origin <git-url> && git -C '$dir' push -u origin HEAD"
             ;;
         use)
             name="${1:-}"
