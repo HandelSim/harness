@@ -6174,7 +6174,10 @@ HELP
     host_write_opencode_config
     harness_vault_dir=$(vault_prepare)
     harness_serve=1
-    harness_oai=$(_oai_configured && echo oai)
+    # Not $(_oai_configured && echo oai): without OAI that assignment fails
+    # and set -e ends serve silently, before the banner.
+    harness_oai=""
+    _oai_configured && harness_oai=oai
     # The proxy is up with its own copy of the key; neither server needs it.
     unset "${_harness_secret_vars[@]}"
 

@@ -943,7 +943,9 @@ codes, `/_auth`, usage, git log, proxy status), plus option errors, the
 password file, the mode aliases (alone and in the merged overlay), the key
 scrub (the OAI provider keeps its slim header in host and serve) and a
 guard that the only `Authorization` header in the CLI is
-`_curl_auth_config`'s.
+`_curl_auth_config`'s, and a stubbed run under `set -e` with no OAI that
+must reach the banner (a failing `$(...)` assignment once ended serve
+silently there).
 
 ## ChatGPT backend (`harness chatgpt`)
 

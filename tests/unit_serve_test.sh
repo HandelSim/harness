@@ -7,6 +7,7 @@
 #   - serve_password_file makes the opencode web password once, mode 600
 #   - serve_opencode_config the prompt-mode model aliases
 #   - the upstream key off curl's argv and out of opencode's env
+#   - cmd_serve           reaches its banner with no OAI configured
 #
 # Prints "SERVE TEST PASSED" on success.
 
@@ -147,5 +148,37 @@ hits=$(grep -nE 'Authorization: (Bearer|Basic)' "$HARNESS" | grep -vE '^[0-9]+:[
     || fail "S5: an Authorization header outside _curl_auth_config; pipe _curl_auth_config to curl -K - instead:
 $hits"
 ok "S5: key via curl -K stdin, scrubbed from opencode's env"
+
+# --- S6: with no OAI configured, serve gets to its banner ---------------------
+# Runs cmd_serve under the harness's own set -euo pipefail in a fresh bash
+# (an `if`/`||` around a subshell would turn set -e off), with the gates, the
+# proxy and both servers stubbed. The stub servers exit at once, so serve
+# then fails, but only after printing the URLs.
+cat >"$TMP_ROOT/serve_run.sh" <<'EOF'
+HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$1" source "$2" 2>/dev/null
+clone_dir="$3"
+source "$3/scripts/lib/platform.sh"
+for f in host_require_python3 host_require_config host_confirm_gate ensure_dirs \
+         host_ensure_toolchain host_preflight _gate_on_upstream_auth \
+         _print_upstream_models host_proxy_start host_proxy_wait_ready \
+         host_proxy_stop host_write_opencode_config host_opencode_env; do
+    eval "$f() { :; }"
+done
+vault_prepare() { :; }
+host_proxy_port() { echo 8000; }
+host_usage_ledger() { echo "$state_root/ledger"; }
+host_python_bin() { echo true; }
+serve_password_file() { echo "$state_root/pw"; }
+opencode() { :; }
+unset OAI_API_URL OAI_API_KEY OAI_MODELS
+set -euo pipefail
+mkdir -p "$state_root"
+cmd_serve --port 18780
+EOF
+bash "$TMP_ROOT/serve_run.sh" "$TMP_ROOT" "$HARNESS" "$REPO_ROOT" >"$TMP_ROOT/serve_out" 2>&1 || true
+grep -q 'pub page:     http://127.0.0.1:18780/' "$TMP_ROOT/serve_out" \
+    || fail "S6: serve exited before printing its URLs:
+$(cat "$TMP_ROOT/serve_out")"
+ok "S6: serve prints its URLs with no OAI configured"
 
 echo "SERVE TEST PASSED"
