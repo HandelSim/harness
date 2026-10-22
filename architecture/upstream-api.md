@@ -219,13 +219,20 @@ it; it only costs TPM/RPM. The vendor docs contradict themselves on plain ids:
 the capability matrix lists `gemini-3.5-flash` as Standard (1x/2x, tools),
 while the "taxonomy" section says plain ids route to the zero-credit lane and
 tool calling needs `-withtools`. Trust `/v1/models` (`lane`, `credit_weights`)
-and `harness probe`, not either page.
+and `harness probe`, not either page. A catalog seen on 2026-10-19 sided
+with the taxonomy: plain `gemini-2.5-pro`, `gemini-3.1-pro-preview`,
+`gemini-3.7-flash` and `gemini-3.8-flash` were `lane: assist` with weights
+0/0, and the `-withtools` ids `lane: standard` at 1/1 (3.1 and 3.5 flash
+lite, 3.5 flash) or 1/2 (3.7 and 3.8 flash).
 
 **Credits.** `credits = prompt_tokens x W_in + completion_tokens x W_out`,
 integer weights from {1, 2, 5, 10, 25, 50}, per model in the catalog's
 `credit_weights`. Documented: flash 1x in / 2x out, pro 2x / 5x, embeddings
 1x / 0x, assist 0x. Whether reasoning tokens bill as output is undocumented
-(`harness probe` assumes yes, an upper estimate).
+(`harness probe` and the proxy's budget guard assume yes, an upper
+estimate); `usage.completion_tokens_details.reasoning_tokens` is reported
+apart from `completion_tokens` (64 prompt + 1 completion + 1,908 reasoning
+= 1,973 total in a probe).
 
 **Every request re-bills the whole conversation.** A chat-completions agent
 resends the full history on every step, so one task costs roughly

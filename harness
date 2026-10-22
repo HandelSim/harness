@@ -5471,8 +5471,12 @@ host_write_opencode_config() {
 # JSON for OPENCODE_CONFIG_CONTENT, which opencode deep-merges over every other
 # config layer. It replaces the system prompt of the build, plan and yolo
 # agents with agents/slim-prompt.md and of the general subagent with
-# agents/slim-subagent-prompt.md (explore keeps opencode's own short prompt),
-# and adds the `x-harness-slim: 1` provider header, on which the proxy swaps
+# agents/slim-subagent-prompt.md (explore keeps opencode's own short prompt).
+# The build, plan and yolo agents also lose the `task` tool and stop after 40
+# steps per prompt: on a metered daily budget a delegated subagent would
+# explore for dozens of steps, each re-sending its whole context, and the task
+# would die unfinished when the budget ran out (the user says "continue" to go
+# past the cap). It also adds the `x-harness-slim: 1` provider header, on which the proxy swaps
 # the built-in tools' long descriptions for short ones. With the argument `oai`
 # (a host launch with an OAI upstream) the header goes on the harness-oai
 # provider too. Prints nothing when slim is off or a prompt file is missing
@@ -5486,11 +5490,13 @@ slim_opencode_config() {
         return 0
     fi
     harness_jq -cn --arg main "$(cat "$main_prompt")" --arg sub "$(cat "$sub_prompt")" \
-        --arg oai "${1:-}" --arg serve "${harness_serve:-0}" '{
+        --arg oai "${1:-}" --arg serve "${harness_serve:-0}" \
+        --argjson lean '{"permission": {"task": "deny"}, "steps": 40}' '{
       "provider": ((if $serve == "1" then {} else {"harness": {"options": {"headers": {"x-harness-slim": "1"}}}} end)
         + (if $oai == "oai" then {"harness-oai": {"options": {"headers": {"x-harness-slim": "1"}}}} else {} end)),
       "agent": {
-        "build": {"prompt": $main}, "plan": {"prompt": $main}, "yolo": {"prompt": $main},
+        "build": ({"prompt": $main} + $lean), "plan": ({"prompt": $main} + $lean),
+        "yolo": ({"prompt": $main} + $lean),
         "general": {"prompt": $sub}
       }
     }'
@@ -5598,6 +5604,56 @@ vault_opencode_config() {
     harness_jq -cn --arg dir "$dir" --arg instr "$instr" '
       {"permission": {"external_directory": {($dir + "/*"): "allow"}}}
       + (if $instr == "" then {} else {"instructions": [$instr]} end)'
+}
+
+# After an interactive session: copy its conversations into the vault
+# (scripts/vault_capture.py writes .raw/sessions/<date>-<session>.md from
+# opencode's database <db>, for top-level sessions updated since <since_ms>),
+# then commit everything the session changed in the vault and push it when the
+# vault has an upstream, rebasing once if the push is rejected. The agent never
+# has to remember to save or commit. Best effort: every failure is a warning
+# and the launch's exit status is unchanged.
+vault_sync() {
+    local dir="$1" since_ms="$2" db="$3" py script
+    [[ -n "$dir" && -d "$dir/.git" ]] || return 0
+    script="$clone_dir/scripts/vault_capture.py"
+    if [[ -f "$db" && -f "$script" ]] && py=$(host_python_bin); then
+        if command -v cygpath >/dev/null 2>&1; then
+            script=$(cygpath -m "$script"); db=$(cygpath -m "$db")
+            local wdir; wdir=$(cygpath -m "$dir")
+            # shellcheck disable=SC2086  # $py can be 'py -3'
+            $py "$script" "$db" "$wdir" "$since_ms" >/dev/null || true
+        else
+            # shellcheck disable=SC2086
+            $py "$script" "$db" "$dir" "$since_ms" >/dev/null || true
+        fi
+    fi
+    git -C "$dir" add -A >/dev/null 2>&1 || { err "vault: git add failed in $dir"; return 0; }
+    git -C "$dir" diff --cached --quiet 2>/dev/null && return 0
+    local n; n=$(git -C "$dir" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+    if ! git -C "$dir" commit -q -m "harness: session $(date -u +%Y-%m-%dT%H:%MZ) ($n files)" >/dev/null 2>&1; then
+        err "vault: commit failed in $dir (is git user.name/user.email set?)"
+        return 0
+    fi
+    echo "[harness] vault: committed $n file(s) in $dir" >&2
+    git -C "$dir" rev-parse -q --verify '@{u}' >/dev/null 2>&1 || return 0
+    if GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" push -q >/dev/null 2>&1; then
+        echo "[harness] vault: pushed" >&2
+        return 0
+    fi
+    if GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" pull -q --rebase >/dev/null 2>&1 \
+        && GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" push -q >/dev/null 2>&1; then
+        echo "[harness] vault: pushed (after rebasing on the remote)" >&2
+        return 0
+    fi
+    git -C "$dir" rebase --abort >/dev/null 2>&1 || true
+    err "vault: push failed (offline or a conflict); the commit stays local in $dir and goes up with the next push"
+    return 0
+}
+
+# Milliseconds since the epoch (date +%s%3N is GNU only).
+_now_ms() {
+    printf '%s000' "$(date +%s)"
 }
 
 # `harness serve` only: no session sharing (a share uploads the session to
@@ -5944,10 +6000,13 @@ host_run_opencode() {
     local -a cmd=(opencode)
     (( ${#args[@]} )) && cmd+=("${args[@]}")
     (( ${#pass_args[@]} )) && cmd+=("${pass_args[@]}")
-    local rc=0
+    local rc=0 launch_ms
+    launch_ms=$(_now_ms)
     "${cmd[@]}" || rc=$?
     host_reset_terminal
     host_proxy_stop
+    vault_sync "${harness_vault_dir:-}" "$launch_ms" \
+        "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
     return "$rc"
 }
 
@@ -6883,7 +6942,8 @@ run_agent_interactive() {
     # session exits. _reap_jq_sidecar runs here and again from the EXIT trap on
     # `exit` below; it's idempotent, so the second call is a cheap no-op.
     _reap_jq_sidecar
-    local rc=0
+    local rc=0 launch_ms
+    launch_ms=$(_now_ms)
     if (( use_winpty )); then
         harness_docker_winpty "${docker_args[@]}" || rc=$?
     else
@@ -6898,6 +6958,7 @@ run_agent_interactive() {
     fi
     [[ -n "$_clip_file" ]] && rm -f "$_clip_file" 2>/dev/null
     _print_agent_issue_footer
+    vault_sync "${harness_vault_dir:-}" "$launch_ms" "$agent_home/.local/share/opencode/opencode.db"
 
     # When this was the LAST agent for the project, tear the shared stack
     # (proxy + enabled MCPs) down too, so an exited agent never leaves the

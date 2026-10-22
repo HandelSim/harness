@@ -126,9 +126,11 @@ jq -e --rawfile main "$REPO_ROOT/agents/slim-prompt.md" --rawfile sub "$REPO_ROO
     .provider.harness.options.headers["x-harness-slim"] == "1"
     and .agent.build.prompt == ($main | rtrimstr("\n")) and .agent.yolo.prompt == .agent.build.prompt
     and .agent.plan.prompt == .agent.build.prompt and .agent.general.prompt == ($sub | rtrimstr("\n"))
-    and (.agent | has("explore") | not) and (.provider.harness.options | has("baseURL") | not)' \
+    and (.agent | has("explore") | not) and (.provider.harness.options | has("baseURL") | not)
+    and ([.agent.build, .agent.plan, .agent.yolo] | all(.permission.task == "deny" and .steps == 40))
+    and (.agent.general | has("steps") | not)' \
     <<<"$overlay" >/dev/null 2>&1 || fail "T5d: slim overlay has the wrong shape — $overlay"
-ok "T5d: yolo is primary-only; slim is the default; its overlay sets the slim prompts and the proxy header"
+ok "T5d: yolo is primary-only; slim is the default; its overlay sets the slim prompts, the proxy header, no task tool and a step cap"
 
 # --- T5c: opencode's cost readout counts tokens, cached ones included -------
 ( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; host_write_opencode_config ) \

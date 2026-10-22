@@ -51,6 +51,7 @@ import json
 import os
 import re
 import sys
+import threading
 import traceback
 import urllib.parse
 import uuid
@@ -710,8 +711,9 @@ def _native_reminder(
         )
     elif has_todowrite:
         lines.append(
-            "Unless this is a single trivial step, your first call is `todowrite` with every "
-            "step of the request, including how you will verify the change."
+            "Unless this is a single trivial step, call `todowrite` with every step of the "
+            "request, including how you will verify the change, in the same message as your "
+            "first other tool calls."
         )
     if st["repeats"]:
         shown = "; ".join(f"{k[:160]} (x{n})" for n, k in st["repeats"][:3])
@@ -739,7 +741,8 @@ def _todo_focus(todos: List[Any]) -> str:
         text = str(current.get("content")).strip().replace("\n", " ")[:_TODOS_MAX_CONTENT]
         return (
             f"Current item: {text}. Stay on it until it is done and verified, then mark it "
-            "completed with `todowrite` and start the next. Do not drift into work that is "
+            "completed with `todowrite` in the same message as the next item's first tool "
+            "call. Do not drift into work that is "
             "not on the list; add it to the list first."
         )
     if "pending" in status:
@@ -943,6 +946,8 @@ def _setup_usage_ledger() -> None:
                     keep.append(line)
             except (ValueError, TypeError, AttributeError):
                 continue
+        if keep:
+            _budget_seed(json.loads(keep[-1]))
         if len(keep) != len(lines):
             tmp = _USAGE_LEDGER + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -977,6 +982,7 @@ def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
         hdr = {}
     left = hdr.get("x-ratelimit-remaining-credits-day")
     tail = f" credits_day_left={left}" if left is not None else ""
+    _budget_note(req_id, model, hdr, _chat_usage(usage) if isinstance(usage, dict) and usage else None)
     if not isinstance(usage, dict) or not usage:
         print(f"[{req_id}] usage: none reported by upstream{tail}", flush=True)
         return
@@ -1000,6 +1006,8 @@ def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
         "cached": cached,
         "remaining": {k[len("x-ratelimit-remaining-"):]: v for k, v in hdr.items()
                       if k.startswith("x-ratelimit-remaining-")},
+        "budget_left": _BUDGET["left"],
+        "reset": _BUDGET["reset"],
     }
     try:
         with open(_USAGE_LEDGER, "a", encoding="utf-8") as f:
@@ -1036,6 +1044,187 @@ def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, st
             usage = obj["usage"]
             break
     _record_usage(req_id, model, usage, headers, "native")
+
+
+# Daily budget guard. The upstream lets the request that crosses the daily
+# allowance finish and then refuses every request until the window resets,
+# zero-credit (assist lane) models included. So the proxy keeps the remaining
+# figure each reply carries (X-RateLimit-Remaining-Credits-Day, less that
+# reply's own cost, in case the header was sent before the reply was billed)
+# and refuses a metered request whose estimated cost, plus the requests still
+# in flight, would not fit. Free models always pass, so the user can switch
+# to one and keep working. With no remaining figure seen yet (a key that does
+# not send the header) the guard does nothing.
+_BUDGET: Dict[str, Any] = {"left": None, "ts": 0.0, "reset": None}
+_BUDGET_INFLIGHT: Dict[str, Tuple[float, int]] = {}
+_BUDGET_LOCK = threading.Lock()
+_BUDGET_OUT_RESERVE = 8192    # output + reasoning tokens assumed per request
+_BUDGET_IMAGE_TOKENS = 1500   # per image part (base64 is not counted as text)
+_BUDGET_DEFAULT_WEIGHTS = (2, 5)  # unknown model: the documented pro weights
+_MODEL_INFO: Dict[str, Dict[str, Any]] = {}   # catalog id -> {"lane", "weights", "chat"}
+_MODEL_INFO_TRIED = [0.0]
+
+
+def _note_catalog(body: Any) -> None:
+    """Keep each model's lane and credit weights from a /v1/models body."""
+    if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+        return
+    for d in body["data"]:
+        if not isinstance(d, dict) or not d.get("id"):
+            continue
+        w = d.get("credit_weights") if isinstance(d.get("credit_weights"), dict) else {}
+        try:
+            weights = (int(w["input"]), int(w["output"])) if w else None
+        except (KeyError, TypeError, ValueError):
+            weights = None
+        _MODEL_INFO[d["id"]] = {"lane": d.get("lane"), "weights": weights,
+                                "chat": (d.get("capabilities") or {}).get("chat", True)}
+
+
+def _load_catalog() -> None:
+    """Fetch the catalog once when the guard needs weights and no client has
+    listed models through this proxy yet (retried at most every 5 minutes)."""
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    if _MODEL_INFO or not PROXY_API_URL or now - _MODEL_INFO_TRIED[0] < 300:
+        return
+    _MODEL_INFO_TRIED[0] = now
+    try:
+        resp = requests.get(MODELS_URL, headers={"Authorization": f"Bearer {PROXY_API_KEY}"},
+                            verify=False, timeout=15)
+        if resp.status_code == 200:
+            _note_catalog(resp.json())
+    except (requests.RequestException, ValueError):
+        pass
+
+
+def _is_free_model(model: str) -> bool:
+    info = _MODEL_INFO.get(model) or {}
+    if info.get("lane") == "assist" or info.get("weights") == (0, 0):
+        return True
+    return model.endswith("-assist") or model == "gemini-enterprise"
+
+
+def _model_weights(model: str) -> Tuple[int, int]:
+    if _is_free_model(model):
+        return (0, 0)
+    return (_MODEL_INFO.get(model) or {}).get("weights") or _BUDGET_DEFAULT_WEIGHTS
+
+
+def _usage_cost(model: str, usage: Dict[str, Any]) -> int:
+    """Credits one reply cost: prompt x W_in + (completion + reasoning) x W_out.
+    Reasoning tokens are reported apart from completion_tokens and are billed
+    as output here (undocumented upstream; the upper estimate)."""
+    w_in, w_out = _model_weights(model)
+    rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+    try:
+        return int(usage.get("prompt_tokens") or 0) * w_in + \
+            (int(usage.get("completion_tokens") or 0) + int(rt)) * w_out
+    except (TypeError, ValueError):
+        return 0
+
+
+def _budget_note(req_id: str, model: str, hdr: Dict[str, Any],
+                 usage: Optional[Dict[str, Any]], reset_s: Optional[int] = None) -> None:
+    """Update the remaining figure from one upstream reply and release the
+    request's in-flight estimate."""
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    with _BUDGET_LOCK:
+        _BUDGET_INFLIGHT.pop(req_id, None)
+        left = hdr.get("x-ratelimit-remaining-credits-day")
+        if left is None:
+            return
+        try:
+            left_n = int(float(left))
+        except (TypeError, ValueError):
+            return
+        if isinstance(usage, dict):
+            left_n -= _usage_cost(model, usage)
+        reset = reset_s
+        if reset is None:
+            try:
+                reset = int(float(hdr["x-ratelimit-reset-credits-day"]))
+            except (KeyError, TypeError, ValueError):
+                reset = None
+        _BUDGET.update(left=max(0, left_n), ts=now, reset=reset)
+
+
+def _budget_failed(req_id: str, spent_reset_s: Optional[int]) -> None:
+    """An upstream refusal: release the request's estimate and, when it was
+    the daily budget, hold metered requests until the window resets."""
+    with _BUDGET_LOCK:
+        _BUDGET_INFLIGHT.pop(req_id, None)
+        if spent_reset_s is not None:
+            _BUDGET.update(left=0, ts=datetime.datetime.now(datetime.timezone.utc).timestamp(),
+                           reset=spent_reset_s)
+
+
+def _budget_seed(entry: Dict[str, Any]) -> None:
+    """Start from the newest ledger row, so a restarted proxy still guards."""
+    left = entry.get("budget_left")
+    if left is None:
+        left = (entry.get("remaining") or {}).get("credits-day")
+    if left is None:
+        return
+    try:
+        _BUDGET.update(left=int(float(left)), ts=float(entry.get("ts", 0)),
+                       reset=entry.get("reset"))
+    except (TypeError, ValueError):
+        pass
+
+
+def _estimate_request_tokens(body: Dict[str, Any]) -> int:
+    """Prompt tokens of a chat request, roughly: 1 token per 3 characters of
+    text (on the high side for code), a flat figure per image."""
+    chars = images = 0
+    for m in body.get("messages") or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        parts = content if isinstance(content, list) else [content]
+        for p in parts:
+            if isinstance(p, dict) and p.get("type") in ("image_url", "image", "input_image"):
+                images += 1
+            elif isinstance(p, dict):
+                chars += len(str(p.get("text") or ""))
+            elif p is not None:
+                chars += len(str(p))
+        if isinstance(m, dict) and m.get("tool_calls"):
+            chars += len(json.dumps(m["tool_calls"]))
+    chars += len(json.dumps(body.get("tools") or []))
+    return chars // 3 + images * _BUDGET_IMAGE_TOKENS
+
+
+def _budget_check(req_id: str, model: str, body: Dict[str, Any]) -> Optional[Response]:
+    """None to let a request through, or the refusal to send instead."""
+    if PROXY_BACKEND == "chatgpt" or _is_oai_model(model):
+        return None
+    _load_catalog()
+    if _is_free_model(model):
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    w_in, w_out = _model_weights(model)
+    est = _estimate_request_tokens(body) * w_in + _BUDGET_OUT_RESERVE * w_out
+    with _BUDGET_LOCK:
+        for k, (t0, _) in list(_BUDGET_INFLIGHT.items()):
+            if now - t0 > PROXY_TIMEOUT + 60:
+                del _BUDGET_INFLIGHT[k]
+        left, ts, reset = _BUDGET["left"], _BUDGET["ts"], _BUDGET["reset"]
+        # The figure holds until the window resets (24 h when the reset is unknown).
+        if left is None or now > ts + (reset if reset is not None else 86400):
+            return None
+        pending = sum(e for _, e in _BUDGET_INFLIGHT.values())
+        if est + pending <= left:
+            _BUDGET_INFLIGHT[req_id] = (now, est)
+            return None
+    free = sorted(m for m, i in _MODEL_INFO.items() if i.get("chat") and _is_free_model(m))
+    wait = int(ts + reset - now) if reset is not None else None
+    when = (f" Metered models are usable again in about {wait // 3600}h {wait % 3600 // 60}m."
+            if wait is not None else "")
+    print(f"[{req_id}] budget guard: refused model={model} est={est} pending={pending} left={left}",
+          flush=True)
+    return _client_error(
+        f"Daily budget guard: about {left:,} credits are left today and this request to "
+        f"{model} would cost about {est + pending:,}. Going over the daily limit locks out "
+        f"every model, the free ones too, until the window resets. Switch to a free model "
+        f"(/models){': ' + ', '.join(free) if free else ''} and continue.{when}", 402)
 
 
 class _UsageLine:
@@ -1584,6 +1773,7 @@ def _native_send(
         message = f"upstream returned status {resp.status_code}" + (f": {detail}" if detail else "")
         out_headers = _relay_headers(resp) if status < 500 else {}
         reset = _daily_quota_reset_seconds(resp.status_code, out_headers, err_body)
+        _budget_failed(req_id, reset)
         if reset is not None:
             # A spent daily budget: tell opencode to wait until it resets
             # (its retry honours Retry-After at any length), so the session
@@ -4691,6 +4881,11 @@ def list_models() -> Response:
             mimetype="application/json",
         )
     print(f"[{req_id}] GET /v1/models -> upstream {resp.status_code}", flush=True)
+    if resp.status_code == 200:
+        try:
+            _note_catalog(json.loads(resp.text))
+        except (TypeError, ValueError):
+            pass
     if oai_entries and resp.status_code == 200:
         try:
             body = resp.json()
@@ -4759,6 +4954,9 @@ def catch_all(path: str) -> Response:
         want_stream = bool(inbound_request.get("stream", False))
 
         print(f"[{req_id}] {request.method} /{path} model={model_name} messages={len(original_messages)} tools={len(tools)}", flush=True)
+        refused = _budget_check(req_id, model_name, inbound_request)
+        if refused is not None:
+            return refused
 
         # Native tool-calling models skip the cooperative pipeline entirely.
         # OAI models are always native, on their own upstream.
@@ -4847,7 +5045,9 @@ def catch_all(path: str) -> Response:
                 err_body = resp.text
             print(f"[{req_id}] upstream returned {resp.status_code}: {err_body}", flush=True)
             save_debug_file(req_id, "03", "API_Error", {"status": resp.status_code, "body": err_body})
-            return _client_error(f"upstream returned status {resp.status_code}", 502)
+            _budget_failed(req_id, _daily_quota_reset_seconds(resp.status_code, _relay_headers(resp), err_body))
+            detail = _upstream_error_detail(err_body)
+            return _client_error(f"upstream returned status {resp.status_code}" + (f": {detail}" if detail else ""), 502)
 
         try:
             target_json = resp.json()

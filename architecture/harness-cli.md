@@ -374,12 +374,21 @@ config layer, so the harness-written config is otherwise unchanged. It:
 
 - sets the `prompt` of the `build`, `plan` and `yolo` agents to
   `agents/slim-prompt.md` (about 3.6k chars instead of opencode's 15k
-  `gemini.txt`: delegate to `task` subagents to keep context small, todo-list
-  discipline, act don't describe, smallest change, honesty) and of the
-  `general` subagent to `agents/slim-subagent-prompt.md` (it has no `task`
-  or `todowrite`). `explore` keeps opencode's own short prompt. opencode
-  still appends its environment block, AGENTS.md/instructions and the skills
-  list, and the `skill` and `task` tools stay.
+  `gemini.txt`: every step costs, so work directly in few steps, batch tool
+  calls, search and read narrowly, stop exploring once able to act; todo-list
+  discipline with `todowrite` riding along with other calls; act don't
+  describe, smallest change, honesty) and of the `general` subagent to
+  `agents/slim-subagent-prompt.md` (it has no `task` or `todowrite`; `harness
+  probe slim` still uses it). `explore` keeps opencode's own short prompt.
+  opencode still appends its environment block, AGENTS.md/instructions and
+  the skills list.
+- gives the `build`, `plan` and `yolo` agents `permission.task: "deny"` (no
+  `task` tool, so no subagents) and `steps: 40` (opencode's per-prompt step
+  limit; on the last step it tells the model to stop and summarize, and the
+  proxy's `_at_step_cap` sends `tool_choice: none`). A delegated `explore`
+  subagent ran 40 to 100 steps, each re-billing its whole context, and a 5M
+  daily budget ran out before the task finished. The user says "continue" to
+  go past the cap.
 - adds the provider header `x-harness-slim: 1`, on which the proxy shortens
   the built-in tools' descriptions on the native route
   ([`proxy.md`](proxy.md)).
@@ -438,12 +447,31 @@ from: <path>" so the model knows where the vault is, and
 there needs no approval. `harness_opencode_overlay` deep-merges that with the
 slim overlay into the one `OPENCODE_CONFIG_CONTENT`. Container mode also
 appends the vault to the extra mounts (same absolute path, deduped against
-the CWD). Committing and pushing vault changes is the agent's job, as in any
-repo; inside a container the push needs the vault's git host marked
-`# git-push` in the allowlist (`firewall/configure-git-credentials.sh`). Clones live under `state/`, so `uninstall` deletes them; it first names
-any clone with uncommitted or unpushed work (a vault with no upstream
-counts as unpushed). `tests/unit_vault_test.sh` covers the registry, clone,
-fast-forward, offline fallback, the overlay and `new`.
+the CWD).
+
+Saving is harness's job, not the agent's. When an interactive session ends
+(`host_run_opencode` after opencode exits, `run_agent_interactive` after
+`docker run` returns, both on the host), `vault_sync` runs
+`scripts/vault_capture.py` on opencode's SQLite store (host:
+`${OPENCODE_DB:-${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db}`;
+container: `state/agent/home/.local/share/opencode/opencode.db`), read-only.
+Each top-level session updated since the launch started becomes
+`.raw/sessions/<YYYY-MM-DD>-<session id>.md` (rewritten on a rerun): front
+matter, then the user's and the assistant's text only (no tool output,
+reasoning or opencode-injected text; tool calls listed by name), with
+anything shaped like a key or token redacted (best effort). Then `git add
+-A`, one commit for everything the session changed in the vault, and a push
+when the branch has an upstream (no credential prompt, 30s limit; on a
+rejected push one `pull --rebase` and a second push; a conflict aborts the
+rebase and leaves the commit local). Every failure warns and the exit status
+is unchanged; without Python the capture is skipped and the commit still
+happens. The push uses the host's git credentials, so the container
+firewall is not involved. Print mode (`-p`) and `serve` do not sync.
+`vault-template/AGENTS.md` tells the agent not to run git itself. Clones
+live under `state/`, so `uninstall` deletes them; it first names any clone
+with uncommitted or unpushed work (a vault with no upstream counts as
+unpushed). `tests/unit_vault_test.sh` covers the registry, clone,
+fast-forward, offline fallback, the overlay, `new` and the sync.
 
 ### Interactive TTY resolution (Windows) — issue #82
 

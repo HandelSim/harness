@@ -4,6 +4,7 @@ Run inside the proxy container:
     docker compose run --rm proxy python -m unittest test_proxy.py
 """
 
+import datetime
 import io
 import json
 import os
@@ -5744,6 +5745,13 @@ class TestNativeToolPassthrough(unittest.TestCase):
         def close(self):
             self.closed = True
 
+    def setUp(self):
+        # The budget guard's state is module-wide; start every test unguarded.
+        for p in (patch.dict(proxy._BUDGET, {"left": None, "ts": 0.0, "reset": None}),
+                  patch.dict(proxy._BUDGET_INFLIGHT, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
     def _post(self, body, fake, slim=False):
         client = proxy.app.test_client()
         self.log = io.StringIO()
@@ -6004,7 +6012,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
                                       "completion_tokens_details": {"reasoning_tokens": 9}}}
                 body = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
                 self._post(body, self.FakeResp(200, json.dumps(upstream), headers={
-                    "X-RateLimit-Remaining-Credits-Day": "777", "Content-Type": "application/json"}))
+                    "X-RateLimit-Remaining-Credits-Day": "777000", "Content-Type": "application/json"}))
                 chunks = [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
                           b'data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":2}}\n\n',
                           b"data: [DONE]\n\n"]
@@ -6013,7 +6021,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
                 rows = [json.loads(line) for line in f]
         self.assertEqual(len(rows), 2)
         self.assertEqual((rows[0]["prompt"], rows[0]["completion"], rows[0]["reasoning"]), (1200, 30, 9))
-        self.assertEqual(rows[0]["remaining"], {"credits-day": "777"})
+        self.assertEqual(rows[0]["remaining"], {"credits-day": "777000"})
         self.assertEqual((rows[0]["model"], rows[0]["route"]), ("gemini-x-withtools", "native"))
         self.assertEqual(rows[1]["prompt"], 50)
 
@@ -6124,6 +6132,120 @@ class TestNativeToolPassthrough(unittest.TestCase):
             self.assertTrue(proxy._is_native_tool_model("gemini-3.8-flash-withtools"))
             self.assertFalse(proxy._is_native_tool_model("gemini-3.8-flash"))
             self.assertFalse(proxy._is_native_tool_model(""))
+
+
+class TestBudgetGuard(unittest.TestCase):
+    """Metered requests that would not fit in the day's remaining credits are
+    refused before they go upstream; free models always pass."""
+
+    CATALOG = {"data": [
+        {"id": "gemini-x-withtools", "lane": "standard", "credit_weights": {"input": 1, "output": 2},
+         "capabilities": {"chat": True}},
+        {"id": "gemini-x", "lane": "assist", "credit_weights": {"input": 0, "output": 0},
+         "capabilities": {"chat": True}},
+        {"id": "gemini-embed", "lane": "standard", "credit_weights": {"input": 1, "output": 0},
+         "capabilities": {"chat": False}}]}
+
+    FakeResp = TestNativeToolPassthrough.FakeResp
+    _post = TestNativeToolPassthrough._post
+
+    def setUp(self):
+        TestNativeToolPassthrough.setUp(self)
+        p = patch.dict(proxy._MODEL_INFO, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+        proxy._note_catalog(self.CATALOG)
+
+    def _reply(self, left, prompt=1000, completion=10, reasoning=0, reset="3600"):
+        usage = {"prompt_tokens": prompt, "completion_tokens": completion,
+                 "completion_tokens_details": {"reasoning_tokens": reasoning}}
+        return self.FakeResp(200, json.dumps({"choices": [{"message": {"content": "ok"}}], "usage": usage}),
+                             headers={"X-RateLimit-Remaining-Credits-Day": str(left),
+                                      "X-RateLimit-Reset-Credits-Day": reset})
+
+    BODY = {"model": "gemini-x-withtools", "messages": [{"role": "user", "content": "x"}]}
+
+    def test_off_until_a_remaining_figure_is_seen(self):
+        resp, _, mock_post = self._post(self.BODY, self._reply(10 ** 6))
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(mock_post.called)
+        # 1e6 less this reply's cost: 1000 x 1 + 10 x 2
+        self.assertEqual(proxy._BUDGET["left"], 10 ** 6 - 1020)
+        self.assertEqual(proxy._BUDGET["reset"], 3600)
+        self.assertEqual(proxy._BUDGET_INFLIGHT, {})
+
+    def test_refuses_request_that_would_not_fit(self):
+        self._post(self.BODY, self._reply(10000, prompt=0, completion=0))
+        resp, data, mock_post = self._post(self.BODY, self._reply(0))
+        self.assertEqual(resp.status_code, 402)
+        self.assertFalse(mock_post.called)
+        msg = json.loads(data)["error"]["message"]
+        self.assertIn("10,000 credits", msg)
+        self.assertIn("free model (/models): gemini-x and continue", msg)
+        self.assertNotIn("gemini-embed", msg)
+        self.assertIn("usable again in about 0h 59m", msg)
+        self.assertIn("budget guard: refused", self.log.getvalue())
+
+    def test_small_request_fits_and_is_held_in_flight(self):
+        self._post(self.BODY, self._reply(10 ** 6, prompt=0, completion=0))
+        self.assertIsNone(proxy._budget_check("a", "gemini-x-withtools", self.BODY))
+        est = proxy._BUDGET_INFLIGHT["a"][1]
+        self.assertEqual(est, 1 * 1 + proxy._BUDGET_OUT_RESERVE * 2)  # "x" + "[]" tools
+        proxy._BUDGET["left"] = est * 2
+        self.assertIsNone(proxy._budget_check("b", "gemini-x-withtools", self.BODY))
+        self.assertIsNotNone(proxy._budget_check("c", "gemini-x-withtools", self.BODY))
+
+    def test_free_models_always_pass(self):
+        proxy._BUDGET.update(left=0, ts=9e12, reset=3600)
+        self.assertIsNone(proxy._budget_check("a", "gemini-x", self.BODY))
+        self.assertIsNone(proxy._budget_check("b", "gemini-3.5-pro-assist", self.BODY))
+        self.assertIsNotNone(proxy._budget_check("c", "gemini-x-withtools", self.BODY))
+        self.assertIsNotNone(proxy._budget_check("d", "unknown-model", self.BODY))
+
+    def test_figure_expires_at_reset(self):
+        proxy._BUDGET.update(left=0, ts=1.0, reset=3600)
+        self.assertIsNone(proxy._budget_check("a", "gemini-x-withtools", self.BODY))
+
+    def test_daily_429_holds_metered_models(self):
+        err = {"error": {"message": "You've used 5000100 of your 5000000 token allowance for this "
+                                    "24-hour window. Your limit resets in 2h 0m."}}
+        resp, _, _ = self._post(self.BODY, self.FakeResp(429, json.dumps(err)))
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual((proxy._BUDGET["left"], proxy._BUDGET["reset"]), (0, 7200))
+        resp, _, mock_post = self._post(self.BODY, self._reply(0))
+        self.assertEqual(resp.status_code, 402)
+        self.assertFalse(mock_post.called)
+
+    def test_images_and_tools_count(self):
+        body = {"messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "a" * 300},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 90000}}]}],
+                "tools": []}
+        self.assertEqual(proxy._estimate_request_tokens(body), 100 + 2 // 3 + proxy._BUDGET_IMAGE_TOKENS)
+
+    def test_ledger_seeds_a_restarted_proxy(self):
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "usage.jsonl")
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            with open(ledger, "w") as f:
+                f.write(json.dumps({"ts": now - 10, "remaining": {"credits-day": "900"}}) + "\n")
+                f.write(json.dumps({"ts": now, "remaining": {"credits-day": "800"},
+                                    "budget_left": 700, "reset": 50}) + "\n")
+            with patch.dict(os.environ, {"PROXY_USAGE_LEDGER": ledger}), \
+                    patch.object(proxy, "_USAGE_LEDGER", ""):
+                proxy._setup_usage_ledger()
+        self.assertEqual((proxy._BUDGET["left"], proxy._BUDGET["reset"]), (700, 50))
+
+    def test_models_route_notes_weights(self):
+        proxy._MODEL_INFO.clear()
+        cat = {"data": [{"id": "m-free", "lane": "assist", "credit_weights": {"input": 0, "output": 0}}]}
+        with patch.object(proxy, "PROXY_API_URL", "https://up.example"), \
+                patch.object(proxy, "PROXY_BACKEND", "openai"), \
+                patch.object(proxy, "OAI_BASE", ""), \
+                patch.object(proxy.requests, "get", return_value=self.FakeResp(200, json.dumps(cat))), \
+                patch("sys.stdout", io.StringIO()):
+            proxy.app.test_client().get("/v1/models")
+        self.assertTrue(proxy._is_free_model("m-free"))
 
 
 class TestThoughtSignaturesAndThoughts(unittest.TestCase):

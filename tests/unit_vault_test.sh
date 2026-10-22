@@ -11,6 +11,10 @@
 #                                         when the remote is unreachable
 #   - vault_opencode_config               instructions + external_directory
 #   - harness_opencode_overlay            merges with the --slim overlay
+#   - vault_sync + scripts/vault_capture.py
+#                                         copy the session's conversation into
+#                                         .raw/sessions/, commit, push (rebasing
+#                                         once on a moved remote)
 #
 # Prints "VAULT TEST PASSED" on success.
 
@@ -164,5 +168,64 @@ err_out=$(vault_prepare 2>&1 >/dev/null)
 mv "$fresh.away" "$fresh"
 grep -q "is gone" <<<"$err_out" || fail "V7: a missing local vault should say so — $err_out"
 ok "V7: new makes a committed vault from the template or a repo, and launches use it"
+
+# --- V8: vault_sync captures the session, commits and pushes -----------------
+PY=$(host_python_bin) || fail "V8: this test needs python 3"
+DB="$TMP_ROOT/opencode.db"
+# shellcheck disable=SC2086
+$PY - "$DB" <<'PYEOF' || fail "V8: could not build the fixture database"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("""
+CREATE TABLE session (id TEXT, parent_id TEXT, directory TEXT, title TEXT, time_created INT,
+  time_updated INT, tokens_input INT, tokens_output INT);
+CREATE TABLE message (id TEXT, session_id TEXT, time_created INT, data TEXT);
+CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INT, data TEXT);
+""")
+c.execute("INSERT INTO session VALUES ('ses_new', NULL, '/w', 'Fix the bug', 1761100000000, 1761100500000, 900, 40)")
+c.execute("INSERT INTO session VALUES ('ses_sub', 'ses_new', '/w', 'subagent', 1761100100000, 1761100500000, 1, 1)")
+c.execute("INSERT INTO session VALUES ('ses_old', NULL, '/w', 'Old', 1, 2, 1, 1)")
+msgs = [("m1", "ses_new", "user", [{"type": "text", "text": "fix it, key sk-abcdefghijklmnopqrstuvwx"},
+                                    {"type": "text", "text": "INJECTED", "synthetic": True}]),
+        ("m2", "ses_new", "assistant", [{"type": "reasoning", "text": "THINKING"},
+                                         {"type": "tool", "tool": "read", "state": {"output": "TOOLOUT"}},
+                                         {"type": "tool", "tool": "read"}, {"type": "tool", "tool": "edit"},
+                                         {"type": "text", "text": "Fixed in a.py"}]),
+        ("m3", "ses_sub", "user", [{"type": "text", "text": "SUBAGENT"}]),
+        ("m4", "ses_old", "user", [{"type": "text", "text": "OLD"}])]
+for i, (mid, sid, role, parts) in enumerate(msgs):
+    c.execute("INSERT INTO message VALUES (?,?,?,?)", (mid, sid, i, json.dumps({"role": role})))
+    for j, p in enumerate(parts):
+        c.execute("INSERT INTO part VALUES (?,?,?,?,?)", (f"{mid}p{j}", mid, sid, j, json.dumps(p)))
+c.commit()
+PYEOF
+SYNC="$TMP_ROOT/sync"
+git clone -q "$REMOTE" "$SYNC" 2>/dev/null
+printf 'agent note\n' > "$SYNC/note.md"
+out=$(vault_sync "$SYNC" 1761100000000 "$DB" 2>&1) || fail "V8: vault_sync failed — $out"
+cap="$SYNC/.raw/sessions/2025-10-22-ses_new.md"
+[[ -f "$cap" ]] || fail "V8: no capture at $cap — $(ls -R "$SYNC/.raw" 2>&1)"
+[[ "$(ls "$SYNC/.raw/sessions")" == "2025-10-22-ses_new.md" ]] || fail "V8: only the new root session belongs there — $(ls "$SYNC/.raw/sessions")"
+grep -q '^title: "Fix the bug"$' "$cap" && grep -q 'Fixed in a.py' "$cap" && grep -q '_tools: read x2, edit_' "$cap" \
+    || fail "V8: capture lacks the title, the reply or the tool list — $(cat "$cap")"
+grep -q 'sk-abcdefghij\|INJECTED\|THINKING\|TOOLOUT' "$cap" && fail "V8: capture kept a key, injected text, reasoning or tool output — $(cat "$cap")"
+[[ -z "$(git -C "$SYNC" status --porcelain)" ]] || fail "V8: vault left uncommitted changes"
+[[ "$(git -C "$SYNC" rev-parse HEAD)" == "$(git --git-dir="$REMOTE" rev-parse HEAD)" ]] || fail "V8: commit was not pushed — $out"
+grep -q "pushed" <<<"$out" || fail "V8: should say it pushed — $out"
+# The remote moved on meanwhile: the push is rebased once and goes through.
+OTHER="$TMP_ROOT/other"
+git clone -q "$REMOTE" "$OTHER" 2>/dev/null
+printf 'x\n' > "$OTHER/other.md"; git -C "$OTHER" add other.md; git -C "$OTHER" commit -qm other
+git -C "$OTHER" push -q 2>/dev/null
+printf 'more\n' >> "$SYNC/note.md"
+out=$(vault_sync "$SYNC" 1761100000000 "$DB" 2>&1)
+grep -q "after rebasing" <<<"$out" || fail "V8: a moved remote should be rebased on — $out"
+[[ "$(git -C "$SYNC" rev-parse HEAD)" == "$(git --git-dir="$REMOTE" rev-parse HEAD)" ]] || fail "V8: rebased commit not pushed"
+# Nothing changed: no commit. No vault: a no-op.
+before=$(git -C "$SYNC" rev-parse HEAD)
+vault_sync "$SYNC" 1761100000000 "$DB" >/dev/null 2>&1
+[[ "$(git -C "$SYNC" rev-parse HEAD)" == "$before" ]] || fail "V8: a rerun with nothing new should not commit"
+vault_sync "" 0 "$DB" || fail "V8: no vault should be a no-op"
+ok "V8: vault_sync captures the session's text (redacted), commits and pushes, rebasing once"
 
 echo "VAULT TEST PASSED"

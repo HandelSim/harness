@@ -11,7 +11,8 @@ answered from what was already read and worked out, not from scratch.
 ## Layout
 
 - `.raw/` holds sources as they arrived: articles, transcripts, PDFs, exports,
-  notes. Read them; never edit, rename or delete them.
+  notes. Read them; never edit, rename or delete them. `.raw/sessions/` holds
+  harness's copy of each past conversation; ingest those only when asked.
 - `wiki/` holds the pages you write and keep current, one topic per page, in
   `wiki/sources/`, `wiki/concepts/`, `wiki/entities/` (people, organizations,
   projects, tools) and `wiki/questions/`.
@@ -63,6 +64,5 @@ the rest in the log entry.
 
 ## Git
 
-Commit after each unit of work, with a message that says what changed
-(`wiki: ingest <source title>`). Push when the repo has a remote. Never rewrite
-history.
+harness commits and pushes this vault when the session ends; do not run git
+yourself unless asked. Never rewrite history.

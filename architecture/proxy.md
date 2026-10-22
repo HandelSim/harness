@@ -106,6 +106,26 @@ are the only changes made to the request or the reply:
   failure warns once and turns the ledger off until restart. `harness usage`
   reads it ([`harness-cli.md`](harness-cli.md)). Cooperative retries and
   require-tool re-asks are not recorded, so that route reads slightly low.
+  Each line also carries `budget_left` and `reset` from the budget guard.
+- **Daily budget guard** (`_budget_check`, at the top of `catch_all`). The
+  upstream lets the request that crosses the daily allowance finish, then
+  refuses every model, zero-credit ones too, until the window resets. So
+  `_budget_note` keeps the latest `X-RateLimit-Remaining-Credits-Day` less
+  that reply's own cost (`prompt x W_in + (completion + reasoning) x W_out`,
+  in case the header predates billing) and `X-RateLimit-Reset-Credits-Day`;
+  a daily 429 sets it to 0 until its reset. A metered request is refused
+  with a 402 (not retried by opencode) when its estimate (`chars / 3 x W_in`
+  plus 1,500 tokens per image, plus 8,192 output tokens `x W_out`) plus the
+  estimates of requests still in flight exceeds that figure. The message
+  names the free models and when metered ones return. Free models (catalog
+  `lane: assist` or `credit_weights` 0/0, else a `-assist` name or
+  `gemini-enterprise`) always pass, as do OAI models and the chatgpt
+  backend. Weights come from `/v1/models` replies (`_note_catalog`), or one
+  catalog fetch when none has passed through; an unknown model counts as
+  2/5. The figure holds until its reset (24 h when unknown), survives a
+  restart through the ledger's last line, and with no header ever seen the
+  guard does nothing. It cannot see other clients spending the same key
+  between two replies.
 - **Old tool output trimmed** (slim only: `x-harness-slim: 1`;
   `_TOOL_OUTPUT_KEEP` = 40,000 tokens). Every native step re-bills the whole history, and most
   of it is tool output. `_trim_plan` keeps about the newest `KEEP × 3` chars
