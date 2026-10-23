@@ -6565,6 +6565,49 @@ class TestThoughtSignaturesAndThoughts(unittest.TestCase):
         self.assertEqual(json.loads(data), reply)
 
 
+class TestRawIngestHeader(unittest.TestCase):
+    """`x-harness-raw: 1` (harness ingest) sends a tool-less cooperative
+    request upstream as plain messages: no scaffold, no reminder, no
+    tool-call extraction. Without the header the request is unchanged."""
+
+    FakeResp = TestNativeToolPassthrough.FakeResp
+
+    def _post(self, body, reply, headers=None):
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post", return_value=self.FakeResp(200, json.dumps(reply))) as mock_post, \
+                patch.object(proxy, "save_debug_file"), \
+                patch.object(proxy, "_NATIVE_TOOL_PATTERNS", ("*-withtools",)), \
+                patch("sys.stdout", io.StringIO()):
+            resp = client.post("/v1/chat/completions", data=json.dumps(body),
+                               content_type="application/json", headers=headers or {})
+            data = resp.get_data()
+        return resp, data, mock_post
+
+    def test_raw_sends_plain_messages_and_returns_text(self):
+        body = {"model": "gemini-x", "stream": False,
+                "messages": [{"role": "system", "content": "RULES"},
+                             {"role": "user", "content": "SOURCE"}]}
+        md = "summary: s\n\n```json\n{\"name\": \"bash\", \"arguments\": {}}\n```"
+        reply = {"choices": [{"message": {"role": "assistant", "content": md}}]}
+        resp, data, mock_post = self._post(body, reply, {"x-harness-raw": "1"})
+        self.assertEqual(resp.status_code, 200)
+        sent = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent["messages"], [{"role": "user", "content": "RULES\n\nSOURCE"}])
+        out = json.loads(data)
+        # A json fence in the text stays text: no tool-call extraction.
+        self.assertEqual(out["choices"][0]["message"]["content"], md)
+        self.assertNotIn("tool_calls", out["choices"][0]["message"])
+        self.assertEqual(out["model"], "gemini-x")
+
+    def test_without_header_scaffold_applies(self):
+        body = {"model": "gemini-x", "stream": False,
+                "messages": [{"role": "user", "content": "SOURCE"}]}
+        reply = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        _, _, mock_post = self._post(body, reply)
+        sent = mock_post.call_args.kwargs["json"]["messages"]
+        self.assertIn("<<<BEGIN_USER_REQUEST>>>", sent[-1]["content"])
+
+
 class TestOaiUpstream(unittest.TestCase):
     """OAI_MODELS go to the OAI upstream natively: chat requests get the
     reasoning-model fixes and a cache key, and /v1/responses is relayed with

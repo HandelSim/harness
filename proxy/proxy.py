@@ -4280,6 +4280,58 @@ def generate_openai_sse(
     yield "data: [DONE]\n\n"
 
 
+# `harness ingest` sends `x-harness-raw: 1` with a tool-less request: on the
+# cooperative route the messages go upstream as they are (a system message
+# folded into the first user message) and the reply comes back as plain text.
+# No tool scaffold, no reminder, no tool-call extraction, never streamed: the
+# agent scaffold tells the model every message needs a tool call, which is
+# wrong for a one-shot "write this section" request. Native models already
+# pass a tool-less request through unchanged.
+_RAW_HEADER = "x-harness-raw"
+
+
+def _raw_completion(req_id: str, original_messages: List[Dict[str, Any]],
+                    model_name: str, reply_model: str) -> Response:
+    system = "\n\n".join(_flatten_content_to_str(m.get("content") or "")
+                         for m in original_messages if m.get("role") == "system")
+    messages = [{"role": m.get("role"), "content": _flatten_content_to_str(m.get("content") or "")}
+                for m in original_messages if m.get("role") in ("user", "assistant")]
+    if system:
+        if messages and messages[0]["role"] == "user":
+            messages[0]["content"] = system + "\n\n" + messages[0]["content"]
+        else:
+            messages.insert(0, {"role": "user", "content": system})
+    payload = {"model": model_name or DEFAULT_MODEL_NAME, "messages": messages}
+    save_debug_file(req_id, "02", "API_Request", payload)
+    try:
+        resp = _upstream_post({"Content-Type": "application/json",
+                               "Authorization": f"Bearer {PROXY_API_KEY}"}, payload)
+    except requests.RequestException as e:
+        print(f"[{req_id}] raw: upstream request failed: {e}", flush=True)
+        return _client_error(f"upstream request failed: {e}", 502)
+    if resp.status_code >= 400:
+        try:
+            err_body: Any = resp.json()
+        except Exception:
+            err_body = resp.text
+        print(f"[{req_id}] raw: upstream returned {resp.status_code}: {err_body}", flush=True)
+        _budget_failed(req_id, _daily_quota_reset_seconds(resp.status_code, _relay_headers(resp), err_body))
+        detail = _upstream_error_detail(err_body)
+        return _client_error(f"upstream returned status {resp.status_code}" + (f": {detail}" if detail else ""), 502)
+    try:
+        target_json = resp.json()
+    except ValueError as e:
+        return _client_error(f"upstream returned non-JSON: {e}", 502)
+    save_debug_file(req_id, "03", "API_Response", target_json)
+    usage = target_json.get("usage") if isinstance(target_json, dict) else None
+    _record_usage(req_id, payload["model"], usage, getattr(resp, "headers", None),
+                  "cooperative", _session_id(request.headers))
+    text = extract_assistant_content(target_json) if isinstance(target_json, dict) else ""
+    print(f"[{req_id}] raw: {len(text)} chars", flush=True)
+    return Response(json.dumps(build_openai_response(reply_model, text, [], usage)),
+                    status=200, mimetype="application/json")
+
+
 def build_openai_response(
     model_name: str,
     clean_text: str,
@@ -5162,6 +5214,8 @@ def catch_all(path: str) -> Response:
             return _client_error(
                 f"model '{model_name}' is not in OAI_MODELS and no vendor upstream "
                 "(PROXY_API_URL) is set", 400)
+        if request.headers.get(_RAW_HEADER, "") == "1" and not tools:
+            return _raw_completion(req_id, original_messages, model_name, reply_model)
 
         # Require-tool mode shows the model one extra tool, `finish`, and
         # everything prompt-facing is built from the augmented array so the

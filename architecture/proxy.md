@@ -326,6 +326,18 @@ unchanged. It's declared as an explicit Flask route so it wins over `catch_all`.
 The agent entrypoint consumes it at startup to build the opencode model dropdown
 (see [`containers.md`](containers.md)).
 
+## Raw requests (`x-harness-raw: 1`, used by `harness ingest`)
+
+A tool-less chat request with header `x-harness-raw: 1` skips the cooperative
+pipeline (`_raw_completion`): system messages are folded into the first user
+message, the user/assistant messages go upstream as plain text, and the reply
+comes back as a non-streamed `chat.completion` with the text untouched. There is
+no tool scaffold, no reminder, no tool-call extraction and no retry, since the
+agent scaffold ("every message needs a tool call", "you have no todo list") is
+wrong for a one-shot "write this wiki section" request. Usage is recorded and
+budget failures are handled as on the normal path. Native and OAI models never
+reach this branch; a tool-less request already passes through them unchanged.
+
 ## Cooperative-prompt modes (`PROXY_PROMPT_MODE`)
 
 The upstream doesn't natively support tool calls, so the proxy injects a
