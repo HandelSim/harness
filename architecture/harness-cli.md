@@ -385,12 +385,14 @@ config layer, so the harness-written config is otherwise unchanged. It:
   appends its environment block, AGENTS.md/instructions and the skills list.
 - sets `steps` (opencode's per-prompt step limit; on the last step it tells
   the model to stop and summarize, and the proxy's `_at_step_cap` sends
-  `tool_choice: none`): 40 on `build`, `plan` and `yolo` (the user says
-  "continue" to go past it), 15 on `general`, 10 on `explore`. Subagents are
-  kept because their reads never enter the main context, so a step of theirs
-  re-bills far less; uncapped, an `explore` subagent ran 40 to 100 steps and
-  a 5M daily budget ran out before the task finished. At its cap a subagent
-  hands its parent a partial report, which the parent continues from.
+  `tool_choice: none`) on the subagents only: 15 on `general`, 10 on
+  `explore`. Subagents are kept because their reads never enter the main
+  context; uncapped, an `explore` subagent ran 40 to 100 steps, reading whole
+  files, and a 5M daily budget ran out before the task finished. At its cap a
+  subagent hands its parent a partial report, which the parent continues
+  from. The main agents have no cap, since a long task may need many steps.
+  `explore` is not disabled: opencode's plan-mode reminder and its
+  truncated-output notice both tell the agent to use it.
 - adds the provider header `x-harness-slim: 1`, on which the proxy shortens
   the built-in tools' descriptions on the native route
   ([`proxy.md`](proxy.md)).

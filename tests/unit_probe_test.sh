@@ -109,7 +109,7 @@ def leak(h):
             "see https://unlock.secretcorp.example/u?k=1 org AcmeInternalOrg" % (h.headers.get("Authorization"), h.headers.get("Host")))
 
 
-def slim_turn(msgs, h):
+def slim_turn(msgs, h, tools=()):
     """The slim suite's scripted agent: (tool_calls, content) or None when the
     request is not one of its loops. Main: read the test, ask an explore
     subagent, read average.py, edit it, run pytest, answer. Subagent: grep,
@@ -126,7 +126,8 @@ def slim_turn(msgs, h):
     hist = [c for m in msgs if m.get("role") == "assistant" for c in m.get("tool_calls") or []]
     sigs = sum(1 for c in hist if c.get("extra_content"))
     which = ("candidate" if "Trust their reports" in sysm else "current") if kind == "main" else \
-        ("explore" if "file search specialist" in sysm else "general" if "You are a subagent" in sysm else "?")
+        ("?" if "You are a subagent" not in sysm else
+         "general" if any((t.get("function") or {}).get("name") == "edit" for t in tools) else "explore")
     with open(SLIM_REC, "a") as f:
         f.write("%s sys=%s step=%d tcs=%d sigs=%d\n" % (kind, which, step, len(hist), sigs))
     last = str(msgs[-1].get("content") or "")
@@ -252,7 +253,7 @@ class H(BaseHTTPRequestHandler):
             # Memory suite: behave like an upstream that sees only the last
             # message (echo the crate labels found there).
             content = " ".join(re.findall(r"[B-Z]{3}-[0-9]{3}", last_text)) + " " + leak(self)
-        slim = slim_turn(msgs, self) if tools else None
+        slim = slim_turn(msgs, self, tools) if tools else None
         if slim is not None:
             tool_calls, content = slim
         elif tools and last.get("role") == "user" and req.get("tool_choice") != "none":

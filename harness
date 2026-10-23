@@ -5472,12 +5472,13 @@ host_write_opencode_config() {
 # config layer. It replaces the system prompt of the build, plan and yolo
 # agents with agents/slim-prompt.md and of the general subagent with
 # agents/slim-subagent-prompt.md, and of the explore subagent too (opencode's
-# own asks it to be thorough; its read-only permissions are kept). Each agent
-# gets a per-prompt step cap: 40 for build, plan and yolo (the user says
-# "continue" to go past it), 15 for general and 10 for explore. Subagents stay,
-# since their reads never enter the main context, but uncapped they explored
-# for 40 to 100 steps on a metered daily budget; at the cap opencode makes the
-# subagent report what it has. It also adds the `x-harness-slim: 1` provider header, on which the proxy swaps
+# own asks it to be thorough; its read-only permissions are kept). The two
+# subagents get a per-prompt step cap, 15 for general and 10 for explore: their
+# reads never enter the main context, but uncapped they explored for 40 to 100
+# steps on a metered daily budget; at the cap opencode makes the subagent report
+# what it has. The main agents are not capped (a long task may need many steps).
+# Explore stays enabled because opencode's own plan-mode and truncated-output
+# texts tell the agent to use it. It also adds the `x-harness-slim: 1` provider header, on which the proxy swaps
 # the built-in tools' long descriptions for short ones. With the argument `oai`
 # (a host launch with an OAI upstream) the header goes on the harness-oai
 # provider too. Prints nothing when slim is off or a prompt file is missing
@@ -5491,13 +5492,11 @@ slim_opencode_config() {
         return 0
     fi
     harness_jq -cn --arg main "$(cat "$main_prompt")" --arg sub "$(cat "$sub_prompt")" \
-        --arg oai "${1:-}" --arg serve "${harness_serve:-0}" \
-        --argjson lean '{"steps": 40}' '{
+        --arg oai "${1:-}" --arg serve "${harness_serve:-0}" '{
       "provider": ((if $serve == "1" then {} else {"harness": {"options": {"headers": {"x-harness-slim": "1"}}}} end)
         + (if $oai == "oai" then {"harness-oai": {"options": {"headers": {"x-harness-slim": "1"}}}} else {} end)),
       "agent": {
-        "build": ({"prompt": $main} + $lean), "plan": ({"prompt": $main} + $lean),
-        "yolo": ({"prompt": $main} + $lean),
+        "build": {"prompt": $main}, "plan": {"prompt": $main}, "yolo": {"prompt": $main},
         "general": {"prompt": $sub, "steps": 15}, "explore": {"prompt": $sub, "steps": 10}
       }
     }'
