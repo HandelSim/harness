@@ -687,8 +687,8 @@ def regenerate(vault):
         else:
             line = f"- [[{p['name']}]]: {summ(rel) or '(no summary)'}"
         groups.setdefault(folder, []).append(line)
-    order = [".", "code", "sources", "topics", "tickets"]
-    heads = {".": "Top level", "code": "Codebases", "sources": "Sources and sessions",
+    order = [".", "notes", "code", "sources", "topics", "tickets"]
+    heads = {".": "Top level", "notes": "Notes", "code": "Codebases", "sources": "Sources and sessions",
              "topics": "Topics", "tickets": "Tickets"}
     out = ["---", "type: index", "summary: every page of this vault, one line each", GENERATED, "---", "",
            "# Index", "",

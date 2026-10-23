@@ -358,6 +358,7 @@ ticket_pattern: '[A-Z]+-[0-9]+'
 MDEOF
 mkdir -p "$V/.raw/notes"
 printf -- '---\ntitle: Meeting\n---\n## Day one\nWe decided on ABC-12 and DEF-3.\n' > "$V/.raw/notes/meeting.md"
+printf -- '---\ntype: note\nsummary: why retries back off\n---\n# Retries\n' > "$V/wiki/notes/why-retry.md"
 ingest() {
     # shellcheck disable=SC2086
     $PY "$REPO_ROOT/scripts/vault_ingest.py" ingest --vault "$V" --proxy "http://127.0.0.1:$PORT/v1" \
@@ -384,6 +385,8 @@ grep -q 'Here you go\|```' "$src_page" && fail "V10: preamble and fence should b
 grep -q 'proj--src--util' "$src_page" || fail "V10: a directory page links its subdirectories — $(cat "$src_page")"
 grep -q '\[\[proj\]\]' "$V/wiki/index.md" || fail "V10: the index lists the codebase — $(cat "$V/wiki/index.md")"
 grep -q 'notes--meeting' "$V/wiki/index.md" || fail "V10: the index lists the sources — $(cat "$V/wiki/index.md")"
+grep -qx -- '- \[\[why-retry\]\]: why retries back off' "$V/wiki/index.md" && grep -qx '## Notes' "$V/wiki/index.md" \
+    || fail "V10: the index lists an agent's notes — $(cat "$V/wiki/index.md")"
 grep -q 'notes--meeting' "$V/wiki/tickets/ABC-12.md" || fail "V10: the ticket page links its sources — $(cat "$V/wiki/tickets/ABC-12.md")"
 ok "V10: ingest writes code, source, topic and ticket pages and the index, through the raw header on the free model"
 

@@ -47,7 +47,9 @@ clone. User config and `state/` are gitignored. `harness update` and
 ├── agents/                     agent image (opencode/shell)
 ├── firewall/                   universal egress firewall + git-creds
 ├── mcp-registry/<name>/        vetted MCP definitions
-├── vault-template/             skeleton for `harness vault new`
+├── vault-template/             skeleton for `harness vault new` (also an Obsidian vault)
+├── scripts/vault_capture.py    sessions → vault .raw/sessions (after each launch)
+├── scripts/vault_ingest.py     `harness ingest`: sources and codebases → wiki pages
 ├── scripts/lib/                shared bash libraries (platform, net, upgrade)
 ├── scripts/upgrade-manifest.json   how `harness upgrade` brings forward state
 ├── tests/                      see architecture/tests.md
