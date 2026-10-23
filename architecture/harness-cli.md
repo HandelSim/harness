@@ -373,22 +373,24 @@ an export in `host_run_opencode`); opencode deep-merges it over every other
 config layer, so the harness-written config is otherwise unchanged. It:
 
 - sets the `prompt` of the `build`, `plan` and `yolo` agents to
-  `agents/slim-prompt.md` (about 3.6k chars instead of opencode's 15k
+  `agents/slim-prompt.md` (about 4.2k chars instead of opencode's 15k
   `gemini.txt`: every step costs, so work directly in few steps, batch tool
   calls, search and read narrowly, stop exploring once able to act; todo-list
-  discipline with `todowrite` riding along with other calls; act don't
-  describe, smallest change, honesty) and of the `general` subagent to
-  `agents/slim-subagent-prompt.md` (it has no `task` or `todowrite`; `harness
-  probe slim` still uses it). `explore` keeps opencode's own short prompt.
-  opencode still appends its environment block, AGENTS.md/instructions and
-  the skills list.
-- gives the `build`, `plan` and `yolo` agents `permission.task: "deny"` (no
-  `task` tool, so no subagents) and `steps: 40` (opencode's per-prompt step
-  limit; on the last step it tells the model to stop and summarize, and the
-  proxy's `_at_step_cap` sends `tool_choice: none`). A delegated `explore`
-  subagent ran 40 to 100 steps, each re-billing its whole context, and a 5M
-  daily budget ran out before the task finished. The user says "continue" to
-  go past the cap.
+  discipline with `todowrite` riding along with other calls; delegate wide
+  searches to a subagent with one narrow question, at most 3 at once; act
+  don't describe, smallest change, honesty) and of the `general` and
+  `explore` subagents to `agents/slim-subagent-prompt.md` (return fast, aim
+  for 3 to 5 steps, report what is left if stopped early; neither has `task`
+  or `todowrite`, and explore keeps its read-only permissions). opencode still
+  appends its environment block, AGENTS.md/instructions and the skills list.
+- sets `steps` (opencode's per-prompt step limit; on the last step it tells
+  the model to stop and summarize, and the proxy's `_at_step_cap` sends
+  `tool_choice: none`): 40 on `build`, `plan` and `yolo` (the user says
+  "continue" to go past it), 15 on `general`, 10 on `explore`. Subagents are
+  kept because their reads never enter the main context, so a step of theirs
+  re-bills far less; uncapped, an `explore` subagent ran 40 to 100 steps and
+  a 5M daily budget ran out before the task finished. At its cap a subagent
+  hands its parent a partial report, which the parent continues from.
 - adds the provider header `x-harness-slim: 1`, on which the proxy shortens
   the built-in tools' descriptions on the native route
   ([`proxy.md`](proxy.md)).
@@ -1331,8 +1333,8 @@ pytest run is judged from the file text, model code never runs). The
 system prompts come from the clone (`--root`, which `cmd_probe` sets to
 `clone_dir`, mounting it read-only at `/harness` in the docker fallback),
 the tool descriptions from proxy.py's `_SLIM_TOOL_DESCRIPTIONS` via `ast`.
-`task` runs a nested loop with `agents/slim-subagent-prompt.md` (`general`)
-or a stand-in `explore` prompt (opencode's is not in the repo). Arms
+`task` runs a nested loop with `agents/slim-subagent-prompt.md` (`general`
+and `explore`, as slim sets both). Arms
 (digits for `--only`): 1 current prompt with thought signatures dropped (what
 opencode alone sends), 2 current prompt with signatures echoed (what the
 proxy now does), 3 `--candidate` (default `scripts/probe_slim_candidate.md`)

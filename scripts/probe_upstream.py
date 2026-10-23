@@ -3816,13 +3816,6 @@ _SLIM_REPO = {
                              '    assert median([4, 1, 3, 2]) == 2.5\n\n\ndef test_median_empty():\n'
                              '    with pytest.raises(ValueError):\n        median([])\n'),
 }
-# Stand-in for opencode's `explore` subagent prompt: opencode's real one ships
-# inside opencode, not in this repo (harness leaves explore's prompt alone).
-_SLIM_EXPLORE_PROMPT = (
-    "You are a file search specialist subagent. Answer the task you were given with read-only searches of "
-    "the codebase (glob, grep, list, read). Do not create or modify files. Prefer one targeted search over "
-    "many reads. Your final message is the only thing the calling agent receives: give the answer with "
-    "absolute paths and line numbers, short and complete.")
 # opencode appends its subagent list to the `task` description (the proxy's
 # slim description keeps that part). Paraphrased: the exact text is opencode's.
 _SLIM_AGENTS_LIST = (
@@ -4333,7 +4326,7 @@ class SlimProber(Prober):
 
     def system(self, run, kind):
         prompt = {"main": self.prompts.get(run["prompt"], ""), "general": self.prompts.get("sub", ""),
-                  "explore": _SLIM_EXPLORE_PROMPT}[kind]
+                  "explore": self.prompts.get("sub", "")}[kind]
         env = ("Here is some useful information about the environment you are running in:\n<env>\n"
                "  Working directory: %s\n  Is directory a git repo: yes\n  Platform: linux\n  Today's date: %s\n</env>"
                % (_SLIM_ROOT, datetime.date.today().strftime("%a %b %d %Y")))
@@ -4372,8 +4365,7 @@ class SlimProber(Prober):
                "applied, so absolute numbers understate a real slim session; the comparison between arms is what "
                "this measures")
         self.p("system prompt = the arm's prompt + an opencode-style <env> block + AGENTS.md as opencode appends it; "
-               "subagents: general = agents/slim-subagent-prompt.md, explore = a stand-in (opencode's own explore "
-               "prompt is not in this repo)")
+               "subagents: general and explore = agents/slim-subagent-prompt.md")
         self.p("prompts: current=agents/slim-prompt.md candidate=%s" % self.rel(self.a.candidate))
         self.p("tool descriptions: %s" % self.desc_note)
         self.p("bounds: main %d steps, subagent %d steps, %d requests per run"

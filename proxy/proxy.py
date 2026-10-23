@@ -812,10 +812,12 @@ _SLIM_TOOL_DESCRIPTIONS: Dict[str, str] = {
     ),
     "task": (
         "Launch a subagent in its own fresh context; only its final report comes back to you, so the "
-        "files and output it reads never fill your context. It starts blind: the `prompt` must state "
-        "the goal, relevant paths, constraints, whether to edit or only research, and exactly what to "
-        "return. `description` is 3-5 words. Several `task` calls in one message run in parallel. Pass "
-        "`task_id` to continue an earlier subagent. Its output is not shown to the user."
+        "files and output it reads never fill your context. It starts blind: the `prompt` must ask ONE "
+        "narrow question and state the relevant paths, constraints, whether to edit or only research, "
+        "and exactly what to return. It has a small step limit and reports what it has when it hits it: "
+        "continue from a partial report rather than relaunching the same search. `description` is 3-5 "
+        "words. Several `task` calls in one message run in parallel. Pass `task_id` to continue an "
+        "earlier subagent. Its output is not shown to the user."
     ),
     "skill": (
         "Load a skill's instructions into the conversation. `name` must be one of the skills listed in "
