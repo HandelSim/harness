@@ -1,0 +1,12 @@
+{
+  "colorGroups": [
+    {"query": "path:wiki/code", "color": {"a": 1, "rgb": 5431378}},
+    {"query": "path:wiki/sources", "color": {"a": 1, "rgb": 14701138}},
+    {"query": "path:wiki/topics", "color": {"a": 1, "rgb": 11621088}},
+    {"query": "path:wiki/tickets", "color": {"a": 1, "rgb": 15105570}},
+    {"query": "path:wiki/notes", "color": {"a": 1, "rgb": 3066993}}
+  ],
+  "showTags": false,
+  "showAttachments": false,
+  "hideUnresolved": false
+}

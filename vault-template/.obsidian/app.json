@@ -1,0 +1,10 @@
+{
+  "userIgnoreFilters": [
+    ".raw/",
+    "pub/",
+    ".harness/"
+  ],
+  "alwaysUpdateLinks": true,
+  "newFileFolderPath": "wiki/notes",
+  "newFileLocation": "folder"
+}

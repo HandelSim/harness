@@ -63,6 +63,8 @@ def _norm_dir(p):
 
 
 def _in_dir(directory, want):
+    if want == "*":  # harness vault import --all
+        return True
     d, w = _norm_dir(directory), _norm_dir(want)
     return bool(w) and (d == w or d.startswith(w + "/"))
 
@@ -225,6 +227,14 @@ def main(argv):
             day = datetime.datetime.fromtimestamp(sess[3] / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
             path = os.path.join(out, f"{day}-{sess[0]}.md")
             os.makedirs(out, exist_ok=True)
+            # Never shrink a captured session: if opencode lost messages (an
+            # undo, a revert), the file keeps what it had.
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    old = f.read()
+                if text.count("\n## ") < old.count("\n## "):
+                    print(f"vault capture: {path} kept, the session now has fewer messages", file=sys.stderr)
+                    continue
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             print(path)

@@ -338,6 +338,19 @@ wrong for a one-shot "write this wiki section" request. Usage is recorded and
 budget failures are handled as on the normal path. Native and OAI models never
 reach this branch; a tool-less request already passes through them unchanged.
 
+## Vault line (`x-harness-vault: <path>`)
+
+A launch with an active vault sends `x-harness-vault: <vault path>` (a provider
+header from the opencode overlay). On the cooperative route the reminder's
+Environment bullet then ends with one sentence (`_vault_clause`): the vault
+holds the project's notes, past sessions and decisions; grep its
+`wiki/index.md`, then `wiki/`, for the key words before answering about the
+project or past work; its `AGENTS.md` says how to write there. A free model sees
+the vault's `AGENTS.md` only at the start of a long, truncated history, so the
+pointer has to ride the per-turn reminder. Values that are empty, over 400
+characters or carry control characters add nothing; the native route ignores
+the header.
+
 ## Cooperative-prompt modes (`PROXY_PROMPT_MODE`)
 
 The upstream doesn't natively support tool calls, so the proxy injects a

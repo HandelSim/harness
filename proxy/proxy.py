@@ -3291,7 +3291,26 @@ def _extract_working_directory(system_content):
     return m.group(1).strip() or None
 
 
-def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None, working_directory=None, todos=None):
+# A launch with an active vault sends `x-harness-vault: <vault path>` (a
+# provider header in the opencode overlay). A cooperative model gets the
+# vault's AGENTS.md only at the start of a long, truncated history, so the
+# reminder's Environment bullet names the vault and how to look things up in
+# it, every turn. Native models read the instructions and get no line.
+_VAULT_HEADER = "x-harness-vault"
+
+
+def _vault_clause(vault):
+    v = str(vault or "").strip()
+    if not v or len(v) > 400 or any(ord(c) < 32 for c in v):
+        return ""
+    return (f" Knowledge vault: `{v}` holds this project's notes, past sessions and decisions."
+            f" Before answering about the project, its code or past work, `grep` `{v}/wiki/index.md`"
+            f" and then `{v}/wiki` for the key words and `read` the matching pages; `{v}/AGENTS.md`"
+            " says how to write there.")
+
+
+def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None, working_directory=None, todos=None,
+                                             vault=None):
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). The recency message that lands on the LAST user
@@ -3374,6 +3393,8 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         )
     else:
         cwd_clause = ""
+    if vault:
+        cwd_clause += _vault_clause(vault)
     tool_entries = _format_tool_entries(tool_signatures, tool_details)
     if _REMINDER_TEMPLATE is None:
         # Lazy load so importing proxy.py (tests) needs no main() call.
@@ -3892,6 +3913,7 @@ def translate_history_and_apply_prompt(
     original_messages: List[Dict[str, Any]],
     tools_text: str,
     tools: Optional[List[Dict[str, Any]]] = None,
+    vault: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
     Translate the inbound OpenAI-format messages into a flat conversation
@@ -4142,6 +4164,7 @@ def translate_history_and_apply_prompt(
                     details,
                     working_directory=working_directory,
                     todos=todos,
+                    vault=vault,
                 )
 
     if _PROMPT_MODE == "single":
@@ -5226,7 +5249,8 @@ def catch_all(path: str) -> Response:
         prompt_tools = _augment_tools_with_finish(tools) if require_tool else tools
 
         tools_text = format_tools_to_text(prompt_tools)
-        translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=prompt_tools)
+        translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=prompt_tools,
+                                                        vault=request.headers.get(_VAULT_HEADER))
 
         # Catalog-size instrumentation (council gate-trigger). `tools` ≈ recency
         # line count (one entry per tool); `schema_tokens` is what the full

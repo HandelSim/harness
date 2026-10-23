@@ -9,7 +9,8 @@
 #   - vault_prepare                       clones on first use, fast-forwards
 #                                         after, warns and keeps the local copy
 #                                         when the remote is unreachable
-#   - vault_opencode_config               instructions + external_directory
+#   - vault_opencode_config               instructions + external_directory +
+#                                         the x-harness-vault header
 #   - harness_opencode_overlay            merges with the --slim overlay
 #   - vault_sync + scripts/vault_capture.py
 #                                         copy the session's conversation into
@@ -104,9 +105,13 @@ cfg=$(vault_opencode_config)
 [[ "$(jq -r '.instructions[0]' <<<"$cfg")" == "$dir/AGENTS.md" ]] || fail "V5: instructions should name AGENTS.md — $cfg"
 [[ "$(jq -r --arg k "$dir/*" '.permission.external_directory[$k]' <<<"$cfg")" == "allow" ]] \
     || fail "V5: external_directory should allow the vault — $cfg"
+[[ "$(jq -r '.provider.harness.options.headers["x-harness-vault"]' <<<"$cfg")" == "$dir" ]] \
+    || fail "V5: the x-harness-vault header should carry the vault path — $cfg"
 harness_slim=1
 merged=$(harness_opencode_overlay)
-jq -e '.provider.harness.options.headers["x-harness-slim"] == "1" and (.instructions | length == 1) and .permission.external_directory' \
+jq -e --arg d "$dir" '.provider.harness.options.headers["x-harness-slim"] == "1"
+        and .provider.harness.options.headers["x-harness-vault"] == $d
+        and (.instructions | length == 1) and .permission.external_directory' \
     <<<"$merged" >/dev/null || fail "V5: slim + vault overlays should merge — $merged"
 harness_slim=0
 [[ "$(harness_opencode_overlay)" == "$cfg" ]] || fail "V5: without slim the overlay is the vault part alone"

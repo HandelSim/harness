@@ -103,8 +103,20 @@ def frontmatter(text):
     for line in text[4:end].splitlines():
         m = re.match(r"([A-Za-z_][\w-]*):\s*(.*)$", line)
         if m:
-            meta[m.group(1)] = m.group(2).strip()
+            meta[m.group(1)] = unquote(m.group(2).strip())
     return meta, text[end + 5:]
+
+
+def unquote(v):
+    """A one-line YAML scalar's value: 'a''b' and "a\\"b" forms included."""
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v[1:-1]
+    return v
 
 
 def yq(value):
@@ -121,7 +133,7 @@ def safe_name(text):
 
 def charter(vault):
     meta, body = frontmatter(read_text(os.path.join(vault, "wiki", "overview.md")) or "")
-    pattern = meta.get("ticket_pattern", "").strip().strip('"').strip("'")
+    pattern = meta.get("ticket_pattern", "").strip()
     try:
         ticket_re = re.compile(r"\b(?:%s)\b" % pattern) if pattern else None
     except re.error:
@@ -129,7 +141,7 @@ def charter(vault):
     lines = []
     for key in ("project", "goal", "readers", "track"):
         if meta.get(key):
-            lines.append(f"{key}: {meta[key].strip(chr(34))}")
+            lines.append(f"{key}: {meta[key]}")
     text = "\n".join(lines)
     extra = body.strip()
     if extra:
@@ -281,7 +293,7 @@ def raw_units(vault, budget):
             chunks = pack(pieces, budget)
             stem = re.sub(r"\.[A-Za-z0-9]+$", "", rel)
             page = "--".join(safe_name(p) for p in stem.split("/"))
-            title = meta.get("title", "").strip('"') or stem
+            title = meta.get("title", "") or stem
             for i, chunk in enumerate(chunks, 1):
                 piece = "".join(t for _, t in chunk)
                 units.append({
@@ -564,7 +576,7 @@ def context_for(vault, u, sections_by_page):
             if "--" in rest:
                 continue  # only direct children
             meta, _ = frontmatter(read_text(os.path.join(base, n), 4096) or "")
-            lines.append(f"- subdirectory [[{n[:-3]}]]: {meta.get('summary', '').strip(chr(34))}")
+            lines.append(f"- subdirectory [[{n[:-3]}]]: {meta.get('summary', '')}")
     return "\n".join(lines[:40])
 
 
@@ -602,7 +614,7 @@ def regenerate(vault):
                 tickets.setdefault(t.strip(), set()).add(rel)
 
     def summ(rel):
-        return pages[rel]["meta"].get("summary", "").strip('"') if rel in pages else ""
+        return pages[rel]["meta"].get("summary", "") if rel in pages else ""
 
     def hub(folder, kind, name, refs, intro):
         rel = f"{folder}/{name}.md"
@@ -639,7 +651,7 @@ def regenerate(vault):
             and p["meta"].get("type") == "code"}
     by_name = {p["name"]: rel for rel, p in code.items()}
     for rel, p in code.items():
-        name, repo = p["name"], p["meta"].get("repo", "").strip('"')
+        name, repo = p["name"], p["meta"].get("repo", "")
         children = sorted(n for n in by_name if n.startswith(name + "--") and "--" not in n[len(name) + 2:]) \
             if name != repo else sorted(n for n in by_name if n.startswith(repo + "--")
                                         and "--" not in n[len(repo) + 2:])

@@ -422,12 +422,24 @@ setting. `add` registers (the first vault becomes active), `use` switches,
 `new <name> [--from <git-url>]` makes a vault in place: it copies
 `vault-template/` (or a `--depth 1` clone of the template repo, whose `.git`
 it drops), runs `git init` on `main` with one commit (signed `harness` when
-git has no identity), and registers the url `local`. A failure removes the
-folder and registers nothing. `vault-template/` is the minimal LLM-wiki
-skeleton (Karpathy's pattern): `AGENTS.md` with the layout and the
-ingest/query/lint rules, `wiki/index.md`, `wiki/log.md`, `.raw/` for
-sources, `pub/` for `serve`. A `local` vault has no remote until the user
-adds one with git; `list` shows its `origin` url once there is one.
+git has no identity), and registers the url `local`; on a terminal it then
+asks for the charter (below). A failure removes the folder and registers
+nothing. `vault-template/` is an LLM-wiki skeleton (Karpathy's pattern) built
+so that harness, not the model, owns the structure: `AGENTS.md` (how to find
+things: grep the index, then the wiki; the page-name scheme; where an agent
+may write, `wiki/notes/`; never edit generated pages or run git),
+`wiki/overview.md` (the charter), `wiki/index.md` and `wiki/log.md`
+(generated), `.raw/` for sources, `pub/` for `serve`, and `.obsidian/`
+(hides `.raw`, `pub`, `.harness` and colours the graph by folder) so the
+folder opens as an Obsidian vault. A `local` vault has no remote until the
+user adds one with git; `list` shows its `origin` url once there is one.
+
+`init` (`_vault_charter`) asks, on `/dev/tty` with no model, what the active
+vault is about: project, goal, readers, what to track, a ticket id regex
+(validated; `-` for none) and the folders it covers, the current answers as
+defaults, and writes them to `wiki/overview.md` as single-quoted YAML front
+matter plus a body; then `vault_sync`. `harness ingest` sends the charter
+with every request and makes a page per ticket id the regex finds.
 
 At launch `vault_prepare` (from `run_agent` after the no-docker fallback,
 and from `cmd_host` before `host_run_opencode`) clones the active vault into
@@ -438,12 +450,15 @@ blocks the launch, and a `local` vault whose folder is gone launches
 without a vault. It sets the `harness_vault_dir` global, which
 `vault_opencode_config` turns into overlay keys: `instructions` with the
 vault's `AGENTS.md` (or `CLAUDE.md`), which opencode sends as "Instructions
-from: <path>" so the model knows where the vault is, and
+from: <path>" so the model knows where the vault is,
 `permission.external_directory` `"<vault>/*": "allow"` so reading and writing
-there needs no approval. `harness_opencode_overlay` deep-merges that with the
-slim overlay into the one `OPENCODE_CONFIG_CONTENT`. Container mode also
-appends the vault to the extra mounts (same absolute path, deduped against
-the CWD).
+there needs no approval, and the provider header `x-harness-vault: <path>`,
+from which the proxy adds a line naming the vault and how to search it to a
+cooperative (free) model's per-turn reminder (see `proxy.md`); a native model
+keeps the instructions in its system prompt and gets no line.
+`harness_opencode_overlay` deep-merges that with the slim overlay into the
+one `OPENCODE_CONFIG_CONTENT`. Container mode also appends the vault to the
+extra mounts (same absolute path, deduped against the CWD).
 
 Saving is harness's job, not the agent's. When an interactive session ends
 (`host_run_opencode` after opencode exits, `run_agent_interactive` after
@@ -452,26 +467,70 @@ Saving is harness's job, not the agent's. When an interactive session ends
 `${OPENCODE_DB:-${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db}`;
 container: `state/agent/home/.local/share/opencode/opencode.db`), read-only.
 Each top-level session started in the launch directory (host: `$PWD`;
-container: the mount path) and updated since the launch started becomes
-`.raw/sessions/<YYYY-MM-DD>-<session id>.md` (rewritten on a rerun): front
-matter, then the user's and the assistant's text only (no tool output,
-reasoning or opencode-injected text; tool calls listed by name), with
-anything shaped like a key or token redacted (best effort). The directory filter matters: that store is shared by every
-opencode session of the user (host) or of every harness container, and
-without it other projects' conversations would be pushed to the vault's
-remote. Then `git add
--A`, one commit for everything the session changed in the vault, and a push
-when the branch has an upstream (no credential prompt, 30s limit; on a
-rejected push one `pull --rebase` and a second push; a conflict aborts the
-rebase and leaves the commit local). Every failure warns and the exit status
-is unchanged; without Python the capture is skipped and the commit still
-happens. The push uses the host's git credentials, so the container
-firewall is not involved. Print mode (`-p`) and `serve` do not sync.
-`vault-template/AGENTS.md` tells the agent not to run git itself. Clones
-live under `state/`, so `uninstall` deletes them; it first names any clone
-with uncommitted or unpushed work (a vault with no upstream counts as
-unpushed). `tests/unit_vault_test.sh` covers the registry, clone,
-fast-forward, offline fallback, the overlay, `new` and the sync.
+container: the mount path) and updated in the 30 days before the launch
+(so a session whose harness was killed is caught by the next one) becomes
+`.raw/sessions/<YYYY-MM-DD>-<session id>.md`: front matter, then the user's
+and the assistant's text (no reasoning or opencode-injected text), each tool
+call as one line naming what it touched (`read` path and range, `edit`/
+`write` path, `grep`/`glob` pattern, path and include, the first 160
+characters of a `bash` command, a `task`'s agent and description plus up to
+1500 characters of its report; no other tool output), with anything shaped
+like a key or token redacted (best effort). The file is rendered from the
+whole session every time: opencode's compaction adds a marker and a summary
+message and deletes nothing, so every message from before any number of
+compactions stays, the marker as `## Compaction` and the summary as
+`## Compaction summary`. A rerun never shrinks a file (an undo or revert in
+opencode keeps what was captured). The directory filter matters: that store
+is shared by every opencode session of the user (host) or of every harness
+container, and without it other projects' conversations would be pushed to
+the vault's remote. `import [<dir>|--all]` runs the same capture with no
+time limit over both stores, for sessions from before the vault existed
+(`--all` drops the directory filter). Then `scripts/vault_ingest.py index`
+rebuilds the generated index and hubs (no model), `git add -A`, one commit
+for everything the session changed in the vault, and a push when the branch
+has an upstream (no credential prompt, 30s limit; on a rejected push one
+`pull --rebase` and a second push; a conflict aborts the rebase and leaves
+the commit local). Every failure warns and the exit status is unchanged;
+without Python the capture is skipped and the commit still happens. The push
+uses the host's git credentials, so the container firewall is not involved.
+Print mode (`-p`) and `serve` do not sync. Clones live under `state/`, so
+`uninstall` deletes them; it first names any clone with uncommitted or
+unpushed work (a vault with no upstream counts as unpushed).
+
+`harness ingest [<dir>]` (`cmd_ingest`) turns raw material into wiki pages.
+It starts the host proxy as `serve` does (stopping it after, if it started
+it), `vault_prepare`s the active vault and runs `scripts/vault_ingest.py
+ingest --commit` against `http://127.0.0.1:<host proxy port>/v1`. The design
+(chosen by council) keeps every decision in code so a free model with no
+tools does it as well as a `-withtools` one: harness picks the units (a
+`.raw` file cut at its `## ` headings, or one codebase directory's tracked
+text files, packed to `--unit-kb`, default 48), sends each as one plain
+request with `x-harness-raw: 1` (no tools, no reminder; a `-withtools` model
+is swapped for its free base when `/models` lists it), with the rules before
+and after the source, the charter, as context the summaries of the page's
+other parts and (code, done deepest first) of its subdirectory pages, and a
+fixed section format (summary line, headings, `Topics:`). The reply is
+checked (a summary line, a body, backticked names that exist in the source),
+sent back once with the problems, then marked failed (`--retry-failed` sends
+it again). Upstream errors do not count as attempts; three in a row stop the
+run. Each unit's text goes between `<!-- unit:ID sha:SHA -->` markers in its
+page (`wiki/code/<repo>/<repo>--<dir>.md`, the root `wiki/code/<repo>/<repo>.md`;
+`wiki/sources/<file>.md`), so a page is rebuilt section by section and a
+`<!-- links -->` block written by hand survives. `.harness/ingest.json` keeps
+each unit's content hash and page: only new or changed units are sent, and
+units (and generated pages) whose source is gone are removed. A codebase
+given once is remembered. After the units, `regenerate` writes
+`wiki/index.md` (top-level pages, one line per codebase, sources, topics,
+tickets, each with its summary line), a hub per topic used by two or more
+pages (`wiki/topics/`), a page per ticket id (`wiki/tickets/`), and each
+repo's module tree with Up/Subdirectories links, and appends to
+`wiki/log.md`; it commits and pushes every 10 units and at the end, Ctrl-C
+included. A lock in `.git` keeps two runs apart. `--max N` stops after N
+units, `--watch [S]` keeps checking every S seconds (default 300) for a
+long-running ingest of a growing codebase, `--dry-run` lists the units.
+`tests/unit_vault_test.sh` covers the registry, clone, fast-forward, offline
+fallback, the overlay, `new`, the sync, the capture's tool lines and
+compaction, and ingest against a mock upstream.
 
 ### Interactive TTY resolution (Windows) — issue #82
 

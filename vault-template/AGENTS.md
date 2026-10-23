@@ -1,68 +1,50 @@
-# Vault rules
+# Knowledge vault
 
 <!-- Your instructions to the agent for this vault. harness hands this file to the
      agent at every launch; edit it to change how the agent works here. -->
 
-This folder is a knowledge vault: a git repo of Markdown that opens as an Obsidian
-vault. You maintain it. People drop sources in; you turn them into a linked wiki
-that gets more useful with every session, so that a question asked next month is
-answered from what was already read and worked out, not from scratch.
+The folder holding this file is a knowledge vault: Markdown pages about past
+work, decisions and the codebases it covers. Paths below are relative to that
+folder. `wiki/overview.md` says what the vault is about and what it tracks.
 
-## Layout
+## Look things up first
 
-- `.raw/` holds sources as they arrived: articles, transcripts, PDFs, exports,
-  notes. Read them; never edit, rename or delete them. `.raw/sessions/` holds
-  harness's copy of each past conversation; ingest those only when asked.
-- `wiki/` holds the pages you write and keep current, one topic per page, in
-  `wiki/sources/`, `wiki/concepts/`, `wiki/entities/` (people, organizations,
-  projects, tools) and `wiki/questions/`.
-- `wiki/index.md` lists every wiki page once with a one-line summary.
-- `wiki/log.md` records what each session changed.
-- `pub/` holds finished HTML pages for people to read in a browser.
-  `harness serve` lists them.
+Before you answer a question about this project, its code, past work or a
+decision, or before you start a task in an area the vault covers, check it:
 
-## Pages
+1. Grep `wiki/index.md` for the key words: it lists every page once with a
+   one-line summary. A codebase is one line there; its directory pages are
+   listed in the module tree at the end of `wiki/code/<repo>/<repo>.md`.
+2. Grep the pages themselves: `grep -ril "<word>" wiki/`, then read the
+   `summary:` lines of the hits and open the best two or three.
+3. A code directory's page has a predictable name:
+   `wiki/code/<repo>/<repo>--<dir with / as -->.md`, so `src/api/auth` of `shop`
+   is `wiki/code/shop/shop--src--api--auth.md`.
+4. Follow the `[[links]]` on a page; `[[name]]` is the file `name.md` anywhere
+   under `wiki/`. `wiki/topics/` and `wiki/tickets/` list every page about a
+   topic or a ticket.
+5. A page can be out of date. Before you rely on it for code, check the code.
 
-- File names are lowercase-with-dashes.md. The first `# ` heading is the title.
-- Every page starts with front matter:
+## What you may write
 
-  ```yaml
+- `wiki/notes/`: your own pages, for anything worth finding next time (a
+  decision and why, how something works, a fix and its cause). Start each with:
+
+  ```
   ---
-  type: source | concept | entity | question
-  sources: [".raw/2026-10-22-some-article.md"]
-  updated: 2026-10-22
+  type: note
+  summary: one line saying what the page is about
   ---
   ```
 
-- Link related pages with `[[wikilinks]]` (the file name without `.md`). Link
-  generously; a page nothing links to gets lost.
-- Say where each claim comes from: a source page or a `.raw/` file. Mark your
-  own inferences as such. When sources disagree, record both and say which is
-  newer; do not silently overwrite.
+  Link the pages it relates to with `[[name]]`.
+- Never edit a page whose front matter says `generated: harness` (index, code,
+  sources, topics, tickets): harness rewrites them and your edit is lost. Write
+  a note that links to it instead.
+- Never edit `.raw/`: those are the sources as they arrived. `.raw/sessions/` is
+  harness's copy of each past session.
+- `pub/` holds finished HTML pages for people to read; `harness serve` lists them.
 
-## Ingest
-
-When a new file lands in `.raw/`, or you are handed a source:
-
-1. Read all of it.
-2. Write a `type: source` page in `wiki/sources/`: what it is, its key points,
-   and what it changes in the wiki.
-3. Update the concept and entity pages it touches, or create them.
-4. Add new pages to `wiki/index.md` and append an entry to `wiki/log.md`.
-
-## Query
-
-When asked a question, start from `wiki/index.md`, read the relevant pages and
-follow their links, then answer with links to the pages you used. If the answer
-took real work, file it as a `type: question` page so it is not redone.
-
-## Lint
-
-When asked, or when you notice rot: find pages missing from the index, broken
-links, orphan pages, stale claims and contradictions. Fix what you can and list
-the rest in the log entry.
-
-## Git
-
-harness commits and pushes this vault when the session ends; do not run git
-yourself unless asked. Never rewrite history.
+harness copies each session into `.raw/sessions/`, turns sources into pages
+(`harness ingest`), rebuilds the index and commits and pushes; do not run git
+in this folder unless asked.

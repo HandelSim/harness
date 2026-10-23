@@ -2769,6 +2769,9 @@ commands:
                         launches clone it into
                         state/vaults/<name>, keep it current, and give the
                         agent its AGENTS.md (see 'harness vault --help')
+  ingest [<dir>]        turn the active vault's sessions and sources, and a
+                        codebase <dir>, into linked wiki pages, only what is
+                        new or changed (see 'harness ingest --help')
   unlock                probe the upstream and print the unlock URL if the
                         key is locked
   usage [--hours N]     total the tokens the upstream reported for the last N
@@ -5581,9 +5584,10 @@ vault_prepare() {
 
 # The vault part of the opencode overlay: the vault's AGENTS.md (or CLAUDE.md)
 # as an instruction file, which opencode sends as "Instructions from: <path>"
-# so the model learns where the vault is, and an external_directory allow so
-# reading and writing under it needs no approval. Prints nothing without a
-# vault.
+# so the model learns where the vault is, an external_directory allow so
+# reading and writing under it needs no approval, and the x-harness-vault
+# provider header, from which the proxy adds a line naming the vault to a
+# cooperative model's reminder. Prints nothing without a vault.
 vault_opencode_config() {
     local dir="${harness_vault_dir:-}" f instr=""
     [[ -n "$dir" ]] || return 0
@@ -5592,7 +5596,8 @@ vault_opencode_config() {
     done
     [[ -n "$instr" ]] || err "vault at $dir has no AGENTS.md or CLAUDE.md; the agent is not told about it"
     harness_jq -cn --arg dir "$dir" --arg instr "$instr" '
-      {"permission": {"external_directory": {($dir + "/*"): "allow"}}}
+      {"permission": {"external_directory": {($dir + "/*"): "allow"}},
+       "provider": {"harness": {"options": {"headers": {"x-harness-vault": $dir}}}}}
       + (if $instr == "" then {} else {"instructions": [$instr]} end)'
 }
 
@@ -5605,21 +5610,30 @@ vault_opencode_config() {
 # has to remember to save or commit. Best effort: every failure is a warning
 # and the launch's exit status is unchanged.
 vault_sync() {
-    local dir="$1" since_ms="$2" db="$3" project="$4" py script
+    local dir="$1" since_ms="$2" db="$3" project="$4" py script index wdir
     [[ -n "$dir" && -d "$dir/.git" ]] || return 0
     script="$clone_dir/scripts/vault_capture.py"
-    if [[ -f "$db" && -f "$script" ]] && py=$(host_python_bin); then
+    index="$clone_dir/scripts/vault_ingest.py"
+    # Look back 30 days, not just to the launch: a session whose harness was
+    # killed (no sync ran) is picked up by the next one. Rewriting an already
+    # captured session is harmless (the capture never shrinks a file).
+    (( since_ms > 2592000000 )) && since_ms=$(( since_ms - 2592000000 ))
+    if py=$(host_python_bin); then
+        wdir="$dir"
         if command -v cygpath >/dev/null 2>&1; then
-            script=$(cygpath -m "$script"); db=$(cygpath -m "$db")
-            local wdir; wdir=$(cygpath -m "$dir")
+            script=$(cygpath -m "$script"); index=$(cygpath -m "$index"); wdir=$(cygpath -m "$dir")
+            [[ -f "$db" ]] && db=$(cygpath -m "$db")
             # A container's /c/... path stays as it is; a host one becomes C:/...
-            [[ "$project" == /[a-zA-Z]/* ]] || project=$(cygpath -m "$project")
+            [[ "$project" == "*" || "$project" == /[a-zA-Z]/* ]] || project=$(cygpath -m "$project")
+        fi
+        if [[ -f "$db" && -f "$script" ]]; then
             # shellcheck disable=SC2086  # $py can be 'py -3'
             $py "$script" "$db" "$wdir" "$since_ms" "$project" >/dev/null || true
-        else
-            # shellcheck disable=SC2086
-            $py "$script" "$db" "$dir" "$since_ms" "$project" >/dev/null || true
         fi
+        # The generated index, hubs and module trees follow whatever the
+        # session wrote (deterministic, no model).
+        # shellcheck disable=SC2086
+        [[ -f "$index" ]] && { $py "$index" index --vault "$wdir" >/dev/null || true; }
     fi
     git -C "$dir" add -A >/dev/null 2>&1 || { err "vault: git add failed in $dir"; return 0; }
     git -C "$dir" diff --cached --quiet 2>/dev/null && return 0
@@ -5721,6 +5735,176 @@ harness_opencode_overlay() {
     printf '%s' "$out"
 }
 
+# `harness vault init` (and `vault new` on a terminal): ask what the vault is
+# for and write its charter, wiki/overview.md. Plain questions on the
+# terminal, no model, so it works the same whatever model you use; `harness
+# ingest` puts the charter in front of every source it sends, and its
+# ticket_pattern decides which ids get a ticket page. Asking again shows the
+# current answers as the defaults.
+_vault_charter() {
+    local dir="$1" f="$1/wiki/overview.md" py
+    [[ -e /dev/tty ]] || { err "harness vault init needs a terminal"; return 1; }
+    _charter_get() {
+        [[ -f "$f" ]] || return 0
+        sed -n "/^---\$/,/^---\$/s/^$1: *//p" "$f" | head -n 1 | sed "s/^'\\(.*\\)'\$/\\1/; s/^\"\\(.*\\)\"\$/\\1/; s/''/'/g"
+    }
+    _charter_ask() {
+        local ans
+        printf '%s\n  [%s]: ' "$1" "$2" >/dev/tty
+        IFS= read -r ans </dev/tty || ans=""
+        printf '%s' "${ans:-$2}"
+    }
+    _charter_q() { local v="${1//\'/\'\'}"; printf "'%s'" "$v"; }
+    _charter_def() { local v; v=$(_charter_get "$1"); printf '%s' "${v:-$2}"; }
+    local project goal readers track tickets covers
+    echo "Describe this vault (Enter keeps the answer in brackets)." >/dev/tty
+    project=$(_charter_ask "What project or area is it about?" "$(_charter_def project "$(basename "$PWD")")")
+    goal=$(_charter_ask "What is it for?" "$(_charter_def goal \
+        "a second brain for $project: how it works, what was decided and why, what was done")")
+    readers=$(_charter_ask "Who reads it?" "$(_charter_def readers "me and my coding agents")")
+    track=$(_charter_ask "What should it keep track of?" "$(_charter_def track \
+        "how the code works, decisions and their reasons, open questions, work per ticket")")
+    tickets=$(_charter_ask "Ticket id pattern, a regular expression (- for none)" \
+        "$(_charter_def ticket_pattern '[A-Z][A-Z0-9]+-[0-9]+')")
+    [[ "$tickets" == "-" ]] && tickets=""
+    if [[ -n "$tickets" ]] && py=$(host_python_bin); then
+        # shellcheck disable=SC2086  # $py can be 'py -3'
+        $py -c 'import re, sys; re.compile(sys.argv[1])' "$tickets" 2>/dev/null \
+            || { err "'$tickets' is not a valid regular expression; no ticket pattern set"; tickets=""; }
+    fi
+    covers=$(_charter_ask "Codebases or folders it covers (paths, for 'harness ingest <dir>')" "$(_charter_get covers)")
+    mkdir -p "$dir/wiki"
+    {
+        echo "---"
+        echo "type: overview"
+        echo "summary: $(_charter_q "$goal")"
+        echo "project: $(_charter_q "$project")"
+        echo "goal: $(_charter_q "$goal")"
+        echo "readers: $(_charter_q "$readers")"
+        echo "track: $(_charter_q "$track")"
+        echo "ticket_pattern: $(_charter_q "$tickets")"
+        echo "covers: $(_charter_q "$covers")"
+        echo "updated: $(date -u +%Y-%m-%d)"
+        echo "---"
+        echo
+        echo "# $project"
+        echo
+        echo "The charter of this vault. \`harness ingest\` puts it in front of every source it"
+        echo "sends to the model, and agents read it first. Edit it freely, or run"
+        echo "\`harness vault init\` again. Text below the headings is yours."
+        echo
+        echo "## What it is for"
+        echo
+        echo "$goal"
+        echo
+        echo "## What to track"
+        echo
+        echo "$track"
+        [[ -n "$tickets" ]] && { echo; echo "Ticket ids match \`$tickets\`; each id seen in a source gets a page in wiki/tickets/."; }
+        [[ -n "$covers" ]] && { echo; echo "## What it covers"; echo; echo "$covers"; }
+    } > "$f.tmp" && mv "$f.tmp" "$f"
+    echo "wrote $f"
+}
+
+# `harness ingest`: turn the active vault's raw material (.raw/, captured
+# sessions included) and any codebase given as <dir> into wiki pages, through
+# the host-mode proxy, one plain request per unit (scripts/vault_ingest.py).
+# Incremental, resumable, and the same for free and -withtools models.
+cmd_ingest() {
+    local src="" model="" max="" unit_kb="" retry=0 watch="" dry=0 arg
+    while (( $# )); do
+        arg="$1"; shift
+        case "$arg" in
+            -h|--help|help)
+                cat <<'HELP'
+usage: harness ingest [<dir>] [--model M] [--max N] [--unit-kb K] [--retry-failed]
+                      [--watch [SECONDS]] [--dry-run]
+
+Turns the active vault's sources into wiki pages: every file under .raw/
+(captured sessions included) and, with <dir>, a codebase (remembered, so a
+plain 'harness ingest' re-checks it). Only new or changed parts are sent: the
+vault keeps a content hash per unit in .harness/ingest.json. Each unit (a code
+directory's files, or a run of messages of a session) goes to the model as one
+plain request with no tools, so a free model does it as well as a -withtools
+one; harness writes, checks and links the pages, rebuilds wiki/index.md, the
+topic and ticket hubs and each codebase's module tree, commits every 10 units
+and pushes.
+
+  --model M        model to use (default: the default model; a -withtools
+                   model is swapped for its free twin when the proxy lists one)
+  --max N          stop after N units (try --max 5 first and read the pages)
+  --unit-kb K      source text per request, in KB (default 48)
+  --retry-failed   send again the units whose reply failed its checks twice
+  --watch [S]      keep going: when nothing is left, check again every S
+                   seconds (default 300); Ctrl-C stops, progress is kept
+  --dry-run        list what would be sent, send nothing
+
+Pages: wiki/code/<repo>/<repo>--<dir>.md per directory with the root's in
+wiki/code/<repo>/<repo>.md; wiki/sources/<file>.md per .raw file. Generated
+pages are rewritten by the next ingest; write your own notes in other pages.
+Describe the vault first with 'harness vault init': its charter goes with
+every request.
+HELP
+                return 0 ;;
+            --model) model="${1:-}"; shift || true ;;
+            --max) max="${1:-}"; shift || true ;;
+            --unit-kb) unit_kb="${1:-}"; shift || true ;;
+            --retry-failed) retry=1 ;;
+            --watch)
+                watch=300
+                if [[ "${1:-}" =~ ^[0-9]+$ ]]; then watch="$1"; shift; fi ;;
+            --dry-run) dry=1 ;;
+            -*) err "unknown ingest option '$arg' (see: harness ingest --help)"; return 1 ;;
+            *)
+                [[ -z "$src" ]] || { err "harness ingest takes one directory"; return 1; }
+                src="$arg" ;;
+        esac
+    done
+    [[ -z "$max" || "$max" =~ ^[0-9]+$ ]] || { err "--max needs a number"; return 1; }
+    [[ -z "$unit_kb" || "$unit_kb" =~ ^[0-9]+$ ]] || { err "--unit-kb needs a number"; return 1; }
+    if [[ -n "$src" ]]; then
+        [[ -d "$src" ]] || { err "not a directory: $src"; return 1; }
+        src=$(harness_abs_path "$src")
+    fi
+    [[ -n "$(vault_active_name)" ]] || { err "no active vault (see: harness vault)"; return 1; }
+    host_require_python3 || exit 1
+    local py script dir
+    py=$(host_python_bin) || { err "harness ingest needs python 3"; return 1; }
+    script="$clone_dir/scripts/vault_ingest.py"
+    local started=0
+    if (( ! dry )); then
+        host_require_config
+        ensure_dirs
+        host_ensure_toolchain || { host_win_location_hint; exit 1; }
+        host_preflight        || { host_win_location_hint; exit 1; }
+        _gate_on_upstream_auth || exit 1
+        host_proxy_running || started=1
+        host_proxy_start || exit 1
+        host_proxy_wait_ready || { host_proxy_stop; exit 1; }
+    fi
+    dir=$(vault_prepare)
+    [[ -n "$dir" ]] || { err "the active vault is not available"; return 1; }
+    [[ -n "$model" ]] || model=$(_effective_default_model)
+    local -a args=(ingest --vault "$dir" --proxy "http://127.0.0.1:$(host_proxy_port)/v1" --model "$model" --commit)
+    if command -v cygpath >/dev/null 2>&1; then
+        script=$(cygpath -m "$script")
+        args=(ingest --vault "$(cygpath -m "$dir")" --proxy "http://127.0.0.1:$(host_proxy_port)/v1" --model "$model" --commit)
+        [[ -n "$src" ]] && src=$(cygpath -m "$src")
+    fi
+    [[ -n "$src" ]] && args+=(--src "$src")
+    [[ -n "$max" ]] && args+=(--max "$max")
+    [[ -n "$unit_kb" ]] && args+=(--unit-kb "$unit_kb")
+    (( retry )) && args+=(--retry-failed)
+    [[ -n "$watch" ]] && args+=(--watch "$watch")
+    (( dry )) && args+=(--dry-run)
+    local rc=0
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    $py "$script" "${args[@]}" || rc=$?
+    # A proxy this command started goes down with it.
+    (( started )) && host_proxy_stop
+    return "$rc"
+}
+
 cmd_vault() {
     local sub="${1:-list}"
     (( $# )) && shift
@@ -5739,14 +5923,26 @@ usage:
   harness vault use <name>         make <name> the active vault
   harness vault off                launch without a vault
   harness vault remove <name>      unregister <name>; its clone stays on disk
+  harness vault init               ask what the active vault is for (project,
+                                   goal, readers, what to track, ticket id
+                                   pattern) and write its charter,
+                                   wiki/overview.md, which every ingest reads
+  harness vault import [<dir>|--all]
+                                   copy the past opencode sessions started in
+                                   <dir> (default: here; --all: anywhere) into
+                                   the active vault's .raw/sessions, from host
+                                   and container launches alike
 
 A launch (harness, harness host, harness chatgpt) with an active vault clones
 it into state/vaults/<name> the first time and fast-forwards it after that.
 The agent gets the vault's AGENTS.md (or CLAUDE.md) as instructions and may
 read and write under the vault without approval; container launches mount it
-at the same path. Committing and pushing vault changes is the agent's (or
-your) job, as in any repo; from a container that needs the vault's git host
-marked '# git-push' in .harness-allowlist (see 'harness net').
+at the same path. When an interactive session ends, harness copies it into
+.raw/sessions (tool calls as one line each; compactions marked, nothing before
+them dropped), rebuilds the generated index, commits and pushes. Turning the
+raw material into wiki pages is 'harness ingest' (see 'harness ingest --help').
+Open the vault folder (or a clone of its remote) in Obsidian to browse it and
+see the graph.
 
 A new vault has no remote until you give it one (an empty repo you made on
 GitHub or elsewhere):
@@ -5840,6 +6036,42 @@ HELP
             fi
             echo "it has no remote yet; to back it up, make an empty repo and run:"
             echo "  git -C '$dir' remote add origin <git-url> && git -C '$dir' push -u origin HEAD"
+            if [[ -t 0 && -t 1 ]]; then
+                _vault_charter "$dir" && vault_sync "$dir" 0 "" "$PWD"
+            else
+                echo "describe what it is for with: harness vault init"
+            fi
+            ;;
+        init)
+            (( $# == 0 )) || { err "usage: harness vault init (works on the active vault)"; return 1; }
+            [[ -n "$(vault_active_name)" ]] || { err "no active vault (see: harness vault)"; return 1; }
+            dir=$(vault_prepare)
+            [[ -n "$dir" ]] || return 1
+            _vault_charter "$dir" || return 1
+            vault_sync "$dir" 0 "" "$PWD"
+            ;;
+        import)
+            local want="${1:-$PWD}" db
+            [[ $# -le 1 ]] || { err "usage: harness vault import [<dir>|--all]"; return 1; }
+            if [[ "$want" == "--all" ]]; then
+                want="*"
+            else
+                [[ -d "$want" ]] || { err "not a directory: $want"; return 1; }
+                want=$(harness_abs_path "$want")
+            fi
+            [[ -n "$(vault_active_name)" ]] || { err "no active vault (see: harness vault)"; return 1; }
+            dir=$(vault_prepare)
+            [[ -n "$dir" ]] || return 1
+            local found=0
+            for db in "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}" \
+                      "$(agent_home_dir)/.local/share/opencode/opencode.db"; do
+                [[ -f "$db" ]] || continue
+                found=1
+                echo "importing sessions from $db"
+                vault_sync "$dir" 0 "$db" "$want"
+            done
+            (( found )) || echo "no opencode session database found (host: ~/.local/share/opencode, container: $(agent_home_dir)/.local/share/opencode)"
+            echo "sessions are in $dir/.raw/sessions; turn them into wiki pages with: harness ingest"
             ;;
         use)
             name="${1:-}"
@@ -10423,6 +10655,7 @@ main() {
         net)                        cmd_net "$@" ;;
         mcp)                        cmd_mcp "$@" ;;
         vault)                      cmd_vault "$@" ;;
+        ingest)                     cmd_ingest "$@" ;;
         serve)                      cmd_serve "$@" ;;
         unlock)                     cmd_unlock "$@" ;;
         probe)                      cmd_probe "$@" ;;
