@@ -91,7 +91,10 @@ These are the load-bearing behaviors the proxy is built around:
   prompt tokens) worked; 600k chars returned `502 upstream_error`. The real
   ceiling is somewhere in between and unmeasured. `MODEL_CONTEXT_LENGTH`
   defaults to 200000 tokens, above that range, so a long session can hit
-  502s before opencode compacts.
+  502s before opencode compacts. A `*-withtools` model's opencode entry
+  declares at most 120000 (`opencode_models_jq`, the entrypoint's
+  `models_prog`), so a metered session compacts earlier; other models
+  declare `MODEL_CONTEXT_LENGTH` as is.
 - **Streaming is coarse.** SSE arrives in a handful of large chunks (6
   events for a ~120-token reply) after a multi-second first byte.
 - **TLS now verifies** against system CAs (the proxy still sends

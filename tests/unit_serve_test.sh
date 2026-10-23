@@ -102,8 +102,8 @@ out=$(harness_opencode_overlay oai)
     || fail "S4: under serve the harness provider must carry no provider-wide mode header"
 [[ "$(jq -r '.provider["harness-oai"].options.headers["x-harness-slim"]' <<<"$out")" == 1 ]] \
     || fail "S4: OAI models keep the slim header under serve"
-jq -e '.provider.harness.models["nat-withtools:stock"] and .agent.build.prompt and .share == "disabled"' <<<"$out" >/dev/null \
-    || fail "S4: the merged overlay lost the aliases, the slim prompts or share"
+jq -e '.provider.harness.models["nat-withtools:stock"] and .agent.stock and (.agent | has("build") | not) and .share == "disabled"' <<<"$out" >/dev/null \
+    || fail "S4: the merged overlay lost the aliases, the stock agent or share (and sets no agent prompts)"
 # The variable is trimmed first, as the proxy does.
 PROXY_NATIVE_TOOL_MODELS='  '
 jq -e '.provider.harness.models["nat-withtools:stock"]' <<<"$(serve_opencode_config)" >/dev/null \

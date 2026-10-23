@@ -100,7 +100,8 @@ are the only changes made to the request or the reply:
 - **Usage ledger** (`PROXY_USAGE_LEDGER`). `_record_usage` appends one JSON
   line per upstream reply, native and cooperative alike, with the upstream's
   own `prompt`/`completion`/`reasoning`/`cached` counts (never the proxy's
-  estimate) and every `X-RateLimit-Remaining-*` header. Compose sets
+  estimate), `session` (opencode's session id from `_session_id`, or null)
+  and every `X-RateLimit-Remaining-*` header. Compose sets
   `/output/usage.jsonl`, host mode `state/output/usage.jsonl`: the same host
   file. Lines older than 48 h are pruned once per proxy start; a write
   failure warns once and turns the ledger off until restart. `harness usage`
@@ -117,8 +118,9 @@ are the only changes made to the request or the reply:
   with a 402 (not retried by opencode) when its estimate (`chars / 3 x W_in`
   plus 1,500 tokens per image, plus 8,192 output tokens `x W_out`) plus the
   estimates of requests still in flight exceeds that figure (under slim the
-  estimate prices the request after `_slim_tools` and the tool-output trim,
-  as sent). An estimate is released when the reply is noted, or when the
+  estimate prices the request after `_slim_tools` and the tool-output trim;
+  the slim prompt swap is not priced). A slim explore subagent rerouted to a
+  free model (below) is checked as that free model. An estimate is released when the reply is noted, or when the
   response closes however the request ended (`_budget_release_on_close`).
   A reply whose request started before the one the figure came from (two
   requests overlapping) only subtracts its cost. The message
@@ -142,17 +144,19 @@ are the only changes made to the request or the reply:
   prefix byte for byte and the upstream prompt cache keeps hitting (a cut
   measured from the newest output moved every step and broke the cache at
   the first rewritten result). Results after the last assistant message (the
-  ones the model has not seen yet) are never cut. Copies, so opencode's own
+  ones the model has not seen yet) are never cut, nor are results of `task`
+  or `todowrite` (`_TRIM_EXEMPT_TOOLS`: a subagent's report cannot be
+  re-fetched without relaunching the subagent). Copies, so opencode's own
   history is untouched; the trim is opencode's `compaction.prune` applied
   on every step instead of only after a prompt finishes, and the usage the
   upstream then reports (and opencode compacts on) is the trimmed size.
 - **Native reminder** (slim only). When a slim request carries tools, `_native_reminder` appends one
   `<system-reminder>` to the LAST message (a copy: the inbound list is not
   mutated, and opencode's history never holds it, so it cannot pile up).
-  It is rebuilt from the history: the step count since the latest user
-  message, an estimate of the tokens the task has cost (each step re-sends
-  its whole prefix; chars/3; the standing advice on working in few steps
-  is in the slim system prompt, not here); the todo list replayed from the last `todowrite` (same
+  It is rebuilt from the history: "harness: step N of this task." (assistant
+  turns since the latest user message; no token or spend figure, and the
+  standing advice on working in few steps is in the slim system prompt,
+  not here); the todo list replayed from the last `todowrite` (same
   `_format_todos_block` as the cooperative replay) with a line naming the
   item in progress and telling the model to stay on it (`_todo_focus`), or,
   with no list, an order to start with one (and a firmer one after 3
@@ -165,8 +169,8 @@ are the only changes made to the request or the reply:
   order to use the earlier result. After 30 steps without an edit-type
   call (`edit`, `write`, `patch`, `multiedit`, `apply_patch`) a soft line
   says to start changing files unless the current item needs more
-  research. Nothing caps or stops a long task: hard tasks may run long.
-  The thresholds are module constants (`_NATIVE_TODO_*`,
+  research. Main agents are never capped: hard tasks may run long (only the
+  general subagent is, below). The thresholds are module constants (`_NATIVE_TODO_*`,
   `_NATIVE_NO_EDIT_NUDGE`, `_NATIVE_REPEAT_AT`), not env knobs: tuning them
   is a probe's job, not the user's.
 - **Slim tool descriptions** (the default; off under `harness --normal`). The slim opencode
@@ -177,17 +181,39 @@ are the only changes made to the request or the reply:
   text) with the short ones in `_SLIM_TOOL_DESCRIPTIONS`. Parameter schemas
   are untouched; `task` keeps opencode's appended subagent list (from
   `_TASK_AGENTS_MARK`); any other tool (MCP, a newer opencode tool) keeps
-  its own description. Without the header the tools pass through as sent.
-  The slim system prompts themselves are opencode agent prompts, set by the
-  CLI ([`harness-cli.md`](harness-cli.md)). Without the header the native
-  route sends opencode's request as is (no trim, no reminder): stock
-  opencode.
-- **Hard step cap.** When opencode hits an agent's `steps` cap it ends the
-  request with an assistant message starting "CRITICAL - MAXIMUM STEPS
+  its own description. Without the header the native route sends opencode's
+  request as is (no trim, no reminder, no prompt swap): stock opencode. The
+  header is the CLI's whole part in slim ([`harness-cli.md`](harness-cli.md));
+  the cooperative route ignores it, so free models get opencode's request
+  as before.
+- **Slim prompts, per agent** (slim only). `_agent_kind` tells the agent
+  from the request's toolset (opencode removes `task` and `todowrite` from
+  subagents): either of those means a main agent (build, plan, yolo), else
+  an edit-type tool means `general`, else `explore`. `_slim_system` replaces
+  the text before opencode's environment block (`_ENV_MARK`, "\nYou are
+  powered by the model named ") in the first system/developer message with
+  `agents/slim-prompt.md` (main) or `agents/slim-subagent-prompt.md`
+  (general); explore keeps opencode's own prompt, and a request without the
+  mark is left alone. `_slim_prompt` reads each file once, from `agents/`
+  next to `proxy.py` (the image: `proxy/Dockerfile` copies both to
+  `/app/agents/`) or `../agents` (a host clone); a missing file logs a
+  warning and keeps opencode's prompt.
+- **General subagent cap** (slim only). A `general` request at
+  `_SLIM_GENERAL_STEPS` (15) steps (assistant turns since the last user
+  message) gets `tool_choice: "none"` and `_SLIM_CAP_NOTE` (report now:
+  answer, `path:line` evidence, what is left) in place of the reminder.
+- **Explore on the free model** (slim only). In `catch_all`, an explore
+  request for a native, non-OAI `<id>-withtools` model goes to `<id>` when
+  the catalog lists `<id>` as a free chat model (`_free_counterpart`), and
+  so through the cooperative pipeline; the reply still names the model
+  opencode asked for. Read-only exploration costs no credits and still works
+  after the budget guard's 402. Log: `slim: explore subagent -> free model`.
+- **opencode's step cap.** When opencode hits an agent's `steps` cap it ends
+  the request with an assistant message starting "CRITICAL - MAXIMUM STEPS
   REACHED" but still sends the tools. `_at_step_cap` spots it and the proxy
-  sets `tool_choice: "none"` (and skips the reminder), so that step has to
-  answer in text. harness sets no `steps` cap itself; this only matters
-  when the user's own opencode config sets one.
+  sets `tool_choice: "none"` (and skips the reminder), slim or not, so that
+  step has to answer in text. harness sets no `steps` in the opencode
+  config; this only matters when the user's own config sets one.
 - **Errors.** 4xx keep their status and upstream message; 5xx become 502.
   `Retry-After`, `Retry-After-Ms`, `X-RateLimit-*`, `x-request-id`,
   `Deprecation`, `Sunset` and `Link` are relayed (opencode's retry honours
@@ -264,10 +290,13 @@ second upstream). Two inbound routes reach it:
   `stream_options`: Responses streams always end with usage). Under slim it
   does what the chat route does, on Responses shapes: `_slim_tools` on the
   flat tool format, `_trim_old_response_outputs` on `function_call_output`
-  items (same `_trim_plan`), the reminder built from `_responses_chat_view`
-  (one model step's reasoning, message and function_call items become one
-  assistant message) and appended by `_append_to_last_item`, and the step
-  cap as `tool_choice: "none"`.
+  items (same `_trim_plan`, same exemptions), the slim prompt swapped into
+  `instructions` when it carries `_ENV_MARK`, else into the system/developer
+  input item, the reminder built from `_responses_chat_view` (one model
+  step's reasoning, message and function_call items become one assistant
+  message) and appended by `_append_to_last_item`, and both step caps
+  (general's 15, opencode's own) as `tool_choice: "none"`. The explore
+  reroute skips OAI models.
 
 `/v1/models` appends the `OAI_MODELS` entries to the vendor catalog (only on
 a 200; a vendor error, such as the locked-key 401, is still returned

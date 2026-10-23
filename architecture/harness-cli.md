@@ -366,43 +366,35 @@ help texts no longer advertise the flag.
 Every launch is slim unless `--normal` is given (`run_agent`, `cmd_host` and
 `cmd_serve` set the `harness_slim` shell global to 0; unset means 1; `--slim`
 is still accepted and sets 1). It is a flag only, not an `.env` setting.
-Slim makes the launch send less per request. `slim_opencode_config`
-prints a one-line JSON overlay that goes to opencode as
-`OPENCODE_CONFIG_CONTENT` (a `-e` from `agent_common_env` in container mode,
-an export in `host_run_opencode`); opencode deep-merges it over every other
-config layer, so the harness-written config is otherwise unchanged. It:
+Slim makes metered requests smaller. `slim_opencode_config` prints a
+one-line JSON overlay that goes to opencode as `OPENCODE_CONFIG_CONTENT` (a
+`-e` from `agent_common_env` in container mode, an export in
+`host_run_opencode`); opencode deep-merges it over every other config layer.
+It only adds the provider header `x-harness-slim: 1` (on `harness`, and on
+`harness-oai` with an OAI upstream, host or container); no agent prompts and
+no `steps`. Everything else happens in the proxy, on the native route only
+(`-withtools` and OAI models; [`proxy.md`](proxy.md)): short tool
+descriptions, `agents/slim-prompt.md` in place of opencode's prompt for the
+main agents and `agents/slim-subagent-prompt.md` for the `general`
+subagent (opencode's environment block, AGENTS.md/instructions and skills
+list are kept), a 15-step hard cap on `general`, `explore` sent to the free
+counterpart of a `-withtools` model, old tool output trimmed and the
+per-step reminder. The main agents have no cap, since a long task may need
+many steps. Free models on the cooperative route ignore the header, so they
+get opencode's request exactly as before slim existed.
 
-- sets the `prompt` of the `build`, `plan` and `yolo` agents to
-  `agents/slim-prompt.md` (about 4.2k chars instead of opencode's 15k
-  `gemini.txt`: every step costs, so work directly in few steps, batch tool
-  calls, search and read narrowly, stop exploring once able to act; todo-list
-  discipline with `todowrite` riding along with other calls; delegate wide
-  searches to a subagent with one narrow question, at most 3 at once; act
-  don't describe, smallest change, honesty) and of the `general` and
-  `explore` subagents to `agents/slim-subagent-prompt.md` (return fast, aim
-  for 3 to 5 steps, report what is left if stopped early; neither has `task`
-  or `todowrite`, and explore keeps its read-only permissions). opencode still
-  appends its environment block, AGENTS.md/instructions and the skills list.
-- sets `steps` (opencode's per-prompt step limit; on the last step it tells
-  the model to stop and summarize, and the proxy's `_at_step_cap` sends
-  `tool_choice: none`) on the subagents only: 15 on `general`, 10 on
-  `explore`. Subagents are kept because their reads never enter the main
-  context; uncapped, an `explore` subagent ran 40 to 100 steps, reading whole
-  files, and a 5M daily budget ran out before the task finished. At its cap a
-  subagent hands its parent a partial report, which the parent continues
-  from. The main agents have no cap, since a long task may need many steps.
-  `explore` is not disabled: opencode's plan-mode reminder and its
-  truncated-output notice both tell the agent to use it.
-- adds the provider header `x-harness-slim: 1`, on which the proxy shortens
-  the built-in tools' descriptions on the native route
-  ([`proxy.md`](proxy.md)).
-
-The prompt files are read from the clone at launch (no image rebuild). If
-one is missing the launch warns and runs without slim. Under `--normal`
-nothing here applies: opencode's own system prompt and tool descriptions
-are sent, and the proxy forwards native requests as is (its reminder and
-old-output trim run only on the slim header). Slim has no tuning knobs; its
-values are proxy constants, and comparing settings is done with a probe.
+`agents/slim-prompt.md` covers: quick orientation and whole-file reads when
+most of a file is needed, otherwise narrow search and ranges; wide searches
+delegated to a subagent with one narrow question, continuing from its
+report; batched tool calls; the todo list; verifying every change; smallest
+change; honesty. `agents/slim-subagent-prompt.md`: answer only the question,
+at most 15 steps, grep first, report with `path:line`. The proxy reads them
+once per process: a host proxy from the clone (its fingerprint includes both
+files, so editing one restarts it), the container proxy from its image
+(`proxy/Dockerfile` copies them). Under `--normal` there is no header:
+opencode's own system prompt and tool descriptions are sent and the proxy
+forwards native requests as is. Slim has no tuning knobs; its values are
+proxy constants, and comparing settings is done with a probe.
 Under `serve` the provider-wide slim header is left out and set per model
 instead (see [`serve`](#serve)), so a user can switch modes in the web UI.
 
@@ -746,7 +738,8 @@ What it does, in order:
    running from before it became the default (whose fingerprint lacks the
    line) is restarted once instead of reused, while one started with the old
    `--require-tool` flag still matches. A leftover `HARNESS_REQUIRE_TOOL` in
-   `.env` does not affect it. A `code=` line (cksum of `proxy/proxy.py`) and a
+   `.env` does not affect it. A `code=` line (one cksum over `proxy/proxy.py`,
+   `agents/slim-prompt.md` and `agents/slim-subagent-prompt.md`) and a
    `native=` line (`PROXY_NATIVE_TOOL_MODELS`, `MODEL_CONTEXT_LENGTH`) are appended
    unconditionally, so a host proxy left running across an upgrade or a knob
    change is restarted instead of serving old code. A `promptmode=<mode>` line is appended **only**
@@ -763,8 +756,8 @@ What it does, in order:
    common cause is `_validate_config` `sys.exit(1)`).
 7. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`
-   (`includeUsage`, token `cost` via `opencode_models_jq`, `compaction.prune`, no agent `steps`
-   cap; see [`containers.md`](containers.md)), but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
+   (`includeUsage`, token `cost` and a `-withtools` context of at most 120k via
+   `opencode_models_jq`, `compaction.prune`, no agent `steps` cap; see [`containers.md`](containers.md)), but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
    **scoped** file (`state/host/opencode.json`). It asserts host `jq` is present
    up front (`host_preflight` guarantees it) so the `harness_jq` docker-sidecar
    fallback can never be reached from this no-docker path. The caller exports
@@ -943,11 +936,11 @@ has thoughts). The provider-wide slim and thoughts headers are then left
 out. Aliases are made only where the proxy honors the headers: none for
 cooperative-route models, under `--normal`, or with the native route off.
 (The function also returns none with a prompt mode set or on the chatgpt
-backend, which `harness serve` cannot be started with today.) The headers change only the
-proxy side (tool descriptions, step reminder, old-output trim, thought
-summaries); the system prompt follows the agent, so a `stock` primary agent
-(opencode's own prompt, starting on `<default>:stock`) sits beside the slim
-`build`/`plan`. `cmd_serve` passes the same four modes to the index as
+backend, which `harness serve` cannot be started with today.) The headers act only in the
+proxy (slim prompt and tool descriptions, step reminder, old-output trim,
+general cap, explore reroute, thought summaries), so the `:stock` alias
+alone is stock mode; the `stock` primary agent is a shortcut that starts on
+`<default>:stock`. `cmd_serve` passes the same four modes to the index as
 `--mode` lines.
 
 **Access codes.** `harness serve code add|list|remove NAME` manages
@@ -1335,8 +1328,9 @@ pytest run is judged from the file text, model code never runs). The
 system prompts come from the clone (`--root`, which `cmd_probe` sets to
 `clone_dir`, mounting it read-only at `/harness` in the docker fallback),
 the tool descriptions from proxy.py's `_SLIM_TOOL_DESCRIPTIONS` via `ast`.
-`task` runs a nested loop with `agents/slim-subagent-prompt.md` (`general`
-and `explore`, as slim sets both). Arms
+`task` runs a nested loop with `agents/slim-subagent-prompt.md` for both
+`general` and `explore` (real slim gives it to `general` only; explore keeps
+opencode's prompt on the free model). Arms
 (digits for `--only`): 1 current prompt with thought signatures dropped (what
 opencode alone sends), 2 current prompt with signatures echoed (what the
 proxy now does), 3 `--candidate` (default `scripts/probe_slim_candidate.md`)

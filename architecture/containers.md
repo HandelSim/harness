@@ -49,6 +49,11 @@ mount or env key: the proxy runs require-tool mode on every launch except
 `passthrough`, with the one `reminder.md` (the former
 `reminder-require-tool.md` mount is gone).
 
+The slim system prompts (`agents/slim-prompt.md`,
+`agents/slim-subagent-prompt.md`) are baked into the image at
+`/app/agents/` with no mount, so editing one needs a proxy image rebuild in
+container mode ([`proxy.md`](proxy.md) → "Slim prompts, per agent").
+
 ## agent containers (`agents/Dockerfile` + `agents/entrypoint.sh`)
 
 A single image backs both modes (`opencode`, `shell`) with
@@ -115,7 +120,10 @@ After the drop, still in the entrypoint:
   program as `opencode_models_jq` in the harness script); each model also
   declares `attachment: true` and `modalities` input text + image, because
   opencode treats a model it does not know as text only and replaces every
-  pasted or read image with an error text before sending;
+  pasted or read image with an error text before sending; a `*-withtools`
+  model declares `limit.context` = min(`MODEL_CONTEXT_LENGTH`, 120000), so
+  opencode compacts before a metered step re-sends a huge history (other
+  models declare `MODEL_CONTEXT_LENGTH`);
   `compaction.prune` is on; no agent gets a `steps` cap (hard tasks may run
   long). Built with `jq` and
   re-written every launch because the model set may have changed. Falls back
@@ -126,10 +134,10 @@ After the drop, still in the entrypoint:
   `permission` block grants `edit`, `bash` (all commands), `webfetch`, and
   `websearch` — matching the set of tools the agent ships so yolo mode
   doesn't trip on the new ones.
-- Unless the launch is `--normal` it also passes `OPENCODE_CONFIG_CONTENT`
-  (slim agent prompts + the `x-harness-slim` provider header, on `harness-oai`
-  too when OAI is configured), which opencode
-  merges over this file; see [`harness-cli.md`](harness-cli.md) "Slim (default) and `--normal`".
+- When the overlay is non-empty it also passes `OPENCODE_CONFIG_CONTENT`
+  (the `x-harness-slim` provider header unless `--normal`, on `harness-oai`
+  too when OAI is configured; the thoughts header with `--thoughts`; the
+  active vault's keys), which opencode merges over this file; see [`harness-cli.md`](harness-cli.md) "Slim (default) and `--normal`".
 - `merge_opencode_mcp_servers` translates the canonical `{"mcpServers": {...}}`
   shape into opencode's `{"mcp": {<name>: {type: "remote"|"local", ...}}}`
   shape. Keeps the host harness script agent-agnostic.

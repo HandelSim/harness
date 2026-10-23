@@ -104,7 +104,7 @@ cfg=$(vault_opencode_config)
     || fail "V5: external_directory should allow the vault — $cfg"
 harness_slim=1
 merged=$(harness_opencode_overlay)
-jq -e '.agent.build.prompt and .provider.harness.options.headers["x-harness-slim"] == "1" and (.instructions | length == 1) and .permission.external_directory' \
+jq -e '.provider.harness.options.headers["x-harness-slim"] == "1" and (.instructions | length == 1) and .permission.external_directory' \
     <<<"$merged" >/dev/null || fail "V5: slim + vault overlays should merge — $merged"
 harness_slim=0
 [[ "$(harness_opencode_overlay)" == "$cfg" ]] || fail "V5: without slim the overlay is the vault part alone"

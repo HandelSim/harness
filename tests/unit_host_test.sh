@@ -122,16 +122,24 @@ jq -e '.agent.yolo.mode == "primary"' "$cfg" >/dev/null 2>&1 \
     || fail "T5d: slim must be the default when harness_slim is unset"
 overlay=$(clone_dir="$REPO_ROOT" harness_slim=1 slim_opencode_config)
 [[ "$overlay" != *$'\n'* ]] || fail "T5d: overlay must be one line (it travels as a docker -e value)"
-jq -e --rawfile main "$REPO_ROOT/agents/slim-prompt.md" --rawfile sub "$REPO_ROOT/agents/slim-subagent-prompt.md" '
-    .provider.harness.options.headers["x-harness-slim"] == "1"
-    and .agent.build.prompt == ($main | rtrimstr("\n")) and .agent.yolo.prompt == .agent.build.prompt
-    and .agent.plan.prompt == .agent.build.prompt and .agent.general.prompt == ($sub | rtrimstr("\n"))
-    and .agent.explore.prompt == .agent.general.prompt and (.provider.harness.options | has("baseURL") | not)
-    and ([.agent.build, .agent.plan, .agent.yolo] | all(has("steps") or has("permission") | not))
-    and .agent.general.steps == 15 and .agent.explore.steps == 10
-    and (.agent.explore | has("permission") | not)' \
-    <<<"$overlay" >/dev/null 2>&1 || fail "T5d: slim overlay has the wrong shape — $overlay"
-ok "T5d: yolo is primary-only; slim is the default; its overlay sets the slim prompts, the proxy header, subagent step caps, no main cap"
+# The overlay is the proxy header alone: prompts and caps are applied by the
+# proxy on the native route, so free (cooperative) models get stock opencode.
+[[ "$overlay" == '{"provider":{"harness":{"options":{"headers":{"x-harness-slim":"1"}}}}}' ]] \
+    || fail "T5d: slim overlay must be the proxy header only — $overlay"
+ok "T5d: yolo is primary-only; slim is the default; its overlay is the proxy header only (no agent prompts or steps)"
+
+# --- T5f2: -withtools models declare at most 120k context (earlier compaction) --
+models=$(printf '%s\n' plain big-withtools | jq -R . | jq -s --argjson ctx 200000 "$(opencode_models_jq)")
+[[ "$(jq -c '[.plain.limit.context, .["big-withtools"].limit.context]' <<<"$models")" == "[200000,120000]" ]] \
+    || fail "T5f2: -withtools entries must cap context at 120000 — $models"
+models=$(printf '%s\n' small-withtools | jq -R . | jq -s --argjson ctx 64000 "$(opencode_models_jq)")
+[[ "$(jq -c '.["small-withtools"].limit.context' <<<"$models")" == "64000" ]] \
+    || fail "T5f2: a smaller MODEL_CONTEXT_LENGTH must win — $models"
+models_prog=$(sed -n "/local models_prog='/,/from_entries'/p" "$REPO_ROOT/agents/entrypoint.sh" | sed "1s/.*models_prog='//; \$s/'\$//")
+models=$(printf '%s\n' plain big-withtools | jq -R . | jq -s --argjson ctx 200000 "$models_prog")
+[[ "$(jq -c '[.plain.limit.context, .["big-withtools"].limit.context]' <<<"$models")" == "[200000,120000]" ]] \
+    || fail "T5f2: the container entrypoint must cap -withtools context too — $models"
+ok "T5f2: -withtools models declare min(MODEL_CONTEXT_LENGTH, 120000), host and container alike"
 
 # --- T5c: opencode's cost readout counts tokens, cached ones included -------
 ( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; host_write_opencode_config ) \
@@ -181,7 +189,7 @@ ok "T5e: OAI models get the harness-oai provider; slim header on both"
 overlay=$(clone_dir="$REPO_ROOT" harness_slim=1 harness_thoughts=1 harness_vault_dir="" harness_opencode_overlay oai)
 jq -e '.provider.harness.options.headers == {"x-harness-slim": "1", "x-harness-thoughts": "1"}
        and .provider["harness-oai"].options.headers == {"x-harness-slim": "1"}
-       and .agent.build.prompt' <<<"$overlay" >/dev/null 2>&1 \
+       and (has("agent") | not)' <<<"$overlay" >/dev/null 2>&1 \
     || fail "T5g: slim + thoughts overlay has the wrong shape — $overlay"
 overlay=$(clone_dir="$REPO_ROOT" harness_slim=0 harness_thoughts=1 harness_vault_dir="" harness_opencode_overlay)
 [[ "$overlay" == '{"provider":{"harness":{"options":{"headers":{"x-harness-thoughts":"1"}}}}}' ]] \

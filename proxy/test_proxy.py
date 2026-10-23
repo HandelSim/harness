@@ -5752,7 +5752,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _post(self, body, fake, slim=False):
+    def _post(self, body, fake, slim=False, headers=None):
         client = proxy.app.test_client()
         self.log = io.StringIO()
         with patch.object(proxy.requests, "post", return_value=fake) as mock_post, \
@@ -5761,7 +5761,7 @@ class TestNativeToolPassthrough(unittest.TestCase):
                 patch("sys.stdout", self.log):
             resp = client.post("/v1/chat/completions", data=json.dumps(body),
                                content_type="application/json",
-                               headers={"x-harness-slim": "1"} if slim else {})
+                               headers={**({"x-harness-slim": "1"} if slim else {}), **(headers or {})})
             data = resp.get_data()
         return resp, data, mock_post
 
@@ -6016,10 +6016,12 @@ class TestNativeToolPassthrough(unittest.TestCase):
                 chunks = [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
                           b'data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":2}}\n\n',
                           b"data: [DONE]\n\n"]
-                self._post(dict(body, stream=True), self.FakeResp(200, "", chunks=chunks))
+                self._post(dict(body, stream=True), self.FakeResp(200, "", chunks=chunks),
+                           headers={"X-Session-Id": "ses_1"})
             with open(ledger) as f:
                 rows = [json.loads(line) for line in f]
         self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["session"], rows[1]["session"]), (None, "ses_1"))
         self.assertEqual((rows[0]["prompt"], rows[0]["completion"], rows[0]["reasoning"]), (1200, 30, 9))
         self.assertEqual(rows[0]["remaining"], {"credits-day": "777000"})
         self.assertEqual((rows[0]["model"], rows[0]["route"]), ("gemini-x-withtools", "native"))
@@ -6132,6 +6134,136 @@ class TestNativeToolPassthrough(unittest.TestCase):
             self.assertTrue(proxy._is_native_tool_model("gemini-3.8-flash-withtools"))
             self.assertFalse(proxy._is_native_tool_model("gemini-3.8-flash"))
             self.assertFalse(proxy._is_native_tool_model(""))
+
+
+class TestSlimAgents(unittest.TestCase):
+    """Under slim the native route picks the prompt and the cap per agent,
+    told apart by toolset; explore goes to the free model; task and todowrite
+    results are never trimmed. Without slim, or on the cooperative route,
+    opencode's request is left alone."""
+
+    FakeResp = TestNativeToolPassthrough.FakeResp
+    _post = TestNativeToolPassthrough._post
+    ENV = "\nYou are powered by the model named m. The exact model ID is harness/m\n<env>\n</env>"
+
+    @staticmethod
+    def _tools(*names):
+        return [{"type": "function", "function": {"name": n, "parameters": {"type": "object"}}}
+                for n in names]
+
+    MAIN = ("bash", "read", "edit", "task", "todowrite")
+    GENERAL = ("bash", "read", "edit", "write")
+    EXPLORE = ("bash", "read", "grep", "glob")
+
+    def setUp(self):
+        TestNativeToolPassthrough.setUp(self)
+        for p in (patch.dict(proxy._MODEL_INFO, clear=True),
+                  patch.dict(proxy._SLIM_PROMPTS, {"main": "SLIM MAIN", "general": "SLIM SUB"}),
+                  patch.object(proxy, "_SESSION_TODOS", {})):
+            p.start()
+            self.addCleanup(p.stop)
+        proxy._note_catalog(TestBudgetGuard.CATALOG)
+
+    def _sent(self, tools, msgs=None, slim=True, model="gemini-x-withtools"):
+        msgs = msgs or [{"role": "system", "content": "opencode prompt" + self.ENV},
+                        {"role": "user", "content": "go"}]
+        body = {"model": model, "messages": msgs, "tools": self._tools(*tools)}
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"), slim=slim)
+        return mock_post.call_args.kwargs["json"]
+
+    def test_agent_kind_by_toolset(self):
+        self.assertEqual(proxy._agent_kind(self._tools(*self.MAIN)), "main")
+        self.assertEqual(proxy._agent_kind(self._tools("read", "todowrite")), "main")
+        self.assertEqual(proxy._agent_kind(self._tools(*self.GENERAL)), "general")
+        self.assertEqual(proxy._agent_kind(self._tools(*self.EXPLORE)), "explore")
+        self.assertEqual(proxy._agent_kind([{"type": "function", "name": "apply_patch"}]), "general")
+
+    def test_prompt_swapped_before_the_environment_block(self):
+        self.assertEqual(self._sent(self.MAIN)["messages"][0]["content"], "SLIM MAIN" + self.ENV)
+        self.assertEqual(self._sent(self.GENERAL)["messages"][0]["content"], "SLIM SUB" + self.ENV)
+
+    def test_prompt_left_alone_for_explore_stock_and_unknown_shapes(self):
+        stock = "opencode prompt" + self.ENV
+        self.assertEqual(self._sent(self.MAIN, slim=False)["messages"][0]["content"], stock)
+        # Explore with no free counterpart stays native, with opencode's prompt.
+        self.assertEqual(self._sent(self.EXPLORE, model="other-withtools")["messages"][0]["content"], stock)
+        no_mark = [{"role": "system", "content": "custom"}, {"role": "user", "content": "go"}]
+        self.assertEqual(self._sent(self.MAIN, msgs=no_mark)["messages"][0]["content"], "custom")
+        parts = [{"role": "system", "content": [{"type": "text", "text": "p" + self.ENV}]},
+                 {"role": "user", "content": "go"}]
+        self.assertEqual(self._sent(self.MAIN, msgs=parts)["messages"][0]["content"],
+                         [{"type": "text", "text": "SLIM MAIN" + self.ENV}])
+
+    def _steps(self, n):
+        msgs = [{"role": "system", "content": "p" + self.ENV}, {"role": "user", "content": "go"}]
+        for i in range(n):
+            msgs += [{"role": "assistant", "content": None, "tool_calls": [
+                         {"id": f"c{i}", "type": "function", "function": {"name": "read", "arguments": f'{{"i": {i}}}'}}]},
+                     {"role": "tool", "tool_call_id": f"c{i}", "content": "x"}]
+        return msgs
+
+    def test_general_capped_at_15_steps(self):
+        sent = self._sent(self.GENERAL, msgs=self._steps(14))
+        self.assertNotIn("tool_choice", sent)
+        sent = self._sent(self.GENERAL, msgs=self._steps(15))
+        self.assertEqual(sent["tool_choice"], "none")
+        self.assertIn("used your 15 steps", sent["messages"][-1]["content"])
+        for tools in (self.MAIN, self.EXPLORE):
+            self.assertNotIn("tool_choice", self._sent(tools, msgs=self._steps(40), model="other-withtools"))
+        self.assertNotIn("tool_choice", self._sent(self.GENERAL, msgs=self._steps(40), slim=False))
+
+    def test_explore_goes_to_the_free_model(self):
+        msgs = [{"role": "system", "content": "opencode explore" + self.ENV}, {"role": "user", "content": "find x"}]
+        body = {"model": "gemini-x-withtools", "messages": msgs, "tools": self._tools(*self.EXPLORE)}
+        reply = self.FakeResp(200, json.dumps({"choices": [{"message": {"role": "assistant", "content": "found"}}]}))
+        resp, data, mock_post = self._post(body, reply, slim=True)
+        self.assertEqual(mock_post.call_args_list[0].kwargs["json"]["model"], "gemini-x")
+        self.assertEqual(json.loads(data)["model"], "gemini-x-withtools")
+        self.assertIn("explore subagent -> free model gemini-x", self.log.getvalue())
+        # Not under --normal, and not for the main agent.
+        _, _, mock_post = self._post(body, self.FakeResp(200, "{}"))
+        self.assertEqual(mock_post.call_args.kwargs["json"]["model"], "gemini-x-withtools")
+        _, _, mock_post = self._post(dict(body, tools=self._tools(*self.MAIN)), self.FakeResp(200, "{}"), slim=True)
+        self.assertEqual(mock_post.call_args.kwargs["json"]["model"], "gemini-x-withtools")
+
+    def test_free_counterpart_needs_a_free_chat_model(self):
+        self.assertEqual(proxy._free_counterpart("gemini-x-withtools"), "gemini-x")
+        self.assertEqual(proxy._free_counterpart("gemini-x"), "")
+        self.assertEqual(proxy._free_counterpart("gemini-embed-withtools"), "")
+        proxy._note_catalog({"data": [{"id": "paid", "lane": "standard",
+                                       "credit_weights": {"input": 1, "output": 1}}]})
+        self.assertEqual(proxy._free_counterpart("paid-withtools"), "")
+
+    def test_task_and_todowrite_results_never_trimmed(self):
+        big = "y" * 9000
+        msgs = [{"role": "user", "content": "go"}]
+        for i, name in enumerate(("task", "read", "todowrite", "read")):
+            msgs += [{"role": "assistant", "content": None, "tool_calls": [
+                         {"id": f"c{i}", "type": "function", "function": {"name": name, "arguments": "{}"}}]},
+                     {"role": "tool", "tool_call_id": f"c{i}", "content": big}]
+        msgs.append({"role": "assistant", "content": "next"})
+        with patch.object(proxy, "_TOOL_OUTPUT_KEEP", 1000), patch.object(proxy, "_TOOL_OUTPUT_TRIM_STEP", 1):
+            out, _ = proxy._trim_old_tool_outputs(msgs)
+            ritems = [{"role": "user", "content": "go"}]
+            for i, name in enumerate(("task", "read", "todowrite", "read")):
+                ritems += [{"type": "function_call", "call_id": f"c{i}", "name": name, "arguments": "{}"},
+                           {"type": "function_call_output", "call_id": f"c{i}", "output": big}]
+            ritems.append({"role": "assistant", "content": "next"})
+            rout, _ = proxy._trim_old_response_outputs(ritems)
+        tool_texts = [m["content"] for m in out if m.get("role") == "tool"]
+        self.assertEqual(tool_texts[0], big)               # task
+        self.assertIn("were dropped", tool_texts[1])       # read
+        self.assertEqual(tool_texts[2], big)               # todowrite
+        outs = [it["output"] for it in rout if it.get("type") == "function_call_output"]
+        self.assertEqual(outs[0], big)
+        self.assertIn("were dropped", outs[1])
+        self.assertEqual(outs[2], big)
+
+    def test_reminder_has_no_spend_figure(self):
+        sent = self._sent(self.MAIN, msgs=self._steps(3))
+        last = sent["messages"][-1]["content"]
+        self.assertIn("harness: step 3 of this task.", last)
+        self.assertNotIn("tokens", last)
 
 
 class TestBudgetGuard(unittest.TestCase):
@@ -6557,6 +6689,20 @@ class TestOaiUpstream(unittest.TestCase):
         self.assertIn("were dropped", outs[1])
         self.assertTrue(outs[2].startswith(big + "\n\n<system-reminder>\nharness: step 3 of this task"))
         self.assertIn("prompt=50 completion=7 reasoning=None cached=0", self.log.getvalue())
+
+    def test_responses_slim_prompt_in_instructions_or_system_item(self):
+        env = "\nYou are powered by the model named gpt-5.6-sol.\n<env></env>"
+        tools = self.FLAT_TOOLS + [{"type": "function", "name": "task", "parameters": {}}]
+        with patch.dict(proxy._SLIM_PROMPTS, {"main": "SLIM MAIN", "general": "SLIM SUB"}):
+            body = {"model": "gpt-5.6-sol", "instructions": "oc" + env, "input": "hi", "tools": tools}
+            _, _, calls = self._post("/v1/responses", body, [self.FakeResp(200, "{}")], {"x-harness-slim": "1"})
+            self.assertEqual(calls[0][1]["instructions"], "SLIM MAIN" + env)
+            items = [{"role": "developer", "content": "oc" + env}, {"role": "user", "content": "hi"}]
+            body = {"model": "gpt-5.6-sol", "input": items, "tools": tools}
+            _, _, calls = self._post("/v1/responses", body, [self.FakeResp(200, "{}")], {"x-harness-slim": "1"})
+            self.assertEqual(calls[0][1]["input"][0]["content"], "SLIM MAIN" + env)
+            _, _, calls = self._post("/v1/responses", body, [self.FakeResp(200, "{}")])
+            self.assertEqual(calls[0][1]["input"][0]["content"], "oc" + env)
 
     def test_responses_step_cap(self):
         items = [{"role": "user", "content": "go"},
