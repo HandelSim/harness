@@ -18,6 +18,9 @@
 #                                         once on a moved remote), with a line
 #                                         per tool call and every message from
 #                                         before a compaction
+#   - scripts/vault_ingest.py             against a mock upstream: pages,
+#                                         index, hubs, incremental runs,
+#                                         retry and failure
 #
 # Prints "VAULT TEST PASSED" on success.
 
@@ -288,5 +291,158 @@ order=$(grep -E '^(FIRST|SECOND|THIRD|SUMMARY)|^## ' "$f2" | paste -sd'|' -)
 want='## User|FIRST ASK|## Assistant|FIRST ANSWER|## Compaction|## Compaction summary|SUMMARY ONE|## User|SECOND ASK|## Compaction|## Compaction summary|SUMMARY TWO|## User|THIRD ASK'
 [[ "$order" == "$want" ]] || fail "V9: capture order — got '$order'"
 ok "V9: a session compacted twice keeps all its earlier text, summaries under their own heading"
+
+# --- V10: harness ingest against a mock upstream -----------------------------
+# The mock answers like a model: a section naming the source's first file, an
+# invented name on the first try for BADNAME, a refusal for FAILALWAYS.
+MOCK="$TMP_ROOT/mock.py"
+REQS="$TMP_ROOT/requests.jsonl"
+cat > "$MOCK" <<'PYEOF'
+import json, re, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        self.reply({"data": [{"id": "free-m"}, {"id": "free-m-withtools"}]})
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with open(sys.argv[2], "a") as f:
+            f.write(json.dumps({"raw": self.headers.get("x-harness-raw"), "model": req.get("model"),
+                                "n": len(req["messages"]), "prompt": req["messages"][0]["content"]}) + "\n")
+        src = req["messages"][0]["content"].split("<<<BEGIN_SOURCE>>>", 1)[1].split("<<<END_SOURCE>>>", 1)[0]
+        m = re.search(r"=== (\S+?)(?: lines [0-9-]+)? ===", src)
+        name = m.group(1) if m else "notes"
+        if "FAILALWAYS" in src:
+            text = "I cannot do that."
+        elif "BADNAME" in src and len(req["messages"]) == 1:
+            text = "summary: does things\n### Purpose\nUses `inventedOne`, `inventedTwo` and `inventedThree`.\nTopics: [[x]]"
+        else:
+            text = (f"```markdown\nHere you go:\nsummary: covers {name}\n# Purpose\nThe file `{name}` does the work.\n"
+                    f"### Gotchas\nnone seen\nTopics: [[Shared Topic]], [[only {name}]]\n```")
+        self.reply({"choices": [{"message": {"role": "assistant", "content": text}}]})
+srv = HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYEOF
+# shellcheck disable=SC2086
+$PY "$MOCK" 0 "$REQS" > "$TMP_ROOT/mock.port" 2>/dev/null &
+MOCK_PID=$!
+trap 'kill "$MOCK_PID" 2>/dev/null; rm -rf "$TMP_ROOT"' EXIT
+for _ in $(seq 50); do [[ -s "$TMP_ROOT/mock.port" ]] && break; sleep 0.1; done
+PORT=$(head -n 1 "$TMP_ROOT/mock.port")
+[[ -n "$PORT" ]] || fail "V10: the mock upstream did not start"
+PROJ="$TMP_ROOT/proj"
+mkdir -p "$PROJ/src/util" "$PROJ/docs" "$PROJ/node_modules/x"
+printf 'def run_app():\n    return 1\n' > "$PROJ/src/app.py"
+printf 'def helper():\n    pass\n' > "$PROJ/src/util/helpers.py"
+printf '# proj\nFixes ABC-12.\n' > "$PROJ/README.md"
+printf 'notes\n' > "$PROJ/docs/notes.md"
+printf 'skip me\n' > "$PROJ/node_modules/x/index.js"
+git -C "$PROJ" init -q && git -C "$PROJ" add -A && git -C "$PROJ" commit -qm init
+V="$TMP_ROOT/ingvault"
+cp -R "$REPO_ROOT/vault-template" "$V"
+cat > "$V/wiki/overview.md" <<'MDEOF'
+---
+type: overview
+summary: 'a test vault'
+project: 'proj'
+goal: 'a test vault, it''s for proj'
+ticket_pattern: '[A-Z]+-[0-9]+'
+---
+
+# proj
+MDEOF
+mkdir -p "$V/.raw/notes"
+printf -- '---\ntitle: Meeting\n---\n## Day one\nWe decided on ABC-12 and DEF-3.\n' > "$V/.raw/notes/meeting.md"
+ingest() {
+    # shellcheck disable=SC2086
+    $PY "$REPO_ROOT/scripts/vault_ingest.py" ingest --vault "$V" --proxy "http://127.0.0.1:$PORT/v1" \
+        --model free-m-withtools "$@" 2>&1
+}
+nreq() { [[ -f "$REQS" ]] && wc -l < "$REQS" | tr -d ' ' || echo 0; }
+out=$(ingest --src "$PROJ") || fail "V10: ingest failed — $out"
+for f in wiki/code/proj/proj.md wiki/code/proj/proj--src.md wiki/code/proj/proj--src--util.md \
+        wiki/code/proj/proj--docs.md wiki/sources/notes--meeting.md wiki/tickets/ABC-12.md wiki/tickets/DEF-3.md; do
+    [[ -f "$V/$f" ]] || fail "V10: ingest should write $f — $(cd "$V" && find wiki -name '*.md' | sort | tr '\n' ' ') $out"
+done
+ls "$V/wiki/topics/" | grep -qi '^shared topic\.md$' || fail "V10: a topic used by many pages gets a hub — $(ls "$V/wiki/topics" 2>&1)"
+grep -rq node_modules "$V/wiki" && fail "V10: node_modules must not be ingested"
+$PY - "$REQS" <<'PYEOF' || fail "V10: requests — $(head -c 600 "$REQS")"
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1])]
+assert rows and all(r["raw"] == "1" and r["model"] == "free-m" for r in rows), "raw header / free model"
+assert any("a test vault, it's for proj" in r["prompt"] for r in rows), "the charter goes with each request"
+assert all("Reminder, the task:" in r["prompt"].split("<<<END_SOURCE>>>")[-1] for r in rows), "rules repeated after the source"
+PYEOF
+src_page="$V/wiki/code/proj/proj--src.md"
+grep -q '^> covers src/app.py' "$src_page" || fail "V10: the section's summary line — $(cat "$src_page")"
+grep -q 'Here you go\|```' "$src_page" && fail "V10: preamble and fence should be stripped — $(cat "$src_page")"
+grep -q 'proj--src--util' "$src_page" || fail "V10: a directory page links its subdirectories — $(cat "$src_page")"
+grep -q '\[\[proj\]\]' "$V/wiki/index.md" || fail "V10: the index lists the codebase — $(cat "$V/wiki/index.md")"
+grep -q 'notes--meeting' "$V/wiki/index.md" || fail "V10: the index lists the sources — $(cat "$V/wiki/index.md")"
+grep -q 'notes--meeting' "$V/wiki/tickets/ABC-12.md" || fail "V10: the ticket page links its sources — $(cat "$V/wiki/tickets/ABC-12.md")"
+ok "V10: ingest writes code, source, topic and ticket pages and the index, through the raw header on the free model"
+
+# --- V11: only new or changed units are sent; gone sources lose their pages --
+before=$(nreq)
+ingest >/dev/null || fail "V11: rerun failed"
+[[ "$(nreq)" == "$before" ]] || fail "V11: a rerun with nothing changed sent $(( $(nreq) - before )) requests"
+printf 'def run_app():\n    return 2\n' > "$PROJ/src/app.py"
+rm -rf "$PROJ/docs"; git -C "$PROJ" add -A; git -C "$PROJ" commit -qm change
+before=$(nreq)
+ingest >/dev/null || fail "V11: incremental run failed"
+[[ "$(nreq)" == "$(( before + 1 ))" ]] || fail "V11: one changed directory should be one request, got $(( $(nreq) - before ))"
+[[ ! -f "$V/wiki/code/proj/proj--docs.md" ]] || fail "V11: a deleted directory's page should go"
+grep -q 'proj--docs' "$V/wiki/index.md" && fail "V11: the index should drop the deleted page"
+ok "V11: incremental: unchanged units are skipped, changed ones resent, deleted ones removed"
+
+# --- V12: a reply that fails its checks is retried once, then marked failed --
+mkdir -p "$PROJ/src/bad" "$PROJ/src/worse"
+printf '# BADNAME\nx = 1\n' > "$PROJ/src/bad/x.py"
+printf '# FAILALWAYS\ny = 1\n' > "$PROJ/src/worse/y.py"
+git -C "$PROJ" add -A; git -C "$PROJ" commit -qm more
+ingest >/dev/null
+$PY - "$V/.harness/ingest.json" "$REQS" <<'PYEOF' || fail "V12: manifest — $(cat "$V/.harness/ingest.json")"
+import json, sys
+units = json.load(open(sys.argv[1]))["units"]
+bad = [v for k, v in units.items() if k.startswith("code:proj/src/bad#")]
+worse = [v for k, v in units.items() if k.startswith("code:proj/src/worse#")]
+assert bad and bad[0]["status"] == "ok", bad
+assert worse and worse[0]["status"] == "failed" and worse[0]["problems"], worse
+rows = [json.loads(l) for l in open(sys.argv[2])]
+assert any(r["n"] == 3 and "BADNAME" in r["prompt"] for r in rows), "the retry carries the first reply and its problems"
+PYEOF
+[[ ! -f "$V/wiki/code/proj/proj--src--worse.md" ]] || fail "V12: a failed unit writes no page"
+before=$(nreq); ingest >/dev/null
+[[ "$(nreq)" == "$before" ]] || fail "V12: a failed unit is not resent without --retry-failed"
+ingest --retry-failed >/dev/null
+(( $(nreq) > before )) || fail "V12: --retry-failed resends the failed unit"
+ok "V12: a bad reply is retried with its problems, a refusal is marked failed and resent only on request"
+
+# --- V13: the capture never shrinks a file, and import --all takes any directory
+DB3="$TMP_ROOT/shrunk.db"
+cp "$DB2" "$DB3"
+# shellcheck disable=SC2086
+$PY - "$DB3" <<'PYEOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1]); c.execute("DELETE FROM message WHERE id = 'm7'"); c.commit()
+PYEOF
+cp "$f2" "$TMP_ROOT/f2.before"
+# shellcheck disable=SC2086
+err_out=$($PY "$REPO_ROOT/scripts/vault_capture.py" "$DB3" "$CAP2" 0 /w 2>&1 >/dev/null)
+cmp -s "$f2" "$TMP_ROOT/f2.before" || fail "V13: a session with fewer messages must not overwrite its capture"
+grep -q 'kept' <<<"$err_out" || fail "V13: keeping the file should be reported — $err_out"
+ALL="$TMP_ROOT/all"
+# shellcheck disable=SC2086
+$PY "$REPO_ROOT/scripts/vault_capture.py" "$DB" "$ALL" 0 '*' >/dev/null
+for sid in ses_new ses_else ses_old; do
+    ls "$ALL/.raw/sessions/" | grep -q "$sid" || fail "V13: --all should capture $sid — $(ls "$ALL/.raw/sessions")"
+done
+ls "$ALL/.raw/sessions/" | grep -q ses_sub && fail "V13: subagent sessions are never captured on their own"
+ok "V13: a capture is never shrunk; import --all captures every directory's root sessions"
 
 echo "VAULT TEST PASSED"
