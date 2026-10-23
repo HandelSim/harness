@@ -515,9 +515,10 @@ def _is_native_tool_model(model: str) -> bool:
 # moving; on a metered model an agent that keeps reading and grepping burns the
 # daily budget (every step re-sends the whole conversation). So under `--slim`
 # each native request that carries tools gets one short <system-reminder>
-# appended to its LAST message: the step count and estimated tokens for this
-# task, the todo list (or the instruction to write one), and nudges when the
-# list goes stale, calls repeat, or many steps pass without a file change. It
+# appended to its LAST message: the step count for this task, the todo list
+# (or the instruction to write one), and nudges when the list goes stale, calls
+# repeat, or many steps pass without a file change. It carries no spend
+# figure: the model's only lever on one is to research less. It
 # is rebuilt from the history on every request and never accumulates: opencode
 # re-sends its own copy of the history, which does not carry it. Without
 # `--slim` the native route sends opencode's request as is.
@@ -526,6 +527,9 @@ _TOOL_OUTPUT_TRIM_MIN = 1_500  # chars: shorter old tool outputs are left alone
 _TOOL_OUTPUT_HEAD = 500        # chars of a trimmed tool output that are kept
 _TOOL_OUTPUT_TRIM_STEP = 60_000  # chars: the trim cut moves in steps this big (prompt cache)
 _NATIVE_EDIT_TOOLS = frozenset({"edit", "write", "patch", "multiedit", "apply_patch"})
+# Results the trim never shortens: a subagent's report cannot be fetched again
+# without relaunching the subagent, and the todo list is the agent's plan.
+_TRIM_EXEMPT_TOOLS = frozenset({"task", "todowrite"})
 _NATIVE_TODO_AFTER = 3        # steps with no todo list before it is demanded
 _NATIVE_TODO_STALE = 12       # steps without a todowrite before the list must be updated
 _NATIVE_NO_EDIT_NUDGE = 30    # steps without a file change before a nudge
@@ -583,18 +587,25 @@ def _trim_old_tool_outputs(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[st
     opencode's own prune does the same thing but only between user prompts,
     never inside one long task. `_trim_plan` picks the results; a trimmed one
     keeps its first `_TOOL_OUTPUT_HEAD` chars plus a note. Results after the
-    last assistant message (the ones the model is about to read) are never
-    trimmed. opencode's stored history is untouched; only this request shrinks,
-    and the upstream's usage (so opencode's compaction counter) follows it.
-    Returns the new list (a copy where changed) and the characters dropped."""
+    last assistant message (the ones the model is about to read) and results
+    of `_TRIM_EXEMPT_TOOLS` are never trimmed. opencode's stored history is
+    untouched; only this request shrinks, and the upstream's usage (so
+    opencode's compaction counter) follows it. Returns the new list (a copy
+    where changed) and the characters dropped."""
     if not messages:
         return messages, 0
     last_assistant = max(
         (i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"),
         default=-1,
     )
+    names = {
+        tc.get("id"): (tc.get("function") or {}).get("name")
+        for m in messages if isinstance(m, dict) and m.get("role") == "assistant"
+        for tc in m.get("tool_calls") or [] if isinstance(tc, dict)
+    }
     outputs = [
-        (i, _flatten_content_to_str(m.get("content") or ""), i < last_assistant)
+        (i, _flatten_content_to_str(m.get("content") or ""),
+         i < last_assistant and names.get(m.get("tool_call_id")) not in _TRIM_EXEMPT_TOOLS)
         for i, m in enumerate(messages)
         if isinstance(m, dict) and m.get("role") == "tool"
     ]
@@ -621,31 +632,23 @@ def _tool_call_key(tc: Dict[str, Any]) -> str:
     return f"{func.get('name')} {json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
 
 
-def _native_task_stats(messages: List[Dict[str, Any]], tools: List[Any]) -> Dict[str, Any]:
+def _native_task_stats(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Count this task's steps from the history: assistant turns since the last
     user message, how many of them changed a file, how many have passed since
-    the last change and since the last `todowrite`, which identical tool calls
-    were repeated, and an estimate of the tokens the task has cost so far
-    (each step's request carried every message before it plus the tool
-    schemas). The estimate divides characters by 3, like `_estimate_tokens`."""
+    the last change and since the last `todowrite`, and which identical tool
+    calls were repeated."""
     last_user = -1
     for i, m in enumerate(messages):
         if isinstance(m, dict) and m.get("role") == "user":
             last_user = i
-    tools_chars = len(json.dumps(tools, ensure_ascii=False)) if tools else 0
-    prefix = [0]
-    for m in messages:
-        prefix.append(prefix[-1] + len(json.dumps(m, ensure_ascii=False, default=str)))
     steps = edits = since_edit = 0
     since_todo = None
     calls: Dict[str, int] = {}
-    chars = prefix[len(messages)] + tools_chars  # the request being sent now
     for j in range(last_user + 1, len(messages)):
         m = messages[j]
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
         steps += 1
-        chars += prefix[j] + tools_chars
         tcs = [tc for tc in m.get("tool_calls") or [] if isinstance(tc, dict)]
         names = {(tc.get("function") or {}).get("name") for tc in tcs}
         for tc in tcs:
@@ -663,7 +666,7 @@ def _native_task_stats(messages: List[Dict[str, Any]], tools: List[Any]) -> Dict
     repeats = sorted(((n, k) for k, n in calls.items() if n >= _NATIVE_REPEAT_AT), reverse=True)
     return {
         "steps": steps, "edits": edits, "since_edit": since_edit, "since_todo": since_todo,
-        "repeats": repeats, "tokens": chars // 3,
+        "repeats": repeats,
     }
 
 
@@ -678,8 +681,8 @@ def _native_reminder(
     out, and so are identical tool calls repeated within the task, the clearest
     sign of a run that has lost its goal. The standing advice on working in
     few steps lives in the slim system prompt, not here."""
-    st = _native_task_stats(messages, tools)
-    lines = [f"harness: step {st['steps']} of this task, about {st['tokens']:,} tokens so far."]
+    st = _native_task_stats(messages)
+    lines = [f"harness: step {st['steps']} of this task."]
     todos = _extract_latest_todos(messages)
     if session_id:
         if todos:
@@ -772,7 +775,7 @@ def _append_to_last_message(messages: List[Dict[str, Any]], text: str) -> List[D
 
 # Slim mode (the default; off under `harness --normal`): opencode then sends
 # `x-harness-slim: 1` (a provider header the slim config overlay adds) and the
-# native path swaps the
+# native path swaps the system prompt (`_slim_system`) and the
 # long built-in tool descriptions (about 24k chars for opencode's 12 tools)
 # for these short ones. Parameter schemas are untouched and a tool not listed
 # here (an MCP tool, a newer opencode tool) keeps its own description. Without
@@ -879,6 +882,112 @@ def _at_step_cap(messages: List[Dict[str, Any]]) -> bool:
     return isinstance(content, str) and content.lstrip().startswith(_MAX_STEPS_MARK)
 
 
+# Slim prompts. Under slim the native route also puts harness's short system
+# prompt in place of opencode's, per agent. opencode sends one system message:
+# the agent's prompt (for build, plan and general, opencode's provider prompt)
+# joined to the environment block, which starts with `_ENV_MARK`; only the
+# part before the mark is replaced. The agent is told apart by its toolset
+# (`_agent_kind`): opencode removes `task` and `todowrite` from a subagent's
+# tools, and explore has no file-editing tool. The main agents get
+# agents/slim-prompt.md; general gets agents/slim-subagent-prompt.md and a
+# hard cap of `_SLIM_GENERAL_STEPS` steps; explore keeps opencode's own prompt
+# and goes to the free model when there is one (`_free_counterpart`). Doing
+# this here rather than in the opencode config keeps it off the free
+# (cooperative) models, which get opencode's request as before.
+_ENV_MARK = "\nYou are powered by the model named "
+_SLIM_PROMPT_FILES = {"main": "slim-prompt.md", "general": "slim-subagent-prompt.md"}
+_SLIM_PROMPTS: Dict[str, str] = {}
+_SLIM_GENERAL_STEPS = 15
+_SLIM_CAP_NOTE = (
+    "<system-reminder>\nharness: you have used your {n} steps and tools are now off. Reply with "
+    "your report now: the answer with `path:line` evidence, what you changed and verified, and "
+    "what is left and where to look next.\n</system-reminder>"
+)
+
+
+def _slim_prompt(kind: str) -> str:
+    """The slim prompt for `kind` ("main" or "general"), read once from
+    agents/ (next to proxy.py in the image, beside proxy/ in a clone). Empty
+    when the file is missing, and the agent then keeps opencode's prompt."""
+    if kind not in _SLIM_PROMPTS:
+        here = os.path.dirname(os.path.abspath(__file__))
+        text = ""
+        for d in (os.path.join(here, "agents"), os.path.join(here, os.pardir, "agents")):
+            try:
+                with open(os.path.join(d, _SLIM_PROMPT_FILES[kind]), encoding="utf-8") as f:
+                    text = f.read().strip()
+                break
+            except OSError:
+                continue
+        if not text:
+            print(f"[!] slim: agents/{_SLIM_PROMPT_FILES[kind]} not found; opencode's prompt is kept",
+                  flush=True)
+        _SLIM_PROMPTS[kind] = text
+    return _SLIM_PROMPTS[kind]
+
+
+def _tool_names(tools: List[Any]) -> set:
+    """Tool names from chat (`function.name`) or Responses (`name`) tools."""
+    return {
+        (t.get("function") or {}).get("name") or t.get("name")
+        for t in tools or [] if isinstance(t, dict)
+    }
+
+
+def _agent_kind(tools: List[Any]) -> str:
+    """"main", "general" or "explore", from the request's toolset."""
+    names = _tool_names(tools)
+    if names & {"task", "todowrite"}:
+        return "main"
+    if names & _NATIVE_EDIT_TOOLS:
+        return "general"
+    return "explore"
+
+
+def _swap_prompt_content(content: Any, prompt: str) -> Any:
+    """`content` (a string or a list of text parts) with `prompt` in place of
+    the text before `_ENV_MARK`, or None when the mark is not there."""
+    if isinstance(content, str):
+        i = content.find(_ENV_MARK)
+        return None if i < 0 else prompt + content[i:]
+    if isinstance(content, list):
+        for k, part in enumerate(content):
+            text = part.get("text") if isinstance(part, dict) else None
+            if isinstance(text, str) and _ENV_MARK in text:
+                return list(content[:k]) + [{**part, "text": _swap_prompt_content(text, prompt)}] \
+                    + list(content[k + 1:])
+    return None
+
+
+def _slim_system(messages: List[Any], kind: str) -> List[Any]:
+    """A copy of `messages` (chat messages or Responses input items) whose
+    first system message carries the slim prompt for `kind`; unchanged for
+    explore, without a prompt file, or when no system message has the mark."""
+    prompt = _slim_prompt(kind) if kind in _SLIM_PROMPT_FILES else ""
+    if not prompt:
+        return messages
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+            new = _swap_prompt_content(m.get("content"), prompt)
+            if new is not None:
+                return list(messages[:i]) + [{**m, "content": new}] + list(messages[i + 1:])
+    return messages
+
+
+def _free_counterpart(model: str) -> str:
+    """The free cooperative model behind a native `<id>-withtools` model, or
+    "" when the catalog has no free chat model `<id>`."""
+    suffix = "-withtools"
+    if not model.endswith(suffix):
+        return ""
+    base = model[:-len(suffix)]
+    _load_catalog()
+    info = _MODEL_INFO.get(base)
+    if not info or not info.get("chat", True) or _is_native_tool_model(base) or not _is_free_model(base):
+        return ""
+    return base
+
+
 # Rate-limit / deprecation headers worth handing back to the client, so the AI
 # SDK and opencode see the upstream's Retry-After instead of guessing a delay.
 _RELAY_HEADERS = ("retry-after", "retry-after-ms", "x-request-id", "deprecation", "sunset", "link")
@@ -974,10 +1083,11 @@ def _chat_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
-                  headers: Any, route: str) -> None:
+                  headers: Any, route: str, session_id: str = "") -> None:
     """Log the usage the upstream reported for one reply and append it to the
     ledger. `usage` is the upstream's own figure, never the proxy's estimate,
-    so the ledger counts what the upstream counts."""
+    so the ledger counts what the upstream counts. `session_id` (opencode's,
+    see `_session_id`) lets the ledger be summed per session."""
     try:
         hdr = {str(k).lower(): v for k, v in dict(headers or {}).items()}
     except (TypeError, ValueError):
@@ -1002,6 +1112,7 @@ def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
         "ts": round(datetime.datetime.now(datetime.timezone.utc).timestamp(), 3),
         "model": model,
         "route": route,
+        "session": session_id or None,
         "prompt": usage.get("prompt_tokens"),
         "completion": usage.get("completion_tokens"),
         "reasoning": rt,
@@ -1023,7 +1134,8 @@ def _record_usage(req_id: str, model: str, usage: Optional[Dict[str, Any]],
         globals()["_USAGE_LEDGER"] = ""
 
 
-def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, str]) -> None:
+def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, str],
+                      session_id: str = "") -> None:
     """One log line per native request with the usage the upstream reported
     (from the JSON body or the stream's usage chunk; for the Responses API
     the `response.completed` event) and the remaining-quota headers, so a
@@ -1045,7 +1157,7 @@ def _log_native_usage(req_id: str, model: str, raw: bytes, headers: Dict[str, st
         if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
             usage = obj["usage"]
             break
-    _record_usage(req_id, model, usage, headers, "native")
+    _record_usage(req_id, model, usage, headers, "native", session_id)
 
 
 # Daily budget guard. The upstream lets the request that crosses the daily
@@ -1536,8 +1648,9 @@ def _native_passthrough(
     their status (so the AI SDK does not retry a deterministic rejection, and
     does retry a 429); 5xx become 502 as on the cooperative path. Under `slim`
     (see `_SLIM_HEADER`) the built-in tools' descriptions are shortened, old
-    tool output is trimmed and the reminder is appended; otherwise the request
-    is opencode's own. `oai` sends it to the OAI upstream instead, after
+    tool output is trimmed, the slim prompt goes in (`_slim_system`), the
+    general subagent is capped at `_SLIM_GENERAL_STEPS` steps and the reminder
+    is appended; otherwise the request is opencode's own. `oai` sends it to the OAI upstream instead, after
     `_oai_chat_payload`. In every mode, thought signatures opencode dropped
     are put back (`_SIGNATURES`), and `thoughts` asks a vendor model for its
     thought summaries (`_THOUGHTS_HEADER`)."""
@@ -1553,14 +1666,21 @@ def _native_passthrough(
         # auto-compacts. opencode asks for usage by default; ask here too so
         # every client gets it.
         payload["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}
+    kind = _agent_kind(payload.get("tools") or []) if slim and payload.get("tools") else ""
     if slim:
         messages, trimmed = _trim_old_tool_outputs(messages)
         if trimmed:
             payload["messages"] = messages
             print(f"[{req_id}] trimmed {trimmed:,} chars of old tool output", flush=True)
-    if payload.get("tools") and _at_step_cap(messages):
+        if kind:
+            payload["messages"] = messages = _slim_system(messages, kind)
+    capped = kind == "general" and _native_task_stats(messages)["steps"] >= _SLIM_GENERAL_STEPS
+    if payload.get("tools") and (capped or _at_step_cap(messages)):
         # Make the step cap hard: the upstream honours tool_choice "none".
         payload["tool_choice"] = "none"
+        if capped and messages:
+            payload["messages"] = messages = _append_to_last_message(
+                messages, _SLIM_CAP_NOTE.format(n=_SLIM_GENERAL_STEPS))
     elif slim and payload.get("tools") and messages:
         payload["messages"] = messages = _append_to_last_message(
             messages, _native_reminder(messages, payload.get("tools") or [], session_id)
@@ -1599,7 +1719,7 @@ def _native_passthrough(
     resp = _native_send(req_id, OAI_CHAT_URL if oai else CHAT_URL, OAI_API_KEY if oai else PROXY_API_KEY,
                         payload, model_name, False if thoughts else want_stream, retry,
                         json_hook=_split_thoughts if thoughts else None,
-                        as_sse=thoughts and want_stream)
+                        as_sse=thoughts and want_stream, session_id=session_id)
     if unsigned_retry["done"] and resp.status_code < 400:
         _SIGNATURES_OFF.add(model_name)
         print(f"[{req_id}] WARN: '{model_name}' refuses reattached thought signatures; no longer reattaching them",
@@ -1666,8 +1786,13 @@ def _trim_old_response_outputs(items: List[Any]) -> Tuple[List[Any], int]:
          and (it.get("type") in ("function_call", "reasoning") or it.get("role") == "assistant")),
         default=-1,
     )
+    names = {
+        it.get("call_id"): it.get("name")
+        for it in items if isinstance(it, dict) and it.get("type") == "function_call"
+    }
     outputs = [
-        (i, _resp_output_text(it.get("output")), i < last_step)
+        (i, _resp_output_text(it.get("output")),
+         i < last_step and names.get(it.get("call_id")) not in _TRIM_EXEMPT_TOOLS)
         for i, it in enumerate(items)
         if isinstance(it, dict) and it.get("type") == "function_call_output"
     ]
@@ -1721,8 +1846,9 @@ def _responses_passthrough(
     what opencode's `@ai-sdk/openai` provider sends), to the OAI upstream
     only. The reply is relayed as-is. The request gets a `prompt_cache_key`
     (the session) when it has none, and under `slim` the same changes as the
-    chat route: short tool descriptions, old tool output trimmed, the reminder
-    on the last input item, and the step cap made hard."""
+    chat route: short tool descriptions, old tool output trimmed, the slim
+    prompt (in `instructions` or the system item), the reminder on the last
+    input item, and the step caps made hard."""
     payload = dict(inbound_request)
     payload["model"] = model_name
     items = payload.get("input")
@@ -1733,14 +1859,26 @@ def _responses_passthrough(
         payload.setdefault("prompt_cache_key", session_id)
     if slim and payload.get("tools"):
         payload["tools"] = _slim_tools(payload["tools"])
+    kind = _agent_kind(payload.get("tools") or []) if slim and payload.get("tools") else ""
     if slim:
         items, trimmed = _trim_old_response_outputs(items)
         if trimmed:
             payload["input"] = items
             print(f"[{req_id}] trimmed {trimmed:,} chars of old tool output", flush=True)
+        if kind:
+            swapped = _swap_prompt_content(payload.get("instructions"), _slim_prompt(kind)) \
+                if kind in _SLIM_PROMPT_FILES and _slim_prompt(kind) else None
+            if swapped is not None:
+                payload["instructions"] = swapped
+            else:
+                payload["input"] = items = _slim_system(items, kind)
     view = _responses_chat_view(items)
-    if payload.get("tools") and _at_step_cap(view):
+    capped = kind == "general" and _native_task_stats(view)["steps"] >= _SLIM_GENERAL_STEPS
+    if payload.get("tools") and (capped or _at_step_cap(view)):
         payload["tool_choice"] = "none"
+        if capped and items:
+            payload["input"] = items = _append_to_last_item(
+                items, _SLIM_CAP_NOTE.format(n=_SLIM_GENERAL_STEPS))
     elif slim and payload.get("tools") and items:
         chat_tools = [{"type": "function", "function": {"name": t.get("name")}}
                       for t in payload["tools"] if isinstance(t, dict)]
@@ -1752,7 +1890,8 @@ def _responses_passthrough(
     )
     save_debug_file(req_id, "02", "API_Request", payload)
     return _native_send(req_id, OAI_RESPONSES_URL, OAI_API_KEY, payload, model_name, want_stream,
-                        lambda d: _oai_responses_retry(req_id, payload, model_name, d))
+                        lambda d: _oai_responses_retry(req_id, payload, model_name, d),
+                        session_id=session_id)
 
 
 def _upstream_error_detail(err_body: Any) -> str:
@@ -1765,7 +1904,7 @@ def _upstream_error_detail(err_body: Any) -> str:
 
 def _native_send(
     req_id: str, url: str, key: str, payload: Dict[str, Any], model_name: str, want_stream: bool,
-    retry: Any = None, json_hook: Any = None, as_sse: bool = False,
+    retry: Any = None, json_hook: Any = None, as_sse: bool = False, session_id: str = "",
 ) -> Response:
     """POST a native request and relay the reply: the upstream's SSE stream or
     JSON body as-is, 4xx with their status (so the AI SDK does not retry a
@@ -1839,7 +1978,7 @@ def _native_send(
         except ValueError:
             save_debug_file(req_id, "03", "API_Response", {"raw": body.decode("utf-8", "replace")})
         _remember_json_signatures(parsed)
-        _log_native_usage(req_id, model_name, body, ok_headers)
+        _log_native_usage(req_id, model_name, body, ok_headers, session_id)
         if json_hook is not None and isinstance(parsed, dict):
             parsed = json_hook(parsed)
             body = json.dumps(parsed).encode("utf-8")
@@ -1878,7 +2017,7 @@ def _native_send(
                 )
             sigs.remember()
             print(f"[{req_id}] upstream OK; relayed native SSE", flush=True)
-            _log_native_usage(req_id, model_name, usage_line.value(), ok_headers)
+            _log_native_usage(req_id, model_name, usage_line.value(), ok_headers, session_id)
 
     return Response(relay(), status=200, mimetype="text/event-stream")
 
@@ -4991,6 +5130,17 @@ def catch_all(path: str) -> Response:
         want_stream = bool(inbound_request.get("stream", False))
 
         print(f"[{req_id}] {request.method} /{path} model={model_name} messages={len(original_messages)} tools={len(tools)}", flush=True)
+        # Slim: an explore subagent on a metered native model goes to that
+        # model's free cooperative counterpart (see `_slim_system`). The reply
+        # still names the model opencode asked for.
+        reply_model = model_name
+        if (request.headers.get(_SLIM_HEADER, "") == "1" and tools
+                and _is_native_tool_model(model_name) and not _is_oai_model(model_name)
+                and _agent_kind(tools) == "explore"):
+            free_model = _free_counterpart(model_name)
+            if free_model:
+                print(f"[{req_id}] slim: explore subagent -> free model {free_model}", flush=True)
+                model_name = free_model
         refused = _budget_check(
             req_id, model_name, inbound_request,
             slim=request.headers.get(_SLIM_HEADER, "") == "1" and _is_native_tool_model(model_name))
@@ -5099,7 +5249,8 @@ def catch_all(path: str) -> Response:
         save_debug_file(req_id, "03", "API_Response", target_json)
         if isinstance(target_json, dict):
             _record_usage(req_id, upstream_model, target_json.get("usage"),
-                          getattr(resp, "headers", None), "cooperative")
+                          getattr(resp, "headers", None), "cooperative",
+                          _session_id(request.headers))
 
         response_text = extract_assistant_content(target_json)
         # Names currently exposed to the model — used to gate the
@@ -5374,11 +5525,11 @@ def catch_all(path: str) -> Response:
         # be dumped to debug output before streaming; memory cost is the
         # response size — a few KB for typical responses.
         if want_stream:
-            sse_chunks = list(generate_openai_sse(model_name, clean_text, tool_call_payloads, usage))
+            sse_chunks = list(generate_openai_sse(reply_model, clean_text, tool_call_payloads, usage))
             save_debug_file(req_id, "04", "OpenAI_SSE_Response", {"chunks": sse_chunks})
             print(f"[{req_id}] upstream OK; emitting OpenAI SSE (tool_calls={len(tool_call_payloads)})", flush=True)
             return app.response_class(iter(sse_chunks), mimetype="text/event-stream")
-        body = build_openai_response(model_name, clean_text, tool_call_payloads, usage)
+        body = build_openai_response(reply_model, clean_text, tool_call_payloads, usage)
         save_debug_file(req_id, "04", "OpenAI_Response", body)
         print(f"[{req_id}] upstream OK; emitting OpenAI JSON (tool_calls={len(tool_call_payloads)})", flush=True)
         return Response(json.dumps(body), status=200, mimetype="application/json")
@@ -5554,7 +5705,7 @@ def main() -> None:
         f"   timeout:        {PROXY_TIMEOUT}s\n"
         f"   prompt mode:    {_PROMPT_MODE}\n"
         f"   native tools:   {_NATIVE_TOOL_STATUS}\n"
-        f"   slim requests:  short tool descriptions, reminder, older tool output trimmed (newest ~{_TOOL_OUTPUT_KEEP:,} tokens whole)\n"
+        f"   slim requests:  short tool descriptions, reminder, older tool output trimmed (newest ~{_TOOL_OUTPUT_KEEP:,} tokens whole), slim prompt, general subagent capped at {_SLIM_GENERAL_STEPS} steps, explore on the free model\n"
         f"   usage ledger:   {_USAGE_LEDGER or 'off (PROXY_USAGE_LEDGER unset)'}\n"
         f"   sys→user:       {_CHANGE_SYSTEM_TO_USER}\n"
         f"   detail tools:   {', '.join(_HYBRID_DETAIL_TOOLS) or '(none)'}\n"

@@ -195,8 +195,10 @@ ensure_opencode_config() {
     # the unit of a token allowance (cached prompt tokens included; opencode
     # would count them free). Same program as opencode_models_jq in the
     # harness script (host mode). The modalities let images through (opencode
-    # treats a model it does not know as text only).
-    local models_prog='map({key: ., value: {name: ., limit: {context: $ctx, output: 8192},
+    # treats a model it does not know as text only). A `*-withtools` model
+    # declares at most 120k so opencode compacts before a metered step gets huge.
+    local models_prog='map({key: ., value: {name: .,
+             limit: {context: (if endswith("-withtools") then ([$ctx, 120000] | min) else $ctx end), output: 8192},
              cost: {input: 1, output: 1, cache_read: 1, cache_write: 1},
              attachment: true, modalities: {input: ["text", "image"], output: ["text"]}}})
          | from_entries'

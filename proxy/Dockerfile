@@ -37,6 +37,9 @@ COPY proxy/reminder.md .
 # path.
 COPY proxy/tool-guidance.json .
 
+# The slim system prompts the native route swaps in (proxy.py `_slim_prompt`).
+COPY agents/slim-prompt.md agents/slim-subagent-prompt.md agents/
+
 # Universal egress firewall.
 COPY firewall/init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod +x /usr/local/bin/init-firewall.sh

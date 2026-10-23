@@ -2818,11 +2818,12 @@ agent flags:
   --yolo                pass auto-approve / skip-permissions to the agent
   --normal              stock opencode requests: opencode's own system prompt
                         and tool descriptions, sent as opencode builds them.
-                        The default is slim: a short harness system prompt
-                        that leans on subagents and the todo list, short tool
-                        descriptions, older tool output trimmed and a step
-                        reminder (native tool models). --slim is accepted and
-                        changes nothing.
+                        The default is slim, for native tool models only: a
+                        short harness system prompt, short tool descriptions,
+                        older tool output trimmed, a step reminder, a step cap
+                        on the general subagent and explore on the free model.
+                        Free (cooperative) models are sent as before either
+                        way. --slim is accepted and changes nothing.
   --thoughts            show the model's thought summaries in opencode's
                         thinking block (vendor native tool models; off by
                         default). Replies then arrive whole rather than
@@ -4427,10 +4428,13 @@ host_usage_ledger()    { printf '%s/output/usage.jsonl' "$state_root"; }
 # prompt tokens included; opencode would count them free). The modalities
 # let images through: opencode defaults a model it does not know (none of
 # ours are in models.dev) to text only and swaps every pasted or read image
-# for an error text before the request is sent.
+# for an error text before the request is sent. A metered native-tools model
+# (`*-withtools`) declares at most 120k, so opencode compacts a long task
+# before every step re-sends 150k+ tokens of the daily budget.
 opencode_models_jq() {
     cat <<'JQ'
-map({key: ., value: {name: ., limit: {context: $ctx, output: 8192},
+map({key: ., value: {name: .,
+    limit: {context: (if endswith("-withtools") then ([$ctx, 120000] | min) else $ctx end), output: 8192},
     cost: {input: 1, output: 1, cache_read: 1, cache_write: 1},
     attachment: true, modalities: {input: ["text", "image"], output: ["text"]}}})
 | from_entries
@@ -4502,11 +4506,13 @@ host_proxy_fingerprint() {
     # its fingerprint lacks this line) is restarted once instead of reused,
     # while one already started with the old --require-tool flag still matches.
     data+=$(printf '\nrequiretool=1\n')
-    # The proxy's own code and the native-route knobs: a host proxy left
-    # running across a `git pull`/upgrade would otherwise keep serving the old
-    # proxy.py until something else forced a restart.
+    # The proxy's own code (with the slim prompts it reads) and the
+    # native-route knobs: a host proxy left running across a `git pull`/upgrade
+    # would otherwise keep serving the old code until something else forced a
+    # restart.
     data+=$(printf '\ncode=%s\nnative=%s|%s\n' \
-        "$(cksum <"$clone_dir/proxy/proxy.py" 2>/dev/null)" \
+        "$(cat "$clone_dir/proxy/proxy.py" "$clone_dir/agents/slim-prompt.md" \
+            "$clone_dir/agents/slim-subagent-prompt.md" 2>/dev/null | cksum)" \
         "${PROXY_NATIVE_TOOL_MODELS:-}" "${MODEL_CONTEXT_LENGTH:-}")
     # Only an explicit --prompt-mode/--single-message is hashed, so a default
     # launch keeps the fingerprint it always had and is not restarted; switching
@@ -5469,36 +5475,20 @@ host_write_opencode_config() {
 
 # Slim (the default; `--normal` turns it off): the opencode config overlay, as one line of
 # JSON for OPENCODE_CONFIG_CONTENT, which opencode deep-merges over every other
-# config layer. It replaces the system prompt of the build, plan and yolo
-# agents with agents/slim-prompt.md and of the general subagent with
-# agents/slim-subagent-prompt.md, and of the explore subagent too (opencode's
-# own asks it to be thorough; its read-only permissions are kept). The two
-# subagents get a per-prompt step cap, 15 for general and 10 for explore: their
-# reads never enter the main context, but uncapped they explored for 40 to 100
-# steps on a metered daily budget; at the cap opencode makes the subagent report
-# what it has. The main agents are not capped (a long task may need many steps).
-# Explore stays enabled because opencode's own plan-mode and truncated-output
-# texts tell the agent to use it. It also adds the `x-harness-slim: 1` provider header, on which the proxy swaps
-# the built-in tools' long descriptions for short ones. With the argument `oai`
-# (a host launch with an OAI upstream) the header goes on the harness-oai
-# provider too. Prints nothing when slim is off or a prompt file is missing
-# (that launch is then a normal one).
+# config layer. It only adds the `x-harness-slim: 1` provider header; everything
+# slim does happens in the proxy, on the native (metered) route only: short tool
+# descriptions, agents/slim-prompt.md for the main agents and
+# agents/slim-subagent-prompt.md plus a 15-step cap for the general subagent,
+# explore sent to the free model, the per-step reminder and the old-output
+# trim (architecture/proxy.md). Models on the cooperative route ignore the
+# header, so they get opencode's request as before. With the argument `oai` (a
+# host launch with an OAI upstream) the header goes on the harness-oai provider
+# too. Prints nothing when slim is off.
 slim_opencode_config() {
     [[ "${harness_slim:-1}" == "1" ]] || return 0
-    local main_prompt="$clone_dir/agents/slim-prompt.md"
-    local sub_prompt="$clone_dir/agents/slim-subagent-prompt.md"
-    if [[ ! -f "$main_prompt" || ! -f "$sub_prompt" ]]; then
-        err "slim: agents/slim-prompt.md or agents/slim-subagent-prompt.md is missing; launching without slim"
-        return 0
-    fi
-    harness_jq -cn --arg main "$(cat "$main_prompt")" --arg sub "$(cat "$sub_prompt")" \
-        --arg oai "${1:-}" --arg serve "${harness_serve:-0}" '{
+    harness_jq -cn --arg oai "${1:-}" --arg serve "${harness_serve:-0}" '{
       "provider": ((if $serve == "1" then {} else {"harness": {"options": {"headers": {"x-harness-slim": "1"}}}} end)
-        + (if $oai == "oai" then {"harness-oai": {"options": {"headers": {"x-harness-slim": "1"}}}} else {} end)),
-      "agent": {
-        "build": {"prompt": $main}, "plan": {"prompt": $main}, "yolo": {"prompt": $main},
-        "general": {"prompt": $sub, "steps": 15}, "explore": {"prompt": $sub, "steps": 10}
-      }
+        + (if $oai == "oai" then {"harness-oai": {"options": {"headers": {"x-harness-slim": "1"}}}} else {} end))
     }'
 }
 
@@ -5667,9 +5657,10 @@ _now_ms() {
 # "<model> (slim)", "(stock)", "(thoughts)" and "(slim+thoughts)": the model's
 # own entry carries the launch's mode (slim, or slim+thoughts with
 # --thoughts) and the other three are aliases "<model>:<mode>" for the same
-# upstream id. A `stock` primary agent, with opencode's own prompt in place of
-# agents/slim-prompt.md, completes stock mode; it starts on the default
-# model's stock alias. Models on the cooperative route get no aliases.
+# upstream id. The proxy picks the prompt from the header, so the stock alias
+# alone is stock mode; a `stock` primary agent that starts on the default
+# model's stock alias is a shortcut to it. Models on the cooperative route get
+# no aliases.
 serve_opencode_config() {
     [[ "${harness_serve:-0}" == "1" ]] || return 0
     local base='{"share":"disabled"}'
@@ -6262,7 +6253,7 @@ opencode behind the same reverse proxy before giving anyone a code.
 Prompt modes: with slim on, each model on the proxy's native-tool route
 appears in opencode web's model picker as "<model> (slim)", "(stock)",
 "(thoughts)" and "(slim+thoughts)", picked per message; the "stock"
-agent swaps the slim prompt for opencode's own.
+agent starts on the default model's stock alias.
 
 opencode web runs as your user with a shell, like 'harness host'. Its
 requests are slim unless --normal is given, and --thoughts shows thought
@@ -6329,8 +6320,8 @@ HELP
     # the client from the proxy's X-Forwarded-For for its sign-in rate limit.
     (( secure_cookie )) && pub_args+=(--secure-cookie --trust-forwarded-for)
     if [[ "${harness_slim:-1}" == "1" ]]; then
-        pub_args+=(--mode "slim=short tool descriptions, old tool output trimmed, a step reminder"
-            --mode "stock=the proxy changes nothing; with the stock agent, opencode as shipped"
+        pub_args+=(--mode "slim=short prompt and tool descriptions, old tool output trimmed, a step reminder"
+            --mode "stock=the proxy changes nothing: opencode as shipped"
             --mode "thoughts=stock plus the model's thought summaries, shown as thinking (experimental)"
             --mode "slim+thoughts=both")
     fi
@@ -6727,7 +6718,7 @@ agent_common_env() {
         oai_provider=oai
         printf -- '-e\nOAI_MODELS=%s\n' "$(_oai_models | paste -sd, -)"
     fi
-    # The opencode overlay (slim prompts + header unless --normal, the active vault), one
+    # The opencode overlay (slim header unless --normal, the active vault), one
     # line of JSON.
     local overlay
     overlay=$(harness_opencode_overlay "$oai_provider")
