@@ -14,7 +14,9 @@
 #   - vault_sync + scripts/vault_capture.py
 #                                         copy the session's conversation into
 #                                         .raw/sessions/, commit, push (rebasing
-#                                         once on a moved remote)
+#                                         once on a moved remote), with a line
+#                                         per tool call and every message from
+#                                         before a compaction
 #
 # Prints "VAULT TEST PASSED" on success.
 
@@ -190,8 +192,16 @@ c.execute("INSERT INTO session VALUES ('ses_else', NULL, '/wx', 'Other', 1761100
 msgs = [("m1", "ses_new", "user", [{"type": "text", "text": "fix it, key sk-abcdefghijklmnopqrstuvwx"},
                                     {"type": "text", "text": "INJECTED", "synthetic": True}]),
         ("m2", "ses_new", "assistant", [{"type": "reasoning", "text": "THINKING"},
-                                         {"type": "tool", "tool": "read", "state": {"output": "TOOLOUT"}},
-                                         {"type": "tool", "tool": "read"}, {"type": "tool", "tool": "edit"},
+                                         {"type": "tool", "tool": "read", "state": {"status": "completed",
+                                          "input": {"filePath": "/w/src/a.py"}, "output": "TOOLOUT"}},
+                                         {"type": "tool", "tool": "grep", "state": {"input": {"pattern": "def run",
+                                          "path": "/w/src", "include": "*.py"}}},
+                                         {"type": "tool", "tool": "bash", "state": {"input": {"command": "pytest -q"}}},
+                                         {"type": "tool", "tool": "edit", "state": {"status": "error",
+                                          "input": {"filePath": "/w/a.py"}}},
+                                         {"type": "tool", "tool": "task", "state": {"status": "completed",
+                                          "input": {"description": "find the config", "subagent_type": "explore"},
+                                          "output": "It is in conf.yaml"}},
                                          {"type": "text", "text": "Fixed in a.py"}]),
         ("m3", "ses_sub", "user", [{"type": "text", "text": "SUBAGENT"}]),
         ("m4", "ses_old", "user", [{"type": "text", "text": "OLD"}]),
@@ -209,8 +219,12 @@ out=$(vault_sync "$SYNC" 1761100000000 "$DB" /w 2>&1) || fail "V8: vault_sync fa
 cap="$SYNC/.raw/sessions/2025-10-22-ses_new.md"
 [[ -f "$cap" ]] || fail "V8: no capture at $cap — $(ls -R "$SYNC/.raw" 2>&1)"
 [[ "$(ls "$SYNC/.raw/sessions")" == "2025-10-22-ses_new.md" ]] || fail "V8: only this project's new root session belongs there — $(ls "$SYNC/.raw/sessions")"
-grep -q '^title: "Fix the bug"$' "$cap" && grep -q 'Fixed in a.py' "$cap" && grep -q '_tools: read x2, edit_' "$cap" \
-    || fail "V8: capture lacks the title, the reply or the tool list — $(cat "$cap")"
+grep -q '^title: "Fix the bug"$' "$cap" && grep -q 'Fixed in a.py' "$cap" \
+    || fail "V8: capture lacks the title or the reply — $(cat "$cap")"
+for line in '- read `src/a.py`' '- grep `def run` in `src` (*.py)' '- bash `pytest -q`' '- edit `a.py` (failed)' \
+        '- task (explore): find the config' '  > It is in conf.yaml'; do
+    grep -qxF -- "$line" "$cap" || fail "V8: capture lacks the tool line '$line' — $(cat "$cap")"
+done
 grep -q 'sk-abcdefghij\|INJECTED\|THINKING\|TOOLOUT' "$cap" && fail "V8: capture kept a key, injected text, reasoning or tool output — $(cat "$cap")"
 [[ -z "$(git -C "$SYNC" status --porcelain)" ]] || fail "V8: vault left uncommitted changes"
 [[ "$(git -C "$SYNC" rev-parse HEAD)" == "$(git --git-dir="$REMOTE" rev-parse HEAD)" ]] || fail "V8: commit was not pushed — $out"
@@ -230,5 +244,44 @@ vault_sync "$SYNC" 1761100000000 "$DB" /w >/dev/null 2>&1
 [[ "$(git -C "$SYNC" rev-parse HEAD)" == "$before" ]] || fail "V8: a rerun with nothing new should not commit"
 vault_sync "" 0 "$DB" /w || fail "V8: no vault should be a no-op"
 ok "V8: vault_sync captures this project's session text (redacted), commits and pushes, rebasing once"
+
+# --- V9: a compacted session keeps everything from before each compaction ----
+DB2="$TMP_ROOT/compacted.db"
+# shellcheck disable=SC2086
+$PY - "$DB2" <<'PYEOF' || fail "V9: could not build the fixture database"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("""
+CREATE TABLE session (id TEXT, parent_id TEXT, directory TEXT, title TEXT, time_created INT,
+  time_updated INT, tokens_input INT, tokens_output INT);
+CREATE TABLE message (id TEXT, session_id TEXT, time_created INT, data TEXT);
+CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INT, data TEXT);
+""")
+c.execute("INSERT INTO session VALUES ('ses_long', NULL, '/w', 'Long', 1761100000000, 1761100500000, 1, 1)")
+# What opencode stores for two compactions: a user message with a compaction
+# part, then an assistant message with summary: true; nothing is deleted.
+msgs = [("user", {}, [{"type": "text", "text": "FIRST ASK"}]),
+        ("assistant", {}, [{"type": "text", "text": "FIRST ANSWER"}]),
+        ("user", {"summary": {"diffs": []}}, [{"type": "compaction", "auto": True}]),
+        ("assistant", {"summary": True}, [{"type": "text", "text": "SUMMARY ONE"}]),
+        ("user", {}, [{"type": "text", "text": "SECOND ASK"}]),
+        ("user", {}, [{"type": "compaction", "auto": True}]),
+        ("assistant", {"summary": True}, [{"type": "text", "text": "SUMMARY TWO"}]),
+        ("user", {}, [{"type": "text", "text": "THIRD ASK"}])]
+for i, (role, extra, parts) in enumerate(msgs):
+    c.execute("INSERT INTO message VALUES (?,?,?,?)", (f"m{i}", "ses_long", i, json.dumps(dict(role=role, **extra))))
+    for j, p in enumerate(parts):
+        c.execute("INSERT INTO part VALUES (?,?,?,?,?)", (f"m{i}p{j}", f"m{i}", "ses_long", j, json.dumps(p)))
+c.commit()
+PYEOF
+CAP2="$TMP_ROOT/cap2"
+# shellcheck disable=SC2086
+$PY "$REPO_ROOT/scripts/vault_capture.py" "$DB2" "$CAP2" 0 /w >/dev/null
+f2="$CAP2/.raw/sessions/2025-10-22-ses_long.md"
+[[ -f "$f2" ]] || fail "V9: no capture of the compacted session"
+order=$(grep -E '^(FIRST|SECOND|THIRD|SUMMARY)|^## ' "$f2" | paste -sd'|' -)
+want='## User|FIRST ASK|## Assistant|FIRST ANSWER|## Compaction|## Compaction summary|SUMMARY ONE|## User|SECOND ASK|## Compaction|## Compaction summary|SUMMARY TWO|## User|THIRD ASK'
+[[ "$order" == "$want" ]] || fail "V9: capture order — got '$order'"
+ok "V9: a session compacted twice keeps all its earlier text, summaries under their own heading"
 
 echo "VAULT TEST PASSED"

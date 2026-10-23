@@ -6,10 +6,16 @@ Usage: vault_capture.py <opencode.db> <vault dir> <since epoch ms> <project dir>
 Reads opencode's SQLite store read-only and writes one markdown file per top
 level session started in <project dir> (or below it) and updated since <since>
 to <vault>/.raw/sessions/, named
-<YYYY-MM-DD>-<session id>.md, so a rerun rewrites the same file. Only the
-user's and the assistant's text is kept (no tool output, no reasoning, no
-text opencode injected), with tool calls listed by name, and anything shaped
-like a key or token is redacted. The database is shared by every opencode
+<YYYY-MM-DD>-<session id>.md, so a rerun rewrites the same file. The user's
+and the assistant's text is kept (no reasoning, no text opencode injected),
+each tool call as one line saying what it touched (the file read or edited,
+the grep pattern and path, the start of a bash command; no tool output except
+a subagent's report), and anything shaped like a key or token is redacted.
+The whole session is rendered from the database every time: opencode's
+compaction only adds a marker and a summary message and keeps every earlier
+message, so text from before any number of compactions stays in the file,
+with each summary under its own heading. A since of 0 captures every session
+in the directory (`harness vault import`). The database is shared by every opencode
 session of the user (or of every harness container), so the directory filter
 is what keeps other projects' conversations out of the vault. Prints the files it wrote. Never fails the
 launch: any problem is one line on stderr and exit status 0.
@@ -65,6 +71,79 @@ def _yaml(s):
     return json.dumps(str(s or ""), ensure_ascii=False)
 
 
+_TOOL_LINES = 40       # tool lines kept per message
+_TASK_REPORT = 1500    # characters of a subagent's report kept
+
+
+def _short(text, n=160):
+    """One line, at most n characters."""
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 1] + "\u2026"
+
+
+def _rel(path, directory):
+    """A path relative to the session's directory when it is inside it."""
+    p, d = _norm_dir(path), _norm_dir(directory)
+    return p[len(d) + 1:] if d and p.startswith(d + "/") else str(path or "")
+
+
+def _code(text):
+    """Inline code that survives backticks in the text."""
+    text = str(text)
+    return f"`` {text} ``" if "`" in text else f"`{text}`"
+
+
+def describe_tool(p, directory):
+    """One markdown line for a tool part: what it did and what it touched."""
+    name = p.get("tool") or "?"
+    state = p.get("state") if isinstance(p.get("state"), dict) else {}
+    a = state.get("input") if isinstance(state.get("input"), dict) else {}
+    path = a.get("filePath") or a.get("file_path") or a.get("path") or ""
+    rel = _code(_rel(path, directory)) if path else ""
+    if name == "read":
+        line = f"read {rel}" if rel else "read"
+        if a.get("offset") or a.get("limit"):
+            start = int(a.get("offset") or 0)
+            line += f" (from line {start}" + (f", {a['limit']} lines)" if a.get("limit") else ")")
+    elif name in ("edit", "write", "multiedit"):
+        line = f"{name} {rel}".strip()
+    elif name == "apply_patch":
+        files = re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", str(a.get("patchText") or ""), re.M)
+        line = "apply_patch " + ", ".join(_code(_rel(f.strip(), directory)) for f in files[:8]) if files else "apply_patch"
+    elif name in ("grep", "glob"):
+        line = f"{name} {_code(_short(a.get('pattern'), 100))}" + (f" in {rel}" if rel else "")
+        if a.get("include"):
+            line += f" ({_short(a['include'], 40)})"
+    elif name == "list":
+        line = f"list {rel}".strip()
+    elif name == "bash":
+        line = f"bash {_code(_short(a.get('command')))}"
+    elif name == "webfetch":
+        line = f"webfetch {_short(a.get('url'), 160)}"
+    elif name in ("websearch", "codesearch"):
+        line = f"{name} {_code(_short(a.get('query'), 120))}"
+    elif name == "task":
+        line = f"task ({a.get('subagent_type') or 'agent'}): {_short(a.get('description') or a.get('prompt'), 120)}"
+    elif name == "todowrite":
+        todos = a.get("todos") if isinstance(a.get("todos"), list) else []
+        doing = [t.get("content") for t in todos if isinstance(t, dict) and t.get("status") == "in_progress"]
+        line = f"todowrite ({len(todos)} items" + (f"; doing: {_short(doing[0], 100)})" if doing else ")")
+    elif name == "skill":
+        line = f"skill {_short(a.get('name'), 60)}"
+    else:
+        # An MCP or plugin tool: its name and its first few short arguments.
+        args = [f"{k}={_short(v, 60)}" for k, v in a.items() if isinstance(v, (str, int, float, bool))][:3]
+        line = name + (" " + ", ".join(args) if args else "")
+    if state.get("status") == "error":
+        line += " (failed)"
+    if name == "task" and state.get("status") == "completed" and str(state.get("output") or "").strip():
+        report = str(state["output"]).strip()
+        if len(report) > _TASK_REPORT:
+            report = report[:_TASK_REPORT] + "\u2026"
+        line += "\n" + "\n".join("  > " + ln for ln in report.splitlines())
+    return "- " + line
+
+
 def render(con, sess):
     """One session as markdown, or None when it has no conversation text."""
     sid, title, directory, created, updated, tin, tout = sess
@@ -73,10 +152,11 @@ def render(con, sess):
                        (sid,)).fetchall()
     for mid, mdata in msgs:
         try:
-            role = json.loads(mdata).get("role")
-        except (TypeError, ValueError):
+            info = json.loads(mdata)
+            role = info.get("role")
+        except (TypeError, ValueError, AttributeError):
             continue
-        texts, tools = [], []
+        texts, tools, compaction = [], [], False
         for (pdata,) in con.execute("SELECT data FROM part WHERE message_id = ? ORDER BY time_created, id",
                                     (mid,)):
             try:
@@ -86,17 +166,30 @@ def render(con, sess):
             if p.get("type") == "text" and not p.get("synthetic") and (p.get("text") or "").strip():
                 texts.append(p["text"].strip())
             elif p.get("type") == "tool" and p.get("tool"):
-                tools.append(p["tool"])
-        if role not in ("user", "assistant") or not (texts or tools):
+                tools.append(describe_tool(p, directory))
+            elif p.get("type") == "compaction":
+                compaction = True
+        if role not in ("user", "assistant"):
+            continue
+        if compaction:
+            # Where opencode compacted the context: the model saw only the
+            # summary below from here on; everything above is still kept.
+            body.append("## Compaction\n\n_The context was compacted here; the messages above "
+                        "were summarized for the model._")
+        if not (texts or tools):
             continue
         block = "\n\n".join(texts)
         if tools:
-            counts = {}
-            for t in tools:
-                counts[t] = counts.get(t, 0) + 1
-            block += ("\n\n" if block else "") + "_tools: " + ", ".join(
-                f"{t} x{n}" if n > 1 else t for t, n in counts.items()) + "_"
-        body.append(f"## {'User' if role == 'user' else 'Assistant'}\n\n{block}")
+            extra = len(tools) - _TOOL_LINES
+            lines = tools[:_TOOL_LINES] + ([f"- \u2026 and {extra} more tool calls"] if extra > 0 else [])
+            block += ("\n\n" if block else "") + "Tools:\n" + "\n".join(lines)
+        # opencode marks the compaction summary with summary: true (a user
+        # message's summary is an object with its diffs).
+        if role == "assistant" and info.get("summary") is True:
+            heading = "Compaction summary"
+        else:
+            heading = "User" if role == "user" else "Assistant"
+        body.append(f"## {heading}\n\n{block}")
     if not any(b.startswith("## User") for b in body):
         return None
     title = redact(title or "")
