@@ -37,6 +37,9 @@ if args and args[0] == "queue":
         open(os.path.join(vault, ".raw", "tickets", args[2] + ".md"), "w").write(os.environ["FAKE_TICKET"])
     sys.exit(0)
 prompt = args[-1]
+if os.environ.get("FAKE_SLEEP"):
+    import time
+    time.sleep(int(os.environ["FAKE_SLEEP"]))
 assert "--ticket" in args and "-p" in args and "--yolo" in args, args
 stage = re.match(r"You are (\w+)", prompt).group(1)
 log.write(stage + " " + " ".join(a for a in args[:-1]) + "\n")
@@ -55,8 +58,11 @@ if stage == "planning":
         "## Approach\nWrite feature.txt.\n## Files\n- feature.txt: new\n## Questions\n" + qs +
         "## Assumptions\n- None\n")
 elif stage in ("implementing", "fixing"):
-    if os.environ.get("FAKE_NO_COMMIT"):
+    if os.environ.get("FAKE_NO_COMMIT") or (stage == "fixing" and os.environ.get("FAKE_FIX_NOOP")):
         sys.exit(0)
+    if os.environ.get("FAKE_EDIT_PLAN"):  # an agent trying to move the goalposts
+        open(os.path.join(vault, "wiki", "notes", "tickets", "ABC-1-plan.md"), "w").write(
+            "## Acceptance criteria\n- Nothing at all\n")
     name = os.environ.get("FAKE_FILE", "feature.txt")
     os.makedirs(os.path.dirname(name) or ".", exist_ok=True)
     with open(name, "a") as f:
@@ -72,7 +78,7 @@ elif stage == "reviewing":
 
 
 class FakeProxy(http.server.BaseHTTPRequestHandler):
-    mode = "ok"        # ok | down | badquote
+    mode = "ok"        # ok | down | badquote | reject (the verifier's request fails, the probe does not)
     seen = []
 
     def log_message(self, *a):
@@ -95,6 +101,8 @@ class FakeProxy(http.server.BaseHTTPRequestHandler):
         FakeProxy.seen.append((req["model"], self.headers.get("x-harness-raw"), prompt))
         if FakeProxy.mode == "down":
             return self.reply(502, {"error": {"message": "upstream down"}})
+        if FakeProxy.mode == "reject" and "check a" in prompt:
+            return self.reply(400, {"error": {"message": "context too long"}})
         m = re.search(r"numbered:\n((?:\d+\. .*\n)+)", prompt)
         n = len(m.group(1).splitlines()) if m else 0
         if "check a plan" in prompt:
@@ -122,7 +130,7 @@ def sh(*args, cwd=None):
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
-class QueueTest(unittest.TestCase):
+class Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeProxy)
@@ -188,6 +196,8 @@ class QueueTest(unittest.TestCase):
     def calls_of(self, stage):
         return [l for l in cat(self.calls).splitlines() if l.startswith(stage)]
 
+
+class QueueTest(Base):
     def test_whole_loop_pushes_the_branch(self):
         os.environ["FAKE_MUSTFIX"] = "1"
         self.add("abc-1")
@@ -348,6 +358,105 @@ class QueueTest(unittest.TestCase):
         for name, vals in (("verify_plan", dict(TICKET="t", PLAN="p", CRITERIA="1. c")),
                            ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d"))):
             self.assertNotIn("{{", tq.render(name, **vals), name)
+
+
+class ReviewFixesTest(Base):
+    """What the first review of the queue found."""
+
+    def test_fix_without_a_new_commit_fails(self):
+        os.environ.update(FAKE_MUSTFIX="1", FAKE_FIX_NOOP="1")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "fix"), out)
+        self.assertIn("no new commit since the review", st["reason"])
+
+    def test_fix_is_checked_against_the_must_fix_items(self):
+        os.environ["FAKE_MUSTFIX"] = "1"
+        self.add("ABC-1")
+        self.run_queue()
+        fix_prompts = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
+        self.assertIn("2. (review) feature.txt:1: say it twice", fix_prompts)
+
+    def test_an_agent_editing_the_plan_does_not_change_the_criteria(self):
+        os.environ["FAKE_EDIT_PLAN"] = "1"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        prompt = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][0]
+        self.assertIn("1. A file feature.txt says hello feature", prompt)
+        self.assertNotIn("Nothing at all", prompt)
+
+    def test_a_timed_out_stage_is_blocked_not_retried(self):
+        os.environ["FAKE_SLEEP"] = "30"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--stage-timeout", "1")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "plan"), out)
+        self.assertIn("ran past 1s", st["reason"])
+
+    def test_a_failed_verifier_request_is_not_an_outage(self):
+        FakeProxy.mode = "reject"
+        self.add("ABC-1", "ABC-2")
+        rc, out = self.run_queue("--retries", "0")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("the verifier request failed", self.status()["reason"])
+        self.assertEqual(self.status("ABC-2")["status"], "blocked")
+
+    def test_an_error_blocks_the_ticket_and_the_queue_goes_on(self):
+        keep = tq.PROMPT_MAX_BYTES
+        tq.PROMPT_MAX_BYTES = 100
+        try:
+            self.add("ABC-1", "ABC-2")
+            rc, out = self.run_queue()
+        finally:
+            tq.PROMPT_MAX_BYTES = keep
+        self.assertEqual(rc, 0, out)
+        for key in ("ABC-1", "ABC-2"):
+            self.assertEqual(self.status(key)["status"], "blocked")
+            self.assertIn("RuntimeError: the plan prompt is", self.status(key)["reason"])
+
+    def test_answering_starts_from_a_fresh_clone_and_not_after_done(self):
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add("ABC-1")
+        self.run_queue("--retries", "0")
+        repo = os.path.join(self.state, "ABC-1", "repo")
+        self.assertTrue(os.path.isdir(repo))
+        rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "x")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(repo))
+        self.assertNotIn("base_sha", self.status())
+        del os.environ["FAKE_NO_COMMIT"]
+        self.run_queue()
+        self.assertEqual(self.status()["status"], "done")
+        rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "y")
+        self.assertEqual(rc, 1)
+        self.assertIn("is done", out)
+
+    def test_retry_is_not_a_way_round_plan_review(self):
+        self.add("ABC-1")
+        self.run_queue("--plan-review", "1")
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.status()["status"], "plan-review")
+
+    def test_quotes_escapes_and_paths(self):
+        reply = '{"criteria": [{"n": 1, "met": true, "quote": "msg = \\"{\\" + name"}], "verdict": "PASS"}'
+        self.assertEqual(tq.json_object("Sure: " + reply)["criteria"][0]["quote"], 'msg = "{" + name')
+        diff = "+++ b/doc.md\n+- alpha one\n+- beta two\n"
+        crit = ["lists alpha and beta"]
+        self.assertEqual(tq.judge({"verdict": "PASS", "criteria": [{"n": 1, "met": True, "quote": "- alpha one\n- beta two"}]},
+                                  crit, diff, "quote", "diff"), [])
+        self.assertTrue(tq.judge({"verdict": "PASS", "criteria": [{"n": 1, "met": True, "quote": "gamma delta"}]},
+                                 crit, diff, "quote", "diff"))
+        self.assertIsNone(tq.SECRET_PATH.search(".env.example"))
+        self.assertIsNotNone(tq.SECRET_PATH.search("app/.env.local"))
+        self.assertIsNotNone(tq.SECRET_PATH.search(".env"))
+
+    def test_ticket_text_is_not_expanded(self):
+        text = tq.render("plan", TICKET="the {{PLAN}} macro", PLAN="SECRET PLAN")
+        self.assertIn("the {{PLAN}} macro", text)
+        self.assertEqual(text.count("SECRET PLAN"), 1)
 
 
 if __name__ == "__main__":

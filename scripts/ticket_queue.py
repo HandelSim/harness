@@ -51,6 +51,8 @@ STAGE_TIMEOUT = 3 * 3600   # one agent launch; a cooperative turn alone can take
 VERIFY_TIMEOUT = 600
 TICKET_CAP = 30_000        # chars of each part embedded in an agent prompt, which
 PLAN_CAP = 15_000          # goes on a command line (one argument is at most 128 KiB)
+NOTE_CAP = 8_000           # feedback and must-fix lists in a prompt
+PROMPT_MAX_BYTES = 120_000
 DIFF_CAP_AGENT = 40_000
 DIFF_CAP_VERIFY = 150_000
 MAX_QUESTIONS = 3
@@ -60,7 +62,7 @@ SECRET_ENV = ("PROXY_API_KEY", "OAI_API_KEY", "CHATGPT_COOKIE_STRING", "TRACKER_
 SECRET_RE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\bgh[pousr]_[A-Za-z0-9]{30,}"
     r"|\bxox[abposr]-[A-Za-z0-9-]{10,}|\bsk-[A-Za-z0-9_-]{32,}")
-SECRET_PATH = re.compile(r"(^|/)(\.env(\..*)?|.*\.pem|.*\.key|id_(rsa|ed25519|ecdsa|dsa)(\.pub)?|\.netrc)$")
+SECRET_PATH = re.compile(r"(^|/)(\.env(?!\.(example|sample|template)$)(\..*)?|.*\.pem|.*\.key|id_(rsa|ed25519|ecdsa|dsa)(\.pub)?|\.netrc)$")
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
 
 
@@ -275,21 +277,32 @@ def check_change(st, change, plan_text):
 
 # --- the verifier -----------------------------------------------------------------
 
-def norm(text):
-    lines = [re.sub(r"^[+\- ]", "", l) for l in text.replace("\r\n", "\n").splitlines()]
-    return re.sub(r"\s+", " ", " ".join(lines)).strip().lower()
+def norm(text, diff=False):
+    """Letters and digits only, lower-cased, so a quote matches whatever the
+    spacing and punctuation; a diff loses its +/-/space column first."""
+    lines = text.replace("\r\n", "\n").splitlines()
+    if diff:
+        lines = [l[1:] if l[:1] in ("+", "-", " ") else l for l in lines]
+    return "".join(c for c in "\n".join(lines).lower() if c.isalnum())
 
 
 def json_object(text):
     """The first balanced {...} in a reply, parsed."""
+    try:
+        return json.loads(text.strip(), strict=False)
+    except ValueError:
+        pass
     start = text.find("{")
     while start != -1:
         depth, in_str, esc = 0, False, False
         for i in range(start, len(text)):
             c = text[i]
             if in_str:
-                esc = (c == "\\") and not esc
-                if c == '"' and not esc:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
                     in_str = False
                 continue
             if c == '"':
@@ -315,7 +328,9 @@ def ask_verifier(ctx, prompt, key, stage):
         try:
             reply = call_model(ctx.proxy, ctx.verify_model, [{"role": "user", "content": prompt}], VERIFY_TIMEOUT)
         except InfraError as e:
-            raise Infra(f"verifier request failed: {e}") from None
+            probe(ctx)  # raises Infra when the upstream is down; else this request was the problem
+            return {"verdict": "FAIL", "criteria": [], "problems": [f"the verifier request failed: {str(e)[:200]}"],
+                    "unreadable": True}
         path = os.path.join(ctx.q.dir(key), f"verify-{stage}-{int(time.time())}-{n}.txt")
         write_atomic(path, reply)
         obj = json_object(reply)
@@ -328,8 +343,10 @@ def ask_verifier(ctx, prompt, key, stage):
 def judge(obj, criteria, source, quote_field, what):
     """Problems with a verdict: every criterion answered, met (for a change),
     and every quote found in <source>."""
+    if obj.get("unreadable"):
+        return [str(p) for p in obj["problems"]]
     problems = []
-    src = norm(source)
+    src = norm(source, diff=(what == "diff"))
     got = {}
     for c in obj.get("criteria", []):
         if isinstance(c, dict):
@@ -367,10 +384,9 @@ def judge(obj, criteria, source, quote_field, what):
 # --- prompts and agent launches -------------------------------------------------------
 
 def render(name, **values):
-    text = read(os.path.join(PROMPTS, name + ".md"))
-    for k, v in values.items():
-        text = text.replace("{{" + k + "}}", str(v))
-    return text
+    """Fill {{NAME}}s in one pass: ticket text that says {{PLAN}} stays as it is."""
+    return re.sub(r"\{\{([A-Z_]+)\}\}", lambda m: str(values.get(m.group(1), m.group(0))),
+                  read(os.path.join(PROMPTS, name + ".md")))
 
 
 def run_agent(ctx, st, stage, prompt):
@@ -382,6 +398,8 @@ def run_agent(ctx, st, stage, prompt):
         cmd.append("host")
     if ctx.single:
         cmd.append("--single-message")
+    if len(prompt.encode()) > PROMPT_MAX_BYTES:
+        raise RuntimeError(f"the {stage} prompt is {len(prompt.encode())} bytes, over one command-line argument's limit")
     cmd += ["-p", "--yolo", "--ticket", key, "-m", model, prompt]
     out = os.path.join(ctx.q.dir(key), f"{stage}-{st['attempt']}.out")
     env = dict(os.environ, HARNESS_HOST_CONFIRM="1")
@@ -395,6 +413,9 @@ def run_agent(ctx, st, stage, prompt):
         except subprocess.TimeoutExpired:
             stop(p)
             rc = 124
+        except BaseException:  # Ctrl-C: the agent is in its own session and did not get it
+            stop(p)
+            raise
         finally:
             ctx.child = None
     # Capture the session into the vault (best effort; never fails the stage).
@@ -425,14 +446,23 @@ def probe(ctx):
 
 def common(ctx, st):
     p = note_paths(ctx.vault, st["key"])
-    answers = read(p["answers"], PLAN_CAP)
+    answers = read(p["answers"])
+    if len(answers) > PLAN_CAP:
+        answers = "[... earlier answers cut ...]\n" + answers[-PLAN_CAP:]
+    plan = read(plan_copy(ctx.q, st["key"]), PLAN_CAP) if st.get("stage", "plan") != "plan" else ""
     return dict(KEY=st["key"], BRANCH=f"ticket/{st['key']}", BASE_SHA=st.get("base_sha", ""),
                 REPO=os.path.join(ctx.q.dir(st["key"]), "repo"), TICKET_FILE=p["ticket"],
                 TICKET=read(p["ticket"], TICKET_CAP) or "(the ticket file is missing; read the path above)",
-                PLAN_FILE=p["plan"], PLAN=read(p["plan"], PLAN_CAP) or "(none yet)",
+                PLAN_FILE=p["plan"], PLAN=plan or read(p["plan"], PLAN_CAP) or "(none yet)",
                 REVIEW_FILE=p["review"], FINDINGS_FILE=p["findings"], ANSWERS_FILE=p["answers"],
                 ANSWERS=answers or "(none)",
-                FEEDBACK=st.get("feedback") or "(first attempt)")
+                FEEDBACK=cap(st.get("feedback") or "(first attempt)", NOTE_CAP))
+
+
+def plan_copy(q, key):
+    """The plan as the verifier passed it, which later stages are held to
+    (an agent can write to the vault's copy)."""
+    return os.path.join(q.dir(key), "plan.md")
 
 
 def stage_plan(ctx, st):
@@ -456,6 +486,7 @@ def stage_plan(ctx, st):
         ctx.q.save(st)
         ctx.q.log(st["key"], f"needs answers: harness queue answer {st['key']}", "\n".join("- " + x for x in open_q))
         return
+    write_atomic(plan_copy(ctx.q, st["key"]), text)
     advance(ctx, st, "implement")
     if ctx.plan_review and not st.get("plan_approved"):
         st.update(status="plan-review", reason=f"plan ready to read: {p['plan']}")
@@ -470,10 +501,16 @@ def numbered(items):
 def verify_change(ctx, st, rc, stage):
     """Gates then the verifier on the branch; True when it passes."""
     p = note_paths(ctx.vault, st["key"])
-    plan = read(p["plan"])
+    plan = read(plan_copy(ctx.q, st["key"]))
     _, criteria, _ = check_plan(plan)
+    if stage == "fix":
+        criteria = criteria + [f"(review) {m}" for m in st.get("must_fix", [])]
     change = fetch_branch(ctx.q, st)
     problems, warnings = check_change(st, change, plan)
+    if not problems and stage == "fix" and change[0] == st.get("review_sha"):
+        problems.append("no new commit since the review: fix the Must fix items and commit")
+    if not problems and rc != 0:
+        problems.append("the agent did not finish; check the work is complete and committed")
     for w in warnings:
         ctx.q.log(st["key"], f"warning: {w}")
     if not problems:
@@ -492,7 +529,7 @@ def verify_change(ctx, st, rc, stage):
 
 
 def cap(text, n):
-    return text if len(text) <= n else text[:n] + f"\n[... diff cut at {n} characters ...]\n"
+    return text if len(text) <= n else text[:n] + f"\n[... cut at {n} characters ...]\n"
 
 
 def stage_implement(ctx, st):
@@ -513,12 +550,13 @@ def stage_review(ctx, st):
     if problems:
         return fail(ctx, st, rc, problems)
     ctx.q.log(st["key"], f"review: {len(must)} must-fix item(s)", "\n".join("- " + m for m in must))
+    st.update(must_fix=must[:15], review_sha=change[0] if change else "")
     advance(ctx, st, "fix" if must else "push")
 
 
 def stage_fix(ctx, st):
     v = common(ctx, st)
-    v["MUST_FIX"] = "\n".join("- " + m for m in check_review(read(note_paths(ctx.vault, st["key"])["review"]))[1])
+    v["MUST_FIX"] = cap("\n".join("- " + m for m in st.get("must_fix", [])), NOTE_CAP)
     rc, _ = run_agent(ctx, st, "fix", render("fix", **v))
     if verify_change(ctx, st, rc, "fix"):
         advance(ctx, st, "push")
@@ -568,6 +606,9 @@ def block(ctx, st, reason):
 def fail(ctx, st, rc, problems):
     """A stage did not pass: stop the run if the upstream is down, else retry
     with the problems listed, then block."""
+    if rc == 124:
+        return block(ctx, st, f"the {st['stage']} agent ran past {ctx.stage_timeout}s and was stopped; a container "
+                              "launch can outlive that, so check 'harness list' before 'harness queue retry'")
     if rc not in (0, None):
         problems = [f"the agent launch exited with status {rc}"] + problems
     probe(ctx)  # raises Infra: the ticket stays at this stage, the attempt is not counted
@@ -623,7 +664,14 @@ def cmd_run(q, a):
                 break
             st = q.load(todo[0])
             done.add(st["key"])
-            process(ctx, st)
+            try:
+                process(ctx, st)
+            except (Infra, KeyboardInterrupt):
+                raise
+            except Exception as e:  # noqa: BLE001 - one ticket's failure must not stop the queue
+                import traceback
+                q.log(st["key"], "error", traceback.format_exc())
+                block(ctx, st, f"{type(e).__name__}: {str(e)[:250]}")
     except Infra as e:
         print(f"[queue] stopped: the upstream does not answer ({str(e)[:300]}). The ticket keeps its place; "
               "check 'harness unlock' and 'harness usage', then run 'harness queue run' again.", file=sys.stderr)
@@ -713,6 +761,12 @@ def requeue(q, key, want, stage=None, **extra):
     st.update(status="queued", attempt=0, feedback="", reason="", **extra)
     if stage:
         st["stage"] = stage
+    if st["stage"] == "plan":  # planned again: start over from the base, not from earlier commits
+        shutil.rmtree(os.path.join(q.dir(st["key"]), "repo"), ignore_errors=True)
+        for f in (plan_copy(q, st["key"]),):
+            if os.path.exists(f):
+                os.remove(f)
+        st.pop("base_sha", None)
     q.save(st)
     return st
 
@@ -727,7 +781,7 @@ def cmd_approve(q, a):
 def cmd_retry(q, a):
     st = q.load(a.key.upper())
     stage = "plan" if st and not os.path.isdir(os.path.join(q.dir(st["key"]), "repo")) else None
-    st = requeue(q, a.key, ("blocked", "needs-answers", "plan-review"), stage=stage)
+    st = requeue(q, a.key, ("blocked", "needs-answers"), stage=stage)
     if st:
         print(f"[queue] {st['key']}: queued again at {st['stage']}")
     return 0 if st else 1
@@ -738,6 +792,10 @@ def cmd_answer(q, a):
     st = q.load(key)
     if not st:
         print(f"[queue] {key} is not in the queue", file=sys.stderr)
+        return 1
+    allowed = ("needs-answers", "plan-review", "blocked", "queued")
+    if st["status"] not in allowed:
+        print(f"[queue] {key} is {st['status']}; answers are for a ticket that is {', '.join(allowed)}", file=sys.stderr)
         return 1
     p = note_paths(a.vault, key)
     _, _, questions = check_plan(read(p["plan"]))
@@ -760,7 +818,7 @@ def cmd_answer(q, a):
     stamp = f"\n<!-- {now_iso()} -->\n"
     old = read(p["answers"])
     write_atomic(p["answers"], (old.rstrip() + "\n" if old.strip() else "") + stamp + text.strip() + "\n")
-    st = requeue(q, key, ("needs-answers", "plan-review", "blocked", "queued"), stage="plan", plan_approved=False)
+    st = requeue(q, key, allowed, stage="plan", plan_approved=False)
     if st:
         print(f"[queue] {key}: answers saved to {p['answers']}; the plan is made again on the next run")
     return 0

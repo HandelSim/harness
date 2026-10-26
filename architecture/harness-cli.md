@@ -628,10 +628,18 @@ key file, no key-shaped added line, no value of a secret env var), then
 one raw verifier call through the proxy (`verify_plan.md` /
 `verify_change.md`, JSON only, three tries). The verifier must quote the
 ticket for each plan criterion and the diff for each criterion met;
-`judge()` checks every quote is really in the source. A failed stage runs
-`QUEUE_RETRIES` more times with the problems as feedback, then the ticket is
-`blocked`. Before a failure counts, one probe request checks the upstream;
-if it does not answer the run exits 3 and the ticket keeps its stage. A
+`judge()` checks every quote is really in the source (letters and digits
+only, so spacing and list markers do not matter). The plan the verifier
+passed is copied to `state/queue/KEY/plan.md` and later stages are held to
+that copy, not the vault's, which agents can write. The fix stage must add
+a commit and is also checked against the review's Must fix items. A failed
+stage runs `QUEUE_RETRIES` more times with the problems as feedback, then
+the ticket is `blocked`; so does any error in harness itself, so one ticket
+never jams the queue. Before a failure counts, one probe request checks the
+upstream; if it does not answer the run exits 3 and the ticket keeps its
+stage. A stage that runs past its timeout is blocked, not retried: a
+container launch can outlive its stopped client. Going back to the plan
+(`answer`) starts from a fresh clone. A
 blocking question parks the ticket as `needs-answers` and the queue moves
 on; `QUEUE_PLAN_REVIEW=1` holds each plan as `plan-review` for `approve`.
 
