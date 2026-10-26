@@ -15,8 +15,12 @@ web and `harness queue` stages alike, finished or still working.
   /runs/<session>.json        the session, its messages and parts, as stored
   /runs/<session>/tail?from=N messages N.. as HTML, for the page's polling
   /runs/<session>/part/<id>   one tool call's full output, as text
-  /runs/ticket/<KEY>          a queue ticket: its log.md, stage outputs and sessions
+  /runs/ticket/<KEY>          a queue ticket: its status, the plan's questions (with a
+                              form to answer them), each attempt and why it failed, the
+                              plan and review, log.md, stage outputs and sessions
   POST /runs/<session>/send   a message for a live run (agents/live-run.sh's inbox)
+  POST /runs/ticket/<KEY>/answer|approve|retry
+                              harness queue answer / approve / retry for the ticket
 
 Each source is a data directory holding opencode/opencode.db and harness/live/ (the
 markers and inboxes agents/live-run.sh keeps). The databases are opened read-only.
@@ -29,6 +33,8 @@ import os
 import re
 import secrets
 import sqlite3
+import subprocess
+import sys
 import time
 from urllib.parse import quote
 
@@ -41,6 +47,9 @@ ACTIVE = 90              # an interactive session updated this recently is shown
 LIST_CAP = 300
 TEXT_CAP = 20000         # characters of one tool input/output shown inline
 MAX_MESSAGE = 65536      # bytes of one message sent to a live run
+FORM_QUESTIONS = 6       # questions with their own answer box (the form has at most 20 fields)
+QUEUE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "ticket_queue.py")
+WAITING = ("needs-answers", "plan-review", "blocked")   # a ticket waiting on the owner
 
 esc = html.escape
 
@@ -83,6 +92,29 @@ textarea { font: inherit; color: inherit; background: var(--bg); border: 1px sol
 .send button { align-self: flex-start; background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .inbox li { font: 12px var(--mono); color: var(--muted); padding: 3px 0; overflow-wrap: anywhere; }
 .inbox .bad { color: var(--bad); }
+.ask, .stop { display: inline-flex; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 650;
+  white-space: nowrap; }
+.ask { color: var(--accent-ink); background: var(--accent); }
+.stop { color: var(--bad); background: var(--bad-soft); }
+.diff .add { color: var(--ok); background: var(--ok-soft); display: inline-block; min-width: 100%; }
+.diff .del { color: var(--bad); background: var(--bad-soft); display: inline-block; min-width: 100%; }
+.diff .hunk { color: var(--accent); }
+.todos { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+.todos li { display: grid; grid-template-columns: 1.2em minmax(0, 1fr); gap: 6px; overflow-wrap: anywhere; }
+.todos .completed { color: var(--muted); text-decoration: line-through; }
+.todos .in_progress { font-weight: 650; }
+.todos .cancelled { color: var(--muted); }
+.qs { display: flex; flex-direction: column; gap: 10px; }
+.qs .q { font-weight: 550; overflow-wrap: anywhere; }
+.qs .q.blocking::before { content: "blocking "; color: var(--bad); font-size: 12px; font-weight: 650; }
+.acts { display: flex; gap: 8px; flex-wrap: wrap; }
+.acts form { margin: 0; }
+.attempts li { padding: 6px 0; border-top: 1px solid var(--line); font-size: 13px; overflow-wrap: anywhere; }
+.attempts li:first-child { border-top: 0; }
+.attempts .failed, .attempts .blocked { color: var(--bad); font-weight: 650; }
+.attempts .passed { color: var(--ok); font-weight: 650; }
+.attempts ul { margin: 4px 0 0; padding-left: 18px; }
+.flash { background: var(--accent-soft); border-radius: 8px; padding: 8px 12px; margin: 0; }
 pre.qlog { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mono); margin: 0; max-height: 640px; overflow: auto; }
 """
 
@@ -158,10 +190,12 @@ class Source:
 
 
 class Runs:
-    def __init__(self, sources, queue_dir=""):
-        """sources: (label, data dir) pairs; queue_dir: harness queue's state/queue."""
+    def __init__(self, sources, queue_dir="", vault=""):
+        """sources: (label, data dir) pairs; queue_dir: harness queue's state/queue;
+        vault: the active vault (the plans, reviews and answers are there)."""
         self.sources = [Source(label, d) for label, d in sources]
         self.queue_dir = queue_dir
+        self.vault = vault
 
     # --- reading -------------------------------------------------------------
 
@@ -289,6 +323,58 @@ class Runs:
             return [n for n in os.listdir(self.queue_dir) if KEY_RE.match(n)]
         except OSError:
             return []
+
+    def ticket_keys(self):
+        """The queue's tickets in its order, then any other ticket folder."""
+        dirs = self._ticket_dirs()
+        try:
+            with open(os.path.join(self.queue_dir, "queue.list"), encoding="utf-8") as f:
+                order = [k for k in f.read().split() if k in dirs]
+        except OSError:
+            order = []
+        return order + sorted(k for k in dirs if k not in order)
+
+    def ticket_state(self, key):
+        """state.json, its fields checked: written by the queue, but a hand edit or
+        an old version must not take the page down."""
+        try:
+            with open(os.path.join(self.queue_dir, key, "state.json"), encoding="utf-8") as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(st, dict):
+            return {}
+        out = {k: st[k] for k in ("status", "stage", "reason", "updated", "vault") if isinstance(st.get(k), str)}
+        out["attempt"] = st["attempt"] if isinstance(st.get("attempt"), int) else 0
+        qs = st.get("questions")
+        out["questions"] = [{"text": q["text"], "blocking": bool(q.get("blocking"))} for q in
+                            (qs if isinstance(qs, list) else []) if isinstance(q, dict) and isinstance(q.get("text"), str)]
+        hist = st.get("history")
+        out["history"] = [{"at": str(h.get("at", "")), "stage": str(h.get("stage", "")),
+                           "attempt": h["attempt"] if isinstance(h.get("attempt"), int) else 0,
+                           "result": str(h.get("result", "")),
+                           "details": [x for x in h.get("details") or [] if isinstance(x, str)]
+                           if isinstance(h.get("details"), list) else []}
+                          for h in (hist if isinstance(hist, list) else []) if isinstance(h, dict)]
+        return out
+
+    def vault_of(self, st):
+        """The vault the queue ran the ticket with (it may not be the one this
+        viewer started with), else this viewer's."""
+        v = st.get("vault")
+        return v if isinstance(v, str) and os.path.isdir(v) else self.vault
+
+    def note(self, key, kind, vault=None):
+        """The ticket's KEY-<kind>.md in the vault (plan, review, answers), or ""."""
+        vault = vault or self.vault
+        if not vault:
+            return ""
+        try:
+            with open(os.path.join(vault, "wiki", "notes", "tickets", f"{key}-{kind}.md"),
+                      encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
 
     def stage_outs(self, key):
         """[(name, mtime, size)] of the ticket's stage outputs, oldest first."""
@@ -423,6 +509,8 @@ def render_list(runs, query=""):
                  "<div class='muted'>Every opencode session on this host: container agents, host mode, opencode "
                  "web and queue stages. <b>live</b> is a headless run you can message; <b>active</b> was "
                  "updated in the last 90 s. This page refreshes itself.</div></section>")
+    if not q:
+        parts += render_queue(runs)
     live_rows = [r for r in rows if r["id"] in live]
     if live_rows:
         parts.append("<section class='panel'><h2>Live now</h2><ul class='runs'>")
@@ -457,6 +545,43 @@ def render_list(runs, query=""):
     return parts
 
 
+TODO_MARK = {"completed": "&#10003;", "in_progress": "&#9656;", "cancelled": "&#10007;"}
+
+
+def _todos(todos):
+    parts = ["<ul class='todos'>"]
+    for t in todos:
+        if not isinstance(t, dict):
+            continue
+        status = t.get("status") if isinstance(t.get("status"), str) else "pending"
+        parts.append(f"<li class='{esc(status)}'><span>{TODO_MARK.get(status, '&#9675;')}</span>"
+                     f"<span>{esc(str(t.get('content') or ''))}</span></li>")
+    return "".join(parts) + "</ul>"
+
+
+def todos_of(msgs):
+    """The session's todo list as its last todowrite left it, or None."""
+    last = None
+    for _, _, _, plist in msgs:
+        for p in plist:
+            if p.get("type") == "tool" and p.get("tool") == "todowrite":
+                st = p.get("state") or {}
+                t = (st.get("metadata") or {}).get("todos") or (st.get("input") or {}).get("todos")
+                if isinstance(t, list):
+                    last = t
+    return last
+
+
+def _diff(text):
+    out = []
+    for line in text.splitlines():
+        cls = ("add" if line.startswith("+") and not line.startswith("+++") else
+               "del" if line.startswith("-") and not line.startswith("---") else
+               "hunk" if line.startswith("@@") else "")
+        out.append(f"<span class='{cls}'>{esc(line)}</span>" if cls else esc(line))
+    return "<pre class='io diff'>" + "\n".join(out) + "</pre>"
+
+
 def _tool(p, sid):
     st = p.get("state") or {}
     status = st.get("status") or "?"
@@ -465,14 +590,32 @@ def _tool(p, sid):
     t = st.get("time") or {}
     took = _dur(_ms(t.get("end")) - _ms(t.get("start"))) if t.get("end") and t.get("start") else ""
     cls = "bad" if status == "error" else "st"
-    head = (f"<summary><b>{esc(name)}</b> {esc(title)} <span class='{cls}'>{esc(status)}"
+    meta = st.get("metadata") or {}
+    inp = st.get("input")
+    # A file change shows as its diff (edit, apply_patch: opencode keeps a unified
+    # diff in the metadata; write: the new contents), open, as opencode shows it.
+    diff = meta.get("diff") if isinstance(meta.get("diff"), str) else ""
+    if not diff and name == "write" and isinstance(inp, dict) and isinstance(inp.get("content"), str):
+        diff = "".join("+" + line + "\n" for line in inp["content"].splitlines())
+    counts = ""
+    if diff:
+        lines = diff.splitlines()
+        plus = sum(1 for x in lines if x.startswith("+") and not x.startswith("+++"))
+        minus = sum(1 for x in lines if x.startswith("-") and not x.startswith("---"))
+        counts = f" <span class='st'>+{plus} &minus;{minus}</span>"
+    head = (f"<summary><b>{esc(name)}</b> {esc(title)}{counts} <span class='{cls}'>{esc(status)}"
             f"{' ' + esc(took) if took else ''}</span></summary>")
     body = []
-    meta = st.get("metadata") or {}
     child = meta.get("sessionId") or meta.get("sessionID")
     if isinstance(child, str) and SID_RE.match(child):
         body.append(f"<div><a href='/runs/{quote(child)}'>open the subagent session &rarr;</a></div>")
-    inp = st.get("input")
+    if name == "todowrite" and isinstance(inp, dict) and isinstance(inp.get("todos"), list):
+        return f"<details class='tool' open>{head}{_todos(inp['todos'])}</details>"
+    if diff and status != "error":
+        text, cut = _cap(diff)
+        body.append(f"<div class='lbl'>diff</div>{_diff(text)}" + (" &hellip;" if cut else ""))
+        if isinstance(inp, dict):
+            inp = {k: v for k, v in inp.items() if k in ("filePath", "path", "replaceAll")}
     if inp:
         text, cut = _cap(json.dumps(inp, indent=2, ensure_ascii=False))
         body.append(f"<div class='lbl'>input</div><pre class='io'>{esc(text)}{' &hellip;' if cut else ''}</pre>")
@@ -486,7 +629,7 @@ def _tool(p, sid):
             body.append(f"<div class='muted'>{len(out):,} characters; "
                         f"<a href='/runs/{quote(sid)}/part/{quote(p['id'])}' target='_blank' rel='noopener'>"
                         "the whole output</a></div>")
-    return f"<details class='tool'>{head}{''.join(body)}</details>"
+    return f"<details class='tool'{' open' if diff and status != 'error' else ''}>{head}{''.join(body)}</details>"
 
 
 def _part(p, sid):
@@ -544,11 +687,17 @@ def render_messages(msgs, sid, start=0):
     return "".join(parts)
 
 
-def render_side(runs, src, row, live, sent=""):
+def render_side(runs, src, row, live, sent="", todos=None):
     sid = row["id"]
     now = time.time()
     root = runs.root_of(src, row)
-    parts = ["<dl class='facts'>"]
+    parts = []
+    if sid in live:
+        parts.append(_send_form(sid, sent))
+    if todos:
+        n = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
+        parts.append(f"<h2>Todo <span class='muted'>{n}/{len(todos)} done</span></h2>{_todos(todos)}")
+    parts.append("<dl class='facts'>")
     facts = [("status", None), ("source", src.label), ("folder", row.get("directory")),
              ("agent", row.get("agent")), ("model", _model_name(row.get("model"))),
              ("started", _when(_ms(row.get("time_created")))),
@@ -574,17 +723,14 @@ def render_side(runs, src, row, live, sent=""):
                          f"<span class='when'>{_ago(_ms(k['time_updated']), now)}</span>"
                          f"<span class='meta'>{esc(k.get('agent') or '')}</span></li>")
         parts.append("</ul>")
-    parts.append("<h2>Message the agent</h2>")
     if sid in live:
-        parts.append(f"<form method='post' action='/runs/{quote(sid)}/send' class='send'>"
-                     "<textarea name='text' required placeholder='Sent to the running session; the agent "
-                     "reads it at its next step.'></textarea><button type='submit'>Send</button></form>")
-        if sent:
-            parts.append(f"<div class='muted'>{esc(sent)}</div>")
+        pass
     elif root and root["id"] != sid and root["id"] in live:
+        parts.append("<h2>Message the agent</h2>")
         parts.append(f"<div class='muted'>This is a subagent of a live run; message the "
                      f"<a href='/runs/{quote(root['id'])}'>main session</a>.</div>")
     else:
+        parts.append("<h2>Message the agent</h2>")
         parts.append("<div class='muted'>Read-only: this run has finished, or it is an interactive "
                      "session (type in its terminal or opencode web). Headless runs (<code>harness -p</code>, "
                      "<code>harness queue</code>) take messages while they work.</div>")
@@ -597,6 +743,14 @@ def render_side(runs, src, row, live, sent=""):
             parts.append(f"<li{cls}>{esc(_when(ts))} {esc(sender)} <b>{esc(state)}</b>: {esc(short)}</li>")
         parts.append("</ul>")
     return "".join(parts)
+
+
+def _send_form(sid, sent=""):
+    return ("<h2>Message the agent</h2>"
+            f"<form method='post' action='/runs/{quote(sid)}/send' class='send'>"
+            "<textarea name='text' required placeholder='Steer it, answer it, or tell it to stop: the agent "
+            "reads this at its next step.'></textarea><button type='submit'>Send</button></form>"
+            + (f"<div class='muted'>{esc(sent)}</div>" if sent else ""))
 
 
 POLL_JS = """
@@ -689,7 +843,7 @@ def render_detail(runs, sid, sent="", follow=""):
              + f">{render_messages(msgs, sid)}</div>"
              + ("" if msgs else "<div class='muted'>No messages yet.</div>") +
              "<span id='end'></span></section></div>",
-             f"<div class='stack'><section class='panel' id='side'>{render_side(runs, src, row, live, sent)}"
+             f"<div class='stack'><section class='panel' id='side'>{render_side(runs, src, row, live, sent, todos_of(msgs))}"
              "</section></div></div>"]
     return title, parts, POLL_JS
 
@@ -744,7 +898,7 @@ def tail(runs, sid, start):
     start = max(0, min(start, len(msgs)))
     working = sid in live or time.time() - _ms(row.get("time_updated")) / 1000 <= ACTIVE
     body = render_messages(msgs, sid, start)
-    side = render_side(runs, src, row, live)
+    side = render_side(runs, src, row, live, todos=todos_of(msgs))
     sig = hashlib.sha1(f"{start}:{len(msgs)}:{body}:{side}".encode()).hexdigest()
     return {"from": start, "count": len(msgs), "html": body, "sig": sig, "working": working, "side": side}
 
@@ -775,7 +929,61 @@ def part_text(runs, sid, pid):
     return out if isinstance(out, str) else json.dumps(out, indent=2, ensure_ascii=False)
 
 
-def render_ticket(runs, key):
+PILL = {"needs-answers": ("ask", "needs your answers"), "plan-review": ("ask", "plan to approve"),
+        "blocked": ("stop", "blocked"), "running": ("live", "running"), "done": ("done", "done"),
+        "queued": ("done", "queued")}
+
+
+def _pill(status):
+    cls, label = PILL.get(status, ("done", status or "?"))
+    return f"<span class='{cls}'>{esc(label)}</span>"
+
+
+def render_queue(runs):
+    """The /runs panel: every queue ticket, its stage and what it is waiting on."""
+    keys = runs.ticket_keys()
+    if not keys:
+        return []
+    parts = ["<section class='panel'><h2>Queue</h2><ul class='runs'>"]
+    for key in keys:
+        st = runs.ticket_state(key)
+        status = st.get("status", "")
+        what = st.get("reason") or ""
+        if status == "running":
+            what = f"attempt {st.get('attempt', 0) + 1}"
+        parts.append(f"<li><span><a href='/runs/ticket/{quote(key)}'><b>{esc(key)}</b></a> {_pill(status)} "
+                     f"<code>{esc(st.get('stage', ''))}</code></span><span class='when'>"
+                     f"{esc((st.get('updated') or '')[:16].replace('T', ' '))}</span>"
+                     f"<span class='meta'>{esc(what)}</span></li>")
+    parts.append("</ul><div class='muted'>A ticket waiting on you (questions, a plan to approve, blocked) does not "
+                 "hold the queue: the run goes on to the next ticket, and takes this one again once you answer, "
+                 "approve or retry it on its page.</div></section>")
+    return parts
+
+
+def _answer_form(key, qs):
+    parts = [f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"]
+    for i, q in enumerate(qs[:FORM_QUESTIONS]):
+        cls = "q blocking" if q.get("blocking") else "q"
+        parts.append(f"<label><div class='{cls}'>{esc(q['text'])}</div>"
+                     f"<input type='hidden' name='q{i}' value='{esc(q['text'])}'>"
+                     f"<textarea name='a{i}' placeholder='Your answer (leave empty to go with its default)'>"
+                     "</textarea></label>")
+    extra = "Anything else for the planner" if qs else "Your answers, or anything the planner should know"
+    if len(qs) > FORM_QUESTIONS:
+        extra = "Answers to the remaining questions, and anything else"
+    parts.append(f"<label><div class='q'>{extra}</div><textarea name='note'></textarea></label>"
+                 "<div class='acts'><button type='submit'>Send answers and plan again</button>"
+                 "<button type='submit' name='defaults' value='1'>Go with the defaults</button></div></form>")
+    return "".join(parts)
+
+
+def _act(key, action, label):
+    return (f"<form method='post' action='/runs/ticket/{quote(key)}/{action}'>"
+            f"<button type='submit'>{esc(label)}</button></form>")
+
+
+def render_ticket(runs, key, msg=""):
     if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
         return None
     d = os.path.join(runs.queue_dir, key)
@@ -787,10 +995,93 @@ def render_ticket(runs, key):
     live = runs.live()
     now = time.time()
     outs = runs.stage_outs(key)
+    names = {n for n, _, _ in outs}
+    st = runs.ticket_state(key)
+    status = st.get("status", "")
     rows = [r for r in runs.sessions(limit=2000) if runs.ticket_of(r.get("directory") or "") == key]
     parts = ["<header class='top'><div class='crumbs'><a href='/'>harness</a><span>/</span><a href='/runs'>runs</a>"
-             f"<span>/</span><b>{esc(key)}</b></div></header><div class='cols'><div class='stack'>"
-             "<section class='panel'><h2>Stage sessions</h2>"]
+             f"<span>/</span><b>{esc(key)}</b></div>{_pill(status)}</header>"]
+    if msg:
+        parts.append(f"<p class='flash'>{esc(msg)}</p>")
+    parts.append("<div class='cols'><div class='stack'>")
+
+    # what it is doing, or what it waits on
+    parts.append(f"<section class='panel'><h2>Status</h2><dl class='facts'><dt>status</dt><dd>{esc(status or '?')}</dd>"
+                 f"<dt>stage</dt><dd>{esc(st.get('stage', ''))}</dd>")
+    if status == "running":
+        parts.append(f"<dt>attempt</dt><dd>{st.get('attempt', 0) + 1}</dd>")
+    if st.get("reason"):
+        parts.append(f"<dt>why</dt><dd>{esc(st['reason'])}</dd>")
+    parts.append("</dl>")
+    now_live = [r for r in rows if r["id"] in live]
+    if now_live:
+        r = max(now_live, key=lambda r: _ms(r["time_created"]))
+        parts.append(f"<p><a href='/runs/{quote(r['id'])}'>Watch and message the running agent &rarr;</a></p>")
+    acts = []
+    if status == "plan-review":
+        acts.append(_act(key, "approve", "Approve the plan"))
+    if status == "blocked":
+        acts.append(_act(key, "retry", "Retry from " + (st.get("stage") or "the start")))
+    elif status == "needs-answers":
+        acts.append(_act(key, "retry", "Plan again without answering"))
+    if acts:
+        parts.append("<div class='acts'>" + "".join(acts) + "</div>")
+    parts.append("</section>")
+
+    # the planner's questions
+    qs = st["questions"] if st else []
+    vault = runs.vault_of(st)
+    if status in WAITING and vault:
+        head = "Questions for you" if qs else "Answer the planner"
+        parts.append(f"<section class='panel'><h2>{head}</h2>")
+        if status == "needs-answers":
+            parts.append("<div class='muted'>The plan is waiting on the blocking questions. Answer what you can; "
+                         "an empty box takes the question's default. The ticket is planned again with your "
+                         "answers.</div>")
+        else:
+            parts.append("<div class='muted'>Answering sends the ticket back to plan with your answers.</div>")
+        parts.append(_answer_form(key, qs) + "</section>")
+    elif qs:
+        parts.append("<section class='panel'><h2>Questions</h2><ul class='qs'>")
+        parts += [f"<li><div class='{'q blocking' if q.get('blocking') else 'q'}'>{esc(q['text'])}</div>"
+                  f"<div class='muted'>{'waiting on you' if q.get('blocking') else 'going with the default'}"
+                  "</div></li>" for q in qs]
+        parts.append("</ul></section>")
+
+    # each attempt and why it failed
+    hist = st.get("history") or []
+    parts.append("<section class='panel'><h2>Attempts</h2>")
+    if hist:
+        parts.append("<ul class='attempts' style='list-style:none;padding:0;margin:0'>")
+        linked = set()   # a retried stage writes <stage>-N.out again: link only its newest attempt
+        for h in reversed(hist):
+            stage, n, res = h["stage"], h["attempt"], h["result"]
+            out = f"{stage}-{n - 1}.out"
+            link = ""
+            if out in names and out not in linked:
+                linked.add(out)
+                link = f" <a href='/runs/ticket/{quote(key)}/{quote(out)}' target='_blank' rel='noopener'>output</a>"
+            parts.append(f"<li><span class='{esc(res)}'>{esc(res)}</span> <code>{esc(stage)}</code> attempt {n} "
+                         f"<span class='muted'>{esc(h['at'][:16].replace('T', ' '))}</span>{link}")
+            det = h["details"]
+            if det:
+                parts.append("<ul>" + "".join(f"<li>{esc(x)}</li>" for x in det) + "</ul>")
+            parts.append("</li>")
+        parts.append("</ul>")
+    else:
+        parts.append("<div class='muted'>No attempt has finished yet. Older tickets keep theirs in the queue "
+                     "log below.</div>")
+    parts.append("</section>")
+
+    for kind, label in (("plan", "Plan"), ("answers", "Your answers"), ("review", "Review")):
+        text = runs.note(key, kind, vault)
+        if text.strip():
+            parts.append(f"<section class='panel'><details><summary><b>{label}</b></summary>"
+                         f"<pre class='qlog'>{esc(_cap(text)[0])}</pre></details></section>")
+    parts.append("<section class='panel'><details><summary><b>Queue log</b></summary>"
+                 f"<pre class='qlog'>{esc(log) if log.strip() else 'no log yet'}</pre></details></section>")
+
+    parts.append("</div><div class='stack'><section class='panel'><h2>Stage sessions</h2>")
     if rows:
         parts.append("<ul class='runs'>")
         for r in sorted(rows, key=lambda r: _ms(r["time_created"])):
@@ -799,9 +1090,7 @@ def render_ticket(runs, key):
         parts.append("</ul>")
     else:
         parts.append("<div class='muted'>No sessions for this ticket in the opencode databases.</div>")
-    parts.append("</section><section class='panel'><h2>Queue log</h2>"
-                 f"<pre class='qlog'>{esc(log) if log.strip() else 'no log yet'}</pre></section></div>"
-                 "<div class='stack'><section class='panel'><h2>Stage outputs</h2>")
+    parts.append("</section><section class='panel'><h2>Stage outputs</h2>")
     if outs:
         parts.append("<ul class='runs'>")
         for name, mtime, size in outs:
@@ -813,6 +1102,58 @@ def render_ticket(runs, key):
         parts.append("<div class='muted'>None yet.</div>")
     parts.append("</section></div></div>")
     return key, parts
+
+
+TICKET_ACTIONS = ("answer", "approve", "retry")
+
+
+def answer_text(form):
+    """The answers note from the ticket page's form, or "" when nothing was answered."""
+    def one(name):
+        v = form.get(name) or ""
+        return (v[0] if isinstance(v, list) and v else v if isinstance(v, str) else "").strip()
+    out = []
+    for i in range(FORM_QUESTIONS):
+        q, a = one(f"q{i}"), one(f"a{i}")
+        if a:
+            out.append(f"## {q or 'Question ' + str(i + 1)}\n\n{a}")
+    if one("note"):
+        out.append(f"## Other\n\n{one('note')}")
+    if not out and not one("defaults"):
+        return ""
+    out.append("Any question not answered here: go with its default.")
+    return "\n\n".join(out)
+
+
+def ticket_action(runs, key, action, form):
+    """Answer, approve or retry a ticket through the queue script, as harness queue
+    does. Returns (ok, message)."""
+    if not KEY_RE.match(key or "") or key not in runs._ticket_dirs() or action not in TICKET_ACTIONS:
+        return False, "no such ticket or action"
+    cmd = [sys.executable, QUEUE_SCRIPT, "--state", runs.queue_dir, action, key]
+    text = None
+    if action == "answer":
+        st = runs.ticket_state(key)
+        vault = runs.vault_of(st)
+        if not vault:
+            return False, "no vault is set, so there is nowhere to keep the answers"
+        if st.get("status") not in WAITING:   # sent twice, or answered elsewhere since the page was loaded
+            return False, f"{key} is {st.get('status') or 'gone'} now, not waiting on answers; reload its page"
+        text = answer_text(form)
+        if not text:
+            return False, "nothing to send: answer a question, or choose Go with the defaults"
+        cmd += ["--vault", vault, "--stdin"]
+    try:
+        p = subprocess.run(cmd, input=(text or "").encode("utf-8"), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"the queue did not answer: {e}"
+    lines = [x for x in p.stdout.decode("utf-8", "replace").splitlines() if x.strip()]
+    last = (lines[-1] if lines else "").replace("[queue] ", "", 1)
+    if p.returncode:
+        return False, last or f"the queue exited with status {p.returncode}"
+    return True, (last + ". A running 'harness queue run' takes it after its current ticket; "
+                  "otherwise start one.")
 
 
 def ticket_file(runs, key, name):

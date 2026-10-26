@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -53,10 +54,20 @@ if stage == "planning":
     blocking = os.environ.get("FAKE_BLOCKING") and "Use the blue one" not in prompt
     qs = "- [blocking] Which colour? Default: blue\n" if blocking else "- None\n"
     crit = os.environ.get("FAKE_CRITERIA", "- A file feature.txt says hello feature\n")
-    open(path("Write the plan to"), "w").write(
-        "# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n" + crit +
-        "## Approach\nWrite feature.txt.\n## Files\n- feature.txt: new\n## Questions\n" + qs +
-        "## Assumptions\n- None\n")
+    plan = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n" + crit +
+            "## Approach\nWrite feature.txt.\n## Files\n- feature.txt: new\n## Questions\n" + qs +
+            "## Assumptions\n- None\n")
+    if os.environ.get("FAKE_ANSWER_DURING") and "planning ticket ABC-2" in prompt:  # the owner answers ABC-1
+        subprocess.run([sys.executable, os.environ["FAKE_TQ"], "--state", os.environ["FAKE_STATE"], "answer",
+                        "ABC-1", "--vault", vault, "--text", "Use the blue one."], check=True, capture_output=True)
+    where = os.environ.get("FAKE_PLAN_WHERE")
+    if where == "print":      # an agent that could not write the vault path
+        print("I could not write the file, so here is the plan:\n\n" + plan)
+    elif where == "clone":    # the file name taken from a Windows path the container cannot see
+        target = path("Write the plan to")
+        open(os.path.join(os.getcwd(), "C:\\x\\" + os.path.basename(target)), "w").write(plan)
+    else:
+        open(path("Write the plan to"), "w").write(plan)
 elif stage in ("implementing", "fixing"):
     if os.environ.get("FAKE_NO_COMMIT") or (stage == "fixing" and os.environ.get("FAKE_FIX_NOOP")):
         sys.exit(0)
@@ -257,6 +268,78 @@ class QueueTest(Base):
         answers = cat(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-answers.md"))
         self.assertIn("Use the blue one.", answers)
 
+    def test_answered_during_the_run_is_planned_again_in_the_same_run(self):
+        os.environ.update(FAKE_BLOCKING="1", FAKE_ANSWER_DURING="1", FAKE_STATE=self.state,
+                          FAKE_TQ=os.path.abspath(tq.__file__))
+        self.add("ABC-1", "ABC-2")
+        rc, out = self.run_queue()
+        self.assertEqual(rc, 0, out)
+        # ABC-1 asked, the queue went on to ABC-2, where the owner answered ABC-1: the run took ABC-1 again.
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(self.status("ABC-2")["status"], "needs-answers")
+        self.assertEqual(len([c for c in self.calls_of("planning")]), 3)
+        st = self.status()
+        results = [(h["stage"], h["result"]) for h in st["history"]]
+        self.assertEqual(results[0], ("plan", "questions"))
+        self.assertIn(("push", "passed"), results)
+        q2 = self.status("ABC-2")["questions"]
+        self.assertEqual(q2, [{"text": "[blocking] Which colour? Default: blue", "blocking": True}])
+
+    def test_a_plan_written_in_the_clone_or_printed_is_recovered(self):
+        for where in ("clone", "print"):
+            with self.subTest(where=where):
+                os.environ["FAKE_PLAN_WHERE"] = where
+                key = "ABC-1" if where == "clone" else "ABC-2"
+                self.add(key)
+                rc, out = self.run_queue("--push", "0")
+                self.assertEqual(self.status(key)["status"], "done", out)
+                plan = cat(os.path.join(self.vault, "wiki", "notes", "tickets", f"{key}-plan.md"))
+                self.assertTrue(plan.startswith("## Goal" if where == "print" else "# ABC-1 plan"), plan[:60])
+                log = cat(os.path.join(self.state, key, "log.md"))
+                self.assertIn("the plan was not at", log)
+                # Not left in the clone for the implement stage to commit.
+                files = sh("git", "-C", self.project, "show", "--name-only", "--format=", key).split()
+                self.assertEqual(files, ["feature.txt"])
+
+    def test_a_failed_attempt_is_in_the_history_with_why(self):
+        os.environ["FAKE_CRITERIA"] = ""
+        self.add("ABC-1")
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        failed = [h for h in st["history"] if h["result"] == "failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual((failed[0]["stage"], failed[0]["attempt"]), ("plan", 1))
+        self.assertTrue(any("lists no criteria" in d for d in failed[0]["details"]), failed[0])
+
+    def test_recovery_never_takes_the_prompt_template(self):
+        with tempfile.TemporaryDirectory() as d:
+            q = tq.Queue(os.path.join(d, "q"))
+            os.makedirs(os.path.join(q.dir("ABC-9"), "repo"))
+            ctx = type("C", (), {"q": q, "vault": os.path.join(d, "v")})()
+            out = os.path.join(d, "plan-0.out")
+            with open(out, "w") as f:
+                f.write(tq.render("plan", KEY="ABC-9"))   # the prompt echoed, the agent said nothing
+            self.assertEqual(tq.recover_note(ctx, {"key": "ABC-9"}, "plan", time.time(), out), "")
+            with open(out, "a") as f:
+                f.write("\n## Goal\nFix it.\n## Acceptance criteria\n- it works\n")
+            self.assertIn("Fix it.", tq.recover_note(ctx, {"key": "ABC-9"}, "plan", time.time(), out))
+
+    def test_agent_paths(self):
+        ctx = type("C", (), {"host": False, "single": False})()
+        self.assertEqual(tq.agent_path(ctx, "/x/y"), "/x/y")   # not Windows: as it is
+        if os.name != "nt":
+            keep = tq.os.name
+            tq.os.name = "nt"
+            try:
+                got = tq.agent_path(ctx, "C:\\Users\\me\\vault\\a.md")
+                ctx.host = True
+                host = tq.agent_path(ctx, "C:\\Users\\me\\vault\\a.md")
+            finally:
+                tq.os.name = keep
+            self.assertEqual(got, "/c/Users/me/vault/a.md")
+            self.assertEqual(host, "C:\\Users\\me\\vault\\a.md")
+
     def test_no_commit_is_retried_once_then_blocked(self):
         os.environ["FAKE_NO_COMMIT"] = "1"
         self.add("ABC-1")
@@ -338,11 +421,27 @@ class QueueTest(Base):
                 "## Assumptions\n- None\n")
         problems, crit, qs = tq.check_plan(plan)
         self.assertEqual(crit, ["one", "two"])
-        self.assertEqual(len(tq.blocking(qs)), 2)
-        self.assertTrue(any("4 questions" in p for p in problems))
-        self.assertTrue(any("without 'Default:'" in p for p in problems))
+        self.assertEqual(problems, [])   # format slips are notes, not a failed attempt
+        # An unmarked question with no default holds the ticket; one with a default does not.
+        self.assertEqual(tq.blocking(qs), ["[blocking] a? Default: b", "e?", "[blocking] f? Default: g"])
+        self.assertEqual(tq.blocking(["Which one? Default: the first"]), [])
+        # A bold or code-styled marker still counts; a statement is not a question.
+        self.assertEqual(tq.blocking(["**[blocking]** Which DB? Default: postgres",
+                                      "`[non-blocking]` Log level? Default: info",
+                                      "The ticket is clear enough."]),
+                         ["**[blocking]** Which DB? Default: postgres"])
+        # The ways of saying there are no questions are not questions; criteria keep "None of".
+        _, crit, qs = tq.check_plan("## Goal\nx\n## Acceptance criteria\n- None of the tests break\n"
+                                    "## Questions\n- No questions.\n- None; the ticket is clear\n- (none)\n")
+        self.assertEqual((crit, qs), (["None of the tests break"], []))
+        notes = tq.plan_notes(plan)
+        self.assertTrue(any("4 questions" in n for n in notes), notes)
+        self.assertTrue(any("not marked" in n and "taken as blocking" in n for n in notes), notes)
         problems, _, _ = tq.check_plan("## Goal\nx\n")
         self.assertTrue(any("Acceptance criteria" in p for p in problems))
+        # Only Goal and Acceptance criteria are needed.
+        self.assertEqual(tq.check_plan("## Goal\nx\n## Acceptance criteria\n- y\n")[0], [])
+        self.assertTrue(any("Approach" in n for n in tq.plan_notes("## Goal\nx\n## Acceptance criteria\n- y\n")))
         self.assertEqual(tq.check_plan("")[0], ["the plan file was not written"])
 
     def test_secrets_and_scope(self):
@@ -355,6 +454,9 @@ class QueueTest(Base):
         os.environ["TRACKER_TOKEN"] = "s3cr3t-value"
         problems, _ = tq.check_change(st, ("sha", "+x = 's3cr3t-value'\n", ["b.py"], 1), "## Files\n- b.py\n")
         self.assertEqual(problems, ["the diff contains the value of TRACKER_TOKEN; remove it"])
+        # A plan the agent left in its clone and committed is not part of the change.
+        problems, _ = tq.check_change(st, ("sha", "+x\n", ["b.py", "docs/ABC-1-plan.md"], 1), "## Files\n- b.py\n")
+        self.assertEqual(problems, ["docs/ABC-1-plan.md: the queue's notes live in the vault, not the branch; git rm it"])
 
     def test_json_object(self):
         self.assertEqual(tq.json_object('text {"a": "}{", "b": {"c": 1}} more'), {"a": "}{", "b": {"c": 1}})

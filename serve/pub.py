@@ -529,7 +529,7 @@ class Config:
         self.usage_ledger = usage_ledger
         self.trust_forwarded_for = trust_forwarded_for
         self.cache = TTLCache()
-        self.runs = runs_view.Runs(agent_data, queue_dir) if agent_data else None
+        self.runs = runs_view.Runs(agent_data, queue_dir, vault) if agent_data else None
 
     def opencode_password(self):
         if not self.password_file:
@@ -886,7 +886,7 @@ def make_handler(cfg):
             bits = rest.split("/")
             if bits[0] == "ticket" and len(bits) in (2, 3):
                 if len(bits) == 2:
-                    got = runs_view.render_ticket(r, bits[1])
+                    got = runs_view.render_ticket(r, bits[1], (q.get("done") or [""])[0][:500])
                     if got:
                         self.send_runs(200, f"harness: {got[0]}", got[1], head=head)
                         return
@@ -941,6 +941,9 @@ def make_handler(cfg):
 
         def runs_send(self, path, user):
             bits = path[len("/runs/"):].split("/")
+            if cfg.runs is not None and len(bits) == 3 and bits[0] == "ticket":
+                self.ticket_post(bits[1], bits[2], user)
+                return
             if cfg.runs is None or len(bits) != 2 or bits[1] != "send":
                 self.send(404, b"not found\n")
                 return
@@ -960,6 +963,28 @@ def make_handler(cfg):
                     f"<a href='/runs/{quote(bits[0])}'>Back to the run</a></section>"])
                 return
             self.redirect(f"/runs/{quote(bits[0])}#end")
+
+        def ticket_post(self, key, action, user):
+            """The ticket page's buttons: answer the plan's questions, approve the
+            plan, retry a blocked ticket (the same as harness queue answer/approve/retry)."""
+            if action not in runs_view.TICKET_ACTIONS:
+                self.send(404, b"not found\n")
+                return
+            try:
+                form = self.read_form(MAX_SEND_FORM)
+            except ValueError:
+                form = None
+            if form is None:
+                self.send(413, b"answers too large\n")
+                return
+            ok, msg = runs_view.ticket_action(cfg.runs, key, action, form)
+            sys.stderr.write(f"[pub] {action} {key} from {user or 'local'}: {msg}\n")
+            if not ok:
+                self.send_runs(409, "harness: not done", [
+                    f"<section class='panel'><h2>Not done</h2><p class='err'>{esc(msg)}</p>"
+                    f"<a href='/runs/ticket/{quote(key)}'>Back to the ticket</a></section>"])
+                return
+            self.redirect(f"/runs/ticket/{quote(key)}?done={quote(msg[:500])}")
 
         def redirect(self, location, head=False, cookies=()):
             self.send(303, b"", extra={"Location": location, "Cache-Control": "no-store"},

@@ -608,7 +608,8 @@ tickets one at a time with no one at the keyboard. `add KEY... [--dir]
 checks once (host mode when docker is missing, `host_confirm_gate` asked
 once), starts the host proxy if it is not running and hands the rest to the
 Python script. `list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
-(`$EDITOR` without TEXT), `findings`, `watch` (tails `run.log`) and `log
+(`$EDITOR` without TEXT; the script's `--stdin` is what the run viewer's
+ticket page uses), `findings`, `watch` (tails `run.log`) and `log
 [KEY]` are the owner's side.
 
 Stages, each a fresh `harness [host] -p --yolo --ticket KEY -m MODEL PROMPT`
@@ -621,13 +622,29 @@ The model is `QUEUE_MODEL`, else the default model's free twin when it is a
 `-withtools` one (`resolve_model`). Plan, review, answers and findings live
 in the vault at `wiki/notes/tickets/KEY-{plan,review,answers,findings}.md`.
 
-After a stage harness runs its own gates (the plan's six sections, 1-15
-criteria, at most 3 questions each with a default and `[blocking]` or
-`[non-blocking]`; commits, a non-empty diff, nothing under `.github/`, no
-key file, no key-shaped added line, no value of a secret env var), then
+The note paths in the prompt are the ones the agent sees: on Windows a
+container launch gets the vault's `/c/...` mount path (`agent_path`: `cygpath
+-u`, else a drive-letter rewrite), not the `C:\...` path native Python holds,
+which a Linux agent cannot write (every plan attempt failed "the plan file
+was not written" before). A plan or review the agent wrote anywhere else in
+the clone (a file ending `KEY-plan.md`, newer than the stage) is moved into
+the vault, else the last `## Goal` / `## Must fix` block of its output is
+taken (`recover_note`, logged; never output that holds the prompt's own
+template).
+
+After a stage harness runs its own gates (the plan's Goal and 1-15
+acceptance criteria; the other sections, the question count and a
+question's `[blocking]` marker (bold or in backticks too) are logged as
+notes, not failures; an unmarked question blocks only when it has a `?` and
+no `Default:`, and "None" / "No questions" bullets are not questions;
+commits, a non-empty diff, nothing under `.github/`, none of the ticket's
+notes (a recovered `KEY-plan.md` the agent committed), no key file, no
+key-shaped added line, no value of a secret env var), then
 one raw verifier call through the proxy (`verify_plan.md` /
 `verify_change.md`, JSON only, three tries). The verifier must quote the
-ticket for each plan criterion and the diff for each criterion met;
+ticket for at least one plan criterion (a quote that does not match is a
+note, since a plan criterion may rightly go past the ticket's words) and the
+diff for each criterion met;
 `judge()` checks every quote is really in the source (letters and digits
 only, so spacing and list markers do not matter); a diff quote must come
 from an added line, or a removed one when the criterion is about removing,
@@ -646,6 +663,13 @@ container launch can outlive its stopped client. Going back to the plan
 (`answer`) starts from a fresh clone. A
 blocking question parks the ticket as `needs-answers` and the queue moves
 on; `QUEUE_PLAN_REVIEW=1` holds each plan as `plan-review` for `approve`.
+A ticket is `running` from the moment a run takes it (before the clone, so an
+`answer` cannot pull the clone from under it), and its `state.json` keeps the
+run's vault, where the ticket page reads notes and writes answers even when
+the viewer started with another. `answer`, `approve` and `retry` stamp `requeued`, so a `queue run` still
+going takes the ticket again after its current one. Every attempt's result
+and, when it failed, its problems go to `state.json`'s `history` (last 30),
+which the ticket page lists.
 
 Harness never runs git in the clone once an agent has had it: it fetches
 branch `KEY` into the project as `refs/harness-queue/KEY`, diffs there,
@@ -658,7 +682,7 @@ vault as `wiki/notes/tickets/KEY-log.md` and `queue _sync` captures the session
 (host or container database) and commits the vault. Nothing is written to the
 tracker.
 State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
-attempt, feedback), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
+attempt, feedback, reason, the plan's `questions`, `history`, `vault`), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
 as `KEY/verify-*.txt`, and `run.lock` (one run at a time: `flock`, or
 `msvcrt.locking` on Windows). Each agent runs in its own session (its own
 process group on Windows), so Ctrl-C reaches only the queue, which then ends
@@ -1175,19 +1199,31 @@ home>/.local/share` and `--agent-data host=${XDG_DATA_HOME:-~/.local/share}`
 dir with no DB shows nothing, and with no `--agent-data` the viewer is off) and `--queue-dir
 state/queue`. Routes:
 
-- `/runs` (`?q=` filter): live runs, queue tickets with their sessions by
-  stage, then every session newest first. The index shows the live ones in
+- `/runs` (`?q=` filter): the queue (each ticket's status, stage and what it
+  waits on), live runs, queue tickets with their sessions by stage, then every
+  session newest first. The index shows the live ones in
   an "Agent runs" panel.
 - `/runs/<sid>`: the transcript (text, thinking, each tool call with input,
-  output, status and timing, subtasks, retries, errors), crumbs to the parent
-  session, a side panel (agent, model, tokens, cost, directory, ticket,
-  subagents) and, for a live run, a message box. A nonce script polls
+  output, status and timing, subtasks, retries, errors; a file change as its
+  diff from opencode's tool metadata, a `todowrite` as a checklist), crumbs to
+  the parent session and a side panel: for a live run the message box first,
+  then the session's latest todo list, then agent, model, tokens, cost,
+  directory, ticket, subagents. A nonce script polls
   `/runs/<sid>/tail?from=N` (2.5 s, 15 s once idle) and appends new or changed
   messages in place.
 - `/runs/<sid>/part/<pid>` (one tool call in full, past the 20,000-character
   inline cap), `/runs/<sid>.json` (the session as JSON), `/runs/ticket/<KEY>`
-  (its sessions by stage, `log.md` and stage `.out` files from `state/queue/KEY`).
+  (status and why, a link to the live stage, the plan's questions with an
+  answer form, approve or retry, every attempt from `history` with its
+  problems and `.out`, the plan, answers and review notes from the vault,
+  `log.md`, the sessions by stage and the `.out` files).
 - `POST /runs/<sid>/send`: puts a message in the run's inbox.
+- `POST /runs/ticket/<KEY>/{answer,approve,retry}`: runs `ticket_queue.py`
+  `answer --stdin` (the form's answers as `## question` sections, `## Other`,
+  and "go with the default" for the rest; needs the vault), `approve` or
+  `retry`, and redirects back with its message (409 with the reason when the
+  ticket is not in a state for it, such as answers sent twice). Same origin and access-code checks as
+  sending.
 - `/runs/follow?since=MS[&queue=1]`: the link a launch opens. It redirects
   (303) to the root session started at or after MS (live first, then still
   working, then newest), or shows a waiting page that polls
@@ -1259,7 +1295,8 @@ proxy up; `wait -n` exits 1 if either child dies. Logs:
 `serve/test_pub.py` (index, Host check, sandbox header, path escape, access
 codes, `/_auth`, usage, git log, proxy status) and `serve/test_runs.py`
 (the run viewer over a fixture opencode DB: list, transcript, escaping, tail,
-ticket page, send and its refusals), a stub-opencode check of `live-run.sh`
+ticket page with its questions, attempts and answer/approve/retry, diffs
+and todos, send and its refusals), a stub-opencode check of `live-run.sh`
 (attach, inbox relay, exit code, fallbacks), plus option errors, the
 password file, the mode aliases (alone and in the merged overlay), the key
 scrub (the OAI provider keeps its slim header in host and serve) and a

@@ -37,4 +37,4 @@ Rules:
 - Every Must fix item names a file and says what is wrong; no style preferences there.
 - Never contact the issue tracker or change anything there.
 - If you notice a bug that is NOT part of this ticket, append one bullet to {{FINDINGS_FILE}}: "- path:line: what is wrong and why it matters (seen while reviewing {{KEY}})".
-- When the review file is written, finish.
+- When the review file is written, finish. If you cannot write it, give the whole review as your final message instead.

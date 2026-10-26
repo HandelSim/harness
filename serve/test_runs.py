@@ -73,6 +73,15 @@ def build_db(path, project, queue_repo, now_ms):
             "output": "found", "metadata": {"sessionId": CHILD}}},
         {"type": "tool", "tool": "read", "callID": "c3", "state": {
             "status": "error", "input": {"filePath": "/nope"}, "error": "no such file"}},
+        {"type": "tool", "tool": "edit", "callID": "c4", "state": {
+            "status": "completed", "title": "src/parse.py",
+            "input": {"filePath": "src/parse.py", "oldString": "old <line>", "newString": "new line"},
+            "metadata": {"diff": "--- src/parse.py\n+++ src/parse.py\n@@ -1 +1 @@\n-old <line>\n+new line\n"},
+            "output": "Edit applied."}},
+        {"type": "tool", "tool": "todowrite", "callID": "c5", "state": {
+            "status": "completed", "title": "1 todo", "input": {"todos": [
+                {"content": "read the parser", "status": "completed"},
+                {"content": "fix <the> bug", "status": "in_progress"}]}, "output": "[]"}},
         {"type": "text", "text": "Done."}])
     session(CHILD, ROOT, project, "explore subagent", now_ms - 58000, agent="explore")
     message(CHILD, "msg_c1", now_ms - 58000, {"role": "user", "agent": "explore"}, [{"type": "text", "text": "find it"}])
@@ -98,6 +107,10 @@ class RunsServer(unittest.TestCase):
         out = os.path.join(self.queue, "ABC-12", "plan-1.out")
         with open(out, "w") as f:
             f.write("the plan\n")
+        self.vault = os.path.join(root, "vault")
+        os.makedirs(os.path.join(self.vault, "wiki", "notes", "tickets"))
+        with open(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-12-plan.md"), "w") as f:
+            f.write("## Goal\n\nFix it.\n\n## Questions\n\n1. [blocking] Which <db>?\n")
         self.now_ms = int(time.time() * 1000)
         os.utime(out, (time.time() - 30, time.time() - 30))
         build_db(os.path.join(self.data, "opencode", "opencode.db"), os.path.join(root, "proj"), repo, self.now_ms)
@@ -112,7 +125,9 @@ class RunsServer(unittest.TestCase):
     def start(self, **kw):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), None)
         port = srv.server_address[1]
-        cfg = pub.Config(port, "", "", 0, "", (), agent_data=[("host", self.data)], queue_dir=self.queue, **kw)
+        kw.setdefault("vault", self.vault)
+        vault = kw.pop("vault")
+        cfg = pub.Config(port, vault, "", 0, "", (), agent_data=[("host", self.data)], queue_dir=self.queue, **kw)
         srv.RequestHandlerClass = pub.make_handler(cfg)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.servers.append(srv)
@@ -128,6 +143,27 @@ class RunsServer(unittest.TestCase):
         data = r.read()
         c.close()
         return r, data.decode("utf-8", "replace")
+
+    def ticket(self, **st):
+        base = {"key": "ABC-12", "project": "/p", "base": "main", "status": "needs-answers", "stage": "plan",
+                "attempt": 0, "feedback": "", "reason": "1 blocking question(s) in the plan",
+                "questions": [{"text": "Which <db>?", "blocking": True},
+                              {"text": "Log level? Default: info", "blocking": False}],
+                "history": [{"at": "2026-10-26T20:00:00Z", "stage": "plan", "attempt": 2, "result": "failed",
+                             "details": ["the plan file was not written: write it to <C:\\x>"]}]}
+        base.update(st)
+        with open(os.path.join(self.queue, "ABC-12", "state.json"), "w") as f:
+            json.dump(base, f)
+        with open(os.path.join(self.queue, "queue.list"), "w") as f:
+            f.write("ABC-12\n")
+
+    def state(self):
+        with open(os.path.join(self.queue, "ABC-12", "state.json")) as f:
+            return json.load(f)
+
+    def act(self, action, fields=()):
+        h = {"Content-Type": "application/x-www-form-urlencoded", "Origin": f"http://127.0.0.1:{self.port}"}
+        return self.req("POST", f"/runs/ticket/ABC-12/{action}", urlencode(list(fields)), h)
 
     def go_live(self, sid=ROOT):
         with open(os.path.join(self.live, sid + ".json"), "w") as f:
@@ -213,6 +249,119 @@ class RunsTest(RunsServer):
         self.assertIn("plan-1.out", body)
         r, body = self.req("GET", "/runs/ticket/ABC-12/plan-1.out")
         self.assertEqual(body, "the plan\n")
+
+    def test_queue_panel_says_what_each_ticket_waits_on(self):
+        self.ticket()
+        self.start()
+        r, body = self.req("GET", "/runs")
+        self.assertIn("<h2>Queue</h2>", body)
+        self.assertRegex(body, r"<b>ABC-12</b></a> <span class='ask'>needs your answers</span>")
+        self.assertIn("does not hold the queue", body)
+
+    def test_ticket_page_shows_questions_attempts_and_notes(self):
+        self.ticket()
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(r.status, 200)
+        self.assertIn("<div class='q blocking'>Which &lt;db&gt;?</div>", body)
+        self.assertIn("name='q0' value='Which &lt;db&gt;?'", body)
+        self.assertIn("action='/runs/ticket/ABC-12/answer'", body)
+        self.assertIn("Go with the defaults", body)
+        self.assertIn("Plan again without answering", body)
+        self.assertIn("<span class='failed'>failed</span> <code>plan</code> attempt 2", body)
+        self.assertIn("write it to &lt;C:\\x&gt;", body)
+        self.assertIn("href='/runs/ticket/ABC-12/plan-1.out'", body)   # the failed attempt's output
+        self.assertIn("1. [blocking] Which &lt;db&gt;?", body)          # the plan note
+        self.ticket(status="plan-review", questions=[])
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("action='/runs/ticket/ABC-12/approve'", body)
+        self.assertIn("Answer the planner", body)   # a free answer box without questions
+        self.ticket(status="running", attempt=1)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("<form method='post'", body)
+        self.assertIn("going with the default", body)
+
+    def test_answering_on_the_page_saves_the_answers_and_requeues(self):
+        self.ticket()
+        self.start()
+        r, body = self.act("answer", [("q0", "Which <db>?"), ("a0", ""), ("q1", "Log level?"), ("a1", "")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("nothing to send", body)
+        r, _ = self.act("answer", [("q0", "Which <db>?"), ("a0", "postgres"), ("note", "keep it small")])
+        self.assertEqual(r.status, 303)
+        self.assertIn("/runs/ticket/ABC-12?done=", r.getheader("Location"))
+        st = self.state()
+        self.assertEqual((st["status"], st["stage"]), ("queued", "plan"))
+        self.assertNotIn("questions", st)
+        with open(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-12-answers.md")) as f:
+            text = f.read()
+        self.assertIn("## Which <db>?\n\npostgres", text)
+        self.assertIn("## Other\n\nkeep it small", text)
+        r, body = self.req("GET", r.getheader("Location"))
+        self.assertIn("<p class='flash'>", body)
+        r, body = self.act("answer", [("defaults", "1")])
+        self.assertEqual(r.status, 409)   # sent twice: the ticket is not waiting any more
+        self.assertIn("ABC-12 is queued now", body)
+        r, body = self.act("approve")
+        self.assertEqual(r.status, 409)
+        self.assertIn("not plan-review", body)
+
+    def test_approve_and_retry_on_the_page(self):
+        self.ticket(status="plan-review", stage="implement")
+        self.start()
+        r, _ = self.act("approve")
+        self.assertEqual(r.status, 303)
+        self.assertEqual((self.state()["status"], self.state()["plan_approved"]), ("queued", True))
+        self.ticket(status="blocked", stage="review", reason="review failed 2 time(s)")
+        r, _ = self.act("retry")
+        self.assertEqual(r.status, 303)
+        self.assertEqual((self.state()["status"], self.state()["stage"]), ("queued", "review"))
+        r, _ = self.act("delete")
+        self.assertEqual(r.status, 404)
+        r, _ = self.req("POST", "/runs/ticket/ABC-12/retry", "", {"Origin": "http://evil.example"})
+        self.assertEqual(r.status, 403)
+
+    def test_answers_go_to_the_vault_the_queue_ran_with(self):
+        other = os.path.join(self.tmp.name, "vault-b")
+        os.makedirs(other)
+        self.ticket(vault=other)
+        self.start()
+        r, _ = self.act("answer", [("a0", "postgres"), ("q0", "Which <db>?")])
+        self.assertEqual(r.status, 303)
+        self.assertTrue(os.path.exists(os.path.join(other, "wiki", "notes", "tickets", "ABC-12-answers.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-12-answers.md")))
+
+    def test_a_malformed_state_does_not_take_the_pages_down(self):
+        self.ticket(status=["x"], stage=3, reason={"a": 1}, attempt="2", updated=5, history={"x": 1},
+                    questions=[{"text": ["q"]}, "q", {"text": "ok?", "blocking": True}])
+        self.start()
+        r, body = self.req("GET", "/runs")
+        self.assertEqual(r.status, 200)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(r.status, 200)
+        self.assertIn("ok?", body)
+
+    def test_answers_need_a_vault(self):
+        self.ticket()
+        self.start(vault="")
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("/answer'", body)
+        r, body = self.act("answer", [("a0", "x")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("no vault", body)
+
+    def test_detail_shows_diffs_and_the_todo_list(self):
+        self.start()
+        r, body = self.req("GET", f"/runs/{ROOT}")
+        self.assertIn("<span class='del'>-old &lt;line&gt;</span>", body)
+        self.assertIn("<span class='add'>+new line</span>", body)
+        self.assertIn("+1 &minus;1", body)
+        self.assertNotIn("oldString", body)        # the diff stands in for the edit's input
+        self.assertIn("Todo <span class='muted'>1/2 done</span>", body)
+        self.assertIn("<li class='in_progress'><span>&#9656;</span><span>fix &lt;the&gt; bug</span></li>", body)
+        self.go_live()
+        r, body = self.req("GET", f"/runs/{ROOT}")
+        self.assertLess(body.index("Message the agent"), body.index("Todo <span"))
 
     def test_send_to_a_live_run_carries_its_agent_and_model(self):
         self.start()

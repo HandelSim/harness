@@ -19,10 +19,10 @@ everything the stage needs, the ticket, the plan, the answers and the last
 attempt's problems, because the free models only read the last message.
 
 After a stage, harness checks the result itself before an AI verifier sees it:
-the plan file has its sections and at most 3 questions; the branch has commits,
-a non-empty diff, no .github/ change and no secret. The verifier (one plain
-request through the proxy, no tools) must quote the ticket for each acceptance
-criterion of a plan and the diff for each one a change meets, and harness checks
+the plan has a goal and acceptance criteria; the branch has commits, a non-empty
+diff, no .github/ change and no secret. The verifier (one plain request through
+the proxy, no tools) must quote the ticket for a plan's criteria and the diff
+for each one a change meets, and harness checks
 every quote is really there. A failed stage runs again once (QUEUE_RETRIES) with
 the problems listed, then the ticket is blocked. When the stage failed because
 the upstream does not answer (one probe request), the whole run stops and the
@@ -57,6 +57,8 @@ DIFF_CAP_AGENT = 40_000
 DIFF_CAP_VERIFY = 150_000
 MAX_QUESTIONS = 3
 PLAN_SECTIONS = ("Goal", "Acceptance criteria", "Approach", "Files", "Questions", "Assumptions")
+PLAN_REQUIRED = ("Goal", "Acceptance criteria")   # the rest missing is noted, not failed
+HISTORY_CAP = 30
 REVIEW_SECTIONS = ("Must fix", "Notes")
 SECRET_ENV = ("PROXY_API_KEY", "OAI_API_KEY", "CHATGPT_COOKIE_STRING", "TRACKER_TOKEN")
 SECRET_RE = re.compile(
@@ -92,7 +94,16 @@ def write_atomic(path, text):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
-    os.replace(tmp, path)
+    for i in range(20):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            # Windows refuses to replace a file another process has open (the
+            # run viewer reading state.json); it is closed again in a moment.
+            if os.name != "nt" or i == 19:
+                raise
+            time.sleep(0.1)
 
 
 class Queue:
@@ -166,29 +177,52 @@ def bullets(body):
 
 
 def check_plan(text):
-    """(problems, criteria, questions) of a plan file."""
+    """(problems, criteria, questions) of a plan file. Only what later stages
+    cannot do without fails the attempt: a goal and the acceptance criteria.
+    Format slips (a missing section, an unmarked question) are plan_notes."""
     if not text.strip():
         return ["the plan file was not written"], [], []
     secs = sections(text)
-    problems = [f"the plan has no '## {s}' section" for s in PLAN_SECTIONS if s.lower() not in secs]
+    problems = [f"the plan has no '## {s}' section" for s in PLAN_REQUIRED if s.lower() not in secs]
     criteria = bullets(secs.get("acceptance criteria", ""))
-    questions = bullets(secs.get("questions", ""))
+    questions = plan_questions(secs)
     if "acceptance criteria" in secs and not criteria:
         problems.append("'## Acceptance criteria' lists no criteria (one bullet each)")
     if len(criteria) > 15:
         problems.append(f"{len(criteria)} acceptance criteria: at most 15, merge the small ones")
-    if len(questions) > MAX_QUESTIONS:
-        problems.append(f"{len(questions)} questions: at most {MAX_QUESTIONS}; decide the rest and list them under Assumptions")
-    for q in questions:
-        if not re.search(r"(?i)\bdefault:", q):
-            problems.append(f"question without 'Default:' (the answer you would go with): {q[:120]}")
-        if not re.match(r"(?i)\s*\[(non-)?blocking\]", q):
-            problems.append(f"question not marked [blocking] or [non-blocking]: {q[:120]}")
     return problems, criteria, questions
 
 
+def plan_questions(secs):
+    """The Questions section's bullets, less the ways of saying there are none."""
+    return [q for q in bullets(secs.get("questions", ""))
+            if not re.match(r"(?i)\W*(none|no (open |further )?questions|n/?a)\b[^?]*$", q)]
+
+
+def question_mark(q):
+    """'blocking', 'non-blocking' or None: the marker, bold or in backticks too."""
+    m = re.match(r"(?i)[\s*_`]*\[(non-)?blocking\]", q)
+    return None if not m else "non-blocking" if m.group(1) else "blocking"
+
+
+def plan_notes(text):
+    """What is off in a plan that passed check_plan, for the log."""
+    secs = sections(text)
+    notes = [f"no '## {s}' section" for s in PLAN_SECTIONS if s.lower() not in secs]
+    questions = plan_questions(secs)
+    if len(questions) > MAX_QUESTIONS:
+        notes.append(f"{len(questions)} questions (asked for at most {MAX_QUESTIONS})")
+    notes += [f"question not marked [blocking] or [non-blocking] (taken as "
+              f"{'blocking' if blocking([q]) else 'non-blocking'}): {q[:120]}"
+              for q in questions if not question_mark(q)]
+    return notes
+
+
 def blocking(questions):
-    return [q for q in questions if re.match(r"(?i)\s*\[blocking\]", q)]
+    """The questions that hold the ticket: marked [blocking], or an unmarked
+    question with no default to go on."""
+    return [q for q in questions if question_mark(q) == "blocking"
+            or (question_mark(q) is None and "?" in q and not re.search(r"(?i)\bdefault:", q))]
 
 
 def check_review(text):
@@ -299,6 +333,10 @@ def check_change(st, change, plan_text):
             problems.append(f"{f}: changes under .github/ (CI) are not made by the queue; leave CI to the owner")
         if SECRET_PATH.search(f):
             problems.append(f"{f}: a secret or key file must not be committed")
+    notes = tuple(f"{st['key']}-{k}.md".lower() for k in ("plan", "review", "answers", "findings"))
+    for f in files:
+        if f.lower().endswith(notes):
+            problems.append(f"{f}: the queue's notes live in the vault, not the branch; git rm it")
     added = "\n".join(l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
     if SECRET_RE.search(added):
         problems.append("the diff adds what looks like a key or token; remove it")
@@ -389,12 +427,15 @@ def diff_sides(diff):
     return norm("\n".join(added), diff=True), norm("\n".join(removed), diff=True)
 
 
-def judge(obj, criteria, source, quote_field, what, notes=""):
+def judge(obj, criteria, source, quote_field, what, notes="", soft=None):
     """Problems with a verdict: every criterion answered, met (for a change),
     and every quote found in <source>. For a diff a quote must be from an added
     line (a removed one when the criterion is about removing; never an unchanged
     one); a reviewer's "(review)" item may instead quote <notes>, the commit
-    messages saying why it is wrong."""
+    messages saying why it is wrong. A ticket quote the verifier got slightly
+    wrong goes to <soft> instead (a list, logged): one found quote is enough
+    to show the plan is about the ticket."""
+    soft = [] if soft is None else soft
     if obj.get("unreadable"):
         return [str(p) for p in obj["problems"]]
     problems = []
@@ -431,7 +472,8 @@ def judge(obj, criteria, source, quote_field, what, notes=""):
         if len(quote) >= 8 and ok:
             found += 1
         else:
-            problems.append(f"criterion {i}: the quoted {what} text is not in the {what}: {quote[:120]}")
+            (soft if what == "ticket" else problems).append(
+                f"criterion {i}: the quoted {what} text is not in the {what}: {quote[:120]}")
     if what == "ticket" and criteria and not found:
         problems.append("no criterion quotes the ticket: the plan may not be about this ticket")
     if str(obj.get("verdict", "")).upper() != "PASS":
@@ -534,17 +576,38 @@ def probe(ctx):
 
 # --- stages -------------------------------------------------------------------------------
 
+_AGENT_PATHS = {}
+
+
+def agent_path(ctx, path):
+    """A host path as the agent sees it. A container launch on Windows mounts the
+    vault at its Git Bash spelling (/c/Users/...); C:\\Users\\... means nothing in
+    Linux, and an agent told to write its plan there never does."""
+    if os.name != "nt" or ctx.host or ctx.single:
+        return path
+    if path not in _AGENT_PATHS:
+        try:
+            got = subprocess.run(["cygpath", "-u", path], capture_output=True, text=True, timeout=10,
+                                 stdin=subprocess.DEVNULL).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            got = ""
+        m = re.match(r"^([A-Za-z]):[\\/](.*)$", path)
+        _AGENT_PATHS[path] = got or (f"/{m.group(1).lower()}/{m.group(2)}" if m else path).replace("\\", "/")
+    return _AGENT_PATHS[path]
+
+
 def common(ctx, st):
     p = note_paths(ctx.vault, st["key"])
+    ap = {k: agent_path(ctx, v) for k, v in p.items()}
     answers = read(p["answers"])
     if len(answers) > PLAN_CAP:
         answers = "[... earlier answers cut ...]\n" + answers[-PLAN_CAP:]
     plan = read(plan_copy(ctx.q, st["key"]), PLAN_CAP) if st.get("stage", "plan") != "plan" else ""
     return dict(KEY=st["key"], BRANCH=st["key"], BASE_SHA=st.get("base_sha", ""),
-                REPO=os.path.join(ctx.q.dir(st["key"]), "repo"), TICKET_FILE=p["ticket"],
+                REPO=os.path.join(ctx.q.dir(st["key"]), "repo"), TICKET_FILE=ap["ticket"],
                 TICKET=read(p["ticket"], TICKET_CAP) or "(the ticket file is missing; read the path above)",
-                PLAN_FILE=p["plan"], PLAN=plan or read(p["plan"], PLAN_CAP) or "(none yet)",
-                REVIEW_FILE=p["review"], FINDINGS_FILE=p["findings"], ANSWERS_FILE=p["answers"],
+                PLAN_FILE=ap["plan"], PLAN=plan or read(p["plan"], PLAN_CAP) or "(none yet)",
+                REVIEW_FILE=ap["review"], FINDINGS_FILE=ap["findings"], ANSWERS_FILE=ap["answers"],
                 ANSWERS=answers or "(none)",
                 FEEDBACK=cap(st.get("feedback") or "(first attempt)", NOTE_CAP))
 
@@ -555,26 +618,86 @@ def plan_copy(q, key):
     return os.path.join(q.dir(key), "plan.md")
 
 
+def fresh(path, started):
+    """The file's text if it was written since started, else ""."""
+    return read(path) if os.path.exists(path) and os.path.getmtime(path) >= started - 1 else ""
+
+
+# A line of each prompt's template: output holding it is the prompt echoed, not the agent's note.
+NOTE_TEMPLATE = {"plan": "One or two sentences: what changes for the user of this code",
+                 "review": "Only real defects that would make the change wrong, unsafe or not meet"}
+NOTE_HEADS = {"plan": r"^##\s+Goal\b", "review": r"^##\s+Must fix\b"}
+
+
+def recover_note(ctx, st, kind, started, out):
+    """The plan or review the agent wrote somewhere else, put where it belongs
+    (KEY-plan.md / KEY-review.md in the vault); its text, or "". An agent that
+    cannot write the vault path writes the file into its clone, or prints it."""
+    key = st["key"]
+    dest = note_paths(ctx.vault, key)[kind]
+    repo = os.path.join(ctx.q.dir(key), "repo")
+    want = f"{key}-{kind}.md".lower()
+    found = None
+    for root, dirs, files in os.walk(repo):
+        depth = os.path.relpath(root, repo).count(os.sep)
+        dirs[:] = [] if depth >= 3 else [d for d in dirs if d not in (".git", "node_modules")]
+        for f in files:
+            # endswith: the name can be a whole Windows path the agent took for a file name
+            if f.lower().endswith(want):
+                path = os.path.join(root, f)
+                try:
+                    m = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if m >= started - 1 and (found is None or m > found[0]):
+                    found = (m, path)
+    text, where = "", ""
+    if found:
+        text, where = read(found[1]), f"the clone ({os.path.relpath(found[1], repo)})"
+        try:
+            os.remove(found[1])   # not the agent's change to commit
+        except OSError:
+            pass
+    else:
+        printed = read(out)
+        heads = list(re.finditer(NOTE_HEADS[kind], printed, re.M | re.I))
+        if heads and NOTE_TEMPLATE[kind] not in printed[heads[-1].start():]:
+            text, where = printed[heads[-1].start():], "the agent's output"
+    if not text.strip():
+        return ""
+    write_atomic(dest, text if text.endswith("\n") else text + "\n")
+    ctx.q.log(key, f"the {kind} was not at {dest}; taken from {where}")
+    return text
+
+
 def stage_plan(ctx, st):
     v = common(ctx, st)
     started = time.time()
-    rc, _ = run_agent(ctx, st, "plan", render("plan", **v))
+    rc, out = run_agent(ctx, st, "plan", render("plan", **v))
     p = note_paths(ctx.vault, st["key"])
-    text = read(p["plan"]) if os.path.exists(p["plan"]) and os.path.getmtime(p["plan"]) >= started - 1 else ""
+    text = fresh(p["plan"], started) or recover_note(ctx, st, "plan", started, out)
     problems, criteria, questions = check_plan(text)
+    if not text.strip():
+        problems = [f"the plan file was not written: write it to {v['PLAN_FILE']}"]
     if not problems:
+        notes = plan_notes(text)
         obj = ask_verifier(ctx, render("verify_plan", TICKET=read(p["ticket"], DIFF_CAP_VERIFY), PLAN=text,
                                        CRITERIA=numbered(criteria)), st["key"], "plan")
-        problems = judge(obj, criteria, read(p["ticket"]), "ticket_quote", "ticket")
+        problems = judge(obj, criteria, read(p["ticket"]), "ticket_quote", "ticket", soft=notes)
         ctx.q.log(st["key"], f"plan verifier: {obj.get('verdict')} ({len(problems)} problem(s))")
+        if notes:
+            ctx.q.log(st["key"], "plan notes (not failures)", "\n".join("- " + n for n in notes))
     if problems:
         return fail(ctx, st, rc, problems)
+    st["questions"] = [{"text": x, "blocking": bool(blocking([x]))} for x in questions]
     open_q = blocking(questions)
     if open_q:
+        record(st, "questions", open_q)
         st.update(status="needs-answers", stage="plan", attempt=0, feedback="",
                   reason=f"{len(open_q)} blocking question(s) in the plan")
         ctx.q.save(st)
-        ctx.q.log(st["key"], f"needs answers: harness queue answer {st['key']}", "\n".join("- " + x for x in open_q))
+        ctx.q.log(st["key"], f"needs answers: harness queue answer {st['key']} (or the ticket's page in harness serve)",
+                  "\n".join("- " + x for x in open_q))
         return
     write_atomic(plan_copy(ctx.q, st["key"]), text)
     advance(ctx, st, "implement")
@@ -638,10 +761,12 @@ def stage_review(ctx, st):
     v = common(ctx, st)
     v["DIFF"] = cap(change[1], DIFF_CAP_AGENT) if change else "(no diff)"
     started = time.time()
-    rc, _ = run_agent(ctx, st, "review", render("review", **v))
+    rc, out = run_agent(ctx, st, "review", render("review", **v))
     path = note_paths(ctx.vault, st["key"])["review"]
-    text = read(path) if os.path.exists(path) and os.path.getmtime(path) >= started - 1 else ""
+    text = fresh(path, started) or recover_note(ctx, st, "review", started, out)
     problems, must = check_review(text)
+    if not text.strip():
+        problems = [f"the review file was not written: write it to {v['REVIEW_FILE']}"]
     if problems:
         return fail(ctx, st, rc, problems)
     ctx.q.log(st["key"], f"review: {len(must)} must-fix item(s)", "\n".join("- " + m for m in must))
@@ -679,6 +804,7 @@ def stage_push(ctx, st):
         ctx.q.log(key, f"pushed branch {key} to {ctx.remote} ({sha[:12]})")
     else:
         ctx.q.log(key, f"branch {key} ready in the project ({sha[:12]}); not pushed (QUEUE_PUSH=0)")
+    record(st, "passed", [f"branch {key} at {sha[:12]}"])
     st.update(status="done", stage="done", attempt=0, feedback="", reason="", sha=sha)
     ctx.q.save(st)
 
@@ -687,12 +813,23 @@ STAGES = {"plan": stage_plan, "implement": stage_implement, "review": stage_revi
           "push": stage_push}
 
 
+def record(st, result, details=()):
+    """One entry in the ticket's history (state.json), which the run viewer shows:
+    each stage attempt's result and, for a failed one, why."""
+    h = st.setdefault("history", [])
+    h.append({"at": now_iso(), "stage": st.get("stage", ""), "attempt": st.get("attempt", 0) + 1,
+              "result": result, "details": [str(d)[:400] for d in list(details)[:20]]})
+    del h[:-HISTORY_CAP]
+
+
 def advance(ctx, st, stage):
+    record(st, "passed")
     st.update(stage=stage, attempt=0, feedback="", status="running")
     ctx.q.save(st)
 
 
 def block(ctx, st, reason):
+    record(st, "blocked", [reason])
     st.update(status="blocked", reason=reason)
     ctx.q.save(st)
     ctx.q.log(st["key"], f"blocked at {st['stage']}: {reason}")
@@ -709,6 +846,7 @@ def fail(ctx, st, rc, problems):
     probe(ctx)  # raises Infra: the ticket stays at this stage, the attempt is not counted
     text = "\n".join("- " + p for p in problems)
     ctx.q.log(st["key"], f"{st['stage']} attempt {st['attempt'] + 1} failed", text)
+    record(st, "failed", problems)
     if st["attempt"] < ctx.retries:
         st.update(attempt=st["attempt"] + 1, feedback=text)
         ctx.q.save(st)
@@ -718,6 +856,10 @@ def fail(ctx, st, rc, problems):
 
 def process(ctx, st):
     key = st["key"]
+    # running (and so not answerable) before the clone, which can take minutes;
+    # the vault is kept for the run viewer, which may have started with another
+    st.update(status="running", vault=ctx.vault)
+    ctx.q.save(st)
     if not st.get("base_sha") or not os.path.isdir(os.path.join(ctx.q.dir(key), "repo")):
         if st["stage"] != "plan":
             return block(ctx, st, "its clone is missing; harness queue retry starts it again from the plan")
@@ -728,8 +870,6 @@ def process(ctx, st):
         ctx.q.log(key, f"cloned {st['project']} at {st['base']} ({st['base_sha'][:12]}) on branch {key}")
     subprocess.run([BASH, ctx.harness, "queue", "_pull", key], stdin=subprocess.DEVNULL,
                    capture_output=True, timeout=300, check=False)
-    st["status"] = "running"
-    ctx.q.save(st)
     while st["status"] == "running":
         ctx.q.log(key, f"{st['stage']} (attempt {st['attempt'] + 1}, {ctx.model})")
         STAGES[st["stage"]](ctx, st)
@@ -748,14 +888,18 @@ def cmd_run(q, a):
         print("[queue] no model: set QUEUE_MODEL or DEFAULT_MODEL_NAME", file=sys.stderr)
         return 1
     ctx.verify_model = (a.verify_model or ctx.model).split("/", 1)[-1]
-    done = set()
+    done = {}   # KEY: its requeued stamp when this run took it; answered or retried since, it is taken again
+
+    def pending(k):
+        s = q.load(k) or {}
+        return s.get("status") in ("queued", "running") and done.get(k) != s.get("requeued", "")
     try:
         while True:
-            todo = [k for k in q.order() if k not in done and (q.load(k) or {}).get("status") in ("queued", "running")]
+            todo = [k for k in q.order() if pending(k)]
             if not todo:
                 break
             st = q.load(todo[0])
-            done.add(st["key"])
+            done[st["key"]] = st.get("requeued", "")
             try:
                 process(ctx, st)
             except (Infra, KeyboardInterrupt):
@@ -853,10 +997,11 @@ def requeue(q, key, want, stage=None, **extra):
     if st["status"] not in want:
         print(f"[queue] {st['key']} is {st['status']}, not {' or '.join(want)}", file=sys.stderr)
         return None
-    st.update(status="queued", attempt=0, feedback="", reason="", **extra)
+    st.update(status="queued", attempt=0, feedback="", reason="", requeued=now_iso(), **extra)
     if stage:
         st["stage"] = stage
     if st["stage"] == "plan":  # planned again: start over from the base, not from earlier commits
+        st.pop("questions", None)
         rmtree(os.path.join(q.dir(st["key"]), "repo"))  # make_clone tries again, and says so
         for f in (plan_copy(q, st["key"]),):
             if os.path.exists(f):
@@ -894,7 +1039,12 @@ def cmd_answer(q, a):
         return 1
     p = note_paths(a.vault, key)
     _, _, questions = check_plan(read(p["plan"]))
-    if a.text:
+    if a.stdin:
+        text = sys.stdin.buffer.read().decode("utf-8", "replace")
+        if not text.strip():
+            print("[queue] no answers given; nothing saved", file=sys.stderr)
+            return 1
+    elif a.text:
         text = a.text
     else:
         tmpl = (f"# Answers for {key}\n\n<!-- Answer under each question; delete nothing else. Save and quit. -->\n\n"
@@ -916,7 +1066,7 @@ def cmd_answer(q, a):
     st = requeue(q, key, allowed, stage="plan", plan_approved=False)
     if st:
         print(f"[queue] {key}: answers saved to {p['answers']}; the plan is made again on the next run")
-    return 0
+    return 0 if st else 1
 
 
 def cmd_findings(q, a):
@@ -941,6 +1091,7 @@ def main(argv):
     s = sub.add_parser("approve"); s.add_argument("key")
     s = sub.add_parser("retry"); s.add_argument("key")
     s = sub.add_parser("answer"); s.add_argument("key"); s.add_argument("--vault", required=True); s.add_argument("--text")
+    s.add_argument("--stdin", action="store_true")
     s = sub.add_parser("findings"); s.add_argument("--vault", required=True)
     s = sub.add_parser("run")
     s.add_argument("--vault", required=True)

@@ -39,4 +39,4 @@ The steps, naming the real files and functions you read.
 Rules:
 - Only read from the tracker's copy above; never contact the issue tracker or change anything there.
 - If you notice a bug or problem in the code that is NOT part of this ticket, do not fix it: append one bullet to {{FINDINGS_FILE}} (create it if missing): "- path:line: what is wrong and why it matters (seen while planning {{KEY}})".
-- When the plan file is written, finish.
+- When the plan file is written, finish. If you cannot write it, give the whole plan, from "# {{KEY}} plan" on, as your final message instead.
