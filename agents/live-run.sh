@@ -35,6 +35,16 @@ pw=$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')
 serve_log=$(mktemp)
 OPENCODE_SERVER_PASSWORD="$pw" opencode serve --hostname 127.0.0.1 --port 0 >"$serve_log" 2>&1 &
 serve_pid=$!
+run_pid="" sid="" marker="" inbox=""
+# Killed (the queue's stage timeout, Ctrl-C, docker stop): take serve and run
+# down too, and drop the marker so the run stops showing as live at once.
+stop() {
+    kill ${run_pid:+"$run_pid"} "$serve_pid" 2>/dev/null
+    [[ -n "$marker" ]] && rm -f "$marker"
+    rm -f "$serve_log"
+    exit "$1"
+}
+trap 'stop 143' TERM; trap 'stop 130' INT; trap 'stop 129' HUP
 url=""
 for _ in $(seq 1 100); do
     url=$(grep -o 'http://127\.0\.0\.1:[0-9]*' "$serve_log" 2>/dev/null | head -1)
@@ -52,7 +62,6 @@ fi
 OPENCODE_SERVER_PASSWORD="$pw" opencode run --attach "$url" --format json "$@" >"$events" &
 run_pid=$!
 
-sid="" marker="" inbox=""
 deliver() {
     local f code
     for f in "$inbox"/*.json; do

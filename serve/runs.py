@@ -334,6 +334,7 @@ class Runs:
                     body["model"] = {"providerID": m["providerID"], "modelID": m["modelID"]}
                 break
         inbox = os.path.join(src.live_dir, sid + ".inbox")
+        sender = re.sub(r"[^A-Za-z0-9_.]", "_", sender)[:32] or "local"
         name = f"{int(time.time() * 1000)}-{sender}-{secrets.token_hex(3)}"
         tmp = os.path.join(inbox, name + ".tmp")
         try:

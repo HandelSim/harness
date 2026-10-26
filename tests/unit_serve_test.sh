@@ -245,6 +245,18 @@ for mode in fail off; do
     grep -q '^run --format json --agent yolo say hi$' "$LR/$mode.log" \
         || fail "S7 ($mode): should fall back to a plain run: $(cat "$LR/$mode.log")"
 done
-ok "S7: live-run.sh attaches run to its own serve, relays the inbox, falls back to a plain run"
+# Killed mid-run (a stage timeout): serve and run go too, and the marker.
+live_run term STUB_RUN_SECS=30
+for _ in $(seq 1 50); do [[ -f "$LR/term/harness/live/ses_stub1.json" ]] && break; sleep 0.1; done
+[[ -f "$LR/term/harness/live/ses_stub1.json" ]] || fail "S7 (term): no live marker"
+kill -TERM "$lr_pid"
+rc=0; wait "$lr_pid" || rc=$?
+[[ "$rc" == 143 ]] || fail "S7 (term): want 143 after SIGTERM, got $rc"
+[[ ! -e "$LR/term/harness/live/ses_stub1.json" ]] || fail "S7 (term): the marker should go with the wrapper"
+spid=$(awk '$1=="serve-pid"{print $2}' "$LR/term.log")
+sleep 0.3
+! kill -0 "$spid" 2>/dev/null || fail "S7 (term): opencode serve outlived a killed wrapper"
+! pgrep -f "$LR/bin/opencode run" >/dev/null || fail "S7 (term): opencode run outlived a killed wrapper"
+ok "S7: live-run.sh attaches run to its own serve, relays the inbox, falls back to a plain run, cleans up when killed"
 
 echo "SERVE TEST PASSED"
