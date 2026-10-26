@@ -142,8 +142,11 @@ for how in host serve; do
 done
 # The only Authorization header in the CLI is the one _curl_auth_config
 # writes; any other (curl -H, a wget header, a continuation line) would put
-# the key on a command line.
-hits=$(grep -nE 'Authorization: (Bearer|Basic)' "$HARNESS" | grep -vE '^[0-9]+:[[:space:]]*#')
+# the key on a command line. Also allowed: the tracker token written by the
+# printf builtin into its mode-600 file (no process argv), and help text
+# showing the header with a <placeholder>.
+hits=$(grep -nE 'Authorization: (Bearer|Basic)' "$HARNESS" | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE 'Authorization: (Bearer|Basic) <|> "\$hdr\.tmp"')
 [[ "$hits" == *'printf '\''header = "Authorization: Bearer %s"'* && $(wc -l <<<"$hits") -eq 1 ]] \
     || fail "S5: an Authorization header outside _curl_auth_config; pipe _curl_auth_config to curl -K - instead:
 $hits"
