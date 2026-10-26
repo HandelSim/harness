@@ -2790,6 +2790,10 @@ commands:
   ingest [<dir>]        turn the active vault's sessions and sources, and a
                         codebase <dir>, into linked wiki pages, only what is
                         new or changed (see 'harness ingest --help')
+  queue [add|run|...]   work tickets one at a time with no one at the
+                        keyboard: plan (with questions), implement, review,
+                        fix, push a branch; AI-checked at each stage (see
+                        'harness queue --help')
   ticket [KEY|off|pull|login]
                         the ticket this folder works on: every launch pulls
                         it from the tracker into the vault and gives the agent
@@ -6391,6 +6395,178 @@ HELP
     # A proxy this command started goes down with it.
     (( started )) && host_proxy_stop
     return "$rc"
+}
+
+# `harness queue`: a list of tickets worked one at a time with no one at the
+# keyboard (scripts/ticket_queue.py): plan, implement, review, one fix, push.
+# Each stage is a headless `harness -p --yolo --ticket KEY` launch in the
+# ticket's own clone under state/queue/KEY/repo; harness checks each stage and
+# an AI verifier (a plain request through the host proxy) must quote its
+# evidence. The tracker is only read, by the usual ticket pull.
+cmd_queue() {
+    local sub="${1:-list}"
+    (( $# )) && shift
+    local qdir="$state_root/queue" py script vault=""
+    script="$clone_dir/scripts/ticket_queue.py"
+    [[ -n "$(vault_active_name)" ]] && vault="$state_root/vaults/$(vault_active_name)"
+    case "$sub" in
+        -h|--help|help)
+            cat <<'HELP'
+usage: harness queue [list]                 the queue: each ticket's status and stage
+       harness queue add KEY... [--dir PROJECT] [--base REF]
+                                            queue tickets for the git project here
+                                            (or PROJECT), branching from REF (default:
+                                            the project's current branch)
+       harness queue run [--host] [--single-message]
+                                            work through the queue, one ticket at a time
+       harness queue answer KEY ["TEXT"]    answer the plan's questions (opens $EDITOR
+                                            without TEXT); the plan is made again
+       harness queue approve KEY            go on with a plan held for reading
+       harness queue retry KEY              queue a blocked ticket again at its stage
+       harness queue watch                  follow the run as it goes (Ctrl-C stops
+                                            watching, not the run)
+       harness queue log [KEY]              the ticket's log (or the whole run's)
+       harness queue findings               bugs the agents saw outside their tickets
+       harness queue remove KEY...          drop tickets and their clones
+
+Each ticket goes through these stages, each one a fresh headless agent launch
+(the firewalled container; host mode with --host or without docker) in its own
+clone of the project, state/queue/KEY/repo, on branch ticket/KEY:
+
+  plan       reads the ticket and the code; writes wiki/notes/tickets/KEY-plan.md
+             in the vault: goal, acceptance criteria, approach, files, at most 3
+             questions each with a default, assumptions. A [blocking] question
+             holds the ticket (needs-answers) and the queue moves on.
+  implement  changes the code and commits on ticket/KEY.
+  review     a fresh session checks the change from several angles (criteria,
+             correctness, security, scope, simplicity) into KEY-review.md.
+  fix        once, when the review has Must fix items.
+  push       harness (not the agent) pushes ticket/KEY to QUEUE_REMOTE, no force.
+
+After each stage harness checks the result (the plan's sections; commits, a
+non-empty diff, no .github/ change, no secret) and a verifier model must quote
+the ticket for each acceptance criterion and the diff for each one met; harness
+checks the quotes are really there. A failed stage runs once more with the
+problems listed, then the ticket is blocked. If the upstream stops answering,
+the run stops and the ticket keeps its place. Bugs an agent notices outside its
+ticket go to KEY-findings.md. Nothing is written to the tracker. There is no
+test stage yet: read each branch before you merge it.
+
+Settings (.env): QUEUE_MODEL (default: the default model, its free twin when it
+is a -withtools one), QUEUE_VERIFY_MODEL (default: QUEUE_MODEL), QUEUE_RETRIES
+(1), QUEUE_REMOTE (origin), QUEUE_PUSH (1; 0 keeps the branch in the project),
+QUEUE_PLAN_REVIEW (0; 1 holds every plan for 'harness queue approve').
+HELP
+            return 0 ;;
+        watch)
+            mkdir -p "$qdir" && touch "$qdir/run.log"
+            tail -n 20 -F "$qdir/run.log"
+            return ;;
+        log)
+            local f="$qdir/run.log" key
+            if [[ -n "${1:-}" ]]; then
+                key=$(_ticket_key "$1") || { err "not a ticket key: $1"; return 1; }
+                f="$qdir/$key/log.md"
+            fi
+            [[ -f "$f" ]] || { echo "no log yet"; return 0; }
+            cat "$f"
+            return ;;
+        _sync)
+            # ticket_queue.py, after each stage: capture the stage's session
+            # (host or container database) into the vault and commit it.
+            local key="$1" repo="$2" since="$3" db
+            [[ -n "$vault" && -d "$vault/.git" ]] || return 0
+            harness_vault_dir="$vault" harness_ticket="$key"
+            for db in "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}" \
+                      "$(agent_home_dir)/.local/share/opencode/opencode.db"; do
+                [[ -f "$db" ]] || continue
+                if [[ "$db" == "$(agent_home_dir)"/* ]]; then
+                    vault_sync "$vault" "$since" "$db" "$repo" "$(agent_home_dir)"
+                else
+                    vault_sync "$vault" "$since" "$db" "$repo" "$HOME"
+                fi
+            done
+            return 0 ;;
+        _pull)
+            # ticket_queue.py, before a ticket: its copy in the vault, fresh.
+            local k
+            k=$(_ticket_key "${1:-}") || return 0
+            [[ -n "$vault" && -d "$vault" ]] || return 0
+            ticket_pull "$vault" "$k"
+            return 0 ;;
+    esac
+    host_require_python3 || exit 1
+    py=$(host_python_bin) || { err "harness queue needs python 3"; return 1; }
+    local -a args=(--state "$qdir")
+    case "$sub" in
+        list|ls) args+=(list) ;;
+        add)
+            local dir="" base="" a
+            local -a keys=()
+            while (( $# )); do
+                a="$1"; shift
+                case "$a" in
+                    --dir) dir="${1:-}"; shift || true ;;
+                    --base) base="${1:-}"; shift || true ;;
+                    -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
+                    *) keys+=("$a") ;;
+                esac
+            done
+            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF]"; return 1; }
+            args+=(add "${keys[@]}")
+            [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")
+            [[ -n "$base" ]] && args+=(--base "$base") ;;
+        remove|rm) (( $# )) || { err "usage: harness queue remove KEY..."; return 1; }
+            args+=(remove "$@") ;;
+        approve|retry) [[ -n "${1:-}" ]] || { err "usage: harness queue $sub KEY"; return 1; }
+            args+=("$sub" "$1") ;;
+        answer|findings)
+            [[ -n "$vault" ]] || { err "no active vault (see: harness vault)"; return 1; }
+            if [[ "$sub" == answer ]]; then
+                [[ -n "${1:-}" ]] || { err "usage: harness queue answer KEY [\"TEXT\"]"; return 1; }
+                args+=(answer "$1" --vault "$vault")
+                [[ -n "${2:-}" ]] && args+=(--text "$2")
+            else
+                args+=(findings --vault "$vault")
+            fi ;;
+        run)
+            local host=0 single=0 started=0 rc=0 a dir
+            for a in "$@"; do
+                case "$a" in
+                    --host) host=1 ;;
+                    --single-message) single=1 host=1 ;;
+                    *) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
+                esac
+            done
+            [[ -n "$vault" ]] || { err "harness queue run needs an active vault: tickets, plans and findings live there (see: harness vault)"; return 1; }
+            harness_runtime_installed || host=1
+            host_require_config
+            ensure_dirs
+            host_ensure_toolchain || { host_win_location_hint; exit 1; }
+            host_preflight        || { host_win_location_hint; exit 1; }
+            _gate_on_upstream_auth || exit 1
+            # Asked once here; the stage launches below run with it answered.
+            if (( host )); then host_confirm_gate 1 || exit 1; fi
+            host_proxy_running || started=1
+            host_proxy_start || exit 1
+            host_proxy_wait_ready || { host_proxy_stop; exit 1; }
+            dir=$(vault_prepare)
+            [[ -n "$dir" ]] || { err "the active vault is not available"; return 1; }
+            args+=(run --vault "$dir" --proxy "http://127.0.0.1:$(host_proxy_port)/v1"
+                   --harness "$clone_dir/harness" --model "${QUEUE_MODEL:-}"
+                   --default-model "$(_effective_default_model)" --verify-model "${QUEUE_VERIFY_MODEL:-}"
+                   --retries "${QUEUE_RETRIES:-1}" --push "${QUEUE_PUSH:-1}"
+                   --remote "${QUEUE_REMOTE:-origin}" --plan-review "${QUEUE_PLAN_REVIEW:-0}")
+            (( host )) && args+=(--host)
+            (( single )) && args+=(--single-message)
+            # shellcheck disable=SC2086  # $py can be 'py -3'
+            $py "$script" "${args[@]}" || rc=$?
+            (( started )) && host_proxy_stop
+            return "$rc" ;;
+        *) err "unknown queue command '$sub' (see: harness queue --help)"; return 1 ;;
+    esac
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    $py "$script" "${args[@]}"
 }
 
 cmd_vault() {
@@ -11175,6 +11351,7 @@ main() {
         mcp)                        cmd_mcp "$@" ;;
         vault)                      cmd_vault "$@" ;;
         ingest)                     cmd_ingest "$@" ;;
+        queue)                      cmd_queue "$@" ;;
         ticket)                     cmd_ticket "$@" ;;
         context)                    cmd_context "$@" ;;
         serve)                      cmd_serve "$@" ;;
