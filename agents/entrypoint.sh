@@ -354,7 +354,11 @@ run_opencode() {
         # `|| rc=$?` keeps set -e from aborting on a non-zero opencode exit and
         # preserves the code so the tests' provider-auth skip path still works.
         rc=0
-        opencode run --format json "${args[@]}" "${op_args[@]}" >"${events_file}" || rc=$?
+        # harness-live-run (agents/live-run.sh) is `opencode run --format json`
+        # attached to its own loopback `opencode serve`, so messages sent from
+        # the pub page's run viewer reach the session while it works; it falls
+        # back to a plain run when serve does not come up or HARNESS_LIVE=0.
+        harness-live-run "${events_file}" "${args[@]}" "${op_args[@]}" || rc=$?
         # Learn the session id. Prefer the json event stream — it names *this*
         # run's session — but opencode 1.15.x intermittently writes an empty
         # stream to a non-TTY stdout (the same finalize-before-idle race that

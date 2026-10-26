@@ -164,6 +164,12 @@ ENV PATH="/home/harness/.local/bin:${PATH}"
 COPY agents/entrypoint.sh /usr/local/bin/agent-entrypoint.sh
 RUN chmod +x /usr/local/bin/agent-entrypoint.sh
 
+# Headless -p runs through this: `opencode run` attached to its own loopback
+# `opencode serve`, so the pub page's run viewer can send the running session
+# a message (see agents/live-run.sh and architecture/containers.md).
+COPY agents/live-run.sh /usr/local/bin/harness-live-run
+RUN chmod +x /usr/local/bin/harness-live-run
+
 # Clipboard bridge (container side). opencode's TUI copies by shelling out to
 # xclip/xsel/wl-copy, none of which work in this image (no display). This shim
 # stands in for them and forwards the copied text to the host-shared bridge

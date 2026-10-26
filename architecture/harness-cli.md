@@ -980,7 +980,9 @@ What it does, in order:
    only when an `OAI_*` key is set.
 8. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
    (provider env, `--agent yolo`, and the headless `-p` json-events +
-   `opencode export` dance that dodges opencode 1.15.x's render race).
+   `opencode export` dance that dodges opencode 1.15.x's render race). The
+   `-p` run goes through `agents/live-run.sh` from the clone, as in the
+   container, so the serve run viewer can message it (see "Run viewer").
    Interactive runs opencode as a **child** (not `exec`) so the proxy is torn
    down on exit; print mode leaves the proxy up so a scripted `-p` loop doesn't
    thrash it (`harness host down` stops it) — the same interactive-vs-print
@@ -1158,6 +1160,46 @@ sessions. `GET /_auth` answers 200 with
 front of opencode (`serve/deploy/`). Codes gate the pub page only; opencode
 itself still needs its Basic password, which the reverse proxy injects.
 
+**Run viewer (`/runs`).** `serve/runs.py`, mounted by pub.py, shows what
+every agent did or is doing, from opencode's own session store, read-only
+(`file:...?mode=ro`). `cmd_serve` passes `--agent-data container=<agent
+home>/.local/share` and `--agent-data host=${XDG_DATA_HOME:-~/.local/share}`
+(each `LABEL=DIR` holding `opencode/opencode.db` and `harness/live/`; a
+dir with no DB shows nothing, and with no `--agent-data` the viewer is off) and `--queue-dir
+state/queue`. Routes:
+
+- `/runs` (`?q=` filter): live runs, queue tickets with their sessions by
+  stage, then every session newest first. The index shows the live ones in
+  an "Agent runs" panel.
+- `/runs/<sid>`: the transcript (text, thinking, each tool call with input,
+  output, status and timing, subtasks, retries, errors), crumbs to the parent
+  session, a side panel (agent, model, tokens, cost, directory, ticket,
+  subagents) and, for a live run, a message box. A nonce script polls
+  `/runs/<sid>/tail?from=N` (2.5 s, 15 s once idle) and appends new or changed
+  messages in place.
+- `/runs/<sid>/part/<pid>` (one tool call in full, past the 20,000-character
+  inline cap), `/runs/<sid>.json` (the session as JSON), `/runs/ticket/<KEY>`
+  (its sessions by stage, `log.md` and stage `.out` files from `state/queue/KEY`).
+- `POST /runs/<sid>/send`: puts a message in the run's inbox.
+
+A run is live when `agents/live-run.sh` (every `-p` run: container via
+`harness-live-run`, host via the clone's copy) is driving it.
+A plain `opencode run` keeps its server in-process, so the script starts
+`opencode serve` on 127.0.0.1 (port 0, random password), attaches `run
+--attach` to it, writes `harness/live/<sid>.json` (touched each second) and
+relays each `harness/live/<sid>.inbox/*.json` to the server's
+`/session/<sid>/prompt_async`, which joins the busy session at its next step
+(renamed `.sent`, `.failed-<code>`, or `.late` once the run ended).
+`HARNESS_LIVE=0` (passed into the container by `agent_common_env`), or a
+serve that does not come up, runs plain `opencode run`. `send` takes the agent
+and model from the session's last user message and is refused (409) when the
+run is not live (marker older than 10 s), the text is empty or over 64 kB;
+with access codes it also needs a session user (401), and like every POST a
+same-host Origin. Interactive TUI sessions are shown but cannot be messaged.
+Anyone who can read the page sees full tool output, and anyone who can write
+the agent home can drop inbox files; the serve password lives only in the
+run's environment.
+
 `pub.py` guards: the `Host` header must be `127.0.0.1|localhost|[::1]:N` or
 a `--allow-host` value (421 otherwise), against DNS rebinding. Every `/pub/`
 response carries `Content-Security-Policy: sandbox allow-scripts
@@ -1180,7 +1222,10 @@ trap also reaps the jq sidecar, since it replaces main's) and leaves the
 proxy up; `wait -n` exits 1 if either child dies. Logs:
 `state/serve/{pub,opencode}.log`. `tests/unit_serve_test.sh` runs
 `serve/test_pub.py` (index, Host check, sandbox header, path escape, access
-codes, `/_auth`, usage, git log, proxy status), plus option errors, the
+codes, `/_auth`, usage, git log, proxy status) and `serve/test_runs.py`
+(the run viewer over a fixture opencode DB: list, transcript, escaping, tail,
+ticket page, send and its refusals), a stub-opencode check of `live-run.sh`
+(attach, inbox relay, exit code, fallbacks), plus option errors, the
 password file, the mode aliases (alone and in the merged overlay), the key
 scrub (the OAI provider keeps its slim header in host and serve) and a
 guard that the only `Authorization` header in the CLI is

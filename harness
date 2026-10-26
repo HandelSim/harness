@@ -6859,11 +6859,14 @@ host_run_opencode() {
 
         local events_file rc sid text
         events_file="$(mktemp)"
-        local -a runcmd=(opencode run --format json)
+        # agents/live-run.sh is `opencode run --format json` attached to its own
+        # loopback `opencode serve`, so the pub page's run viewer can message the
+        # session while it works (plain run if serve fails or HARNESS_LIVE=0).
+        local -a runcmd=(bash "$clone_dir/agents/live-run.sh" "${events_file}")
         (( ${#args[@]} )) && runcmd+=("${args[@]}")
         (( ${#op_args[@]} )) && runcmd+=("${op_args[@]}")
         rc=0
-        "${runcmd[@]}" >"${events_file}" || rc=$?
+        "${runcmd[@]}" || rc=$?
         sid="$(harness_jq -rs 'map(select(.sessionID))[0].sessionID // empty' "${events_file}" 2>/dev/null || true)"
         if [[ -z "${sid}" ]]; then
             sid="$(opencode session list --format json 2>/dev/null \
@@ -7137,6 +7140,12 @@ Serves, on 127.0.0.1 only:
                           links to the services below (default N = 8780)
   http://127.0.0.1:N+1/   opencode web, logged in from the pub page's link
                           (password in state/serve/opencode-password)
+  http://127.0.0.1:N/runs every agent session (container, host, opencode
+                          web, queue stages by ticket): transcripts with
+                          each tool call's input and output, subagents
+                          nested, followed live; a headless run (harness -p,
+                          harness queue) still working takes a message there
+                          (HARNESS_LIVE=0 at launch turns that off)
 It starts the host-mode proxy if needed (same as 'harness host') and runs in
 the foreground; Ctrl-C stops both servers and leaves the proxy up ('harness
 host down' stops it). With no vault active the pub page still comes up, with
@@ -7217,8 +7226,13 @@ HELP
     # The proxy is up with its own copy of the key; neither server needs it.
     unset "${_harness_secret_vars[@]}"
 
+    # The run viewer (/runs) reads both opencode databases, the container
+    # agents' shared home and this host's, and the queue's tickets.
     local pub_args=(--proxy-url "http://127.0.0.1:$(host_proxy_port)"
-        --usage-ledger "$(host_usage_ledger)")
+        --usage-ledger "$(host_usage_ledger)"
+        --agent-data "container=$(agent_home_dir)/.local/share"
+        --agent-data "host=${XDG_DATA_HOME:-$HOME/.local/share}"
+        --queue-dir "$state_root/queue")
     # Gated as long as the file exists, even with no codes left in it (then
     # nobody can sign in): deleting the file is the one way to open the page.
     if [[ -e "$(serve_codes_file)" ]]; then
@@ -7628,6 +7642,9 @@ agent_common_env() {
     printf -- '-e\nHOST_UID=%s\n' "$(id -u)"
     printf -- '-e\nHOST_GID=%s\n' "$(id -g)"
     printf -- '-e\nHARNESS_YOLO=%s\n' "$yolo"
+    # HARNESS_LIVE=0 runs headless -p without the run viewer's message inbox
+    # (agents/live-run.sh).
+    printf -- '-e\nHARNESS_LIVE=%s\n' "${HARNESS_LIVE:-1}"
     printf -- '-e\nDEFAULT_MODEL_NAME=%s\n' "$agent_model"
     # opencode talks directly to the translating proxy over its OpenAI-
     # compatible interface; the entrypoint builds the provider baseURL

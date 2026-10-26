@@ -41,8 +41,15 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import runs as runs_view  # noqa: E402
+
 PUB_CSP = "sandbox allow-scripts allow-popups"
 INDEX_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
+# The run viewer's pages run one inline script each (polling), allowed by nonce.
+RUNS_CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; connect-src 'self'; "
+            "form-action 'self'; frame-ancestors 'none'")
+MAX_SEND_FORM = 3 * runs_view.MAX_MESSAGE + 1024   # urlencoded, so up to 3 bytes a byte
 TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -496,7 +503,7 @@ def vault_log(vault):
 class Config:
     def __init__(self, port, vault, vault_name, opencode_port, password_file, allow_hosts,
                  access_codes="", secure_cookie=False, opencode_url="", proxy_url="",
-                 modes=(), usage_ledger="", trust_forwarded_for=False):
+                 modes=(), usage_ledger="", trust_forwarded_for=False, agent_data=(), queue_dir=""):
         self.port = port
         self.vault = vault
         self.vault_name = vault_name
@@ -517,6 +524,7 @@ class Config:
         self.usage_ledger = usage_ledger
         self.trust_forwarded_for = trust_forwarded_for
         self.cache = TTLCache()
+        self.runs = runs_view.Runs(agent_data, queue_dir) if agent_data else None
 
     def opencode_password(self):
         if not self.password_file:
@@ -652,7 +660,7 @@ esc = html.escape
 def _head(title):
     return ["<!doctype html><html lang='en'><head><meta charset='utf-8'>",
             "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-            f"<title>{esc(title)}</title><style>", STYLE, "</style></head><body><main>"]
+            f"<title>{esc(title)}</title><style>", STYLE, runs_view.STYLE, "</style></head><body><main>"]
 
 
 def _n(v):
@@ -805,7 +813,8 @@ def render_index(cfg, request_host, user=None, query=""):
     parts.append("</header>")
     launch, modes = _services(cfg, host)
     parts += launch
-    main = (_pages(cfg, query) if cfg.vault else []) + _usage(cfg)
+    main = (runs_view.live_summary(cfg.runs) if cfg.runs else []) + \
+        (_pages(cfg, query) if cfg.vault else []) + _usage(cfg)
     side = modes + (_activity(cfg) if cfg.vault else [])
     if main and side:
         parts += ["<div class='cols'><div class='stack'>"] + main + ["</div><div class='stack'>"] + side + ["</div></div>"]
@@ -845,6 +854,94 @@ def make_handler(cfg):
                     "Referrer-Policy": "same-origin"}
             hdrs.update(extra or {})
             self.send(code, body, "text/html; charset=utf-8", hdrs, head)
+
+        def send_runs(self, code, title, parts, script="", head=False):
+            nonce = secrets.token_urlsafe(16)
+            body = _head(title) + parts
+            if script:
+                body.append(f"<script nonce='{nonce}'>{script}</script>")
+            body.append("</main></body></html>")
+            self.send(code, "".join(body).encode(), "text/html; charset=utf-8",
+                      {"Cache-Control": "no-store", "Content-Security-Policy": RUNS_CSP.format(nonce=nonce),
+                       "Referrer-Policy": "same-origin"}, head)
+
+        def runs_get(self, path, query, head):
+            r = cfg.runs
+            if r is None:
+                self.send(404, b"the run viewer is off (no --agent-data)\n", head=head)
+                return
+            rest = path[len("/runs"):].strip("/")
+            q = parse_qs(query)
+            text = {"Cache-Control": "no-store", "Content-Security-Policy": PUB_CSP}
+            if not rest:
+                filt = (q.get("q") or [""])[0].strip()[:200]
+                self.send_runs(200, "harness: runs", runs_view.render_list(r, filt),
+                               "" if filt else runs_view.LIST_JS, head)
+                return
+            bits = rest.split("/")
+            if bits[0] == "ticket" and len(bits) in (2, 3):
+                if len(bits) == 2:
+                    got = runs_view.render_ticket(r, bits[1])
+                    if got:
+                        self.send_runs(200, f"harness: {got[0]}", got[1], head=head)
+                        return
+                else:
+                    data = runs_view.ticket_file(r, bits[1], bits[2])
+                    if data is not None:
+                        self.send(200, data, extra=text, head=head)
+                        return
+                self.send(404, b"not found\n", head=head)
+                return
+            sid = bits[0]
+            if len(bits) == 1 and sid.endswith(".json"):
+                got = runs_view.export(r, sid[:-5])
+                if got is not None:
+                    self.send(200, json.dumps(got, ensure_ascii=False, default=str).encode(),
+                              "application/json; charset=utf-8", text, head)
+                    return
+            elif len(bits) == 1:
+                got = runs_view.render_detail(r, sid, "")
+                if got:
+                    self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head)
+                    return
+            elif bits[1:] == ["tail"]:
+                try:
+                    start = int((q.get("from") or ["0"])[0])
+                except ValueError:
+                    start = 0
+                got = runs_view.tail(r, sid, start)
+                if got is not None:
+                    self.send(200, json.dumps(got).encode(), "application/json; charset=utf-8",
+                              {"Cache-Control": "no-store"}, head)
+                    return
+            elif len(bits) == 3 and bits[1] == "part":
+                got = runs_view.part_text(r, sid, bits[2])
+                if got is not None:
+                    self.send(200, got.encode(), extra=text, head=head)
+                    return
+            self.send(404, b"not found\n", head=head)
+
+        def runs_send(self, path, user):
+            bits = path[len("/runs/"):].split("/")
+            if cfg.runs is None or len(bits) != 2 or bits[1] != "send":
+                self.send(404, b"not found\n")
+                return
+            try:
+                form = self.read_form(MAX_SEND_FORM)
+            except ValueError:
+                form = None
+            if form is None:
+                self.send(413, b"message too large\n")
+                return
+            text = (form.get("text") or [""])[0]
+            ok, msg = cfg.runs.send(bits[0], text.replace("\r\n", "\n"), user or "local")
+            sys.stderr.write(f"[pub] message to {bits[0]} from {user or 'local'}: {msg}\n")
+            if not ok:
+                self.send_runs(409, "harness: not sent", [
+                    f"<section class='panel'><h2>Not sent</h2><p class='err'>{esc(msg)}</p>"
+                    f"<a href='/runs/{quote(bits[0])}'>Back to the run</a></section>"])
+                return
+            self.redirect(f"/runs/{quote(bits[0])}#end")
 
         def redirect(self, location, head=False, cookies=()):
             self.send(303, b"", extra={"Location": location, "Cache-Control": "no-store"},
@@ -921,6 +1018,9 @@ def make_handler(cfg):
                 self.send_page(200, render_index(cfg, self.headers.get("Host", "").lower(), user, query),
                                head=head)
                 return
+            if path == "/runs" or path.startswith("/runs/"):
+                self.runs_get(path, url.query, head)
+                return
             if path.startswith("/pub/"):
                 target = resolve_pub(cfg.pub_dir, path)
                 if not target:
@@ -936,13 +1036,13 @@ def make_handler(cfg):
                 return
             self.send(404, b"not found\n", head=head)
 
-        def read_form(self):
+        def read_form(self, limit=MAX_FORM):
             """The urlencoded body as a dict, or None if it is too large."""
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 return None
-            if n < 0 or n > MAX_FORM:
+            if n < 0 or n > limit:
                 return None
             raw = self.rfile.read(n) if n else b""
             return parse_qs(raw.decode("utf-8", "replace"), max_num_fields=20)
@@ -954,6 +1054,13 @@ def make_handler(cfg):
                 self.send(403, b"cross-origin request refused\n")
                 return
             path = urlsplit(self.path).path
+            if path.startswith("/runs/"):
+                _, user = self.session()
+                if cfg.codes and not user:
+                    self.send(401, b"not signed in\n")
+                    return
+                self.runs_send(path, user)
+                return
             if not cfg.codes or path not in ("/login", "/logout"):
                 self.send(404, b"not found\n")
                 return
@@ -1015,6 +1122,13 @@ def _mode(value):
     return name.strip(), desc.strip()
 
 
+def _labelled(value):
+    label, sep, path = value.partition("=")
+    if not sep or not label.strip() or not path.strip():
+        raise argparse.ArgumentTypeError(f"--agent-data wants LABEL=DIR, got {value!r}")
+    return label.strip(), path.strip()
+
+
 def codes_main(argv):
     """add-code / remove-code: manage the access codes file."""
     cmd = argv[0]
@@ -1065,11 +1179,17 @@ def main(argv=None):
                     help="a prompt mode / model alias to list (repeatable)")
     ap.add_argument("--usage-ledger", default="", metavar="FILE",
                     help="the proxy's usage JSONL; the index shows last-24 h totals")
+    ap.add_argument("--agent-data", type=_labelled, action="append", default=[], metavar="LABEL=DIR",
+                    help="a data dir holding opencode/opencode.db and harness/live (repeatable); "
+                         "turns on the run viewer at /runs")
+    ap.add_argument("--queue-dir", default="", metavar="DIR",
+                    help="harness queue's state/queue, to group its stage sessions by ticket")
     a = ap.parse_args(argv)
     cfg = Config(a.port, a.vault, a.vault_name, a.opencode_port, a.password_file, a.allow_host,
                  access_codes=a.access_codes, secure_cookie=a.secure_cookie,
                  opencode_url=a.opencode_url, proxy_url=a.proxy_url, modes=a.mode,
-                 usage_ledger=a.usage_ledger, trust_forwarded_for=a.trust_forwarded_for)
+                 usage_ledger=a.usage_ledger, trust_forwarded_for=a.trust_forwarded_for,
+                 agent_data=a.agent_data, queue_dir=a.queue_dir)
     if cfg.codes:
         n = len(cfg.codes.entries())
         if not n:

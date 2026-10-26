@@ -244,6 +244,12 @@ render race. Without this, an empty stream means no id â†’ `export` never runs â
 empty `-p` output (the `full_pipeline_test` T10 failure on the first full CI run
 of opencode 1.15.7).
 
+The json run itself goes through `harness-live-run` (`agents/live-run.sh`),
+which attaches it to a loopback `opencode serve` so the serve run viewer can
+message it while it works, via `~/.local/share/harness/live/` in the agent
+home (see "Run viewer" in [`harness-cli.md`](harness-cli.md));
+`HARNESS_LIVE=0` runs it plain.
+
 The run's exit code is preserved so the tests' provider-auth skip path keeps
 working. This trades live streaming (irrelevant for single-shot `-p`) for a
 deterministic final answer. The opencode-version coupling and the bump checklist

@@ -8,6 +8,8 @@
 #   - serve_opencode_config the prompt-mode model aliases
 #   - the upstream key off curl's argv and out of opencode's env
 #   - cmd_serve           reaches its banner with no OAI configured
+#   - serve/test_runs.py  the run viewer (/runs)
+#   - agents/live-run.sh  headless runs that take messages (stub opencode)
 #
 # Prints "SERVE TEST PASSED" on success.
 
@@ -29,6 +31,8 @@ PY=$(command -v python3 || command -v python) || fail "this test needs Python 3"
 # --- S1: the pub server ------------------------------------------------------
 ( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_pub ) || fail "S1: serve/test_pub.py failed"
 ok "S1: pub server tests"
+( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_runs ) || fail "S1: serve/test_runs.py failed"
+ok "S1: run viewer tests (/runs)"
 
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
@@ -180,5 +184,67 @@ grep -q 'pub page:     http://127.0.0.1:18780/' "$TMP_ROOT/serve_out" \
     || fail "S6: serve exited before printing its URLs:
 $(cat "$TMP_ROOT/serve_out")"
 ok "S6: serve prints its URLs with no OAI configured"
+
+# --- S7: agents/live-run.sh: a headless run that takes messages --------------
+# A stub opencode on PATH: `serve` listens on a loopback port and logs each
+# request; `run` logs its argv, names a session in its event stream, waits,
+# and exits 7.
+LR="$TMP_ROOT/live"
+mkdir -p "$LR/bin"
+cat >"$LR/bin/opencode" <<EOF
+#!$PY
+import http.server, json, os, sys, time
+log = os.environ["STUB_LOG"]
+def note(*a):
+    with open(log, "a") as f:
+        f.write(" ".join(a) + "\n")
+if sys.argv[1] == "serve":
+    if os.environ.get("STUB_SERVE_FAIL"):
+        sys.exit(1)
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            note("POST", self.path, self.headers.get("Authorization", "none"), body.decode())
+            self.send_response(204); self.end_headers()
+        def log_message(self, *a): pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    note("serve-pid", str(os.getpid()))
+    print("opencode server listening on http://127.0.0.1:%d" % srv.server_address[1], flush=True)
+    srv.serve_forever()
+note("run", *sys.argv[2:])
+print(json.dumps({"type": "step_start", "sessionID": "ses_stub1"}), flush=True)
+time.sleep(float(os.environ.get("STUB_RUN_SECS", "3")))
+sys.exit(7)
+EOF
+chmod +x "$LR/bin/opencode"
+live_run() {  # live_run NAME [env...]: runs live-run.sh in the background, sets lr_pid
+    env PATH="$LR/bin:$PATH" XDG_DATA_HOME="$LR/$1" STUB_LOG="$LR/$1.log" "${@:2}" \
+        bash "$REPO_ROOT/agents/live-run.sh" "$LR/$1.events" --agent yolo "say hi" &
+    lr_pid=$!
+}
+live_run a
+for _ in $(seq 1 50); do [[ -f "$LR/a/harness/live/ses_stub1.json" ]] && break; sleep 0.1; done
+[[ -f "$LR/a/harness/live/ses_stub1.json" ]] || fail "S7: no live marker for the running session"
+printf '%s' '{"parts":[{"type":"text","text":"more"}]}' >"$LR/a/harness/live/ses_stub1.inbox/1-x-ab.json"
+rc=0; wait "$lr_pid" || rc=$?
+[[ "$rc" == 7 ]] || fail "S7: live-run.sh should exit with run's status (7), got $rc"
+grep -q '^run --attach http://127\.0\.0\.1:[0-9]* --format json --agent yolo say hi$' "$LR/a.log" \
+    || fail "S7: run was not attached to the loopback serve: $(cat "$LR/a.log")"
+grep -q '^POST /session/ses_stub1/prompt_async Basic [A-Za-z0-9+/=]* {"parts":\[{"type":"text","text":"more"}\]}$' "$LR/a.log" \
+    || fail "S7: the inbox message did not reach prompt_async with a login: $(cat "$LR/a.log")"
+[[ -f "$LR/a/harness/live/ses_stub1.inbox/1-x-ab.sent" ]] || fail "S7: a delivered message should be renamed .sent"
+[[ ! -e "$LR/a/harness/live/ses_stub1.json" ]] || fail "S7: the live marker should go when the run ends"
+grep -q '"sessionID": "ses_stub1"' "$LR/a.events" || fail "S7: the event stream should reach EVENTS_FILE"
+spid=$(awk '$1=="serve-pid"{print $2}' "$LR/a.log")
+sleep 0.3
+! kill -0 "$spid" 2>/dev/null || fail "S7: the run's opencode serve outlived it"
+for mode in fail off; do
+    if [[ "$mode" == fail ]]; then live_run "$mode" STUB_SERVE_FAIL=1; else live_run "$mode" HARNESS_LIVE=0; fi
+    rc=0; wait "$lr_pid" || rc=$?
+    [[ "$rc" == 7 ]] || fail "S7 ($mode): want run's status 7, got $rc"
+    grep -q '^run --format json --agent yolo say hi$' "$LR/$mode.log" \
+        || fail "S7 ($mode): should fall back to a plain run: $(cat "$LR/$mode.log")"
+done
+ok "S7: live-run.sh attaches run to its own serve, relays the inbox, falls back to a plain run"
 
 echo "SERVE TEST PASSED"
