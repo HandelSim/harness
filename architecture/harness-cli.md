@@ -663,8 +663,15 @@ as `KEY/verify-*.txt`, and `run.lock` (one run at a time: `flock`, or
 `msvcrt.locking` on Windows). Each agent runs in its own session (its own
 process group on Windows), so Ctrl-C reaches only the queue, which then ends
 the agent's tree (`killpg`, or `taskkill /T` on Windows). `bash` is found on
-`PATH`, since a bare name on Windows can resolve to WSL's `bash.exe`. Covered by
-`tests/unit_queue_test.sh`.
+`PATH`, since a bare name on Windows can resolve to WSL's `bash.exe`. The clone
+is made in place, not in `repo.new` renamed to `repo` (Windows refuses to rename
+a directory while anything, such as a virus scan of the fresh clone, has a file
+in it open), and is complete once `base_sha` is saved. Old clones are removed
+with the read-only bit cleared (git's objects are read-only, which a plain
+`rmtree` cannot delete on Windows) and retried for a few seconds; one that will
+not go blocks the ticket with the reason. On Windows the clone sets
+`core.fsmonitor=false`, so Git for Windows' monitor daemon does not hold it
+open. Covered by `tests/unit_queue_test.sh`.
 
 ### Interactive TTY resolution (Windows) — issue #82
 

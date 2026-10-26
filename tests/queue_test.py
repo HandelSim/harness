@@ -486,6 +486,44 @@ class ReviewFixesTest(Base):
         self.assertEqual(rc, 1)
         self.assertIn("is done", out)
 
+    def test_a_left_over_clone_is_cleared_and_cloned_in_place(self):
+        # What an interrupted older run left: repo and repo.new, with read-only
+        # files as git's objects are. The clone is made in place (Windows will not
+        # rename a directory that something has a file open in).
+        self.add("ABC-1")
+        for d in ("repo", "repo.new"):
+            p = os.path.join(self.state, "ABC-1", d, "objects")
+            os.makedirs(p)
+            put(os.path.join(p, "pack"), "x")
+            os.chmod(os.path.join(p, "pack"), 0o444)
+        rc, out = self.run_queue()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "repo.new")))
+        made = []
+        real = tq.git
+        tq.git = lambda cwd, *a, **k: made.append(cwd) or real(cwd, *a, **k)
+        try:
+            st = self.status()
+            tq.make_clone(tq.Queue(self.state), st)
+        finally:
+            tq.git = real
+        self.assertNotIn(os.path.join(self.state, "ABC-1", "repo.new"), made)
+
+    def test_a_clone_that_cannot_be_removed_blocks_with_the_reason(self):
+        self.add("ABC-1")
+        real = tq.rmtree
+        tq.rmtree = lambda path: f"could not remove {path}: [WinError 5] Access is denied"
+        try:
+            rc, out = self.run_queue()
+        finally:
+            tq.rmtree = real
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "plan"), out)
+        self.assertIn("could not clone", st["reason"])
+        self.assertIn("harness queue retry ABC-1", st["reason"])
+        self.assertNotIn("base_sha", st)
+
     def test_retry_is_not_a_way_round_plan_review(self):
         self.add("ABC-1")
         self.run_queue("--plan-review", "1")

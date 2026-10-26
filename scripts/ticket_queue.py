@@ -209,23 +209,61 @@ def git(cwd, *args, check=True, timeout=300):
     return r
 
 
+def rmtree(path):
+    """Remove a tree; None, or why it is still there. On Windows git's object
+    files are read-only, which a plain rmtree cannot delete (WinError 5), and a
+    file another program has open (a virus scan of a fresh clone) frees up
+    within moments, so clear the bit and try again for a few seconds."""
+    def writable(func, p, exc):
+        if func not in (os.unlink, os.remove, os.rmdir):
+            raise exc if isinstance(exc, BaseException) else exc[1]
+        for x in (os.path.dirname(p), p):
+            os.chmod(x, 0o700)
+        func(p)
+    err = None
+    for i in range(10):
+        if not os.path.lexists(path):
+            return None
+        try:
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(path, onexc=writable)
+            else:
+                shutil.rmtree(path, onerror=writable)
+        except OSError as e:
+            err = e
+            if os.name != "nt":
+                break
+            time.sleep(0.5 * (i + 1))
+    return None if not os.path.lexists(path) else f"could not remove {path}: {err}"
+
+
 def make_clone(q, st):
     """Clone the project at its base into DIR/repo, on a new branch KEY (the ticket key).
     Runs before any agent touches the clone; the clone has no remote, so the
-    agent cannot push anywhere."""
+    agent cannot push anywhere. Cloned in place, not renamed into place: Windows
+    refuses to rename a directory while anything has a file in it open. A clone
+    is complete once base_sha is saved; process() makes it again until then."""
     dest = os.path.join(q.dir(st["key"]), "repo")
-    tmp = dest + ".new"
-    shutil.rmtree(tmp, ignore_errors=True)
-    shutil.rmtree(dest, ignore_errors=True)
+    st.pop("base_sha", None)
+    q.save(st)
+    for d in (dest + ".new", dest):  # .new: left by versions that renamed
+        err = rmtree(d)
+        if err:
+            raise RuntimeError(f"{err}. Close whatever has it open (an editor, a terminal "
+                               f"in it, git's fsmonitor daemon) and run harness queue retry {st['key']}")
     base_sha = git(st["project"], "rev-parse", "--verify", st["base"] + "^{commit}").stdout.strip()
-    subprocess.run(["git", "clone", "-q", "--no-checkout", st["project"], tmp], check=True,
-                   capture_output=True, text=True, timeout=600)
-    git(tmp, "checkout", "-q", "-b", st["key"], base_sha)
-    git(tmp, "remote", "remove", "origin")
+    # Git for Windows can enable a file system monitor daemon per repo; it keeps
+    # the clone's directory open, so a later retry could not remove it.
+    opts = ["-c", "core.fsmonitor=false"] if os.name == "nt" else []
+    r = subprocess.run(["git", "clone", "-q", "--no-checkout", *opts, st["project"], dest],
+                       capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f"git clone: {(r.stderr or r.stdout).strip()[:400]}")
+    git(dest, "checkout", "-q", "-b", st["key"], base_sha)
+    git(dest, "remote", "remove", "origin")
     for k, fallback in (("user.name", "harness queue"), ("user.email", "harness-queue@localhost")):
         v = git(st["project"], "config", k, check=False).stdout.strip()
-        git(tmp, "config", k, v or fallback)
-    os.replace(tmp, dest)
+        git(dest, "config", k, v or fallback)
     st["base_sha"] = base_sha
     q.save(st)
 
@@ -799,7 +837,9 @@ def cmd_remove(q, a):
             print(f"[queue] {key} is not in the queue", file=sys.stderr)
             continue
         order = [k for k in order if k != key]
-        shutil.rmtree(q.dir(key), ignore_errors=True)
+        err = rmtree(q.dir(key))
+        if err:
+            print(f"[queue] {key}: {err}; remove it by hand", file=sys.stderr)
         print(f"[queue] {key} removed (its branch, if any, stays in the project as refs/harness-queue/{key})")
     q.set_order(order)
     return 0
@@ -817,7 +857,7 @@ def requeue(q, key, want, stage=None, **extra):
     if stage:
         st["stage"] = stage
     if st["stage"] == "plan":  # planned again: start over from the base, not from earlier commits
-        shutil.rmtree(os.path.join(q.dir(st["key"]), "repo"), ignore_errors=True)
+        rmtree(os.path.join(q.dir(st["key"]), "repo"))  # make_clone tries again, and says so
         for f in (plan_copy(q, st["key"]),):
             if os.path.exists(f):
                 os.remove(f)
