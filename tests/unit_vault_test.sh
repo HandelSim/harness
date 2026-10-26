@@ -499,8 +499,9 @@ sys.exit(0 if os.waitstatus_to_exitcode(status) == 0 else "exit %r; output: %r" 
 PYEOF2
     charter() { $PY "$TMP_ROOT/charter_pty.py" "$REPO_ROOT" "$TMP_ROOT" "$CH" "$@"; }
     fm() { sed -n "s/^$1: //p" "$CH/wiki/overview.md"; }
-    # project: clear, type, five lefts, insert; readers: Home, insert; covers empty.
-    charter '\x15hello world\x1b[D\x1b[D\x1b[D\x1b[D\x1b[Dbig \r' '\r' '\x1b[Hjust \r' '\r' '\r' '\r' \
+    # project: clear, type, five lefts, insert; readers: Home, insert; covers,
+    # tracker URL empty (an empty tracker skips the tracker-fields question).
+    charter '\x15hello world\x1b[D\x1b[D\x1b[D\x1b[D\x1b[Dbig \r' '\r' '\x1b[Hjust \r' '\r' '\r' '\r' '\r' \
         || fail "V14: first init run failed"
     [[ "$(fm project)" == "'hello big world'" ]] || fail "V14: left arrow should insert mid-line — project=$(fm project)"
     [[ "$(fm readers)" == "'just me and my coding agents'" ]] || fail "V14: Home should insert at the start — readers=$(fm readers)"
@@ -508,12 +509,13 @@ PYEOF2
         || fail "V14: Enter keeps the suggestion — goal=$(fm goal)"
     [[ "$(fm ticket_pattern)" == "'[A-Z][A-Z0-9]+-[0-9]+'" ]] || fail "V14: a new vault suggests the ticket pattern — $(fm ticket_pattern)"
     [[ "$(fm covers)" == "''" ]] || fail "V14: covers should be empty — $(fm covers)"
+    [[ "$(fm tracker_url)" == "''" ]] || fail "V14: an empty tracker URL should stay empty — $(fm tracker_url)"
     [[ ! -e "$CH/wiki/overview.md.tmp" ]] || fail "V14: the charter was left as overview.md.tmp"
     grep -q $'\x1b' "$CH/wiki/overview.md" && fail "V14: escape codes reached the charter"
     # Clear the ticket pattern, then a run of plain Enters keeps every answer.
-    charter '\r' '\r' '\r' '\r' '\x15\r' '\r' || fail "V14: second init run failed"
+    charter '\r' '\r' '\r' '\r' '\x15\r' '\r' '\r' || fail "V14: second init run failed"
     [[ "$(fm ticket_pattern)" == "''" ]] || fail "V14: an emptied ticket pattern should save empty — $(fm ticket_pattern)"
-    charter '\r' '\r' '\r' '\r' '\r' '\r' || fail "V14: third init run failed"
+    charter '\r' '\r' '\r' '\r' '\r' '\r' '\r' || fail "V14: third init run failed"
     [[ "$(fm ticket_pattern)" == "''" && "$(fm project)" == "'hello big world'" ]] \
         || fail "V14: a re-run should keep the saved answers — project=$(fm project) ticket_pattern=$(fm ticket_pattern)"
     ok "V14: vault init edits pre-filled answers in place, writes the charter, keeps answers on a re-run"

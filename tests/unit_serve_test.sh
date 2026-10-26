@@ -140,13 +140,18 @@ for how in host serve; do
             <<<"${OPENCODE_CONFIG_CONTENT:-null}" >/dev/null
     ) || fail "S5: $how: the OAI slim header was lost with the key scrub"
 done
-# The only Authorization header in the CLI is the one _curl_auth_config
-# writes; any other (curl -H, a wget header, a continuation line) would put
+# Every Authorization header in the CLI must keep the key off argv. The only
+# key-safe forms are: _curl_auth_config's `printf 'header = "Authorization:
+# Bearer %s"'` (a curl -K config piped to `curl -K -`), `harness ticket
+# login`'s `printf 'Authorization: Bearer %s'` into a mode-600 header file
+# (read back by vault_ticket.py), and the `<...>`-placeholder prose in --help.
+# Any other occurrence (curl -H, a wget header, a continuation line) would put
 # the key on a command line.
 hits=$(grep -nE 'Authorization: (Bearer|Basic)' "$HARNESS" | grep -vE '^[0-9]+:[[:space:]]*#')
-[[ "$hits" == *'printf '\''header = "Authorization: Bearer %s"'* && $(wc -l <<<"$hits") -eq 1 ]] \
-    || fail "S5: an Authorization header outside _curl_auth_config; pipe _curl_auth_config to curl -K - instead:
-$hits"
+unexpected=$(grep -vE "printf 'header = \"Authorization: Bearer %s\"|printf 'Authorization: Bearer %s|Authorization: (Bearer|Basic) <" <<<"$hits" || true)
+[[ -z "$unexpected" ]] \
+    || fail "S5: an Authorization header outside the key-safe forms (curl -K config, the ticket header file, or --help prose); if it reaches a command line, pipe _curl_auth_config to curl -K - instead:
+$unexpected"
 ok "S5: key via curl -K stdin, scrubbed from opencode's env"
 
 # --- S6: with no OAI configured, serve gets to its banner ---------------------
