@@ -6553,6 +6553,10 @@ HELP
             host_proxy_wait_ready || { host_proxy_stop; exit 1; }
             dir=$(vault_prepare)
             [[ -n "$dir" ]] || { err "the active vault is not available"; return 1; }
+            # One tab for the whole run: it follows the queue's newest stage
+            # session, so the stage launches below do not open their own.
+            harness_vault_dir="$dir" harness_view "/runs/follow?$(harness_view_since)&queue=1"
+            export HARNESS_OPEN=0
             args+=(run --vault "$dir" --proxy "http://127.0.0.1:$(host_proxy_port)/v1"
                    --harness "$clone_dir/harness" --model "${QUEUE_MODEL:-}"
                    --default-model "$(_effective_default_model)" --verify-model "${QUEUE_VERIFY_MODEL:-}"
@@ -6863,6 +6867,7 @@ host_run_opencode() {
         # loopback `opencode serve`, so the pub page's run viewer can message the
         # session while it works (plain run if serve fails or HARNESS_LIVE=0).
         local -a runcmd=(bash "$clone_dir/agents/live-run.sh" "${events_file}")
+        harness_view "/runs/follow?$(harness_view_since)"
         (( ${#args[@]} )) && runcmd+=("${args[@]}")
         (( ${#op_args[@]} )) && runcmd+=("${op_args[@]}")
         rc=0
@@ -7085,6 +7090,77 @@ serve_password_file() {
 # The pub page's access codes (serve/pub.py: name:sha256 per line, mode 600).
 serve_codes_file() { printf '%s/serve/access-codes' "$state_root"; }
 
+# The pub page arguments harness serve and the background run viewer share:
+# the opencode databases (the container agents' shared home and this host's),
+# the queue's tickets, the usage ledger and the access codes. Appends to the
+# caller's pub_args.
+serve_pub_args() {
+    pub_args+=(--usage-ledger "$(host_usage_ledger)"
+        --agent-data "container=$(agent_home_dir)/.local/share"
+        --agent-data "host=${XDG_DATA_HOME:-$HOME/.local/share}"
+        --queue-dir "$state_root/queue")
+    # Gated as long as the file exists, even with no codes left in it (then
+    # nobody can sign in): deleting the file is the one way to open the page.
+    if [[ -e "$(serve_codes_file)" ]]; then
+        pub_args+=(--access-codes "$(serve_codes_file)")
+        grep -Eqv '^[[:space:]]*(#|$)' "$(serve_codes_file)" 2>/dev/null \
+            || err "warning: serve: $(serve_codes_file) has no codes, so nobody can sign in to the pub page ('harness serve code add NAME', or delete the file to open the page)"
+    fi
+}
+
+# Opens URL in the default browser, in the background, when someone is at a
+# terminal to see it. Nothing happens with no browser to open (a headless
+# Linux box): the caller has printed the URL.
+harness_open_url() {
+    local url="$1"
+    [[ "${HARNESS_OPEN:-1}" != 0 && -z "${CI:-}" && -t 2 ]] || return 0
+    case "$(harness_detect_os)" in
+        # Not cmd /c start, which reads the & in a query as a command separator.
+        windows) MSYS2_ARG_CONV_EXCL='*' rundll32.exe url.dll,FileProtocolHandler "$url" ;;
+        macos) open "$url" ;;
+        linux)
+            if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+                if command -v wslview; then wslview "$url"; else explorer.exe "$url"; fi
+            elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v xdg-open; then
+                xdg-open "$url"
+            fi ;;
+    esac </dev/null >/dev/null 2>&1 &
+}
+
+# Shows the agent a launch starts: brings up the run viewer (the pub page,
+# /runs) on HARNESS_VIEW_PORT (default 8780, harness serve's port, so a
+# running harness serve is used as it is) in the background if nothing
+# answers there, prints the link to PATH and opens it. It stays up after
+# the launch, so the history stays readable; harness serve stop ends it.
+# HARNESS_OPEN=0 (and CI) leave it all out; never fails the launch.
+harness_view() {
+    local path="$1" port="${HARNESS_VIEW_PORT:-8780}" py logdir="$state_root/serve"
+    [[ "${HARNESS_OPEN:-1}" != 0 && -z "${CI:-}" ]] || return 0
+    py=$(host_python_bin) || return 0
+    mkdir -p "$logdir" || return 0
+    local pub_args=(--port "$port" --vault "${harness_vault_dir:-}" --vault-name "$(vault_active_name)")
+    serve_pub_args
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    if ! $py "$clone_dir/serve/pub.py" start --pid-file "$logdir/viewer.pid" \
+            --log "$logdir/viewer.log" "${pub_args[@]}" >&2; then
+        err "warning: the run viewer did not start (see $logdir/viewer.log); the agent runs anyway"
+        return 0
+    fi
+    echo "harness: watch the agent at http://127.0.0.1:$port$path" >&2
+    harness_open_url "http://127.0.0.1:$port$path"
+}
+
+# Ends the run viewer harness_view started, if it is up.
+harness_view_stop() {
+    local py
+    py=$(host_python_bin) || return 0
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    $py "$clone_dir/serve/pub.py" stop --pid-file "$state_root/serve/viewer.pid" || true
+}
+
+# The start of a run viewer link: the root sessions created from now on.
+harness_view_since() { printf 'since=%s000' "$(( $(date +%s) - 2 ))"; }
+
 # `harness serve code add|remove|list [NAME]`: the per-person access codes.
 serve_code() {
     local sub="${1:-list}" name="${2:-}" f py
@@ -7117,6 +7193,7 @@ serve_code() {
 
 cmd_serve() {
     [[ "${1:-}" == "code" ]] && { shift; serve_code "$@"; return; }
+    [[ "${1:-}" == "stop" ]] && { harness_view_stop; return; }
     local port=8780 arg want="" opencode_url="" secure_cookie=0
     local allow_hosts=()
     for arg in "$@"; do
@@ -7134,6 +7211,7 @@ cmd_serve() {
 usage: harness serve [--port N] [--allow-host NAME] [--opencode-url URL]
                      [--secure-cookie] [--normal] [--thoughts]
        harness serve code add NAME | remove NAME | list
+       harness serve stop
 
 Serves, on 127.0.0.1 only:
   http://127.0.0.1:N/     the pub page: the active vault's pub/**/*.html and
@@ -7146,6 +7224,11 @@ Serves, on 127.0.0.1 only:
                           nested, followed live; a headless run (harness -p,
                           harness queue) still working takes a message there
                           (HARNESS_LIVE=0 at launch turns that off)
+A headless run (harness -p, harness host -p, harness queue run) brings up
+that run viewer by itself on port HARNESS_VIEW_PORT (default 8780) and
+opens the run in the default browser; it stays up in the background
+until 'harness serve stop' or harness serve takes the port over.
+HARNESS_OPEN=0 turns that off.
 It starts the host-mode proxy if needed (same as 'harness host') and runs in
 the foreground; Ctrl-C stops both servers and leaves the proxy up ('harness
 host down' stops it). With no vault active the pub page still comes up, with
@@ -7228,18 +7311,8 @@ HELP
 
     # The run viewer (/runs) reads both opencode databases, the container
     # agents' shared home and this host's, and the queue's tickets.
-    local pub_args=(--proxy-url "http://127.0.0.1:$(host_proxy_port)"
-        --usage-ledger "$(host_usage_ledger)"
-        --agent-data "container=$(agent_home_dir)/.local/share"
-        --agent-data "host=${XDG_DATA_HOME:-$HOME/.local/share}"
-        --queue-dir "$state_root/queue")
-    # Gated as long as the file exists, even with no codes left in it (then
-    # nobody can sign in): deleting the file is the one way to open the page.
-    if [[ -e "$(serve_codes_file)" ]]; then
-        pub_args+=(--access-codes "$(serve_codes_file)")
-        grep -Eqv '^[[:space:]]*(#|$)' "$(serve_codes_file)" 2>/dev/null \
-            || err "warning: serve: $(serve_codes_file) has no codes, so nobody can sign in to the pub page ('harness serve code add NAME', or delete the file to open the page)"
-    fi
+    local pub_args=(--proxy-url "http://127.0.0.1:$(host_proxy_port)")
+    serve_pub_args
     [[ -n "$opencode_url" ]] && pub_args+=(--opencode-url "$opencode_url")
     # Behind a TLS reverse proxy every client is 127.0.0.1, so pub.py takes
     # the client from the proxy's X-Forwarded-For for its sign-in rate limit.
@@ -7256,6 +7329,8 @@ HELP
     local logdir="$state_root/serve" workdir="${harness_vault_dir:-$HOME}"
     mkdir -p "$logdir"
 
+    # The run viewer a launch left up has this port; serve takes it over.
+    harness_view_stop
     local oc_pid pub_pid
     (
         host_opencode_env
@@ -7624,6 +7699,7 @@ run_agent() {
     fi
 
     if (( print_mode )); then
+        [[ "$tool" == opencode ]] && harness_view "/runs/follow?$(harness_view_since)"
         run_agent_print "$tool" "$yolo" "$net_open" "$mount_path" "$image" \
             "$agent_home" "$network" "$mounts_blob" "${pass_args[@]}"
     else

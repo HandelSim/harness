@@ -7,6 +7,11 @@ web and `harness queue` stages alike, finished or still working.
                               its input and output, subagent sessions nested; follows a
                               working session as it goes, and takes a message for a
                               headless run that is still live
+  /runs/follow?since=MS[&queue=1]
+                              what a launch opens: the newest session started since
+                              MS (with queue=1, queue stages only, and moving on to
+                              each next stage); waits for one to start
+  /runs/follow.json?...       {"sid": that session, or null}
   /runs/<session>.json        the session, its messages and parts, as stored
   /runs/<session>/tail?from=N messages N.. as HTML, for the page's polling
   /runs/<session>/part/<id>   one tool call's full output, as text
@@ -598,7 +603,7 @@ POLL_JS = """
 (function () {
   var box = document.getElementById('msgs'), side = document.getElementById('side');
   if (!box) return;
-  var url = box.getAttribute('data-tail'), idle = 0, last = '';
+  var url = box.getAttribute('data-tail'), follow = box.getAttribute('data-follow'), idle = 0, last = '';
   function nearBottom() { return window.innerHeight + window.scrollY >= document.body.scrollHeight - 160; }
   function tick() {
     if (document.hidden) { setTimeout(tick, 3000); return; }
@@ -619,10 +624,34 @@ POLL_JS = """
       var ta = side.querySelector('textarea');
       if (!ta || (!ta.value && document.activeElement !== ta)) side.innerHTML = d.side;
       idle = d.working ? 0 : idle + 1;
-      setTimeout(tick, idle > 20 ? 15000 : 2500);
+      // Following a queue: once this stage's session is done, go to the next one.
+      if (follow && !d.working) {
+        fetch(follow, {credentials: 'same-origin', cache: 'no-store'}).then(function (r) { return r.json(); })
+          .then(function (f) {
+            if (f.sid && f.sid !== box.getAttribute('data-sid'))
+              location.replace('/runs/' + encodeURIComponent(f.sid) + '?' + follow.split('?')[1]);
+          }).catch(function () {});
+      }
+      setTimeout(tick, idle > (follow ? 200 : 20) ? 15000 : 2500);
     }).catch(function () { setTimeout(tick, 10000); });
   }
   setTimeout(tick, 2500);
+})();
+"""
+
+FOLLOW_JS = """
+(function () {
+  var w = document.getElementById('wait');
+  if (!w) return;
+  var url = w.getAttribute('data-follow'), jump = w.getAttribute('data-jump');
+  function tick() {
+    fetch(url, {credentials: 'same-origin', cache: 'no-store'}).then(function (r) { return r.json(); })
+      .then(function (f) {
+        if (f.sid) location.replace('/runs/' + encodeURIComponent(f.sid) + (jump ? '?' + url.split('?')[1] : ''));
+        else setTimeout(tick, 2000);
+      }).catch(function () { setTimeout(tick, 5000); });
+  }
+  setTimeout(tick, 1500);
 })();
 """
 
@@ -637,8 +666,9 @@ LIST_JS = """
 """
 
 
-def render_detail(runs, sid, sent=""):
-    """(title, body parts, script) or None."""
+def render_detail(runs, sid, sent="", follow=""):
+    """(title, body parts, script) or None. follow: a follow query (follow_query) to
+    move on to once this session is done."""
     src, row = runs.find(sid)
     if not row:
         return None
@@ -654,12 +684,55 @@ def render_detail(runs, sid, sent=""):
     parts = [f"<header class='top'><div class='crumbs'>{''.join(crumbs)}<span>/</span><b>{esc(title)}</b></div>"
              f"<a class='chip' href='/runs/{quote(sid)}.json' target='_blank' rel='noopener'>JSON</a></header>",
              "<div class='cols'><div class='stack'><section class='panel'>"
-             f"<div id='msgs' data-tail='/runs/{quote(sid)}/tail'>{render_messages(msgs, sid)}</div>"
+             f"<div id='msgs' data-sid='{esc(sid)}' data-tail='/runs/{quote(sid)}/tail'"
+             + (f" data-follow='/runs/follow.json?{esc(follow)}'" if follow else "")
+             + f">{render_messages(msgs, sid)}</div>"
              + ("" if msgs else "<div class='muted'>No messages yet.</div>") +
              "<span id='end'></span></section></div>",
              f"<div class='stack'><section class='panel' id='side'>{render_side(runs, src, row, live, sent)}"
              "</section></div></div>"]
     return title, parts, POLL_JS
+
+
+def follow_query(query):
+    """The follow parameters from a parsed query string, rebuilt from checked values:
+    since (ms; sessions started before it are skipped) and queue (1: queue stages
+    only, and move on to the next stage). (since, queue, query string)."""
+    try:
+        since = max(0, int((query.get("since") or ["0"])[0]))
+    except ValueError:
+        since = 0
+    queue = (query.get("queue") or [""])[0] == "1"
+    return since, queue, f"since={since}" + ("&queue=1" if queue else "")
+
+
+def follow_target(runs, since=0, queue=False):
+    """The session a follow page shows: of the root sessions started at or after
+    since (queue stages only with queue), a live one first, then one still
+    working, then the newest. None until one has started."""
+    live = runs.live()
+    now = time.time()
+    best = None
+    for r in runs.sessions(limit=200):
+        created = _ms(r["time_created"])
+        if created < since or (queue and not runs.ticket_of(r.get("directory") or "")):
+            continue
+        working = r["id"] in live or now - _ms(r["time_updated"]) / 1000 <= ACTIVE
+        rank = (r["id"] in live, working, created)
+        if best is None or rank > best[0]:
+            best = (rank, r["id"])
+    return best[1] if best else None
+
+
+def render_follow(follow, queue):
+    """The page a launch opens before its agent's session exists."""
+    what = "the queue's next stage" if queue else "the agent"
+    return ("<header class='top'><div class='crumbs'><a href='/'>harness</a><span>/</span>"
+            "<a href='/runs'>runs</a><span>/</span><b>waiting</b></div></header>"
+            f"<section class='panel' id='wait' data-follow='/runs/follow.json?{esc(follow)}'"
+            + (" data-jump='1'" if queue else "") +
+            f"><h2>Waiting for {what} to start&hellip;</h2><div class='muted'>This page opens its "
+            "session as soon as it starts. <a href='/runs'>All sessions</a></div></section>")
 
 
 def tail(runs, sid, start):

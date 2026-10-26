@@ -1188,6 +1188,34 @@ state/queue`. Routes:
   inline cap), `/runs/<sid>.json` (the session as JSON), `/runs/ticket/<KEY>`
   (its sessions by stage, `log.md` and stage `.out` files from `state/queue/KEY`).
 - `POST /runs/<sid>/send`: puts a message in the run's inbox.
+- `/runs/follow?since=MS[&queue=1]`: the link a launch opens. It redirects
+  (303) to the root session started at or after MS (live first, then still
+  working, then newest), or shows a waiting page that polls
+  `/runs/follow.json` (`{"sid": ...}`) until one starts. With `queue=1` only
+  queue stages count, and a stage page carries `data-follow`, so once its
+  session is done the page moves on to the next stage's.
+
+**Auto-open.** Every headless launch shows its run: `harness_view` (host
+`-p` in `host_run_opencode`, container `-p` in `run_agent`, and once per
+`harness queue run`, which then exports `HARNESS_OPEN=0` so its stage
+launches do not open their own) runs `pub.py start` on
+`HARNESS_VIEW_PORT` (default 8780): if a pub page already answers
+`/healthz` there (a running `harness serve`, or an earlier launch's viewer)
+it is used as it is, else pub.py starts detached (its own session; on
+Windows `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) with
+`serve_pub_args` (the agent data, queue, ledger and access codes `cmd_serve`
+passes) and no opencode web, pid in `state/serve/viewer.pid`, log
+`viewer.log`. It stays up after the launch; `harness serve stop`
+(`pub.py stop`, which signals the pid only if the port still answers) ends
+it, and `cmd_serve` stops it before binding the port. The link
+`/runs/follow?since=<now-2s>` is printed, and `harness_open_url` opens it
+in the background when stderr is a terminal and neither `HARNESS_OPEN=0`
+nor `CI` is set: `rundll32 url.dll,FileProtocolHandler` on Windows (not
+`cmd /c start`, which splits the URL at `&`), `open` on macOS, `wslview` or
+`explorer.exe` under WSL, `xdg-open` on Linux only with `DISPLAY` or
+`WAYLAND_DISPLAY`. A viewer that does not start is a warning; the launch
+goes on. Interactive (TUI) launches open nothing: the user is in the
+session already.
 
 A run is live when `agents/live-run.sh` (every `-p` run: container via
 `harness-live-run`, host via the clone's copy) is driving it.

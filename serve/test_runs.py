@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -275,6 +276,65 @@ class RunsTest(RunsServer):
         self.assertEqual(r.status, 404)
         r, body = self.req("GET", "/")
         self.assertNotIn("Agent runs", body)
+
+    def test_follow_waits_then_opens_the_newest_session(self):
+        self.start()
+        later = self.now_ms + 1000
+        r, body = self.req("GET", f"/runs/follow?since={later}")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Waiting for the agent", body)
+        self.assertIn(f"data-follow='/runs/follow.json?since={later}'", body)
+        self.assertNotIn("data-jump=", body)
+        r, body = self.req("GET", f"/runs/follow.json?since={later}")
+        self.assertEqual(json.loads(body), {"sid": None})
+        # ROOT started 60 s ago, the queue stage 120 s ago: since 70 s ago is ROOT alone.
+        r, _ = self.req("GET", f"/runs/follow?since={self.now_ms - 70000}")
+        self.assertEqual(r.status, 303)
+        self.assertEqual(r.getheader("Location"), f"/runs/{ROOT}")
+        r, body = self.req("GET", "/runs/follow.json?since=junk")
+        self.assertEqual(json.loads(body)["sid"], ROOT)  # newest of all
+        self.go_live(QSES)
+        r, body = self.req("GET", "/runs/follow.json?since=0")
+        self.assertEqual(json.loads(body)["sid"], QSES)  # a live one first
+
+    def test_follow_a_queue_keeps_to_its_stages(self):
+        self.start()
+        r, _ = self.req("GET", f"/runs/follow?since={self.now_ms - 70000}&queue=1")
+        self.assertEqual(r.status, 200)  # ROOT is not a queue stage
+        r, _ = self.req("GET", "/runs/follow?since=0&queue=1&x=<b>")
+        self.assertEqual(r.status, 303)
+        self.assertEqual(r.getheader("Location"), f"/runs/{QSES}?since=0&queue=1")
+        r, body = self.req("GET", f"/runs/{QSES}?since=0&queue=1")
+        self.assertIn("data-follow='/runs/follow.json?since=0&amp;queue=1'", body)
+        r, body = self.req("GET", f"/runs/{QSES}")
+        self.assertNotIn("data-follow=", body)
+        r, body = self.req("GET", "/runs/follow?since=99999999999999&queue=1")
+        self.assertIn("Waiting for the queue", body)
+        self.assertIn("data-jump='1'", body)
+
+
+class BackgroundTest(unittest.TestCase):
+    def test_start_reuses_a_running_page_and_stop_ends_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            pid_file, log = os.path.join(tmp, "viewer.pid"), os.path.join(tmp, "viewer.log")
+            start = ["start", "--pid-file", pid_file, "--log", log, "--port", str(port)]
+            self.assertEqual(pub.main(start), 0)
+            self.assertTrue(pub.pub_answers(port))
+            pid = open(pid_file).read().split()[0]
+            self.assertEqual(pub.main(start), 0)  # already up: left as it is
+            self.assertEqual(open(pid_file).read().split()[0], pid)
+            self.assertEqual(pub.main(["stop", "--pid-file", pid_file]), 0)
+            self.assertFalse(os.path.exists(pid_file))
+            for _ in range(50):
+                if not pub.pub_answers(port):
+                    break
+                time.sleep(0.1)
+            self.assertFalse(pub.pub_answers(port))
+            self.assertEqual(pub.main(["stop", "--pid-file", pid_file]), 0)  # nothing to stop
 
 
 if __name__ == "__main__":

@@ -19,6 +19,10 @@ what the page links to, which includes opencode web, a shell on this host.
   pub.py --port N [...]                          serve
   pub.py add-code --access-codes FILE NAME       mint a code, print it once
   pub.py remove-code --access-codes FILE NAME    revoke NAME
+  pub.py start --pid-file F [--log F] --port N [...]
+                                                 serve in the background, unless a pub
+                                                 page already answers on N
+  pub.py stop --pid-file F                       end the one start started
 """
 
 import argparse
@@ -32,6 +36,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -892,6 +897,18 @@ def make_handler(cfg):
                         return
                 self.send(404, b"not found\n", head=head)
                 return
+            if bits[0] in ("follow", "follow.json") and len(bits) == 1:
+                since, queue, follow = runs_view.follow_query(q)
+                sid = runs_view.follow_target(r, since, queue)
+                if bits[0] == "follow.json":
+                    self.send(200, json.dumps({"sid": sid}).encode(), "application/json; charset=utf-8",
+                              {"Cache-Control": "no-store"}, head)
+                elif sid:
+                    self.redirect(f"/runs/{quote(sid)}" + (f"?{follow}" if queue else ""), head)
+                else:
+                    self.send_runs(200, "harness: waiting", [runs_view.render_follow(follow, queue)],
+                                   runs_view.FOLLOW_JS, head)
+                return
             sid = bits[0]
             if len(bits) == 1 and sid.endswith(".json"):
                 got = runs_view.export(r, sid[:-5])
@@ -900,7 +917,8 @@ def make_handler(cfg):
                               "application/json; charset=utf-8", text, head)
                     return
             elif len(bits) == 1:
-                got = runs_view.render_detail(r, sid, "")
+                _, queue, follow = runs_view.follow_query(q)
+                got = runs_view.render_detail(r, sid, "", follow if queue else "")
                 if got:
                     self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head)
                     return
@@ -1151,10 +1169,75 @@ def codes_main(argv):
     return 0
 
 
+def pub_answers(port):
+    """Whether a pub page answers /healthz on 127.0.0.1:port."""
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c.request("GET", "/healthz", headers={"Host": f"127.0.0.1:{port}"})
+        r = c.getresponse()
+        ok = r.status == 200 and r.read(8) == b"ok\n"
+        c.close()
+        return ok
+    except (OSError, http.client.HTTPException):
+        return False
+
+
+def background_main(argv):
+    """start / stop: the run viewer harness brings up when an agent starts working,
+    so the launch can open it. It outlives the launch (the history stays readable)
+    and its Ctrl-C (its own session, or on Windows a detached process group)."""
+    cmd = argv[0]
+    ap = argparse.ArgumentParser(prog=f"pub.py {cmd}")
+    ap.add_argument("--pid-file", required=True)
+    if cmd == "stop":
+        a = ap.parse_args(argv[1:])
+        try:
+            with open(a.pid_file) as f:
+                pid, port = (int(x) for x in f.read().split()[:2])
+        except (OSError, ValueError):
+            return 0
+        if pub_answers(port):  # not some later process that reused the pid
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        try:
+            os.remove(a.pid_file)
+        except OSError:
+            pass
+        return 0
+    ap.add_argument("--log", default=os.devnull)
+    a, rest = ap.parse_known_args(argv[1:])
+    pp = argparse.ArgumentParser(add_help=False)
+    pp.add_argument("--port", type=int, required=True)
+    port = pp.parse_known_args(rest)[0].port
+    if pub_answers(port):
+        return 0
+    if os.name == "nt":
+        flags = {"creationflags": 0x00000008 | 0x00000200}  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        flags = {"start_new_session": True}
+    with open(a.log, "ab") as log:
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), *rest], stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=log, close_fds=True, **flags)
+    with open(a.pid_file, "w") as f:
+        f.write(f"{proc.pid} {port}\n")
+    for _ in range(50):
+        if pub_answers(port):
+            return 0
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    sys.stderr.write(f"pub.py start: the page did not come up on 127.0.0.1:{port} (see {a.log})\n")
+    return 1
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] in ("add-code", "remove-code"):
         return codes_main(argv)
+    if argv and argv[0] in ("start", "stop"):
+        return background_main(argv)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--vault", default="")

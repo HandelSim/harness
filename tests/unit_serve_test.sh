@@ -10,6 +10,7 @@
 #   - cmd_serve           reaches its banner with no OAI configured
 #   - serve/test_runs.py  the run viewer (/runs)
 #   - agents/live-run.sh  headless runs that take messages (stub opencode)
+#   - harness_view        the run viewer a headless launch brings up
 #
 # Prints "SERVE TEST PASSED" on success.
 
@@ -258,5 +259,29 @@ sleep 0.3
 ! kill -0 "$spid" 2>/dev/null || fail "S7 (term): opencode serve outlived a killed wrapper"
 ! pgrep -f "$LR/bin/opencode run" >/dev/null || fail "S7 (term): opencode run outlived a killed wrapper"
 ok "S7: live-run.sh attaches run to its own serve, relays the inbox, falls back to a plain run, cleans up when killed"
+
+# --- S8: a headless launch brings up the run viewer (harness_view) -------------
+state_root="$TMP_ROOT/view"
+mkdir -p "$state_root"
+VB="$TMP_ROOT/viewbin"; mkdir -p "$VB"
+printf '#!/bin/sh\necho "$@" >>"%s/opened"\n' "$VB" >"$VB/xdg-open"; chmod +x "$VB/xdg-open"
+HARNESS_VIEW_PORT=$("$PY" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+export HARNESS_VIEW_PORT
+out=$(HARNESS_OPEN=0 harness_view "/runs/follow?since=1" 2>&1)
+[[ -z "$out" && ! -e "$state_root/serve/viewer.pid" ]] || fail "S8: HARNESS_OPEN=0 should leave the viewer out: $out"
+out=$(PATH="$VB:$PATH" DISPLAY=:9 harness_view "/runs/follow?$(harness_view_since)" 2>&1 </dev/null)
+grep -q "watch the agent at http://127.0.0.1:$HARNESS_VIEW_PORT/runs/follow?since=[0-9]*000$" <<<"$out" \
+    || fail "S8: no link printed: $out"
+pid=$(cut -d' ' -f1 "$state_root/serve/viewer.pid")
+curl -sf --noproxy '*' "http://127.0.0.1:$HARNESS_VIEW_PORT/runs" >/dev/null || fail "S8: the viewer is not serving /runs"
+harness_view "/runs" >/dev/null 2>&1
+[[ "$(cut -d' ' -f1 "$state_root/serve/viewer.pid")" == "$pid" ]] || fail "S8: a second launch should use the viewer that is up"
+sleep 0.3
+[[ ! -e "$VB/opened" ]] || fail "S8: opened a browser with no terminal to see it"
+harness_view_stop
+for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+! kill -0 "$pid" 2>/dev/null || fail "S8: harness serve stop left the viewer running"
+[[ ! -e "$state_root/serve/viewer.pid" ]] || fail "S8: the pid file should go"
+ok "S8: harness_view starts the run viewer once, prints the link, HARNESS_OPEN=0 skips it, stop ends it"
 
 echo "SERVE TEST PASSED"
