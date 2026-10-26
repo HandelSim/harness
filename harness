@@ -2772,6 +2772,12 @@ commands:
   ingest [<dir>]        turn the active vault's sessions and sources, and a
                         codebase <dir>, into linked wiki pages, only what is
                         new or changed (see 'harness ingest --help')
+  ticket [KEY|off|pull|login]
+                        the ticket this folder works on: every launch pulls
+                        it from the tracker into the vault and gives the agent
+                        it and its state note (see 'harness ticket --help')
+  context [--host]      list what a launch from here gives the model: the
+                        instruction files with their size, and the ticket
   unlock                probe the upstream and print the unlock URL if the
                         key is locked
   usage [--hours N]     total the tokens the upstream reported for the last N
@@ -2840,6 +2846,10 @@ agent flags:
                         defaults via HARNESS_EXTRA_MOUNTS in .env (colon-
                         separated). The CWD is always mounted, regardless
                         of --mount; the agent always starts in the CWD.
+  --ticket KEY          work on ticket KEY (like ABC-123) from this folder:
+                        remembered for it, pulled from the tracker at every
+                        launch, given to the agent with its state note (needs
+                        an active vault; see 'harness ticket --help')
   -p, --print "PROMPT"  headless single-shot invocation; runs `opencode run`
                         inside the container
 
@@ -5587,18 +5597,182 @@ vault_prepare() {
 # so the model learns where the vault is, an external_directory allow so
 # reading and writing under it needs no approval, and the x-harness-vault
 # provider header, from which the proxy adds a line naming the vault to a
-# cooperative model's reminder. Prints nothing without a vault.
+# cooperative model's reminder. With a ticket (harness_ticket, set by
+# ticket_prepare) the ticket's copy and its state note are two more
+# instruction files and x-harness-ticket adds where they are to that line.
+# Prints nothing without a vault.
 vault_opencode_config() {
-    local dir="${harness_vault_dir:-}" f instr=""
+    local dir="${harness_vault_dir:-}" what f instr=()
     [[ -n "$dir" ]] || return 0
-    for f in AGENTS.md CLAUDE.md; do
-        [[ -f "$dir/$f" ]] && { instr="$dir/$f"; break; }
-    done
-    [[ -n "$instr" ]] || err "vault at $dir has no AGENTS.md or CLAUDE.md; the agent is not told about it"
-    harness_jq -cn --arg dir "$dir" --arg instr "$instr" '
+    while IFS=$'\t' read -r what f; do
+        [[ "$what" == vault || "$what" == ticket* ]] && instr+=("$f")
+    done < <(harness_context_files "$HOME")
+    [[ -f "$dir/AGENTS.md" || -f "$dir/CLAUDE.md" ]] \
+        || err "vault at $dir has no AGENTS.md or CLAUDE.md; the agent is not told about it"
+    harness_jq -cn --arg dir "$dir" --arg ticket "${harness_ticket:-}" \
+        --argjson instr "$(printf '%s\n' ${instr[@]+"${instr[@]}"} | harness_jq -R . | harness_jq -sc 'map(select(. != ""))')" '
       {"permission": {"external_directory": {($dir + "/*"): "allow"}},
-       "provider": {"harness": {"options": {"headers": {"x-harness-vault": $dir}}}}}
-      + (if $instr == "" then {} else {"instructions": [$instr]} end)'
+       "provider": {"harness": {"options": {"headers": ({"x-harness-vault": $dir}
+         + (if $ticket == "" then {} else {"x-harness-ticket": $ticket} end))}}}}
+      + (if ($instr | length) == 0 then {} else {"instructions": $instr} end)'
+}
+
+# --- tickets ---
+#
+# `harness --ticket KEY` picks the ticket this folder works on; it is kept in
+# state/tickets.list ("<folder>\t<KEY>" lines) and reused by every later
+# launch from that folder or below it. With a vault active, each launch pulls
+# the ticket from the tracker named in the vault charter (tracker_url) into
+# <vault>/.raw/tickets/KEY.md (scripts/vault_ticket.py; offline, the last
+# copy is used) and the agent gets that copy and its state note,
+# <vault>/wiki/notes/tickets/KEY-state.md, as instruction files. The tracker
+# token is state/tracker/header (harness ticket login): never in git, the
+# vault or a container.
+
+_ticket_list() { printf '%s/tickets.list' "$state_root"; }
+_ticket_header_file() { printf '%s/tracker/header' "$state_root"; }
+
+# KEY, upper-cased, when it looks like a ticket key (ABC-123); fails otherwise.
+_ticket_key() {
+    local k="${1^^}"
+    [[ ${#k} -le 40 && "$k" =~ ^[A-Z][A-Z0-9_]*-[0-9]+$ ]] || return 1
+    printf '%s' "$k"
+}
+
+# --ticket KEY on a launch: checks KEY and keeps it in harness_ticket_arg.
+harness_ticket_flag() {
+    harness_ticket_arg=$(_ticket_key "$1") && return 0
+    err "--ticket needs a ticket key like ABC-123${1:+ (got '$1')}; 'harness ticket off' clears the folder's ticket"
+    return 1
+}
+
+# The ticket remembered for <dir> or the nearest folder above it; with a
+# second argument "dir", the folder it was remembered for.
+ticket_for_dir() {
+    local want="$1" f d k best="" from="" len=-1
+    f=$(_ticket_list)
+    [[ -f "$f" ]] || return 0
+    while IFS=$'\t' read -r d k; do
+        [[ -n "$d" && -n "$k" ]] || continue
+        if [[ "$want" == "$d" || "$want" == "$d"/* ]] && (( ${#d} > len )); then
+            best="$k" from="$d" len=${#d}
+        fi
+    done < "$f"
+    if [[ "${2:-}" == dir ]]; then printf '%s' "$from"; else printf '%s' "$best"; fi
+}
+
+# Remember KEY for <dir>; an empty KEY forgets the folder's ticket.
+ticket_remember() {
+    local dir="$1" key="$2" f d k
+    f=$(_ticket_list)
+    mkdir -p "$state_root"
+    : > "$f.tmp"
+    if [[ -f "$f" ]]; then
+        while IFS=$'\t' read -r d k; do
+            [[ -n "$d" && "$d" != "$dir" ]] && printf '%s\t%s\n' "$d" "$k" >> "$f.tmp"
+        done < "$f"
+    fi
+    [[ -z "$key" ]] || printf '%s\t%s\n' "$dir" "$key" >> "$f.tmp"
+    mv "$f.tmp" "$f"
+}
+
+# Pull KEY into the vault at <dir> and print the one-line outcome. Never fails.
+ticket_pull() {
+    local dir="$1" key="$2" py script hdr wdir out
+    if ! py=$(host_python_bin); then
+        err "ticket $key: python 3 is needed to pull it from the tracker; the vault's copy is used"
+        return 0
+    fi
+    script="$clone_dir/scripts/vault_ticket.py" hdr=$(_ticket_header_file) wdir="$dir"
+    if command -v cygpath >/dev/null 2>&1; then
+        script=$(cygpath -m "$script"); wdir=$(cygpath -m "$dir"); hdr=$(cygpath -m "$hdr")
+    fi
+    local -a args=("$script" "$wdir" "$key")
+    [[ -f "$(_ticket_header_file)" ]] && args+=("$hdr")
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    out=$($py "${args[@]}" 2>&1) || true
+    [[ -z "$out" ]] || echo "[harness] ticket $out" >&2
+    return 0
+}
+
+# The launch's ticket: --ticket KEY (then remembered for this folder) or the
+# one remembered. Pulls it and sets harness_ticket, which the overlay and
+# vault_sync read. Runs after vault_prepare; never fails the launch.
+ticket_prepare() {
+    local here key
+    harness_ticket=""
+    here=$(harness_abs_path "$PWD") || return 0
+    if [[ -n "${harness_ticket_arg:-}" ]]; then
+        key="$harness_ticket_arg"
+        ticket_remember "$here" "$key"
+    else
+        key=$(ticket_for_dir "$here")
+    fi
+    [[ -n "$key" ]] || return 0
+    if [[ -z "${harness_vault_dir:-}" ]]; then
+        err "ticket $key: no vault is active, so the agent does not get it (see: harness vault)"
+        return 0
+    fi
+    ticket_pull "$harness_vault_dir" "$key"
+    harness_ticket="$key"
+}
+
+# The instruction files a launch from here gives the model, in the order
+# opencode sends them, as "<kind>\t<path>" lines (existing files only): the
+# global one (<home>/.config/opencode/AGENTS.md, else <home>/.claude/CLAUDE.md),
+# the project's (every AGENTS.md from here up to the git root, else every
+# CLAUDE.md, else CONTEXT.md: opencode's rule), then harness's: the vault's
+# AGENTS.md, the ticket's copy and its state note. <home> is the agent's home:
+# $HOME for a host launch; any other is a container's, where only this folder
+# is mounted, so the project files above it are not seen.
+harness_context_files() {
+    local home="$1" cfg vault="${harness_vault_dir:-}" key="${harness_ticket:-}"
+    local f d name stop="/" cdup found seen=$'\n'
+    cfg="$home/.config"
+    [[ "$home" == "$HOME" && -n "${XDG_CONFIG_HOME:-}" ]] && cfg="$XDG_CONFIG_HOME"
+    for f in "$cfg/opencode/AGENTS.md" "$home/.claude/CLAUDE.md"; do
+        [[ -f "$f" ]] && { printf 'global\t%s\n' "$f"; break; }
+    done
+    if [[ "$home" != "$HOME" ]]; then
+        stop="$PWD"
+    elif cdup=$(git rev-parse --show-cdup 2>/dev/null); then
+        stop=$(cd "./$cdup" 2>/dev/null && pwd) || stop="/"
+    fi
+    for name in AGENTS.md CLAUDE.md CONTEXT.md; do
+        found=0 d="$PWD"
+        while [[ -n "$d" ]]; do
+            if [[ -f "$d/$name" ]]; then
+                printf 'project\t%s\n' "$d/$name"; seen+="$d/$name"$'\n'; found=1
+            fi
+            [[ "$d" == "$stop" || "$d" == / ]] && break
+            d=$(dirname "$d")
+        done
+        (( found )) && break
+    done
+    [[ -n "$vault" ]] || return 0
+    for f in "$vault/AGENTS.md" "$vault/CLAUDE.md"; do
+        if [[ -f "$f" ]]; then
+            [[ "$seen" == *$'\n'"$f"$'\n'* ]] || printf 'vault\t%s\n' "$f"
+            break
+        fi
+    done
+    [[ -n "$key" ]] || return 0
+    f="$vault/.raw/tickets/$key.md"
+    [[ -f "$f" ]] && printf 'ticket\t%s\n' "$f"
+    f="$vault/wiki/notes/tickets/$key-state.md"
+    [[ -f "$f" ]] && printf 'ticket state\t%s\n' "$f"
+    return 0
+}
+
+# One line at launch: how many instruction files go to the model and their size.
+context_banner() {
+    local what f n=0 bytes=0 s
+    while IFS=$'\t' read -r what f; do
+        s=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || s=0
+        n=$((n + 1)) bytes=$((bytes + ${s:-0}))
+    done < <(harness_context_files "$1")
+    (( n )) || return 0
+    echo "[harness] context: $n instruction file(s), ~$((bytes / 4)) tokens${harness_ticket:+, ticket $harness_ticket} ('harness context' lists them)" >&2
 }
 
 # After an interactive session: copy its conversations into the vault
@@ -5607,10 +5781,14 @@ vault_opencode_config() {
 # updated since <since_ms>; the database is shared with every other project),
 # then commit everything the session changed in the vault and push it when the
 # vault has an upstream, rebasing once if the push is rejected. The agent never
-# has to remember to save or commit. Best effort: every failure is a warning
-# and the launch's exit status is unchanged.
+# has to remember to save or commit. After a launch, <home> (the agent's home)
+# is given too, and the sessions it touched record its ticket and the
+# instruction files it gave the model (harness_context_files). Best effort:
+# every failure is a warning and the launch's exit status is unchanged.
 vault_sync() {
-    local dir="$1" since_ms="$2" db="$3" project="$4" py script index wdir
+    local dir="$1" since_ms="$2" db="$3" project="$4" home="${5:-}" py script index wdir
+    local launch_ms="$2" what f
+    local -a extra=()
     [[ -n "$dir" && -d "$dir/.git" ]] || return 0
     script="$clone_dir/scripts/vault_capture.py"
     index="$clone_dir/scripts/vault_ingest.py"
@@ -5626,9 +5804,17 @@ vault_sync() {
             # A container's /c/... path stays as it is; a host one becomes C:/...
             [[ "$project" == "*" || "$project" == /[a-zA-Z]/* ]] || project=$(cygpath -m "$project")
         fi
+        if [[ -n "$home" ]]; then
+            extra=(--launch "$launch_ms")
+            [[ -n "${harness_ticket:-}" ]] && extra+=(--ticket "$harness_ticket")
+            while IFS=$'\t' read -r what f; do
+                command -v cygpath >/dev/null 2>&1 && f=$(cygpath -m "$f")
+                extra+=(--context "$f")
+            done < <(harness_context_files "$home")
+        fi
         if [[ -f "$db" && -f "$script" ]]; then
             # shellcheck disable=SC2086  # $py can be 'py -3'
-            $py "$script" "$db" "$wdir" "$since_ms" "$project" >/dev/null || true
+            $py "$script" "$db" "$wdir" "$since_ms" "$project" ${extra[@]+"${extra[@]}"} >/dev/null || true
         fi
         # The generated index, hubs and module trees follow whatever the
         # session wrote (deterministic, no model).
@@ -5763,7 +5949,7 @@ _vault_charter() {
     }
     _charter_q() { local v="${1//\'/\'\'}"; printf "'%s'" "$v"; }
     _charter_def() { local v; v=$(_charter_get "$1"); printf '%s' "${v:-$2}"; }
-    local project goal readers track tickets covers
+    local project goal readers track tickets covers tracker fields
     echo "Describe this vault. Each answer starts as a suggestion: Enter keeps it," >/dev/tty
     echo "the arrow keys move through it to edit, Ctrl-U clears it." >/dev/tty
     project=$(_charter_ask "What project or area is it about?" "$(_charter_def project "$(basename "$PWD")")")
@@ -5788,6 +5974,17 @@ _vault_charter() {
     fi
     covers=$(_charter_ask "Codebases or folders it covers, for 'harness ingest <dir>' (empty for none)" \
         "$(_charter_get covers)" optional)
+    tracker=$(_charter_ask "Ticket tracker base URL, for 'harness --ticket KEY', e.g. https://jira.example.com (empty for none)" \
+        "$(_charter_get tracker_url)" optional)
+    tracker="${tracker%/}"
+    if [[ -n "$tracker" && ! "$tracker" =~ ^https?://[^[:space:]]+$ ]]; then
+        err "'$tracker' is not an http(s) URL; no tracker set"; tracker=""
+    fi
+    fields=""
+    if [[ -n "$tracker" ]]; then
+        fields=$(_charter_ask "Extra ticket fields to copy, ids or names, comma-separated (empty for the usual ones)" \
+            "$(_charter_get tracker_fields)" optional)
+    fi
     mkdir -p "$dir/wiki"
     {
         echo "---"
@@ -5799,6 +5996,8 @@ _vault_charter() {
         echo "track: $(_charter_q "$track")"
         echo "ticket_pattern: $(_charter_q "$tickets")"
         echo "covers: $(_charter_q "$covers")"
+        echo "tracker_url: $(_charter_q "$tracker")"
+        echo "tracker_fields: $(_charter_q "$fields")"
         echo "updated: $(date -u +%Y-%m-%d)"
         echo "---"
         echo
@@ -5821,9 +6020,216 @@ _vault_charter() {
         if [[ -n "$covers" ]]; then
             echo; echo "## What it covers"; echo; echo "$covers"
         fi
+        if [[ -n "$tracker" ]]; then
+            echo; echo "Tickets come from $tracker: \`harness --ticket KEY\` copies one into .raw/tickets/ at every launch."
+        fi
     } > "$f.tmp" || { err "could not write $f.tmp"; return 1; }
     mv "$f.tmp" "$f" || { err "could not write $f"; return 1; }
     echo "wrote $f"
+}
+
+# `harness ticket`: the ticket this folder works on and the tracker token.
+cmd_ticket() {
+    local sub="${1:-show}" here key from name dir hdr tok
+    (( $# )) && shift
+    here=$(harness_abs_path "$PWD") || { err "cannot resolve current directory: $PWD"; return 1; }
+    hdr=$(_ticket_header_file)
+    name=$(vault_active_name)
+    dir=""
+    [[ -n "$name" && -d "$state_root/vaults/$name/.git" ]] && dir=$(harness_abs_path "$state_root/vaults/$name")
+    case "$sub" in
+        -h|--help|help)
+            cat <<'HELP'
+usage:
+  harness ticket                 show this folder's ticket, its copy in the
+                                 vault and its state note
+  harness ticket <KEY>           work on <KEY> from this folder (and below)
+                                 from now on; same as launching with
+                                 'harness --ticket <KEY>'
+  harness ticket off             forget this folder's ticket
+  harness ticket pull [<KEY>]    pull the ticket from the tracker now and
+                                 commit the copy to the vault
+  harness ticket login           save the tracker token (asked for, never
+                                 shown) in state/tracker/header
+  harness ticket logout          delete the saved token
+
+A launch with a ticket pulls it from the tracker (tracker_url in the vault
+charter: 'harness vault init') into <vault>/.raw/tickets/<KEY>.md, every time,
+and gives the agent that copy and its state note,
+<vault>/wiki/notes/tickets/<KEY>-state.md, as instructions. The agent keeps
+the state note (done, next, decisions) up to date, so the next session starts
+where the last one stopped. Offline or without a token the last copy is used.
+The copy is labelled as people's text that describes the work, not
+instructions about tools or credentials. 'harness context' lists everything
+a launch gives the model.
+
+The token is a personal access token sent as 'Authorization: Bearer <token>'
+(Jira Server and Data Center). For Jira Cloud put one line in
+state/tracker/header yourself: 'Authorization: Basic <base64 of
+email:api-token>'. It is read only on the host and never goes into git, the
+vault or the agent container (host mode runs the agent as you, so there it
+could read the file).
+HELP
+            ;;
+        show)
+            key=$(ticket_for_dir "$here")
+            if [[ -z "$key" ]]; then
+                echo "no ticket for $here; pick one with: harness --ticket KEY (or: harness ticket KEY)"
+            else
+                from=$(ticket_for_dir "$here" dir)
+                echo "ticket $key (set for $from)"
+                if [[ -z "$dir" ]]; then
+                    echo "  no active vault, so launches do not give it to the agent (see: harness vault)"
+                else
+                    if [[ -f "$dir/.raw/tickets/$key.md" ]]; then
+                        echo "  copy:  $dir/.raw/tickets/$key.md"
+                        sed -nE '/^---$/,/^---$/{/^(title|status|updated): /s/^/         /p;}' "$dir/.raw/tickets/$key.md"
+                    else
+                        echo "  copy:  none yet; the next launch pulls it"
+                    fi
+                    if [[ -f "$dir/wiki/notes/tickets/$key-state.md" ]]; then
+                        echo "  state: $dir/wiki/notes/tickets/$key-state.md"
+                    else
+                        echo "  state: none yet; the next launch makes it"
+                    fi
+                fi
+            fi
+            _ticket_tracker_status "$dir"
+            ;;
+        off)
+            from=$(ticket_for_dir "$here" dir)
+            if [[ -z "$from" ]]; then
+                echo "no ticket for $here"
+            else
+                key=$(ticket_for_dir "$here")
+                ticket_remember "$from" ""
+                echo "forgot ticket $key for $from"
+            fi
+            ;;
+        pull)
+            key="${1:-}"
+            [[ -n "$key" ]] || key=$(ticket_for_dir "$here")
+            [[ -n "$key" ]] || { err "no ticket for $here; give one: harness ticket pull KEY"; return 1; }
+            key=$(_ticket_key "$key") || { err "'$1' is not a ticket key like ABC-123"; return 1; }
+            harness_vault_dir=$(vault_prepare)
+            [[ -n "$harness_vault_dir" ]] || { err "no active vault to pull into (see: harness vault)"; return 1; }
+            ticket_pull "$harness_vault_dir" "$key"
+            harness_ticket="$key"
+            vault_sync "$harness_vault_dir" 0 "" "$here"
+            ;;
+        login)
+            [[ -e /dev/tty ]] || { err "harness ticket login needs a terminal"; return 1; }
+            echo "Paste a personal access token from the tracker (your profile > Personal Access Tokens)." >/dev/tty
+            echo "It is not shown as you type." >/dev/tty
+            IFS= read -r -s -p 'token: ' tok </dev/tty 2>/dev/tty || tok=""
+            echo >/dev/tty
+            tok="${tok//[[:space:]]/}"
+            [[ -n "$tok" ]] || { err "no token given; nothing saved"; return 1; }
+            mkdir -p "${hdr%/*}" && chmod 700 "${hdr%/*}" 2>/dev/null
+            if ! (umask 077 && printf 'Authorization: Bearer %s\n' "$tok" > "$hdr.tmp" && mv "$hdr.tmp" "$hdr"); then
+                tok=""; err "could not write $hdr"; return 1
+            fi
+            tok=""
+            echo "saved in $hdr (readable only by you; never copied into git, the vault or a container)"
+            _ticket_tracker_status "$dir"
+            ;;
+        logout)
+            if [[ -f "$hdr" ]]; then rm -f "$hdr"; echo "deleted the saved tracker token"; else echo "no tracker token saved"; fi
+            ;;
+        -*)
+            err "unknown option '$sub' (see: harness ticket --help)"; return 1
+            ;;
+        *)
+            key=$(_ticket_key "$sub") || { err "'$sub' is not a ticket key like ABC-123 (see: harness ticket --help)"; return 1; }
+            ticket_remember "$here" "$key"
+            echo "ticket $key for $here; the next launch here pulls it"
+            ;;
+    esac
+}
+
+# The tracker part of `harness ticket` and `harness context`: the charter's
+# tracker_url and whether a token is saved (never the token).
+_ticket_tracker_status() {
+    local dir="$1" url=""
+    if [[ -n "$dir" && -f "$dir/wiki/overview.md" ]]; then
+        url=$(sed -n '/^---$/,/^---$/s/^tracker_url: *//p' "$dir/wiki/overview.md" | head -n 1 | tr -d "'\"")
+    fi
+    echo "tracker: ${url:-none (set tracker_url with: harness vault init)}"
+    if [[ -f "$(_ticket_header_file)" ]]; then
+        echo "token:   saved (harness ticket logout deletes it)"
+    else
+        echo "token:   none (harness ticket login)"
+    fi
+}
+
+# `harness context`: what a launch from here gives the model besides the
+# conversation, with sizes, so nothing harness adds is hidden.
+cmd_context() {
+    local home="" arg name here what f n=0 bytes=0 sz mode
+    for arg in "$@"; do
+        case "$arg" in
+            --host) home="$HOME" ;;
+            -h|--help|help)
+                cat <<'HELP'
+usage: harness context [--host]
+
+Lists what a launch from this folder gives the model besides the conversation:
+the instruction files, in the order opencode sends them, with their size
+(about 4 characters a token), and the lines harness adds for free models. It
+reads the vault and ticket as they are now, without pulling. --host shows a
+host-mode launch ('harness host'); the default is the launch bare 'harness'
+makes here. Every captured session records its ticket and these files in its
+front matter (context:); files outside the vault are copied into
+.raw/context/ so later sessions and ingest see what this one saw.
+HELP
+                return 0 ;;
+            *) err "unknown argument '$arg' (see: harness context --help)"; return 1 ;;
+        esac
+    done
+    mode="host mode"
+    if [[ -z "$home" ]]; then
+        if harness_runtime_installed; then home=$(agent_home_dir); mode="container mode"; else home="$HOME"; fi
+    fi
+    here=$(harness_abs_path "$PWD") || { err "cannot resolve current directory: $PWD"; return 1; }
+    name=$(vault_active_name)
+    harness_vault_dir=""
+    [[ -n "$name" && -d "$state_root/vaults/$name/.git" ]] && harness_vault_dir=$(harness_abs_path "$state_root/vaults/$name")
+    harness_ticket=$(ticket_for_dir "$here")
+    echo "A launch from $here ($mode) gives the model, before your messages:"
+    echo "  the system prompt and tool definitions (opencode's with --normal, else harness's slim ones)"
+    echo
+    echo "Instruction files, in the order they are sent:"
+    while IFS=$'\t' read -r what f; do
+        sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || sz=0
+        n=$((n + 1)) bytes=$((bytes + ${sz:-0}))
+        printf '  %d. %-13s %s  (%s KB, ~%s tokens)\n' "$n" "$what" "$f" \
+            "$(( (${sz:-0} + 512) / 1024 ))" "$(( ${sz:-0} / 4 ))"
+    done < <(harness_context_files "$home")
+    (( n )) || echo "  none"
+    (( n )) && echo "  total ~$((bytes / 4)) tokens"
+    if [[ -n "$harness_ticket" && -n "$harness_vault_dir" ]]; then
+        [[ -f "$harness_vault_dir/.raw/tickets/$harness_ticket.md" ]] \
+            || echo "  (ticket $harness_ticket has no copy in the vault yet; the next launch pulls it)"
+        [[ -f "$harness_vault_dir/wiki/notes/tickets/$harness_ticket-state.md" ]] \
+            || echo "  (its state note is made at the next launch)"
+    fi
+    if [[ -n "$harness_vault_dir" ]]; then
+        echo
+        echo "Free (cooperative) models also get one line in each turn's reminder: where the"
+        if [[ -n "$harness_ticket" ]]; then
+            echo "vault is, and where ticket $harness_ticket's copy and state note are."
+        else
+            echo "vault is."
+        fi
+    fi
+    echo
+    if [[ -n "$harness_ticket" ]]; then
+        echo "ticket:  $harness_ticket (harness ticket shows it, harness ticket off clears it)"
+    else
+        echo "ticket:  none (harness --ticket KEY)"
+    fi
+    echo "vault:   ${harness_vault_dir:-none (harness vault)}"
+    _ticket_tracker_status "$harness_vault_dir"
 }
 
 # `harness ingest`: turn the active vault's raw material (.raw/, captured
@@ -5945,8 +6351,9 @@ usage:
   harness vault remove <name>      unregister <name>; its clone stays on disk
   harness vault init               ask what the active vault is for (project,
                                    goal, readers, what to track, ticket id
-                                   pattern) and write its charter,
-                                   wiki/overview.md, which every ingest reads
+                                   pattern, ticket tracker) and write its
+                                   charter, wiki/overview.md, which every
+                                   ingest reads
   harness vault import [<dir>|--all]
                                    copy the past opencode sessions started in
                                    <dir> (default: here; --all: anywhere) into
@@ -6252,7 +6659,7 @@ host_run_opencode() {
     host_reset_terminal
     host_proxy_stop
     vault_sync "${harness_vault_dir:-}" "$launch_ms" \
-        "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}" "$PWD"
+        "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}" "$PWD" "$HOME"
     return "$rc"
 }
 
@@ -6299,7 +6706,7 @@ cmd_host() {
 harness host — run CONTAINERLESS: the proxy + opencode as plain host processes.
 
 usage:
-  harness host [--yolo] [--normal] [--thoughts] [--single-message | --prompt-mode M] [-p "PROMPT"] [agent flags...]
+  harness host [--yolo] [--normal] [--thoughts] [--ticket KEY] [--single-message | --prompt-mode M] [-p "PROMPT"] [agent flags...]
   harness host down            stop the background host proxy
 
 --single-message (= --prompt-mode single) folds the whole chat into ONE
@@ -6337,13 +6744,19 @@ EOF
 
     local yolo=0 print_mode=0
     local pass_args=()
-    local arg want_mode=0
+    local arg want_mode=0 want_ticket=0
     for arg in "$@"; do
         if (( want_mode )); then
             prompt_mode_override="$arg"; want_mode=0; continue
         fi
+        if (( want_ticket )); then
+            harness_ticket_flag "$arg" || exit 1
+            want_ticket=0; continue
+        fi
         case "$arg" in
             --yolo)      yolo=1 ;;
+            --ticket)    want_ticket=1 ;;
+            --ticket=*)  harness_ticket_flag "${arg#--ticket=}" || exit 1 ;;
             --slim)      harness_slim=1 ;;
             --normal)    harness_slim=0 ;;
             --thoughts)  harness_thoughts=1 ;;
@@ -6362,6 +6775,7 @@ EOF
         err "--prompt-mode requires a value (hybrid, user_front, passthrough, or single)"
         exit 1
     fi
+    (( want_ticket )) && { harness_ticket_flag ""; exit 1; }
     _validate_prompt_mode_override || exit 1
 
     host_require_python3 || exit 1
@@ -6392,6 +6806,8 @@ EOF
     host_proxy_wait_ready || { host_proxy_stop; exit 1; }
     host_write_opencode_config
     harness_vault_dir=$(vault_prepare)
+    ticket_prepare
+    context_banner "$HOME"
 
     local rc=0
     if (( ${#pass_args[@]} )); then
@@ -6683,7 +7099,7 @@ Notes:
   * The backend-api keeps conversation state server-side; this proxy is
     stateless, so each request opens a fresh conversation carrying the full
     translated history. Tool use, prompt modes and MCPs work as usual.
-  * 'harness chatgpt' accepts --yolo, --normal, -p/--print, --net and --mount like a
+  * 'harness chatgpt' accepts --yolo, --normal, --ticket, -p/--print, --net and --mount like a
     normal launch. 'harness chatgpt host' takes the flags 'harness host'
     takes: --net and --mount are container-only and do not apply there.
 EOF
@@ -6740,16 +7156,29 @@ run_agent() {
     local net_open=0
     local pass_args=()
     local extra_mounts=()
-    local expecting_mount_arg=0
+    local expecting_mount_arg=0 expecting_ticket=0
     for arg in "$@"; do
         if (( expecting_mount_arg )); then
             extra_mounts+=("$arg")
             expecting_mount_arg=0
             continue
         fi
+        if (( expecting_ticket )); then
+            harness_ticket_flag "$arg" || exit 1
+            expecting_ticket=0
+            continue
+        fi
         case "$arg" in
             --yolo)
                 yolo=1
+                ;;
+            --ticket)
+                # Read by ticket_prepare (and by cmd_host on the no-docker
+                # fallback below) like --normal.
+                expecting_ticket=1
+                ;;
+            --ticket=*)
+                harness_ticket_flag "${arg#--ticket=}" || exit 1
                 ;;
             --slim|--normal)
                 # Read by agent_common_env (and by cmd_host on the no-docker
@@ -6793,6 +7222,7 @@ run_agent() {
         err "--mount requires a path argument"
         exit 1
     fi
+    (( expecting_ticket )) && { harness_ticket_flag ""; exit 1; }
 
     # No container runtime installed at all (a host-only install): containerless
     # host mode is the only way this launch can run, so say so and hand off to
@@ -6872,6 +7302,7 @@ run_agent() {
     # other, so launching from inside the vault is fine).
     harness_vault_dir=$(vault_prepare)
     [[ -n "$harness_vault_dir" ]] && extra_mounts+=("$harness_vault_dir")
+    ticket_prepare
 
     # Merge --mount flags with HARNESS_EXTRA_MOUNTS (colon-separated, like
     # PATH). Validate each entry: must exist as a directory; rejected if
@@ -6907,6 +7338,7 @@ run_agent() {
     image=$(agent_image)
     agent_home=$(agent_home_dir)
     mkdir -p "$agent_home"
+    context_banner "$agent_home"
 
     # Refresh the MCP side file before launch so the entrypoint sees the
     # current set of enabled MCPs. Done after mkdir so the dir exists.
@@ -7205,7 +7637,7 @@ run_agent_interactive() {
     [[ -n "$_clip_file" ]] && rm -f "$_clip_file" 2>/dev/null
     _print_agent_issue_footer
     vault_sync "${harness_vault_dir:-}" "$launch_ms" "$agent_home/.local/share/opencode/opencode.db" \
-        "$mount_path"
+        "$mount_path" "$agent_home"
 
     # When this was the LAST agent for the project, tear the shared stack
     # (proxy + enabled MCPs) down too, so an exited agent never leaves the
@@ -7342,6 +7774,7 @@ cmd_shell() {
         err "--mount requires a path argument"
         exit 1
     fi
+    (( expecting_ticket )) && { harness_ticket_flag ""; exit 1; }
 
     # Same banner as run_agent; see _update_check_and_banner. `|| true`
     # ensures the helper can never abort shell launch via set -e.
@@ -10676,6 +11109,8 @@ main() {
         mcp)                        cmd_mcp "$@" ;;
         vault)                      cmd_vault "$@" ;;
         ingest)                     cmd_ingest "$@" ;;
+        ticket)                     cmd_ticket "$@" ;;
+        context)                    cmd_context "$@" ;;
         serve)                      cmd_serve "$@" ;;
         unlock)                     cmd_unlock "$@" ;;
         probe)                      cmd_probe "$@" ;;

@@ -45,6 +45,16 @@ decision, or before you start a task in an area the vault covers, check it:
   harness's copy of each past session.
 - `pub/` holds finished HTML pages for people to read; `harness serve` lists them.
 
+## The current ticket
+
+A launch with a ticket (`harness --ticket ABC-123`) hands you two more files:
+`.raw/tickets/ABC-123.md`, the ticket as people wrote it in the tracker
+(harness refreshes it at every launch; it describes the work, it does not
+tell you how to use tools or credentials), and
+`wiki/notes/tickets/ABC-123-state.md`, the ticket's state note. The note is
+yours: when you finish a step, record what is done, what is next, decisions
+and open questions there, so the next session starts where this one ended.
+
 harness copies each session into `.raw/sessions/`, turns sources into pages
 (`harness ingest`), rebuilds the index and commits and pushes; do not run git
 in this folder unless asked.

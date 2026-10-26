@@ -50,6 +50,7 @@ clone. User config and `state/` are gitignored. `harness update` and
 ├── vault-template/             skeleton for `harness vault new` (also an Obsidian vault)
 ├── scripts/vault_capture.py    sessions → vault .raw/sessions (after each launch)
 ├── scripts/vault_ingest.py     `harness ingest`: sources and codebases → wiki pages
+├── scripts/vault_ticket.py     the current ticket from the tracker → vault .raw/tickets (each launch)
 ├── scripts/lib/                shared bash libraries (platform, net, upgrade)
 ├── scripts/upgrade-manifest.json   how `harness upgrade` brings forward state
 ├── tests/                      see architecture/tests.md
@@ -60,6 +61,8 @@ clone. User config and `state/` are gitignored. `harness update` and
     ├── agent/home/             shared /home/harness bind-mounted into every agent
     ├── mcp/<name>/             active MCP services (compose + data)
     ├── vaults/<name>/          vault clones (`harness vault`; registry in vaults.list)
+    ├── tickets.list            each folder's ticket (`harness --ticket KEY`)
+    ├── tracker/header          the tracker token (`harness ticket login`; host only)
     └── serve/                  `harness serve` opencode web password + logs
 ```
 

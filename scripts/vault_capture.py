@@ -2,6 +2,7 @@
 """Copy the opencode conversations of one harness launch into the active vault.
 
 Usage: vault_capture.py <opencode.db> <vault dir> <since epoch ms> <project dir>
+                       [--launch <epoch ms>] [--ticket <KEY>] [--context <file>]...
 
 Reads opencode's SQLite store read-only and writes one markdown file per top
 level session started in <project dir> (or below it) and updated since <since>
@@ -19,8 +20,17 @@ in the directory (`harness vault import`). The database is shared by every openc
 session of the user (or of every harness container), so the directory filter
 is what keeps other projects' conversations out of the vault. Prints the files it wrote. Never fails the
 launch: any problem is one line on stderr and exit status 0.
+
+With --launch, each session updated since then gets `ticket:` (from
+--ticket) and `context:` in its front matter: the instruction files the
+launch gave the model (--context, in order). A file inside the vault is named
+by its vault path (git has its history); any other one (the project's
+AGENTS.md) is copied to .raw/context/<hash>.md, once per content, and named
+by that copy. Older sessions keep the ticket and context they were captured
+with.
 """
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -146,8 +156,9 @@ def describe_tool(p, directory):
     return "- " + line
 
 
-def render(con, sess):
-    """One session as markdown, or None when it has no conversation text."""
+def render(con, sess, extra=()):
+    """One session as markdown, or None when it has no conversation text.
+    `extra` are front matter lines added after the standard ones."""
     sid, title, directory, created, updated, tin, tout = sess
     body = []
     msgs = con.execute("SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, id",
@@ -197,17 +208,73 @@ def render(con, sess):
     title = redact(title or "")
     head = ["---", "type: session", "source: harness", f"session: {sid}", f"title: {_yaml(title)}",
             f"directory: {_yaml(directory)}", f"created: {_iso(created)}", f"updated: {_iso(updated)}",
-            f"tokens_input: {tin or 0}", f"tokens_output: {tout or 0}", "---", "",
+            f"tokens_input: {tin or 0}", f"tokens_output: {tout or 0}", *extra, "---", "",
             f"# {title or sid}", ""]
     return "\n".join(head) + redact("\n\n".join(body)) + "\n"
 
 
+def context_refs(vault, files):
+    """The vault paths naming each instruction file; a file from outside the
+    vault is copied to .raw/context/<sha12>.md first."""
+    refs, root = [], _norm_dir(os.path.abspath(vault))
+    for f in files:
+        try:
+            with open(f, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        full = _norm_dir(os.path.abspath(f))
+        if full.startswith(root + "/"):
+            refs.append(full[len(root) + 1:])
+            continue
+        rel = f".raw/context/{hashlib.sha256(data).hexdigest()[:12]}.md"
+        dest = os.path.join(vault, rel)
+        if not os.path.exists(dest):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            text = redact(data.decode("utf-8", "replace"))
+            with open(dest, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(f"---\ntype: context\ntitle: {_yaml('instructions from ' + os.path.basename(f))}\n"
+                         f"path: {_yaml(f)}\n---\n\n{text}")
+        refs.append(rel)
+    return refs
+
+
+def _old_lines(path, keys):
+    """Front matter lines starting with one of `keys` in an existing file."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = f.read(4000)
+    except OSError:
+        return []
+    end = head.find("\n---", 4)
+    return [ln for ln in head[4:end].splitlines() if ln.split(":", 1)[0] in keys] if end > 0 else []
+
+
 def main(argv):
-    if len(argv) != 5:
-        print("usage: vault_capture.py <opencode.db> <vault dir> <since epoch ms> <project dir>",
-              file=sys.stderr)
+    args, opts = [], {"--launch": None, "--ticket": "", "--context": []}
+    it = iter(argv[1:])
+    for a in it:
+        if a in opts:
+            v = next(it, "")
+            if a == "--context":
+                opts[a].append(v)
+            else:
+                opts[a] = v
+        else:
+            args.append(a)
+    if len(args) != 4:
+        print("usage: vault_capture.py <opencode.db> <vault dir> <since epoch ms> <project dir>"
+              " [--launch MS] [--ticket KEY] [--context FILE]...", file=sys.stderr)
         return 0
-    db, vault, since, project = argv[1], argv[2], int(argv[3]), argv[4]
+    db, vault, since, project = args[0], args[1], int(args[2]), args[3]
+    launch = int(opts["--launch"]) if (opts["--launch"] or "").isdigit() else None
+    fresh = []
+    if launch is not None:
+        if re.match(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$", opts["--ticket"]):
+            fresh.append(f"ticket: {opts['--ticket']}")
+        refs = context_refs(vault, opts["--context"]) if opts["--context"] else []
+        if refs:
+            fresh.append("context: [" + ", ".join(_yaml(r) for r in refs) + "]")
     if not os.path.isfile(db):
         return 0
     try:
@@ -221,11 +288,17 @@ def main(argv):
         for sess in sessions:
             if not _in_dir(sess[2], project):
                 continue
-            text = render(con, sess)
-            if text is None:
-                continue
             day = datetime.datetime.fromtimestamp(sess[3] / 1000, datetime.timezone.utc).strftime("%Y-%m-%d")
             path = os.path.join(out, f"{day}-{sess[0]}.md")
+            # This launch's ticket and context for the sessions it touched;
+            # the others keep what an earlier capture recorded.
+            if launch is not None and sess[4] >= launch:
+                extra = fresh
+            else:
+                extra = _old_lines(path, ("ticket", "context"))
+            text = render(con, sess, extra)
+            if text is None:
+                continue
             os.makedirs(out, exist_ok=True)
             # Never shrink a captured session: if opencode lost messages (an
             # undo, a revert), the file keeps what it had.

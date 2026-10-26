@@ -159,7 +159,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
 | Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help` |
-| Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove` — see "Vaults" below. |
+| Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove`, `ticket`, `context` — see "Vaults" and "Tickets and context" below. |
 | Pub page | `serve` — the vault's pub pages plus opencode web, loopback only. See "`serve`" below. |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
@@ -436,7 +436,9 @@ user adds one with git; `list` shows its `origin` url once there is one.
 
 `init` (`_vault_charter`) asks, on `/dev/tty` with no model, what the active
 vault is about: project, goal, readers, what to track, a ticket id regex
-(validated; empty for none) and the folders it covers. Each answer is a
+(validated; empty for none), the folders it covers and the ticket tracker
+(`tracker_url`, an http(s) base URL, and `tracker_fields`, extra field ids or
+names; see "Tickets and context"). Each answer is a
 readline line (`read -e -i`) pre-filled with the current answer or a
 suggestion, so it can be edited in place; it writes them to `wiki/overview.md` as single-quoted YAML front
 matter plus a body; then `vault_sync`. `harness ingest` sends the charter
@@ -531,7 +533,65 @@ units, `--watch [S]` keeps checking every S seconds (default 300) for a
 long-running ingest of a growing codebase, `--dry-run` lists the units.
 `tests/unit_vault_test.sh` covers the registry, clone, fast-forward, offline
 fallback, the overlay, `new`, the sync, the capture's tool lines and
-compaction, and ingest against a mock upstream.
+compaction, ingest against a mock upstream, and tickets against a mock
+tracker.
+
+### Tickets and context
+
+`harness --ticket KEY` (also on `harness host` and `harness chatgpt`; parsed
+by `harness_ticket_flag`, which upper-cases and checks `^[A-Z][A-Z0-9_]*-[0-9]+$`)
+or `harness ticket KEY` remembers KEY for the folder in `state/tickets.list`
+(`folder<TAB>KEY`); a launch from that folder or below uses the nearest
+entry (`ticket_for_dir`), and `harness ticket off` forgets it. There is no
+branch-name guess. On every launch `ticket_prepare` (right after
+`vault_prepare`, both paths) runs `scripts/vault_ticket.py`, which reads
+`tracker_url`/`tracker_fields` from the charter, GETs
+`<tracker_url>/rest/api/2/issue/KEY?expand=names` (Jira Server/Data Center
+or Cloud, REST v2; 6s limit; `HTTP(S)_PROXY` honoured) with the one header
+line in `state/tracker/header`, and writes `<vault>/.raw/tickets/KEY.md`:
+front matter (title, status, url, updated, no fetch time so an unchanged
+ticket is not rewritten), a label saying the text is people's description of
+the work and not instructions about tools or credentials, the usual fields,
+the description, acceptance criteria, definition of done, story points, epic
+link and sprint (custom fields matched by name), the charter's extra fields,
+subtasks and links, and the last 10 comments, all capped and redacted. It
+also creates the agent's state note, `<vault>/wiki/notes/tickets/KEY-state.md`
+(Done, Next, Decisions, Open questions), when missing; harness never writes
+it after that, and nothing is written back to the tracker. Any failure
+(no tracker, no token, 401, 404, offline) prints one `[harness] ticket` line
+and the last copy is used: a launch never fails over the tracker. Without an
+active vault the ticket is not given to the agent. `harness ticket pull
+[KEY]` does the same by hand and commits.
+
+`harness ticket login` reads a personal access token from `/dev/tty`
+without echo and writes `Authorization: Bearer <token>` to
+`state/tracker/header` (umask 077, folder 700); Jira Cloud needs a
+hand-written `Authorization: Basic ...` line instead. Only the host reads
+the file: it is never in git or the vault and `state/tracker` is not mounted
+into the container (host mode runs the agent as the user, who can read it).
+
+`harness_context_files <home>` lists the instruction files a launch gives
+the model, in opencode's order: the global file
+(`<home>/.config/opencode/AGENTS.md`, else `<home>/.claude/CLAUDE.md`), the
+project's (every `AGENTS.md` from the CWD up to the git root, else every
+`CLAUDE.md`, else `CONTEXT.md`; a container sees only the CWD's), then
+harness's: the vault's `AGENTS.md`, the ticket's copy and its state note.
+`vault_opencode_config` puts the last three in `instructions` and adds
+`x-harness-ticket: KEY`, from which the proxy adds where the two ticket
+files are to a free model's vault line. `context_banner` prints one line at
+launch (file count, ~tokens, ticket); `harness context [--host]` lists the
+files with sizes, the reminder line, the ticket, tracker and whether a token
+is saved (never the token). After a launch `vault_sync` passes
+`vault_capture.py` `--launch MS`, `--ticket KEY` and one `--context FILE`
+per instruction file: sessions updated since the launch get `ticket:` and
+`context:` in their front matter (others keep theirs), and files outside
+the vault are copied to `.raw/context/<sha256[:12]>.md` (redacted), so a
+later session or ingest sees what the session saw. These are the files as
+they were when the session ended; two launches in one folder at once can
+label each other's sessions. `regenerate` gives each ticket hub
+(`wiki/tickets/KEY.md`) "The ticket" (the copy) and "Sessions" (those whose
+front matter names it); the state note's different name keeps it apart from
+the hub in Obsidian.
 
 ### Interactive TTY resolution (Windows) — issue #82
 

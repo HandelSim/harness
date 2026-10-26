@@ -349,7 +349,11 @@ project or past work; its `AGENTS.md` says how to write there. A free model sees
 the vault's `AGENTS.md` only at the start of a long, truncated history, so the
 pointer has to ride the per-turn reminder. Values that are empty, over 400
 characters or carry control characters add nothing; the native route ignores
-the header.
+the header. With a ticket the launch also sends `x-harness-ticket: KEY`, and
+the sentence goes on to name the ticket's copy (`<vault>/.raw/tickets/KEY.md`)
+and its state note (`<vault>/wiki/notes/tickets/KEY-state.md`, kept up to date
+as each step is finished). A key that is not `ABC-123` shaped or is over 40
+characters, or a ticket without a vault, adds nothing.
 
 ## Cooperative-prompt modes (`PROXY_PROMPT_MODE`)
 

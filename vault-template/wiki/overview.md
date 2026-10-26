@@ -7,6 +7,8 @@ readers: ''
 track: ''
 ticket_pattern: ''
 covers: ''
+tracker_url: ''
+tracker_fields: ''
 ---
 
 # Overview

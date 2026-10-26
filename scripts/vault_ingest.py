@@ -616,20 +616,50 @@ def regenerate(vault):
     def summ(rel):
         return pages[rel]["meta"].get("summary", "") if rel in pages else ""
 
-    def hub(folder, kind, name, refs, intro):
+    def hub(folder, kind, name, refs, intro, more=(), summary=None):
         rel = f"{folder}/{name}.md"
         lines = [f"- [[{pages[r]['name']}]]: {summ(r)}" for r in sorted(refs)]
-        text = (f"---\ntype: {kind}\nsummary: {yq(f'{len(refs)} pages about {name}')}\n{GENERATED}\n---\n\n"
-                f"# {name}\n\n{intro}\n\n" + "\n".join(lines) + "\n")
+        summary = summary or f"{len(refs)} pages about {name}"
+        text = (f"---\ntype: {kind}\nsummary: {yq(summary)}\n{GENERATED}\n---\n\n"
+                f"# {name}\n\n{intro}\n\n" + "\n".join(lines) + "\n" + "".join(more))
         write_if_changed(os.path.join(vault, "wiki", rel), text)
         return rel
 
+    # Tickets worked on with `harness --ticket`: the tracker's copy in
+    # .raw/tickets/ and the sessions whose front matter names the ticket.
+    def source(raw_rel, title):
+        """A .raw file as a link to its source page once ingested, else its path."""
+        stem = re.sub(r"\.[A-Za-z0-9]+$", "", raw_rel)
+        page = "--".join(safe_name(p) for p in stem.split("/"))
+        link = f"[[{page}]]" if f"sources/{page}.md" in pages else f"`.raw/{raw_rel}`"
+        return f"- {link}" + (f": {title}" if title else "") + "\n"
+
+    worked = {}
+    for sub in ("tickets", "sessions"):
+        d = os.path.join(vault, ".raw", sub)
+        for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            if not n.endswith(".md"):
+                continue
+            meta, _ = frontmatter(read_text(os.path.join(d, n), 4000) or "")
+            t = meta.get("ticket", "").strip()
+            if t and BAD_NAME.search(t) is None:
+                w = worked.setdefault(t, {"tickets": [], "sessions": []})
+                w[sub].append(source(f"{sub}/{n}", meta.get("title", "")))
     keep = set()
     for t, refs in topics.items():
         if len(refs) >= 2:
             keep.add(hub("topics", "topic", t, refs, "Generated topic hub: every page whose Topics line names it."))
-    for t, refs in tickets.items():
-        keep.add(hub("tickets", "ticket", t, refs, "Generated ticket hub: every page that mentions this ticket."))
+    for t in sorted(set(tickets) | set(worked)):
+        w = worked.get(t, {})
+        more = []
+        if w.get("tickets"):
+            more += ["\n## The ticket\n\nAs written in the tracker, refreshed at each launch:\n\n"] + w["tickets"]
+        if w.get("sessions"):
+            more += [f"\n## Sessions ({len(w['sessions'])})\n\n"] + w["sessions"]
+        n = len(tickets.get(t, ()))
+        summary = f"{n} pages about {t}" + (f", {len(w['sessions'])} sessions on it" if w.get("sessions") else "")
+        keep.add(hub("tickets", "ticket", t, tickets.get(t, set()),
+                     "Generated ticket hub: every page that mentions this ticket.", more, summary))
     for rel, p in list(pages.items()):
         if hubs(rel) and p["generated"] and rel not in keep:
             os.remove(p["path"])

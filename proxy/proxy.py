@@ -3296,21 +3296,30 @@ def _extract_working_directory(system_content):
 # vault's AGENTS.md only at the start of a long, truncated history, so the
 # reminder's Environment bullet names the vault and how to look things up in
 # it, every turn. Native models read the instructions and get no line.
+# `x-harness-ticket: <KEY>` (`harness --ticket KEY`) adds where the ticket
+# and its state note are: a pointer, never the ticket's text.
 _VAULT_HEADER = "x-harness-vault"
+_TICKET_HEADER = "x-harness-ticket"
+_TICKET_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
 
 
-def _vault_clause(vault):
+def _vault_clause(vault, ticket=None):
     v = str(vault or "").strip()
     if not v or len(v) > 400 or any(ord(c) < 32 for c in v):
         return ""
-    return (f" Knowledge vault: `{v}` holds this project's notes, past sessions and decisions."
-            f" Before answering about the project, its code or past work, `grep` `{v}/wiki/index.md`"
-            f" and then `{v}/wiki` for the key words and `read` the matching pages; `{v}/AGENTS.md`"
-            " says how to write there.")
+    out = (f" Knowledge vault: `{v}` holds this project's notes, past sessions and decisions."
+           f" Before answering about the project, its code or past work, `grep` `{v}/wiki/index.md`"
+           f" and then `{v}/wiki` for the key words and `read` the matching pages; `{v}/AGENTS.md`"
+           " says how to write there.")
+    t = str(ticket or "").strip()
+    if len(t) <= 40 and _TICKET_RE.match(t):
+        out += (f" Current ticket: {t}, described in `{v}/.raw/tickets/{t}.md`; keep its state"
+                f" (done, next, decisions) in `{v}/wiki/notes/tickets/{t}-state.md` as you finish each step.")
+    return out
 
 
 def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None, working_directory=None, todos=None,
-                                             vault=None):
+                                             vault=None, ticket=None):
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). The recency message that lands on the LAST user
@@ -3394,7 +3403,7 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     else:
         cwd_clause = ""
     if vault:
-        cwd_clause += _vault_clause(vault)
+        cwd_clause += _vault_clause(vault, ticket)
     tool_entries = _format_tool_entries(tool_signatures, tool_details)
     if _REMINDER_TEMPLATE is None:
         # Lazy load so importing proxy.py (tests) needs no main() call.
@@ -3914,6 +3923,7 @@ def translate_history_and_apply_prompt(
     tools_text: str,
     tools: Optional[List[Dict[str, Any]]] = None,
     vault: Optional[str] = None,
+    ticket: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
     Translate the inbound OpenAI-format messages into a flat conversation
@@ -4165,6 +4175,7 @@ def translate_history_and_apply_prompt(
                     working_directory=working_directory,
                     todos=todos,
                     vault=vault,
+                    ticket=ticket,
                 )
 
     if _PROMPT_MODE == "single":
@@ -5250,7 +5261,8 @@ def catch_all(path: str) -> Response:
 
         tools_text = format_tools_to_text(prompt_tools)
         translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=prompt_tools,
-                                                        vault=request.headers.get(_VAULT_HEADER))
+                                                        vault=request.headers.get(_VAULT_HEADER),
+                                                        ticket=request.headers.get(_TICKET_HEADER))
 
         # Catalog-size instrumentation (council gate-trigger). `tools` ≈ recency
         # line count (one entry per tool); `schema_tokens` is what the full
