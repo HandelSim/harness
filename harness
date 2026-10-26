@@ -531,7 +531,8 @@ _sweep_stale_jq_sidecars() {
 # a detached HEAD. A local branch that origin doesn't have never caches a
 # value, so it never shows a banner.
 #
-# Used by run_agent and cmd_shell at startup with the default 4s budget,
+# Used by run_agent, cmd_shell, cmd_host and cmd_serve at startup with the
+# default 4s budget,
 # and by cmd_check_updates with a longer budget for an explicit foreground
 # check.
 
@@ -560,6 +561,30 @@ _update_is_behind() {
     ! git -C "$install_root" merge-base --is-ancestor "$1" HEAD 2>/dev/null
 }
 
+# The remote HEAD of origin's branch $2, or nothing: `git ls-remote` bounded
+# by $1 seconds. macOS ships no `timeout` (a bare call there always failed,
+# so no banner ever showed); without it the lookup runs in the background
+# and is killed at the deadline. No credential prompt: a lookup that needs
+# one counts as failed.
+_update_remote_head() {
+    local secs="$1" ref="refs/heads/$2" out="" tmp pid i
+    if command -v timeout >/dev/null 2>&1; then
+        out=$(GIT_TERMINAL_PROMPT=0 timeout "$secs" git -C "$install_root" ls-remote origin "$ref" 2>/dev/null || true)
+    elif tmp=$(mktemp 2>/dev/null); then
+        GIT_TERMINAL_PROMPT=0 git -C "$install_root" ls-remote origin "$ref" >"$tmp" 2>/dev/null &
+        pid=$!
+        for (( i = 0; i < secs * 10; i++ )); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        out=$(cat "$tmp" 2>/dev/null || true)
+        rm -f "$tmp"
+    fi
+    awk -v r="$ref" '$2 == r { print $1 }' <<<"$out"
+}
+
 _update_check_and_banner() {
     [[ "${HARNESS_SKIP_UPDATE_CHECK:-0}" == "1" ]] && return 0
     [[ -d "${install_root}/.git" ]] || return 0
@@ -572,14 +597,9 @@ _update_check_and_banner() {
     local remote_head
 
     # Synchronous check, bounded so a flaky network can't stall agent
-    # startup. `timeout` exits 124 on the deadline, non-zero on other
-    # failures; either way we treat $remote_head as empty and fall back
-    # to the cache. `|| true` is required because the script runs under
-    # `set -euo pipefail` — without it, a failed ls-remote (offline,
-    # missing remote, timeout) would propagate out of the pipeline and
-    # abort the agent launch.
-    remote_head=$(timeout "$timeout_secs" git -C "$install_root" ls-remote origin "refs/heads/${branch}" 2>/dev/null \
-        | awk -v r="refs/heads/${branch}" '$2 == r { print $1 }' || true)
+    # startup. A failed or timed-out lookup (offline, missing remote) leaves
+    # $remote_head empty and we fall back to the cache.
+    remote_head=$(_update_remote_head "$timeout_secs" "$branch")
     if [[ -n "$remote_head" ]]; then
         mkdir -p "${install_root}/state" 2>/dev/null
         printf '%s %s\n' "$branch" "$remote_head" >"$cache" 2>/dev/null
@@ -612,10 +632,7 @@ cmd_check_updates() {
     fi
     local local_head remote_head
     local_head=$(git -C "$install_root" rev-parse HEAD 2>/dev/null)
-    # `|| true` defends against pipefail aborting on offline / missing
-    # remote — we want the empty-stdout path below to handle it cleanly.
-    remote_head=$(timeout 10 git -C "$install_root" ls-remote origin "refs/heads/${branch}" 2>/dev/null \
-        | awk -v r="refs/heads/${branch}" '$2 == r { print $1 }' || true)
+    remote_head=$(_update_remote_head 10 "$branch")
     if [[ -z "$remote_head" ]]; then
         err "could not reach origin/${branch} (offline, no remote configured, or origin has no '${branch}' branch)"
         return 1
@@ -6784,6 +6801,8 @@ EOF
 
     host_require_python3 || exit 1
     host_require_config
+    # The update banner, as run_agent shows it; never blocks the launch.
+    _update_check_and_banner 4 || true
     host_confirm_gate "$yolo" || exit 1
 
     ensure_dirs
@@ -6960,6 +6979,8 @@ HELP
 
     host_require_python3 || exit 1
     host_require_config
+    # The update banner, as run_agent shows it; never blocks the launch.
+    _update_check_and_banner 4 || true
     host_confirm_gate 0 || exit 1
     ensure_dirs
     host_ensure_toolchain || { host_win_location_hint; exit 1; }

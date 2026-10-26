@@ -1224,7 +1224,8 @@ Covered by `tests/unit_chatgpt_test.sh` (docker-free) and the ChatGPT classes in
 
 ## Update-available banner
 
-`_update_check_and_banner` runs synchronously on every agent launch with
+`_update_check_and_banner` runs synchronously on every agent launch
+(`run_agent`, `cmd_shell`, and host mode's `cmd_host` and `cmd_serve`) with
 a tight (4s) timeout against `origin/<branch>`, where `<branch>` is the one
 the clone is on (`main` or `dev` from the installer), the same branch `harness
 update`/`upgrade` pull. The banner shows only when the remote has commits HEAD
@@ -1234,7 +1235,10 @@ users on flaky networks still get the banner; the cache is only used for the
 branch that wrote it (a legacy bare-SHA cache counts as `main`), and a branch
 origin doesn't have never caches one. Skipped entirely when
 `HARNESS_SKIP_UPDATE_CHECK=1`, when not in a git checkout, or on a detached
-HEAD. Advisory only — never gates a launch.
+HEAD. Advisory only — never gates a launch. The lookup
+(`_update_remote_head`) uses `timeout` where it exists and otherwise (macOS)
+a background `git ls-remote` killed at the deadline, with no credential
+prompt.
 
 `cmd_check_updates` runs the same check in the foreground with a longer
 budget for an explicit "am I up to date?" query. Covered by

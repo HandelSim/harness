@@ -16,6 +16,10 @@
 #         cache gives no banner on main, and a legacy bare-SHA cache (written
 #         only on main) still gives one on main.
 #   - T5: a local branch origin doesn't have: no banner, launch unaffected.
+#   - T6: no `timeout` on the host (macOS): the banner still shows, and a
+#         remote that never answers is cut off at the deadline.
+#   - T7: `harness host` and `harness serve` show the banner before their
+#         confirm prompt.
 #
 # Prints "UPDATE CHECK TEST PASSED" on success.
 
@@ -103,6 +107,44 @@ rc=0; out="$(banner)" || rc=$?
 (( rc == 0 )) || fail "T5: helper returned rc=$rc"
 ! grep -q "update available" <<<"$out" || fail "T5: banner on a branch origin doesn't have — $out"
 ok "T5: a local-only branch gets no banner"
+
+# --- T6: no `timeout` command -------------------------------------------------------
+# A function named `command` hides `timeout` from the helper's lookup.
+banner_no_timeout() {
+    # shellcheck disable=SC1090
+    ( HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$ROOT" source "$HARNESS" >/dev/null 2>&1
+      command() { [[ "$*" == "-v timeout" ]] && return 1; builtin command "$@"; }
+      _update_check_and_banner "${1:-4}" 2>&1 )
+}
+git -C "$ROOT" checkout -q dev
+advance dev
+rm -f "$CACHE"
+out="$(banner_no_timeout)"
+grep -q "update available on dev" <<<"$out" || fail "T6: no banner without a timeout command — $out"
+# A transport that sleeps stands in for a remote that never answers.
+git -C "$ROOT" remote set-url origin "ext::sleep 30"
+rm -f "$CACHE"
+start=$SECONDS
+out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=protocol.ext.allow GIT_CONFIG_VALUE_0=always banner_no_timeout 1)"
+(( SECONDS - start <= 5 )) || fail "T6: the lookup was not cut off at its deadline ($((SECONDS - start))s)"
+! grep -q "update available" <<<"$out" || fail "T6: a hung lookup with no cache showed a banner — $out"
+git -C "$ROOT" remote set-url origin "$REMOTE"
+ok "T6: without timeout the banner still shows and a hung remote is cut off"
+
+# --- T7: host mode launches show the banner ---------------------------------------
+# Stubs stop each launch at its confirm prompt, after the check.
+launch_banner() {
+    # shellcheck disable=SC1090
+    ( HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$ROOT" source "$HARNESS" >/dev/null 2>&1
+      host_require_python3() { :; }; host_require_config() { :; }; host_confirm_gate() { return 1; }
+      "$1" 2>&1 ) || true
+}
+rm -f "$CACHE"
+for c in cmd_host cmd_serve; do
+    out="$(launch_banner "$c")"
+    grep -q "update available on dev" <<<"$out" || fail "T7: $c showed no banner — $out"
+done
+ok "T7: harness host and harness serve show the banner"
 
 echo
 echo "UPDATE CHECK TEST PASSED"
