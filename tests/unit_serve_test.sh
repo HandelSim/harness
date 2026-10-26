@@ -261,6 +261,11 @@ sleep 0.3
 ok "S7: live-run.sh attaches run to its own serve, relays the inbox, falls back to a plain run, cleans up when killed"
 
 # --- S8: a headless launch brings up the run viewer (harness_view) -------------
+# harness_view (like the real launch path) leaves the viewer out when $CI is
+# set, so unset it here to exercise the start/reuse path. CI is the test's own
+# environment, not the thing under test; the HARNESS_OPEN=0 case below still
+# proves suppression on its own.
+unset CI
 state_root="$TMP_ROOT/view"
 mkdir -p "$state_root"
 VB="$TMP_ROOT/viewbin"; mkdir -p "$VB"
