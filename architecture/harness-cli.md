@@ -159,7 +159,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
 | Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help` |
-| Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove`, `ticket`, `context` — see "Vaults" and "Tickets and context" below. |
+| Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove`, `ticket`, `context`, `queue` — see "Vaults", "Tickets and context" and "Ticket queue" below. |
 | Pub page | `serve` — the vault's pub pages plus opencode web, loopback only. See "`serve`" below. |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
@@ -598,6 +598,54 @@ label each other's sessions. `regenerate` gives each ticket hub
 (`wiki/tickets/KEY.md`) "The ticket" (the copy), a link to the state note
 and "Sessions" (those whose front matter names it); the state note's different name keeps it apart from
 the hub in Obsidian.
+
+### Ticket queue
+
+`harness queue` (`cmd_queue`, then `scripts/ticket_queue.py`) works queued
+tickets one at a time with no one at the keyboard. `add KEY... [--dir]
+[--base]` records the project and base (default: its current branch);
+`run [--host] [--single-message]` needs an active vault, does the launch
+checks once (host mode when docker is missing, `host_confirm_gate` asked
+once), starts the host proxy if it is not running and hands the rest to the
+Python script. `list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
+(`$EDITOR` without TEXT), `findings`, `watch` (tails `run.log`) and `log
+[KEY]` are the owner's side.
+
+Stages, each a fresh `harness [host] -p --yolo --ticket KEY -m MODEL PROMPT`
+in `state/queue/KEY/repo` (a clone at the base on `ticket/KEY`, its origin
+removed): `plan` → `implement` → `review` → `fix` (once, when the review has
+Must fix items) → `push`. The prompt (`scripts/queue_prompts/<stage>.md`)
+embeds the ticket, plan, answers and the last attempt's problems, capped to
+fit one argv argument, because the free models only read the last message.
+The model is `QUEUE_MODEL`, else the default model's free twin when it is a
+`-withtools` one (`resolve_model`). Plan, review, answers and findings live
+in the vault at `wiki/notes/tickets/KEY-{plan,review,answers,findings}.md`.
+
+After a stage harness runs its own gates (the plan's six sections, 1-15
+criteria, at most 3 questions each with a default and `[blocking]` or
+`[non-blocking]`; commits, a non-empty diff, nothing under `.github/`, no
+key file, no key-shaped added line, no value of a secret env var), then
+one raw verifier call through the proxy (`verify_plan.md` /
+`verify_change.md`, JSON only, three tries). The verifier must quote the
+ticket for each plan criterion and the diff for each criterion met;
+`judge()` checks every quote is really in the source. A failed stage runs
+`QUEUE_RETRIES` more times with the problems as feedback, then the ticket is
+`blocked`. Before a failure counts, one probe request checks the upstream;
+if it does not answer the run exits 3 and the ticket keeps its stage. A
+blocking question parks the ticket as `needs-answers` and the queue moves
+on; `QUEUE_PLAN_REVIEW=1` holds each plan as `plan-review` for `approve`.
+
+Harness never runs git in the clone once an agent has had it: it fetches
+`ticket/KEY` into the project as `refs/harness-queue/KEY`, diffs there,
+updates the project's `ticket/KEY` only by fast-forward and pushes
+`sha:refs/heads/ticket/KEY` to `QUEUE_REMOTE` without force (`QUEUE_PUSH=0`
+keeps it local). Before each ticket `queue _pull` refreshes the vault's copy
+of the ticket; after each stage `queue _sync` captures the session (host or
+container database) into the vault. Nothing is written to the tracker.
+State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
+attempt, feedback), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
+as `KEY/verify-*.txt`, and `run.lock` (one run at a time). Covered by
+`tests/unit_queue_test.sh`.
 
 ### Interactive TTY resolution (Windows) — issue #82
 
