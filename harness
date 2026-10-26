@@ -6431,17 +6431,17 @@ usage: harness queue [list]                 the queue: each ticket's status and 
 
 Each ticket goes through these stages, each one a fresh headless agent launch
 (the firewalled container; host mode with --host or without docker) in its own
-clone of the project, state/queue/KEY/repo, on branch ticket/KEY:
+clone of the project, state/queue/KEY/repo, on branch KEY:
 
   plan       reads the ticket and the code; writes wiki/notes/tickets/KEY-plan.md
              in the vault: goal, acceptance criteria, approach, files, at most 3
              questions each with a default, assumptions. A [blocking] question
              holds the ticket (needs-answers) and the queue moves on.
-  implement  changes the code and commits on ticket/KEY.
+  implement  changes the code and commits on branch KEY.
   review     a fresh session checks the change from several angles (criteria,
              correctness, security, scope, simplicity) into KEY-review.md.
   fix        once, when the review has Must fix items.
-  push       harness (not the agent) pushes ticket/KEY to QUEUE_REMOTE, no force.
+  push       harness (not the agent) pushes branch KEY to QUEUE_REMOTE, no force.
 
 After each stage harness checks the result (the plan's sections; commits, a
 non-empty diff, no .github/ change, no secret) and a verifier model must quote
@@ -6449,7 +6449,8 @@ the ticket for each acceptance criterion and the diff for each one met; harness
 checks the quotes are really there. A failed stage runs once more with the
 problems listed, then the ticket is blocked. If the upstream stops answering,
 the run stops and the ticket keeps its place. Bugs an agent notices outside its
-ticket go to KEY-findings.md. Nothing is written to the tracker. There is no
+ticket go to KEY-findings.md; the queue's log of each ticket, verdicts included,
+goes to KEY-log.md in the vault. Nothing is written to the tracker. There is no
 test stage yet: read each branch before you merge it.
 
 Settings (.env): QUEUE_MODEL (default: the default model, its free twin when it

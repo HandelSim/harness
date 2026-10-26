@@ -14,7 +14,7 @@ plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
 Each stage is one fresh, headless agent launch through the harness CLI
 (`harness -p --yolo --ticket KEY -m MODEL PROMPT`: the firewalled container,
 or host mode) in the ticket's own clone of the project, state/queue/KEY/repo,
-on branch ticket/KEY. The prompt (scripts/queue_prompts/<stage>.md) carries
+on branch KEY. The prompt (scripts/queue_prompts/<stage>.md) carries
 everything the stage needs, the ticket, the plan, the answers and the last
 attempt's problems, because the free models only read the last message.
 
@@ -29,7 +29,7 @@ the upstream does not answer (one probe request), the whole run stops and the
 ticket stays where it was.
 
 harness never runs git inside the clone once the agent has had it: it fetches
-ticket/KEY into the project (refs/harness-queue/KEY), diffs there and pushes
+branch KEY into the project (refs/harness-queue/KEY), diffs there and pushes
 from there, without force. Nothing is ever written to the tracker.
 """
 import argparse
@@ -44,7 +44,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vault_ingest import InfraError, call_model, resolve_model  # noqa: E402
+from vault_ingest import InfraError, call_model, resolve_model, yq  # noqa: E402
 
 PROMPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_prompts")
 STAGE_TIMEOUT = 3 * 3600   # one agent launch; a cooperative turn alone can take 15 minutes
@@ -135,7 +135,7 @@ def note_paths(vault, key):
     d = os.path.join(vault, "wiki", "notes", "tickets")
     return {"plan": os.path.join(d, f"{key}-plan.md"), "review": os.path.join(d, f"{key}-review.md"),
             "findings": os.path.join(d, f"{key}-findings.md"), "answers": os.path.join(d, f"{key}-answers.md"),
-            "state": os.path.join(d, f"{key}-state.md"),
+            "state": os.path.join(d, f"{key}-state.md"), "log": os.path.join(d, f"{key}-log.md"),
             "ticket": os.path.join(vault, ".raw", "tickets", f"{key}.md")}
 
 
@@ -210,7 +210,7 @@ def git(cwd, *args, check=True, timeout=300):
 
 
 def make_clone(q, st):
-    """Clone the project at its base into DIR/repo, on a new branch ticket/KEY.
+    """Clone the project at its base into DIR/repo, on a new branch KEY (the ticket key).
     Runs before any agent touches the clone; the clone has no remote, so the
     agent cannot push anywhere."""
     dest = os.path.join(q.dir(st["key"]), "repo")
@@ -220,7 +220,7 @@ def make_clone(q, st):
     base_sha = git(st["project"], "rev-parse", "--verify", st["base"] + "^{commit}").stdout.strip()
     subprocess.run(["git", "clone", "-q", "--no-checkout", st["project"], tmp], check=True,
                    capture_output=True, text=True, timeout=600)
-    git(tmp, "checkout", "-q", "-b", f"ticket/{st['key']}", base_sha)
+    git(tmp, "checkout", "-q", "-b", st["key"], base_sha)
     git(tmp, "remote", "remove", "origin")
     for k, fallback in (("user.name", "harness queue"), ("user.email", "harness-queue@localhost")):
         v = git(st["project"], "config", k, check=False).stdout.strip()
@@ -231,12 +231,12 @@ def make_clone(q, st):
 
 
 def fetch_branch(q, st):
-    """Fetch the clone's ticket/KEY into the project; (sha, diff, files, commits)
+    """Fetch the clone's branch KEY into the project; (sha, diff, files, commits)
     or None when the branch has no commits of its own."""
     key, project = st["key"], st["project"]
     ref = f"refs/harness-queue/{key}"
     r = git(project, "fetch", "-q", "--no-tags", os.path.join(q.dir(key), "repo"),
-            f"+refs/heads/ticket/{key}:{ref}", check=False)
+            f"+refs/heads/{key}:{ref}", check=False)
     if r.returncode != 0:
         return None
     sha = git(project, "rev-parse", ref).stdout.strip()
@@ -251,7 +251,7 @@ def fetch_branch(q, st):
 def check_change(st, change, plan_text):
     """Hard gates on a branch, and the warnings that are not gates."""
     if change is None:
-        return [f"no commits on branch ticket/{st['key']}: commit your change on that branch (git add, git commit)"], []
+        return [f"no commits on branch {st['key']}: commit your change on that branch (git add, git commit)"], []
     _, diff, files, _ = change
     problems, warnings = [], []
     if not diff.strip():
@@ -340,13 +340,30 @@ def ask_verifier(ctx, prompt, key, stage):
             "unreadable": True}
 
 
-def judge(obj, criteria, source, quote_field, what):
+REMOVAL = re.compile(r"(?i)\b(remov|delet|drop|strip|get rid|no longer|stop|deprecat|eliminat)")
+
+
+def diff_sides(diff):
+    """(added, removed) lines of a diff, each normalized; context lines are in neither."""
+    lines = diff.replace("\r\n", "\n").splitlines()
+    added = [l for l in lines if l.startswith("+") and not l.startswith("+++ ")]
+    removed = [l for l in lines if l.startswith("-") and not l.startswith("--- ")]
+    return norm("\n".join(added), diff=True), norm("\n".join(removed), diff=True)
+
+
+def judge(obj, criteria, source, quote_field, what, notes=""):
     """Problems with a verdict: every criterion answered, met (for a change),
-    and every quote found in <source>."""
+    and every quote found in <source>. For a diff a quote must be from an added
+    line (a removed one when the criterion is about removing; never an unchanged
+    one); a reviewer's "(review)" item may instead quote <notes>, the commit
+    messages saying why it is wrong."""
     if obj.get("unreadable"):
         return [str(p) for p in obj["problems"]]
     problems = []
-    src = norm(source, diff=(what == "diff"))
+    if what == "diff":
+        added, removed = diff_sides(source)
+    else:
+        src = norm(source)
     got = {}
     for c in obj.get("criteria", []):
         if isinstance(c, dict):
@@ -368,7 +385,12 @@ def judge(obj, criteria, source, quote_field, what):
             if what == "diff":
                 problems.append(f"criterion {i}: no quote from the diff shows it is met")
             continue
-        if len(quote) >= 8 and quote in src:
+        if what == "diff":
+            ok = quote in added or (REMOVAL.search(crit) and quote in removed) \
+                or (crit.startswith("(review) ") and quote in norm(notes))
+        else:
+            ok = quote in src
+        if len(quote) >= 8 and ok:
             found += 1
         else:
             problems.append(f"criterion {i}: the quoted {what} text is not in the {what}: {quote[:120]}")
@@ -418,10 +440,22 @@ def run_agent(ctx, st, stage, prompt):
             raise
         finally:
             ctx.child = None
-    # Capture the session into the vault (best effort; never fails the stage).
+    sync_vault(ctx, key, since)
+    return rc, out
+
+
+def sync_vault(ctx, key, since):
+    """Copy the ticket's queue log (stages, checks, verifier verdicts) to KEY-log.md in the
+    vault, then capture the session and commit the vault (best effort; never fails a stage)."""
+    log = read(os.path.join(ctx.q.dir(key), "log.md"))
+    if log.strip():
+        fence = "`" * max(3, 1 + max((len(m) for m in re.findall(r"`+", log)), default=0))
+        write_atomic(note_paths(ctx.vault, key)["log"],
+                     f"---\ntype: note\nticket: {key}\nsummary: {yq(f'harness queue log of {key}')}\n---\n\n"
+                     f"# {key}: queue log\n\nWritten by `harness queue`; each line is a stage, a check or a verdict.\n\n"
+                     f"{fence}text\n{log.rstrip()}\n{fence}\n")
     subprocess.run(["bash", ctx.harness, "queue", "_sync", key, os.path.join(ctx.q.dir(key), "repo"), str(since)],
                    stdin=subprocess.DEVNULL, capture_output=True, timeout=600, check=False)
-    return rc, out
 
 
 def stop(p):
@@ -450,7 +484,7 @@ def common(ctx, st):
     if len(answers) > PLAN_CAP:
         answers = "[... earlier answers cut ...]\n" + answers[-PLAN_CAP:]
     plan = read(plan_copy(ctx.q, st["key"]), PLAN_CAP) if st.get("stage", "plan") != "plan" else ""
-    return dict(KEY=st["key"], BRANCH=f"ticket/{st['key']}", BASE_SHA=st.get("base_sha", ""),
+    return dict(KEY=st["key"], BRANCH=st["key"], BASE_SHA=st.get("base_sha", ""),
                 REPO=os.path.join(ctx.q.dir(st["key"]), "repo"), TICKET_FILE=p["ticket"],
                 TICKET=read(p["ticket"], TICKET_CAP) or "(the ticket file is missing; read the path above)",
                 PLAN_FILE=p["plan"], PLAN=plan or read(p["plan"], PLAN_CAP) or "(none yet)",
@@ -516,10 +550,15 @@ def verify_change(ctx, st, rc, stage):
     if not problems:
         _, diff, files, commits = change
         ctx.q.log(st["key"], f"{stage}: {commits} commit(s), {len(files)} file(s) changed")
+        notes = ""
+        if stage == "fix" and st.get("review_sha"):
+            notes = git(st["project"], "log", "--format=%B", f"{st['review_sha']}..{change[0]}",
+                        check=False).stdout.strip()
         obj = ask_verifier(ctx, render("verify_change", TICKET=read(p["ticket"], TICKET_CAP),
-                                       CRITERIA=numbered(criteria), DIFF=cap(diff, DIFF_CAP_VERIFY)),
+                                       CRITERIA=numbered(criteria), DIFF=cap(diff, DIFF_CAP_VERIFY),
+                                       COMMITS=cap(notes, NOTE_CAP) or "(none)"),
                            st["key"], stage)
-        problems = judge(obj, criteria, diff, "quote", "diff")
+        problems = judge(obj, criteria, diff, "quote", "diff", notes)
         ctx.q.log(st["key"], f"{stage} verifier: {obj.get('verdict')} ({len(problems)} problem(s))")
         st["warnings"] = warnings
     if problems:
@@ -568,7 +607,7 @@ def stage_push(ctx, st):
     if change is None:
         return block(ctx, st, "the branch is gone from the clone")
     sha = change[0]
-    branch = f"refs/heads/ticket/{key}"
+    branch = f"refs/heads/{key}"
     old = git(project, "rev-parse", "-q", "--verify", branch, check=False).stdout.strip()
     if not old:
         git(project, "update-ref", branch, sha)
@@ -576,14 +615,14 @@ def stage_push(ctx, st):
         if git(project, "merge-base", "--is-ancestor", old, sha, check=False).returncode == 0:
             git(project, "update-ref", branch, sha, old)
         else:
-            ctx.q.log(key, f"warning: the project's ticket/{key} is not behind the queue's branch; left as it is")
+            ctx.q.log(key, f"warning: the project's branch {key} is not behind the queue's branch; left as it is")
     if ctx.push:
         r = git(project, "push", "-q", ctx.remote, f"{sha}:{branch}", check=False, timeout=600)
         if r.returncode != 0:
             return block(ctx, st, f"push to {ctx.remote} refused: {(r.stderr or r.stdout).strip()[:300]}")
-        ctx.q.log(key, f"pushed ticket/{key} to {ctx.remote} ({sha[:12]})")
+        ctx.q.log(key, f"pushed branch {key} to {ctx.remote} ({sha[:12]})")
     else:
-        ctx.q.log(key, f"branch ticket/{key} ready in the project ({sha[:12]}); not pushed (QUEUE_PUSH=0)")
+        ctx.q.log(key, f"branch {key} ready in the project ({sha[:12]}); not pushed (QUEUE_PUSH=0)")
     st.update(status="done", stage="done", attempt=0, feedback="", reason="", sha=sha)
     ctx.q.save(st)
 
@@ -630,7 +669,7 @@ def process(ctx, st):
             make_clone(ctx.q, st)
         except (RuntimeError, subprocess.SubprocessError) as e:
             return block(ctx, st, f"could not clone {st['project']} at {st['base']}: {e}")
-        ctx.q.log(key, f"cloned {st['project']} at {st['base']} ({st['base_sha'][:12]}) on ticket/{key}")
+        ctx.q.log(key, f"cloned {st['project']} at {st['base']} ({st['base_sha'][:12]}) on branch {key}")
     subprocess.run(["bash", ctx.harness, "queue", "_pull", key], stdin=subprocess.DEVNULL,
                    capture_output=True, timeout=300, check=False)
     st["status"] = "running"
@@ -672,6 +711,7 @@ def cmd_run(q, a):
                 import traceback
                 q.log(st["key"], "error", traceback.format_exc())
                 block(ctx, st, f"{type(e).__name__}: {str(e)[:250]}")
+            sync_vault(ctx, st["key"], int(time.time() * 1000))   # the outcome, into the vault
     except Infra as e:
         print(f"[queue] stopped: the upstream does not answer ({str(e)[:300]}). The ticket keeps its place; "
               "check 'harness unlock' and 'harness usage', then run 'harness queue run' again.", file=sys.stderr)

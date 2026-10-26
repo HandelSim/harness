@@ -60,6 +60,10 @@ if stage == "planning":
 elif stage in ("implementing", "fixing"):
     if os.environ.get("FAKE_NO_COMMIT") or (stage == "fixing" and os.environ.get("FAKE_FIX_NOOP")):
         sys.exit(0)
+    if stage == "fixing" and os.environ.get("FAKE_FIX_REJECT"):  # the review item is wrong
+        git("commit", "-q", "--allow-empty", "-m", "ABC-1: review fixes",
+            "-m", "Left as it is: feature.txt already says hello feature once, which the ticket asks for")
+        sys.exit(0)
     if os.environ.get("FAKE_EDIT_PLAN"):  # an agent trying to move the goalposts
         open(os.path.join(vault, "wiki", "notes", "tickets", "ABC-1-plan.md"), "w").write(
             "## Acceptance criteria\n- Nothing at all\n")
@@ -212,16 +216,25 @@ class QueueTest(Base):
         self.assertIn("-m harness/free", self.calls_of("planning")[0])
         self.assertTrue(all(m == "free" and raw == "1" for m, raw, _ in FakeProxy.seen))
         # The branch reached the remote and the project, with both commits.
-        log = sh("git", "-C", self.remote, "log", "--format=%s", "ticket/ABC-1")
+        log = sh("git", "-C", self.remote, "log", "--format=%s", "ABC-1")
         self.assertIn("ABC-1: implementing", log)
         self.assertIn("ABC-1: fixing", log)
-        self.assertEqual(sh("git", "-C", self.project, "rev-parse", "ticket/ABC-1"),
-                         sh("git", "-C", self.remote, "rev-parse", "ticket/ABC-1"))
+        self.assertEqual(sh("git", "-C", self.project, "rev-parse", "ABC-1"),
+                         sh("git", "-C", self.remote, "rev-parse", "ABC-1"))
+        # The branch is named after the ticket alone.
+        refs = sh("git", "-C", self.remote, "for-each-ref", "--format=%(refname)").split()
+        self.assertIn("refs/heads/ABC-1", refs)
+        self.assertFalse([r for r in refs if "ticket/" in r], refs)
         # The agent's clone has no remote to push to.
         self.assertEqual(sh("git", "-C", os.path.join(self.state, "ABC-1", "repo"), "remote"), "")
-        # Each stage's session was captured; the ticket was pulled first.
+        # Each stage's session was captured, then the outcome; the ticket was pulled first.
         self.assertEqual(self.calls_of("queue _pull"), ["queue _pull"])
-        self.assertEqual(len(self.calls_of("queue _sync")), 4)
+        self.assertEqual(len(self.calls_of("queue _sync")), 5)
+        # The queue's log, verdicts and outcome included, is in the vault.
+        vlog = cat(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-log.md"))
+        self.assertTrue(vlog.startswith("---\ntype: note\nticket: ABC-1\n"), vlog[:80])
+        self.assertIn("plan verifier: PASS", vlog)
+        self.assertIn("pushed branch ABC-1 to", vlog)
         rc, out = self.q("findings", "--vault", self.vault)
         self.assertIn("an unrelated bug", out)
         self.assertIn("plan verifier: PASS", cat(os.path.join(self.state, "run.log")))
@@ -251,7 +264,7 @@ class QueueTest(Base):
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
         self.assertEqual(len(self.calls_of("implementing")), 2)
-        self.assertIn("no commits on branch ticket/ABC-1", st["reason"])
+        self.assertIn("no commits on branch ABC-1", st["reason"])
         # The retry was told what was wrong.
         log = cat(os.path.join(self.state, "ABC-1", "log.md"))
         self.assertIn("implement attempt 1 failed", log)
@@ -300,7 +313,7 @@ class QueueTest(Base):
         self.assertEqual(self.status()["status"], "done", out)
         self.assertEqual(len(self.calls_of("planning")), 1)
         # QUEUE_PUSH=0: the branch is in the project only.
-        sh("git", "-C", self.project, "rev-parse", "--verify", "ticket/ABC-1")
+        sh("git", "-C", self.project, "rev-parse", "--verify", "ABC-1")
         self.assertEqual(sh("git", "-C", self.remote, "branch"), "")
 
     def test_add_list_remove(self):
@@ -356,7 +369,7 @@ class QueueTest(Base):
             self.assertNotIn("{{", text, name)
             self.assertLess(len(text), 120_000)
         for name, vals in (("verify_plan", dict(TICKET="t", PLAN="p", CRITERIA="1. c")),
-                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d"))):
+                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m"))):
             self.assertNotIn("{{", tq.render(name, **vals), name)
 
 
@@ -377,6 +390,35 @@ class ReviewFixesTest(Base):
         self.run_queue()
         fix_prompts = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
         self.assertIn("2. (review) feature.txt:1: say it twice", fix_prompts)
+
+    def test_a_wrong_review_item_can_be_answered_in_the_commit_message(self):
+        os.environ.update(FAKE_MUSTFIX="1", FAKE_FIX_REJECT="1")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--retries", "0")
+        self.assertEqual(self.status()["status"], "done", out)
+        prompt = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
+        self.assertIn("Left as it is: feature.txt already says hello feature once", prompt)
+
+    def test_diff_quotes_must_come_from_changed_lines(self):
+        diff = ("diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1,3 +1,3 @@\n"
+                " def unchanged_context():\n-    return legacy_value\n+    return shiny_new_value\n")
+        crit = ["Return the new value", "Remove the legacy value", "(review) f.py: wrong name"]
+
+        def verdict(*quotes):
+            return {"verdict": "PASS", "criteria": [{"n": i, "met": True, "quote": q} for i, q in enumerate(quotes, 1)]}
+        ok = tq.judge(verdict("return shiny_new_value", "return legacy_value", "the name is right because x"),
+                      crit, diff, "quote", "diff", "The name is right because x.")
+        self.assertEqual(ok, [])
+        bad = tq.judge(verdict("def unchanged_context():", "def unchanged_context():", "return legacy_value"),
+                       crit, diff, "quote", "diff", "The name is right because x.")
+        self.assertEqual(len(bad), 3, bad)      # context lines never; removed lines only to remove
+        bad = tq.judge(verdict("return legacy_value", "return legacy_value", "return shiny_new_value"),
+                       crit, diff, "quote", "diff", "")
+        self.assertEqual(len(bad), 1, bad)      # a commit message is no evidence for a plan criterion
+        self.assertIn("criterion 1", bad[0])
+        bad = tq.judge(verdict("the name is right because x", "return legacy_value", "x"),
+                       crit, diff, "quote", "diff", "The name is right because x.")
+        self.assertEqual(len(bad), 2, bad)
 
     def test_an_agent_editing_the_plan_does_not_change_the_criteria(self):
         os.environ["FAKE_EDIT_PLAN"] = "1"

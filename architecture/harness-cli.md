@@ -612,7 +612,7 @@ Python script. `list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
 [KEY]` are the owner's side.
 
 Stages, each a fresh `harness [host] -p --yolo --ticket KEY -m MODEL PROMPT`
-in `state/queue/KEY/repo` (a clone at the base on `ticket/KEY`, its origin
+in `state/queue/KEY/repo` (a clone at the base on branch `KEY`, its origin
 removed): `plan` → `implement` → `review` → `fix` (once, when the review has
 Must fix items) → `push`. The prompt (`scripts/queue_prompts/<stage>.md`)
 embeds the ticket, plan, answers and the last attempt's problems, capped to
@@ -629,10 +629,14 @@ one raw verifier call through the proxy (`verify_plan.md` /
 `verify_change.md`, JSON only, three tries). The verifier must quote the
 ticket for each plan criterion and the diff for each criterion met;
 `judge()` checks every quote is really in the source (letters and digits
-only, so spacing and list markers do not matter). The plan the verifier
+only, so spacing and list markers do not matter); a diff quote must come
+from an added line, or a removed one when the criterion is about removing,
+never an unchanged context line. The plan the verifier
 passed is copied to `state/queue/KEY/plan.md` and later stages are held to
 that copy, not the vault's, which agents can write. The fix stage must add
-a commit and is also checked against the review's Must fix items. A failed
+a commit and is also checked against the review's Must fix items; an item
+the fixer finds wrong is answered in the commit message (an empty commit when
+nothing changed), which the verifier sees and may quote for that item only. A failed
 stage runs `QUEUE_RETRIES` more times with the problems as feedback, then
 the ticket is `blocked`; so does any error in harness itself, so one ticket
 never jams the queue. Before a failure counts, one probe request checks the
@@ -644,12 +648,15 @@ blocking question parks the ticket as `needs-answers` and the queue moves
 on; `QUEUE_PLAN_REVIEW=1` holds each plan as `plan-review` for `approve`.
 
 Harness never runs git in the clone once an agent has had it: it fetches
-`ticket/KEY` into the project as `refs/harness-queue/KEY`, diffs there,
-updates the project's `ticket/KEY` only by fast-forward and pushes
-`sha:refs/heads/ticket/KEY` to `QUEUE_REMOTE` without force (`QUEUE_PUSH=0`
+branch `KEY` into the project as `refs/harness-queue/KEY`, diffs there,
+updates the project's `KEY` only by fast-forward and pushes
+`sha:refs/heads/KEY` (just the ticket key) to `QUEUE_REMOTE` without force (`QUEUE_PUSH=0`
 keeps it local). Before each ticket `queue _pull` refreshes the vault's copy
-of the ticket; after each stage `queue _sync` captures the session (host or
-container database) into the vault. Nothing is written to the tracker.
+of the ticket; after each stage, and once more when the ticket stops, the
+ticket's `log.md` (stages, checks, verifier verdicts, outcome) is copied to the
+vault as `wiki/notes/tickets/KEY-log.md` and `queue _sync` captures the session
+(host or container database) and commits the vault. Nothing is written to the
+tracker.
 State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
 attempt, feedback), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
 as `KEY/verify-*.txt`, and `run.lock` (one run at a time). Covered by
