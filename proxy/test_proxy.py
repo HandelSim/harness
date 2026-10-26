@@ -6642,6 +6642,17 @@ class TestVaultReminderLine(unittest.TestCase):
         self.assertEqual(proxy._vault_clause("x" * 401), "")
         self.assertEqual(proxy._vault_clause("  "), "")
 
+    def test_ticket_header_adds_its_files(self):
+        last = self._sent({"x-harness-vault": "/v", "x-harness-ticket": "ABC-7"})
+        self.assertIn("Current ticket: ABC-7, described in `/v/.raw/tickets/ABC-7.md`", last)
+        self.assertIn("`/v/wiki/notes/tickets/ABC-7-state.md`", last)
+
+    def test_bad_ticket_or_no_vault_adds_nothing(self):
+        self.assertNotIn("Current ticket", proxy._vault_clause("/v", "ABC-7; rm -rf /"))
+        self.assertNotIn("Current ticket", proxy._vault_clause("/v", "A-" + "1" * 40))
+        self.assertNotIn("Current ticket", proxy._vault_clause("/v", ""))
+        self.assertNotIn("Current ticket", self._sent({"x-harness-ticket": "ABC-7"}))
+
 
 class TestOaiUpstream(unittest.TestCase):
     """OAI_MODELS go to the OAI upstream natively: chat requests get the

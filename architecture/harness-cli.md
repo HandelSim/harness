@@ -583,14 +583,15 @@ launch (file count, ~tokens, ticket); `harness context [--host]` lists the
 files with sizes, the reminder line, the ticket, tracker and whether a token
 is saved (never the token). After a launch `vault_sync` passes
 `vault_capture.py` `--launch MS`, `--ticket KEY` and one `--context FILE`
-per instruction file: sessions updated since the launch get `ticket:` and
+per instruction file except the global one (personal, and the vault's
+remote may be shared): sessions updated since the launch get `ticket:` and
 `context:` in their front matter (others keep theirs), and files outside
 the vault are copied to `.raw/context/<sha256[:12]>.md` (redacted), so a
 later session or ingest sees what the session saw. These are the files as
 they were when the session ended; two launches in one folder at once can
 label each other's sessions. `regenerate` gives each ticket hub
-(`wiki/tickets/KEY.md`) "The ticket" (the copy) and "Sessions" (those whose
-front matter names it); the state note's different name keeps it apart from
+(`wiki/tickets/KEY.md`) "The ticket" (the copy), a link to the state note
+and "Sessions" (those whose front matter names it); the state note's different name keeps it apart from
 the hub in Obsidian.
 
 ### Interactive TTY resolution (Windows) — issue #82

@@ -193,8 +193,8 @@ def render(con, sess, extra=()):
             continue
         block = "\n\n".join(texts)
         if tools:
-            extra = len(tools) - _TOOL_LINES
-            lines = tools[:_TOOL_LINES] + ([f"- \u2026 and {extra} more tool calls"] if extra > 0 else [])
+            more = len(tools) - _TOOL_LINES
+            lines = tools[:_TOOL_LINES] + ([f"- \u2026 and {more} more tool calls"] if more > 0 else [])
             block += ("\n\n" if block else "") + "Tools:\n" + "\n".join(lines)
         # opencode marks the compaction summary with summary: true (a user
         # message's summary is an object with its diffs).

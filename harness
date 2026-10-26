@@ -5783,12 +5783,13 @@ context_banner() {
 # vault has an upstream, rebasing once if the push is rejected. The agent never
 # has to remember to save or commit. After a launch, <home> (the agent's home)
 # is given too, and the sessions it touched record its ticket and the
-# instruction files it gave the model (harness_context_files). Best effort:
+# instruction files it gave the model (harness_context_files; all but the
+# user's global one). Best effort:
 # every failure is a warning and the launch's exit status is unchanged.
 vault_sync() {
     local dir="$1" since_ms="$2" db="$3" project="$4" home="${5:-}" py script index wdir
     local launch_ms="$2" what f
-    local -a extra=()
+    local -a capture_args=()
     [[ -n "$dir" && -d "$dir/.git" ]] || return 0
     script="$clone_dir/scripts/vault_capture.py"
     index="$clone_dir/scripts/vault_ingest.py"
@@ -5805,16 +5806,19 @@ vault_sync() {
             [[ "$project" == "*" || "$project" == /[a-zA-Z]/* ]] || project=$(cygpath -m "$project")
         fi
         if [[ -n "$home" ]]; then
-            extra=(--launch "$launch_ms")
-            [[ -n "${harness_ticket:-}" ]] && extra+=(--ticket "$harness_ticket")
+            capture_args=(--launch "$launch_ms")
+            [[ -n "${harness_ticket:-}" ]] && capture_args+=(--ticket "$harness_ticket")
+            # Not the user's global file: it is personal, and the vault's
+            # remote may be shared.
             while IFS=$'\t' read -r what f; do
+                [[ "$what" == global ]] && continue
                 command -v cygpath >/dev/null 2>&1 && f=$(cygpath -m "$f")
-                extra+=(--context "$f")
+                capture_args+=(--context "$f")
             done < <(harness_context_files "$home")
         fi
         if [[ -f "$db" && -f "$script" ]]; then
             # shellcheck disable=SC2086  # $py can be 'py -3'
-            $py "$script" "$db" "$wdir" "$since_ms" "$project" ${extra[@]+"${extra[@]}"} >/dev/null || true
+            $py "$script" "$db" "$wdir" "$since_ms" "$project" ${capture_args[@]+"${capture_args[@]}"} >/dev/null || true
         fi
         # The generated index, hubs and module trees follow whatever the
         # session wrote (deterministic, no model).

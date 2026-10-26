@@ -21,6 +21,11 @@
 #   - scripts/vault_ingest.py             against a mock upstream: pages,
 #                                         index, hubs, incremental runs,
 #                                         retry and failure
+#   - tickets                             scripts/vault_ticket.py against a
+#                                         mock tracker, --ticket per folder,
+#                                         the launch's instruction files,
+#                                         ticket and context in captured
+#                                         sessions, the ticket hub
 #
 # Prints "VAULT TEST PASSED" on success.
 
@@ -500,7 +505,7 @@ PYEOF2
     charter() { $PY "$TMP_ROOT/charter_pty.py" "$REPO_ROOT" "$TMP_ROOT" "$CH" "$@"; }
     fm() { sed -n "s/^$1: //p" "$CH/wiki/overview.md"; }
     # project: clear, type, five lefts, insert; readers: Home, insert; covers empty.
-    charter '\x15hello world\x1b[D\x1b[D\x1b[D\x1b[D\x1b[Dbig \r' '\r' '\x1b[Hjust \r' '\r' '\r' '\r' \
+    charter '\x15hello world\x1b[D\x1b[D\x1b[D\x1b[D\x1b[Dbig \r' '\r' '\x1b[Hjust \r' '\r' '\r' '\r' '\r' \
         || fail "V14: first init run failed"
     [[ "$(fm project)" == "'hello big world'" ]] || fail "V14: left arrow should insert mid-line — project=$(fm project)"
     [[ "$(fm readers)" == "'just me and my coding agents'" ]] || fail "V14: Home should insert at the start — readers=$(fm readers)"
@@ -511,14 +516,202 @@ PYEOF2
     [[ ! -e "$CH/wiki/overview.md.tmp" ]] || fail "V14: the charter was left as overview.md.tmp"
     grep -q $'\x1b' "$CH/wiki/overview.md" && fail "V14: escape codes reached the charter"
     # Clear the ticket pattern, then a run of plain Enters keeps every answer.
-    charter '\r' '\r' '\r' '\r' '\x15\r' '\r' || fail "V14: second init run failed"
+    charter '\r' '\r' '\r' '\r' '\x15\r' '\r' '\r' || fail "V14: second init run failed"
     [[ "$(fm ticket_pattern)" == "''" ]] || fail "V14: an emptied ticket pattern should save empty — $(fm ticket_pattern)"
-    charter '\r' '\r' '\r' '\r' '\r' '\r' || fail "V14: third init run failed"
+    charter '\r' '\r' '\r' '\r' '\r' '\r' '\r' || fail "V14: third init run failed"
     [[ "$(fm ticket_pattern)" == "''" && "$(fm project)" == "'hello big world'" ]] \
         || fail "V14: a re-run should keep the saved answers — project=$(fm project) ticket_pattern=$(fm ticket_pattern)"
-    ok "V14: vault init edits pre-filled answers in place, writes the charter, keeps answers on a re-run"
+    [[ "$(fm tracker_url)" == "''" ]] || fail "V14: no tracker by default — $(fm tracker_url)"
+    # A tracker (its trailing slash dropped) asks for extra fields too.
+    charter '\r' '\r' '\r' '\r' '\r' '\r' 'https://jira.example.com/\r' 'customfield_10500, Team\r' \
+        || fail "V14: init with a tracker failed"
+    [[ "$(fm tracker_url)" == "'https://jira.example.com'" && "$(fm tracker_fields)" == "'customfield_10500, Team'" ]] \
+        || fail "V14: tracker_url/tracker_fields — $(fm tracker_url) $(fm tracker_fields)"
+    ok "V14: vault init edits pre-filled answers in place, writes the charter (tracker included), keeps answers on a re-run"
 else
     ok "V14: skipped (no pty in this Python)"
 fi
+
+# --- V15: vault_ticket.py against a mock tracker -----------------------------
+# The mock is Jira Server's REST v2: ABC-7 with the bearer token, 401 without
+# it, 404 for anything else.
+JIRA="$TMP_ROOT/jira.py"
+cat > "$JIRA" <<'PYEOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+ISSUE = {"key": "ABC-7",
+         "names": {"customfield_10400": "Acceptance Criteria", "customfield_10111": "Story Points",
+                   "customfield_10109": "Sprint", "customfield_10500": "Team", "customfield_10600": "Risk Index"},
+         "fields": {"summary": "Report sets while the task runs", "status": {"name": "To Do"},
+                    "issuetype": {"name": "Improvement"}, "priority": {"name": "High"}, "assignee": None,
+                    "labels": ["backend"], "updated": "2026-10-20T10:00:00.000+0000",
+                    "description": "Report them in-stride.\nUse key sk-abcdefghijklmnopqrstuvwxyz0123 for the demo.",
+                    "customfield_10400": "GIVEN a task\nWHEN it runs\nTHEN sets are reported",
+                    "customfield_10111": 8.0, "customfield_10500": {"value": "Blue"}, "customfield_10600": 3.5,
+                    "customfield_10109": ["com.atlassian.greenhopper.service.sprint.Sprint@1f[id=5,rapidViewId=2,state=ACTIVE,name=Sprint 5,startDate=x]"],
+                    "subtasks": [{"key": "ABC-8", "fields": {"summary": "the sub part", "status": {"name": "Done"}}}],
+                    "issuelinks": [], "comment": {"comments": [
+                        {"author": {"displayName": "Pat"}, "created": "2026-10-%02dT09:00:00.000+0000" % (i + 1),
+                         "body": "comment %d" % i} for i in range(12)]}}}
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.headers.get("Authorization") != "Bearer tok123":
+            code, body = 401, {"errorMessages": ["no"]}
+        elif self.path.startswith("/rest/api/2/issue/ABC-7?") and "expand=names" in self.path:
+            code, body = 200, ISSUE
+        else:
+            code, body = 404, {"errorMessages": ["Issue Does Not Exist"]}
+        b = json.dumps(body).encode()
+        self.send_response(code); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+srv = HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYEOF
+# shellcheck disable=SC2086
+$PY "$JIRA" > "$TMP_ROOT/jira.port" 2>/dev/null &
+JIRA_PID=$!
+trap 'kill "$MOCK_PID" "$JIRA_PID" 2>/dev/null; rm -rf "$TMP_ROOT"' EXIT
+for _ in $(seq 50); do [[ -s "$TMP_ROOT/jira.port" ]] && break; sleep 0.1; done
+JPORT=$(head -n 1 "$TMP_ROOT/jira.port")
+[[ -n "$JPORT" ]] || fail "V15: the mock tracker did not start"
+TV="$TMP_ROOT/ticketvault"
+git init -q "$TV"
+cp -R "$REPO_ROOT/vault-template/." "$TV/"
+cat > "$TV/wiki/overview.md" <<MDEOF
+---
+type: overview
+summary: 'a test vault'
+project: 'proj'
+tracker_url: 'http://127.0.0.1:$JPORT/'
+tracker_fields: 'Team'
+---
+MDEOF
+git -C "$TV" add -A && git -C "$TV" commit -qm init
+HDR="$TMP_ROOT/header"
+printf 'Authorization: Bearer tok123\n' > "$HDR"
+tk() { $PY "$REPO_ROOT/scripts/vault_ticket.py" "$TV" "$@" 2>&1; }
+SNAP="$TV/.raw/tickets/ABC-7.md"
+NOTE="$TV/wiki/notes/tickets/ABC-7-state.md"
+out=$(tk ABC-7 "$HDR") || fail "V15: vault_ticket.py failed — $out"
+[[ "$out" == "ABC-7 (To Do): Report sets while the task runs [new]" ]] || fail "V15: status line — $out"
+[[ -f "$SNAP" && -f "$NOTE" ]] || fail "V15: the copy and the state note should be written"
+for want in '^ticket: ABC-7$' '^status: "\?To Do"\?$' '^> This is the ticket as people wrote it' '^- Priority: High$' \
+        '^## Acceptance Criteria$' '^THEN sets are reported$' '^## Story Points$' '^8$' '^Sprint 5$' '^## Team$' '^Blue$' \
+        '^- subtask ABC-8 (Done): the sub part$' '^## Comments (the last 10 of 12)$' '^comment 11$'; do
+    grep -q -- "$want" "$SNAP" || fail "V15: the copy lacks /$want/ — $(cat "$SNAP")"
+done
+grep -q 'sk-abcdefghij\|Risk Index\|^comment 1$' "$SNAP" && fail "V15: the copy kept a key, an unasked field or an old comment — $(cat "$SNAP")"
+grep -q '^Tickets: \[\[ABC-7\]\]$' "$NOTE" || fail "V15: the state note should link the hub — $(cat "$NOTE")"
+[[ "$(tk ABC-7 "$HDR")" == *"[unchanged]" ]] || fail "V15: a second pull of the same ticket should be unchanged"
+printf 'mine\n' > "$NOTE"
+printf 'Authorization: Bearer wrong\n' > "$TMP_ROOT/badheader"
+out=$(tk ABC-7 "$TMP_ROOT/badheader")
+[[ "$out" == *"refused the token (HTTP 401"*"using the copy from 2026-10-20"* ]] || fail "V15: a refused token — $out"
+[[ "$(cat "$NOTE")" == "mine" ]] || fail "V15: an existing state note must not be touched"
+out=$(tk ABC-7)
+[[ "$out" == *"no tracker token"*"using the copy"* ]] || fail "V15: no token — $out"
+out=$(tk ABC-99 "$HDR")
+[[ "$out" == *"HTTP 404"*"no copy of the ticket yet"* && -f "$TV/wiki/notes/tickets/ABC-99-state.md" ]] \
+    || fail "V15: an unknown ticket still gets its state note — $out"
+sed -i.bak "s#127.0.0.1:$JPORT#127.0.0.1:9#" "$TV/wiki/overview.md"
+out=$(tk ABC-7 "$HDR")
+[[ "$out" == *"not reachable"*"using the copy"* ]] || fail "V15: an unreachable tracker — $out"
+mv "$TV/wiki/overview.md.bak" "$TV/wiki/overview.md"
+ok "V15: vault_ticket.py writes a labelled, redacted copy and a state note, and falls back to the copy"
+
+# --- V16: --ticket, the folder's ticket, the launch's instruction files ------
+PROJ2="$TMP_ROOT/proj2"
+mkdir -p "$PROJ2/sub/deeper"
+git -C "$PROJ2" init -q
+printf 'root rules\n' > "$PROJ2/AGENTS.md"
+printf 'sub rules\n' > "$PROJ2/sub/AGENTS.md"
+printf 'claude rules\n' > "$PROJ2/sub/CLAUDE.md"
+harness_ticket_flag abc-7 2>/dev/null || fail "V16: --ticket abc-7 refused"
+[[ "$harness_ticket_arg" == "ABC-7" ]] || fail "V16: --ticket should upper-case the key — $harness_ticket_arg"
+harness_ticket_flag 'nope' 2>/dev/null && fail "V16: --ticket nope accepted"
+harness_ticket_flag '' 2>/dev/null && fail "V16: --ticket with no key accepted"
+mkdir -p "$state_root/tracker"
+cp "$HDR" "$(_ticket_header_file)"
+(
+    cd "$PROJ2/sub/deeper"
+    here=$(harness_abs_path "$PWD")
+    harness_vault_dir=$(harness_abs_path "$TV") harness_ticket_arg="ABC-7"
+    ticket_prepare 2>"$TMP_ROOT/prep.err"
+    [[ "$harness_ticket" == "ABC-7" ]] || fail "V16: ticket_prepare should set the ticket — $(cat "$TMP_ROOT/prep.err")"
+    grep -q '^\[harness\] ticket ABC-7 (To Do)' "$TMP_ROOT/prep.err" || fail "V16: launch line — $(cat "$TMP_ROOT/prep.err")"
+    [[ "$(ticket_for_dir "$here")" == "ABC-7" ]] || fail "V16: --ticket should be remembered for the folder"
+    [[ "$(cd "$PROJ2/sub" && ticket_for_dir "$(harness_abs_path "$PWD")")" == "" ]] || fail "V16: a parent folder has no ticket"
+    cmd_ticket DEF-1 >/dev/null
+    harness_ticket_arg=""
+    (cd .. && cmd_ticket XY-2 >/dev/null)
+    [[ "$(ticket_for_dir "$here")" == "DEF-1" ]] || fail "V16: the nearest folder's ticket wins"
+    cmd_ticket off >/dev/null
+    [[ "$(ticket_for_dir "$here")" == "XY-2" ]] || fail "V16: off forgets this folder's ticket only"
+    cmd_ticket nope >/dev/null 2>&1 && fail "V16: harness ticket nope accepted"
+    harness_ticket="ABC-7"
+    # Host: the global file, then every AGENTS.md up to the git root (the
+    # CLAUDE.md next to one is not read), then the vault's three.
+    mkdir -p "$TMP_ROOT/home/.claude"
+    printf 'global\n' > "$TMP_ROOT/home/.claude/CLAUDE.md"
+    got=$(HOME="$TMP_ROOT/home" XDG_CONFIG_HOME="" harness_context_files "$TMP_ROOT/home" | cut -f1 | paste -sd, -)
+    [[ "$got" == "global,project,project,vault,ticket,ticket state" ]] || fail "V16: host context files — $got"
+    got=$(HOME="$TMP_ROOT/home" XDG_CONFIG_HOME="" harness_context_files "$TMP_ROOT/home" | sed -n 2p | cut -f2)
+    [[ "$got" == "$PROJ2/sub/AGENTS.md" ]] || fail "V16: the nearest AGENTS.md comes first — $got"
+    # A container sees only its folder: no project file in sub/deeper.
+    got=$(harness_context_files "$TMP_ROOT/home" | cut -f1 | paste -sd, -)
+    [[ "$got" == "global,vault,ticket,ticket state" ]] || fail "V16: container context files — $got"
+    cfg=$(vault_opencode_config)
+    jq -e --arg v "$(harness_abs_path "$TV")" '.instructions == [$v + "/AGENTS.md", $v + "/.raw/tickets/ABC-7.md",
+            $v + "/wiki/notes/tickets/ABC-7-state.md"]
+        and .provider.harness.options.headers["x-harness-ticket"] == "ABC-7"' <<<"$cfg" >/dev/null \
+        || fail "V16: the overlay should carry the ticket files and header — $cfg"
+    out=$(HOME="$TMP_ROOT/home" cmd_context --host)
+    grep -q '^  1\. global ' <<<"$out" && grep -q '^ticket:  XY-2' <<<"$out" && grep -q '^token:   saved' <<<"$out" \
+        || fail "V16: harness context — $out"
+    grep -q 'tok123' <<<"$out" && fail "V16: harness context printed the token"
+    exit 0
+) || exit 1
+ok "V16: --ticket is checked and remembered per folder; the overlay and harness context list the ticket's files"
+
+# --- V17: sessions record their ticket and context; the hub links them ------
+DB3="$TMP_ROOT/tickets.db"
+# shellcheck disable=SC2086
+$PY - "$DB3" <<'PYEOF' || fail "V17: could not build the fixture database"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("""
+CREATE TABLE session (id TEXT, parent_id TEXT, directory TEXT, title TEXT, time_created INT,
+  time_updated INT, tokens_input INT, tokens_output INT);
+CREATE TABLE message (id TEXT, session_id TEXT, time_created INT, data TEXT);
+CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INT, data TEXT);
+""")
+for sid, upd in (("ses_before", 1761100000000), ("ses_during", 1761100900000)):
+    c.execute("INSERT INTO session VALUES (?, NULL, '/w', ?, 1761100000000, ?, 1, 1)", (sid, sid, upd))
+    c.execute("INSERT INTO message VALUES (?,?,?,?)", (sid + "m", sid, 0, json.dumps({"role": "user"})))
+    c.execute("INSERT INTO part VALUES (?,?,?,?,?)", (sid + "p", sid + "m", sid, 0,
+              json.dumps({"type": "text", "text": "work on it"})))
+c.commit()
+PYEOF
+printf 'project rules\n' > "$TMP_ROOT/PROJECT_AGENTS.md"
+cap() { $PY "$REPO_ROOT/scripts/vault_capture.py" "$DB3" "$TV" 0 /w "$@" >/dev/null; }
+cap --launch 1761100500000 --ticket ABC-7 --context "$TV/AGENTS.md" --context "$TMP_ROOT/PROJECT_AGENTS.md" \
+    || fail "V17: capture failed"
+during="$TV/.raw/sessions/2025-10-22-ses_during.md"
+before="$TV/.raw/sessions/2025-10-22-ses_before.md"
+copy=".raw/context/$($PY -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()[:12])' "$TMP_ROOT/PROJECT_AGENTS.md").md"
+grep -q '^ticket: ABC-7$' "$during" && grep -qF "context: [\"AGENTS.md\", \"$copy\"]" "$during" \
+    || fail "V17: the launch's session should record its ticket and context — $(head -12 "$during")"
+grep -q '^ticket:' "$before" && fail "V17: a session not touched by the launch got its ticket"
+grep -q '^project rules$' "$TV/$copy" || fail "V17: a file outside the vault is copied into .raw/context"
+cap --launch 1761200000000 || fail "V17: second capture failed"
+grep -q '^ticket: ABC-7$' "$during" || fail "V17: a later capture must keep the session's ticket"
+$PY "$REPO_ROOT/scripts/vault_ingest.py" index --vault "$TV" >/dev/null || fail "V17: index failed"
+hubf="$TV/wiki/tickets/ABC-7.md"
+grep -q '^## The ticket$' "$hubf" && grep -qF '`.raw/tickets/ABC-7.md`' "$hubf" && grep -q '^## Sessions (1)$' "$hubf" \
+    && grep -q 'ses_during' "$hubf" && grep -qF '[[ABC-7-state]]' "$hubf" \
+    || fail "V17: the ticket hub should link the copy, the state note and the session — $(cat "$hubf")"
+ok "V17: sessions record their ticket and instruction files; the ticket hub links the copy, state and sessions"
 
 echo "VAULT TEST PASSED"

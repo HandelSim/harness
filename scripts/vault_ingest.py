@@ -654,6 +654,8 @@ def regenerate(vault):
         more = []
         if w.get("tickets"):
             more += ["\n## The ticket\n\nAs written in the tracker, refreshed at each launch:\n\n"] + w["tickets"]
+        if os.path.isfile(os.path.join(vault, "wiki", "notes", "tickets", f"{t}-state.md")):
+            more += [f"\nState kept by the agents: [[{t}-state]]\n"]
         if w.get("sessions"):
             more += [f"\n## Sessions ({len(w['sessions'])})\n\n"] + w["sessions"]
         n = len(tickets.get(t, ()))
