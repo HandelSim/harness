@@ -125,6 +125,25 @@ def yq(value):
     return json.dumps(value) if re.search(r'[:#\[\]{}&*!|>\'"%@`,]|^[-?]', value) or not value else value
 
 
+def try_lock(f):
+    """Lock open file f for this process without waiting; False when another process holds it.
+    fcntl on POSIX, msvcrt on Windows (one byte at offset 0, so open the file in "a" mode)."""
+    try:
+        import fcntl
+    except ImportError:
+        import msvcrt
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
 def safe_name(text):
     return BAD_NAME.sub("_", text).strip(" .") or "_"
 
@@ -929,13 +948,8 @@ def main(argv):
     vault = os.path.abspath(a.vault)
     # The lock lives in .git so it is never committed.
     lock_dir = os.path.join(vault, ".git") if os.path.isdir(os.path.join(vault, ".git")) else vault
-    lock = open(os.path.join(lock_dir, "harness-ingest.lock"), "w")
-    try:
-        import fcntl
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except ImportError:
-        pass  # Windows: no lock
-    except OSError:
+    lock = open(os.path.join(lock_dir, "harness-ingest.lock"), "a")
+    if not try_lock(lock):
         print("[ingest] another ingest is running on this vault", file=sys.stderr)
         return 1
     try:

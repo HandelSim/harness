@@ -399,6 +399,17 @@ class ReviewFixesTest(Base):
         prompt = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
         self.assertIn("Left as it is: feature.txt already says hello feature once", prompt)
 
+    def test_run_lock_is_held_by_one_process(self):
+        path = os.path.join(self.tmp, "run.lock")
+        held = open(path, "a")
+        self.addCleanup(held.close)
+        self.assertTrue(tq.try_lock(held))
+        other = subprocess.run([sys.executable, "-c",
+                                "import sys; sys.path.insert(0, sys.argv[1]); import vault_ingest as v; "
+                                "sys.exit(0 if v.try_lock(open(sys.argv[2], 'a')) else 3)",
+                                os.path.dirname(tq.__file__), path])
+        self.assertEqual(other.returncode, 3)
+
     def test_diff_quotes_must_come_from_changed_lines(self):
         diff = ("diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1,3 +1,3 @@\n"
                 " def unchanged_context():\n-    return legacy_value\n+    return shiny_new_value\n")

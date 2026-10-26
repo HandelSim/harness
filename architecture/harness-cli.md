@@ -659,7 +659,11 @@ vault as `wiki/notes/tickets/KEY-log.md` and `queue _sync` captures the session
 tracker.
 State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
 attempt, feedback), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
-as `KEY/verify-*.txt`, and `run.lock` (one run at a time). Covered by
+as `KEY/verify-*.txt`, and `run.lock` (one run at a time: `flock`, or
+`msvcrt.locking` on Windows). Each agent runs in its own session (its own
+process group on Windows), so Ctrl-C reaches only the queue, which then ends
+the agent's tree (`killpg`, or `taskkill /T` on Windows). `bash` is found on
+`PATH`, since a bare name on Windows can resolve to WSL's `bash.exe`. Covered by
 `tests/unit_queue_test.sh`.
 
 ### Interactive TTY resolution (Windows) — issue #82

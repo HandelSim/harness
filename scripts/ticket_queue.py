@@ -44,7 +44,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vault_ingest import InfraError, call_model, resolve_model, yq  # noqa: E402
+from vault_ingest import InfraError, call_model, resolve_model, try_lock, yq  # noqa: E402
 
 PROMPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_prompts")
 STAGE_TIMEOUT = 3 * 3600   # one agent launch; a cooperative turn alone can take 15 minutes
@@ -415,7 +415,7 @@ def run_agent(ctx, st, stage, prompt):
     """One headless agent launch in the clone; its output goes to DIR/<stage>-N.out."""
     key = st["key"]
     model = ctx.model if "/" in ctx.model else "harness/" + ctx.model
-    cmd = ["bash", ctx.harness]
+    cmd = [BASH, ctx.harness]
     if ctx.host or ctx.single:   # --single-message is a host-mode launch flag
         cmd.append("host")
     if ctx.single:
@@ -428,7 +428,7 @@ def run_agent(ctx, st, stage, prompt):
     since = int(time.time() * 1000)
     with open(out, "w", encoding="utf-8") as f:
         p = subprocess.Popen(cmd, cwd=os.path.join(ctx.q.dir(key), "repo"), stdin=subprocess.DEVNULL,
-                             stdout=f, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                             stdout=f, stderr=subprocess.STDOUT, env=env, **NEW_GROUP)
         ctx.child = p
         try:
             rc = p.wait(timeout=ctx.stage_timeout)
@@ -454,11 +454,29 @@ def sync_vault(ctx, key, since):
                      f"---\ntype: note\nticket: {key}\nsummary: {yq(f'harness queue log of {key}')}\n---\n\n"
                      f"# {key}: queue log\n\nWritten by `harness queue`; each line is a stage, a check or a verdict.\n\n"
                      f"{fence}text\n{log.rstrip()}\n{fence}\n")
-    subprocess.run(["bash", ctx.harness, "queue", "_sync", key, os.path.join(ctx.q.dir(key), "repo"), str(since)],
+    subprocess.run([BASH, ctx.harness, "queue", "_sync", key, os.path.join(ctx.q.dir(key), "repo"), str(since)],
                    stdin=subprocess.DEVNULL, capture_output=True, timeout=600, check=False)
 
 
+# On Windows a bare "bash" can resolve to WSL's System32\bash.exe before PATH is searched;
+# shutil.which walks PATH, where Git Bash puts its own bash first.
+BASH = shutil.which("bash") or "bash"
+
+# The agent gets its own session (process group on Windows) so Ctrl-C reaches only the queue,
+# which then stops the agent's whole tree itself.
+NEW_GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
+
+
 def stop(p):
+    if os.name == "nt":  # no killpg or SIGKILL: taskkill /T ends bash and everything it started
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], stdin=subprocess.DEVNULL,
+                       capture_output=True, check=False)
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        return
     for sig, wait in ((signal.SIGTERM, 30), (signal.SIGKILL, 10)):
         try:
             os.killpg(p.pid, sig)
@@ -670,7 +688,7 @@ def process(ctx, st):
         except (RuntimeError, subprocess.SubprocessError) as e:
             return block(ctx, st, f"could not clone {st['project']} at {st['base']}: {e}")
         ctx.q.log(key, f"cloned {st['project']} at {st['base']} ({st['base_sha'][:12]}) on branch {key}")
-    subprocess.run(["bash", ctx.harness, "queue", "_pull", key], stdin=subprocess.DEVNULL,
+    subprocess.run([BASH, ctx.harness, "queue", "_pull", key], stdin=subprocess.DEVNULL,
                    capture_output=True, timeout=300, check=False)
     st["status"] = "running"
     ctx.q.save(st)
@@ -680,14 +698,11 @@ def process(ctx, st):
 
 
 def cmd_run(q, a):
-    import fcntl
-    lock = open(os.path.join(q.root, "run.lock"), "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    lock = open(os.path.join(q.root, "run.lock"), "a")
+    if not try_lock(lock):
         print("[queue] another 'harness queue run' is running", file=sys.stderr)
         return 1
-    ctx = argparse.Namespace(q=q, vault=os.path.abspath(a.vault), proxy=a.proxy, harness=a.harness, host=a.host,
+    ctx =argparse.Namespace(q=q, vault=os.path.abspath(a.vault), proxy=a.proxy, harness=a.harness, host=a.host,
                              single=a.single_message, retries=a.retries, push=a.push == 1, remote=a.remote,
                              plan_review=a.plan_review == 1, stage_timeout=a.stage_timeout, child=None)
     ctx.model = a.model or resolve_model(a.proxy, a.default_model)
