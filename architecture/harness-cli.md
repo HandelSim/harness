@@ -436,8 +436,9 @@ user adds one with git; `list` shows its `origin` url once there is one.
 
 `init` (`_vault_charter`) asks, on `/dev/tty` with no model, what the active
 vault is about: project, goal, readers, what to track, a ticket id regex
-(validated; `-` for none) and the folders it covers, the current answers as
-defaults, and writes them to `wiki/overview.md` as single-quoted YAML front
+(validated; empty for none) and the folders it covers. Each answer is a
+readline line (`read -e -i`) pre-filled with the current answer or a
+suggestion, so it can be edited in place; it writes them to `wiki/overview.md` as single-quoted YAML front
 matter plus a body; then `vault_sync`. `harness ingest` sends the charter
 with every request and makes a page per ticket id the regex finds.
 

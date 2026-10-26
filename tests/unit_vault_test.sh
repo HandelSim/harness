@@ -448,4 +448,77 @@ done
 ls "$ALL/.raw/sessions/" | grep -q ses_sub && fail "V13: subagent sessions are never captured on their own"
 ok "V13: a capture is never shrunk; import --all captures every directory's root sessions"
 
+# --- V14: vault init edits answers in place and always writes the charter ----
+# Drives _vault_charter through a pty, as a terminal user would: arrow keys
+# and Home insert inside the pre-filled line (a plain read stored them as
+# escape codes), an empty covers answer still writes wiki/overview.md, and an
+# emptied ticket pattern stays empty on the next run. Skipped where Python has
+# no pty (Windows).
+if $PY -c 'import pty' 2>/dev/null; then
+    CH="$TMP_ROOT/charter"
+    mkdir -p "$CH/wiki"
+    cp "$REPO_ROOT/vault-template/wiki/overview.md" "$CH/wiki/overview.md"
+    cat > "$TMP_ROOT/charter_pty.py" <<'PYEOF2'
+import os, pty, re, select, sys, time
+repo, root, vdir = sys.argv[1:4]
+keys = [k.encode().decode("unicode_escape") for k in sys.argv[4:]]
+script = ('HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$1/install" source "$2/harness" 2>/dev/null'
+          ' && clone_dir="$2" && source "$2/scripts/lib/platform.sh" && cd "$3" && _vault_charter "$3"')
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm"
+    os.execvp("bash", ["bash", "-c", script, "x", root, repo, vdir])
+out = b""
+# The readline prompt, after the bracketed-paste switch or other escapes.
+PROMPT = re.compile(rb"\n(?:\x1b\[[?0-9;]*[A-Za-z])*> ")
+def read_until(n, timeout=20):
+    global out
+    end = time.time() + timeout
+    while len(PROMPT.findall(out)) < n and time.time() < end:
+        if select.select([fd], [], [], 0.2)[0]:
+            try:
+                out += os.read(fd, 4096)
+            except OSError:
+                break
+    return len(PROMPT.findall(out)) >= n
+for i, k in enumerate(keys, 1):
+    if not read_until(i):
+        sys.exit("no prompt %d; output so far: %r" % (i, out))
+    time.sleep(0.1)
+    os.write(fd, k.encode())
+while True:
+    try:
+        chunk = os.read(fd, 4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    out += chunk
+_, status = os.waitpid(pid, 0)
+sys.exit(0 if os.waitstatus_to_exitcode(status) == 0 else "exit %r; output: %r" % (status, out))
+PYEOF2
+    charter() { $PY "$TMP_ROOT/charter_pty.py" "$REPO_ROOT" "$TMP_ROOT" "$CH" "$@"; }
+    fm() { sed -n "s/^$1: //p" "$CH/wiki/overview.md"; }
+    # project: clear, type, five lefts, insert; readers: Home, insert; covers empty.
+    charter '\x15hello world\x1b[D\x1b[D\x1b[D\x1b[D\x1b[Dbig \r' '\r' '\x1b[Hjust \r' '\r' '\r' '\r' \
+        || fail "V14: first init run failed"
+    [[ "$(fm project)" == "'hello big world'" ]] || fail "V14: left arrow should insert mid-line — project=$(fm project)"
+    [[ "$(fm readers)" == "'just me and my coding agents'" ]] || fail "V14: Home should insert at the start — readers=$(fm readers)"
+    [[ "$(fm goal)" == "'a second brain for hello big world: how it works, what was decided and why, what was done'" ]] \
+        || fail "V14: Enter keeps the suggestion — goal=$(fm goal)"
+    [[ "$(fm ticket_pattern)" == "'[A-Z][A-Z0-9]+-[0-9]+'" ]] || fail "V14: a new vault suggests the ticket pattern — $(fm ticket_pattern)"
+    [[ "$(fm covers)" == "''" ]] || fail "V14: covers should be empty — $(fm covers)"
+    [[ ! -e "$CH/wiki/overview.md.tmp" ]] || fail "V14: the charter was left as overview.md.tmp"
+    grep -q $'\x1b' "$CH/wiki/overview.md" && fail "V14: escape codes reached the charter"
+    # Clear the ticket pattern, then a run of plain Enters keeps every answer.
+    charter '\r' '\r' '\r' '\r' '\x15\r' '\r' || fail "V14: second init run failed"
+    [[ "$(fm ticket_pattern)" == "''" ]] || fail "V14: an emptied ticket pattern should save empty — $(fm ticket_pattern)"
+    charter '\r' '\r' '\r' '\r' '\r' '\r' || fail "V14: third init run failed"
+    [[ "$(fm ticket_pattern)" == "''" && "$(fm project)" == "'hello big world'" ]] \
+        || fail "V14: a re-run should keep the saved answers — project=$(fm project) ticket_pattern=$(fm ticket_pattern)"
+    ok "V14: vault init edits pre-filled answers in place, writes the charter, keeps answers on a re-run"
+else
+    ok "V14: skipped (no pty in this Python)"
+fi
+
 echo "VAULT TEST PASSED"

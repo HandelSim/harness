@@ -5739,8 +5739,8 @@ harness_opencode_overlay() {
 # for and write its charter, wiki/overview.md. Plain questions on the
 # terminal, no model, so it works the same whatever model you use; `harness
 # ingest` puts the charter in front of every source it sends, and its
-# ticket_pattern decides which ids get a ticket page. Asking again shows the
-# current answers as the defaults.
+# ticket_pattern decides which ids get a ticket page. Asking again pre-fills
+# the current answers.
 _vault_charter() {
     local dir="$1" f="$1/wiki/overview.md" py
     [[ -e /dev/tty ]] || { err "harness vault init needs a terminal"; return 1; }
@@ -5748,31 +5748,46 @@ _vault_charter() {
         [[ -f "$f" ]] || return 0
         sed -n "/^---\$/,/^---\$/s/^$1: *//p" "$f" | head -n 1 | sed "s/^'\\(.*\\)'\$/\\1/; s/^\"\\(.*\\)\"\$/\\1/; s/''/'/g"
     }
+    # The question, then an input line pre-filled with the suggestion. read -e
+    # is readline: the arrow keys, Home/End and Ctrl-A/E move through the line
+    # and typing inserts at the cursor (a plain read takes arrow keys as text
+    # and the terminal draws over what was typed). Its prompt and redraws go
+    # to stderr, so they get /dev/tty and only the answer reaches stdout. An
+    # emptied answer keeps the suggestion unless $3 is "optional".
     _charter_ask() {
         local ans
-        printf '%s\n  [%s]: ' "$1" "$2" >/dev/tty
-        IFS= read -r ans </dev/tty || ans=""
-        printf '%s' "${ans:-$2}"
+        printf '\n%s\n' "$1" >/dev/tty
+        IFS= read -r -e -p '> ' -i "$2" ans </dev/tty 2>/dev/tty || ans=""
+        [[ -n "$ans" || "${3:-}" == optional ]] || ans="$2"
+        printf '%s' "$ans"
     }
     _charter_q() { local v="${1//\'/\'\'}"; printf "'%s'" "$v"; }
     _charter_def() { local v; v=$(_charter_get "$1"); printf '%s' "${v:-$2}"; }
     local project goal readers track tickets covers
-    echo "Describe this vault (Enter keeps the answer in brackets)." >/dev/tty
+    echo "Describe this vault. Each answer starts as a suggestion: Enter keeps it," >/dev/tty
+    echo "the arrow keys move through it to edit, Ctrl-U clears it." >/dev/tty
     project=$(_charter_ask "What project or area is it about?" "$(_charter_def project "$(basename "$PWD")")")
     goal=$(_charter_ask "What is it for?" "$(_charter_def goal \
         "a second brain for $project: how it works, what was decided and why, what was done")")
     readers=$(_charter_ask "Who reads it?" "$(_charter_def readers "me and my coding agents")")
     track=$(_charter_ask "What should it keep track of?" "$(_charter_def track \
         "how the code works, decisions and their reasons, open questions, work per ticket")")
-    tickets=$(_charter_ask "Ticket id pattern, a regular expression (- for none)" \
-        "$(_charter_def ticket_pattern '[A-Z][A-Z0-9]+-[0-9]+')")
+    # Once init has run (a project is set; the template's is empty) the saved
+    # pattern is the suggestion, an empty one (no tickets) included.
+    if [[ -n "$(_charter_get project)" ]]; then
+        tickets=$(_charter_get ticket_pattern)
+    else
+        tickets='[A-Z][A-Z0-9]+-[0-9]+'
+    fi
+    tickets=$(_charter_ask "Ticket id pattern, a regular expression (empty for none)" "$tickets" optional)
     [[ "$tickets" == "-" ]] && tickets=""
     if [[ -n "$tickets" ]] && py=$(host_python_bin); then
         # shellcheck disable=SC2086  # $py can be 'py -3'
         $py -c 'import re, sys; re.compile(sys.argv[1])' "$tickets" 2>/dev/null \
             || { err "'$tickets' is not a valid regular expression; no ticket pattern set"; tickets=""; }
     fi
-    covers=$(_charter_ask "Codebases or folders it covers (paths, for 'harness ingest <dir>')" "$(_charter_get covers)")
+    covers=$(_charter_ask "Codebases or folders it covers, for 'harness ingest <dir>' (empty for none)" \
+        "$(_charter_get covers)" optional)
     mkdir -p "$dir/wiki"
     {
         echo "---"
@@ -5800,9 +5815,14 @@ _vault_charter() {
         echo "## What to track"
         echo
         echo "$track"
-        [[ -n "$tickets" ]] && { echo; echo "Ticket ids match \`$tickets\`; each id seen in a source gets a page in wiki/tickets/."; }
-        [[ -n "$covers" ]] && { echo; echo "## What it covers"; echo; echo "$covers"; }
-    } > "$f.tmp" && mv "$f.tmp" "$f"
+        if [[ -n "$tickets" ]]; then
+            echo; echo "Ticket ids match \`$tickets\`; each id seen in a source gets a page in wiki/tickets/."
+        fi
+        if [[ -n "$covers" ]]; then
+            echo; echo "## What it covers"; echo; echo "$covers"
+        fi
+    } > "$f.tmp" || { err "could not write $f.tmp"; return 1; }
+    mv "$f.tmp" "$f" || { err "could not write $f"; return 1; }
     echo "wrote $f"
 }
 
