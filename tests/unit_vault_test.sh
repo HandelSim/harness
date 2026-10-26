@@ -679,9 +679,10 @@ harness_ticket_flag '' 2>/dev/null && fail "V16: --ticket with no key accepted"
         || fail "V16: the overlay should carry the ticket files and header — $cfg"
     out=$(HOME="$TMP_ROOT/home" cmd_context --host)
     grep -q '^  1\. global ' <<<"$out" && grep -q '^ticket:  XY-2' <<<"$out" && grep -q '^token:   set' <<<"$out" \
-        && grep -q "^tracker: http://127.0.0.1:$JPORT/" <<<"$out" \
         || fail "V16: harness context — $out"
     grep -q 'tok123' <<<"$out" && fail "V16: harness context printed the token"
+    [[ "$(_ticket_tracker_status "$TV" | head -n 1)" == "tracker: http://127.0.0.1:$JPORT/" ]] \
+        || fail "V16: the tracker shown should be the charter's — $(_ticket_tracker_status "$TV")"
     exit 0
 ) || exit 1
 ok "V16: --ticket is checked and remembered per folder; the overlay and harness context list the ticket's files"
