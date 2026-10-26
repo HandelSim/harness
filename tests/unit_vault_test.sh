@@ -533,8 +533,8 @@ else
 fi
 
 # --- V15: vault_ticket.py against a mock tracker -----------------------------
-# The mock is Jira Server's REST v2: ABC-7 with the bearer token, 401 without
-# it, 404 for anything else.
+# The mock is Jira Server's REST v2: ABC-7 with the token (Bearer, or Basic
+# for Cloud's email:token), 401 without it, 404 for anything else.
 JIRA="$TMP_ROOT/jira.py"
 cat > "$JIRA" <<'PYEOF'
 import json, sys
@@ -556,7 +556,7 @@ ISSUE = {"key": "ABC-7",
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
-        if self.headers.get("Authorization") != "Bearer tok123":
+        if self.headers.get("Authorization") not in ("Bearer tok123", "Basic bWVAeC5pbzp0b2sxMjM="):
             code, body = 401, {"errorMessages": ["no"]}
         elif self.path.startswith("/rest/api/2/issue/ABC-7?") and "expand=names" in self.path:
             code, body = 200, ISSUE
@@ -589,12 +589,11 @@ tracker_fields: 'Team'
 ---
 MDEOF
 git -C "$TV" add -A && git -C "$TV" commit -qm init
-HDR="$TMP_ROOT/header"
-printf 'Authorization: Bearer tok123\n' > "$HDR"
-tk() { $PY "$REPO_ROOT/scripts/vault_ticket.py" "$TV" "$@" 2>&1; }
+# tk TOKEN KEY: the token goes in the environment, as ticket_pull passes it.
+tk() { TRACKER_TOKEN="$1" $PY "$REPO_ROOT/scripts/vault_ticket.py" "$TV" "$2" 2>&1; }
 SNAP="$TV/.raw/tickets/ABC-7.md"
 NOTE="$TV/wiki/notes/tickets/ABC-7-state.md"
-out=$(tk ABC-7 "$HDR") || fail "V15: vault_ticket.py failed — $out"
+out=$(tk tok123 ABC-7) || fail "V15: vault_ticket.py failed — $out"
 [[ "$out" == "ABC-7 (To Do): Report sets while the task runs [new]" ]] || fail "V15: status line — $out"
 [[ -f "$SNAP" && -f "$NOTE" ]] || fail "V15: the copy and the state note should be written"
 for want in '^ticket: ABC-7$' '^status: "\?To Do"\?$' '^> This is the ticket as people wrote it' '^- Priority: High$' \
@@ -604,21 +603,33 @@ for want in '^ticket: ABC-7$' '^status: "\?To Do"\?$' '^> This is the ticket as 
 done
 grep -q 'sk-abcdefghij\|Risk Index\|^comment 1$' "$SNAP" && fail "V15: the copy kept a key, an unasked field or an old comment — $(cat "$SNAP")"
 grep -q '^Tickets: \[\[ABC-7\]\]$' "$NOTE" || fail "V15: the state note should link the hub — $(cat "$NOTE")"
-[[ "$(tk ABC-7 "$HDR")" == *"[unchanged]" ]] || fail "V15: a second pull of the same ticket should be unchanged"
+[[ "$(tk me@x.io:tok123 ABC-7)" == *"[unchanged]" ]] || fail "V15: a second pull (Basic auth, email:token) should be unchanged"
 printf 'mine\n' > "$NOTE"
-printf 'Authorization: Bearer wrong\n' > "$TMP_ROOT/badheader"
-out=$(tk ABC-7 "$TMP_ROOT/badheader")
-[[ "$out" == *"refused the token (HTTP 401"*"using the copy from 2026-10-20"* ]] || fail "V15: a refused token — $out"
+out=$(tk wrong ABC-7)
+[[ "$out" == *"refused TRACKER_TOKEN (HTTP 401"*"using the copy from 2026-10-20"* ]] || fail "V15: a refused token — $out"
 [[ "$(cat "$NOTE")" == "mine" ]] || fail "V15: an existing state note must not be touched"
-out=$(tk ABC-7)
-[[ "$out" == *"no tracker token"*"using the copy"* ]] || fail "V15: no token — $out"
-out=$(tk ABC-99 "$HDR")
+out=$(tk '' ABC-7)
+[[ "$out" == *"no Jira token set"*"using the copy"* ]] || fail "V15: no token — $out"
+out=$(tk tok123 ABC-99)
 [[ "$out" == *"HTTP 404"*"no copy of the ticket yet"* && -f "$TV/wiki/notes/tickets/ABC-99-state.md" ]] \
     || fail "V15: an unknown ticket still gets its state note — $out"
 sed -i.bak "s#127.0.0.1:$JPORT#127.0.0.1:9#" "$TV/wiki/overview.md"
-out=$(tk ABC-7 "$HDR")
+out=$(tk tok123 ABC-7)
 [[ "$out" == *"not reachable"*"using the copy"* ]] || fail "V15: an unreachable tracker — $out"
 mv "$TV/wiki/overview.md.bak" "$TV/wiki/overview.md"
+# harness ticket login writes the URL into the charter with _charter_set:
+# replacing the key, or adding it when the charter has none.
+cp "$TV/wiki/overview.md" "$TMP_ROOT/charter.bak"
+_charter_set "$TV" tracker_url "https://jira.new.example/it's" || fail "V15: _charter_set failed"
+[[ "$(_charter_value "$TV" tracker_url)" == "https://jira.new.example/it's" ]] \
+    || fail "V15: _charter_set should replace tracker_url — $(cat "$TV/wiki/overview.md")"
+[[ "$(grep -c '^tracker_url:' "$TV/wiki/overview.md")" == 1 && "$(_charter_value "$TV" tracker_fields)" == "Team" ]] \
+    || fail "V15: _charter_set should leave one tracker_url and the other keys — $(cat "$TV/wiki/overview.md")"
+sed -i.bak '/^tracker_url:/d' "$TV/wiki/overview.md"
+_charter_set "$TV" tracker_url "https://jira.example.com" || fail "V15: _charter_set (no key yet) failed"
+[[ "$(_charter_value "$TV" tracker_url)" == "https://jira.example.com" && "$(sed -n 1p "$TV/wiki/overview.md")" == "---" ]] \
+    || fail "V15: _charter_set should add a missing key in the front matter — $(cat "$TV/wiki/overview.md")"
+mv "$TMP_ROOT/charter.bak" "$TV/wiki/overview.md"; rm -f "$TV/wiki/overview.md.bak"
 ok "V15: vault_ticket.py writes a labelled, redacted copy and a state note, and falls back to the copy"
 
 # --- V16: --ticket, the folder's ticket, the launch's instruction files ------
@@ -632,9 +643,8 @@ harness_ticket_flag abc-7 2>/dev/null || fail "V16: --ticket abc-7 refused"
 [[ "$harness_ticket_arg" == "ABC-7" ]] || fail "V16: --ticket should upper-case the key — $harness_ticket_arg"
 harness_ticket_flag 'nope' 2>/dev/null && fail "V16: --ticket nope accepted"
 harness_ticket_flag '' 2>/dev/null && fail "V16: --ticket with no key accepted"
-mkdir -p "$state_root/tracker"
-cp "$HDR" "$(_ticket_header_file)"
 (
+    TRACKER_TOKEN=tok123
     cd "$PROJ2/sub/deeper"
     here=$(harness_abs_path "$PWD")
     harness_vault_dir=$(harness_abs_path "$TV") harness_ticket_arg="ABC-7"
@@ -668,7 +678,8 @@ cp "$HDR" "$(_ticket_header_file)"
         and .provider.harness.options.headers["x-harness-ticket"] == "ABC-7"' <<<"$cfg" >/dev/null \
         || fail "V16: the overlay should carry the ticket files and header — $cfg"
     out=$(HOME="$TMP_ROOT/home" cmd_context --host)
-    grep -q '^  1\. global ' <<<"$out" && grep -q '^ticket:  XY-2' <<<"$out" && grep -q '^token:   saved' <<<"$out" \
+    grep -q '^  1\. global ' <<<"$out" && grep -q '^ticket:  XY-2' <<<"$out" && grep -q '^token:   set' <<<"$out" \
+        && grep -q "^tracker: http://127.0.0.1:$JPORT/" <<<"$out" \
         || fail "V16: harness context — $out"
     grep -q 'tok123' <<<"$out" && fail "V16: harness context printed the token"
     exit 0

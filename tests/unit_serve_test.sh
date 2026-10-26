@@ -117,10 +117,10 @@ ok "S4: prompt-mode aliases only for native-route models, sharing off"
 cfg=$(_curl_auth_config 'k"e\y')
 [[ "$cfg" == 'header = "Authorization: Bearer k\"e\\y"' ]] || fail "S5: curl config not escaped: $cfg"
 (
-    PROXY_API_KEY=secret OAI_API_KEY=secret CHATGPT_COOKIE_STRING=secret
-    export PROXY_API_KEY OAI_API_KEY CHATGPT_COOKIE_STRING
+    PROXY_API_KEY=secret OAI_API_KEY=secret CHATGPT_COOKIE_STRING=secret TRACKER_TOKEN=secret
+    export PROXY_API_KEY OAI_API_KEY CHATGPT_COOKIE_STRING TRACKER_TOKEN
     host_opencode_env >/dev/null 2>&1 || true
-    env | grep -qE '^(PROXY_API_KEY|OAI_API_KEY|CHATGPT_COOKIE_STRING)=' && exit 1
+    env | grep -qE '^(PROXY_API_KEY|OAI_API_KEY|CHATGPT_COOKIE_STRING|TRACKER_TOKEN)=' && exit 1
     exit 0
 ) || fail "S5: host_opencode_env must drop the upstream secrets"
 # The scrub must not hide the OAI upstream from the overlay: its models keep
@@ -142,11 +142,8 @@ for how in host serve; do
 done
 # The only Authorization header in the CLI is the one _curl_auth_config
 # writes; any other (curl -H, a wget header, a continuation line) would put
-# the key on a command line. Also allowed: the tracker token written by the
-# printf builtin into its mode-600 file (no process argv), and help text
-# showing the header with a <placeholder>.
-hits=$(grep -nE 'Authorization: (Bearer|Basic)' "$HARNESS" | grep -vE '^[0-9]+:[[:space:]]*#' \
-    | grep -vE 'Authorization: (Bearer|Basic) <|> "\$hdr\.tmp"')
+# the key on a command line.
+hits=$(grep -nE 'Authorization: (Bearer|Basic)' "$HARNESS" | grep -vE '^[0-9]+:[[:space:]]*#')
 [[ "$hits" == *'printf '\''header = "Authorization: Bearer %s"'* && $(wc -l <<<"$hits") -eq 1 ]] \
     || fail "S5: an Authorization header outside _curl_auth_config; pipe _curl_auth_config to curl -K - instead:
 $hits"

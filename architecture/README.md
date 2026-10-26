@@ -62,7 +62,6 @@ clone. User config and `state/` are gitignored. `harness update` and
     ├── mcp/<name>/             active MCP services (compose + data)
     ├── vaults/<name>/          vault clones (`harness vault`; registry in vaults.list)
     ├── tickets.list            each folder's ticket (`harness --ticket KEY`)
-    ├── tracker/header          the tracker token (`harness ticket login`; host only)
     └── serve/                  `harness serve` opencode web password + logs
 ```
 

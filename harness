@@ -341,7 +341,7 @@ _curl_auth_config() {
 # The upstream secrets from .env. Every harness run exports .env, so a
 # host-mode opencode, and every shell its agent opens, would inherit them;
 # host_opencode_env drops them (the proxy, already started, holds its own copy).
-_harness_secret_vars=(PROXY_API_KEY OAI_API_KEY CHATGPT_COOKIE_STRING)
+_harness_secret_vars=(PROXY_API_KEY OAI_API_KEY CHATGPT_COOKIE_STRING TRACKER_TOKEN)
 
 # harness_jq — wrapper that uses host jq if available, else falls back to
 # the proxy container's jq. Same args/stdin/stdout/exit semantics as
@@ -2262,6 +2262,7 @@ NO_PROXY|comma-separated hosts that bypass the proxy
 CHATGPT_BASE_URL|ChatGPT backend-api base URL, used only by 'harness chatgpt'
 CHATGPT_MODEL_NAME|model id the ChatGPT backend serves (e.g. gpt-5.6-terra)
 CHATGPT_COOKIE_STRING|ChatGPT session cookie (secret; shown masked)
+TRACKER_TOKEN|Jira personal access token, or email:api-token for Jira Cloud (secret; shown masked)
 EOF
 }
 
@@ -5639,15 +5640,15 @@ vault_opencode_config() {
 # `harness --ticket KEY` picks the ticket this folder works on; it is kept in
 # state/tickets.list ("<folder>\t<KEY>" lines) and reused by every later
 # launch from that folder or below it. With a vault active, each launch pulls
-# the ticket from the tracker named in the vault charter (tracker_url) into
+# the ticket from the Jira named in the vault charter (tracker_url) into
 # <vault>/.raw/tickets/KEY.md (scripts/vault_ticket.py; offline, the last
 # copy is used) and the agent gets that copy and its state note,
-# <vault>/wiki/notes/tickets/KEY-state.md, as instruction files. The tracker
-# token is state/tracker/header (harness ticket login): never in git, the
-# vault or a container.
+# <vault>/wiki/notes/tickets/KEY-state.md, as instruction files.
+# TRACKER_TOKEN (.env, set by harness ticket login) reaches only that script:
+# it is one of _harness_secret_vars, unset before opencode starts, and never
+# goes into git, the vault or a container.
 
 _ticket_list() { printf '%s/tickets.list' "$state_root"; }
-_ticket_header_file() { printf '%s/tracker/header' "$state_root"; }
 
 # KEY, upper-cased, when it looks like a ticket key (ABC-123); fails otherwise.
 _ticket_key() {
@@ -5695,19 +5696,18 @@ ticket_remember() {
 
 # Pull KEY into the vault at <dir> and print the one-line outcome. Never fails.
 ticket_pull() {
-    local dir="$1" key="$2" py script hdr wdir out
+    local dir="$1" key="$2" py script wdir out
     if ! py=$(host_python_bin); then
         err "ticket $key: python 3 is needed to pull it from the tracker; the vault's copy is used"
         return 0
     fi
-    script="$clone_dir/scripts/vault_ticket.py" hdr=$(_ticket_header_file) wdir="$dir"
+    script="$clone_dir/scripts/vault_ticket.py" wdir="$dir"
     if command -v cygpath >/dev/null 2>&1; then
-        script=$(cygpath -m "$script"); wdir=$(cygpath -m "$dir"); hdr=$(cygpath -m "$hdr")
+        script=$(cygpath -m "$script"); wdir=$(cygpath -m "$dir")
     fi
-    local -a args=("$script" "$wdir" "$key")
-    [[ -f "$(_ticket_header_file)" ]] && args+=("$hdr")
+    # The token goes in the script's environment, never on a command line.
     # shellcheck disable=SC2086  # $py can be 'py -3'
-    out=$($py "${args[@]}" 2>&1) || true
+    out=$(TRACKER_TOKEN="${TRACKER_TOKEN:-}" $py "$script" "$wdir" "$key" 2>&1) || true
     [[ -z "$out" ]] || echo "[harness] ticket $out" >&2
     return 0
 }
@@ -5951,10 +5951,7 @@ harness_opencode_overlay() {
 _vault_charter() {
     local dir="$1" f="$1/wiki/overview.md" py
     [[ -e /dev/tty ]] || { err "harness vault init needs a terminal"; return 1; }
-    _charter_get() {
-        [[ -f "$f" ]] || return 0
-        sed -n "/^---\$/,/^---\$/s/^$1: *//p" "$f" | head -n 1 | sed "s/^'\\(.*\\)'\$/\\1/; s/^\"\\(.*\\)\"\$/\\1/; s/''/'/g"
-    }
+    _charter_get() { _charter_value "$dir" "$1"; }
     # The question, then an input line pre-filled with the suggestion. read -e
     # is readline: the arrow keys, Home/End and Ctrl-A/E move through the line
     # and typing inserts at the cursor (a plain read takes arrow keys as text
@@ -5995,15 +5992,17 @@ _vault_charter() {
     fi
     covers=$(_charter_ask "Codebases or folders it covers, for 'harness ingest <dir>' (empty for none)" \
         "$(_charter_get covers)" optional)
-    tracker=$(_charter_ask "Ticket tracker base URL, for 'harness --ticket KEY', e.g. https://jira.example.com (empty for none)" \
+    tracker=$(_charter_ask "Jira URL, the address you open Jira at, e.g. https://jira.example.com (empty for none).
+Every 'harness --ticket KEY' launch copies that ticket from it into the agent's context;
+'harness ticket login' saves your Jira token." \
         "$(_charter_get tracker_url)" optional)
     tracker="${tracker%/}"
     if [[ -n "$tracker" && ! "$tracker" =~ ^https?://[^[:space:]]+$ ]]; then
-        err "'$tracker' is not an http(s) URL; no tracker set"; tracker=""
+        err "'$tracker' is not an http(s) URL; no Jira URL set"; tracker=""
     fi
     fields=""
     if [[ -n "$tracker" ]]; then
-        fields=$(_charter_ask "Extra ticket fields to copy, ids or names, comma-separated (empty for the usual ones)" \
+        fields=$(_charter_ask "Extra Jira fields to copy into the ticket, ids (customfield_12345) or names, comma-separated (empty: acceptance criteria, story points, epic link and sprint are copied anyway)" \
             "$(_charter_get tracker_fields)" optional)
     fi
     mkdir -p "$dir/wiki"
@@ -6042,7 +6041,7 @@ _vault_charter() {
             echo; echo "## What it covers"; echo; echo "$covers"
         fi
         if [[ -n "$tracker" ]]; then
-            echo; echo "Tickets come from $tracker: \`harness --ticket KEY\` copies one into .raw/tickets/ at every launch."
+            echo; echo "Tickets come from Jira at $tracker: \`harness --ticket KEY\` copies one into .raw/tickets/ at every launch."
         fi
     } > "$f.tmp" || { err "could not write $f.tmp"; return 1; }
     mv "$f.tmp" "$f" || { err "could not write $f"; return 1; }
@@ -6051,10 +6050,9 @@ _vault_charter() {
 
 # `harness ticket`: the ticket this folder works on and the tracker token.
 cmd_ticket() {
-    local sub="${1:-show}" here key from name dir hdr tok
+    local sub="${1:-show}" here key from name dir tok
     (( $# )) && shift
     here=$(harness_abs_path "$PWD") || { err "cannot resolve current directory: $PWD"; return 1; }
-    hdr=$(_ticket_header_file)
     name=$(vault_active_name)
     dir=""
     [[ -n "$name" && -d "$state_root/vaults/$name/.git" ]] && dir=$(harness_abs_path "$state_root/vaults/$name")
@@ -6070,12 +6068,14 @@ usage:
   harness ticket off             forget this folder's ticket
   harness ticket pull [<KEY>]    pull the ticket from the tracker now and
                                  commit the copy to the vault
-  harness ticket login           save the tracker token (asked for, never
-                                 shown) in state/tracker/header
-  harness ticket logout          delete the saved token
+  harness ticket login           set the Jira URL (in the vault charter, shared
+                                 with everyone using the vault) and your token
+                                 (TRACKER_TOKEN in .env, never shown)
+  harness ticket logout          clear TRACKER_TOKEN
 
-A launch with a ticket pulls it from the tracker (tracker_url in the vault
-charter: 'harness vault init') into <vault>/.raw/tickets/<KEY>.md, every time,
+A launch with a ticket pulls it from Jira (tracker_url in the vault charter,
+set by 'harness ticket login' or 'harness vault init'; tracker_fields there
+lists extra fields to copy) into <vault>/.raw/tickets/<KEY>.md, every time,
 and gives the agent that copy and its state note,
 <vault>/wiki/notes/tickets/<KEY>-state.md, as instructions. The agent keeps
 the state note (done, next, decisions) up to date, so the next session starts
@@ -6084,12 +6084,11 @@ The copy is labelled as people's text that describes the work, not
 instructions about tools or credentials. 'harness context' lists everything
 a launch gives the model.
 
-The token is a personal access token sent as 'Authorization: Bearer <token>'
-(Jira Server and Data Center). For Jira Cloud put one line in
-state/tracker/header yourself: 'Authorization: Basic <base64 of
-email:api-token>'. It is read only on the host and never goes into git, the
-vault or the agent container (host mode runs the agent as you, so there it
-could read the file).
+TRACKER_TOKEN is a personal access token, sent as a Bearer token (Jira
+Server and Data Center), or <email>:<api-token> for Jira Cloud, sent as Basic
+auth. Only the script that pulls the ticket gets it: harness removes it from
+the environment before opencode starts, and it never goes into git, the vault
+or the agent container.
 HELP
             ;;
         show)
@@ -6139,23 +6138,48 @@ HELP
             vault_sync "$harness_vault_dir" 0 "" "$here"
             ;;
         login)
-            [[ -e /dev/tty ]] || { err "harness ticket login needs a terminal"; return 1; }
-            echo "Paste a personal access token from the tracker (your profile > Personal Access Tokens)." >/dev/tty
-            echo "It is not shown as you type." >/dev/tty
+            [[ -e /dev/tty ]] || { err "harness ticket login needs a terminal; or set TRACKER_TOKEN with: harness config"; return 1; }
+            local url old=""
+            if [[ -n "$dir" ]]; then
+                old=$(_charter_value "$dir" tracker_url)
+                echo "Jira URL, the address you open Jira at, e.g. https://jira.example.com." >/dev/tty
+                echo "It is saved in the vault charter ($name), so everyone using the vault pulls from it." >/dev/tty
+                IFS= read -r -e -p 'Jira URL: ' -i "$old" url </dev/tty 2>/dev/tty || url=""
+                url="${url%/}"
+                if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
+                    err "'$url' is not an http(s) URL; nothing saved"; return 1
+                fi
+                if [[ "$url" != "$old" ]]; then
+                    _charter_set "$dir" tracker_url "$url" || return 1
+                    echo "saved the Jira URL in $dir/wiki/overview.md"
+                    vault_sync "$dir" 0 "" "$here"
+                fi
+                echo >/dev/tty
+            else
+                echo "No active vault, so no Jira URL is asked for: it goes in a vault's charter (see: harness vault)." >/dev/tty
+            fi
+            echo "Paste a Jira personal access token (in Jira: your profile > Personal Access Tokens;" >/dev/tty
+            echo "for Jira Cloud: <email>:<api-token>). It is not shown as you type; Enter alone keeps the saved one." >/dev/tty
             IFS= read -r -s -p 'token: ' tok </dev/tty 2>/dev/tty || tok=""
             echo >/dev/tty
             tok="${tok//[[:space:]]/}"
-            [[ -n "$tok" ]] || { err "no token given; nothing saved"; return 1; }
-            mkdir -p "${hdr%/*}" && chmod 700 "${hdr%/*}" 2>/dev/null
-            if ! (umask 077 && printf 'Authorization: Bearer %s\n' "$tok" > "$hdr.tmp" && mv "$hdr.tmp" "$hdr"); then
-                tok=""; err "could not write $hdr"; return 1
+            if [[ -n "$tok" ]]; then
+                _config_write_key TRACKER_TOKEN "$tok" || { tok=""; return 1; }
+                TRACKER_TOKEN="$tok"
+                echo "saved TRACKER_TOKEN in $env_file"
             fi
             tok=""
-            echo "saved in $hdr (readable only by you; never copied into git, the vault or a container)"
+            [[ -n "${TRACKER_TOKEN:-}" ]] || { err "no token given; run harness ticket login again"; return 1; }
             _ticket_tracker_status "$dir"
             ;;
         logout)
-            if [[ -f "$hdr" ]]; then rm -f "$hdr"; echo "deleted the saved tracker token"; else echo "no tracker token saved"; fi
+            if [[ -n "$(_config_read_key TRACKER_TOKEN)" ]]; then
+                _config_write_key TRACKER_TOKEN "" || return 1
+                echo "cleared TRACKER_TOKEN in $env_file"
+            else
+                echo "no TRACKER_TOKEN in $env_file"
+            fi
+            [[ -z "${TRACKER_TOKEN:-}" ]] || echo "(TRACKER_TOKEN is still set in your shell's environment)"
             ;;
         -*)
             err "unknown option '$sub' (see: harness ticket --help)"; return 1
@@ -6168,16 +6192,33 @@ HELP
     esac
 }
 
+# One front-matter value of the charter of the vault at $1, unquoted.
+_charter_value() {
+    local f="$1/wiki/overview.md"
+    [[ -f "$f" ]] || return 0
+    sed -n "/^---\$/,/^---\$/s/^$2: *//p" "$f" | head -n 1 | sed "s/^'\\(.*\\)'\$/\\1/; s/^\"\\(.*\\)\"\$/\\1/; s/''/'/g"
+}
+
+# Set the front-matter key $2 of the charter of the vault at $1 to $3 (single
+# quoted YAML), adding the key when the charter has none.
+_charter_set() {
+    local f="$1/wiki/overview.md" v="${3//\'/\'\'}"
+    [[ -f "$f" && "$(head -n 1 "$f")" == "---" ]] || { err "$f has no front matter (run: harness vault init)"; return 1; }
+    awk -v k="$2" -v v="'$v'" '
+        NR == 1 { print; fm = 1; next }
+        fm && $0 ~ "^" k ":" { if (!done) print k ": " v; done = 1; next }
+        fm && /^---$/ { if (!done) print k ": " v; done = 1; fm = 0 }
+        { print }' "$f" > "$f.tmp" && mv "$f.tmp" "$f" || { rm -f "$f.tmp"; err "could not write $f"; return 1; }
+}
+
 # The tracker part of `harness ticket` and `harness context`: the charter's
-# tracker_url and whether a token is saved (never the token).
+# tracker_url and whether TRACKER_TOKEN is set (never the token).
 _ticket_tracker_status() {
-    local dir="$1" url=""
-    if [[ -n "$dir" && -f "$dir/wiki/overview.md" ]]; then
-        url=$(sed -n '/^---$/,/^---$/s/^tracker_url: *//p' "$dir/wiki/overview.md" | head -n 1 | tr -d "'\"")
-    fi
-    echo "tracker: ${url:-none (set tracker_url with: harness vault init)}"
-    if [[ -f "$(_ticket_header_file)" ]]; then
-        echo "token:   saved (harness ticket logout deletes it)"
+    local url=""
+    [[ -n "${1:-}" ]] && url=$(_charter_value "$1" tracker_url)
+    echo "tracker: ${url:-none (harness ticket login sets the Jira URL)}"
+    if [[ -n "${TRACKER_TOKEN:-}" ]]; then
+        echo "token:   set (TRACKER_TOKEN; harness ticket logout clears it)"
     else
         echo "token:   none (harness ticket login)"
     fi

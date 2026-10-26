@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Pull the current ticket from the tracker into the active vault.
 
-Usage: vault_ticket.py <vault dir> <KEY> [<header file>]
+Usage: TRACKER_TOKEN=... vault_ticket.py <vault dir> <KEY>
 
 Run by harness at every launch with a ticket (`harness --ticket KEY`) and by
 `harness ticket pull`. Reads tracker_url (and the optional tracker_fields)
 from the vault's charter, wiki/overview.md, fetches
 <tracker_url>/rest/api/2/issue/<KEY> (Jira Server/Data Center or Cloud, REST
-v2) with the one `Name: value` header line in <header file>, and writes
+v2) with TRACKER_TOKEN from the environment (a personal access token, sent as
+Bearer; <email>:<api-token> for Cloud, sent as Basic), and writes
 .raw/tickets/<KEY>.md: the ticket as people wrote it, labelled as such,
 secrets redacted, rewritten only when it changed. It also creates the agent's
 state note, wiki/notes/tickets/<KEY>-state.md, when there is none. Both reach
@@ -15,9 +16,10 @@ the agent as instruction files; the note is the agent's to keep up to date.
 
 Prints one status line (new, updated, unchanged, or why the tracker was not
 reached and which snapshot is used instead) and exits 0: a launch never
-fails over the tracker. The token is read from the file, sent in the request
-and never printed or written anywhere else. HTTP(S)_PROXY are honoured.
+fails over the tracker. The token is sent in the request and never printed or
+written anywhere. HTTP(S)_PROXY are honoured.
 """
+import base64
 import json
 import os
 import re
@@ -157,52 +159,50 @@ def ensure_note(vault, key, title):
     return True
 
 
-def fetch(url, key, header_file):
+def fetch(url, key, token):
     """(issue dict, None) or (None, why it failed)."""
-    try:
-        with open(header_file, encoding="utf-8") as fh:
-            line = fh.readline().strip()
-    except OSError:
-        return None, "no tracker token (harness ticket login)"
-    name, sep, value = line.partition(":")
-    if not sep or not name.strip() or not value.strip():
-        return None, "the token file is not one 'Name: value' line (harness ticket login)"
+    if ":" in token:
+        auth = "Basic " + base64.b64encode(token.encode("utf-8")).decode("ascii")
+    else:
+        auth = "Bearer " + token
     req = urllib.request.Request(
         f"{url.rstrip('/')}/rest/api/2/issue/{urllib.parse.quote(key)}?expand=names",
-        headers={name.strip(): value.strip(), "Accept": "application/json"})
+        headers={"Authorization": auth, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             return json.loads(r.read().decode("utf-8", "replace")), None
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            return None, f"the tracker refused the token (HTTP {e.code}; harness ticket login)"
+            return None, f"the tracker refused TRACKER_TOKEN (HTTP {e.code}; harness ticket login)"
         if e.code == 404:
             return None, f"the tracker has no ticket {key} you can see (HTTP 404)"
         return None, f"the tracker answered HTTP {e.code}"
     except (urllib.error.URLError, OSError) as e:
-        return None, f"the tracker is not reachable ({getattr(e, 'reason', e)})"
+        return None, f"the tracker at {url} is not reachable ({getattr(e, 'reason', e)})"
     except ValueError:
         return None, "the tracker's answer is not JSON"
 
 
 def main(argv):
-    if len(argv) not in (3, 4):
-        print("usage: vault_ticket.py <vault dir> <KEY> [<header file>]", file=sys.stderr)
+    if len(argv) != 3:
+        print("usage: vault_ticket.py <vault dir> <KEY>", file=sys.stderr)
         return 2
     vault, key = argv[1], argv[2]
-    header = argv[3] if len(argv) == 4 else ""
     meta, _ = frontmatter(read_text(os.path.join(vault, "wiki", "overview.md")) or "")
-    url = (meta.get("tracker_url") or "").strip()
+    url = (meta.get("tracker_url") or "").strip().rstrip("/")
     extra = [x.strip() for x in (meta.get("tracker_fields") or "").split(",") if x.strip()]
+    token = os.environ.get("TRACKER_TOKEN", "").strip()
     snap = os.path.join(vault, snapshot_rel(key))
     old_meta, _ = frontmatter(read_text(snap) or "")
+    issue = None
     if not url:
-        why = "no tracker_url in the vault charter (harness vault init)"
-        issue = None
+        why = "no Jira URL in the vault charter (harness ticket login sets it)"
     elif not re.match(r"^https?://", url):
-        why, issue = f"tracker_url is not an http(s) URL: {url}", None
+        why = f"the charter's tracker_url is not an http(s) URL: {url}"
+    elif not token:
+        why = "no Jira token set (harness ticket login sets TRACKER_TOKEN)"
     else:
-        issue, why = fetch(url, key, header) if header else (None, "no tracker token (harness ticket login)")
+        issue, why = fetch(url, key, token)
     title = old_meta.get("title", "")
     if issue is not None:
         text = render(key, url, issue, extra)

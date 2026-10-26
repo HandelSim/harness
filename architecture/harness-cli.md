@@ -436,9 +436,9 @@ user adds one with git; `list` shows its `origin` url once there is one.
 
 `init` (`_vault_charter`) asks, on `/dev/tty` with no model, what the active
 vault is about: project, goal, readers, what to track, a ticket id regex
-(validated; empty for none), the folders it covers and the ticket tracker
-(`tracker_url`, an http(s) base URL, and `tracker_fields`, extra field ids or
-names; see "Tickets and context"). Each answer is a
+(validated; empty for none), the folders it covers and the Jira URL
+(`tracker_url`, an http(s) base URL, and, when set, `tracker_fields`, extra
+field ids or names; see "Tickets and context"). Each answer is a
 readline line (`read -e -i`) pre-filled with the current answer or a
 suggestion, so it can be edited in place; it writes them to `wiki/overview.md` as single-quoted YAML front
 matter plus a body; then `vault_sync`. `harness ingest` sends the charter
@@ -545,10 +545,12 @@ or `harness ticket KEY` remembers KEY for the folder in `state/tickets.list`
 entry (`ticket_for_dir`), and `harness ticket off` forgets it. There is no
 branch-name guess. On every launch `ticket_prepare` (right after
 `vault_prepare`, both paths) runs `scripts/vault_ticket.py`, which reads
-`tracker_url`/`tracker_fields` from the charter, GETs
-`<tracker_url>/rest/api/2/issue/KEY?expand=names` (Jira Server/Data Center
-or Cloud, REST v2; 6s limit; `HTTP(S)_PROXY` honoured) with the one header
-line in `state/tracker/header`, and writes `<vault>/.raw/tickets/KEY.md`:
+`tracker_url`/`tracker_fields` from the charter (shared by everyone using the
+vault) and `TRACKER_TOKEN` (per user, `.env`) from its environment, never its
+command line. It GETs `<tracker_url>/rest/api/2/issue/KEY?expand=names` (Jira Server/Data Center
+or Cloud, REST v2; 6s limit; `HTTP(S)_PROXY` honoured), with the token as
+Bearer, or as Basic when it is `<email>:<api-token>` (Cloud), and writes
+`<vault>/.raw/tickets/KEY.md`:
 front matter (title, status, url, updated, no fetch time so an unchanged
 ticket is not rewritten), a label saying the text is people's description of
 the work and not instructions about tools or credentials, the usual fields,
@@ -563,12 +565,15 @@ and the last copy is used: a launch never fails over the tracker. Without an
 active vault the ticket is not given to the agent. `harness ticket pull
 [KEY]` does the same by hand and commits.
 
-`harness ticket login` reads a personal access token from `/dev/tty`
-without echo and writes `Authorization: Bearer <token>` to
-`state/tracker/header` (umask 077, folder 700); Jira Cloud needs a
-hand-written `Authorization: Basic ...` line instead. Only the host reads
-the file: it is never in git or the vault and `state/tracker` is not mounted
-into the container (host mode runs the agent as the user, who can read it).
+`harness ticket login` asks on `/dev/tty` for the Jira URL (pre-filled with
+the charter's; written with `_charter_set` and committed by `vault_sync`
+when it changed) and the token (no echo; written to `.env` with
+`_config_write_key`); `harness ticket logout` clears the token, and `harness
+config` edits it (masked). `TRACKER_TOKEN` is in
+`_harness_secret_vars`, so `host_opencode_env` unsets it before opencode
+starts (after `ticket_prepare` has used it), and `agent_common_env` passes
+the container an allowlist that does not include it: the agent and its
+shell commands never have it in their environment.
 
 `harness_context_files <home>` lists the instruction files a launch gives
 the model, in opencode's order: the global file
@@ -581,7 +586,7 @@ harness's: the vault's `AGENTS.md`, the ticket's copy and its state note.
 files are to a free model's vault line. `context_banner` prints one line at
 launch (file count, ~tokens, ticket); `harness context [--host]` lists the
 files with sizes, the reminder line, the ticket, tracker and whether a token
-is saved (never the token). After a launch `vault_sync` passes
+is set (never the token). After a launch `vault_sync` passes
 `vault_capture.py` `--launch MS`, `--ticket KEY` and one `--context FILE`
 per instruction file except the global one (personal, and the vault's
 remote may be shared): sessions updated since the launch get `ticket:` and
@@ -1009,7 +1014,7 @@ gets in. It runs the same preamble as `cmd_host` (python, config, confirm
 gate, toolchain, preflight, upstream gate, `host_proxy_start`,
 `host_write_opencode_config`, `vault_prepare`), sets `harness_serve=1`,
 unsets the upstream secrets (`_harness_secret_vars`: `PROXY_API_KEY`,
-`OAI_API_KEY`, `CHATGPT_COOKIE_STRING`) from its own shell, and then starts
+`OAI_API_KEY`, `CHATGPT_COOKIE_STRING`, `TRACKER_TOKEN`) from its own shell, and then starts
 two foreground children:
 
 - `serve/pub.py` (stdlib) on `127.0.0.1:N` (default 8780), the index page.
