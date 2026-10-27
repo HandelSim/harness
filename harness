@@ -1872,7 +1872,9 @@ subcommands:
             host --yolo -p' with and without it on 38 SWE-bench Verified
             tasks, graded by their tests, stopped at --budget tokens
             (default 20M). Start with --gate-only (builds the tasks, no
-            model calls). 'harness probe thoughts --help' for its options.
+            model calls). --suite local: six small local tasks instead,
+            3.5M tokens by default, fits in a day.
+            'harness probe thoughts --help' for its options.
   help      this list
 
 'harness probe <subcommand> --help' lists that subcommand's options.

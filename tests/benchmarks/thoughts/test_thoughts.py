@@ -47,6 +47,34 @@ class Plan(unittest.TestCase):
         self.assertEqual(set(t[0]), {"id", "repo", "difficulty", "solve_rate"})
 
 
+class LocalPlan(unittest.TestCase):
+    def test_balanced(self):
+        ids = ["a", "b", "c", "d", "e", "f"]
+        p = run.build_local_plan(ids, 4)
+        self.assertEqual([x[0] for x in p], list(range(24)))
+        for t in ids:
+            orders = [x[2][0] for x in p if x[1] == t]
+            self.assertEqual(sorted(orders), ["slim", "slim", "thoughts", "thoughts"])
+        for r in range(4):
+            block = p[r * 6:(r + 1) * 6]
+            self.assertEqual(sorted(x[1] for x in block), ids)
+            self.assertEqual(sum(x[2][0] == "slim" for x in block), 3)
+        self.assertEqual(p, run.build_local_plan(ids, 4))  # seeded: --resume gets the same plan
+
+    def test_dry_run_and_defaults(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(run.main(["--suite", "local", "--dry-run"]), 0)
+        out = buf.getvalue()
+        self.assertIn("budget 3,500,000 tokens; per-trial cap 250,000; timeout 900s", out)
+        self.assertEqual(len([ln for ln in out.splitlines() if "slim-thoughts" in ln or "thoughts-slim" in ln]), 24)
+        self.assertIn("no tokens spent", out)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            run.main(["--suite", "local", "--dry-run", "--repeats", "1", "--pairs", "4", "--budget", "1000000"])
+        self.assertEqual(len([ln for ln in buf.getvalue().splitlines() if "-slim " in ln or "-thoughts " in ln]), 4)
+
+
 class Guard(unittest.TestCase):
     def test_p75(self):
         self.assertEqual(run.p75([]), 0.0)
@@ -565,6 +593,51 @@ class CapKill(unittest.TestCase):
             self.assertTrue(r["arm_ok"])
             self.assertEqual(r["per_step"], {"prompt": 900, "completion": 60, "reasoning": 40})
             self.assertEqual(r["infra"], "")
+        finally:
+            shutil.rmtree(d)
+
+
+FAKE_LOCAL_HARNESS = r"""#!/bin/bash
+# Stand-in for `harness host`: two billed requests in the arm's shape, then
+# the task's work (done.txt) in the current directory.
+h="$HARNESS_INSTALL_ROOT/state/host"; mkdir -p "$h"; echo $$ > "$h/proxy.pid"; : > "$h/proxy.log"
+mode=native/slim; for x in "$@"; do [[ $x == --thoughts ]] && mode=native/slim/thoughts; done
+for i in 1 2; do
+  printf '[r%s] POST /v1/chat/completions model=m messages=3 tools=5\n[r%s] upstream shape: mode=%s messages=3 chars=2000\n[r%s] usage: model=m prompt=%s completion=10 reasoning=50 cached=0\n' "$i" "$i" "$mode" "$i" "$((i * 1000))" >> "$h/proxy.log"
+done
+echo ok > done.txt
+"""
+
+
+@unittest.skipIf(os.name == "nt", "needs bash")
+class LocalTrial(unittest.TestCase):
+    def test_scratch_copy_check_and_metrics(self):
+        d = tempfile.mkdtemp()
+        try:
+            hb = os.path.join(d, "harness")
+            with open(hb, "w") as f:
+                f.write(FAKE_LOCAL_HARNESS)
+            os.chmod(hb, 0o755)
+            task = {"id": "t", "dir": os.path.join(d, "task"), "prompt": "make done.txt"}
+            os.makedirs(os.path.join(task["dir"], "files"))
+            with open(os.path.join(task["dir"], "files", "seed.txt"), "w") as f:
+                f.write("seed\n")
+            with open(os.path.join(task["dir"], "check.py"), "w") as f:
+                f.write("import os, sys\nok = os.path.isfile('done.txt') and os.path.isfile('seed.txt')\n"
+                        "print('pass' if ok else 'FAIL: no done.txt')\nsys.exit(0 if ok else 1)\n")
+            os.makedirs(os.path.join(d, "out", "trials"))
+            ctx = {"harness": hb, "bench_root": os.path.join(d, "root"), "port": 1, "timeout": 60,
+                   "redact": lambda s: s, "out": os.path.join(d, "out"), "first": False, "needles": [],
+                   "ledger": os.path.join(d, "none.jsonl"), "oc_db": os.path.join(d, "none.db"), "next_pair": 0,
+                   "suite": "local", "keep": False}
+            for arm in ("slim", "thoughts"):
+                r = run.run_trial(0, 0, {"id": "t"}, task, None, arm, 100_000, ctx)
+                self.assertTrue(r["passed"], r)
+                self.assertTrue(r["arm_ok"])
+                self.assertEqual((r["tokens"], r["steps"], r["first_prompt"], r["prompt_per_kchar"]),
+                                 (3120, 2, 1000, 750.0))
+                self.assertEqual(r["check"], "pass")
+            self.assertEqual(os.listdir(task["dir"] + "/files"), ["seed.txt"])  # seed untouched
         finally:
             shutil.rmtree(d)
 

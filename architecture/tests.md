@@ -110,7 +110,9 @@ Benchmarks are NOT regular tests; they're driven by `harness benchmark
 - `harness probe thoughts` — docker-free paired A/B of `--thoughts` on 38
   SWE-bench Verified tasks (`tests/benchmarks/thoughts/`), token-capped at
   20M by default; `--gate-only` builds the tasks and checks the gold
-  patches with no model calls. Its unit tests run in `harness test unit` via
+  patches with no model calls. `--suite local` runs the same A/B on the
+  modes benchmark's six small tasks (x `--repeats`, default 4), 3.5M by
+  default, sized for one day's allowance. Its unit tests run in `harness test unit` via
   `tests/unit_thoughts_test.sh`. See `tests/benchmarks/thoughts/README.md`.
 
 See `tests/benchmarks/README.md` for the full reference: installation,

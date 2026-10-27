@@ -24,6 +24,41 @@ Only verdicts are cached in `gate.json`. A task whose env failed to build
 (an exception, such as a failed clone) is retried on the next run, and
 `--rebuild-envs` rebuilds everything.
 
+## Quick suite: `--suite local` (one day's allowance)
+
+The SWE-bench suite needs far more than one day's tokens: a trial there can
+cost up to 1.5M. `--suite local` runs the same A/B, through the same runner,
+with the same guard, ledger check and report, on the six small scored tasks of
+`tests/benchmarks/modes/tasks/` (fix-bug, rename-symbol, implement-slugify,
+csv-summary, recall-config, early-constraint). Each trial gets a fresh scratch
+copy of the task's seed files, and the task's `check.py` grades it. There are
+no envs to build and no gate. Each task runs once per repeat in each arm. A
+task's arm order flips every repeat, and half of each repeat starts with each
+arm. The defaults are a 3,500,000-token budget, a 250,000 cap per trial, a
+900 s timeout and 4 repeats (24 pairs). The budget guard ends the run early
+when the observed cost says the next pair will not fit.
+
+```
+harness probe thoughts --suite local --dry-run    # plan and budget, offline
+harness probe thoughts --suite local              # the run
+harness probe thoughts --suite local --resume tests/benchmarks/runs/thoughts-local-<stamp>
+```
+
+What it can show with about 20 pairs:
+
+- **Cost**: tokens per trial, prompt, completion and reasoning tokens per
+  step, step-1 prompt tokens (the same input in both arms, so the same count),
+  and prompt tokens per 1,000 chars sent. If the thoughts that come back in
+  the history were billed, B would pay more per char.
+- **Breakage**: upstream errors, empty replies, tool errors and arm
+  verification. Every request in an arm must have that arm's shape, and the run
+  stops after a trial whose requests never had it, for example when
+  `DEFAULT_MODEL_NAME` is not a native tool model.
+- **It cannot show** a pass-rate difference. These tasks are easy, so both
+  arms will mostly pass. The model also sees the same context in both arms
+  (the upstream ignores `reasoning_content`), so a large quality effect is not
+  expected.
+
 ## Run it (owner)
 
 ```

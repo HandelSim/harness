@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Paired, token-capped A/B probe of `harness --thoughts` on SWE-bench Verified.
+"""Paired, token-capped A/B probe of `harness --thoughts`, on SWE-bench Verified
+(--suite swe, the default) or on the modes benchmark's six small local tasks
+(--suite local: a few hundred thousand tokens a pair-set, fits in a day's
+allowance).
 
 Arm A = `harness host --yolo -p ...` (default slim mode); arm B = the same plus
 `--thoughts`. Stock opencode in both arms; the flag is the only difference.
@@ -36,6 +39,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 
@@ -51,8 +55,11 @@ REPO, RUNS_DIR, IS_WINDOWS, BASH, log = modes.REPO, modes.RUNS_DIR, modes.IS_WIN
 TASKS_JSON = os.path.join(HERE, "tasks.json")
 ARMS = {"slim": [], "thoughts": ["--thoughts"]}
 ARM_SHAPE = {"slim": "native/slim", "thoughts": "native/slim/thoughts"}
-DEFAULT_BUDGET = 20_000_000
-DEFAULT_CAP = 1_500_000
+# Per suite: (budget, per-trial cap, per-trial timeout s). The local default
+# leaves about 1M of a 5M daily allowance; the upstream refuses every model
+# once the day's allowance is crossed.
+DEFAULTS = {"swe": (20_000_000, 1_500_000, 2400), "local": (3_500_000, 250_000, 900)}
+DEFAULT_BUDGET, DEFAULT_CAP = DEFAULTS["swe"][:2]
 LEDGER_TOL = 0.10
 PROMPT = (
     "You are working in a checkout of the {repo} repository (the current directory). A Python "
@@ -85,6 +92,21 @@ def build_plan(task_ids: list[str]) -> list[tuple[int, str, list[str]]]:
     so arm order (warm caches, upstream drift) is balanced across the run."""
     return [(i, tid, ["slim", "thoughts"] if i % 2 == 0 else ["thoughts", "slim"])
             for i, tid in enumerate(task_ids)]
+
+
+def build_local_plan(task_ids: list[str], repeats: int) -> list[tuple[int, str, list[str]]]:
+    """[(pair, task, [first arm, second arm])] for --suite local: every task
+    once per repeat, in a seeded shuffle; a task's arm order flips every
+    repeat and half the tasks of a repeat start with each arm."""
+    import random
+    plan = []
+    for r in range(repeats):
+        ids = list(task_ids)
+        random.Random(2000 + r).shuffle(ids)
+        for tid in ids:
+            ab = (task_ids.index(tid) + r) % 2 == 0
+            plan.append((len(plan), tid, ["slim", "thoughts"] if ab else ["thoughts", "slim"]))
+    return plan
 
 
 def p75(xs: list[float]) -> float:
@@ -366,21 +388,53 @@ def opencode_metrics(db: str, directory: str, t0: float, t1: float, needles: lis
 # --------------------------------------------------------------------------
 
 
+def local_workspace(task: dict) -> dict:
+    """A fresh scratch copy of a local task's seed files (outside any repo)."""
+    scratch = tempfile.mkdtemp(prefix="hb-thoughts-")
+    work = os.path.join(os.path.realpath(scratch), "w")
+    shutil.copytree(os.path.join(task["dir"], "files"), work)
+    keep = os.path.join(work, ".keep")
+    if os.path.exists(keep):
+        os.remove(keep)
+    return {"src": work, "scratch": scratch}
+
+
+def local_check(task: dict, work: str, log_path: str) -> dict:
+    """The task's own check.py, run in the workdir: exit 0 is a pass."""
+    try:
+        chk = subprocess.run([sys.executable, os.path.join(task["dir"], "check.py")], cwd=work,
+                             capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        ok, why = chk.returncode == 0, (chk.stdout + chk.stderr)
+    except subprocess.TimeoutExpired:
+        ok, why = False, "check timed out"
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(why)
+    return {"resolved": ok, "applied": True, "reason": (why.strip().splitlines() or [""])[0][:200]}
+
+
 def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, eff_cap: int, ctx: dict) -> dict:
+    """One arm of one pair. --suite swe: `row` is the SWE-bench row and `env`
+    its checkout + venv. --suite local: `row` is the local task and `env` is
+    ignored (each trial gets a fresh scratch copy)."""
+    local = ctx.get("suite") == "local"
     host = os.path.join(ctx["bench_root"], "state", "host")
     tail = Tail(os.path.join(host, "proxy.log"), os.path.join(host, "proxy.pid"))
     meter = LogMeter()
-    swe_env.reset(env)
+    if local:
+        env = local_workspace(row)
+    else:
+        swe_env.reset(env)
     tid = f"p{pair:02d}-{arm}-{task['id']}"
     tdir = os.path.join(ctx["out"], "trials")
     out_path, err_path = os.path.join(tdir, tid + ".stdout"), os.path.join(tdir, tid + ".stderr")
-    cmd = [ctx["harness"], "host", "--yolo"] + ARMS[arm] + ["-p", PROMPT.format(repo=row["repo"],
-                                                                               problem=row["problem_statement"])]
+    prompt = row["prompt"] if local else PROMPT.format(repo=row["repo"], problem=row["problem_statement"])
+    cmd = [ctx["harness"], "host", "--yolo"] + ARMS[arm] + ["-p", prompt]
     if IS_WINDOWS:
         cmd = [BASH] + cmd
     cenv = modes.child_env(ctx["bench_root"], ctx["port"], False, first=ctx["first"])
-    cenv["VIRTUAL_ENV"] = env["venv"]
-    cenv["PATH"] = swe_env.venv_bin(env["venv"]) + os.pathsep + cenv.get("PATH", "")
+    if not local:
+        cenv["VIRTUAL_ENV"] = env["venv"]
+        cenv["PATH"] = swe_env.venv_bin(env["venv"]) + os.pathsep + cenv.get("PATH", "")
     t0w, t0 = time.time(), time.monotonic()
     capped = timed_out = False
     inflight = os.path.join(ctx["out"], "inflight.json")
@@ -416,11 +470,18 @@ def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, e
     led = ledger_check(ledger_window(ctx["ledger"], t0w, time.time()),
                        0 if c["tokens_estimated"] else c["tokens"], ctx["next_pair"])
     oc = opencode_metrics(ctx["oc_db"], env["src"], t0w, time.time(), ctx["needles"])
-    patch = swe_env.capture_diff(env)
-    with open(os.path.join(tdir, tid + ".patch"), "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
-        f.write(patch)
-    ev = swe_env.evaluate(env, row, patch, log_path=os.path.join(tdir, tid + ".eval.log")) if patch.strip() \
-        else {"resolved": False, "applied": True, "empty_patch": True}
+    if local:
+        patch = ""
+        ev = local_check(row, env["src"], os.path.join(tdir, tid + ".eval.log"))
+        if not ctx.get("keep"):
+            shutil.rmtree(env["scratch"], ignore_errors=True)
+    else:
+        patch = swe_env.capture_diff(env)
+        with open(os.path.join(tdir, tid + ".patch"), "w", encoding="utf-8", errors="surrogateescape",
+                  newline="") as f:
+            f.write(patch)
+        ev = swe_env.evaluate(env, row, patch, log_path=os.path.join(tdir, tid + ".eval.log")) if patch.strip() \
+            else {"resolved": False, "applied": True, "empty_patch": True}
     passed = bool(ev.get("resolved")) and not capped
     err_tail = modes._tail(err_path)
     infra = ""
@@ -438,14 +499,22 @@ def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, e
     agent = [r for r in meter.req.values() if r["tools"] > 0]
     steps = max(len(agent), 1)
     done = [r for r in agent if r.get("t_done")]
+    billed = [r for r in agent if r["has_usage"]]
+    chars = sum(r["chars"] for r in billed)
     return {
         "pair": pair, "pos": pos, "task": task["id"], "arm": arm, "passed": passed,
         "resolved_raw": bool(ev.get("resolved")), "f2p_pass": ev.get("f2p_pass"), "p2p_pass": ev.get("p2p_pass"),
+        "check": ev.get("reason", ""),
         "patch_applied": ev.get("applied"), "patch_lines": patch.count("\n"),
         "capped": capped, "eff_cap": eff_cap, "timed_out": timed_out, "rc": rc, "secs": round(secs, 1),
         "infra": infra, "arm_ok": bool(c["steps"]) and c["shape_modes"] == [ARM_SHAPE[arm]],
         "per_step": {k: round(sum(r[k] for r in agent) / steps, 1) for k in ("prompt", "completion", "reasoning")},
         "secs_per_step": round(sum(r["t_done"] - r["t"] for r in done) / max(len(done), 1), 2),
+        # Prompt tokens per 1k chars of message content the proxy sent: if the
+        # thoughts that come back in the history (reasoning_content) were
+        # billed, B would pay more per char than A.
+        "prompt_per_kchar": round(1000 * sum(r["prompt"] for r in billed) / chars, 1) if chars else 0.0,
+        "first_prompt": billed[0]["prompt"] if billed else 0,
         **c, **led, **oc,
     }
 
@@ -467,7 +536,8 @@ def pair_rows(results: list[dict]) -> dict:
 def report(results: list[dict], meta: dict) -> str:
     spent = sum(int(r.get("tokens") or 0) for r in results)
     pairs = pair_rows(results)
-    L = [f"--thoughts probe on SWE-bench Verified: slim (A) vs slim + --thoughts (B)",
+    suite = "local tasks" if meta.get("suite") == "local" else "SWE-bench Verified"
+    L = [f"--thoughts probe on {suite}: slim (A) vs slim + --thoughts (B)",
          f"model: {meta.get('model', '?')}   budget: {meta.get('budget', 0):,}   spent: {spent:,} tokens "
          f"({len(results)} trials, {sum(1 for r in results if r.get('infra'))} infra)",
          f"complete pairs: {len(pairs)}"]
@@ -486,7 +556,8 @@ def report(results: list[dict], meta: dict) -> str:
           f"  discordant: slim-only {b}, thoughts-only {c}; exact McNemar p = {modes.mcnemar_exact(b, c):.3f}",
           "", "paired per-trial means (B - A, 95% CI):"]
     for key, label in (("steps", "steps"), ("tokens", "tokens/trial"), ("secs", "wall s/trial"),
-                       ("secs_per_step", "s/step")):
+                       ("secs_per_step", "s/step"), ("first_prompt", "step-1 prompt"),
+                       ("prompt_per_kchar", "prompt/1k chars")):
         d = [float(t.get(key) or 0) - float(a.get(key) or 0) for a, t in zip(A, B)]
         m, h = modes.mean_ci(d)
         L.append(f"  {label:<16} A {sum(float(a.get(key) or 0) for a in A) / n:>10.1f}  "
@@ -517,7 +588,8 @@ def report(results: list[dict], meta: dict) -> str:
         L += ["", "one-arm-passed pairs (steps / tokens / patch lines, A vs B):"]
         for a, t in one:
             L.append(f"  {a['task']:<28} {'A' if a['passed'] else 'B'} passed   "
-                     f"{a['steps']}/{a['tokens']:,}/{a['patch_lines']}  vs  {t['steps']}/{t['tokens']:,}/{t['patch_lines']}")
+                     f"{a['steps']}/{a['tokens']:,}/{a.get('patch_lines', 0)}  vs  "
+                     f"{t['steps']}/{t['tokens']:,}/{t.get('patch_lines', 0)}")
     return "\n".join(L) + "\n"
 
 
@@ -550,12 +622,22 @@ def account_lost_inflight(out: str, results_path: str) -> None:
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="tests/benchmarks/thoughts/run.py",
-                                 description="Paired token-capped A/B of `harness --thoughts` on SWE-bench Verified.")
-    ap.add_argument("--task-ids", default="", help="comma list (default: all 38 in tasks.json)")
-    ap.add_argument("--pairs", type=int, default=0, help="stop after N pairs (default: all tasks)")
-    ap.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help=f"total upstream tokens, both arms (default {DEFAULT_BUDGET:,})")
-    ap.add_argument("--trial-token-cap", type=int, default=DEFAULT_CAP, help=f"kill a trial at this many tokens (default {DEFAULT_CAP:,})")
-    ap.add_argument("--timeout", type=int, default=2400, help="seconds per trial (default 2400)")
+                                 description="Paired token-capped A/B of `harness --thoughts` on SWE-bench Verified "
+                                             "or on six small local tasks.")
+    ap.add_argument("--suite", choices=("swe", "local"), default="swe",
+                    help="swe: 38 SWE-bench Verified tasks (default); local: the six tasks of "
+                         "tests/benchmarks/modes/tasks, x --repeats, sized for one day's allowance")
+    ap.add_argument("--repeats", type=int, default=4, help="--suite local: runs of each task per arm (default 4)")
+    ap.add_argument("--task-ids", default="", help="comma list (default: every task of the suite)")
+    ap.add_argument("--pairs", type=int, default=0, help="stop after N pairs (default: the whole plan)")
+    ap.add_argument("--budget", type=int, default=None,
+                    help="total upstream tokens, both arms (default: swe %s, local %s)"
+                         % tuple(f"{DEFAULTS[k][0]:,}" for k in ("swe", "local")))
+    ap.add_argument("--trial-token-cap", type=int, default=None,
+                    help="kill a trial at this many tokens (default: swe %s, local %s)"
+                         % tuple(f"{DEFAULTS[k][1]:,}" for k in ("swe", "local")))
+    ap.add_argument("--timeout", type=int, default=None, help="seconds per trial (default: swe 2400, local 900)")
+    ap.add_argument("--keep-workdirs", action="store_true", help="--suite local: keep each trial's scratch dir")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and budget math and check inputs; spends nothing")
     ap.add_argument("--gate-only", action="store_true", help="build envs and run the gold gate, no trials")
     ap.add_argument("--rebuild-envs", action="store_true", help="rebuild envs and rerun gates")
@@ -566,6 +648,13 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--harness-bin", default="", help="harness script (default: $HARNESS_BIN or the repo's)")
     ap.add_argument("--install-root", default="", help="install root with your .env (default: $HARNESS_BENCH_INSTALL_ROOT or the repo)")
     a = ap.parse_args(argv)
+    local = a.suite == "local"
+    d_budget, d_cap, d_timeout = DEFAULTS[a.suite]
+    a.budget = d_budget if a.budget is None else a.budget
+    a.trial_token_cap = d_cap if a.trial_token_cap is None else a.trial_token_cap
+    a.timeout = d_timeout if a.timeout is None else a.timeout
+    if a.repeats <= 0:
+        ap.error("need --repeats > 0")
     if a.budget <= 0 or a.trial_token_cap <= 0 or a.trial_token_cap * 2 > a.budget:
         ap.error("need budget > 0 and 0 < 2 * trial-token-cap <= budget")
 
@@ -585,10 +674,29 @@ def main(argv: list[str]) -> int:
     real_root = os.path.abspath(a.install_root or os.environ.get("HARNESS_BENCH_INSTALL_ROOT") or REPO)
     cache = os.path.abspath(a.cache_dir or os.path.join(real_root, "state", "bench-thoughts"))
     data_dir = os.path.join(cache, "data")
-    tasks = load_tasks([x.strip() for x in a.task_ids.split(",") if x.strip()] or None)
-    if a.pairs:
-        tasks = tasks[: a.pairs]
-    plan = build_plan([t["id"] for t in tasks])
+    only = [x.strip() for x in a.task_ids.split(",") if x.strip()] or None
+    if local:
+        tasks = modes.load_tasks(only)
+        plan = build_local_plan([t["id"] for t in tasks], a.repeats)[: a.pairs or None]
+    else:
+        tasks = load_tasks(only)
+        if a.pairs:
+            tasks = tasks[: a.pairs]
+        plan = build_plan([t["id"] for t in tasks])
+
+    if a.dry_run and local:
+        print(f"{'pair':>4} {'order':<15} task")
+        for i, tid, order in plan:
+            print(f"{i:>4} {'-'.join(order):<15} {tid}")
+        g0 = guard(0, a.budget, [], a.trial_token_cap)
+        print(f"\nbudget {a.budget:,} tokens; per-trial cap {a.trial_token_cap:,}; timeout {a.timeout}s; "
+              f"first pair projected {g0['projected_pair']:,} (cap stands in for p75 until 2 trials finish)")
+        print(f"rule: before each pair, run only if spent + 2*p75(trial tokens) <= budget, and stop if the "
+              f"upstream reports fewer tokens left today than the next pair needs. Worst case (every trial "
+              f"capped): {a.budget // (2 * a.trial_token_cap)} of {len(plan)} pairs.")
+        print(f"harness: {harness_bin} ({'found' if os.path.isfile(harness_bin) else 'MISSING'})")
+        print("dry run: nothing started, no upstream call, no tokens spent")
+        return 0
 
     if a.dry_run:
         rows = swe_env.load_rows([t["id"] for t in tasks], data_dir, a.dataset, fetch=False) \
@@ -620,44 +728,55 @@ def main(argv: list[str]) -> int:
         print("dry run: nothing started, no upstream call, no tokens spent")
         return 0
 
-    rows = swe_env.load_rows([t["id"] for t in tasks], data_dir, a.dataset)
-    log(f"gold gate on {len(tasks)} task(s) (cached per task)")
-    gates = {}
-    for t in tasks:
-        gates[t["id"]] = swe_env.gold_gate(rows[t["id"]], cache, a.rebuild_envs, logf=log)
-        g = gates[t["id"]]
-        log(f"  gate {t['id']}: {'ok' if g['ok'] else 'EXCLUDED - ' + g.get('why', '')}"
-            + (f" ({'; '.join(g.get('notes') or [])})" if g.get("notes") else ""))
-    if a.gate_only:
-        ok = sum(g["ok"] for g in gates.values())
-        log(f"{ok}/{len(gates)} task(s) pass the gold gate")
-        return 0
-    # Renumber after exclusions so AB/BA stays balanced (gates are cached, so
-    # a resumed run gets the same numbering).
-    plan = build_plan([p[1] for p in plan if gates[p[1]]["ok"]])
+    if local:
+        if a.gate_only:
+            log("--suite local has no gate (its checkers are unit-tested against their mock solutions)")
+            return 0
+        rows, gates = {t["id"]: t for t in tasks}, {}
+    else:
+        rows = swe_env.load_rows([t["id"] for t in tasks], data_dir, a.dataset)
+        log(f"gold gate on {len(tasks)} task(s) (cached per task)")
+        gates = {}
+        for t in tasks:
+            gates[t["id"]] = swe_env.gold_gate(rows[t["id"]], cache, a.rebuild_envs, logf=log)
+            g = gates[t["id"]]
+            log(f"  gate {t['id']}: {'ok' if g['ok'] else 'EXCLUDED - ' + g.get('why', '')}"
+                + (f" ({'; '.join(g.get('notes') or [])})" if g.get("notes") else ""))
+        if a.gate_only:
+            ok = sum(g["ok"] for g in gates.values())
+            log(f"{ok}/{len(gates)} task(s) pass the gold gate")
+            return 0
+        # Renumber after exclusions so AB/BA stays balanced (gates are cached, so
+        # a resumed run gets the same numbering).
+        plan = build_plan([p[1] for p in plan if gates[p[1]]["ok"]])
 
     if not os.path.isfile(os.path.join(real_root, ".env")):
         raise SystemExit(f"no .env in {real_root}: configure harness first")
-    out = a.resume or os.path.join(RUNS_DIR, "thoughts-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    out = a.resume or os.path.join(RUNS_DIR, ("thoughts-local-" if local else "thoughts-")
+                                   + datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(os.path.join(out, "trials"), exist_ok=True)
     results_path = os.path.join(out, "results.jsonl")
     account_lost_inflight(out, results_path)
     bench_root = os.path.join(real_root, "state", "bench-thoughts", "root")
     red = modes.make_redactor()
     port = modes.free_port()
-    meta = {"budget": a.budget, "trial_token_cap": a.trial_token_cap, "timeout_s": a.timeout,
-            "tasks": [p[1] for p in plan], "model": red(os.environ.get("DEFAULT_MODEL_NAME", "")) or "from .env",
+    meta = {"suite": a.suite, "budget": a.budget, "trial_token_cap": a.trial_token_cap, "timeout_s": a.timeout,
+            "repeats": a.repeats if local else None, "tasks": [p[1] for p in plan], "model": red(os.environ.get("DEFAULT_MODEL_NAME", "")) or "from .env",
             "host": f"{platform.system()} {platform.machine()}",
             "excluded": {k: g.get("why") for k, g in gates.items() if not g["ok"]}}
     with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=1)
     ctx = {"harness": harness_bin, "bench_root": bench_root, "port": port, "timeout": a.timeout, "redact": red,
-           "out": out, "first": True, "needles": contamination_needles(cache, a.dataset, out),
+           "out": out, "first": True, "suite": a.suite, "keep": a.keep_workdirs,
+           "needles": (sorted({"benchmarks/modes", "check.py", "mock_solution", "task.json",
+                               os.path.basename(out), "benchmarks/runs"}) if local
+                       else contamination_needles(cache, a.dataset, out)),
            "ledger": os.path.join(bench_root, "state", "output", "usage.jsonl"),
            "oc_db": os.path.join(bench_root, "xdg", "data", "opencode", "opencode.db")}
     resume = f"python3 {os.path.join(HERE, 'run.py')} --resume {out} --budget {a.budget} " \
              f"--trial-token-cap {a.trial_token_cap}" + (f" --task-ids {a.task_ids}" if a.task_ids else "") \
-             + (f" --pairs {a.pairs}" if a.pairs else "")
+             + (f" --pairs {a.pairs}" if a.pairs else "") \
+             + (f" --suite local --repeats {a.repeats}" if local else "")
 
     def stop_proxy():
         subprocess.run(([BASH] if IS_WINDOWS else []) + [harness_bin, "host", "down"],
@@ -689,7 +808,7 @@ def main(argv: list[str]) -> int:
                 aborted = "token budget: " + g["why"]
                 break
             ctx["next_pair"] = g["projected_pair"]
-            env = swe_env.build_env(rows[tid], cache, logf=log)
+            env = None if local else swe_env.build_env(rows[tid], cache, logf=log)
             for arm in todo:
                 r = run_trial(pair, order.index(arm), {"id": tid}, rows[tid], env, arm, g["eff_cap"], ctx)
                 with open(results_path, "a", encoding="utf-8") as f:
@@ -708,6 +827,11 @@ def main(argv: list[str]) -> int:
                     aborted = "ledger: " + r.get("why", "")
                 elif r["infra"] == "launch" and ctx["first"]:
                     aborted = "harness host did not start the agent"
+                elif not r["infra"] and r["steps"] and ARM_SHAPE[arm] not in r["shape_modes"]:
+                    # The run would be void: DEFAULT_MODEL_NAME is not on the
+                    # native tool route, or the thoughts header did not arrive.
+                    aborted = (f"arm {arm} did not take effect (request shapes {r['shape_modes']}, "
+                               f"want {ARM_SHAPE[arm]}); DEFAULT_MODEL_NAME must be a native tool model")
                 if aborted:
                     break
                 if not r["infra"]:
