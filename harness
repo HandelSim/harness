@@ -6152,8 +6152,8 @@ Every 'harness --ticket KEY' launch copies that ticket from it into the agent's 
 'harness ticket login' saves your Jira token." \
         "$(_charter_get tracker_url)" optional)
     tracker="${tracker%/}"
-    if [[ -n "$tracker" && ! "$tracker" =~ ^https?://[^[:space:]]+$ ]]; then
-        err "'$tracker' is not an http(s) URL; no Jira URL set"; tracker=""
+    if [[ -n "$tracker" ]] && ! _tracker_url_ok "$tracker"; then
+        err "no Jira URL set"; tracker=""
     fi
     fields=""
     if [[ -n "$tracker" ]]; then
@@ -6301,9 +6301,7 @@ HELP
                 echo "It is saved in the vault charter ($name), so everyone using the vault pulls from it." >/dev/tty
                 IFS= read -r -e -p 'Jira URL: ' -i "$old" url </dev/tty 2>/dev/tty || url=""
                 url="${url%/}"
-                if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
-                    err "'$url' is not an http(s) URL; nothing saved"; return 1
-                fi
+                _tracker_url_ok "$url" || { err "nothing saved"; return 1; }
                 if [[ "$url" != "$old" ]]; then
                     _charter_set "$dir" tracker_url "$url" || return 1
                     echo "saved the Jira URL in $dir/wiki/overview.md"
@@ -6364,6 +6362,20 @@ _charter_set() {
         fm && $0 ~ "^" k ":" { if (!done) print k ": " v; done = 1; next }
         fm && /^---$/ { if (!done) print k ": " v; done = 1; fm = 0 }
         { print }' "$f" > "$f.tmp" && mv "$f.tmp" "$f" || { rm -f "$f.tmp"; err "could not write $f"; return 1; }
+}
+
+# Can the Jira token be sent to this URL: https, or http to this host only
+# (vault_ticket.py checks the same before sending it). Says why not.
+_tracker_url_ok() {
+    local u="${1,,}"
+    [[ "$u" =~ ^https://[^[:space:]/]+(/[^[:space:]]*)?$ ]] && return 0
+    [[ "$u" =~ ^http://(localhost|127\.0\.0\.1)(:[0-9]+)?(/[^[:space:]]*)?$ ]] && return 0
+    if [[ "$u" =~ ^http://[^[:space:]]+$ ]]; then
+        err "'$1' is http, which would send the Jira token unencrypted; use https (http only for localhost)"
+    else
+        err "'$1' is not an https URL"
+    fi
+    return 1
 }
 
 # The tracker part of `harness ticket` and `harness context`: the charter's

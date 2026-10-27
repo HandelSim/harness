@@ -17,7 +17,9 @@ the agent as instruction files; the note is the agent's to keep up to date.
 Prints one status line (new, updated, unchanged, or why the tracker was not
 reached and which snapshot is used instead) and exits 0: a launch never
 fails over the tracker. The token is sent in the request and never printed or
-written anywhere. HTTP(S)_PROXY are honoured.
+written anywhere, and only to tracker_url itself: it must be https (http only
+for localhost and 127.0.0.1) and a redirect is not followed. HTTP(S)_PROXY are
+honoured.
 """
 import base64
 import json
@@ -159,6 +161,37 @@ def ensure_note(vault, key, title):
     return True
 
 
+LOCAL_HOSTS = ("localhost", "127.0.0.1")
+
+
+def url_problem(url):
+    """Why the token must not go to `url`, or None."""
+    try:
+        u = urllib.parse.urlparse(url)
+        host = (u.hostname or "").lower()
+    except ValueError:
+        return f"the charter's tracker_url is not a URL: {url}"
+    if u.scheme not in ("http", "https") or not host:
+        return f"the charter's tracker_url is not an http(s) URL: {url}"
+    if u.scheme == "http" and host not in LOCAL_HOSTS:
+        return (f"the charter's tracker_url is http, which would send TRACKER_TOKEN unencrypted; "
+                f"use https (http only for localhost): {url}")
+    return None
+
+
+class Redirected(urllib.error.URLError):
+    pass
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would send the Authorization header on to another address
+    (urllib keeps it); stop instead and say where it pointed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Redirected(f"redirected (HTTP {code}) to {newurl}; not followed with the token, "
+                         "set tracker_url to the address it points at")
+
+
 def fetch(url, key, token):
     """(issue dict, None) or (None, why it failed)."""
     if ":" in token:
@@ -169,7 +202,7 @@ def fetch(url, key, token):
         f"{url.rstrip('/')}/rest/api/2/issue/{urllib.parse.quote(key)}?expand=names",
         headers={"Authorization": auth, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        with urllib.request.build_opener(NoRedirect()).open(req, timeout=TIMEOUT) as r:
             return json.loads(r.read().decode("utf-8", "replace")), None
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
@@ -177,6 +210,8 @@ def fetch(url, key, token):
         if e.code == 404:
             return None, f"the tracker has no ticket {key} you can see (HTTP 404)"
         return None, f"the tracker answered HTTP {e.code}"
+    except Redirected as e:
+        return None, f"the tracker {e.reason}"
     except (urllib.error.URLError, OSError) as e:
         return None, f"the tracker at {url} is not reachable ({getattr(e, 'reason', e)})"
     except ValueError:
@@ -197,8 +232,8 @@ def main(argv):
     issue = None
     if not url:
         why = "no Jira URL in the vault charter (harness ticket login sets it)"
-    elif not re.match(r"^https?://", url):
-        why = f"the charter's tracker_url is not an http(s) URL: {url}"
+    elif url_problem(url):
+        why = url_problem(url)
     elif not token:
         why = "no Jira token set (harness ticket login sets TRACKER_TOKEN)"
     else:

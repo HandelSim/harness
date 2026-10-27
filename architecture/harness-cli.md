@@ -440,7 +440,8 @@ user adds one with git; `list` shows its `origin` url once there is one.
 `init` (`_vault_charter`) asks, on `/dev/tty` with no model, what the active
 vault is about: project, goal, readers, what to track, a ticket id regex
 (validated; empty for none), the folders it covers and the Jira URL
-(`tracker_url`, an http(s) base URL, and, when set, `tracker_fields`, extra
+(`tracker_url`, an https base URL, http only for localhost/127.0.0.1,
+checked by `_tracker_url_ok`, and, when set, `tracker_fields`, extra
 field ids or names; see "Tickets and context"). Each answer is a
 readline line (`read -e -i`) pre-filled with the current answer or a
 suggestion, so it can be edited in place; it writes them to `wiki/overview.md` as single-quoted YAML front
@@ -603,14 +604,19 @@ link and sprint (custom fields matched by name), the charter's extra fields,
 subtasks and links, and the last 10 comments, all capped and redacted. It
 also creates the agent's state note, `<vault>/wiki/notes/tickets/KEY-state.md`
 (Done, Next, Decisions, Open questions), when missing; harness never writes
-it after that, and nothing is written back to the tracker. Any failure
-(no tracker, no token, 401, 404, offline) prints one `[harness] ticket` line
+it after that, and nothing is written back to the tracker. The token goes
+only to `tracker_url` itself: `url_problem` refuses a non-https URL (http is
+allowed for localhost and 127.0.0.1 only) before any request, and the opener's
+`NoRedirect` handler stops at a 3xx instead of following it (urllib would send
+the Authorization header on to the new address), naming the address so the
+charter can be fixed. Any failure
+(no tracker, no token, a refused URL, a redirect, 401, 404, offline) prints one `[harness] ticket` line
 and the last copy is used: a launch never fails over the tracker. Without an
 active vault the ticket is not given to the agent. `harness ticket pull
 [KEY]` does the same by hand and commits.
 
 `harness ticket login` asks on `/dev/tty` for the Jira URL (pre-filled with
-the charter's; written with `_charter_set` and committed by `vault_sync`
+the charter's, checked by `_tracker_url_ok`; written with `_charter_set` and committed by `vault_sync`
 when it changed) and the token (no echo; written to `.env` with
 `_config_write_key`); `harness ticket logout` clears the token, and `harness
 config` edits it (masked). `TRACKER_TOKEN` is in

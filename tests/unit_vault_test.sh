@@ -558,7 +558,8 @@ fi
 
 # --- V15: vault_ticket.py against a mock tracker -----------------------------
 # The mock is Jira Server's REST v2: ABC-7 with the token (Bearer, or Basic
-# for Cloud's email:token), 401 without it, 404 for anything else.
+# for Cloud's email:token), 401 without it, 404 for anything else; under
+# /moved/ it redirects to the real path. It logs each request's path.
 JIRA="$TMP_ROOT/jira.py"
 cat > "$JIRA" <<'PYEOF'
 import json, sys
@@ -580,6 +581,10 @@ ISSUE = {"key": "ABC-7",
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
+        open(sys.argv[1], "a").write(self.path + "\n")
+        if self.path.startswith("/moved/"):
+            self.send_response(302); self.send_header("Location", self.path[len("/moved"):])
+            self.send_header("Content-Length", "0"); self.end_headers(); return
         if self.headers.get("Authorization") not in ("Bearer tok123", "Basic bWVAeC5pbzp0b2sxMjM="):
             code, body = 401, {"errorMessages": ["no"]}
         elif self.path.startswith("/rest/api/2/issue/ABC-7?") and "expand=names" in self.path:
@@ -594,7 +599,7 @@ print(srv.server_address[1], flush=True)
 srv.serve_forever()
 PYEOF
 # shellcheck disable=SC2086
-$PY "$JIRA" > "$TMP_ROOT/jira.port" 2>/dev/null &
+$PY "$JIRA" "$TMP_ROOT/jira.log" > "$TMP_ROOT/jira.port" 2>/dev/null &
 JIRA_PID=$!
 trap 'kill "$MOCK_PID" "$JIRA_PID" 2>/dev/null; rm -rf "$TMP_ROOT"' EXIT
 for _ in $(seq 50); do [[ -s "$TMP_ROOT/jira.port" ]] && break; sleep 0.1; done
@@ -641,6 +646,30 @@ sed -i.bak "s#127.0.0.1:$JPORT#127.0.0.1:9#" "$TV/wiki/overview.md"
 out=$(tk tok123 ABC-7)
 [[ "$out" == *"not reachable"*"using the copy"* ]] || fail "V15: an unreachable tracker — $out"
 mv "$TV/wiki/overview.md.bak" "$TV/wiki/overview.md"
+# The token goes only to tracker_url: a redirect is not followed (urllib
+# would send the Authorization header on), plain http only to this host.
+: > "$TMP_ROOT/jira.log"
+sed -i.bak "s#127.0.0.1:$JPORT/#127.0.0.1:$JPORT/moved/#" "$TV/wiki/overview.md"
+out=$(tk tok123 ABC-7)
+[[ "$out" == *"the tracker redirected (HTTP 302) to http://127.0.0.1:$JPORT/rest/api/2/issue/ABC-7"*"not followed"*"using the copy"* ]] \
+    || fail "V15: a redirect should not be followed — $out"
+[[ "$(cat "$TMP_ROOT/jira.log")" == "/moved/rest/api/2/issue/ABC-7?expand=names" ]] \
+    || fail "V15: only the redirecting address should be asked — $(cat "$TMP_ROOT/jira.log")"
+mv "$TV/wiki/overview.md.bak" "$TV/wiki/overview.md"
+for u in "http://jira.example.com" "http://127.0.0.2:$JPORT"; do
+    sed -i.bak "s#^tracker_url: .*#tracker_url: '$u'#" "$TV/wiki/overview.md"
+    out=$(tk tok123 ABC-7)
+    [[ "$out" == *"is http, which would send TRACKER_TOKEN unencrypted"*"using the copy"* ]] \
+        || fail "V15: http to $u should be refused — $out"
+    mv "$TV/wiki/overview.md.bak" "$TV/wiki/overview.md"
+done
+[[ "$(wc -l < "$TMP_ROOT/jira.log")" -eq 1 ]] || fail "V15: a refused URL made a request — $(cat "$TMP_ROOT/jira.log")"
+for u in https://jira.example.com https://jira.example.com:8443/jira http://localhost:8080 HTTP://127.0.0.1/; do
+    _tracker_url_ok "$u" 2>/dev/null || fail "V15: _tracker_url_ok should take $u"
+done
+for u in http://jira.example.com http://localhost.evil.io ftp://x https:// 'https://a b'; do
+    _tracker_url_ok "$u" 2>/dev/null && fail "V15: _tracker_url_ok should refuse $u"
+done
 # harness ticket login writes the URL into the charter with _charter_set:
 # replacing the key, or adding it when the charter has none.
 cp "$TV/wiki/overview.md" "$TMP_ROOT/charter.bak"
@@ -654,7 +683,7 @@ _charter_set "$TV" tracker_url "https://jira.example.com" || fail "V15: _charter
 [[ "$(_charter_value "$TV" tracker_url)" == "https://jira.example.com" && "$(sed -n 1p "$TV/wiki/overview.md")" == "---" ]] \
     || fail "V15: _charter_set should add a missing key in the front matter — $(cat "$TV/wiki/overview.md")"
 mv "$TMP_ROOT/charter.bak" "$TV/wiki/overview.md"; rm -f "$TV/wiki/overview.md.bak"
-ok "V15: vault_ticket.py writes a labelled, redacted copy and a state note, and falls back to the copy"
+ok "V15: vault_ticket.py writes a labelled, redacted copy and a state note, falls back to the copy, sends the token only to an https (or local) tracker_url and follows no redirect"
 
 # --- V16: --ticket, the folder's ticket, the launch's instruction files ------
 PROJ2="$TMP_ROOT/proj2"
