@@ -706,7 +706,13 @@ class VaultFixture(LiveServer):
         git = ["git", "-C", v, "-c", "user.name=t", "-c", "user.email=t@x", "-c", "commit.gpgsign=false"]
         subprocess.run(git[:3] + ["init", "-q"], check=True)
         subprocess.run(git + ["add", "-A", "wiki", ".raw"], check=True)
-        subprocess.run(git + ["commit", "-q", "-m", "ingest: 3 written"], check=True)
+        # Commit well in the past so the overview's git %ar fields read "N days ago"
+        # (a stable granularity). A commit dated "now" reads "N seconds ago", which
+        # ticks between the /vault render and the separate /vault/live poll and makes
+        # their signatures disagree — a flake, not a real change.
+        then = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 13 * 86400))
+        env = dict(os.environ, GIT_AUTHOR_DATE=then, GIT_COMMITTER_DATE=then)
+        subprocess.run(git + ["commit", "-q", "-m", "ingest: 3 written"], check=True, env=env)
         self.sha = subprocess.run(git[:3] + ["rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         os.makedirs(os.path.join(v, ".harness"))
         with open(os.path.join(v, ".harness", "ingest.json"), "w") as f:
