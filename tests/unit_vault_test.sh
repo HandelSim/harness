@@ -892,6 +892,7 @@ rc=0; timeout 5 "$PY" "$REPO_ROOT/scripts/vault_ingest.py" ingest --vault "$V" -
 [[ "$rc" == 124 ]] || fail "V22: the watch should still be running (rc $rc)"
 [[ "$(nreq)" == "$(( before + 2 ))" ]] || fail "V22: one try and one retry, then sleep; got $(( $(nreq) - before )) requests"
 [[ "$(grep -c ' ingest: ' "$V/wiki/log.md")" == "$(( logs + 1 ))" ]] || fail "V22: one log line for the pass, none for the sleeps"
+[[ ! -e "$V/harness-ingest.run.json" ]] || fail "V22: a run stopped with SIGTERM should remove its run file"
 ok "V22: --watch --retry-failed retries a failed unit once per run and sleeps instead of looping"
 
 # --- V23: nothing in a vault's .git runs: hooks and fsmonitor are off --------
@@ -1007,5 +1008,102 @@ grep -q "push failed" <<<"$out" || fail "V25: a conflict on a written page shoul
 [[ "$(git -C "$GB" rev-list --count '@{u}..')" == 1 ]] || fail "V25: the commit should stay local"
 grep -q '^b writes$' "$GB/wiki/notes/n.md" || fail "V25: the local text should be kept"
 ok "V25: a rebase conflicting only on generated files takes the remote's, regenerates and pushes; any other aborts"
+
+# --- V26: status, the run file, the lock (exit 3), --unit and forget ---------
+VI="$REPO_ROOT/scripts/vault_ingest.py"
+RUNF="$V/harness-ingest.run.json"   # $V has no .git: the lock and the run file are in it
+st() { $PY "$VI" status --vault "$V" --json "$@"; }
+st --quick > "$TMP_ROOT/st.json" || fail "V26: status --quick failed"
+$PY - "$TMP_ROOT/st.json" "$TMP_ROOT/there/away" <<'PYEOF' || fail "V26: status --quick — $(cat "$TMP_ROOT/st.json")"
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert set(s) == {"vault", "running", "repos", "raw", "failed", "last_run", "pages"}, sorted(s)
+assert s["running"] is None, s["running"]
+repos = {r["name"]: r for r in s["repos"]}
+assert set(repos) == {"proj", "away"}, repos
+assert repos["away"] == {"name": "away", "path": sys.argv[2], "exists": True, "units": 1, "ok": 1, "failed": 0,
+                         "pending": None}, repos["away"]
+assert repos["proj"]["failed"] == 1 and repos["proj"]["pending"] is None and repos["proj"]["ok"] >= 4, repos["proj"]
+assert set(s["raw"]) == {"units", "ok", "failed", "pending"} and s["raw"]["ok"] >= 1 and s["raw"]["pending"] is None
+f = s["failed"]
+assert len(f) == 1 and f[0]["id"] == "code:proj/src/worse#1" and f[0]["problems"] and f[0]["attempts"] >= 1, f
+assert set(f[0]) == {"id", "page", "attempts", "at", "problems"}, f[0]
+lr = s["last_run"]
+assert lr and lr["model"] == "free-m" and isinstance(lr["written"], int) and lr["at"].endswith("Z"), lr
+assert s["pages"] >= 8, s["pages"]
+PYEOF
+printf 'def more():\n    pass\n' > "$PROJ/src/util/more.py"
+st > "$TMP_ROOT/st.json" || fail "V26: status failed"
+[[ "$(jq -c '[.repos[] | select(.name == "proj") | .pending, .failed][]' "$TMP_ROOT/st.json" | tr '\n' ' ')" == "1 1 " \
+    && "$(jq '.raw.pending' "$TMP_ROOT/st.json")" == 0 ]] \
+    || fail "V26: status counts the changed directory as pending — $(cat "$TMP_ROOT/st.json")"
+before=$(nreq)
+# A watch run, stopped with Ctrl-C (SIGINT) after a pass; meanwhile, look at it.
+(
+    for _ in $(seq 50); do [[ "$(jq -r '.step' "$RUNF" 2>/dev/null)" == waiting ]] && break; sleep 0.1; done
+    cp "$RUNF" "$TMP_ROOT/run.json" 2>/dev/null
+    st --quick > "$TMP_ROOT/st-running.json"
+    rc=0; ingest > "$TMP_ROOT/second.out" || rc=$?; echo "$rc" > "$TMP_ROOT/second.rc"
+    rc=0; $PY "$VI" forget --vault "$V" away > /dev/null 2>&1 || rc=$?; echo "$rc" > "$TMP_ROOT/forget.rc"
+) &
+watcher=$!
+rc=0; timeout -s INT 6 "$PY" "$VI" ingest --vault "$V" --proxy "http://127.0.0.1:$PORT/v1" --model free-m-withtools \
+    --watch 1 > /dev/null 2>&1 || rc=$?
+wait "$watcher"
+[[ "$rc" == 124 ]] || fail "V26: the watch should run until stopped (rc $rc)"
+[[ "$(nreq)" == "$(( before + 1 ))" ]] || fail "V26: the watch should send the changed directory once"
+$PY - "$TMP_ROOT/run.json" <<'PYEOF' || fail "V26: the run file — $(cat "$TMP_ROOT/run.json" 2>&1)"
+import json, re, sys
+r = json.load(open(sys.argv[1]))
+assert set(r) == {"pid", "started", "beat", "model", "args", "step", "unit", "done", "failed", "left", "watch"}, sorted(r)
+iso = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
+assert isinstance(r["pid"], int) and re.fullmatch(iso, r["started"]) and re.fullmatch(iso, r["beat"]), r
+assert r["model"] == "free-m" and r["step"] == "waiting" and r["unit"] == "" and r["watch"] is True, r
+assert r["done"] == 1 and r["failed"] == 0 and r["left"] == 0, r
+assert r["args"][:2] == ["ingest", "--vault"] and r["args"][-2:] == ["--watch", "1"], r["args"]
+PYEOF
+[[ "$(jq -c '.running | [.alive, .step]' "$TMP_ROOT/st-running.json")" == '[true,"waiting"]' ]] \
+    || fail "V26: status during a run says it is running — $(cat "$TMP_ROOT/st-running.json")"
+[[ "$(cat "$TMP_ROOT/second.rc")" == 3 ]] && grep -q 'another ingest is running on this vault (pid' "$TMP_ROOT/second.out" \
+    || fail "V26: a second ingest exits 3 — rc $(cat "$TMP_ROOT/second.rc"): $(cat "$TMP_ROOT/second.out")"
+[[ "$(cat "$TMP_ROOT/forget.rc")" == 3 ]] || fail "V26: forget during an ingest exits 3"
+[[ ! -e "$RUNF" ]] || fail "V26: the run file should go when the run ends"
+# A run file left by a run that is gone (killed): not alive.
+printf '{"pid": 999999999, "started": "2026-01-01T00:00:00Z", "beat": "2026-01-01T00:00:05Z", "step": "ingesting"}\n' > "$RUNF"
+[[ "$(st --quick | jq -c '.running | [.alive, .step]')" == '[false,"ingesting"]' ]] || fail "V26: a stale run file is not alive"
+rm -f "$RUNF"
+# --unit: just that unit, whatever its state.
+before=$(nreq)
+ingest --unit 'code:proj/src#1' >/dev/null || fail "V26: --unit of an ok unit failed"
+[[ "$(nreq)" == "$(( before + 1 ))" ]] || fail "V26: --unit should send that one unit"
+out=$(ingest --unit 'code:nope/x#1') && fail "V26: an unknown --unit should fail — $out"
+[[ "$out" == *"no unit code:nope/x#1 here"* ]] || fail "V26: unknown --unit message — $out"
+# forget: units, repo entry and generated pages go; a page someone wrote stays.
+printf '# mine\n' > "$V/wiki/code/away/mine.md"
+out=$($PY "$VI" forget --vault "$V" away 2>&1) || fail "V26: forget failed — $out"
+[[ "$out" == *"kept wiki/code/away/mine.md"*"forgot away: 1 units, 2 pages removed"* ]] || fail "V26: forget output — $out"
+[[ ! -e "$V/wiki/code/away/away--lib.md" && ! -e "$V/wiki/code/away/away.md" && -f "$V/wiki/code/away/mine.md" ]] \
+    || fail "V26: forget removes the generated pages only — $(ls -R "$V/wiki/code/away")"
+grep -q '"away"\|code:away/' "$V/.harness/ingest.json" && fail "V26: forget should drop the repo and its units"
+grep -q 'away--lib' "$V/wiki/index.md" && fail "V26: the index should drop the forgotten pages"
+grep -q ' forget: codebase away, 1 units, 2 pages removed$' "$V/wiki/log.md" || fail "V26: forget is logged"
+out=$($PY "$VI" forget --vault "$V" away 2>&1) && fail "V26: forgetting an unknown codebase should fail"
+[[ "$out" == *"no codebase named away (it has: proj)"* ]] || fail "V26: unknown forget message — $out"
+rm -f "$V/wiki/code/away/mine.md"
+# harness ingest --status / --forget: the active vault's local copy.
+(
+    state_root="$TMP_ROOT/st26"; mkdir -p "$state_root/vaults"; ln -s "$V" "$state_root/vaults/t26"
+    vault_active_name() { echo t26; }
+    vault_prepare() { echo "$state_root/vaults/t26"; }
+    out=$(cmd_ingest --status --quick --json) || fail "V26: harness ingest --status failed — $out"
+    [[ "$(jq -r '.repos[0].name' <<<"$out")" == proj ]] || fail "V26: harness ingest --status --json — $out"
+    cmd_ingest --status | grep -q '^code:     proj (' || fail "V26: harness ingest --status text"
+    cmd_ingest --json 2>/dev/null && fail "V26: --json alone should be refused"
+    cmd_ingest --forget proj "$PROJ" 2>/dev/null && fail "V26: --forget with a <dir> should be refused"
+    rc=0; cmd_ingest --forget nope >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 1 ]] || fail "V26: harness ingest --forget of an unknown codebase (rc $rc)"
+    true
+) || exit 1
+ok "V26: status (--json, --quick), the run file while an ingest runs, exit 3 on the lock, --unit, forget, harness ingest --status/--forget"
 
 echo "VAULT TEST PASSED"

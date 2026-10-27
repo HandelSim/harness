@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Ingest sources into a harness vault, and keep the vault's generated pages up to date.
 
-  vault_ingest.py ingest --vault V --proxy URL --model M [--src DIR] [--max N]
+  vault_ingest.py ingest --vault V --proxy URL --model M [--src DIR] [--max N] [--unit ID]
                          [--unit-kb K] [--retry-failed] [--watch SECONDS] [--dry-run] [--commit]
   vault_ingest.py index  --vault V
+  vault_ingest.py status [--vault V] [--json] [--quick]
+  vault_ingest.py forget --vault V NAME [--commit]
 
 harness does the bookkeeping, the model only writes text. The sources are the
 vault's .raw/ files (captured sessions included) and any codebase given with
@@ -26,6 +28,11 @@ two or more pages), ticket hubs (wiki/tickets/, ids found with the charter's
 ticket_pattern), the module trees and up/down links, and wiki/index.md.
 Generated files carry `generated: harness` in their frontmatter; nothing else
 is ever rewritten.
+
+One ingest or forget at a time per vault: they hold <vault>/.git/harness-ingest.lock
+and exit 3 when another holds it. An ingest keeps <vault>/.git/harness-ingest.run.json
+(what it is doing, rewritten every few seconds and after each unit, removed when it
+ends) for `status` and harness serve; `status` takes no lock.
 """
 import argparse
 import atexit
@@ -35,9 +42,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -69,6 +78,10 @@ def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 
 
+def now_iso_s():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def sha(text):
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
@@ -91,7 +104,16 @@ def write_atomic(path, text):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
-    os.replace(tmp, path)
+    # On Windows a reader (status, harness serve) holding the file open makes
+    # the replace fail for a moment.
+    for i in range(40):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == 39:
+                raise
+            time.sleep(0.05)
 
 
 def write_if_changed(path, text):
@@ -153,6 +175,99 @@ def try_lock(f):
         return True
     except OSError:
         return False
+
+
+def lock_dir(vault):
+    """Where the lock and the run file live: .git, so they are never committed."""
+    g = os.path.join(vault, ".git")
+    return g if os.path.isdir(g) else vault
+
+
+def run_path(vault):
+    return os.path.join(lock_dir(vault), "harness-ingest.run.json")
+
+
+BEAT = 5           # seconds between run file beats
+STALE = 120        # a beat older than this is a run that is gone
+
+
+class RunFile:
+    """<lock dir>/harness-ingest.run.json: what this ingest is doing and when it
+    last said so. Written under the lock; removed when the run ends."""
+
+    def __init__(self, path, info):
+        self.path, self.info = path, info
+        self.mu, self.ended = threading.Lock(), threading.Event()
+
+    def set(self, **change):
+        if not self.path:
+            return
+        with self.mu:
+            if self.ended.is_set():
+                return
+            self.info.update(change, beat=now_iso_s())
+            try:
+                write_atomic(self.path, json.dumps(self.info) + "\n")
+            except OSError:
+                pass  # the next beat writes it
+
+    def start(self):
+        self.set()
+        if self.path:
+            threading.Thread(target=self._beats, daemon=True).start()
+
+    def _beats(self):
+        while not self.ended.wait(BEAT):
+            self.set()
+
+    def end(self):
+        self.ended.set()
+        if self.path:
+            with self.mu:
+                try:
+                    os.remove(self.path)
+                except OSError:
+                    pass
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.get_last_error() == 5  # access denied: it exists
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def read_run(vault):
+    """The run file plus "alive" (its pid runs and its beat is under STALE s
+    old), or None when there is none."""
+    try:
+        info = json.loads(read_text(run_path(vault)) or "null")
+    except ValueError:
+        info = None
+    if not isinstance(info, dict):
+        return None
+    try:
+        at = datetime.datetime.strptime(str(info.get("beat")), "%Y-%m-%dT%H:%M:%SZ")
+        age = time.time() - at.replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        age = STALE
+    info["alive"] = pid_alive(info.get("pid")) and age < STALE
+    return info
 
 
 def safe_name(text):
@@ -709,11 +824,13 @@ def regenerate(vault):
             del pages[rel]
 
     # Up/down links of code pages and each repo's module tree. A repo whose
-    # root directory has no files still gets its overview page.
+    # root directory has no files still gets its overview page; a folder with
+    # only pages someone wrote (a forgotten codebase's) does not.
     code_root = os.path.join(vault, "wiki", "code")
     for repo in sorted(os.listdir(code_root)) if os.path.isdir(code_root) else []:
         rel = f"code/{repo}/{repo}.md"
-        if rel not in pages and os.path.isdir(os.path.join(code_root, repo)):
+        if rel not in pages and os.path.isdir(os.path.join(code_root, repo)) \
+                and any(r.startswith(f"code/{repo}/") and p["generated"] for r, p in pages.items()):
             path = os.path.join(code_root, repo, repo + ".md")
             text = (f"---\ntype: code\nrepo: {yq(repo)}\npath: .\nsummary: {yq(f'overview of the {repo} codebase')}\n"
                     f"{GENERATED}\n---\n\n# {repo}\n\nGenerated by `harness ingest`: the module tree of `{repo}`.\n")
@@ -918,7 +1035,7 @@ def resolve_model(proxy, model):
     return base if base in ids else model
 
 
-def run_ingest(a):
+def run_ingest(a, run):
     vault = os.path.abspath(a.vault)
     m = load_manifest(vault)
     srcs = set()
@@ -944,16 +1061,29 @@ def run_ingest(a):
         m["repos"][name] = root
         srcs.add(name)
     budget = max(4, a.unit_kb) * 1024
+    if not a.dry_run:
+        m["unit_kb"] = max(4, a.unit_kb)  # for status, which cuts the sources the same way
     charter_text, ticket_re = charter(vault)
     model = a.model if a.dry_run else resolve_model(a.proxy, a.model)
+    run.set(model=model)
     done = failed = 0
     warned = set()
     # Units that failed in this run are not sent again by --retry-failed in the
     # same run (a watch would loop on them and commit every pass), until they change.
     failed_here = set()
     while True:
+        run.set(step="planning", unit="")
         units = plan(vault, m, srcs, budget, warned)
         todo = [u for u in pending(units, m, a.retry_failed) if (u["id"], u["sha"]) not in failed_here]
+        if a.unit:
+            # --unit ID: just those, whatever their state.
+            by_id = {u["id"]: u for u in units}
+            unknown = [x for x in a.unit if x not in by_id]
+            if unknown:
+                print(f"[ingest] no unit {', '.join(unknown)} here (vault_ingest.py status lists the failed ones)",
+                      file=sys.stderr)
+                return 1
+            todo = [by_id[x] for x in dict.fromkeys(a.unit)]
         if a.max:
             todo = todo[: max(0, a.max - done - failed)]
         if a.dry_run:
@@ -973,13 +1103,16 @@ def run_ingest(a):
         for u in units:
             by_page.setdefault(u["page"], []).append(u)
         infra, since_commit, wrote = 0, 0, 0
-        for u in todo:
+        run.set(step="ingesting", left=len(todo))
+        for n, u in enumerate(todo, 1):
+            run.set(unit=u["id"])
             path = page_path(vault, u)
             old = existing_sections(path)
             ctx = context_for(vault, u, {u["page"]: [(k, section_summary(v[1])) for k, v in old.items()]})
             try:
                 summary, body, topics, problems = ingest_unit(u, a.proxy, model, charter_text, ctx, a.timeout)
             except InfraError as e:
+                run.set(left=len(todo) - n)
                 infra += 1
                 print(f"[ingest] {u['id']}: proxy error ({e})", file=sys.stderr)
                 if infra >= INFRA_STOP:
@@ -1004,12 +1137,17 @@ def run_ingest(a):
                 print(f"[ingest] {u['id']} -> {u['dir']}/{u['page']}.md", file=sys.stderr)
             m["units"][u["id"]] = entry
             save_manifest(vault, m)
+            run.set(done=done, failed=failed, left=len(todo) - n)
             since_commit += 1
             wrote += 1
             if a.commit and since_commit >= COMMIT_EVERY:
+                run.set(step="indexing", unit="")
                 regenerate(vault)
+                run.set(step="committing")
                 commit(vault, f"harness: ingest {since_commit} units")
+                run.set(step="ingesting")
                 since_commit = 0
+        run.set(step="indexing", unit="", left=0)
         # Units that no longer exist (a deleted file or directory) leave the manifest;
         # their pages are rebuilt from what is left.
         live = {u["id"] for u in units}
@@ -1032,15 +1170,153 @@ def run_ingest(a):
             log(vault, f"- {now_iso()} ingest: {done} sections written, {failed} failed ({model})")
         regenerate(vault)
         if a.commit:
+            run.set(step="committing")
             commit(vault, f"harness: ingest ({done} written, {failed} failed)")
         if infra >= INFRA_STOP:
             return 2
-        if not a.watch or (a.max and done + failed >= a.max):
+        if not a.watch or a.unit or (a.max and done + failed >= a.max):
             break
         if not wrote:
+            run.set(step="waiting")
             time.sleep(a.watch)
     left = len(pending(plan(vault, m, srcs, budget, warned), m, False))
     print(f"[ingest] done: {done} sections written, {failed} failed, {left} units left", file=sys.stderr)
+    return 0
+
+
+LOG_RUN = re.compile(r"^- (\S+) ingest: (\d+) sections written, (\d+) failed \((.*)\)\s*$")
+
+
+def last_run(vault):
+    """The last ingest line of wiki/log.md as {at, written, failed, model}."""
+    for line in reversed((read_text(os.path.join(vault, "wiki", "log.md")) or "").splitlines()):
+        r = LOG_RUN.match(line)
+        if r:
+            return {"at": r.group(1), "written": int(r.group(2)), "failed": int(r.group(3)), "model": r.group(4)}
+    return None
+
+
+def status(vault, quick):
+    """What the vault's ingest state is, read-only and without the lock. --quick
+    reads only the manifest (pending is null); otherwise the sources are cut and
+    hashed as an ingest would, so pending counts new or changed units."""
+    m = load_manifest(vault)
+    away = missing_repos(m)
+    planned = None
+    if not quick:
+        # Cut as the last ingest did, so the hashes compare.
+        planned = plan(vault, m, set(), m.get("unit_kb", UNIT_KB) * 1024, set(m["repos"]))
+
+    def blank():
+        return {"units": 0, "ok": 0, "failed": 0, "pending": None if quick else 0}
+
+    repos = {name: dict(name=name, path=root, exists=name not in away, **blank())
+             for name, root in sorted(m["repos"].items())}
+    raw = blank()
+
+    def bucket(uid):
+        if uid.startswith("code:"):
+            name = uid[5:].split("/", 1)[0]
+            if name not in repos:  # units left of a codebase no longer listed
+                repos[name] = dict(name=name, path="", exists=False, **blank())
+            return repos[name]
+        return raw
+
+    failed = []
+
+    def count(uid, e, state):
+        b = bucket(uid)
+        b["units"] += 1
+        b[state] += 1
+        if state == "failed" and len(failed) < 200:
+            failed.append({"id": uid, "page": e.get("page", ""), "attempts": e.get("attempts", 0),
+                           "at": e.get("at", ""), "problems": e.get("problems", [])})
+
+    seen = set()
+    for u in planned or []:
+        seen.add(u["id"])
+        e = m["units"].get(u["id"])
+        if e is None or e.get("sha") != u["sha"]:
+            count(u["id"], e or {}, "pending")
+        else:
+            count(u["id"], e, "failed" if e.get("status") == "failed" else "ok")
+    for uid, e in sorted(m["units"].items()):
+        if uid in seen:
+            continue
+        if planned is not None and not (uid.startswith("code:") and uid[5:].split("/", 1)[0] in away):
+            continue  # gone from its source: the next ingest drops it
+        count(uid, e, "failed" if e.get("status") == "failed" else "ok")
+    for name in away:
+        repos[name]["pending"] = None  # not knowable from this host
+    return {"vault": vault, "running": read_run(vault), "repos": list(repos.values()), "raw": raw,
+            "failed": failed, "last_run": last_run(vault), "pages": sum(1 for _ in wiki_pages(vault))}
+
+
+def print_status(st):
+    r = st["running"]
+    if r is None:
+        print("running:  no")
+    else:
+        what = (f"pid {r.get('pid')}, {r.get('step')}{' ' + r['unit'] if r.get('unit') else ''}, "
+                f"{r.get('done')} written, {r.get('failed')} failed, {r.get('left')} left")
+        print(f"running:  {what}" if r["alive"] else f"running:  no (a run that ended without cleaning up: {what})")
+    lr = st["last_run"]
+    print(f"last run: {lr['at']}, {lr['written']} written, {lr['failed']} failed ({lr['model']})" if lr
+          else "last run: none")
+
+    def counts(b):
+        pend = "?" if b["pending"] is None else b["pending"]
+        return f"{b['units']} units: {b['ok']} ok, {b['failed']} failed, {pend} pending"
+
+    print(f"pages:    {st['pages']}")
+    print(f"raw:      {counts(st['raw'])}")
+    for r in st["repos"]:
+        where = r["path"] if r["exists"] else f"{r['path'] or '(no path)'}, not on this host"
+        print(f"code:     {r['name']} ({where}): {counts(r)}")
+    for f in st["failed"]:
+        print(f"failed:   {f['id']}: {'; '.join(f['problems']) or 'no reason recorded'}")
+
+
+def forget(vault, name, do_commit):
+    """Drop codebase NAME: its manifest entries and the generated pages of it."""
+    m = load_manifest(vault)
+    prefix = f"code:{name}/"
+    ids = [k for k in m["units"] if k.startswith(prefix)]
+    if name not in m["repos"] and not ids:
+        known = ", ".join(sorted(m["repos"])) or "none"
+        print(f"[ingest] the vault has no codebase named {name} (it has: {known})", file=sys.stderr)
+        return 1
+    wiki = os.path.realpath(os.path.join(vault, "wiki"))
+    pages = {os.path.join(vault, m["units"][k].get("page", "")) for k in ids if m["units"][k].get("page")}
+    base = os.path.join(vault, "wiki", "code", safe_name(name))
+    for d, _, files in os.walk(base):
+        pages.update(os.path.join(d, f) for f in files if f.endswith(".md"))
+    removed, kept = 0, []
+    for path in sorted(pages):
+        real = os.path.realpath(path)
+        if not real.startswith(wiki + os.sep) or not os.path.isfile(real):
+            continue
+        if GENERATED in (read_text(real, 4096) or "")[:2000]:
+            os.remove(real)
+            removed += 1
+        else:
+            kept.append(os.path.relpath(real, vault).replace(os.sep, "/"))
+    for d, _, _ in sorted(os.walk(base), reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+    for k in ids:
+        del m["units"][k]
+    m["repos"].pop(name, None)
+    save_manifest(vault, m)
+    for k in kept:
+        print(f"[ingest] kept {k}: not a generated page", file=sys.stderr)
+    log(vault, f"- {now_iso()} forget: codebase {name}, {len(ids)} units, {removed} pages removed")
+    regenerate(vault)
+    if do_commit:
+        commit(vault, f"harness: forget codebase {name}")
+    print(f"[ingest] forgot {name}: {len(ids)} units, {removed} pages removed", file=sys.stderr)
     return 0
 
 
@@ -1053,6 +1329,7 @@ def main(argv):
     i.add_argument("--model", default="")
     i.add_argument("--src", action="append")
     i.add_argument("--max", type=int, default=0)
+    i.add_argument("--unit", action="append")
     i.add_argument("--unit-kb", type=int, default=UNIT_KB)
     i.add_argument("--timeout", type=int, default=300)
     i.add_argument("--retry-failed", action="store_true")
@@ -1061,26 +1338,57 @@ def main(argv):
     i.add_argument("--commit", action="store_true")
     x = sub.add_parser("index")
     x.add_argument("--vault", required=True)
+    st = sub.add_parser("status")
+    st.add_argument("--vault", default=".")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--quick", action="store_true")
+    fg = sub.add_parser("forget")
+    fg.add_argument("--vault", required=True)
+    fg.add_argument("name")
+    fg.add_argument("--commit", action="store_true")
     a = p.parse_args(argv[1:])
     if a.cmd == "index":
         if os.path.isdir(os.path.join(a.vault, "wiki")):
             regenerate(os.path.abspath(a.vault))
         return 0
     vault = os.path.abspath(a.vault)
-    # The lock lives in .git so it is never committed.
-    lock_dir = os.path.join(vault, ".git") if os.path.isdir(os.path.join(vault, ".git")) else vault
-    lock = open(os.path.join(lock_dir, "harness-ingest.lock"), "a")
-    if not try_lock(lock):
-        print("[ingest] another ingest is running on this vault", file=sys.stderr)
+    if not os.path.isdir(vault):
+        print(f"[ingest] not a directory: {a.vault}", file=sys.stderr)
         return 1
+    if a.cmd == "status":
+        result = status(vault, a.quick)
+        if a.json:
+            print(json.dumps(result, indent=1))
+        else:
+            print_status(result)
+        return 0
+    lock = open(os.path.join(lock_dir(vault), "harness-ingest.lock"), "a")
+    if not try_lock(lock):
+        r = read_run(vault)
+        who = f" (pid {r['pid']}, {r.get('step')})" if r and r["alive"] else ""
+        print(f"[ingest] another ingest is running on this vault{who}", file=sys.stderr)
+        return 3
+    if a.cmd == "forget":
+        return forget(vault, a.name, a.commit)
+
+    def stop(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)  # a kill (harness serve's stop, timeout) ends as Ctrl-C does
+    run = RunFile(None if a.dry_run else run_path(vault),
+                  {"pid": os.getpid(), "started": now_iso_s(), "beat": "", "model": a.model, "args": argv[1:],
+                   "step": "planning", "unit": "", "done": 0, "failed": 0, "left": 0, "watch": bool(a.watch)})
+    run.start()
     try:
-        return run_ingest(a)
+        return run_ingest(a, run)
     except KeyboardInterrupt:
         print("\n[ingest] interrupted; progress is saved, rerun to resume", file=sys.stderr)
         if a.commit and not a.dry_run:
+            run.set(step="committing", unit="")
             regenerate(vault)
             commit(vault, "harness: ingest (interrupted)")
         return 130
+    finally:
+        run.end()
 
 
 if __name__ == "__main__":

@@ -6469,14 +6469,17 @@ HELP
 # the host-mode proxy, one plain request per unit (scripts/vault_ingest.py).
 # Incremental, resumable, and the same for free and -withtools models.
 cmd_ingest() {
-    local src="" model="" max="" unit_kb="" retry=0 watch="" dry=0 arg
+    local src="" model="" max="" unit_kb="" retry=0 watch="" dry=0 status=0 json=0 quick=0 forget="" arg
+    local -a units=()
     while (( $# )); do
         arg="$1"; shift
         case "$arg" in
             -h|--help|help)
                 cat <<'HELP'
 usage: harness ingest [<dir>] [--model M] [--max N] [--unit-kb K] [--retry-failed]
-                      [--watch [SECONDS]] [--dry-run]
+                      [--unit ID]... [--watch [SECONDS]] [--dry-run]
+       harness ingest --status [--json] [--quick]
+       harness ingest --forget NAME
 
 Turns the active vault's sources into wiki pages: every file under .raw/
 (captured sessions included) and, with <dir>, a codebase (remembered, so a
@@ -6499,6 +6502,18 @@ again (same folder name) moves it to this machine's path.
   --watch [S]      keep going: when nothing is left, check again every S
                    seconds (default 300); Ctrl-C stops, progress is kept
   --dry-run        list what would be sent, send nothing
+  --unit ID        send just this unit (an id from --status), whatever its
+                   state; repeatable
+  --status         what the vault's ingest state is, from its local copy (no
+                   pull, no proxy): whether an ingest is running and on what,
+                   each codebase (and whether its folder is on this machine),
+                   units ok, failed and pending, the failed ones and why, the
+                   last run; --json for the same as JSON, --quick to read only
+                   the manifest (no pending counts)
+  --forget NAME    drop codebase NAME: its units, its generated pages under
+                   wiki/code/NAME/ (pages you wrote stay), committed and pushed
+
+One ingest at a time per vault: another exits with status 3.
 
 Pages: wiki/code/<repo>/<repo>--<dir>.md per directory with the root's in
 wiki/code/<repo>/<repo>.md; wiki/sources/<file>.md per .raw file. Generated
@@ -6515,6 +6530,15 @@ HELP
                 watch=300
                 if [[ "${1:-}" =~ ^[0-9]+$ ]]; then watch="$1"; shift; fi ;;
             --dry-run) dry=1 ;;
+            --unit)
+                [[ -n "${1:-}" ]] || { err "--unit needs a unit id (see: harness ingest --status)"; return 1; }
+                units+=("$1"); shift ;;
+            --status) status=1 ;;
+            --json) json=1 ;;
+            --quick) quick=1 ;;
+            --forget)
+                [[ -n "${1:-}" && "${1:-}" != -* ]] || { err "--forget needs a codebase name (see: harness ingest --status)"; return 1; }
+                forget="$1"; shift ;;
             -*) err "unknown ingest option '$arg' (see: harness ingest --help)"; return 1 ;;
             *)
                 [[ -z "$src" ]] || { err "harness ingest takes one directory"; return 1; }
@@ -6523,6 +6547,13 @@ HELP
     done
     [[ -z "$max" || "$max" =~ ^[0-9]+$ ]] || { err "--max needs a number"; return 1; }
     [[ -z "$unit_kb" || "$unit_kb" =~ ^[0-9]+$ ]] || { err "--unit-kb needs a number"; return 1; }
+    if (( json || quick )) && (( ! status )); then
+        err "--json and --quick go with --status"; return 1
+    fi
+    if (( status )) || [[ -n "$forget" ]]; then
+        _ingest_state "$status" "$json" "$quick" "$forget" "$src"
+        return
+    fi
     if [[ -n "$src" ]]; then
         [[ -d "$src" ]] || { err "not a directory: $src"; return 1; }
         src=$(harness_abs_path "$src")
@@ -6553,6 +6584,7 @@ HELP
         [[ -n "$src" ]] && src=$(cygpath -m "$src")
     fi
     [[ -n "$src" ]] && args+=(--src "$src")
+    for arg in ${units[@]+"${units[@]}"}; do args+=(--unit "$arg"); done
     [[ -n "$max" ]] && args+=(--max "$max")
     [[ -n "$unit_kb" ]] && args+=(--unit-kb "$unit_kb")
     (( retry )) && args+=(--retry-failed)
@@ -6564,6 +6596,41 @@ HELP
     # A proxy this command started goes down with it.
     (( started )) && host_proxy_stop
     return "$rc"
+}
+
+# `harness ingest --status` (the active vault's local copy as it is: no pull,
+# no proxy) and `--forget NAME` (pulled first, committed and pushed).
+_ingest_state() {
+    local status="$1" json="$2" quick="$3" forget="$4" src="$5" name py script dir
+    if (( status )) && [[ -n "$forget" ]] || [[ -n "$src" ]]; then
+        err "--status and --forget take no <dir> and not each other"; return 1
+    fi
+    name=$(vault_active_name)
+    [[ -n "$name" ]] || { err "no active vault (see: harness vault)"; return 1; }
+    host_require_python3 || exit 1
+    py=$(host_python_bin) || { err "harness ingest needs python 3"; return 1; }
+    script="$clone_dir/scripts/vault_ingest.py"
+    if (( status )); then
+        dir="$state_root/vaults/$name"
+        [[ -d "$dir" ]] || { err "vault '$name' has no local copy yet (a launch clones it)"; return 1; }
+    else
+        dir=$(vault_prepare)
+        [[ -n "$dir" ]] || { err "the active vault is not available"; return 1; }
+    fi
+    if command -v cygpath >/dev/null 2>&1; then
+        script=$(cygpath -m "$script")
+        dir=$(cygpath -m "$dir")
+    fi
+    local -a args
+    if (( status )); then
+        args=(status --vault "$dir")
+        (( json )) && args+=(--json)
+        (( quick )) && args+=(--quick)
+    else
+        args=(forget --vault "$dir" "$forget" --commit)
+    fi
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    $py "$script" "${args[@]}"
 }
 
 # `harness queue`: a list of tickets worked one at a time with no one at the

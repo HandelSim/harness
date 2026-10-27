@@ -575,7 +575,28 @@ tickets, each with its summary line), a hub per topic used by two or more
 pages (`wiki/topics/`), a page per ticket id (`wiki/tickets/`), and each
 repo's module tree with Up/Subdirectories links, and appends to
 `wiki/log.md`; it commits and pushes every 10 units and at the end, Ctrl-C
-included. A lock in `.git` keeps two runs apart. `--max N` stops after N
+(or SIGTERM) included. A lock, `.git/harness-ingest.lock` (`flock`, or
+`msvcrt.locking` on Windows; the vault's top folder when it has no `.git`),
+keeps two runs apart: `ingest` and `forget` exit 3 when it is held. Under it
+an ingest (not `--dry-run`) keeps `.git/harness-ingest.run.json` (`RunFile`):
+`{pid, started, beat, model, args, step, unit, done, failed, left, watch}`,
+times as `YYYY-MM-DDTHH:MM:SSZ`, step one of `planning`, `ingesting`,
+`indexing`, `committing`, `waiting` (a `--watch` sleep), rewritten every 5 s
+by a thread and after each unit, removed when the run ends. A run file whose
+pid is not alive (`os.kill(pid, 0)`, `OpenProcess` on Windows) or whose beat
+is 120 s old is a run that was killed. `vault_ingest.py status [--json]
+[--quick]` (`harness ingest --status`, on the local copy: no pull, no proxy)
+takes no lock and reports the run file plus `alive`, each codebase (path,
+whether it exists here, units, ok, failed, pending), the same counts for
+`.raw`, the failed units with their problems (at most 200), the last
+`ingest:` line of `wiki/log.md` and the number of wiki pages; pending cuts
+and hashes the sources as the last ingest did (`unit_kb` is kept in the
+manifest), `--quick` reads only the manifest and leaves pending null.
+`forget NAME` (`harness ingest --forget NAME`, pulled, committed, pushed)
+drops a codebase's units and repo entry and removes its generated pages
+under `wiki/code/NAME/` (pages someone wrote stay; a folder with none
+generated gets no overview page). `--unit ID` sends just those units,
+whatever their state. `--max N` stops after N
 units, `--watch [S]` keeps checking every S seconds (default 300) for a
 long-running ingest of a growing codebase, `--dry-run` lists the units.
 `tests/unit_vault_test.sh` covers the registry, clone, fast-forward, offline
