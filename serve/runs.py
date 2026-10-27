@@ -422,14 +422,16 @@ class Source:
 
 
 class Runs:
-    def __init__(self, sources, queue_dir="", vault="", harness=""):
+    def __init__(self, sources, queue_dir="", vault="", harness="", project_dir=""):
         """sources: (label, data dir) pairs; queue_dir: harness queue's state/queue;
         vault: the active vault (the plans, reviews and answers are there);
-        harness: the harness script the Start button runs `queue run` with."""
+        harness: the harness script the Start button runs `queue run` with;
+        project_dir: the folder harness serve was started in."""
         self.sources = [Source(label, d) for label, d in sources]
         self.queue_dir = queue_dir
         self.vault = vault
         self.harness = harness or HARNESS
+        self.project_dir = project_dir
         self.launched = None        # the `harness queue run` this viewer started: (Popen, started at)
         self._in_place = {}         # KEY: (state.json stat, project, launch windows) of in-place tickets
         self.launch_lock = threading.RLock()
@@ -1427,9 +1429,24 @@ def queue_live(runs):
     return {"sig": _sig(regions), "regions": regions}
 
 
+def _serve_project(runs):
+    """The git repository harness serve was started in (its top folder), or ""."""
+    d = runs.project_dir
+    if not d or not os.path.isdir(d):
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def _projects(runs):
-    """Project folders tickets were added with, newest first."""
-    seen = []
+    """Project folders for the Add form, the default first: the repository
+    harness serve was started in, then those tickets were added with, newest first."""
+    here = _serve_project(runs)
+    seen = [here] if here else []
     for k in sorted(runs.ticket_keys(), key=lambda k: -_iso_ms(runs.ticket_state(k).get("created", ""))):
         p = runs.ticket_state(k).get("project")
         if p and p not in seen:

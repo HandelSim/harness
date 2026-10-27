@@ -1332,7 +1332,10 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
   project folder, base, the existing work's ref such as `origin/ABC-123`,
   a note for the agents, and the stages: Full, Review only,
   Implement+review, Plan only or Custom). "+ Add tickets" scrolls to the
-  form and focuses the keys. The project folder is taken as pasted: quotes
+  form and focuses the keys. The project folder starts as the git repository
+`harness serve` (or the launch that started the viewer) was run in
+(`--project-dir`, its top folder), else the last ticket's; the others are
+offered as suggestions. It is taken as pasted: quotes
   and blanks around it dropped, `~` expanded, and on Windows a Git Bash
   `/c/...` path read as `C:/...`. A refused add shows the queue page again
   (409) with the reason in the form and every value kept. `/runs/queue/live`

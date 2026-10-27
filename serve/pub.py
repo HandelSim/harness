@@ -510,7 +510,7 @@ class Config:
     def __init__(self, port, vault, vault_name, opencode_port, password_file, allow_hosts,
                  access_codes="", secure_cookie=False, opencode_url="", proxy_url="",
                  modes=(), usage_ledger="", trust_forwarded_for=False, agent_data=(), queue_dir="",
-                 harness=""):
+                 harness="", project_dir=""):
         self.port = port
         self.vault = vault
         self.vault_name = vault_name
@@ -531,7 +531,7 @@ class Config:
         self.usage_ledger = usage_ledger
         self.trust_forwarded_for = trust_forwarded_for
         self.cache = TTLCache()
-        self.runs = runs_view.Runs(agent_data, queue_dir, vault, harness) if agent_data else None
+        self.runs = runs_view.Runs(agent_data, queue_dir, vault, harness, project_dir) if agent_data else None
 
     def opencode_password(self):
         if not self.password_file:
@@ -1410,12 +1410,16 @@ def main(argv=None):
     ap.add_argument("--harness", default="", metavar="PATH",
                     help="the harness script the queue page's Start runs 'queue run' with "
                          "(default: the one next to this serve/ folder)")
+    ap.add_argument("--project-dir", default="", metavar="DIR",
+                    help="the folder harness serve was started in: the Add form's project folder "
+                         "when it is in a git repository")
     a = ap.parse_args(argv)
     cfg = Config(a.port, a.vault, a.vault_name, a.opencode_port, a.password_file, a.allow_host,
                  access_codes=a.access_codes, secure_cookie=a.secure_cookie,
                  opencode_url=a.opencode_url, proxy_url=a.proxy_url, modes=a.mode,
                  usage_ledger=a.usage_ledger, trust_forwarded_for=a.trust_forwarded_for,
-                 agent_data=a.agent_data, queue_dir=a.queue_dir, harness=a.harness)
+                 agent_data=a.agent_data, queue_dir=a.queue_dir, harness=a.harness,
+                 project_dir=a.project_dir)
     if cfg.codes:
         n = len(cfg.codes.entries())
         if not n:

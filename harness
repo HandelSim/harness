@@ -7263,6 +7263,11 @@ serve_pub_args() {
         --agent-data "host=${XDG_DATA_HOME:-$HOME/.local/share}"
         --queue-dir "$state_root/queue"
         --harness "$real_self")
+    # The Add form's default project folder: where serve (or the launch that
+    # started the viewer) was run.
+    local here=$PWD
+    command -v cygpath >/dev/null 2>&1 && here=$(cygpath -m "$here")
+    pub_args+=(--project-dir "$here")
     # Gated as long as the file exists, even with no codes left in it (then
     # nobody can sign in): deleting the file is the one way to open the page.
     if [[ -e "$(serve_codes_file)" ]]; then

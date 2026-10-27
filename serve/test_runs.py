@@ -562,6 +562,21 @@ class QueuePageTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-99/live")
         self.assertEqual(json.loads(body), {"gone": "/runs/queue"})
 
+    def test_the_project_folder_defaults_to_where_serve_was_started(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        os.makedirs(os.path.join(proj, "sub"))
+        self.ticket()                      # added with /p
+        self.start(project_dir=os.path.join(proj, "sub"))
+        r, body = self.req("GET", "/runs/queue")
+        top = subprocess.run(["git", "-C", proj, "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True).stdout.strip()
+        self.assertIn(f"name='project' required list='projects' spellcheck='false' value='{top}'", body)
+        self.assertIn("<option value='/p'>", body)
+        # not in a repository: the folder the last ticket was added with
+        self.start(project_dir=self.tmp.name)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("spellcheck='false' value='/p'", body)
+
     def test_add_with_a_start_a_branch_and_the_defaults(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
         head = subprocess.run(["git", "-C", proj, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
