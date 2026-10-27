@@ -288,6 +288,18 @@ class RunsTest(RunsServer):
         self.assertIn("Agree the plan, or send feedback", body)   # a free feedback box
         self.assertIn("Send feedback and plan again", body)
         self.assertNotIn("Go with the defaults", body)
+        # blocked at review: no planner's questions, a note that re-plans, and Retry runs review as is
+        self.ticket(status="blocked", stage="review", reason="the <review> found a bug")
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("Get it going again", body)
+        self.assertIn("It stopped at review: the &lt;review&gt; found a bug.", body)
+        self.assertIn("Send and plan again", body)
+        self.assertNotIn("name='q0'", body)
+        self.assertNotIn("Answer the planner", body)
+        self.assertIn("<button type='submit'>Retry</button>", body)
+        self.ticket(status="blocked", stage="review", stages=["implement", "review"])
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("Send and run review again", body)
         self.ticket(status="running", attempt=1)
         self.run_on(stage="plan", step="asking the <verifier>")
         r, body = self.req("GET", "/runs/ticket/ABC-12")

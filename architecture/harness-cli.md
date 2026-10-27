@@ -1468,7 +1468,10 @@ offered as suggestions. It is taken as pasted: quotes
   stage, then every session newest first. The index shows the live ones in
   an "Agent runs" panel.
 - `/runs/ticket/<KEY>`: status and why, the stage strip and buttons, the
-  plan's questions with an answer form, the ticket's sessions from every
+  plan's questions with an answer form (a blocked ticket instead says where
+  and why it stopped and takes one note: Retry runs that stage again as is,
+  the note re-plans, or reruns the stage when the ticket has no plan), the
+  ticket's sessions from every
   `--agent-data` source by stage, every attempt from `history` with its
   result, reason and `.out`, the notes with an add form, the plan, answers
   and review notes from the vault, and `log.md`. `/runs/ticket/<KEY>/live`

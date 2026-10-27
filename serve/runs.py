@@ -1611,6 +1611,15 @@ def render_queue_page(runs, msg="", bad=False, form=None, err=""):
 
 # --- /runs/ticket/KEY ---------------------------------------------------------------
 
+def _note_form(key, button):
+    """A blocked ticket: one note for the agents, sent the same way as answers."""
+    return (f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"
+            "<label><div class='q'>What should change</div><textarea name='note' required placeholder='For "
+            "example: the tests need the database running first, or: keep the old API and add the new one beside "
+            "it'></textarea></label>"
+            f"<div class='acts'><button type='submit' class='primary'>{button}</button></div></form>")
+
+
 def _answer_form(key, qs, review=False):
     parts = [f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"]
     for i, q in enumerate(qs[:FORM_QUESTIONS]):
@@ -1704,6 +1713,19 @@ def _t_questions(runs, key, st):
     status = st.get("status", "")
     qs = st.get("questions") or []
     vault = runs.vault_of(st)
+    if status == "blocked" and vault:
+        # Blocked at any stage, not by the planner: retry as is, or send a note
+        stage = st.get("stage", "")
+        planned = "plan" in (st.get("stages") or STAGES)
+        then = ("the ticket goes back to planning with it, and the revised plan comes back here for your "
+                "approval before anything is built." if planned else f"the ticket runs {stage} again with it.")
+        intro = (f"It stopped at {esc(stage)}" + (f": {esc(st['reason'])}" if st.get("reason") else "") + ". "
+                 f"If you fixed the cause yourself (a setting, the run mode, something on your machine), use "
+                 f"Retry above: it runs {esc(stage)} again as it is. If the agents should do something "
+                 f"differently, write it here: {then}")
+        return (f"<section class='panel'><h2>Get it going again</h2><div class='muted'>{intro}</div>"
+                f"{_note_form(key, 'Send and plan again' if planned else f'Send and run {esc(stage)} again')}"
+                "</section>")
     if status in WAITING and vault:
         review = status == "plan-review"
         head = "Agree the plan, or send feedback" if review else "Questions for you" if qs else "Answer the planner"
@@ -1711,8 +1733,7 @@ def _t_questions(runs, key, st):
                  "you approve it.")
         intro = ("Approve the plan to start building, or answer and give feedback here." + again if review
                  else "The plan is waiting on the blocking questions. Answer what you can; an empty box takes "
-                 "the question's default." + again + " Go with the defaults skips that." if status == "needs-answers"
-                 else "Answering sends the ticket back to plan with your answers." + again)
+                 "the question's default." + again + " Go with the defaults skips that.")
         return (f"<section class='panel'><h2>{head}</h2><div class='muted'>{intro}</div>"
                 f"{_answer_form(key, qs, review)}</section>")
     if qs:
