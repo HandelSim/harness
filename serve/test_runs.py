@@ -17,7 +17,8 @@ import threading
 import time
 import unittest
 from http.server import ThreadingHTTPServer
-from urllib.parse import quote, urlencode
+from unittest import mock
+from urllib.parse import quote, unquote, urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pub  # noqa: E402
@@ -313,7 +314,9 @@ class RunsTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("run ended</span>", body)
         self.assertIn("the queue run ended while it was at plan; start the queue to carry on there", body)
-        self.assertIn("href='/runs/queue'>Start the queue", body)
+        self.assertIn("action='/runs/queue/start'", body)          # the queue page's Start, here
+        self.assertIn("<input type='hidden' name='back' value='ABC-12'>", body)
+        self.assertIn("ABC-12 waits until a run takes it", body)
         self.assertIn("action='/runs/ticket/ABC-12/stop'", body)
         self.assertNotIn(">running</span>", body)
         r, body = self.req("GET", "/runs/queue")
@@ -326,7 +329,9 @@ class RunsTest(RunsServer):
         r, body = self.act("retry", [("stage", "plan")])
         self.assertEqual(r.status, 303, body)
         self.assertEqual((self.state()["status"], self.state()["stage"]), ("queued", "plan"))
-        self.assertNotIn("href='/runs/queue'>Start the queue", body)
+        self.assertNotIn("the queue is not running", r.getheader("Location"))   # the run takes it
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("action='/runs/queue/start'", body)
 
     def test_answering_on_the_page_saves_the_answers_and_requeues(self):
         self.ticket()
@@ -379,6 +384,10 @@ class RunsTest(RunsServer):
         r, _ = self.act("approve")
         self.assertEqual(r.status, 303)
         self.assertEqual((self.state()["status"], self.state()["plan_approved"]), ("queued", True))
+        self.assertIn("the queue is not running: Start the queue below takes it", unquote(r.getheader("Location")))
+        r, body = self.req("GET", r.getheader("Location"))
+        self.assertIn("action='/runs/queue/start'", body)   # shown, never started by the approve
+        self.assertFalse(os.path.exists(os.path.join(self.queue, "run.json")))
         self.ticket(status="blocked", stage="review", reason="review failed 2 time(s)")
         r, _ = self.act("retry")
         self.assertEqual(r.status, 303)
@@ -549,6 +558,78 @@ class QueuePageTest(RunsServer):
         h = {"Content-Type": "application/x-www-form-urlencoded",
              "Origin": origin or f"http://127.0.0.1:{self.port}"}
         return self.req("POST", path, urlencode(list(fields)), h)
+
+    def pushed(self):
+        """A project whose origin has ABC-12 one commit past main (an earlier go's
+        push); the ticket's clone has that branch too. (project, main's sha)."""
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+
+        def git(*cmd):
+            return subprocess.run(["git", *cmd], check=True, env=env, capture_output=True, text=True).stdout.strip()
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        remote = os.path.join(self.tmp.name, "remote.git")
+        git("init", "-q", "--bare", remote)
+        git("-C", proj, "remote", "add", "origin", remote)
+        main = git("-C", proj, "rev-parse", "main")
+        tip = git("-C", proj, "commit-tree", "main^{tree}", "-p", main, "-m", "two")
+        git("-C", proj, "push", "-q", "origin", "main", f"{tip}:refs/heads/ABC-12")
+        git("-C", proj, "fetch", "-q", "origin")
+        clone = os.path.join(self.queue, "ABC-12", "repo")
+        git("-C", clone, "init", "-q", "-b", "main")
+        git("-C", clone, "fetch", "-q", remote, "ABC-12:ABC-12")
+        return proj, main
+
+    def test_retry_offers_only_the_stages_the_queue_takes(self):
+        proj, main = self.pushed()
+        with open(os.path.join(self.queue, "ABC-12", "plan.md"), "w") as f:
+            f.write("## Goal\n\nFix it.\n")
+        self.ticket(project=proj, status="done", stage="done", base_sha=main, made_branch=True, questions=[])
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("Run again</button>", body)
+        self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["implement", "review", "push"])
+        self.assertIn("not from the start: ABC-12&#x27;s branch ABC-12 has commits that main does not "
+                      "(origin/ABC-12 at", body)
+        before = self.state()
+        r, body = self.act("retry", [("stage", "plan")])   # posted anyway: the queue says no, the same way
+        self.assertEqual(r.status, 409)
+        self.assertIn("starts the work over from main", body)
+        self.assertEqual(self.state(), before)
+        r, body = self.act("retry", [("stage", "review")])
+        self.assertEqual(r.status, 303, body)
+        self.assertEqual((self.state()["status"], self.state()["stage"]), ("queued", "review"))
+        self.assertIn("the queue is not running: Start the queue below takes it", unquote(r.getheader("Location")))
+        # its work gone too: no stage it can go again at, and the page says why
+        os.remove(os.path.join(self.queue, "ABC-12", "plan.md"))
+        self.ticket(project=proj, status="blocked", stage="plan", made_branch=True, questions=[],
+                    reason="the branch has commits")
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("action='/runs/ticket/ABC-12/retry'", body)
+        self.assertIn("Retry: ABC-12&#x27;s branch ABC-12 has commits that main does not", body)
+        self.assertIn("delete it (here and on the remote, then git fetch --prune)", body)
+        # the queue's module not to be had (an older checkout): every stage, as before
+        with mock.patch.object(runs, "_tq", lambda: None):
+            r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["", *runs.STAGES])
+
+    def test_start_from_a_ticket_goes_back_to_it(self):
+        self.ticket(status="queued", questions=[])
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("ABC-12 waits until a run takes it", body)
+        self.assertIn("<input type='hidden' name='back' value='ABC-12'>", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/live")
+        self.assertIn("action='/runs/queue/start'", json.loads(body)["regions"]["start"])
+        r, body = self.post("/runs/queue/start", [("mode", "host"), ("back", "ABC-12")])
+        self.assertEqual(r.status, 409)       # host mode needs its box ticked
+        self.assertIn("<a href='/runs/ticket/ABC-12'>Back to the ticket</a>", body)
+        r, body = self.post("/runs/queue/start", [("mode", "host"), ("back", "../x")])
+        self.assertIn("<a href='/runs/queue'>Back to the queue</a>", body)
+        self.run_on("ABC-1")
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("action='/runs/queue/start'", body)
+        self.assertNotIn("waits until a run takes it", body)
 
     def test_queue_page_lists_tickets_with_stages_and_actions(self):
         self.ticket()
@@ -836,7 +917,7 @@ class QueuePageTest(RunsServer):
             f.write(f'#!/bin/bash\necho "$@ HOST_CONFIRM=$HARNESS_HOST_CONFIRM OPEN=$HARNESS_OPEN" > {args}\n'
                     'echo "no active vault <x>"\nexit 3\n')
         self.ticket()
-        self.start(harness=fake)
+        cfg = self.start(harness=fake)
         r, body = self.post("/runs/queue/start", [("mode", "single"), ("confirm_host", "1")])
         self.assertEqual(r.status, 409)
         self.assertIn("ended at once (status 3): no active vault &lt;x&gt;", body)
@@ -845,6 +926,21 @@ class QueuePageTest(RunsServer):
         r, body = self.req("GET", "/runs/queue/runner.out")
         self.assertIn("no active vault <x>", body)
         self.assertEqual(r.getheader("Content-Type").split(";")[0], "text/plain")
+        # started from a ticket's page: back to the ticket, which shows the run starting
+        with open(fake, "w") as f:
+            f.write("#!/bin/bash\nexec sleep 30\n")
+        self.ticket(status="queued", questions=[])
+        r, body = self.post("/runs/queue/start", [("mode", "container"), ("back", "ABC-12")])
+        try:
+            self.assertEqual(r.status, 303, body)
+            self.assertTrue(r.getheader("Location").startswith("/runs/ticket/ABC-12?done="))
+            r, body = self.req("GET", "/runs/ticket/ABC-12")
+            self.assertIn("Queue starting", body)
+            self.assertNotIn("action='/runs/queue/start'", body)
+        finally:
+            if cfg.runs.launched:
+                cfg.runs.launched[0].kill()
+                cfg.runs.launched[0].wait()
 
     def test_a_queue_session_has_a_stop_button_and_the_host_an_opencode_link(self):
         self.ticket(status="running", stage="plan")

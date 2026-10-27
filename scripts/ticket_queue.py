@@ -579,9 +579,10 @@ def workdir(q, st):
     return st["project"] if st.get("in_place") else os.path.join(q.dir(st["key"]), "repo")
 
 
-def commit_of(project, ref):
-    """The commit ref names now (a <remote>/<branch> is fetched first); HERE is HEAD."""
-    return resolve_ref(project, "HEAD" if ref == HERE else ref)
+def commit_of(project, ref, fetch=True):
+    """The commit ref names now (a <remote>/<branch> is fetched first, unless not
+    fetch); HERE is HEAD."""
+    return resolve_ref(project, "HEAD" if ref == HERE else ref, fetch)
 
 
 def start_and_base(st):
@@ -601,24 +602,31 @@ def start_and_base(st):
     return start, r.stdout.strip()
 
 
-def tips(project, branch):
-    """[(name, sha)]: the branch here and on each remote (fetched first), where it exists."""
+def tips(project, branch, fetch=True):
+    """[(name, sha)]: the branch here and on each remote (fetched first, unless not
+    fetch: as last fetched), where it exists."""
     out = []
     local = git(project, "rev-parse", "-q", "--verify", f"refs/heads/{branch}^{{commit}}", check=False).stdout.strip()
     if local:
         out.append((branch, local))
     for remote in git(project, "remote", check=False).stdout.split():
-        sha = resolve_ref(project, f"{remote}/{branch}")
+        sha = resolve_ref(project, f"{remote}/{branch}", fetch)
         if sha:
             out.append((f"{remote}/{branch}", sha))
     return out
 
 
-def lost_by(project, branch, sha):
+def lost_by(project, branch, sha, fetch=True):
     """The tips of branch that sha does not contain: ending the work on branch at
     sha would throw their commits away. [] for a new branch, or sha on top of it."""
-    return [(name, tip) for name, tip in tips(project, branch)
+    return [(name, tip) for name, tip in tips(project, branch, fetch)
             if git(project, "merge-base", "--is-ancestor", tip, sha, check=False).returncode != 0]
+
+
+def own_branch(st, lost):
+    """True when lost (lost_by the ticket's branch) is the project's branch alone,
+    made by an earlier go of this ticket: ends_on keeps it and starts it again."""
+    return bool(lost) and lost == [(branch_of(st), lost[0][1])] and bool(st.get("made_branch"))
 
 
 def ends_on(q, st, start):
@@ -628,7 +636,7 @@ def ends_on(q, st, start):
     refs/harness-queue/prev/KEY and started again; a pushed one is never moved."""
     project, branch = st["project"], branch_of(st)
     lost = lost_by(project, branch, start)
-    if lost and lost == [(branch, lost[0][1])] and st.get("made_branch"):
+    if own_branch(st, lost):
         prev = f"refs/harness-queue/prev/{st['key']}"
         git(project, "update-ref", prev, lost[0][1])
         q.log(st["key"], f"branch {branch} from the earlier go ({lost[0][1][:12]}) kept at {prev}")
@@ -645,11 +653,12 @@ def ends_on(q, st, start):
                            f"(--start {lost[0][0]}), end on another branch (--branch), or delete it")
 
 
-def resolve_ref(project, ref):
+def resolve_ref(project, ref, fetch=True):
     """The commit ref names in project, or "". A remote-tracking ref (origin/X) is
-    fetched from its remote first, best effort, so it is the work as it is now."""
+    fetched from its remote first, best effort, so it is the work as it is now
+    (not fetch: as last fetched)."""
     head, _, rest = ref.partition("/")
-    if rest and head in git(project, "remote", check=False).stdout.split():
+    if fetch and rest and head in git(project, "remote", check=False).stdout.split():
         net_git(project, "fetch", "-q", "--no-tags", head, f"+refs/heads/{rest}:refs/remotes/{head}/{rest}",
                 timeout=120)
     r = git(project, "rev-parse", "-q", "--verify", ref + "^{commit}", check=False)
@@ -2682,7 +2691,7 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
     if stage or fresh:   # the agent runs again; only a plain retry checks the kept result again
         st.pop("verify_only", None)
         st.pop("verified_sha", None)
-    if fresh or st["stage"] == "plan" or not has_work(q, st):  # from the start, not earlier commits
+    if starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "must_fix", "warnings", "verify_only", "verified_sha"):
             st.pop(k, None)
         if st["stage"] == "plan":
@@ -2694,6 +2703,13 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
             st["verify_only"] = kept
     q.save(st)
     return st
+
+
+def starts_over(q, st, stage=None, fresh=False):
+    """True when going again at stage (None: where it is) sets the work up again
+    from its start (the run clones, or sets up in place, again): fresh, from the
+    plan, or its work is gone."""
+    return fresh or (stage or st["stage"]) == "plan" or not has_work(q, st)
 
 
 def has_work(q, st):
@@ -2719,25 +2735,84 @@ def cmd_approve(q, a):
 RETRYABLE = ("blocked", "needs-answers", "stopped", "done")
 
 
-def retry_refused(q, st, stage):
-    """Why the ticket cannot go again at stage (--stage), or ""."""
+def plain_retry(q, st):
+    """(stage, fresh): where a retry without --stage queues the ticket. Where it was
+    (None); a plan the verifier gave no verdict on is kept and checked again; done,
+    or its work gone, from the start on a fresh clone."""
+    if st["status"] != "done" and st.get("stage") == "plan" and (st.get("verify_only") or {}).get("stage") == "plan":
+        return None, False
+    if st["status"] == "done" or st.get("stage") not in ALL_STAGES or not has_work(q, st):
+        return first_stage(st), True
+    return None, False
+
+
+def lost_over(q, st, fetch=True, seen=None):
+    """The tips of the ticket's branch that setting its work up again from its start
+    would throw away, so ends_on refuses it (a pushed branch is never moved back);
+    [] when none, or when the project or start is not there to tell (setup says why).
+    seen: a dict kept across calls for one ticket, so the branch is looked at once."""
+    if seen is not None and "lost" in seen:
+        return seen["lost"]
+    project, lost = st.get("project") or "", []
+    if os.path.isdir(project):
+        start = commit_of(project, start_of(st), fetch)
+        if start:
+            lost = lost_by(project, branch_of(st), start, fetch)
+            lost = [] if own_branch(st, lost) else lost
+    if seen is not None:
+        seen["lost"] = lost
+    return lost
+
+
+def retry_refused(q, st, stage=None, fetch=True, seen=None):
+    """Why the ticket cannot go again at stage (--stage; None: a plain retry), or "".
+    Not fetch: the remotes' branches as last fetched (the run's page asks often);
+    seen: as lost_over's, for asking of several stages."""
     key = st["key"]
+    seen = {} if seen is None else seen
     held_plan = st["status"] == "plan-review" or (st["status"] == "stopped" and st.get("stopped_from") == "plan-review")
-    if held_plan and stage != "plan":
+    fresh, how = False, f"--stage {stage}"
+    if stage is None:
+        if st["status"] == "queued":
+            return f"{key} is queued already; 'harness queue run' takes it (--stage S sends it to another stage)"
+        if st["status"] == "plan-review":
+            return f"{key}'s plan waits to be read: harness queue approve {key} goes on, --stage plan makes it again"
+        if held_plan:
+            return ""   # back to plan-review: nothing is set up again
+        (stage, fresh), how = plain_retry(q, st), "a retry"
+    elif held_plan and stage != "plan":
         return f"{key}'s plan waits to be read: harness queue approve {key} goes on, --stage plan makes it again"
-    if stage == first_stage(st) or stage == "plan":
+    elif stage not in (first_stage(st), "plan"):
+        stages = stages_of(st)
+        if "plan" in stages and ALL_STAGES.index(stage) > 0 and not os.path.exists(plan_copy(q, key)):
+            return f"{key} has no checked plan yet, so {stage} has nothing to work from: --stage plan"
+        if stage == "fix" and not st.get("must_fix"):
+            return f"{key}'s review has no Must fix items, so fix has nothing to do: --stage review"
+        if stage in ("review", "fix", "push"):
+            if not has_work(q, st):
+                return f"{key}'s work is gone (or was never made), so {stage} has nothing to take: --stage {first_stage(st)}"
+            if "commits" not in seen:
+                seen["commits"] = commits_since_base(q, st)
+            if not seen["commits"]:
+                return f"{key}'s branch {branch_of(st)} has no commits yet, so {stage} has nothing to take: --stage implement"
+    if not starts_over(q, st, stage, fresh):
+        return ""   # goes on from the work: its branch only moves forward
+    lost = lost_over(q, st, fetch, seen)
+    if not lost:
         return ""
-    stages = stages_of(st)
-    if "plan" in stages and ALL_STAGES.index(stage) > 0 and not os.path.exists(plan_copy(q, key)):
-        return f"{key} has no checked plan yet, so {stage} has nothing to work from: --stage plan"
-    if stage == "fix" and not st.get("must_fix"):
-        return f"{key}'s review has no Must fix items, so fix has nothing to do: --stage review"
-    if stage in ("review", "fix", "push"):
-        if not has_work(q, st):
-            return f"{key}'s work is gone (or was never made), so {stage} has nothing to take: --stage {first_stage(st)}"
-        if not commits_since_base(q, st):
-            return f"{key}'s branch {branch_of(st)} has no commits yet, so {stage} has nothing to take: --stage implement"
-    return ""
+    names = ", ".join(f"{n} at {t[:12]}" for n, t in lost)
+    then = ("--stage implement (or a later stage) goes on from the work instead" if has_work(q, st) else
+            f"delete it (here and on the remote, then git fetch --prune), or remove {key} and add it again "
+            f"with --start {lost[0][0]} or another --branch")
+    return (f"{key}'s branch {branch_of(st)} has commits that {start_of(st)} does not ({names}); {how} starts "
+            f"the work over from {start_of(st)}, and the queue never ends it over them: {then}")
+
+
+def retry_choices(q, st, fetch=False):
+    """{stage: why not, or ""} for a retry at each stage, None the plain retry: what
+    the run's page offers. Not fetched by default: the page asks on every refresh."""
+    seen = {}
+    return {s: retry_refused(q, st, s, fetch, seen) for s in (None,) + ALL_STAGES}
 
 
 def cmd_retry(q, a):
@@ -2748,13 +2823,13 @@ def cmd_retry(q, a):
         return 1
     reap_stranded(q, key, getattr(a, "harness", ""))
     st = q.load(key) or st
+    why = retry_refused(q, st, a.stage)   # fetched, as setup will be: not under the lock
+    if why:
+        print(f"[queue] {why}", file=sys.stderr)
+        return 1
     extra = {}
     stage = a.stage
     if stage:
-        why = retry_refused(q, st, stage)
-        if why:
-            print(f"[queue] {why}", file=sys.stderr)
-            return 1
         if stage not in stages_of(st):
             extra["stages"] = [s for s in ALL_STAGES if s in stages_of(st) or s == stage]
         if stage == "plan":
@@ -2771,19 +2846,10 @@ def cmd_retry(q, a):
             q.save(st)
         print(f"[queue] {key}: back to plan-review; harness queue approve {key} goes on")
         return 0
-    elif st["status"] == "queued":
-        print(f"[queue] {key} is queued already; 'harness queue run' takes it (--stage S sends it to another stage)",
-              file=sys.stderr)
-        return 1
-    elif st["status"] == "plan-review":
-        print(f"[queue] {key}'s plan waits to be read: harness queue approve {key} goes on, --stage plan makes it "
-              "again", file=sys.stderr)
-        return 1
-    elif st["status"] != "done" and st.get("stage") == "plan" and (st.get("verify_only") or {}).get("stage") == "plan":
-        pass   # the plan the verifier gave no verdict on is kept and checked again
-    elif st["status"] == "done" or st.get("stage") not in ALL_STAGES or not has_work(q, st):
-        stage = first_stage(st)   # done, or its work is gone: from the start, on a fresh clone
-        extra["fresh"] = True
+    else:
+        stage, fresh = plain_retry(q, st)   # done, or its work is gone: from the start, on a fresh clone
+        if fresh:
+            extra["fresh"] = True
     # also a ticket left running by a run that ended (or is stuck elsewhere), and a
     # queued one sent back to an earlier stage; under the lock the run takes tickets under
     with held(os.path.join(q.root, "queue.lock")):

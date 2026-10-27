@@ -707,8 +707,13 @@ that branch. An existing target branch is only ever fast-forwarded:
 setup refuses when the start does not contain one, rather than drop
 commits; the one exception is a local branch an earlier go of this ticket
 made (`made_branch`), whose old tip is kept at
-`refs/harness-queue/prev/KEY`. So a fresh retry of a pushed ticket is
-refused until the branch is deleted or another `--branch` is used.
+`refs/harness-queue/prev/KEY`. So `retry` refuses up front (`retry_refused`:
+`lost_over`, the same rule) any retry that would start a pushed ticket over
+(a plain retry of a done one, `--stage plan`, or any stage once its work is
+gone), saying which tips and what goes on instead (`--stage implement` or
+later while the work is there, else delete the branch or re-add with
+`--start`). `retry_choices` is that rule for every stage, unfetched, for the
+run viewer.
 In place, the agents work in the project folder itself (`workdir()`):
 setup saves what the owner has uncommitted (`owner.json`), never resets,
 cleans or stashes, and switches the folder to the branch at the start; a
@@ -736,7 +741,9 @@ owner note every later prompt gets (`{{NOTES}}`); notes live in
 holding older state cannot drop one. `retry KEY [--stage S]` (blocked,
 needs-answers, stopped, done, a running ticket no run has in hand, a queued
 one with `--stage`; back to plan, or any retry of a done ticket
-without `--stage`, means a fresh clone from `--ref`), `stop KEY` (a waiting
+without `--stage` (`plain_retry`), means a fresh clone from `--ref`;
+refused with exit 1 and the reason, `state.json` untouched, where
+`retry_refused` says so), `stop KEY` (a waiting
 ticket becomes `stopped`; a running one the run has in hand gets the
 `KEY/stop` sentinel, which the runner also checks right before the push;
 "in hand" is `run_holds`: a fresh beat, run.json naming it (the run writes
@@ -1492,7 +1499,7 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   push: passed, skipped, current in the status colour, still to do, or not
   one of the ticket's stages), why it waits (a running ticket: its stage,
   attempt and the run's `step`; a `running` ticket with no live run on it:
-  "run ended", with Start the queue on its page), and its buttons (move, Answer
+  "run ended"), and its buttons (move, Answer
   or Review plan, stop, retry, remove); and the Add form (keys, project
   folder, a Starting point: New work from the target branch, Continue
   existing work on a named branch such as `origin/ABC-123` (the work branch
@@ -1518,6 +1525,12 @@ offered as suggestions. It is taken as pasted: quotes
   plan's questions with an answer form (a blocked ticket instead says where
   and why it stopped and takes one note: Retry runs that stage again as is,
   the note re-plans, or reruns the stage when the ticket has no plan), the
+  retry form's "from" stages (only those `ticket_queue.retry_choices`, imported
+  from the queue script, does not refuse, remotes as last fetched; none: the
+  reason instead of the form; the module not importable: all), the queue's
+  Start form when the ticket is queued or "run ended" and no run is going
+  (`back=KEY` returns to the ticket; answer, approve and retry never start a
+  run, they say none is going), the
   ticket's sessions from every
   `--agent-data` source by stage, every attempt from `history` with its
   result, reason and `.out`, the notes with an add form, the plan, answers
@@ -1552,7 +1565,8 @@ offered as suggestions. It is taken as pasted: quotes
   session or process group, no console, `HARNESS_OPEN=0`,
   `HARNESS_HOST_CONFIRM=1` for host modes, `HARNESS_INSTALL_ROOT` from the
   queue dir), output appended to `<queue>/runner.out`, refused while a run
-  holds the queue; `halt` writes the halt file; `end` runs `halt --force`
+  holds the queue, then back to `/runs/ticket/<back>` when the form came
+  from a ticket; `halt` writes the halt file; `end` runs `halt --force`
   (offered while halting, or when a ticket's stop has waited over
   `STUCK_AFTER` s).
 - `POST /runs/ticket/<KEY>/{answer,approve,retry,stop,remove,move,note}`:

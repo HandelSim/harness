@@ -1384,26 +1384,53 @@ class ReviewerFixesTest(Base):
         st = self.status()
         self.assertEqual(st["status"], "done")
         self.assertIn("base_sha", st)
+        # The redone work would start at the base again, so ending it on ABC-1 would
+        # drop the first go's pushed commits: refused up front, with what to do.
+        for stage in ((), ("--stage", "plan")):
+            rc, out = self.q("retry", "ABC-1", *stage)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("branch ABC-1 has commits that main does not", out)
+            self.assertIn("origin/ABC-1 at", out)
+            self.assertIn("--stage implement (or a later stage) goes on from the work", out)
+            self.assertEqual(self.status(), st)
+        sh("git", "-C", self.remote, "branch", "-D", "ABC-1")
+        sh("git", "-C", self.project, "branch", "-D", "ABC-1")
+        sh("git", "-C", self.project, "fetch", "--prune", "origin")
         rc, out = self.q("retry", "ABC-1")
         st = self.status()
         self.assertEqual((rc, st["status"], st["stage"]), (0, "queued", "implement"), out)
         self.assertNotIn("base_sha", st)
         self.assertNotIn("sha", st)
-        # The redone work would start at the base again, so ending it on ABC-1 would
-        # drop the first go's pushed commits: refused, with what to do.
-        rc, out = self.run_queue("--push", "0")
-        st = self.status()
-        self.assertEqual(st["status"], "blocked", out)
-        self.assertIn("has commits that main does not", st["reason"])
-        self.assertIn("--start ABC-1", st["reason"])
-        sh("git", "-C", self.remote, "branch", "-D", "ABC-1")
-        sh("git", "-C", self.project, "branch", "-D", "ABC-1")
-        sh("git", "-C", self.project, "fetch", "--prune", "origin")
-        rc, out = self.q("retry", "ABC-1")
-        self.assertEqual(rc, 0, out)
         rc, out = self.run_queue("--push", "0")
         self.assertEqual(self.status()["status"], "done", out)
-        self.assertEqual(cat(os.path.join(self.state, "ABC-1", "log.md")).count(" cloned "), 2)   # the refused go did not clone
+        self.assertEqual(cat(os.path.join(self.state, "ABC-1", "log.md")).count(" cloned "), 2)
+
+    def test_retry_of_a_pushed_ticket_is_refused_only_where_it_starts_over(self):
+        self.add("ABC-1")
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done")
+        q = tq.Queue(self.state)
+        why = tq.retry_choices(q, st)
+        self.assertEqual({s for s, w in why.items() if not w}, {"implement", "review", "push"}, why)
+        self.assertIn("has commits that main does not", why[None])
+        self.assertIn("has commits that main does not", why["plan"])
+        self.assertIn("no Must fix items", why["fix"])
+        self.assertEqual(tq.retry_choices(q, st, fetch=True), why)
+        # a ticket an earlier retry sent back to the start (its work gone) blocked at
+        # setup over the pushed branch: every stage would start over, all refused
+        tq.requeue(q, "ABC-1", ("done",), stage="plan", fresh=True)
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("has commits that main does not", st["reason"])
+        why = tq.retry_choices(q, st)
+        self.assertTrue(all(why.values()), why)
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("delete it (here and on the remote, then git fetch --prune), or remove ABC-1 and add it "
+                      "again with --start ABC-1", out)
+        self.assertEqual(self.status(), st)
 
     def test_task_files_are_kept_out_of_the_vaults_git(self):
         tickets = os.path.join(self.vault, "wiki", "notes", "tickets")
@@ -1514,6 +1541,13 @@ class StartAndBranchTest(Base):
         rc, out = self.run_queue()
         self.assertEqual(self.status()["status"], "done", out)
         self.assertEqual(self.remote_parent("feat"), feat)                    # a fast-forward of feat
+        # done and pushed, but its start is the branch: going again from the start loses nothing
+        first = sh("git", "-C", self.remote, "rev-parse", "feat").strip()
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(self.remote_parent("feat"), first)
 
     def test_start_here_in_a_clone_is_the_commit_checked_out(self):
         self.git_p("checkout", "-q", "-b", "wip")
@@ -2002,7 +2036,9 @@ class AddGuardTest(Base):
 class RetryMatrixTest(Base):
     """Every status x (retry, retry --stage S): refused leaving state.json as it was, or
     queued with its counters, reason and last go's results cleared, and a run then
-    takes it to an end (done or plan-review), never stranded."""
+    takes it to an end (done or plan-review), never stranded (a pushed ticket sent
+    back to the start is refused up front, not blocked at setup). The page offers
+    the same: retry_choices refuses exactly what retry does."""
 
     def make(self, status):
         if status == "plan-review":
@@ -2042,7 +2078,9 @@ class RetryMatrixTest(Base):
                         self.make(status)
                         before = self.status()
                         self.assertEqual(before["status"], status.replace("running-orphan", "running"))
+                        offered = not tq.retry_choices(tq.Queue(self.state), before)[stage]
                         rc, out = self.q("retry", "ABC-1", *(("--stage", stage) if stage else ()))
+                        self.assertEqual(offered, rc == 0, out)
                         st = self.status()
                         if rc:
                             self.assertEqual({k: v for k, v in st.items() if k != "updated"},
@@ -2055,10 +2093,6 @@ class RetryMatrixTest(Base):
                             self.assertNotIn(k, st)
                         rc, out = self.run_queue()
                         end = self.status()
-                        if end["status"] == "blocked" and "branch ABC-1 has commits that" in end["reason"]:
-                            # a pushed ticket from the start would drop its pushed commits: the setup refuses
-                            table.append((status, stage or "-", f"queued at {st['stage']} -> blocked: pushed branch"))
-                            continue
                         self.assertIn(end["status"], want.values(), out + str(end.get("reason")))
                         table.append((status, stage or "-", f"queued at {st['stage']} -> {end['status']}"))
                     finally:

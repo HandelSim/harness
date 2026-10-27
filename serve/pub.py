@@ -1270,7 +1270,8 @@ def make_handler(cfg):
             self.redirect(f"/runs/{quote(bits[0])}#end")
 
         def queue_post(self, action, user):
-            """The queue page's forms: add tickets, start the run, halt it."""
+            """The queue page's forms: add tickets, start the run (from a ticket's page
+            too: back=KEY), halt it."""
             if action not in runs_view.QUEUE_ACTIONS or not cfg.runs.queue_dir:
                 self.send(404, b"not found\n")
                 return
@@ -1287,10 +1288,12 @@ def make_handler(cfg):
                 self.send_runs(409, "harness: queue", runs_view.render_queue_page(cfg.runs, form=form, err=msg),
                                runs_view.LIVE_JS, active="queue")
                 return
+            key = (form.get("back") or [""])[0]   # started from a ticket's page: back there
+            back = f"/runs/ticket/{quote(key)}" if runs_view.KEY_RE.match(key) else "/runs/queue"
             if not ok:
-                self.refused(msg, "/runs/queue", "Back to the queue")
+                self.refused(msg, back, "Back to the ticket" if back != "/runs/queue" else "Back to the queue")
                 return
-            self.redirect(f"/runs/queue?done={quote(msg[:500])}")
+            self.redirect(f"{back}?done={quote(msg[:500])}")
 
         def ticket_post(self, key, action, user):
             """The ticket's buttons: answer the plan's questions, approve the plan,

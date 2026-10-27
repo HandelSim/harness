@@ -31,7 +31,8 @@ control room: its runner, its tickets, and every action harness queue has.
   POST /runs/ticket/<KEY>/answer|approve|retry|stop|remove|move|note
                               harness queue's own commands for the ticket
   POST /runs/queue/add|start|halt
-                              add tickets; start `harness queue run` detached; halt it
+                              add tickets; start `harness queue run` detached (back=KEY:
+                              back to that ticket's page); halt it
 
 Each source is a data directory holding opencode/opencode.db and harness/live/ (the
 markers and inboxes agents/live-run.sh keeps). The databases are opened read-only.
@@ -83,6 +84,19 @@ PRESET_LABELS = (("full", "Full", "plan, implement, review, fix, push"),
 MOVES = ("up", "down", "top", "bottom")
 
 esc = html.escape
+_TQ = []   # scripts/ticket_queue.py as a module, loaded on first use; [None] when it cannot be
+
+
+def _tq():
+    """The queue's own module, for the rules it applies (where a retry may go), or None."""
+    if not _TQ:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(QUEUE_SCRIPT)))
+            import ticket_queue
+            _TQ.append(ticket_queue)
+        except Exception:   # an older or broken checkout: the page offers what it did before
+            _TQ.append(None)
+    return _TQ[0]
 
 STYLE = """
 /* The run viewer and queue: neutral greys, one indigo accent, status colours that mean one
@@ -682,6 +696,20 @@ class Runs:
                 # window closed): a run takes it again at its stage
                 out.update(status="interrupted", stopping=False, run_going=r["running"])
         return out
+
+    def retry_choices(self, key):
+        """{stage: why the queue refuses a retry there, or ""}, None the plain retry:
+        ticket_queue.retry_choices on state.json as it is (the remotes as last
+        fetched). None when the queue's module or the state cannot be read."""
+        tq = _tq()
+        if tq is None:
+            return None
+        try:
+            q = tq.Queue(self.queue_dir)
+            st = q.load(key)
+            return tq.retry_choices(q, st) if isinstance(st, dict) else None
+        except Exception:   # a hand-edited state.json: every stage, and the queue says no where it must
+            return None
 
     def vault_of(self, st):
         """The vault the queue ran the ticket with (it may not be the one this
@@ -1397,7 +1425,8 @@ def _ticket_row(runs, key, st, i, n, now):
             f"<div class='ra'>{''.join(acts)}</div></div>")
 
 
-def _runner_card(runs, r, now):
+def _runner_card(runs, r, now, back=""):
+    """The runner: what it is on, or the Start form (back: the ticket page it is on)."""
     parts = ["<section class='panel runner'>"]
     if r["running"]:
         mode = "host, single message" if r["single"] else "host" if r["host"] else "container"
@@ -1426,11 +1455,13 @@ def _runner_card(runs, r, now):
         if out:
             parts.append(f"<pre class='qlog facts-row'>{esc(out)}</pre>")
     else:
+        waits = (f"{esc(back)} waits until a run takes it; tickets go one at a time, in the queue's order."
+                 if back else "Tickets wait until a run takes them, one at a time, in this order.")
         parts.append("<div class='state'><span class='sdot'></span><div><h2>Queue not running</h2>"
-                     "<div class='muted'>Tickets wait until a run takes them, one at a time, in this order.</div>"
-                     "</div></div>")
+                     f"<div class='muted'>{waits}</div></div></div>")
         parts.append("<form method='post' action='/runs/queue/start' class='startf' "
                      "data-confirm-host='Host mode runs the agents as you, with no container and no firewall. Start?'>"
+                     + (_hidden("back", back) if back else "") +
                      "<div class='checks'><label><input type='radio' name='mode' value='container' checked> container</label>"
                      "<label><input type='radio' name='mode' value='host'> host</label>"
                      "<label><input type='radio' name='mode' value='single'> host, single message</label></div>"
@@ -1680,18 +1711,10 @@ def _t_acts(runs, key, st, rows, live, pos, n):
         parts.append(f"<a class='btn primary' href='/runs/{quote(r['id'])}'>Watch and message the agent &rarr;</a>")
     if status == "plan-review":
         parts.append(_btn(base + "approve", "Approve the plan", "primary"))
-    if status == "interrupted" and not st.get("run_going"):
-        parts.append("<a class='btn primary' href='/runs/queue'>Start the queue &rarr;</a>")
     if _stuck(st):
         parts.append(_end_btn())
     if status in RETRYABLE:
-        opts = "".join(f"<option value='{s}'{' selected' if s == st.get('stage') else ''}>{s}</option>"
-                       for s in STAGES)
-        label = {"blocked": "Retry", "needs-answers": "Plan again without answering", "stopped": "Resume",
-                 "done": "Run again", "interrupted": "Queue again"}[status]
-        parts.append(f"<form method='post' action='{base}retry'><button type='submit'>{label}</button>"
-                     f"<label class='muted'>from <select name='stage' aria-label='stage'><option value=''>"
-                     f"{'where it was' if status != 'done' else 'the start'}</option>{opts}</select></label></form>")
+        parts.append(_t_retry(runs, key, st))
     if status in STOPPABLE and not st.get("stopping"):
         parts.append(_btn(base + "stop", "Stop", "warn", confirm=f"Stop {key}?" + (
             " Its agent is stopped now; Resume takes it again." if status == "running" else "")))
@@ -1707,6 +1730,34 @@ def _t_acts(runs, key, st, rows, live, pos, n):
                       confirm=f"Remove {key}? Its " + ("outputs and log are deleted (the project and its "
                               "branch stay)." if st.get("in_place") else "clone, outputs and log are deleted.")))
     return f"<div class='acts'>{''.join(parts)}</div>"
+
+
+def _t_retry(runs, key, st):
+    """The retry form: from where it was (or the start) and each stage the queue
+    would take it at (its own retry_refused); why not, when it takes none."""
+    status = st.get("status", "")
+    label = {"blocked": "Retry", "needs-answers": "Plan again without answering", "stopped": "Resume",
+             "done": "Run again", "interrupted": "Queue again"}[status]
+    why = runs.retry_choices(key) or dict.fromkeys((None,) + STAGES, "")   # unknown: all, the queue still says no
+    stages = [s for s in STAGES if not why.get(s)]
+    if why.get(None) and not stages:
+        return f"<span class='muted'>{esc(label)}: {esc(why[None])}</span>"
+    opts = "".join(f"<option value='{s}'{' selected' if s == st.get('stage') else ''}>{s}</option>" for s in stages)
+    if not why.get(None):
+        opts = f"<option value=''>{'where it was' if status != 'done' else 'the start'}</option>" + opts
+    pick = f"<label class='muted'>from <select name='stage' aria-label='stage'>{opts}</select></label>" if stages else ""
+    note = f"<span class='muted'>not {'from where it was' if status != 'done' else 'from the start'}: " \
+           f"{esc(why[None])}</span>" if why.get(None) else ""
+    return (f"<form method='post' action='/runs/ticket/{quote(key)}/retry'><button type='submit'>{label}</button>"
+            f"{pick}</form>{note}")
+
+
+def _t_start(runs, key, st, r, now):
+    """The queue's Start form (the queue page's own), on a ticket a run would take
+    when none is going: an approve, answer or retry never starts one by itself."""
+    if st.get("status") not in ("queued", "interrupted") or r["running"]:
+        return ""
+    return _runner_card(runs, r, now, back=key)
 
 
 def _t_questions(runs, key, st):
@@ -1864,7 +1915,8 @@ def ticket_live(runs, key):
     pos = listed.index(key) + 1 if key in listed else 0
     n = len([k for k in listed if k in order])
     regions = {"head": _t_head(runs, key, st, pos, n), "acts": _t_acts(runs, key, st, rows, live, pos, n),
-               "qs": _t_questions(runs, key, st), "sessions": _t_sessions(runs, key, st, rows, live, outs, now),
+               "start": _t_start(runs, key, st, runs.runner(now), now), "qs": _t_questions(runs, key, st),
+               "sessions": _t_sessions(runs, key, st, rows, live, outs, now),
                "attempts": _t_attempts(key, st, {o[0] for o in outs}), "notes": _t_notes(key, st),
                "outs": _t_outs(key, outs, now), "docs": _t_docs(runs, key, st, log), "nav": nav(runs, "queue")}
     return {"sig": _sig(regions), "regions": regions}
@@ -1878,7 +1930,7 @@ def render_ticket(runs, key, msg="", bad=False):
     return key, [_live_tag(f"/runs/ticket/{quote(key)}/live", d["sig"]),
                  f"<div id='r-head' class='stack'>{g['head']}</div>", _flash(msg, bad),
                  f"<section class='panel' id='r-acts'>{g['acts']}</section>",
-                 f"<div id='r-qs'>{g['qs']}</div>",
+                 f"<div id='r-start'>{g['start']}</div>", f"<div id='r-qs'>{g['qs']}</div>",
                  "<div class='wide'><div class='stack'>"
                  f"<section class='panel' id='r-sessions'>{g['sessions']}</section>"
                  f"<section class='panel' id='r-attempts'>{g['attempts']}</section>"
@@ -1940,6 +1992,16 @@ def _queue(runs, args, text=None):
     return True, "; ".join(x.replace("[queue] ", "", 1) for x in lines[-3:])
 
 
+def _waits(runs, key, res):
+    """An answer, approve or retry that queued the ticket with no run going or
+    starting: say so (the ticket page shows Start the queue; nothing starts by itself)."""
+    ok, msg = res
+    r = runs.runner()
+    if ok and runs.ticket_state(key).get("status") == "queued" and not (r["running"] or r["starting"]):
+        msg += "; the queue is not running: Start the queue below takes it"
+    return ok, msg
+
+
 def ticket_action(runs, key, action, form):
     """A ticket's button, through the queue script as harness queue does it.
     Returns (ok, message)."""
@@ -1958,11 +2020,11 @@ def ticket_action(runs, key, action, form):
         if not text:
             return False, "nothing to send: answer a question, or choose Go with the defaults"
         go = ["--go"] if _one(form, "defaults").strip() else []   # took the defaults: no plan review
-        return _queue(runs, ["answer", key, "--vault", vault, "--stdin"] + go, text)
+        return _waits(runs, key, _queue(runs, ["answer", key, "--vault", vault, "--stdin"] + go, text))
     if action == "approve":
         if status != "plan-review":
             return False, f"{key} is {status}, not a plan waiting for approval{again}"
-        return _queue(runs, ["approve", key])
+        return _waits(runs, key, _queue(runs, ["approve", key]))
     if action == "retry":
         stage = _one(form, "stage")
         if stage and stage not in STAGES:
@@ -1970,7 +2032,7 @@ def ticket_action(runs, key, action, form):
         if status not in RETRYABLE:
             return False, (f"{key} is {status}; only a blocked, stopped, done, waiting or interrupted ticket "
                            f"is retried{again}")
-        return _queue(runs, ["retry", key] + (["--stage", stage] if stage else []))
+        return _waits(runs, key, _queue(runs, ["retry", key] + (["--stage", stage] if stage else [])))
     if action == "stop":
         if status not in STOPPABLE:
             return False, f"{key} is {status}; there is nothing to stop"
