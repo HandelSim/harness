@@ -236,10 +236,24 @@ class AccessGateTest(LiveServer):
         self.assertGreaterEqual(len(self.cookie_of(r).split("=", 1)[1]), 43)   # 32 random bytes
         r, body = self.req(port, "GET", "/", {"Cookie": self.cookie_of(r)})
         self.assertEqual(r.status, 200)
-        self.assertIn(b"signed in as <b>alice</b>", body)
+        self.assertIn(b"title='signed in as alice'", body)
         self.assertIn(b"New page", body)
         self.assertIn(b"opencode:s3cret@", body)
         self.assertIn("form-action 'self'", r.getheader("Content-Security-Policy"))
+
+    def test_live_poll_signed_out_gets_401_json_not_the_login_page(self):
+        port = self.gated()
+        r, body = self.req(port, "GET", "/live", {"X-Harness-Live": "1"})
+        self.assertEqual(r.status, 401)
+        self.assertEqual(json.loads(body), {"auth": False})
+        r, _ = self.req(port, "GET", "/runs/queue/live", {"X-Harness-Live": "1"})
+        self.assertEqual(r.status, 401)
+        r, _ = self.req(port, "GET", "/live")     # a browser's plain visit still goes to the sign-in page
+        self.assertEqual(r.status, 303)
+        r, _ = self.login(port, self.alice)
+        r, body = self.req(port, "GET", "/live", {"Cookie": self.cookie_of(r), "X-Harness-Live": "1"})
+        self.assertEqual(r.status, 200)
+        self.assertIn("New page", json.loads(body)["regions"]["main"])
 
     def test_secure_cookie_uses_host_prefix(self):
         port = self.gated(secure_cookie=True)
@@ -325,7 +339,7 @@ class AccessGateTest(LiveServer):
         self.assertEqual(r.status, 200)
         self.assertEqual(r.getheader("X-Harness-User"), "bob")
         r, body = self.req(port, "GET", "/", {"Cookie": cookie, "X-Harness-User": "alice"})
-        self.assertIn(b"signed in as <b>bob</b>", body)
+        self.assertIn(b"title='signed in as bob'", body)
 
     def test_forward_auth_without_codes_is_open_and_names_nobody(self):
         port = self.start()
@@ -459,7 +473,7 @@ class CommandLineTest(LiveServer):
         c.request("GET", "/", headers={"Host": "pub.example.test", "Cookie": cookie})
         text = c.getresponse().read().decode()
         c.close()
-        for want in ("signed in as <b>alice</b>", "href='https://code.example.test/'", "<code>slim</code>",
+        for want in ("title='signed in as alice'", "href='https://code.example.test/'", "<code>slim</code>",
                      "Usage, last 24 h", "<span class='down'>down</span>"):
             self.assertIn(want, text)
         self.assertNotIn("s3cret", text)
@@ -608,6 +622,59 @@ class IndexContentTest(LiveServer):
         self.assertFalse(sent & {"cookie", "authorization"}, sent)
         self.get(port, "/")
         self.assertEqual(len(seen), 1)                # cached
+
+
+class HomeLiveTest(LiveServer):
+    def test_home_is_live_and_its_regions_match_the_page(self):
+        port = self.start()
+        r, body = self.get(port, "/")
+        text = body.decode()
+        self.assertIn("id='live'", text)
+        self.assertIn("data-live='/live'", text)
+        self.assertIn("id='r-main'", text)
+        self.assertIn("id='fresh'", text)
+        self.assertIn("aria-current='page'>Home", text)
+        nonce = re.search(r"script-src 'nonce-([^']+)'", r.getheader("Content-Security-Policy")).group(1)
+        self.assertIn(f"<script nonce='{nonce}'>", text)
+        sig = re.search(r"data-sig='([^']+)'", text).group(1)
+        r, body = self.get(port, "/live")
+        d = json.loads(body)
+        self.assertEqual(d["sig"], sig)                  # nothing changed: the first poll swaps nothing
+        self.assertIn(d["regions"]["main"], text)
+        self.assertIsNone(r.getheader("X-Harness-Stale"))
+
+    def test_filter_carries_into_the_poll(self):
+        port = self.start()
+        _, body = self.get(port, "/?q=new")
+        self.assertIn("data-live='/live?q=new'", body.decode())
+        _, body = self.get(port, "/live?q=new")
+        main = json.loads(body)["regions"]["main"]
+        self.assertIn("New page", main)
+        self.assertNotIn("Old &amp; page", main)
+
+    def test_vault_switch_shows_without_restart(self):
+        state = os.path.join(self.tmp.name, "state")
+        other = os.path.join(state, "vaults", "work")
+        os.makedirs(os.path.join(other, "pub"))
+        with open(os.path.join(other, "pub", "w.html"), "w") as f:
+            f.write("<title>Work page</title>")
+        port = self.start(state_dir=state)
+        _, body = self.get(port, "/live")
+        self.assertIn("New page", json.loads(body)["regions"]["main"])
+        with open(os.path.join(state, "vault.active"), "w") as f:
+            f.write("work\n")
+        time.sleep(pub.VAULT_TTL + 0.2)
+        _, body = self.get(port, "/live")
+        d = json.loads(body)["regions"]
+        self.assertIn("Work page", d["main"])
+        self.assertIn("<b>work</b>", d["top"])
+
+    def test_stale_header_once_serve_code_changes(self):
+        cfg = pub.Config(0, self.vault, "brain", 0, self.pwfile, ())
+        self.assertFalse(cfg.code_changed())
+        cfg.started_code -= 100
+        cfg._code_seen = (0.0, False)
+        self.assertTrue(cfg.code_changed())
 
 
 class OpencodeLinkTest(unittest.TestCase):

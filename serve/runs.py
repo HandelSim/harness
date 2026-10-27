@@ -110,6 +110,15 @@ STYLE = """
 .runchip b { color: var(--ink); font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 .runchip:hover { text-decoration: none; border-color: var(--line-2); }
 main.rv { max-width: 1280px; gap: 18px; padding-top: 22px; }
+.fresh { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; min-width: 0; max-width: 46ch; }
+.fresh::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
+.fresh.warn { color: var(--wait); } .fresh.warn::before { background: var(--wait); }
+.fresh.bad { color: var(--bad); } .fresh.bad::before { background: var(--bad); }
+.fresh[hidden] { display: none; }
+.bar-who { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.bar-who span { max-width: 14ch; overflow: hidden; text-overflow: ellipsis; }
+.bar .bar-who button { padding: 4px 9px; font-size: 12.5px; }
 .ph { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap; min-width: 0; }
 .ph h1 { font-size: 22px; font-weight: 680; letter-spacing: -.01em; overflow-wrap: anywhere; }
 .ph .sub { flex-basis: 100%; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
@@ -341,7 +350,10 @@ details.doc summary .muted { font-weight: 400; }
   .grid2, .presets.two { grid-template-columns: minmax(0, 1fr); }
   .runchip .rtxt { display: none; }
   .tabs a { padding: 6px 8px; }
-  .bar-in { gap: 8px; }
+  .bar-in { gap: 4px 8px; height: auto; min-height: 52px; flex-wrap: wrap; padding-top: 8px; padding-bottom: 6px; }
+  .bar-mid { order: 3; flex-basis: 100%; overflow-x: auto; }
+  .bar-who span { display: none; }
+  .fresh { max-width: 22ch; margin-left: auto; }
   .tk .pos { display: none; } .tk { grid-template-columns: minmax(0, 1fr) auto; }
   .tk .strip, .tk .ra { grid-column: 1 / -1; } .tk .when { grid-column: 2; }
   main.rv { padding-top: 16px; }
@@ -424,17 +436,22 @@ class Source:
 class Runs:
     def __init__(self, sources, queue_dir="", vault="", harness="", project_dir=""):
         """sources: (label, data dir) pairs; queue_dir: harness queue's state/queue;
-        vault: the active vault (the plans, reviews and answers are there);
+        vault: the active vault (the plans, reviews and answers are there): a path,
+        or an object whose get() gives (path, name) now;
         harness: the harness script the Start button runs `queue run` with;
         project_dir: the folder harness serve was started in."""
         self.sources = [Source(label, d) for label, d in sources]
         self.queue_dir = queue_dir
-        self.vault = vault
+        self._vault = vault
         self.harness = harness or HARNESS
         self.project_dir = project_dir
         self.launched = None        # the `harness queue run` this viewer started: (Popen, started at)
         self._in_place = {}         # KEY: (state.json stat, project, launch windows) of in-place tickets
         self.launch_lock = threading.RLock()
+
+    @property
+    def vault(self):
+        return self._vault.get()[0] if hasattr(self._vault, "get") else self._vault
 
     # --- reading -------------------------------------------------------------
 
@@ -1110,21 +1127,26 @@ def stage_strip(st, big=False):
     return f"<ol class='strip{' big' if big else ''}' aria-label='stages'>{''.join(items)}</ol>"
 
 
-def nav(runs, active=""):
-    """The sticky bar's live part: tabs (Queue, with how many tickets wait on you;
-    Sessions) and the runner chip."""
+TABS = (("home", "/", "Home"), ("queue", "/runs/queue", "Queue"), ("sessions", "/runs", "Sessions"))
+
+
+def nav(runs, active="", tabs=TABS):
+    """The sticky bar's live part: tabs (Queue, with how many tickets wait on you)
+    and the runner chip."""
     waiting = 0
-    if runs.queue_dir:
+    if runs and runs.queue_dir:
         for k in runs.ticket_keys():
             if runs.ticket_state(k).get("status") in WAITING + ("interrupted",):
                 waiting += 1
     badge = f" <span class='badge' title='waiting on you'>{waiting}</span>" if waiting else ""
-    def on(name):
-        return " class='on' aria-current='page'" if active == name else ""
-    tabs = (f"<div class='tabs'><a href='/runs/queue'{on('queue')}>Queue{badge}</a>"
-            f"<a href='/runs'{on('sessions')}>Sessions</a></div>")
+    links = []
+    for name, href, label in tabs:
+        if name in ("queue", "sessions") and not runs:
+            continue
+        on = " class='on' aria-current='page'" if active == name else ""
+        links.append(f"<a href='{href}'{on}>{label}{badge if name == 'queue' else ''}</a>")
     chip = ""
-    if runs.queue_dir:
+    if runs and runs.queue_dir:
         r = runs.runner()
         if r["running"]:
             what = "between tickets"
@@ -1141,12 +1163,18 @@ def nav(runs, active=""):
         else:
             chip = ("<a class='runchip' href='/runs/queue'><span class='sdot'></span>"
                     "<span class='rtxt'>queue idle</span></a>")
-    return f"{tabs}<div class='bar-right'>{chip}</div>"
+    return f"<div class='tabs'>{''.join(links)}</div><div class='bar-right'>{chip}</div>"
 
 
-def nav_bar(runs, active=""):
+def nav_bar(runs, active="", user=None, tabs=TABS):
+    """The bar on every page: logo, live tabs and runner chip (#r-nav), how fresh the
+    page is (#fresh, kept by the polling script) and who is signed in."""
+    who = (f"<form method='post' action='/logout' class='bar-who'><span title='signed in as {esc(user)}'>{esc(user)}"
+           "</span><button type='submit' class='ghost'>Log out</button></form>") if user else ""
     return ("<nav class='bar'><div class='bar-in'><a class='logo' href='/'>harness</a>"
-            f"<div id='r-nav' class='bar-mid'>{nav(runs, active)}</div></div></nav>")
+            f"<div id='r-nav' class='bar-mid'>{nav(runs, active, tabs)}</div>"
+            "<span id='fresh' class='fresh' role='status' aria-live='polite' hidden></span>"
+            f"{who}</div></nav>")
 
 
 def _live_tag(url, sig):
@@ -2015,8 +2043,8 @@ def live_summary(runs):
         parts.append("</ul>")
     else:
         parts.append("<div class='muted'>No headless run is working right now.</div>")
-    parts.append("<a href='/runs/queue'>The queue</a> &middot; "
-                 "<a href='/runs'>All sessions, transcripts and queue stages &rarr;</a></section>")
+    parts.append("<div class='muted'><a href='/runs/queue'>The queue</a> &middot; "
+                 "<a href='/runs'>All sessions, transcripts and queue stages &rarr;</a></div></section>")
     return parts
 
 
@@ -2116,6 +2144,95 @@ COMMON_JS = """
   window.addEventListener('pageshow', function () {
     document.querySelectorAll('[data-busy]').forEach(function (b) { b.disabled = false; b.removeAttribute('data-busy'); });
   });
+  // The top bar's freshness note: 'ok' after each good poll, 'off' when a
+  // poll failed, 'auth' when the session ended. A page that polls calls it;
+  // a page that does not shows nothing.
+  var fresh = document.getElementById('fresh'), okAt = 0, state = '', stale = false;
+  function paint() {
+    if (!fresh || !state) return;
+    var age = okAt ? Math.round((Date.now() - okAt) / 1000) : 0, t = '', c = 'fresh';
+    if (state === 'auth') { fresh.innerHTML = 'signed out &middot; <a href="/login">sign in</a>'; fresh.className = 'fresh bad'; fresh.hidden = false; return; }
+    if (state === 'off') { t = 'offline \\u00b7 retrying' + (okAt ? ' \\u00b7 last update ' + ago(age) : ''); c += ' bad'; }
+    else t = age < 20 ? 'live' : 'updated ' + ago(age);
+    if (stale) { t += ' \\u00b7 harness changed on disk: restart harness serve'; c += ' warn'; }
+    fresh.textContent = t; fresh.className = c; fresh.hidden = false;
+  }
+  function ago(s) { return s < 90 ? s + ' s ago' : s < 5400 ? Math.round(s / 60) + ' min ago' : Math.round(s / 3600) + ' h ago'; }
+  window.hFresh = function (s) { state = s; if (s === 'ok') okAt = Date.now(); paint(); };
+  setInterval(paint, 1000);
+  // fetch for the live JSON: rejects with 'auth' when the session ended (the
+  // server answers 401, or a proxy sent the login page) and 'off' otherwise.
+  window.hFetch = function (url) {
+    return fetch(url, {credentials: 'same-origin', cache: 'no-store', headers: {'X-Harness-Live': '1'}}).then(function (r) {
+      var ct = r.headers.get('Content-Type') || '';
+      if (r.status === 401 || r.redirected || (r.ok && ct.indexOf('json') < 0)) throw 'auth';
+      if (!r.ok) throw 'off';
+      stale = r.headers.get('X-Harness-Stale') === '1';
+      return r.json();
+    }).then(function (d) { window.hFresh('ok'); return d; }, function (e) {
+      window.hFresh(e === 'auth' ? 'auth' : 'off');
+      throw e;
+    });
+  };
+  // Replace a region's HTML but keep any form in it that is being filled in
+  // (a changed field or the focus), matched to the new HTML's form by action
+  // and position. Returns false, changing nothing, when a kept form has no
+  // place in the new HTML or a changed field is outside any form.
+  function changed(x) {
+    if (x.type === 'hidden' || x.type === 'submit' || x.type === 'button') return false;
+    if (x.type === 'checkbox' || x.type === 'radio') return x.checked !== x.defaultChecked;
+    if (x.tagName === 'SELECT') {
+      for (var j = 0; j < x.options.length; j++) if (x.options[j].selected !== x.options[j].defaultSelected) return true;
+      return false;
+    }
+    return x.value !== x.defaultValue;
+  }
+  function busy(el) {
+    var a = document.activeElement;
+    if (a && a !== document.body && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return true;
+    var f = el.querySelectorAll('input, textarea, select');
+    for (var i = 0; i < f.length; i++) if (changed(f[i])) return true;
+    return false;
+  }
+  function keys(root) {
+    var n = {}, out = [];
+    root.querySelectorAll('form').forEach(function (f) {
+      var k = (f.getAttribute('action') || '') + '|' + (f.id || '');
+      n[k] = (n[k] || 0) + 1;
+      out.push([k + '#' + n[k], f]);
+    });
+    return out;
+  }
+  window.hSwap = function (r, html) {
+    var keep = {}, any = false, loose = false;
+    keys(r).forEach(function (p) { if (busy(p[1])) { keep[p[0]] = p[1]; any = true; } });
+    r.querySelectorAll('input, textarea, select').forEach(function (x) { if (!x.form && changed(x)) loose = true; });
+    if (loose) return false;
+    var tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    if (any) {
+      var slots = {};
+      keys(tmp).forEach(function (p) { slots[p[0]] = p[1]; });
+      for (var k in keep) if (!slots[k]) return false;
+      var a = document.activeElement, s = null, top = 0;
+      if (a && r.contains(a)) { try { s = [a.selectionStart, a.selectionEnd]; } catch (e) {} top = a.scrollTop; } else a = null;
+      for (k in keep) slots[k].parentNode.replaceChild(keep[k], slots[k]);
+    }
+    var open = {};
+    r.querySelectorAll('details[data-k]').forEach(function (d) { open[d.getAttribute('data-k')] = d.open; });
+    tmp.querySelectorAll('details[data-k]').forEach(function (d) {
+      var n = d.getAttribute('data-k');
+      if (n in open) d.open = open[n];
+    });
+    while (r.firstChild) r.removeChild(r.firstChild);
+    while (tmp.firstChild) r.appendChild(tmp.firstChild);
+    if (a && document.contains(a)) {
+      a.focus({preventScroll: true});
+      if (s && s[0] != null) try { a.setSelectionRange(s[0], s[1]); } catch (e) {}
+      a.scrollTop = top;
+    }
+    return true;
+  };
   if (/[?&]done=/.test(location.search) && history.replaceState)
     history.replaceState(null, '', location.pathname + location.hash);
   var add = document.getElementById('addform');
@@ -2165,55 +2282,33 @@ COMMON_JS = """
 })();
 """.replace("%PRESETS%", json.dumps({k: list(v) for k, v in PRESETS.items()}))
 
-# The queue, ticket and sessions pages: poll the page's live JSON every 3 s and
-# swap the regions that changed. A region with a field being typed in (or edited
-# and not sent) is left alone until it is not; open <details> stay open. No
-# polling while the tab is hidden.
+# The home, queue, ticket and sessions pages: poll the page's live JSON every 3 s
+# and swap the regions that changed (hSwap keeps a form being filled in and open
+# <details>). No polling while the tab is hidden.
 LIVE_JS = """
 (function () {
   var tag = document.getElementById('live');
   if (!tag) return;
-  var url = tag.getAttribute('data-live'), sig = tag.getAttribute('data-sig'), last = {}, timer = null, fails = 0;
-  function dirty(r) {
-    var a = document.activeElement;
-    if (a && a !== document.body && r.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return true;
-    var f = r.querySelectorAll('input, textarea, select');
-    for (var i = 0; i < f.length; i++) {
-      var x = f[i];
-      if (x.type === 'hidden' || x.type === 'submit') continue;
-      if (x.type === 'checkbox' || x.type === 'radio') { if (x.checked !== x.defaultChecked) return true; }
-      else if (x.tagName === 'SELECT') {
-        for (var j = 0; j < x.options.length; j++) if (x.options[j].selected !== x.options[j].defaultSelected) return true;
-      } else if (x.value !== x.defaultValue) return true;
-    }
-    return false;
-  }
+  var url = tag.getAttribute('data-live'), sig = tag.getAttribute('data-sig'), last = {}, seeded = false,
+    timer = null, fails = 0;
+  window.hFresh('ok');
   function apply(regions) {
     Object.keys(regions).forEach(function (k) {
       var r = document.getElementById('r-' + k), h = regions[k];
-      if (!r || last[k] === h || dirty(r)) return;
-      var open = {};
-      r.querySelectorAll('details[data-k]').forEach(function (d) { open[d.getAttribute('data-k')] = d.open; });
-      r.innerHTML = h;
-      last[k] = h;
-      r.querySelectorAll('details[data-k]').forEach(function (d) {
-        var n = d.getAttribute('data-k');
-        if (n in open) d.open = open[n];
-      });
+      if (r && last[k] !== h && window.hSwap(r, h)) last[k] = h;
     });
   }
   function later(ms) { clearTimeout(timer); timer = document.hidden ? null : setTimeout(tick, ms); }
   function tick() {
     timer = null;
     if (document.hidden) return;
-    fetch(url, {credentials: 'same-origin', cache: 'no-store'}).then(function (r) {
-      if (!r.ok) throw new Error(r.status);
-      return r.json();
-    }).then(function (d) {
+    window.hFetch(url).then(function (d) {
       fails = 0;
       if (d.gone) { location.replace(d.gone); return; }
-      if (d.sig === sig) { if (!last.seeded) { last = d.regions || {}; last.seeded = 1; } }
-      else { sig = d.sig; apply(d.regions || {}); }
+      var regions = d.regions || {};
+      // The page as served is what the first poll would show: nothing to swap.
+      if (!seeded) { seeded = true; if (d.sig === sig) Object.keys(regions).forEach(function (k) { last[k] = regions[k]; }); }
+      apply(regions);
       later(3000);
     }).catch(function () { fails++; later(fails > 3 ? 15000 : 6000); });
   }
@@ -2226,15 +2321,13 @@ POLL_JS = """
 (function () {
   var box = document.getElementById('msgs'), side = document.getElementById('side'), nav = document.getElementById('r-nav');
   if (!box) return;
-  var url = box.getAttribute('data-tail'), follow = box.getAttribute('data-follow'), idle = 0, last = '', navLast = nav ? nav.innerHTML : '';
+  var url = box.getAttribute('data-tail'), follow = box.getAttribute('data-follow'), idle = 0, last = '', navLast = nav ? nav.innerHTML : '', sideLast = null;
+  window.hFresh('ok');
   function nearBottom() { return window.innerHeight + window.scrollY >= document.body.scrollHeight - 160; }
   function tick() {
     if (document.hidden) { setTimeout(tick, 3000); return; }
     var n = box.querySelectorAll('.msg').length, from = Math.max(0, n - 1);
-    fetch(url + '?from=' + from, {credentials: 'same-origin', cache: 'no-store'}).then(function (r) {
-      if (!r.ok) throw new Error(r.status);
-      return r.json();
-    }).then(function (d) {
+    window.hFetch(url + '?from=' + from).then(function (d) {
       var stick = nearBottom();
       if (d.sig !== last) {
         last = d.sig;
@@ -2246,9 +2339,8 @@ POLL_JS = """
         if (none && d.count) none.remove();
         if (stick) window.scrollTo(0, document.body.scrollHeight);
       }
-      var ta = side.querySelector('textarea');
-      if (!ta || (!ta.value && document.activeElement !== ta)) side.innerHTML = d.side;
-      if (nav && d.nav && d.nav !== navLast) { nav.innerHTML = d.nav; navLast = d.nav; }
+      if (d.side !== sideLast && window.hSwap(side, d.side)) sideLast = d.side;
+      if (nav && d.nav && d.nav !== navLast && window.hSwap(nav, d.nav)) navLast = d.nav;
       idle = d.working ? 0 : idle + 1;
       // Following a queue: once this stage's session is done, go to the next one.
       if (follow && !d.working) {

@@ -66,6 +66,7 @@ FAIL_WINDOW = 600            # failed-login window, seconds
 FAIL_PER_CLIENT = 10
 FAIL_GLOBAL = 60
 CACHE_TTL = 5.0
+VAULT_TTL = 2.0
 PAGE_CAP = 200
 LEDGER_TAIL = 5 * 1024 * 1024
 MAX_FORM = 4096
@@ -506,15 +507,54 @@ def vault_log(vault):
     return [row for row in rows if len(row) == 4] or None
 
 
+def code_stamp():
+    """The newest mtime of serve's own code: a later one than at start means harness
+    was updated on disk and this server still runs the old code."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        return max(os.stat(os.path.join(here, n)).st_mtime for n in os.listdir(here) if n.endswith(".py"))
+    except (OSError, ValueError):
+        return 0
+
+
+class ActiveVault:
+    """The vault harness has active now: with state_dir, read from its vault.active on
+    each use (cached VAULT_TTL s), so `harness vault use` shows without a restart; else
+    the one this process was started with."""
+
+    def __init__(self, state_dir="", path="", name=""):
+        self.state_dir, self.fixed = state_dir, (path, name)
+        self._at, self._val = 0.0, ("", "")
+
+    def get(self):
+        if not self.state_dir:
+            return self.fixed
+        now = time.monotonic()
+        if now - self._at > VAULT_TTL:
+            try:
+                with open(os.path.join(self.state_dir, "vault.active"), encoding="utf-8") as f:
+                    name = f.read().strip()
+            except OSError:
+                name = None
+            path = os.path.join(self.state_dir, "vaults", name) if name else ""
+            if name is None or (name and name == self.fixed[1] and self.fixed[0]):
+                val = self.fixed            # as started (its path in the form harness gave it)
+            elif path and os.path.isdir(path):
+                val = (path, name)
+            else:
+                val = ("", name)
+            self._val, self._at = val, now
+        return self._val
+
+
 class Config:
     def __init__(self, port, vault, vault_name, opencode_port, password_file, allow_hosts,
                  access_codes="", secure_cookie=False, opencode_url="", proxy_url="",
                  modes=(), usage_ledger="", trust_forwarded_for=False, agent_data=(), queue_dir="",
-                 harness="", project_dir=""):
+                 harness="", project_dir="", state_dir=""):
         self.port = port
-        self.vault = vault
-        self.vault_name = vault_name
-        self.pub_dir = os.path.join(vault, "pub") if vault else ""
+        self.active = ActiveVault(state_dir, vault, vault_name)
+        self.state_dir = state_dir
         self.opencode_port = opencode_port
         self.password_file = password_file
         self.allowed = {f"{h}:{port}" for h in ("127.0.0.1", "localhost", "[::1]")}
@@ -531,7 +571,29 @@ class Config:
         self.usage_ledger = usage_ledger
         self.trust_forwarded_for = trust_forwarded_for
         self.cache = TTLCache()
-        self.runs = runs_view.Runs(agent_data, queue_dir, vault, harness, project_dir) if agent_data else None
+        self.started_code = code_stamp()
+        self._code_seen = (0.0, False)
+        self.runs = runs_view.Runs(agent_data, queue_dir, self.active, harness, project_dir) if agent_data else None
+
+    def code_changed(self):
+        at, changed = self._code_seen
+        if not changed and time.time() - at > 10:
+            changed = code_stamp() > self.started_code + 1
+            self._code_seen = (time.time(), changed)
+        return changed
+
+    @property
+    def vault(self):
+        return self.active.get()[0]
+
+    @property
+    def vault_name(self):
+        return self.active.get()[1]
+
+    @property
+    def pub_dir(self):
+        v = self.vault
+        return os.path.join(v, "pub") if v else ""
 
     def opencode_password(self):
         if not self.password_file:
@@ -669,6 +731,8 @@ tr:last-child td { border-bottom: 0; }
 .log code { color: var(--accent); }
 .signin { max-width: 400px; width: 100%; margin: 12vh auto 0; }
 @media (max-width: 820px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+.cols.one { grid-template-columns: minmax(0, 1fr); } .stack:empty { display: none; }
+.home-top { display: flex; flex-direction: column; gap: 14px; }
 @media (max-width: 560px) { .launch { grid-template-columns: minmax(0, 1fr); } .go { justify-content: center; }
   .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } .list li { flex-direction: column; gap: 2px; } }
 """
@@ -845,31 +909,36 @@ def _activity(cfg):
     return parts
 
 
-def render_index(cfg, request_host, user=None, query=""):
+def home_regions(cfg, request_host, query=""):
+    """The home page's live parts: the vault and services at the top, then runs,
+    pages and usage beside the prompt modes and vault activity."""
     host = request_host.rsplit(":", 1)[0] if request_host else "127.0.0.1"
-    parts = _head("harness")
-    parts.append("<header class='top'><div class='brand'><h1>harness</h1>")
-    if cfg.vault:
-        parts.append(f"<span class='chip'>vault <b>{esc(cfg.vault_name or cfg.vault)}</b></span>")
-    else:
-        parts.append("<span class='chip'>no vault selected (harness vault use &lt;name&gt;)</span>")
-    parts.append("</div>")
-    if user:
-        parts.append(f"<div class='who'><span>signed in as <b>{esc(user)}</b></span>"
-                     "<form method='post' action='/logout' class='inline'>"
-                     "<button type='submit'>Log out</button></form></div>")
-    parts.append("</header>")
     launch, modes = _services(cfg, host)
-    parts += launch
+    if cfg.vault:
+        vault = f"<span class='chip'>vault <b>{esc(cfg.vault_name or cfg.vault)}</b></span>"
+    else:
+        vault = "<span class='chip'>no vault selected (harness vault use &lt;name&gt;)</span>"
     main = (runs_view.live_summary(cfg.runs) if cfg.runs else []) + \
         (_pages(cfg, query) if cfg.vault else []) + _usage(cfg)
     side = modes + (_activity(cfg) if cfg.vault else [])
-    if main and side:
-        parts += ["<div class='cols'><div class='stack'>"] + main + ["</div><div class='stack'>"] + side + ["</div></div>"]
-    else:
-        parts += main + side
-    parts.append("</main></body></html>")
-    return "".join(parts).encode()
+    regions = {"top": f"<div class='brand'>{vault}</div>" + "".join(launch),
+               "main": "".join(main), "side": "".join(side), "nav": runs_view.nav(cfg.runs, "home")}
+    return regions
+
+
+def home_live(cfg, request_host, query=""):
+    regions = home_regions(cfg, request_host, query)
+    return {"sig": runs_view._sig(regions), "regions": regions}
+
+
+def render_home(cfg, request_host, query=""):
+    """The home page's body parts, for send_runs (which adds the bar and the scripts)."""
+    regions = home_regions(cfg, request_host, query)
+    live = "/live" + (f"?q={quote(query, safe='')}" if query else "")
+    return [runs_view._live_tag(live, runs_view._sig(regions)),
+            f"<div id='r-top' class='home-top'>{regions['top']}</div>",
+            f"<div class='cols{'' if regions['side'] else ' one'}'><div id='r-main' class='stack'>{regions['main']}</div>"
+            f"<div id='r-side' class='stack'>{regions['side']}</div></div>"]
 
 
 def make_handler(cfg):
@@ -905,7 +974,7 @@ def make_handler(cfg):
 
         def send_runs(self, code, title, parts, script="", head=False, active="sessions"):
             nonce = secrets.token_urlsafe(16)
-            bar = runs_view.nav_bar(cfg.runs, active) if cfg.runs else ""
+            bar = runs_view.nav_bar(cfg.runs, active, getattr(self, "user", None))
             body = _head(title, bar) + parts
             body.append(f"<script nonce='{nonce}'>{runs_view.COMMON_JS}{script}</script>")
             body.append("</main></body></html>")
@@ -914,8 +983,10 @@ def make_handler(cfg):
                        "Referrer-Policy": "same-origin"}, head)
 
         def send_json(self, obj, head=False):
-            self.send(200, json.dumps(obj).encode(), "application/json; charset=utf-8",
-                      {"Cache-Control": "no-store"}, head)
+            extra = {"Cache-Control": "no-store"}
+            if cfg.code_changed():
+                extra["X-Harness-Stale"] = "1"
+            self.send(200, json.dumps(obj).encode(), "application/json; charset=utf-8", extra, head)
 
         def oc_link(self):
             return opencode_session_link(cfg, (self.headers.get("Host") or "127.0.0.1").rsplit(":", 1)[0])
@@ -1140,6 +1211,7 @@ def make_handler(cfg):
             # X-Harness-User is only ever set here, from the session; an
             # inbound one is never read.
             sid, user = self.session()
+            self.user = user
             if cfg.codes and not user and path.startswith("/pub/"):
                 for vid in cookie_values(self.headers, cfg.view_cookie_name):
                     user = cfg.sessions.lookup_view(vid)
@@ -1166,15 +1238,23 @@ def make_handler(cfg):
                     self.send_page(200, render_login(cfg), head=head)
                 return
             if cfg.codes and not user:
-                if path == "/":
+                if self.headers.get("X-Harness-Live"):
+                    # the live scripts' polls: say so, rather than redirect to a page they cannot show
+                    self.send(401, b'{"auth": false}', "application/json; charset=utf-8",
+                              {"Cache-Control": "no-store"}, head)
+                elif path == "/":
                     self.send_page(401, render_login(cfg), head=head)
                 else:
                     self.redirect("/login", head=head)
                 return
-            if path == "/":
+            if path in ("/", "/live"):
                 query = (parse_qs(url.query).get("q") or [""])[0].strip()[:200]
-                self.send_page(200, render_index(cfg, self.headers.get("Host", "").lower(), user, query),
-                               head=head)
+                host = self.headers.get("Host", "").lower()
+                if path == "/live":
+                    self.send_json(home_live(cfg, host, query), head)
+                else:
+                    self.send_runs(200, "harness", render_home(cfg, host, query), runs_view.LIVE_JS,
+                                   head, "home")
                 return
             if path == "/runs" or path.startswith("/runs/"):
                 self.runs_get(path, url.query, head)
@@ -1410,6 +1490,9 @@ def main(argv=None):
     ap.add_argument("--harness", default="", metavar="PATH",
                     help="the harness script the queue page's Start runs 'queue run' with "
                          "(default: the one next to this serve/ folder)")
+    ap.add_argument("--state-dir", default="", metavar="DIR",
+                    help="harness's state folder: the active vault is read from its vault.active "
+                         "on each request (--vault is then only the fallback when not given)")
     ap.add_argument("--project-dir", default="", metavar="DIR",
                     help="the folder harness serve was started in: the Add form's project folder "
                          "when it is in a git repository")
@@ -1419,7 +1502,7 @@ def main(argv=None):
                  opencode_url=a.opencode_url, proxy_url=a.proxy_url, modes=a.mode,
                  usage_ledger=a.usage_ledger, trust_forwarded_for=a.trust_forwarded_for,
                  agent_data=a.agent_data, queue_dir=a.queue_dir, harness=a.harness,
-                 project_dir=a.project_dir)
+                 project_dir=a.project_dir, state_dir=a.state_dir)
     if cfg.codes:
         n = len(cfg.codes.entries())
         if not n:

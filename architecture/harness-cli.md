@@ -1243,10 +1243,14 @@ two foreground children:
   modes (`--mode NAME=DESC`, below), last-24h usage from the proxy's ledger
   (`--usage-ledger`, last ~5 MB read), and the vault's last 15 commits.
   These parts are cached for a few seconds. With no vault active the index
-  still comes up with no pages. Layout: the launch panel on top, then pages
-  and usage beside a side column of prompt modes and vault commits (one
-  column below 820 px); inline CSS only, system fonts, light and dark from
-  `prefers-color-scheme`, since the index CSP loads nothing. `/healthz` is a liveness check.
+  still comes up with no pages. The vault is read per request from
+  `state/vault.active` (`--state-dir`, cached 2 s), so `harness vault use`
+  shows without a restart. The index is the Home tab of the shared top bar
+  and live like the run viewer's pages (`/live?q=`: regions `top`, `main`,
+  `side`, `nav`). Layout: the vault and launch panel on top, then runs,
+  pages and usage beside a side column of prompt modes and vault commits
+  (one column below 820 px); inline CSS, system fonts, light and dark from
+  `prefers-color-scheme`. `/healthz` is a liveness check.
 - `opencode serve` on `127.0.0.1:N+1`, with `host_opencode_env` (shared with
   `host_run_opencode`, so the config, overlay and NO_PROXY match `harness
   host`; it unsets `_harness_secret_vars` too, since opencode reaches the
@@ -1315,8 +1319,9 @@ home>/.local/share` and `--agent-data host=${XDG_DATA_HOME:-~/.local/share}`
 (each `LABEL=DIR` holding `opencode/opencode.db` and `harness/live/`; a
 dir with no DB shows nothing, and with no `--agent-data` the viewer is off),
 `--queue-dir state/queue` and `--harness <this script>` (what Start runs;
-default the `harness` next to `serve/`). Pages share one top bar (Queue,
-Sessions, the index) and a neutral dark theme with an indigo accent (light
+default the `harness` next to `serve/`). Pages share one top bar (Home,
+Queue, Sessions; the runner chip; how fresh the page is; who is signed in,
+with Log out) and a neutral dark theme with an indigo accent (light
 from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
 
 - `/runs/queue`: the owner's console. A runner card (running or not, mode,
@@ -1390,9 +1395,17 @@ offered as suggestions. It is taken as pasted: quotes
   is not in a state for it (answers sent twice, approve of a ticket not in
   plan-review). Every POST needs a same-host `Origin` and, when codes are
   on, a session.
-- Live updates: the queue, ticket and session-list pages poll their `/live`
-  JSON every 3 s and swap only the parts whose signature changed, keep text
-  being typed in a form, and pause while the tab is hidden.
+- Live updates: Home and the queue, ticket and session-list pages poll their
+  `/live` JSON every 3 s (a session page its tail) and swap only the parts
+  that changed (`hSwap` in `COMMON_JS`): a form being filled in (a changed
+  field or the focus) is kept in place, with its focus and selection, while
+  the rest of its region updates; open `<details data-k>` stay open; polling
+  pauses while the tab is hidden. The bar's freshness note says `live`,
+  `updated N s ago`, `offline · retrying` or `signed out · sign in`: a poll
+  sends `X-Harness-Live: 1`, and a signed-out one gets 401 JSON instead of
+  the redirect to `/login`. When serve's code on disk is newer than the code
+  it started with, `/live` answers carry `X-Harness-Stale: 1` and the note
+  asks for a restart of `harness serve`.
 - `/runs/follow?since=MS[&queue=1]`: the link a launch opens. It redirects
   (303) to the root session started at or after MS (live first, then still
   working, then newest), or shows a waiting page that polls

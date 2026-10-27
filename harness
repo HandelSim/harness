@@ -7262,6 +7262,7 @@ serve_pub_args() {
         --agent-data "container=$(agent_home_dir)/.local/share"
         --agent-data "host=${XDG_DATA_HOME:-$HOME/.local/share}"
         --queue-dir "$state_root/queue"
+        --state-dir "$state_root"
         --harness "$real_self")
     # The Add form's default project folder: where serve (or the launch that
     # started the viewer) was run.
