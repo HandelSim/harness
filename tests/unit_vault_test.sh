@@ -269,15 +269,20 @@ before=$(git -C "$SYNC" rev-parse HEAD)
 vault_sync "$SYNC" 1761100000000 "$DB" /w >/dev/null 2>&1
 [[ "$(git -C "$SYNC" rev-parse HEAD)" == "$before" ]] || fail "V8: a rerun with nothing new should not commit"
 vault_sync "" 0 "$DB" /w || fail "V8: no vault should be a no-op"
-# A signing key (a smart card asks for its PIN) is not used for harness's
-# commits unless HARNESS_VAULT_SIGN=1; gpg.program=false stands in for the card.
+# A signing key (a smart card asks for its PIN) is never used for harness's
+# commits; gpg.program=false stands in for the card.
 git -C "$SYNC" config commit.gpgsign true; git -C "$SYNC" config gpg.program false
 printf 'signed?\n' >> "$SYNC/note.md"
 out=$(vault_sync "$SYNC" 1761100000000 "$DB" /w 2>&1)
 grep -q "committed" <<<"$out" || fail "V8: a signing setup should not stop the vault commit — $out"
-printf 'signed!\n' >> "$SYNC/note.md"
-out=$(HARNESS_VAULT_SIGN=1 vault_sync "$SYNC" 1761100000000 "$DB" /w 2>&1)
-grep -q "commit failed" <<<"$out" || fail "V8: HARNESS_VAULT_SIGN=1 should keep git's signing — $out"
+git -C "$SYNC" cat-file commit HEAD | grep -q '^gpgsig' && fail "V8: the vault commit should not be signed"
+# An agent launched by harness host gets the same through the environment.
+(export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.abbrev GIT_CONFIG_VALUE_0=9; harness_git_nosign_env
+ [[ $GIT_CONFIG_COUNT == 3 && $GIT_CONFIG_KEY_0 == core.abbrev && $GIT_CONFIG_KEY_1 == commit.gpgsign ]] \
+     || fail "V8: harness_git_nosign_env should append after the caller's entries ($GIT_CONFIG_COUNT)"
+ printf 'agent\n' >> "$SYNC/note.md"
+ git -C "$SYNC" -c user.name=t -c user.email=t@x commit -qam agent \
+     || fail "V8: under harness_git_nosign_env a commit should not use the signing key") || exit 1
 git -C "$SYNC" config --unset commit.gpgsign; git -C "$SYNC" config --unset gpg.program
 vault_sync "$SYNC" 1761100000000 "$DB" /w >/dev/null 2>&1
 ok "V8: vault_sync captures this project's session text (redacted), commits and pushes, rebasing once"

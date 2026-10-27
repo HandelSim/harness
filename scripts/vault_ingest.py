@@ -929,10 +929,10 @@ def git(vault, *args, timeout=60):
 
 
 def commit_opts(vault):
-    """-c options for a commit or a rebase: not signed (a smart-card key would
-    ask for its PIN on every commit) unless HARNESS_VAULT_SIGN=1, as for
-    harness's other vault commits, and harness's identity when git has none."""
-    opts = [] if os.environ.get("HARNESS_VAULT_SIGN") == "1" else ["-c", "commit.gpgsign=false"]
+    """-c options for a commit or a rebase: never signed (a smart-card key would
+    ask for its PIN on every commit), as for harness's other vault commits, and
+    harness's identity when git has none."""
+    opts = ["-c", "commit.gpgsign=false"]
     if not git_run(vault, "config", "user.name")[1].strip():
         opts += ["-c", "user.name=harness"]
     if not git_run(vault, "config", "user.email")[1].strip():

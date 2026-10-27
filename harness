@@ -5592,12 +5592,23 @@ vault_active_name() {
 }
 
 # Run git with a time limit where `timeout` exists (it is missing on macOS).
-# Harness's own vault commits are not signed: a signing key on a smart card or
-# behind a passphrase would ask for its PIN on every launch, and a headless run
-# would wait on that prompt. HARNESS_VAULT_SIGN=1 keeps the user's git setting
-# (for a remote that only takes signed commits).
+# Harness's own vault commits are never signed: a signing key on a smart card
+# or behind a passphrase would ask for its PIN on every commit, and a headless
+# run would wait on that prompt.
 _vault_nosign() {
-    [[ "${HARNESS_VAULT_SIGN:-0}" == 1 ]] || printf '%s\n' -c commit.gpgsign=false
+    printf '%s\n' -c commit.gpgsign=false
+}
+
+# The same for every git an agent launched by `harness host` runs (its commits,
+# rebases, merges): git's GIT_CONFIG_COUNT entries win over every config file,
+# and are appended after any the caller already set. A container agent has its
+# own git config with no signing key.
+harness_git_nosign_env() {
+    local n=${GIT_CONFIG_COUNT:-0}
+    [[ $n =~ ^[0-9]+$ ]] || n=0
+    export "GIT_CONFIG_KEY_$n=commit.gpgsign" "GIT_CONFIG_VALUE_$n=false"
+    export "GIT_CONFIG_KEY_$((n + 1))=tag.gpgsign" "GIT_CONFIG_VALUE_$((n + 1))=false"
+    export GIT_CONFIG_COUNT=$((n + 2))
 }
 
 # The -c options for a commit (or a rebase, which commits) in vault <dir>:
@@ -7224,6 +7235,7 @@ host_run_opencode() {
 
     local args=()
     [[ "$yolo" == "1" ]] && args+=(--agent yolo)
+    harness_git_nosign_env
 
     echo "============================================================" >&2
     echo " harness host (opencode, containerless)" >&2

@@ -444,8 +444,10 @@ def run_quiet(cmd, timeout, cwd=None, env=None):
 
 def git(cwd, *args, check=True, timeout=300, env=None):
     env = dict(os.environ, **{"GIT_TERMINAL_PROMPT": "0", **(env or {})})
-    # no fsmonitor daemon started by the queue's git: it would outlive the call holding its files
-    r = run_quiet(["git", "-C", cwd, "-c", "core.fsmonitor=false", *args], timeout, env=env)
+    # no fsmonitor daemon started by the queue's git: it would outlive the call holding its files;
+    # no signing: a key on a smart card would ask for its PIN with nobody there
+    r = run_quiet(["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", *args],
+                  timeout, env=env)
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args[:3])}: {(r.stderr or r.stdout).strip()[:400]}")
     return r

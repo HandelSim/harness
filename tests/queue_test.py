@@ -1542,6 +1542,16 @@ class StartAndBranchTest(Base):
         self.assertEqual(self.git_p("show", snap + ":build/make.sh"), "echo hi")
         self.assertTrue(st["launches"])
 
+    def test_the_queues_git_never_signs(self):
+        # A signing key on a smart card would ask for its PIN on the snapshot of
+        # every stage; gpg.program=false stands in for the card.
+        self.git_p("config", "commit.gpgsign", "true")
+        self.git_p("config", "gpg.program", "false")
+        tree = tq.git(self.project, "write-tree").stdout.strip()
+        sha = tq.git(self.project, "commit-tree", tree, "-m", "snap").stdout.strip()
+        self.assertNotIn("gpgsig", self.git_p("cat-file", "commit", sha))
+        tq.git(self.project, "commit", "-q", "--allow-empty", "-m", "queue")
+
     def test_in_place_commit_of_an_owners_file_fails(self):
         put(os.path.join(self.project, "README"), "project, edited\n")
         os.environ["FAKE_FILE"] = "README"       # the agent commits the owner's edit with its own

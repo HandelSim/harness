@@ -511,8 +511,7 @@ rebuilds the generated index and hubs (no model), `git add -A`, one commit
 for everything the session changed in the vault (unsigned, `-c
 commit.gpgsign=false`, as are `vault new`'s and ingest's commits: a signing
 key on a smart card would ask for its PIN on every launch, and a headless run
-would wait on it; `HARNESS_VAULT_SIGN=1` keeps git's setting for a remote that
-takes only signed commits; with no `user.name`/`user.email` the commit is
+would wait on it; there is no switch for it; with no `user.name`/`user.email` the commit is
 harness's, `harness <harness@localhost>`), and a push when the branch
 has an upstream (no credential prompt, 30s limit; on a rejected push one
 `pull --rebase --autostash`, unsigned and with the same identity, and a
@@ -1083,7 +1082,12 @@ What it does, in order:
    unfiltered network), a strictly bigger blast radius than `--net`.
    `HARNESS_HOST_CONFIRM=1` bypasses it for automation; refuses non-interactive
    without `/dev/tty`. This is why host mode exists as a separate, gated command
-   rather than a flag on the normal launch.
+   rather than a flag on the normal launch. The agent's git never signs
+   (`harness_git_nosign_env`: `GIT_CONFIG_COUNT` entries `commit.gpgsign` and
+   `tag.gpgsign` false, appended after any the caller set): a signing key on a
+   smart card would ask for its PIN on every commit. A container agent has its
+   own git config with no key; the queue's own git passes `-c
+   commit.gpgsign=false`.
 4. **`host_ensure_toolchain`** (after the gate, so no download happens before
    consent) — provisions the other three deps (`jq`, Node >= 20, `opencode`) into
    `state/host/toolchain/` and prepends the vendored dirs to `PATH` for the rest
