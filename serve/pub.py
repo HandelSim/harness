@@ -1105,11 +1105,14 @@ def make_handler(cfg):
                 self.redirect("/vault", head=head)
                 return
             if rest in ("ingest", "ingest/live"):
+                log = vault_view.ingest_log(cfg.state_dir)
                 if rest == "ingest/live":
-                    self.send_json(vault_view.ingest_live(vault, nav), head)
+                    self.send_json(vault_view.ingest_live(vault, nav, log), head)
                 else:
-                    self.send_runs(200, "harness: ingest", vault_view.render_ingest(vault, nav), runs_view.LIVE_JS,
-                                   head, "vault")
+                    done, bad = (q.get("done") or [""])[0][:600], (q.get("bad") or [""])[0][:600]
+                    self.send_runs(200, "harness: ingest", vault_view.render_ingest(vault, nav, log, done or bad,
+                                                                                    bool(bad and not done)),
+                                   runs_view.LIVE_JS, head, "vault")
                 return
             if rest == "search":
                 self.send_runs(200, "harness: vault search",
@@ -1137,12 +1140,27 @@ def make_handler(cfg):
             self.send_runs(200, "harness: vault", got, "", head, "vault")
 
         def vault_post(self, path, user):
-            if path != "/vault/use":
+            if path not in ("/vault/use", "/vault/ingest/start", "/vault/ingest/stop", "/vault/ingest/forget"):
                 self.send(404, b"not found\n")
                 return
             form = self.read_form()
             if form is None:
                 self.send(413, b"form too large\n")
+                return
+            if path.startswith("/vault/ingest/"):
+                vault, _ = cfg.active.get()
+                if not vault or not os.path.isdir(vault):
+                    self.redirect("/vault")
+                    return
+                act = path.rsplit("/", 1)[1]
+                if act == "start":
+                    ok, msg = vault_view.start_ingest(self.settings_args(), cfg.state_dir, vault, form)
+                elif act == "stop":
+                    ok, msg = vault_view.stop_ingest(vault)
+                else:
+                    ok, msg = vault_view.forget_codebase(self.settings_args(), vault, form)
+                sys.stderr.write(f"[pub] ingest {act} from {user or 'local'}: {msg}\n")
+                self.redirect("/vault/ingest?" + urlencode({"done" if ok else "bad": msg}))
                 return
             ok, msg = vault_view.use_vault(cfg.state_dir, (form.get("name") or [""])[0].strip())
             sys.stderr.write(f"[pub] vault use from {user or 'local'}: {msg}\n")

@@ -1398,7 +1398,15 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   does), and an Ingest panel: the run file `.git/harness-ingest.run.json`
   (alive while its pid lives and its beat is under 120 s old) and, per
   codebase and `.raw`, ok and failed sections from `.harness/ingest.json`;
-  `/vault/ingest` (live) lists failed sections with their problems.
+  `/vault/ingest` (live) lists failed sections with their problems and
+  controls ingest: POST `/vault/ingest/start` runs `harness ingest` in the
+  background (no terminal, own session; "what changed", `--retry-failed`, a
+  new codebase `<dir>`, `--max`, `--model`, or one failed section's
+  `--unit ID`), its output in `state/serve/ingest.out` shown under the
+  controls; refused while an ingest is alive (run file) or the one started
+  here still runs. `/vault/ingest/stop` sends SIGTERM to the run file's pid
+  and to the started harness's process group (ingest saves its progress).
+  `/vault/ingest/forget` runs `harness ingest --forget NAME`.
   `/vault/browse/<rel>`: a folder lists folders then files (titles from
   front matter or the first heading); a markdown file is rendered on the
   server by the vendored mistune 3.3.4 (`serve/vendor/`, BSD-3, raw HTML

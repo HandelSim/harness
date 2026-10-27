@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pub  # noqa: E402
+import vault_view  # noqa: E402
 
 
 class LiveServer(unittest.TestCase):
@@ -677,8 +678,8 @@ class HomeLiveTest(LiveServer):
         self.assertTrue(cfg.code_changed())
 
 
-class VaultPagesTest(LiveServer):
-    """The Vault section: a git vault under state/vaults, read-only pages."""
+class VaultFixture(LiveServer):
+    """A git vault under state/vaults with an ingest manifest, and serve on it."""
 
     def setUp(self):
         super().setUp()
@@ -723,6 +724,10 @@ class VaultPagesTest(LiveServer):
         r, body = self.get(self.port, path)
         self.assertEqual(r.status, code, path)
         return body.decode()
+
+
+class VaultPagesTest(VaultFixture):
+    """The Vault section: read-only pages."""
 
     def test_overview_shows_contents_ingest_and_vaults(self):
         text = self.page("/vault")
@@ -851,6 +856,8 @@ case "$*" in
   doctor) printf '\033[1m[deps]\033[0m\n  \xe2\x9c\x93 git  git version 2\n  \xe2\x9c\x97 docker  not reachable <b>\n' ;;
   "config set DEFAULT_MODEL_NAME bad") echo "harness: refused" >&2; exit 1 ;;
   "net allow"*) echo "added ${3}" ;;
+  "ingest --forget"*) echo "forgot ${3}: 2 pages removed" ;;
+  ingest*) echo "ingesting"; exec sleep 30 ;;
   "net deny"*) echo "removed ${3}" ;;
   *) echo ok ;;
 esac
@@ -963,3 +970,61 @@ class SettingsPageTest(LiveServer):
         r, _ = self.post(port, "/settings/access", {"act": "remove", "name": "bob"}, cookie)
         self.assertIn("done=", r.getheader("Location"))
         self.assertEqual({n for n, _ in pub.parse_codes(open(codes).read())}, {"alice"})
+
+
+class IngestControlsTest(VaultFixture):
+    """/vault/ingest/start, stop and forget run harness ingest (a fake one here)."""
+
+    def setUp(self):
+        super().setUp()
+        self.harness = os.path.join(self.tmp.name, "harness")
+        with open(self.harness, "w") as f:
+            f.write(FAKE_HARNESS)
+        self.log = os.path.join(self.tmp.name, "log")
+        os.environ["LOG"] = self.log
+        self.addCleanup(os.environ.pop, "LOG", None)
+        self.servers[-1].shutdown()
+        self.port = self.start(vault="", state_dir=self.state, harness=self.harness)
+        self.addCleanup(lambda: vault_view.stop_ingest(self.v))
+
+    post = SettingsPageTest.post
+    calls = SettingsPageTest.calls
+
+    def wait_call(self, line):
+        for _ in range(100):
+            if line in self.calls():
+                return
+            time.sleep(0.05)
+        self.assertIn(line, self.calls())
+
+    def test_start_refuse_while_running_stop_and_forget(self):
+        page = self.page("/vault/ingest")
+        self.assertIn("Ingest what changed", page)
+        self.assertIn("Retry failed sections too", page)
+        self.assertIn(">Forget<", page)
+        r, _ = self.post(self.port, "/vault/ingest/start", {"what": "all", "dir": "/no/such/dir"})
+        self.assertIn("bad=", r.getheader("Location"))
+        r, _ = self.post(self.port, "/vault/ingest/start", {"what": "retry", "max": "3"})
+        self.assertIn("done=", r.getheader("Location"))
+        self.wait_call("ingest --retry-failed --max 3")
+        r, _ = self.post(self.port, "/vault/ingest/start", {"unit": "code:api/cache#1"})
+        self.assertIn("already+running", r.getheader("Location"))
+        for _ in range(50):
+            page = self.page("/vault/ingest")
+            if "ingesting" in page:
+                break
+            time.sleep(0.1)
+        self.assertIn(">Stop<", page)
+        self.assertIn("ingesting", page)                      # the output's tail
+        r, _ = self.post(self.port, "/vault/ingest/stop", {})
+        self.assertIn("done=", r.getheader("Location"))
+        vault_view._started["proc"].wait(5)
+        r, _ = self.post(self.port, "/vault/ingest/start", {"unit": "code:api/cache#1"})
+        self.assertIn("done=", r.getheader("Location"))
+        self.wait_call("ingest --unit code:api/cache#1")
+        vault_view.stop_ingest(self.v)
+        vault_view._started["proc"].wait(5)
+        r, _ = self.post(self.port, "/vault/ingest/forget", {"name": "api"})
+        self.assertIn("done=Forgot+api", r.getheader("Location"))
+        r, _ = self.post(self.port, "/vault/ingest/forget", {"name": "../x"})
+        self.assertIn("bad=", r.getheader("Location"))

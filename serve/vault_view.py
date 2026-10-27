@@ -79,6 +79,11 @@ pre.vraw { white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.55 var
 .hits pre { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mono); color: var(--ink-2); }
 .hits mark { background: var(--wait-soft); color: var(--ink); border-radius: 3px; }
 .ing { display: flex; flex-direction: column; gap: 8px; }
+.inl { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.ingf details { margin-top: 8px; } .ingf summary { cursor: pointer; color: var(--muted); font: 13px/1.4 var(--sans); }
+.ingf .grid2 { margin-top: 8px; } .ingf label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+pre.out { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mono); max-height: 320px; overflow: auto;
+  background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 6px 0 0; }
 .bar2 { height: 6px; border-radius: 3px; background: var(--sunk); overflow: hidden; display: flex; }
 .bar2 i { display: block; height: 100%; } .bar2 .ok { background: var(--ok); } .bar2 .bad { background: var(--bad); }
 .bar2 .pend { background: var(--wait); }
@@ -420,11 +425,55 @@ def _ago_iso(text):
     return runs_view._ago(ms) if ms else ""
 
 
-def _ingest_panel(vault, full=False):
+def _ingest_controls(run, s, log):
+    """Start, retry and add forms when nothing runs, Stop while something does, and the
+    last ingest started from here (its output's tail)."""
+    btn = runs_view._btn
+    parts = []
+    proc = _started["proc"]
+    if (run and run.get("alive")) or (proc is not None and proc.poll() is None):
+        parts.append("<div class='inl'>" + btn("/vault/ingest/stop", "Stop", "ghost", (),
+                     confirm="Stop this ingest? Sections already written are kept; the rest wait for the next one.")
+                     + "</div>")
+    else:
+        parts.append(
+            "<form method='post' action='/vault/ingest/start' class='ingf'>"
+            "<div class='inl'><button type='submit' name='what' value='all' class='primary'>Ingest what changed</button>"
+            + ("<button type='submit' name='what' value='retry'>Retry failed sections too</button>" if s["nfailed"] else "")
+            + "</div><details><summary>Add a codebase, or limit the run</summary><div class='grid2'>"
+            "<label>Codebase folder<input type='text' name='dir' placeholder='e.g. C:/src/api or ~/src/api' "
+            "spellcheck='false' autocapitalize='off'></label>"
+            "<label>At most this many sections<input type='text' name='max' inputmode='numeric' placeholder='all'></label>"
+            "<label>Model<input type='text' name='model' placeholder='the default model' spellcheck='false'></label>"
+            "</div><p class='muted'>A folder is remembered, so later runs check it too. Try a few sections first "
+            "and read the pages.</p></details></form>")
+    if log:
+        tail = _log_tail(log)
+        if tail:
+            parts.append(f"<details{' open' if run and run.get('alive') else ''}><summary>Output of the last ingest "
+                         f"started here</summary><pre class='out'>{esc(tail)}</pre></details>")
+    return "".join(parts)
+
+
+def _log_tail(path, limit=6000):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            n = f.tell()
+            f.seek(max(0, n - limit))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    if n > limit:
+        text = text.split("\n", 1)[-1]
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).replace("\r\n", "\n").strip()
+
+
+def _ingest_panel(vault, full=False, log=""):
     run = ingest_run(vault)
     s = ingest_summary(vault)
     parts = ["<section class='panel ing' id='ingest'><div class='hd'><h2>Ingest</h2>"
-             + ("" if full else "<a href='/vault/ingest'>details</a>") + "</div>"]
+             + ("" if full else "<a href='/vault/ingest'>details and controls</a>") + "</div>"]
     if run and run.get("alive"):
         n = int(run.get("done") or 0) + int(run.get("failed") or 0)
         left = int(run.get("left") or 0)
@@ -433,12 +482,19 @@ def _ingest_panel(vault, full=False):
                      + (f" &middot; with {esc(str(run.get('model')))}" if run.get("model") else "")
                      + (f"<br><span class='muted'>now: <code>{esc(str(run.get('unit')))}</code></span>"
                         if run.get("unit") else "") + "</p>")
+    elif full and _started["proc"] is not None and _started["proc"].poll() is None:
+        parts.append("<p><span class='pill t-run dot pulse'>starting</span> harness is getting ready (the first "
+                     "run on a computer can install tools first); the output is below.</p>")
     elif run:
         parts.append("<p class='muted'>An ingest stopped without finishing (its process is gone); the next "
                      "ingest takes over.</p>")
     else:
-        parts.append("<p class='muted'>Not running. " + (f"Last: {esc(s['last'])}" if s["last"] else
+        m = re.match(r"^(\S+) ingest: (.*)$", s["last"] or "")
+        last = f"last run {_ago_iso(m.group(1))}: {m.group(2)}" if m else s["last"]
+        parts.append("<p class='muted'>Not running. " + (f"{esc(last[:1].upper() + last[1:])}" if last else
                                                           "Nothing ingested yet.") + "</p>")
+    if full:
+        parts.append(_ingest_controls(run, s, log))
     if s["sources"]:
         parts.append("<ul class='vlist'>")
         for src in s["sources"]:
@@ -451,7 +507,12 @@ def _ingest_panel(vault, full=False):
                 f"<span class='meta'>{src['ok']} ok" + (f" &middot; <b class='t-bad'>{src['failed']} failed</b>"
                                                            if src["failed"] else "")
                 + (f" &middot; {esc(_ago_iso(src['at']))}" if src["at"] else "") + "</span>"
-                f"<div class='bar2' style='flex-basis:100%'><i class='ok' style='width:{100 * src['ok'] / tot:.1f}%'></i>"
+                + (runs_view._btn("/vault/ingest/forget", "Forget", "ghost sm", (("name", src["name"]),),
+                                  confirm=f"Forget codebase {src['name']}? Its generated pages under "
+                                          f"wiki/code/{src['name']}/ are deleted (pages you wrote stay) and "
+                                          "the change is committed and pushed.")
+                   if full and src["name"] != ".raw" and not (run and run.get("alive")) else "")
+                + f"<div class='bar2' style='flex-basis:100%'><i class='ok' style='width:{100 * src['ok'] / tot:.1f}%'></i>"
                 f"<i class='bad' style='width:{100 * src['failed'] / tot:.1f}%'></i></div></li>")
         parts.append("</ul>")
     if full and s["failed"]:
@@ -461,7 +522,10 @@ def _ingest_panel(vault, full=False):
             parts.append(f"<li><span class='nm'><code>{esc(f['id'])}</code>"
                          + (f" &rarr; <a href='{esc(href_of(f['page']))}'>{esc(f['page'])}</a>" if f["page"] else "")
                          + f"<ul class='probs'>{probs}</ul></span><span class='meta'>{f['attempts']} tries"
-                         + (f" &middot; {esc(_ago_iso(f['at']))}" if f["at"] else "") + "</span></li>")
+                         + (f" &middot; {esc(_ago_iso(f['at']))}" if f["at"] else "") + "</span>"
+                         + ("" if run and run.get("alive") else
+                            runs_view._btn("/vault/ingest/start", "Retry", "ghost sm", (("unit", f["id"]),)))
+                         + "</li>")
         parts.append("</ul>")
     parts.append("</section>")
     return "".join(parts)
@@ -623,17 +687,17 @@ def overview_live(vault, name, vaults=(), extra=None):
     return {"sig": runs_view._sig(regions), "regions": regions}
 
 
-def render_ingest(vault, extra=None):
-    regions = dict({"ing": _ingest_panel(vault, full=True)}, **(extra or {}))
+def render_ingest(vault, extra=None, log="", flash="", bad=False):
+    regions = dict({"ing": _ingest_panel(vault, full=True, log=log)}, **(extra or {}))
     return [f"<style>{STYLE}</style>", runs_view._live_tag("/vault/ingest/live", runs_view._sig(regions)),
             "<div class='ph'><div class='crumbs'><a href='/vault'>Vault</a><span>/</span><b>Ingest</b></div>"
             "<h1>Ingest</h1><div class='sub'>Ingest turns codebases and .raw material into wiki pages, one "
             "section at a time, and keeps a hash of each so only what changed is sent again.</div></div>",
-            f"<div id='r-ing' class='stack'>{regions['ing']}</div>"]
+            runs_view._flash(flash, bad), f"<div id='r-ing' class='stack'>{regions['ing']}</div>"]
 
 
-def ingest_live(vault, extra=None):
-    regions = dict({"ing": _ingest_panel(vault, full=True)}, **(extra or {}))
+def ingest_live(vault, extra=None, log=""):
+    regions = dict({"ing": _ingest_panel(vault, full=True, log=log)}, **(extra or {}))
     return {"sig": runs_view._sig(regions), "regions": regions}
 
 
@@ -822,3 +886,93 @@ def file_bytes(vault, rel):
     except OSError:
         return None
     return (data, ctype) if len(data) <= 20_000_000 else None
+
+
+# --- ingest controls ------------------------------------------------------------------
+
+UNIT_RE = re.compile(r"^[^\s\x00-\x1f]{1,400}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$")
+_started = {"proc": None}
+
+
+def ingest_log(state_dir):
+    return os.path.join(state_dir, "serve", "ingest.out") if state_dir else ""
+
+
+def start_ingest(h, state_dir, vault, form):
+    """Start `harness ingest` in the background as the form asks: (ok, message)."""
+    import settings_view
+    run = ingest_run(vault)
+    proc = _started["proc"]
+    if (run and run.get("alive")) or (proc is not None and proc.poll() is None):
+        return False, "an ingest is already running on this vault; stop it first or wait for it"
+    get = lambda k: (form.get(k) or [""])[0].strip()   # noqa: E731
+    args = ["ingest"]
+    unit, folder, mx, model = get("unit"), get("dir"), get("max"), get("model")
+    if unit:
+        if not UNIT_RE.match(unit):
+            return False, "not a section id"
+        args += ["--unit", unit]
+    else:
+        if folder:
+            if folder.startswith("-") or "\n" in folder or len(folder) > 1000:
+                return False, "give the codebase's folder path"
+            path = os.path.expanduser(folder)
+            if not os.path.isdir(path):
+                return False, f"no folder {folder} on the computer harness serve runs on"
+            args.append(path)
+        if get("what") == "retry":
+            args.append("--retry-failed")
+    if mx:
+        if not mx.isdigit() or not 0 < int(mx) < 100000:
+            return False, "at most: a whole number of sections"
+        args += ["--max", mx]
+    if model:
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,200}$", model):
+            return False, "not a model id"
+        args += ["--model", model]
+    proc, why = settings_view.spawn_harness(*h, args, ingest_log(state_dir))
+    if proc is None:
+        return False, why
+    _started["proc"] = proc
+    return True, "Ingest started. This page follows it; the output is under the controls."
+
+
+def stop_ingest(vault):
+    """SIGTERM the running ingest (it saves its progress and removes its run file) and the
+    harness started from here with it, which may still be getting ready (no run file yet)."""
+    import signal
+    run, proc, stopped = ingest_run(vault), _started["proc"], False
+    if run and run.get("alive"):
+        try:
+            os.kill(int(run.get("pid")), signal.SIGTERM)
+            stopped = True
+        except (TypeError, ValueError, OSError):
+            pass
+    if proc is not None and proc.poll() is None:
+        try:
+            if os.name == "nt":
+                proc.terminate()
+            else:
+                os.killpg(proc.pid, signal.SIGTERM)    # its own session: harness and what it started
+            stopped = True
+        except OSError:
+            pass
+    if not stopped:
+        return False, "no ingest is running"
+    return True, "Asked the ingest to stop; sections already written are kept."
+
+
+def forget_codebase(h, vault, form):
+    import settings_view
+    name = (form.get("name") or [""])[0].strip()
+    if not NAME_RE.match(name):
+        return False, "not a codebase name"
+    run = ingest_run(vault)
+    if run and run.get("alive"):
+        return False, "an ingest is running; stop it first"
+    rc, out = settings_view.run_harness(*h, "ingest", "--forget", name, timeout=180)
+    lines = [x.strip() for x in (out or "").splitlines() if x.strip()]
+    if rc != 0:
+        return False, (lines[-1] if lines else "harness ingest --forget failed")
+    return True, f"Forgot {name}: " + (lines[-1] if lines else "done")

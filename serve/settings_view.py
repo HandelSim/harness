@@ -65,33 +65,54 @@ pre.out { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--m
 """
 
 
-def run_harness(harness, install_root, *args, timeout=60):
-    """(exit status, output) of `harness ARGS` with no terminal (it cannot prompt), or
-    (None, why) when it could not run or took too long."""
+def _launch(harness, install_root):
+    """(argv head, env, Popen keywords) to run harness with no terminal, or (None, why, None)."""
     bash = shutil.which("bash")
     if not bash:
-        return None, "bash is not on PATH, so harness cannot run"
+        return None, "bash is not on PATH, so harness cannot run", None
     if not harness or not os.path.isfile(harness):
-        return None, f"no harness script at {harness or '(none)'} (pub.py --harness)"
+        return None, f"no harness script at {harness or '(none)'} (pub.py --harness)", None
     env = dict(os.environ, HARNESS_OPEN="0", NO_COLOR="1", TERM="dumb")
     if install_root and not env.get("HARNESS_INSTALL_ROOT"):
         env["HARNESS_INSTALL_ROOT"] = install_root
-    kw = {}
+    home = os.path.expanduser("~")
+    kw = {"stdin": subprocess.DEVNULL, "env": env, "cwd": home if os.path.isdir(home) else None}
     if os.name == "nt":
         kw["creationflags"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                                | getattr(subprocess, "CREATE_NO_WINDOW", 0))
     else:
         kw["start_new_session"] = True        # no controlling terminal: a /dev/tty prompt fails at once
-    home = os.path.expanduser("~")
+    return [bash, harness], env, kw
+
+
+def run_harness(harness, install_root, *args, timeout=60):
+    """(exit status, output) of `harness ARGS` with no terminal (it cannot prompt), or
+    (None, why) when it could not run or took too long."""
+    head, env, kw = _launch(harness, install_root)
+    if head is None:
+        return None, env
     try:
-        r = subprocess.run([bash, harness, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=timeout, env=env,
-                           cwd=home if os.path.isdir(home) else None, **kw)
+        r = subprocess.run([*head, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, **kw)
     except subprocess.TimeoutExpired:
         return None, f"harness {' '.join(args)} took over {timeout} s and was stopped"
     except OSError as e:
         return None, f"cannot run harness: {e.strerror or e}"
     return r.returncode, ANSI.sub("", r.stdout.decode("utf-8", "replace")).replace("\r\n", "\n")
+
+
+def spawn_harness(harness, install_root, args, log):
+    """Start `harness ARGS` in the background, output to log (replaced); the Popen, or why not."""
+    head, env, kw = _launch(harness, install_root)
+    if head is None:
+        return None, env
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "wb") as out:
+            out.write(("$ harness " + " ".join(args) + "\n").encode())
+            out.flush()
+            return subprocess.Popen([*head, *args], stdout=out, stderr=subprocess.STDOUT, **kw), ""
+    except OSError as e:
+        return None, f"cannot start harness: {e.strerror or e}"
 
 
 def _last_line(text):
