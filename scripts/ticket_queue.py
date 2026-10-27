@@ -935,7 +935,7 @@ def nested_repos(project, skip=()):
     """The repositories inside the project (their own .git): 3 levels down, ignored
     ones too, and any deeper one git add -A would meet; not the project's own
     worktrees, nor one that is or holds a folder in skip (the vault, the queue's
-    state), nor one inside a tool's folder (NESTED_SKIP). Relative paths, sorted."""
+    state), nor one inside a tool's folder (NESTED_SKIP), nor a submodule. Relative paths, sorted."""
     found = {r for r in untracked_repos(project) if not set(r.split("/")) & set(NESTED_SKIP)}
     for root, dirs, files in os.walk(project):
         if root != project and (".git" in dirs or ".git" in files):
@@ -944,6 +944,14 @@ def nested_repos(project, skip=()):
             continue
         depth = os.path.relpath(root, project).count(os.sep)
         dirs[:] = [] if depth >= 2 else [d for d in dirs if d != ".git" and d not in NESTED_SKIP]
+
+    # submodules (gitlinks in the index, or named in .gitmodules) are the project's own
+    staged = git(project, "ls-files", "-s", "-z", check=False).stdout.split("\0")
+    subs = {e.split("\t", 1)[1] for e in staged if e.startswith("160000 ") and "\t" in e}
+    named = git(project, "config", "-f", os.path.join(project, ".gitmodules"), "--get-regexp",
+                r"^submodule\..*\.path$", check=False).stdout.splitlines()
+    subs |= {l.split(" ", 1)[1].strip("/") for l in named if " " in l}
+    found -= subs
 
     def rev_parse(d, what):   # no --path-format (git 2.31): relative to d, as git prints it
         out = git(d, "rev-parse", what, check=False).stdout.strip()
@@ -966,16 +974,20 @@ def nested_repos(project, skip=()):
 
 NESTED_FILES_CAP = 500   # paths kept by name, per repository, to say which changed
 NESTED_HASH_MAX = 16 << 20   # bigger files are known by size and mtime
+NESTED_HASH_BUDGET = 256 << 20   # and so is every file in a repository past this many bytes read
 
 
-def _content(path):
+def _content(path, budget=None):
     """What a path holds, for telling a change from a touch: a hash of a file's bytes
-    (a link's target), or its size and mtime when it is big or not a file."""
+    (a link's target), or its size and mtime when it is big, past budget (a one-item
+    list of bytes left to read, taken from) or not a file."""
     try:
         s = os.lstat(path)
         if stat.S_ISLNK(s.st_mode):
-            return "link " + hashlib.sha256(os.readlink(path).encode()).hexdigest()[:16]
-        if stat.S_ISREG(s.st_mode) and s.st_size <= NESTED_HASH_MAX:
+            return "link " + hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()[:16]
+        if stat.S_ISREG(s.st_mode) and s.st_size <= NESTED_HASH_MAX and (budget is None or s.st_size <= budget[0]):
+            if budget is not None:
+                budget[0] -= s.st_size
             h = hashlib.sha256()
             with open(path, "rb") as f:
                 for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -994,13 +1006,13 @@ def nested_state(project, skip=()):
     out = {}
     for rel in nested_repos(project, skip):
         d = os.path.join(project, rel)
-        files, err = {}, ""
+        files, err, budget = {}, "", [NESTED_HASH_BUDGET]
         try:
             entries = status_entries(d, env={"GIT_OPTIONAL_LOCKS": "0"})   # no index refresh in the owner's repo
         except RuntimeError as e:   # one git cannot read is still looked at for HEAD and branch
             entries, err = [], f"git status: {e}"[:200]
         for xy, path in entries:
-            files[path] = f"{xy} {_content(os.path.join(d, path))}"
+            files[path] = f"{xy} {_content(os.path.join(d, path), budget)}"
         out[rel] = {"head": git(d, "rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip(),
                     "branch": git(d, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip(),
                     "sum": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:16],
@@ -1061,9 +1073,10 @@ def fetch_branch(q, st):
 
 
 def added_gitlinks(project, since, sha):
-    """Repositories committed as bare pointers (gitlinks) since since: not the ones
-    .gitmodules at sha names (submodules, the owner's or the ticket's)."""
-    raw = git(project, "diff", "--raw", "-z", "--no-renames", "--ignore-submodules=none", "--diff-filter=A", since,
+    """Repositories committed as bare pointers (gitlinks) since since, added or in a
+    tracked file's place: not the ones .gitmodules at sha names (submodules, the
+    owner's or the ticket's)."""
+    raw = git(project, "diff", "--raw", "-z", "--no-renames", "--ignore-submodules=none", "--diff-filter=AT", since,
               sha, check=False).stdout.split("\0")   # -z: a path as it is, not quoted
     links = [raw[i + 1] for i in range(0, len(raw) - 1, 2) if raw[i].startswith(":") and raw[i].split()[1] == "160000"]
     if not links:
@@ -1328,9 +1341,9 @@ def run_agent(ctx, st, stage, prompt):
         exclude_block(st["project"], None)   # the snapshot takes the owner's files too
         snapshot(ctx.q, st, stage)
         # before the owner's untracked files are hidden: a deep repository among them would be too
-        if "nested_base" not in st:   # a stage launched again (the run died) keeps the one from before it
+        if "nested_base" not in st:   # one left by a run that died was looked at in process()
             try:
-                st["nested_base"] = nested_state(st["project"], skip)
+                st["nested_base"], st["nested_stage"] = nested_state(st["project"], skip), stage
                 blind = [r for r, v in st["nested_base"].items() if v.get("err")]
                 if blind:
                     ctx.q.log(key, f"warning: git does not say what is uncommitted in {', '.join(blind[:10])} "
@@ -1353,7 +1366,11 @@ def run_agent(ctx, st, stage, prompt):
             with contextlib.suppress(RuntimeError, OSError, subprocess.SubprocessError):
                 exclude_block(st["project"], None)
             if not ended:   # stopped, halted, the upstream gone: the next launch takes its own baseline
-                nested_check(ctx, st, stage, skip)
+                try:   # and never in place of why the launch ended
+                    nested_check(ctx, st, stage, skip, ended=False)
+                except Exception as e:  # noqa: BLE001
+                    with contextlib.suppress(Exception):
+                        ctx.q.log(key, f"warning: repositories inside the project not looked at after {stage}: {e}")
     # The agent's part of the stage is over: saved at once, so a run that dies from
     # here on (or an outage, a halt, a verifier with no verdict) goes on from its
     # result instead of launching it again. fail/advance/block let it go.
@@ -1364,32 +1381,50 @@ def run_agent(ctx, st, stage, prompt):
     return rc, out
 
 
-def nested_check(ctx, st, stage, skip):
+def nested_check(ctx, st, stage, skip, ended=True):
     """After an in-place launch: what it changed in repositories inside the project goes
-    to st["nested_moved"] (to block the ticket: nested_block) and the baseline goes."""
+    to st["nested_moved"] (to block the ticket: nested_block) and the baseline goes.
+    When they cannot be looked at, a launch that ended blocks (unknown) and one that
+    did not keeps its baseline for the launch after it."""
+    stage = st.get("nested_stage") or stage   # a launch that died: its own
     if isinstance(st.get("nested_base"), dict):
         try:
             moved = nested_moved(st["project"], st["nested_base"], skip)
             if moved:
                 st["nested_moved"] = {"stage": stage, "lines": moved[:10]}
                 ctx.q.log(st["key"], f"{stage}: repositories inside the project changed", "\n".join(moved[:10]))
-        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        except Exception as e:  # noqa: BLE001 - not looked at is not unchanged
             ctx.q.log(st["key"], f"warning: repositories inside the project not looked at after {stage}: {e}")
+            if not ended:
+                ctx.q.save(st)
+                return
+            st["nested_moved"] = {"stage": stage, "unknown": True,
+                                  "lines": [f"they could not be looked at after it ({str(e)[:200]})"]}
     st.pop("nested_base", None)
+    st.pop("nested_stage", None)
     ctx.q.save(st)
+
+
+def nested_said(st):
+    """What a launch changed in repositories inside the project (st["nested_moved"]),
+    for a block reason; "" when nothing."""
+    m = st.get("nested_moved")
+    if not (isinstance(m, dict) and m.get("lines")):
+        return ""
+    did = "may have changed" if m.get("unknown") else "changed"
+    return (f"the {m.get('stage', 'last')} agent {did} repositories inside the project, which the queue does not "
+            f"verify, commit or push: {'; '.join(m['lines'])}. Look at them first (it may have been you, working "
+            f"there meanwhile): the ticket's branch would be pushed without them")
 
 
 def nested_block(st):
     """Raises NestedMoved when a launch changed repositories inside the project; it
-    stays in state.json until block() takes it, so a run that dies first still blocks."""
-    m = st.get("nested_moved")
-    if isinstance(m, dict) and m.get("lines"):
+    stays in state.json until a block says it, so a run that dies first still blocks."""
+    said = nested_said(st)
+    if said:
         then = "checks the agent's result" if st.get("verify_only") else "runs the stage again"   # stopped: none kept
         raise NestedMoved(
-            f"the {m.get('stage', 'last')} agent changed repositories inside the project, which the queue does not "
-            f"verify, commit or push: {'; '.join(m['lines'])}. Look at them first (it may have been you, working "
-            f"there meanwhile): the ticket's branch would be pushed without them. harness queue retry {st['key']} "
-            f"then {then}; "
+            f"{said}. harness queue retry {st['key']} then {then}; "
             f"a change they need is a ticket of its own (harness queue add KEY --project {st['project']}/<repository>)")
 
 
@@ -1397,7 +1432,6 @@ def agent_or_kept(ctx, st, stage, prompt):
     """(rc, out, started): run_agent on prompt(), or the result its agent left when
     that is kept (verify_only: the verifier gave no verdict, the run died, the
     upstream went away after the agent ended); the agent is not launched again."""
-    nested_block(st)
     kept = st.get("verify_only")
     if isinstance(kept, dict) and kept.get("stage") == stage and kept.get("out"):
         ctx.q.log(st["key"], f"{stage}: the agent's result from before is kept; checking it without a new launch")
@@ -2310,6 +2344,7 @@ def advance(ctx, st, stage, reason=""):
     record(st, "passed")
     st.pop("verify_only", None)
     st.pop("nested_base", None)   # a stage's own
+    st.pop("nested_stage", None)
     if stage:
         st.update(stage=stage, attempt=0, feedback="", status="running")
     else:
@@ -2331,7 +2366,10 @@ def block(ctx, st, reason, keep=False):
     (verify_only) by a retry without --stage."""
     if not keep:
         st.pop("verify_only", None)
-    st.pop("nested_moved", None)   # said in reason
+    said = nested_said(st)   # whatever else blocked it first, the owner hears of it
+    if said and said not in reason:
+        reason = f"{reason.rstrip('. ')}. Also, {said}"
+    st.pop("nested_moved", None)
     record(st, "blocked", [reason])
     st.update(status="blocked", reason=reason)
     ctx.q.save(st)
@@ -2415,6 +2453,9 @@ def process(ctx, st):
         beat(ctx, ticket=key, stage=st["stage"], step="")
         ctx.q.log(key, f"{st['stage']} (attempt {st['attempt'] + 1}, {ctx.model})")
         try:
+            if st.get("in_place") and isinstance(st.get("nested_base"), dict):   # left by a run that died
+                nested_check(ctx, st, st["stage"], (ctx.vault, ctx.q.root))
+            nested_block(st)   # before any stage, push too: a launch that ended without a result
             STAGES[st["stage"]](ctx, st)
         except NestedMoved as e:   # kept: once the owner has looked, a retry checks the work
             block(ctx, st, str(e), keep=True)
@@ -2887,8 +2928,7 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
         st["stage"] = stage
     if stage or fresh:   # the agent runs again; only a plain retry checks the kept result again
         st.pop("verify_only", None)
-        st.pop("verified_sha", None)
-        st.pop("nested_base", None)
+        st.pop("verified_sha", None)   # nested_base stays: the launch that died is compared all the same
     if starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "must_fix", "warnings", "verify_only", "verified_sha"):
             st.pop(k, None)

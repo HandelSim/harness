@@ -2356,6 +2356,98 @@ class NestedReposTest(Base):
         rc, out = self.run_queue()
         self.assertEqual(self.status()["status"], "done", out)
 
+    def stopped_after_a_commit_in_libA(self):
+        lib = self.ignored_libA()
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1", FAKE_SLEEP_NESTED=lib)
+        self.add_in_place()
+        p = self.run_bg()
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        self.wait_for(lambda: sh("git", "-C", lib, "log", "-1", "--format=%s").strip() == "agent", "the commit in libA")
+        self.q("stop", "ABC-1")
+        self.wait_for(lambda: self.status()["status"] == "stopped", "ABC-1 to stop", timeout=20)
+        p.wait(timeout=30)
+        for k in ("FAKE_SLEEP", "FAKE_SLEEP_NESTED"):
+            del os.environ[k]
+        self.assertIn("nested_moved", self.status())
+        return lib
+
+    def test_another_block_first_says_it_too(self):
+        self.stopped_after_a_commit_in_libA()
+        gd = self.git_p("rev-parse", "--absolute-git-dir")   # what a killed agent can leave
+        os.makedirs(os.path.join(gd, "rebase-merge"))
+        self.q("retry", "ABC-1")
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("rebase", st["reason"])
+        self.assertIn("Also, the implement agent changed repositories inside the project", st["reason"])
+        self.assertIn("libA: 1 new commit(s)", st["reason"])
+        self.assertNotIn("nested_moved", st)
+
+    def test_a_retry_from_the_push_is_checked_too(self):
+        self.stopped_after_a_commit_in_libA()
+        c = self.git_p("-c", "user.name=A", "-c", "user.email=a@example.com", "commit-tree", "ABC-1^{tree}", "-p",
+                       "ABC-1", "-m", "ABC-1: the owner's commit on the branch")
+        self.git_p("update-ref", "refs/heads/ABC-1", c)
+        rc, out = self.q("retry", "ABC-1", "--stage", "push")
+        self.assertEqual(rc, 0, out)
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("the implement agent changed repositories inside the project", st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+
+    def test_a_baseline_left_by_a_run_that_died_is_looked_at_first(self):
+        lib = self.ignored_libA()
+        self.add_in_place()
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        st.update(nested_base=tq.nested_state(self.project), nested_stage="implement")
+        q.save(st)
+        sh("git", "-C", lib, "-c", "user.name=A", "-c", "user.email=a@example.com", "commit", "-q", "--allow-empty",
+           "-m", "the agent before the run died")
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("the implement agent changed repositories inside the project: libA: 1 new commit(s)",
+                      st["reason"].replace(", which the queue does not verify, commit or push", ""))
+        self.assertNotIn("nested_base", st)
+        self.assertEqual(self.calls_of("implementing"), [])
+
+    def test_not_looked_at_is_not_unchanged(self):
+        self.ignored_libA()
+        st = {"key": "ABC-1", "project": self.project, "nested_base": tq.nested_state(self.project)}
+        ctx = types.SimpleNamespace(q=types.SimpleNamespace(log=lambda *a: None, save=lambda s: None))
+        with mock.patch.object(tq, "nested_moved", side_effect=RuntimeError("git ls-files timed out")):
+            tq.nested_check(ctx, st, "implement", (), ended=False)   # a launch that did not end: kept for the next
+            self.assertIn("nested_base", st)
+            self.assertNotIn("nested_moved", st)
+            tq.nested_check(ctx, st, "implement", ())
+        self.assertNotIn("nested_base", st)
+        self.assertTrue(st["nested_moved"]["unknown"])
+        with self.assertRaises(tq.NestedMoved) as e:
+            tq.nested_block(st)
+        self.assertIn("the implement agent may have changed repositories inside the project: they could not be "
+                      "looked at after it (git ls-files timed out)", str(e.exception).replace(
+                          ", which the queue does not verify, commit or push", ""))
+
+    def test_a_link_to_a_name_that_is_not_utf8(self):
+        lib = self.ignored_libA()
+        os.symlink(b"caf\xe9".decode("utf-8", "surrogateescape"), os.path.join(lib, "odd"))
+        self.assertTrue(tq.nested_state(self.project)["libA"]["files"]["odd"].startswith("?? link "))
+
+    def test_a_tracked_file_made_a_repository_is_a_bare_pointer(self):
+        put(os.path.join(self.project, "lib"), "a file\n")
+        self.git_p("add", "lib")
+        self.git_p("commit", "-q", "-m", "a file")
+        base = self.git_p("rev-parse", "HEAD")
+        self.git_p("rm", "-q", "--cached", "lib")
+        os.remove(os.path.join(self.project, "lib"))
+        self.repo("lib")
+        self.git_p("add", "lib")
+        self.git_p("commit", "-q", "-m", "a repository in its place")
+        self.assertEqual(tq.added_gitlinks(self.project, base, "HEAD"), ["lib"])
+
     def test_a_file_written_again_as_it_was_is_no_change(self):
         lib = self.ignored_libA()
         put(os.path.join(lib, "lib.txt"), "lib, the owner's edit\n")
@@ -2383,6 +2475,20 @@ class NestedReposTest(Base):
         st = self.status("ABC-2")
         self.assertEqual(st["status"], "blocked")
         self.assertIn("newlib: a repository inside the project is committed as a bare pointer", st["reason"])
+
+    def test_the_projects_submodules_are_its_own(self):
+        # a build step (git submodule update) or the ticket moves one's HEAD: the top commit says so
+        sub = os.path.join(self.tmp, "sub")
+        sh("git", "init", "-q", "-b", "main", sub)
+        sh("git", "-C", sub, "-c", "user.name=O", "-c", "user.email=o@example.com", "commit", "-q", "--allow-empty",
+           "-m", "sub")
+        self.git_p("-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "mods/sub")
+        self.git_p("commit", "-q", "-m", "a submodule")
+        self.assertEqual(tq.nested_repos(self.project), [])
+        os.environ["FAKE_NESTED"] = "switch:mods/sub"
+        self.add_in_place()
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
 
     def test_tools_checkouts_and_a_stray_git_folder_are_not_ones(self):
         self.repo(".venv/src/pkg")

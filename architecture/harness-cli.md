@@ -729,25 +729,28 @@ fails a stage when the folder has a rebase or merge going, a left-over
 file the owner had changed or untracked. Repositories inside the project
 (their own `.git`, not the ticket's; `nested_repos`: three levels down,
 ignored ones too, any deeper one `git add -A` meets; not the project's own
-worktrees, nor the vault or the queue's state, nor tools' checkouts under
-`NESTED_SKIP` such as `.venv` or `.terraform`) are left out of the snapshot
+worktrees, nor its submodules, nor the vault or the queue's state, nor tools'
+checkouts under `NESTED_SKIP` such as `.venv` or `.terraform`) are left out of the snapshot
 (`:(exclude,literal)`, so one with no commit no longer fails it; past
 `SNAP_ARGS_MAX` characters the pathspecs go through `--pathspec-from-file`),
 and each in-place stage records their HEAD, branch and uncommitted paths with
 a hash of each one's content (`nested_base`, taken before the owner's files
-are excluded, so a deep one among them is seen; kept for a stage launched
-again after a crash). A stage that changed one (`nested_moved`: a commit, a
+are excluded, so a deep one among them is seen; past `NESTED_HASH_BUDGET`
+bytes a repository's files are known by size and mtime; one a run that died
+left is compared before the next stage, whichever a retry starts). A stage that changed one (`nested_moved`: a commit, a
 branch switch, an uncommitted path added, edited or gone; a file rewritten as
 it was is no change; a repository made since is not one) leaves
 `nested_moved` in state.json, saved with `verify_only`, and raises
-`NestedMoved` (`nested_block`, also at the start of `agent_or_kept`, so a run
-that dies first still blocks): blocked with the agent's result kept, since
+`NestedMoved` (`nested_block`, also before every stage, push too, so a run
+that dies first still blocks; any other block says it too, `nested_said`): blocked with the agent's result kept, since
 the verifier never sees those repositories and the push would go without
 them; a plain `retry` checks the result once the owner has looked. A launch
 that ends without a result (stop, halt, outage, Ctrl-C) records the same and
 drops the baseline, so the owner's own work there before the next launch is
-not taken for the agent's. `check_change` fails a commit since the start that
-adds a gitlink (a repository committed whole) which `.gitmodules` does not
+not taken for the agent's. When they cannot be looked at after a launch, that
+blocks too ("may have changed"); a launch that did not end keeps its baseline
+instead. `check_change` fails a commit since the start that adds a gitlink (a
+repository committed whole, or in a tracked file's place) which `.gitmodules` does not
 name (`added_gitlinks`, with `--ignore-submodules=none`), so submodules, the
 owner's or the ticket's, pass. A ticket's change in
 another repository is a ticket of its own (`add --project <top>/<repo>`);
