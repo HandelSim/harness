@@ -126,8 +126,10 @@ cmd_queue retry ABC-1 --stage fix >/dev/null || fail "Q5: retry --stage failed"
 [[ "$(qs ABC-1 status stage stages)" == "queued fix ['review', 'fix', 'push']" ]] || fail "Q5: retry --stage — $(qs ABC-1 status stage stages)"
 if cmd_queue retry ABC-1 --stage 2>/dev/null; then fail "Q5: retry --stage without a stage accepted"; fi
 grep -q 'no queue run is going' < <(cmd_queue halt) || fail "Q5: halt with no run should say so"
+grep -q 'no queue run is going' < <(cmd_queue halt --force) || fail "Q5: halt --force with no run should say so"
+cmd_queue halt --now >/dev/null 2>&1 && fail "Q5: halt takes only --force"
 cmd_queue remove ABC-1 ABC-2 >/dev/null
-ok "Q5: status --json, note, move, stop, retry --stage, halt, add --stages/--ref/--note/--start/--branch/--in-place/--review-plan"
+ok "Q5: status --json, note, move, stop, retry --stage, halt [--force], add --stages/--ref/--note/--start/--branch/--in-place/--review-plan"
 
 # --- Q6: run's launch setup, with everything around it stubbed ---------------
 # A container run answers the firewall question once (stages have no tty) and
