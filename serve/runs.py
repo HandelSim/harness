@@ -6,7 +6,7 @@ control room: its runner, its tickets, and every action harness queue has.
   /runs                       live runs, queue tickets by stage, then everything else
   /runs/queue                 the queue: the runner (start, stop), every ticket in
                               order with its stage strip and row actions, and a form
-                              to add tickets (stages, existing work, a note)
+                              to add tickets (stages, start, branch, in place, a note)
   /runs/queue/live            the queue page's live regions, as JSON (polled)
   /runs/<session>             the transcript: messages, thinking, every tool call with
                               its input and output, subagent sessions nested; follows a
@@ -430,6 +430,7 @@ class Runs:
         self.vault = vault
         self.harness = harness or HARNESS
         self.launched = None        # the `harness queue run` this viewer started: (Popen, started at)
+        self._in_place = {}         # KEY: (state.json stat, project, launch windows) of in-place tickets
         self.launch_lock = threading.RLock()
 
     # --- reading -------------------------------------------------------------
@@ -537,20 +538,50 @@ class Runs:
 
     # --- the queue -----------------------------------------------------------
 
-    def ticket_of(self, directory):
-        """The queue ticket KEY whose clone (state/queue/KEY/repo) directory is in, or ""."""
+    def ticket_of_row(self, row):
+        """ticket_of for a session row: its folder and when it was made."""
+        return self.ticket_of(row.get("directory") or "", _ms(row.get("time_created")))
+
+    def ticket_of(self, directory, created=0):
+        """The queue ticket KEY whose clone (state/queue/KEY/repo) directory is in, or
+        "". An in-place ticket's agents work in the project itself: a session there
+        made (created, ms) while one of the ticket's stages ran is the ticket's."""
         if not self.queue_dir or not directory:
             return ""
         q, d = _norm(self.queue_dir), _norm(directory)
         prefix = q.rstrip("/\\") + os.sep
         if not d.startswith(os.path.normcase(prefix)):
-            return ""
+            return self._in_place_ticket(d, created) if created else ""
         rest = d[len(prefix):].replace("\\", "/").split("/")
         if len(rest) >= 2 and rest[1] == "repo":
             # the KEY as the queue spelled it, not normcase'd
             for name in self._ticket_dirs():
                 if os.path.normcase(name) == rest[0]:
                     return name
+        return ""
+
+    def _in_place_ticket(self, d, created):
+        for key in self._ticket_dirs():
+            path = os.path.join(self.queue_dir, key, "state.json")
+            try:
+                fs = os.stat(path)
+                mtime = (fs.st_mtime_ns, fs.st_size, fs.st_ino)   # the queue replaces it: a new inode
+            except OSError:
+                continue
+            got = self._in_place.get(key)
+            if not got or got[0] != mtime:
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        st = json.load(f)
+                except (OSError, ValueError):
+                    st = {}
+                st = st if isinstance(st, dict) else {}
+                wins = [w for w in st.get("launches") or [] if isinstance(w, list) and len(w) == 2
+                        and all(isinstance(x, int) for x in w)] if st.get("in_place") is True else []
+                proj = st.get("project")
+                got = self._in_place[key] = (mtime, _norm(proj) if isinstance(proj, str) else "", wins)
+            if got[1] == d and any(a <= created and (not b or created <= b) for a, b in got[2]):
+                return key
         return ""
 
     def _ticket_dirs(self):
@@ -581,9 +612,12 @@ class Runs:
         if not isinstance(st, dict):
             return {}
         out = {k: st[k] for k in ("status", "stage", "reason", "updated", "vault", "project", "base", "ref",
-                                  "sha", "created", "stopped_from") if isinstance(st.get(k), str)}
+                                  "start", "branch", "sha", "created", "stopped_from") if isinstance(st.get(k), str)}
+        out.setdefault("start", out.get("ref", ""))
         out["attempt"] = st["attempt"] if isinstance(st.get("attempt"), int) else 0
         out["plan_approved"] = st.get("plan_approved") is True
+        out["in_place"] = st.get("in_place") is True
+        out["plan_review"] = st.get("plan_review") is True
         want = st.get("stages")
         want = [s for s in want if isinstance(s, str)] if isinstance(want, list) and want else list(STAGES)
         out["stages"] = [s for s in STAGES if s in want]
@@ -722,17 +756,21 @@ class Runs:
     # --- the queue's runner and sessions ----------------------------------------
 
     def ticket_sessions(self, key):
-        """Every top session run in the ticket's clone, from every source, archived
-        ones too, oldest first."""
+        """Every top session run in the ticket's clone (or, in place, in the project
+        while its stages ran), from every source, archived ones too, oldest first."""
         out = []
+        st = self.ticket_state(key)
+        # the project's folder name: its path may be spelled C:/... or /c/...
+        needle = os.path.basename(st["project"].replace("\\", "/").rstrip("/")) if st.get("in_place") and st.get("project") else key
+        needle = needle or key
         for src in self.sources:
             for r in self._query(src, "select s.id, s.parent_id, s.directory, s.title, s.agent, s.model, "
                                       "s.time_created, s.time_updated, s.tokens_input, s.tokens_output, s.cost, "
                                       "(select count(*) from session c where c.parent_id = s.id) as kids "
                                       "from session s where s.parent_id is null and instr(s.directory, ?) > 0 "
-                                      "order by s.time_created limit 500", (key,)):
+                                      "order by s.time_created limit 500", (needle,)):
                 d = dict(r)
-                if self.ticket_of(d.get("directory") or "") == key:
+                if self.ticket_of_row(d) == key:
                     d["source"] = src
                     out.append(d)
         out.sort(key=lambda d: _ms(d["time_created"]))
@@ -1170,7 +1208,7 @@ def _list_body(runs, query=""):
         parts.append("</ul></section>")
     tickets, other = {}, []
     for r in rows:
-        key = runs.ticket_of(r.get("directory") or "")
+        key = runs.ticket_of_row(r)
         if key:
             tickets.setdefault(key, []).append(r)
         else:
@@ -1272,12 +1310,17 @@ def _ticket_row(runs, key, st, i, n, now):
         acts.append(_btn(base + "retry", "Retry", "sm", back))
     acts.append(_btn(base + "remove", "Remove", "sm danger", back, disabled=status == "running",
                      title="Stop it first" if status == "running" else "",
-                     confirm=f"Remove {key} from the queue? Its clone and stage outputs are deleted."))
+                     confirm=f"Remove {key} from the queue? Its " + ("stage outputs are deleted (the project "
+                             "and its branch stay)." if st.get("in_place") else "clone and stage outputs are deleted.")))
     tone = " wait" if status in WAITING + ("interrupted",) else " run" if status == "running" else ""
     proj = os.path.basename((st.get("project") or "").rstrip("/\\"))
     tags = f"<span class='tag' title='{esc(st.get('project', ''))}'>{esc(proj)}</span>" if proj else ""
-    if st.get("ref"):
-        tags += f" <span class='tag' title='the work is at this ref'>{esc(st['ref'])}</span>"
+    if st.get("start"):
+        tags += f" <span class='tag' title='the work starts from this'>from {esc(st['start'][:40])}</span>"
+    if st.get("branch") and st["branch"] != key:
+        tags += f" <span class='tag' title='the branch the work ends on'>on {esc(st['branch'])}</span>"
+    if st.get("in_place"):
+        tags += " <span class='tag' title='its agents work in the project folder itself, not a clone'>in place</span>"
     when = _iso_ms(st.get("updated", ""))
     return (f"<div class='tk{tone}'><span class='pos'>{i + 1}</span><div class='main'><div class='key'>"
             f"<a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>{_pill(status, st.get('stopping'))}{tags}</div>"
@@ -1390,16 +1433,27 @@ def add_form(runs, form=None, err=""):
             f"<datalist id='projects'>{opts}</datalist><small>the git repository the work is in (absolute path)</small></label>"
             f"<label class='fld'>Base<input name='base' spellcheck='false' value='{esc(v('base'))}' "
             "placeholder='the project&#39;s current branch'><small>branch or commit the work goes onto</small></label>"
-            f"<label class='fld'>Existing work<input name='ref' spellcheck='false' value='{esc(v('ref'))}' "
-            "placeholder='origin/ABC-123'><small>where a solution already is: the ticket branch starts there</small></label>"
+            f"<label class='fld'>Start from<input name='ref' spellcheck='false' value='{esc(v('ref'))}' "
+            "placeholder='the base'><small>where the work starts: a branch, tag or commit (origin/ABC-123 is "
+            "fetched first, e.g. existing work), or <b>here</b>: what the project has checked out</small></label>"
+            f"<label class='fld'>Branch<input name='branch' spellcheck='false' value='{esc(v('branch'))}' "
+            "placeholder='the ticket key'><small>the branch the work ends on; an existing one is only moved "
+            "forward (start from it to carry on its work)</small></label>"
             "</div>"
+            "<div class='checks'>"
+            f"<label title='Your uncommitted and untracked files stay as they are and are kept out of the commits; "
+            f"the folder is switched to the branch'><input type='checkbox' name='in_place' value='1'"
+            f"{' checked' if v('in_place') else ''}> work in the project folder itself, not a clone "
+            "(start defaults to here)</label>"
+            f"<label><input type='checkbox' name='review_plan' value='1'{' checked' if v('review_plan') else ''}> "
+            "hold the plan for me to approve</label></div>"
             f"<fieldset><legend>What still needs doing</legend><div class='presets'>{presets}</div>"
             f"<div class='checks' id='stagechecks'>{checks}</div></fieldset>"
             "<label class='fld'>Note for the agents<textarea name='note' maxlength='4000' "
             "placeholder='Context every stage gets, e.g. the solution is on origin/ABC-3122; only the "
             f"review is left.'>{esc(v('note'))}</textarea></label>"
             "<div class='formacts'><button type='submit' class='primary'>Add to the queue</button>"
-            "<span class='muted' id='addhint'>Review without implement needs the existing work's ref.</span></div>"
+            "<span class='muted' id='addhint'>Review without implement needs where the work is (start from).</span></div>"
             "</form></section>")
 
 
@@ -1417,7 +1471,7 @@ def render_queue_page(runs, msg="", bad=False, form=None, err=""):
 
 # --- /runs/ticket/KEY ---------------------------------------------------------------
 
-def _answer_form(key, qs):
+def _answer_form(key, qs, review=False):
     parts = [f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"]
     for i, q in enumerate(qs[:FORM_QUESTIONS]):
         cls = "q blocking" if q.get("blocking") else "q"
@@ -1426,11 +1480,16 @@ def _answer_form(key, qs):
                      f"<textarea name='a{i}' placeholder='Your answer (leave empty to go with its default)'>"
                      "</textarea></label>")
     extra = "Anything else for the planner" if qs else "Your answers, or anything the planner should know"
-    if len(qs) > FORM_QUESTIONS:
+    if review:
+        extra = "Your feedback on the plan: what to change, add or drop"
+    elif len(qs) > FORM_QUESTIONS:
         extra = "Answers to the remaining questions, and anything else"
+    go = "" if review else ("<button type='submit' name='defaults' value='1' title='The plan is made again with "
+                            "the defaults and the ticket goes on to implement without coming back to you'>"
+                            "Go with the defaults</button>")
     parts.append(f"<label><div class='q'>{extra}</div><textarea name='note'></textarea></label>"
-                 "<div class='acts'><button type='submit' class='primary'>Send answers and plan again</button>"
-                 "<button type='submit' name='defaults' value='1'>Go with the defaults</button></div></form>")
+                 "<div class='acts'><button type='submit' class='primary'>"
+                 f"{'Send feedback and plan again' if review else 'Send answers and plan again'}</button>{go}</div></form>")
     return "".join(parts)
 
 
@@ -1441,9 +1500,13 @@ def _t_head(runs, key, st, pos, n):
         facts.append(f"<span>project <b>{esc(st['project'])}</b></span>")
     if st.get("base"):
         facts.append(f"<span>base <b>{esc(st['base'])}</b></span>")
-    if st.get("ref"):
-        facts.append(f"<span>work from <b>{esc(st['ref'])}</b></span>")
-    facts.append(f"<span>branch <b>{esc(key)}</b></span>")
+    if st.get("start"):
+        facts.append(f"<span>from <b>{esc(st['start'])}</b></span>")
+    facts.append(f"<span>branch <b>{esc(st.get('branch') or key)}</b></span>")
+    if st.get("in_place"):
+        facts.append("<span><b>in place</b> (no clone)</span>")
+    if st.get("plan_review"):
+        facts.append("<span>plan held for approval</span>")
     if st.get("sha"):
         facts.append(f"<span>commit <b>{esc(st['sha'][:12])}</b></span>")
     if st.get("created"):
@@ -1490,7 +1553,8 @@ def _t_acts(runs, key, st, rows, live, pos, n):
     parts.append("<span class='sep'></span>")
     parts.append(_btn(base + "remove", "Remove", "sm danger", disabled=status == "running",
                       title="Stop it first: its agent is working in the clone" if status == "running" else "",
-                      confirm=f"Remove {key}? Its clone, outputs and log are deleted."))
+                      confirm=f"Remove {key}? Its " + ("outputs and log are deleted (the project and its "
+                              "branch stay)." if st.get("in_place") else "clone, outputs and log are deleted.")))
     return f"<div class='acts'>{''.join(parts)}</div>"
 
 
@@ -1499,12 +1563,16 @@ def _t_questions(runs, key, st):
     qs = st.get("questions") or []
     vault = runs.vault_of(st)
     if status in WAITING and vault:
-        head = "Questions for you" if qs else "Answer the planner"
-        intro = ("The plan is waiting on the blocking questions. Answer what you can; an empty box takes the "
-                 "question's default. The ticket is planned again with your answers." if status == "needs-answers"
-                 else "Answering sends the ticket back to plan with your answers.")
+        review = status == "plan-review"
+        head = "Agree the plan, or send feedback" if review else "Questions for you" if qs else "Answer the planner"
+        again = (" The planner revises the plan with them and it comes back here: nothing is built until "
+                 "you approve it.")
+        intro = ("Approve the plan to start building, or answer and give feedback here." + again if review
+                 else "The plan is waiting on the blocking questions. Answer what you can; an empty box takes "
+                 "the question's default." + again + " Go with the defaults skips that." if status == "needs-answers"
+                 else "Answering sends the ticket back to plan with your answers." + again)
         return (f"<section class='panel'><h2>{head}</h2><div class='muted'>{intro}</div>"
-                f"{_answer_form(key, qs)}</section>")
+                f"{_answer_form(key, qs, review)}</section>")
     if qs:
         items = "".join(f"<li><div class='{'q blocking' if q.get('blocking') else 'q'}'>{esc(q['text'])}</div>"
                         f"<div class='muted'>{'waiting on you' if q.get('blocking') else 'going with the default'}"
@@ -1726,7 +1794,8 @@ def ticket_action(runs, key, action, form):
         text = answer_text(form)
         if not text:
             return False, "nothing to send: answer a question, or choose Go with the defaults"
-        return _queue(runs, ["answer", key, "--vault", vault, "--stdin"], text)
+        go = ["--go"] if _one(form, "defaults").strip() else []   # took the defaults: no plan review
+        return _queue(runs, ["answer", key, "--vault", vault, "--stdin"] + go, text)
     if action == "approve":
         if status != "plan-review":
             return False, f"{key} is {status}, not a plan waiting for approval{again}"
@@ -1785,8 +1854,9 @@ def add_tickets(runs, form):
     project = project_path(_one(form, "project"))
     if not project or not os.path.isabs(project) or not os.path.isdir(project):
         return False, "the project folder must be an absolute path to a folder that exists"
-    base, ref = _one(form, "base").strip(), _one(form, "ref").strip()
-    for name, v in (("base", base), ("existing work", ref)):
+    base, ref, branch = (_one(form, n).strip() for n in ("base", "ref", "branch"))
+    in_place, review_plan = bool(_one(form, "in_place")), bool(_one(form, "review_plan"))
+    for name, v in (("base", base), ("start from", ref), ("branch", branch)):
         if v and not ref_ok(v):
             return False, f"{name}: not a branch, tag or commit name: {v[:80]}"
     preset = _one(form, "preset") or "full"
@@ -1800,8 +1870,8 @@ def add_tickets(runs, form):
         return False, "pick at least one stage"
     if "fix" in stages and "review" not in stages:
         return False, "fix runs only after a review asks for fixes; pick review too"
-    if "implement" not in stages and any(s in stages for s in ("review", "fix", "push")) and not ref:
-        return False, "with no implement stage, give the existing work's ref (e.g. origin/ABC-123) to review"
+    if "implement" not in stages and any(s in stages for s in ("review", "fix", "push")) and not ref and not in_place:
+        return False, "with no implement stage, say where the work is in start from (e.g. origin/ABC-123)"
     note = _one(form, "note").replace("\r\n", "\n")
     if len(note) > ADD_NOTE_MAX:
         return False, f"the note is over {ADD_NOTE_MAX} characters"
@@ -1809,7 +1879,13 @@ def add_tickets(runs, form):
     if base:
         args.append(f"--base={base}")
     if ref:
-        args.append(f"--ref={ref}")
+        args.append(f"--start={ref}")
+    if branch:
+        args.append(f"--branch={branch}")
+    if in_place:
+        args.append("--in-place")
+    if review_plan:
+        args.append("--review-plan")
     if note.strip():
         args.append(f"--note={note}")
     return _queue(runs, args)
@@ -1835,7 +1911,7 @@ def session_stop(runs, sid):
     if not row:
         return False, "no such session"
     root = runs.root_of(src, row) or row
-    key = runs.ticket_of(root.get("directory") or "")
+    key = runs.ticket_of_row(root)
     if not key:
         return False, ("this is not a queue stage; stop a harness -p run from its terminal, "
                        "and an interactive one from opencode")
@@ -1876,7 +1952,7 @@ def render_side(runs, src, row, live, sent="", todos=None, oc_url=""):
     now = time.time()
     root = runs.root_of(src, row) or row
     parts = []
-    key = runs.ticket_of(root.get("directory") or "")
+    key = runs.ticket_of_row(root)
     if key:
         st = runs.ticket_state(key)
         stage, n = _stage_label(runs, key, root, st, None)
@@ -1986,10 +2062,11 @@ COMMON_JS = """
     var checks = add.querySelectorAll('input[name^=stage_]');
     var hint = document.getElementById('addhint');
     function sync() {
-      var on = [], ref = add.querySelector('input[name=ref]').value.trim();
+      var on = [], ref = add.querySelector('input[name=ref]').value.trim() ||
+        add.querySelector('input[name=in_place]').checked;
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
       var need = on.indexOf('implement') < 0 && (on.indexOf('review') >= 0 || on.indexOf('push') >= 0);
-      hint.textContent = need && !ref ? 'Review without implement needs the existing work\\u2019s ref.' :
+      hint.textContent = need && !ref ? 'Review without implement needs where the work is (start from).' :
         on.length ? 'Stages: ' + on.join(' \\u2192 ') : 'Pick at least one stage.';
       hint.className = need && !ref || !on.length ? 'err' : 'muted';
     }
@@ -2142,7 +2219,7 @@ def render_detail(runs, sid, sent="", follow="", oc_url=None, msg="", bad=False)
     live = runs.live()
     msgs = runs.messages(src, sid)
     crumbs = ["<a href='/runs'>Sessions</a>"]
-    key = runs.ticket_of(row.get("directory") or "")
+    key = runs.ticket_of_row(row)
     if key:
         crumbs = [f"<a href='/runs/queue'>Queue</a><span>/</span><a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>"]
     for p in runs.chain(src, row):
@@ -2184,7 +2261,7 @@ def follow_target(runs, since=0, queue=False):
     best = None
     for r in runs.sessions(limit=200):
         created = _ms(r["time_created"])
-        if created < since or (queue and not runs.ticket_of(r.get("directory") or "")):
+        if created < since or (queue and not runs.ticket_of_row(r)):
             continue
         working = r["id"] in live or now - _ms(r["time_updated"]) / 1000 <= ACTIVE
         rank = (r["id"] in live, working, created)
@@ -2213,7 +2290,7 @@ def tail(runs, sid, start, oc_url=None):
     working = sid in live or time.time() - _ms(row.get("time_updated")) / 1000 <= ACTIVE
     body = render_messages(msgs, sid, start)
     side = render_side(runs, src, row, live, todos=todos_of(msgs), oc_url=oc_url(src.label, sid) if oc_url else "")
-    bar = nav(runs, "queue" if runs.ticket_of(row.get("directory") or "") else "sessions")
+    bar = nav(runs, "queue" if runs.ticket_of_row(row) else "sessions")
     sig = hashlib.sha1(f"{start}:{len(msgs)}:{body}:{side}".encode()).hexdigest()
     return {"from": start, "count": len(msgs), "html": body, "sig": sig, "working": working, "side": side,
             "nav": bar}

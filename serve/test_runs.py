@@ -284,7 +284,9 @@ class RunsTest(RunsServer):
         self.ticket(status="plan-review", questions=[])
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("action='/runs/ticket/ABC-12/approve'", body)
-        self.assertIn("Answer the planner", body)   # a free answer box without questions
+        self.assertIn("Agree the plan, or send feedback", body)   # a free feedback box
+        self.assertIn("Send feedback and plan again", body)
+        self.assertNotIn("Go with the defaults", body)
         self.ticket(status="running", attempt=1)
         self.run_on(stage="plan", step="asking the <verifier>")
         r, body = self.req("GET", "/runs/ticket/ABC-12")
@@ -320,6 +322,7 @@ class RunsTest(RunsServer):
         st = self.state()
         self.assertEqual((st["status"], st["stage"]), ("queued", "plan"))
         self.assertNotIn("questions", st)
+        self.assertIs(st["plan_hold"], True)   # the plan made with the answers comes back to be agreed
         with open(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-12-answers.md")) as f:
             text = f.read()
         self.assertIn("## Which <db>?\n\npostgres", text)
@@ -328,6 +331,9 @@ class RunsTest(RunsServer):
         self.assertIn("<p class='flash' role='status'>", body)
         r, body = self.act("answer", [("note", "one more thing")])
         self.assertEqual(r.status, 303)   # a queued ticket takes more answers before it runs
+        r, body = self.act("answer", [("defaults", "1")])
+        self.assertEqual(r.status, 303)
+        self.assertIs(self.state()["plan_hold"], False)   # the defaults taken: it goes on without coming back
         self.ticket(status="running")
         self.run_on()
         r, body = self.act("answer", [("defaults", "1")])
@@ -336,6 +342,18 @@ class RunsTest(RunsServer):
         r, body = self.act("approve")
         self.assertEqual(r.status, 409)
         self.assertIn("not a plan waiting for approval", body)
+
+    def test_an_in_place_tickets_sessions_are_those_made_while_its_stages_ran(self):
+        proj = os.path.join(self.tmp.name, "proj")
+        rs = runs.Runs([("host", self.data)], queue_dir=self.queue)
+        row = {"directory": proj, "time_created": self.now_ms - 60000}   # ROOT, made in the project
+        self.ticket(in_place=True, project=proj, launches=[[self.now_ms - 70000, self.now_ms - 50000]])
+        self.assertEqual(rs.ticket_of_row(row), "ABC-12")
+        self.assertEqual([d["id"] for d in rs.ticket_sessions("ABC-12")], [ROOT])
+        self.ticket(in_place=True, project=proj, launches=[[self.now_ms - 50000, 0]])   # the owner's own, before
+        self.assertEqual(rs.ticket_of_row(row), "")
+        self.ticket(in_place=False, project=proj, launches=[[self.now_ms - 70000, self.now_ms - 50000]])
+        self.assertEqual(rs.ticket_of_row(row), "")
 
     def test_approve_and_retry_on_the_page(self):
         self.ticket(status="plan-review", stage="implement")
@@ -538,6 +556,25 @@ class QueuePageTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-99/live")
         self.assertEqual(json.loads(body), {"gone": "/runs/queue"})
 
+    def test_add_with_a_start_a_branch_in_place_and_plan_review(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.start()
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("preset", "review"),
+                                                ("ref", "here"), ("branch", "feat/x"), ("in_place", "1"),
+                                                ("review_plan", "1")])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
+            st = json.load(f)
+        self.assertEqual((st["start"], st["branch"], st["in_place"], st["plan_review"]),
+                         ("here", "feat/x", True, True))
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn(">in place</span>", body)
+        self.assertIn(">on feat/x</span>", body)
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-8"), ("project", proj), ("preset", "review"),
+                                                ("branch", "a..b")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("branch: not a branch", body)
+
     def test_add_a_review_only_ticket_with_its_ref_and_a_note(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
         self.start()
@@ -548,7 +585,7 @@ class QueuePageTest(RunsServer):
         self.assertTrue(r.getheader("Location").startswith("/runs/queue?done="))
         with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
             st = json.load(f)
-        self.assertEqual((st["stages"], st["ref"], st["stage"]), (["review"], "ABC-7-work", "review"))
+        self.assertEqual((st["stages"], st["start"], st["stage"]), (["review"], "ABC-7-work", "review"))
         r, body = self.req("GET", "/runs/ticket/ABC-7")
         self.assertIn("the fix is on &lt;ABC-7-work&gt;", body)
         self.assertNotIn("<ABC-7-work>", body)

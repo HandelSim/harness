@@ -100,7 +100,13 @@ qs() { python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print(*(s.ge
        "$state_root/queue/$1/state.json" "${@:2}"; }
 cmd_queue add ABC-1 ABC-2 --dir "$PROJ" --stages review,push --ref main --note 'keep it small' >/dev/null \
     || fail "Q5: add with --stages/--ref/--note failed"
-[[ "$(qs ABC-1 stages stage ref)" == "['review', 'push'] review main" ]] || fail "Q5: add options not stored — $(qs ABC-1 stages stage ref)"
+[[ "$(qs ABC-1 stages stage start)" == "['review', 'push'] review main" ]] || fail "Q5: add options not stored — $(qs ABC-1 stages stage start)"
+cmd_queue add ABC-3 --dir "$PROJ" --start main --branch feat-x --in-place --review-plan >/dev/null \
+    || fail "Q5: add with --start/--branch/--in-place/--review-plan failed"
+[[ "$(qs ABC-3 start branch in_place plan_review)" == "main feat-x True True" ]] \
+    || fail "Q5: --start/--branch/--in-place/--review-plan not stored — $(qs ABC-3 start branch in_place plan_review)"
+if cmd_queue add ABC-4 --dir "$PROJ" --branch 2>/dev/null; then fail "Q5: --branch without a value accepted"; fi
+cmd_queue remove ABC-3 >/dev/null
 if cmd_queue add ABC-3 --dir "$PROJ" --stages 2>/dev/null; then fail "Q5: --stages without a value accepted"; fi
 if cmd_queue add ABC-3 --dir "$PROJ" --stages frob >/dev/null 2>&1; then fail "Q5: an unknown stage accepted"; fi
 cmd_queue note abc-1 'second note' >/dev/null || fail "Q5: note failed"
@@ -121,7 +127,7 @@ cmd_queue retry ABC-1 --stage fix >/dev/null || fail "Q5: retry --stage failed"
 if cmd_queue retry ABC-1 --stage 2>/dev/null; then fail "Q5: retry --stage without a stage accepted"; fi
 grep -q 'no queue run is going' < <(cmd_queue halt) || fail "Q5: halt with no run should say so"
 cmd_queue remove ABC-1 ABC-2 >/dev/null
-ok "Q5: status --json, note, move, stop, retry --stage, halt, add --stages/--ref/--note"
+ok "Q5: status --json, note, move, stop, retry --stage, halt, add --stages/--ref/--note/--start/--branch/--in-place/--review-plan"
 
 # --- Q6: run's launch setup, with everything around it stubbed ---------------
 # A container run answers the firewall question once (stages have no tty) and
@@ -184,6 +190,10 @@ grep -qF -- "docker ps -q --filter label=harness.agent=true --filter label=harne
 [[ "$(grep -c '^docker stop' "$Q7_LOG")" == 3 ]] || fail "Q7: stops — $(cat "$Q7_LOG")"
 out=$(Q7_PS="" q7 /q/ABC-1/repo) && [[ "$out" == 0 ]] || fail "Q7: none running gave '$out'"
 if Q7_PS=fail q7 /q/ABC-1/repo >/dev/null; then fail "Q7: a docker failure must fail"; fi
-ok "Q7: _stop_agents: by the clone's mount label, through harness_docker, counts what stopped"
+# With a launch id (an in-place ticket shares the folder with the owner's agents): only that launch's.
+: > "$Q7_LOG"; Q7_PS="c1" q7 /proj abc123 >/dev/null || fail "Q7: _stop_agents with a launch id failed"
+grep -qF -- "docker ps -q --filter label=harness.agent=true --filter label=harness.mount=/abs/proj --filter label=harness.queue-launch=abc123" "$Q7_LOG" \
+    || fail "Q7: launch filter — $(cat "$Q7_LOG")"
+ok "Q7: _stop_agents: by the clone's mount label (and launch id), through harness_docker, counts what stopped"
 
 echo "QUEUE TEST PASSED"

@@ -608,7 +608,8 @@ the hub in Obsidian.
 
 `harness queue` (`cmd_queue`, then `scripts/ticket_queue.py`) works queued
 tickets one at a time with no one at the keyboard. `add KEY... [--dir]
-[--base] [--stages LIST] [--ref REF] [--note TEXT]` records the project and base (default: its current branch);
+[--base] [--stages LIST] [--start REF|here] [--branch NAME] [--in-place]
+[--review-plan] [--note TEXT]` records the project and base (default: its current branch);
 `run [--host] [--single-message]` needs an active vault, does the launch
 checks once (host mode when docker is missing, `host_confirm_gate` asked
 once), starts the host proxy if it is not running and hands the rest to the
@@ -620,9 +621,34 @@ ticket page uses), `findings`, `watch` (tails `run.log`) and `log
 Owner control (all of it also on the run viewer's queue and ticket pages):
 `--stages` runs a subset of plan, implement, review, fix, push (kept in that
 order; `fix` needs `review`), starting at the first and done after the last;
-`--ref` starts branch `KEY` at existing work (a `remote/branch` is fetched
-first) with `base_sha` the merge-base, so `--stages review` reviews that
-branch. Without a plan stage the change is held to the ticket's own
+`--start` (alias `--ref`; default the base) is the commit the work starts
+from (a `remote/branch` is fetched first, `here` is what the project has
+checked out: frozen to its HEAD sha at add for a clone) and `--branch`
+(default `KEY`) the branch it ends on and push pushes; `base_sha` is the
+merge-base of base and start, so `--stages review --start origin/X` reviews
+that branch. An existing target branch is only ever fast-forwarded:
+`lost_by` checks the local tip and every remote's (fetched) tip, and add or
+setup refuses when the start does not contain one, rather than drop
+commits; the one exception is a local branch an earlier go of this ticket
+made (`made_branch`), whose old tip is kept at
+`refs/harness-queue/prev/KEY`. So a fresh retry of a pushed ticket is
+refused until the branch is deleted or another `--branch` is used.
+`--in-place` works in the project folder itself (`workdir()`), not a clone:
+setup saves what the owner has uncommitted (`owner.json`), never resets,
+cleans or stashes, and switches the folder to the branch at the start. Before
+each stage everything in the folder (index plus untracked, not ignored
+files) is committed to `refs/harness-queue/snap/KEY` (a chain, a temp
+index), and the owner's untracked and changed paths go in a marked block of
+`.git/info/exclude` that is removed after the stage. `in_place_problems`
+fails a stage when the folder has a rebase or merge going, a left-over
+`index.lock`, is not on the branch, or a commit since the start touches a
+file the owner had changed or untracked; changes inside nested repos are
+only logged. Windows container launches cannot work in place (`--host`).
+Each launch gets `HARNESS_QUEUE_LAUNCH` (a nonce), which harness puts on its
+container as `harness.queue-launch` and which stops `--ticket` being
+remembered for the folder; in-place stages also record `launches` windows,
+by which the run viewer maps the project's sessions to the ticket.
+`--review-plan` holds this ticket's plan as `plan-review`. Without a plan stage the change is held to the ticket's own
 "Acceptance criteria" bullets, else to "the change does what the ticket asks
 for". Must fix items with no fix stage end the ticket: `done` when review was
 last, else `blocked` (`retry KEY --stage fix` goes on). `note KEY` adds an
@@ -638,8 +664,9 @@ exits; a halt file older than the run's lock is stale and dropped), `move KEY
 up|down|top|bottom`, `remove KEY` (refused while a run is on it) and `status
 [--json]`. Killing a container launch's client leaves its container running,
 so after a stop, halt or timeout the runner calls `harness queue _stop_agents
-CLONE`, which stops the containers labelled `harness.agent=true` and
-`harness.mount=<clone>` (the log says to check `harness list` when that
+DIR LAUNCH`, which stops the containers labelled `harness.agent=true`,
+`harness.mount=<DIR>` and, given a launch id, `harness.queue-launch=<LAUNCH>`
+(so an in-place stop never hits the owner's own agents in the folder) (the log says to check `harness list` when that
 fails). The runner takes a ticket, and `stop` and `note` save state, under
 `queue.lock`. The runner polls its agent every
 2 s for the sentinels and the stage timeout (a verifier call runs in a thread
@@ -715,6 +742,10 @@ container launch can outlive its stopped client. Going back to the plan
 (`answer`) starts from a fresh clone. A
 blocking question parks the ticket as `needs-answers` and the queue moves
 on; `QUEUE_PLAN_REVIEW=1` holds each plan as `plan-review` for `approve`.
+`answer` (answers or feedback on a held plan) sets `plan_hold`, so the plan
+revised with them (the prompt has the previous plan and says to revise it)
+comes back as `plan-review` until `approve` clears it; `answer --go` (the
+viewer's "Go with the defaults") does not hold.
 A ticket is `running` from the moment a run takes it (before the clone, so an
 `answer` cannot pull the clone from under it), and its `state.json` keeps the
 run's vault, where the ticket page reads notes and writes answers even when
@@ -724,10 +755,11 @@ and, when it failed, its problems go to `state.json`'s `history` (last 30),
 which the ticket page lists.
 
 Harness never runs git in the clone once an agent has had it: it fetches
-branch `KEY` into the project as `refs/harness-queue/KEY`, diffs there,
-updates the project's `KEY` only by fast-forward (and not at all while a
-worktree of the project has `KEY` checked out) and pushes
-`sha:refs/heads/KEY` (just the ticket key) to `QUEUE_REMOTE` without force (`QUEUE_PUSH=0`
+the ticket's branch into the project as `refs/harness-queue/KEY` (in place:
+reads the branch), diffs there,
+updates the project's branch only by fast-forward (and not at all while a
+worktree of the project has it checked out, or in place) and pushes
+`sha:refs/heads/BRANCH` to `QUEUE_REMOTE` without force (`QUEUE_PUSH=0`
 keeps it local). Before each ticket `queue _pull` refreshes the vault's copy
 of the ticket; after each stage, and once more when the ticket stops, the
 ticket's `log.md` (stages, checks, verifier verdicts, outcome) is copied to the

@@ -3,11 +3,11 @@
 plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
 
   ticket_queue.py --state DIR add KEY... [--project DIR] [--base REF] [--stages LIST]
-                  [--ref REF] [--note TEXT]
+                  [--start REF|here] [--branch NAME] [--in-place] [--review-plan] [--note TEXT]
   ticket_queue.py --state DIR list | status [--json] | remove KEY... | approve KEY
   ticket_queue.py --state DIR retry KEY [--stage S] | stop KEY | halt | move KEY up|down|top|bottom
   ticket_queue.py --state DIR note KEY [--text T | --stdin]
-  ticket_queue.py --state DIR answer KEY --vault V [--text T]
+  ticket_queue.py --state DIR answer KEY --vault V [--text T] [--go]
   ticket_queue.py --state DIR findings --vault V
   ticket_queue.py --state DIR run --vault V --proxy URL --harness PATH
                   [--model M] [--default-model M] [--verify-model M] [--host]
@@ -15,8 +15,8 @@ plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
                   [--plan-review 0|1]
 Each stage is one fresh, headless agent launch through the harness CLI
 (`harness -p --yolo --ticket KEY -m MODEL PROMPT`: the firewalled container,
-or host mode) in the ticket's own clone of the project, state/queue/KEY/repo,
-on branch KEY. The prompt (scripts/queue_prompts/<stage>.md) carries
+or host mode) in the ticket's own clone of the project, state/queue/KEY/repo
+(or, --in-place, the project folder itself), on the ticket's branch. The prompt (scripts/queue_prompts/<stage>.md) carries
 everything the stage needs, the ticket, the plan, the answers and the last
 attempt's problems, because the free models only read the last message.
 
@@ -31,8 +31,12 @@ the upstream does not answer (one probe request), the whole run stops and the
 ticket stays where it was.
 
 A ticket can run a subset of the stages (--stages; fix still only after a
-review with Must fix items) and start from work that already exists (--ref:
-branch KEY starts there, the diff is from its merge-base with the base).
+review with Must fix items). Its work starts at --start (a branch, tag, commit,
+or <remote>/<branch>, fetched first; "here": the project's HEAD, and in place
+its tree as it is; default: the base) and ends on --branch (default KEY). An
+existing branch is only ever moved forward: one with commits the start lacks is
+refused. The change reviewed is from the merge-base of the base and the start,
+so existing work at the start is part of it.
 
 The owner's side runs in other processes while a run holds a ticket in memory,
 so it never writes what the run owns: notes go to KEY/notes.json (mirrored into
@@ -415,7 +419,7 @@ def clone_opts(container):
 
 
 def make_clone(q, st, container=False):
-    """Clone the project at its base into DIR/repo, on a new branch KEY (the ticket key).
+    """Clone the project into DIR/repo, on the ticket's branch at its start.
     Runs before any agent touches the clone; the clone has no remote, so the
     agent cannot push anywhere. Cloned in place, not renamed into place: Windows
     refuses to rename a directory while anything has a file in it open. A clone
@@ -428,35 +432,120 @@ def make_clone(q, st, container=False):
         if err:
             raise RuntimeError(f"{err}. Close whatever has it open (an editor, a terminal "
                                f"in it, git's fsmonitor daemon) and run harness queue retry {st['key']}")
-    base_sha = git(st["project"], "rev-parse", "--verify", st["base"] + "^{commit}").stdout.strip()
-    start = base_sha
-    if st.get("ref"):   # the work exists: the branch starts there, the change is since its merge-base
-        start = resolve_ref(st["project"], st["ref"])
-        if not start:
-            raise RuntimeError(f"{st['ref']} is not a commit in {st['project']}")
-        base_sha = git(st["project"], "merge-base", base_sha, start).stdout.strip()
+    start, base_sha = start_and_base(st)
+    ends_on(q, st, start)
     r = subprocess.run(["git", "clone", "-q", "--no-checkout", *clone_opts(container), st["project"], dest],
                        capture_output=True, timeout=600, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"), **TEXT)
     if r.returncode != 0:
         raise RuntimeError(f"git clone: {(r.stderr or r.stdout).strip()[:400]}")
-    if start != base_sha:
-        # A clone has the project's branches only; the ref (a remote-tracking one, a
-        # bare sha) comes over by a name of its own, there for the fetch alone.
-        tmp = f"refs/harness-queue-ref/{st['key']}"
-        git(st["project"], "update-ref", tmp, start)
-        try:
-            git(dest, "fetch", "-q", "--no-tags", st["project"], f"+{tmp}:{tmp}")
-        finally:
-            git(st["project"], "update-ref", "-d", tmp, check=False)
-    git(dest, "checkout", "-q", "-b", st["key"], start)
-    if start != base_sha:
-        git(dest, "update-ref", "-d", tmp, check=False)
+    # A clone has the project's branches only; the start (a remote-tracking ref, a
+    # bare sha) comes over by a name of its own, there for the fetch alone.
+    tmp = f"refs/harness-queue-ref/{st['key']}"
+    git(st["project"], "update-ref", tmp, start)
+    try:
+        git(dest, "fetch", "-q", "--no-tags", st["project"], f"+{tmp}:{tmp}")
+    finally:
+        git(st["project"], "update-ref", "-d", tmp, check=False)
+    git(dest, "checkout", "-q", "--detach", start)
+    git(dest, "update-ref", "-d", tmp, check=False)
+    git(dest, "update-ref", f"refs/heads/{branch_of(st)}", start)   # the clone's own copy of the branch
+    git(dest, "checkout", "-q", branch_of(st))
     git(dest, "remote", "remove", "origin")
     for k, fallback in (("user.name", "harness queue"), ("user.email", "harness-queue@localhost")):
         v = git(st["project"], "config", k, check=False).stdout.strip()
         git(dest, "config", k, v or fallback)
-    st["base_sha"] = base_sha
+    st.update(start_sha=start, base_sha=base_sha)
     q.save(st)
+
+
+def checked_out(project, branch):
+    """True when branch is checked out in one of the project's worktrees."""
+    return f"branch refs/heads/{branch}" in git(project, "worktree", "list", "--porcelain",
+                                                 check=False).stdout.splitlines()
+
+
+HERE = "here"   # --start here: where the project is (in place: its tree as it is, uncommitted changes too)
+
+
+def branch_of(st):
+    """The branch the work ends on: --branch, else the ticket key."""
+    return st.get("branch") or st["key"]
+
+
+def start_of(st):
+    """What the work starts from: --start (--ref in older state files), else the base."""
+    return st.get("start") or st.get("ref") or st["base"]
+
+
+def workdir(q, st):
+    """Where the agents work: the project itself (--in-place) or the ticket's clone."""
+    return st["project"] if st.get("in_place") else os.path.join(q.dir(st["key"]), "repo")
+
+
+def commit_of(project, ref):
+    """The commit ref names now (a <remote>/<branch> is fetched first); HERE is HEAD."""
+    return resolve_ref(project, "HEAD" if ref == HERE else ref)
+
+
+def start_and_base(st):
+    """(start, base_sha): the commit the work starts from, and where the change
+    being made begins (the merge-base of the base and the start: with existing
+    work at the start, that work is part of the change reviewed)."""
+    project = st["project"]
+    start = commit_of(project, start_of(st))
+    if not start:
+        raise RuntimeError(f"{start_of(st)} is not a commit in {project}")
+    base = commit_of(project, st["base"]) if st["base"] != start_of(st) else start
+    if not base:
+        raise RuntimeError(f"{st['base']} is not a commit in {project}")
+    r = git(project, "merge-base", base, start, check=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"{start_of(st)} and {st['base']} have no history in common")
+    return start, r.stdout.strip()
+
+
+def tips(project, branch):
+    """[(name, sha)]: the branch here and on each remote (fetched first), where it exists."""
+    out = []
+    local = git(project, "rev-parse", "-q", "--verify", f"refs/heads/{branch}^{{commit}}", check=False).stdout.strip()
+    if local:
+        out.append((branch, local))
+    for remote in git(project, "remote", check=False).stdout.split():
+        sha = resolve_ref(project, f"{remote}/{branch}")
+        if sha:
+            out.append((f"{remote}/{branch}", sha))
+    return out
+
+
+def lost_by(project, branch, sha):
+    """The tips of branch that sha does not contain: ending the work on branch at
+    sha would throw their commits away. [] for a new branch, or sha on top of it."""
+    return [(name, tip) for name, tip in tips(project, branch)
+            if git(project, "merge-base", "--is-ancestor", tip, sha, check=False).returncode != 0]
+
+
+def ends_on(q, st, start):
+    """Raise unless the ticket's branch can end up at start without losing commits:
+    an existing branch must be behind the start, so the work goes on from its tip.
+    The project's own branch, left by an earlier go of this ticket, is kept at
+    refs/harness-queue/prev/KEY and started again; a pushed one is never moved."""
+    project, branch = st["project"], branch_of(st)
+    lost = lost_by(project, branch, start)
+    if lost and lost == [(branch, lost[0][1])] and st.get("made_branch"):
+        prev = f"refs/harness-queue/prev/{st['key']}"
+        git(project, "update-ref", prev, lost[0][1])
+        q.log(st["key"], f"branch {branch} from the earlier go ({lost[0][1][:12]}) kept at {prev}")
+        if not st.get("in_place"):   # in place, enter_in_place moves it with the checkout
+            if checked_out(project, branch):
+                raise RuntimeError(f"branch {branch} from the earlier go is checked out; switch away from it")
+            git(project, "update-ref", f"refs/heads/{branch}", start, lost[0][1])
+        return
+    if lost:
+        names = ", ".join(f"{n} at {t[:12]}" for n, t in lost)
+        earlier = " (an earlier go of this ticket?)" if branch == st["key"] else ""
+        raise RuntimeError(f"branch {branch} has commits that {start_of(st)} does not ({names}){earlier}; "
+                           f"ending the work there would throw them away. Start from the branch "
+                           f"(--start {lost[0][0]}), end on another branch (--branch), or delete it")
 
 
 def resolve_ref(project, ref):
@@ -473,16 +562,168 @@ def resolve_ref(project, ref):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def uncommitted(project):
+    """{"untracked": [...], "changed": [...]}: what git status shows in project.
+    A nested repository is one untracked "dir/" entry."""
+    out = {"untracked": [], "changed": []}
+    raw = git(project, "status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none").stdout.split("\0")
+    i = 0
+    while i < len(raw):
+        e = raw[i]
+        i += 1
+        if len(e) < 4:
+            continue
+        out["untracked" if e[:2] == "??" else "changed"].append(e[3:])
+        if e[0] in "RC":   # a rename's old path follows
+            i += 1
+    return out
+
+
+def owner_files(q, st):
+    try:
+        with open(os.path.join(q.dir(st["key"]), "owner.json"), encoding="utf-8") as f:
+            got = json.load(f)
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+EXCLUDE_MARK = "# harness queue: the owner's uncommitted files (removed when the stage ends)"
+
+
+def exclude_block(project, paths):
+    """Keep the owner's untracked files out of git add -A in place (.git/info/exclude,
+    between marks); paths=None takes the block out again."""
+    path = git(project, "rev-parse", "--git-path", "info/exclude").stdout.strip()
+    path = path if os.path.isabs(path) else os.path.join(project, path)
+    text = read(path)
+    end = EXCLUDE_MARK.replace("(removed", "(end; removed")
+    if EXCLUDE_MARK in text:
+        a = text.index(EXCLUDE_MARK)
+        b = text.find(end, a)
+        text = text[:a].rstrip("\n") + ("\n" + text[b + len(end):].lstrip("\n") if b != -1 else "\n")
+        text = text if text.strip() else ""
+    if paths:
+        lines = ["/" + p.replace("[", "\\[").replace("*", "\\*").replace("?", "\\?") for p in paths]
+        text = (text.rstrip("\n") + "\n" if text.strip() else "") + "\n".join([EXCLUDE_MARK] + lines + [end]) + "\n"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_atomic(path, text)
+
+
+def enter_in_place(q, st):
+    """Put the project itself on the ticket's branch at its start, keeping the
+    owner's uncommitted changes (git switch carries them, and refuses rather than
+    overwrite one). What is uncommitted now is the owner's: saved to DIR/owner.json
+    for the gates. Never resets, cleans or stashes."""
+    project, branch, key = st["project"], branch_of(st), st["key"]
+    st.pop("base_sha", None)
+    q.save(st)
+    trouble = in_place_trouble(project, None)
+    if trouble:
+        raise RuntimeError(trouble)
+    start, base_sha = start_and_base(st)
+    if start_of(st) == HERE:   # frozen at the first go, as a clone's is at add: going again starts there too
+        st["start"] = start
+    ends_on(q, st, start)
+    for wt in git(project, "worktree", "list", "--porcelain", check=False).stdout.split("\n\n")[1:]:
+        if f"branch refs/heads/{branch}" in wt.splitlines():
+            raise RuntimeError(f"branch {branch} is checked out in another worktree ({wt.splitlines()[0][9:]})")
+    owner = uncommitted(project)
+    write_atomic(os.path.join(q.dir(key), "owner.json"), json.dumps(owner))
+    head = git(project, "rev-parse", "HEAD").stdout.strip()
+    on = git(project, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    if on != branch or head != start:
+        if head != start:
+            git(project, "switch", "-q", "--detach", start)
+        old = git(project, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False).stdout.strip()
+        if old != start:
+            git(project, "update-ref", f"refs/heads/{branch}", start, *([old] if old else []))
+            if not old:
+                st["made_branch"] = True
+        git(project, "switch", "-q", branch)
+    for k, fallback in (("user.name", "harness queue"), ("user.email", "harness-queue@localhost")):
+        if not git(project, "config", k, check=False).stdout.strip():
+            raise RuntimeError(f"git {k} is not set in {project}; the agent's commits need it (git config {k} ...)")
+    st.update(start_sha=start, base_sha=base_sha)
+    q.save(st)
+    n = len(owner["untracked"]) + len(owner["changed"])
+    return f"{n} uncommitted file(s) of yours kept out of the commits" if n else ""
+
+
+def in_place_trouble(project, branch):
+    """Why the project is not fit for an in-place stage (a rebase or merge going,
+    git's index.lock left, not on the ticket's branch), or ""."""
+    for name, what in (("rebase-merge", "a rebase"), ("rebase-apply", "a rebase or git am"),
+                       ("MERGE_HEAD", "a merge"), ("CHERRY_PICK_HEAD", "a cherry-pick"), ("index.lock", "index.lock")):
+        p = git(project, "rev-parse", "--git-path", name, check=False).stdout.strip()
+        if p and os.path.exists(p if os.path.isabs(p) else os.path.join(project, p)):
+            return (f"{what} is left in {project}" if name == "index.lock" else f"{what} is in progress in {project}") \
+                + "; finish or abort it there, then harness queue retry"
+    if branch:
+        on = git(project, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+        if on != branch:
+            return f"{project} is on {on or 'a detached HEAD'}, not the ticket's branch {branch}; " \
+                   f"git switch {branch} there (your changes on the way stay), then harness queue retry"
+    return ""
+
+
+def snapshot(q, st, stage):
+    """In place, before each stage: the project's whole tree as it is (uncommitted
+    and untracked files too; not ignored ones, nor nested repos' contents) as a
+    commit at refs/harness-queue/snap/KEY, each one on the one before. If an agent
+    throws away work: git checkout <snap> -- <path> takes it back."""
+    project, key = st["project"], st["key"]
+    ref = f"refs/harness-queue/snap/{key}"
+    index = os.path.join(q.dir(key), "snap.index")
+    real = git(project, "rev-parse", "--git-path", "index").stdout.strip()
+    real = real if os.path.isabs(real) else os.path.join(project, real)
+    who = {"GIT_INDEX_FILE": index, "GIT_AUTHOR_NAME": "harness queue", "GIT_AUTHOR_EMAIL": "harness-queue@localhost",
+           "GIT_COMMITTER_NAME": "harness queue", "GIT_COMMITTER_EMAIL": "harness-queue@localhost"}
+    try:
+        if os.path.exists(real):   # git's stat cache: only what changed is read again
+            shutil.copyfile(real, index)
+        git(project, "-c", "advice.addEmbeddedRepo=false", "add", "-A", env=who, timeout=600)
+        tree = git(project, "write-tree", env=who).stdout.strip()
+        prev = git(project, "rev-parse", "-q", "--verify", ref, check=False).stdout.strip()
+        sha = git(project, "commit-tree", tree, *(["-p", prev] if prev else []), "-m",
+                  f"{key}: the project before {stage}", env=who).stdout.strip()
+        git(project, "update-ref", ref, sha)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        q.log(key, f"warning: no snapshot of the project before {stage}: {e}")
+    finally:
+        drop(index)
+
+
+def nested_changes(project):
+    """["dir (n)"]: repositories inside the project (3 levels down) with changes; the
+    queue commits in the project's own repository only."""
+    out = []
+    for root, dirs, files in os.walk(project):
+        if root != project and (".git" in dirs or ".git" in files):
+            dirs[:] = []
+            n = len(git(root, "status", "--porcelain", check=False).stdout.splitlines())
+            if n:
+                out.append(f"{os.path.relpath(root, project)} ({n})")
+            continue
+        depth = os.path.relpath(root, project).count(os.sep)
+        dirs[:] = [] if depth >= 2 else [d for d in dirs if d not in (".git", "node_modules")]
+    return out
+
+
 def fetch_branch(q, st):
-    """Fetch the clone's branch KEY into the project; (sha, diff, files, commits)
-    or None when the branch has no commits of its own."""
+    """The ticket's branch, fetched from the clone into the project (in place it is
+    the project's); (sha, diff, files, commits) or None when it has no commits of its own."""
     key, project = st["key"], st["project"]
-    ref = f"refs/harness-queue/{key}"
-    r = git(project, "fetch", "-q", "--no-tags", os.path.join(q.dir(key), "repo"),
-            f"+refs/heads/{key}:{ref}", check=False)
+    ref = f"refs/heads/{branch_of(st)}"
+    if not st.get("in_place"):   # in place the branch is the project's own
+        r = git(project, "fetch", "-q", "--no-tags", workdir(q, st), f"+{ref}:refs/harness-queue/{key}", check=False)
+        if r.returncode != 0:
+            return None
+        ref = f"refs/harness-queue/{key}"
+    r = git(project, "rev-parse", "-q", "--verify", ref, check=False)
     if r.returncode != 0:
         return None
-    sha = git(project, "rev-parse", ref).stdout.strip()
+    sha = r.stdout.strip()
     commits = int(git(project, "rev-list", "--count", f"{st['base_sha']}..{sha}").stdout.strip() or 0)
     if not commits:
         return None
@@ -494,7 +735,7 @@ def fetch_branch(q, st):
 def check_change(st, change, plan_text):
     """Hard gates on a branch, and the warnings that are not gates."""
     if change is None:
-        return [f"no commits on branch {st['key']}: commit your change on that branch (git add, git commit)"], []
+        return [f"no commits on branch {branch_of(st)}: commit your change on that branch (git add, git commit)"], []
     _, diff, files, _ = change
     problems, warnings = [], []
     if not diff.strip():
@@ -710,7 +951,8 @@ def run_agent(ctx, st, stage, prompt):
     task = note_paths(ctx.vault, key)["task"]
     arg = prompt
     if WINDOWS and len(prompt) > WIN_PROMPT_MAX:
-        arg = (f"You are working on ticket {key}, stage {stage}, in a clone of the project on branch {key}.\n\n"
+        arg = (f"You are working on ticket {key}, stage {stage}, in {'the project' if st.get('in_place') else 'a clone of the project'} "
+               f"on branch {branch_of(st)}.\n\n"
                f"Your full instructions for the {stage} stage of ticket {key} are in {agent_path(ctx, task)}. "
                f"Read it first and follow it exactly.\n")
     elif len(prompt.encode()) > PROMPT_MAX_BYTES:
@@ -719,10 +961,27 @@ def run_agent(ctx, st, stage, prompt):
     out = os.path.join(ctx.q.dir(key), f"{stage}-{st['attempt']}.out")
     since = int(time.time() * 1000)
     write_atomic(task, prompt)
+    if st.get("in_place"):
+        exclude_block(st["project"], None)   # the snapshot takes the owner's files too
+        snapshot(ctx.q, st, stage)
+        exclude_block(st["project"], owner_files(ctx.q, st).get("untracked"))
+        # when the stage ran, for the run viewer: in place its session's folder is the project's
+        st["launches"] = (st.get("launches") or [])[-(HISTORY_CAP - 1):] + [[since, 0]]
+        ctx.q.save(st)
     try:
         rc = launch(ctx, st, cmd, out, since)
     finally:   # gone before the vault is committed: it is the prompt, not a note
         drop(task)
+        if st.get("in_place"):
+            st["launches"][-1][1] = int(time.time() * 1000)
+            ctx.q.save(st)
+            with contextlib.suppress(RuntimeError, OSError, subprocess.SubprocessError):
+                exclude_block(st["project"], None)
+    if st.get("in_place"):
+        nested = nested_changes(st["project"])
+        if nested:
+            ctx.q.log(key, "changes in repositories inside the project, which the queue does not commit: "
+                           + ", ".join(nested[:20]))
     sync_vault(ctx, key, since)
     return rc, out
 
@@ -766,13 +1025,17 @@ def copy_instructions(project, repo):
 def launch(ctx, st, cmd, out, since):
     """Run the agent to its end, a timeout (rc 124), or the owner's stop or halt (Interrupted)."""
     key = st["key"]
-    env = dict(os.environ, HARNESS_HOST_CONFIRM="1")
+    # HARNESS_QUEUE_LAUNCH: harness labels the container with it (what stop_containers
+    # stops) and does not remember the ticket for the folder (in place, the owner's)
+    st["launch_id"] = f"{key}-{os.getpid()}-{int(time.time() * 1000)}"
+    env = dict(os.environ, HARNESS_HOST_CONFIRM="1", HARNESS_QUEUE_LAUNCH=st["launch_id"])
     end = time.monotonic() + ctx.stage_timeout
     notes_at = mtime(ctx.q.notes_path(key))
-    copy_instructions(st["project"], os.path.join(ctx.q.dir(key), "repo"))
+    if not st.get("in_place"):
+        copy_instructions(st["project"], workdir(ctx.q, st))
     step(ctx, "the agent is working")
     with open(out, "w", encoding="utf-8") as f:
-        p = subprocess.Popen(cmd, cwd=os.path.join(ctx.q.dir(key), "repo"), stdin=subprocess.DEVNULL,
+        p = subprocess.Popen(cmd, cwd=workdir(ctx.q, st), stdin=subprocess.DEVNULL,
                              stdout=f, stderr=subprocess.STDOUT, env=env, **NEW_GROUP)
         ctx.child = p
         rc = None
@@ -806,19 +1069,20 @@ def launch(ctx, st, cmd, out, since):
 
 def stop_containers(ctx, st):
     """Stopping the docker client leaves its container running: stop the agent
-    containers running in this ticket's clone (harness queue _stop_agents)."""
+    container of this ticket's launch (harness queue _stop_agents, by the folder
+    it mounts and the launch's label)."""
     if ctx.host or ctx.single:
         return
     key = st["key"]
     try:
-        r = subprocess.run([BASH, ctx.harness, "queue", "_stop_agents", os.path.join(ctx.q.dir(key), "repo")],
+        r = subprocess.run([BASH, ctx.harness, "queue", "_stop_agents", workdir(ctx.q, st), st.get("launch_id", "")],
                            stdin=subprocess.DEVNULL, capture_output=True, timeout=120, check=False, **TEXT)
         n = r.stdout.strip() if r.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         n = ""
     if n.isdigit():
         if int(n):
-            ctx.q.log(key, f"stopped {n} agent container(s) in the clone")
+            ctx.q.log(key, f"stopped {n} agent container(s)")
     else:
         ctx.q.log(key, "warning: the agent's container may still be running; check 'harness list' "
                        "(harness stop NAME) before 'harness queue retry'")
@@ -872,7 +1136,8 @@ def sync_vault(ctx, key, since):
                      f"---\ntype: note\nticket: {key}\nsummary: {yq(f'harness queue log of {key}')}\n---\n\n"
                      f"# {key}: queue log\n\nWritten by `harness queue`; each line is a stage, a check or a verdict.\n\n"
                      f"{fence}text\n{log.rstrip()}\n{fence}\n")
-    subprocess.run([BASH, ctx.harness, "queue", "_sync", key, os.path.join(ctx.q.dir(key), "repo"), str(since)],
+    st = ctx.q.load(key) or {"key": key, "project": ""}
+    subprocess.run([BASH, ctx.harness, "queue", "_sync", key, workdir(ctx.q, st), str(since)],
                    stdin=subprocess.DEVNULL, capture_output=True, timeout=600, check=False)
 
 
@@ -946,13 +1211,22 @@ def common(ctx, st):
     plan = read(plan_copy(ctx.q, st["key"]), PLAN_CAP) if st.get("stage", "plan") != "plan" else ""
     if not plan:   # the vault's copy is unchecked: only the plan stage itself reads it
         plan = NO_PLAN if "plan" not in stages_of(st) else read(p["plan"], PLAN_CAP) or "(none yet)"
-    return dict(KEY=st["key"], BRANCH=st["key"], BASE_SHA=st.get("base_sha", ""),
-                REPO=os.path.join(ctx.q.dir(st["key"]), "repo"), TICKET_FILE=ap["ticket"],
+    return dict(KEY=st["key"], BRANCH=branch_of(st), BASE_SHA=st.get("base_sha", ""),
+                REPO=workdir(ctx.q, st), WHERE=IN_PLACE if st.get("in_place") else IN_CLONE,
+                TICKET_FILE=ap["ticket"],
                 TICKET=read(p["ticket"], TICKET_CAP) or "(the ticket file is missing; read the path above)",
                 PLAN_FILE=ap["plan"], PLAN=plan,
                 REVIEW_FILE=ap["review"], FINDINGS_FILE=ap["findings"], ANSWERS_FILE=ap["answers"],
                 ANSWERS=answers or "(none)", NOTES=owner_notes(ctx.q.notes(st["key"])),
                 FEEDBACK=cap(st.get("feedback") or "(first attempt)", NOTE_CAP))
+
+
+IN_CLONE = "a clone of the project made for this ticket"
+IN_PLACE = ("the owner's own project folder, not a clone. It has the owner's uncommitted files: leave every file you "
+            "do not change for the ticket alone; commit only files you changed, by name (git add <file>; never "
+            "git add -A, git add . or git commit -a); never run git checkout/restore of files you did not change, "
+            "git reset --hard, git clean, git stash or git switch. Repositories inside it are not committed by harness: "
+            "change them only when the ticket needs it and say so in your commit message")
 
 
 def owner_notes(notes):
@@ -1005,7 +1279,7 @@ def recover_note(ctx, st, kind, started, out):
     cannot write the vault path writes the file into its clone, or prints it."""
     key = st["key"]
     dest = note_paths(ctx.vault, key)[kind]
-    repo = os.path.join(ctx.q.dir(key), "repo")
+    repo = workdir(ctx.q, st)
     want = f"{key}-{kind}.md".lower()
     found = None
     for root, dirs, files in os.walk(repo):
@@ -1023,7 +1297,7 @@ def recover_note(ctx, st, kind, started, out):
                     found = (m, path)
     text, where = "", ""
     if found:
-        text, where = read(found[1]), f"the clone ({os.path.relpath(found[1], repo)})"
+        text, where = read(found[1]), f"the agent's folder ({os.path.relpath(found[1], repo)})"
         try:
             os.remove(found[1])   # not the agent's change to commit
         except OSError:
@@ -1071,7 +1345,8 @@ def stage_plan(ctx, st):
         return
     write_atomic(plan_copy(ctx.q, st["key"]), text)
     advance(ctx, st, next_stage(st, "plan"))
-    if ctx.plan_review and not st.get("plan_approved") and st["status"] == "running":
+    held = ctx.plan_review or st.get("plan_review") or st.get("plan_hold")
+    if held and not st.get("plan_approved") and st["status"] == "running":
         st.update(status="plan-review", reason=f"plan ready to read: {p['plan']}")
         ctx.q.save(st)
         ctx.q.log(st["key"], f"waiting for the plan to be read: harness queue approve {st['key']}")
@@ -1090,6 +1365,10 @@ def verify_change(ctx, st, rc, stage):
         criteria = criteria + [f"(review) {m}" for m in st.get("must_fix", [])]
     change = fetch_branch(ctx.q, st)
     problems, warnings = check_change(st, change, plan)
+    if st.get("in_place"):
+        problems += in_place_problems(ctx, st)
+    if not problems and stage == "implement" and change[0] == st.get("start_sha"):
+        problems.append(f"no new commit on branch {branch_of(st)}: commit your change (git add <files>, git commit)")
     if not problems and stage == "fix" and change[0] == st.get("review_sha"):
         problems.append("no new commit since the review: fix the Must fix items and commit")
     if not problems and rc != 0:
@@ -1114,6 +1393,28 @@ def verify_change(ctx, st, rc, stage):
         fail(ctx, st, rc, problems)
         return False
     return True
+
+
+def in_place_problems(ctx, st):
+    """In place: the project left on the ticket's branch with nothing half done, and
+    no commit since the start touching a file the owner had uncommitted when the
+    ticket started (each commit, not the sum: a file added then removed was pushed)."""
+    project = st["project"]
+    trouble = in_place_trouble(project, branch_of(st))
+    if trouble:
+        return [trouble]
+    owner = owner_files(ctx.q, st)
+    mine = set(owner.get("untracked", [])) | set(owner.get("changed", []))
+    dirs = tuple(p for p in mine if p.endswith("/"))
+    touched = git(project, "log", "--format=", "--name-only", "--no-renames",
+                  f"{st['start_sha']}..refs/heads/{branch_of(st)}", check=False).stdout.split("\n")
+    hit = sorted({f for f in touched if f and (f in mine or f + "/" in mine or f.startswith(dirs))})
+    if not hit:
+        return []
+    return [f"the commits touch {', '.join(hit[:10])}, which the owner had uncommitted in the project when the ticket "
+            f"started (theirs, not the ticket's). Take them out of every commit since {st['start_sha'][:12]}: "
+            f"git reset --soft {st['start_sha'][:12]}, git restore --staged {' '.join(hit[:10])}, then commit "
+            "again with only your files. Never delete or edit those files"]
 
 
 def cap(text, n):
@@ -1164,32 +1465,34 @@ def stage_push(ctx, st):
     change = fetch_branch(ctx.q, st)
     if change is None:
         return block(ctx, st, "the branch is gone from the clone")
-    sha = change[0]
-    branch = f"refs/heads/{key}"
+    sha, name = change[0], branch_of(st)
+    branch = f"refs/heads/{name}"
     old = git(project, "rev-parse", "-q", "--verify", branch, check=False).stdout.strip()
-    worktrees = git(project, "worktree", "list", "--porcelain", check=False).stdout.splitlines()
-    if f"branch {branch}" in worktrees:
+    if st.get("in_place"):
+        pass   # the agents committed on the project's branch itself
+    elif checked_out(project, name):
         # Moving a checked-out branch leaves its index and files behind: the
         # checkout would then show the queue's commits as changes undone.
-        ctx.q.log(key, f"warning: branch {key} is checked out in the project; not moved to {sha[:12]} "
+        ctx.q.log(key, f"warning: branch {name} is checked out in the project; not moved to {sha[:12]} "
                        f"(git merge --ff-only {sha[:12]} there takes it)")
     elif not old:
         git(project, "update-ref", branch, sha)
+        st["made_branch"] = True
     elif old != sha:
         if git(project, "merge-base", "--is-ancestor", old, sha, check=False).returncode == 0:
             git(project, "update-ref", branch, sha, old)
         else:
-            ctx.q.log(key, f"warning: the project's branch {key} is not behind the queue's branch; left as it is")
+            ctx.q.log(key, f"warning: the project's branch {name} is not behind the queue's branch; left as it is")
     if ctx.push:
         checkpoint(ctx)   # a stop asked during the stage: nothing pushed
         r = git(project, "-c", "credential.interactive=false", "push", "-q", ctx.remote, f"{sha}:{branch}",
                 check=False, timeout=600, env=push_env(project))
         if r.returncode != 0:
             return block(ctx, st, f"push to {ctx.remote} refused: {(r.stderr or r.stdout).strip()[:300]}")
-        ctx.q.log(key, f"pushed branch {key} to {ctx.remote} ({sha[:12]})")
+        ctx.q.log(key, f"pushed branch {name} to {ctx.remote} ({sha[:12]})")
     else:
-        ctx.q.log(key, f"branch {key} ready in the project ({sha[:12]}); not pushed (QUEUE_PUSH=0)")
-    record(st, "passed", [f"branch {key} at {sha[:12]}"])
+        ctx.q.log(key, f"branch {name} ready in the project ({sha[:12]}); not pushed (QUEUE_PUSH=0)")
+    record(st, "passed", [f"branch {name} at {sha[:12]}"])
     st.update(status="done", stage="done", attempt=0, feedback="", reason="", sha=sha)
     ctx.q.save(st)
 
@@ -1264,16 +1567,25 @@ def process(ctx, st):
     # the vault is kept for the run viewer, which may have started with another
     st.update(status="running", vault=ctx.vault, reason="")
     ctx.q.save(st)
-    if not st.get("base_sha") or not os.path.isdir(os.path.join(ctx.q.dir(key), "repo")):
+    if st.get("in_place") and os.name == "nt" and not (ctx.host or ctx.single):
+        # the container's Linux git would see every file of a CRLF checkout as changed
+        return block(ctx, st, "in place on Windows needs a host run: harness queue run --host")
+    if st.get("in_place") and st.get("base_sha"):
+        trouble = in_place_trouble(st["project"], branch_of(st))
+        if trouble:
+            return block(ctx, st, trouble)
+    elif not st.get("base_sha") or not os.path.isdir(workdir(ctx.q, st)):
         if st.get("base_sha") and st["stage"] != first_stage(st):
             return block(ctx, st, f"its clone is missing; harness queue retry starts it again from {first_stage(st)}")
-        step(ctx, f"cloning {st['project']}")
+        step(ctx, f"setting up {branch_of(st)} in {st['project']}" if st.get("in_place") else f"cloning {st['project']}")
         try:
-            make_clone(ctx.q, st, container=not (ctx.host or ctx.single))
+            kept = enter_in_place(ctx.q, st) if st.get("in_place") else make_clone(ctx.q, st, container=not (ctx.host or ctx.single))
         except (RuntimeError, subprocess.SubprocessError) as e:
-            return block(ctx, st, f"could not clone {st['project']} at {st['base']}: {e}")
-        at = f" from {st['ref']}" if st.get("ref") else ""
-        ctx.q.log(key, f"cloned {st['project']} at {st['base']} ({st['base_sha'][:12]}) on branch {key}{at}")
+            return block(ctx, st, f"could not {'set up' if st.get('in_place') else 'clone'} {st['project']} "
+                                  f"at {start_of(st)}: {e}")
+        where = f"in place in {st['project']}" if st.get("in_place") else f"cloned {st['project']}"
+        ctx.q.log(key, f"{where}: branch {branch_of(st)} from {start_of(st)} ({st['start_sha'][:12]}); the change is "
+                       f"since {st['base_sha'][:12]} (base {st['base']})" + (f"; {kept}" if kept else ""))
     subprocess.run([BASH, ctx.harness, "queue", "_pull", key], stdin=subprocess.DEVNULL,
                    capture_output=True, timeout=300, check=False)
     while st["status"] == "running":
@@ -1479,16 +1791,28 @@ def cmd_add(q, a):
     if why:
         print(f"[queue] {why}", file=sys.stderr)
         return 1
-    if a.ref:
-        sha = resolve_ref(project, a.ref)
+    if a.start and a.ref and a.start != a.ref:
+        print("[queue] --ref is the old name of --start; give one of them", file=sys.stderr)
+        return 1
+    start = a.start or a.ref or (HERE if a.in_place else "")
+    if start and start != HERE or start == HERE and not a.in_place:
+        sha = commit_of(project, start)
         if not sha:
-            print(f"[queue] {a.ref} is not a commit in {project} (git fetch it first?)", file=sys.stderr)
+            print(f"[queue] {start} is not a commit in {project} (git fetch it first?)", file=sys.stderr)
             return 1
         if git(project, "merge-base", base, sha, check=False).returncode != 0:
-            print(f"[queue] {a.ref} and {base} have no history in common", file=sys.stderr)
+            print(f"[queue] {start} and {base} have no history in common", file=sys.stderr)
             return 1
-        if git(project, "rev-list", "--count", f"{base}..{sha}").stdout.strip() == "0":
-            print(f"[queue] note: {a.ref} has no commits that {base} lacks", file=sys.stderr)
+        if start == HERE:   # a clone has only commits: here is the commit the project is at now
+            changes = uncommitted(project)
+            if changes["untracked"] or changes["changed"]:
+                print(f"[queue] note: the clone starts at {project}'s HEAD ({sha[:12]}); its "
+                      f"{len(changes['untracked']) + len(changes['changed'])} uncommitted file(s) are not in it "
+                      "(--in-place works on them)", file=sys.stderr)
+            start = sha
+    if a.branch and git(project, "check-ref-format", "--branch", a.branch, check=False).returncode != 0:
+        print(f"[queue] not a branch name: {a.branch}", file=sys.stderr)
+        return 1
     if a.note is not None and not a.note.strip():
         print("[queue] --note is empty", file=sys.stderr)
         return 1
@@ -1508,14 +1832,22 @@ def cmd_add(q, a):
             st = {"key": key, "project": project, "base": base, "status": "queued", "stage": "plan", "attempt": 0,
                   "feedback": "", "reason": "", "created": now_iso(), "stages": stages, "notes": []}
             st["stage"] = first_stage(st)
-            if a.ref:
-                st["ref"] = a.ref
+            st.update({k: v for k, v in (("start", start), ("branch", a.branch), ("in_place", a.in_place),
+                                         ("plan_review", a.review_plan)) if v})
+            if start != HERE:
+                lost = lost_by(project, branch_of(st), commit_of(project, start_of(st)))
+                if lost:
+                    print(f"[queue] {key}: branch {branch_of(st)} has commits that {start_of(st)} does not "
+                          f"({', '.join(n for n, _ in lost)}): the work would end over them. Start from it "
+                          f"(--start {lost[0][0]}) or pick another --branch", file=sys.stderr)
+                    rc = 1
+                    continue
             if a.note:
                 q.add_note(key, a.note)
             q.save(st)
             order.append(key)
-            at = f" from {a.ref}" if a.ref else ""
-            print(f"[queue] {key}: queued ({project} at {base}{at}; stages {','.join(stages)})")
+            how = (f"in place in {project}" if a.in_place else project) + f", from {start_of(st)} on branch {branch_of(st)}"
+            print(f"[queue] {key}: queued ({how}; stages {','.join(stages)})")
         q.set_order(order)
     return rc
 
@@ -1577,7 +1909,7 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
     if stage:
         st["stage"] = stage
     repo = os.path.join(q.dir(st["key"]), "repo")
-    if fresh or st["stage"] == "plan" or not os.path.isdir(repo):  # from the base (or --ref), not earlier commits
+    if fresh or st["stage"] == "plan" or not has_work(q, st):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "must_fix", "warnings"):
             st.pop(k, None)
         if st["stage"] == "plan":
@@ -1590,8 +1922,13 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
     return st
 
 
+def has_work(q, st):
+    """The ticket's work so far is there: its clone, or (in place) the project set up."""
+    return bool(st.get("base_sha")) if st.get("in_place") else os.path.isdir(os.path.join(q.dir(st["key"]), "repo"))
+
+
 def cmd_approve(q, a):
-    st = requeue(q, a.key, ("plan-review",), plan_approved=True)
+    st = requeue(q, a.key, ("plan-review",), plan_approved=True, plan_hold=False)
     if st:
         print(f"[queue] {st['key']}: plan approved; 'harness queue run' implements it")
     return 0 if st else 1
@@ -1620,8 +1957,7 @@ def cmd_retry(q, a):
         q.save(st)
         print(f"[queue] {key}: back to plan-review; harness queue approve {key} goes on")
         return 0
-    elif st["status"] == "done" or st.get("stage") not in ALL_STAGES \
-            or not os.path.isdir(os.path.join(q.dir(key), "repo")):
+    elif st["status"] == "done" or st.get("stage") not in ALL_STAGES or not has_work(q, st):
         stage = first_stage(st)   # done, or its work is gone: from the start, on a fresh clone
         extra["fresh"] = True
     st = requeue(q, key, RETRYABLE, stage=stage, **extra)
@@ -1790,7 +2126,10 @@ def cmd_answer(q, a):
     old = read(p["answers"])
     write_atomic(p["answers"], (old.rstrip() + "\n" if old.strip() else "") + stamp + text.strip() + "\n")
     planned = "plan" in stages_of(st)   # without a plan stage the answers reach the next stage's prompt
-    st = requeue(q, key, allowed, stage="plan" if planned else None, plan_approved=False)
+    # Answers or feedback: the plan made with them comes back to be agreed before
+    # anything is built (--go: the owner took the defaults and wants it to go on).
+    st = requeue(q, key, allowed, stage="plan" if planned else None, plan_approved=False,
+                 plan_hold=planned and not a.go)
     if st:
         print(f"[queue] {key}: answers saved to {p['answers']}; "
               + ("the plan is made again on the next run" if planned else f"the next run goes on at {st['stage']}"))
@@ -1814,7 +2153,9 @@ def main(argv):
     p.add_argument("--state", required=True)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("add"); s.add_argument("keys", nargs="+"); s.add_argument("--project"); s.add_argument("--base")
-    s.add_argument("--stages"); s.add_argument("--ref"); s.add_argument("--note")
+    s.add_argument("--stages"); s.add_argument("--ref"); s.add_argument("--note"); s.add_argument("--start")
+    s.add_argument("--branch"); s.add_argument("--in-place", action="store_true")
+    s.add_argument("--review-plan", action="store_true")
     sub.add_parser("list")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("remove"); s.add_argument("keys", nargs="+")
@@ -1825,6 +2166,7 @@ def main(argv):
     s = sub.add_parser("move"); s.add_argument("key"); s.add_argument("where", choices=("up", "down", "top", "bottom"))
     s = sub.add_parser("note"); s.add_argument("key"); s.add_argument("--text"); s.add_argument("--stdin", action="store_true")
     s = sub.add_parser("answer"); s.add_argument("key"); s.add_argument("--vault", required=True); s.add_argument("--text")
+    s.add_argument("--go", action="store_true")
     s.add_argument("--stdin", action="store_true")
     s = sub.add_parser("findings"); s.add_argument("--vault", required=True)
     s = sub.add_parser("run")

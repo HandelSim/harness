@@ -36,6 +36,7 @@ if args and args[0] == "queue":
     log.write("queue " + args[1] + "\n")
     if args[1] == "_stop_agents":
         log.write("stop-agents " + args[2] + "\n")
+        log.write("stop-launch " + args[3] + "\n")
         print(os.environ.get("FAKE_STOPPED", "1"))
         sys.exit(int(os.environ.get("FAKE_STOP_RC", "0")))
     if args[1] == "_pull":
@@ -74,7 +75,7 @@ if stage == "planning":
             "## Assumptions\n- None\n")
     if os.environ.get("FAKE_ANSWER_DURING") and "planning ticket ABC-2" in prompt:  # the owner answers ABC-1
         subprocess.run([sys.executable, os.environ["FAKE_TQ"], "--state", os.environ["FAKE_STATE"], "answer",
-                        "ABC-1", "--vault", vault, "--text", "Use the blue one."], check=True, capture_output=True)
+                        "ABC-1", "--vault", vault, "--text", "Use the blue one.", "--go"], check=True, capture_output=True)
     where = os.environ.get("FAKE_PLAN_WHERE")
     if where == "print":      # an agent that could not write the vault path
         print("I could not write the file, so here is the plan:\n\n" + plan)
@@ -228,6 +229,27 @@ class Base(unittest.TestCase):
     def calls_of(self, stage):
         return [l for l in cat(self.calls).splitlines() if l.startswith(stage)]
 
+    def git_p(self, *a):
+        return sh("git", "-C", self.project, *a).strip()
+
+    def feature_branch(self):
+        """origin/feat: a commit adding feature.txt, only on the remote and as a
+        remote-tracking ref; main has moved on since it branched."""
+        self.git_p("checkout", "-q", "-b", "feat")
+        put(os.path.join(self.project, "feature.txt"), "hello feature\n")
+        self.git_p("add", "feature.txt")
+        self.git_p("commit", "-q", "-m", "feat: hello")
+        feat = self.git_p("rev-parse", "HEAD")
+        self.git_p("push", "-q", "origin", "feat")
+        self.git_p("checkout", "-q", "main")
+        self.git_p("branch", "-q", "-D", "feat")
+        fork = self.git_p("rev-parse", "HEAD")
+        put(os.path.join(self.project, "other.txt"), "later\n")
+        self.git_p("add", "other.txt")
+        self.git_p("commit", "-q", "-m", "main moves on")
+        return feat, fork
+
+
 
 class QueueTest(Base):
     def test_whole_loop_pushes_the_branch(self):
@@ -296,6 +318,20 @@ class QueueTest(Base):
         rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "Use the blue one.")
         self.assertEqual(rc, 0, out)
         self.assertEqual((self.status()["status"], self.status()["stage"]), ("queued", "plan"))
+        rc, out = self.run_queue()
+        # The plan made with the answer is held to be agreed before anything is built.
+        self.assertEqual(self.status()["status"], "plan-review", out)
+        self.assertEqual(len(self.calls_of("implementing")), 0)
+        # More feedback: planned again, held again.
+        rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "Keep the file short.")
+        self.assertEqual(rc, 0, out)
+        self.run_queue()
+        self.assertEqual(self.status()["status"], "plan-review")
+        last = cat(self.calls + ".planning").split("\n=====\n")[-2]
+        self.assertIn("Keep the file short.", last)
+        self.assertIn("revise that plan", last)
+        rc, out = self.q("approve", "ABC-1")
+        self.assertEqual(rc, 0, out)
         rc, out = self.run_queue()
         self.assertEqual(self.status()["status"], "done", out)
         # The answer reached the planner in its prompt.
@@ -617,7 +653,7 @@ class ReviewFixesTest(Base):
         self.run_queue("--retries", "0")
         repo = os.path.join(self.state, "ABC-1", "repo")
         self.assertTrue(os.path.isdir(repo))
-        rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "x")
+        rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "x", "--go")
         self.assertEqual(rc, 0, out)
         self.assertFalse(os.path.exists(repo))
         self.assertNotIn("base_sha", self.status())
@@ -646,7 +682,7 @@ class ReviewFixesTest(Base):
         real = tq.git
         tq.git = lambda cwd, *a, **k: made.append(cwd) or real(cwd, *a, **k)
         try:
-            st = self.status()
+            st = dict(self.status(), start="ABC-1")   # carry on the branch the first go made
             tq.make_clone(tq.Queue(self.state), st)
         finally:
             tq.git = real
@@ -695,26 +731,6 @@ class ReviewFixesTest(Base):
 class OwnerControlTest(Base):
     """Stages, an existing ref, owner notes, stop, halt, move, status and retry --stage."""
 
-    def git_p(self, *a):
-        return sh("git", "-C", self.project, *a).strip()
-
-    def feature_branch(self):
-        """origin/feat: a commit adding feature.txt, only on the remote and as a
-        remote-tracking ref; main has moved on since it branched."""
-        self.git_p("checkout", "-q", "-b", "feat")
-        put(os.path.join(self.project, "feature.txt"), "hello feature\n")
-        self.git_p("add", "feature.txt")
-        self.git_p("commit", "-q", "-m", "feat: hello")
-        feat = self.git_p("rev-parse", "HEAD")
-        self.git_p("push", "-q", "origin", "feat")
-        self.git_p("checkout", "-q", "main")
-        self.git_p("branch", "-q", "-D", "feat")
-        fork = self.git_p("rev-parse", "HEAD")
-        put(os.path.join(self.project, "other.txt"), "later\n")
-        self.git_p("add", "other.txt")
-        self.git_p("commit", "-q", "-m", "main moves on")
-        return feat, fork
-
     def prompts(self, stage):
         path = self.calls + "." + stage
         return cat(path).split("\n=====\n")[:-1] if os.path.exists(path) else []
@@ -762,7 +778,7 @@ class OwnerControlTest(Base):
         feat, fork = self.feature_branch()
         rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "review", "--ref", "origin/feat")
         self.assertEqual(rc, 0, out)
-        self.assertEqual((self.status()["stage"], self.status()["ref"]), ("review", "origin/feat"))
+        self.assertEqual((self.status()["stage"], self.status()["start"]), ("review", "origin/feat"))
         rc, out = self.run_queue()
         self.assertEqual(rc, 0, out)
         st = self.status()
@@ -927,7 +943,9 @@ class OwnerControlTest(Base):
         self.assertEqual(self.status_json()["runner"], {"running": False})
         # Its container (a container launch) is stopped too, found by the clone it mounts.
         self.assertIn("stop-agents " + os.path.join(self.state, "ABC-1", "repo"), cat(self.calls).splitlines())
-        self.assertIn("stopped 1 agent container(s) in the clone", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertIn("stopped 1 agent container(s)", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        # Only that launch's: the label harness gave its container.
+        self.assertIn("stop-launch " + self.status()["launch_id"], cat(self.calls).splitlines())
 
     def test_halt_puts_the_ticket_back_and_ends_the_run(self):
         os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1")
@@ -1250,11 +1268,21 @@ class ReviewerFixesTest(Base):
         self.assertNotIn("base_sha", st)
         self.assertNotIn("sha", st)
         self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "repo")))
-        # The redone branch starts at the base again (not on the first push), so it
-        # is not pushed here: origin would refuse it unless it is the same commit.
+        # The redone work would start at the base again, so ending it on ABC-1 would
+        # drop the first go's pushed commits: refused, with what to do.
+        rc, out = self.run_queue("--push", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", out)
+        self.assertIn("has commits that main does not", st["reason"])
+        self.assertIn("--start ABC-1", st["reason"])
+        sh("git", "-C", self.remote, "branch", "-D", "ABC-1")
+        sh("git", "-C", self.project, "branch", "-D", "ABC-1")
+        sh("git", "-C", self.project, "fetch", "--prune", "origin")
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
         rc, out = self.run_queue("--push", "0")
         self.assertEqual(self.status()["status"], "done", out)
-        self.assertEqual(cat(os.path.join(self.state, "ABC-1", "log.md")).count(" cloned "), 2)
+        self.assertEqual(cat(os.path.join(self.state, "ABC-1", "log.md")).count(" cloned "), 2)   # the refused go did not clone
 
     def test_task_files_are_kept_out_of_the_vaults_git(self):
         tickets = os.path.join(self.vault, "wiki", "notes", "tickets")
@@ -1320,6 +1348,119 @@ class ReviewerFixesTest(Base):
         self.assertEqual(sh("git", "-C", wt, "status", "--porcelain"), "")
         self.assertIn("branch ABC-1 is checked out in the project; not moved", cat(os.path.join(self.state, "ABC-1", "log.md")))
         self.assertEqual(sh("git", "-C", self.remote, "rev-parse", "ABC-1").strip(), st["sha"])
+
+
+class StartAndBranchTest(Base):
+    """Where the work starts (--start) and the branch it ends on (--branch)."""
+
+    def remote_parent(self, branch):
+        return sh("git", "-C", self.remote, "rev-parse", branch + "^").strip()
+
+    def test_from_a_remote_branch_onto_a_new_branch(self):
+        feat, _ = self.feature_branch()
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--start", "origin/feat",
+                         "--branch", "abc-new", "--stages", "implement,push")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("from origin/feat on branch abc-new", out)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(self.remote_parent("abc-new"), feat)                  # built on the fetched start
+        self.assertEqual(sh("git", "-C", self.remote, "rev-parse", "feat").strip(), feat)   # left alone
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+
+    def test_onto_an_existing_branch_only_forward(self):
+        feat, fork = self.feature_branch()
+        self.git_p("branch", "behind", fork)        # the start contains it: moved forward
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--start", "origin/feat",
+                         "--branch", "behind", "--stages", "implement,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(self.remote_parent("behind"), feat)
+        # A branch with commits the start does not have is not ended on: they would be lost.
+        self.git_p("branch", "ahead", "main")
+        rc, out = self.q("add", "ABC-2", "--project", self.project, "--start", "origin/feat",
+                         "--branch", "ahead")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("has commits that origin/feat does not", out)
+        self.assertIsNone(self.status("ABC-2"))
+
+    def test_carry_on_an_existing_branch(self):
+        feat, _ = self.feature_branch()
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--start", "origin/feat",
+                         "--branch", "feat", "--stages", "implement,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(self.remote_parent("feat"), feat)                    # a fast-forward of feat
+
+    def test_start_here_in_a_clone_is_the_commit_checked_out(self):
+        self.git_p("checkout", "-q", "-b", "wip")
+        put(os.path.join(self.project, "wip.txt"), "wip\n")
+        self.git_p("add", "wip.txt")
+        self.git_p("commit", "-q", "-m", "wip")
+        wip = self.git_p("rev-parse", "HEAD")
+        put(os.path.join(self.project, "AGENTS.md"), "rules\n")   # not committed: not in a clone
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--start", "here", "--stages", "implement")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["start"], wip)
+        self.assertIn("1 uncommitted file(s) are not in it", out)
+
+    def test_in_place_keeps_the_owners_files_out(self):
+        put(os.path.join(self.project, "AGENTS.md"), "rules\n")            # untracked
+        os.makedirs(os.path.join(self.project, "build"))
+        put(os.path.join(self.project, "build", "make.sh"), "echo hi\n")  # untracked, in a folder
+        put(os.path.join(self.project, "README"), "project, edited\n")    # changed, not committed
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--stages", "implement,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "repo")))   # no clone
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-1")
+        self.assertEqual(sh("git", "-C", self.remote, "ls-tree", "--name-only", "-r", "ABC-1").split(),
+                         ["README", "feature.txt"])
+        self.assertEqual(sh("git", "-C", self.remote, "show", "ABC-1:README"), "project\n")
+        # The owner's files are as they were, and still not committed.
+        self.assertEqual(cat(os.path.join(self.project, "README")), "project, edited\n")
+        self.assertEqual(cat(os.path.join(self.project, "AGENTS.md")), "rules\n")
+        self.assertIn("?? AGENTS.md", self.git_p("status", "--porcelain"))
+        self.assertNotIn(tq.EXCLUDE_MARK, cat(os.path.join(self.project, ".git", "info", "exclude")))
+        # What the folder held before the stage is in the snapshot.
+        snap = "refs/harness-queue/snap/ABC-1"
+        self.assertEqual(self.git_p("show", snap + ":AGENTS.md"), "rules")
+        self.assertEqual(self.git_p("show", snap + ":build/make.sh"), "echo hi")
+        self.assertTrue(st["launches"])
+
+    def test_in_place_commit_of_an_owners_file_fails(self):
+        put(os.path.join(self.project, "README"), "project, edited\n")
+        os.environ["FAKE_FILE"] = "README"       # the agent commits the owner's edit with its own
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--stages", "implement")
+        self.assertEqual(rc, 0, out)
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("README", st["reason"])
+
+    def test_in_place_needs_the_branch_checked_out(self):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--stages", "implement,review")
+        self.assertEqual(rc, 0, out)
+        os.environ["FAKE_MUSTFIX"] = "1"
+        self.run_queue("--retries", "0")
+        self.git_p("checkout", "-q", "main")
+        rc, out = self.q("retry", "ABC-1", "--stage", "review")
+        self.assertEqual(rc, 0, out)
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("is on main, not the ticket's branch ABC-1", st["reason"])
+
+    def test_review_plan_holds_this_tickets_plan(self):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--review-plan")
+        self.assertEqual(rc, 0, out)
+        self.run_queue()
+        self.assertEqual(self.status()["status"], "plan-review")
+        self.assertEqual(len(self.calls_of("implementing")), 0)
 
 
 if __name__ == "__main__":

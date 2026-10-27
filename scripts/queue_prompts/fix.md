@@ -1,6 +1,6 @@
 You are fixing the problems a review found in the change for ticket {{KEY}}. Nobody is watching: fix them all, then commit.
 
-Your working directory is the clone on branch {{BRANCH}}. The change so far is `git diff {{BASE_SHA}}..HEAD`.
+Your working directory is {{WHERE}}, on branch {{BRANCH}}. The change so far is `git diff {{BASE_SHA}}..HEAD`.
 
 <<<BEGIN_MUST_FIX (from {{REVIEW_FILE}})>>>
 {{MUST_FIX}}

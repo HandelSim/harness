@@ -990,7 +990,7 @@ def make_handler(cfg):
                 got = runs_view.render_detail(r, sid, "", follow if queue else "", self.oc_link(), done)
                 if got:
                     self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head,
-                                   "queue" if r.ticket_of((r.find(sid)[1] or {}).get("directory") or "") else "sessions")
+                                   "queue" if r.ticket_of_row(r.find(sid)[1] or {}) else "sessions")
                     return
             elif bits[1:] == ["tail"]:
                 try:

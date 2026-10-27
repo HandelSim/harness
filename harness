@@ -5734,7 +5734,9 @@ ticket_prepare() {
     here=$(harness_abs_path "$PWD") || return 0
     if [[ -n "${harness_ticket_arg:-}" ]]; then
         key="$harness_ticket_arg"
-        ticket_remember "$here" "$key"
+        # A queue stage (HARNESS_QUEUE_LAUNCH) may work in the project folder
+        # itself (--in-place); it must not become the folder's ticket.
+        [[ -n "${HARNESS_QUEUE_LAUNCH:-}" ]] || ticket_remember "$here" "$key"
     else
         key=$(ticket_for_dir "$here")
     fi
@@ -6425,17 +6427,20 @@ usage: harness queue [list]                 the queue: each ticket's status and 
        harness queue status [--json]        the same, and whether a run is going and
                                             on what (--json: run.json and every state)
        harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST]
-                                [--ref REF] [--note TEXT]
+                                [--start REF|here] [--branch NAME] [--in-place]
+                                [--review-plan] [--note TEXT]
                                             queue tickets for the git project here
-                                            (or PROJECT), branching from REF (default:
-                                            the project's current branch); --stages
-                                            runs only some stages (e.g. review,fix,push),
-                                            --ref starts from work that exists (e.g.
-                                            origin/ABC-12: review reviews that branch)
+                                            (or PROJECT); see "Where the work starts
+                                            and ends" below; --stages runs only some
+                                            stages (e.g. review,fix,push); --review-plan
+                                            holds this ticket's plan for approve
        harness queue run [--host] [--single-message]
                                             work through the queue, one ticket at a time
-       harness queue answer KEY ["TEXT"]    answer the plan's questions (opens $EDITOR
-                                            without TEXT); the plan is made again
+       harness queue answer KEY ["TEXT"] [--go]
+                                            answer the plan's questions or give
+                                            feedback on it (opens $EDITOR without
+                                            TEXT); the plan is made again and held
+                                            for approve (--go: not held)
        harness queue note KEY ["TEXT"]      a note every later stage's prompt gets
                                             (opens $EDITOR without TEXT); any time
        harness queue approve KEY            go on with a plan held for reading
@@ -6453,9 +6458,33 @@ usage: harness queue [list]                 the queue: each ticket's status and 
        harness queue findings               bugs the agents saw outside their tickets
        harness queue remove KEY...          drop tickets and their clones
 
+Where the work starts and ends:
+  --start REF   the commit the work starts from: a branch, tag, sha, or a remote
+                branch (origin/feat: fetched first). Default: --base, which
+                defaults to the project's current branch. "here": what the
+                project has checked out (in a clone: its HEAD commit, so files
+                you have not committed are not there).
+  --branch NAME the branch the work ends on (and push pushes). Default: KEY.
+                A new branch is made at the start. An existing one (local, or on
+                any remote) is only ever moved forward: the start must contain
+                it (--start NAME --branch NAME carries on its work), else add
+                refuses rather than drop its commits.
+  --base REF    what the work will merge into; the change reviewed is everything
+                since the merge base of REF and the start.
+  --ref REF     the same as --start.
+  --in-place    work in the project folder itself, not a clone: your uncommitted
+                and untracked files are left as they are and kept out of the
+                agents' commits (listed in .git/info/exclude during a stage), and
+                before each stage everything in the folder is snapshotted to
+                refs/harness-queue/snap/KEY. The folder is switched to the branch
+                and must stay on it while the ticket runs; a stage whose commits
+                touch a file you had changed fails. --start defaults to here.
+                Nested repos are not committed; their changes are only logged.
+
 Each ticket goes through these stages, each one a fresh headless agent launch
 (the firewalled container; host mode with --host or without docker) in its own
-clone of the project, state/queue/KEY/repo, on branch KEY:
+clone of the project, state/queue/KEY/repo (or the project, --in-place), on its
+branch:
 
   plan       reads the ticket and the code; writes wiki/notes/tickets/KEY-plan.md
              in the vault: goal, acceptance criteria, approach, files, at most 3
@@ -6463,12 +6492,14 @@ clone of the project, state/queue/KEY/repo, on branch KEY:
              holds the ticket (needs-answers) and the queue moves on to the
              next ticket; answer it on the ticket's page in the run viewer
              (harness serve, /runs) or with harness queue answer, and a run
-             still going takes the ticket again.
-  implement  changes the code and commits on branch KEY.
+             still going takes the ticket again: the plan is revised with your
+             answers and feedback and held (plan-review) until you approve it
+             or send more feedback.
+  implement  changes the code and commits on the ticket's branch.
   review     a fresh session checks the change from several angles (criteria,
              correctness, security, scope, simplicity) into KEY-review.md.
   fix        once, when the review has Must fix items.
-  push       harness (not the agent) pushes branch KEY to QUEUE_REMOTE, no force.
+  push       harness (not the agent) pushes the branch to QUEUE_REMOTE, no force.
 
 With --stages a ticket starts at its first listed stage and is done after its
 last; without plan, the change is held to the ticket's own acceptance criteria.
@@ -6523,12 +6554,16 @@ HELP
             return 0 ;;
         _stop_agents)
             # ticket_queue.py, after stopping a stage's launch: killing the
-            # client leaves a -p container running, labelled with the clone
-            # it mounts. Prints how many were stopped; non-zero when unknown.
+            # client leaves a -p container running, labelled with the folder
+            # it mounts and the launch's id (2nd arg; then only that launch's,
+            # since an in-place ticket shares the folder with the owner's own
+            # agents). Prints how many were stopped; non-zero when unknown.
             local m ids c n=0
+            local -a f=(--filter "label=harness.agent=true")
             m=$(harness_abs_path "${1:-}" 2>/dev/null) || return 1
-            ids=$(harness_docker ps -q --filter "label=harness.agent=true" \
-                    --filter "label=harness.mount=$m" 2>/dev/null) || return 1
+            f+=(--filter "label=harness.mount=$m")
+            [[ -n "${2:-}" ]] && f+=(--filter "label=harness.queue-launch=$2")
+            ids=$(harness_docker ps -q "${f[@]}" 2>/dev/null) || return 1
             for c in $ids; do
                 harness_docker stop "$c" >/dev/null 2>&1 && n=$((n + 1))
             done
@@ -6555,13 +6590,14 @@ HELP
                 case "$a" in
                     --dir) dir="${1:-}"; shift || true ;;
                     --base) base="${1:-}"; shift || true ;;
-                    --stages|--ref|--note) (( $# )) || { err "$a needs a value"; return 1; }
+                    --stages|--ref|--note|--start|--branch) (( $# )) || { err "$a needs a value"; return 1; }
                         opts+=("$a" "$1"); shift ;;
+                    --in-place|--review-plan) opts+=("$a") ;;
                     -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                     *) keys+=("$a") ;;
                 esac
             done
-            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--ref REF] [--note TEXT]"; return 1; }
+            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME] [--in-place] [--review-plan] [--note TEXT]"; return 1; }
             args+=(add "${keys[@]}" ${opts[@]+"${opts[@]}"})
             [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")
             [[ -n "$base" ]] && args+=(--base "$base") ;;
@@ -6586,9 +6622,14 @@ HELP
         answer|findings)
             [[ -n "$vault" ]] || { err "no active vault (see: harness vault)"; return 1; }
             if [[ "$sub" == answer ]]; then
-                [[ -n "${1:-}" ]] || { err "usage: harness queue answer KEY [\"TEXT\"]"; return 1; }
+                local go=0 x
+                local -a rest=()
+                for x in "$@"; do [[ "$x" == --go ]] && go=1 || rest+=("$x"); done
+                set -- ${rest[@]+"${rest[@]}"}
+                [[ -n "${1:-}" && $# -le 2 ]] || { err "usage: harness queue answer [--go] KEY [\"TEXT\"]"; return 1; }
                 args+=(answer "$1" --vault "$vault")
                 [[ -n "${2:-}" ]] && args+=(--text "$2")
+                (( go )) && args+=(--go)
             else
                 args+=(findings --vault "$vault")
             fi ;;
@@ -8023,9 +8064,10 @@ run_agent_interactive() {
         --label "harness.project=$project_name"
         --label "harness.tool=$tool"
         --label "harness.mount=$mount_path"
-        "$image"
-        "$tool"
     )
+    # A queue stage's launch: ticket_queue.py stops its container by this label.
+    [[ -n "${HARNESS_QUEUE_LAUNCH:-}" ]] && docker_args+=(--label "harness.queue-launch=$HARNESS_QUEUE_LAUNCH")
+    docker_args+=("$image" "$tool")
     if (( ${#pass_args[@]} > 0 )); then
         docker_args+=("${pass_args[@]}")
     fi
@@ -8145,9 +8187,10 @@ run_agent_print() {
         --label "harness.project=$project_name"
         --label "harness.tool=$tool"
         --label "harness.mount=$mount_path"
-        "$image"
-        "$tool"
     )
+    # A queue stage's launch: ticket_queue.py stops its container by this label.
+    [[ -n "${HARNESS_QUEUE_LAUNCH:-}" ]] && docker_args+=(--label "harness.queue-launch=$HARNESS_QUEUE_LAUNCH")
+    docker_args+=("$image" "$tool")
     if (( ${#pass_args[@]} > 0 )); then
         docker_args+=("${pass_args[@]}")
     fi
