@@ -382,7 +382,8 @@ class RunsTest(RunsServer):
         self.ticket(status="blocked", stage="review", reason="review failed 2 time(s)")
         r, _ = self.act("retry")
         self.assertEqual(r.status, 303)
-        self.assertEqual((self.state()["status"], self.state()["stage"]), ("queued", "review"))
+        # its clone and commits are gone: from the start, not a review of nothing
+        self.assertEqual((self.state()["status"], self.state()["stage"]), ("queued", "plan"))
         r, _ = self.act("delete")
         self.assertEqual(r.status, 404)
         r, _ = self.req("POST", "/runs/ticket/ABC-12/retry", "", {"Origin": "http://evil.example"})
@@ -715,11 +716,15 @@ class QueuePageTest(RunsServer):
         self.assertEqual(r.status, 303)
         with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
             self.assertEqual(json.load(f)["status"], "stopped")
-        r, _ = self.post("/runs/ticket/ABC-7/retry", [("stage", "push")])
+        r, _ = self.post("/runs/ticket/ABC-7/retry", [("stage", "push")])   # no commits: nothing to push
+        self.assertEqual(r.status, 409)
+        with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
+            self.assertEqual(json.load(f)["status"], "stopped")
+        r, _ = self.post("/runs/ticket/ABC-7/retry")
         self.assertEqual(r.status, 303)
         with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
             st = json.load(f)
-        self.assertEqual((st["status"], st["stage"]), ("queued", "push"))
+        self.assertEqual((st["status"], st["stage"]), ("queued", "review"))
         r, _ = self.post("/runs/ticket/ABC-8/remove", [("back", "queue")])
         self.assertEqual(r.status, 303)
         self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-8")))
