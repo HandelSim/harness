@@ -5625,7 +5625,7 @@ vault_prepare() {
     elif [[ ! -d "$dir/.git" ]]; then
         echo "[harness] vault '$name': cloning $url" >&2
         mkdir -p "$state_root/vaults"
-        if ! git clone -q "$url" "$dir" >&2; then
+        if ! git clone -q -c core.autocrlf=false "$url" "$dir" >&2; then
             err "vault '$name': clone failed; launching without the vault"
             return 0
         fi
@@ -5634,7 +5634,29 @@ vault_prepare() {
     elif ! GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" pull -q --ff-only >/dev/null 2>&1; then
         err "vault '$name': could not fast-forward from its remote (offline, or local commits); using the local copy"
     fi
+    _vault_eol "$dir"
     harness_abs_path "$dir"
+}
+
+# The vault's working tree is LF: it is shared between Windows and Linux and
+# harness parses its pages by line, while Git for Windows' default
+# (core.autocrlf=true) checks out CRLF. Sets core.autocrlf=false in the
+# vault's own config once, never over a value already there; a clone checked
+# out with CRLF is checked out again, only when nothing tracked is
+# uncommitted (else the next launch tries). vault-template's .gitattributes
+# (eol=lf) does the same for a new vault.
+_vault_eol() {
+    local dir="$1"
+    git -C "$dir" config --local --get core.autocrlf >/dev/null 2>&1 && return 0
+    if [[ "$(git -C "$dir" config --get core.autocrlf 2>/dev/null)" == true ]]; then
+        [[ -z "$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]] || return 0
+        git -C "$dir" config core.autocrlf false || return 0
+        # -u: the index takes the new sizes, else every file shows as modified.
+        git -C "$dir" checkout-index -a -f -u -q 2>/dev/null || true
+    else
+        git -C "$dir" config core.autocrlf false || true
+    fi
+    return 0
 }
 
 # The vault part of the opencode overlay: the vault's AGENTS.md (or CLAUDE.md)

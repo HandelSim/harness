@@ -1,0 +1,5 @@
+# LF everywhere: the vault is shared between Windows and Linux, and harness
+# parses its pages line by line.
+* text=auto eol=lf
+# Appends from two machines merge without a conflict.
+wiki/log.md merge=union

@@ -432,7 +432,9 @@ may write, `wiki/notes/`; never edit generated pages or run git),
 `wiki/overview.md` (the charter), `wiki/index.md` and `wiki/log.md`
 (generated), `.raw/` for sources, `pub/` for `serve`, and `.obsidian/`
 (hides `.raw`, `pub`, `.harness` and colours the graph by folder) so the
-folder opens as an Obsidian vault. A `local` vault has no remote until the
+folder opens as an Obsidian vault, and `.gitattributes` (`* text=auto
+eol=lf`, so a Windows checkout is LF too; `wiki/log.md merge=union`, so two
+machines' appends do not conflict). A `local` vault has no remote until the
 user adds one with git; `list` shows its `origin` url once there is one.
 
 `init` (`_vault_charter`) asks, on `/dev/tty` with no model, what the active
@@ -451,7 +453,14 @@ and from `cmd_host` before `host_run_opencode`) clones the active vault into
 with no credential prompt and a 30s limit (skipped when the branch has no
 upstream, as for a new vault); a failed pull or clone warns and never
 blocks the launch, and a `local` vault whose folder is gone launches
-without a vault. It sets the `harness_vault_dir` global, which
+without a vault. The working tree is kept LF (`_vault_eol`): the clone is
+made with `-c core.autocrlf=false`, and an existing clone gets
+`core.autocrlf=false` in its own config once, unless that config already
+sets it; one checked out CRLF (Git for Windows' default `true`) is checked
+out again (`checkout-index -a -f -u`) when nothing tracked is uncommitted.
+The parsers in `vault_ingest.py` and `vault_ticket.py` read CRLF as LF
+anyway (`read_text` normalises, `frontmatter` and the unit/link markers take
+`\r\n`), so a unit's hash is the same on both systems. It sets the `harness_vault_dir` global, which
 `vault_opencode_config` turns into overlay keys: `instructions` with the
 vault's `AGENTS.md` (or `CLAUDE.md`), which opencode sends as "Instructions
 from: <path>" so the model knows where the vault is,

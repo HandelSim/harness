@@ -73,7 +73,9 @@ def read_text(path, limit=None):
         return None
     if b"\0" in data[:8192]:
         return None
-    return data.decode("utf-8", "replace")
+    # A Windows checkout (core.autocrlf=true) has CRLF: every parser here
+    # reads LF, and a unit's hash is the same on both systems.
+    return data.decode("utf-8", "replace").replace("\r\n", "\n")
 
 
 def write_atomic(path, text):
@@ -93,9 +95,10 @@ def write_if_changed(path, text):
 
 
 def frontmatter(text):
-    """(dict of top-level `key: value` lines, body) of a markdown file."""
-    if not text or not text.startswith("---\n"):
-        return {}, text or ""
+    """(dict of top-level `key: value` lines, body) of a markdown file, LF or CRLF."""
+    text = (text or "").replace("\r\n", "\n")
+    if not text.startswith("---\n"):
+        return {}, text
     end = text.find("\n---\n", 4)
     if end < 0:
         return {}, text
@@ -508,8 +511,8 @@ def ingest_unit(u, proxy, model, charter_text, context, timeout):
 
 # --- pages ---------------------------------------------------------------------
 
-UNIT_RE = re.compile(r"<!-- unit:(\S+) sha:(\w+) -->\n(.*?)\n<!-- /unit -->", re.S)
-BLOCK_RE = re.compile(r"\n?<!-- links -->.*?<!-- /links -->\n?", re.S)
+UNIT_RE = re.compile(r"<!-- unit:(\S+) sha:(\w+) -->\r?\n(.*?)\r?\n<!-- /unit -->", re.S)
+BLOCK_RE = re.compile(r"(?:\r?\n)?<!-- links -->.*?<!-- /links -->(?:\r?\n)?", re.S)
 
 
 def page_path(vault, u):

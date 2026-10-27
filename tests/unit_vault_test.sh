@@ -163,7 +163,7 @@ ok "V6: use/off/remove keep the registry consistent and never delete a clone"
 cmd_vault use other >/dev/null
 out=$(cmd_vault new fresh) || fail "V7: new failed — $out"
 fresh="$state_root/vaults/fresh"
-for f in AGENTS.md wiki/index.md wiki/log.md .raw/.gitkeep pub/.gitkeep .gitignore; do
+for f in AGENTS.md wiki/index.md wiki/log.md .raw/.gitkeep pub/.gitkeep .gitignore .gitattributes; do
     [[ -f "$fresh/$f" ]] || fail "V7: new vault is missing $f"
 done
 [[ "$(git -C "$fresh" rev-list --count HEAD)" == "1" ]] || fail "V7: new vault should have one commit"
@@ -749,5 +749,64 @@ grep -q '^## The ticket$' "$hubf" && grep -qF '`.raw/tickets/ABC-7.md`' "$hubf" 
     && grep -q 'ses_during' "$hubf" && grep -qF '[[ABC-7-state]]' "$hubf" \
     || fail "V17: the ticket hub should link the copy, the state note and the session — $(cat "$hubf")"
 ok "V17: sessions record their ticket and instruction files; the ticket hub links the copy, state and sessions"
+
+# --- V18: CRLF pages (a Windows checkout) parse like LF ones ------------------
+# A two-part page whose file is CRLF: changing one part keeps the other's text.
+mkdir -p "$PROJ/src/big"
+# shellcheck disable=SC2086
+$PY - "$PROJ/src/big" <<'PYEOF'
+import sys
+for n in ("a", "b"):
+    open(f"{sys.argv[1]}/{n}.py", "w").write("".join(f"def {n}_{i}():\n    return {i}\n" for i in range(110)))
+PYEOF
+git -C "$PROJ" add -A; git -C "$PROJ" commit -qm big
+ingest --unit-kb 4 >/dev/null || fail "V18: ingest of a two-part directory failed"
+BIG="$V/wiki/code/proj/proj--src--big.md"
+[[ "$(grep -c '^<!-- unit:code:proj/src/big#' "$BIG")" == 2 ]] || fail "V18: expected a two-part page — $(cat "$BIG")"
+for f in "$BIG" "$V/wiki/overview.md" "$V/wiki/notes/why-retry.md"; do sed -i.bak 's/$/\r/' "$f" && rm -f "$f.bak"; done
+grep -q $'\r$' "$BIG" || fail "V18: the page should be CRLF for this test"
+printf 'def b_extra():\n    return 0\n' >> "$PROJ/src/big/b.py"
+git -C "$PROJ" add -A; git -C "$PROJ" commit -qm big2
+before=$(nreq)
+ingest --unit-kb 4 >/dev/null || fail "V18: incremental ingest on a CRLF page failed"
+[[ "$(nreq)" == "$(( before + 1 ))" ]] || fail "V18: one changed part should be one request, got $(( $(nreq) - before ))"
+grep -q 'Not ingested yet' "$BIG" && fail "V18: the unchanged part of a CRLF page became a placeholder — $(cat "$BIG")"
+grep -q '^> covers src/big/a.py' "$BIG" || fail "V18: part 1's section should be kept — $(cat "$BIG")"
+grep -qx -- '- \[\[why-retry\]\]: why retries back off' "$V/wiki/index.md" \
+    || fail "V18: a CRLF note's summary should reach the index — $(cat "$V/wiki/index.md")"
+# shellcheck disable=SC2086
+$PY - "$REPO_ROOT/scripts" "$V" <<'PYEOF' || fail "V18: CRLF parsers"
+import sys
+sys.path.insert(0, sys.argv[1])
+import vault_ingest as vi
+meta, body = vi.frontmatter("---\r\ntracker_url: 'https://j.example'\r\n---\r\n# x\r\n")
+assert meta == {"tracker_url": "https://j.example"} and body == "# x\n", (meta, body)
+m = vi.UNIT_RE.search("<!-- unit:a#1 sha:abc -->\r\n> s\r\n<!-- /unit -->\r\n")
+assert m and m.group(1) == "a#1" and m.group(3) == "> s", m
+_, ticket_re = vi.charter(sys.argv[2])
+assert ticket_re and ticket_re.findall("see ABC-12") == ["ABC-12"], "a CRLF charter's ticket_pattern"
+PYEOF
+ok "V18: CRLF pages, notes and charter parse as LF ones; a CRLF two-part page keeps its other part"
+
+# --- V19: the vault's working tree is LF (core.autocrlf=false, set once) -----
+# GIT_CONFIG_GLOBAL stands in for Git for Windows' core.autocrlf=true.
+printf '[core]\n\tautocrlf = true\n' > "$TMP_ROOT/crlf.gitconfig"
+cmd_vault add crlf "$REMOTE" >/dev/null && cmd_vault use crlf >/dev/null
+CRLFV="$state_root/vaults/crlf"
+GIT_CONFIG_GLOBAL="$TMP_ROOT/crlf.gitconfig" git clone -q "$REMOTE" "$CRLFV" 2>/dev/null
+grep -q $'\r$' "$CRLFV/AGENTS.md" || fail "V19: the stand-in should check out CRLF"
+GIT_CONFIG_GLOBAL="$TMP_ROOT/crlf.gitconfig" vault_prepare >/dev/null 2>&1
+[[ "$(git -C "$CRLFV" config --local core.autocrlf)" == false ]] || fail "V19: prepare should set core.autocrlf=false in the vault"
+grep -q $'\r$' "$CRLFV/AGENTS.md" && fail "V19: a clean CRLF checkout should be checked out again as LF"
+[[ -z "$(git -C "$CRLFV" status --porcelain)" ]] || fail "V19: the re-checkout should leave the vault clean — $(git -C "$CRLFV" status --porcelain)"
+git -C "$CRLFV" config core.autocrlf input
+vault_prepare >/dev/null 2>&1
+[[ "$(git -C "$CRLFV" config --local core.autocrlf)" == input ]] || fail "V19: a value already in the vault's config is kept"
+rm -rf "$CRLFV"
+GIT_CONFIG_GLOBAL="$TMP_ROOT/crlf.gitconfig" vault_prepare >/dev/null 2>&1
+grep -q $'\r$' "$CRLFV/AGENTS.md" && fail "V19: a new clone should be checked out LF"
+[[ "$(git -C "$CRLFV" config --local core.autocrlf)" == false ]] || fail "V19: a new clone should keep core.autocrlf=false"
+cmd_vault use fresh >/dev/null && cmd_vault remove crlf >/dev/null
+ok "V19: vault clones check out LF and keep core.autocrlf=false unless the vault's config says otherwise"
 
 echo "VAULT TEST PASSED"
