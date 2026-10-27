@@ -5631,6 +5631,15 @@ vault_opencode_config() {
     done < <(harness_context_files "$HOME")
     [[ -f "$dir/AGENTS.md" || -f "$dir/CLAUDE.md" ]] \
         || err "vault at $dir has no AGENTS.md or CLAUDE.md; the agent is not told about it"
+    # A host launch on Windows (harness_native_paths=1) runs a Windows
+    # opencode, which resolves every path to C:\...: a /c/... rule never
+    # matches, so each vault read is asked and a headless run rejects it, and
+    # a /c/... instruction file is never found. It gets the C:/... form.
+    if [[ "${harness_native_paths:-0}" == 1 && "$(harness_detect_os)" == windows ]] \
+            && command -v cygpath >/dev/null 2>&1; then
+        dir=$(cygpath -m "$dir")
+        for f in "${!instr[@]}"; do instr[f]=$(cygpath -m "${instr[f]}"); done
+    fi
     harness_jq -cn --arg dir "$dir" --arg ticket "${harness_ticket:-}" \
         --argjson instr "$(printf '%s\n' ${instr[@]+"${instr[@]}"} | harness_jq -R . | harness_jq -sc 'map(select(. != ""))')" '
       {"permission": {"external_directory": {($dir + "/*"): "allow"}},
@@ -6793,7 +6802,7 @@ host_opencode_env() {
     export OPENCODE_CONFIG="$(host_opencode_config)"
     export OPENCODE_DISABLE_AUTOUPDATE=1
     local overlay
-    overlay=$(harness_opencode_overlay "$oai_provider")
+    overlay=$(harness_native_paths=1 harness_opencode_overlay "$oai_provider")
     [[ -n "$overlay" ]] && export OPENCODE_CONFIG_CONTENT="$overlay"
     # Exa web-search parity with container mode. Intentional in host mode too:
     # host mode already runs with NO egress firewall (the confirm gate makes

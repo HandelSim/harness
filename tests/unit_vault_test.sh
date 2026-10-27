@@ -127,9 +127,22 @@ mv "$dir/AGENTS.md" "$dir/AGENTS.away"
 cfg=$(vault_opencode_config 2>/dev/null)
 mv "$dir/AGENTS.away" "$dir/AGENTS.md"
 jq -e 'has("instructions") | not' <<<"$cfg" >/dev/null || fail "V5: no AGENTS.md/CLAUDE.md means no instructions — $cfg"
+# A Windows host launch gets C:/... paths; a container launch keeps /c/...
+cygpath() { [[ "$1" == -m ]] && printf 'C:%s' "$2"; }
+real_detect_os=$(declare -f harness_detect_os)
+harness_detect_os() { echo windows; }
+win=$(harness_native_paths=1 vault_opencode_config)
+jq -e --arg d "C:$dir" '.permission.external_directory[$d + "/*"] == "allow"
+        and .instructions[0] == ($d + "/AGENTS.md")
+        and .provider.harness.options.headers["x-harness-vault"] == $d' \
+    <<<"$win" >/dev/null || fail "V5: a Windows host launch should get C:/ paths — $win"
+jq -e --arg d "$dir" '.instructions[0] == ($d + "/AGENTS.md")' <<<"$(vault_opencode_config)" >/dev/null \
+    || fail "V5: a container launch should keep the vault path as is"
+unset -f cygpath harness_detect_os
+eval "$real_detect_os"
 harness_vault_dir=""
 [[ -z "$(harness_opencode_overlay)" ]] || fail "V5: no vault and no slim means no overlay"
-ok "V5: overlay carries instructions + external_directory, merges with slim"
+ok "V5: overlay carries instructions + external_directory, merges with slim; C:/ paths on a Windows host"
 
 # --- V6: use / off / remove --------------------------------------------------
 cmd_vault use other >/dev/null || fail "V6: use failed"

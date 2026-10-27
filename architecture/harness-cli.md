@@ -459,6 +459,11 @@ there needs no approval, and the provider header `x-harness-vault: <path>`,
 from which the proxy adds a line naming the vault and how to search it to a
 cooperative (free) model's per-turn reminder (see `proxy.md`); a native model
 keeps the instructions in its system prompt and gets no line.
+On a Windows host launch (`host_opencode_env` sets `harness_native_paths=1`)
+the vault and instruction paths go in as `C:/...` (`cygpath -m`): the
+Windows opencode resolves every path the agent touches to `C:\...`, so a
+`/c/...` rule would never match (each vault read asked, and a headless `-p`
+run rejects asks) and a `/c/...` instruction file would not be found.
 `harness_opencode_overlay` deep-merges that with the slim overlay into the
 one `OPENCODE_CONFIG_CONTENT`. Container mode also appends the vault to the
 extra mounts (same absolute path, deduped against the CWD).
