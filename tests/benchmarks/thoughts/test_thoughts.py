@@ -523,6 +523,17 @@ class Contamination(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+    def test_same_path_matches_windows_spellings(self):
+        from unittest import mock
+        with mock.patch.object(run, "IS_WINDOWS", True):
+            want = run._same_path(r"C:\Users\Me\AppData\Local\Temp\hb-thoughts-x\w")
+            for p in ("c:/Users/Me/AppData/Local/Temp/hb-thoughts-x/w", "/c/users/me/AppData/Local/Temp/hb-thoughts-x/w/",
+                      r"C:\USERS\me\appdata\local\temp\hb-thoughts-x\w"):
+                self.assertEqual(run._same_path(p), want, p)
+        with mock.patch.object(run, "IS_WINDOWS", False):
+            self.assertNotEqual(run._same_path("/tmp/W"), run._same_path("/tmp/w"))
+            self.assertEqual(run._same_path("/tmp/w/"), "/tmp/w")
+
     def test_opencode_metrics_counts_contaminated_tool_inputs(self):
         import sqlite3
         d = tempfile.mkdtemp()

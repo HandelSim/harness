@@ -332,6 +332,16 @@ def is_contaminated(text: str, needles: list[str], own_src: str) -> bool:
     return any(x in text for x in needles)
 
 
+def _same_path(p: str) -> str:
+    """A directory in one spelling, so opencode's record of it matches ours on
+    Windows too (case, slashes, a Git Bash /c/... form)."""
+    p = p.replace("\\", "/").rstrip("/")
+    m = re.match(r"^/([a-zA-Z])(/|$)", p)
+    if m and IS_WINDOWS:
+        p = m.group(1) + ":/" + p[3:]
+    return p.lower() if IS_WINDOWS else p
+
+
 def opencode_metrics(db: str, directory: str, t0: float, t1: float, needles: list[str]) -> dict:
     """Tool-call / tool-error / reasoning-part / empty-reply counts for the
     trial's sessions (by directory and time), and a contamination count of
@@ -343,12 +353,13 @@ def opencode_metrics(db: str, directory: str, t0: float, t1: float, needles: lis
         try:
             cols = {r[1] for r in con.execute("PRAGMA table_info(session)")}
             tc = "time_created" if "time_created" in cols else None
-            q = "SELECT id FROM session WHERE directory = ?"
-            args: list = [directory]
+            q = "SELECT id, directory FROM session"
+            args: list = []
             if tc:
-                q += f" AND {tc} >= ? AND {tc} <= ?"
+                q += f" WHERE {tc} >= ? AND {tc} <= ?"
                 args += [int(t0 * 1000) - 5000, int(t1 * 1000) + 5000]
-            sids = [r[0] for r in con.execute(q, args)]
+            want = _same_path(directory)
+            sids = [r[0] for r in con.execute(q, args) if _same_path(r[1] or "") == want]
             if "parent_id" in cols and sids:
                 kids = [r[0] for r in con.execute(
                     f"SELECT id FROM session WHERE parent_id IN ({','.join('?' * len(sids))})", sids)]
@@ -580,6 +591,10 @@ def report(results: list[dict], meta: dict) -> str:
         L.append(f"  {label:<36} {sum(int(r.get(key) or 0) for r in A):>6} | {sum(int(r.get(key) or 0) for r in B):>6}")
     L.append(f"  {'arm-verification failures':<36} {sum(not r['arm_ok'] for r in A):>6} | "
              f"{sum(not r['arm_ok'] for r in B):>6}")
+    # The tool and reasoning counters above come from opencode's database; a
+    # trial whose session was not found there counts 0 for all of them.
+    L.append(f"  {'opencode session not found':<36} {sum(not r.get('oc_sessions') for r in A):>6} | "
+             f"{sum(not r.get('oc_sessions') for r in B):>6}")
     ta = sum(int(r.get("tool_errors") or 0) for r in A) / max(1, sum(int(r.get("tool_calls") or 0) for r in A))
     tb = sum(int(r.get("tool_errors") or 0) for r in B) / max(1, sum(int(r.get("tool_calls") or 0) for r in B))
     L.append(f"  {'tool-error rate':<36} {ta:>6.1%} | {tb:>6.1%}")
