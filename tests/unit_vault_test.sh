@@ -809,4 +809,56 @@ grep -q $'\r$' "$CRLFV/AGENTS.md" && fail "V19: a new clone should be checked ou
 cmd_vault use fresh >/dev/null && cmd_vault remove crlf >/dev/null
 ok "V19: vault clones check out LF and keep core.autocrlf=false unless the vault's config says otherwise"
 
+# --- V20: a codebase not on this host keeps its pages; --src moves it --------
+# The other machine's path (C:/x on Windows, /home/x on Linux) is not a folder here.
+AWAY="$TMP_ROOT/here/away"
+mkdir -p "$AWAY/lib"
+printf 'def far():\n    pass\n' > "$AWAY/lib/far.py"
+git -C "$AWAY" init -q && git -C "$AWAY" add -A && git -C "$AWAY" commit -qm init
+ingest --src "$AWAY" >/dev/null || fail "V20: ingest of a second codebase failed"
+[[ -f "$V/wiki/code/away/away--lib.md" ]] || fail "V20: the codebase's page should exist"
+mkdir -p "$TMP_ROOT/there" && mv "$AWAY" "$TMP_ROOT/there/away"
+before=$(nreq)
+out=$(ingest) || fail "V20: ingest with a codebase not on this host failed — $out"
+[[ -f "$V/wiki/code/away/away--lib.md" ]] && ! grep -q 'Not ingested yet' "$V/wiki/code/away/away--lib.md" \
+    || fail "V20: the pages of a codebase not on this host must be left alone — $out"
+grep -q '"code:away/lib#1"' "$V/.harness/ingest.json" || fail "V20: its units must stay in the manifest"
+[[ "$(grep -c 'away: .* is not on this host' <<<"$out")" == 1 ]] || fail "V20: one warning per run — $out"
+[[ "$(nreq)" == "$before" ]] || fail "V20: nothing should be sent"
+out=$(ingest --src "$TMP_ROOT/there/away") || fail "V20: --src with the codebase's new path should take over — $out"
+[[ "$(nreq)" == "$before" ]] || fail "V20: the same files at a new path are not sent again"
+grep -qF "\"away\": \"$TMP_ROOT/there/away\"" "$V/.harness/ingest.json" || fail "V20: the path should be updated — $(cat "$V/.harness/ingest.json")"
+mkdir -p "$TMP_ROOT/third/away"
+ingest --src "$TMP_ROOT/third/away" >/dev/null && fail "V20: a name whose path is on this host must still be refused"
+ok "V20: a codebase whose folder is not on this host keeps its pages; --src with its new path updates it"
+
+# --- V21: secret-looking files are never sent ---------------------------------
+mkdir -p "$PROJ/src/conf/secrets" "$V/.raw/notes"
+for f in .env .env.local id_rsa id_ed25519.pub server.pem tls.key cert.p12 .netrc credentials.json \
+        secrets.yaml secrets/db.txt; do
+    printf 'TOPSECRET\n' > "$PROJ/src/conf/$f"
+done
+printf 'KEY=EXAMPLEVALUE\n' > "$PROJ/src/conf/.env.example"
+printf 'DEBUG = True\n' > "$PROJ/src/conf/settings.py"
+printf 'TOPSECRET\n' > "$V/.raw/notes/credentials.md"
+git -C "$PROJ" add -A; git -C "$PROJ" commit -qm conf
+before=$(nreq)
+ingest >/dev/null || fail "V21: ingest failed"
+(( $(nreq) > before )) || fail "V21: the conf directory should be sent"
+tail -n +"$(( before + 1 ))" "$REQS" | grep -q TOPSECRET && fail "V21: a secret-looking file was sent"
+tail -n +"$(( before + 1 ))" "$REQS" | grep -q EXAMPLEVALUE || fail "V21: .env.example is not a secret"
+grep -q 'credentials' "$V/.harness/ingest.json" && fail "V21: a .raw credentials file got a unit"
+ok "V21: .env*, keys, .netrc, credentials* and secrets* files are never sent; .env.example is"
+
+# --- V22: --watch --retry-failed sleeps on units that failed in this run -----
+grep -q '"status": "failed"' "$V/.harness/ingest.json" || fail "V22: needs a failed unit"
+before=$(nreq)
+logs=$(grep -c ' ingest: ' "$V/wiki/log.md")
+rc=0; timeout 5 "$PY" "$REPO_ROOT/scripts/vault_ingest.py" ingest --vault "$V" --proxy "http://127.0.0.1:$PORT/v1" \
+    --model free-m --retry-failed --watch 1 >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 124 ]] || fail "V22: the watch should still be running (rc $rc)"
+[[ "$(nreq)" == "$(( before + 2 ))" ]] || fail "V22: one try and one retry, then sleep; got $(( $(nreq) - before )) requests"
+[[ "$(grep -c ' ingest: ' "$V/wiki/log.md")" == "$(( logs + 1 ))" ]] || fail "V22: one log line for the pass, none for the sleeps"
+ok "V22: --watch --retry-failed retries a failed unit once per run and sleeps instead of looping"
+
 echo "VAULT TEST PASSED"

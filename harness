@@ -6377,7 +6377,10 @@ directory's files, or a run of messages of a session) goes to the model as one
 plain request with no tools, so a free model does it as well as a -withtools
 one; harness writes, checks and links the pages, rebuilds wiki/index.md, the
 topic and ticket hubs and each codebase's module tree, commits every 10 units
-and pushes.
+and pushes. Files that look like secrets (.env*, *.pem, *.key, *.p12,
+id_rsa*, .netrc, credentials*, secrets*) are never sent. A remembered
+codebase whose folder is not on this machine keeps its pages; giving <dir>
+again (same folder name) moves it to this machine's path.
 
   --model M        model to use (default: the default model; a -withtools
                    model is swapped for its free twin when the proxy lists one)

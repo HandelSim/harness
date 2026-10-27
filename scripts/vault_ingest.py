@@ -54,6 +54,11 @@ SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svg", ".
 SKIP_NAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock",
               "go.sum", "composer.lock", "Gemfile.lock", ".DS_Store"}
 GENERATED = "generated: harness"
+# Never sent to a model: ticket_queue.py's SECRET_PATH (copied, the two scripts
+# stand alone) plus .p12, credentials* and secrets* files and secrets/ folders.
+SECRET_PATH = re.compile(r"(^|/)(\.env(?!\.(example|sample|template)$)(\..*)?|.*\.pem|.*\.key|.*\.p12"
+                         r"|id_(rsa|ed25519|ecdsa|dsa)[^/]*|\.netrc|credentials[^/]*|secrets[^/]*)$"
+                         r"|(^|/)secrets/", re.I)
 BAD_NAME = re.compile(r'[\[\]#^|\\:*?"<>/]')
 
 
@@ -214,7 +219,7 @@ def repo_files(root):
         low = name.lower()
         if any(p in SKIP_DIRS for p in parts[:-1]) or name in SKIP_NAMES:
             continue
-        if any(low.endswith(e) for e in SKIP_EXT):
+        if any(low.endswith(e) for e in SKIP_EXT) or SECRET_PATH.search(rel):
             continue
         path = os.path.join(root, rel)
         try:
@@ -298,6 +303,8 @@ def raw_units(vault, budget):
                 continue
             path = os.path.join(d, name)
             rel = os.path.relpath(path, raw).replace(os.sep, "/")
+            if SECRET_PATH.search(rel):
+                continue
             text = read_text(path, MAX_FILE_BYTES * 4)
             if text is None or not text.strip():
                 continue
@@ -327,13 +334,22 @@ def raw_units(vault, budget):
     return units
 
 
-def plan(vault, m, srcs, budget):
+def missing_repos(m):
+    """Remembered codebases whose folder is not on this host (another machine's
+    path, an unmounted drive): their units and pages are left as they are."""
+    return {name for name, root in m["repos"].items() if not os.path.isdir(root)}
+
+
+def plan(vault, m, srcs, budget, warned=None):
     units = raw_units(vault, budget)
     for name, root in sorted(m["repos"].items()):
         if os.path.isdir(root):
             units += code_units(name, root, budget)
-        elif name in srcs:
-            print(f"[ingest] {name}: {root} not found, skipped", file=sys.stderr)
+        elif warned is None or name not in warned:
+            if warned is not None:
+                warned.add(name)
+            print(f"[ingest] {name}: {root} is not on this host; its pages are left as they are "
+                  f"(--src DIR updates the path, harness ingest --forget {name} drops it)", file=sys.stderr)
     return units
 
 
@@ -829,18 +845,25 @@ def run_ingest(a):
             print(f"[ingest] {src} contains or is inside the vault; ingest the codebase only", file=sys.stderr)
             return 1
         name = safe_name(os.path.basename(root.rstrip("/\\")))
-        if m["repos"].get(name, root) != root:
+        # A path that is not on this host is another machine's (C:/x vs /home/x): this one takes over.
+        if m["repos"].get(name, root) != root and os.path.isdir(m["repos"][name]):
             print(f"[ingest] the vault already has a codebase named {name} at {m['repos'][name]}", file=sys.stderr)
             return 1
+        if m["repos"].get(name, root) != root:
+            print(f"[ingest] {name}: path {m['repos'][name]} is not on this host; now {root}", file=sys.stderr)
         m["repos"][name] = root
         srcs.add(name)
     budget = max(4, a.unit_kb) * 1024
     charter_text, ticket_re = charter(vault)
     model = a.model if a.dry_run else resolve_model(a.proxy, a.model)
     done = failed = 0
+    warned = set()
+    # Units that failed in this run are not sent again by --retry-failed in the
+    # same run (a watch would loop on them and commit every pass), until they change.
+    failed_here = set()
     while True:
-        units = plan(vault, m, srcs, budget)
-        todo = pending(units, m, a.retry_failed)
+        units = plan(vault, m, srcs, budget, warned)
+        todo = [u for u in pending(units, m, a.retry_failed) if (u["id"], u["sha"]) not in failed_here]
         if a.max:
             todo = todo[: max(0, a.max - done - failed)]
         if a.dry_run:
@@ -878,6 +901,7 @@ def run_ingest(a):
             entry = m["units"].get(u["id"], {})
             if problems:
                 failed += 1
+                failed_here.add((u["id"], u["sha"]))
                 entry = {"sha": u["sha"], "page": f"{u['dir']}/{u['page']}.md", "status": "failed",
                          "attempts": entry.get("attempts", 0) + 1, "problems": problems[:3], "at": now_iso()}
                 print(f"[ingest] {u['id']}: failed: {'; '.join(problems)}", file=sys.stderr)
@@ -899,7 +923,8 @@ def run_ingest(a):
         # Units that no longer exist (a deleted file or directory) leave the manifest;
         # their pages are rebuilt from what is left.
         live = {u["id"] for u in units}
-        gone = [k for k in m["units"] if k not in live]
+        away = tuple(f"code:{name}/" for name in missing_repos(m))
+        gone = [k for k in m["units"] if k not in live and not (away and k.startswith(away))]
         live_pages = {f"{u['dir']}/{u['page']}.md" for u in units}
         for k in gone:
             # A page whose source is gone entirely goes too (git keeps it).
@@ -922,9 +947,9 @@ def run_ingest(a):
             return 2
         if not a.watch or (a.max and done + failed >= a.max):
             break
-        if not todo:
+        if not wrote:
             time.sleep(a.watch)
-    left = len(pending(plan(vault, m, srcs, budget), m, False))
+    left = len(pending(plan(vault, m, srcs, budget, warned), m, False))
     print(f"[ingest] done: {done} sections written, {failed} failed, {left} units left", file=sys.stderr)
     return 0
 

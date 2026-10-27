@@ -526,7 +526,9 @@ ingest --commit` against `http://127.0.0.1:<host proxy port>/v1`. The design
 (chosen by council) keeps every decision in code so a free model with no
 tools does it as well as a `-withtools` one: harness picks the units (a
 `.raw` file cut at its `## ` headings, or one codebase directory's tracked
-text files, packed to `--unit-kb`, default 48), sends each as one plain
+text files, packed to `--unit-kb`, default 48; files that look like secrets,
+`SECRET_PATH` copied from `ticket_queue.py` plus `*.p12`, `credentials*`,
+`secrets*` and `secrets/`, are never read), sends each as one plain
 request with `x-harness-raw: 1` (no tools, no reminder; a `-withtools` model
 is swapped for its free base when `/models` lists it), with the rules before
 and after the source, the charter, as context the summaries of the page's
@@ -534,14 +536,21 @@ other parts and (code, done deepest first) of its subdirectory pages, and a
 fixed section format (summary line, headings, `Topics:`). The reply is
 checked (a summary line, a body, backticked names that exist in the source),
 sent back once with the problems, then marked failed (`--retry-failed` sends
-it again). Upstream errors do not count as attempts; three in a row stop the
+it again, once per run: a `--watch` sleeps rather than resend a unit that
+failed in this run, until its source changes; a pass that wrote nothing
+sleeps). Upstream errors do not count as attempts; three in a row stop the
 run. Each unit's text goes between `<!-- unit:ID sha:SHA -->` markers in its
 page (`wiki/code/<repo>/<repo>--<dir>.md`, the root `wiki/code/<repo>/<repo>.md`;
 `wiki/sources/<file>.md`), so a page is rebuilt section by section and a
 `<!-- links -->` block written by hand survives. `.harness/ingest.json` keeps
 each unit's content hash and page: only new or changed units are sent, and
 units (and generated pages) whose source is gone are removed. A codebase
-given once is remembered. After the units, `regenerate` writes
+given once is remembered by name and absolute path. The vault is shared
+between machines (`C:/x` on Windows, `/home/x` on Linux), so a remembered
+codebase whose folder is not on this host is not "gone": its units and pages
+are left alone, with one warning per run; `<dir>` with the same folder name
+takes it over when the stored path is not on this host (and is refused when
+it is). After the units, `regenerate` writes
 `wiki/index.md` (top-level pages, one line per codebase, sources, topics,
 tickets, each with its summary line), a hub per topic used by two or more
 pages (`wiki/topics/`), a page per ticket id (`wiki/tickets/`), and each
