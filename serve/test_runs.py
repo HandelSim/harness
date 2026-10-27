@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 from http.server import ThreadingHTTPServer
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pub  # noqa: E402
@@ -615,6 +615,64 @@ class QueuePageTest(RunsServer):
                                                 ("branch", "a..b")])
         self.assertEqual(r.status, 409)
         self.assertIn("branch: not a branch", body)
+
+    def test_add_starting_points_and_the_branch_list(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        g = lambda *a: subprocess.run(["git", "-C", proj, *a], capture_output=True, text=True, check=True).stdout.strip()
+        head = g("rev-parse", "HEAD")
+        g("update-ref", "refs/remotes/origin/ABC-5", head)
+        g("branch", "side")
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("name='start' value='new' checked>New work", body)
+        self.assertIn("<datalist id='branches'></datalist>", body)
+        r, body = self.req("GET", "/runs/queue/branches?project=" + quote(proj))
+        d = json.loads(body)
+        self.assertEqual(d["current"], g("symbolic-ref", "--short", "HEAD"))
+        self.assertIn("side", d["local"])
+        self.assertEqual(d["remote"], ["origin/ABC-5"])
+        self.assertIn("error", json.loads(self.req("GET", "/runs/queue/branches?project=relative")[1]))
+        self.assertIn("error", json.loads(self.req("GET", "/runs/queue/branches?project=" + quote(self.tmp.name))[1]))
+        # continue a remote branch: the work goes on on a branch of the same name
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-5"), ("project", proj), ("preset", "review"),
+                                                ("start", "continue"), ("cont", "origin/ABC-5")])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "ABC-5", "state.json")) as f:
+            st = json.load(f)
+        self.assertEqual((st["start"], st["branch"]), ("origin/ABC-5", "ABC-5"))
+        # continue a local branch: that branch
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-6"), ("project", proj), ("start", "continue"),
+                                                ("cont", "side")])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "ABC-6", "state.json")) as f:
+            self.assertEqual(json.load(f)["branch"], "side")
+        # the folder as it is now
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("start", "here"),
+                                                ("cont", "ignored")])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
+            self.assertEqual(json.load(f)["start"], head)
+        # new work from a target branch
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-8"), ("project", proj), ("start", "new"),
+                                                ("base", "side")])
+        self.assertEqual(r.status, 303, body)
+        for fields, why in (
+                ([("start", "continue")], "name the branch"),
+                ([("start", "continue"), ("cont", "x"), ("keys", "ABC-1 ABC-2")], "one ticket"),
+                ([("branch", "b"), ("keys", "ABC-1 ABC-2")], "one ticket"),
+                ([("start", "sideways")], "not a starting point")):
+            f = [("keys", "ABC-1"), ("project", proj)]
+            f = [x for x in f if x[0] not in dict(fields)] + fields
+            r, body = self.post("/runs/queue/add", f)
+            self.assertEqual(r.status, 409, (fields, body[:300]))
+            self.assertIn(why, body)
+        # a refused continue keeps what was typed and the choice
+        self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-1")))
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-1"), ("project", "rel"), ("start", "continue"),
+                                                ("cont", "origin/ABC-5")])
+        self.assertIn("name='start' value='continue' checked>", body)
+        self.assertIn("placeholder='origin/ABC-123'", body)
+        self.assertIn("value='origin/ABC-5'", body)
 
     def test_add_a_review_only_ticket_with_its_ref_and_a_note(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))

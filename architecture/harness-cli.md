@@ -1333,10 +1333,16 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
   one of the ticket's stages), why it waits (a running ticket: its stage,
   attempt and the run's `step`; a `running` ticket with no live run on it:
   "run ended", with Start the queue on its page), and its buttons (move, Answer
-  or Review plan, stop, retry, remove); and the Add form (keys,
-  project folder, base, the existing work's ref such as `origin/ABC-123`,
-  a note for the agents, and the stages: Full, Review only,
-  Implement+review, Plan only or Custom). "+ Add tickets" scrolls to the
+  or Review plan, stop, retry, remove); and the Add form (keys, project
+  folder, a Starting point: New work from the target branch, Continue
+  existing work on a named branch such as `origin/ABC-123` (the work branch
+  defaults to that branch's name; one ticket per add), or The folder as it is
+  now (`--start here`); the Target branch (`--base`), an optional Work branch
+  name, where the agents work, plan approval, a note for the agents, and the
+  stages: Full, Review only, Implement+review, Plan only or Custom). The
+  branch fields suggest the project's local and remote branches from
+  `/runs/queue/branches?project=` (read-only git, cached 5 s), which also
+  says which repository and branch the folder is on. "+ Add tickets" scrolls to the
   form and focuses the keys. The project folder starts as the git repository
 `harness serve` (or the launch that started the viewer) was run in
 (`--project-dir`, its top folder), else the last ticket's; the others are

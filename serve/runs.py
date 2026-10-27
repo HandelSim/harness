@@ -222,6 +222,12 @@ legend { font-size: 13px; font-weight: 550; padding: 0; margin-bottom: 6px; }
 .presets label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
 .presets label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .presets.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.presets.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.presets label input[name=cont] { position: static; opacity: 1; pointer-events: auto; margin-top: 6px; width: 100%; }
+.projhint { font-size: 12px; min-height: 1em; margin-top: -4px; }
+.projhint.err { color: var(--bad); }
+details.adv > summary { cursor: pointer; font: 600 13px/1.6 var(--sans); padding: 2px 0; }
+details.adv[open] > summary { margin-bottom: 4px; }
 .checks { display: flex; gap: 6px; flex-wrap: wrap; }
 .checks label { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
   border: 1px solid var(--line-2); font-size: 13px; cursor: pointer; }
@@ -344,6 +350,7 @@ details.doc summary .muted { font-weight: 400; }
 }
 @media (max-width: 860px) {
   .presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .presets.three { grid-template-columns: minmax(0, 1fr); }
   .runner { grid-template-columns: minmax(0, 1fr); } .runner .startf { justify-content: flex-start; }
 }
 @media (max-width: 560px) {
@@ -1510,6 +1517,32 @@ def _choice(legend, name, value, choices):
     return f"<fieldset><legend>{esc(legend)}</legend><div class='presets two'>{cards}</div></fieldset>"
 
 
+START_MODES = ("new", "continue", "here")
+
+
+def _start_choice(v, sent):
+    """The Starting point cards; Continue carries the branch to continue."""
+    mode = v("start") if v("start") in START_MODES else ("continue" if sent and v("ref") and v("ref") != "here"
+                                                          else "here" if sent and v("ref") == "here" else "new")
+    cont = v("cont") or (v("ref") if mode == "continue" and not v("start") else "")
+    cards = (
+        ("new", "New work", "a fresh branch from the target branch below. In your project folder its "
+         "uncommitted files come along."),
+        ("continue", "Continue existing work", "pick up a branch that already has work on it (a remote one is "
+         "fetched first); the work goes on on that branch."),
+        ("here", "The folder as it is now", "start from the commit the project folder has checked out, "
+         "whatever branch that is."))
+    out = []
+    for c, lab, hint in cards:
+        extra = ""
+        if c == "continue":
+            extra = (f"<input name='cont' list='branches' spellcheck='false' value='{esc(cont)}' "
+                     "placeholder='origin/ABC-123' aria-label='branch or commit to continue'>")
+        out.append(f"<label><input type='radio' name='start' value='{c}'{' checked' if c == mode else ''}>"
+                   f"{esc(lab)}<small>{esc(hint)}</small>{extra}</label>")
+    return f"<fieldset><legend>Starting point</legend><div class='presets three'>{''.join(out)}</div></fieldset>"
+
+
 def add_form(runs, form=None, err=""):
     """The Add tickets form; after a refused add, the values sent (form) and
     why it was refused (err), so nothing typed is lost."""
@@ -1534,16 +1567,22 @@ def add_form(runs, form=None, err=""):
             "<small>one or more, space or comma separated</small></label>"
             f"<label class='fld'>Project folder<input name='project' required list='projects' spellcheck='false' "
             f"value='{esc(project)}' placeholder='/home/me/src/project'>"
-            f"<datalist id='projects'>{opts}</datalist><small>the git repository the work is in (absolute path)</small></label>"
-            f"<label class='fld'>Base<input name='base' spellcheck='false' value='{esc(v('base'))}' "
-            "placeholder='the project&#39;s current branch'><small>branch or commit the work goes onto</small></label>"
-            f"<label class='fld'>Start from<input name='ref' spellcheck='false' value='{esc(v('ref'))}' "
-            "placeholder='what the folder has checked out'><small>where the work starts: a branch, tag or commit "
-            "(origin/ABC-123 is fetched first, e.g. existing work), or <b>here</b>: what the project folder has "
-            "checked out. Empty: here, or the base when the agents work in a copy</small></label>"
-            f"<label class='fld'>Branch<input name='branch' spellcheck='false' value='{esc(v('branch'))}' "
-            "placeholder='the ticket key'><small>the branch the work ends on; an existing one is only moved "
-            "forward (start from it to carry on its work)</small></label>"
+            f"<datalist id='projects'>{opts}</datalist><datalist id='branches'></datalist>"
+            "<small>the git repository the work is in (absolute path)</small></label>"
+            "</div>"
+            "<div class='projhint muted' id='projhint' aria-live='polite'></div>"
+            + _start_choice(v, form is not None) +
+            "<div class='grid2'>"
+            f"<label class='fld'>Target branch<input name='base' list='branches' spellcheck='false' "
+            f"value='{esc(v('base'))}' placeholder='the branch the folder is on'>"
+            "<small>the branch this work is meant to go into: review compares the work with it, and New work "
+            "starts from it</small></label>"
+            "<details class='fld adv' data-k='addadv'" + (" open" if v("branch") else "") + ">"
+            "<summary>Work branch name</summary>"
+            f"<label class='fld'><input name='branch' spellcheck='false' value='{esc(v('branch'))}' "
+            "placeholder='the ticket key'><small>the branch the agents commit to. Empty: the ticket key, or the "
+            "branch you continue. An existing branch is only moved forward, never rewritten.</small></label>"
+            "</details>"
             "</div>"
             + _choice("Where the agents work", "where", v("where"), WHERE_CHOICES)
             + _choice("When the plan is written", "after_plan", v("after_plan"), AFTER_PLAN_CHOICES) +
@@ -1553,7 +1592,7 @@ def add_form(runs, form=None, err=""):
             "placeholder='Context every stage gets, e.g. the solution is on origin/ABC-3122; only the "
             f"review is left.'>{esc(v('note'))}</textarea></label>"
             "<div class='formacts'><button type='submit' class='primary'>Add to the queue</button>"
-            "<span class='muted' id='addhint'>Review without implement needs where the work is (start from).</span></div>"
+            "<span class='muted' id='addhint'></span></div>"
             "</form></section>")
 
 
@@ -1943,6 +1982,60 @@ def project_path(p, nt=os.name == "nt"):
     return f"{m.group(1).upper()}:{m.group(2) or '/'}" if m else p
 
 
+_BRANCHES = {}
+
+
+def project_branches(project):
+    """The Add form's branch suggestions for a project folder: the repository's top
+    folder, the branch it is on, origin's default branch and the local and
+    remote-tracking branches, newest commit first. Read-only git; cached 5 s."""
+    p = project_path(project)
+    if not p or not os.path.isabs(p) or not os.path.isdir(p):
+        return {"error": "not a folder (give an absolute path)"}
+    now = time.time()
+    hit = _BRANCHES.get(p)
+    if hit and now - hit[0] < 5:
+        return hit[1]
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+
+    def git(*a):
+        try:
+            r = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", p, *a], capture_output=True, text=True,
+                               timeout=10, stdin=subprocess.DEVNULL, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    top = git("rev-parse", "--show-toplevel")
+    if top is None:
+        out = {"error": "not in a git repository"}
+    else:
+        local, remote = [], []
+        for line in (git("for-each-ref", "--sort=-committerdate", "--count=300", "--format=%(refname)",
+                         "refs/heads", "refs/remotes") or "").splitlines():
+            if line.startswith("refs/heads/"):
+                local.append(line[len("refs/heads/"):])
+            elif line.startswith("refs/remotes/") and not line.endswith("/HEAD"):
+                remote.append(line[len("refs/remotes/"):])
+        out = {"top": top, "current": git("symbolic-ref", "-q", "--short", "HEAD") or "",
+               "default": git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "",
+               "local": local, "remote": remote}
+    _BRANCHES[p] = (now, out)
+    if len(_BRANCHES) > 50:
+        _BRANCHES.pop(next(iter(_BRANCHES)))
+    return out
+
+
+def _branch_of_ref(info, ref):
+    """The branch name continuing ref ends on: ref itself when it is a local branch,
+    NAME for a remote-tracking REMOTE/NAME; "" for a tag or commit."""
+    if ref in info.get("local", ()):
+        return ref
+    if ref in info.get("remote", ()):
+        return ref.split("/", 1)[1]
+    return ""
+
+
 def add_tickets(runs, form):
     """The queue page's Add form: harness queue add, its values checked first."""
     raw = _one(form, "keys")
@@ -1959,9 +2052,28 @@ def add_tickets(runs, form):
         return False, "the project folder must be an absolute path to a folder that exists"
     base, ref, branch = (_one(form, n).strip() for n in ("base", "ref", "branch"))
     in_place, wait = _one(form, "where") != "copy", _one(form, "after_plan") != "go"
-    for name, v in (("base", base), ("start from", ref), ("branch", branch)):
+    mode = _one(form, "start")
+    if mode and mode not in START_MODES:
+        return False, "not a starting point: " + mode[:40]
+    if mode == "continue":
+        ref = _one(form, "cont").strip()
+        if not ref:
+            return False, "continue existing work: name the branch (or commit) the work is on"
+    elif mode == "here":
+        ref = "here"
+    elif mode == "new":
+        ref = base      # empty: the queue's own default (the folder's branch, or where a queued ticket started)
+    for name, v in (("target branch" if mode else "base", base),
+                    ("continue from" if mode == "continue" else "start from", "" if ref == "here" else ref),
+                    ("branch", branch)):
         if v and not ref_ok(v):
             return False, f"{name}: not a branch, tag or commit name: {v[:80]}"
+    if branch and len(keys) > 1:
+        return False, "a work branch name is for one ticket; add the tickets one at a time"
+    if mode == "continue" and len(keys) > 1:
+        return False, "continue existing work takes one ticket at a time (each needs its own branch)"
+    if mode == "continue" and not branch:
+        branch = _branch_of_ref(project_branches(project), ref)
     preset = _one(form, "preset") or "full"
     if preset in PRESETS:
         stages = list(PRESETS[preset])
@@ -1974,7 +2086,8 @@ def add_tickets(runs, form):
     if "fix" in stages and "review" not in stages:
         return False, "fix runs only after a review asks for fixes; pick review too"
     if "implement" not in stages and any(s in stages for s in ("review", "fix", "push")) and not ref and not in_place:
-        return False, "with no implement stage, say where the work is in start from (e.g. origin/ABC-123)"
+        return False, ("with no implement stage, say where the existing work is: pick Continue existing work "
+                       "and name its branch (e.g. origin/ABC-123)")
     note = _one(form, "note").replace("\r\n", "\n")
     if len(note) > ADD_NOTE_MAX:
         return False, f"the note is over {ADD_NOTE_MAX} characters"
@@ -2254,11 +2367,12 @@ COMMON_JS = """
     var checks = add.querySelectorAll('input[name^=stage_]');
     var hint = document.getElementById('addhint');
     function sync() {
-      var on = [], ref = add.querySelector('input[name=ref]').value.trim() ||
-        add.querySelector('input[name=where][value=folder]').checked;
+      var md = add.querySelector('input[name=start]:checked'), on = [];
+      var ref = (md && md.value === 'continue' && add.querySelector('input[name=cont]').value.trim()) ||
+        (md && md.value === 'here') || add.querySelector('input[name=where][value=folder]').checked;
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
       var need = on.indexOf('implement') < 0 && (on.indexOf('review') >= 0 || on.indexOf('push') >= 0);
-      hint.textContent = need && !ref ? 'Review without implement needs where the work is (start from).' :
+      hint.textContent = need && !ref ? 'Review without implement needs the existing work: pick Continue existing work.' :
         on.length ? 'Stages: ' + on.join(' \\u2192 ') : 'Pick at least one stage.';
       hint.className = need && !ref || !on.length ? 'err' : 'muted';
     }
@@ -2276,8 +2390,37 @@ COMMON_JS = """
       }
       sync();
     });
-    add.addEventListener('input', sync);
+    add.addEventListener('input', function (e) {
+      if (e.target.name === 'cont' && e.target.value) add.querySelector('input[name=start][value=continue]').checked = true;
+      sync();
+    });
     sync();
+    // The project's branches: suggestions for the branch fields, and what the folder is on.
+    var proj = add.querySelector('input[name=project]'), dl = document.getElementById('branches'),
+      ph = document.getElementById('projhint'), bt = null, lastP = null;
+    function branches() {
+      var p = proj.value.trim();
+      if (p === lastP) return;
+      lastP = p;
+      if (!p) { ph.textContent = ''; return; }
+      fetch('/runs/queue/branches?project=' + encodeURIComponent(p), {credentials: 'same-origin', cache: 'no-store'})
+        .then(function (r) { return r.json(); }).then(function (d) {
+          if (proj.value.trim() !== p) return;
+          dl.innerHTML = '';
+          if (d.error) { ph.textContent = p + ': ' + d.error; ph.className = 'projhint err'; return; }
+          ph.className = 'projhint muted';
+          ph.textContent = 'git repository ' + d.top + (d.current ? ', on branch ' + d.current : ', on a detached commit') +
+            ' \u00b7 ' + d.local.length + ' local and ' + d.remote.length + ' remote branches';
+          d.local.concat(d.remote).forEach(function (b) {
+            var o = document.createElement('option'); o.value = b; dl.appendChild(o);
+          });
+          add.querySelector('input[name=base]').placeholder = d.current ? d.current + ' (the branch the folder is on)' :
+            'the commit the folder is on';
+        }).catch(function () { lastP = null; });
+    }
+    proj.addEventListener('input', function () { clearTimeout(bt); bt = setTimeout(branches, 400); });
+    proj.addEventListener('change', branches);
+    branches();
   }
 })();
 """.replace("%PRESETS%", json.dumps({k: list(v) for k, v in PRESETS.items()}))

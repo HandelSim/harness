@@ -1015,6 +1015,8 @@ def make_handler(cfg):
                                    runs_view.LIVE_JS, head, "queue")
                 elif bits[1] == "live":
                     self.send_json(runs_view.queue_live(r), head)
+                elif bits[1] == "branches":
+                    self.send_json(runs_view.project_branches((q.get("project") or [""])[0][:1000]), head)
                 elif bits[1] == "runner.out":
                     self.send(200, (r.runner_out(400) or "nothing yet").encode(), extra=text, head=head)
                 else:
