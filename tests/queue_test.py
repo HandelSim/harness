@@ -227,8 +227,9 @@ class Base(unittest.TestCase):
         self.assertEqual(rc, 0, out)
 
     def run_queue(self, *extra):
+        # an outage ends the run and no idle watchdog, unless a test asks (the last one given wins)
         return self.q("run", "--vault", self.vault, "--proxy", self.proxy, "--harness", self.harness,
-                      "--default-model", "free-withtools", *extra)
+                      "--default-model", "free-withtools", "--outage-wait", "0", "--idle-min", "0", *extra)
 
     def status(self, key="ABC-1"):
         return tq.Queue(self.state).load(key)
@@ -636,10 +637,15 @@ class ReviewFixesTest(Base):
         self.add("ABC-1", "ABC-2")
         rc, out = self.run_queue("--retries", "0")
         self.assertEqual(rc, 0, out)
-        self.assertIn("the verifier request failed", self.status()["reason"])
+        st = self.status()
+        self.assertTrue(st["reason"].startswith("verifier failed at plan: the verifier request failed"), st["reason"])
+        self.assertIn("harness queue retry ABC-1 asks the verifier again without running the agent", st["reason"])
+        self.assertEqual(st["verify_only"]["stage"], "plan")   # the agent's work, kept for that retry
         self.assertEqual(self.status("ABC-2")["status"], "blocked")
-        # A 400 is the request's own fault: asked once per ticket, not again.
-        self.assertEqual(len([p for _, _, p in FakeProxy.seen if "check a" in p]), 2)
+        # A 400 is the request's own fault: not tried again as is, once more with a
+        # shorter prompt; the agent is never launched again for it.
+        self.assertEqual(len([p for _, _, p in FakeProxy.seen if "check a" in p]), 4)
+        self.assertEqual(len(self.calls_of("planning")), 2)
 
     def test_an_error_blocks_the_ticket_and_the_queue_goes_on(self):
         keep = tq.PROMPT_MAX_BYTES
@@ -662,8 +668,7 @@ class ReviewFixesTest(Base):
         self.assertTrue(os.path.isdir(repo))
         rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "x", "--go")
         self.assertEqual(rc, 0, out)
-        self.assertFalse(os.path.exists(repo))
-        self.assertNotIn("base_sha", self.status())
+        self.assertNotIn("base_sha", self.status())   # cloned again by the run (no delete under the lock)
         del os.environ["FAKE_NO_COMMIT"]
         self.run_queue()
         self.assertEqual(self.status()["status"], "done")
@@ -1082,7 +1087,7 @@ class OwnerControlTest(Base):
         # Done, without --stage: from the start, the plan on a fresh clone.
         rc, out = self.q("retry", "ABC-1")
         self.assertEqual((rc, self.status()["stage"]), (0, "plan"), out)
-        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "repo")))
+        self.assertNotIn("base_sha", self.status())
 
     def test_an_old_state_file_runs_every_stage(self):
         os.makedirs(os.path.join(self.state, "ABC-1"))
@@ -1340,7 +1345,6 @@ class ReviewerFixesTest(Base):
         self.assertEqual((rc, st["status"], st["stage"]), (0, "queued", "implement"), out)
         self.assertNotIn("base_sha", st)
         self.assertNotIn("sha", st)
-        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "repo")))
         # The redone work would start at the base again, so ending it on ABC-1 would
         # drop the first go's pushed commits: refused, with what to do.
         rc, out = self.run_queue("--push", "0")
@@ -1490,7 +1494,9 @@ class StartAndBranchTest(Base):
         st = self.status()
         self.assertEqual(st["status"], "done", out)
         self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "repo")))   # no clone
-        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-1")
+        # done: the folder is back on the branch it was on, the owner's changes with it
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "main")
+        self.assertEqual((st["orig_branch"], st["folder_branch_now"]), ("main", "main"))
         self.assertEqual(sh("git", "-C", self.remote, "ls-tree", "--name-only", "-r", "ABC-1").split(),
                          ["README", "feature.txt"])
         self.assertEqual(sh("git", "-C", self.remote, "show", "ABC-1:README"), "project\n")
@@ -1520,13 +1526,15 @@ class StartAndBranchTest(Base):
         self.assertEqual(rc, 0, out)
         os.environ["FAKE_MUSTFIX"] = "1"
         self.run_queue("--retries", "0")
-        self.git_p("checkout", "-q", "main")
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "main")   # parked where it was
+        self.git_p("checkout", "-q", "-b", "other")   # a branch of the owner's own choosing
         rc, out = self.q("retry", "ABC-1", "--stage", "review")
         self.assertEqual(rc, 0, out)
         self.run_queue()
         st = self.status()
         self.assertEqual(st["status"], "blocked")
-        self.assertIn("is on main, not the ticket's branch ABC-1", st["reason"])
+        self.assertIn("is on other, not the ticket's branch ABC-1", st["reason"])
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "other")
 
     def test_review_plan_holds_this_tickets_plan(self):
         rc, out = self.q("add", "ABC-1", "--project", self.project, "--review-plan")
@@ -1560,26 +1568,29 @@ class StartAndBranchTest(Base):
             self.assertEqual(rc, 0, out)
         self.run_queue()
         self.assertEqual([self.status(k)["status"] for k in ("ABC-1", "ABC-2")], ["plan-review"] * 2)
-        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-2")   # the last one set up
+        # each plan waiting for the owner put the folder back on main, where it was
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "main")
         self.assertEqual(self.q("approve", "ABC-1")[0], 0)
 
     def test_in_place_tickets_take_turns_in_the_folder(self):
         self.two_in_place()
         rc, out = self.run_queue()
         self.assertEqual(self.status("ABC-1")["status"], "done", out)
-        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-1")
-        self.assertIn("switched " + self.project + " from ABC-2 back to ABC-1",
-                      cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "main")
+        log = cat(os.path.join(self.state, "ABC-1", "log.md"))
+        self.assertIn("switched " + self.project + " from main back to ABC-1", log)
+        self.assertIn("switched " + self.project + " back to main, the branch it was on before ABC-1", log)
         self.assertEqual(self.q("approve", "ABC-2")[0], 0)
         rc, out = self.run_queue()
         self.assertEqual(self.status("ABC-2")["status"], "done", out)
-        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-2")
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "main")
         self.assertEqual(cat(os.path.join(self.project, "AGENTS.md")), "rules\n")
         for key in ("ABC-1", "ABC-2"):   # each built on main, not on the other
             self.assertEqual(self.git_p("rev-parse", key + "~1"), self.git_p("rev-parse", "main"))
 
     def test_another_tickets_leftovers_are_not_carried_over(self):
         self.two_in_place()
+        self.git_p("checkout", "-q", "ABC-2")
         put(os.path.join(self.project, "half.txt"), "ABC-2's\n")   # not there when ABC-1 started
         self.run_queue()
         st = self.status("ABC-1")
@@ -1588,7 +1599,8 @@ class StartAndBranchTest(Base):
         self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-2")
 
     def test_a_new_ticket_starts_where_the_folders_ticket_did(self):
-        self.two_in_place()   # the folder is on ABC-2's branch
+        self.two_in_place()
+        self.git_p("checkout", "-q", "ABC-2")   # the folder on ABC-2's branch
         self.git_p("commit", "-q", "--allow-empty", "-m", "on ABC-2")
         rc, out = self.q("add", "ABC-3", "--project", self.project, defaults=True)
         self.assertEqual(rc, 0, out)
