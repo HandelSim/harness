@@ -6427,13 +6427,13 @@ usage: harness queue [list]                 the queue: each ticket's status and 
        harness queue status [--json]        the same, and whether a run is going and
                                             on what (--json: run.json and every state)
        harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST]
-                                [--start REF|here] [--branch NAME] [--in-place]
-                                [--review-plan] [--note TEXT]
+                                [--start REF|here] [--branch NAME] [--clone]
+                                [--no-plan-approval] [--note TEXT]
                                             queue tickets for the git project here
-                                            (or PROJECT); see "Where the work starts
-                                            and ends" below; --stages runs only some
-                                            stages (e.g. review,fix,push); --review-plan
-                                            holds this ticket's plan for approve
+                                            (or PROJECT); see "Where the agents
+                                            work" and "Where the work starts and
+                                            ends" below; --stages runs only some
+                                            stages (e.g. review,fix,push)
        harness queue run [--host] [--single-message]
                                             work through the queue, one ticket at a time
        harness queue answer KEY ["TEXT"] [--go]
@@ -6443,13 +6443,20 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             for approve (--go: not held)
        harness queue note KEY ["TEXT"]      a note every later stage's prompt gets
                                             (opens $EDITOR without TEXT); any time
-       harness queue approve KEY            go on with a plan held for reading
+       harness queue approve KEY            approve the plan: implementing starts
        harness queue retry KEY [--stage S]  queue a blocked, stopped or done ticket
+                                            (or one left running by a run that ended)
                                             again at its stage (or from stage S)
        harness queue stop KEY               hold a ticket (a running one: its agent is
-                                            stopped within seconds); retry resumes it
+                                            stopped within seconds; one left running by
+                                            a run that ended is stopped at once);
+                                            retry resumes it
        harness queue halt                   end the run; its ticket goes back to the
                                             queue at the same stage
+       harness queue halt --force           end a run that does not halt (stuck, or
+                                            left over from an earlier harness): kill
+                                            it and its agent; its ticket goes back to
+                                            the queue, or stopped if you had stopped it
        harness queue move KEY up|down|top|bottom
                                             change the order the queue takes tickets in
        harness queue watch                  follow the run as it goes (Ctrl-C stops
@@ -6458,12 +6465,45 @@ usage: harness queue [list]                 the queue: each ticket's status and 
        harness queue findings               bugs the agents saw outside their tickets
        harness queue remove KEY...          drop tickets and their clones
 
+Where the agents work (default: in the project folder):
+  in the project folder (the default)
+                the agents edit your project folder itself, so they see
+                everything in it, uncommitted files and nested repos too. The
+                queue switches the folder to the ticket's branch; your
+                uncommitted changes come along and are never committed, reset,
+                stashed or deleted (git switch refuses rather than overwrite
+                one). Before each stage the whole folder is saved to
+                refs/harness-queue/snap/KEY (git checkout
+                refs/harness-queue/snap/KEY -- FILE gets a file back), and a
+                stage whose commits touch a file you had uncommitted fails.
+                Between tickets of the same project the queue switches the
+                folder from one ticket's branch to the next. Do not work in the
+                folder while the queue is on a ticket there. Nested repos are
+                not committed; their changes are only logged. Windows needs
+                harness queue run --host for this.
+  --clone       a separate copy instead: the queue clones the project for the
+                ticket (state/queue/KEY/repo) and never touches your folder,
+                but the copy has only what is committed.
+  --in-place    the default, accepted for older scripts.
+
+After the plan (default: wait for you):
+  by default a ticket stops after its plan (plan-review): read the plan on the
+  ticket's page in the run viewer, then Approve it (harness queue approve) or
+  send feedback (harness queue answer): the planner revises the plan and it
+  comes back to you. Nothing is implemented until you approve.
+  --no-plan-approval
+                implementing starts right after the plan; a plan with a
+                blocking question still stops for your answer.
+  --review-plan the default, accepted for older scripts.
+
 Where the work starts and ends:
   --start REF   the commit the work starts from: a branch, tag, sha, or a remote
-                branch (origin/feat: fetched first). Default: --base, which
-                defaults to the project's current branch. "here": what the
-                project has checked out (in a clone: its HEAD commit, so files
-                you have not committed are not there).
+                branch (origin/feat: fetched first). "here": the commit the
+                project has checked out when you add the ticket (in the folder,
+                your uncommitted changes come along; in a clone they are not
+                there). Default: here in the project folder, --base with
+                --clone. When the queue has the folder on another ticket's
+                branch, a new ticket starts where that one did.
   --branch NAME the branch the work ends on (and push pushes). Default: KEY.
                 A new branch is made at the start. An existing one (local, or on
                 any remote) is only ever moved forward: the start must contain
@@ -6472,19 +6512,10 @@ Where the work starts and ends:
   --base REF    what the work will merge into; the change reviewed is everything
                 since the merge base of REF and the start.
   --ref REF     the same as --start.
-  --in-place    work in the project folder itself, not a clone: your uncommitted
-                and untracked files are left as they are and kept out of the
-                agents' commits (listed in .git/info/exclude during a stage), and
-                before each stage everything in the folder is snapshotted to
-                refs/harness-queue/snap/KEY. The folder is switched to the branch
-                and must stay on it while the ticket runs; a stage whose commits
-                touch a file you had changed fails. --start defaults to here.
-                Nested repos are not committed; their changes are only logged.
 
 Each ticket goes through these stages, each one a fresh headless agent launch
-(the firewalled container; host mode with --host or without docker) in its own
-clone of the project, state/queue/KEY/repo (or the project, --in-place), on its
-branch:
+(the firewalled container; host mode with --host or without docker) in the
+project folder (or, --clone, its own clone of the project), on its branch:
 
   plan       reads the ticket and the code; writes wiki/notes/tickets/KEY-plan.md
              in the vault: goal, acceptance criteria, approach, files, at most 3
@@ -6592,12 +6623,12 @@ HELP
                     --base) base="${1:-}"; shift || true ;;
                     --stages|--ref|--note|--start|--branch) (( $# )) || { err "$a needs a value"; return 1; }
                         opts+=("$a" "$1"); shift ;;
-                    --in-place|--review-plan) opts+=("$a") ;;
+                    --in-place|--clone|--review-plan|--no-plan-approval) opts+=("$a") ;;
                     -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                     *) keys+=("$a") ;;
                 esac
             done
-            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME] [--in-place] [--review-plan] [--note TEXT]"; return 1; }
+            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME] [--clone] [--no-plan-approval] [--note TEXT]"; return 1; }
             args+=(add "${keys[@]}" ${opts[@]+"${opts[@]}"})
             [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")
             [[ -n "$base" ]] && args+=(--base "$base") ;;
@@ -6611,7 +6642,11 @@ HELP
             else
                 err "usage: harness queue retry KEY [--stage plan|implement|review|fix|push]"; return 1
             fi ;;
-        halt) args+=(halt) ;;
+        halt) case "$*" in
+                "") args+=(halt) ;;
+                --force) args+=(halt --force --harness "$clone_dir/harness") ;;
+                *) err "usage: harness queue halt [--force]"; return 1 ;;
+            esac ;;
         status) [[ $# -eq 0 || "$*" == --json ]] || { err "usage: harness queue status [--json]"; return 1; }
             args+=(status "$@") ;;
         move) [[ $# -eq 2 ]] || { err "usage: harness queue move KEY up|down|top|bottom"; return 1; }

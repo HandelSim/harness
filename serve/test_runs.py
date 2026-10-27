@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -308,6 +309,11 @@ class RunsTest(RunsServer):
         self.run_on("ABC-1")   # a run on another ticket takes this one again in its turn
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("this run takes it again", body)
+        # or it is queued again now, from the stage picked: no run has it in hand
+        self.assertIn("Queue again</button>", body)
+        r, body = self.act("retry", [("stage", "plan")])
+        self.assertEqual(r.status, 303, body)
+        self.assertEqual((self.state()["status"], self.state()["stage"]), ("queued", "plan"))
         self.assertNotIn("href='/runs/queue'>Start the queue", body)
 
     def test_answering_on_the_page_saves_the_answers_and_requeues(self):
@@ -556,20 +562,40 @@ class QueuePageTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-99/live")
         self.assertEqual(json.loads(body), {"gone": "/runs/queue"})
 
-    def test_add_with_a_start_a_branch_in_place_and_plan_review(self):
+    def test_add_with_a_start_a_branch_and_the_defaults(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        head = subprocess.run(["git", "-C", proj, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         self.start()
+        r, body = self.req("GET", "/runs/queue")
+        # the defaults, each choice saying what it does
+        self.assertIn("name='where' value='folder' checked>In your project folder", body)
+        self.assertIn("name='after_plan' value='wait' checked>Wait for my approval", body)
+        self.assertIn("never committed, reset or deleted", body)
+        self.assertIn("Nothing is built until you approve", body)
+        self.assertNotIn("hold the plan", body)
         r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("preset", "review"),
-                                                ("ref", "here"), ("branch", "feat/x"), ("in_place", "1"),
-                                                ("review_plan", "1")])
+                                                ("ref", "here"), ("branch", "feat/x")])
         self.assertEqual(r.status, 303, body)
         with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
             st = json.load(f)
         self.assertEqual((st["start"], st["branch"], st["in_place"], st["plan_review"]),
-                         ("here", "feat/x", True, True))
+                         (head, "feat/x", True, True))
         r, body = self.req("GET", "/runs/queue")
-        self.assertIn(">in place</span>", body)
+        self.assertIn(">in your folder</span>", body)
+        self.assertIn(">plan approval</span>", body)
         self.assertIn(">on feat/x</span>", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-7")
+        self.assertIn("works <b>in your project folder</b>", body)
+        self.assertIn("after the plan <b>waits for your approval</b>", body)
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-9"), ("project", proj), ("where", "copy"),
+                                                ("after_plan", "go")])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "ABC-9", "state.json")) as f:
+            st = json.load(f)
+        self.assertEqual((st.get("in_place"), st.get("plan_review")), (None, None))
+        r, body = self.req("GET", "/runs/ticket/ABC-9")
+        self.assertIn("works <b>in a separate copy</b>", body)
+        self.assertIn("after the plan <b>goes straight on</b>", body)
         r, body = self.post("/runs/queue/add", [("keys", "ABC-8"), ("project", proj), ("preset", "review"),
                                                 ("branch", "a..b")])
         self.assertEqual(r.status, 409)
@@ -624,7 +650,7 @@ class QueuePageTest(RunsServer):
                 ([("keys", "ABC-9"), ("project", "relative/dir")], "absolute path"),
                 (good[:2] + [("base", "main..x")], "not a branch"),
                 (good[:2] + [("ref", "-x")], "not a branch"),
-                (good[:2] + [("preset", "review")], "existing work"),
+                (good[:2] + [("preset", "review"), ("where", "copy")], "existing work"),
                 (good[:2] + [("preset", "custom"), ("stage_fix", "1"), ("stage_implement", "1")], "pick review"),
                 (good[:2] + [("preset", "custom")], "at least one stage"),
                 (good[:2] + [("preset", "<b>")], "not a preset: &lt;b&gt;"),
@@ -690,10 +716,28 @@ class QueuePageTest(RunsServer):
         self.assertTrue(os.path.exists(os.path.join(self.queue, "halt")))
         r, body = self.req("GET", "/runs/queue")
         self.assertIn("halting", body)
+        self.assertIn("action='/runs/queue/end'", body)   # for a run that does not halt
+        # a stop the run has not acted on for a while: the ticket offers to end the run too
+        stop = os.path.join(self.queue, "ABC-12", "stop")
+        with open(stop, "w") as f:
+            f.write("x\n")
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("stopping: the run stops its agent within seconds", body)
+        self.assertNotIn("/runs/queue/end'", body)
+        os.utime(stop, (time.time() - runs.STUCK_AFTER - 5,) * 2)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("still stopping", body)
+        self.assertIn("action='/runs/queue/end'", body)
         with open(os.path.join(self.queue, "run.json"), "w") as f:
             json.dump({"beat": time.time() - runs.RUN_FRESH - 5}, f)
         r, body = self.req("GET", "/runs/queue")
         self.assertIn("action='/runs/queue/start'", body)   # a stale beat is a run that is gone
+        # End the run with no run left: the ticket it left running is put back, the stop kept
+        r, body = self.post("/runs/queue/end")
+        self.assertEqual(r.status, 303, body)
+        self.assertEqual(self.state()["status"], "stopped")
+        for f in ("halt", "run.json", stop):
+            self.assertFalse(os.path.exists(os.path.join(self.queue, f)), f)
 
     def test_start_runs_harness_queue_run_and_reports_an_early_exit(self):
         fake = os.path.join(self.tmp.name, "harness")

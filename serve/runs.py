@@ -6,7 +6,7 @@ control room: its runner, its tickets, and every action harness queue has.
   /runs                       live runs, queue tickets by stage, then everything else
   /runs/queue                 the queue: the runner (start, stop), every ticket in
                               order with its stage strip and row actions, and a form
-                              to add tickets (stages, start, branch, in place, a note)
+                              to add tickets (stages, start, branch, where the agents work, plan approval, a note)
   /runs/queue/live            the queue page's live regions, as JSON (polled)
   /runs/<session>             the transcript: messages, thinking, every tool call with
                               its input and output, subagent sessions nested; follows a
@@ -212,6 +212,7 @@ legend { font-size: 13px; font-weight: 550; padding: 0; margin-bottom: 6px; }
 .presets input { position: absolute; opacity: 0; pointer-events: none; }
 .presets label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
 .presets label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.presets.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .checks { display: flex; gap: 6px; flex-wrap: wrap; }
 .checks label { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
   border: 1px solid var(--line-2); font-size: 13px; cursor: pointer; }
@@ -337,7 +338,7 @@ details.doc summary .muted { font-weight: 400; }
   .runner { grid-template-columns: minmax(0, 1fr); } .runner .startf { justify-content: flex-start; }
 }
 @media (max-width: 560px) {
-  .grid2 { grid-template-columns: minmax(0, 1fr); }
+  .grid2, .presets.two { grid-template-columns: minmax(0, 1fr); }
   .runchip .rtxt { display: none; }
   .tabs a { padding: 6px 8px; }
   .bar-in { gap: 8px; }
@@ -641,6 +642,11 @@ class Runs:
                           for h in (hist if isinstance(hist, list) else []) if isinstance(h, dict)]
         # the owner asked a running ticket to stop; the run has not got to it yet
         out["stopping"] = out.get("status") == "running" and os.path.exists(os.path.join(self.queue_dir, key, "stop"))
+        if out["stopping"]:
+            try:
+                out["stop_wait"] = time.time() - os.path.getmtime(os.path.join(self.queue_dir, key, "stop"))
+            except OSError:
+                out["stop_wait"] = 0
         if out.get("status") == "running":
             r = self.runner()
             if r["running"] and r.get("ticket") == key:
@@ -1272,13 +1278,17 @@ def _btn(action, label, cls="", fields=(), confirm="", title="", disabled=False)
 
 
 STOPPABLE = ("queued", "needs-answers", "plan-review", "blocked", "running", "interrupted")
-RETRYABLE = ("blocked", "needs-answers", "stopped", "done")
+RETRYABLE = ("blocked", "needs-answers", "stopped", "done", "interrupted")
+STUCK_AFTER = 20   # s a stop or halt may take before the page offers to end the run
 ANSWERABLE = ("needs-answers", "plan-review", "blocked", "queued", "stopped")
 
 
 def _why(st):
     status = st.get("status", "")
     if st.get("stopping"):
+        if _stuck(st):
+            return ("still stopping: the run has not got to it, so it may be stuck; "
+                    "End the run kills it and puts this ticket back")
         return "stopping: the run stops its agent within seconds"
     if status == "running":
         return f"{st.get('stage', '')}, attempt {st.get('attempt', 0) + 1}" + (f": {st['step']}" if st.get("step") else "")
@@ -1290,6 +1300,20 @@ def _why(st):
     if status == "done":
         return st.get("reason") or (f"done at {st['sha'][:12]}" if st.get("sha") else "done")
     return st.get("reason") or ""
+
+
+def _stuck(st):
+    return st.get("stopping") and st.get("stop_wait", 0) > STUCK_AFTER
+
+
+END_CONFIRM = ("End the queue run now? Its process and its agent are killed (any work the agent has not "
+               "committed in this stage may be lost) and the ticket it is on goes back to the queue; a ticket "
+               "you asked to stop stays stopped.")
+
+
+def _end_btn(cls=""):
+    return _btn("/runs/queue/end", "End the run", ("warn " + cls).strip(), confirm=END_CONFIRM,
+                title="the run is not responding to stop or halt: kill it")
 
 
 def _ticket_row(runs, key, st, i, n, now):
@@ -1306,6 +1330,8 @@ def _ticket_row(runs, key, st, i, n, now):
     if status in STOPPABLE and not st.get("stopping"):
         acts.append(_btn(base + "stop", "Stop", "sm warn", back,
                          confirm=f"Stop {key}?" + (" Its agent is stopped now." if status == "running" else "")))
+    if _stuck(st):
+        acts.append(_end_btn("sm"))
     if status in RETRYABLE:
         acts.append(_btn(base + "retry", "Retry", "sm", back))
     acts.append(_btn(base + "remove", "Remove", "sm danger", back, disabled=status == "running",
@@ -1320,7 +1346,11 @@ def _ticket_row(runs, key, st, i, n, now):
     if st.get("branch") and st["branch"] != key:
         tags += f" <span class='tag' title='the branch the work ends on'>on {esc(st['branch'])}</span>"
     if st.get("in_place"):
-        tags += " <span class='tag' title='its agents work in the project folder itself, not a clone'>in place</span>"
+        tags += " <span class='tag' title='its agents edit your project folder directly'>in your folder</span>"
+    elif st.get("project"):
+        tags += " <span class='tag' title='its agents work in a clone of the project; your folder is not touched'>in a copy</span>"
+    if st.get("plan_review"):
+        tags += " <span class='tag' title='the plan waits for your approval before implementing'>plan approval</span>"
     when = _iso_ms(st.get("updated", ""))
     return (f"<div class='tk{tone}'><span class='pos'>{i + 1}</span><div class='main'><div class='key'>"
             f"<a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>{_pill(status, st.get('stopping'))}{tags}</div>"
@@ -1344,7 +1374,8 @@ def _runner_card(runs, r, now):
             parts.append("<div class='startf'>" + _btn("/runs/queue/halt", "Halt the run", "warn", confirm=(
                 "Halt the queue run? The ticket it is on goes back to the queue at the same stage.")) + "</div>")
         else:
-            parts.append("<div class='startf muted'>the run ends at its next check</div>")
+            parts.append("<div class='startf'><span class='muted'>the run ends at its next check; if it does not "
+                         "within a minute it is stuck</span>" + _end_btn() + "</div>")
         parts.append(f"<div class='kv facts-row'><span>on <b>{what}</b></span><span>mode <b>{esc(mode)}</b></span>"
                      + (f"<span>model <b>{esc(r['model'])}</b></span>" if r.get("model") else "")
                      + (f"<span>since <b>{_ago(started, now)}</b></span>" if started else "")
@@ -1406,6 +1437,34 @@ def _projects(runs):
     return seen
 
 
+WHERE_CHOICES = (
+    ("folder", "In your project folder", "default",
+     "The agents edit the project folder above directly, so they see everything in it, uncommitted files "
+     "included. The queue switches the folder to the ticket's branch first; your uncommitted changes come "
+     "along and are never committed, reset or deleted. Don't edit in the folder yourself while a ticket "
+     "runs there."),
+    ("copy", "In a separate copy", "",
+     "The queue clones the project for this ticket and the agents work in the clone; your folder is never "
+     "touched. The clone has only what is committed (plus an uncommitted AGENTS.md or CLAUDE.md)."))
+AFTER_PLAN_CHOICES = (
+    ("wait", "Wait for my approval", "default",
+     "The ticket stops at \u201cplan to approve\u201d so you can read the plan. Approve it to start "
+     "implementing, or send feedback: the planner revises the plan and it comes back to you. Nothing is "
+     "built until you approve."),
+    ("go", "Go straight on to implementing", "",
+     "Implementing starts as soon as the plan is written. A plan with questions only you can answer still "
+     "stops and waits for your answers."))
+
+
+def _choice(legend, name, value, choices):
+    """A fieldset of radio cards, each saying what it does; the first is the default."""
+    value = value if value in [c[0] for c in choices] else choices[0][0]
+    cards = "".join(f"<label><input type='radio' name='{name}' value='{c}'{' checked' if c == value else ''}>"
+                    f"{esc(lab)}{f' <span class=muted>({esc(tag)})</span>' if tag else ''}<small>{esc(hint)}</small>"
+                    "</label>" for c, lab, tag, hint in choices)
+    return f"<fieldset><legend>{esc(legend)}</legend><div class='presets two'>{cards}</div></fieldset>"
+
+
 def add_form(runs, form=None, err=""):
     """The Add tickets form; after a refused add, the values sent (form) and
     why it was refused (err), so nothing typed is lost."""
@@ -1434,19 +1493,15 @@ def add_form(runs, form=None, err=""):
             f"<label class='fld'>Base<input name='base' spellcheck='false' value='{esc(v('base'))}' "
             "placeholder='the project&#39;s current branch'><small>branch or commit the work goes onto</small></label>"
             f"<label class='fld'>Start from<input name='ref' spellcheck='false' value='{esc(v('ref'))}' "
-            "placeholder='the base'><small>where the work starts: a branch, tag or commit (origin/ABC-123 is "
-            "fetched first, e.g. existing work), or <b>here</b>: what the project has checked out</small></label>"
+            "placeholder='what the folder has checked out'><small>where the work starts: a branch, tag or commit "
+            "(origin/ABC-123 is fetched first, e.g. existing work), or <b>here</b>: what the project folder has "
+            "checked out. Empty: here, or the base when the agents work in a copy</small></label>"
             f"<label class='fld'>Branch<input name='branch' spellcheck='false' value='{esc(v('branch'))}' "
             "placeholder='the ticket key'><small>the branch the work ends on; an existing one is only moved "
             "forward (start from it to carry on its work)</small></label>"
             "</div>"
-            "<div class='checks'>"
-            f"<label title='Your uncommitted and untracked files stay as they are and are kept out of the commits; "
-            f"the folder is switched to the branch'><input type='checkbox' name='in_place' value='1'"
-            f"{' checked' if v('in_place') else ''}> work in the project folder itself, not a clone "
-            "(start defaults to here)</label>"
-            f"<label><input type='checkbox' name='review_plan' value='1'{' checked' if v('review_plan') else ''}> "
-            "hold the plan for me to approve</label></div>"
+            + _choice("Where the agents work", "where", v("where"), WHERE_CHOICES)
+            + _choice("When the plan is written", "after_plan", v("after_plan"), AFTER_PLAN_CHOICES) +
             f"<fieldset><legend>What still needs doing</legend><div class='presets'>{presets}</div>"
             f"<div class='checks' id='stagechecks'>{checks}</div></fieldset>"
             "<label class='fld'>Note for the agents<textarea name='note' maxlength='4000' "
@@ -1503,10 +1558,10 @@ def _t_head(runs, key, st, pos, n):
     if st.get("start"):
         facts.append(f"<span>from <b>{esc(st['start'])}</b></span>")
     facts.append(f"<span>branch <b>{esc(st.get('branch') or key)}</b></span>")
-    if st.get("in_place"):
-        facts.append("<span><b>in place</b> (no clone)</span>")
-    if st.get("plan_review"):
-        facts.append("<span>plan held for approval</span>")
+    facts.append("<span>works <b>" + ("in your project folder" if st.get("in_place") else "in a separate copy")
+                 + "</b></span>")
+    facts.append("<span>after the plan <b>" + ("waits for your approval" if st.get("plan_review")
+                                               else "goes straight on") + "</b></span>")
     if st.get("sha"):
         facts.append(f"<span>commit <b>{esc(st['sha'][:12])}</b></span>")
     if st.get("created"):
@@ -1533,11 +1588,13 @@ def _t_acts(runs, key, st, rows, live, pos, n):
         parts.append(_btn(base + "approve", "Approve the plan", "primary"))
     if status == "interrupted" and not st.get("run_going"):
         parts.append("<a class='btn primary' href='/runs/queue'>Start the queue &rarr;</a>")
+    if _stuck(st):
+        parts.append(_end_btn())
     if status in RETRYABLE:
         opts = "".join(f"<option value='{s}'{' selected' if s == st.get('stage') else ''}>{s}</option>"
                        for s in STAGES)
         label = {"blocked": "Retry", "needs-answers": "Plan again without answering", "stopped": "Resume",
-                 "done": "Run again"}[status]
+                 "done": "Run again", "interrupted": "Queue again"}[status]
         parts.append(f"<form method='post' action='{base}retry'><button type='submit'>{label}</button>"
                      f"<label class='muted'>from <select name='stage' aria-label='stage'><option value=''>"
                      f"{'where it was' if status != 'done' else 'the start'}</option>{opts}</select></label></form>")
@@ -1727,7 +1784,7 @@ def render_ticket(runs, key, msg="", bad=False):
 # --- actions ------------------------------------------------------------------------
 
 TICKET_ACTIONS = ("answer", "approve", "retry", "stop", "remove", "move", "note")
-QUEUE_ACTIONS = ("add", "start", "halt")
+QUEUE_ACTIONS = ("add", "start", "halt", "end")
 
 
 def _one(form, name):
@@ -1805,7 +1862,8 @@ def ticket_action(runs, key, action, form):
         if stage and stage not in STAGES:
             return False, "not a stage: " + stage[:40]
         if status not in RETRYABLE:
-            return False, f"{key} is {status}; only a blocked, stopped, done or waiting ticket is retried{again}"
+            return False, (f"{key} is {status}; only a blocked, stopped, done, waiting or interrupted ticket "
+                           f"is retried{again}")
         return _queue(runs, ["retry", key] + (["--stage", stage] if stage else []))
     if action == "stop":
         if status not in STOPPABLE:
@@ -1855,7 +1913,7 @@ def add_tickets(runs, form):
     if not project or not os.path.isabs(project) or not os.path.isdir(project):
         return False, "the project folder must be an absolute path to a folder that exists"
     base, ref, branch = (_one(form, n).strip() for n in ("base", "ref", "branch"))
-    in_place, review_plan = bool(_one(form, "in_place")), bool(_one(form, "review_plan"))
+    in_place, wait = _one(form, "where") != "copy", _one(form, "after_plan") != "go"
     for name, v in (("base", base), ("start from", ref), ("branch", branch)):
         if v and not ref_ok(v):
             return False, f"{name}: not a branch, tag or commit name: {v[:80]}"
@@ -1882,10 +1940,8 @@ def add_tickets(runs, form):
         args.append(f"--start={ref}")
     if branch:
         args.append(f"--branch={branch}")
-    if in_place:
-        args.append("--in-place")
-    if review_plan:
-        args.append("--review-plan")
+    args.append("--in-place" if in_place else "--clone")
+    args.append("--review-plan" if wait else "--no-plan-approval")
     if note.strip():
         args.append(f"--note={note}")
     return _queue(runs, args)
@@ -1898,6 +1954,8 @@ def queue_action(runs, action, form):
         return add_tickets(runs, form)
     if action == "halt":
         return _queue(runs, ["halt"])
+    if action == "end":   # a run that does not stop or halt: kill it, put its ticket back
+        return _queue(runs, ["halt", "--force", "--harness", runs.harness])
     mode = _one(form, "mode") or "container"
     if mode in ("host", "single") and _one(form, "confirm_host") != "1":
         return False, ("host mode runs the agents as you, with no container and no firewall: tick "
@@ -2063,7 +2121,7 @@ COMMON_JS = """
     var hint = document.getElementById('addhint');
     function sync() {
       var on = [], ref = add.querySelector('input[name=ref]').value.trim() ||
-        add.querySelector('input[name=in_place]').checked;
+        add.querySelector('input[name=where][value=folder]').checked;
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
       var need = on.indexOf('implement') < 0 && (on.indexOf('review') >= 0 || on.indexOf('push') >= 0);
       hint.textContent = need && !ref ? 'Review without implement needs where the work is (start from).' :

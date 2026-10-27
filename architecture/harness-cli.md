@@ -608,8 +608,11 @@ the hub in Obsidian.
 
 `harness queue` (`cmd_queue`, then `scripts/ticket_queue.py`) works queued
 tickets one at a time with no one at the keyboard. `add KEY... [--dir]
-[--base] [--stages LIST] [--start REF|here] [--branch NAME] [--in-place]
-[--review-plan] [--note TEXT]` records the project and base (default: its current branch);
+[--base] [--stages LIST] [--start REF|here] [--branch NAME] [--clone]
+[--no-plan-approval] [--note TEXT]` records the project and base (default: its current branch);
+by default a ticket works in the project folder (in place) and its plan waits
+for approval (`plan_review`); `--clone` and `--no-plan-approval` opt out
+(`--in-place` and `--review-plan` are accepted and are the defaults);
 `run [--host] [--single-message]` needs an active vault, does the launch
 checks once (host mode when docker is missing, `host_confirm_gate` asked
 once), starts the host proxy if it is not running and hands the rest to the
@@ -621,9 +624,11 @@ ticket page uses), `findings`, `watch` (tails `run.log`) and `log
 Owner control (all of it also on the run viewer's queue and ticket pages):
 `--stages` runs a subset of plan, implement, review, fix, push (kept in that
 order; `fix` needs `review`), starting at the first and done after the last;
-`--start` (alias `--ref`; default the base) is the commit the work starts
+`--start` (alias `--ref`; default `here` in place, the base in a clone; in
+place, a folder on another in-place ticket's branch makes the new ticket
+start where that one did) is the commit the work starts
 from (a `remote/branch` is fetched first, `here` is what the project has
-checked out: frozen to its HEAD sha at add for a clone) and `--branch`
+checked out, frozen to its HEAD sha at add) and `--branch`
 (default `KEY`) the branch it ends on and push pushes; `base_sha` is the
 merge-base of base and start, so `--stages review --start origin/X` reviews
 that branch. An existing target branch is only ever fast-forwarded:
@@ -633,9 +638,12 @@ commits; the one exception is a local branch an earlier go of this ticket
 made (`made_branch`), whose old tip is kept at
 `refs/harness-queue/prev/KEY`. So a fresh retry of a pushed ticket is
 refused until the branch is deleted or another `--branch` is used.
-`--in-place` works in the project folder itself (`workdir()`), not a clone:
+In place, the agents work in the project folder itself (`workdir()`):
 setup saves what the owner has uncommitted (`owner.json`), never resets,
-cleans or stashes, and switches the folder to the branch at the start. Before
+cleans or stashes, and switches the folder to the branch at the start; a
+later stage finding the folder on another in-place ticket's branch switches
+it back (`back_on_branch`) unless that leaves changes behind that were not
+there when the ticket started, and blocks on any branch the owner chose. Before
 each stage everything in the folder (index plus untracked, not ignored
 files) is committed to `refs/harness-queue/snap/KEY` (a chain, a temp
 index), and the owner's untracked and changed paths go in a marked block of
@@ -648,20 +656,30 @@ Each launch gets `HARNESS_QUEUE_LAUNCH` (a nonce), which harness puts on its
 container as `harness.queue-launch` and which stops `--ticket` being
 remembered for the folder; in-place stages also record `launches` windows,
 by which the run viewer maps the project's sessions to the ticket.
-`--review-plan` holds this ticket's plan as `plan-review`. Without a plan stage the change is held to the ticket's own
+A `plan_review` ticket's plan is held as `plan-review`. Without a plan stage the change is held to the ticket's own
 "Acceptance criteria" bullets, else to "the change does what the ticket asks
 for". Must fix items with no fix stage end the ticket: `done` when review was
 last, else `blocked` (`retry KEY --stage fix` goes on). `note KEY` adds an
 owner note every later prompt gets (`{{NOTES}}`); notes live in
 `KEY/notes.json` under a lock and are re-read on every save, so a runner
 holding older state cannot drop one. `retry KEY [--stage S]` (blocked,
-needs-answers, stopped, done; back to plan, or any retry of a done ticket
+needs-answers, stopped, done, a running ticket no run has in hand, a queued
+one with `--stage`; back to plan, or any retry of a done ticket
 without `--stage`, means a fresh clone from `--ref`), `stop KEY` (a waiting
-ticket becomes `stopped`; a running one gets the `KEY/stop` sentinel, which
-the runner also checks right before the push), `halt` (the `halt` sentinel:
+ticket becomes `stopped`; a running one the run has in hand gets the
+`KEY/stop` sentinel, which the runner also checks right before the push;
+"in hand" is `run_holds`: a fresh beat, run.json naming it (the run writes
+that under `queue.lock` before marking it running) and `run.lock` held, so
+one left running by a run that ended or is stuck is stopped at once),
+`halt` (the `halt` sentinel:
 the run kills its agent, puts the ticket back at its stage uncounted and
-exits; a halt file older than the run's lock is stale and dropped), `move KEY
-up|down|top|bottom`, `remove KEY` (refused while a run is on it) and `status
+exits; a halt file older than the run's lock is stale and dropped), `halt
+--force` (`end_run`, for a run that does not halt: kills the run's pid and
+its agent's process group from run.json, `taskkill /T` on Windows, waits for
+`run.lock`, then puts every running ticket back, `stopped` when it had a
+stop sentinel, else `queued` with an `interrupted` entry, and stops the
+held launch's container), `move KEY
+up|down|top|bottom`, `remove KEY` (refused while a run has it in hand) and `status
 [--json]`. Killing a container launch's client leaves its container running,
 so after a stop, halt or timeout the runner calls `harness queue _stop_agents
 DIR LAUNCH`, which stops the containers labelled `harness.agent=true`,
@@ -1343,15 +1361,19 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
 - `POST /runs/<sid>/send`: puts a message in the run's inbox.
   `POST /runs/<sid>/stop`: stops the ticket whose stage this session is
   (refused for anything not a queue stage).
-- `POST /runs/queue/{add,start,halt}`: `add` checks the form (keys, an
+- `POST /runs/queue/{add,start,halt,end}`: `add` checks the form (keys, an
   absolute existing project folder, refs that cannot carry options or
   revision syntax, `fix` only with `review`, a ref when there is no
-  implement stage) and runs `queue add --stages --ref --note`; `start`
+  implement stage in a copy) and runs `queue add --stages --start --branch
+  --in-place|--clone --review-plan|--no-plan-approval --note` (the form's
+  "Where the agents work" and "When the plan is written" choices); `start`
   runs `bash <harness> queue run [--host|--single-message]` detached (own
   session or process group, no console, `HARNESS_OPEN=0`,
   `HARNESS_HOST_CONFIRM=1` for host modes, `HARNESS_INSTALL_ROOT` from the
   queue dir), output appended to `<queue>/runner.out`, refused while a run
-  holds the queue; `halt` writes the halt file.
+  holds the queue; `halt` writes the halt file; `end` runs `halt --force`
+  (offered while halting, or when a ticket's stop has waited over
+  `STUCK_AFTER` s).
 - `POST /runs/ticket/<KEY>/{answer,approve,retry,stop,remove,move,note}`:
   `ticket_queue.py` `answer --stdin` (the form's answers as `## question`
   sections, `## Other`, and "go with the default" for the rest; needs the

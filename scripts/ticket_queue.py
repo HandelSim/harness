@@ -3,9 +3,10 @@
 plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
 
   ticket_queue.py --state DIR add KEY... [--project DIR] [--base REF] [--stages LIST]
-                  [--start REF|here] [--branch NAME] [--in-place] [--review-plan] [--note TEXT]
+                  [--start REF|here] [--branch NAME] [--clone] [--no-plan-approval] [--note TEXT]
   ticket_queue.py --state DIR list | status [--json] | remove KEY... | approve KEY
-  ticket_queue.py --state DIR retry KEY [--stage S] | stop KEY | halt | move KEY up|down|top|bottom
+  ticket_queue.py --state DIR retry KEY [--stage S] | stop KEY | move KEY up|down|top|bottom
+  ticket_queue.py --state DIR halt [--force --harness PATH]
   ticket_queue.py --state DIR note KEY [--text T | --stdin]
   ticket_queue.py --state DIR answer KEY --vault V [--text T] [--go]
   ticket_queue.py --state DIR findings --vault V
@@ -15,8 +16,10 @@ plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
                   [--plan-review 0|1]
 Each stage is one fresh, headless agent launch through the harness CLI
 (`harness -p --yolo --ticket KEY -m MODEL PROMPT`: the firewalled container,
-or host mode) in the ticket's own clone of the project, state/queue/KEY/repo
-(or, --in-place, the project folder itself), on the ticket's branch. The prompt (scripts/queue_prompts/<stage>.md) carries
+or host mode) in the project folder itself (or, --clone, the ticket's own clone
+of the project, state/queue/KEY/repo), on the ticket's branch. A plan waits for
+the owner's approval (plan-review) unless the ticket was added with
+--no-plan-approval. The prompt (scripts/queue_prompts/<stage>.md) carries
 everything the stage needs, the ticket, the plan, the answers and the last
 attempt's problems, because the free models only read the last message.
 
@@ -32,8 +35,9 @@ ticket stays where it was.
 
 A ticket can run a subset of the stages (--stages; fix still only after a
 review with Must fix items). Its work starts at --start (a branch, tag, commit,
-or <remote>/<branch>, fetched first; "here": the project's HEAD, and in place
-its tree as it is; default: the base) and ends on --branch (default KEY). An
+or <remote>/<branch>, fetched first; "here": the project's HEAD when the
+ticket is added, and in place its uncommitted files too; default: here in
+place, the base in a clone) and ends on --branch (default KEY). An
 existing branch is only ever moved forward: one with commits the start lacks is
 refused. The change reviewed is from the merge-base of the base and the start,
 so existing work at the start is part of it.
@@ -244,6 +248,15 @@ def run_going(q):
         return True
 
 
+def run_holds(q, key):
+    """True when a going run has the ticket in hand: run.json names it (the run
+    names a ticket under queue.lock as it takes it) and beats. A ticket left running by
+    a run that ended, or by one stuck elsewhere or frozen, is not in hand: the owner's commands
+    change it themselves rather than leave it a request no run will read."""
+    r = runner(q)
+    return r["running"] and r.get("ticket") == key and run_going(q)
+
+
 def stages_of(st):
     """The ticket's stages in their order; an older state file has none: all five."""
     want = st.get("stages") or ALL_STAGES
@@ -372,7 +385,9 @@ TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}
 
 def git(cwd, *args, check=True, timeout=300, env=None):
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", **(env or {}))
-    r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, env=env, timeout=timeout, **TEXT)
+    # no fsmonitor daemon started by the queue's git: it would outlive the call holding its pipes
+    r = subprocess.run(["git", "-C", cwd, "-c", "core.fsmonitor=false", *args], capture_output=True, env=env,
+                       timeout=timeout, **TEXT)
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args[:3])}: {(r.stderr or r.stdout).strip()[:400]}")
     return r
@@ -664,6 +679,42 @@ def in_place_trouble(project, branch):
         if on != branch:
             return f"{project} is on {on or 'a detached HEAD'}, not the ticket's branch {branch}; " \
                    f"git switch {branch} there (your changes on the way stay), then harness queue retry"
+    return ""
+
+
+def in_place_branches(q, project):
+    """The branches of the in-place tickets set up in project: the queue switches
+    the project between them, never from a branch the owner put it on."""
+    return {branch_of(s) for s in map(q.load, q.order())
+            if s and s.get("in_place") and s.get("project") == project and s.get("start_sha")}
+
+
+def back_on_branch(q, st):
+    """In place, before a stage: the project back on the ticket's branch when
+    another in-place ticket left it on its own, with nothing uncommitted but what
+    the owner had when this ticket started, so no other ticket's leftovers come
+    along. "" when it is on the branch, else why not."""
+    project, branch, key = st["project"], branch_of(st), st["key"]
+    trouble = in_place_trouble(project, None)
+    if trouble:
+        return trouble
+    on = git(project, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    if on == branch:
+        return ""
+    fix = f"git switch {branch} there (your uncommitted changes come along), then harness queue retry {key}"
+    if not on or on not in in_place_branches(q, project):
+        return f"{project} is on {on or 'a detached HEAD'}, not the ticket's branch {branch}; {fix}"
+    owner = owner_files(q, st)
+    mine = set(owner.get("untracked", [])) | set(owner.get("changed", []))
+    now = uncommitted(project)
+    new = sorted(p for p in now["untracked"] + now["changed"] if p not in mine)
+    if new:
+        return (f"{project} is on {on}, not the ticket's branch {branch}, and has uncommitted changes that were "
+                f"not there when {key} started ({', '.join(new[:10])}); commit, stash or remove them, or {fix}")
+    r = git(project, "switch", "-q", branch, check=False)
+    if r.returncode != 0:
+        return f"could not switch {project} from {on} to {branch}: {(r.stderr or r.stdout).strip()[:300]}; {fix}"
+    q.log(key, f"switched {project} from {on} back to {branch}")
     return ""
 
 
@@ -1038,6 +1089,7 @@ def launch(ctx, st, cmd, out, since):
         p = subprocess.Popen(cmd, cwd=workdir(ctx.q, st), stdin=subprocess.DEVNULL,
                              stdout=f, stderr=subprocess.STDOUT, env=env, **NEW_GROUP)
         ctx.child = p
+        beat(ctx, agent=p.pid, launch=st["launch_id"])   # halt --force ends it (and its container) with the run
         rc = None
         try:
             while rc is None:
@@ -1063,6 +1115,7 @@ def launch(ctx, st, cmd, out, since):
             raise
         finally:
             ctx.child = None
+            beat(ctx, agent=0, launch="")
             step(ctx, "the agent ended; checking its work")
     return rc
 
@@ -1137,8 +1190,11 @@ def sync_vault(ctx, key, since):
                      f"# {key}: queue log\n\nWritten by `harness queue`; each line is a stage, a check or a verdict.\n\n"
                      f"{fence}text\n{log.rstrip()}\n{fence}\n")
     st = ctx.q.load(key) or {"key": key, "project": ""}
+    # no pipes: on Windows a timed-out run() waits for its pipes to close, which a
+    # process the call left behind (a server, git's fsmonitor daemon) never does
     subprocess.run([BASH, ctx.harness, "queue", "_sync", key, workdir(ctx.q, st), str(since)],
-                   stdin=subprocess.DEVNULL, capture_output=True, timeout=600, check=False)
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=600, check=False)
 
 
 # On Windows a bare "bash" can resolve to WSL's System32\bash.exe before PATH is searched;
@@ -1569,9 +1625,11 @@ def process(ctx, st):
     ctx.q.save(st)
     if st.get("in_place") and os.name == "nt" and not (ctx.host or ctx.single):
         # the container's Linux git would see every file of a CRLF checkout as changed
-        return block(ctx, st, "in place on Windows needs a host run: harness queue run --host")
+        return block(ctx, st, "working in the project folder on Windows needs the queue run on the host "
+                              "(harness queue run --host, or Start the queue with host); or remove the ticket and "
+                              "add it again to work in a separate copy (--clone)")
     if st.get("in_place") and st.get("base_sha"):
-        trouble = in_place_trouble(st["project"], branch_of(st))
+        trouble = back_on_branch(ctx.q, st)
         if trouble:
             return block(ctx, st, trouble)
     elif not st.get("base_sha") or not os.path.isdir(workdir(ctx.q, st)):
@@ -1587,7 +1645,7 @@ def process(ctx, st):
         ctx.q.log(key, f"{where}: branch {branch_of(st)} from {start_of(st)} ({st['start_sha'][:12]}); the change is "
                        f"since {st['base_sha'][:12]} (base {st['base']})" + (f"; {kept}" if kept else ""))
     subprocess.run([BASH, ctx.harness, "queue", "_pull", key], stdin=subprocess.DEVNULL,
-                   capture_output=True, timeout=300, check=False)
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=False)
     while st["status"] == "running":
         checkpoint(ctx)
         beat(ctx, ticket=key, stage=st["stage"], step="")
@@ -1728,6 +1786,8 @@ def run_tickets(q, ctx):
                 if not pending(todo[0]) or todo[0] not in q.order():
                     continue
                 st = q.load(todo[0])
+                ctx.key = st["key"]
+                beat(ctx, ticket=st["key"], stage=st["stage"], step="")   # in hand (run_holds) before it is running
                 st.update(status="running", vault=ctx.vault)
                 q.save(st)
             done[st["key"]] = st.get("requeued", "")
@@ -1782,8 +1842,19 @@ def cmd_add(q, a):
         print(f"[queue] {project} is not in a git repository (use --dir)", file=sys.stderr)
         return 1
     project = r.stdout.strip()
-    base = a.base or git(project, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip() \
-        or git(project, "rev-parse", "HEAD").stdout.strip()
+    if a.in_place and a.clone:
+        print("[queue] --in-place and --clone: give one of them (in place is the default)", file=sys.stderr)
+        return 1
+    if a.review_plan and a.no_plan_approval:
+        print("[queue] --review-plan and --no-plan-approval: give one of them (approval is the default)",
+              file=sys.stderr)
+        return 1
+    in_place = not a.clone
+    on = git(project, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    # the folder on an in-place ticket's branch (the queue switched it): new work starts where that ticket's did
+    queued = next((s for s in map(q.load, q.order()) if s and s.get("in_place") and s.get("project") == project
+                   and s.get("start_sha") and on and branch_of(s) == on), None)
+    base = a.base or (queued["base"] if queued else on) or git(project, "rev-parse", "HEAD").stdout.strip()
     if git(project, "rev-parse", "-q", "--verify", base + "^{commit}", check=False).returncode != 0:
         print(f"[queue] {base} is not a commit in {project}", file=sys.stderr)
         return 1
@@ -1794,8 +1865,11 @@ def cmd_add(q, a):
     if a.start and a.ref and a.start != a.ref:
         print("[queue] --ref is the old name of --start; give one of them", file=sys.stderr)
         return 1
-    start = a.start or a.ref or (HERE if a.in_place else "")
-    if start and start != HERE or start == HERE and not a.in_place:
+    start = a.start or a.ref or ((queued["start_sha"] if queued else HERE) if in_place else "")
+    if queued and not (a.start or a.ref):
+        print(f"[queue] note: {project} is on {queued['key']}'s branch {on}; the work starts where "
+              f"{queued['key']}'s did ({start[:12]}), on base {base}", file=sys.stderr)
+    if start:
         sha = commit_of(project, start)
         if not sha:
             print(f"[queue] {start} is not a commit in {project} (git fetch it first?)", file=sys.stderr)
@@ -1803,12 +1877,12 @@ def cmd_add(q, a):
         if git(project, "merge-base", base, sha, check=False).returncode != 0:
             print(f"[queue] {start} and {base} have no history in common", file=sys.stderr)
             return 1
-        if start == HERE:   # a clone has only commits: here is the commit the project is at now
+        if start == HERE:   # the commit the project is at now (in place, its uncommitted files come along)
             changes = uncommitted(project)
-            if changes["untracked"] or changes["changed"]:
+            if not in_place and (changes["untracked"] or changes["changed"]):
                 print(f"[queue] note: the clone starts at {project}'s HEAD ({sha[:12]}); its "
                       f"{len(changes['untracked']) + len(changes['changed'])} uncommitted file(s) are not in it "
-                      "(--in-place works on them)", file=sys.stderr)
+                      "(working in place, the default, works on them)", file=sys.stderr)
             start = sha
     if a.branch and git(project, "check-ref-format", "--branch", a.branch, check=False).returncode != 0:
         print(f"[queue] not a branch name: {a.branch}", file=sys.stderr)
@@ -1832,9 +1906,9 @@ def cmd_add(q, a):
             st = {"key": key, "project": project, "base": base, "status": "queued", "stage": "plan", "attempt": 0,
                   "feedback": "", "reason": "", "created": now_iso(), "stages": stages, "notes": []}
             st["stage"] = first_stage(st)
-            st.update({k: v for k, v in (("start", start), ("branch", a.branch), ("in_place", a.in_place),
-                                         ("plan_review", a.review_plan)) if v})
-            if start != HERE:
+            st.update({k: v for k, v in (("start", start), ("branch", a.branch), ("in_place", in_place),
+                                         ("plan_review", not a.no_plan_approval)) if v})
+            if start:
                 lost = lost_by(project, branch_of(st), commit_of(project, start_of(st)))
                 if lost:
                     print(f"[queue] {key}: branch {branch_of(st)} has commits that {start_of(st)} does not "
@@ -1846,8 +1920,11 @@ def cmd_add(q, a):
                 q.add_note(key, a.note)
             q.save(st)
             order.append(key)
-            how = (f"in place in {project}" if a.in_place else project) + f", from {start_of(st)} on branch {branch_of(st)}"
-            print(f"[queue] {key}: queued ({how}; stages {','.join(stages)})")
+            how = (f"in {project} itself" if in_place else f"in a clone of {project}") \
+                + f", from {start_of(st)[:40]} on branch {branch_of(st)}"
+            plan = "" if "plan" not in stages else "; the plan waits for approve" if not a.no_plan_approval \
+                else "; implement starts after the plan without asking"
+            print(f"[queue] {key}: queued ({how}; stages {','.join(stages)}{plan})")
         q.set_order(order)
     return rc
 
@@ -1879,7 +1956,7 @@ def cmd_remove(q, a):
                 print(f"[queue] {key} is not in the queue", file=sys.stderr)
                 continue
             st = q.load(key) or {}
-            if st.get("status") == "running" and run_going(q):
+            if st.get("status") == "running" and run_holds(q, key):
                 print(f"[queue] {key} is running; stop it first (harness queue stop {key})", file=sys.stderr)
                 rc = 1
                 continue
@@ -1960,7 +2037,13 @@ def cmd_retry(q, a):
     elif st["status"] == "done" or st.get("stage") not in ALL_STAGES or not has_work(q, st):
         stage = first_stage(st)   # done, or its work is gone: from the start, on a fresh clone
         extra["fresh"] = True
-    st = requeue(q, key, RETRYABLE, stage=stage, **extra)
+    # also a ticket left running by a run that ended (or is stuck elsewhere), and a
+    # queued one sent back to an earlier stage; under the lock the run takes tickets under
+    with held(os.path.join(q.root, "queue.lock")):
+        if run_holds(q, key):
+            print(f"[queue] {key} is running; stop it first (harness queue stop {key})", file=sys.stderr)
+            return 1
+        st = requeue(q, key, RETRYABLE + ("running",) + (("queued",) if a.stage else ()), stage=stage, **extra)
     if st:
         print(f"[queue] {st['key']}: queued again at {st['stage']}")
     return 0 if st else 1
@@ -1983,19 +2066,24 @@ def stop_locked(q, a):
     if st["status"] not in ("queued", "needs-answers", "plan-review", "blocked", "running"):
         print(f"[queue] {key} is {st['status']}; there is nothing to stop", file=sys.stderr)
         return 1
-    if st["status"] == "running" and run_going(q):
+    if st["status"] == "running" and run_holds(q, key):
         # The run holds a running ticket in memory and would write over a status
         # set here: it looks for this file, stops the agent and sets it itself.
         write_atomic(q.sentinel(key), now_iso() + "\n")
-        print(f"[queue] {key}: asked the run to stop it; it stops within seconds")
+        print(f"[queue] {key}: asked the run to stop it; it stops within seconds "
+              "(a run that does not: harness queue halt --force)")
         return 0
-    st.update(status="stopped", reason="stopped by the owner", stopped_from=st["status"])
+    drop(q.sentinel(key))   # asked of a run that never got to it
+    st.update(status="stopped", reason="stopped by the owner",
+              stopped_from="queued" if st["status"] == "running" else st["status"])
     q.save(st)
     print(f"[queue] {key}: stopped; harness queue retry {key} resumes it")
     return 0
 
 
 def cmd_halt(q, a):
+    if a.force:
+        return end_run(q, a)
     if not run_going(q):
         stale = os.path.exists(q.sentinel())
         if stale:
@@ -2004,6 +2092,60 @@ def cmd_halt(q, a):
         return 0
     write_atomic(q.sentinel(), now_iso() + "\n")
     print("[queue] asked the run to halt; its ticket goes back to the queue at the same stage")
+    return 0
+
+
+def end_run(q, a):
+    """halt --force: a run that does not halt (stuck in a call that never comes
+    back) is killed with its agent, and its ticket goes back to the queue at its
+    stage (stopped, when the owner had asked that)."""
+    r = runner(q)
+    pid, agent = r.get("pid"), r.get("agent")
+    if run_going(q):
+        if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+            print("[queue] a run holds the queue but run.json does not say which process it is; "
+                  "end the python process running ticket_queue.py run by hand", file=sys.stderr)
+            return 1
+        for victim in (agent, pid):
+            if not isinstance(victim, int) or victim <= 0:
+                continue
+            if os.name == "nt":   # the whole tree: the run's agent, its docker client, bash
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(victim)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=60)
+                continue
+            with contextlib.suppress(OSError):
+                (os.killpg if victim == agent else os.kill)(victim, signal.SIGKILL)
+        end = time.time() + 20
+        while run_going(q) and time.time() < end:
+            time.sleep(0.2)
+        if run_going(q):
+            print(f"[queue] the run (process {pid}) still holds the queue; end it by hand", file=sys.stderr)
+            return 1
+        print(f"[queue] ended the run (process {pid})")
+    else:
+        print("[queue] no queue run is going")
+    for path in (q.sentinel(), os.path.join(q.root, "run.json")):
+        drop(path)
+    with held(os.path.join(q.root, "queue.lock")):
+        for key in q.order():
+            st = q.load(key)
+            if not st or st.get("status") != "running":
+                continue
+            stopped = os.path.exists(q.sentinel(key))
+            drop(q.sentinel(key))
+            why = "the run was ended by the owner (halt --force)"
+            record(st, "stopped" if stopped else "interrupted", [why + "; the attempt does not count"])
+            st.update(status="stopped" if stopped else "queued", reason=why,
+                      **({"stopped_from": "queued"} if stopped else {}))
+            q.save(st)
+            q.log(key, f"{why}: {'stopped' if stopped else 'back in the queue'} at {st['stage']}")
+            launch = r.get("launch") if r.get("ticket") == key else ""
+            if launch and a.harness and not r.get("host"):   # its agent's container
+                with contextlib.suppress(OSError, subprocess.SubprocessError):
+                    subprocess.run([BASH, a.harness, "queue", "_stop_agents", workdir(q, st), launch],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=120, check=False)
+            print(f"[queue] {key}: {'stopped' if stopped else 'back in the queue'} at {st['stage']}")
     return 0
 
 
@@ -2154,15 +2296,17 @@ def main(argv):
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("add"); s.add_argument("keys", nargs="+"); s.add_argument("--project"); s.add_argument("--base")
     s.add_argument("--stages"); s.add_argument("--ref"); s.add_argument("--note"); s.add_argument("--start")
-    s.add_argument("--branch"); s.add_argument("--in-place", action="store_true")
-    s.add_argument("--review-plan", action="store_true")
+    s.add_argument("--branch"); s.add_argument("--in-place", action="store_true")   # the default
+    s.add_argument("--clone", action="store_true")
+    s.add_argument("--review-plan", action="store_true")   # the default
+    s.add_argument("--no-plan-approval", action="store_true")
     sub.add_parser("list")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("remove"); s.add_argument("keys", nargs="+")
     s = sub.add_parser("approve"); s.add_argument("key")
     s = sub.add_parser("retry"); s.add_argument("key"); s.add_argument("--stage", choices=ALL_STAGES)
     s = sub.add_parser("stop"); s.add_argument("key")
-    sub.add_parser("halt")
+    s = sub.add_parser("halt"); s.add_argument("--force", action="store_true"); s.add_argument("--harness", default="")
     s = sub.add_parser("move"); s.add_argument("key"); s.add_argument("where", choices=("up", "down", "top", "bottom"))
     s = sub.add_parser("note"); s.add_argument("key"); s.add_argument("--text"); s.add_argument("--stdin", action="store_true")
     s = sub.add_parser("answer"); s.add_argument("key"); s.add_argument("--vault", required=True); s.add_argument("--text")

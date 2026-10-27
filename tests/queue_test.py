@@ -209,7 +209,14 @@ class Base(unittest.TestCase):
         os.environ.update(self.env_keep)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def q(self, *args):
+    def q(self, *args, defaults=False):
+        # add works in place and holds the plan by default; most tests are about a
+        # clone that goes on after the plan, so they say so unless they ask otherwise
+        if args and args[0] == "add" and not defaults:
+            if not {"--in-place", "--clone"} & set(args):
+                args += ("--clone",)
+            if not {"--review-plan", "--no-plan-approval"} & set(args):
+                args += ("--no-plan-approval",)
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             rc = tq.main(["ticket_queue.py", "--state", self.state, *args])
@@ -970,6 +977,72 @@ class OwnerControlTest(Base):
         rc, out = self.run_queue()
         self.assertEqual((rc, self.status()["status"], self.status("ABC-2")["status"]), (0, "done", "done"), out)
 
+    def test_a_ticket_left_running_is_not_the_runs_to_stop(self):
+        # ABC-1 was left running by an earlier run; this run is on ABC-2 and has not
+        # got to ABC-1, so a stop request would wait for it forever.
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-2")
+        self.add("ABC-1", "ABC-2", "ABC-3")
+        self.q("move", "ABC-2", "top")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        st["status"] = "running"
+        q.save(st)
+        p = self.run_bg("--push", "0")
+        self.wait_for(lambda: self.sleeping("ABC-2"), "the ABC-2 agent")
+        rc, out = self.q("stop", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("asked the run", out)
+        self.assertEqual(self.status()["status"], "stopped")
+        self.assertFalse(os.path.exists(q.sentinel("ABC-1")))
+        # Retried from the plan, and removed: neither waits on the run either.
+        st = q.load("ABC-1")
+        st["status"] = "running"
+        q.save(st)
+        rc, out = self.q("retry", "ABC-1", "--stage", "plan")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.status()["status"], self.status()["stage"]), ("queued", "plan"))
+        st = q.load("ABC-3")
+        st["status"] = "running"
+        q.save(st)
+        rc, out = self.q("remove", "ABC-3")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("ABC-3", q.order())
+        # The ticket the run has in hand still goes through the run.
+        rc, out = self.q("retry", "ABC-2")
+        self.assertEqual(rc, 1, out)
+        rc, out = self.q("remove", "ABC-2")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stop it first", out)
+        p.kill()
+        p.wait()
+
+    def test_halt_force_ends_a_run_that_does_not_halt(self):
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1")
+        self.add("ABC-1", "ABC-2")
+        p = self.run_bg()
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        self.wait_for(lambda: self.status_json()["runner"].get("agent"), "the agent's pid in run.json")
+        agent, launch = self.status_json()["runner"]["agent"], self.status_json()["runner"]["launch"]
+        rc, out = self.q("halt", "--force", "--harness", self.harness)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"ended the run (process {p.pid})", out)
+        self.assertNotEqual(p.wait(timeout=15), 0)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(agent, 0)
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"], st["history"][-1]["result"]), ("queued", "plan", "interrupted"))
+        self.assertIn("halt --force", st["reason"])
+        self.assertEqual(self.status("ABC-2")["status"], "queued")
+        for f in ("halt", "run.json", os.path.join("ABC-1", "stop")):
+            self.assertFalse(os.path.exists(os.path.join(self.state, f)), f)
+        self.assertIn("stop-launch " + launch, cat(self.calls).splitlines())
+        rc, out = self.q("retry", "ABC-1", "--stage", "plan")
+        self.assertEqual((rc, self.status()["status"]), (0, "queued"), out)
+        # No run going: halt --force only tidies up.
+        rc, out = self.q("halt", "--force")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("no queue run is going", out)
+
     def test_move(self):
         self.add("ABC-1", "ABC-2", "ABC-3")
         order = lambda: tq.Queue(self.state).order()  # noqa: E731
@@ -1461,6 +1534,68 @@ class StartAndBranchTest(Base):
         self.run_queue()
         self.assertEqual(self.status()["status"], "plan-review")
         self.assertEqual(len(self.calls_of("implementing")), 0)
+
+
+    def test_defaults_are_in_place_and_wait_for_the_plan(self):
+        head = self.git_p("rev-parse", "HEAD")
+        rc, out = self.q("add", "ABC-1", "--project", self.project, defaults=True)
+        self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertIs(st["in_place"], True)
+        self.assertIs(st["plan_review"], True)
+        self.assertEqual(st["start"], head)                  # here, fixed when added
+        self.assertIn("the plan waits for approve", out)
+        rc, out = self.q("add", "ABC-2", "--project", self.project, "--clone", "--no-plan-approval", defaults=True)
+        self.assertEqual(rc, 0, out)
+        st = self.status("ABC-2")
+        self.assertNotIn("in_place", st)
+        self.assertNotIn("plan_review", st)
+        rc, out = self.q("add", "ABC-3", "--project", self.project, "--clone", "--in-place", defaults=True)
+        self.assertEqual(rc, 1, out)
+
+    def two_in_place(self):
+        put(os.path.join(self.project, "AGENTS.md"), "rules\n")   # the owner's, untracked
+        for key in ("ABC-1", "ABC-2"):
+            rc, out = self.q("add", key, "--project", self.project, "--stages", "plan,implement", defaults=True)
+            self.assertEqual(rc, 0, out)
+        self.run_queue()
+        self.assertEqual([self.status(k)["status"] for k in ("ABC-1", "ABC-2")], ["plan-review"] * 2)
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-2")   # the last one set up
+        self.assertEqual(self.q("approve", "ABC-1")[0], 0)
+
+    def test_in_place_tickets_take_turns_in_the_folder(self):
+        self.two_in_place()
+        rc, out = self.run_queue()
+        self.assertEqual(self.status("ABC-1")["status"], "done", out)
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-1")
+        self.assertIn("switched " + self.project + " from ABC-2 back to ABC-1",
+                      cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertEqual(self.q("approve", "ABC-2")[0], 0)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status("ABC-2")["status"], "done", out)
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-2")
+        self.assertEqual(cat(os.path.join(self.project, "AGENTS.md")), "rules\n")
+        for key in ("ABC-1", "ABC-2"):   # each built on main, not on the other
+            self.assertEqual(self.git_p("rev-parse", key + "~1"), self.git_p("rev-parse", "main"))
+
+    def test_another_tickets_leftovers_are_not_carried_over(self):
+        self.two_in_place()
+        put(os.path.join(self.project, "half.txt"), "ABC-2's\n")   # not there when ABC-1 started
+        self.run_queue()
+        st = self.status("ABC-1")
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("uncommitted changes that were not there when ABC-1 started (half.txt)", st["reason"])
+        self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "ABC-2")
+
+    def test_a_new_ticket_starts_where_the_folders_ticket_did(self):
+        self.two_in_place()   # the folder is on ABC-2's branch
+        self.git_p("commit", "-q", "--allow-empty", "-m", "on ABC-2")
+        rc, out = self.q("add", "ABC-3", "--project", self.project, defaults=True)
+        self.assertEqual(rc, 0, out)
+        st = self.status("ABC-3")
+        self.assertEqual(st["start"], self.status("ABC-2")["start_sha"])
+        self.assertEqual(st["base"], "main")
+        self.assertIn("is on ABC-2's branch ABC-2", out)
 
 
 if __name__ == "__main__":
