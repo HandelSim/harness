@@ -294,6 +294,14 @@ helper with `harness upgrade`.
 3. Apply the flagged upgrade actions from `scripts/upgrade-manifest.json`
    to the install root (`apply_upgrade_actions` takes an optional ID
    filter so only the prechecked actions run).
+3b. Restart what harness left running, on the new code, unless
+   `--no-restart` (which says what still runs the old code): the host proxy
+   (`host_proxy_refresh`, with the backend and prompt mode recorded in
+   `state/host/proxy.mode` when it started), a `harness serve` in a terminal
+   (`harness_serve_refresh`: USR1, it `exec`s the new code in place) and the
+   run viewer (`harness_view_refresh`). A queue run restarts itself between
+   tickets (exit 75); a working agent is not interrupted. This runs before
+   the host-only/container split, so both paths get it.
 4. `harness down --remove-orphans` and `harness start` (skippable via
    `--no-restart`).
 
@@ -313,9 +321,8 @@ lazily on the next `harness host` (it is sha-stamped against
 `proxy/requirements.txt`). The host toolchain (`state/host/toolchain`) is
 likewise untouched at upgrade time and re-provisions lazily on the next
 `harness host` only if the pulled code bumped a `HARNESS_HOST_*_VERSION` pin
-(each tool is stamped against its pinned version). If a proxy is already
-running, the completion message tells the user to bounce it with `harness host
-down && harness host`.
+(each tool is stamped against its pinned version). A proxy already
+running was restarted on the new code in step 3b.
 The config merge needs jq; on a host-only box without jq the merge step is
 skipped with a warning (the pull still applies) rather than failing. A
 container install with the daemon merely stopped is NOT treated as host-only

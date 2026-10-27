@@ -802,7 +802,12 @@ means no run. A run that ends on an upstream outage (exit 3) or Ctrl-C (130)
 puts the ticket it was on back to `queued` at its stage, uncounted, with the
 reason and an `interrupted` history entry; one killed outright leaves it
 `running`, which the viewer shows as "run ended" and the next run takes
-again.
+again. Between tickets the runner hashes its own code (`ticket_queue.py`,
+`vault_ingest.py`); when `harness upgrade` changed it, it exits 75 and
+`harness queue run` `exec`s the clone's `harness queue run` with the same
+arguments, `HARNESS_QUEUE_OWNS_PROXY=1` telling the new run that the proxy
+is still its to stop. Each stage is a fresh `harness` launch, so it is on
+the new CLI code already.
 
 Stages, each a fresh `harness [host] -p --yolo --ticket KEY -m MODEL PROMPT`
 in `state/queue/KEY/repo` (a clone at the base on branch `KEY`, its origin
