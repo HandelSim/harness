@@ -61,6 +61,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -70,6 +71,9 @@ from vault_ingest import InfraError, call_model, resolve_model, try_lock, yq  # 
 PROMPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_prompts")
 STAGE_TIMEOUT = 3 * 3600   # one agent launch; a cooperative turn alone can take 15 minutes
 VERIFY_TIMEOUT = 600
+SYNC_TIMEOUT = 600         # harness queue _sync: a session into the vault, and its commit
+PULL_TIMEOUT = 300         # harness queue _pull: the ticket from the tracker
+PUSH_TIMEOUT = 600
 TICKET_CAP = 30_000        # chars of each part embedded in an agent prompt, which
 PLAN_CAP = 15_000          # goes on a command line (one argument is at most 128 KiB)
 NOTE_CAP = 8_000           # feedback and must-fix lists in a prompt
@@ -383,14 +387,63 @@ def check_review(text):
 TEXT = {"text": True, "encoding": "utf-8", "errors": "replace"}
 
 
+def run_quiet(cmd, timeout, cwd=None, env=None):
+    """subprocess.run with no pipes: output goes to temporary files, so a process the
+    command leaves behind (ssh, a credential helper, git's fsmonitor daemon, a docker
+    client) cannot hold the call open, which on Windows a pipe does past any timeout.
+    On a timeout the whole tree is ended and returncode is 124; 127 when it could not
+    start. Never raises for the command's sake."""
+    with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+        try:
+            p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe, **NEW_GROUP)
+        except OSError as e:
+            return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: {e}")
+        try:
+            rc = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stop(p, grace=5)
+            rc = 124
+        except BaseException:   # Ctrl-C: it is in its own session and did not get it
+            stop(p, grace=5)
+            raise
+        out = []
+        for f in (fo, fe):   # as text=True reads a pipe: utf-8, universal newlines
+            f.seek(0)
+            out.append(f.read().decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n"))
+    if rc == 124:
+        out[1] += f"\n(no answer in {timeout}s; stopped)"
+    return subprocess.CompletedProcess(cmd, rc, out[0], out[1])
+
+
 def git(cwd, *args, check=True, timeout=300, env=None):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", **(env or {}))
-    # no fsmonitor daemon started by the queue's git: it would outlive the call holding its pipes
-    r = subprocess.run(["git", "-C", cwd, "-c", "core.fsmonitor=false", *args], capture_output=True, env=env,
-                       timeout=timeout, **TEXT)
+    env = dict(os.environ, **{"GIT_TERMINAL_PROMPT": "0", **(env or {})})
+    # no fsmonitor daemon started by the queue's git: it would outlive the call holding its files
+    r = run_quiet(["git", "-C", cwd, "-c", "core.fsmonitor=false", *args], timeout, env=env)
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args[:3])}: {(r.stderr or r.stdout).strip()[:400]}")
     return r
+
+
+# Network git (fetch, push): nobody is watching, so no prompt may hold it (a
+# terminal, Git Credential Manager's window, ssh asking for a passphrase or about
+# a host key), and a connection that stalls is given up on, not waited on for hours.
+NET_OPTS = ("-c", "credential.interactive=false", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60")
+SSH_BATCH = "ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+
+
+def net_env(project):
+    """The environment of network git. An ssh the owner chose (GIT_SSH, GIT_SSH_COMMAND,
+    core.sshCommand: plink, a key, the Windows agent) is kept."""
+    env = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+    if not (os.environ.get("GIT_SSH") or os.environ.get("GIT_SSH_COMMAND")
+            or git(project, "config", "core.sshCommand", check=False).stdout.strip()):
+        env["GIT_SSH_COMMAND"] = SSH_BATCH
+    return env
+
+
+def net_git(project, *args, timeout=300):
+    """git fetch or push in project, with NET_OPTS and net_env; never raises."""
+    return git(project, *NET_OPTS, *args, check=False, timeout=timeout, env=net_env(project))
 
 
 def rmtree(path):
@@ -449,8 +502,8 @@ def make_clone(q, st, container=False):
                                f"in it, git's fsmonitor daemon) and run harness queue retry {st['key']}")
     start, base_sha = start_and_base(st)
     ends_on(q, st, start)
-    r = subprocess.run(["git", "clone", "-q", "--no-checkout", *clone_opts(container), st["project"], dest],
-                       capture_output=True, timeout=600, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"), **TEXT)
+    r = run_quiet(["git", "clone", "-q", "--no-checkout", *clone_opts(container), st["project"], dest],
+                  600, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
     if r.returncode != 0:
         raise RuntimeError(f"git clone: {(r.stderr or r.stdout).strip()[:400]}")
     # A clone has the project's branches only; the start (a remote-tracking ref, a
@@ -568,11 +621,8 @@ def resolve_ref(project, ref):
     fetched from its remote first, best effort, so it is the work as it is now."""
     head, _, rest = ref.partition("/")
     if rest and head in git(project, "remote", check=False).stdout.split():
-        try:
-            git(project, "fetch", "-q", "--no-tags", head, f"+refs/heads/{rest}:refs/remotes/{head}/{rest}",
-                check=False, timeout=120)
-        except subprocess.SubprocessError:
-            pass
+        net_git(project, "fetch", "-q", "--no-tags", head, f"+refs/heads/{rest}:refs/remotes/{head}/{rest}",
+                timeout=120)
     r = git(project, "rev-parse", "-q", "--verify", ref + "^{commit}", check=False)
     return r.stdout.strip() if r.returncode == 0 else ""
 
@@ -1127,18 +1177,20 @@ def stop_containers(ctx, st):
     if ctx.host or ctx.single:
         return
     key = st["key"]
-    try:
-        r = subprocess.run([BASH, ctx.harness, "queue", "_stop_agents", workdir(ctx.q, st), st.get("launch_id", "")],
-                           stdin=subprocess.DEVNULL, capture_output=True, timeout=120, check=False, **TEXT)
-        n = r.stdout.strip() if r.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
-        n = ""
+    n = launch_containers_stopped(ctx.harness, workdir(ctx.q, st), st.get("launch_id", ""))
     if n.isdigit():
         if int(n):
             ctx.q.log(key, f"stopped {n} agent container(s)")
     else:
         ctx.q.log(key, "warning: the agent's container may still be running; check 'harness list' "
                        "(harness stop NAME) before 'harness queue retry'")
+
+
+def launch_containers_stopped(harness, folder, launch_id):
+    """harness queue _stop_agents FOLDER LAUNCH: how many agent containers it
+    stopped, as text; "" when that is not known."""
+    r = run_quiet([BASH, harness, "queue", "_stop_agents", folder, launch_id], 120)
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def mtime(path):
@@ -1183,18 +1235,21 @@ def sync_vault(ctx, key, since):
     """Copy the ticket's queue log (stages, checks, verifier verdicts) to KEY-log.md in the
     vault, then capture the session and commit the vault (best effort; never fails a stage)."""
     log = read(os.path.join(ctx.q.dir(key), "log.md"))
-    if log.strip():
-        fence = "`" * max(3, 1 + max((len(m) for m in re.findall(r"`+", log)), default=0))
-        write_atomic(note_paths(ctx.vault, key)["log"],
-                     f"---\ntype: note\nticket: {key}\nsummary: {yq(f'harness queue log of {key}')}\n---\n\n"
-                     f"# {key}: queue log\n\nWritten by `harness queue`; each line is a stage, a check or a verdict.\n\n"
-                     f"{fence}text\n{log.rstrip()}\n{fence}\n")
+    try:
+        if log.strip():
+            fence = "`" * max(3, 1 + max((len(m) for m in re.findall(r"`+", log)), default=0))
+            write_atomic(note_paths(ctx.vault, key)["log"],
+                         f"---\ntype: note\nticket: {key}\nsummary: {yq(f'harness queue log of {key}')}\n---\n\n"
+                         f"# {key}: queue log\n\nWritten by `harness queue`; each line is a stage, a check or a "
+                         f"verdict.\n\n{fence}text\n{log.rstrip()}\n{fence}\n")
+    except OSError as e:
+        ctx.q.log(key, f"warning: could not write the log into the vault: {e}")
     st = ctx.q.load(key) or {"key": key, "project": ""}
-    # no pipes: on Windows a timed-out run() waits for its pipes to close, which a
-    # process the call left behind (a server, git's fsmonitor daemon) never does
-    subprocess.run([BASH, ctx.harness, "queue", "_sync", key, workdir(ctx.q, st), str(since)],
-                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   timeout=600, check=False)
+    step(ctx, "saving the session into the vault")
+    r = run_quiet([BASH, ctx.harness, "queue", "_sync", key, workdir(ctx.q, st), str(since)], SYNC_TIMEOUT)
+    if r.returncode != 0:
+        ctx.q.log(key, f"warning: the session was not saved into the vault (harness queue _sync: "
+                       f"{(r.stderr or r.stdout).strip()[-300:] or 'exit ' + str(r.returncode)}); the ticket goes on")
 
 
 # On Windows a bare "bash" can resolve to WSL's System32\bash.exe before PATH is searched;
@@ -1207,22 +1262,50 @@ NEW_GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name =
              else {"start_new_session": True})
 
 
-def stop(p):
+def stop(p, grace=30):
+    """End p and everything it started (it runs in its own session, NEW_GROUP)."""
     if os.name == "nt":  # no killpg or SIGKILL: taskkill /T ends bash and everything it started
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], stdin=subprocess.DEVNULL,
-                       capture_output=True, check=False)
-        try:
+        kill_tree(p.pid)
+        with contextlib.suppress(subprocess.TimeoutExpired):
             p.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            pass
         return
-    for sig, wait in ((signal.SIGTERM, 30), (signal.SIGKILL, 10)):
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 10)):
         try:
             os.killpg(p.pid, sig)
             p.wait(timeout=wait)
+            break
+        except ProcessLookupError:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                p.wait(timeout=1)
             return
-        except (ProcessLookupError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
             continue
+    # what the leader left behind in its group (a docker client, ssh): the group lives
+    # on while any of it does, so its id is not anyone else's yet
+    with contextlib.suppress(OSError):
+        os.killpg(p.pid, signal.SIGKILL)
+
+
+def kill_tree(pid):
+    """End pid's process tree (POSIX: its process group, as NEW_GROUP made it); best
+    effort, bounded: taskkill itself is given a minute."""
+    if os.name == "nt":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=60)
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, sig)
+        except OSError:
+            return
+        end = time.time() + 10
+        while time.time() < end:
+            try:
+                os.killpg(pid, 0)
+            except OSError:
+                return
+            time.sleep(0.1)
 
 
 def probe(ctx):
