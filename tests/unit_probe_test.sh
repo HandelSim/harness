@@ -454,6 +454,22 @@ done
     || { echo "$out" | tail -40; fail "T8 a probe error, or a server session read into a last-message-only mock"; }
 ok "T8 memory suite exits 0 with all sections and a verdict"
 
+# --- T9: memory suite redaction ---
+log=$(ls "$TMP_ROOT"/state/output/probe-memory-*.log 2>/dev/null | head -1)
+[[ -n "$log" && -s "$log" ]] || fail "T9 no memory log written under state/output"
+for f in "$TMP_ROOT/stdout-mem.txt" "$log"; do
+    for secret in "$KEY" "PROBEKEY" "tok_PROB" "$PREFIX" "secretcorp" "admin" "10.1." "127.0" ":${PORT}" \
+                  "p-123456" "ASSISTSECRET" "$ORG" "unlock.secret"; do
+        if grep -qiF -- "$secret" "$f"; then
+            grep -niF -- "$secret" "$f" | head -3 >&2
+            fail "T9 secret '$secret' leaked into $(basename "$f")"
+        fi
+    done
+done
+grep -qF '"session_id": "<redacted>"' "$log" || fail "T9 passed-back session id not scrubbed in the log"
+grep -qF '### layout ' "$log" || fail "T9 memory log lacks the per-request layout lines"
+ok "T9 no secrets in the memory suite's stdout or log"
+
 # --- T8b: section 8 detects a server-side session keyed on message 0 ---
 start_mock msg0
 URL="http://127.0.0.1:${PORT}/${PREFIX}"
@@ -472,22 +488,6 @@ done
 [[ "$out" != *"--- 5. "* && "$out" != *"Traceback"* && "$out" != *"Facts leaked between independent"* ]] \
     || { echo "$out" | tail -40; fail "T8b ran other sections, crashed, or called a same-session recall a leak"; }
 ok "T8b section 8 reads a message-0 session: key, growth and time"
-
-# --- T9: memory suite redaction ---
-log=$(ls "$TMP_ROOT"/state/output/probe-memory-*.log 2>/dev/null | head -1)
-[[ -n "$log" && -s "$log" ]] || fail "T9 no memory log written under state/output"
-for f in "$TMP_ROOT/stdout-mem.txt" "$log"; do
-    for secret in "$KEY" "PROBEKEY" "tok_PROB" "$PREFIX" "secretcorp" "admin" "10.1." "127.0" ":${PORT}" \
-                  "p-123456" "ASSISTSECRET" "$ORG" "unlock.secret"; do
-        if grep -qiF -- "$secret" "$f"; then
-            grep -niF -- "$secret" "$f" | head -3 >&2
-            fail "T9 secret '$secret' leaked into $(basename "$f")"
-        fi
-    done
-done
-grep -qF '"session_id": "<redacted>"' "$log" || fail "T9 passed-back session id not scrubbed in the log"
-grep -qF '### layout ' "$log" || fail "T9 memory log lacks the per-request layout lines"
-ok "T9 no secrets in the memory suite's stdout or log"
 
 # --- T9b: --budget stops a section before an expensive request ---
 start_mock ok
