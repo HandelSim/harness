@@ -14,6 +14,10 @@ Your working directory is a fresh clone of the project on branch {{BRANCH}}. Rea
 {{PLAN}}
 <<<END_PREVIOUS_PLAN>>>
 
+<<<BEGIN_NOTES_FROM_THE_OWNER (they win over the ticket, the plan and the answers)>>>
+{{NOTES}}
+<<<END_NOTES_FROM_THE_OWNER>>>
+
 <<<BEGIN_PROBLEMS_WITH_THE_LAST_ATTEMPT>>>
 {{FEEDBACK}}
 <<<END_PROBLEMS_WITH_THE_LAST_ATTEMPT>>>

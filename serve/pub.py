@@ -26,6 +26,7 @@ what the page links to, which includes opencode web, a shell on this host.
 """
 
 import argparse
+import base64
 import hashlib
 import hmac
 import html
@@ -508,7 +509,8 @@ def vault_log(vault):
 class Config:
     def __init__(self, port, vault, vault_name, opencode_port, password_file, allow_hosts,
                  access_codes="", secure_cookie=False, opencode_url="", proxy_url="",
-                 modes=(), usage_ledger="", trust_forwarded_for=False, agent_data=(), queue_dir=""):
+                 modes=(), usage_ledger="", trust_forwarded_for=False, agent_data=(), queue_dir="",
+                 harness=""):
         self.port = port
         self.vault = vault
         self.vault_name = vault_name
@@ -529,7 +531,7 @@ class Config:
         self.usage_ledger = usage_ledger
         self.trust_forwarded_for = trust_forwarded_for
         self.cache = TTLCache()
-        self.runs = runs_view.Runs(agent_data, queue_dir, vault) if agent_data else None
+        self.runs = runs_view.Runs(agent_data, queue_dir, vault, harness) if agent_data else None
 
     def opencode_password(self):
         if not self.password_file:
@@ -564,26 +566,38 @@ class Config:
 
 
 STYLE = """
-/* A console for one host: the opencode launch panel up top, then pages and usage in the main
+/* Neutral greys, one indigo accent, and status colours that each mean one thing.
+   A console for one host: the opencode launch panel up top, then pages and usage in the main
    column beside a rail of prompt modes and vault commits; one column on a phone. System fonts
    only (the index CSP loads nothing). */
 :root {
   color-scheme: light;
-  --bg: #f3f5f7; --panel: #ffffff; --sunk: #e9edf1; --ink: #14181d; --muted: #5b6672; --line: #dbe1e7;
-  --accent: #0b6e60; --accent-ink: #ffffff; --accent-soft: #d6eeea;
-  --ok: #157347; --ok-soft: #dcf1e5; --bad: #b42318; --bad-soft: #fbe3df;
+  --bg: #f6f7f9; --panel: #ffffff; --raised: #f3f4f6; --sunk: #eef0f3; --hover: #f0f2f5; --field: #ffffff;
+  --line: #e1e4e8; --line-2: #d0d4da; --line-3: #b5bbc4; --ink: #16181d; --ink-2: #3b4048; --muted: #5f6670;
+  --faint: #8a919b; --accent: #4f56d6; --accent-ink: #ffffff; --accent-soft: rgba(79, 86, 214, .10);
+  --run: #1f6feb; --run-soft: rgba(31, 111, 235, .10); --wait: #9a6700; --wait-soft: rgba(212, 167, 44, .16);
+  --wait-ink: #ffffff; --bad: #cf222e; --bad-soft: rgba(207, 34, 46, .09); --ok: #1a7f37; --ok-soft: rgba(26, 127, 55, .10);
+  --user: #1f6feb; --user-soft: rgba(31, 111, 235, .04); --user-line: rgba(31, 111, 235, .28); --tool: #6f42c1;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --r: 10px;
 }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
-  --bg: #0f1215; --panel: #171b20; --sunk: #1e242a; --ink: #e7ecf0; --muted: #96a2ad; --line: #2a3138;
-  --accent: #4cc2ab; --accent-ink: #062520; --accent-soft: #173a35;
-  --ok: #5ccf94; --ok-soft: #173326; --bad: #ff8a7a; --bad-soft: #3d1d19; color-scheme: dark; } }
+  --bg: #0e0f12; --panel: #15171b; --raised: #1c1f24; --sunk: #111317; --hover: #1a1d22; --field: #0f1114;
+  --line: #262a31; --line-2: #343a43; --line-3: #4a515c; --ink: #e6e8eb; --ink-2: #c3c7cd; --muted: #9298a2;
+  --faint: #6b717b; --accent: #8a90ff; --accent-ink: #0b0c1a; --accent-soft: rgba(138, 144, 255, .14);
+  --run: #5aa9ff; --run-soft: rgba(90, 169, 255, .13); --wait: #e8a93b; --wait-soft: rgba(232, 169, 59, .13);
+  --wait-ink: #1a1205; --bad: #f2685f; --bad-soft: rgba(242, 104, 95, .13); --ok: #3fbf7f; --ok-soft: rgba(63, 191, 127, .13);
+  --user: #5aa9ff; --user-soft: rgba(90, 169, 255, .06); --user-line: rgba(90, 169, 255, .26); --tool: #c4a7ff;
+  color-scheme: dark; } }
 :root[data-theme="dark"] {
-  --bg: #0f1215; --panel: #171b20; --sunk: #1e242a; --ink: #e7ecf0; --muted: #96a2ad; --line: #2a3138;
-  --accent: #4cc2ab; --accent-ink: #062520; --accent-soft: #173a35;
-  --ok: #5ccf94; --ok-soft: #173326; --bad: #ff8a7a; --bad-soft: #3d1d19; color-scheme: dark; }
+  --bg: #0e0f12; --panel: #15171b; --raised: #1c1f24; --sunk: #111317; --hover: #1a1d22; --field: #0f1114;
+  --line: #262a31; --line-2: #343a43; --line-3: #4a515c; --ink: #e6e8eb; --ink-2: #c3c7cd; --muted: #9298a2;
+  --faint: #6b717b; --accent: #8a90ff; --accent-ink: #0b0c1a; --accent-soft: rgba(138, 144, 255, .14);
+  --run: #5aa9ff; --run-soft: rgba(90, 169, 255, .13); --wait: #e8a93b; --wait-soft: rgba(232, 169, 59, .13);
+  --wait-ink: #1a1205; --bad: #f2685f; --bad-soft: rgba(242, 104, 95, .13); --ok: #3fbf7f; --ok-soft: rgba(63, 191, 127, .13);
+  --user: #5aa9ff; --user-soft: rgba(90, 169, 255, .06); --user-line: rgba(90, 169, 255, .26); --tool: #c4a7ff;
+  color-scheme: dark; }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); }
 main { max-width: 1100px; margin: 0 auto; padding-block: 20px 56px;
@@ -662,10 +676,39 @@ tr:last-child td { border-bottom: 0; }
 esc = html.escape
 
 
-def _head(title):
+def _head(title, bar=""):
+    """The page's head; with bar (the run viewer's sticky nav), the runs layout."""
     return ["<!doctype html><html lang='en'><head><meta charset='utf-8'>",
             "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-            f"<title>{esc(title)}</title><style>", STYLE, runs_view.STYLE, "</style></head><body><main>"]
+            f"<title>{esc(title)}</title><style>", STYLE, runs_view.STYLE, "</style></head><body>",
+            bar + "<main class='rv'>" if bar else "<main>"]
+
+
+def opencode_session_link(cfg, host):
+    """f(source label, session id) -> the session in opencode web, or "": opencode's
+    own route /server/<base64url of its origin>/session/<id>, which opens a session
+    by id whatever folder it is in. Only the host's sessions: opencode web (opencode
+    serve on this host) reads the host's database, not a container's."""
+    if cfg.opencode_url:
+        u = urlsplit(cfg.opencode_url)
+        netloc = u.netloc.rpartition("@")[2].lower()
+        default = {"http": ":80", "https": ":443"}.get(u.scheme, "")
+        if default and netloc.endswith(default):
+            netloc = netloc[:-len(default)]
+        origin = f"{u.scheme}://{netloc}"
+        base = f"{u.scheme}://{u.netloc}"      # with the login, if the URL carries one
+    elif cfg.opencode_port:
+        origin = f"http://{host}:{cfg.opencode_port}"
+        pw = cfg.opencode_password()
+        # the login in the userinfo, as on the index's link (see _services)
+        base = f"http://opencode:{quote(pw, safe='')}@{host}:{cfg.opencode_port}" if pw else origin
+    else:
+        return None
+    server = base64.urlsafe_b64encode(origin.encode()).decode().rstrip("=")
+
+    def link(label, sid):
+        return f"{base}/server/{server}/session/{quote(sid)}" if label == "host" else ""
+    return link
 
 
 def _n(v):
@@ -860,15 +903,22 @@ def make_handler(cfg):
             hdrs.update(extra or {})
             self.send(code, body, "text/html; charset=utf-8", hdrs, head)
 
-        def send_runs(self, code, title, parts, script="", head=False):
+        def send_runs(self, code, title, parts, script="", head=False, active="sessions"):
             nonce = secrets.token_urlsafe(16)
-            body = _head(title) + parts
-            if script:
-                body.append(f"<script nonce='{nonce}'>{script}</script>")
+            bar = runs_view.nav_bar(cfg.runs, active) if cfg.runs else ""
+            body = _head(title, bar) + parts
+            body.append(f"<script nonce='{nonce}'>{runs_view.COMMON_JS}{script}</script>")
             body.append("</main></body></html>")
             self.send(code, "".join(body).encode(), "text/html; charset=utf-8",
                       {"Cache-Control": "no-store", "Content-Security-Policy": RUNS_CSP.format(nonce=nonce),
                        "Referrer-Policy": "same-origin"}, head)
+
+        def send_json(self, obj, head=False):
+            self.send(200, json.dumps(obj).encode(), "application/json; charset=utf-8",
+                      {"Cache-Control": "no-store"}, head)
+
+        def oc_link(self):
+            return opencode_session_link(cfg, (self.headers.get("Host") or "127.0.0.1").rsplit(":", 1)[0])
 
         def runs_get(self, path, query, head):
             r = cfg.runs
@@ -878,18 +928,37 @@ def make_handler(cfg):
             rest = path[len("/runs"):].strip("/")
             q = parse_qs(query)
             text = {"Cache-Control": "no-store", "Content-Security-Policy": PUB_CSP}
-            if not rest:
+            done = (q.get("done") or [""])[0][:500]
+            if not rest or rest == "live":
                 filt = (q.get("q") or [""])[0].strip()[:200]
-                self.send_runs(200, "harness: runs", runs_view.render_list(r, filt),
-                               "" if filt else runs_view.LIST_JS, head)
+                if rest:
+                    self.send_json(runs_view.list_live(r, filt), head)
+                else:
+                    self.send_runs(200, "harness: sessions", runs_view.render_list(r, filt),
+                                   runs_view.LIVE_JS, head)
                 return
             bits = rest.split("/")
+            if bits[0] == "queue" and len(bits) <= 2 and r.queue_dir:
+                if len(bits) == 1:
+                    self.send_runs(200, "harness: queue", runs_view.render_queue_page(r, done),
+                                   runs_view.LIVE_JS, head, "queue")
+                elif bits[1] == "live":
+                    self.send_json(runs_view.queue_live(r), head)
+                elif bits[1] == "runner.out":
+                    self.send(200, (r.runner_out(400) or "nothing yet").encode(), extra=text, head=head)
+                else:
+                    self.send(404, b"not found\n", head=head)
+                return
             if bits[0] == "ticket" and len(bits) in (2, 3):
                 if len(bits) == 2:
-                    got = runs_view.render_ticket(r, bits[1], (q.get("done") or [""])[0][:500])
+                    got = runs_view.render_ticket(r, bits[1], done)
                     if got:
-                        self.send_runs(200, f"harness: {got[0]}", got[1], head=head)
+                        self.send_runs(200, f"harness: {got[0]}", got[1], runs_view.LIVE_JS, head, "queue")
                         return
+                elif bits[2] == "live":
+                    got = runs_view.ticket_live(r, bits[1])
+                    self.send_json(got if got else {"gone": "/runs/queue"}, head)
+                    return
                 else:
                     data = runs_view.ticket_file(r, bits[1], bits[2])
                     if data is not None:
@@ -907,7 +976,7 @@ def make_handler(cfg):
                     self.redirect(f"/runs/{quote(sid)}" + (f"?{follow}" if queue else ""), head)
                 else:
                     self.send_runs(200, "harness: waiting", [runs_view.render_follow(follow, queue)],
-                                   runs_view.FOLLOW_JS, head)
+                                   runs_view.FOLLOW_JS, head, "queue" if queue else "sessions")
                 return
             sid = bits[0]
             if len(bits) == 1 and sid.endswith(".json"):
@@ -918,19 +987,19 @@ def make_handler(cfg):
                     return
             elif len(bits) == 1:
                 _, queue, follow = runs_view.follow_query(q)
-                got = runs_view.render_detail(r, sid, "", follow if queue else "")
+                got = runs_view.render_detail(r, sid, "", follow if queue else "", self.oc_link(), done)
                 if got:
-                    self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head)
+                    self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head,
+                                   "queue" if r.ticket_of((r.find(sid)[1] or {}).get("directory") or "") else "sessions")
                     return
             elif bits[1:] == ["tail"]:
                 try:
                     start = int((q.get("from") or ["0"])[0])
                 except ValueError:
                     start = 0
-                got = runs_view.tail(r, sid, start)
+                got = runs_view.tail(r, sid, start, self.oc_link())
                 if got is not None:
-                    self.send(200, json.dumps(got).encode(), "application/json; charset=utf-8",
-                              {"Cache-Control": "no-store"}, head)
+                    self.send_json(got, head)
                     return
             elif len(bits) == 3 and bits[1] == "part":
                 got = runs_view.part_text(r, sid, bits[2])
@@ -939,10 +1008,33 @@ def make_handler(cfg):
                     return
             self.send(404, b"not found\n", head=head)
 
+        def refused(self, msg, back, label):
+            self.send_runs(409, "harness: not done", [
+                f"<section class='panel'><h2>Not done</h2><p class='err'>{esc(msg)}</p>"
+                f"<a href='{esc(back)}'>{esc(label)}</a></section>"])
+
         def runs_send(self, path, user):
             bits = path[len("/runs/"):].split("/")
             if cfg.runs is not None and len(bits) == 3 and bits[0] == "ticket":
                 self.ticket_post(bits[1], bits[2], user)
+                return
+            if cfg.runs is not None and len(bits) == 2 and bits[0] == "queue":
+                self.queue_post(bits[1], user)
+                return
+            if cfg.runs is not None and len(bits) == 2 and bits[1] == "stop":
+                try:
+                    form = self.read_form()
+                except ValueError:
+                    form = None
+                if form is None:
+                    self.send(413, b"form too large\n")
+                    return
+                ok, msg = runs_view.session_stop(cfg.runs, bits[0])
+                sys.stderr.write(f"[pub] stop {bits[0]} from {user or 'local'}: {msg}\n")
+                if not ok:
+                    self.refused(msg, f"/runs/{quote(bits[0])}", "Back to the run")
+                    return
+                self.redirect(f"/runs/{quote(bits[0])}?done={quote(msg[:500])}")
                 return
             if cfg.runs is None or len(bits) != 2 or bits[1] != "send":
                 self.send(404, b"not found\n")
@@ -964,9 +1056,28 @@ def make_handler(cfg):
                 return
             self.redirect(f"/runs/{quote(bits[0])}#end")
 
+        def queue_post(self, action, user):
+            """The queue page's forms: add tickets, start the run, halt it."""
+            if action not in runs_view.QUEUE_ACTIONS or not cfg.runs.queue_dir:
+                self.send(404, b"not found\n")
+                return
+            try:
+                form = self.read_form(MAX_SEND_FORM)
+            except ValueError:
+                form = None
+            if form is None:
+                self.send(413, b"form too large\n")
+                return
+            ok, msg = runs_view.queue_action(cfg.runs, action, form)
+            sys.stderr.write(f"[pub] queue {action} from {user or 'local'}: {msg}\n")
+            if not ok:
+                self.refused(msg, "/runs/queue", "Back to the queue")
+                return
+            self.redirect(f"/runs/queue?done={quote(msg[:500])}")
+
         def ticket_post(self, key, action, user):
-            """The ticket page's buttons: answer the plan's questions, approve the
-            plan, retry a blocked ticket (the same as harness queue answer/approve/retry)."""
+            """The ticket's buttons: answer the plan's questions, approve the plan,
+            retry, stop, remove, move, add a note (harness queue's own commands)."""
             if action not in runs_view.TICKET_ACTIONS:
                 self.send(404, b"not found\n")
                 return
@@ -979,12 +1090,12 @@ def make_handler(cfg):
                 return
             ok, msg = runs_view.ticket_action(cfg.runs, key, action, form)
             sys.stderr.write(f"[pub] {action} {key} from {user or 'local'}: {msg}\n")
+            queue = (form.get("back") or [""])[0] == "queue" or (ok and action == "remove")
+            back = "/runs/queue" if queue else f"/runs/ticket/{quote(key)}"
             if not ok:
-                self.send_runs(409, "harness: not done", [
-                    f"<section class='panel'><h2>Not done</h2><p class='err'>{esc(msg)}</p>"
-                    f"<a href='/runs/ticket/{quote(key)}'>Back to the ticket</a></section>"])
+                self.refused(msg, back, "Back to the queue" if queue else "Back to the ticket")
                 return
-            self.redirect(f"/runs/ticket/{quote(key)}?done={quote(msg[:500])}")
+            self.redirect(f"{back}?done={quote(msg[:500])}")
 
         def redirect(self, location, head=False, cookies=()):
             self.send(303, b"", extra={"Location": location, "Cache-Control": "no-store"},
@@ -1291,13 +1402,16 @@ def main(argv=None):
                     help="a data dir holding opencode/opencode.db and harness/live (repeatable); "
                          "turns on the run viewer at /runs")
     ap.add_argument("--queue-dir", default="", metavar="DIR",
-                    help="harness queue's state/queue, to group its stage sessions by ticket")
+                    help="harness queue's state/queue: the queue page, and its stage sessions by ticket")
+    ap.add_argument("--harness", default="", metavar="PATH",
+                    help="the harness script the queue page's Start runs 'queue run' with "
+                         "(default: the one next to this serve/ folder)")
     a = ap.parse_args(argv)
     cfg = Config(a.port, a.vault, a.vault_name, a.opencode_port, a.password_file, a.allow_host,
                  access_codes=a.access_codes, secure_cookie=a.secure_cookie,
                  opencode_url=a.opencode_url, proxy_url=a.proxy_url, modes=a.mode,
                  usage_ledger=a.usage_ledger, trust_forwarded_for=a.trust_forwarded_for,
-                 agent_data=a.agent_data, queue_dir=a.queue_dir)
+                 agent_data=a.agent_data, queue_dir=a.queue_dir, harness=a.harness)
     if cfg.codes:
         n = len(cfg.codes.entries())
         if not n:

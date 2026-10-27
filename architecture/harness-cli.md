@@ -608,7 +608,7 @@ the hub in Obsidian.
 
 `harness queue` (`cmd_queue`, then `scripts/ticket_queue.py`) works queued
 tickets one at a time with no one at the keyboard. `add KEY... [--dir]
-[--base]` records the project and base (default: its current branch);
+[--base] [--stages LIST] [--ref REF] [--note TEXT]` records the project and base (default: its current branch);
 `run [--host] [--single-message]` needs an active vault, does the launch
 checks once (host mode when docker is missing, `host_confirm_gate` asked
 once), starts the host proxy if it is not running and hands the rest to the
@@ -617,12 +617,49 @@ Python script. `list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
 ticket page uses), `findings`, `watch` (tails `run.log`) and `log
 [KEY]` are the owner's side.
 
+Owner control (all of it also on the run viewer's queue and ticket pages):
+`--stages` runs a subset of plan, implement, review, fix, push (kept in that
+order; `fix` needs `review`), starting at the first and done after the last;
+`--ref` starts branch `KEY` at existing work (a `remote/branch` is fetched
+first) with `base_sha` the merge-base, so `--stages review` reviews that
+branch. Without a plan stage the change is held to the ticket's own
+"Acceptance criteria" bullets, else to "the change does what the ticket asks
+for". Must fix items with no fix stage end the ticket: `done` when review was
+last, else `blocked` (`retry KEY --stage fix` goes on). `note KEY` adds an
+owner note every later prompt gets (`{{NOTES}}`); notes live in
+`KEY/notes.json` under a lock and are re-read on every save, so a runner
+holding older state cannot drop one. `retry KEY [--stage S]` (blocked,
+needs-answers, stopped, done; back to plan, or any retry of a done ticket
+without `--stage`, means a fresh clone from `--ref`), `stop KEY` (a waiting
+ticket becomes `stopped`; a running one gets the `KEY/stop` sentinel, which
+the runner also checks right before the push), `halt` (the `halt` sentinel:
+the run kills its agent, puts the ticket back at its stage uncounted and
+exits; a halt file older than the run's lock is stale and dropped), `move KEY
+up|down|top|bottom`, `remove KEY` (refused while a run is on it) and `status
+[--json]`. Killing a container launch's client leaves its container running,
+so after a stop, halt or timeout the runner calls `harness queue _stop_agents
+CLONE`, which stops the containers labelled `harness.agent=true` and
+`harness.mount=<clone>` (the log says to check `harness list` when that
+fails). The runner takes a ticket, and `stop` and `note` save state, under
+`queue.lock`. The runner polls its agent every
+2 s for the sentinels and the stage timeout (a verifier call runs in a thread
+for the same reason) and keeps `run.json` (`pid`, `started`, `beat` every 3 s,
+`host`, `single`, `model`, `ticket`, `stage`), deleted on exit; a `beat` over
+30 s old means no run.
+
 Stages, each a fresh `harness [host] -p --yolo --ticket KEY -m MODEL PROMPT`
 in `state/queue/KEY/repo` (a clone at the base on branch `KEY`, its origin
 removed): `plan` → `implement` → `review` → `fix` (once, when the review has
 Must fix items) → `push`. The prompt (`scripts/queue_prompts/<stage>.md`)
 embeds the ticket, plan, answers and the last attempt's problems, capped to
 fit one argv argument, because the free models only read the last message.
+While a stage runs its whole prompt is also in the vault at
+`wiki/notes/tickets/KEY-task.md` (removed before the vault is synced, ignored
+by the vault's `.gitignore`, which a run adds the line to when missing, and
+leftovers deleted at run start; the branch check refuses it), which the proxy names to cooperative models every
+turn, since they lose the prompt after their first tool call; on Windows,
+where a command line is at most 32,767 characters, a prompt over 24,000
+characters goes as a short one pointing there.
 The model is `QUEUE_MODEL`, else the default model's free twin when it is a
 `-withtools` one (`resolve_model`). Plan, review, answers and findings live
 in the vault at `wiki/notes/tickets/KEY-{plan,review,answers,findings}.md`.
@@ -662,7 +699,8 @@ nothing changed), which the verifier sees and may quote for that item only. A fa
 stage runs `QUEUE_RETRIES` more times with the problems as feedback, then
 the ticket is `blocked`; so does any error in harness itself, so one ticket
 never jams the queue. Before a failure counts, one probe request checks the
-upstream; if it does not answer the run exits 3 and the ticket keeps its
+upstream; the verifier and the probe each try 3 times (20 s, 60 s apart) on no
+answer, 408, 429 or 5xx; if it does not answer the run exits 3 and the ticket keeps its
 stage. A stage that runs past its timeout is blocked, not retried: a
 container launch can outlive its stopped client. Going back to the plan
 (`answer`) starts from a fresh clone. A
@@ -678,7 +716,8 @@ which the ticket page lists.
 
 Harness never runs git in the clone once an agent has had it: it fetches
 branch `KEY` into the project as `refs/harness-queue/KEY`, diffs there,
-updates the project's `KEY` only by fast-forward and pushes
+updates the project's `KEY` only by fast-forward (and not at all while a
+worktree of the project has `KEY` checked out) and pushes
 `sha:refs/heads/KEY` (just the ticket key) to `QUEUE_REMOTE` without force (`QUEUE_PUSH=0`
 keeps it local). Before each ticket `queue _pull` refreshes the vault's copy
 of the ticket; after each stage, and once more when the ticket stops, the
@@ -700,7 +739,15 @@ with the read-only bit cleared (git's objects are read-only, which a plain
 `rmtree` cannot delete on Windows) and retried for a few seconds; one that will
 not go blocks the ticket with the reason. On Windows the clone sets
 `core.fsmonitor=false`, so Git for Windows' monitor daemon does not hold it
-open. Covered by `tests/unit_queue_test.sh`.
+open, `core.longpaths=true`, and for container runs `core.autocrlf=false` (a
+CRLF checkout looks modified to the container's git); a host prompt's paths
+use `/` (`C:/...`), which backslash-escaping no-tools tool calls cannot
+break. git output is read as UTF-8 (`PYTHONUTF8=1`), the push never asks for
+credentials (`credential.interactive=false`, `GCM_INTERACTIVE=never`, ssh
+`BatchMode` only when neither `GIT_SSH`, `GIT_SSH_COMMAND` nor the project's
+`core.sshCommand` names an ssh of the owner's), and a container `run` asks the open-firewall question once,
+then sets `HARNESS_NET_CONFIRM=1` for its stages; `--single-message` starts
+the proxy in single mode up front. Covered by `tests/unit_queue_test.sh`.
 
 ### Interactive TTY resolution (Windows) — issue #82
 
@@ -1015,7 +1062,8 @@ What it does, in order:
    provider ([`containers.md`](containers.md)). The fingerprint gains an `oai` line
    only when an `OAI_*` key is set.
 8. **Launch** — `host_run_opencode` mirrors the entrypoint's `run_opencode`
-   (provider env, `--agent yolo`, and the headless `-p` json-events +
+   (provider env, `--agent yolo`, `--auto` for a headless `--yolo` run since
+   `opencode run` rejects any permission ask it cannot show, and the headless `-p` json-events +
    `opencode export` dance that dodges opencode 1.15.x's render race). The
    `-p` run goes through `agents/live-run.sh` from the clone, as in the
    container, so the serve run viewer can message it (see "Run viewer").
@@ -1198,37 +1246,75 @@ itself still needs its Basic password, which the reverse proxy injects.
 
 **Run viewer (`/runs`).** `serve/runs.py`, mounted by pub.py, shows what
 every agent did or is doing, from opencode's own session store, read-only
-(`file:...?mode=ro`). `cmd_serve` passes `--agent-data container=<agent
+(`file:...?mode=ro`), and drives the queue through `ticket_queue.py`'s own
+commands. `serve_pub_args` passes `--agent-data container=<agent
 home>/.local/share` and `--agent-data host=${XDG_DATA_HOME:-~/.local/share}`
 (each `LABEL=DIR` holding `opencode/opencode.db` and `harness/live/`; a
-dir with no DB shows nothing, and with no `--agent-data` the viewer is off) and `--queue-dir
-state/queue`. Routes:
+dir with no DB shows nothing, and with no `--agent-data` the viewer is off),
+`--queue-dir state/queue` and `--harness <this script>` (what Start runs;
+default the `harness` next to `serve/`). Pages share one top bar (Queue,
+Sessions, the index) and a neutral dark theme with an indigo accent (light
+from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
 
-- `/runs` (`?q=` filter): the queue (each ticket's status, stage and what it
-  waits on), live runs, queue tickets with their sessions by stage, then every
-  session newest first. The index shows the live ones in
+- `/runs/queue`: the owner's console. A runner card (running or not, mode,
+  model, ticket and stage, heartbeat age, `runner.out` tail at
+  `/runs/queue/runner.out`) with Start (container, host or single-message
+  host; host modes need the "host mode is OK" box) and Halt; one row per
+  ticket in queue order with a stage strip (plan, implement, review, fix,
+  push: passed, skipped, current in the status colour, still to do, or not
+  one of the ticket's stages), why it waits, and its buttons (move, Answer
+  or Review plan, stop, retry, remove); and the Add form (keys,
+  project folder, base, the existing work's ref such as `origin/ABC-123`,
+  a note for the agents, and the stages: Full, Review only,
+  Implement+review, Plan only or Custom). `/runs/queue/live` is the JSON
+  the page polls.
+- `/runs` (`?q=` filter): live runs, queue tickets with their sessions by
+  stage, then every session newest first. The index shows the live ones in
   an "Agent runs" panel.
+- `/runs/ticket/<KEY>`: status and why, the stage strip and buttons, the
+  plan's questions with an answer form, the ticket's sessions from every
+  `--agent-data` source by stage, every attempt from `history` with its
+  result, reason and `.out`, the notes with an add form, the plan, answers
+  and review notes from the vault, and `log.md`. `/runs/ticket/<KEY>/live`
+  is its poll JSON, `/runs/ticket/<KEY>/<stage>-<n>.out` an output file.
 - `/runs/<sid>`: the transcript (text, thinking, each tool call with input,
   output, status and timing, subtasks, retries, errors; a file change as its
-  diff from opencode's tool metadata, a `todowrite` as a checklist), crumbs to
-  the parent session and a side panel: for a live run the message box first,
-  then the session's latest todo list, then agent, model, tokens, cost,
-  directory, ticket, subagents. A nonce script polls
-  `/runs/<sid>/tail?from=N` (2.5 s, 15 s once idle) and appends new or changed
-  messages in place.
+  diff from opencode's tool metadata, a `todowrite` as a checklist), crumbs
+  (the queue and ticket for a stage) and a side panel: for a live run the
+  message box first, a "Stop this stage" button for a queue stage, then the
+  session's latest todo list, then agent, model, tokens, cost, directory,
+  ticket, subagents. A host session gets "Open in opencode web" when this
+  page runs under `harness serve` (`/server/<base64url(origin)>/session/<id>`
+  on opencode's own server, with the Basic login in the link as on the
+  index; container sessions live in another database, so none). A nonce
+  script polls `/runs/<sid>/tail?from=N` (2.5 s, 15 s once idle) and appends
+  new or changed messages in place.
 - `/runs/<sid>/part/<pid>` (one tool call in full, past the 20,000-character
-  inline cap), `/runs/<sid>.json` (the session as JSON), `/runs/ticket/<KEY>`
-  (status and why, a link to the live stage, the plan's questions with an
-  answer form, approve or retry, every attempt from `history` with its
-  problems and `.out`, the plan, answers and review notes from the vault,
-  `log.md`, the sessions by stage and the `.out` files).
+  inline cap), `/runs/<sid>.json` (the session as JSON).
 - `POST /runs/<sid>/send`: puts a message in the run's inbox.
-- `POST /runs/ticket/<KEY>/{answer,approve,retry}`: runs `ticket_queue.py`
-  `answer --stdin` (the form's answers as `## question` sections, `## Other`,
-  and "go with the default" for the rest; needs the vault), `approve` or
-  `retry`, and redirects back with its message (409 with the reason when the
-  ticket is not in a state for it, such as answers sent twice). Same origin and access-code checks as
-  sending.
+  `POST /runs/<sid>/stop`: stops the ticket whose stage this session is
+  (refused for anything not a queue stage).
+- `POST /runs/queue/{add,start,halt}`: `add` checks the form (keys, an
+  absolute existing project folder, refs that cannot carry options or
+  revision syntax, `fix` only with `review`, a ref when there is no
+  implement stage) and runs `queue add --stages --ref --note`; `start`
+  runs `bash <harness> queue run [--host|--single-message]` detached (own
+  session or process group, no console, `HARNESS_OPEN=0`,
+  `HARNESS_HOST_CONFIRM=1` for host modes, `HARNESS_INSTALL_ROOT` from the
+  queue dir), output appended to `<queue>/runner.out`, refused while a run
+  holds the queue; `halt` writes the halt file.
+- `POST /runs/ticket/<KEY>/{answer,approve,retry,stop,remove,move,note}`:
+  `ticket_queue.py` `answer --stdin` (the form's answers as `## question`
+  sections, `## Other`, and "go with the default" for the rest; needs the
+  vault), `approve`, `retry [--stage S]`, `stop`, `remove` (refused while
+  running), `move up|down|top|bottom`, `note --stdin`. Each redirects back
+  with the queue's message, or answers 409 with the reason when the ticket
+  is not in a state for it (answers sent twice, approve of a ticket not in
+  plan-review). Every POST needs a same-host `Origin` and, when codes are
+  on, a session.
+- Live updates: the queue, ticket and session-list pages poll their `/live`
+  JSON every 3 s and swap only the parts whose signature changed, keep text
+  being typed in a form, and pause while the tab is hidden.
 - `/runs/follow?since=MS[&queue=1]`: the link a launch opens. It redirects
   (303) to the root session started at or after MS (live first, then still
   working, then newest), or shows a waiting page that polls

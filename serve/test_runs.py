@@ -190,9 +190,10 @@ class RunsTest(RunsServer):
         self.assertIn("Fix the &lt;b&gt;parser&lt;/b&gt;", body)
         self.assertNotIn("<b>parser</b>", body)
         self.assertIn("Live now", body)
-        self.assertIn("<span class='live'>live</span>", body)
+        self.assertIn("<span class='pill t-run dot pulse'>live</span>", body)
         self.assertIn("href='/runs/ticket/ABC-12'", body)
-        self.assertRegex(body, r"<code>plan-1</code> <a href='/runs/ses_queue1'>")
+        # plan-1.out is the plan's second attempt (outputs count from 0)
+        self.assertIn("<span class='tag'>plan &middot; 2</span> <a href='/runs/ses_queue1'>", body)
         self.assertIn("1 subagent session", body)
         self.assertNotIn(f"href='/runs/{CHILD}'", body)  # subagents sit under their parent
         r, body = self.req("GET", "/runs?q=parser")
@@ -255,7 +256,8 @@ class RunsTest(RunsServer):
         self.start()
         r, body = self.req("GET", "/runs")
         self.assertIn("<h2>Queue</h2>", body)
-        self.assertRegex(body, r"<b>ABC-12</b></a> <span class='ask'>needs your answers</span>")
+        self.assertIn("<a href='/runs/ticket/ABC-12'><b>ABC-12</b></a> "
+                      "<span class='pill t-wait dot'>needs your answers</span>", body)
         self.assertIn("does not hold the queue", body)
 
     def test_ticket_page_shows_questions_attempts_and_notes(self):
@@ -268,7 +270,8 @@ class RunsTest(RunsServer):
         self.assertIn("action='/runs/ticket/ABC-12/answer'", body)
         self.assertIn("Go with the defaults", body)
         self.assertIn("Plan again without answering", body)
-        self.assertIn("<span class='failed'>failed</span> <code>plan</code> attempt 2", body)
+        self.assertIn("<span class='pill t-bad'>failed</span><span class='tag'>plan</span><span>attempt 2</span>",
+                      body)
         self.assertIn("write it to &lt;C:\\x&gt;", body)
         self.assertIn("href='/runs/ticket/ABC-12/plan-1.out'", body)   # the failed attempt's output
         self.assertIn("1. [blocking] Which &lt;db&gt;?", body)          # the plan note
@@ -278,7 +281,9 @@ class RunsTest(RunsServer):
         self.assertIn("Answer the planner", body)   # a free answer box without questions
         self.ticket(status="running", attempt=1)
         r, body = self.req("GET", "/runs/ticket/ABC-12")
-        self.assertNotIn("<form method='post'", body)
+        self.assertNotIn("/answer'", body)
+        self.assertNotIn("/retry'", body)
+        self.assertIn("action='/runs/ticket/ABC-12/stop'", body)   # a running ticket can be stopped
         self.assertIn("going with the default", body)
 
     def test_answering_on_the_page_saves_the_answers_and_requeues(self):
@@ -298,13 +303,16 @@ class RunsTest(RunsServer):
         self.assertIn("## Which <db>?\n\npostgres", text)
         self.assertIn("## Other\n\nkeep it small", text)
         r, body = self.req("GET", r.getheader("Location"))
-        self.assertIn("<p class='flash'>", body)
+        self.assertIn("<p class='flash' role='status'>", body)
+        r, body = self.act("answer", [("note", "one more thing")])
+        self.assertEqual(r.status, 303)   # a queued ticket takes more answers before it runs
+        self.ticket(status="running")
         r, body = self.act("answer", [("defaults", "1")])
-        self.assertEqual(r.status, 409)   # sent twice: the ticket is not waiting any more
-        self.assertIn("ABC-12 is queued now", body)
+        self.assertEqual(r.status, 409)   # but not a running one
+        self.assertIn("ABC-12 is running now", body)
         r, body = self.act("approve")
         self.assertEqual(r.status, 409)
-        self.assertIn("not plan-review", body)
+        self.assertIn("not a plan waiting for approval", body)
 
     def test_approve_and_retry_on_the_page(self):
         self.ticket(status="plan-review", stage="implement")
@@ -460,6 +468,197 @@ class RunsTest(RunsServer):
         r, body = self.req("GET", "/runs/follow?since=99999999999999&queue=1")
         self.assertIn("Waiting for the queue", body)
         self.assertIn("data-jump='1'", body)
+
+
+
+def git_repo(path):
+    import subprocess
+    os.makedirs(path)
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t")
+    for cmd in (["init", "-q", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "one"],
+                ["branch", "ABC-7-work"]):
+        subprocess.run(["git", "-C", path, *cmd], check=True, env=env, capture_output=True)
+    return path
+
+
+class QueuePageTest(RunsServer):
+    """/runs/queue and the ticket's buttons, through the real scripts/ticket_queue.py."""
+
+    def post(self, path, fields=(), origin=None):
+        h = {"Content-Type": "application/x-www-form-urlencoded",
+             "Origin": origin or f"http://127.0.0.1:{self.port}"}
+        return self.req("POST", path, urlencode(list(fields)), h)
+
+    def test_queue_page_lists_tickets_with_stages_and_actions(self):
+        self.ticket()
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertEqual(r.status, 200)
+        self.assertIn("<nav class='bar'", body)
+        self.assertIn("href='/runs/ticket/ABC-12'", body)
+        self.assertIn("class='strip", body)
+        self.assertIn("action='/runs/queue/add'", body)
+        self.assertIn("action='/runs/queue/start'", body)
+        self.assertIn("action='/runs/ticket/ABC-12/stop'", body)
+        self.assertIn("action='/runs/ticket/ABC-12/retry'", body)
+        self.assertIn("data-confirm='Remove ABC-12", body)
+        self.assertIn("data-live='/runs/queue/live'", body)
+        r, body = self.req("GET", "/runs/queue/live")
+        d = json.loads(body)
+        self.assertEqual(set(d["regions"]), {"runner", "tickets", "nav"})
+        self.assertIn("ABC-12", d["regions"]["tickets"])
+        r, body = self.req("GET", "/runs/ticket/ABC-12/live")
+        d = json.loads(body)
+        self.assertIn("Which &lt;db&gt;?", d["regions"]["qs"])
+        self.assertNotIn("Which <db>?", json.dumps(d))
+        r, body = self.req("GET", "/runs/ticket/ABC-99/live")
+        self.assertEqual(json.loads(body), {"gone": "/runs/queue"})
+
+    def test_add_a_review_only_ticket_with_its_ref_and_a_note(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.start()
+        r, body = self.post("/runs/queue/add", [("keys", "abc-7, ABC-8"), ("project", proj), ("base", "main"),
+                                                ("preset", "review"), ("ref", "ABC-7-work"),
+                                                ("note", "the fix is on <ABC-7-work>")])
+        self.assertEqual(r.status, 303, body)
+        self.assertTrue(r.getheader("Location").startswith("/runs/queue?done="))
+        with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
+            st = json.load(f)
+        self.assertEqual((st["stages"], st["ref"], st["stage"]), (["review"], "ABC-7-work", "review"))
+        r, body = self.req("GET", "/runs/ticket/ABC-7")
+        self.assertIn("the fix is on &lt;ABC-7-work&gt;", body)
+        self.assertNotIn("<ABC-7-work>", body)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertLess(body.index("ABC-7"), body.index("ABC-8"))
+        # notes, move, stop, retry, remove on the ticket
+        r, _ = self.post("/runs/ticket/ABC-7/note", [("text", "keep the API")])
+        self.assertEqual(r.status, 303)
+        r, body = self.req("GET", "/runs/ticket/ABC-7")
+        self.assertIn("keep the API", body)
+        r, _ = self.post("/runs/ticket/ABC-8/move", [("where", "top"), ("back", "queue")])
+        self.assertEqual((r.status, r.getheader("Location").split("?")[0]), (303, "/runs/queue"))
+        r, body = self.req("GET", "/runs/queue")
+        self.assertLess(body.index("ticket/ABC-8"), body.index("ticket/ABC-7"))
+        r, _ = self.post("/runs/ticket/ABC-7/stop")
+        self.assertEqual(r.status, 303)
+        with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
+            self.assertEqual(json.load(f)["status"], "stopped")
+        r, _ = self.post("/runs/ticket/ABC-7/retry", [("stage", "push")])
+        self.assertEqual(r.status, 303)
+        with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
+            st = json.load(f)
+        self.assertEqual((st["status"], st["stage"]), ("queued", "push"))
+        r, _ = self.post("/runs/ticket/ABC-8/remove", [("back", "queue")])
+        self.assertEqual(r.status, 303)
+        self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-8")))
+
+    def test_add_and_actions_refuse_bad_values(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.ticket(status="running")
+        self.start()
+        good = [("keys", "ABC-9"), ("project", proj), ("preset", "full")]
+        for fields, why in (
+                ([("keys", "a b; <x>"), ("project", proj)], "not a ticket key"),
+                ([("keys", "ABC-9"), ("project", "relative/dir")], "absolute path"),
+                (good[:2] + [("base", "main..x")], "not a branch"),
+                (good[:2] + [("ref", "-x")], "not a branch"),
+                (good[:2] + [("preset", "review")], "existing work"),
+                (good[:2] + [("preset", "custom"), ("stage_fix", "1"), ("stage_implement", "1")], "pick review"),
+                (good[:2] + [("preset", "custom")], "at least one stage"),
+                (good[:2] + [("preset", "<b>")], "not a preset: &lt;b&gt;"),
+                (good + [("note", "x" * 4001)], "over 4000")):
+            r, body = self.post("/runs/queue/add", fields)
+            self.assertEqual(r.status, 409, fields)
+            self.assertIn(why, body)
+        self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-9")))
+        r, _ = self.post("/runs/queue/add", good, origin="http://evil.example")
+        self.assertEqual(r.status, 403)
+        r, body = self.post("/runs/ticket/ABC-12/remove")
+        self.assertEqual(r.status, 409)       # its agent is working in the clone
+        self.assertIn("stop it first", body)
+        r, body = self.post("/runs/ticket/ABC-12/retry", [("stage", "deploy")])
+        self.assertEqual(r.status, 409)
+        r, body = self.post("/runs/ticket/ABC-12/move", [("where", "sideways")])
+        self.assertEqual(r.status, 409)
+        r, _ = self.post("/runs/ticket/ABC-99/stop")
+        self.assertEqual(r.status, 409)
+        r, body = self.post("/runs/queue/start", [("mode", "host")])
+        self.assertEqual(r.status, 409)       # host mode needs its box ticked
+        self.assertIn("host mode is OK", body)
+        r, _ = self.post("/runs/queue/nope")
+        self.assertEqual(r.status, 404)
+
+    def test_runner_status_from_run_json_and_halt(self):
+        self.ticket(status="running")
+        self.start()
+        with open(os.path.join(self.queue, "run.json"), "w") as f:
+            json.dump({"pid": 1, "started": "2026-10-27T10:00:00Z", "beat": time.time(), "host": True,
+                       "single": False, "model": "big <m>", "ticket": "ABC-12", "stage": "plan"}, f)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("big &lt;m&gt;", body)
+        self.assertIn("action='/runs/queue/halt'", body)
+        self.assertNotIn("action='/runs/queue/start'", body)
+        import fcntl
+        with open(os.path.join(self.queue, "run.lock"), "a") as lock:   # a run holds it while it goes
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            r, _ = self.post("/runs/queue/halt")
+        self.assertEqual(r.status, 303)
+        self.assertTrue(os.path.exists(os.path.join(self.queue, "halt")))
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("halting", body)
+        with open(os.path.join(self.queue, "run.json"), "w") as f:
+            json.dump({"beat": time.time() - runs.RUN_FRESH - 5}, f)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("action='/runs/queue/start'", body)   # a stale beat is a run that is gone
+
+    def test_start_runs_harness_queue_run_and_reports_an_early_exit(self):
+        fake = os.path.join(self.tmp.name, "harness")
+        args = os.path.join(self.tmp.name, "args")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/bash\necho "$@ HOST_CONFIRM=$HARNESS_HOST_CONFIRM OPEN=$HARNESS_OPEN" > {args}\n'
+                    'echo "no active vault <x>"\nexit 3\n')
+        self.ticket()
+        self.start(harness=fake)
+        r, body = self.post("/runs/queue/start", [("mode", "single"), ("confirm_host", "1")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("ended at once (status 3): no active vault &lt;x&gt;", body)
+        with open(args) as f:
+            self.assertEqual(f.read().strip(), "queue run --single-message HOST_CONFIRM=1 OPEN=0")
+        r, body = self.req("GET", "/runs/queue/runner.out")
+        self.assertIn("no active vault <x>", body)
+        self.assertEqual(r.getheader("Content-Type").split(";")[0], "text/plain")
+
+    def test_a_queue_session_has_a_stop_button_and_the_host_an_opencode_link(self):
+        self.ticket(status="running", stage="plan")
+        cfg = self.start()
+        cfg.opencode_port = 4096
+        cfg.opencode_password = lambda: "p w"
+        self.go_live(QSES)
+        r, body = self.req("GET", f"/runs/{QSES}")
+        self.assertIn(f"action='/runs/{QSES}/stop'", body)
+        self.assertIn("http://opencode:p%20w@127.0.0.1:4096/server/aHR0cDovLzEyNy4wLjAuMTo0MDk2/session/"
+                      f"{QSES}", body)
+        r, _ = self.post(f"/runs/{QSES}/stop")
+        self.assertEqual(r.status, 303)
+        self.assertEqual(self.state()["status"], "stopped")
+        r, body = self.post(f"/runs/{ROOT}/stop")
+        self.assertEqual(r.status, 409)     # not a queue stage
+        self.assertIn("not a queue stage", body)
+
+    def test_access_codes_gate_the_queue_forms(self):
+        codes = os.path.join(self.tmp.name, "codes")
+        with open(codes, "w") as f:
+            f.write("ann:" + pub.code_hash("letmein") + "\n")
+        self.ticket()
+        self.start(access_codes=codes)
+        for path in ("/runs/queue", "/runs/queue/live", "/runs/ticket/ABC-12/live", "/runs/queue/runner.out"):
+            r, _ = self.req("GET", path)
+            self.assertEqual(r.status, 303, path)
+        for path in ("/runs/queue/halt", "/runs/ticket/ABC-12/stop", f"/runs/{QSES}/stop"):
+            r, _ = self.post(path)
+            self.assertEqual(r.status, 401, path)
+        self.assertEqual(self.state()["status"], "needs-answers")
 
 
 class BackgroundTest(unittest.TestCase):

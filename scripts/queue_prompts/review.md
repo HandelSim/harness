@@ -14,12 +14,16 @@ Your working directory is the clone on branch {{BRANCH}}. The whole change is `g
 {{ANSWERS}}
 <<<END_OWNER_ANSWERS>>>
 
+<<<BEGIN_NOTES_FROM_THE_OWNER (they win over the ticket, the plan and the answers)>>>
+{{NOTES}}
+<<<END_NOTES_FROM_THE_OWNER>>>
+
 <<<BEGIN_DIFF>>>
 {{DIFF}}
 <<<END_DIFF>>>
 
 Check the change from each of these angles, one after the other:
-1. Acceptance criteria: is each one in the plan really met by the code, not just mentioned?
+1. Acceptance criteria: is each one in the plan (with no plan, each thing the ticket asks for) really met by the code, not just mentioned?
 2. Correctness: wrong logic, missed cases, broken error handling, a caller or test the change breaks.
 3. Security: injection, secrets, unsafe file or shell handling, input from outside trusted without a check.
 4. Scope: changes the ticket did not ask for, files changed for no reason, behaviour that changed silently.

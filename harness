@@ -6422,16 +6422,31 @@ cmd_queue() {
         -h|--help|help)
             cat <<'HELP'
 usage: harness queue [list]                 the queue: each ticket's status and stage
-       harness queue add KEY... [--dir PROJECT] [--base REF]
+       harness queue status [--json]        the same, and whether a run is going and
+                                            on what (--json: run.json and every state)
+       harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST]
+                                [--ref REF] [--note TEXT]
                                             queue tickets for the git project here
                                             (or PROJECT), branching from REF (default:
-                                            the project's current branch)
+                                            the project's current branch); --stages
+                                            runs only some stages (e.g. review,fix,push),
+                                            --ref starts from work that exists (e.g.
+                                            origin/ABC-12: review reviews that branch)
        harness queue run [--host] [--single-message]
                                             work through the queue, one ticket at a time
        harness queue answer KEY ["TEXT"]    answer the plan's questions (opens $EDITOR
                                             without TEXT); the plan is made again
+       harness queue note KEY ["TEXT"]      a note every later stage's prompt gets
+                                            (opens $EDITOR without TEXT); any time
        harness queue approve KEY            go on with a plan held for reading
-       harness queue retry KEY              queue a blocked ticket again at its stage
+       harness queue retry KEY [--stage S]  queue a blocked, stopped or done ticket
+                                            again at its stage (or from stage S)
+       harness queue stop KEY               hold a ticket (a running one: its agent is
+                                            stopped within seconds); retry resumes it
+       harness queue halt                   end the run; its ticket goes back to the
+                                            queue at the same stage
+       harness queue move KEY up|down|top|bottom
+                                            change the order the queue takes tickets in
        harness queue watch                  follow the run as it goes (Ctrl-C stops
                                             watching, not the run)
        harness queue log [KEY]              the ticket's log (or the whole run's)
@@ -6454,6 +6469,11 @@ clone of the project, state/queue/KEY/repo, on branch KEY:
              correctness, security, scope, simplicity) into KEY-review.md.
   fix        once, when the review has Must fix items.
   push       harness (not the agent) pushes branch KEY to QUEUE_REMOTE, no force.
+
+With --stages a ticket starts at its first listed stage and is done after its
+last; without plan, the change is held to the ticket's own acceptance criteria.
+A review with Must fix items and no fix stage ends the ticket: done when the
+review was its last stage, else blocked (retry --stage fix goes on).
 
 After each stage harness checks the result (the plan's goal and acceptance
 criteria; commits, a non-empty diff, no .github/ change, no secret) and a
@@ -6501,6 +6521,19 @@ HELP
                 fi
             done
             return 0 ;;
+        _stop_agents)
+            # ticket_queue.py, after stopping a stage's launch: killing the
+            # client leaves a -p container running, labelled with the clone
+            # it mounts. Prints how many were stopped; non-zero when unknown.
+            local m ids c n=0
+            m=$(harness_abs_path "${1:-}" 2>/dev/null) || return 1
+            ids=$(harness_docker ps -q --filter "label=harness.agent=true" \
+                    --filter "label=harness.mount=$m" 2>/dev/null) || return 1
+            for c in $ids; do
+                harness_docker stop "$c" >/dev/null 2>&1 && n=$((n + 1))
+            done
+            echo "$n"
+            return 0 ;;
         _pull)
             # ticket_queue.py, before a ticket: its copy in the vault, fresh.
             local k
@@ -6516,24 +6549,40 @@ HELP
         list|ls) args+=(list) ;;
         add)
             local dir="" base="" a
-            local -a keys=()
+            local -a keys=() opts=()
             while (( $# )); do
                 a="$1"; shift
                 case "$a" in
                     --dir) dir="${1:-}"; shift || true ;;
                     --base) base="${1:-}"; shift || true ;;
+                    --stages|--ref|--note) (( $# )) || { err "$a needs a value"; return 1; }
+                        opts+=("$a" "$1"); shift ;;
                     -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                     *) keys+=("$a") ;;
                 esac
             done
-            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF]"; return 1; }
-            args+=(add "${keys[@]}")
+            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--ref REF] [--note TEXT]"; return 1; }
+            args+=(add "${keys[@]}" ${opts[@]+"${opts[@]}"})
             [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")
             [[ -n "$base" ]] && args+=(--base "$base") ;;
         remove|rm) (( $# )) || { err "usage: harness queue remove KEY..."; return 1; }
             args+=(remove "$@") ;;
-        approve|retry) [[ -n "${1:-}" ]] || { err "usage: harness queue $sub KEY"; return 1; }
+        approve|stop) [[ -n "${1:-}" && $# -eq 1 ]] || { err "usage: harness queue $sub KEY"; return 1; }
             args+=("$sub" "$1") ;;
+        retry)
+            if [[ -n "${1:-}" && ( $# -eq 1 || ( $# -eq 3 && "$2" == --stage ) ) ]]; then
+                args+=(retry "$@")
+            else
+                err "usage: harness queue retry KEY [--stage plan|implement|review|fix|push]"; return 1
+            fi ;;
+        halt) args+=(halt) ;;
+        status) [[ $# -eq 0 || "$*" == --json ]] || { err "usage: harness queue status [--json]"; return 1; }
+            args+=(status "$@") ;;
+        move) [[ $# -eq 2 ]] || { err "usage: harness queue move KEY up|down|top|bottom"; return 1; }
+            args+=(move "$1" "$2") ;;
+        note) [[ -n "${1:-}" && $# -le 2 ]] || { err "usage: harness queue note KEY [\"TEXT\"]"; return 1; }
+            args+=(note "$1")
+            [[ -n "${2:-}" ]] && args+=(--text "$2") ;;
         answer|findings)
             [[ -n "$vault" ]] || { err "no active vault (see: harness vault)"; return 1; }
             if [[ "$sub" == answer ]]; then
@@ -6559,8 +6608,16 @@ HELP
             host_ensure_toolchain || { host_win_location_hint; exit 1; }
             host_preflight        || { host_win_location_hint; exit 1; }
             _gate_on_upstream_auth || exit 1
-            # Asked once here; the stage launches below run with it answered.
-            if (( host )); then host_confirm_gate 1 || exit 1; fi
+            # Asked once here; the stage launches below run with it answered
+            # (they have no terminal, so a question there fails every stage).
+            if (( host )); then
+                host_confirm_gate 1 || exit 1
+            else
+                warn_if_firewall_open 0 queue || exit 1
+                export HARNESS_NET_CONFIRM=1
+            fi
+            # The mode the stages' launches want, so the first one does not restart the proxy.
+            (( single )) && prompt_mode_override=single
             host_proxy_running || started=1
             host_proxy_start || exit 1
             host_proxy_wait_ready || { host_proxy_stop; exit 1; }
@@ -6578,13 +6635,14 @@ HELP
             (( host )) && args+=(--host)
             (( single )) && args+=(--single-message)
             # shellcheck disable=SC2086  # $py can be 'py -3'
-            $py "$script" "${args[@]}" || rc=$?
+            PYTHONUTF8=1 $py "$script" "${args[@]}" || rc=$?
             (( started )) && host_proxy_stop
             return "$rc" ;;
         *) err "unknown queue command '$sub' (see: harness queue --help)"; return 1 ;;
     esac
+    # UTF-8 for its files and pipes whatever the Windows code page is.
     # shellcheck disable=SC2086  # $py can be 'py -3'
-    $py "$script" "${args[@]}"
+    PYTHONUTF8=1 $py "$script" "${args[@]}"
 }
 
 cmd_vault() {
@@ -6874,6 +6932,11 @@ host_run_opencode() {
             done
         fi
 
+        # A headless run cannot answer a permission ask, so `opencode run` rejects
+        # it and the session ends (a third identical tool call is a doom_loop
+        # ask, a path outside the folder and the vault an external_directory
+        # one). --yolo means approve: --auto approves every ask not denied.
+        [[ "$yolo" == "1" ]] && args+=(--auto)
         local events_file rc sid text
         events_file="$(mktemp)"
         # agents/live-run.sh is `opencode run --format json` attached to its own
@@ -7105,13 +7168,15 @@ serve_codes_file() { printf '%s/serve/access-codes' "$state_root"; }
 
 # The pub page arguments harness serve and the background run viewer share:
 # the opencode databases (the container agents' shared home and this host's),
-# the queue's tickets, the usage ledger and the access codes. Appends to the
+# the queue's tickets, this script (the queue page's Start runs it), the usage
+# ledger and the access codes. Appends to the
 # caller's pub_args.
 serve_pub_args() {
     pub_args+=(--usage-ledger "$(host_usage_ledger)"
         --agent-data "container=$(agent_home_dir)/.local/share"
         --agent-data "host=${XDG_DATA_HOME:-$HOME/.local/share}"
-        --queue-dir "$state_root/queue")
+        --queue-dir "$state_root/queue"
+        --harness "$real_self")
     # Gated as long as the file exists, even with no codes left in it (then
     # nobody can sign in): deleting the file is the one way to open the page.
     if [[ -e "$(serve_codes_file)" ]]; then

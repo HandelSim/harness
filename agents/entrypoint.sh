@@ -73,6 +73,12 @@ if [[ "$(id -u)" == "0" ]]; then
         fi
     fi
 
+    # Docker Desktop shows a bind-mounted C:\ project as owned by another uid,
+    # and git (>= 2.35.2) then refuses every command in it ("dubious
+    # ownership"), so an agent could never commit. The mounts are the user's
+    # own folders.
+    git config --system --replace-all safe.directory '*' 2>/dev/null || true
+
     exec gosu harness "$0" "$@"
 fi
 
@@ -328,6 +334,9 @@ run_opencode() {
     if [[ "${HARNESS_PRINT_MODE:-0}" == "1" ]]; then
         # opencode has no `-p` flag — strip a leading -p / --print if the
         # harness forwarded it, hand the rest to `opencode run`.
+        # A headless run rejects every permission ask, which ends the session;
+        # --auto approves the asks --yolo means to (not explicit denies).
+        [[ "${HARNESS_YOLO:-0}" == "1" ]] && args+=(--auto)
         local op_args=()
         local seen_p=0
         local arg

@@ -6646,6 +6646,7 @@ class TestVaultReminderLine(unittest.TestCase):
         last = self._sent({"x-harness-vault": "/v", "x-harness-ticket": "ABC-7"})
         self.assertIn("Current ticket: ABC-7, described in `/v/.raw/tickets/ABC-7.md`", last)
         self.assertIn("`/v/wiki/notes/tickets/ABC-7-state.md`", last)
+        self.assertIn("`/v/wiki/notes/tickets/ABC-7-task.md`", last)
 
     def test_bad_ticket_or_no_vault_adds_nothing(self):
         self.assertNotIn("Current ticket", proxy._vault_clause("/v", "ABC-7; rm -rf /"))

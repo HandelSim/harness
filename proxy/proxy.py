@@ -3297,7 +3297,10 @@ def _extract_working_directory(system_content):
 # reminder's Environment bullet names the vault and how to look things up in
 # it, every turn. Native models read the instructions and get no line.
 # `x-harness-ticket: <KEY>` (`harness --ticket KEY`) adds where the ticket
-# and its state note are: a pointer, never the ticket's text.
+# and its state note are, and where a queue stage's prompt is kept: a
+# cooperative model sees only the last message, so after its first tool call
+# the stage prompt (plan path, commit on branch KEY) is gone from its view.
+# Pointers, never the text.
 _VAULT_HEADER = "x-harness-vault"
 _TICKET_HEADER = "x-harness-ticket"
 _TICKET_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-[0-9]+$")
@@ -3314,7 +3317,9 @@ def _vault_clause(vault, ticket=None):
     t = str(ticket or "").strip()
     if len(t) <= 40 and _TICKET_RE.match(t):
         out += (f" Current ticket: {t}, described in `{v}/.raw/tickets/{t}.md`; keep its state"
-                f" (done, next, decisions) in `{v}/wiki/notes/tickets/{t}-state.md` as you finish each step.")
+                f" (done, next, decisions) in `{v}/wiki/notes/tickets/{t}-state.md` as you finish each step."
+                f" A queue stage keeps its full instructions in `{v}/wiki/notes/tickets/{t}-task.md`:"
+                " when that file exists and this turn does not show you your task, `read` it again.")
     return out
 
 

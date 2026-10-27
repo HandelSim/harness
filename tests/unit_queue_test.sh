@@ -14,7 +14,9 @@
 #   - cmd_queue                the CLI around it: help, add/list/remove through
 #                              the sourced harness, the internal _sync/_pull
 #                              doing nothing without a vault, run and answer
-#                              refusing without one
+#                              refusing without one; the owner's controls
+#                              (status --json, note, move, stop, retry --stage,
+#                              halt, add --stages/--ref/--note) passed through
 #
 # Prints "QUEUE TEST PASSED" on success.
 
@@ -56,8 +58,10 @@ mkdir -p "$state_root"
 # --- Q2: help names the stages and the settings ------------------------------
 out=$(cmd_queue --help)
 for w in 'harness queue add' 'harness queue run' 'harness queue answer' 'needs-answers' \
-         'QUEUE_MODEL' 'QUEUE_PLAN_REVIEW' 'Nothing is written to the tracker'; do
-    grep -qF "$w" <<<"$out" || fail "Q2: help should mention '$w'"
+         'QUEUE_MODEL' 'QUEUE_PLAN_REVIEW' 'Nothing is written to the tracker' \
+         'status [--json]' '--stages LIST' '--ref REF' 'harness queue note' 'retry KEY [--stage S]' \
+         'harness queue stop' 'harness queue halt' 'harness queue move'; do
+    grep -qF -- "$w" <<<"$out" || fail "Q2: help should mention '$w'"
 done
 grep -q 'harness queue' < <(bash "$HARNESS" --help 2>/dev/null) || fail "Q2: harness --help should list queue"
 ok "Q2: help covers the commands, stages and settings"
@@ -90,5 +94,96 @@ if cmd_queue answer ABC-7 x 2>/dev/null; then fail "Q4: answer without a vault a
 if cmd_queue run --frob 2>/dev/null; then fail "Q4: run with an unknown option accepted"; fi
 if cmd_queue frob 2>/dev/null; then fail "Q4: an unknown subcommand accepted"; fi
 ok "Q4: no vault: _sync/_pull are no-ops, run/answer refuse"
+
+# --- Q5: the owner's controls through the CLI --------------------------------
+qs() { python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print(*(s.get(k) for k in sys.argv[2:]))' \
+       "$state_root/queue/$1/state.json" "${@:2}"; }
+cmd_queue add ABC-1 ABC-2 --dir "$PROJ" --stages review,push --ref main --note 'keep it small' >/dev/null \
+    || fail "Q5: add with --stages/--ref/--note failed"
+[[ "$(qs ABC-1 stages stage ref)" == "['review', 'push'] review main" ]] || fail "Q5: add options not stored — $(qs ABC-1 stages stage ref)"
+if cmd_queue add ABC-3 --dir "$PROJ" --stages 2>/dev/null; then fail "Q5: --stages without a value accepted"; fi
+if cmd_queue add ABC-3 --dir "$PROJ" --stages frob >/dev/null 2>&1; then fail "Q5: an unknown stage accepted"; fi
+cmd_queue note abc-1 'second note' >/dev/null || fail "Q5: note failed"
+[[ "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["notes"]))' "$state_root/queue/ABC-1/state.json")" == 2 ]] \
+    || fail "Q5: the note should be in state.json"
+EDITOR="sh -c 'printf \"from the editor\\n\" >> \"\$1\"' sh" cmd_queue note ABC-1 >/dev/null || fail "Q5: note from \$EDITOR failed"
+grep -q 'from the editor' "$state_root/queue/ABC-1/state.json" || fail "Q5: the editor's note is missing"
+cmd_queue move ABC-2 top >/dev/null || fail "Q5: move failed"
+out=$(cmd_queue status --json)
+[[ "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["runner"]["running"], *(t["key"] for t in d["tickets"]))' <<<"$out")" == "False ABC-2 ABC-1" ]] \
+    || fail "Q5: status --json — $out"
+if cmd_queue status --frob 2>/dev/null; then fail "Q5: status with an unknown option accepted"; fi
+if cmd_queue move ABC-2 sideways 2>/dev/null; then fail "Q5: move sideways accepted"; fi
+cmd_queue stop ABC-1 >/dev/null || fail "Q5: stop failed"
+[[ "$(qs ABC-1 status)" == stopped ]] || fail "Q5: ABC-1 should be stopped"
+cmd_queue retry ABC-1 --stage fix >/dev/null || fail "Q5: retry --stage failed"
+[[ "$(qs ABC-1 status stage stages)" == "queued fix ['review', 'fix', 'push']" ]] || fail "Q5: retry --stage — $(qs ABC-1 status stage stages)"
+if cmd_queue retry ABC-1 --stage 2>/dev/null; then fail "Q5: retry --stage without a stage accepted"; fi
+grep -q 'no queue run is going' < <(cmd_queue halt) || fail "Q5: halt with no run should say so"
+cmd_queue remove ABC-1 ABC-2 >/dev/null
+ok "Q5: status --json, note, move, stop, retry --stage, halt, add --stages/--ref/--note"
+
+# --- Q6: run's launch setup, with everything around it stubbed ---------------
+# A container run answers the firewall question once (stages have no tty) and
+# hands the script HARNESS_NET_CONFIRM=1; --single-message starts the proxy in
+# single mode; the script always gets PYTHONUTF8=1.
+STUB_PY="$TMP_ROOT/py.sh"
+cat > "$STUB_PY" <<'EOF2'
+#!/usr/bin/env bash
+printf 'utf8=%s net=%s args=%s\n' "${PYTHONUTF8:-}" "${HARNESS_NET_CONFIRM:-}" "$*" >> "$Q6_LOG"
+EOF2
+chmod +x "$STUB_PY"
+export Q6_LOG="$TMP_ROOT/q6.log"
+q6() {
+    (
+        vault_active_name() { echo v; }
+        harness_runtime_installed() { return "$Q6_CONTAINER"; }
+        host_require_config() { :; }; ensure_dirs() { :; }; host_ensure_toolchain() { :; }
+        host_preflight() { :; }; _gate_on_upstream_auth() { :; }; host_proxy_running() { return 0; }
+        host_confirm_gate() { echo "confirm" >> "$Q6_LOG"; }
+        warn_if_firewall_open() { echo "firewall $*" >> "$Q6_LOG"; }
+        host_proxy_start() { echo "proxy mode=${prompt_mode_override:-}" >> "$Q6_LOG"; }
+        host_proxy_wait_ready() { :; }; host_proxy_stop() { :; }; vault_prepare() { echo "$TMP_ROOT"; }
+        harness_view() { :; }; harness_view_since() { :; }; host_proxy_port() { echo 1; }
+        _effective_default_model() { echo m; }; host_require_python3() { :; }
+        host_python_bin() { echo "$STUB_PY"; }
+        unset HARNESS_NET_CONFIRM
+        cmd_queue run "$@"
+    )
+}
+: > "$Q6_LOG"; Q6_CONTAINER=0 q6 || fail "Q6: container run failed — $(cat "$Q6_LOG")"
+[[ "$(cat "$Q6_LOG")" == $'firewall 0 queue\nproxy mode=\n'"utf8=1 net=1 args="* ]] || fail "Q6: container run — $(cat "$Q6_LOG")"
+: > "$Q6_LOG"; Q6_CONTAINER=0 q6 --single-message || fail "Q6: single-message run failed"
+[[ "$(cat "$Q6_LOG")" == $'confirm\nproxy mode=single\n'"utf8=1 net= args="*--single-message* ]] || fail "Q6: single run — $(cat "$Q6_LOG")"
+: > "$Q6_LOG"; Q6_CONTAINER=1 q6 || fail "Q6: host run failed"
+[[ "$(cat "$Q6_LOG")" == $'confirm\nproxy mode=\n'"utf8=1 net= args="*--host* ]] || fail "Q6: host run — $(cat "$Q6_LOG")"
+ok "Q6: run: firewall gate once for containers, single mode up front, PYTHONUTF8 for the script"
+
+# --- Q7: _stop_agents stops the containers mounting a ticket's clone ---------
+# Only through harness_docker, filtered by the agent and mount labels; prints
+# how many it stopped, and fails (the script then warns) when docker does.
+export Q7_LOG="$TMP_ROOT/q7.log"
+q7() {
+    (
+        vault_active_name() { :; }
+        harness_abs_path() { echo "/abs$1"; }
+        harness_docker() {
+            echo "docker $*" >> "$Q7_LOG"
+            case "$1" in
+                ps) [[ "$Q7_PS" == fail ]] && return 1; printf '%s\n' $Q7_PS ;;
+                stop) [[ "$2" != bad ]] ;;
+            esac
+        }
+        cmd_queue _stop_agents "$@"
+    )
+}
+: > "$Q7_LOG"; out=$(Q7_PS="c1 bad c2" q7 /q/ABC-1/repo) || fail "Q7: _stop_agents failed"
+[[ "$out" == 2 ]] || fail "Q7: expected 2 stopped, got '$out'"
+grep -qF -- "docker ps -q --filter label=harness.agent=true --filter label=harness.mount=/abs/q/ABC-1/repo" "$Q7_LOG" \
+    || fail "Q7: ps filter — $(cat "$Q7_LOG")"
+[[ "$(grep -c '^docker stop' "$Q7_LOG")" == 3 ]] || fail "Q7: stops — $(cat "$Q7_LOG")"
+out=$(Q7_PS="" q7 /q/ABC-1/repo) && [[ "$out" == 0 ]] || fail "Q7: none running gave '$out'"
+if Q7_PS=fail q7 /q/ABC-1/repo >/dev/null; then fail "Q7: a docker failure must fail"; fi
+ok "Q7: _stop_agents: by the clone's mount label, through harness_docker, counts what stopped"
 
 echo "QUEUE TEST PASSED"

@@ -18,13 +18,17 @@ Your working directory is the clone on branch {{BRANCH}}. The change so far is `
 {{ANSWERS}}
 <<<END_OWNER_ANSWERS>>>
 
+<<<BEGIN_NOTES_FROM_THE_OWNER (they win over the ticket, the plan and the answers)>>>
+{{NOTES}}
+<<<END_NOTES_FROM_THE_OWNER>>>
+
 <<<BEGIN_PROBLEMS_WITH_THE_LAST_ATTEMPT (fix every one)>>>
 {{FEEDBACK}}
 <<<END_PROBLEMS_WITH_THE_LAST_ATTEMPT>>>
 
 What to do:
 1. For each Must fix item, read the code it names and fix it. If an item is wrong (the code is already right), leave the code and say in the commit message, for that item, why it is wrong, naming the lines that show it.
-2. Keep every acceptance criterion of the plan met. Change nothing else.
+2. Keep every acceptance criterion of the plan (with no plan, what the ticket asks for) met. Change nothing else.
 3. Run the project's existing quick checks if there are any; do not install anything.
 4. Commit on {{BRANCH}}: `git add <files>` then `git commit -m "{{KEY}}: review fixes" -m "<why any item was left as it is>"`. When every item was wrong and nothing changed, still commit: `git commit --allow-empty` with the same messages. Do not push, do not rewrite earlier commits, never commit secrets, and do not change anything under .github/.
 

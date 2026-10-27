@@ -352,7 +352,9 @@ characters or carry control characters add nothing; the native route ignores
 the header. With a ticket the launch also sends `x-harness-ticket: KEY`, and
 the sentence goes on to name the ticket's copy (`<vault>/.raw/tickets/KEY.md`)
 and its state note (`<vault>/wiki/notes/tickets/KEY-state.md`, kept up to date
-as each step is finished). A key that is not `ABC-123` shaped or is over 40
+as each step is finished), plus `KEY-task.md` beside it, where a `harness
+queue` stage keeps its whole prompt while it runs: the model loses the stage
+prompt from view after its first tool call. A key that is not `ABC-123` shaped or is over 40
 characters, or a ticket without a vault, adds nothing.
 
 ## Cooperative-prompt modes (`PROXY_PROMPT_MODE`)

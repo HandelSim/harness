@@ -70,7 +70,10 @@ launch (root side), regardless of mode:
    ownership is already correct — on Windows + Docker Desktop the
    recursive chown across a bind-mounted host path is dramatically slow
    (every syscall is a WSL2/virtiofs translation), so the gate matters.
-3. **gosu drop.** `exec gosu harness "$0" "$@"`. Agents should never run
+3. **gosu drop.** First `git config --system safe.directory '*'`: Docker
+   Desktop shows a bind-mounted `C:\` folder as owned by another uid, and git
+   then refuses every command there ("dubious ownership"). Then
+   `exec gosu harness "$0" "$@"`. Agents should never run
    as root, and we want tests (which may not pass `--user 0:0`) to behave
    the same as production launches.
 
@@ -228,7 +231,10 @@ race and the body is silently dropped — the regression that forced the 1.15.7
 rollback in issue #86. `--format json` does not avoid it either.
 
 The body is always **persisted** to the session regardless of the race, so the
-branch instead: runs `opencode run --format json` (stdout captured to a temp
+branch instead: runs `opencode run --format json` (with `--auto` under
+`--yolo`: a headless run rejects every permission ask, such as opencode's
+`doom_loop` ask on a third identical tool call, and the rejection ends the
+session; stdout captured to a temp
 file), learns the session id, then prints the final assistant text from
 `opencode export <session>` (parsed with `jq` from
 `{messages:[{info.role, parts:[{type:"text", text}]}]}`). A fallback extracts

@@ -1,8 +1,13 @@
 """The pub page's run viewer (/runs): every opencode session harness agents ran, read
 from opencode's own databases, so it covers container agents, host mode, opencode
-web and `harness queue` stages alike, finished or still working.
+web and `harness queue` stages alike, finished or still working; and the queue's
+control room: its runner, its tickets, and every action harness queue has.
 
   /runs                       live runs, queue tickets by stage, then everything else
+  /runs/queue                 the queue: the runner (start, stop), every ticket in
+                              order with its stage strip and row actions, and a form
+                              to add tickets (stages, existing work, a note)
+  /runs/queue/live            the queue page's live regions, as JSON (polled)
   /runs/<session>             the transcript: messages, thinking, every tool call with
                               its input and output, subagent sessions nested; follows a
                               working session as it goes, and takes a message for a
@@ -15,26 +20,35 @@ web and `harness queue` stages alike, finished or still working.
   /runs/<session>.json        the session, its messages and parts, as stored
   /runs/<session>/tail?from=N messages N.. as HTML, for the page's polling
   /runs/<session>/part/<id>   one tool call's full output, as text
-  /runs/ticket/<KEY>          a queue ticket: its status, the plan's questions (with a
-                              form to answer them), each attempt and why it failed, the
-                              plan and review, log.md, stage outputs and sessions
+  /runs/ticket/<KEY>          a queue ticket: status, stage strip, every action its
+                              status allows, owner notes, the plan's questions (with
+                              a form to answer them), every session run for it,
+                              each attempt and why it failed, plan/review/answers,
+                              log.md and stage outputs
+  /runs/ticket/<KEY>/live     the ticket page's live regions, as JSON (polled)
   POST /runs/<session>/send   a message for a live run (agents/live-run.sh's inbox)
-  POST /runs/ticket/<KEY>/answer|approve|retry
-                              harness queue answer / approve / retry for the ticket
+  POST /runs/<session>/stop   stop the queue stage the session belongs to
+  POST /runs/ticket/<KEY>/answer|approve|retry|stop|remove|move|note
+                              harness queue's own commands for the ticket
+  POST /runs/queue/add|start|halt
+                              add tickets; start `harness queue run` detached; halt it
 
 Each source is a data directory holding opencode/opencode.db and harness/live/ (the
 markers and inboxes agents/live-run.sh keeps). The databases are opened read-only.
 """
 
+import calendar
 import hashlib
 import html
 import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import quote
 
@@ -42,80 +56,288 @@ SID_RE = re.compile(r"^ses_[A-Za-z0-9]{1,64}$")
 PART_RE = re.compile(r"^prt_[A-Za-z0-9]{1,64}$")
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
 OUT_RE = re.compile(r"^[a-z]+-[0-9]+\.out$")
+# A git ref or commit as the add form takes it: no leading '-' (an option), no
+# spaces, no '..' (a range), nothing git would read as revision syntax.
+REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$")
 LIVE_FRESH = 10          # seconds since the relay last touched the marker
 ACTIVE = 90              # an interactive session updated this recently is shown as active
+RUN_FRESH = 30           # seconds since the queue runner's heartbeat (run.json) for it to count as running
 LIST_CAP = 300
 TEXT_CAP = 20000         # characters of one tool input/output shown inline
 MAX_MESSAGE = 65536      # bytes of one message sent to a live run
+NOTE_MAX = 4000         # characters of one owner note
+ADD_NOTE_MAX = 4000      # the note given with add (it goes on a command line)
+MAX_KEYS = 50
 FORM_QUESTIONS = 6       # questions with their own answer box (the form has at most 20 fields)
-QUEUE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "ticket_queue.py")
+HERE = os.path.dirname(os.path.abspath(__file__))
+QUEUE_SCRIPT = os.path.join(HERE, "..", "scripts", "ticket_queue.py")
+HARNESS = os.path.join(HERE, "..", "harness")
 WAITING = ("needs-answers", "plan-review", "blocked")   # a ticket waiting on the owner
+STAGES = ("plan", "implement", "review", "fix", "push")
+PRESETS = {"full": STAGES, "review": ("review",), "implement": ("implement", "review", "fix", "push"),
+           "plan": ("plan",)}
+PRESET_LABELS = (("full", "Full", "plan, implement, review, fix, push"),
+                 ("review", "Review only", "review existing work; nothing is pushed"),
+                 ("implement", "Implement + review", "no plan: implement, review, fix, push"),
+                 ("plan", "Plan only", "write the plan and stop"))
+MOVES = ("up", "down", "top", "bottom")
 
 esc = html.escape
 
 STYLE = """
-.crumbs { display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; font-size: 14px; }
-.crumbs span { color: var(--muted); }
-.runs li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 16px; padding: 9px 0;
+/* The run viewer and queue: neutral greys, one indigo accent, status colours that mean one
+   thing each (blue running, amber waiting on you, red blocked/failed, green done, grey
+   stopped). System fonts only; works offline. */
+.bar { position: sticky; top: 0; z-index: 20; background: var(--bg);
+  background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: saturate(1.4) blur(10px);
+  -webkit-backdrop-filter: saturate(1.4) blur(10px); border-bottom: 1px solid var(--line); }
+.bar-in { max-width: 1280px; margin: 0 auto; height: 52px; display: flex; align-items: center; gap: 14px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.logo { font: 700 15px/1 var(--mono); color: var(--ink); letter-spacing: -.02em; white-space: nowrap; }
+.logo::before { content: "~$ "; color: var(--accent); }
+.logo:hover { text-decoration: none; }
+.tabs { display: flex; gap: 2px; min-width: 0; }
+.tabs a { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 7px; color: var(--muted);
+  font-weight: 550; font-size: 14px; white-space: nowrap; }
+.tabs a:hover { color: var(--ink); background: var(--raised); text-decoration: none; }
+.tabs a.on { color: var(--ink); background: var(--raised); box-shadow: inset 0 0 0 1px var(--line); }
+.badge { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  font-size: 11px; font-weight: 700; background: var(--wait); color: var(--wait-ink); }
+.bar-mid { flex: 1; display: flex; align-items: center; gap: 14px; min-width: 0; }
+.bar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.runchip { display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--line); font-size: 12.5px; color: var(--muted); white-space: nowrap; min-width: 0; }
+.runchip b { color: var(--ink); font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.runchip:hover { text-decoration: none; border-color: var(--line-2); }
+main.rv { max-width: 1280px; gap: 18px; padding-top: 22px; }
+.ph { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap; min-width: 0; }
+.ph h1 { font-size: 22px; font-weight: 680; letter-spacing: -.01em; overflow-wrap: anywhere; }
+.ph .sub { flex-basis: 100%; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+.crumbs { display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; font-size: 13px; color: var(--muted);
+  flex-basis: 100%; min-width: 0; }
+.crumbs a { color: var(--muted); } .crumbs a:hover { color: var(--ink); }
+.crumbs span { color: var(--faint); }
+.crumbs b { color: var(--ink); font-weight: 550; overflow-wrap: anywhere; }
+.rv .panel h2, .rv h2 { font-size: 14px; font-weight: 650; letter-spacing: 0; text-transform: none; color: var(--ink);
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rv h2 .muted { font-weight: 450; }
+.panel > .hd { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; }
+.panel.flush { padding: 0; gap: 0; overflow: hidden; }
+.panel.flush > .hd { padding: 14px 18px; border-bottom: 1px solid var(--line); }
+
+/* pills: one per state */
+.pill { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 9px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; line-height: 1; white-space: nowrap; border: 1px solid transparent;
+  vertical-align: middle; }
+.t-run { color: var(--run); background: var(--run-soft); }
+.t-wait { color: var(--wait); background: var(--wait-soft); }
+.t-bad { color: var(--bad); background: var(--bad-soft); }
+.t-ok { color: var(--ok); background: var(--ok-soft); }
+.t-off { color: var(--muted); background: var(--sunk); }
+.t-queued { color: var(--ink-2); border-color: var(--line-2); }
+.t-acc { color: var(--accent); background: var(--accent-soft); }
+.dot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+.pulse::before { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) { .pulse::before { animation: none; } }
+.sdot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
+.sdot.run { background: var(--run); box-shadow: 0 0 0 4px var(--run-soft); }
+.sdot.wait { background: var(--wait); }
+
+/* the stage strip: plan implement review fix push */
+.strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; list-style: none; padding: 0;
+  margin: 0; min-width: 0; }
+.strip li { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.strip i { display: block; height: 5px; border-radius: 3px; background: var(--line); }
+.strip span { font-size: 11px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.strip .done i { background: var(--ok); } .strip .done span { color: var(--muted); }
+.strip .skip i { background: var(--ok); opacity: .3; }
+.strip .off i { background: transparent; border: 1px dashed var(--line-2); height: 5px; }
+.strip .off span { text-decoration: line-through; }
+.strip .cur span { color: var(--ink); font-weight: 650; }
+.strip .cur.run i { background: var(--run); } .strip .cur.wait i { background: var(--wait); }
+.strip .cur.bad i { background: var(--bad); } .strip .cur.queued i { background: var(--ink-2); opacity: .55; }
+.strip .cur.stopped i { background: var(--muted); }
+.strip.big { gap: 6px; } .strip.big i { height: 7px; } .strip.big span { font-size: 12.5px; }
+.strip.big em { font-style: normal; font-size: 11.5px; color: var(--muted); }
+
+/* the queue's tickets */
+.tks { display: flex; flex-direction: column; }
+.tk { display: grid; grid-template-columns: 30px minmax(0, 1fr) minmax(200px, 320px) 64px 320px;
+  gap: 6px 18px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--line); min-width: 0; }
+.tk:first-child { border-top: 0; }
+.tk:hover { background: var(--hover); }
+.tk.wait { box-shadow: inset 3px 0 0 var(--wait); background: linear-gradient(90deg, var(--wait-soft), transparent 55%); }
+.tk.run { box-shadow: inset 3px 0 0 var(--run); }
+.tk .pos { color: var(--faint); font: 12px var(--mono); text-align: right; }
+.tk .main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.tk .key { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tk .key a { font: 650 14.5px var(--mono); color: var(--ink); }
+.tk .why { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tk.wait .why { color: var(--wait); }
+.tk .when { font-size: 12px; color: var(--muted); white-space: nowrap; text-align: right; }
+.ra { display: flex; gap: 4px; justify-content: flex-end; flex-wrap: wrap; }
+.ra form { margin: 0; }
+.empty { padding: 28px 18px; color: var(--muted); text-align: center; font-size: 14px; }
+
+/* buttons and fields */
+.btn, .panel button, .bar button, form button { display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 32px; padding: 0 12px; border-radius: 7px; border: 1px solid var(--line-2); background: var(--raised);
+  color: var(--ink); font: 550 13px/1 var(--sans); cursor: pointer; white-space: nowrap; text-decoration: none; }
+.btn:hover, form button:hover { background: var(--hover); border-color: var(--line-3); text-decoration: none; }
+form button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+form button.primary:hover, .btn.primary:hover { filter: brightness(1.1); background: var(--accent); }
+form button.danger { color: var(--bad); } form button.danger:hover { background: var(--bad-soft); border-color: var(--bad); }
+form button.warn { color: var(--wait); } form button.warn:hover { background: var(--wait-soft); border-color: var(--wait); }
+form button.sm, .btn.sm { height: 26px; padding: 0 8px; font-size: 12px; border-radius: 6px; }
+form button.ic { width: 26px; padding: 0; font-size: 12px; }
+form button:disabled { opacity: .4; cursor: default; }
+.panel input[type=text], .panel input[type=search], .panel input:not([type]), .panel select, .panel textarea,
+main input[type=search] { width: 100%; height: 34px; padding: 0 10px; background: var(--field); border: 1px solid var(--line-2);
+  border-radius: 7px; color: var(--ink); font: 14px var(--sans); }
+.panel textarea { height: auto; min-height: 84px; padding: 8px 10px; line-height: 1.5; resize: vertical; }
+.panel select { width: auto; padding-right: 6px; }
+.panel input:focus, .panel textarea:focus, .panel select:focus, main input[type=search]:focus { outline: none;
+  border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+::placeholder { color: var(--faint); }
+.fld { display: flex; flex-direction: column; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
+.fld small { font-weight: 400; color: var(--muted); font-size: 12px; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+fieldset { border: 0; padding: 0; margin: 0; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+legend { font-size: 13px; font-weight: 550; padding: 0; margin-bottom: 6px; }
+.presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.presets label { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border: 1px solid var(--line-2);
+  border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; min-width: 0; }
+.presets label small { font-weight: 400; color: var(--muted); font-size: 11.5px; line-height: 1.35; }
+.presets input { position: absolute; opacity: 0; pointer-events: none; }
+.presets label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.presets label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.checks { display: flex; gap: 6px; flex-wrap: wrap; }
+.checks label { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--line-2); font-size: 13px; cursor: pointer; }
+.checks label:has(input:checked) { border-color: var(--accent); color: var(--ink); background: var(--accent-soft); }
+.checks input, .opt input { accent-color: var(--accent); margin: 0; }
+.opt { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
+.opt small { display: block; color: var(--muted); font-size: 12px; }
+.formacts { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* the runner card */
+.runner { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px 24px; align-items: center; }
+.runner .state { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.runner .state h2 { font-size: 16px; }
+.runner .facts { grid-column: 1 / -1; }
+.runner .startf { display: flex; gap: 8px 16px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.kv { display: flex; gap: 6px 22px; flex-wrap: wrap; font-size: 13px; color: var(--muted); min-width: 0; }
+.kv b { color: var(--ink); font-weight: 550; overflow-wrap: anywhere; }
+.counts { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* lists of sessions */
+.runs li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 16px; padding: 10px 0;
   border-top: 1px solid var(--line); }
 .runs li:first-child { border-top: 0; }
 .runs a { font-weight: 550; overflow-wrap: anywhere; }
 .runs .meta { grid-column: 1 / -1; font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
-.runs .when { font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
-.live, .active, .done { display: inline-flex; align-items: center; gap: 6px; padding: 1px 9px; border-radius: 999px;
-  font-size: 12px; font-weight: 650; white-space: nowrap; }
-.live { color: var(--ok); background: var(--ok-soft); }
-.live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.active { color: var(--accent); background: var(--accent-soft); }
-.done { color: var(--muted); background: var(--sunk); }
-.ticket { border-top: 1px solid var(--line); padding-top: 10px; }
+.runs .when { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.tag { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 5px; background: var(--sunk);
+  border: 1px solid var(--line); font: 600 11.5px var(--mono); color: var(--ink-2); white-space: nowrap; vertical-align: middle; }
+.ses { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 14px; padding: 11px 0; border-top: 1px solid var(--line); }
+.ses:first-child { border-top: 0; }
+.ses .t { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.ses .t a { font-weight: 600; overflow-wrap: anywhere; }
+.ses .meta { grid-column: 1 / -1; font-size: 12px; color: var(--muted); display: flex; gap: 4px 14px; flex-wrap: wrap; }
+.ses .meta code { font-size: 11.5px; }
+.ticket { border-top: 1px solid var(--line); padding-top: 12px; }
 .ticket:first-of-type { border-top: 0; padding-top: 0; }
-.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 14px; font-size: 13px; margin: 0; }
-.facts dt { color: var(--muted); } .facts dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
-.msg { border-left: 3px solid var(--line); padding: 2px 0 2px 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.msg.user { border-left-color: var(--accent); }
-.msg .who { font-size: 12px; color: var(--muted); font-family: var(--mono); }
-.msg .who b { color: var(--ink); }
-.txt { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
-.msg.user .txt { background: var(--accent-soft); border-radius: 8px; padding: 8px 12px; }
-details.tool, details.think { background: var(--sunk); border-radius: 8px; padding: 6px 10px; min-width: 0; }
-details.think { background: transparent; border: 1px dashed var(--line); }
-details summary { cursor: pointer; font: 13px var(--mono); overflow-wrap: anywhere; }
+.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; font-size: 13px; margin: 0; }
+.facts dt { color: var(--muted); } .facts dd { margin: 0; font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+
+/* transcripts */
+#msgs { display: flex; flex-direction: column; gap: 12px; }
+.msg { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column;
+  gap: 10px; min-width: 0; background: var(--panel); }
+.msg.user { background: var(--user-soft); border-color: var(--user-line); }
+.msg .who { font: 12px var(--mono); color: var(--muted); display: flex; gap: 4px 8px; flex-wrap: wrap; align-items: center; }
+.msg .who b { color: var(--ink); font-family: var(--sans); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+.msg.user .who b { color: var(--user); }
+.msg.assistant .who b { color: var(--ok); }
+.txt { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; line-height: 1.55; }
+details.tool, details.think { background: var(--sunk); border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 11px; min-width: 0; }
+details.think { background: transparent; border-style: dashed; }
+details.think summary { color: var(--muted); font-style: italic; }
+details summary { cursor: pointer; font: 12.5px/1.6 var(--mono); overflow-wrap: anywhere; }
+details.tool summary b { color: var(--tool); font-weight: 650; }
 details summary .st { color: var(--muted); }
+details summary .ok { color: var(--ok); }
 details summary .bad { color: var(--bad); }
-pre.io { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 var(--mono); margin: 8px 0 0;
-  max-height: 480px; overflow: auto; background: var(--bg); border-radius: 6px; padding: 8px; }
+pre.io { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mono); margin: 8px 0 0;
+  max-height: 480px; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
 .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-top: 8px; }
-textarea { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 12px; width: 100%; min-height: 90px; resize: vertical; }
 .send { display: flex; flex-direction: column; gap: 8px; margin: 0; }
-.send button { align-self: flex-start; background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.send button { align-self: flex-start; }
 .inbox li { font: 12px var(--mono); color: var(--muted); padding: 3px 0; overflow-wrap: anywhere; }
 .inbox .bad { color: var(--bad); }
-.ask, .stop { display: inline-flex; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 650;
-  white-space: nowrap; }
-.ask { color: var(--accent-ink); background: var(--accent); }
-.stop { color: var(--bad); background: var(--bad-soft); }
 .diff .add { color: var(--ok); background: var(--ok-soft); display: inline-block; min-width: 100%; }
 .diff .del { color: var(--bad); background: var(--bad-soft); display: inline-block; min-width: 100%; }
 .diff .hunk { color: var(--accent); }
 .todos { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
 .todos li { display: grid; grid-template-columns: 1.2em minmax(0, 1fr); gap: 6px; overflow-wrap: anywhere; }
 .todos .completed { color: var(--muted); text-decoration: line-through; }
-.todos .in_progress { font-weight: 650; }
+.todos .in_progress { font-weight: 650; color: var(--run); }
 .todos .cancelled { color: var(--muted); }
-.qs { display: flex; flex-direction: column; gap: 10px; }
+
+/* the ticket page */
+.qs { display: flex; flex-direction: column; gap: 12px; }
+.qs label { display: flex; flex-direction: column; gap: 6px; }
 .qs .q { font-weight: 550; overflow-wrap: anywhere; }
-.qs .q.blocking::before { content: "blocking "; color: var(--bad); font-size: 12px; font-weight: 650; }
-.acts { display: flex; gap: 8px; flex-wrap: wrap; }
-.acts form { margin: 0; }
-.attempts li { padding: 6px 0; border-top: 1px solid var(--line); font-size: 13px; overflow-wrap: anywhere; }
-.attempts li:first-child { border-top: 0; }
-.attempts .failed, .attempts .blocked { color: var(--bad); font-weight: 650; }
-.attempts .passed { color: var(--ok); font-weight: 650; }
-.attempts ul { margin: 4px 0 0; padding-left: 18px; }
-.flash { background: var(--accent-soft); border-radius: 8px; padding: 8px 12px; margin: 0; }
-pre.qlog { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mono); margin: 0; max-height: 640px; overflow: auto; }
+.qs .q.blocking::before { content: "blocking"; color: var(--wait); background: var(--wait-soft); font-size: 11px;
+  font-weight: 700; padding: 1px 6px; border-radius: 4px; margin-right: 8px; vertical-align: 1px; }
+.acts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.acts form { margin: 0; display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; max-width: 100%; }
+.acts label { display: inline-flex; gap: 6px; align-items: center; }
+.acts .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
+.attempts { list-style: none; padding: 0; margin: 0; }
+.attempts > li { padding: 9px 0; border-top: 1px solid var(--line); font-size: 13px; overflow-wrap: anywhere;
+  display: flex; flex-direction: column; gap: 4px; }
+.attempts > li:first-child { border-top: 0; }
+.attempts .hd { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.attempts ul { margin: 0; padding-left: 18px; color: var(--ink-2); list-style: disc; }
+.notes { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; }
+.notes li { border-left: 3px solid var(--accent); background: var(--sunk); border-radius: 0 8px 8px 0; padding: 8px 12px;
+  font-size: 14px; }
+.notes .at { font-size: 11.5px; color: var(--muted); display: block; margin-bottom: 2px; }
+.notes .txt { font-size: 14px; }
+.flash { background: var(--ok-soft); color: var(--ink); border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent);
+  border-radius: 9px; padding: 10px 14px; margin: 0; overflow-wrap: anywhere; }
+.flash.bad { background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+pre.qlog { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 var(--mono); margin: 10px 0 0; max-height: 560px;
+  overflow: auto; background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+details.doc summary { font: 600 14px var(--sans); display: flex; align-items: center; gap: 8px; }
+details.doc summary .muted { font-weight: 400; }
+.wide { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 360px); gap: 18px; align-items: start; }
+.wide2 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 1020px) { .wide, .wide2 { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 1180px) {
+  .tk { grid-template-columns: 22px minmax(0, 1fr) auto; padding: 12px 14px; }
+  .tk .strip { grid-column: 2 / -1; grid-row: 2; max-width: 520px; }
+  .tk .when { grid-column: 3; grid-row: 1; align-self: start; }
+  .tk .ra { grid-column: 2 / -1; grid-row: 3; justify-content: flex-start; }
+}
+@media (max-width: 860px) {
+  .presets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .runner { grid-template-columns: minmax(0, 1fr); } .runner .startf { justify-content: flex-start; }
+}
+@media (max-width: 560px) {
+  .grid2 { grid-template-columns: minmax(0, 1fr); }
+  .runchip .rtxt { display: none; }
+  .tabs a { padding: 6px 8px; }
+  .bar-in { gap: 8px; }
+  .tk .pos { display: none; } .tk { grid-template-columns: minmax(0, 1fr) auto; }
+  .tk .strip, .tk .ra { grid-column: 1 / -1; } .tk .when { grid-column: 2; }
+  main.rv { padding-top: 16px; }
+  .panel { padding: 14px; }
+  .panel.flush > .hd { padding: 12px 14px; }
+}
 """
 
 
@@ -190,12 +412,16 @@ class Source:
 
 
 class Runs:
-    def __init__(self, sources, queue_dir="", vault=""):
+    def __init__(self, sources, queue_dir="", vault="", harness=""):
         """sources: (label, data dir) pairs; queue_dir: harness queue's state/queue;
-        vault: the active vault (the plans, reviews and answers are there)."""
+        vault: the active vault (the plans, reviews and answers are there);
+        harness: the harness script the Start button runs `queue run` with."""
         self.sources = [Source(label, d) for label, d in sources]
         self.queue_dir = queue_dir
         self.vault = vault
+        self.harness = harness or HARNESS
+        self.launched = None        # the `harness queue run` this viewer started: (Popen, started at)
+        self.launch_lock = threading.RLock()
 
     # --- reading -------------------------------------------------------------
 
@@ -336,7 +562,8 @@ class Runs:
 
     def ticket_state(self, key):
         """state.json, its fields checked: written by the queue, but a hand edit or
-        an old version must not take the page down."""
+        an old version must not take the page down. The owner's notes are read from
+        notes.json (only `note` writes it; state.json carries a copy)."""
         try:
             with open(os.path.join(self.queue_dir, key, "state.json"), encoding="utf-8") as f:
                 st = json.load(f)
@@ -344,8 +571,21 @@ class Runs:
             return {}
         if not isinstance(st, dict):
             return {}
-        out = {k: st[k] for k in ("status", "stage", "reason", "updated", "vault") if isinstance(st.get(k), str)}
+        out = {k: st[k] for k in ("status", "stage", "reason", "updated", "vault", "project", "base", "ref",
+                                  "sha", "created", "stopped_from") if isinstance(st.get(k), str)}
         out["attempt"] = st["attempt"] if isinstance(st.get("attempt"), int) else 0
+        out["plan_approved"] = st.get("plan_approved") is True
+        want = st.get("stages")
+        want = [s for s in want if isinstance(s, str)] if isinstance(want, list) and want else list(STAGES)
+        out["stages"] = [s for s in STAGES if s in want]
+        notes = st.get("notes")
+        try:
+            with open(os.path.join(self.queue_dir, key, "notes.json"), encoding="utf-8") as f:
+                notes = json.load(f)
+        except (OSError, ValueError):
+            pass
+        out["notes"] = [{"at": str(n.get("at", "")), "text": n["text"]} for n in
+                        (notes if isinstance(notes, list) else []) if isinstance(n, dict) and isinstance(n.get("text"), str)]
         qs = st.get("questions")
         out["questions"] = [{"text": q["text"], "blocking": bool(q.get("blocking"))} for q in
                             (qs if isinstance(qs, list) else []) if isinstance(q, dict) and isinstance(q.get("text"), str)]
@@ -356,6 +596,8 @@ class Runs:
                            "details": [x for x in h.get("details") or [] if isinstance(x, str)]
                            if isinstance(h.get("details"), list) else []}
                           for h in (hist if isinstance(hist, list) else []) if isinstance(h, dict)]
+        # the owner asked a running ticket to stop; the run has not got to it yet
+        out["stopping"] = out.get("status") == "running" and os.path.exists(os.path.join(self.queue_dir, key, "stop"))
         return out
 
     def vault_of(self, st):
@@ -460,90 +702,137 @@ class Runs:
             out.append((_ms(ts), sender, "waiting" if state == "json" else state, text))
         return sorted(out, reverse=True)
 
+    # --- the queue's runner and sessions ----------------------------------------
 
-# --- rendering ---------------------------------------------------------------
+    def ticket_sessions(self, key):
+        """Every top session run in the ticket's clone, from every source, archived
+        ones too, oldest first."""
+        out = []
+        for src in self.sources:
+            for r in self._query(src, "select s.id, s.parent_id, s.directory, s.title, s.agent, s.model, "
+                                      "s.time_created, s.time_updated, s.tokens_input, s.tokens_output, s.cost, "
+                                      "(select count(*) from session c where c.parent_id = s.id) as kids "
+                                      "from session s where s.parent_id is null and instr(s.directory, ?) > 0 "
+                                      "order by s.time_created limit 500", (key,)):
+                d = dict(r)
+                if self.ticket_of(d.get("directory") or "") == key:
+                    d["source"] = src
+                    out.append(d)
+        out.sort(key=lambda d: _ms(d["time_created"]))
+        return out
 
-def _status(runs, row, live, now=None):
-    now = now or time.time()
-    if row["id"] in live:
-        return "<span class='live'>live</span>"
-    if now - _ms(row["time_updated"]) / 1000 <= ACTIVE:
-        return "<span class='active'>active</span>"
-    return "<span class='done'>idle</span>"
+    def runner(self, now=None):
+        """What the queue's run is doing: run.json (the run beats it every few
+        seconds; a beat older than RUN_FRESH is a run that is gone), and the run this
+        viewer started, if any: "starting" until its first beat, or how it ended."""
+        now = now or time.time()
+        info = {}
+        try:
+            with open(os.path.join(self.queue_dir, "run.json"), encoding="utf-8") as f:
+                got = json.load(f)
+            if isinstance(got, dict):
+                info = got
+        except (OSError, ValueError):
+            pass
+        out = {k: info[k] for k in ("model", "ticket", "stage", "started") if isinstance(info.get(k), str)}
+        out.update(host=info.get("host") is True, single=info.get("single") is True)
+        beat = info.get("beat")
+        out["beat"] = beat if isinstance(beat, (int, float)) and not isinstance(beat, bool) else 0
+        out["pid"] = info.get("pid") if isinstance(info.get("pid"), int) else 0
+        out["running"] = bool(out["beat"]) and now - out["beat"] < RUN_FRESH
+        out["halting"] = out["running"] and os.path.exists(os.path.join(self.queue_dir, "halt"))
+        out["starting"] = False
+        out["exited"] = None
+        with self.launch_lock:
+            if self.launched:
+                proc, at = self.launched
+                rc = proc.poll()
+                if rc is None and not out["running"]:
+                    out["starting"] = True
+                    out["since"] = at
+                elif rc is not None and not out["running"] and now - at < 3600:
+                    out["exited"] = (rc, at)
+        return out
+
+    def runner_out(self, lines=12):
+        """The last lines `harness queue run` wrote to runner.out, when this viewer started it."""
+        try:
+            with open(os.path.join(self.queue_dir, "runner.out"), "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 16384))
+                text = f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+        text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+        return "\n".join([x for x in text.splitlines() if x.strip()][-lines:])
+
+    def start_runner(self, mode):
+        """Start `harness queue run` in the background, as its own process group with
+        no terminal. mode: container, host or single (single-message host mode).
+        Returns (ok, message)."""
+        if mode not in ("container", "host", "single"):
+            return False, "pick container, host or single-message mode"
+        if not self.queue_dir:
+            return False, "this viewer has no queue (pub.py --queue-dir)"
+        if not os.path.isfile(self.harness):
+            return False, f"no harness script at {self.harness} (pub.py --harness)"
+        bash = shutil.which("bash")
+        if not bash:
+            return False, "bash is not on PATH, so harness cannot run"
+        with self.launch_lock:
+            r = self.runner()
+            if r["running"]:
+                return False, "the queue is already running"
+            if self.launched and self.launched[0].poll() is None:
+                return False, "the queue is starting already"
+            argv = [bash, self.harness, "queue", "run"]
+            if mode == "host":
+                argv.append("--host")
+            elif mode == "single":
+                argv.append("--single-message")   # harness takes it for host mode too
+            env = dict(os.environ)
+            env["HARNESS_OPEN"] = "0"             # no browser tab: the owner is on this page
+            if mode != "container":
+                # Host mode asks for a yes on the terminal; there is none. The owner ticked
+                # the box that says the same thing on the queue page.
+                env["HARNESS_HOST_CONFIRM"] = "1"
+            parent = os.path.dirname(os.path.abspath(self.queue_dir))
+            if not env.get("HARNESS_INSTALL_ROOT") and os.path.basename(parent) == "state":
+                # the run must use the queue this page shows: <install root>/state/queue
+                env["HARNESS_INSTALL_ROOT"] = os.path.dirname(parent)
+            cwd = os.path.expanduser("~")
+            if not os.path.isdir(cwd):
+                cwd = parent
+            kw = {}
+            if os.name == "nt":
+                kw["creationflags"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                                       | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                kw["start_new_session"] = True
+            try:
+                os.makedirs(self.queue_dir, exist_ok=True)
+                with open(os.path.join(self.queue_dir, "runner.out"), "ab") as out:
+                    out.write(f"\n== {time.strftime('%Y-%m-%d %H:%M:%S')} started from the queue page: "
+                              f"harness queue run {' '.join(argv[4:])}\n".encode())
+                    out.flush()
+                    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                            cwd=cwd, env=env, **kw)
+            except OSError as e:
+                return False, f"cannot start harness: {e.strerror or e}"
+            self.launched = (proc, time.time())
+        # A run that fails its checks (no vault, no upstream login, no docker for
+        # container mode) ends within seconds; say why rather than "started".
+        for _ in range(30):
+            if proc.poll() is not None or self.runner()["running"]:
+                break
+            time.sleep(0.1)
+        if proc.poll() is not None:
+            last = self.runner_out(1)
+            return False, f"harness queue run ended at once (status {proc.returncode})" + (f": {last}" if last else "")
+        return True, "the queue run is starting" + (" in host mode" if mode != "container" else "")
 
 
-def _row(runs, row, live, extra="", now=None):
-    sid = row["id"]
-    title = row.get("title") or sid
-    kids = row.get("kids") or 0
-    meta = [esc(row["source"].label)]
-    if row.get("agent"):
-        meta.append("agent " + esc(row["agent"]))
-    model = _model_name(row.get("model"))
-    if model:
-        meta.append(esc(model))
-    if kids:
-        meta.append(f"{kids} subagent session{'s' if kids != 1 else ''}")
-    tok = _ms(row.get("tokens_input")) + _ms(row.get("tokens_output"))
-    if tok:
-        meta.append(f"{tok:,} tokens")
-    meta.append(esc(row.get("directory") or ""))
-    return (f"<li><span>{extra}<a href='/runs/{quote(sid)}'>{esc(title)}</a> {_status(runs, row, live, now)}</span>"
-            f"<span class='when'>{_ago(_ms(row['time_updated']), now)}</span>"
-            f"<span class='meta'>{' &middot; '.join(meta)}</span></li>")
-
-
-def render_list(runs, query=""):
-    now = time.time()
-    live = runs.live(now)
-    rows = runs.sessions()
-    q = query.lower()
-    if q:
-        rows = [r for r in rows if q in (r.get("title") or "").lower() or q in (r.get("directory") or "").lower()
-                or q in r["id"].lower()]
-    parts = ["<header class='top'><div class='crumbs'><a href='/'>harness</a><span>/</span><b>runs</b></div>"
-             f"<span class='chip'>{len(live)} live</span></header>"]
-    parts.append("<section class='panel'><form method='get' action='/runs' class='row'>"
-                 f"<input type='search' name='q' value='{esc(query)}' placeholder='filter by title, folder or id'>"
-                 "<button type='submit'>Filter</button></form>"
-                 "<div class='muted'>Every opencode session on this host: container agents, host mode, opencode "
-                 "web and queue stages. <b>live</b> is a headless run you can message; <b>active</b> was "
-                 "updated in the last 90 s. This page refreshes itself.</div></section>")
-    if not q:
-        parts += render_queue(runs)
-    live_rows = [r for r in rows if r["id"] in live]
-    if live_rows:
-        parts.append("<section class='panel'><h2>Live now</h2><ul class='runs'>")
-        parts += [_row(runs, r, live, now=now) for r in live_rows]
-        parts.append("</ul></section>")
-    tickets, other = {}, []
-    for r in rows:
-        key = runs.ticket_of(r.get("directory") or "")
-        if key:
-            tickets.setdefault(key, []).append(r)
-        else:
-            other.append(r)
-    if tickets:
-        parts.append("<section class='panel'><h2>Queue tickets</h2>")
-        for key in sorted(tickets, key=lambda k: -max(_ms(r["time_updated"]) for r in tickets[k])):
-            outs = runs.stage_outs(key)
-            parts.append(f"<div class='ticket'><a href='/runs/ticket/{quote(key)}'><b>{esc(key)}</b></a> "
-                         "<span class='muted'>queue log and stage outputs</span><ul class='runs'>")
-            for r in sorted(tickets[key], key=lambda r: _ms(r["time_created"])):
-                stage = runs.stage_of(key, _ms(r["time_created"]), outs) or "running"
-                parts.append(_row(runs, r, live, f"<code>{esc(stage)}</code> ", now))
-            parts.append("</ul></div>")
-        parts.append("</section>")
-    parts.append("<section class='panel'><h2>Sessions</h2>")
-    if other:
-        parts.append("<ul class='runs'>")
-        parts += [_row(runs, r, live, now=now) for r in other]
-        parts.append("</ul>")
-    else:
-        parts.append("<div class='muted'>No sessions" + (" match." if q else " yet.") + "</div>")
-    parts.append("</section>")
-    return parts
-
+# --- rendering: messages ------------------------------------------------------
 
 TODO_MARK = {"completed": "&#10003;", "in_progress": "&#9656;", "cancelled": "&#10007;"}
 
@@ -687,11 +976,873 @@ def render_messages(msgs, sid, start=0):
     return "".join(parts)
 
 
-def render_side(runs, src, row, live, sent="", todos=None):
+# --- rendering: shared pieces ---------------------------------------------------
+
+def _iso_ms(text):
+    """The queue's ISO UTC stamps (2026-01-02T03:04:05Z) as epoch ms, 0 if not one."""
+    try:
+        return calendar.timegm(time.strptime((text or "")[:19], "%Y-%m-%dT%H:%M:%S")) * 1000
+    except ValueError:
+        return 0
+
+
+def _sig(obj):
+    return hashlib.sha1(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+
+PILL = {"running": ("t-run dot pulse", "running"), "needs-answers": ("t-wait dot", "needs your answers"),
+        "plan-review": ("t-wait dot", "plan to approve"), "blocked": ("t-bad dot", "blocked"),
+        "done": ("t-ok dot", "done"), "stopped": ("t-off dot", "stopped"), "queued": ("t-queued", "queued")}
+TONE = {"running": "run", "needs-answers": "wait", "plan-review": "wait", "blocked": "bad", "stopped": "stopped",
+        "queued": "queued"}
+
+
+def _pill(status, stopping=False):
+    if stopping:
+        return "<span class='pill t-run dot'>stopping</span>"
+    cls, label = PILL.get(status, ("t-off", status or "?"))
+    return f"<span class='pill {cls}'>{esc(label)}</span>"
+
+
+def _status(runs, row, live, now=None):
+    now = now or time.time()
+    if row["id"] in live:
+        return "<span class='pill t-run dot pulse'>live</span>"
+    if now - _ms(row["time_updated"]) / 1000 <= ACTIVE:
+        return "<span class='pill t-acc dot'>active</span>"
+    return "<span class='pill t-off'>idle</span>"
+
+
+def _flash(msg, bad=False):
+    return f"<p class='flash{' bad' if bad else ''}' role='status'>{esc(msg)}</p>" if msg else ""
+
+
+def stage_strip(st, big=False):
+    """plan implement review fix push, each done, skipped, current (in the ticket's
+    status colour), still to do, or not one of the ticket's stages."""
+    stages, status, cur = st.get("stages") or list(STAGES), st.get("status", ""), st.get("stage", "")
+    last = {}
+    for h in st.get("history") or []:
+        last[h["stage"]] = h
+    done = status == "done" or cur == "done"
+    at = STAGES.index(cur) if cur in STAGES else (len(STAGES) if done else 0)
+    items = []
+    for i, s in enumerate(STAGES):
+        h = last.get(s)
+        if s not in stages:
+            cls, note = "off", "not in this ticket"
+        elif i < at:
+            cls, note = ("done", "passed") if h and h["result"] == "passed" else ("skip", "not needed" if s == "fix" else "skipped")
+        elif i == at:
+            cls = "cur " + TONE.get(status, "queued")
+            note = {"running": f"attempt {st.get('attempt', 0) + 1}", "queued": "next",
+                    "needs-answers": "questions", "plan-review": "to approve", "blocked": "blocked",
+                    "stopped": "stopped"}.get(status, status)
+        else:
+            cls, note = "todo", ""
+        em = f"<em>{esc(note)}</em>" if big and note else ""
+        items.append(f"<li class='{cls}' title='{esc(s)}{': ' + esc(note) if note else ''}'><i></i>"
+                     f"<span>{esc(s)}</span>{em}</li>")
+    return f"<ol class='strip{' big' if big else ''}' aria-label='stages'>{''.join(items)}</ol>"
+
+
+def nav(runs, active=""):
+    """The sticky bar's live part: tabs (Queue, with how many tickets wait on you;
+    Sessions) and the runner chip."""
+    waiting = 0
+    if runs.queue_dir:
+        for k in runs.ticket_keys():
+            if runs.ticket_state(k).get("status") in WAITING:
+                waiting += 1
+    badge = f" <span class='badge' title='waiting on you'>{waiting}</span>" if waiting else ""
+    def on(name):
+        return " class='on' aria-current='page'" if active == name else ""
+    tabs = (f"<div class='tabs'><a href='/runs/queue'{on('queue')}>Queue{badge}</a>"
+            f"<a href='/runs'{on('sessions')}>Sessions</a></div>")
+    chip = ""
+    if runs.queue_dir:
+        r = runs.runner()
+        if r["running"]:
+            what = "between tickets"
+            if r.get("ticket"):
+                what = f"{esc(r['ticket'])} &middot; {esc(r.get('stage') or '')}"
+            label = "halting" if r["halting"] else "running"
+            chip = (f"<a class='runchip' href='/runs/queue' title='the queue run'><span class='sdot run'></span>"
+                    f"<span class='rtxt'>{label} <b>{what}</b></span></a>")
+        elif r["starting"]:
+            chip = ("<a class='runchip' href='/runs/queue'><span class='sdot wait'></span>"
+                    "<span class='rtxt'>queue starting&hellip;</span></a>")
+        else:
+            chip = ("<a class='runchip' href='/runs/queue'><span class='sdot'></span>"
+                    "<span class='rtxt'>queue idle</span></a>")
+    return f"{tabs}<div class='bar-right'>{chip}</div>"
+
+
+def nav_bar(runs, active=""):
+    return ("<nav class='bar'><div class='bar-in'><a class='logo' href='/'>harness</a>"
+            f"<div id='r-nav' class='bar-mid'>{nav(runs, active)}</div></div></nav>")
+
+
+def _live_tag(url, sig):
+    return f"<span id='live' hidden data-live='{esc(url)}' data-sig='{esc(sig)}'></span>"
+
+
+def _row(runs, row, live, extra="", now=None):
+    sid = row["id"]
+    title = row.get("title") or sid
+    kids = row.get("kids") or 0
+    meta = [esc(row["source"].label)]
+    if row.get("agent"):
+        meta.append("agent " + esc(row["agent"]))
+    model = _model_name(row.get("model"))
+    if model:
+        meta.append(esc(model))
+    if kids:
+        meta.append(f"{kids} subagent session{'s' if kids != 1 else ''}")
+    tok = _ms(row.get("tokens_input")) + _ms(row.get("tokens_output"))
+    if tok:
+        meta.append(f"{tok:,} tokens")
+    meta.append(esc(row.get("directory") or ""))
+    return (f"<li><span>{extra}<a href='/runs/{quote(sid)}'>{esc(title)}</a> {_status(runs, row, live, now)}</span>"
+            f"<span class='when'>{_ago(_ms(row['time_updated']), now)}</span>"
+            f"<span class='meta'>{' &middot; '.join(meta)}</span></li>")
+
+
+def _stage_label(runs, key, row, st, outs):
+    """(stage, attempt) of a ticket session: the stage output written after it
+    started; none yet: the stage the ticket is running now."""
+    name = runs.stage_of(key, _ms(row["time_created"]), outs)
+    if name:
+        stage, _, n = name.partition("-")
+        return stage, int(n) + 1 if n.isdigit() else 0
+    if st.get("status") == "running":
+        return st.get("stage", ""), st.get("attempt", 0) + 1
+    return "", 0
+
+
+# --- /runs: every session ---------------------------------------------------------
+
+def _list_body(runs, query=""):
+    now = time.time()
+    live = runs.live(now)
+    rows = runs.sessions()
+    q = query.lower()
+    if q:
+        rows = [r for r in rows if q in (r.get("title") or "").lower() or q in (r.get("directory") or "").lower()
+                or q in r["id"].lower()]
+    parts = []
+    keys = runs.ticket_keys() if not q else []
+    if keys:
+        counts = {}
+        for k in keys:
+            s = runs.ticket_state(k).get("status", "")
+            counts[s] = counts.get(s, 0) + 1
+        bits = " ".join(f"{_pill(s)}<span class='muted'>&times;{n}</span>" for s, n in sorted(counts.items()))
+        parts.append("<section class='panel'><div class='hd'><h2>Queue</h2>"
+                     "<a class='btn sm' href='/runs/queue'>Open the queue &rarr;</a></div>"
+                     f"<div class='counts'>{bits}</div>"
+                     "<div class='muted'>A ticket waiting on you does not hold the queue: the run goes on to the "
+                     "next ticket, and takes this one again once you answer, approve or retry it.</div></section>")
+    live_rows = [r for r in rows if r["id"] in live]
+    if live_rows:
+        parts.append("<section class='panel'><h2>Live now</h2><ul class='runs'>")
+        parts += [_row(runs, r, live, now=now) for r in live_rows]
+        parts.append("</ul></section>")
+    tickets, other = {}, []
+    for r in rows:
+        key = runs.ticket_of(r.get("directory") or "")
+        if key:
+            tickets.setdefault(key, []).append(r)
+        else:
+            other.append(r)
+    if tickets:
+        parts.append("<section class='panel'><h2>Queue tickets</h2>")
+        for key in sorted(tickets, key=lambda k: -max(_ms(r["time_updated"]) for r in tickets[k])):
+            outs = runs.stage_outs(key)
+            st = runs.ticket_state(key)
+            parts.append(f"<div class='ticket'><div class='ph'><a href='/runs/ticket/{quote(key)}'><b>{esc(key)}</b></a>"
+                         f" {_pill(st.get('status', ''), st.get('stopping'))}</div><ul class='runs'>")
+            for r in sorted(tickets[key], key=lambda r: _ms(r["time_created"])):
+                stage, n = _stage_label(runs, key, r, st, outs)
+                tag = f"<span class='tag'>{esc(stage or '?')}{f' &middot; {n}' if n else ''}</span> "
+                parts.append(_row(runs, r, live, tag, now))
+            parts.append("</ul></div>")
+        parts.append("</section>")
+    parts.append("<section class='panel'><h2>Sessions</h2>")
+    if other:
+        parts.append("<ul class='runs'>")
+        parts += [_row(runs, r, live, now=now) for r in other]
+        parts.append("</ul>")
+    else:
+        parts.append("<div class='muted'>No sessions" + (" match." if q else " yet.") + "</div>")
+    parts.append("</section>")
+    return "".join(parts), len(live)
+
+
+def list_live(runs, query=""):
+    body, n = _list_body(runs, query)
+    regions = {"list": body, "nav": nav(runs, "sessions"), "count": f"{n} live"}
+    return {"sig": _sig(regions), "regions": regions}
+
+
+def render_list(runs, query=""):
+    d = list_live(runs, query)
+    url = "/runs/live" + (f"?q={quote(query)}" if query else "")
+    return [_live_tag(url, d["sig"]),
+            "<header class='ph'><h1>Sessions</h1>"
+            f"<span class='pill t-run dot' id='r-count'>{d['regions']['count']}</span>"
+            "<div class='sub'>Every opencode session on this host: container agents, host mode, opencode web "
+            "and queue stages. <b>live</b> is a headless run you can message; <b>active</b> was updated in the "
+            "last 90 s.</div></header>",
+            "<form method='get' action='/runs' class='row'>"
+            f"<input type='search' name='q' value='{esc(query)}' placeholder='filter by title, folder or id'>"
+            "<button type='submit'>Filter</button></form>",
+            f"<div id='r-list' class='stack'>{d['regions']['list']}</div>"]
+
+
+# --- /runs/queue ------------------------------------------------------------------
+
+def _hidden(name, value):
+    return f"<input type='hidden' name='{esc(name)}' value='{esc(value)}'>"
+
+
+def _btn(action, label, cls="", fields=(), confirm="", title="", disabled=False):
+    conf = f" data-confirm='{esc(confirm)}'" if confirm else ""
+    t = f" title='{esc(title)}' aria-label='{esc(title)}'" if title else ""
+    return (f"<form method='post' action='{esc(action)}'{conf}>{''.join(_hidden(k, v) for k, v in fields)}"
+            f"<button type='submit' class='{cls}'{t}{' disabled' if disabled else ''}>{label}</button></form>")
+
+
+STOPPABLE = ("queued", "needs-answers", "plan-review", "blocked", "running")
+RETRYABLE = ("blocked", "needs-answers", "stopped", "done")
+ANSWERABLE = ("needs-answers", "plan-review", "blocked", "queued", "stopped")
+
+
+def _why(st):
+    status = st.get("status", "")
+    if st.get("stopping"):
+        return "stopping: the run stops its agent within seconds"
+    if status == "running":
+        return f"{st.get('stage', '')}, attempt {st.get('attempt', 0) + 1}"
+    if status == "queued":
+        return st.get("reason") or f"waits for the run; starts at {st.get('stage', '')}"
+    if status == "done":
+        return st.get("reason") or (f"done at {st['sha'][:12]}" if st.get("sha") else "done")
+    return st.get("reason") or ""
+
+
+def _ticket_row(runs, key, st, i, n, now):
+    status = st.get("status", "")
+    base = f"/runs/ticket/{quote(key)}/"
+    back = (("back", "queue"),)
+    acts = [_btn(base + "move", "&uarr;", "sm ic", back + (("where", "up"),), title=f"Move {key} up",
+                 disabled=i == 0),
+            _btn(base + "move", "&darr;", "sm ic", back + (("where", "down"),), title=f"Move {key} down",
+                 disabled=i == n - 1)]
+    if status in ("needs-answers", "plan-review"):
+        acts.append(f"<a class='btn sm primary' href='/runs/ticket/{quote(key)}'>"
+                    f"{'Answer' if status == 'needs-answers' else 'Review plan'}</a>")
+    if status in STOPPABLE and not st.get("stopping"):
+        acts.append(_btn(base + "stop", "Stop", "sm warn", back,
+                         confirm=f"Stop {key}?" + (" Its agent is stopped now." if status == "running" else "")))
+    if status in RETRYABLE:
+        acts.append(_btn(base + "retry", "Retry", "sm", back))
+    acts.append(_btn(base + "remove", "Remove", "sm danger", back, disabled=status == "running",
+                     title="Stop it first" if status == "running" else "",
+                     confirm=f"Remove {key} from the queue? Its clone and stage outputs are deleted."))
+    tone = " wait" if status in WAITING else " run" if status == "running" else ""
+    proj = os.path.basename((st.get("project") or "").rstrip("/\\"))
+    tags = f"<span class='tag' title='{esc(st.get('project', ''))}'>{esc(proj)}</span>" if proj else ""
+    if st.get("ref"):
+        tags += f" <span class='tag' title='the work is at this ref'>{esc(st['ref'])}</span>"
+    when = _iso_ms(st.get("updated", ""))
+    return (f"<div class='tk{tone}'><span class='pos'>{i + 1}</span><div class='main'><div class='key'>"
+            f"<a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>{_pill(status, st.get('stopping'))}{tags}</div>"
+            f"<div class='why' title='{esc(_why(st))}'>{esc(_why(st)) or '&nbsp;'}</div></div>"
+            f"{stage_strip(st)}<span class='when'>{_ago(when, now) if when else ''}</span>"
+            f"<div class='ra'>{''.join(acts)}</div></div>")
+
+
+def _runner_card(runs, r, now):
+    parts = ["<section class='panel runner'>"]
+    if r["running"]:
+        mode = "host, single message" if r["single"] else "host" if r["host"] else "container"
+        what = (f"<a href='/runs/ticket/{quote(r['ticket'])}'>{esc(r['ticket'])}</a> &middot; {esc(r.get('stage', ''))}"
+                if r.get("ticket") and KEY_RE.match(r["ticket"]) else "between tickets")
+        started = _iso_ms(r.get("started", ""))
+        parts.append("<div class='state'><span class='sdot run'></span><h2>Queue running"
+                     + (" <span class='pill t-wait dot'>halting</span>" if r["halting"] else "") + "</h2></div>")
+        if not r["halting"]:
+            parts.append("<div class='startf'>" + _btn("/runs/queue/halt", "Halt the run", "warn", confirm=(
+                "Halt the queue run? The ticket it is on goes back to the queue at the same stage.")) + "</div>")
+        else:
+            parts.append("<div class='startf muted'>the run ends at its next check</div>")
+        parts.append(f"<div class='kv facts-row'><span>on <b>{what}</b></span><span>mode <b>{esc(mode)}</b></span>"
+                     + (f"<span>model <b>{esc(r['model'])}</b></span>" if r.get("model") else "")
+                     + (f"<span>since <b>{_ago(started, now)}</b></span>" if started else "")
+                     + f"<span>heartbeat <b>{_ago(r['beat'] * 1000, now)}</b></span>"
+                     + (f"<span>pid <b>{r['pid']}</b></span>" if r["pid"] else "") + "</div>")
+    elif r["starting"]:
+        parts.append("<div class='state'><span class='sdot wait'></span><h2>Queue starting&hellip;</h2></div>"
+                     "<div class='startf muted'>checks the vault, the upstream login and the proxy</div>")
+        out = runs.runner_out(6)
+        if out:
+            parts.append(f"<pre class='qlog facts-row'>{esc(out)}</pre>")
+    else:
+        parts.append("<div class='state'><span class='sdot'></span><div><h2>Queue not running</h2>"
+                     "<div class='muted'>Tickets wait until a run takes them, one at a time, in this order.</div>"
+                     "</div></div>")
+        parts.append("<form method='post' action='/runs/queue/start' class='startf' "
+                     "data-confirm-host='Host mode runs the agents as you, with no container and no firewall. Start?'>"
+                     "<div class='checks'><label><input type='radio' name='mode' value='container' checked> container</label>"
+                     "<label><input type='radio' name='mode' value='host'> host</label>"
+                     "<label><input type='radio' name='mode' value='single'> host, single message</label></div>"
+                     "<label class='opt'><input type='checkbox' name='confirm_host' value='1'>"
+                     "<span>host mode is OK<small>no container, no firewall</small></span></label>"
+                     "<button type='submit' class='primary'>Start the queue</button></form>")
+        if r["exited"]:
+            rc, at = r["exited"]
+            out = runs.runner_out(8)
+            parts.append(f"<div class='facts-row'><div class='flash bad'>The run started here {_ago(at * 1000, now)} "
+                         f"ended (status {rc}). <a href='/runs/queue/runner.out' target='_blank' rel='noopener'>"
+                         f"its output</a></div>" + (f"<pre class='qlog'>{esc(out)}</pre>" if out else "") + "</div>")
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def queue_live(runs):
+    now = time.time()
+    keys = runs.ticket_keys()
+    states = {k: runs.ticket_state(k) for k in keys}
+    counts = {}
+    for st in states.values():
+        counts[st.get("status", "")] = counts.get(st.get("status", ""), 0) + 1
+    order = ("running", "needs-answers", "plan-review", "blocked", "queued", "stopped", "done")
+    summary = " ".join(f"{_pill(s)}<span class='muted'>{counts[s]}</span>" for s in order if counts.get(s))
+    rows = [_ticket_row(runs, k, states[k], i, len(keys), now) for i, k in enumerate(keys)]
+    tickets = (f"<div class='hd'><h2>Tickets <span class='muted'>{len(keys)}</span></h2>"
+               f"<div class='counts'>{summary}</div></div>"
+               + (f"<div class='tks'>{''.join(rows)}</div>" if rows else
+                  "<div class='empty'>The queue is empty. Add tickets below.</div>"))
+    regions = {"runner": _runner_card(runs, runs.runner(now), now), "tickets": tickets, "nav": nav(runs, "queue")}
+    return {"sig": _sig(regions), "regions": regions}
+
+
+def _projects(runs):
+    """Project folders tickets were added with, newest first."""
+    seen = []
+    for k in sorted(runs.ticket_keys(), key=lambda k: -_iso_ms(runs.ticket_state(k).get("created", ""))):
+        p = runs.ticket_state(k).get("project")
+        if p and p not in seen:
+            seen.append(p)
+    return seen
+
+
+def add_form(runs):
+    projects = _projects(runs)
+    presets = "".join(f"<label><input type='radio' name='preset' value='{v}'{' checked' if v == 'full' else ''}>"
+                      f"{esc(lab)}<small>{esc(hint)}</small></label>" for v, lab, hint in PRESET_LABELS)
+    presets += ("<label><input type='radio' name='preset' value='custom'>Custom"
+                "<small>pick the stages below</small></label>")
+    checks = "".join(f"<label><input type='checkbox' name='stage_{s}' value='{s}' checked> {s}</label>" for s in STAGES)
+    opts = "".join(f"<option value='{esc(p)}'>" for p in projects)
+    return ("<section class='panel' id='add'><div class='hd'><h2>Add tickets</h2></div>"
+            "<form method='post' action='/runs/queue/add' id='addform' class='stack'>"
+            "<div class='grid2'>"
+            "<label class='fld'>Ticket keys<input name='keys' required autocomplete='off' spellcheck='false' "
+            "placeholder='ABC-123 ABC-124'><small>one or more, space or comma separated</small></label>"
+            f"<label class='fld'>Project folder<input name='project' required list='projects' spellcheck='false' "
+            f"value='{esc(projects[0] if projects else '')}' placeholder='/home/me/src/project'>"
+            f"<datalist id='projects'>{opts}</datalist><small>the git repository the work is in (absolute path)</small></label>"
+            "<label class='fld'>Base<input name='base' spellcheck='false' placeholder='the project&#39;s current branch'>"
+            "<small>branch or commit the work goes onto</small></label>"
+            "<label class='fld'>Existing work<input name='ref' spellcheck='false' placeholder='origin/ABC-123'>"
+            "<small>where a solution already is: the ticket branch starts there</small></label>"
+            "</div>"
+            f"<fieldset><legend>What still needs doing</legend><div class='presets'>{presets}</div>"
+            f"<div class='checks' id='stagechecks'>{checks}</div></fieldset>"
+            "<label class='fld'>Note for the agents<textarea name='note' maxlength='4000' "
+            "placeholder='Context every stage gets, e.g. the solution is on origin/ABC-3122; only the "
+            "review is left.'></textarea></label>"
+            "<div class='formacts'><button type='submit' class='primary'>Add to the queue</button>"
+            "<span class='muted' id='addhint'>Review without implement needs the existing work's ref.</span></div>"
+            "</form></section>")
+
+
+def render_queue_page(runs, msg="", bad=False):
+    d = queue_live(runs)
+    return [_live_tag("/runs/queue/live", d["sig"]),
+            "<header class='ph'><h1>Queue</h1><a class='btn sm' href='#add'>+ Add tickets</a>"
+            "<div class='sub'>The run works the tickets top down, one stage at a time. A ticket waiting on you "
+            "(questions, a plan to approve, blocked) does not hold the queue.</div></header>",
+            _flash(msg, bad),
+            f"<div id='r-runner'>{d['regions']['runner']}</div>",
+            f"<section class='panel flush' id='r-tickets'>{d['regions']['tickets']}</section>",
+            add_form(runs)]
+
+
+# --- /runs/ticket/KEY ---------------------------------------------------------------
+
+def _answer_form(key, qs):
+    parts = [f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"]
+    for i, q in enumerate(qs[:FORM_QUESTIONS]):
+        cls = "q blocking" if q.get("blocking") else "q"
+        parts.append(f"<label><div class='{cls}'>{esc(q['text'])}</div>"
+                     f"<input type='hidden' name='q{i}' value='{esc(q['text'])}'>"
+                     f"<textarea name='a{i}' placeholder='Your answer (leave empty to go with its default)'>"
+                     "</textarea></label>")
+    extra = "Anything else for the planner" if qs else "Your answers, or anything the planner should know"
+    if len(qs) > FORM_QUESTIONS:
+        extra = "Answers to the remaining questions, and anything else"
+    parts.append(f"<label><div class='q'>{extra}</div><textarea name='note'></textarea></label>"
+                 "<div class='acts'><button type='submit' class='primary'>Send answers and plan again</button>"
+                 "<button type='submit' name='defaults' value='1'>Go with the defaults</button></div></form>")
+    return "".join(parts)
+
+
+def _t_head(runs, key, st, pos, n):
+    status = st.get("status", "")
+    facts = []
+    if st.get("project"):
+        facts.append(f"<span>project <b>{esc(st['project'])}</b></span>")
+    if st.get("base"):
+        facts.append(f"<span>base <b>{esc(st['base'])}</b></span>")
+    if st.get("ref"):
+        facts.append(f"<span>work from <b>{esc(st['ref'])}</b></span>")
+    facts.append(f"<span>branch <b>{esc(key)}</b></span>")
+    if st.get("sha"):
+        facts.append(f"<span>commit <b>{esc(st['sha'][:12])}</b></span>")
+    if st.get("created"):
+        facts.append(f"<span>added <b>{esc(st['created'][:16].replace('T', ' '))}</b></span>")
+    upd = _iso_ms(st.get("updated", ""))
+    if upd:
+        facts.append(f"<span>updated <b>{_ago(upd)}</b></span>")
+    where = f"<span class='muted'>{pos} of {n} in the queue</span>" if pos else ""
+    return ("<header class='ph'><div class='crumbs'><a href='/runs/queue'>Queue</a><span>/</span>"
+            f"<b>{esc(key)}</b></div><h1>{esc(key)}</h1>{_pill(status, st.get('stopping'))}{where}"
+            f"<div class='sub'>{esc(_why(st))}</div></header>"
+            f"<section class='panel'>{stage_strip(st, True)}<div class='kv'>{''.join(facts)}</div></section>")
+
+
+def _t_acts(runs, key, st, rows, live, pos, n):
+    status = st.get("status", "")
+    base = f"/runs/ticket/{quote(key)}/"
+    parts = []
+    now_live = [r for r in rows if r["id"] in live]
+    if now_live:
+        r = max(now_live, key=lambda r: _ms(r["time_created"]))
+        parts.append(f"<a class='btn primary' href='/runs/{quote(r['id'])}'>Watch and message the agent &rarr;</a>")
+    if status == "plan-review":
+        parts.append(_btn(base + "approve", "Approve the plan", "primary"))
+    if status in RETRYABLE:
+        opts = "".join(f"<option value='{s}'{' selected' if s == st.get('stage') else ''}>{s}</option>"
+                       for s in STAGES)
+        label = {"blocked": "Retry", "needs-answers": "Plan again without answering", "stopped": "Resume",
+                 "done": "Run again"}[status]
+        parts.append(f"<form method='post' action='{base}retry'><button type='submit'>{label}</button>"
+                     f"<label class='muted'>from <select name='stage' aria-label='stage'><option value=''>"
+                     f"{'where it was' if status != 'done' else 'the start'}</option>{opts}</select></label></form>")
+    if status in STOPPABLE and not st.get("stopping"):
+        parts.append(_btn(base + "stop", "Stop", "warn", confirm=f"Stop {key}?" + (
+            " Its agent is stopped now; Resume takes it again." if status == "running" else "")))
+    if pos:
+        parts.append("<span class='sep'></span>")
+        for where, label in (("top", "Top"), ("up", "Up"), ("down", "Down"), ("bottom", "Bottom")):
+            dis = (pos == 1 and where in ("top", "up")) or (pos == n and where in ("down", "bottom"))
+            parts.append(_btn(base + "move", label, "sm", (("where", where),), disabled=dis,
+                              title=f"Move {key} {where}"))
+    parts.append("<span class='sep'></span>")
+    parts.append(_btn(base + "remove", "Remove", "sm danger", disabled=status == "running",
+                      title="Stop it first: its agent is working in the clone" if status == "running" else "",
+                      confirm=f"Remove {key}? Its clone, outputs and log are deleted."))
+    return f"<div class='acts'>{''.join(parts)}</div>"
+
+
+def _t_questions(runs, key, st):
+    status = st.get("status", "")
+    qs = st.get("questions") or []
+    vault = runs.vault_of(st)
+    if status in WAITING and vault:
+        head = "Questions for you" if qs else "Answer the planner"
+        intro = ("The plan is waiting on the blocking questions. Answer what you can; an empty box takes the "
+                 "question's default. The ticket is planned again with your answers." if status == "needs-answers"
+                 else "Answering sends the ticket back to plan with your answers.")
+        return (f"<section class='panel'><h2>{head}</h2><div class='muted'>{intro}</div>"
+                f"{_answer_form(key, qs)}</section>")
+    if qs:
+        items = "".join(f"<li><div class='{'q blocking' if q.get('blocking') else 'q'}'>{esc(q['text'])}</div>"
+                        f"<div class='muted'>{'waiting on you' if q.get('blocking') else 'going with the default'}"
+                        "</div></li>" for q in qs)
+        return f"<section class='panel'><h2>Questions</h2><ul class='qs'>{items}</ul></section>"
+    return ""
+
+
+def _t_sessions(runs, key, st, rows, live, outs, now):
+    parts = [f"<h2>Sessions <span class='muted'>{len(rows)}</span></h2>"]
+    if not rows:
+        parts.append("<div class='muted'>No session for this ticket in the opencode databases yet.</div>")
+        return "".join(parts)
+    for r in reversed(rows):
+        stage, n = _stage_label(runs, key, r, st, outs)
+        created, updated = _ms(r["time_created"]), _ms(r["time_updated"])
+        meta = [f"<span>{esc(r['source'].label)}</span>"]
+        model = _model_name(r.get("model"))
+        if model:
+            meta.append(f"<span>{esc(model)}</span>")
+        meta.append(f"<span>started {esc(_when(created))}</span>")
+        if updated > created:
+            meta.append(f"<span>{'ran' if r['id'] not in live else 'running'} {_dur(updated - created)}</span>")
+        if r.get("kids"):
+            meta.append(f"<span>{r['kids']} subagent{'s' if r['kids'] != 1 else ''}</span>")
+        tok = _ms(r.get("tokens_input")) + _ms(r.get("tokens_output"))
+        if tok:
+            meta.append(f"<span>{tok:,} tokens</span>")
+        tag = f"<span class='tag'>{esc(stage or '?')}{f' &middot; {n}' if n else ''}</span>"
+        parts.append(f"<div class='ses'><div class='t'>{tag}<a href='/runs/{quote(r['id'])}'>"
+                     f"{esc(r.get('title') or r['id'])}</a>{_status(runs, r, live, now)}</div>"
+                     f"<span class='when'>{_ago(updated, now)}</span><div class='meta'>{''.join(meta)}</div></div>")
+    return "".join(parts)
+
+
+def _t_attempts(key, st, names):
+    hist = st.get("history") or []
+    parts = [f"<h2>Attempts <span class='muted'>{len(hist)}</span></h2>"]
+    if not hist:
+        parts.append("<div class='muted'>No attempt has finished yet. Older tickets keep theirs in the queue log.</div>")
+        return "".join(parts)
+    parts.append("<ul class='attempts'>")
+    linked = set()   # a retried stage writes <stage>-N.out again: link only its newest attempt
+    tone = {"passed": "t-ok", "failed": "t-bad", "blocked": "t-bad", "stopped": "t-off", "halted": "t-off"}
+    for h in reversed(hist):
+        stage, n, res = h["stage"], h["attempt"], h["result"]
+        out = f"{stage}-{n - 1}.out"
+        link = ""
+        if out in names and out not in linked:
+            linked.add(out)
+            link = f"<a href='/runs/ticket/{quote(key)}/{quote(out)}' target='_blank' rel='noopener'>output</a>"
+        parts.append(f"<li><div class='hd'><span class='pill {tone.get(res, 't-off')}'>{esc(res)}</span>"
+                     f"<span class='tag'>{esc(stage)}</span><span>attempt {n}</span>"
+                     f"<span class='muted'>{esc(h['at'][:16].replace('T', ' '))}</span>{link}</div>")
+        if h["details"]:
+            parts.append("<ul>" + "".join(f"<li>{esc(x)}</li>" for x in h["details"]) + "</ul>")
+        parts.append("</li>")
+    parts.append("</ul>")
+    return "".join(parts)
+
+
+def _t_notes(key, st):
+    notes = st.get("notes") or []
+    parts = [f"<h2>Notes <span class='muted'>{len(notes)}</span></h2>"]
+    if notes:
+        parts.append("<ul class='notes'>" + "".join(
+            f"<li><span class='at'>{esc(n['at'][:16].replace('T', ' '))}</span><div class='txt'>{esc(n['text'])}</div></li>"
+            for n in reversed(notes)) + "</ul>")
+    else:
+        parts.append("<div class='muted'>Context for the agents: every stage from now on gets your notes.</div>")
+    parts.append(f"<form method='post' action='/runs/ticket/{quote(key)}/note' class='send'>"
+                 "<textarea name='text' required maxlength='4000' placeholder='e.g. the fix is on origin/ABC-3122; "
+                 "keep the public API as it is'></textarea><button type='submit'>Add note</button></form>")
+    return "".join(parts)
+
+
+def _t_outs(key, outs, now):
+    parts = ["<h2>Stage outputs</h2>"]
+    if not outs:
+        return parts[0] + "<div class='muted'>None yet.</div>"
+    parts.append("<ul class='runs'>")
+    for name, mtime, size in reversed(outs):
+        parts.append(f"<li><span><a href='/runs/ticket/{quote(key)}/{quote(name)}' target='_blank' "
+                     f"rel='noopener'>{esc(name)}</a></span><span class='when'>{_ago(mtime * 1000, now)}</span>"
+                     f"<span class='meta'>{size:,} bytes</span></li>")
+    parts.append("</ul>")
+    return "".join(parts)
+
+
+def _t_docs(runs, key, st, log):
+    vault = runs.vault_of(st)
+    parts = []
+    for kind, label in (("plan", "Plan"), ("answers", "Your answers"), ("review", "Review"), ("findings", "Findings")):
+        text = runs.note(key, kind, vault)
+        if text.strip():
+            parts.append(f"<section class='panel'><details class='doc' data-k='{kind}'><summary>{label}"
+                         f"<span class='muted'>{len(text.splitlines())} lines</span></summary>"
+                         f"<pre class='qlog'>{esc(_cap(text)[0])}</pre></details></section>")
+    text = log[-60000:] if log.strip() else "no log yet"
+    parts.append("<section class='panel'><details class='doc' data-k='log'><summary>Queue log"
+                 f"<span class='muted'>{len(log.splitlines())} lines</span></summary>"
+                 f"<pre class='qlog'>{esc(text)}</pre></details></section>")
+    return "".join(parts)
+
+
+def ticket_live(runs, key):
+    """The ticket page's regions, or None when the ticket is gone."""
+    if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
+        return None
+    try:
+        with open(os.path.join(runs.queue_dir, key, "log.md"), encoding="utf-8", errors="replace") as f:
+            log = f.read()
+    except OSError:
+        log = ""
+    now = time.time()
+    live = runs.live(now)
+    outs = runs.stage_outs(key)
+    st = runs.ticket_state(key)
+    rows = runs.ticket_sessions(key)
+    order = runs.ticket_keys()
+    try:
+        with open(os.path.join(runs.queue_dir, "queue.list"), encoding="utf-8") as f:
+            listed = f.read().split()
+    except OSError:
+        listed = []
+    pos = listed.index(key) + 1 if key in listed else 0
+    n = len([k for k in listed if k in order])
+    regions = {"head": _t_head(runs, key, st, pos, n), "acts": _t_acts(runs, key, st, rows, live, pos, n),
+               "qs": _t_questions(runs, key, st), "sessions": _t_sessions(runs, key, st, rows, live, outs, now),
+               "attempts": _t_attempts(key, st, {o[0] for o in outs}), "notes": _t_notes(key, st),
+               "outs": _t_outs(key, outs, now), "docs": _t_docs(runs, key, st, log), "nav": nav(runs, "queue")}
+    return {"sig": _sig(regions), "regions": regions}
+
+
+def render_ticket(runs, key, msg="", bad=False):
+    d = ticket_live(runs, key)
+    if d is None:
+        return None
+    g = d["regions"]
+    return key, [_live_tag(f"/runs/ticket/{quote(key)}/live", d["sig"]),
+                 f"<div id='r-head' class='stack'>{g['head']}</div>", _flash(msg, bad),
+                 f"<section class='panel' id='r-acts'>{g['acts']}</section>",
+                 f"<div id='r-qs'>{g['qs']}</div>",
+                 "<div class='wide'><div class='stack'>"
+                 f"<section class='panel' id='r-sessions'>{g['sessions']}</section>"
+                 f"<section class='panel' id='r-attempts'>{g['attempts']}</section>"
+                 f"<div id='r-docs' class='stack'>{g['docs']}</div></div>"
+                 f"<div class='stack'><section class='panel' id='r-notes'>{g['notes']}</section>"
+                 f"<section class='panel' id='r-outs'>{g['outs']}</section></div></div>"]
+
+
+# --- actions ------------------------------------------------------------------------
+
+TICKET_ACTIONS = ("answer", "approve", "retry", "stop", "remove", "move", "note")
+QUEUE_ACTIONS = ("add", "start", "halt")
+
+
+def _one(form, name):
+    v = form.get(name) or ""
+    return (v[0] if isinstance(v, list) and v else v if isinstance(v, str) else "")
+
+
+def answer_text(form):
+    """The answers note from the ticket page's form, or "" when nothing was answered."""
+    def one(name):
+        return _one(form, name).strip()
+    out = []
+    for i in range(FORM_QUESTIONS):
+        q, a = one(f"q{i}"), one(f"a{i}")
+        if a:
+            out.append(f"## {q or 'Question ' + str(i + 1)}\n\n{a}")
+    if one("note"):
+        out.append(f"## Other\n\n{one('note')}")
+    if not out and not one("defaults"):
+        return ""
+    out.append("Any question not answered here: go with its default.")
+    return "\n\n".join(out)
+
+
+def ref_ok(ref):
+    """A branch, tag, remote-tracking ref or commit: nothing an option, a range or
+    revision syntax could hide in."""
+    return bool(REF_RE.match(ref)) and ".." not in ref and "//" not in ref and not ref.endswith(("/", ".lock", "."))
+
+
+def _queue(runs, args, text=None):
+    """Run the queue script (argv, never a shell); (ok, its last line)."""
+    cmd = [sys.executable, QUEUE_SCRIPT, "--state", runs.queue_dir] + args
+    try:
+        p = subprocess.run(cmd, input=(text or "").encode("utf-8"), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"the queue did not answer: {e}"
+    out = p.stdout.decode("utf-8", "replace")
+    lines = [x for x in out.splitlines() if x.strip()]
+    if p.returncode and ("invalid choice" in out or "unrecognized arguments" in out):
+        return False, (f"this harness's queue does not have that command yet ({args[0]}); "
+                       "update harness: " + (lines[-1] if lines else ""))
+    if p.returncode:
+        bad = [x.replace("[queue] ", "", 1) for x in lines if "[queue]" in x] or lines
+        return False, "; ".join(bad[-3:]) or f"the queue exited with status {p.returncode}"
+    return True, "; ".join(x.replace("[queue] ", "", 1) for x in lines[-3:])
+
+
+def ticket_action(runs, key, action, form):
+    """A ticket's button, through the queue script as harness queue does it.
+    Returns (ok, message)."""
+    if not KEY_RE.match(key or "") or key not in runs._ticket_dirs() or action not in TICKET_ACTIONS:
+        return False, "no such ticket or action"
+    st = runs.ticket_state(key)
+    status = st.get("status") or "gone"
+    again = "; reload its page"
+    if action == "answer":
+        vault = runs.vault_of(st)
+        if not vault:
+            return False, "no vault is set, so there is nowhere to keep the answers"
+        if status not in ANSWERABLE:   # sent twice, or answered elsewhere since the page was loaded
+            return False, f"{key} is {status} now, not waiting on answers{again}"
+        text = answer_text(form)
+        if not text:
+            return False, "nothing to send: answer a question, or choose Go with the defaults"
+        return _queue(runs, ["answer", key, "--vault", vault, "--stdin"], text)
+    if action == "approve":
+        if status != "plan-review":
+            return False, f"{key} is {status}, not a plan waiting for approval{again}"
+        return _queue(runs, ["approve", key])
+    if action == "retry":
+        stage = _one(form, "stage")
+        if stage and stage not in STAGES:
+            return False, "not a stage: " + stage[:40]
+        if status not in RETRYABLE:
+            return False, f"{key} is {status}; only a blocked, stopped, done or waiting ticket is retried{again}"
+        return _queue(runs, ["retry", key] + (["--stage", stage] if stage else []))
+    if action == "stop":
+        if status not in STOPPABLE:
+            return False, f"{key} is {status}; there is nothing to stop"
+        return _queue(runs, ["stop", key])
+    if action == "remove":
+        if status == "running":   # its agent is working in the clone the remove deletes
+            return False, f"{key} is running; stop it first{again}"
+        return _queue(runs, ["remove", key])
+    if action == "move":
+        where = _one(form, "where")
+        if where not in MOVES:
+            return False, "move takes up, down, top or bottom"
+        return _queue(runs, ["move", key, where])
+    text = _one(form, "text").replace("\r\n", "\n")   # note
+    if not text.strip():
+        return False, "the note is empty"
+    if len(text) > NOTE_MAX:
+        return False, f"the note is over {NOTE_MAX} characters"
+    return _queue(runs, ["note", key, "--stdin"], text)
+
+
+def add_tickets(runs, form):
+    """The queue page's Add form: harness queue add, its values checked first."""
+    raw = _one(form, "keys")
+    keys = [k.upper() for k in re.split(r"[\s,;]+", raw) if k]
+    if not keys:
+        return False, "give at least one ticket key"
+    if len(keys) > MAX_KEYS:
+        return False, f"at most {MAX_KEYS} tickets at a time"
+    bad = [k for k in keys if not KEY_RE.match(k) or len(k) > 40]
+    if bad:
+        return False, "not a ticket key (like ABC-123): " + ", ".join(bad[:5])[:200]
+    project = _one(form, "project").strip()
+    if not project or not os.path.isabs(project) or not os.path.isdir(project):
+        return False, "the project folder must be an absolute path to a folder that exists"
+    base, ref = _one(form, "base").strip(), _one(form, "ref").strip()
+    for name, v in (("base", base), ("existing work", ref)):
+        if v and not ref_ok(v):
+            return False, f"{name}: not a branch, tag or commit name: {v[:80]}"
+    preset = _one(form, "preset") or "full"
+    if preset in PRESETS:
+        stages = list(PRESETS[preset])
+    elif preset == "custom":
+        stages = [s for s in STAGES if _one(form, "stage_" + s)]
+    else:
+        return False, "not a preset: " + preset[:40]
+    if not stages:
+        return False, "pick at least one stage"
+    if "fix" in stages and "review" not in stages:
+        return False, "fix runs only after a review asks for fixes; pick review too"
+    if "implement" not in stages and any(s in stages for s in ("review", "fix", "push")) and not ref:
+        return False, "with no implement stage, give the existing work's ref (e.g. origin/ABC-123) to review"
+    note = _one(form, "note").replace("\r\n", "\n")
+    if len(note) > ADD_NOTE_MAX:
+        return False, f"the note is over {ADD_NOTE_MAX} characters"
+    args = ["add", *keys, f"--project={project}", "--stages=" + ",".join(stages)]
+    if base:
+        args.append(f"--base={base}")
+    if ref:
+        args.append(f"--ref={ref}")
+    if note.strip():
+        args.append(f"--note={note}")
+    return _queue(runs, args)
+
+
+def queue_action(runs, action, form):
+    if not runs.queue_dir or action not in QUEUE_ACTIONS:
+        return False, "no queue, or no such action"
+    if action == "add":
+        return add_tickets(runs, form)
+    if action == "halt":
+        return _queue(runs, ["halt"])
+    mode = _one(form, "mode") or "container"
+    if mode in ("host", "single") and _one(form, "confirm_host") != "1":
+        return False, ("host mode runs the agents as you, with no container and no firewall: tick "
+                       "'host mode is OK' to start it")
+    return runs.start_runner(mode)
+
+
+def session_stop(runs, sid):
+    """The Stop button of a queue stage's session: stop its ticket. (ok, message)."""
+    src, row = runs.find(sid)
+    if not row:
+        return False, "no such session"
+    root = runs.root_of(src, row) or row
+    key = runs.ticket_of(root.get("directory") or "")
+    if not key:
+        return False, ("this is not a queue stage; stop a harness -p run from its terminal, "
+                       "and an interactive one from opencode")
+    return ticket_action(runs, key, "stop", {})
+
+
+def ticket_file(runs, key, name):
+    if not KEY_RE.match(key or "") or not OUT_RE.match(name or "") or key not in runs._ticket_dirs():
+        return None
+    try:
+        with open(os.path.join(runs.queue_dir, key, name), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def live_summary(runs):
+    """The index's panel: live runs, linked."""
+    live = runs.live()
+    rows = [r for r in runs.sessions(limit=100) if r["id"] in live]
+    parts = ["<section class='panel'><h2>Agent runs</h2>"]
+    if rows:
+        parts.append("<ul class='runs'>")
+        now = time.time()
+        parts += [_row(runs, r, live, now=now) for r in rows]
+        parts.append("</ul>")
+    else:
+        parts.append("<div class='muted'>No headless run is working right now.</div>")
+    parts.append("<a href='/runs/queue'>The queue</a> &middot; "
+                 "<a href='/runs'>All sessions, transcripts and queue stages &rarr;</a></section>")
+    return parts
+
+
+# --- /runs/<session> ------------------------------------------------------------
+
+def render_side(runs, src, row, live, sent="", todos=None, oc_url=""):
     sid = row["id"]
     now = time.time()
-    root = runs.root_of(src, row)
+    root = runs.root_of(src, row) or row
     parts = []
+    key = runs.ticket_of(root.get("directory") or "")
+    if key:
+        st = runs.ticket_state(key)
+        stage, n = _stage_label(runs, key, root, st, None)
+        working = root["id"] in live or now - _ms(root.get("time_updated")) / 1000 <= ACTIVE
+        parts.append(f"<div class='ph'><span class='muted'>Queue ticket</span>"
+                     f"<a href='/runs/ticket/{quote(key)}'><b>{esc(key)}</b></a>"
+                     f"{_pill(st.get('status', ''), st.get('stopping'))}"
+                     + (f"<span class='tag'>{esc(stage)}{f' &middot; {n}' if n else ''}</span>" if stage else "")
+                     + "</div>")
+        if st.get("status") == "running" and working and not st.get("stopping"):
+            parts.append(_btn(f"/runs/{quote(sid)}/stop", "Stop this stage", "warn", confirm=(
+                f"Stop {key}? Its agent is stopped and the ticket is held; Resume on its page takes it again.")))
+    if oc_url:
+        parts.append(f"<a class='btn' href='{esc(oc_url)}' target='_blank' rel='noreferrer'>Open in opencode web</a>")
     if sid in live:
         parts.append(_send_form(sid, sent))
     if todos:
@@ -710,14 +1861,9 @@ def render_side(runs, src, row, live, sent="", todos=None):
         elif v:
             parts.append(f"<dt>{k}</dt><dd>{esc(str(v))}</dd>")
     parts.append("</dl>")
-    key = runs.ticket_of(row.get("directory") or "")
-    if key:
-        stage = runs.stage_of(key, _ms(root.get("time_created"))) or "running"
-        parts.append(f"<div>Queue ticket <a href='/runs/ticket/{quote(key)}'><b>{esc(key)}</b></a>, "
-                     f"stage <code>{esc(stage)}</code></div>")
     kids = runs.children(src, sid)
     if kids:
-        parts.append("<h2>Subagent sessions</h2><ul class='runs'>")
+        parts.append(f"<h2>Subagent sessions <span class='muted'>{len(kids)}</span></h2><ul class='runs'>")
         for k in kids:
             parts.append(f"<li><span><a href='/runs/{quote(k['id'])}'>{esc(k.get('title') or k['id'])}</a></span>"
                          f"<span class='when'>{_ago(_ms(k['time_updated']), now)}</span>"
@@ -749,15 +1895,121 @@ def _send_form(sid, sent=""):
     return ("<h2>Message the agent</h2>"
             f"<form method='post' action='/runs/{quote(sid)}/send' class='send'>"
             "<textarea name='text' required placeholder='Steer it, answer it, or tell it to stop: the agent "
-            "reads this at its next step.'></textarea><button type='submit'>Send</button></form>"
+            "reads this at its next step.'></textarea><button type='submit' class='primary'>Send</button></form>"
             + (f"<div class='muted'>{esc(sent)}</div>" if sent else ""))
 
 
+# Every runs page: a form or button with data-confirm asks first; the add form's
+# presets tick their stages; a ?done= flash is not shown again on reload.
+COMMON_JS = """
+(function () {
+  document.addEventListener('submit', function (e) {
+    var f = e.target, m = f.getAttribute('data-confirm');
+    if (!m && f.getAttribute('data-confirm-host')) {
+      var md = f.querySelector('input[name=mode]:checked');
+      if (md && md.value !== 'container') m = f.getAttribute('data-confirm-host');
+    }
+    if (m && !window.confirm(m)) { e.preventDefault(); return; }
+    var b = e.submitter || f.querySelector('button[type=submit]');
+    if (b) setTimeout(function () { b.disabled = true; }, 0);
+  }, true);
+  if (/[?&]done=/.test(location.search) && history.replaceState)
+    history.replaceState(null, '', location.pathname + location.hash);
+  var add = document.getElementById('addform');
+  if (add) {
+    var presets = %PRESETS%;
+    var checks = add.querySelectorAll('input[name^=stage_]');
+    var hint = document.getElementById('addhint');
+    function sync() {
+      var on = [], ref = add.querySelector('input[name=ref]').value.trim();
+      checks.forEach(function (c) { if (c.checked) on.push(c.value); });
+      var need = on.indexOf('implement') < 0 && (on.indexOf('review') >= 0 || on.indexOf('push') >= 0);
+      hint.textContent = need && !ref ? 'Review without implement needs the existing work\\u2019s ref.' :
+        on.length ? 'Stages: ' + on.join(' \\u2192 ') : 'Pick at least one stage.';
+      hint.className = need && !ref || !on.length ? 'err' : 'muted';
+    }
+    add.addEventListener('change', function (e) {
+      var t = e.target;
+      if (t.name === 'preset' && presets[t.value])
+        checks.forEach(function (c) { c.checked = presets[t.value].indexOf(c.value) >= 0; });
+      else if (t.name && t.name.indexOf('stage_') === 0) {
+        var on = [];
+        checks.forEach(function (c) { if (c.checked) on.push(c.value); });
+        var hit = 'custom';
+        Object.keys(presets).forEach(function (k) { if (presets[k].join() === on.join()) hit = k; });
+        var r = add.querySelector('input[name=preset][value=' + hit + ']');
+        if (r) r.checked = true;
+      }
+      sync();
+    });
+    add.addEventListener('input', sync);
+    sync();
+  }
+})();
+""".replace("%PRESETS%", json.dumps({k: list(v) for k, v in PRESETS.items()}))
+
+# The queue, ticket and sessions pages: poll the page's live JSON every 3 s and
+# swap the regions that changed. A region with a field being typed in (or edited
+# and not sent) is left alone until it is not; open <details> stay open. No
+# polling while the tab is hidden.
+LIVE_JS = """
+(function () {
+  var tag = document.getElementById('live');
+  if (!tag) return;
+  var url = tag.getAttribute('data-live'), sig = tag.getAttribute('data-sig'), last = {}, timer = null, fails = 0;
+  function dirty(r) {
+    var a = document.activeElement;
+    if (a && a !== document.body && r.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return true;
+    var f = r.querySelectorAll('input, textarea, select');
+    for (var i = 0; i < f.length; i++) {
+      var x = f[i];
+      if (x.type === 'hidden' || x.type === 'submit') continue;
+      if (x.type === 'checkbox' || x.type === 'radio') { if (x.checked !== x.defaultChecked) return true; }
+      else if (x.tagName === 'SELECT') {
+        for (var j = 0; j < x.options.length; j++) if (x.options[j].selected !== x.options[j].defaultSelected) return true;
+      } else if (x.value !== x.defaultValue) return true;
+    }
+    return false;
+  }
+  function apply(regions) {
+    Object.keys(regions).forEach(function (k) {
+      var r = document.getElementById('r-' + k), h = regions[k];
+      if (!r || last[k] === h || dirty(r)) return;
+      var open = {};
+      r.querySelectorAll('details[data-k]').forEach(function (d) { open[d.getAttribute('data-k')] = d.open; });
+      r.innerHTML = h;
+      last[k] = h;
+      r.querySelectorAll('details[data-k]').forEach(function (d) {
+        var n = d.getAttribute('data-k');
+        if (n in open) d.open = open[n];
+      });
+    });
+  }
+  function later(ms) { clearTimeout(timer); timer = document.hidden ? null : setTimeout(tick, ms); }
+  function tick() {
+    timer = null;
+    if (document.hidden) return;
+    fetch(url, {credentials: 'same-origin', cache: 'no-store'}).then(function (r) {
+      if (!r.ok) throw new Error(r.status);
+      return r.json();
+    }).then(function (d) {
+      fails = 0;
+      if (d.gone) { location.replace(d.gone); return; }
+      if (d.sig === sig) { if (!last.seeded) { last = d.regions || {}; last.seeded = 1; } }
+      else { sig = d.sig; apply(d.regions || {}); }
+      later(3000);
+    }).catch(function () { fails++; later(fails > 3 ? 15000 : 6000); });
+  }
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) later(200); });
+  later(3000);
+})();
+"""
+
 POLL_JS = """
 (function () {
-  var box = document.getElementById('msgs'), side = document.getElementById('side');
+  var box = document.getElementById('msgs'), side = document.getElementById('side'), nav = document.getElementById('r-nav');
   if (!box) return;
-  var url = box.getAttribute('data-tail'), follow = box.getAttribute('data-follow'), idle = 0, last = '';
+  var url = box.getAttribute('data-tail'), follow = box.getAttribute('data-follow'), idle = 0, last = '', navLast = nav ? nav.innerHTML : '';
   function nearBottom() { return window.innerHeight + window.scrollY >= document.body.scrollHeight - 160; }
   function tick() {
     if (document.hidden) { setTimeout(tick, 3000); return; }
@@ -773,10 +2025,13 @@ POLL_JS = """
           if (+m.getAttribute('data-i') >= d.from) m.remove();
         });
         box.insertAdjacentHTML('beforeend', d.html);
+        var none = document.getElementById('nomsg');
+        if (none && d.count) none.remove();
         if (stick) window.scrollTo(0, document.body.scrollHeight);
       }
       var ta = side.querySelector('textarea');
       if (!ta || (!ta.value && document.activeElement !== ta)) side.innerHTML = d.side;
+      if (nav && d.nav && d.nav !== navLast) { nav.innerHTML = d.nav; navLast = d.nav; }
       idle = d.working ? 0 : idle + 1;
       // Following a queue: once this stage's session is done, go to the next one.
       if (follow && !d.working) {
@@ -809,42 +2064,37 @@ FOLLOW_JS = """
 })();
 """
 
-LIST_JS = """
-(function () {
-  function again() {
-    var a = document.activeElement;
-    if (document.hidden || (a && a.tagName === 'INPUT')) setTimeout(again, 5000); else location.reload();
-  }
-  setTimeout(again, 10000);
-})();
-"""
+LIST_JS = LIVE_JS
 
 
-def render_detail(runs, sid, sent="", follow=""):
+def render_detail(runs, sid, sent="", follow="", oc_url=None, msg="", bad=False):
     """(title, body parts, script) or None. follow: a follow query (follow_query) to
-    move on to once this session is done."""
+    move on to once this session is done. oc_url: a function giving the session's
+    opencode web link from its source label, or None."""
     src, row = runs.find(sid)
     if not row:
         return None
     live = runs.live()
     msgs = runs.messages(src, sid)
-    crumbs = ["<a href='/'>harness</a><span>/</span><a href='/runs'>runs</a>"]
+    crumbs = ["<a href='/runs'>Sessions</a>"]
     key = runs.ticket_of(row.get("directory") or "")
     if key:
-        crumbs.append(f"<span>/</span><a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>")
+        crumbs = [f"<a href='/runs/queue'>Queue</a><span>/</span><a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>"]
     for p in runs.chain(src, row):
         crumbs.append(f"<span>/</span><a href='/runs/{quote(p['id'])}'>{esc(p.get('title') or p['id'])}</a>")
     title = row.get("title") or sid
-    parts = [f"<header class='top'><div class='crumbs'>{''.join(crumbs)}<span>/</span><b>{esc(title)}</b></div>"
-             f"<a class='chip' href='/runs/{quote(sid)}.json' target='_blank' rel='noopener'>JSON</a></header>",
-             "<div class='cols'><div class='stack'><section class='panel'>"
+    link = oc_url(src.label, sid) if oc_url else ""
+    parts = [f"<header class='ph'><div class='crumbs'>{''.join(crumbs)}</div><h1>{esc(title)}</h1>"
+             f"{_status(runs, row, live)}<a class='btn sm' href='/runs/{quote(sid)}.json' target='_blank' "
+             "rel='noopener'>JSON</a></header>", _flash(msg, bad),
+             "<div class='cols'><div class='stack'>"
              f"<div id='msgs' data-sid='{esc(sid)}' data-tail='/runs/{quote(sid)}/tail'"
              + (f" data-follow='/runs/follow.json?{esc(follow)}'" if follow else "")
              + f">{render_messages(msgs, sid)}</div>"
-             + ("" if msgs else "<div class='muted'>No messages yet.</div>") +
-             "<span id='end'></span></section></div>",
-             f"<div class='stack'><section class='panel' id='side'>{render_side(runs, src, row, live, sent, todos_of(msgs))}"
-             "</section></div></div>"]
+             + ("" if msgs else "<div class='panel muted' id='nomsg'>No messages yet.</div>") +
+             "<span id='end'></span></div>",
+             f"<div class='stack'><section class='panel' id='side'>"
+             f"{render_side(runs, src, row, live, sent, todos_of(msgs), link)}</section></div></div>"]
     return title, parts, POLL_JS
 
 
@@ -881,15 +2131,14 @@ def follow_target(runs, since=0, queue=False):
 def render_follow(follow, queue):
     """The page a launch opens before its agent's session exists."""
     what = "the queue's next stage" if queue else "the agent"
-    return ("<header class='top'><div class='crumbs'><a href='/'>harness</a><span>/</span>"
-            "<a href='/runs'>runs</a><span>/</span><b>waiting</b></div></header>"
-            f"<section class='panel' id='wait' data-follow='/runs/follow.json?{esc(follow)}'"
+    return (f"<section class='panel' id='wait' data-follow='/runs/follow.json?{esc(follow)}'"
             + (" data-jump='1'" if queue else "") +
-            f"><h2>Waiting for {what} to start&hellip;</h2><div class='muted'>This page opens its "
-            "session as soon as it starts. <a href='/runs'>All sessions</a></div></section>")
+            f"><div class='ph'><span class='sdot run'></span><h1>Waiting for {what} to start&hellip;</h1></div>"
+            "<div class='muted'>This page opens its session as soon as it starts. "
+            "<a href='/runs'>All sessions</a> &middot; <a href='/runs/queue'>the queue</a></div></section>")
 
 
-def tail(runs, sid, start):
+def tail(runs, sid, start, oc_url=None):
     src, row = runs.find(sid)
     if not row:
         return None
@@ -898,9 +2147,11 @@ def tail(runs, sid, start):
     start = max(0, min(start, len(msgs)))
     working = sid in live or time.time() - _ms(row.get("time_updated")) / 1000 <= ACTIVE
     body = render_messages(msgs, sid, start)
-    side = render_side(runs, src, row, live, todos=todos_of(msgs))
+    side = render_side(runs, src, row, live, todos=todos_of(msgs), oc_url=oc_url(src.label, sid) if oc_url else "")
+    bar = nav(runs, "queue" if runs.ticket_of(row.get("directory") or "") else "sessions")
     sig = hashlib.sha1(f"{start}:{len(msgs)}:{body}:{side}".encode()).hexdigest()
-    return {"from": start, "count": len(msgs), "html": body, "sig": sig, "working": working, "side": side}
+    return {"from": start, "count": len(msgs), "html": body, "sig": sig, "working": working, "side": side,
+            "nav": bar}
 
 
 def export(runs, sid):
@@ -927,256 +2178,3 @@ def part_text(runs, sid, pid):
     if out is None:
         out = p.get("text", "")
     return out if isinstance(out, str) else json.dumps(out, indent=2, ensure_ascii=False)
-
-
-PILL = {"needs-answers": ("ask", "needs your answers"), "plan-review": ("ask", "plan to approve"),
-        "blocked": ("stop", "blocked"), "running": ("live", "running"), "done": ("done", "done"),
-        "queued": ("done", "queued")}
-
-
-def _pill(status):
-    cls, label = PILL.get(status, ("done", status or "?"))
-    return f"<span class='{cls}'>{esc(label)}</span>"
-
-
-def render_queue(runs):
-    """The /runs panel: every queue ticket, its stage and what it is waiting on."""
-    keys = runs.ticket_keys()
-    if not keys:
-        return []
-    parts = ["<section class='panel'><h2>Queue</h2><ul class='runs'>"]
-    for key in keys:
-        st = runs.ticket_state(key)
-        status = st.get("status", "")
-        what = st.get("reason") or ""
-        if status == "running":
-            what = f"attempt {st.get('attempt', 0) + 1}"
-        parts.append(f"<li><span><a href='/runs/ticket/{quote(key)}'><b>{esc(key)}</b></a> {_pill(status)} "
-                     f"<code>{esc(st.get('stage', ''))}</code></span><span class='when'>"
-                     f"{esc((st.get('updated') or '')[:16].replace('T', ' '))}</span>"
-                     f"<span class='meta'>{esc(what)}</span></li>")
-    parts.append("</ul><div class='muted'>A ticket waiting on you (questions, a plan to approve, blocked) does not "
-                 "hold the queue: the run goes on to the next ticket, and takes this one again once you answer, "
-                 "approve or retry it on its page.</div></section>")
-    return parts
-
-
-def _answer_form(key, qs):
-    parts = [f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"]
-    for i, q in enumerate(qs[:FORM_QUESTIONS]):
-        cls = "q blocking" if q.get("blocking") else "q"
-        parts.append(f"<label><div class='{cls}'>{esc(q['text'])}</div>"
-                     f"<input type='hidden' name='q{i}' value='{esc(q['text'])}'>"
-                     f"<textarea name='a{i}' placeholder='Your answer (leave empty to go with its default)'>"
-                     "</textarea></label>")
-    extra = "Anything else for the planner" if qs else "Your answers, or anything the planner should know"
-    if len(qs) > FORM_QUESTIONS:
-        extra = "Answers to the remaining questions, and anything else"
-    parts.append(f"<label><div class='q'>{extra}</div><textarea name='note'></textarea></label>"
-                 "<div class='acts'><button type='submit'>Send answers and plan again</button>"
-                 "<button type='submit' name='defaults' value='1'>Go with the defaults</button></div></form>")
-    return "".join(parts)
-
-
-def _act(key, action, label):
-    return (f"<form method='post' action='/runs/ticket/{quote(key)}/{action}'>"
-            f"<button type='submit'>{esc(label)}</button></form>")
-
-
-def render_ticket(runs, key, msg=""):
-    if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
-        return None
-    d = os.path.join(runs.queue_dir, key)
-    try:
-        with open(os.path.join(d, "log.md"), encoding="utf-8", errors="replace") as f:
-            log = f.read()
-    except OSError:
-        log = ""
-    live = runs.live()
-    now = time.time()
-    outs = runs.stage_outs(key)
-    names = {n for n, _, _ in outs}
-    st = runs.ticket_state(key)
-    status = st.get("status", "")
-    rows = [r for r in runs.sessions(limit=2000) if runs.ticket_of(r.get("directory") or "") == key]
-    parts = ["<header class='top'><div class='crumbs'><a href='/'>harness</a><span>/</span><a href='/runs'>runs</a>"
-             f"<span>/</span><b>{esc(key)}</b></div>{_pill(status)}</header>"]
-    if msg:
-        parts.append(f"<p class='flash'>{esc(msg)}</p>")
-    parts.append("<div class='cols'><div class='stack'>")
-
-    # what it is doing, or what it waits on
-    parts.append(f"<section class='panel'><h2>Status</h2><dl class='facts'><dt>status</dt><dd>{esc(status or '?')}</dd>"
-                 f"<dt>stage</dt><dd>{esc(st.get('stage', ''))}</dd>")
-    if status == "running":
-        parts.append(f"<dt>attempt</dt><dd>{st.get('attempt', 0) + 1}</dd>")
-    if st.get("reason"):
-        parts.append(f"<dt>why</dt><dd>{esc(st['reason'])}</dd>")
-    parts.append("</dl>")
-    now_live = [r for r in rows if r["id"] in live]
-    if now_live:
-        r = max(now_live, key=lambda r: _ms(r["time_created"]))
-        parts.append(f"<p><a href='/runs/{quote(r['id'])}'>Watch and message the running agent &rarr;</a></p>")
-    acts = []
-    if status == "plan-review":
-        acts.append(_act(key, "approve", "Approve the plan"))
-    if status == "blocked":
-        acts.append(_act(key, "retry", "Retry from " + (st.get("stage") or "the start")))
-    elif status == "needs-answers":
-        acts.append(_act(key, "retry", "Plan again without answering"))
-    if acts:
-        parts.append("<div class='acts'>" + "".join(acts) + "</div>")
-    parts.append("</section>")
-
-    # the planner's questions
-    qs = st["questions"] if st else []
-    vault = runs.vault_of(st)
-    if status in WAITING and vault:
-        head = "Questions for you" if qs else "Answer the planner"
-        parts.append(f"<section class='panel'><h2>{head}</h2>")
-        if status == "needs-answers":
-            parts.append("<div class='muted'>The plan is waiting on the blocking questions. Answer what you can; "
-                         "an empty box takes the question's default. The ticket is planned again with your "
-                         "answers.</div>")
-        else:
-            parts.append("<div class='muted'>Answering sends the ticket back to plan with your answers.</div>")
-        parts.append(_answer_form(key, qs) + "</section>")
-    elif qs:
-        parts.append("<section class='panel'><h2>Questions</h2><ul class='qs'>")
-        parts += [f"<li><div class='{'q blocking' if q.get('blocking') else 'q'}'>{esc(q['text'])}</div>"
-                  f"<div class='muted'>{'waiting on you' if q.get('blocking') else 'going with the default'}"
-                  "</div></li>" for q in qs]
-        parts.append("</ul></section>")
-
-    # each attempt and why it failed
-    hist = st.get("history") or []
-    parts.append("<section class='panel'><h2>Attempts</h2>")
-    if hist:
-        parts.append("<ul class='attempts' style='list-style:none;padding:0;margin:0'>")
-        linked = set()   # a retried stage writes <stage>-N.out again: link only its newest attempt
-        for h in reversed(hist):
-            stage, n, res = h["stage"], h["attempt"], h["result"]
-            out = f"{stage}-{n - 1}.out"
-            link = ""
-            if out in names and out not in linked:
-                linked.add(out)
-                link = f" <a href='/runs/ticket/{quote(key)}/{quote(out)}' target='_blank' rel='noopener'>output</a>"
-            parts.append(f"<li><span class='{esc(res)}'>{esc(res)}</span> <code>{esc(stage)}</code> attempt {n} "
-                         f"<span class='muted'>{esc(h['at'][:16].replace('T', ' '))}</span>{link}")
-            det = h["details"]
-            if det:
-                parts.append("<ul>" + "".join(f"<li>{esc(x)}</li>" for x in det) + "</ul>")
-            parts.append("</li>")
-        parts.append("</ul>")
-    else:
-        parts.append("<div class='muted'>No attempt has finished yet. Older tickets keep theirs in the queue "
-                     "log below.</div>")
-    parts.append("</section>")
-
-    for kind, label in (("plan", "Plan"), ("answers", "Your answers"), ("review", "Review")):
-        text = runs.note(key, kind, vault)
-        if text.strip():
-            parts.append(f"<section class='panel'><details><summary><b>{label}</b></summary>"
-                         f"<pre class='qlog'>{esc(_cap(text)[0])}</pre></details></section>")
-    parts.append("<section class='panel'><details><summary><b>Queue log</b></summary>"
-                 f"<pre class='qlog'>{esc(log) if log.strip() else 'no log yet'}</pre></details></section>")
-
-    parts.append("</div><div class='stack'><section class='panel'><h2>Stage sessions</h2>")
-    if rows:
-        parts.append("<ul class='runs'>")
-        for r in sorted(rows, key=lambda r: _ms(r["time_created"])):
-            stage = runs.stage_of(key, _ms(r["time_created"]), outs) or "running"
-            parts.append(_row(runs, r, live, f"<code>{esc(stage)}</code> ", now))
-        parts.append("</ul>")
-    else:
-        parts.append("<div class='muted'>No sessions for this ticket in the opencode databases.</div>")
-    parts.append("</section><section class='panel'><h2>Stage outputs</h2>")
-    if outs:
-        parts.append("<ul class='runs'>")
-        for name, mtime, size in outs:
-            parts.append(f"<li><span><a href='/runs/ticket/{quote(key)}/{quote(name)}' target='_blank' "
-                         f"rel='noopener'>{esc(name)}</a></span><span class='when'>{_ago(mtime * 1000, now)}</span>"
-                         f"<span class='meta'>{size:,} bytes</span></li>")
-        parts.append("</ul>")
-    else:
-        parts.append("<div class='muted'>None yet.</div>")
-    parts.append("</section></div></div>")
-    return key, parts
-
-
-TICKET_ACTIONS = ("answer", "approve", "retry")
-
-
-def answer_text(form):
-    """The answers note from the ticket page's form, or "" when nothing was answered."""
-    def one(name):
-        v = form.get(name) or ""
-        return (v[0] if isinstance(v, list) and v else v if isinstance(v, str) else "").strip()
-    out = []
-    for i in range(FORM_QUESTIONS):
-        q, a = one(f"q{i}"), one(f"a{i}")
-        if a:
-            out.append(f"## {q or 'Question ' + str(i + 1)}\n\n{a}")
-    if one("note"):
-        out.append(f"## Other\n\n{one('note')}")
-    if not out and not one("defaults"):
-        return ""
-    out.append("Any question not answered here: go with its default.")
-    return "\n\n".join(out)
-
-
-def ticket_action(runs, key, action, form):
-    """Answer, approve or retry a ticket through the queue script, as harness queue
-    does. Returns (ok, message)."""
-    if not KEY_RE.match(key or "") or key not in runs._ticket_dirs() or action not in TICKET_ACTIONS:
-        return False, "no such ticket or action"
-    cmd = [sys.executable, QUEUE_SCRIPT, "--state", runs.queue_dir, action, key]
-    text = None
-    if action == "answer":
-        st = runs.ticket_state(key)
-        vault = runs.vault_of(st)
-        if not vault:
-            return False, "no vault is set, so there is nowhere to keep the answers"
-        if st.get("status") not in WAITING:   # sent twice, or answered elsewhere since the page was loaded
-            return False, f"{key} is {st.get('status') or 'gone'} now, not waiting on answers; reload its page"
-        text = answer_text(form)
-        if not text:
-            return False, "nothing to send: answer a question, or choose Go with the defaults"
-        cmd += ["--vault", vault, "--stdin"]
-    try:
-        p = subprocess.run(cmd, input=(text or "").encode("utf-8"), stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return False, f"the queue did not answer: {e}"
-    lines = [x for x in p.stdout.decode("utf-8", "replace").splitlines() if x.strip()]
-    last = (lines[-1] if lines else "").replace("[queue] ", "", 1)
-    if p.returncode:
-        return False, last or f"the queue exited with status {p.returncode}"
-    return True, (last + ". A running 'harness queue run' takes it after its current ticket; "
-                  "otherwise start one.")
-
-
-def ticket_file(runs, key, name):
-    if not KEY_RE.match(key or "") or not OUT_RE.match(name or "") or key not in runs._ticket_dirs():
-        return None
-    try:
-        with open(os.path.join(runs.queue_dir, key, name), "rb") as f:
-            return f.read()
-    except OSError:
-        return None
-
-
-def live_summary(runs):
-    """The index's panel: live runs, linked."""
-    live = runs.live()
-    rows = [r for r in runs.sessions(limit=100) if r["id"] in live]
-    parts = ["<section class='panel'><h2>Agent runs</h2>"]
-    if rows:
-        parts.append("<ul class='runs'>")
-        now = time.time()
-        parts += [_row(runs, r, live, now=now) for r in rows]
-        parts.append("</ul>")
-    else:
-        parts.append("<div class='muted'>No headless run is working right now.</div>")
-    parts.append("<a href='/runs'>All sessions, transcripts and queue stages &rarr;</a></section>")
-    return parts

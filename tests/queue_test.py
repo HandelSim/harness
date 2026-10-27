@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import ticket_queue as tq  # noqa: E402
@@ -33,17 +34,31 @@ vault = os.environ["FAKE_VAULT"]
 log = open(os.environ["FAKE_CALLS"], "a")
 if args and args[0] == "queue":
     log.write("queue " + args[1] + "\n")
+    if args[1] == "_stop_agents":
+        log.write("stop-agents " + args[2] + "\n")
+        print(os.environ.get("FAKE_STOPPED", "1"))
+        sys.exit(int(os.environ.get("FAKE_STOP_RC", "0")))
     if args[1] == "_pull":
         os.makedirs(os.path.join(vault, ".raw", "tickets"), exist_ok=True)
         open(os.path.join(vault, ".raw", "tickets", args[2] + ".md"), "w").write(os.environ["FAKE_TICKET"])
     sys.exit(0)
 prompt = args[-1]
-if os.environ.get("FAKE_SLEEP"):
-    import time
-    time.sleep(int(os.environ["FAKE_SLEEP"]))
 assert "--ticket" in args and "-p" in args and "--yolo" in args, args
+ticket = args[args.index("--ticket") + 1]
+task = os.path.join(vault, "wiki", "notes", "tickets", ticket + "-task.md")
+pointer = re.search(r"Your full instructions for the \w+ stage of ticket \S+ are in (\S+?)\. Read it first", prompt)
+if pointer:   # the short prompt of a long one on Windows: the agent reads the task file
+    open(os.environ["FAKE_CALLS"] + ".pointer", "a").write(prompt + "\n=====\n")
+    prompt = open(pointer.group(1), encoding="utf-8").read()
+same = os.path.exists(task) and open(task, encoding="utf-8").read() == prompt
+open(os.environ["FAKE_CALLS"] + ".task", "a").write(f"{ticket} {same}\n")
 stage = re.match(r"You are (\w+)", prompt).group(1)
+if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == ticket:
+    import time
+    open(os.environ["FAKE_CALLS"] + ".sleeping", "a").write(ticket + "\n")
+    time.sleep(int(os.environ["FAKE_SLEEP"]))
 log.write(stage + " " + " ".join(a for a in args[:-1]) + "\n")
+open(os.environ["FAKE_CALLS"] + "." + stage, "a").write(prompt + "\n=====\n")
 def path(label):
     p = re.search(label + r" (\S+?)[ )\n]", prompt).group(1)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -185,8 +200,10 @@ class Base(unittest.TestCase):
         os.environ.update(FAKE_VAULT=self.vault, FAKE_CALLS=self.calls, FAKE_TICKET=TICKET)
         FakeProxy.mode = "ok"
         FakeProxy.seen = []
+        self.pauses, tq.INFRA_RETRY_PAUSES = tq.INFRA_RETRY_PAUSES, (0, 0)
 
     def tearDown(self):
+        tq.INFRA_RETRY_PAUSES = self.pauses
         os.environ.clear()
         os.environ.update(self.env_keep)
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -338,7 +355,7 @@ class QueueTest(Base):
             finally:
                 tq.os.name = keep
             self.assertEqual(got, "/c/Users/me/vault/a.md")
-            self.assertEqual(host, "C:\\Users\\me\\vault\\a.md")
+            self.assertEqual(host, "C:/Users/me/vault/a.md")   # opencode takes /; JSON needs no escapes
 
     def test_no_commit_is_retried_once_then_blocked(self):
         os.environ["FAKE_NO_COMMIT"] = "1"
@@ -557,6 +574,8 @@ class ReviewFixesTest(Base):
         self.assertEqual(rc, 0, out)
         self.assertIn("the verifier request failed", self.status()["reason"])
         self.assertEqual(self.status("ABC-2")["status"], "blocked")
+        # A 400 is the request's own fault: asked once per ticket, not again.
+        self.assertEqual(len([p for _, _, p in FakeProxy.seen if "check a" in p]), 2)
 
     def test_an_error_blocks_the_ticket_and_the_queue_goes_on(self):
         keep = tq.PROMPT_MAX_BYTES
@@ -650,6 +669,630 @@ class ReviewFixesTest(Base):
         text = tq.render("plan", TICKET="the {{PLAN}} macro", PLAN="SECRET PLAN")
         self.assertIn("the {{PLAN}} macro", text)
         self.assertEqual(text.count("SECRET PLAN"), 1)
+
+
+class OwnerControlTest(Base):
+    """Stages, an existing ref, owner notes, stop, halt, move, status and retry --stage."""
+
+    def git_p(self, *a):
+        return sh("git", "-C", self.project, *a).strip()
+
+    def feature_branch(self):
+        """origin/feat: a commit adding feature.txt, only on the remote and as a
+        remote-tracking ref; main has moved on since it branched."""
+        self.git_p("checkout", "-q", "-b", "feat")
+        put(os.path.join(self.project, "feature.txt"), "hello feature\n")
+        self.git_p("add", "feature.txt")
+        self.git_p("commit", "-q", "-m", "feat: hello")
+        feat = self.git_p("rev-parse", "HEAD")
+        self.git_p("push", "-q", "origin", "feat")
+        self.git_p("checkout", "-q", "main")
+        self.git_p("branch", "-q", "-D", "feat")
+        fork = self.git_p("rev-parse", "HEAD")
+        put(os.path.join(self.project, "other.txt"), "later\n")
+        self.git_p("add", "other.txt")
+        self.git_p("commit", "-q", "-m", "main moves on")
+        return feat, fork
+
+    def prompts(self, stage):
+        path = self.calls + "." + stage
+        return cat(path).split("\n=====\n")[:-1] if os.path.exists(path) else []
+
+    def run_bg(self, *extra):
+        out = open(os.path.join(self.tmp, "run.out"), "w")
+        self.addCleanup(out.close)
+        p = subprocess.Popen([sys.executable, tq.__file__, "--state", self.state, "run", "--vault", self.vault,
+                              "--proxy", self.proxy, "--harness", self.harness, "--default-model", "free-withtools",
+                              *extra], stdout=out, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        return p
+
+    def wait_for(self, cond, what, timeout=30):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return
+            time.sleep(0.1)
+        self.fail(f"timed out waiting for {what}; run output:\n" + cat(os.path.join(self.tmp, "run.out"))[-2000:])
+
+    def sleeping(self, key="ABC-1"):
+        path = self.calls + ".sleeping"
+        return os.path.exists(path) and key in cat(path).split()
+
+    def status_json(self):
+        rc, out = self.q("status", "--json")
+        self.assertEqual(rc, 0, out)
+        return json.loads(out)
+
+    def test_add_validates_stages_and_ref(self):
+        for bad in ("", "plan,bogus", "fix,push"):
+            rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", bad)
+            self.assertEqual(rc, 1, (bad, out))
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--ref", "origin/nope")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not a commit", out)
+        self.assertIsNone(self.status())
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "push, Implement")
+        self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertEqual((st["stages"], st["stage"], st["notes"]), (["implement", "push"], "implement", []))
+
+    def test_review_only_of_existing_work_at_a_ref(self):
+        feat, fork = self.feature_branch()
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "review", "--ref", "origin/feat")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.status()["stage"], self.status()["ref"]), ("review", "origin/feat"))
+        rc, out = self.run_queue()
+        self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("done", "done"), out)
+        self.assertIn("nothing pushed", st["reason"])
+        self.assertEqual([len(self.calls_of(s)) for s in ("planning", "implementing", "reviewing", "fixing")],
+                         [0, 0, 1, 0])
+        # The change reviewed is the existing work, from the merge-base with main.
+        self.assertEqual(st["base_sha"], fork)
+        repo = os.path.join(self.state, "ABC-1", "repo")
+        self.assertEqual(sh("git", "-C", repo, "rev-parse", "ABC-1").strip(), feat)
+        review = self.prompts("reviewing")[0]
+        self.assertIn("+hello feature", review)
+        self.assertNotIn("other.txt", review)
+        self.assertIn(tq.NO_PLAN, review)
+        self.assertEqual(self.git_p("for-each-ref", "refs/harness-queue-ref"), "")   # the fetch's ref is gone
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+
+    def test_must_fix_without_a_fix_stage(self):
+        os.environ["FAKE_MUSTFIX"] = "1"
+        self.feature_branch()
+        for key, stages in (("ABC-1", "review"), ("ABC-2", "review,push")):
+            rc, out = self.q("add", key, "--project", self.project, "--stages", stages, "--ref", "origin/feat")
+            self.assertEqual(rc, 0, out)
+        self.run_queue()
+        # Review was the last stage: done, with the findings as the reason.
+        st = self.status("ABC-1")
+        self.assertEqual(st["status"], "done")
+        self.assertIn("1 must-fix item(s)", st["reason"])
+        # Something was to follow: held, and the push did not happen.
+        st = self.status("ABC-2")
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "review"))
+        self.assertIn("harness queue retry ABC-2 --stage fix", st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-2"), "")
+        # retry --stage fix adds the stage and goes on from the review.
+        rc, out = self.q("retry", "ABC-2", "--stage", "fix")
+        self.assertEqual(rc, 0, out)
+        st = self.status("ABC-2")
+        self.assertEqual((st["status"], st["stage"], st["stages"]), ("queued", "fix", ["review", "fix", "push"]))
+        rc, out = self.run_queue()
+        self.assertEqual(self.status("ABC-2")["status"], "done", out)
+        self.assertEqual(len(self.calls_of("fixing")), 1)
+        self.assertIn("ABC-2", sh("git", "-C", self.remote, "branch", "--list", "ABC-2"))
+        # No plan and no criteria in the ticket: held to the ticket as a whole, and the review.
+        prompt = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
+        self.assertIn("1. " + tq.NO_PLAN_CRITERION + "\n2. (review) feature.txt:1: say it twice", prompt)
+
+    def test_implement_without_a_plan_takes_the_tickets_criteria(self):
+        os.environ["FAKE_TICKET"] = TICKET + "\n## Acceptance criteria\n- A file says hello feature\n\n## Notes\nx\n"
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "implement,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(len(self.calls_of("planning")), 0)
+        self.assertIn(tq.NO_PLAN, self.prompts("implementing")[0])
+        prompt = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][0]
+        self.assertIn("numbered:\n1. A file says hello feature\n\n", prompt)
+        self.assertIn("the ticket's 1 acceptance criteria", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertIn("ABC-1", sh("git", "-C", self.remote, "branch", "--list", "ABC-1"))
+
+    def test_owner_notes_reach_every_stage(self):
+        os.environ["FAKE_MUSTFIX"] = "1"
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--note", "Use tabs, not spaces.")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.q("note", "abc-1", "--text", "The {{PLAN}} is at origin/x; review it.")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([n["text"] for n in self.status()["notes"]],
+                         ["Use tabs, not spaces.", "The {{PLAN}} is at origin/x; review it."])
+        self.run_queue()
+        self.assertEqual(self.status()["status"], "done")
+        for stage in ("planning", "implementing", "reviewing", "fixing"):
+            prompt = self.prompts(stage)[0]
+            self.assertIn("NOTES_FROM_THE_OWNER", prompt, stage)
+            self.assertIn("Use tabs, not spaces.", prompt, stage)
+            self.assertIn("The {{PLAN}} is at origin/x; review it.", prompt, stage)
+        v = tq.common(type("C", (), {"vault": self.vault, "q": tq.Queue(self.state)})(), {"key": "ABC-9"})
+        self.assertEqual(v["NOTES"], "(none)")
+        rc, out = self.q("note", "ABC-1", "--text", "  ")
+        self.assertEqual(rc, 1)
+        rc, out = self.q("note", "ABC-7", "--text", "x")
+        self.assertEqual(rc, 1)
+
+    def test_notes_are_capped_and_survive_a_run_saving_old_state(self):
+        self.add("ABC-1")
+        q = tq.Queue(self.state)
+        held_by_run = q.load("ABC-1")        # what a run holds in memory
+        self.q("note", "ABC-1", "--text", "x" * 5000)
+        held_by_run["stage"] = "implement"
+        q.save(held_by_run)                   # the run saves after the note
+        st = self.status()
+        self.assertEqual(st["stage"], "implement")
+        self.assertEqual(len(st["notes"]), 1)
+        self.assertIn("cut at 4000", st["notes"][0]["text"])
+        with open(os.path.join(self.state, "ABC-1", "state.json")) as f:
+            self.assertEqual(len(json.load(f)["notes"]), 1)   # in state.json itself, for the viewer
+        for i in range(55):
+            q.add_note("ABC-1", f"n{i}")
+        notes = self.status()["notes"]
+        self.assertEqual((len(notes), notes[-1]["text"]), (50, "n54"))
+
+    def test_stop_a_waiting_ticket_and_resume_it(self):
+        self.add("ABC-1", "ABC-2")
+        rc, out = self.q("stop", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertEqual((st["status"], st["reason"]), ("stopped", "stopped by the owner"))
+        self.assertEqual(self.q("stop", "ABC-1")[0], 0)   # already stopped
+        rc, out = self.run_queue()
+        self.assertEqual(self.status("ABC-2")["status"], "done", out)
+        self.assertEqual(self.status()["status"], "stopped")
+        self.assertFalse([c for c in cat(self.calls).splitlines() if "--ticket ABC-1" in c])
+        self.assertEqual(self.q("stop", "ABC-2")[0], 1)   # done: nothing to stop
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.status()["status"], self.status()["stage"]), ("queued", "plan"))
+        self.assertEqual(self.q("retry", "ABC-1")[0], 1)  # queued: nothing to retry
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+
+    def test_a_stopped_plan_review_goes_back_to_plan_review(self):
+        self.add("ABC-1")
+        self.run_queue("--plan-review", "1")
+        self.assertEqual(self.status()["status"], "plan-review")
+        self.q("stop", "ABC-1")
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.status()["status"], self.status()["stage"]), ("plan-review", "implement"))
+
+    def test_stop_a_running_ticket_with_no_run_left(self):
+        self.add("ABC-1")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        st["status"] = "running"   # a run that died
+        q.save(st)
+        rc, out = self.q("stop", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["status"], "stopped")
+        self.assertFalse(os.path.exists(q.sentinel("ABC-1")))
+
+    def test_stop_the_running_ticket_and_the_run_goes_on(self):
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1")
+        self.add("ABC-1", "ABC-2")
+        p = self.run_bg("--push", "0")
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        r = self.status_json()["runner"]
+        self.assertTrue(r["running"], r)
+        self.assertEqual((r["ticket"], r["stage"], r["pid"], r["host"]), ("ABC-1", "plan", p.pid, False))
+        self.assertEqual(self.status()["status"], "running")
+        asked = time.time()
+        rc, out = self.q("stop", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("asked the run", out)
+        self.wait_for(lambda: self.status()["status"] == "stopped", "ABC-1 to stop", timeout=10)
+        self.assertLess(time.time() - asked, 6)
+        self.assertEqual(p.wait(timeout=30), 0, cat(os.path.join(self.tmp, "run.out")))
+        st = self.status()
+        self.assertEqual((st["stage"], st["attempt"], st["history"][-1]["result"]), ("plan", 0, "stopped"))
+        self.assertFalse(any(h["result"] == "failed" for h in st["history"]))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "stop")))
+        self.assertEqual(self.status("ABC-2")["status"], "done")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "run.json")))
+        self.assertEqual(self.status_json()["runner"], {"running": False})
+        # Its container (a container launch) is stopped too, found by the clone it mounts.
+        self.assertIn("stop-agents " + os.path.join(self.state, "ABC-1", "repo"), cat(self.calls).splitlines())
+        self.assertIn("stopped 1 agent container(s) in the clone", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+    def test_halt_puts_the_ticket_back_and_ends_the_run(self):
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1")
+        self.add("ABC-1", "ABC-2")
+        p = self.run_bg()
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        rc, out = self.q("halt")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(timeout=15), 0)
+        self.assertIn("halted by the owner", cat(os.path.join(self.tmp, "run.out")))
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"], st["attempt"]), ("queued", "plan", 0))
+        self.assertEqual(self.status("ABC-2")["status"], "queued")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "halt")))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "run.json")))
+        # No run: say so, and an old halt request does not stop the next run.
+        put(os.path.join(self.state, "halt"), "x")
+        rc, out = self.q("halt")
+        self.assertIn("no queue run is going; removed an old halt request", out)
+        put(os.path.join(self.state, "halt"), "x")
+        del os.environ["FAKE_SLEEP"]
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"], self.status("ABC-2")["status"]), (0, "done", "done"), out)
+
+    def test_move(self):
+        self.add("ABC-1", "ABC-2", "ABC-3")
+        order = lambda: tq.Queue(self.state).order()  # noqa: E731
+        for args, want in ((("ABC-3", "top"), ["ABC-3", "ABC-1", "ABC-2"]),
+                           (("ABC-3", "down"), ["ABC-1", "ABC-3", "ABC-2"]),
+                           (("ABC-1", "up"), ["ABC-1", "ABC-3", "ABC-2"]),
+                           (("abc-1", "bottom"), ["ABC-3", "ABC-2", "ABC-1"]),
+                           (("ABC-2", "up"), ["ABC-2", "ABC-3", "ABC-1"])):
+            rc, out = self.q("move", *args)
+            self.assertEqual((rc, order()), (0, want), (args, out))
+        self.assertEqual(self.q("move", "ABC-9", "up")[0], 1)
+
+    def test_status_json(self):
+        self.add("ABC-1", "ABC-2")
+        self.q("move", "ABC-2", "top")
+        got = self.status_json()
+        self.assertEqual(got["runner"], {"running": False})
+        self.assertEqual([t["key"] for t in got["tickets"]], ["ABC-2", "ABC-1"])
+        self.assertEqual(got["tickets"][0]["stages"], list(tq.ALL_STAGES))
+        put(os.path.join(self.state, "run.json"), json.dumps({"pid": 1, "beat": int(time.time()) - 60}))
+        self.assertEqual(self.status_json()["runner"], {"pid": 1, "beat": int(time.time()) - 60, "running": False})
+        rc, out = self.q("status")
+        self.assertIn("run: not going", out)
+
+    def test_retry_from_a_stage(self):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "plan,implement")
+        self.run_queue()
+        self.assertEqual(self.status()["status"], "done")
+        self.assertEqual(len(self.calls_of("reviewing")), 0)
+        rc, out = self.q("retry", "ABC-1", "--stage", "review")
+        self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"], st["stages"]), ("queued", "review", ["plan", "implement", "review"]))
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual([len(self.calls_of(s)) for s in ("planning", "implementing", "reviewing")], [1, 1, 1])
+        # Done, without --stage: from the start, the plan on a fresh clone.
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual((rc, self.status()["stage"]), (0, "plan"), out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "repo")))
+
+    def test_an_old_state_file_runs_every_stage(self):
+        os.makedirs(os.path.join(self.state, "ABC-1"))
+        put(os.path.join(self.state, "ABC-1", "state.json"), json.dumps(
+            {"key": "ABC-1", "project": self.project, "base": "main", "status": "queued", "stage": "plan",
+             "attempt": 0, "feedback": "", "reason": "", "created": "2026-01-01T00:00:00Z"}))
+        put(os.path.join(self.state, "queue.list"), "ABC-1\n")
+        self.assertEqual(self.status_json()["tickets"][0]["notes"], [])
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        self.assertNotIn("stages", st)
+        self.assertEqual([h["stage"] for h in st["history"]], ["plan", "implement", "review", "push"])
+        self.assertIn("ABC-1", sh("git", "-C", self.remote, "branch", "--list", "ABC-1"))
+
+
+class AuditFixesTest(Base):
+    """The task file, the Windows command-line limit, UTF-8 git output, clone and
+    push options, Windows agent paths and the verifier's retries."""
+
+    def test_each_stage_has_its_prompt_in_the_task_file_while_it_runs(self):
+        os.environ["FAKE_MUSTFIX"] = "1"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(cat(self.calls + ".task").split(), ["ABC-1", "True"] * 4)   # plan, implement, review, fix
+        self.assertFalse(os.path.exists(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-task.md")))
+        # The agent was told where it is (the full prompt) and a copy in the branch is refused.
+        self.assertIn("ABC-1-task.md", tq.check_change({"key": "ABC-1"}, ("x", "+a", ["notes/ABC-1-task.md"], 1), "")[0][0])
+
+    def test_the_task_file_is_gone_after_a_stopped_stage(self):
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1")
+        self.add("ABC-1")
+        task = os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-task.md")
+        q = tq.Queue(self.state)
+        def stop_when_running():
+            end = time.time() + 30
+            while not os.path.exists(self.calls + ".sleeping") and time.time() < end:
+                time.sleep(0.1)
+            self.assertTrue(os.path.exists(task))   # there while the agent runs
+            put(q.sentinel("ABC-1"), "x")
+        threading.Thread(target=stop_when_running, daemon=True).start()
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "stopped"), out)
+        self.assertFalse(os.path.exists(task))
+
+    def test_a_long_prompt_on_windows_goes_through_the_task_file(self):
+        keep = tq.WINDOWS, tq.WIN_PROMPT_MAX, tq.PROMPT_MAX_BYTES
+        tq.WINDOWS, tq.WIN_PROMPT_MAX, tq.PROMPT_MAX_BYTES = True, 100, 100   # 100: Linux would refuse it
+        try:
+            self.add("ABC-1")
+            rc, out = self.run_queue()
+        finally:
+            tq.WINDOWS, tq.WIN_PROMPT_MAX, tq.PROMPT_MAX_BYTES = keep
+        self.assertEqual(self.status()["status"], "done", out)
+        short = cat(self.calls + ".pointer").split("\n=====\n")[:-1]
+        self.assertEqual(len(short), 3)   # plan, implement, review
+        task = os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-task.md")
+        self.assertIn("ticket ABC-1, stage plan, in a clone of the project on branch ABC-1", short[0])
+        self.assertIn(f"Your full instructions for the plan stage of ticket ABC-1 are in {task}. Read it first", short[0])
+        self.assertLess(max(len(x) for x in short), 1000)
+        self.assertIn("You are planning ticket ABC-1", cat(self.calls + ".planning"))
+
+    def test_git_output_is_utf8_whatever_the_locale(self):
+        sh("git", "-C", self.project, "commit", "-q", "--allow-empty", "-m", "Łódź Ёлка")
+        env = dict(os.environ, LC_ALL="C", LANG="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0",
+                   PYTHONPATH=os.path.dirname(os.path.abspath(tq.__file__)))
+        code = ("import locale, sys, ticket_queue as tq; assert 'utf' not in locale.getpreferredencoding(False).lower();"
+                "sys.stdout.buffer.write(tq.git(sys.argv[1], 'log', '-1', '--format=%s').stdout.encode('utf-8'))")
+        r = subprocess.run([sys.executable, "-c", code, self.project], capture_output=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr.decode(errors="replace"))
+        self.assertEqual(r.stdout.decode("utf-8").strip(), "Łódź Ёлка")
+
+    def test_windows_clone_options(self):
+        with mock.patch.object(tq.os, "name", "posix"):
+            self.assertEqual(tq.clone_opts(True), [])
+        with mock.patch.object(tq.os, "name", "nt"):
+            self.assertEqual(tq.clone_opts(False), ["-c", "core.fsmonitor=false", "-c", "core.longpaths=true"])
+            self.assertEqual(tq.clone_opts(True)[-2:], ["-c", "core.autocrlf=false"])
+        # The options stay in the clone's config (git clone -c writes them there).
+        self.add("ABC-1")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        with mock.patch.object(tq, "clone_opts", lambda c: ["-c", "core.autocrlf=false"] if c else []):
+            tq.make_clone(q, st, container=True)
+        repo = os.path.join(self.state, "ABC-1", "repo")
+        self.assertEqual(sh("git", "-C", repo, "config", "--local", "core.autocrlf").strip(), "false")
+
+    def test_a_push_never_waits_for_a_credential_prompt(self):
+        seen = []
+        real = tq.git
+
+        def spy(cwd, *args, **kw):
+            seen.append((args, kw.get("env")))
+            return real(cwd, *args, **kw)
+        for k in ("GIT_SSH_COMMAND", "GIT_SSH"):
+            os.environ.pop(k, None)
+        self.add("ABC-1")
+        with mock.patch.object(tq, "git", spy):
+            rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        push = [(a, e) for a, e in seen if "push" in a]
+        self.assertEqual(len(push), 1)
+        args, env = push[0]
+        self.assertEqual(args[:3], ("-c", "credential.interactive=false", "push"))
+        self.assertEqual(env, {"GCM_INTERACTIVE": "never", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes"})
+        # The owner's own ssh is kept: GIT_SSH_COMMAND, GIT_SSH (plink) or core.sshCommand.
+        for k, v in (("GIT_SSH_COMMAND", "ssh -i mykey"), ("GIT_SSH", "plink.exe")):
+            os.environ[k] = v
+            self.assertEqual(tq.push_env(self.project), {"GCM_INTERACTIVE": "never"}, k)
+            del os.environ[k]
+        sh("git", "-C", self.project, "config", "core.sshCommand", "ssh -i other")
+        self.assertEqual(tq.push_env(self.project), {"GCM_INTERACTIVE": "never"})
+
+    def test_agent_paths_on_windows(self):
+        ctx = type("C", (), {"host": True, "single": False})()
+        with mock.patch.object(tq.os, "name", "nt"):
+            self.assertEqual(tq.agent_path(ctx, "C:\\Users\\me\\vault\\x.md"), "C:/Users/me/vault/x.md")
+            ctx.host = False
+            with mock.patch.object(tq.subprocess, "run", side_effect=OSError):
+                self.assertEqual(tq.agent_path(ctx, "D:\\v\\y.md"), "/d/v/y.md")
+        with mock.patch.object(tq.os, "name", "posix"):
+            self.assertEqual(tq.agent_path(ctx, "/a\\b"), "/a\\b")
+
+    def test_the_verifier_is_asked_again_when_the_upstream_fails(self):
+        calls = []
+
+        def flaky(proxy, model, messages, timeout):
+            calls.append(1)
+            if len(calls) < 3:
+                raise tq.InfraError("HTTP 429: slow down")
+            return '{"criteria": [], "verdict": "PASS"}'
+        q = tq.Queue(self.state)
+        os.makedirs(q.dir("ABC-1"), exist_ok=True)
+        ctx = type("C", (), {"q": q, "key": "ABC-1", "proxy": "p", "verify_model": "m"})()
+        with mock.patch.object(tq, "INFRA_RETRY_PAUSES", (0, 0)), mock.patch.object(tq, "call_model", flaky):
+            self.assertEqual(tq.ask_verifier(ctx, "x", "ABC-1", "plan")["verdict"], "PASS")
+            self.assertEqual(len(calls), 3)
+            self.assertIn("trying again", cat(os.path.join(q.dir("ABC-1"), "log.md")))
+            # Down for good: three tries, then the probe's three, then the outage.
+            calls.clear()
+            with mock.patch.object(tq, "call_model", side_effect=tq.InfraError("HTTP 502: down")) as cm:
+                with self.assertRaises(tq.Infra):
+                    tq.ask_verifier(ctx, "x", "ABC-1", "plan")
+                self.assertEqual(cm.call_count, 6)
+            # A 4xx about the request: not asked again.
+            with mock.patch.object(tq, "call_model", side_effect=tq.InfraError("HTTP 400: too long")) as cm:
+                with self.assertRaises(tq.InfraError):
+                    tq.model_call(ctx, [], 1)
+                self.assertEqual(cm.call_count, 1)
+        self.assertEqual([tq.transient(tq.InfraError(m)) for m in
+                          ("HTTP 429: x", "HTTP 503: x", "timed out", "HTTP 400: x", "HTTP 408: x")],
+                         [True, True, True, False, True])
+
+
+class ReviewerFixesTest(Base):
+    """remove of a running ticket, agent containers, a stop at push, retry of a done
+    ticket, the vault's .gitignore, halt at start-up, the heartbeat's end, notes
+    and a checked-out branch."""
+
+    def bg_run(self, *extra):
+        out = open(os.path.join(self.tmp, "run.out"), "w")
+        self.addCleanup(out.close)
+        p = subprocess.Popen([sys.executable, tq.__file__, "--state", self.state, "run", "--vault", self.vault,
+                              "--proxy", self.proxy, "--harness", self.harness, "--default-model", "free-withtools",
+                              *extra], stdout=out, stderr=subprocess.STDOUT)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        end = time.time() + 30
+        while not os.path.exists(self.calls + ".sleeping"):
+            self.assertLess(time.time(), end, cat(os.path.join(self.tmp, "run.out")))
+            time.sleep(0.1)
+        return p
+
+    def test_a_running_ticket_is_not_removed(self):
+        os.environ.update(FAKE_SLEEP="60")
+        self.add("ABC-1")
+        p = self.bg_run()
+        rc, out = self.q("remove", "ABC-1")
+        self.assertEqual(rc, 1)
+        self.assertIn("stop it first", out)
+        self.assertEqual(self.status()["status"], "running")
+        self.assertEqual(tq.Queue(self.state).order(), ["ABC-1"])
+        self.q("stop", "ABC-1")
+        self.assertEqual(p.wait(timeout=30), 0)
+        self.assertEqual(self.q("remove", "ABC-1")[0], 0)
+        self.assertIsNone(self.status())
+
+    def test_a_running_ticket_left_by_a_dead_run_can_be_removed(self):
+        self.add("ABC-1")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        st["status"] = "running"
+        q.save(st)
+        self.assertEqual(self.q("remove", "ABC-1")[0], 0)
+        self.assertIsNone(self.status())
+
+    def test_containers_unknown_or_host(self):
+        self.add("ABC-1")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        ctx = type("C", (), {"q": q, "harness": self.harness, "host": False, "single": False})()
+        os.environ["FAKE_STOP_RC"] = "1"   # no docker, or it failed: say the container may be running
+        tq.stop_containers(ctx, st)
+        self.assertIn("container may still be running; check 'harness list'", cat(os.path.join(q.dir("ABC-1"), "log.md")))
+        os.environ.update(FAKE_STOP_RC="0", FAKE_STOPPED="0")
+        tq.stop_containers(ctx, st)
+        self.assertNotIn("stopped 0", cat(os.path.join(q.dir("ABC-1"), "log.md")))
+        n = cat(self.calls).count("stop-agents")
+        ctx.host = True    # a host launch has no container
+        tq.stop_containers(ctx, st)
+        self.assertEqual(cat(self.calls).count("stop-agents"), n)
+
+    def test_a_stop_at_the_push_pushes_nothing(self):
+        real = tq.fetch_branch
+
+        def fetch(q, st):
+            if st["stage"] == "push":   # the owner stops it as the push stage starts
+                put(q.sentinel(st["key"]), "x")
+            return real(q, st)
+        self.add("ABC-1")
+        with mock.patch.object(tq, "fetch_branch", fetch):
+            rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("stopped", "push"), out)
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "stop")))
+
+    def test_a_stop_too_late_does_not_outlive_the_run(self):
+        real = tq.record
+
+        def rec(st, result, details=()):
+            if st.get("stage") == "push" and result == "passed":
+                put(tq.Queue(self.state).sentinel(st["key"]), "x")
+            return real(st, result, details)
+        self.add("ABC-1")
+        with mock.patch.object(tq, "record", rec):
+            self.run_queue()
+        self.assertEqual(self.status()["status"], "done")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "stop")))
+
+    def test_retry_of_a_done_ticket_starts_on_a_fresh_clone(self):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "implement,push")
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done")
+        self.assertIn("base_sha", st)
+        rc, out = self.q("retry", "ABC-1")
+        st = self.status()
+        self.assertEqual((rc, st["status"], st["stage"]), (0, "queued", "implement"), out)
+        self.assertNotIn("base_sha", st)
+        self.assertNotIn("sha", st)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "repo")))
+        # The redone branch starts at the base again (not on the first push), so it
+        # is not pushed here: origin would refuse it unless it is the same commit.
+        rc, out = self.run_queue("--push", "0")
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(cat(os.path.join(self.state, "ABC-1", "log.md")).count(" cloned "), 2)
+
+    def test_task_files_are_kept_out_of_the_vaults_git(self):
+        tickets = os.path.join(self.vault, "wiki", "notes", "tickets")
+        os.makedirs(tickets)
+        put(os.path.join(self.vault, ".gitignore"), ".trash/")    # no newline at the end
+        self.add("ABC-1")
+        put(os.path.join(tickets, "ABC-1-task.md"), "left by a killed run")
+        put(os.path.join(tickets, "OTHER-9-task.md"), "not a queue ticket's")
+        q = tq.Queue(self.state)
+        tq.keep_tasks_out(q, self.vault)
+        tq.keep_tasks_out(q, self.vault)
+        self.assertEqual(cat(os.path.join(self.vault, ".gitignore")),
+                         ".trash/\n# harness queue: a stage's prompt while it runs\nwiki/notes/tickets/*-task.md\n")
+        self.assertFalse(os.path.exists(os.path.join(tickets, "ABC-1-task.md")))
+        self.assertTrue(os.path.exists(os.path.join(tickets, "OTHER-9-task.md")))
+        sh("git", "init", "-q", self.vault)
+        put(os.path.join(tickets, "ABC-1-task.md"), "x")
+        self.assertEqual(sh("git", "-C", self.vault, "status", "--porcelain", "--", "wiki"), "")
+
+    def test_a_halt_asked_as_the_run_starts_is_kept(self):
+        self.add("ABC-1")
+        halt = tq.Queue(self.state).sentinel()
+        put(halt, "x")
+        os.utime(halt, (time.time() + 5,) * 2)   # written after the run took its lock
+        rc, out = self.run_queue()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.status()["status"], self.status()["stage"]), ("queued", "plan"))
+        self.assertFalse(os.path.exists(halt))
+        self.assertFalse(os.path.exists(self.calls))   # nothing launched
+
+    def test_no_beat_after_the_run_ended(self):
+        q = tq.Queue(self.state)
+        ctx = type("C", (), {"q": q, "beat_lock": threading.Lock(), "beating": threading.Event(),
+                             "run_info": {}})()
+        tq.beat(ctx)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "run.json")))
+        os.remove(os.path.join(self.state, "run.json"))
+        ctx.beating.set()
+        tq.beat(ctx)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "run.json")))
+
+    def test_a_note_does_not_write_over_a_running_ticket(self):
+        self.add("ABC-1")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        st["status"] = "running"
+        q.save(st)
+        path = os.path.join(self.state, "ABC-1", "state.json")
+        before = cat(path)
+        self.assertEqual(self.q("note", "ABC-1", "--text", "hi")[0], 0)
+        self.assertEqual(cat(path), before)                 # the run's file, untouched
+        self.assertEqual([n["text"] for n in q.load("ABC-1")["notes"]], ["hi"])   # and the note there on load
+
+    def test_a_checked_out_branch_is_not_moved(self):
+        wt = os.path.join(self.tmp, "wt")
+        sh("git", "-C", self.project, "worktree", "add", "-q", "-b", "ABC-1", wt, "main")
+        at = sh("git", "-C", self.project, "rev-parse", "ABC-1").strip()
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(sh("git", "-C", self.project, "rev-parse", "ABC-1").strip(), at)
+        self.assertEqual(sh("git", "-C", wt, "status", "--porcelain"), "")
+        self.assertIn("branch ABC-1 is checked out in the project; not moved", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertEqual(sh("git", "-C", self.remote, "rev-parse", "ABC-1").strip(), st["sha"])
 
 
 if __name__ == "__main__":

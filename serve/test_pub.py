@@ -3,6 +3,7 @@
 Run: python3 -m unittest serve/test_pub.py (tests/unit_serve_test.sh does).
 """
 
+import base64
 import http.client
 import json
 import os
@@ -78,7 +79,8 @@ class PubServerTest(LiveServer):
         self.assertIn("New page", text)
         self.assertIn("Old &amp; page", text)
         self.assertLess(text.index("New page"), text.index("Old &amp; page"))
-        self.assertNotIn("hidden", text)
+        self.assertNotIn(">hidden<", text)      # pub/.git/x.html is not a page
+        self.assertNotIn("x.html", text)
         self.assertIn(f"href='http://opencode:s3cret@127.0.0.1:{port + 1}/'", text)
         self.assertNotIn("auth_token", text)
         self.assertEqual(r.getheader("Cache-Control"), "no-store")
@@ -606,6 +608,29 @@ class IndexContentTest(LiveServer):
         self.assertFalse(sent & {"cookie", "authorization"}, sent)
         self.get(port, "/")
         self.assertEqual(len(seen), 1)                # cached
+
+
+class OpencodeLinkTest(unittest.TestCase):
+    """The run viewer's "Open in opencode web": opencode's /server/<base64url origin>/session/<id>."""
+
+    def cfg(self, **kw):
+        c = pub.Config(8770, "", "", kw.pop("port", 0), "", (), **kw)
+        c.opencode_password = lambda: "pw/1"
+        return c
+
+    def test_port_link_carries_the_login_and_only_the_hosts_sessions(self):
+        link = pub.opencode_session_link(self.cfg(port=4096), "10.0.0.5")
+        key = base64.urlsafe_b64encode(b"http://10.0.0.5:4096").decode().rstrip("=")
+        self.assertEqual(link("host", "ses_1"), f"http://opencode:pw%2F1@10.0.0.5:4096/server/{key}/session/ses_1")
+        self.assertEqual(link("container", "ses_1"), "")
+
+    def test_url_link_keys_on_the_origin_without_login_or_default_port(self):
+        link = pub.opencode_session_link(self.cfg(opencode_url="https://u:p@OC.example.com:443/"), "x")
+        key = base64.urlsafe_b64encode(b"https://oc.example.com").decode().rstrip("=")
+        self.assertEqual(link("host", "ses_2"), f"https://u:p@OC.example.com:443/server/{key}/session/ses_2")
+
+    def test_no_opencode_no_link(self):
+        self.assertIsNone(pub.opencode_session_link(self.cfg(), "x"))
 
 
 if __name__ == "__main__":
