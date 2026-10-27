@@ -48,13 +48,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import runs as runs_view  # noqa: E402
+import runs as runs_view
+import vault_view  # noqa: E402
 
 PUB_CSP = "sandbox allow-scripts allow-popups"
 INDEX_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
 # The run viewer's pages run one inline script each (polling), allowed by nonce.
 RUNS_CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; connect-src 'self'; "
-            "form-action 'self'; frame-ancestors 'none'")
+            "img-src 'self'; form-action 'self'; frame-ancestors 'none'")
 MAX_SEND_FORM = 3 * runs_view.MAX_MESSAGE + 1024   # urlencoded, so up to 3 bytes a byte
 TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
@@ -1081,6 +1082,74 @@ def make_handler(cfg):
                     return
             self.send(404, b"not found\n", head=head)
 
+        def vault_get(self, path, query, head):
+            """The Vault pages (vault_view): read-only views of the active vault."""
+            vault, name = cfg.active.get()
+            q = parse_qs(query)
+            rest = path[len("/vault"):].strip("/")
+            nav = {"nav": runs_view.nav(cfg.runs, "vault")}
+            if rest in ("", "live"):
+                vaults = vault_view.list_vaults(cfg.state_dir)
+                if rest == "live":
+                    self.send_json(vault_view.overview_live(vault, name, vaults, nav), head)
+                else:
+                    done = (q.get("done") or [""])[0][:500]
+                    parts = vault_view.render_overview(vault, name, vaults, nav)
+                    if done:
+                        parts.insert(3, runs_view._flash(done))
+                    self.send_runs(200, "harness: vault", parts, runs_view.LIVE_JS, head, "vault")
+                return
+            if not vault or not os.path.isdir(vault):
+                self.redirect("/vault", head=head)
+                return
+            if rest in ("ingest", "ingest/live"):
+                if rest == "ingest/live":
+                    self.send_json(vault_view.ingest_live(vault, nav), head)
+                else:
+                    self.send_runs(200, "harness: ingest", vault_view.render_ingest(vault, nav), runs_view.LIVE_JS,
+                                   head, "vault")
+                return
+            if rest == "search":
+                self.send_runs(200, "harness: vault search",
+                               vault_view.render_search(vault, (q.get("q") or [""])[0]), "", head, "vault")
+                return
+            kind, _, arg = rest.partition("/")
+            arg = unquote(arg)
+            got = None
+            if kind == "browse" or rest == "browse":
+                got = vault_view.render_browse(vault, name, arg)
+            elif kind == "commit":
+                got = vault_view.render_commit(vault, arg, (q.get("path") or [""])[0])
+            elif kind == "file":
+                img = vault_view.file_bytes(vault, arg)
+                if img:
+                    self.send(200, img[0], img[1], {"Content-Security-Policy": "default-src 'none'; sandbox",
+                                                    "X-Content-Type-Options": "nosniff",
+                                                    "Cache-Control": "no-cache"}, head)
+                    return
+            if got is None:
+                self.send_runs(404, "harness: not found", [
+                    "<section class='panel'><h2>Not found</h2><p>Nothing by that name in the vault (or it is "
+                    "not shown here).</p><a href='/vault'>Back to the vault</a></section>"], "", head, "vault")
+                return
+            self.send_runs(200, "harness: vault", got, "", head, "vault")
+
+        def vault_post(self, path, user):
+            if path != "/vault/use":
+                self.send(404, b"not found\n")
+                return
+            form = self.read_form()
+            if form is None:
+                self.send(413, b"form too large\n")
+                return
+            ok, msg = vault_view.use_vault(cfg.state_dir, (form.get("name") or [""])[0].strip())
+            sys.stderr.write(f"[pub] vault use from {user or 'local'}: {msg}\n")
+            if not ok:
+                self.refused(msg, "/vault", "Back to the vault")
+                return
+            cfg.active._at = 0.0
+            self.redirect(f"/vault?done={quote(msg)}")
+
         def refused(self, msg, back, label):
             self.send_runs(409, "harness: not done", [
                 f"<section class='panel'><h2>Not done</h2><p class='err'>{esc(msg)}</p>"
@@ -1261,6 +1330,9 @@ def make_handler(cfg):
             if path == "/runs" or path.startswith("/runs/"):
                 self.runs_get(path, url.query, head)
                 return
+            if path == "/vault" or path.startswith("/vault/"):
+                self.vault_get(path, url.query, head)
+                return
             if path.startswith("/pub/"):
                 target = resolve_pub(cfg.pub_dir, path)
                 if not target:
@@ -1294,12 +1366,15 @@ def make_handler(cfg):
                 self.send(403, b"cross-origin request refused\n")
                 return
             path = urlsplit(self.path).path
-            if path.startswith("/runs/"):
+            if path.startswith(("/runs/", "/vault/")):
                 _, user = self.session()
                 if cfg.codes and not user:
                     self.send(401, b"not signed in\n")
                     return
-                self.runs_send(path, user)
+                if path.startswith("/vault/"):
+                    self.vault_post(path, user)
+                else:
+                    self.runs_send(path, user)
                 return
             if not cfg.codes or path not in ("/login", "/logout"):
                 self.send(404, b"not found\n")

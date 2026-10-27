@@ -1320,9 +1320,38 @@ home>/.local/share` and `--agent-data host=${XDG_DATA_HOME:-~/.local/share}`
 dir with no DB shows nothing, and with no `--agent-data` the viewer is off),
 `--queue-dir state/queue` and `--harness <this script>` (what Start runs;
 default the `harness` next to `serve/`). Pages share one top bar (Home,
-Queue, Sessions; the runner chip; how fresh the page is; who is signed in,
+Queue, Sessions, Vault; the runner chip; how fresh the page is; who is signed in,
 with Log out) and a neutral dark theme with an indigo accent (light
-from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
+from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. Routes:
+
+- `/vault*` (`serve/vault_view.py`): read-only views of the active vault.
+  git runs with `GIT_OPTIONAL_LOCKS=0`, `core.fsmonitor=false`, no prompt,
+  never fetches. `/vault` (live, `/vault/live`: `main`, `side`, `nav`):
+  counts by wiki folder and `.raw`, folder, remote (credentials stripped),
+  branch, ahead/behind from local refs, uncommitted files, recently changed
+  pages, last commits, the registered vaults (`state/vaults.list`) with Use
+  (POST `/vault/use` writes `state/vault.active` as `harness vault use`
+  does), and an Ingest panel: the run file `.git/harness-ingest.run.json`
+  (alive while its pid lives and its beat is under 120 s old) and, per
+  codebase and `.raw`, ok and failed sections from `.harness/ingest.json`;
+  `/vault/ingest` (live) lists failed sections with their problems.
+  `/vault/browse/<rel>`: a folder lists folders then files (titles from
+  front matter or the first heading); a markdown file is rendered on the
+  server by the vendored mistune 3.3.4 (`serve/vendor/`, BSD-3, raw HTML
+  escaped, `javascript:` links dropped) with Obsidian `[[wikilinks]]`
+  (full path, else the shortest file of that name; missing ones dimmed),
+  `![[embeds]]` of images, `> [!callouts]`, relative links mapped into the
+  browser, front matter as Properties and HTML comment lines (unit markers)
+  dropped; other text as is; per-file history (`git log --follow`). Paths
+  are confined to the vault by realpath (no `..`, no `.git`), and files
+  whose names look like secrets (`.env*`, `*.pem`, `*.key`, `id_*`,
+  `.netrc`, `credentials`) are listed but never shown or searched.
+  `/vault/search?q=`: `git grep --untracked -i -F` with every word on one
+  line (at most 300 lines), names matching first, wiki before `.raw`.
+  `/vault/commit/<sha>[?path=]`: the commit's stat and diff (400 kB cap).
+  `/vault/file/<rel>`: png, jpeg, gif and webp only, sandboxed, nosniff.
+  An "Open in Obsidian" link (`obsidian://open?vault=<folder name>`) is on
+  the overview and each markdown page.
 
 - `/runs/queue`: the owner's console. A runner card (running or not, mode,
   model, ticket and stage, heartbeat age, `runner.out` tail at

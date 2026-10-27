@@ -1134,7 +1134,8 @@ def stage_strip(st, big=False):
     return f"<ol class='strip{' big' if big else ''}' aria-label='stages'>{''.join(items)}</ol>"
 
 
-TABS = (("home", "/", "Home"), ("queue", "/runs/queue", "Queue"), ("sessions", "/runs", "Sessions"))
+TABS = (("home", "/", "Home"), ("queue", "/runs/queue", "Queue"), ("sessions", "/runs", "Sessions"),
+        ("vault", "/vault", "Vault"))
 
 
 def nav(runs, active="", tabs=TABS):

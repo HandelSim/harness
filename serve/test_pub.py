@@ -677,6 +677,140 @@ class HomeLiveTest(LiveServer):
         self.assertTrue(cfg.code_changed())
 
 
+class VaultPagesTest(LiveServer):
+    """The Vault section: a git vault under state/vaults, read-only pages."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = os.path.join(self.tmp.name, "state")
+        v = self.v = os.path.join(self.state, "vaults", "brain")
+        files = {
+            "wiki/code/api/server.md": "---\ntitle: API server\nrepo: api\n---\n# API server\n\n"
+                                       "<!-- unit:code:api/server#1 sha:abc -->\nGoes to [[handlers]], "
+                                       "[[cache|the cache]], [[nope]] and [p](../../notes/n.md).\n\n"
+                                       "> [!warning] Careful\n> body\n\n<script>alert(1)</script>\n"
+                                       "[x](javascript:alert(1)) ![i](pic.png)\n",
+            "wiki/code/api/handlers.md": "# Handlers\n\nneedle in the handlers\n",
+            "wiki/code/api/pic.png": "\x89PNG fake",
+            "wiki/notes/n.md": "# Note\n",
+            "wiki/cache.md": "# Cache\n",
+            ".raw/sessions/s.md": "user: needle here\n",
+            ".env": "TOKEN=needle-secret\n",
+            "keys/id_rsa": "needle key\n",
+        }
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(v, rel)), exist_ok=True)
+            with open(os.path.join(v, rel), "w") as f:
+                f.write(text)
+        git = ["git", "-C", v, "-c", "user.name=t", "-c", "user.email=t@x", "-c", "commit.gpgsign=false"]
+        subprocess.run(git[:3] + ["init", "-q"], check=True)
+        subprocess.run(git + ["add", "-A", "wiki", ".raw"], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "ingest: 3 written"], check=True)
+        self.sha = subprocess.run(git[:3] + ["rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        os.makedirs(os.path.join(v, ".harness"))
+        with open(os.path.join(v, ".harness", "ingest.json"), "w") as f:
+            json.dump({"version": 1, "repos": {"api": v}, "units": {
+                "code:api/server#1": {"page": "wiki/code/api/server.md", "status": "ok", "at": "2026-10-27T10:00:00Z"},
+                "code:api/cache#1": {"page": "wiki/cache.md", "status": "failed", "attempts": 3,
+                                     "at": "2026-10-27T10:00:00Z", "problems": ["no page <b>"]}}}, f)
+        with open(os.path.join(self.state, "vaults.list"), "w") as f:
+            f.write("brain\tlocal\nwork\thttps://u:tok@example.com/w.git\n")
+        with open(os.path.join(self.state, "vault.active"), "w") as f:
+            f.write("brain\n")
+        self.port = self.start(vault="", state_dir=self.state)
+
+    def page(self, path, code=200):
+        r, body = self.get(self.port, path)
+        self.assertEqual(r.status, code, path)
+        return body.decode()
+
+    def test_overview_shows_contents_ingest_and_vaults(self):
+        text = self.page("/vault")
+        self.assertIn("aria-current='page'>Vault", text)
+        self.assertIn("wiki pages", text)
+        self.assertIn("1 failed", text)
+        self.assertIn("ingest: 3 written", text)
+        self.assertIn("https://example.com/w.git", text)
+        self.assertNotIn("tok@", text)                       # no credentials from a remote URL
+        self.assertIn("img-src 'self'", self.get(self.port, "/vault")[0].getheader("Content-Security-Policy"))
+        sig = re.search(r"data-sig='([^']+)'", text).group(1)
+        self.assertEqual(json.loads(self.get(self.port, "/vault/live")[1])["sig"], sig)
+        ing = self.page("/vault/ingest")
+        self.assertIn("no page &lt;b&gt;", ing)
+        self.assertIn("code:api/cache#1", ing)
+
+    def test_page_renders_markdown_safely_and_resolves_links(self):
+        text = self.page("/vault/browse/wiki/code/api/server.md")
+        self.assertNotIn("<script>alert", text)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", text)
+        self.assertNotIn('href="javascript:', text)
+        self.assertIn('href="/vault/browse/wiki/code/api/handlers.md"', text)
+        self.assertIn('href="/vault/browse/wiki/cache.md">the cache</a>', text)
+        self.assertIn("class=\"missing\"", text)
+        self.assertIn('href="/vault/browse/wiki/notes/n.md"', text)
+        self.assertIn("src=\"/vault/file/wiki/code/api/pic.png\"", text)
+        self.assertIn("callout-warning", text)
+        self.assertNotIn("unit:code:api", text)                # generated markers are not shown
+        self.assertIn("<dt>repo</dt><dd>api</dd>", text)
+        self.assertIn(f"/vault/commit/{self.sha[:7]}", text)
+
+    def test_paths_stay_inside_and_secrets_stay_hidden(self):
+        for bad in ("/vault/browse/../../vaults.list", "/vault/browse/%2e%2e/%2e%2e/vaults.list",
+                    "/vault/browse/.git/config", "/vault/browse/wiki/..%2f..%2f..%2fvaults.list",
+                    "/vault/file/.env", "/vault/file/wiki/notes/n.md", "/vault/commit/HEAD",
+                    "/vault/commit/--output=x"):
+            self.assertNotIn("tok@", self.page(bad, 404), bad)
+        os.symlink(self.state, os.path.join(self.v, "out"))
+        self.page("/vault/browse/out/vaults.list", 404)
+        self.assertIn("looks like a secret", self.page("/vault/browse/.env"))
+        self.assertNotIn("TOKEN", self.page("/vault/browse/.env"))
+        self.assertIn("looks like a secret", self.page("/vault/browse/keys/id_rsa"))
+        r, body = self.get(self.port, "/vault/file/wiki/code/api/pic.png")
+        self.assertEqual((r.status, r.getheader("Content-Type")), (200, "image/png"))
+        self.assertIn("sandbox", r.getheader("Content-Security-Policy"))
+
+    def test_search_folder_and_commit(self):
+        text = self.page("/vault/search?q=needle")
+        self.assertIn("wiki/code/api/handlers.md", text)
+        self.assertIn(".raw/sessions/s.md", text)
+        self.assertNotIn("needle-secret", text)
+        self.assertNotIn("id_rsa", text)
+        self.assertLess(text.index("handlers.md"), text.index("sessions/s.md"))    # wiki first
+        self.assertIn("Nothing matches", self.page("/vault/search?q=zzzqqq"))
+        self.assertIn("&lt;img", self.page("/vault/search?q=%3Cimg"))
+        listing = self.page("/vault/browse/wiki/code/api")
+        self.assertIn("handlers.md", listing)
+        self.assertIn("<small>Handlers</small>", listing)
+        commit = self.page(f"/vault/commit/{self.sha[:10]}")
+        self.assertIn("ingest: 3 written", commit)
+        self.assertIn("needle in the handlers", commit)
+        self.page("/vault/commit/0000000", 404)
+
+    def test_use_switches_the_active_vault(self):
+        os.makedirs(os.path.join(self.state, "vaults", "work", ".git"))
+        h = {"Origin": f"http://127.0.0.1:{self.port}", "Content-Type": "application/x-www-form-urlencoded"}
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/vault/use", urlencode({"name": "nosuch"}), {**h, "Host": f"127.0.0.1:{self.port}"})
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 409)
+        c.request("POST", "/vault/use", urlencode({"name": "work"}), {**h, "Host": f"127.0.0.1:{self.port}"})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 303)
+        with open(os.path.join(self.state, "vault.active")) as f:
+            self.assertEqual(f.read(), "work\n")
+        self.assertIn("<b>work</b>", self.page("/vault").replace("<h2>work</h2>", "<b>work</b>"))
+
+    def test_no_vault(self):
+        os.remove(os.path.join(self.state, "vault.active"))
+        time.sleep(pub.VAULT_TTL + 0.2)
+        self.assertIn("No vault", self.page("/vault"))
+        r, _ = self.get(self.port, "/vault/browse/wiki")
+        self.assertEqual(r.status, 303)
+
+
 class OpencodeLinkTest(unittest.TestCase):
     """The run viewer's "Open in opencode web": opencode's /server/<base64url origin>/session/<id>."""
 
