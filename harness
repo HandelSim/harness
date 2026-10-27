@@ -5720,7 +5720,9 @@ _vault_eol() {
 # provider header, from which the proxy adds a line naming the vault to a
 # cooperative model's reminder. With a ticket (harness_ticket, set by
 # ticket_prepare) the ticket's copy and its state note are two more
-# instruction files and x-harness-ticket adds where they are to that line.
+# instruction files, and x-harness-ticket plus x-harness-task (base64 JSON:
+# the title, and a queue stage's HARNESS_TASK_CARD) give a cooperative model
+# a task card at the end of every turn.
 # Prints nothing without a vault.
 vault_opencode_config() {
     local dir="${harness_vault_dir:-}" what f instr=()
@@ -5739,11 +5741,24 @@ vault_opencode_config() {
         dir=$(cygpath -m "$dir")
         for f in "${!instr[@]}"; do instr[f]=$(cygpath -m "${instr[f]}"); done
     fi
+    # The task card's fields: the ticket's title (the "# KEY: title" heading
+    # under its copy's front matter) and, for a queue stage, HARNESS_TASK_CARD
+    # (a JSON object the queue sets). The proxy renders them at the end of
+    # every cooperative turn.
+    local title="" line n=0
+    if [[ -n "${harness_ticket:-}" && -f "${harness_vault_dir}/.raw/tickets/$harness_ticket.md" ]]; then
+        while IFS= read -r line && (( n++ < 40 )); do
+            [[ "$line" == "# $harness_ticket: "* ]] && { title="${line#"# $harness_ticket: "}"; break; }
+        done < "${harness_vault_dir}/.raw/tickets/$harness_ticket.md"
+    fi
     harness_jq -cn --arg dir "$dir" --arg ticket "${harness_ticket:-}" \
+        --arg title "$title" --arg card "${HARNESS_TASK_CARD:-}" \
         --argjson instr "$(printf '%s\n' ${instr[@]+"${instr[@]}"} | harness_jq -R . | harness_jq -sc 'map(select(. != ""))')" '
+      (($card | try fromjson catch {}) | if type == "object" then . else {} end)
+        + (if $title == "" then {} else {"title": $title} end) | tojson | @base64 | . as $task |
       {"permission": {"external_directory": {($dir + "/*"): "allow"}},
        "provider": {"harness": {"options": {"headers": ({"x-harness-vault": $dir}
-         + (if $ticket == "" then {} else {"x-harness-ticket": $ticket} end))}}}}
+         + (if $ticket == "" then {} else {"x-harness-ticket": $ticket, "x-harness-task": $task} end))}}}}
       + (if ($instr | length) == 0 then {} else {"instructions": $instr} end)'
 }
 

@@ -69,6 +69,7 @@ if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == 
     open(os.environ["FAKE_CALLS"] + ".sleeping", "a").write(ticket + "\n")
     time.sleep(int(os.environ["FAKE_SLEEP"]))
 log.write(stage + " " + " ".join(a for a in args[:-1]) + "\n")
+open(os.environ["FAKE_CALLS"] + ".card", "a").write(os.environ.get("HARNESS_TASK_CARD", "") + "\n")
 open(os.environ["FAKE_CALLS"] + "." + stage, "a").write(prompt + "\n=====\n")
 def path(label):
     p = re.search(label + r" (\S+?)[ )\n]", prompt).group(1)
@@ -298,6 +299,16 @@ class QueueTest(Base):
         # Every stage ran once, the fix because the review had a Must fix item.
         for stage in ("planning", "implementing", "reviewing", "fixing"):
             self.assertEqual(len(self.calls_of(stage)), 1, stage)
+        # Each stage's task card (HARNESS_TASK_CARD, which harness sends the proxy):
+        # the stage, the branch, and done in the words of the stage's checks.
+        cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines()]
+        self.assertEqual([c["stage"] for c in cards], ["plan", "implement", "review", "fix"])
+        self.assertTrue(all(c["branch"] == "ABC-1" and c["attempt"] == 1 and "clone" in c["where"] for c in cards), cards)
+        plan_file = os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-plan.md")
+        self.assertIn(f"the plan is written to {plan_file}: # ABC-1 plan", cards[0]["done"])
+        self.assertIn("committed on ABC-1", cards[1]["done"])
+        self.assertIn("## Must fix", cards[2]["done"])
+        self.assertEqual((cards[3]["must_fix"], "must_fix" in cards[2]), (1, False))
         # The free twin of the -withtools default, on the agent and the verifier.
         self.assertIn("-m harness/free", self.calls_of("planning")[0])
         self.assertTrue(all(m == "free" and raw == "1" for m, raw, _ in FakeProxy.seen))
@@ -454,6 +465,8 @@ class QueueTest(Base):
         self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
         self.assertEqual(len(self.calls_of("implementing")), 2)
         self.assertIn("no commits on branch ABC-1", st["reason"])
+        # The card counts the attempts.
+        self.assertEqual([json.loads(c)["attempt"] for c in cat(self.calls + ".card").splitlines()][-2:], [1, 2])
         # The retry was told what was wrong.
         log = cat(os.path.join(self.state, "ABC-1", "log.md"))
         self.assertIn("implement attempt 1 failed", log)
@@ -1541,6 +1554,9 @@ class StartAndBranchTest(Base):
         self.assertEqual(self.git_p("show", snap + ":AGENTS.md"), "rules")
         self.assertEqual(self.git_p("show", snap + ":build/make.sh"), "echo hi")
         self.assertTrue(st["launches"])
+        # In place, the card says whose folder it is and how to commit there.
+        card = json.loads(cat(self.calls + ".card").splitlines()[-1])
+        self.assertEqual(card["where"], tq.CARD_WHERE_IN_PLACE)
 
     def test_the_queues_git_never_signs(self):
         # A signing key on a smart card would ask for its PIN on the snapshot of

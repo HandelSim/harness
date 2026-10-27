@@ -1172,7 +1172,7 @@ def run_agent(ctx, st, stage, prompt):
         st["launches"] = (st.get("launches") or [])[-(HISTORY_CAP - 1):] + [[since, 0]]
         ctx.q.save(st)
     try:
-        rc = launch(ctx, st, cmd, out, since)
+        rc = launch(ctx, st, cmd, out, since, task_card(ctx, st, stage))
     finally:   # gone before the vault is committed: it is the prompt, not a note
         drop(task)
         if st.get("in_place"):
@@ -1244,13 +1244,16 @@ def copy_instructions(project, repo):
             print(f"[queue] warning: could not copy {src} into the clone: {e}", file=sys.stderr)
 
 
-def launch(ctx, st, cmd, out, since):
+def launch(ctx, st, cmd, out, since, card=None):
     """Run the agent to its end, a timeout (rc 124), or the owner's stop or halt (Interrupted)."""
     key = st["key"]
     # HARNESS_QUEUE_LAUNCH: harness labels the container with it (what stop_containers
     # stops) and does not remember the ticket for the folder (in place, the owner's)
     st["launch_id"] = f"{key}-{os.getpid()}-{int(time.time() * 1000)}"
     env = dict(os.environ, HARNESS_HOST_CONFIRM="1", HARNESS_QUEUE_LAUNCH=st["launch_id"])
+    env.pop("HARNESS_TASK_CARD", None)
+    if card:
+        env["HARNESS_TASK_CARD"] = json.dumps(card)
     # nobody is at the keyboard: no editor (git commit, rebase), password or host-key prompt may hold the agent
     env.update(net_env(st["project"]), GIT_EDITOR="true")
     t0 = time.monotonic()
@@ -1681,6 +1684,39 @@ IN_PLACE = ("the owner's own project folder, not a clone. It has the owner's unc
             "git add -A, git add . or git commit -a); never run git checkout/restore of files you did not change, "
             "git reset --hard, git clean, git stash or git switch. Repositories inside it are not committed by harness: "
             "change them only when the ticket needs it and say so in your commit message")
+
+
+# The task card: a few lines a model on the cooperative route (no native tool
+# calls) sees at the end of every turn, where the stage's prompt is long gone
+# after its first tool call. harness sends it to the proxy (x-harness-task,
+# with the ticket's title); the proxy points at KEY-task.md for the rest. Done
+# says what the stage's checks look for, in their words.
+CARD_WHERE_IN_PLACE = ("the owner's own project folder, not a clone. Commit only files you changed, by name (never "
+                       "git add -A, git add . or git commit -a); leave every other file alone (no git reset --hard, "
+                       "clean, stash, or checkout of files you did not change)")
+CARD_DONE = {
+    "plan": "the plan is written to {PLAN_FILE}: # {KEY} plan, then ## Goal, ## Acceptance criteria (one bullet each, "
+            "at most 15), ## Approach, ## Files, ## Questions, ## Assumptions. Change no code in this stage.",
+    "implement": "every acceptance criterion of the plan is met and committed on {BRANCH} (git add <files>, git commit "
+                 "-m \"{KEY}: <what changed>\"), and git status is clean. Do not push.",
+    "review": "the review is written to {REVIEW_FILE}: # {KEY} review, then ## Must fix (path:line: the problem and "
+              "what to do, or - None) and ## Notes. Change no code in this stage.",
+    "fix": "every Must fix item is fixed, or said in the commit message to be wrong, and committed on {BRANCH} in a "
+           "new commit (git commit --allow-empty when nothing changed). Do not push.",
+}
+
+
+def task_card(ctx, st, stage):
+    if stage not in CARD_DONE:
+        return None
+    p = {k: agent_path(ctx, v) for k, v in note_paths(ctx.vault, st["key"]).items()}
+    card = {"stage": stage, "attempt": st.get("attempt", 0) + 1, "branch": branch_of(st),
+            "where": CARD_WHERE_IN_PLACE if st.get("in_place") else IN_CLONE,
+            "done": CARD_DONE[stage].format(KEY=st["key"], BRANCH=branch_of(st), PLAN_FILE=p["plan"],
+                                            REVIEW_FILE=p["review"])}
+    if stage == "fix" and st.get("must_fix"):
+        card["must_fix"] = len(st["must_fix"])
+    return card
 
 
 def owner_notes(notes):

@@ -654,8 +654,10 @@ project's (every `AGENTS.md` from the CWD up to the git root, else every
 `CLAUDE.md`, else `CONTEXT.md`; a container sees only the CWD's), then
 harness's: the vault's `AGENTS.md`, the ticket's copy and its state note.
 `vault_opencode_config` puts the last three in `instructions` and adds
-`x-harness-ticket: KEY`, from which the proxy adds where the two ticket
-files are to a free model's vault line. `context_banner` prints one line at
+`x-harness-ticket: KEY` and `x-harness-task` (base64 JSON: the title from the
+copy's `# KEY: title` heading, plus `HARNESS_TASK_CARD`, a JSON object a queue
+stage sets; anything else there is dropped), from which the proxy gives a free
+model a task card at the end of every turn (`architecture/proxy.md`). `context_banner` prints one line at
 launch (file count, ~tokens, ticket); `harness context [--host]` lists the
 files with sizes, the reminder line, the ticket, tracker and whether a token
 is set (never the token). After a launch `vault_sync` passes
@@ -779,8 +781,12 @@ fit one argv argument, because the free models only read the last message.
 While a stage runs its whole prompt is also in the vault at
 `wiki/notes/tickets/KEY-task.md` (removed before the vault is synced, ignored
 by the vault's `.gitignore`, which a run adds the line to when missing, and
-leftovers deleted at run start; the branch check refuses it), which the proxy names to cooperative models every
-turn, since they lose the prompt after their first tool call; on Windows,
+leftovers deleted at run start; the branch check refuses it). Cooperative
+models lose the prompt after their first tool call, so each stage's launch
+also sets `HARNESS_TASK_CARD` (`task_card`): stage, attempt, where it works
+(`CARD_WHERE_IN_PLACE` in place), branch, done-when (`CARD_DONE`, the
+stage's checks in words) and, for fix, the Must fix count; the proxy shows it,
+with a pointer to the task file, at the end of every turn. On Windows,
 where a command line is at most 32,767 characters, a prompt over 24,000
 characters goes as a short one pointing there.
 The model is `QUEUE_MODEL`, else the default model's free twin when it is a

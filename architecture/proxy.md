@@ -351,20 +351,49 @@ pointer has to ride the per-turn reminder. Values that are empty, over 400
 characters or carry control characters add nothing; the native route ignores
 the header. The proxy's own re-asks (malformed-call retry, tool search,
 require-tool corrections) rebuild the last message with the same line:
-`catch_all` hands them its `prompt_ctx` (vault, ticket, session id). With a ticket the launch also sends `x-harness-ticket: KEY`, and
-the sentence goes on to name the ticket's copy (`<vault>/.raw/tickets/KEY.md`)
-and its state note (`<vault>/wiki/notes/tickets/KEY-state.md`, kept up to date
-as each step is finished), plus `KEY-task.md` beside it, where a `harness
-queue` stage keeps its whole prompt while it runs: the model loses the stage
-prompt from view after its first tool call. A key that is not `ABC-123` shaped or is over 40
-characters, or a ticket without a vault, adds nothing.
+`catch_all` hands them its `prompt_ctx` (vault, ticket, task, session id).
+
+## Task card (`x-harness-ticket: KEY`, `x-harness-task`)
+
+A launch with a ticket (and a vault) also sends `x-harness-ticket: KEY` and
+`x-harness-task` (base64 JSON, from harness: the ticket's title and, for a
+`harness queue` stage, the queue's card). On the cooperative route
+`_task_card` renders a short card at the very end of every last message,
+after the reminder: the ticket's key and quoted title, then for a queue stage
+the stage and attempt ("this session does this stage only"), where it works
+and the branch, done-when in the words of the queue's checks, a note when the
+last attempt failed, the Must fix count, and pointers to `KEY-task.md` (the
+stage's whole prompt, there while it runs), the ticket's copy and its state
+note, each to be read "when you need a detail", not "when you cannot see it"
+(a model that sees one message cannot tell, and loops). A free model loses the
+stage prompt, which is only in its first message, after its first tool call:
+the card is what keeps the stage, its output and how it is checked in view.
+`_task_fields` keeps only the known fields, each collapsed to one line and
+capped (title 120, where 300, done 500 characters; attempt and must_fix
+1-999); a header that is not base64 JSON of an object, or over 8,192
+characters, gives the bare card (key and pointers). Text the model reads
+cannot pass for the card: `_defang_card` rewrites `[harness task card` in the
+turn's content to `[quoted harness task card`. With a card, the
+instruction-file line leaves out the ticket's two files, which the card
+names. A key that is not `ABC-123` shaped or is over 40 characters, or a
+ticket without a vault, gives no card.
+
+## Session tag in message 0
+
+With a session id (`_session_id`), the cooperative route ends message 0 with
+`Session: <first 12 hex of sha256(id)>`. If the upstream keeps a hidden
+conversation keyed on message 0 (`harness probe memory` section 8 measures
+that), two sessions with the same instructions, such as a ticket's plan and
+review stages, would otherwise share one. It is the same for every request
+and re-ask of one session.
 
 ## Instruction-file line
 
 opencode puts every instruction file it loaded into the system prompt as
 `Instructions from: <path>` followed by its text: the project's `AGENTS.md`
 (or `CLAUDE.md`) found from the working directory up, the global one, and the
-config `instructions` (vault `AGENTS.md`, ticket, task file). On the
+config `instructions` (the vault's `AGENTS.md`, a ticket's copy and its state
+note). On the
 cooperative route the Environment bullet names those paths
 (`_extract_instruction_files` over every system message, `_instructions_clause`)
 and says to `read` them again when their text is not in the conversation, since

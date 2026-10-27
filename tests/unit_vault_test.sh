@@ -735,6 +735,17 @@ harness_ticket_flag '' 2>/dev/null && fail "V16: --ticket with no key accepted"
             $v + "/wiki/notes/tickets/ABC-7-state.md"]
         and .provider.harness.options.headers["x-harness-ticket"] == "ABC-7"' <<<"$cfg" >/dev/null \
         || fail "V16: the overlay should carry the ticket files and header — $cfg"
+    # x-harness-task: the title from the copy, plus a queue stage's card;
+    # a card that is not a JSON object is dropped, the title kept.
+    task=$(jq -r '.provider.harness.options.headers["x-harness-task"]' <<<"$cfg" | base64 -d)
+    [[ "$task" == '{"title":"Report sets while the task runs"}' ]] || fail "V16: the task header — $task"
+    task=$(HARNESS_TASK_CARD='{"stage":"plan","attempt":2}' vault_opencode_config \
+        | jq -r '.provider.harness.options.headers["x-harness-task"]' | base64 -d)
+    [[ "$task" == '{"stage":"plan","attempt":2,"title":"Report sets while the task runs"}' ]] \
+        || fail "V16: the task header with a queue card — $task"
+    task=$(HARNESS_TASK_CARD='["plan"]' vault_opencode_config \
+        | jq -r '.provider.harness.options.headers["x-harness-task"]' | base64 -d)
+    [[ "$task" == '{"title":"Report sets while the task runs"}' ]] || fail "V16: a bad queue card — $task"
     out=$(HOME="$TMP_ROOT/home" cmd_context --host)
     grep -q '^  1\. global ' <<<"$out" && grep -q '^ticket:  XY-2' <<<"$out" && grep -q '^token:   set' <<<"$out" \
         || fail "V16: harness context — $out"
