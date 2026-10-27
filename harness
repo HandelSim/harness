@@ -2376,7 +2376,9 @@ harness config — view and change .env settings.
 usage:
   harness config                 interactive picker of common settings
   harness config get [KEY]       print one KEY (or the common set with no KEY)
-  harness config list            alias for 'config get' with no KEY
+  harness config list [--tsv]    alias for 'config get' with no KEY; --tsv
+                                 prints KEY, value, secret (1/0), description
+                                 tab-separated, for programs
   harness config set KEY VALUE   set KEY to VALUE (any key; VALUE may be empty)
 
 Secrets (PROXY_API_KEY and the like) are shown masked. Upstream URL hosts
@@ -2401,6 +2403,19 @@ _config_get() {
         [[ -n "$key" ]] || continue
         val=$(_config_read_key "$key")
         printf '  %-22s %s\n' "$key" "$(_config_display_value "$key" "$val")"
+    done < <(_config_editable_keys)
+}
+
+# The common set for programs (harness serve's Settings page): KEY, the value as
+# 'config get' shows it (secrets masked), whether it is a secret (1/0) and the
+# description, tab-separated, one key a line.
+_config_tsv() {
+    local key desc val
+    while IFS='|' read -r key desc; do
+        [[ -n "$key" ]] || continue
+        val=$(_config_read_key "$key")
+        [[ -z "$val" ]] || val=$(_config_display_value "$key" "$val")
+        printf '%s\t%s\t%d\t%s\n' "$key" "${val//$'\t'/ }" "$(_config_is_secret "$key" && echo 1 || echo 0)" "$desc"
     done < <(_config_editable_keys)
 }
 
@@ -2495,7 +2510,7 @@ cmd_config() {
         "")             _config_overview ;;
         pick|menu)      _config_picker ;;
         get)            shift; _config_get "$@" ;;
-        list)           _config_get ;;
+        list)           if [[ "${2:-}" == "--tsv" ]]; then _config_tsv; else _config_get; fi ;;
         set)            shift; _config_set "$@" ;;
         -h|--help|help) _config_help ;;
         *)

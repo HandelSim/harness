@@ -45,10 +45,11 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runs as runs_view
+import settings_view  # noqa: E402
 import vault_view  # noqa: E402
 
 PUB_CSP = "sandbox allow-scripts allow-popups"
@@ -556,6 +557,7 @@ class Config:
         self.port = port
         self.active = ActiveVault(state_dir, vault, vault_name)
         self.state_dir = state_dir
+        self.harness = harness
         self.opencode_port = opencode_port
         self.password_file = password_file
         self.allowed = {f"{h}:{port}" for h in ("127.0.0.1", "localhost", "[::1]")}
@@ -1150,6 +1152,57 @@ def make_handler(cfg):
             cfg.active._at = 0.0
             self.redirect(f"/vault?done={quote(msg)}")
 
+        def settings_args(self):
+            sd = cfg.state_dir
+            root = os.path.dirname(os.path.abspath(sd)) if sd and os.path.basename(os.path.abspath(sd)) == "state" else ""
+            return cfg.harness, root
+
+        def send_settings(self, code, flash="", bad=False, new_code=None, result=None, head=False):
+            h = self.settings_args()
+            _, user = self.session() if cfg.codes else (None, None)
+            parts = settings_view.render(h, cfg.codes, user, settings_view.system_info(h), flash, bad,
+                                         new_code, result)
+            self.send_runs(code, "harness: settings", parts, "", head, "settings")
+
+        def settings_post(self, path, user):
+            """Settings changes: each runs the harness command a terminal user would type."""
+            form = self.read_form(fields=80)
+            if form is None:
+                self.send(413, b"form too large\n")
+                return
+            h, what = self.settings_args(), path[len("/settings/"):]
+            new_code = result = None
+            if what == "config":
+                ok, msg = settings_view.save_config(h, form)
+            elif what == "net":
+                ok, msg = settings_view.net_change(h, form)
+            elif what == "mcp":
+                ok, msg = settings_view.mcp_change(h, form)
+            elif what == "access" and cfg.codes:
+                act, name = (form.get("act") or [""])[0], (form.get("name") or [""])[0].strip()
+                try:
+                    if act == "add":
+                        new_code, ok, msg = (name, add_code(cfg.codes.path, name)), True, f"Made a code for {name}."
+                    elif act == "remove" and name != user:
+                        remove_code(cfg.codes.path, name)
+                        ok, msg = True, f"Removed {name}'s code; they are signed out."
+                    else:
+                        ok, msg = False, "you cannot remove the code you are signed in with"
+                except (ValueError, OSError) as e:
+                    ok, msg = False, str(e)
+            elif what == "system":
+                act = (form.get("act") or [""])[0]
+                ok, msg, result = settings_view.system_action(h, act)
+            else:
+                self.send(404, b"not found\n")
+                return
+            sys.stderr.write(f"[pub] settings {what} from {user or 'local'}: {msg}\n")
+            if new_code or result:
+                # shown once, on this answer: a code is never stored, a report is not worth keeping
+                self.send_settings(200, msg, not ok, new_code, result)
+                return
+            self.redirect("/settings?" + urlencode({"done" if ok else "bad": msg}))
+
         def refused(self, msg, back, label):
             self.send_runs(409, "harness: not done", [
                 f"<section class='panel'><h2>Not done</h2><p class='err'>{esc(msg)}</p>"
@@ -1333,6 +1386,11 @@ def make_handler(cfg):
             if path == "/vault" or path.startswith("/vault/"):
                 self.vault_get(path, url.query, head)
                 return
+            if path == "/settings":
+                q = parse_qs(url.query)
+                done, bad = (q.get("done") or [""])[0][:600], (q.get("bad") or [""])[0][:600]
+                self.send_settings(200, done or bad, bool(bad and not done), head=head)
+                return
             if path.startswith("/pub/"):
                 target = resolve_pub(cfg.pub_dir, path)
                 if not target:
@@ -1348,7 +1406,7 @@ def make_handler(cfg):
                 return
             self.send(404, b"not found\n", head=head)
 
-        def read_form(self, limit=MAX_FORM):
+        def read_form(self, limit=MAX_FORM, fields=20):
             """The urlencoded body as a dict, or None if it is too large."""
             try:
                 n = int(self.headers.get("Content-Length") or 0)
@@ -1357,7 +1415,7 @@ def make_handler(cfg):
             if n < 0 or n > limit:
                 return None
             raw = self.rfile.read(n) if n else b""
-            return parse_qs(raw.decode("utf-8", "replace"), max_num_fields=20)
+            return parse_qs(raw.decode("utf-8", "replace"), max_num_fields=fields)
 
         def do_POST(self):
             if not self.host_ok(False):
@@ -1366,13 +1424,15 @@ def make_handler(cfg):
                 self.send(403, b"cross-origin request refused\n")
                 return
             path = urlsplit(self.path).path
-            if path.startswith(("/runs/", "/vault/")):
+            if path.startswith(("/runs/", "/vault/", "/settings/")):
                 _, user = self.session()
                 if cfg.codes and not user:
                     self.send(401, b"not signed in\n")
                     return
                 if path.startswith("/vault/"):
                     self.vault_post(path, user)
+                elif path.startswith("/settings/"):
+                    self.settings_post(path, user)
                 else:
                     self.runs_send(path, user)
                 return

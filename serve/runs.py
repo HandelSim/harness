@@ -356,7 +356,7 @@ details.doc summary .muted { font-weight: 400; }
 @media (max-width: 560px) {
   .grid2, .presets.two { grid-template-columns: minmax(0, 1fr); }
   .runchip .rtxt { display: none; }
-  .tabs a { padding: 6px 8px; }
+  .tabs { gap: 0; } .tabs a { padding: 6px 7px; font-size: 13.5px; }
   .bar-in { gap: 4px 8px; height: auto; min-height: 52px; flex-wrap: wrap; padding-top: 8px; padding-bottom: 6px; }
   .bar-mid { order: 3; flex-basis: 100%; overflow-x: auto; }
   .bar-who span { display: none; }
@@ -1135,7 +1135,7 @@ def stage_strip(st, big=False):
 
 
 TABS = (("home", "/", "Home"), ("queue", "/runs/queue", "Queue"), ("sessions", "/runs", "Sessions"),
-        ("vault", "/vault", "Vault"))
+        ("vault", "/vault", "Vault"), ("settings", "/settings", "Settings"))
 
 
 def nav(runs, active="", tabs=TABS):

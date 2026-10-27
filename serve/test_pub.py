@@ -18,7 +18,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pub  # noqa: E402
@@ -836,3 +836,130 @@ class OpencodeLinkTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+FAKE_HARNESS = r'''#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$LOG"
+case "$*" in
+  "config list --tsv")
+    printf 'PROXY_API_URL\thttps://llm.example\t0\tupstream URL\n'
+    printf 'PROXY_API_KEY\t(set, 9 chars)\t1\tupstream key\n'
+    printf 'DEFAULT_MODEL_NAME\tbig\t0\tdefault model\n'
+    printf 'HTTPS_PROXY\thttp://al:pw9@proxy:3128\t0\tproxy\n' ;;
+  "net list") printf 'allowlist (/x):\n  pypi.org            # pip\n  gitlab.example.com  [git-push]\n' ;;
+  "mcp list --available") printf 'NAME STATE STATUS\nserena installed-enabled running\ngh available -\n' ;;
+  doctor) printf '\033[1m[deps]\033[0m\n  \xe2\x9c\x93 git  git version 2\n  \xe2\x9c\x97 docker  not reachable <b>\n' ;;
+  "config set DEFAULT_MODEL_NAME bad") echo "harness: refused" >&2; exit 1 ;;
+  "net allow"*) echo "added ${3}" ;;
+  "net deny"*) echo "removed ${3}" ;;
+  *) echo ok ;;
+esac
+'''
+
+
+class SettingsPageTest(LiveServer):
+    """/settings drives the harness commands; a fake harness records what it was asked."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = os.path.join(self.tmp.name, "inst", "state")
+        os.makedirs(self.state)
+        self.harness = os.path.join(self.tmp.name, "harness")
+        with open(self.harness, "w") as f:
+            f.write(FAKE_HARNESS)
+        self.log = os.path.join(self.tmp.name, "log")
+        os.environ["LOG"] = self.log
+        self.addCleanup(os.environ.pop, "LOG", None)
+
+    def calls(self):
+        try:
+            with open(self.log) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def post(self, port, path, fields, cookie=""):
+        h = {"Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}",
+             "Content-Type": "application/x-www-form-urlencoded"}
+        if cookie:
+            h["Cookie"] = cookie
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+        c.request("POST", path, urlencode(fields), h)
+        r = c.getresponse()
+        body = r.read().decode()
+        c.close()
+        return r, body
+
+    def test_page_shows_every_part_and_no_secret(self):
+        port = self.start(vault="", state_dir=self.state, harness=self.harness)
+        r, body = self.get(port, "/settings")
+        text = body.decode()
+        self.assertEqual(r.status, 200)
+        self.assertIn("aria-current='page'>Settings", text)
+        self.assertIn("value='big'", text)
+        self.assertIn("type='password' name='v_PROXY_API_KEY'", text)
+        self.assertIn("type='password' name='v_HTTPS_PROXY'", text)     # a proxy URL with a password
+        self.assertNotIn("pw9", text)
+        self.assertIn("gitlab.example.com", text)
+        self.assertIn("git push", text)
+        self.assertIn("serena", text)
+        self.assertIn(">Disable<", text)
+        self.assertIn(">Install<", text)
+        self.assertIn("Access codes are off", text)
+
+    def test_save_sets_only_what_changed(self):
+        port = self.start(vault="", state_dir=self.state, harness=self.harness)
+        r, _ = self.post(port, "/settings/config", {"v_PROXY_API_URL": "https://llm.example", "v_DEFAULT_MODEL_NAME": "other",
+                                                    "v_PROXY_API_KEY": "", "v_HTTPS_PROXY": ""})
+        self.assertEqual(r.status, 303)
+        self.assertIn("done=Saved+DEFAULT_MODEL_NAME", r.getheader("Location"))
+        sets = [c for c in self.calls() if c.startswith("config set")]
+        self.assertEqual(sets, ["config set DEFAULT_MODEL_NAME other"])
+        self.post(port, "/settings/config", {"v_PROXY_API_KEY": "sk-new", "clear_HTTPS_PROXY": "1"})
+        sets = [c for c in self.calls() if c.startswith("config set")]
+        self.assertEqual(sets[1:], ["config set PROXY_API_KEY sk-new", "config set HTTPS_PROXY "])
+        r, _ = self.post(port, "/settings/config", {"v_DEFAULT_MODEL_NAME": "a\nb"})
+        self.assertIn("bad=", r.getheader("Location"))
+        r, _ = self.post(port, "/settings/config", {"v_DEFAULT_MODEL_NAME": "bad"})
+        self.assertIn("refused", unquote(r.getheader("Location")).replace("+", " "))
+
+    def test_net_mcp_and_doctor(self):
+        port = self.start(vault="", state_dir=self.state, harness=self.harness)
+        r, _ = self.post(port, "/settings/net", {"act": "allow", "host": "Git.Example.com", "push": "1"})
+        self.assertIn("done=Added", r.getheader("Location"))
+        r, _ = self.post(port, "/settings/net", {"act": "allow", "host": "a b;rm"})
+        self.assertIn("bad=", r.getheader("Location"))
+        self.post(port, "/settings/net", {"act": "deny", "host": "pypi.org"})
+        r, _ = self.post(port, "/settings/mcp", {"act": "enable", "name": "gh"})
+        self.assertEqual(r.status, 303)
+        r, _ = self.post(port, "/settings/mcp", {"act": "uninstall", "name": "gh"})
+        self.assertIn("bad=", r.getheader("Location"))
+        r, body = self.post(port, "/settings/system", {"act": "doctor"})
+        self.assertEqual(r.status, 200)
+        self.assertIn("class='bad'", body)
+        self.assertIn("not reachable &lt;b&gt;", body)
+        self.assertNotIn("\x1b", body)
+        calls = self.calls()
+        self.assertIn("net allow git.example.com --git-push", calls)
+        self.assertIn("net deny pypi.org", calls)
+        self.assertIn("mcp enable gh", calls)
+        self.assertNotIn("mcp uninstall gh", calls)
+        self.assertFalse(any("rm" in c for c in calls))
+
+    def test_access_codes_are_managed_here_when_on(self):
+        codes = os.path.join(self.tmp.name, "codes")
+        alice = pub.add_code(codes, "alice")
+        port = self.start(vault="", state_dir=self.state, harness=self.harness, access_codes=codes)
+        r, _ = self.post(port, "/settings/net", {"act": "deny", "host": "pypi.org"})
+        self.assertEqual(r.status, 401)
+        r, _ = self.post(port, "/login", {"code": alice})
+        cookie = r.getheader("Set-Cookie").split(";")[0]
+        r, body = self.post(port, "/settings/access", {"act": "add", "name": "bob"}, cookie)
+        self.assertEqual(r.status, 200)
+        code = re.search(r"class='newcode'>([^<]+)<", body).group(1)
+        self.assertEqual(pub.parse_codes(open(codes).read()) >= {("bob", pub.code_hash(code))}, True)
+        r, _ = self.post(port, "/settings/access", {"act": "remove", "name": "alice"}, cookie)
+        self.assertIn("bad=", r.getheader("Location"))
+        r, _ = self.post(port, "/settings/access", {"act": "remove", "name": "bob"}, cookie)
+        self.assertIn("done=", r.getheader("Location"))
+        self.assertEqual({n for n, _ in pub.parse_codes(open(codes).read())}, {"alice"})

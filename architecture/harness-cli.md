@@ -196,8 +196,9 @@ installer. Three commands cover post-install setup:
     This bare path runs through `_config_overview`. The curated set comes from
     `_config_editable_keys` (`KEY|description` pairs). Picking
     `DEFAULT_MODEL_NAME` delegates to `cmd_model`.
-  - `config get [KEY]` / `config list` print values; `config set KEY VALUE`
-    writes one. **Not a whitelist** — `set` writes any key; the picker/`get`
+  - `config get [KEY]` / `config list` print values (`config list --tsv`:
+    `KEY<TAB>shown value<TAB>secret 1/0<TAB>description`, secrets masked, for
+    serve's Settings page); `config set KEY VALUE` writes one. **Not a whitelist** — `set` writes any key; the picker/`get`
     just surface the common ones.
   - Reads use `_config_read_key` (straight from `$env_file`, so they reflect
     on-disk state). Writes use `_config_write_key` — the same atomic
@@ -1352,6 +1353,18 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   `/vault/file/<rel>`: png, jpeg, gif and webp only, sandboxed, nosniff.
   An "Open in Obsidian" link (`obsidian://open?vault=<folder name>`) is on
   the overview and each markdown page.
+
+- `/settings` (`serve/settings_view.py`): every change runs the harness
+  command a terminal user would type, with no terminal (stdin /dev/null, new
+  session, `HARNESS_INSTALL_ROOT` = the parent of `--state-dir`), so nothing
+  waits on a prompt. Model and keys: `config list --tsv`, one form, Save runs
+  `config set` for each changed value (secrets and URLs with a password are
+  password fields: blank keeps, a typed value replaces, "clear it" empties;
+  never echoed). Network allowlist: `net list`, `net allow [--git-push]`,
+  `net deny`. MCP: `mcp list --available`, install/enable/disable. Access
+  (with `--access-codes`): add shows the new code once, remove (not your
+  own). System: version, Run doctor (rendered by section), check-updates,
+  `update`. Changes are logged to stderr with who made them.
 
 - `/runs/queue`: the owner's console. A runner card (running or not, mode,
   model, ticket and stage, heartbeat age, `runner.out` tail at
