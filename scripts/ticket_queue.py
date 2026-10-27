@@ -57,6 +57,7 @@ from there, without force. Nothing is ever written to the tracker.
 import argparse
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -131,6 +132,11 @@ class LaunchFailed(Infra):
 
 class VerifierBroke(Exception):
     """The verifier gave no verdict twice (no reply, or not the JSON asked for)."""
+
+
+class NestedMoved(Exception):
+    """In place, the stage changed repositories inside the project (a commit, a branch
+    switch, uncommitted files), which the queue does not verify, commit or push."""
 
 
 class Busy(RuntimeError):
@@ -665,20 +671,28 @@ def resolve_ref(project, ref, fetch=True):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def uncommitted(project):
-    """{"untracked": [...], "changed": [...]}: what git status shows in project.
-    A nested repository is one untracked "dir/" entry."""
-    out = {"untracked": [], "changed": []}
-    raw = git(project, "status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none").stdout.split("\0")
-    i = 0
+def status_entries(project, env=None):
+    """[(XY, path)]: what git status shows in project, untracked files one by one."""
+    raw = git(project, "status", "--porcelain=v1", "-z", "-uall", "--ignore-submodules=none",
+              env=env).stdout.split("\0")
+    out, i = [], 0
     while i < len(raw):
         e = raw[i]
         i += 1
         if len(e) < 4:
             continue
-        out["untracked" if e[:2] == "??" else "changed"].append(e[3:])
+        out.append((e[:2], e[3:]))
         if e[0] in "RC":   # a rename's old path follows
             i += 1
+    return out
+
+
+def uncommitted(project):
+    """{"untracked": [...], "changed": [...]}: what git status shows in project.
+    A nested repository is one untracked "dir/" entry."""
+    out = {"untracked": [], "changed": []}
+    for xy, path in status_entries(project):
+        out["untracked" if xy == "??" else "changed"].append(path)
     return out
 
 
@@ -866,9 +880,10 @@ def park(q, st):
 
 def snapshot(q, st, stage):
     """In place, before each stage: the project's whole tree as it is (uncommitted
-    and untracked files too; not ignored ones, nor nested repos' contents) as a
-    commit at refs/harness-queue/snap/KEY, each one on the one before. If an agent
-    throws away work: git checkout <snap> -- <path> takes it back."""
+    and untracked files too; not ignored ones, nor the repositories inside it: one
+    with no commit would fail git add) as a commit at refs/harness-queue/snap/KEY,
+    each one on the one before. If an agent throws away work: git checkout <snap>
+    -- <path> takes it back."""
     project, key = st["project"], st["key"]
     ref = f"refs/harness-queue/snap/{key}"
     index = os.path.join(q.dir(key), "snap.index")
@@ -879,7 +894,9 @@ def snapshot(q, st, stage):
     try:
         if os.path.exists(real):   # git's stat cache: only what changed is read again
             shutil.copyfile(real, index)
-        git(project, "-c", "advice.addEmbeddedRepo=false", "add", "-A", env=who, timeout=600)
+        # literal: a repository named l* would take the owner's untracked lx/ with it
+        git(project, "-c", "advice.addEmbeddedRepo=false", "add", "-A", "--", ".",
+            *(f":(exclude,literal){r}/" for r in untracked_repos(project)), env=who, timeout=600)
         tree = git(project, "write-tree", env=who).stdout.strip()
         prev = git(project, "rev-parse", "-q", "--verify", ref, check=False).stdout.strip()
         sha = git(project, "commit-tree", tree, *(["-p", prev] if prev else []), "-m",
@@ -891,19 +908,94 @@ def snapshot(q, st, stage):
         drop(index)
 
 
-def nested_changes(project):
-    """["dir (n)"]: repositories inside the project (3 levels down) with changes; the
-    queue commits in the project's own repository only."""
-    out = []
+def untracked_repos(project):
+    """The repositories inside the project that git add -A would meet (each an
+    untracked "dir/" in git ls-files, at any depth): relative paths."""
+    raw = git(project, "ls-files", "-z", "-o", "--exclude-standard", timeout=600).stdout.split("\0")
+    return [e[:-1] for e in raw if e.endswith("/")]
+
+
+def nested_repos(project, skip=()):
+    """The repositories inside the project (their own .git): 3 levels down, ignored
+    ones too, and any deeper one git add -A would meet; not the project's own
+    worktrees, nor one that is or holds a folder in skip (the vault, the queue's
+    state). Relative paths, sorted."""
+    found = set(untracked_repos(project))
     for root, dirs, files in os.walk(project):
         if root != project and (".git" in dirs or ".git" in files):
             dirs[:] = []
-            n = len(git(root, "status", "--porcelain", check=False).stdout.splitlines())
-            if n:
-                out.append(f"{os.path.relpath(root, project)} ({n})")
+            found.add(os.path.relpath(root, project).replace(os.sep, "/"))
             continue
         depth = os.path.relpath(root, project).count(os.sep)
         dirs[:] = [] if depth >= 2 else [d for d in dirs if d not in (".git", "node_modules")]
+    common = lambda d: os.path.realpath(git(d, "rev-parse", "--path-format=absolute", "--git-common-dir",
+                                            check=False).stdout.strip() or d)
+    mine = common(project)
+    skip = [os.path.realpath(s) for s in skip if s]
+    out = []
+    for rel in sorted(found):
+        d = os.path.realpath(os.path.join(project, rel))
+        # a .git that is not a repository's: git there is the project's
+        if not any(s == d or s.startswith(d + os.sep) for s in skip) and common(d) != mine:
+            out.append(rel)
+    return out
+
+
+NESTED_FILES_CAP = 500   # paths kept by name, per repository, to say which changed
+
+
+def nested_state(project, skip=()):
+    """{path: {"head", "branch", "sum", "files"}}: each repository inside the project,
+    its HEAD and branch and what it has uncommitted (each changed or untracked path's
+    status, size and mtime; "sum" over all of them, "files" by name when there are few)."""
+    out = {}
+    for rel in nested_repos(project, skip):
+        d = os.path.join(project, rel)
+        files = {}
+        try:
+            entries = status_entries(d, env={"GIT_OPTIONAL_LOCKS": "0"})   # no index refresh in the owner's repo
+        except RuntimeError as e:   # one git cannot read is still looked at for HEAD and branch
+            entries, files[""] = [], f"git status: {e}"[:200]
+        for xy, path in entries:
+            try:
+                s = os.lstat(os.path.join(d, path))
+                files[path] = f"{xy} {s.st_size} {s.st_mtime_ns}"
+            except OSError:
+                files[path] = f"{xy} -"
+        out[rel] = {"head": git(d, "rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip(),
+                    "branch": git(d, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip(),
+                    "sum": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:16],
+                    "files": files if len(files) <= NESTED_FILES_CAP else None}
+    return out
+
+
+def nested_moved(project, before, skip=()):
+    """What changed since before (nested_state) in the repositories inside the project:
+    ["libA: 2 new commit(s), 1a2b3c4d5e6f..9f8e7d6c5b4a on main", ...]. One made
+    since is not counted: committed, it is a gitlink, which check_change refuses."""
+    now = nested_state(project, skip)
+    name = lambda b: b or "a detached HEAD"
+    out = []
+    for rel, a in sorted(before.items()):
+        b = now.get(rel)
+        if b is None:
+            out.append(f"{rel}: gone")
+            continue
+        if a["branch"] != b["branch"]:
+            out.append(f"{rel}: switched from {name(a['branch'])} to {name(b['branch'])}")
+        elif a["head"] != b["head"]:
+            n = git(os.path.join(project, rel), "rev-list", "--count", f"{a['head']}..{b['head']}",
+                    check=False).stdout.strip() if a["head"] and b["head"] else ""
+            out.append(f"{rel}: {n or 'new'} new commit(s), {a['head'][:12] or '(none)'}..{b['head'][:12]} on "
+                       f"{name(b['branch'])}")
+        if a["sum"] != b["sum"]:
+            fa, fb = a.get("files"), b.get("files")
+            if fa is None or fb is None:
+                out.append(f"{rel}: its uncommitted files changed")
+            else:
+                hit = sorted(p for p in set(fa) | set(fb) if fa.get(p) != fb.get(p))
+                out.append(f"{rel}: uncommitted files changed: " + ", ".join(hit[:8])
+                           + (f" and {len(hit) - 8} more" if len(hit) > 8 else ""))
     return out
 
 
@@ -933,10 +1025,16 @@ def check_change(st, change, plan_text):
     """Hard gates on a branch, and the warnings that are not gates."""
     if change is None:
         return [f"no commits on branch {branch_of(st)}: commit your change on that branch (git add, git commit)"], []
-    _, diff, files, _ = change
+    sha, diff, files, _ = change
     problems, warnings = [], []
     if not diff.strip():
         problems.append("the commits change nothing (the diff is empty)")
+    if st.get("project") and st.get("base_sha"):   # a repository made inside it, added by git add -A or .
+        raw = git(st["project"], "diff", "--raw", "--no-renames", "--diff-filter=A", st["base_sha"], sha,
+                  check=False).stdout.splitlines()
+        for f in [l.split("\t", 1)[1] for l in raw if "\t" in l and l.split()[1] == "160000"][:10]:
+            problems.append(f"{f}: a repository inside the project is committed as a bare pointer (a gitlink), which "
+                            f"would be pushed without its commits: git rm --cached {f}, and leave it out of commits")
     for f in files:
         if f.startswith(".github/"):
             problems.append(f"{f}: changes under .github/ (CI) are not made by the queue; leave CI to the owner")
@@ -1173,10 +1271,16 @@ def run_agent(ctx, st, stage, prompt):
     out = os.path.join(ctx.q.dir(key), f"{stage}-{st['attempt']}.out")
     since = int(time.time() * 1000)
     write_atomic(task, prompt)
+    skip = (ctx.vault, ctx.q.root)
     if st.get("in_place"):
         exclude_block(st["project"], None)   # the snapshot takes the owner's files too
         snapshot(ctx.q, st, stage)
         exclude_block(st["project"], owner_files(ctx.q, st).get("untracked"))
+        if "nested_base" not in st:   # a stage launched again (the run died) keeps the one from before it
+            try:
+                st["nested_base"] = nested_state(st["project"], skip)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+                ctx.q.log(key, f"warning: repositories inside the project not looked at before {stage}: {e}")
         # when the stage ran, for the run viewer: in place its session's folder is the project's
         st["launches"] = (st.get("launches") or [])[-(HISTORY_CAP - 1):] + [[since, 0]]
         ctx.q.save(st)
@@ -1194,12 +1298,22 @@ def run_agent(ctx, st, stage, prompt):
     # result instead of launching it again. fail/advance/block let it go.
     st["verify_only"] = {"stage": stage, "rc": rc, "out": out, "started": since / 1000}
     ctx.q.save(st)
-    if st.get("in_place"):
-        nested = nested_changes(st["project"])
-        if nested:
-            ctx.q.log(key, "changes in repositories inside the project, which the queue does not commit: "
-                           + ", ".join(nested[:20]))
+    moved = []
+    if isinstance(st.get("nested_base"), dict):
+        try:
+            moved = nested_moved(st["project"], st["nested_base"], skip)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            ctx.q.log(key, f"warning: repositories inside the project not looked at after {stage}: {e}")
+        st.pop("nested_base", None)
+        ctx.q.save(st)
     sync_vault(ctx, key, since)
+    if moved:
+        raise NestedMoved(
+            f"the {stage} agent changed repositories inside the project, which the queue does not verify, commit or "
+            f"push: {'; '.join(moved[:10])}. Look at them first (it may have been you, working there meanwhile): "
+            f"the ticket's branch would be pushed without them. harness queue retry {key} then checks the agent's "
+            f"result; a change they need is a ticket of its own (harness queue add KEY --project "
+            f"{st['project']}/<repository>)")
     return rc, out
 
 
@@ -1691,8 +1805,10 @@ IN_CLONE = "a clone of the project made for this ticket"
 IN_PLACE = ("the owner's own project folder, not a clone. It has the owner's uncommitted files: leave every file you "
             "do not change for the ticket alone; commit only files you changed, by name (git add <file>; never "
             "git add -A, git add . or git commit -a); never run git checkout/restore of files you did not change, "
-            "git reset --hard, git clean, git stash or git switch. Repositories inside it are not committed by harness: "
-            "change them only when the ticket needs it and say so in your commit message")
+            "git reset --hard, git clean, git stash or git switch. Repositories inside it (with their own .git) are "
+            "not the ticket's: change nothing in them, no edit, commit or branch switch; the queue does not verify, "
+            "commit or push them, and a change there stops the ticket. If the ticket needs one, say so in your commit "
+            "message")
 
 
 # The task card: a few lines a model on the cooperative route (no native tool
@@ -1702,7 +1818,7 @@ IN_PLACE = ("the owner's own project folder, not a clone. It has the owner's unc
 # says what the stage's checks look for, in their words.
 CARD_WHERE_IN_PLACE = ("the owner's own project folder, not a clone. Commit only files you changed, by name (never "
                        "git add -A, git add . or git commit -a); leave every other file alone (no git reset --hard, "
-                       "clean, stash, or checkout of files you did not change)")
+                       "clean, stash, or checkout of files you did not change); change nothing in repositories inside it")
 CARD_DONE = {
     "plan": "the plan is written to {PLAN_FILE}: # {KEY} plan, then ## Goal, ## Acceptance criteria (one bullet each, "
             "at most 15), ## Approach, ## Files, ## Questions, ## Assumptions. Change no code in this stage.",
@@ -2221,6 +2337,8 @@ def process(ctx, st):
         ctx.q.log(key, f"{st['stage']} (attempt {st['attempt'] + 1}, {ctx.model})")
         try:
             STAGES[st["stage"]](ctx, st)
+        except NestedMoved as e:   # kept: once the owner has looked, a retry checks the work
+            block(ctx, st, str(e), keep=True)
         except VerifierBroke as e:   # the work was not judged: kept for a retry that asks again
             stage = st["stage"]
             block(ctx, st, f"verifier failed at {stage}: {e}. The agent's work is kept: harness queue retry {key} "
@@ -2691,6 +2809,7 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
     if stage or fresh:   # the agent runs again; only a plain retry checks the kept result again
         st.pop("verify_only", None)
         st.pop("verified_sha", None)
+        st.pop("nested_base", None)
     if starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "must_fix", "warnings", "verify_only", "verified_sha"):
             st.pop(k, None)

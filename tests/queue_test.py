@@ -105,6 +105,21 @@ elif stage in ("implementing", "fixing"):
     if os.environ.get("FAKE_EDIT_PLAN"):  # an agent trying to move the goalposts
         open(os.path.join(vault, "wiki", "notes", "tickets", "ABC-1-plan.md"), "w").write(
             "## Acceptance criteria\n- Nothing at all\n")
+    for op, d in (x.split(":", 1) for x in os.environ.get("FAKE_NESTED", "").split(",") if x):
+        me = ("-c", "user.name=A", "-c", "user.email=a@example.com")
+        if op == "gitlink":    # a repository of its own, made and added whole
+            git("init", "-q", d)
+            git("-C", d, *me, "commit", "-q", "--allow-empty", "-m", "new")
+            git("add", d)
+            continue
+        if op == "switch":
+            git("-C", d, "switch", "-q", "-c", "agent")
+            continue
+        with open(os.path.join(d, "agent.txt"), "a") as f:   # edit, or commit
+            f.write("the agent was here\n")
+        if op == "commit":
+            git("-C", d, "add", "agent.txt")
+            git("-C", d, *me, "commit", "-q", "-m", "agent")
     name = os.environ.get("FAKE_FILE", "feature.txt")
     os.makedirs(os.path.dirname(name) or ".", exist_ok=True)
     with open(name, "a") as f:
@@ -2160,6 +2175,134 @@ class OrphanAgentTest(Base):
         rc, out = self.run_queue()
         self.assertTrue(self.gone(mine), out)
         self.assertEqual(self.status()["status"], "done", out)
+
+
+class NestedReposTest(Base):
+    """In place: repositories inside the project (their own .git, not submodules)
+    are not the ticket's; the queue never commits there, and a stage that changes
+    one is blocked with its result kept."""
+
+    def repo(self, rel, commit=True):
+        d = os.path.join(self.project, rel)
+        sh("git", "init", "-q", "-b", "main", d)
+        if commit:
+            put(os.path.join(d, "lib.txt"), "lib\n")
+            sh("git", "-C", d, "add", "lib.txt")
+            sh("git", "-C", d, "-c", "user.name=O", "-c", "user.email=o@example.com", "commit", "-q", "-m", "lib")
+        return d
+
+    def ignored_libA(self):
+        put(os.path.join(self.project, ".gitignore"), "libA/\n")
+        self.git_p("add", ".gitignore")
+        self.git_p("commit", "-q", "-m", "ignore libA")
+        return self.repo("libA")
+
+    def add_in_place(self, stages="implement,push"):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--stages", stages)
+        self.assertEqual(rc, 0, out)
+
+    def test_the_snapshot_leaves_repositories_inside_out(self):
+        # one with no commit failed the snapshot's git add -A; lib[1] is no glob
+        self.repo("libA", commit=False)
+        self.repo("vendor/x/libB", commit=False)
+        self.repo("lib[1]", commit=False)
+        put(os.path.join(self.project, "lx.txt"), "mine\n")
+        put(os.path.join(self.project, "vendor", "y.txt"), "mine too\n")
+        os.makedirs(os.path.join(self.project, "lib1"))
+        put(os.path.join(self.project, "lib1", "z.txt"), "what the glob lib[1]/ would take\n")
+        self.add_in_place()
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        tree = self.git_p("ls-tree", "-r", "--name-only", "refs/harness-queue/snap/ABC-1").split("\n")
+        self.assertIn("lx.txt", tree)
+        self.assertIn("vendor/y.txt", tree)
+        self.assertIn("lib1/z.txt", tree)
+        self.assertFalse([f for f in tree if f.startswith(("libA", "vendor/x", "lib["))], tree)
+        self.assertNotIn("no snapshot", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+    def test_a_commit_in_one_blocks_and_keeps_the_result(self):
+        lib = self.ignored_libA()
+        mine = sh("git", "-C", lib, "rev-parse", "HEAD").strip()
+        os.environ["FAKE_NESTED"] = "commit:libA"
+        self.add_in_place()
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", out)
+        self.assertIn("libA: 1 new commit(s), " + mine[:12], st["reason"])
+        self.assertIn("on main", st["reason"])
+        self.assertIn("--project " + self.project + "/<repository>", st["reason"])
+        self.assertEqual(st["verify_only"]["stage"], "implement")
+        self.assertNotIn("nested_base", st)
+        # the queue left libA as the agent did, and pushed nothing
+        self.assertEqual(sh("git", "-C", lib, "log", "-1", "--format=%s"), "agent\n")
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+        self.assertIn("libA", st["history"][-1]["details"][0])
+        # The owner looks; a plain retry checks the kept work without a new launch.
+        del os.environ["FAKE_NESTED"]
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(len(self.calls_of("implementing")), 1)
+        self.assertIn("ABC-1", sh("git", "-C", self.remote, "branch", "--list", "ABC-1"))
+
+    def test_a_branch_switch_in_one_blocks(self):
+        self.ignored_libA()
+        os.environ["FAKE_NESTED"] = "switch:libA"
+        self.add_in_place()
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("libA: switched from main to agent", st["reason"])
+
+    def test_the_owners_changes_there_are_theirs_and_the_agents_block(self):
+        lib = self.ignored_libA()
+        put(os.path.join(lib, "lib.txt"), "lib, the owner's edit\n")
+        put(os.path.join(lib, "notes.txt"), "the owner's\n")
+        self.add_in_place()
+        rc, out = self.run_queue()     # the agent leaves libA alone: the owner's changes are no matter
+        self.assertEqual(self.status()["status"], "done", out)
+        os.environ["FAKE_NESTED"] = "edit:libA"   # an uncommitted edit is a change there too
+        rc, out = self.q("retry", "ABC-1", "--stage", "implement")
+        self.assertEqual(rc, 0, out)
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("libA: uncommitted files changed: agent.txt", st["reason"])
+        self.assertEqual(cat(os.path.join(lib, "lib.txt")), "lib, the owner's edit\n")
+
+    def test_the_vault_and_the_projects_own_worktrees_are_not_ones(self):
+        # the vault inside the project (a repository the stages write), and a
+        # worktree of the project's: neither is a repository inside it
+        put(os.path.join(self.project, ".gitignore"), "vault/\n.wt/\n")
+        self.git_p("add", ".gitignore")
+        self.git_p("commit", "-q", "-m", "ignore")
+        self.vault = os.path.join(self.project, "vault")
+        sh("git", "init", "-q", self.vault)
+        os.environ["FAKE_VAULT"] = self.vault
+        self.git_p("worktree", "add", "-q", "-b", "wt", os.path.join(self.project, ".wt", "x"))
+        os.environ["FAKE_NESTED"] = "commit:.wt/x"
+        self.add_in_place("plan,implement,push")
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(tq.nested_repos(self.project, (self.vault,)), [])
+        self.assertEqual(tq.nested_repos(self.project), ["vault"])
+
+    def test_a_repository_committed_whole_fails(self):
+        os.environ["FAKE_NESTED"] = "gitlink:newlib"
+        self.add_in_place()
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("newlib: a repository inside the project is committed as a bare pointer", st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+
+    def test_the_prompt_and_card_say_so(self):
+        self.add_in_place("implement")
+        self.run_queue()
+        self.assertIn("change nothing in them, no edit, commit or branch switch", cat(self.calls + ".implementing"))
+        card = json.loads(cat(self.calls + ".card").splitlines()[-1])
+        self.assertTrue(card["where"].endswith("change nothing in repositories inside it"))
 
 
 if __name__ == "__main__":

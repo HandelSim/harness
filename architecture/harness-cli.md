@@ -726,8 +726,22 @@ index), and the owner's untracked and changed paths go in a marked block of
 `.git/info/exclude` that is removed after the stage. `in_place_problems`
 fails a stage when the folder has a rebase or merge going, a left-over
 `index.lock`, is not on the branch, or a commit since the start touches a
-file the owner had changed or untracked; changes inside nested repos are
-only logged. Windows container launches cannot work in place (`--host`).
+file the owner had changed or untracked. Repositories inside the project
+(their own `.git`, not the ticket's; `nested_repos`: three levels down,
+ignored ones too, any deeper one `git add -A` meets; not the project's own
+worktrees, nor the vault or the queue's state) are left out of the snapshot
+(`:(exclude,literal)`, so one with no commit no longer fails it), and each
+in-place stage records their HEAD, branch and uncommitted paths
+(`nested_base`, kept for a stage launched again after a crash). A stage that
+changed one (`nested_moved`: a commit, a branch switch, an uncommitted path
+added, edited or gone; a repository made since is not one) raises
+`NestedMoved`: blocked with the agent's result kept, since the verifier never
+sees those repositories and the push would go without them; a plain `retry`
+checks the result once the owner has looked. `check_change` fails a commit
+that adds a gitlink (a repository committed whole). A ticket's change in
+another repository is a ticket of its own (`add --project <top>/<repo>`);
+carrying several repositories in one ticket is not built.
+Windows container launches cannot work in place (`--host`).
 Each launch gets `HARNESS_QUEUE_LAUNCH` (a nonce), which harness puts on its
 container as `harness.queue-launch` and which stops `--ticket` being
 remembered for the folder; in-place stages also record `launches` windows,
