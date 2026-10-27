@@ -317,6 +317,15 @@ details.doc summary .muted { font-weight: 400; }
 .wide { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 360px); gap: 18px; align-items: start; }
 .wide2 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; align-items: start; }
 @media (max-width: 1020px) { .wide, .wide2 { grid-template-columns: minmax(0, 1fr); } }
+/* A long transcript scrolls; the session's side panel (message box, Stop, todo list,
+   facts) and a ticket's buttons stay in view, under the top bar. */
+@media (min-width: 821px) {
+  .cols > .stick { position: sticky; top: 68px; max-height: calc(100vh - 84px); overflow-y: auto;
+    overscroll-behavior: contain; scrollbar-width: thin; border-radius: 12px; }
+  #r-acts { position: sticky; top: 60px; z-index: 10; }
+}
+#add { scroll-margin-top: 68px; transition: box-shadow .3s; }
+#add.hl { box-shadow: 0 0 0 2px var(--accent); }
 @media (max-width: 1180px) {
   .tk { grid-template-columns: 22px minmax(0, 1fr) auto; padding: 12px 14px; }
   .tk .strip { grid-column: 2 / -1; grid-row: 2; max-width: 520px; }
@@ -1338,38 +1347,47 @@ def _projects(runs):
     return seen
 
 
-def add_form(runs):
+def add_form(runs, form=None, err=""):
+    """The Add tickets form; after a refused add, the values sent (form) and
+    why it was refused (err), so nothing typed is lost."""
     projects = _projects(runs)
-    presets = "".join(f"<label><input type='radio' name='preset' value='{v}'{' checked' if v == 'full' else ''}>"
-                      f"{esc(lab)}<small>{esc(hint)}</small></label>" for v, lab, hint in PRESET_LABELS)
-    presets += ("<label><input type='radio' name='preset' value='custom'>Custom"
-                "<small>pick the stages below</small></label>")
-    checks = "".join(f"<label><input type='checkbox' name='stage_{s}' value='{s}' checked> {s}</label>" for s in STAGES)
+    v = (lambda name: _one(form, name)) if form is not None else (lambda name: "")
+    preset = v("preset") if v("preset") in (*PRESETS, "custom") else "full"
+    on = PRESETS[preset] if preset in PRESETS else [s for s in STAGES if v("stage_" + s)]
+    presets = "".join(f"<label><input type='radio' name='preset' value='{p}'{' checked' if p == preset else ''}>"
+                      f"{esc(lab)}<small>{esc(hint)}</small></label>" for p, lab, hint in PRESET_LABELS)
+    presets += (f"<label><input type='radio' name='preset' value='custom'{' checked' if preset == 'custom' else ''}>"
+                "Custom<small>pick the stages below</small></label>")
+    checks = "".join(f"<label><input type='checkbox' name='stage_{s}' value='{s}'{' checked' if s in on else ''}> "
+                     f"{s}</label>" for s in STAGES)
     opts = "".join(f"<option value='{esc(p)}'>" for p in projects)
-    return ("<section class='panel' id='add'><div class='hd'><h2>Add tickets</h2></div>"
+    project = v("project") if form is not None else (projects[0] if projects else "")
+    return (f"<section class='panel' id='add'{' data-err=1' if err else ''}><div class='hd'><h2>Add tickets</h2></div>"
+            + (f"<p class='err' role='alert'>Not added: {esc(err)}</p>" if err else "") +
             "<form method='post' action='/runs/queue/add' id='addform' class='stack'>"
             "<div class='grid2'>"
             "<label class='fld'>Ticket keys<input name='keys' required autocomplete='off' spellcheck='false' "
-            "placeholder='ABC-123 ABC-124'><small>one or more, space or comma separated</small></label>"
+            f"value='{esc(v('keys'))}' placeholder='ABC-123 ABC-124'>"
+            "<small>one or more, space or comma separated</small></label>"
             f"<label class='fld'>Project folder<input name='project' required list='projects' spellcheck='false' "
-            f"value='{esc(projects[0] if projects else '')}' placeholder='/home/me/src/project'>"
+            f"value='{esc(project)}' placeholder='/home/me/src/project'>"
             f"<datalist id='projects'>{opts}</datalist><small>the git repository the work is in (absolute path)</small></label>"
-            "<label class='fld'>Base<input name='base' spellcheck='false' placeholder='the project&#39;s current branch'>"
-            "<small>branch or commit the work goes onto</small></label>"
-            "<label class='fld'>Existing work<input name='ref' spellcheck='false' placeholder='origin/ABC-123'>"
-            "<small>where a solution already is: the ticket branch starts there</small></label>"
+            f"<label class='fld'>Base<input name='base' spellcheck='false' value='{esc(v('base'))}' "
+            "placeholder='the project&#39;s current branch'><small>branch or commit the work goes onto</small></label>"
+            f"<label class='fld'>Existing work<input name='ref' spellcheck='false' value='{esc(v('ref'))}' "
+            "placeholder='origin/ABC-123'><small>where a solution already is: the ticket branch starts there</small></label>"
             "</div>"
             f"<fieldset><legend>What still needs doing</legend><div class='presets'>{presets}</div>"
             f"<div class='checks' id='stagechecks'>{checks}</div></fieldset>"
             "<label class='fld'>Note for the agents<textarea name='note' maxlength='4000' "
             "placeholder='Context every stage gets, e.g. the solution is on origin/ABC-3122; only the "
-            "review is left.'></textarea></label>"
+            f"review is left.'>{esc(v('note'))}</textarea></label>"
             "<div class='formacts'><button type='submit' class='primary'>Add to the queue</button>"
             "<span class='muted' id='addhint'>Review without implement needs the existing work's ref.</span></div>"
             "</form></section>")
 
 
-def render_queue_page(runs, msg="", bad=False):
+def render_queue_page(runs, msg="", bad=False, form=None, err=""):
     d = queue_live(runs)
     return [_live_tag("/runs/queue/live", d["sig"]),
             "<header class='ph'><h1>Queue</h1><a class='btn sm' href='#add'>+ Add tickets</a>"
@@ -1378,7 +1396,7 @@ def render_queue_page(runs, msg="", bad=False):
             _flash(msg, bad),
             f"<div id='r-runner'>{d['regions']['runner']}</div>",
             f"<section class='panel flush' id='r-tickets'>{d['regions']['tickets']}</section>",
-            add_form(runs)]
+            add_form(runs, form, err)]
 
 
 # --- /runs/ticket/KEY ---------------------------------------------------------------
@@ -1723,6 +1741,18 @@ def ticket_action(runs, key, action, form):
     return _queue(runs, ["note", key, "--stdin"], text)
 
 
+def project_path(p, nt=os.name == "nt"):
+    """A project folder as it gets pasted: no surrounding blanks or quotes (Windows'
+    Copy as path quotes it), ~ expanded, and on Windows a Git Bash /c/... path as
+    C:/..., which Windows Python does not resolve."""
+    p = p.strip()
+    if len(p) > 1 and p[0] == p[-1] and p[0] in "\"'":
+        p = p[1:-1].strip()
+    p = os.path.expanduser(p)
+    m = re.match(r"/([A-Za-z])(/.*)?$", p) if nt else None
+    return f"{m.group(1).upper()}:{m.group(2) or '/'}" if m else p
+
+
 def add_tickets(runs, form):
     """The queue page's Add form: harness queue add, its values checked first."""
     raw = _one(form, "keys")
@@ -1734,7 +1764,7 @@ def add_tickets(runs, form):
     bad = [k for k in keys if not KEY_RE.match(k) or len(k) > 40]
     if bad:
         return False, "not a ticket key (like ABC-123): " + ", ".join(bad[:5])[:200]
-    project = _one(form, "project").strip()
+    project = project_path(_one(form, "project"))
     if not project or not os.path.isabs(project) or not os.path.isdir(project):
         return False, "the project folder must be an absolute path to a folder that exists"
     base, ref = _one(form, "base").strip(), _one(form, "ref").strip()
@@ -1911,12 +1941,29 @@ COMMON_JS = """
     }
     if (m && !window.confirm(m)) { e.preventDefault(); return; }
     var b = e.submitter || f.querySelector('button[type=submit]');
-    if (b) setTimeout(function () { b.disabled = true; }, 0);
+    if (b) setTimeout(function () { b.disabled = true; b.setAttribute('data-busy', '1'); }, 0);
   }, true);
+  // Back to a page the browser kept: its buttons are not still busy.
+  window.addEventListener('pageshow', function () {
+    document.querySelectorAll('[data-busy]').forEach(function (b) { b.disabled = false; b.removeAttribute('data-busy'); });
+  });
   if (/[?&]done=/.test(location.search) && history.replaceState)
     history.replaceState(null, '', location.pathname + location.hash);
   var add = document.getElementById('addform');
+  function toAdd(smooth) {
+    var p = document.getElementById('add');
+    p.scrollIntoView({behavior: smooth ? 'smooth' : 'auto', block: 'start'});
+    var k = add.querySelector('input[name=keys]');
+    if (k) k.focus({preventScroll: true});
+    p.classList.add('hl');
+    setTimeout(function () { p.classList.remove('hl'); }, 1500);
+  }
   if (add) {
+    document.addEventListener('click', function (e) {
+      var a = e.target.closest && e.target.closest('a[href="#add"]');
+      if (a) { e.preventDefault(); toAdd(true); }
+    });
+    if (document.getElementById('add').hasAttribute('data-err')) toAdd(false);
     var presets = %PRESETS%;
     var checks = add.querySelectorAll('input[name^=stage_]');
     var hint = document.getElementById('addhint');
@@ -2093,7 +2140,7 @@ def render_detail(runs, sid, sent="", follow="", oc_url=None, msg="", bad=False)
              + f">{render_messages(msgs, sid)}</div>"
              + ("" if msgs else "<div class='panel muted' id='nomsg'>No messages yet.</div>") +
              "<span id='end'></span></div>",
-             f"<div class='stack'><section class='panel' id='side'>"
+             f"<div class='stack stick'><section class='panel' id='side'>"
              f"{render_side(runs, src, row, live, sent, todos_of(msgs), link)}</section></div></div>"]
     return title, parts, POLL_JS
 

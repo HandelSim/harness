@@ -1070,6 +1070,10 @@ def make_handler(cfg):
                 return
             ok, msg = runs_view.queue_action(cfg.runs, action, form)
             sys.stderr.write(f"[pub] queue {action} from {user or 'local'}: {msg}\n")
+            if not ok and action == "add":   # the form again, with what was typed and why not
+                self.send_runs(409, "harness: queue", runs_view.render_queue_page(cfg.runs, form=form, err=msg),
+                               runs_view.LIVE_JS, active="queue")
+                return
             if not ok:
                 self.refused(msg, "/runs/queue", "Back to the queue")
                 return

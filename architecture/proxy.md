@@ -357,6 +357,19 @@ queue` stage keeps its whole prompt while it runs: the model loses the stage
 prompt from view after its first tool call. A key that is not `ABC-123` shaped or is over 40
 characters, or a ticket without a vault, adds nothing.
 
+## Instruction-file line
+
+opencode puts every instruction file it loaded into the system prompt as
+`Instructions from: <path>` followed by its text: the project's `AGENTS.md`
+(or `CLAUDE.md`) found from the working directory up, the global one, and the
+config `instructions` (vault `AGENTS.md`, ticket, task file). On the
+cooperative route the Environment bullet names those paths
+(`_extract_instruction_files` over every system message, `_instructions_clause`)
+and says to `read` them again when their text is not in the conversation, since
+a free model loses it with the rest of a long history. Paths only, never the
+text; URLs, paths over 400 characters or with control characters or backticks
+are dropped, at most 6 are named, and no such block adds nothing.
+
 ## Cooperative-prompt modes (`PROXY_PROMPT_MODE`)
 
 The upstream doesn't natively support tool calls, so the proxy injects a

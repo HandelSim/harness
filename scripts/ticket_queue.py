@@ -735,12 +735,38 @@ def drop(path):
             os.remove(path)
 
 
+INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md", "CONTEXT.md")   # what opencode looks for, in its order
+
+
+def copy_instructions(project, repo):
+    """The project's own AGENTS.md (or CLAUDE.md, CONTEXT.md) into the clone when
+    the clone has none: a clone has only what is committed, so an instruction file
+    kept uncommitted in the project would never reach the agent. Listed in the
+    clone's .git/info/exclude, so it is never committed or pushed. Before every
+    stage, so a file added since the clone is picked up."""
+    for name in INSTRUCTION_FILES:
+        src, dst = os.path.join(project, name), os.path.join(repo, name)
+        if not os.path.isfile(src) or os.path.lexists(dst):
+            continue
+        try:
+            shutil.copyfile(src, dst)
+            exclude = os.path.join(repo, ".git", "info", "exclude")
+            os.makedirs(os.path.dirname(exclude), exist_ok=True)
+            with open(exclude, "a+", encoding="utf-8") as f:
+                f.seek(0)
+                if f"/{name}" not in f.read().splitlines():
+                    f.write(f"\n/{name}\n")
+        except OSError as e:
+            print(f"[queue] warning: could not copy {src} into the clone: {e}", file=sys.stderr)
+
+
 def launch(ctx, st, cmd, out, since):
     """Run the agent to its end, a timeout (rc 124), or the owner's stop or halt (Interrupted)."""
     key = st["key"]
     env = dict(os.environ, HARNESS_HOST_CONFIRM="1")
     end = time.monotonic() + ctx.stage_timeout
     notes_at = mtime(ctx.q.notes_path(key))
+    copy_instructions(st["project"], os.path.join(ctx.q.dir(key), "repo"))
     with open(out, "w", encoding="utf-8") as f:
         p = subprocess.Popen(cmd, cwd=os.path.join(ctx.q.dir(key), "repo"), stdin=subprocess.DEVNULL,
                              stdout=f, stderr=subprocess.STDOUT, env=env, **NEW_GROUP)

@@ -3291,6 +3291,35 @@ def _extract_working_directory(system_content):
     return m.group(1).strip() or None
 
 
+# opencode puts each instruction file it loaded (the project's AGENTS.md or
+# CLAUDE.md found from the cwd up, the global one, the config `instructions`:
+# vault AGENTS.md, ticket, task file) into the system prompt as
+# `Instructions from: <path>` + its text. A cooperative model loses that text
+# with the rest of a long history, so the Environment bullet names the files,
+# every turn, and says to read them again when their text is gone. Pointers,
+# never the text; URLs (fetched, not readable) are left out.
+_INSTRUCTIONS_RE = re.compile(r"Instructions from: ([^\n]+)")
+_INSTRUCTION_FILES_MAX = 6
+
+
+def _extract_instruction_files(system_content):
+    out = []
+    for m in _INSTRUCTIONS_RE.finditer(system_content or ""):
+        p = m.group(1).strip()
+        if (p and p not in out and len(p) <= 400 and not any(ord(c) < 32 or c == "`" for c in p)
+                and not p.startswith(("http://", "https://"))):
+            out.append(p)
+    return out[:_INSTRUCTION_FILES_MAX]
+
+
+def _instructions_clause(files):
+    if not files:
+        return ""
+    return (" Instruction files for this session: " + ", ".join(f"`{p}`" for p in files)
+            + ". They hold the rules for this project and session; when their text is not in this"
+            " conversation, `read` them before you act.")
+
+
 # A launch with an active vault sends `x-harness-vault: <vault path>` (a
 # provider header in the opencode overlay). A cooperative model gets the
 # vault's AGENTS.md only at the start of a long, truncated history, so the
@@ -3324,7 +3353,7 @@ def _vault_clause(vault, ticket=None):
 
 
 def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_details=None, working_directory=None, todos=None,
-                                             vault=None, ticket=None):
+                                             vault=None, ticket=None, instruction_files=None):
     """In hybrid mode the full tool definitions sit at the stable prefix
     (the system message; with _CHANGE_SYSTEM_TO_USER on, the user-role
     message at index 0). The recency message that lands on the LAST user
@@ -3407,6 +3436,7 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         )
     else:
         cwd_clause = ""
+    cwd_clause += _instructions_clause(instruction_files)
     if vault:
         cwd_clause += _vault_clause(vault, ticket)
     tool_entries = _format_tool_entries(tool_signatures, tool_details)
@@ -4168,6 +4198,10 @@ def translate_history_and_apply_prompt(
                     else ""
                 )
                 working_directory = _extract_working_directory(system_content)
+                # opencode may split its system prompt over two system
+                # messages (prompt + env, then the instruction files).
+                instruction_files = _extract_instruction_files("\n".join(
+                    _flatten_content_to_str(m["content"]) for m in messages if m["role"] == "system"))
                 # Replayed from the raw inbound history (tool_calls are
                 # flattened into prose in `messages` by this point), so the
                 # list reaches recency even when the upstream has dropped
@@ -4181,6 +4215,7 @@ def translate_history_and_apply_prompt(
                     todos=todos,
                     vault=vault,
                     ticket=ticket,
+                    instruction_files=instruction_files,
                 )
 
     if _PROMPT_MODE == "single":

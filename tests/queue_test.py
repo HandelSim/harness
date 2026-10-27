@@ -267,6 +267,23 @@ class QueueTest(Base):
         self.assertIn("an unrelated bug", out)
         self.assertIn("plan verifier: PASS", cat(os.path.join(self.state, "run.log")))
 
+    def test_an_uncommitted_agents_md_reaches_the_clone_and_is_never_committed(self):
+        put(os.path.join(self.project, "AGENTS.md"), "Use tabs.\n")
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+        repo = os.path.join(self.state, "ABC-1", "repo")
+        self.assertEqual(cat(os.path.join(repo, "AGENTS.md")), "Use tabs.\n")
+        self.assertIn("/AGENTS.md", cat(os.path.join(repo, ".git", "info", "exclude")).splitlines())
+        self.assertNotIn("AGENTS.md", sh("git", "-C", repo, "status", "--porcelain", "--untracked-files=all"))
+        self.assertNotIn("AGENTS.md", sh("git", "-C", self.remote, "ls-tree", "-r", "--name-only", "ABC-1"))
+        # A file the clone has already is left alone; copying again adds no second exclude line.
+        put(os.path.join(repo, "CLAUDE.md"), "the clone's\n")
+        put(os.path.join(self.project, "CLAUDE.md"), "the project's\n")
+        tq.copy_instructions(self.project, repo)
+        self.assertEqual(cat(os.path.join(repo, "CLAUDE.md")), "the clone's\n")
+        self.assertEqual(cat(os.path.join(repo, ".git", "info", "exclude")).splitlines().count("/AGENTS.md"), 1)
+
     def test_blocking_question_waits_for_an_answer(self):
         os.environ["FAKE_BLOCKING"] = "1"
         self.add("ABC-1", "ABC-2")

@@ -572,6 +572,18 @@ class QueuePageTest(RunsServer):
             self.assertEqual(r.status, 409, fields)
             self.assertIn(why, body)
         self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-9")))
+        # a refused add is the queue page again: the reason in the form, nothing typed lost
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-9"), ("project", "relative/dir"), ("base", "dev"),
+                                                ("preset", "custom"), ("stage_review", "review"),
+                                                ("ref", "origin/x"), ("note", "keep <me>")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("id='add' data-err=1", body)
+        self.assertIn("Not added: the project folder", body)
+        for frag in ("name='keys' required autocomplete='off' spellcheck='false' value='ABC-9'",
+                     "value='dev'", "value='origin/x'", ">keep &lt;me&gt;</textarea>",
+                     "value='custom' checked", "value='review' checked", "value='plan'> plan"):
+            self.assertIn(frag, body)
+        self.assertNotIn("keep <me>", body)
         r, _ = self.post("/runs/queue/add", good, origin="http://evil.example")
         self.assertEqual(r.status, 403)
         r, body = self.post("/runs/ticket/ABC-12/remove")
@@ -588,6 +600,16 @@ class QueuePageTest(RunsServer):
         self.assertIn("host mode is OK", body)
         r, _ = self.post("/runs/queue/nope")
         self.assertEqual(r.status, 404)
+
+    def test_project_path_as_pasted(self):
+        self.assertEqual(runs.project_path('  "/home/me/p"  '), "/home/me/p")
+        self.assertEqual(runs.project_path("'/home/me/p'"), "/home/me/p")
+        self.assertEqual(runs.project_path("~/p"), os.path.expanduser("~/p"))
+        self.assertEqual(runs.project_path("/c/Users/me/p", nt=True), "C:/Users/me/p")
+        self.assertEqual(runs.project_path("/d", nt=True), "D:/")
+        self.assertEqual(runs.project_path("/c/Users/me/p", nt=False), "/c/Users/me/p")
+        self.assertEqual(runs.project_path("/home/me", nt=True), "/home/me")
+        self.assertEqual(runs.project_path('"C:\\Users\\me\\p"', nt=True), "C:\\Users\\me\\p")
 
     def test_runner_status_from_run_json_and_halt(self):
         self.ticket(status="running")

@@ -649,7 +649,10 @@ for the same reason) and keeps `run.json` (`pid`, `started`, `beat` every 3 s,
 
 Stages, each a fresh `harness [host] -p --yolo --ticket KEY -m MODEL PROMPT`
 in `state/queue/KEY/repo` (a clone at the base on branch `KEY`, its origin
-removed): `plan` → `implement` → `review` → `fix` (once, when the review has
+removed; before each stage the project's own `AGENTS.md`, `CLAUDE.md` or
+`CONTEXT.md` is copied in when the clone has none, since a clone has only
+what is committed, and listed in the clone's `.git/info/exclude` so it is
+never committed or pushed): `plan` → `implement` → `review` → `fix` (once, when the review has
 Must fix items) → `push`. The prompt (`scripts/queue_prompts/<stage>.md`)
 embeds the ticket, plan, answers and the last attempt's problems, capped to
 fit one argv argument, because the free models only read the last message.
@@ -1266,8 +1269,12 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
   or Review plan, stop, retry, remove); and the Add form (keys,
   project folder, base, the existing work's ref such as `origin/ABC-123`,
   a note for the agents, and the stages: Full, Review only,
-  Implement+review, Plan only or Custom). `/runs/queue/live` is the JSON
-  the page polls.
+  Implement+review, Plan only or Custom). "+ Add tickets" scrolls to the
+  form and focuses the keys. The project folder is taken as pasted: quotes
+  and blanks around it dropped, `~` expanded, and on Windows a Git Bash
+  `/c/...` path read as `C:/...`. A refused add shows the queue page again
+  (409) with the reason in the form and every value kept. `/runs/queue/live`
+  is the JSON the page polls.
 - `/runs` (`?q=` filter): live runs, queue tickets with their sessions by
   stage, then every session newest first. The index shows the live ones in
   an "Agent runs" panel.
@@ -1283,7 +1290,9 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
   (the queue and ticket for a stage) and a side panel: for a live run the
   message box first, a "Stop this stage" button for a queue stage, then the
   session's latest todo list, then agent, model, tokens, cost, directory,
-  ticket, subagents. A host session gets "Open in opencode web" when this
+  ticket, subagents. On a wide screen the side panel stays in view while the
+  transcript scrolls (sticky, scrolling on its own when taller than the
+  window), as does a ticket page's row of buttons. A host session gets "Open in opencode web" when this
   page runs under `harness serve` (`/server/<base64url(origin)>/session/<id>`
   on opencode's own server, with the Basic login in the link as on the
   index; container sessions live in another database, so none). A nonce

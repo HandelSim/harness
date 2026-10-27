@@ -2054,6 +2054,34 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
         self.assertIn('"this folder"', c)
         self.assertIn('"here"', c)
 
+    def test_instruction_files_named_at_recency(self):
+        """opencode's `Instructions from: <path>` blocks (the project's
+        AGENTS.md, the global one, config instructions), in either system
+        message, are named in the Environment bullet with the order kept and
+        a pointer to read them again; their text is not repeated, URLs and
+        bad paths are dropped."""
+        msgs = [
+            {"role": "system", "content": "You are opencode.\n<env>\n  Working directory: /w/proj\n</env>\n"
+                                          "Instructions from: /w/proj/AGENTS.md\nRule: use tabs."},
+            {"role": "system", "content": "Instructions from: /home/u/.config/opencode/AGENTS.md\nbe brief\n\n"
+                                          "Instructions from: https://example.com/rules.md\nx\n\n"
+                                          "Instructions from: /w/proj/AGENTS.md\nRule: use tabs.\n\n"
+                                          "Instructions from: /bad`path\ny"},
+            {"role": "user", "content": "do the thing"},
+        ]
+        tools_text = proxy.format_tools_to_text(self.tools)
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            out = proxy.translate_history_and_apply_prompt(msgs, tools_text, tools=self.tools)
+        c = out[-1]["content"]
+        self.assertIn("Instruction files for this session: `/w/proj/AGENTS.md`, "
+                      "`/home/u/.config/opencode/AGENTS.md`.", c)
+        self.assertIn("`read` them before you act", c)
+        self.assertNotIn("example.com", c)
+        self.assertNotIn("bad`path", c)
+        self.assertEqual(proxy._extract_instruction_files(
+            "".join(f"Instructions from: /f{i}\n" for i in range(9))), [f"/f{i}" for i in range(6)])
+        self.assertEqual(proxy._instructions_clause([]), "")
+
     def test_cwd_clause_absent_when_system_has_no_working_directory(self):
         """No `Working directory:` line in the inbound system prompt (a
         non-opencode upstream, or a future opencode rename) => the
@@ -2070,6 +2098,7 @@ class TestHybridConsolidatedRecency(unittest.TestCase):
             )
         c = out[-1]["content"]
         self.assertNotIn("The working directory for this turn is", c)
+        self.assertNotIn("Instruction files", c)
         # Environment still renders the load-bearing facts (host bind-mount,
         # reproducibility) — only the CWD clause drops.
         self.assertIn("- Environment:", c)
