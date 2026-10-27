@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1970,6 +1971,135 @@ class AddGuardTest(Base):
             release.set()
             t.join()
         self.assertEqual(rc, 1, out)
+
+
+class RetryMatrixTest(Base):
+    """Every status x (retry, retry --stage S): refused leaving state.json as it was, or
+    queued with its counters, reason and last go's results cleared, and a run then
+    takes it to an end (done or plan-review), never stranded."""
+
+    def make(self, status):
+        if status == "plan-review":
+            rc, out = self.q("add", "ABC-1", "--project", self.project, "--review-plan")
+            self.assertEqual(rc, 0, out)
+        else:
+            self.add("ABC-1")
+        if status == "queued":
+            return
+        if status == "stopped":
+            self.q("stop", "ABC-1")
+        elif status == "needs-answers":
+            os.environ["FAKE_BLOCKING"] = "1"
+            self.run_queue()
+        elif status in ("blocked", "running-orphan"):
+            os.environ["FAKE_NO_COMMIT"] = "1"
+            self.run_queue()
+            if status == "running-orphan":   # a run that died left it running, no run holds it
+                st = self.status()
+                st["status"] = "running"
+                tq.Queue(self.state).save(st)
+        else:
+            self.run_queue()
+        for k in ("FAKE_BLOCKING", "FAKE_NO_COMMIT"):
+            os.environ.pop(k, None)
+
+    def test_matrix(self):
+        statuses = ("queued", "stopped", "needs-answers", "plan-review", "blocked", "running-orphan", "done")
+        want = {"done": "done", "plan-review": "plan-review"}
+        table, pauses = [], self.pauses
+        self.addCleanup(setattr, self, "pauses", pauses)
+        for status in statuses:
+            for stage in (None,) + tq.ALL_STAGES:
+                with self.subTest(status=status, stage=stage):
+                    self.setUp()
+                    try:
+                        self.make(status)
+                        before = self.status()
+                        self.assertEqual(before["status"], status.replace("running-orphan", "running"))
+                        rc, out = self.q("retry", "ABC-1", *(("--stage", stage) if stage else ()))
+                        st = self.status()
+                        if rc:
+                            self.assertEqual({k: v for k, v in st.items() if k != "updated"},
+                                             {k: v for k, v in before.items() if k != "updated"}, out)
+                            table.append((status, stage or "-", "refused: " + out.strip().splitlines()[-1][8:90]))
+                            continue
+                        self.assertEqual((st["status"], st["attempt"], st["reason"]), ("queued", 0, ""), out)
+                        self.assertEqual(st["stage"], stage or st["stage"])
+                        for k in tq.RESULTS:
+                            self.assertNotIn(k, st)
+                        rc, out = self.run_queue()
+                        end = self.status()
+                        if end["status"] == "blocked" and "branch ABC-1 has commits that" in end["reason"]:
+                            # a pushed ticket from the start would drop its pushed commits: the setup refuses
+                            table.append((status, stage or "-", f"queued at {st['stage']} -> blocked: pushed branch"))
+                            continue
+                        self.assertIn(end["status"], want.values(), out + str(end.get("reason")))
+                        table.append((status, stage or "-", f"queued at {st['stage']} -> {end['status']}"))
+                    finally:
+                        self.tearDown()
+        print("\nretry matrix:")
+        for row in table:
+            print("  %-15s %-10s %s" % row)
+
+
+@unittest.skipUnless(os.path.isdir("/proc"), "finds the agent through /proc")
+class OrphanAgentTest(Base):
+    def spawn(self, launch):
+        """An agent whose run is gone: its own group, not this process's child (init reaps it)."""
+        pid = int(subprocess.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], start_new_session=True,
+                                 env=dict(os.environ, HARNESS_QUEUE_LAUNCH=launch), capture_output=True,
+                                 text=True).stdout)
+        p = types.SimpleNamespace(pid=os.getpgid(pid), poll=lambda: None if self.alive(pid) else 0)
+        self.addCleanup(lambda: self.alive(pid) and os.kill(pid, 9))
+        return p
+
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split(") ")[1][0] != "Z"
+
+    def orphan(self, pid, launch):
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add("ABC-1")
+        self.run_queue()
+        del os.environ["FAKE_NO_COMMIT"]
+        st = self.status()
+        st.update(status="running", agent={"pid": pid, "launch": launch, "host": socket.gethostname(),
+                                           "container": False, "workdir": self.project})
+        tq.Queue(self.state).save(st)
+
+    def gone(self, p, secs=10):
+        end = time.time() + secs
+        while time.time() < end and p.poll() is None:
+            time.sleep(0.1)
+        return p.poll() is not None
+
+    def test_retry_ends_the_agent_a_dead_run_left(self):
+        mine, other = self.spawn("L-1"), self.spawn("L-2")
+        self.orphan(mine.pid, "L-1")
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.gone(mine), out)
+        self.assertIsNone(other.poll())
+        self.assertNotIn("agent", self.status())
+
+    def test_a_pid_that_is_not_that_launch_is_left_alone(self):
+        other = self.spawn("L-2")
+        self.orphan(other.pid, "L-1")
+        rc, out = self.q("remove", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.gone(other, 1))
+
+    def test_run_ends_the_orphan_before_taking_the_ticket(self):
+        mine = self.spawn("L-1")
+        self.orphan(mine.pid, "L-1")
+        rc, out = self.run_queue()
+        self.assertTrue(self.gone(mine), out)
+        self.assertEqual(self.status()["status"], "done", out)
 
 
 if __name__ == "__main__":
