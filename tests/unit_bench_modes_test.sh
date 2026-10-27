@@ -107,7 +107,12 @@ fi
 grep -q 'HARNESS_HOST_NO_WEB:-0}" == "1" ]] && unset OPENCODE_ENABLE_EXA' \
     < <(sed -n '/^host_opencode_env()/,/^}/p' "$HARNESS") \
     || fail "T5: host_opencode_env keeps Exa on under HARNESS_HOST_NO_WEB"
-sed -n '/^host_run_opencode()/,/^}/p' "$HARNESS" | grep -q '^    host_opencode_env$' \
+# Process substitution, not `sed | grep`: under `set -o pipefail`, grep -q
+# matches early in the ~90-line extract and closes the pipe, killing sed with
+# SIGPIPE (141), which pipefail would surface as the pipeline's status and trip
+# `fail` despite the match. Mirrors the two checks above.
+grep -q '^    host_opencode_env$' \
+    < <(sed -n '/^host_run_opencode()/,/^}/p' "$HARNESS") \
     || fail "T5: host_run_opencode no longer calls host_opencode_env"
 ok "T5: HARNESS_HOST_NO_WEB turns off web tools, Exa and sharing; default unchanged"
 
