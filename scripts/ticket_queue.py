@@ -318,7 +318,7 @@ def note_paths(vault, key):
     return {"plan": os.path.join(d, f"{key}-plan.md"), "review": os.path.join(d, f"{key}-review.md"),
             "findings": os.path.join(d, f"{key}-findings.md"), "answers": os.path.join(d, f"{key}-answers.md"),
             "state": os.path.join(d, f"{key}-state.md"), "log": os.path.join(d, f"{key}-log.md"),
-            "task": os.path.join(d, f"{key}-task.md"),
+            "task": os.path.join(d, f"{key}-task.md"), "result": os.path.join(d, f"{key}-result.md"),
             "ticket": os.path.join(vault, ".raw", "tickets", f"{key}.md")}
 
 
@@ -928,7 +928,7 @@ def check_change(st, change, plan_text):
             problems.append(f"{f}: changes under .github/ (CI) are not made by the queue; leave CI to the owner")
         if SECRET_PATH.search(f):
             problems.append(f"{f}: a secret or key file must not be committed")
-    notes = tuple(f"{st['key']}-{k}.md".lower() for k in ("plan", "review", "answers", "findings", "task"))
+    notes = tuple(f"{st['key']}-{k}.md".lower() for k in ("plan", "review", "answers", "findings", "task", "result"))
     for f in files:
         if f.lower().endswith(notes):
             problems.append(f"{f}: the queue's notes live in the vault, not the branch; git rm it")
@@ -1912,15 +1912,19 @@ def stage_push(ctx, st):
     if change is None:
         return block(ctx, st, "the branch is gone from the clone")
     sha, name = change[0], branch_of(st)
+    if st.get("verified_sha") and st["verified_sha"] != sha:
+        return block(ctx, st, f"branch {name} moved since it was checked ({st['verified_sha'][:12]}, now {sha[:12]}): "
+                              f"look at what was added; harness queue retry {key} --stage push pushes it as it is")
     branch = f"refs/heads/{name}"
     old = git(project, "rev-parse", "-q", "--verify", branch, check=False).stdout.strip()
+    warnings = list(st.get("warnings") or [])
     if st.get("in_place"):
         pass   # the agents committed on the project's branch itself
     elif checked_out(project, name):
         # Moving a checked-out branch leaves its index and files behind: the
         # checkout would then show the queue's commits as changes undone.
-        ctx.q.log(key, f"warning: branch {name} is checked out in the project; not moved to {sha[:12]} "
-                       f"(git merge --ff-only {sha[:12]} there takes it)")
+        warnings.append(f"branch {name} is checked out in the project; not moved to {sha[:12]} "
+                        f"(git merge --ff-only {sha[:12]} there takes it)")
     elif not old:
         git(project, "update-ref", branch, sha)
         st["made_branch"] = True
@@ -1928,30 +1932,119 @@ def stage_push(ctx, st):
         if git(project, "merge-base", "--is-ancestor", old, sha, check=False).returncode == 0:
             git(project, "update-ref", branch, sha, old)
         else:
-            ctx.q.log(key, f"warning: the project's branch {name} is not behind the queue's branch; left as it is")
-    if ctx.push:
-        checkpoint(ctx)   # a stop asked during the stage: nothing pushed
-        r = git(project, "-c", "credential.interactive=false", "push", "-q", ctx.remote, f"{sha}:{branch}",
-                check=False, timeout=600, env=push_env(project))
-        if r.returncode != 0:
-            return block(ctx, st, f"push to {ctx.remote} refused: {(r.stderr or r.stdout).strip()[:300]}")
-        ctx.q.log(key, f"pushed branch {name} to {ctx.remote} ({sha[:12]})")
+            warnings.append(f"the project's branch {name} is not behind the queue's branch; left as it is")
+    for w in warnings[len(st.get("warnings") or []):]:
+        ctx.q.log(key, f"warning: {w}")
+    st["warnings"] = warnings
+    url = remote_url(project, ctx.remote)
+    push = {"remote": ctx.remote, "url": url, "branch": name, "sha": sha, "result": "local", "error": ""}
+    if not ctx.push:
+        reason = f"kept local (QUEUE_PUSH=0): branch {name} at {sha[:12]} in the project"
+    elif not git(project, "remote", "get-url", ctx.remote, check=False).stdout.strip():
+        reason = f"kept local: the project has no remote {ctx.remote}; branch {name} at {sha[:12]} in the project"
     else:
-        ctx.q.log(key, f"branch {name} ready in the project ({sha[:12]}); not pushed (QUEUE_PUSH=0)")
+        checkpoint(ctx)   # a stop asked during the stage: nothing pushed
+        r = net_git(project, "push", "-q", ctx.remote, f"{sha}:{branch}", timeout=PUSH_TIMEOUT)
+        if r.returncode != 0:
+            push.update(result="rejected", error=(r.stderr or r.stdout).strip()[:300])
+            results(ctx, st, change, push)
+            return block(ctx, st, f"push to {ctx.remote} refused: {push['error']}. Fix that, then harness queue "
+                                  f"retry {key} --stage push (branch {name} is at {sha[:12]} in the project)")
+        push["result"], reason = "pushed", ""
+        ctx.q.log(key, f"pushed branch {name} to {ctx.remote} ({sha[:12]})")
+    if reason:
+        ctx.q.log(key, reason)
+    results(ctx, st, change, push)
     record(st, "passed", [f"branch {name} at {sha[:12]}"])
-    st.update(status="done", stage="done", attempt=0, feedback="", reason="", sha=sha)
+    st.update(status="done", stage="done", attempt=0, feedback="", reason=reason, sha=sha)
     ctx.q.save(st)
 
 
-def push_env(project):
-    """No credential prompt can hold a push (nobody is watching): Git Credential
-    Manager and ssh fail instead of asking. An ssh the owner chose (GIT_SSH,
-    GIT_SSH_COMMAND, core.sshCommand: plink, a key, the Windows agent) is kept."""
-    env = {"GCM_INTERACTIVE": "never"}
-    if not (os.environ.get("GIT_SSH") or os.environ.get("GIT_SSH_COMMAND")
-            or git(project, "config", "core.sshCommand", check=False).stdout.strip()):
-        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
-    return env
+def remote_url(project, remote):
+    """The remote's url without a user or password in it; "" when there is no such remote."""
+    url = git(project, "remote", "get-url", remote, check=False).stdout.strip()
+    return re.sub(r"(?i)^([a-z][a-z0-9+.-]*://)[^/@]*@", r"\1", url)
+
+
+def compare_url(url, base, branch):
+    """The page that opens a pull request of branch onto base: GitHub's compare view,
+    GitLab's new merge request; "" for another host or a url that is not a host's."""
+    m = re.match(r"(?i)^(?:(?:https?|ssh|git)://)?(?:[^@/]+@)?([a-z0-9.-]+)(?::\d+)?[:/]([^:]+?)(?:\.git)?/*$", url)
+    if not m or os.path.isabs(url) or re.match(r"^[A-Za-z]:[\\/]", url) or url.startswith("file:"):
+        return ""
+    host, path = m.group(1).lower(), m.group(2).strip("/")
+    quote = lambda s: urllib.parse.quote(s, safe="/")   # noqa: E731
+    if "github" in host:
+        return f"https://{host}/{path}/compare/{quote(base)}...{quote(branch)}?expand=1"
+    if "gitlab" in host:
+        return f"https://{host}/{path}/-/merge_requests/new?merge_request[source_branch]={quote(branch)}"
+    return ""
+
+
+def results(ctx, st, change, push):
+    """What the ticket ended with, into state.json (the run viewer shows it) and
+    KEY-result.md in the vault; best effort: the outcome stands without them."""
+    key, project = st["key"], st["project"]
+    try:
+        commits, stat = [], {"files": 0, "insertions": 0, "deletions": 0}
+        if change and st.get("base_sha"):
+            log = git(project, "log", "-n", "50", "--format=%H%x09%s", f"{st['base_sha']}..{change[0]}", check=False)
+            commits = [{"sha": c.split("\t", 1)[0], "subject": c.split("\t", 1)[-1]} for c in log.stdout.splitlines() if c]
+            for line in git(project, "diff", "--numstat", "--no-ext-diff", st["base_sha"], change[0],
+                            check=False).stdout.splitlines():
+                n = line.split("\t")
+                if len(n) >= 3:
+                    stat["files"] += 1
+                    stat["insertions"] += int(n[0]) if n[0].isdigit() else 0
+                    stat["deletions"] += int(n[1]) if n[1].isdigit() else 0
+        base = st.get("base", "")
+        base = st.get("orig_branch", "") if base == HERE else re.sub(rf"^{re.escape(push['remote'])}/", "", base)
+        link = compare_url(push["url"], base, push["branch"]) if push["result"] == "pushed" and base else ""
+        now = git(project, "symbolic-ref", "--short", "-q", "HEAD", check=False).stdout.strip()
+        st.update(push=push, compare_url=link, commits=commits, diffstat=stat, folder_branch_now=now)
+        st.setdefault("orig_branch", "")
+        st.setdefault("warnings", [])
+        ctx.q.save(st)
+        result_note(ctx, st)
+    except Exception as e:  # noqa: BLE001 - the stage's outcome does not hang on its summary
+        ctx.q.log(key, f"warning: the ticket's results were not all written: {type(e).__name__}: {str(e)[:200]}")
+
+
+def result_note(ctx, st):
+    """KEY-result.md: what the ticket set out to do and what it ended with."""
+    key, p = st["key"], note_paths(ctx.vault, st["key"])
+    plan = read(plan_copy(ctx.q, key)) or read(p["plan"])
+    goal = sections(plan).get("goal", "").strip()
+    ticket = read(p["ticket"])
+    if not goal:
+        m = re.search(r"(?m)^#\s+(.+)$", ticket)
+        goal = m.group(1).strip() if m else ""
+    criteria = check_plan(plan)[1] if plan.strip() else ticket_criteria(ticket)
+    push, stat = st["push"], st["diffstat"]
+    where = {"pushed": f"pushed to {push['remote']}", "local": "kept local (not pushed)",
+             "rejected": f"push to {push['remote']} refused: {push['error']}", "skipped": "no push stage"}[push["result"]]
+    lines = ["---", "type: note", f"ticket: {key}", f"summary: {yq(f'harness queue result of {key}: {where}')}", "---",
+             "", f"# {key}: result", "", "## Goal", "", goal or "(not written)", "", "## Acceptance criteria", ""]
+    lines += [f"- {c}" for c in criteria] or ["(none)"]
+    lines += ["", "## Branch", "", f"- branch: `{push['branch']}`" + (f" at `{push['sha'][:12]}`" if push["sha"] else ""),
+              f"- {where}"]
+    if push["url"]:
+        lines.append(f"- remote: {push['url']}")
+    if st.get("compare_url"):
+        lines.append(f"- open a pull request: {st['compare_url']}")
+    if st.get("orig_branch") or st.get("folder_branch_now"):
+        lines.append(f"- the project folder is on `{st.get('folder_branch_now') or '?'}`"
+                     + (f" (it was on `{st['orig_branch']}`)" if st.get("orig_branch") else ""))
+    lines += ["", "## Commits", ""]
+    lines += [f"- `{c['sha'][:12]}` {c['subject']}" for c in st["commits"]] or ["(none)"]
+    lines += ["", "## Diffstat", "", f"{stat['files']} file(s), +{stat['insertions']} -{stat['deletions']}",
+              "", "## Review notes", ""]
+    notes = [f"- must fix (asked by the review): {m}" for m in st.get("must_fix") or []]
+    notes += [f"- warning: {w}" for w in st.get("warnings") or []]
+    if os.path.exists(p["review"]):
+        notes.append(f"- the review: [[{key}-review]]")
+    lines += notes or ["(none)"]
+    write_atomic(p["result"], "\n".join(lines) + "\n")
 
 
 STAGES = {"plan": stage_plan, "implement": stage_implement, "review": stage_review, "fix": stage_fix,
@@ -1978,6 +2071,12 @@ def advance(ctx, st, stage, reason=""):
             reason = f"its stages are done ({','.join(stages_of(st))}); nothing pushed"
         st.update(stage="done", attempt=0, feedback="", status="done", reason=reason)
         ctx.q.log(st["key"], f"done: {reason}" if reason else "done")
+        if st.get("base_sha"):   # what the stages left, with nothing pushed
+            change = None
+            with contextlib.suppress(Exception):
+                change = fetch_branch(ctx.q, st)
+            results(ctx, st, change, {"remote": "", "url": "", "branch": branch_of(st),
+                                      "sha": change[0] if change else "", "result": "skipped", "error": ""})
     ctx.q.save(st)
 
 
@@ -2500,6 +2599,8 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
     st.pop("stopped_from", None)
     for k in RESULTS:
         st.pop(k, None)
+    if st.get("vault"):   # the last go's summary is not this one's
+        drop(note_paths(st["vault"], st["key"])["result"])
     try:
         os.remove(q.sentinel(st["key"]))   # a stop asked before is not for this go
     except OSError:

@@ -1192,15 +1192,18 @@ class AuditFixesTest(Base):
         push = [(a, e) for a, e in seen if "push" in a]
         self.assertEqual(len(push), 1)
         args, env = push[0]
-        self.assertEqual(args[:3], ("-c", "credential.interactive=false", "push"))
-        self.assertEqual(env, {"GCM_INTERACTIVE": "never", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes"})
+        self.assertEqual(args[:len(tq.NET_OPTS) + 1], (*tq.NET_OPTS, "push"))
+        self.assertIn("credential.interactive=false", args)
+        self.assertEqual(env, {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "GIT_SSH_COMMAND": tq.SSH_BATCH})
+        self.assertIn("BatchMode=yes", tq.SSH_BATCH)
         # The owner's own ssh is kept: GIT_SSH_COMMAND, GIT_SSH (plink) or core.sshCommand.
+        quiet = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
         for k, v in (("GIT_SSH_COMMAND", "ssh -i mykey"), ("GIT_SSH", "plink.exe")):
             os.environ[k] = v
-            self.assertEqual(tq.push_env(self.project), {"GCM_INTERACTIVE": "never"}, k)
+            self.assertEqual(tq.net_env(self.project), quiet, k)
             del os.environ[k]
         sh("git", "-C", self.project, "config", "core.sshCommand", "ssh -i other")
-        self.assertEqual(tq.push_env(self.project), {"GCM_INTERACTIVE": "never"})
+        self.assertEqual(tq.net_env(self.project), quiet)
 
     def test_agent_paths_on_windows(self):
         ctx = type("C", (), {"host": True, "single": False})()
@@ -1608,6 +1611,112 @@ class StartAndBranchTest(Base):
         self.assertEqual(st["start"], self.status("ABC-2")["start_sha"])
         self.assertEqual(st["base"], "main")
         self.assertIn("is on ABC-2's branch ABC-2", out)
+
+
+class ResultsTest(Base):
+    def note(self, key="ABC-1"):
+        return cat(os.path.join(self.vault, "wiki", "notes", "tickets", f"{key}-result.md"))
+
+    def test_a_pushed_ticket_records_what_it_ended_with(self):
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"], st["reason"]), (0, "done", ""), out)
+        self.assertEqual(st["push"], {"remote": "origin", "url": self.remote, "branch": "ABC-1", "sha": st["sha"],
+                                      "result": "pushed", "error": ""})
+        self.assertEqual(st["compare_url"], "")   # a folder remote has no web page
+        self.assertEqual([c["subject"] for c in st["commits"]], ["ABC-1: implementing"])
+        self.assertEqual(st["commits"][0]["sha"], st["sha"])
+        self.assertEqual(st["diffstat"], {"files": 1, "insertions": 1, "deletions": 0})
+        self.assertEqual((st["orig_branch"], st["folder_branch_now"], st["warnings"]), ("", "main", []))
+        note = self.note()
+        self.assertTrue(note.startswith("---\ntype: note\nticket: ABC-1\n"), note[:80])
+        for part in ("## Goal\n\nA feature file.", "- A file feature.txt says hello feature", "pushed to origin",
+                     "ABC-1: implementing", "1 file(s), +1 -0", "## Review notes"):
+            self.assertIn(part, note)
+        # A retry clears them and the stale note; the next go writes its own.
+        rc, out = self.q("retry", "ABC-1", "--stage", "push")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse({"push", "compare_url", "commits", "diffstat"} & set(self.status()), self.status())
+        self.assertFalse(os.path.exists(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-result.md")))
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["push"]["result"], "pushed", out)
+
+    def test_with_push_off_or_no_remote_the_branch_is_kept_local(self):
+        self.add("ABC-1")
+        rc, out = self.run_queue("--push", "0")
+        st = self.status()
+        self.assertEqual((rc, st["status"], st["push"]["result"]), (0, "done", "local"), out)
+        self.assertTrue(st["reason"].startswith("kept local (QUEUE_PUSH=0): branch ABC-1 at "), st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch"), "")
+        self.assertIn("kept local (not pushed)", self.note())
+        self.git_p("remote", "remove", "origin")
+        self.add("ABC-2")
+        rc, out = self.run_queue()
+        st = self.status("ABC-2")
+        self.assertEqual((rc, st["status"], st["push"]["result"], st["push"]["url"]), (0, "done", "local", ""), out)
+        self.assertIn("kept local: the project has no remote origin", st["reason"])
+
+    def test_a_refused_push_blocks_with_the_error(self):
+        self.add("ABC-1")
+        self.git_p("remote", "set-url", "origin", os.path.join(self.tmp, "nowhere.git"))
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"], st["push"]["result"]), ("blocked", "push", "rejected"), out)
+        self.assertTrue(st["push"]["error"], st)
+        self.assertIn("push to origin refused", st["reason"])
+        self.assertIn("harness queue retry ABC-1 --stage push", st["reason"])
+
+    def test_a_branch_moved_since_it_was_checked_is_not_pushed(self):
+        self.add("ABC-1")
+        real = tq.STAGES["push"]
+
+        def late_commit(ctx, st):   # something commits on the branch after the verifier passed it
+            repo = os.path.join(self.state, "ABC-1", "repo")
+            sh("git", "-C", repo, "commit", "-q", "--allow-empty", "-m", "unchecked")
+            return real(ctx, st)
+        with mock.patch.dict(tq.STAGES, {"push": late_commit}):
+            rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "push"), out)
+        self.assertIn("moved since it was checked", st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch"), "")
+        # The owner looked and pushes it as it is.
+        rc, out = self.q("retry", "ABC-1", "--stage", "push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["push"]["result"]), ("done", "pushed"), out)
+        self.assertEqual([c["subject"] for c in st["commits"]], ["unchecked", "ABC-1: implementing"])
+
+    def test_stages_without_a_push_record_what_they_left(self):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "plan,implement")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["push"]["result"], len(st["commits"])), ("done", "skipped", 1), out)
+        self.assertIn("no push stage", self.note())
+
+    def test_compare_urls(self):
+        cases = {
+            "https://github.com/o/r.git": "https://github.com/o/r/compare/main...ABC-1?expand=1",
+            "git@github.com:o/r.git": "https://github.com/o/r/compare/main...ABC-1?expand=1",
+            "ssh://git@github.com/o/r": "https://github.com/o/r/compare/main...ABC-1?expand=1",
+            "https://gitlab.example.com/g/sub/r.git":
+                "https://gitlab.example.com/g/sub/r/-/merge_requests/new?merge_request[source_branch]=ABC-1",
+            "https://bitbucket.org/o/r.git": "",
+            "/srv/git/r.git": "",
+            "C:/repos/r.git": "",
+            "file:///srv/r.git": "",
+        }
+        for url, want in cases.items():
+            self.assertEqual(tq.compare_url(url, "main", "ABC-1"), want, url)
+        self.assertEqual(tq.compare_url("https://github.com/o/r", "rel/1", "a b"),
+                         "https://github.com/o/r/compare/rel/1...a%20b?expand=1")
+        # A token in the remote's url is never recorded.
+        self.git_p("remote", "set-url", "origin", "https://user:tok3n@github.com/o/r.git")
+        self.assertEqual(tq.remote_url(self.project, "origin"), "https://github.com/o/r.git")
+        self.assertEqual(tq.remote_url(self.project, "nope"), "")
 
 
 if __name__ == "__main__":
