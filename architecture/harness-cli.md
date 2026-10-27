@@ -1893,14 +1893,22 @@ in chosen messages and asks for them back; the reply's labels are a bitmap
 of what the model saw, and a label from an earlier request coming back is
 counted as server-side state. Setup reads `credit_weights` from
 `/v1/models`, measures chars per prompt token and records `reasoning_tokens`
-per `reasoning_effort`. Sections 1-7, cheapest first: reach (an earlier
+per `reasoning_effort`. Sections 1-7 and 8, cheapest first: reach (an earlier
 request vs this request's history), turn count, layout, server-side memory
 (delays, session pass-back, `user` field; `--long-term` opts into the
 product's saved memory and deletes it after), an agent session with native
 `tools` (assistant `tool_calls` + `role: tool` results, the question sent
 with `tool_choice: "none"`), conversation size (a padding turn of 0-500k
 chars, stopping at the first error), and a per-model check over the chat
-models. A 3-turn canary runs after every section. Cost control: `Prober`
+models. Section 8 (message-0 sessions, run right after 4) tests whether the
+gateway keeps a server-side session keyed on the conversation start: each
+request sends only message 0, "OK." and its own last message, so an earlier
+request's fact can return only from server state. It varies message 0 (same,
+one character changed, different), the reply after it, the message count and
+full history (8a); grows one session a fact and 2k/8k chars per request,
+reading resets, oldest-first truncation and prompt-token growth (8b); and
+asks again after 0-900 s (8c). `msg0_verdict` adds its lines and reading.
+A 3-turn canary runs after every section. Cost control: `Prober`
 totals reported usage into credits (reasoning billed as output, an upper
 estimate); `MemProber.mchat` raises `OverBudget` before a request that would
 pass `--budget` (default 500k credits), which ends only that section; and a

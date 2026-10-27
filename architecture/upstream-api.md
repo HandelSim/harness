@@ -73,6 +73,15 @@ These are the load-bearing behaviors the proxy is built around:
   message was recalled whole up to 700k chars. `harness probe
   optimize-single` measures which join format, size and framing work best
   for a whole chat folded into that one message.
+- **Server-side sessions across requests: unmeasured.** Every memory
+  probe so far planted and asked with DIFFERENT first messages, so none
+  could see a session the gateway keeps per conversation start (replies
+  carry `gemini_enterprise.session`; `proxy.md`'s single-mode note that
+  the gateway "keys its hidden session on message 0" was never measured).
+  If it exists, a tool-less model sees earlier requests' last messages
+  until the session resets. `harness probe memory --only 8 --model
+  <free model>` measures the key, the reset and truncation points and
+  expiry; record the result here.
 - **Unreliable `usage`.** `usage.total_tokens` is per-request (the most
   recent request + response only), not cumulative for the conversation.
   It cannot be used for context tracking — the proxy estimates tokens

@@ -21,6 +21,9 @@
 #      an unknown subcommand errors
 #   T8 'harness probe memory --quick' exits 0 with every section and the
 #      verdict (the mock sees only the last message and 502s above 100 KB)
+#   T8b against a mock that keeps a session per message 0, section 8 reports
+#      what it is keyed on (one changed char of message 0 starts over; the
+#      reply after it and the message count do not), growth and time
 #   T9 none of the secrets appear in the memory suite's stdout or log, and
 #      the session id it passes back is scrubbed in the log
 #   T9b memory --budget stops a section before a request that would pass it
@@ -89,16 +92,18 @@ PREFIX="zqsecretprefix"
 ORG="AcmeInternalOrg"
 
 cat >"$TMP_ROOT/mock.py" <<'PYEOF'
-import json, os, re, sys, time
+import hashlib, json, os, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PREFIX = "/" + sys.argv[2]
 LOCKED = sys.argv[3] == "locked"
 QUOTA = sys.argv[3] == "quota"
 SLIMLOOP = sys.argv[3] == "slimloop"
+MSG0 = sys.argv[3] == "msg0"  # also keep a server-side session per message 0
 PORT_FILE = sys.argv[1]
 SLIM_REC = os.path.join(os.path.dirname(PORT_FILE), "slim-rec.txt")
 SEEN = {"single": 0}
+SESS = {}  # msg0 mode: message 0 -> the last messages of earlier requests
 CREDITS = {"left": 10000000}
 LEVEL_TOKENS = {"minimal": 4, "low": 40, "medium": 160, "high": 640}
 
@@ -251,8 +256,14 @@ class H(BaseHTTPRequestHandler):
                 content = "<thought>**Adding the products** pairwise, then mod 97. %s</thought>%s" % (leak(self), content)
         elif "crate" in last_text:
             # Memory suite: behave like an upstream that sees only the last
-            # message (echo the crate labels found there).
-            content = " ".join(re.findall(r"[B-Z]{3}-[0-9]{3}", last_text)) + " " + leak(self)
+            # message (echo the crate labels found there). msg0 mode: plus the
+            # last messages of earlier requests that opened with this message 0.
+            seen = last_text
+            if MSG0:
+                k = json.dumps(msgs[0], sort_keys=True)
+                seen = " ".join(SESS.get(k, []) + [last_text])
+                SESS.setdefault(k, []).append(last_text)
+            content = " ".join(re.findall(r"[B-Z]{3}-[0-9]{3}", seen)) + " " + leak(self)
         slim = slim_turn(msgs, self, tools) if tools else None
         if slim is not None:
             tool_calls, content = slim
@@ -270,7 +281,10 @@ class H(BaseHTTPRequestHandler):
                 content = re.search(r"FALCON-\d+", last["content"]).group(0)
         if req.get("response_format"):
             content = json.dumps({"title": "Dune", "author": "Frank Herbert", "publication_year": 1965})
-        ge = {"assist_token": "ASSISTSECRET123456", "session": "projects/p-123456/locations/global/sessions/9",
+        sid = "9"
+        if MSG0 and msgs:
+            sid = str(int(hashlib.sha256(json.dumps(msgs[0], sort_keys=True).encode()).hexdigest()[:8], 16))
+        ge = {"assist_token": "ASSISTSECRET123456", "session": "projects/p-123456/locations/global/sessions/" + sid,
               "thinking": ["thought about it " + leak(self)]}
         pt, rt = max(10, len(raw) // 3), 0 if req.get("reasoning_effort") == "none" else 20
         rt = LEVEL_TOKENS.get(tc_cfg.get("thinking_level"), rt)
@@ -426,7 +440,9 @@ stop_mock
 echo "$out" >"$TMP_ROOT/stdout-mem.txt"
 [[ $rc -eq 0 ]] || { echo "$out" | tail -30; fail "T8 memory probe exited $rc"; }
 for want in "=== harness probe memory v" "--- 1. " "--- 2. " "--- 3. " "--- 4. " "--- 5. " "--- 6. " \
-            "--- 7. " "=== memory verdict" "earlier facts recalled from separate messages: 0/" \
+            "--- 7. " "--- 8. " "=== memory verdict" "earlier facts recalled from separate messages: 0/" \
+            "M8a  NO   same message 0, same layout #1" "message-0 sessions (8), a separate earlier request recalled with: same 0/1" \
+            "No server-side session: a request with the same message 0" \
             "never reached the model" "M4c" "M5   NONE" "agent session (native tools)" \
             "by padding size: mid@0:" "reasoning_effort -> reasoning_tokens: absent:20, none:0, low:20, high:20" \
             "tokens used (as reported): prompt" \
@@ -434,9 +450,28 @@ for want in "=== harness probe memory v" "--- 1. " "--- 2. " "--- 3. " "--- 4. "
             "full redacted request log: state/output/probe-memory-" "=== end harness probe ==="; do
     [[ "$out" == *"$want"* ]] || { echo "$out" | tail -40; fail "T8 missing '$want' in output"; }
 done
-[[ "$out" != *"--- 8. "* && "$out" != *"probe error"* && "$out" != *"Traceback"* ]] \
-    || { echo "$out" | tail -40; fail "T8 unexpected section 8 or a probe error"; }
+[[ "$out" != *"probe error"* && "$out" != *"Traceback"* && "$out" != *"keyed on the conversation start"* ]] \
+    || { echo "$out" | tail -40; fail "T8 a probe error, or a server session read into a last-message-only mock"; }
 ok "T8 memory suite exits 0 with all sections and a verdict"
+
+# --- T8b: section 8 detects a server-side session keyed on message 0 ---
+start_mock msg0
+URL="http://127.0.0.1:${PORT}/${PREFIX}"
+out=$(PROXY_API_URL="$URL" PROXY_API_KEY="$KEY" DEFAULT_MODEL_NAME="mock-a" \
+      cmd_probe memory --quick --only 8 --max-chars 200000 --delay-scale 0 --timeout 20 2>&1); rc=$?
+stop_mock
+[[ $rc -eq 0 ]] || { echo "$out" | tail -30; fail "T8b msg0 probe exited $rc"; }
+for want in "--- 8. " "M8a  RECALL same message 0, same layout #1" "M8a  NO   message 0 with one character changed" \
+            "M8a  NO   a different message 0 (control)" "M8a  RECALL same message 0, a different reply after it" \
+            "M8a  RECALL same message 0, two more messages" "same 1/1, edit 0/1, other 0/1, middle 1/1, longer 1/1, full 1/1" \
+            "M8b  ALL  pad 2k step 6: facts from steps 1-5" "# ## ### #### #####" "0s:yes 60s:yes" \
+            "keyed on the conversation start" "Changing message 0 by one character starts a new one." \
+            "Changing the reply after it keeps the session." "Adding messages keeps the session."; do
+    [[ "$out" == *"$want"* ]] || { echo "$out" | tail -60; fail "T8b missing '$want' in output"; }
+done
+[[ "$out" != *"--- 5. "* && "$out" != *"Traceback"* && "$out" != *"Facts leaked between independent"* ]] \
+    || { echo "$out" | tail -40; fail "T8b ran other sections, crashed, or called a same-session recall a leak"; }
+ok "T8b section 8 reads a message-0 session: key, growth and time"
 
 # --- T9: memory suite redaction ---
 log=$(ls "$TMP_ROOT"/state/output/probe-memory-*.log 2>/dev/null | head -1)

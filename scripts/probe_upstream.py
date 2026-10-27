@@ -1895,9 +1895,11 @@ class MemProber(Prober):
         self.guarded("setup", self.setup)
         self.guarded("canary", lambda: self.canary("start"))
         sel = self.a.only
-        # Cheapest first, so a short budget or quota still answers the most.
+        # Cheapest first, so a short budget or quota still answers the most;
+        # 8 (message-0 sessions) runs right after 4, before the large requests.
         plan = [("1", self.sec_reach), ("2", self.sec_turns), ("3", self.sec_layout),
-                ("4", self.sec_server), ("5", self.sec_agent), ("6", self.sec_hist_size), ("7", self.sec_models)]
+                ("4", self.sec_server), ("8", self.sec_msg0), ("5", self.sec_agent), ("6", self.sec_hist_size),
+                ("7", self.sec_models)]
         for key, fn in plan:
             if sel and key not in sel:
                 continue
@@ -2291,6 +2293,161 @@ class MemProber(Prober):
             self.rec("M4f", "cleanup request", "INFO" if r.ok else "ERR", "" if r.ok else self.fail_note(r), r, r.content, 100)
 
     # ------------------------------------------------------------------
+    def msg0(self, tag, chars=1500):
+        """A message 0 like the proxy's hybrid one (agent instructions + tool
+        block, sent as a user message), unique to this session by its tag."""
+        words = " ".join(random.choice(_WORDS) for _ in range(6))
+        return ("You are a coding agent working in a repository (probe session %s, %s). Follow these instructions "
+                "on every turn.\n%s" % (tag, words, code_filler(chars, seed=random.randint(0, 99999))))
+
+    def sec_msg0(self):
+        self.section("8. message-0 sessions: does a later request that opens with the same message 0 see earlier ones")
+        # Each request sends ONLY [message 0, "OK.", its own last message]: an
+        # earlier request's fact can come back only from server-side state.
+        ok_a = {"role": "assistant", "content": "OK."}
+        res = self.notes.setdefault("msg0", {"key": {}, "retention": [], "expiry": []})
+
+        def plant(u0, i, l, label):
+            return self.mchat([{"role": "user", "content": u0}, ok_a,
+                               {"role": "user", "content": self.fact(i, l) + " Reply OK."}], label, [("x", l)])
+
+        def ask(msgs, i, l, label, optin):
+            ctrl = self.lab(label)
+            q = "Earlier in this conversation I told you which label crate %s carries." % i
+            return self.mchat(msgs + [{"role": "user", "content": self.final(ctrl, q)}], label,
+                              [("x", l), ("ctrl", ctrl)], optin=optin)
+
+        # 8a: what the session is keyed on. Every variant plants afresh.
+        variants = [
+            ("same", "same message 0, same layout", lambda u0, l: [{"role": "user", "content": u0}, ok_a], True),
+            ("edit", "message 0 with one character changed", lambda u0, l: [{"role": "user", "content": u0 + "!"}, ok_a], False),
+            ("other", "a different message 0 (control)", lambda u0, l: [{"role": "user", "content": self.msg0("other")}, ok_a], False),
+            ("middle", "same message 0, a different reply after it",
+             lambda u0, l: [{"role": "user", "content": u0}, {"role": "assistant", "content": "Understood, ready."}], True),
+            ("longer", "same message 0, two more messages",
+             lambda u0, l: [{"role": "user", "content": u0}, ok_a, {"role": "user", "content": "Reply OK."}, ok_a], True),
+            ("full", "same message 0 with the planting turn in the history (what a client sends)",
+             lambda u0, l: [{"role": "user", "content": u0}, ok_a,
+                            {"role": "user", "content": self.fact(4, l) + " Reply OK."}, ok_a], True),
+        ]
+        for i in range(1 if self.a.quick else min(self.R, 2)):
+            for key, title, build, optin in variants:
+                u0 = self.msg0("8a-%s-%d-%06d" % (key, i, random.randint(0, 999999)))
+                l = self.lab("M8 plant " + key)
+                ra = plant(u0, 4, l, "M8a %s plant #%d" % (key, i + 1))
+                m = ask(build(u0, l), 4, l, "M8a %s ask #%d" % (key, i + 1), optin)
+                hit = m.hit("x") if m.ok and ra.ok else None
+                res["key"].setdefault(key, []).append(hit)
+                self.mrec("M8a", "%s #%d" % (title, i + 1), m,
+                          verdict="RECALL" if hit else ("ERR" if hit is None else "NO"),
+                          note="same_session_as_plant=%s" % (m.sess != "-" and m.sess == ra.sess))
+                self.sample("8", "key " + key, m, ["x"], "server")
+
+        # 8b: one session grows by a fact (and padding) per request; each
+        # request asks for every fact so far. A run of '.' after '#' marks a
+        # reset; oldest-first loss marks a truncation; ptok shows how much
+        # context the server adds.
+        steps = 6 if self.a.quick else (self.a.steps or 12)
+        pads = [2000] if self.a.quick else [2000, 8000]
+        for pad in pads:
+            u0 = self.msg0("8b-%d-%06d" % (pad, random.randint(0, 999999)))
+            facts, rows = [], []
+            for k in range(1, steps + 1):
+                l = self.lab("M8b pad=%d" % pad)
+                facts.append(("s%d" % k, l))
+                body = "Reference output:\n%s\n\n%s" % (code_filler(pad, seed=pad + k), self.fact(k, l))
+                msgs = [{"role": "user", "content": u0}, ok_a, {"role": "user", "content": body + "\n\n" + _QUESTION}]
+                m = self.mchat(msgs, "M8b pad=%s step %d" % (_kfmt(pad), k), facts[:-1] + [("ctrl", l)], optin=True)
+                names = [n for n, _ in facts[:-1]]
+                pt = (m.r.usage or {}).get("prompt_tokens") if isinstance(m.r.usage, dict) else None
+                rows.append({"step": k, "ok": m.ok, "hits": [m.hit(n) for n in names], "ctrl": m.hit("ctrl"),
+                             "ptok": pt, "own": int(len(json.dumps(msgs)) / self.cpt), "sess": m.sess})
+                self.mrec("M8b", "pad %s step %d: %s" % (_kfmt(pad), k, "facts from steps 1-%d" % (k - 1) if k > 1
+                                                          else "first fact"), m, names or None,
+                          note="own~%dtok" % rows[-1]["own"])
+                if not m.ok:
+                    break
+            res["retention"].append((pad, rows))
+
+        # 8c: time. Plant one session per delay, then ask each when it is due.
+        delays = [0, 60] if self.a.quick else [0, 60, 300, 900]
+        planted = []
+        for d in delays:
+            u0 = self.msg0("8c-%d-%06d" % (d, random.randint(0, 999999)))
+            l = self.lab("M8c d=%d" % d)
+            ra = plant(u0, 9, l, "M8c plant d=%d" % d)
+            planted.append((d, u0, l, ra, time.monotonic()))
+        if max(delays):
+            self.p("     (8c waits up to %ds for the last ask)" % int(max(delays) * self.a.delay_scale))
+        for d, u0, l, ra, at in planted:
+            wait = at + d * self.a.delay_scale - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            m = ask([{"role": "user", "content": u0}, ok_a], 9, l, "M8c ask d=%d" % d, True)
+            hit = m.hit("x") if m.ok and ra.ok else None
+            res["expiry"].append((d, hit))
+            self.mrec("M8c", "same message 0, asked %ds after the plant" % d, m,
+                      verdict="RECALL" if hit else ("ERR" if hit is None else "NO"),
+                      note="same_session_as_plant=%s waited=%ds" % (m.sess != "-" and m.sess == ra.sess,
+                                                                    int(time.monotonic() - at)))
+
+    def msg0_verdict(self):
+        """Lines for section 8 in the verdict, and the reading."""
+        res = self.notes.get("msg0")
+        if not res:
+            return []
+
+        def frac(xs):
+            return "%d/%d" % (sum(1 for x in xs if x), sum(1 for x in xs if x is not None))
+
+        key = res["key"]
+        self.p("  message-0 sessions (8), a separate earlier request recalled with: %s"
+               % ", ".join("%s %s" % (k, frac(v)) for k, v in key.items()))
+        for pad, rows in res["retention"]:
+            bits = " ".join(("".join("#" if h else "." for h in r["hits"]) or "-") + ("" if r["ctrl"] else "!")
+                            for r in rows if r["ok"])
+            pts = ",".join(str(r["ptok"]) if r["ptok"] is not None else "-" for r in rows if r["ok"])
+            self.p("    one session, %s padding per request (steps 2..; '#' = an earlier step's fact came back):" % _kfmt(pad))
+            self.p("      %s" % bits)
+            self.p("      prompt tokens per step: %s (each request alone ~%s)" % (
+                pts, ",".join(str(r["own"]) for r in rows if r["ok"])))
+        if res["expiry"]:
+            self.p("    recalled after a wait: %s" % " ".join(
+                "%ds:%s" % (d, "?" if h is None else ("yes" if h else "no")) for d, h in res["expiry"]))
+        out = []
+        same = [x for x in key.get("same", []) if x is not None]
+        other = [x for x in key.get("other", []) if x is not None]
+        if same and any(same) and not any(other):
+            out.append("A request that opens with the same message 0 as an earlier one sees that request's last")
+            out.append("message: the gateway keeps a server-side session keyed on the conversation start.")
+            for k, what in (("edit", "Changing message 0 by one character"), ("middle", "Changing the reply after it"),
+                            ("longer", "Adding messages")):
+                v = [x for x in key.get(k, []) if x is not None]
+                if v:
+                    out.append("%s %s." % (what, "keeps the session" if all(v) else
+                                            ("starts a new one" if not any(v) else "sometimes keeps it")))
+            for pad, rows in res["retention"]:
+                ok = [r for r in rows if r["ok"]]
+                lost = [r["step"] for r in ok if r["hits"] and not any(r["hits"])]
+                if lost:
+                    out.append("With %s per request the session reset at step %s." % (_kfmt(pad), ",".join(map(str, lost))))
+                cut = [r["step"] for r in ok if any(r["hits"]) and not r["hits"][0]]
+                if cut:
+                    out.append("With %s per request the oldest facts dropped out from step %d (truncation)." % (_kfmt(pad), cut[0]))
+                if len(ok) > 1 and ok[0]["ptok"] and ok[-1]["ptok"] and ok[-1]["ptok"] > 1.5 * ok[0]["ptok"]:
+                    out.append("Prompt tokens grew from %d to %d over the session: the server adds the earlier requests "
+                               "to the prompt." % (ok[0]["ptok"], ok[-1]["ptok"]))
+            ex = [d for d, h in res["expiry"] if h is False]
+            if ex:
+                out.append("A session was gone after %ds." % min(ex))
+        elif any(other):
+            out.append("Requests with a DIFFERENT message 0 recalled earlier ones: server state is not keyed on")
+            out.append("message 0 (or is shared per key); see the M8a lines.")
+        elif same:
+            out.append("No server-side session: a request with the same message 0 did not see earlier requests.")
+        return out
+
+    # ------------------------------------------------------------------
     def sec_models(self):
         self.section("7. per-model: 3 earlier turns on every chat model in the catalog")
         for model in self.catalog:
@@ -2378,6 +2535,7 @@ class MemProber(Prober):
         self.p("  recalls from deliberately continued requests (session pass-back, 'user', long-term): %d%s"
                % (len(self.optin_recalls), (" via " + "; ".join(a for a, _, _ in self.optin_recalls[:5]))
                   if self.optin_recalls else ""))
+        reading8 = self.msg0_verdict()
         self.p("  unexplained label-like strings in replies: %d" % len(self.foreign))
         cans = [s for s in S if s["sec"] == "canary" and s["ok"]]
         if cans:
@@ -2395,7 +2553,8 @@ class MemProber(Prober):
         hist_any = k > 0 if multi else None
         if hist_any is False and (not conf or conf.get("history", 0) == 0):
             self.p("  Separate earlier messages never reached the model: the upstream answers from the last")
-            self.p("  message only.")
+            self.p("  message only%s." % (" of each request (but see message-0 sessions below)" if reading8
+                                         and "keyed on" in " ".join(reading8) else ""))
         elif hist_any and multi and all(all(s["hits"]) for s in multi):
             self.p("  Earlier messages always reached the model in this run; the forgetting did not reproduce.")
         elif hist_any:
@@ -2404,7 +2563,10 @@ class MemProber(Prober):
         if self.leaks:
             self.p("  Facts leaked between independent requests: there IS server-side state.")
         if self.optin_recalls:
-            self.p("  A deliberately continued request recalled an earlier one: see the M4c/M4d/M4e lines.")
+            self.p("  A deliberately continued request recalled an earlier one: see the %s lines." % "/".join(
+                sorted({a.split()[0] for a, _, _ in self.optin_recalls})))
+        for line in reading8:
+            self.p("  " + line)
         self.p("requests=%d elapsed=%ds" % (self.c.n, int(secs)))
 
 # --------------------------------------------------------------------------

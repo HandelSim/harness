@@ -1933,6 +1933,16 @@ Sections, cheapest first:
      chars, stopping at the first size that errors
   7  per-model check over the chat models in /v1/models (skip with
      --no-matrix)
+  8  message-0 sessions (runs right after 4): every request sends only
+     message 0, "OK." and its own last message, so an earlier request's
+     fact can come back only from server-side state. 8a: what the session
+     is keyed on (same message 0; one character changed; a different one;
+     a different reply after it; more messages; the full history). 8b: one
+     session grows a fact and padding per request (--steps, default 12;
+     2k and 8k chars): when it resets or drops its oldest facts, and
+     whether prompt tokens grow. 8c: recalled after 0, 60, 300 and 900 s
+     (--quick: 0 and 60), so it takes 15 minutes. Run it on a model
+     without native tools, e.g. --only 8 --model <free model>.
 
 A 3-turn canary runs at the start and after every section to catch drift.
 The verdict block at the end summarizes what was seen, the largest
