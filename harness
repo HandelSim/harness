@@ -2626,8 +2626,8 @@ cmd_uninstall() {
     local vdir
     for vdir in "$state_root"/vaults/*/; do
         [[ -d "$vdir.git" ]] || continue
-        if [[ -n "$(git -C "$vdir" status --porcelain 2>/dev/null)" ]] \
-            || [[ "$(git -C "$vdir" rev-list --count '@{u}..' 2>/dev/null || echo 1)" != "0" ]]; then
+        if [[ -n "$(_vault_g -C "$vdir" status --porcelain 2>/dev/null)" ]] \
+            || [[ "$(_vault_g -C "$vdir" rev-list --count '@{u}..' 2>/dev/null || echo 1)" != "0" ]]; then
             echo "  WARNING: vault clone ${vdir%/} has uncommitted or unpushed work"
         fi
     done
@@ -5598,11 +5598,39 @@ _vault_nosign() {
     [[ "${HARNESS_VAULT_SIGN:-0}" == 1 ]] || printf '%s\n' -c commit.gpgsign=false
 }
 
+# The -c options for a commit (or a rebase, which commits) in vault <dir>:
+# unsigned (above), and harness's identity when git has none here.
+_vault_commit_opts() {
+    _vault_nosign
+    [[ -n "$(git -C "$1" config user.name 2>/dev/null)" ]] || printf '%s\n' -c user.name=harness
+    [[ -n "$(git -C "$1" config user.email 2>/dev/null)" ]] || printf '%s\n' -c user.email=harness@localhost
+}
+
+# git on a vault. The agent can write the clone's .git (container mode mounts
+# the clone), so nothing there may run on the host: hooks come from an empty
+# folder harness owns (state/no-hooks) and fsmonitor is off.
+_vault_safe=() _vault_safe_for=""
+_vault_safe_init() {
+    [[ "$_vault_safe_for" == "$state_root" ]] && return 0
+    local d="$state_root/no-hooks"
+    mkdir -p "$d" 2>/dev/null || true
+    command -v cygpath >/dev/null 2>&1 && d=$(cygpath -m "$d")
+    _vault_safe=(-c "core.hooksPath=$d" -c core.fsmonitor=false)
+    _vault_safe_for="$state_root"
+}
+
+_vault_g() {
+    _vault_safe_init
+    git "${_vault_safe[@]}" "$@"
+}
+
+# The same with a 30 s limit where `timeout` exists (it is missing on macOS).
 _vault_git() {
+    _vault_safe_init
     if command -v timeout >/dev/null 2>&1; then
-        timeout 30 git "$@"
+        timeout 30 git "${_vault_safe[@]}" "$@"
     else
-        git "$@"
+        git "${_vault_safe[@]}" "$@"
     fi
 }
 
@@ -5625,11 +5653,11 @@ vault_prepare() {
     elif [[ ! -d "$dir/.git" ]]; then
         echo "[harness] vault '$name': cloning $url" >&2
         mkdir -p "$state_root/vaults"
-        if ! git clone -q -c core.autocrlf=false "$url" "$dir" >&2; then
+        if ! _vault_g clone -q -c core.autocrlf=false "$url" "$dir" >&2; then
             err "vault '$name': clone failed; launching without the vault"
             return 0
         fi
-    elif ! git -C "$dir" rev-parse -q --verify '@{u}' >/dev/null 2>&1; then
+    elif ! _vault_g -C "$dir" rev-parse -q --verify '@{u}' >/dev/null 2>&1; then
         :   # no upstream (a new vault not pushed yet): nothing to pull
     elif ! GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" pull -q --ff-only >/dev/null 2>&1; then
         err "vault '$name': could not fast-forward from its remote (offline, or local commits); using the local copy"
@@ -5647,14 +5675,14 @@ vault_prepare() {
 # (eol=lf) does the same for a new vault.
 _vault_eol() {
     local dir="$1"
-    git -C "$dir" config --local --get core.autocrlf >/dev/null 2>&1 && return 0
-    if [[ "$(git -C "$dir" config --get core.autocrlf 2>/dev/null)" == true ]]; then
-        [[ -z "$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]] || return 0
-        git -C "$dir" config core.autocrlf false || return 0
+    _vault_g -C "$dir" config --local --get core.autocrlf >/dev/null 2>&1 && return 0
+    if [[ "$(_vault_g -C "$dir" config --get core.autocrlf 2>/dev/null)" == true ]]; then
+        [[ -z "$(_vault_g -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]] || return 0
+        _vault_g -C "$dir" config core.autocrlf false || return 0
         # -u: the index takes the new sizes, else every file shows as modified.
-        git -C "$dir" checkout-index -a -f -u -q 2>/dev/null || true
+        _vault_g -C "$dir" checkout-index -a -f -u -q 2>/dev/null || true
     else
-        git -C "$dir" config core.autocrlf false || true
+        _vault_g -C "$dir" config core.autocrlf false || true
     fi
     return 0
 }
@@ -5902,28 +5930,94 @@ vault_sync() {
         # shellcheck disable=SC2086
         [[ -f "$index" ]] && { $py "$index" index --vault "$wdir" >/dev/null || true; }
     fi
-    git -C "$dir" add -A >/dev/null 2>&1 || { err "vault: git add failed in $dir"; return 0; }
-    git -C "$dir" diff --cached --quiet 2>/dev/null && return 0
-    local n; n=$(git -C "$dir" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
-    local nosign=(); mapfile -t nosign < <(_vault_nosign)
-    if ! git ${nosign[@]+"${nosign[@]}"} -C "$dir" commit -q -m "harness: session $(date -u +%Y-%m-%dT%H:%MZ) ($n files)" >/dev/null 2>&1; then
-        err "vault: commit failed in $dir (is git user.name/user.email set?)"
+    _vault_g -C "$dir" add -A >/dev/null 2>&1 || { err "vault: git add failed in $dir"; return 0; }
+    _vault_g -C "$dir" diff --cached --quiet 2>/dev/null && return 0
+    local n; n=$(_vault_g -C "$dir" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+    local copts=(); mapfile -t copts < <(_vault_commit_opts "$dir")
+    if ! _vault_g ${copts[@]+"${copts[@]}"} -C "$dir" commit -q -m "harness: session $(date -u +%Y-%m-%dT%H:%MZ) ($n files)" >/dev/null 2>&1; then
+        err "vault: commit failed in $dir"
         return 0
     fi
     echo "[harness] vault: committed $n file(s) in $dir" >&2
-    git -C "$dir" rev-parse -q --verify '@{u}' >/dev/null 2>&1 || return 0
+    _vault_g -C "$dir" rev-parse -q --verify '@{u}' >/dev/null 2>&1 || return 0
     if GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" push -q >/dev/null 2>&1; then
         echo "[harness] vault: pushed" >&2
         return 0
     fi
-    if GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" pull -q --rebase >/dev/null 2>&1 \
-        && GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" push -q >/dev/null 2>&1; then
-        echo "[harness] vault: pushed (after rebasing on the remote)" >&2
+    local how="after rebasing on the remote"
+    if ! GIT_TERMINAL_PROMPT=0 _vault_git ${copts[@]+"${copts[@]}"} -C "$dir" pull -q --rebase --autostash >/dev/null 2>&1; then
+        if ! _vault_rebase_generated "$dir"; then
+            _vault_g -C "$dir" rebase --abort >/dev/null 2>&1 || true
+            err "vault: push failed (offline or a conflict); the commit stays local in $dir and goes up with the next push"
+            return 0
+        fi
+        # The remote's copies of the generated files won; rebuild them from
+        # everything now in the vault.
+        # shellcheck disable=SC2086  # $py can be 'py -3'
+        [[ -n "$py" && -f "$index" ]] && { $py "$index" index --vault "${wdir:-$dir}" >/dev/null || true; }
+        _vault_g -C "$dir" add -A >/dev/null 2>&1
+        _vault_g -C "$dir" diff --cached --quiet 2>/dev/null \
+            || _vault_g ${copts[@]+"${copts[@]}"} -C "$dir" commit -q -m "harness: regenerate after rebase" >/dev/null 2>&1
+        how="after rebasing on the remote and regenerating the index"
+    fi
+    if GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" push -q >/dev/null 2>&1; then
+        echo "[harness] vault: pushed ($how)" >&2
         return 0
     fi
-    git -C "$dir" rebase --abort >/dev/null 2>&1 || true
     err "vault: push failed (offline or a conflict); the commit stays local in $dir and goes up with the next push"
     return 0
+}
+
+# A `pull --rebase` stopped on conflicts. When every conflicted file is one
+# harness generates (front matter `generated: harness`, or wiki/index.md,
+# wiki/log.md, wiki/topics/, wiki/tickets/), take the remote's copy (in a
+# rebase --ours is the remote) and go on, as often as the rebase stops; the
+# caller regenerates them. Returns 1 with the rebase still stopped on any
+# other conflict (the caller aborts).
+_vault_rebase_generated() {
+    local dir="$1" gitdir f n=0
+    local -a copts=() files=()
+    mapfile -t copts < <(_vault_commit_opts "$dir")
+    gitdir=$(_vault_g -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+    # No rebase stopped: the pull failed for another reason (offline).
+    [[ -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" ]] || return 1
+    while [[ -d "$gitdir/rebase-merge" || -d "$gitdir/rebase-apply" ]]; do
+        (( ++n <= 50 )) || return 1
+        mapfile -t files < <(_vault_g -c core.quotePath=false -C "$dir" diff --name-only --diff-filter=U 2>/dev/null)
+        (( ${#files[@]} )) || return 1
+        for f in "${files[@]}"; do
+            _vault_generated_conflict "$dir" "$f" || return 1
+        done
+        for f in "${files[@]}"; do
+            if _vault_g -C "$dir" cat-file -e ":2:$f" 2>/dev/null; then
+                { _vault_g -C "$dir" checkout -q --ours -- "$f" && _vault_g -C "$dir" add -- "$f"; } || return 1
+            else
+                _vault_g -C "$dir" rm -q -f -- "$f" >/dev/null 2>&1 || return 1
+            fi
+        done
+        # A commit left with no change of its own is skipped (older git stops on it).
+        if _vault_g -C "$dir" diff --cached --quiet 2>/dev/null; then
+            GIT_EDITOR=true _vault_g ${copts[@]+"${copts[@]}"} -C "$dir" rebase --skip >/dev/null 2>&1 || true
+        else
+            GIT_EDITOR=true _vault_g ${copts[@]+"${copts[@]}"} -C "$dir" rebase --continue >/dev/null 2>&1 || true
+        fi
+    done
+    return 0
+}
+
+# Is conflicted <file> in vault <dir> harness-generated on both sides?
+_vault_generated_conflict() {
+    local dir="$1" f="$2" s text seen=0
+    case "$f" in
+        wiki/index.md|wiki/log.md|wiki/topics/*|wiki/tickets/*) return 0 ;;
+    esac
+    for s in 2 3; do
+        _vault_g -C "$dir" cat-file -e ":$s:$f" 2>/dev/null || continue
+        text=$(_vault_g -C "$dir" show ":$s:$f" 2>/dev/null) || return 1
+        [[ "${text:0:2000}" == *"generated: harness"* ]] || return 1
+        seen=1
+    done
+    (( seen ))
 }
 
 # Milliseconds since the epoch (date +%s%3N is GNU only).
@@ -6828,7 +6922,7 @@ HELP
                 [[ "$name" == "$active" ]] && mark="*"
                 [[ -d "$state_root/vaults/$name/.git" ]] && where="$state_root/vaults/$name"
                 if [[ "$url" == "local" ]]; then
-                    url=$(git -C "$state_root/vaults/$name" remote get-url origin 2>/dev/null) \
+                    url=$(_vault_g -C "$state_root/vaults/$name" remote get-url origin 2>/dev/null) \
                         || url="local, no remote"
                 fi
                 printf '%s %s  %s  (%s)\n' "$mark" "$name" "$url" "$where"
@@ -6875,7 +6969,7 @@ HELP
             mkdir -p "$state_root/vaults"
             if [[ -n "$from" ]]; then
                 echo "copying template $from"
-                if ! GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 "$from" "$dir"; then
+                if ! GIT_TERMINAL_PROMPT=0 _vault_g clone -q --depth 1 "$from" "$dir"; then
                     rm -rf "$dir"
                     err "could not clone $from"; return 1
                 fi
@@ -6886,12 +6980,11 @@ HELP
             [[ -f "$dir/AGENTS.md" || -f "$dir/CLAUDE.md" ]] \
                 || err "the template has no AGENTS.md or CLAUDE.md; write one so the agent knows the vault's rules"
             # A fresh history; harness signs the first commit when git has no identity.
-            local ident=()
-            git -C "$dir" config user.email >/dev/null 2>&1 || ident=(-c user.name=harness -c user.email=harness@localhost)
-            mapfile -t -O "${#ident[@]}" ident < <(_vault_nosign)
-            if ! { git -C "$dir" init -q && git -C "$dir" symbolic-ref HEAD refs/heads/main \
-                    && git -C "$dir" add -A \
-                    && git ${ident[@]+"${ident[@]}"} -C "$dir" commit -q -m "new vault${from:+ from $from}"; }; then
+            local copts=()
+            mapfile -t copts < <(_vault_commit_opts "$dir")
+            if ! { _vault_g -C "$dir" init -q && _vault_g -C "$dir" symbolic-ref HEAD refs/heads/main \
+                    && _vault_g -C "$dir" add -A \
+                    && _vault_g ${copts[@]+"${copts[@]}"} -C "$dir" commit -q -m "new vault${from:+ from $from}"; }; then
                 rm -rf "$dir"
                 err "could not make the vault's first commit"; return 1
             fi

@@ -509,10 +509,26 @@ for everything the session changed in the vault (unsigned, `-c
 commit.gpgsign=false`, as are `vault new`'s and ingest's commits: a signing
 key on a smart card would ask for its PIN on every launch, and a headless run
 would wait on it; `HARNESS_VAULT_SIGN=1` keeps git's setting for a remote that
-takes only signed commits), and a push when the branch
+takes only signed commits; with no `user.name`/`user.email` the commit is
+harness's, `harness <harness@localhost>`), and a push when the branch
 has an upstream (no credential prompt, 30s limit; on a rejected push one
-`pull --rebase` and a second push; a conflict aborts the rebase and leaves
-the commit local). Every failure warns and the exit status is unchanged;
+`pull --rebase --autostash`, unsigned and with the same identity, and a
+second push). A rebase that stops on conflicts only in generated files
+(front matter `generated: harness`, or `wiki/index.md`, `wiki/log.md`,
+`wiki/topics/`, `wiki/tickets/`) takes the remote's copy of each
+(`_vault_rebase_generated`; in a rebase `--ours` is the remote), goes on,
+reruns `vault_ingest.py index` and commits "regenerate after rebase"
+before pushing; any other conflict aborts the rebase and leaves the commit
+local. `.harness/ingest.json` is not in that list: a conflict there (two
+machines ingesting the same units) aborts. Every git call on a vault
+(`_vault_g`, and `_vault_git` with the time limit; `vault_ingest.py`'s
+`git()` likewise) runs with `-c core.hooksPath=<empty folder>` and `-c
+core.fsmonitor=false`: in container mode the agent can write the clone's
+`.git`, and hooks and fsmonitor are programs git would run on the host
+(bash uses `state/no-hooks`, `C:/` form on Windows; python a temporary
+folder of its own). Other `.git/config` keys that run programs (filter
+drivers, `core.sshCommand`, credential helpers, `include.path`) are not
+overridden. Every failure warns and the exit status is unchanged;
 without Python the capture is skipped and the commit still happens. The push
 uses the host's git credentials, so the container firewall is not involved.
 Print mode (`-p`) and `serve` do not sync. Clones live under `state/`, so

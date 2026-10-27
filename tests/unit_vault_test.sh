@@ -861,4 +861,118 @@ rc=0; timeout 5 "$PY" "$REPO_ROOT/scripts/vault_ingest.py" ingest --vault "$V" -
 [[ "$(grep -c ' ingest: ' "$V/wiki/log.md")" == "$(( logs + 1 ))" ]] || fail "V22: one log line for the pass, none for the sleeps"
 ok "V22: --watch --retry-failed retries a failed unit once per run and sleeps instead of looping"
 
+# --- V23: nothing in a vault's .git runs: hooks and fsmonitor are off --------
+# An agent can write the clone's .git; harness's git (bash and python) must not
+# run what it put there, through a commit, a push and a rebase.
+HOOKV="$TMP_ROOT/hookv"
+RAN="$TMP_ROOT/hook.ran"
+git clone -q "$REMOTE" "$HOOKV" 2>/dev/null
+mkdir -p "$TMP_ROOT/evil-hooks"
+for h in pre-commit commit-msg post-commit pre-push pre-rebase post-rewrite post-checkout post-merge reference-transaction; do
+    for d in "$HOOKV/.git/hooks" "$TMP_ROOT/evil-hooks"; do
+        printf '#!/bin/sh\necho %s >> "%s"\n' "$h" "$RAN" > "$d/$h"; chmod +x "$d/$h"
+    done
+done
+printf '#!/bin/sh\necho fsmonitor >> "%s"\nexit 1\n' "$RAN" > "$TMP_ROOT/fsmon.sh"; chmod +x "$TMP_ROOT/fsmon.sh"
+git -C "$HOOKV" config core.fsmonitor "$TMP_ROOT/fsmon.sh"
+git -C "$HOOKV" config core.hooksPath "$TMP_ROOT/evil-hooks"
+moveremote() {   # another machine pushes, so the next push is rebased first
+    git -C "$OTHER" pull -q --rebase 2>/dev/null; printf '%s\n' "$1" >> "$OTHER/other.md"
+    git -C "$OTHER" commit -qam "$1"; git -C "$OTHER" push -q 2>/dev/null
+}
+moveremote hooks1
+printf 'hooked?\n' > "$HOOKV/hooked.md"
+out=$(vault_sync "$HOOKV" 0 "" /w 2>&1)
+grep -q "pushed (after rebasing" <<<"$out" || fail "V23: vault_sync should commit, rebase and push — $out"
+[[ ! -e "$RAN" ]] || fail "V23: vault_sync ran the vault's hooks or fsmonitor: $(tr '\n' ' ' < "$RAN")"
+moveremote hooks2
+printf 'hooked again\n' >> "$HOOKV/hooked.md"
+# shellcheck disable=SC2086
+$PY -c 'import sys; sys.path.insert(0, sys.argv[1]); import vault_ingest as vi; vi.commit(sys.argv[2], "py")' \
+    "$REPO_ROOT/scripts" "$HOOKV" || fail "V23: python commit failed"
+[[ "$(git --git-dir="$REMOTE" log -1 --format=%s)" == py ]] || fail "V23: the python commit should be rebased and pushed"
+[[ ! -e "$RAN" ]] || fail "V23: vault_ingest.py ran the vault's hooks or fsmonitor: $(tr '\n' ' ' < "$RAN")"
+# The stand-ins work: plain git does run them.
+git -C "$HOOKV" status >/dev/null 2>&1
+[[ -s "$RAN" ]] || fail "V23: the fsmonitor stand-in should run under plain git"
+ok "V23: harness's vault git (bash and python) runs no hook and no fsmonitor from the vault's .git"
+
+# --- V24: no identity, a signing key: commits and the rebase still go through
+IDV="$TMP_ROOT/idv"
+git clone -q "$REMOTE" "$IDV" 2>/dev/null
+printf '[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n' > "$TMP_ROOT/sign.gitconfig"
+(
+    unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TMP_ROOT/sign.gitconfig"
+    moveremote() {
+        git -C "$OTHER" pull -q --rebase 2>/dev/null
+        printf '%s\n' "$1" >> "$OTHER/other.md"
+        git -c user.name=o -c user.email=o@o -c commit.gpgsign=false -C "$OTHER" commit -qam "$1"
+        git -C "$OTHER" push -q 2>/dev/null
+    }
+    moveremote id1
+    printf 'who?\n' > "$IDV/who.md"
+    out=$(vault_sync "$IDV" 0 "" /w 2>&1)
+    grep -q "pushed (after rebasing" <<<"$out" || fail "V24: vault_sync with no identity and a signing key — $out"
+    [[ "$(git --git-dir="$REMOTE" log -1 --format='%ae %ce')" == "harness@localhost harness@localhost" ]] \
+        || fail "V24: harness's identity should be used — $(git --git-dir="$REMOTE" log -1 --format='%ae %ce')"
+    moveremote id2
+    printf 'who again?\n' >> "$IDV/who.md"
+    # shellcheck disable=SC2086
+    $PY -c 'import sys; sys.path.insert(0, sys.argv[1]); import vault_ingest as vi; vi.commit(sys.argv[2], "py-id")' \
+        "$REPO_ROOT/scripts" "$IDV" 2>&1
+    [[ "$(git --git-dir="$REMOTE" log -1 --format='%s %ce')" == "py-id harness@localhost" ]] \
+        || fail "V24: python's commit and rebase with no identity and a signing key"
+    exit 0
+) || exit 1
+ok "V24: with no git identity and a signing key, harness commits and rebases as harness@localhost, unsigned"
+
+# --- V25: a rebase that conflicts only on generated files takes the remote's --
+GEN="$TMP_ROOT/gen.git"
+git init -q --bare "$GEN"
+GA="$TMP_ROOT/ga"; GB="$TMP_ROOT/gb"; GC="$TMP_ROOT/gc"
+git clone -q "$GEN" "$GA" 2>/dev/null
+mkdir -p "$GA/wiki/code/x" "$GA/wiki/notes" "$GA/.raw/notes"
+genpage() { printf -- '---\ntype: code\nsummary: %s\ngenerated: harness\n---\n\n# x\n\n%s\n' "$2" "$2" > "$1"; }
+genpage "$GA/wiki/code/x/x.md" base
+printf -- '---\ntype: index\ngenerated: harness\n---\n\nbase\n' > "$GA/wiki/index.md"
+printf -- '---\ntype: note\nsummary: a note\n---\n\nbase\n' > "$GA/wiki/notes/n.md"
+git -C "$GA" add -A; git -C "$GA" commit -qm base; git -C "$GA" push -q origin HEAD 2>/dev/null
+git clone -q "$GEN" "$GB" 2>/dev/null; git clone -q "$GEN" "$GC" 2>/dev/null
+mkdir -p "$GB/.raw/notes" "$GC/.raw/notes"
+genpage "$GA/wiki/code/x/x.md" "from a"; printf 'from a\n' >> "$GA/wiki/index.md"
+git -C "$GA" commit -qam a1; git -C "$GA" push -q 2>/dev/null
+genpage "$GB/wiki/code/x/x.md" "from b"; printf 'from b\n' >> "$GB/wiki/index.md"
+printf 'b raw\n' > "$GB/.raw/notes/b.md"
+out=$(vault_sync "$GB" 0 "" /w 2>&1)
+grep -q "pushed (after rebasing on the remote and regenerating" <<<"$out" || fail "V25: generated conflicts should be resolved — $out"
+[[ "$(git -C "$GB" rev-parse HEAD)" == "$(git --git-dir="$GEN" rev-parse HEAD)" ]] || fail "V25: not pushed"
+[[ ! -d "$GB/.git/rebase-merge" && ! -d "$GB/.git/rebase-apply" ]] || fail "V25: a rebase was left stopped"
+grep -q '^from a$' "$GB/wiki/code/x/x.md" || fail "V25: the remote's generated page should win — $(cat "$GB/wiki/code/x/x.md")"
+git --git-dir="$GEN" cat-file -e HEAD:.raw/notes/b.md || fail "V25: the local raw file should be pushed"
+grep -q '^# Index$' "$GB/wiki/index.md" && grep -q '\[\[x\]\]' "$GB/wiki/index.md" \
+    || fail "V25: the index should be regenerated — $(cat "$GB/wiki/index.md")"
+# Python: the same with the third clone.
+git -C "$GA" pull -q 2>/dev/null
+genpage "$GA/wiki/code/x/x.md" "from a again"; git -C "$GA" commit -qam a2; git -C "$GA" push -q 2>/dev/null
+genpage "$GC/wiki/code/x/x.md" "from c"; printf 'c raw\n' > "$GC/.raw/notes/c.md"
+# shellcheck disable=SC2086
+$PY -c 'import sys; sys.path.insert(0, sys.argv[1]); import vault_ingest as vi; vi.commit(sys.argv[2], "py-gen")' \
+    "$REPO_ROOT/scripts" "$GC" 2>&1
+[[ "$(git -C "$GC" rev-parse HEAD)" == "$(git --git-dir="$GEN" rev-parse HEAD)" ]] || fail "V25: python should resolve and push"
+grep -q '^from a again$' "$GC/wiki/code/x/x.md" && git --git-dir="$GEN" cat-file -e HEAD:.raw/notes/c.md \
+    || fail "V25: python: the remote's generated page wins, the raw file goes up"
+# A conflict on a page someone wrote: aborted, the commit stays local.
+git -C "$GA" pull -q 2>/dev/null
+printf 'a writes\n' >> "$GA/wiki/notes/n.md"; git -C "$GA" commit -qam a3; git -C "$GA" push -q 2>/dev/null
+git -C "$GB" pull -q 2>/dev/null
+printf 'b writes\n' >> "$GB/wiki/notes/n.md"; git -C "$GA" pull -q 2>/dev/null
+printf 'a writes more\n' >> "$GA/wiki/notes/n.md"; git -C "$GA" commit -qam a4; git -C "$GA" push -q 2>/dev/null
+out=$(vault_sync "$GB" 0 "" /w 2>&1)
+grep -q "push failed" <<<"$out" || fail "V25: a conflict on a written page should fail the push — $out"
+[[ ! -d "$GB/.git/rebase-merge" && ! -d "$GB/.git/rebase-apply" ]] || fail "V25: the rebase should be aborted"
+[[ "$(git -C "$GB" rev-list --count '@{u}..')" == 1 ]] || fail "V25: the commit should stay local"
+grep -q '^b writes$' "$GB/wiki/notes/n.md" || fail "V25: the local text should be kept"
+ok "V25: a rebase conflicting only on generated files takes the remote's, regenerates and pushes; any other aborts"
+
 echo "VAULT TEST PASSED"

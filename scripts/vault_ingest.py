@@ -28,13 +28,16 @@ Generated files carry `generated: harness` in their frontmatter; nothing else
 is ever rewritten.
 """
 import argparse
+import atexit
 import datetime
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -204,7 +207,7 @@ def repo_files(root):
     """Text files of a codebase, relative paths, git-aware."""
     rels = []
     try:
-        out = subprocess.run(["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        out = subprocess.run([*safe_git(), "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
                              capture_output=True, timeout=60, check=True).stdout
         rels = [p for p in out.decode("utf-8", "replace").split("\0") if p]
     except (OSError, subprocess.SubprocessError):
@@ -781,13 +784,92 @@ def log(vault, line):
 
 # --- git -------------------------------------------------------------------------
 
-def git(vault, *args, timeout=60):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+_NO_HOOKS = []
+
+
+def safe_git():
+    """git with the options for a repo whose .git an agent can write: hooks
+    from an empty folder this process owns, no fsmonitor (both run programs)."""
+    if not _NO_HOOKS:
+        d = tempfile.mkdtemp(prefix="harness-no-hooks-")
+        atexit.register(shutil.rmtree, d, True)
+        _NO_HOOKS.append(d.replace("\\", "/"))
+    return ["git", "-c", f"core.hooksPath={_NO_HOOKS[0]}", "-c", "core.fsmonitor=false"]
+
+
+def git_run(vault, *args, timeout=60):
+    """(exit code, stdout) of git in `vault`; -1 when it could not run."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_EDITOR="true")
     try:
-        return subprocess.run(["git", "-C", vault, *args], capture_output=True, timeout=timeout,
-                              env=env).returncode == 0
+        r = subprocess.run([*safe_git(), "-C", vault, *args], capture_output=True, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError):
-        return False
+        return -1, ""
+    return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def git(vault, *args, timeout=60):
+    return git_run(vault, *args, timeout=timeout)[0] == 0
+
+
+def commit_opts(vault):
+    """-c options for a commit or a rebase: not signed (a smart-card key would
+    ask for its PIN on every commit) unless HARNESS_VAULT_SIGN=1, as for
+    harness's other vault commits, and harness's identity when git has none."""
+    opts = [] if os.environ.get("HARNESS_VAULT_SIGN") == "1" else ["-c", "commit.gpgsign=false"]
+    if not git_run(vault, "config", "user.name")[1].strip():
+        opts += ["-c", "user.name=harness"]
+    if not git_run(vault, "config", "user.email")[1].strip():
+        opts += ["-c", "user.email=harness@localhost"]
+    return opts
+
+
+GENERATED_PATHS = re.compile(r"wiki/(index\.md|log\.md|topics/.*|tickets/.*)")
+
+
+def generated_conflict(vault, rel):
+    """Is conflicted `rel` harness-generated on both sides of the rebase?"""
+    if GENERATED_PATHS.fullmatch(rel):
+        return True
+    seen = False
+    for stage in (2, 3):
+        rc, text = git_run(vault, "show", f":{stage}:{rel}")
+        if rc != 0:
+            continue  # deleted on that side
+        if GENERATED not in text[:2000]:
+            return False
+        seen = True
+    return seen
+
+
+def rebase_generated(vault, opts):
+    """A pull --rebase stopped on conflicts: when every conflicted file is one
+    harness generates, take the remote's copy (in a rebase, --ours is the
+    remote) and go on, as often as the rebase stops. False, the rebase still
+    stopped, on any other conflict; the caller regenerates or aborts."""
+    gitdir = git_run(vault, "rev-parse", "--absolute-git-dir")[1].strip()
+
+    def stopped():
+        return bool(gitdir) and any(os.path.isdir(os.path.join(gitdir, d)) for d in ("rebase-merge", "rebase-apply"))
+
+    if not stopped():
+        return False  # the pull failed for another reason (offline)
+    for _ in range(50):
+        if not stopped():
+            return True
+        files = [f for f in git_run(vault, "diff", "--name-only", "-z", "--diff-filter=U")[1].split("\0") if f]
+        if not files or not all(generated_conflict(vault, f) for f in files):
+            return False
+        for f in files:
+            if git(vault, "cat-file", "-e", f":2:{f}"):
+                ok = git(vault, "checkout", "-q", "--ours", "--", f) and git(vault, "add", "--", f)
+            else:
+                ok = git(vault, "rm", "-q", "-f", "--", f)
+            if not ok:
+                return False
+        # A commit left with no change of its own is skipped (older git stops on it).
+        git(vault, *opts, "rebase", "--skip" if git(vault, "diff", "--cached", "--quiet") else "--continue",
+            timeout=120)
+    return not stopped()
 
 
 def commit(vault, message):
@@ -796,19 +878,27 @@ def commit(vault, message):
     git(vault, "add", "-A")
     if git(vault, "diff", "--cached", "--quiet"):
         return
-    # Not signed (a smart-card key would ask for its PIN on every commit) unless
-    # HARNESS_VAULT_SIGN=1, as for harness's other vault commits.
-    nosign = [] if os.environ.get("HARNESS_VAULT_SIGN") == "1" else ["-c", "commit.gpgsign=false"]
-    if not git(vault, *nosign, "commit", "-q", "-m", message):
-        print("[ingest] git commit failed (is git user.name/user.email set?)", file=sys.stderr)
+    opts = commit_opts(vault)
+    if not git(vault, *opts, "commit", "-q", "-m", message):
+        print("[ingest] git commit failed", file=sys.stderr)
         return
     if not git(vault, "rev-parse", "-q", "--verify", "@{u}"):
         return
-    if git(vault, "push", "-q", timeout=120) or (git(vault, "pull", "-q", "--rebase", timeout=120)
-                                                  and git(vault, "push", "-q", timeout=120)):
+    if git(vault, "push", "-q", timeout=120):
         return
-    git(vault, "rebase", "--abort")
-    print("[ingest] push failed; the commits stay local and go up with the next push", file=sys.stderr)
+    if not git(vault, *opts, "pull", "-q", "--rebase", "--autostash", timeout=120):
+        if not rebase_generated(vault, opts):
+            git(vault, "rebase", "--abort")
+            print("[ingest] push failed (offline or a conflict); the commits stay local and go up with the next push",
+                  file=sys.stderr)
+            return
+        # The remote's copies of the generated files won; rebuild them.
+        regenerate(vault)
+        git(vault, "add", "-A")
+        if not git(vault, "diff", "--cached", "--quiet"):
+            git(vault, *opts, "commit", "-q", "-m", "harness: regenerate after rebase")
+    if not git(vault, "push", "-q", timeout=120):
+        print("[ingest] push failed; the commits stay local and go up with the next push", file=sys.stderr)
 
 
 # --- commands ----------------------------------------------------------------------
