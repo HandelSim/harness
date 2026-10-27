@@ -67,6 +67,12 @@ if os.environ.get("FAKE_EXIT"):   # N:RC: the first N launches die at once, havi
 if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == ticket:
     import time
     open(os.environ["FAKE_CALLS"] + ".sleeping", "a").write(ticket + "\n")
+    if os.environ.get("FAKE_SLEEP_NESTED"):   # a commit there, then stopped while it sleeps
+        d = os.environ["FAKE_SLEEP_NESTED"]
+        open(os.path.join(d, "agent.txt"), "a").write("before the stop\n")
+        subprocess.run(["git", "-C", d, "add", "agent.txt"], check=True)
+        subprocess.run(["git", "-C", d, "-c", "user.name=A", "-c", "user.email=a@example.com", "commit", "-q",
+                        "-m", "agent"], check=True)
     time.sleep(int(os.environ["FAKE_SLEEP"]))
 log.write(stage + " " + " ".join(a for a in args[:-1]) + "\n")
 open(os.environ["FAKE_CALLS"] + ".card", "a").write(os.environ.get("HARNESS_TASK_CARD", "") + "\n")
@@ -114,6 +120,16 @@ elif stage in ("implementing", "fixing"):
             continue
         if op == "switch":
             git("-C", d, "switch", "-q", "-c", "agent")
+            continue
+        if op == "submodule":  # a submodule the ticket adds: .gitmodules names it
+            git("-c", "protocol.file.allow=always", "submodule", "add", "-q", os.environ["FAKE_SUB_URL"], d)
+            continue
+        if op == "touch":      # each changed file written again as it is: no change
+            for f in subprocess.run(["git", "-C", d, "ls-files", "-m", "-o", "--exclude-standard"],
+                                    capture_output=True, text=True).stdout.split():
+                data = open(os.path.join(d, f), "rb").read()
+                open(os.path.join(d, f), "wb").write(data)
+                os.utime(os.path.join(d, f), (1e9, 1e9))
             continue
         with open(os.path.join(d, "agent.txt"), "a") as f:   # edit, or commit
             f.write("the agent was here\n")
@@ -2182,6 +2198,8 @@ class NestedReposTest(Base):
     are not the ticket's; the queue never commits there, and a stage that changes
     one is blocked with its result kept."""
 
+    run_bg, wait_for, sleeping = OwnerControlTest.run_bg, OwnerControlTest.wait_for, OwnerControlTest.sleeping
+
     def repo(self, rel, commit=True):
         d = os.path.join(self.project, rel)
         sh("git", "init", "-q", "-b", "main", d)
@@ -2231,6 +2249,7 @@ class NestedReposTest(Base):
         self.assertIn("libA: 1 new commit(s), " + mine[:12], st["reason"])
         self.assertIn("on main", st["reason"])
         self.assertIn("--project " + self.project + "/<repository>", st["reason"])
+        self.assertIn("harness queue retry ABC-1 then checks the agent's result", st["reason"])
         self.assertEqual(st["verify_only"]["stage"], "implement")
         self.assertNotIn("nested_base", st)
         # the queue left libA as the agent did, and pushed nothing
@@ -2296,6 +2315,95 @@ class NestedReposTest(Base):
         self.assertEqual(st["status"], "blocked")
         self.assertIn("newlib: a repository inside the project is committed as a bare pointer", st["reason"])
         self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+
+    def test_a_deep_one_the_owner_has_not_committed_is_looked_at(self):
+        # 4 levels down: not walked, and hidden from git ls-files once the owner's
+        # untracked files are excluded for the stage; the baseline is taken before
+        self.repo("a/b/c/deep")
+        os.environ["FAKE_NESTED"] = "commit:a/b/c/deep"
+        self.add_in_place()
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("a/b/c/deep: 1 new commit(s)", st["reason"])
+
+    def test_one_changed_by_a_stopped_agent_blocks_when_it_goes_on(self):
+        lib = self.ignored_libA()
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1", FAKE_SLEEP_NESTED=lib)
+        self.add_in_place()
+        p = self.run_bg()
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        self.wait_for(lambda: sh("git", "-C", lib, "log", "-1", "--format=%s").strip() == "agent", "the commit in libA")
+        rc, out = self.q("stop", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.wait_for(lambda: self.status()["status"] == "stopped", "ABC-1 to stop", timeout=20)
+        p.wait(timeout=30)
+        st = self.status()
+        self.assertNotIn("nested_base", st)   # the next launch takes its own: the owner's work meanwhile is theirs
+        self.assertIn("libA: 1 new commit(s)", st["nested_moved"]["lines"][0])
+        for k in ("FAKE_SLEEP", "FAKE_SLEEP_NESTED"):
+            del os.environ[k]
+        self.q("retry", "ABC-1")
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("the implement agent changed repositories inside the project", st["reason"])
+        self.assertIn("push: libA: 1 new commit(s)", st["reason"])
+        self.assertIn("harness queue retry ABC-1 then runs the stage again", st["reason"])
+        self.assertNotIn("nested_moved", st)
+        self.assertEqual(self.calls_of("implementing"), [])   # not launched again to find it
+        self.q("retry", "ABC-1")   # the owner has looked
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+
+    def test_a_file_written_again_as_it_was_is_no_change(self):
+        lib = self.ignored_libA()
+        put(os.path.join(lib, "lib.txt"), "lib, the owner's edit\n")
+        put(os.path.join(lib, "notes.txt"), "the owner's\n")
+        os.environ["FAKE_NESTED"] = "touch:libA"
+        self.add_in_place()
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+
+    def test_a_submodule_is_not_a_bare_pointer(self):
+        sub = os.path.join(self.tmp, "sub")
+        sh("git", "init", "-q", "-b", "main", sub)
+        sh("git", "-C", sub, "-c", "user.name=O", "-c", "user.email=o@example.com", "commit", "-q", "--allow-empty",
+           "-m", "sub")
+        os.environ.update(FAKE_NESTED="submodule:ext/sub", FAKE_SUB_URL=sub)
+        self.add_in_place()
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        # and git's own setting to hide submodule changes does not hide a bare one
+        self.git_p("config", "diff.ignoreSubmodules", "all")
+        os.environ["FAKE_NESTED"] = "gitlink:newlib"
+        rc, out = self.q("add", "ABC-2", "--project", self.project, "--in-place", "--stages", "implement,push")
+        self.assertEqual(rc, 0, out)
+        self.run_queue("--retries", "0")
+        st = self.status("ABC-2")
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("newlib: a repository inside the project is committed as a bare pointer", st["reason"])
+
+    def test_tools_checkouts_and_a_stray_git_folder_are_not_ones(self):
+        self.repo(".venv/src/pkg")
+        self.repo(".terraform/modules/m")
+        os.makedirs(os.path.join(self.project, "bogus", ".git"))   # git there is the project's
+        self.repo("libA")
+        self.assertEqual(tq.nested_repos(self.project), ["libA"])
+
+    def test_many_of_them_go_to_git_add_in_a_file(self):
+        # Windows: past ~32k characters the command line cannot hold the excludes
+        self.repo("libA", commit=False)
+        self.repo("lib[1]", commit=False)
+        put(os.path.join(self.project, "lx.txt"), "mine\n")
+        os.makedirs(os.path.join(self.state, "ABC-1"), exist_ok=True)
+        q = types.SimpleNamespace(dir=lambda k: os.path.join(self.state, k), log=lambda *a: self.fail(a))
+        with mock.patch.object(tq, "SNAP_ARGS_MAX", 0):
+            tq.snapshot(q, {"project": self.project, "key": "ABC-1"}, "implement")
+        tree = self.git_p("ls-tree", "-r", "--name-only", "refs/harness-queue/snap/ABC-1").split("\n")
+        self.assertIn("lx.txt", tree)
+        self.assertFalse([f for f in tree if f.startswith("lib")], tree)
+        self.assertEqual(os.listdir(os.path.join(self.state, "ABC-1")), [])
 
     def test_the_prompt_and_card_say_so(self):
         self.add_in_place("implement")
