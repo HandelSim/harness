@@ -583,10 +583,11 @@ def pause(ctx, secs):
             checkpoint(ctx)
 
 
-def model_call(ctx, messages, timeout):
+def model_call(ctx, messages, timeout, what="asking the verifier"):
     """call_model, tried again after INFRA_RETRY_PAUSES when the upstream fails
     (the error does not carry Retry-After, so the pauses are fixed)."""
     for n in range(len(INFRA_RETRY_PAUSES) + 1):
+        step(ctx, what + (f" (try {n + 1})" if n else ""))
         try:
             return wait_call(ctx, call_model, ctx.proxy, ctx.verify_model, messages, timeout)
         except InfraError as e:
@@ -595,6 +596,7 @@ def model_call(ctx, messages, timeout):
             if getattr(ctx, "key", ""):
                 ctx.q.log(ctx.key, f"the verifier request failed ({str(e)[:120]}); trying again in "
                                    f"{INFRA_RETRY_PAUSES[n]}s")
+            step(ctx, f"the verifier request failed; trying again in {INFRA_RETRY_PAUSES[n]}s")
             pause(ctx, INFRA_RETRY_PAUSES[n])
 
 
@@ -602,6 +604,7 @@ def ask_verifier(ctx, prompt, key, stage):
     """The verifier's JSON verdict; three tries with the whole prompt each time
     (the upstream reads only the last message). Every reply is kept for review."""
     reply = ""
+    ctx.q.log(key, f"asking the verifier ({ctx.verify_model}) about the {stage}")
     for n in range(3):
         try:
             reply = model_call(ctx, [{"role": "user", "content": prompt}], VERIFY_TIMEOUT)
@@ -767,6 +770,7 @@ def launch(ctx, st, cmd, out, since):
     end = time.monotonic() + ctx.stage_timeout
     notes_at = mtime(ctx.q.notes_path(key))
     copy_instructions(st["project"], os.path.join(ctx.q.dir(key), "repo"))
+    step(ctx, "the agent is working")
     with open(out, "w", encoding="utf-8") as f:
         p = subprocess.Popen(cmd, cwd=os.path.join(ctx.q.dir(key), "repo"), stdin=subprocess.DEVNULL,
                              stdout=f, stderr=subprocess.STDOUT, env=env, **NEW_GROUP)
@@ -796,6 +800,7 @@ def launch(ctx, st, cmd, out, since):
             raise
         finally:
             ctx.child = None
+            step(ctx, "the agent ended; checking its work")
     return rc
 
 
@@ -902,7 +907,8 @@ def stop(p):
 def probe(ctx):
     """Raise Infra when the upstream does not answer one tiny request."""
     try:
-        model_call(ctx, [{"role": "user", "content": "Reply with the single word OK."}], 180)
+        model_call(ctx, [{"role": "user", "content": "Reply with the single word OK."}], 180,
+                   "checking that the upstream answers")
     except InfraError as e:
         raise Infra(str(e)) from None
 
@@ -1256,11 +1262,12 @@ def process(ctx, st):
     checkpoint(ctx)
     # running (and so not answerable) before the clone, which can take minutes;
     # the vault is kept for the run viewer, which may have started with another
-    st.update(status="running", vault=ctx.vault)
+    st.update(status="running", vault=ctx.vault, reason="")
     ctx.q.save(st)
     if not st.get("base_sha") or not os.path.isdir(os.path.join(ctx.q.dir(key), "repo")):
         if st.get("base_sha") and st["stage"] != first_stage(st):
             return block(ctx, st, f"its clone is missing; harness queue retry starts it again from {first_stage(st)}")
+        step(ctx, f"cloning {st['project']}")
         try:
             make_clone(ctx.q, st, container=not (ctx.host or ctx.single))
         except (RuntimeError, subprocess.SubprocessError) as e:
@@ -1271,7 +1278,7 @@ def process(ctx, st):
                    capture_output=True, timeout=300, check=False)
     while st["status"] == "running":
         checkpoint(ctx)
-        beat(ctx, ticket=key, stage=st["stage"])
+        beat(ctx, ticket=key, stage=st["stage"], step="")
         ctx.q.log(key, f"{st['stage']} (attempt {st['attempt'] + 1}, {ctx.model})")
         STAGES[st["stage"]](ctx, st)
 
@@ -1287,6 +1294,21 @@ def beat(ctx, **change):
             write_atomic(os.path.join(ctx.q.root, "run.json"), json.dumps(ctx.run_info) + "\n")
         except OSError:
             pass
+
+
+def step(ctx, text):
+    """What the run is doing in its ticket's stage, for the viewer (run.json "step")."""
+    if hasattr(ctx, "run_info"):
+        beat(ctx, step=text)
+
+
+def put_back(ctx, st, why):
+    """The run ends with this ticket taken (the upstream does not answer, Ctrl-C):
+    it goes back to the queue at its stage, the attempt not counted, saying why."""
+    record(st, "interrupted", [why])
+    st.update(status="queued", reason=why)
+    ctx.q.save(st)
+    ctx.q.log(st["key"], f"{why}; back in the queue at {st['stage']}")
 
 
 def interrupted(ctx, st, e):
@@ -1338,7 +1360,7 @@ def run_locked(q, a, locked_at):
         drop(q.sentinel())                  # not one asked of this run as it started
     keep_tasks_out(q, ctx.vault)
     ctx.run_info = {"pid": os.getpid(), "started": now_iso(), "beat": 0, "host": bool(ctx.host or ctx.single),
-                    "single": bool(ctx.single), "model": ctx.model, "ticket": "", "stage": ""}
+                    "single": bool(ctx.single), "model": ctx.model, "ticket": "", "stage": "", "step": ""}
     beat(ctx)
 
     def beats():
@@ -1385,7 +1407,7 @@ def run_tickets(q, ctx):
     try:
         while True:
             ctx.key = ""
-            beat(ctx, ticket="", stage="")
+            beat(ctx, ticket="", stage="", step="")
             checkpoint(ctx)
             todo = [k for k in q.order() if pending(k)]
             if not todo:
@@ -1405,7 +1427,12 @@ def run_tickets(q, ctx):
                 if e.kind == "halt":
                     sync_vault(ctx, st["key"], int(time.time() * 1000))
                     raise
-            except (Infra, KeyboardInterrupt):
+            except Infra as e:
+                put_back(ctx, st, f"the run stopped: the upstream does not answer ({str(e)[:200]}); "
+                                 "start the queue again to carry on")
+                raise
+            except KeyboardInterrupt:
+                put_back(ctx, st, "the run was interrupted (Ctrl-C); start the queue again to carry on")
                 raise
             except Exception as e:  # noqa: BLE001 - one ticket's failure must not stop the queue
                 import traceback

@@ -644,8 +644,14 @@ fails). The runner takes a ticket, and `stop` and `note` save state, under
 `queue.lock`. The runner polls its agent every
 2 s for the sentinels and the stage timeout (a verifier call runs in a thread
 for the same reason) and keeps `run.json` (`pid`, `started`, `beat` every 3 s,
-`host`, `single`, `model`, `ticket`, `stage`), deleted on exit; a `beat` over
-30 s old means no run.
+`host`, `single`, `model`, `ticket`, `stage`, and `step`: cloning, the agent
+is working, the agent ended, asking the verifier, a verifier retry's wait,
+checking that the upstream answers), deleted on exit; a `beat` over 30 s old
+means no run. A run that ends on an upstream outage (exit 3) or Ctrl-C (130)
+puts the ticket it was on back to `queued` at its stage, uncounted, with the
+reason and an `interrupted` history entry; one killed outright leaves it
+`running`, which the viewer shows as "run ended" and the next run takes
+again.
 
 Stages, each a fresh `harness [host] -p --yolo --ticket KEY -m MODEL PROMPT`
 in `state/queue/KEY/repo` (a clone at the base on branch `KEY`, its origin
@@ -1265,7 +1271,9 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only. Routes:
   host; host modes need the "host mode is OK" box) and Halt; one row per
   ticket in queue order with a stage strip (plan, implement, review, fix,
   push: passed, skipped, current in the status colour, still to do, or not
-  one of the ticket's stages), why it waits, and its buttons (move, Answer
+  one of the ticket's stages), why it waits (a running ticket: its stage,
+  attempt and the run's `step`; a `running` ticket with no live run on it:
+  "run ended", with Start the queue on its page), and its buttons (move, Answer
   or Review plan, stop, retry, remove); and the Add form (keys,
   project folder, base, the existing work's ref such as `origin/ABC-123`,
   a note for the agents, and the stages: Full, Review only,

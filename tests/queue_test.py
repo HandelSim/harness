@@ -412,6 +412,10 @@ class QueueTest(Base):
         self.assertEqual(rc, 3, out)
         self.assertIn("the upstream does not answer", out)
         self.assertEqual((self.status()["stage"], self.status()["attempt"]), ("plan", 0))
+        # not left "running" with no run on it: back in the queue, saying why
+        self.assertEqual(self.status()["status"], "queued")
+        self.assertIn("the upstream does not answer", self.status()["reason"])
+        self.assertEqual(self.status()["history"][-1]["result"], "interrupted")
         self.assertEqual(self.status("ABC-2")["status"], "queued")
         # Back up: the run carries on from the same place.
         FakeProxy.mode = "ok"
@@ -1122,11 +1126,17 @@ class AuditFixesTest(Base):
             return '{"criteria": [], "verdict": "PASS"}'
         q = tq.Queue(self.state)
         os.makedirs(q.dir("ABC-1"), exist_ok=True)
+        steps = []
         ctx = type("C", (), {"q": q, "key": "ABC-1", "proxy": "p", "verify_model": "m"})()
-        with mock.patch.object(tq, "INFRA_RETRY_PAUSES", (0, 0)), mock.patch.object(tq, "call_model", flaky):
+        with mock.patch.object(tq, "INFRA_RETRY_PAUSES", (0, 0)), mock.patch.object(tq, "call_model", flaky), \
+                mock.patch.object(tq, "step", lambda c, t: steps.append(t)):
             self.assertEqual(tq.ask_verifier(ctx, "x", "ABC-1", "plan")["verdict"], "PASS")
             self.assertEqual(len(calls), 3)
             self.assertIn("trying again", cat(os.path.join(q.dir("ABC-1"), "log.md")))
+            self.assertIn("asking the verifier (m) about the plan", cat(os.path.join(q.dir("ABC-1"), "log.md")))
+            self.assertEqual(steps, ["asking the verifier", "the verifier request failed; trying again in 0s",
+                                     "asking the verifier (try 2)", "the verifier request failed; trying again in 0s",
+                                     "asking the verifier (try 3)"])
             # Down for good: three tries, then the probe's three, then the outage.
             calls.clear()
             with mock.patch.object(tq, "call_model", side_effect=tq.InfraError("HTTP 502: down")) as cm:

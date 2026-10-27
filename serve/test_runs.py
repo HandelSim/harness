@@ -157,6 +157,12 @@ class RunsServer(unittest.TestCase):
         with open(os.path.join(self.queue, "queue.list"), "w") as f:
             f.write("ABC-12\n")
 
+    def run_on(self, key="ABC-12", **info):
+        """A queue run going (a fresh heartbeat), on key."""
+        info.update(beat=time.time(), ticket=key)
+        with open(os.path.join(self.queue, "run.json"), "w") as f:
+            json.dump(info, f)
+
     def state(self):
         with open(os.path.join(self.queue, "ABC-12", "state.json")) as f:
             return json.load(f)
@@ -280,11 +286,27 @@ class RunsTest(RunsServer):
         self.assertIn("action='/runs/ticket/ABC-12/approve'", body)
         self.assertIn("Answer the planner", body)   # a free answer box without questions
         self.ticket(status="running", attempt=1)
+        self.run_on(stage="plan", step="asking the <verifier>")
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertNotIn("/answer'", body)
         self.assertNotIn("/retry'", body)
         self.assertIn("action='/runs/ticket/ABC-12/stop'", body)   # a running ticket can be stopped
         self.assertIn("going with the default", body)
+        self.assertIn("plan, attempt 2: asking the &lt;verifier&gt;", body)   # what the run is doing in it
+        # left running by a run that is gone (killed, its window closed): not shown as running
+        os.remove(os.path.join(self.queue, "run.json"))
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("run ended</span>", body)
+        self.assertIn("the queue run ended while it was at plan; start the queue to carry on there", body)
+        self.assertIn("href='/runs/queue'>Start the queue", body)
+        self.assertIn("action='/runs/ticket/ABC-12/stop'", body)
+        self.assertNotIn(">running</span>", body)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("run ended</span>", body)
+        self.run_on("ABC-1")   # a run on another ticket takes this one again in its turn
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("this run takes it again", body)
+        self.assertNotIn("href='/runs/queue'>Start the queue", body)
 
     def test_answering_on_the_page_saves_the_answers_and_requeues(self):
         self.ticket()
@@ -307,6 +329,7 @@ class RunsTest(RunsServer):
         r, body = self.act("answer", [("note", "one more thing")])
         self.assertEqual(r.status, 303)   # a queued ticket takes more answers before it runs
         self.ticket(status="running")
+        self.run_on()
         r, body = self.act("answer", [("defaults", "1")])
         self.assertEqual(r.status, 409)   # but not a running one
         self.assertIn("ABC-12 is running now", body)
@@ -556,6 +579,7 @@ class QueuePageTest(RunsServer):
     def test_add_and_actions_refuse_bad_values(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
         self.ticket(status="running")
+        self.run_on()
         self.start()
         good = [("keys", "ABC-9"), ("project", proj), ("preset", "full")]
         for fields, why in (
@@ -653,6 +677,7 @@ class QueuePageTest(RunsServer):
 
     def test_a_queue_session_has_a_stop_button_and_the_host_an_opencode_link(self):
         self.ticket(status="running", stage="plan")
+        self.run_on()
         cfg = self.start()
         cfg.opencode_port = 4096
         cfg.opencode_password = lambda: "p w"

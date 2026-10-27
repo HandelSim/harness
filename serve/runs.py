@@ -607,6 +607,14 @@ class Runs:
                           for h in (hist if isinstance(hist, list) else []) if isinstance(h, dict)]
         # the owner asked a running ticket to stop; the run has not got to it yet
         out["stopping"] = out.get("status") == "running" and os.path.exists(os.path.join(self.queue_dir, key, "stop"))
+        if out.get("status") == "running":
+            r = self.runner()
+            if r["running"] and r.get("ticket") == key:
+                out["step"] = r.get("step", "")
+            elif not r["starting"]:
+                # left running by a run that ended without putting it back (killed, its
+                # window closed): a run takes it again at its stage
+                out.update(status="interrupted", stopping=False, run_going=r["running"])
         return out
 
     def vault_of(self, st):
@@ -743,7 +751,7 @@ class Runs:
                 info = got
         except (OSError, ValueError):
             pass
-        out = {k: info[k] for k in ("model", "ticket", "stage", "started") if isinstance(info.get(k), str)}
+        out = {k: info[k] for k in ("model", "ticket", "stage", "step", "started") if isinstance(info.get(k), str)}
         out.update(host=info.get("host") is True, single=info.get("single") is True)
         beat = info.get("beat")
         out["beat"] = beat if isinstance(beat, (int, float)) and not isinstance(beat, bool) else 0
@@ -1001,9 +1009,10 @@ def _sig(obj):
 
 PILL = {"running": ("t-run dot pulse", "running"), "needs-answers": ("t-wait dot", "needs your answers"),
         "plan-review": ("t-wait dot", "plan to approve"), "blocked": ("t-bad dot", "blocked"),
-        "done": ("t-ok dot", "done"), "stopped": ("t-off dot", "stopped"), "queued": ("t-queued", "queued")}
+        "done": ("t-ok dot", "done"), "stopped": ("t-off dot", "stopped"), "queued": ("t-queued", "queued"),
+        "interrupted": ("t-wait dot", "run ended")}
 TONE = {"running": "run", "needs-answers": "wait", "plan-review": "wait", "blocked": "bad", "stopped": "stopped",
-        "queued": "queued"}
+        "queued": "queued", "interrupted": "wait"}
 
 
 def _pill(status, stopping=False):
@@ -1046,7 +1055,7 @@ def stage_strip(st, big=False):
             cls = "cur " + TONE.get(status, "queued")
             note = {"running": f"attempt {st.get('attempt', 0) + 1}", "queued": "next",
                     "needs-answers": "questions", "plan-review": "to approve", "blocked": "blocked",
-                    "stopped": "stopped"}.get(status, status)
+                    "stopped": "stopped", "interrupted": "run ended"}.get(status, status)
         else:
             cls, note = "todo", ""
         em = f"<em>{esc(note)}</em>" if big and note else ""
@@ -1061,7 +1070,7 @@ def nav(runs, active=""):
     waiting = 0
     if runs.queue_dir:
         for k in runs.ticket_keys():
-            if runs.ticket_state(k).get("status") in WAITING:
+            if runs.ticket_state(k).get("status") in WAITING + ("interrupted",):
                 waiting += 1
     badge = f" <span class='badge' title='waiting on you'>{waiting}</span>" if waiting else ""
     def on(name):
@@ -1075,6 +1084,8 @@ def nav(runs, active=""):
             what = "between tickets"
             if r.get("ticket"):
                 what = f"{esc(r['ticket'])} &middot; {esc(r.get('stage') or '')}"
+                if r.get("step"):
+                    what = f"<span title='{esc(r['step'])}'>{what}</span>"
             label = "halting" if r["halting"] else "running"
             chip = (f"<a class='runchip' href='/runs/queue' title='the queue run'><span class='sdot run'></span>"
                     f"<span class='rtxt'>{label} <b>{what}</b></span></a>")
@@ -1124,7 +1135,7 @@ def _stage_label(runs, key, row, st, outs):
     if name:
         stage, _, n = name.partition("-")
         return stage, int(n) + 1 if n.isdigit() else 0
-    if st.get("status") == "running":
+    if st.get("status") in ("running", "interrupted"):
         return st.get("stage", ""), st.get("attempt", 0) + 1
     return "", 0
 
@@ -1222,7 +1233,7 @@ def _btn(action, label, cls="", fields=(), confirm="", title="", disabled=False)
             f"<button type='submit' class='{cls}'{t}{' disabled' if disabled else ''}>{label}</button></form>")
 
 
-STOPPABLE = ("queued", "needs-answers", "plan-review", "blocked", "running")
+STOPPABLE = ("queued", "needs-answers", "plan-review", "blocked", "running", "interrupted")
 RETRYABLE = ("blocked", "needs-answers", "stopped", "done")
 ANSWERABLE = ("needs-answers", "plan-review", "blocked", "queued", "stopped")
 
@@ -1232,7 +1243,10 @@ def _why(st):
     if st.get("stopping"):
         return "stopping: the run stops its agent within seconds"
     if status == "running":
-        return f"{st.get('stage', '')}, attempt {st.get('attempt', 0) + 1}"
+        return f"{st.get('stage', '')}, attempt {st.get('attempt', 0) + 1}" + (f": {st['step']}" if st.get("step") else "")
+    if status == "interrupted":
+        return (f"the queue run ended while it was at {st.get('stage', '')}; "
+                + ("this run takes it again" if st.get("run_going") else "start the queue to carry on there"))
     if status == "queued":
         return st.get("reason") or f"waits for the run; starts at {st.get('stage', '')}"
     if status == "done":
@@ -1259,7 +1273,7 @@ def _ticket_row(runs, key, st, i, n, now):
     acts.append(_btn(base + "remove", "Remove", "sm danger", back, disabled=status == "running",
                      title="Stop it first" if status == "running" else "",
                      confirm=f"Remove {key} from the queue? Its clone and stage outputs are deleted."))
-    tone = " wait" if status in WAITING else " run" if status == "running" else ""
+    tone = " wait" if status in WAITING + ("interrupted",) else " run" if status == "running" else ""
     proj = os.path.basename((st.get("project") or "").rstrip("/\\"))
     tags = f"<span class='tag' title='{esc(st.get('project', ''))}'>{esc(proj)}</span>" if proj else ""
     if st.get("ref"):
@@ -1278,6 +1292,8 @@ def _runner_card(runs, r, now):
         mode = "host, single message" if r["single"] else "host" if r["host"] else "container"
         what = (f"<a href='/runs/ticket/{quote(r['ticket'])}'>{esc(r['ticket'])}</a> &middot; {esc(r.get('stage', ''))}"
                 if r.get("ticket") and KEY_RE.match(r["ticket"]) else "between tickets")
+        if r.get("ticket") and r.get("step"):
+            what += f": {esc(r['step'])}"
         started = _iso_ms(r.get("started", ""))
         parts.append("<div class='state'><span class='sdot run'></span><h2>Queue running"
                      + (" <span class='pill t-wait dot'>halting</span>" if r["halting"] else "") + "</h2></div>")
@@ -1326,7 +1342,7 @@ def queue_live(runs):
     counts = {}
     for st in states.values():
         counts[st.get("status", "")] = counts.get(st.get("status", ""), 0) + 1
-    order = ("running", "needs-answers", "plan-review", "blocked", "queued", "stopped", "done")
+    order = ("running", "interrupted", "needs-answers", "plan-review", "blocked", "queued", "stopped", "done")
     summary = " ".join(f"{_pill(s)}<span class='muted'>{counts[s]}</span>" for s in order if counts.get(s))
     rows = [_ticket_row(runs, k, states[k], i, len(keys), now) for i, k in enumerate(keys)]
     tickets = (f"<div class='hd'><h2>Tickets <span class='muted'>{len(keys)}</span></h2>"
@@ -1452,6 +1468,8 @@ def _t_acts(runs, key, st, rows, live, pos, n):
         parts.append(f"<a class='btn primary' href='/runs/{quote(r['id'])}'>Watch and message the agent &rarr;</a>")
     if status == "plan-review":
         parts.append(_btn(base + "approve", "Approve the plan", "primary"))
+    if status == "interrupted" and not st.get("run_going"):
+        parts.append("<a class='btn primary' href='/runs/queue'>Start the queue &rarr;</a>")
     if status in RETRYABLE:
         opts = "".join(f"<option value='{s}'{' selected' if s == st.get('stage') else ''}>{s}</option>"
                        for s in STAGES)
