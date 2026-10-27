@@ -629,6 +629,25 @@ class QueueTest(Base):
             self.assertNotIn("{{", tq.render(name, **vals), name)
 
 
+    def test_an_upgrade_restarts_the_run_between_tickets(self):
+        # harness upgrade changed ticket_queue.py under a running queue: the ticket
+        # it is on finishes on the old code, then the run ends with RESTART so
+        # harness queue run starts it again on the new code (the next ticket).
+        self.add("ABC-1", "ABC-2")
+        sigs = iter(["old", "old"])
+        real, tq.code_sig = tq.code_sig, lambda: next(sigs, "new")
+        try:
+            rc, out = self.run_queue()
+        finally:
+            tq.code_sig = real
+        self.assertEqual(rc, tq.RESTART, out)
+        self.assertIn("harness was updated; the run starts again on the new code", out)
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(self.status("ABC-2")["status"], "queued", out)
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status("ABC-2")["status"]), (0, "done"), out)
+
+
 class ReviewFixesTest(Base):
     """What the first review of the queue found."""
 

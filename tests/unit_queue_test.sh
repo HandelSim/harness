@@ -200,4 +200,38 @@ grep -qF -- "docker ps -q --filter label=harness.agent=true --filter label=harne
     || fail "Q7: launch filter — $(cat "$Q7_LOG")"
 ok "Q7: _stop_agents: by the clone's mount label (and launch id), through harness_docker, counts what stopped"
 
+# --- Q8: a run harness upgrade ended (75) starts again on the new code -------
+# harness queue run execs the clone's harness with the same options; a proxy
+# this run started stays its own (HARNESS_QUEUE_OWNS_PROXY), so the new run
+# still stops it at the end, and nothing stops it in between.
+Q8="$TMP_ROOT/q8"; mkdir -p "$Q8/clone"
+export Q8_LOG="$Q8/log"
+printf '#!/usr/bin/env bash\necho "75" >> "$Q8_LOG"; exit 75\n' > "$Q8/py.sh"
+printf '#!/usr/bin/env bash\necho "exec $* owns=${HARNESS_QUEUE_OWNS_PROXY:-}" >> "$Q8_LOG"\n' > "$Q8/clone/harness"
+chmod +x "$Q8/py.sh" "$Q8/clone/harness"
+q8() {
+    (
+        clone_dir="$Q8/clone"
+        vault_active_name() { echo v; }
+        harness_runtime_installed() { return 1; }
+        host_require_config() { :; }; ensure_dirs() { :; }; host_ensure_toolchain() { :; }
+        host_preflight() { :; }; _gate_on_upstream_auth() { :; }; host_confirm_gate() { :; }
+        host_proxy_running() { return "$Q8_UP"; }
+        host_proxy_start() { :; }; host_proxy_wait_ready() { :; }
+        host_proxy_stop() { echo "proxy stopped" >> "$Q8_LOG"; }
+        vault_prepare() { echo "$TMP_ROOT"; }
+        harness_view() { :; }; harness_view_since() { :; }; host_proxy_port() { echo 1; }
+        _effective_default_model() { echo m; }; host_require_python3() { :; }
+        host_python_bin() { echo "$Q8/py.sh"; }
+        cmd_queue run "$@"
+    )
+}
+: > "$Q8_LOG"; Q8_UP=1 q8 --host || fail "Q8: the restarted run failed — $(cat "$Q8_LOG")"
+[[ "$(cat "$Q8_LOG")" == $'75\nexec queue run --host owns=1' ]] || fail "Q8: own proxy — $(cat "$Q8_LOG")"
+: > "$Q8_LOG"; Q8_UP=0 HARNESS_QUEUE_OWNS_PROXY=1 q8 || fail "Q8: the restarted run failed — $(cat "$Q8_LOG")"
+[[ "$(cat "$Q8_LOG")" == $'75\nexec queue run owns=1' ]] || fail "Q8: a restarted run keeps owning its proxy — $(cat "$Q8_LOG")"
+: > "$Q8_LOG"; Q8_UP=0 q8 || fail "Q8: the restarted run failed — $(cat "$Q8_LOG")"
+[[ "$(cat "$Q8_LOG")" == $'75\nexec queue run owns=' ]] || fail "Q8: a proxy it did not start — $(cat "$Q8_LOG")"
+ok "Q8: a run ended for an upgrade (75) execs harness queue run again, its proxy kept and still its own"
+
 echo "QUEUE TEST PASSED"

@@ -144,6 +144,23 @@ class Busy(RuntimeError):
     """A lock (queue.lock, notes.lock) stayed held past the wait."""
 
 
+# The run's own code: when harness upgrade changes it, the run ends between
+# tickets with RESTART and harness queue run starts it again on the new code.
+RESTART = 75
+CODE_FILES = ("ticket_queue.py", "vault_ingest.py")
+
+
+def code_sig():
+    h = hashlib.sha256()
+    for name in CODE_FILES:
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name), "rb") as f:
+                h.update(f.read())
+        except OSError:
+            pass
+    return h.hexdigest()
+
+
 class Interrupted(Exception):
     """The owner stopped the ticket ("stop", KEY/stop) or the run ("halt", DIR/halt)."""
     def __init__(self, kind):
@@ -2534,6 +2551,7 @@ def run_locked(q, a, locked_at):
                              plan_review=a.plan_review == 1, stage_timeout=a.stage_timeout, child=None, key="",
                              beat_lock=threading.Lock(), beating=threading.Event(), outage_wait=max(0, a.outage_wait),
                              idle_min=max(0.0, a.idle_min), watch=[w for w in a.watch if w], outage={})
+    ctx.code = code_sig()
     ctx.model = a.model or resolve_model(a.proxy, a.default_model)
     if not ctx.model:
         print("[queue] no model: set QUEUE_MODEL or DEFAULT_MODEL_NAME", file=sys.stderr)
@@ -2637,6 +2655,9 @@ def run_tickets(q, ctx):
             ctx.key = ""
             beat(ctx, ticket="", stage="", step="")
             checkpoint(ctx)
+            if getattr(ctx, "code", "") and code_sig() != ctx.code:
+                print("[queue] harness was updated; the run starts again on the new code", file=sys.stderr)
+                return RESTART
             todo = [k for k in q.order() if pending(k)]
             if not todo:
                 break

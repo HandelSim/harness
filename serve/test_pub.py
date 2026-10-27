@@ -4,7 +4,9 @@ Run: python3 -m unittest serve/test_pub.py (tests/unit_serve_test.sh does).
 """
 
 import base64
+import contextlib
 import http.client
+import io
 import json
 import os
 import re
@@ -133,6 +135,38 @@ class PubServerTest(LiveServer):
         self.assertTrue(stale)
         self.assertEqual(sid, pub.state_id(os.path.join(state, ".", "")))
         self.assertIsNone(pub.pub_health(free_port()))
+
+    def test_healthz_gives_the_pid_and_the_port_is_its_own(self):
+        port = self.start()
+        self.assertEqual(pub.pub_pid(port), os.getpid())
+        self.assertEqual(pub.pub_pid(free_port()), 0)
+        # One page per port: on Windows SO_REUSEADDR let a second share it, and
+        # each request went to either (an old page answered half of them).
+        srv = pub.Server(("127.0.0.1", 0), pub.make_handler(self.cfg))
+        try:
+            with self.assertRaises(OSError):
+                pub.Server(("127.0.0.1", srv.server_address[1]), pub.make_handler(self.cfg))
+        finally:
+            srv.server_close()
+
+    def test_stop_opencode_port_leaves_another_program(self):
+        port = free_port()
+        other = subprocess.Popen([sys.executable, "-m", "http.server", "--bind", "127.0.0.1", str(port)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(50):
+                if pub.listening_pids(port):
+                    break
+                time.sleep(0.1)
+            self.assertEqual(pub.listening_pids(port), {other.pid})
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertFalse(pub.stop_opencode_port(port))
+            self.assertIn("not opencode; left alone", err.getvalue())
+            self.assertIsNone(other.poll())
+        finally:
+            other.kill()
+            other.wait()
+        self.assertTrue(pub.stop_opencode_port(free_port()))
 
     def test_state_id_is_one_name_for_any_spelling(self):
         d = self.tmp.name

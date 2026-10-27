@@ -13,6 +13,7 @@
 #   - harness_view        the run viewer a headless launch brings up
 #   - harness_view_refresh harness upgrade restarts it on the new code
 #   - serve_pub_native_paths its paths as C:/... for Windows Python
+#   - cmd_serve           Ctrl-C, upgrade restart and serve stop leave nothing up
 #
 # Prints "SERVE TEST PASSED" on success.
 
@@ -327,5 +328,156 @@ pub_args=(--vault /v)
 serve_pub_native_paths
 [[ "${pub_args[*]}" == "--vault /v" ]] || fail "S10: no cygpath should leave them: ${pub_args[*]}"
 ok "S10: the viewer's path arguments are converted with one cygpath"
+
+# --- S11: serve's lifecycle: Ctrl-C, upgrade restart, serve stop, takeover ----
+# Real pub.py, and an opencode shaped like npm's: a wrapper (node there) that
+# starts the binary and waits on it, the binary starting an agent. Killing the
+# wrapper leaves the binary and its agent up, as on Windows, so after each
+# stop nothing may be left: not on either port, not the agent.
+SL="$TMP_ROOT/life"; FC="$SL/clone"; mkdir -p "$SL/bin/real" "$FC"
+ln -s "$REPO_ROOT/serve" "$FC/serve"; ln -s "$REPO_ROOT/scripts" "$FC/scripts"
+cat >"$SL/bin/opencode" <<EOF
+#!$PY
+import os, subprocess, sys
+sys.exit(subprocess.call([os.path.join(os.path.dirname(os.path.abspath(__file__)), "real", "opencode"), *sys.argv[1:]]))
+EOF
+cat >"$SL/bin/real/opencode" <<EOF
+#!$PY
+import http.server, os, subprocess, sys
+port = int(sys.argv[sys.argv.index("--port") + 1])
+agent = subprocess.Popen(["sleep", "300"])
+with open(os.environ["STUB_PIDS"], "a") as f:
+    f.write(f"{os.getpid()} {agent.pid}\n")
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+EOF
+chmod +x "$SL/bin/opencode" "$SL/bin/real/opencode"
+# The clone's harness: the real one with the gates and the proxy stubbed, so
+# the restart's exec lands here too.
+cat >"$FC/harness" <<EOF
+#!/usr/bin/env bash
+HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$SL/root" source "$HARNESS" 2>/dev/null
+clone_dir="$FC"
+source "$REPO_ROOT/scripts/lib/platform.sh"
+for f in host_require_python3 host_require_config host_confirm_gate ensure_dirs \\
+         host_ensure_toolchain host_preflight _gate_on_upstream_auth _update_check_and_banner \\
+         _print_upstream_models host_proxy_start host_proxy_wait_ready \\
+         host_proxy_stop host_write_opencode_config host_opencode_env; do
+    eval "\$f() { :; }"
+done
+vault_prepare() { :; }
+host_proxy_port() { echo 1; }
+serve_password_file() { echo pw >"\$state_root/pw"; echo "\$state_root/pw"; }
+set -euo pipefail
+mkdir -p "\$state_root/serve"
+[[ "\$1" == refresh ]] && { harness_serve_refresh; exit; }   # what harness upgrade runs
+shift   # "serve"
+cmd_serve "\$@"
+EOF
+chmod +x "$FC/harness"
+SPORT=$("$PY" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+STUB_PIDS="$SL/pids" PATH="$SL/bin:$PATH" "$PY" - "$FC/harness" "$SPORT" "$SL/root/state" <<'EOF' \
+    || fail "S11: serve lifecycle (above)"
+import os, signal, socket, subprocess, sys, time
+harness, port, state = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+pidf = os.path.join(state, "serve", "serve.pid")
+def fail(m):
+    print("S11:", m, file=sys.stderr); sys.exit(1)
+def listening(p):
+    s = socket.socket()
+    try:
+        return s.connect_ex(("127.0.0.1", p)) == 0
+    finally:
+        s.close()
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    with open(f"/proc/{pid}/stat") as f:   # a zombie is gone
+        return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+def until(cond, secs, what):
+    end = time.time() + secs
+    while time.time() < end:
+        if cond():
+            return
+        time.sleep(0.1)
+    fail(what)
+def stubs():
+    try:
+        return [tuple(map(int, l.split())) for l in open(os.environ["STUB_PIDS"])]
+    except OSError:
+        return []
+def start(n):
+    # A python parent, not this script's shell: a background job of a
+    # shell ignores SIGINT, and an ignored signal stays ignored for good.
+    p = subprocess.Popen([harness, "serve", "--port", str(port)], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=open(os.environ["STUB_PIDS"] + ".err", "a"))
+    until(lambda: listening(port) and listening(port + 1) and len(stubs()) >= n and os.path.exists(pidf),
+          20, f"serve {n} did not come up: " + open(os.environ["STUB_PIDS"] + ".err").read())
+    return p
+def all_gone(what):
+    until(lambda: not listening(port) and not listening(port + 1), 10, f"{what}: a port is still held")
+    left = [pid for pair in stubs() for pid in pair if alive(pid)]
+    if left:
+        fail(f"{what}: left running: {left}")
+
+# Ctrl-C
+p = start(1)
+p.send_signal(signal.SIGINT)
+try:
+    p.wait(20)
+except subprocess.TimeoutExpired:
+    fail("Ctrl-C did not end serve")
+all_gone("Ctrl-C")
+if os.path.exists(pidf):
+    fail("serve.pid is left after Ctrl-C")
+
+# harness upgrade's restart (USR1): the same terminal, a new stamp and servers
+p = start(2)
+stamp = open(pidf).read().split()
+r = subprocess.run([harness, "refresh"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=150)
+if f"harness serve is back on port {port}" not in r.stdout:
+    fail("harness_serve_refresh: " + r.stdout + r.stderr)
+until(lambda: open(pidf).read().split() != stamp and len(stubs()) >= 3
+      and listening(port) and listening(port + 1), 20, "USR1 did not restart serve")
+if p.poll() is not None:
+    fail("the restart left its terminal")
+old = stubs()[1]
+if any(alive(x) for x in old):
+    fail(f"the restart left the old opencode or its agent: {old}")
+if stamp[0] != open(pidf).read().split()[0]:
+    fail("the restart is to keep serve's pid (exec)")
+
+# harness serve stop from another terminal ends it all
+r = subprocess.run([harness, "serve", "stop"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+try:
+    p.wait(20)
+except subprocess.TimeoutExpired:
+    fail("serve stop did not end the serve: " + r.stderr)
+all_gone("serve stop")
+
+# Takeover: a pub page and an opencode a serve left behind (its Ctrl-C did not
+# reach them) are ended by the next serve, which then has both ports.
+fc = os.path.dirname(harness)
+stray_pub = subprocess.Popen([sys.executable, os.path.join(fc, "serve", "pub.py"), "--port", str(port),
+                              "--vault", ""], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+stray_oc = subprocess.Popen(["opencode", "serve", "--port", str(port + 1)], stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+until(lambda: listening(port) and listening(port + 1) and len(stubs()) >= 4, 10, "the strays did not come up")
+stray_oc.kill(); stray_oc.wait()    # the wrapper only, as a kill does on Windows
+p = start(5)
+until(lambda: stray_pub.poll() is not None, 10, "serve left the stray pub page up")
+if any(alive(x) for x in stubs()[3]):
+    fail(f"serve left the stray opencode or its agent up: {stubs()[3]}")
+p.send_signal(signal.SIGINT)
+p.wait(20)
+all_gone("Ctrl-C after takeover")
+EOF
+ok "S11: Ctrl-C, harness upgrade's restart (USR1) and serve stop leave nothing running; serve takes over what one left"
 
 echo "SERVE TEST PASSED"

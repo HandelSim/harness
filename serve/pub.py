@@ -38,6 +38,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1362,8 +1363,10 @@ def make_handler(cfg):
             path = url.path
             if path == "/healthz":
                 # for `pub.py start`: whether this server runs code that has changed since,
-                # and which harness state it shows (hashed: /healthz needs no sign-in)
-                extra = {"Cache-Control": "no-store", "X-Harness-State": state_id(cfg.state_dir)}
+                # and which harness state it shows (hashed: /healthz needs no sign-in);
+                # for `pub.py stop --port`: which process to end
+                extra = {"Cache-Control": "no-store", "X-Harness-State": state_id(cfg.state_dir),
+                         "X-Harness-Pid": str(os.getpid())}
                 if cfg.code_changed():
                     extra["X-Harness-Stale"] = "1"
                 self.send(200, b"ok\n", extra=extra, head=head)
@@ -1588,6 +1591,170 @@ def pub_health(port):
         return None
 
 
+def pub_pid(port):
+    """The pid a pub page on 127.0.0.1:port gives at /healthz (0: none, or one too old to say)."""
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c.request("GET", "/healthz", headers={"Host": f"127.0.0.1:{port}"})
+        r = c.getresponse()
+        r.read(8)
+        pid = r.getheader("X-Harness-Pid") or ""
+        c.close()
+        return int(pid) if r.status == 200 and pid.isdigit() else 0
+    except (OSError, http.client.HTTPException):
+        return 0
+
+
+def listening_pids(port):
+    """The pids the OS lists as listening on TCP port, for a pub page too old to
+    give its own. netstat's state column is translated, so a listening row is
+    known by its remote address, which is 0.0.0.0:0 or [::]:0."""
+    if os.name == "nt":
+        cmd = ["netstat", "-ano", "-p", "TCP"]
+    elif shutil.which("lsof"):
+        cmd = ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"]
+    else:
+        cmd = ["ss", "-Hltnp", f"sport = :{port}"]
+    try:
+        out = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=10, **runs_view.NO_WINDOW).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if cmd[0] == "lsof":
+        return {int(x) for x in out.split() if x.isdigit()}
+    if cmd[0] == "ss":
+        return {int(x) for x in re.findall(r"pid=(\d+)", out)}
+    pids = set()
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[1].rsplit(":", 1)[-1] == str(port) and f[2].endswith(":0") and f[-1].isdigit():
+            pids.add(int(f[-1]))
+    return pids
+
+
+def end_process(pid, tree=False):
+    """End pid; tree=True also ends what it started. Without it a queue run the page started goes on, as it
+    does when the page stops any other way."""
+    if os.name == "nt":
+        # os.kill is TerminateProcess there, which leaves the children
+        subprocess.run(["taskkill", "/F", *(["/T"] if tree else []), "/PID", str(pid)], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, **runs_view.NO_WINDOW)
+        return
+    for p in (descendants(pid) if tree else []) + [pid]:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def descendants(pid):
+    """pid's children, theirs and so on (POSIX: from ps), deepest last."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=10).stdout.decode()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    kids = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+            kids.setdefault(int(f[1]), []).append(int(f[0]))
+    found, todo = [], [pid]
+    while todo:
+        for k in kids.get(todo.pop(), []):
+            if k not in found:
+                found.append(k)
+                todo.append(k)
+    return found
+
+
+def process_name(pid):
+    """The lower-cased program name of pid ("" when unknown)."""
+    if os.name == "nt":
+        cmd = ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"]
+    else:
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                return f.read().strip().lower()
+        except OSError:
+            cmd = ["ps", "-o", "comm=", "-p", str(pid)]
+    try:
+        out = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=10, **runs_view.NO_WINDOW).stdout.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if os.name == "nt":
+        out = out.split(",")[0].strip('"') if out.startswith('"') else ""
+    return os.path.basename(out).lower()
+
+
+def _wait_free(port, secs=5):
+    for _ in range(int(secs * 10)):
+        if not listening_pids(port):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def stop_port(port):
+    """End the pub pages answering on 127.0.0.1:port, whichever harness started
+    them (a run viewer an older harness left up, a harness serve in another
+    terminal or one whose Ctrl-C did not reach it): a new one is to have the
+    port. Every process listening there goes, since on Windows an older page
+    shared the port with a newer one. True when one was there."""
+    if not pub_answers(port):
+        return False
+    pids = set()
+    for _ in range(3):
+        now = ({pub_pid(port)} | listening_pids(port)) - {0, os.getpid()}
+        pids |= now
+        for pid in now:
+            try:
+                end_process(pid)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        for _ in range(50):
+            if not pub_answers(port):
+                return True
+            time.sleep(0.1)
+    sys.stderr.write(f"harness: the pages on port {port} (pid {', '.join(map(str, sorted(pids))) or 'unknown'}) "
+                     "did not stop; end that process\n")
+    return True
+
+
+# What harness serve's opencode runs as: the native binary, the npm wrapper (node)
+# that starts it, or bun.
+OPENCODE_NAMES = ("opencode", "node", "bun")
+
+
+def stop_opencode_port(port):
+    """End the opencode web listening on 127.0.0.1:port and everything it started:
+    one a harness serve left behind (killing the npm wrapper leaves the binary
+    up, with its agents) would keep the port from the next one. A program
+    of another name there is left alone. True when the port is free."""
+    pids = listening_pids(port) - {0, os.getpid()}
+    if not pids:
+        return True
+    left = []
+    for pid in pids:
+        name = process_name(pid)
+        if not any(n in name for n in OPENCODE_NAMES):
+            left.append(f"{pid} {name or '?'}")
+            continue
+        try:
+            end_process(pid, tree=True)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if left:
+        sys.stderr.write(f"harness: port {port} is held by {', '.join(left)}, not opencode; left alone\n")
+        return False
+    if not _wait_free(port):
+        sys.stderr.write(f"harness: opencode on port {port} (pid {', '.join(map(str, sorted(pids)))}) "
+                         "did not stop; end that process\n")
+        return False
+    return True
+
+
 def pub_answers(port):
     """Whether a pub page answers /healthz on 127.0.0.1:port."""
     return pub_health(port) is not None
@@ -1633,7 +1800,16 @@ def background_main(argv):
     ap = argparse.ArgumentParser(prog=f"pub.py {cmd}")
     ap.add_argument("--pid-file", required=True)
     if cmd == "stop":
-        stop_viewer(ap.parse_args(argv[1:]).pid_file)
+        ap.add_argument("--port", type=int, action="append", default=[],
+                        help="also end the pub page on this port, whoever started it (repeatable)")
+        ap.add_argument("--opencode-port", type=int, action="append", default=[],
+                        help="also end the opencode listening on this port, with what it started (repeatable)")
+        a = ap.parse_args(argv[1:])
+        stop_viewer(a.pid_file)
+        for port in a.port:
+            stop_port(port)
+        for port in a.opencode_port:
+            stop_opencode_port(port)
         return 0
     ap.add_argument("--log", default=os.devnull)
     a, rest = ap.parse_known_args(argv[1:])
@@ -1677,6 +1853,19 @@ def background_main(argv):
         time.sleep(0.1)
     sys.stderr.write(f"pub.py start: the page did not come up on 127.0.0.1:{port} (see {a.log})\n")
     return 1
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # Windows lets a second SO_REUSEADDR socket bind a port another one listens on,
+    # and then either may get a connection: a pub page an older harness left up
+    # went on answering in front of the new one. There the port is one socket's.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def main(argv=None):
@@ -1735,8 +1924,7 @@ def main(argv=None):
         if not n:
             sys.stderr.write(f"[pub] warning: no valid codes in {a.access_codes}; nobody can sign in "
                              "(pub.py add-code --access-codes FILE NAME)\n")
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(cfg))
-    srv.daemon_threads = True
+    srv = Server(("127.0.0.1", a.port), make_handler(cfg))
     sys.stderr.write(f"[pub] serving http://127.0.0.1:{a.port}/\n")
     try:
         srv.serve_forever()

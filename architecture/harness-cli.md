@@ -1699,22 +1699,47 @@ its terminal, a shell as the invoking user with the server's environment
 sudo or docker, that is root. The proxy runs as the same user, so an agent
 can still read `.env` or the proxy's environment: scrubbing the key from
 opencode's env stops casual leaks, not a determined agent. Real separation
-needs the proxy under its own user. Ctrl-C stops both children (the EXIT
-trap also reaps the jq sidecar, since it replaces main's) and leaves the
-proxy up; `wait -n` exits 1 if either child dies. Logs:
+needs the proxy under its own user. Lifecycle. `cmd_serve` writes
+`state/serve/serve.pid` (`<shell pid> <port> <stamp>`, a new stamp per start)
+and, before binding, runs `pub.py stop --port N --opencode-port N+1`, which
+ends whatever still holds the two ports: on the pub port every listener plus
+the pid `/healthz` gives in `X-Harness-Pid`; on the opencode port a listener
+named `opencode`, `node` or `bun`, with its process tree (on Windows the npm
+`opencode` shim runs node, which runs `opencode.exe`, and ending node alone
+leaves `opencode.exe` and its agents up), while another program there is
+named and left alone. Listeners are found with `netstat -ano` on Windows,
+`lsof` or `ss` elsewhere. `pub.py` binds with `SO_EXCLUSIVEADDRUSE` on
+Windows (its `SO_REUSEADDR` lets a second server share a port, which once
+split requests between an old and a new pub.py) and `SO_REUSEADDR`
+elsewhere. Ctrl-C, `wait -n` returning (either child died) and `harness
+serve stop` (TERM to the serve.pid shell, then the same port sweep) all run
+`_serve_end`: INT ignored while it runs, the opencode tree ended (`taskkill
+/T` on its Windows pid under Git Bash), both children signalled and polled
+for up to 5 s, then the sweep; the EXIT trap also removes serve.pid and
+reaps the jq sidecar (it replaces main's). The proxy stays up. `harness
+upgrade` runs `harness_serve_refresh`: USR1 to a running serve, which ends
+its children and `exec`s the clone's new `harness serve` with its original
+arguments in the same terminal; the upgrade waits for the new stamp.
+`cmd_serve` also sets `harness_git_nosign_env`, so agents opencode web
+starts commit unsigned like `harness host` ones. Logs:
 `state/serve/{pub,opencode}.log`. `tests/unit_serve_test.sh` runs
 `serve/test_pub.py` (index, Host check, sandbox header, path escape, access
 codes, `/_auth`, usage, git log, proxy status) and `serve/test_runs.py`
 (the run viewer over a fixture opencode DB: list, transcript, escaping, tail,
 ticket page with its questions, attempts and answer/approve/retry, diffs
-and todos, send and its refusals), a stub-opencode check of `live-run.sh`
+and todos, send and its refusals, the pid header, the exclusive bind, a
+non-opencode program on the opencode port left alone), a stub-opencode check of `live-run.sh`
 (attach, inbox relay, exit code, fallbacks), plus option errors, the
 password file, the mode aliases (alone and in the merged overlay), the key
 scrub (the OAI provider keeps its slim header in host and serve) and a
 guard that the only `Authorization` header in the CLI is
 `_curl_auth_config`'s, and a stubbed run under `set -e` with no OAI that
 must reach the banner (a failing `$(...)` assignment once ended serve
-silently there).
+silently there), and S11: a real `cmd_serve` over a stub opencode (an npm-like
+wrapper whose child spawns an agent) ended by SIGINT, restarted by
+`harness_serve_refresh`, stopped by `serve stop`, and started over a stray
+pub.py and an orphaned opencode, each time leaving both ports free and no
+stub process alive.
 
 ## ChatGPT backend (`harness chatgpt`)
 

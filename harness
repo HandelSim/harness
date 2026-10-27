@@ -3391,10 +3391,17 @@ flags:
                   Config merges still apply; hand-edited prompt-data files
                   (reminder.md, tool-guidance.json) are always left alone,
                   since replacing your prose unattended is never safe.
-  --no-restart    apply upgrade actions but skip the build/down/start cycle.
+  --no-restart    apply upgrade actions but skip the build/down/start cycle
+                  and the restarts below.
   --rebuild       force a clean rebuild (compose build --no-cache). Slower
                   but bypasses any cache-poisoning from earlier failed
                   builds.
+
+What runs keeps running, on the new code: a host proxy is started again
+with the backend and prompt mode it had, a harness serve restarts itself in
+its terminal with the same options, the run viewer a launch left up is
+started again, and a queue run restarts itself after the ticket it is on.
+A working agent (harness host, a queue stage) is never interrupted.
 
 Upgrade actions are offered ONE AT A TIME, so you can take the new .env
 variables without taking a reminder rewrite. Enter accepts, 'a' accepts
@@ -3596,22 +3603,22 @@ EOF
         apply_upgrade_actions "$manifest" 0 "$needed_ids" "$action_prompt"
     fi
 
-    # Stop a running host proxy so the next 'harness host' relaunches on the
-    # freshly pulled code. The proxy serves proxy.py from memory, and its restart
-    # fingerprint tracks only port/url/key/model (NOT code) — so without this a
-    # plain 'harness host' after an upgrade REUSES the stale-code proxy and the
-    # update silently does not take effect. This is the host analog of the
-    # container restart below (which tears down and rebuilds the stack); host
-    # opencode is an interactive foreground launch, so the user's next
-    # 'harness host' is the relaunch. Gated on --no-restart, like the container
-    # path. Runs before the host_only/container split so a container install with
-    # a stray host proxy gets it cleaned too.
-    (( no_restart )) || harness_view_refresh
-    local host_proxy_was_running=0
-    if (( ! no_restart )) && host_proxy_running; then
-        host_proxy_was_running=1
-        echo "[harness] stopping the running host proxy so your next 'harness host' uses the new code"
-        host_proxy_stop
+    # Everything long-running that harness started runs the old code from
+    # memory: start each again on the new code, in place, so nothing needs a
+    # manual stop and start. The host proxy first (a harness serve's restart
+    # uses it), then a harness serve in a terminal (it re-execs itself there),
+    # then the run viewer a launch left up. A queue run restarts itself
+    # between tickets (ticket_queue.py), and a working agent (harness host, a
+    # queue stage) is never interrupted: it reconnects to the proxy, and its
+    # next launch is on the new code. Runs before the host_only/container
+    # split so a container install with a host proxy gets it too.
+    if (( no_restart )); then
+        host_proxy_running && echo "[harness] --no-restart: the host proxy still runs the old code (harness host down, then harness host)"
+        serve_running && echo "[harness] --no-restart: harness serve still runs the old code (Ctrl-C it and run harness serve again)"
+    else
+        host_proxy_refresh
+        harness_serve_refresh
+        harness_view_refresh
     fi
 
     # Container path rebuilds images + restarts the stack so image-level changes
@@ -3621,18 +3628,9 @@ EOF
     if (( host_only )); then
         echo
         echo "[harness] host-only upgrade complete."
-        echo "  Code is updated. proxy.py runs from the clone; the host proxy venv"
-        echo "  refreshes automatically on your next 'harness host' if"
-        echo "  proxy/requirements.txt changed."
-        if (( host_proxy_was_running )); then
-            echo "  Stopped the running host proxy; run 'harness host' to relaunch it"
-            echo "  on the new code."
-        elif host_proxy_running; then
-            echo "  A host proxy is running (left up by --no-restart) — restart it to"
-            echo "  pick up the new code:  harness host down  &&  harness host"
-        else
-            echo "  Run 'harness host' to use the new code."
-        fi
+        echo "  Code is updated. What was running (host proxy, harness serve, run"
+        echo "  viewer) was restarted on it above, unless --no-restart; a queue run"
+        echo "  restarts itself after the ticket it is on."
         return 0
     fi
 
@@ -4482,6 +4480,9 @@ host_state_dir()       { printf '%s/host' "$state_root"; }
 host_venv_dir()        { printf '%s/host/venv' "$state_root"; }
 host_proxy_pidfile()   { printf '%s/host/proxy.pid' "$state_root"; }
 host_proxy_fpfile()    { printf '%s/host/proxy.fp' "$state_root"; }
+# The backend and prompt mode the running proxy was started with (two lines),
+# so `harness upgrade` can start it again the same way.
+host_proxy_modefile()  { printf '%s/host/proxy.mode' "$state_root"; }
 host_proxy_logfile()   { printf '%s/host/proxy.log' "$state_root"; }
 # Both proxies write the same file: compose mounts state/output at /output.
 host_usage_ledger()    { printf '%s/output/usage.jsonl' "$state_root"; }
@@ -5342,6 +5343,26 @@ host_proxy_start() {
         nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"
+    printf '%s\n%s\n' "${backend_override:-}" "${prompt_mode_override:-}" >"$(host_proxy_modefile)"
+}
+
+# After an upgrade: a running host proxy serves the old proxy.py from memory.
+# Start it again on the new code, with the backend and prompt mode it had, so
+# a harness host or harness serve using it sees a few seconds' gap, not a dead
+# port. One started by a harness from before proxy.mode gets the defaults.
+host_proxy_refresh() {
+    host_proxy_running || return 0
+    local mf b="" m=""
+    mf=$(host_proxy_modefile)
+    [[ -f "$mf" ]] && { IFS= read -r b; IFS= read -r m; } <"$mf" 2>/dev/null
+    echo "[harness] restarting the host proxy on the new code"
+    host_proxy_stop
+    # local: host_proxy_start reads them, and they end with this function.
+    local backend_override="$b" prompt_mode_override="$m"
+    if ! { host_proxy_start && host_proxy_wait_ready; } >&2; then
+        err "the host proxy did not come back up; 'harness host' or 'harness serve' starts it"
+    fi
+    return 0
 }
 
 # Wait for the host proxy to accept connections on its loopback port. The proxy
@@ -6972,6 +6993,9 @@ HELP
             fi
             # The mode the stages' launches want, so the first one does not restart the proxy.
             (( single )) && prompt_mode_override=single
+            # A run that started itself again after an upgrade (below) still owns its proxy.
+            [[ "${HARNESS_QUEUE_OWNS_PROXY:-}" == 1 ]] && started=1
+            unset HARNESS_QUEUE_OWNS_PROXY
             host_proxy_running || started=1
             host_proxy_start || exit 1
             host_proxy_wait_ready || { host_proxy_stop; exit 1; }
@@ -6994,6 +7018,12 @@ HELP
             (( single )) && args+=(--single-message)
             # shellcheck disable=SC2086  # $py can be 'py -3'
             PYTHONUTF8=1 $py "$script" "${args[@]}" || rc=$?
+            if (( rc == 75 )); then
+                # harness upgrade changed the runner: it ended between tickets
+                # to go on with the new code (and this script's).
+                (( started )) && export HARNESS_QUEUE_OWNS_PROXY=1
+                exec "$clone_dir/harness" queue run "$@"
+            fi
             (( started )) && host_proxy_stop
             return "$rc" ;;
         *) err "unknown queue command '$sub' (see: harness queue --help)"; return 1 ;;
@@ -7633,11 +7663,12 @@ harness_view_up() {
 
 # After an upgrade: the run viewer a launch left up still serves the old pages
 # (its pages say "harness changed on disk"), so start it again on the new code;
-# an open tab keeps working. A harness serve in a terminal is the owner's to
-# restart: say so.
+# an open tab keeps working. A harness serve is harness_serve_refresh's; one
+# started by a harness from before serve.pid can only be named.
 harness_view_refresh() {
     local pidf="$state_root/serve/viewer.pid" port="${HARNESS_VIEW_PORT:-8780}" py
     py=$(host_python_bin) || return 0
+    serve_running && return 0
     [[ -f "$pidf" ]] && read -r _ port _ < "$pidf" 2>/dev/null
     [[ "$port" =~ ^[0-9]+$ ]] || return 0
     # shellcheck disable=SC2086  # $py can be 'py -3'
@@ -7650,17 +7681,89 @@ sys.exit(c.getresponse().status != 200)' "$port" >/dev/null 2>&1 || return 0
         echo "[harness] restarting the run viewer (port $port) on the new code"
         harness_view_up "$port" || true
     else
-        echo "[harness] harness serve is up on port $port: stop it (Ctrl-C) and run harness serve again to load the updated pages"
+        echo "[harness] harness serve is up on port $port: stop it (Ctrl-C) and run harness serve again to load the updated pages (this once: a harness serve started from now on restarts itself on upgrade)"
     fi
     return 0
 }
 
-# Ends the run viewer harness_view started, if it is up.
+# Ends the run viewer harness_view started, if it is up. pub.py stop's options
+# go through: --port N also ends the pub pages on N, whoever started them (a
+# viewer an older harness left up, a harness serve in another terminal or one
+# whose Ctrl-C did not reach it), --opencode-port N the opencode listening on
+# N with everything it started, so the ports are free for a new serve.
 harness_view_stop() {
     local py
     py=$(host_python_bin) || return 0
     # shellcheck disable=SC2086  # $py can be 'py -3'
-    $py "$clone_dir/serve/pub.py" stop --pid-file "$state_root/serve/viewer.pid" || true
+    $py "$clone_dir/serve/pub.py" stop --pid-file "$state_root/serve/viewer.pid" "$@" || true
+}
+
+# The harness serve running in a terminal: "<its shell's pid> <port> <stamp>",
+# the stamp new each time it (re)starts. Removed when it exits.
+serve_pidfile() { printf '%s/serve/serve.pid' "$state_root"; }
+
+# Whether the harness serve serve.pid names is running. A pid the system gave
+# to another process since (serve ended without removing the file) is not.
+serve_running() {
+    local pid cmdline=""
+    read -r pid _ 2>/dev/null <"$(serve_pidfile)" || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+        cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
+    else
+        cmdline=$(ps -o command= -p "$pid" 2>/dev/null) || cmdline=""
+    fi
+    [[ "$cmdline" == *harness* ]]
+}
+
+# After an upgrade: a harness serve in a terminal serves the old pages and the
+# old opencode web. Ask it (SIGUSR1) to start again in place, on the new code
+# and with the same options, in the same terminal; wait until it is back.
+harness_serve_refresh() {
+    serve_running || return 0
+    local f pid port stamp now i
+    f=$(serve_pidfile)
+    read -r pid port stamp _ <"$f"
+    echo "[harness] restarting harness serve (port $port) on the new code"
+    if ! kill -USR1 "$pid" 2>/dev/null; then
+        err "could not reach harness serve (pid $pid): stop it (Ctrl-C) and run harness serve again"
+        return 0
+    fi
+    # Its checks, the proxy and the vault pull come first: up to two minutes.
+    for (( i = 0; i < 600; i++ )); do
+        now=""
+        read -r _ _ now _ 2>/dev/null <"$f" || true
+        if [[ -n "$now" && "$now" != "$stamp" ]]; then
+            echo "[harness] harness serve is back on port $port"
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+    err "harness serve did not come back (see its terminal and $state_root/serve/pub.log); run harness serve again"
+    return 0
+}
+
+# Ends harness serve's two servers (<opencode job> <pub job> <port> <opencode
+# port>) and what opencode started, leaving nothing on either port.
+_serve_end() {
+    local oc="$1" pub="$2" port="$3" oc_port="$4" w i
+    trap '' INT   # a second Ctrl-C does not cut this short
+    # On Windows a kill ends only the npm wrapper (node), not opencode.exe and
+    # the agents it started: taskkill /T ends the tree. The pub page's tree
+    # stays: a queue run started from it goes on, as on Linux (its own session).
+    if harness_is_git_bash && [[ -r "/proc/$oc/winpid" ]] && command -v taskkill >/dev/null 2>&1; then
+        w=$(cat "/proc/$oc/winpid" 2>/dev/null) && taskkill //PID "$w" //T //F >/dev/null 2>&1 || true
+    fi
+    kill "$oc" "$pub" 2>/dev/null || true
+    for (( i = 0; i < 50; i++ )); do
+        kill -0 "$oc" 2>/dev/null || kill -0 "$pub" 2>/dev/null || break
+        sleep 0.1
+    done
+    # Whatever still holds the ports (opencode.exe once its wrapper is gone, a
+    # page Ctrl-C did not reach) ends too, so nothing is left running.
+    harness_view_stop --port "$port" --opencode-port "$oc_port"
+    trap - INT    # an exec'd serve inherits an ignored INT for good
 }
 
 # The start of a run viewer link: the root sessions created from now on.
@@ -7698,7 +7801,20 @@ serve_code() {
 
 cmd_serve() {
     [[ "${1:-}" == "code" ]] && { shift; serve_code "$@"; return; }
-    [[ "${1:-}" == "stop" ]] && { harness_view_stop; return; }
+    if [[ "${1:-}" == "stop" ]]; then
+        local spid="" sport="" i
+        read -r spid sport _ 2>/dev/null <"$(serve_pidfile)" || true
+        [[ "$sport" =~ ^[0-9]+$ ]] || sport=""
+        if serve_running; then   # it ends its servers itself
+            kill -TERM "$spid" 2>/dev/null || true
+            for (( i = 0; i < 100; i++ )); do serve_running || break; sleep 0.1; done
+        fi
+        harness_view_stop --port "${HARNESS_VIEW_PORT:-8780}" \
+            ${sport:+--port "$sport" --opencode-port "$((sport + 1))"}
+        return
+    fi
+    # For the restart in place after an upgrade (harness_serve_refresh).
+    local serve_argv=("$@")
     local port=8780 arg want="" opencode_url="" secure_cookie=0
     local allow_hosts=()
     for arg in "$@"; do
@@ -7813,6 +7929,8 @@ HELP
     _oai_configured && harness_oai=oai
     # The proxy is up with its own copy of the key; neither server needs it.
     unset "${_harness_secret_vars[@]}"
+    # Agents opencode web starts commit like `harness host` ones: unsigned.
+    harness_git_nosign_env
 
     # The run viewer (/runs) reads both opencode databases, the container
     # agents' shared home and this host's, and the queue's tickets.
@@ -7835,8 +7953,9 @@ HELP
     local logdir="$state_root/serve" workdir="${harness_vault_dir:-$HOME}"
     mkdir -p "$logdir"
 
-    # The run viewer a launch left up has this port; serve takes it over.
-    harness_view_stop
+    # The run viewer a launch left up has this port, or a page an older
+    # harness left there: serve takes it over.
+    harness_view_stop --port "$port" --opencode-port "$oc_port"
     local oc_pid pub_pid
     (
         host_opencode_env
@@ -7853,8 +7972,12 @@ HELP
     pub_pid=$!
     # shellcheck disable=SC2064  # expand the pids now
     # Replaces main's EXIT trap, so it reaps the jq sidecar too.
-    trap "kill $oc_pid $pub_pid 2>/dev/null; wait $oc_pid $pub_pid 2>/dev/null; _reap_jq_sidecar" EXIT
+    trap "_serve_end $oc_pid $pub_pid $port $oc_port; rm -f '$(serve_pidfile)'; _reap_jq_sidecar" EXIT
     trap 'exit 130' INT TERM
+    # harness upgrade asks for a restart on the new code with USR1.
+    local serve_restart=0
+    trap 'serve_restart=1' USR1
+    printf '%s %s %s\n' "$$" "$port" "$RANDOM$RANDOM" >"$(serve_pidfile)"
 
     echo "============================================================" >&2
     echo " harness serve" >&2
@@ -7863,12 +7986,21 @@ HELP
     echo "   vault:        ${harness_vault_dir:-none}" >&2
     echo "   logs:         $logdir/{pub,opencode}.log" >&2
     echo "   Ctrl-C stops serve; the proxy stays up ('harness host down')" >&2
+    echo "   harness upgrade restarts it here on the new code" >&2
     echo "============================================================" >&2
 
     local rc=0
     wait -n "$oc_pid" "$pub_pid" || rc=$?
-    err "serve: a server exited (status $rc); see $logdir/pub.log and $logdir/opencode.log"
-    exit 1
+    if (( ! serve_restart )); then
+        err "serve: a server exited (status $rc); see $logdir/pub.log and $logdir/opencode.log"
+        exit 1
+    fi
+    echo "[harness] serve: harness was upgraded; starting again on the new code" >&2
+    trap - USR1
+    trap - EXIT
+    _serve_end "$oc_pid" "$pub_pid" "$port" "$oc_port"
+    _reap_jq_sidecar
+    exec "$clone_dir/harness" serve ${serve_argv[@]+"${serve_argv[@]}"}
 }
 
 cmd_host_down() {

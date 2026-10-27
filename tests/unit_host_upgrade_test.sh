@@ -110,5 +110,35 @@ if grep -q "host-only upgrade complete" <<<"${out2}"; then
 fi
 ok "T2: a runtime-present install does NOT take the host-only branch"
 
+# --- T3: a running host proxy comes back with the mode it had ---------------
+# host_proxy_start records backend and prompt mode in proxy.mode; the restart
+# an upgrade runs reads them back for the new proxy, and leaves this shell's
+# own overrides as they were.
+mkdir -p "${state_root}/host"
+printf 'chatgpt\nsingle\n' >"$(host_proxy_modefile)"
+host_proxy_running()    { return 0; }
+host_proxy_stop()       { echo "STOPPED"; }
+host_proxy_start()      { echo "STARTED backend=${backend_override:-} mode=${prompt_mode_override:-}"; }
+host_proxy_wait_ready() { return 0; }
+backend_override="" prompt_mode_override=""
+out3=$(host_proxy_refresh 2>&1)
+grep -q "STOPPED" <<<"${out3}" && grep -q "STARTED backend=chatgpt mode=single" <<<"${out3}" \
+    || { echo "${out3}" | sed 's/^/    /'; fail "T3: the proxy did not restart with its recorded mode"; }
+host_proxy_refresh >/dev/null 2>&1
+[[ -z "${backend_override}" && -z "${prompt_mode_override}" ]] \
+    || fail "T3: host_proxy_refresh changed the caller's overrides"
+ok "T3: host_proxy_refresh restarts the proxy with its recorded backend and mode"
+
+host_proxy_wait_ready() { return 1; }
+out3=$(host_proxy_refresh 2>&1) || fail "T3: a proxy that does not come back fails the upgrade"
+grep -q "did not come back up" <<<"${out3}" \
+    || { echo "${out3}" | sed 's/^/    /'; fail "T3: no message when the proxy does not come back"; }
+ok "T3: a proxy that does not come back is reported, and the upgrade goes on"
+
+host_proxy_running() { return 1; }
+out3=$(host_proxy_refresh 2>&1)
+[[ -z "${out3}" ]] || fail "T3: no proxy running, but refresh did: ${out3}"
+ok "T3: with no proxy running, nothing is started"
+
 echo
 echo "HOST UPGRADE TEST PASSED (${pass} checks)"
