@@ -777,7 +777,10 @@ def commit(vault, message):
     git(vault, "add", "-A")
     if git(vault, "diff", "--cached", "--quiet"):
         return
-    if not git(vault, "commit", "-q", "-m", message):
+    # Not signed (a smart-card key would ask for its PIN on every commit) unless
+    # HARNESS_VAULT_SIGN=1, as for harness's other vault commits.
+    nosign = [] if os.environ.get("HARNESS_VAULT_SIGN") == "1" else ["-c", "commit.gpgsign=false"]
+    if not git(vault, *nosign, "commit", "-q", "-m", message):
         print("[ingest] git commit failed (is git user.name/user.email set?)", file=sys.stderr)
         return
     if not git(vault, "rev-parse", "-q", "--verify", "@{u}"):

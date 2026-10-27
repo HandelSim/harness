@@ -495,7 +495,11 @@ the vault's remote. `import [<dir>|--all]` runs the same capture with no
 time limit over both stores, for sessions from before the vault existed
 (`--all` drops the directory filter). Then `scripts/vault_ingest.py index`
 rebuilds the generated index and hubs (no model), `git add -A`, one commit
-for everything the session changed in the vault, and a push when the branch
+for everything the session changed in the vault (unsigned, `-c
+commit.gpgsign=false`, as are `vault new`'s and ingest's commits: a signing
+key on a smart card would ask for its PIN on every launch, and a headless run
+would wait on it; `HARNESS_VAULT_SIGN=1` keeps git's setting for a remote that
+takes only signed commits), and a push when the branch
 has an upstream (no credential prompt, 30s limit; on a rejected push one
 `pull --rebase` and a second push; a conflict aborts the rebase and leaves
 the commit local). Every failure warns and the exit status is unchanged;

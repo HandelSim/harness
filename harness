@@ -5575,6 +5575,14 @@ vault_active_name() {
 }
 
 # Run git with a time limit where `timeout` exists (it is missing on macOS).
+# Harness's own vault commits are not signed: a signing key on a smart card or
+# behind a passphrase would ask for its PIN on every launch, and a headless run
+# would wait on that prompt. HARNESS_VAULT_SIGN=1 keeps the user's git setting
+# (for a remote that only takes signed commits).
+_vault_nosign() {
+    [[ "${HARNESS_VAULT_SIGN:-0}" == 1 ]] || printf '%s\n' -c commit.gpgsign=false
+}
+
 _vault_git() {
     if command -v timeout >/dev/null 2>&1; then
         timeout 30 git "$@"
@@ -5860,7 +5868,8 @@ vault_sync() {
     git -C "$dir" add -A >/dev/null 2>&1 || { err "vault: git add failed in $dir"; return 0; }
     git -C "$dir" diff --cached --quiet 2>/dev/null && return 0
     local n; n=$(git -C "$dir" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
-    if ! git -C "$dir" commit -q -m "harness: session $(date -u +%Y-%m-%dT%H:%MZ) ($n files)" >/dev/null 2>&1; then
+    local nosign=(); mapfile -t nosign < <(_vault_nosign)
+    if ! git ${nosign[@]+"${nosign[@]}"} -C "$dir" commit -q -m "harness: session $(date -u +%Y-%m-%dT%H:%MZ) ($n files)" >/dev/null 2>&1; then
         err "vault: commit failed in $dir (is git user.name/user.email set?)"
         return 0
     fi
@@ -6839,6 +6848,7 @@ HELP
             # A fresh history; harness signs the first commit when git has no identity.
             local ident=()
             git -C "$dir" config user.email >/dev/null 2>&1 || ident=(-c user.name=harness -c user.email=harness@localhost)
+            mapfile -t -O "${#ident[@]}" ident < <(_vault_nosign)
             if ! { git -C "$dir" init -q && git -C "$dir" symbolic-ref HEAD refs/heads/main \
                     && git -C "$dir" add -A \
                     && git ${ident[@]+"${ident[@]}"} -C "$dir" commit -q -m "new vault${from:+ from $from}"; }; then
