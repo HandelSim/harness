@@ -4,7 +4,9 @@ an opencode database built with opencode 1.19.3's own session/message/part table
 Run: python3 -m unittest serve/test_runs.py (tests/unit_serve_test.sh does).
 """
 
+import contextlib
 import http.client
+import io
 import json
 import os
 import re
@@ -997,6 +999,73 @@ class BackgroundTest(unittest.TestCase):
                 time.sleep(0.1)
             self.assertFalse(pub.pub_answers(port))
             self.assertEqual(pub.main(["stop", "--pid-file", pid_file]), 0)  # nothing to stop
+
+    # A page on the port answering /healthz as one whose code changed on disk.
+    OLD_VIEWER = (
+        "import sys, http.server\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200); self.send_header('X-Harness-Stale', '1')\n"
+        "        self.send_header('X-Harness-State', sys.argv[2]); self.end_headers(); self.wfile.write(b'ok\\n')\n"
+        "    def log_message(self, *a): pass\n"
+        "http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()\n")
+
+    def old_viewer(self, port, state=""):
+        proc = subprocess.Popen([sys.executable, "-c", self.OLD_VIEWER, str(port), state])
+        self.addCleanup(proc.wait, 10)
+        self.addCleanup(proc.kill)
+        for _ in range(50):
+            if pub.pub_answers(port):
+                return proc
+            time.sleep(0.1)
+        self.fail("the old viewer did not come up")
+
+    def test_start_replaces_its_viewer_on_old_code_and_leaves_another_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            pid_file, log = os.path.join(tmp, "viewer.pid"), os.path.join(tmp, "viewer.log")
+            start = ["start", "--pid-file", pid_file, "--log", log, "--port", str(port), "--state-dir", tmp]
+            # Not the viewer the pid file names (a harness serve in a terminal): left up, and said.
+            old = self.old_viewer(port)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(pub.main(start), 0)
+            self.assertIn("run harness serve again", err.getvalue())
+            self.assertIsNone(old.poll())
+            self.assertFalse(os.path.exists(pid_file))
+            # The viewer a launch left up (harness upgrade since): ended, a new one on the new code.
+            with open(pid_file, "w") as f:
+                f.write(f"{old.pid} {port}\n")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pub.main(start), 0)
+            try:
+                self.assertIsNotNone(old.wait(10))
+                self.assertEqual(pub.pub_health(port), (False, pub.state_id(tmp)))
+                with open(pid_file) as f:
+                    self.assertNotEqual(f.read().split()[0], str(old.pid))
+            finally:
+                pub.main(["stop", "--pid-file", pid_file])
+
+    def test_start_says_when_the_port_has_another_installs_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            # a current page (not stale) of another state folder
+            srv = ThreadingHTTPServer(("127.0.0.1", port), None)
+            srv.RequestHandlerClass = pub.make_handler(pub.Config(port, "", "", 0, "", (), state_dir=os.path.join(tmp, "other")))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(pub.main(["start", "--pid-file", os.path.join(tmp, "p"), "--port", str(port),
+                                           "--state-dir", tmp]), 0)
+            self.assertIn("another harness install", err.getvalue())
 
 
 if __name__ == "__main__":

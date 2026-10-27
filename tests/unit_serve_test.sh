@@ -11,6 +11,8 @@
 #   - serve/test_runs.py  the run viewer (/runs)
 #   - agents/live-run.sh  headless runs that take messages (stub opencode)
 #   - harness_view        the run viewer a headless launch brings up
+#   - harness_view_refresh harness upgrade restarts it on the new code
+#   - serve_pub_native_paths its paths as C:/... for Windows Python
 #
 # Prints "SERVE TEST PASSED" on success.
 
@@ -288,5 +290,42 @@ for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
 ! kill -0 "$pid" 2>/dev/null || fail "S8: harness serve stop left the viewer running"
 [[ ! -e "$state_root/serve/viewer.pid" ]] || fail "S8: the pid file should go"
 ok "S8: harness_view starts the run viewer once, prints the link, HARNESS_OPEN=0 skips it, stop ends it"
+
+# --- S9: harness upgrade restarts the run viewer on the new code ---------------
+out=$(harness_view_refresh 2>&1)
+[[ -z "$out" ]] || fail "S9: nothing on the port, nothing to say: $out"
+HARNESS_OPEN=0 harness_view_up "$HARNESS_VIEW_PORT" 2>/dev/null || fail "S9: the viewer did not start"
+pid=$(cut -d' ' -f1 "$state_root/serve/viewer.pid")
+out=$(harness_view_refresh 2>&1)
+grep -q "restarting the run viewer (port $HARNESS_VIEW_PORT)" <<<"$out" || fail "S9: no restart said: $out"
+pid2=$(cut -d' ' -f1 "$state_root/serve/viewer.pid")
+[[ "$pid2" != "$pid" ]] || fail "S9: the pid file still names the old viewer"
+! kill -0 "$pid" 2>/dev/null || fail "S9: the old viewer is still up"
+curl -sf --noproxy '*' "http://127.0.0.1:$HARNESS_VIEW_PORT/runs" >/dev/null || fail "S9: the new viewer is not serving /runs"
+# A page on the port that harness did not start (harness serve in a terminal): said, left up.
+rm -f "$state_root/serve/viewer.pid"
+out=$(harness_view_refresh 2>&1)
+grep -q "harness serve is up on port $HARNESS_VIEW_PORT: stop it" <<<"$out" || fail "S9: no restart hint: $out"
+kill -0 "$pid2" 2>/dev/null || fail "S9: refresh ended a page it did not start"
+kill "$pid2"
+ok "S9: upgrade restarts the viewer a launch left up, and says to restart a harness serve"
+
+# --- S10: the viewer's paths go to Windows Python as C:/... ---------------------
+CB="$TMP_ROOT/cygbin"; mkdir -p "$CB"
+cat >"$CB/cygpath" <<'EOF'
+#!/bin/sh
+[ "$1" = -m ] && [ "$2" = -- ] || exit 1
+shift 2
+for p; do echo "C:$p"; done
+EOF
+chmod +x "$CB/cygpath"
+pub_args=(--port 1 --vault /v --vault-name brain --agent-data "host=/h/share" --mode "slim=a /b" --queue-dir /s/queue --vault "")
+PATH="$CB:$PATH" serve_pub_native_paths
+want=(--port 1 --vault C:/v --vault-name brain --agent-data "host=C:/h/share" --mode "slim=a /b" --queue-dir C:/s/queue --vault "")
+[[ "${pub_args[*]}" == "${want[*]}" ]] || fail "S10: got ${pub_args[*]}"
+pub_args=(--vault /v)
+serve_pub_native_paths
+[[ "${pub_args[*]}" == "--vault /v" ]] || fail "S10: no cygpath should leave them: ${pub_args[*]}"
+ok "S10: the viewer's path arguments are converted with one cygpath"
 
 echo "SERVE TEST PASSED"

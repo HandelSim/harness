@@ -3606,6 +3606,7 @@ EOF
     # 'harness host' is the relaunch. Gated on --no-restart, like the container
     # path. Runs before the host_only/container split so a container install with
     # a stray host proxy gets it cleaned too.
+    (( no_restart )) || harness_view_refresh
     local host_proxy_was_running=0
     if (( ! no_restart )) && host_proxy_running; then
         host_proxy_was_running=1
@@ -7548,6 +7549,37 @@ serve_pub_args() {
         grep -Eqv '^[[:space:]]*(#|$)' "$(serve_codes_file)" 2>/dev/null \
             || err "warning: serve: $(serve_codes_file) has no codes, so nobody can sign in to the pub page ('harness serve code add NAME', or delete the file to open the page)"
     fi
+    serve_pub_native_paths
+}
+
+# Windows: pub.py is a native Python, which reads C:/... and not the /c/...
+# Git Bash gives. MSYS converts a path argument on its own only while neither
+# MSYS_NO_PATHCONV nor MSYS2_ARG_CONV_EXCL is set (docker users often set
+# them); then the page finds no vault, no queue and no state. So the paths in
+# pub_args are converted here, all in one cygpath.
+serve_pub_native_paths() {
+    command -v cygpath >/dev/null 2>&1 || return 0
+    local i v at=() vals=() out=()
+    for (( i = 1; i < ${#pub_args[@]}; i++ )); do
+        v=${pub_args[i]}
+        case "${pub_args[i-1]}" in
+            --vault|--password-file|--usage-ledger|--queue-dir|--state-dir|--harness|--project-dir|--access-codes) ;;
+            --agent-data) v=${v#*=} ;;
+            *) continue ;;
+        esac
+        [[ -n "$v" ]] && at+=("$i") && vals+=("$v")
+    done
+    (( ${#vals[@]} )) || return 0
+    mapfile -t out < <(cygpath -m -- "${vals[@]}") || return 0
+    (( ${#out[@]} == ${#vals[@]} )) || return 0
+    for i in "${!at[@]}"; do
+        v=${pub_args[at[i]]}
+        if [[ "${pub_args[at[i]-1]}" == --agent-data ]]; then
+            pub_args[at[i]]="${v%%=*}=${out[i]}"
+        else
+            pub_args[at[i]]=${out[i]}
+        fi
+    done
 }
 
 # Opens URL in the default browser, in the background, when someone is at a
@@ -7576,20 +7608,51 @@ harness_open_url() {
 # the launch, so the history stays readable; harness serve stop ends it.
 # HARNESS_OPEN=0 (and CI) leave it all out; never fails the launch.
 harness_view() {
-    local path="$1" port="${HARNESS_VIEW_PORT:-8780}" py logdir="$state_root/serve"
+    local path="$1" port="${HARNESS_VIEW_PORT:-8780}"
     [[ "${HARNESS_OPEN:-1}" != 0 && -z "${CI:-}" ]] || return 0
-    py=$(host_python_bin) || return 0
-    mkdir -p "$logdir" || return 0
+    harness_view_up "$port" || return 0
+    echo "harness: watch the agent at http://127.0.0.1:$port$path" >&2
+    harness_open_url "http://127.0.0.1:$port$path"
+}
+
+# Brings up the run viewer on PORT unless a pub page answers there (pub.py
+# start replaces the one a launch left up when its code changed on disk since).
+harness_view_up() {
+    local port="$1" py logdir="$state_root/serve"
+    py=$(host_python_bin) || return 1
+    mkdir -p "$logdir" || return 1
     local pub_args=(--port "$port" --vault "${harness_vault_dir:-}" --vault-name "$(vault_active_name)")
     serve_pub_args
     # shellcheck disable=SC2086  # $py can be 'py -3'
     if ! $py "$clone_dir/serve/pub.py" start --pid-file "$logdir/viewer.pid" \
             --log "$logdir/viewer.log" "${pub_args[@]}" >&2; then
         err "warning: the run viewer did not start (see $logdir/viewer.log); the agent runs anyway"
-        return 0
+        return 1
     fi
-    echo "harness: watch the agent at http://127.0.0.1:$port$path" >&2
-    harness_open_url "http://127.0.0.1:$port$path"
+}
+
+# After an upgrade: the run viewer a launch left up still serves the old pages
+# (its pages say "harness changed on disk"), so start it again on the new code;
+# an open tab keeps working. A harness serve in a terminal is the owner's to
+# restart: say so.
+harness_view_refresh() {
+    local pidf="$state_root/serve/viewer.pid" port="${HARNESS_VIEW_PORT:-8780}" py
+    py=$(host_python_bin) || return 0
+    [[ -f "$pidf" ]] && read -r _ port _ < "$pidf" 2>/dev/null
+    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    $py -c 'import sys, http.client as h
+c = h.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=2)
+c.request("GET", "/healthz", headers={"Host": "127.0.0.1:" + sys.argv[1]})
+sys.exit(c.getresponse().status != 200)' "$port" >/dev/null 2>&1 || return 0
+    if [[ -f "$pidf" ]]; then
+        harness_view_stop
+        echo "[harness] restarting the run viewer (port $port) on the new code"
+        harness_view_up "$port" || true
+    else
+        echo "[harness] harness serve is up on port $port: stop it (Ctrl-C) and run harness serve again to load the updated pages"
+    fi
+    return 0
 }
 
 # Ends the run viewer harness_view started, if it is up.
@@ -7753,7 +7816,10 @@ HELP
 
     # The run viewer (/runs) reads both opencode databases, the container
     # agents' shared home and this host's, and the queue's tickets.
-    local pub_args=(--proxy-url "http://127.0.0.1:$(host_proxy_port)")
+    local pwfile
+    pwfile=$(serve_password_file) || { err "serve: cannot create the opencode web password"; exit 1; }
+    local pub_args=(--proxy-url "http://127.0.0.1:$(host_proxy_port)" --vault "${harness_vault_dir:-}"
+        --vault-name "$(vault_active_name)" --password-file "$pwfile")
     serve_pub_args
     [[ -n "$opencode_url" ]] && pub_args+=(--opencode-url "$opencode_url")
     # Behind a TLS reverse proxy every client is 127.0.0.1, so pub.py takes
@@ -7766,8 +7832,6 @@ HELP
             --mode "slim+thoughts=both")
     fi
 
-    local pwfile
-    pwfile=$(serve_password_file) || { err "serve: cannot create the opencode web password"; exit 1; }
     local logdir="$state_root/serve" workdir="${harness_vault_dir:-$HOME}"
     mkdir -p "$logdir"
 
@@ -7784,8 +7848,7 @@ HELP
     oc_pid=$!
     # shellcheck disable=SC2086  # host_python_bin may be the two words 'py -3'
     $(host_python_bin) "$clone_dir/serve/pub.py" --port "$port" \
-        --vault "${harness_vault_dir:-}" --vault-name "$(vault_active_name)" \
-        --opencode-port "$oc_port" --password-file "$pwfile" "${pub_args[@]}" \
+        --opencode-port "$oc_port" "${pub_args[@]}" \
         ${allow_hosts[@]+"${allow_hosts[@]}"} 2>"$logdir/pub.log" &
     pub_pid=$!
     # shellcheck disable=SC2064  # expand the pids now

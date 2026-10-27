@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 
 import runs as runs_view
 
@@ -166,8 +167,22 @@ def read_doctor(h):
     return rc, out
 
 
-def gather(h):
-    """The page's slow parts, read side by side."""
+_GATHERED = {}       # (harness, root): (when, what gather read)
+GATHER_TTL = 60     # seconds; a change made here forgets it at once
+
+
+def forget():
+    _GATHERED.clear()
+
+
+def gather(h, cached_only=False):
+    """The page's slow parts, read side by side (each is a harness run, seconds on
+    Windows); kept GATHER_TTL s. cached_only: None rather than reading them."""
+    hit = _GATHERED.get(h)
+    if hit and time.monotonic() - hit[0] < GATHER_TTL:
+        return hit[1]
+    if cached_only:
+        return None
     got = {}
     jobs = {"config": read_config, "net": read_allowlist, "mcp": read_mcp}
 
@@ -181,7 +196,35 @@ def gather(h):
         t.start()
     for t in threads:
         t.join(130)
-    return {n: got.get(n, (None, "took too long")) for n in jobs}
+    out = {n: got.get(n, (None, "took too long")) for n in jobs}
+    _GATHERED[h] = (time.monotonic(), out)
+    return out
+
+
+SLOW = (("model", "config", "Model and keys"), ("network", "net", "Network allowlist"), ("mcp", "mcp", "MCP services"))
+
+
+def slow_panels(g):
+    """The live regions' inner HTML, by region name (set-<section>)."""
+    return {f"set-{k}": panel(*g[src]) for (k, src, _), panel in zip(SLOW, (_config_panel, _net_panel, _mcp_panel))}
+
+
+# The page comes up at once; the parts harness has to read come from /settings/panels.
+PANELS_JS = """
+(function () {
+  if (!document.querySelector('.set-wait')) return;
+  window.hFetch('/settings/panels').then(function (d) {
+    Object.keys(d.regions || {}).forEach(function (k) {
+      var r = document.getElementById('r-' + k);
+      if (r) window.hSwap(r, d.regions[k]);
+    });
+  }).catch(function () {
+    document.querySelectorAll('.set-wait').forEach(function (x) {
+      x.textContent = 'Could not read this part: reload the page to try again.';
+    });
+  });
+})();
+"""
 
 
 # --- changing ------------------------------------------------------------------------
@@ -251,9 +294,9 @@ def system_info(h):
     clone = os.path.dirname(os.path.abspath(harness)) if harness else ""
     try:
         r = subprocess.run(["git", "-C", clone, "log", "-1", "--format=%h, %cr: %<(70,trunc)%s"], capture_output=True,
-                           timeout=5, stdin=subprocess.DEVNULL, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
+                           timeout=5, stdin=subprocess.DEVNULL, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"), **runs_view.NO_WINDOW)
         b = subprocess.run(["git", "-C", clone, "symbolic-ref", "--short", "-q", "HEAD"], capture_output=True,
-                           timeout=5, stdin=subprocess.DEVNULL)
+                           timeout=5, stdin=subprocess.DEVNULL, **runs_view.NO_WINDOW)
         if r.returncode == 0:
             branch = b.stdout.decode(errors="replace").strip()
             out["version"] = (f"{branch} at " if branch else "") + r.stdout.decode(errors="replace").strip()[:160]
@@ -405,7 +448,10 @@ def doctor_list(out):
 def _system_panel(info, result=None):
     parts = [f"<dl class='facts'><dt>harness</dt><dd>{esc(info.get('version') or '?')}</dd>"
              f"<dt>installed at</dt><dd>{esc(info.get('root') or '?')}</dd>"
-             f"<dt>code</dt><dd>{esc(info.get('code') or '?')}</dd></dl>",
+             f"<dt>code</dt><dd>{esc(info.get('code') or '?')}</dd>"
+             # what this page reads: a launch from another install shows another vault and queue
+             + "".join(f"<dt>{esc(k)}</dt><dd>{esc(info[k])}</dd>" for k in ("state", "vault", "queue") if info.get(k))
+             + "</dl>",
              "<div class='inl'>",
              runs_view._btn("/settings/system", "Run doctor", "", (("act", "doctor"),)),
              runs_view._btn("/settings/system", "Check for updates", "ghost", (("act", "check"),)),
@@ -423,12 +469,12 @@ def _system_panel(info, result=None):
 
 
 def render(h, codes, user, info, flash="", bad=False, new_code=None, result=None):
-    g = gather(h)
-    sections = (("model", "Model and keys", _config_panel(*g["config"])),
-                ("network", "Network allowlist", _net_panel(*g["net"])),
-                ("mcp", "MCP services", _mcp_panel(*g["mcp"])),
-                ("access", "Access", _access_panel(codes, user, new_code)),
-                ("system", "System", _system_panel(info, result)))
+    g = gather(h, cached_only=True)
+    slow = slow_panels(g) if g else {}
+    wait = "<p class='muted set-wait'>Reading it from harness&hellip;</p>"
+    sections = tuple((k, title, f"<div id='r-set-{k}'>{slow.get(f'set-{k}', wait)}</div>") for k, _, title in SLOW) + (
+        ("access", "Access", _access_panel(codes, user, new_code)),
+        ("system", "System", _system_panel(info, result)))
     chips = "".join(f"<a href='#{k}'>{esc(t)}</a>" for k, t, _ in sections)
     body = "".join(f"<section class='panel' id='{k}'><div class='hd'><h2>{esc(t)}</h2></div>{html}</section>"
                    for k, t, html in sections)

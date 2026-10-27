@@ -500,7 +500,7 @@ def vault_log(vault):
            "--no-color", "--format=%h%x09%an%x09%ar%x09%s"]
     try:
         r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=3, env=env)
+                           stderr=subprocess.DEVNULL, timeout=3, env=env, **runs_view.NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
@@ -919,6 +919,9 @@ def home_regions(cfg, request_host, query=""):
     launch, modes = _services(cfg, host)
     if cfg.vault:
         vault = f"<span class='chip'>vault <b>{esc(cfg.vault_name or cfg.vault)}</b></span>"
+    elif cfg.vault_name:
+        vault = (f"<span class='chip'>vault <b>{esc(cfg.vault_name)}</b>: not cloned here yet "
+                 "(a launch clones it)</span>")
     else:
         vault = "<span class='chip'>no vault selected (harness vault use &lt;name&gt;)</span>"
     main = (runs_view.live_summary(cfg.runs) if cfg.runs else []) + \
@@ -1178,9 +1181,15 @@ def make_handler(cfg):
         def send_settings(self, code, flash="", bad=False, new_code=None, result=None, head=False):
             h = self.settings_args()
             _, user = self.session() if cfg.codes else (None, None)
-            parts = settings_view.render(h, cfg.codes, user, settings_view.system_info(h), flash, bad,
-                                         new_code, result)
-            self.send_runs(code, "harness: settings", parts, "", head, "settings")
+            info = settings_view.system_info(h)
+            info["state"] = cfg.state_dir
+            info["vault"] = (f"{cfg.vault_name or '?'} at {cfg.vault}" if cfg.vault else
+                             f"{cfg.vault_name}, not cloned here yet (a launch clones it)" if cfg.vault_name else "none")
+            if cfg.runs and cfg.runs.queue_dir:
+                n = len(cfg.runs.ticket_keys())
+                info["queue"] = f"{cfg.runs.queue_dir} ({n} ticket{'' if n == 1 else 's'})"
+            parts = settings_view.render(h, cfg.codes, user, info, flash, bad, new_code, result)
+            self.send_runs(code, "harness: settings", parts, settings_view.PANELS_JS, head, "settings")
 
         def settings_post(self, path, user):
             """Settings changes: each runs the harness command a terminal user would type."""
@@ -1214,6 +1223,7 @@ def make_handler(cfg):
             else:
                 self.send(404, b"not found\n")
                 return
+            settings_view.forget()     # what the page read may have changed
             sys.stderr.write(f"[pub] settings {what} from {user or 'local'}: {msg}\n")
             if new_code or result:
                 # shown once, on this answer: a code is never stored, a report is not worth keeping
@@ -1351,7 +1361,12 @@ def make_handler(cfg):
             url = urlsplit(self.path)
             path = url.path
             if path == "/healthz":
-                self.send(200, b"ok\n", extra={"Cache-Control": "no-store"}, head=head)
+                # for `pub.py start`: whether this server runs code that has changed since,
+                # and which harness state it shows (hashed: /healthz needs no sign-in)
+                extra = {"Cache-Control": "no-store", "X-Harness-State": state_id(cfg.state_dir)}
+                if cfg.code_changed():
+                    extra["X-Harness-Stale"] = "1"
+                self.send(200, b"ok\n", extra=extra, head=head)
                 return
             # X-Harness-User is only ever set here, from the session; an
             # inbound one is never read.
@@ -1406,6 +1421,10 @@ def make_handler(cfg):
                 return
             if path == "/vault" or path.startswith("/vault/"):
                 self.vault_get(path, url.query, head)
+                return
+            if path == "/settings/panels":
+                self.send_json({"regions": settings_view.slow_panels(settings_view.gather(self.settings_args()))},
+                               head)
                 return
             if path == "/settings":
                 q = parse_qs(url.query)
@@ -1547,17 +1566,63 @@ def codes_main(argv):
     return 0
 
 
-def pub_answers(port):
-    """Whether a pub page answers /healthz on 127.0.0.1:port."""
+def state_id(state_dir):
+    """A short name for a harness state folder, the same for any spelling of it."""
+    if not state_dir:
+        return ""
+    return hashlib.sha256(os.path.normcase(os.path.realpath(state_dir)).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def pub_health(port):
+    """The pub page on 127.0.0.1:port: None when none answers /healthz, else
+    (stale: its code changed on disk since it started, its state_id)."""
     try:
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
         c.request("GET", "/healthz", headers={"Host": f"127.0.0.1:{port}"})
         r = c.getresponse()
         ok = r.status == 200 and r.read(8) == b"ok\n"
+        got = (r.getheader("X-Harness-Stale") == "1", r.getheader("X-Harness-State") or "")
         c.close()
-        return ok
+        return got if ok else None
     except (OSError, http.client.HTTPException):
+        return None
+
+
+def pub_answers(port):
+    """Whether a pub page answers /healthz on 127.0.0.1:port."""
+    return pub_health(port) is not None
+
+
+def stop_viewer(pid_file):
+    """End the run viewer pid_file names, if it is up; True when one was."""
+    try:
+        with open(pid_file) as f:
+            pid, port = (int(x) for x in f.read().split()[:2])
+    except (OSError, ValueError):
         return False
+    up = pub_answers(port)
+    if up:  # not some later process that reused the pid
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        os.remove(pid_file)
+    except OSError:
+        pass
+    for _ in range(30 if up else 0):   # the port is free before a new one takes it
+        if not pub_answers(port):
+            break
+        time.sleep(0.1)
+    return up
+
+
+def viewer_port(pid_file):
+    try:
+        with open(pid_file) as f:
+            return int(f.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def background_main(argv):
@@ -1568,31 +1633,35 @@ def background_main(argv):
     ap = argparse.ArgumentParser(prog=f"pub.py {cmd}")
     ap.add_argument("--pid-file", required=True)
     if cmd == "stop":
-        a = ap.parse_args(argv[1:])
-        try:
-            with open(a.pid_file) as f:
-                pid, port = (int(x) for x in f.read().split()[:2])
-        except (OSError, ValueError):
-            return 0
-        if pub_answers(port):  # not some later process that reused the pid
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-        try:
-            os.remove(a.pid_file)
-        except OSError:
-            pass
+        stop_viewer(ap.parse_args(argv[1:]).pid_file)
         return 0
     ap.add_argument("--log", default=os.devnull)
     a, rest = ap.parse_known_args(argv[1:])
     pp = argparse.ArgumentParser(add_help=False)
     pp.add_argument("--port", type=int, required=True)
-    port = pp.parse_known_args(rest)[0].port
-    if pub_answers(port):
+    pp.add_argument("--state-dir", default="")
+    known = pp.parse_known_args(rest)[0]
+    port = known.port
+    up = pub_health(port)
+    if up and up[0] and viewer_port(a.pid_file) == port:
+        # the viewer a launch left up runs code harness has updated since (harness
+        # upgrade, harness update): start it again on the new code
+        sys.stderr.write("harness: harness was updated since the run viewer started; restarting it\n")
+        stop_viewer(a.pid_file)
+        up = pub_health(port)
+    if up:
+        stale, state = up
+        if stale:
+            sys.stderr.write(f"harness: harness serve on port {port} runs the code from before harness was "
+                             "updated; stop it (Ctrl-C) and run harness serve again\n")
+        elif state and known.state_dir and state != state_id(known.state_dir):
+            sys.stderr.write(f"harness: port {port} has the pages of another harness install (another state "
+                             "folder): its vault and queue are not this one's\n")
         return 0
     if os.name == "nt":
-        flags = {"creationflags": 0x00000008 | 0x00000200}  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        # CREATE_NO_WINDOW, not DETACHED_PROCESS: a console with no window that the
+        # git and harness it runs share, where with none each of them opens one.
+        flags = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | 0x00000200}  # | CREATE_NEW_PROCESS_GROUP
     else:
         flags = {"start_new_session": True}
     with open(a.log, "ab") as log:

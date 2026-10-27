@@ -60,6 +60,7 @@ class LiveServer(unittest.TestCase):
         srv.RequestHandlerClass = pub.make_handler(cfg)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.servers = getattr(self, "servers", []) + [srv]
+        self.cfg = cfg
         return port
 
     def get(self, port, path, host=None):
@@ -116,10 +117,29 @@ class PubServerTest(LiveServer):
         port = self.start(vault="")
         r, body = self.get(port, "/")
         self.assertEqual(r.status, 200)
-        self.assertIn(b"no vault selected", body)
+        self.assertIn(b"vault <b>brain</b>: not cloned here yet", body)     # active, not cloned at state/vaults
+        self.assertNotIn(b"no vault selected", body)
         self.assertIn(b"opencode web", body)
         r, _ = self.get(port, "/pub/old.html")
         self.assertEqual(r.status, 404)
+
+    def test_healthz_says_which_state_and_whether_stale(self):
+        state = os.path.join(self.tmp.name, "state")
+        os.makedirs(state)
+        port = self.start(state_dir=state)
+        self.assertEqual(pub.pub_health(port), (False, pub.state_id(state)))
+        self.cfg.started_code, self.cfg._code_seen = 0, (0.0, False)     # its code changed on disk since; looked again
+        stale, sid = pub.pub_health(port)
+        self.assertTrue(stale)
+        self.assertEqual(sid, pub.state_id(os.path.join(state, ".", "")))
+        self.assertIsNone(pub.pub_health(free_port()))
+
+    def test_state_id_is_one_name_for_any_spelling(self):
+        d = self.tmp.name
+        self.assertEqual(pub.state_id(d), pub.state_id(d + "/"))
+        self.assertEqual(pub.state_id(d), pub.state_id(os.path.join(d, "vault", "..")))
+        self.assertNotEqual(pub.state_id(d), pub.state_id(self.vault))
+        self.assertEqual(pub.state_id(""), "")
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -909,6 +929,25 @@ class SettingsPageTest(LiveServer):
         text = body.decode()
         self.assertEqual(r.status, 200)
         self.assertIn("aria-current='page'>Settings", text)
+        # The page comes up without running harness; the slow parts come from /settings/panels.
+        self.assertEqual([c for c in self.calls() if "list" in c], [])
+        self.assertEqual(text.count("class='muted set-wait'"), 3)
+        self.assertIn("Access codes are off", text)
+        self.assertIn(f"<dt>state</dt><dd>{self.state}</dd>", text)
+        self.assertIn("brain, not cloned here yet", text)
+        r, body = self.get(port, "/settings/panels")
+        self.assertEqual(r.status, 200)
+        regions = json.loads(body)["regions"]
+        self.assertEqual(set(regions), {"set-model", "set-network", "set-mcp"})
+        self.assertNotIn("r-set-", body.decode())        # inner HTML: the page keeps its region div
+        self.assertEqual(sorted(self.calls()), ["config list --tsv", "mcp list --available", "net list"])
+        # Within GATHER_TTL the page shows them at once, without asking harness again.
+        r, body = self.get(port, "/settings")
+        text = body.decode()
+        self.assertNotIn("class='muted set-wait'", text)
+        self.assertEqual(len(self.calls()), 3)
+        for part in regions.values():
+            self.assertIn(part, text)
         self.assertIn("value='big'", text)
         self.assertIn("type='password' name='v_PROXY_API_KEY'", text)
         self.assertIn("type='password' name='v_HTTPS_PROXY'", text)     # a proxy URL with a password
@@ -918,7 +957,13 @@ class SettingsPageTest(LiveServer):
         self.assertIn("serena", text)
         self.assertIn(">Disable<", text)
         self.assertIn(">Install<", text)
-        self.assertIn("Access codes are off", text)
+
+    def test_a_change_here_forgets_what_was_read(self):
+        port = self.start(vault="", state_dir=self.state, harness=self.harness)
+        self.get(port, "/settings/panels")
+        self.post(port, "/settings/net", {"act": "deny", "host": "pypi.org"})
+        _, body = self.get(port, "/settings")
+        self.assertIn("class='muted set-wait'", body.decode())
 
     def test_save_sets_only_what_changed(self):
         port = self.start(vault="", state_dir=self.state, harness=self.harness)
@@ -965,6 +1010,9 @@ class SettingsPageTest(LiveServer):
         port = self.start(vault="", state_dir=self.state, harness=self.harness, access_codes=codes)
         r, _ = self.post(port, "/settings/net", {"act": "deny", "host": "pypi.org"})
         self.assertEqual(r.status, 401)
+        r, body = self.get(port, "/settings/panels")
+        self.assertNotIn(b"big", body)
+        self.assertNotIn("config list --tsv", self.calls())
         r, _ = self.post(port, "/login", {"code": alice})
         cookie = r.getheader("Set-Cookie").split(";")[0]
         r, body = self.post(port, "/settings/access", {"act": "add", "name": "bob"}, cookie)

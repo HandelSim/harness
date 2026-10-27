@@ -1516,8 +1516,13 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   never echoed). Network allowlist: `net list`, `net allow [--git-push]`,
   `net deny`. MCP: `mcp list --available`, install/enable/disable. Access
   (with `--access-codes`): add shows the new code once, remove (not your
-  own). System: version, Run doctor (rendered by section), check-updates,
-  `update`. Changes are logged to stderr with who made them.
+  own). System: version, the state folder, active vault and queue folder
+  (with its ticket count) this page reads, Run doctor (rendered by section),
+  check-updates, `update`. Changes are logged to stderr with who made them.
+  The three `list` reads (seconds each in Git Bash) run side by side and are
+  kept 60 s (`gather`; any change here forgets them): with none kept the
+  page comes up at once with placeholders and fetches them from
+  `/settings/panels` (JSON regions `set-model`, `set-network`, `set-mcp`).
 
 - `/runs/queue`: the owner's console. A runner card (running or not, mode,
   model, ticket and stage, heartbeat age, `runner.out` tail at
@@ -1631,10 +1636,23 @@ launches do not open their own) runs `pub.py start` on
 `HARNESS_VIEW_PORT` (default 8780): if a pub page already answers
 `/healthz` there (a running `harness serve`, or an earlier launch's viewer)
 it is used as it is, else pub.py starts detached (its own session; on
-Windows `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) with
+Windows `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`: a console with no
+window, shared by the git, bash and python it runs, where under
+`DETACHED_PROCESS` each of them opened a console window of its own; its
+subprocess calls also pass `runs.NO_WINDOW`) with
 `serve_pub_args` (the agent data, queue, ledger and access codes `cmd_serve`
-passes) and no opencode web, pid in `state/serve/viewer.pid`, log
-`viewer.log`. It stays up after the launch; `harness serve stop`
+passes; on Windows its paths go through one `cygpath -m`,
+`serve_pub_native_paths`, since MSYS leaves them as `/c/...` when
+`MSYS_NO_PATHCONV` or `MSYS2_ARG_CONV_EXCL` is set) and no opencode web,
+pid in `state/serve/viewer.pid`, log `viewer.log`. `/healthz` sends
+`X-Harness-State` (a hash of the state folder's real path, `state_id`) and,
+once its code changed on disk, `X-Harness-Stale: 1`: `start` replaces a
+stale page when it is the viewer the pid file names, says to restart a
+stale one it did not start (`harness serve`), and says when the port has
+another state folder's page. `harness upgrade` (unless `--no-restart`)
+runs `harness_view_refresh`: a viewer the pid file names is restarted on
+the new code; another page on the port gets the restart hint. It stays up
+after the launch; `harness serve stop`
 (`pub.py stop`, which signals the pid only if the port still answers) ends
 it, and `cmd_serve` stops it before binding the port. The link
 `/runs/follow?since=<now-2s>` is printed, and `harness_open_url` opens it

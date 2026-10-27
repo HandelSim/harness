@@ -68,6 +68,10 @@ TEXT_CAP = 20000         # characters of one tool input/output shown inline
 MAX_MESSAGE = 65536      # bytes of one message sent to a live run
 NOTE_MAX = 4000         # characters of one owner note
 ADD_NOTE_MAX = 4000      # the note given with add (it goes on a command line)
+# Windows: a child with a console of its own that has no window. Without it each git
+# or queue call a click makes flashes a console window when serve has no console
+# (the run viewer a launch leaves up) or a hidden one.
+NO_WINDOW = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
 MAX_KEYS = 50
 FORM_QUESTIONS = 6       # questions with their own answer box (the form has at most 20 fields)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1491,7 +1495,8 @@ def queue_live(runs):
     tickets = (f"<div class='hd'><h2>Tickets <span class='muted'>{len(keys)}</span></h2>"
                f"<div class='counts'>{summary}</div></div>"
                + (f"<div class='tks'>{''.join(rows)}</div>" if rows else
-                  "<div class='empty'>The queue is empty. Add tickets below.</div>"))
+                  "<div class='empty'>The queue is empty. Add tickets below."
+                  f"<div class='muted'>Its folder: <code>{esc(runs.queue_dir or '(none given)')}</code></div></div>"))
     regions = {"runner": _runner_card(runs, runs.runner(now), now), "tickets": tickets, "nav": nav(runs, "queue")}
     return {"sig": _sig(regions), "regions": regions}
 
@@ -1503,7 +1508,7 @@ def _serve_project(runs):
         return ""
     try:
         r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
-                           timeout=10, stdin=subprocess.DEVNULL)
+                           timeout=10, stdin=subprocess.DEVNULL, **NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -1596,7 +1601,8 @@ def add_form(runs, form=None, err=""):
             "<div class='grid2'>"
             "<label class='fld'>Ticket keys<input name='keys' required autocomplete='off' spellcheck='false' "
             f"value='{esc(v('keys'))}' placeholder='ABC-123 ABC-124'>"
-            "<small>one or more, space or comma separated</small></label>"
+            "<small>one or more, space or comma separated. Each is its own ticket with its own work branch "
+            "(named after its key), all with the settings below</small></label>"
             f"<label class='fld'>Project folder<input name='project' required list='projects' spellcheck='false' "
             f"value='{esc(project)}' placeholder='/home/me/src/project'>"
             f"<datalist id='projects'>{opts}</datalist><datalist id='branches'></datalist>"
@@ -1978,7 +1984,7 @@ def _queue(runs, args, text=None):
     cmd = [sys.executable, QUEUE_SCRIPT, "--state", runs.queue_dir] + args
     try:
         p = subprocess.run(cmd, input=(text or "").encode("utf-8"), stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=120)
+                           stderr=subprocess.STDOUT, timeout=120, **NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"the queue did not answer: {e}"
     out = p.stdout.decode("utf-8", "replace")
@@ -2085,7 +2091,7 @@ def project_branches(project):
     def git(*a):
         try:
             r = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", p, *a], capture_output=True, text=True,
-                               timeout=10, stdin=subprocess.DEVNULL, env=env)
+                               timeout=10, stdin=subprocess.DEVNULL, env=env, **NO_WINDOW)
         except (OSError, subprocess.SubprocessError):
             return None
         return r.stdout.strip() if r.returncode == 0 else None

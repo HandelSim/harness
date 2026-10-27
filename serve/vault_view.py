@@ -102,7 +102,7 @@ def git(vault, *args, timeout=8, binary=False):
            "-c", "color.ui=false", "-c", "core.quotepath=false", *args]
     try:
         r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           timeout=timeout, env=env)
+                           timeout=timeout, env=env, **runs_view.NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode not in (0, 1) or (r.returncode == 1 and args[:1] != ("grep",)):
