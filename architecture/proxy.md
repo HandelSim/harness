@@ -349,7 +349,9 @@ project or past work; its `AGENTS.md` says how to write there. A free model sees
 the vault's `AGENTS.md` only at the start of a long, truncated history, so the
 pointer has to ride the per-turn reminder. Values that are empty, over 400
 characters or carry control characters add nothing; the native route ignores
-the header. With a ticket the launch also sends `x-harness-ticket: KEY`, and
+the header. The proxy's own re-asks (malformed-call retry, tool search,
+require-tool corrections) rebuild the last message with the same line:
+`catch_all` hands them its `prompt_ctx` (vault, ticket, session id). With a ticket the launch also sends `x-harness-ticket: KEY`, and
 the sentence goes on to name the ticket's copy (`<vault>/.raw/tickets/KEY.md`)
 and its state note (`<vault>/wiki/notes/tickets/KEY-state.md`, kept up to date
 as each step is finished), plus `KEY-task.md` beside it, where a `harness
@@ -945,9 +947,12 @@ of the model at recency, in the one place the upstream cannot have forgotten.
 `_extract_latest_todos` walks the raw inbound messages and keeps the LAST
 `todowrite` arguments (string- or object-shaped; unparsable calls are skipped,
 never raised on). An explicit empty `todos` wins over an earlier non-empty one
-— clearing the list is a real state. There is **no cache**: the proxy is
-stateless per request and has no session key it could cache under that would
-stay correct across concurrent sessions, so the list is re-derived every turn.
+— clearing the list is a real state. The list is re-derived every turn. A
+compaction drops the `todowrite` calls from the history, so `_session_todos`
+(shared with the native reminder) also keeps each opencode session's latest
+list (`_SESSION_TODOS`, keyed on `_session_id`) and replays that when the
+history has none; a request without a session id gets no fallback. The
+require-tool `finish` bounce reads the same list.
 
 `_format_todos_block` renders it, and never returns `""`:
 

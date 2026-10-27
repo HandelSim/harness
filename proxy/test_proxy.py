@@ -6683,6 +6683,62 @@ class TestVaultReminderLine(unittest.TestCase):
         self.assertNotIn("Current ticket", proxy._vault_clause("/v", ""))
         self.assertNotIn("Current ticket", self._sent({"x-harness-ticket": "ABC-7"}))
 
+    def _reasks(self, replies, headers, messages=None):
+        """Every upstream request of one turn, with require-tool on."""
+        body = {"model": "gemini-x", "stream": False, "tools": self.TOOLS,
+                "messages": messages or [{"role": "user", "content": "what did we decide?"}]}
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post", side_effect=[
+                    self.FakeResp(200, json.dumps({"choices": [{"message": {"role": "assistant", "content": r}}]}))
+                    for r in replies]) as mock_post, \
+                patch.object(proxy, "_REQUIRE_TOOL_ENABLED", True), \
+                patch.object(proxy, "_SESSION_TODOS", {}), \
+                patch.object(proxy, "save_debug_file"), \
+                patch("sys.stdout", io.StringIO()):
+            client.post("/v1/chat/completions", data=json.dumps(body),
+                        content_type="application/json", headers=headers)
+        return [c.kwargs["json"]["messages"][-1]["content"] for c in mock_post.call_args_list]
+
+    def test_reasks_keep_the_vault_and_ticket_line(self):
+        call = "```json\n{\"name\": \"grep\", \"arguments\": {}}\n```"
+        sent = self._reasks(["I would grep the wiki.", call],
+                            {"x-harness-vault": "/v", "x-harness-ticket": "ABC-7"})
+        self.assertEqual(len(sent), 2)
+        self.assertIn("REJECTED", sent[1])   # the require-tool correction is the last message
+        for last in sent:
+            self.assertIn("Current ticket: ABC-7", last)
+
+    def test_todo_list_survives_a_compaction(self):
+        todo = {"todos": [{"content": "patch the parser", "status": "in_progress"}]}
+        before = [{"role": "user", "content": "fix it"},
+                  {"role": "assistant", "content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
+                      "name": "todowrite", "arguments": json.dumps(todo)}}]},
+                  {"role": "tool", "tool_call_id": "t", "content": "ok"}]
+        after = [{"role": "user", "content": "What did we do so far?"},
+                 {"role": "assistant", "content": "summary of the work"},
+                 {"role": "user", "content": "Continue if you have next steps"}]
+        call = "```json\n{\"name\": \"grep\", \"arguments\": {}}\n```"
+        finish = "```json\n{\"name\": \"finish\", \"arguments\": {\"summary\": \"done\"}}\n```"
+        body = {"model": "gemini-x", "stream": False, "tools": self.TOOLS}
+        client = proxy.app.test_client()
+        with patch.object(proxy.requests, "post", side_effect=[
+                    self.FakeResp(200, json.dumps({"choices": [{"message": {"role": "assistant", "content": r}}]}))
+                    for r in (call, finish, call)]) as mock_post, \
+                patch.object(proxy, "_REQUIRE_TOOL_ENABLED", True), \
+                patch.object(proxy, "_SESSION_TODOS", {}), \
+                patch.object(proxy, "save_debug_file"), \
+                patch("sys.stdout", io.StringIO()):
+            for msgs in (before, after):
+                client.post("/v1/chat/completions", data=json.dumps(dict(body, messages=msgs)),
+                            content_type="application/json", headers={"X-Session-Id": "ses_1"})
+            sent = [c.kwargs["json"]["messages"][-1]["content"] for c in mock_post.call_args_list]
+        self.assertEqual(len(sent), 3)
+        self.assertIn("patch the parser", sent[1])   # replayed after the compaction
+        self.assertNotIn("YOU HAVE NO TODO LIST", sent[1])
+        # and the finish while it is open is bounced with the item named
+        self.assertIn("patch the parser", sent[2])
+        self.assertIn("held back", sent[2])
+
 
 class TestOaiUpstream(unittest.TestCase):
     """OAI_MODELS go to the OAI upstream natively: chat requests get the

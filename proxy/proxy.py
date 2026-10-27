@@ -670,6 +670,21 @@ def _native_task_stats(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _session_todos(messages: List[Dict[str, Any]], session_id: str = "") -> Any:
+    """The latest todo list: from the history, or, when a compaction dropped
+    every todowrite from it, the last list this opencode session wrote."""
+    todos = _extract_latest_todos(messages)
+    if session_id:
+        if todos:
+            _SESSION_TODOS.pop(session_id, None)
+            _SESSION_TODOS[session_id] = todos
+            while len(_SESSION_TODOS) > _SESSION_TODOS_MAX:
+                _SESSION_TODOS.pop(next(iter(_SESSION_TODOS)))
+        else:
+            todos = _SESSION_TODOS.get(session_id)
+    return todos
+
+
 def _native_reminder(
     messages: List[Dict[str, Any]], tools: List[Any], session_id: str = "",
 ) -> str:
@@ -683,15 +698,7 @@ def _native_reminder(
     few steps lives in the slim system prompt, not here."""
     st = _native_task_stats(messages)
     lines = [f"harness: step {st['steps']} of this task."]
-    todos = _extract_latest_todos(messages)
-    if session_id:
-        if todos:
-            _SESSION_TODOS.pop(session_id, None)
-            _SESSION_TODOS[session_id] = todos
-            while len(_SESSION_TODOS) > _SESSION_TODOS_MAX:
-                _SESSION_TODOS.pop(next(iter(_SESSION_TODOS)))
-        else:
-            todos = _SESSION_TODOS.get(session_id)
+    todos = _session_todos(messages, session_id)
     has_todowrite = any(
         isinstance(t, dict) and (t.get("function") or {}).get("name") == "todowrite"
         for t in tools or []
@@ -3097,9 +3104,10 @@ def _extract_latest_todos(messages):
     look its own list up. The list only exists in two places: opencode's local
     SQLite, which the proxy has no access to, and the `todowrite` tool_calls
     sitting in the history opencode sends on every request. The second is the
-    one harness can reach, so the list is re-derived from scratch each turn
-    rather than cached: the proxy is stateless per request, and a cache keyed
-    on anything available here would be wrong across concurrent sessions.
+    one harness can reach, so the list is re-derived from scratch each turn.
+    A compaction drops those calls from the history; `_session_todos` then
+    falls back to the last list the same opencode session (its X-Session-Id)
+    wrote, and a request without a session id gets no fallback.
 
     This is what makes the replay survive the upstream forgetting: opencode
     keeps sending the full history, so even when the upstream has dropped
@@ -3959,6 +3967,7 @@ def translate_history_and_apply_prompt(
     tools: Optional[List[Dict[str, Any]]] = None,
     vault: Optional[str] = None,
     ticket: Optional[str] = None,
+    session_id: str = "",
 ) -> List[Dict[str, str]]:
     """
     Translate the inbound OpenAI-format messages into a flat conversation
@@ -4205,8 +4214,9 @@ def translate_history_and_apply_prompt(
                 # Replayed from the raw inbound history (tool_calls are
                 # flattened into prose in `messages` by this point), so the
                 # list reaches recency even when the upstream has dropped
-                # every earlier turn.
-                todos = _extract_latest_todos(original_messages)
+                # every earlier turn; after a compaction, from this session's
+                # last list.
+                todos = _session_todos(original_messages, session_id)
                 messages[-1]["content"] = build_cooperative_prompt_hybrid_reminder(
                     live_content,
                     signatures,
@@ -4562,6 +4572,7 @@ def _retry_upstream_with_correction(
     headers: Dict[str, str],
     bad_response_text: str,
     kind: str,
+    prompt_ctx: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[Dict[str, Any], str, List[Dict[str, Any]], str]]:
     """Append `[assistant(<bad>), user(<correction>)]` to the conversation
     and re-POST upstream once (issue #121, retry budget = 1). The retry is
@@ -4586,7 +4597,7 @@ def _retry_upstream_with_correction(
         {"role": "user", "content": correction},
     ]
     translated = translate_history_and_apply_prompt(
-        augmented, tools_text, tools=tools
+        augmented, tools_text, tools=tools, **(prompt_ctx or {})
     )
     retry_payload: Dict[str, Any] = {
         "model": upstream_model,
@@ -4729,6 +4740,7 @@ def _serve_meta_tools(
     headers: Dict[str, str],
     assistant_text: str,
     meta_payloads: List[Dict[str, Any]],
+    prompt_ctx: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[Dict[str, Any], str, List[Dict[str, Any]], str]]:
     """Serve one or more synthetic meta-tool calls and continue the upstream
     conversation until the model emits a real (non-meta) response. The loop runs
@@ -4762,7 +4774,7 @@ def _serve_meta_tools(
             {"role": "user", "content": "\n\n".join(results)},
         ]
         translated = translate_history_and_apply_prompt(
-            convo, tools_text, tools=tools
+            convo, tools_text, tools=tools, **(prompt_ctx or {})
         )
         payload: Dict[str, Any] = {"model": upstream_model, "messages": translated}
         if _PROMPT_MODE == "passthrough" and tools:
@@ -4975,11 +4987,11 @@ def _finish_summary_text(payload: Dict[str, Any]) -> str:
     return ""
 
 
-def _open_todo_items(messages: List[Dict[str, Any]]) -> List[str]:
+def _open_todo_items(messages: List[Dict[str, Any]], session_id: str = "") -> List[str]:
     """Contents of the model's own todo items that are not `completed`, from
     the same replay `{{TODOS}}` uses. Empty when there is no list — a model
     that never wrote one is not evidence of anything."""
-    todos = _extract_latest_todos(messages)
+    todos = _session_todos(messages, session_id)
     if not isinstance(todos, list):
         return []
     open_items = []
@@ -5003,6 +5015,7 @@ def _serve_require_tool_correction(
     assistant_text: str,
     correction: str,
     budget: int,
+    prompt_ctx: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[Dict[str, Any], str, List[Dict[str, Any]], str]]:
     """Reject a message and ask for one with a tool call, up to `budget`
     rounds. Each round appends `[assistant(<rejected>), user(<correction>)]`
@@ -5034,7 +5047,7 @@ def _serve_require_tool_correction(
             {"role": "user", "content": message},
         ]
         translated = translate_history_and_apply_prompt(
-            convo, prompt_tools_text, tools=prompt_tools
+            convo, prompt_tools_text, tools=prompt_tools, **(prompt_ctx or {})
         )
         payload: Dict[str, Any] = {
             "model": upstream_model,
@@ -5300,9 +5313,13 @@ def catch_all(path: str) -> Response:
         prompt_tools = _augment_tools_with_finish(tools) if require_tool else tools
 
         tools_text = format_tools_to_text(prompt_tools)
+        # What the reminder needs from the launch, for this request and for
+        # every re-ask the proxy makes on its behalf below.
+        prompt_ctx = {"vault": request.headers.get(_VAULT_HEADER),
+                      "ticket": request.headers.get(_TICKET_HEADER),
+                      "session_id": _session_id(request.headers)}
         translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=prompt_tools,
-                                                        vault=request.headers.get(_VAULT_HEADER),
-                                                        ticket=request.headers.get(_TICKET_HEADER))
+                                                        **prompt_ctx)
 
         # Catalog-size instrumentation (council gate-trigger). `tools` ≈ recency
         # line count (one entry per tool); `schema_tokens` is what the full
@@ -5420,6 +5437,7 @@ def catch_all(path: str) -> Response:
                     headers,
                     response_text,
                     kind,
+                    prompt_ctx=prompt_ctx,
                 )
                 if retry_result is not None:
                     retry_json, retry_text, retry_payloads, retry_clean = retry_result
@@ -5462,6 +5480,7 @@ def catch_all(path: str) -> Response:
                 served = _serve_meta_tools(
                     req_id, original_messages, prompt_tools, tools_text,
                     upstream_model, headers, response_text, meta_payloads,
+                    prompt_ctx=prompt_ctx,
                 )
                 served_meta = True
                 if served is not None:
@@ -5511,7 +5530,7 @@ def catch_all(path: str) -> Response:
                     served = _serve_require_tool_correction(
                         req_id, original_messages, prompt_tools, tools_text,
                         upstream_model, headers, response_text,
-                        _REQUIRE_TOOL_CORRECTION, budget,
+                        _REQUIRE_TOOL_CORRECTION, budget, prompt_ctx=prompt_ctx,
                     )
                 else:
                     served = None
@@ -5550,7 +5569,7 @@ def catch_all(path: str) -> Response:
             # entirely when there is no list or every item is complete, so a
             # normal finish costs nothing.
             if finish_payload is not None:
-                open_items = _open_todo_items(original_messages)
+                open_items = _open_todo_items(original_messages, prompt_ctx["session_id"])
                 if open_items:
                     served = _serve_require_tool_correction(
                         req_id, original_messages, prompt_tools, tools_text,
@@ -5559,7 +5578,7 @@ def catch_all(path: str) -> Response:
                             open_count=len(open_items),
                             next_item=open_items[0],
                         ),
-                        1,
+                        1, prompt_ctx=prompt_ctx,
                     )
                     print(
                         f"[{req_id}] require-tool: bounced `finish` with "
