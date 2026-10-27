@@ -824,6 +824,10 @@ cmd_vault add crlf "$REMOTE" >/dev/null && cmd_vault use crlf >/dev/null
 CRLFV="$state_root/vaults/crlf"
 GIT_CONFIG_GLOBAL="$TMP_ROOT/crlf.gitconfig" git clone -q "$REMOTE" "$CRLFV" 2>/dev/null
 grep -q $'\r$' "$CRLFV/AGENTS.md" || fail "V19: the stand-in should check out CRLF"
+# A clone from long ago: files older than the index, so git trusts their stat
+# data and does not look at their content (a fresh clone is "racily clean").
+git -C "$CRLFV" ls-files -z | (cd "$CRLFV" && xargs -0 touch -d '2020-01-01 00:00:00')
+GIT_CONFIG_GLOBAL="$TMP_ROOT/crlf.gitconfig" git -C "$CRLFV" update-index -q --refresh
 GIT_CONFIG_GLOBAL="$TMP_ROOT/crlf.gitconfig" vault_prepare >/dev/null 2>&1
 [[ "$(git -C "$CRLFV" config --local core.autocrlf)" == false ]] || fail "V19: prepare should set core.autocrlf=false in the vault"
 grep -q $'\r$' "$CRLFV/AGENTS.md" && fail "V19: a clean CRLF checkout should be checked out again as LF"

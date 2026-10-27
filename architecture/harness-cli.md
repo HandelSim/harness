@@ -458,7 +458,9 @@ without a vault. The working tree is kept LF (`_vault_eol`): the clone is
 made with `-c core.autocrlf=false`, and an existing clone gets
 `core.autocrlf=false` in its own config once, unless that config already
 sets it; one checked out CRLF (Git for Windows' default `true`) is checked
-out again (`checkout-index -a -f -u`) when nothing tracked is uncommitted.
+out again (`read-tree HEAD`, which drops the stat data `checkout-index`
+would otherwise trust, then `checkout-index -a -f -u`) when nothing tracked
+is uncommitted.
 The parsers in `vault_ingest.py` and `vault_ticket.py` read CRLF as LF
 anyway (`read_text` normalises, `frontmatter` and the unit/link markers take
 `\r\n`), so a unit's hash is the same on both systems. It sets the `harness_vault_dir` global, which

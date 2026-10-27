@@ -5679,7 +5679,10 @@ _vault_eol() {
     if [[ "$(_vault_g -C "$dir" config --get core.autocrlf 2>/dev/null)" == true ]]; then
         [[ -z "$(_vault_g -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]] || return 0
         _vault_g -C "$dir" config core.autocrlf false || return 0
-        # -u: the index takes the new sizes, else every file shows as modified.
+        # checkout-index skips a file whose stat data matches the index, -f or
+        # not: read-tree drops that data (the index is HEAD, nothing is staged),
+        # so every file is written again; -u keeps the new stat data.
+        _vault_g -C "$dir" read-tree HEAD 2>/dev/null || return 0
         _vault_g -C "$dir" checkout-index -a -f -u -q 2>/dev/null || true
     else
         _vault_g -C "$dir" config core.autocrlf false || true
