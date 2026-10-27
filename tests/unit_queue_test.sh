@@ -122,8 +122,10 @@ if cmd_queue status --frob 2>/dev/null; then fail "Q5: status with an unknown op
 if cmd_queue move ABC-2 sideways 2>/dev/null; then fail "Q5: move sideways accepted"; fi
 cmd_queue stop ABC-1 >/dev/null || fail "Q5: stop failed"
 [[ "$(qs ABC-1 status)" == stopped ]] || fail "Q5: ABC-1 should be stopped"
-cmd_queue retry ABC-1 --stage fix >/dev/null || fail "Q5: retry --stage failed"
-[[ "$(qs ABC-1 status stage stages)" == "queued fix ['review', 'fix', 'push']" ]] || fail "Q5: retry --stage — $(qs ABC-1 status stage stages)"
+# a stage with nothing to work from is refused: no review ran, so no Must fix items
+if cmd_queue retry ABC-1 --stage fix 2>/dev/null; then fail "Q5: retry --stage fix with no review accepted"; fi
+cmd_queue retry ABC-1 --stage plan >/dev/null || fail "Q5: retry --stage failed"
+[[ "$(qs ABC-1 status stage stages)" == "queued plan ['plan', 'review', 'push']" ]] || fail "Q5: retry --stage — $(qs ABC-1 status stage stages)"
 if cmd_queue retry ABC-1 --stage 2>/dev/null; then fail "Q5: retry --stage without a stage accepted"; fi
 grep -q 'no queue run is going' < <(cmd_queue halt) || fail "Q5: halt with no run should say so"
 grep -q 'no queue run is going' < <(cmd_queue halt --force) || fail "Q5: halt --force with no run should say so"

@@ -676,7 +676,7 @@ the hub in Obsidian.
 
 `harness queue` (`cmd_queue`, then `scripts/ticket_queue.py`) works queued
 tickets one at a time with no one at the keyboard. `add KEY... [--dir]
-[--base] [--stages LIST] [--start REF|here] [--branch NAME] [--clone]
+[--base] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch]] [--clone]
 [--no-plan-approval] [--note TEXT]` records the project and base (default: its current branch);
 by default a ticket works in the project folder (in place) and its plan waits
 for approval (`plan_review`); `--clone` and `--no-plan-approval` opt out
@@ -697,7 +697,9 @@ place, a folder on another in-place ticket's branch makes the new ticket
 start where that one did) is the commit the work starts
 from (a `remote/branch` is fetched first, `here` is what the project has
 checked out, frozen to its HEAD sha at add) and `--branch`
-(default `KEY`) the branch it ends on and push pushes; `base_sha` is the
+(default `KEY`) the branch it ends on and push pushes (refused with more than
+one key, and, without `--allow-branch`, when it is the base, `main`,
+`master` or a remote's default branch: `shared_branches`); `base_sha` is the
 merge-base of base and start, so `--stages review --start origin/X` reviews
 that branch. An existing target branch is only ever fast-forwarded:
 `lost_by` checks the local tip and every remote's (fetched) tip, and add or
@@ -822,9 +824,44 @@ stage runs `QUEUE_RETRIES` more times with the problems as feedback, then
 the ticket is `blocked`; so does any error in harness itself, so one ticket
 never jams the queue. Before a failure counts, one probe request checks the
 upstream; the verifier and the probe each try 3 times (20 s, 60 s apart) on no
-answer, 408, 429 or 5xx; if it does not answer the run exits 3 and the ticket keeps its
-stage. A stage that runs past its timeout is blocked, not retried: a
-container launch can outlive its stopped client. Going back to the plan
+answer, 408, 429 or 5xx; if it does not answer the ticket goes back at its
+stage, uncounted, and the run waits (`wait_out`: looks again after 2, 5, 10,
+then every 30 min, `waiting {since, next, until, why}` in `run.json`, a halt
+still ends it) up to `--outage-wait` (`QUEUE_OUTAGE_WAIT`, 6 h; 0: exit 3 at
+once), then exits 3. A launch that ends non-zero within 60 s having started
+nothing (no note, no commit on its branch, no `--watch` session write:
+`LaunchFailed`) goes back the same way, uncounted (`launch_fails`), and
+blocks the ticket the third time in a row. An agent with nothing new (its
+output, the `--watch` session databases, the ticket's notes, the folder's
+index and HEAD reflog, its newest file) for `--idle-min` (`QUEUE_IDLE_MIN`,
+20) is stopped: with the upstream down that is an outage, else its work is
+checked as it is ("made no progress"). The agent's result is saved as
+`verify_only` before any check, so a verifier that hangs (`VERIFY_TIMEOUT`,
+600 s), gives no JSON twice (`VerifierBroke`), or a run killed mid-check
+never launches it again: a verifier failure blocks with "verifier failed at
+STAGE ... retry KEY", and a plain retry checks the kept work again (at the
+plan stage too). A change's verdict needs `met: true` for each criterion. A
+stage that runs past its timeout is blocked, not retried: a container
+launch can outlive its stopped client. The running agent is in
+`state.json` as `agent {pid, launch, host, container, workdir}`; `run`,
+`retry`, `remove` and `stop` first end one a dead run left (`reap`,
+`is_agent`: the pid still leads that launch). The container launch gets
+`GIT_EDITOR=true`, `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never` and a
+batch-mode `GIT_SSH_COMMAND` (on the queue's launch path only). The
+project's network git (fetch, push, `ls-remote`) runs with the same
+settings and a timeout that ends the whole process tree, never under
+`queue.lock`; a failed `_sync` or `_pull` only warns. In place, the
+folder's branch at add is `orig_branch`; a parked or finished ticket
+switches the folder back unless that leaves new changes behind, and a
+stale exclude block is stripped. After push (or a last stage that is not
+push) `state.json` has `push {remote, url, branch, sha, result:
+pushed|local|rejected|skipped, error}`, `compare_url` (GitHub or GitLab,
+when pushed), `commits [{sha, subject}]` (at most 50), `diffstat {files,
+insertions, deletions}`, `folder_branch_now` and `warnings`, also written
+to the vault as `wiki/notes/tickets/KEY-result.md`; push pushes only
+`verified_sha`, and blocks when the branch moved since it was checked.
+`answer` and `approve` take `queue.lock`; a lock held over 10 s fails the
+owner command (rc 1) rather than hang. Going back to the plan
 (`answer`) starts from a fresh clone. A
 blocking question parks the ticket as `needs-answers` and the queue moves
 on; `QUEUE_PLAN_REVIEW=1` holds each plan as `plan-review` for `approve`.

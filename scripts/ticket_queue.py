@@ -30,8 +30,11 @@ the proxy, no tools) must quote the ticket for a plan's criteria and the diff
 for each one a change meets, and harness checks
 every quote is really there. A failed stage runs again once (QUEUE_RETRIES) with
 the problems listed, then the ticket is blocked. When the stage failed because
-the upstream does not answer (one probe request), the whole run stops and the
-ticket stays where it was.
+the upstream does not answer (one probe request), the ticket goes back at its
+stage, uncounted, and the run waits for the upstream (QUEUE_OUTAGE_WAIT, then it
+stops); so does a launch that dies at once having started nothing (three in a
+row block the ticket). An agent with nothing new for QUEUE_IDLE_MIN is stopped
+and its work checked; a verifier that gives no verdict blocks, its work kept.
 
 A ticket can run a subset of the stages (--stages; fix still only after a
 review with Must fix items). Its work starts at --start (a branch, tag, commit,
@@ -1078,8 +1081,6 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None):
     wrong goes to <soft> instead (a list, logged): one found quote is enough
     to show the plan is about the ticket."""
     soft = [] if soft is None else soft
-    if obj.get("unreadable"):
-        return [str(p) for p in obj["problems"]]
     problems = []
     if what == "diff":
         added, removed = diff_sides(source)
@@ -1100,6 +1101,10 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None):
             continue
         if c.get("met") is False or c.get("ok") is False:
             problems.append(f"criterion {i} failed the check: {crit[:100]} ({str(c.get('why', ''))[:200]})")
+            continue
+        if what == "diff" and not (c.get("met") is True or str(c.get("met")).lower() in ("true", "yes")):
+            problems.append(f"criterion {i}: the verifier did not say it is met (\"met\": "
+                            f"{json.dumps(c.get('met'))[:40]}): {crit[:100]}")
             continue
         quote = norm(str(c.get(quote_field) or ""))
         if not quote:
@@ -2469,6 +2474,7 @@ def cmd_add(q, a):
         if git(project, "merge-base", base, sha, check=False).returncode != 0:
             print(f"[queue] {start} and {base} have no history in common", file=sys.stderr)
             return 1
+        start_sha = sha
         if start == HERE:   # the commit the project is at now (in place, its uncommitted files come along)
             changes = uncommitted(project)
             if not in_place and (changes["untracked"] or changes["changed"]):
@@ -2479,10 +2485,22 @@ def cmd_add(q, a):
     if a.branch and git(project, "check-ref-format", "--branch", a.branch, check=False).returncode != 0:
         print(f"[queue] not a branch name: {a.branch}", file=sys.stderr)
         return 1
+    if a.branch and len({k.upper() for k in a.keys}) > 1:
+        print(f"[queue] --branch {a.branch} with {len(a.keys)} tickets: each would end on (and push) the same "
+              "branch. Add them one at a time, or leave --branch out (each gets its own)", file=sys.stderr)
+        return 1
+    shared = shared_branches(project, base)
+    if a.branch and a.branch in shared and not a.allow_branch:
+        print(f"[queue] --branch {a.branch} is {shared[a.branch]}: the queue would commit (and push) there "
+              "directly. Pick a branch of its own, or give --allow-branch to mean it", file=sys.stderr)
+        return 1
     if a.note is not None and not a.note.strip():
         print("[queue] --note is empty", file=sys.stderr)
         return 1
-    rc = 0
+    rc, lost = 0, {}
+    if start:   # the branch's tips here and on each remote: fetched, so not under the lock
+        for key in {k.upper() for k in a.keys if KEY_RE.match(k.upper())}:
+            lost[key] = lost_by(project, a.branch or key, start_sha)
     with held(os.path.join(q.root, "queue.lock")):
         order = q.order()
         for raw in a.keys:
@@ -2500,14 +2518,12 @@ def cmd_add(q, a):
             st["stage"] = first_stage(st)
             st.update({k: v for k, v in (("start", start), ("branch", a.branch), ("in_place", in_place),
                                          ("plan_review", not a.no_plan_approval)) if v})
-            if start:
-                lost = lost_by(project, branch_of(st), commit_of(project, start_of(st)))
-                if lost:
-                    print(f"[queue] {key}: branch {branch_of(st)} has commits that {start_of(st)} does not "
-                          f"({', '.join(n for n, _ in lost)}): the work would end over them. Start from it "
-                          f"(--start {lost[0][0]}) or pick another --branch", file=sys.stderr)
-                    rc = 1
-                    continue
+            if lost.get(key):
+                print(f"[queue] {key}: branch {branch_of(st)} has commits that {start_of(st)} does not "
+                      f"({', '.join(n for n, _ in lost[key])}): the work would end over them. Start from it "
+                      f"(--start {lost[key][0][0]}) or pick another --branch", file=sys.stderr)
+                rc = 1
+                continue
             if a.note:
                 q.add_note(key, a.note)
             q.save(st)
@@ -2519,6 +2535,21 @@ def cmd_add(q, a):
             print(f"[queue] {key}: queued ({how}; stages {','.join(stages)}{plan})")
         q.set_order(order)
     return rc
+
+
+def shared_branches(project, base):
+    """{branch: what it is}: the branches a ticket's work does not end on unless
+    the owner means it (--allow-branch): the base, main, master, each remote's default."""
+    out = {"main": "a main branch", "master": "a main branch"}
+    remotes = git(project, "remote", check=False).stdout.split()
+    for r in remotes:
+        d = git(project, "symbolic-ref", "-q", "--short", f"refs/remotes/{r}/HEAD", check=False).stdout.strip()
+        if d.startswith(r + "/"):
+            out[d[len(r) + 1:]] = f"{r}'s default branch"
+    names = [base] + [base[len(r) + 1:] for r in remotes if base.startswith(r + "/")]
+    for n in names:
+        out[n] = "the base the work starts from"
+    return out
 
 
 def print_list(q):
@@ -2605,6 +2636,9 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
         os.remove(q.sentinel(st["key"]))   # a stop asked before is not for this go
     except OSError:
         pass
+    kept = st.get("verify_only")   # a plan the verifier gave no verdict on is checked again, not made again
+    kept = kept if (not stage and not fresh and isinstance(kept, dict) and kept.get("stage") == st["stage"] == "plan"
+                    and kept.get("out")) else None
     if stage:
         st["stage"] = stage
     if stage or fresh:   # the agent runs again; only a plain retry checks the kept result again
@@ -2618,6 +2652,8 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
             if os.path.exists(plan_copy(q, st["key"])):
                 os.remove(plan_copy(q, st["key"]))
         st.pop("base_sha", None)   # the run clones (or sets up) again; no delete under the lock
+        if kept:
+            st["verify_only"] = kept
     q.save(st)
     return st
 
@@ -2705,6 +2741,8 @@ def cmd_retry(q, a):
         print(f"[queue] {key}'s plan waits to be read: harness queue approve {key} goes on, --stage plan makes it "
               "again", file=sys.stderr)
         return 1
+    elif st["status"] != "done" and st.get("stage") == "plan" and (st.get("verify_only") or {}).get("stage") == "plan":
+        pass   # the plan the verifier gave no verdict on is kept and checked again
     elif st["status"] == "done" or st.get("stage") not in ALL_STAGES or not has_work(q, st):
         stage = first_stage(st)   # done, or its work is gone: from the start, on a fresh clone
         extra["fresh"] = True

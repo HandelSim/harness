@@ -6653,7 +6653,8 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             on what (--json: run.json and every state)
        harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST]
                                 [--start REF|here] [--branch NAME] [--clone]
-                                [--no-plan-approval] [--note TEXT]
+                                [--allow-branch] [--no-plan-approval]
+                                [--note TEXT]
                                             queue tickets for the git project here
                                             (or PROJECT); see "Where the agents
                                             work" and "Where the work starts and
@@ -6733,7 +6734,9 @@ Where the work starts and ends:
                 A new branch is made at the start. An existing one (local, or on
                 any remote) is only ever moved forward: the start must contain
                 it (--start NAME --branch NAME carries on its work), else add
-                refuses rather than drop its commits.
+                refuses rather than drop its commits. The base, main, master
+                and a remote's default branch are refused (the queue would
+                commit and push there directly) unless --allow-branch is given.
   --base REF    what the work will merge into; the change reviewed is everything
                 since the merge base of REF and the start.
   --ref REF     the same as --start.
@@ -6767,8 +6770,15 @@ criteria; commits, a non-empty diff, no .github/ change, no secret) and a
 verifier model must quote the diff for each criterion met; harness checks the
 quotes are really there. A failed stage runs once more with the problems
 listed, then the ticket is blocked; each attempt and why it failed is on the
-ticket's page and in harness queue log KEY. If the upstream stops answering,
-the run stops and the ticket keeps its place. Bugs an agent notices outside its
+ticket's page and in harness queue log KEY. If the upstream stops answering
+(or a launch dies at once), the ticket keeps its place and the run waits,
+looking again after 2, 5, 10 and then every 30 min, for up to QUEUE_OUTAGE_WAIT;
+a halt ends the wait. An agent that changes nothing for QUEUE_IDLE_MIN minutes
+is stopped (its attempt fails, unless the upstream is down). A verifier that
+cannot answer blocks the ticket with the agent's work kept: retry KEY asks the
+verifier again without running the agent. The outcome (pushed, kept local,
+refused; commits, diffstat, a pull-request link) is in state.json and
+KEY-result.md in the vault. Bugs an agent notices outside its
 ticket go to KEY-findings.md; the queue's log of each ticket, verdicts included,
 goes to KEY-log.md in the vault. Nothing is written to the tracker. There is no
 test stage yet: read each branch before you merge it.
@@ -6776,7 +6786,9 @@ test stage yet: read each branch before you merge it.
 Settings (.env): QUEUE_MODEL (default: the default model, its free twin when it
 is a -withtools one), QUEUE_VERIFY_MODEL (default: QUEUE_MODEL), QUEUE_RETRIES
 (1), QUEUE_REMOTE (origin), QUEUE_PUSH (1; 0 keeps the branch in the project),
-QUEUE_PLAN_REVIEW (0; 1 holds every plan for 'harness queue approve').
+QUEUE_PLAN_REVIEW (0; 1 holds every plan for 'harness queue approve'),
+QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
+0 turns the idle watchdog off).
 HELP
             return 0 ;;
         watch)
@@ -6848,22 +6860,24 @@ HELP
                     --base) base="${1:-}"; shift || true ;;
                     --stages|--ref|--note|--start|--branch) (( $# )) || { err "$a needs a value"; return 1; }
                         opts+=("$a" "$1"); shift ;;
-                    --in-place|--clone|--review-plan|--no-plan-approval) opts+=("$a") ;;
+                    --in-place|--clone|--review-plan|--no-plan-approval|--allow-branch) opts+=("$a") ;;
                     -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                     *) keys+=("$a") ;;
                 esac
             done
-            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME] [--clone] [--no-plan-approval] [--note TEXT]"; return 1; }
+            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch]] [--clone] [--no-plan-approval] [--note TEXT]"; return 1; }
             args+=(add "${keys[@]}" ${opts[@]+"${opts[@]}"})
             [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")
             [[ -n "$base" ]] && args+=(--base "$base") ;;
+        # remove, stop and retry end the agent (and container) of a ticket no run holds
         remove|rm) (( $# )) || { err "usage: harness queue remove KEY..."; return 1; }
-            args+=(remove "$@") ;;
+            args+=(remove "$@" --harness "$clone_dir/harness") ;;
         approve|stop) [[ -n "${1:-}" && $# -eq 1 ]] || { err "usage: harness queue $sub KEY"; return 1; }
-            args+=("$sub" "$1") ;;
+            args+=("$sub" "$1")
+            [[ "$sub" == stop ]] && args+=(--harness "$clone_dir/harness") ;;
         retry)
             if [[ -n "${1:-}" && ( $# -eq 1 || ( $# -eq 3 && "$2" == --stage ) ) ]]; then
-                args+=(retry "$@")
+                args+=(retry "$@" --harness "$clone_dir/harness")
             else
                 err "usage: harness queue retry KEY [--stage plan|implement|review|fix|push]"; return 1
             fi ;;
@@ -6932,7 +6946,11 @@ HELP
                    --harness "$clone_dir/harness" --model "${QUEUE_MODEL:-}"
                    --default-model "$(_effective_default_model)" --verify-model "${QUEUE_VERIFY_MODEL:-}"
                    --retries "${QUEUE_RETRIES:-1}" --push "${QUEUE_PUSH:-1}"
-                   --remote "${QUEUE_REMOTE:-origin}" --plan-review "${QUEUE_PLAN_REVIEW:-0}")
+                   --remote "${QUEUE_REMOTE:-origin}" --plan-review "${QUEUE_PLAN_REVIEW:-0}"
+                   --outage-wait "${QUEUE_OUTAGE_WAIT:-21600}" --idle-min "${QUEUE_IDLE_MIN:-20}"
+                   # the session databases a working agent writes to: its idle watchdog watches them
+                   --watch "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
+                   --watch "$(agent_home_dir)/.local/share/opencode/opencode.db")
             (( host )) && args+=(--host)
             (( single )) && args+=(--single-message)
             # shellcheck disable=SC2086  # $py can be 'py -3'
@@ -8455,7 +8473,10 @@ run_agent_print() {
         --label "harness.mount=$mount_path"
     )
     # A queue stage's launch: ticket_queue.py stops its container by this label.
-    [[ -n "${HARNESS_QUEUE_LAUNCH:-}" ]] && docker_args+=(--label "harness.queue-launch=$HARNESS_QUEUE_LAUNCH")
+    # Nobody watches it, so no git in it may wait on an editor or a password.
+    [[ -n "${HARNESS_QUEUE_LAUNCH:-}" ]] && docker_args+=(--label "harness.queue-launch=$HARNESS_QUEUE_LAUNCH"
+        -e GIT_EDITOR=true -e GIT_TERMINAL_PROMPT=0 -e GCM_INTERACTIVE=never
+        -e "GIT_SSH_COMMAND=ssh -o BatchMode=yes -o ConnectTimeout=15")
     docker_args+=("$image" "$tool")
     if (( ${#pass_args[@]} > 0 )); then
         docker_args+=("${pass_args[@]}")

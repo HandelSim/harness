@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -54,6 +55,14 @@ if pointer:   # the short prompt of a long one on Windows: the agent reads the t
 same = os.path.exists(task) and open(task, encoding="utf-8").read() == prompt
 open(os.environ["FAKE_CALLS"] + ".task", "a").write(f"{ticket} {same}\n")
 stage = re.match(r"You are (\w+)", prompt).group(1)
+if os.environ.get("FAKE_EXIT"):   # N:RC: the first N launches die at once, having done nothing
+    n, rc = os.environ["FAKE_EXIT"].split(":")
+    count = os.environ["FAKE_CALLS"] + ".exits"
+    done = len(open(count).read()) if os.path.exists(count) else 0
+    if done < int(n):
+        open(count, "a").write("x")
+        print("launch failed: no container runtime")
+        sys.exit(int(rc))
 if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == ticket:
     import time
     open(os.environ["FAKE_CALLS"] + ".sleeping", "a").write(ticket + "\n")
@@ -105,12 +114,20 @@ elif stage in ("implementing", "fixing"):
 elif stage == "reviewing":
     must = "- feature.txt:1: say it twice\n" if os.environ.get("FAKE_MUSTFIX") else "- None\n"
     open(path("Write the review to"), "w").write("# ABC-1 review\n## Must fix\n" + must + "## Notes\n- None\n")
+if os.environ.get("FAKE_HANG_AFTER") and os.environ.get("FAKE_HANG_STAGE", stage) == stage:
+    import time   # its work done, the agent does not exit
+    open(os.environ["FAKE_CALLS"] + ".hanging", "a").write(stage + "\n")
+    time.sleep(int(os.environ["FAKE_HANG_AFTER"]))
 '''
 
 
 class FakeProxy(http.server.BaseHTTPRequestHandler):
-    mode = "ok"        # ok | down | badquote | reject (the verifier's request fails, the probe does not)
+    # ok | down | badquote | reject (the verifier's request fails, the probe does not)
+    # | hang (the verifier's request gets no answer for hang_secs) | garbage (a verifier reply that is not JSON)
+    mode = "ok"
     seen = []
+    down_left = 0      # the next N requests get 502 whatever the mode
+    hang_secs = 5
 
     def log_message(self, *a):
         pass
@@ -130,10 +147,18 @@ class FakeProxy(http.server.BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         prompt = req["messages"][-1]["content"]
         FakeProxy.seen.append((req["model"], self.headers.get("x-harness-raw"), prompt))
+        if FakeProxy.down_left > 0:
+            FakeProxy.down_left -= 1
+            return self.reply(502, {"error": {"message": "upstream down"}})
         if FakeProxy.mode == "down":
             return self.reply(502, {"error": {"message": "upstream down"}})
         if FakeProxy.mode == "reject" and "check a" in prompt:
             return self.reply(400, {"error": {"message": "context too long"}})
+        if FakeProxy.mode == "hang" and "check a" in prompt:
+            time.sleep(FakeProxy.hang_secs)
+            return self.reply(200, {"choices": [{"message": {"content": "too late"}}]})
+        if FakeProxy.mode == "garbage" and "check a" in prompt:
+            return self.reply(200, {"choices": [{"message": {"content": "Looks fine to me, ship it."}}]})
         m = re.search(r"numbered:\n((?:\d+\. .*\n)+)", prompt)
         n = len(m.group(1).splitlines()) if m else 0
         if "check a plan" in prompt:
@@ -201,6 +226,8 @@ class Base(unittest.TestCase):
         os.environ.update(FAKE_VAULT=self.vault, FAKE_CALLS=self.calls, FAKE_TICKET=TICKET)
         FakeProxy.mode = "ok"
         FakeProxy.seen = []
+        FakeProxy.down_left = 0
+        FakeProxy.hang_secs = 5
         self.pauses, tq.INFRA_RETRY_PAUSES = tq.INFRA_RETRY_PAUSES, (0, 0)
 
     def tearDown(self):
@@ -1717,6 +1744,232 @@ class ResultsTest(Base):
         self.git_p("remote", "set-url", "origin", "https://user:tok3n@github.com/o/r.git")
         self.assertEqual(tq.remote_url(self.project, "origin"), "https://github.com/o/r.git")
         self.assertEqual(tq.remote_url(self.project, "nope"), "")
+
+
+class StallTest(Base):
+    """A stage always moves on when its agent returns: outages are waited out, a launch
+    that dies at once is not an attempt, an idle agent is stopped, a broken verifier blocks."""
+
+    def setUp(self):
+        super().setUp()
+        for name, v in (("POLL", 0.1), ("OUTAGE_PAUSES", (0.2,))):
+            p = mock.patch.object(tq, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_outage_is_waited_out(self):
+        self.add("ABC-1")
+        FakeProxy.down_left = 8   # the verifier, its retries and the probes all fail for a while
+        rc, out = self.run_queue("--outage-wait", "60")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertIn("waiting: the upstream does not answer since", out)
+        self.assertIn("the run waits and carries on", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertEqual(len(self.calls_of("planning")), 1)   # the plan was kept, only its check waited
+
+    def test_outage_past_the_wait_ends_the_run(self):
+        self.add("ABC-1")
+        FakeProxy.mode = "down"
+        rc, out = self.run_queue("--outage-wait", "1")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("waited", out)
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("queued", "plan"), out)
+
+    def test_halt_during_an_outage_wait(self):
+        self.add("ABC-1")
+        FakeProxy.mode = "down"
+        q = tq.Queue(self.state)
+
+        def halt():
+            end = time.time() + 30
+            while time.time() < end:
+                try:
+                    if json.load(open(os.path.join(self.state, "run.json"))).get("waiting"):
+                        put(q.sentinel(), "")
+                        return
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.05)
+        t = threading.Thread(target=halt, daemon=True)
+        t.start()
+        with mock.patch.object(tq, "OUTAGE_PAUSES", (30,)):
+            t0 = time.time()
+            rc, out = self.run_queue("--outage-wait", "600")
+        self.assertLess(time.time() - t0, 25, out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("halted by the owner", out)
+        self.assertEqual(self.status()["status"], "queued")
+
+    def test_launch_that_dies_at_once_is_not_an_attempt(self):
+        os.environ["FAKE_EXIT"] = "1:1"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--outage-wait", "60")
+        self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertNotIn("launch_fails", st)
+        self.assertTrue(any("having started nothing" in " ".join(h["details"]) for h in st["history"]),
+                        st["history"])
+        passed = [h for h in st["history"] if h["stage"] == "plan" and h["result"] == "passed"]
+        self.assertEqual([h["attempt"] for h in passed], [1], st["history"])   # its first attempt, not its second
+
+    def test_launch_failing_again_and_again_blocks(self):
+        os.environ["FAKE_EXIT"] = "9:1"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--outage-wait", "60")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", out)
+        self.assertIn("3 times in a row", st["reason"])
+        self.assertEqual(len(cat(self.calls + ".exits")), 3)
+
+    def test_agent_done_but_not_exiting_is_stopped_and_checked(self):
+        os.environ.update(FAKE_HANG_AFTER="60", FAKE_HANG_STAGE="implementing")
+        self.add("ABC-1")
+        t0 = time.time()
+        rc, out = self.run_queue("--idle-min", "0.03")
+        self.assertLess(time.time() - t0, 45, out)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertIn("made no progress", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+    def test_idle_agent_with_the_upstream_down_goes_back(self):
+        os.environ.update(FAKE_HANG_AFTER="60", FAKE_HANG_STAGE="planning")
+        self.add("ABC-1")
+        FakeProxy.mode = "down"
+        rc, out = self.run_queue("--idle-min", "0.03")
+        self.assertEqual(rc, 3, out)
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("queued", "plan"), out)
+        self.assertIn("made no progress", st["reason"])
+
+    def broken_verifier(self, mode):
+        self.add("ABC-1")
+        FakeProxy.mode = mode
+        FakeProxy.hang_secs = 3
+        with mock.patch.object(tq, "VERIFY_TIMEOUT", 1):
+            rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", out)
+        self.assertIn("verifier failed at plan", st["reason"])
+        self.assertIn("retry ABC-1", st["reason"])   # what to do about it
+        self.assertTrue(st.get("verify_only"), st)    # the agent's plan is kept
+        FakeProxy.mode = "ok"
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(len(self.calls_of("planning")), 1, "the plan was checked again, not made again")
+        return st
+
+    def test_verifier_that_hangs_blocks_then_retry_rechecks(self):
+        self.broken_verifier("hang")
+
+    def test_verifier_that_gives_garbage_blocks_then_retry_rechecks(self):
+        st = self.broken_verifier("garbage")
+        self.assertIn("not the JSON asked for", st["reason"])
+
+    def test_wait_call_gives_up_at_its_deadline(self):
+        t0 = time.time()
+        with self.assertRaisesRegex(tq.InfraError, "no answer in"):
+            tq.wait_call(types.SimpleNamespace(), lambda: time.sleep(3), deadline=0.5)
+        self.assertLess(time.time() - t0, 2)
+
+    def test_run_killed_while_verifying_resumes_without_a_new_launch(self):
+        self.add("ABC-1")
+        FakeProxy.mode = "hang"
+        FakeProxy.hang_secs = 30
+        p = self.run_bg()
+        try:
+            self.wait_for(lambda: any("check a plan" in s[2] for s in FakeProxy.seen), "the plan's check", 60)
+            time.sleep(0.3)
+        finally:
+            p.kill()
+            p.wait()
+        st = self.status()
+        self.assertEqual(st["status"], "running")
+        self.assertTrue(st.get("verify_only"), st)
+        FakeProxy.mode = "ok"
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(len(self.calls_of("planning")), 1)
+
+    run_bg = OwnerControlTest.run_bg
+    wait_for = OwnerControlTest.wait_for
+
+    def test_verifier_must_say_met_and_an_empty_diff_fails(self):
+        diff = "+++ b/f.txt\n+hello feature\n"
+        crit = ["says hello"]
+        self.assertTrue(tq.judge({"verdict": "PASS", "criteria": [{"n": 1, "quote": "hello feature"}]},
+                                 crit, diff, "quote", "diff"))
+        self.assertEqual(tq.judge({"verdict": "PASS", "criteria": [{"n": 1, "met": True, "quote": "hello feature"}]},
+                                  crit, diff, "quote", "diff"), [])
+
+
+class AddGuardTest(Base):
+    def test_branch_that_is_shared_needs_allow_branch(self):
+        self.git_p("checkout", "-q", "-b", "dev")
+        self.git_p("push", "-q", "origin", "dev", "main")
+        sh("git", "-C", self.remote, "symbolic-ref", "HEAD", "refs/heads/dev")
+        self.git_p("remote", "set-head", "origin", "dev")
+        self.git_p("checkout", "-q", "main")
+        for branch, base in (("main", "main"), ("master", "main"), ("dev", "main"), ("feat", "origin/feat"),
+                             ("feat", "feat")):
+            if base in ("origin/feat", "feat"):
+                self.git_p("branch", "-q", "-f", "feat", "main")
+                if base == "origin/feat":
+                    self.git_p("push", "-q", "origin", "feat")
+                    self.git_p("fetch", "-q", "origin")
+            with self.subTest(branch=branch, base=base):
+                rc, out = self.q("add", "ABC-1", "--project", self.project, "--branch", branch, "--base", base)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("--allow-branch", out)
+                self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1")))
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--branch", "main", "--allow-branch")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["branch"], "main")
+
+    def test_one_branch_for_many_tickets_is_refused(self):
+        rc, out = self.q("add", "ABC-1", "ABC-2", "--project", self.project, "--branch", "work")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("same branch", out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1")))
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--branch", "work")
+        self.assertEqual(rc, 0, out)
+
+    def test_empty_ticket_or_missing_project_blocks(self):
+        os.environ["FAKE_TICKET"] = ""
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", out)
+        self.assertIn("ticket's text is not at", st["reason"])
+        self.assertEqual(self.calls_of("planning"), [])
+        os.environ["FAKE_TICKET"] = TICKET
+        self.add("ABC-2")
+        shutil.rmtree(self.project)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status("ABC-2")["status"], "blocked", out)
+
+    def test_owner_command_on_a_held_lock_fails_cleanly(self):
+        self.add("ABC-1")
+        self.run_queue("--plan-review", "1")
+        got = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with tq.held(os.path.join(self.state, "queue.lock")):
+                got.set()
+                release.wait(30)
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        got.wait(10)
+        try:
+            rc, out = self.q("approve", "ABC-1")   # waits 10 s for the lock, then gives up
+        finally:
+            release.set()
+            t.join()
+        self.assertEqual(rc, 1, out)
 
 
 if __name__ == "__main__":
