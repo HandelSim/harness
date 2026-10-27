@@ -1721,8 +1721,8 @@ def _t_questions(runs, key, st):
                 "approval before anything is built." if planned else f"the ticket runs {stage} again with it.")
         intro = (f"It stopped at {esc(stage)}" + (f": {esc(st['reason'])}" if st.get("reason") else "") + ". "
                  f"If you fixed the cause yourself (a setting, the run mode, something on your machine), use "
-                 f"Retry above: it runs {esc(stage)} again as it is. If the agents should do something "
-                 f"differently, write it here: {then}")
+                 f"Retry above: it runs {esc(stage)} again as it is (add a note under Notes first and every "
+                 f"stage gets it). If the work itself should change, write it here: {then}")
         return (f"<section class='panel'><h2>Get it going again</h2><div class='muted'>{intro}</div>"
                 f"{_note_form(key, 'Send and plan again' if planned else f'Send and run {esc(stage)} again')}"
                 "</section>")
