@@ -797,6 +797,11 @@ class VaultPagesTest(VaultFixture):
         self.assertIn("ingest: 3 written", text)
         self.assertIn("https://example.com/w.git", text)
         self.assertNotIn("tok@", text)                       # no credentials from a remote URL
+        # Obsidian finds a vault by the folder's name only once that folder was opened as one.
+        name = os.path.basename(self.v)
+        self.assertIn(f"href='obsidian://open?vault={name}'", text)
+        self.assertIn(f"Open folder as vault, pick {os.path.normpath(self.v)}", text)
+        self.assertIn(f"cannot find a vault named {name}", text)
         self.assertIn("img-src 'self'", self.get(self.port, "/vault")[0].getheader("Content-Security-Policy"))
         sig = re.search(r"data-sig='([^']+)'", text).group(1)
         self.assertEqual(json.loads(self.get(self.port, "/vault/live")[1])["sig"], sig)

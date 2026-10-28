@@ -1527,7 +1527,9 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   `/vault/commit/<sha>[?path=]`: the commit's stat and diff (400 kB cap).
   `/vault/file/<rel>`: png, jpeg, gif and webp only, sandboxed, nosniff.
   An "Open in Obsidian" link (`obsidian://open?vault=<folder name>`) is on
-  the overview and each markdown page.
+  the overview and each markdown page. Obsidian resolves the name only after
+  that folder was opened once as a vault there, so the overview says so under
+  the folder path and the link's tooltip names the path.
 
 - `/settings` (`serve/settings_view.py`): every change runs the harness
   command a terminal user would type, with no terminal (stdin /dev/null, new

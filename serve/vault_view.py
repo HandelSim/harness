@@ -406,12 +406,15 @@ def _crumbs(rel, last_link=False):
     return f"<div class='crumbs'>{''.join(out)}</div>"
 
 
-def _obsidian(name, rel=""):
-    """An Open in Obsidian link (the vault folder's name is its Obsidian name)."""
+def _obsidian(vault, rel=""):
+    """An Open in Obsidian link (the vault folder's name is its Obsidian name, so it
+    works once that folder has been opened as a vault in Obsidian)."""
+    name = os.path.basename(vault)
     if not name:
         return ""
     q = f"vault={quote(name, safe='')}" + (f"&file={quote(rel, safe='')}" if rel else "")
-    return f"<a class='btn ghost' href='obsidian://open?{q}' title='needs Obsidian with this vault open'>Open in Obsidian</a>"
+    tip = f"Works once Obsidian knows this vault: Open folder as vault, pick {os.path.normpath(vault)}"
+    return f"<a class='btn ghost' href='obsidian://open?{q}' title='{esc(tip)}'>Open in Obsidian</a>"
 
 
 def _search_box(q=""):
@@ -609,8 +612,10 @@ def overview_regions(vault, name, vaults=()):
         f"<li><span class='nm'><a href='{esc(href_of(p))}'>{esc(p)}</a></span><span class='meta'>{esc(w)}</span></li>"
         for p, w in recent) + "</ul>" if recent else "<p class='muted'>Nothing changed yet.</p>"
     main = (f"<section class='panel'><div class='hd'><h2>{esc(name or os.path.basename(vault))}</h2>"
-            f"{_obsidian(os.path.basename(vault))}</div>{_search_box()}<div class='vstats'>{''.join(stats)}</div>"
-            f"<dl class='facts'><dt>folder</dt><dd>{esc(vault)}</dd>{''.join(sync)}</dl></section>"
+            f"{_obsidian(vault)}</div>{_search_box()}<div class='vstats'>{''.join(stats)}</div>"
+            f"<dl class='facts'><dt>folder</dt><dd>{esc(os.path.normpath(vault))}<br><span class='muted'>For Open in "
+            "Obsidian, open this folder once in Obsidian with Open folder as vault. Until then Obsidian says it "
+            f"cannot find a vault named {esc(os.path.basename(vault))}.</span></dd>{''.join(sync)}</dl></section>"
             f"<section class='panel'><div class='hd'><h2>Recently changed</h2>"
             f"<a href='{esc(href_of(''))}'>browse all files</a></div>{rec}</section>")
     side = (_ingest_panel(vault) + _vaults_panel(vaults, name)
@@ -714,7 +719,7 @@ def render_browse(vault, name, rel):
     title = rel.rsplit("/", 1)[-1]
     side = (f"<section class='panel'><div class='hd'><h2>History</h2></div>{_hist_list(_history(vault, rel, 15), rel)}"
             "</section>")
-    acts = _obsidian(os.path.basename(vault), rel) if rel.lower().endswith(".md") else ""
+    acts = _obsidian(vault, rel) if rel.lower().endswith(".md") else ""
     if SECRET.search(rel):
         body = "<p class='muted'>Not shown: the name looks like a secret or key file.</p>"
     else:
