@@ -6,8 +6,12 @@ control room: its runner, its tickets, and every action harness queue has.
   /runs                       live runs, queue tickets by stage, then everything else
   /runs/queue                 the queue: the runner (start, stop), every ticket in
                               order with its stage strip and row actions, and a form
-                              to add tickets (stages, start, branch, where the agents work, plan approval, a note)
+                              to add tickets (stages, start, branch, how the changes land in each
+                              repository, plan approval, a note)
   /runs/queue/live            the queue page's live regions, as JSON (polled)
+  /runs/queue/repos?project=P the Add form's tree, as JSON: the project's repository and
+                              those nested in it, each with its branch, uncommitted
+                              files, ahead/behind its upstream and its branches
   /runs/<session>             the transcript: messages, thinking, every tool call with
                               its input and output, subagent sessions nested; follows a
                               working session as it goes, and takes a message for a
@@ -43,6 +47,7 @@ import hashlib
 import html
 import json
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -74,6 +79,11 @@ ADD_NOTE_MAX = 4000      # the note given with add (it goes on a command line)
 NO_WINDOW = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
 MAX_KEYS = 50
 FORM_QUESTIONS = 6       # questions with their own answer box (the form has at most 20 fields)
+REPO_ROWS = 50           # repositories the Add form's tree lists, the project's own first
+REPO_REFS = 200          # branch names of one repository offered as its target
+REPO_BUDGET = 30         # s all of the tree's git calls may take
+REPO_MODES = ("uncommitted", "branch")   # how a ticket's changes land in a repository
+ADD_FIELDS = 20 + 3 * REPO_ROWS          # the Add form: its own fields, then a mode, branch and target per repository
 HERE = os.path.dirname(os.path.abspath(__file__))
 QUEUE_SCRIPT = os.path.join(HERE, "..", "scripts", "ticket_queue.py")
 HARNESS = os.path.join(HERE, "..", "harness")
@@ -259,6 +269,19 @@ details.adv[open] > summary { margin-bottom: 4px; }
 .opt { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
 .opt small { display: block; color: var(--muted); font-size: 12px; }
 .formacts { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#addform [hidden] { display: none; }
+/* the Add form's repositories: one row each, indented by depth (set inline) */
+.repotree { display: flex; flex-direction: column; border: 1px solid var(--line-2); border-radius: 8px; }
+.rrow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 6px 10px;
+  border-top: 1px solid var(--line); font-size: 12.5px; color: var(--muted); }
+.rrow:first-child { border-top: 0; }
+.rrow .rpath { font: 600 12.5px var(--mono); color: var(--ink); overflow-wrap: anywhere; }
+.rrow .hot { color: var(--wait); font-weight: 600; }
+.rrow .err { color: var(--bad); }
+.rrow select { height: 28px; font-size: 12.5px; margin-left: auto; }
+.rrow .rbr { display: flex; flex-wrap: wrap; gap: 6px 12px; flex-basis: 100%; }
+.rrow .rbr label { display: flex; align-items: center; gap: 6px; font-weight: 550; color: var(--ink); }
+.rrow .rbr input { height: 28px; width: 22ch; font-size: 12.5px; }
 
 /* the runner card */
 .runner { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px 24px; align-items: center; }
@@ -1571,15 +1594,6 @@ def _projects(runs):
     return seen
 
 
-WHERE_CHOICES = (
-    ("folder", "In your project folder", "default",
-     "The agents edit the project folder above directly, so they see everything in it, uncommitted files "
-     "included. The queue switches the folder to the ticket's branch first; your uncommitted changes come "
-     "along and are never committed, reset or deleted. Don't edit in the folder yourself while a ticket "
-     "runs there."),
-    ("copy", "In a separate copy", "",
-     "The queue clones the project for this ticket and the agents work in the clone; your folder is never "
-     "touched. The clone has only what is committed (plus an uncommitted AGENTS.md or CLAUDE.md)."))
 AFTER_PLAN_CHOICES = (
     ("wait", "Wait for my approval", "default",
      "The ticket stops at \u201cplan to approve\u201d so you can read the plan. Approve it to start "
@@ -1609,8 +1623,8 @@ def _start_choice(v, sent):
                                                           else "here" if sent and v("ref") == "here" else "new")
     cont = v("cont") or (v("ref") if mode == "continue" and not v("start") else "")
     cards = (
-        ("new", "New work", "a fresh branch from the target branch below. In your project folder its "
-         "uncommitted files come along."),
+        ("new", "New work", "a fresh branch from the target branch below; the folder's uncommitted files "
+         "come along."),
         ("continue", "Continue existing work", "pick up a branch that already has work on it (a remote one is "
          "fetched first); the work goes on on that branch."),
         ("here", "The folder as it is now", "start from the commit the project folder has checked out, "
@@ -1642,24 +1656,30 @@ def add_form(runs, form=None, err=""):
                      f"{s}</label>" for s in STAGES)
     opts = "".join(f"<option value='{esc(p)}'>" for p in projects)
     project = v("project") if form is not None else (projects[0] if projects else "")
+    sent = {k: _one(form, k) for k in form if k.startswith("repo_")} if form is not None else {}
     return (f"<section class='panel' id='add'{' data-err=1' if err else ''}><div class='hd'><h2>Add tickets</h2></div>"
             + (f"<p class='err' role='alert'>Not added: {esc(err)}</p>" if err else "") +
             "<form method='post' action='/runs/queue/add' id='addform' class='stack'>"
             "<div class='grid2'>"
             "<label class='fld'>Ticket keys<input name='keys' required autocomplete='off' spellcheck='false' "
             f"value='{esc(v('keys'))}' placeholder='ABC-123 ABC-124'>"
-            "<small>one or more, space or comma separated. Each is its own ticket with its own work branch "
-            "(named after its key), all with the settings below</small></label>"
+            "<small>one or more, space or comma separated. Each is its own ticket, all with the settings below; "
+            "a work branch it gets is named after its key</small></label>"
             f"<label class='fld'>Project folder<input name='project' required list='projects' spellcheck='false' "
             f"value='{esc(project)}' placeholder='/home/me/src/project'>"
             f"<datalist id='projects'>{opts}</datalist><datalist id='branches'></datalist>"
             "<small>the git repository the work is in (absolute path)</small></label>"
             "</div>"
             "<div class='projhint muted' id='projhint' aria-live='polite'></div>"
+            "<fieldset id='f-repos' hidden><legend>Repositories</legend>"
+            "<small class='muted'>The agents work in all of them. For each, the ticket's changes are left "
+            "uncommitted or made on a branch.</small>"
+            f"<div class='repotree' id='repotree' data-sent='{esc(json.dumps(sent))}'></div>"
+            "<div class='why' hidden></div></fieldset>"
             f"<fieldset><legend>What still needs doing</legend><div class='presets'>{presets}</div>"
             f"<div class='checks' id='stagechecks'>{checks}</div><div class='why' hidden></div></fieldset>"
             + _start_choice(v, form is not None) +
-            "<div class='grid2'>"
+            "<div class='grid2' id='f-branch'>"
             f"<label class='fld'>Target branch<input name='base' list='branches' spellcheck='false' "
             f"value='{esc(v('base'))}' placeholder='the branch the folder is on'>"
             "<small>the branch this work is meant to go into: review compares the work with it, and New work "
@@ -1672,7 +1692,6 @@ def add_form(runs, form=None, err=""):
             "<small class='why' id='branchwhy' hidden></small></label>"
             "</details>"
             "</div>"
-            + _choice("Where the agents work", "where", v("where"), WHERE_CHOICES)
             + _choice("When the plan is written", "after_plan", v("after_plan"), AFTER_PLAN_CHOICES) +
             "<label class='fld'>Note for the agents<textarea name='note' maxlength='4000' "
             "placeholder='Context every stage gets, e.g. the solution is on origin/ABC-3122; only the "
@@ -2222,6 +2241,123 @@ def _branch_of_ref(info, ref):
     return ""
 
 
+def _git_ro(d, *a, timeout=10):
+    """Read-only git in d that takes no lock (not even the index's) and never asks
+    for a password: (ok, stdout, why it failed)."""
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(k, None)
+    try:
+        r = subprocess.run(["git", "-c", "core.fsmonitor=false", "-c", "core.quotepath=false", "-C", d, *a],
+                           capture_output=True, encoding="utf-8", errors="replace", timeout=max(1, timeout),
+                           stdin=subprocess.DEVNULL, env=env, **NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return False, "", "git took too long"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, "", f"git did not run: {e}"
+    err = [x.strip() for x in r.stderr.splitlines() if x.strip()]
+    return r.returncode == 0, r.stdout, (err[0] if err else f"git exited with status {r.returncode}")[:300]
+
+
+def _repo_row(top, rel, nested, deadline):
+    """One row of the Add form's tree: the repository at rel ("." the project)."""
+    d = top if rel == "." else os.path.join(top, *rel.split("/"))
+    row = {"path": rel, "depth": 0 if rel == "." else rel.count("/") + 1, "branch": None, "head": None,
+           "dirty": 0, "ahead": None, "behind": None, "branches": []}
+
+    def git(*a):
+        left = deadline - time.monotonic()
+        return _git_ro(d, *a, timeout=min(10, left)) if left > 0 else (False, "", "not read: out of time")
+    ok, out, err = git("status", "--porcelain=v1", "-uall", "-z")
+    if not ok:
+        row["err"] = err
+        return row
+    pre, ents, i = ("" if rel == "." else rel + "/"), out.split("\0"), 0
+    while i < len(ents):
+        e, i = ents[i], i + 1
+        if len(e) < 4:
+            continue
+        if "R" in e[:2] or "C" in e[:2]:   # the path it was renamed or copied from follows
+            i += 1
+        if (pre + e[3:]).rstrip("/") not in nested:   # a repository inside it is its own row
+            row["dirty"] += 1
+    ok, out, _ = git("symbolic-ref", "-q", "--short", "HEAD")
+    row["branch"] = out.strip() or None if ok else None
+    ok, out, _ = git("rev-parse", "--short", "HEAD")
+    row["head"] = out.strip() or None if ok else None
+    ok, out, _ = git("rev-list", "--left-right", "--count", "@{upstream}...HEAD")
+    if ok and len(out.split()) == 2 and all(x.isdigit() for x in out.split()):
+        row["behind"], row["ahead"] = (int(x) for x in out.split())
+    ok, out, _ = git("for-each-ref", "--sort=-committerdate", f"--count={REPO_REFS}", "--format=%(refname)",
+                     "refs/heads", "refs/remotes")
+    local = [x[len("refs/heads/"):] for x in out.splitlines() if x.startswith("refs/heads/")]
+    remote = [x[len("refs/remotes/"):] for x in out.splitlines()
+              if x.startswith("refs/remotes/") and not x.endswith("/HEAD")]
+    row["branches"] = local + remote
+    return row
+
+
+def repo_tree(runs, project):
+    """The Add form's tree: the project's repository (".") and those nested in it
+    (the queue's nested_repos, skipping the queue's folder as the diff page does),
+    each with its branch, short HEAD, uncommitted entries, ahead/behind its upstream
+    and its branches. Read-only git, no fetch; a repository git cannot read is a row
+    with err."""
+    p = project_path(project)
+    if not p or not os.path.isabs(p) or not os.path.isdir(p):
+        return {"error": "not a folder (give an absolute path)"}
+    ok, top, _ = _git_ro(p, "rev-parse", "--show-toplevel")
+    top = top.strip()
+    if not ok or not top:
+        return {"error": "not in a git repository"}
+    if os.path.normcase(os.path.realpath(top)) != os.path.normcase(os.path.realpath(p)):
+        return {"error": f"not the repository's top folder, which is {top}"}
+    out = {"project": top, "more": 0}
+    tq = _tq()
+    try:
+        nested = tq.nested_repos(top, skip=(runs.queue_dir,)) if tq else []
+    except Exception:   # an odd folder: the project's own row still shows
+        nested, out["warn"] = [], "the repositories inside it could not be listed"
+    out["more"] = max(0, len(nested) - (REPO_ROWS - 1))
+    deadline, every = time.monotonic() + REPO_BUDGET, set(nested)
+    out["repos"] = [_repo_row(top, rel, every, deadline) for rel in [".", *nested[:REPO_ROWS - 1]]]
+    return out
+
+
+def repo_args(form, project, many=False):
+    """The tree's choices as harness queue add takes them: (whether the project's
+    own changes are left uncommitted, the --repo-branch args, why not or "")."""
+    root = _one(form, "repo_mode:.") or "branch"   # no tree on the form (it did not load): as before
+    if root not in REPO_MODES:
+        return False, [], "the project: not a choice: " + root[:40]
+    rels = sorted(k[len("repo_mode:"):] for k in form if k.startswith("repo_mode:") and k != "repo_mode:.")
+    if len(rels) > REPO_ROWS:
+        return False, [], f"at most {REPO_ROWS} repositories"
+    real = os.path.realpath(project)
+    args = []
+    for rel in rels:
+        mode, name = _one(form, "repo_mode:" + rel), rel[:80]
+        if mode not in REPO_MODES:
+            return False, [], f"{name}: not a choice: {mode[:40]}"
+        if mode != "branch":   # left uncommitted: the queue's default
+            continue
+        d = os.path.join(project, *rel.split("/"))
+        if (not rel or rel.startswith("/") or posixpath.normpath(rel) != rel or ".." in rel.split("/")
+                or re.search(r"[\\:=\x00-\x1f]", rel) or not os.path.isdir(d)
+                or not os.path.exists(os.path.join(d, ".git"))
+                or not os.path.realpath(d).startswith(real.rstrip(os.sep) + os.sep)):
+            return False, [], f"not a repository inside the project: {name}"
+        br, tgt = _one(form, "repo_branch:" + rel).strip(), _one(form, "repo_target:" + rel).strip()
+        for what, v in (("branch", br), ("target branch", tgt)):
+            if v and not ref_ok(v):
+                return False, [], f"{name}: {what}: not a branch name: {v[:80]}"
+        if br and many:
+            return False, [], f"{name}: a branch name is for one ticket; leave it empty or add the tickets one at a time"
+        args.append(f"--repo-branch={rel}={br}:{tgt}" if tgt else f"--repo-branch={rel}={br}" if br
+                    else f"--repo-branch={rel}")
+    return root == "uncommitted", args, ""
+
+
 def add_tickets(runs, form):
     """The queue page's Add form: harness queue add, its values checked first."""
     raw = _one(form, "keys")
@@ -2236,8 +2372,14 @@ def add_tickets(runs, form):
     project = project_path(_one(form, "project"))
     if not project or not os.path.isabs(project) or not os.path.isdir(project):
         return False, "the project folder must be an absolute path to a folder that exists"
+    keep, repo_branches, why = repo_args(form, project, len(keys) > 1)
+    if why:
+        return False, why
+    if keep and any(_one(form, n).strip() for n in ("base", "ref", "branch", "start", "cont")):
+        return False, ("the project's changes are left uncommitted, so there is no starting point, target branch "
+                       "or work branch for it; pick changes on a branch for the project, or leave those empty")
     base, ref, branch = (_one(form, n).strip() for n in ("base", "ref", "branch"))
-    in_place, wait = _one(form, "where") != "copy", _one(form, "after_plan") != "go"
+    wait = _one(form, "after_plan") != "go"
     mode = _one(form, "start")
     if mode and mode not in START_MODES:
         return False, "not a starting point: " + mode[:40]
@@ -2272,12 +2414,12 @@ def add_tickets(runs, form):
     if "fix" in stages and "review" not in stages:
         return False, "fix runs only after a review asks for fixes; pick review too"
     if "implement" not in stages and any(s in stages for s in ("review", "fix", "push")) \
-            and (mode == "new" or not mode and not ref and not in_place):
+            and mode == "new":
         return False, ("with no implement stage the work must already exist: pick Continue existing work and name "
                        "its branch (e.g. origin/ABC-123), or The folder as it is now")
     if "plan" not in stages or stages == ["plan"]:   # nothing waits on an approval
         wait = False
-    if len(keys) == 1:   # what the queue will not commit straight onto, said the form's way
+    if len(keys) == 1 and not keep:   # what the queue will not commit straight onto, said the form's way
         info = project_branches(project)
         work = branch or keys[0]
         tgt = base or info.get("current", "")
@@ -2298,7 +2440,9 @@ def add_tickets(runs, form):
         args.append(f"--start={ref}")
     if branch:
         args.append(f"--branch={branch}")
-    args.append("--in-place" if in_place else "--clone")
+    if keep:
+        args.append("--no-branch")
+    args += repo_branches
     args.append("--review-plan" if wait else "--no-plan-approval")
     if note.strip():
         args.append(f"--note={note}")
@@ -2592,7 +2736,11 @@ COMMON_JS = """
     var presets = %PRESETS%, info = null, projErr = '';
     var checks = add.querySelectorAll('input[name^=stage_]');
     var hint = document.getElementById('addhint'), btn = add.querySelector('button[type=submit]');
-    var KEY = /^[A-Z][A-Z0-9_]*-[0-9]+$/, MAXK = %MAXK%;
+    var KEY = /^[A-Z][A-Z0-9_]*-[0-9]+$/, MAXK = %MAXK%, tree = document.getElementById('repotree');
+    var REF = /^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,199}$/;
+    function refOk(v) {   // ref_ok
+      return REF.test(v) && v.indexOf('..') < 0 && v.indexOf('//') < 0 && !/(\/|\.lock|\.)$/.test(v);
+    }
     function q(sel) { return add.querySelector(sel); }
     function pick(name, v) { return q('input[name=' + name + '][value=' + v + ']'); }
     function val(name) { var r = q('input[name=' + name + ']:checked'); return r ? r.value : ''; }
@@ -2633,14 +2781,20 @@ COMMON_JS = """
       off(pick('start', 'new'), existing ? 'Not with these stages: a new branch has no work on it yet to ' +
         (has('review') ? 'review' : 'push') + '.' : '');
       off(pick('start', 'continue'), many ? 'One ticket at a time: each one needs its own branch.' : '');
-      var md = val('start'), cont = q('input[name=cont]'), br = q('input[name=branch]'), base = q('input[name=base]');
+      // the project's changes left uncommitted: no starting point, target or work branch for it
+      var root = q('select[name="repo_mode:."]'), keep = !!root && root.value === 'uncommitted';
+      var fs = document.getElementById('f-start'), bf = document.getElementById('f-branch');
+      fs.hidden = fs.disabled = bf.hidden = keep;
+      say(q('#f-repos > .why'), keep ? "The project's changes are left uncommitted, so Starting point, Target " +
+        'branch and Work branch name are off.' : '');
+      var md = keep ? '' : val('start'), cont = q('input[name=cont]'), br = q('input[name=branch]'),
+        base = q('input[name=base]');
       cont.disabled = md !== 'continue';
-      br.disabled = many;
+      base.disabled = keep;
+      br.disabled = many || keep;
       say(document.getElementById('branchwhy'), many ? 'Off with more than one ticket: each gets a branch named ' +
         'after its key.' : '');
       br.placeholder = md === 'continue' ? 'the branch you continue' : 'the ticket key';
-      say(q('#f-start > .why'), md === 'here' && val('where') === 'copy' ? 'A separate copy starts at the ' +
-        "folder's commit; the folder's uncommitted files are not in it." : '');
       var ap = document.getElementById('f-after_plan'), apWhy = !has('plan') ? 'No plan stage: there is no plan to approve.' :
         on.length === 1 ? 'Plan only: the ticket is done once the plan is written.' : '';
       ap.disabled = !!apWhy;
@@ -2653,11 +2807,23 @@ COMMON_JS = """
       if (!q('input[name=project]').value.trim()) probs.push('Give the project folder.');
       else if (projErr) probs.push(projErr);
       if (!on.length) probs.push('Pick at least one stage.');
-      if (!md) probs.push(!existing ? 'Pick a starting point.' : many ? 'Pick The folder as it is now: the work must ' +
+      if (!md && !keep) probs.push(!existing ? 'Pick a starting point.' : many ? 'Pick The folder as it is now: the work must ' +
         'already exist, and Continue existing work takes one ticket at a time.' :
         'Pick where the existing work is: Continue existing work, or The folder as it is now.');
       if (md === 'continue' && !cont.value.trim()) probs.push('Continue existing work: name the branch the work is on.');
-      if (info && !many) {
+      tree.querySelectorAll('select[name^="repo_mode:"]').forEach(function (s) {
+        var box = s.parentNode.querySelector('.rbr'), on = s.value === 'branch', rel = s.name.slice(10);
+        if (!box) return;
+        box.hidden = !on;
+        box.querySelectorAll('input').forEach(function (i) {
+          var own = i.name.indexOf('repo_branch:') === 0, v = i.value.trim();
+          i.disabled = !on || own && many;
+          if (own) i.placeholder = many ? "each ticket's key" : keys[0] || 'the ticket key';
+          if (!i.disabled && v && !refOk(v))
+            probs.push(rel + ': ' + (own ? 'branch' : 'target branch') + ': not a branch name: ' + v);
+        });
+      });
+      if (info && !many && !keep) {
         var tgt = base.value.trim() || info.current, own = br.value.trim();
         var work = own || (md === 'continue' ? branchOf(cont.value.trim()) : '') || keys[0] || '';
         var why = work ? shared(work, tgt || '') : '';
@@ -2668,7 +2834,7 @@ COMMON_JS = """
           probs.push('The work would be committed straight onto ' + work + ' (' + why + '). ' + (own ?
             'Give another work branch name.' : 'Open Work branch name and give it a branch of its own.'));
       }
-      if (info && md !== 'continue') keys.forEach(function (k) {
+      if (info && md !== 'continue' && !keep) keys.forEach(function (k) {
         var name = (!many && br.value.trim()) || k, there = [];
         if (info.local.indexOf(name) >= 0) there.push(name);
         info.remote.forEach(function (r) { if (r.split('/').slice(1).join('/') === name) there.push(r); });
@@ -2701,6 +2867,66 @@ COMMON_JS = """
       sync();
     });
     sync();
+    // The project's repositories, how the ticket's changes land in each: the project's own
+    // row drives the branch fields above; a nested one on a branch has its own branch and target.
+    var treeFs = document.getElementById('f-repos'), sent = JSON.parse(tree.getAttribute('data-sent') || '{}'),
+      MODES = [['uncommitted', 'changes: left uncommitted'], ['branch', 'changes: on a branch']];
+    function el(tag, cls, text) {
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text != null) e.textContent = text;
+      return e;
+    }
+    function repoRow(r, i, n) {
+      var d = el('div', 'rrow');
+      d.style.paddingLeft = (10 + 18 * r.depth) + 'px';
+      d.appendChild(el('code', 'rpath', r.path === '.' ? './ (the project)' : r.path + '/'));
+      if (r.err) { d.appendChild(el('span', 'err', r.err)); return d; }
+      d.appendChild(el('span', '', r.branch ? 'on ' + r.branch : r.head ? 'detached at ' + r.head : 'no commits yet'));
+      var dirty = d.appendChild(el('span', r.dirty ? 'hot' : '', r.dirty + ' uncommitted'));
+      if (r.dirty) dirty.title = "files you have here that the ticket's changes could mix with";
+      d.appendChild(el('span', '', r.ahead == null ? 'no upstream' : '\u2191' + r.ahead + ' \u2193' + r.behind));
+      var s = el('select'), want = sent['repo_mode:' + r.path];
+      s.name = 'repo_mode:' + r.path;
+      s.setAttribute('aria-label', 'how the changes land in ' + r.path);
+      MODES.forEach(function (m) { var o = s.appendChild(el('option', '', m[1])); o.value = m[0]; });
+      // the project with none inside it: on a branch, as before
+      s.value = want === 'branch' || want === 'uncommitted' ? want : r.path === '.' && n === 1 ? 'branch' : 'uncommitted';
+      d.appendChild(s);
+      if (r.path === '.') return d;
+      var box = el('span', 'rbr'), list = el('datalist');
+      list.id = 'rb-' + i;
+      r.branches.forEach(function (b) { list.appendChild(el('option')).value = b; });
+      [['repo_branch:', 'Branch', ''], ['repo_target:', 'Target', r.branch || '']].forEach(function (f) {
+        var l = box.appendChild(el('label', '', f[1] + ' ')), inp = l.appendChild(el('input'));
+        inp.name = f[0] + r.path;
+        inp.spellcheck = false;
+        inp.autocomplete = 'off';
+        inp.value = inp.name in sent ? sent[inp.name] : f[2];
+        if (f[0] === 'repo_target:') inp.setAttribute('list', list.id);
+      });
+      box.appendChild(list);
+      d.appendChild(box);
+      return d;
+    }
+    function repos(p) {
+      tree.innerHTML = '';
+      treeFs.hidden = true;
+      sync();
+      if (!p) return;
+      fetch('/runs/queue/repos?project=' + encodeURIComponent(p), {credentials: 'same-origin', cache: 'no-store'})
+        .then(function (r) { return r.json(); }).then(function (d) {
+          if (proj.value.trim() !== p) return;
+          tree.innerHTML = '';
+          if (d.error) tree.appendChild(el('div', 'rrow err', d.error));
+          else d.repos.forEach(function (r, i) { tree.appendChild(repoRow(r, i, d.repos.length)); });
+          if (d.more) tree.appendChild(el('div', 'rrow', d.more + ' more not listed: their changes are left uncommitted'));
+          if (d.warn) tree.appendChild(el('div', 'rrow err', d.warn));
+          sent = {};
+          treeFs.hidden = false;
+          sync();
+        }).catch(function () {});
+    }
     // The project's branches: suggestions for the branch fields, and what the folder is on.
     var proj = add.querySelector('input[name=project]'), dl = document.getElementById('branches'),
       ph = document.getElementById('projhint'), bt = null, lastP = null;
@@ -2708,6 +2934,7 @@ COMMON_JS = """
       var p = proj.value.trim();
       if (p === lastP) return;
       lastP = p;
+      repos(p);
       info = null; projErr = '';
       if (!p) { ph.textContent = ''; sync(); return; }
       fetch('/runs/queue/branches?project=' + encodeURIComponent(p), {credentials: 'same-origin', cache: 'no-store'})

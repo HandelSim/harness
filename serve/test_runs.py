@@ -729,10 +729,10 @@ class QueuePageTest(RunsServer):
         head = subprocess.run(["git", "-C", proj, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         self.start()
         r, body = self.req("GET", "/runs/queue")
-        # the defaults, each choice saying what it does
-        self.assertIn("name='where' value='folder' checked>In your project folder", body)
+        # the defaults, each choice saying what it does; the agents always work in the folder
+        self.assertNotIn("type='radio' name='where'", body)
+        self.assertNotIn("separate copy", body)
         self.assertIn("name='after_plan' value='wait' checked>Wait for my approval", body)
-        self.assertIn("never committed, reset or deleted", body)
         self.assertIn("Nothing is built until you approve", body)
         self.assertNotIn("hold the plan", body)
         r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("preset", "full"),
@@ -749,12 +749,10 @@ class QueuePageTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-7")
         self.assertIn("works <b>in your project folder</b>", body)
         self.assertIn("after the plan <b>waits for your approval</b>", body)
-        r, body = self.post("/runs/queue/add", [("keys", "ABC-9"), ("project", proj), ("where", "copy"),
-                                                ("after_plan", "go")])
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-9"), ("project", proj), ("after_plan", "go")])
         self.assertEqual(r.status, 303, body)
         with open(os.path.join(self.queue, "ABC-9", "state.json")) as f:
-            st = json.load(f)
-        self.assertEqual((st.get("in_place"), st.get("plan_review")), (None, None))
+            self.assertIsNone(json.load(f).get("plan_review"))
         # no plan stage: nothing waits on an approval, whatever the radio said
         r, body = self.post("/runs/queue/add", [("keys", "ABC-10"), ("project", proj), ("preset", "review"),
                                                 ("start", "continue"), ("cont", "ABC-7-work")])
@@ -764,7 +762,6 @@ class QueuePageTest(RunsServer):
         info = runs.project_branches(proj)
         self.assertEqual((info["current"], info["remotes"], info["defaults"]), ("main", [], []))
         r, body = self.req("GET", "/runs/ticket/ABC-9")
-        self.assertIn("works <b>in a separate copy</b>", body)
         self.assertIn("after the plan <b>goes straight on</b>", body)
         r, body = self.post("/runs/queue/add", [("keys", "ABC-8"), ("project", proj), ("preset", "review"),
                                                 ("branch", "a..b")])
@@ -900,7 +897,6 @@ class QueuePageTest(RunsServer):
                 ([("keys", "ABC-9"), ("project", "relative/dir")], "absolute path"),
                 (good[:2] + [("base", "main..x")], "not a branch"),
                 (good[:2] + [("ref", "-x")], "not a branch"),
-                (good[:2] + [("preset", "review"), ("where", "copy")], "existing work"),
                 (good[:2] + [("preset", "custom"), ("stage_fix", "1"), ("stage_implement", "1")], "pick review"),
                 (good[:2] + [("preset", "custom")], "at least one stage"),
                 (good[:2] + [("preset", "<b>")], "not a preset: &lt;b&gt;"),
@@ -950,6 +946,117 @@ class QueuePageTest(RunsServer):
         self.assertIn("host mode is OK", body)
         r, _ = self.post("/runs/queue/nope")
         self.assertEqual(r.status, 404)
+
+    def nested(self):
+        """A project with repositories inside it: app (a new file, one commit past its
+        upstream), lib (on a branch of its own), pkgs/a/deep (no commit yet) and
+        broken (a .git git cannot read); the project has one new file. The project."""
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+        g = lambda d, *a: subprocess.run(["git", "-C", os.path.join(proj, d), *a], check=True, env=env,
+                                         capture_output=True)
+        git_repo(os.path.join(proj, "app"))
+        g("app", "commit", "-q", "--allow-empty", "-m", "two")
+        g("app", "branch", "-q", "-u", "ABC-7-work", "main")
+        git_repo(os.path.join(proj, "lib"))
+        g("lib", "checkout", "-q", "ABC-7-work")
+        os.makedirs(os.path.join(proj, "pkgs", "a", "deep"))
+        g("pkgs/a/deep", "init", "-q", "-b", "main")
+        os.makedirs(os.path.join(proj, "broken"))
+        for name, text in (("app/new.txt", "x"), ("top.txt", "y"), ("broken/.git", "gitdir: /nonexistent\n")):
+            with open(os.path.join(proj, name), "w") as f:
+                f.write(text)
+        return proj
+
+    def test_the_add_forms_tree_of_repositories(self):
+        proj = self.nested()
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("<fieldset id='f-repos' hidden><legend>Repositories</legend>", body)
+        self.assertIn("id='repotree' data-sent='{}'", body)
+        r, body = self.req("GET", "/runs/queue/repos?project=" + quote(proj))
+        self.assertEqual(r.status, 200)
+        d = json.loads(body)
+        rows = {x["path"]: x for x in d["repos"]}
+        self.assertEqual([x["path"] for x in d["repos"]], [".", "app", "broken", "lib", "pkgs/a/deep"])
+        self.assertEqual([x["depth"] for x in d["repos"]], [0, 1, 1, 1, 3])
+        # the project's new file counts, the repositories inside it do not
+        self.assertEqual({k: x["dirty"] for k, x in rows.items()},
+                         {".": 1, "app": 1, "broken": 0, "lib": 0, "pkgs/a/deep": 0})
+        self.assertEqual({k: x["branch"] for k, x in rows.items()},
+                         {".": "main", "app": "main", "broken": None, "lib": "ABC-7-work", "pkgs/a/deep": "main"})
+        self.assertEqual((rows["app"]["ahead"], rows["app"]["behind"]), (1, 0))
+        self.assertEqual((rows["."]["ahead"], rows["."]["behind"]), (None, None))
+        self.assertRegex(rows["lib"]["head"], r"^[0-9a-f]{7,}$")
+        self.assertIsNone(rows["pkgs/a/deep"]["head"])
+        self.assertEqual(sorted(rows["lib"]["branches"]), ["ABC-7-work", "main"])
+        self.assertIn("not a git repository", rows["broken"]["err"])
+        self.assertNotIn("err", rows["app"])
+        # a folder that is not a repository's top is said so
+        for p, why in (("relative", "absolute path"), (os.path.join(proj, "pkgs"), "top folder, which is " + proj),
+                       (self.tmp.name, "not in a git repository")):
+            self.assertIn(why, json.loads(self.req("GET", "/runs/queue/repos?project=" + quote(p))[1])["error"])
+
+    def test_add_with_the_changes_left_uncommitted_or_on_branches(self):
+        proj = self.nested()
+        self.start()
+        calls = []
+
+        def queue(runs_, args, text=None):
+            calls.append(args)
+            return True, "added"
+        good = [("keys", "ABC-7"), ("project", proj), ("preset", "full")]
+        with mock.patch.object(runs, "_queue", queue):
+            # the project uncommitted, each repository inside it as asked
+            r, body = self.post("/runs/queue/add", good + [
+                ("repo_mode:.", "uncommitted"), ("repo_mode:app", "branch"), ("repo_branch:app", "feat/a"),
+                ("repo_target:app", "main"), ("repo_mode:lib", "branch"), ("repo_mode:pkgs/a/deep", "branch"),
+                ("repo_target:pkgs/a/deep", "main"), ("repo_mode:broken", "uncommitted"),
+                ("repo_branch:broken", "ignored")])
+            self.assertEqual(r.status, 303, body)
+            args = calls.pop()
+            self.assertIn("--no-branch", args)
+            self.assertEqual([a for a in args if a.startswith("--repo-branch")],
+                             ["--repo-branch=app=feat/a:main", "--repo-branch=lib", "--repo-branch=pkgs/a/deep=:main"])
+            self.assertFalse([a for a in args if a.startswith(("--branch", "--base", "--start", "--clone",
+                                                               "--in-place"))], args)
+            r, body = self.post("/runs/queue/add", good + [("repo_mode:.", "branch"), ("repo_mode:lib", "branch"),
+                                                           ("repo_branch:lib", "lib-work"), ("branch", "feat/x")])
+            self.assertEqual(r.status, 303, body)
+            args = calls.pop()
+            self.assertIn("--repo-branch=lib=lib-work", args)
+            self.assertIn("--branch=feat/x", args)
+            self.assertNotIn("--no-branch", args)
+            # no tree sent (it did not load): on a branch, as before
+            r, body = self.post("/runs/queue/add", good)
+            self.assertEqual(r.status, 303, body)
+            self.assertFalse([a for a in calls.pop() if a in ("--no-branch", "--clone", "--in-place")])
+            un = [("repo_mode:.", "uncommitted")]
+            for fields, why in (
+                    (un + [("base", "main")], "left uncommitted, so there is no starting point"),
+                    (un + [("start", "here")], "left uncommitted"),
+                    (un + [("branch", "feat/x")], "left uncommitted"),
+                    ([("repo_mode:.", "sideways")], "not a choice: sideways"),
+                    ([("repo_mode:app", "both")], "app: not a choice"),
+                    ([("repo_mode:../x", "branch")], "not a repository inside the project: ../x"),
+                    ([("repo_mode:/etc", "branch")], "not a repository inside the project: /etc"),
+                    ([("repo_mode:app/../lib", "branch")], "not a repository inside the project"),
+                    ([("repo_mode:pkgs", "branch")], "not a repository inside the project: pkgs"),
+                    ([("repo_mode:a=b", "branch")], "not a repository inside the project"),
+                    ([("repo_mode:app", "branch"), ("repo_branch:app", "-x")], "app: branch: not a branch name"),
+                    ([("repo_mode:app", "branch"), ("repo_branch:app", "a b")], "not a branch name"),
+                    ([("repo_mode:app", "branch"), ("repo_branch:app", "a:b")], "not a branch name"),
+                    ([("repo_mode:app", "branch"), ("repo_target:app", "x=y")], "app: target branch: not a branch"),
+                    ([("repo_mode:app", "branch"), ("repo_branch:app", "b"), ("keys", "ABC-1 ABC-2")],
+                     "a branch name is for one ticket")):
+                f = [x for x in good if x[0] not in dict(fields)] + fields
+                r, body = self.post("/runs/queue/add", f)
+                self.assertEqual(r.status, 409, (fields, body[:300]))
+                self.assertIn(why, body)
+            self.assertEqual(calls, [])
+            # a refused add keeps the tree's choices for the form to put back
+            self.assertIn(runs.esc(json.dumps({"repo_mode:app": "branch", "repo_branch:app": "b"})), body)
 
     def test_project_path_as_pasted(self):
         self.assertEqual(runs.project_path('  "/home/me/p"  '), "/home/me/p")

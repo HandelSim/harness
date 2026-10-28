@@ -141,8 +141,9 @@ elif stage in ("implementing", "fixing"):
     os.makedirs(os.path.dirname(name) or ".", exist_ok=True)
     with open(name, "a") as f:
         f.write("hello feature\n" if stage == "implementing" else "fixed by review\n")
-    git("add", name)
-    git("commit", "-q", "-m", "ABC-1: " + stage)
+    if not os.environ.get("FAKE_TOP_UNCOMMITTED"):   # --no-branch: the top's change is left in the files
+        git("add", name)
+        git("commit", "-q", "-m", "ABC-1: " + stage)
     with open(path("append one bullet to"), "a") as f:
         f.write("- other.py:3: an unrelated bug (seen while " + stage + " ABC-1)\n")
 elif stage == "reviewing":
@@ -2355,11 +2356,12 @@ class OrphanAgentTest(Base):
 
 
 class NestedReposTest(Base):
-    """In place: repositories inside the project (their own .git, not submodules)
-    are not the ticket's; the queue never commits there, and a stage that changes
-    one is blocked with its result kept."""
-
-    run_bg, wait_for, sleeping = OwnerControlTest.run_bg, OwnerControlTest.wait_for, OwnerControlTest.sleeping
+    """In place, the project is the top of one or more repositories (each its own
+    .git, not submodules): the agent works from the top and may change any of them.
+    Each repository's change is left uncommitted (the default for one inside it, and
+    the top's with --no-branch) or on a branch of the ticket's (the top's by default,
+    one inside it with --repo-branch); review and the verifier see every part, and
+    nothing there blocks the ticket."""
 
     def repo(self, rel, commit=True):
         d = os.path.join(self.project, rel)
@@ -2376,9 +2378,12 @@ class NestedReposTest(Base):
         self.git_p("commit", "-q", "-m", "ignore libA")
         return self.repo("libA")
 
-    def add_in_place(self, stages="implement,push"):
-        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--stages", stages)
+    def add_in_place(self, stages="implement,push", *extra):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--stages", stages, *extra)
         self.assertEqual(rc, 0, out)
+
+    def review_prompt(self):
+        return cat(self.calls + ".reviewing")
 
     def test_the_snapshot_leaves_repositories_inside_out(self):
         # one with no commit failed the snapshot's git add -A; lib[1] is no glob
@@ -2399,57 +2404,104 @@ class NestedReposTest(Base):
         self.assertFalse([f for f in tree if f.startswith(("libA", "vendor/x", "lib["))], tree)
         self.assertNotIn("no snapshot", cat(os.path.join(self.state, "ABC-1", "log.md")))
 
-    def test_a_commit_in_one_blocks_and_keeps_the_result(self):
+    def test_a_change_left_uncommitted_in_one_is_the_tickets(self):
         lib = self.ignored_libA()
-        mine = sh("git", "-C", lib, "rev-parse", "HEAD").strip()
+        put(os.path.join(lib, "lib.txt"), "lib, the owner's edit\n")   # the owner's, before the ticket
+        put(os.path.join(lib, "notes.txt"), "the owner's\n")
+        os.environ["FAKE_NESTED"] = "edit:libA"
+        self.add_in_place("implement,review,push")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        review = self.review_prompt()
+        self.assertIn("libA/agent.txt", review)
+        self.assertIn("feature.txt", review)
+        self.assertNotIn("libA/notes.txt", review)   # the owner's, there before the work started
+        self.assertNotIn("libA/lib.txt", review)
+        self.assertEqual(st["left_uncommitted"], ["libA"])
+        self.assertIn("left uncommitted", st["reason"])
+        self.assertIn("ABC-1", sh("git", "-C", self.remote, "branch", "--list", "ABC-1"))   # the top's branch
+        self.assertEqual(sh("git", "-C", lib, "log", "-1", "--format=%s"), "lib\n")   # nothing committed there
+        self.assertEqual(cat(os.path.join(lib, "agent.txt")), "the agent was here\n")
+        self.assertEqual(cat(os.path.join(lib, "lib.txt")), "lib, the owner's edit\n")
+
+    def test_a_commit_or_switch_in_one_left_uncommitted_does_not_block(self):
+        lib = self.ignored_libA()
         os.environ["FAKE_NESTED"] = "commit:libA"
         self.add_in_place()
         rc, out = self.run_queue()
-        st = self.status()
-        self.assertEqual(st["status"], "blocked", out)
-        self.assertIn("libA: 1 new commit(s), " + mine[:12], st["reason"])
-        self.assertIn("on main", st["reason"])
-        self.assertIn("--project " + self.project + "/<repository>", st["reason"])
-        self.assertIn("harness queue retry ABC-1 then checks the agent's result", st["reason"])
-        self.assertEqual(st["verify_only"]["stage"], "implement")
-        self.assertNotIn("nested_base", st)
-        # the queue left libA as the agent did, and pushed nothing
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertIn("libA has commits since the work started", cat(os.path.join(self.state, "ABC-1", "log.md")))
         self.assertEqual(sh("git", "-C", lib, "log", "-1", "--format=%s"), "agent\n")
-        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
-        self.assertIn("libA", st["history"][-1]["details"][0])
-        # The owner looks; a plain retry checks the kept work without a new launch.
-        del os.environ["FAKE_NESTED"]
-        rc, out = self.q("retry", "ABC-1")
+        os.environ["FAKE_NESTED"] = "switch:libA"
+        rc, out = self.q("add", "ABC-2", "--project", self.project, "--in-place", "--stages", "implement,push",
+                         "--no-plan-approval")
         self.assertEqual(rc, 0, out)
         rc, out = self.run_queue()
-        self.assertEqual(self.status()["status"], "done", out)
-        self.assertEqual(len(self.calls_of("implementing")), 1)
-        self.assertIn("ABC-1", sh("git", "-C", self.remote, "branch", "--list", "ABC-1"))
+        self.assertEqual(self.status("ABC-2")["status"], "done", out)
 
-    def test_a_branch_switch_in_one_blocks(self):
-        self.ignored_libA()
-        os.environ["FAKE_NESTED"] = "switch:libA"
-        self.add_in_place()
-        self.run_queue()
-        st = self.status()
-        self.assertEqual(st["status"], "blocked")
-        self.assertIn("libA: switched from main to agent", st["reason"])
-
-    def test_the_owners_changes_there_are_theirs_and_the_agents_block(self):
+    def test_no_branch_leaves_every_change_uncommitted(self):
         lib = self.ignored_libA()
-        put(os.path.join(lib, "lib.txt"), "lib, the owner's edit\n")
-        put(os.path.join(lib, "notes.txt"), "the owner's\n")
-        self.add_in_place()
-        rc, out = self.run_queue()     # the agent leaves libA alone: the owner's changes are no matter
-        self.assertEqual(self.status()["status"], "done", out)
-        os.environ["FAKE_NESTED"] = "edit:libA"   # an uncommitted edit is a change there too
-        rc, out = self.q("retry", "ABC-1", "--stage", "implement")
-        self.assertEqual(rc, 0, out)
-        self.run_queue()
+        put(os.path.join(self.project, "lx.txt"), "mine\n")   # the owner's, uncommitted
+        top = self.git_p("rev-parse", "HEAD")
+        os.environ.update(FAKE_NESTED="edit:libA", FAKE_TOP_UNCOMMITTED="1")
+        self.add_in_place("implement,review,push", "--no-branch")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        review = self.review_prompt()
+        self.assertIn("feature.txt", review)
+        self.assertIn("libA/agent.txt", review)
+        self.assertNotIn("lx.txt", review)
+        self.assertIn("leave what you change uncommitted", cat(self.calls + ".implementing").lower()
+                      .replace("leave what you change there uncommitted", "leave what you change uncommitted"))
+        self.assertEqual(st["left_uncommitted"], [".", "libA"])
+        self.assertEqual(self.git_p("rev-parse", "HEAD"), top)
+        self.assertEqual(self.git_p("branch", "--show-current"), "main")
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+        self.assertEqual(cat(os.path.join(self.project, "feature.txt")), "hello feature\n")
+        self.assertEqual(cat(os.path.join(lib, "agent.txt")), "the agent was here\n")
+
+    def test_no_branch_with_no_change_is_said(self):
+        self.ignored_libA()
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add_in_place("implement,push", "--no-branch")
+        self.run_queue("--retries", "0")
         st = self.status()
         self.assertEqual(st["status"], "blocked")
-        self.assertIn("libA: uncommitted files changed: agent.txt", st["reason"])
-        self.assertEqual(cat(os.path.join(lib, "lib.txt")), "lib, the owner's edit\n")
+        self.assertIn("nothing changed since the work started", st["reason"])
+
+    def test_a_repo_branch_is_made_pushed_and_left(self):
+        lib = self.ignored_libA()
+        libremote = os.path.join(self.tmp, "libA.git")
+        sh("git", "init", "-q", "--bare", libremote)
+        sh("git", "-C", lib, "remote", "add", "origin", libremote)
+        sh("git", "-C", lib, "push", "-q", "origin", "main")
+        os.environ.update(FAKE_NESTED="commit:libA", FAKE_TOP_UNCOMMITTED="1")
+        self.add_in_place("implement,review,push", "--no-branch", "--repo-branch", "libA")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertIn("libA/agent.txt", self.review_prompt())
+        self.assertIn("libA/: on branch ABC-1", cat(self.calls + ".implementing"))
+        pushed = sh("git", "-C", libremote, "log", "-1", "--format=%s", "ABC-1")
+        self.assertEqual(pushed, "agent\n")
+        self.assertEqual([p["result"] for p in st["pushes"]], ["pushed"])
+        self.assertEqual(st["left_uncommitted"], ["."])
+        self.assertEqual(sh("git", "-C", lib, "branch", "--show-current"), "main\n")   # parked: back where it was
+        self.assertEqual(sh("git", "-C", lib, "log", "-1", "--format=%s", "main"), "lib\n")
+
+    def test_add_refuses_what_does_not_fit(self):
+        self.ignored_libA()
+        os.makedirs(os.path.join(self.project, "plain"))
+        for extra, why in ((("--no-branch", "--branch", "X-1"), "--no-branch"),
+                           (("--repo-branch", "plain"), "plain"),
+                           (("--repo-branch", "../x"), "../x"),
+                           (("--repo-branch", "libA=main"), "main")):
+            rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", *extra)
+            self.assertNotEqual(rc, 0, extra)
+            self.assertIn(why, out)
+            self.assertIsNone(self.status())
 
     def test_the_vault_and_the_projects_own_worktrees_are_not_ones(self):
         # the vault inside the project (a repository the stages write), and a
@@ -2461,10 +2513,11 @@ class NestedReposTest(Base):
         sh("git", "init", "-q", self.vault)
         os.environ["FAKE_VAULT"] = self.vault
         self.git_p("worktree", "add", "-q", "-b", "wt", os.path.join(self.project, ".wt", "x"))
-        os.environ["FAKE_NESTED"] = "commit:.wt/x"
         self.add_in_place("plan,implement,push")
         rc, out = self.run_queue()
-        self.assertEqual(self.status()["status"], "done", out)
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(st["left_uncommitted"], [])
         self.assertEqual(tq.nested_repos(self.project, (self.vault,)), [])
         self.assertEqual(tq.nested_repos(self.project), ["vault"])
 
@@ -2476,126 +2529,6 @@ class NestedReposTest(Base):
         self.assertEqual(st["status"], "blocked")
         self.assertIn("newlib: a repository inside the project is committed as a bare pointer", st["reason"])
         self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
-
-    def test_a_deep_one_the_owner_has_not_committed_is_looked_at(self):
-        # 4 levels down: not walked, and hidden from git ls-files once the owner's
-        # untracked files are excluded for the stage; the baseline is taken before
-        self.repo("a/b/c/deep")
-        os.environ["FAKE_NESTED"] = "commit:a/b/c/deep"
-        self.add_in_place()
-        self.run_queue()
-        st = self.status()
-        self.assertEqual(st["status"], "blocked")
-        self.assertIn("a/b/c/deep: 1 new commit(s)", st["reason"])
-
-    def test_one_changed_by_a_stopped_agent_blocks_when_it_goes_on(self):
-        lib = self.ignored_libA()
-        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1", FAKE_SLEEP_NESTED=lib)
-        self.add_in_place()
-        p = self.run_bg()
-        self.wait_for(self.sleeping, "the ABC-1 agent")
-        self.wait_for(lambda: sh("git", "-C", lib, "log", "-1", "--format=%s").strip() == "agent", "the commit in libA")
-        rc, out = self.q("stop", "ABC-1")
-        self.assertEqual(rc, 0, out)
-        self.wait_for(lambda: self.status()["status"] == "stopped", "ABC-1 to stop", timeout=20)
-        p.wait(timeout=30)
-        st = self.status()
-        self.assertNotIn("nested_base", st)   # the next launch takes its own: the owner's work meanwhile is theirs
-        self.assertIn("libA: 1 new commit(s)", st["nested_moved"]["lines"][0])
-        for k in ("FAKE_SLEEP", "FAKE_SLEEP_NESTED"):
-            del os.environ[k]
-        self.q("retry", "ABC-1")
-        self.run_queue()
-        st = self.status()
-        self.assertEqual(st["status"], "blocked")
-        self.assertIn("the implement agent changed repositories inside the project", st["reason"])
-        self.assertIn("push: libA: 1 new commit(s)", st["reason"])
-        self.assertIn("harness queue retry ABC-1 then runs the stage again", st["reason"])
-        self.assertNotIn("nested_moved", st)
-        self.assertEqual(self.calls_of("implementing"), [])   # not launched again to find it
-        self.q("retry", "ABC-1")   # the owner has looked
-        rc, out = self.run_queue()
-        self.assertEqual(self.status()["status"], "done", out)
-
-    def stopped_after_a_commit_in_libA(self):
-        lib = self.ignored_libA()
-        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1", FAKE_SLEEP_NESTED=lib)
-        self.add_in_place()
-        p = self.run_bg()
-        self.wait_for(self.sleeping, "the ABC-1 agent")
-        self.wait_for(lambda: sh("git", "-C", lib, "log", "-1", "--format=%s").strip() == "agent", "the commit in libA")
-        self.q("stop", "ABC-1")
-        self.wait_for(lambda: self.status()["status"] == "stopped", "ABC-1 to stop", timeout=20)
-        p.wait(timeout=30)
-        for k in ("FAKE_SLEEP", "FAKE_SLEEP_NESTED"):
-            del os.environ[k]
-        self.assertIn("nested_moved", self.status())
-        return lib
-
-    def test_another_block_first_says_it_too(self):
-        self.stopped_after_a_commit_in_libA()
-        gd = self.git_p("rev-parse", "--absolute-git-dir")   # what a killed agent can leave
-        os.makedirs(os.path.join(gd, "rebase-merge"))
-        self.q("retry", "ABC-1")
-        self.run_queue()
-        st = self.status()
-        self.assertEqual(st["status"], "blocked")
-        self.assertIn("rebase", st["reason"])
-        self.assertIn("Also, the implement agent changed repositories inside the project", st["reason"])
-        self.assertIn("libA: 1 new commit(s)", st["reason"])
-        self.assertNotIn("nested_moved", st)
-
-    def test_a_retry_from_the_push_is_checked_too(self):
-        self.stopped_after_a_commit_in_libA()
-        c = self.git_p("-c", "user.name=A", "-c", "user.email=a@example.com", "commit-tree", "ABC-1^{tree}", "-p",
-                       "ABC-1", "-m", "ABC-1: the owner's commit on the branch")
-        self.git_p("update-ref", "refs/heads/ABC-1", c)
-        rc, out = self.q("retry", "ABC-1", "--stage", "push")
-        self.assertEqual(rc, 0, out)
-        self.run_queue()
-        st = self.status()
-        self.assertEqual(st["status"], "blocked")
-        self.assertIn("the implement agent changed repositories inside the project", st["reason"])
-        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
-
-    def test_a_baseline_left_by_a_run_that_died_is_looked_at_first(self):
-        lib = self.ignored_libA()
-        self.add_in_place()
-        q = tq.Queue(self.state)
-        st = q.load("ABC-1")
-        st.update(nested_base=tq.nested_state(self.project), nested_stage="implement")
-        q.save(st)
-        sh("git", "-C", lib, "-c", "user.name=A", "-c", "user.email=a@example.com", "commit", "-q", "--allow-empty",
-           "-m", "the agent before the run died")
-        self.run_queue()
-        st = self.status()
-        self.assertEqual(st["status"], "blocked")
-        self.assertIn("the implement agent changed repositories inside the project: libA: 1 new commit(s)",
-                      st["reason"].replace(", which the queue does not verify, commit or push", ""))
-        self.assertNotIn("nested_base", st)
-        self.assertEqual(self.calls_of("implementing"), [])
-
-    def test_not_looked_at_is_not_unchanged(self):
-        self.ignored_libA()
-        st = {"key": "ABC-1", "project": self.project, "nested_base": tq.nested_state(self.project)}
-        ctx = types.SimpleNamespace(q=types.SimpleNamespace(log=lambda *a: None, save=lambda s: None))
-        with mock.patch.object(tq, "nested_moved", side_effect=RuntimeError("git ls-files timed out")):
-            tq.nested_check(ctx, st, "implement", (), ended=False)   # a launch that did not end: kept for the next
-            self.assertIn("nested_base", st)
-            self.assertNotIn("nested_moved", st)
-            tq.nested_check(ctx, st, "implement", ())
-        self.assertNotIn("nested_base", st)
-        self.assertTrue(st["nested_moved"]["unknown"])
-        with self.assertRaises(tq.NestedMoved) as e:
-            tq.nested_block(st)
-        self.assertIn("the implement agent may have changed repositories inside the project: they could not be "
-                      "looked at after it (git ls-files timed out)", str(e.exception).replace(
-                          ", which the queue does not verify, commit or push", ""))
-
-    def test_a_link_to_a_name_that_is_not_utf8(self):
-        lib = self.ignored_libA()
-        os.symlink(b"caf\xe9".decode("utf-8", "surrogateescape"), os.path.join(lib, "odd"))
-        self.assertTrue(tq.nested_state(self.project)["libA"]["files"]["odd"].startswith("?? link "))
 
     def test_a_tracked_file_made_a_repository_is_a_bare_pointer(self):
         put(os.path.join(self.project, "lib"), "a file\n")
@@ -2614,9 +2547,10 @@ class NestedReposTest(Base):
         put(os.path.join(lib, "lib.txt"), "lib, the owner's edit\n")
         put(os.path.join(lib, "notes.txt"), "the owner's\n")
         os.environ["FAKE_NESTED"] = "touch:libA"
-        self.add_in_place()
+        self.add_in_place("implement,review,push")
         rc, out = self.run_queue()
         self.assertEqual(self.status()["status"], "done", out)
+        self.assertNotIn("libA/", self.review_prompt().split("<<<BEGIN_DIFF")[-1])
 
     def test_a_submodule_is_not_a_bare_pointer(self):
         sub = os.path.join(self.tmp, "sub")
@@ -2673,12 +2607,24 @@ class NestedReposTest(Base):
         self.assertEqual(os.listdir(os.path.join(self.state, "ABC-1")), [])
 
     def test_the_prompt_and_card_say_so(self):
+        self.ignored_libA()
         self.add_in_place("implement")
         self.run_queue()
-        self.assertIn("change nothing in them, no edit, commit or branch switch", cat(self.calls + ".implementing"))
+        prompt = cat(self.calls + ".implementing")
+        self.assertIn("The project is more than one git repository", prompt)
+        self.assertIn("this folder (the project's top): on branch ABC-1", prompt)
+        self.assertIn("libA/: leave what you change there uncommitted", prompt)
+        self.assertNotIn("change nothing in them", prompt)
         card = json.loads(cat(self.calls + ".card").splitlines()[-1])
-        self.assertTrue(card["where"].endswith("change nothing in repositories inside it"))
+        self.assertEqual(card["where"], tq.CARD_WHERE_IN_PLACE)
+        self.assertIn("Leave every other change uncommitted", card["done"])
 
+    def test_one_repository_keeps_the_plain_words(self):
+        self.add_in_place("implement")
+        self.run_queue()
+        prompt = cat(self.calls + ".implementing")
+        self.assertIn("You are on branch ABC-1. Stay on that branch.", prompt)
+        self.assertIn("4. Commit on ABC-1: `git add <the files you changed>`", prompt)
 
 if __name__ == "__main__":
     unittest.main()

@@ -1025,6 +1025,8 @@ def make_handler(cfg):
                     self.send_json(runs_view.queue_live(r), head)
                 elif bits[1] == "branches":
                     self.send_json(runs_view.project_branches((q.get("project") or [""])[0][:1000]), head)
+                elif bits[1] == "repos":
+                    self.send_json(runs_view.repo_tree(r, (q.get("project") or [""])[0][:1000]), head)
                 elif bits[1] == "runner.out":
                     self.send(200, (r.runner_out(400) or "nothing yet").encode(), extra=text, head=head)
                 else:
@@ -1292,8 +1294,8 @@ def make_handler(cfg):
             if action not in runs_view.QUEUE_ACTIONS or not cfg.runs.queue_dir:
                 self.send(404, b"not found\n")
                 return
-            try:
-                form = self.read_form(MAX_SEND_FORM)
+            try:   # the Add form has a mode, branch and target per repository
+                form = self.read_form(MAX_SEND_FORM, fields=runs_view.ADD_FIELDS)
             except ValueError:
                 form = None
             if form is None:
