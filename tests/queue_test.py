@@ -1800,6 +1800,25 @@ class StartAndBranchTest(Base):
         self.assertIn("is on other, not the ticket's branch ABC-1", st["reason"])
         self.assertEqual(self.git_p("rev-parse", "--abbrev-ref", "HEAD"), "other")
 
+    def test_in_place_in_a_linked_worktree(self):
+        # The project is a linked worktree already on the ticket's branch (a retry,
+        # or the owner switched it): that is the project, not another worktree.
+        wt = os.path.join(self.tmp, "wt")
+        self.git_p("worktree", "add", "-q", "-b", "ABC-1", wt, "main")
+        rc, out = self.q("add", "ABC-1", "--project", wt, "--in-place", "--stages", "implement,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(sh("git", "-C", self.remote, "show", "ABC-1:feature.txt"), "hello feature\n")
+        # The branch checked out in the main worktree is still refused.
+        rc, out = self.q("add", "ABC-2", "--project", wt, "--in-place", "--stages", "implement")
+        self.assertEqual(rc, 0, out)
+        self.git_p("checkout", "-q", "-b", "ABC-2")
+        self.run_queue("--retries", "0")
+        st = self.status("ABC-2")
+        self.assertNotEqual(st["status"], "done")
+        self.assertIn("branch ABC-2 is checked out in another worktree", st["reason"])
+
     def test_review_plan_holds_this_tickets_plan(self):
         rc, out = self.q("add", "ABC-1", "--project", self.project, "--review-plan")
         self.assertEqual(rc, 0, out)

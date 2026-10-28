@@ -762,9 +762,14 @@ def enter_in_place(q, st):
     if start_of(st) == HERE:   # frozen at the first go, as a clone's is at add: going again starts there too
         st["start"] = start
     ends_on(q, st, start)
-    for wt in git(project, "worktree", "list", "--porcelain", check=False).stdout.split("\n\n")[1:]:
-        if f"branch refs/heads/{branch}" in wt.splitlines():
-            raise RuntimeError(f"branch {branch} is checked out in another worktree ({wt.splitlines()[0][9:]})")
+    # Not the first entry: the project can be a linked worktree itself (a bare
+    # repository with its worktrees beside it), and the main one is then another.
+    here = os.path.normcase(os.path.realpath(project))
+    for wt in git(project, "worktree", "list", "--porcelain", check=False).stdout.split("\n\n"):
+        lines = wt.splitlines()
+        if lines and f"branch refs/heads/{branch}" in lines \
+                and os.path.normcase(os.path.realpath(lines[0][9:])) != here:
+            raise RuntimeError(f"branch {branch} is checked out in another worktree ({lines[0][9:]})")
     exclude_block(project, None)   # a run that died mid-stage left it: its files would not show as uncommitted
     owner = uncommitted(project)
     write_atomic(os.path.join(q.dir(key), "owner.json"), json.dumps(owner))
