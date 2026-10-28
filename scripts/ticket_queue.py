@@ -2499,6 +2499,7 @@ def stage_push(ctx, st):
     pushes, reasons = [], []
     for p in [p for p in parts if p["kind"] == "branch"]:
         d, where = repo_dir(st, p["repo"]), "the project" if p["repo"] == "." else p["repo"]
+        of = "" if p["repo"] == "." else f" of {where}"
         push = {"remote": ctx.remote, "url": remote_url(d, ctx.remote), "branch": p["branch"], "sha": p["sha"],
                 "result": "local", "error": "", "repo": p["repo"]}
         pushes.append(push)
@@ -2513,11 +2514,11 @@ def stage_push(ctx, st):
             if r.returncode != 0:
                 push.update(result="rejected", error=(r.stderr or r.stdout).strip()[:300])
                 results(ctx, st, change, pushes)
-                return block(ctx, st, f"push of {where} to {ctx.remote} refused: {push['error']}. Fix that, then "
+                return block(ctx, st, f"push{of} to {ctx.remote} refused: {push['error']}. Fix that, then "
                                       f"harness queue retry {key} --stage push (branch {p['branch']} is at "
                                       f"{p['sha'][:12]} in {where})")
             push["result"] = "pushed"
-            ctx.q.log(key, f"pushed branch {p['branch']} of {where} to {ctx.remote} ({p['sha'][:12]})")
+            ctx.q.log(key, f"pushed branch {p['branch']}{of} to {ctx.remote} ({p['sha'][:12]})")
     left = [p["repo"] for p in parts if p["kind"] == "uncommitted"]
     if left:
         reasons.append("changes left uncommitted in " + ", ".join("the project" if r == "." else r for r in left))
@@ -2616,11 +2617,11 @@ def result_note(ctx, st):
              "", f"# {key}: result", "", "## Goal", "", goal or "(not written)", "", "## Acceptance criteria", ""]
     lines += [f"- {c}" for c in criteria] or ["(none)"]
     lines += ["", "## Branch", ""]
-    for p in st.get("pushes") or ([push] if push["branch"] else []):
-        r = "" if p.get("repo", ".") == "." else f" in {p['repo']}"
-        lines += [f"- branch: `{p['branch']}`{r}" + (f" at `{p['sha'][:12]}`" if p["sha"] else ""), f"- {where_of(p)}"]
-        if p["url"]:
-            lines.append(f"- remote: {p['url']}")
+    for x in st.get("pushes") or ([push] if push["branch"] else []):
+        r = "" if x.get("repo", ".") == "." else f" in {x['repo']}"
+        lines += [f"- branch: `{x['branch']}`{r}" + (f" at `{x['sha'][:12]}`" if x["sha"] else ""), f"- {where_of(x)}"]
+        if x["url"]:
+            lines.append(f"- remote: {x['url']}")
     for rel in st.get("left_uncommitted") or []:
         lines.append(f"- left uncommitted in {'the project' if rel == '.' else rel}")
     if st.get("compare_url"):

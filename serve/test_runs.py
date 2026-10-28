@@ -301,6 +301,30 @@ class RunsTest(RunsServer):
         self.assertIn("! [rejected] (non-fast-forward)", body)
         self.assertNotIn("javascript:", body)
         self.assertIn("No commits on the branch.", body)
+        # several repositories: each one's branch, and where the change is left uncommitted
+        self.ticket(status="done", stage="done", questions=[], reason="changes left uncommitted in the project",
+                    push={"remote": "origin", "url": "", "branch": "ABC-12", "sha": sha, "result": "pushed",
+                          "error": "", "repo": "api"},
+                    pushes=[{"remote": "origin", "url": "", "branch": "ABC-12", "sha": sha, "result": "pushed",
+                             "error": "", "repo": "api"}],
+                    left_uncommitted=[".", "web"], commits=[{"sha": sha, "subject": "api: the <route>"}],
+                    diffstat={"files": 2, "insertions": 5, "deletions": 1})
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("api: branch <b>ABC-12</b>", body)
+        self.assertIn("api: <b>pushed to origin</b>", body)
+        self.assertIn("left uncommitted in <b>the project, web</b>", body)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn(f"api: pushed branch ABC-12 to origin ({sha[:12]}); changes left uncommitted in the project",
+                      body)
+        # everything left uncommitted: no branch, nothing pushed
+        self.ticket(status="done", stage="done", questions=[], reason="changes left uncommitted in the project",
+                    push={"remote": "", "url": "", "branch": "", "sha": "", "result": "local", "error": "",
+                          "repo": "."}, pushes=[], left_uncommitted=["."], commits=[],
+                    diffstat={"files": 1, "insertions": 1, "deletions": 0})
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("branch <b></b>", body)
+        self.assertNotIn("No commits on the branch.", body)
+        self.assertIn("left uncommitted in <b>the project</b>", body)
         # an old state.json without results: no panel
         self.ticket(status="done", stage="done", questions=[])
         r, body = self.req("GET", "/runs/ticket/ABC-12")

@@ -677,11 +677,13 @@ the hub in Obsidian.
 
 `harness queue` (`cmd_queue`, then `scripts/ticket_queue.py`) works queued
 tickets one at a time with no one at the keyboard. `add KEY... [--dir]
-[--base] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch]] [--clone]
-[--no-plan-approval] [--note TEXT]` records the project and base (default: its current branch);
-by default a ticket works in the project folder (in place) and its plan waits
-for approval (`plan_review`); `--clone` and `--no-plan-approval` opt out
-(`--in-place` and `--review-plan` are accepted and are the defaults);
+[--base] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch]
+[--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval] [--note TEXT]` records the project and base (default: its current branch);
+a ticket works in the project folder (in place) and its plan waits
+for approval (`plan_review`); `--no-plan-approval` opts out
+(`--in-place` and `--review-plan` are accepted and are the defaults). Clone
+mode (`--clone`, a copy in `state/queue/KEY/repo`) is gone from the help and the
+run viewer; the engine still takes the flag, hidden, for old scripts and the tests;
 `run [--host] [--single-message]` needs an active vault, does the launch
 checks once (host mode when docker is missing, `host_confirm_gate` asked
 once and exported as `HARNESS_HOST_CONFIRM=1`, so the exit-75 `exec` does
@@ -733,29 +735,39 @@ ignored ones too, any deeper one `git add -A` meets; not the project's own
 worktrees, nor its submodules, nor the vault or the queue's state, nor tools'
 checkouts under `NESTED_SKIP` such as `.venv` or `.terraform`) are left out of the snapshot
 (`:(exclude,literal)`, so one with no commit no longer fails it; past
-`SNAP_ARGS_MAX` characters the pathspecs go through `--pathspec-from-file`),
-and each in-place stage records their HEAD, branch and uncommitted paths with
-a hash of each one's content (`nested_base`, taken before the owner's files
-are excluded, so a deep one among them is seen; past `NESTED_HASH_BUDGET`
-bytes a repository's files are known by size and mtime; one a run that died
-left is compared before the next stage, whichever a retry starts). A stage that changed one (`nested_moved`: a commit, a
-branch switch, an uncommitted path added, edited or gone; a file rewritten as
-it was is no change; a repository made since is not one) leaves
-`nested_moved` in state.json, saved with `verify_only`, and raises
-`NestedMoved` (`nested_block`, also before every stage, push too, so a run
-that dies first still blocks; any other block says it too, `nested_said`): blocked with the agent's result kept, since
-the verifier never sees those repositories and the push would go without
-them; a plain `retry` checks the result once the owner has looked. A launch
-that ends without a result (stop, halt, outage, Ctrl-C) records the same and
-drops the baseline, so the owner's own work there before the next launch is
-not taken for the agent's. When they cannot be looked at after a launch, that
-blocks too ("may have changed"); a launch that did not end keeps its baseline
-instead. `check_change` fails a commit since the start that adds a gitlink (a
+`SNAP_ARGS_MAX` characters the pathspecs go through `--pathspec-from-file`).
+
+Multi-repo projects: the project folder is the top repository and the agent
+always starts there (its AGENTS.md, build script and the vault say where to
+work; nothing in the repositories is off limits, the prompt only says how each
+one's change lands). Each repository's change lands one of two ways:
+- uncommitted (each repository inside not named by `--repo-branch`, and the
+  top with `--no-branch`): `take_baselines` (before each stage in `process`,
+  once per run of stages: implement takes the files as they are, a review-first
+  ticket HEAD's tree) saves a commit of the working tree (`worktree_tree`: a
+  temp index, `add -A` without the repositories inside) to
+  `refs/harness-queue/base/KEY` in that repository, kept in
+  `st["baselines"][rel]` with its HEAD; the change is the working tree against
+  it, so the owner's uncommitted files from before are not in it. A commit there
+  is a warning (`head_moved`), not a block.
+- on a branch (the top by default; one inside with `--repo-branch`,
+  validated by `repo_branches`: inside the project, its own `.git`, branch
+  default KEY, target default its checkout, main/master/the target refused
+  without `--allow-branch`): `enter_nested` makes or carries on the branch and
+  keeps `st["nested"][rel]` (start, merge base, the branch it was on); `park`
+  switches it back when the ticket is done and nothing new is uncommitted.
+`ticket_change` gathers every part into one change (`sha, diff, files, commits,
+parts`; the diffs path-prefixed by repository) that review, the verifier,
+fix and push read; `stage_push` pushes each branch part from its own
+repository to its remote and records `pushes` and `left_uncommitted`
+(`results`, KEY-result.md, the run viewer's Result panel). The prompts' words
+for this come from `lands`/`landing` (LAYOUT, COMMIT_STEP, CHECK_STEP,
+FIX_COMMIT_STEP, CHANGE, ON_BRANCH); one repository on one branch keeps the
+plain single-branch wording. Known gap: the owner's own edits in an
+uncommitted-mode repository during a ticket show up in its change. `check_change` fails a commit since the start that adds a gitlink (a
 repository committed whole, or in a tracked file's place) which `.gitmodules` does not
 name (`added_gitlinks`, with `--ignore-submodules=none`), so submodules, the
-owner's or the ticket's, pass. A ticket's change in
-another repository is a ticket of its own (`add --project <top>/<repo>`);
-carrying several repositories in one ticket is not built.
+owner's or the ticket's, pass.
 Windows container launches cannot work in place (`--host`).
 Each launch gets `HARNESS_QUEUE_LAUNCH` (a nonce), which harness puts on its
 container as `harness.queue-launch` and which stops `--ticket` being
@@ -1562,12 +1574,20 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   existing work on a named branch such as `origin/ABC-123` (the work branch
   defaults to that branch's name; one ticket per add), or The folder as it is
   now (`--start here`); the Target branch (`--base`), an optional Work branch
-  name, where the agents work, plan approval, a note for the agents, and the
+  name, the Repositories tree, plan approval, a note for the agents, and the
   stages: Full, Review only, Implement+review, Plan only or Custom). The
   branch fields suggest the project's local and remote branches from
   `/runs/queue/branches?project=` (read-only git, cached 5 s), which also
   says which repository and branch the folder is on, its remotes and their
-  default branches. The form is clamped to what the add accepts, each
+  default branches. The Repositories tree (`repo_tree`, from
+  `/runs/queue/repos?project=`: the project's top first, then
+  `nested_repos`, at most `REPO_ROWS`, read-only git within `REPO_BUDGET`
+  seconds) shows each repository's branch, uncommitted count and
+  ahead/behind, with a choice per row: leave the changes uncommitted (the
+  default for every repository) or a branch of the ticket's (name and
+  target). The top left uncommitted sends `--no-branch` and hides the
+  starting point and branch fields; a row on a branch sends
+  `--repo-branch REL=BRANCH:TARGET` (`repo_args`). The form is clamped to what the add accepts, each
   greyed-out choice saying why, and Add stays off with the reasons listed
   until the choices make sense: fix needs review; with review/fix/push but
   no implement, New work is off (the work must already exist); more than one
@@ -1648,9 +1668,9 @@ offered as suggestions. It is taken as pasted: quotes
 - `POST /runs/queue/{add,start,halt,end}`: `add` checks the form (keys, an
   absolute existing project folder, refs that cannot carry options or
   revision syntax, `fix` only with `review`, a ref when there is no
-  implement stage in a copy) and runs `queue add --stages --start --branch
-  --in-place|--clone --review-plan|--no-plan-approval --note` (the form's
-  "Where the agents work" and "When the plan is written" choices); `start`
+  implement stage) and runs `queue add --stages --start --branch
+  [--no-branch] [--repo-branch ...] --review-plan|--no-plan-approval --note`
+  (the form's tree and "When the plan is written" choices); `start`
   runs `bash <harness> queue run [--host|--single-message]` detached (own
   session or process group, no console, `HARNESS_OPEN=0`,
   `HARNESS_HOST_CONFIRM=1` for host modes, `HARNESS_INSTALL_ROOT` from the

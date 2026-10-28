@@ -6713,7 +6713,8 @@ usage: harness queue [list]                 the queue: each ticket's status and 
        harness queue status [--json]        the same, and whether a run is going and
                                             on what (--json: run.json and every state)
        harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST]
-                                [--start REF|here] [--branch NAME] [--clone]
+                                [--start REF|here] [--branch NAME | --no-branch]
+                                [--repo-branch REL[=BRANCH][:TARGET]]...
                                 [--allow-branch] [--no-plan-approval]
                                 [--note TEXT]
                                             queue tickets for the git project here
@@ -6765,13 +6766,34 @@ Where the agents work (default: in the project folder):
                 stage whose commits touch a file you had uncommitted fails.
                 Between tickets of the same project the queue switches the
                 folder from one ticket's branch to the next. Do not work in the
-                folder while the queue is on a ticket there. Nested repos are
-                not committed; their changes are only logged. Windows needs
+                folder while the queue is on a ticket there. Windows needs
                 harness queue run --host for this.
-  --clone       a separate copy instead: the queue clones the project for the
-                ticket (state/queue/KEY/repo) and never touches your folder,
-                but the copy has only what is committed.
   --in-place    the default, accepted for older scripts.
+
+A project of several repositories (the project folder the top one, others
+inside it with their own .git): the agents start in the top folder (its
+AGENTS.md, build script and your vault notes say where to work) and may change
+any of the repositories; nothing in them is off limits. Each repository's
+change lands one of two ways, and review, the verifier and push take every
+repository's part:
+  uncommitted   left in the files for you to commit: the default for each
+                repository inside the project, and the top's with --no-branch.
+                The change is the files now against the files when the work
+                started (saved to refs/harness-queue/base/KEY in that
+                repository), so your own uncommitted files there are not in it.
+                A commit the agent makes there anyway is noted, not blocked.
+  on a branch   the top's by default (as for a single repository: --branch,
+                --start). For a repository inside it:
+  --repo-branch REL[=BRANCH][:TARGET]
+                that repository (REL, relative to the project) gets a branch of
+                the ticket's: BRANCH (default KEY), made from TARGET (default
+                what it has checked out) or carried on when it exists; push
+                pushes it to that repository's own remote, and the repository
+                goes back to its branch when the ticket is done. Give it once
+                per repository. main, master and TARGET itself are refused
+                unless --allow-branch.
+  --no-branch   the top's change is left uncommitted too (no --branch, --start,
+                --ref or --base); push then pushes only the --repo-branch ones.
 
 After the plan (default: wait for you):
   by default a ticket stops after its plan (plan-review): read the plan on the
@@ -6788,8 +6810,7 @@ Where the work starts and ends:
                 branch (origin/feat: fetched first). "here": the commit the
                 project has checked out when you add the ticket (in the folder,
                 your uncommitted changes come along; in a clone they are not
-                there). Default: here in the project folder, --base with
-                --clone. When the queue has the folder on another ticket's
+                there). Default: here. When the queue has the folder on another ticket's
                 branch, a new ticket starts where that one did.
   --branch NAME the branch the work ends on (and push pushes). Default: KEY.
                 A new branch is made at the start. An existing one (local, or on
@@ -6804,7 +6825,7 @@ Where the work starts and ends:
 
 Each ticket goes through these stages, each one a fresh headless agent launch
 (the firewalled container; host mode with --host or without docker) in the
-project folder (or, --clone, its own clone of the project), on its branch:
+project folder, on its branch (or with its change left uncommitted):
 
   plan       reads the ticket and the code; writes wiki/notes/tickets/KEY-plan.md
              in the vault: goal, acceptance criteria, approach, files, at most 3
@@ -6920,14 +6941,14 @@ HELP
                 case "$a" in
                     --dir|--base) [[ -n "${1:-}" && "${1:-}" != -* ]] || { err "$a needs a value"; return 1; }
                         if [[ "$a" == --dir ]]; then dir="$1"; else base="$1"; fi; shift ;;
-                    --stages|--ref|--note|--start|--branch) (( $# )) || { err "$a needs a value"; return 1; }
+                    --stages|--ref|--note|--start|--branch|--repo-branch) (( $# )) || { err "$a needs a value"; return 1; }
                         opts+=("$a" "$1"); shift ;;
-                    --in-place|--clone|--review-plan|--no-plan-approval|--allow-branch) opts+=("$a") ;;
+                    --in-place|--clone|--no-branch|--review-plan|--no-plan-approval|--allow-branch) opts+=("$a") ;;
                     -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                     *) keys+=("$a") ;;
                 esac
             done
-            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch]] [--clone] [--no-plan-approval] [--note TEXT]"; return 1; }
+            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch] [--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval] [--note TEXT]"; return 1; }
             args+=(add "${keys[@]}" ${opts[@]+"${opts[@]}"})
             [[ -n "$vault" ]] || echo "harness: note: no active vault, and harness queue run needs one to work the tickets (harness vault new <name>, or harness vault use <name>)" >&2
             [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")

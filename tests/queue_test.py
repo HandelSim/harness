@@ -1904,7 +1904,7 @@ class ResultsTest(Base):
         st = self.status()
         self.assertEqual((rc, st["status"], st["reason"]), (0, "done", ""), out)
         self.assertEqual(st["push"], {"remote": "origin", "url": self.remote, "branch": "ABC-1", "sha": st["sha"],
-                                      "result": "pushed", "error": ""})
+                                      "result": "pushed", "error": "", "repo": "."})
         self.assertEqual(st["compare_url"], "")   # a folder remote has no web page
         self.assertEqual([c["subject"] for c in st["commits"]], ["ABC-1: implementing"])
         self.assertEqual(st["commits"][0]["sha"], st["sha"])
@@ -2469,7 +2469,7 @@ class NestedReposTest(Base):
         self.run_queue("--retries", "0")
         st = self.status()
         self.assertEqual(st["status"], "blocked")
-        self.assertIn("nothing changed since the work started", st["reason"])
+        self.assertIn("the ticket changed nothing: no file changed in ., libA (left uncommitted)", st["reason"])
 
     def test_a_repo_branch_is_made_pushed_and_left(self):
         lib = self.ignored_libA()

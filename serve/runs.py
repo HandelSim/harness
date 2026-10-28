@@ -716,7 +716,14 @@ class Runs:
                           for h in (hist if isinstance(hist, list) else []) if isinstance(h, dict)]
         push = st.get("push")
         if isinstance(push, dict) and push.get("result") in ("pushed", "local", "rejected", "skipped"):
-            out["push"] = {k: str(push.get(k) or "") for k in ("result", "remote", "url", "branch", "sha", "error")}
+            keys = ("result", "remote", "url", "branch", "sha", "error", "repo")
+            out["push"] = {k: str(push.get(k) or "") for k in keys}
+            pushes = st.get("pushes")
+            out["pushes"] = [{k: str(p.get(k) or "") for k in keys} for p in
+                             (pushes if isinstance(pushes, list) else [])
+                             if isinstance(p, dict) and p.get("result") in PUSHED]
+            left = st.get("left_uncommitted")
+            out["left_uncommitted"] = [r for r in left if isinstance(r, str)] if isinstance(left, list) else []
             url = st.get("compare_url")
             out["compare_url"] = url if isinstance(url, str) and re.match(r"https?://", url) else ""
             commits = st.get("commits")
@@ -1430,9 +1437,11 @@ def _why(st):
     if status == "queued":
         return st.get("reason") or f"waits for the run; starts at {st.get('stage', '')}"
     if status == "done":
-        p = st.get("push") or {}
-        if p.get("result") == "pushed":
-            return f"pushed branch {p['branch']} to {p['remote']}" + (f" ({p['sha'][:12]})" if p["sha"] else "")
+        said = [("" if p.get("repo", ".") in (".", "") else f"{p['repo']}: ") + f"pushed branch {p['branch']} to "
+                f"{p['remote']}" + (f" ({p['sha'][:12]})" if p["sha"] else "")
+                for p in st.get("pushes") or [st.get("push") or {}] if p.get("result") == "pushed"]
+        if said:   # the reason says what was kept local or left uncommitted
+            return "; ".join(said + [r for r in (st.get("reason") or "").split("; ") if r.startswith("changes left")])
         return st.get("reason") or (f"done at {st['sha'][:12]}" if st.get("sha") else "done")
     return st.get("reason") or ""
 
@@ -1786,10 +1795,19 @@ def _t_result(st):
     if not p:
         return ""
     stat = st["diffstat"]
-    facts = [f"<span>branch <b>{esc(p['branch'])}</b>" + (f" at <b>{esc(p['sha'][:12])}</b>" if p["sha"] else "")
-             + "</span>", f"<span><b>{esc(PUSHED[p['result']].format(remote=p['remote'] or 'the remote'))}</b></span>",
-             f"<span>changed <b>{stat['files']} file(s), +{stat['insertions']} &minus;{stat['deletions']}</b></span>"]
-    if p["url"]:
+    facts = []
+    for x in st.get("pushes") or ([p] if p.get("branch") else []):   # a branch per repository; older states: one
+        where = "" if x.get("repo", ".") in (".", "") else f"{esc(x['repo'])}: "
+        facts.append(f"<span>{where}branch <b>{esc(x['branch'])}</b>" +
+                     (f" at <b>{esc(x['sha'][:12])}</b>" if x["sha"] else "") + "</span>")
+        facts.append(f"<span>{where}<b>{esc(PUSHED[x['result']].format(remote=x['remote'] or 'the remote'))}</b>"
+                     "</span>")
+    left = st.get("left_uncommitted") or []
+    if left:
+        facts.append("<span>left uncommitted in <b>" + esc(", ".join("the project" if r == "." else r for r in left))
+                     + "</b></span>")
+    facts.append(f"<span>changed <b>{stat['files']} file(s), +{stat['insertions']} &minus;{stat['deletions']}</b></span>")
+    if p["url"] and p.get("branch"):
         facts.append(f"<span>remote <b>{esc(p['url'])}</b></span>")
     if st.get("folder_branch_now"):
         facts.append(f"<span>your folder is on <b>{esc(st['folder_branch_now'])}</b></span>")
@@ -1800,7 +1818,7 @@ def _t_result(st):
     commits = "".join(f"<li><code>{esc(c['sha'][:12])}</code> {esc(c['subject'])}</li>" for c in st["commits"])
     commits = (f"<details class='doc' data-k='commits'><summary>Commits<span class='muted'>{len(st['commits'])}"
                f"</span></summary><ul class='commits'>{commits}</ul></details>") if commits else \
-        "<div class='muted'>No commits on the branch.</div>"
+        ("" if left and not st.get("pushes") else "<div class='muted'>No commits on the branch.</div>")
     return (f"<section class='panel'><h2>Result</h2><div class='kv'>{''.join(facts)}</div>{bad}{warn}"
             f"{link}{commits}</section>")
 
