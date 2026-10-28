@@ -2616,11 +2616,11 @@ def result_note(ctx, st):
              "", f"# {key}: result", "", "## Goal", "", goal or "(not written)", "", "## Acceptance criteria", ""]
     lines += [f"- {c}" for c in criteria] or ["(none)"]
     lines += ["", "## Branch", ""]
-    for p in st.get("pushes") or ([push] if push["branch"] else []):
-        r = "" if p.get("repo", ".") == "." else f" in {p['repo']}"
-        lines += [f"- branch: `{p['branch']}`{r}" + (f" at `{p['sha'][:12]}`" if p["sha"] else ""), f"- {where_of(p)}"]
-        if p["url"]:
-            lines.append(f"- remote: {p['url']}")
+    for pu in st.get("pushes") or ([push] if push["branch"] else []):
+        r = "" if pu.get("repo", ".") == "." else f" in {pu['repo']}"
+        lines += [f"- branch: `{pu['branch']}`{r}" + (f" at `{pu['sha'][:12]}`" if pu["sha"] else ""), f"- {where_of(pu)}"]
+        if pu["url"]:
+            lines.append(f"- remote: {pu['url']}")
     for rel in st.get("left_uncommitted") or []:
         lines.append(f"- left uncommitted in {'the project' if rel == '.' else rel}")
     if st.get("compare_url"):

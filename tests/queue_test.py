@@ -364,7 +364,7 @@ class QueueTest(Base):
         vlog = cat(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-log.md"))
         self.assertTrue(vlog.startswith("---\ntype: note\nticket: ABC-1\n"), vlog[:80])
         self.assertIn("plan verifier: PASS", vlog)
-        self.assertIn("pushed branch ABC-1 to", vlog)
+        self.assertIn("pushed branch ABC-1 of the project to origin", vlog)
         rc, out = self.q("findings", "--vault", self.vault)
         self.assertIn("an unrelated bug", out)
         self.assertIn("plan verifier: PASS", cat(os.path.join(self.state, "run.log")))
@@ -1904,7 +1904,7 @@ class ResultsTest(Base):
         st = self.status()
         self.assertEqual((rc, st["status"], st["reason"]), (0, "done", ""), out)
         self.assertEqual(st["push"], {"remote": "origin", "url": self.remote, "branch": "ABC-1", "sha": st["sha"],
-                                      "result": "pushed", "error": ""})
+                                      "result": "pushed", "error": "", "repo": "."})
         self.assertEqual(st["compare_url"], "")   # a folder remote has no web page
         self.assertEqual([c["subject"] for c in st["commits"]], ["ABC-1: implementing"])
         self.assertEqual(st["commits"][0]["sha"], st["sha"])
@@ -1945,7 +1945,7 @@ class ResultsTest(Base):
         st = self.status()
         self.assertEqual((st["status"], st["stage"], st["push"]["result"]), ("blocked", "push", "rejected"), out)
         self.assertTrue(st["push"]["error"], st)
-        self.assertIn("push to origin refused", st["reason"])
+        self.assertIn("push of the project to origin refused", st["reason"])
         self.assertIn("harness queue retry ABC-1 --stage push", st["reason"])
 
     def test_a_branch_moved_since_it_was_checked_is_not_pushed(self):
@@ -2366,6 +2366,8 @@ class NestedReposTest(Base):
     def repo(self, rel, commit=True):
         d = os.path.join(self.project, rel)
         sh("git", "init", "-q", "-b", "main", d)
+        for k, v in (("user.name", "O"), ("user.email", "o@example.com")):
+            sh("git", "-C", d, "config", k, v)
         if commit:
             put(os.path.join(d, "lib.txt"), "lib\n")
             sh("git", "-C", d, "add", "lib.txt")
@@ -2469,7 +2471,7 @@ class NestedReposTest(Base):
         self.run_queue("--retries", "0")
         st = self.status()
         self.assertEqual(st["status"], "blocked")
-        self.assertIn("nothing changed since the work started", st["reason"])
+        self.assertIn("the ticket changed nothing: no file changed in ., libA (left uncommitted)", st["reason"])
 
     def test_a_repo_branch_is_made_pushed_and_left(self):
         lib = self.ignored_libA()
