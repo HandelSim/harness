@@ -2117,15 +2117,17 @@ def ticket_action(runs, key, action, form):
         if status not in RETRYABLE:
             return False, (f"{key} is {status}; only a blocked, stopped, done, waiting or interrupted ticket "
                            f"is retried{again}")
-        return _waits(runs, key, _queue(runs, ["retry", key] + (["--stage", stage] if stage else [])))
+        # --harness: an agent a run that is gone left behind is ended, its container too
+        return _waits(runs, key, _queue(runs, ["retry", key] + (["--stage", stage] if stage else [])
+                                        + ["--harness", runs.harness]))
     if action == "stop":
         if status not in STOPPABLE:
             return False, f"{key} is {status}; there is nothing to stop"
-        return _queue(runs, ["stop", key])
+        return _queue(runs, ["stop", key, "--harness", runs.harness])
     if action == "remove":
         if status == "running":   # its agent is working in the clone the remove deletes
             return False, f"{key} is running; stop it first{again}"
-        return _queue(runs, ["remove", key])
+        return _queue(runs, ["remove", key, "--harness", runs.harness])
     if action == "move":
         where = _one(form, "where")
         if where not in MOVES:

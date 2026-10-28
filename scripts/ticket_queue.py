@@ -893,7 +893,24 @@ def park(q, st):
     if why:
         q.log(key, f"{project} stays on {on}: {why}")
         st["reason"] = (st.get("reason", "") + "; " if st.get("reason") else "") + f"the folder stays on {on}: {why}"
-    q.save(st)
+    with held(os.path.join(q.root, "queue.lock")):
+        # the owner may have approved, answered or stopped it since it stopped for them: theirs stands
+        cur = q.load(key) or {}
+        if (cur.get("status"), cur.get("requeued")) != (st.get("status"), st.get("requeued")):
+            st = dict(cur, folder_branch_now=on)
+        q.save(st)
+
+
+def put_away(q, st):
+    """In place, the ticket stopped for the owner or the run ended (halt, Ctrl-C):
+    the folder back on the owner's branch (park); the run that takes it again
+    switches it back. Never raises: the folder is the owner's to sort out."""
+    if not st.get("in_place"):
+        return
+    try:
+        park(q, st)
+    except Exception as e:  # noqa: BLE001
+        q.log(st["key"], f"warning: the folder was not put back: {type(e).__name__}: {str(e)[:200]}")
 
 
 def snapshot(q, st, stage):
@@ -1526,6 +1543,7 @@ def launch(ctx, st, cmd, out, since, card=None):
                        "container": not (ctx.host or ctx.single), "workdir": workdir(ctx.q, st)}
         ctx.q.save(st)
         rc = None
+        keep = False   # the agent not known to be ended: st["agent"] stays for the next run, stop, retry or remove
         seen, quiet_since, next_look = activity(ctx, st, out, gitdir), t0, t0 + look
         try:
             while rc is None:
@@ -1550,16 +1568,19 @@ def launch(ctx, st, cmd, out, since, card=None):
                             rc = idle_out(ctx, st, p, (now - quiet_since) / 60)
         except Interrupted:
             stop(p)
-            stop_containers(ctx, st)
+            keep = not stop_containers(ctx, st)
             drop(note_paths(ctx.vault, key)["task"])
             sync_vault(ctx, key, since)
             raise
         except BaseException:  # Ctrl-C: the agent is in its own session and did not get it
             stop(p)
+            keep = True   # a second Ctrl-C while its container is stopped
+            keep = not stop_containers(ctx, st)
             raise
         finally:
             ctx.child = None
-            st.pop("agent", None)
+            if not keep:
+                st.pop("agent", None)
             with contextlib.suppress(OSError):
                 ctx.q.save(st)
             beat(ctx, agent=0, launch="")
@@ -1650,17 +1671,18 @@ def idle_out(ctx, st, p, mins):
 def stop_containers(ctx, st):
     """Stopping the docker client leaves its container running: stop the agent
     container of this ticket's launch (harness queue _stop_agents, by the folder
-    it mounts and the launch's label)."""
+    it mounts and the launch's label). False: it may still be running."""
     if ctx.host or ctx.single:
-        return
+        return True
     key = st["key"]
     n = launch_containers_stopped(ctx.harness, workdir(ctx.q, st), st.get("launch_id", ""))
     if n.isdigit():
         if int(n):
             ctx.q.log(key, f"stopped {n} agent container(s)")
-    else:
-        ctx.q.log(key, "warning: the agent's container may still be running; check 'harness list' "
-                       "(harness stop NAME) before 'harness queue retry'")
+        return True
+    ctx.q.log(key, "warning: the agent's container may still be running; check 'harness list' "
+                   "(harness stop NAME) before 'harness queue retry'")
+    return False
 
 
 def launch_containers_stopped(harness, folder, launch_id):
@@ -1884,6 +1906,9 @@ def reap(q, st, harness, why):
         n = launch_containers_stopped(harness, a.get("workdir") or workdir(q, st), a.get("launch", ""))
         if n.isdigit() and int(n):
             q.log(key, f"stopped {n} agent container(s) a run left running: {why}")
+    elif a.get("container"):
+        q.log(key, f"warning: the agent's container may still be running (launch {a.get('launch', '')}); "
+                   "check 'harness list' (harness stop NAME)")
 
 
 # --- stages -------------------------------------------------------------------------------
@@ -2070,7 +2095,7 @@ def stage_plan(ctx, st):
         obj = verdict(ctx, st, "plan", lambda c: render("verify_plan", TICKET=read(p["ticket"], c), PLAN=text,
                                                          CRITERIA=numbered(criteria)))
         problems = judge(obj, criteria, read(p["ticket"]), "ticket_quote", "ticket", soft=notes)
-        ctx.q.log(st["key"], f"plan verifier: {obj.get('verdict')} ({len(problems)} problem(s))")
+        ctx.q.log(st["key"], f"plan verifier: {verifier_line(obj, problems)}")
         if notes:
             ctx.q.log(st["key"], "plan notes (not failures)", "\n".join("- " + n for n in notes))
     if problems:
@@ -2093,6 +2118,16 @@ def stage_plan(ctx, st):
         st.update(status="plan-review", reason=f"plan ready to read: {p['plan']}")
         ctx.q.save(st)
         ctx.q.log(st["key"], f"waiting for the plan to be read: harness queue approve {st['key']}")
+
+
+def verifier_line(obj, problems):
+    """The verifier's verdict for the log, saying whether it stands: a PASS with
+    problems found in its answer (an unquoted criterion, say) is a fail."""
+    v = obj.get("verdict") or "no verdict"
+    if not problems:
+        return f"{v}, no problems: passed"
+    return f"{v}, but {len(problems)} problem(s) found: failed" if str(v).upper() == "PASS" \
+        else f"{v}, {len(problems)} problem(s): failed"
 
 
 def numbered(items):
@@ -2129,7 +2164,7 @@ def verify_change(ctx, st, rc, stage):
             "verify_change", TICKET=read(p["ticket"], min(TICKET_CAP, c)), CRITERIA=numbered(criteria),
             DIFF=cap(diff, c), COMMITS=cap(notes, NOTE_CAP) or "(none)"))
         problems = judge(obj, criteria, diff, "quote", "diff", notes)
-        ctx.q.log(st["key"], f"{stage} verifier: {obj.get('verdict')} ({len(problems)} problem(s))")
+        ctx.q.log(st["key"], f"{stage} verifier: {verifier_line(obj, problems)}")
         st["warnings"] = warnings
     if problems:
         fail(ctx, st, rc, problems)
@@ -2206,7 +2241,9 @@ def stage_push(ctx, st):
     key, project = st["key"], st["project"]
     change = fetch_branch(ctx.q, st)
     if change is None:
-        return block(ctx, st, "the branch is gone from the clone")
+        where = "the project" if st.get("in_place") else "the ticket's clone"
+        return block(ctx, st, f"nothing to push: branch {branch_of(st)} in {where} has no commits on its start "
+                              f"(or is gone); harness queue retry {key} --stage implement makes the change again")
     sha, name = change[0], branch_of(st)
     if st.get("verified_sha") and st["verified_sha"] != sha:
         return block(ctx, st, f"branch {name} moved since it was checked ({st['verified_sha'][:12]}, now {sha[:12]}): "
@@ -2437,8 +2474,9 @@ def process(ctx, st):
                        f"{(r.stderr or r.stdout).strip()[-300:] or 'exit ' + str(r.returncode)}); the vault's copy is used")
     ticket = note_paths(ctx.vault, key)["ticket"]
     if not read(ticket).strip():
-        return block(ctx, st, f"the ticket's text is not at {ticket} and the tracker did not give it (check "
-                              f"TRACKER_* and 'harness queue _pull {key}', or write the ticket there), then "
+        return block(ctx, st, f"there is no ticket text for {key}: the tracker did not give it (no tracker set up, "
+                              f"or no access: harness ticket login, then harness ticket pull {key}) and {ticket} "
+                              f"is empty or missing. Pull it, or write the ticket into that file yourself, then "
                               f"harness queue retry {key}")
     mode = "container" if not (ctx.host or ctx.single) else "host"
     if WINDOWS and not st.get("in_place") and st.get("base_sha") and st.get("clone_mode", mode) != mode:
@@ -2622,7 +2660,7 @@ def take(ctx, key, pending, done):
                 q.save(st)
                 q.log(key, why)
             return None, False
-        orphan = st.get("status") == "running" and bool(st.get("agent"))
+        orphan = bool(st.get("agent"))   # only a launch sets it; a run that is gone left it
         ctx.key = key
         beat(ctx, ticket=key, stage=st["stage"], step="")   # in hand (run_holds) before it is running
         st.update(status="running", vault=ctx.vault)
@@ -2680,6 +2718,7 @@ def run_tickets(q, ctx):
             except Interrupted as e:
                 interrupted(ctx, st, e)
                 if e.kind == "halt":
+                    put_away(q, st)
                     sync_vault(ctx, key, int(time.time() * 1000))
                     raise
             except Infra as e:   # the ticket goes back; the run waits for the upstream and carries on
@@ -2697,21 +2736,20 @@ def run_tickets(q, ctx):
                     outage = e
             except KeyboardInterrupt:
                 put_back(ctx, st, "the run was interrupted (Ctrl-C); start the queue again to carry on")
+                put_away(q, st)
                 raise
             except Exception as e:  # noqa: BLE001 - one ticket's failure must not stop the queue
                 import traceback
                 try:
                     q.log(key, "error", traceback.format_exc())
-                    block(ctx, st, f"{type(e).__name__}: {str(e)[:250]}")
+                    block(ctx, st, f"the queue hit an error of its own ({type(e).__name__}: {str(e)[:200]}); the "
+                                   f"details are in harness queue log {key}; harness queue retry {key} tries again")
                 except Exception:  # noqa: BLE001 - nor its handling
                     traceback.print_exc()
             finally:   # a stop asked too late for this go is not for a later one
                 drop(q.sentinel(key))
-            if st.get("in_place") and st.get("status") in PARKED:
-                try:
-                    park(q, st)
-                except Exception as e:  # noqa: BLE001 - the folder is the owner's to sort out
-                    q.log(key, f"warning: the folder was not put back: {type(e).__name__}: {str(e)[:200]}")
+            if st.get("status") in PARKED:
+                put_away(q, st)
             sync_vault(ctx, key, int(time.time() * 1000))   # the outcome, into the vault
             if outage is not None:
                 ctx.key = ""
@@ -2834,10 +2872,13 @@ def cmd_add(q, a):
                 q.add_note(key, a.note)
             q.save(st)
             order.append(key)
+            frm = start_of(st)
+            frm = frm[:12] if re.fullmatch(r"[0-9a-f]{40}", frm) else frm[:40]
             how = (f"in {project} itself" if in_place else f"in a clone of {project}") \
-                + f", from {start_of(st)[:40]} on branch {branch_of(st)}"
-            plan = "" if "plan" not in stages else "; the plan waits for approve" if not a.no_plan_approval \
-                else "; implement starts after the plan without asking"
+                + f", from {frm} on branch {branch_of(st)}"
+            plan = "" if "plan" not in stages else \
+                f"; the plan waits for you to approve it (harness queue approve {key})" if not a.no_plan_approval \
+                else "; implementing starts after the plan without asking"
             print(f"[queue] {key}: queued ({how}; stages {','.join(stages)}{plan})")
         q.set_order(order)
     return rc
@@ -2858,16 +2899,31 @@ def shared_branches(project, base):
     return out
 
 
-def print_list(q):
+NEXT = {"needs-answers": "harness queue answer {k}   (or --go: take the plan's defaults)",
+        "plan-review": "harness queue approve {k}   (or harness queue answer {k} \"feedback\": plan again)",
+        "blocked": "read why above (harness queue log {k}), then harness queue retry {k}",
+        "stopped": "harness queue retry {k}   resumes it"}
+
+
+def print_list(q, hints=True):
     keys = q.order()
     if not keys:
         print("the queue is empty (harness queue add KEY...)")
         return
     print(f"{'TICKET':<14} {'STATUS':<14} {'STAGE':<10} NOTE")
-    for k in keys:
-        st = q.load(k) or {}
+    sts = [q.load(k) or {"key": k} for k in keys]
+    for st in sts:
         note = st.get("reason") or (f"attempt {st.get('attempt', 0) + 1}" if st.get("status") == "running" else "")
-        print(f"{k:<14} {st.get('status', '?'):<14} {st.get('stage', '?'):<10} {note}")
+        print(f"{st['key']:<14} {st.get('status', '?'):<14} {st.get('stage', '?'):<10} {note}")
+    if not hints:
+        return
+    waits = [(st["key"], NEXT[st["status"]]) for st in sts if st.get("status") in NEXT]
+    if waits:
+        print("\nwaiting on you:")
+        for k, what in waits:
+            print(f"  {k:<12} " + what.format(k=k))
+    if any(st.get("status") in ("queued", "running") for st in sts) and not run_going(q):
+        print("\nno queue run is going: harness queue run (or Start the queue in harness serve) works the queued tickets")
 
 
 def cmd_list(q, a):
@@ -2880,8 +2936,11 @@ def reap_stranded(q, key, harness):
     it): its agent, if still going, is ended. Outside queue.lock (it can take a
     minute); the command then drops st["agent"] under the lock."""
     st = q.load(key) or {}
-    if st.get("status") == "running" and st.get("agent") and not run_holds(q, key):
+    if st.get("agent") and not run_holds(q, key):
         reap(q, st, harness, "the owner changed the ticket")
+
+
+FINISHING = "the run is finishing up its last stage; try again in a few seconds"
 
 
 def cmd_remove(q, a):
@@ -2895,10 +2954,12 @@ def cmd_remove(q, a):
             key = raw.upper()
             if key not in order and not q.load(key):
                 print(f"[queue] {key} is not in the queue", file=sys.stderr)
+                rc = 1
                 continue
             st = q.load(key) or {}
-            if st.get("status") == "running" and run_holds(q, key):
-                print(f"[queue] {key} is running; stop it first (harness queue stop {key})", file=sys.stderr)
+            if run_holds(q, key):   # running, or just stopped for the owner and the run still putting it away
+                print(f"[queue] {key}: " + (f"is running; stop it first (harness queue stop {key})"
+                                            if st.get("status") == "running" else FINISHING), file=sys.stderr)
                 rc = 1
                 continue
             order = [k for k in order if k != key]
@@ -2910,13 +2971,33 @@ def cmd_remove(q, a):
                     trash.append((key, gone))
             except OSError as e:
                 print(f"[queue] {key}: {e}; remove {q.dir(key)} by hand", file=sys.stderr)
-            print(f"[queue] {key} removed (its branch, if any, stays in the project as refs/harness-queue/{key})")
+            print(f"[queue] {key} removed" + removed_note(q, st, order))
         q.set_order(order)
     for key, gone in trash:
         err = rmtree(gone)
         if err:
             print(f"[queue] {key}: {err}; the next run removes it, or remove {gone} by hand", file=sys.stderr)
     return rc
+
+
+def removed_note(q, st, order):
+    """What a removed ticket leaves in the project. In place: its branch, and the
+    folder still on it when a run that died left it there; the uncommitted-files
+    block in .git/info/exclude goes, unless another ticket of the folder is mid-stage."""
+    project = st.get("project", "")
+    if not st.get("in_place"):
+        return f" (its work, if any, stays in the project as refs/harness-queue/{st.get('key', '')})"
+    if not project or not os.path.isdir(project):
+        return ""
+    branch = branch_of(st)
+    if not any(run_holds(q, k) for k in order if (q.load(k) or {}).get("project") == project):
+        with contextlib.suppress(RuntimeError, OSError, subprocess.SubprocessError):
+            exclude_block(project, None)
+    on = git(project, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    if on == branch:
+        back = st.get("orig_branch") or "your branch"
+        return f"; {project} is still on its branch {branch}: git switch {back} to go back"
+    return f" (its branch {branch}, if any, stays in {project})"
 
 
 RESULTS = ("push", "compare_url", "commits", "diffstat", "folder_branch_now", "launch_fails", "agent")
@@ -3113,7 +3194,9 @@ def cmd_retry(q, a):
     # queued one sent back to an earlier stage; under the lock the run takes tickets under
     with held(os.path.join(q.root, "queue.lock")):
         if run_holds(q, key):
-            print(f"[queue] {key} is running; stop it first (harness queue stop {key})", file=sys.stderr)
+            print(f"[queue] {key}: " + (f"is running; stop it first (harness queue stop {key})"
+                                        if (q.load(key) or {}).get("status") == "running" else FINISHING),
+                  file=sys.stderr)
             return 1
         st = requeue(q, key, RETRYABLE + ("running",) + (("queued", "plan-review") if a.stage else ()),
                      stage=stage, **extra)
@@ -3222,6 +3305,14 @@ def end_run(q, a):
             print(f"[queue] {key}: {'stopped' if stopped else 'back in the queue'} at {st['stage']}")
     for st in left:   # its agent (if it outlived the kill) and its container; slow, so after the lock
         reap(q, st, a.harness, "the run was ended by the owner")
+    tidy(q)   # the in-place exclude block of the stage cut short
+    for key in q.order():
+        st = q.load(key) or {}
+        if st.get("in_place") and st.get("status") in ("queued", "stopped") and os.path.isdir(st.get("project", "")):
+            on = git(st["project"], "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+            if on == branch_of(st) and st.get("orig_branch") not in ("", None, on):
+                print(f"[queue] {key}: {st['project']} is left on its branch {on} (the next run carries on there; "
+                      f"git switch {st['orig_branch']} to go back meanwhile)")
     return 0
 
 
@@ -3302,7 +3393,8 @@ def cmd_status(q, a):
         print(json.dumps({"runner": r, "tickets": tickets}, indent=2))
         return 0
     if r["running"]:
-        print(f"run: going (pid {r.get('pid')}): {r.get('ticket') or 'between tickets'} {r.get('stage') or ''}".rstrip())
+        doing = f"{r.get('ticket') or 'between tickets'} {r.get('stage') or ''}".rstrip()
+        print(f"run: going (pid {r.get('pid')}): {doing}" + (f": {r['step']}" if r.get("step") else ""))
     else:
         print("run: not going")
     print_list(q)
@@ -3344,14 +3436,22 @@ def cmd_answer(q, a):
     old = read(p["answers"])
     write_atomic(p["answers"], (old.rstrip() + "\n" if old.strip() else "") + stamp + text.strip() + "\n")
     planned = "plan" in stages_of(st)   # without a plan stage the answers reach the next stage's prompt
+    was = st["stage"]
     # Answers or feedback: the plan made with them comes back to be agreed before
-    # anything is built (--go: the owner took the defaults and wants it to go on).
+    # anything is built (--go: the owner took the defaults and wants it to go on: approved).
     with held(os.path.join(q.root, "queue.lock")):   # the run takes a queued ticket under it
-        st = requeue(q, key, allowed, stage="plan" if planned else None, plan_approved=False,
+        st = requeue(q, key, allowed, stage="plan" if planned else None, plan_approved=planned and bool(a.go),
                      plan_hold=planned and not a.go)
     if st:
-        print(f"[queue] {key}: answers saved to {p['answers']}; "
-              + ("the plan is made again on the next run" if planned else f"the next run goes on at {st['stage']}"))
+        if not planned:
+            then = f"the queue run goes on at {st['stage']} with them"
+        elif a.go:
+            then = "the queue run makes the plan again with them and goes straight on to implementing"
+        else:
+            then = "the queue run makes the plan again with them, and it comes back to you to approve"
+        if planned and was not in ("plan", "done"):
+            then += f" (the ticket was at {was}: it starts again from the plan)"
+        print(f"[queue] {key}: answers saved; {then}")
     return 0 if st else 1
 
 

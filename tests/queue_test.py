@@ -1693,7 +1693,7 @@ class StartAndBranchTest(Base):
         self.assertIs(st["in_place"], True)
         self.assertIs(st["plan_review"], True)
         self.assertEqual(st["start"], head)                  # here, fixed when added
-        self.assertIn("the plan waits for approve", out)
+        self.assertIn("the plan waits for you to approve it (harness queue approve", out)
         rc, out = self.q("add", "ABC-2", "--project", self.project, "--clone", "--no-plan-approval", defaults=True)
         self.assertEqual(rc, 0, out)
         st = self.status("ABC-2")
