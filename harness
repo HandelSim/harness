@@ -1872,8 +1872,9 @@ subcommands:
             host --yolo -p' with and without it on 38 SWE-bench Verified
             tasks, graded by their tests, stopped at --budget tokens
             (default 20M). Start with --gate-only (builds the tasks, no
-            model calls). --suite local: six small local tasks instead,
-            3.5M tokens by default, fits in a day.
+            model calls). --day-budget N stops each day's invocation at N
+            tokens; continue the next day with --resume. --suite local: six
+            small local tasks instead, 3.5M tokens by default, fits in a day.
             'harness probe thoughts --help' for its options.
   help      this list
 
@@ -6916,8 +6917,8 @@ HELP
             while (( $# )); do
                 a="$1"; shift
                 case "$a" in
-                    --dir) dir="${1:-}"; shift || true ;;
-                    --base) base="${1:-}"; shift || true ;;
+                    --dir|--base) [[ -n "${1:-}" && "${1:-}" != -* ]] || { err "$a needs a value"; return 1; }
+                        if [[ "$a" == --dir ]]; then dir="$1"; else base="$1"; fi; shift ;;
                     --stages|--ref|--note|--start|--branch) (( $# )) || { err "$a needs a value"; return 1; }
                         opts+=("$a" "$1"); shift ;;
                     --in-place|--clone|--review-plan|--no-plan-approval|--allow-branch) opts+=("$a") ;;
@@ -6927,6 +6928,7 @@ HELP
             done
             (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch]] [--clone] [--no-plan-approval] [--note TEXT]"; return 1; }
             args+=(add "${keys[@]}" ${opts[@]+"${opts[@]}"})
+            [[ -n "$vault" ]] || echo "harness: note: no active vault, and harness queue run needs one to work the tickets (harness vault new <name>, or harness vault use <name>)" >&2
             [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")
             [[ -n "$base" ]] && args+=(--base "$base") ;;
         # remove, stop and retry end the agent (and container) of a ticket no run holds
@@ -6976,7 +6978,7 @@ HELP
                     *) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                 esac
             done
-            [[ -n "$vault" ]] || { err "harness queue run needs an active vault: tickets, plans and findings live there (see: harness vault)"; return 1; }
+            [[ -n "$vault" ]] || { err "harness queue run needs an active vault: tickets, plans and findings live there. Make one with: harness vault new <name> (or pick one: harness vault use <name>)"; return 1; }
             harness_runtime_installed || host=1
             host_require_config
             ensure_dirs
@@ -6987,6 +6989,8 @@ HELP
             # (they have no terminal, so a question there fails every stage).
             if (( host )); then
                 host_confirm_gate 1 || exit 1
+                # answered: the run started again after an upgrade (exec below) does not ask again
+                export HARNESS_HOST_CONFIRM=1
             else
                 warn_if_firewall_open 0 queue || exit 1
                 export HARNESS_NET_CONFIRM=1

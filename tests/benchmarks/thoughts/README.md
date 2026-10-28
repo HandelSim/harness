@@ -69,8 +69,22 @@ python3 tests/benchmarks/thoughts/run.py --resume tests/benchmarks/runs/thoughts
 python3 tests/benchmarks/thoughts/run.py --report tests/benchmarks/runs/thoughts-<stamp>
 ```
 
+Over several days (a daily allowance smaller than the run):
+
+```
+python3 tests/benchmarks/thoughts/run.py --budget 60000000 --trial-token-cap 1000000 --day-budget 4000000
+python3 tests/benchmarks/thoughts/run.py --resume tests/benchmarks/runs/thoughts-<stamp> --budget 60000000 --trial-token-cap 1000000 --day-budget 4000000
+```
+
+`--day-budget N` caps what one invocation spends. A pair starts only while
+two full trial caps fit in what is left of it, so the day's limit holds even
+when both trials run to the cap, and no trial is cut short by it (it stops
+with "resume tomorrow"; the next day's `--resume` starts its own count). Set
+it to what is left of the day's allowance after your own use. `--budget`
+stays the total for the whole run.
+
 Flags: `--budget N` (default 20,000,000), `--trial-token-cap N`
-(1,500,000), `--timeout S` (2400), `--pairs N`, `--task-ids a,b`,
+(1,500,000), `--day-budget N` (off), `--timeout S` (2400), `--pairs N`, `--task-ids a,b`,
 `--dataset PATH` (local datasets-server rows instead of HF), `--cache-dir`,
 `--harness-bin`, `--install-root`. No new environment variables.
 

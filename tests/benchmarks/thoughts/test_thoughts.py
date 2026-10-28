@@ -47,6 +47,18 @@ class Plan(unittest.TestCase):
         self.assertEqual(set(t[0]), {"id", "repo", "difficulty", "solve_rate"})
 
 
+class DayBudget(unittest.TestCase):
+    def test_day_stop(self):
+        self.assertEqual(run.day_stop(5_000_000, 0, 1_000_000), "")  # off
+        self.assertEqual(run.day_stop(0, 4_000_000, 1_000_000), "")
+        self.assertEqual(run.day_stop(2_000_000, 4_000_000, 1_000_000), "")
+        self.assertIn("day budget 4,000,000", run.day_stop(2_000_001, 4_000_000, 1_000_000))
+
+    def test_day_budget_needs_two_caps(self):
+        with self.assertRaises(SystemExit):
+            run.main(["--dry-run", "--day-budget", "1000000", "--trial-token-cap", "600000"])
+
+
 class LocalPlan(unittest.TestCase):
     def test_balanced(self):
         ids = ["a", "b", "c", "d", "e", "f"]

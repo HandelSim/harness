@@ -128,6 +128,16 @@ def guard(spent: int, budget: int, costs: list[int], cap: int) -> dict:
             "why": "" if ok else f"spent {spent:,} + projected pair {projected:,} > budget {budget:,}"}
 
 
+def day_stop(today: int, day_budget: int, cap: int) -> str:
+    """With --day-budget, why this invocation starts no more pairs ("" to go
+    on). A pair starts only while two full trial caps fit in what is left of
+    the day, so the day's limit holds even if both trials run to the cap and
+    no trial is cut short by it."""
+    if day_budget and today + 2 * cap > day_budget:
+        return f"spent {today:,} today + 2 x trial cap {cap:,} > day budget {day_budget:,}"
+    return ""
+
+
 # --------------------------------------------------------------------------
 # proxy log: live token meter
 # --------------------------------------------------------------------------
@@ -651,6 +661,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--trial-token-cap", type=int, default=None,
                     help="kill a trial at this many tokens (default: swe %s, local %s)"
                          % tuple(f"{DEFAULTS[k][1]:,}" for k in ("swe", "local")))
+    ap.add_argument("--day-budget", type=int, default=0,
+                    help="spend at most this many tokens in this invocation (a pair starts only while "
+                         "2 trial caps fit), then stop; --resume the next day")
     ap.add_argument("--timeout", type=int, default=None, help="seconds per trial (default: swe 2400, local 900)")
     ap.add_argument("--keep-workdirs", action="store_true", help="--suite local: keep each trial's scratch dir")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and budget math and check inputs; spends nothing")
@@ -672,6 +685,8 @@ def main(argv: list[str]) -> int:
         ap.error("need --repeats > 0")
     if a.budget <= 0 or a.trial_token_cap <= 0 or a.trial_token_cap * 2 > a.budget:
         ap.error("need budget > 0 and 0 < 2 * trial-token-cap <= budget")
+    if a.day_budget and a.trial_token_cap * 2 > a.day_budget:
+        ap.error("need 2 * trial-token-cap <= day-budget")
 
     if a.report:
         meta = {}
@@ -738,6 +753,9 @@ def main(argv: list[str]) -> int:
         print(f"rule: before each pair, run only if spent + 2*p75(trial tokens) <= budget; each trial is killed at "
               f"min(cap, (budget - spent)/2). Worst case (every trial capped): {worst_pairs} of {len(plan)} pairs, "
               f"overshoot at most one in-flight request.")
+        if a.day_budget:
+            print(f"day budget {a.day_budget:,}: a pair starts only while 2 x cap fits in what is left of it, "
+                  f"so at least {a.day_budget // (2 * a.trial_token_cap)} pair(s) a day, then --resume")
         print(f"dataset rows: {'checked ' + str(len(rows)) if rows else 'not cached (fetched from HF at run time)'}; "
               f"harness: {harness_bin} ({'found' if os.path.isfile(harness_bin) else 'MISSING'}); cache: {cache}")
         print("dry run: nothing started, no upstream call, no tokens spent")
@@ -791,7 +809,9 @@ def main(argv: list[str]) -> int:
     resume = f"python3 {os.path.join(HERE, 'run.py')} --resume {out} --budget {a.budget} " \
              f"--trial-token-cap {a.trial_token_cap}" + (f" --task-ids {a.task_ids}" if a.task_ids else "") \
              + (f" --pairs {a.pairs}" if a.pairs else "") \
+             + (f" --day-budget {a.day_budget}" if a.day_budget else "") \
              + (f" --suite local --repeats {a.repeats}" if local else "")
+    start_spent = sum(int(r.get("tokens") or 0) for r in read_results(results_path))
 
     def stop_proxy():
         subprocess.run(([BASH] if IS_WINDOWS else []) + [harness_bin, "host", "down"],
@@ -821,6 +841,10 @@ def main(argv: list[str]) -> int:
                 f"trial cap {g['eff_cap']:,}")
             if not g["ok"]:
                 aborted = "token budget: " + g["why"]
+                break
+            day = day_stop(spent - start_spent, a.day_budget, a.trial_token_cap)
+            if day:
+                aborted = "day budget: " + day + "; resume tomorrow"
                 break
             ctx["next_pair"] = g["projected_pair"]
             env = None if local else swe_env.build_env(rows[tid], cache, logf=log)
