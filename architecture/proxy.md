@@ -354,7 +354,11 @@ holds the project's notes, past sessions and decisions; grep its
 `wiki/index.md`, then `wiki/`, for the key words before answering about the
 project or past work; its `AGENTS.md` says how to write there. A free model sees
 the vault's `AGENTS.md` only at the start of a long, truncated history, so the
-pointer has to ride the per-turn reminder. Values that are empty, over 400
+pointer has to ride the per-turn reminder. In a queue stage (a task card with a
+stage) the sentence is narrower: the only vault files the stage needs are the
+vault's `AGENTS.md` and the ones the card names, so no wiki search; the stage
+prompts never ask for one, and an invitation to search sent a free model
+roaming. Values that are empty, over 400
 characters or carry control characters add nothing; the native route ignores
 the header. The proxy's own re-asks (malformed-call retry, tool search,
 require-tool corrections) rebuild the last message with the same line:
@@ -368,7 +372,12 @@ A launch with a ticket (and a vault) also sends `x-harness-ticket: KEY` and
 `_task_card` renders a short card at the very end of every last message,
 after the reminder: the ticket's key and quoted title, then for a queue stage
 the stage and attempt ("this session does this stage only"), where it works
-and the branch, done-when in the words of the queue's checks, a note when the
+and the branch, a line keeping it in its working directory (the path from the
+`<env>` block: outside it, only the files the card, the task file and the
+Environment bullet name; nothing is listed, searched or read, since it sits in
+`state/queue/KEY/repo` deep in the harness install and a model hunting for
+files or an `AGENTS.md` climbed into the install, an external_directory ask
+per read), done-when in the words of the queue's checks, a note when the
 last attempt failed, the Must fix count, and pointers to `KEY-task.md` (the
 stage's whole prompt, there while it runs), the ticket's copy and its state
 note, each to be read "when you need a detail", not "when you cannot see it"
@@ -382,7 +391,10 @@ characters, gives the bare card (key and pointers). Text the model reads
 cannot pass for the card: `_defang_card` rewrites `[harness task card` in the
 turn's content to `[quoted harness task card`. With a card, the
 instruction-file line leaves out the ticket's two files, which the card
-names. A key that is not `ABC-123` shaped or is over 40 characters, or a
+names, and in a queue stage also every file outside the working directory and
+the vault (`_under`; the user's global `AGENTS.md` or `~/.claude/CLAUDE.md`):
+opencode asks `external_directory` for `<its folder>/*` on each read there,
+and its text is in the system message anyway. A key that is not `ABC-123` shaped or is over 40 characters, or a
 ticket without a vault, gives no card.
 
 ## Session tag in message 0
@@ -458,7 +470,8 @@ validator in `_setup_prompt_mode` accepts:
   the nearest available excuse for handing the work back.
   **Amnesia** (the premise for re-sending the rules at all: history is
   silently truncated mid-task, so nothing above this block can be trusted.
-  Carries the per-turn check that the TEXT of AGENTS.md is still visible — a
+  Carries the per-turn check that the TEXT of AGENTS.md (the instruction files
+  the Environment bullet names: never one to go looking for) is still visible — a
   checked-off "read AGENTS.md" todo item is explicitly not evidence, because
   the earlier one-time wording produced exactly that: one read at the top of
   the first list and never again),

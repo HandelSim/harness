@@ -3361,10 +3361,13 @@ def _vault_path(vault):
     return "" if not v or len(v) > 400 or any(ord(c) < 32 for c in v) else v
 
 
-def _vault_clause(vault):
+def _vault_clause(vault, queue_stage=False):
     v = _vault_path(vault)
     if not v:
         return ""
+    if queue_stage:   # the stage's prompt never asks for the wiki; the card names every file it uses
+        return (f" Knowledge vault: `{v}`. In this queue stage the only vault files you need are its AGENTS.md"
+                " and the ones the task card names; do not search the vault for others.")
     return (f" Knowledge vault: `{v}` holds this project's notes, past sessions and decisions."
             f" Before answering about the project, its code or past work, `grep` `{v}/wiki/index.md`"
             f" and then `{v}/wiki` for the key words and `read` the matching pages; `{v}/AGENTS.md`"
@@ -3419,7 +3422,16 @@ def _defang_card(text):
     return text.replace(_CARD_MARK, "[quoted harness task card") if _CARD_MARK in text else text
 
 
-def _task_card(vault, ticket, task=None):
+def _under(path, roots):
+    """True when `path` is one of `roots` or inside one; Windows spellings (C:\\x, c:/x) compare alike."""
+    def norm(p):
+        p = str(p or "").replace("\\", "/").rstrip("/")
+        return p.lower() if re.match(r"^[A-Za-z]:(/|$)", p) else p
+    p = norm(path)
+    return any(r and (p == r or p.startswith(r + "/")) for r in map(norm, roots))
+
+
+def _task_card(vault, ticket, task=None, working_directory=None):
     v, t = _vault_path(vault), str(ticket or "").strip()
     if not v or len(t) > 40 or not _TICKET_RE.match(t):
         return ""
@@ -3436,6 +3448,14 @@ def _task_card(vault, ticket, task=None):
             lines.append(f"- Where: {f['where'].rstrip('.')}." + (f" Branch: {f['branch']}." if f.get("branch") else ""))
         elif f.get("branch"):
             lines.append(f"- Branch: {f['branch']}.")
+        # A queue stage works in state/queue/KEY/repo (or the owner's folder), deep
+        # in the harness install: a model hunting for the project's files or an
+        # AGENTS.md climbs into the install, and each read there is an
+        # external_directory ask.
+        wd = _vault_path(working_directory)
+        lines.append(f"- Work only in {f'`{wd}`' if wd else 'your working directory'}: the project's files are all"
+                     " in there. Outside it, use only the files named here, in the task file and under Environment;"
+                     " do not list, search or read anything else (the folders around it are not the project).")
         if f.get("done"):
             lines.append(f"- Done when: {f['done']}")
         if f.get("attempt", 1) > 1:
@@ -3520,7 +3540,7 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     `_extract_tool_details` — the "detail tools" whose description is inlined
     under the matching tool's entry.
     """
-    card = _task_card(vault, ticket, task)
+    card = _task_card(vault, ticket, task, working_directory)
     if card:
         content = _defang_card(content)
     is_tool_result = "<<<BEGIN_TOOL_RESULT" in content
@@ -3543,13 +3563,19 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         )
     else:
         cwd_clause = ""
+    stage = bool(card) and "stage" in _task_fields(task)
     if card:   # the card names the ticket's files, read when needed
         v = _vault_path(vault)
         instruction_files = [p for p in instruction_files or []
                              if not p.startswith((f"{v}/.raw/tickets/", f"{v}/wiki/notes/tickets/"))]
+        if stage and working_directory:
+            # A queue stage stays in its folder and the vault. A file outside both (the
+            # user's global AGENTS.md or ~/.claude/CLAUDE.md) is an external_directory
+            # ask on every re-read; its text is in the system message all the same.
+            instruction_files = [p for p in instruction_files if _under(p, (working_directory, v))]
     cwd_clause += _instructions_clause(instruction_files)
     if vault:
-        cwd_clause += _vault_clause(vault)
+        cwd_clause += _vault_clause(vault, stage)
     tool_entries = _format_tool_entries(tool_signatures, tool_details)
     if _REMINDER_TEMPLATE is None:
         # Lazy load so importing proxy.py (tests) needs no main() call.

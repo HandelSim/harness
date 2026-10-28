@@ -6800,7 +6800,43 @@ class TestVaultReminderLine(unittest.TestCase):
                      "- The review found 3 Must fix item(s)",
                      "`/v/wiki/notes/tickets/ABC-7-task.md`. `read` it when you need a detail"):
             self.assertIn(want, card)
+        self.assertIn("- Work only in your working directory: ", card)
         self.assertLess(len(card), 2000)
+
+    def test_a_queue_stage_stays_in_its_folder_and_the_card_files(self):
+        """A stage's folder sits deep in the harness install, and a no-tools model
+        looking for files climbed into it: the card names the folder and keeps it
+        there, and the vault line names only the card's files, no wiki search."""
+        msgs = [{"role": "system", "content": "<env>\nWorking directory: /h/state/queue/ABC-7/repo\n</env>\n"
+                 "Instructions from: /home/u/.claude/CLAUDE.md\nmine\n"
+                 "Instructions from: /h/state/queue/ABC-7/repo/AGENTS.md\nproject\n"
+                 "Instructions from: /v/AGENTS.md\nvault\n"},
+                {"role": "user", "content": "go"}]
+        stage = {"x-harness-vault": "/v", "x-harness-ticket": "ABC-7",
+                 "x-harness-task": self._task(stage="implement", where="a clone of the project made for this ticket")}
+        last = self._all_sent(stage, msgs)[-1]["content"]
+        card = last[last.index("[harness task card:"):]
+        self.assertIn("- Work only in `/h/state/queue/ABC-7/repo`: the project's files are all in there. Outside it,"
+                      " use only the files named here, in the task file and under Environment; do not list, search or read anything"
+                      " else", card)
+        self.assertIn("Knowledge vault: `/v`. In this queue stage the only vault files you need are its AGENTS.md"
+                      " and the ones the task card names; do not search the vault for others.", last)
+        self.assertNotIn("/v/wiki/index.md", last)
+        # the global rules file is outside both: a read there is an ask, and its text is in message 0
+        self.assertIn("Instruction files for this session: `/h/state/queue/ABC-7/repo/AGENTS.md`, `/v/AGENTS.md`.",
+                      last)
+        self.assertNotIn("`/home/u/.claude/CLAUDE.md`", last)
+        # a ticket outside the queue keeps the wiki lookup and every file, and gets no folder line
+        last = self._all_sent({"x-harness-vault": "/v", "x-harness-ticket": "ABC-7"}, msgs)[-1]["content"]
+        self.assertIn("`/v/wiki/index.md`", last)
+        self.assertIn("`/home/u/.claude/CLAUDE.md`", last)
+        self.assertNotIn("Work only in", last)
+
+    def test_under_compares_windows_spellings_alike(self):
+        self.assertTrue(proxy._under("C:/Users/u/h/state/vaults/w/AGENTS.md", ["c:\\Users\\U\\h\\state\\vaults\\w"]))
+        self.assertTrue(proxy._under("/w/repo", ["/w/repo/"]))
+        self.assertFalse(proxy._under("/w/repo2/AGENTS.md", ["/w/repo"]))
+        self.assertFalse(proxy._under("/etc/x", ["/", ""]))
 
     def test_card_fields_are_one_capped_line_and_bad_headers_give_the_bare_card(self):
         f = proxy._task_fields(self._task(title="a\n\nb " + "x" * 300, stage=["plan"], attempt=True, must_fix=5000,
