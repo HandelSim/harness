@@ -2281,8 +2281,12 @@ _REMINDER_TOKEN_CWD = "{{CWD}}"
 _REMINDER_TOKEN_TOOL_ENTRIES = "{{TOOL_ENTRIES}}"
 _REMINDER_TOKEN_ENVIRONMENT = "{{ENVIRONMENT}}"
 _REMINDER_TOKEN_TODOS = "{{TODOS}}"
+# Optional, and not in the shipped default: a queue stage's own lines (the
+# task header's `do`). With the token in the file they render there, one
+# "- line" each, and leave the task card; with no token they stay in the card.
+_REMINDER_TOKEN_INSTRUCTIONS = "{{INSTRUCTIONS}}"
 
-# Matches exactly the five tokens above and nothing else, so an unknown
+# Matches exactly the six tokens above and nothing else, so an unknown
 # {{...}} in a user-edited reminder.md stays literal, as it always has.
 _REMINDER_TOKEN_RE = re.compile(
     "|".join(
@@ -2293,9 +2297,16 @@ _REMINDER_TOKEN_RE = re.compile(
             _REMINDER_TOKEN_TOOL_ENTRIES,
             _REMINDER_TOKEN_ENVIRONMENT,
             _REMINDER_TOKEN_TODOS,
+            _REMINDER_TOKEN_INSTRUCTIONS,
         )
     )
 )
+
+# A line holding only {{INSTRUCTIONS}} (a "- " before it allowed): it becomes
+# the bare token when there are lines, and goes when there are none, so no
+# empty line and no "- - " bullet is left behind.
+_REMINDER_INSTRUCTIONS_LINE_RE = re.compile(
+    r"[ \t]*(?:-[ \t]*)?" + re.escape(_REMINDER_TOKEN_INSTRUCTIONS) + r"[ \t]*")
 
 # Only a comment block at the very TOP of the file is stripped (that is where
 # the file documents its own tokens). Anchored at \A so a `<!--` appearing in
@@ -3382,7 +3393,8 @@ def _vault_clause(vault, queue_stage=False):
 # (`harness --ticket KEY`, with a vault) gives the card; `x-harness-task`
 # (base64 JSON, from harness) fills it: the ticket's title, and for a queue
 # stage the stage, attempt, where it works, branch, when it is done and the
-# number of Must fix items, in the queue's words. Harness writes every field
+# number of Must fix items, in the queue's words, plus the stage's own lines
+# (`do`, at most 8 of 240 characters, 1000 in all). Harness writes every field
 # but the title, which is the ticket's and is quoted as data. Each field is one
 # line with a cap, so the card stays near 1k characters. The full text stays in
 # files the card names, read when a detail is needed: a "read it when you
@@ -3390,6 +3402,7 @@ def _vault_clause(vault, queue_stage=False):
 _TASK_HEADER = "x-harness-task"
 _CARD_MARK = "[harness task card"
 _CARD_FIELDS = {"title": 120, "stage": 20, "branch": 100, "where": 300, "done": 500}
+_CARD_DO_LINES, _CARD_DO_LINE, _CARD_DO_TOTAL = 8, 240, 1000
 
 
 def _task_fields(raw):
@@ -3414,7 +3427,26 @@ def _task_fields(raw):
         v = obj.get(k)
         if isinstance(v, int) and not isinstance(v, bool) and 0 < v < 1000:
             out[k] = v
+    do, total = [], 0
+    for v in obj.get("do") if isinstance(obj.get("do"), list) else ():
+        if isinstance(v, str):
+            v = _defang_card(" ".join(v.split()))[:_CARD_DO_LINE].strip()
+            if not v:
+                continue
+            if len(do) == _CARD_DO_LINES or total + len(v) > _CARD_DO_TOTAL:
+                break
+            do.append(v)
+            total += len(v)
+    if do:
+        out["do"] = do
     return out
+
+
+def _do_bullets(fields):
+    """A queue stage's own lines (`do`), one "- line" each; none outside a stage."""
+    if "stage" not in fields:
+        return []
+    return [v if v.startswith("- ") else f"- {v}" for v in fields.get("do", ())]
 
 
 def _defang_card(text):
@@ -3431,7 +3463,7 @@ def _under(path, roots):
     return any(r and (p == r or p.startswith(r + "/")) for r in map(norm, roots))
 
 
-def _task_card(vault, ticket, task=None, working_directory=None):
+def _task_card(vault, ticket, task=None, working_directory=None, do_in_card=True):
     v, t = _vault_path(vault), str(ticket or "").strip()
     if not v or len(t) > 40 or not _TICKET_RE.match(t):
         return ""
@@ -3458,6 +3490,8 @@ def _task_card(vault, ticket, task=None, working_directory=None):
                      " do not list, search or read anything else (the folders around it are not the project).")
         if f.get("done"):
             lines.append(f"- Done when: {f['done']}")
+        if do_in_card:   # else the reminder's {{INSTRUCTIONS}} carries them
+            lines += _do_bullets(f)
         if f.get("attempt", 1) > 1:
             lines.append("- The last attempt failed its checks; what was wrong is in the task file.")
         if f.get("must_fix"):
@@ -3514,10 +3548,10 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
 
     The bullets' PROSE is not here: it is user-owned data, loaded from
     `<install root>/reminder.md` by `_setup_reminder_template`. This function only
-    substitutes the five tokens the file documents — `{{HOST_OS}}`,
-    `{{CWD}}`, `{{ENVIRONMENT}}`, `{{TODOS}}`, `{{TOOL_ENTRIES}}` — into it,
-    in ONE pass, so a token appearing inside a substituted value (a todo item
-    the model wrote, say) stays literal. Read the shipped default at
+    substitutes the six tokens the file documents — `{{HOST_OS}}`,
+    `{{CWD}}`, `{{ENVIRONMENT}}`, `{{TODOS}}`, `{{TOOL_ENTRIES}}`, the
+    optional `{{INSTRUCTIONS}}` — into it, in ONE pass, so a token appearing
+    inside a substituted value (a todo item the model wrote, say) stays literal. Read the shipped default at
     `proxy/reminder.md` for the wording and why each rule is there (the
     "Act, don't describe" bullet's "you act through opencode, calls really execute" is
     issue #109's anchor against the upstream's "I can't execute, here are
@@ -3540,7 +3574,12 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     `_extract_tool_details` — the "detail tools" whose description is inlined
     under the matching tool's entry.
     """
-    card = _task_card(vault, ticket, task, working_directory)
+    if _REMINDER_TEMPLATE is None:
+        # Lazy load so importing proxy.py (tests) needs no main() call.
+        _setup_reminder_template()
+    template = _REMINDER_TEMPLATE or ""
+    do_in_card = _REMINDER_TOKEN_INSTRUCTIONS not in template
+    card = _task_card(vault, ticket, task, working_directory, do_in_card)
     if card:
         content = _defang_card(content)
     is_tool_result = "<<<BEGIN_TOOL_RESULT" in content
@@ -3563,7 +3602,8 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         )
     else:
         cwd_clause = ""
-    stage = bool(card) and "stage" in _task_fields(task)
+    fields = _task_fields(task) if card else {}
+    stage = "stage" in fields
     if card:   # the card names the ticket's files, read when needed
         v = _vault_path(vault)
         instruction_files = [p for p in instruction_files or []
@@ -3577,10 +3617,13 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
     if vault:
         cwd_clause += _vault_clause(vault, stage)
     tool_entries = _format_tool_entries(tool_signatures, tool_details)
-    if _REMINDER_TEMPLATE is None:
-        # Lazy load so importing proxy.py (tests) needs no main() call.
-        _setup_reminder_template()
-    # One pass, not five chained .replace() calls. Chaining rescans each
+    instructions = "" if do_in_card else "\n".join(_do_bullets(fields))
+    if not do_in_card:
+        template = "\n".join(
+            _REMINDER_TOKEN_INSTRUCTIONS if _REMINDER_INSTRUCTIONS_LINE_RE.fullmatch(line) else line
+            for line in template.split("\n")
+            if instructions or not _REMINDER_INSTRUCTIONS_LINE_RE.fullmatch(line))
+    # One pass, not six chained .replace() calls. Chaining rescans each
     # substituted value for the tokens that have not run yet, and two of the
     # values carry text the proxy does not author: the todo list is written by
     # the model, and {{CWD}} comes from the inbound <env> block. A todo item
@@ -3597,9 +3640,10 @@ def build_cooperative_prompt_hybrid_reminder(content, tool_signatures, tool_deta
         _REMINDER_TOKEN_ENVIRONMENT: _format_environment_clause(),
         _REMINDER_TOKEN_TODOS: _format_todos_block(todos),
         _REMINDER_TOKEN_TOOL_ENTRIES: tool_entries,
+        _REMINDER_TOKEN_INSTRUCTIONS: instructions,
     }
     reminder = _REMINDER_TOKEN_RE.sub(
-        lambda m: expansions[m.group(0)], _REMINDER_TEMPLATE or ""
+        lambda m: expansions[m.group(0)], template
     )
     return f"{wrapped}\n\n{reminder}" + (f"\n\n{card}" if card else "")
 

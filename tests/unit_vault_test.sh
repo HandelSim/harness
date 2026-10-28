@@ -631,7 +631,7 @@ out=$(tk tok123 ABC-7) || fail "V15: vault_ticket.py failed — $out"
 [[ "$out" == "ABC-7 (To Do): Report sets while the task runs [new]" ]] || fail "V15: status line — $out"
 [[ -f "$SNAP" && -f "$NOTE" ]] || fail "V15: the copy and the state note should be written"
 for want in '^ticket: ABC-7$' '^status: "\?To Do"\?$' '^> This is the ticket as people wrote it' '^- Priority: High$' \
-        '^## Acceptance Criteria$' '^THEN sets are reported$' '^## Story Points$' '^8$' '^Sprint 5$' '^## Team$' '^Blue$' \
+        '^## Acceptance criteria$' '^- THEN sets are reported$' '^## Story Points$' '^8$' '^Sprint 5$' '^## Team$' '^Blue$' \
         '^- subtask ABC-8 (Done): the sub part$' '^## Comments (the last 10 of 12)$' '^comment 11$'; do
     grep -q -- "$want" "$SNAP" || fail "V15: the copy lacks /$want/ — $(cat "$SNAP")"
 done
@@ -688,7 +688,60 @@ _charter_set "$TV" tracker_url "https://jira.example.com" || fail "V15: _charter
 [[ "$(_charter_value "$TV" tracker_url)" == "https://jira.example.com" && "$(sed -n 1p "$TV/wiki/overview.md")" == "---" ]] \
     || fail "V15: _charter_set should add a missing key in the front matter — $(cat "$TV/wiki/overview.md")"
 mv "$TMP_ROOT/charter.bak" "$TV/wiki/overview.md"; rm -f "$TV/wiki/overview.md.bak"
-ok "V15: vault_ticket.py writes a labelled, redacted copy and a state note, falls back to the copy, sends the token only to an https (or local) tracker_url and follows no redirect"
+# The acceptance criteria field: TRACKER_AC_FIELDS (environment), else the
+# charter's tracker_ac_fields, names the fields instead of the display-name
+# match; the named field goes under the heading, not under its own.
+out=$(TRACKER_AC_FIELDS=Team tk tok123 ABC-7)
+[[ "$out" == *"[updated]" ]] || fail "V15: TRACKER_AC_FIELDS=Team should change the copy — $out"
+sed -n '/^## Acceptance criteria$/,/^## /p' "$SNAP" | grep -q '^- Blue$' && ! grep -q '^## Team$\|THEN sets' "$SNAP" \
+    || fail "V15: TRACKER_AC_FIELDS=Team should put Team, alone, under the criteria — $(cat "$SNAP")"
+cp "$TV/wiki/overview.md" "$TMP_ROOT/charter.bak"
+printf "tracker_ac_fields: 'customfield_10500'\n" > "$TMP_ROOT/acline"
+sed -i.bak "/^tracker_fields:/r $TMP_ROOT/acline" "$TV/wiki/overview.md"
+tk tok123 ABC-7 >/dev/null
+sed -n '/^## Acceptance criteria$/,/^## /p' "$SNAP" | grep -q '^- Blue$' \
+    || fail "V15: the charter's tracker_ac_fields should name the criteria field — $(cat "$SNAP")"
+TRACKER_AC_FIELDS=customfield_10400 tk tok123 ABC-7 >/dev/null
+grep -q '^- THEN sets are reported$' "$SNAP" && grep -q '^## Team$' "$SNAP" \
+    || fail "V15: TRACKER_AC_FIELDS should win over the charter — $(cat "$SNAP")"
+mv "$TMP_ROOT/charter.bak" "$TV/wiki/overview.md"; rm -f "$TV/wiki/overview.md.bak"
+tk tok123 ABC-7 >/dev/null
+# render() on the field's shapes, read back with the queue's ticket_criteria.
+$PY - "$REPO_ROOT/scripts" <<'PYEOF' || fail "V15: the acceptance criteria field shapes (above)"
+import sys
+sys.path.insert(0, sys.argv[1])
+from vault_ticket import render
+from ticket_queue import ticket_criteria
+names = {"customfield_1": "Acceptance criteria", "customfield_2": "AC", "customfield_3": "Team"}
+para = lambda t: {"type": "paragraph", "content": [{"type": "text", "text": t}]}
+item = lambda *c: {"type": "listItem", "content": list(c)}
+adf = {"type": "doc", "version": 1, "content": [para("Scenarios:"), {"type": "bulletList", "content": [
+    item(para("a user logs in")), item(para("a bad password"), {"type": "orderedList", "content": [item(para("shows an error"))]})]}]}
+def crit(fields, ac=(), desc="Do it."):
+    text = render("A-1", "https://j", {"names": names, "fields": dict(fields, summary="s", description=desc)}, [], ac)
+    return text, ticket_criteria(text)
+bad = []
+def want(what, got, exp):
+    if got != exp:
+        bad.append(f"{what}: got {got!r}, want {exp!r}")
+want("ADF", crit({"customfield_1": adf})[1], ["a user logs in", "a bad password", "shows an error"])
+want("wiki", crit({"customfield_1": "h3. Login\n# Given a user\n## When the password is wrong\n* Then it says so"})[1],
+     ["Given a user", "When the password is wrong", "Then it says so"])
+want("plain text", crit({"customfield_1": "Users can log in\n\nErrors are shown"})[1], ["Users can log in", "Errors are shown"])
+want("checklist", crit({"customfield_1": [{"name": "one", "checked": True}, "two", 3, None]})[1], ["one", "two"])
+want("override", crit({"customfield_1": "* auto", "customfield_2": "* the AC field"}, ["AC"])[1], ["the AC field"])
+want("AC alone is not matched", crit({"customfield_2": "* x"})[1], [])
+base = crit({"customfield_3": "Blue"})[0]
+want("no field", "Acceptance" in base, False)
+for v in (None, "", " \n", {"type": "doc", "content": []}, 12, {"odd": 1}):
+    want(f"empty or unknown {v!r}", crit({"customfield_1": v, "customfield_3": "Blue"})[0], base)
+d = "Acceptance criteria:\n* x\n* y"
+want("already in the description", crit({"customfield_1": "* x\n* y"}, desc=d)[0].count("cceptance criteria"), 1)
+want("described, no heading", crit({"customfield_1": "* x\n* y"}, desc="* x\n* y")[1], ["x", "y"])
+print("\n".join(bad), file=sys.stderr)
+sys.exit(1 if bad else 0)
+PYEOF
+ok "V15: vault_ticket.py writes a labelled, redacted copy (the acceptance criteria field as bullets) and a state note, falls back to the copy, sends the token only to an https (or local) tracker_url and follows no redirect"
 
 # --- V16: --ticket, the folder's ticket, the launch's instruction files ------
 PROJ2="$TMP_ROOT/proj2"

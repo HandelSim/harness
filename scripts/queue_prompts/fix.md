@@ -29,7 +29,7 @@ Your working directory is {{WHERE}}. {{LAYOUT}} The change so far is {{CHANGE_SO
 What to do:
 1. For each Must fix item, read the code it names and fix it. If an item is wrong (the code is already right), leave the code and say in the commit message, for that item, why it is wrong, naming the lines that show it.
 2. Keep every acceptance criterion of the plan (with no plan, what the ticket asks for) met. Change nothing else.
-3. Run the project's existing quick checks if there are any; do not install anything.
+3. Make sure it still builds: run the project's build, compile or lint command, or with none a syntax check of each file you changed (bash -n, python -m py_compile, node --check); fix what you broke. Do not write or run tests in this stage, and do not install anything.
 4. {{FIX_COMMIT_STEP}} Never commit secrets, and do not change anything under .github/.
 
 Rules:

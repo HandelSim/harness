@@ -1,0 +1,29 @@
+{
+  "_README": [
+    "The lines a queue stage's agent sees on its task card at the end of every turn (the proxy's cooperative",
+    "route), under 'Done when'. Keep them few and short: the proxy keeps at most 8 lines, 240 characters each,",
+    "1000 in all. {KEY} is the ticket's key. Keys starting with _ are not read. A reminder.md with an",
+    "{{INSTRUCTIONS}} line gets them there instead of on the card."
+  ],
+  "plan": [
+    "This stage: PLAN. Change no code; run no build or test. Read the code the ticket touches, then write the plan file in the card's shape.",
+    "Each criterion is ONE line: - ACn: GIVEN .. WHEN .. THEN .. ending (ticket: \"exact words\") or (edge of ACn); cover every edge case of each one.",
+    "Every decision the ticket and the code leave open is a Question with Options and a Default, not a guess.",
+    "Then the self-check: read back each file and function your Steps name, fix the plan, write it again. Not done before that."
+  ],
+  "implement": [
+    "This stage: IMPLEMENT the plan's Steps, one todo item each (file, function, its ACs, edge cases included).",
+    "Do NOT write or run tests in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
+    "Run it, read the output, fix what you broke. Finish only when the card's Done line holds and the build is clean."
+  ],
+  "review": [
+    "This stage: REVIEW. Change no code, commit nothing, write or run no tests.",
+    "One todo item per AC of the plan, edge cases included: find the lines that meet it (path:line); one no code meets is a Must fix item.",
+    "Then check correctness, security, scope, simplicity, write the review file in the card's shape, and finish."
+  ],
+  "fix": [
+    "This stage: FIX the Must fix items only, one todo item each (path:line and the fix); change nothing else.",
+    "Do NOT write or run tests in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
+    "Finish only when the card's Done line holds and the build is clean."
+  ]
+}

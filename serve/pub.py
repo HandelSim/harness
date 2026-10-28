@@ -60,6 +60,10 @@ INDEX_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; 
 RUNS_CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; connect-src 'self'; "
             "img-src 'self'; form-action 'self'; frame-ancestors 'none'")
 MAX_SEND_FORM = 3 * runs_view.MAX_MESSAGE + 1024   # urlencoded, so up to 3 bytes a byte
+# A ticket's forms: the plan feedback form has a verdict and a comment per criterion and
+# question (60 and 12, comments of 1000 characters) and a 4000-character note
+MAX_TICKET_FORM = 256 * 1024
+TICKET_FIELDS = 200
 TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1321,7 +1325,7 @@ def make_handler(cfg):
                 self.send(404, b"not found\n")
                 return
             try:
-                form = self.read_form(MAX_SEND_FORM)
+                form = self.read_form(MAX_TICKET_FORM, fields=TICKET_FIELDS)
             except ValueError:
                 form = None
             if form is None:

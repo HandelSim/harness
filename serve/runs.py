@@ -26,7 +26,9 @@ control room: its runner, its tickets, and every action harness queue has.
   /runs/<session>/part/<id>   one tool call's full output, as text
   /runs/ticket/<KEY>          a queue ticket: status, stage strip, every action its
                               status allows, owner notes, the plan's questions (with
-                              a form to answer them), every session run for it,
+                              a form to answer them; a card per question and per
+                              acceptance criterion when the queue read them from the
+                              plan), every session run for it,
                               each attempt and why it failed, plan/review/answers,
                               log.md and stage outputs
   /runs/ticket/<KEY>/live     the ticket page's live regions, as JSON (polled)
@@ -79,6 +81,11 @@ ADD_NOTE_MAX = 4000      # the note given with add (it goes on a command line)
 NO_WINDOW = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
 MAX_KEYS = 50
 FORM_QUESTIONS = 6       # questions with their own answer box (the form has at most 20 fields)
+MAX_CRITERIA = 60        # a plan's acceptance criteria the page shows, each a card on the feedback form
+MAX_QUESTIONS = 12       # and its questions
+ITEM_MAX = 2000          # characters of a criterion's or question's text kept from state.json
+COMMENT_MAX = 1000       # characters of one comment or answer on the plan feedback form
+ITEM_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,15}$")   # AC3, Q1: a form field's name carries it
 REPO_ROWS = 50           # repositories the Add form's tree lists, the project's own first
 REPO_REFS = 200          # branch names of one repository offered as its target
 REPO_BUDGET = 30         # s all of the tree's git calls may take
@@ -356,6 +363,20 @@ pre.io { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mo
 .qs .q { font-weight: 550; overflow-wrap: anywhere; }
 .qs .q.blocking::before { content: "blocking"; color: var(--wait); background: var(--wait-soft); font-size: 11px;
   font-weight: 700; padding: 1px 6px; border-radius: 4px; margin-right: 8px; vertical-align: 1px; }
+/* the plan feedback form: a card per question and per acceptance criterion, an edge case under its own */
+.qs h3 { font-size: 14px; margin: 6px 0 0; }
+.fb { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; display: flex; flex-direction: column;
+  gap: 8px; min-width: 0; }
+.fb.edge { margin-left: 18px; border-style: dashed; }
+.fb:has(input[value=reject]:checked) { border-color: var(--bad); background: var(--bad-soft); }
+.fb .src { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.fb .gwt { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 10px; margin: 0; font-size: 14px; }
+.fb .gwt dt { font: 700 11px/1.9 var(--mono); color: var(--muted); text-transform: uppercase; }
+.fb .gwt dd { margin: 0; overflow-wrap: anywhere; }
+.qs .pick { display: flex; flex-direction: column; gap: 4px; }
+.qs .pick.row { flex-direction: row; flex-wrap: wrap; gap: 4px 18px; }
+.qs .pick label { flex-direction: row; align-items: flex-start; gap: 8px; font-size: 14px; overflow-wrap: anywhere; }
+.qs .pick input { accent-color: var(--accent); margin: 3px 0 0; flex: none; }
 .acts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .acts form { margin: 0; display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; max-width: 100%; }
 .acts label { display: inline-flex; gap: 6px; align-items: center; }
@@ -461,6 +482,26 @@ def _cap(text, limit=TEXT_CAP):
     if len(text) <= limit:
         return text, False
     return text[:limit], True
+
+
+def _s(v, limit=ITEM_MAX):
+    """A string from state.json, capped; "" for anything else."""
+    return v[:limit] if isinstance(v, str) else ""
+
+
+def _items(raw, kind, limit):
+    """[(id, item)] of a plan's criteria (kind AC) or questions (Q) in state.json:
+    dicts with a text, each with its id (AC<n> by its place when it has none or
+    one a field name cannot carry), the first of a repeated id only, at most limit."""
+    out, seen = [], set()
+    for n, x in enumerate(raw if isinstance(raw, list) else [], 1):
+        if not isinstance(x, dict) or not isinstance(x.get("text"), str):
+            continue
+        i = x.get("id") if isinstance(x.get("id"), str) and ITEM_ID_RE.match(x["id"]) else f"{kind}{n}"
+        if i not in seen:
+            seen.add(i)
+            out.append((i, x))
+    return out[:limit]
 
 
 def _model_name(raw):
@@ -710,9 +751,18 @@ class Runs:
             pass
         out["notes"] = [{"at": str(n.get("at", "")), "text": n["text"]} for n in
                         (notes if isinstance(notes, list) else []) if isinstance(n, dict) and isinstance(n.get("text"), str)]
-        qs = st.get("questions")
-        out["questions"] = [{"text": q["text"], "blocking": bool(q.get("blocking"))} for q in
-                            (qs if isinstance(qs, list) else []) if isinstance(q, dict) and isinstance(q.get("text"), str)]
+        # the plan's items: an older state's questions have a text and blocking only
+        out["criteria"] = [{"id": i, "text": _s(c["text"]), **{k: _s(c.get(k)) for k in ("given", "when", "then", "source")},
+                            "edge": c.get("edge") is True or _s(c.get("source")).lower().startswith("edge")}
+                           for i, c in _items(st.get("criteria"), "AC", MAX_CRITERIA)]
+        out["questions"] = [{"id": i, "text": _s(q["text"]), "ask": _s(q.get("ask")).strip() or _s(q["text"]),
+                             "blocking": bool(q.get("blocking")), "default": _s(q.get("default")).strip(),
+                             "options": [_s(o, 500) for o in q["options"] if isinstance(o, str) and o.strip()][:8]
+                             if isinstance(q.get("options"), list) else []}
+                            for i, q in _items(st.get("questions"), "Q", MAX_QUESTIONS)]
+        sig = st.get("plan_sig")
+        out["plan_sig"] = sig if isinstance(sig, str) and re.match(r"^[0-9a-f]{4,64}$", sig) else ""
+        out["take_defaults"] = st.get("take_defaults") is True
         hist = st.get("history")
         out["history"] = [{"at": str(h.get("at", "")), "stage": str(h.get("stage", "")),
                            "attempt": h["attempt"] if isinstance(h.get("attempt"), int) else 0,
@@ -1660,7 +1710,10 @@ AFTER_PLAN_CHOICES = (
      "built until you approve."),
     ("go", "Go straight on to implementing", "",
      "Implementing starts as soon as the plan is written. A plan with questions only you can answer still "
-     "stops and waits for your answers."))
+     "stops and waits for your answers."),
+    ("defaults", "Go on with the defaults", "",
+     "Implementing starts as soon as the plan is written, each of its questions taking its default. Only a "
+     "question the planner gave no default stops it."))
 
 
 def _choice(legend, name, value, choices):
@@ -1669,7 +1722,8 @@ def _choice(legend, name, value, choices):
     cards = "".join(f"<label><input type='radio' name='{name}' value='{c}'{' checked' if c == value else ''}>"
                     f"{esc(lab)}{f' <span class=muted>({esc(tag)})</span>' if tag else ''}<small>{esc(hint)}</small>"
                     "</label>" for c, lab, tag, hint in choices)
-    return (f"<fieldset id='f-{name}'><legend>{esc(legend)}</legend><div class='presets two'>{cards}</div>"
+    cols = "two" if len(choices) == 2 else "three"
+    return (f"<fieldset id='f-{name}'><legend>{esc(legend)}</legend><div class='presets {cols}'>{cards}</div>"
             "<div class='why' hidden></div></fieldset>")
 
 
@@ -1820,6 +1874,85 @@ def _answer_form(key, qs, review=False):
     return "".join(parts)
 
 
+def _default_pick(q):
+    """The option a question's default names ("(b), because ..." -> 1; or one
+    the default starts with), or None."""
+    d, opts = q.get("default", ""), q.get("options") or []
+    m = re.match(r"\s*\(?([a-h])\)", d, re.I)
+    if m and ord(m.group(1).lower()) - 97 < len(opts):
+        return ord(m.group(1).lower()) - 97
+    low = d.lower()
+    return next((n for n, o in enumerate(opts) if o.strip() and low.startswith(o.strip().lower())), None)
+
+
+def _source(src):
+    """(tag, line) a criterion card shows for where it comes from: the criterion
+    it is an edge case of, the ticket's own words, or the source as written."""
+    m = re.match(r"(?i)edge(?:[- ]case)?\b\W*(?:of\s+)?(.*)$", src)
+    if m:
+        return f" <span class='tag'>edge case{' of ' + esc(m.group(1)) if m.group(1) else ''}</span>", ""
+    m = re.match(r"(?i)(?:from the )?ticket\b\s*:?\s*(.*)$", src, re.S)
+    if m:
+        words = m.group(1).strip().strip("\"'“”")
+        return "", f"<div class='src'>from the ticket{': &ldquo;' + esc(words) + '&rdquo;' if words else ''}</div>"
+    return "", f"<div class='src'>{esc(src)}</div>" if src else ""
+
+
+def _criterion_card(c):
+    i = esc(c["id"])
+    tag, src = _source(c["source"])
+    if c["given"] or c["when"] or c["then"]:
+        body = "<dl class='gwt'>" + "".join(f"<dt>{w}</dt><dd>{esc(c[w.lower()])}</dd>"
+                                            for w in ("Given", "When", "Then")) + "</dl>"
+    else:   # not written as GIVEN ... WHEN ... THEN (an older plan): as it is
+        body = f"<div class='txt'>{esc(c['text'])}</div>"
+    pick = "".join(f"<label><input type='radio' name='ac.{i}' value='{v}'{' checked' if v == 'accept' else ''}>"
+                   f"{lab}</label>" for v, lab in (("accept", "Accept"), ("reject", "Reject")))
+    return (f"<div class='fb{' edge' if c['edge'] else ''}'><div class='q'>{i}{tag}</div>{src}{body}"
+            f"<div class='pick row'>{pick}</div><input name='acc.{i}' maxlength='{COMMENT_MAX}' "
+            f"aria-label='comment on {i}' placeholder='Comment (optional): what should change'></div>")
+
+
+def _question_card(q):
+    i = esc(q["id"])
+    head = f"<div class='{'q blocking' if q['blocking'] else 'q'}'>{i} {esc(q['ask'])}</div>"
+    head += f"<div class='src'>Default: {esc(q['default'])}</div>" if q["default"] else ""
+    if not q["options"]:
+        return (f"<div class='fb'>{head}<textarea name='qt.{i}' maxlength='{COMMENT_MAX}' aria-label='answer to {i}' "
+                "placeholder='Your answer (leave empty to go with its default)'></textarea></div>")
+    pick = _default_pick(q)
+    opts = [(str(n), f"({chr(97 + n)}) {esc(o)}", n == pick) for n, o in enumerate(q["options"])]
+    if pick is None:   # the default is none of the options: its own choice, and the one taken
+        opts.append(("", "No pick: go with its default", True))
+    radios = "".join(f"<label><input type='radio' name='q.{i}' value='{v}'{' checked' if on else ''}>"
+                     f"<span>{lab}</span></label>" for v, lab, on in opts)
+    return (f"<div class='fb'>{head}<div class='pick'>{radios}</div><input name='qt.{i}' maxlength='{COMMENT_MAX}' "
+            f"aria-label='other answer or comment on {i}' placeholder='Other / comment (optional)'></div>")
+
+
+def _feedback_form(key, st):
+    """The plan's questions, then its acceptance criteria, each a card: an option
+    to pick, accept or reject, a comment. sig is the plan they were read from, so
+    an answer to a plan made again since is refused (ticket_action)."""
+    review = st.get("status") == "plan-review"
+    base = f"/runs/ticket/{quote(key)}/"
+    parts = [f"<form method='post' action='{base}answer' class='qs'>", _hidden("sig", st.get("plan_sig", ""))]
+    if st["questions"]:   # first: they decide what gets built
+        parts.append("<h3>Questions</h3>" + "".join(_question_card(q) for q in st["questions"]))
+    parts.append("<h3>Acceptance criteria</h3>" + "".join(_criterion_card(c) for c in st["criteria"]))
+    parts.append(f"<label><div class='q'>Other notes</div><textarea name='note' maxlength='{NOTE_MAX}'></textarea>"
+                 "</label>")
+    if review:   # the same form: approve refuses what it would drop (a rejection, a comment, an answer)
+        other = (f"<button type='submit' formaction='{base}approve' title='implementing starts when the queue run "
+                 "gets to this ticket'>Approve the plan</button>")
+    else:
+        other = ("<button type='submit' name='defaults' value='1' title='The plan is made again with the defaults "
+                 "and the ticket goes on to implement without coming back to you'>Go with the defaults</button>")
+    parts.append(f"<div class='acts'><button type='submit' class='primary'>Send and plan again</button>{other}</div>"
+                 "</form>")
+    return "".join(parts)
+
+
 def _t_head(runs, key, st, pos, n):
     status = st.get("status", "")
     facts = []
@@ -1832,7 +1965,8 @@ def _t_head(runs, key, st, pos, n):
     facts.append(f"<span>branch <b>{esc(st.get('branch') or key)}</b></span>")
     facts.append("<span>works <b>" + ("in your project folder" if st.get("in_place") else "in a separate copy")
                  + "</b></span>")
-    facts.append("<span>after the plan <b>" + ("waits for your approval" if st.get("plan_review")
+    facts.append("<span>after the plan <b>" + ("takes each question's default and goes on" if st.get("take_defaults")
+                                               else "waits for your approval" if st.get("plan_review")
                                                else "goes straight on") + "</b></span>")
     if st.get("sha"):
         facts.append(f"<span>commit <b>{esc(st['sha'][:12])}</b></span>")
@@ -1897,7 +2031,8 @@ def _t_acts(runs, key, st, rows, live, pos, n):
         r = max(now_live, key=lambda r: _ms(r["time_created"]))
         parts.append(f"<a class='btn primary' href='/runs/{quote(r['id'])}'>Watch and message the agent &rarr;</a>")
     if status == "plan-review":
-        parts.append(_btn(base + "approve", "Approve the plan", "primary",
+        parts.append(_btn(base + "approve", "Approve the plan", "primary",   # sig: the plan this page shows
+                          (("sig", st["plan_sig"]),) if st.get("plan_sig") else (),
                           title="implementing starts when the queue run gets to this ticket"))
     if _stuck(st):
         parts.append(_end_btn())
@@ -1997,17 +2132,19 @@ def _t_questions(runs, key, st):
         head = "Approve the plan, or send feedback" if review else "Questions for you" if qs else "Answer the planner"
         again = (" The planner revises the plan with them and it comes back here: nothing is built until "
                  "you approve it.")
+        items = bool(st.get("criteria")) and status in ("needs-answers", "plan-review")   # a card per item
         intro = ("Approve the plan to start building, or answer and give feedback here." + again if review
-                 else "The plan is waiting on the blocking questions. Answer what you can; an empty box takes "
-                 "the question's default." + again + " Go with the defaults instead: the plan is made "
-                 "with every default and implementing starts without it coming back to you.")
+                 else "The plan is waiting on the blocking questions. Answer what you can; " +
+                 ("a question left on its default goes with it." if items else
+                  "an empty box takes the question's default.") + again + " Go with the defaults instead: the "
+                 "plan is made with every default and implementing starts without it coming back to you.")
         plan = runs.note(key, "plan", vault)
         if plan.strip():   # what is to be approved or answered, where it is decided
             plan = (f"<details class='doc' data-k='qplan' open><summary>The plan<span class='muted'>"
                     f"{len(plan.splitlines())} lines</span></summary><pre class='qlog'>{esc(_cap(plan)[0])}</pre>"
                     "</details>")
         return (f"<section class='panel'><h2>{head}</h2><div class='muted'>{intro}</div>"
-                f"{plan}{_answer_form(key, qs, review)}</section>")
+                f"{plan}{_feedback_form(key, st) if items else _answer_form(key, qs, review)}</section>")
     if qs:
         items = "".join(f"<li><div class='{'q blocking' if q.get('blocking') else 'q'}'>{esc(q['text'])}</div>"
                         f"<div class='muted'>{'waiting on you' if q.get('blocking') else 'going with the default'}"
@@ -2166,6 +2303,8 @@ def render_ticket(runs, key, msg="", bad=False):
 
 TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note")
 QUEUE_ACTIONS = ("add", "start", "halt", "end")
+# an answer or approve from a page that showed another plan (its sig): the plan was made again since
+CHANGED = "The plan changed since this page was loaded: reload it and answer again."
 
 
 def _one(form, name):
@@ -2188,6 +2327,64 @@ def answer_text(form):
         return ""
     out.append("Any question not answered here: go with its default.")
     return "\n\n".join(out)
+
+
+def _per_item(form):
+    """True for the plan feedback form (a field per criterion and question)."""
+    return any(k.startswith(("ac.", "acc.", "q.", "qt.")) for k in form)
+
+
+def plan_feedback(form, st):
+    """The plan feedback form read against the state's own items (any other name
+    is ignored): {"rejected": [(criterion, comment)], "changed": [(criterion,
+    comment)], "accepted": [ids], "answers": [(question, option or None, text)],
+    "note": str}; or why not, a string. The option the default names, with no
+    comment, is no answer: the defaults line says the same."""
+    def one(name):
+        return _one(form, name).replace("\r\n", "\n").strip()
+    fb = {"rejected": [], "changed": [], "accepted": [], "answers": [], "note": one("note")}
+    if len(fb["note"]) > NOTE_MAX:
+        return f"the notes are over {NOTE_MAX} characters"
+    for c in st.get("criteria") or []:
+        why = one("acc." + c["id"])
+        if len(why) > COMMENT_MAX:
+            return f"the comment on {c['id']} is over {COMMENT_MAX} characters"
+        if one("ac." + c["id"]) == "reject":
+            fb["rejected"].append((c, why))
+        elif why:   # accepted, with a change asked for
+            fb["changed"].append((c, why))
+        else:
+            fb["accepted"].append(c["id"])
+    for q in st.get("questions") or []:
+        text, pick = one("qt." + q["id"]), one("q." + q["id"])
+        if len(text) > COMMENT_MAX:
+            return f"the answer to {q['id']} is over {COMMENT_MAX} characters"
+        pick = int(pick) if re.match(r"^[0-7]$", pick) and int(pick) < len(q["options"]) else None
+        if pick is not None and pick == _default_pick(q) and not text:
+            pick = None
+        if pick is not None or text:
+            fb["answers"].append((q, pick, text))
+    return fb
+
+
+def feedback_text(fb, sig):
+    """The answers note from the plan feedback form, a line per item (the planner's
+    prompt reads this format; the ids stay the same from round to round)."""
+    def line(t):
+        return " ".join(t.split())
+    out = [f"Feedback on the plan (round of {sig}):" if sig else "Feedback on the plan:"]
+    out += [f"- {c['id']}: rejected - {line(why) or 'no reason given'} (it read: \"{line(c['text'])[:160]}\")"
+            for c, why in fb["rejected"]]
+    out += [f"- {c['id']}: {line(why)} (it read: \"{line(c['text'])[:160]}\")" for c, why in fb["changed"]]
+    for q, pick, text in fb["answers"]:
+        said = [f"({chr(97 + pick)}) {line(q['options'][pick])}"] if pick is not None else []
+        out.append(f"- {q['id']}: " + " - ".join(said + ([line(text)] if text else [])))
+    if fb["accepted"]:
+        out.append(f"- {', '.join(fb['accepted'])}: accepted")
+    out.append("Any question not answered here: go with its default.")
+    if fb["note"]:
+        out.append(f"Other notes: {fb['note']}")
+    return "\n".join(out)
 
 
 def ref_ok(ref):
@@ -2239,14 +2436,35 @@ def ticket_action(runs, key, action, form):
             return False, "no vault is set, so there is nowhere to keep the answers"
         if status not in ANSWERABLE:   # sent twice, or answered elsewhere since the page was loaded
             return False, f"{key} is {status} now, not waiting on answers{again}"
-        text = answer_text(form)
+        if _one(form, "sig") and _one(form, "sig") != st.get("plan_sig"):
+            return False, CHANGED
+        go = ["--go"] if _one(form, "defaults").strip() else []   # took the defaults: no plan review
+        if _per_item(form):   # the plan feedback form
+            fb = plan_feedback(form, st)
+            if isinstance(fb, str):
+                return False, fb
+            if not go and not (fb["rejected"] or fb["changed"] or fb["answers"] or fb["note"]):
+                return False, ("nothing to send: approve the plan instead" if status == "plan-review" else
+                               "nothing to send: answer a question, or choose Go with the defaults")
+            text = feedback_text(fb, st.get("plan_sig", ""))
+        else:
+            text = answer_text(form)
         if not text:
             return False, "nothing to send: answer a question, or choose Go with the defaults"
-        go = ["--go"] if _one(form, "defaults").strip() else []   # took the defaults: no plan review
         return _waits(runs, key, _queue(runs, ["answer", key, "--vault", vault, "--stdin"] + go, text))
     if action == "approve":
         if status != "plan-review":
             return False, f"{key} is {status}, not a plan waiting for approval{again}"
+        if _one(form, "sig") and _one(form, "sig") != st.get("plan_sig"):
+            return False, CHANGED
+        fb = plan_feedback(form, st) if _per_item(form) else {}
+        if isinstance(fb, str):
+            return False, fb
+        if fb and (fb["rejected"] or fb["changed"] or fb["answers"] or fb["note"]):   # approving would drop it
+            what = ([c["id"] for c, _ in fb["rejected"] + fb["changed"]] + [q["id"] for q, _, _ in fb["answers"]]
+                    + (["the notes"] if fb["note"] else []))
+            return False, (f"not approved: what you gave on {', '.join(what)} would be lost. Use Send and plan "
+                           "again to have the plan revised with it, or undo it to approve the plan as it is")
         return _waits(runs, key, _queue(runs, ["approve", key]))
     if action == "retry":
         stage = _one(form, "stage")
@@ -2496,7 +2714,8 @@ def add_tickets(runs, form):
         return False, ("the project's changes are left uncommitted, so there is no starting point, target branch "
                        "or work branch for it; pick changes on a branch for the project, or leave those empty")
     base, ref, branch = (_one(form, n).strip() for n in ("base", "ref", "branch"))
-    wait = _one(form, "after_plan") != "go"
+    after = _one(form, "after_plan")
+    wait, defaults = after not in ("go", "defaults"), after == "defaults"
     mode = _one(form, "start")
     if mode and mode not in START_MODES:
         return False, "not a starting point: " + mode[:40]
@@ -2534,8 +2753,8 @@ def add_tickets(runs, form):
             and mode == "new":
         return False, ("with no implement stage the work must already exist: pick Continue existing work and name "
                        "its branch (e.g. origin/ABC-123), or The folder as it is now")
-    if "plan" not in stages or stages == ["plan"]:   # nothing waits on an approval
-        wait = False
+    if "plan" not in stages or stages == ["plan"]:   # nothing waits on an approval, nor goes on past the plan
+        wait = defaults = False
     if len(keys) == 1 and not keep:   # what the queue will not commit straight onto, said the form's way
         info = project_branches(project)
         work = branch or keys[0]
@@ -2561,6 +2780,8 @@ def add_tickets(runs, form):
         args.append("--no-branch")
     args += repo_branches
     args.append("--review-plan" if wait else "--no-plan-approval")
+    if defaults:   # its questions take their defaults: no stop for them either
+        args.append("--take-defaults")
     if note.strip():
         args.append(f"--note={note}")
     return _queue(runs, args)

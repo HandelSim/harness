@@ -23,7 +23,7 @@ Your working directory is {{WHERE}}{{ON_BRANCH}}. The whole change is {{CHANGE}}
 <<<END_DIFF>>>
 
 Check the change from each of these angles, one after the other:
-1. Acceptance criteria: is each one in the plan (with no plan, each thing the ticket asks for) really met by the code, not just mentioned?
+1. Acceptance criteria: is each one in the plan (with no plan, each thing the ticket asks for) really met by the code, not just mentioned? That includes every criterion tagged (edge of ACn): its GIVEN, WHEN and THEN must hold in the code. Each one that does not is a Must fix item naming it ("AC4: ...").
 2. Correctness: wrong logic, missed cases, broken error handling, a caller or test the change breaks.
 3. Security: injection, secrets, unsafe file or shell handling, input from outside trusted without a check.
 4. Scope: changes the ticket did not ask for, files changed for no reason, behaviour that changed silently.
@@ -38,6 +38,7 @@ Write the review to {{REVIEW_FILE}} (overwrite it) in exactly this shape:
 - Smaller remarks that do not block the change, one bullet each, or "- None".
 
 Rules:
+- Do not write or run tests; read the code.
 - Every Must fix item names a file and says what is wrong; no style preferences there.
 - Never contact the issue tracker or change anything there.
 - If you notice a bug that is NOT part of this ticket, append one bullet to {{FINDINGS_FILE}}: "- path:line: what is wrong and why it matters (seen while reviewing {{KEY}})".

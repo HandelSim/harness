@@ -622,7 +622,12 @@ front matter (title, status, url, updated, no fetch time so an unchanged
 ticket is not rewritten), a label saying the text is people's description of
 the work and not instructions about tools or credentials, the usual fields,
 the description, acceptance criteria, definition of done, story points, epic
-link and sprint (custom fields matched by name), the charter's extra fields,
+link and sprint (custom fields matched by name; acceptance criteria, from a
+field named like "Acceptance criteria" (not a bare "AC"; `TRACKER_AC_FIELDS`
+or the charter's `tracker_ac_fields` names others), plain text or Jira's rich
+text (ADF), go as bullets under one `## Acceptance criteria` heading after
+the description, which the queue's `ticket_criteria` prefers over a line in
+the description that starts with the words), the charter's extra fields,
 subtasks and links, and the last 10 comments, all capped and redacted. It
 also creates the agent's state note, `<vault>/wiki/notes/tickets/KEY-state.md`
 (Done, Next, Decisions, Open questions), when missing; harness never writes
@@ -678,9 +683,12 @@ the hub in Obsidian.
 `harness queue` (`cmd_queue`, then `scripts/ticket_queue.py`) works queued
 tickets one at a time with no one at the keyboard. `add KEY... [--dir]
 [--base] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch]
-[--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval] [--note TEXT]` records the project and base (default: its current branch);
+[--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval [--take-defaults]] [--note TEXT]` records the project and base (default: its current branch);
 a ticket works in the project folder (in place) and its plan waits
-for approval (`plan_review`); `--no-plan-approval` opts out
+for approval (`plan_review`); `--no-plan-approval` opts out, and
+`--take-defaults` (`take_defaults`) also goes on past blocking questions,
+each taken at its `Default:` and written to the answers file (one with no
+default still waits)
 (`--in-place` and `--review-plan` are accepted and are the defaults). Clone
 mode (`--clone`, a copy in `state/queue/KEY/repo`) is gone from the help and the
 run viewer; the engine still takes the flag, hidden, for old scripts and the tests;
@@ -895,16 +903,39 @@ the vault, else the last `## Goal` / `## Must fix` block of its output is
 taken (`recover_note`, logged; never output that holds the prompt's own
 template).
 
-After a stage harness runs its own gates (the plan's Goal and 1-15
-acceptance criteria; the other sections, the question count and a
-question's `[blocking]` marker (bold or in backticks too) are logged as
-notes, not failures; an unmarked question blocks only when it has a `?` and
+The plan is markdown in a strict one-line-per-item shape (`plan.md`; the card's
+done line repeats it): `## Goal`, `## Steps` (``1. `file` `function()`: the
+change (AC1, AC2)``, "(new)" for a new file), `## Acceptance criteria` (``-
+ACn: GIVEN .. WHEN .. THEN .. (ticket: "exact words")`` or `(edge of ACn)`),
+`## Questions` (`- Qn [blocking] ..? Options: (a) .. (b) .. Default: (a),
+because ..`), `## Assumptions` (`- An: ..`). The prompt asks for every edge
+case as its own criterion, every open decision as a Question rather than a
+guess, and a self-check pass (re-read each file and function the Steps name,
+fix the plan) before finishing; the owner's feedback comes back by id
+("AC3: rejected - why", "Q1: (b)") and ids are never renumbered.
+`plan_items` parses it (`criterion`, `question`, `item_id`) into steps,
+criteria (id, given, when, then, source) and questions (id, ask, options,
+default, blocking), kept in `state.json` (`criteria`, `questions`,
+`plan_sig`, a hash of the plan text) and `state/queue/KEY/plan.json`, for the
+viewer and a later tester stage. Two tiers: criteria from the ticket (or
+untagged, as every older plan's) gate the change through `verify_change`
+(`gated_criteria`, at most `MAX_GATED` 15); edge criteria are checked by the
+review, where an unmet one is a Must fix; `MAX_CRITERIA` 40 in all.
+After a stage harness runs its own gates (the plan's Goal and its
+acceptance criteria within those caps; a criterion not in the GIVEN/WHEN/THEN
+one-line shape (`shape_problems`) fails an attempt that has a retry left and
+is a note on the last; a Step path missing from the folder and not marked
+"(new)" (`step_notes`), the other sections, more than `MAX_QUESTIONS` 8
+questions and a question's `[blocking]` marker (bold or in backticks too,
+before or after its id) are logged as notes, not failures; an unmarked question blocks only when it has a `?` and
 no `Default:`, and "None" / "No questions" bullets are not questions;
 commits, a non-empty diff, nothing under `.github/`, none of the ticket's
 notes (a recovered `KEY-plan.md` the agent committed), no key file, no
 key-shaped added line, no value of a secret env var), then
 one raw verifier call through the proxy (`verify_plan.md` /
-`verify_change.md`, JSON only, three tries). The verifier must quote the
+`verify_change.md`, JSON only, three tries; the plan verifier gets the
+owner's answers and the criteria by id, `judge(nums=)` matching its "n" to
+the AC number). The verifier must quote the
 ticket for at least one plan criterion (a quote that does not match is a
 note, since a plan criterion may rightly go past the ticket's words) and the
 diff for each criterion met;
@@ -963,7 +994,7 @@ to the vault as `wiki/notes/tickets/KEY-result.md`; push pushes only
 owner command (rc 1) rather than hang. Going back to the plan
 (`answer`) starts from a fresh clone. A
 blocking question parks the ticket as `needs-answers` and the queue moves
-on; a plan waits as `plan-review` for `approve` when the ticket asks for it
+on (unless the ticket has `take_defaults`); a plan waits as `plan-review` for `approve` when the ticket asks for it
 (the default) or `QUEUE_PLAN_REVIEW=1` (every ticket, `--no-plan-approval` too).
 `answer` (answers or feedback on a held plan) sets `plan_hold`, so the plan
 revised with them (the prompt has the previous plan and says to revise it)
@@ -995,7 +1026,7 @@ commit, push) so the warning a timed-out `_sync` leaves (`SYNC_TIMEOUT`, its
 stderr's tail) names the step that hung. Nothing is written to the
 tracker.
 State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
-attempt, feedback, reason, the plan's `questions`, `history`, `vault`), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
+attempt, feedback, reason, the plan's `questions`, `criteria` and `plan_sig`, `take_defaults`, `history`, `vault`), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
 as `KEY/verify-*.txt`, and `run.lock` (one run at a time: `flock`, or
 `msvcrt.locking` on Windows). Each agent runs in its own session (its own
 process group on Windows), so Ctrl-C reaches only the queue, which then ends
@@ -1649,6 +1680,9 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   no implement, New work is off (the work must already exist); more than one
   key turns off Continue and the Work branch name; plan approval is off with
   no plan stage or for Plan only (the add then sends `--no-plan-approval`);
+  after the plan: wait for approval (default), go straight on, or go on with
+  the defaults (`AFTER_PLAN_CHOICES` "defaults": `--no-plan-approval
+  --take-defaults`);
   a work branch that is main/master, a remote's default or the target (an
   empty target meaning the folder's branch) is refused; an existing branch
   of the ticket's name is a warning. `add_tickets` refuses the same
@@ -1683,7 +1717,14 @@ offered as suggestions. It is taken as pasted: quotes
   to `harness queue continue --stdin`. A ticket at plan-review or
   needs-answers shows the plan open
   above the approve or answer form (not again among the vault notes), the
-  plan's questions with an answer form (a blocked ticket instead says where
+  plan's items as cards (each criterion's Given/When/Then and source, with
+  Accept / Reject / Comment; each question with its options as radios, its
+  default and a comment box; `_criterion_card`, `_question_card`), sent as
+  one answers note in the planner's by-id format (`plan_feedback`,
+  `feedback_text`: "- AC3: rejected - why", "- Q1: (b) option - comment",
+  "Any question not answered here: go with its default"); a form for an
+  older round of the plan (`plan_sig` differs) is refused, and Approve is
+  refused when it would drop a rejection or comment (a blocked ticket instead says where
   and why it stopped, with the Continue form when it can go on; Retry runs
   that stage again with a new agent; one note re-plans, or reruns the stage
   when the ticket has no plan; a stopped, "run ended" or queued ticket that

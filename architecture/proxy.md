@@ -377,7 +377,11 @@ and the branch, a line keeping it in its working directory (the path from the
 Environment bullet name; nothing is listed, searched or read, since it sits in
 `state/queue/KEY/repo` deep in the harness install and a model hunting for
 files or an `AGENTS.md` climbed into the install, an external_directory ask
-per read), done-when in the words of the queue's checks, a note when the
+per read), done-when in the words of the queue's checks, the stage's `do`
+lines (`scripts/queue_prompts/stage-guidance.json`, `{stage: [lines]}`, sent
+by the queue as the card's `do` list and shown as bullets right after "Done
+when": what this stage does and does not do, e.g. plan writes no code,
+implement and fix check the build and write no tests), a note when the
 last attempt failed, the Must fix count, and pointers to `KEY-task.md` (the
 stage's whole prompt, there while it runs), the ticket's copy and its state
 note, each to be read "when you need a detail", not "when you cannot see it"
@@ -385,8 +389,12 @@ note, each to be read "when you need a detail", not "when you cannot see it"
 stage prompt, which is only in its first message, after its first tool call:
 the card is what keeps the stage, its output and how it is checked in view.
 `_task_fields` keeps only the known fields, each collapsed to one line and
-capped (title 120, where 300, done 500 characters; attempt and must_fix
-1-999); a header that is not base64 JSON of an object, or over 8,192
+capped (title 120, where 300, done 500 characters; `do` at most
+`_CARD_DO_LINES` 8 lines of `_CARD_DO_LINE` 240, `_CARD_DO_TOTAL` 1,000 in all,
+the rest dropped; attempt and must_fix 1-999). A user `reminder.md` with a
+line holding only `{{INSTRUCTIONS}}` gets the `do` bullets there instead of
+in the card (the line is dropped when there are none); the shipped reminder
+has no such line, so its body is unchanged; a header that is not base64 JSON of an object, or over 8,192
 characters, gives the bare card (key and pointers). Text the model reads
 cannot pass for the card: `_defang_card` rewrites `[harness task card` in the
 turn's content to `[quoted harness task card`. With a card, the

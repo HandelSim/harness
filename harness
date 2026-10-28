@@ -6829,7 +6829,7 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                 [--start REF|here] [--branch NAME | --no-branch]
                                 [--repo-branch REL[=BRANCH][:TARGET]]...
                                 [--allow-branch] [--no-plan-approval]
-                                [--note TEXT]
+                                [--take-defaults] [--note TEXT]
                                             queue tickets for the git project here
                                             (or PROJECT); see "Where the agents
                                             work" and "Where the work starts and
@@ -6928,6 +6928,10 @@ After the plan (default: wait for you):
   --no-plan-approval
                 implementing starts right after the plan; a plan with a
                 blocking question still stops for your answer.
+  --take-defaults
+                with --no-plan-approval: a blocking question that has a
+                Default does not stop the ticket either; it goes on with the
+                Default (written to KEY-answers.md). One with no Default stops.
   --review-plan the default, accepted for older scripts.
 
 Where the work starts and ends:
@@ -7068,12 +7072,12 @@ HELP
                         if [[ "$a" == --dir ]]; then dir="$1"; else base="$1"; fi; shift ;;
                     --stages|--ref|--note|--start|--branch|--repo-branch) (( $# )) || { err "$a needs a value"; return 1; }
                         opts+=("$a" "$1"); shift ;;
-                    --in-place|--clone|--no-branch|--review-plan|--no-plan-approval|--allow-branch) opts+=("$a") ;;
+                    --in-place|--clone|--no-branch|--review-plan|--no-plan-approval|--take-defaults|--allow-branch) opts+=("$a") ;;
                     -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                     *) keys+=("$a") ;;
                 esac
             done
-            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch] [--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval] [--note TEXT]"; return 1; }
+            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch] [--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval [--take-defaults]] [--note TEXT]"; return 1; }
             args+=(add "${keys[@]}" ${opts[@]+"${opts[@]}"})
             [[ -n "$vault" ]] || echo "harness: note: no active vault, and harness queue run needs one to work the tickets (harness vault new <name>, or harness vault use <name>)" >&2
             [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")

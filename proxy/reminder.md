@@ -19,7 +19,7 @@ model's older history can be truncated away, this message never is):
        <<<BEGIN_USER_REQUEST>>>
        add retries to the upload
        <<<END_USER_REQUEST>>>
-  2. This file, below this comment, with the five tokens filled in.
+  2. This file, below this comment, with its tokens filled in.
   3. The task card, only in a session started on a ticket (`harness --ticket
      KEY`, or a queue stage). The proxy writes it; it is not in this file. For
      a queue stage it reads:
@@ -29,12 +29,14 @@ model's older history can be truncated away, this message never is):
        - Where: a clone of the project made for this ticket. Branch: ABC-12.
        - Work only in `/home/you/harness/state/queue/ABC-12/repo`: the project's files are all in there. Outside it, use only the files named here, in the task file and under Environment; do not list, search or read anything else (the folders around it are not the project).
        - Done when: every acceptance criterion of the plan is met and committed on ABC-12 (...), and git status is clean. Do not push.
+       - This stage: ... (the stage's own lines, one bullet each, unless this file carries {{INSTRUCTIONS}})
        - Full instructions (the ticket, plan, owner's answers and notes, problems with the last attempt): `<vault>/wiki/notes/tickets/ABC-12-task.md`. `read` it when you need a detail this card and your todo list do not give; ...
        - Ticket text: `<vault>/.raw/tickets/ABC-12.md`. Progress notes (done, next, decisions): `<vault>/wiki/notes/tickets/ABC-12-state.md`; update them as you finish each step.
      Outside a queue stage it is the first two lines plus the ticket text and
      progress-notes lines.
 
 Everything below this comment block is injected verbatim, except five tokens
+(and the optional sixth, {{INSTRUCTIONS}}, which the shipped file leaves out)
 the proxy substitutes per turn. Each one below says what it is and then shows
 what it turned into in a real host-mode queue stage (Linux host, a vault at
 /home/you/harness/state/vaults/work, written <vault> after the first time):
@@ -128,6 +130,13 @@ what it turned into in a real host-mode queue stage (Linux host, a vault at
                         list a directory) by absolute path. ...
                       - finish(summary) — the only way to end your turn;
                         `summary` is what the user reads. ...
+
+  {{INSTRUCTIONS}}  Optional; not in this file. The queue stage's own lines
+                    (from scripts/queue_prompts/stage-guidance.json), one
+                    "- line" each. Put it on a line of its own: that line
+                    becomes the bullets, and goes away when there are none
+                    (outside a queue stage). With no token they go in the
+                    task card, after its "Done when" line.
 
 A token you delete simply stops being injected. Unknown `{{...}}` text is left
 alone, so a typo degrades to literal text in the prompt rather than an error.

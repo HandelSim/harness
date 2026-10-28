@@ -97,6 +97,25 @@ def build_db(path, project, queue_repo, now_ms):
     con.close()
 
 
+# A plan's items as the queue writes them to state.json (its plan_items, with an id and
+# edge each), and some a hand edit left: a repeated id, a bad one, not a dict.
+PLAN_ITEMS = dict(
+    plan_sig="abc123def456", take_defaults=True,
+    criteria=[{"id": "AC1", "text": 'AC1: GIVEN a log WHEN parsed THEN ok (ticket: "parse logs")', "given": "a log",
+               "when": "parsed", "then": "it is <b>ok</b>", "source": 'ticket: "parse <logs>"', "edge": False},
+              {"id": "AC2", "text": "AC2: an empty log <script>alert(1)</script> is skipped", "given": "",
+               "when": "", "then": "", "source": "edge of AC1", "edge": True},
+              {"id": "AC3", "text": "AC3: GIVEN x WHEN y THEN z", "given": "x", "when": "y", "then": "z",
+               "source": "", "edge": False},
+              {"id": "AC1", "text": "a repeat"}, {"id": "bad id!", "text": "no good id"}, "nope", {"text": 3}],
+    questions=[{"id": "Q1", "text": "[blocking] Q1: Which db?", "ask": "Which <db>?", "blocking": True,
+                "options": ["postgres", "sqlite <3>"], "default": "(b), because it is small"},
+               {"id": "Q2", "text": "Q2: Log level?", "ask": "Log level?", "blocking": False, "options": [],
+                "default": "info"},
+               {"id": "Q3", "text": "Q3: Retry?", "ask": "Retry?", "blocking": False, "options": ["yes", "no"],
+                "default": "ask later"}])
+
+
 class RunsServer(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -442,6 +461,144 @@ class RunsTest(RunsServer):
         r, body = self.act("approve")
         self.assertEqual(r.status, 409)
         self.assertIn("not a plan waiting for approval", body)
+
+    def test_the_plans_items_from_the_state_are_checked(self):
+        self.ticket(**PLAN_ITEMS)
+        st = runs.Runs([("host", self.data)], queue_dir=self.queue).ticket_state("ABC-12")
+        self.assertEqual([c["id"] for c in st["criteria"]], ["AC1", "AC2", "AC3", "AC5"])   # a repeat dropped
+        self.assertEqual(st["criteria"][3]["text"], "no good id")       # a bad id: by its place
+        self.assertEqual((st["criteria"][1]["edge"], st["criteria"][1]["given"]), (True, ""))
+        self.assertEqual(st["questions"][0], {"id": "Q1", "text": "[blocking] Q1: Which db?", "ask": "Which <db>?",
+                                              "blocking": True, "default": "(b), because it is small",
+                                              "options": ["postgres", "sqlite <3>"]})
+        self.assertEqual((st["plan_sig"], st["take_defaults"]), ("abc123def456", True))
+        # hand-edited: wrong types are dropped or made safe, long lists and texts capped
+        self.ticket(plan_sig="<x>", take_defaults="yes", criteria={"AC1": "x"},
+                    questions=[{"text": "old?", "blocking": True}, {"text": "q", "options": "a, b", "ask": 3},
+                               {"text": "q3", "options": [1, "", "ok"] + ["o"] * 9, "default": ["x"]}]
+                    + [{"text": f"more {n}"} for n in range(20)])
+        st = runs.Runs([("host", self.data)], queue_dir=self.queue).ticket_state("ABC-12")
+        self.assertEqual((st["plan_sig"], st["take_defaults"], st["criteria"]), ("", False, []))
+        self.assertEqual(st["questions"][0], {"id": "Q1", "text": "old?", "ask": "old?", "blocking": True,
+                                              "default": "", "options": []})
+        self.assertEqual((st["questions"][1]["ask"], st["questions"][1]["options"]), ("q", []))
+        self.assertEqual(st["questions"][2]["options"], ["ok"] + ["o"] * 7)
+        self.assertEqual(len(st["questions"]), runs.MAX_QUESTIONS)
+        self.ticket(criteria=[{"id": f"AC{n}", "text": "t" * 5000} for n in range(1, 80)])
+        st = runs.Runs([("host", self.data)], queue_dir=self.queue).ticket_state("ABC-12")
+        self.assertEqual((len(st["criteria"]), len(st["criteria"][0]["text"])), (runs.MAX_CRITERIA, runs.ITEM_MAX))
+
+    def test_the_plan_feedback_form_has_a_card_per_item(self):
+        self.ticket(**PLAN_ITEMS)
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(r.status, 200)
+        self.assertIn("<input type='hidden' name='sig' value='abc123def456'>", body)
+        self.assertLess(body.index("<h3>Questions</h3>"), body.index("<h3>Acceptance criteria</h3>"))
+        # the questions: the option the default names is picked; none named, its own choice is
+        self.assertIn("<div class='q blocking'>Q1 Which &lt;db&gt;?</div>", body)
+        self.assertIn("<div class='src'>Default: (b), because it is small</div>", body)
+        self.assertIn("name='q.Q1' value='0'><span>(a) postgres</span>", body)
+        self.assertIn("name='q.Q1' value='1' checked><span>(b) sqlite &lt;3&gt;</span>", body)
+        self.assertIn("name='q.Q3' value='' checked><span>No pick: go with its default</span>", body)
+        self.assertIn("<input name='qt.Q1' maxlength='1000'", body)
+        self.assertIn("<textarea name='qt.Q2'", body)   # no options: a box
+        # the criteria: given/when/then, where it comes from, accepted unless rejected
+        self.assertIn("<dt>Given</dt><dd>a log</dd><dt>When</dt><dd>parsed</dd><dt>Then</dt>"
+                      "<dd>it is &lt;b&gt;ok&lt;/b&gt;</dd>", body)
+        self.assertIn("<div class='src'>from the ticket: &ldquo;parse &lt;logs&gt;&rdquo;</div>", body)
+        self.assertIn("<div class='fb edge'><div class='q'>AC2 <span class='tag'>edge case of AC1</span></div>", body)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt; is skipped", body)   # not GIVEN-shaped: as written
+        self.assertNotIn("<script>alert(1)", body)
+        self.assertIn("name='ac.AC1' value='accept' checked>Accept</label>", body)
+        self.assertIn("name='ac.AC1' value='reject'>Reject</label>", body)
+        self.assertIn("<input name='acc.AC5' maxlength='1000'", body)
+        self.assertIn("Go with the defaults", body)
+        self.assertNotIn("formaction=", body)
+        self.assertNotIn("name='q0'", body)   # not the older form
+        self.ticket(status="plan-review", **PLAN_ITEMS)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<button type='submit' formaction='/runs/ticket/ABC-12/approve'", body)
+        self.assertIn("Send and plan again</button>", body)
+        self.assertNotIn("Go with the defaults", body)
+        # the Approve atop the page carries the plan it was shown with too
+        self.assertIn("<form method='post' action='/runs/ticket/ABC-12/approve'><input type='hidden' name='sig' "
+                      "value='abc123def456'>", body)
+        # an older state (no criteria): the form as it was
+        self.ticket(status="plan-review", questions=[{"text": "Which <db>?", "blocking": True}])
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("name='q0' value='Which &lt;db&gt;?'", body)
+        self.assertNotIn("Acceptance criteria</h3>", body)
+        self.assertIn("Send feedback and plan again", body)
+
+    def test_plan_feedback_goes_to_the_planner_a_line_an_item(self):
+        self.ticket(**PLAN_ITEMS)
+        self.start()
+        calls = []
+
+        def queue(runs_, args, text=None):
+            calls.append((args, text))
+            return True, "answered"
+        sig = ("sig", "abc123def456")
+        mixed = [sig, ("ac.AC1", "reject"), ("ac.AC2", "accept"), ("acc.AC2", "make it\n  a warning"),
+                 ("ac.AC3", "accept"), ("ac.AC5", "accept"), ("q.Q1", "0"), ("qt.Q1", "we have it"),
+                 ("qt.Q2", "debug"), ("q.Q3", ""), ("note", "keep it small"),
+                 ("ac.AC99", "reject"), ("acc.ZZ", "not ours")]   # names not in the plan: ignored
+        with mock.patch.object(runs, "_queue", queue):
+            r, body = self.act("answer", mixed)
+            self.assertEqual(r.status, 303, body)
+            args, text = calls.pop()
+            self.assertEqual(args, ["answer", "ABC-12", "--vault", self.vault, "--stdin"])
+            self.assertEqual(text, "Feedback on the plan (round of abc123def456):\n"
+                             "- AC1: rejected - no reason given (it read: \"AC1: GIVEN a log WHEN parsed THEN ok "
+                             "(ticket: \"parse logs\")\")\n"
+                             "- AC2: make it a warning (it read: \"AC2: an empty log <script>alert(1)</script> is "
+                             "skipped\")\n"
+                             "- Q1: (a) postgres - we have it\n"
+                             "- Q2: debug\n"
+                             "- AC3, AC5: accepted\n"
+                             "Any question not answered here: go with its default.\n"
+                             "Other notes: keep it small")
+            # the default's own option is no answer; the defaults line covers it
+            r, body = self.act("answer", [sig, ("ac.AC1", "accept"), ("q.Q1", "1"), ("q.Q3", "1")])
+            self.assertEqual(r.status, 303, body)
+            self.assertEqual(calls.pop()[1], "Feedback on the plan (round of abc123def456):\n- Q3: (b) no\n"
+                             "- AC1, AC2, AC3, AC5: accepted\nAny question not answered here: go with its default.")
+            r, body = self.act("answer", [sig, ("ac.AC1", "accept"), ("q.Q1", "1")])
+            self.assertEqual(r.status, 409)
+            self.assertIn("nothing to send: answer a question, or choose Go with the defaults", body)
+            r, body = self.act("answer", [sig, ("ac.AC1", "accept"), ("q.Q1", "1"), ("defaults", "1")])
+            self.assertEqual(r.status, 303, body)
+            args, text = calls.pop()
+            self.assertEqual(args[-1], "--go")
+            self.assertTrue(text.endswith("- AC1, AC2, AC3, AC5: accepted\nAny question not answered here: go with "
+                                          "its default."))
+            r, body = self.act("answer", [sig, ("acc.AC3", "x" * 1001)])
+            self.assertEqual(r.status, 409)
+            self.assertIn("the comment on AC3 is over 1000 characters", body)
+            # made again since the page was loaded: nothing is sent
+            r, body = self.act("answer", [("sig", "0ld0"), ("ac.AC1", "reject")])
+            self.assertEqual(r.status, 409)
+            self.assertIn("The plan changed since this page was loaded: reload it and answer again.", body)
+            self.ticket(status="plan-review", **PLAN_ITEMS)
+            r, body = self.act("approve", [("sig", "0ld0")])
+            self.assertEqual(r.status, 409)
+            self.assertIn("The plan changed since this page was loaded", body)
+            # approve drops what was written: refused, it names what
+            r, body = self.act("approve", mixed)
+            self.assertEqual(r.status, 409)
+            self.assertIn("not approved: what you gave on AC1, AC2, Q1, Q2, the notes would be lost. Use Send and "
+                          "plan again", body)
+            r, body = self.act("approve", [sig, ("ac.AC1", "reject")])
+            self.assertEqual(r.status, 409)
+            self.assertEqual(calls, [])
+            r, body = self.act("approve", [sig, ("ac.AC1", "accept"), ("q.Q1", "1"), ("q.Q3", "")])
+            self.assertEqual(r.status, 303, body)
+            self.assertEqual(calls.pop()[0], ["approve", "ABC-12"])
+            r, body = self.act("answer", [sig, ("ac.AC1", "accept")])
+            self.assertEqual(r.status, 409)
+            self.assertIn("nothing to send: approve the plan instead", body)
+        self.assertEqual(calls, [])
 
     def test_an_in_place_tickets_sessions_are_those_made_while_its_stages_ran(self):
         proj = os.path.join(self.tmp.name, "proj")
@@ -886,6 +1043,35 @@ class QueuePageTest(RunsServer):
                                                 ("branch", "a..b")])
         self.assertEqual(r.status, 409)
         self.assertIn("branch: not a branch", body)
+
+    def test_add_a_ticket_that_takes_the_plans_defaults(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("<div class='presets three'><label><input type='radio' name='after_plan' value='wait' checked>",
+                      body)
+        self.assertIn("name='after_plan' value='defaults'>Go on with the defaults", body)
+        calls = []
+
+        def queue(runs_, args, text=None):
+            calls.append(args)
+            return True, "added"
+        good = [("keys", "ABC-7"), ("project", proj), ("branch", "feat/x")]
+        with mock.patch.object(runs, "_queue", queue):
+            r, body = self.post("/runs/queue/add", good + [("after_plan", "defaults")])
+            self.assertEqual(r.status, 303, body)
+            self.assertEqual(calls.pop()[-2:], ["--no-plan-approval", "--take-defaults"])
+            r, body = self.post("/runs/queue/add", good + [("after_plan", "go")])
+            self.assertEqual(calls.pop()[-1], "--no-plan-approval")
+            r, body = self.post("/runs/queue/add", good + [("after_plan", "wait")])
+            self.assertEqual(calls.pop()[-1], "--review-plan")
+            # plan only: nothing goes on past the plan
+            r, body = self.post("/runs/queue/add", good + [("preset", "plan"), ("after_plan", "defaults")])
+            self.assertEqual(r.status, 303, body)
+            self.assertEqual(calls.pop()[-1], "--no-plan-approval")
+        self.ticket(status="queued", take_defaults=True, plan_review=False)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("after the plan <b>takes each question's default and goes on</b>", body)
 
     def test_add_starting_points_and_the_branch_list(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))

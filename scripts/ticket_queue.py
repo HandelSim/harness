@@ -4,7 +4,7 @@ plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
 
   ticket_queue.py --state DIR add KEY... [--project DIR] [--base REF] [--stages LIST]
                   [--start REF|here] [--branch NAME | --no-branch] [--repo-branch REL[=BRANCH][:TARGET]]...
-                  [--no-plan-approval] [--note TEXT]
+                  [--no-plan-approval] [--take-defaults] [--note TEXT]
   ticket_queue.py --state DIR list | status [--json] | remove KEY... | approve KEY
   ticket_queue.py --state DIR retry KEY [--stage S] | stop KEY | move KEY up|down|top|bottom
   ticket_queue.py --state DIR halt [--force --harness PATH]
@@ -111,8 +111,13 @@ WIN_PROMPT_MAX = 24_000
 INFRA_RETRY_PAUSES = (20, 60)
 DIFF_CAP_AGENT = 40_000
 DIFF_CAP_VERIFY = 150_000
-MAX_QUESTIONS = 3
-PLAN_SECTIONS = ("Goal", "Acceptance criteria", "Approach", "Files", "Questions", "Assumptions")
+MAX_QUESTIONS = 8
+# A plan's criteria: the ones from the ticket gate the change (verify_change);
+# their edge cases, tagged (edge of ACn), are the review's to check, and the
+# ticket's tests later. Up to MAX_GATED of the first, MAX_CRITERIA in all.
+MAX_GATED = 15
+MAX_CRITERIA = 40
+PLAN_SECTIONS = ("Goal", "Steps", "Acceptance criteria", "Questions", "Assumptions")
 PLAN_REQUIRED = ("Goal", "Acceptance criteria")   # the rest missing is noted, not failed
 HISTORY_CAP = 30
 REVIEW_SECTIONS = ("Must fix", "Notes")
@@ -392,8 +397,13 @@ def check_plan(text):
     questions = plan_questions(secs)
     if "acceptance criteria" in secs and not criteria:
         problems.append("'## Acceptance criteria' lists no criteria (one bullet each)")
-    if len(criteria) > 15:
-        problems.append(f"{len(criteria)} acceptance criteria: at most 15, merge the small ones")
+    gated = len(gated_criteria(criteria))
+    if gated > MAX_GATED:
+        problems.append(f"{gated} acceptance criteria from the ticket: at most {MAX_GATED}, merge the small ones "
+                        "(edge cases tagged (edge of ACn) do not count)" if gated < len(criteria) else
+                        f"{gated} acceptance criteria: at most {MAX_GATED}, merge the small ones")
+    if len(criteria) > MAX_CRITERIA:
+        problems.append(f"{len(criteria)} acceptance criteria: at most {MAX_CRITERIA} in all, merge the small ones")
     return problems, criteria, questions
 
 
@@ -404,15 +414,17 @@ def plan_questions(secs):
 
 
 def question_mark(q):
-    """'blocking', 'non-blocking' or None: the marker, bold or in backticks too."""
-    m = re.match(r"(?i)[\s*_`]*\[(non-)?blocking\]", q)
+    """'blocking', 'non-blocking' or None: the marker, bold or in backticks too,
+    after the question's id or before it ("Q1 [blocking] ..." or "[blocking] Q1: ...")."""
+    m = re.match(r"(?i)[\s*_`]*(?:Q\d+\b[\s*_`:.)-]*)?\[(non-)?blocking\]", q)
     return None if not m else "non-blocking" if m.group(1) else "blocking"
 
 
 def plan_notes(text):
     """What is off in a plan that passed check_plan, for the log."""
     secs = sections(text)
-    notes = [f"no '## {s}' section" for s in PLAN_SECTIONS if s.lower() not in secs]
+    notes = [f"no '## {s}' section" for s in PLAN_SECTIONS
+             if s.lower() not in secs and not (s == "Steps" and "approach" in secs)]
     questions = plan_questions(secs)
     if len(questions) > MAX_QUESTIONS:
         notes.append(f"{len(questions)} questions (asked for at most {MAX_QUESTIONS})")
@@ -427,6 +439,129 @@ def blocking(questions):
     question with no default to go on."""
     return [q for q in questions if question_mark(q) == "blocking"
             or (question_mark(q) is None and "?" in q and not re.search(r"(?i)\bdefault:", q))]
+
+
+# The plan's items, for the owner's page and a later tester: its numbered steps,
+# its GIVEN/WHEN/THEN criteria (AC1...) and its questions (Q1...) with their
+# options and default. The plan stays markdown the model writes; this is read
+# from it, so an older plan (an Approach, plain bullets) still gives items.
+ITEM_ID = re.compile(r"^[\s*_`]*(AC|Q)[-\s]?(\d{1,3})\b[\s*_`]*[:.)\-\u2013\u2014]?[\s*_`]*", re.I)
+GWT_WORD = re.compile(r"(?i)[*_`]+(given|when|then|and)\b[*_`]*|\b(given|when|then)[*_`]+")
+GWT = re.compile(r"(?is)^\W*given\b[\s,:]*(.*?)[\s,;]*\bwhen\b[\s,:]*(.*?)[\s,;]*\bthen\b[\s,:]*(.*)$")
+SOURCE = re.compile(r"\s*[(\[]\s*((?:from the )?(?:ticket|edge(?:[- ]case)?|source|from|owner|answer)\b[^\n]*?)"
+                    r"\s*[)\]]\s*\.?\s*$", re.I)
+PATH_RE = re.compile(r"`([^`\s]+\.[A-Za-z0-9]{1,8}|[^`\s]*/[^`\s]*)`")
+
+
+def item_id(text, kind, n):
+    """(id, the text without it): "AC3: GIVEN..." -> ("AC3", "GIVEN...")."""
+    m = ITEM_ID.match(text)
+    if m and m.group(1).upper() == kind:
+        return f"{kind}{int(m.group(2))}", text[m.end():].strip()
+    return f"{kind}{n}", text.strip()
+
+
+def criterion(text, n):
+    """One acceptance criterion as {id, text, given, when, then, source}; given,
+    when and then are "" when it is not written as GIVEN ... WHEN ... THEN ..."""
+    cid, body = item_id(text, "AC", n)
+    m = SOURCE.search(body)
+    source = m.group(1).strip() if m else ""
+    if m:
+        body = body[:m.start()].rstrip()
+    plain = GWT_WORD.sub(lambda w: w.group(1) or w.group(2), body)
+    g = GWT.match(plain)
+    parts = [x.strip().rstrip(",;").strip() for x in g.groups()] if g else ["", "", ""]
+    return dict(id=cid, text=text, given=parts[0], when=parts[1], then=parts[2], source=source)
+
+
+def question(text, n):
+    """One question as {id, text, blocking, options, default}."""
+    unmark = lambda t: re.sub(r"(?i)^[\s*_`]*\[(non-)?blocking\][\s*_`]*", "", t)   # noqa: E731
+    mark = question_mark(text)   # "[blocking] Q1: ..." or "Q1 [blocking] ...": either order
+    qid, body = item_id(unmark(text), "Q", n)
+    mark = mark or question_mark(body)
+    body = unmark(body)
+    default = ""
+    m = re.search(r"(?i)\s*\bdefault\s*:\s*", body)
+    if m:
+        default, body = body[m.end():].strip(), body[:m.start()].rstrip()
+    options = []
+    m = re.search(r"(?i)\s*\boptions?\s*:\s*", body)
+    if m:
+        opts, body = body[m.end():], body[:m.start()].rstrip()
+        options = [o.strip().rstrip(";,.").strip() for o in
+                   re.split(r"(?:^|[\s;,]+)\(?[a-hA-H]\)\s+", " " + opts) if o.strip().rstrip(";,.").strip()]
+        if len(options) < 2:
+            options = [o.strip() for o in re.split(r"\s*(?:;|\s\|\s)\s*", opts) if o.strip()]
+    blocks = mark == "blocking" or (mark is None and "?" in body and not default)
+    return dict(id=qid, text=text, ask=body.strip(), blocking=blocks, options=options[:8], default=default)
+
+
+def plan_items(text):
+    """{steps, criteria, questions} of a plan (see criterion and question)."""
+    secs = sections(text)
+    steps = bullets(secs.get("steps") or secs.get("approach") or "")
+    return {"steps": [{"n": i, "text": t, "files": PATH_RE.findall(t)} for i, t in enumerate(steps, 1)],
+            "criteria": [criterion(c, i) for i, c in enumerate(bullets(secs.get("acceptance criteria", "")), 1)],
+            "questions": [question(x, i) for i, x in enumerate(plan_questions(secs), 1)]}
+
+
+def is_edge(c):
+    """True for a criterion tagged (edge of ACn): an edge case of another one."""
+    return c["source"].lower().startswith("edge")
+
+
+def gated_criteria(criteria):
+    """The criteria (bullets) a change is held to: all but the edge cases, each
+    without its id. A plan with no tags (an older one) gives all of them as written."""
+    out = []
+    for i, text in enumerate(criteria, 1):
+        c = criterion(text, i)
+        if not is_edge(c):
+            out.append(item_id(text, "AC", i)[1])
+    return out
+
+
+def criteria_by_id(criteria):
+    """(lines "ACn: ...", [n, ...]) for a verifier, n its AC number; numbered by
+    place when the ids are not one each (a plan with AC2 twice)."""
+    ids = [criterion(t, i)["id"] for i, t in enumerate(criteria, 1)]
+    if len(set(ids)) == len(ids):
+        nums = [int(x[2:]) for x in ids]
+    else:
+        nums = list(range(1, len(criteria) + 1))
+    return "\n".join(f"AC{n}: {item_id(t, 'AC', n)[1]}" for n, t in zip(nums, criteria)), nums
+
+
+def shape_problems(text):
+    """What is off in how a plan's criteria are written (GIVEN/WHEN/THEN, one
+    line each), naming them. Asked for again on a retry; a note on the last try."""
+    body = sections(text).get("acceptance criteria", "")
+    loose = [l.strip() for l in body.splitlines() if l.strip() and not l.startswith((" ", "\t"))
+             and not re.match(r"^\s*(?:[-*]|\d+[.)])\s", l)]
+    out = []
+    if loose:
+        out.append(f"a criterion is broken over lines (one line each): {loose[0][:120]}")
+    bad = [c["id"] for c in (criterion(t, i) for i, t in enumerate(bullets(body), 1)) if not c["given"]]
+    if bad:
+        out.append(f"{', '.join(bad[:12])}: not written as one line '- ACn: GIVEN ... WHEN ... THEN ...' "
+                   "ending with (ticket: \"...\") or (edge of ACn)")
+    return out
+
+
+def step_notes(text, repo):
+    """A Step's backticked path that is not in the working directory and is not
+    marked (new): for the log, never a failure (the path can be another repo's)."""
+    notes = []
+    for st_ in plan_items(text)["steps"]:
+        if re.search(r"(?i)\(new\b", st_["text"]):
+            continue
+        for f in st_["files"]:
+            f = re.sub(r"(::|:\d|#L\d).*$", "", f).strip("/")
+            if f and ".." not in f.split("/") and not os.path.exists(os.path.join(repo, f)):
+                notes.append(f"step {st_['n']} names `{f}`, which is not in the working directory")
+    return notes[:10]
 
 
 def check_review(text):
@@ -1429,14 +1564,15 @@ def diff_sides(diff):
     return norm("\n".join(added), diff=True), norm("\n".join(removed), diff=True)
 
 
-def judge(obj, criteria, source, quote_field, what, notes="", soft=None):
+def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=None):
     """Problems with a verdict: every criterion answered, met (for a change),
     and every quote found in <source>. For a diff a quote must be from an added
     line (a removed one when the criterion is about removing; never an unchanged
     one); a reviewer's "(review)" item may instead quote <notes>, the commit
     messages saying why it is wrong. A ticket quote the verifier got slightly
     wrong goes to <soft> instead (a list, logged): one found quote is enough
-    to show the plan is about the ticket."""
+    to show the plan is about the ticket. <nums> are the numbers the verifier
+    was told for the criteria (their AC numbers), 1, 2, 3... by default."""
     soft = [] if soft is None else soft
     problems = []
     if what == "diff":
@@ -1451,7 +1587,7 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None):
             except (TypeError, ValueError):
                 pass
     found = 0
-    for i, crit in enumerate(criteria, 1):
+    for i, crit in zip(nums or range(1, len(criteria) + 1), criteria):
         c = got.get(i)
         if c is None:
             problems.append(f"criterion {i} was not checked: {crit[:100]}")
@@ -2244,8 +2380,11 @@ CARD_WHERE_IN_PLACE = ("the owner's own project folder, not a clone. Where you c
                        "by name (never git add -A, git add . or git commit -a); leave every other file alone (no git "
                        "reset --hard, clean, stash, or checkout of files you did not change)")
 CARD_DONE = {
-    "plan": "the plan is written to {PLAN_FILE}: # {KEY} plan, then ## Goal, ## Acceptance criteria (one bullet each, "
-            "at most 15), ## Approach, ## Files, ## Questions, ## Assumptions. Change no code in this stage.",
+    "plan": "the plan is written to {PLAN_FILE}: # {KEY} plan, then ## Goal, ## Steps (1. `file` `function()`: the "
+            "change (AC1, AC2)), ## Acceptance criteria (one line each: - AC1: GIVEN .. WHEN .. THEN .. (ticket: "
+            "\"exact words\") or (edge of AC1)), ## Questions (- Q1 [blocking] ..? Options: (a) .. (b) .. Default: "
+            "(a), because ..), ## Assumptions (- A1: ..); then you re-read the code each Step names and fixed the "
+            "plan. Change no code.",
     "implement": "every acceptance criterion of the plan is met and committed on {BRANCH} (git add <files>, git commit "
                  "-m \"{KEY}: <what changed>\"), and git status is clean. Do not push.",
     "implement-repos": "every acceptance criterion of the plan is met. {COMMIT_STEP}",
@@ -2272,7 +2411,30 @@ def task_card(ctx, st, stage):
                                 **words)}
     if stage == "fix" and st.get("must_fix"):
         card["must_fix"] = len(st["must_fix"])
+    do = stage_guidance(ctx.q, st["key"]).get(stage)
+    if do:
+        card["do"] = [line.replace("{KEY}", st["key"]) for line in do]
     return card
+
+
+STAGE_GUIDANCE = os.path.join(PROMPTS, "stage-guidance.json")
+
+
+def stage_guidance(q=None, key=""):
+    """{stage: [lines]} from queue_prompts/stage-guidance.json, the few lines
+    a stage's agent sees on its task card every turn; {} when the file is
+    missing or not that shape (logged), so a hand edit never stops a run."""
+    try:
+        with open(STAGE_GUIDANCE, encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as e:
+        if q is not None and key and os.path.exists(STAGE_GUIDANCE):
+            q.log(key, f"{STAGE_GUIDANCE} is not used: {str(e)[:200]}")
+        return {}
+    return {k: [x for x in v if isinstance(x, str) and x.strip()] for k, v in obj.items()
+            if not k.startswith("_") and isinstance(v, list)}
 
 
 def owner_notes(notes):
@@ -2284,8 +2446,11 @@ def owner_notes(notes):
 
 
 def ticket_criteria(text):
-    """The bullets under the ticket's own 'Acceptance criteria' heading, if it has one."""
-    m = re.search(r"(?im)^[#*\s]*acceptance criteria\b.*$", text)
+    """The bullets under the ticket's own 'Acceptance criteria' heading, if it has one:
+    a markdown heading first (the tracker's criteria field, as harness writes it),
+    else a line that starts with the words (a description's own)."""
+    m = re.search(r"(?im)^#{1,6}\s*acceptance criteria\s*$", text) \
+        or re.search(r"(?im)^[#*\s]*acceptance criteria\b.*$", text)
     if not m:
         return []
     return bullets(re.split(r"(?m)^#{1,6}\s", text[m.end():], maxsplit=1)[0])[:15]
@@ -2295,7 +2460,7 @@ def change_criteria(ctx, st, plan):
     """What a change is held to: the plan's acceptance criteria; with no plan (the
     stage is not in the ticket's stages) the ticket's own, else the ticket as a whole."""
     if plan.strip():
-        return check_plan(plan)[1]
+        return gated_criteria(check_plan(plan)[1])
     crit = ticket_criteria(read(note_paths(ctx.vault, st["key"])["ticket"]))
     ctx.q.log(st["key"], "no plan: the change is checked against " +
               (f"the ticket's {len(crit)} acceptance criteria" if crit else "the ticket as a whole"))
@@ -2369,17 +2534,29 @@ def stage_plan(ctx, st):
     if not text.strip():
         problems = [f"the plan file was not written: write it to {v['PLAN_FILE']}"]
     if not problems:
-        notes = plan_notes(text)
+        shape = shape_problems(text)
+        if st["attempt"] < ctx.retries:   # asked for once more; on the last try only noted
+            problems = shape
+    if not problems:
+        notes = plan_notes(text) + shape + step_notes(text, workdir(ctx.q, st))
+        listed, nums = criteria_by_id(criteria)
         obj = verdict(ctx, st, "plan", lambda c: render("verify_plan", TICKET=read(p["ticket"], c), PLAN=text,
-                                                         CRITERIA=numbered(criteria)))
-        problems = judge(obj, criteria, read(p["ticket"]), "ticket_quote", "ticket", soft=notes)
+                                                         ANSWERS=v["ANSWERS"], CRITERIA=listed))
+        problems = judge(obj, criteria, read(p["ticket"]), "ticket_quote", "ticket", soft=notes, nums=nums)
         ctx.q.log(st["key"], f"plan verifier: {verifier_line(obj, problems)}")
         if notes:
             ctx.q.log(st["key"], "plan notes (not failures)", "\n".join("- " + n for n in notes))
     if problems:
         return fail(ctx, st, rc, problems)
-    st["questions"] = [{"text": x, "blocking": bool(blocking([x]))} for x in questions]
+    items = plan_items(text)
+    st["questions"] = [dict(q, blocking=bool(blocking([q["text"]]))) for q in items["questions"]]
+    st["criteria"] = [dict(c, edge=is_edge(c)) for c in items["criteria"]]
+    st["plan_sig"] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    write_atomic(os.path.join(ctx.q.dir(st["key"]), "plan.json"),
+                 json.dumps(dict(items, sig=st["plan_sig"]), indent=1, ensure_ascii=False) + "\n")
     open_q = blocking(questions)
+    if open_q and st.get("take_defaults"):
+        open_q = take_defaults(ctx, st, p, open_q)
     if open_q:
         record(st, "questions", open_q)
         st.pop("verify_only", None)   # answered, the plan is written again
@@ -2396,6 +2573,26 @@ def stage_plan(ctx, st):
         st.update(status="plan-review", reason=f"plan ready to read: {p['plan']}")
         ctx.q.save(st)
         ctx.q.log(st["key"], f"waiting for the plan to be read: harness queue approve {st['key']}")
+
+
+def take_defaults(ctx, st, p, open_q):
+    """The ticket goes on with its questions' defaults (its after-plan setting):
+    each blocking question with a Default is taken at it, written to the
+    answers file for the stages after; the ones with no Default, still open."""
+    taken, left = [], []
+    for x in open_q:
+        q = question(x, 0)
+        (taken if q["default"] else left).append(x)
+    if taken:
+        lines = "\n".join(f"- {question(x, 0)['ask'][:300]} -> the default: {question(x, 0)['default'][:300]}"
+                          for x in taken)
+        old = read(p["answers"])
+        write_atomic(p["answers"], (old.rstrip() + "\n" if old.strip() else "") + f"\n<!-- {now_iso()} -->\n"
+                     "Taken at their defaults (the ticket is set to go on without waiting for answers):\n"
+                     + lines + "\n")
+        ctx.q.log(st["key"], f"{len(taken)} blocking question(s) taken at their default (the ticket goes on "
+                             "without waiting for answers)", lines)
+    return left
 
 
 def verifier_line(obj, problems):
@@ -3269,7 +3466,8 @@ def cmd_add(q, a):
             st["stage"] = first_stage(st)
             st.update({k: v for k, v in (("start", "" if a.no_branch else start), ("branch", a.branch),
                                          ("in_place", in_place), ("plan_review", not a.no_plan_approval),
-                                         ("no_branch", a.no_branch), ("repos", repos)) if v})
+                                         ("no_branch", a.no_branch), ("repos", repos),
+                                         ("take_defaults", a.take_defaults)) if v})
             if lost.get(key) and not a.no_branch:
                 print(f"[queue] {key}: branch {branch_of(st)} has commits that {start_of(st)} does not "
                       f"({', '.join(n for n, _ in lost[key])}): the work would end over them. Start from it "
@@ -3483,7 +3681,8 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
                   "verified_repos"):
             st.pop(k, None)
         if st["stage"] == "plan":
-            st.pop("questions", None)
+            for k in ("questions", "criteria", "plan_sig"):
+                st.pop(k, None)
             if os.path.exists(plan_copy(q, st["key"])):
                 os.remove(plan_copy(q, st["key"]))
         st.pop("base_sha", None)   # the run clones (or sets up) again; no delete under the lock
@@ -4016,6 +4215,7 @@ def main(argv):
     s.add_argument("--allow-branch", action="store_true")   # --branch may be the base, main or master
     s.add_argument("--review-plan", action="store_true")   # the default
     s.add_argument("--no-plan-approval", action="store_true")
+    s.add_argument("--take-defaults", action="store_true")   # blocking questions go on at their Default
     sub.add_parser("list")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("remove"); s.add_argument("keys", nargs="+"); s.add_argument("--harness", default="")

@@ -100,7 +100,8 @@ def git(*a):
 if stage == "planning":
     blocking = os.environ.get("FAKE_BLOCKING") and "Use the blue one" not in prompt
     qs = "- [blocking] Which colour? Default: blue\n" if blocking else "- None\n"
-    crit = os.environ.get("FAKE_CRITERIA", "- A file feature.txt says hello feature\n")
+    crit = os.environ.get("FAKE_CRITERIA", "- AC1: GIVEN the project WHEN the change is in THEN a file feature.txt says "
+                          "hello feature (ticket: \"add a feature file\")\n")
     plan = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n" + crit +
             "## Approach\nWrite feature.txt.\n## Files\n- feature.txt: new\n## Questions\n" + qs +
             "## Assumptions\n- None\n")
@@ -216,8 +217,10 @@ class FakeProxy(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"choices": [{"message": {"content": "Looks fine to me, ship it."}}]})
         m = re.search(r"numbered:\n((?:\d+\. .*\n)+)", prompt)
         n = len(m.group(1).splitlines()) if m else 0
+        ids = re.search(r"with their ids:\n((?:AC\d+: .*\n)+)", prompt)   # a plan's criteria, by AC number
+        nums = [int(x) for x in re.findall(r"^AC(\d+):", ids.group(1), re.M)] if ids else range(1, n + 1)
         if "check a plan" in prompt:
-            crit = [{"n": i, "ticket_quote": "add a feature file", "ok": True, "why": "asked"} for i in range(1, n + 1)]
+            crit = [{"n": i, "ticket_quote": "add a feature file", "ok": True, "why": "asked"} for i in nums]
         elif "check a code change" in prompt:
             quote = "hello feature" if FakeProxy.mode != "badquote" else "a line that is not there"
             crit = [{"n": i, "met": True, "quote": quote, "why": "added"} for i in range(1, n + 1)]
@@ -362,6 +365,15 @@ class QueueTest(Base):
         self.assertIn("committed on ABC-1", cards[1]["done"])
         self.assertIn("## Must fix", cards[2]["done"])
         self.assertEqual((cards[3]["must_fix"], "must_fix" in cards[2]), (1, False))
+        # Each card carries its stage's lines from stage-guidance.json, as the "do" list.
+        guide = tq.stage_guidance()
+        self.assertEqual([c.get("do") for c in cards], [guide[s] for s in ("plan", "implement", "review", "fix")])
+        self.assertTrue(cards[0]["do"][0].startswith("This stage: PLAN"))
+        # The plan's items are kept for the viewer and a later tester: in the state and plan.json.
+        self.assertEqual([(c["id"], c["edge"]) for c in st["criteria"]], [("AC1", False)])
+        self.assertEqual(st["criteria"][0]["then"], "a file feature.txt says hello feature")
+        saved = json.loads(cat(os.path.join(self.state, "ABC-1", "plan.json")))
+        self.assertEqual((saved["sig"], [c["id"] for c in saved["criteria"]]), (st["plan_sig"], ["AC1"]))
         # The free twin of the -withtools default, on the agent and the verifier.
         self.assertIn("-m harness/free", self.calls_of("planning")[0])
         self.assertTrue(all(m == "free" and raw == "1" for m, raw, _ in FakeProxy.seen))
@@ -438,6 +450,129 @@ class QueueTest(Base):
         answers = cat(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-answers.md"))
         self.assertIn("Use the blue one.", answers)
 
+    def test_edge_criteria_are_left_to_the_review(self):
+        # The change is held to the ticket's criteria; its edge cases go to the review.
+        os.environ["FAKE_CRITERIA"] = (
+            '- AC1: GIVEN the project WHEN the change is in THEN a file feature.txt says hello feature '
+            '(ticket: "add a feature file")\n'
+            '- AC2: GIVEN feature.txt exists WHEN the change is in THEN it says hello feature once (edge of AC1)\n')
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(len(self.calls_of("planning")), 1)
+        plan_prompt = [p for _, _, p in FakeProxy.seen if "check a plan" in p][0]
+        self.assertIn("with their ids:\nAC1: GIVEN the project", plan_prompt)
+        self.assertIn("\nAC2: GIVEN feature.txt exists", plan_prompt)
+        change = [p for _, _, p in FakeProxy.seen if "check a code change" in p][0]
+        self.assertIn("numbered:\n1. GIVEN the project WHEN the change is in THEN a file feature.txt says hello "
+                      'feature (ticket: "add a feature file")\n\n', change)
+        self.assertNotIn("hello feature once", change)
+        self.assertEqual([c["edge"] for c in self.status()["criteria"]], [False, True])
+
+    def test_a_criterion_not_in_the_shape_is_asked_for_again_once(self):
+        os.environ["FAKE_CRITERIA"] = "- A file feature.txt says hello feature\n"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        # Attempt 1 is sent back for the shape; the last attempt only notes it.
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(len(self.calls_of("planning")), 2)
+        second = cat(self.calls + ".planning").split("\n=====\n")[1]
+        self.assertIn("AC1: not written as one line '- ACn: GIVEN ... WHEN ... THEN ...'", second)
+        log = cat(os.path.join(self.state, "ABC-1", "log.md"))
+        self.assertIn("plan notes (not failures)", log)
+
+    def test_take_defaults_goes_on_without_answers(self):
+        os.environ["FAKE_BLOCKING"] = "1"
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--no-plan-approval", "--take-defaults")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.status()["take_defaults"])
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(len(self.calls_of("planning")), 1)
+        answers = cat(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-answers.md"))
+        self.assertIn("Taken at their defaults", answers)
+        self.assertIn("- Which colour? -> the default: blue", answers)
+        # A question with no default still waits.
+        st = {"key": "ABC-1"}
+        ctx = type("C", (), {"q": tq.Queue(self.state)})()
+        p = {"answers": os.path.join(self.tmp, "a.md")}
+        self.assertEqual(tq.take_defaults(ctx, st, p, ["[blocking] Which one?", "[blocking] Size? Default: 3"]),
+                         ["[blocking] Which one?"])
+        self.assertIn("Size? -> the default: 3", cat(p["answers"]))
+
+    def test_plan_contract_parsing(self):
+        plan = ("# ABC-1 plan\n## Goal\nx\n## Steps\n1. `src/a.py` `run()`: guard empty input. (AC1, AC2)\n"
+                "2. `src/new.py` (new): the helper. (AC1)\n"
+                "## Acceptance criteria\n"
+                '- AC1: GIVEN a file WHEN run THEN it prints ok. (ticket: "prints ok")\n'
+                "- AC2: GIVEN an empty file WHEN run THEN it exits 1 with \"empty\". (edge of AC1)\n"
+                "- AC4: GIVEN no file WHEN run THEN it exits 2. (edge of AC1)\n"
+                "## Questions\n- Q1 [blocking] Exit code for empty? Options: (a) 1 (b) 0 Default: (a), because errors.\n"
+                "- [non-blocking] Q2: Log it? Default: no\n## Assumptions\n- A1: utf-8 only.\n")
+        problems, crit, qs = tq.check_plan(plan)
+        self.assertEqual(problems, [])
+        self.assertEqual(tq.shape_problems(plan), [])
+        items = tq.plan_items(plan)
+        self.assertEqual([s_["files"] for s_ in items["steps"]], [["src/a.py"], ["src/new.py"]])
+        self.assertEqual([(c["id"], c["source"]) for c in items["criteria"]],
+                         [("AC1", 'ticket: "prints ok"'), ("AC2", "edge of AC1"), ("AC4", "edge of AC1")])
+        self.assertEqual([(q["id"], bool(tq.blocking([q["text"]]))) for q in items["questions"]],
+                         [("Q1", True), ("Q2", False)])
+        self.assertEqual(items["questions"][0]["default"][:3], "(a)")
+        # Only the ticket's criteria gate the change, without their ids; the verifier gets ids and numbers.
+        self.assertEqual(tq.gated_criteria(crit), ['GIVEN a file WHEN run THEN it prints ok. (ticket: "prints ok")'])
+        listed, nums = tq.criteria_by_id(crit)
+        self.assertEqual(nums, [1, 2, 4])
+        self.assertTrue(listed.splitlines()[2].startswith("AC4: GIVEN no file"))
+        verdict = {"verdict": "PASS", "criteria": [{"n": n, "ticket_quote": "prints ok", "ok": True} for n in (1, 2, 4)]}
+        self.assertEqual(tq.judge(verdict, crit, "it prints ok", "ticket_quote", "ticket", nums=nums), [])
+        self.assertTrue(any("criterion 4 was not checked" in x for x in
+                            tq.judge({"criteria": verdict["criteria"][:2]}, crit, "it prints ok", "ticket_quote",
+                                     "ticket", nums=nums)))
+        # An older plan (no ids, no tags) is held to every bullet as written, numbered by place.
+        old = ["one thing", "another thing"]
+        self.assertEqual(tq.gated_criteria(old), old)
+        self.assertEqual(tq.criteria_by_id(old)[1], [1, 2])
+        # Shape: a plain bullet, a criterion broken over lines.
+        bad = "## Goal\nx\n## Acceptance criteria\n- AC1: GIVEN a WHEN b\nTHEN c (ticket: \"x\")\n- plain\n"
+        shape = tq.shape_problems(bad)
+        self.assertTrue(any("broken over lines" in x for x in shape), shape)
+        self.assertTrue(any("AC2" in x and "not written as one line" in x for x in shape), shape)
+        # Caps: 16 ticket criteria fail; 15 plus edge cases pass; over 40 in all fails.
+        def acs(n_ticket, n_edge):
+            return ("## Goal\nx\n## Acceptance criteria\n"
+                    + "".join(f'- AC{i}: GIVEN a WHEN b THEN c{i} (ticket: "x")\n' for i in range(1, n_ticket + 1))
+                    + "".join(f"- AC{100 + i}: GIVEN a WHEN e THEN d{i} (edge of AC1)\n" for i in range(n_edge)))
+        self.assertTrue(tq.check_plan(acs(16, 0))[0])
+        self.assertEqual(tq.check_plan(acs(15, 25))[0], [])
+        self.assertTrue(any("at most 40" in x for x in tq.check_plan(acs(15, 26))[0]))
+        # A ticket's criteria: the "## Acceptance criteria" heading (the tracker's field) wins over prose.
+        t = "# K\n\nAcceptance criteria are in the field below.\n- not this\n\n## Acceptance criteria\n- one\n\n## C\n- c\n"
+        self.assertEqual(tq.ticket_criteria(t), ["one"])
+        self.assertEqual(tq.ticket_criteria("x\n**Acceptance criteria**\n- a\n"), ["a"])
+        # Step paths that are not in the repo are noted (not failed), unless marked (new).
+        os.makedirs(os.path.join(self.tmp, "repo", "src"), exist_ok=True)
+        put(os.path.join(self.tmp, "repo", "src", "a.py"), "")
+        self.assertEqual(tq.step_notes(plan, os.path.join(self.tmp, "repo")), [])
+        self.assertTrue(tq.step_notes(plan.replace("src/a.py", "src/gone.py"), os.path.join(self.tmp, "repo")))
+
+    def test_stage_guidance_file(self):
+        guide = tq.stage_guidance()
+        self.assertEqual(sorted(guide), ["fix", "implement", "plan", "review"])
+        for stage, lines in guide.items():   # within the proxy's caps for the card's do list
+            self.assertLessEqual(len(lines), 8, stage)
+            self.assertTrue(all(len(x) <= 240 for x in lines), stage)
+            self.assertLessEqual(sum(len(x) for x in lines), 1000, stage)
+        q = tq.Queue(self.state)
+        bad = os.path.join(self.tmp, "g.json")
+        for text, want in (("not json", {}), ('["a"]', {}),
+                           ('{"plan": ["x {KEY}", 3, ""], "_c": ["y"], "fix": "z"}', {"plan": ["x {KEY}"]})):
+            put(bad, text)
+            with mock.patch.object(tq, "STAGE_GUIDANCE", bad):
+                self.assertEqual(tq.stage_guidance(q, "ABC-1"), want)
+        with mock.patch.object(tq, "STAGE_GUIDANCE", os.path.join(self.tmp, "missing.json")):
+            self.assertEqual(tq.stage_guidance(q, "ABC-1"), {})
+
     def test_answered_during_the_run_is_planned_again_in_the_same_run(self):
         os.environ.update(FAKE_BLOCKING="1", FAKE_ANSWER_DURING="1", FAKE_STATE=self.state,
                           FAKE_TQ=os.path.abspath(tq.__file__))
@@ -453,7 +588,8 @@ class QueueTest(Base):
         self.assertEqual(results[0], ("plan", "questions"))
         self.assertIn(("push", "passed"), results)
         q2 = self.status("ABC-2")["questions"]
-        self.assertEqual(q2, [{"text": "[blocking] Which colour? Default: blue", "blocking": True}])
+        self.assertEqual(q2, [{"id": "Q1", "text": "[blocking] Which colour? Default: blue", "ask": "Which colour?",
+                              "blocking": True, "options": [], "default": "blue"}])
 
     def test_a_plan_written_in_the_clone_or_printed_is_recovered(self):
         for where in ("clone", "print"):
@@ -611,13 +747,16 @@ class QueueTest(Base):
                                     "## Questions\n- No questions.\n- None; the ticket is clear\n- (none)\n")
         self.assertEqual((crit, qs), (["None of the tests break"], []))
         notes = tq.plan_notes(plan)
-        self.assertTrue(any("4 questions" in n for n in notes), notes)
         self.assertTrue(any("not marked" in n and "taken as blocking" in n for n in notes), notes)
+        many = "## Goal\nx\n## Acceptance criteria\n- y\n## Questions\n" + "".join(
+            f"- [non-blocking] q{i}? Default: a\n" for i in range(9))
+        self.assertEqual(tq.check_plan(many)[0], [])   # too many questions is a note only
+        self.assertTrue(any("9 questions" in n for n in tq.plan_notes(many)), tq.plan_notes(many))
         problems, _, _ = tq.check_plan("## Goal\nx\n")
         self.assertTrue(any("Acceptance criteria" in p for p in problems))
         # Only Goal and Acceptance criteria are needed.
         self.assertEqual(tq.check_plan("## Goal\nx\n## Acceptance criteria\n- y\n")[0], [])
-        self.assertTrue(any("Approach" in n for n in tq.plan_notes("## Goal\nx\n## Acceptance criteria\n- y\n")))
+        self.assertTrue(any("Steps" in n for n in tq.plan_notes("## Goal\nx\n## Acceptance criteria\n- y\n")))
         self.assertEqual(tq.check_plan("")[0], ["the plan file was not written"])
 
     def test_secrets_and_scope(self):
@@ -646,7 +785,7 @@ class QueueTest(Base):
             text = tq.render(name, DIFF="d", MUST_FIX="m", **v)
             self.assertNotIn("{{", text, name)
             self.assertLess(len(text), 120_000)
-        for name, vals in (("verify_plan", dict(TICKET="t", PLAN="p", CRITERIA="1. c")),
+        for name, vals in (("verify_plan", dict(TICKET="t", PLAN="p", CRITERIA="AC1: c", ANSWERS="a")),
                            ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m"))):
             self.assertNotIn("{{", tq.render(name, **vals), name)
 
@@ -734,7 +873,7 @@ class ReviewFixesTest(Base):
         rc, out = self.run_queue()
         self.assertEqual(self.status()["status"], "done", out)
         prompt = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][0]
-        self.assertIn("1. A file feature.txt says hello feature", prompt)
+        self.assertIn("1. GIVEN the project WHEN the change is in THEN a file feature.txt says hello feature", prompt)
         self.assertNotIn("Nothing at all", prompt)
 
     def test_a_timed_out_stage_is_blocked_not_retried(self):
@@ -2156,7 +2295,7 @@ class ResultsTest(Base):
         self.assertEqual((st["orig_branch"], st["folder_branch_now"], st["warnings"]), ("", "main", []))
         note = self.note()
         self.assertTrue(note.startswith("---\ntype: note\nticket: ABC-1\n"), note[:80])
-        for part in ("## Goal\n\nA feature file.", "- A file feature.txt says hello feature", "pushed to origin",
+        for part in ("## Goal\n\nA feature file.", "THEN a file feature.txt says hello feature", "pushed to origin",
                      "ABC-1: implementing", "1 file(s), +1 -0", "## Review notes"):
             self.assertIn(part, note)
         # A retry clears them and the stale note; the next go writes its own.
