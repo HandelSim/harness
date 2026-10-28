@@ -361,7 +361,7 @@ class QueueTest(Base):
         self.assertEqual([c["stage"] for c in cards], ["plan", "implement", "review", "fix"])
         self.assertTrue(all(c["branch"] == "ABC-1" and c["attempt"] == 1 and "clone" in c["where"] for c in cards), cards)
         plan_file = os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-plan.md")
-        self.assertIn(f"the plan is written to {plan_file}: # ABC-1 plan", cards[0]["done"])
+        self.assertIn(f"no code changed, the plan written to {plan_file}: # ABC-1 plan", cards[0]["done"])
         self.assertIn("committed on ABC-1", cards[1]["done"])
         self.assertIn("## Must fix", cards[2]["done"])
         self.assertEqual((cards[3]["must_fix"], "must_fix" in cards[2]), (1, False))

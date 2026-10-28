@@ -2434,11 +2434,10 @@ CARD_WHERE_IN_PLACE = ("the owner's own project folder, not a clone. Where you c
                        "by name (never git add -A, git add . or git commit -a); leave every other file alone (no git "
                        "reset --hard, clean, stash, or checkout of files you did not change)")
 CARD_DONE = {
-    "plan": "the plan is written to {PLAN_FILE}: # {KEY} plan, then ## Goal, ## Steps (1. `file` `function()`: the "
-            "change (AC1, AC2)), ## Acceptance criteria (one line each: - AC1: GIVEN .. WHEN .. THEN .. (ticket: "
-            "\"exact words\") or (edge of AC1)), ## Questions (- Q1 [blocking] ..? Options: (a) .. (b) .. Default: "
-            "(a), because ..), ## Assumptions (- A1: ..); then you re-read the code each Step names and fixed the "
-            "plan. Change no code.",
+    "plan": "no code changed, the plan written to {PLAN_FILE}: # {KEY} plan, ## Goal, ## Steps (1. `file` "
+            "`function()`: the change (AC1)), ## Acceptance criteria (one line each: - AC1: GIVEN .. WHEN .. THEN .. "
+            "(ticket: \"exact words\") or (edge of AC1)), ## Questions (- Q1 [blocking] ..? Options: (a) .. (b) .. "
+            "Default: (a), because ..), ## Assumptions (- A1: ..); then each Step's code re-read and the plan fixed.",
     "implement": "every acceptance criterion of the plan is met and committed on {BRANCH} (git add <files>, git commit "
                  "-m \"{KEY}: <what changed>\"), and git status is clean. Do not push.",
     "implement-repos": "every acceptance criterion of the plan is met. {COMMIT_STEP}",
