@@ -52,6 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runs as runs_view
 import settings_view  # noqa: E402
 import vault_view  # noqa: E402
+import diff_view  # noqa: E402
 
 PUB_CSP = "sandbox allow-scripts allow-popups"
 INDEX_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
@@ -1034,6 +1035,11 @@ def make_handler(cfg):
                     got = runs_view.render_ticket(r, bits[1], done)
                     if got:
                         self.send_runs(200, f"harness: {got[0]}", got[1], runs_view.LIVE_JS, head, "queue")
+                        return
+                elif bits[2] == "diff":
+                    got = diff_view.page(r, bits[1], q)
+                    if got:
+                        self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head, "queue")
                         return
                 elif bits[2] == "live":
                     got = runs_view.ticket_live(r, bits[1])

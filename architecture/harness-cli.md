@@ -1564,7 +1564,17 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   stages: Full, Review only, Implement+review, Plan only or Custom). The
   branch fields suggest the project's local and remote branches from
   `/runs/queue/branches?project=` (read-only git, cached 5 s), which also
-  says which repository and branch the folder is on. "+ Add tickets" scrolls to the
+  says which repository and branch the folder is on, its remotes and their
+  default branches. The form is clamped to what the add accepts, each
+  greyed-out choice saying why, and Add stays off with the reasons listed
+  until the choices make sense: fix needs review; with review/fix/push but
+  no implement, New work is off (the work must already exist); more than one
+  key turns off Continue and the Work branch name; plan approval is off with
+  no plan stage or for Plan only (the add then sends `--no-plan-approval`);
+  a work branch that is main/master, a remote's default or the target (an
+  empty target meaning the folder's branch) is refused; an existing branch
+  of the ticket's name is a warning. `add_tickets` refuses the same
+  combinations server-side. "+ Add tickets" scrolls to the
   form and focuses the keys. The project folder starts as the git repository
 `harness serve` (or the launch that started the viewer) was run in
 (`--project-dir`, its top folder), else the last ticket's; the others are
@@ -1599,6 +1609,21 @@ offered as suggestions. It is taken as pasted: quotes
   result, reason and `.out`, the notes with an add form, the plan, answers
   and review notes from the vault, and `log.md`. `/runs/ticket/<KEY>/live`
   is its poll JSON, `/runs/ticket/<KEY>/<stage>-<n>.out` an output file.
+- `/runs/ticket/<KEY>/diff?repo=&view=` (`serve/diff_view.py`, "Changes" on
+  the ticket page): a diff drawn in the browser by the vendored diff2html
+  3.4.56 (`serve/vendor/diff2html/`, MIT; its JS and CSS inlined, the JS
+  under the page's nonce), side by side or one column (remembered per
+  browser). `repo` picks the repository: the project itself, or for an
+  in-place ticket one inside it (`ticket_queue.nested_repos`: its own
+  `.git`, three levels down, not a submodule, not in node_modules and the
+  like); anything else is refused and the project shown. `view`: `work`
+  (the project only: `base_sha..` the ticket's branch, in the project or
+  its copy, else `refs/harness-queue/KEY`; what review reads),
+  `uncommitted` (`git diff HEAD` plus untracked files, at most 100, each
+  cut at 200 kB) or `unpushed` (`@{upstream}...HEAD`, as last fetched).
+  Read-only git with no external diff or textconv; 2 MB of diff at most,
+  cut at a file boundary and said so; files that look like secrets
+  (`vault_view.SECRET`) are left out and named.
 - `/runs/<sid>`: the transcript (text, thinking, each tool call with input,
   output, status and timing, subtasks, retries, errors; a file change as its
   diff from opencode's tool metadata, a `todowrite` as a checklist), crumbs

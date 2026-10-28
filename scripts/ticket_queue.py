@@ -2876,9 +2876,9 @@ def cmd_add(q, a):
             frm = frm[:12] if re.fullmatch(r"[0-9a-f]{40}", frm) else frm[:40]
             how = (f"in {project} itself" if in_place else f"in a clone of {project}") \
                 + f", from {frm} on branch {branch_of(st)}"
-            plan = "" if "plan" not in stages else \
-                f"; the plan waits for you to approve it (harness queue approve {key})" if not a.no_plan_approval \
-                else "; implementing starts after the plan without asking"
+            plan = "" if "plan" not in stages else "; it is done once the plan is written" if stages == ["plan"] \
+                else f"; the plan waits for you to approve it (harness queue approve {key})" if not a.no_plan_approval \
+                else f"; {stages[1]} starts after the plan without asking"
             print(f"[queue] {key}: queued ({how}; stages {','.join(stages)}{plan})")
         q.set_order(order)
     return rc

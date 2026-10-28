@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -25,6 +26,7 @@ from urllib.parse import quote, unquote, urlencode
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pub  # noqa: E402
 import runs  # noqa: E402
+import diff_view  # noqa: E402
 
 # As opencode 1.19.3 creates them (sqlite_master), trimmed to the tables the viewer reads.
 SCHEMA = """
@@ -733,7 +735,7 @@ class QueuePageTest(RunsServer):
         self.assertIn("never committed, reset or deleted", body)
         self.assertIn("Nothing is built until you approve", body)
         self.assertNotIn("hold the plan", body)
-        r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("preset", "review"),
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("preset", "full"),
                                                 ("ref", "here"), ("branch", "feat/x")])
         self.assertEqual(r.status, 303, body)
         with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
@@ -753,6 +755,14 @@ class QueuePageTest(RunsServer):
         with open(os.path.join(self.queue, "ABC-9", "state.json")) as f:
             st = json.load(f)
         self.assertEqual((st.get("in_place"), st.get("plan_review")), (None, None))
+        # no plan stage: nothing waits on an approval, whatever the radio said
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-10"), ("project", proj), ("preset", "review"),
+                                                ("start", "continue"), ("cont", "ABC-7-work")])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "ABC-10", "state.json")) as f:
+            self.assertIsNone(json.load(f).get("plan_review"))
+        info = runs.project_branches(proj)
+        self.assertEqual((info["current"], info["remotes"], info["defaults"]), ("main", [], []))
         r, body = self.req("GET", "/runs/ticket/ABC-9")
         self.assertIn("works <b>in a separate copy</b>", body)
         self.assertIn("after the plan <b>goes straight on</b>", body)
@@ -894,11 +904,24 @@ class QueuePageTest(RunsServer):
                 (good[:2] + [("preset", "custom"), ("stage_fix", "1"), ("stage_implement", "1")], "pick review"),
                 (good[:2] + [("preset", "custom")], "at least one stage"),
                 (good[:2] + [("preset", "<b>")], "not a preset: &lt;b&gt;"),
+                # what the form greys out, refused here too
+                (good[:2] + [("preset", "review"), ("start", "new")], "the work must already exist"),
+                (good + [("start", "continue"), ("cont", "main")], "straight onto main; give it a work branch name"),
+                (good + [("start", "continue"), ("cont", "ABC-7-work"), ("branch", "main")], "straight onto main"),
+                (good + [("start", "new"), ("branch", "master")], "straight onto master"),
+                (good + [("start", "continue"), ("cont", "ABC-7-work"), ("base", "ABC-7-work")],
+                 "straight onto ABC-7-work"),
                 (good + [("note", "x" * 4001)], "over 4000")):
             r, body = self.post("/runs/queue/add", fields)
             self.assertEqual(r.status, 409, fields)
             self.assertIn(why, body)
         self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-9")))
+        # continuing the branch the folder is on, with no target: the work would go onto itself
+        subprocess.run(["git", "-C", proj, "checkout", "-q", "ABC-7-work"], check=True, capture_output=True)
+        runs._BRANCHES.clear()
+        r, body = self.post("/runs/queue/add", good + [("start", "continue"), ("cont", "ABC-7-work")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("empty means the branch the folder is on, ABC-7-work", body)
         # a refused add is the queue page again: the reason in the form, nothing typed lost
         r, body = self.post("/runs/queue/add", [("keys", "ABC-9"), ("project", "relative/dir"), ("base", "dev"),
                                                 ("preset", "custom"), ("stage_review", "review"),
@@ -1042,6 +1065,106 @@ class QueuePageTest(RunsServer):
             r, _ = self.post(path)
             self.assertEqual(r.status, 401, path)
         self.assertEqual(self.state()["status"], "needs-answers")
+
+
+class DiffPageTest(RunsServer):
+    """/runs/ticket/KEY/diff: the repository picked, its diff drawn by diff2html."""
+
+    def git(self, d, *a):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+        return subprocess.run(["git", "-C", d, *a], check=True, env=env, capture_output=True, text=True).stdout.strip()
+
+    def write(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+    def setUp(self):
+        super().setUp()
+        proj = self.proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.write(os.path.join(proj, "a.txt"), "one\n")
+        self.git(proj, "add", "a.txt")
+        self.git(proj, "commit", "-qm", "a")
+        self.base = self.git(proj, "rev-parse", "HEAD")
+        self.git(proj, "checkout", "-qb", "ABC-12")
+        self.write(os.path.join(proj, "a.txt"), "one\nwork <b>line</b>\n")
+        self.write(os.path.join(proj, ".env"), "TOKEN=nope\n")
+        self.git(proj, "add", "a.txt", ".env")
+        self.git(proj, "commit", "-qm", "the ticket's work")
+        self.git(proj, "checkout", "-q", "main")
+        self.write(os.path.join(proj, "a.txt"), "one\nnot committed\n")
+        self.write(os.path.join(proj, "new.txt"), "hello\n")
+        self.write(os.path.join(proj, ".env.local"), "TOKEN=nope\n")
+        inner = git_repo(os.path.join(proj, "libs", "inner"))
+        self.write(os.path.join(inner, "x.txt"), "inner change\n")
+        sub = git_repo(os.path.join(proj, "sub"))   # a gitlink in the project's index: a submodule, not listed
+        self.git(proj, "add", "sub")
+        self.git(proj, "commit", "-qm", "sub")
+        self.assertTrue(os.path.isdir(sub))
+        self.ticket(project=proj, in_place=True, base_sha=self.base, status="done", questions=[])
+        self.start()
+
+    def shown(self, body):
+        m = re.search(r"<script type='application/json' id='dv-data'>(.*?)</script>", body, re.S)
+        return json.loads(m.group(1)) if m else ""
+
+    def test_the_tickets_work_and_the_repository_pick(self):
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("href='/runs/ticket/ABC-12/diff'>Changes</a>", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
+        self.assertEqual(r.status, 200, body)
+        self.assertIn("<option value='libs/inner'>libs/inner</option>", body)
+        self.assertNotIn("value='sub'", body)
+        self.assertIn("name='view' value='work' checked>", body)
+        self.assertIn("1 commit(s)", body)
+        self.assertIn("Diff2Html", body)
+        self.assertIn(".d2h-wrapper", body)
+        diff = self.shown(body)
+        self.assertIn("+work <b>line</b>", diff)
+        self.assertNotIn("<b>", body.split("id='dv-data'>", 1)[1].split("</script>", 1)[0])
+        self.assertNotIn("TOKEN", diff)
+        self.assertIn("left out because they look like secrets: .env", body)
+        self.assertNotIn("not committed", diff)
+
+    def test_uncommitted_new_files_and_a_nested_repository(self):
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
+        diff = self.shown(body)
+        self.assertIn("+not committed", diff)
+        self.assertIn("+++ b/new.txt\n@@ -0,0 +1,1 @@\n+hello", diff)
+        self.assertNotIn(".env.local", diff)
+        self.assertNotIn("+work", diff)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=work")
+        self.assertIn("value='libs/inner' selected", body)
+        self.assertIn("name='view' value='work' disabled>", body)   # only the project has the ticket's branch
+        self.assertIn("name='view' value='uncommitted' checked>", body)
+        self.assertIn("+inner change", self.shown(body))
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=unpushed")
+        self.assertIn("has no upstream", body)
+        self.assertEqual(self.shown(body), "")
+
+    def test_refusals_caps_and_a_copy(self):
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=../../etc")
+        self.assertIn("not a repository of this ticket: ../../etc; showing the project", body)
+        self.assertIn("+work", self.shown(body))
+        r, _ = self.req("GET", "/runs/ticket/ABC-99/diff")
+        self.assertEqual(r.status, 404)
+        cap = diff_view.DIFF_CAP
+        self.addCleanup(setattr, diff_view, "DIFF_CAP", cap)
+        diff_view.DIFF_CAP = 100
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
+        self.assertIn("too big to show in full", body)
+        self.assertLessEqual(len(self.shown(body)), 100)
+        diff_view.DIFF_CAP = cap
+        self.ticket(project=self.proj, base_sha=self.base, status="done", questions=[])   # a copy, now gone
+        self.git(self.proj, "update-ref", "refs/harness-queue/ABC-12", "ABC-12")
+        shutil.rmtree(os.path.join(self.queue, "ABC-12", "repo"))
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
+        self.assertNotIn("libs/inner", body)
+        self.assertIn("holds only the project's own repository", body)
+        self.assertIn("+work", self.shown(body))   # what push fetched into the project
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
+        self.assertIn("the separate copy is gone", body)
 
 
 class BackgroundTest(unittest.TestCase):
