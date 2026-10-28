@@ -1558,8 +1558,16 @@ offered as suggestions. It is taken as pasted: quotes
   is the JSON the page polls.
 - `/runs` (`?q=` filter): live runs, queue tickets with their sessions by
   stage, then every session newest first. The index shows the live ones in
-  an "Agent runs" panel.
-- `/runs/ticket/<KEY>`: status and why, the stage strip and buttons, the
+  an "Agent runs" panel, under a line saying what the queue run is on (or
+  that none is going) and how many tickets are queued and waiting on you.
+- `/runs/ticket/<KEY>`: status and why, the stage strip, a Result panel
+  once `state.json` has `push` (where the branch went, an "Open a pull
+  request" link from `compare_url` when it is an http(s) one, the diffstat,
+  the commits, a refused push's error and the push `warnings`), and buttons,
+  each with a tooltip saying what it does (the queue page's rows use the same
+  retry labels: Retry, Plan again without answering, Resume, Run again,
+  Queue again). A ticket at plan-review or needs-answers shows the plan open
+  above the approve or answer form (not again among the vault notes), the
   plan's questions with an answer form (a blocked ticket instead says where
   and why it stopped and takes one note: Retry runs that stage again as is,
   the note re-plans, or reruns the stage when the ticket has no plan), the
