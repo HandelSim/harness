@@ -32,7 +32,7 @@ control room: its runner, its tickets, and every action harness queue has.
   /runs/ticket/<KEY>/live     the ticket page's live regions, as JSON (polled)
   POST /runs/<session>/send   a message for a live run (agents/live-run.sh's inbox)
   POST /runs/<session>/stop   stop the queue stage the session belongs to
-  POST /runs/ticket/<KEY>/answer|approve|retry|stop|remove|move|note
+  POST /runs/ticket/<KEY>/answer|approve|retry|continue|stop|remove|move|note
                               harness queue's own commands for the ticket
   POST /runs/queue/add|start|halt
                               add tickets; start `harness queue run` detached (back=KEY:
@@ -696,6 +696,9 @@ class Runs:
         want = st.get("stages")
         want = [s for s in want if isinstance(s, str)] if isinstance(want, list) and want else list(STAGES)
         out["stages"] = [s for s in STAGES if s in want]
+        ses = st.get("session")   # the agent's opencode session a cut-off stage goes on in
+        out["session"] = ({"stage": ses["stage"], "id": ses["id"]} if isinstance(ses, dict)
+                          and isinstance(ses.get("stage"), str) and isinstance(ses.get("id"), str) else {})
         notes = st.get("notes")
         try:
             with open(os.path.join(self.queue_dir, key, "notes.json"), encoding="utf-8") as f:
@@ -1402,6 +1405,9 @@ def _btn(action, label, cls="", fields=(), confirm="", title="", disabled=False)
 
 STOPPABLE = ("queued", "needs-answers", "plan-review", "blocked", "running", "interrupted")
 RETRYABLE = ("blocked", "needs-answers", "stopped", "done", "interrupted")
+# a stage an agent works in, cut off or blocked: harness queue continue goes on in its session
+CONTINUABLE = ("blocked", "stopped", "interrupted", "queued")
+AGENT_STAGES = ("plan", "implement", "review", "fix")
 RETRY_LABEL = {"blocked": "Retry", "needs-answers": "Plan again without answering", "stopped": "Resume",
                "done": "Run again", "interrupted": "Queue again"}
 RETRY_TITLE = {"blocked": "queue it again at the stage it stopped at, as it is",
@@ -1733,6 +1739,19 @@ def _note_form(key, button):
             f"<div class='acts'><button type='submit' class='primary'>{button}</button></div></form>")
 
 
+def _continue_form(key, st):
+    """Go on with the stage that was cut off, in its agent's own session, with a message."""
+    stage = esc(st.get("stage", ""))
+    s = st.get("session") or {}
+    how = ("its agent goes on in the same session, with what it did so far" if s.get("stage") == st.get("stage")
+           and s.get("id") else "no session of its agent is known, so a new agent is told to finish the work there")
+    return (f"<form method='post' action='/runs/ticket/{quote(key)}/continue' class='qs'>"
+            f"<label><div class='q'>Message for the agent <span class='muted'>(optional; {how})</span></div>"
+            f"<textarea name='text' maxlength='{NOTE_MAX}' placeholder='For example: the proxy was down and is back; "
+            "carry on. Or: the test needs the database running, it is up now'></textarea></label>"
+            f"<div class='acts'><button type='submit' class='primary'>Continue {stage}</button></div></form>")
+
+
 def _answer_form(key, qs, review=False):
     parts = [f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"]
     for i, q in enumerate(qs[:FORM_QUESTIONS]):
@@ -1894,12 +1913,21 @@ def _t_questions(runs, key, st):
         then = ("the ticket goes back to planning with it, and the revised plan comes back here for your "
                 "approval before anything is built." if planned else f"the ticket runs {stage} again with it.")
         intro = (f"It stopped at {esc(stage)}" + (f": {esc(st['reason'])}" if st.get("reason") else "") + ". "
-                 f"If you fixed the cause yourself (a setting, the run mode, something on your machine), use "
-                 f"Retry above: it runs {esc(stage)} again as it is (add a note under Notes first and every "
-                 f"stage gets it). If the work itself should change, write it here: {then}")
-        return (f"<section class='panel'><h2>Get it going again</h2><div class='muted'>{intro}</div>"
+                 f"If you fixed the cause yourself (a setting, the run mode, something on your machine), "
+                 f"Continue: the agent goes on with {esc(stage)} where it was, told what you write, and its work "
+                 f"is checked as usual when it ends. Retry above runs {esc(stage)} again with a new agent (add a "
+                 f"note under Notes first and every stage gets it).")
+        go_on = _continue_form(key, st) if stage in AGENT_STAGES else ""
+        return (f"<section class='panel'><h2>Get it going again</h2><div class='muted'>{intro}</div>{go_on}"
+                f"<div class='muted'>If the work itself should change, write it here: {then}</div>"
                 f"{_note_form(key, 'Send and plan again' if planned else f'Send and run {esc(stage)} again')}"
                 "</section>")
+    if status in ("stopped", "interrupted") and st.get("stage") in AGENT_STAGES and st.get("stopped_from") != "plan-review":
+        cut = "you stopped it" if status == "stopped" else "the queue run working on it ended"
+        intro = (f"Its {esc(st.get('stage', ''))} stage was cut off ({cut}). Continue goes on with it where it was, "
+                 "told what you write; Resume (or Queue again) above runs the stage again with a new agent.")
+        return (f"<section class='panel'><h2>Go on with it</h2><div class='muted'>{intro}</div>"
+                f"{_continue_form(key, st)}</section>")
     if status in WAITING and vault:
         review = status == "plan-review"
         head = "Approve the plan, or send feedback" if review else "Questions for you" if qs else "Answer the planner"
@@ -2072,7 +2100,7 @@ def render_ticket(runs, key, msg="", bad=False):
 
 # --- actions ------------------------------------------------------------------------
 
-TICKET_ACTIONS = ("answer", "approve", "retry", "stop", "remove", "move", "note")
+TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note")
 QUEUE_ACTIONS = ("add", "start", "halt", "end")
 
 
@@ -2166,6 +2194,13 @@ def ticket_action(runs, key, action, form):
         # --harness: an agent a run that is gone left behind is ended, its container too
         return _waits(runs, key, _queue(runs, ["retry", key] + (["--stage", stage] if stage else [])
                                         + ["--harness", runs.harness]))
+    if action == "continue":
+        if status not in CONTINUABLE:
+            return False, f"{key} is {status}; there is no stage to go on{again}"
+        text = _one(form, "text").replace("\r\n", "\n")
+        if len(text) > NOTE_MAX:
+            return False, f"the message is over {NOTE_MAX} characters"
+        return _waits(runs, key, _queue(runs, ["continue", key, "--stdin", "--harness", runs.harness], text))
     if action == "stop":
         if status not in STOPPABLE:
             return False, f"{key} is {status}; there is nothing to stop"

@@ -254,7 +254,10 @@ The json run itself goes through `harness-live-run` (`agents/live-run.sh`),
 which attaches it to a loopback `opencode serve` so the serve run viewer can
 message it while it works, via `~/.local/share/harness/live/` in the agent
 home (see "Run viewer" in [`harness-cli.md`](harness-cli.md));
-`HARNESS_LIVE=0` runs it plain.
+`HARNESS_LIVE=0` runs it plain. Either way it prints `[harness] session:
+<id>` on stderr (live: as soon as the session exists; plain: at the end),
+which `harness queue` records to go on in a cut-off stage; the script is
+baked into the image, so a container gets that line after `harness upgrade`.
 
 The run's exit code is preserved so the tests' provider-auth skip path keeps
 working. This trades live streaming (irrelevant for single-shot `-p`) for a

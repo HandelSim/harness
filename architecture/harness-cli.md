@@ -784,7 +784,22 @@ needs-answers, stopped, done, a running ticket no run has in hand, a queued
 one with `--stage`; back to plan, or any retry of a done ticket
 without `--stage` (`plain_retry`), means a fresh clone from `--ref`;
 refused with exit 1 and the reason, `state.json` untouched, where
-`retry_refused` says so), `stop KEY` (a waiting
+`retry_refused` says so; a new agent does the stage again), `continue KEY
+["MESSAGE"]` (`cmd_continue`; blocked, stopped, interrupted or queued at an
+agent stage with its work there, else refused by `continue_refused`: the
+stage goes on from the work as it is, `requeue(go_on=True)` keeping the
+commits, and the next launch passes `--session <id>` to `opencode run` with
+`queue_prompts/continue.md` (why it was cut off, the owner's message, the
+task file holding the stage's full prompt); its result is checked as usual.
+The session id comes from the `[harness] session: ses_...` line
+`agents/live-run.sh` prints on stderr, recorded in `state.json` `session`
+while the agent runs (so a killed run leaves it) and dropped when the stage
+passes or a new agent starts it. With no session known, one of the other
+mode's (container vs host stores), or a resumed launch that dies at once
+(`LaunchFailed`), a new agent gets the full prompt plus a `GOING_ON` block
+telling it to finish the work there. A halt, Ctrl-C, an upstream outage or a
+run that died with the agent working sets `resume` itself (`go_on_later`), so
+the next run goes on in the session without being asked), `stop KEY` (a waiting
 ticket becomes `stopped`; a running one the run has in hand gets the
 `KEY/stop` sentinel, which the runner also checks right before the push;
 "in hand" is `run_holds`: a fresh beat, run.json naming it (the run writes
@@ -1642,8 +1657,11 @@ offered as suggestions. It is taken as pasted: quotes
   Queue again). A ticket at plan-review or needs-answers shows the plan open
   above the approve or answer form (not again among the vault notes), the
   plan's questions with an answer form (a blocked ticket instead says where
-  and why it stopped and takes one note: Retry runs that stage again as is,
-  the note re-plans, or reruns the stage when the ticket has no plan), the
+  and why it stopped, with a Continue form at an agent stage: its message
+  goes to `harness queue continue --stdin`, the agent going on in its
+  session; Retry runs that stage again with a new agent; one note re-plans,
+  or reruns the stage when the ticket has no plan; a stopped or "run ended"
+  ticket at an agent stage gets the Continue form too), the
   retry form's "from" stages (only those `ticket_queue.retry_choices`, imported
   from the queue script, does not refuse, remotes as last fetched; none: the
   reason instead of the form; the module not importable: all), the queue's

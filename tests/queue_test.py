@@ -54,6 +54,18 @@ pointer = re.search(r"Your full instructions for the \w+ stage of ticket \S+ are
 if pointer:   # the short prompt of a long one on Windows: the agent reads the task file
     open(os.environ["FAKE_CALLS"] + ".pointer", "a").write(prompt + "\n=====\n")
     prompt = open(pointer.group(1), encoding="utf-8").read()
+# its session, as agents/live-run.sh says it; --session: going on in one, with a short
+# prompt and the stage's own in the task file
+if "--session" in args:
+    sid = args[args.index("--session") + 1]
+    open(os.environ["FAKE_CALLS"] + ".continue", "a").write(prompt + "\n=====\n")
+    prompt = open(task, encoding="utf-8").read()
+else:
+    count = os.environ["FAKE_CALLS"] + ".sessions"
+    sid = "ses_fake%d" % (len(open(count).read()) if os.path.exists(count) else 0)
+    open(count, "a").write("x")
+if not os.environ.get("FAKE_NO_SESSION"):
+    print("[harness] session: " + sid, file=sys.stderr, flush=True)
 same = os.path.exists(task) and open(task, encoding="utf-8").read() == prompt
 open(os.environ["FAKE_CALLS"] + ".task", "a").write(f"{ticket} {same}\n")
 stage = re.match(r"You are (\w+)", prompt).group(1)
@@ -65,7 +77,8 @@ if os.environ.get("FAKE_EXIT"):   # N:RC: the first N launches die at once, havi
         open(count, "a").write("x")
         print("launch failed: no container runtime")
         sys.exit(int(rc))
-if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == ticket:
+if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == ticket \
+        and os.environ.get("FAKE_SLEEP_STAGE", stage) == stage:
     import time
     open(os.environ["FAKE_CALLS"] + ".sleeping", "a").write(ticket + "\n")
     if os.environ.get("FAKE_SLEEP_NESTED"):   # a commit there, then stopped while it sleeps
@@ -1306,6 +1319,146 @@ class OwnerControlTest(Base):
         self.assertIn("goes straight on to implementing", out)
         rc, out = self.run_queue()
         self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+
+    def session_of(self, stage, key="ABC-1"):
+        s = (self.status(key) or {}).get("session") or {}
+        return s.get("id") if s.get("stage") == stage else None
+
+    def stopped_mid_implement(self, how):
+        """ABC-1's implement agent (the run's second launch: ses_fake1) cut off by a stop or a halt."""
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1", FAKE_SLEEP_STAGE="implementing")
+        self.add("ABC-1")
+        p = self.run_bg()
+        self.wait_for(self.sleeping, "the implement agent")
+        self.wait_for(lambda: self.session_of("implement") == "ses_fake1", "its session on record")
+        rc, out = self.q(how) if how == "halt" else self.q(how, "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(timeout=30), 0, cat(os.path.join(self.tmp, "run.out")))
+        del os.environ["FAKE_SLEEP"]
+
+    def test_continue_a_stopped_stage_goes_on_in_its_session(self):
+        self.stopped_mid_implement("stop")
+        self.assertEqual(self.status()["status"], "stopped")
+        rc, out = self.q("continue", "abc-1", "The proxy is back; carry on.")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("go on at implement in its agent's session ses_fake1", out)
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"], st["resume"]["message"]),
+                         ("queued", "implement", "The proxy is back; carry on."))
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        implementing = self.calls_of("implementing")
+        self.assertEqual(len(implementing), 1, implementing)   # the stopped one never got to log its call
+        self.assertIn("--session ses_fake1", implementing[0])
+        said = cat(self.calls + ".continue")
+        self.assertIn("implement stage of ticket ABC-1", said)
+        self.assertIn("The proxy is back; carry on.", said)
+        self.assertIn("stopped by the owner", said)
+        self.assertIn(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-task.md"), said)
+        # the agent read its stage's own prompt from the task file, and the stage was checked as usual
+        self.assertIn("You are implementing", self.prompts("implementing")[0])
+        self.assertTrue(os.path.exists(os.path.join(self.state, "ABC-1", "implement-0.out.before")))
+        self.assertIn("ABC-1", sh("git", "-C", self.remote, "branch", "--list", "ABC-1"))
+        self.assertNotIn("resume", st)
+        self.assertNotIn("session", st)   # done: no stage to go on in
+
+    def test_a_halted_stage_goes_on_in_its_session_by_itself(self):
+        self.stopped_mid_implement("halt")
+        st = self.status()
+        self.assertEqual((st["status"], st["resume"]["stage"]), ("queued", "implement"))
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+        implementing = self.calls_of("implementing")
+        self.assertEqual(len(implementing), 1, implementing)
+        self.assertIn("--session ses_fake1", implementing[0])
+        said = cat(self.calls + ".continue")
+        self.assertIn("halted", said)
+        self.assertIn("(none: carry on)", said)
+        # the next stage is a new agent's
+        self.assertNotIn("--session", self.calls_of("reviewing")[0])
+
+    def test_continue_a_blocked_stage_with_what_to_do(self):
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add("ABC-1")
+        self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"], st["session"]["id"]), ("blocked", "implement", "ses_fake2"))
+        del os.environ["FAKE_NO_COMMIT"]
+        rc, out = self.q("continue", "ABC-1", "--text", "Commit it this time.")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+        last = self.calls_of("implementing")[-1]
+        self.assertIn("--session ses_fake2", last)   # the last agent's, the one that was blocked
+        said = cat(self.calls + ".continue")
+        self.assertIn("no commits on branch ABC-1", said)   # why it was cut off
+        self.assertIn("Commit it this time.", said)
+
+    def test_continue_with_no_session_tells_a_new_agent_to_finish(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_NO_SESSION="1")
+        self.add("ABC-1")
+        self.run_queue("--retries", "0")
+        self.assertEqual(self.status()["status"], "blocked")
+        self.assertNotIn("session", self.status())
+        del os.environ["FAKE_NO_COMMIT"]
+        rc, out = self.q("continue", "ABC-1", "Commit it this time.")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("with a new agent", out)
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+        self.assertNotIn("--session", self.calls_of("implementing")[-1])
+        prompt = self.prompts("implementing")[-1]
+        self.assertIn("You are implementing", prompt)
+        self.assertIn("BEGIN_GOING_ON", prompt)
+        self.assertIn("no commits on branch ABC-1", prompt)
+        self.assertIn("Commit it this time.", prompt)
+        self.assertNotIn("BEGIN_GOING_ON", self.prompts("reviewing")[0])
+
+    def test_a_session_that_will_not_go_on_falls_back_to_a_new_agent(self):
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add("ABC-1")
+        self.run_queue("--retries", "0")
+        del os.environ["FAKE_NO_COMMIT"]
+        self.q("continue", "ABC-1", "Commit it this time.")
+        os.environ["FAKE_EXIT"] = "1:1"   # the resumed launch dies at once (its session gone, say)
+        with mock.patch.object(tq, "POLL", 0.1), mock.patch.object(tq, "OUTAGE_PAUSES", (0.2,)):
+            rc, out = self.run_queue("--outage-wait", "60")
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+        self.assertIn("Commit it this time.", cat(self.calls + ".continue"))   # the session was tried first
+        self.assertNotIn("--session", self.calls_of("implementing")[-1])
+        prompt = self.prompts("implementing")[-1]
+        self.assertIn("BEGIN_GOING_ON", prompt)
+        self.assertIn("Commit it this time.", prompt)
+
+    def test_continue_is_refused_where_there_is_nothing_to_go_on(self):
+        self.add("ABC-1")
+        rc, out = self.q("continue", "ABC-1")
+        self.assertEqual(rc, 1)
+        self.assertIn("work is gone (or was never set up)", out)
+        self.assertEqual(self.q("continue", "ABC-9")[0], 1)
+        q = tq.Queue(self.state)
+        for status, said in (("needs-answers", "harness queue answer ABC-1"),
+                             ("plan-review", "harness queue approve ABC-1"), ("done", "no stage to go on")):
+            st = q.load("ABC-1")
+            st["status"] = status
+            q.save(st)
+            rc, out = self.q("continue", "ABC-1")
+            self.assertEqual(rc, 1, status)
+            self.assertIn(said, out)
+        st = q.load("ABC-1")
+        st.update(status="stopped", stopped_from="plan-review")
+        q.save(st)
+        rc, out = self.q("continue", "ABC-1")
+        self.assertEqual(rc, 1)
+        self.assertIn("plan waited to be read", out)
+        st = q.load("ABC-1")
+        st.update(status="blocked", stage="push", base_sha="abc")
+        st.pop("stopped_from")
+        q.save(st)
+        rc, out = self.q("continue", "ABC-1")
+        self.assertEqual(rc, 1)
+        self.assertIn("at push, where no agent works", out)
 
     def test_list_says_what_waits_on_the_owner(self):
         self.add("ABC-1", "ABC-2")

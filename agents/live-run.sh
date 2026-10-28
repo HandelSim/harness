@@ -18,11 +18,22 @@
 #
 # HARNESS_LIVE=0, or a serve that does not come up, runs plain `opencode run`.
 # Used by agents/entrypoint.sh (container) and the harness host launch.
+#
+# Prints "[harness] session: <id>" to stderr as soon as the session is known
+# (after the run on the plain path): `harness queue continue` resumes a stage
+# that was cut off in that session, and finds it in the stage's output.
 
 set -u
 events="$1"; shift
 
-plain() { opencode run --format json "$@" >"$events"; }
+session_of() { grep -o '"sessionID": *"ses_[A-Za-z0-9]*"' "$events" 2>/dev/null | head -1 | cut -d'"' -f4; }
+plain() {
+    local rc=0 s
+    opencode run --format json "$@" >"$events" || rc=$?
+    s=$(session_of)
+    [[ -n "$s" ]] && echo "[harness] session: $s" >&2
+    return "$rc"
+}
 
 live="${XDG_DATA_HOME:-$HOME/.local/share}/harness/live"
 if [[ "${HARNESS_LIVE:-1}" == "0" ]] || ! mkdir -p "$live" 2>/dev/null \
@@ -78,8 +89,9 @@ deliver() {
 }
 while kill -0 "$run_pid" 2>/dev/null; do
     if [[ -z "$sid" ]]; then
-        sid=$(grep -o '"sessionID": *"ses_[A-Za-z0-9]*"' "$events" 2>/dev/null | head -1 | cut -d'"' -f4)
+        sid=$(session_of)
         if [[ -n "$sid" ]]; then
+            echo "[harness] session: $sid" >&2
             marker="$live/$sid.json" inbox="$live/$sid.inbox"
             mkdir -p "$inbox"
             printf '{"session":"%s","pid":%s,"started":%s}\n' "$sid" "$$" "$(date +%s)" >"$marker"

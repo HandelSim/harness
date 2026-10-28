@@ -15,7 +15,7 @@
 #                              the sourced harness, the internal _sync/_pull
 #                              doing nothing without a vault, run and answer
 #                              refusing without one; the owner's controls
-#                              (status --json, note, move, stop, retry --stage,
+#                              (status --json, note, move, stop, continue, retry --stage,
 #                              halt, add --stages/--ref/--note) passed through
 #
 # Prints "QUEUE TEST PASSED" on success.
@@ -60,7 +60,7 @@ out=$(cmd_queue --help)
 for w in 'harness queue add' 'harness queue run' 'harness queue answer' 'needs-answers' \
          'QUEUE_MODEL' 'QUEUE_PLAN_REVIEW' 'Nothing is written to the tracker' \
          'status [--json]' '--stages LIST' '--ref REF' 'harness queue note' 'retry KEY [--stage S]' \
-         'harness queue stop' 'harness queue halt' 'harness queue move'; do
+         'harness queue stop' 'harness queue halt' 'harness queue move' 'harness queue continue KEY'; do
     grep -qF -- "$w" <<<"$out" || fail "Q2: help should mention '$w'"
 done
 grep -q 'harness queue' < <(bash "$HARNESS" --help 2>/dev/null) || fail "Q2: harness --help should list queue"
@@ -122,6 +122,11 @@ if cmd_queue status --frob 2>/dev/null; then fail "Q5: status with an unknown op
 if cmd_queue move ABC-2 sideways 2>/dev/null; then fail "Q5: move sideways accepted"; fi
 cmd_queue stop ABC-1 >/dev/null || fail "Q5: stop failed"
 [[ "$(qs ABC-1 status)" == stopped ]] || fail "Q5: ABC-1 should be stopped"
+# continue reaches the queue (stopped with no work yet: refused with why); one key, one message
+grep -q 'work is gone (or was never set up)' < <(cmd_queue continue ABC-1 'it is back' 2>&1) \
+    || fail "Q5: continue should pass through to the queue and be refused"
+if cmd_queue continue 2>/dev/null; then fail "Q5: continue without a key accepted"; fi
+if cmd_queue continue ABC-1 a b 2>/dev/null; then fail "Q5: continue with two messages accepted"; fi
 # a stage with nothing to work from is refused: no review ran, so no Must fix items
 if cmd_queue retry ABC-1 --stage fix 2>/dev/null; then fail "Q5: retry --stage fix with no review accepted"; fi
 cmd_queue retry ABC-1 --stage plan >/dev/null || fail "Q5: retry --stage failed"
@@ -131,12 +136,13 @@ grep -q 'no queue run is going' < <(cmd_queue halt) || fail "Q5: halt with no ru
 grep -q 'no queue run is going' < <(cmd_queue halt --force) || fail "Q5: halt --force with no run should say so"
 cmd_queue halt --now >/dev/null 2>&1 && fail "Q5: halt takes only --force"
 cmd_queue remove ABC-1 ABC-2 >/dev/null
-ok "Q5: status --json, note, move, stop, retry --stage, halt [--force], add --stages/--ref/--note/--start/--branch/--in-place/--review-plan"
+ok "Q5: status --json, note, move, stop, continue, retry --stage, halt [--force], add --stages/--ref/--note/--start/--branch/--in-place/--review-plan"
 
 # --- Q6: run's launch setup, with everything around it stubbed ---------------
 # A container run answers the firewall question once (stages have no tty) and
-# hands the script HARNESS_NET_CONFIRM=1; --single-message starts the proxy in
-# single mode; the script always gets PYTHONUTF8=1.
+# hands the script HARNESS_NET_CONFIRM=1; --single-message is the stages' own
+# (a per-request header), so the shared proxy starts as it is; the script
+# always gets PYTHONUTF8=1.
 STUB_PY="$TMP_ROOT/py.sh"
 cat > "$STUB_PY" <<'EOF2'
 #!/usr/bin/env bash
@@ -164,10 +170,10 @@ q6() {
 : > "$Q6_LOG"; Q6_CONTAINER=0 q6 || fail "Q6: container run failed — $(cat "$Q6_LOG")"
 [[ "$(cat "$Q6_LOG")" == $'firewall 0 queue\nproxy mode=\n'"utf8=1 net=1 args="* ]] || fail "Q6: container run — $(cat "$Q6_LOG")"
 : > "$Q6_LOG"; Q6_CONTAINER=0 q6 --single-message || fail "Q6: single-message run failed"
-[[ "$(cat "$Q6_LOG")" == $'confirm\nproxy mode=single\n'"utf8=1 net= args="*--single-message* ]] || fail "Q6: single run — $(cat "$Q6_LOG")"
+[[ "$(cat "$Q6_LOG")" == $'confirm\nproxy mode=\n'"utf8=1 net= args="*--single-message* ]] || fail "Q6: single run — $(cat "$Q6_LOG")"
 : > "$Q6_LOG"; Q6_CONTAINER=1 q6 || fail "Q6: host run failed"
 [[ "$(cat "$Q6_LOG")" == $'confirm\nproxy mode=\n'"utf8=1 net= args="*--host* ]] || fail "Q6: host run — $(cat "$Q6_LOG")"
-ok "Q6: run: firewall gate once for containers, single mode up front, PYTHONUTF8 for the script"
+ok "Q6: run: firewall gate once for containers, single mode per stage launch, PYTHONUTF8 for the script"
 
 # --- Q7: _stop_agents stops the containers mounting a ticket's clone ---------
 # Only through harness_docker, filtered by the agent and mount labels; prints

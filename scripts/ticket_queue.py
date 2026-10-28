@@ -1495,10 +1495,66 @@ def render(name, **values):
                   read(os.path.join(PROMPTS, name + ".md")))
 
 
+# agents/live-run.sh says which opencode session the launch is: the session a stage
+# that was cut off goes on in (harness queue continue; an outage, Ctrl-C or a halt)
+SESSION_LINE = re.compile(r"^\[harness\] session: (ses_\w+)", re.M)
+RESUMABLE = ("plan", "implement", "review", "fix")   # the stages an agent works in
+
+
+def session_in(text):
+    """The last opencode session a launch's output names, or ""."""
+    found = SESSION_LINE.findall(text)
+    return found[-1] if found else ""
+
+
+def resuming(ctx, st, stage):
+    """The session stage goes on in when it is to go on (st["resume"]), or "": none
+    known, or one of the other mode's (a container agent's sessions are not where a
+    host one looks, nor the other way round)."""
+    r, s = st.get("resume") or {}, st.get("session") or {}
+    if r.get("stage") != stage or s.get("stage") != stage or not s.get("id"):
+        return ""
+    return s["id"] if bool(s.get("container")) == (not (ctx.host or ctx.single)) else ""
+
+
+def note_session(ctx, st, out, since):
+    """st["session"], the opencode session the launch (started at since, ms) names, when it names
+    one (kept: the stage, attempt and mode, and when the session started: a note
+    written before it was cut off counts). True when it does."""
+    got, before = session_in(read(out)), st.get("session") or {}
+    if not got:
+        return False
+    same = before.get("id") == got and before.get("stage") == st["stage"]
+    st["session"] = {"stage": st["stage"], "attempt": st.get("attempt", 0), "id": got,
+                     "container": not (ctx.host or ctx.single),
+                     "started": before["started"] if same and before.get("started") else since / 1000}
+    return True
+
+
+def go_on_later(st, why):
+    """This attempt's agent was cut off (an outage, Ctrl-C, a halt): the next launch
+    of the stage goes on in its session (or, with none known, a new agent is told to
+    finish its work) instead of starting the stage over."""
+    s = st.get("session") or {}
+    if st.get("stage") in RESUMABLE and s.get("stage") == st["stage"] and s.get("attempt") == st.get("attempt", 0):
+        st["resume"] = {"stage": st["stage"], "why": why, "message": ""}
+
+
+CARRY_ON = ("\n\n<<<BEGIN_GOING_ON (an earlier agent on this stage was cut off before it finished: {why})>>>\n"
+            "Its work so far is in your working directory. Check what is already done (git status, git log, the "
+            "files the stage writes) and finish it instead of starting over.\n{message}<<<END_GOING_ON>>>\n")
+
+
 def run_agent(ctx, st, stage, prompt):
-    """One headless agent launch in the clone; its output goes to DIR/<stage>-N.out."""
+    """One headless agent launch in the clone; its output goes to DIR/<stage>-N.out.
+    A stage to go on (st["resume"]) goes on in its agent's session, told so with the
+    owner's message (the full prompt is in the task file); with no session to go on
+    in, a new agent gets the prompt and is told to finish the work there."""
     key = st["key"]
     model = ctx.model if "/" in ctx.model else "harness/" + ctx.model
+    sid = resuming(ctx, st, stage)
+    resume = st.pop("resume", None)
+    resume = resume if isinstance(resume, dict) and resume.get("stage") == stage else None
     cmd = [BASH, ctx.harness]
     if ctx.host or ctx.single:   # --single-message is a host-mode launch flag
         cmd.append("host")
@@ -1507,17 +1563,31 @@ def run_agent(ctx, st, stage, prompt):
     # The whole prompt is also in the vault while the stage runs: a no-tools model
     # loses the prompt after its first tool call, and the proxy points it there.
     task = note_paths(ctx.vault, key)["task"]
+    if resume and not sid:
+        msg = (resume.get("message") or "").strip()
+        prompt += CARRY_ON.format(why=resume.get("why") or "it was stopped",
+                                  message=f"The owner's message (it wins over everything above):\n{msg}\n" if msg else "")
     arg = prompt
-    if WINDOWS and len(prompt) > WIN_PROMPT_MAX:
+    if sid:
+        arg = render("continue", KEY=key, STAGE=stage, TASK_FILE=agent_path(ctx, task),
+                     WHY=resume.get("why") or "it was stopped",
+                     MESSAGE=(resume.get("message") or "").strip() or "(none: carry on)")
+        ctx.q.log(key, f"{stage}: going on in the agent's session {sid}")
+    elif WINDOWS and len(prompt) > WIN_PROMPT_MAX:
         arg = (f"You are working on ticket {key}, stage {stage}, in {'the project' if st.get('in_place') else 'a clone of the project'} "
                f"on branch {branch_of(st)}.\n\n"
                f"Your full instructions for the {stage} stage of ticket {key} are in {agent_path(ctx, task)}. "
                f"Read it first and follow it exactly.\n")
     elif len(prompt.encode()) > PROMPT_MAX_BYTES:
         raise RuntimeError(f"the {stage} prompt is {len(prompt.encode())} bytes, over one command-line argument's limit")
-    cmd += ["-p", "--yolo", "--ticket", key, "-m", model, arg]
+    cmd += ["-p", "--yolo", "--ticket", key, "-m", model] + (["--session", sid] if sid else []) + [arg]
     out = os.path.join(ctx.q.dir(key), f"{stage}-{st['attempt']}.out")
+    if sid and os.path.exists(out):   # what the agent did before it was cut off stays readable
+        with contextlib.suppress(OSError):
+            os.replace(out, out + ".before")
     since = int(time.time() * 1000)
+    if not sid:   # a new agent: its session, once it says, is the one a cut-off stage goes on in
+        st.pop("session", None)
     write_atomic(task, prompt)
     if st.get("in_place"):
         exclude_block(st["project"], None)   # the snapshot takes the owner's files too
@@ -1526,12 +1596,21 @@ def run_agent(ctx, st, stage, prompt):
         # when the stage ran, for the run viewer: in place its session's folder is the project's
         st["launches"] = (st.get("launches") or [])[-(HISTORY_CAP - 1):] + [[since, 0]]
         ctx.q.save(st)
-    ended = False
+    ended = gone = False
     try:
         rc = launch(ctx, st, cmd, out, since, task_card(ctx, st, stage))
         ended = True
+    except LaunchFailed:
+        if resume:   # the session would not go on (gone, say): the next launch is a new agent, still told
+            st.pop("session", None)
+            st["resume"] = resume
+            gone = True
+        raise
     finally:   # gone before the vault is committed: it is the prompt, not a note
         drop(task)
+        if not gone:
+            note_session(ctx, st, out, since)   # the plain opencode run says it only at its end
+        ctx.q.save(st)
         if st.get("in_place"):
             st["launches"][-1][1] = int(time.time() * 1000)
             ctx.q.save(st)
@@ -1553,9 +1632,11 @@ def agent_or_kept(ctx, st, stage, prompt):
     kept = st.get("verify_only")
     if isinstance(kept, dict) and kept.get("stage") == stage and kept.get("out"):
         ctx.q.log(st["key"], f"{stage}: the agent's result from before is kept; checking it without a new launch")
+        st.pop("resume", None)
         return kept.get("rc", 0), kept["out"], kept.get("started", 0)
     st.pop("verify_only", None)
-    started = time.time()
+    # going on in a session: the notes it wrote before it was cut off count
+    started = (st["session"].get("started") or time.time()) if resuming(ctx, st, stage) else time.time()
     rc, out = run_agent(ctx, st, stage, prompt())
     return rc, out, started
 
@@ -1629,11 +1710,15 @@ def launch(ctx, st, cmd, out, since, card=None):
         rc = None
         keep = False   # the agent not known to be ended: st["agent"] stays for the next run, stop, retry or remove
         seen, quiet_since, next_look = activity(ctx, st, out, gitdir), t0, t0 + look
+        named = False   # the agent's session saved: a run that dies from here on leaves it to go on in
         try:
             while rc is None:
                 try:
                     rc = p.wait(timeout=max(0.1, min(POLL, end - time.monotonic())))
                 except subprocess.TimeoutExpired:
+                    if not named and note_session(ctx, st, out, since):
+                        named = True
+                        ctx.q.save(st)
                     checkpoint(ctx)
                     if mtime(ctx.q.notes_path(key)) != notes_at:   # a note: into state.json for the viewer
                         notes_at = mtime(ctx.q.notes_path(key))
@@ -2658,6 +2743,8 @@ def advance(ctx, st, stage, reason=""):
     """On to stage; None: the ticket's stages are done (push marks done itself)."""
     record(st, "passed")
     st.pop("verify_only", None)
+    st.pop("session", None)   # the next stage's agent is a new one
+    st.pop("resume", None)
     if stage:
         st.update(stage=stage, attempt=0, feedback="", status="running")
     else:
@@ -2812,12 +2899,14 @@ def interrupted(ctx, st, e):
     key = st["key"]
     if e.kind == "halt":
         record(st, "halted", ["the run was halted by the owner; the attempt does not count"])
+        go_on_later(st, "the queue run was halted")
         st.update(status="queued")
         ctx.q.log(key, f"halted by the owner: back in the queue at {st['stage']}")
     else:
         record(st, "stopped", ["stopped by the owner"])
         st.update(status="stopped", reason="stopped by the owner")
-        ctx.q.log(key, f"stopped by the owner at {st['stage']}; harness queue retry {key} resumes it")
+        ctx.q.log(key, f"stopped by the owner at {st['stage']}; harness queue continue {key} \"message\" goes on "
+                       f"in the agent's session, harness queue retry {key} starts the stage again")
     ctx.q.save(st)
     if e.kind == "stop":
         try:
@@ -2968,6 +3057,7 @@ def run_tickets(q, ctx):
             if orphan:   # a run that is gone left its agent: ended before this one starts
                 reap(q, st, ctx.harness, "the ticket is taken again")
                 st.pop("agent", None)
+                go_on_later(st, "the queue run working on it ended while the agent worked")
                 q.save(st)
             outage = None
             try:
@@ -2987,11 +3077,14 @@ def run_tickets(q, ctx):
                 else:
                     if n:
                         st["launch_fails"] = n
+                    else:   # the outage may have cut the agent short: the stage goes on in its session
+                        go_on_later(st, "the upstream stopped answering")
                     put_back(ctx, st, f"the upstream does not answer ({str(e)[:200]}); the run waits and carries on"
                              if not n else f"{str(e)[:300]}; the run waits and carries on")
                     done.pop(key, None)
                     outage = e
             except KeyboardInterrupt:
+                go_on_later(st, "the queue run was interrupted (Ctrl-C)")
                 put_back(ctx, st, "the run was interrupted (Ctrl-C); start the queue again to carry on")
                 put_away(q, st)
                 raise
@@ -3204,8 +3297,10 @@ def shared_branches(project, base):
 
 NEXT = {"needs-answers": "harness queue answer {k}   (or --go: take the plan's defaults)",
         "plan-review": "harness queue approve {k}   (or harness queue answer {k} \"feedback\": plan again)",
-        "blocked": "read why above (harness queue log {k}), then harness queue retry {k}",
-        "stopped": "harness queue retry {k}   resumes it"}
+        "blocked": "read why above (harness queue log {k}), then harness queue continue {k} \"what to do\"   "
+                   "(or harness queue retry {k}: the stage again)",
+        "stopped": "harness queue continue {k}   goes on in the agent's session   (harness queue retry {k}: the "
+                   "stage again)"}
 
 
 def print_list(q, hints=True):
@@ -3306,9 +3401,10 @@ def removed_note(q, st, order):
 RESULTS = ("push", "compare_url", "commits", "diffstat", "folder_branch_now", "launch_fails", "agent")
 
 
-def requeue(q, key, want, stage=None, fresh=False, **extra):
+def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
     """Under queue.lock: the ticket queued again (at stage), counters and the last
-    go's outcome cleared; fresh (or from the plan): its work too, made again by the run."""
+    go's outcome cleared; fresh (or from the plan): its work too, made again by the run.
+    go_on (harness queue continue): its stage goes on from the work as it is."""
     st = q.load(key.upper())
     if not st:
         print(f"[queue] {key} is not in the queue", file=sys.stderr)
@@ -3318,6 +3414,7 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
         return None
     st.update(status="queued", attempt=0, feedback="", reason="", requeued=now_iso(), **extra)
     st.pop("stopped_from", None)
+    st.pop("resume", None)   # a cut-off stage goes on only when continued (the caller sets it again)
     for k in RESULTS:
         st.pop(k, None)
     if st.get("vault"):   # the last go's summary is not this one's
@@ -3331,11 +3428,11 @@ def requeue(q, key, want, stage=None, fresh=False, **extra):
                     and kept.get("out")) else None
     if stage:
         st["stage"] = stage
-    if stage or fresh:   # the agent runs again; only a plain retry checks the kept result again
+    if stage or fresh or go_on:   # the agent runs again; only a plain retry checks the kept result again
         st.pop("verify_only", None)
         st.pop("verified_sha", None)
         st.pop("verified_repos", None)
-    if starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
+    if not go_on and starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "verify_only", "verified_sha",
                   "verified_repos"):
             st.pop(k, None)
@@ -3516,6 +3613,79 @@ def cmd_retry(q, a):
         print(f"[queue] {st['key']}: queued again at {st['stage']}"
               + ("; the agent's kept work is checked again, not made again" if kept else ""))
     return 0 if st else 1
+
+
+CONTINUABLE = ("blocked", "stopped", "queued", "running")
+
+
+def continue_refused(q, st):
+    """Why the ticket's stage cannot go on (harness queue continue), or ""."""
+    key, stage = st["key"], st.get("stage")
+    if st["status"] not in CONTINUABLE:
+        how = {"needs-answers": f"harness queue answer {key}", "plan-review": f"harness queue approve {key}",
+               "done": f"harness queue retry {key} starts it over"}.get(st["status"])
+        return f"{key} is {st['status']}: there is no stage to go on" + (f" ({how})" if how else "")
+    if st["status"] == "stopped" and st.get("stopped_from") == "plan-review":
+        return f"{key} was stopped while its plan waited to be read: harness queue retry {key} puts it back"
+    if stage not in RESUMABLE:
+        return f"{key} is at {stage}, where no agent works: harness queue retry {key}"
+    if not has_work(q, st):
+        return f"{key}'s work is gone (or was never set up): harness queue retry {key} starts it again"
+    return ""
+
+
+def cut_off_why(st):
+    """Why the stage stopped, for the agent going on: the reason and what the stage's
+    last results (failed, blocked, stopped...) said."""
+    said = [st.get("reason") or ""]
+    for h in reversed((st.get("history") or [])[-3:]):
+        if h.get("stage") != st.get("stage") or h.get("result") == "passed":
+            break
+        said += [d for d in h.get("details") or [] if d not in said]
+    text = "; ".join(d for d in said if d)
+    return cap(text, 1500) if text else "it was stopped"
+
+
+def cmd_continue(q, a):
+    """The stage that was cut off (blocked, stopped, or left by a run that ended)
+    goes on in its agent's session with the owner's message, its work as it is;
+    checked as usual when the agent ends."""
+    key = a.key.upper()
+    st = q.load(key)
+    if not st:
+        print(f"[queue] {key} is not in the queue", file=sys.stderr)
+        return 1
+    if a.stdin:
+        text = sys.stdin.buffer.read().decode("utf-8", "replace")
+    else:
+        text = a.text if a.text is not None else a.message or ""
+    if len(text) > OWNER_NOTE_CAP:
+        text = text[:OWNER_NOTE_CAP] + f"\n[... cut at {OWNER_NOTE_CAP} characters ...]"
+    reap_stranded(q, key, getattr(a, "harness", ""))
+    with held(os.path.join(q.root, "queue.lock")):
+        if run_holds(q, key):
+            print(f"[queue] {key}: " + (f"is running; stop it first (harness queue stop {key})"
+                                        if (q.load(key) or {}).get("status") == "running" else FINISHING),
+                  file=sys.stderr)
+            return 1
+        st = q.load(key) or st
+        why = continue_refused(q, st)
+        if why:
+            print(f"[queue] {why}", file=sys.stderr)
+            return 1
+        cut = cut_off_why(st)
+        st = requeue(q, key, CONTINUABLE, go_on=True)
+        if not st:
+            return 1
+        st["resume"] = {"stage": st["stage"], "why": cut, "message": text.strip()}
+        st["reason"] = f"continued by the owner: {st['stage']} goes on"
+        q.save(st)
+    s = st.get("session") or {}
+    how = (f"in its agent's session {s['id']}" if s.get("stage") == st["stage"] and s.get("id") else
+           "with a new agent told to finish the work there (no session of the stage's agent is known)")
+    print(f"[queue] {key}: queued to go on at {st['stage']} {how}"
+          + ("" if run_going(q) else "; harness queue run takes it"))
+    return 0
 
 
 def cmd_stop(q, a):
@@ -3797,6 +3967,8 @@ def main(argv):
     s = sub.add_parser("approve"); s.add_argument("key")
     s = sub.add_parser("retry"); s.add_argument("key"); s.add_argument("--stage", choices=ALL_STAGES)
     s.add_argument("--harness", default="")
+    s = sub.add_parser("continue"); s.add_argument("key"); s.add_argument("message", nargs="?")
+    s.add_argument("--text"); s.add_argument("--stdin", action="store_true"); s.add_argument("--harness", default="")
     s = sub.add_parser("stop"); s.add_argument("key"); s.add_argument("--harness", default="")
     s = sub.add_parser("halt"); s.add_argument("--force", action="store_true"); s.add_argument("--harness", default="")
     s = sub.add_parser("move"); s.add_argument("key"); s.add_argument("where", choices=("up", "down", "top", "bottom"))
@@ -3826,7 +3998,7 @@ def main(argv):
     q = Queue(a.state)
     try:
         return {"add": cmd_add, "list": cmd_list, "status": cmd_status, "remove": cmd_remove, "approve": cmd_approve,
-            "retry": cmd_retry, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
+            "retry": cmd_retry, "continue": cmd_continue, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
             "answer": cmd_answer, "findings": cmd_findings, "run": cmd_run}[a.cmd](q, a)
     except Busy as e:
         print(f"[queue] {e}; try again", file=sys.stderr)

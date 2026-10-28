@@ -475,6 +475,36 @@ class RunsTest(RunsServer):
         r, _ = self.req("POST", "/runs/ticket/ABC-12/retry", "", {"Origin": "http://evil.example"})
         self.assertEqual(r.status, 403)
 
+    def test_continue_on_the_page_goes_on_in_the_agents_session(self):
+        session = {"stage": "implement", "attempt": 1, "id": "ses_abc", "container": True}
+        self.ticket(status="blocked", stage="implement", base_sha="abc", reason="no commits on branch ABC-12",
+                    questions=[], session=session)
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("action='/runs/ticket/ABC-12/continue'", body)
+        self.assertIn("Continue implement</button>", body)
+        self.assertIn("its agent goes on in the same session", body)
+        r, body = self.act("continue", [("text", "the <db> is up now")])
+        self.assertEqual(r.status, 303, body)
+        st = self.state()
+        self.assertEqual((st["status"], st["stage"]), ("queued", "implement"))
+        self.assertEqual(st["resume"]["message"], "the <db> is up now")
+        self.assertIn("no commits on branch ABC-12", st["resume"]["why"])
+        # stopped mid-stage, no session known: offered all the same, a new agent finishing the work
+        self.ticket(status="stopped", stage="review", base_sha="abc", questions=[])
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("Go on with it", body)
+        self.assertIn("a new agent is told to finish the work there", body)
+        # not where no agent works, nor where nothing waits to go on
+        self.ticket(status="blocked", stage="push", base_sha="abc", questions=[])
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("/continue'", body)
+        r, _ = self.act("continue")
+        self.assertEqual(r.status, 409)
+        self.ticket(status="done", stage="done", base_sha="abc", questions=[])
+        r, _ = self.act("continue")
+        self.assertEqual(r.status, 409)
+
     def test_answers_go_to_the_vault_the_queue_ran_with(self):
         other = os.path.join(self.tmp.name, "vault-b")
         os.makedirs(other)
