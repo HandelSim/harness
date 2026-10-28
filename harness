@@ -5769,6 +5769,12 @@ _vault_g() {
     git "${_vault_safe[@]}" "$@"
 }
 
+# `harness queue _sync` only: each step of vault_sync on stderr, so the
+# queue's warning about a save that never ended says where it got to.
+_vault_step() {
+    [[ -z "${harness_vault_steps:-}" ]] || echo "[harness] vault: $*" >&2
+}
+
 # The same with a 30 s limit where `timeout` exists (it is missing on macOS).
 _vault_git() {
     _vault_safe_init
@@ -6085,14 +6091,17 @@ vault_sync() {
             done < <(harness_context_files "$home")
         fi
         if [[ -f "$db" && -f "$script" ]]; then
+            _vault_step "capturing the session from $db"
             # shellcheck disable=SC2086  # $py can be 'py -3'
             $py "$script" "$db" "$wdir" "$since_ms" "$project" ${capture_args[@]+"${capture_args[@]}"} >/dev/null || true
         fi
         # The generated index, hubs and module trees follow whatever the
         # session wrote (deterministic, no model).
+        _vault_step "rebuilding the index"
         # shellcheck disable=SC2086
         [[ -f "$index" ]] && { $py "$index" index --vault "$wdir" >/dev/null || true; }
     fi
+    _vault_step "git add, commit"
     _vault_g -C "$dir" add -A >/dev/null 2>&1 || { err "vault: git add failed in $dir"; return 0; }
     _vault_g -C "$dir" diff --cached --quiet 2>/dev/null && return 0
     local n; n=$(_vault_g -C "$dir" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
@@ -6103,6 +6112,7 @@ vault_sync() {
     fi
     echo "[harness] vault: committed $n file(s) in $dir" >&2
     _vault_g -C "$dir" rev-parse -q --verify '@{u}' >/dev/null 2>&1 || return 0
+    _vault_step "pushing"
     if GIT_TERMINAL_PROMPT=0 _vault_git -C "$dir" push -q >/dev/null 2>&1; then
         echo "[harness] vault: pushed" >&2
         return 0
@@ -6842,7 +6852,10 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             message, its work as it is, and is checked
                                             as usual when the agent ends; fix what
                                             stopped it first. With no session known, a
-                                            new agent is told to finish the work there
+                                            new agent is told to finish the work there.
+                                            If its agent had already finished (stopped
+                                            while its session was saved, say), with no
+                                            message its kept work is just checked
        harness queue retry KEY [--stage S]  queue a blocked, stopped or done ticket
                                             (or one left running by a run that ended)
                                             again at its stage (or from stage S): a
@@ -7004,7 +7017,7 @@ HELP
             # (host or container database) into the vault and commit it.
             local key="$1" repo="$2" since="$3" db
             [[ -n "$vault" && -d "$vault/.git" ]] || return 0
-            harness_vault_dir="$vault" harness_ticket="$key"
+            harness_vault_dir="$vault" harness_ticket="$key" harness_vault_steps=1
             for db in "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}" \
                       "$(agent_home_dir)/.local/share/opencode/opencode.db"; do
                 [[ -f "$db" ]] || continue

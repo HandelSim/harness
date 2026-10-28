@@ -1370,6 +1370,57 @@ class OwnerControlTest(Base):
         self.assertNotIn("resume", st)
         self.assertNotIn("session", st)   # done: no stage to go on in
 
+    def stopped_while_saved(self):
+        """ABC-1's implement agent ended, and the owner stopped the ticket while its session
+        was being saved into the vault (a _sync that hangs): the stage is stopped with the
+        agent's result kept. Returns (status, the ticket run.json names) at each save."""
+        real, verify, seen = tq.sync_vault, tq.verify_change, []
+
+        def sync(ctx, key, since):
+            st = ctx.q.load(key)
+            if st["stage"] == "implement" and tq.kept_result(st) and not any(s == "stopped" for s, _ in seen):
+                put(ctx.q.sentinel(key), "x")
+            seen.append((st["status"], tq.runner(ctx.q).get("ticket")))
+            return real(ctx, key, since)
+
+        def slow_verify(ctx, st, rc, stage):   # a real verifier is out long enough to see the stop
+            tq.checkpoint(ctx)
+            return verify(ctx, st, rc, stage)
+        self.add("ABC-1")
+        with mock.patch.object(tq, "sync_vault", sync), mock.patch.object(tq, "verify_change", slow_verify):
+            rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"], st["stage"]), (0, "stopped", "implement"), out)
+        self.assertTrue(tq.kept_result(st), st)
+        self.assertEqual(len(self.calls_of("implementing")), 1)
+        return seen
+
+    def test_continue_checks_the_work_of_an_agent_that_had_finished(self):
+        seen = self.stopped_while_saved()
+        # stopped and put away: the run lets go of it before the slow vault save, so an
+        # owner's continue is not refused for as long as that save takes
+        self.assertEqual(seen[-1], ("stopped", ""), seen)
+        rc, out = self.q("continue", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("its agent had finished, so its work is checked as it is", out)
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("queued", "implement"))
+        self.assertNotIn("resume", st)
+        self.assertTrue(tq.kept_result(st), st)
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+        self.assertEqual(len(self.calls_of("implementing")), 1)   # checked, not launched again
+        self.assertIn("the agent's result from before is kept", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+    def test_continue_with_a_message_sends_a_finished_agent_back_to_it(self):
+        self.stopped_while_saved()
+        rc, out = self.q("continue", "ABC-1", "Add a test for it too.")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("in its agent's session", out)
+        st = self.status()
+        self.assertEqual(st["resume"]["message"], "Add a test for it too.")
+        self.assertNotIn("verify_only", st)
+
     def test_a_halted_stage_goes_on_in_its_session_by_itself(self):
         self.stopped_mid_implement("halt")
         st = self.status()

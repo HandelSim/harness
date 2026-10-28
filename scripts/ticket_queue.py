@@ -1656,6 +1656,13 @@ def run_agent(ctx, st, stage, prompt):
     return rc, out
 
 
+def kept_result(st):
+    """The agent of the ticket's stage ended and its result is kept (verify_only):
+    going on checks that result rather than launching the agent again."""
+    kept = st.get("verify_only")
+    return isinstance(kept, dict) and kept.get("stage") == st.get("stage") and bool(kept.get("out"))
+
+
 def agent_or_kept(ctx, st, stage, prompt):
     """(rc, out, started): run_agent on prompt(), or the result its agent left when
     that is kept (verify_only: the verifier gave no verdict, the run died, the
@@ -3137,6 +3144,8 @@ def run_tickets(q, ctx):
                 drop(q.sentinel(key))
             if st.get("status") in PARKED:
                 put_away(q, st)
+                # done with it: an owner's continue, retry or remove need not wait out the vault save
+                beat(ctx, ticket="", stage="", step="")
             sync_vault(ctx, key, int(time.time() * 1000))   # the outcome, into the vault
             if outage is not None:
                 ctx.key = ""
@@ -3711,16 +3720,25 @@ def cmd_continue(q, a):
             print(f"[queue] {why}", file=sys.stderr)
             return 1
         cut = cut_off_why(st)
+        # its agent had ended (stopped while its work was being saved or checked): with
+        # nothing new to tell it, its work is checked as it is, not made again
+        kept = st["verify_only"] if kept_result(st) and not text.strip() else None
         st = requeue(q, key, CONTINUABLE, go_on=True)
         if not st:
             return 1
-        st["resume"] = {"stage": st["stage"], "why": cut, "message": text.strip()}
-        st["reason"] = f"continued by the owner: {st['stage']} goes on"
+        if kept:
+            st["verify_only"] = kept
+            st["reason"] = f"continued by the owner: {st['stage']}'s finished work is checked"
+        else:
+            st["resume"] = {"stage": st["stage"], "why": cut, "message": text.strip()}
+            st["reason"] = f"continued by the owner: {st['stage']} goes on"
         q.save(st)
     s = st.get("session") or {}
-    how = (f"in its agent's session {s['id']}" if s.get("stage") == st["stage"] and s.get("id") else
-           "with a new agent told to finish the work there (no session of the stage's agent is known)")
-    print(f"[queue] {key}: queued to go on at {st['stage']} {how}"
+    how = ("; its agent had finished, so its work is checked as it is, with no new launch (a message sends the "
+           "agent back to it first)" if kept else
+           f" in its agent's session {s['id']}" if s.get("stage") == st["stage"] and s.get("id") else
+           " with a new agent told to finish the work there (no session of the stage's agent is known)")
+    print(f"[queue] {key}: queued to go on at {st['stage']}{how}"
           + ("" if run_going(q) else "; harness queue run takes it"))
     return 0
 

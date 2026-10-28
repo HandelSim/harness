@@ -505,6 +505,25 @@ class RunsTest(RunsServer):
         r, _ = self.act("continue")
         self.assertEqual(r.status, 409)
 
+    def test_continue_checks_the_work_of_an_agent_that_had_finished(self):
+        session = {"stage": "implement", "attempt": 0, "id": "ses_abc", "container": True}
+        self.ticket(status="stopped", stage="implement", base_sha="abc", questions=[], session=session,
+                    verify_only={"stage": "implement", "rc": 0, "out": "done", "started": 1})
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("Continue implement</button>", body)
+        self.assertIn(runs.FINISHED_TITLE, body)
+        # Start over names the stage: a plain retry would check the kept work, not start over
+        self.assertIn("<input type='hidden' name='stage' value='implement'>", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("Its agent had finished, so Continue checks its work as it is", body)
+        r, body = self.act("continue")
+        self.assertEqual(r.status, 303, body)
+        st = self.state()
+        self.assertEqual((st["status"], st["stage"]), ("queued", "implement"))
+        self.assertNotIn("resume", st)
+        self.assertEqual(st["verify_only"]["out"], "done")
+
     def test_continue_is_on_the_queue_page_and_atop_the_ticket(self):
         session = {"stage": "implement", "attempt": 0, "id": "ses_abc", "container": True}
         self.ticket(status="stopped", stage="implement", base_sha="abc", questions=[], session=session)

@@ -791,6 +791,11 @@ stage goes on from the work as it is, `requeue(go_on=True)` keeping the
 commits, and the next launch passes `--session <id>` to `opencode run` with
 `queue_prompts/continue.md` (why it was cut off, the owner's message, the
 task file holding the stage's full prompt); its result is checked as usual.
+Where the stage's agent had already ended and its result is kept
+(`kept_result`: `verify_only` of that stage, say a stop that landed while
+its session was being saved), `continue` with no message keeps
+`verify_only` and sets no `resume`: the kept work is checked, no agent is
+launched; with a message the agent goes on in its session first.
 The session id comes from the `[harness] session: ses_...` line
 `agents/live-run.sh` prints on stderr, recorded in `state.json` `session`
 while the agent runs (so a killed run leaves it) and dropped when the stage
@@ -810,7 +815,10 @@ ticket becomes `stopped`; a running one the run has in hand gets the
 `KEY/stop` sentinel, which the runner also checks right before the push;
 "in hand" is `run_holds`: a fresh beat, run.json naming it (the run writes
 that under `queue.lock` before marking it running) and `run.lock` held, so
-one left running by a run that ended or is stuck is stopped at once),
+one left running by a run that ended or is stuck is stopped at once; the
+run lets go of a parked ticket (run.json's ticket cleared) as soon as it is
+put away, before the last vault save, so an owner's command is not refused
+for as long as a slow `_sync` takes),
 `halt` (the `halt` sentinel:
 the run kills its agent, puts the ticket back at its stage uncounted and
 exits; a halt file older than the run's lock is stale and dropped), `halt
@@ -981,7 +989,10 @@ keeps it local). Before each ticket `queue _pull` refreshes the vault's copy
 of the ticket; after each stage, and once more when the ticket stops, the
 ticket's `log.md` (stages, checks, verifier verdicts, outcome) is copied to the
 vault as `wiki/notes/tickets/KEY-log.md` and `queue _sync` captures the session
-(host or container database) and commits the vault. Nothing is written to the
+(host or container database) and commits the vault, printing a
+`[harness] vault: <step>` line on stderr before each step (capture, index,
+commit, push) so the warning a timed-out `_sync` leaves (`SYNC_TIMEOUT`, its
+stderr's tail) names the step that hung. Nothing is written to the
 tracker.
 State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
 attempt, feedback, reason, the plan's `questions`, `history`, `vault`), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
@@ -1660,7 +1671,9 @@ offered as suggestions. It is taken as pasted: quotes
   the commits, a refused push's error and the push `warnings`), and buttons,
   each with a tooltip saying what it does (the queue page's rows use the same
   retry labels: Retry, Plan again without answering, Resume, Run again,
-  Queue again; "Start over" beside a Continue). Continue is offered wherever
+  Queue again; "Start over" beside a Continue, which posts `--stage` with the
+  ticket's stage so it really starts over rather than checking a finished
+  agent's kept work). Continue is offered wherever
   `harness queue continue` would take the ticket (`_continuable`: blocked,
   stopped or "run ended" at an agent stage, or queued to go on already (a
   message for its agent then), and `ticket_queue.continue_refused` imported from the queue
