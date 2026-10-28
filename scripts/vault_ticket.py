@@ -11,7 +11,7 @@ v2) with TRACKER_TOKEN from the environment (a personal access token, sent as
 Bearer; <email>:<api-token> for Cloud, sent as Basic), and writes
 .raw/tickets/<KEY>.md: the ticket as people wrote it, labelled as such,
 secrets redacted, rewritten only when it changed. The acceptance criteria
-field (by name, or the ids or names in TRACKER_AC_FIELDS, else the charter's
+field (by name, and the ids or names in TRACKER_AC_FIELDS, else the charter's
 tracker_ac_fields) goes in it as bullets under "## Acceptance criteria". It also creates the agent's
 state note, wiki/notes/tickets/<KEY>-state.md, when there is none. Both reach
 the agent as instruction files; the note is the agent's to keep up to date.
@@ -191,7 +191,7 @@ def _ids(want, f, names):
 def render(key, url, issue, extra, ac=()):
     """The snapshot markdown. No fetch time in it, so an unchanged ticket
     gives the same text and the file is not rewritten. `ac`: the fields that
-    hold the acceptance criteria (ids or names); empty, the ones AC_NAME matches."""
+    hold the acceptance criteria (ids or names), as well as the ones AC_NAME matches."""
     f = issue.get("fields") or {}
     names = issue.get("names") or {}
     summary = _value(f.get("summary")) or key
@@ -214,7 +214,7 @@ def render(key, url, issue, extra, ac=()):
     body += ["", "## Description", "", _cut(desc, MAX_DESCRIPTION) if desc else "(none)"]
     # The acceptance criteria, each field once; one already in the
     # description under its own heading is not repeated.
-    ac_ids = [i for want in ac for i in _ids(want, f, names)] if ac else \
+    ac_ids = [i for want in ac for i in _ids(want, f, names)] + \
         [fid for fid, n in names.items() if fid.startswith("customfield_") and AC_NAME.match(str(n))]
     crit, seen = [], set()
     for fid in dict.fromkeys(ac_ids):

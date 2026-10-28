@@ -687,7 +687,7 @@ tickets one at a time with no one at the keyboard. `add KEY... [--dir]
 a ticket works in the project folder (in place) and its plan waits
 for approval (`plan_review`); `--no-plan-approval` opts out, and
 `--take-defaults` (`take_defaults`) also goes on past blocking questions,
-each taken at its `Default:` and written to the answers file (one with no
+each taken at its `Default:` (with the option it names, `default_said`) and written to the answers file (one with no
 default still waits)
 (`--in-place` and `--review-plan` are accepted and are the defaults). Clone
 mode (`--clone`, a copy in `state/queue/KEY/repo`) is gone from the help and the
@@ -917,18 +917,25 @@ fix the plan) before finishing; the owner's feedback comes back by id
 criteria (id, given, when, then, source) and questions (id, ask, options,
 default, blocking), kept in `state.json` (`criteria`, `questions`,
 `plan_sig`, a hash of the plan text) and `state/queue/KEY/plan.json`, for the
-viewer and a later tester stage. Two tiers: criteria from the ticket (or
+viewer and a later tester stage; each criterion has one id
+(`criterion_ids`: a repeated or missing id takes the next after the highest),
+and its source is the last `(ticket: ..)` / `(edge of ..)` tag on the line
+(`source_tag`). Two tiers: criteria from the ticket (or
 untagged, as every older plan's) gate the change through `verify_change`
 (`gated_criteria`, at most `MAX_GATED` 15); edge criteria are checked by the
 review, where an unmet one is a Must fix; `MAX_CRITERIA` 40 in all.
 After a stage harness runs its own gates (the plan's Goal and its
 acceptance criteria within those caps; a criterion not in the GIVEN/WHEN/THEN
-one-line shape (`shape_problems`) fails an attempt that has a retry left and
-is a note on the last; a Step path missing from the folder and not marked
+one-line shape (`shape_problems`), or a criterion the owner accepted by id
+on the last round that the re-plan dropped or reworded (`accepted_changed`,
+read against the previous `plan.json` and that round's answers block; an id
+the owner wrote about since, or in the notes, is free), fails an attempt
+that has a retry left and is a note on the last; a Step path missing from the folder and not marked
 "(new)" (`step_notes`), the other sections, more than `MAX_QUESTIONS` 8
-questions and a question's `[blocking]` marker (bold or in backticks too,
-before or after its id) are logged as notes, not failures; an unmarked question blocks only when it has a `?` and
-no `Default:`, and "None" / "No questions" bullets are not questions;
+questions and a missing `[blocking]` marker (`MARK`: in brackets,
+parentheses, bold or backticks, anywhere on the line) are logged as notes,
+not failures; an unmarked question with a `?` blocks, default or not, and
+"None" / "No questions" bullets are not questions;
 commits, a non-empty diff, nothing under `.github/`, none of the ticket's
 notes (a recovered `KEY-plan.md` the agent committed), no key file, no
 key-shaped added line, no value of a secret env var), then
@@ -1722,9 +1729,10 @@ offered as suggestions. It is taken as pasted: quotes
   default and a comment box; `_criterion_card`, `_question_card`), sent as
   one answers note in the planner's by-id format (`plan_feedback`,
   `feedback_text`: "- AC3: rejected - why", "- Q1: (b) option - comment",
-  "Any question not answered here: go with its default"); a form for an
-  older round of the plan (`plan_sig` differs) is refused, and Approve is
-  refused when it would drop a rejection or comment (a blocked ticket instead says where
+  "- Q2, Q4: the default", "- AC1, AC2: accepted"); a form for an
+  older round of the plan (`plan_sig` differs) is refused, and Approve (the
+  one atop the page submits the same form, `form='planfb'`) is refused when
+  it would drop a rejection or comment (a blocked ticket instead says where
   and why it stopped, with the Continue form when it can go on; Retry runs
   that stage again with a new agent; one note re-plans, or reruns the stage
   when the ticket has no plan; a stopped, "run ended" or queued ticket that

@@ -521,9 +521,10 @@ class RunsTest(RunsServer):
         self.assertIn("<button type='submit' formaction='/runs/ticket/ABC-12/approve'", body)
         self.assertIn("Send and plan again</button>", body)
         self.assertNotIn("Go with the defaults", body)
-        # the Approve atop the page carries the plan it was shown with too
-        self.assertIn("<form method='post' action='/runs/ticket/ABC-12/approve'><input type='hidden' name='sig' "
-                      "value='abc123def456'>", body)
+        # the Approve atop the page sends the feedback form (its sig too), so what is in it is not lost
+        self.assertIn("<button type='submit' form='planfb' formaction='/runs/ticket/ABC-12/approve'", body)
+        self.assertIn("class='qs' id='planfb'><input type='hidden' name='sig' value='abc123def456'>", body)
+        self.assertNotIn("<form method='post' action='/runs/ticket/ABC-12/approve'>", body)
         # an older state (no criteria): the form as it was
         self.ticket(status="plan-review", questions=[{"text": "Which <db>?", "blocking": True}])
         r, body = self.req("GET", "/runs/ticket/ABC-12")
@@ -556,6 +557,7 @@ class RunsTest(RunsServer):
                              "skipped\")\n"
                              "- Q1: (a) postgres - we have it\n"
                              "- Q2: debug\n"
+                             "- Q3: the default\n"
                              "- AC3, AC5: accepted\n"
                              "Any question not answered here: go with its default.\n"
                              "Other notes: keep it small")
@@ -563,7 +565,8 @@ class RunsTest(RunsServer):
             r, body = self.act("answer", [sig, ("ac.AC1", "accept"), ("q.Q1", "1"), ("q.Q3", "1")])
             self.assertEqual(r.status, 303, body)
             self.assertEqual(calls.pop()[1], "Feedback on the plan (round of abc123def456):\n- Q3: (b) no\n"
-                             "- AC1, AC2, AC3, AC5: accepted\nAny question not answered here: go with its default.")
+                             "- Q1, Q2: the default\n- AC1, AC2, AC3, AC5: accepted\n"
+                             "Any question not answered here: go with its default.")
             r, body = self.act("answer", [sig, ("ac.AC1", "accept"), ("q.Q1", "1")])
             self.assertEqual(r.status, 409)
             self.assertIn("nothing to send: answer a question, or choose Go with the defaults", body)

@@ -727,6 +727,55 @@ class QueueTest(Base):
         self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1")))
         self.assertEqual(tq.Queue(self.state).order(), [])
 
+    def test_plan_review_fixes(self):
+        # The tag ending a criterion is the last ticket/edge one: a GIVEN's own "(from ...)" is not it,
+        # and a ticket quote may hold brackets.
+        c = tq.criterion("AC2: GIVEN a user (from the admin page) WHEN they save THEN it is saved (edge of AC1)", 2)
+        self.assertEqual((c["given"], c["source"]), ("a user (from the admin page)", "edge of AC1"))
+        self.assertTrue(tq.is_edge(c))
+        c = tq.criterion('AC1: GIVEN x WHEN y THEN z (ticket: "call foo() on save (from the docs)")', 1)
+        self.assertEqual(c["source"], 'ticket: "call foo() on save (from the docs)"')
+        # One id each: a repeated or missing id takes the next after the highest; the others keep theirs.
+        self.assertEqual(tq.criterion_ids(["AC1: a", "AC2: b", "AC4: c", "plain"]), [1, 2, 4, 5])
+        self.assertEqual(tq.criterion_ids(["a", "b", "c"]), [1, 2, 3])
+        self.assertEqual(tq.criterion_ids(["AC2: a", "AC2: b", "AC1: c"]), [2, 3, 1])
+        self.assertEqual(tq.criteria_by_id(["AC1: a", "AC1: b"]), ("AC1: a\nAC2: b", [1, 2]))
+        self.assertEqual([c["id"] for c in tq.plan_criteria(["AC2: a", "AC2: b"])], ["AC2", "AC3"])
+        # A verifier naming a criterion "AC4" rather than 4 is still read.
+        said = {"verdict": "PASS", "criteria": [{"n": "AC4", "ok": True, "ticket_quote": "say hello"}]}
+        self.assertEqual(tq.judge(said, ["x"], "please say hello", "ticket_quote", "ticket", nums=[4]), [])
+        # A default written out with the option it names.
+        q = tq.question("Q1 [blocking] Which db? Options: (a) Postgres (b) SQLite "
+                        "Default: (a), because it is there.", 1)
+        self.assertEqual(tq.default_said(q), "(a) Postgres, because it is there.")
+        self.assertEqual(tq.default_said(tq.question("Q2 [blocking] Size? Default: 3", 2)), "3")
+        # A heading or a lead-in line among the criteria is not a criterion broken over lines.
+        plan = ("## Goal\nx\n## Acceptance criteria\nFrom the ticket:\n"
+                '- AC1: GIVEN a WHEN b THEN c (ticket: "a")\n### Edge cases\n'
+                "- AC2: GIVEN a WHEN d THEN e (edge of AC1)\n")
+        self.assertEqual(tq.shape_problems(plan), [])
+
+    def test_accepted_criteria_are_kept_word_for_word(self):
+        old = {"sig": "abc", "criteria": [{"id": "AC1", "text": "AC1: GIVEN a WHEN b THEN c (ticket: \"a\")"},
+                                          {"id": "AC2", "text": "AC2: GIVEN a WHEN d THEN e (edge of AC1)"},
+                                          {"id": "AC3", "text": "AC3: GIVEN f WHEN g THEN h (edge of AC1)"}]}
+        answers = ("<!-- t1 -->\nFeedback on the plan (round of abc):\n- AC3: rejected - no (it read: \"x\")\n"
+                   "- AC1, AC2: accepted\nAny question not answered here: go with its default.\n")
+        kept = ["AC1: GIVEN a WHEN b THEN c. (ticket: \"a\")", "AC2: GIVEN a WHEN d THEN e (edge of AC1)"]
+        self.assertEqual(tq.accepted_changed(old, answers, "", kept), [])   # punctuation and spacing aside
+        reworded = [kept[0], "AC2: GIVEN a WHEN d THEN something else (edge of AC1)"]
+        got = tq.accepted_changed(old, answers, "", reworded)
+        self.assertEqual(len(got), 1)
+        self.assertIn('AC2 was accepted by the owner: keep it word for word, same id: "- AC2: GIVEN a WHEN d', got[0])
+        self.assertEqual(len(tq.accepted_changed(old, answers, "", kept[:1])), 1)   # dropped
+        # Rejected ones are free; so is one the owner wrote about since, or in the notes.
+        self.assertEqual(tq.accepted_changed(old, answers, "AC2 is wrong after all", reworded), [])
+        later = answers + "\n<!-- t2 -->\nAC2 should say more\n"
+        self.assertEqual(tq.accepted_changed(old, later, "", reworded), [])
+        # Feedback on another round, or no plan before: nothing to hold.
+        self.assertEqual(tq.accepted_changed(dict(old, sig="zzz"), answers, "", reworded), [])
+        self.assertEqual(tq.accepted_changed(None, answers, "", reworded), [])
+
     def test_check_plan(self):
         plan = ("## Goal\nx\n## Acceptance criteria\n- one\n- two\n## Approach\nx\n## Files\n- a\n"
                 "## Questions\n- [blocking] a? Default: b\n- [non-blocking] c? Default: d\n- e?\n- [blocking] f? Default: g\n"
@@ -734,9 +783,18 @@ class QueueTest(Base):
         problems, crit, qs = tq.check_plan(plan)
         self.assertEqual(crit, ["one", "two"])
         self.assertEqual(problems, [])   # format slips are notes, not a failed attempt
-        # An unmarked question with no default holds the ticket; one with a default does not.
+        # An unmarked question holds the ticket, default or not (every question has one now).
         self.assertEqual(tq.blocking(qs), ["[blocking] a? Default: b", "e?", "[blocking] f? Default: g"])
-        self.assertEqual(tq.blocking(["Which one? Default: the first"]), [])
+        self.assertEqual(tq.blocking(["Which one? Default: the first"]), ["Which one? Default: the first"])
+        # The marker counts wherever and however it is written.
+        for q in ("Q1 \u2014 [blocking] Which? Default: (a)", "Q-1 [blocking] Which? Default: (a)",
+                  "Q1 [ blocking ] Which? Default: (a)", "Q1 (blocking) Which? Default: (a)",
+                  "Q1 **blocking** Which? Default: (a)", "Q1: Which? [blocking] Options: (a) x (b) y Default: (a)"):
+            self.assertEqual(tq.blocking([q]), [q], q)
+            self.assertEqual(tq.question(q, 9)["id"], "Q1", q)
+            self.assertTrue(tq.question(q, 9)["ask"].startswith("Which?"), tq.question(q, 9)["ask"])
+        self.assertEqual(tq.blocking(["Q2 (non-blocking) Log it? Default: no",
+                                      "Q3 [non blocking] Why? Default: x"]), [])
         # A bold or code-styled marker still counts; a statement is not a question.
         self.assertEqual(tq.blocking(["**[blocking]** Which DB? Default: postgres",
                                       "`[non-blocking]` Log level? Default: info",

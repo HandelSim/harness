@@ -689,12 +689,13 @@ _charter_set "$TV" tracker_url "https://jira.example.com" || fail "V15: _charter
     || fail "V15: _charter_set should add a missing key in the front matter — $(cat "$TV/wiki/overview.md")"
 mv "$TMP_ROOT/charter.bak" "$TV/wiki/overview.md"; rm -f "$TV/wiki/overview.md.bak"
 # The acceptance criteria field: TRACKER_AC_FIELDS (environment), else the
-# charter's tracker_ac_fields, names the fields instead of the display-name
+# charter's tracker_ac_fields, names more fields besides the display-name
 # match; the named field goes under the heading, not under its own.
 out=$(TRACKER_AC_FIELDS=Team tk tok123 ABC-7)
 [[ "$out" == *"[updated]" ]] || fail "V15: TRACKER_AC_FIELDS=Team should change the copy — $out"
-sed -n '/^## Acceptance criteria$/,/^## /p' "$SNAP" | grep -q '^- Blue$' && ! grep -q '^## Team$\|THEN sets' "$SNAP" \
-    || fail "V15: TRACKER_AC_FIELDS=Team should put Team, alone, under the criteria — $(cat "$SNAP")"
+crit=$(sed -n '/^## Acceptance criteria$/,/^## /p' "$SNAP")
+grep -q '^- Blue$' <<<"$crit" && grep -q 'THEN sets' <<<"$crit" && ! grep -q '^## Team$' "$SNAP" \
+    || fail "V15: TRACKER_AC_FIELDS=Team should put Team, with the Acceptance Criteria field, under the criteria — $(cat "$SNAP")"
 cp "$TV/wiki/overview.md" "$TMP_ROOT/charter.bak"
 printf "tracker_ac_fields: 'customfield_10500'\n" > "$TMP_ROOT/acline"
 sed -i.bak "/^tracker_fields:/r $TMP_ROOT/acline" "$TV/wiki/overview.md"
@@ -729,7 +730,7 @@ want("wiki", crit({"customfield_1": "h3. Login\n# Given a user\n## When the pass
      ["Given a user", "When the password is wrong", "Then it says so"])
 want("plain text", crit({"customfield_1": "Users can log in\n\nErrors are shown"})[1], ["Users can log in", "Errors are shown"])
 want("checklist", crit({"customfield_1": [{"name": "one", "checked": True}, "two", 3, None]})[1], ["one", "two"])
-want("override", crit({"customfield_1": "* auto", "customfield_2": "* the AC field"}, ["AC"])[1], ["the AC field"])
+want("override adds", crit({"customfield_1": "* auto", "customfield_2": "* the AC field"}, ["AC"])[1], ["the AC field", "auto"])
 want("AC alone is not matched", crit({"customfield_2": "* x"})[1], [])
 base = crit({"customfield_3": "Blue"})[0]
 want("no field", "Acceptance" in base, False)

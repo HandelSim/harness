@@ -46,10 +46,11 @@ How to fill it:
 - Assumptions: each decision you made alone that is too small to ask about, or "- None".
 
 When there is a previous plan and the owner has answered or given feedback, revise that plan: change what the answers and feedback ask for, keep what they did not question, and do not ask again what they settled. Do not start over. Feedback by id means:
-- "ACn: accepted", or no word on it: keep that line exactly, same id, same words.
+- "ACn: accepted" (or "AC1, AC3: accepted"), or no word on it: keep that line exactly, same id, same words.
 - "ACn: rejected - <why>": remove it, or rewrite it under the same id if the reason says how. Never give its id to another criterion.
 - "ACn: <comment>": rewrite ACn under the same id as the comment asks.
 - "Qn: <answer>": remove Qn from Questions, add "- Ak: Qn settled by the owner: <the answer>" under Assumptions, and change the Steps and criteria to match. Do not ask it again.
+- "Qn: the default" (or "Q1, Q3: the default"): settle it the same way, at its Default.
 - "An: <comment>": change that assumption as asked, same id.
 - New items take the next number after the highest id the previous plan used (gaps are fine). Never renumber.
 

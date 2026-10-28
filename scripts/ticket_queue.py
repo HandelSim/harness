@@ -413,10 +413,14 @@ def plan_questions(secs):
             if not re.match(r"(?i)\W*(none|no (open |further )?questions|n/?a)\b[^?]*$", q)]
 
 
+MARK = re.compile(r"(?i)(?:\[|\(|\*\*|`)\s*(non[-\s]?)?blocking\s*(?:\]|\)|\*\*|`)")
+
+
 def question_mark(q):
-    """'blocking', 'non-blocking' or None: the marker, bold or in backticks too,
-    after the question's id or before it ("Q1 [blocking] ..." or "[blocking] Q1: ...")."""
-    m = re.match(r"(?i)[\s*_`]*(?:Q\d+\b[\s*_`:.)-]*)?\[(non-)?blocking\]", q)
+    """'blocking', 'non-blocking' or None: the marker in brackets, parentheses,
+    bold or backticks, wherever it is ("Q1 [blocking] ...", "[blocking] Q1: ...",
+    "Q1 - (blocking) ...", "Q1: Which? [blocking] ...")."""
+    m = MARK.search(q)
     return None if not m else "non-blocking" if m.group(1) else "blocking"
 
 
@@ -436,9 +440,8 @@ def plan_notes(text):
 
 def blocking(questions):
     """The questions that hold the ticket: marked [blocking], or an unmarked
-    question with no default to go on."""
-    return [q for q in questions if question_mark(q) == "blocking"
-            or (question_mark(q) is None and "?" in q and not re.search(r"(?i)\bdefault:", q))]
+    question (every question has a default now, so that tells nothing)."""
+    return [q for q in questions if question(q, 0)["blocking"]]
 
 
 # The plan's items, for the owner's page and a later tester: its numbered steps,
@@ -448,9 +451,35 @@ def blocking(questions):
 ITEM_ID = re.compile(r"^[\s*_`]*(AC|Q)[-\s]?(\d{1,3})\b[\s*_`]*[:.)\-\u2013\u2014]?[\s*_`]*", re.I)
 GWT_WORD = re.compile(r"(?i)[*_`]+(given|when|then|and)\b[*_`]*|\b(given|when|then)[*_`]+")
 GWT = re.compile(r"(?is)^\W*given\b[\s,:]*(.*?)[\s,;]*\bwhen\b[\s,:]*(.*?)[\s,;]*\bthen\b[\s,:]*(.*)$")
-SOURCE = re.compile(r"\s*[(\[]\s*((?:from the )?(?:ticket|edge(?:[- ]case)?|source|from|owner|answer)\b[^\n]*?)"
+SOURCE = re.compile(r"[(\[]\s*((?:from the )?(?:ticket|edge(?:[- ]case)?|source|from|owner|answer)\b[^\n]*?)"
                     r"\s*[)\]]\s*\.?\s*$", re.I)
 PATH_RE = re.compile(r"`([^`\s]+\.[A-Za-z0-9]{1,8}|[^`\s]*/[^`\s]*)`")
+
+
+def source_tag(body):
+    """The tag that ends a criterion, as a match (or None): the last (ticket: ...)
+    or (edge of ACn), else the last other one; a GIVEN can hold its own "(from ...)"
+    before the tag, and a ticket quote can hold brackets."""
+    found = [m for m in (SOURCE.match(body, i) for i, ch in enumerate(body) if ch in "([") if m]
+    main = [m for m in found if re.match(r"(?i)(?:from the )?(?:ticket|edge)", m.group(1))]
+    return (main or found or [None])[-1]
+
+
+def criterion_ids(criteria):
+    """Each criterion's AC number: its own id, unless an earlier one has it or it
+    has none; those take the numbers after the highest (all plain: 1, 2, 3...)."""
+    own = []
+    for t in criteria:
+        m = ITEM_ID.match(t)
+        own.append(int(m.group(2)) if m and m.group(1).upper() == "AC" else None)
+    top, seen, out = max([x for x in own if x is not None] or [0]), set(), []
+    for x in own:
+        if x is None or x in seen:
+            top += 1
+            x = top
+        seen.add(x)
+        out.append(x)
+    return out
 
 
 def item_id(text, kind, n):
@@ -465,7 +494,7 @@ def criterion(text, n):
     """One acceptance criterion as {id, text, given, when, then, source}; given,
     when and then are "" when it is not written as GIVEN ... WHEN ... THEN ..."""
     cid, body = item_id(text, "AC", n)
-    m = SOURCE.search(body)
+    m = source_tag(body)
     source = m.group(1).strip() if m else ""
     if m:
         body = body[:m.start()].rstrip()
@@ -477,11 +506,9 @@ def criterion(text, n):
 
 def question(text, n):
     """One question as {id, text, blocking, options, default}."""
-    unmark = lambda t: re.sub(r"(?i)^[\s*_`]*\[(non-)?blocking\][\s*_`]*", "", t)   # noqa: E731
-    mark = question_mark(text)   # "[blocking] Q1: ..." or "Q1 [blocking] ...": either order
-    qid, body = item_id(unmark(text), "Q", n)
-    mark = mark or question_mark(body)
-    body = unmark(body)
+    mark = question_mark(text)
+    qid, body = item_id(MARK.sub(" ", text, count=1).strip(), "Q", n)
+    body = re.sub(r"^[\s*_`:.\-\u2013\u2014]+", "", body)
     default = ""
     m = re.search(r"(?i)\s*\bdefault\s*:\s*", body)
     if m:
@@ -494,7 +521,7 @@ def question(text, n):
                    re.split(r"(?:^|[\s;,]+)\(?[a-hA-H]\)\s+", " " + opts) if o.strip().rstrip(";,.").strip()]
         if len(options) < 2:
             options = [o.strip() for o in re.split(r"\s*(?:;|\s\|\s)\s*", opts) if o.strip()]
-    blocks = mark == "blocking" or (mark is None and "?" in body and not default)
+    blocks = mark == "blocking" or (mark is None and "?" in body)
     return dict(id=qid, text=text, ask=body.strip(), blocking=blocks, options=options[:8], default=default)
 
 
@@ -503,8 +530,13 @@ def plan_items(text):
     secs = sections(text)
     steps = bullets(secs.get("steps") or secs.get("approach") or "")
     return {"steps": [{"n": i, "text": t, "files": PATH_RE.findall(t)} for i, t in enumerate(steps, 1)],
-            "criteria": [criterion(c, i) for i, c in enumerate(bullets(secs.get("acceptance criteria", "")), 1)],
+            "criteria": plan_criteria(bullets(secs.get("acceptance criteria", ""))),
             "questions": [question(x, i) for i, x in enumerate(plan_questions(secs), 1)]}
+
+
+def plan_criteria(criteria):
+    """The criteria parsed, each with its id from criterion_ids (one id each)."""
+    return [dict(criterion(t, n), id=f"AC{n}") for t, n in zip(criteria, criterion_ids(criteria))]
 
 
 def is_edge(c):
@@ -524,13 +556,8 @@ def gated_criteria(criteria):
 
 
 def criteria_by_id(criteria):
-    """(lines "ACn: ...", [n, ...]) for a verifier, n its AC number; numbered by
-    place when the ids are not one each (a plan with AC2 twice)."""
-    ids = [criterion(t, i)["id"] for i, t in enumerate(criteria, 1)]
-    if len(set(ids)) == len(ids):
-        nums = [int(x[2:]) for x in ids]
-    else:
-        nums = list(range(1, len(criteria) + 1))
+    """(lines "ACn: ...", [n, ...]) for a verifier, n its AC number (criterion_ids)."""
+    nums = criterion_ids(criteria)
     return "\n".join(f"AC{n}: {item_id(t, 'AC', n)[1]}" for n, t in zip(nums, criteria)), nums
 
 
@@ -539,14 +566,41 @@ def shape_problems(text):
     line each), naming them. Asked for again on a retry; a note on the last try."""
     body = sections(text).get("acceptance criteria", "")
     loose = [l.strip() for l in body.splitlines() if l.strip() and not l.startswith((" ", "\t"))
-             and not re.match(r"^\s*(?:[-*]|\d+[.)])\s", l)]
+             and not re.match(r"^\s*(?:[-*]|\d+[.)])\s", l) and not re.match(r"^(?:#|.*:\s*$)", l.strip())]
     out = []
     if loose:
         out.append(f"a criterion is broken over lines (one line each): {loose[0][:120]}")
-    bad = [c["id"] for c in (criterion(t, i) for i, t in enumerate(bullets(body), 1)) if not c["given"]]
+    bad = [c["id"] for c in plan_criteria(bullets(body)) if not c["given"]]
     if bad:
         out.append(f"{', '.join(bad[:12])}: not written as one line '- ACn: GIVEN ... WHEN ... THEN ...' "
                    "ending with (ticket: \"...\") or (edge of ACn)")
+    return out
+
+
+def accepted_changed(old_plan, answers, notes, criteria):
+    """The criteria the owner accepted by id in the feedback on the previous plan
+    (the round of its sig) that the new plan dropped or reworded, one problem each;
+    an id the owner wrote about again after that round, or in the notes, is free."""
+    sig = (old_plan or {}).get("sig")
+    if not sig:
+        return []
+    head = f"Feedback on the plan (round of {sig}):"
+    at = answers.rfind(head)
+    if at < 0:
+        return []
+    end = answers.find("\n<!-- ", at)
+    block, later = (answers[at:], "") if end < 0 else (answers[at:end], answers[end:])
+    ids = [i for m in re.finditer(r"(?m)^- ((?:AC\d+, )*AC\d+): accepted\s*$", block)
+           for i in m.group(1).split(", ")]
+    free = set(re.findall(r"\bAC\d+\b", later + "\n" + (notes or "")))
+    old = {c.get("id"): item_id(c.get("text", ""), "AC", 0)[1] for c in old_plan.get("criteria") or []}
+    new = {c["id"]: item_id(c["text"], "AC", 0)[1] for c in plan_criteria(criteria)}
+    out = []
+    for i in dict.fromkeys(ids):
+        if i in free or i not in old or norm(new.get(i, "")) == norm(old[i]):
+            continue
+        out.append(f"{i} was accepted by the owner: keep it word for word, same id: \"- {i}: {old[i][:300]}\". "
+                   "If an answer this round means it must change, keep it and ask about it as a Question.")
     return out
 
 
@@ -1583,7 +1637,7 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=No
     for c in obj.get("criteria", []):
         if isinstance(c, dict):
             try:
-                got[int(c.get("n"))] = c
+                got[int(re.sub(r"(?i)^\s*AC", "", str(c.get("n"))))] = c
             except (TypeError, ValueError):
                 pass
     found = 0
@@ -2534,7 +2588,12 @@ def stage_plan(ctx, st):
     if not text.strip():
         problems = [f"the plan file was not written: write it to {v['PLAN_FILE']}"]
     if not problems:
-        shape = shape_problems(text)
+        try:
+            last = json.loads(read(os.path.join(ctx.q.dir(st["key"]), "plan.json")) or "null")
+        except ValueError:
+            last = None
+        shape = shape_problems(text) + accepted_changed(last if isinstance(last, dict) else None, read(p["answers"]),
+                                                        owner_notes(ctx.q.notes(st["key"])), criteria)
         if st["attempt"] < ctx.retries:   # asked for once more; on the last try only noted
             problems = shape
     if not problems:
@@ -2575,6 +2634,16 @@ def stage_plan(ctx, st):
         ctx.q.log(st["key"], f"waiting for the plan to be read: harness queue approve {st['key']}")
 
 
+def default_said(q):
+    """A question's default with the option it names written out: "(a), because
+    ..." -> "(a) Postgres, because ..."."""
+    m = re.match(r"\(?([a-h])\)", q["default"])
+    i = ord(m.group(1)) - 97 if m else -1
+    if 0 <= i < len(q["options"]):
+        return f"({m.group(1)}) {q['options'][i]}{q['default'][m.end():]}"
+    return q["default"]
+
+
 def take_defaults(ctx, st, p, open_q):
     """The ticket goes on with its questions' defaults (its after-plan setting):
     each blocking question with a Default is taken at it, written to the
@@ -2584,7 +2653,7 @@ def take_defaults(ctx, st, p, open_q):
         q = question(x, 0)
         (taken if q["default"] else left).append(x)
     if taken:
-        lines = "\n".join(f"- {question(x, 0)['ask'][:300]} -> the default: {question(x, 0)['default'][:300]}"
+        lines = "\n".join(f"- {question(x, 0)['ask'][:300]} -> the default: {default_said(question(x, 0))[:300]}"
                           for x in taken)
         old = read(p["answers"])
         write_atomic(p["answers"], (old.rstrip() + "\n" if old.strip() else "") + f"\n<!-- {now_iso()} -->\n"

@@ -1936,7 +1936,8 @@ def _feedback_form(key, st):
     an answer to a plan made again since is refused (ticket_action)."""
     review = st.get("status") == "plan-review"
     base = f"/runs/ticket/{quote(key)}/"
-    parts = [f"<form method='post' action='{base}answer' class='qs'>", _hidden("sig", st.get("plan_sig", ""))]
+    parts = [f"<form method='post' action='{base}answer' class='qs' id='planfb'>",
+             _hidden("sig", st.get("plan_sig", ""))]
     if st["questions"]:   # first: they decide what gets built
         parts.append("<h3>Questions</h3>" + "".join(_question_card(q) for q in st["questions"]))
     parts.append("<h3>Acceptance criteria</h3>" + "".join(_criterion_card(c) for c in st["criteria"]))
@@ -2030,7 +2031,11 @@ def _t_acts(runs, key, st, rows, live, pos, n):
     if now_live:
         r = max(now_live, key=lambda r: _ms(r["time_created"]))
         parts.append(f"<a class='btn primary' href='/runs/{quote(r['id'])}'>Watch and message the agent &rarr;</a>")
-    if status == "plan-review":
+    if status == "plan-review" and st.get("criteria") and runs.vault_of(st):
+        # the feedback form is on the page: approve it, so what is in it is refused rather than lost
+        parts.append("<button type='submit' form='planfb' formaction='" + esc(base + "approve") + "' class='primary' "
+                     "title='implementing starts when the queue run gets to this ticket'>Approve the plan</button>")
+    elif status == "plan-review":
         parts.append(_btn(base + "approve", "Approve the plan", "primary",   # sig: the plan this page shows
                           (("sig", st["plan_sig"]),) if st.get("plan_sig") else (),
                           title="implementing starts when the queue run gets to this ticket"))
@@ -2342,7 +2347,7 @@ def plan_feedback(form, st):
     comment, is no answer: the defaults line says the same."""
     def one(name):
         return _one(form, name).replace("\r\n", "\n").strip()
-    fb = {"rejected": [], "changed": [], "accepted": [], "answers": [], "note": one("note")}
+    fb = {"rejected": [], "changed": [], "accepted": [], "answers": [], "defaults": [], "note": one("note")}
     if len(fb["note"]) > NOTE_MAX:
         return f"the notes are over {NOTE_MAX} characters"
     for c in st.get("criteria") or []:
@@ -2364,6 +2369,8 @@ def plan_feedback(form, st):
             pick = None
         if pick is not None or text:
             fb["answers"].append((q, pick, text))
+        else:
+            fb["defaults"].append(q["id"])
     return fb
 
 
@@ -2379,6 +2386,8 @@ def feedback_text(fb, sig):
     for q, pick, text in fb["answers"]:
         said = [f"({chr(97 + pick)}) {line(q['options'][pick])}"] if pick is not None else []
         out.append(f"- {q['id']}: " + " - ".join(said + ([line(text)] if text else [])))
+    if fb.get("defaults"):
+        out.append(f"- {', '.join(fb['defaults'])}: the default")
     if fb["accepted"]:
         out.append(f"- {', '.join(fb['accepted'])}: accepted")
     out.append("Any question not answered here: go with its default.")
