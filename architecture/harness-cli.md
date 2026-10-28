@@ -1660,14 +1660,22 @@ offered as suggestions. It is taken as pasted: quotes
   the commits, a refused push's error and the push `warnings`), and buttons,
   each with a tooltip saying what it does (the queue page's rows use the same
   retry labels: Retry, Plan again without answering, Resume, Run again,
-  Queue again). A ticket at plan-review or needs-answers shows the plan open
+  Queue again; "Start over" beside a Continue). Continue is offered wherever
+  `harness queue continue` would take the ticket (`_continuable`: blocked,
+  stopped or "run ended" at an agent stage, or queued to go on already (a
+  message for its agent then), and `ticket_queue.continue_refused` imported from the queue
+  script says nothing): a "Continue <stage>" button on the queue page's row
+  (posts with no message), one atop the ticket page and on its session's
+  page linking to the ticket's `#go-on` panel, whose form sends a message
+  to `harness queue continue --stdin`. A ticket at plan-review or
+  needs-answers shows the plan open
   above the approve or answer form (not again among the vault notes), the
   plan's questions with an answer form (a blocked ticket instead says where
-  and why it stopped, with a Continue form at an agent stage: its message
-  goes to `harness queue continue --stdin`, the agent going on in its
-  session; Retry runs that stage again with a new agent; one note re-plans,
-  or reruns the stage when the ticket has no plan; a stopped or "run ended"
-  ticket at an agent stage gets the Continue form too), the
+  and why it stopped, with the Continue form when it can go on; Retry runs
+  that stage again with a new agent; one note re-plans, or reruns the stage
+  when the ticket has no plan; a stopped, "run ended" or queued ticket that
+  can go on gets the Continue form too, a blocked one with no vault as
+  well), the
   retry form's "from" stages (only those `ticket_queue.retry_choices`, imported
   from the queue script, does not refuse, remotes as last fetched; none: the
   reason instead of the form; the module not importable: all), the queue's

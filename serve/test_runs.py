@@ -505,6 +505,52 @@ class RunsTest(RunsServer):
         r, _ = self.act("continue")
         self.assertEqual(r.status, 409)
 
+    def test_continue_is_on_the_queue_page_and_atop_the_ticket(self):
+        session = {"stage": "implement", "attempt": 0, "id": "ses_abc", "container": True}
+        self.ticket(status="stopped", stage="implement", base_sha="abc", questions=[], session=session)
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("action='/runs/ticket/ABC-12/continue'", body)
+        self.assertIn("Continue implement</button>", body)
+        self.assertIn("Start over</button>", body)        # the retry beside it says what it does
+        self.assertNotIn(">Resume</button>", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<a class='btn primary' href='#go-on'", body)
+        self.assertIn("<section class='panel' id='go-on'><h2>Go on with it</h2>", body)
+        self.assertIn("Start over</button>", body)
+        # from the queue page, no message: it goes on in the session, back on the queue page
+        r, body = self.act("continue", [("back", "queue")])
+        self.assertEqual(r.status, 303, body)
+        self.assertIn("/runs/queue", r.getheader("Location"))
+        st = self.state()
+        self.assertEqual((st["status"], st["stage"], st["resume"]["message"]), ("queued", "implement", ""))
+        # queued to go on: a message for its agent, on its page only
+        r, body = self.req("GET", "/runs/queue")
+        self.assertNotIn("/continue'", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("It is queued to go on with implement where its agent was cut off.", body)
+        r, body = self.act("continue", [("text", "and run the <linter>")])
+        self.assertEqual(r.status, 303, body)
+        self.assertEqual(self.state()["resume"]["message"], "and run the <linter>")
+        # queued to start over (a retry) or not begun: nothing to go on with
+        self.ticket(status="queued", stage="implement", base_sha="abc", questions=[], session=session)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("/continue'", body)
+        # blocked with no vault: the Continue form all the same
+        self.ticket(status="blocked", stage="fix", base_sha="abc", questions=[], session=session)
+        self.start(vault="")
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("Continue fix</button>", body)
+        self.assertIn("(it was blocked)", body)
+        # its work gone: the queue would refuse, so none is offered, and Resume is Resume again
+        shutil.rmtree(os.path.join(self.queue, "ABC-12", "repo"))
+        self.ticket(status="stopped", stage="implement", base_sha="abc", questions=[], session=session)
+        for page in ("/runs/queue", "/runs/ticket/ABC-12"):
+            r, body = self.req("GET", page)
+            self.assertNotIn("/continue'", body, page)
+            self.assertNotIn("#go-on", body, page)
+            self.assertIn(">Resume</button>", body, page)
+
     def test_answers_go_to_the_vault_the_queue_ran_with(self):
         other = os.path.join(self.tmp.name, "vault-b")
         os.makedirs(other)
@@ -1209,6 +1255,10 @@ class QueuePageTest(RunsServer):
         r, _ = self.post(f"/runs/{QSES}/stop")
         self.assertEqual(r.status, 303)
         self.assertEqual(self.state()["status"], "stopped")
+        self.ticket(status="stopped", stage="plan", base_sha="abc")   # its work there: Continue, from here too
+        r, body = self.req("GET", f"/runs/{QSES}")
+        self.assertIn("href='/runs/ticket/ABC-12#go-on'", body)
+        self.assertIn("Continue plan</a>", body)
         r, body = self.post(f"/runs/{ROOT}/stop")
         self.assertEqual(r.status, 409)     # not a queue stage
         self.assertIn("not a queue stage", body)

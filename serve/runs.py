@@ -699,6 +699,7 @@ class Runs:
         ses = st.get("session")   # the agent's opencode session a cut-off stage goes on in
         out["session"] = ({"stage": ses["stage"], "id": ses["id"]} if isinstance(ses, dict)
                           and isinstance(ses.get("stage"), str) and isinstance(ses.get("id"), str) else {})
+        out["resume"] = isinstance(st.get("resume"), dict)   # queued to go on in it when a run takes it
         notes = st.get("notes")
         try:
             with open(os.path.join(self.queue_dir, key, "notes.json"), encoding="utf-8") as f:
@@ -768,6 +769,19 @@ class Runs:
             st = q.load(key)
             return tq.retry_choices(q, st) if isinstance(st, dict) else None
         except Exception:   # a hand-edited state.json: every stage, and the queue says no where it must
+            return None
+
+    def continue_refused(self, key):
+        """Why harness queue continue would refuse the ticket (ticket_queue.continue_refused
+        on state.json as it is), "" when it would go on, None when that cannot be read."""
+        tq = _tq()
+        if tq is None:
+            return None
+        try:
+            q = tq.Queue(self.queue_dir)
+            st = q.load(key)
+            return tq.continue_refused(q, st) if isinstance(st, dict) else None
+        except Exception:   # a hand-edited state.json: offered, and the queue says no where it must
             return None
 
     def vault_of(self, st):
@@ -1417,8 +1431,29 @@ RETRY_TITLE = {"blocked": "queue it again at the stage it stopped at, as it is",
                "interrupted": "queue it again at the stage the run was on"}
 STOP_TITLE = {False: "take it out of the run's way: the run skips it until you resume it",
               True: "stop its agent now; it waits as stopped until you resume it"}
+CONTINUE_TITLE = "its agent goes on with the stage where it was, in its own session, with the work as it is"
+REDO_TITLE = "a new agent runs the stage again on the work as it is (Continue goes on in its agent's session instead)"
 REMOVE_TITLE = "delete the ticket from the queue (its branch and the vault notes stay)"
 STUCK_AFTER = 20   # s a stop or halt may take before the page offers to end the run
+
+
+def _continuable(runs, key, st):
+    """The ticket's stage can go on in its agent's session (harness queue continue):
+    an agent stage cut off or blocked, or queued to go on in its session already (a
+    message for it then); and the queue's own check (its work is there) does not say no."""
+    status, stage = st.get("status", ""), st.get("stage")
+    if status not in CONTINUABLE or stage not in AGENT_STAGES or st.get("stopping"):
+        return False
+    if st.get("stopped_from") == "plan-review":
+        return False
+    if status == "queued" and not st.get("resume"):
+        return False   # not begun, or queued to start over (a retry, answers for the planner)
+    return not runs.continue_refused(key)
+
+
+def _retry_label(status, go_on):
+    """The retry button's label; beside a Continue it says it starts the stage over."""
+    return "Start over" if go_on and status in ("blocked", "stopped", "interrupted") else RETRY_LABEL[status]
 
 
 def _short(ref):
@@ -1484,8 +1519,13 @@ def _ticket_row(runs, key, st, i, n, now):
                          confirm=f"Stop {key}?" + (" Its agent is stopped now." if status == "running" else "")))
     if _stuck(st):
         acts.append(_end_btn("sm"))
+    go_on = status != "queued" and _continuable(runs, key, st)   # a queued one: on its page
+    if go_on:
+        acts.append(_btn(base + "continue", f"Continue {esc(st['stage'])}", "sm primary", back,
+                         title=CONTINUE_TITLE))
     if status in RETRYABLE:
-        acts.append(_btn(base + "retry", RETRY_LABEL[status], "sm", back, title=RETRY_TITLE[status]))
+        acts.append(_btn(base + "retry", _retry_label(status, go_on), "sm", back,
+                         title=REDO_TITLE if go_on else RETRY_TITLE[status]))
     acts.append(_btn(base + "remove", "Remove", "sm danger", back, disabled=status == "running",
                      title="Stop it first" if status == "running" else REMOVE_TITLE,
                      confirm=f"Remove {key} from the queue? Its " + ("stage outputs are deleted (the project "
@@ -1855,11 +1895,15 @@ def _t_acts(runs, key, st, rows, live, pos, n):
                           title="implementing starts when the queue run gets to this ticket"))
     if _stuck(st):
         parts.append(_end_btn())
+    go_on = _continuable(runs, key, st)
+    if go_on:   # the form, with its message box, is in the panel below
+        parts.append(f"<a class='btn primary' href='#go-on' title='{esc(CONTINUE_TITLE)}'>"
+                     f"Continue {esc(st['stage'])}</a>")
     if status in RETRYABLE:
-        parts.append(_t_retry(runs, key, st))
+        parts.append(_t_retry(runs, key, st, go_on))
     if status in STOPPABLE and not st.get("stopping"):
         parts.append(_btn(base + "stop", "Stop", "warn", title=STOP_TITLE[status == "running"], confirm=f"Stop {key}?" + (
-            " Its agent is stopped now; Resume takes it again." if status == "running" else "")))
+            " Its agent is stopped now; Continue on this page goes on where it was." if status == "running" else "")))
     if pos:
         parts.append("<span class='sep'></span>")
         for where, label in (("top", "Top"), ("up", "Up"), ("down", "Down"), ("bottom", "Bottom")):
@@ -1874,11 +1918,11 @@ def _t_acts(runs, key, st, rows, live, pos, n):
     return f"<div class='acts'>{''.join(parts)}</div>"
 
 
-def _t_retry(runs, key, st):
+def _t_retry(runs, key, st, go_on=False):
     """The retry form: from where it was (or the start) and each stage the queue
     would take it at (its own retry_refused); why not, when it takes none."""
     status = st.get("status", "")
-    label = RETRY_LABEL[status]
+    label = _retry_label(status, go_on)
     why = runs.retry_choices(key) or dict.fromkeys((None,) + STAGES, "")   # unknown: all, the queue still says no
     stages = [s for s in STAGES if not why.get(s)]
     if why.get(None) and not stages:
@@ -1890,7 +1934,7 @@ def _t_retry(runs, key, st):
     note = f"<span class='muted'>not {'from where it was' if status != 'done' else 'from the start'}: " \
            f"{esc(why[None])}</span>" if why.get(None) else ""
     return (f"<form method='post' action='/runs/ticket/{quote(key)}/retry'>"
-            f"<button type='submit' title='{esc(RETRY_TITLE[status])}'>{label}</button>"
+            f"<button type='submit' title='{esc(REDO_TITLE if go_on else RETRY_TITLE[status])}'>{label}</button>"
             f"{pick}</form>{note}")
 
 
@@ -1906,27 +1950,37 @@ def _t_questions(runs, key, st):
     status = st.get("status", "")
     qs = st.get("questions") or []
     vault = runs.vault_of(st)
+    go_on = _continuable(runs, key, st)
+    stage = st.get("stage", "")
     if status == "blocked" and vault:
-        # Blocked at any stage, not by the planner: retry as is, or send a note
-        stage = st.get("stage", "")
+        # Blocked at any stage, not by the planner: go on, retry as is, or send a note
         planned = "plan" in (st.get("stages") or STAGES)
         then = ("the ticket goes back to planning with it, and the revised plan comes back here for your "
                 "approval before anything is built." if planned else f"the ticket runs {stage} again with it.")
-        intro = (f"It stopped at {esc(stage)}" + (f": {esc(st['reason'])}" if st.get("reason") else "") + ". "
-                 f"If you fixed the cause yourself (a setting, the run mode, something on your machine), "
-                 f"Continue: the agent goes on with {esc(stage)} where it was, told what you write, and its work "
-                 f"is checked as usual when it ends. Retry above runs {esc(stage)} again with a new agent (add a "
-                 f"note under Notes first and every stage gets it).")
-        go_on = _continue_form(key, st) if stage in AGENT_STAGES else ""
-        return (f"<section class='panel'><h2>Get it going again</h2><div class='muted'>{intro}</div>{go_on}"
+        intro = f"It stopped at {esc(stage)}" + (f": {esc(st['reason'])}" if st.get("reason") else "") + ". "
+        if go_on:
+            intro += (f"If you fixed the cause yourself (a setting, the run mode, something on your machine), "
+                      f"Continue: the agent goes on with {esc(stage)} where it was, told what you write, and its "
+                      f"work is checked as usual when it ends. Start over above runs {esc(stage)} again with a new "
+                      f"agent (add a note under Notes first and every stage gets it).")
+        else:
+            intro += (f"Retry above runs {esc(stage)} again as it is (add a note under Notes first and every "
+                      f"stage gets it).")
+        return (f"<section class='panel' id='go-on'><h2>Get it going again</h2><div class='muted'>{intro}</div>"
+                f"{_continue_form(key, st) if go_on else ''}"
                 f"<div class='muted'>If the work itself should change, write it here: {then}</div>"
                 f"{_note_form(key, 'Send and plan again' if planned else f'Send and run {esc(stage)} again')}"
                 "</section>")
-    if status in ("stopped", "interrupted") and st.get("stage") in AGENT_STAGES and st.get("stopped_from") != "plan-review":
-        cut = "you stopped it" if status == "stopped" else "the queue run working on it ended"
-        intro = (f"Its {esc(st.get('stage', ''))} stage was cut off ({cut}). Continue goes on with it where it was, "
-                 "told what you write; Resume (or Queue again) above runs the stage again with a new agent.")
-        return (f"<section class='panel'><h2>Go on with it</h2><div class='muted'>{intro}</div>"
+    if go_on:   # cut off (stopped, a run that ended), blocked, or queued to go on
+        if status == "queued":
+            intro = (f"It is queued to go on with {esc(stage)} where its agent was cut off. Continue gives "
+                     "that agent a message from you as well.")
+        else:
+            cut = {"stopped": "you stopped it", "blocked": "it was blocked"}.get(
+                status, "the queue run working on it ended")
+            intro = (f"Its {esc(stage)} stage was cut off ({cut}). Continue goes on with it where it was, "
+                     "told what you write; Start over above runs the stage again with a new agent.")
+        return (f"<section class='panel' id='go-on'><h2>Go on with it</h2><div class='muted'>{intro}</div>"
                 f"{_continue_form(key, st)}</section>")
     if status in WAITING and vault:
         review = status == "plan-review"
@@ -2601,7 +2655,10 @@ def render_side(runs, src, row, live, sent="", todos=None, oc_url=""):
                      + "</div>")
         if st.get("status") == "running" and working and not st.get("stopping"):
             parts.append(_btn(f"/runs/{quote(sid)}/stop", "Stop this stage", "warn", confirm=(
-                f"Stop {key}? Its agent is stopped and the ticket is held; Resume on its page takes it again.")))
+                f"Stop {key}? Its agent is stopped and the ticket is held; Continue on its page goes on.")))
+        elif st.get("status") != "queued" and _continuable(runs, key, st):
+            parts.append(f"<a class='btn primary' href='/runs/ticket/{quote(key)}#go-on' title='{esc(CONTINUE_TITLE)}'>"
+                         f"Continue {esc(st['stage'])}</a>")
     if oc_url:
         parts.append(f"<a class='btn' href='{esc(oc_url)}' target='_blank' rel='noreferrer'>Open in opencode web</a>")
     if sid in live:
