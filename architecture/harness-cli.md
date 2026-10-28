@@ -799,7 +799,13 @@ mode's (container vs host stores), or a resumed launch that dies at once
 (`LaunchFailed`), a new agent gets the full prompt plus a `GOING_ON` block
 telling it to finish the work there. A halt, Ctrl-C, an upstream outage or a
 run that died with the agent working sets `resume` itself (`go_on_later`), so
-the next run goes on in the session without being asked), `stop KEY` (a waiting
+the next run goes on in the session without being asked. So does an agent
+that stopped on an error (`crash_of`: the `[harness] opencode error: ...`
+line live-run.sh prints, or a failing launch status, a compaction that went
+wrong say): `fail` sends the stage on in its session once per attempt
+(`go_on_after_crash`, `session.crashed`, history result `crashed`, no attempt
+counted); a second stop fails the attempt and the next one is a new agent
+with the `GOING_ON` block), `stop KEY` (a waiting
 ticket becomes `stopped`; a running one the run has in hand gets the
 `KEY/stop` sentinel, which the runner also checks right before the push;
 "in hand" is `run_holds`: a fresh beat, run.json naming it (the run writes

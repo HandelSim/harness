@@ -22,17 +22,39 @@
 # Prints "[harness] session: <id>" to stderr as soon as the session is known
 # (after the run on the plain path): `harness queue continue` resumes a stage
 # that was cut off in that session, and finds it in the stage's output.
+# An error that ended the session (opencode puts it only in the event stream)
+# is printed as "[harness] opencode error: <message>", and the exit status is
+# then 1 on both paths (an attached run otherwise exits 0).
 
 set -u
 events="$1"; shift
 
 session_of() { grep -o '"sessionID": *"ses_[A-Za-z0-9]*"' "$events" 2>/dev/null | head -1 | cut -d'"' -f4; }
+# The run's {"type":"error",...,"error":{"name":..,"data":{"message":..}}}
+# lines, each as its message (or the error's name when it has none).
+errors_of() {
+    grep '^{"type":"error"' "$events" 2>/dev/null | head -3 | while IFS= read -r line; do
+        m=$(sed -nE 's/.*"message":"(([^"\\]|\\.)*)".*/\1/p' <<<"$line")
+        [[ -n "$m" ]] || m=$(sed -nE 's/.*"name":"([^"]*)".*/\1/p' <<<"$line")
+        m=${m//\\n/ }; m=${m//\\\"/\"}
+        echo "[harness] opencode error: ${m:-unknown error}" | cut -c1-500
+    done
+}
+# The run's status: 1 when it ended on an error but exited 0.
+status_of() {
+    local rc="$1" errs
+    errs=$(errors_of)
+    [[ -n "$errs" ]] || return "$rc"
+    echo "$errs" >&2
+    [[ "$rc" == 0 ]] && return 1
+    return "$rc"
+}
 plain() {
     local rc=0 s
     opencode run --format json "$@" >"$events" || rc=$?
     s=$(session_of)
     [[ -n "$s" ]] && echo "[harness] session: $s" >&2
-    return "$rc"
+    status_of "$rc"
 }
 
 live="${XDG_DATA_HOME:-$HOME/.local/share}/harness/live"
@@ -104,6 +126,7 @@ while kill -0 "$run_pid" 2>/dev/null; do
     sleep 1
 done
 wait "$run_pid"; rc=$?
+status_of "$rc"; rc=$?
 
 if [[ -n "$sid" ]]; then
     rm -f "$marker"

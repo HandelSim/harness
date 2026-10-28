@@ -258,6 +258,9 @@ home (see "Run viewer" in [`harness-cli.md`](harness-cli.md));
 <id>` on stderr (live: as soon as the session exists; plain: at the end),
 which `harness queue` records to go on in a cut-off stage; the script is
 baked into the image, so a container gets that line after `harness upgrade`.
+An error that ended the session, which opencode writes only to the event
+stream, is printed as `[harness] opencode error: <message>`, and the status is
+then 1 (an attached run exits 0 on it; a plain one already exits 1).
 
 The run's exit code is preserved so the tests' provider-auth skip path keeps
 working. This trades live streaming (irrelevant for single-shot `-p`) for a

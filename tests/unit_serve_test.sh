@@ -192,7 +192,8 @@ ok "S6: serve prints its URLs with no OAI configured"
 # --- S7: agents/live-run.sh: a headless run that takes messages --------------
 # A stub opencode on PATH: `serve` listens on a loopback port and logs each
 # request; `run` logs its argv, names a session in its event stream, waits,
-# and exits 7.
+# and exits 7 (STUB_RC). STUB_ERROR: the stream ends on a session error, as
+# opencode writes it.
 LR="$TMP_ROOT/live"
 mkdir -p "$LR/bin"
 cat >"$LR/bin/opencode" <<EOF
@@ -218,7 +219,11 @@ if sys.argv[1] == "serve":
 note("run", *sys.argv[2:])
 print(json.dumps({"type": "step_start", "sessionID": "ses_stub1"}), flush=True)
 time.sleep(float(os.environ.get("STUB_RUN_SECS", "3")))
-sys.exit(7)
+if os.environ.get("STUB_ERROR"):
+    print(json.dumps({"type": "error", "timestamp": 1, "sessionID": "ses_stub1", "error": {
+        "name": "UnknownError", "data": {"message": 'Tool call not allowed while generating summary: "read"'}}},
+        separators=(",", ":")), flush=True)
+sys.exit(int(os.environ.get("STUB_RC", "7")))
 EOF
 chmod +x "$LR/bin/opencode"
 live_run() {  # live_run NAME [env...]: runs live-run.sh in the background, sets lr_pid
@@ -248,6 +253,16 @@ for mode in fail off; do
     [[ "$rc" == 7 ]] || fail "S7 ($mode): want run's status 7, got $rc"
     grep -q '^run --format json --agent yolo say hi$' "$LR/$mode.log" \
         || fail "S7 ($mode): should fall back to a plain run: $(cat "$LR/$mode.log")"
+done
+# A session that ended on an error says what it was, and an attached run's 0
+# becomes 1, as a plain run's already is.
+for mode in err errplain; do
+    live_run "$mode" STUB_RUN_SECS=0.3 STUB_ERROR=1 STUB_RC=0 $([[ "$mode" == errplain ]] && echo HARNESS_LIVE=0) \
+        2>"$LR/$mode.err"
+    rc=0; wait "$lr_pid" || rc=$?
+    [[ "$rc" == 1 ]] || fail "S7 ($mode): a run that ended on an error should exit 1, got $rc"
+    grep -qxF '[harness] opencode error: Tool call not allowed while generating summary: "read"' "$LR/$mode.err" \
+        || fail "S7 ($mode): the error should be printed: $(cat "$LR/$mode.err")"
 done
 # Killed mid-run (a stage timeout): serve and run go too, and the marker.
 live_run term STUB_RUN_SECS=30

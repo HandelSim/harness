@@ -1498,6 +1498,7 @@ def render(name, **values):
 # agents/live-run.sh says which opencode session the launch is: the session a stage
 # that was cut off goes on in (harness queue continue; an outage, Ctrl-C or a halt)
 SESSION_LINE = re.compile(r"^\[harness\] session: (ses_\w+)", re.M)
+ERROR_LINE = re.compile(r"^\[harness\] opencode error: (.*)$", re.M)   # agents/live-run.sh: what ended the session
 RESUMABLE = ("plan", "implement", "review", "fix")   # the stages an agent works in
 
 
@@ -1528,6 +1529,8 @@ def note_session(ctx, st, out, since):
     st["session"] = {"stage": st["stage"], "attempt": st.get("attempt", 0), "id": got,
                      "container": not (ctx.host or ctx.single),
                      "started": before["started"] if same and before.get("started") else since / 1000}
+    if same and before.get("crashed"):
+        st["session"]["crashed"] = before["crashed"]
     return True
 
 
@@ -1538,6 +1541,34 @@ def go_on_later(st, why):
     s = st.get("session") or {}
     if st.get("stage") in RESUMABLE and s.get("stage") == st["stage"] and s.get("attempt") == st.get("attempt", 0):
         st["resume"] = {"stage": st["stage"], "why": why, "message": ""}
+
+
+def crash_of(st, rc):
+    """Why this attempt's agent stopped before it finished, when it stopped on an
+    error (opencode's: a compaction that went wrong, say) or its launch failed;
+    else ""."""
+    kept = st.get("verify_only") or {}
+    err = ERROR_LINE.findall(read(kept["out"])) if kept.get("out") else []
+    if err:
+        return f"its agent stopped on an error: {err[-1][:300]}"
+    return f"its agent's launch exited with status {rc}" if rc not in (0, None, IDLE) else ""
+
+
+def go_on_after_crash(ctx, st, why):
+    """The agent stopped (crash_of): True when the stage goes on in its session
+    instead of failing the attempt. Once per attempt, which is not counted; a
+    second stop fails it as usual."""
+    s = st.get("session") or {}
+    if st.get("stage") not in RESUMABLE or s.get("stage") != st["stage"] \
+            or s.get("attempt") != st.get("attempt", 0) or s.get("crashed") or not s.get("id"):
+        return False
+    s["crashed"] = True
+    st.pop("verify_only", None)
+    st["resume"] = {"stage": st["stage"], "why": why, "message": ""}
+    ctx.q.log(st["key"], f"{st['stage']}: {why}; going on in its session {s['id']}")
+    record(st, "crashed", [why])
+    ctx.q.save(st)
+    return True
 
 
 CARRY_ON = ("\n\n<<<BEGIN_GOING_ON (an earlier agent on this stage was cut off before it finished: {why})>>>\n"
@@ -2793,12 +2824,18 @@ def fail(ctx, st, rc, problems):
         st.pop("verify_only", None)
         ctx.q.save(st)
         raise
+    crash = crash_of(st, rc)
+    if crash and go_on_after_crash(ctx, st, crash):
+        return
     st.pop("verify_only", None)
     text = "\n".join("- " + p for p in problems)
     ctx.q.log(st["key"], f"{st['stage']} attempt {st['attempt'] + 1} failed", text)
     record(st, "failed", problems)
     if st["attempt"] < ctx.retries:
         st.update(attempt=st["attempt"] + 1, feedback=text)
+        if crash and st["stage"] in RESUMABLE:   # its session stopped again: a new agent, told to finish the work
+            st.pop("session", None)
+            st["resume"] = {"stage": st["stage"], "why": crash, "message": ""}
         ctx.q.save(st)
     else:
         block(ctx, st, f"{st['stage']} failed {st['attempt'] + 1} time(s): {problems[0][:200]}")

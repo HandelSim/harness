@@ -166,6 +166,13 @@ if os.environ.get("FAKE_HANG_AFTER") and os.environ.get("FAKE_HANG_STAGE", stage
     import time   # its work done, the agent does not exit
     open(os.environ["FAKE_CALLS"] + ".hanging", "a").write(stage + "\n")
     time.sleep(int(os.environ["FAKE_HANG_AFTER"]))
+if os.environ.get("FAKE_CRASH"):   # STAGE:N: its first N launches end on an opencode error, their work done
+    s, n = os.environ["FAKE_CRASH"].split(":")
+    count = os.environ["FAKE_CALLS"] + ".crashes"
+    if s == stage and (len(open(count).read()) if os.path.exists(count) else 0) < int(n):
+        open(count, "a").write("x")
+        print("[harness] opencode error: Tool call not allowed while generating summary: read", file=sys.stderr)
+        sys.exit(1)
 '''
 
 
@@ -1430,6 +1437,39 @@ class OwnerControlTest(Base):
         prompt = self.prompts("implementing")[-1]
         self.assertIn("BEGIN_GOING_ON", prompt)
         self.assertIn("Commit it this time.", prompt)
+
+    def test_an_agent_that_stops_on_an_error_goes_on_in_its_session(self):
+        os.environ["FAKE_CRASH"] = "implementing:1"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        implementing = self.calls_of("implementing")
+        self.assertEqual(len(implementing), 2, implementing)
+        self.assertNotIn("--session", implementing[0])
+        self.assertIn("--session ses_fake1", implementing[1])
+        said = cat(self.calls + ".continue")
+        self.assertIn("Tool call not allowed while generating summary: read", said)
+        self.assertIn("(none: carry on)", said)
+        crashed = [h for h in st["history"] if h["result"] == "crashed"]
+        self.assertEqual([(h["stage"], h["attempt"]) for h in crashed], [("implement", 1)], st["history"])
+        self.assertFalse([h for h in st["history"] if h["result"] == "failed"], st["history"])   # not an attempt
+
+    def test_an_agent_that_stops_twice_gets_a_new_agent_told_to_finish(self):
+        os.environ["FAKE_CRASH"] = "implementing:2"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        implementing = self.calls_of("implementing")
+        self.assertEqual(len(implementing), 3, implementing)
+        self.assertIn("--session ses_fake1", implementing[1])
+        self.assertNotIn("--session", implementing[2])
+        prompt = self.prompts("implementing")[-1]
+        self.assertIn("BEGIN_GOING_ON", prompt)
+        self.assertIn("stopped on an error: Tool call not allowed", prompt)
+        failed = [h for h in st["history"] if h["result"] == "failed"]
+        self.assertEqual([(h["stage"], h["attempt"]) for h in failed], [("implement", 1)], st["history"])
 
     def test_continue_is_refused_where_there_is_nothing_to_go_on(self):
         self.add("ABC-1")
