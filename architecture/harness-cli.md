@@ -983,8 +983,8 @@ break. git output is read as UTF-8 (`PYTHONUTF8=1`), the push never asks for
 credentials (`credential.interactive=false`, `GCM_INTERACTIVE=never`, ssh
 `BatchMode` only when neither `GIT_SSH`, `GIT_SSH_COMMAND` nor the project's
 `core.sshCommand` names an ssh of the owner's), and a container `run` asks the open-firewall question once,
-then sets `HARNESS_NET_CONFIRM=1` for its stages; `--single-message` starts
-the proxy in single mode up front. Covered by `tests/unit_queue_test.sh`.
+then sets `HARNESS_NET_CONFIRM=1` for its stages; with `--single-message`
+its stage launches send the single header on the shared proxy. Covered by `tests/unit_queue_test.sh`.
 
 ### Interactive TTY resolution (Windows) — issue #82
 
@@ -1261,17 +1261,41 @@ What it does, in order:
    `native=` line (`PROXY_NATIVE_TOOL_MODELS`, `MODEL_CONTEXT_LENGTH`) are appended
    unconditionally, so a host proxy left running across an upgrade or a knob
    change is restarted instead of serving old code. A `promptmode=<mode>` line is appended **only**
-   when `harness host --single-message` / `--prompt-mode M` set
-   `prompt_mode_override` (exported to the host proxy as `PROXY_PROMPT_MODE`,
-   blank by default), so a default launch hashes as before, while switching
-   modes in either direction restarts the proxy; a plain `harness host` after a
-   `--single-message` run therefore comes back on hybrid. Folding the requirements content in matters because the reuse
+   when `harness host --prompt-mode M` sets `prompt_mode_override` (exported
+   to the host proxy as `PROXY_PROMPT_MODE`, blank by default), so a default
+   launch hashes as before. `--single-message` (and `--prompt-mode single`) on
+   host is not a proxy mode: `cmd_host` turns it into `harness_single=1`,
+   whose `single_opencode_config` overlay adds the `x-harness-prompt-mode:
+   single` provider header, so the shared proxy folds that launch's requests
+   and nobody else's ([`proxy.md`](proxy.md)). Folding the requirements content in matters because the reuse
    short-circuit returns *before* `host_proxy_ensure_venv`, so an `upgrade` that
    bumps a proxy dep restarts the running proxy onto the rebuilt venv instead of
    leaving it on stale deps. `host_proxy_wait_ready`
    polls the loopback port via `/dev/tcp` (the proxy calls `app.run()` last, so
    an accepted connect means it is serving) and tails the log on failure (the
    common cause is `_validate_config` `sys.exit(1)`).
+   **Shared proxy, leases:** one host proxy serves every harness on the
+   install at once (a `harness host` per terminal, `harness serve`, a queue
+   run and its stage launches, `harness ingest`). Each holds a lease while it
+   uses it (`host_proxy_hold`: an empty file named for its pid under
+   `state/host/proxy.users`), taken before `host_proxy_start` and dropped on
+   exit (`host_proxy_release`; an `exec` restart keeps the pid and so the
+   lease). `host_proxy_others` lists the other live holders and removes the
+   leases of dead pids (and, where `/proc` exists, of pids whose command line
+   no longer names harness). Nothing stops or restarts the proxy under
+   another holder: an interactive exit, and a queue run or ingest that
+   started it, go through `host_proxy_done` (release, stop only if no other
+   holds it); a fingerprint mismatch with holders live keeps the proxy and
+   leaves `proxy.fp` stale, so the first launch after they end restarts it,
+   unless `host_proxy_same_kind` says it can't serve this launch (backend,
+   explicit prompt mode or port differ, from `state/host/proxy.mode`), when
+   the launch fails naming the pids; `harness down` (which also runs when the
+   last container agent exits) and the upgrade restart (`host_proxy_refresh`)
+   skip it with a message; `harness host down` stops it anyway, saying who
+   it cuts off. Before this, closing one terminal, a config or code change
+   seen by the next launch, or the last container agent exiting killed the
+   proxy under an agent working elsewhere ("Cannot connect to API"). Covered by
+   `tests/unit_host_proxy_lease_test.sh`.
 7. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`
    (`includeUsage`, token `cost` and a `-withtools` context of at most 120k via
@@ -1310,13 +1334,13 @@ What it does, in order:
    `-p` run goes through `agents/live-run.sh` from the clone, as in the
    container, so the serve run viewer can message it (see "Run viewer").
    Interactive runs opencode as a **child** (not `exec`) so the proxy is torn
-   down on exit; print mode leaves the proxy up so a scripted `-p` loop doesn't
+   down on exit (unless another harness holds it, see leases above); print mode leaves the proxy up so a scripted `-p` loop doesn't
    thrash it (`harness host down` stops it) — the same interactive-vs-print
    teardown split as container mode. Because nothing reaps a `-p` proxy, print
    mode prints a stderr reminder after the run naming the live pid and the
    `harness host down` stop command. `host_run_opencode` exports
    `OPENCODE_ENABLE_EXA=1` (Exa web search) unless `HARNESS_HOST_NO_WEB=1`. **Terminal reset on interactive exit:** after
-   the interactive child returns (before `host_proxy_stop`), `host_reset_terminal`
+   the interactive child returns (before `host_proxy_done`), `host_reset_terminal`
    re-sends the xterm DECRST disables for mouse-tracking (`?1000`/`?1002`/`?1003`
    + the `?1005`/`?1006`/`?1015` report encodings), focus-reporting (`?1004`) and
    bracketed-paste (`?2004`), plus a cursor-show (`?25h`). opencode's TUI enables

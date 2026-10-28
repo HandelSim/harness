@@ -297,7 +297,9 @@ helper with `harness upgrade`.
 3b. Restart what harness left running, on the new code, unless
    `--no-restart` (which says what still runs the old code): the host proxy
    (`host_proxy_refresh`, with the backend and prompt mode recorded in
-   `state/host/proxy.mode` when it started), a `harness serve` in a terminal
+   `state/host/proxy.mode` when it started; skipped while another harness
+   holds a lease on it, and the first launch after they end restarts it on the
+   new code, see harness-cli.md), a `harness serve` in a terminal
    (`harness_serve_refresh`: USR1, it `exec`s the new code in place) and the
    run viewer (`harness_view_refresh`). A queue run restarts itself between
    tickets (exit 75); a working agent is not interrupted. This runs before

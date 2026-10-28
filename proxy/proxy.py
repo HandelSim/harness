@@ -2069,6 +2069,21 @@ _OUTPUT_DIR: Optional[str] = None  # set in main() before serving
 _PROMPT_MODE: str = "hybrid"  # set in main() before serving
 _PROMPT_MODES = ("hybrid", "user_front", "passthrough", "single")
 
+# `x-harness-prompt-mode: single` (a provider header `harness host
+# --single-message` adds) asks for single on that request alone, so one shared
+# host proxy serves single-message and default launches side by side instead
+# of being restarted under whichever one is working. It wins over the proxy's
+# own mode, as --single-message used to by restarting it, except on a
+# passthrough proxy (a benchmark control that sends the request as it came).
+# Only "single" is honored: the other modes stay a property of the proxy.
+_PROMPT_MODE_HEADER = "x-harness-prompt-mode"
+
+
+def _request_prompt_mode(headers) -> Optional[str]:
+    """"single" when the request asks for it, else None (the proxy's own mode)."""
+    asked = str(headers.get(_PROMPT_MODE_HEADER, "") or "").strip().lower()
+    return "single" if asked == "single" and _PROMPT_MODE != "passthrough" else None
+
 # Single mode only. Above this many characters the fold drops the OLDEST
 # conversation turns first (instructions and the current turn are always
 # kept). `harness probe optimize-single` saw whole-message recall hold to
@@ -4057,6 +4072,7 @@ def translate_history_and_apply_prompt(
     ticket: Optional[str] = None,
     session_id: str = "",
     task: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
     Translate the inbound OpenAI-format messages into a flat conversation
@@ -4074,11 +4090,15 @@ def translate_history_and_apply_prompt(
     list). No history translation, no cooperative-prompt scaffolding, no
     system→user rewrite. This is a benchmark control — see the catch_all
     handler for the matching `tools` passthrough that completes the bypass.
+
+    mode: this request's prompt mode (`_request_prompt_mode`), else the
+    proxy's own.
     """
     if not original_messages:
         return []
+    mode = mode or _PROMPT_MODE
 
-    if _PROMPT_MODE == "passthrough":
+    if mode == "passthrough":
         # Shallow copy each dict so a downstream mutation can't poison the
         # caller's view of the upstream payload. We intentionally don't
         # validate or coerce any fields — the whole point is "do nothing".
@@ -4191,7 +4211,7 @@ def translate_history_and_apply_prompt(
     #                real user turn in <<<BEGIN_USER_MESSAGE>>>. Tool-result
     #                turns keep only their <<<BEGIN_TOOL_RESULT>>> markers.
     if tools_text and messages:
-        if _PROMPT_MODE == "user_front":
+        if mode == "user_front":
             if messages[-1]["role"] == "user":
                 original_last_role = original_messages[-1].get("role")
                 final_content = messages[-1]["content"]
@@ -4199,7 +4219,7 @@ def translate_history_and_apply_prompt(
                     messages[-1]["content"] = build_cooperative_prompt_tool_front(final_content, tools_text)
                 else:
                     messages[-1]["content"] = build_cooperative_prompt_user_front(final_content, tools_text)
-        elif _PROMPT_MODE in ("hybrid", "single"):
+        elif mode in ("hybrid", "single"):
             # Single mode builds this same hybrid content and only folds it
             # into one message at the end (_fold_single_message).
             # Hybrid: full tool definitions go on the system message (stable
@@ -4318,7 +4338,7 @@ def translate_history_and_apply_prompt(
                     task=task,
                 )
 
-    if _PROMPT_MODE == "single":
+    if mode == "single":
         return [{"role": "user", "content": _fold_single_message(messages)}]
 
     # A tag for this opencode session at the end of message 0. If the upstream
@@ -5386,8 +5406,10 @@ def catch_all(path: str) -> Response:
         g.budget_req = req_id
 
         # Native tool-calling models skip the cooperative pipeline entirely.
-        # OAI models are always native, on their own upstream.
-        if _is_oai_model(model_name) or _is_native_tool_model(model_name):
+        # OAI models are always native, on their own upstream. A single-message
+        # request stays cooperative, as an explicit --prompt-mode does.
+        request_mode = _request_prompt_mode(request.headers)
+        if _is_oai_model(model_name) or (_is_native_tool_model(model_name) and not request_mode):
             return _native_passthrough(
                 req_id, inbound_request, model_name, want_stream,
                 _session_id(request.headers),
@@ -5416,7 +5438,8 @@ def catch_all(path: str) -> Response:
         prompt_ctx = {"vault": request.headers.get(_VAULT_HEADER),
                       "ticket": request.headers.get(_TICKET_HEADER),
                       "task": request.headers.get(_TASK_HEADER),
-                      "session_id": _session_id(request.headers)}
+                      "session_id": _session_id(request.headers),
+                      "mode": request_mode}
         translated = translate_history_and_apply_prompt(original_messages, tools_text, tools=prompt_tools,
                                                         **prompt_ctx)
 
@@ -5434,7 +5457,7 @@ def catch_all(path: str) -> Response:
         # --test-modes` reads this to confirm each mode actually took effect
         # (single sends exactly one message).
         print(
-            f"[{req_id}] upstream shape: mode={_PROMPT_MODE} "
+            f"[{req_id}] upstream shape: mode={request_mode or _PROMPT_MODE} "
             f"messages={len(translated)} "
             f"chars={sum(len(_flatten_content_to_str(m.get('content') or '')) for m in translated)}",
             flush=True,

@@ -554,6 +554,15 @@ validator in `_setup_prompt_mode` accepts:
   instructions and the current turn are never cut. Retries and require-tool
   re-asks go through the same translate, so they fold too. Require-tool stays
   on. Compare against hybrid with `harness benchmark --test-modes`.
+  Per request: an `x-harness-prompt-mode: single` header
+  (`_request_prompt_mode`; `harness host --single-message` sets it as a
+  provider header through `single_opencode_config`) folds that request alone,
+  whatever the proxy's own mode, except on a passthrough proxy. It is passed
+  to `translate_history_and_apply_prompt` (and the re-asks) as `mode` and
+  keeps the request off the native route, as an explicit
+  `PROXY_PROMPT_MODE` does. This is how one shared host proxy serves single
+  and default launches at once; container launches still set the mode on
+  their own proxy.
 
 Invalid values fall back to `hybrid` with a warning (absent or empty is
 silently `hybrid`; host mode always passes the var, blank by default) — including the

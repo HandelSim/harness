@@ -10,12 +10,14 @@
 #     prompt_mode_override=single; nothing passed leaves it empty (hybrid);
 #     an unknown mode is still rejected
 #   - write_runtime_override: emits PROXY_PROMPT_MODE: "single" for the proxy
-#   - host_proxy_fingerprint: unchanged for a default launch, different for a
-#     single launch (so switching modes restarts the host proxy)
+#   - host_proxy_fingerprint: unchanged for a default launch, different for an
+#     explicit mode (a `--prompt-mode M` host launch restarts the proxy)
 #   - cmd_host: consumes --single-message / --prompt-mode M (never forwarded to
-#     opencode), rejects a bad mode before starting anything, and leaves the
-#     override empty without the flag
-#   - host_proxy_start hands the mode to the proxy as PROXY_PROMPT_MODE
+#     opencode), rejects a bad mode before starting anything, and turns single
+#     into harness_single (a per-request header) instead of a proxy mode, so
+#     the shared host proxy is neither restarted nor made single for others
+#   - host_proxy_start hands an explicit mode to the proxy as PROXY_PROMPT_MODE
+#   - single_opencode_config: the x-harness-prompt-mode header, only when asked
 #
 # Run:  bash tests/unit_single_message_test.sh
 
@@ -111,7 +113,7 @@ run_host() {
         _gate_on_upstream_auth() { return 0; }
         _print_upstream_models() { return 0; }
         host_proxy_start() {
-            echo "MODE=[${prompt_mode_override}] PASSARGS=[${pass_args[*]-}]"
+            echo "MODE=[${prompt_mode_override}] SINGLE=[${harness_single:-0}] PASSARGS=[${pass_args[*]-}]"
             exit 43
         }
         cmd_host "$@" 2>&1
@@ -119,23 +121,31 @@ run_host() {
 }
 rc=0; out=$(run_host --single-message -p hi) || rc=$?
 (( rc == 43 )) || fail "T4: cmd_host --single-message did not reach the proxy start (rc=$rc) — $out"
-grep -q 'MODE=\[single\] PASSARGS=\[-p hi\]' <<<"$out" || fail "T4: --single-message — $out"
+grep -q 'MODE=\[\] SINGLE=\[1\] PASSARGS=\[-p hi\]' <<<"$out" || fail "T4: --single-message — $out"
 rc=0; out=$(run_host --prompt-mode single) || rc=$?
-grep -q 'MODE=\[single\] PASSARGS=\[\]' <<<"$out" || fail "T4: --prompt-mode single — $out"
+grep -q 'MODE=\[\] SINGLE=\[1\] PASSARGS=\[\]' <<<"$out" || fail "T4: --prompt-mode single — $out"
 rc=0; out=$(run_host --prompt-mode=user_front) || rc=$?
-grep -q 'MODE=\[user_front\]' <<<"$out" || fail "T4: --prompt-mode=user_front — $out"
+grep -q 'MODE=\[user_front\] SINGLE=\[0\]' <<<"$out" || fail "T4: --prompt-mode=user_front — $out"
 rc=0; out=$(run_host -p hi) || rc=$?
-grep -q 'MODE=\[\] PASSARGS=\[-p hi\]' <<<"$out" || fail "T4: plain host is not default — $out"
+grep -q 'MODE=\[\] SINGLE=\[0\] PASSARGS=\[-p hi\]' <<<"$out" || fail "T4: plain host is not default — $out"
 rc=0; out=$(run_host --prompt-mode bogus) || rc=$?
 (( rc != 43 && rc != 0 )) || fail "T4: a bad mode reached the proxy start — $out"
 rc=0; out=$(run_host --prompt-mode) || rc=$?
 (( rc != 43 && rc != 0 )) || fail "T4: a missing mode value reached the proxy start — $out"
-ok "T4: cmd_host consumes the mode flags, validates them, and defaults to hybrid"
+ok "T4: cmd_host consumes the mode flags, validates them, sends single per request, and defaults to hybrid"
 
 # --- T5: host_proxy_start passes the mode to the proxy -----------------------
 grep -q 'PROXY_PROMPT_MODE="${prompt_mode_override:-}"' \
     < <(sed -n '/^host_proxy_start()/,/^}/p' "$HARNESS") \
     || fail "T5: host_proxy_start does not export PROXY_PROMPT_MODE"
 ok "T5: host_proxy_start exports PROXY_PROMPT_MODE"
+
+# --- T6: the single header overlay -------------------------------------------
+[[ -z "$(harness_single=0 single_opencode_config)" ]] || fail "T6: header without --single-message"
+hdr=$(harness_single=1 single_opencode_config)
+grep -q '"x-harness-prompt-mode":"single"' <<<"$hdr" || fail "T6: no single header — $hdr"
+grep -q 'single_opencode_config' < <(sed -n '/^harness_opencode_overlay()/,/^}/p' "$HARNESS") \
+    || fail "T6: harness_opencode_overlay does not merge the single overlay"
+ok "T6: --single-message adds the x-harness-prompt-mode header to the launch's overlay"
 
 echo "[single-message] all $pass checks passed"

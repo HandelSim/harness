@@ -3077,7 +3077,17 @@ cmd_down() {
     # down here too — a no-op when nothing is running. Done before require_docker
     # so both a host-only box (no runtime) and a leftover 'harness host -p' proxy
     # on a container box get cleaned up by the muscle-memory teardown verb.
-    host_proxy_stop
+    # Not while a harness uses it: this also runs when the last container
+    # agent exits (stop_stack_if_last_agent), and that must not cut off a
+    # harness host working in another terminal. harness host down stops it
+    # regardless.
+    local proxy_users
+    proxy_users=$(host_proxy_others)
+    if [[ -n "$proxy_users" ]]; then
+        host_proxy_running && echo "[harness] host proxy left running: other harnesses use it (pid $(echo $proxy_users)); harness host down stops it anyway" >&2
+    else
+        host_proxy_stop
+    fi
 
     # Host-only install: there is no container stack to tear down. Stop any host
     # MCP processes and return rather than hard-failing on require_docker.
@@ -4481,8 +4491,9 @@ host_state_dir()       { printf '%s/host' "$state_root"; }
 host_venv_dir()        { printf '%s/host/venv' "$state_root"; }
 host_proxy_pidfile()   { printf '%s/host/proxy.pid' "$state_root"; }
 host_proxy_fpfile()    { printf '%s/host/proxy.fp' "$state_root"; }
-# The backend and prompt mode the running proxy was started with (two lines),
-# so `harness upgrade` can start it again the same way.
+# The backend, prompt mode and port the running proxy was started with (three
+# lines), so `harness upgrade` can start it again the same way and a launch
+# can tell whether it serves it (host_proxy_same_kind).
 host_proxy_modefile()  { printf '%s/host/proxy.mode' "$state_root"; }
 host_proxy_logfile()   { printf '%s/host/proxy.log' "$state_root"; }
 # Both proxies write the same file: compose mounts state/output at /output.
@@ -5271,13 +5282,27 @@ host_output_dir_resolve() {
 # which sourced .env with `set -a`, so only the host-specific overrides are set
 # here. Records the PID; pipes stdout+stderr to the logfile.
 host_proxy_start() {
-    local venv port pf fpf lf cur_fp
+    local venv port pf fpf lf cur_fp others
     fpf=$(host_proxy_fpfile)
     cur_fp=$(host_proxy_fingerprint)
     # Reuse a live proxy only when its captured config still matches .env.
     # Otherwise restart it so an edited port/url/key/model takes effect (M2).
     if host_proxy_running; then
         if [[ -f "$fpf" && "$(cat "$fpf" 2>/dev/null)" == "$cur_fp" ]]; then
+            return 0
+        fi
+        # Another harness is working through this proxy: a restart would cut it
+        # off mid-request. Keep it when it still serves this launch the same
+        # way (a .env or code edit waits until they end; the fingerprint stays
+        # old so the next launch after them restarts it), refuse when it can't.
+        others=$(host_proxy_others)
+        if [[ -n "$others" ]]; then
+            if ! host_proxy_same_kind; then
+                err "the host proxy runs with another backend, prompt mode or port, and other harnesses use it (pid $(echo $others))"
+                err "  finish those first, or stop it for all of them: harness host down"
+                return 1
+            fi
+            echo "[harness] host mode: config changed since the proxy started, but other harnesses use it (pid $(echo $others)); keeping it until they end" >&2
             return 0
         fi
         # The fingerprint covers the backend as well as .env, so say "config"
@@ -5344,16 +5369,24 @@ host_proxy_start() {
         nohup "$(host_venv_python)" "$clone_dir/proxy/proxy.py" >"$lf" 2>&1 &
     printf '%s\n' "$!" >"$pf"
     printf '%s\n' "$cur_fp" >"$fpf"
-    printf '%s\n%s\n' "${backend_override:-}" "${prompt_mode_override:-}" >"$(host_proxy_modefile)"
+    printf '%s\n%s\n%s\n' "${backend_override:-}" "${prompt_mode_override:-}" "$port" >"$(host_proxy_modefile)"
 }
 
 # After an upgrade: a running host proxy serves the old proxy.py from memory.
-# Start it again on the new code, with the backend and prompt mode it had, so
-# a harness host or harness serve using it sees a few seconds' gap, not a dead
-# port. One started by a harness from before proxy.mode gets the defaults.
+# Start it again on the new code, with the backend and prompt mode it had,
+# when no harness is using it. One started by a harness from before proxy.mode
+# gets the defaults.
 host_proxy_refresh() {
     host_proxy_running || return 0
-    local mf b="" m=""
+    local mf b="" m="" others
+    # A restart drops the requests in flight, so not under a working harness.
+    # The proxy's code is in its fingerprint: the first launch after they all
+    # end starts it on the new code.
+    others=$(host_proxy_others)
+    if [[ -n "$others" ]]; then
+        echo "[harness] the host proxy keeps the old code while other harnesses use it (pid $(echo $others)); it restarts on the new code once they end"
+        return 0
+    fi
     mf=$(host_proxy_modefile)
     [[ -f "$mf" ]] && { IFS= read -r b; IFS= read -r m; } <"$mf" 2>/dev/null
     echo "[harness] restarting the host proxy on the new code"
@@ -5423,6 +5456,62 @@ host_proxy_stop() {
         taskkill //PID "$pid" //T //F >/dev/null 2>&1 || true
     fi
     rm -f "$pf" "$(host_proxy_fpfile)" 2>/dev/null || true
+}
+
+# Several harnesses share the one host proxy (a harness host in each terminal,
+# harness serve, a queue run and its stage launches). Each holds a lease while
+# it uses the proxy: a file named for its pid under proxy.users. A harness that
+# ends, or that sees the config changed, stops or restarts the proxy only when
+# no other live harness holds one, so closing one terminal no longer cuts off
+# an agent working in another ("Cannot connect to API").
+host_proxy_usersdir() { printf '%s/host/proxy.users' "$state_root"; }
+host_proxy_hold() {
+    local d
+    d=$(host_proxy_usersdir)
+    mkdir -p "$d" 2>/dev/null && : >"$d/$$" 2>/dev/null || true
+}
+host_proxy_release() { rm -f "$(host_proxy_usersdir)/$$" 2>/dev/null || true; }
+# The pids of the other live harnesses holding a lease, one per line. A lease
+# whose harness is gone (crashed, killed, its pid now some other program's) is
+# removed here.
+host_proxy_others() {
+    local d f p
+    d=$(host_proxy_usersdir)
+    [[ -d "$d" ]] || return 0
+    for f in "$d"/*; do
+        [[ -f "$f" ]] || continue
+        p=${f##*/}
+        [[ "$p" == "$$" ]] && continue
+        if [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null \
+            && { [[ ! -r "/proc/$p/cmdline" ]] || tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q harness; }; then
+            printf '%s\n' "$p"
+        else
+            rm -f "$f" 2>/dev/null || true
+        fi
+    done
+}
+# Done with the proxy: drop this harness's lease, and stop the proxy unless
+# another harness still uses it.
+host_proxy_done() {
+    local others
+    host_proxy_release
+    others=$(host_proxy_others)
+    if [[ -n "$others" ]]; then
+        host_proxy_running && echo "[harness] host proxy left running: other harnesses use it (pid $(echo $others))" >&2
+        return 0
+    fi
+    host_proxy_stop
+}
+# The backend, explicit prompt mode and port the running proxy started with
+# match this launch's (proxy.mode). Those decide what a request gets, so a
+# proxy that differs can't serve this launch even while others hold it. A
+# proxy.mode from before the port line counts as the same port.
+host_proxy_same_kind() {
+    local mf b="" m="" p=""
+    mf=$(host_proxy_modefile)
+    [[ -f "$mf" ]] && { IFS= read -r b; IFS= read -r m; IFS= read -r p; } <"$mf" 2>/dev/null
+    [[ "$b" == "${backend_override:-}" && "$m" == "${prompt_mode_override:-}" ]] \
+        && [[ -z "$p" || "$p" == "$(host_proxy_port)" ]]
 }
 
 # Write the host opencode config to a scoped file and point OPENCODE_CONFIG at
@@ -5586,6 +5675,16 @@ thoughts_opencode_config() {
     [[ "${harness_thoughts:-0}" == "1" ]] || return 0
     [[ "${harness_serve:-0}" == "1" && "${harness_slim:-1}" == "1" ]] && return 0
     printf '%s' '{"provider":{"harness":{"options":{"headers":{"x-harness-thoughts":"1"}}}}}'
+}
+
+# `harness host --single-message`: the `x-harness-prompt-mode: single` provider
+# header, on which the proxy folds that launch's requests into one message. A
+# header rather than a proxy restart in single mode, so the one host proxy
+# serves single and default launches side by side (architecture/proxy.md).
+# Container launches set the mode on their own proxy instead.
+single_opencode_config() {
+    [[ "${harness_single:-0}" == "1" ]] || return 0
+    printf '%s' '{"provider":{"harness":{"options":{"headers":{"x-harness-prompt-mode":"single"}}}}}'
 }
 
 # === Vaults (the brain) ===
@@ -6144,13 +6243,13 @@ serve_opencode_config() {
                          + (if ($native | index($dflt)) then {model: "harness/\($dflt):stock"} else {} end))}}' "$cfg"
 }
 
-# OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts, serve and vault
-# overlays deep-merged. Prints nothing when none applies. `oai` (a launch with
+# OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts, single, serve and
+# vault overlays deep-merged. Prints nothing when none applies. `oai` (a launch with
 # an OAI upstream, host or container) is passed on to slim_opencode_config.
 harness_opencode_overlay() {
     local part out=""
     for part in "$(slim_opencode_config "${1:-}")" "$(thoughts_opencode_config)" \
-            "$(serve_opencode_config)" "$(vault_opencode_config)"; do
+            "$(single_opencode_config)" "$(serve_opencode_config)" "$(vault_opencode_config)"; do
         [[ -n "$part" ]] || continue
         if [[ -z "$out" ]]; then
             out="$part"
@@ -6632,8 +6731,9 @@ HELP
         host_preflight        || { host_win_location_hint; exit 1; }
         _gate_on_upstream_auth || exit 1
         host_proxy_running || started=1
-        host_proxy_start || exit 1
-        host_proxy_wait_ready || { host_proxy_stop; exit 1; }
+        host_proxy_hold
+        host_proxy_start || { host_proxy_release; exit 1; }
+        host_proxy_wait_ready || { host_proxy_done; exit 1; }
     fi
     dir=$(vault_prepare)
     [[ -n "$dir" ]] || { err "the active vault is not available"; return 1; }
@@ -6654,8 +6754,11 @@ HELP
     local rc=0
     # shellcheck disable=SC2086  # $py can be 'py -3'
     $py "$script" "${args[@]}" || rc=$?
-    # A proxy this command started goes down with it.
-    (( started )) && host_proxy_stop
+    # A proxy this command started goes down with it, unless another harness
+    # took it up meanwhile.
+    if (( ! dry )); then
+        if (( started )); then host_proxy_done; else host_proxy_release; fi
+    fi
     return "$rc"
 }
 
@@ -7017,14 +7120,15 @@ HELP
                 warn_if_firewall_open 0 queue || exit 1
                 export HARNESS_NET_CONFIRM=1
             fi
-            # The mode the stages' launches want, so the first one does not restart the proxy.
-            (( single )) && prompt_mode_override=single
             # A run that started itself again after an upgrade (below) still owns its proxy.
             [[ "${HARNESS_QUEUE_OWNS_PROXY:-}" == 1 ]] && started=1
             unset HARNESS_QUEUE_OWNS_PROXY
             host_proxy_running || started=1
-            host_proxy_start || exit 1
-            host_proxy_wait_ready || { host_proxy_stop; exit 1; }
+            # Held for the whole run (the exec below keeps the pid, so the
+            # lease too): a harness host closed meanwhile leaves the proxy up.
+            host_proxy_hold
+            host_proxy_start || { host_proxy_release; exit 1; }
+            host_proxy_wait_ready || { host_proxy_done; exit 1; }
             dir=$(vault_prepare)
             [[ -n "$dir" ]] || { err "the active vault is not available"; return 1; }
             # One tab for the whole run: it follows the queue's newest stage
@@ -7050,7 +7154,7 @@ HELP
                 (( started )) && export HARNESS_QUEUE_OWNS_PROXY=1
                 exec "$clone_dir/harness" queue run "$@"
             fi
-            (( started )) && host_proxy_stop
+            if (( started )); then host_proxy_done; else host_proxy_release; fi
             return "$rc" ;;
         *) err "unknown queue command '$sub' (see: harness queue --help)"; return 1 ;;
     esac
@@ -7395,7 +7499,7 @@ host_run_opencode() {
     launch_ms=$(_now_ms)
     "${cmd[@]}" || rc=$?
     host_reset_terminal
-    host_proxy_stop
+    host_proxy_done
     vault_sync "${harness_vault_dir:-}" "$launch_ms" \
         "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}" "$PWD" "$HOME"
     return "$rc"
@@ -7449,9 +7553,15 @@ usage:
 
 --single-message (= --prompt-mode single) folds the whole chat into ONE
 upstream message instead of the default multi-message (hybrid) layout. It is
-experimental and only active when passed; a launch without it uses hybrid
-(and restarts a proxy left running in another mode). Compare the two with
+experimental and only active when passed; a launch without it uses hybrid.
+It is a header on this launch's requests, so the one host proxy serves single
+and default launches side by side. Compare the two with
 'harness benchmark --test-modes'.
+
+Several harnesses (a harness host per terminal, harness serve, a queue run)
+share the one host proxy. Each one holds it while it runs, and the proxy stops
+or restarts (for a .env, code or upgrade change) only when no other holds it,
+so closing one terminal never cuts off an agent working in another.
 
 No docker, no images, no egress firewall; opencode runs as your full host user,
 so every launch prompts to confirm (set HARNESS_HOST_CONFIRM=1 to skip it in
@@ -7471,8 +7581,9 @@ notes:
     on Windows" before relying on it.
   - debug dumps are OFF by default (opt in via OUTPUT_DIR in .env, same as
     container mode).
-  - interactive runs stop the proxy on exit; `-p` (print mode) leaves it
-    running for scripted loops — stop it with `harness host down`.
+  - interactive runs stop the proxy on exit unless another harness still uses
+    it; `-p` (print mode) leaves it running for scripted loops — stop it with
+    `harness host down`.
   - host-only installs (no docker) upgrade with `harness upgrade`, which pulls
     code + merges .env and skips the image rebuild.
 EOF
@@ -7515,6 +7626,12 @@ EOF
     fi
     (( want_ticket )) && { harness_ticket_flag ""; exit 1; }
     _validate_prompt_mode_override || exit 1
+    # Single goes per request (single_opencode_config), so this launch neither
+    # restarts the shared proxy nor turns it single for the others using it.
+    if [[ "$prompt_mode_override" == "single" ]]; then
+        harness_single=1
+        prompt_mode_override=""
+    fi
 
     host_require_python3 || exit 1
     host_require_config
@@ -7542,8 +7659,9 @@ EOF
     # in host_write_opencode_config below.
     _print_upstream_models || exit 1
 
-    host_proxy_start || exit 1
-    host_proxy_wait_ready || { host_proxy_stop; exit 1; }
+    host_proxy_hold
+    host_proxy_start || { host_proxy_release; exit 1; }
+    host_proxy_wait_ready || { host_proxy_done; exit 1; }
     host_write_opencode_config
     harness_vault_dir=$(vault_prepare)
     ticket_prepare
@@ -7555,6 +7673,7 @@ EOF
     else
         host_run_opencode "$yolo" "$print_mode" || rc=$?
     fi
+    host_proxy_release
     exit "$rc"
 }
 
@@ -7944,8 +8063,11 @@ HELP
     host_preflight        || { host_win_location_hint; exit 1; }
     _gate_on_upstream_auth || exit 1
     _print_upstream_models || exit 1
-    host_proxy_start || exit 1
-    host_proxy_wait_ready || { host_proxy_stop; exit 1; }
+    # Held while serve runs (its restart after an upgrade keeps the pid); a
+    # crashed serve's lease is dropped by the next host_proxy_others.
+    host_proxy_hold
+    host_proxy_start || { host_proxy_release; exit 1; }
+    host_proxy_wait_ready || { host_proxy_done; exit 1; }
     host_write_opencode_config
     harness_vault_dir=$(vault_prepare)
     harness_serve=1
@@ -8030,7 +8152,10 @@ HELP
 }
 
 cmd_host_down() {
+    local others
     if host_proxy_running; then
+        others=$(host_proxy_others)
+        [[ -n "$others" ]] && echo "[harness] host mode: other harnesses still use the proxy (pid $(echo $others)); their requests fail until a harness host starts it again" >&2
         echo "[harness] host mode: stopping proxy" >&2
         host_proxy_stop
     else

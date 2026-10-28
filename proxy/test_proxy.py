@@ -5692,6 +5692,28 @@ class TestSinglePromptMode(unittest.TestCase):
         self.assertEqual(out[1]["content"], "I understand the instructions above.")
         self.assertNotIn("<current_turn>", json.dumps(out))
 
+    def test_header_asks_single_for_one_request(self):
+        """`harness host --single-message` sends x-harness-prompt-mode: single,
+        so one shared host proxy serves single and default launches at once."""
+        h = {proxy._PROMPT_MODE_HEADER: "single"}
+        for mode in ("hybrid", "user_front", "single"):
+            with patch.object(proxy, "_PROMPT_MODE", mode):
+                self.assertEqual(proxy._request_prompt_mode(h), "single")
+                self.assertIsNone(proxy._request_prompt_mode({}))
+                self.assertIsNone(proxy._request_prompt_mode({proxy._PROMPT_MODE_HEADER: "user_front"}))
+        with patch.object(proxy, "_PROMPT_MODE", "passthrough"):
+            self.assertIsNone(proxy._request_prompt_mode(h))
+
+    def test_request_mode_folds_on_a_hybrid_proxy(self):
+        with patch.object(proxy, "_PROMPT_MODE", "hybrid"):
+            single = proxy.translate_history_and_apply_prompt(
+                self.history, self.tools_text, tools=self.TOOLS, mode="single")
+            plain = proxy.translate_history_and_apply_prompt(
+                self.history, self.tools_text, tools=self.TOOLS)
+        self.assertEqual(len(single), 1)
+        self.assertIn("<current_turn>", single[0]["content"])
+        self.assertGreater(len(plain), 1)
+
     def test_single_request_id_unique(self):
         a = self._run("single")[0]["content"].split("\n", 1)[0]
         b = self._run("single")[0]["content"].split("\n", 1)[0]
