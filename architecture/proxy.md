@@ -338,6 +338,13 @@ wrong for a one-shot "write this wiki section" request. Usage is recorded and
 budget failures are handled as on the normal path. Native and OAI models never
 reach this branch; a tool-less request already passes through them unchanged.
 
+A tool-less cooperative request without the header (opencode's compaction
+summary, its session title) gets no tool scaffold either, and its reply goes
+back as text with no tool-call extraction and no malformed-call retry: opencode
+ends the session ("Tool call not allowed while generating summary") on any tool
+call in reply to one, and a summary often quotes a ```json block from the
+history.
+
 ## Vault line (`x-harness-vault: <path>`)
 
 A launch with an active vault sends `x-harness-vault: <vault path>` (a provider

@@ -5432,7 +5432,11 @@ def catch_all(path: str) -> Response:
         require_tool = _require_tool_active(tools)
         prompt_tools = _augment_tools_with_finish(tools) if require_tool else tools
 
-        tools_text = format_tools_to_text(prompt_tools)
+        # A request with no tools gets no tool scaffold and no tool-call
+        # extraction (below): opencode's tool-less calls (a compaction
+        # summary, a session title) end the session on any tool call, and a
+        # json block a summary quotes from the history reads as one.
+        tools_text = format_tools_to_text(prompt_tools) if prompt_tools else ""
         # What the reminder needs from the launch, for this request and for
         # every re-ask the proxy makes on its behalf below.
         prompt_ctx = {"vault": request.headers.get(_VAULT_HEADER),
@@ -5525,10 +5529,13 @@ def catch_all(path: str) -> Response:
         # Names currently exposed to the model — used to gate the
         # missing-`arguments` lift inside `extract_tool_calls_and_text`
         # (see its docstring; issue #118).
-        tool_call_payloads, clean_text = extract_tool_calls_and_text(
-            response_text,
-            available_tool_names=_collect_tool_names(prompt_tools),
-        )
+        if prompt_tools:
+            tool_call_payloads, clean_text = extract_tool_calls_and_text(
+                response_text,
+                available_tool_names=_collect_tool_names(prompt_tools),
+            )
+        else:
+            tool_call_payloads, clean_text = [], response_text
 
         # In-proxy retry for malformed tool-call attempts (issue #121).
         # When extraction yielded zero tool calls AND the response looks
@@ -5547,7 +5554,7 @@ def catch_all(path: str) -> Response:
         # below — the retry is strictly additive.
         retry_rounds_used = 0
         served_meta = False
-        if not tool_call_payloads:
+        if not tool_call_payloads and prompt_tools:
             kind = _diagnose_failed_tool_call(response_text)
             if kind is not None:
                 retry_result = _retry_upstream_with_correction(

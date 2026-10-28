@@ -3479,6 +3479,61 @@ class TestEmptyResponseDetection(unittest.TestCase):
         self.assertIsNone(proxy._select_rescue_tool(None))
 
 
+class TestToolLessRequest(unittest.TestCase):
+    """opencode's compaction summary and title calls send no tools, and
+    opencode ends the session ("Tool call not allowed while generating
+    summary") on any tool call in reply. So a tool-less request gets no tool
+    scaffold upstream, and a json block in the reply stays text."""
+
+    SUMMARY = ("## Done so far\nRead the config with:\n```json\n"
+               '{"name": "read", "arguments": {"filePath": "/w/a.py"}}\n```\n'
+               "Next: fix the parser.")
+
+    def _post(self, content, tools=None):
+        request_body = {"model": "GenAI", "stream": False, "messages": [
+            {"role": "user", "content": "Summarize the conversation so far."}]}
+        if tools is not None:
+            request_body["tools"] = tools
+
+        class FakeResp:
+            status_code = 200
+
+            def json(self_inner):
+                return {"choices": [{"message": {"role": "assistant", "content": content},
+                                     "finish_reason": "stop"}]}
+
+        with patch.object(proxy.requests, "post") as mock_post, \
+                patch.object(proxy, "save_debug_file"):
+            mock_post.return_value = FakeResp()
+            resp = proxy.app.test_client().post(
+                "/v1/chat/completions", data=json.dumps(request_body),
+                content_type="application/json")
+        return json.loads(resp.get_data(as_text=True)), mock_post
+
+    def test_a_json_block_in_a_summary_is_not_a_tool_call(self):
+        body, mock_post = self._post(self.SUMMARY, tools=[])
+        msg = body["choices"][0]["message"]
+        self.assertFalse(msg.get("tool_calls"))
+        self.assertEqual(msg["content"], self.SUMMARY)
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(mock_post.call_count, 1)
+
+    def test_no_tool_scaffold_goes_upstream(self):
+        for tools in ([], None):
+            _, mock_post = self._post("A title", tools=tools)
+            sent = json.dumps(mock_post.call_args.kwargs["json"]["messages"])
+            self.assertNotIn("BEGIN_AGENT_TOOLS", sent)
+            self.assertNotIn("Tool Usage Instructions", sent)
+
+    def test_with_tools_the_same_block_is_still_a_call(self):
+        tools = [{"type": "function", "function": {
+            "name": "read", "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}}}}}]
+        body, _ = self._post(self.SUMMARY, tools=tools)
+        calls = body["choices"][0]["message"].get("tool_calls") or []
+        self.assertEqual([c["function"]["name"] for c in calls], ["read"])
+
+
 class TestMalformedToolCallRetry(unittest.TestCase):
     """Issue #121. When the upstream emits a ```json tool-call attempt that
     fails to extract — either a fence opener with no parseable JSON body
@@ -6652,10 +6707,19 @@ class TestRawIngestHeader(unittest.TestCase):
         self.assertNotIn("tool_calls", out["choices"][0]["message"])
         self.assertEqual(out["model"], "gemini-x")
 
-    def test_without_header_scaffold_applies(self):
-        body = {"model": "gemini-x", "stream": False,
-                "messages": [{"role": "user", "content": "SOURCE"}]}
+    def test_without_header_the_cooperative_path_runs(self):
+        """No header: the system text stays its own message (raw folds it), and a
+        request with tools gets the scaffold. A tool-less one gets none
+        either way (TestToolLessRequest)."""
         reply = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        body = {"model": "gemini-x", "stream": False,
+                "messages": [{"role": "system", "content": "RULES"},
+                             {"role": "user", "content": "SOURCE"}]}
+        _, _, mock_post = self._post(body, reply)
+        sent = mock_post.call_args.kwargs["json"]["messages"]
+        self.assertEqual((sent[0]["content"], sent[-1]["content"]), ("RULES", "SOURCE"))
+        body["tools"] = [{"type": "function", "function": {
+            "name": "grep", "description": "search", "parameters": {"type": "object", "properties": {}}}}]
         _, _, mock_post = self._post(body, reply)
         sent = mock_post.call_args.kwargs["json"]["messages"]
         self.assertIn("<<<BEGIN_USER_REQUEST>>>", sent[-1]["content"])
