@@ -2366,6 +2366,8 @@ class NestedReposTest(Base):
     def repo(self, rel, commit=True):
         d = os.path.join(self.project, rel)
         sh("git", "init", "-q", "-b", "main", d)
+        for k, v in (("user.name", "O"), ("user.email", "o@example.com")):
+            sh("git", "-C", d, "config", k, v)   # CI has no global identity; the agent commits here
         if commit:
             put(os.path.join(d, "lib.txt"), "lib\n")
             sh("git", "-C", d, "add", "lib.txt")

@@ -1015,7 +1015,7 @@ class QueuePageTest(RunsServer):
         self.assertRegex(rows["lib"]["head"], r"^[0-9a-f]{7,}$")
         self.assertIsNone(rows["pkgs/a/deep"]["head"])
         self.assertEqual(sorted(rows["lib"]["branches"]), ["ABC-7-work", "main"])
-        self.assertIn("not a git repository", rows["broken"]["err"])
+        self.assertTrue(rows["broken"]["err"], rows["broken"])   # git's wording for a .git it cannot read varies by version
         self.assertNotIn("err", rows["app"])
         # a folder that is not a repository's top is said so
         for p, why in (("relative", "absolute path"), (os.path.join(proj, "pkgs"), "top folder, which is " + proj),
