@@ -2857,9 +2857,9 @@ COMMON_JS = """
     var checks = add.querySelectorAll('input[name^=stage_]');
     var hint = document.getElementById('addhint'), btn = add.querySelector('button[type=submit]');
     var KEY = /^[A-Z][A-Z0-9_]*-[0-9]+$/, MAXK = %MAXK%, tree = document.getElementById('repotree');
-    var REF = /^[A-Za-z0-9_][A-Za-z0-9._\/-]{0,199}$/;
+    var REF = /^[A-Za-z0-9_][A-Za-z0-9._\\/-]{0,199}$/;
     function refOk(v) {   // ref_ok
-      return REF.test(v) && v.indexOf('..') < 0 && v.indexOf('//') < 0 && !/(\/|\.lock|\.)$/.test(v);
+      return REF.test(v) && v.indexOf('..') < 0 && v.indexOf('//') < 0 && !/(\\/|\\.lock|\\.)$/.test(v);
     }
     function q(sel) { return add.querySelector(sel); }
     function pick(name, v) { return q('input[name=' + name + '][value=' + v + ']'); }
