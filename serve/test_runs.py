@@ -270,6 +270,51 @@ class RunsTest(RunsServer):
                       "<span class='pill t-wait dot'>needs your answers</span>", body)
         self.assertIn("does not hold the queue", body)
 
+    def test_a_done_ticket_says_where_its_work_went(self):
+        sha = "ab" * 20
+        self.ticket(status="done", stage="done", questions=[], reason="",
+                    push={"remote": "origin", "url": "https://github.com/acme/web", "branch": "ABC-12", "sha": sha,
+                          "result": "pushed", "error": ""},
+                    compare_url="https://github.com/acme/web/compare/main...ABC-12?expand=1",
+                    commits=[{"sha": sha, "subject": "Remember the <user>"}],
+                    diffstat={"files": 3, "insertions": 42, "deletions": 7}, folder_branch_now="ABC-12")
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<h2>Result</h2>", body)
+        self.assertIn("<b>pushed to origin</b>", body)
+        self.assertIn("href='https://github.com/acme/web/compare/main...ABC-12?expand=1'", body)
+        self.assertIn("Open a pull request", body)
+        self.assertIn(f"<code>{sha[:12]}</code> Remember the &lt;user&gt;", body)
+        self.assertIn("3 file(s), +42 &minus;7", body)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn(f"pushed branch ABC-12 to origin ({sha[:12]})", body)
+        self.assertIn(">Run again</button>", body)   # the row says what its retry does, as the page does
+        # a refused push says why; a link that is not a web page is not one
+        self.ticket(status="blocked", stage="push", questions=[], reason="push to origin refused",
+                    push={"remote": "origin", "url": "", "branch": "ABC-12", "sha": sha, "result": "rejected",
+                          "error": "! [rejected] (non-fast-forward)"},
+                    compare_url="javascript:alert(1)", commits=[], diffstat={})
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("the push to origin was refused", body)
+        self.assertIn("! [rejected] (non-fast-forward)", body)
+        self.assertNotIn("javascript:", body)
+        self.assertIn("No commits on the branch.", body)
+        # an old state.json without results: no panel
+        self.ticket(status="done", stage="done", questions=[])
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("<h2>Result</h2>", body)
+
+    def test_home_says_what_the_queue_is_doing(self):
+        self.ticket()
+        self.start()
+        r, body = self.req("GET", "/")
+        self.assertIn("<b>Queue not running</b>", body)
+        self.assertIn("<b>1 waiting on you</b>", body)
+        self.run_on("ABC-1", stage="implement")
+        r, body = self.req("GET", "/")
+        self.assertIn("<b>Queue running</b> on <b>ABC-1</b> &middot; implement", body)
+        self.assertIn("title='1 ticket waiting on you'", body)
+
     def test_ticket_page_shows_questions_attempts_and_notes(self):
         self.ticket()
         self.start()
@@ -285,10 +330,13 @@ class RunsTest(RunsServer):
         self.assertIn("write it to &lt;C:\\x&gt;", body)
         self.assertIn("href='/runs/ticket/ABC-12/plan-1.out'", body)   # the failed attempt's output
         self.assertIn("1. [blocking] Which &lt;db&gt;?", body)          # the plan note
+        self.assertEqual(body.count("1. [blocking] Which"), 1)          # open by the answers, not again below
+        self.assertIn("<details class='doc' data-k='qplan' open>", body)
         self.ticket(status="plan-review", questions=[])
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("action='/runs/ticket/ABC-12/approve'", body)
-        self.assertIn("Agree the plan, or send feedback", body)   # a free feedback box
+        self.assertIn("Approve the plan, or send feedback", body)   # a free feedback box
+        self.assertIn("data-k='qplan' open", body)                  # the plan to approve, open beside it
         self.assertIn("Send feedback and plan again", body)
         self.assertNotIn("Go with the defaults", body)
         # blocked at review: no planner's questions, a note that re-plans, and Retry runs review as is
@@ -299,7 +347,8 @@ class RunsTest(RunsServer):
         self.assertIn("Send and plan again", body)
         self.assertNotIn("name='q0'", body)
         self.assertNotIn("Answer the planner", body)
-        self.assertIn("<button type='submit'>Retry</button>", body)
+        self.assertIn("<button type='submit' title='queue it again at the stage it stopped at, as it is'>Retry"
+                      "</button>", body)
         self.ticket(status="blocked", stage="review", stages=["implement", "review"])
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("Send and run review again", body)
@@ -325,7 +374,7 @@ class RunsTest(RunsServer):
         self.assertIn("run ended</span>", body)
         self.run_on("ABC-1")   # a run on another ticket takes this one again in its turn
         r, body = self.req("GET", "/runs/ticket/ABC-12")
-        self.assertIn("this run takes it again", body)
+        self.assertIn("the run going now takes it again there", body)
         # or it is queued again now, from the stage picked: no run has it in hand
         self.assertIn("Queue again</button>", body)
         r, body = self.act("retry", [("stage", "plan")])
@@ -386,7 +435,7 @@ class RunsTest(RunsServer):
         r, _ = self.act("approve")
         self.assertEqual(r.status, 303)
         self.assertEqual((self.state()["status"], self.state()["plan_approved"]), ("queued", True))
-        self.assertIn("the queue is not running: Start the queue below takes it", unquote(r.getheader("Location")))
+        self.assertIn("the queue is not running, so nothing happens until you start it", unquote(r.getheader("Location")))
         r, body = self.req("GET", r.getheader("Location"))
         self.assertIn("action='/runs/queue/start'", body)   # shown, never started by the approve
         self.assertFalse(os.path.exists(os.path.join(self.queue, "run.json")))
@@ -601,7 +650,7 @@ class QueuePageTest(RunsServer):
         r, body = self.act("retry", [("stage", "review")])
         self.assertEqual(r.status, 303, body)
         self.assertEqual((self.state()["status"], self.state()["stage"]), ("queued", "review"))
-        self.assertIn("the queue is not running: Start the queue below takes it", unquote(r.getheader("Location")))
+        self.assertIn("the queue is not running, so nothing happens until you start it", unquote(r.getheader("Location")))
         # its work gone too: no stage it can go again at, and the page says why
         os.remove(os.path.join(self.queue, "ABC-12", "plan.md"))
         self.ticket(project=proj, status="blocked", stage="plan", made_branch=True, questions=[],

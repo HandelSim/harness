@@ -2987,7 +2987,7 @@ def cmd_approve(q, a):
     with held(os.path.join(q.root, "queue.lock")):
         st = requeue(q, a.key, ("plan-review",), plan_approved=True, plan_hold=False)
     if st:
-        print(f"[queue] {st['key']}: plan approved; 'harness queue run' implements it")
+        print(f"[queue] {st['key']}: plan approved; the queue run implements it when it gets to it")
     return 0 if st else 1
 
 

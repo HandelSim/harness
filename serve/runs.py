@@ -263,6 +263,8 @@ details.adv[open] > summary { margin-bottom: 4px; }
 .runner .startf { display: flex; gap: 8px 16px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 .kv { display: flex; gap: 6px 22px; flex-wrap: wrap; font-size: 13px; color: var(--muted); min-width: 0; }
 .kv b { color: var(--ink); font-weight: 550; overflow-wrap: anywhere; }
+.commits { margin: 8px 0 0; padding-left: 18px; font-size: 13px; display: grid; gap: 4px; }
+.commits code { font: 12px var(--mono); color: var(--muted); }
 .counts { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* lists of sessions */
@@ -684,6 +686,21 @@ class Runs:
                            "details": [x for x in h.get("details") or [] if isinstance(x, str)]
                            if isinstance(h.get("details"), list) else []}
                           for h in (hist if isinstance(hist, list) else []) if isinstance(h, dict)]
+        push = st.get("push")
+        if isinstance(push, dict) and push.get("result") in ("pushed", "local", "rejected", "skipped"):
+            out["push"] = {k: str(push.get(k) or "") for k in ("result", "remote", "url", "branch", "sha", "error")}
+            url = st.get("compare_url")
+            out["compare_url"] = url if isinstance(url, str) and re.match(r"https?://", url) else ""
+            commits = st.get("commits")
+            out["commits"] = [{"sha": str(c.get("sha", "")), "subject": str(c.get("subject", ""))} for c in
+                              (commits if isinstance(commits, list) else []) if isinstance(c, dict)]
+            stat = st.get("diffstat") if isinstance(st.get("diffstat"), dict) else {}
+            out["diffstat"] = {k: stat[k] if isinstance(stat.get(k), int) else 0
+                               for k in ("files", "insertions", "deletions")}
+            out["warnings"] = [w for w in st.get("warnings") or [] if isinstance(w, str)] \
+                if isinstance(st.get("warnings"), list) else []
+            now_on = st.get("folder_branch_now")
+            out["folder_branch_now"] = now_on if isinstance(now_on, str) else ""
         # the owner asked a running ticket to stop; the run has not got to it yet
         out["stopping"] = out.get("status") == "running" and os.path.exists(os.path.join(self.queue_dir, key, "stop"))
         if out["stopping"]:
@@ -1178,7 +1195,8 @@ def nav(runs, active="", tabs=TABS):
         for k in runs.ticket_keys():
             if runs.ticket_state(k).get("status") in WAITING + ("interrupted",):
                 waiting += 1
-    badge = f" <span class='badge' title='waiting on you'>{waiting}</span>" if waiting else ""
+    badge = (f" <span class='badge' title='{waiting} ticket{'s' * (waiting > 1)} waiting on you'>"
+             f"{waiting}</span>") if waiting else ""
     links = []
     for name, href, label in tabs:
         if name in ("queue", "sessions") and not runs:
@@ -1349,7 +1367,22 @@ def _btn(action, label, cls="", fields=(), confirm="", title="", disabled=False)
 
 STOPPABLE = ("queued", "needs-answers", "plan-review", "blocked", "running", "interrupted")
 RETRYABLE = ("blocked", "needs-answers", "stopped", "done", "interrupted")
+RETRY_LABEL = {"blocked": "Retry", "needs-answers": "Plan again without answering", "stopped": "Resume",
+               "done": "Run again", "interrupted": "Queue again"}
+RETRY_TITLE = {"blocked": "queue it again at the stage it stopped at, as it is",
+               "needs-answers": "queue it again: the planner plans again without your answers",
+               "stopped": "queue it again where you stopped it",
+               "done": "queue it again from the start",
+               "interrupted": "queue it again at the stage the run was on"}
+STOP_TITLE = {False: "take it out of the run's way: the run skips it until you resume it",
+              True: "stop its agent now; it waits as stopped until you resume it"}
+REMOVE_TITLE = "delete the ticket from the queue (its branch and the vault notes stay)"
 STUCK_AFTER = 20   # s a stop or halt may take before the page offers to end the run
+
+
+def _short(ref):
+    """A commit id as its first 12, a ref name as it is."""
+    return ref[:12] if re.fullmatch(r"[0-9a-f]{40}", ref or "") else ref
 ANSWERABLE = ("needs-answers", "plan-review", "blocked", "queued", "stopped")
 
 
@@ -1364,10 +1397,14 @@ def _why(st):
         return f"{st.get('stage', '')}, attempt {st.get('attempt', 0) + 1}" + (f": {st['step']}" if st.get("step") else "")
     if status == "interrupted":
         return (f"the queue run ended while it was at {st.get('stage', '')}; "
-                + ("this run takes it again" if st.get("run_going") else "start the queue to carry on there"))
+                + ("the run going now takes it again there" if st.get("run_going")
+                   else "start the queue to carry on there"))
     if status == "queued":
         return st.get("reason") or f"waits for the run; starts at {st.get('stage', '')}"
     if status == "done":
+        p = st.get("push") or {}
+        if p.get("result") == "pushed":
+            return f"pushed branch {p['branch']} to {p['remote']}" + (f" ({p['sha'][:12]})" if p["sha"] else "")
         return st.get("reason") or (f"done at {st['sha'][:12]}" if st.get("sha") else "done")
     return st.get("reason") or ""
 
@@ -1395,24 +1432,27 @@ def _ticket_row(runs, key, st, i, n, now):
             _btn(base + "move", "&darr;", "sm ic", back + (("where", "down"),), title=f"Move {key} down",
                  disabled=i == n - 1)]
     if status in ("needs-answers", "plan-review"):
-        acts.append(f"<a class='btn sm primary' href='/runs/ticket/{quote(key)}'>"
-                    f"{'Answer' if status == 'needs-answers' else 'Review plan'}</a>")
+        acts.append(f"<a class='btn sm primary' href='/runs/ticket/{quote(key)}' title="
+                    + ("'open the ticket to answer the planner&#39;s questions'>Answer" if status == "needs-answers"
+                       else "'open the ticket to read the plan and approve it or send feedback'>Review plan")
+                    + "</a>")
     if status in STOPPABLE and not st.get("stopping"):
-        acts.append(_btn(base + "stop", "Stop", "sm warn", back,
+        acts.append(_btn(base + "stop", "Stop", "sm warn", back, title=STOP_TITLE[status == "running"],
                          confirm=f"Stop {key}?" + (" Its agent is stopped now." if status == "running" else "")))
     if _stuck(st):
         acts.append(_end_btn("sm"))
     if status in RETRYABLE:
-        acts.append(_btn(base + "retry", "Retry", "sm", back))
+        acts.append(_btn(base + "retry", RETRY_LABEL[status], "sm", back, title=RETRY_TITLE[status]))
     acts.append(_btn(base + "remove", "Remove", "sm danger", back, disabled=status == "running",
-                     title="Stop it first" if status == "running" else "",
+                     title="Stop it first" if status == "running" else REMOVE_TITLE,
                      confirm=f"Remove {key} from the queue? Its " + ("stage outputs are deleted (the project "
                              "and its branch stay)." if st.get("in_place") else "clone and stage outputs are deleted.")))
     tone = " wait" if status in WAITING + ("interrupted",) else " run" if status == "running" else ""
     proj = os.path.basename((st.get("project") or "").rstrip("/\\"))
     tags = f"<span class='tag' title='{esc(st.get('project', ''))}'>{esc(proj)}</span>" if proj else ""
     if st.get("start"):
-        tags += f" <span class='tag' title='the work starts from this'>from {esc(st['start'][:40])}</span>"
+        tags += (f" <span class='tag' title='the work starts from {esc(st['start'])}'>"
+                 f"from {esc(_short(st['start']))}</span>")
     if st.get("branch") and st["branch"] != key:
         tags += f" <span class='tag' title='the branch the work ends on'>on {esc(st['branch'])}</span>"
     if st.get("in_place"):
@@ -1425,7 +1465,7 @@ def _ticket_row(runs, key, st, i, n, now):
     return (f"<div class='tk{tone}'><span class='pos'>{i + 1}</span><div class='main'><div class='key'>"
             f"<a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>{_pill(status, st.get('stopping'))}{tags}</div>"
             f"<div class='why' title='{esc(_why(st))}'>{esc(_why(st)) or '&nbsp;'}</div></div>"
-            f"{stage_strip(st)}<span class='when'>{_ago(when, now) if when else ''}</span>"
+            f"{stage_strip(st)}<span class='when' title='last changed'>{_ago(when, now) if when else ''}</span>"
             f"<div class='ra'>{''.join(acts)}</div></div>")
 
 
@@ -1687,7 +1727,7 @@ def _t_head(runs, key, st, pos, n):
     if st.get("base"):
         facts.append(f"<span>base <b>{esc(st['base'])}</b></span>")
     if st.get("start"):
-        facts.append(f"<span>from <b>{esc(st['start'])}</b></span>")
+        facts.append(f"<span>starts from <b title='{esc(st['start'])}'>{esc(_short(st['start']))}</b></span>")
     facts.append(f"<span>branch <b>{esc(st.get('branch') or key)}</b></span>")
     facts.append("<span>works <b>" + ("in your project folder" if st.get("in_place") else "in a separate copy")
                  + "</b></span>")
@@ -1704,7 +1744,37 @@ def _t_head(runs, key, st, pos, n):
     return ("<header class='ph'><div class='crumbs'><a href='/runs/queue'>Queue</a><span>/</span>"
             f"<b>{esc(key)}</b></div><h1>{esc(key)}</h1>{_pill(status, st.get('stopping'))}{where}"
             f"<div class='sub'>{esc(_why(st))}</div></header>"
-            f"<section class='panel'>{stage_strip(st, True)}<div class='kv'>{''.join(facts)}</div></section>")
+            f"<section class='panel'>{stage_strip(st, True)}<div class='kv'>{''.join(facts)}</div></section>" + _t_result(st))
+
+
+PUSHED = {"pushed": "pushed to {remote}", "local": "kept on this computer: not pushed",
+          "rejected": "the push to {remote} was refused", "skipped": "not pushed: the ticket has no push stage"}
+
+
+def _t_result(st):
+    """What the ticket ended with (the queue writes it at push, or when its stages
+    end without one): where the branch is, the pull request link, its commits."""
+    p = st.get("push")
+    if not p:
+        return ""
+    stat = st["diffstat"]
+    facts = [f"<span>branch <b>{esc(p['branch'])}</b>" + (f" at <b>{esc(p['sha'][:12])}</b>" if p["sha"] else "")
+             + "</span>", f"<span><b>{esc(PUSHED[p['result']].format(remote=p['remote'] or 'the remote'))}</b></span>",
+             f"<span>changed <b>{stat['files']} file(s), +{stat['insertions']} &minus;{stat['deletions']}</b></span>"]
+    if p["url"]:
+        facts.append(f"<span>remote <b>{esc(p['url'])}</b></span>")
+    if st.get("folder_branch_now"):
+        facts.append(f"<span>your folder is on <b>{esc(st['folder_branch_now'])}</b></span>")
+    link = (f"<div class='acts'><a class='btn primary' href='{esc(st['compare_url'])}' target='_blank' "
+            "rel='noopener'>Open a pull request &rarr;</a></div>") if st.get("compare_url") else ""
+    bad = f"<div class='flash bad'>{esc(p['error'])}</div>" if p["error"] else ""
+    warn = "".join(f"<div class='flash bad'>{esc(w)}</div>" for w in st.get("warnings") or [])
+    commits = "".join(f"<li><code>{esc(c['sha'][:12])}</code> {esc(c['subject'])}</li>" for c in st["commits"])
+    commits = (f"<details class='doc' data-k='commits'><summary>Commits<span class='muted'>{len(st['commits'])}"
+               f"</span></summary><ul class='commits'>{commits}</ul></details>") if commits else \
+        "<div class='muted'>No commits on the branch.</div>"
+    return (f"<section class='panel'><h2>Result</h2><div class='kv'>{''.join(facts)}</div>{bad}{warn}"
+            f"{link}{commits}</section>")
 
 
 def _t_acts(runs, key, st, rows, live, pos, n):
@@ -1716,13 +1786,14 @@ def _t_acts(runs, key, st, rows, live, pos, n):
         r = max(now_live, key=lambda r: _ms(r["time_created"]))
         parts.append(f"<a class='btn primary' href='/runs/{quote(r['id'])}'>Watch and message the agent &rarr;</a>")
     if status == "plan-review":
-        parts.append(_btn(base + "approve", "Approve the plan", "primary"))
+        parts.append(_btn(base + "approve", "Approve the plan", "primary",
+                          title="implementing starts when the queue run gets to this ticket"))
     if _stuck(st):
         parts.append(_end_btn())
     if status in RETRYABLE:
         parts.append(_t_retry(runs, key, st))
     if status in STOPPABLE and not st.get("stopping"):
-        parts.append(_btn(base + "stop", "Stop", "warn", confirm=f"Stop {key}?" + (
+        parts.append(_btn(base + "stop", "Stop", "warn", title=STOP_TITLE[status == "running"], confirm=f"Stop {key}?" + (
             " Its agent is stopped now; Resume takes it again." if status == "running" else "")))
     if pos:
         parts.append("<span class='sep'></span>")
@@ -1732,7 +1803,7 @@ def _t_acts(runs, key, st, rows, live, pos, n):
                               title=f"Move {key} {where}"))
     parts.append("<span class='sep'></span>")
     parts.append(_btn(base + "remove", "Remove", "sm danger", disabled=status == "running",
-                      title="Stop it first: its agent is working in the clone" if status == "running" else "",
+                      title="Stop it first: its agent is working on it" if status == "running" else REMOVE_TITLE,
                       confirm=f"Remove {key}? Its " + ("outputs and log are deleted (the project and its "
                               "branch stay)." if st.get("in_place") else "clone, outputs and log are deleted.")))
     return f"<div class='acts'>{''.join(parts)}</div>"
@@ -1742,8 +1813,7 @@ def _t_retry(runs, key, st):
     """The retry form: from where it was (or the start) and each stage the queue
     would take it at (its own retry_refused); why not, when it takes none."""
     status = st.get("status", "")
-    label = {"blocked": "Retry", "needs-answers": "Plan again without answering", "stopped": "Resume",
-             "done": "Run again", "interrupted": "Queue again"}[status]
+    label = RETRY_LABEL[status]
     why = runs.retry_choices(key) or dict.fromkeys((None,) + STAGES, "")   # unknown: all, the queue still says no
     stages = [s for s in STAGES if not why.get(s)]
     if why.get(None) and not stages:
@@ -1754,7 +1824,8 @@ def _t_retry(runs, key, st):
     pick = f"<label class='muted'>from <select name='stage' aria-label='stage'>{opts}</select></label>" if stages else ""
     note = f"<span class='muted'>not {'from where it was' if status != 'done' else 'from the start'}: " \
            f"{esc(why[None])}</span>" if why.get(None) else ""
-    return (f"<form method='post' action='/runs/ticket/{quote(key)}/retry'><button type='submit'>{label}</button>"
+    return (f"<form method='post' action='/runs/ticket/{quote(key)}/retry'>"
+            f"<button type='submit' title='{esc(RETRY_TITLE[status])}'>{label}</button>"
             f"{pick}</form>{note}")
 
 
@@ -1785,14 +1856,20 @@ def _t_questions(runs, key, st):
                 "</section>")
     if status in WAITING and vault:
         review = status == "plan-review"
-        head = "Agree the plan, or send feedback" if review else "Questions for you" if qs else "Answer the planner"
+        head = "Approve the plan, or send feedback" if review else "Questions for you" if qs else "Answer the planner"
         again = (" The planner revises the plan with them and it comes back here: nothing is built until "
                  "you approve it.")
         intro = ("Approve the plan to start building, or answer and give feedback here." + again if review
                  else "The plan is waiting on the blocking questions. Answer what you can; an empty box takes "
-                 "the question's default." + again + " Go with the defaults skips that.")
+                 "the question's default." + again + " Go with the defaults instead: the plan is made "
+                 "with every default and implementing starts without it coming back to you.")
+        plan = runs.note(key, "plan", vault)
+        if plan.strip():   # what is to be approved or answered, where it is decided
+            plan = (f"<details class='doc' data-k='qplan' open><summary>The plan<span class='muted'>"
+                    f"{len(plan.splitlines())} lines</span></summary><pre class='qlog'>{esc(_cap(plan)[0])}</pre>"
+                    "</details>")
         return (f"<section class='panel'><h2>{head}</h2><div class='muted'>{intro}</div>"
-                f"{_answer_form(key, qs, review)}</section>")
+                f"{plan}{_answer_form(key, qs, review)}</section>")
     if qs:
         items = "".join(f"<li><div class='{'q blocking' if q.get('blocking') else 'q'}'>{esc(q['text'])}</div>"
                         f"<div class='muted'>{'waiting on you' if q.get('blocking') else 'going with the default'}"
@@ -1886,6 +1963,8 @@ def _t_docs(runs, key, st, log):
     vault = runs.vault_of(st)
     parts = []
     for kind, label in (("plan", "Plan"), ("answers", "Your answers"), ("review", "Review"), ("findings", "Findings")):
+        if kind == "plan" and st.get("status") in WAITING and st.get("status") != "blocked":
+            continue   # shown open above, with the answer form
         text = runs.note(key, kind, vault)
         if text.strip():
             parts.append(f"<section class='panel'><details class='doc' data-k='{kind}'><summary>{label}"
@@ -2004,7 +2083,7 @@ def _waits(runs, key, res):
     ok, msg = res
     r = runs.runner()
     if ok and runs.ticket_state(key).get("status") == "queued" and not (r["running"] or r["starting"]):
-        msg += "; the queue is not running: Start the queue below takes it"
+        msg += "; the queue is not running, so nothing happens until you start it (Start the queue, below)"
     return ok, msg
 
 
@@ -2234,18 +2313,42 @@ def ticket_file(runs, key, name):
         return None
 
 
+def _queue_line(runs):
+    """The queue in a line: what its run is on, and what waits on the owner."""
+    r = runs.runner()
+    counts = {}
+    for k in runs.ticket_keys():
+        status = runs.ticket_state(k).get("status", "")
+        counts[status] = counts.get(status, 0) + 1
+    if r["running"]:
+        what = (f"on <b>{esc(r['ticket'])}</b> &middot; {esc(r.get('stage') or '')}" if r.get("ticket")
+                else "between tickets")
+        head = f"<b>Queue {'halting' if r['halting'] else 'running'}</b> {what}"
+    elif r["starting"]:
+        head = "<b>Queue starting&hellip;</b>"
+    else:
+        head = "<b>Queue not running</b>" + (" (start it on the queue page)" if counts.get("queued") else "")
+    waiting = sum(counts.get(s, 0) for s in WAITING + ("interrupted",))
+    tail = [f"{counts['queued']} queued"] if counts.get("queued") else []
+    if waiting:
+        tail.append(f"<b>{waiting} waiting on you</b>")
+    return (f"<a href='/runs/queue'>{head}</a>" + (" &middot; " + ", ".join(tail) if tail else ""))
+
+
 def live_summary(runs):
     """The index's panel: live runs, linked."""
     live = runs.live()
     rows = [r for r in runs.sessions(limit=100) if r["id"] in live]
     parts = ["<section class='panel'><h2>Agent runs</h2>"]
+    if runs.queue_dir:
+        parts.append(f"<div>{_queue_line(runs)}</div>")
     if rows:
         parts.append("<ul class='runs'>")
         now = time.time()
         parts += [_row(runs, r, live, now=now) for r in rows]
         parts.append("</ul>")
     else:
-        parts.append("<div class='muted'>No headless run is working right now.</div>")
+        parts.append("<div class='muted'>No agent session is live right now.</div>")
     parts.append("<div class='muted'><a href='/runs/queue'>The queue</a> &middot; "
                  "<a href='/runs'>All sessions, transcripts and queue stages &rarr;</a></div></section>")
     return parts
