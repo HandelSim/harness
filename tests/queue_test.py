@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1195,6 +1196,128 @@ class OwnerControlTest(Base):
         self.assertIn("ABC-1", sh("git", "-C", self.remote, "branch", "--list", "ABC-1"))
 
 
+    def owner(self, *args):
+        """An owner command from another process, as the CLI and the web UI run one."""
+        r = subprocess.run([sys.executable, tq.__file__, "--state", self.state, *args],
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout + r.stderr
+
+    def test_ctrl_c_stops_the_agents_container_too(self):
+        # the docker client dies with Ctrl-C, its container does not: the run stops it
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1")
+        self.add("ABC-1")
+        p = self.run_bg()
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        p.send_signal(signal.SIGINT)
+        self.assertEqual(p.wait(timeout=60), 130, cat(os.path.join(self.tmp, "run.out")))
+        st = self.status()
+        self.assertEqual(st["status"], "queued")
+        self.assertIn("stop-launch " + st["launch_id"], cat(self.calls).splitlines())
+        self.assertNotIn("agent", st)
+
+    def test_a_container_not_known_stopped_stays_on_record_for_the_next_command(self):
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1", FAKE_STOP_RC="1")
+        self.add("ABC-1")
+        p = self.run_bg()
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        p.send_signal(signal.SIGINT)
+        self.assertEqual(p.wait(timeout=60), 130, cat(os.path.join(self.tmp, "run.out")))
+        st = self.status()
+        self.assertEqual((st["status"], st["agent"]["launch"]), ("queued", st["launch_id"]))
+        del os.environ["FAKE_STOP_RC"]
+        n = cat(self.calls).splitlines().count("queue _stop_agents")
+        rc, out = self.q("stop", "ABC-1", "--harness", self.harness)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(cat(self.calls).splitlines().count("queue _stop_agents"), n + 1)
+        self.assertNotIn("agent", self.status())
+
+    def test_approve_while_the_run_puts_the_folder_back_stands(self):
+        # in place: the plan is up for approval (on disk) while the run still switches the folder back
+        rc, out = self.q("add", "ABC-1", "--project", self.project, defaults=True)
+        self.assertEqual(rc, 0, out)
+        real, seen = tq.park, []
+
+        def park(q, st):
+            if not seen:
+                seen.append(self.owner("approve", "ABC-1"))
+            return real(q, st)
+        with mock.patch.object(tq, "park", park):
+            rc, out = self.run_queue()
+        self.assertEqual(seen[0][0], 0, seen)
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        self.assertIn("implement", [h["stage"] for h in st["history"]])
+
+    def test_remove_while_the_run_puts_the_folder_back_waits(self):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, defaults=True)
+        self.assertEqual(rc, 0, out)
+        real, seen = tq.park, []
+
+        def park(q, st):
+            if not seen:
+                seen.append(self.owner("remove", "ABC-1"))
+            return real(q, st)
+        with mock.patch.object(tq, "park", park):
+            self.run_queue()
+        self.assertEqual(seen[0][0], 1, seen)
+        self.assertIn("finishing up", seen[0][1])
+        self.assertEqual((tq.Queue(self.state).order(), self.status()["status"]), (["ABC-1"], "plan-review"))
+        rc, out = self.q("remove", "ABC-1")   # then it goes, for good
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1")))
+
+    def test_remove_after_a_killed_run_gives_the_folder_back(self):
+        put(os.path.join(self.project, "mine.txt"), "the owner's own untracked file\n")
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--no-plan-approval", defaults=True)
+        self.assertEqual(rc, 0, out)
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_KEY="ABC-1")
+        p = self.run_bg("--host")
+        self.wait_for(self.sleeping, "the ABC-1 agent")
+        os.kill(p.pid, signal.SIGKILL)
+        p.wait(timeout=30)
+        excl = os.path.join(self.project, ".git", "info", "exclude")
+        self.assertIn(tq.EXCLUDE_MARK, cat(excl))
+        rc, out = self.q("remove", "ABC-1", "--harness", self.harness)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(tq.EXCLUDE_MARK, cat(excl))
+        self.assertIn("mine.txt", self.git_p("status", "--porcelain", "--untracked-files=all"))
+        self.assertIn("still on its branch ABC-1: git switch main", out)
+        rc, out = self.q("remove", "ABC-1")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not in the queue", out)
+
+    def test_answer_go_takes_the_defaults_and_skips_plan_approval(self):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--clone", defaults=True)   # plan approval
+        self.assertEqual(rc, 0, out)
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        st.update(status="needs-answers")
+        q.save(st)
+        rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "no: postgres")
+        st = self.status()
+        self.assertEqual((rc, st["status"], st["plan_approved"], st["plan_hold"]), (0, "queued", False, True), out)
+        self.assertIn("comes back to you to approve", out)
+        st.update(status="needs-answers")
+        q.save(st)
+        rc, out = self.q("answer", "ABC-1", "--vault", self.vault, "--text", "take the defaults", "--go")
+        st = self.status()
+        self.assertEqual((rc, st["plan_approved"], st["plan_hold"]), (0, True, False), out)
+        self.assertIn("goes straight on to implementing", out)
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+
+    def test_list_says_what_waits_on_the_owner(self):
+        self.add("ABC-1", "ABC-2")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        st.update(status="plan-review")
+        q.save(st)
+        rc, out = self.q("list")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("waiting on you:\n  ABC-1        harness queue approve ABC-1", out)
+        self.assertIn("no queue run is going: harness queue run", out)
+
+
 class AuditFixesTest(Base):
     """The task file, the Windows command-line limit, UTF-8 git output, clone and
     push options, Windows agent paths and the verifier's retries."""
@@ -2054,7 +2177,7 @@ class AddGuardTest(Base):
         rc, out = self.run_queue()
         st = self.status()
         self.assertEqual(st["status"], "blocked", out)
-        self.assertIn("ticket's text is not at", st["reason"])
+        self.assertIn("there is no ticket text for ABC-1", st["reason"])
         self.assertEqual(self.calls_of("planning"), [])
         os.environ["FAKE_TICKET"] = TICKET
         self.add("ABC-2")

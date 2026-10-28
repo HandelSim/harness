@@ -684,7 +684,8 @@ for approval (`plan_review`); `--clone` and `--no-plan-approval` opt out
 (`--in-place` and `--review-plan` are accepted and are the defaults);
 `run [--host] [--single-message]` needs an active vault, does the launch
 checks once (host mode when docker is missing, `host_confirm_gate` asked
-once), starts the host proxy if it is not running and hands the rest to the
+once and exported as `HARNESS_HOST_CONFIRM=1`, so the exit-75 `exec` does
+not ask again; `add` with no active vault warns that `run` will need one), starts the host proxy if it is not running and hands the rest to the
 Python script. `list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
 (`$EDITOR` without TEXT; the script's `--stdin` is what the run viewer's
 ticket page uses), `findings`, `watch` (tails `run.log`) and `log
@@ -785,8 +786,13 @@ its agent's process group from run.json, `taskkill /T` on Windows, waits for
 `run.lock`, then puts every running ticket back, `stopped` when it had a
 stop sentinel, else `queued` with an `interrupted` entry, and stops the
 held launch's container), `move KEY
-up|down|top|bottom`, `remove KEY` (refused while a run has it in hand) and `status
-[--json]`. Killing a container launch's client leaves its container running,
+up|down|top|bottom`, `remove KEY` (refused while a run has it in hand, which lasts until the
+run has put the folder back, so a ticket that just finished can answer "the
+run is finishing up"; the reply says where the work stays and, in place,
+which branch the folder is still on; the exclude block is stripped unless
+another ticket of that project is in hand), `status [--json]` (with the
+run's `step`) and `list` (ends with what waits on the owner, one command
+per ticket, and says when queued tickets have no run going). Killing a container launch's client leaves its container running,
 so after a stop, halt or timeout the runner calls `harness queue _stop_agents
 DIR LAUNCH`, which stops the containers labelled `harness.agent=true`,
 `harness.mount=<DIR>` and, given a launch id, `harness.queue-launch=<LAUNCH>`
@@ -800,7 +806,12 @@ is working, the agent ended, asking the verifier, a verifier retry's wait,
 checking that the upstream answers), deleted on exit; a `beat` over 30 s old
 means no run. A run that ends on an upstream outage (exit 3) or Ctrl-C (130)
 puts the ticket it was on back to `queued` at its stage, uncounted, with the
-reason and an `interrupted` history entry; one killed outright leaves it
+reason and an `interrupted` history entry; after a halt or Ctrl-C an in-place
+ticket's folder is put back (`put_away`, as for a parked one) and the
+launch's container is stopped; an `agent` record whose container is not
+known to be stopped stays in `state.json`, and `reap_stranded` (any record no
+run holds, whatever the status) or the next take ends it; `halt --force`
+also tidies and names a folder left on a ticket's branch; one killed outright leaves it
 `running`, which the viewer shows as "run ended" and the next run takes
 again. Between tickets the runner hashes its own code (`ticket_queue.py`,
 `vault_ingest.py`); when `harness upgrade` changed it, it exits 75 and
@@ -897,7 +908,9 @@ project's network git (fetch, push, `ls-remote`) runs with the same
 settings and a timeout that ends the whole process tree, never under
 `queue.lock`; a failed `_sync` or `_pull` only warns. In place, the
 folder's branch at add is `orig_branch`; a parked or finished ticket
-switches the folder back unless that leaves new changes behind, and a
+switches the folder back unless that leaves new changes behind (`park` saves
+under `queue.lock` and keeps an `approve`, `answer` or `stop` the owner made
+meanwhile), and a
 stale exclude block is stripped. After push (or a last stage that is not
 push) `state.json` has `push {remote, url, branch, sha, result:
 pushed|local|rejected|skipped, error}`, `compare_url` (GitHub or GitLab,
@@ -909,11 +922,14 @@ to the vault as `wiki/notes/tickets/KEY-result.md`; push pushes only
 owner command (rc 1) rather than hang. Going back to the plan
 (`answer`) starts from a fresh clone. A
 blocking question parks the ticket as `needs-answers` and the queue moves
-on; `QUEUE_PLAN_REVIEW=1` holds each plan as `plan-review` for `approve`.
+on; a plan waits as `plan-review` for `approve` when the ticket asks for it
+(the default) or `QUEUE_PLAN_REVIEW=1` (every ticket, `--no-plan-approval` too).
 `answer` (answers or feedback on a held plan) sets `plan_hold`, so the plan
 revised with them (the prompt has the previous plan and says to revise it)
 comes back as `plan-review` until `approve` clears it; `answer --go` (the
-viewer's "Go with the defaults") does not hold.
+viewer's "Go with the defaults") does not hold and approves the revised
+plan. An answer to a ticket past plan starts it again from the plan, and the
+reply says so.
 A ticket is `running` from the moment a run takes it (before the clone, so an
 `answer` cannot pull the clone from under it), and its `state.json` keeps the
 run's vault, where the ticket page reads notes and writes answers even when
@@ -1469,8 +1485,9 @@ commands. `serve_pub_args` passes `--agent-data container=<agent
 home>/.local/share` and `--agent-data host=${XDG_DATA_HOME:-~/.local/share}`
 (each `LABEL=DIR` holding `opencode/opencode.db` and `harness/live/`; a
 dir with no DB shows nothing, and with no `--agent-data` the viewer is off),
-`--queue-dir state/queue` and `--harness <this script>` (what Start runs;
-default the `harness` next to `serve/`). Pages share one top bar (Home,
+`--queue-dir state/queue` and `--harness <this script>` (what Start runs,
+and what the Stop, Retry and Remove buttons pass on so they end a container a
+dead run left; default the `harness` next to `serve/`). Pages share one top bar (Home,
 Queue, Sessions, Vault; the runner chip; how fresh the page is; who is signed in,
 with Log out) and a neutral dark theme with an indigo accent (light
 from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. Routes:

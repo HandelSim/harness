@@ -6847,7 +6847,8 @@ test stage yet: read each branch before you merge it.
 Settings (.env): QUEUE_MODEL (default: the default model, its free twin when it
 is a -withtools one), QUEUE_VERIFY_MODEL (default: QUEUE_MODEL), QUEUE_RETRIES
 (1), QUEUE_REMOTE (origin), QUEUE_PUSH (1; 0 keeps the branch in the project),
-QUEUE_PLAN_REVIEW (0; 1 holds every plan for 'harness queue approve'),
+QUEUE_PLAN_REVIEW (0: each ticket's own choice, which by default waits for
+'harness queue approve'; 1 holds every plan, --no-plan-approval ones too),
 QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
 0 turns the idle watchdog off).
 HELP

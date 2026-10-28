@@ -861,6 +861,24 @@ class QueuePageTest(RunsServer):
         self.assertEqual(r.status, 303)
         self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-8")))
 
+    def test_stop_retry_and_remove_end_the_container_a_gone_run_left(self):
+        # a run killed outright left its agent's container: the buttons pass --harness, so it is stopped
+        fake = os.path.join(self.tmp.name, "harness")
+        calls = os.path.join(self.tmp.name, "calls")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/bash\necho "$@" >> {calls}\necho 1\n')
+        agent = {"pid": 999999, "launch": "ABC-12-1-1", "host": socket.gethostname(), "container": True,
+                 "workdir": "/x/repo"}
+        self.start(harness=fake)
+        for n, action in enumerate(("stop", "retry", "remove"), 1):
+            self.ticket(status="running", stage="implement", agent=agent, questions=[])
+            r, body = self.act(action)
+            self.assertEqual(r.status, 303, body)
+            with open(calls) as f:
+                self.assertEqual(f.read().splitlines().count("queue _stop_agents /x/repo ABC-12-1-1"), n, action)
+            if action != "remove":
+                self.assertNotIn("agent", self.state(), action)
+
     def test_add_and_actions_refuse_bad_values(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
         self.ticket(status="running")
