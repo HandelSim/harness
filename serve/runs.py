@@ -801,8 +801,9 @@ class Runs:
                 out["stop_wait"] = 0
         if out.get("status") == "running":
             r = self.runner()
-            if r["running"] and r.get("ticket") == key:
-                out["step"] = r.get("step", "")
+            on = [o for o in r["on"] if o["ticket"] == key] if r["running"] else []
+            if on:
+                out["step"] = on[0]["step"]
             elif not r["starting"]:
                 # left running by a run that ended without putting it back (killed, its
                 # window closed): a run takes it again at its stage
@@ -981,6 +982,24 @@ class Runs:
         out["pid"] = info.get("pid") if isinstance(info.get("pid"), int) else 0
         out["running"] = bool(out["beat"]) and now - out["beat"] < RUN_FRESH
         out["halting"] = out["running"] and os.path.exists(os.path.join(self.queue_dir, "halt"))
+        # "on": the tickets in hand, each {ticket, stage, step}; a parallel run's are its
+        # slots' (run-I.json, beating like run.json)
+        par = info.get("parallel")
+        out["parallel"] = par if isinstance(par, int) and not isinstance(par, bool) and par > 1 else 0
+        slots = [info]
+        if out["parallel"] and out["running"]:
+            slots = []
+            for i in range(1, out["parallel"] + 1):
+                try:
+                    with open(os.path.join(self.queue_dir, f"run-{i}.json"), encoding="utf-8") as f:
+                        got = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                b = got.get("beat") if isinstance(got, dict) else None
+                if isinstance(b, (int, float)) and not isinstance(b, bool) and now - b < RUN_FRESH:
+                    slots.append(got)
+        out["on"] = [{k: x[k] if isinstance(x.get(k), str) else "" for k in ("ticket", "stage", "step")}
+                     for x in slots if isinstance(x.get("ticket"), str) and x["ticket"]]
         out["starting"] = False
         out["exited"] = None
         with self.launch_lock:
@@ -1311,11 +1330,9 @@ def nav(runs, active="", tabs=TABS):
     if runs and runs.queue_dir:
         r = runs.runner()
         if r["running"]:
-            what = "between tickets"
-            if r.get("ticket"):
-                what = f"{esc(r['ticket'])} &middot; {esc(r.get('stage') or '')}"
-                if r.get("step"):
-                    what = f"<span title='{esc(r['step'])}'>{what}</span>"
+            what = ", ".join(f"<span title='{esc(o['step'])}'>{esc(o['ticket'])} &middot; {esc(o['stage'])}</span>"
+                             if o["step"] else f"{esc(o['ticket'])} &middot; {esc(o['stage'])}"
+                             for o in r["on"]) or "between tickets"
             label = "halting" if r["halting"] else "running"
             chip = (f"<a class='runchip' href='/runs/queue' title='the queue run'><span class='sdot run'></span>"
                     f"<span class='rtxt'>{label} <b>{what}</b></span></a>")
@@ -1611,10 +1628,9 @@ def _runner_card(runs, r, now, back=""):
     parts = ["<section class='panel runner'>"]
     if r["running"]:
         mode = "host, single message" if r["single"] else "host" if r["host"] else "container"
-        what = (f"<a href='/runs/ticket/{quote(r['ticket'])}'>{esc(r['ticket'])}</a> &middot; {esc(r.get('stage', ''))}"
-                if r.get("ticket") and KEY_RE.match(r["ticket"]) else "between tickets")
-        if r.get("ticket") and r.get("step"):
-            what += f": {esc(r['step'])}"
+        what = "; ".join(f"<a href='/runs/ticket/{quote(o['ticket'])}'>{esc(o['ticket'])}</a> &middot; {esc(o['stage'])}"
+                         + (f": {esc(o['step'])}" if o["step"] else "")
+                         for o in r["on"] if KEY_RE.match(o["ticket"])) or "between tickets"
         started = _iso_ms(r.get("started", ""))
         parts.append("<div class='state'><span class='sdot run'></span><h2>Queue running"
                      + (" <span class='pill t-wait dot'>halting</span>" if r["halting"] else "") + "</h2></div>")
@@ -1625,6 +1641,7 @@ def _runner_card(runs, r, now, back=""):
             parts.append("<div class='startf'><span class='muted'>the run ends at its next check; if it does not "
                          "within a minute it is stuck</span>" + _end_btn() + "</div>")
         parts.append(f"<div class='kv facts-row'><span>on <b>{what}</b></span><span>mode <b>{esc(mode)}</b></span>"
+                     + (f"<span>at a time <b>{r['parallel']} tickets</b></span>" if r["parallel"] else "")
                      + (f"<span>model <b>{esc(r['model'])}</b></span>" if r.get("model") else "")
                      + (f"<span>since <b>{_ago(started, now)}</b></span>" if started else "")
                      + f"<span>heartbeat <b>{_ago(r['beat'] * 1000, now)}</b></span>"
@@ -2843,8 +2860,8 @@ def _queue_line(runs):
         status = runs.ticket_state(k).get("status", "")
         counts[status] = counts.get(status, 0) + 1
     if r["running"]:
-        what = (f"on <b>{esc(r['ticket'])}</b> &middot; {esc(r.get('stage') or '')}" if r.get("ticket")
-                else "between tickets")
+        what = ("on " + ", ".join(f"<b>{esc(o['ticket'])}</b> &middot; {esc(o['stage'])}" for o in r["on"])
+                if r["on"] else "between tickets")
         head = f"<b>Queue {'halting' if r['halting'] else 'running'}</b> {what}"
     elif r["starting"]:
         head = "<b>Queue starting&hellip;</b>"

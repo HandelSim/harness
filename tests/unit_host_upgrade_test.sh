@@ -140,5 +140,67 @@ out3=$(host_proxy_refresh 2>&1)
 [[ -z "${out3}" ]] || fail "T3: no proxy running, but refresh did: ${out3}"
 ok "T3: with no proxy running, nothing is started"
 
+# --- T4: a container install's upgrade takes the stack down, not up -----------
+# The next container launch starts it on the new code; agents still working
+# keep it up (marked stale); only images this install has are rebuilt.
+harness_runtime_installed() { return 0; }
+require_docker()        { :; }
+host_proxy_refresh()    { :; }
+harness_serve_refresh() { :; }
+harness_view_refresh()  { :; }
+cmd_down()  { echo "MARKER_CMD_DOWN"; }
+compose()   { echo "MARKER_COMPOSE $*"; }
+n_agents=0 images=1
+running_agent_count() { echo "${n_agents}"; }
+harness_docker() { [[ "$1 $2" == "image inspect" ]] && (( images )); }
+upgrade4() { HARNESS_UPGRADE_SKIP_PULL=1 cmd_upgrade --no-prompt 2>&1; }
+
+out4=$(upgrade4) || { echo "${out4}" | sed 's/^/    /'; fail "T4: the container upgrade failed"; }
+grep -q "MARKER_CMD_DOWN" <<<"${out4}" && grep -q "MARKER_COMPOSE --profile agent build" <<<"${out4}" \
+    || { echo "${out4}" | sed 's/^/    /'; fail "T4: the stack was not taken down and the images rebuilt"; }
+! grep -q "MARKER_CMD_START" <<<"${out4}" || fail "T4: the upgrade started the stack again"
+grep -q "the next container launch starts it on the new code" <<<"${out4}" || fail "T4: no word on the next launch"
+[[ ! -f "$(stack_stale_file)" ]] || fail "T4: stack marked stale with no agent working"
+ok "T4: the stack is taken down and the images rebuilt; nothing is started"
+
+n_agents=2
+out4=$(upgrade4) || fail "T4: the upgrade with agents working failed"
+! grep -q "MARKER_CMD_DOWN" <<<"${out4}" || { echo "${out4}" | sed "s/^/    /"; fail "T4: the upgrade took the stack down under working agents"; }
+grep -q "2 agent container(s) still working" <<<"${out4}" && [[ -f "$(stack_stale_file)" ]] \
+    || { echo "${out4}" | sed 's/^/    /'; fail "T4: working agents not left the stack, marked stale"; }
+ok "T4: agent containers still working keep the stack up, marked stale"
+
+n_agents=0 images=0
+rm -f "$(stack_stale_file)"
+out4=$(upgrade4) || fail "T4: the upgrade with no images failed"
+! grep -q "MARKER_COMPOSE" <<<"${out4}" && grep -q "no container images built yet" <<<"${out4}" \
+    || { echo "${out4}" | sed 's/^/    /'; fail "T4: built images an install never had"; }
+ok "T4: an install with no images built (host use only) builds none"
+
+# --- T5: the first launch after the working agents end starts it again -------
+services_up() { return 0; }
+_chatgpt_in_play() { return 1; }
+host_mcp_start_enabled() { :; }
+cmd_start() { echo "MARKER_CMD_START"; }
+: >"$(stack_stale_file)"
+n_agents=1
+[[ -z "$(ensure_services_up)" ]] || fail "T5: a stale stack was started again under a working agent"
+n_agents=0
+grep -q "MARKER_CMD_START" <<<"$(ensure_services_up)" || fail "T5: a stale stack with no agent left was not started again"
+rm -f "$(stack_stale_file)"
+[[ -z "$(ensure_services_up)" ]] || fail "T5: a current stack was started again"
+ok "T5: a stale stack starts again at the first launch with no agent working"
+
+# --- T6: restart with no stack running has nothing to restart ----------------
+services_up() { return 1; }
+out6=$(cmd_restart 2>&1) || fail "T6: restart with no stack running failed"
+! grep -qE "MARKER_CMD_DOWN|MARKER_CMD_START" <<<"${out6}" && grep -q "nothing to restart" <<<"${out6}" \
+    || { echo "${out6}" | sed 's/^/    /'; fail "T6: restart started a stack that was not running"; }
+ok "T6: restart leaves a stack that is not running alone (host mode uses none)"
+grep -q "MARKER_CMD_START" <<<"$(cmd_restart --prompt-mode passthrough 2>&1)" \
+    || fail "T6: restart --prompt-mode did not start the stack in that mode"
+prompt_mode_override=""
+ok "T6: restart --prompt-mode still starts a stack that is not running"
+
 echo
 echo "HOST UPGRADE TEST PASSED (${pass} checks)"

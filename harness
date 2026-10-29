@@ -1317,6 +1317,11 @@ ensure_services_up() {
     if ! services_up; then
         echo "harness: services not running; starting..."
         cmd_start
+    elif [[ -f "$(stack_stale_file)" && "$(running_agent_count)" == 0 ]]; then
+        # An upgrade left the stack up for agents that were working (see
+        # cmd_upgrade); they have ended, so this launch starts it on the new code.
+        echo "harness: the services run the code from before the last upgrade; starting them again"
+        cmd_start
     elif _chatgpt_in_play; then
         # Reconciliation costs two `compose ps` plus a `docker inspect` on every
         # launch, so it is skipped entirely on an install that has never
@@ -1351,11 +1356,7 @@ ensure_services_up() {
 # the `harness.agent` label, so a concurrent agent of either kind keeps the
 # count non-zero and holds the stack up until the final interactive exit.
 stop_stack_if_last_agent() {
-    local remaining
-    remaining=$(harness_docker ps -q \
-        --filter "label=harness.project=$project_name" \
-        --filter "label=harness.agent=true" 2>/dev/null | wc -l | tr -d ' ')
-    [[ "$remaining" == "0" ]] || return 0
+    [[ "$(running_agent_count)" == "0" ]] || return 0
     echo "[harness] last agent exited; stopping proxy/MCP" >&2
     # Best-effort teardown, in a subshell: cmd_down → require_docker can `exit 1`
     # if the runtime probe fails, and a bare `cmd_down ... || true` catches only a
@@ -1364,6 +1365,20 @@ stop_stack_if_last_agent() {
     # code via `exit "$rc"` (#81). Isolating it means a failed teardown is a no-op
     # for the caller, never a clobbered exit status.
     ( cmd_down ) >/dev/null 2>&1 || true
+}
+
+# Agent containers (interactive and print) running for this project.
+running_agent_count() {
+    harness_docker ps -q \
+        --filter "label=harness.project=$project_name" \
+        --filter "label=harness.agent=true" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Present while the stack runs code from before an upgrade, which left it up
+# for agents still working: the next launch with none left starts it again
+# (ensure_services_up). Any start or down of the stack clears it.
+stack_stale_file() {
+    printf '%s\n' "$state_root/stack.stale"
 }
 
 # Unique container name for one agent launch. Discovery (list/stop/picker)
@@ -3009,6 +3024,7 @@ cmd_start() {
     # was disabled becomes an orphan container without it and would never
     # actually go down on `harness start`.
     compose down --remove-orphans 2>/dev/null || true
+    rm -f "$(stack_stale_file)"
 
     # HARNESS_NO_BUILD=1 skips the --build flag — useful when all needed
     # images already exist locally and re-running buildkit (which can pull
@@ -3157,6 +3173,17 @@ cmd_restart() {
         return 1
     fi
     require_docker
+    # Not running: nothing to restart. A host-mode user on a box with docker
+    # would otherwise get a stack started that nothing uses or takes down; the
+    # host proxy takes .env changes on its own at the next 'harness host'.
+    # A --prompt-mode asks for a stack in that mode, so that one still starts.
+    if [[ -z "$prompt_mode_override" ]] && ! services_up; then
+        echo "[harness] the container stack is not running, so there is nothing to restart."
+        echo "  The next container launch starts it (or: harness start). Host mode"
+        echo "  (harness host, harness serve) uses no containers and picks up .env"
+        echo "  changes on its next launch."
+        return 0
+    fi
     # Come back up on the dialect that was actually running (see
     # _adopt_running_backend); must be read before cmd_down destroys the
     # container that carries it.
@@ -3389,8 +3416,8 @@ cmd_upgrade() {
             --resume-after-pull) resume_after_pull=1 ;;
             -h|--help)
                 cat <<'EOF'
-harness upgrade — pull latest code, apply upgrade actions, rebuild images,
-                  restart services.
+harness upgrade — pull latest code, apply upgrade actions, rebuild the
+                  container images, take the container stack down.
 
 usage:
   harness upgrade [--check] [--no-prompt] [--no-restart] [--rebuild]
@@ -3402,7 +3429,7 @@ flags:
                   Config merges still apply; hand-edited prompt-data files
                   (reminder.md, tool-guidance.json) are always left alone,
                   since replacing your prose unattended is never safe.
-  --no-restart    apply upgrade actions but skip the build/down/start cycle
+  --no-restart    apply upgrade actions but skip the build and stack down,
                   and the restarts below.
   --rebuild       force a clean rebuild (compose build --no-cache). Slower
                   but bypasses any cache-poisoning from earlier failed
@@ -3412,7 +3439,14 @@ What runs keeps running, on the new code: a host proxy is started again
 with the backend and prompt mode it had, a harness serve restarts itself in
 its terminal with the same options, the run viewer a launch left up is
 started again, and a queue run restarts itself after the ticket it is on.
-A working agent (harness host, a queue stage) is never interrupted.
+A working agent (harness host, a queue stage, a container agent) is never
+interrupted.
+
+The container stack is taken down, not started again: the next container
+launch starts it on the new code, so an install used in host mode only never
+runs it. With container agents still working, the stack stays up for them and
+the first launch after they end starts it again. Only images this install has
+built are rebuilt; a first container launch builds the rest.
 
 Upgrade actions are offered ONE AT A TIME, so you can take the new .env
 variables without taking a reminder rewrite. Enter accepts, 'a' accepts
@@ -3431,8 +3465,8 @@ is the same directory as the clone, post-B4) is brought forward when the
 repo changes — env vars, firewall hostnames, MCP registry definitions.
 User-set values are NEVER overwritten.
 
-Image rebuild is run between manifest-apply and start so image-level
-changes (Dockerfile, proxy.py, agent entrypoint) take effect on upgrade.
+Image rebuild runs after manifest-apply so image-level changes (Dockerfile,
+proxy.py, agent entrypoint) take effect on the next container launch.
 
 Internal flag (do not pass manually): --resume-after-pull. Used when
 harness re-execs into the freshly-pulled script after 'git pull'
@@ -3522,11 +3556,9 @@ EOF
     if [[ ! -f "$manifest" || ! -f "$lib" ]]; then
         err "no upgrade manifest or actions library found; falling back to legacy upgrade"
         if (( ! host_only && ! no_restart && ! check_only )); then
-            # Come back up on the dialect that is running, not always openai
-            # (see _adopt_running_backend). Must be read before the teardown.
-            _adopt_running_backend
-            cmd_down --remove-orphans 2>/dev/null || true
-            cmd_start
+            # Down, not up again: the next container launch starts the stack
+            # (and builds what it needs) on the new code.
+            _upgrade_stack_down
         fi
         return 0
     fi
@@ -3632,8 +3664,8 @@ EOF
         harness_view_refresh
     fi
 
-    # Container path rebuilds images + restarts the stack so image-level changes
-    # take effect. A host-only install has neither: the proxy runs from the
+    # Container path rebuilds images and takes the stack down so image-level
+    # changes take effect at the next launch. A host-only install has neither: the proxy runs from the
     # now-updated clone and its venv refreshes lazily on the next 'harness host',
     # so there is nothing to rebuild — report and point the user at the relaunch.
     if (( host_only )); then
@@ -3646,52 +3678,72 @@ EOF
     fi
 
     if (( ! no_restart )); then
-        # Come back up on the dialect that is running, not always openai (see
-        # _adopt_running_backend). Must be read before the teardown destroys
-        # the container that carries it.
-        _adopt_running_backend
+        _upgrade_stack_down
+
+        if harness_docker image inspect harness-proxy:latest >/dev/null 2>&1 \
+            || harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
+            # Rebuild images so image-level changes (Dockerfile, proxy.py, agent
+            # entrypoint) take effect. Without this, the existing local images
+            # are reused and the user runs stale containers without realizing
+            # (a launch builds the agent image only when it is missing). Only an
+            # install that has built them: one used in host mode only gets none,
+            # and a first container launch builds what is missing anyway.
+            # --rebuild adds --no-cache for a force-rebuild; otherwise BuildKit
+            # uses its layer cache and only changed layers are re-run.
+            local build_args=()
+            if (( rebuild )); then
+                build_args+=(--no-cache)
+            fi
+            echo "[harness] rebuilding container images..."
+            # --profile agent ensures the agent service (which is profile-gated
+            # in docker-compose.yml) is included in the rebuild set; without it,
+            # only default-profile services (proxy) get rebuilt and
+            # image-level changes to agents/Dockerfile or agents/entrypoint.sh
+            # silently slip past the upgrade.
+            if ! compose --profile agent build "${build_args[@]}"; then
+                err "compose build failed; aborting upgrade"
+                return 1
+            fi
+
+            # Force docker compose to re-resolve every bind-mount source path
+            # (notably .harness-allowlist) before the next `compose up`.
+            # Why: on Windows + Docker Desktop, the linefile_merge step in
+            # apply_upgrade_actions writes to .harness-allowlist via a tmp-file +
+            # atomic-mv. The Git-Bash-side mv lands the new inode on disk
+            # immediately, but Docker Desktop's bind-mount source lookup runs
+            # against its WSL2/virtiofs filesystem cache, which may still hold a
+            # stale "missing" entry for that path right after the rename. When
+            # the next `compose up` then mounts the source, Docker sees nothing
+            # there, auto-creates an empty *directory* at the bind source, and
+            # the proxy container boots but fails its firewall init
+            # with "allowlist file not found at /etc/harness/allowlist". A bare
+            # `compose config` triggers compose's path-resolution pass and gives
+            # the daemon a chance to refresh that cache before the next `up`.
+            # On Linux this is just YAML re-validation — effectively a no-op.
+            compose config >/dev/null 2>&1 || true
+        else
+            echo "[harness] no container images built yet: the first container launch builds them."
+        fi
+        if [[ -f "$(stack_stale_file)" ]]; then
+            echo "[harness] upgrade complete."
+        else
+            echo "[harness] upgrade complete. The container stack is down; the next container launch starts it on the new code."
+        fi
+    fi
+}
+
+# The container stack down for an upgrade, unless agent containers are still
+# working: those keep the stack up on the old code, and the first launch after
+# they end starts it on the new code (stack_stale_file, ensure_services_up).
+_upgrade_stack_down() {
+    local agents
+    agents=$(running_agent_count)
+    if [[ "$agents" =~ ^[1-9] ]]; then
+        : >"$(stack_stale_file)"
+        echo "[harness] $agents agent container(s) still working: the container stack stays up for"
+        echo "  them on the old code; the first container launch after they end starts it on the new code."
+    else
         cmd_down --remove-orphans 2>/dev/null || true
-
-        # Rebuild images so image-level changes (Dockerfile, proxy.py, agent
-        # entrypoint) take effect. Without this, the existing local images
-        # are reused and the user runs stale containers without realizing.
-        # --rebuild adds --no-cache for a force-rebuild; otherwise BuildKit
-        # uses its layer cache and only changed layers are re-run.
-        local build_args=()
-        if (( rebuild )); then
-            build_args+=(--no-cache)
-        fi
-        echo "[harness] rebuilding container images..."
-        # --profile agent ensures the agent service (which is profile-gated
-        # in docker-compose.yml) is included in the rebuild set; without it,
-        # only default-profile services (proxy) get rebuilt and
-        # image-level changes to agents/Dockerfile or agents/entrypoint.sh
-        # silently slip past the upgrade.
-        if ! compose --profile agent build "${build_args[@]}"; then
-            err "compose build failed; aborting upgrade"
-            return 1
-        fi
-
-        # Force docker compose to re-resolve every bind-mount source path
-        # (notably .harness-allowlist) before `cmd_start` issues `compose up`.
-        # Why: on Windows + Docker Desktop, the linefile_merge step in
-        # apply_upgrade_actions writes to .harness-allowlist via a tmp-file +
-        # atomic-mv. The Git-Bash-side mv lands the new inode on disk
-        # immediately, but Docker Desktop's bind-mount source lookup runs
-        # against its WSL2/virtiofs filesystem cache, which may still hold a
-        # stale "missing" entry for that path right after the rename. When
-        # the next `compose up` then mounts the source, Docker sees nothing
-        # there, auto-creates an empty *directory* at the bind source, and
-        # the proxy container boots but fails its firewall init
-        # with "allowlist file not found at /etc/harness/allowlist". A bare
-        # `compose config` triggers compose's path-resolution pass and gives
-        # the daemon a chance to refresh that cache before the real `up`.
-        # On Linux this is just YAML re-validation — effectively a no-op.
-        compose config >/dev/null 2>&1 || true
-
-        # The 'compose --profile agent build' above already built everything;
-        # skip cmd_start's redundant --build pass.
-        HARNESS_NO_BUILD=1 cmd_start
     fi
 }
 
@@ -6839,8 +6891,11 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             work" and "Where the work starts and
                                             ends" below; --stages runs only some
                                             stages (e.g. review,fix,push)
-       harness queue run [--host] [--single-message]
+       harness queue run [--host] [--single-message] [--parallel N]
                                             work through the queue, one ticket at a time
+                                            (--parallel N, or QUEUE_PARALLEL: N at a
+                                            time; tickets of the same project folder
+                                            take turns)
        harness queue answer KEY ["TEXT"] [--go]
                                             answer the plan's questions or give
                                             feedback on it (opens $EDITOR without
@@ -7004,7 +7059,8 @@ is a -withtools one), QUEUE_VERIFY_MODEL (default: QUEUE_MODEL), QUEUE_RETRIES
 QUEUE_PLAN_REVIEW (0: each ticket's own choice, which by default waits for
 'harness queue approve'; 1 holds every plan, --no-plan-approval ones too),
 QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
-0 turns the idle watchdog off).
+0 turns the idle watchdog off), QUEUE_PARALLEL (1; tickets a run works at a time,
+the same as run --parallel N).
 HELP
             return 0 ;;
         watch)
@@ -7127,14 +7183,19 @@ HELP
                 args+=(findings --vault "$vault")
             fi ;;
         run)
-            local host=0 single=0 started=0 rc=0 a dir
-            for a in "$@"; do
+            local host=0 single=0 started=0 rc=0 a dir parallel="${QUEUE_PARALLEL:-1}" i=1
+            while (( i <= $# )); do
+                a="${!i}"
                 case "$a" in
                     --host) host=1 ;;
                     --single-message) single=1 host=1 ;;
+                    --parallel) i=$((i + 1)); parallel="${!i:-}" ;;
+                    --parallel=*) parallel="${a#--parallel=}" ;;
                     *) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                 esac
+                i=$((i + 1))
             done
+            [[ "$parallel" =~ ^[1-9][0-9]*$ ]] || { err "--parallel / QUEUE_PARALLEL must be a whole number of tickets at a time, 1 or more (got '$parallel')"; return 1; }
             [[ -n "$vault" ]] || { err "harness queue run needs an active vault: tickets, plans and findings live there. Make one with: harness vault new <name> (or pick one: harness vault use <name>)"; return 1; }
             harness_runtime_installed || host=1
             host_require_config
@@ -7178,6 +7239,14 @@ HELP
                    --watch "$(agent_home_dir)/.local/share/opencode/opencode.db")
             (( host )) && args+=(--host)
             (( single )) && args+=(--single-message)
+            args+=(--parallel "$parallel")
+            # Tickets at a time in containers: the stack up before the first
+            # stages launch together, so they do not each start it (a start
+            # takes the stack down first, under the other's agent).
+            if (( parallel > 1 && ! host )); then
+                require_docker
+                ensure_services_up || { if (( started )); then host_proxy_done; else host_proxy_release; fi; return 1; }
+            fi
             # shellcheck disable=SC2086  # $py can be 'py -3'
             PYTHONUTF8=1 $py "$script" "${args[@]}" || rc=$?
             if (( rc == 75 )); then

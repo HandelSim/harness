@@ -681,7 +681,8 @@ the hub in Obsidian.
 ### Ticket queue
 
 `harness queue` (`cmd_queue`, then `scripts/ticket_queue.py`) works queued
-tickets one at a time with no one at the keyboard. `add KEY... [--dir]
+tickets with no one at the keyboard, one at a time unless `run --parallel N`
+(or `QUEUE_PARALLEL=N` in `.env`) asks for N at a time. `add KEY... [--dir]
 [--base] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch]
 [--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval [--take-defaults]] [--note TEXT]` records the project and base (default: its current branch);
 a ticket works in the project folder (in place) and its plan waits
@@ -869,6 +870,24 @@ arguments, `HARNESS_QUEUE_OWNS_PROXY=1` telling the new run that the proxy
 is still its to stop. Each stage is a fresh `harness` launch, so it is on
 the new CLI code already.
 
+`run --parallel N` (N > 1) makes the run a parent: it holds `run.lock`, beats
+`run.json` with `"parallel": N` (no ticket of its own), resolves the model
+once, tidies, and spawns N slot processes (`run --slot I`, the same arguments
+plus `--model`), each beating `run-I.json` with its ticket, stage and step.
+`runner()` and the viewer read the slots (`slot_runs`), so `status` prints
+"N tickets at a time" and a line per slot, and the viewer's `on` lists each
+ticket in hand. A slot skips a ticket another slot holds, or one whose
+working folder is the same as, inside, or around another slot's
+(`elsewhere`, `overlaps`), and its step says whom it waits for: tickets of different
+project folders run side by side, tickets of one folder take turns (they
+share its checkout; only the hidden `--clone` gives a ticket its own). The vault save is serialized under `vault.lock`
+(waited for up to `SYNC_TIMEOUT`, else skipped with a warning). A slot ends
+itself when its parent is gone (`checkpoint` compares `getppid`); only the
+parent drops the `halt` sentinel, once every slot has ended, and `halt
+--force` (`end_run`) kills every slot's pid and agent as well as the parent's.
+`harness queue run --parallel N` on a container box starts the stack once
+before the run, so the slots' first launches do not race to start it.
+
 Stages, each a fresh `harness [host] -p --yolo --ticket KEY -m MODEL PROMPT`
 in `state/queue/KEY/repo` (a clone at the base on branch `KEY`, its origin
 removed; before each stage the project's own `AGENTS.md`, `CLAUDE.md` or
@@ -1034,7 +1053,7 @@ stderr's tail) names the step that hung. Nothing is written to the
 tracker.
 State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
 attempt, feedback, reason, the plan's `questions`, `criteria` and `plan_sig`, `take_defaults`, `history`, `vault`), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
-as `KEY/verify-*.txt`, and `run.lock` (one run at a time: `flock`, or
+as `KEY/verify-*.txt`, `run-I.json` per slot of a parallel run, `vault.lock`, and `run.lock` (one run at a time: `flock`, or
 `msvcrt.locking` on Windows). Each agent runs in its own session (its own
 process group on Windows), so Ctrl-C reaches only the queue, which then ends
 the agent's tree (`killpg`, or `taskkill /T` on Windows). `bash` is found on
@@ -1186,6 +1205,15 @@ a `-p` agent now appears in `harness list` for the duration of its run. The
 count is project-scoped, so concurrent interactive agents likewise keep the
 stack up until the last one exits. This is the inverse of `cmd_down`'s own
 agent-stop sweep, which tears agents down when the *stack* goes down.
+
+`running_agent_count` is that count; `stop_stack_if_last_agent` and
+`harness upgrade` both use it. Upgrade never stops working agents: when any
+are running it leaves the old stack up and touches `state/stack.stale`
+instead of taking it down. `ensure_services_up` reads the marker: with the
+stack up, the marker present and no agent running, it says so and calls
+`cmd_start` (down, then up on the new code), whose `compose down` clears the
+marker. So the first launch after the last old agent ends picks up the
+upgrade.
 
 ## Host mode (containerless)
 
@@ -1462,7 +1490,11 @@ maintenance subcommands behave on a box that never installed a runtime:
 [`install-and-upgrade.md`](install-and-upgrade.md) → "Host-only upgrade"),
 `cmd_down` stops the host proxy + host MCPs and returns without
 `require_docker`, and `cmd_restart` points the user at `harness host down &&
-harness host` instead of erroring. A container install with the daemon merely
+harness host` instead of erroring. On a container box `cmd_restart` with no
+stack running and no `--prompt-mode` says there is nothing to restart and returns 0 (the next launch
+starts the stack on the current `.env`); a host-mode user never needs
+`restart`, since the host proxy's `.env` fingerprint restarts it on the next
+`harness host` launch. A container install with the daemon merely
 stopped still has the binary, so it does **not** take these paths — it hits
 `require_docker` and is told to start the daemon.
 
@@ -1973,8 +2005,9 @@ pointer to `harness chatgpt doctor` rather than silently reporting three
 failures. `cmd_preflight` prints the same pointer, and
 `require_runtime_config`'s abort adds one naming `harness chatgpt ...`.
 
-**Restart-in-place adopts the running dialect.** `cmd_restart` and `cmd_upgrade`
-(and therefore `cmd_downgrade`, which delegates to it) are down-then-start, so
+**Restart-in-place adopts the running dialect.** `cmd_restart` is
+down-then-start (`cmd_upgrade` no longer starts the stack: it takes it down
+and the next launch starts it), so
 without help they always come back on the OpenAI dialect — on a chatgpt-only
 install that means the stack is torn down and `cmd_start` then aborts naming
 three keys the user deliberately never set. `_adopt_running_backend` reads

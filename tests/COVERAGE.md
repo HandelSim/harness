@@ -112,7 +112,11 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   throwaway listener). Covers Ho001–Ho007, Ho018, Ho019.
 - `tests/unit_host_upgrade_test.sh` (no docker) — host-only upgrade transition
   (`cmd_upgrade` with no container runtime: host-aware path, no `require_docker`,
-  no rebuild/restart, returns 0). Sourced via `HARNESS_SOURCE_ONLY=1`. Covers Ho008.
+  no rebuild/restart, returns 0); the container upgrade tail (stack down and
+  images rebuilt, never started; working agents leave the stack up and marked
+  stale; no images means no build), the stale-stack restart in
+  `ensure_services_up`, and `restart` with no stack running. Sourced via
+  `HARNESS_SOURCE_ONLY=1`. Covers Ho008.
 - `tests/unit_host_toolchain_test.sh` (no docker, no network) — host-mode
   dependency auto-provisioner (`host_ensure_toolchain` and helpers): platform
   mapping, `host_sha_from_manifest` parsing (curl stubbed), `host_sha256_check`,

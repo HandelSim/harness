@@ -1761,6 +1761,79 @@ class OwnerControlTest(Base):
         self.assertIn("no queue run is going: harness queue run", out)
 
 
+class ParallelTest(Base):
+    """run --parallel N: N tickets at a time, one at a time in a folder."""
+    run_bg, wait_for, sleeping = OwnerControlTest.run_bg, OwnerControlTest.wait_for, OwnerControlTest.sleeping
+
+    def runner(self):
+        return tq.runner(tq.Queue(self.state))
+
+    def run_files(self):
+        return sorted(n for n in os.listdir(self.state) if n.startswith("run") and n.endswith(".json"))
+
+    def test_two_tickets_at_a_time(self):
+        os.environ.update(FAKE_SLEEP="4", FAKE_SLEEP_STAGE="planning")
+        self.add("ABC-1", "ABC-2", "ABC-3")   # clones: each works in a folder of its own
+        p = self.run_bg("--parallel", "2", "--idle-min", "0", "--outage-wait", "0")
+        self.wait_for(lambda: len(self.runner().get("tickets", [])) == 2, "two tickets in hand at once")
+        r = self.runner()
+        self.assertEqual((r["parallel"], [s["slot"] for s in r["slots"]]), (2, [1, 2]))
+        self.assertTrue(all(tq.run_holds(tq.Queue(self.state), k) for k in r["tickets"]))
+        rc, out = self.q("status")
+        self.assertIn("2 tickets at a time", out)
+        self.assertEqual(p.wait(timeout=60), 0, cat(os.path.join(self.tmp, "run.out"))[-2000:])
+        self.assertEqual([self.status(k)["status"] for k in ("ABC-1", "ABC-2", "ABC-3")], ["done"] * 3)
+        self.assertEqual(self.run_files(), [])
+        self.assertFalse(tq.run_going(tq.Queue(self.state)))
+
+    def test_one_ticket_at_a_time_in_a_project_folder(self):
+        os.environ.update(FAKE_SLEEP="3", FAKE_SLEEP_STAGE="planning")
+        for k in ("ABC-1", "ABC-2"):
+            rc, out = self.q("add", k, "--project", self.project, "--in-place", "--stages", "plan")
+            self.assertEqual(rc, 0, out)
+        p = self.run_bg("--parallel", "2", "--idle-min", "0", "--outage-wait", "0")
+        self.wait_for(lambda: any("waiting for ABC-1" in (s.get("step") or "") for s in self.runner().get("slots", [])),
+                      "the other slot waiting for ABC-1's folder")
+        self.assertEqual(self.runner()["tickets"], ["ABC-1"])
+        self.assertEqual(p.wait(timeout=60), 0, cat(os.path.join(self.tmp, "run.out"))[-2000:])
+        self.assertEqual([self.status(k)["status"] for k in ("ABC-1", "ABC-2")], ["done"] * 2)
+        self.assertEqual(self.run_files(), [])
+
+    def test_in_place_tickets_of_two_projects_at_once(self):
+        os.environ.update(FAKE_SLEEP="4", FAKE_SLEEP_STAGE="planning")
+        other = os.path.join(self.tmp, "other")
+        sh("git", "clone", "-q", self.project, other)
+        for k, v in (("user.name", "T"), ("user.email", "t@example.com")):
+            sh("git", "-C", other, "config", k, v)
+        for k, d in (("ABC-1", self.project), ("ABC-2", other)):
+            rc, out = self.q("add", k, "--project", d, "--in-place", "--stages", "plan")
+            self.assertEqual(rc, 0, out)
+        p = self.run_bg("--parallel", "2", "--idle-min", "0", "--outage-wait", "0")
+        self.wait_for(lambda: len(self.runner().get("tickets", [])) == 2, "a ticket of each project in hand at once")
+        self.assertEqual(p.wait(timeout=60), 0, cat(os.path.join(self.tmp, "run.out"))[-2000:])
+        self.assertEqual([self.status(k)["status"] for k in ("ABC-1", "ABC-2")], ["done"] * 2)
+
+    def test_halt_and_halt_force_end_every_slot(self):
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_STAGE="planning")
+        self.add("ABC-1", "ABC-2")
+        p = self.run_bg("--parallel", "2", "--idle-min", "0")
+        self.wait_for(lambda: len(self.runner().get("tickets", [])) == 2, "two tickets in hand at once")
+        rc, out = self.q("halt")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(timeout=30), 0)
+        self.assertEqual([self.status(k)["status"] for k in ("ABC-1", "ABC-2")], ["queued"] * 2)
+        self.assertEqual(self.run_files(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "halt")))
+        # A run that does not halt: halt --force kills each slot and the run, and both go back.
+        p = self.run_bg("--parallel", "2", "--idle-min", "0")
+        self.wait_for(lambda: len(self.runner().get("tickets", [])) == 2, "two tickets in hand again")
+        rc, out = self.q("halt", "--force", "--harness", self.harness)
+        self.assertEqual(rc, 0, out)
+        p.wait(timeout=30)
+        self.assertEqual([self.status(k)["status"] for k in ("ABC-1", "ABC-2")], ["queued"] * 2)
+        self.assertEqual(self.run_files(), [])
+
+
 class AuditFixesTest(Base):
     """The task file, the Windows command-line limit, UTF-8 git output, clone and
     push options, Windows agent paths and the verifier's retries."""

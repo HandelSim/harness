@@ -441,6 +441,7 @@ backend_override=""
 ORDER_LOG="$TMP_ROOT/order.log"
 harness_runtime_installed() { return 0; }
 require_docker() { :; }
+services_up() { return 0; }
 _running_proxy_backend() { echo "read" >>"$ORDER_LOG"; printf 'chatgpt'; }
 cmd_down()  { echo "down"  >>"$ORDER_LOG"; }
 cmd_start() { echo "start:${backend_override}" >>"$ORDER_LOG"; }
@@ -450,7 +451,7 @@ cmd_restart
 down
 start:chatgpt" ]] || fail "T19: cmd_restart order/backend wrong — $(cat "$ORDER_LOG")"
 backend_override=""
-unset -f harness_runtime_installed require_docker cmd_down cmd_start
+unset -f harness_runtime_installed require_docker services_up cmd_down cmd_start
 ok "T19: restart adopts the running dialect before tearing the stack down"
 
 # --- T20: bare diagnostics point at the other entry point -------------------

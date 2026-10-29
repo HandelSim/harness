@@ -304,8 +304,18 @@ helper with `harness upgrade`.
    run viewer (`harness_view_refresh`). A queue run restarts itself between
    tickets (exit 75); a working agent is not interrupted. This runs before
    the host-only/container split, so both paths get it.
-4. `harness down --remove-orphans` and `harness start` (skippable via
-   `--no-restart`).
+4. Take the container stack down and rebuild its images; never start it
+   again (skippable via `--no-restart`). The next container launch's
+   `ensure_services_up` starts the stack on the new code, so a host-only or
+   serve-only user is never left with containers they do not use.
+   `_upgrade_stack_down` runs `harness down --remove-orphans` unless agent
+   containers are still working (`running_agent_count`): those are never
+   interrupted, the stack stays up on the old code, and `state/stack.stale`
+   makes the first launch after the last of them ends restart it (see
+   harness-cli.md, "Last-agent stack teardown"). `compose --profile agent
+   build` runs only when the install has a `harness-proxy` or `harness-agent`
+   image already; one that never launched a container builds them at its
+   first launch.
 
 `--check` is the exception: it lists every action and dry-runs them all
 (full preview), bypassing the precheck.
@@ -335,8 +345,8 @@ so a transient docker outage never silently downgrades the upgrade. The same
 `harness host down && harness host` instead of erroring on a missing runtime.
 
 Declining the `[y/n]` confirmation skips step 3 (the file merges) but
-still runs step 4 — the git pull has already happened, so the rebuild +
-restart are needed to avoid running stale images on new code. To abort
+still runs step 4 — the git pull has already happened, so the stack must
+come down and the images be rebuilt to avoid running stale images on new code. To abort
 the whole upgrade, use Ctrl-C.
 
 **Cross-version contract on `--resume-after-pull`.** Once a version
@@ -355,7 +365,7 @@ Flags:
 
 - `--check` — preview only (no git pull, no writes).
 - `--no-prompt` — apply without the [y/n] confirmation.
-- `--no-restart` — apply without down/start (e.g. for CI).
+- `--no-restart` — apply without stack down/rebuild or the host restarts (e.g. for CI).
 - `--rebuild` — `compose build --no-cache`; slower.
 
 ## `harness downgrade` — move back to the previous release tag

@@ -1417,6 +1417,25 @@ class QueuePageTest(RunsServer):
         for f in ("halt", "run.json", stop):
             self.assertFalse(os.path.exists(os.path.join(self.queue, f)), f)
 
+    def test_a_parallel_run_shows_each_ticket_in_hand(self):
+        self.ticket(status="running")
+        self.start()
+        now = time.time()
+        with open(os.path.join(self.queue, "run.json"), "w") as f:
+            json.dump({"pid": 1, "beat": now, "ticket": "", "stage": "", "parallel": 3}, f)
+        for i, info in ((1, {"ticket": "ABC-12", "stage": "implement", "step": "the agent works"}),
+                        (2, {"ticket": "ABC-13", "stage": "plan"}),
+                        (3, {"ticket": "ABC-14", "stage": "plan", "beat": now - runs.RUN_FRESH - 5})):  # gone
+            with open(os.path.join(self.queue, f"run-{i}.json"), "w") as f:
+                json.dump({"beat": now, "step": "", **info}, f)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("ABC-12</a> &middot; implement: the agent works; ", body)
+        self.assertIn("ABC-13</a> &middot; plan", body)
+        self.assertNotIn("ABC-14", body)
+        self.assertIn("<b>3 tickets</b>", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("interrupted", body)   # in a slot's hand, not left running by a run that is gone
+
     def test_start_runs_harness_queue_run_and_reports_an_early_exit(self):
         fake = os.path.join(self.tmp.name, "harness")
         args = os.path.join(self.tmp.name, "args")
