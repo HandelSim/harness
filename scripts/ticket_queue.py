@@ -1801,7 +1801,8 @@ def run_agent(ctx, st, stage, prompt):
                                   message=f"The owner's message (it wins over everything above):\n{msg}\n" if msg else "")
     arg = prompt
     if sid:
-        arg = render("continue-failed" if resume.get("failed") else "continue", KEY=key, STAGE=stage, TASK_FILE=agent_path(ctx, task),
+        arg = render("continue-failed" if resume.get("failed") else "continue",
+                     KEY=key, STAGE=stage, TASK_FILE=agent_path(ctx, task),
                      WHY=resume.get("why") or "it was stopped",
                      MESSAGE=(resume.get("message") or "").strip() or "(none: carry on)")
         ctx.q.log(key, f"{stage}: going on in the agent's session {sid}")
@@ -3102,7 +3103,10 @@ def block(ctx, st, reason, keep=False, failed=False, no_go_on=""):
     record(st, "blocked", [reason])
     st.update(status="blocked", reason=reason)
     for k, v in (("blocked_failed", failed), ("no_go_on", no_go_on)):
-        st.update({k: v}) if v else st.pop(k, None)
+        if v:
+            st[k] = v
+        else:
+            st.pop(k, None)
     ctx.q.save(st)
     ctx.q.log(st["key"], f"blocked at {st['stage']}: {reason}")
 
@@ -4108,7 +4112,9 @@ def cmd_continue(q, a):
         # nothing new to tell it, its work is checked as it is, not made again
         kept = st["verify_only"] if kept_result(st) and not text.strip() else None
         # the attempts are not counted again: a stage that keeps failing its check still blocks
-        failed, attempt = st["status"] == "blocked" and st.get("blocked_failed"), st.get("attempt", 0)
+        # (a queued one continued already keeps what its block was)
+        failed = st.get("blocked_failed") if st["status"] == "blocked" else (st.get("resume") or {}).get("failed")
+        attempt = st.get("attempt", 0)
         st = requeue(q, key, CONTINUABLE, go_on=True)
         if not st:
             return 1

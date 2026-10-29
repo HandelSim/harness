@@ -1650,6 +1650,8 @@ class OwnerControlTest(Base):
         self.assertEqual(rc, 0, out)
         st = self.status()
         self.assertEqual((st["attempt"], st["resume"]["failed"]), (attempt, True))   # not counted again
+        rc, out = self.q("continue", "ABC-1", "--text", "Commit it this time.")   # queued: a new message
+        self.assertEqual((rc, self.status()["resume"]["failed"]), (0, True), out)
         rc, out = self.run_queue()
         self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
         last = self.calls_of("implementing")[-1]

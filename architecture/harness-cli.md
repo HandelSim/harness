@@ -810,7 +810,17 @@ agent stage with its work there, else refused by `continue_refused`: the
 stage goes on from the work as it is, `requeue(go_on=True)` keeping the
 commits, and the next launch passes `--session <id>` to `opencode run` with
 `queue_prompts/continue.md` (why it was cut off, the owner's message, the
-task file holding the stage's full prompt); its result is checked as usual.
+task file holding the stage's full prompt), or `continue-failed.md` when the
+block was the stage's check failing on its last attempt (`block(failed=True)`
+sets `blocked_failed`; `resume["failed"]`: the agent is told its work did not
+pass and to fix what the check said); its result is checked as usual.
+`continue` keeps the attempt count (`requeue` resets it, `cmd_continue`
+puts it back) and marks `continued` with the stage, so a continued stage
+that fails its check again blocks at once ("again after harness queue
+continue") rather than getting its retries over; a retry or the stage
+passing drops the mark. A block where going on cannot help sets `no_go_on`
+(`block(no_go_on=...)`: a review's must-fix items with no fix stage, which
+the review would only find again), and `continue_refused` refuses with it.
 Where the stage's agent had already ended and its result is kept
 (`kept_result`: `verify_only` of that stage, say a stop that landed while
 its session was being saved), `continue` with no message keeps
@@ -1766,7 +1776,11 @@ offered as suggestions. It is taken as pasted: quotes
   script says nothing): a "Continue <stage>" button on the queue page's row
   (posts with no message), one atop the ticket page and on its session's
   page linking to the ticket's `#go-on` panel, whose form sends a message
-  to `harness queue continue --stdin`. A ticket at plan-review or
+  to `harness queue continue --stdin`. With no run going or starting, a
+  Continue then starts one (`start_runner`) in the mode the stage's agent
+  ran in (`_continue_mode`: `session` `container`/`single`, else
+  `clone_mode`; its session is found only by that mode), a host one only
+  with the form's "host mode is OK" ticked, as on Start the queue. A ticket at plan-review or
   needs-answers shows the plan open
   above the approve or answer form (not again among the vault notes), the
   plan's items as cards (each criterion's Given/When/Then and source, with
@@ -1788,7 +1802,7 @@ offered as suggestions. It is taken as pasted: quotes
   reason instead of the form; the module not importable: all), the queue's
   Start form when the ticket is queued or "run ended" and no run is going
   (`back=KEY` returns to the ticket; answer, approve and retry never start a
-  run, they say none is going), the
+  run, they say none is going; Continue does, above), the
   ticket's sessions from every
   `--agent-data` source by stage, every attempt from `history` with its
   result, reason and `.out`, the notes with an add form, the plan, answers
