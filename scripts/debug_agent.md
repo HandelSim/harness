@@ -12,8 +12,11 @@ hand to a harness developer. You investigate; you do not fix.
    `.env`, containers, processes and git: no edits, no `harness restart` /
    `down` / `config set` / `upgrade`, no `docker restart`, no `kill`, no
    installs. Harness enforces part of this: edits and any command outside a
-   read-only set ask the user first (or are refused in a headless run). Do
-   not try to get around a refusal; note what you would have run instead.
+   read-only set ask the user first (or are refused in a headless run), and
+   so does any output redirect (`>`, `2>/dev/null`, `2>&1`): leave those off,
+   the shell tool already returns stderr. Do not try to get around a
+   refusal; note what you would have run instead. `harness logs` follows
+   forever; use `docker logs --tail 200 <name>` instead.
 2. **Do not read `.env`.** Its keys and whether each is set are in
    `snapshot.txt` (`harness config list`, secrets masked). That is enough to
    diagnose config problems.

@@ -158,7 +158,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Config / setup | `config` (get/set/list + interactive picker), `model` (pick `DEFAULT_MODEL_NAME` from the live catalog), `uninstall` — see "Config and setup commands" below. |
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
-| Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help` |
+| Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help`, `debug` (an agent on harness itself; see "`debug`" below) |
 | Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove`, `ticket`, `context`, `queue` — see "Vaults", "Tickets and context" and "Ticket queue" below. |
 | Pub page | `serve` — the vault's pub pages plus opencode web, loopback only. See "`serve`" below. |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
@@ -2165,6 +2165,57 @@ breaks the recursion.
   (`python3`/`jq`/`node`/`opencode`, Node >= 20) instead of the daemon, and
   skips the allowlist file-exists and `PROXY_API_URL`-in-allowlist checks
   (the firewall allowlist only governs container mode).
+
+## `debug`
+
+`harness debug [-p ISSUE]` (container) and `harness debug host [-p ISSUE]`
+launch opencode on harness itself to find why something fails on this
+machine, and print a report the user hands to a developer. It needs a
+working model path, so when the launch itself fails without a report,
+`debug_finish` keeps the redacted snapshot instead and says so.
+
+- **Workspace** `state/debug/`: `AGENTS.md` is copied from the tracked
+  `scripts/debug_agent.md` on every launch (what harness is, the log/state
+  map, the read-only rules, the report format and privacy rules), and
+  `snapshot.txt` is collected on the host first (`debug_snapshot`: commit,
+  OS, runtime version, `harness doctor` under `timeout`, `config list`
+  masked, the project's and agent containers with `docker logs --tail 300`
+  each, `state/host/`). opencode loads that `AGENTS.md` because the launch
+  `cd`s there (the clone root has none, so its `CLAUDE.md` is not loaded).
+  Container mode adds `--mount <install root>` so the agent sees the code
+  and `state/`; it cannot run docker or harness, so the snapshot is its
+  view of the host.
+- **Nothing of the user's**: under `harness_debug=1`, `vault_prepare` and
+  `ticket_prepare` return before attaching anything, so no vault, ticket or
+  their instruction files reach the agent.
+- **Read-only** is enforced by `debug_opencode_config`, the last part of
+  `harness_opencode_overlay`: permissions on the top level and on the
+  `build`, `general` and `yolo` agents (an agent's rules beat the top level,
+  and the yolo agent's own allow-all would otherwise win; `--yolo` is
+  dropped anyway). opencode takes the last matching rule and checks a
+  pipeline command by command, with any redirect in the command's text, so
+  the bash map is `"*"` first, a read-only allowlist (`cat`, `grep`, `git
+  log`, `docker logs`, `harness doctor`, ...), then the patterns that make
+  an allowed command write or leak (`*>*`, `find -delete/-exec`, `curl -o/-d/
+  -X`, `*.env`, `*environ*`, ...). Edits are the same except `report.md`;
+  reading `.env` asks. The mode is `ask` interactively and `deny` under
+  `-p`, where an ask ends a headless session. This guards against mistakes,
+  not an adversary: the redaction below is what keeps the report clean.
+- **Report**: the agent writes `state/debug/report.md`; on exit
+  `debug_finish` redacts it (`debug_scrub`) into
+  `state/debug/reports/<time>.md`, deletes the raw file and prints it. A
+  `-p` run sends the agent's stdout to `session.log` and prints that,
+  redacted, if no report was written. `debug_scrub` replaces, longest
+  first, every `.env` value of 4+ chars (not numbers or common words such
+  as `true`/`hybrid`) with `[KEY]`, a URL value's host with `[KEY host]`,
+  `doctor_redact`'s `abcd...wxyz` form of a secret, vault names/urls and
+  `tickets.list` folders/keys, and the hostname; then the install root
+  becomes `<harness>`, a path under `$HOME` (or `~/`) becomes `~/<path>`
+  unless its first part is a dot dir (`~/.local/share/opencode` names a
+  tool, not a project), and `$HOME` becomes `~`.
+- `cmd_host` and `run_agent` exit (or exec), so `cmd_debug` runs them in a
+  subshell with `set -e` re-enabled inside, and passes the agent's exit
+  code on. Covered by `tests/unit_debug_test.sh`.
 
 ## `probe`
 

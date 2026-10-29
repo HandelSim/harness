@@ -15,6 +15,7 @@
 #       the report redacted into state/debug/reports/ and printed, the raw
 #       one removed, the agent's exit code passed on; `debug host` goes
 #       through cmd_host
+#   T6: a launch that fails before any report keeps the redacted snapshot
 #
 # Run:  bash tests/unit_debug_test.sh
 
@@ -174,5 +175,21 @@ t5h=$(
 )
 [[ "$t5h" == 'HOST=[] debug=1 print=0' ]] || fail "T5: debug host — $t5h"
 ok "T5: a run redacts and prints the report; debug host goes through cmd_host"
+
+# --- T6: a launch that fails before any report keeps the redacted snapshot -----------
+rm -rf "$TMP_ROOT/state/debug"
+rc=0
+(
+    src
+    harness_runtime_installed() { return 0; }
+    debug_snapshot() { echo "key sk-secretvalue123456 at $TMP_ROOT"; }
+    run_agent() { exit 1; }
+    cmd_debug 2>"$TMP_ROOT/err"
+) || rc=$?
+[[ $rc -eq 1 ]] || fail "T6: rc $rc"
+saved=$(ls "$TMP_ROOT/state/debug/reports/"*-snapshot.md) || fail "T6: no snapshot kept"
+[[ "$(cat "$saved")" == 'key [PROXY_API_KEY] at <harness>' ]] || fail "T6: kept snapshot — $(cat "$saved")"
+grep -q 'did not run to the end' "$TMP_ROOT/err" || fail "T6: no note — $(cat "$TMP_ROOT/err")"
+ok "T6: a failed launch keeps the redacted snapshot and says so"
 
 echo "[debug] all checks passed"

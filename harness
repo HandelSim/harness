@@ -11353,9 +11353,20 @@ debug_snapshot() {
 
 # After the agent exits: redact report.md into state/debug/reports/<time>.md,
 # drop the raw file and print the redacted one. A -p run that wrote no report
-# prints its redacted session output instead.
+# prints its redacted session output instead. A launch that failed (rc, $2)
+# without a report most likely never reached the model, the very thing that
+# may be broken, so the redacted snapshot is kept for the user to hand over.
 debug_finish() {
-    local print="$1" dir="$state_root/debug" out
+    local print="$1" rc="${2:-0}" dir="$state_root/debug" out
+    if [[ ! -s "$dir/report.md" && "$rc" != 0 && -s "$dir/snapshot.txt" ]]; then
+        mkdir -p "$dir/reports"
+        out="$dir/reports/$(date +%Y%m%d-%H%M%S)-snapshot.md"
+        debug_scrub < "$dir/snapshot.txt" > "$out"
+        err "debug: the agent did not run to the end (exit $rc), so it wrote no report."
+        err "       If the failure is in the container or host path, try the other one"
+        err "       ('harness debug' / 'harness debug host'). The redacted diagnostics"
+        err "       are in state/debug/reports/${out##*/} to hand over as they are."
+    fi
     if [[ -s "$dir/report.md" ]]; then
         mkdir -p "$dir/reports"
         out="$dir/reports/$(date +%Y%m%d-%H%M%S).md"
@@ -11369,7 +11380,7 @@ debug_finish() {
         echo >&2
         tail -c 200000 "$dir/session.log" | debug_scrub
         echo
-    else
+    elif [[ "$rc" == 0 ]]; then
         echo "[harness] debug: no report was written. Run 'harness debug' again and ask the agent to write the report." >&2
     fi
 }
@@ -11422,7 +11433,7 @@ cmd_debug() {
     fi
     rc=$?
     set -e
-    debug_finish "$print"
+    debug_finish "$print" "$rc"
     return "$rc"
 }
 
