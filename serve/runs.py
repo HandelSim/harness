@@ -728,7 +728,8 @@ class Runs:
         if not isinstance(st, dict):
             return {}
         out = {k: st[k] for k in ("status", "stage", "reason", "updated", "vault", "project", "base", "ref",
-                                  "start", "branch", "sha", "created", "stopped_from") if isinstance(st.get(k), str)}
+                                  "start", "branch", "sha", "created", "stopped_from", "clone_mode")
+               if isinstance(st.get(k), str)}
         out.setdefault("start", out.get("ref", ""))
         out["attempt"] = st["attempt"] if isinstance(st.get("attempt"), int) else 0
         out["plan_approved"] = st.get("plan_approved") is True
@@ -738,7 +739,8 @@ class Runs:
         want = [s for s in want if isinstance(s, str)] if isinstance(want, list) and want else list(STAGES)
         out["stages"] = [s for s in STAGES if s in want]
         ses = st.get("session")   # the agent's opencode session a cut-off stage goes on in
-        out["session"] = ({"stage": ses["stage"], "id": ses["id"]} if isinstance(ses, dict)
+        out["session"] = ({"stage": ses["stage"], "id": ses["id"], "container": ses.get("container") is True,
+                           "single": ses.get("single") is True} if isinstance(ses, dict)
                           and isinstance(ses.get("stage"), str) and isinstance(ses.get("id"), str) else {})
         out["resume"] = isinstance(st.get("resume"), dict)   # queued to go on in it when a run takes it
         kept = st.get("verify_only")   # its agent ended; Continue checks its work rather than launch it again
@@ -1854,10 +1856,23 @@ def _note_form(key, button):
             f"<div class='acts'><button type='submit' class='primary'>{button}</button></div></form>")
 
 
+def _continue_mode(st):
+    """The run mode a Continue starts when no run is going: the one the stage's
+    agent ran in (its session is only found in that mode), else the clone's."""
+    s = st.get("session") or {}
+    if s.get("stage") == st.get("stage") and s.get("id"):
+        return "container" if s.get("container") else "single" if s.get("single") else "host"
+    return "host" if st.get("clone_mode") == "host" else "container"
+
+
 def _continue_form(key, st):
     """Go on with the stage that was cut off, in its agent's own session, with a message."""
     stage = esc(st.get("stage", ""))
     s = st.get("session") or {}
+    host = "" if _continue_mode(st) == "container" else (
+        "<label class='opt'><input type='checkbox' name='confirm_host' value='1'>"
+        "<span>host mode is OK<small>with no run going, this starts one in host mode (no container, "
+        "no firewall), as its agent ran</small></span></label>")
     how = ("its agent had finished: with no message its work is checked as it is; with one, the agent goes on "
            "in its session first" if st.get("finished") else
            "its agent goes on in the same session, with what it did so far" if s.get("stage") == st.get("stage")
@@ -1866,7 +1881,7 @@ def _continue_form(key, st):
             f"<label><div class='q'>Message for the agent <span class='muted'>(optional; {how})</span></div>"
             f"<textarea name='text' maxlength='{NOTE_MAX}' placeholder='For example: the proxy was down and is back; "
             "carry on. Or: the test needs the database running, it is up now'></textarea></label>"
-            f"<div class='acts'><button type='submit' class='primary'>Continue {stage}</button></div></form>")
+            f"{host}<div class='acts'><button type='submit' class='primary'>Continue {stage}</button></div></form>")
 
 
 def _answer_form(key, qs, review=False):
@@ -2508,7 +2523,19 @@ def ticket_action(runs, key, action, form):
         text = _one(form, "text").replace("\r\n", "\n")
         if len(text) > NOTE_MAX:
             return False, f"the message is over {NOTE_MAX} characters"
-        return _waits(runs, key, _queue(runs, ["continue", key, "--stdin", "--harness", runs.harness], text))
+        ok, msg = _queue(runs, ["continue", key, "--stdin", "--harness", runs.harness], text)
+        r = runs.runner()
+        if not ok or r["running"] or r["starting"]:
+            return ok, msg
+        # nothing would take it: a run starts, in the mode its agent ran in (host
+        # mode only with the box ticked, as on Start the queue)
+        mode = _continue_mode(runs.ticket_state(key))
+        if mode != "container" and _one(form, "confirm_host") != "1":
+            return ok, (msg + f"; the queue is not running and its agent ran in host mode: start the queue in "
+                        f"{'host, single message' if mode == 'single' else 'host'} mode (below), or tick "
+                        "'host mode is OK' when you continue")
+        started, said = runs.start_runner(mode)
+        return ok, msg + "; " + (said if started else "the queue did not start: " + said)
     if action == "stop":
         if status not in STOPPABLE:
             return False, f"{key} is {status}; there is nothing to stop"

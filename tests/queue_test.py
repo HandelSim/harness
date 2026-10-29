@@ -1135,6 +1135,10 @@ class OwnerControlTest(Base):
         self.assertEqual((st["status"], st["stage"]), ("blocked", "review"))
         self.assertIn("harness queue retry ABC-2 --stage fix", st["reason"])
         self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-2"), "")
+        # going on with the review would only find the same items again
+        rc, out = self.q("continue", "ABC-2")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ABC-2 cannot go on at review: the review's must-fix items need a fix stage", out)
         # retry --stage fix adds the stage and goes on from the review.
         rc, out = self.q("retry", "ABC-2", "--stage", "fix")
         self.assertEqual(rc, 0, out)
@@ -1640,16 +1644,39 @@ class OwnerControlTest(Base):
         self.run_queue()
         st = self.status()
         self.assertEqual((st["status"], st["stage"], st["session"]["id"]), ("blocked", "implement", "ses_fake2"))
+        attempt = st["attempt"]
         del os.environ["FAKE_NO_COMMIT"]
         rc, out = self.q("continue", "ABC-1", "--text", "Commit it this time.")
         self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertEqual((st["attempt"], st["resume"]["failed"]), (attempt, True))   # not counted again
         rc, out = self.run_queue()
         self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
         last = self.calls_of("implementing")[-1]
         self.assertIn("--session ses_fake2", last)   # the last agent's, the one that was blocked
         said = cat(self.calls + ".continue")
-        self.assertIn("no commits on branch ABC-1", said)   # why it was cut off
+        self.assertIn("did not pass the stage's check, so the ticket was blocked", said)   # not "cut off"
+        self.assertIn("no commits on branch ABC-1", said)   # what the check said
         self.assertIn("Commit it this time.", said)
+
+    def test_a_continued_stage_that_fails_its_check_again_blocks_at_once(self):
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add("ABC-1")
+        self.run_queue()
+        launched = len(self.calls_of("implementing"))
+        rc, out = self.q("continue", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.run_queue()
+        del os.environ["FAKE_NO_COMMIT"]
+        st = self.status()
+        # one more go, not the retries over again
+        self.assertEqual(len(self.calls_of("implementing")), launched + 1)
+        self.assertEqual(st["status"], "blocked")
+        self.assertIn("again after harness queue continue", st["reason"])
+        # a retry starts the count over, and drops the mark
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((self.status()["attempt"], self.status().get("continued")), (0, None))
 
     def test_continue_with_no_session_tells_a_new_agent_to_finish(self):
         os.environ.update(FAKE_NO_COMMIT="1", FAKE_NO_SESSION="1")

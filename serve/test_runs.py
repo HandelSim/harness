@@ -684,6 +684,64 @@ class RunsTest(RunsServer):
         self.assertNotIn("resume", st)
         self.assertEqual(st["verify_only"]["out"], "done")
 
+    def test_continue_starts_a_run_in_the_mode_its_agent_ran_in(self):
+        fake = os.path.join(self.tmp.name, "harness")
+        args = os.path.join(self.tmp.name, "args")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/bash\necho "$@ HOST_CONFIRM=$HARNESS_HOST_CONFIRM" > {args}\nexec sleep 30\n')
+        cfg = self.start(harness=fake)
+
+        def go(session, fields=()):
+            self.ticket(status="blocked", stage="implement", base_sha="abc", questions=[], session=session)
+            try:
+                r, body = self.act("continue", fields)
+                self.assertEqual(r.status, 303, body)
+                self.assertEqual(self.state()["status"], "queued")
+                with contextlib.suppress(OSError):
+                    with open(args) as f:
+                        return unquote(r.getheader("Location")), f.read().strip()
+                return unquote(r.getheader("Location")), ""
+            finally:
+                if cfg.runs.launched:
+                    cfg.runs.launched[0].kill()
+                    cfg.runs.launched[0].wait()
+                    cfg.runs.launched = None
+                with contextlib.suppress(OSError):
+                    os.remove(args)
+
+        where, ran = go({"stage": "implement", "attempt": 0, "id": "ses_abc", "container": True})
+        self.assertEqual(ran, "queue run HOST_CONFIRM=")
+        self.assertIn("the queue run is starting", where)
+        # a host agent's session is found only by a host run: started so only with the box ticked
+        host = {"stage": "implement", "attempt": 0, "id": "ses_abc", "container": False}
+        self.ticket(status="blocked", stage="implement", base_sha="abc", questions=[], session=host)
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("name='confirm_host'", body.split("/continue'")[1].split("</form>")[0])
+        where, ran = go(host)
+        self.assertEqual(ran, "")
+        self.assertIn("its agent ran in host mode", where)
+        where, ran = go(host, [("confirm_host", "1")])
+        self.assertEqual(ran, "queue run --host HOST_CONFIRM=1")
+        where, ran = go(dict(host, single=True), [("confirm_host", "1")])
+        self.assertEqual(ran, "queue run --single-message HOST_CONFIRM=1")
+        # a run going takes it: none is started
+        self.run_on("ABC-13")
+        where, ran = go({"stage": "implement", "attempt": 0, "id": "ses_abc", "container": True})
+        self.assertEqual(ran, "")
+        self.assertNotIn("starting", where)
+
+    def test_no_continue_where_going_on_finds_the_same_again(self):
+        session = {"stage": "review", "attempt": 0, "id": "ses_abc", "container": True}
+        self.ticket(status="blocked", stage="review", base_sha="abc", questions=[], session=session,
+                    reason="the review found 2 must-fix item(s)", no_go_on="the review's must-fix items need a "
+                    "fix stage: harness queue retry ABC-12 --stage fix")
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertNotIn("/continue'", body)
+        r, body = self.act("continue")
+        self.assertEqual(r.status, 409)
+        self.assertIn("--stage fix", body)
+
     def test_continue_is_on_the_queue_page_and_atop_the_ticket(self):
         session = {"stage": "implement", "attempt": 0, "id": "ses_abc", "container": True}
         self.ticket(status="stopped", stage="implement", base_sha="abc", questions=[], session=session)

@@ -1724,7 +1724,7 @@ def note_session(ctx, st, out, since):
         return False
     same = before.get("id") == got and before.get("stage") == st["stage"]
     st["session"] = {"stage": st["stage"], "attempt": st.get("attempt", 0), "id": got,
-                     "container": not (ctx.host or ctx.single),
+                     "container": not (ctx.host or ctx.single), "single": bool(ctx.single),
                      "started": before["started"] if same and before.get("started") else since / 1000}
     if same and before.get("crashed"):
         st["session"]["crashed"] = before["crashed"]
@@ -1768,9 +1768,12 @@ def go_on_after_crash(ctx, st, why):
     return True
 
 
-CARRY_ON = ("\n\n<<<BEGIN_GOING_ON (an earlier agent on this stage was cut off before it finished: {why})>>>\n"
+CARRY_ON = ("\n\n<<<BEGIN_GOING_ON (an earlier agent on this stage {how}: {why})>>>\n"
             "Its work so far is in your working directory. Check what is already done (git status, git log, the "
             "files the stage writes) and finish it instead of starting over.\n{message}<<<END_GOING_ON>>>\n")
+
+
+HOW_FAILED = "did not pass its check, so the ticket was blocked; fix what the check says"
 
 
 def run_agent(ctx, st, stage, prompt):
@@ -1793,11 +1796,12 @@ def run_agent(ctx, st, stage, prompt):
     task = note_paths(ctx.vault, key)["task"]
     if resume and not sid:
         msg = (resume.get("message") or "").strip()
-        prompt += CARRY_ON.format(why=resume.get("why") or "it was stopped",
+        prompt += CARRY_ON.format(how=HOW_FAILED if resume.get("failed") else "was cut off before it finished",
+                                  why=resume.get("why") or "it was stopped",
                                   message=f"The owner's message (it wins over everything above):\n{msg}\n" if msg else "")
     arg = prompt
     if sid:
-        arg = render("continue", KEY=key, STAGE=stage, TASK_FILE=agent_path(ctx, task),
+        arg = render("continue-failed" if resume.get("failed") else "continue", KEY=key, STAGE=stage, TASK_FILE=agent_path(ctx, task),
                      WHY=resume.get("why") or "it was stopped",
                      MESSAGE=(resume.get("message") or "").strip() or "(none: carry on)")
         ctx.q.log(key, f"{stage}: going on in the agent's session {sid}")
@@ -2843,8 +2847,10 @@ def stage_review(ctx, st):
         return advance(ctx, st, "fix" if must else after)
     found = f"the review found {len(must)} must-fix item(s) ({path}); fix is not in this ticket's stages"
     if after:   # nothing after a review that wants fixes, without them
-        return block(ctx, st, f"{found}, so {after} did not run: harness queue retry {st['key']} --stage fix "
-                              f"(or --stage {after} to go on as it is)")
+        how = f"harness queue retry {st['key']} --stage fix (or --stage {after} to go on as it is)"
+        return block(ctx, st, f"{found}, so {after} did not run: {how}",
+                     no_go_on=f"the review's must-fix items need a fix stage, and going on with the review "
+                              f"would find them again: {how}")
     advance(ctx, st, None, reason=found)
 
 
@@ -3064,6 +3070,7 @@ def advance(ctx, st, stage, reason=""):
     st.pop("verify_only", None)
     st.pop("session", None)   # the next stage's agent is a new one
     st.pop("resume", None)
+    st.pop("continued", None)
     if stage:
         st.update(stage=stage, attempt=0, feedback="", status="running")
     else:
@@ -3085,13 +3092,17 @@ def advance(ctx, st, stage, reason=""):
     ctx.q.save(st)
 
 
-def block(ctx, st, reason, keep=False):
+def block(ctx, st, reason, keep=False, failed=False, no_go_on=""):
     """Blocked for the owner; keep: the agent's result stays to be checked again
-    (verify_only) by a retry without --stage."""
+    (verify_only) by a retry without --stage. failed: the stage's work did not pass
+    its check (harness queue continue tells the agent so); no_go_on: why going on
+    with the stage cannot help (continue is refused with it)."""
     if not keep:
         st.pop("verify_only", None)
     record(st, "blocked", [reason])
     st.update(status="blocked", reason=reason)
+    for k, v in (("blocked_failed", failed), ("no_go_on", no_go_on)):
+        st.update({k: v}) if v else st.pop(k, None)
     ctx.q.save(st)
     ctx.q.log(st["key"], f"blocked at {st['stage']}: {reason}")
 
@@ -3126,7 +3137,8 @@ def fail(ctx, st, rc, problems):
             st["resume"] = {"stage": st["stage"], "why": crash, "message": ""}
         ctx.q.save(st)
     else:
-        block(ctx, st, f"{st['stage']} failed {st['attempt'] + 1} time(s): {problems[0][:200]}")
+        again = ", again after harness queue continue" if st.get("continued") == st["stage"] else ""
+        block(ctx, st, f"{st['stage']} failed {st['attempt'] + 1} time(s){again}: {problems[0][:200]}", failed=True)
 
 
 def process(ctx, st):
@@ -3827,7 +3839,8 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         print(f"[queue] {st['key']} is {st['status']}, not {' or '.join(want)}", file=sys.stderr)
         return None
     st.update(status="queued", attempt=0, feedback="", reason="", requeued=now_iso(), **extra)
-    st.pop("stopped_from", None)
+    for k in ("stopped_from", "blocked_failed", "no_go_on", "continued"):
+        st.pop(k, None)
     st.pop("resume", None)   # a cut-off stage goes on only when continued (the caller sets it again)
     for k in RESULTS:
         st.pop(k, None)
@@ -4040,6 +4053,8 @@ def continue_refused(q, st):
         how = {"needs-answers": f"harness queue answer {key}", "plan-review": f"harness queue approve {key}",
                "done": f"harness queue retry {key} starts it over"}.get(st["status"])
         return f"{key} is {st['status']}: there is no stage to go on" + (f" ({how})" if how else "")
+    if st["status"] == "blocked" and st.get("no_go_on"):
+        return f"{key} cannot go on at {stage}: {st['no_go_on']}"
     if st["status"] == "stopped" and st.get("stopped_from") == "plan-review":
         return f"{key} was stopped while its plan waited to be read: harness queue retry {key} puts it back"
     if stage not in RESUMABLE:
@@ -4092,14 +4107,17 @@ def cmd_continue(q, a):
         # its agent had ended (stopped while its work was being saved or checked): with
         # nothing new to tell it, its work is checked as it is, not made again
         kept = st["verify_only"] if kept_result(st) and not text.strip() else None
+        # the attempts are not counted again: a stage that keeps failing its check still blocks
+        failed, attempt = st["status"] == "blocked" and st.get("blocked_failed"), st.get("attempt", 0)
         st = requeue(q, key, CONTINUABLE, go_on=True)
         if not st:
             return 1
+        st.update(attempt=attempt, continued=st["stage"])
         if kept:
             st["verify_only"] = kept
             st["reason"] = f"continued by the owner: {st['stage']}'s finished work is checked"
         else:
-            st["resume"] = {"stage": st["stage"], "why": cut, "message": text.strip()}
+            st["resume"] = {"stage": st["stage"], "why": cut, "message": text.strip(), "failed": bool(failed)}
             st["reason"] = f"continued by the owner: {st['stage']} goes on"
         q.save(st)
     s = st.get("session") or {}
