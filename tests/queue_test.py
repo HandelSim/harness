@@ -1262,7 +1262,7 @@ class OwnerControlTest(Base):
         self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1", "stop")))
         self.assertEqual(self.status("ABC-2")["status"], "done")
         self.assertFalse(os.path.exists(os.path.join(self.state, "run.json")))
-        self.assertEqual(self.status_json()["runner"], {"running": False})
+        self.assertEqual(self.status_json()["runner"], {"running": False, "slots": [], "tickets": []})
         # Its container (a container launch) is stopped too, found by the clone it mounts.
         self.assertIn("stop-agents " + os.path.join(self.state, "ABC-1", "repo"), cat(self.calls).splitlines())
         self.assertIn("stopped 1 agent container(s)", cat(os.path.join(self.state, "ABC-1", "log.md")))
@@ -1374,11 +1374,12 @@ class OwnerControlTest(Base):
         self.add("ABC-1", "ABC-2")
         self.q("move", "ABC-2", "top")
         got = self.status_json()
-        self.assertEqual(got["runner"], {"running": False})
+        self.assertEqual(got["runner"], {"running": False, "slots": [], "tickets": []})
         self.assertEqual([t["key"] for t in got["tickets"]], ["ABC-2", "ABC-1"])
         self.assertEqual(got["tickets"][0]["stages"], list(tq.ALL_STAGES))
         put(os.path.join(self.state, "run.json"), json.dumps({"pid": 1, "beat": int(time.time()) - 60}))
-        self.assertEqual(self.status_json()["runner"], {"pid": 1, "beat": int(time.time()) - 60, "running": False})
+        self.assertEqual(self.status_json()["runner"],
+                         {"pid": 1, "beat": int(time.time()) - 60, "running": False, "slots": [], "tickets": []})
         rc, out = self.q("status")
         self.assertIn("run: not going", out)
 
@@ -2079,7 +2080,7 @@ class ReviewerFixesTest(Base):
     def test_no_beat_after_the_run_ended(self):
         q = tq.Queue(self.state)
         ctx = type("C", (), {"q": q, "beat_lock": threading.Lock(), "beating": threading.Event(),
-                             "run_info": {}})()
+                             "run_info": {}, "run_file": os.path.join(self.state, "run.json")})()
         tq.beat(ctx)
         self.assertTrue(os.path.exists(os.path.join(self.state, "run.json")))
         os.remove(os.path.join(self.state, "run.json"))
