@@ -124,9 +124,13 @@ After the drop, still in the entrypoint:
   declares `attachment: true` and `modalities` input text + image, because
   opencode treats a model it does not know as text only and replaces every
   pasted or read image with an error text before sending; a `*-withtools`
-  model declares `limit.context` = min(`MODEL_CONTEXT_LENGTH`, 120000), so
-  opencode compacts before a metered step re-sends a huge history (other
-  models declare `MODEL_CONTEXT_LENGTH`);
+  model declares `limit.output` 32000 (opencode's most; opencode sends it as
+  `max_tokens`, and the model's thinking counts against it, so at 8192 a long
+  step could end `finish_reason: length` with nothing written) and
+  `limit.context` = min(`MODEL_CONTEXT_LENGTH`, 144000), so opencode, which
+  compacts at context less output, compacts at 112k before a metered step
+  re-sends a huge history (other models declare `MODEL_CONTEXT_LENGTH` and
+  8192 output);
   `compaction.prune` is on; no agent gets a `steps` cap (hard tasks may run
   long). Built with `jq` and
   re-written every launch because the model set may have changed. Falls back

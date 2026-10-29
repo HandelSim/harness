@@ -128,18 +128,21 @@ overlay=$(clone_dir="$REPO_ROOT" harness_slim=1 slim_opencode_config)
     || fail "T5d: slim overlay must be the proxy header only — $overlay"
 ok "T5d: yolo is primary-only; slim is the default; its overlay is the proxy header only (no agent prompts or steps)"
 
-# --- T5f2: -withtools models declare at most 120k context (earlier compaction) --
+# --- T5f2: -withtools models get 32000 output, context at most 144k ----------
+# opencode sends limit.output as max_tokens (thinking counts against it) and
+# compacts at context less output, so 144k - 32k keeps the 112k compaction point.
+lim='[.plain.limit.context, .plain.limit.output, .["big-withtools"].limit.context, .["big-withtools"].limit.output]'
 models=$(printf '%s\n' plain big-withtools | jq -R . | jq -s --argjson ctx 200000 "$(opencode_models_jq)")
-[[ "$(jq -c '[.plain.limit.context, .["big-withtools"].limit.context]' <<<"$models")" == "[200000,120000]" ]] \
-    || fail "T5f2: -withtools entries must cap context at 120000 — $models"
+[[ "$(jq -c "$lim" <<<"$models")" == "[200000,8192,144000,32000]" ]] \
+    || fail "T5f2: -withtools entries must get 32000 output and at most 144000 context — $models"
 models=$(printf '%s\n' small-withtools | jq -R . | jq -s --argjson ctx 64000 "$(opencode_models_jq)")
 [[ "$(jq -c '.["small-withtools"].limit.context' <<<"$models")" == "64000" ]] \
     || fail "T5f2: a smaller MODEL_CONTEXT_LENGTH must win — $models"
 models_prog=$(sed -n "/local models_prog='/,/from_entries'/p" "$REPO_ROOT/agents/entrypoint.sh" | sed "1s/.*models_prog='//; \$s/'\$//")
 models=$(printf '%s\n' plain big-withtools | jq -R . | jq -s --argjson ctx 200000 "$models_prog")
-[[ "$(jq -c '[.plain.limit.context, .["big-withtools"].limit.context]' <<<"$models")" == "[200000,120000]" ]] \
-    || fail "T5f2: the container entrypoint must cap -withtools context too — $models"
-ok "T5f2: -withtools models declare min(MODEL_CONTEXT_LENGTH, 120000), host and container alike"
+[[ "$(jq -c "$lim" <<<"$models")" == "[200000,8192,144000,32000]" ]] \
+    || fail "T5f2: the container entrypoint must set the same limits — $models"
+ok "T5f2: -withtools models declare 32000 output and min(MODEL_CONTEXT_LENGTH, 144000), host and container alike"
 
 # --- T5c: opencode's cost readout counts tokens, cached ones included -------
 ( PROXY_PORT=8123; DEFAULT_MODEL_NAME="test-model"; host_write_opencode_config ) \

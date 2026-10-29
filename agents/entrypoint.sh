@@ -202,9 +202,12 @@ ensure_opencode_config() {
     # would count them free). Same program as opencode_models_jq in the
     # harness script (host mode). The modalities let images through (opencode
     # treats a model it does not know as text only). A `*-withtools` model
-    # declares at most 120k so opencode compacts before a metered step gets huge.
+    # gets 32000 output tokens (max_tokens, thinking included: 8192 could all go
+    # to thinking) and at most 144k context, so opencode still compacts at 112k
+    # before a metered step gets huge.
     local models_prog='map({key: ., value: {name: .,
-             limit: {context: (if endswith("-withtools") then ([$ctx, 120000] | min) else $ctx end), output: 8192},
+             limit: (if endswith("-withtools") then {context: ([$ctx, 144000] | min), output: 32000}
+                    else {context: $ctx, output: 8192} end),
              cost: {input: 1, output: 1, cache_read: 1, cache_write: 1},
              attachment: true, modalities: {input: ["text", "image"], output: ["text"]}}})
          | from_entries'

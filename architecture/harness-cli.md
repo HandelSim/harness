@@ -1368,7 +1368,7 @@ What it does, in order:
    `tests/unit_host_proxy_lease_test.sh`.
 7. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`
-   (`includeUsage`, token `cost` and a `-withtools` context of at most 120k via
+   (`includeUsage`, token `cost` and a `-withtools` model's 32000 output and context of at most 144k via
    `opencode_models_jq`, `compaction.prune`, no agent `steps` cap; see [`containers.md`](containers.md)), but `baseURL` → `http://127.0.0.1:<port>/v1` and built with `harness_jq`, to a
    **scoped** file (`state/host/opencode.json`). It asserts host `jq` is present
    up front (`host_preflight` guarantees it) so the `harness_jq` docker-sidecar

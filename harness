@@ -4504,13 +4504,17 @@ host_usage_ledger()    { printf '%s/output/usage.jsonl' "$state_root"; }
 # prompt tokens included; opencode would count them free). The modalities
 # let images through: opencode defaults a model it does not know (none of
 # ours are in models.dev) to text only and swaps every pasted or read image
-# for an error text before the request is sent. A metered native-tools model
-# (`*-withtools`) declares at most 120k, so opencode compacts a long task
-# before every step re-sends 150k+ tokens of the daily budget.
+# for an error text before the request is sent. A native-tools model
+# (`*-withtools`) gets 32000 output tokens, opencode's most: it sends that as
+# max_tokens and the model's thinking counts against it, so at 8192 a step on a
+# long task could spend it all thinking and end with no reply. Its context is
+# at most 144k, so opencode (which compacts at context less output) still
+# compacts at 112k, before every step re-sends 150k+ of the daily budget.
 opencode_models_jq() {
     cat <<'JQ'
 map({key: ., value: {name: .,
-    limit: {context: (if endswith("-withtools") then ([$ctx, 120000] | min) else $ctx end), output: 8192},
+    limit: (if endswith("-withtools") then {context: ([$ctx, 144000] | min), output: 32000}
+           else {context: $ctx, output: 8192} end),
     cost: {input: 1, output: 1, cache_read: 1, cache_write: 1},
     attachment: true, modalities: {input: ["text", "image"], output: ["text"]}}})
 | from_entries
