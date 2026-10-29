@@ -88,7 +88,7 @@ After the drop, still in the entrypoint:
    `~/.harness-home-initialized`), copies `/etc/skel/harness/.` over the
    empty bind-mounted home with `cp -an` (archive + no-clobber) so any
    files the user dropped in survive. Marks the home as initialized so
-   re-running the image during `harness upgrade` does NOT re-seed.
+   re-running a rebuilt image after an upgrade does NOT re-seed.
 6. **cd to host CWD.** `cd "$HARNESS_HOST_CWD"` so `pwd` inside the
    container matches the host shell.
 7. **Mode dispatch.** `mode=${1:-opencode}`; calls `run_opencode` or drops
@@ -222,7 +222,7 @@ clipboard (it cannot read it; only the copy direction is bridged).
   dies (never orphans) and removes the temp file on exit; harness also kills it
   and removes the file on normal session exit. Only the interactive launch wires
   this in (print/`-p` mode is headless). The feature needs the agent image
-  rebuilt (`harness upgrade`) to pick up the shim.
+  rebuilt to pick up the shim (the first launch after the change does it).
 
 ### Headless `-p` output recovery
 
@@ -261,7 +261,8 @@ home (see "Run viewer" in [`harness-cli.md`](harness-cli.md));
 `HARNESS_LIVE=0` runs it plain. Either way it prints `[harness] session:
 <id>` on stderr (live: as soon as the session exists; plain: at the end),
 which `harness queue` records to go on in a cut-off stage; the script is
-baked into the image, so a container gets that line after `harness upgrade`.
+baked into the image, so a container gets that line once the first launch
+after the change has rebuilt the image.
 An error that ended the session, which opencode writes only to the event
 stream, is printed as `[harness] opencode error: <message>`, and the status is
 then 1 (an attached run exits 0 on it; a plain one already exits 1).

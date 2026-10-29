@@ -326,6 +326,17 @@ They each:
 4. `docker run` the unified agent image (`harness-agent:latest`) with the
    mode arg (`opencode` or `shell`) and any forwarded flags.
 
+**Agent image.** `run_agent` and `cmd_shell` call `ensure_agent_image`
+first, and `harness queue run` calls it once before any stage (so parallel
+slots do not each build). It builds the image when missing, and rebuilds it
+when `state/agent-image.src` (the `cksum` of every file under `agents/` and
+`firewall/`, names included, plus the image id) differs from now: after a
+pull or upgrade that changed those files, or when something else built the
+image (an older harness after a downgrade, a hand-run build). A failed
+rebuild with an old image present warns and launches the old one; a failed
+first build fails the launch. `HARNESS_NO_BUILD=1` builds only a missing
+image (CI pre-builds). `harness upgrade` builds nothing (install-and-upgrade.md).
+
 The container name carries a per-launch random suffix, so multiple agents
 can run from the same directory at once. `list`/`stop`/the picker discover
 agents by label (`harness.agent`/`tool`/`mount`), never by name, so the

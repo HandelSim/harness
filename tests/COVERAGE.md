@@ -112,9 +112,13 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
   throwaway listener). Covers Ho001–Ho007, Ho018, Ho019.
 - `tests/unit_host_upgrade_test.sh` (no docker) — host-only upgrade transition
   (`cmd_upgrade` with no container runtime: host-aware path, no `require_docker`,
-  no rebuild/restart, returns 0); the container upgrade tail (stack down and
-  images rebuilt, never started; working agents leave the stack up and marked
-  stale; no images means no build), the stale-stack restart in
+  no rebuild/restart, returns 0); the container upgrade tail (stack down, nothing
+  built or started; `--rebuild` builds `--no-cache` and records the agent
+  image; working agents leave the stack up and marked stale; no images means
+  no compose), `ensure_agent_image` (T7: missing built and recorded, a failed
+  first build fails, current not rebuilt, `HARNESS_NO_BUILD=1`, changed source
+  rebuilt, failed rebuild warns and keeps the old image, an image built
+  elsewhere rebuilt), the stale-stack restart in
   `ensure_services_up`, and `restart` with no stack running. Sourced via
   `HARNESS_SOURCE_ONLY=1`. Covers Ho008.
 - `tests/unit_host_toolchain_test.sh` (no docker, no network) — host-mode
@@ -142,16 +146,16 @@ Test artifacts audited (re-audited from current state after Tracks D/E/F2):
 
 | status   | count | percent |
 |----------|-------|---------|
-| green    |   377 |  75.55% |
+| green    |   378 |  75.75% |
 | yellow   |     5 |   1.00% |
-| red      |   117 |  23.45% |
+| red      |   116 |  23.25% |
 | **total**|   499 | 100.00% |
 
 Per-prefix breakdown:
 
 | prefix | total | green | yellow | red |
 |--------|-------|-------|--------|-----|
-| F      |   158 |   117 |      2 |  39 |
+| F      |   158 |   118 |      2 |  38 |
 | P      |    89 |    75 |      1 |  13 |
 | A      |    24 |    12 |      0 |  12 |
 | M      |    33 |    28 |      0 |   5 |
@@ -163,7 +167,7 @@ Per-prefix breakdown:
 | B      |    12 |    12 |      0 |   0 |
 | Ho     |    23 |    23 |      0 |   0 |
 | C      |    40 |    40 |      0 |   0 |
-| **all**|   510 |   388 |      5 | 117 |
+| **all**|   510 |   389 |      5 | 116 |
 
 (Per-prefix counts derived directly from this file's status column; they
 reconcile to the total table above. The remaining yellows — F102, F142,
@@ -240,7 +244,7 @@ non-green rows — the gap.
 | F035 | green  | tests/harness_test.sh:800-854               | T16: `[[ "${env_mt_before}" == "${env_mt_after}" ]]` ensures `--check` does not write. | |
 | F036 | green  | tests/harness_test.sh:862-898               | T17: `--no-prompt` proceeds without TTY; asserts apply succeeded. | |
 | F037 | green  | tests/harness_test.sh:862-898               | T17: `--no-restart` means proxy is NOT re-started; asserts `docker inspect` state unchanged. | |
-| F038 | red    | —                                           | —                                                                                                     | No test exercises `harness upgrade --rebuild` (would need to assert `docker compose build --no-cache` ran). |
+| F038 | green  | tests/unit_host_upgrade_test.sh:T4          | T4: `cmd_upgrade --no-prompt --rebuild` with a stubbed compose runs `compose --profile agent build --no-cache` and writes `state/agent-image.src`; without `--rebuild` no build runs. | |
 | F039 | green  | tests/upgrade_test.sh:476-562 (T8)          | T8: `printf 'y\n' \| _upgrade_confirm` proceeds; tests Y, y, yes, YES, empty (with default), CR-stripping. | |
 | F040 | green  | tests/upgrade_test.sh:476-562 (T8)          | T8: `printf 'n\n' \| _upgrade_confirm` aborts; tests n, N, no, NO, x, CR-stripping. | |
 | F140 | green  | tests/upgrade_test.sh:865-901 (T12)         | T12: `_upgrade_confirm "test? " n <<<""` returns rc 1 (Enter aborts); `<<<"y"` returns 0; default-y cases assert `""`→0, `n`→1 (back-compat). | |

@@ -140,28 +140,39 @@ out3=$(host_proxy_refresh 2>&1)
 [[ -z "${out3}" ]] || fail "T3: no proxy running, but refresh did: ${out3}"
 ok "T3: with no proxy running, nothing is started"
 
-# --- T4: a container install's upgrade takes the stack down, not up -----------
-# The next container launch starts it on the new code; agents still working
-# keep it up (marked stale); only images this install has are rebuilt.
+# --- T4: a container install's upgrade takes the stack down, builds nothing --
+# The next container launch starts it on the new code and rebuilds changed
+# images; agents still working keep it up (marked stale); --rebuild builds now.
 harness_runtime_installed() { return 0; }
 require_docker()        { :; }
 host_proxy_refresh()    { :; }
 harness_serve_refresh() { :; }
 harness_view_refresh()  { :; }
 cmd_down()  { echo "MARKER_CMD_DOWN"; }
-compose()   { echo "MARKER_COMPOSE $*"; }
-n_agents=0 images=1
+build_ok=1
+compose()   { echo "MARKER_COMPOSE $*"; (( build_ok )); }
+n_agents=0 images=1 img_id="sha256:aaa"
 running_agent_count() { echo "${n_agents}"; }
-harness_docker() { [[ "$1 $2" == "image inspect" ]] && (( images )); }
-upgrade4() { HARNESS_UPGRADE_SKIP_PULL=1 cmd_upgrade --no-prompt 2>&1; }
+harness_docker() {
+    [[ "$1 $2" == "image inspect" ]] && (( images )) || return 1
+    [[ "$3" == "-f" ]] && echo "${img_id}"
+    return 0
+}
+upgrade4() { HARNESS_UPGRADE_SKIP_PULL=1 cmd_upgrade --no-prompt "$@" 2>&1; }
 
 out4=$(upgrade4) || { echo "${out4}" | sed 's/^/    /'; fail "T4: the container upgrade failed"; }
-grep -q "MARKER_CMD_DOWN" <<<"${out4}" && grep -q "MARKER_COMPOSE --profile agent build" <<<"${out4}" \
-    || { echo "${out4}" | sed 's/^/    /'; fail "T4: the stack was not taken down and the images rebuilt"; }
+grep -q "MARKER_CMD_DOWN" <<<"${out4}" && ! grep -q "MARKER_COMPOSE.* build" <<<"${out4}" \
+    || { echo "${out4}" | sed 's/^/    /'; fail "T4: the stack was not taken down, or images were built"; }
 ! grep -q "MARKER_CMD_START" <<<"${out4}" || fail "T4: the upgrade started the stack again"
 grep -q "the next container launch starts it on the new code" <<<"${out4}" || fail "T4: no word on the next launch"
 [[ ! -f "$(stack_stale_file)" ]] || fail "T4: stack marked stale with no agent working"
-ok "T4: the stack is taken down and the images rebuilt; nothing is started"
+ok "T4: the stack is taken down and nothing is built or started"
+
+out4=$(upgrade4 --rebuild) || { echo "${out4}" | sed 's/^/    /'; fail "T4: the --rebuild upgrade failed"; }
+grep -q "MARKER_COMPOSE --profile agent build --no-cache" <<<"${out4}" \
+    && [[ -s "${state_root}/agent-image.src" ]] \
+    || { echo "${out4}" | sed 's/^/    /'; fail "T4: --rebuild did not build clean and record the agent image"; }
+ok "T4: --rebuild builds the images now, without the cache"
 
 n_agents=2
 out4=$(upgrade4) || fail "T4: the upgrade with agents working failed"
@@ -171,11 +182,11 @@ grep -q "2 agent container(s) still working" <<<"${out4}" && [[ -f "$(stack_stal
 ok "T4: agent containers still working keep the stack up, marked stale"
 
 n_agents=0 images=0
-rm -f "$(stack_stale_file)"
+rm -f "$(stack_stale_file)" "${state_root}/agent-image.src"
 out4=$(upgrade4) || fail "T4: the upgrade with no images failed"
-! grep -q "MARKER_COMPOSE" <<<"${out4}" && grep -q "no container images built yet" <<<"${out4}" \
-    || { echo "${out4}" | sed 's/^/    /'; fail "T4: built images an install never had"; }
-ok "T4: an install with no images built (host use only) builds none"
+! grep -q "MARKER_COMPOSE" <<<"${out4}" \
+    || { echo "${out4}" | sed 's/^/    /'; fail "T4: ran compose for an install with no images"; }
+ok "T4: an install with no images built (host use only) runs no compose"
 
 # --- T5: the first launch after the working agents end starts it again -------
 services_up() { return 0; }
@@ -201,6 +212,57 @@ grep -q "MARKER_CMD_START" <<<"$(cmd_restart --prompt-mode passthrough 2>&1)" \
     || fail "T6: restart --prompt-mode did not start the stack in that mode"
 prompt_mode_override=""
 ok "T6: restart --prompt-mode still starts a stack that is not running"
+
+# --- T7: a launch builds the agent image when missing or its source changed --
+# A copy of the image source, so the test can change it.
+real_clone="${clone_dir}"
+clone_dir="${WORK}/clone"
+mkdir -p "${clone_dir}"
+cp -r "${real_clone}/agents" "${real_clone}/firewall" "${clone_dir}/"
+ensure7() { rc7=0; out7=$(ensure_agent_image 2>&1) || rc7=$?; }
+
+images=0 build_ok=0
+ensure7
+(( rc7 == 1 )) && [[ ! -f "${state_root}/agent-image.src" ]] \
+    || { echo "${out7}" | sed 's/^/    /'; fail "T7: a failed first build did not fail the launch"; }
+ok "T7: a failed first build fails the launch"
+
+# The stub build "makes" the image (in ensure7's subshell, where the record is read).
+build_ok=1
+compose() { echo "MARKER_COMPOSE $*"; (( build_ok )) && images=1; }
+ensure7
+(( rc7 == 0 )) && grep -q "MARKER_COMPOSE --profile agent build agent" <<<"${out7}" \
+    && [[ -s "${state_root}/agent-image.src" ]] \
+    || { echo "${out7}" | sed 's/^/    /'; fail "T7: a missing image was not built and recorded"; }
+ok "T7: a missing image is built and recorded"
+
+images=1
+ensure7
+(( rc7 == 0 )) && [[ -z "${out7}" ]] || { echo "${out7}" | sed 's/^/    /'; fail "T7: an up-to-date image was rebuilt"; }
+ok "T7: an image built from the current source is not rebuilt"
+
+echo "# changed" >>"${clone_dir}/agents/entrypoint.sh"
+HARNESS_NO_BUILD=1 ensure7
+(( rc7 == 0 )) && [[ -z "${out7}" ]] || { echo "${out7}" | sed 's/^/    /'; fail "T7: HARNESS_NO_BUILD=1 rebuilt an existing image"; }
+build_ok=0
+ensure7
+(( rc7 == 0 )) && grep -q "MARKER_COMPOSE --profile agent build agent" <<<"${out7}" \
+    && grep -q "launching the existing one" <<<"${out7}" \
+    || { echo "${out7}" | sed 's/^/    /'; fail "T7: a failed rebuild did not warn and keep the old image"; }
+build_ok=1
+ensure7
+(( rc7 == 0 )) && grep -q "updating harness-agent:latest" <<<"${out7}" \
+    || { echo "${out7}" | sed 's/^/    /'; fail "T7: a changed source did not rebuild the image"; }
+ensure7
+[[ -z "${out7}" ]] || fail "T7: the rebuilt image was rebuilt again"
+ok "T7: a changed source rebuilds it; a failed rebuild warns and keeps the old one"
+
+img_id="sha256:bbb"
+ensure7
+grep -q "updating harness-agent:latest" <<<"${out7}" \
+    || { echo "${out7}" | sed 's/^/    /'; fail "T7: an image built elsewhere was taken as current"; }
+ok "T7: an image built elsewhere (e.g. by an older harness) is rebuilt"
+clone_dir="${real_clone}"
 
 echo
 echo "HOST UPGRADE TEST PASSED (${pass} checks)"

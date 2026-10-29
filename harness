@@ -2776,14 +2776,15 @@ commands:
                         down + start (preserves per-invocation state).
                         Accepts the same flags as start.
   update                git pull --ff-only in the clone
-  upgrade [flags]       pull + apply manifest + rebuild images + restart
+  upgrade [flags]       pull + apply manifest + stack down + restarts; the
+                        next container launch rebuilds changed images
                         flags: --check (dry-run preview, no pull),
                                --no-prompt (skip apply confirmation),
-                               --no-restart (apply without build/down/start),
-                               --rebuild (compose build --no-cache; slower)
+                               --no-restart (apply without down/restarts),
+                               --rebuild (build now, --no-cache; slower)
   downgrade [flags]     reset the clone to the previous release tag, then run
-                        the upgrade machinery (config merge + rebuild + restart)
-                        so images match the older code. Stays on the branch, so
+                        the upgrade machinery (config merge + stack down +
+                        restarts) so the next launch runs the older code. Stays on the branch, so
                         a later 'update'/'upgrade' returns you to the tip.
                         flags: --no-prompt, --no-restart, --rebuild.
                         WARNING: 'git reset --hard' discards commits after the
@@ -3427,8 +3428,8 @@ cmd_upgrade() {
             --resume-after-pull) resume_after_pull=1 ;;
             -h|--help)
                 cat <<'EOF'
-harness upgrade — pull latest code, apply upgrade actions, rebuild the
-                  container images, take the container stack down.
+harness upgrade — pull latest code, apply upgrade actions, take the
+                  container stack down. Builds nothing unless --rebuild.
 
 usage:
   harness upgrade [--check] [--no-prompt] [--no-restart] [--rebuild]
@@ -3440,11 +3441,11 @@ flags:
                   Config merges still apply; hand-edited prompt-data files
                   (reminder.md, tool-guidance.json) are always left alone,
                   since replacing your prose unattended is never safe.
-  --no-restart    apply upgrade actions but skip the build and stack down,
+  --no-restart    apply upgrade actions but skip the stack down, --rebuild
                   and the restarts below.
-  --rebuild       force a clean rebuild (compose build --no-cache). Slower
-                  but bypasses any cache-poisoning from earlier failed
-                  builds.
+  --rebuild       build the container images now, clean (compose build
+                  --no-cache). Slower, but bypasses any cache-poisoning
+                  from earlier failed builds.
 
 What runs keeps running, on the new code: a host proxy is started again
 with the backend and prompt mode it had, a harness serve restarts itself in
@@ -3456,13 +3457,18 @@ interrupted.
 The container stack is taken down, not started again: the next container
 launch starts it on the new code, so an install used in host mode only never
 runs it. With container agents still working, the stack stays up for them and
-the first launch after they end starts it again. Only images this install has
-built are rebuilt; a first container launch builds the rest.
+the first launch after they end starts it again.
+
+Upgrade builds no images: the next container launch does, and only what
+changed. Starting the stack rebuilds the proxy and MCP images, and a launch
+rebuilds the agent image when agents/ or firewall/ changed since its last
+build. If that rebuild fails (offline, say), the launch warns and runs the
+old agent image.
 
 Upgrade actions are offered ONE AT A TIME, so you can take the new .env
 variables without taking a reminder rewrite. Enter accepts, 'a' accepts
 every remaining action, 'q' skips them all. Declining skips only the file
-merges — the upgrade still rebuilds images and restarts. Use Ctrl-C to
+merges — the upgrade still takes the stack down and restarts. Use Ctrl-C to
 abort entirely.
 
 If 'git pull' can't fast-forward because the clone's branch has diverged
@@ -3475,9 +3481,6 @@ action describes how a file harness manages inside the install root (which
 is the same directory as the clone, post-B4) is brought forward when the
 repo changes — env vars, firewall hostnames, MCP registry definitions.
 User-set values are NEVER overwritten.
-
-Image rebuild runs after manifest-apply so image-level changes (Dockerfile,
-proxy.py, agent entrypoint) take effect on the next container launch.
 
 Internal flag (do not pass manually): --resume-after-pull. Used when
 harness re-execs into the freshly-pulled script after 'git pull'
@@ -3675,8 +3678,9 @@ EOF
         harness_view_refresh
     fi
 
-    # Container path rebuilds images and takes the stack down so image-level
-    # changes take effect at the next launch. A host-only install has neither: the proxy runs from the
+    # Container path takes the stack down so the next launch starts it (and
+    # rebuilds changed images) on the new code. A host-only install has no
+    # stack: the proxy runs from the
     # now-updated clone and its venv refreshes lazily on the next 'harness host',
     # so there is nothing to rebuild — report and point the user at the relaunch.
     if (( host_only )); then
@@ -3691,31 +3695,22 @@ EOF
     if (( ! no_restart )); then
         _upgrade_stack_down
 
-        if harness_docker image inspect harness-proxy:latest >/dev/null 2>&1 \
-            || harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
-            # Rebuild images so image-level changes (Dockerfile, proxy.py, agent
-            # entrypoint) take effect. Without this, the existing local images
-            # are reused and the user runs stale containers without realizing
-            # (a launch builds the agent image only when it is missing). Only an
-            # install that has built them: one used in host mode only gets none,
-            # and a first container launch builds what is missing anyway.
-            # --rebuild adds --no-cache for a force-rebuild; otherwise BuildKit
-            # uses its layer cache and only changed layers are re-run.
-            local build_args=()
-            if (( rebuild )); then
-                build_args+=(--no-cache)
-            fi
-            echo "[harness] rebuilding container images..."
-            # --profile agent ensures the agent service (which is profile-gated
-            # in docker-compose.yml) is included in the rebuild set; without it,
-            # only default-profile services (proxy) get rebuilt and
-            # image-level changes to agents/Dockerfile or agents/entrypoint.sh
-            # silently slip past the upgrade.
-            if ! compose --profile agent build "${build_args[@]}"; then
+        # No build here: the stack start builds the proxy and MCP images
+        # (`up --build`), and a container launch rebuilds the agent image when
+        # agents/ or firewall/ changed (ensure_agent_image). --rebuild is the
+        # explicit "build now, no cache", e.g. past a poisoned layer cache.
+        # --profile agent puts the profile-gated agent service in the set.
+        if (( rebuild )); then
+            echo "[harness] rebuilding container images (no cache)..."
+            if ! compose --profile agent build --no-cache; then
                 err "compose build failed; aborting upgrade"
                 return 1
             fi
+            agent_image_built
+        fi
 
+        if harness_docker image inspect harness-proxy:latest >/dev/null 2>&1 \
+            || harness_docker image inspect harness-agent:latest >/dev/null 2>&1; then
             # Force docker compose to re-resolve every bind-mount source path
             # (notably .harness-allowlist) before the next `compose up`.
             # Why: on Windows + Docker Desktop, the linefile_merge step in
@@ -3732,13 +3727,11 @@ EOF
             # the daemon a chance to refresh that cache before the next `up`.
             # On Linux this is just YAML re-validation — effectively a no-op.
             compose config >/dev/null 2>&1 || true
-        else
-            echo "[harness] no container images built yet: the first container launch builds them."
         fi
         if [[ -f "$(stack_stale_file)" ]]; then
             echo "[harness] upgrade complete."
         else
-            echo "[harness] upgrade complete. The container stack is down; the next container launch starts it on the new code."
+            echo "[harness] upgrade complete. The container stack is down; the next container launch starts it on the new code, rebuilding the images whose files changed."
         fi
     fi
 }
@@ -3781,7 +3774,7 @@ _downgrade_target_tag() {
 cmd_downgrade() {
     # Move the clone's CURRENT branch back to the previous release tag with
     # `git reset --hard`, then re-run the upgrade machinery (config merge +
-    # rebuild + restart) so the running images match the older code. Staying on
+    # stack down + restarts) so what runs next is the older code. Staying on
     # the branch (rather than a detached tag checkout) is deliberate: a later
     # `harness update`/`upgrade` fast-forwards the user back to the tip with no
     # special detached-HEAD handling.
@@ -3794,7 +3787,7 @@ cmd_downgrade() {
             -h|--help)
                 cat <<'EOF'
 harness downgrade — reset the clone to the previous release tag, then run the
-                    upgrade machinery so the images match the older code.
+                    upgrade machinery so what runs next is the older code.
 
 usage:
   harness downgrade [--no-prompt] [--no-restart] [--rebuild]
@@ -3807,7 +3800,7 @@ Tags are resolved topologically (git describe), so any scheme works, including
 two-number tags like v0.1 / v1.0.
 
 After the reset it re-execs the downgraded 'harness upgrade
---resume-after-pull', so the same config merge + image rebuild + restart that
+--resume-after-pull', so the same config merge + stack down + restarts that
 'upgrade' runs are applied from the older code (config vars removed since the
 target release are merged back in).
 
@@ -3882,7 +3875,7 @@ EOF
     fi
 
     # Re-exec the DOWNGRADED harness's upgrade orchestration so the config
-    # merge + image rebuild + restart run from the older code we just reset to,
+    # merge + stack down + restarts run from the older code we just reset to,
     # not from this still-in-memory newer process. --resume-after-pull skips
     # the git pull (we moved HEAD ourselves). This mirrors cmd_upgrade's own
     # post-pull re-exec and relies on the same cross-version contract that
@@ -4302,6 +4295,49 @@ PY
 # entrypoint via /etc/skel/harness/.
 agent_image() { printf 'harness-agent:latest'; }
 agent_home_dir() { printf '%s' "$state_root/agent/home"; }
+
+# The agent image's source: every file under agents/ and firewall/ (its
+# Dockerfile and what that COPYs), names included so a rename counts.
+agent_image_fingerprint() {
+    (cd "$clone_dir" && find agents firewall -type f | LC_ALL=C sort \
+        | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done) | cksum | tr -d ' '
+}
+
+# Recorded after each good build of the agent image: its source fingerprint
+# and image id. The id makes a build from anywhere else (an older harness's
+# upgrade after a downgrade, a hand-run compose build) count as unknown.
+agent_image_record() {
+    local id
+    id=$(harness_docker image inspect -f '{{.Id}}' "$(agent_image)" 2>/dev/null) || return 0
+    printf '%s %s\n' "$(agent_image_fingerprint)" "$id"
+}
+agent_image_built() {
+    mkdir -p "$state_root" && agent_image_record >"$state_root/agent-image.src"
+}
+
+# Build the agent image when it is missing, or rebuild it when its source
+# changed since the last good build here, so the first container launch after
+# a git pull or upgrade runs the new code (upgrade itself builds nothing). A
+# failed rebuild with an old image present (offline, say) warns and keeps the
+# old one; a failed first build returns 1. HARNESS_NO_BUILD=1 builds only a
+# missing image: CI pre-builds its images.
+ensure_agent_image() {
+    local image
+    image=$(agent_image)
+    if harness_docker image inspect "$image" >/dev/null 2>&1; then
+        [[ "${HARNESS_NO_BUILD:-0}" == 1 ]] && return 0
+        [[ "$(cat "$state_root/agent-image.src" 2>/dev/null)" == "$(agent_image_record)" ]] && return 0
+        echo "harness: updating $image to the current agents/ and firewall/ code..." >&2
+        if ! compose --profile agent build agent; then
+            err "warning: rebuilding $image failed; launching the existing one, on older code"
+            return 0
+        fi
+    else
+        echo "harness: building $image (one-time)..." >&2
+        compose --profile agent build agent || return 1
+    fi
+    agent_image_built
+}
 
 # Write the merged MCP client config to <install-root>/state/agent/home/
 # .harness-mcp-servers.json so the entrypoint picks it up at startup. The
@@ -7257,10 +7293,20 @@ HELP
             args+=(--parallel "$parallel")
             # Tickets at a time in containers: the stack up before the first
             # stages launch together, so they do not each start it (a start
-            # takes the stack down first, under the other's agent).
-            if (( parallel > 1 && ! host )); then
+            # takes the stack down first, under the other's agent). The agent
+            # image is built here too, once, not by every slot's first stage.
+            if (( ! host )); then
                 require_docker
-                ensure_services_up || { if (( started )); then host_proxy_done; else host_proxy_release; fi; return 1; }
+                if ! ensure_agent_image; then
+                    err "agent image build failed; cannot launch the stages"
+                    rc=1
+                elif (( parallel > 1 )) && ! ensure_services_up; then
+                    rc=1
+                fi
+                if (( rc )); then
+                    if (( started )); then host_proxy_done; else host_proxy_release; fi
+                    return 1
+                fi
             fi
             # shellcheck disable=SC2086  # $py can be 'py -3'
             PYTHONUTF8=1 $py "$script" "${args[@]}" || rc=$?
@@ -8580,17 +8626,13 @@ run_agent() {
     # current set of enabled MCPs. Done after mkdir so the dir exists.
     write_agent_mcp_config
 
-    # Build image on demand if missing — different from the per-tool
-    # behavior pre-13a where `harness start` was the only build path.
-    # `harness <tool>` is the natural first command users try; auto-build
-    # avoids the "no, you have to run start first" dance.
-    if ! harness_docker image inspect "$image" >/dev/null 2>&1; then
-        echo "harness: building $image (one-time)..."
-        compose --profile agent build agent || {
-            err "agent image build failed; cannot launch $tool"
-            exit 1
-        }
-    fi
+    # Build the image on demand (missing, or its source changed): `harness
+    # <tool>` is the natural first command users try, and upgrade leaves the
+    # build to the first launch.
+    ensure_agent_image || {
+        err "agent image build failed; cannot launch $tool"
+        exit 1
+    }
 
     local network="${project_name}_harness-net"
 
@@ -9031,13 +9073,10 @@ cmd_shell() {
 
     local image
     image=$(agent_image)
-    if ! harness_docker image inspect "$image" >/dev/null 2>&1; then
-        echo "harness: building $image (one-time)..."
-        compose --profile agent build agent || {
-            err "agent image build failed; cannot launch shell"
-            exit 1
-        }
-    fi
+    ensure_agent_image || {
+        err "agent image build failed; cannot launch shell"
+        exit 1
+    }
 
     local agent_home
     agent_home=$(agent_home_dir)

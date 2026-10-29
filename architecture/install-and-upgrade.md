@@ -304,18 +304,21 @@ helper with `harness upgrade`.
    run viewer (`harness_view_refresh`). A queue run restarts itself between
    tickets (exit 75); a working agent is not interrupted. This runs before
    the host-only/container split, so both paths get it.
-4. Take the container stack down and rebuild its images; never start it
-   again (skippable via `--no-restart`). The next container launch's
+4. Take the container stack down; build nothing and never start it again
+   (skippable via `--no-restart`). The next container launch's
    `ensure_services_up` starts the stack on the new code, so a host-only or
    serve-only user is never left with containers they do not use.
    `_upgrade_stack_down` runs `harness down --remove-orphans` unless agent
    containers are still working (`running_agent_count`): those are never
    interrupted, the stack stays up on the old code, and `state/stack.stale`
    makes the first launch after the last of them ends restart it (see
-   harness-cli.md, "Last-agent stack teardown"). `compose --profile agent
-   build` runs only when the install has a `harness-proxy` or `harness-agent`
-   image already; one that never launched a container builds them at its
-   first launch.
+   harness-cli.md, "Last-agent stack teardown"). Images are left to the next
+   container launch, which rebuilds only what changed: `cmd_start`'s
+   `up --build` rebuilds the proxy and MCP images, and `ensure_agent_image`
+   rebuilds the agent image when `agents/` or `firewall/` changed (see
+   harness-cli.md, "Agent image"). `--rebuild` is the one build here:
+   `compose --profile agent build --no-cache`, then the agent image is
+   recorded as current.
 
 `--check` is the exception: it lists every action and dry-runs them all
 (full preview), bypassing the precheck.
@@ -327,8 +330,8 @@ takes a docker-free path instead of aborting at `require_docker`. It still
 pulls code (step 1, the only part `harness host` actually needs — `proxy.py`
 runs from the updated clone) and still merges `.env`/allowlist (steps 2–3),
 then prints `[harness] host-only upgrade complete.` and `return`s **before**
-the rebuild/restart block (step 4 is a no-op with no images to rebuild or
-containers to restart). The host venv is not touched here: it refreshes
+the stack-down block (step 4 is a no-op with no containers to take
+down). The host venv is not touched here: it refreshes
 lazily on the next `harness host` (it is sha-stamped against
 `proxy/requirements.txt`). The host toolchain (`state/host/toolchain`) is
 likewise untouched at upgrade time and re-provisions lazily on the next
@@ -365,8 +368,8 @@ Flags:
 
 - `--check` — preview only (no git pull, no writes).
 - `--no-prompt` — apply without the [y/n] confirmation.
-- `--no-restart` — apply without stack down/rebuild or the host restarts (e.g. for CI).
-- `--rebuild` — `compose build --no-cache`; slower.
+- `--no-restart` — apply without stack down, `--rebuild` or the host restarts (e.g. for CI).
+- `--rebuild` — build the images now, `compose build --no-cache`; slower.
 
 ## `harness downgrade` — move back to the previous release tag
 
@@ -390,7 +393,7 @@ Flow:
    strictly behind upstream, so a later `update`/`upgrade` fast-forwards back
    to the tip with no detached-HEAD special-casing.
 4. **Re-exec the downgraded `harness upgrade --resume-after-pull`** so the
-   config merge + image rebuild + restart run from the *older* code (and any
+   config merge + stack down + restarts run from the *older* code (and any
    config var removed since the target release is merged back in).
    `--resume-after-pull` skips the git pull (downgrade already moved HEAD).
    This reuses the same re-exec hand-off and cross-version `--resume-after-pull`
@@ -398,8 +401,11 @@ Flow:
    script, falling back to an in-process orchestration if it fails the check.
 
 Flags mirror `upgrade`: `--no-prompt` (skip the confirm — required for a
-non-interactive run), `--no-restart` (pure git reset, no rebuild; the only
-path that doesn't require docker), `--rebuild` (`--no-cache`). Because the
+non-interactive run), `--no-restart` (pure git reset, no stack down; the only
+path that doesn't require docker), `--rebuild` (`--no-cache`). The older
+harness's upgrade may build the agent image itself; the image id recorded with
+the source fingerprint makes the next launch on newer code rebuild it anyway.
+Because the
 branch is intentionally left behind the tip, the update banner will
 report "update available" after a downgrade — expected, not a bug.
 
@@ -408,8 +414,8 @@ report "update available" after a downgrade — expected, not a bug.
 `run_agent` (opencode) and `cmd_shell` call
 `_check_and_offer_config_merge` at startup, right after the update banner.
 It reuses the same precheck + merge functions as `harness upgrade`, but only
-for the two config files (`.env`, `.harness-allowlist`) — not the rebuild,
-restart, or MCP registry actions. Purpose: a plain `harness update` pulls new
+for the two config files (`.env`, `.harness-allowlist`) — not the stack
+down, restart, or MCP registry actions. Purpose: a plain `harness update` pulls new
 code that may introduce env vars / allowlist hosts without merging them; this
 surfaces the merge at the next agent launch instead of silently running on a
 stale config.
