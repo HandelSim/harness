@@ -1252,7 +1252,9 @@ What it does, in order:
    per-invocation flag), worded harder: host mode has no egress firewall and
    runs opencode as the full host user (full filesystem incl. `~/.ssh`/`~/.aws`,
    unfiltered network), a strictly bigger blast radius than `--net`.
-   `HARNESS_HOST_CONFIRM=1` bypasses it for automation; refuses non-interactive
+   `HARNESS_HOST_CONFIRM=1` bypasses it, from the environment or `.env` (an
+   exported 1, as the queue and serve set for their launches, wins over
+   `.env`'s value); refuses non-interactive
    without `/dev/tty`. This is why host mode exists as a separate, gated command
    rather than a flag on the normal launch. The agent's git never signs
    (`harness_git_nosign_env`: `GIT_CONFIG_COUNT` entries `commit.gpgsign` and

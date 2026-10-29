@@ -144,6 +144,9 @@ _harness_proxy_keys=(HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_p
 for _k in "${_harness_proxy_keys[@]}"; do
     printf -v "_harness_shell_$_k" '%s' "${!_k:-}"
 done
+# HARNESS_HOST_CONFIRM=1 exported by the caller (the queue and serve set it for
+# the launches they start, which have no terminal) wins over .env's value.
+_harness_shell_host_confirm="${HARNESS_HOST_CONFIRM:-}"
 
 # A .env value that carries a space or a shell metacharacter but is NOT quoted
 # does not survive `source`: bash ends the assignment at that character and
@@ -206,7 +209,8 @@ done
 # harness that didn't load it (HARNESS_SOURCE_ONLY). Guard so source-only
 # contexts don't abort under set -u/-e.
 command -v harness_normalize_proxy_env >/dev/null 2>&1 && harness_normalize_proxy_env
-unset _harness_proxy_keys _k _sv
+[[ "$_harness_shell_host_confirm" == 1 ]] && export HARNESS_HOST_CONFIRM=1
+unset _harness_proxy_keys _k _sv _harness_shell_host_confirm
 
 # The default/fallback model id. REQUIRED (no hardcoded default): once the
 # model passes through to the upstream, a cosmetic default would be a real
@@ -2291,6 +2295,7 @@ CHATGPT_BASE_URL|ChatGPT backend-api base URL, used only by 'harness chatgpt'
 CHATGPT_MODEL_NAME|model id the ChatGPT backend serves (e.g. gpt-5.6-terra)
 CHATGPT_COOKIE_STRING|ChatGPT session cookie (secret; shown masked)
 TRACKER_TOKEN|Jira personal access token, or email:api-token for Jira Cloud (secret; shown masked)
+HARNESS_HOST_CONFIRM|1 skips the y/N question before host mode (harness host / serve) starts
 EOF
 }
 

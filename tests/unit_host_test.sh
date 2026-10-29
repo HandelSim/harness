@@ -74,6 +74,20 @@ out=$( ( HARNESS_HOST_CONFIRM=1; host_confirm_gate 0 ) 2>&1 || true )
 grep -qi "auto-confirmed" <<<"$out" || fail "T3: expected auto-confirm notice — $out"
 ok "T3: host_confirm_gate auto-confirms via HARNESS_HOST_CONFIRM=1"
 
+# --- T3b: HARNESS_HOST_CONFIRM from .env; an exported 1 still wins ---------
+confirm_from_env() {  # $1: .env line, $2: exported value ("" = unset)
+    local root; root=$(mktemp -d "$TMP_ROOT/t3b.XXXXXX")
+    printf '%s\n' "$1" >"$root/.env"
+    ( unset HARNESS_HOST_CONFIRM; [[ -n "$2" ]] && export HARNESS_HOST_CONFIRM="$2"
+      HARNESS_SOURCE_ONLY=1 HARNESS_INSTALL_ROOT="$root" source "$HARNESS" 2>/dev/null
+      printf '%s' "${HARNESS_HOST_CONFIRM:-}" )
+}
+[[ "$(confirm_from_env HARNESS_HOST_CONFIRM=1 '')" == 1 ]] || fail "T3b: .env's HARNESS_HOST_CONFIRM=1 not read"
+[[ "$(confirm_from_env HARNESS_HOST_CONFIRM= 1)" == 1 ]] || fail "T3b: a blank .env value clobbered an exported 1"
+[[ "$(confirm_from_env HARNESS_HOST_CONFIRM=0 1)" == 1 ]] || fail "T3b: .env's 0 beat an exported 1 (queue/serve launches would prompt)"
+grep -q '^HARNESS_HOST_CONFIRM=$' "$REPO_ROOT/.env.example" || fail "T3b: .env.example must offer HARNESS_HOST_CONFIRM= (off)"
+ok "T3b: HARNESS_HOST_CONFIRM is read from .env, and an exported 1 wins over it"
+
 # --- T4: host_preflight fails clearly when deps are absent ------------------
 # Empty PATH => command -v finds none of python3/jq/node/opencode.
 out=$( ( PATH="/nonexistent-dir"; host_preflight ) 2>&1 || true )
