@@ -61,6 +61,13 @@ so it never writes what the run owns: notes go to KEY/notes.json (mirrored into
 state.json by every save), a stop or halt is a file (KEY/stop, DIR/halt) the run
 looks for every POLL seconds, and the run keeps DIR/run.json beating.
 
+run --parallel N works N tickets at a time: the run (holding run.lock and
+run.json) starts N slots, each a run of its own process (run --slot I, beating
+DIR/run-I.json) that takes tickets one at a time like a lone run. A slot takes
+no ticket another slot holds, nor one whose project folder another slot's
+ticket works in (in place, the folder is on one ticket's branch at a time), and
+the vault is committed by one slot at a time (DIR/vault.lock).
+
 harness never runs git inside the clone once the agent has had it: it fetches
 branch KEY into the project (refs/harness-queue/KEY), diffs there and pushes
 from there, without force. Nothing is ever written to the tracker.
@@ -319,7 +326,7 @@ def run_holds(q, key):
     a run that ended, or by one stuck elsewhere or frozen, is not in hand: the owner's commands
     change it themselves rather than leave it a request no run will read."""
     r = runner(q)
-    return r["running"] and r.get("ticket") == key and run_going(q)
+    return r["running"] and key in r["tickets"] and run_going(q)
 
 
 def stages_of(st):
@@ -2100,6 +2107,9 @@ def checkpoint(ctx):
     """Raise Interrupted when the owner asked the run (DIR/halt) or this ticket (KEY/stop) to stop."""
     if os.path.exists(ctx.q.sentinel()):
         raise Interrupted("halt")
+    parent = getattr(ctx, "parent", 0)
+    if parent and os.name != "nt" and os.getppid() != parent:   # a slot whose run was killed
+        raise Interrupted("halt")
     key = getattr(ctx, "key", "")
     if key and os.path.exists(ctx.q.sentinel(key)):
         raise Interrupted("stop")
@@ -2145,7 +2155,13 @@ def sync_vault(ctx, key, since):
         ctx.q.log(key, f"warning: could not write the log into the vault: {e}")
     st = ctx.q.load(key) or {"key": key, "project": ""}
     step(ctx, "saving the session into the vault")
-    r = run_quiet([BASH, ctx.harness, "queue", "_sync", key, workdir(ctx.q, st), str(since)], SYNC_TIMEOUT)
+    try:   # the slots of a parallel run commit the vault one at a time
+        with held(os.path.join(ctx.q.root, "vault.lock"), wait=SYNC_TIMEOUT):
+            r = run_quiet([BASH, ctx.harness, "queue", "_sync", key, workdir(ctx.q, st), str(since)], SYNC_TIMEOUT)
+    except Busy:
+        ctx.q.log(key, "warning: the session was not saved into the vault (another slot held the vault for "
+                       f"{SYNC_TIMEOUT}s); the ticket goes on")
+        return
     if r.returncode != 0:
         ctx.q.log(key, f"warning: the session was not saved into the vault (harness queue _sync: "
                        f"{(r.stderr or r.stdout).strip()[-300:] or 'exit ' + str(r.returncode)}); the ticket goes on")
@@ -3182,7 +3198,7 @@ def beat(ctx, **change):
             return
         ctx.run_info.update(change, beat=int(time.time()))
         try:
-            write_atomic(os.path.join(ctx.q.root, "run.json"), json.dumps(ctx.run_info) + "\n")
+            write_atomic(ctx.run_file, json.dumps(ctx.run_info) + "\n")
         except OSError:
             pass
 
@@ -3225,6 +3241,8 @@ def interrupted(ctx, st, e):
 
 
 def cmd_run(q, a):
+    if a.slot:   # a slot of a parallel run: the run that started it holds run.lock
+        return run_locked(q, a, time.time())
     lock = open(os.path.join(q.root, "run.lock"), "a")
     if not try_lock(lock):
         lock.close()
@@ -3232,7 +3250,7 @@ def cmd_run(q, a):
         return 1
     locked_at = time.time()
     try:   # released here, not whenever the file object is collected (an exception's frames can hold it)
-        return run_locked(q, a, locked_at)
+        return (run_parallel if a.parallel > 1 else run_locked)(q, a, locked_at)
     finally:
         unlock(lock)
         lock.close()
@@ -3243,19 +3261,35 @@ def run_locked(q, a, locked_at):
                              single=a.single_message, retries=a.retries, push=a.push == 1, remote=a.remote,
                              plan_review=a.plan_review == 1, stage_timeout=a.stage_timeout, child=None, key="",
                              beat_lock=threading.Lock(), beating=threading.Event(), outage_wait=max(0, a.outage_wait),
-                             idle_min=max(0.0, a.idle_min), watch=[w for w in a.watch if w], outage={})
+                             idle_min=max(0.0, a.idle_min), watch=[w for w in a.watch if w], outage={},
+                             slot=a.slot, parent=os.getppid() if a.slot else 0,
+                             run_file=os.path.join(q.root, f"run-{a.slot}.json" if a.slot else "run.json"))
     ctx.code = code_sig()
     ctx.model = a.model or resolve_model(a.proxy, a.default_model)
     if not ctx.model:
         print("[queue] no model: set QUEUE_MODEL or DEFAULT_MODEL_NAME", file=sys.stderr)
         return 1
     ctx.verify_model = (a.verify_model or ctx.model).split("/", 1)[-1]
+    if not a.slot:   # a parallel run did these for its slots
+        new_run(q, ctx.vault, locked_at)
+    ctx.run_info = {"pid": os.getpid(), "started": now_iso(), "beat": 0, "host": bool(ctx.host or ctx.single),
+                    "single": bool(ctx.single), "model": ctx.model, "ticket": "", "stage": "", "step": ""}
+    with beating_run(ctx):
+        return run_tickets(q, ctx)
+
+
+def new_run(q, vault, locked_at):
     at = mtime(q.sentinel())
     if at is not None and at < locked_at:   # a halt asked of a run that had already ended,
         drop(q.sentinel())                  # not one asked of this run as it started
-    keep_tasks_out(q, ctx.vault)
-    ctx.run_info = {"pid": os.getpid(), "started": now_iso(), "beat": 0, "host": bool(ctx.host or ctx.single),
-                    "single": bool(ctx.single), "model": ctx.model, "ticket": "", "stage": "", "step": ""}
+    keep_tasks_out(q, vault)
+    for info in slot_runs(q, all_files=True):   # a killed parallel run's
+        drop(os.path.join(q.root, f"run-{info['slot']}.json"))
+
+
+@contextlib.contextmanager
+def beating_run(ctx):
+    """ctx.run_file beating every BEAT seconds while the run goes, and gone after."""
     beat(ctx)
 
     def beats():
@@ -3263,14 +3297,48 @@ def run_locked(q, a, locked_at):
             beat(ctx)
     threading.Thread(target=beats, daemon=True).start()
     try:
-        return run_tickets(q, ctx)
+        yield
     finally:
         ctx.beating.set()
         with ctx.beat_lock:
             try:
-                os.remove(os.path.join(q.root, "run.json"))
+                os.remove(ctx.run_file)
             except OSError:
                 pass
+
+
+def run_parallel(q, a, locked_at):
+    """--parallel N: N slots, each a run in a process of its own (run --slot I) that
+    takes the queue's tickets one at a time; this process holds run.lock and beats
+    run.json for them. It ends when they all have: Ctrl-C reaches them too (each puts
+    its ticket back), a halt ends each at its next check, and after a harness upgrade
+    each ends after its ticket, and the run starts again on the new code (RESTART)."""
+    model = a.model or resolve_model(a.proxy, a.default_model)
+    if not model:
+        print("[queue] no model: set QUEUE_MODEL or DEFAULT_MODEL_NAME", file=sys.stderr)
+        return 1
+    new_run(q, os.path.abspath(a.vault), locked_at)
+    tidy(q)
+    ctx = argparse.Namespace(q=q, beat_lock=threading.Lock(), beating=threading.Event(),
+                             run_file=os.path.join(q.root, "run.json"))
+    ctx.run_info = {"pid": os.getpid(), "started": now_iso(), "beat": 0, "host": bool(a.host or a.single_message),
+                    "single": bool(a.single_message), "model": model, "ticket": "", "stage": "", "step": "",
+                    "parallel": a.parallel}
+    argv = [sys.executable, os.path.abspath(__file__), *a.argv[1:], "--model", model]
+    kids = []
+    with beating_run(ctx):
+        try:
+            for i in range(1, a.parallel + 1):
+                kids.append(subprocess.Popen([*argv, "--slot", str(i)]))
+            rcs = [k.wait() for k in kids]
+            drop(q.sentinel())   # a halt, seen by every slot
+        except KeyboardInterrupt:   # the slots have it too: wait for each to put its ticket back
+            for k in kids:
+                with contextlib.suppress(KeyboardInterrupt):
+                    k.wait()
+            print("\n[queue] interrupted; 'harness queue run' carries on from the same stage", file=sys.stderr)
+            return 130
+    return next((rc for rc in (130, RESTART, 3) if rc in rcs), max(rcs, default=0))
 
 
 TASK_IGNORE = "wiki/notes/tickets/*-task.md"
@@ -3305,6 +3373,10 @@ def take(ctx, key, pending, done):
         if not pending(key) or key not in q.order():
             return None, False
         st = q.load(key)
+        why = elsewhere(ctx, st)
+        if why:   # not this slot's to take; it waits for the other to be done
+            ctx.waiting = why
+            return None, False
         if WINDOWS and st.get("in_place") and not (ctx.host or ctx.single):
             # the container's Linux git would see every file of a CRLF checkout as changed
             done[key] = st.get("requeued", "")
@@ -3322,6 +3394,30 @@ def take(ctx, key, pending, done):
         q.save(st)
     done[key] = st.get("requeued", "")
     return st, orphan
+
+
+def elsewhere(ctx, st):
+    """A slot of a parallel run: why another slot keeps it off this ticket (that slot
+    has it, or a ticket that works in the same folder: in place, the project folder
+    is on one ticket's branch at a time), or ""."""
+    if not getattr(ctx, "slot", 0):
+        return ""
+    for r in slot_runs(ctx.q):
+        other = r.get("ticket")
+        if r["slot"] == ctx.slot or not other:
+            continue
+        if other == st["key"]:
+            return f"{other} is on slot {r['slot']}"
+        o = ctx.q.load(other)
+        if o and o.get("project") and overlaps(workdir(ctx.q, st), workdir(ctx.q, o)):
+            return f"waiting for {other} (slot {r['slot']}): it works in {workdir(ctx.q, o)}"
+    return ""
+
+
+def overlaps(a, b):
+    """The two folders are one, or one is inside the other."""
+    a, b = (os.path.normcase(os.path.realpath(x)) for x in (a, b))
+    return a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
 
 
 def tidy(q):
@@ -3342,7 +3438,8 @@ def run_tickets(q, ctx):
     def pending(k):
         s = q.load(k) or {}
         return s.get("status") in ("queued", "running") and done.get(k) != s.get("requeued", "")
-    tidy(q)
+    if not ctx.slot:   # a parallel run tidied for its slots
+        tidy(q)
     try:
         while True:
             ctx.key = ""
@@ -3354,13 +3451,20 @@ def run_tickets(q, ctx):
             todo = [k for k in q.order() if pending(k)]
             if not todo:
                 break
+            ctx.waiting = ""
             try:
-                st, orphan = take(ctx, todo[0], pending, done)
+                for k in todo:
+                    st, orphan = take(ctx, k, pending, done)
+                    if st is not None:
+                        break
             except Busy:   # an owner command holds it; it lets go within seconds
                 step(ctx, "waiting for the queue's lock")
                 pause(ctx, POLL)
                 continue
             if st is None:
+                if ctx.waiting:   # what is left is another slot's, or in its folder
+                    step(ctx, ctx.waiting)
+                    pause(ctx, POLL)
                 continue
             key = st["key"]
             if orphan:   # a run that is gone left its agent: ended before this one starts
@@ -3416,10 +3520,8 @@ def run_tickets(q, ctx):
                 ctx.key = ""
                 wait_out(ctx, outage)
     except Interrupted:   # halt: between tickets, or the ticket above went back to the queue
-        try:
-            os.remove(q.sentinel())
-        except OSError:
-            pass
+        if not ctx.slot:   # the other slots are to see it too: their run drops it
+            drop(q.sentinel())
         print("[queue] halted by the owner; 'harness queue run' carries on from the same stage", file=sys.stderr)
         return 0
     except Infra as e:
@@ -4070,13 +4172,17 @@ def end_run(q, a):
                   "end the python process running ticket_queue.py run by hand", file=sys.stderr)
             return 1
         # the run first: it would take its agent's end for a failed launch and go on
-        if os.name == "nt":
-            kill_tree(pid)
-        else:
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
-        if isinstance(agent, int) and agent > 0:
-            kill_tree(agent)   # the agent's session (Windows: its tree: bash, the docker client)
+        # (a parallel run: each slot is a run, then the run that started them)
+        for s in [*slot_runs(q, all_files=True), r]:
+            if s is not r and not (isinstance(s.get("pid"), int) and s["pid"] > 0):
+                continue
+            if os.name == "nt":
+                kill_tree(s["pid"])
+            else:
+                with contextlib.suppress(OSError):
+                    os.kill(s["pid"], signal.SIGKILL)
+            if isinstance(s.get("agent"), int) and s["agent"] > 0:
+                kill_tree(s["agent"])   # the agent's session (Windows: its tree: bash, the docker client)
         end = time.time() + 20
         while run_going(q) and time.time() < end:
             time.sleep(0.2)
@@ -4086,7 +4192,8 @@ def end_run(q, a):
         print(f"[queue] ended the run (process {pid})")
     else:
         print("[queue] no queue run is going")
-    for path in (q.sentinel(), os.path.join(q.root, "run.json")):
+    for path in (q.sentinel(), os.path.join(q.root, "run.json"),
+                 *(os.path.join(q.root, f"run-{s['slot']}.json") for s in slot_runs(q, all_files=True))):
         drop(path)
     left = []
     with held(os.path.join(q.root, "queue.lock")):
@@ -4171,16 +4278,43 @@ def edit(path):
 
 
 def runner(q):
-    """run.json with "running": a beat within the last 30 s."""
-    try:
-        info = json.loads(read(os.path.join(q.root, "run.json")) or "null")
-    except ValueError:
-        info = None
-    if not isinstance(info, dict):
-        return {"running": False}
-    beat_at = info.get("beat")
-    info["running"] = isinstance(beat_at, (int, float)) and time.time() - beat_at < 30
+    """run.json with "running": a beat within the last 30 s; "slots": a parallel
+    run's slots that beat (run-I.json, "slot": I); "tickets": the tickets in hand."""
+    info = run_file(os.path.join(q.root, "run.json"))
+    if info is None:
+        return {"running": False, "slots": [], "tickets": []}
+    info["running"] = beating(info)
+    info["slots"] = slot_runs(q) if info["running"] and info.get("parallel") else []
+    info["tickets"] = [t for t in [info.get("ticket")] + [s.get("ticket") for s in info["slots"]] if t]
     return info
+
+
+def run_file(path):
+    try:
+        info = json.loads(read(path) or "null")
+    except (OSError, ValueError):
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def beating(info):
+    beat_at = info.get("beat")
+    return isinstance(beat_at, (int, float)) and time.time() - beat_at < 30
+
+
+SLOT_FILE = re.compile(r"run-(\d+)\.json")
+
+
+def slot_runs(q, all_files=False):
+    """The slots of a parallel run that beat (all_files: every run-I.json there is), by slot."""
+    out = []
+    for name in os.listdir(q.root) if os.path.isdir(q.root) else ():
+        m = SLOT_FILE.fullmatch(name)
+        info = run_file(os.path.join(q.root, name)) if m else None
+        if info is not None and (all_files or beating(info)):
+            info["slot"] = int(m.group(1))
+            out.append(info)
+    return sorted(out, key=lambda i: i["slot"])
 
 
 def cmd_status(q, a):
@@ -4195,7 +4329,12 @@ def cmd_status(q, a):
                 tickets.append(st)
         print(json.dumps({"runner": r, "tickets": tickets}, indent=2))
         return 0
-    if r["running"]:
+    if r["running"] and r.get("parallel"):
+        print(f"run: going (pid {r.get('pid')}), {r['parallel']} tickets at a time")
+        for s in r["slots"]:
+            doing = f"{s.get('ticket') or 'between tickets'} {s.get('stage') or ''}".rstrip()
+            print(f"  slot {s['slot']} (pid {s.get('pid')}): {doing}" + (f": {s['step']}" if s.get("step") else ""))
+    elif r["running"]:
         doing = f"{r.get('ticket') or 'between tickets'} {r.get('stage') or ''}".rstrip()
         print(f"run: going (pid {r.get('pid')}): {doing}" + (f": {r['step']}" if r.get("step") else ""))
     else:
@@ -4317,7 +4456,10 @@ def main(argv):
     s.add_argument("--outage-wait", type=int, default=OUTAGE_WAIT)   # seconds; 0: an outage ends the run
     s.add_argument("--idle-min", type=float, default=IDLE_MIN)       # 0: no idle watchdog
     s.add_argument("--watch", action="append", default=[])           # files the agent writes as it works
+    s.add_argument("--parallel", type=int, default=1)                # tickets at a time
+    s.add_argument("--slot", type=int, default=0, help=argparse.SUPPRESS)   # one of a parallel run's slots
     a = p.parse_args(argv[1:])
+    a.argv = argv
     q = Queue(a.state)
     try:
         return {"add": cmd_add, "list": cmd_list, "status": cmd_status, "remove": cmd_remove, "approve": cmd_approve,
