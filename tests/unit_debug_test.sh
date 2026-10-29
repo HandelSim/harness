@@ -113,9 +113,9 @@ t2=$(
     harness_jq -cn --argjson o "$j" '{agent: {yolo: {permission: {edit: "allow", bash: {"*": "allow"}}}}} * $o
         | .agent.yolo.permission | (.bash | keys_unsorted[0]) == "*" and .bash["*"] == "ask" and .edit["*"] == "ask"' \
         | grep -qx true || fail "T2: merged over the yolo agent"
-    echo done
+    echo passed
 )
-[[ "$t2" == done ]] || fail "T2: $t2"
+[[ "$t2" == passed ]] || fail "T2: $t2"
 ok "T2: debug_opencode_config is read-only (ask, deny under -p) on every primary agent"
 
 # --- T3: no vault, no ticket ---------------------------------------------------------
