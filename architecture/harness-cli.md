@@ -1016,8 +1016,17 @@ checked as it is ("made no progress"). The agent's result is saved as
 never launches it again: a verifier failure blocks with "verifier failed at
 STAGE ... retry KEY", and a plain retry checks the kept work again (at the
 plan stage too). A change's verdict needs `met: true` for each criterion. A
-stage that runs past its timeout is blocked, not retried: a container
-launch can outlive its stopped client. The running agent is in
+stage that runs past `--stage-timeout` (`QUEUE_STAGE_TIMEOUT`, 3 h) is
+stopped and its work checked as it is, like an idle one; a failed check is
+an attempt, and its retry is a new agent told to finish the work. It is
+blocked instead when its container may still be running (`_stop_agents`
+could not say), since a container launch can outlive its stopped client. On
+Windows each launch (and each `run_quiet` command) is in a job object of
+its own (`spawn`), and `stop` ends the job: `taskkill /T` follows parent
+ids and misses a process whose parent is gone. A `_sync` that gets no
+answer in `SYNC_TIMEOUT` (600 s) makes the run skip its saves for
+`SYNC_BACKOFF` (30 min); the next one captures 30 days of sessions, so
+nothing is lost. The running agent is in
 `state.json` as `agent {pid, launch, host, container, workdir}`; `run`,
 `retry`, `remove` and `stop` first end one a dead run left (`reap`,
 `is_agent`: the pid still leads that launch). The container launch gets
@@ -2233,8 +2242,14 @@ working model path, so when the launch itself fails without a report,
   redacted, if no report was written. `debug_scrub` replaces, longest
   first, every `.env` value of 4+ chars (not numbers or common words such
   as `true`/`hybrid`) with `[KEY]`, a URL value's host with `[KEY host]`,
-  `doctor_redact`'s `abcd...wxyz` form of a secret, vault names/urls and
-  `tickets.list` folders/keys, and the hostname; then the install root
+  `doctor_redact`'s `abcd...wxyz` form of a secret, vault names/urls,
+  `tickets.list` folders/keys, the queue's tickets (`state/queue/*/state.json`:
+  the key, the project folder in its `\`, `/` and MSYS `/c/` forms, a
+  project or nested repo name of 5+ chars, branch/start/base unless a commit;
+  parsed with `host_python_bin`, keys only without one), and the hostname;
+  `main`/`master`/`develop`/`trunk` are kept. The prompt
+  (`debug_agent.md`, Privacy) is the main guard against file names and
+  project text, which no list can know; then the install root
   becomes `<harness>`, a path under `$HOME` (or `~/`) becomes `~/<path>`
   unless its first part is a dot dir (`~/.local/share/opencode` names a
   tool, not a project), and `$HOME` becomes `~`.

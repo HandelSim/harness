@@ -42,6 +42,10 @@ if args and args[0] == "queue":
         log.write("stop-launch " + args[3] + "\n")
         print(os.environ.get("FAKE_STOPPED", "1"))
         sys.exit(int(os.environ.get("FAKE_STOP_RC", "0")))
+    if args[1] == "_sync" and os.environ.get("FAKE_SYNC_HANG"):
+        import time
+        log.flush()
+        time.sleep(int(os.environ["FAKE_SYNC_HANG"]))
     if args[1] == "_pull":
         os.makedirs(os.path.join(vault, ".raw", "tickets"), exist_ok=True)
         open(os.path.join(vault, ".raw", "tickets", args[2] + ".md"), "w").write(os.environ["FAKE_TICKET"])
@@ -78,7 +82,8 @@ if os.environ.get("FAKE_EXIT"):   # N:RC: the first N launches die at once, havi
         print("launch failed: no container runtime")
         sys.exit(int(rc))
 if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == ticket \
-        and os.environ.get("FAKE_SLEEP_STAGE", stage) == stage:
+        and os.environ.get("FAKE_SLEEP_STAGE", stage) == stage \
+        and not (os.environ.get("FAKE_SLEEP_ONCE") and os.path.exists(os.environ["FAKE_CALLS"] + ".sleeping")):
     import time
     open(os.environ["FAKE_CALLS"] + ".sleeping", "a").write(ticket + "\n")
     if os.environ.get("FAKE_SLEEP_NESTED"):   # a commit there, then stopped while it sleeps
@@ -934,13 +939,15 @@ class ReviewFixesTest(Base):
         self.assertIn("1. GIVEN the project WHEN the change is in THEN a file feature.txt says hello feature", prompt)
         self.assertNotIn("Nothing at all", prompt)
 
-    def test_a_timed_out_stage_is_blocked_not_retried(self):
+    def test_a_timed_out_stage_is_checked_and_retried_then_blocked(self):
         os.environ["FAKE_SLEEP"] = "30"
         self.add("ABC-1")
         rc, out = self.run_queue("--stage-timeout", "1")
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "plan"), out)
         self.assertIn("ran past 1s", st["reason"])
+        self.assertEqual(cat(self.calls + ".sleeping").split(), ["ABC-1", "ABC-1"])   # an attempt, retried once
+        self.assertNotIn("agent", st)
 
     def test_a_failed_verifier_request_is_not_an_outage(self):
         FakeProxy.mode = "reject"
@@ -2640,6 +2647,73 @@ class StallTest(Base):
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("queued", "plan"), out)
         self.assertIn("made no progress", st["reason"])
+
+    def test_a_timed_out_agent_with_its_work_done_is_checked_and_passes(self):
+        os.environ.update(FAKE_HANG_AFTER="60", FAKE_HANG_STAGE="implementing")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--stage-timeout", "5")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertIn("ran past 5s (QUEUE_STAGE_TIMEOUT) and was stopped; its work is checked as it is",
+                      cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertEqual(cat(self.calls + ".implementing").count("====="), 1)   # not run again
+
+    def test_a_timed_out_agent_that_did_not_finish_is_retried_told_to_finish(self):
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_STAGE="implementing", FAKE_SLEEP_ONCE="1")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--stage-timeout", "5")
+        self.assertEqual(rc, 0, out)
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        failed = [h for h in st["history"] if h["stage"] == "implement" and h["result"] == "failed"]
+        self.assertEqual(len(failed), 1, st["history"])
+        self.assertIn("ran past 5s (QUEUE_STAGE_TIMEOUT) and was stopped before it finished", failed[0]["details"][0])
+        prompt = cat(self.calls + ".implementing")
+        self.assertIn("was cut off before it finished: it ran past the stage's 5s limit", prompt)
+        self.assertNotIn("--session", " ".join(self.calls_of("implementing")))   # a new agent
+
+    def test_a_timed_out_agent_whose_container_may_still_run_blocks(self):
+        os.environ.update(FAKE_HANG_AFTER="60", FAKE_HANG_STAGE="implementing", FAKE_STOP_RC="1")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--stage-timeout", "5")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
+        self.assertIn("container may still be running", st["reason"])
+        self.assertEqual(st["agent"]["launch"], st["launch_id"])   # on record for the next run, retry or stop
+        self.assertFalse([pr for _, _, pr in FakeProxy.seen if "check a code change" in pr])
+
+    def test_a_vault_save_that_hangs_skips_the_runs_next_saves(self):
+        os.environ["FAKE_SYNC_HANG"] = "30"
+        self.add("ABC-1")
+        with mock.patch.object(tq, "SYNC_TIMEOUT", 1):
+            rc, out = self.run_queue()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["status"], "done", out)
+        self.assertEqual(len(self.calls_of("queue _sync")), 1)
+        log = cat(os.path.join(self.state, "ABC-1", "log.md"))
+        self.assertIn("no answer in 1s", log)
+        self.assertIn("so the run skips them until", log)
+
+    def test_windows_stop_ends_the_agents_job(self):
+        k = mock.Mock()
+        k.CreateJobObjectW.return_value, k.OpenProcess.return_value = 5, 9
+        k.AssignProcessToJobObject.return_value = k.TerminateJobObject.return_value = 1
+        with mock.patch.object(tq.os, "name", "nt"), mock.patch.object(tq, "kernel32", return_value=k), \
+                mock.patch.object(tq, "kill_tree") as kill_tree:
+            p = tq.spawn(["true"])
+            p.wait(timeout=10)
+            self.assertEqual(p.job, 5)
+            k.CloseHandle.assert_called_once_with(9)   # the process handle; the job stays open
+            tq.stop(p)
+            k.TerminateJobObject.assert_called_once_with(5, 1)
+            self.assertIsNone(p.job)
+            kill_tree.assert_not_called()
+            k.AssignProcessToJobObject.return_value = 0   # no job (it could not be made): taskkill /T
+            p = tq.spawn(["true"])
+            p.wait(timeout=10)
+            self.assertIsNone(p.job)
+            tq.stop(p)
+            kill_tree.assert_called_once_with(p.pid)
 
     def broken_verifier(self, mode):
         self.add("ABC-1")

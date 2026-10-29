@@ -99,7 +99,7 @@ opencode (agent) --/v1/chat/completions--> proxy (Flask, proxy/proxy.py) --> ups
 | Usage ledger | `state/output/usage.jsonl` |
 | MCP services | `state/mcp/<name>/` (compose file, data; host MCPs log to `server.log`) |
 | `harness serve` | `state/serve/` (`pub.log`, `opencode.log`, `viewer.log`) |
-| Ticket queue | `state/queue/run.log`, `state/queue/<KEY>/log.md` |
+| Ticket queue | `state/queue/run.log`, `state/queue/<ticket>/log.md` (`state.json`, stage output `*.out`) |
 | Firewall config | `.harness-allowlist`, `.harness-net-overrides.json` |
 | Compose override | `state/.harness-runtime.yml` |
 
@@ -141,7 +141,7 @@ from there. Keep it short; a developer should understand it in a minute.
 
 **Symptom:** <what the user saw, with the exact error text, redacted>
 
-**Root cause:** <the mechanism, with code references like `harness:1234` or `proxy/proxy.py:567` (paths relative to the harness repo)>
+**Root cause:** <the mechanism, with code references like `harness:1234` or `proxy/proxy.py:567` (paths relative to the harness repo, the only file names the report gives)>
 
 **Evidence:**
 - <short log excerpt or command output, trimmed to the relevant line(s)>
@@ -162,11 +162,26 @@ problem and nothing else.
   ("`PROXY_API_URL` has no scheme", "`DEFAULT_MODEL_NAME` is not in the
   catalog"). Never its value: no API keys, tokens, cookies, upstream URLs or
   hostnames, model names, proxy settings or ports the user set.
-- **Nothing about the user's project.** No project, repo, vault or ticket
-  names, no paths into it, no file contents, code, prompts or conversation
-  text from it. If the project triggered the bug, describe the trigger
-  generically ("a tool call whose argument contains a literal newline").
+- **Nothing about the user's project.** The logs are full of it: ticket
+  keys, project and repo names, branch names, vault names, the project's
+  file names and paths, its language and build tools, ticket text, plans,
+  commit messages, prompts and conversation. None of that goes in the
+  report, not in the timeline, the evidence or the summary. Say what
+  happened to harness and describe the project's part generically:
+  - "a queue ticket", "the project", "a source file", "the agent's build
+    and test runs", never the key, the name or the file;
+  - a harness path that holds a project name gets a placeholder:
+    `state/queue/<ticket>/implement-0.out`, `<project>/.git`;
+  - the project's language or toolchain only when it is the cause ("a
+    Windows build tool that keeps a file open"), and then as a kind, not a
+    name from the project.
+  If the project triggered the bug, describe the trigger generically ("a
+  tool call whose argument contains a literal newline").
 - **No personal details.** Write home paths as `~`, the install root as
   `<harness>`; no usernames, hostnames or IP addresses of this machine.
 - **Trim log excerpts** to the lines that show the fault and redact anything
   above from them. Prefer a paraphrase to a long excerpt.
+
+Before you finish, reread `report.md` line by line for a ticket key, a
+project, branch or file name, or text from the project, and take it out.
+Harness redacts the names it knows as a backstop, not as the check.

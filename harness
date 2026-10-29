@@ -7094,8 +7094,10 @@ listed, then the ticket is blocked; each attempt and why it failed is on the
 ticket's page and in harness queue log KEY. If the upstream stops answering
 (or a launch dies at once), the ticket keeps its place and the run waits,
 looking again after 2, 5, 10 and then every 30 min, for up to QUEUE_OUTAGE_WAIT;
-a halt ends the wait. An agent that changes nothing for QUEUE_IDLE_MIN minutes
-is stopped (its attempt fails, unless the upstream is down). A verifier that
+a halt ends the wait. An agent that changes nothing for QUEUE_IDLE_MIN minutes,
+or still runs after QUEUE_STAGE_TIMEOUT seconds, is stopped and its work
+checked as it is (a failed check is an attempt; an idle agent with the upstream
+down is an outage). A verifier that
 cannot answer blocks the ticket with the agent's work kept: retry KEY asks the
 verifier again without running the agent. The outcome (pushed, kept local,
 refused; commits, diffstat, a pull-request link) is in state.json and
@@ -7110,7 +7112,8 @@ is a -withtools one), QUEUE_VERIFY_MODEL (default: QUEUE_MODEL), QUEUE_RETRIES
 QUEUE_PLAN_REVIEW (0: each ticket's own choice, which by default waits for
 'harness queue approve'; 1 holds every plan, --no-plan-approval ones too),
 QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
-0 turns the idle watchdog off), QUEUE_PARALLEL (1; tickets a run works at a time,
+0 turns the idle watchdog off), QUEUE_STAGE_TIMEOUT (10800 s; one agent
+launch at most), QUEUE_PARALLEL (1; tickets a run works at a time,
 the same as run --parallel N).
 HELP
             return 0 ;;
@@ -7285,6 +7288,7 @@ HELP
                    --retries "${QUEUE_RETRIES:-1}" --push "${QUEUE_PUSH:-1}"
                    --remote "${QUEUE_REMOTE:-origin}" --plan-review "${QUEUE_PLAN_REVIEW:-0}"
                    --outage-wait "${QUEUE_OUTAGE_WAIT:-21600}" --idle-min "${QUEUE_IDLE_MIN:-20}"
+                   --stage-timeout "${QUEUE_STAGE_TIMEOUT:-10800}"
                    # the session databases a working agent writes to: its idle watchdog watches them
                    --watch "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
                    --watch "$(agent_home_dir)/.local/share/opencode/opencode.db")
@@ -11198,7 +11202,7 @@ _debug_scrub_skip() {
     case "${1,,}" in
         true|false|yes|no|on|off|none|auto|null|default|hybrid|single|\
         passthrough|user_front|harness|opencode|proxy|container|host|docker|\
-        podman|localhost|http|https) return 0 ;;
+        podman|localhost|http|https|main|master|develop|trunk) return 0 ;;
     esac
     [[ "$1" =~ ^[0-9]+$ ]]
 }
@@ -11206,9 +11210,10 @@ _debug_scrub_skip() {
 # The "<length>\t<value>\t<label>" lines debug_scrub replaces, unsorted: every
 # .env value (and its host when it is a URL, and doctor_redact's
 # "abcd...wxyz" form of a secret), the vault names and urls, the remembered
-# ticket folders and keys, and this machine's hostname.
+# ticket folders and keys, the queue's tickets (key, project folder and its
+# name, branch), and this machine's hostname.
 _debug_scrub_pairs() {
-    local key val host name url d k
+    local key val host name url d k py label
     if [[ -f "$env_file" ]]; then
         while IFS= read -r key; do
             val=$(_config_read_key "$key")
@@ -11237,6 +11242,48 @@ _debug_scrub_pairs() {
             [[ -n "$d" ]] && printf '%d\t%s\t[project folder]\n' "${#d}" "$d"
             [[ -n "$k" ]] && printf '%d\t%s\t[ticket]\n' "${#k}" "$k"
         done < "$(_ticket_list)"
+    fi
+    for d in "$state_root"/queue/*/state.json; do
+        [[ -f "$d" ]] || continue
+        k="${d%/state.json}"; k="${k##*/}"
+        printf '%d\t%s\t[ticket]\n' "${#k}" "$k"
+    done
+    if [[ -d "$state_root/queue" ]] && read -ra py <<<"$(host_python_bin)" && (( ${#py[@]} )); then
+        while IFS=$'\t' read -r val label; do
+            (( ${#val} >= 4 )) && ! _debug_scrub_skip "$val" \
+                && printf '%d\t%s\t[%s]\n' "${#val}" "$val" "$label"
+        done < <("${py[@]}" - "$state_root/queue" 2>/dev/null <<'PY' || true
+import glob, json, os, re, sys
+for f in glob.glob(os.path.join(sys.argv[1], "*", "state.json")):
+    try:
+        st = json.load(open(f, encoding="utf-8"))
+    except (OSError, ValueError):
+        continue
+    out, names = [], []
+    p = str(st.get("project") or "").rstrip("/\\")
+    if p:
+        fwd = p.replace("\\", "/")
+        drive = re.match(r"([A-Za-z]):/(.*)", fwd)   # C:/x is /c/x to MSYS tools
+        for v in {p, fwd, p.replace("/", "\\")} | ({"/%s/%s" % (drive[1].lower(), drive[2])} if drive else set()):
+            out.append((v, "project folder"))
+        names.append(p)
+    for rel, want in (st.get("repos") or {}).items():
+        names.append(str(rel))
+        if isinstance(want, dict):
+            out.append((str(want.get("branch") or ""), "branch"))
+    for n in names:   # a short name would also hit words of harness's own
+        n = re.split(r"[/\\]", n.rstrip("/\\"))[-1]
+        if len(n) >= 5:
+            out.append((n, "project"))
+    for k in ("branch", "start", "base"):
+        v = str(st.get(k) or "")
+        if not re.fullmatch(r"[0-9a-f]{7,40}", v):   # a commit says nothing about the project
+            out.append((v, "branch"))
+    for v, label in out:
+        if v and "\t" not in v and "\n" not in v:
+            print(v + "\t" + label)
+PY
+        )
     fi
     host=$(uname -n 2>/dev/null || true)
     if (( ${#host} >= 4 )) && ! _debug_scrub_skip "$host"; then

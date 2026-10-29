@@ -96,6 +96,7 @@ PROMPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_prompt
 STAGE_TIMEOUT = 3 * 3600   # one agent launch; a cooperative turn alone can take 15 minutes
 VERIFY_TIMEOUT = 600
 SYNC_TIMEOUT = 600         # harness queue _sync: a session into the vault, and its commit
+SYNC_BACKOFF = 1800        # after a _sync that got no answer in SYNC_TIMEOUT, the run's next ones skip this long
 PULL_TIMEOUT = 300         # harness queue _pull: the ticket from the tracker
 PUSH_TIMEOUT = 600
 # The upstream does not answer: the ticket goes back to the queue and the run waits,
@@ -647,7 +648,7 @@ def run_quiet(cmd, timeout, cwd=None, env=None):
     start. Never raises for the command's sake."""
     with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
         try:
-            p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe, **NEW_GROUP)
+            p = spawn(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe)
         except OSError as e:
             return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: {e}")
         try:
@@ -658,6 +659,8 @@ def run_quiet(cmd, timeout, cwd=None, env=None):
         except BaseException:   # Ctrl-C: it is in its own session and did not get it
             stop(p, grace=5)
             raise
+        finally:
+            release(p)
         out = []
         for f in (fo, fe):   # as text=True reads a pipe: utf-8, universal newlines
             f.seek(0)
@@ -1939,8 +1942,8 @@ def launch(ctx, st, cmd, out, since, card=None):
     look = min(60.0, idle / 4) if idle else 0
     step(ctx, "the agent is working")
     with open(out, "w", encoding="utf-8") as f:
-        p = subprocess.Popen(cmd, cwd=workdir(ctx.q, st), stdin=subprocess.DEVNULL,
-                             stdout=f, stderr=subprocess.STDOUT, env=env, **NEW_GROUP)
+        p = spawn(cmd, cwd=workdir(ctx.q, st), stdin=subprocess.DEVNULL,
+                  stdout=f, stderr=subprocess.STDOUT, env=env)
         ctx.child = p
         beat(ctx, agent=p.pid, launch=st["launch_id"])   # halt --force ends it (and its container) with the run
         # a run that dies leaves this behind: the next run (or retry, remove, stop) ends that agent
@@ -1964,10 +1967,13 @@ def launch(ctx, st, cmd, out, since, card=None):
                         notes_at = mtime(ctx.q.notes_path(key))
                         ctx.q.save(st)
                     now = time.monotonic()
-                    if now >= end:
+                    if now >= end:   # its work is checked as it is, unless its container may still run
                         stop(p)
-                        stop_containers(ctx, st)
+                        keep = not stop_containers(ctx, st)
                         rc = 124
+                        ctx.q.log(key, f"the agent ran past {ctx.stage_timeout}s (QUEUE_STAGE_TIMEOUT) and was "
+                                       "stopped" + ("; its container may still be running" if keep else
+                                                    "; its work is checked as it is"))
                     elif look and now >= next_look:
                         next_look = now + look
                         got = activity(ctx, st, out, gitdir)
@@ -1987,6 +1993,7 @@ def launch(ctx, st, cmd, out, since, card=None):
             keep = not stop_containers(ctx, st)
             raise
         finally:
+            release(p)
             ctx.child = None
             if not keep:
                 st.pop("agent", None)
@@ -2158,6 +2165,11 @@ def sync_vault(ctx, key, since):
                          f"verdict.\n\n{fence}text\n{log.rstrip()}\n{fence}\n")
     except OSError as e:
         ctx.q.log(key, f"warning: could not write the log into the vault: {e}")
+    hung = getattr(ctx, "sync_hung", 0)
+    if hung and time.time() - hung < SYNC_BACKOFF:   # nothing lost: the next save takes 30 days of sessions
+        ctx.q.log(key, f"the session is not saved into the vault now: a save got no answer in {SYNC_TIMEOUT}s at "
+                       f"{hhmm(hung)}, so the run skips them until {hhmm(hung + SYNC_BACKOFF)}; a later save catches up")
+        return
     st = ctx.q.load(key) or {"key": key, "project": ""}
     step(ctx, "saving the session into the vault")
     try:   # the slots of a parallel run commit the vault one at a time
@@ -2167,6 +2179,8 @@ def sync_vault(ctx, key, since):
         ctx.q.log(key, "warning: the session was not saved into the vault (another slot held the vault for "
                        f"{SYNC_TIMEOUT}s); the ticket goes on")
         return
+    if r.returncode == 124:
+        ctx.sync_hung = time.time()
     if r.returncode != 0:
         ctx.q.log(key, f"warning: the session was not saved into the vault (harness queue _sync: "
                        f"{(r.stderr or r.stdout).strip()[-300:] or 'exit ' + str(r.returncode)}); the ticket goes on")
@@ -2182,10 +2196,68 @@ NEW_GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name =
              else {"start_new_session": True})
 
 
+_KERNEL32 = []
+
+
+def kernel32():
+    """Windows' kernel32 with the job object calls typed (a HANDLE is 64 bits); None elsewhere."""
+    if os.name != "nt":
+        return None
+    if not _KERNEL32:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        for name, res, args in (("CreateJobObjectW", wintypes.HANDLE, (wintypes.LPVOID, wintypes.LPCWSTR)),
+                                ("OpenProcess", wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)),
+                                ("AssignProcessToJobObject", wintypes.BOOL, (wintypes.HANDLE, wintypes.HANDLE)),
+                                ("TerminateJobObject", wintypes.BOOL, (wintypes.HANDLE, wintypes.UINT)),
+                                ("CloseHandle", wintypes.BOOL, (wintypes.HANDLE,))):
+            f = getattr(k, name)
+            f.restype, f.argtypes = res, args
+        _KERNEL32.append(k)
+    return _KERNEL32[0]
+
+
+def spawn(cmd, **kw):
+    """Popen in a session of its own (NEW_GROUP); on Windows also in a job object of
+    its own (p.job), which everything it starts joins: stop() ends the job, so a
+    process whose parent is gone (MSYS bash's children, a detached opencode) is
+    ended too, where taskkill /T, which follows parent ids, no longer finds it."""
+    p = subprocess.Popen(cmd, **kw, **NEW_GROUP)
+    p.job = None
+    k = kernel32()
+    if k:
+        with contextlib.suppress(OSError):
+            job = k.CreateJobObjectW(None, None)
+            h = k.OpenProcess(0x0101, False, p.pid) if job else None   # PROCESS_TERMINATE | PROCESS_SET_QUOTA
+            if h and k.AssignProcessToJobObject(job, h):
+                p.job = job
+            elif job:
+                k.CloseHandle(job)
+            if h:
+                k.CloseHandle(h)
+    return p
+
+
+def release(p):
+    """Close p's job (its processes go on: only stop() ends them)."""
+    job, p.job = getattr(p, "job", None), None
+    if job:
+        with contextlib.suppress(OSError):
+            kernel32().CloseHandle(job)
+
+
 def stop(p, grace=30):
     """End p and everything it started (it runs in its own session, NEW_GROUP)."""
-    if os.name == "nt":  # no killpg or SIGKILL: taskkill /T ends bash and everything it started
-        kill_tree(p.pid)
+    if os.name == "nt":  # no killpg or SIGKILL: its job ends everything in it; else taskkill /T, by parent ids
+        job = getattr(p, "job", None)
+        ended = False
+        if job:
+            with contextlib.suppress(OSError):
+                ended = bool(kernel32().TerminateJobObject(job, 1))
+            release(p)
+        if not ended:
+            kill_tree(p.pid)
         with contextlib.suppress(subprocess.TimeoutExpired):
             p.wait(timeout=30)
         return
@@ -2705,6 +2777,9 @@ def verify_change(ctx, st, rc, stage):
     criteria = change_criteria(ctx, st, plan)
     if stage == "fix":
         criteria = criteria + [f"(review) {m}" for m in st.get("must_fix", [])]
+    if rc == 124 and st.get("agent"):   # stopped on the timeout, its container may still be changing the work
+        fail(ctx, st, rc, [])
+        return False
     change = ticket_change(ctx.q, st)
     problems, warnings = check_change(st, change, plan)
     if st.get("in_place"):
@@ -2717,7 +2792,7 @@ def verify_change(ctx, st, rc, stage):
     if not problems and stage == "fix" and st.get("review_digest") and not moved_since(st, change, "review"):
         problems.append("no new commit since the review: fix the Must fix items and commit"
                         if not st.get("no_branch") else "nothing changed since the review: fix the Must fix items")
-    if not problems and rc not in (0, IDLE):   # IDLE: it went quiet; the work is judged as it is
+    if not problems and rc not in (0, IDLE, 124):   # stopped (quiet, or the timeout): the work is judged as it is
         problems.append("the agent did not finish; check the work is complete and committed")
     for w in warnings:
         ctx.q.log(st["key"], f"warning: {w}")
@@ -3114,10 +3189,14 @@ def block(ctx, st, reason, keep=False, failed=False, no_go_on=""):
 def fail(ctx, st, rc, problems):
     """A stage did not pass: stop the run if the upstream is down, else retry
     with the problems listed, then block."""
+    if rc == 124 and st.get("agent"):
+        return block(ctx, st, f"the {st['stage']} agent ran past {ctx.stage_timeout}s and was stopped, but its "
+                              "container may still be running: check 'harness list' (harness stop NAME) before "
+                              "'harness queue retry'")
     if rc == 124:
-        return block(ctx, st, f"the {st['stage']} agent ran past {ctx.stage_timeout}s and was stopped; a container "
-                              "launch can outlive that, so check 'harness list' before 'harness queue retry'")
-    if rc == IDLE:
+        problems = [f"the agent ran past {ctx.stage_timeout}s (QUEUE_STAGE_TIMEOUT) and was stopped before it "
+                    "finished"] + problems
+    elif rc == IDLE:
         problems = [f"the agent made no progress for {getattr(ctx, 'idle_min', 0):g} min and was stopped"] + problems
     elif rc not in (0, None):
         problems = [f"the agent launch exited with status {rc}"] + problems
@@ -3127,7 +3206,7 @@ def fail(ctx, st, rc, problems):
         st.pop("verify_only", None)
         ctx.q.save(st)
         raise
-    crash = crash_of(st, rc)
+    crash = crash_of(st, rc) if rc != 124 else ""   # a timeout is no crash: its attempt counts
     if crash and go_on_after_crash(ctx, st, crash):
         return
     st.pop("verify_only", None)
@@ -3136,9 +3215,10 @@ def fail(ctx, st, rc, problems):
     record(st, "failed", problems)
     if st["attempt"] < ctx.retries:
         st.update(attempt=st["attempt"] + 1, feedback=text)
-        if crash and st["stage"] in RESUMABLE:   # its session stopped again: a new agent, told to finish the work
+        if (crash or rc == 124) and st["stage"] in RESUMABLE:   # a new agent, told to finish the work
             st.pop("session", None)
-            st["resume"] = {"stage": st["stage"], "why": crash, "message": ""}
+            st["resume"] = {"stage": st["stage"], "message": "",
+                            "why": crash or f"it ran past the stage's {ctx.stage_timeout}s limit"}
         ctx.q.save(st)
     else:
         again = ", again after harness queue continue" if st.get("continued") == st["stage"] else ""

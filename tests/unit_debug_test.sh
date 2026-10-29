@@ -3,7 +3,8 @@
 # tests/unit_debug_test.sh — `harness debug`, docker-free and offline.
 #
 #   T1: debug_scrub redacts .env values (and a URL's host, and doctor's
-#       "abcd...wxyz" form of a secret), vault and ticket names, the install
+#       "abcd...wxyz" form of a secret), vault and ticket names, the queue's
+#       tickets (key, project folder in each path form, its name, branch), the install
 #       root and paths under $HOME, and leaves code references alone
 #   T2: debug_opencode_config is read-only: "*" asks (denies under -p) and
 #       comes first, the allowlist after it, the write patterns last, on the
@@ -44,6 +45,10 @@ DEFAULT_MODEL_NAME=my-model-x
 EOF
 printf 'brainvault\tgit@github.com:someone/brain.git\n' > "$TMP_ROOT/state/vaults.list"
 printf '/home/tester/work/acme\tACME-12\n' > "$TMP_ROOT/state/tickets.list"
+mkdir -p "$TMP_ROOT/state/queue/WIDG-7" "$TMP_ROOT/state/queue/WIN-3"
+printf '{"key": "WIDG-7", "project": "/home/tester/work/widgetapp", "branch": "feature/fast-path", "base": "main", "start": "abc1234def"}' \
+    > "$TMP_ROOT/state/queue/WIDG-7/state.json"
+printf '{"key": "WIN-3", "project": "C:/Users/t/src/gizmo-lib", "base": "release-2"}' > "$TMP_ROOT/state/queue/WIN-3/state.json"
 
 src() {
     # shellcheck disable=SC1090
@@ -64,10 +69,13 @@ project /home/tester/work/acme/src/app.py
 other /home/tester/code/secret-app/main.go and ~/code/secret-app/x
 opencode log /home/tester/.local/share/opencode/log/a.log
 code $TMP_ROOT/proxy/proxy.py:120 and harness:2321
+queue WIDG-7 in /home/tester/work/widgetapp on feature/fast-path from main at abc1234def
+the widgetapp build, state/queue/WIDG-7/implement-0.out
+win WIN-3 /c/Users/t/src/gizmo-lib and C:\Users\t\src\gizmo-lib\a.c on release-2
 EOF
 )
 for bad in sk-secret 'sk-s...3456' upstream.example my-model-x brainvault someone/brain ACME-12 \
-        acme secret-app "$TMP_ROOT" /home/tester; do
+        acme secret-app "$TMP_ROOT" /home/tester WIDG-7 widgetapp fast-path WIN-3 gizmo-lib release-2; do
     [[ "$t1" != *"$bad"* ]] || fail "T1: '$bad' survived:
 $t1"
 done
@@ -78,11 +86,14 @@ for want in 'key [PROXY_API_KEY] and doctor'"'"'s [PROXY_API_KEY]' \
         'project [project folder]/src/app.py' \
         'other ~/<path> and ~/<path>' \
         'opencode log ~/.local/share/opencode/log/a.log' \
-        'code <harness>/proxy/proxy.py:120 and harness:2321'; do
+        'code <harness>/proxy/proxy.py:120 and harness:2321' \
+        'queue [ticket] in [project folder] on [branch] from main at abc1234def' \
+        'the [project] build, state/queue/[ticket]/implement-0.out' \
+        'win [ticket] [project folder] and [project folder]\a.c on [branch]'; do
     grep -qxF -- "$want" <<<"$t1" || fail "T1: missing line '$want':
 $t1"
 done
-ok "T1: debug_scrub redacts .env values, vault/ticket names, install root and home paths"
+ok "T1: debug_scrub redacts .env values, vault/ticket/queue names, install root and home paths"
 
 # --- T2: permission overlay --------------------------------------------------------
 t2_off=$( src; debug_opencode_config )
