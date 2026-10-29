@@ -2870,6 +2870,12 @@ commands:
   doctor                run runtime diagnostics (read-only). Reports container
                         AND host-mode state; on a host-only box (no runtime) it
                         warns instead of failing on the missing daemon.
+  debug [host] [-p ISSUE]
+                        launch an agent on harness itself to find why something
+                        fails on this machine. Read-only unless you say so;
+                        prints a redacted report (no .env values, nothing about
+                        your project) to hand to a developer.
+                        See 'harness debug --help'.
   preflight             validate config + prerequisites before launch: .env
                         always, plus the container runtime + allowlist, OR the
                         host-mode deps (python3/jq/node>=20/opencode) on a
@@ -5846,6 +5852,8 @@ _vault_git() {
 # clone fails. A failed pull only warns: the agent then works on the local copy.
 vault_prepare() {
     local name url dir
+    # harness debug works on harness itself: no vault, nothing of the user's.
+    [[ "${harness_debug:-0}" == "1" ]] && return 0
     name=$(vault_active_name)
     [[ -n "$name" ]] || return 0
     url=$(_vault_url "$name")
@@ -6029,6 +6037,7 @@ ticket_pull() {
 ticket_prepare() {
     local here key
     harness_ticket=""
+    [[ "${harness_debug:-0}" == "1" ]] && return 0
     here=$(harness_abs_path "$PWD") || return 0
     if [[ -n "${harness_ticket_arg:-}" ]]; then
         key="$harness_ticket_arg"
@@ -6309,13 +6318,14 @@ serve_opencode_config() {
                          + (if ($native | index($dflt)) then {model: "harness/\($dflt):stock"} else {} end))}}' "$cfg"
 }
 
-# OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts, single, serve and
-# vault overlays deep-merged. Prints nothing when none applies. `oai` (a launch with
+# OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts, single, serve,
+# vault and debug overlays deep-merged (debug last: its permissions win). Prints nothing when none applies. `oai` (a launch with
 # an OAI upstream, host or container) is passed on to slim_opencode_config.
 harness_opencode_overlay() {
     local part out=""
     for part in "$(slim_opencode_config "${1:-}")" "$(thoughts_opencode_config)" \
-            "$(single_opencode_config)" "$(serve_opencode_config)" "$(vault_opencode_config)"; do
+            "$(single_opencode_config)" "$(serve_opencode_config)" "$(vault_opencode_config)" \
+            "$(debug_opencode_config)"; do
         [[ -n "$part" ]] || continue
         if [[ -z "$out" ]]; then
             out="$part"
@@ -11092,6 +11102,325 @@ cmd_net() {
     esac
 }
 
+# --- debug ------------------------------------------------------------------
+#
+# `harness debug` launches opencode on harness itself to find out why
+# something fails on this machine, and prints a report the user can hand to a
+# developer. The agent works in state/debug/ (gitignored): its AGENTS.md is a
+# copy of scripts/debug_agent.md (what harness is, where the logs are, the
+# rules), and snapshot.txt is collected on the host just before the launch
+# (doctor, config list, container status and logs), which is all a container
+# agent sees of docker. The install root rides along as a --mount so the
+# container sees the code and state/. No vault or ticket is attached
+# (vault_prepare and ticket_prepare skip under harness_debug), so nothing
+# about the user's project reaches the agent from harness itself.
+#
+# Read-only is enforced in opencode's permissions (debug_opencode_config):
+# edits other than report.md and any command outside a read-only allowlist
+# ask, or are denied in a headless -p run, where an ask would end the session.
+# The agent writes report.md; on exit debug_finish redacts it (debug_scrub:
+# every .env value, vault and ticket names, home paths) into
+# state/debug/reports/ and prints it.
+
+debug_help() {
+    cat <<'EOF'
+harness debug — launch an agent on harness itself to investigate a problem.
+
+usage:
+  harness debug [-p "WHAT GOES WRONG"] [agent flags...]
+  harness debug host [-p "WHAT GOES WRONG"] [agent flags...]
+
+The agent reads harness's code, logs and state on this machine, finds the
+cause, and writes a report. It does not change anything unless you tell it
+to: edits and any command outside a read-only set ask first (a headless -p
+run refuses them). On exit the report is redacted (no .env values, no vault,
+ticket or project names, home paths as ~) and printed, and a copy is kept in
+state/debug/reports/. Hand that report to whoever fixes harness.
+
+  harness debug         container agent (the host's docker state comes from a
+                        snapshot taken at launch); host mode when no container
+                        runtime is installed
+  harness debug host    host-mode agent: can run read-only docker and harness
+                        commands itself (harness host's confirm prompt applies)
+  -p "ISSUE"            headless: investigate ISSUE, print the report, exit
+
+--yolo is ignored here.
+EOF
+}
+
+# Values the scrubber leaves alone: too common to be identifying, and
+# replacing them would mangle the report's prose.
+_debug_scrub_skip() {
+    case "${1,,}" in
+        true|false|yes|no|on|off|none|auto|null|default|hybrid|single|\
+        passthrough|user_front|harness|opencode|proxy|container|host|docker|\
+        podman|localhost|http|https) return 0 ;;
+    esac
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# The "<length>\t<value>\t<label>" lines debug_scrub replaces, unsorted: every
+# .env value (and its host when it is a URL, and doctor_redact's
+# "abcd...wxyz" form of a secret), the vault names and urls, the remembered
+# ticket folders and keys, and this machine's hostname.
+_debug_scrub_pairs() {
+    local key val host name url d k
+    if [[ -f "$env_file" ]]; then
+        while IFS= read -r key; do
+            val=$(_config_read_key "$key")
+            (( ${#val} >= 4 )) || continue
+            _debug_scrub_skip "$val" && continue
+            printf '%d\t%s\t[%s]\n' "${#val}" "$val" "$key"
+            if [[ "$val" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^/@]*@)?([^/:?#]+) ]]; then
+                host="${BASH_REMATCH[2]}"
+                (( ${#host} >= 4 )) && ! _debug_scrub_skip "$host" \
+                    && printf '%d\t%s\t[%s host]\n' "${#host}" "$host" "$key"
+            fi
+            if _config_is_secret "$key" && (( ${#val} >= 12 )); then
+                printf '11\t%s\t[%s]\n' "$(doctor_redact "$val")" "$key"
+            fi
+        done < <(grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$env_file" | tr -d ' \t=' | sort -u)
+    fi
+    if [[ -f "$state_root/vaults.list" ]]; then
+        while IFS=$'\t' read -r name url; do
+            [[ -n "$name" ]] && ! _debug_scrub_skip "$name" \
+                && printf '%d\t%s\t[vault]\n' "${#name}" "$name"
+            [[ -n "$url" && "$url" != local ]] && printf '%d\t%s\t[vault url]\n' "${#url}" "$url"
+        done < "$state_root/vaults.list"
+    fi
+    if [[ -f "$(_ticket_list)" ]]; then
+        while IFS=$'\t' read -r d k; do
+            [[ -n "$d" ]] && printf '%d\t%s\t[project folder]\n' "${#d}" "$d"
+            [[ -n "$k" ]] && printf '%d\t%s\t[ticket]\n' "${#k}" "$k"
+        done < "$(_ticket_list)"
+    fi
+    host=$(uname -n 2>/dev/null || true)
+    if (( ${#host} >= 4 )) && ! _debug_scrub_skip "$host"; then
+        printf '%d\t%s\t[hostname]\n' "${#host}" "$host"
+    fi
+    return 0
+}
+
+# Redact stdin to stdout for a report that leaves this machine: the
+# _debug_scrub_pairs values (longest first, so a value holding another is
+# replaced whole), then the install root as <harness>, a path under $HOME as
+# ~/<path> (a dot dir such as ~/.local/share/opencode is kept: it names a
+# tool, not the user's project), and $HOME itself as ~.
+debug_scrub() {
+    local text n val label h home_re
+    text=$(cat; printf x)
+    text="${text%x}"
+    while IFS=$'\t' read -r n val label; do
+        [[ -n "$val" ]] && text="${text//"$val"/"$label"}"
+    done < <(_debug_scrub_pairs | sort -t$'\t' -k1,1rn)
+    local roots=("$install_root")
+    [[ -n "${HOME:-}" && "$install_root" == "$HOME/"* ]] && roots+=("~/${install_root#"$HOME/"}")
+    for h in "${roots[@]}"; do
+        [[ -n "$h" ]] && text="${text//"$h"/"<harness>"}"
+    done
+    local homes=()
+    if [[ -n "${HOME:-}" && "$HOME" != / ]]; then
+        homes+=("$HOME")
+        command -v cygpath >/dev/null 2>&1 && homes+=("$(cygpath -m "$HOME")")
+    fi
+    homes+=("~")
+    for h in "${homes[@]}"; do
+        home_re=$(printf '%s' "$h" | sed 's/[][\.*^$/#+?(){}|]/\\&/g')
+        text=$(printf '%sx' "$text" \
+            | sed -E "s#${home_re}/[^.[:space:]\"'\`<>)][^[:space:]\"'\`<>)]*#~/<path>#g")
+        text="${text%x}"
+        [[ "$h" == "~" ]] || text="${text//"$h"/"~"}"
+    done
+    printf '%s' "$text"
+}
+
+# The opencode overlay part for a debug launch: read-only permissions on the
+# top level and on every primary agent a user can switch to (an agent's rules
+# win over the top level, and the yolo agent's own allow-all would otherwise
+# apply). opencode takes the LAST matching rule, so "*" comes first, the
+# read-only allowlist after it, and the patterns that make an allowed command
+# write (a redirect, find -delete, curl -o, ...) last. A pipeline is checked
+# command by command, a redirect is part of its command's text. The mode is
+# "ask" interactively and "deny" for -p (harness_debug_print=1).
+debug_opencode_config() {
+    [[ "${harness_debug:-0}" == "1" ]] || return 0
+    local mode=ask
+    [[ "${harness_debug_print:-0}" == "1" ]] && mode=deny
+    local p allow=(
+        'cat *' 'head *' 'tail *' 'ls *' 'find *' 'grep *' 'rg *' 'wc *' 'stat *'
+        'file *' 'du *' 'df *' 'pwd' 'whoami' 'id *' 'uname *' 'hostname' 'echo *'
+        'date *' 'which *' 'command -v *' 'type *' 'uptime *' 'free *' 'jq *'
+        'cut *' 'diff *' 'cmp *' 'sha256sum *' 'md5sum *' 'readlink *'
+        'realpath *' 'dirname *' 'basename *' 'tree *' 'curl *' 'ps' 'ps aux*'
+        'ps -ef*' 'ps -eo *' 'ps -p *' 'pgrep *' 'ss *' 'netstat *' 'lsof *'
+        'systemctl status *' 'journalctl *'
+        'git status*' 'git log*' 'git diff*' 'git show*' 'git rev-parse*'
+        'git describe*' 'git remote -v*' 'git branch --show-current*'
+        'git config --get *' 'git -C * status*' 'git -C * log*' 'git -C * diff*'
+        'git -C * show*' 'git -C * rev-parse*'
+    )
+    local rt h
+    for rt in docker podman; do
+        allow+=("$rt ps*" "$rt logs *" "$rt inspect -f *" "$rt inspect --format *"
+            "$rt version*" "$rt info*" "$rt images*" "$rt image ls*"
+            "$rt network ls*" "$rt volume ls*" "$rt stats --no-stream*"
+            "$rt system df*" "$rt compose ls*" "$rt compose ps*" "$rt compose logs *"
+            "$rt compose version*" "$rt compose -p * ps*" "$rt compose -p * logs *")
+    done
+    for h in harness '*/harness'; do
+        allow+=("$h doctor*" "$h list*" "$h config list*" "$h config get *"
+            "$h context*" "$h usage*" "$h help*" "$h --help*" "$h mcp list*"
+            "$h mcp status*" "$h net list*" "$h net status*")
+    done
+    local guard=(
+        '*>*' 'find *-delete*' 'find *-exec*' 'find *-ok*' 'find *-fprint*'
+        'find *-fls*' 'curl *-o *' 'curl *-O*' 'curl *--output*' 'curl *-X*'
+        'curl *--request*' 'curl *-d *' 'curl *--data*' 'curl *-F *'
+        'curl *--form*' 'curl *-T *' 'curl *--upload*' 'curl *-K *'
+        'curl *--config*' 'git *--output*' 'journalctl *--vacuum*'
+        'journalctl *--rotate*' 'journalctl *--flush*' 'ps *e' 'ps *e *'
+        '*.env' '*.env *' '*.env.*' '*.env/*' '*environ*' '*/.ssh/*' '*id_rsa*'
+        '*id_ed25519*' '*.pem*'
+    )
+    local bash_rules
+    bash_rules=$( { printf '*\t%s\n' "$mode"
+                    for p in "${allow[@]}"; do printf '%s\tallow\n' "$p"; done
+                    for p in "${guard[@]}"; do printf '%s\t%s\n' "$p" "$mode"; done; } \
+        | harness_jq -Rsc '
+            split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: .[1]})
+            | from_entries')
+    harness_jq -cn --arg m "$mode" --arg dir "$state_root/debug" --argjson bash "$bash_rules" '
+      {edit: {"*": $m, "report.md": "allow", "state/debug/report.md": "allow",
+              ($dir + "/report.md"): "allow", "*/state/debug/report.md": "allow"},
+       bash: $bash,
+       read: {"*": "allow", "*.env": $m, "*.env.*": $m, "*/.ssh/*": $m,
+              "*.pem": $m, "*.key": $m},
+       external_directory: {"*": "allow"}} as $p
+      | {permission: $p,
+         agent: {build: {permission: $p}, general: {permission: $p},
+                 yolo: {permission: $p}}}'
+}
+
+_debug_section() { printf '\n## %s\n\n' "$1"; }
+_debug_noansi() { sed $'s/\033\\[[0-9;]*[A-Za-z]//g'; }
+
+# Host-side facts for the debug agent, written to state/debug/snapshot.txt.
+# A container agent cannot run docker or harness, so this is its view of the
+# host. doctor is bounded by timeout where the host has it; nothing here
+# fails the launch.
+debug_snapshot() {
+    local mode="$1" to=(env) c
+    command -v timeout >/dev/null 2>&1 && to=(timeout 120)
+    echo "# harness debug snapshot"
+    echo
+    echo "mode: $mode"
+    echo "taken: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "harness commit: $(git -C "$clone_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+        "on $(git -C "$clone_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)," \
+        "$(git -C "$clone_dir" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ') modified tracked file(s)"
+    echo "os: $(harness_detect_os) ($(uname -srm 2>/dev/null || echo unknown)), bash $BASH_VERSION"
+    if harness_runtime_installed; then
+        echo "container runtime: $(harness_docker --version 2>/dev/null | head -1 || true)"
+    else
+        echo "container runtime: none installed"
+    fi
+    _debug_section "harness doctor"
+    { "${to[@]}" "$clone_dir/harness" doctor </dev/null 2>&1 || true; } | _debug_noansi || true
+    _debug_section "harness config list (secrets masked)"
+    { "${to[@]}" "$clone_dir/harness" config list </dev/null 2>&1 || true; }
+    if harness_runtime_installed && harness_docker_running; then
+        _debug_section "harness containers"
+        { harness_docker ps -a --filter "label=com.docker.compose.project=$project_name" \
+              --format '{{.Names}}\t{{.Status}}\t{{.Image}}' 2>&1 || true
+          harness_docker ps -a --filter "label=harness.agent=true" \
+              --format '{{.Names}}\t{{.Status}}\t{{.Image}}' 2>&1 || true; } | sort -u || true
+        while IFS= read -r c; do
+            [[ -n "$c" ]] || continue
+            _debug_section "docker logs --tail 300 $c"
+            { harness_docker logs --tail 300 "$c" 2>&1 || true; } | _debug_noansi || true
+        done < <(harness_docker ps -a --filter "label=com.docker.compose.project=$project_name" \
+                     --format '{{.Names}}' 2>/dev/null || true)
+    fi
+    _debug_section "state/host"
+    ls -la "$state_root/host" 2>&1 || true
+    return 0
+}
+
+# After the agent exits: redact report.md into state/debug/reports/<time>.md,
+# drop the raw file and print the redacted one. A -p run that wrote no report
+# prints its redacted session output instead.
+debug_finish() {
+    local print="$1" dir="$state_root/debug" out
+    if [[ -s "$dir/report.md" ]]; then
+        mkdir -p "$dir/reports"
+        out="$dir/reports/$(date +%Y%m%d-%H%M%S).md"
+        debug_scrub < "$dir/report.md" > "$out"
+        rm -f "$dir/report.md"
+        echo "[harness] debug report (redacted; saved to state/debug/reports/${out##*/}):" >&2
+        echo >&2
+        cat "$out"
+    elif [[ "$print" == 1 && -s "$dir/session.log" ]]; then
+        echo "[harness] debug: the agent wrote no report.md; its output (redacted):" >&2
+        echo >&2
+        tail -c 200000 "$dir/session.log" | debug_scrub
+        echo
+    else
+        echo "[harness] debug: no report was written. Run 'harness debug' again and ask the agent to write the report." >&2
+    fi
+}
+
+cmd_debug() {
+    local mode=container
+    case "${1:-}" in
+        -h|--help|help) debug_help; return 0 ;;
+        host) mode=host; shift ;;
+    esac
+    harness_runtime_installed || mode=host
+    local args=() a print=0
+    for a in "$@"; do
+        case "$a" in
+            --yolo) err "debug: ignoring --yolo (the debug agent asks before it changes anything)" ;;
+            -p|--print) print=1; args+=("$a") ;;
+            *) args+=("$a") ;;
+        esac
+    done
+    harness_debug=1
+    harness_debug_print=$print
+    local dir="$state_root/debug"
+    mkdir -p "$dir/reports"
+    # A raw report left by a run that died before debug_finish is redacted
+    # and kept, not mixed into this run's.
+    [[ -s "$dir/report.md" ]] && debug_finish 0 >/dev/null 2>&1
+    cp "$clone_dir/scripts/debug_agent.md" "$dir/AGENTS.md"
+    echo "[harness] debug: collecting a snapshot of this install..." >&2
+    debug_snapshot "$mode" > "$dir/snapshot.txt"
+    cd "$dir" || { err "cannot enter $dir"; return 1; }
+    # cmd_host and run_agent exit (or exec); the subshell keeps this shell
+    # for debug_finish. set -e is off around it so a failed run still gets
+    # here, and on inside it so the launch behaves as it does on its own.
+    local rc=0
+    set +e
+    if [[ "$mode" == host ]]; then
+        if (( print )); then
+            ( set -e; cmd_host "${args[@]}" ) > "$dir/session.log"
+        elif (( ${#args[@]} )); then
+            ( set -e; cmd_host "${args[@]}" )
+        else
+            ( set -e; cmd_host )
+        fi
+    elif (( print )); then
+        ( set -e; run_agent opencode --mount "$install_root" "${args[@]}" ) > "$dir/session.log"
+    elif (( ${#args[@]} )); then
+        ( set -e; run_agent opencode --mount "$install_root" "${args[@]}" )
+    else
+        ( set -e; run_agent opencode --mount "$install_root" )
+    fi
+    rc=$?
+    set -e
+    debug_finish "$print"
+    return "$rc"
+}
+
 # --- doctor -----------------------------------------------------------------
 #
 # Read-only runtime diagnostics. Each section runs a fixed set of checks;
@@ -12349,6 +12678,7 @@ main() {
         model)                      cmd_model "$@" ;;
         uninstall)                  cmd_uninstall "$@" ;;
         doctor)                     cmd_doctor ;;
+        debug)                      cmd_debug "$@" ;;
         preflight)                  cmd_preflight ;;
         test)                       cmd_test "$@" ;;
         benchmark)                  cmd_benchmark "$@" ;;
