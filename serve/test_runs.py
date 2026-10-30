@@ -1292,6 +1292,106 @@ class QueuePageTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("after the plan <b>takes each question's default and goes on</b>", body)
 
+    def test_a_ticket_shows_its_settings_and_edits_them_before_its_work_starts(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.start()
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("branch", "feat/x")])
+        self.assertEqual(r.status, 303, body)
+        r, body = self.req("GET", "/runs/ticket/ABC-7")
+        self.assertIn("<h2>Settings</h2><a class='btn sm' href='/runs/ticket/ABC-7/edit'>Edit settings</a>", body)
+        self.assertIn("branch <b>feat/x</b>", body)
+        self.assertIn("Nothing has run yet: every setting can change.", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-7/edit")
+        self.assertEqual(r.status, 200, body)
+        self.assertIn("<input name='keys' readonly value='ABC-7'>", body)
+        self.assertIn("action='/runs/ticket/ABC-7/edit'", body)
+        self.assertIn("feat/x", body)
+        self.assertIn("name='after_plan' value='wait' checked", body)
+        form = [("keys", "ABC-7"), ("project", proj), ("branch", "feat/y"), ("preset", "review"),
+                ("start", "continue"), ("cont", "ABC-7-work"), ("after_plan", "go")]
+        r, body = self.post("/runs/ticket/ABC-7/edit", form)
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
+            st = json.load(f)
+        self.assertEqual((st["branch"], st["stages"], st["start"], st.get("plan_review")),
+                         ("feat/y", ["review"], "ABC-7-work", None))
+        self.assertIn("ABC-7", open(os.path.join(self.queue, "queue.list")).read())
+        # refused: the form again, as typed, saying why
+        r, body = self.post("/runs/ticket/ABC-7/edit", form[:2] + [("branch", "a..b")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("Not changed: branch: not a branch", body)
+        self.assertIn("value='a..b'", body)
+        # emptied: back to add's defaults (the key; in the folder, where it is now)
+        r, body = self.post("/runs/ticket/ABC-7/edit", [("keys", "ABC-7"), ("project", proj), ("branch", "")])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "ABC-7", "state.json")) as f:
+            st = json.load(f)
+        head = subprocess.run(["git", "-C", proj, "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        self.assertEqual((st.get("branch"), st.get("start"), st["plan_review"]), (None, head, True))
+
+    def test_the_edit_form_sends_every_setting_and_the_repositories_only_when_listed(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.ticket(project=proj, status="queued", branch="feat/x", repos={"lib": {"branch": "b", "base": "main"}})
+        self.start()
+        calls = []
+
+        def queue(runs_, args, text=None):
+            calls.append(args)
+            return True, "changed"
+        with mock.patch.object(runs, "_queue", queue):
+            r, body = self.post("/runs/ticket/ABC-12/edit", [("keys", "ABC-12"), ("project", proj)])
+            self.assertEqual(r.status, 303, body)
+            self.assertEqual(calls.pop(), ["edit", "ABC-12", f"--project={proj}",
+                                           "--stages=plan,implement,review,fix,push", "--base=", "--start=",
+                                           "--branch=", "--review-plan"])
+            r, body = self.post("/runs/ticket/ABC-12/edit", [("keys", "ABC-12"), ("project", proj),
+                                                             ("repo_mode:.", "branch"), ("branch", "feat/x")])
+            self.assertEqual(r.status, 303, body)
+            self.assertIn("--no-repo-branches", calls.pop())
+
+    def test_a_started_ticket_changes_only_the_stages_to_come_and_after_the_plan(self):
+        self.ticket(status="needs-answers", stage="implement", start_sha="a" * 40, plan_review=True)
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("href='/runs/ticket/ABC-12/edit'>Edit settings</a>", body)
+        self.assertIn("Its work has started", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
+        self.assertIn("What can still change", body)
+        self.assertNotIn("name='project'", body)
+        self.assertIn("name='stage_implement' value='implement' checked disabled", body)
+        self.assertIn("name='stage_review' value='review' checked>", body)
+        keep = [("stage_plan", "plan"), ("stage_implement", "implement")]
+        r, body = self.post("/runs/ticket/ABC-12/edit", keep + [("stage_review", "review"), ("stage_fix", "fix"),
+                                                               ("stage_push", "push"), ("after_plan", "wait")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("Not changed: nothing changed", body)
+        r, body = self.post("/runs/ticket/ABC-12/edit", keep + [("stage_push", "push"), ("after_plan", "go")])
+        self.assertEqual(r.status, 303, body)
+        st = self.state()
+        self.assertEqual((st["stages"], st.get("plan_review")), (["plan", "implement", "push"], None))
+        # the queue's own check holds too: the stages it has passed stay
+        r, body = self.post("/runs/ticket/ABC-12/edit", [("stage_plan", "plan"), ("after_plan", "go")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("the stages up to it stay", body)
+
+    def test_a_running_ticket_shows_its_settings_but_not_to_change(self):
+        self.ticket(status="running", stage="plan", start_sha="a" * 40)
+        self.run_on()
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<h2>Settings</h2>", body)
+        self.assertNotIn("Edit settings", body)
+        self.assertIn("It is running: stop it to change its settings.", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
+        self.assertEqual(r.status, 200)
+        self.assertNotIn("<form method='post' action='/runs/ticket/ABC-12/edit'", body)
+        r, body = self.post("/runs/ticket/ABC-12/edit", [("stage_plan", "plan"), ("after_plan", "go")])
+        self.assertEqual(r.status, 409)
+        self.assertEqual(self.state().get("plan_review"), None)
+        r, body = self.req("GET", "/runs/ticket/NOPE-1/edit")
+        self.assertEqual(r.status, 404)
+
     def test_add_starting_points_and_the_branch_list(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
         g = lambda *a: subprocess.run(["git", "-C", proj, *a], capture_output=True, text=True, check=True).stdout.strip()

@@ -7036,6 +7036,16 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             tracker: a ticket of your own, LOCAL-N
                                             in the vault, is made for it (harness
                                             ticket new makes one to queue later)
+       harness queue edit KEY [add's options] [--no-repo-branches]
+                                            change a ticket's settings, only the
+                                            ones given (an empty value: add's
+                                            default). Before its work starts,
+                                            anything add sets; after, only the
+                                            stages still to come and
+                                            --review-plan, --no-plan-approval and
+                                            --take-defaults (to change the rest,
+                                            remove it and add it again). Not while
+                                            it runs: stop it first
        harness queue run [--host] [--single-message] [--parallel N]
                                             work through the queue, one ticket at a time
                                             (--parallel N, or QUEUE_PARALLEL: N at a
@@ -7327,6 +7337,26 @@ HELP
                 done
                 return "$rc"
             fi ;;
+        edit)
+            local key="" a
+            local -a opts=()
+            while (( $# )); do
+                a="$1"; shift
+                case "$a" in
+                    --dir) [[ -n "${1:-}" && "${1:-}" != -* ]] || { err "$a needs a value"; return 1; }
+                        opts+=("--project=$(harness_abs_path "$1")"); shift ;;
+                    # an empty value puts it back to add's default
+                    --base|--stages|--start|--branch|--repo-branch) (( $# )) || { err "$a needs a value"; return 1; }
+                        opts+=("$a=$1"); shift ;;
+                    --in-place|--no-branch|--no-repo-branches|--allow-branch|--review-plan|--no-plan-approval|--take-defaults)
+                        opts+=("$a") ;;
+                    -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
+                    *) [[ -z "$key" ]] || { err "harness queue edit takes one ticket"; return 1; }
+                        key="$a" ;;
+                esac
+            done
+            [[ -n "$key" ]] || { err "usage: harness queue edit KEY [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch] [--repo-branch REL[=BRANCH][:TARGET]]... [--no-repo-branches] [--in-place] [--review-plan | --no-plan-approval [--take-defaults]]"; return 1; }
+            args+=(edit "$key" ${opts[@]+"${opts[@]}"}) ;;
         # remove, stop, retry and continue end the agent (and container) of a ticket no run holds
         remove|rm) (( $# )) || { err "usage: harness queue remove KEY..."; return 1; }
             args+=(remove "$@" --harness "$clone_dir/harness") ;;

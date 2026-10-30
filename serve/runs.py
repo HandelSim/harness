@@ -758,6 +758,12 @@ class Runs:
         out["plan_approved"] = st.get("plan_approved") is True
         out["in_place"] = st.get("in_place") is True
         out["plan_review"] = st.get("plan_review") is True
+        out["no_branch"] = st.get("no_branch") is True
+        out["start_sha"] = st["start_sha"] if isinstance(st.get("start_sha"), str) else ""   # its work started
+        repos = st.get("repos")   # the nested repositories' own branches: {rel: {branch, base}}
+        out["repos"] = {rel: {k: r[k] for k in ("branch", "base") if isinstance(r.get(k), str)}
+                        for rel, r in (repos.items() if isinstance(repos, dict) else ())
+                        if isinstance(rel, str) and isinstance(r, dict)}
         want = st.get("stages")
         want = [s for s in want if isinstance(s, str)] if isinstance(want, list) and want else list(STAGES)
         out["stages"] = [s for s in STAGES if s in want]
@@ -1827,9 +1833,10 @@ def _start_choice(v, sent):
             "<div class='why' hidden></div></fieldset>")
 
 
-def add_form(runs, form=None, err=""):
+def add_form(runs, form=None, err="", edit=""):
     """The Add tickets form; after a refused add, the values sent (form) and
-    why it was refused (err), so nothing typed is lost."""
+    why it was refused (err), so nothing typed is lost. edit: the form for that
+    ticket's settings (not started yet), its key fixed."""
     projects = _projects(runs)
     v = (lambda name: _one(form, name)) if form is not None else (lambda name: "")
     preset = v("preset") if v("preset") in (*PRESETS, "custom") else "full"
@@ -1843,14 +1850,17 @@ def add_form(runs, form=None, err=""):
     opts = "".join(f"<option value='{esc(p)}'>" for p in projects)
     project = v("project") if form is not None else (projects[0] if projects else "")
     sent = {k: _one(form, k) for k in form if k.startswith("repo_")} if form is not None else {}
-    return (f"<section class='panel' id='add'{' data-err=1' if err else ''}><div class='hd'><h2>Add tickets</h2></div>"
-            + (f"<p class='err' role='alert'>Not added: {esc(err)}</p>" if err else "") +
-            "<form method='post' action='/runs/queue/add' id='addform' class='stack'>"
-            "<div class='grid2'>"
-            "<label class='fld'>Ticket keys<input name='keys' required autocomplete='off' spellcheck='false' "
-            f"value='{esc(v('keys'))}' placeholder='ABC-123 ABC-124'>"
-            "<small>one or more, space or comma separated. Each is its own ticket, all with the settings below; "
-            "a work branch it gets is named after its key</small></label>"
+    keys = (f"<label class='fld'>Ticket<input name='keys' readonly value='{esc(edit)}'><small>the key does not "
+            "change; remove the ticket and add it again for another</small></label>") if edit else (
+        "<label class='fld'>Ticket keys<input name='keys' required autocomplete='off' spellcheck='false' "
+        f"value='{esc(v('keys'))}' placeholder='ABC-123 ABC-124'>"
+        "<small>one or more, space or comma separated. Each is its own ticket, all with the settings below; "
+        "a work branch it gets is named after its key</small></label>")
+    title, action = ("Settings", f"/runs/ticket/{quote(edit)}/edit") if edit else ("Add tickets", "/runs/queue/add")
+    return (f"<section class='panel' id='add'{' data-err=1' if err else ''}><div class='hd'><h2>{title}</h2></div>"
+            + (f"<p class='err' role='alert'>Not {'changed' if edit else 'added'}: {esc(err)}</p>" if err else "") +
+            f"<form method='post' action='{action}' id='addform' class='stack'>"
+            f"<div class='grid2'>{keys}"
             f"<label class='fld'>Project folder<input name='project' required list='projects' spellcheck='false' "
             f"value='{esc(project)}' placeholder='/home/me/src/project'>"
             f"<datalist id='projects'>{opts}</datalist><datalist id='branches'></datalist>"
@@ -1879,10 +1889,13 @@ def add_form(runs, form=None, err=""):
             "</details>"
             "</div>"
             + _choice("When the plan is written", "after_plan", v("after_plan"), AFTER_PLAN_CHOICES) +
-            "<label class='fld'>Note for the agents<textarea name='note' maxlength='4000' "
-            "placeholder='Context every stage gets, e.g. the solution is on origin/ABC-3122; only the "
-            f"review is left.'>{esc(v('note'))}</textarea></label>"
-            "<div class='formacts'><button type='submit' class='primary'>Add to the queue</button>"
+            ("<p class='muted'>Notes for the agents are on the ticket's page (Notes), and can be added any "
+             "time.</p>" if edit else
+             "<label class='fld'>Note for the agents<textarea name='note' maxlength='4000' "
+             "placeholder='Context every stage gets, e.g. the solution is on origin/ABC-3122; only the "
+             f"review is left.'>{esc(v('note'))}</textarea></label>") +
+            f"<div class='formacts'><button type='submit' class='primary'>{'Save' if edit else 'Add to the queue'}"
+            "</button>"
             "<div class='muted' id='addhint' aria-live='polite'></div></div>"
             "</form></section>")
 
@@ -2056,21 +2069,53 @@ def _feedback_form(key, st):
     return "".join(parts)
 
 
-def _t_head(runs, key, st, pos, n):
-    status = st.get("status", "")
+def _settings_facts(key, st):
+    """What the ticket was added with (and edited to since)."""
     facts = []
     if st.get("project"):
         facts.append(f"<span>project <b>{esc(st['project'])}</b></span>")
-    if st.get("base"):
-        facts.append(f"<span>base <b>{esc(st['base'])}</b></span>")
-    if st.get("start"):
-        facts.append(f"<span>starts from <b title='{esc(st['start'])}'>{esc(_short(st['start']))}</b></span>")
-    facts.append(f"<span>branch <b>{esc(st.get('branch') or key)}</b></span>")
+    if st.get("no_branch"):
+        facts.append("<span>the project's change <b>left uncommitted</b></span>")
+    else:
+        if st.get("base"):
+            facts.append(f"<span>base <b>{esc(st['base'])}</b></span>")
+        start = st.get("start") or st.get("ref")
+        if start:
+            facts.append(f"<span>starts from <b title='{esc(start)}'>{esc(_short(start))}</b></span>")
+        facts.append(f"<span>branch <b>{esc(st.get('branch') or key)}</b></span>")
+    for rel, v in sorted((st.get("repos") or {}).items()):
+        facts.append(f"<span>{esc(rel)}: branch <b>{esc(v.get('branch') or key)}</b> from <b>{esc(v.get('base', ''))}"
+                     "</b></span>")
     facts.append("<span>works <b>" + ("in your project folder" if st.get("in_place") else "in a separate copy")
                  + "</b></span>")
+    facts.append("<span>stages <b>" + " &rarr; ".join(esc(x) for x in (st.get("stages") or STAGES)) + "</b></span>")
     facts.append("<span>after the plan <b>" + ("takes each question's default and goes on" if st.get("take_defaults")
                                                else "waits for your approval" if st.get("plan_review")
                                                else "goes straight on") + "</b></span>")
+    return facts
+
+
+def _edit_lock(st):
+    """(what can change now, why the rest cannot): all, some (its work started) or none (running)."""
+    if st.get("status") == "running":
+        return "none", "It is running: stop it to change its settings."
+    if st.get("start_sha"):
+        return "some", ("Its work has started, so its project, base, start, branch and repositories stay as they "
+                        "are (remove the ticket and add it again to change them). The stages still to come and "
+                        "what happens after the plan can change.")
+    return "all", "Nothing has run yet: every setting can change."
+
+
+def _t_settings(key, st):
+    can, why = _edit_lock(st)
+    act = (f"<a class='btn sm' href='/runs/ticket/{quote(key)}/edit'>Edit settings</a>" if can != "none" else "")
+    return (f"<section class='panel'><div class='hd'><h2>Settings</h2>{act}</div>"
+            f"<div class='kv'>{''.join(_settings_facts(key, st))}</div><div class='muted'>{esc(why)}</div></section>")
+
+
+def _t_head(runs, key, st, pos, n):
+    status = st.get("status", "")
+    facts = []
     if st.get("sha"):
         facts.append(f"<span>commit <b>{esc(st['sha'][:12])}</b></span>")
     if st.get("created"):
@@ -2083,7 +2128,8 @@ def _t_head(runs, key, st, pos, n):
             f"<b>{esc(key)}</b></div><h1>{esc(key)}</h1>{_pill(status, st.get('stopping'))}{where}"
             f"<a class='btn' href='/runs/ticket/{quote(key)}/diff'>Changes</a>"
             f"<div class='sub'>{esc(_why(st))}</div></header>"
-            f"<section class='panel'>{stage_strip(st, True)}<div class='kv'>{''.join(facts)}</div></section>" + _t_result(st))
+            f"<section class='panel'>{stage_strip(st, True)}<div class='kv'>{''.join(facts)}</div></section>"
+            + _t_settings(key, st) + _t_result(st))
 
 
 PUSHED = {"pushed": "pushed to {remote}", "local": "kept on this computer: not pushed",
@@ -2553,6 +2599,96 @@ def render_ticket(runs, key, msg="", bad=False):
                  f"<div id='r-rounds'>{g['rounds']}</div></div></div>"]
 
 
+# --- /runs/ticket/KEY/edit ---------------------------------------------------------
+
+def _edit_values(key, st):
+    """The Add form's fields as the ticket has them, for its edit form."""
+    stages = [x for x in STAGES if x in (st.get("stages") or STAGES)]
+    start = st.get("start") or st.get("ref") or ""
+    mode = "new" if not start or start == st.get("base") else "continue"   # here: a commit since add
+    f = {"keys": [key], "project": [st.get("project", "")], "base": [st.get("base", "")], "start": [mode],
+         "cont": [start if mode == "continue" else ""], "branch": [st.get("branch", "")],
+         "preset": [next((p for p, v in PRESETS.items() if list(v) == stages), "custom")],
+         "after_plan": ["defaults" if st.get("take_defaults") else "wait" if st.get("plan_review") else "go"],
+         "repo_mode:.": ["uncommitted" if st.get("no_branch") else "branch"]}
+    f.update({"stage_" + x: [x] for x in stages})
+    for rel, r in (st.get("repos") or {}).items():
+        f.update({"repo_mode:" + rel: ["branch"], "repo_branch:" + rel: [r.get("branch", "")],
+                  "repo_target:" + rel: [r.get("base", "")]})
+    return f
+
+
+def _later_form(key, st, err=""):
+    """A ticket whose work started: the stages after the one it is at, and what
+    happens after the plan."""
+    cur, stages = st.get("stage"), st.get("stages") or list(STAGES)
+    fixed = STAGES[:STAGES.index(cur) + 1] if cur in STAGES else STAGES
+    checks = "".join(
+        f"<label><input type='checkbox' name='stage_{x}' value='{x}'{' checked' if x in stages else ''}"
+        f"{' disabled' if x in fixed else ''}> {x}</label>" + (_hidden("stage_" + x, x) if x in fixed and x in stages
+                                                               else "") for x in STAGES)
+    after = "defaults" if st.get("take_defaults") else "wait" if st.get("plan_review") else "go"
+    held = ("<p class='muted'>The plan waiting now still needs Approve or feedback; this is for the next plan "
+            "written.</p>") if st.get("status") == "plan-review" else ""
+    at = f"at {cur}" if cur in STAGES else "done"
+    return (f"<section class='panel'><div class='hd'><h2>What can still change</h2></div>"
+            + (f"<p class='err' role='alert'>Not changed: {esc(err)}</p>" if err else "") +
+            f"<form method='post' action='/runs/ticket/{quote(key)}/edit' class='stack'>"
+            f"<fieldset><legend>Stages</legend><div class='checks'>{checks}</div><small class='muted'>It is {at}: "
+            "that stage and the ones before it stay as they are; fix needs review.</small></fieldset>"
+            + _choice("When the plan is written", "after_plan", after, AFTER_PLAN_CHOICES) + held +
+            "<div class='formacts'><button type='submit' class='primary'>Save</button></div></form></section>")
+
+
+def render_ticket_edit(runs, key, form=None, err=""):
+    """The ticket's settings: all of them to change before its work started (the
+    Add form), the stages still to come and the after-plan choice after, none
+    while it runs. (title, parts), or None for no such ticket."""
+    if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
+        return None
+    st = runs.ticket_state(key)
+    if not st:
+        return None
+    can, why = _edit_lock(st)
+    k = quote(key)
+    parts = [f"<header class='ph'><div class='crumbs'><a href='/runs/queue'>Queue</a><span>/</span>"
+             f"<a href='/runs/ticket/{k}'>{esc(key)}</a><span>/</span><b>settings</b></div>"
+             f"<h1>{esc(key)}: settings</h1>{_pill(st.get('status', ''), st.get('stopping'))}"
+             f"<a class='btn' href='/runs/ticket/{k}'>Back to the ticket</a><div class='sub'>{esc(why)}</div></header>"]
+    if can == "all":
+        parts.append(add_form(runs, form if form is not None else _edit_values(key, st), err, edit=key))
+    else:
+        parts.append(f"<section class='panel'><div class='hd'><h2>Settings</h2></div>"
+                     f"<div class='kv'>{''.join(_settings_facts(key, st))}</div></section>")
+        if can == "some":
+            parts.append(_later_form(key, st, err))
+    return f"{key}: settings", parts
+
+
+def edit_ticket(runs, key, st, form):
+    """The edit form sent: harness queue edit with what it may change now."""
+    can, why = _edit_lock(st)
+    if can == "none":
+        return False, why
+    if can == "all":
+        args = ticket_args(form, [key], st)
+        return (False, args) if isinstance(args, str) else _queue(runs, ["edit", key, *args])
+    stages = [x for x in STAGES if _one(form, "stage_" + x)]
+    after = _one(form, "after_plan")
+    args = []
+    if stages != [x for x in STAGES if x in (st.get("stages") or STAGES)]:
+        if not stages:
+            return False, "pick at least one stage"
+        args.append("--stages=" + ",".join(stages))
+    was = "defaults" if st.get("take_defaults") else "wait" if st.get("plan_review") else "go"
+    if after in ("wait", "go", "defaults") and after != was:
+        args += {"wait": ["--review-plan"], "go": ["--no-plan-approval"],
+                 "defaults": ["--no-plan-approval", "--take-defaults"]}[after]
+    if not args:
+        return False, "nothing changed"
+    return _queue(runs, ["edit", key, *args])
+
+
 # --- /runs/debug ---------------------------------------------------------------------
 
 DEBUG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
@@ -2646,7 +2782,7 @@ def render_debug_report(runs, kind, name):
 
 # --- actions ------------------------------------------------------------------------
 
-TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note", "followup")
+TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note", "followup", "edit")
 QUEUE_ACTIONS = ("add", "start", "halt", "end")
 # an answer or approve from a page that showed another plan (its sig): the plan was made again since
 CHANGED = "The plan changed since this page was loaded: reload it and answer again."
@@ -2788,6 +2924,8 @@ def ticket_action(runs, key, action, form):
     st = runs.ticket_state(key)
     status = st.get("status") or "gone"
     again = "; reload its page"
+    if action == "edit":
+        return edit_ticket(runs, key, st, form)
     if action == "answer":
         vault = runs.vault_of(st)
         if not vault:
@@ -3087,25 +3225,44 @@ def add_tickets(runs, form):
     bad = [k for k in keys if not KEY_RE.match(k) or len(k) > 40]
     if bad:
         return False, "not a ticket key (like ABC-123): " + ", ".join(bad[:5])[:200]
+    args = ticket_args(form, keys)
+    if isinstance(args, str):
+        return False, args
+    note = _one(form, "note").replace("\r\n", "\n")
+    if len(note) > ADD_NOTE_MAX:
+        return False, f"the note is over {ADD_NOTE_MAX} characters"
+    if note.strip():
+        args.append(f"--note={note}")
+    return _queue(runs, ["add", *keys, *args])
+
+
+def ticket_args(form, keys, st=None):
+    """The Add form's settings as harness queue add (or, for st, a ticket not
+    started yet: edit) takes them, checked first; or why not. An edit gives every
+    setting, so one emptied goes back to add's default; a repository tree that did
+    not load leaves the ticket's repositories as they are."""
     project = project_path(_one(form, "project"))
     if not project or not os.path.isabs(project) or not os.path.isdir(project):
-        return False, "the project folder must be an absolute path to a folder that exists"
+        return "the project folder must be an absolute path to a folder that exists"
+    tree = "repo_mode:." in form
     keep, repo_branches, why = repo_args(form, project, len(keys) > 1)
     if why:
-        return False, why
+        return why
+    if st is not None and not tree:
+        keep = bool(st.get("no_branch"))
     if keep and any(_one(form, n).strip() for n in ("base", "ref", "branch", "start", "cont")):
-        return False, ("the project's changes are left uncommitted, so there is no starting point, target branch "
-                       "or work branch for it; pick changes on a branch for the project, or leave those empty")
+        return ("the project's changes are left uncommitted, so there is no starting point, target branch "
+                "or work branch for it; pick changes on a branch for the project, or leave those empty")
     base, ref, branch = (_one(form, n).strip() for n in ("base", "ref", "branch"))
     after = _one(form, "after_plan")
     wait, defaults = after not in ("go", "defaults"), after == "defaults"
     mode = _one(form, "start")
     if mode and mode not in START_MODES:
-        return False, "not a starting point: " + mode[:40]
+        return "not a starting point: " + mode[:40]
     if mode == "continue":
         ref = _one(form, "cont").strip()
         if not ref:
-            return False, "continue existing work: name the branch (or commit) the work is on"
+            return "continue existing work: name the branch (or commit) the work is on"
     elif mode == "here":
         ref = "here"
     elif mode == "new":
@@ -3114,11 +3271,11 @@ def add_tickets(runs, form):
                     ("continue from" if mode == "continue" else "start from", "" if ref == "here" else ref),
                     ("branch", branch)):
         if v and not ref_ok(v):
-            return False, f"{name}: not a branch, tag or commit name: {v[:80]}"
+            return f"{name}: not a branch, tag or commit name: {v[:80]}"
     if branch and len(keys) > 1:
-        return False, "a work branch name is for one ticket; add the tickets one at a time"
+        return "a work branch name is for one ticket; add the tickets one at a time"
     if mode == "continue" and len(keys) > 1:
-        return False, "continue existing work takes one ticket at a time (each needs its own branch)"
+        return "continue existing work takes one ticket at a time (each needs its own branch)"
     if mode == "continue" and not branch:
         branch = _branch_of_ref(project_branches(project), ref)
     preset = _one(form, "preset") or "full"
@@ -3127,15 +3284,15 @@ def add_tickets(runs, form):
     elif preset == "custom":
         stages = [s for s in STAGES if _one(form, "stage_" + s)]
     else:
-        return False, "not a preset: " + preset[:40]
+        return "not a preset: " + preset[:40]
     if not stages:
-        return False, "pick at least one stage"
+        return "pick at least one stage"
     if "fix" in stages and "review" not in stages:
-        return False, "fix runs only after a review asks for fixes; pick review too"
+        return "fix runs only after a review asks for fixes; pick review too"
     if "implement" not in stages and any(s in stages for s in ("review", "fix", "push")) \
             and mode == "new":
-        return False, ("with no implement stage the work must already exist: pick Continue existing work and name "
-                       "its branch (e.g. origin/ABC-123), or The folder as it is now")
+        return ("with no implement stage the work must already exist: pick Continue existing work and name "
+                "its branch (e.g. origin/ABC-123), or The folder as it is now")
     if "plan" not in stages or stages == ["plan"]:   # nothing waits on an approval, nor goes on past the plan
         wait = defaults = False
     if len(keys) == 1 and not keep:   # what the queue will not commit straight onto, said the form's way
@@ -3146,28 +3303,23 @@ def add_tickets(runs, form):
         names |= {tgt} | {tgt[len(r) + 1:] for r in info.get("remotes", ()) if tgt.startswith(r + "/")}
         if "error" not in info and work in names - {""}:
             if not base and work == tgt and work not in ("main", "master", *info.get("defaults", ())):
-                return False, (f"target branch: empty means the branch the folder is on, {tgt}, which is the branch "
-                               "the work would be committed to; give the branch this work is meant to go into")
-            return False, f"the work would be committed straight onto {work}; give it a work branch name of its own"
-    note = _one(form, "note").replace("\r\n", "\n")
-    if len(note) > ADD_NOTE_MAX:
-        return False, f"the note is over {ADD_NOTE_MAX} characters"
-    args = ["add", *keys, f"--project={project}", "--stages=" + ",".join(stages)]
-    if base:
-        args.append(f"--base={base}")
-    if ref:
-        args.append(f"--start={ref}")
-    if branch:
-        args.append(f"--branch={branch}")
+                return (f"target branch: empty means the branch the folder is on, {tgt}, which is the branch "
+                        "the work would be committed to; give the branch this work is meant to go into")
+            return f"the work would be committed straight onto {work}; give it a work branch name of its own"
+    args = [f"--project={project}", "--stages=" + ",".join(stages)]
+    for name, v in (("base", base), ("start", ref), ("branch", branch)):
+        if v or st is not None and not keep:
+            args.append(f"--{name}={v}")
     if keep:
         args.append("--no-branch")
-    args += repo_branches
+    if st is not None and tree and not repo_branches:
+        args.append("--no-repo-branches")
+    if st is None or tree:
+        args += repo_branches
     args.append("--review-plan" if wait else "--no-plan-approval")
     if defaults:   # its questions take their defaults: no stop for them either
         args.append("--take-defaults")
-    if note.strip():
-        args.append(f"--note={note}")
-    return _queue(runs, args)
+    return args
 
 
 def queue_action(runs, action, form):
