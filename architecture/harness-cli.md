@@ -703,7 +703,8 @@ never fetched (the pull prints `[your own ticket, not in the tracker]`), so a
 tracker issue with the same key cannot overwrite it, and everything that reads
 a ticket's copy (`--ticket`, the context files, the queue's `_pull` and
 `ticket_criteria`) works on it unchanged. Edit the file to change the work.
-`harness queue add --new "TEXT"` (repeatable) makes one per TEXT, titled by its
+`harness queue add --new "TEXT"` (repeatable; the viewer's Add form has the
+same as New work, no Jira ticket) makes one per TEXT, titled by its
 first line, and queues it with the other keys; a minted ticket whose add
 failed (no `state/queue/KEY/state.json`) is deleted again, and the vault is
 committed by the run's sync.
@@ -1850,8 +1851,12 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   one of the ticket's stages), why it waits (a running ticket: its stage,
   attempt and the run's `step`; a `running` ticket with no live run on it:
   "run ended"), and its buttons (move, Answer
-  or Review plan, stop, retry, remove); and the Add form (keys, project
-  folder, a Starting point: New work from the target branch, Continue
+  or Review plan, stop, retry, remove); and the Add form (keys, New work
+  with no Jira ticket (a textarea; `add_tickets` checks everything else
+  first, then `new_ticket` runs `vault_ticket.py --new` into the active
+  vault as `harness queue add --new` does, adds the LOCAL-N key to the
+  keys, and deletes the copy again when the queue did not add it; off with
+  no active vault), project folder, a Starting point: New work from the target branch, Continue
   existing work on a named branch such as `origin/ABC-123` (the work branch
   defaults to that branch's name; one ticket per add), or The folder as it is
   now (`--start here`); the Target branch (`--base`), an optional Work branch

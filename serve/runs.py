@@ -81,6 +81,7 @@ TEXT_CAP = 20000         # characters of one tool input/output shown inline
 MAX_MESSAGE = 65536      # bytes of one message sent to a live run
 NOTE_MAX = 4000         # characters of one owner note
 ADD_NOTE_MAX = 4000      # the note given with add (it goes on a command line)
+ADD_NEW_MAX = 20000      # the work described for a ticket of your own (it goes on stdin)
 # Windows: a child with a console of its own that has no window. Without it each git
 # or queue call a click makes flashes a console window when serve has no console
 # (the run viewer a launch leaves up) or a hidden one.
@@ -99,6 +100,7 @@ REPO_MODES = ("uncommitted", "branch")   # how a ticket's changes land in a repo
 ADD_FIELDS = 20 + 3 * REPO_ROWS          # the Add form: its own fields, then a mode, branch and target per repository
 HERE = os.path.dirname(os.path.abspath(__file__))
 QUEUE_SCRIPT = os.path.join(HERE, "..", "scripts", "ticket_queue.py")
+TICKET_SCRIPT = os.path.join(HERE, "..", "scripts", "vault_ticket.py")
 HARNESS = os.path.join(HERE, "..", "harness")
 WAITING = ("needs-answers", "plan-review", "blocked")   # a ticket waiting on the owner
 STAGES = ("plan", "implement", "review", "fix", "push")
@@ -1852,10 +1854,19 @@ def add_form(runs, form=None, err="", edit=""):
     sent = {k: _one(form, k) for k in form if k.startswith("repo_")} if form is not None else {}
     keys = (f"<label class='fld'>Ticket<input name='keys' readonly value='{esc(edit)}'><small>the key does not "
             "change; remove the ticket and add it again for another</small></label>") if edit else (
-        "<label class='fld'>Ticket keys<input name='keys' required autocomplete='off' spellcheck='false' "
+        "<label class='fld'>Ticket keys<input name='keys' autocomplete='off' spellcheck='false' "
         f"value='{esc(v('keys'))}' placeholder='ABC-123 ABC-124'>"
         "<small>one or more, space or comma separated. Each is its own ticket, all with the settings below; "
-        "a work branch it gets is named after its key</small></label>")
+        "a work branch it gets is named after its key. No ticket in Jira? Describe the work below</small></label>")
+    new = "" if edit else (
+        "<label class='fld'>New work, no Jira ticket<textarea name='new' maxlength='20000' "
+        + ("" if runs.vault else "disabled ") +
+        "placeholder='Fix the flaky login test&#10;It fails about one run in ten, in CI only.'>"
+        f"{esc(v('new'))}</textarea><small>"
+        + ("a ticket of your own, the next LOCAL-N, is made for it in the vault and queued with the keys above. "
+           "The first line is its title; edit it later in .raw/tickets/ in the vault" if runs.vault else
+           "needs an active vault to write the ticket into (harness vault use NAME)") +
+        "</small></label>")
     title, action = ("Settings", f"/runs/ticket/{quote(edit)}/edit") if edit else ("Add tickets", "/runs/queue/add")
     return (f"<section class='panel' id='add'{' data-err=1' if err else ''}><div class='hd'><h2>{title}</h2></div>"
             + (f"<p class='err' role='alert'>Not {'changed' if edit else 'added'}: {esc(err)}</p>" if err else "") +
@@ -1865,7 +1876,7 @@ def add_form(runs, form=None, err="", edit=""):
             f"value='{esc(project)}' placeholder='/home/me/src/project'>"
             f"<datalist id='projects'>{opts}</datalist><datalist id='branches'></datalist>"
             "<small>the git repository the work is in (absolute path)</small></label>"
-            "</div>"
+            f"</div>{new}"
             "<div class='projhint muted' id='projhint' aria-live='polite'></div>"
             "<fieldset id='f-repos' hidden><legend>Repositories</legend>"
             "<small class='muted'>The agents work in all of them. For each, the ticket's changes are left "
@@ -3218,14 +3229,19 @@ def add_tickets(runs, form):
     """The queue page's Add form: harness queue add, its values checked first."""
     raw = _one(form, "keys")
     keys = [k.upper() for k in re.split(r"[\s,;]+", raw) if k]
-    if not keys:
-        return False, "give at least one ticket key"
-    if len(keys) > MAX_KEYS:
+    new = _one(form, "new").replace("\r\n", "\n").strip()
+    if not keys and not new:
+        return False, "give at least one ticket key, or describe new work with no Jira ticket"
+    if new and not (runs.vault and os.path.isdir(runs.vault)):
+        return False, "new work is written into the active vault as a ticket of your own, and there is no active vault"
+    if len(new) > ADD_NEW_MAX:
+        return False, f"the new work's description is over {ADD_NEW_MAX} characters"
+    if len(keys) + bool(new) > MAX_KEYS:
         return False, f"at most {MAX_KEYS} tickets at a time"
     bad = [k for k in keys if not KEY_RE.match(k) or len(k) > 40]
     if bad:
         return False, "not a ticket key (like ABC-123): " + ", ".join(bad[:5])[:200]
-    args = ticket_args(form, keys)
+    args = ticket_args(form, keys + [""] * bool(new))   # the new work is one more ticket, its key not made yet
     if isinstance(args, str):
         return False, args
     note = _one(form, "note").replace("\r\n", "\n")
@@ -3233,7 +3249,37 @@ def add_tickets(runs, form):
         return False, f"the note is over {ADD_NOTE_MAX} characters"
     if note.strip():
         args.append(f"--note={note}")
-    return _queue(runs, ["add", *keys, *args])
+    made = ""
+    if new:   # last, once everything else is fine: the ticket of your own, as harness queue add --new makes it
+        made, why = new_ticket(runs, new)
+        if why:
+            return False, why
+        keys.append(made)
+    res = _queue(runs, ["add", *keys, *args])
+    if made and not os.path.exists(os.path.join(runs.queue_dir, made, "state.json")):
+        try:   # not queued: the ticket made for it goes again
+            os.remove(os.path.join(runs.vault, ".raw", "tickets", made + ".md"))
+        except OSError:
+            pass
+    return res
+
+
+def new_ticket(runs, text):
+    """A ticket of your own for text (vault_ticket.py --new, as harness ticket new):
+    (its key, "") or ("", why not)."""
+    title = next((x.strip() for x in text.splitlines() if x.strip()), "")
+    cmd = [sys.executable, TICKET_SCRIPT, "--new", runs.vault, "-", title, runs.queue_dir]
+    try:
+        p = subprocess.run(cmd, input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=30, env={**os.environ, "PYTHONUTF8": "1"}, **NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "", f"the ticket for the new work was not made: {e}"
+    key = p.stdout.decode("utf-8", "replace").strip()
+    if p.returncode or not KEY_RE.match(key):
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        return "", "the ticket for the new work was not made: " + ((err[-1] if err else "") or key or
+                                                                   f"status {p.returncode}")[:200]
+    return key, ""
 
 
 def ticket_args(form, keys, st=None):
@@ -3297,7 +3343,7 @@ def ticket_args(form, keys, st=None):
         wait = defaults = False
     if len(keys) == 1 and not keep:   # what the queue will not commit straight onto, said the form's way
         info = project_branches(project)
-        work = branch or keys[0]
+        work = branch or keys[0]   # "": new work, its key (LOCAL-N) not a shared branch
         tgt = base or info.get("current", "")
         names = {"main", "master", *info.get("defaults", ())}
         names |= {tgt} | {tgt[len(r) + 1:] for r in info.get("remotes", ()) if tgt.startswith(r + "/")}
@@ -3645,7 +3691,9 @@ COMMON_JS = """
       return hit;
     }
     function sync() {
-      var keys = q('input[name=keys]').value.toUpperCase().split(/[\\s,;]+/).filter(Boolean), many = keys.length > 1;
+      var keys = q('input[name=keys]').value.toUpperCase().split(/[\\s,;]+/).filter(Boolean),
+        nw = q('textarea[name=new]'), fresh = !!nw && !nw.disabled && !!nw.value.trim(),
+        many = keys.length + (fresh ? 1 : 0) > 1;
       off(q('input[name=stage_fix]'), q('input[name=stage_review]').checked ? '' : 'fix needs review');
       var on = [];
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
@@ -3677,9 +3725,9 @@ COMMON_JS = """
       say(ap.querySelector(':scope > .why'), apWhy);
       var probs = [], warns = [];
       var bad = keys.filter(function (k) { return !KEY.test(k) || k.length > 40; });
-      if (!keys.length) probs.push('Give at least one ticket key.');
+      if (!keys.length && !fresh) probs.push('Give at least one ticket key, or describe new work with no Jira ticket.');
       else if (bad.length) probs.push('Not a ticket key (like ABC-123): ' + bad.slice(0, 3).join(', '));
-      else if (keys.length > MAXK) probs.push('At most ' + MAXK + ' tickets at a time.');
+      else if (keys.length + (fresh ? 1 : 0) > MAXK) probs.push('At most ' + MAXK + ' tickets at a time.');
       if (!q('input[name=project]').value.trim()) probs.push('Give the project folder.');
       else if (projErr) probs.push(projErr);
       if (!on.length) probs.push('Pick at least one stage.');

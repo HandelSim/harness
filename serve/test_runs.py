@@ -1450,6 +1450,49 @@ class QueuePageTest(RunsServer):
         self.assertIn("placeholder='origin/ABC-123'", body)
         self.assertIn("value='origin/ABC-5'", body)
 
+    def test_add_new_work_with_no_jira_ticket(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        tickets = os.path.join(self.vault, ".raw", "tickets")
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("New work, no Jira ticket<textarea name='new'", body)
+        # only the new work: a ticket of your own is made in the vault and queued
+        r, body = self.post("/runs/queue/add", [("keys", ""), ("project", proj), ("branch", "fix/login"),
+                                                ("new", "Fix the flaky login test\r\nIt fails one run in ten")])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.queue, "LOCAL-1", "state.json")) as f:
+            self.assertEqual(json.load(f)["branch"], "fix/login")
+        with open(os.path.join(tickets, "LOCAL-1.md")) as f:
+            copy = f.read()
+        for want in ("source: local\n", "# LOCAL-1: Fix the flaky login test\n", "It fails one run in ten\n"):
+            self.assertIn(want, copy)
+        # with keys: one more ticket, so no work branch name
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-30"), ("project", proj), ("branch", "x"),
+                                                ("new", "tidy the readme")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("a work branch name is for one ticket", body)
+        self.assertIn(">tidy the readme</textarea>", body)
+        self.assertFalse(os.path.exists(os.path.join(tickets, "LOCAL-2.md")))
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-30"), ("project", proj), ("new", "tidy the readme")])
+        self.assertEqual(r.status, 303, body)
+        for k in ("ABC-30", "LOCAL-2"):
+            self.assertTrue(os.path.exists(os.path.join(self.queue, k, "state.json")), k)
+        # an add the queue refuses takes its new ticket out of the vault again
+        r, body = self.post("/runs/queue/add", [("project", self.tmp.name), ("new", "never queued")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("not in a git repository", body)
+        self.assertFalse(os.path.exists(os.path.join(tickets, "LOCAL-3.md")))
+        r, body = self.post("/runs/queue/add", [("keys", " "), ("project", proj), ("new", " ")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("or describe new work", body)
+        # no active vault: nowhere to write it
+        self.start(vault="")
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("<textarea name='new' maxlength='20000' disabled", body)
+        r, body = self.post("/runs/queue/add", [("project", proj), ("new", "x")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("there is no active vault", body)
+
     def test_add_a_review_only_ticket_with_its_ref_and_a_note(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
         self.start()
@@ -1549,7 +1592,7 @@ class QueuePageTest(RunsServer):
         self.assertEqual(r.status, 409)
         self.assertIn("id='add' data-err=1", body)
         self.assertIn("Not added: the project folder", body)
-        for frag in ("name='keys' required autocomplete='off' spellcheck='false' value='ABC-9'",
+        for frag in ("name='keys' autocomplete='off' spellcheck='false' value='ABC-9'",
                      "value='dev'", "value='origin/x'", ">keep &lt;me&gt;</textarea>",
                      "value='custom' checked", "value='review' checked", "value='plan'> plan"):
             self.assertIn(frag, body)
