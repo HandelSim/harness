@@ -1499,10 +1499,10 @@ class QueuePageTest(RunsServer):
         self.assertIn("not a kind of ticket", body)
         r, body = self.post("/runs/queue/add", [("keys", " "), ("project", proj)])
         self.assertIn("give at least one ticket key", body)
-        # no active vault: nowhere to save one
+        # no active vault: nowhere to save one (the queue still has LOCAL-1 and LOCAL-2)
         self.start(vault="")
         r, body = self.req("GET", "/runs/queue")
-        self.assertIn("value='local' data-next='LOCAL-1' disabled>A ticket of your own", body)
+        self.assertIn("value='local' data-next='LOCAL-3' disabled>A ticket of your own", body)
         r, body = self.post("/runs/queue/add", [("kind", "local"), ("title", "x"), ("project", proj)])
         self.assertEqual(r.status, 409)
         self.assertIn("there is no active vault", body)
