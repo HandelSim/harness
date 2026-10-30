@@ -277,7 +277,7 @@ class Queue:
         """KEY/stop (the owner stopped the ticket) or, without a key, DIR/halt (the run)."""
         return os.path.join(self.dir(key), "stop") if key else os.path.join(self.root, "halt")
 
-    def log(self, key, line, detail=""):
+    def log(self, key, line, detail="", echo=True):
         """One line in the ticket's log and in run.log (what `harness queue watch` tails)."""
         stamp = f"{now_iso()} {key} {line}\n"
         for path in (os.path.join(self.dir(key), "log.md"), os.path.join(self.root, "run.log")):
@@ -286,7 +286,8 @@ class Queue:
                 f.write(stamp)
                 if detail and path.endswith("log.md"):
                     f.write(detail.rstrip() + "\n")
-        print(stamp, end="", file=sys.stderr, flush=True)
+        if echo:
+            print(stamp, end="", file=sys.stderr, flush=True)
 
 
 @contextlib.contextmanager
@@ -3924,32 +3925,35 @@ def run_tickets(q, ctx):
 
 # --- the owner's commands --------------------------------------------------------------
 
-def cmd_add(q, a):
+def settle(q, a, keys):
+    """add's options (a) for these keys checked and worked out: {project, base,
+    stages, start, start_sha, in_place, repos, lost}, or None (why printed). edit
+    checks a ticket's new settings with it too."""
     project = a.project or os.getcwd()
     r = subprocess.run(["git", "-C", project, "rev-parse", "--show-toplevel"], capture_output=True, **TEXT)
     if r.returncode != 0:
         print(f"[queue] {project} is not in a git repository (use --dir)", file=sys.stderr)
-        return 1
+        return None
     project = r.stdout.strip()
     if a.in_place and a.clone:
         print("[queue] --in-place and --clone: give one of them (in place is the default)", file=sys.stderr)
-        return 1
+        return None
     if a.review_plan and a.no_plan_approval:
         print("[queue] --review-plan and --no-plan-approval: give one of them (approval is the default)",
               file=sys.stderr)
-        return 1
+        return None
     in_place = not a.clone
     if a.no_branch and (a.branch or a.start or a.ref or a.base or a.clone):
         print("[queue] --no-branch leaves the change in the project uncommitted: --branch, --start, --base and "
               "--clone do not go with it", file=sys.stderr)
-        return 1
+        return None
     repos, why = repo_branches(project, a.repo_branch, a.allow_branch)
     if why:
         print(f"[queue] {why}", file=sys.stderr)
-        return 1
+        return None
     if repos and not in_place:
         print("[queue] --repo-branch works in place, not in a clone", file=sys.stderr)
-        return 1
+        return None
     on = git(project, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
     # the folder on an in-place ticket's branch (the queue switched it): new work starts where that ticket's did
     queued = next((s for s in map(q.load, q.order()) if s and s.get("in_place") and s.get("project") == project
@@ -3957,15 +3961,15 @@ def cmd_add(q, a):
     base = a.base or (queued["base"] if queued else on) or git(project, "rev-parse", "HEAD").stdout.strip()
     if git(project, "rev-parse", "-q", "--verify", base + "^{commit}", check=False).returncode != 0:
         print(f"[queue] {base} is not a commit in {project}", file=sys.stderr)
-        return 1
+        return None
     stages, why = parse_stages(a.stages) if a.stages is not None else (list(ALL_STAGES), None)
     if why:
         print(f"[queue] {why}", file=sys.stderr)
-        return 1
+        return None
     if a.start and a.ref and a.start != a.ref:
         print("[queue] --ref is the old name of --start; give one of them", file=sys.stderr)
-        return 1
-    start = a.start or a.ref or ((queued["start_sha"] if queued else HERE) if in_place else "")
+        return None
+    start, start_sha = a.start or a.ref or ((queued["start_sha"] if queued else HERE) if in_place else ""), ""
     if queued and not (a.start or a.ref):
         print(f"[queue] note: {project} is on {queued['key']}'s branch {on}; the work starts where "
               f"{queued['key']}'s did ({start[:12]}), on base {base}", file=sys.stderr)
@@ -3973,10 +3977,10 @@ def cmd_add(q, a):
         sha = commit_of(project, start)
         if not sha:
             print(f"[queue] {start} is not a commit in {project} (git fetch it first?)", file=sys.stderr)
-            return 1
+            return None
         if git(project, "merge-base", base, sha, check=False).returncode != 0:
             print(f"[queue] {start} and {base} have no history in common", file=sys.stderr)
-            return 1
+            return None
         start_sha = sha
         if start == HERE:   # the commit the project is at now (in place, its uncommitted files come along)
             changes = uncommitted(project)
@@ -3987,23 +3991,66 @@ def cmd_add(q, a):
             start = sha
     if a.branch and git(project, "check-ref-format", "--branch", a.branch, check=False).returncode != 0:
         print(f"[queue] not a branch name: {a.branch}", file=sys.stderr)
-        return 1
-    if a.branch and len({k.upper() for k in a.keys}) > 1:
-        print(f"[queue] --branch {a.branch} with {len(a.keys)} tickets: each would end on (and push) the same "
+        return None
+    if a.branch and len({k.upper() for k in keys}) > 1:
+        print(f"[queue] --branch {a.branch} with {len(keys)} tickets: each would end on (and push) the same "
               "branch. Add them one at a time, or leave --branch out (each gets its own)", file=sys.stderr)
-        return 1
+        return None
     shared = shared_branches(project, base)
     if a.branch and a.branch in shared and not a.allow_branch:
         print(f"[queue] --branch {a.branch} is {shared[a.branch]}: the queue would commit (and push) there "
               "directly. Pick a branch of its own, or give --allow-branch to mean it", file=sys.stderr)
+        return None
+    lost = {}
+    if start:   # the branch's tips here and on each remote: fetched, so not under the lock
+        for key in {k.upper() for k in keys if KEY_RE.match(k.upper())}:
+            lost[key] = lost_by(project, a.branch or key, start_sha)
+    return {"project": project, "base": base, "stages": stages, "start": start, "start_sha": start_sha,
+            "in_place": in_place, "repos": repos, "lost": lost}
+
+
+def settings(st, got, a):
+    """The ticket's settings from settle's result (got) and add's options (a); a
+    setting that is off is left out of the state, as add has always written it."""
+    st.update(project=got["project"], base=got["base"], stages=got["stages"])
+    for k in ("start", "ref", "branch", "in_place", "plan_review", "no_branch", "repos", "take_defaults"):
+        st.pop(k, None)
+    st.update({k: v for k, v in (("start", "" if a.no_branch else got["start"]), ("branch", a.branch),
+                                 ("in_place", got["in_place"]), ("plan_review", not a.no_plan_approval),
+                                 ("no_branch", a.no_branch), ("repos", got["repos"]),
+                                 ("take_defaults", a.take_defaults)) if v})
+    st["stage"] = first_stage(st)
+    return st
+
+
+def lost_why(st, lost):
+    return (f"{st['key']}: branch {branch_of(st)} has commits that {start_of(st)} does not "
+            f"({', '.join(n for n, _ in lost)}): the work would end over them. Start from it "
+            f"(--start {lost[0][0]}) or pick another --branch")
+
+
+def described(st):
+    """How a ticket will be worked, said as add and edit say it."""
+    key, project, stages, repos = st["key"], st["project"], stages_of(st), st.get("repos") or {}
+    frm = start_of(st)
+    frm = frm[:12] if re.fullmatch(r"[0-9a-f]{40}", frm) else frm[:40]
+    how = (f"in {project} itself" if st.get("in_place") else f"in a clone of {project}") \
+        + (", its change left uncommitted" if st.get("no_branch") else f", from {frm} on branch {branch_of(st)}") \
+        + "".join(f"; {r} on branch {v['branch'] or key} (from {v['base']})" for r, v in sorted(repos.items()))
+    plan = "" if "plan" not in stages else "; it is done once the plan is written" if stages == ["plan"] \
+        else f"; the plan waits for you to approve it (harness queue approve {key})" if st.get("plan_review") \
+        else f"; {stages[1]} starts after the plan without asking"
+    return f"{how}; stages {','.join(stages)}{plan}"
+
+
+def cmd_add(q, a):
+    got = settle(q, a, a.keys)
+    if got is None:
         return 1
     if a.note is not None and not a.note.strip():
         print("[queue] --note is empty", file=sys.stderr)
         return 1
-    rc, lost = 0, {}
-    if start:   # the branch's tips here and on each remote: fetched, so not under the lock
-        for key in {k.upper() for k in a.keys if KEY_RE.match(k.upper())}:
-            lost[key] = lost_by(project, a.branch or key, start_sha)
+    rc = 0
     with held(os.path.join(q.root, "queue.lock")):
         order = q.order()
         for raw in a.keys:
@@ -4016,34 +4063,144 @@ def cmd_add(q, a):
                 print(f"[queue] {key} is already in the queue ('harness queue remove {key}' first)", file=sys.stderr)
                 rc = 1
                 continue
-            st = {"key": key, "project": project, "base": base, "status": "queued", "stage": "plan", "attempt": 0,
-                  "feedback": "", "reason": "", "created": now_iso(), "stages": stages, "notes": []}
-            st["stage"] = first_stage(st)
-            st.update({k: v for k, v in (("start", "" if a.no_branch else start), ("branch", a.branch),
-                                         ("in_place", in_place), ("plan_review", not a.no_plan_approval),
-                                         ("no_branch", a.no_branch), ("repos", repos),
-                                         ("take_defaults", a.take_defaults)) if v})
-            if lost.get(key) and not a.no_branch:
-                print(f"[queue] {key}: branch {branch_of(st)} has commits that {start_of(st)} does not "
-                      f"({', '.join(n for n, _ in lost[key])}): the work would end over them. Start from it "
-                      f"(--start {lost[key][0][0]}) or pick another --branch", file=sys.stderr)
+            st = settings({"key": key, "status": "queued", "attempt": 0, "feedback": "", "reason": "",
+                           "created": now_iso(), "notes": []}, got, a)
+            if got["lost"].get(key) and not a.no_branch:
+                print(f"[queue] {lost_why(st, got['lost'][key])}", file=sys.stderr)
                 rc = 1
                 continue
             if a.note:
                 q.add_note(key, a.note)
             q.save(st)
             order.append(key)
-            frm = start_of(st)
-            frm = frm[:12] if re.fullmatch(r"[0-9a-f]{40}", frm) else frm[:40]
-            how = (f"in {project} itself" if in_place else f"in a clone of {project}") \
-                + (", its change left uncommitted" if a.no_branch else f", from {frm} on branch {branch_of(st)}") \
-                + "".join(f"; {r} on branch {v['branch'] or key} (from {v['base']})" for r, v in sorted(repos.items()))
-            plan = "" if "plan" not in stages else "; it is done once the plan is written" if stages == ["plan"] \
-                else f"; the plan waits for you to approve it (harness queue approve {key})" if not a.no_plan_approval \
-                else f"; {stages[1]} starts after the plan without asking"
-            print(f"[queue] {key}: queued ({how}; stages {','.join(stages)}{plan})")
+            print(f"[queue] {key}: queued ({described(st)})")
         q.set_order(order)
     return rc
+
+
+WHERE_OPTS = ("project", "base", "start", "branch")   # edit's options that say where the work is
+
+
+def edit_refused(q, st):
+    """Why the ticket's settings cannot change now, or ''."""
+    if st["status"] == "running" or run_holds(q, st["key"]):
+        return (f"{st['key']} is running: its settings change only while it waits "
+                f"(harness queue stop {st['key']} first)")
+    return ""
+
+
+def cmd_edit(q, a):
+    """A ticket's settings changed, only the options given. Before its work started
+    (the queue made its branch or clone), anything add sets, checked as add checks
+    it; after, the stages still to come and what happens after the plan."""
+    key = a.key.upper()
+    st = q.load(key)
+    if not st:
+        print(f"[queue] {key} is not in the queue", file=sys.stderr)
+        return 1
+    why = edit_refused(q, st)
+    if why:
+        print(f"[queue] {why}", file=sys.stderr)
+        return 1
+    where = any(getattr(a, k) is not None for k in WHERE_OPTS) or a.no_branch or a.repo_branch \
+        or a.no_repo_branches or a.in_place or a.clone
+    plan = a.review_plan or a.no_plan_approval or a.take_defaults
+    if a.review_plan and (a.no_plan_approval or a.take_defaults):
+        print("[queue] --review-plan and --no-plan-approval or --take-defaults: give one of them", file=sys.stderr)
+        return 1
+    if not (where or plan or a.stages is not None):
+        print(f"[queue] nothing to change for {key} (see: harness queue edit --help)", file=sys.stderr)
+        return 1
+    review = a.review_plan if plan else bool(st.get("plan_review"))
+    defaults = a.take_defaults if plan else bool(st.get("take_defaults"))
+    if st.get("start_sha"):
+        if where:
+            print(f"[queue] {key}'s work has started (branch {branch_of(st)} from {st['start_sha'][:12]}"
+                  f"{' in ' + st['project'] if st.get('in_place') else ' in its clone'}): its project, base, "
+                  f"start, branch and repositories stay as they are. To change them, harness queue remove {key} "
+                  "and add it again", file=sys.stderr)
+            return 1
+        stages = stages_of(st)
+        if a.stages is not None:
+            stages, why = parse_stages(a.stages)
+            if why:
+                print(f"[queue] {why}", file=sys.stderr)
+                return 1
+            cur = st.get("stage")
+            if cur not in ALL_STAGES:
+                print(f"[queue] {key} is done: its stages stay as they are (harness queue followup {key}, or "
+                      f"retry --stage S, takes it further)", file=sys.stderr)
+                return 1
+            upto = ALL_STAGES[:ALL_STAGES.index(cur) + 1]
+            kept = [s for s in stages_of(st) if s in upto]
+            if [s for s in stages if s in upto] != kept:
+                print(f"[queue] {key} is at {cur}: the stages up to it stay ({','.join(kept)}); only the ones "
+                      f"after it change", file=sys.stderr)
+                return 1
+        with held(os.path.join(q.root, "queue.lock")):
+            now = q.load(key)
+            why = edit_refused(q, now) if now else f"{key} is not in the queue"
+            if not why and now.get("stage") != st.get("stage"):
+                why = f"{key} moved on to {now.get('stage')} meanwhile; look again"
+            if why:
+                print(f"[queue] {why}", file=sys.stderr)
+                return 1
+            now["stages"] = stages
+            for k, v in (("plan_review", review), ("take_defaults", defaults)):
+                now.pop(k, None)
+                if v:
+                    now[k] = True
+            q.save(now)
+        q.log(key, f"edited: {described(now)}", echo=False)
+        print(f"[queue] {key}: changed ({described(now)})"
+              + ("; the plan waiting now still needs approve or answer" if now["status"] == "plan-review" and plan
+                 else ""))
+        return 0
+    # not started: add's checks on the settings as they would be
+    top = git(a.project, "rev-parse", "--show-toplevel", check=False).stdout.strip() \
+        if a.project and os.path.isdir(a.project) else ""
+    moved = bool(a.project) and os.path.realpath(top or a.project) != os.path.realpath(st["project"])
+    old = (lambda v: None if moved else v or None)
+    if a.no_branch:
+        no_branch = True
+    elif any(getattr(a, k) is not None for k in ("base", "start", "branch")):
+        no_branch = False
+    else:
+        no_branch = bool(old(st.get("no_branch")))
+    pick = (lambda k, v: None if no_branch else (getattr(a, k) or None) if getattr(a, k) is not None else old(v))
+    if a.no_repo_branches:
+        specs = []
+    elif a.repo_branch:
+        specs = a.repo_branch
+    else:
+        specs = [f"{r}={v.get('branch', '')}:{v['base']}" for r, v in sorted((old(st.get("repos")) or {}).items())]
+    in_place = True if a.in_place else False if a.clone else bool(st.get("in_place")) or moved
+    ns = argparse.Namespace(
+        project=a.project or st["project"], base=pick("base", st.get("base")),
+        start=pick("start", st.get("start") or st.get("ref")), ref=None, branch=pick("branch", st.get("branch")),
+        no_branch=no_branch, repo_branch=specs, allow_branch=a.allow_branch, in_place=False, clone=not in_place,
+        stages=a.stages if a.stages is not None else ",".join(stages_of(st)), review_plan=False,
+        no_plan_approval=not review, take_defaults=defaults and not review)
+    got = settle(q, ns, [key])
+    if got is None:
+        return 1
+    with held(os.path.join(q.root, "queue.lock")):
+        now = q.load(key)
+        why = edit_refused(q, now) if now else f"{key} is not in the queue"
+        if not why and now.get("start_sha"):
+            why = f"{key}'s work started meanwhile; look again"
+        if why:
+            print(f"[queue] {why}", file=sys.stderr)
+            return 1
+        before = described(now)
+        settings(now, got, ns)
+        if got["lost"].get(key) and not ns.no_branch:
+            print(f"[queue] {lost_why(now, got['lost'][key])}", file=sys.stderr)
+            return 1
+        q.save(now)
+    q.log(key, f"edited: {described(now)} (was: {before})", echo=False)
+    print(f"[queue] {key}: changed ({described(now)})")
+    return 0
 
 
 def repo_branches(project, specs, allow_branch=False):
@@ -4907,6 +5064,16 @@ def main(argv):
     s.add_argument("--review-plan", action="store_true")   # the default
     s.add_argument("--no-plan-approval", action="store_true")
     s.add_argument("--take-defaults", action="store_true")   # blocking questions go on at their Default
+    s = sub.add_parser("edit"); s.add_argument("key"); s.add_argument("--project"); s.add_argument("--base")
+    s.add_argument("--stages"); s.add_argument("--start"); s.add_argument("--branch")   # "": the default again
+    s.add_argument("--in-place", action="store_true")
+    s.add_argument("--clone", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--no-branch", action="store_true")
+    s.add_argument("--repo-branch", action="append", default=[])   # given: these replace the ticket's
+    s.add_argument("--no-repo-branches", action="store_true")       # every repository inside left uncommitted
+    s.add_argument("--allow-branch", action="store_true")
+    s.add_argument("--review-plan", action="store_true"); s.add_argument("--no-plan-approval", action="store_true")
+    s.add_argument("--take-defaults", action="store_true")
     sub.add_parser("list")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("remove"); s.add_argument("keys", nargs="+"); s.add_argument("--harness", default="")
@@ -4950,8 +5117,8 @@ def main(argv):
     a.argv = argv
     q = Queue(a.state)
     try:
-        return {"add": cmd_add, "list": cmd_list, "status": cmd_status, "remove": cmd_remove, "approve": cmd_approve,
-            "retry": cmd_retry, "continue": cmd_continue, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
+        return {"add": cmd_add, "edit": cmd_edit, "list": cmd_list, "status": cmd_status, "remove": cmd_remove,
+            "approve": cmd_approve, "retry": cmd_retry, "continue": cmd_continue, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
             "answer": cmd_answer, "followup": cmd_followup, "findings": cmd_findings, "run": cmd_run}[a.cmd](q, a)
     except Busy as e:
         print(f"[queue] {e}; try again", file=sys.stderr)
