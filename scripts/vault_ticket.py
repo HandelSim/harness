@@ -13,8 +13,10 @@ Bearer; <email>:<api-token> for Cloud, sent as Basic), and writes
 secrets redacted, rewritten only when it changed. The acceptance criteria
 field (by name, and the ids or names in TRACKER_AC_FIELDS, else the charter's
 tracker_ac_fields) goes in it as bullets under "## Acceptance criteria". It also creates the agent's
-state note, wiki/notes/tickets/<KEY>-state.md, when there is none. Both reach
-the agent as instruction files; the note is the agent's to keep up to date.
+state note, wiki/notes/tickets/<KEY>-state.md, when there is none, and
+rewrites wiki/context/<KEY>-context.md, the glossary lines the ticket uses
+(vault_ingest.ticket_contexts). All three reach the agent as instruction
+files; the note is the agent's to keep up to date.
 
 Prints one status line (new, updated, unchanged, or why the tracker was not
 reached and which snapshot is used instead) and exits 0: a launch never
@@ -34,7 +36,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vault_capture import redact  # noqa: E402
-from vault_ingest import frontmatter, read_text, write_if_changed, yq  # noqa: E402
+from vault_ingest import frontmatter, read_text, ticket_contexts, write_if_changed, yq  # noqa: E402
 
 TIMEOUT = 6
 MAX_DESCRIPTION = 12000
@@ -375,6 +377,7 @@ def main(argv):
     else:
         msg = f"{key}: {why}; no copy of the ticket yet, the agent gets only its state note"
     ensure_note(vault, key, title)
+    ticket_contexts(vault, only=key)
     print(msg)
     return 0
 

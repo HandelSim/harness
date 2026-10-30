@@ -26,6 +26,10 @@
 #                                         the launch's instruction files,
 #                                         ticket and context in captured
 #                                         sessions, the ticket hub
+#   - domain documents                    md/html/docx (a bad pdf skipped),
+#                                         quote-checked Terms, Rules and Keep
+#                                         lines, the glossary, a ticket's
+#                                         context page, the candidates
 #
 # Prints "VAULT TEST PASSED" on success.
 
@@ -1175,5 +1179,139 @@ rm -f "$V/wiki/code/away/mine.md"
     true
 ) || exit 1
 ok "V26: status (--json, --quick), the run file while an ingest runs, exit 3 on the lock, --unit, forget, harness ingest --status/--forget"
+
+# --- V27: domain documents, the glossary, ticket context and candidates ------
+# The mock answers in the format the prompt asks for (Terms/Rules for a
+# domain document, Keep for a session), with one quote that is not in the
+# source each time: that line, and only that line, must be dropped.
+MOCK27="$TMP_ROOT/mock27.py"
+REQS27="$TMP_ROOT/requests27.jsonl"
+cat > "$MOCK27" <<'PYEOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+DOCS = [
+    ("Net Asset Value", "summary: fund valuation\n### Terms\n"
+     "- Net Asset Value (NAV): fund assets minus liabilities \"value of a fund's assets minus its liabilities\"\n"
+     "- Widget: a made up thing \"widgets are always blue\"\n### Rules\n"
+     "- The NAV is published by 6 pm each business day \"must be published by 6 pm\"\n"
+     "- Trades settle within two business days \"must settle within two business days\"\nTopics: [[valuation]]"),
+    ("Settlement Date", "summary: settlement\n### Terms\n"
+     "- **Settlement Date**: the day a trade is paid \"the day a trade is paid for\"\n### Rules\n- none\nTopics: [[settlement]]"),
+    ("clearing house", "summary: clearing\n### Terms\n"
+     "- clearing house: sits between the two sides “stands between buyer and seller”\n### Rules\n- none\nTopics: [[clearing]]"),
+    ("ALLBAD", "summary: nothing\n### Terms\n- Foo: bar \"this is not in the source at all\"\n### Rules\n- none\nTopics: [[x]]"),
+    ("we chose sqlite", "summary: storage choice\n### What happened\nThe storage engine was chosen for the host.\n"
+     "### Keep\n- [decision] Use sqlite: the host has no database server \"the host has no server\"\n"
+     "- [gotcha] something invented \"this never was said here\"\nTopics: [[storage]]"),
+]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        self.reply({"data": [{"id": "free-m"}]})
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        prompt = req["messages"][0]["content"]
+        with open(sys.argv[2], "a") as f:
+            f.write(json.dumps({"n": len(req["messages"]), "prompt": prompt}) + "\n")
+        src = prompt.split("<<<BEGIN_SOURCE>>>", 1)[1].split("<<<END_SOURCE>>>", 1)[0]
+        text = next((t for k, t in DOCS if k in src),
+                    "summary: covers notes\n### What happened\nThe source was read and summed up here.\nTopics: [[misc]]")
+        self.reply({"choices": [{"message": {"role": "assistant", "content": text}}]})
+srv = HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYEOF
+# shellcheck disable=SC2086
+$PY "$MOCK27" 0 "$REQS27" > "$TMP_ROOT/mock27.port" 2>/dev/null &
+MOCK27_PID=$!
+trap 'kill "$MOCK_PID" "$JIRA_PID" "$MOCK27_PID" 2>/dev/null; rm -rf "$TMP_ROOT"' EXIT
+for _ in $(seq 50); do [[ -s "$TMP_ROOT/mock27.port" ]] && break; sleep 0.1; done
+PORT27=$(head -n 1 "$TMP_ROOT/mock27.port")
+[[ -n "$PORT27" ]] || fail "V27: the mock upstream did not start"
+DV="$TMP_ROOT/domvault"
+cp -R "$REPO_ROOT/vault-template" "$DV"
+printf -- "---\ntype: overview\nsummary: 'funds'\nproject: 'funds'\nticket_pattern: '[A-Z]+-[0-9]+'\n---\n" > "$DV/wiki/overview.md"
+mkdir -p "$DV/.raw/domain" "$DV/.raw/sessions" "$DV/.raw/tickets"
+printf '# Funds\n\nThe Net Asset Value (NAV) is the value of a fund'"'"'s assets minus its liabilities.\n\n## Rules\n\nThe NAV must be published by 6 pm every business day. Every trade must settle within two business days.\n' \
+    > "$DV/.raw/domain/funds.md"
+printf '<html><body><h1>Clearing</h1><p>A clearing house stands between buyer and seller.</p><script>evilScript()</script></body></html>\n' \
+    > "$DV/.raw/domain/clearing.html"
+printf 'ALLBAD: nothing useful in this document at all.\n' > "$DV/.raw/domain/bad.txt"
+printf 'not a pdf\n' > "$DV/.raw/domain/scan.pdf"
+$PY - "$DV/.raw/domain/terms.docx" <<'PYEOF'
+import sys, zipfile
+W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+doc = (f'<?xml version="1.0"?><w:document {W}><w:body>'
+       '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Settlement</w:t></w:r></w:p>'
+       '<w:p><w:r><w:t>Settlement Date: the day a trade is paid for </w:t></w:r><w:r><w:t>and delivered.</w:t></w:r></w:p>'
+       '</w:body></w:document>')
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    z.writestr("word/document.xml", doc)
+PYEOF
+printf -- '---\ntype: session\ntitle: storage\n---\n## User\nWhich database?\n## Assistant\nwe chose sqlite because the host has no server to run one.\n' \
+    > "$DV/.raw/sessions/2026-10-01-abc.md"
+printf -- '---\ntype: ticket\nticket: ABC-9\ntitle: Fix the NAV rounding\n---\n# ABC-9: Fix the NAV rounding\n\n> This is the ticket as people wrote it in the tracker. Net Asset Value here is the label.\n\nThe NAV is off by a cent.\n' \
+    > "$DV/.raw/tickets/ABC-9.md"
+printf -- '---\ntype: ticket\nticket: ABC-10\ntitle: Move the nav bar\n---\n# ABC-10: Move the nav bar\n\nThe nav bar should be on the left.\n' \
+    > "$DV/.raw/tickets/ABC-10.md"
+out=$($PY "$VI" ingest --vault "$DV" --proxy "http://127.0.0.1:$PORT27/v1" --model free-m 2>&1) || fail "V27: ingest failed — $out"
+grep -q 'scan.pdf: .*skipped' <<<"$out" || fail "V27: an unreadable pdf is skipped out loud — $out"
+[[ -z "$(find "$DV/wiki" -name '*scan*')" ]] || fail "V27: the pdf should have no page"
+for f in domain--funds domain--clearing domain--terms; do
+    grep -q '^type: domain$' "$DV/wiki/domain/$f.md" 2>/dev/null || fail "V27: $f should be a domain page — $(ls "$DV/wiki/domain" 2>&1) $out"
+done
+grep -q 'Widget' "$DV/wiki/domain/domain--funds.md" && fail "V27: a line whose quote is not in the source is dropped"
+grep -q 'Net Asset Value (NAV)' "$DV/wiki/domain/domain--funds.md" || fail "V27: a quoted line is kept — $(cat "$DV/wiki/domain/domain--funds.md")"
+$PY - "$REQS27" <<'PYEOF' || fail "V27: requests — $(head -c 800 "$REQS27")"
+import json, sys
+rows = [json.loads(l)["prompt"] for l in open(sys.argv[1])]
+html = [p for p in rows if "clearing house" in p]
+assert html and not any("evilScript" in p for p in html), "html: text only, no script"
+assert any("## Settlement" in p.split("<<<BEGIN_SOURCE>>>")[1] for p in rows), "docx: a heading is a cut point"
+assert any("### Terms" in p and "Full Name (ABBR)" in p for p in rows), "domain format and rules"
+assert any("### Keep" in p for p in rows if "we chose sqlite" in p), "sessions are asked for Keep lines"
+PYEOF
+$PY - "$DV/.harness/ingest.json" <<'PYEOF' || fail "V27: manifest — $(cat "$DV/.harness/ingest.json")"
+import json, sys
+u = json.load(open(sys.argv[1]))["units"]
+bad = u["raw:domain/bad.txt#1"]
+assert bad["status"] == "failed" and "quote" in " ".join(bad["problems"]), bad
+PYEOF
+G="$DV/wiki/domain/glossary.md"
+grep -qx -- '- \*\*Net Asset Value (NAV)\*\*: fund assets minus liabilities (\[\[domain--funds\]\])' "$G" \
+    && grep -q '^- \*\*Settlement Date\*\*: .*\[\[domain--terms\]\]' "$G" && grep -q '^- \*\*clearing house\*\*' "$G" \
+    && grep -qx -- '- Trades settle within two business days (\[\[domain--funds\]\])' "$G" \
+    || fail "V27: the glossary lists every document's terms and rules — $(cat "$G" 2>&1)"
+grep -q 'Widget\|Foo' "$G" && fail "V27: the glossary has a dropped line — $(cat "$G")"
+C="$DV/wiki/context/ABC-9-context.md"
+grep -q 'Net Asset Value (NAV)' "$C" 2>/dev/null && grep -q 'published by 6 pm' "$C" \
+    || fail "V27: a ticket using NAV gets its term and the rules naming it — $(cat "$C" 2>&1)"
+grep -q 'settle within' "$C" && fail "V27: a rule not naming the ticket's terms stays out — $(cat "$C")"
+[[ ! -e "$DV/wiki/context/ABC-10-context.md" ]] || fail "V27: 'nav' in lower case is not the abbreviation NAV — $(cat "$DV/wiki/context/ABC-10-context.md")"
+grep -q '^- \[decision\] Use sqlite: the host has no database server (\[\[sessions--2026-10-01-abc\]\], 2026-10-01)$' \
+    "$DV/wiki/candidates.md" || fail "V27: candidates — $(cat "$DV/wiki/candidates.md" 2>&1)"
+grep -q 'invented' "$DV/wiki/candidates.md" && fail "V27: a Keep line without its quote is dropped"
+grep -qx '## Domain documents' "$DV/wiki/index.md" && grep -q '\[\[glossary\]\]' "$DV/wiki/index.md" \
+    || fail "V27: the index lists the domain pages and the glossary — $(cat "$DV/wiki/index.md")"
+grep -q 'candidates\|ABC-9-context' "$DV/wiki/index.md" && fail "V27: candidates and context pages are not in the index"
+# The launch's ticket pull rewrites the context; status says nothing about the pdf.
+rm "$C"
+$PY "$REPO_ROOT/scripts/vault_ticket.py" "$DV" ABC-9 >/dev/null 2>&1
+[[ -f "$C" ]] || fail "V27: vault_ticket.py writes the ticket's context"
+out=$($PY "$VI" status --vault "$DV" 2>&1) || fail "V27: status failed — $out"
+grep -q 'pdf' <<<"$out" && fail "V27: status prints no ingest warnings — $out"
+(
+    mkdir -p "$TMP_ROOT/h27" "$TMP_ROOT/w27"; cd "$TMP_ROOT/w27"
+    harness_vault_dir="$DV" harness_ticket=ABC-9
+    got=$(harness_context_files "$TMP_ROOT/h27" | cut -f1 | paste -sd, -)
+    [[ "$got" == "vault,ticket,ticket context,ticket state" ]] || fail "V27: context files — $got"
+    jq -e --arg c "$C" '.instructions | index($c) != null' <<<"$(vault_opencode_config)" >/dev/null \
+        || fail "V27: the overlay hands the ticket's context to the agent"
+) || exit 1
+ok "V27: domain docs (md, html, docx; a bad pdf skipped) give quote-checked terms, the glossary, ticket context and candidates"
 
 echo "VAULT TEST PASSED"

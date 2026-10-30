@@ -6133,7 +6133,7 @@ ticket_prepare() {
 # global one (<home>/.config/opencode/AGENTS.md, else <home>/.claude/CLAUDE.md),
 # the project's (every AGENTS.md from here up to the git root, else every
 # CLAUDE.md, else CONTEXT.md: opencode's rule), then harness's: the vault's
-# AGENTS.md, the ticket's copy and its state note. <home> is the agent's home:
+# AGENTS.md, the ticket's copy, its domain context and its state note. <home> is the agent's home:
 # $HOME for a host launch; any other is a container's, where only this folder
 # is mounted, so the project files above it are not seen.
 harness_context_files() {
@@ -6170,6 +6170,8 @@ harness_context_files() {
     [[ -n "$key" ]] || return 0
     f="$vault/.raw/tickets/$key.md"
     [[ -f "$f" ]] && printf 'ticket\t%s\n' "$f"
+    f="$vault/wiki/context/$key-context.md"
+    [[ -f "$f" ]] && printf 'ticket context\t%s\n' "$f"
     f="$vault/wiki/notes/tickets/$key-state.md"
     [[ -f "$f" ]] && printf 'ticket state\t%s\n' "$f"
     return 0
@@ -6742,7 +6744,7 @@ HELP
     while IFS=$'\t' read -r what f; do
         sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ') || sz=0
         n=$((n + 1)) bytes=$((bytes + ${sz:-0}))
-        printf '  %d. %-13s %s  (%s KB, ~%s tokens)\n' "$n" "$what" "$f" \
+        printf '  %d. %-14s %s  (%s KB, ~%s tokens)\n' "$n" "$what" "$f" \
             "$(( (${sz:-0} + 512) / 1024 ))" "$(( ${sz:-0} / 4 ))"
     done < <(harness_context_files "$home")
     (( n )) || echo "  none"
@@ -6826,6 +6828,16 @@ One ingest at a time per vault: another exits with status 3.
 Pages: wiki/code/<repo>/<repo>--<dir>.md per directory with the root's in
 wiki/code/<repo>/<repo>.md; wiki/sources/<file>.md per .raw file. Generated
 pages are rewritten by the next ingest; write your own notes in other pages.
+
+Domain documents (the field the project serves: specs, regulations, manuals)
+go in .raw/domain/: .md, .txt, .html, .docx, and .pdf when pdftotext
+(poppler-utils) is installed. Each becomes wiki/domain/<file>.md with its
+terms and rules, every line checked against a quote of the document, and
+together wiki/domain/glossary.md. A ticket that uses glossary terms gets
+wiki/context/<KEY>-context.md (those terms and the rules naming them, at most 2 KB),
+handed to the agent with the ticket. wiki/candidates.md lists the lines
+sessions suggest keeping, newest first: copy the right ones into the
+project's AGENTS.md; agents are not given it.
 Describe the vault first with 'harness vault init': its charter goes with
 every request.
 HELP

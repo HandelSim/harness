@@ -3393,8 +3393,8 @@ def _vault_clause(vault, queue_stage=False):
                 " and the ones the task card names; do not search the vault for others.")
     return (f" Knowledge vault: `{v}` holds this project's notes, past sessions and decisions."
             f" Before answering about the project, its code or past work, `grep` `{v}/wiki/index.md`"
-            f" and then `{v}/wiki` for the key words and `read` the matching pages; `{v}/AGENTS.md`"
-            " says how to write there.")
+            f" and then `{v}/wiki` for the key words and `read` the matching pages; a word of the project's"
+            f" field: `grep` `{v}/wiki/domain/glossary.md`. `{v}/AGENTS.md` says how to write there.")
 
 
 # The task card: what a cooperative model is working on, at the very end of

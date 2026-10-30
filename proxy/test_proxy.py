@@ -6765,6 +6765,7 @@ class TestVaultReminderLine(unittest.TestCase):
         last = self._sent({"x-harness-vault": "/home/u/vaults/brain"})
         self.assertIn("Knowledge vault: `/home/u/vaults/brain`", last)
         self.assertIn("`/home/u/vaults/brain/wiki/index.md`", last)
+        self.assertIn("`/home/u/vaults/brain/wiki/domain/glossary.md`", last)
 
     def test_no_header_no_line(self):
         self.assertNotIn("Knowledge vault", self._sent({}))

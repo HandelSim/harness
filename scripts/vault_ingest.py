@@ -22,10 +22,19 @@ without touching the others.
 
 Pages: wiki/code/<repo>/<repo>--<dir with / as -->.md per directory, with the
 root directory's files and a generated module tree in wiki/code/<repo>/<repo>.md;
-wiki/sources/<path under .raw with / as -->.md per .raw file. `index` rebuilds
-the generated parts: topic hubs (wiki/topics/, from the sections' Topics lines,
-two or more pages), ticket hubs (wiki/tickets/, ids found with the charter's
-ticket_pattern), the module trees and up/down links, and wiki/index.md.
+wiki/sources/<path under .raw with / as -->.md per .raw file; and
+wiki/domain/domain--<file>.md per document under .raw/domain/ (docx, html and,
+with pdftotext, pdf are turned into text first), whose sections list Terms and
+Rules. The Terms, Rules and a session's Keep lines must each end with a quote
+found in the source; a line whose quote is not there is dropped. `index`
+rebuilds the generated parts: topic hubs (wiki/topics/, from the sections'
+Topics lines, two or more pages), ticket hubs (wiki/tickets/, ids found with
+the charter's ticket_pattern), the module trees and up/down links,
+wiki/domain/glossary.md (every Terms and Rules line of the domain pages),
+wiki/context/<KEY>-context.md per ticket copy in .raw/tickets/ (the glossary lines
+the ticket uses, an instruction file of a launch on that ticket),
+wiki/candidates.md (the Keep lines, for a person to copy into the project's
+AGENTS.md) and wiki/index.md.
 Generated files carry `generated: harness` in their frontmatter; nothing else
 is ever rewritten.
 
@@ -50,6 +59,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
+from html.parser import HTMLParser
+from xml.etree import ElementTree
 
 UNIT_KB = 48
 MAX_FILE_BYTES = 1_000_000
@@ -72,6 +84,17 @@ SECRET_PATH = re.compile(r"(^|/)(\.env(?!\.(example|sample|template)$)(\..*)?|.*
                          r"|id_(rsa|ed25519|ecdsa|dsa)[^/]*|\.netrc|credentials[^/]*|secrets[^/]*)$"
                          r"|(^|/)secrets/", re.I)
 BAD_NAME = re.compile(r'[\[\]#^|\\:*?"<>/]')
+# .raw/domain/: documents about the field the project works in (md, txt, html,
+# docx, and pdf through pdftotext when it is installed). Their pages hold the
+# terms and rules found in them; regenerate() compiles wiki/domain/glossary.md
+# and, per ticket in .raw/tickets/, wiki/context/<KEY>-context.md.
+DOMAIN = "domain"
+DOC_EXT = (".docx", ".html", ".htm", ".pdf")
+# Part of every .raw unit's hash: raising it when RAW_FORMAT or DOMAIN_FORMAT
+# changes sends every .raw unit again once, so old sessions get the new sections.
+RAW_FMT = "2"
+CONTEXT_CAP = 2000        # bytes of a ticket's context page
+CANDIDATES_CAP = 80       # lines of wiki/candidates.md
 
 
 def now_iso():
@@ -411,19 +434,84 @@ def code_units(repo, root, budget):
     return units
 
 
-def raw_units(vault, budget):
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+class _HTMLText(HTMLParser):
+    """The text of an HTML page, headings as `## ` lines."""
+    def __init__(self):
+        super().__init__()
+        self.out, self.skip = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip += 1
+        elif tag in ("h1", "h2", "h3"):
+            self.out.append("\n## ")
+        elif tag in ("p", "div", "li", "tr", "br", "h4", "h5", "h6"):
+            self.out.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.skip = max(0, self.skip - 1)
+        elif tag in ("h1", "h2", "h3", "p", "li", "tr"):
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(data)
+
+
+def doc_text(path, warn):
+    """The plain text of a domain document that is not plain text (DOC_EXT),
+    headings and pdf pages as `## ` lines (the cut points); None, after a
+    `warn` line, when it cannot be read."""
+    low = path.lower()
+    try:
+        if low.endswith(".docx"):
+            with zipfile.ZipFile(path) as z:
+                root = ElementTree.fromstring(z.read("word/document.xml"))
+            lines = []
+            for p in root.iter(W_NS + "p"):
+                text = "".join(t.text or "" for t in p.iter(W_NS + "t"))
+                style = p.find(f"{W_NS}pPr/{W_NS}pStyle")
+                head = style is not None and (style.get(W_NS + "val") or "").lower().startswith(("heading", "title"))
+                lines.append(("## " if head and text.strip() else "") + text)
+            return "\n".join(lines)
+        if low.endswith((".html", ".htm")):
+            p = _HTMLText()
+            p.feed(read_text(path, MAX_FILE_BYTES * 4) or "")
+            return re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", "".join(p.out))
+        if low.endswith(".pdf"):
+            if not shutil.which("pdftotext"):
+                warn(f"{os.path.basename(path)}: install pdftotext (poppler-utils) to read pdf files; skipped")
+                return None
+            r = subprocess.run(["pdftotext", "-enc", "UTF-8", path, "-"], capture_output=True, timeout=120)
+            if r.returncode != 0:
+                raise OSError(r.stderr.decode("utf-8", "replace").strip()[:200])
+            pages = r.stdout.decode("utf-8", "replace").split("\f")
+            return "\n".join(f"## page {i}\n{t}" for i, t in enumerate(pages, 1) if t.strip())
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile, ElementTree.ParseError,
+            subprocess.TimeoutExpired) as e:
+        warn(f"{os.path.basename(path)}: cannot read it ({e}); skipped")
+    return None
+
+
+def raw_units(vault, budget, warn=lambda line: None):
     units = []
     raw = os.path.join(vault, ".raw")
     for d, dirs, files in os.walk(raw):
         dirs[:] = sorted(x for x in dirs if not x.startswith("."))
         for name in sorted(files):
-            if name.startswith(".") or any(name.lower().endswith(e) for e in SKIP_EXT):
-                continue
             path = os.path.join(d, name)
             rel = os.path.relpath(path, raw).replace(os.sep, "/")
+            domain = rel.startswith(DOMAIN + "/")
+            doc = domain and name.lower().endswith(DOC_EXT)
+            if name.startswith(".") or (not doc and any(name.lower().endswith(e) for e in SKIP_EXT)):
+                continue
             if SECRET_PATH.search(rel):
                 continue
-            text = read_text(path, MAX_FILE_BYTES * 4)
+            text = doc_text(path, warn) if doc else read_text(path, MAX_FILE_BYTES * 4)
             if text is None or not text.strip():
                 continue
             meta, body = frontmatter(text)
@@ -444,10 +532,12 @@ def raw_units(vault, budget):
             for i, chunk in enumerate(chunks, 1):
                 piece = "".join(t for _, t in chunk)
                 units.append({
-                    "id": f"raw:{rel}#{i}", "kind": "raw", "page": page, "dir": "wiki/sources",
-                    "source": f".raw/{rel}", "title": title, "stype": meta.get("type", "document"),
+                    "id": f"raw:{rel}#{i}", "kind": "raw", "page": page,
+                    "dir": "wiki/" + (DOMAIN if domain else "sources"),
+                    "source": f".raw/{rel}", "title": title,
+                    "stype": DOMAIN if domain else meta.get("type", "document"),
                     "part": i, "parts": len(chunks), "labels": [], "files": [],
-                    "text": piece, "sha": sha(piece), "depth": 0,
+                    "text": piece, "sha": sha(RAW_FMT + piece), "depth": 0,
                 })
     return units
 
@@ -458,8 +548,12 @@ def missing_repos(m):
     return {name for name, root in m["repos"].items() if not os.path.isdir(root)}
 
 
-def plan(vault, m, srcs, budget, warned=None):
-    units = raw_units(vault, budget)
+def plan(vault, m, srcs, budget, warned=None, quiet=False):
+    def warn(line):
+        if not quiet and warned is not None and line not in warned:
+            warned.add(line)
+            print(f"[ingest] {line}", file=sys.stderr)
+    units = raw_units(vault, budget, warn)
     for name, root in sorted(m["repos"].items()):
         if os.path.isdir(root):
             units += code_units(name, root, budget)
@@ -504,17 +598,37 @@ RAW_FORMAT = """summary: <one sentence, at most 25 words: what this part is abou
 - <a durable fact worth finding later: exact `paths`, `commands`, `names`, values>
 ### Open questions
 - <unfinished work or open questions; "none" if none>
+### Keep
+- [decision|gotcha|command|term] <one line a newcomer to the project must know> "<the words of the source that show it, copied exactly>"
 Topics: [[<topic>]], [[<topic>]]"""
+
+DOMAIN_FORMAT = """summary: <one sentence, at most 25 words: what this part of the document is about>
+### Terms
+- <term>: <what it means, one sentence> "<the words of the source that define it, copied exactly>"
+### Rules
+- <a rule, limit or process step of this field, one sentence> "<the words of the source that state it, copied exactly>"
+Topics: [[<topic>]], [[<topic>]]"""
+
+KEEP_RULE = """- Keep: at most 3 lines, often none (then write `- none`). Only what stays true after this part
+  and is not visible in the code: a decision and its reason, a trap someone fell into, a command that
+  works, a term of the project's field. Start each line with its kind in brackets, end it with a quote."""
+
+DOMAIN_RULES = """- Terms: the words of this field a newcomer would not know: jargon, names, abbreviations
+  (write those as: Full Name (ABBR)). Rules: what must or must not happen, limits, the steps of a process.
+- End every Terms and Rules line with a short quote, the source's own words copied exactly,
+  in double quotes. A line without a quote found in the source is thrown away.
+- Write `- none` under a heading with nothing in this part."""
 
 
 def build_prompt(u, charter_text, context):
+    extra = ""
     if u["kind"] == "code":
         what = (f"directory `{u['path']}` of the codebase `{u['repo']}`"
                 + (f" (part {u['part']} of {u['parts']})" if u["parts"] > 1 else ""))
         fmt = CODE_FORMAT
     else:
         what = (f"the {u['stype']} `{u['source']}`" + (f", part {u['part']} of {u['parts']}" if u["parts"] > 1 else ""))
-        fmt = RAW_FORMAT
+        fmt, extra = (DOMAIN_FORMAT, "\n" + DOMAIN_RULES) if u["stype"] == DOMAIN else (RAW_FORMAT, "\n" + KEEP_RULE)
     rules = f"""Write ONE section of a knowledge-base page about {what}.
 Reply with ONLY the section, in exactly this format:
 
@@ -527,7 +641,7 @@ Rules:
 - Topics: 1 to 5 short lowercase noun phrases naming the concepts this part is about
   (for example [[authentication]], [[retry logic]]), each as a [[wikilink]].
 - Be dense and specific: this section is what someone searching the vault will read instead of the source.
-- Code examples: at most 5 lines each."""
+- Code examples: at most 5 lines each.{extra}"""
     parts = []
     if charter_text:
         parts.append("<<<BEGIN_VAULT_CHARTER>>>\n" + charter_text + "\n<<<END_VAULT_CHARTER>>>")
@@ -611,12 +725,69 @@ def grounding(body, summary, source):
     return unknown, names
 
 
+# The quote that ends an item line: "...", “...”, or (quote: "...").
+QUOTE_RE = re.compile(r'\s*\(?\s*(?:(?:quote|source|evidence)\s*:\s*)?["\u201c]([^"\u201c\u201d\n]{6,})["\u201d]'
+                      r'\s*\)?[.;]?\s*$', re.I)
+ITEM_SECTIONS = ("Terms", "Rules", "Keep")
+NONE_ITEM = re.compile(r"\s*[-*]\s+\(?_?none\b", re.I)
+_NORM = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-",
+                       "\u2014": "-", "\u00a0": " "})
+
+
+def norm(text):
+    """Text as a quote is compared with its source: lower case, one kind of
+    quote mark and dash, no markdown emphasis, single spaces."""
+    return re.sub(r"\s+", " ", re.sub(r"[*_`]", "", text.lower().translate(_NORM))).strip()
+
+
+def quoted(line, source_norm):
+    """(text, quote) of an item line whose quote is in the source (normalized),
+    else None. A quote shortened with ... matches when each part does."""
+    m = QUOTE_RE.search(line)
+    if not m:
+        return None
+    parts = [p for p in (norm(x).strip(" .,;:") for x in re.split(r"\.\.\.|\u2026", m.group(1))) if len(p) >= 4]
+    if not parts or sum(len(p) for p in parts) < 8 or not all(p in source_norm for p in parts):
+        return None
+    return line[:m.start()].strip(), m.group(1).strip()
+
+
+def filter_items(body, source):
+    """The body keeping only the item lines (under ### Terms, Rules or Keep)
+    whose quote is in the source: (body, kept, dropped). A model's wrong
+    definition of a real term fails here, where the name check cannot see it."""
+    src = norm(source)
+    out, section, kept, dropped, skipping = [], "", 0, 0, False
+    for ln in body.split("\n"):
+        h = re.match(r"\s*#{2,4}\s+(.+?)\s*$", ln)
+        if h:
+            section, skipping = h.group(1).strip("*: ").capitalize(), False
+        elif section in ITEM_SECTIONS and re.match(r"\s*[-*]\s+\S", ln) and not NONE_ITEM.match(ln):
+            skipping = quoted(ln, src) is None
+            kept, dropped = kept + (not skipping), dropped + skipping
+        elif skipping and ln.strip():
+            continue  # the rest of a dropped line
+        else:
+            skipping = False
+        if not skipping:
+            out.append(ln)
+    return "\n".join(out), kept, dropped
+
+
 def check(reply, u):
     summary, body, topics = clean_reply(reply)
     problems = []
+    domain = u["kind"] == "raw" and u["stype"] == DOMAIN
+    if u["kind"] == "raw":
+        body, kept, dropped = filter_items(body, u["text"])
+        if domain and not re.search(r"(?im)^###\s+\**terms", body):
+            problems.append("the section must have a `### Terms` and a `### Rules` heading")
+        elif domain and dropped and not kept:
+            problems.append("no Terms or Rules line ends with a quote found in the source: end each line "
+                            "with the source's own words copied exactly, in double quotes")
     if not summary:
         problems.append("the reply must start with a `summary:` line")
-    if len(body) < 40:
+    if len(body) < (20 if domain else 40):
         problems.append("the section body is missing or nearly empty")
     if re.search(r'```json\s*\{\s*"name"', reply):
         problems.append("no tool calls or JSON: reply with the markdown section only")
@@ -703,7 +874,7 @@ def assemble_page(vault, page_units, new):
                  + (f" and {len(files) - 60} more" if len(files) > 60 else "") + "\n")
     else:
         title = u0["title"]
-        meta = [f"type: {'session' if u0['stype'] == 'session' else 'source'}",
+        meta = [f"type: {u0['stype'] if u0['stype'] in ('session', DOMAIN) else 'source'}",
                 f"source: {yq(u0['source'])}", f"aliases: [{yq(u0['title'])}]"]
         intro = (f"Generated by `harness ingest` from `{u0['source']}` (the full text is there). "
                  "Edits here are overwritten: put your own notes in another page and link to this one.\n")
@@ -746,6 +917,192 @@ def wiki_pages(vault):
             if n.endswith(".md"):
                 p = os.path.join(d, n)
                 yield p, os.path.relpath(p, root).replace(os.sep, "/")
+
+
+# --- domain glossary, ticket context, candidates ---------------------------------------
+
+GLOSSARY = f"wiki/{DOMAIN}/glossary.md"
+CANDIDATES = "wiki/candidates.md"
+CONTEXT_DIR = "wiki/context"
+KINDS = ("decision", "gotcha", "command", "term")
+COMMON_TICKETS = 5        # with this many tickets, a term in more than COMMON_SHARE of them is not matched
+COMMON_SHARE = 0.4
+
+
+def section_items(body, heading):
+    """The item lines under `### <heading>` in a page body (every section of it),
+    without the leading dash and the closing quote."""
+    out, on = [], False
+    for ln in body.split("\n"):
+        h = re.match(r"\s*#{2,4}\s+(.+?)\s*$", ln)
+        if h:
+            on = h.group(1).strip("*: ").lower() == heading.lower()
+        elif ln.startswith("<!-- "):
+            on = False
+        elif on and re.match(r"[-*]\s+\S", ln) and not NONE_ITEM.match(ln):
+            m = QUOTE_RE.search(ln)
+            item = (ln[:m.start()] if m else ln)[1:].strip()
+            if item:
+                out.append(item)
+    return out
+
+
+def split_term(item):
+    """(term, definition) of a `term: definition` item, else None."""
+    m = re.match(r"\**([^:*]{2,80}?)\**\s*:\s*\**\s*(\S.*)$", item)
+    return (m.group(1).strip(), m.group(2).strip()) if m else None
+
+
+def term_patterns(term):
+    """Regexes for the names of a term: `Full Name (ABBR)` gives both. An
+    all-caps name is matched as written, any other in any case; a plural matches."""
+    names = [term]
+    m = re.match(r"^(.+?)\s*\(([^()]+)\)\s*$", term)
+    if m:
+        names = [m.group(1).strip(), m.group(2).strip()]
+    pats = []
+    for n in names:
+        caps = re.fullmatch(r"[A-Z0-9&/.-]{2,12}", n) is not None
+        if len(n) < (2 if caps else 3):
+            continue
+        pats.append(re.compile(r"(?<![\w-])" + re.escape(n) + r"(?:s|es)?(?![\w-])", 0 if caps else re.I))
+    return pats
+
+
+def write_glossary(vault, pages):
+    """wiki/domain/glossary.md from the Terms and Rules of the domain pages:
+    every definition kept, one line per term per document, sorted so two
+    documents' definitions of a term sit together."""
+    path = os.path.join(vault, GLOSSARY)
+    terms, rules, docs = {}, {}, 0
+    for rel, p in sorted(pages.items()):
+        if not (rel.startswith(DOMAIN + "/") and p["generated"] and p["meta"].get("type") == DOMAIN):
+            continue
+        docs += 1
+        for item in section_items(p["body"], "Terms"):
+            td = split_term(item)
+            if td:
+                terms.setdefault((td[0].lower(), norm(td[1])), f"- **{td[0]}**: {td[1]} ([[{p['name']}]])")
+        for item in section_items(p["body"], "Rules"):
+            rules.setdefault(norm(item), f"- {item} ([[{p['name']}]])")
+    if not docs:
+        if GENERATED in (read_text(path) or "")[:2000]:
+            os.remove(path)
+        return
+    text = (f"---\ntype: glossary\nsummary: {yq(f'{len(terms)} terms and {len(rules)} rules of the domain, from {docs} documents')}\n"
+            f"{GENERATED}\n---\n\n# Glossary\n\nGenerated by harness from the documents in `.raw/{DOMAIN}/`; do not edit. "
+            "grep this file for a word. Each line links to its document's page, which quotes the source.\n\n"
+            "## Terms\n\n" + "\n".join(terms[k] for k in sorted(terms)) + "\n\n## Rules\n\n"
+            + ("\n".join(rules[k] for k in sorted(rules)) or "- none") + "\n")
+    write_if_changed(path, text)
+
+
+def ticket_contexts(vault, only=None):
+    """wiki/context/<KEY>-context.md for each ticket copy in .raw/tickets/ (or just
+    `only`): the glossary lines whose terms the ticket uses and the rules that
+    name those terms, at most CONTEXT_CAP bytes. A ticket that uses none has no
+    page. Matching is plain text, no model: what is wrong here is the glossary's."""
+    _, gbody = frontmatter(read_text(os.path.join(vault, GLOSSARY)) or "")
+    part = lambda h: re.search(rf"(?ms)^## {h}\n(.*?)(?=^## |\Z)", gbody)  # noqa: E731
+    terms = []
+    for ln in (part("Terms").group(1) if part("Terms") else "").splitlines():
+        m = re.match(r"- \*\*(.+?)\*\*: ", ln)
+        if m:
+            terms.append((ln, term_patterns(m.group(1))))
+    rules = [ln for ln in (part("Rules").group(1) if part("Rules") else "").splitlines()
+             if ln.startswith("- ") and ln != "- none"]
+    tdir = os.path.join(vault, ".raw", "tickets")
+    texts = {}
+    for n in sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []:
+        key = n[:-3]
+        if n.endswith(".md") and BAD_NAME.search(key) is None:
+            meta, body = frontmatter(read_text(os.path.join(tdir, n), MAX_FILE_BYTES) or "")
+            # Without the label harness puts on every copy.
+            texts[key] = meta.get("title", "") + "\n" + re.sub(r"(?m)^> This is the ticket as people wrote it.*$", "", body)
+    hits = {}  # ticket: [(term line, where the ticket first uses it)]
+    for key, t in texts.items():
+        h = hits[key] = []
+        for i, (_, pats) in enumerate(terms):
+            pos = [m.start() for m in (p.search(t) for p in pats) if m]
+            if pos:
+                h.append((i, min(pos)))
+    if len(texts) >= COMMON_TICKETS:
+        seen = {}
+        for h in hits.values():
+            for i, _ in h:
+                seen[i] = seen.get(i, 0) + 1
+        common = {i for i, c in seen.items() if c > COMMON_SHARE * len(texts)}
+        hits = {k: [x for x in h if x[0] not in common] for k, h in hits.items()}
+    cdir = os.path.join(vault, CONTEXT_DIR)
+    if only and BAD_NAME.search(only):
+        return
+    for key in [only] if only else sorted(set(texts) | {n[:-11] for n in (os.listdir(cdir) if os.path.isdir(cdir) else [])
+                                                      if n.endswith("-context.md")}):
+        path = os.path.join(cdir, key + "-context.md")
+        old = read_text(path)
+        if old is not None and GENERATED not in old[:2000]:
+            continue  # someone wrote this one
+        found = sorted(hits.get(key, []), key=lambda x: x[1])
+        if not found:
+            if old is not None:
+                os.remove(path)
+            continue
+        pats = [p for i, _ in found for p in terms[i][1]]
+        lines, left, size = [], 0, 0
+        named = [r for r in rules if any(p.search(r) for p in pats)]
+        for head, items in (("Terms", [terms[i][0] for i, _ in found]), ("Rules", named)):
+            if items:
+                lines.append(f"\n## {head}\n")
+            for ln in items:
+                n = len(ln.encode()) + 1
+                if size + n > CONTEXT_CAP:
+                    left += 1
+                    continue
+                lines.append(ln)
+                size += n
+        if left:
+            lines.append(f"\n{left} more lines did not fit: grep [[glossary]].")
+        text = (f"---\ntype: context\nticket: {yq(key)}\n"
+                f"summary: {yq(f'the domain terms and rules ticket {key} uses')}\n{GENERATED}\n---\n\n"
+                f"# {key}: domain context\n\nGenerated by harness: the [[glossary]] lines whose terms "
+                f"ticket {key} uses, and the rules that name them. Matched by spelling, so a line can be off topic.\n"
+                + "\n".join(lines) + "\n")
+        write_if_changed(path, text)
+
+
+def write_candidates(vault, pages):
+    """wiki/candidates.md: the Keep lines of the session and source pages,
+    newest first, a line several sessions repeat counted once. For the owner to
+    copy the right ones into the project's AGENTS.md; no agent is given it."""
+    items = {}
+    for rel, p in pages.items():
+        if not (rel.startswith("sources/") and p["generated"]):
+            continue
+        d = re.search(r"\d{4}-\d{2}-\d{2}", p["name"])
+        day = d.group(0) if d else str(p["meta"].get("updated", ""))[:10]
+        for item in section_items(p["body"], "Keep"):
+            m = re.match(r"\[([^\]]{1,40})\]\s*:?\s*(\S.*)$", item)
+            kind, line = ("note", item) if not m else (
+                next((k for k in KINDS if k in m.group(1).lower()), "note"), m.group(2))
+            e = items.setdefault(re.sub(r"[^\w ]", "", norm(line)), {"kind": kind, "line": line, "day": "", "pages": set()})
+            e["pages"].add(p["name"])
+            if day >= e["day"]:
+                e["day"], e["line"], e["kind"], e["page"] = day, line, kind, p["name"]
+    path = os.path.join(vault, CANDIDATES)
+    if not items:
+        if GENERATED in (read_text(path) or "")[:2000]:
+            os.remove(path)
+        return
+    ranked = sorted(items.values(), key=lambda e: (e["day"], len(e["pages"])), reverse=True)
+    lines = [f"- [{e['kind']}] {e['line']} ([[{e['page']}]]{', ' + e['day'] if e['day'] else ''}"
+             + (f", {len(e['pages'])} sessions" if len(e["pages"]) > 1 else "") + ")" for e in ranked[:CANDIDATES_CAP]]
+    text = (f"---\ntype: candidates\nsummary: {yq(f'{len(items)} lines sessions suggest for the project AGENTS.md')}\n"
+            f"{GENERATED}\n---\n\n# Candidates for AGENTS.md\n\n"
+            "Generated by harness from the Keep lines of ingested sessions; not checked by anyone and not given "
+            "to agents. Copy the lines that are right into the project's AGENTS.md (by hand, that is the check). "
+            f"Newest first, at most {CANDIDATES_CAP}; a line you skip sinks as newer ones come.\n\n"
+            + "\n".join(lines) + ("\n\n" + f"{len(items) - CANDIDATES_CAP} older lines are not shown." if len(items) > CANDIDATES_CAP else "") + "\n")
+    write_if_changed(path, text)
 
 
 def regenerate(vault):
@@ -861,11 +1218,22 @@ def regenerate(vault):
             text += "\n<!-- links -->\n" + "\n\n".join(block) + "\n<!-- /links -->\n"
         write_if_changed(p["path"], text)
 
+    write_glossary(vault, pages)
+    write_candidates(vault, pages)
+    ticket_contexts(vault)
+    glossary = os.path.join(vault, GLOSSARY)
+    if os.path.isfile(glossary):
+        meta, body = frontmatter(read_text(glossary) or "")
+        pages[GLOSSARY[5:]] = {"path": glossary, "name": "glossary", "meta": meta, "body": body, "generated": True}
+    else:
+        pages.pop(GLOSSARY[5:], None)
+
     # wiki/index.md: one line per page outside code/ (each repo is one line),
-    # grouped by folder. Agents grep it; nobody edits it.
+    # grouped by folder. Agents grep it; nobody edits it. Ticket context pages
+    # and the candidates are not in it: each is read by its one reader.
     groups = {}
     for rel, p in sorted(pages.items()):
-        if rel in ("index.md", "log.md"):
+        if rel in ("index.md", "log.md", CANDIDATES[5:]) or rel.startswith(CONTEXT_DIR[5:] + "/"):
             continue
         folder = rel.split("/")[0] if "/" in rel else "."
         if folder == "code":
@@ -877,8 +1245,9 @@ def regenerate(vault):
         else:
             line = f"- [[{p['name']}]]: {summ(rel) or '(no summary)'}"
         groups.setdefault(folder, []).append(line)
-    order = [".", "notes", "code", "sources", "topics", "tickets"]
-    heads = {".": "Top level", "notes": "Notes", "code": "Codebases", "sources": "Sources and sessions",
+    order = [".", "notes", DOMAIN, "code", "sources", "topics", "tickets"]
+    heads = {".": "Top level", "notes": "Notes", DOMAIN: "Domain documents", "code": "Codebases",
+             "sources": "Sources and sessions",
              "topics": "Topics", "tickets": "Tickets"}
     out = ["---", "type: index", "summary: every page of this vault, one line each", GENERATED, "---", "",
            "# Index", "",
@@ -940,7 +1309,7 @@ def commit_opts(vault):
     return opts
 
 
-GENERATED_PATHS = re.compile(r"wiki/(index\.md|log\.md|topics/.*|tickets/.*)")
+GENERATED_PATHS = re.compile(r"wiki/(index\.md|log\.md|candidates\.md|domain/glossary\.md|topics/.*|tickets/.*|context/.*)")
 
 
 def generated_conflict(vault, rel):
@@ -1205,7 +1574,7 @@ def status(vault, quick):
     planned = None
     if not quick:
         # Cut as the last ingest did, so the hashes compare.
-        planned = plan(vault, m, set(), m.get("unit_kb", UNIT_KB) * 1024, set(m["repos"]))
+        planned = plan(vault, m, set(), m.get("unit_kb", UNIT_KB) * 1024, set(m["repos"]), quiet=True)
 
     def blank():
         return {"units": 0, "ok": 0, "failed": 0, "pending": None if quick else 0}
