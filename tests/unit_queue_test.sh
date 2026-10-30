@@ -60,7 +60,8 @@ out=$(cmd_queue --help)
 for w in 'harness queue add' 'harness queue run' 'harness queue answer' 'needs-answers' \
          'QUEUE_MODEL' 'QUEUE_PLAN_REVIEW' 'Nothing is written to the tracker' \
          'status [--json]' '--stages LIST' '--ref REF' 'harness queue note' 'retry KEY [--stage S]' \
-         'harness queue stop' 'harness queue halt' 'harness queue move' 'harness queue continue KEY'; do
+         'harness queue stop' 'harness queue halt' 'harness queue move' 'harness queue continue KEY' \
+         'harness queue edit KEY'; do
     grep -qF -- "$w" <<<"$out" || fail "Q2: help should mention '$w'"
 done
 grep -q 'harness queue' < <(bash "$HARNESS" --help 2>/dev/null) || fail "Q2: harness --help should list queue"
@@ -106,6 +107,17 @@ cmd_queue add ABC-3 --dir "$PROJ" --start main --branch feat-x --in-place --revi
 [[ "$(qs ABC-3 start branch in_place plan_review)" == "main feat-x True True" ]] \
     || fail "Q5: --start/--branch/--in-place/--review-plan not stored — $(qs ABC-3 start branch in_place plan_review)"
 if cmd_queue add ABC-4 --dir "$PROJ" --branch 2>/dev/null; then fail "Q5: --branch without a value accepted"; fi
+# edit: only the options given change; an empty value is add's default (the key)
+cmd_queue edit abc-3 --branch feat-y --stages plan,implement --no-plan-approval >/dev/null 2>&1 \
+    || fail "Q5: edit --branch/--stages/--no-plan-approval failed"
+[[ "$(qs ABC-3 start branch stages plan_review)" == "main feat-y ['plan', 'implement'] None" ]] \
+    || fail "Q5: edit not stored — $(qs ABC-3 start branch stages plan_review)"
+cmd_queue edit ABC-3 --branch '' >/dev/null 2>&1 || fail "Q5: edit --branch '' failed"
+[[ "$(qs ABC-3 branch)" == None ]] || fail "Q5: edit --branch '' should drop the branch — $(qs ABC-3 branch)"
+if cmd_queue edit ABC-3 ABC-1 --stages plan 2>/dev/null; then fail "Q5: edit of two tickets accepted"; fi
+if cmd_queue edit ABC-3 --frob 2>/dev/null; then fail "Q5: edit with an unknown option accepted"; fi
+if cmd_queue edit ABC-3 --stages 2>/dev/null; then fail "Q5: edit --stages without a value accepted"; fi
+if cmd_queue edit ABC-3 >/dev/null 2>&1; then fail "Q5: edit with nothing to change accepted"; fi
 cmd_queue remove ABC-3 >/dev/null
 if cmd_queue add ABC-3 --dir "$PROJ" --stages 2>/dev/null; then fail "Q5: --stages without a value accepted"; fi
 if cmd_queue add ABC-3 --dir "$PROJ" --stages frob >/dev/null 2>&1; then fail "Q5: an unknown stage accepted"; fi

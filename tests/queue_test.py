@@ -926,6 +926,65 @@ class QueueTest(Base):
         self.assertFalse(os.path.exists(os.path.join(self.state, "ABC-1")))
         self.assertEqual(tq.Queue(self.state).order(), [])
 
+    def test_edit_changes_what_add_set_until_the_work_starts(self):
+        self.add("ABC-1")
+        Q = tq.Queue(self.state)
+        rc, out = self.q("edit", "ABC-1")
+        self.assertEqual((rc, "nothing to change" in out), (1, True), out)
+        rc, out = self.q("edit", "abc-1", "--branch", "feat/x", "--stages", "plan,implement", "--review-plan")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("[queue] ABC-1: changed", out)
+        st = Q.load("ABC-1")
+        self.assertEqual((st["branch"], st["stages"], st["plan_review"], st["stage"], st["status"]),
+                         ("feat/x", ["plan", "implement"], True, "plan", "queued"))
+        self.assertNotIn("in_place", st)   # a clone stays a clone
+        rc, out = self.q("edit", "ABC-1", "--branch", "main")
+        self.assertEqual(rc, 1)
+        self.assertIn("main", out)
+        self.assertEqual(Q.load("ABC-1")["branch"], "feat/x")
+        rc, out = self.q("edit", "ABC-1", "--branch", "", "--stages", "review")
+        self.assertEqual(rc, 0, out)
+        st = Q.load("ABC-1")
+        self.assertEqual((st.get("branch"), st["stages"], st["stage"]), (None, ["review"], "review"))
+        rc, out = self.q("edit", "ABC-1", "--no-branch", "--in-place")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((Q.load("ABC-1").get("no_branch"), Q.load("ABC-1").get("in_place")), (True, True))
+        rc, out = self.q("edit", "ABC-2", "--stages", "plan")
+        self.assertEqual(rc, 1)
+        self.assertIn("not in the queue", out)
+        self.assertEqual(Q.order(), ["ABC-1"])
+
+    def test_edit_after_the_work_starts_changes_only_the_stages_to_come(self):
+        self.add("ABC-1")
+        Q = tq.Queue(self.state)
+        st = Q.load("ABC-1")
+        st.update(start_sha=self.git_p("rev-parse", "HEAD"), stage="implement")
+        Q.save(st)
+        rc, out = self.q("edit", "ABC-1", "--branch", "feat/x")
+        self.assertEqual(rc, 1)
+        self.assertIn("work has started", out)
+        rc, out = self.q("edit", "ABC-1", "--stages", "implement,review")
+        self.assertEqual(rc, 1)
+        self.assertIn("the stages up to it stay (plan,implement)", out)
+        rc, out = self.q("edit", "ABC-1", "--stages", "plan,implement,push", "--review-plan")
+        self.assertEqual(rc, 0, out)
+        st = Q.load("ABC-1")
+        self.assertEqual((st["stages"], st.get("plan_review"), st["stage"]), (["plan", "implement", "push"], True,
+                                                                             "implement"))
+        rc, out = self.q("edit", "ABC-1", "--stages", "plan,implement,fix")
+        self.assertEqual(rc, 1)   # fix needs review
+        st.update(status="running")
+        Q.save(st)
+        rc, out = self.q("edit", "ABC-1", "--no-plan-approval")
+        self.assertEqual(rc, 1)
+        self.assertIn("is running", out)
+        st.update(status="done", stage="done")
+        Q.save(st)
+        rc, out = self.q("edit", "ABC-1", "--stages", "plan")
+        self.assertEqual(rc, 1)
+        self.assertIn("is done", out)
+        self.assertEqual(Q.load("ABC-1")["stages"], ["plan", "implement", "push"])
+
     def test_plan_review_fixes(self):
         # The tag ending a criterion is the last ticket/edge one: a GIVEN's own "(from ...)" is not it,
         # and a ticket quote may hold brackets.

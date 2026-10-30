@@ -745,6 +745,20 @@ ticket page uses), `followup KEY ["TEXT"]` (same input rules; see
 "Follow-up rounds" below), `findings`, `watch` (tails `run.log`) and `log
 [KEY]` are the owner's side.
 
+`edit KEY [add's options] [--no-repo-branches]` (`cmd_edit`) changes only the
+settings given; an empty value (`--branch ''`) puts it back to add's default.
+Add and edit share `settle` (every check add makes, so an edit can never store
+what add would refuse) and `settings` (which fields are stored). The line is
+`start_sha`, set when a run first takes the ticket (`make_clone` /
+`enter_in_place`): before it, anything add sets can change (a new `--project`
+drops the old base, start, branch and repositories); after it, project, base,
+start, branch, `--no-branch`, repositories and in place/clone are refused
+("remove it and add it again"), and only the stages after the current one
+(`--stages`; the ones up to it must stay; refused once done) and
+`--review-plan` / `--no-plan-approval [--take-defaults]` change. Refused while
+running or held by a run (`edit_refused`); re-checked under `queue.lock`
+before saving, and logged as `edited: ...`.
+
 Owner control (all of it also on the run viewer's queue and ticket pages):
 `--stages` runs a subset of plan, implement, review, fix, push (kept in that
 order; `fix` needs `review`), starting at the first and done after the last;
@@ -1864,7 +1878,10 @@ offered as suggestions. It is taken as pasted: quotes
 - `/runs/ticket/<KEY>`: status and why, the stage strip, a Result panel
   once `state.json` has `push` (where the branch went, an "Open a pull
   request" link from `compare_url` when it is an http(s) one, the diffstat,
-  the commits, a refused push's error and the push `warnings`), and buttons,
+  the commits, a refused push's error and the push `warnings`), a Settings
+  panel (`_settings_facts`: project, base, start, branch or uncommitted, each
+  repository's branch, where it works, stages, after the plan; `_edit_lock`
+  says what can change now and why), and buttons,
   each with a tooltip saying what it does (the queue page's rows use the same
   retry labels: Retry, Plan again without answering, Resume, Run again,
   Queue again; "Start over" beside a Continue, which posts `--stage` with the
@@ -1978,6 +1995,15 @@ offered as suggestions. It is taken as pasted: quotes
   from a ticket; `halt` writes the halt file; `end` runs `halt --force`
   (offered while halting, or when a ticket's stop has waited over
   `STUCK_AFTER` s).
+- `/runs/ticket/<KEY>/edit` (`render_ticket_edit`): before the work starts,
+  the Add form prefilled from the state (`_edit_values`; key read-only, no
+  note) posting every setting through `ticket_args`, add's own checks, so an
+  emptied field is add's default; the repository tree's settings are sent
+  only when the tree loaded, so one that failed to load cannot wipe them.
+  After it starts: the settings read-only plus `_later_form` (the stages
+  after the current one, the after-plan choice), which sends only what
+  changed. While running: read-only. `POST .../edit` runs `queue edit`; a
+  refusal is the form again (409) with "Not changed:" and what was typed.
 - `POST /runs/ticket/<KEY>/{answer,approve,retry,stop,remove,move,note}`:
   `ticket_queue.py` `answer --stdin` (the form's answers as `## question`
   sections, `## Other`, and "go with the default" for the rest; needs the

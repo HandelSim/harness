@@ -1047,6 +1047,11 @@ def make_handler(cfg):
                     if got:
                         self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head, "queue")
                         return
+                elif bits[2] == "edit":
+                    got = runs_view.render_ticket_edit(r, bits[1])
+                    if got:
+                        self.send_runs(200, f"harness: {got[0]}", got[1], "", head, "queue")
+                        return
                 elif bits[2] == "live":
                     got = runs_view.ticket_live(r, bits[1])
                     self.send_json(got if got else {"gone": "/runs/queue"}, head)
@@ -1343,6 +1348,10 @@ def make_handler(cfg):
                 return
             ok, msg = runs_view.ticket_action(cfg.runs, key, action, form)
             sys.stderr.write(f"[pub] {action} {key} from {user or 'local'}: {msg}\n")
+            got = runs_view.render_ticket_edit(cfg.runs, key, form, msg) if action == "edit" and not ok else None
+            if got:   # the form again, with what was typed and why not
+                self.send_runs(409, f"harness: {got[0]}", got[1], active="queue")
+                return
             queue = (form.get("back") or [""])[0] == "queue" or (ok and action == "remove")
             back = "/runs/queue" if queue else f"/runs/ticket/{quote(key)}"
             if not ok:
