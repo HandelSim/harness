@@ -278,7 +278,7 @@ class RunsTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertEqual(r.status, 200)
         self.assertIn("verifier: pass &lt;ok&gt;", body)
-        self.assertIn("plan-1.out", body)
+        self.assertNotIn("Stage outputs", body)   # the agent CLI's own output: a link on its attempt only
         r, body = self.req("GET", "/runs/ticket/ABC-12/plan-1.out")
         self.assertEqual(body, "the plan\n")
 
@@ -373,15 +373,18 @@ class RunsTest(RunsServer):
         self.assertIn("<span class='pill t-bad'>failed</span><span class='tag'>plan</span><span>attempt 2</span>",
                       body)
         self.assertIn("write it to &lt;C:\\x&gt;", body)
-        self.assertIn("href='/runs/ticket/ABC-12/plan-1.out'", body)   # the failed attempt's output
-        self.assertIn("1. [blocking] Which &lt;db&gt;?", body)          # the plan note
-        self.assertEqual(body.count("1. [blocking] Which"), 1)          # open by the answers, not again below
-        self.assertIn("<details class='doc' data-k='qplan' open>", body)
+        self.assertIn("href='/runs/ticket/ABC-12/plan-1.out' target='_blank' rel='noopener' title="
+                      "'what the agent CLI printed (stdout and stderr): for debugging a launch'>raw output</a>",
+                      body)   # the failed attempt's output
+        self.assertIn("<li>[blocking] Which &lt;db&gt;?</li>", body)   # the plan note, as markdown
+        self.assertEqual(body.count("[blocking] Which"), 1)             # by the answers, not again below
+        self.assertIn("<div class='glance'><article class='md'><h3>Goal</h3>\n<p>Fix it.</p>", body)
+        self.assertIn("<details class='doc' data-k='qplan'><summary>The whole plan", body)   # folded under it
         self.ticket(status="plan-review", questions=[])
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("action='/runs/ticket/ABC-12/approve'", body)
         self.assertIn("Approve the plan, or send feedback", body)   # a free feedback box
-        self.assertIn("data-k='qplan' open", body)                  # the plan to approve, open beside it
+        self.assertIn("<div class='glance'>", body)                 # the plan to approve, beside it
         self.assertIn("Send feedback and plan again", body)
         self.assertNotIn("Go with the defaults", body)
         # blocked at review: no planner's questions, a note that re-plans, and Retry runs review as is
@@ -602,6 +605,116 @@ class RunsTest(RunsServer):
             self.assertEqual(r.status, 409)
             self.assertIn("nothing to send: approve the plan instead", body)
         self.assertEqual(calls, [])
+
+    def test_the_plan_reads_first_by_what_it_does_then_file_by_file(self):
+        with open(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-12-plan.md"), "w") as f:
+            f.write("---\ntype: note\n---\n## Goal\n\nParse **logs**.\n\n## How it works\n\n- a parser\n\n"
+                    "## Not included\n\n- the UI\n\n## Steps\n\n1. `src/log.py`: add parse()\n"
+                    "2. `tests/test_log.py`: cover it\n3. `src/log.py` - skip empty logs\n4. tell the team\n\n"
+                    "## Acceptance criteria\n\n- AC1: GIVEN a log WHEN parsed THEN ok (ticket: \"parse logs\")\n")
+        self.ticket(**PLAN_ITEMS, assumptions=[{"id": "A1", "text": "logs are <utf-8>"}])
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        g = body[body.index("<div class='glance'>"):body.index("The whole plan")]
+        for x in ("<h3>Goal</h3>", "<strong>logs</strong>", "<h3>How it works</h3>", "<h3>Not included</h3>",
+                  "<h3>Changes by file</h3>"):
+            self.assertIn(x, g)
+        # a file's steps together, in the order the files come up; its name not again in the step
+        self.assertIn("<h4><code>src/log.py</code></h4>\n<ul>\n<li>add parse()</li>\n<li>skip empty logs</li>", g)
+        self.assertLess(g.index("src/log.py"), g.index("tests/test_log.py"))
+        self.assertIn("<h4>Other</h4>\n<ul>\n<li>tell the team</li>", g)
+        self.assertNotIn("type: note", body)   # front matter dropped
+        # edge cases folded (still posted); the assumptions, each with a correction box
+        self.assertIn("<details class='edges'><summary>Edge cases <span class='muted'>1: accepted unless", body)
+        self.assertLess(body.index("<details class='edges'>"), body.index("<div class='fb edge'>"))
+        self.assertIn("<h3>Assumptions</h3>", body)
+        self.assertIn("<div class='txt'>logs are &lt;utf-8&gt;</div><input name='as.A1'", body)
+
+    def test_a_wrong_assumption_goes_to_the_planner(self):
+        self.ticket(**PLAN_ITEMS, assumptions=[{"id": "A1", "text": "logs are utf-8"}])
+        self.start()
+        calls = []
+
+        def queue(runs_, args, text=None):
+            calls.append((args, text))
+            return True, "answered"
+        sig = ("sig", "abc123def456")
+        with mock.patch.object(runs, "_queue", queue):
+            r, body = self.act("answer", [sig, ("as.A1", "they can be latin-1")])
+            self.assertEqual(r.status, 303, body)
+            self.assertIn('- A1: wrong - they can be latin-1 (it read: "logs are utf-8")\n', calls.pop()[1])
+            self.ticket(status="plan-review", **PLAN_ITEMS, assumptions=[{"id": "A1", "text": "logs are utf-8"}])
+            r, body = self.act("approve", [sig, ("as.A1", "no")])
+            self.assertEqual(r.status, 409)
+            self.assertIn("what you gave on A1 would be lost", body)
+        self.assertEqual(calls, [])
+
+    def test_the_tickets_vault_notes_are_rendered(self):
+        d = os.path.join(self.vault, "wiki", "notes", "tickets")
+        with open(os.path.join(d, "ABC-12-state.md"), "w") as f:
+            f.write("# ABC-12\n\n## Done\n\n- parsed <logs>\n")
+        os.makedirs(os.path.join(self.vault, ".raw", "tickets"))
+        with open(os.path.join(self.vault, ".raw", "tickets", "ABC-12.md"), "w") as f:
+            f.write("# Parse logs\n\nThe ticket.\n")
+        self.ticket(status="done", stage="done", questions=[])
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("Agent's state note", body)
+        self.assertIn("<h2>Done</h2>\n<ul>\n<li>parsed &lt;logs&gt;</li>", body)
+        self.assertIn("<summary>The ticket", body)
+        self.assertIn("href='/vault/browse/wiki/notes/tickets/ABC-12-state.md'>open in the vault</a>", body)
+        self.assertIn("href='/vault/browse/.raw/tickets/ABC-12.md'", body)
+        self.assertIn("<pre class='qlog'>12:00 plan-1 started", body)   # the queue's log: as it is
+
+    def test_a_done_ticket_takes_a_follow_up(self):
+        self.ticket(status="done", stage="done", questions=[])
+        self.start()
+        calls = []
+
+        def queue(runs_, args, text=None):
+            calls.append((args, text))
+            return True, "follow-up saved"
+        with mock.patch.object(runs.Runs, "followup_refused", lambda self_, key: ""):
+            r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<h2>Follow up on what was built</h2>", body)
+        self.assertIn("<code>ABC-12-plan-r1.md</code>", body)
+        self.assertIn("action='/runs/ticket/ABC-12/followup'", body)
+        with mock.patch.object(runs.Runs, "followup_refused", lambda self_, key: "its work is <gone>"):
+            r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("its work is &lt;gone&gt;", body)
+        self.assertNotIn("/followup'", body)
+        with mock.patch.object(runs, "_queue", queue):
+            r, body = self.act("followup", [("text", "make it\r\nper project")])
+            self.assertEqual(r.status, 303, body)
+            self.assertEqual(calls.pop(), (["followup", "ABC-12", "--vault", self.vault, "--stdin"],
+                                           "make it\nper project"))
+            r, body = self.act("followup", [("text", "  ")])
+            self.assertEqual(r.status, 409)
+            self.ticket(status="queued", stage="plan", questions=[])
+            r, body = self.act("followup", [("text", "more")])
+            self.assertEqual(r.status, 409)
+            self.assertIn("ABC-12 is queued, not done", body)
+        self.assertEqual(calls, [])
+
+    def test_a_ticket_that_went_round_again_lists_its_rounds(self):
+        d = os.path.join(self.vault, "wiki", "notes", "tickets")
+        with open(os.path.join(d, "ABC-12-plan-r1.md"), "w") as f:
+            f.write("## Goal\n\nFirst.\n")
+        self.ticket(status="plan-review", stage="plan", questions=[],
+                    rounds=[{"n": 1, "ended": "2026-10-29T10:00:00Z", "push": "local", "commits": [{"sha": "a"}] * 3,
+                             "diffstat": {"files": 2, "insertions": 9, "deletions": 1}, "followup": "per <project>"},
+                            {"n": "bad"}, "nope"],
+                    push={"result": "local", "branch": "ABC-12", "sha": "", "remote": "", "url": "", "error": ""},
+                    commits=[], diffstat={"files": 2, "insertions": 9, "deletions": 1})
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("<h2>Rounds <span class='muted'>2</span></h2>", body)
+        self.assertIn("<b>Round 1</b><span class='muted'>2026-10-29 10:00 &middot; 3 commits &middot; 2 file(s), +9 "
+                      "&minus;1 &middot; kept on this computer: not pushed</span>", body)
+        self.assertIn("href='/vault/browse/wiki/notes/tickets/ABC-12-plan-r1.md'>its plan</a>", body)
+        self.assertIn("<div class='txt'>per &lt;project&gt;</div>", body)
+        self.assertIn("<b>Round 2</b><span class='muted'>now: plan-review</span>", body)
+        self.assertIn("<h2>Result of round 1</h2>", body)
 
     def test_an_in_place_tickets_sessions_are_those_made_while_its_stages_ran(self):
         proj = os.path.join(self.tmp.name, "proj")

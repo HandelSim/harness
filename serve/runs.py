@@ -783,7 +783,7 @@ class Runs:
         rounds = st.get("rounds")   # the earlier rounds of a ticket followed up after it was done
         out["rounds"] = [{"n": r["n"], "ended": str(r.get("ended", "")), "reason": str(r.get("reason", "")),
                           "followup": str(r.get("followup", "")), "at": str(r.get("at", "")),
-                          "push": str((r.get("push") or {}).get("result", "")) if isinstance(r.get("push"), dict) else "",
+                          "push": r["push"] if isinstance(r.get("push"), str) else "",
                           "compare_url": r["compare_url"] if isinstance(r.get("compare_url"), str)
                           and re.match(r"https?://", r["compare_url"]) else "",
                           "commits": len(r["commits"]) if isinstance(r.get("commits"), list) else 0,
@@ -2410,19 +2410,17 @@ def _plan_glance(runs, key, vault, plan):
     """The plan as the owner reads it first: its goal, how it works, what is not
     included and the changes file by file; then the whole plan, folded."""
     rel = _note_rel(key, "plan")
-    items = _plan_items(plan)
-    whole = (f"<details class='doc' data-k='qplan'{'' if items else ' open'}><summary>The whole plan<span "
-             f"class='muted'>{len(plan.splitlines())} lines</span></summary><div class='vlink'>"
-             f"{_open_in_vault(runs, vault, rel)}</div>{_md(vault, rel, plan)}</details>")
-    if not items:
-        return whole
+    items = _plan_items(plan) or {}
     md = []
     for k, head in (("goal", "Goal"), ("how", "How it works"), ("out", "Not included")):
         if (items.get(k) or "").strip():
             md += [f"### {head}", "", items[k].strip(), ""]
     if items.get("steps"):
         md += ["### Changes by file", "", _by_file(items["steps"])]
-    return f"<div class='glance'>{_md(vault, rel, chr(10).join(md))}</div>{whole}" if md else whole
+    glance = f"<div class='glance'>{_md(vault, rel, chr(10).join(md))}</div>" if md else ""
+    return (f"{glance}<details class='doc' data-k='qplan'{'' if glance else ' open'}><summary>The whole plan<span "
+            f"class='muted'>{len(plan.splitlines())} lines</span></summary><div class='vlink'>"
+            f"{_open_in_vault(runs, vault, rel)}</div>{_md(vault, rel, plan)}</details>")
 
 
 def _t_followup(runs, key, st):
