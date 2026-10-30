@@ -81,7 +81,8 @@ TEXT_CAP = 20000         # characters of one tool input/output shown inline
 MAX_MESSAGE = 65536      # bytes of one message sent to a live run
 NOTE_MAX = 4000         # characters of one owner note
 ADD_NOTE_MAX = 4000      # the note given with add (it goes on a command line)
-ADD_NEW_MAX = 20000      # the work described for a ticket of your own (it goes on stdin)
+ADD_NEW_MAX = 20000      # a ticket of your own's description (it goes on stdin)
+LOCAL_TITLE_MAX = 120    # and its title (vault_ticket.py keeps no more)
 # Windows: a child with a console of its own that has no window. Without it each git
 # or queue call a click makes flashes a console window when serve has no console
 # (the run viewer a launch leaves up) or a hidden one.
@@ -1852,31 +1853,44 @@ def add_form(runs, form=None, err="", edit=""):
     opts = "".join(f"<option value='{esc(p)}'>" for p in projects)
     project = v("project") if form is not None else (projects[0] if projects else "")
     sent = {k: _one(form, k) for k in form if k.startswith("repo_")} if form is not None else {}
+    kind = "local" if v("kind") == "local" and runs.vault else "jira"
+    hide = {k: "" if k == kind else " hidden" for k in ("jira", "local")}
+    nxt = next_local_key(runs)
     keys = (f"<label class='fld'>Ticket<input name='keys' readonly value='{esc(edit)}'><small>the key does not "
             "change; remove the ticket and add it again for another</small></label>") if edit else (
-        "<label class='fld'>Ticket keys<input name='keys' autocomplete='off' spellcheck='false' "
-        f"value='{esc(v('keys'))}' placeholder='ABC-123 ABC-124'>"
+        f"<label class='fld' data-kind='jira'{hide['jira']}>Ticket keys<input name='keys' autocomplete='off' "
+        f"spellcheck='false' value='{esc(v('keys'))}' placeholder='ABC-123 ABC-124'>"
         "<small>one or more, space or comma separated. Each is its own ticket, all with the settings below; "
-        "a work branch it gets is named after its key. No ticket in Jira? Describe the work below</small></label>")
-    new = "" if edit else (
-        "<label class='fld'>New work, no Jira ticket<textarea name='new' maxlength='20000' "
-        + ("" if runs.vault else "disabled ") +
-        "placeholder='Fix the flaky login test&#10;It fails about one run in ten, in CI only.'>"
-        f"{esc(v('new'))}</textarea><small>"
-        + ("a ticket of your own, the next LOCAL-N, is made for it in the vault and queued with the keys above. "
-           "The first line is its title; edit it later in .raw/tickets/ in the vault" if runs.vault else
-           "needs an active vault to write the ticket into (harness vault use NAME)") +
-        "</small></label>")
+        "a work branch it gets is named after its key</small></label>"
+        f"<label class='fld' data-kind='local'{hide['local']}>Title<input name='title' maxlength='{LOCAL_TITLE_MAX}' "
+        f"autocomplete='off' value='{esc(v('title'))}' placeholder='Fix the flaky login test'>"
+        f"<small>its key is {esc(nxt)}, the next free one: the queue, its page and its work branch go by "
+        "it</small></label>")
+    kinds = desc = ""
+    if not edit:
+        cards = (("jira", "Jira tickets", "tickets that are in Jira, by key", ""),
+                 ("local", "A ticket of your own", f"work with no Jira ticket: you write it, it is saved in the "
+                  f"vault as {nxt} and queued like any other" if runs.vault else
+                  "work with no Jira ticket. Needs an active vault to save it in (harness vault use NAME)",
+                  "" if runs.vault else " disabled"))
+        kinds = ("<fieldset id='f-kind'><legend>Ticket</legend><div class='presets two'>" + "".join(
+            f"<label><input type='radio' name='kind' value='{c}' data-next='{esc(nxt)}'"
+            f"{' checked' if c == kind else ''}{off}>{lab}<small>{esc(hint)}</small></label>"
+            for c, lab, hint, off in cards) + "</div></fieldset>")
+        desc = (f"<label class='fld' data-kind='local'{hide['local']}>Description<textarea name='desc' "
+                f"maxlength='{ADD_NEW_MAX}' placeholder='What needs doing, and anything the agents should know.'>"
+                f"{esc(v('desc'))}</textarea><small>what the agents read as the ticket (empty: the title). Edit it "
+                f"later in .raw/tickets/{esc(nxt)}.md in the vault</small></label>")
     title, action = ("Settings", f"/runs/ticket/{quote(edit)}/edit") if edit else ("Add tickets", "/runs/queue/add")
     return (f"<section class='panel' id='add'{' data-err=1' if err else ''}><div class='hd'><h2>{title}</h2></div>"
             + (f"<p class='err' role='alert'>Not {'changed' if edit else 'added'}: {esc(err)}</p>" if err else "") +
-            f"<form method='post' action='{action}' id='addform' class='stack'>"
+            f"<form method='post' action='{action}' id='addform' class='stack'>{kinds}"
             f"<div class='grid2'>{keys}"
             f"<label class='fld'>Project folder<input name='project' required list='projects' spellcheck='false' "
             f"value='{esc(project)}' placeholder='/home/me/src/project'>"
             f"<datalist id='projects'>{opts}</datalist><datalist id='branches'></datalist>"
             "<small>the git repository the work is in (absolute path)</small></label>"
-            f"</div>{new}"
+            f"</div>{desc}"
             "<div class='projhint muted' id='projhint' aria-live='polite'></div>"
             "<fieldset id='f-repos' hidden><legend>Repositories</legend>"
             "<small class='muted'>The agents work in all of them. For each, the ticket's changes are left "
@@ -3227,21 +3241,29 @@ def repo_args(form, project, many=False):
 
 def add_tickets(runs, form):
     """The queue page's Add form: harness queue add, its values checked first."""
-    raw = _one(form, "keys")
-    keys = [k.upper() for k in re.split(r"[\s,;]+", raw) if k]
-    new = _one(form, "new").replace("\r\n", "\n").strip()
-    if not keys and not new:
-        return False, "give at least one ticket key, or describe new work with no Jira ticket"
-    if new and not (runs.vault and os.path.isdir(runs.vault)):
-        return False, "new work is written into the active vault as a ticket of your own, and there is no active vault"
-    if len(new) > ADD_NEW_MAX:
-        return False, f"the new work's description is over {ADD_NEW_MAX} characters"
-    if len(keys) + bool(new) > MAX_KEYS:
-        return False, f"at most {MAX_KEYS} tickets at a time"
-    bad = [k for k in keys if not KEY_RE.match(k) or len(k) > 40]
-    if bad:
-        return False, "not a ticket key (like ABC-123): " + ", ".join(bad[:5])[:200]
-    args = ticket_args(form, keys + [""] * bool(new))   # the new work is one more ticket, its key not made yet
+    kind = _one(form, "kind") or "jira"
+    if kind not in ("jira", "local"):
+        return False, "not a kind of ticket: " + kind[:40]
+    keys, title, desc = [], " ".join(_one(form, "title").split()), _one(form, "desc").replace("\r\n", "\n").strip()
+    if kind == "local":
+        if not (runs.vault and os.path.isdir(runs.vault)):
+            return False, "a ticket of your own is saved in the active vault, and there is no active vault"
+        if not title:
+            return False, "give the ticket of your own a title"
+        if len(title) > LOCAL_TITLE_MAX:
+            return False, f"the title is over {LOCAL_TITLE_MAX} characters"
+        if len(desc) > ADD_NEW_MAX:
+            return False, f"the description is over {ADD_NEW_MAX} characters"
+    else:
+        keys = [k.upper() for k in re.split(r"[\s,;]+", _one(form, "keys")) if k]
+        if not keys:
+            return False, "give at least one ticket key"
+        if len(keys) > MAX_KEYS:
+            return False, f"at most {MAX_KEYS} tickets at a time"
+        bad = [k for k in keys if not KEY_RE.match(k) or len(k) > 40]
+        if bad:
+            return False, "not a ticket key (like ABC-123): " + ", ".join(bad[:5])[:200]
+    args = ticket_args(form, keys or [""])   # a ticket of your own: one, its key not made yet
     if isinstance(args, str):
         return False, args
     note = _one(form, "note").replace("\r\n", "\n")
@@ -3250,11 +3272,11 @@ def add_tickets(runs, form):
     if note.strip():
         args.append(f"--note={note}")
     made = ""
-    if new:   # last, once everything else is fine: the ticket of your own, as harness queue add --new makes it
-        made, why = new_ticket(runs, new)
+    if kind == "local":   # last, once everything else is fine: as harness ticket new makes it
+        made, why = new_ticket(runs, title, desc)
         if why:
             return False, why
-        keys.append(made)
+        keys = [made]
     res = _queue(runs, ["add", *keys, *args])
     if made and not os.path.exists(os.path.join(runs.queue_dir, made, "state.json")):
         try:   # not queued: the ticket made for it goes again
@@ -3264,21 +3286,35 @@ def add_tickets(runs, form):
     return res
 
 
-def new_ticket(runs, text):
-    """A ticket of your own for text (vault_ticket.py --new, as harness ticket new):
+def next_local_key(runs):
+    """The key the next ticket of your own gets, numbered as vault_ticket.py's
+    new_local numbers it (the next <prefix>-N free in the vault and the queue)."""
+    p = (os.environ.get("TICKET_LOCAL_PREFIX") or "LOCAL").strip().upper()
+    p = p if KEY_RE.match(p + "-1") else "LOCAL"
+    names = []
+    for d in (os.path.join(runs.vault, ".raw", "tickets") if runs.vault else "", runs.queue_dir):
+        try:
+            names += os.listdir(d) if d else []
+        except OSError:
+            pass
+    n = [int(m.group(1)) for f in names for m in [re.fullmatch(re.escape(p) + r"-([0-9]+)(\.md)?", f)] if m]
+    return f"{p}-{max(n, default=0) + 1}"
+
+
+def new_ticket(runs, title, text):
+    """A ticket of your own (vault_ticket.py --new, as harness ticket new):
     (its key, "") or ("", why not)."""
-    title = next((x.strip() for x in text.splitlines() if x.strip()), "")
     cmd = [sys.executable, TICKET_SCRIPT, "--new", runs.vault, "-", title, runs.queue_dir]
     try:
         p = subprocess.run(cmd, input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            timeout=30, env={**os.environ, "PYTHONUTF8": "1"}, **NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return "", f"the ticket for the new work was not made: {e}"
+        return "", f"the ticket of your own was not made: {e}"
     key = p.stdout.decode("utf-8", "replace").strip()
     if p.returncode or not KEY_RE.match(key):
         err = p.stderr.decode("utf-8", "replace").strip().splitlines()
-        return "", "the ticket for the new work was not made: " + ((err[-1] if err else "") or key or
-                                                                   f"status {p.returncode}")[:200]
+        return "", "the ticket of your own was not made: " + ((err[-1] if err else "") or key or
+                                                             f"status {p.returncode}")[:200]
     return key, ""
 
 
@@ -3543,6 +3579,15 @@ COMMON_JS = """
     var b = e.submitter || f.querySelector('button[type=submit]');
     if (b) setTimeout(function () { b.disabled = true; b.setAttribute('data-busy', '1'); }, 0);
   }, true);
+  // A text box grows with what is in it (up to most of the screen) instead of scrolling.
+  function grow(t) {
+    if (!t.offsetParent) return;   // hidden: no height to go by
+    t.style.height = 'auto';
+    t.style.height = Math.min(t.scrollHeight + t.offsetHeight - t.clientHeight, window.innerHeight * 0.7) + 'px';
+  }
+  window.growText = grow;
+  document.addEventListener('input', function (e) { if (e.target.tagName === 'TEXTAREA') grow(e.target); });
+  document.querySelectorAll('textarea').forEach(function (t) { if (t.value) grow(t); });
   // Back to a page the browser kept: its buttons are not still busy.
   window.addEventListener('pageshow', function () {
     document.querySelectorAll('[data-busy]').forEach(function (b) { b.disabled = false; b.removeAttribute('data-busy'); });
@@ -3642,7 +3687,7 @@ COMMON_JS = """
   function toAdd(smooth) {
     var p = document.getElementById('add');
     p.scrollIntoView({behavior: smooth ? 'smooth' : 'auto', block: 'start'});
-    var k = add.querySelector('input[name=keys]');
+    var k = add.querySelector('[data-kind]:not([hidden]) input') || add.querySelector('input[name=keys]');
     if (k) k.focus({preventScroll: true});
     p.classList.add('hl');
     setTimeout(function () { p.classList.remove('hl'); }, 1500);
@@ -3691,9 +3736,15 @@ COMMON_JS = """
       return hit;
     }
     function sync() {
-      var keys = q('input[name=keys]').value.toUpperCase().split(/[\\s,;]+/).filter(Boolean),
-        nw = q('textarea[name=new]'), fresh = !!nw && !nw.disabled && !!nw.value.trim(),
-        many = keys.length + (fresh ? 1 : 0) > 1;
+      var kd = q('input[name=kind]:checked'), mine = !!kd && kd.value === 'local';
+      add.querySelectorAll('[data-kind]').forEach(function (e) {
+        var was = e.hidden;
+        e.hidden = e.getAttribute('data-kind') !== (mine ? 'local' : 'jira');
+        if (was && !e.hidden) e.querySelectorAll('textarea').forEach(window.growText);
+      });
+      var keys = mine ? [kd.getAttribute('data-next')] :
+          q('input[name=keys]').value.toUpperCase().split(/[\\s,;]+/).filter(Boolean),
+        many = keys.length > 1;
       off(q('input[name=stage_fix]'), q('input[name=stage_review]').checked ? '' : 'fix needs review');
       var on = [];
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
@@ -3725,9 +3776,10 @@ COMMON_JS = """
       say(ap.querySelector(':scope > .why'), apWhy);
       var probs = [], warns = [];
       var bad = keys.filter(function (k) { return !KEY.test(k) || k.length > 40; });
-      if (!keys.length && !fresh) probs.push('Give at least one ticket key, or describe new work with no Jira ticket.');
+      if (mine) { if (!q('input[name=title]').value.trim()) probs.push('Give the ticket of your own a title.'); }
+      else if (!keys.length) probs.push('Give at least one ticket key.');
       else if (bad.length) probs.push('Not a ticket key (like ABC-123): ' + bad.slice(0, 3).join(', '));
-      else if (keys.length + (fresh ? 1 : 0) > MAXK) probs.push('At most ' + MAXK + ' tickets at a time.');
+      else if (keys.length > MAXK) probs.push('At most ' + MAXK + ' tickets at a time.');
       if (!q('input[name=project]').value.trim()) probs.push('Give the project folder.');
       else if (projErr) probs.push(projErr);
       if (!on.length) probs.push('Pick at least one stage.');
@@ -3785,6 +3837,7 @@ COMMON_JS = """
       sync();
       if (t.name && t.name.indexOf('stage_') === 0) pick('preset', presetOf()).checked = true;
       if (t.name === 'start' && t.value === 'continue') q('input[name=cont]').focus();
+      if (t.name === 'kind') q('[data-kind]:not([hidden]) input').focus();
     });
     add.addEventListener('input', function (e) {
       if (e.target.name === 'cont' && e.target.value) pick('start', 'continue').checked = true;

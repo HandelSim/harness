@@ -704,7 +704,7 @@ tracker issue with the same key cannot overwrite it, and everything that reads
 a ticket's copy (`--ticket`, the context files, the queue's `_pull` and
 `ticket_criteria`) works on it unchanged. Edit the file to change the work.
 `harness queue add --new "TEXT"` (repeatable; the viewer's Add form has the
-same as New work, no Jira ticket) makes one per TEXT, titled by its
+same as A ticket of your own) makes one per TEXT, titled by its
 first line, and queues it with the other keys; a minted ticket whose add
 failed (no `state/queue/KEY/state.json`) is deleted again, and the vault is
 committed by the run's sync.
@@ -1851,12 +1851,13 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   one of the ticket's stages), why it waits (a running ticket: its stage,
   attempt and the run's `step`; a `running` ticket with no live run on it:
   "run ended"), and its buttons (move, Answer
-  or Review plan, stop, retry, remove); and the Add form (keys, New work
-  with no Jira ticket (a textarea; `add_tickets` checks everything else
-  first, then `new_ticket` runs `vault_ticket.py --new` into the active
-  vault as `harness queue add --new` does, adds the LOCAL-N key to the
-  keys, and deletes the copy again when the queue did not add it; off with
-  no active vault), project folder, a Starting point: New work from the target branch, Continue
+  or Review plan, stop, retry, remove); and the Add form (Ticket: Jira
+  tickets, by keys, or A ticket of your own, a title and a description
+  and no keys, its key the next LOCAL-N as `next_local_key` predicts it;
+  `add_tickets` checks everything else first, then `new_ticket` runs
+  `vault_ticket.py --new` into the active vault as `harness ticket new`
+  does, queues that key, and deletes the copy again when the queue did not
+  add it; off with no active vault), project folder, a Starting point: New work from the target branch, Continue
   existing work on a named branch such as `origin/ABC-123` (the work branch
   defaults to that branch's name; one ticket per add), or The folder as it is
   now (`--start here`); the Target branch (`--base`), an optional Work branch
@@ -2036,6 +2037,8 @@ offered as suggestions. It is taken as pasted: quotes
   is not in a state for it (answers sent twice, approve of a ticket not in
   plan-review). Every POST needs a same-host `Origin` and, when codes are
   on, a session.
+- Text boxes grow with what is typed in them, up to 70% of the window,
+  instead of scrolling (`grow` in `COMMON_JS`).
 - Live updates: Home and the queue, ticket and session-list pages poll their
   `/live` JSON every 3 s (a session page its tail) and swap only the parts
   that changed (`hSwap` in `COMMON_JS`): a form being filled in (a changed

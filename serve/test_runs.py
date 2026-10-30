@@ -1450,46 +1450,60 @@ class QueuePageTest(RunsServer):
         self.assertIn("placeholder='origin/ABC-123'", body)
         self.assertIn("value='origin/ABC-5'", body)
 
-    def test_add_new_work_with_no_jira_ticket(self):
+    def test_add_a_ticket_of_your_own(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
         tickets = os.path.join(self.vault, ".raw", "tickets")
         self.start()
         r, body = self.req("GET", "/runs/queue")
-        self.assertIn("New work, no Jira ticket<textarea name='new'", body)
-        # only the new work: a ticket of your own is made in the vault and queued
-        r, body = self.post("/runs/queue/add", [("keys", ""), ("project", proj), ("branch", "fix/login"),
-                                                ("new", "Fix the flaky login test\r\nIt fails one run in ten")])
+        # two kinds, Jira first; the title and description only for a ticket of your own, its key said
+        self.assertIn("<input type='radio' name='kind' value='jira' data-next='LOCAL-1' checked>Jira tickets", body)
+        self.assertIn("<input type='radio' name='kind' value='local' data-next='LOCAL-1'>A ticket of your own", body)
+        self.assertIn("<label class='fld' data-kind='jira'>Ticket keys", body)
+        self.assertIn("<label class='fld' data-kind='local' hidden>Title<input name='title'", body)
+        self.assertIn("<label class='fld' data-kind='local' hidden>Description<textarea name='desc'", body)
+        self.assertIn("its key is LOCAL-1", body)
+        r, body = self.post("/runs/queue/add", [("kind", "local"), ("title", " Fix the  flaky login test "),
+                                                ("desc", "It fails one run in ten\r\nin CI only"),
+                                                ("keys", "ABC-30"), ("project", proj), ("branch", "fix/login")])
         self.assertEqual(r.status, 303, body)
         with open(os.path.join(self.queue, "LOCAL-1", "state.json")) as f:
             self.assertEqual(json.load(f)["branch"], "fix/login")
+        self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-30")))   # keys are for Jira tickets only
         with open(os.path.join(tickets, "LOCAL-1.md")) as f:
             copy = f.read()
-        for want in ("source: local\n", "# LOCAL-1: Fix the flaky login test\n", "It fails one run in ten\n"):
+        for want in ("source: local\n", "# LOCAL-1: Fix the flaky login test\n", "It fails one run in ten\nin CI only\n"):
             self.assertIn(want, copy)
-        # with keys: one more ticket, so no work branch name
-        r, body = self.post("/runs/queue/add", [("keys", "ABC-30"), ("project", proj), ("branch", "x"),
-                                                ("new", "tidy the readme")])
-        self.assertEqual(r.status, 409)
-        self.assertIn("a work branch name is for one ticket", body)
-        self.assertIn(">tidy the readme</textarea>", body)
-        self.assertFalse(os.path.exists(os.path.join(tickets, "LOCAL-2.md")))
-        r, body = self.post("/runs/queue/add", [("keys", "ABC-30"), ("project", proj), ("new", "tidy the readme")])
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("its key is LOCAL-2", body)
+        # no description: the title is
+        r, body = self.post("/runs/queue/add", [("kind", "local"), ("title", "tidy the readme"), ("project", proj)])
         self.assertEqual(r.status, 303, body)
-        for k in ("ABC-30", "LOCAL-2"):
-            self.assertTrue(os.path.exists(os.path.join(self.queue, k, "state.json")), k)
-        # an add the queue refuses takes its new ticket out of the vault again
-        r, body = self.post("/runs/queue/add", [("project", self.tmp.name), ("new", "never queued")])
+        with open(os.path.join(tickets, "LOCAL-2.md")) as f:
+            self.assertIn("## Description\n\ntidy the readme\n", f.read())
+        # refused: what was typed is kept, its kind picked, and no ticket is left in the vault
+        r, body = self.post("/runs/queue/add", [("kind", "local"), ("title", "never queued"), ("desc", "a <b>"),
+                                                ("project", self.tmp.name)])
         self.assertEqual(r.status, 409)
         self.assertIn("not in a git repository", body)
+        self.assertIn("value='local' data-next='LOCAL-3' checked", body)
+        self.assertIn("value='never queued'", body)
+        self.assertIn(">a &lt;b&gt;</textarea>", body)
+        self.assertIn("<label class='fld' data-kind='jira' hidden>Ticket keys", body)
         self.assertFalse(os.path.exists(os.path.join(tickets, "LOCAL-3.md")))
-        r, body = self.post("/runs/queue/add", [("keys", " "), ("project", proj), ("new", " ")])
+        r, body = self.post("/runs/queue/add", [("kind", "local"), ("title", "  "), ("desc", "x"), ("project", proj)])
         self.assertEqual(r.status, 409)
-        self.assertIn("or describe new work", body)
-        # no active vault: nowhere to write it
+        self.assertIn("give the ticket of your own a title", body)
+        r, body = self.post("/runs/queue/add", [("kind", "local"), ("title", "x" * 121), ("project", proj)])
+        self.assertIn("the title is over 120 characters", body)
+        r, body = self.post("/runs/queue/add", [("kind", "other"), ("keys", "ABC-31"), ("project", proj)])
+        self.assertIn("not a kind of ticket", body)
+        r, body = self.post("/runs/queue/add", [("keys", " "), ("project", proj)])
+        self.assertIn("give at least one ticket key", body)
+        # no active vault: nowhere to save one
         self.start(vault="")
         r, body = self.req("GET", "/runs/queue")
-        self.assertIn("<textarea name='new' maxlength='20000' disabled", body)
-        r, body = self.post("/runs/queue/add", [("project", proj), ("new", "x")])
+        self.assertIn("value='local' data-next='LOCAL-1' disabled>A ticket of your own", body)
+        r, body = self.post("/runs/queue/add", [("kind", "local"), ("title", "x"), ("project", proj)])
         self.assertEqual(r.status, 409)
         self.assertIn("there is no active vault", body)
 
