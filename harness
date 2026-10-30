@@ -370,9 +370,18 @@ _harness_secret_vars=(PROXY_API_KEY OAI_API_KEY CHATGPT_COOKIE_STRING TRACKER_TO
 #   image inline. We tell the user this is happening so they don't think
 #   the script froze. Build is one-time; subsequent calls are fast.
 # - If Docker isn't running, both paths fail. Clear error.
+# - The jq `harness host` vendors (state/host/toolchain/bin) comes before the
+#   sidecar: it is on PATH only inside a host launch, and an upgrade or a
+#   `harness net` call outside one should not need docker for it.
 harness_jq() {
     if command -v jq >/dev/null 2>&1; then
         jq "$@"
+        return $?
+    fi
+    local vendored
+    vendored=$(host_jq_vendored)
+    if [[ -x "$vendored" ]]; then
+        "$vendored" "$@"
         return $?
     fi
 
@@ -3457,7 +3466,9 @@ interrupted.
 The container stack is taken down, not started again: the next container
 launch starts it on the new code, so an install used in host mode only never
 runs it. With container agents still working, the stack stays up for them and
-the first launch after they end starts it again.
+the first launch after they end starts it again. Upgrade never starts docker:
+with it stopped there is no stack to take down, and the next container launch
+starts the stack on the new code. Only --rebuild needs docker running.
 
 Upgrade builds no images: the next container launch does, and only what
 changed. Starting the stack rebuilds the proxy and MCP images, and a launch
@@ -3503,13 +3514,22 @@ EOF
     # and point the user at 'harness host'. The proxy runs from the (updated)
     # clone and its venv refreshes lazily on the next launch, so there is
     # genuinely nothing to rebuild. A --check preview is runtime-agnostic.
-    local host_only=0
+    #
+    # Upgrade never starts docker (on Windows and macOS require_docker starts
+    # Docker Desktop). With the daemon stopped no stack runs, so there is
+    # nothing to take down: docker_off skips the stack steps and marks the stack
+    # stale. Only --rebuild, an explicit "build now", needs the daemon.
+    local host_only=0 docker_off=0
     if (( ! check_only )) && ! harness_runtime_installed; then
         host_only=1
         echo "harness: no container runtime found — running a host-only upgrade"
         echo "         (pull + config merge; no image rebuild or container restart)."
     elif (( ! check_only )); then
-        require_docker
+        if (( rebuild && ! no_restart )); then
+            require_docker
+        elif ! harness_docker_running; then
+            docker_off=1
+        fi
     fi
 
     if (( ! check_only )); then
@@ -3569,7 +3589,9 @@ EOF
     local lib="$clone_dir/scripts/lib/upgrade_actions.sh"
     if [[ ! -f "$manifest" || ! -f "$lib" ]]; then
         err "no upgrade manifest or actions library found; falling back to legacy upgrade"
-        if (( ! host_only && ! no_restart && ! check_only )); then
+        if (( docker_off && ! no_restart )); then
+            : >"$(stack_stale_file)"
+        elif (( ! host_only && ! no_restart && ! check_only )); then
             # Down, not up again: the next container launch starts the stack
             # (and builds what it needs) on the new code.
             _upgrade_stack_down
@@ -3599,11 +3621,13 @@ EOF
     # merges entirely, instead of prompting + running jq on every upgrade.
     local needed_ids=""
     local skip_actions=0
-    if (( host_only )) && ! command -v jq >/dev/null 2>&1; then
+    if (( host_only || docker_off )) && ! command -v jq >/dev/null 2>&1 \
+            && [[ ! -x "$(host_jq_vendored)" ]]; then
         # The manifest merge runs through harness_jq, which on a jq-less host
-        # falls back to a docker jq sidecar. A host-only box has no docker, so
-        # without host jq the merge can't run. The pull already succeeded (code
-        # is updated), so skip the config merges rather than hard-fail.
+        # falls back to a docker jq sidecar. Without docker (none installed, or
+        # its daemon stopped) and without host jq the merge can't run. The pull
+        # already succeeded (code is updated), so skip the config merges rather
+        # than hard-fail.
         echo
         echo "harness: 'jq' not found on the host; skipping config-file merges."
         echo "         Code is updated. Install jq and re-run 'harness upgrade'"
@@ -3692,7 +3716,14 @@ EOF
         return 0
     fi
 
-    if (( ! no_restart )); then
+    if (( docker_off && ! no_restart )); then
+        # The proxy has restart: unless-stopped, so a stack that was up when
+        # docker stopped comes back with docker on its old image. The stale mark
+        # makes the next container launch start it again on the new code.
+        : >"$(stack_stale_file)"
+        echo "[harness] upgrade complete. Docker is not running, so there was no container stack to take down;"
+        echo "  the next container launch starts it on the new code, rebuilding the images whose files changed."
+    elif (( ! no_restart )); then
         _upgrade_stack_down
 
         # No build here: the stack start builds the proxy and MCP images
@@ -3824,10 +3855,10 @@ EOF
         shift
     done
 
-    # The reset itself is pure git; only the rebuild/restart needs docker, so
-    # fail fast on a missing daemon BEFORE the destructive reset (but allow a
-    # code-only --no-restart downgrade on a host without docker).
-    if (( ! no_restart )); then
+    # The reset itself is pure git; only --rebuild needs docker (the upgrade
+    # run below skips the stack steps when docker is not running), so fail fast
+    # on a missing daemon BEFORE the destructive reset only for that.
+    if (( rebuild && ! no_restart )); then
         require_docker
     fi
 

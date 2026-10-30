@@ -9,8 +9,9 @@
 #     NOT abort on require_docker the way the container path does, and must
 #     NOT try to rebuild images or restart a container stack. It pulls + merges
 #     config, then prints "[harness] host-only upgrade complete." and returns 0.
-#   - When a container runtime IS present, upgrade still takes the require_docker
-#     path (the gate actually branches on harness_runtime_installed).
+#   - When a container runtime is installed but its daemon is stopped, upgrade
+#     does not start it (require_docker would start Docker Desktop): no stack
+#     runs, so it marks the stack stale and finishes. Only --rebuild needs it.
 #
 # Runs without docker: `harness` is sourced with HARNESS_SOURCE_ONLY=1 so
 # main() never runs, the git pull is suppressed with HARNESS_UPGRADE_SKIP_PULL,
@@ -50,6 +51,9 @@ source "${REPO_ROOT}/harness"
 # (the same "tests keep clone_dir resolved to the real repo" intent noted at
 # the top of `harness`).
 clone_dir="${REPO_ROOT}"
+# For the same reason platform.sh was not sourced; load it from the real repo.
+# shellcheck source=/dev/null
+source "${REPO_ROOT}/scripts/lib/platform.sh"
 
 # Container-only helpers the host path must never reach. Each prints a unique
 # marker and exits with a unique code, so a host run that touches one fails
@@ -89,26 +93,75 @@ if grep -qE "MARKER_REQUIRE_DOCKER|MARKER_CMD_DOWN|MARKER_CMD_START" <<<"${out}"
 fi
 ok "T1: never calls require_docker / cmd_down / cmd_start on the host path"
 
-# --- T2: runtime present -> still goes through require_docker ----------------
-# Pins the branch: with a runtime installed the gate must take the container
-# path (require_docker), not the host-only path.
+# --- T2: runtime installed, daemon stopped -> docker is never started --------
+# Upgrade does not start docker (require_docker starts Docker Desktop on
+# Windows/macOS): with the daemon stopped there is no stack to take down, so it
+# marks the stack stale and finishes. Only --rebuild needs the daemon.
 harness_runtime_installed() { return 0; }
+harness_docker_running()    { return 1; }
+mkdir -p "${state_root}"   # an install's state/ always exists; this throwaway root's does not yet
+rm -f "$(stack_stale_file)"
 set +e
 out2=$(HARNESS_UPGRADE_SKIP_PULL=1 cmd_upgrade --no-prompt 2>&1)
 rc2=$?
 set -e
-
-grep -q "MARKER_REQUIRE_DOCKER" <<<"${out2}" \
-    || { echo "${out2}" | sed 's/^/    /'; fail "T2: container path did not call require_docker"; }
-[[ "${rc2}" -eq 91 ]] \
-    || { echo "${out2}" | sed 's/^/    /'; fail "T2: expected rc 91 from the require_docker sentinel, got ${rc2}"; }
-ok "T2: a runtime-present install takes the require_docker path"
-
-if grep -q "host-only upgrade complete" <<<"${out2}"; then
+[[ "${rc2}" -eq 0 ]] || { echo "${out2}" | sed 's/^/    /'; fail "T2: upgrade with docker stopped returned ${rc2}, expected 0"; }
+if grep -qE "MARKER_REQUIRE_DOCKER|MARKER_CMD_DOWN|MARKER_CMD_START" <<<"${out2}"; then
     echo "${out2}" | sed 's/^/    /'
-    fail "T2: runtime-present install wrongly took the host-only branch"
+    fail "T2: upgrade with docker stopped started docker or touched the stack"
 fi
-ok "T2: a runtime-present install does NOT take the host-only branch"
+grep -q "Docker is not running, so there was no container stack to take down" <<<"${out2}" \
+    || { echo "${out2}" | sed 's/^/    /'; fail "T2: no word that docker is not running"; }
+[[ -f "$(stack_stale_file)" ]] || fail "T2: the stack was not marked stale"
+! grep -q "host-only upgrade complete" <<<"${out2}" || fail "T2: an installed runtime took the host-only branch"
+ok "T2: docker installed but stopped: not started, stack marked stale, upgrade completes"
+rm -f "$(stack_stale_file)"
+
+# Without jq the merges would need the docker jq sidecar: skipped, as host-only.
+set +e
+out2=$(HARNESS_UPGRADE_SKIP_PULL=1 PATH=/nonexistent cmd_upgrade --no-prompt 2>&1)
+rc2=$?
+set -e
+[[ "${rc2}" -eq 0 ]] && grep -q "skipping config-file merges" <<<"${out2}" \
+    && ! grep -q "MARKER_REQUIRE_DOCKER" <<<"${out2}" \
+    || { echo "${out2}" | sed 's/^/    /'; fail "T2: no jq and docker stopped did not skip the merges"; }
+ok "T2: no jq and docker stopped: config merges skipped, docker not started"
+rm -f "$(stack_stale_file)"
+
+set +e
+out2=$(HARNESS_UPGRADE_SKIP_PULL=1 cmd_upgrade --no-prompt --rebuild 2>&1)
+rc2=$?
+set -e
+grep -q "MARKER_REQUIRE_DOCKER" <<<"${out2}" && [[ "${rc2}" -eq 91 ]] \
+    || { echo "${out2}" | sed 's/^/    /'; fail "T2: --rebuild did not require docker (rc ${rc2})"; }
+ok "T2: --rebuild still requires docker"
+
+# downgrade: the same, before its reset (no earlier tag here, so it stops there).
+_downgrade_target_tag() { return 1; }
+git() { [[ "${3:-}" == fetch ]] && return 0; command git "$@"; }
+set +e
+out2=$(cmd_downgrade --no-prompt 2>&1)
+rc2=$?
+set -e
+! grep -q "MARKER_REQUIRE_DOCKER" <<<"${out2}" && grep -q "no earlier release tag" <<<"${out2}" \
+    || { echo "${out2}" | sed 's/^/    /'; fail "T2: downgrade required docker without --rebuild"; }
+set +e
+out2=$(cmd_downgrade --no-prompt --rebuild 2>&1)
+rc2=$?
+set -e
+grep -q "MARKER_REQUIRE_DOCKER" <<<"${out2}" || fail "T2: downgrade --rebuild did not require docker"
+unset -f git
+ok "T2: downgrade requires docker only for --rebuild"
+
+# harness_jq uses the jq a host launch vendored before the docker sidecar.
+mkdir -p "$(host_tool_bin_dir)"
+printf '#!/bin/sh\necho VENDORED_JQ "$@"\n' >"$(host_jq_vendored)"
+chmod +x "$(host_jq_vendored)"
+mkdir -p "${WORK}/nojq"; ln -sf "$(command -v uname)" "${WORK}/nojq/uname"   # a PATH without jq
+[[ "$(PATH="${WORK}/nojq" harness_jq -r .x)" == "VENDORED_JQ -r .x" ]] \
+    || fail "T2: harness_jq did not use the vendored jq"
+rm -f "$(host_jq_vendored)"
+ok "T2: harness_jq falls back to the vendored jq before the docker sidecar"
 
 # --- T3: a running host proxy comes back with the mode it had ---------------
 # host_proxy_start records backend and prompt mode in proxy.mode; the restart
@@ -144,6 +197,7 @@ ok "T3: with no proxy running, nothing is started"
 # The next container launch starts it on the new code and rebuilds changed
 # images; agents still working keep it up (marked stale); --rebuild builds now.
 harness_runtime_installed() { return 0; }
+harness_docker_running()    { return 0; }
 require_docker()        { :; }
 host_proxy_refresh()    { :; }
 harness_serve_refresh() { :; }

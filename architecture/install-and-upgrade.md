@@ -338,11 +338,21 @@ likewise untouched at upgrade time and re-provisions lazily on the next
 `harness host` only if the pulled code bumped a `HARNESS_HOST_*_VERSION` pin
 (each tool is stamped against its pinned version). A proxy already
 running was restarted on the new code in step 3b.
-The config merge needs jq; on a host-only box without jq the merge step is
-skipped with a warning (the pull still applies) rather than failing. A
-container install with the daemon merely stopped is NOT treated as host-only
-— it still hits `require_docker`, which tells the user to start the daemon,
-so a transient docker outage never silently downgrades the upgrade. The same
+The config merge needs jq: host jq, else the jq `harness host` vendored
+(`state/host/toolchain/bin`, which `harness_jq` tries before its docker
+sidecar). With neither on a box without docker the merge step is skipped with
+a warning (the pull still applies) rather than failing.
+
+**Docker installed but stopped.** Upgrade never starts docker
+(`require_docker` would start Docker Desktop on Windows/macOS). With the
+daemon unreachable (`harness_docker_running` false) no stack runs, so there is
+nothing to take down: `cmd_upgrade` skips step 4, writes `stack_stale_file`
+(the proxy's `restart: unless-stopped` brings a stack that was up when docker
+stopped back on its old image; the marker makes the next container launch
+start it again on the new code) and says so. The merges follow the jq rule
+above. Only `--rebuild`, an explicit "build now", calls `require_docker`;
+`harness downgrade` likewise checks docker before its reset only for
+`--rebuild`. The same
 `harness_runtime_installed` gate makes `harness down` a host-proxy/MCP stop
 (no `require_docker`) and makes `harness restart` point host users at
 `harness host down && harness host` instead of erroring on a missing runtime.
