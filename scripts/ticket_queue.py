@@ -2714,7 +2714,7 @@ def fresh(path, started):
 
 
 # A line of each prompt's template: output holding it is the prompt echoed, not the agent's note.
-NOTE_TEMPLATE = {"plan": "One or two sentences in plain words: what the owner gets when the ticket is done.",
+NOTE_TEMPLATE = {"plan": "One or two sentences in plain words: what the owner gets",   # plan.md's Goal line
                  "review": "Only real defects that would make the change wrong, unsafe or not meet"}
 NOTE_HEADS = {"plan": r"^##\s+Goal\b", "review": r"^##\s+Must fix\b"}
 
@@ -3104,6 +3104,7 @@ def stage_push(ctx, st):
     results(ctx, st, change, pushes)
     record(st, "passed", [part_line(p) for p in parts])
     st.update(status="done", stage="done", attempt=0, feedback="", reason=reason, sha=sha or "")
+    st.pop("built_on", None)   # the round is built: a retry from the plan starts over, a followup sets it again
     ctx.q.save(st)
 
 
@@ -3243,6 +3244,7 @@ def advance(ctx, st, stage, reason=""):
         if not reason and "push" not in stages_of(st):
             reason = f"its stages are done ({','.join(stages_of(st))}); nothing pushed"
         st.update(stage="done", attempt=0, feedback="", status="done", reason=reason)
+        st.pop("built_on", None)
         ctx.q.log(st["key"], f"done: {reason}" if reason else "done")
         if st.get("base_sha"):   # what the stages left, with nothing pushed
             change = None

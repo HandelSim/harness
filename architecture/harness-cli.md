@@ -710,7 +710,8 @@ once and exported as `HARNESS_HOST_CONFIRM=1`, so the exit-75 `exec` does
 not ask again; `add` with no active vault warns that `run` will need one), starts the host proxy if it is not running and hands the rest to the
 Python script. `list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
 (`$EDITOR` without TEXT; the script's `--stdin` is what the run viewer's
-ticket page uses), `findings`, `watch` (tails `run.log`) and `log
+ticket page uses), `followup KEY ["TEXT"]` (same input rules; see
+"Follow-up rounds" below), `findings`, `watch` (tails `run.log`) and `log
 [KEY]` are the owner's side.
 
 Owner control (all of it also on the run viewer's queue and ticket pages):
@@ -946,7 +947,9 @@ taken (`recover_note`, logged; never output that holds the prompt's own
 template).
 
 The plan is markdown in a strict one-line-per-item shape (`plan.md`; the card's
-done line repeats it): `## Goal`, `## Steps` (``1. `file` `function()`: the
+done line repeats it): `## Goal`, `## How it works` (2-5 plain bullets: what
+the owner will see, and the main choice made and why), `## Not included`,
+`## Steps` (``1. `file` `function()`: the
 change (AC1, AC2)``, "(new)" for a new file), `## Acceptance criteria` (``-
 ACn: GIVEN .. WHEN .. THEN .. (ticket: "exact words")`` or `(edge of ACn)`),
 `## Questions` (`- Qn [blocking] ..? Options: (a) .. (b) .. Default: (a),
@@ -955,9 +958,15 @@ case as its own criterion, every open decision as a Question rather than a
 guess, and a self-check pass (re-read each file and function the Steps name,
 fix the plan) before finishing; the owner's feedback comes back by id
 ("AC3: rejected - why", "Q1: (b)") and ids are never renumbered.
+The owner reads the plan before approving it, so the prompt asks for short plain
+lines, Steps that start with their file (the ticket page groups them by it),
+and Questions on anything with two readings (names, defaults, errors, scope,
+changed behaviour), each option saying what would be built. A missing How it
+works / Not included is a note, never a failure (`PLAN_SECTIONS`).
 `plan_items` parses it (`criterion`, `question`, `item_id`) into steps,
-criteria (id, given, when, then, source) and questions (id, ask, options,
-default, blocking), kept in `state.json` (`criteria`, `questions`,
+criteria (id, given, when, then, source), questions (id, ask, options,
+default, blocking), assumptions (id, text) and the goal / how / not-included
+text, kept in `state.json` (`criteria`, `questions`, `assumptions`,
 `plan_sig`, a hash of the plan text) and `state/queue/KEY/plan.json`, for the
 viewer and a later tester stage; each criterion has one id
 (`criterion_ids`: a repeated or missing id takes the next after the highest),
@@ -971,7 +980,8 @@ acceptance criteria within those caps; a criterion not in the GIVEN/WHEN/THEN
 one-line shape (`shape_problems`), or a criterion the owner accepted by id
 on the last round that the re-plan dropped or reworded (`accepted_changed`,
 read against the previous `plan.json` and that round's answers block; an id
-the owner wrote about since, or in the notes, is free), fails an attempt
+the owner wrote about since, or in the notes, is free; after a follow-up
+every id is free), fails an attempt
 that has a retry left and is a note on the last; a Step path missing from the folder and not marked
 "(new)" (`step_notes`), the other sections, more than `MAX_QUESTIONS` 8
 questions and a missing `[blocking]` marker (`MARK`: in brackets,
@@ -1028,7 +1038,11 @@ its own (`spawn`), and `stop` ends the job: `taskkill /T` follows parent
 ids and misses a process whose parent is gone. A `_sync` that gets no
 answer in `SYNC_TIMEOUT` (600 s) makes the run skip its saves for
 `SYNC_BACKOFF` (30 min); the next one captures 30 days of sessions, so
-nothing is lost. The running agent is in
+nothing is lost. `sync_vault` never raises (a failure is a warning in the
+ticket's log, or on stderr when that cannot be written), so a vault that
+cannot be saved never holds a ticket between stages or ends the run; the
+`_sync` call gets `net_env`, so a vault push or pull never waits on a
+credential prompt. The running agent is in
 `state.json` as `agent {pid, launch, host, container, workdir}`; `run`,
 `retry`, `remove` and `stop` first end one a dead run left (`reap`,
 `is_agent`: the pid still leads that launch). The container launch gets
@@ -1067,6 +1081,26 @@ the viewer started with another. `answer`, `approve` and `retry` stamp `requeued
 going takes the ticket again after its current one. Every attempt's result
 and, when it failed, its problems go to `state.json`'s `history` (last 30),
 which the ticket page lists.
+
+Follow-up rounds: `followup KEY` (`cmd_followup`, under `queue.lock`) takes
+a `done` ticket that has a plan stage and its work (`followup_refused`)
+round again on the same branch, instead of starting over. The round's plan,
+review and result notes are copied to `KEY-plan-rN.md` (and `-review-rN`,
+`-result-rN`); `KEY-plan.md` stays the one current plan, revised in place,
+so no later prompt has to name another file. The round goes into
+`state.json` `rounds` (n, ended, push result, compare URL, commits,
+diffstat, the follow-up text), and the text is appended to
+`KEY-answers.md` under `FOLLOW_UP_HEAD`, so the planner and `verify_plan`
+both read it. The ticket is requeued at plan with `built_on` (so
+`starts_over` keeps the clone/branch and `base_sha`: the next round builds on
+the commits) and `plan_hold` (the revised plan comes back as `plan-review`);
+the last round's sha, review and plan items are dropped. The plan prompt
+gets a `FOLLOW_UP` block (`follow_up`: the round number, branch, the
+archived plan's path and its commits) and is told: Steps cover only what is
+left, the acceptance criteria cover the whole ticket (the review checks the
+whole change against the base). `built_on` lasts for the round: reaching
+`done`, or a requeue that sets the work up again, clears it, so a later
+retry from the plan starts over as before.
 
 Harness never runs git in the clone once an agent has had it: it fetches
 the ticket's branch into the project as `refs/harness-queue/KEY` (in place:
@@ -1816,8 +1850,22 @@ offered as suggestions. It is taken as pasted: quotes
   run, they say none is going; Continue does, above), the
   ticket's sessions from every
   `--agent-data` source by stage, every attempt from `history` with its
-  result, reason and `.out`, the notes with an add form, the plan, answers
-  and review notes from the vault, and `log.md`. `/runs/ticket/<KEY>/live`
+  result, reason and a "raw output" link to its `.out` (the agent CLI's
+  stdout/stderr, for debugging a launch; there is no separate outputs
+  panel), the notes with an add form, and the ticket's vault notes rendered
+  as markdown by `vault_view.render_markdown` (imported lazily: it imports
+  this module), each with an "open in the vault" link: the plan, the
+  agent's state note (`KEY-state.md`), review, findings, the owner's answers
+  and follow-ups, the ticket (`.raw/tickets/KEY.md`); then `log.md` as text.
+  A plan waiting on the owner shows first at a glance (`_plan_glance`: Goal,
+  How it works, Not included, and the Steps grouped by the first file each
+  names, from `ticket_queue.plan_items`), the whole plan folded under it;
+  the feedback form folds the edge-case criteria (still posted) and has a
+  correction box per assumption (`as.An`, sent as "- An: wrong - ..."). A
+  `done` ticket has a follow-up form (`followup` action, refused with the
+  queue's own `followup_refused` reason), and a ticket that went round again
+  lists its rounds (each one's commits, diffstat, push result, follow-up
+  text and archived plan). `/runs/ticket/<KEY>/live`
   is its poll JSON, `/runs/ticket/<KEY>/<stage>-<n>.out` an output file.
 - `/runs/ticket/<KEY>/diff?repo=&view=` (`serve/diff_view.py`, "Changes" on
   the ticket page): a diff drawn in the browser by the vendored diff2html

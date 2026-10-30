@@ -716,6 +716,89 @@ class QueueTest(Base):
         sh("git", "-C", self.project, "rev-parse", "--verify", "ABC-1")
         self.assertEqual(sh("git", "-C", self.remote, "branch"), "")
 
+    def test_a_done_ticket_goes_round_again_with_a_follow_up(self):
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        first = self.status()
+        self.assertEqual(first["status"], "done", out)
+        tickets = os.path.join(self.vault, "wiki", "notes", "tickets")
+        plan1 = cat(os.path.join(tickets, "ABC-1-plan.md"))
+        rc, out = self.q("followup", "ABC-1", "--vault", self.vault, "--text", "  ")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no follow-up given", out)
+        rc, out = self.q("followup", "ABC-1", "--vault", self.vault, "--text", "Say it louder.")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("round 2", out)
+        st = self.status()
+        # queued at its plan, on the work as it is; the round before kept
+        self.assertEqual((st["status"], st["stage"], st["built_on"], st["plan_hold"]), ("queued", "plan", True, True))
+        self.assertEqual(st["base_sha"], first["base_sha"])
+        self.assertFalse(tq.starts_over(tq.Queue(self.state), st))
+        self.assertEqual([(r["n"], len(r["commits"]), r["followup"]) for r in st["rounds"]],
+                         [(1, len(first["commits"]), "Say it louder.")])
+        self.assertNotIn("criteria", st)
+        self.assertEqual(cat(os.path.join(tickets, "ABC-1-plan-r1.md")), plan1)
+        for kind in ("review", "result"):
+            self.assertTrue(os.path.exists(os.path.join(tickets, f"ABC-1-{kind}-r1.md")), kind)
+        answers = cat(os.path.join(tickets, "ABC-1-answers.md"))
+        self.assertIn(tq.FOLLOW_UP_HEAD + " (round 2, after round 1 was built", answers)
+        self.assertIn("Say it louder.", answers)
+        rc, out = self.q("followup", "ABC-1", "--vault", self.vault, "--text", "again")   # not done now
+        self.assertEqual(rc, 1, out)
+        self.assertIn("a follow-up is for a done ticket", out)
+        # the planner is told what was built and where the follow-up is; the plan comes back to be approved
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "plan-review", out)
+        prompts = cat(self.calls + ".planning").split("\n=====\n")
+        self.assertIn("<<<BEGIN_FOLLOW_UP (round 2 of this ticket", prompts[1])
+        self.assertIn(os.path.join(tickets, "ABC-1-plan-r1.md"), prompts[1])
+        self.assertIn("Say it louder.", prompts[1])
+        self.assertNotIn("BEGIN_FOLLOW_UP", prompts[0])
+        rc, out = self.q("approve", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        # built on the first round's commits, not from the start again
+        log = sh("git", "-C", self.remote, "log", "--format=%s", "ABC-1")
+        self.assertEqual(log.count("ABC-1: implementing"), 2, log)
+        self.assertEqual(len(st["rounds"]), 1)
+        self.assertNotIn("built_on", st)   # done: a retry from the plan starts over again
+
+    def test_a_follow_up_needs_a_plan_stage_and_the_work(self):
+        self.add("ABC-1")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        self.assertIn("is queued", tq.followup_refused(q, st))
+        st.update(status="done", stages=["review"])
+        self.assertIn("runs no plan stage", tq.followup_refused(q, st))
+        st["stages"] = list(tq.ALL_STAGES)
+        self.assertIn("work is gone", tq.followup_refused(q, st))   # never cloned
+
+    def test_the_owners_part_of_a_plan_is_read(self):
+        items = tq.plan_items("## Goal\nParse logs.\n## How it works\n- a parser\n## Not included\n- the UI\n"
+                              "## Steps\n1. `src/a.py`: x\n## Assumptions\n- A1: logs are utf-8\n- also this\n")
+        self.assertEqual((items["goal"], items["how"], items["out"]), ("Parse logs.", "- a parser", "- the UI"))
+        self.assertEqual(items["assumptions"], [{"id": "A1", "text": "logs are utf-8"}, {"id": "A2", "text": "also this"}])
+        self.assertEqual(items["steps"][0]["files"], ["src/a.py"])
+        # a follow-up round: the criteria the owner had accepted may change with it
+        last = {"sig": "s1", "criteria": [{"id": "AC1", "text": "AC1: GIVEN a WHEN b THEN c"}]}
+        answers = "Feedback on the plan (round of s1):\n- AC1: accepted\n"
+        reworded = ["AC1: GIVEN a WHEN b THEN d"]
+        self.assertEqual(len(tq.accepted_changed(last, answers, "", reworded)), 1)
+        answers += "\n<!-- 2026-10-30T10:00:00Z -->\n" + tq.FOLLOW_UP_HEAD + " (round 2):\n\nmake it louder\n"
+        self.assertEqual(tq.accepted_changed(last, answers, "", reworded), [])
+
+    def test_saving_into_the_vault_never_ends_the_run(self):
+        q = tq.Queue(self.state)
+        ctx = type("C", (), {"q": q, "vault": self.vault})()
+        with mock.patch.object(tq, "_sync_vault", side_effect=OSError("disk full")), \
+                mock.patch.object(q, "log", side_effect=OSError("log gone")):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                tq.sync_vault(ctx, "ABC-1", 0)
+        self.assertIn("disk full", err.getvalue())
+
     def test_add_list_remove(self):
         self.add("ABC-1")
         rc, out = self.q("add", "ABC-1", "--project", self.project)
