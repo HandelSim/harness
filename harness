@@ -6983,6 +6983,12 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             feedback on it (opens $EDITOR without
                                             TEXT); the plan is made again and held
                                             for approve (--go: not held)
+       harness queue followup KEY ["TEXT"]  a done ticket goes round again with your
+                                            comments on what was built (opens $EDITOR
+                                            without TEXT): the planner revises the plan
+                                            on top of the work, it comes back to you to
+                                            approve, and the stages build, review and
+                                            push the rest on the same branch
        harness queue note KEY ["TEXT"]      a note every later stage's prompt gets
                                             (opens $EDITOR without TEXT); any time
        harness queue approve KEY            approve the plan: implementing starts
@@ -7253,9 +7259,13 @@ HELP
         note) [[ -n "${1:-}" && $# -le 2 ]] || { err "usage: harness queue note KEY [\"TEXT\"]"; return 1; }
             args+=(note "$1")
             [[ -n "${2:-}" ]] && args+=(--text "$2") ;;
-        answer|findings)
+        answer|followup|findings)
             [[ -n "$vault" ]] || { err "no active vault (see: harness vault)"; return 1; }
-            if [[ "$sub" == answer ]]; then
+            if [[ "$sub" == followup ]]; then
+                [[ -n "${1:-}" && $# -le 2 ]] || { err "usage: harness queue followup KEY [\"TEXT\"]"; return 1; }
+                args+=(followup "$1" --vault "$vault")
+                [[ -n "${2:-}" ]] && args+=(--text "$2")
+            elif [[ "$sub" == answer ]]; then
                 local go=0 x
                 local -a rest=()
                 for x in "$@"; do [[ "$x" == --go ]] && go=1 || rest+=("$x"); done

@@ -398,6 +398,23 @@ pre.io { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mo
 pre.qlog { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 var(--mono); margin: 10px 0 0; max-height: 560px;
   overflow: auto; background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
 details.doc summary { font: 600 14px var(--sans); display: flex; align-items: center; gap: 8px; }
+.vlink { margin: 8px 0 0; font-size: 12.5px; } details.doc .md { margin-top: 10px; font-size: 14px; }
+.glance { border: 1px solid var(--line); border-radius: 10px; padding: 4px 14px 2px; margin: 10px 0; background: var(--raised); }
+.glance .md h3 { font-size: 15px; margin: 12px 0 4px; } .glance .md h4 { font-size: 13.5px; margin: 10px 0 2px; }
+details.edges { margin: 8px 0; } details.edges > summary { font: 600 13.5px var(--sans); cursor: pointer; }
+.rounds { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
+.rounds .hd { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.rounds .txt { white-space: pre-wrap; background: var(--sunk); border-radius: 8px; padding: 6px 10px; margin-top: 4px; }
+.md { font-size: 15px; line-height: 1.65; overflow-wrap: anywhere; min-width: 0; }
+.md h1 { font-size: 24px; margin: 0 0 12px; } .md h2 { font-size: 19px; margin: 22px 0 8px; }
+.md h3 { font-size: 16px; margin: 18px 0 6px; } .md p, .md ul, .md ol { margin: 0 0 10px; }
+.md pre { background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  overflow: auto; font: 12.5px/1.5 var(--mono); }
+.md code { background: var(--sunk); padding: 1px 4px; border-radius: 4px; } .md pre code { background: none; padding: 0; }
+.md table { border-collapse: collapse; margin: 0 0 12px; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; vertical-align: top; }
+.md blockquote { margin: 0 0 12px; padding: 4px 14px; border-left: 3px solid var(--line-2); color: var(--ink-2); }
+.md .task-list-item { list-style: none; } .md .task-list-item input { margin: 0 6px 0 0; }
 details.doc summary .muted { font-weight: 400; }
 .wide { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 360px); gap: 18px; align-items: start; }
 .wide2 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; align-items: start; }
@@ -762,6 +779,19 @@ class Runs:
                              "options": [_s(o, 500) for o in q["options"] if isinstance(o, str) and o.strip()][:8]
                              if isinstance(q.get("options"), list) else []}
                             for i, q in _items(st.get("questions"), "Q", MAX_QUESTIONS)]
+        out["assumptions"] = [{"id": i, "text": _s(a["text"])} for i, a in _items(st.get("assumptions"), "A", MAX_CRITERIA)]
+        rounds = st.get("rounds")   # the earlier rounds of a ticket followed up after it was done
+        out["rounds"] = [{"n": r["n"], "ended": str(r.get("ended", "")), "reason": str(r.get("reason", "")),
+                          "followup": str(r.get("followup", "")), "at": str(r.get("at", "")),
+                          "push": str((r.get("push") or {}).get("result", "")) if isinstance(r.get("push"), dict) else "",
+                          "compare_url": r["compare_url"] if isinstance(r.get("compare_url"), str)
+                          and re.match(r"https?://", r["compare_url"]) else "",
+                          "commits": len(r["commits"]) if isinstance(r.get("commits"), list) else 0,
+                          "diffstat": {k: r["diffstat"][k] if isinstance(r.get("diffstat"), dict)
+                                       and isinstance(r["diffstat"].get(k), int) else 0
+                                       for k in ("files", "insertions", "deletions")}}
+                         for r in (rounds if isinstance(rounds, list) else [])
+                         if isinstance(r, dict) and isinstance(r.get("n"), int)]
         sig = st.get("plan_sig")
         out["plan_sig"] = sig if isinstance(sig, str) and re.match(r"^[0-9a-f]{4,64}$", sig) else ""
         out["take_defaults"] = st.get("take_defaults") is True
@@ -837,6 +867,19 @@ class Runs:
             st = q.load(key)
             return tq.continue_refused(q, st) if isinstance(st, dict) else None
         except Exception:   # a hand-edited state.json: offered, and the queue says no where it must
+            return None
+
+    def followup_refused(self, key):
+        """Why harness queue followup would refuse the ticket, "" when it would take
+        one, None when that cannot be read (the form is offered; the queue says no)."""
+        tq = _tq()
+        if tq is None or not hasattr(tq, "followup_refused"):
+            return None
+        try:
+            q = tq.Queue(self.queue_dir)
+            st = q.load(key)
+            return tq.followup_refused(q, st) if isinstance(st, dict) else None
+        except Exception:
             return None
 
     def vault_of(self, st):
@@ -1962,6 +2005,13 @@ def _question_card(q):
             f"aria-label='other answer or comment on {i}' placeholder='Other / comment (optional)'></div>")
 
 
+def _assumption_card(a):
+    i = esc(a["id"])
+    return (f"<div class='fb'><div class='q'>{i}</div><div class='txt'>{esc(a['text'])}</div>"
+            f"<input name='as.{i}' maxlength='{COMMENT_MAX}' aria-label='correction to {i}' "
+            "placeholder='Correction (optional): what is true instead'></div>")
+
+
 def _feedback_form(key, st):
     """The plan's questions, then its acceptance criteria, each a card: an option
     to pick, accept or reject, a comment. sig is the plan they were read from, so
@@ -1972,7 +2022,15 @@ def _feedback_form(key, st):
              _hidden("sig", st.get("plan_sig", ""))]
     if st["questions"]:   # first: they decide what gets built
         parts.append("<h3>Questions</h3>" + "".join(_question_card(q) for q in st["questions"]))
-    parts.append("<h3>Acceptance criteria</h3>" + "".join(_criterion_card(c) for c in st["criteria"]))
+    main = [c for c in st["criteria"] if not c["edge"]]
+    edges = [c for c in st["criteria"] if c["edge"]]
+    parts.append("<h3>Acceptance criteria</h3>" + "".join(_criterion_card(c) for c in main))
+    if edges:   # folded: accepted as they are unless opened and changed (the fields still post)
+        parts.append(f"<details class='edges'><summary>Edge cases <span class='muted'>{len(edges)}: accepted unless "
+                     "you change them</span></summary>" + "".join(_criterion_card(c) for c in edges) + "</details>")
+    if st.get("assumptions"):
+        parts.append("<h3>Assumptions</h3><div class='muted'>What the planner took as given. Correct any that is "
+                     "wrong.</div>" + "".join(_assumption_card(a) for a in st["assumptions"]))
     parts.append(f"<label><div class='q'>Other notes</div><textarea name='note' maxlength='{NOTE_MAX}'></textarea>"
                  "</label>")
     if review:   # the same form: approve refuses what it would drop (a rejection, a comment, an answer)
@@ -2051,7 +2109,9 @@ def _t_result(st):
     commits = (f"<details class='doc' data-k='commits'><summary>Commits<span class='muted'>{len(st['commits'])}"
                f"</span></summary><ul class='commits'>{commits}</ul></details>") if commits else \
         ("" if left and not st.get("pushes") else "<div class='muted'>No commits on the branch.</div>")
-    return (f"<section class='panel'><h2>Result</h2><div class='kv'>{''.join(facts)}</div>{bad}{warn}"
+    head = (f"Result of round {len(st['rounds'])}" if st.get("rounds") and st.get("status") != "done"
+            else "Result")   # going round again: what the last round ended with, until this one does
+    return (f"<section class='panel'><h2>{head}</h2><div class='kv'>{''.join(facts)}</div>{bad}{warn}"
             f"{link}{commits}</section>")
 
 
@@ -2177,17 +2237,16 @@ def _t_questions(runs, key, st):
                  "plan is made with every default and implementing starts without it coming back to you.")
         plan = runs.note(key, "plan", vault)
         if plan.strip():   # what is to be approved or answered, where it is decided
-            plan = (f"<details class='doc' data-k='qplan' open><summary>The plan<span class='muted'>"
-                    f"{len(plan.splitlines())} lines</span></summary><pre class='qlog'>{esc(_cap(plan)[0])}</pre>"
-                    "</details>")
+            plan = _plan_glance(runs, key, vault, plan)
         return (f"<section class='panel'><h2>{head}</h2><div class='muted'>{intro}</div>"
                 f"{plan}{_feedback_form(key, st) if items else _answer_form(key, qs, review)}</section>")
     if qs:
         items = "".join(f"<li><div class='{'q blocking' if q.get('blocking') else 'q'}'>{esc(q['text'])}</div>"
                         f"<div class='muted'>{'waiting on you' if q.get('blocking') else 'going with the default'}"
                         "</div></li>" for q in qs)
-        return f"<section class='panel'><h2>Questions</h2><ul class='qs'>{items}</ul></section>"
-    return ""
+        return (f"<section class='panel'><h2>Questions</h2><ul class='qs'>{items}</ul></section>"
+                + _t_followup(runs, key, st))
+    return _t_followup(runs, key, st)
 
 
 def _t_sessions(runs, key, st, rows, live, outs, now):
@@ -2232,7 +2291,8 @@ def _t_attempts(key, st, names):
         link = ""
         if out in names and out not in linked:
             linked.add(out)
-            link = f"<a href='/runs/ticket/{quote(key)}/{quote(out)}' target='_blank' rel='noopener'>output</a>"
+            link = (f"<a href='/runs/ticket/{quote(key)}/{quote(out)}' target='_blank' rel='noopener' title="
+                    "'what the agent CLI printed (stdout and stderr): for debugging a launch'>raw output</a>")
         parts.append(f"<li><div class='hd'><span class='pill {tone.get(res, 't-off')}'>{esc(res)}</span>"
                      f"<span class='tag'>{esc(stage)}</span><span>attempt {n}</span>"
                      f"<span class='muted'>{esc(h['at'][:16].replace('T', ' '))}</span>{link}</div>")
@@ -2258,34 +2318,159 @@ def _t_notes(key, st):
     return "".join(parts)
 
 
-def _t_outs(key, outs, now):
-    parts = ["<h2>Stage outputs</h2>"]
-    if not outs:
-        return parts[0] + "<div class='muted'>None yet.</div>"
-    parts.append("<ul class='runs'>")
-    for name, mtime, size in reversed(outs):
-        parts.append(f"<li><span><a href='/runs/ticket/{quote(key)}/{quote(name)}' target='_blank' "
-                     f"rel='noopener'>{esc(name)}</a></span><span class='when'>{_ago(mtime * 1000, now)}</span>"
-                     f"<span class='meta'>{size:,} bytes</span></li>")
-    parts.append("</ul>")
-    return "".join(parts)
+DOCS = (("plan", "Plan"), ("state", "Agent's state note"), ("review", "Review"), ("findings", "Findings"),
+        ("answers", "Your answers and follow-ups"), ("ticket", "The ticket"))
+
+
+def _note_rel(key, kind):
+    """A ticket note's path in the vault."""
+    return f".raw/tickets/{key}.md" if kind == "ticket" else f"wiki/notes/tickets/{key}-{kind}.md"
+
+
+def _vault_text(vault, rel):
+    if not vault:
+        return ""
+    try:
+        with open(os.path.join(vault, *rel.split("/")), encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _md(vault, rel, text):
+    """A vault note as the vault viewer shows it: its markdown rendered (raw HTML
+    escaped), its front matter dropped; as text when that cannot be done."""
+    try:
+        import vault_view   # it imports this module: loaded here, on first use
+        return (f"<article class='md'>{vault_view.render_markdown(vault, rel, vault_view.frontmatter(text)[1])}"
+                "</article>")
+    except Exception:   # noqa: BLE001 - a note the renderer chokes on is still shown
+        return f"<pre class='qlog'>{esc(_cap(text)[0])}</pre>"
+
+
+def _open_in_vault(runs, vault, rel):
+    """The note's page in the vault viewer, when it is the vault this viewer shows."""
+    return (f"<a class='muted' href='/vault/browse/{quote(rel)}'>open in the vault</a>"
+            if vault and vault == runs.vault else "")
+
+
+def _doc(runs, vault, key, kind, label, text, open_=False):
+    rel = _note_rel(key, kind)
+    return (f"<section class='panel'><details class='doc' data-k='{kind}'{' open' if open_ else ''}><summary>{label}"
+            f"<span class='muted'>{len(text.splitlines())} lines</span></summary>"
+            f"<div class='vlink'>{_open_in_vault(runs, vault, rel)}</div>{_md(vault, rel, text)}</details></section>")
 
 
 def _t_docs(runs, key, st, log):
+    """The ticket's notes in the vault, rendered: the plan (unless it is open above,
+    with the answer form), the agent's state note, the review, the findings, the
+    owner's answers and follow-ups, the ticket itself; then the queue's own log."""
     vault = runs.vault_of(st)
     parts = []
-    for kind, label in (("plan", "Plan"), ("answers", "Your answers"), ("review", "Review"), ("findings", "Findings")):
+    for kind, label in DOCS:
         if kind == "plan" and st.get("status") in WAITING and st.get("status") != "blocked":
             continue   # shown open above, with the answer form
-        text = runs.note(key, kind, vault)
+        text = _vault_text(vault, _note_rel(key, kind))
         if text.strip():
-            parts.append(f"<section class='panel'><details class='doc' data-k='{kind}'><summary>{label}"
-                         f"<span class='muted'>{len(text.splitlines())} lines</span></summary>"
-                         f"<pre class='qlog'>{esc(_cap(text)[0])}</pre></details></section>")
+            parts.append(_doc(runs, vault, key, kind, label, text))
     text = log[-60000:] if log.strip() else "no log yet"
     parts.append("<section class='panel'><details class='doc' data-k='log'><summary>Queue log"
                  f"<span class='muted'>{len(log.splitlines())} lines</span></summary>"
                  f"<pre class='qlog'>{esc(text)}</pre></details></section>")
+    return "".join(parts)
+
+
+def _plan_items(text):
+    """The plan's parts as the queue reads them (ticket_queue.plan_items), or None."""
+    tq = _tq()
+    try:
+        return tq.plan_items(text) if tq is not None else None
+    except Exception:   # noqa: BLE001 - a plan the parser chokes on is shown whole
+        return None
+
+
+def _by_file(steps):
+    """The plan's steps as markdown, grouped by the first file each names, in the
+    order the files come up; a step naming none goes under Other."""
+    groups = {}
+    for x in steps:
+        f = x["files"][0] if x.get("files") else ""
+        text = x["text"]
+        if f:   # the heading names the file: not again at the start of the step
+            text = re.sub(r"^\s*\*{0,2}`?" + re.escape(f) + r"`?\*{0,2}\s*[:\u2013\u2014-]?\s*", "", text) or text
+        groups.setdefault(f, []).append(text)
+    out = []
+    for f, texts in groups.items():
+        out.append(f"#### `{f}`" if f else "#### Other")
+        out += [""] + [f"- {t}" for t in texts] + [""]
+    return "\n".join(out)
+
+
+def _plan_glance(runs, key, vault, plan):
+    """The plan as the owner reads it first: its goal, how it works, what is not
+    included and the changes file by file; then the whole plan, folded."""
+    rel = _note_rel(key, "plan")
+    items = _plan_items(plan)
+    whole = (f"<details class='doc' data-k='qplan'{'' if items else ' open'}><summary>The whole plan<span "
+             f"class='muted'>{len(plan.splitlines())} lines</span></summary><div class='vlink'>"
+             f"{_open_in_vault(runs, vault, rel)}</div>{_md(vault, rel, plan)}</details>")
+    if not items:
+        return whole
+    md = []
+    for k, head in (("goal", "Goal"), ("how", "How it works"), ("out", "Not included")):
+        if (items.get(k) or "").strip():
+            md += [f"### {head}", "", items[k].strip(), ""]
+    if items.get("steps"):
+        md += ["### Changes by file", "", _by_file(items["steps"])]
+    return f"<div class='glance'>{_md(vault, rel, chr(10).join(md))}</div>{whole}" if md else whole
+
+
+def _t_followup(runs, key, st):
+    """A done ticket: the owner's comments on what was built send it round again."""
+    if st.get("status") != "done" or "plan" not in (st.get("stages") or STAGES) or not runs.vault_of(st):
+        return ""
+    why = runs.followup_refused(key)
+    if why:
+        return (f"<section class='panel' id='follow-up'><h2>Follow up on what was built</h2>"
+                f"<div class='muted'>{esc(why)}</div></section>")
+    n = len(st.get("rounds") or []) + 1
+    return (f"<section class='panel' id='follow-up'><h2>Follow up on what was built</h2><div class='muted'>"
+            f"Not what you wanted, or something more to do? Write it here. The ticket goes round again on the same "
+            f"branch: the planner gets your comments, what round {n} built and its plan, and revises the plan for "
+            f"what is left. The plan comes back here for your approval before anything more is built, and the "
+            f"review checks the whole change. Round {n}'s plan, review and result are kept "
+            f"(<code>{esc(key)}-plan-r{n}.md</code> and so on).</div>"
+            f"<form method='post' action='/runs/ticket/{quote(key)}/followup' class='send'>"
+            f"<textarea name='text' required maxlength='{NOTE_MAX}' placeholder='e.g. the setting should be per "
+            "project, not global; keep the old flag working'></textarea>"
+            "<button type='submit' class='primary'>Send to the planner</button></form></section>")
+
+
+def _t_rounds(runs, key, st):
+    """The ticket's rounds: each one before this, what it ended with and the
+    follow-up that started the next; nothing for a ticket that never went round again."""
+    rounds = st.get("rounds") or []
+    if not rounds:
+        return ""
+    vault = runs.vault_of(st)
+    parts = [f"<section class='panel'><h2>Rounds <span class='muted'>{len(rounds) + 1}</span></h2><ul class='rounds'>"]
+    for r in reversed(rounds):
+        stat = r["diffstat"]
+        facts = [esc(r["ended"][:16].replace("T", " "))] if r["ended"] else []
+        facts.append(f"{r['commits']} commit{'s' if r['commits'] != 1 else ''}")
+        if stat["files"]:
+            facts.append(f"{stat['files']} file(s), +{stat['insertions']} &minus;{stat['deletions']}")
+        if r["push"] in PUSHED:
+            facts.append(esc(PUSHED[r["push"]].format(remote="the remote")))
+        rel = f"wiki/notes/tickets/{key}-plan-r{r['n']}.md"
+        plan = (f"<a href='/vault/browse/{quote(rel)}'>its plan</a>"
+                if vault and vault == runs.vault and os.path.exists(os.path.join(vault, *rel.split("/"))) else "")
+        said = (f"<details><summary>your follow-up</summary><div class='txt'>{esc(r['followup'])}</div></details>"
+                if r["followup"] else "")
+        parts.append(f"<li><div class='hd'><b>Round {r['n']}</b><span class='muted'>{' &middot; '.join(facts)}"
+                     f"</span>{plan}</div>{said}</li>")
+    parts.append(f"<li><div class='hd'><b>Round {len(rounds) + 1}</b><span class='muted'>now: "
+                 f"{esc(st.get('status', ''))}</span></div></li></ul></section>")
     return "".join(parts)
 
 
@@ -2315,7 +2500,7 @@ def ticket_live(runs, key):
                "start": _t_start(runs, key, st, runs.runner(now), now), "qs": _t_questions(runs, key, st),
                "sessions": _t_sessions(runs, key, st, rows, live, outs, now),
                "attempts": _t_attempts(key, st, {o[0] for o in outs}), "notes": _t_notes(key, st),
-               "outs": _t_outs(key, outs, now), "docs": _t_docs(runs, key, st, log), "nav": nav(runs, "queue")}
+               "rounds": _t_rounds(runs, key, st), "docs": _t_docs(runs, key, st, log), "nav": nav(runs, "queue")}
     return {"sig": _sig(regions), "regions": regions}
 
 
@@ -2330,15 +2515,15 @@ def render_ticket(runs, key, msg="", bad=False):
                  f"<div id='r-start'>{g['start']}</div>", f"<div id='r-qs'>{g['qs']}</div>",
                  "<div class='wide'><div class='stack'>"
                  f"<section class='panel' id='r-sessions'>{g['sessions']}</section>"
-                 f"<section class='panel' id='r-attempts'>{g['attempts']}</section>"
-                 f"<div id='r-docs' class='stack'>{g['docs']}</div></div>"
+                 f"<div id='r-docs' class='stack'>{g['docs']}</div>"
+                 f"<section class='panel' id='r-attempts'>{g['attempts']}</section></div>"
                  f"<div class='stack'><section class='panel' id='r-notes'>{g['notes']}</section>"
-                 f"<section class='panel' id='r-outs'>{g['outs']}</section></div></div>"]
+                 f"<div id='r-rounds'>{g['rounds']}</div></div></div>"]
 
 
 # --- actions ------------------------------------------------------------------------
 
-TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note")
+TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note", "followup")
 QUEUE_ACTIONS = ("add", "start", "halt", "end")
 # an answer or approve from a page that showed another plan (its sig): the plan was made again since
 CHANGED = "The plan changed since this page was loaded: reload it and answer again."
@@ -2368,7 +2553,7 @@ def answer_text(form):
 
 def _per_item(form):
     """True for the plan feedback form (a field per criterion and question)."""
-    return any(k.startswith(("ac.", "acc.", "q.", "qt.")) for k in form)
+    return any(k.startswith(("ac.", "acc.", "q.", "qt.", "as.")) for k in form)
 
 
 def plan_feedback(form, st):
@@ -2379,7 +2564,8 @@ def plan_feedback(form, st):
     comment, is no answer: the defaults line says the same."""
     def one(name):
         return _one(form, name).replace("\r\n", "\n").strip()
-    fb = {"rejected": [], "changed": [], "accepted": [], "answers": [], "defaults": [], "note": one("note")}
+    fb = {"rejected": [], "changed": [], "accepted": [], "answers": [], "defaults": [], "assumed": [],
+          "note": one("note")}
     if len(fb["note"]) > NOTE_MAX:
         return f"the notes are over {NOTE_MAX} characters"
     for c in st.get("criteria") or []:
@@ -2403,6 +2589,12 @@ def plan_feedback(form, st):
             fb["answers"].append((q, pick, text))
         else:
             fb["defaults"].append(q["id"])
+    for x in st.get("assumptions") or []:
+        why = one("as." + x["id"])
+        if len(why) > COMMENT_MAX:
+            return f"the correction to {x['id']} is over {COMMENT_MAX} characters"
+        if why:
+            fb["assumed"].append((x, why))
     return fb
 
 
@@ -2418,6 +2610,8 @@ def feedback_text(fb, sig):
     for q, pick, text in fb["answers"]:
         said = [f"({chr(97 + pick)}) {line(q['options'][pick])}"] if pick is not None else []
         out.append(f"- {q['id']}: " + " - ".join(said + ([line(text)] if text else [])))
+    out += [f"- {x['id']}: wrong - {line(why)} (it read: \"{line(x['text'])[:160]}\")"
+            for x, why in fb.get("assumed") or []]
     if fb.get("defaults"):
         out.append(f"- {', '.join(fb['defaults'])}: the default")
     if fb["accepted"]:
@@ -2484,7 +2678,7 @@ def ticket_action(runs, key, action, form):
             fb = plan_feedback(form, st)
             if isinstance(fb, str):
                 return False, fb
-            if not go and not (fb["rejected"] or fb["changed"] or fb["answers"] or fb["note"]):
+            if not go and not (fb["rejected"] or fb["changed"] or fb["answers"] or fb["assumed"] or fb["note"]):
                 return False, ("nothing to send: approve the plan instead" if status == "plan-review" else
                                "nothing to send: answer a question, or choose Go with the defaults")
             text = feedback_text(fb, st.get("plan_sig", ""))
@@ -2501,9 +2695,10 @@ def ticket_action(runs, key, action, form):
         fb = plan_feedback(form, st) if _per_item(form) else {}
         if isinstance(fb, str):
             return False, fb
-        if fb and (fb["rejected"] or fb["changed"] or fb["answers"] or fb["note"]):   # approving would drop it
+        if fb and (fb["rejected"] or fb["changed"] or fb["answers"] or fb["assumed"] or fb["note"]):
+            # approving would drop it
             what = ([c["id"] for c, _ in fb["rejected"] + fb["changed"]] + [q["id"] for q, _, _ in fb["answers"]]
-                    + (["the notes"] if fb["note"] else []))
+                    + [x["id"] for x, _ in fb["assumed"]] + (["the notes"] if fb["note"] else []))
             return False, (f"not approved: what you gave on {', '.join(what)} would be lost. Use Send and plan "
                            "again to have the plan revised with it, or undo it to approve the plan as it is")
         return _waits(runs, key, _queue(runs, ["approve", key]))
@@ -2536,6 +2731,18 @@ def ticket_action(runs, key, action, form):
                         "'host mode is OK' when you continue")
         started, said = runs.start_runner(mode)
         return ok, msg + "; " + (said if started else "the queue did not start: " + said)
+    if action == "followup":
+        vault = runs.vault_of(st)
+        if not vault:
+            return False, "no vault is set, so there is nowhere to keep the follow-up"
+        if status != "done":
+            return False, f"{key} is {status}, not done; a follow-up is for a done ticket{again}"
+        text = _one(form, "text").replace("\r\n", "\n")
+        if not text.strip():
+            return False, "the follow-up is empty"
+        if len(text) > NOTE_MAX:
+            return False, f"the follow-up is over {NOTE_MAX} characters"
+        return _waits(runs, key, _queue(runs, ["followup", key, "--vault", vault, "--stdin"], text))
     if action == "stop":
         if status not in STOPPABLE:
             return False, f"{key} is {status}; there is nothing to stop"

@@ -125,7 +125,7 @@ MAX_QUESTIONS = 8
 # ticket's tests later. Up to MAX_GATED of the first, MAX_CRITERIA in all.
 MAX_GATED = 15
 MAX_CRITERIA = 40
-PLAN_SECTIONS = ("Goal", "Steps", "Acceptance criteria", "Questions", "Assumptions")
+PLAN_SECTIONS = ("Goal", "How it works", "Not included", "Steps", "Acceptance criteria", "Questions", "Assumptions")
 PLAN_REQUIRED = ("Goal", "Acceptance criteria")   # the rest missing is noted, not failed
 HISTORY_CAP = 30
 REVIEW_SECTIONS = ("Must fix", "Notes")
@@ -367,6 +367,17 @@ def note_paths(vault, key):
             "ticket": os.path.join(vault, ".raw", "tickets", f"{key}.md")}
 
 
+def round_file(path, n):
+    """A note of an earlier round of the ticket: KEY-plan.md -> KEY-plan-r1.md."""
+    root, ext = os.path.splitext(path)
+    return f"{root}-r{n}{ext}"
+
+
+# A done ticket the owner comes back to (harness queue followup): their words go
+# into the answers file under this, and the planner revises the built plan with them.
+FOLLOW_UP_HEAD = "Follow-up from the owner"
+
+
 # --- plan and review files ------------------------------------------------------
 
 def sections(text):
@@ -453,10 +464,11 @@ def blocking(questions):
 
 
 # The plan's items, for the owner's page and a later tester: its numbered steps,
-# its GIVEN/WHEN/THEN criteria (AC1...) and its questions (Q1...) with their
-# options and default. The plan stays markdown the model writes; this is read
-# from it, so an older plan (an Approach, plain bullets) still gives items.
-ITEM_ID = re.compile(r"^[\s*_`]*(AC|Q)[-\s]?(\d{1,3})\b[\s*_`]*[:.)\-\u2013\u2014]?[\s*_`]*", re.I)
+# its GIVEN/WHEN/THEN criteria (AC1...), its questions (Q1...) with their options
+# and default, and its assumptions (A1...). The plan stays markdown the model
+# writes; this is read from it, so an older plan (an Approach, plain bullets)
+# still gives items.
+ITEM_ID = re.compile(r"^[\s*_`]*(AC|Q|A)[-\s]?(\d{1,3})\b[\s*_`]*[:.)\-\u2013\u2014]?[\s*_`]*", re.I)
 GWT_WORD = re.compile(r"(?i)[*_`]+(given|when|then|and)\b[*_`]*|\b(given|when|then)[*_`]+")
 GWT = re.compile(r"(?is)^\W*given\b[\s,:]*(.*?)[\s,;]*\bwhen\b[\s,:]*(.*?)[\s,;]*\bthen\b[\s,:]*(.*)$")
 SOURCE = re.compile(r"[(\[]\s*((?:from the )?(?:ticket|edge(?:[- ]case)?|source|from|owner|answer)\b[^\n]*?)"
@@ -534,12 +546,17 @@ def question(text, n):
 
 
 def plan_items(text):
-    """{steps, criteria, questions} of a plan (see criterion and question)."""
+    """{steps, criteria, questions, assumptions} of a plan (see criterion and
+    question), and what the owner reads first: its goal, how it works, and what
+    it leaves out (the sections as written; "" when a plan has none)."""
     secs = sections(text)
     steps = bullets(secs.get("steps") or secs.get("approach") or "")
     return {"steps": [{"n": i, "text": t, "files": PATH_RE.findall(t)} for i, t in enumerate(steps, 1)],
             "criteria": plan_criteria(bullets(secs.get("acceptance criteria", ""))),
-            "questions": [question(x, i) for i, x in enumerate(plan_questions(secs), 1)]}
+            "questions": [question(x, i) for i, x in enumerate(plan_questions(secs), 1)],
+            "assumptions": [dict(zip(("id", "text"), item_id(x, "A", i)))
+                            for i, x in enumerate(bullets(secs.get("assumptions", "")), 1)],
+            "goal": secs.get("goal", ""), "how": secs.get("how it works", ""), "out": secs.get("not included", "")}
 
 
 def plan_criteria(criteria):
@@ -598,6 +615,8 @@ def accepted_changed(old_plan, answers, notes, criteria):
         return []
     end = answers.find("\n<!-- ", at)
     block, later = (answers[at:], "") if end < 0 else (answers[at:end], answers[end:])
+    if FOLLOW_UP_HEAD in later:   # the owner came back after it was built: any criterion may change
+        return []
     ids = [i for m in re.finditer(r"(?m)^- ((?:AC\d+, )*AC\d+): accepted\s*$", block)
            for i in m.group(1).split(", ")]
     free = set(re.findall(r"\bAC\d+\b", later + "\n" + (notes or "")))
@@ -2191,7 +2210,20 @@ def wait_call(ctx, fn, *args, deadline=None):
 
 def sync_vault(ctx, key, since):
     """Copy the ticket's queue log (stages, checks, verifier verdicts) to KEY-log.md in the
-    vault, then capture the session and commit the vault (best effort; never fails a stage)."""
+    vault, then capture the session and commit the vault. Best effort: it never raises,
+    so a vault that cannot be saved never fails a stage, holds a ticket between its
+    stages, or ends the run (one call is after the ticket's own error handling)."""
+    try:
+        _sync_vault(ctx, key, since)
+    except Exception as e:  # noqa: BLE001
+        msg = f"warning: the session was not saved into the vault ({type(e).__name__}: {str(e)[:200]}); the ticket goes on"
+        try:
+            ctx.q.log(key, msg)
+        except Exception:  # noqa: BLE001 - the queue's own log not writable: say it where the run prints
+            print(f"[queue] {key}: {msg}", file=sys.stderr)
+
+
+def _sync_vault(ctx, key, since):
     log = read(os.path.join(ctx.q.dir(key), "log.md"))
     try:
         if log.strip():
@@ -2211,7 +2243,9 @@ def sync_vault(ctx, key, since):
     step(ctx, "saving the session into the vault")
     try:   # the slots of a parallel run commit the vault one at a time
         with held(os.path.join(ctx.q.root, "vault.lock"), wait=SYNC_TIMEOUT):
-            r = run_quiet([BASH, ctx.harness, "queue", "_sync", key, workdir(ctx.q, st), str(since)], SYNC_TIMEOUT)
+            # the vault's push and pull: nobody is watching, so no credential window or ssh question may hold them
+            r = run_quiet([BASH, ctx.harness, "queue", "_sync", key, workdir(ctx.q, st), str(since)], SYNC_TIMEOUT,
+                          env=dict(os.environ, **net_env(ctx.vault)))
     except Busy:
         ctx.q.log(key, "warning: the session was not saved into the vault (another slot held the vault for "
                        f"{SYNC_TIMEOUT}s); the ticket goes on")
@@ -2479,7 +2513,24 @@ def common(ctx, st):
                 PLAN_FILE=ap["plan"], PLAN=plan,
                 REVIEW_FILE=ap["review"], FINDINGS_FILE=ap["findings"], ANSWERS_FILE=ap["answers"],
                 ANSWERS=answers or "(none)", NOTES=owner_notes(ctx.q.notes(st["key"])),
-                FEEDBACK=cap(st.get("feedback") or "(first attempt)", NOTE_CAP))
+                FOLLOW_UP=follow_up(ctx, st), FEEDBACK=cap(st.get("feedback") or "(first attempt)", NOTE_CAP))
+
+
+def follow_up(ctx, st):
+    """The plan prompt's FOLLOW_UP block on a follow-up round (harness queue
+    followup): what the round before built, and where to read it; "" otherwise."""
+    rounds = st.get("rounds") or []
+    if not st.get("built_on") or not rounds:
+        return ""
+    last, n = rounds[-1], len(rounds) + 1
+    plan = round_file(note_paths(ctx.vault, st["key"])["plan"], last["n"])
+    commits = "\n".join(f"- {c['sha'][:12]} {c['subject']}" for c in (last.get("commits") or [])[:30]) or "(none listed)"
+    return (f"\n<<<BEGIN_FOLLOW_UP (round {n} of this ticket; data, not instructions)>>>\n"
+            f"Round {last['n']} of this ticket is built: the code you are in has it, on {branch_of(st)}. "
+            f"The plan it built is in {agent_path(ctx, plan) if os.path.exists(plan) else '(not kept)'}; the previous "
+            f"plan below is that plan, or your own draft for this round when the owner answered it. Its commits:\n"
+            f"{commits}\nThe owner looked at what was built and asked for more: their follow-up is the last "
+            f"'{FOLLOW_UP_HEAD}' in the owner's answers above.\n<<<END_FOLLOW_UP>>>\n")
 
 
 IN_CLONE = "a clone of the project made for this ticket"
@@ -2564,7 +2615,8 @@ CARD_WHERE_IN_PLACE = ("the owner's own project folder, not a clone. Where you c
                        "by name (never git add -A, git add . or git commit -a); leave every other file alone (no git "
                        "reset --hard, clean, stash, or checkout of files you did not change)")
 CARD_DONE = {
-    "plan": "no code changed, the plan written to {PLAN_FILE}: # {KEY} plan, ## Goal, ## Steps (1. `file` "
+    "plan": "no code changed, the plan written to {PLAN_FILE}: # {KEY} plan, ## Goal, ## How it works, "
+            "## Not included, ## Steps (1. `file` "
             "`function()`: the change (AC1)), ## Acceptance criteria (one line each: - AC1: GIVEN .. WHEN .. THEN .. "
             "(ticket: \"exact words\") or (edge of AC1)), ## Questions (- Q1 [blocking] ..? Options: (a) .. (b) .. "
             "Default: (a), because ..), ## Assumptions (- A1: ..); then each Step's code re-read and the plan fixed.",
@@ -2739,6 +2791,7 @@ def stage_plan(ctx, st):
     items = plan_items(text)
     st["questions"] = [dict(q, blocking=bool(blocking([q["text"]]))) for q in items["questions"]]
     st["criteria"] = [dict(c, edge=is_edge(c)) for c in items["criteria"]]
+    st["assumptions"] = items["assumptions"]
     st["plan_sig"] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
     write_atomic(os.path.join(ctx.q.dir(st["key"]), "plan.json"),
                  json.dumps(dict(items, sig=st["plan_sig"]), indent=1, ensure_ascii=False) + "\n")
@@ -3982,7 +4035,7 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         st.pop("verified_repos", None)
     if not go_on and starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "verify_only", "verified_sha",
-                  "verified_repos"):
+                  "verified_repos", "built_on"):
             st.pop(k, None)
         if st["stage"] == "plan":
             for k in ("questions", "criteria", "plan_sig"):
@@ -3999,8 +4052,8 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
 def starts_over(q, st, stage=None, fresh=False):
     """True when going again at stage (None: where it is) sets the work up again
     from its start (the run clones, or sets up in place, again): fresh, from the
-    plan, or its work is gone."""
-    return fresh or (stage or st["stage"]) == "plan" or not has_work(q, st)
+    plan (not on a follow-up round, which plans on what was built), or its work is gone."""
+    return fresh or ((stage or st["stage"]) == "plan" and not st.get("built_on")) or not has_work(q, st)
 
 
 def has_work(q, st):
@@ -4538,6 +4591,87 @@ def cmd_answer(q, a):
     return 0 if st else 1
 
 
+def followup_refused(q, st):
+    """Why the ticket cannot go round again with a follow-up, or ""."""
+    key = st["key"]
+    if st["status"] != "done":
+        return (f"{key} is {st['status']}; a follow-up is for a done ticket (harness queue answer, continue or "
+                f"retry are for this one)")
+    if "plan" not in stages_of(st):
+        return (f"{key} runs no plan stage ({','.join(stages_of(st))}), so nothing takes a follow-up: add a note "
+                f"(harness queue note {key}) and harness queue retry {key} --stage {first_stage(st)}")
+    if not has_work(q, st):
+        return f"{key}'s work is gone, so a follow-up has nothing to build on: harness queue retry {key} starts it over"
+    return ""
+
+
+def cmd_followup(q, a):
+    """A done ticket goes round again with the owner's comments on what was built:
+    the round's plan, review and result are kept as KEY-plan-rN.md (and so on), the
+    comments go into the answers file, and the ticket is queued at its plan, which
+    revises the built plan on top of the work (not set up again) and comes back to
+    the owner to approve."""
+    key = a.key.upper()
+    st = q.load(key)
+    if not st:
+        print(f"[queue] {key} is not in the queue", file=sys.stderr)
+        return 1
+    why = followup_refused(q, st)
+    if why:
+        print(f"[queue] {why}", file=sys.stderr)
+        return 1
+    if a.stdin:
+        text = sys.stdin.buffer.read().decode("utf-8", "replace")
+    elif a.text is not None:
+        text = a.text
+    else:
+        tmpl = (f"# Follow-up for {key}\n\n<!-- What should change in what was built? The planner revises the plan "
+                "with it on top of the work. Save and quit. -->\n\n")
+        tmp = os.path.join(q.dir(key), "followup.edit.md")
+        write_atomic(tmp, tmpl)
+        if edit(tmp):
+            print("[queue] the editor failed; nothing saved", file=sys.stderr)
+            return 1
+        text = read(tmp)
+        text = "" if text.strip() == tmpl.strip() else text
+    if not text.strip():
+        print("[queue] no follow-up given; nothing saved", file=sys.stderr)
+        return 1
+    p = note_paths(a.vault, key)
+    with held(os.path.join(q.root, "queue.lock")):   # the run takes a queued ticket under it
+        st = q.load(key)
+        why = followup_refused(q, st) if st else f"{key} is not in the queue"
+        if why:
+            print(f"[queue] {why}", file=sys.stderr)
+            return 1
+        rounds = st.get("rounds") or []
+        n = len(rounds) + 1
+        for kind in ("plan", "review", "result"):   # this round's, kept: the next one writes them again
+            old = read(p[kind])
+            if old.strip():
+                write_atomic(round_file(p[kind], n), old)
+        rounds = rounds[-(HISTORY_CAP - 1):] + [{
+            "n": n, "ended": st.get("updated", ""), "reason": st.get("reason", ""),
+            "push": (st.get("push") or {}).get("result", ""), "compare_url": st.get("compare_url", ""),
+            "commits": (st.get("commits") or [])[:50], "diffstat": st.get("diffstat") or {},
+            "followup": text.strip()[:4000], "at": now_iso()}]
+        old = read(p["answers"])
+        write_atomic(p["answers"], (old.rstrip() + "\n" if old.strip() else "") + f"\n<!-- {now_iso()} -->\n"
+                     f"{FOLLOW_UP_HEAD} (round {n + 1}, after round {n} was built; it wins over the ticket and the "
+                     f"plans before it):\n\n{text.strip()}\n")
+        st = requeue(q, key, ("done",), stage="plan", rounds=rounds, built_on=True, plan_hold=True,
+                     plan_approved=False)
+        if st:   # the review and checks of the last round are not this one's
+            for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "questions", "criteria",
+                      "assumptions"):
+                st.pop(k, None)
+            q.save(st)
+    if st:
+        print(f"[queue] {key}: follow-up saved; round {n + 1}: the queue run revises the plan on top of what round "
+              f"{n} built, and it comes back to you to approve before anything is built")
+    return 0 if st else 1
+
+
 def cmd_findings(q, a):
     any_ = False
     for k in q.order():
@@ -4579,6 +4713,8 @@ def main(argv):
     s = sub.add_parser("answer"); s.add_argument("key"); s.add_argument("--vault", required=True); s.add_argument("--text")
     s.add_argument("--go", action="store_true")
     s.add_argument("--stdin", action="store_true")
+    s = sub.add_parser("followup"); s.add_argument("key"); s.add_argument("--vault", required=True)
+    s.add_argument("--text"); s.add_argument("--stdin", action="store_true")
     s = sub.add_parser("findings"); s.add_argument("--vault", required=True)
     s = sub.add_parser("run")
     s.add_argument("--vault", required=True)
@@ -4605,7 +4741,7 @@ def main(argv):
     try:
         return {"add": cmd_add, "list": cmd_list, "status": cmd_status, "remove": cmd_remove, "approve": cmd_approve,
             "retry": cmd_retry, "continue": cmd_continue, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
-            "answer": cmd_answer, "findings": cmd_findings, "run": cmd_run}[a.cmd](q, a)
+            "answer": cmd_answer, "followup": cmd_followup, "findings": cmd_findings, "run": cmd_run}[a.cmd](q, a)
     except Busy as e:
         print(f"[queue] {e}; try again", file=sys.stderr)
         return 1
