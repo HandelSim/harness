@@ -3024,6 +3024,40 @@ class NestedReposTest(Base):
         self.assertFalse([f for f in tree if f.startswith(("libA", "vendor/x", "lib["))], tree)
         self.assertNotIn("no snapshot", cat(os.path.join(self.state, "ABC-1", "log.md")))
 
+    def test_the_snapshot_leaves_files_with_a_windows_device_name_out_on_windows(self):
+        # Git Bash's "> nul" makes a file nul that reads as the device there: git add -A fails on it
+        os.makedirs(os.path.join(self.project, "sub"))
+        for f in ("nul", "sub/CON", "aux.txt", "console.txt"):
+            put(os.path.join(self.project, f), "x\n")
+        q, st = tq.Queue(self.state), {"key": "ABC-1"}
+        os.makedirs(q.dir("ABC-1"), exist_ok=True)
+        self.addCleanup(tq.DEVICES_SAID.clear)
+        names = lambda tree: sh("git", "-C", self.project, "ls-tree", "-r", "--name-only", tree).split()
+        self.assertIn("nul", names(tq.worktree_tree(q, st, self.project)))   # elsewhere it is a file
+        with mock.patch.object(tq, "WINDOWS", True):
+            tree = names(tq.worktree_tree(q, st, self.project))
+            tq.worktree_tree(q, st, self.project)
+        self.assertNotIn("nul", tree)
+        self.assertNotIn("sub/CON", tree)
+        self.assertIn("aux.txt", tree)   # a plain file on Windows 11
+        self.assertIn("console.txt", tree)
+        log = cat(os.path.join(self.state, "ABC-1", "log.md"))
+        self.assertEqual(log.count("left out of the snapshot: nul, sub/CON (a Windows device name"), 1)
+        self.assertEqual(os.listdir(q.dir("ABC-1")), ["log.md"])   # no index, specs or lock left
+
+    def test_a_git_error_says_what_failed_not_the_warnings_before_it(self):
+        crlf = "warning: in the working copy of 'a.txt', LF will be replaced by CRLF the next time Git touches it\n"
+        r = types.SimpleNamespace(stdout="", stderr=crlf * 50 + "error: short read while indexing nul\n"
+                                                              "error: unable to index file 'nul'\nfatal: adding files failed\n")
+        self.assertEqual(tq.git_said(r), "error: short read while indexing nul / error: unable to index file 'nul' / "
+                                         "fatal: adding files failed")
+        r = types.SimpleNamespace(stdout="", stderr="hint: x\n" * 100 + "the last line\n")
+        said = tq.git_said(r)
+        self.assertTrue(said.startswith("...") and said.endswith("the last line") and len(said) == 403, said)
+        with self.assertRaises(RuntimeError) as e:
+            tq.git(self.project, "-c", "core.safecrlf=false", "rev-parse", "--verify", "no-such-ref")
+        self.assertTrue(str(e.exception).startswith("git rev-parse --verify: fatal:"), str(e.exception))
+
     def test_a_change_left_uncommitted_in_one_is_the_tickets(self):
         lib = self.ignored_libA()
         put(os.path.join(lib, "lib.txt"), "lib, the owner's edit\n")   # the owner's, before the ticket

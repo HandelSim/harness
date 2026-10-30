@@ -2479,6 +2479,17 @@ class TestEnvironmentClause(unittest.TestCase):
             proxy._RUN_MODE, proxy._HOST_OS = mode, "windows"
             self.assertIn("(host OS: windows)", proxy._format_environment_clause())
 
+    def test_host_mode_on_windows_says_the_shell_is_git_bash(self):
+        # cmd habits there made a file named nul (git add fails on it) and a /F into F:/
+        proxy._RUN_MODE, proxy._HOST_OS = "host", "windows"
+        clause = proxy._format_environment_clause()
+        self.assertIn("Your shell is Git Bash", clause)
+        self.assertIn("/dev/null, never to nul", clause)
+        self.assertIn("taskkill //F //PID 123", clause)
+        for mode, host_os in (("host", "linux"), ("host", ""), ("container", "windows")):
+            proxy._RUN_MODE, proxy._HOST_OS = mode, host_os
+            self.assertNotIn("Git Bash", proxy._format_environment_clause())
+
     def test_unknown_host_os_drops_the_parenthetical_in_both_modes(self):
         for mode in ("container", "host"):
             proxy._RUN_MODE, proxy._HOST_OS = mode, ""

@@ -677,8 +677,19 @@ def git(cwd, *args, check=True, timeout=300, env=None):
     r = run_quiet(["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", *args],
                   timeout, env=env)
     if check and r.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args[:3])}: {(r.stderr or r.stdout).strip()[:400]}")
+        words = [a for i, a in enumerate(args) if a != "-c" and (i == 0 or args[i - 1] != "-c")]
+        raise RuntimeError(f"git {' '.join(words[:2])}: {git_said(r)}")
     return r
+
+
+def git_said(r, cap=400):
+    """What a failed git said: its error: and fatal: lines, not the warnings before
+    them (on Windows "LF will be replaced by CRLF" for each file git add reads), else
+    the end of its output, where git puts what went wrong."""
+    lines = [x.strip() for x in (r.stderr or r.stdout or "").splitlines() if x.strip()]
+    bad = [x for x in lines if x.startswith(("error:", "fatal:"))]
+    said = " / ".join(bad or lines)
+    return said if len(said) <= cap else said[:cap] if bad else "..." + said[-cap:]
 
 
 # Network git (fetch, push): nobody is watching, so no prompt may hold it (a
@@ -762,7 +773,7 @@ def make_clone(q, st, container=False):
     r = run_quiet(["git", "clone", "-q", "--no-checkout", *clone_opts(container), st["project"], dest],
                   600, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
     if r.returncode != 0:
-        raise RuntimeError(f"git clone: {(r.stderr or r.stdout).strip()[:400]}")
+        raise RuntimeError(f"git clone: {git_said(r)}")
     # A clone has the project's branches only; the start (a remote-tracking ref, a
     # bare sha) comes over by a name of its own, there for the fetch alone.
     tmp = f"refs/harness-queue-ref/{st['key']}"
@@ -1083,7 +1094,7 @@ def nested_back(q, st):
         r = git(d, "switch", "-q", n["branch"], check=False)
         if r.returncode != 0:
             return (f"could not switch {rel} from {on or 'a detached HEAD'} to {n['branch']}: "
-                    f"{(r.stderr or r.stdout).strip()[:300]}; git switch {n['branch']} there, then harness queue retry {key}")
+                    f"{git_said(r, 300)}; git switch {n['branch']} there, then harness queue retry {key}")
         q.log(key, f"switched {rel} from {on or 'a detached HEAD'} back to {n['branch']}")
     return ""
 
@@ -1151,7 +1162,7 @@ def top_back_on_branch(q, st):
                 f"not there when {key} started ({', '.join(new[:10])}); commit, stash or remove them, or {fix}")
     r = git(project, "switch", "-q", branch, check=False)
     if r.returncode != 0:
-        return f"could not switch {project} from {on} to {branch}: {(r.stderr or r.stdout).strip()[:300]}; {fix}"
+        return f"could not switch {project} from {on} to {branch}: {git_said(r, 300)}; {fix}"
     q.log(key, f"switched {project} from {on} back to {branch}")
     return ""
 
@@ -1242,18 +1253,29 @@ def worktree_tree(q, st, repo):
         if os.path.exists(real):   # git's stat cache: only what changed is read again
             shutil.copyfile(real, index)
         # literal: a repository named l* would take the owner's untracked lx/ with it
-        specs = [".", *(f":(exclude,literal){r}/" for r in untracked_repos(repo))]
+        repos, devices = untracked_skips(repo)
+        if devices:
+            said = DEVICES_SAID.setdefault(st["key"], set())
+            if set(devices) - said:
+                said.update(devices)
+                q.log(st["key"], f"left out of the snapshot: {', '.join(devices[:10])} (a Windows device name: the file "
+                                 "reads as the device, and git add fails on it; a '> nul' in Git Bash makes one). "
+                                 "Delete it in Git Bash (rm <path>) or in cmd (del \\\\?\\<full path>)")
+        specs = [".", *(f":(exclude,literal){r}/" for r in repos), *(f":(exclude,literal){d}" for d in devices)]
         if sum(len(x) + 1 for x in specs) > SNAP_ARGS_MAX:   # Windows: 32k characters on one command line
             with open(index + ".specs", "w", encoding="utf-8", newline="") as f:
                 f.write("\0".join(specs))
             specs = ["--pathspec-from-file=" + index + ".specs", "--pathspec-file-nul"]
         else:
             specs = ["--", *specs]
-        git(repo, "-c", "advice.addEmbeddedRepo=false", "add", "-A", *specs, env=who, timeout=600)
+        # safecrlf: no "LF will be replaced by CRLF" warning for each file read
+        git(repo, "-c", "advice.addEmbeddedRepo=false", "-c", "core.safecrlf=false", "add", "-A", *specs,
+            env=who, timeout=600)
         return git(repo, "write-tree", env=who).stdout.strip()
     finally:
         drop(index)
         drop(index + ".specs")
+        drop(index + ".lock")   # a git add that was killed leaves it
 
 
 def snapshot(q, st, stage):
@@ -1278,8 +1300,23 @@ SNAP_ARGS_MAX = 8000
 def untracked_repos(project):
     """The repositories inside the project that git add -A would meet (each an
     untracked "dir/" in git ls-files, at any depth): relative paths."""
+    return untracked_skips(project)[0]
+
+
+# A file named for a Windows device (NUL, CON, COM1, ...: Git Bash's "> nul" into
+# a Windows program makes one) opens as the device: empty, and git add fails on it
+# ("short read while indexing nul"). A name with an extension is a plain file on Windows 11.
+DEVICE_NAME = re.compile(r"(?i)(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])[ .]*")
+DEVICES_SAID = {}   # ticket key: the device files its log already names
+
+
+def untracked_skips(project):
+    """What git add -A must not take in the project: the repositories inside it (each
+    an untracked "dir/" in git ls-files, at any depth) and, on Windows, untracked files
+    with a device name. Two lists of relative paths."""
     raw = git(project, "ls-files", "-z", "-o", "--exclude-standard", timeout=600).stdout.split("\0")
-    return [e[:-1] for e in raw if e.endswith("/")]
+    devices = [e for e in raw if WINDOWS and e and DEVICE_NAME.fullmatch(e.rsplit("/", 1)[-1])]
+    return [e[:-1] for e in raw if e.endswith("/")], devices
 
 
 # Folders of tools' own checkouts (a virtualenv's pip -e git+, terraform's
@@ -2998,7 +3035,7 @@ def stage_push(ctx, st):
             checkpoint(ctx)   # a stop asked during the stage: nothing (more) pushed
             r = net_git(d, "push", "-q", ctx.remote, f"{p['sha']}:refs/heads/{p['branch']}", timeout=PUSH_TIMEOUT)
             if r.returncode != 0:
-                push.update(result="rejected", error=(r.stderr or r.stdout).strip()[:300])
+                push.update(result="rejected", error=git_said(r, 300))
                 results(ctx, st, change, pushes)
                 return block(ctx, st, f"push{of} to {ctx.remote} refused: {push['error']}. Fix that, then "
                                       f"harness queue retry {key} --stage push (branch {p['branch']} is at "

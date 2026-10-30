@@ -988,6 +988,11 @@ exports it directly. `_setup_host_os` reads it into the `_HOST_OS` module
 global, honouring only `linux`/`macos`/`windows` and normalising anything else
 (unset, empty, `unknown`) to `""`.
 
+In host mode on Windows the clause ends with `_GIT_BASH_NOTE`: the shell is
+Git Bash, so discard output to `/dev/null`, not `nul` (a file named `nul` in
+the project reads as the device and fails `git add -A`), and give Windows
+programs `//F`-style options (MSYS turns `/F` into the path `F:/`).
+
 `{{ENVIRONMENT}}` names the host OS inline in BOTH modes, so the shipped
 `reminder.md` does not also carry `{{HOST_OS}}`. When `_HOST_OS` is `""` only
 the `(host OS: …)` parenthetical drops — the rest of the clause still renders,

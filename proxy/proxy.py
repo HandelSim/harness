@@ -3090,6 +3090,18 @@ _TODO_STATUS_MARK = {
 }
 
 
+# Host mode on Windows: opencode's shell tool is Git Bash (MSYS), where a
+# model's cmd habits misfire. "2>nul" makes a file named nul in the project,
+# which reads as the NUL device and fails every git add -A, and MSYS rewrites
+# a "/F" argument to the path "F:/" (a queue ticket blocked on both at once).
+_GIT_BASH_NOTE = (
+    " Your shell is Git Bash: send output you do not want to /dev/null, never "
+    "to nul (that makes a file named nul, which breaks git add), and double "
+    "the slash of a Windows program's options (taskkill //F //PID 123), since "
+    "Git Bash turns /F into the path F:/."
+)
+
+
 def _format_environment_clause() -> str:
     """The Environment bullet's body, chosen by run mode.
 
@@ -3110,7 +3122,7 @@ def _format_environment_clause() -> str:
             "tool instead of guessing. Anything you install lands on their "
             "machine, so keep setup project-local (e.g. a venv inside the "
             "working directory + requirements.txt) rather than installing "
-            "globally."
+            "globally." + _GIT_BASH_NOTE * (_HOST_OS == "windows")
         )
     return (
         "you run in a Linux container with the current working directory "

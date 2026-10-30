@@ -765,7 +765,9 @@ one's change lands). Each repository's change lands one of two ways:
   top with `--no-branch`): `take_baselines` (before each stage in `process`,
   once per run of stages: implement takes the files as they are, a review-first
   ticket HEAD's tree) saves a commit of the working tree (`worktree_tree`: a
-  temp index, `add -A` without the repositories inside) to
+  temp index, `add -A` without the repositories inside nor, on Windows, an
+  untracked file with a device name such as `nul`, which reads as the device
+  and fails `git add`; it is logged once per ticket) to
   `refs/harness-queue/base/KEY` in that repository, kept in
   `st["baselines"][rel]` with its HEAD; the change is the working tree against
   it, so the owner's uncommitted files from before are not in it. A commit there
