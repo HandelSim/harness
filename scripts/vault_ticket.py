@@ -377,7 +377,10 @@ def main(argv):
     else:
         msg = f"{key}: {why}; no copy of the ticket yet, the agent gets only its state note"
     ensure_note(vault, key, title)
-    ticket_contexts(vault, only=key)
+    try:
+        ticket_contexts(vault, only=key)
+    except OSError as e:
+        msg += f" (its domain context page was not written: {e})"
     print(msg)
     return 0
 

@@ -1218,7 +1218,8 @@ class H(BaseHTTPRequestHandler):
         with open(sys.argv[2], "a") as f:
             f.write(json.dumps({"n": len(req["messages"]), "prompt": prompt}) + "\n")
         src = prompt.split("<<<BEGIN_SOURCE>>>", 1)[1].split("<<<END_SOURCE>>>", 1)[0]
-        text = next((t for k, t in DOCS if k in src),
+        domain = "Full Name (ABBR)" in prompt
+        text = next((t for k, t in DOCS if k in src and ("### Terms" in t) == domain),
                     "summary: covers notes\n### What happened\nThe source was read and summed up here.\nTopics: [[misc]]")
         self.reply({"choices": [{"message": {"role": "assistant", "content": text}}]})
 srv = HTTPServer(("127.0.0.1", 0), H)
@@ -1254,7 +1255,7 @@ with zipfile.ZipFile(sys.argv[1], "w") as z:
 PYEOF
 printf -- '---\ntype: session\ntitle: storage\n---\n## User\nWhich database?\n## Assistant\nwe chose sqlite because the host has no server to run one.\n' \
     > "$DV/.raw/sessions/2026-10-01-abc.md"
-printf -- '---\ntype: ticket\nticket: ABC-9\ntitle: Fix the NAV rounding\n---\n# ABC-9: Fix the NAV rounding\n\n> This is the ticket as people wrote it in the tracker. Net Asset Value here is the label.\n\nThe NAV is off by a cent.\n' \
+printf -- '---\ntype: ticket\nticket: ABC-9\ntitle: Fix the NAV rounding\n---\n# ABC-9: Fix the NAV rounding\n\n> This is the ticket as people wrote it in the tracker. The label mentions a Settlement Date.\n\nThe NAV is off by a cent.\n' \
     > "$DV/.raw/tickets/ABC-9.md"
 printf -- '---\ntype: ticket\nticket: ABC-10\ntitle: Move the nav bar\n---\n# ABC-10: Move the nav bar\n\nThe nav bar should be on the left.\n' \
     > "$DV/.raw/tickets/ABC-10.md"
@@ -1291,6 +1292,7 @@ C="$DV/wiki/context/ABC-9-context.md"
 grep -q 'Net Asset Value (NAV)' "$C" 2>/dev/null && grep -q 'published by 6 pm' "$C" \
     || fail "V27: a ticket using NAV gets its term and the rules naming it — $(cat "$C" 2>&1)"
 grep -q 'settle within' "$C" && fail "V27: a rule not naming the ticket's terms stays out — $(cat "$C")"
+grep -q 'Settlement Date' "$C" && fail "V27: the label harness puts on a ticket copy is not matched — $(cat "$C")"
 [[ ! -e "$DV/wiki/context/ABC-10-context.md" ]] || fail "V27: 'nav' in lower case is not the abbreviation NAV — $(cat "$DV/wiki/context/ABC-10-context.md")"
 grep -q '^- \[decision\] Use sqlite: the host has no database server (\[\[sessions--2026-10-01-abc\]\], 2026-10-01)$' \
     "$DV/wiki/candidates.md" || fail "V27: candidates — $(cat "$DV/wiki/candidates.md" 2>&1)"

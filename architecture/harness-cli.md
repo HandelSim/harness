@@ -609,10 +609,37 @@ generated gets no overview page). `--unit ID` sends just those units,
 whatever their state. `--max N` stops after N
 units, `--watch [S]` keeps checking every S seconds (default 300) for a
 long-running ingest of a growing codebase, `--dry-run` lists the units.
+
+Domain documents (council 2026-10-30: grow context without loading anything
+generated on every turn) go in `.raw/domain/`: md and txt as they are, html
+through `html.parser` (h1 to h3 become `## ` cut points, script and style
+dropped), docx through `zipfile` + `ElementTree` (heading-styled paragraphs
+become `## `), pdf through `pdftotext` when it is on PATH (a page per `## `),
+else one "skipped" warning per run (`status` prints none). Their units ask
+for `DOMAIN_FORMAT` (`### Terms`: `- term: definition "quote"`, abbreviations
+as `Full Name (ABBR)`; `### Rules`) and land in `wiki/domain/domain--<file>.md`
+(`type: domain`). Sessions' `RAW_FORMAT` gained `### Keep` (at most 3
+`- [decision|gotcha|command|term] line "quote"`). `filter_items` drops every
+Terms, Rules or Keep line whose quote is not in the source (normalized case,
+spaces, quote marks; `...` parts each matched); a domain unit with lines but
+none kept fails. `RAW_FMT` is part of a `.raw` unit's hash, so changing the
+formats re-sends every `.raw` unit once. `regenerate` then writes
+`wiki/domain/glossary.md` (every term and rule line, one per document, sorted
+so two documents' definitions sit together, each linked to its page),
+`wiki/context/KEY-context.md` per ticket copy in `.raw/tickets/` that uses a
+glossary term (`ticket_contexts`: word-boundary match, an all-caps name case
+sensitive, `Full Name (ABBR)` by either name, plurals; with 5 or more tickets
+a term in over 40% of them is skipped; the matching term lines and the rules
+naming them, at most 2 KB of lines; removed when none match; the `-context`
+suffix keeps it apart from the ticket hub), and `wiki/candidates.md` (Keep
+lines, newest first, repeats counted once, at most 80, for a person to copy
+into the project's AGENTS.md; no agent is given it). Neither the context
+pages nor the candidates are in `wiki/index.md`. `vault_ticket.py` also
+rewrites the launch ticket's context page, so it follows the latest copy.
 `tests/unit_vault_test.sh` covers the registry, clone, fast-forward, offline
 fallback, the overlay, `new`, the sync, the capture's tool lines and
-compaction, ingest against a mock upstream, and tickets against a mock
-tracker.
+compaction, ingest against a mock upstream, domain documents, and tickets
+against a mock tracker.
 
 ### Tickets and context
 
@@ -668,8 +695,12 @@ the model, in opencode's order: the global file
 (`<home>/.config/opencode/AGENTS.md`, else `<home>/.claude/CLAUDE.md`), the
 project's (every `AGENTS.md` from the CWD up to the git root, else every
 `CLAUDE.md`, else `CONTEXT.md`; a container sees only the CWD's), then
-harness's: the vault's `AGENTS.md`, the ticket's copy and its state note.
-`vault_opencode_config` puts the last three in `instructions` and adds
+harness's: the vault's `AGENTS.md`, the ticket's copy, its context page
+(`wiki/context/KEY-context.md`, kind `ticket context`, when the ticket uses
+glossary terms) and its state note. The vault's `AGENTS.md` (template in
+`vault-template/`) is a routing table: for a ticket these files, for a word
+of the field `grep` the glossary, for past work `grep` the index.
+`vault_opencode_config` puts these vault files in `instructions` and adds
 `x-harness-ticket: KEY` and `x-harness-task` (base64 JSON: the title from the
 copy's `# KEY: title` heading, plus `HARNESS_TASK_CARD`, a JSON object a queue
 stage sets; anything else there is dropped), from which the proxy gives a free

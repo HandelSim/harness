@@ -352,7 +352,8 @@ header from the opencode overlay). On the cooperative route the reminder's
 Environment bullet then ends with one sentence (`_vault_clause`): the vault
 holds the project's notes, past sessions and decisions; grep its
 `wiki/index.md`, then `wiki/`, for the key words before answering about the
-project or past work; its `AGENTS.md` says how to write there. A free model sees
+project or past work; for a word of the project's field, grep
+`wiki/domain/glossary.md`; its `AGENTS.md` says how to write there. A free model sees
 the vault's `AGENTS.md` only at the start of a long, truncated history, so the
 pointer has to ride the per-turn reminder. In a queue stage (a task card with a
 stage) the sentence is narrower: the only vault files the stage needs are the
