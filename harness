@@ -6646,7 +6646,7 @@ HELP
             [[ -n "${title//[[:space:]]/}" ]] || { err "usage: harness ticket new \"TITLE\" [\"TEXT\" | -] [--key KEY]"; return 1; }
             harness_vault_dir=$(vault_prepare)
             [[ -n "$harness_vault_dir" ]] || { err "no active vault to write the ticket into (see: harness vault)"; return 1; }
-            key=$(ticket_new "$harness_vault_dir" "$nkey" "$title" "$text") || return 1
+            key=$(ticket_new "$harness_vault_dir" "$nkey" "$title" "$text" "$state_root/queue") || return 1
             echo "ticket $key (your own, not in the tracker): $harness_vault_dir/.raw/tickets/$key.md"
             echo "  work on it: harness --ticket $key, or queue it: harness queue add $key"
             harness_ticket="$key"

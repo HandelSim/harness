@@ -427,7 +427,7 @@ def main(argv):
         status = frontmatter(text)[0].get("status", "")
         msg = f"{key} ({status}): {title} [{state}]"
     elif old_meta.get("source") == "local":
-        msg = f"{key}: {title} [{why}]"
+        msg = f"{key} ({old_meta.get('status') or 'open'}): {title} [{why}]"
     elif old_meta:
         msg = f"{key}: {why}; using the copy from {old_meta.get('updated') or 'an earlier launch'}"
     else:

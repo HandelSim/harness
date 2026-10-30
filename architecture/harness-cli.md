@@ -694,8 +694,9 @@ A ticket of the owner's own, with nothing in the tracker: `harness ticket new
 "TITLE" ["TEXT" | -] [--key KEY]` (`ticket_new`, then `vault_ticket.py --new
 <vault> <KEY|-> <title> [<queue dir>]`, description on stdin) writes
 `.raw/tickets/KEY.md` with `source: local` in its front matter, a label saying
-it is the owner's own description of the work, `## Description`, and the state
-note; it is committed by `vault_sync`. KEY defaults to the next `LOCAL-N` free
+it is the owner's own description of the work, and `## Description` (the
+state note comes with the first pull, as for any ticket); it is committed by
+`vault_sync`. KEY defaults to the next `LOCAL-N` free
 in the vault and as a folder in `state/queue` (`TICKET_LOCAL_PREFIX` names
 another prefix); an existing copy is refused. A copy marked `source: local` is
 never fetched (the pull prints `[your own ticket, not in the tracker]`), so a

@@ -30,6 +30,8 @@
 #                                         quote-checked Terms, Rules and Keep
 #                                         lines, the glossary, a ticket's
 #                                         context page, the candidates
+#   - tickets of your own                 vault_ticket.py --new and harness
+#                                         ticket new: LOCAL-N, never pulled
 #
 # Prints "VAULT TEST PASSED" on success.
 
@@ -1315,5 +1317,39 @@ grep -q 'pdf' <<<"$out" && fail "V27: status prints no ingest warnings — $out"
         || fail "V27: the overlay hands the ticket's context to the agent"
 ) || exit 1
 ok "V27: domain docs (md, html, docx; a bad pdf skipped) give quote-checked terms, the glossary, ticket context and candidates"
+
+# --- V28: tickets of your own (source: local), never pulled ------------------
+tn() { printf '%s\n' "$3" | $PY "$REPO_ROOT/scripts/vault_ticket.py" --new "$TV" "$1" "$2" ${4:+"$4"} 2>&1; }
+[[ "$(tn - 'first thing' 'do the first thing')" == LOCAL-1 && "$(tn - 'second' '')" == LOCAL-2 ]] \
+    || fail "V28: --new should mint LOCAL-1 then LOCAL-2 — $(ls "$TV/.raw/tickets")"
+L1="$TV/.raw/tickets/LOCAL-1.md"
+for want in '^source: local$' '^status: open$' '^# LOCAL-1: first thing$' "^> This is the owner's own ticket" '^do the first thing$'; do
+    grep -q -- "$want" "$L1" || fail "V28: the copy lacks /$want/ — $(cat "$L1")"
+done
+grep -q '^second$' "$TV/.raw/tickets/LOCAL-2.md" || fail "V28: no text: the title is the description — $(cat "$TV/.raw/tickets/LOCAL-2.md")"
+mkdir -p "$TMP_ROOT/q28/LOCAL-7"
+[[ "$(tn - 'past the queue' x "$TMP_ROOT/q28")" == LOCAL-8 ]] || fail "V28: a key the queue has is not minted again"
+[[ "$(TICKET_LOCAL_PREFIX=me tn - mine x)" == ME-1 ]] || fail "V28: TICKET_LOCAL_PREFIX names the prefix"
+out=$(tn LOCAL-1 again x) && fail "V28: an existing copy was overwritten — $out"
+out=$(tn 'not a key' t x) && fail "V28: a bad key accepted — $out"
+# ABC-5 is a key the tracker knows the shape of: as your own it is never fetched.
+[[ "$(tn ABC-5 'mine, not jira' 'keep it')" == ABC-5 ]] || fail "V28: --new with a key"
+: > "$TMP_ROOT/jira.log"
+out=$(tk tok123 ABC-5)
+[[ "$out" == "ABC-5 (open): mine, not jira [your own ticket, not in the tracker]" ]] || fail "V28: the pull of your own ticket — $out"
+[[ ! -s "$TMP_ROOT/jira.log" ]] || fail "V28: your own ticket was asked of the tracker — $(cat "$TMP_ROOT/jira.log")"
+grep -q '^keep it$' "$TV/.raw/tickets/ABC-5.md" || fail "V28: the pull changed your own ticket"
+[[ -f "$TV/wiki/notes/tickets/ABC-5-state.md" ]] || fail "V28: the pull makes your own ticket's state note"
+(
+    vault_prepare() { echo "$TV"; }; vault_sync() { echo "sync $1 $harness_ticket" > "$TMP_ROOT/v28.sync"; }
+    out=$(printf 'from stdin\n' | cmd_ticket new 'by hand' - 2>&1) || fail "V28: harness ticket new failed — $out"
+    [[ "$out" == "ticket LOCAL-9 (your own, not in the tracker): $TV/.raw/tickets/LOCAL-9.md"* ]] || fail "V28: harness ticket new — $out"
+    grep -q '^from stdin$' "$TV/.raw/tickets/LOCAL-9.md" || fail "V28: - reads the text from stdin"
+    [[ "$(cat "$TMP_ROOT/v28.sync")" == "sync $TV LOCAL-9" ]] || fail "V28: the vault is synced — $(cat "$TMP_ROOT/v28.sync")"
+    cmd_ticket new 2>/dev/null && fail "V28: harness ticket new with no title accepted"
+    cmd_ticket new t --key 'no' 2>/dev/null && fail "V28: harness ticket new with a bad key accepted"
+    exit 0
+) || exit 1
+ok "V28: tickets of your own: LOCAL-N (past the queue's keys, TICKET_LOCAL_PREFIX), never overwritten, never fetched, harness ticket new"
 
 echo "VAULT TEST PASSED"

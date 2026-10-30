@@ -247,19 +247,19 @@ mkdir -p "$Q9V/.raw/tickets" "$state_root/queue/LOCAL-2"
     vault_active_name() { echo q9vault; }
     cmd_queue add --new $'fix the flaky login test\nit fails one run in ten' --new 'tidy the readme' --dir "$PROJ" >/dev/null \
         || fail "Q9: add --new failed"
-    # LOCAL-2 is a folder in the queue already: the two made are LOCAL-1 and LOCAL-3.
-    for k in LOCAL-1 LOCAL-3; do
+    # LOCAL-2 is a folder in the queue already: the two made are LOCAL-3 and LOCAL-4.
+    for k in LOCAL-3 LOCAL-4; do
         [[ -f "$state_root/queue/$k/state.json" && -f "$Q9V/.raw/tickets/$k.md" ]] || fail "Q9: $k should be queued and in the vault"
     done
-    grep -q '^source: local$' "$Q9V/.raw/tickets/LOCAL-1.md" && grep -q '^# LOCAL-1: fix the flaky login test$' "$Q9V/.raw/tickets/LOCAL-1.md" \
-        && grep -q '^it fails one run in ten$' "$Q9V/.raw/tickets/LOCAL-1.md" || fail "Q9: the copy — $(cat "$Q9V/.raw/tickets/LOCAL-1.md")"
+    grep -q '^source: local$' "$Q9V/.raw/tickets/LOCAL-3.md" && grep -q '^# LOCAL-3: fix the flaky login test$' "$Q9V/.raw/tickets/LOCAL-3.md" \
+        && grep -q '^it fails one run in ten$' "$Q9V/.raw/tickets/LOCAL-3.md" || fail "Q9: the copy — $(cat "$Q9V/.raw/tickets/LOCAL-3.md")"
     # An add that fails takes its new ticket out of the vault again.
     if cmd_queue add --new 'never queued' --dir "$PROJ" --stages frob >/dev/null 2>&1; then fail "Q9: an unknown stage accepted"; fi
-    [[ ! -e "$Q9V/.raw/tickets/LOCAL-4.md" && ! -d "$state_root/queue/LOCAL-4" ]] || fail "Q9: a failed add should leave no LOCAL-4"
+    [[ ! -e "$Q9V/.raw/tickets/LOCAL-5.md" && ! -d "$state_root/queue/LOCAL-5" ]] || fail "Q9: a failed add should leave no LOCAL-5"
     if cmd_queue add --new ' ' --dir "$PROJ" 2>/dev/null; then fail "Q9: --new with no text accepted"; fi
     vault_active_name() { :; }
     if cmd_queue add --new 'x' --dir "$PROJ" 2>/dev/null; then fail "Q9: --new with no vault accepted"; fi
 ) || exit 1
-ok "Q9: add --new makes LOCAL-N tickets (skipping keys the queue has) and queues them; a failed add takes them out"
+ok "Q9: add --new makes LOCAL-N tickets (numbered past keys the queue has) and queues them; a failed add takes them out"
 
 echo "QUEUE TEST PASSED"
