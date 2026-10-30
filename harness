@@ -11415,8 +11415,11 @@ debug_scrub() {
 # win over the top level, and the yolo agent's own allow-all would otherwise
 # apply). opencode takes the LAST matching rule, so "*" comes first, the
 # read-only allowlist after it, and the patterns that make an allowed command
-# write (a redirect, find -delete, curl -o, ...) last. A pipeline is checked
-# command by command, a redirect is part of its command's text. The mode is
+# write (a redirect, find -delete, ...) last. A pipeline is checked
+# command by command, a redirect is part of its command's text. A * matches
+# anything, spaces and quotes too, so a * only ends a pattern and never
+# stands for a folder or a project: `git -C * status*` would take `git -C x
+# push origin status`. curl is one plain GET of a local URL. The mode is
 # "ask" interactively and "deny" for -p (harness_debug_print=1).
 #
 # A queue debug run with --fix also gets debug_fix_commands (its working
@@ -11432,23 +11435,28 @@ debug_opencode_config() {
         'file *' 'du *' 'df *' 'pwd' 'whoami' 'id *' 'uname *' 'hostname' 'echo *'
         'date *' 'which *' 'command -v *' 'type *' 'uptime *' 'free *' 'jq *'
         'cut *' 'diff *' 'cmp *' 'sha256sum *' 'md5sum *' 'readlink *'
-        'realpath *' 'dirname *' 'basename *' 'tree *' 'curl *' 'ps' 'ps aux*'
+        'realpath *' 'dirname *' 'basename *' 'ps' 'ps aux*'
         'ps -ef*' 'ps -eo *' 'ps -p *' 'pgrep *' 'ss *' 'netstat *' 'lsof *'
         'systemctl status *' 'journalctl *'
         'git status*' 'git log*' 'git diff*' 'git show*' 'git rev-parse*'
         'git describe*' 'git remote -v*' 'git branch --show-current*'
-        'git config --get *' 'git -C * status*' 'git -C * log*' 'git -C * diff*'
-        'git -C * show*' 'git -C * rev-parse*'
+        'git config --get *'
+        'curl -s http://127.0.0.1:*' 'curl -s http://localhost:*' 'curl -s http://proxy:*'
     )
-    local rt h
+    local rt h d
+    for d in "$install_root" "$clone_dir" ${harness_debug_fix:+"$harness_debug_fix"}; do
+        allow+=("git -C $d status*" "git -C $d log*" "git -C $d diff*" "git -C $d show*"
+            "git -C $d rev-parse*")
+    done
     for rt in docker podman; do
         allow+=("$rt ps*" "$rt logs *" "$rt inspect -f *" "$rt inspect --format *"
             "$rt version*" "$rt info*" "$rt images*" "$rt image ls*"
             "$rt network ls*" "$rt volume ls*" "$rt stats --no-stream*"
             "$rt system df*" "$rt compose ls*" "$rt compose ps*" "$rt compose logs *"
-            "$rt compose version*" "$rt compose -p * ps*" "$rt compose -p * logs *")
+            "$rt compose version*" "$rt compose -p $project_name ps*"
+            "$rt compose -p $project_name logs *")
     done
-    for h in harness '*/harness'; do
+    for h in harness "$clone_dir/harness"; do
         allow+=("$h doctor*" "$h list*" "$h config list*" "$h config get *"
             "$h context*" "$h usage*" "$h help*" "$h --help*" "$h mcp list*"
             "$h mcp status*" "$h net list*" "$h net status*")
@@ -11458,17 +11466,15 @@ debug_opencode_config() {
     allow+=(${fixes[@]+"${fixes[@]}"})
     local guard=(
         '*>*' 'find *-delete*' 'find *-exec*' 'find *-ok*' 'find *-fprint*'
-        'find *-fls*' 'curl *-o *' 'curl *-O*' 'curl *--output*' 'curl *-X*'
-        'curl *--request*' 'curl *-d *' 'curl *--data*' 'curl *-F *'
-        'curl *--form*' 'curl *-T *' 'curl *--upload*' 'curl *-K *'
-        'curl *--config*' 'git *--output*' 'journalctl *--vacuum*'
+        'find *-fls*' 'curl -s http* *' 'curl *@*' 'file *-C*' 'echo *$*' 'jq *env*' 'jq *ENV*' 'git *--output*'
+        'git *--exec*' 'git *--git-dir*' 'git *--work-tree*' 'journalctl *--vacuum*'
         'journalctl *--rotate*' 'journalctl *--flush*' 'ps *e' 'ps *e *'
         '*.env' '*.env *' '*.env.*' '*.env/*' '*environ*' '*/.ssh/*' '*id_rsa*'
         '*id_ed25519*' '*.pem*'
     )
     (( ${#fixes[@]} )) && guard+=('git *--force*' 'git * -f' 'git * -f *' 'git *--hard*'
         'git *--discard-changes*' 'git *--orphan*' 'git *switch*-C*' 'git *--global*'
-        'git *--system*' 'git *--file*' 'git *--exec*')
+        'git *--system*' 'git *--file*')
     local bash_rules
     bash_rules=$( { printf '*\t%s\n' "$mode"
                     for p in "${allow[@]}"; do printf '%s\tallow\n' "$p"; done
@@ -11488,20 +11494,26 @@ debug_opencode_config() {
                  yolo: {permission: $p}}}'
 }
 
-# The repairs a queue debug run may make, as opencode patterns (one per line,
-# * the agent's to fill in), for its working copy (harness_debug_fix,
-# resolved) alone: the ones any working copy may take, then
-# (harness_debug_fix_clone=1, the queue's own clone, which holds nothing of
-# the owner's) a stash, a switch and checkout settings.
+# The repairs a queue debug run may make, each spelled out whole with its
+# working copy (harness_debug_fix, resolved), for that folder alone. In the
+# owner's own folder (a ticket in place) only the two that lose nothing: a
+# half-done rebase or merge there, or an index.lock, may be the owner's own
+# (an abort drops its conflict resolutions), so the run reports them. The
+# queue's own clone (harness_debug_fix_clone=1) holds nothing of the
+# owner's: aborts, the stale lock, a stash, a switch to the ticket's branch
+# (harness_debug_fix_branch) and checkout settings.
 debug_fix_commands() {
-    local w="${harness_debug_fix:-}" gd="${harness_debug_gitdir:-}" c cmds
+    local w="${harness_debug_fix:-}" gd="${harness_debug_gitdir:-}" b="${harness_debug_fix_branch:-}" c cmds
     [[ -n "$w" ]] || return 0
-    cmds=("rebase --abort" "rebase --quit" "merge --abort" "cherry-pick --abort" "revert --abort"
-          "am --abort" "worktree prune*" "update-index --refresh*")
-    [[ "${harness_debug_fix_clone:-0}" == 1 ]] && cmds+=("stash push*" "stash list*" "stash show*"
-        "switch *" "config core.longpaths true" "sparse-checkout *")
+    cmds=("worktree prune" "update-index -q --refresh")
+    if [[ "${harness_debug_fix_clone:-0}" == 1 ]]; then
+        cmds+=("rebase --abort" "rebase --quit" "merge --abort" "cherry-pick --abort" "revert --abort"
+            "am --abort" "stash push" "stash push --include-untracked" "stash list" "stash show"
+            "config core.longpaths true" "sparse-checkout disable")
+        [[ -n "$b" ]] && cmds+=("switch $b")
+    fi
     for c in "${cmds[@]}"; do printf 'git -C %s %s\n' "$w" "$c"; done
-    [[ -n "$gd" ]] && printf 'rm -f %s/index.lock\n' "$gd"
+    [[ "${harness_debug_fix_clone:-0}" == 1 && -n "$gd" ]] && printf 'rm -f %s/index.lock\n' "$gd"
     return 0
 }
 
@@ -11608,15 +11620,15 @@ cmd_debug() {
         host) mode=host; shift ;;
     esac
     harness_runtime_installed || mode=host
-    local args=() print=0 rundir="" fix=""
+    local args=() print=0 rundir="" fix="" branch=""
     while (( $# )); do
         case "$1" in
             --yolo) err "debug: ignoring --yolo (the debug agent asks before it changes anything)"; shift ;;
             -p|--print) print=1; args+=("$1"); shift
                 (( $# )) && { args+=("$1"); shift; } ;;
-            --dir|--fix)
-                (( $# >= 2 )) || { err "debug: $1 needs a folder"; return 1; }
-                if [[ "$1" == --dir ]]; then rundir="$2"; else fix="$2"; fi
+            --dir|--fix|--fix-branch)
+                (( $# >= 2 )) || { err "debug: $1 needs a value"; return 1; }
+                case "$1" in --dir) rundir="$2" ;; --fix) fix="$2" ;; *) branch="$2" ;; esac
                 shift 2 ;;
             *) args+=("$1"); shift ;;
         esac
@@ -11644,6 +11656,8 @@ cmd_debug() {
         fix=$(cd "$fix" 2>/dev/null && pwd -P) || fix=""
         if [[ -z "$fix" || "$(git -C "$fix" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]]; then
             err "debug: --fix is not a git working copy; this run only reports"; fix=""
+        elif [[ "$fix" == *[[:space:]\*\?\[]* ]]; then   # its repairs are patterns typed with the folder
+            err "debug: --fix has a space or a * ? [ in its path; this run only reports"; fix=""
         elif [[ "$fix" == "$qroot/"* ]]; then
             harness_debug_fix_clone=1
         elif [[ "$fix" == "$root" || "$fix" == "$root/"* || "$root" == "$fix/"* ]]; then
@@ -11651,6 +11665,8 @@ cmd_debug() {
         fi
         if [[ -n "$fix" ]]; then
             harness_debug_fix="$fix"
+            [[ "${harness_debug_fix_clone:-0}" == 1 && -n "$branch" && "$branch" != *[\*\?\[]* ]] \
+                && git check-ref-format --branch "$branch" >/dev/null 2>&1 && harness_debug_fix_branch="$branch"
             harness_debug_gitdir=$(git -C "$fix" rev-parse --absolute-git-dir 2>/dev/null || true)
             [[ "$fix" == "$root/"* ]] || mounts+=(--mount "$fix")
         fi
@@ -11660,7 +11676,8 @@ cmd_debug() {
         { cat "$clone_dir/scripts/debug_agent.md" "$clone_dir/scripts/debug_queue.md"
           printf '\n## This run\n\n'
           if [[ -n "$fix" ]]; then
-              printf 'Working copy: %s\n\nThe repairs you may make, typed exactly so (a * is yours to fill in,\nnever with a force or a reset):\n\n' "$fix"
+              printf 'Working copy: %s (%s)\n\nThe repairs you may make, each typed exactly so, alone:\n\n' "$fix" \
+                  "$([[ "${harness_debug_fix_clone:-0}" == 1 ]] && echo "the queue's own clone" || echo "the owner's own folder")"
               debug_fix_commands | sed 's/^/    /'
           else
               printf 'No working copy to repair: this run only reports.\n'

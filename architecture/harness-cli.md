@@ -1084,7 +1084,10 @@ call), `retry_refused` is empty. No loop: `debugged = STAGE` is set before
 the launch and cleared only when a stage passes (`advance`) or by the
 owner's own requeue; a stub report (`debug_stub`, needs-owner) covers a
 timeout, a stop or no report; `tidy` marks a look a dead run left
-`running` as needs-owner. On
+`running` as needs-owner. The look's process is in `state.json` `agent`
+like a stage's (`workdir` its run folder) until it ends, so a dead run's
+look is ended by the owner's retry, stop or remove (`reap`). A queue clone
+gets `--fix-branch BRANCH` (its one `switch`). On
 Windows each launch (and each `run_quiet` command) is in a job object of
 its own (`spawn`), and `stop` ends the job: `taskkill /T` follows parent
 ids and misses a process whose parent is gone. A `_sync` that gets no
@@ -2324,16 +2327,20 @@ working model path, so when the launch itself fails without a report,
   never share files; `AGENTS.md` there is `debug_agent.md` +
   `scripts/debug_queue.md` (the fix-mode rules and verdict lines) + the
   run's exact repair commands. `--fix` is the ticket's working copy,
-  resolved with `pwd -P`; not a git work tree, or inside the install root
-  but not under `state/queue/`, and the run only reports. A project outside
-  the install root is mounted too. `debug_fix_commands` gives
-  `debug_opencode_config` the allowlist for that folder alone (`git -C W
-  rebase|merge|cherry-pick|revert|am --abort`, `rebase --quit`, `worktree
-  prune`, `update-index --refresh`, `rm -f GITDIR/index.lock`; in a queue
-  clone also `stash push/list/show`, `switch *`, `config core.longpaths
-  true`, `sparse-checkout *`), with `git *--force*`, `* -f`, `--hard`,
-  `--discard-changes`, `--orphan`, `switch -C`, `--global/--system/--file`
-  and `--exec` after it. Edits stay `report.md` only, so harness is never
+  resolved with `pwd -P`; not a git work tree, a path with a space or a
+  `* ? [` (a pattern cannot spell it), or inside the install root but not
+  under `state/queue/`, and the run only reports. A project outside the
+  install root is mounted too. `debug_fix_commands` gives
+  `debug_opencode_config` the allowlist for that folder alone, every
+  command whole, no `*`: in the owner's own folder (in place) only `git -C
+  W worktree prune` and `update-index -q --refresh` (a half-done merge or
+  an `index.lock` there may be the owner's, so it is reported); in a queue
+  clone also `rebase|merge|cherry-pick|revert|am --abort`, `rebase --quit`,
+  `rm -f GITDIR/index.lock`, `stash push [--include-untracked]/list/show`,
+  `switch BRANCH` (`--fix-branch`, checked by `git check-ref-format`),
+  `config core.longpaths true`, `sparse-checkout disable`. Guards after it:
+  `git *--force*`, `* -f`, `--hard`, `--discard-changes`, `--orphan`,
+  `switch -C`, `--global/--system/--file`. Edits stay `report.md` only, so harness is never
   changed and nothing is pushed. `debug_finish` redacts the report in place
   with `harness_debug_keep_keys=1` (ticket keys kept, the report stays on
   this machine) or writes a needs-owner one when there is none.
@@ -2359,11 +2366,18 @@ working model path, so when the launch itself fails without a report,
   pipeline command by command, with any redirect in the command's text, so
   the bash map is `"*"` first, a read-only allowlist (`cat`, `grep`, `git
   log`, `docker logs`, `harness doctor`, ...), then the patterns that make
-  an allowed command write or leak (`*>*`, `find -delete/-exec`, `curl -o/-d/
-  -X`, `*.env`, `*environ*`, ...). Edits are the same except `report.md`;
-  reading `.env` asks. The mode is `ask` interactively and `deny` under
-  `-p`, where an ask ends a headless session. This guards against mistakes,
-  not an adversary: the redaction below is what keeps the report clean.
+  an allowed command write or leak (`*>*`, `find -delete/-exec`, `echo
+  *$*`, `jq *env*`, `git *--exec*`, `*.env`, `*environ*`, ...). A `*`
+  matches spaces and quotes too, so it only ends a pattern: folders and
+  the compose project are spelled out (`git -C <install root|clone|fix>
+  status*`, `compose -p $project_name ps*`, `$clone_dir/harness doctor*`),
+  never `git -C * status*` (that takes `git -C x push origin status`).
+  curl is one plain local GET (`curl -s http://127.0.0.1:*`, `localhost`,
+  `proxy`), any second argument or an `@` refused. Edits are the same
+  except `report.md`; reading `.env` asks. The mode is `ask` interactively
+  and `deny` under `-p`, where an ask ends a headless session. The queue
+  runs it unattended on text from the ticket, so the allowlist must hold
+  on its own; the redaction below is what keeps the report clean.
 - **Report**: the agent writes `state/debug/report.md`; on exit
   `debug_finish` redacts it (`debug_scrub`) into
   `state/debug/reports/<time>.md`, deletes the raw file and prints it. A

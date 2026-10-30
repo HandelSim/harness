@@ -3689,6 +3689,11 @@ def debug_block(ctx, st):
         raise
     except Exception as e:  # noqa: BLE001 - a helper: its failure leaves the block to the owner
         ctx.q.log(st["key"], f"warning: the debug agent did not run to its end: {type(e).__name__}: {str(e)[:200]}")
+        with held(os.path.join(ctx.q.root, "queue.lock")):
+            st = ctx.q.load(st["key"])
+            if st and (st.get("debug") or {}).get("verdict") == "running":
+                st["debug"].update(verdict="needs-owner", note=f"it did not run to its end: {type(e).__name__}")
+                ctx.q.save(st)
 
 
 def debug_look(ctx, key, stage):
@@ -3735,6 +3740,7 @@ def debug_look(ctx, key, stage):
                 st = requeue(q, key, ("blocked",))
                 st.update(debugged=stage, reason=f"a debug agent repaired the block; {stage} goes again "
                                                  f"(its report: state/debug/runs/{name}/report.md)")
+        st.pop("agent", None)
         st["debug"] = dict(st.get("debug") or {}, verdict=verdict, harness_change=change, ended=now_iso(),
                            retried=st["status"] == "queued", **({"note": note} if note else {}))
         q.save(st)
@@ -3761,7 +3767,9 @@ def debug_launch(ctx, st, d, work):
     or the halt's Interrupted for the caller to raise once the look is recorded)."""
     key = st["key"]
     cmd = [BASH, ctx.harness, "debug"] + (["host"] if ctx.host or ctx.single else []) + ["--dir", d]
-    cmd += (["--fix", work] if work else []) + ["-p", debug_prompt(ctx.q, st, work)]
+    cmd += ["--fix", work] if work else []
+    cmd += ["--fix-branch", st["branch"]] if work and not st.get("in_place") and st.get("branch") else []
+    cmd += ["-p", debug_prompt(ctx.q, st, work)]
     launch_id = f"{key}-debug-{os.getpid()}-{int(time.time() * 1000)}"
     env = dict(os.environ, HARNESS_HOST_CONFIRM="1", HARNESS_QUEUE_LAUNCH=launch_id, GIT_EDITOR="true")
     env.pop("HARNESS_TASK_CARD", None)
@@ -3771,6 +3779,13 @@ def debug_launch(ctx, st, d, work):
         p = spawn(cmd, cwd=d, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, env=env)
         ctx.child = p
         beat(ctx, agent=p.pid, launch=launch_id)
+        # a run that dies leaves this behind, as a stage does: the owner's retry, stop or remove ends it
+        with held(os.path.join(ctx.q.root, "queue.lock")):
+            s = ctx.q.load(key)
+            if s:
+                s["agent"] = {"pid": p.pid, "launch": launch_id, "host": socket.gethostname(),
+                              "container": not (ctx.host or ctx.single), "workdir": d}
+                ctx.q.save(s)
         try:
             while rc is None:
                 try:

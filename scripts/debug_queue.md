@@ -19,26 +19,27 @@ and the stages' output (`*.out`). Start there, then the working copy.
 ## What you may change
 
 Only the ticket's working copy (named in "This run" at the end of this
-file), only its git state, and only with the commands listed there, typed
-exactly so with that folder. That covers the usual causes of a blocked
-stage that are not the ticket's own work:
+file), only its git state, and only with the commands listed there, each
+typed exactly so, with no other options. Which ones you
+get depends on the folder:
 
-- a rebase, merge, cherry-pick, revert or am left half done: `--abort` it
-  (a `--quit` when an abort refuses);
-- a stale `index.lock` (no git process is running on that folder: check
-  with `ps aux`): remove it;
-- in the queue's own clone (under `state/queue/`, nothing of the owner's is
-  in it) also: a dirty tree the stage did not make (`stash push`), a
-  detached HEAD or the wrong branch (`switch` to the ticket's branch from
-  `state.json`), a file git cannot check out (`config core.longpaths true`,
-  `sparse-checkout`).
+- the queue's own clone (under `state/queue/`, nothing of the owner's is in
+  it): `--abort` a rebase, merge, cherry-pick, revert or am left half done
+  (a `rebase --quit` when the abort refuses); remove a stale `index.lock`
+  (the stage's agent has ended by now); `stash push` a dirty tree the stage
+  did not make; `switch` back to the ticket's branch from a detached HEAD or
+  the wrong branch; `config core.longpaths true` or `sparse-checkout
+  disable` for a file git cannot check out;
+- the owner's own folder (a ticket run in place): only `worktree prune` and
+  `update-index --refresh`. A half-done rebase or merge there, or an
+  `index.lock`, may be the owner's own work in progress: report it with the
+  command that would clear it, and change nothing.
 
 Never anything else: no file edits but `report.md`, no commit, no push or
 fetch, no force, no reset, no clean, no checkout of a file over its changes,
-no `kill`, no change in harness's own folder, `.env` or settings. In the
-owner's own folder (a ticket run in place) leave a dirty tree as it is: that
-is the owner's work. A refused command is the answer: do not look for
-another way round it; say in the report what you would have run.
+no `kill`, no change in harness's own folder, `.env` or settings. A refused
+command is the answer: do not look for another way round it; say in the
+report what you would have run.
 
 A harness defect (the queue's own checks, the proxy, the container, a
 harness command that misbehaves) you only report, with the code location

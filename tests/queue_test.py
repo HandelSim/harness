@@ -54,7 +54,8 @@ if args and args[0] == "debug":   # the debug agent on a block: FAKE_DEBUG_* say
     a = args[2:] if args[1:2] == ["host"] else args[1:]
     d = a[a.index("--dir") + 1]
     fix = a[a.index("--fix") + 1] if "--fix" in a else ""
-    log.write("debug " + ("fix " + fix if fix else "report") + "\n")
+    on = " on " + a[a.index("--fix-branch") + 1] if "--fix-branch" in a else ""
+    log.write("debug " + ("fix " + fix + on if fix else "report") + "\n")
     open(os.environ["FAKE_CALLS"] + ".debugprompt", "a").write(a[-1] + "\n=====\n")
     if os.environ.get("FAKE_DEBUG_SLEEP"):
         import time
@@ -700,12 +701,13 @@ class QueueTest(Base):
         self.assertEqual(st["status"], "done", out)
         self.assertEqual(len(self.calls_of("implementing")), 3)   # two attempts, blocked, one more after the fix
         clone = os.path.join(self.state, "ABC-1", "repo")
-        self.assertEqual(self.calls_of("debug"), [f"debug fix {clone}"])
+        self.assertEqual(self.calls_of("debug"), [f"debug fix {clone} on ABC-1"])   # the clone's branch to switch to
         self.assertIn("ABC-1 at its implement stage", cat(self.calls + ".debugprompt"))
         self.assertEqual((st["debug"]["verdict"], st["debug"]["retried"], st["debug"]["harness_change"]),
                          ("fixed", True, False))
         self.assertIn("VERDICT: fixed", self.debug_report(st))
         self.assertNotIn("debugged", st)   # the stage passed: a later block gets its own look
+        self.assertNotIn("agent", st)   # its record for a run that dies mid-look, dropped when it ended
         self.assertIn("debug agent: fixed", cat(os.path.join(self.state, "ABC-1", "log.md")))
 
     def test_harness_change_needed_stays_blocked_with_the_report_linked(self):

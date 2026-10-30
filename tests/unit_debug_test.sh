@@ -226,7 +226,7 @@ t7=$(
         printf '# x\nWIDG-7 on feature/fast-path, key sk-secretvalue123456\nVERDICT: fixed\n' > report.md
         exit 0
     }
-    cmd_debug --dir "$run7" --fix "$work7" -p "the block" 2>"$TMP_ROOT/err"
+    cmd_debug --dir "$run7" --fix "$work7" --fix-branch feature/fast-path -p "the block" 2>"$TMP_ROOT/err"
 ) || rc=$?
 [[ $rc -eq 0 ]] || fail "T7: rc $rc — $(cat "$TMP_ROOT/err")"
 [[ "$(cat "$TMP_ROOT/launch7.args")" == "opencode --mount $TMP_ROOT -p the block" ]] \
@@ -234,10 +234,14 @@ t7=$(
 grep -q "the ticket queue's debug agent" "$run7/AGENTS.md" || fail "T7: no debug_queue.md in AGENTS.md"
 grep -qx "    git -C $work7 rebase --abort" "$run7/AGENTS.md" || fail "T7: the run's repairs — $(cat "$run7/AGENTS.md")"
 ( src; harness_jq -e --arg w "$work7" --arg r "$run7/report.md" '.permission as $p | ($p.bash | keys_unsorted) as $k
-    | $p.bash["git -C \($w) rebase --abort"] == "allow" and $p.bash["git -C \($w) switch *"] == "allow"
+    | $p.bash["git -C \($w) rebase --abort"] == "allow" and $p.bash["git -C \($w) switch feature/fast-path"] == "allow"
+      and $p.bash["git -C \($w) switch *"] == null and $p.bash["git -C \($w) status*"] == "allow"
       and $p.bash["rm -f \($w)/.git/index.lock"] == "allow" and $p.bash["git *--force*"] == "deny"
-      and $p.bash["git *--hard*"] == "deny" and ($k | index("git *--force*")) > ($k | index("git -C \($w) switch *"))
-      and $p.bash["git -C * rebase --abort"] == null and $p.edit[$r] == "allow"' "$TMP_ROOT/perm7.json" >/dev/null ) \
+      and $p.bash["git *--hard*"] == "deny" and ($k | index("git *--force*")) > ($k | index("git -C \($w) rebase --abort"))
+      and $p.bash["git -C * rebase --abort"] == null and $p.edit[$r] == "allow"
+      and ([$k[] | select(test("^[*]|^git -C [*]|^curl [*]$|compose -p [*]"))] == ["*", "*>*", "*.env", "*.env *",
+           "*.env.*", "*.env/*", "*environ*", "*/.ssh/*", "*id_rsa*", "*id_ed25519*", "*.pem*"])
+      and $p.bash["curl -s http* *"] == "deny" and $p.bash["curl *@*"] == "deny"' "$TMP_ROOT/perm7.json" >/dev/null ) \
     || fail "T7: permissions — $(cat "$TMP_ROOT/perm7.json")"
 [[ "$(cat "$run7/report.md")" == $'# x\nWIDG-7 on [branch], key [PROXY_API_KEY]\nVERDICT: fixed' ]] \
     || fail "T7: report — $(cat "$run7/report.md")"
@@ -250,10 +254,29 @@ rc=0; ( src; cmd_debug --dir "$TMP_ROOT/state" -p x >/dev/null 2>&1 ) || rc=$?
 [[ $rc -eq 1 ]] || fail "T7: a --dir outside state/debug/runs/ was taken"
 git init -q "$TMP_ROOT/state/notqueue"
 t7o=$( src; harness_runtime_installed() { return 0; }; debug_snapshot() { :; }
-       run_agent() { debug_opencode_config; exit 0; }
+       run_agent() { debug_opencode_config > "$TMP_ROOT/perm7o.json"; echo "VERDICT: needs-owner" > report.md; exit 0; }
        cmd_debug --dir "$run7" --fix "$TMP_ROOT/state/notqueue" -p x 2>"$TMP_ROOT/err" ) || true
 grep -q "will not repair harness's own folder" "$TMP_ROOT/err" || fail "T7: harness's folder — $(cat "$TMP_ROOT/err")"
-grep -q 'rebase --abort' <<<"$t7o" && fail "T7: repairs allowed in harness's own folder"
+[[ -s "$TMP_ROOT/perm7o.json" ]] || fail "T7: harness's folder, no config"
+grep -q 'rebase --abort' "$TMP_ROOT/perm7o.json" && fail "T7: repairs allowed in harness's own folder"
+rm -f "$TMP_ROOT/perm7o.json"
+# the owner's own folder (in place): nothing its own work in progress could lose
+own7=$(mktemp -d); git init -q "$own7"; own7=$(cd "$own7" && pwd -P)
+t7o=$( src; harness_runtime_installed() { return 0; }; debug_snapshot() { :; }
+       run_agent() { debug_opencode_config > "$TMP_ROOT/perm7o.json"; echo "VERDICT: needs-owner" > report.md; exit 0; }
+       cmd_debug --dir "$run7" --fix "$own7" --fix-branch main -p x 2>"$TMP_ROOT/err" ) || true
+grep -q "the owner's own folder" "$run7/AGENTS.md" || fail "T7: in place, AGENTS.md"
+got7=$( src; harness_jq -r '.permission.bash | to_entries[] | select(.value == "allow") | .key' "$TMP_ROOT/perm7o.json" )
+grep -qx "git -C $own7 update-index -q --refresh" <<<"$got7" || fail "T7: in place, no refresh — $(cat "$TMP_ROOT/err")"
+grep -E 'abort|index\.lock|switch|stash' <<<"$got7" && fail "T7: in place, a repair that can lose the owner's work"
+rm -rf "$own7" "$TMP_ROOT/perm7o.json"
+# a folder a pattern cannot spell (a space): the run only reports
+work8="$TMP_ROOT/state/queue/W 8/repo"; git init -q "$work8"
+t7o=$( src; harness_runtime_installed() { return 0; }; debug_snapshot() { :; }
+       run_agent() { debug_opencode_config > "$TMP_ROOT/perm7o.json"; echo "VERDICT: needs-owner" > report.md; exit 0; }
+       cmd_debug --dir "$run7" --fix "$work8" -p x 2>"$TMP_ROOT/err" ) || true
+grep -q "only reports" "$TMP_ROOT/err" && [[ -s "$TMP_ROOT/perm7o.json" ]] && ! grep -q 'abort' "$TMP_ROOT/perm7o.json" \
+    || fail "T7: a space in the path — $(cat "$TMP_ROOT/err")"
 ok "T7: the queue's debug run: its own folder, its working copy's repairs only, the report redacted in place"
 
 echo "[debug] all checks passed"
