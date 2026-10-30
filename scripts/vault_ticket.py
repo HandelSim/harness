@@ -313,8 +313,11 @@ def new_local(vault, key, title, text, taken=""):
     if key in ("", "-"):
         prefix = local_prefix()
         names = (os.listdir(d) if os.path.isdir(d) else []) + (os.listdir(taken) if taken and os.path.isdir(taken) else [])
-        n = [int(m.group(1)) for f in names for m in [re.fullmatch(re.escape(prefix) + r"-([0-9]+)(\.md)?", f)] if m]
-        key = f"{prefix}-{max(n, default=0) + 1}"
+        used = {int(m.group(1)) for f in names for m in [re.fullmatch(re.escape(prefix) + r"-([0-9]+)(\.md)?", f)] if m}
+        n = 1
+        while n in used:
+            n += 1
+        key = f"{prefix}-{n}"
     key = key.upper()
     if not KEY_RE.match(key) or len(key) > 40:
         return "", f"not a ticket key like ABC-123: {key}"
