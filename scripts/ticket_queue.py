@@ -2714,7 +2714,7 @@ def fresh(path, started):
 
 
 # A line of each prompt's template: output holding it is the prompt echoed, not the agent's note.
-NOTE_TEMPLATE = {"plan": "One or two sentences: what changes for the user of this code",
+NOTE_TEMPLATE = {"plan": "One or two sentences in plain words: what the owner gets when the ticket is done.",
                  "review": "Only real defects that would make the change wrong, unsafe or not meet"}
 NOTE_HEADS = {"plan": r"^##\s+Goal\b", "review": r"^##\s+Must fix\b"}
 
