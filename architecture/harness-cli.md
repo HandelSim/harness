@@ -1063,7 +1063,28 @@ stage that runs past `--stage-timeout` (`QUEUE_STAGE_TIMEOUT`, 3 h) is
 stopped and its work checked as it is, like an idle one; a failed check is
 an attempt, and its retry is a new agent told to finish the work. It is
 blocked instead when its container may still be running (`_stop_agents`
-could not say), since a container launch can outlive its stopped client. On
+could not say), since a container launch can outlive its stopped client.
+
+**The debug agent on a block** (`debug_block`, `--debug`/`QUEUE_DEBUG`, 1;
+0 is off). Every block goes through `block()` and `put_away`, so
+`run_tickets` hooks there: a stopped stage's second attempt and a timeout
+that blocks at once are covered too. In the slot that blocked it, one
+`harness debug [host] --dir state/debug/runs/<time>-KEY --fix WORKDIR -p
+...` (`debug_launch`; the same spawn, poll, halt/stop and
+`launch_containers_stopped` as a stage) runs for `--debug-timeout`
+(`QUEUE_DEBUG_TIMEOUT`, 1200 s) at most, the beat naming the ticket so
+`run_holds` keeps owner commands and other slots off it. Its verdict
+(`verdict_of`: the report's last `VERDICT:` line, the word alone, anything
+else `needs-owner`) is kept in `state.json` `debug {dir, stage, at, verdict,
+harness_change, ended, retried, note}`. `fixed` requeues the stage once,
+only after the queue checks it itself: no rebase, merge, cherry-pick or
+`index.lock` left (`GIT_TROUBLE`), the owner did not send the ticket on
+meanwhile, `plain_retry` stays at the stage (a fresh start is the owner's
+call), `retry_refused` is empty. No loop: `debugged = STAGE` is set before
+the launch and cleared only when a stage passes (`advance`) or by the
+owner's own requeue; a stub report (`debug_stub`, needs-owner) covers a
+timeout, a stop or no report; `tidy` marks a look a dead run left
+`running` as needs-owner. On
 Windows each launch (and each `run_quiet` command) is in a job object of
 its own (`spawn`), and `stop` ends the job: `taskkill /T` follows parent
 ids and misses a process whose parent is gone. A `_sync` that gets no
@@ -1898,6 +1919,14 @@ offered as suggestions. It is taken as pasted: quotes
   lists its rounds (each one's commits, diffstat, push result, follow-up
   text and archived plan). `/runs/ticket/<KEY>/live`
   is its poll JSON, `/runs/ticket/<KEY>/<stage>-<n>.out` an output file.
+  A ticket with `state.json` `debug` gets a "Debug agent" panel (verdict,
+  harness should change, note, the report rendered as markdown; open while
+  blocked).
+- `/runs/debug` (`render_debug_page`, linked from the queue page): every
+  report newest first by mtime, `state/debug/runs/*/report.md` with their
+  verdict and ticket and `state/debug/reports/*.md`;
+  `/runs/debug/runs/<run>` and `/runs/debug/reports/<file>` render one
+  (`DEBUG_NAME_RE` names only).
 - `/runs/ticket/<KEY>/diff?repo=&view=` (`serve/diff_view.py`, "Changes" on
   the ticket page): a diff drawn in the browser by the vendored diff2html
   3.4.56 (`serve/vendor/diff2html/`, MIT; its JS and CSS inlined, the JS
@@ -2289,6 +2318,25 @@ machine, and print a report the user hands to a developer. It needs a
 working model path, so when the launch itself fails without a report,
 `debug_finish` keeps the redacted snapshot instead and says so.
 
+- **The queue's run** (`--dir`, `--fix`, see "The debug agent on a block"
+  above): `--dir` must be a folder right in `state/debug/runs/` and is the
+  run's own workspace (`snapshot.txt`, `session.log`, `report.md`), so runs
+  never share files; `AGENTS.md` there is `debug_agent.md` +
+  `scripts/debug_queue.md` (the fix-mode rules and verdict lines) + the
+  run's exact repair commands. `--fix` is the ticket's working copy,
+  resolved with `pwd -P`; not a git work tree, or inside the install root
+  but not under `state/queue/`, and the run only reports. A project outside
+  the install root is mounted too. `debug_fix_commands` gives
+  `debug_opencode_config` the allowlist for that folder alone (`git -C W
+  rebase|merge|cherry-pick|revert|am --abort`, `rebase --quit`, `worktree
+  prune`, `update-index --refresh`, `rm -f GITDIR/index.lock`; in a queue
+  clone also `stash push/list/show`, `switch *`, `config core.longpaths
+  true`, `sparse-checkout *`), with `git *--force*`, `* -f`, `--hard`,
+  `--discard-changes`, `--orphan`, `switch -C`, `--global/--system/--file`
+  and `--exec` after it. Edits stay `report.md` only, so harness is never
+  changed and nothing is pushed. `debug_finish` redacts the report in place
+  with `harness_debug_keep_keys=1` (ticket keys kept, the report stays on
+  this machine) or writes a needs-owner one when there is none.
 - **Workspace** `state/debug/`: `AGENTS.md` is copied from the tracked
   `scripts/debug_agent.md` on every launch (what harness is, the log/state
   map, the read-only rules, the report format and privacy rules), and

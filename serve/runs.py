@@ -32,6 +32,11 @@ control room: its runner, its tickets, and every action harness queue has.
                               each attempt and why it failed, plan/review/answers,
                               log.md and stage outputs
   /runs/ticket/<KEY>/live     the ticket page's live regions, as JSON (polled)
+  /runs/debug                 every debug report, newest first: the queue's debug
+                              agents' (state/debug/runs/, with their verdicts) and
+                              harness debug's own (state/debug/reports/)
+  /runs/debug/runs/<run>, /runs/debug/reports/<file>
+                              one of them, rendered
   POST /runs/<session>/send   a message for a live run (agents/live-run.sh's inbox)
   POST /runs/<session>/stop   stop the queue stage the session belongs to
   POST /runs/ticket/<KEY>/answer|approve|retry|continue|stop|remove|move|note
@@ -45,6 +50,7 @@ markers and inboxes agents/live-run.sh keeps). The databases are opened read-onl
 """
 
 import calendar
+import glob
 import hashlib
 import html
 import json
@@ -1880,6 +1886,7 @@ def render_queue_page(runs, msg="", bad=False, form=None, err=""):
     d = queue_live(runs)
     return [_live_tag("/runs/queue/live", d["sig"]),
             "<header class='ph'><h1>Queue</h1><a class='btn sm' href='#add'>+ Add tickets</a>"
+            "<a class='btn sm' href='/runs/debug'>Debug reports</a>"
             "<div class='sub'>The run works the tickets top down, one stage at a time. A ticket waiting on you "
             "(questions, a plan to approve, blocked) does not hold the queue.</div></header>",
             _flash(msg, bad),
@@ -2361,6 +2368,27 @@ def _doc(runs, vault, key, kind, label, text, open_=False):
             f"<div class='vlink'>{_open_in_vault(runs, vault, rel)}</div>{_md(vault, rel, text)}</details></section>")
 
 
+def _t_debug(runs, key, st):
+    """The debug agent's last look at the ticket's block (state.json's debug): its
+    verdict and its report, open while the ticket is blocked."""
+    dbg = st.get("debug") or {}
+    if not isinstance(dbg, dict) or not DEBUG_NAME_RE.match(str(dbg.get("dir") or "")):
+        return ""
+    text = _debug_text(runs, "runs", dbg["dir"]) or ""
+    verdict = str(dbg.get("verdict") or "")
+    head = (f"<span class='pill {VERDICT_TONE.get(verdict, 't-off')}'>{esc(verdict or '?')}</span>"
+            + (" <span class='pill t-bad'>harness should change</span>" if dbg.get("harness_change") else "")
+            + (" <span class='muted'>the stage went again</span>" if dbg.get("retried") else ""))
+    note = f"<div class='muted'>{esc(str(dbg['note']))}</div>" if dbg.get("note") else ""
+    body = (_md(runs.vault, "debug-report.md", text) if text.strip()
+            else "<div class='muted'>No report yet.</div>")
+    href = f"/runs/debug/runs/{quote(dbg['dir'])}"
+    return (f"<section class='panel'><details class='doc' data-k='debug'{' open' if st.get('status') == 'blocked' else ''}>"
+            f"<summary>Debug agent ({esc(str(dbg.get('stage') or ''))} block) {head}</summary>"
+            f"<div class='vlink'><a class='muted' href='{href}'>its own page</a> "
+            f"<a class='muted' href='/runs/debug'>all debug reports</a></div>{note}{body}</details></section>")
+
+
 def _t_docs(runs, key, st, log):
     """The ticket's notes in the vault, rendered: the plan (unless it is open above,
     with the answer form), the agent's state note, the review, the findings, the
@@ -2373,6 +2401,7 @@ def _t_docs(runs, key, st, log):
         text = _vault_text(vault, _note_rel(key, kind))
         if text.strip():
             parts.append(_doc(runs, vault, key, kind, label, text))
+    parts.append(_t_debug(runs, key, st))
     text = log[-60000:] if log.strip() else "no log yet"
     parts.append("<section class='panel'><details class='doc' data-k='log'><summary>Queue log"
                  f"<span class='muted'>{len(log.splitlines())} lines</span></summary>"
@@ -2517,6 +2546,97 @@ def render_ticket(runs, key, msg="", bad=False):
                  f"<section class='panel' id='r-attempts'>{g['attempts']}</section></div>"
                  f"<div class='stack'><section class='panel' id='r-notes'>{g['notes']}</section>"
                  f"<div id='r-rounds'>{g['rounds']}</div></div></div>"]
+
+
+# --- /runs/debug ---------------------------------------------------------------------
+
+DEBUG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
+VERDICT_TONE = {"fixed": "t-ok", "harness-change-needed": "t-bad", "needs-owner": "t-wait", "running": "t-run dot pulse"}
+
+
+def debug_dir(runs):
+    """state/debug/, beside the queue's state/queue/ ("" without a queue)."""
+    return os.path.join(os.path.dirname(os.path.abspath(runs.queue_dir)), "debug") if runs.queue_dir else ""
+
+
+def _debug_path(runs, kind, name):
+    """A report's file: runs/<run>/report.md (a queue debug run) or reports/<file>.md
+    (harness debug's own); None for any other name."""
+    top = debug_dir(runs)
+    if not top or not DEBUG_NAME_RE.match(name or "") or ".." in name:
+        return None
+    if kind == "runs":
+        return os.path.join(top, "runs", name, "report.md")
+    return os.path.join(top, "reports", name) if kind == "reports" and name.endswith(".md") else None
+
+
+def _debug_text(runs, kind, name):
+    path = _debug_path(runs, kind, name)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except (OSError, TypeError):
+        return None
+
+
+def debug_reports(runs):
+    """Every debug report, newest first: {kind, name, mtime, key, verdict, change, title}."""
+    top, tq, out = debug_dir(runs), _tq(), []
+    if not top:
+        return out
+    for kind, pattern in (("runs", os.path.join(top, "runs", "*", "report.md")),
+                          ("reports", os.path.join(top, "reports", "*.md"))):
+        for path in glob.glob(pattern):
+            name = os.path.basename(os.path.dirname(path)) if kind == "runs" else os.path.basename(path)
+            if not DEBUG_NAME_RE.match(name):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read(200000)
+            except OSError:
+                continue
+            m = re.match(r"\d{8}-\d{6}-(.+)$", name) if kind == "runs" else None
+            verdict, change = (tq.verdict_of(text) if tq is not None and kind == "runs" else ("", False))
+            title = next((ln.lstrip("# ").strip() for ln in text.splitlines() if ln.startswith("# ")), "")
+            out.append({"kind": kind, "name": name, "mtime": mtime, "key": m.group(1) if m else "",
+                        "verdict": verdict, "change": change, "title": title})
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out
+
+
+def render_debug_page(runs):
+    rows = debug_reports(runs)
+    parts = ["<header class='ph'><h1>Debug reports</h1><div class='sub'>Newest first: the queue's debug agent "
+             "on each blocked ticket (its verdict; harness should change marks the ones to read for a harness "
+             "fix), and harness debug's own.</div></header>", "<section class='panel'>"]
+    if not rows:
+        parts.append("<div class='muted'>No debug report yet.</div>")
+    else:
+        parts.append("<ul class='attempts'>")
+        for r in rows:
+            href = f"/runs/debug/{r['kind']}/{quote(r['name'])}"
+            tags = (f"<span class='pill {VERDICT_TONE.get(r['verdict'], 't-off')}'>{esc(r['verdict'])}</span>"
+                    if r["verdict"] else "<span class='pill t-off'>harness debug</span>")
+            if r["change"]:
+                tags += "<span class='pill t-bad'>harness should change</span>"
+            if r["key"]:
+                tags += f"<a class='tag' href='/runs/ticket/{quote(r['key'])}'>{esc(r['key'])}</a>"
+            parts.append(f"<li><div class='hd'>{tags}<a href='{href}'>{esc(r['title'] or r['name'])}</a>"
+                         f"<span class='muted'>{esc(_when(r['mtime'] * 1000))}</span></div></li>")
+        parts.append("</ul>")
+    parts.append("</section>")
+    return parts
+
+
+def render_debug_report(runs, kind, name):
+    """(title, parts) for one report, or None."""
+    text = _debug_text(runs, kind, name)
+    if text is None:
+        return None
+    return name, ["<header class='ph'><h1>Debug report</h1>"
+                  f"<div class='sub'><a href='/runs/debug'>all debug reports</a> <code>{esc(name)}</code></div></header>",
+                  f"<section class='panel'>{_md(runs.vault, 'debug-report.md', text)}</section>"]
 
 
 # --- actions ------------------------------------------------------------------------

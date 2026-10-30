@@ -1058,6 +1058,16 @@ def make_handler(cfg):
                         return
                 self.send(404, b"not found\n", head=head)
                 return
+            if bits[0] == "debug" and len(bits) in (1, 3) and r.queue_dir:
+                if len(bits) == 1:
+                    self.send_runs(200, "harness: debug reports", runs_view.render_debug_page(r), "", head, "queue")
+                    return
+                got = runs_view.render_debug_report(r, bits[1], bits[2])
+                if got:
+                    self.send_runs(200, f"harness: {got[0]}", got[1], "", head, "queue")
+                    return
+                self.send(404, b"not found\n", head=head)
+                return
             if bits[0] in ("follow", "follow.json") and len(bits) == 1:
                 since, queue, follow = runs_view.follow_query(q)
                 sid = runs_view.follow_target(r, since, queue)

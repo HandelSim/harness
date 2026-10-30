@@ -7146,7 +7146,14 @@ looking again after 2, 5, 10 and then every 30 min, for up to QUEUE_OUTAGE_WAIT;
 a halt ends the wait. An agent that changes nothing for QUEUE_IDLE_MIN minutes,
 or still runs after QUEUE_STAGE_TIMEOUT seconds, is stopped and its work
 checked as it is (a failed check is an attempt; an idle agent with the upstream
-down is an outage). A verifier that
+down is an outage). A blocked ticket (a stopped agent's second attempt
+included) gets one debug agent (harness debug --fix) per blocked stage: it may
+repair the ticket's working copy's git state (a stuck rebase or merge, a stale
+index.lock; in the queue's own clone also a stash or a switch), never harness,
+never a push or a force. Its report (state/debug/runs/, listed at
+/runs/debug in the run viewer and linked from the ticket's page) ends in a
+verdict: fixed sends the stage once more, harness-change-needed and
+needs-owner leave the ticket blocked. A verifier that
 cannot answer blocks the ticket with the agent's work kept: retry KEY asks the
 verifier again without running the agent. The outcome (pushed, kept local,
 refused; commits, diffstat, a pull-request link) is in state.json and
@@ -7163,7 +7170,8 @@ QUEUE_PLAN_REVIEW (0: each ticket's own choice, which by default waits for
 QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
 0 turns the idle watchdog off), QUEUE_STAGE_TIMEOUT (10800 s; one agent
 launch at most), QUEUE_PARALLEL (1; tickets a run works at a time,
-the same as run --parallel N).
+the same as run --parallel N), QUEUE_DEBUG (1; 0 turns the debug agent off),
+QUEUE_DEBUG_TIMEOUT (1200 s; one debug agent at most).
 HELP
             return 0 ;;
         watch)
@@ -7342,6 +7350,7 @@ HELP
                    --remote "${QUEUE_REMOTE:-origin}" --plan-review "${QUEUE_PLAN_REVIEW:-0}"
                    --outage-wait "${QUEUE_OUTAGE_WAIT:-21600}" --idle-min "${QUEUE_IDLE_MIN:-20}"
                    --stage-timeout "${QUEUE_STAGE_TIMEOUT:-10800}"
+                   --debug "${QUEUE_DEBUG:-1}" --debug-timeout "${QUEUE_DEBUG_TIMEOUT:-1200}"
                    # the session databases a working agent writes to: its idle watchdog watches them
                    --watch "${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
                    --watch "$(agent_home_dir)/.local/share/opencode/opencode.db")
@@ -11222,6 +11231,16 @@ cmd_net() {
 # The agent writes report.md; on exit debug_finish redacts it (debug_scrub:
 # every .env value, vault and ticket names, home paths) into
 # state/debug/reports/ and prints it.
+#
+# The ticket queue runs it on a blocked ticket (ticket_queue.py debug_block)
+# with --dir state/debug/runs/<time>-KEY, a folder of the run's own: AGENTS.md
+# gets scripts/debug_queue.md and the run's exact repair commands too, and the
+# report is redacted in place there, ticket keys kept, ending in the VERDICT
+# line the queue reads. With --fix WORKDIR, the ticket's working copy, the
+# allowlist also takes those few git repairs, spelled out for that folder
+# alone (abort a rebase or merge, drop a stale index.lock; in the queue's own
+# clone also stash and switch). Never a push, a force, a reset, an edit, nor
+# a repair in harness's own folder.
 
 debug_help() {
     cat <<'EOF'
@@ -11245,7 +11264,8 @@ state/debug/reports/. Hand that report to whoever fixes harness.
                         commands itself (harness host's confirm prompt applies)
   -p "ISSUE"            headless: investigate ISSUE, print the report, exit
 
---yolo is ignored here.
+--yolo is ignored here. The ticket queue runs one by itself on a blocked
+ticket (QUEUE_DEBUG; see harness queue --help), with --dir and --fix.
 EOF
 }
 
@@ -11350,13 +11370,24 @@ PY
 # replaced whole), then the install root as <harness>, a path under $HOME as
 # ~/<path> (a dot dir such as ~/.local/share/opencode is kept: it names a
 # tool, not the user's project), and $HOME itself as ~.
+#
+# harness_debug_keep_keys=1 (a queue debug run's report, which stays on this
+# machine) keeps the ticket keys, whatever label they also come with (a
+# branch is named after its ticket by default).
 debug_scrub() {
-    local text n val label h home_re
+    local text n val label h home_re pairs
+    local -A keep=()
     text=$(cat; printf x)
     text="${text%x}"
+    pairs=$(_debug_scrub_pairs | sort -t$'\t' -k1,1rn)
+    if [[ "${harness_debug_keep_keys:-0}" == 1 ]]; then
+        while IFS=$'\t' read -r n val label; do
+            [[ -n "$val" && "$label" == "[ticket]" ]] && keep["$val"]=1
+        done <<<"$pairs"
+    fi
     while IFS=$'\t' read -r n val label; do
-        [[ -n "$val" ]] && text="${text//"$val"/"$label"}"
-    done < <(_debug_scrub_pairs | sort -t$'\t' -k1,1rn)
+        [[ -n "$val" && -z "${keep[$val]:-}" ]] && text="${text//"$val"/"$label"}"
+    done <<<"$pairs"
     local roots=("$install_root")
     # shellcheck disable=SC2088  # a literal ~, as the agent may write it
     [[ -n "${HOME:-}" && "$install_root" == "$HOME/"* ]] && roots+=("~/${install_root#"$HOME/"}")
@@ -11387,6 +11418,11 @@ debug_scrub() {
 # write (a redirect, find -delete, curl -o, ...) last. A pipeline is checked
 # command by command, a redirect is part of its command's text. The mode is
 # "ask" interactively and "deny" for -p (harness_debug_print=1).
+#
+# A queue debug run with --fix also gets debug_fix_commands (its working
+# copy's repairs, each spelled out with the folder), and guards against a
+# force, a reset, an orphan branch or a config write outside the repository.
+# Its report.md (in harness_debug_dir) is the one file it may edit.
 debug_opencode_config() {
     [[ "${harness_debug:-0}" == "1" ]] || return 0
     local mode=ask
@@ -11417,6 +11453,9 @@ debug_opencode_config() {
             "$h context*" "$h usage*" "$h help*" "$h --help*" "$h mcp list*"
             "$h mcp status*" "$h net list*" "$h net status*")
     done
+    local fixes=()
+    mapfile -t fixes < <(debug_fix_commands)
+    allow+=(${fixes[@]+"${fixes[@]}"})
     local guard=(
         '*>*' 'find *-delete*' 'find *-exec*' 'find *-ok*' 'find *-fprint*'
         'find *-fls*' 'curl *-o *' 'curl *-O*' 'curl *--output*' 'curl *-X*'
@@ -11427,6 +11466,9 @@ debug_opencode_config() {
         '*.env' '*.env *' '*.env.*' '*.env/*' '*environ*' '*/.ssh/*' '*id_rsa*'
         '*id_ed25519*' '*.pem*'
     )
+    (( ${#fixes[@]} )) && guard+=('git *--force*' 'git * -f' 'git * -f *' 'git *--hard*'
+        'git *--discard-changes*' 'git *--orphan*' 'git *switch*-C*' 'git *--global*'
+        'git *--system*' 'git *--file*' 'git *--exec*')
     local bash_rules
     bash_rules=$( { printf '*\t%s\n' "$mode"
                     for p in "${allow[@]}"; do printf '%s\tallow\n' "$p"; done
@@ -11434,7 +11476,7 @@ debug_opencode_config() {
         | harness_jq -Rsc '
             split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: .[1]})
             | from_entries')
-    harness_jq -cn --arg m "$mode" --arg dir "$state_root/debug" --argjson bash "$bash_rules" '
+    harness_jq -cn --arg m "$mode" --arg dir "${harness_debug_dir:-$state_root/debug}" --argjson bash "$bash_rules" '
       {edit: {"*": $m, "report.md": "allow", "state/debug/report.md": "allow",
               ($dir + "/report.md"): "allow", "*/state/debug/report.md": "allow"},
        bash: $bash,
@@ -11444,6 +11486,25 @@ debug_opencode_config() {
       | {permission: $p,
          agent: {build: {permission: $p}, general: {permission: $p},
                  yolo: {permission: $p}}}'
+}
+
+# The repairs a queue debug run may make, as opencode patterns (one per line,
+# * the agent's to fill in), for its working copy (harness_debug_fix,
+# resolved) alone: the ones any working copy may take, then
+# (harness_debug_fix_clone=1, the queue's own clone, which holds nothing of
+# the owner's) a stash, a switch and checkout settings.
+debug_fix_commands() {
+    local w="${harness_debug_fix:-}" gd="${harness_debug_gitdir:-}"
+    [[ -n "$w" ]] || return 0
+    printf 'git -C %s %s\n' "$w" "rebase --abort" "rebase --quit" "merge --abort" \
+        "cherry-pick --abort" "revert --abort" "am --abort" "worktree prune*" \
+        "update-index --refresh*"
+    [[ -n "$gd" ]] && printf 'rm -f %s/index.lock\n' "$gd"
+    if [[ "${harness_debug_fix_clone:-0}" == 1 ]]; then
+        printf 'git -C %s %s\n' "$w" "stash push*" "stash list*" "stash show*" "switch *" \
+            "config core.longpaths true" "sparse-checkout *"
+    fi
+    return 0
 }
 
 _debug_section() { printf '\n## %s\n\n' "$1"; }
@@ -11496,8 +11557,25 @@ debug_snapshot() {
 # prints its redacted session output instead. A launch that failed (rc, $2)
 # without a report most likely never reached the model, the very thing that
 # may be broken, so the redacted snapshot is kept for the user to hand over.
+# A queue debug run's folder ($3): its report.md is redacted in place, or,
+# with none written, one saying so ends in the verdict needs-owner.
 debug_finish() {
     local print="$1" rc="${2:-0}" dir="$state_root/debug" out
+    if [[ -n "${3:-}" ]]; then
+        dir="$3"
+        if [[ -s "$dir/report.md" ]]; then
+            debug_scrub < "$dir/report.md" > "$dir/report.md.tmp" && mv -f "$dir/report.md.tmp" "$dir/report.md"
+        else
+            { printf '# harness queue debug: no report\n\n'
+              printf '**Summary:** the debug agent ended (exit %s) without writing report.md;' "$rc"
+              printf ' its output is in session.log next to this file.\n\n'
+              printf 'VERDICT: needs-owner\nHARNESS-CHANGE: no\n'; } > "$dir/report.md"
+            [[ -s "$dir/session.log" ]] && { debug_scrub < "$dir/session.log" > "$dir/session.log.tmp" \
+                && mv -f "$dir/session.log.tmp" "$dir/session.log"; }
+        fi
+        cat "$dir/report.md"
+        return 0
+    fi
     if [[ ! -s "$dir/report.md" && "$rc" != 0 && -s "$dir/snapshot.txt" ]]; then
         mkdir -p "$dir/reports"
         out="$dir/reports/$(date +%Y%m%d-%H%M%S)-snapshot.md"
@@ -11532,22 +11610,69 @@ cmd_debug() {
         host) mode=host; shift ;;
     esac
     harness_runtime_installed || mode=host
-    local args=() a print=0
-    for a in "$@"; do
-        case "$a" in
-            --yolo) err "debug: ignoring --yolo (the debug agent asks before it changes anything)" ;;
-            -p|--print) print=1; args+=("$a") ;;
-            *) args+=("$a") ;;
+    local args=() print=0 rundir="" fix=""
+    while (( $# )); do
+        case "$1" in
+            --yolo) err "debug: ignoring --yolo (the debug agent asks before it changes anything)"; shift ;;
+            -p|--print) print=1; args+=("$1"); shift
+                (( $# )) && { args+=("$1"); shift; } ;;
+            --dir|--fix)
+                (( $# >= 2 )) || { err "debug: $1 needs a folder"; return 1; }
+                if [[ "$1" == --dir ]]; then rundir="$2"; else fix="$2"; fi
+                shift 2 ;;
+            *) args+=("$1"); shift ;;
         esac
     done
     harness_debug=1
     harness_debug_print=$print
-    local dir="$state_root/debug"
+    local dir="$state_root/debug" mounts=(--mount "$install_root")
+    if [[ -n "$rundir" ]]; then
+        local runs
+        mkdir -p "$state_root/debug/runs"
+        runs=$(cd "$state_root/debug/runs" && pwd -P)
+        rundir=$(cd "$rundir" 2>/dev/null && pwd -P) || { err "debug: no folder $rundir"; return 1; }
+        [[ "$rundir" == "$runs/"* && "${rundir#"$runs/"}" != */* ]] \
+            || { err "debug: --dir must be a folder in state/debug/runs/"; return 1; }
+        dir="$rundir"
+        harness_debug_dir="$rundir"
+        harness_debug_keep_keys=1
+    elif [[ -n "$fix" ]]; then
+        err "debug: --fix is for the queue's debug runs (with --dir)"; return 1
+    fi
+    if [[ -n "$fix" ]]; then
+        local root qroot
+        root=$(cd "$install_root" && pwd -P)
+        qroot=$(cd "$state_root" && pwd -P)/queue
+        fix=$(cd "$fix" 2>/dev/null && pwd -P) || fix=""
+        if [[ -z "$fix" || "$(git -C "$fix" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]]; then
+            err "debug: --fix is not a git working copy; this run only reports"; fix=""
+        elif [[ "$fix" == "$qroot/"* ]]; then
+            harness_debug_fix_clone=1
+        elif [[ "$fix" == "$root" || "$fix" == "$root/"* || "$root" == "$fix/"* ]]; then
+            err "debug: --fix will not repair harness's own folder; this run only reports"; fix=""
+        fi
+        if [[ -n "$fix" ]]; then
+            harness_debug_fix="$fix"
+            harness_debug_gitdir=$(git -C "$fix" rev-parse --absolute-git-dir 2>/dev/null || true)
+            [[ "$fix" == "$root/"* ]] || mounts+=(--mount "$fix")
+        fi
+    fi
     mkdir -p "$dir/reports"
-    # A raw report left by a run that died before debug_finish is redacted
-    # and kept, not mixed into this run's.
-    [[ -s "$dir/report.md" ]] && debug_finish 0 >/dev/null 2>&1
-    cp "$clone_dir/scripts/debug_agent.md" "$dir/AGENTS.md"
+    if [[ -n "$rundir" ]]; then
+        { cat "$clone_dir/scripts/debug_agent.md" "$clone_dir/scripts/debug_queue.md"
+          printf '\n## This run\n\n'
+          if [[ -n "$fix" ]]; then
+              printf 'Working copy: %s\n\nThe repairs you may make, typed exactly so (a * is yours to fill in,\nnever with a force or a reset):\n\n' "$fix"
+              debug_fix_commands | sed 's/^/    /'
+          else
+              printf 'No working copy to repair: this run only reports.\n'
+          fi; } > "$dir/AGENTS.md"
+    else
+        # A raw report left by a run that died before debug_finish is redacted
+        # and kept, not mixed into this run's.
+        [[ -s "$dir/report.md" ]] && debug_finish 0 >/dev/null 2>&1
+        cp "$clone_dir/scripts/debug_agent.md" "$dir/AGENTS.md"
+    fi
     echo "[harness] debug: collecting a snapshot of this install..." >&2
     debug_snapshot "$mode" > "$dir/snapshot.txt"
     cd "$dir" || { err "cannot enter $dir"; return 1; }
@@ -11565,15 +11690,15 @@ cmd_debug() {
             ( set -e; cmd_host )
         fi
     elif (( print )); then
-        ( set -e; run_agent opencode --mount "$install_root" "${args[@]}" ) > "$dir/session.log"
+        ( set -e; run_agent opencode "${mounts[@]}" "${args[@]}" ) > "$dir/session.log"
     elif (( ${#args[@]} )); then
-        ( set -e; run_agent opencode --mount "$install_root" "${args[@]}" )
+        ( set -e; run_agent opencode "${mounts[@]}" "${args[@]}" )
     else
-        ( set -e; run_agent opencode --mount "$install_root" )
+        ( set -e; run_agent opencode "${mounts[@]}" )
     fi
     rc=$?
     set -e
-    debug_finish "$print" "$rc"
+    debug_finish "$print" "$rc" "$rundir"
     return "$rc"
 }
 

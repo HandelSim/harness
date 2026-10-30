@@ -50,6 +50,26 @@ if args and args[0] == "queue":
         os.makedirs(os.path.join(vault, ".raw", "tickets"), exist_ok=True)
         open(os.path.join(vault, ".raw", "tickets", args[2] + ".md"), "w").write(os.environ["FAKE_TICKET"])
     sys.exit(0)
+if args and args[0] == "debug":   # the debug agent on a block: FAKE_DEBUG_* say what it finds
+    a = args[2:] if args[1:2] == ["host"] else args[1:]
+    d = a[a.index("--dir") + 1]
+    fix = a[a.index("--fix") + 1] if "--fix" in a else ""
+    log.write("debug " + ("fix " + fix if fix else "report") + "\n")
+    open(os.environ["FAKE_CALLS"] + ".debugprompt", "a").write(a[-1] + "\n=====\n")
+    if os.environ.get("FAKE_DEBUG_SLEEP"):
+        import time
+        log.flush()
+        time.sleep(int(os.environ["FAKE_DEBUG_SLEEP"]))
+    if os.environ.get("FAKE_DEBUG_FIX"):      # what it repaired makes the stage pass
+        open(os.environ["FAKE_CALLS"] + ".debugged", "a").write("x")
+    if os.environ.get("FAKE_DEBUG_LEAVE") and fix:   # says fixed, leaves a rebase behind
+        os.makedirs(os.path.join(fix, ".git", os.environ["FAKE_DEBUG_LEAVE"]), exist_ok=True)
+    v = os.environ.get("FAKE_DEBUG_VERDICT", "needs-owner")
+    if v != "none":
+        open(os.path.join(d, "report.md"), "w").write(
+            "# harness issue: a test block\n\n**Summary:** found it\n\n"
+            f"VERDICT: {v}\nHARNESS-CHANGE: {os.environ.get('FAKE_DEBUG_CHANGE', 'no')}\n")
+    sys.exit(0)
 prompt = args[-1]
 assert "--ticket" in args and "-p" in args and "--yolo" in args, args
 ticket = args[args.index("--ticket") + 1]
@@ -122,7 +142,8 @@ if stage == "planning":
     else:
         open(path("Write the plan to"), "w").write(plan)
 elif stage in ("implementing", "fixing"):
-    if os.environ.get("FAKE_NO_COMMIT") or (stage == "fixing" and os.environ.get("FAKE_FIX_NOOP")):
+    if os.environ.get("FAKE_NO_COMMIT") or (stage == "fixing" and os.environ.get("FAKE_FIX_NOOP")) \
+            or (os.environ.get("FAKE_NO_COMMIT_UNTIL_DEBUG") and not os.path.exists(os.environ["FAKE_CALLS"] + ".debugged")):
         sys.exit(0)
     if stage == "fixing" and os.environ.get("FAKE_FIX_REJECT"):  # the review item is wrong
         git("commit", "-q", "--allow-empty", "-m", "ABC-1: review fixes",
@@ -667,6 +688,93 @@ class QueueTest(Base):
         # retry queues it again at the same stage.
         rc, out = self.q("retry", "ABC-1")
         self.assertEqual((self.status()["status"], self.status()["stage"]), ("queued", "implement"))
+
+    def debug_report(self, st):
+        return cat(os.path.join(os.path.dirname(self.state), "debug", "runs", st["debug"]["dir"], "report.md"))
+
+    def test_a_block_gets_one_debug_agent_and_fixed_sends_the_stage_again(self):
+        os.environ.update(FAKE_NO_COMMIT_UNTIL_DEBUG="1", FAKE_DEBUG_FIX="1", FAKE_DEBUG_VERDICT="fixed")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--debug", "1")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(len(self.calls_of("implementing")), 3)   # two attempts, blocked, one more after the fix
+        clone = os.path.join(self.state, "ABC-1", "repo")
+        self.assertEqual(self.calls_of("debug"), [f"debug fix {clone}"])
+        self.assertIn("ABC-1 at its implement stage", cat(self.calls + ".debugprompt"))
+        self.assertEqual((st["debug"]["verdict"], st["debug"]["retried"], st["debug"]["harness_change"]),
+                         ("fixed", True, False))
+        self.assertIn("VERDICT: fixed", self.debug_report(st))
+        self.assertNotIn("debugged", st)   # the stage passed: a later block gets its own look
+        self.assertIn("debug agent: fixed", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+    def test_harness_change_needed_stays_blocked_with_the_report_linked(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_VERDICT="harness-change-needed")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--debug", "1")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
+        self.assertEqual(len(self.calls_of("implementing")), 2)
+        self.assertEqual(len(self.calls_of("debug")), 1)
+        self.assertEqual((st["debug"]["verdict"], st["debug"]["harness_change"], st["debug"]["retried"]),
+                         ("harness-change-needed", True, False))
+        self.assertTrue(st["debug"]["dir"].endswith("-ABC-1"))
+        self.assertIn("a test block", self.debug_report(st))
+        # A run again takes nothing: no second look at the same block.
+        self.run_queue("--debug", "1")
+        self.assertEqual(len(self.calls_of("debug")), 1)
+        # The owner's retry is a new block's chance: it gets its own look.
+        self.q("retry", "ABC-1")
+        self.run_queue("--debug", "1")
+        self.assertEqual(self.status()["status"], "blocked")
+        self.assertEqual(len(self.calls_of("debug")), 2)
+
+    def test_a_fixed_block_that_blocks_again_gets_no_second_look(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_VERDICT="fixed")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--debug", "1")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
+        self.assertEqual(len(self.calls_of("implementing")), 4)   # 2, the fix's retry, its own second attempt
+        self.assertEqual(len(self.calls_of("debug")), 1)
+        self.assertEqual((st["debugged"], st["debug"]["verdict"], st["debug"]["retried"]), ("implement", "fixed", True))
+
+    def test_a_fixed_verdict_the_working_copy_contradicts_is_needs_owner(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_VERDICT="fixed", FAKE_DEBUG_LEAVE="rebase-merge")
+        self.add("ABC-1")
+        self.run_queue("--debug", "1")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked")
+        self.assertEqual(len(self.calls_of("implementing")), 2)
+        self.assertEqual(st["debug"]["verdict"], "needs-owner")
+        self.assertIn("a rebase is still left", st["debug"]["note"])
+
+    def test_a_debug_agent_past_its_timeout_is_stopped_and_needs_owner(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_SLEEP="60", FAKE_DEBUG_VERDICT="fixed")
+        self.add("ABC-1")
+        t0 = time.monotonic()
+        self.run_queue("--debug", "1", "--debug-timeout", "1")
+        self.assertLess(time.monotonic() - t0, 45)
+        st = self.status()
+        self.assertEqual((st["status"], st["debug"]["verdict"]), ("blocked", "needs-owner"))
+        self.assertIn("QUEUE_DEBUG_TIMEOUT", self.debug_report(st))
+        self.assertIn("VERDICT: needs-owner", self.debug_report(st))
+
+    def test_no_debug_agent_when_it_is_off(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_VERDICT="fixed")
+        self.add("ABC-1")
+        self.run_queue()
+        self.assertEqual(self.status()["status"], "blocked")
+        self.assertEqual(self.calls_of("debug"), [])
+        self.assertNotIn("debug", self.status())
+
+    def test_verdict_of_reads_the_last_verdict_line_alone(self):
+        self.assertEqual(tq.verdict_of("x\n**VERDICT:** fixed\nHARNESS-CHANGE: yes\n"), ("fixed", True))
+        self.assertEqual(tq.verdict_of("VERDICT: fixed | harness-change-needed | needs-owner\n"), ("needs-owner", False))
+        self.assertEqual(tq.verdict_of("VERDICT: fixed\nlater\nVERDICT: harness-change-needed\n"),
+                         ("harness-change-needed", True))
+        self.assertEqual(tq.verdict_of("VERDICT: done\n"), ("needs-owner", False))
+        self.assertEqual(tq.verdict_of(""), ("needs-owner", False))
 
     def test_a_made_up_quote_fails_the_change(self):
         FakeProxy.mode = "badquote"

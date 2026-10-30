@@ -65,7 +65,7 @@ clone. User config and `state/` are gitignored. `harness update` and
     ├── vaults/<name>/          vault clones (`harness vault`; registry in vaults.list)
     ├── tickets.list            each folder's ticket (`harness --ticket KEY`)
     ├── queue/                  `harness queue`: order, each ticket's state, log and clone
-    ├── debug/                  `harness debug`: its AGENTS.md, snapshot, redacted reports/
+    ├── debug/                  `harness debug`: its AGENTS.md, snapshot, redacted reports/, the queue's runs/
     └── serve/                  `harness serve` opencode web password + logs
 ```
 

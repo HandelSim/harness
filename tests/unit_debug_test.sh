@@ -17,6 +17,12 @@
 #       one removed, the agent's exit code passed on; `debug host` goes
 #       through cmd_host
 #   T6: a launch that fails before any report keeps the redacted snapshot
+#   T7: the queue's run (--dir, --fix): its own folder, AGENTS.md with
+#       debug_queue.md and the run's repairs, those allowed for that working
+#       copy alone and the force/reset guards after them, the report redacted
+#       in place with the ticket keys kept; no report is a needs-owner one;
+#       a --dir outside state/debug/runs/ is refused, a --fix outside the
+#       queue's clones in harness's own folder only reports
 #
 # Run:  bash tests/unit_debug_test.sh
 
@@ -202,5 +208,52 @@ saved=$(ls "$TMP_ROOT/state/debug/reports/"*-snapshot.md) || fail "T6: no snapsh
 [[ "$(cat "$saved")" == 'key [PROXY_API_KEY] at <harness>' ]] || fail "T6: kept snapshot — $(cat "$saved")"
 grep -q 'did not run to the end' "$TMP_ROOT/err" || fail "T6: no note — $(cat "$TMP_ROOT/err")"
 ok "T6: a failed launch keeps the redacted snapshot and says so"
+
+# --- T7: the queue's debug run -------------------------------------------------------
+run7="$TMP_ROOT/state/debug/runs/20260101-000000-WIDG-7"
+work7="$TMP_ROOT/state/queue/WIDG-7/repo"
+mkdir -p "$run7"
+git init -q "$work7"
+rc=0
+t7=$(
+    src
+    harness_runtime_installed() { return 0; }
+    debug_snapshot() { echo "mode: $1"; }
+    run_agent() {
+        printf '%s\n' "$*" > "$TMP_ROOT/launch7.args"
+        [[ "$PWD" == "$run7" ]] || echo "wrong cwd $PWD" > "$TMP_ROOT/launch7.args"
+        debug_opencode_config > "$TMP_ROOT/perm7.json"
+        printf '# x\nWIDG-7 on feature/fast-path, key sk-secretvalue123456\nVERDICT: fixed\n' > report.md
+        exit 0
+    }
+    cmd_debug --dir "$run7" --fix "$work7" -p "the block" 2>"$TMP_ROOT/err"
+) || rc=$?
+[[ $rc -eq 0 ]] || fail "T7: rc $rc — $(cat "$TMP_ROOT/err")"
+[[ "$(cat "$TMP_ROOT/launch7.args")" == "opencode --mount $TMP_ROOT -p the block" ]] \
+    || fail "T7: launch args — $(cat "$TMP_ROOT/launch7.args")"
+grep -q "the ticket queue's debug agent" "$run7/AGENTS.md" || fail "T7: no debug_queue.md in AGENTS.md"
+grep -qx "    git -C $work7 rebase --abort" "$run7/AGENTS.md" || fail "T7: the run's repairs — $(cat "$run7/AGENTS.md")"
+harness_jq -e --arg w "$work7" --arg r "$run7/report.md" '.permission as $p | ($p.bash | keys_unsorted) as $k
+    | $p.bash["git -C \($w) rebase --abort"] == "allow" and $p.bash["git -C \($w) switch *"] == "allow"
+      and $p.bash["rm -f \($w)/.git/index.lock"] == "allow" and $p.bash["git *--force*"] == "deny"
+      and $p.bash["git *--hard*"] == "deny" and ($k | index("git *--force*")) > ($k | index("git -C \($w) switch *"))
+      and $p.bash["git -C * rebase --abort"] == null and $p.edit[$r] == "allow"' "$TMP_ROOT/perm7.json" >/dev/null \
+    || fail "T7: permissions — $(cat "$TMP_ROOT/perm7.json")"
+[[ "$(cat "$run7/report.md")" == $'# x\nWIDG-7 on [branch], key [PROXY_API_KEY]\nVERDICT: fixed' ]] \
+    || fail "T7: report — $(cat "$run7/report.md")"
+[[ "$t7" == "$(cat "$run7/report.md")" ]] || fail "T7: printed — $t7"
+rm -f "$run7/report.md"
+( src; harness_runtime_installed() { return 0; }; debug_snapshot() { :; }; run_agent() { exit 2; }
+  cmd_debug --dir "$run7" -p x >/dev/null 2>&1 ) || true
+grep -qx 'VERDICT: needs-owner' "$run7/report.md" || fail "T7: no-report stub — $(cat "$run7/report.md")"
+rc=0; ( src; cmd_debug --dir "$TMP_ROOT/state" -p x >/dev/null 2>&1 ) || rc=$?
+[[ $rc -eq 1 ]] || fail "T7: a --dir outside state/debug/runs/ was taken"
+git init -q "$TMP_ROOT/state/notqueue"
+t7o=$( src; harness_runtime_installed() { return 0; }; debug_snapshot() { :; }
+       run_agent() { debug_opencode_config; exit 0; }
+       cmd_debug --dir "$run7" --fix "$TMP_ROOT/state/notqueue" -p x 2>"$TMP_ROOT/err" ) || true
+grep -q "will not repair harness's own folder" "$TMP_ROOT/err" || fail "T7: harness's folder — $(cat "$TMP_ROOT/err")"
+grep -q 'rebase --abort' <<<"$t7o" && fail "T7: repairs allowed in harness's own folder"
+ok "T7: the queue's debug run: its own folder, its working copy's repairs only, the report redacted in place"
 
 echo "[debug] all checks passed"

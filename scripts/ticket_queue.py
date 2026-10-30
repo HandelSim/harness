@@ -14,7 +14,7 @@ plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
   ticket_queue.py --state DIR run --vault V --proxy URL --harness PATH
                   [--model M] [--default-model M] [--verify-model M] [--host]
                   [--single-message] [--retries N] [--push 0|1] [--remote R]
-                  [--plan-review 0|1]
+                  [--plan-review 0|1] [--debug 0|1] [--debug-timeout S]
 Each stage is one fresh, headless agent launch through the harness CLI
 (`harness -p --yolo --ticket KEY -m MODEL PROMPT`: the firewalled container,
 or host mode) in the project folder itself, on the ticket's branch. A plan waits for
@@ -35,6 +35,9 @@ stage, uncounted, and the run waits for the upstream (QUEUE_OUTAGE_WAIT, then it
 stops); so does a launch that dies at once having started nothing (three in a
 row block the ticket). An agent with nothing new for QUEUE_IDLE_MIN is stopped
 and its work checked; a verifier that gives no verdict blocks, its work kept.
+With --debug 1 (QUEUE_DEBUG) a block gets one debug agent (harness debug --fix):
+it may repair the ticket's working copy's git state and reports to
+state/debug/runs/<time>-KEY/; its verdict fixed retries the stage once.
 
 A ticket can run a subset of the stages (--stages; fix still only after a
 review with Must fix items). Its work starts at --start (a branch, tag, commit,
@@ -94,6 +97,7 @@ from vault_ingest import InfraError, call_model, resolve_model, try_lock, yq  # 
 
 PROMPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_prompts")
 STAGE_TIMEOUT = 3 * 3600   # one agent launch; a cooperative turn alone can take 15 minutes
+DEBUG_TIMEOUT = 1200       # QUEUE_DEBUG_TIMEOUT: the debug agent's one look at a block
 VERIFY_TIMEOUT = 600
 SYNC_TIMEOUT = 600         # harness queue _sync: a session into the vault, and its commit
 SYNC_BACKOFF = 1800        # after a _sync that got no answer in SYNC_TIMEOUT, the run's next ones skip this long
@@ -1118,11 +1122,14 @@ def nested_back(q, st):
     return ""
 
 
+GIT_TROUBLE = (("rebase-merge", "a rebase"), ("rebase-apply", "a rebase or git am"),
+               ("MERGE_HEAD", "a merge"), ("CHERRY_PICK_HEAD", "a cherry-pick"), ("index.lock", "index.lock"))
+
+
 def in_place_trouble(project, branch):
     """Why the project is not fit for an in-place stage (a rebase or merge going,
     git's index.lock left, not on the ticket's branch), or ""."""
-    for name, what in (("rebase-merge", "a rebase"), ("rebase-apply", "a rebase or git am"),
-                       ("MERGE_HEAD", "a merge"), ("CHERRY_PICK_HEAD", "a cherry-pick"), ("index.lock", "index.lock")):
+    for name, what in GIT_TROUBLE:
         p = git(project, "rev-parse", "--git-path", name, check=False).stdout.strip()
         if p and os.path.exists(p if os.path.isabs(p) else os.path.join(project, p)):
             return (f"{what} is left in {project}" if name == "index.lock" else f"{what} is in progress in {project}") \
@@ -3235,6 +3242,7 @@ def advance(ctx, st, stage, reason=""):
     """On to stage; None: the ticket's stages are done (push marks done itself)."""
     record(st, "passed")
     st.pop("verify_only", None)
+    st.pop("debugged", None)   # a block of the next stage gets its own debug agent
     st.pop("session", None)   # the next stage's agent is a new one
     st.pop("resume", None)
     st.pop("continued", None)
@@ -3448,6 +3456,7 @@ def run_locked(q, a, locked_at):
     ctx = argparse.Namespace(q=q, vault=os.path.abspath(a.vault), proxy=a.proxy, harness=a.harness, host=a.host,
                              single=a.single_message, retries=a.retries, push=a.push == 1, remote=a.remote,
                              plan_review=a.plan_review == 1, stage_timeout=a.stage_timeout, child=None, key="",
+                             debug=a.debug == 1, debug_timeout=max(1, a.debug_timeout),
                              beat_lock=threading.Lock(), beating=threading.Event(), outage_wait=max(0, a.outage_wait),
                              idle_min=max(0.0, a.idle_min), watch=[w for w in a.watch if w], outage={},
                              slot=a.slot, parent=os.getppid() if a.slot else 0,
@@ -3610,14 +3619,185 @@ def overlaps(a, b):
 
 def tidy(q):
     """At the start of a run: what a run or a remove that died left behind (a
-    removed ticket's folder, the in-place exclude block of a stage cut short)."""
+    removed ticket's folder, the in-place exclude block of a stage cut short,
+    a debug agent's look that never ended)."""
     for name in os.listdir(q.root):
         if name.startswith(".trash-"):
             rmtree(os.path.join(q.root, name))
+    for key in q.order():
+        if ((q.load(key) or {}).get("debug") or {}).get("verdict") == "running":
+            with held(os.path.join(q.root, "queue.lock")):
+                st = q.load(key)
+                if st and (st.get("debug") or {}).get("verdict") == "running":
+                    st["debug"].update(verdict="needs-owner", note="the queue run ended before its debug agent did")
+                    q.save(st)
     for project in {s["project"] for s in map(q.load, q.order()) if s and s.get("in_place") and s.get("project")}:
         if os.path.isdir(project) and not any(run_holds(q, s["key"]) for s in map(q.load, q.order()) if s):
             with contextlib.suppress(RuntimeError, OSError, subprocess.SubprocessError):
                 exclude_block(project, None)
+
+
+# --- the debug agent: one look at each block ----------------------------------------
+#
+# A blocked ticket gets one headless `harness debug --dir D --fix WORKDIR` launch
+# (QUEUE_DEBUG=0: none), in the slot that blocked it, for QUEUE_DEBUG_TIMEOUT at
+# most. It may repair the ticket's working copy's git state (opencode permissions
+# in harness, debug_opencode_config) and writes D/report.md, redacted by harness,
+# ending in a VERDICT line. fixed: the stage is retried once. st["debugged"] (the
+# stage looked at) keeps a block after that retry, and any later block of the same
+# stage, from a second look until a stage passes or the owner sends the ticket on.
+
+VERDICTS = ("fixed", "harness-change-needed", "needs-owner")
+# the word alone on its line: the template's "fixed | harness-change-needed | ..." is none
+VERDICT_RE = re.compile(r"^[ \t*_`>-]*VERDICT[ \t*_`]*:[ \t*_`]*([A-Za-z-]+)[ \t\r*_`.]*$", re.M)
+HARNESS_CHANGE_RE = re.compile(r"^[ \t*_`>-]*HARNESS-CHANGE[ \t*_`]*:[ \t*_`]*([A-Za-z]+)[ \t\r*_`.]*$", re.M)
+
+
+def debug_runs_dir(q):
+    """state/debug/runs/: a folder per debug run, beside state/queue/."""
+    return os.path.join(os.path.dirname(os.path.abspath(q.root)), "debug", "runs")
+
+
+def verdict_of(text):
+    """(verdict, harness_change) from a debug report's last VERDICT and HARNESS-CHANGE
+    lines; no verdict it knows is needs-owner, and harness-change-needed is a change."""
+    got = [m.group(1).lower() for m in VERDICT_RE.finditer(text or "")]
+    verdict = got[-1] if got and got[-1] in VERDICTS else "needs-owner"
+    said = [m.group(1).lower() for m in HARNESS_CHANGE_RE.finditer(text or "")]
+    return verdict, verdict == "harness-change-needed" or (bool(said) and said[-1] == "yes")
+
+
+def debug_stub(d, why):
+    """D/report.md for a debug run that wrote none (or whose report was cut short:
+    kept unredacted, for this machine only, as report-unfinished.md)."""
+    report = os.path.join(d, "report.md")
+    if os.path.exists(report):
+        os.replace(report, os.path.join(d, "report-unfinished.md"))
+    write_atomic(report, f"# harness queue debug: no report\n\n**Summary:** {why}\n\n"
+                         "VERDICT: needs-owner\nHARNESS-CHANGE: no\n")
+
+
+def debug_block(ctx, st):
+    """A ticket just blocked: one debug agent looks at it, unless QUEUE_DEBUG is off or
+    one looked at this stage already. Never raises but for a halt or Ctrl-C: the
+    ticket stays blocked."""
+    if not getattr(ctx, "debug", False) or st.get("debugged") == st.get("stage"):
+        return
+    try:
+        debug_look(ctx, st["key"], st.get("stage", ""))
+    except (Interrupted, KeyboardInterrupt):
+        raise
+    except Exception as e:  # noqa: BLE001 - a helper: its failure leaves the block to the owner
+        ctx.q.log(st["key"], f"warning: the debug agent did not run to its end: {type(e).__name__}: {str(e)[:200]}")
+
+
+def debug_look(ctx, key, stage):
+    q, lock = ctx.q, os.path.join(ctx.q.root, "queue.lock")
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{key}"
+    d = os.path.join(debug_runs_dir(q), name)
+    with held(lock):
+        st = q.load(key)
+        if not st or st.get("status") != "blocked" or st.get("debugged") == stage:
+            return
+        st["debugged"] = stage   # first: a run that dies in the look does not look again
+        st["debug"] = {"dir": name, "stage": stage, "at": now_iso(), "verdict": "running"}
+        q.save(st)
+        stamp = st.get("requeued", "")
+        beat(ctx, ticket=key, stage=stage, step="a debug agent is looking at the block")
+    os.makedirs(d, exist_ok=True)
+    work = workdir(q, st)
+    work = work if os.path.isdir(work) else ""
+    q.log(key, f"blocked: a debug agent looks at it (state/debug/runs/{name}/)")
+    rc, why, halt = debug_launch(ctx, st, d, work)
+    if why:
+        debug_stub(d, why)
+    elif not os.path.exists(os.path.join(d, "report.md")):
+        debug_stub(d, f"harness debug ended with status {rc} and no report; its output is launch.out beside this file")
+    verdict, change = verdict_of(read(os.path.join(d, "report.md")))
+    note = ""
+    if verdict == "fixed" and work:   # what the queue can see itself must agree
+        gd = git_dir(q, st)
+        left = [what for n, what in GIT_TROUBLE if gd and os.path.exists(os.path.join(gd, n))]
+        if left:
+            verdict, note = "needs-owner", f"it said fixed, but {left[0]} is still left in the working copy"
+    with held(lock):
+        st = q.load(key)
+        if not st:
+            return
+        if verdict == "fixed" and not note:
+            if st.get("status") != "blocked" or st.get("requeued", "") != stamp:
+                note = "the owner sent the ticket on meanwhile"
+            elif plain_retry(q, st) != (None, False):
+                note = "a retry would start the work over, which is the owner's call"
+            else:
+                note = retry_refused(q, st, None, fetch=False)
+            if not note:
+                st = requeue(q, key, ("blocked",))
+                st.update(debugged=stage, reason=f"a debug agent repaired the block; {stage} goes again "
+                                                 f"(its report: state/debug/runs/{name}/report.md)")
+        st["debug"] = dict(st.get("debug") or {}, verdict=verdict, harness_change=change, ended=now_iso(),
+                           retried=st["status"] == "queued", **({"note": note} if note else {}))
+        q.save(st)
+    q.log(key, f"debug agent: {verdict}" + ("; harness should change (see the report)" if change else "")
+          + (f"; {note}" if note else "") + ("; the stage goes again" if st["status"] == "queued" else ""))
+    if halt is not None:
+        raise halt
+
+
+def debug_prompt(q, st, work):
+    key, stage = st["key"], st.get("stage", "")
+    where = (f"The ticket's working copy is {work}, " + ("the owner's own project folder, worked in place"
+                                                        if st.get("in_place") else "the ticket's own clone")
+             if work else "The ticket's working copy is not there (nothing to repair)")
+    return (f"The harness ticket queue blocked ticket {key} at its {stage} stage, saying:\n\n{st.get('reason', '')}\n\n"
+            f"{where}. Its queue state is in {q.dir(key)} (state.json, log.md, the stage outputs *.out). "
+            "Find out why it blocked, repair it if the cause is in the working copy's git state, and write "
+            "report.md ending in the VERDICT and HARNESS-CHANGE lines, as AGENTS.md says.")
+
+
+def debug_launch(ctx, st, d, work):
+    """harness debug on the block to its end: (rc, "", None), or (124, why it was cut
+    short: QUEUE_DEBUG_TIMEOUT, the owner stopping or removing the ticket, a halt, None
+    or the halt's Interrupted for the caller to raise once the look is recorded)."""
+    key = st["key"]
+    cmd = [BASH, ctx.harness, "debug"] + (["host"] if ctx.host or ctx.single else []) + ["--dir", d]
+    cmd += (["--fix", work] if work else []) + ["-p", debug_prompt(ctx.q, st, work)]
+    launch_id = f"{key}-debug-{os.getpid()}-{int(time.time() * 1000)}"
+    env = dict(os.environ, HARNESS_HOST_CONFIRM="1", HARNESS_QUEUE_LAUNCH=launch_id, GIT_EDITOR="true")
+    env.pop("HARNESS_TASK_CARD", None)
+    end = time.monotonic() + ctx.debug_timeout
+    rc, why, halt = None, "", None
+    with open(os.path.join(d, "launch.out"), "w", encoding="utf-8") as f:
+        p = spawn(cmd, cwd=d, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, env=env)
+        ctx.child = p
+        beat(ctx, agent=p.pid, launch=launch_id)
+        try:
+            while rc is None:
+                try:
+                    rc = p.wait(timeout=max(0.1, min(POLL, end - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    try:
+                        checkpoint(ctx)
+                    except Interrupted as e:
+                        halt = e if e.kind == "halt" else None
+                        why = f"the queue run was {'halted' if halt else 'asked to stop it'} while the debug agent " \
+                              "worked; it was stopped"
+                    if not why and (ctx.q.load(key) or {}).get("status") != "blocked":
+                        why = "the owner stopped or removed the ticket while the debug agent worked; it was stopped"
+                    elif not why and time.monotonic() >= end:
+                        why = (f"the debug agent ran past {ctx.debug_timeout}s (QUEUE_DEBUG_TIMEOUT) and was "
+                               "stopped before it wrote its report")
+                    if why:
+                        rc = 124
+        finally:
+            if rc is None or why:
+                stop(p)
+                if not (ctx.host or ctx.single):
+                    launch_containers_stopped(ctx.harness, d, launch_id)
+            release(p)
+            ctx.child = None
+            beat(ctx, agent=0, launch="")
+    return rc, why, halt
 
 
 def run_tickets(q, ctx):
@@ -3701,6 +3881,8 @@ def run_tickets(q, ctx):
                 drop(q.sentinel(key))
             if st.get("status") in PARKED:
                 put_away(q, st)
+                if st.get("status") == "blocked":   # fixed: queued again, so this run takes it again
+                    debug_block(ctx, st)
                 # done with it: an owner's continue, retry or remove need not wait out the vault save
                 beat(ctx, ticket="", stage="", step="")
             sync_vault(ctx, key, int(time.time() * 1000))   # the outcome, into the vault
@@ -3943,6 +4125,14 @@ def reap_stranded(q, key, harness):
 FINISHING = "the run is finishing up its last stage; try again in a few seconds"
 
 
+def finishing(st):
+    """Why a run holds a ticket that is not running: putting it away, or its debug agent."""
+    if (st.get("debug") or {}).get("verdict") == "running":
+        return (f"a debug agent is looking at its block (QUEUE_DEBUG_TIMEOUT at most); try again when it is done, "
+                f"or harness queue stop {st.get('key', '')} ends it")
+    return FINISHING
+
+
 def cmd_remove(q, a):
     rc = 0
     for raw in a.keys:
@@ -3959,7 +4149,7 @@ def cmd_remove(q, a):
             st = q.load(key) or {}
             if run_holds(q, key):   # running, or just stopped for the owner and the run still putting it away
                 print(f"[queue] {key}: " + (f"is running; stop it first (harness queue stop {key})"
-                                            if st.get("status") == "running" else FINISHING), file=sys.stderr)
+                                            if st.get("status") == "running" else finishing(st)), file=sys.stderr)
                 rc = 1
                 continue
             order = [k for k in order if k != key]
@@ -4015,7 +4205,7 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         print(f"[queue] {st['key']} is {st['status']}, not {' or '.join(want)}", file=sys.stderr)
         return None
     st.update(status="queued", attempt=0, feedback="", reason="", requeued=now_iso(), **extra)
-    for k in ("stopped_from", "blocked_failed", "no_go_on", "continued"):
+    for k in ("stopped_from", "blocked_failed", "no_go_on", "continued", "debugged"):
         st.pop(k, None)
     st.pop("resume", None)   # a cut-off stage goes on only when continued (the caller sets it again)
     for k in RESULTS:
@@ -4206,8 +4396,9 @@ def cmd_retry(q, a):
     # queued one sent back to an earlier stage; under the lock the run takes tickets under
     with held(os.path.join(q.root, "queue.lock")):
         if run_holds(q, key):
+            held_st = q.load(key) or {}
             print(f"[queue] {key}: " + (f"is running; stop it first (harness queue stop {key})"
-                                        if (q.load(key) or {}).get("status") == "running" else FINISHING),
+                                        if held_st.get("status") == "running" else finishing(held_st)),
                   file=sys.stderr)
             return 1
         st = requeue(q, key, RETRYABLE + ("running",) + (("queued", "plan-review") if a.stage else ()),
@@ -4270,8 +4461,9 @@ def cmd_continue(q, a):
     reap_stranded(q, key, getattr(a, "harness", ""))
     with held(os.path.join(q.root, "queue.lock")):
         if run_holds(q, key):
+            held_st = q.load(key) or {}
             print(f"[queue] {key}: " + (f"is running; stop it first (harness queue stop {key})"
-                                        if (q.load(key) or {}).get("status") == "running" else FINISHING),
+                                        if held_st.get("status") == "running" else finishing(held_st)),
                   file=sys.stderr)
             return 1
         st = q.load(key) or st
@@ -4732,6 +4924,8 @@ def main(argv):
     s.add_argument("--remote", default="origin")
     s.add_argument("--plan-review", type=int, default=0)
     s.add_argument("--stage-timeout", type=int, default=STAGE_TIMEOUT)
+    s.add_argument("--debug", type=int, default=0)                   # 1: a debug agent looks at each block
+    s.add_argument("--debug-timeout", type=int, default=DEBUG_TIMEOUT)
     s.add_argument("--outage-wait", type=int, default=OUTAGE_WAIT)   # seconds; 0: an outage ends the run
     s.add_argument("--idle-min", type=float, default=IDLE_MIN)       # 0: no idle watchdog
     s.add_argument("--watch", action="append", default=[])           # files the agent writes as it works
