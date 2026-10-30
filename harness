@@ -6103,6 +6103,21 @@ ticket_pull() {
     return 0
 }
 
+# A ticket of the owner's own, not in the tracker: ticket_new VAULT KEY|- TITLE
+# TEXT [QUEUE_DIR] writes VAULT/.raw/tickets/KEY.md marked source: local (KEY
+# -: the next LOCAL-N free in the vault and the queue, TICKET_LOCAL_PREFIX
+# naming LOCAL), which is never pulled, and prints the key.
+ticket_new() {
+    local py script wdir
+    py=$(host_python_bin) || { err "python 3 is needed to write a ticket"; return 1; }
+    script="$clone_dir/scripts/vault_ticket.py" wdir="$1"
+    if command -v cygpath >/dev/null 2>&1; then
+        script=$(cygpath -m "$script"); wdir=$(cygpath -m "$1")
+    fi
+    # shellcheck disable=SC2086  # $py can be 'py -3'
+    printf '%s\n' "$4" | $py "$script" --new "$wdir" "$2" "$3" ${5:+"$5"}
+}
+
 # The launch's ticket: --ticket KEY (then remembered for this folder) or the
 # one remembered. Pulls it and sets harness_ticket, which the overlay and
 # vault_sync read. Runs after vault_prepare; never fails the launch.
@@ -6534,6 +6549,16 @@ usage:
                                  from now on; same as launching with
                                  'harness --ticket <KEY>'
   harness ticket off             forget this folder's ticket
+  harness ticket new "TITLE" ["TEXT" | -] [--key KEY]
+                                 a ticket of your own, not in Jira: written
+                                 to <vault>/.raw/tickets/<KEY>.md (KEY: the
+                                 next LOCAL-N; TEXT, or - for stdin, is its
+                                 description, the title without it) and never
+                                 pulled from the tracker. Use it like any
+                                 key: harness --ticket KEY, harness queue add
+                                 KEY. Edit the file to change it; an
+                                 "Acceptance criteria:" line with bullets in
+                                 TEXT gives the queue its criteria
   harness ticket pull [<KEY>]    pull the ticket from the tracker now and
                                  commit the copy to the vault
   harness ticket login           set the Jira URL (in the vault charter, shared
@@ -6602,6 +6627,28 @@ HELP
             harness_vault_dir=$(vault_prepare)
             [[ -n "$harness_vault_dir" ]] || { err "no active vault to pull into (see: harness vault)"; return 1; }
             ticket_pull "$harness_vault_dir" "$key"
+            harness_ticket="$key"
+            vault_sync "$harness_vault_dir" 0 "" "$here"
+            ;;
+        new)
+            local title="" text="" nkey="-" a
+            while (( $# )); do
+                a="$1"; shift
+                case "$a" in
+                    --key) [[ -n "${1:-}" ]] || { err "--key needs a value"; return 1; }
+                        nkey=$(_ticket_key "$1") || { err "'$1' is not a ticket key like ABC-123"; return 1; }; shift ;;
+                    -) text=$(cat) ;;
+                    -?*) err "unknown option '$a' (see: harness ticket --help)"; return 1 ;;
+                    *) if [[ -z "$title" ]]; then title="$a"; elif [[ -z "$text" ]]; then text="$a"
+                       else err "usage: harness ticket new \"TITLE\" [\"TEXT\" | -] [--key KEY]"; return 1; fi ;;
+                esac
+            done
+            [[ -n "${title//[[:space:]]/}" ]] || { err "usage: harness ticket new \"TITLE\" [\"TEXT\" | -] [--key KEY]"; return 1; }
+            harness_vault_dir=$(vault_prepare)
+            [[ -n "$harness_vault_dir" ]] || { err "no active vault to write the ticket into (see: harness vault)"; return 1; }
+            key=$(ticket_new "$harness_vault_dir" "$nkey" "$title" "$text") || return 1
+            echo "ticket $key (your own, not in the tracker): $harness_vault_dir/.raw/tickets/$key.md"
+            echo "  work on it: harness --ticket $key, or queue it: harness queue add $key"
             harness_ticket="$key"
             vault_sync "$harness_vault_dir" 0 "" "$here"
             ;;
@@ -6979,12 +7026,16 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                 [--start REF|here] [--branch NAME | --no-branch]
                                 [--repo-branch REL[=BRANCH][:TARGET]]...
                                 [--allow-branch] [--no-plan-approval]
-                                [--take-defaults] [--note TEXT]
+                                [--take-defaults] [--note TEXT] [--new TEXT]...
                                             queue tickets for the git project here
                                             (or PROJECT); see "Where the agents
                                             work" and "Where the work starts and
                                             ends" below; --stages runs only some
-                                            stages (e.g. review,fix,push)
+                                            stages (e.g. review,fix,push); --new
+                                            TEXT queues work with no ticket in the
+                                            tracker: a ticket of your own, LOCAL-N
+                                            in the vault, is made for it (harness
+                                            ticket new makes one to queue later)
        harness queue run [--host] [--single-message] [--parallel N]
                                             work through the queue, one ticket at a time
                                             (--parallel N, or QUEUE_PARALLEL: N at a
@@ -7235,7 +7286,7 @@ HELP
         list|ls) args+=(list) ;;
         add)
             local dir="" base="" a
-            local -a keys=() opts=()
+            local -a keys=() opts=() news=() made=()
             while (( $# )); do
                 a="$1"; shift
                 case "$a" in
@@ -7243,16 +7294,39 @@ HELP
                         if [[ "$a" == --dir ]]; then dir="$1"; else base="$1"; fi; shift ;;
                     --stages|--ref|--note|--start|--branch|--repo-branch) (( $# )) || { err "$a needs a value"; return 1; }
                         opts+=("$a" "$1"); shift ;;
+                    --new) [[ -n "${1//[[:space:]]/}" ]] || { err "--new needs the work to do, e.g. --new \"fix the flaky login test\""; return 1; }
+                        news+=("$1"); shift ;;
                     --in-place|--clone|--no-branch|--review-plan|--no-plan-approval|--take-defaults|--allow-branch) opts+=("$a") ;;
                     -*) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                     *) keys+=("$a") ;;
                 esac
             done
-            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch] [--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval [--take-defaults]] [--note TEXT]"; return 1; }
+            # --new TEXT: a ticket of your own (not in the tracker) made for it,
+            # titled by TEXT's first line; taken out again if it is not queued
+            if (( ${#news[@]} )); then
+                [[ -n "$vault" && -d "$vault" ]] || { err "--new writes the ticket into the active vault, and there is none (harness vault new <name>, or harness vault use <name>)"; return 1; }
+                local t k
+                for t in "${news[@]}"; do
+                    k=$(ticket_new "$vault" - "$(printf '%s\n' "$t" | sed -n '/[^[:space:]]/{p;q;}')" "$t" "$qdir") || {
+                        for k in ${made[@]+"${made[@]}"}; do rm -f "$vault/.raw/tickets/$k.md"; done
+                        return 1; }
+                    keys+=("$k"); made+=("$k")
+                done
+            fi
+            (( ${#keys[@]} )) || { err "usage: harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch] [--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval [--take-defaults]] [--note TEXT] [--new TEXT]..."; return 1; }
             args+=(add "${keys[@]}" ${opts[@]+"${opts[@]}"})
             [[ -n "$vault" ]] || echo "harness: note: no active vault, and harness queue run needs one to work the tickets (harness vault new <name>, or harness vault use <name>)" >&2
             [[ -n "$dir" ]] && args+=(--project "$(harness_abs_path "$dir")")
-            [[ -n "$base" ]] && args+=(--base "$base") ;;
+            [[ -n "$base" ]] && args+=(--base "$base")
+            if (( ${#made[@]} )); then
+                local rc=0
+                # shellcheck disable=SC2086  # $py can be 'py -3'
+                PYTHONUTF8=1 $py "$script" "${args[@]}" || rc=$?
+                for k in "${made[@]}"; do
+                    [[ -f "$qdir/$k/state.json" ]] || rm -f "$vault/.raw/tickets/$k.md"
+                done
+                return "$rc"
+            fi ;;
         # remove, stop, retry and continue end the agent (and container) of a ticket no run holds
         remove|rm) (( $# )) || { err "usage: harness queue remove KEY..."; return 1; }
             args+=(remove "$@" --harness "$clone_dir/harness") ;;

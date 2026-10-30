@@ -690,6 +690,23 @@ starts (after `ticket_prepare` has used it), and `agent_common_env` passes
 the container an allowlist that does not include it: the agent and its
 shell commands never have it in their environment.
 
+A ticket of the owner's own, with nothing in the tracker: `harness ticket new
+"TITLE" ["TEXT" | -] [--key KEY]` (`ticket_new`, then `vault_ticket.py --new
+<vault> <KEY|-> <title> [<queue dir>]`, description on stdin) writes
+`.raw/tickets/KEY.md` with `source: local` in its front matter, a label saying
+it is the owner's own description of the work, `## Description`, and the state
+note; it is committed by `vault_sync`. KEY defaults to the next `LOCAL-N` free
+in the vault and as a folder in `state/queue` (`TICKET_LOCAL_PREFIX` names
+another prefix); an existing copy is refused. A copy marked `source: local` is
+never fetched (the pull prints `[your own ticket, not in the tracker]`), so a
+tracker issue with the same key cannot overwrite it, and everything that reads
+a ticket's copy (`--ticket`, the context files, the queue's `_pull` and
+`ticket_criteria`) works on it unchanged. Edit the file to change the work.
+`harness queue add --new "TEXT"` (repeatable) makes one per TEXT, titled by its
+first line, and queues it with the other keys; a minted ticket whose add
+failed (no `state/queue/KEY/state.json`) is deleted again, and the vault is
+committed by the run's sync.
+
 `harness_context_files <home>` lists the instruction files a launch gives
 the model, in opencode's order: the global file
 (`<home>/.config/opencode/AGENTS.md`, else `<home>/.claude/CLAUDE.md`), the
@@ -726,7 +743,7 @@ the hub in Obsidian.
 tickets with no one at the keyboard, one at a time unless `run --parallel N`
 (or `QUEUE_PARALLEL=N` in `.env`) asks for N at a time. `add KEY... [--dir]
 [--base] [--stages LIST] [--start REF|here] [--branch NAME [--allow-branch] | --no-branch]
-[--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval [--take-defaults]] [--note TEXT]` records the project and base (default: its current branch);
+[--repo-branch REL[=BRANCH][:TARGET]]... [--no-plan-approval [--take-defaults]] [--note TEXT] [--new TEXT]...` (`--new`: see "Tickets and context") records the project and base (default: its current branch);
 a ticket works in the project folder (in place) and its plan waits
 for approval (`plan_review`); `--no-plan-approval` opts out, and
 `--take-defaults` (`take_defaults`) also goes on past blocking questions,
