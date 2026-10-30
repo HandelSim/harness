@@ -233,11 +233,11 @@ t7=$(
     || fail "T7: launch args — $(cat "$TMP_ROOT/launch7.args")"
 grep -q "the ticket queue's debug agent" "$run7/AGENTS.md" || fail "T7: no debug_queue.md in AGENTS.md"
 grep -qx "    git -C $work7 rebase --abort" "$run7/AGENTS.md" || fail "T7: the run's repairs — $(cat "$run7/AGENTS.md")"
-harness_jq -e --arg w "$work7" --arg r "$run7/report.md" '.permission as $p | ($p.bash | keys_unsorted) as $k
+( src; harness_jq -e --arg w "$work7" --arg r "$run7/report.md" '.permission as $p | ($p.bash | keys_unsorted) as $k
     | $p.bash["git -C \($w) rebase --abort"] == "allow" and $p.bash["git -C \($w) switch *"] == "allow"
       and $p.bash["rm -f \($w)/.git/index.lock"] == "allow" and $p.bash["git *--force*"] == "deny"
       and $p.bash["git *--hard*"] == "deny" and ($k | index("git *--force*")) > ($k | index("git -C \($w) switch *"))
-      and $p.bash["git -C * rebase --abort"] == null and $p.edit[$r] == "allow"' "$TMP_ROOT/perm7.json" >/dev/null \
+      and $p.bash["git -C * rebase --abort"] == null and $p.edit[$r] == "allow"' "$TMP_ROOT/perm7.json" >/dev/null ) \
     || fail "T7: permissions — $(cat "$TMP_ROOT/perm7.json")"
 [[ "$(cat "$run7/report.md")" == $'# x\nWIDG-7 on [branch], key [PROXY_API_KEY]\nVERDICT: fixed' ]] \
     || fail "T7: report — $(cat "$run7/report.md")"

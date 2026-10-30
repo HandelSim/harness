@@ -282,6 +282,51 @@ class RunsTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-12/plan-1.out")
         self.assertEqual(body, "the plan\n")
 
+    def test_debug_reports(self):
+        """The queue's debug agent: its report on the ticket page (from state.json's
+        debug), the list of every report newest first, one report's page."""
+        top = os.path.join(os.path.dirname(self.queue), "debug")
+        for name, text, age in (("20261030-120000-ABC-12", "**Cause:** a <stuck> rebase\n\n"
+                                 "VERDICT: harness-change-needed\nHARNESS-CHANGE: yes\n", 10),
+                                ("20261029-120000-ABC-12", "VERDICT: fixed\nHARNESS-CHANGE: no\n", 900)):
+            os.makedirs(os.path.join(top, "runs", name))
+            path = os.path.join(top, "runs", name, "report.md")
+            with open(path, "w") as f:
+                f.write(text)
+            os.utime(path, (time.time() - age, time.time() - age))
+        os.makedirs(os.path.join(top, "reports"))
+        with open(os.path.join(top, "reports", "20261028-report.md"), "w") as f:
+            f.write("a hand-run look\n")
+        self.ticket(status="blocked", stage="implementing", reason="the rebase stopped",
+                    debug={"dir": "20261030-120000-ABC-12", "stage": "implementing", "verdict": "harness-change-needed",
+                           "harness_change": True, "retried": False, "secret": "x"})
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Debug agent (implementing block)", body)
+        self.assertIn("harness should change", body)
+        self.assertIn("a &lt;stuck&gt; rebase", body)
+        self.assertIn("/runs/debug/runs/20261030-120000-ABC-12", body)
+        r, body = self.req("GET", "/runs/debug")
+        self.assertEqual(r.status, 200)
+        newest, older = body.find("20261030-120000-ABC-12"), body.find("20261029-120000-ABC-12")
+        self.assertTrue(0 <= newest < older, "newest first")
+        self.assertIn("20261028-report.md", body)
+        r, body = self.req("GET", "/runs/debug/runs/20261030-120000-ABC-12")
+        self.assertEqual(r.status, 200)
+        self.assertIn("a &lt;stuck&gt; rebase", body)
+        r, body = self.req("GET", "/runs/debug/reports/20261028-report.md")
+        self.assertIn("a hand-run look", body)
+        for path in ("/runs/debug/runs/..", "/runs/debug/runs/nope", "/runs/debug/reports/x.txt",
+                     "/runs/debug/runs/..%2f..%2fqueue", "/runs/debug/other/20261030-120000-ABC-12"):
+            r, _ = self.req("GET", path)
+            self.assertEqual(r.status, 404, path)
+        # a bad debug in state.json: no panel, the page still up
+        self.ticket(status="blocked", debug={"dir": "../../etc", "verdict": 3})
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(r.status, 200)
+        self.assertNotIn("Debug agent (", body)
+
     def test_queue_panel_says_what_each_ticket_waits_on(self):
         self.ticket()
         self.start()

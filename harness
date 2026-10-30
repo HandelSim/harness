@@ -11494,16 +11494,14 @@ debug_opencode_config() {
 # (harness_debug_fix_clone=1, the queue's own clone, which holds nothing of
 # the owner's) a stash, a switch and checkout settings.
 debug_fix_commands() {
-    local w="${harness_debug_fix:-}" gd="${harness_debug_gitdir:-}"
+    local w="${harness_debug_fix:-}" gd="${harness_debug_gitdir:-}" c cmds
     [[ -n "$w" ]] || return 0
-    printf 'git -C %s %s\n' "$w" "rebase --abort" "rebase --quit" "merge --abort" \
-        "cherry-pick --abort" "revert --abort" "am --abort" "worktree prune*" \
-        "update-index --refresh*"
+    cmds=("rebase --abort" "rebase --quit" "merge --abort" "cherry-pick --abort" "revert --abort"
+          "am --abort" "worktree prune*" "update-index --refresh*")
+    [[ "${harness_debug_fix_clone:-0}" == 1 ]] && cmds+=("stash push*" "stash list*" "stash show*"
+        "switch *" "config core.longpaths true" "sparse-checkout *")
+    for c in "${cmds[@]}"; do printf 'git -C %s %s\n' "$w" "$c"; done
     [[ -n "$gd" ]] && printf 'rm -f %s/index.lock\n' "$gd"
-    if [[ "${harness_debug_fix_clone:-0}" == 1 ]]; then
-        printf 'git -C %s %s\n' "$w" "stash push*" "stash list*" "stash show*" "switch *" \
-            "config core.longpaths true" "sparse-checkout *"
-    fi
     return 0
 }
 

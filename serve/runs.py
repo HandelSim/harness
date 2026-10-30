@@ -801,6 +801,11 @@ class Runs:
         sig = st.get("plan_sig")
         out["plan_sig"] = sig if isinstance(sig, str) and re.match(r"^[0-9a-f]{4,64}$", sig) else ""
         out["take_defaults"] = st.get("take_defaults") is True
+        dbg = st.get("debug")   # the debug agent's look at the last block
+        out["debug"] = (dict({k: dbg[k] for k in ("dir", "stage", "at", "verdict", "ended", "note")
+                              if isinstance(dbg.get(k), str)},
+                             harness_change=dbg.get("harness_change") is True, retried=dbg.get("retried") is True)
+                        if isinstance(dbg, dict) else {})
         hist = st.get("history")
         out["history"] = [{"at": str(h.get("at", "")), "stage": str(h.get("stage", "")),
                            "attempt": h["attempt"] if isinstance(h.get("attempt"), int) else 0,
