@@ -444,6 +444,21 @@ harness_docker compose --project-name "${PROJECT_NAME}" \
 
 echo "[pipeline] T5 OK"
 
+# Both images are now pre-built. From here on every `harness` launch runs
+# with HARNESS_NO_BUILD=1, matching integration_test.sh and the documented
+# CI contract ("CI pre-builds its images", see ensure_agent_image in the
+# harness script). Without it, each launch hits ensure_agent_image's
+# rebuild-on-source-change branch: T5 builds the agent image via
+# `compose build`, which never writes the state/agent-image.src stamp, so
+# every subsequent `harness -p` sees the stamp as stale and runs a full
+# `compose --profile agent build agent`. On a cache-cold runner that rebuild
+# (apt-get from scratch) overruns the 60s per-launch timeout below, timing
+# out T9/T10/T15 (exit 124) even though the agent round-trip itself succeeds.
+# ensure_agent_image still builds a genuinely missing image regardless of
+# this flag, so pre-built-image launches skip the rebuild and nothing else
+# changes.
+export HARNESS_NO_BUILD=1
+
 # --- T6: bring up mock upstream sidecar ------------------------------------
 #
 # We need the mock listening as `mockupstream` on the harness-net network so
