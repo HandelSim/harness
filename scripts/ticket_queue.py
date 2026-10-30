@@ -3768,7 +3768,7 @@ def debug_launch(ctx, st, d, work):
     key = st["key"]
     cmd = [BASH, ctx.harness, "debug"] + (["host"] if ctx.host or ctx.single else []) + ["--dir", d]
     cmd += ["--fix", work] if work else []
-    cmd += ["--fix-branch", st["branch"]] if work and not st.get("in_place") and st.get("branch") else []
+    cmd += ["--fix-branch", branch_of(st)] if work and not st.get("in_place") else []
     cmd += ["-p", debug_prompt(ctx.q, st, work)]
     launch_id = f"{key}-debug-{os.getpid()}-{int(time.time() * 1000)}"
     env = dict(os.environ, HARNESS_HOST_CONFIRM="1", HARNESS_QUEUE_LAUNCH=launch_id, GIT_EDITOR="true")

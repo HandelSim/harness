@@ -760,6 +760,7 @@ class QueueTest(Base):
         st = self.status()
         self.assertEqual((st["status"], st["debug"]["verdict"]), ("blocked", "needs-owner"))
         self.assertIn("QUEUE_DEBUG_TIMEOUT", self.debug_report(st))
+        self.assertNotIn("agent", st)
         self.assertIn("VERDICT: needs-owner", self.debug_report(st))
 
     def test_no_debug_agent_when_it_is_off(self):
