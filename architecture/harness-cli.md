@@ -896,18 +896,29 @@ launched; with a message the agent goes on in its session first.
 The session id comes from the `[harness] session: ses_...` line
 `agents/live-run.sh` prints on stderr, recorded in `state.json` `session`
 while the agent runs (so a killed run leaves it) and dropped when the stage
-passes or a new agent starts it. With no session known, one of the other
+passes. A new agent's launch first writes a `session` with no `id` (stage,
+attempt, `started`: a cut-off agent's whose work it finishes, else its own),
+so a run that dies before the id is known still shows this attempt's agent
+was launched. With no session known, one of the other
 mode's (container vs host stores), or a resumed launch that dies at once
 (`LaunchFailed`), a new agent gets the full prompt plus a `GOING_ON` block
 telling it to finish the work there. A halt, Ctrl-C, an upstream outage or a
 run that died with the agent working sets `resume` itself (`go_on_later`), so
-the next run goes on in the session without being asked. So does an agent
+the next run goes on in the session without being asked: only when `session`
+is this stage's and attempt's (an agent was launched; none was, say, for a
+stage `advance` just moved to) and no `resume` for the stage is already
+waiting (fail's is kept). So does an agent
 that stopped on an error (`crash_of`: the `[harness] opencode error: ...`
 line live-run.sh prints, or a failing launch status, a compaction that went
 wrong say): `fail` sends the stage on in its session once per attempt
 (`go_on_after_crash`, `session.crashed`, history result `crashed`, no attempt
 counted); a second stop fails the attempt and the next one is a new agent
-with the `GOING_ON` block), `stop KEY` (a waiting
+with the `GOING_ON` block, its `resume.started` the cut-off session's so the
+notes it wrote still count). An agent that ended on its own and failed its
+check goes on in its session too (`fail`: `resume.failed`, the
+`continue-failed` prompt with the problems; the session moves to the new
+attempt and loses `crashed`), not a new agent doing the stage over from its
+start), `stop KEY` (a waiting
 ticket becomes `stopped`; a running one the run has in hand gets the
 `KEY/stop` sentinel, which the runner also checks right before the push;
 "in hand" is `run_holds`: a fresh beat, run.json naming it (the run writes
@@ -1086,11 +1097,15 @@ blocks the ticket the third time in a row. An agent with nothing new (its
 output, the `--watch` session databases, the ticket's notes, the folder's
 index and HEAD reflog, its newest file) for `--idle-min` (`QUEUE_IDLE_MIN`,
 20) is stopped: with the upstream down that is an outage, else its work is
-checked as it is ("made no progress"). The agent's result is saved as
+checked as it is ("made no progress"). A gap of over `ASLEEP` (120 s)
+between two looks is the machine sleeping (Windows' clock counts it): it
+moves the stage timeout and the idle watch on, so waking does not stop the
+agent. The agent's result is saved as
 `verify_only` before any check, so a verifier that hangs (`VERIFY_TIMEOUT`,
 600 s), gives no JSON twice (`VerifierBroke`), or a run killed mid-check
-never launches it again: a verifier failure blocks with "verifier failed at
-STAGE ... retry KEY", and a plain retry checks the kept work again (at the
+never launches it again (an outage found by `fail` keeps it too when the
+agent ended on its own, status 0 and no `crash_of` error): a verifier
+failure blocks with "verifier failed at STAGE ... retry KEY", and a plain retry checks the kept work again (at the
 plan stage too). A change's verdict needs `met: true` for each criterion. A
 stage that runs past `--stage-timeout` (`QUEUE_STAGE_TIMEOUT`, 3 h) is
 stopped and its work checked as it is, like an idle one; a failed check is
@@ -1112,8 +1127,9 @@ else `needs-owner`) is kept in `state.json` `debug {dir, stage, at, verdict,
 harness_change, ended, retried, note}`. `fixed` requeues the stage once,
 only after the queue checks it itself: no rebase, merge, cherry-pick or
 `index.lock` left (`GIT_TROUBLE`), the owner did not send the ticket on
-meanwhile, `plain_retry` stays at the stage (a fresh start is the owner's
-call), `retry_refused` is empty. No loop: `debugged = STAGE` is set before
+meanwhile, `plain_retry` stays at the stage and `starts_over` is false
+unless the plan's result is kept (a fresh start, a plan made again, is the
+owner's call), `retry_refused` is empty. No loop: `debugged = STAGE` is set before
 the launch and cleared only when a stage passes (`advance`) or by the
 owner's own requeue; a stub report (`debug_stub`, needs-owner) covers a
 timeout, a stop or no report; `tidy` marks a look a dead run left
@@ -2521,7 +2537,10 @@ estimate); `MemProber.mchat` raises `OverBudget` before a request that would
 pass `--budget` (default 500k credits), which ends only that section; and a
 429 that names the daily credit quota (or a retry-after over an hour) raises
 `QuotaExhausted`, which stops every suite at once and prints the findings so
-far, rc 3. The log adds a layout line
+far, rc 3. In every suite `Prober.chat` resends a request that was never sent
+(DNS, connection refused, no network) after 30/60/120/240 s before it counts
+toward the network-failure abort, and an unexpected exception prints one
+redacted line and the findings so far, rc 1. The log adds a layout line
 per request (role, chars and planted labels per message, wire bytes) and the
 reply, thinking trace and usage, capped at 20k chars; session ids appear
 only as a short hash, and pass-back fields (`session`, `session_id`,
@@ -2558,7 +2577,8 @@ Requests are independent and run `--parallel` (default 2) on threads, paced by
 `Pacer` to `--tpm` estimated tokens (chars/3) per 60 s; a 429 is waited out
 for its `retry_after_seconds` and retried (up to 6), a 5xx or connection
 error once; a timeout is not resent. Failures are counted as errors and left
-out of the quality stats; a size that fails 3 requests in a row is skipped for
+out of the quality stats; a size that fails 3 requests in a row (a 429 not
+counted) is skipped for
 the rest of the run, and the run aborts only after 10 consecutive non-timeout
 network failures. The verdict
 prints per-format and per-size tables with 95% intervals (normal for means,

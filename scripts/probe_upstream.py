@@ -671,6 +671,20 @@ def filler(n_chars, needle=None, seed=0):
 # --------------------------------------------------------------------------
 
 
+# A request that failed before it was sent (DNS, connection refused, no
+# network) is resent after each of these waits before it counts toward the
+# network-failure abort, so a short drop or a laptop sleep does not end the
+# run. A timeout or a reset may already be billed and is never resent here.
+NET_RETRY_WAITS = (30, 60, 120, 240)
+_PRESEND_ERR = re.compile(r"name or service not known|nodename nor servname|getaddrinfo|name resolution|gaierror"
+                          r"|connection refused|actively refused|network is unreachable|no route to host", re.I)
+_sleep = time.sleep  # tests replace it
+
+
+def _not_sent(r):
+    return r.status is None and "while reading" not in r.error and bool(_PRESEND_ERR.search(r.error))
+
+
 class QuotaExhausted(SystemExit):
     """The key's credit quota is used up: every further request would fail
     the same way, so the run stops and reports what it has."""
@@ -746,6 +760,12 @@ class Prober:
             body["stream"] = True
         body.update(kw)
         r = self.c.request("/v1/chat/completions", body=body, stream=stream, timeout=timeout, label=label)
+        for wait in NET_RETRY_WAITS:
+            if not _not_sent(r):
+                break
+            self.p("     %s: not sent (%s); resending in %ds" % (label, self.red(r.error)[:120], wait))
+            _sleep(wait)
+            r = self.c.request("/v1/chat/completions", body=body, stream=stream, timeout=timeout, label=label)
         if r.status is None:
             self.consec_net_fail += 1
             if self.consec_net_fail >= self.net_fail_max:
@@ -808,12 +828,14 @@ class Prober:
 
     def repeat(self, fn):
         n = max(1, self.a.repeat)
-        oks = 0
+        oks = errs = 0
         last = None
         for _ in range(n):
             ok, last = fn()
             oks += 1 if ok else 0
-        verdict = "PASS" if oks == n else ("FAIL" if oks == 0 else "PART")
+            errs += 1 if last is not None and not last.ok else 0
+        # Every try a request error: that says nothing about the behavior.
+        verdict = "PASS" if oks == n else ("ERR" if errs == n else "FAIL" if oks == 0 else "PART")
         return verdict, "%d/%d" % (oks, n), last
 
     # ------------------------------------------------------------------
@@ -980,7 +1002,8 @@ class Prober:
 
         r = self.chat([{"role": "user", "content": "Session facts: the secret codeword for this session is ZEBRA-7731.\n\nWhat is the secret codeword for this session? Reply with just the codeword, or NONE."}],
                       "B03 control")
-        self.rec("B03", "control: same fact in a user message", "PASS" if r.ok and "ZEBRA-7731" in r.content.upper() else "FAIL", "", r, r.content)
+        self.rec("B03", "control: same fact in a user message", "PASS" if r.ok and "ZEBRA-7731" in r.content.upper() else ("ERR" if not r.ok else "FAIL"),
+                 "" if r.ok else self.fail_note(r), r, r.content)
 
         r = self.chat([{"role": "developer", "content": "Session facts: the secret codeword for this session is OTTER-4410."},
                        {"role": "user", "content": "What is the secret codeword for this session? Reply with just the codeword, or NONE."}],
@@ -2140,6 +2163,15 @@ class MemProber(Prober):
                          {"role": "user", "content": self.final(ctrl)}]
                 m = self.mchat(msgs, "M6 mid pad=%s #%d" % (_kfmt(p), i + 1), [("before", a), ("after", b), ("ctrl", ctrl)],
                                timeout=max(self.a.timeout, 300))
+                st = m.r.status
+                if st == 429 or (st or 0) >= 500 or (st is None and "timed out" not in m.r.error.lower()):
+                    # A rate limit, a gateway error or a dropped connection is
+                    # not this size failing: resend once before recording it.
+                    # (A timeout is a result for the size, as in single.)
+                    self.p("     (%s; resending once)" % self.fail_note(m.r))
+                    _sleep(20 * self.a.delay_scale)
+                    m = self.mchat(msgs, "M6 mid pad=%s #%d resend" % (_kfmt(p), i + 1),
+                                   [("before", a), ("after", b), ("ctrl", ctrl)], timeout=max(self.a.timeout, 300))
                 self.mrec("M6a", "pad %s (%s) in a middle turn (before,after) #%d" % (_kfmt(p), tok, i + 1), m,
                           ["before", "after"])
                 self.sample("6", "mid %d" % p, m, ["before", "after"], "multi", pad=p)
@@ -3046,7 +3078,8 @@ class SingleProber(Prober):
         with self.lock:
             self.samples.append(s)
             z = job["size"]
-            self.size_fail[z] = 0 if s["ok"] else self.size_fail.get(z, 0) + 1
+            # A 429 that outlasted send()'s retries is rate limiting, not the size.
+            self.size_fail[z] = 0 if s["ok"] else self.size_fail.get(z, 0) + (r.status != 429)
             newly_dead = self.size_fail[z] >= 3 and z not in self.dead_sizes
             if newly_dead:
                 self.dead_sizes.add(z)
@@ -5416,6 +5449,16 @@ def main():
         except Exception:
             pass
         rc = 130
+    except Exception as e:
+        # A bug or an unforeseen reply: one redacted line and the findings
+        # so far, not a traceback (which, on the docker path, lands in the log).
+        out(red("probe error: %s: %s" % (type(e).__name__, " ".join(str(e).split())))[:300])
+        out("findings so far:")
+        try:
+            prober.summary(0)
+        except Exception:
+            pass
+        rc = 1
     finally:
         if log_fh:
             out("full redacted request log: %s" % (a.log_display or "(written)"))

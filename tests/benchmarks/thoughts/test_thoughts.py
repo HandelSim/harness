@@ -58,6 +58,13 @@ class DayBudget(unittest.TestCase):
         with self.assertRaises(SystemExit):
             run.main(["--dry-run", "--day-budget", "1000000", "--trial-token-cap", "600000"])
 
+    def test_spent_today_spans_invocations(self):
+        now = 1_000_000.0
+        rows = [{"tokens": 100, "ts": now - 60}, {"tokens": 20, "ts": now - 86400 + 5},  # today
+                {"tokens": 4000, "ts": now - 86400 - 5}, {"tokens": 7000}]  # older; no ts counts as older
+        self.assertEqual(run.spent_today(rows, now), 120)
+        self.assertEqual(run.spent_today([{"infra": "lost", "tokens": 9, "ts": time.time()}]), 9)
+
 
 class LocalPlan(unittest.TestCase):
     def test_balanced(self):
@@ -279,6 +286,57 @@ class ResumeReport(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+    def test_torn_row_is_skipped_and_cannot_swallow_the_next(self):
+        d = tempfile.mkdtemp()
+        try:
+            res = os.path.join(d, "results.jsonl")
+            run.append_row(res, fake_row(0))
+            with open(res, "a") as f:
+                f.write('{"pair": 1, "arm": "sl')  # power loss mid-append
+            with open(os.path.join(d, "inflight.json"), "w") as f:
+                json.dump({"pair": 1, "task": "t", "arm": "slim", "tokens": 77}, f)
+            with redirect_stdout(io.StringIO()):
+                run.account_lost_inflight(d, res)
+                r = run.read_results(res)
+            self.assertEqual([(x["pair"], x.get("infra")) for x in r], [(0, ""), (1, "lost")])
+            self.assertEqual(r[1]["tokens"], 77)
+            self.assertIn("ts", r[1])
+        finally:
+            shutil.rmtree(d)
+
+    def test_resume_takes_settings_from_meta(self):
+        d = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(d, "meta.json"), "w") as f:
+                json.dump({"suite": "local", "budget": 1_000_000, "trial_token_cap": 200_000, "timeout_s": 300,
+                           "repeats": 1, "day_budget": 0}, f)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(run.main(["--resume", d, "--dry-run"]), 0)
+            out = buf.getvalue()
+            self.assertIn("budget 1,000,000 tokens; per-trial cap 200,000; timeout 300s", out)
+            self.assertEqual(len([ln for ln in out.splitlines() if "slim-thoughts" in ln or "thoughts-slim" in ln]), 6)
+            buf = io.StringIO()
+            with redirect_stdout(buf):  # a flag given again wins
+                run.main(["--resume", d, "--dry-run", "--budget", "2000000"])
+            self.assertIn("budget 2,000,000 tokens; per-trial cap 200,000", buf.getvalue())
+            with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                run.main(["--resume", d, "--dry-run", "--suite", "swe"])
+        finally:
+            shutil.rmtree(d)
+
+    def test_inflight_write_is_atomic(self):
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "inflight.json")
+            run.write_json_atomic(p, {"tokens": 1})
+            with self.assertRaises(TypeError):
+                run.write_json_atomic(p, {"tokens": object()})  # dies mid-write
+            with open(p) as f:
+                self.assertEqual(json.load(f), {"tokens": 1})  # the old file, whole
+        finally:
+            shutil.rmtree(d)
+
     def test_report_cli(self):
         d = tempfile.mkdtemp()
         try:
@@ -308,6 +366,50 @@ class ResumeReport(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+
+
+class Lock(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.lock = os.path.join(self.d, "root", "run.lock")
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def test_one_run_at_a_time(self):
+        run.take_lock(self.lock)
+        with open(self.lock) as f:
+            self.assertEqual(f.read(), str(os.getpid()))
+        if os.name != "nt":
+            with self.assertRaises(SystemExit) as e:
+                run.take_lock(self.lock)  # our pid is alive
+            self.assertIn("another thoughts run holds", str(e.exception))
+
+    @unittest.skipIf(os.name == "nt", "pid probe is POSIX only")
+    def test_stale_lock_of_a_dead_pid_is_taken_over(self):
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        os.makedirs(os.path.dirname(self.lock))
+        with open(self.lock, "w") as f:
+            f.write(str(p.pid))
+        with redirect_stdout(io.StringIO()):
+            run.take_lock(self.lock)
+        with open(self.lock) as f:
+            self.assertEqual(f.read(), str(os.getpid()))
+
+    def test_windows_goes_stale_by_age_only(self):
+        os.makedirs(os.path.dirname(self.lock))
+        with open(self.lock, "w") as f:
+            f.write("999999999")
+        old = run.IS_WINDOWS
+        run.IS_WINDOWS = True
+        try:
+            self.assertFalse(run.lock_stale(self.lock))
+            t = time.time() - run.LOCK_STALE_S - 10
+            os.utime(self.lock, (t, t))
+            self.assertTrue(run.lock_stale(self.lock))
+        finally:
+            run.IS_WINDOWS = old
 
 
 GOLD = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"

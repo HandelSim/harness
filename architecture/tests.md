@@ -112,8 +112,8 @@ Benchmarks are NOT regular tests; they're driven by `harness benchmark
   20M by default; `--gate-only` builds the tasks and checks the gold
   patches with no model calls. `--suite local` runs the same A/B on the
   modes benchmark's six small tasks (x `--repeats`, default 4), 3.5M by
-  default, sized for one day's allowance. `--day-budget N` caps one
-  invocation's spend so the SWE-bench suite can run over several days with
+  default, sized for one day's allowance. `--day-budget N` caps the
+  spend of any 24 h so the SWE-bench suite can run over several days with
   `--resume`. Its unit tests run in `harness test unit` via
   `tests/unit_thoughts_test.sh`. See `tests/benchmarks/thoughts/README.md`.
 

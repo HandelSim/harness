@@ -1900,7 +1900,7 @@ subcommands:
             host --yolo -p' with and without it on 38 SWE-bench Verified
             tasks, graded by their tests, stopped at --budget tokens
             (default 20M). Start with --gate-only (builds the tasks, no
-            model calls). --day-budget N stops each day's invocation at N
+            model calls). --day-budget N caps the spend of any 24 h at N
             tokens; continue the next day with --resume. --suite local: six
             small local tasks instead, 3.5M tokens by default, fits in a day.
             'harness probe thoughts --help' for its options.
@@ -3506,6 +3506,15 @@ EOF
         esac
         shift
     done
+
+    # A queue run that harness upgrade's new code makes start again waits while
+    # this is here (the pull and the file merges half done), then starts on the
+    # whole of it. The re-exec after the pull keeps the pid and sets it again.
+    if (( ! check_only )); then
+        mkdir -p "$state_root" 2>/dev/null
+        printf '%s\n' "$$" > "$state_root/upgrading" 2>/dev/null || true
+        trap 'rm -f "$state_root/upgrading"; _reap_jq_sidecar' EXIT
+    fi
 
     # Host-only installs (no container runtime present) can't rebuild images or
     # restart a container stack, and must NOT abort on require_docker the way the
@@ -7482,7 +7491,21 @@ HELP
             PYTHONUTF8=1 $py "$script" "${args[@]}" || rc=$?
             if (( rc == 75 )); then
                 # harness upgrade changed the runner: it ended between tickets
-                # to go on with the new code (and this script's).
+                # to go on with the new code (and this script's). Not while the
+                # upgrade is still at it, nor into a script that does not parse
+                # (half written): either waits, up to 30 min.
+                local waited=0 up_pid
+                while (( waited < 1800 )); do
+                    up_pid=$(cat "$state_root/upgrading" 2>/dev/null) || up_pid=""
+                    if [[ "$up_pid" =~ ^[0-9]+$ ]] && kill -0 "$up_pid" 2>/dev/null; then
+                        :
+                    elif bash -n "$clone_dir/harness" 2>/dev/null; then
+                        break
+                    fi
+                    (( waited )) || echo "[queue] waiting for harness upgrade to finish before the run starts again" >&2
+                    sleep 5
+                    waited=$(( waited + 5 ))
+                done
                 (( started )) && export HARNESS_QUEUE_OWNS_PROXY=1
                 exec "$clone_dir/harness" queue run "$@"
             fi

@@ -683,8 +683,13 @@ def read_results(path: str) -> list[dict]:
         with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     out.append(json.loads(line))
+                except ValueError:
+                    # A row cut short by a crash or power loss mid-append.
+                    log(f"skipping unreadable row in {path}")
     return out
 
 

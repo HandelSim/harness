@@ -141,6 +141,7 @@ SECRET_PATH = re.compile(r"(^|/)(\.env(?!\.(example|sample|template)$)(\..*)?|.*
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
 ALL_STAGES = ("plan", "implement", "review", "fix", "push")
 POLL = 2                   # seconds between looks at the agent, the stop and halt files
+ASLEEP = 120               # a gap this long between two looks: the machine slept, and the time is not counted
 BEAT = 3                   # seconds between run.json beats
 OWNER_NOTE_CAP = 4_000     # chars of one owner note
 OWNER_NOTES_MAX = 50
@@ -174,10 +175,16 @@ CODE_FILES = ("ticket_queue.py", "vault_ingest.py")
 
 def code_sig():
     h = hashlib.sha256()
-    for name in CODE_FILES:
+    here = os.path.dirname(os.path.abspath(__file__))
+    prompts = os.path.join(here, "queue_prompts")
+    try:   # the stage prompts too: the run holds them from its start (PROMPT_TEXT)
+        names = sorted(os.path.join("queue_prompts", n) for n in os.listdir(prompts) if n.endswith(".md"))
+    except OSError:
+        names = []
+    for name in list(CODE_FILES) + names:
         try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name), "rb") as f:
-                h.update(f.read())
+            with open(os.path.join(here, name), "rb") as f:
+                h.update(name.encode() + b"\0" + f.read())
         except OSError:
             pass
     return h.hexdigest()
@@ -207,21 +214,32 @@ def read(path, cap=None):
     return text
 
 
-def write_atomic(path, text):
+def write_atomic(path, text, sync=True):
+    """path holds text, whole: written beside it and moved over it. sync: on disk
+    before the move, so a machine that loses power keeps the old or the new file,
+    never an empty one (the run's beat, rewritten every few seconds, is not)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    for i in range(20):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            # Windows refuses to replace a file another process has open (the
-            # run viewer reading state.json); it is closed again in a moment.
-            if os.name != "nt" or i == 19:
-                raise
-            time.sleep(0.1)
+    tmp = f"{path}.{os.getpid()}-{threading.get_ident()}.tmp"   # two writers never share one
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            if sync:
+                f.flush()
+                os.fsync(f.fileno())
+        for i in range(20):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Windows refuses to replace a file another process has open (the
+                # run viewer reading state.json); it is closed again in a moment.
+                if os.name != "nt" or i == 19:
+                    raise
+                time.sleep(0.1)
+    except BaseException:   # a full disk, say: no half-written file is left beside it
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
 
 
 class Queue:
@@ -1753,10 +1771,25 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=No
 
 # --- prompts and agent launches -------------------------------------------------------
 
+def _prompts():
+    try:
+        return {n[:-3]: read(os.path.join(PROMPTS, n)) for n in os.listdir(PROMPTS) if n.endswith(".md")}
+    except OSError:
+        return {}
+
+
+# Read once, as the run starts: harness upgrade changing them under a run that is on a
+# ticket would hand this (old) code's stages the new prompts. The run starts again on
+# both, together, between tickets (RESTART).
+PROMPT_TEXT = _prompts()
+
+
 def render(name, **values):
     """Fill {{NAME}}s in one pass: ticket text that says {{PLAN}} stays as it is."""
-    return re.sub(r"\{\{([A-Z_]+)\}\}", lambda m: str(values.get(m.group(1), m.group(0))),
-                  read(os.path.join(PROMPTS, name + ".md")))
+    text = PROMPT_TEXT.get(name)
+    if text is None:
+        text = read(os.path.join(PROMPTS, name + ".md"))
+    return re.sub(r"\{\{([A-Z_]+)\}\}", lambda m: str(values.get(m.group(1), m.group(0))), text)
 
 
 # agents/live-run.sh says which opencode session the launch is: the session a stage
@@ -1789,7 +1822,8 @@ def note_session(ctx, st, out, since):
     got, before = session_in(read(out)), st.get("session") or {}
     if not got:
         return False
-    same = before.get("id") == got and before.get("stage") == st["stage"]
+    same = before.get("stage") == st["stage"] and (before.get("id") == got or not before.get("id")
+                                                   and before.get("attempt") == st.get("attempt", 0))
     st["session"] = {"stage": st["stage"], "attempt": st.get("attempt", 0), "id": got,
                      "container": not (ctx.host or ctx.single), "single": bool(ctx.single),
                      "started": before["started"] if same and before.get("started") else since / 1000}
@@ -1803,8 +1837,11 @@ def go_on_later(st, why):
     of the stage goes on in its session (or, with none known, a new agent is told to
     finish its work) instead of starting the stage over."""
     s = st.get("session") or {}
-    if st.get("stage") in RESUMABLE and s.get("stage") == st["stage"] and s.get("attempt") == st.get("attempt", 0):
-        st["resume"] = {"stage": st["stage"], "why": why, "message": ""}
+    if st.get("stage") not in RESUMABLE or (st.get("resume") or {}).get("stage") == st["stage"]:
+        return   # no agent launched since that resume was set (fail's, say): it still holds
+    if s.get("stage") != st["stage"] or s.get("attempt") != st.get("attempt", 0):
+        return   # no agent of this attempt was launched: nothing was cut off
+    st["resume"] = {"stage": st["stage"], "why": why, "message": "", "started": s.get("started")}
 
 
 def crash_of(st, rc):
@@ -1840,7 +1877,7 @@ CARRY_ON = ("\n\n<<<BEGIN_GOING_ON (an earlier agent on this stage {how}: {why})
             "files the stage writes) and finish it instead of starting over.\n{message}<<<END_GOING_ON>>>\n")
 
 
-HOW_FAILED = "did not pass its check, so the ticket was blocked; fix what the check says"
+HOW_FAILED = "did not pass its check; fix what the check says"
 
 
 def run_agent(ctx, st, stage, prompt):
@@ -1886,8 +1923,11 @@ def run_agent(ctx, st, stage, prompt):
         with contextlib.suppress(OSError):
             os.replace(out, out + ".before")
     since = int(time.time() * 1000)
-    if not sid:   # a new agent: its session, once it says, is the one a cut-off stage goes on in
-        st.pop("session", None)
+    if not sid:   # a new agent: its session, once it says, is the one a cut-off stage goes on in;
+        # till then (or with none named) it says this attempt's agent was launched, and since
+        # when its notes count (a cut-off agent's whose work it finishes: theirs too)
+        st["session"] = {"stage": stage, "attempt": st.get("attempt", 0), "container": not (ctx.host or ctx.single),
+                         "single": bool(ctx.single), "started": (resume or {}).get("started") or since / 1000}
     write_atomic(task, prompt)
     if st.get("in_place"):
         exclude_block(st["project"], None)   # the snapshot takes the owner's files too
@@ -1919,7 +1959,9 @@ def run_agent(ctx, st, stage, prompt):
     # The agent's part of the stage is over: saved at once, so a run that dies from
     # here on (or an outage, a halt, a verifier with no verdict) goes on from its
     # result instead of launching it again. fail/advance/block let it go.
-    st["verify_only"] = {"stage": stage, "rc": rc, "out": out, "started": since / 1000}
+    s = st.get("session") or {}   # a session gone on in: its notes count from its start
+    st["verify_only"] = {"stage": stage, "rc": rc, "out": out,
+                         "started": s.get("started") if s.get("stage") == stage and s.get("started") else since / 1000}
     ctx.q.save(st)
     sync_vault(ctx, key, since)
     return rc, out
@@ -1942,8 +1984,15 @@ def agent_or_kept(ctx, st, stage, prompt):
         st.pop("resume", None)
         return kept.get("rc", 0), kept["out"], kept.get("started", 0)
     st.pop("verify_only", None)
-    # going on in a session: the notes it wrote before it was cut off count
-    started = (st["session"].get("started") or time.time()) if resuming(ctx, st, stage) else time.time()
+    # going on in a session, or a new agent finishing a cut-off one's work: what was
+    # written before it was cut off counts
+    resume = st.get("resume") or {}
+    if resuming(ctx, st, stage):
+        started = st["session"].get("started") or time.time()
+    elif resume.get("stage") == stage and resume.get("started"):
+        started = resume["started"]
+    else:
+        started = time.time()
     rc, out = run_agent(ctx, st, stage, prompt())
     return rc, out, started
 
@@ -2009,20 +2058,24 @@ def launch(ctx, st, cmd, out, since, card=None):
         p = spawn(cmd, cwd=workdir(ctx.q, st), stdin=subprocess.DEVNULL,
                   stdout=f, stderr=subprocess.STDOUT, env=env)
         ctx.child = p
-        beat(ctx, agent=p.pid, launch=st["launch_id"])   # halt --force ends it (and its container) with the run
-        # a run that dies leaves this behind: the next run (or retry, remove, stop) ends that agent
-        st["agent"] = {"pid": p.pid, "launch": st["launch_id"], "host": socket.gethostname(),
-                       "container": not (ctx.host or ctx.single), "workdir": workdir(ctx.q, st)}
-        ctx.q.save(st)
         rc = None
         keep = False   # the agent not known to be ended: st["agent"] stays for the next run, stop, retry or remove
-        seen, quiet_since, next_look = activity(ctx, st, out, gitdir), t0, t0 + look
         named = False   # the agent's session saved: a run that dies from here on leaves it to go on in
-        try:
+        try:   # from here on, anything that goes wrong stops the agent: none is left running unrecorded
+            beat(ctx, agent=p.pid, launch=st["launch_id"])   # halt --force ends it (and its container) with the run
+            # a run that dies leaves this behind: the next run (or retry, remove, stop) ends that agent
+            st["agent"] = {"pid": p.pid, "launch": st["launch_id"], "host": socket.gethostname(),
+                           "container": not (ctx.host or ctx.single), "workdir": workdir(ctx.q, st)}
+            ctx.q.save(st)
+            seen, quiet_since, next_look = activity(ctx, st, out, gitdir), t0, t0 + look
+            last = time.monotonic()
             while rc is None:
                 try:
                     rc = p.wait(timeout=max(0.1, min(POLL, end - time.monotonic())))
                 except subprocess.TimeoutExpired:
+                    gap = time.monotonic() - last
+                    if gap > ASLEEP:   # the machine slept (Windows counts it): not the agent's time
+                        end, quiet_since, next_look = end + gap, quiet_since + gap, next_look + gap
                     if not named and note_session(ctx, st, out, since):
                         named = True
                         ctx.q.save(st)
@@ -2045,6 +2098,7 @@ def launch(ctx, st, cmd, out, since, card=None):
                             seen, quiet_since = got, now
                         elif now - quiet_since >= idle:
                             rc = idle_out(ctx, st, p, (now - quiet_since) / 60)
+                    last = time.monotonic()
         except Interrupted:
             stop(p)
             keep = not stop_containers(ctx, st)
@@ -2441,7 +2495,7 @@ def is_agent(pid, launch, key):
     if os.name == "nt":
         r = run_quiet(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                        f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"], 60)
-        return r.returncode == 0 and f"--ticket {key}" in r.stdout
+        return r.returncode == 0 and re.search(rf"--ticket {re.escape(key)}(\s|$)", r.stdout) is not None
     if os.path.isdir("/proc"):
         for p in os.listdir("/proc"):
             if not p.isdigit():
@@ -2456,7 +2510,7 @@ def is_agent(pid, launch, key):
                 continue
         return False
     r = run_quiet(["ps", "-A", "-o", "pgid=,command="], 60)
-    return any(line.split(None, 1)[0] == str(pid) and f"--ticket {key}" in line
+    return any(line.split(None, 1)[0] == str(pid) and re.search(rf"--ticket {re.escape(key)}(\s|$)", line)
                for line in r.stdout.splitlines() if line.strip())
 
 
@@ -3303,8 +3357,9 @@ def fail(ctx, st, rc, problems):
         problems = [f"the agent launch exited with status {rc}"] + problems
     try:
         probe(ctx)  # raises Infra: the ticket stays at this stage, the attempt is not counted
-    except Infra:   # the agent's work may be what the outage cut short: it runs again after
-        st.pop("verify_only", None)
+    except Infra:   # the agent's work may be what the outage cut short: it runs again after,
+        if rc != 0 or crash_of(st, rc):   # unless it ended on its own: then its result is checked again
+            st.pop("verify_only", None)
         ctx.q.save(st)
         raise
     crash = crash_of(st, rc) if rc != 124 else ""   # a timeout is no crash: its attempt counts
@@ -3316,10 +3371,21 @@ def fail(ctx, st, rc, problems):
     record(st, "failed", problems)
     if st["attempt"] < ctx.retries:
         st.update(attempt=st["attempt"] + 1, feedback=text)
-        if (crash or rc == 124) and st["stage"] in RESUMABLE:   # a new agent, told to finish the work
+        session = st.get("session") or {}
+        if (crash or rc in (124, IDLE)) and st["stage"] in RESUMABLE:   # a new agent, told to finish the work
             st.pop("session", None)
             st["resume"] = {"stage": st["stage"], "message": "",
-                            "why": crash or f"it ran past the stage's {ctx.stage_timeout}s limit"}
+                            "why": crash or (f"it ran past the stage's {ctx.stage_timeout}s limit" if rc == 124
+                                             else "it made no progress and was stopped"),
+                            "started": session.get("started") if session.get("stage") == st["stage"] else None}
+        elif rc == 0 and st["stage"] in RESUMABLE and session.get("stage") == st["stage"] and session.get("id"):
+            # it ended on its own and its check failed: it goes on in its session, told what
+            # failed, instead of a new agent doing the stage over from its start (a stop of
+            # this attempt's agent may go on in it once more: go_on_after_crash)
+            session["attempt"] = st["attempt"]
+            session.pop("crashed", None)
+            st["resume"] = {"stage": st["stage"], "failed": True, "message": "",
+                            "why": "the check found:\n" + text}
         ctx.q.save(st)
     else:
         again = ", again after harness queue continue" if st.get("continued") == st["stage"] else ""
@@ -3395,7 +3461,7 @@ def beat(ctx, **change):
             return
         ctx.run_info.update(change, beat=int(time.time()))
         try:
-            write_atomic(ctx.run_file, json.dumps(ctx.run_info) + "\n")
+            write_atomic(ctx.run_file, json.dumps(ctx.run_info) + "\n", sync=False)
         except OSError:
             pass
 
@@ -3571,6 +3637,8 @@ def take(ctx, key, pending, done):
         if not pending(key) or key not in q.order():
             return None, False
         st = q.load(key)
+        if not st:
+            return None, False
         why = elsewhere(ctx, st)
         if why:   # not this slot's to take; it waits for the other to be done
             ctx.waiting = why
@@ -3733,7 +3801,7 @@ def debug_look(ctx, key, stage):
         if verdict == "fixed" and not note:
             if st.get("status") != "blocked" or st.get("requeued", "") != stamp:
                 note = "the owner sent the ticket on meanwhile"
-            elif plain_retry(q, st) != (None, False):
+            elif plain_retry(q, st) != (None, False) or (starts_over(q, st) and not kept_result(st)):
                 note = "a retry would start the work over, which is the owner's call"
             else:
                 note = retry_refused(q, st, None, fetch=False)
@@ -4859,7 +4927,7 @@ def run_file(path):
 
 def beating(info):
     beat_at = info.get("beat")
-    return isinstance(beat_at, (int, float)) and time.time() - beat_at < 30
+    return isinstance(beat_at, (int, float)) and 0 <= time.time() - beat_at < 30   # one from the future: a clock set back
 
 
 SLOT_FILE = re.compile(r"run-(\d+)\.json")

@@ -143,6 +143,10 @@ if stage == "planning":
     else:
         open(path("Write the plan to"), "w").write(plan)
 elif stage in ("implementing", "fixing"):
+    once = os.environ["FAKE_CALLS"] + ".nocommit"   # FAKE_NO_COMMIT_ONCE: the first implementing commits nothing
+    if os.environ.get("FAKE_NO_COMMIT_ONCE") and stage == "implementing" and not os.path.exists(once):
+        open(once, "w").close()
+        sys.exit(0)
     if os.environ.get("FAKE_NO_COMMIT") or (stage == "fixing" and os.environ.get("FAKE_FIX_NOOP")) \
             or (os.environ.get("FAKE_NO_COMMIT_UNTIL_DEBUG") and not os.path.exists(os.environ["FAKE_CALLS"] + ".debugged")):
         sys.exit(0)
@@ -770,6 +774,73 @@ class QueueTest(Base):
         self.assertEqual(self.status()["status"], "blocked")
         self.assertEqual(self.calls_of("debug"), [])
         self.assertNotIn("debug", self.status())
+
+    def test_a_fixed_plan_block_is_not_planned_over_again(self):
+        # a retry from the plan sets the work up again and plans it anew: the owner's call
+        os.environ.update(FAKE_CRITERIA="", FAKE_DEBUG_VERDICT="fixed")
+        self.add("ABC-1")
+        self.run_queue("--debug", "1", "--retries", "0")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "plan"))
+        self.assertEqual(len(self.calls_of("planning")), 1)
+        self.assertEqual(len(self.calls_of("debug")), 1)
+        self.assertEqual((st["debug"]["verdict"], st["debug"]["retried"]), ("fixed", False))
+        self.assertIn("start the work over", st["debug"]["note"])
+
+    def test_a_failed_check_goes_on_in_the_agents_session(self):
+        # not a new agent doing the stage over from its start (a second planner, say)
+        os.environ["FAKE_NO_COMMIT_ONCE"] = "1"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+        calls = self.calls_of("implementing")
+        self.assertEqual(len(calls), 2, calls)
+        self.assertNotIn("--session", calls[0])
+        self.assertIn("--session ses_fake1", calls[1])
+        said = cat(self.calls + ".continue")
+        self.assertIn("did not pass the stage's check: the check found:", said)
+        self.assertIn("no commits on branch ABC-1", said)
+        self.assertNotIn("blocked", said)
+
+    def test_go_on_later_goes_on_only_from_an_agent_this_attempt_launched(self):
+        # launched, no session named yet: a new agent, told to finish its work (its notes count)
+        st = {"stage": "implement", "attempt": 1, "session": {"stage": "implement", "attempt": 1, "started": 5.0}}
+        tq.go_on_later(st, "the run ended")
+        self.assertEqual(st["resume"], {"stage": "implement", "why": "the run ended", "message": "", "started": 5.0})
+        st = {"stage": "implement", "attempt": 0, "session": {"stage": "implement", "attempt": 0, "id": "ses_x"}}
+        tq.go_on_later(st, "the run ended")
+        self.assertEqual((st["session"]["id"], st["resume"]["stage"]), ("ses_x", "implement"))
+        # an earlier attempt's session, or the stage before's: nothing of this attempt was cut off
+        for ses in ({"stage": "implement", "attempt": 0, "id": "ses_x"}, {"stage": "plan", "attempt": 1, "id": "ses_p"}):
+            st = {"stage": "implement", "attempt": 1, "session": dict(ses)}
+            tq.go_on_later(st, "the run ended")
+            self.assertNotIn("resume", st)
+        # a resume set and no launch since (fail's, after a failed check): it holds
+        failed = {"stage": "implement", "failed": True, "message": "", "why": "the check found:\n- x"}
+        st = {"stage": "implement", "attempt": 1, "resume": dict(failed),
+              "session": {"stage": "implement", "attempt": 1, "id": "ses_x"}}
+        tq.go_on_later(st, "the run was halted")
+        self.assertEqual(st["resume"], failed)
+        st = {"stage": "merge", "attempt": 0}
+        tq.go_on_later(st, "the run ended")
+        self.assertNotIn("resume", st)
+
+    def test_a_beat_from_the_future_is_no_run(self):
+        self.assertTrue(tq.beating({"beat": time.time() - 5}))
+        self.assertFalse(tq.beating({"beat": time.time() - 60}))
+        self.assertFalse(tq.beating({"beat": time.time() + 3600}))   # the clock was set back
+
+    def test_write_atomic_leaves_no_temporary_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x", "state.json")
+            tq.write_atomic(p, "one")
+            tq.write_atomic(p, "two", sync=False)
+            self.assertEqual(cat(p), "two")
+            self.assertEqual(os.listdir(os.path.dirname(p)), ["state.json"])
+            os.makedirs(os.path.join(d, "x", "dir"))
+            with self.assertRaises(OSError):   # the move fails: what was written beside it goes too
+                tq.write_atomic(os.path.join(d, "x", "dir"), "three")
+            self.assertEqual(sorted(os.listdir(os.path.dirname(p))), ["dir", "state.json"])
 
     def test_verdict_of_reads_the_last_verdict_line_alone(self):
         self.assertEqual(tq.verdict_of("x\n**VERDICT:** fixed\nHARNESS-CHANGE: yes\n"), ("fixed", True))
@@ -1903,7 +1974,8 @@ class OwnerControlTest(Base):
         self.add("ABC-1")
         self.run_queue()
         st = self.status()
-        self.assertEqual((st["status"], st["stage"], st["session"]["id"]), ("blocked", "implement", "ses_fake2"))
+        # the failed check's retry went on in the first agent's session
+        self.assertEqual((st["status"], st["stage"], st["session"]["id"]), ("blocked", "implement", "ses_fake1"))
         attempt = st["attempt"]
         del os.environ["FAKE_NO_COMMIT"]
         rc, out = self.q("continue", "ABC-1", "--text", "Commit it this time.")
@@ -1915,9 +1987,9 @@ class OwnerControlTest(Base):
         rc, out = self.run_queue()
         self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
         last = self.calls_of("implementing")[-1]
-        self.assertIn("--session ses_fake2", last)   # the last agent's, the one that was blocked
+        self.assertIn("--session ses_fake1", last)   # the last agent's, the one that was blocked
         said = cat(self.calls + ".continue")
-        self.assertIn("did not pass the stage's check, so the ticket was blocked", said)   # not "cut off"
+        self.assertIn("did not pass the stage's check", said)   # not "cut off"
         self.assertIn("no commits on branch ABC-1", said)   # what the check said
         self.assertIn("Commit it this time.", said)
 
@@ -1945,7 +2017,7 @@ class OwnerControlTest(Base):
         self.add("ABC-1")
         self.run_queue("--retries", "0")
         self.assertEqual(self.status()["status"], "blocked")
-        self.assertNotIn("session", self.status())
+        self.assertNotIn("id", self.status()["session"])   # launched, its session never named
         del os.environ["FAKE_NO_COMMIT"]
         rc, out = self.q("continue", "ABC-1", "Commit it this time.")
         self.assertEqual(rc, 0, out)

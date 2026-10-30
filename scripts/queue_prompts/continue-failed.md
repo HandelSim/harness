@@ -1,4 +1,4 @@
-You were working on the {{STAGE}} stage of ticket {{KEY}} in this session. Its work did not pass the stage's check, so the ticket was blocked: {{WHY}}
+You were working on the {{STAGE}} stage of ticket {{KEY}} in this session. Its work did not pass the stage's check: {{WHY}}
 
 <<<BEGIN_MESSAGE_FROM_THE_OWNER (it wins over everything before it)>>>
 {{MESSAGE}}

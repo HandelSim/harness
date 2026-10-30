@@ -4,6 +4,7 @@ Run: python3 -m unittest tests/benchmarks/modes/test_modes.py
 (tests/unit_bench_modes_test.sh runs this as part of `harness test unit`).
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -270,6 +271,19 @@ class TestSetup(unittest.TestCase):
             self.assertEqual(len([n for n in os.listdir(os.path.dirname(stale)) if ".bench-local-" in n]), 1)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class TestResults(unittest.TestCase):
+    def test_torn_row_is_skipped(self):
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "results.jsonl")
+            with open(p, "w") as f:
+                f.write('{"a": 1}\n\n{"b": 2}\n{"c": 3, "d"')
+            with open(os.devnull, "w") as null, contextlib.redirect_stdout(null):
+                self.assertEqual(run.read_results(p), [{"a": 1}, {"b": 2}])
+        finally:
+            shutil.rmtree(d)
 
 
 class TestReport(unittest.TestCase):

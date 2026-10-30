@@ -302,7 +302,12 @@ helper with `harness upgrade`.
    new code, see harness-cli.md), a `harness serve` in a terminal
    (`harness_serve_refresh`: USR1, it `exec`s the new code in place) and the
    run viewer (`harness_view_refresh`). A queue run restarts itself between
-   tickets (exit 75); a working agent is not interrupted. This runs before
+   tickets (exit 75; `code_sig` covers `ticket_queue.py`, `vault_ingest.py`
+   and `queue_prompts/*.md`, which the run reads once at its start, so a
+   ticket finishes on the prompts its code was written for); a working agent
+   is not interrupted. Upgrade keeps `state/upgrading` (its pid) while it
+   runs; the queue wrapper waits (up to 30 min) for it to go and for
+   `bash -n harness` to pass before it `exec`s the new code. This runs before
    the host-only/container split, so both paths get it.
 4. Take the container stack down; build nothing and never start it again
    (skippable via `--no-restart`). The next container launch's

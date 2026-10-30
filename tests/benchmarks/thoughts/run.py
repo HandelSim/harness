@@ -36,6 +36,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -61,6 +62,8 @@ ARM_SHAPE = {"slim": "native/slim", "thoughts": "native/slim/thoughts"}
 DEFAULTS = {"swe": (20_000_000, 1_500_000, 2400), "local": (3_500_000, 250_000, 900)}
 DEFAULT_BUDGET, DEFAULT_CAP = DEFAULTS["swe"][:2]
 LEDGER_TOL = 0.10
+# Windows has no safe pid probe here, so its run.lock goes stale only by age.
+LOCK_STALE_S = 12 * 3600
 PROMPT = (
     "You are working in a checkout of the {repo} repository (the current directory). A Python "
     "environment with the package installed in development mode is active (python, pip on PATH).\n"
@@ -129,13 +132,21 @@ def guard(spent: int, budget: int, costs: list[int], cap: int) -> dict:
 
 
 def day_stop(today: int, day_budget: int, cap: int) -> str:
-    """With --day-budget, why this invocation starts no more pairs ("" to go
-    on). A pair starts only while two full trial caps fit in what is left of
-    the day, so the day's limit holds even if both trials run to the cap and
-    no trial is cut short by it."""
+    """With --day-budget, why no more pairs start ("" to go on). A pair starts
+    only while two full trial caps fit in what is left of the day, so the
+    day's limit holds even if both trials run to the cap and no trial is cut
+    short by it."""
     if day_budget and today + 2 * cap > day_budget:
         return f"spent {today:,} today + 2 x trial cap {cap:,} > day budget {day_budget:,}"
     return ""
+
+
+def spent_today(results: list[dict], now: float | None = None) -> int:
+    """Tokens of the rows booked in the last 24 h (the upstream's daily
+    window), across invocations; a row with no ts (from before rows had one)
+    counts as older."""
+    now = time.time() if now is None else now
+    return sum(int(r.get("tokens") or 0) for r in results if float(r.get("ts") or 0) > now - 86400)
 
 
 # --------------------------------------------------------------------------
@@ -433,6 +444,14 @@ def local_check(task: dict, work: str, log_path: str) -> dict:
     return {"resolved": ok, "applied": True, "reason": (why.strip().splitlines() or [""])[0][:200]}
 
 
+def write_json_atomic(path: str, obj, **kw) -> None:
+    """A kill mid-write leaves the old file whole, never a truncated one."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, **kw)
+    os.replace(tmp, path)
+
+
 def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, eff_cap: int, ctx: dict) -> dict:
     """One arm of one pair. --suite swe: `row` is the SWE-bench row and `env`
     its checkout + venv. --suite local: `row` is the local task and `env` is
@@ -470,8 +489,7 @@ def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, e
                 tok, _ = meter.tokens()
                 if time.monotonic() - last > 5:
                     last = time.monotonic()
-                    with open(inflight, "w", encoding="utf-8") as f:
-                        json.dump({"pair": pair, "task": task["id"], "arm": arm, "tokens": tok}, f)
+                    write_json_atomic(inflight, {"pair": pair, "task": task["id"], "arm": arm, "tokens": tok})
                 if tok >= eff_cap:
                     capped = True
                     modes._kill_tree(proc)
@@ -536,7 +554,7 @@ def run_trial(pair: int, pos: int, task: dict, row: dict, env: dict, arm: str, e
         # billed, B would pay more per char than A.
         "prompt_per_kchar": round(1000 * sum(r["prompt"] for r in billed) / chars, 1) if chars else 0.0,
         "first_prompt": billed[0]["prompt"] if billed else 0,
-        **c, **led, **oc,
+        **c, **led, **oc, "ts": time.time(),
     }
 
 
@@ -627,6 +645,63 @@ def read_results(path: str) -> list[dict]:
     return modes.read_results(path)
 
 
+def append_row(results_path: str, row: dict) -> None:
+    # The leading newline ends a row a crash cut short, so it cannot swallow
+    # this one (read_results skips the torn row and the blank line).
+    with open(results_path, "a", encoding="utf-8") as f:
+        f.write("\n" + json.dumps(row) + "\n")
+
+
+def lock_stale(path: str) -> bool:
+    """True if the run that wrote lock `path` is gone: its pid no longer
+    exists. On Windows (os.kill(pid, 0) would interrupt that process) a lock
+    is stale only once it is LOCK_STALE_S old."""
+    try:
+        age = time.time() - os.path.getmtime(path)
+        with open(path, encoding="utf-8") as f:
+            pid = int(f.read().strip() or 0)
+    except OSError:
+        return True
+    except ValueError:
+        pid = 0
+    if IS_WINDOWS:
+        return age > LOCK_STALE_S
+    if not pid:
+        return age > 60  # still being written, or not a lock of ours
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass  # EPERM: alive, another user's
+    return False
+
+
+def take_lock(path: str) -> None:
+    """One run at a time per bench root (runs share its proxy, proxy log and
+    opencode store): create `path` holding our pid, taking over a stale one."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if not lock_stale(path):
+                raise SystemExit(f"another thoughts run holds {path}"
+                                 + (f" (on Windows a lock counts as stale only after {LOCK_STALE_S // 3600} h)"
+                                    if IS_WINDOWS else "")
+                                 + "; delete it if no run is going")
+            log(f"taking over the stale lock {path}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        return
+    raise SystemExit(f"could not take the lock {path}")
+
+
 def account_lost_inflight(out: str, results_path: str) -> None:
     """A runner killed mid-trial left inflight.json: book its tokens as an
     infra row so the budget still counts them."""
@@ -637,9 +712,8 @@ def account_lost_inflight(out: str, results_path: str) -> None:
         with open(p, encoding="utf-8") as f:
             d = json.load(f)
         row = {"pair": d["pair"], "task": d["task"], "arm": d["arm"], "passed": False,
-               "infra": "lost", "tokens": int(d.get("tokens") or 0)}
-        with open(results_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+               "infra": "lost", "tokens": int(d.get("tokens") or 0), "ts": time.time()}
+        append_row(results_path, row)
     except (OSError, ValueError, KeyError):
         pass
     os.remove(p)
@@ -649,10 +723,10 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="tests/benchmarks/thoughts/run.py",
                                  description="Paired token-capped A/B of `harness --thoughts` on SWE-bench Verified "
                                              "or on six small local tasks.")
-    ap.add_argument("--suite", choices=("swe", "local"), default="swe",
+    ap.add_argument("--suite", choices=("swe", "local"), default=None,
                     help="swe: 38 SWE-bench Verified tasks (default); local: the six tasks of "
                          "tests/benchmarks/modes/tasks, x --repeats, sized for one day's allowance")
-    ap.add_argument("--repeats", type=int, default=4, help="--suite local: runs of each task per arm (default 4)")
+    ap.add_argument("--repeats", type=int, default=None, help="--suite local: runs of each task per arm (default 4)")
     ap.add_argument("--task-ids", default="", help="comma list (default: every task of the suite)")
     ap.add_argument("--pairs", type=int, default=0, help="stop after N pairs (default: the whole plan)")
     ap.add_argument("--budget", type=int, default=None,
@@ -661,21 +735,36 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--trial-token-cap", type=int, default=None,
                     help="kill a trial at this many tokens (default: swe %s, local %s)"
                          % tuple(f"{DEFAULTS[k][1]:,}" for k in ("swe", "local")))
-    ap.add_argument("--day-budget", type=int, default=0,
-                    help="spend at most this many tokens in this invocation (a pair starts only while "
+    ap.add_argument("--day-budget", type=int, default=None,
+                    help="spend at most this many tokens in any 24 h (a pair starts only while "
                          "2 trial caps fit), then stop; --resume the next day")
     ap.add_argument("--timeout", type=int, default=None, help="seconds per trial (default: swe 2400, local 900)")
     ap.add_argument("--keep-workdirs", action="store_true", help="--suite local: keep each trial's scratch dir")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and budget math and check inputs; spends nothing")
     ap.add_argument("--gate-only", action="store_true", help="build envs and run the gold gate, no trials")
     ap.add_argument("--rebuild-envs", action="store_true", help="rebuild envs and rerun gates")
-    ap.add_argument("--resume", default="", metavar="DIR", help="continue the run in DIR")
+    ap.add_argument("--resume", default="", metavar="DIR",
+                    help="continue the run in DIR (flags not given again come from its meta.json)")
     ap.add_argument("--report", default="", metavar="DIR", help="only rebuild DIR/report.txt")
     ap.add_argument("--dataset", default="", metavar="PATH", help="local SWE-bench_Verified rows (file or dir) instead of HF")
     ap.add_argument("--cache-dir", default="", help="env/dataset cache (default <install root>/state/bench-thoughts)")
     ap.add_argument("--harness-bin", default="", help="harness script (default: $HARNESS_BIN or the repo's)")
     ap.add_argument("--install-root", default="", help="install root with your .env (default: $HARNESS_BENCH_INSTALL_ROOT or the repo)")
     a = ap.parse_args(argv)
+    if a.resume and os.path.isfile(os.path.join(a.resume, "meta.json")):
+        # A resumed run keeps its own settings: a flag not given again comes
+        # from its meta.json, and another suite is refused.
+        with open(os.path.join(a.resume, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        if a.suite and meta.get("suite") and a.suite != meta["suite"]:
+            ap.error(f"{a.resume} is a --suite {meta['suite']} run, not --suite {a.suite}")
+        for k, mk in (("suite", "suite"), ("budget", "budget"), ("trial_token_cap", "trial_token_cap"),
+                      ("timeout", "timeout_s"), ("repeats", "repeats"), ("day_budget", "day_budget")):
+            if getattr(a, k) is None and meta.get(mk) is not None:
+                setattr(a, k, meta[mk])
+    a.suite = a.suite or "swe"
+    a.repeats = 4 if a.repeats is None else a.repeats
+    a.day_budget = a.day_budget or 0
     local = a.suite == "local"
     d_budget, d_cap, d_timeout = DEFAULTS[a.suite]
     a.budget = d_budget if a.budget is None else a.budget
@@ -785,20 +874,21 @@ def main(argv: list[str]) -> int:
 
     if not os.path.isfile(os.path.join(real_root, ".env")):
         raise SystemExit(f"no .env in {real_root}: configure harness first")
+    bench_root = os.path.join(real_root, "state", "bench-thoughts", "root")
+    lock = os.path.join(bench_root, "run.lock")
+    take_lock(lock)
     out = a.resume or os.path.join(RUNS_DIR, ("thoughts-local-" if local else "thoughts-")
                                    + datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(os.path.join(out, "trials"), exist_ok=True)
     results_path = os.path.join(out, "results.jsonl")
     account_lost_inflight(out, results_path)
-    bench_root = os.path.join(real_root, "state", "bench-thoughts", "root")
     red = modes.make_redactor()
     port = modes.free_port()
     meta = {"suite": a.suite, "budget": a.budget, "trial_token_cap": a.trial_token_cap, "timeout_s": a.timeout,
-            "repeats": a.repeats if local else None, "tasks": [p[1] for p in plan], "model": red(os.environ.get("DEFAULT_MODEL_NAME", "")) or "from .env",
+            "day_budget": a.day_budget, "repeats": a.repeats if local else None, "tasks": [p[1] for p in plan], "model": red(os.environ.get("DEFAULT_MODEL_NAME", "")) or "from .env",
             "host": f"{platform.system()} {platform.machine()}",
             "excluded": {k: g.get("why") for k, g in gates.items() if not g["ok"]}}
-    with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=1)
+    write_json_atomic(os.path.join(out, "meta.json"), meta, indent=1)
     ctx = {"harness": harness_bin, "bench_root": bench_root, "port": port, "timeout": a.timeout, "redact": red,
            "out": out, "first": True, "suite": a.suite, "keep": a.keep_workdirs,
            "needles": (sorted({"benchmarks/modes", "check.py", "mock_solution", "task.json",
@@ -811,13 +901,18 @@ def main(argv: list[str]) -> int:
              + (f" --pairs {a.pairs}" if a.pairs else "") \
              + (f" --day-budget {a.day_budget}" if a.day_budget else "") \
              + (f" --suite local --repeats {a.repeats}" if local else "")
-    start_spent = sum(int(r.get("tokens") or 0) for r in read_results(results_path))
 
     def stop_proxy():
         subprocess.run(([BASH] if IS_WINDOWS else []) + [harness_bin, "host", "down"],
                        env=modes.child_env(bench_root, port, False, first=False),
                        capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
 
+    def _stop(*_):
+        raise KeyboardInterrupt
+
+    # A closed terminal or a kill takes the Ctrl-C path, which kills the
+    # trial's process tree (it runs in its own session, out of the signal's reach).
+    old_sig = {s: signal.signal(getattr(signal, s), _stop) for s in ("SIGTERM", "SIGHUP") if hasattr(signal, s)}
     aborted = ""
     try:
         modes.prepare_root(real_root, bench_root, None)
@@ -842,7 +937,7 @@ def main(argv: list[str]) -> int:
             if not g["ok"]:
                 aborted = "token budget: " + g["why"]
                 break
-            day = day_stop(spent - start_spent, a.day_budget, a.trial_token_cap)
+            day = day_stop(spent_today(results), a.day_budget, a.trial_token_cap)
             if day:
                 aborted = "day budget: " + day + "; resume tomorrow"
                 break
@@ -850,8 +945,7 @@ def main(argv: list[str]) -> int:
             env = None if local else swe_env.build_env(rows[tid], cache, logf=log)
             for arm in todo:
                 r = run_trial(pair, order.index(arm), {"id": tid}, rows[tid], env, arm, g["eff_cap"], ctx)
-                with open(results_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(r) + "\n")
+                append_row(results_path, r)
                 try:
                     os.remove(os.path.join(out, "inflight.json"))
                 except OSError:
@@ -886,6 +980,12 @@ def main(argv: list[str]) -> int:
         except Exception:  # noqa: BLE001
             pass
         account_lost_inflight(out, results_path)
+        for s, h in old_sig.items():
+            signal.signal(getattr(signal, s), h)
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
 
     text = report(read_results(results_path), meta)
     with open(os.path.join(out, "report.txt"), "w", encoding="utf-8") as f:

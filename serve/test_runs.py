@@ -1841,6 +1841,31 @@ class QueuePageTest(RunsServer):
                 cfg.runs.launched[0].kill()
                 cfg.runs.launched[0].wait()
 
+    def test_a_run_the_machine_took_down_starts_again_as_it_was(self):
+        fake = os.path.join(self.tmp.name, "harness")
+        args = os.path.join(self.tmp.name, "args")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/bash\necho "$@ HOST_CONFIRM=$HARNESS_HOST_CONFIRM" > {args}\nexit 3\n')
+        self.ticket(status="running", stage="plan")
+        cfg = self.start(harness=fake)
+        self.assertIsNone(cfg.runs.resume_runner())   # no run.json: the last run ended
+        with open(os.path.join(self.queue, "run.json"), "w") as f:
+            json.dump({"pid": 1, "beat": int(time.time()) - 600, "host": True, "single": False, "parallel": 2}, f)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("value='host' checked", body)   # the Start form: the mode the last run had
+        self.assertNotIn("value='container' checked", body)
+        os.environ["QUEUE_AUTORESUME"] = "0"
+        try:
+            self.assertIsNone(cfg.runs.resume_runner())
+        finally:
+            del os.environ["QUEUE_AUTORESUME"]
+        self.assertFalse(os.path.exists(args))
+        ok, msg = cfg.runs.resume_runner()
+        with open(args) as f:
+            self.assertEqual(f.read().strip(), "queue run --host --parallel 2 HOST_CONFIRM=1")
+        with open(os.path.join(self.queue, "runner.out")) as f:
+            self.assertIn("started again: the last run ended with the machine: harness queue run --host", f.read())
+
     def test_a_queue_session_has_a_stop_button_and_the_host_an_opencode_link(self):
         self.ticket(status="running", stage="plan")
         self.run_on()

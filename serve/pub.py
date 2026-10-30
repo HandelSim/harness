@@ -1957,6 +1957,10 @@ def main(argv=None):
                              "(pub.py add-code --access-codes FILE NAME)\n")
     srv = Server(("127.0.0.1", a.port), make_handler(cfg))
     sys.stderr.write(f"[pub] serving http://127.0.0.1:{a.port}/\n")
+    if cfg.runs:   # a queue run the machine took down goes on (QUEUE_AUTORESUME=0: not)
+        got = cfg.runs.resume_runner()
+        if got:
+            sys.stderr.write(f"[pub] queue run left unfinished: {got[1]}\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

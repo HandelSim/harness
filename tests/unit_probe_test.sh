@@ -771,4 +771,86 @@ stop_mock
     || { echo "$out" | tail -20; fail "T21 'harness probe slim': rc=$rc"; }
 ok "T21 'harness probe slim' runs the suite against the launch clone and logs to state/output/probe-slim-*"
 
+# --- T22: failsafety, no network: a request that was never sent (DNS,
+# refused) is resent after a bounded backoff before it counts toward the
+# network abort, a timeout is not resent; repeat() says ERR when every try
+# errored; a single-suite 429 does not mark a size dead; an unexpected
+# exception gives one redacted line, the summary so far and rc 1 ---
+out=$(cd "$TMP_ROOT/scripts" && PROXY_API_URL="http://127.0.0.1:9/$PREFIX" PROXY_API_KEY="$KEY" \
+      python3 -I - <<'PYEOF4' 2>&1
+import io, sys, types
+from contextlib import redirect_stdout
+sys.path.insert(0, ".")
+import probe_upstream as P
+waits = []
+P._sleep = waits.append
+def resp(status=None, error=""):
+    r = P.Resp()
+    r.status, r.error = status, error
+    return r
+class C:
+    log = None
+    def __init__(self, replies):
+        self.replies, self.n = list(replies), 0
+    def request(self, *a, **k):
+        self.n += 1
+        return self.replies.pop(0)
+a = types.SimpleNamespace(model="m", repeat=3, facts=6, reps=1, quick=False, seed=1, tpm=0, delay_scale=0, timeout=5)
+dns = "URLError: <urlopen error [Errno -2] Name or service not known>"
+def prober(replies):
+    pr = P.Prober(a, C(replies), lambda x: x, lambda s: None)
+    return pr
+bad = []
+pr = prober([resp(None, dns), resp(None, "URLError: <urlopen error [Errno 111] Connection refused>"), resp(200)])
+r = pr.chat([], "x")
+if (r.status, waits, pr.c.n, pr.consec_net_fail) != (200, [30, 60], 3, 0):
+    bad.append(("dns then refused then ok", r.status, waits, pr.c.n))
+del waits[:]
+pr = prober([resp(None, dns)] * 5)
+pr.chat([], "x")
+if (waits, pr.c.n, pr.consec_net_fail) != ([30, 60, 120, 240], 5, 1):
+    bad.append(("bounded backoff", waits, pr.c.n, pr.consec_net_fail))
+del waits[:]
+for err in ("URLError: <urlopen error timed out>", "ConnectionResetError: [Errno 104] Connection reset by peer",
+            "RemoteDisconnected while reading: Connection refused"):
+    pr = prober([resp(None, err)])
+    pr.chat([], "x")
+    if (waits, pr.c.n) != ([], 1):
+        bad.append(("resent a maybe-billed request", err, waits, pr.c.n))
+pr = prober([])
+seq = iter([(False, resp(None, dns)), (False, resp(503)), (False, resp(None, dns))])
+if pr.repeat(lambda: next(seq))[0] != "ERR":
+    bad.append("repeat all errors != ERR")
+seq = iter([(False, resp(200)), (False, resp(503)), (False, resp(None, dns))])
+if pr.repeat(lambda: next(seq))[0] != "FAIL":
+    bad.append("repeat one real reply != FAIL")
+sp = P.SingleProber(a, C([]), lambda x: x, lambda s: None)
+job = {"stage": "A", "fmt": "markers", "framing": "end", "size": 8000, "rep": 0, "seed": 3, "label": "j"}
+for st in (429, 429, 429, 429):
+    sp.send = lambda text, label, st=st: (resp(st), 6)
+    sp.one(job)
+if sp.size_fail.get(8000) or 8000 in sp.dead_sizes:
+    bad.append(("429 counted toward size_fail", sp.size_fail))
+for _ in range(3):
+    sp.send = lambda text, label: (resp(503), 1)
+    sp.one(job)
+if 8000 not in sp.dead_sizes:
+    bad.append("3 x 503 did not mark the size dead")
+def boom(self):
+    raise RuntimeError("bad reply from http://127.0.0.1:9/zqsecretprefix key sk-test-PROBEKEY-9f8e7d6c5b4a3210")
+P.Prober.run = boom
+sys.argv = ["probe_upstream.py", "--model", "m"]
+buf = io.StringIO()
+with redirect_stdout(buf):
+    rc = P.main()
+txt = buf.getvalue()
+if rc != 1 or "probe error: RuntimeError: bad reply" not in txt or "findings so far" not in txt \
+        or "PROBEKEY" in txt or "zqsecretprefix" in txt or "Traceback" in txt:
+    bad.append(("unexpected exception", rc, txt[-400:]))
+print("BAD %r" % bad if bad else "FAILSAFE OK")
+PYEOF4
+)
+[[ "$out" == *"FAILSAFE OK"* ]] || fail "T22 failsafety: $out"
+ok "T22 unsent requests back off and resend (bounded), billed-maybe ones do not; ERR not FAIL on all-error repeats; 429 does not kill a size; an unexpected exception is one redacted line + summary, rc 1"
+
 echo "PROBE TEST PASSED"

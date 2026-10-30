@@ -1090,7 +1090,21 @@ class Runs:
         text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
         return "\n".join([x for x in text.splitlines() if x.strip()][-lines:])
 
-    def start_runner(self, mode):
+    def resume_runner(self):
+        """At serve's start: a queue run that died without ending (the machine went
+        down: its run.json is left, with no beat) starts again as it was, its mode and
+        parallel slots, and picks its tickets up where they were. A run that ended
+        (done, halted, Ctrl-C) took its run.json away. QUEUE_AUTORESUME=0: never.
+        Returns (ok, message), or None when there is nothing to start again."""
+        if os.environ.get("QUEUE_AUTORESUME", "1").strip() == "0" or not self.queue_dir:
+            return None
+        r = self.runner()
+        if r["running"] or not r["beat"] or r["starting"]:
+            return None
+        return self.start_runner("single" if r["single"] else "host" if r["host"] else "container",
+                                 parallel=r["parallel"], why="started again: the last run ended with the machine")
+
+    def start_runner(self, mode, parallel=0, why="started from the queue page"):
         """Start `harness queue run` in the background, as its own process group with
         no terminal. mode: container, host or single (single-message host mode).
         Returns (ok, message)."""
@@ -1114,6 +1128,8 @@ class Runs:
                 argv.append("--host")
             elif mode == "single":
                 argv.append("--single-message")   # harness takes it for host mode too
+            if parallel > 1:
+                argv += ["--parallel", str(parallel)]
             env = dict(os.environ)
             env["HARNESS_OPEN"] = "0"             # no browser tab: the owner is on this page
             if mode != "container":
@@ -1136,7 +1152,7 @@ class Runs:
             try:
                 os.makedirs(self.queue_dir, exist_ok=True)
                 with open(os.path.join(self.queue_dir, "runner.out"), "ab") as out:
-                    out.write(f"\n== {time.strftime('%Y-%m-%d %H:%M:%S')} started from the queue page: "
+                    out.write(f"\n== {time.strftime('%Y-%m-%d %H:%M:%S')} {why}: "
                               f"harness queue run {' '.join(argv[4:])}\n".encode())
                     out.flush()
                     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
@@ -1722,12 +1738,16 @@ def _runner_card(runs, r, now, back=""):
                  if back else "Tickets wait until a run takes them, one at a time, in this order.")
         parts.append("<div class='state'><span class='sdot'></span><div><h2>Queue not running</h2>"
                      f"<div class='muted'>{waits}</div></div></div>")
+        # the mode the last run had (a run.json it left behind), else container
+        mode = "single" if r["single"] else "host" if r["host"] else "container"
         parts.append("<form method='post' action='/runs/queue/start' class='startf' "
                      "data-confirm-host='Host mode runs the agents as you, with no container and no firewall. Start?'>"
                      + (_hidden("back", back) if back else "") +
-                     "<div class='checks'><label><input type='radio' name='mode' value='container' checked> container</label>"
-                     "<label><input type='radio' name='mode' value='host'> host</label>"
-                     "<label><input type='radio' name='mode' value='single'> host, single message</label></div>"
+                     "<div class='checks'>"
+                     + "".join(f"<label><input type='radio' name='mode' value='{m}'{' checked' if m == mode else ''}> "
+                               f"{label}</label>" for m, label in (("container", "container"), ("host", "host"),
+                                                                    ("single", "host, single message")))
+                     + "</div>"
                      "<label class='opt'><input type='checkbox' name='confirm_host' value='1'>"
                      "<span>host mode is OK<small>no container, no firewall</small></span></label>"
                      "<button type='submit' class='primary'>Start the queue</button></form>")
