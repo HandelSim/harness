@@ -481,14 +481,14 @@ def tests_problems(text, st=None):
     if test_command(text):
         return []
     st = st or {}
-    drop = f"harness queue edit {st.get('key', 'KEY')} --stages {without_test(st)}"
+    drop = f"the queue's edit {st.get('key', 'KEY')} --stages {without_test(st)}"   # not OWNER_ONLY: the agent fixes it
     m = TEST_COMMAND_LINE.search(sections(text).get("tests", ""))
     if m and (m.group(2) or m.group(1)) and st.get("take_defaults"):
         return ["the plan says - Command: none, but this ticket takes the plan's defaults: write the default's "
-                "runner command in - Command: `<command>` (or the owner drops the test stage: " + drop + ")"]
+                "runner command in - Command: `<command>` (or the owner drops the test stage with " + drop + ")"]
     if m and (m.group(2) or m.group(1)) and any(question_mark(q) == "blocking" for q in plan_questions(sections(text))):
         return []
-    return [NO_TESTS_SECTION + "; the owner drops the test stage with " + drop]
+    return [NO_TESTS_SECTION + "; or the owner drops the test stage with " + drop]
 
 
 def plan_questions(secs):

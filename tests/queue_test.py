@@ -4595,7 +4595,7 @@ class TestStageTest(Base):
         self.assertEqual({k: guide[k] for k in self.OLD_GUIDE}, self.OLD_GUIDE)
 
     def test_the_plan_check_of_the_tests_section(self):
-        no = [tq.NO_TESTS_SECTION + "; the owner drops the test stage with harness queue edit KEY --stages "
+        no = [tq.NO_TESTS_SECTION + "; or the owner drops the test stage with the queue's edit KEY --stages "
               "plan,implement,review,fix,push"]
         self.assertEqual(tq.tests_problems(self.PLAN), no)
         self.assertEqual(tq.tests_problems(self.PLAN + "## Tests\n- Files: `test_x.py`\n"), no)
@@ -4838,7 +4838,8 @@ class TestStageTest(Base):
         self.assertIn("takes the plan's defaults: write the default's runner command in - Command:", got[0])
         # no ## Tests at all: the way to drop the stage is a command that works
         got = tq.tests_problems(self.PLAN, {"key": "ABC-1", "stages": self.STAGES.split(",")})
-        self.assertIn("harness queue edit ABC-1 --stages plan,implement,review,fix,push", got[0])
+        self.assertIn("edit ABC-1 --stages plan,implement,review,fix,push", got[0])
+        self.assertFalse(tq.OWNER_ONLY.search(got[0]))   # the plan agent still goes on once to add the section
         self.add_tested()
         ctx = type("C", (), {"vault": self.vault, "q": tq.Queue(self.state)})()
         step = tq.test_words(ctx, tq.Queue(self.state).load("ABC-1"))["TEST_STEP"]
