@@ -469,15 +469,26 @@ def test_command(plan_text):
     return "" if cmd.lower() == "none" else cmd
 
 
-def tests_problems(text):
+def without_test(st):
+    """The ticket's stages less the test stage, as --stages takes them."""
+    return ",".join(s for s in stages_of(st) if s != "test")
+
+
+def tests_problems(text, st=None):
     """With the test stage: a plan with no ## Tests command fails; "- Command: none"
-    passes only with a [blocking] question (the owner settles how to test, or drops the stage)."""
+    passes only with a [blocking] question (the owner settles how to test, or drops the
+    stage), and never when the ticket takes the plan's defaults (nobody answers it)."""
     if test_command(text):
         return []
+    st = st or {}
+    drop = f"harness queue edit {st.get('key', 'KEY')} --stages {without_test(st)}"
     m = TEST_COMMAND_LINE.search(sections(text).get("tests", ""))
+    if m and (m.group(2) or m.group(1)) and st.get("take_defaults"):
+        return ["the plan says - Command: none, but this ticket takes the plan's defaults: write the default's "
+                "runner command in - Command: `<command>` (or the owner drops the test stage: " + drop + ")"]
     if m and (m.group(2) or m.group(1)) and any(question_mark(q) == "blocking" for q in plan_questions(sections(text))):
         return []
-    return [NO_TESTS_SECTION]
+    return [NO_TESTS_SECTION + "; the owner drops the test stage with " + drop]
 
 
 def plan_questions(secs):
@@ -2802,12 +2813,13 @@ TEST_STEPS = {
              "the project's tests already are. Find the command in the README, Makefile, package.json, pyproject or "
              "CI config. If the project has no test framework, write - Command: none and ask a [blocking] Question: "
              "(a) tests with the language's built-in runner (python -m unittest, node --test, go test, cargo test), "
-             "installing nothing (Default); (b) drop the test stage."),
+             "installing nothing (Default); (b) drop the test stage (the owner runs harness queue edit {key} --stages "
+             "{rest})."),
     "implement": ("Do not write or run tests, unless the ticket itself asks for them: this ticket has no test stage. "
                   "Install nothing.",
                   "The test stage wrote the tests (see the plan's ## Tests). Run {cmd}, read the output, fix the code "
-                  "until they pass. Do not delete, skip or weaken a test; change one only where it is wrong against "
-                  "the plan, and say why in the commit message. Write no other tests; install nothing. If the command "
+                  "until they pass. Do not delete, skip, weaken or change a test; one that is wrong against "
+                  "the plan: leave it as it is, and say which and why in the commit message. Write no other tests; install nothing. If the command "
                   "cannot run here, say why in the commit message. Remove what the run left behind (caches, build "
                   "output) unless .gitignore covers it; never commit it."),
     "fix": ("Do not write or run tests, unless the ticket itself asks for them: this ticket has no test stage. "
@@ -2834,7 +2846,7 @@ def test_words(ctx, st):
     sha = st.get("test_sha") or ""
     sha = f"the test stage's version: git diff {sha} -- <test files>" if sha else "the test commits"
     step = TEST_STEPS.get(st.get("stage", "plan"), ("", ""))[on]
-    return dict(TEST_STEP=step.format(cmd=cmd, sha=sha), TEST_CRITERIA=TEST_CRITERIA[on], TEST_COMMAND=cmd,
+    return dict(TEST_STEP=step.format(cmd=cmd, sha=sha, key=st["key"], rest=without_test(st)), TEST_CRITERIA=TEST_CRITERIA[on], TEST_COMMAND=cmd,
                 TEST_SHA=st.get("test_sha") or "")
 
 
@@ -2973,7 +2985,8 @@ def task_card(ctx, st, stage):
         card["must_fix"] = len(st["must_fix"])
     guide = stage_guidance(ctx.q, st["key"])
     tested = "test" in stages_of(st) and stage != "test" and stage + "+test" in guide
-    cmd = clip(test_command(read(plan_copy(ctx.q, st["key"]))), 60) if tested else ""
+    cmd = test_command(read(plan_copy(ctx.q, st["key"]))) if tested else ""
+    cmd = cmd if len(cmd) <= 60 else ""   # too long for a card line: "the plan's test command"
     do = [line.replace("{KEY}", st["key"]).replace("{TEST}", cmd or "the plan's test command")
           for line in guide.get(stage + "+test" if tested else stage) or []]
     do = last_failure(st, do) + do
@@ -3192,7 +3205,7 @@ def stage_plan(ctx, st):
     if not text.strip():
         problems = [f"the plan file was not written: write it to {v['PLAN_FILE']}"]
     if not problems and "test" in stages_of(st):   # the test stage runs the plan's ## Tests command
-        problems = tests_problems(text)
+        problems = tests_problems(text, st)
     if not problems:
         try:
             last = json.loads(read(os.path.join(ctx.q.dir(st["key"]), "plan.json")) or "null")
@@ -3342,7 +3355,7 @@ def change_problems(ctx, st, rc, stage):
                         if not st.get("no_branch") and not st.get("baselines") and not st.get("nested")
                         else "nothing changed since the work started: make the change " + HOW_SHORT)
     if not problems and marks and tested:
-        gone = deleted_paths(tested[1])
+        gone = deleted_paths(tested[1]) | {f for f in st.get("test_files") or [] if f not in change[2]}
         problems += [f"{f}: a test the test stage wrote was deleted; put it back ("
                      + (f"git checkout {st['test_sha'][:12]} -- {f}, or " if st.get("test_sha") else "")
                      + "restore the file)" for f in st.get("test_files") or [] if f in gone]
@@ -3361,8 +3374,8 @@ def change_problems(ctx, st, rc, stage):
         ctx.q.log(st["key"], f"warning: {w}")
     if not problems:
         _, diff, files, commits, parts = change
-        if tested:   # a test's line is no proof the code is built
-            diff = tested[1]
+        if marks:   # a test's line is no proof the code is built: the whole change, less the test files
+            diff = without_files(diff, st.get("test_files") or [])
         ctx.q.log(st["key"], f"{stage}: {commits} commit(s), {len(files)} file(s) changed"
                   + (f" ({'; '.join(part_line(p) for p in parts)})" if len(parts) > 1 or st.get("no_branch") else ""))
         notes = ""
@@ -3396,7 +3409,8 @@ def change_problems(ctx, st, rc, stage):
     if stage == "test":   # what the tests were written on: implement and fix are judged on what they add
         st["test_marks"] = {p["repo"]: p["sha"] if p["kind"] == "branch" else
                             worktree_tree(ctx.q, st, repo_dir(st, p["repo"])) for p in change[4]}
-        st["test_files"] = list(change[2])
+        own = ticket_change(ctx.q, st, since=st.get("test_from")) if st.get("test_from") else change
+        st["test_files"] = list(own[2]) if own else []
         st["test_sha"] = change[0] or ""
         st["implement_from"] = mark(change)   # the tests alone are not implement's work
     return []
@@ -3411,6 +3425,13 @@ MET_WHEN = ("A criterion is met only when lines in the diff implement it; a comm
 TEST_PATH = re.compile(r"(?i)(^|/)(tests?|specs?|__tests__|testing)/|(^|/)(test_[^/]*|[^/]*[._-](test|spec)s?\.\w+"
                        r"|[^/]*Tests?\.\w+|conftest\.py)$")
 DELETED = re.compile(r'^--- (?:a/(.*)|"a/(.*)")\n\+\+\+ /dev/null$', re.M)
+
+
+def without_files(diff, files):
+    """The diff less the sections of these files (a diff --git header naming one)."""
+    keep = re.split(r"(?m)^(?=diff --git )", diff)
+    return "".join(sec for sec in keep if not any(sec.split("\n", 1)[0].endswith((f" b/{f}", f' "b/{f}"'))
+                                                for f in files))
 
 
 def deleted_paths(diff):
@@ -3680,6 +3701,11 @@ def no_framework_line(text):
 def stage_test(ctx, st):
     """The opt-in test stage: tests for the plan's criteria, committed before the code
     exists (verify_change marks them: test_marks); a project with no test framework blocks."""
+    if not isinstance(st.get("test_from"), dict):   # the change before the tests: test_files are what it adds
+        before = ticket_change(ctx.q, st)
+        st["test_from"] = {p["repo"]: p["sha"] if p["kind"] == "branch" else
+                           worktree_tree(ctx.q, st, repo_dir(st, p["repo"])) for p in before[4]} if before else {}
+        ctx.q.save(st)
     rc, out, _ = agent_or_kept(ctx, st, "test", lambda: render("test", **common(ctx, st)))
     said = no_framework_line(read(out)) if out else ""
     if said and not moved_since(st, ticket_change(ctx.q, st), "implement"):   # the owner's call, not a retry's
@@ -3687,7 +3713,7 @@ def stage_test(ctx, st):
         rest = ",".join(s for s in stages_of(st) if s != "test")   # the owner's other stages, as chosen
         how = (f"drop the test stage (harness queue edit {key} --stages {rest}, then "
                f"harness queue retry {key} --stage implement), or say which framework to use (harness queue answer "
-               f"{key} --text \"<the framework>\": the plan is made again with it)")
+               f"{key} \"<the framework>\": the plan is made again with it)")
         return block(ctx, st, f"the test stage found no test framework in the project: {clip(' '.join(said.split()), 200)}"
                               f"; {how}", no_go_on=f"the project has no test framework to write the tests in: {how}")
     if verify_change(ctx, st, rc, "test"):
@@ -5024,6 +5050,8 @@ def cmd_edit(q, a):
                 print(f"[queue] {why}", file=sys.stderr)
                 return 1
             now["stages"] = stages
+            if now.get("stage") in ALL_STAGES and now["stage"] not in stages:   # e.g. test dropped at test
+                now["stage"] = next_stage(now, now["stage"]) or now["stage"]
             for k, v in (("plan_review", review), ("take_defaults", defaults)):
                 now.pop(k, None)
                 if v:
@@ -5278,7 +5306,7 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         st.pop("verified_mark", None)
     if not go_on and starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "verify_only", "verified_sha",
-                  "verified_repos", "verified_mark", "implement_from", "built_on", *TEST_MARKS):
+                  "verified_repos", "verified_mark", "implement_from", "built_on", "test_from", *TEST_MARKS):
             st.pop(k, None)
         if st["stage"] == "plan":
             for k in ("questions", "criteria", "plan_sig"):
@@ -5289,7 +5317,7 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         if kept:
             st["verify_only"] = kept
     if st["stage"] in ("plan", "test"):   # the tests are written again, and marked again
-        for k in TEST_MARKS:
+        for k in TEST_MARKS + (() if go_on else ("test_from",)):
             st.pop(k, None)
     q.save(st)
     return st
@@ -5918,7 +5946,7 @@ def cmd_followup(q, a):
                      plan_approved=False)
         if st:   # the review and checks of the last round are not this one's
             for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "questions", "criteria",
-                      "assumptions", "subs", *TEST_MARKS):
+                      "assumptions", "subs", "test_from", *TEST_MARKS):
                 st.pop(k, None)
             q.save(st)
     if st:

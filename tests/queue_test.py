@@ -2540,10 +2540,10 @@ class ReviewerFixesTest(Base):
     def test_a_stop_at_the_push_pushes_nothing(self):
         real = tq.fetch_branch
 
-        def fetch(q, st):
+        def fetch(q, st, since=None):
             if st["stage"] == "push":   # the owner stops it as the push stage starts
                 put(q.sentinel(st["key"]), "x")
-            return real(q, st)
+            return real(q, st, since)
         self.add("ABC-1")
         with mock.patch.object(tq, "fetch_branch", fetch):
             rc, out = self.run_queue()
@@ -4715,7 +4715,8 @@ class TestStageTest(Base):
                       "unittest or tests/ folder", st["reason"])
         self.assertIn("harness queue edit ABC-1 --stages plan,implement,review,fix,push, then harness queue retry "
                       "ABC-1 --stage implement", st["reason"])
-        self.assertIn("harness queue answer ABC-1 --text", st["reason"])
+        self.assertIn('harness queue answer ABC-1 "<the framework>"', st["reason"])   # the wrapper's usage
+        self.assertNotIn("--text", st["reason"])
         self.assertEqual(self.code_checks(), [])
         # the commands it gives go on
         rc, out = self.q("edit", "ABC-1", "--stages", "plan,implement,review,fix,push")
@@ -4738,6 +4739,7 @@ class TestStageTest(Base):
         rc, out = self.q("edit", "ABC-1", "--stages", "plan,implement")
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.status()["stages"], ["plan", "implement"])
+        self.assertEqual(self.status()["stage"], "implement")   # the stage it was at is gone: the next one
 
     def test_every_stage_an_agent_works_in_has_its_tables(self):
         guide = tq.stage_guidance()
@@ -4805,6 +4807,39 @@ class TestStageTest(Base):
         for words in (cat(os.path.join(tq.PROMPTS, "test.md")), cat(tq.STAGE_GUIDANCE),
                       'finish with a message that starts "NO TEST FRAMEWORK:"', "", None):
             self.assertEqual(tq.no_framework_line(words), "", words)   # the prompt's and the card's words
+
+    def test_the_test_files_are_the_test_stages_own_after_a_retry_at_test(self):
+        os.environ.update(FAKE_TESTS=self.CMD)
+        self.add_tested()
+        self.run_queue()
+        Q = tq.Queue(self.state)
+        self.assertEqual(Q.load("ABC-1")["status"], "done")
+        rc, out = self.q("retry", "ABC-1", "--stage", "test")
+        self.assertEqual(rc, 0, out)
+        FakeProxy.seen.clear()
+        self.run_queue()
+        st = Q.load("ABC-1")
+        self.assertEqual(st["test_files"], ["test_feature.py"], st.get("reason"))   # not round one's feature.txt
+        diff = "diff --git a/feature.txt b/feature.txt\n+x\ndiff --git a/test_feature.py b/test_feature.py\n+t\n"
+        self.assertEqual(tq.without_files(diff, ["test_feature.py"]), "diff --git a/feature.txt b/feature.txt\n+x\n")
+
+    def test_command_none_is_a_plan_problem_when_the_defaults_are_taken(self):
+        plan = self.PLAN + "## Tests\n- Command: none\n## Questions\n- Q1 [blocking]: which runner? Options: (a) unittest " \
+                           "(Default) (b) drop the test stage\n"
+        st = {"key": "ABC-1", "stages": self.STAGES.split(",")}
+        self.assertEqual(tq.tests_problems(plan, st), [])
+        st["take_defaults"] = True
+        got = tq.tests_problems(plan, st)
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("takes the plan's defaults: write the default's runner command in - Command:", got[0])
+        # no ## Tests at all: the way to drop the stage is a command that works
+        got = tq.tests_problems(self.PLAN, {"key": "ABC-1", "stages": self.STAGES.split(",")})
+        self.assertIn("harness queue edit ABC-1 --stages plan,implement,review,fix,push", got[0])
+        self.add_tested()
+        ctx = type("C", (), {"vault": self.vault, "q": tq.Queue(self.state)})()
+        step = tq.test_words(ctx, tq.Queue(self.state).load("ABC-1"))["TEST_STEP"]
+        self.assertIn("(b) drop the test stage (the owner runs harness queue edit ABC-1 --stages "
+                      "plan,implement,review,fix,push)", step)
 
     def test_a_retry_at_test_needs_a_plan_with_a_test_command(self):
         self.add("ABC-1")   # without the test stage: its plan has no ## Tests
