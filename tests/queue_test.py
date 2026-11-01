@@ -4846,6 +4846,18 @@ class TestStageTest(Base):
         self.assertIn("(b) drop the test stage (the owner runs harness queue edit ABC-1 --stages "
                       "plan,implement,review,fix,push)", step)
 
+    def test_a_test_command_too_long_for_the_card_is_named_not_clipped(self):
+        long = "python3 -m unittest test_feature  # " + "x" * 40   # over 60 characters
+        os.environ.update(FAKE_TESTS=long)
+        self.add_tested()
+        rc, out = self.run_queue()
+        cards = [c for c in self.cards() if c["stage"] == "implement"]
+        self.assertTrue(cards, out)
+        guide = tq.stage_guidance()
+        self.assertEqual(cards[0]["do"], [l.replace("{KEY}", "ABC-1").replace("{TEST}", "the plan's test command")
+                                          for l in guide["implement+test"]])
+        self.assertFalse(any(long[:30] in l for l in cards[0]["do"]))   # never a clipped command that cannot run
+
     def test_the_implement_prompt_leaves_a_wrong_test_as_the_card_does(self):
         step = tq.TEST_STEPS["implement"][1]
         self.assertIn("leave it as it is, and say which and why in the commit message", step)
