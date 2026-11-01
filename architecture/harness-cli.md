@@ -864,6 +864,32 @@ uncommitted-mode repository during a ticket show up in its change. `check_change
 repository committed whole, or in a tracked file's place) which `.gitmodules` does not
 name (`added_gitlinks`, with `--ignore-submodules=none`), so submodules, the
 owner's or the ticket's, pass.
+Submodules (`submodules_of`: the index's gitlinks with a checkout there; not
+`nested_repos`) never drop the agent's work:
+- one of an uncommitted repository (the top with `--no-branch`, a repository
+  inside left uncommitted) is an uncommitted repository itself, baselined by
+  `take_baselines`, its files part of the change;
+- one of the top on its branch: its change lands as commits inside it plus the
+  new pointer committed in the top. `take_baselines` snapshots it (files as they
+  are, at any stage) into `st["subs"]`; `submodule_problems` (in `verify_change`,
+  clone or in place) fails implement and fix on changes not committed inside it,
+  or a HEAD the branch's pointer does not name, since the snapshot, with the
+  exact commands. The queue commits nothing there itself. The owner's dirty
+  submodule is not kept out of the top's commits (`in_place_problems`);
+- `submodule_diffs` adds each moved pointer's old..new diff, run inside the
+  submodule (`sub_repo`: the work's checkout, else the project's), to the top's
+  part, so review and the verifier see the work; an added one stays its
+  "Subproject commit" line;
+- `push_submodules`, before the top's push: each pointer the branch adds or moves
+  to a commit on none of the submodule's remote-tracking branches (git's
+  `--recurse-submodules=check` test, done by hand: `on-demand` would push the
+  submodule's own refspecs) is pushed to `ctx.remote` there as the ticket's
+  branch; no such remote, a refused push, or the commit in no checkout here
+  blocks the push, and the top is not pushed.
+A clone does not check submodules out (the agent may: `git submodule update
+--init`); `fetch_branch` fetches with `--no-recurse-submodules`, as git's
+on-demand fetch fails on commits only the clone's submodule has. Not covered:
+submodules of a `--repo-branch` repository, and submodules of submodules.
 Windows container launches cannot work in place (`--host`).
 Each launch gets `HARNESS_QUEUE_LAUNCH` (a nonce), which harness puts on its
 container as `harness.queue-launch` and which stops `--ticket` being

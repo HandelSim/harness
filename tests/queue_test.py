@@ -3833,5 +3833,151 @@ class NestedReposTest(Base):
         self.assertIn("You are on branch ABC-1. Stay on that branch.", prompt)
         self.assertIn("4. Commit on ABC-1: `git add <the files you changed>`", prompt)
 
+
+# FAKE_NESTED ops of SubmoduleWorkTest's agent, on a submodule DIR:
+#   bump:DIR  agent.txt committed inside DIR, and its new pointer staged in the top
+#   lazy:DIR  agent.txt left uncommitted inside DIR, committed as bump does once the prompt says how
+#   init:DIR  DIR checked out first (git submodule update --init: a clone has it empty), then bump
+SUB_OPS = '''        if op in ("bump", "lazy", "init"):
+            if op == "init":
+                git("-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init", d)
+            with open(os.path.join(d, "agent.txt"), "a") as f:
+                f.write("the agent was here\\n")
+            if op != "lazy" or "git -C " + d + " commit" in prompt:
+                git("-C", d, "add", "agent.txt")
+                git("-C", d, *me, "commit", "-q", "-m", "agent in sub")
+                git("add", d)
+            continue
+'''
+
+
+class SubmoduleWorkTest(Base):
+    """The agent's work inside a submodule is never dropped: on the top's branch it must
+    be committed there and its pointer committed in the top, or the stage fails with the
+    commands; review and the verifier see the submodule's own diff; the push puts the
+    submodule's commit on its remote first, or blocks without pushing the top. With
+    --no-branch a submodule's edits are part of the change left uncommitted."""
+    add_in_place = NestedReposTest.add_in_place
+    review_prompt = NestedReposTest.review_prompt
+
+    def setUp(self):
+        super().setUp()
+        anchor = '        if op == "switch":\n'
+        put(os.path.join(self.tmp, "fake_agent.py"), FAKE_AGENT.replace(anchor, SUB_OPS + anchor, 1))
+
+    def submodule(self, rel="mods/sub"):
+        """The project with a submodule at rel, cloned from a bare remote of its own."""
+        src, remote = os.path.join(self.tmp, "subsrc"), os.path.join(self.tmp, "sub.git")
+        sh("git", "init", "-q", "-b", "main", src)
+        put(os.path.join(src, "s.txt"), "sub\n")
+        sh("git", "-C", src, "add", "s.txt")
+        sh("git", "-C", src, "-c", "user.name=O", "-c", "user.email=o@example.com", "commit", "-q", "-m", "sub")
+        sh("git", "clone", "-q", "--bare", src, remote)
+        self.git_p("-c", "protocol.file.allow=always", "submodule", "add", "-q", remote, rel)
+        self.git_p("commit", "-q", "-m", "a submodule")
+        self.git_p("push", "-q", "origin", "main")
+        return remote, os.path.join(self.project, rel)
+
+    def pointer(self):
+        """The submodule commit the top's pushed branch points to, and whether its remote has it."""
+        ptr = sh("git", "-C", self.remote, "rev-parse", "ABC-1:mods/sub").strip()
+        r = subprocess.run(["git", "-C", os.path.join(self.tmp, "sub.git"), "rev-parse", "-q", "--verify",
+                            "refs/heads/ABC-1"], capture_output=True, text=True)
+        return ptr, r.stdout.strip()
+
+    def test_work_left_uncommitted_in_a_submodule_fails_with_the_commands(self):
+        _, d = self.submodule()
+        sh("git", "-C", d, "checkout", "-q", "--detach")
+        put(os.path.join(d, "owner.txt"), "the owner's, there before\n")
+        os.environ["FAKE_NESTED"] = "lazy:mods/sub"
+        self.add_in_place()
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        self.assertIn("mods/sub: changes not committed inside the submodule (agent.txt): git -C mods/sub switch -c "
+                      "ABC-1, git -C mods/sub add <files>, git -C mods/sub commit, then git add mods/sub, git commit",
+                      st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+
+    def test_the_retry_that_commits_it_is_reviewed_and_pushed_with_the_submodule_first(self):
+        _, d = self.submodule()
+        put(os.path.join(d, "owner.txt"), "the owner's, there before\n")   # the top's status: mods/sub changed
+        os.environ["FAKE_NESTED"] = "lazy:mods/sub"
+        self.add_in_place("implement,review,push")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        self.assertIn("changes not committed inside the submodule", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        review = self.review_prompt().split("<<<BEGIN_DIFF")[-1]
+        self.assertIn("b/mods/sub/agent.txt", review)   # the submodule's own diff, not just its pointer line
+        self.assertIn("+the agent was here", review)
+        self.assertNotIn("owner.txt", review)
+        ptr, pushed = self.pointer()
+        self.assertEqual(pushed, ptr)   # the pointer names a commit the submodule's remote has
+
+    def test_a_commit_in_a_submodule_its_pointer_does_not_name_fails(self):
+        _, d = self.submodule()
+        os.environ["FAKE_NESTED"] = "commit:mods/sub"
+        self.add_in_place()
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        head = sh("git", "-C", d, "rev-parse", "HEAD").strip()
+        self.assertIn(f"mods/sub: the submodule is at {head[:12]}, not where branch ABC-1 points it ", st["reason"])
+        self.assertIn("): git add mods/sub, git commit", st["reason"])
+
+    def test_a_submodule_commit_it_cannot_push_blocks_the_whole_push(self):
+        remote, d = self.submodule()
+        sh("git", "-C", d, "remote", "rename", "origin", "upstream")
+        os.environ["FAKE_NESTED"] = "bump:mods/sub"
+        self.add_in_place()
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        self.assertIn("submodule mods/sub has no remote origin", st["reason"])
+        self.assertIn("harness queue retry ABC-1 --stage push", st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")   # the top not pushed
+        sh("git", "-C", d, "remote", "rename", "upstream", "origin")
+        hook = os.path.join(remote, "hooks", "pre-receive")
+        put(hook, "#!/bin/sh\necho no thanks >&2\nexit 1\n")
+        os.chmod(hook, 0o755)
+        rc, out = self.q("retry", "ABC-1", "--stage", "push")
+        self.assertEqual(rc, 0, out)
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        self.assertIn("push of submodule mods/sub to origin refused", st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+        os.remove(hook)
+        self.q("retry", "ABC-1", "--stage", "push")
+        self.run_queue()
+        self.assertEqual(self.status()["status"], "done", self.status().get("reason"))
+        ptr, pushed = self.pointer()
+        self.assertEqual(pushed, ptr)
+
+    def test_no_branch_a_submodules_edits_are_part_of_the_change_left_uncommitted(self):
+        _, d = self.submodule()
+        os.environ.update(FAKE_NESTED="edit:mods/sub", FAKE_TOP_UNCOMMITTED="1")
+        self.add_in_place("implement,review,push", "--no-branch")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        self.assertIn("mods/sub/agent.txt", self.review_prompt().split("<<<BEGIN_DIFF")[-1])
+        self.assertEqual(st["left_uncommitted"], [".", "mods/sub"])
+        self.assertEqual(cat(os.path.join(d, "agent.txt")), "the agent was here\n")
+
+    def test_in_a_clone_a_submodule_the_agent_checks_out_and_changes_is_pushed_first(self):
+        self.submodule()
+        os.environ["FAKE_NESTED"] = "init:mods/sub"
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--clone", "--stages", "implement,review,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        self.assertIn("b/mods/sub/agent.txt", self.review_prompt().split("<<<BEGIN_DIFF")[-1])
+        ptr, pushed = self.pointer()
+        self.assertEqual(pushed, ptr)
+
+
 if __name__ == "__main__":
     unittest.main()

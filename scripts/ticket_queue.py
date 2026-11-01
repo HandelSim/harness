@@ -1014,6 +1014,7 @@ def enter_in_place(q, st):
     project, branch, key = st["project"], branch_of(st), st["key"]
     st.pop("base_sha", None)
     st.pop("baselines", None)   # set up again: what the uncommitted repositories hold is looked at again
+    st.pop("subs", None)
     q.save(st)
     trouble = in_place_trouble(project, None)
     if trouble:
@@ -1429,26 +1430,68 @@ def uncommitted_repos(st, skip=()):
     return (["."] if st.get("no_branch") else []) + [r for r in nested_repos(st["project"], skip) if r not in named]
 
 
+def submodules_of(repo):
+    """The submodules checked out in repo: its gitlinks (in the index) with a repository
+    there. Relative paths, sorted; [] in a repository with none."""
+    staged = git(repo, "ls-files", "-s", "-z", check=False).stdout.split("\0")
+    links = {e.split("\t", 1)[1] for e in staged if e.startswith("160000 ") and "\t" in e}
+    return sorted(s for s in links if os.path.exists(os.path.join(repo, s, ".git")))
+
+
+def moved_pointers(project, since, sha, kinds="M"):
+    """[(rel, old, new)]: the submodule pointers (gitlinks) since..sha changes in project,
+    kinds of change as diff --diff-filter takes them (M moved, A added)."""
+    raw = git(project, "diff", "--raw", "-z", "--no-abbrev", "--no-renames", "--ignore-submodules=none",
+              f"--diff-filter={kinds}", since, sha, check=False).stdout.split("\0")
+    out = []
+    for i in range(0, len(raw) - 1, 2):
+        meta = raw[i].split()
+        if raw[i].startswith(":") and len(meta) >= 4 and meta[1] == "160000" and meta[0] in (":160000", ":000000"):
+            out.append((raw[i + 1], meta[2], meta[3]))
+    return out
+
+
+def sub_repo(q, st, rel, sha):
+    """The checkout of submodule rel that holds commit sha: the one the agents worked in,
+    else the project's; "" when neither does."""
+    for top in dict.fromkeys((workdir(q, st), st["project"])):
+        d = os.path.join(top, rel)
+        if os.path.exists(os.path.join(d, ".git")) and \
+                git(d, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0:
+            return d
+    return ""
+
+
 def take_baselines(q, st, stage, skip=()):
     """Before the first stage after the plan: what each uncommitted repository holds
     (uncommitted_repos), as a commit at refs/harness-queue/base/KEY there. Its part of
     the change is its files against that. Before implement: its files as they are (the
     owner's uncommitted work is not the ticket's); a ticket with no implement (review
     first): its HEAD, so what is uncommitted there is the change. Kept until the work
-    is set up again (enter_in_place)."""
+    is set up again (enter_in_place). A submodule of an uncommitted repository is one
+    too; one of the top on its branch is snapshot the same way into st["subs"], so
+    submodule_problems tells the work there from what was there before."""
     if stage == "plan" or isinstance(st.get("baselines"), dict):
         return
-    key, out = st["key"], {}
+    key, out, subs = st["key"], {}, {}
     try:
         repos = uncommitted_repos(st, skip)
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
         q.log(key, f"warning: repositories inside the project not looked for before {stage}: {e}")
         repos = ["."] if st.get("no_branch") else []
-    for rel in repos:
+    on_branch = []   # the top's submodules, whose change lands on the top's branch
+    for parent in ([] if st.get("no_branch") else ["."]) + list(repos):
+        try:
+            found = [s if parent == "." else f"{parent}/{s}" for s in submodules_of(repo_dir(st, parent))]
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            q.log(key, f"warning: the submodules of {parent} not looked for before {stage}: {e}")
+            continue
+        (repos if parent in repos else on_branch).extend(s for s in found if s not in repos)
+    for rel in repos + on_branch:
         d = repo_dir(st, rel)
         try:
             head = git(d, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False).stdout.strip()
-            if stage == "implement":
+            if stage == "implement" or rel in on_branch:   # a submodule's change is its commits
                 tree = worktree_tree(q, st, d)
             elif head:
                 tree = git(d, "rev-parse", f"{head}^{{tree}}").stdout.strip()
@@ -1457,10 +1500,12 @@ def take_baselines(q, st, stage, skip=()):
             sha = git(d, "commit-tree", tree, "-m", f"{key}: {rel} before the ticket's work",
                       env=SNAP_WHO).stdout.strip()
             git(d, "update-ref", f"refs/harness-queue/base/{key}", sha)
-            out[rel] = {"snap": sha, "head": head}
+            (subs if rel in on_branch else out)[rel] = {"snap": sha, "head": head}
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             q.log(key, f"warning: {rel} not looked at before {stage}: {e}; a change there is not part of the ticket's")
     st["baselines"] = out
+    if subs:
+        st["subs"] = subs
     q.save(st)
     if out:
         q.log(key, f"left uncommitted (the change there is the files against how they are now): {', '.join(out)}")
@@ -1483,9 +1528,10 @@ def ticket_change(q, st):
     parts, diffs = [], []
     top = None if st.get("no_branch") else fetch_branch(q, st)
     if top:
-        parts.append({"repo": ".", "kind": "branch", "branch": branch_of(st), "sha": top[0], "files": top[2],
-                      "commits": top[3]})
-        diffs.append(top[1])
+        sub_diff, sub_files = submodule_diffs(q, st, top[0])
+        parts.append({"repo": ".", "kind": "branch", "branch": branch_of(st), "sha": top[0],
+                      "files": top[2] + sub_files, "commits": top[3]})
+        diffs.append(top[1] + sub_diff)
     for rel, n in sorted((st.get("nested") or {}).items()):
         d = repo_dir(st, rel)
         sha = git(d, "rev-parse", "-q", "--verify", f"refs/heads/{n['branch']}", check=False).stdout.strip()
@@ -1510,6 +1556,53 @@ def ticket_change(q, st):
             sum(p["commits"] for p in parts), parts)
 
 
+def submodule_diffs(q, st, sha):
+    """(diff, files): what each submodule pointer the top's branch moves (since the base)
+    brings, from inside the submodule (its old..new diff, its paths under its folder), so
+    the work there is reviewed, not just its "Subproject commit" line. One added stays that
+    line (its history is not the ticket's), as does one whose commits are not here."""
+    diffs, files = [], []
+    for rel, old, new in moved_pointers(st["project"], st["base_sha"], sha):
+        d = sub_repo(q, st, rel, new)
+        if d and git(d, "cat-file", "-e", f"{old}^{{commit}}", check=False).returncode == 0:
+            diff, fs = repo_diff(d, rel, old, new)
+            diffs.append(diff)
+            files += fs
+    return "".join(diffs), files
+
+
+def submodule_problems(q, st):
+    """[problem] for each submodule of the top holding work its branch does not: changes
+    not committed there, or a HEAD the branch's pointer does not name. What was there
+    before the work started (st["subs"], in place) is the owner's and passes. The queue
+    commits nothing itself: the agent is told the exact commands."""
+    if st.get("no_branch"):
+        return []
+    wd, branch = workdir(q, st), branch_of(st)
+    tip = git(wd, "rev-parse", "-q", "--verify", f"refs/heads/{branch}^{{commit}}", check=False).stdout.strip()
+    out = []
+    for rel in submodules_of(wd):
+        d, was = os.path.join(wd, rel), (st.get("subs") or {}).get(rel) or {}
+        try:
+            head = git(d, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False).stdout.strip()
+            now = worktree_tree(q, st, d)
+            names = lambda a: set(git(d, "diff", "--name-only", "--no-ext-diff", a, now).stdout.splitlines())  # noqa: E731
+            loose = sorted(names(head) & (names(was["snap"]) if was.get("snap") else names(head))) if head else []
+            pointer = git(wd, "rev-parse", "-q", "--verify", f"{tip}:{rel}", check=False).stdout.strip() if tip else ""
+            detached = git(d, "symbolic-ref", "-q", "HEAD", check=False).returncode != 0
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            q.log(st["key"], f"warning: submodule {rel} not looked at: {e}")
+            continue
+        if loose:   # short: a notools model's card line holds 240 characters
+            switch = f"git -C {rel} switch -c {branch}, " if detached else ""
+            out.append(f"{rel}: changes not committed inside the submodule ({', '.join(loose[:3])}): {switch}"
+                       f"git -C {rel} add <files>, git -C {rel} commit, then git add {rel}, git commit")
+        elif head and head != pointer and head != was.get("head"):
+            out.append(f"{rel}: the submodule is at {head[:12]}, not where branch {branch} points it "
+                       f"({pointer[:12] or 'nowhere'}): git add {rel}, git commit")
+    return out
+
+
 def no_change(st):
     """What a ticket with no change (ticket_change None) lacks, for its problem."""
     if not st.get("no_branch") and not st.get("nested") and not st.get("baselines"):
@@ -1527,7 +1620,10 @@ def fetch_branch(q, st):
     key, project = st["key"], st["project"]
     ref = f"refs/heads/{branch_of(st)}"
     if not st.get("in_place"):   # in place the branch is the project's own
-        r = git(project, "fetch", "-q", "--no-tags", workdir(q, st), f"+{ref}:refs/harness-queue/{key}", check=False)
+        # not into the project's submodules: their new commits are in the clone's (git's
+        # on-demand fetch would fail on them, and the branch would look gone)
+        r = git(project, "fetch", "-q", "--no-tags", "--no-recurse-submodules", workdir(q, st),
+                f"+{ref}:refs/harness-queue/{key}", check=False)
         if r.returncode != 0:
             return None
         ref = f"refs/harness-queue/{key}"
@@ -3015,6 +3111,7 @@ def verify_change(ctx, st, rc, stage):
         reattach(ctx, st)
     change = ticket_change(ctx.q, st)
     problems, warnings = check_change(st, change, plan)
+    problems += submodule_problems(ctx.q, st)
     since = st.get("start_sha") or st.get("base_sha")
     if change and change[0] and since and not st.get("no_branch") and \
             git(st["project"], "merge-base", "--is-ancestor", since, change[0], check=False).returncode != 0:
@@ -3246,8 +3343,9 @@ def in_place_problems(ctx, st):
     out = []
     if not st.get("no_branch"):
         owner = owner_files(ctx.q, st)
-        out += owners_touched(project, ".", st["start_sha"], branch_of(st),
-                              set(owner.get("untracked", [])) | set(owner.get("changed", [])))
+        # a submodule the owner had changes in is not kept out: its new pointer is the ticket's to commit
+        mine = set(owner.get("untracked", [])) | set(owner.get("changed", []))
+        out += owners_touched(project, ".", st["start_sha"], branch_of(st), mine - set(st.get("subs") or {}))
     for rel, n in sorted((st.get("nested") or {}).items()):
         trouble = in_place_trouble(repo_dir(st, rel), n["branch"])
         out += [trouble] if trouble else \
@@ -3385,6 +3483,11 @@ def stage_push(ctx, st):
     st["warnings"] = warnings
     # each branch with commits pushed from its own repository: the top's first, then the ones inside it
     pushes, reasons = [], []
+    if sha and ctx.push and git(project, "remote", "get-url", ctx.remote, check=False).stdout.strip():
+        pushes, why = push_submodules(ctx, st, sha)   # before the top, which points to their commits
+        if why:
+            results(ctx, st, change, pushes)
+            return block(ctx, st, why)
     for p in [p for p in parts if p["kind"] == "branch"]:
         d, where = repo_dir(st, p["repo"]), "the project" if p["repo"] == "." else p["repo"]
         of = "" if p["repo"] == "." else f" of {where}"
@@ -3418,6 +3521,40 @@ def stage_push(ctx, st):
     st.update(status="done", stage="done", attempt=0, feedback="", reason=reason, sha=sha or "")
     st.pop("built_on", None)   # the round is built: a retry from the plan starts over, a followup sets it again
     ctx.q.save(st)
+
+
+def push_submodules(ctx, st, sha):
+    """Put each submodule commit the top's branch points to anew (since the base) on a
+    remote of that submodule, before the top is pushed: one on none of its remote-tracking
+    branches (what git push --recurse-submodules=check asks) is pushed to ctx.remote there,
+    as the ticket's branch. (pushes, why): why says what stops the top's push, else ""."""
+    key, name, pushes = st["key"], branch_of(st), []
+    for rel, _, new in moved_pointers(st["project"], st["base_sha"], sha, "AM"):
+        d = sub_repo(ctx.q, st, rel, new)
+        if not d:
+            return pushes, (f"branch {name} points submodule {rel} to {new[:12]}, a commit no checkout of it here "
+                            f"holds, so nobody could check the branch out; nothing was pushed. Commit the work inside "
+                            f"{rel}, then harness queue retry {key} --stage push")
+        if not git(d, "rev-list", "-n", "1", new, "--not", "--remotes", check=False).stdout.strip():
+            continue   # on a remote of it already
+        push = {"remote": ctx.remote, "url": remote_url(d, ctx.remote), "branch": name, "sha": new,
+                "result": "local", "error": "", "repo": rel}
+        pushes.append(push)
+        if not push["url"]:
+            return pushes, (f"submodule {rel} has no remote {ctx.remote}, and its commit {new[:12]} (which branch "
+                            f"{name} points it to) is on none of its remotes; nothing was pushed, as the branch would "
+                            f"point to a commit nobody else has. Push it (git -C {d} push <remote> "
+                            f"{new}:refs/heads/{name}), then harness queue retry {key} --stage push")
+        checkpoint(ctx)   # a stop asked during the stage: nothing (more) pushed
+        r = net_git(d, "push", "-q", ctx.remote, f"{new}:refs/heads/{name}", timeout=PUSH_TIMEOUT)
+        if r.returncode != 0:
+            push.update(result="rejected", error=git_said(r, 300))
+            return pushes, (f"push of submodule {rel} to {ctx.remote} refused: {push['error']}. The project's branch "
+                            f"was not pushed (it points {rel} to {new[:12]}). Fix that, then harness queue retry {key} "
+                            "--stage push")
+        push["result"] = "pushed"
+        ctx.q.log(key, f"pushed submodule {rel}'s {new[:12]} to {ctx.remote} as branch {name}")
+    return pushes, ""
 
 
 def remote_url(project, remote):
