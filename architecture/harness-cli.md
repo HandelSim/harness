@@ -980,10 +980,15 @@ least likely to finish), with no session known, or for a problem naming a
 attempt as before. After a stop the next attempt is a new agent with the
 `GOING_ON` block, its `resume.started` the cut-off session's so the notes it
 wrote still count. After a failed check by an agent that ended on its own, the
-next (counted) attempt goes on in the same session too (`fail`:
-`resume.failed`, the `continue-failed` prompt with the problems; the session
-moves to the new attempt and loses `crashed`), not a new agent doing the stage
-over from its start, and it has its own uncounted go-on), `stop KEY` (a waiting
+next (counted) attempt is not a new agent doing the stage over from its start
+(`fail`: `resume.failed`, with `started`): it goes on in the same session (the
+`continue-failed` prompt with the problems; the session moves to the new
+attempt and loses `crashed`), unless that session already had this attempt's
+check go-on (`went_on` kind `check`) and is still wrong; then a new agent with
+a fresh context finishes its work (the `GOING_ON` block, "did not pass its
+check"). Either way the new attempt has its own uncounted go-on: with
+`--retries 1`, agent, go-on, new agent, go-on, block. `continue` carries the
+session's `started` too), `stop KEY` (a waiting
 ticket becomes `stopped`; a running one the run has in hand gets the
 `KEY/stop` sentinel, which the runner also checks right before the push;
 "in hand" is `run_holds`: a fresh beat, run.json naming it (the run writes
@@ -1028,7 +1033,8 @@ run holds, whatever the status) or the next take ends it; `halt --force`
 also tidies and names a folder left on a ticket's branch; one killed outright leaves it
 `running`, which the viewer shows as "run ended" and the next run takes
 again. Between tickets the runner hashes its own code (`ticket_queue.py`,
-`vault_ingest.py`); when `harness upgrade` changed it, it exits 75 and
+`vault_ingest.py`, the `queue_prompts/*.md` it read at its start and the
+cards' `stage-guidance.json`); when `harness upgrade` changed it, it exits 75 and
 `harness queue run` `exec`s the clone's `harness queue run` with the same
 arguments, `HARNESS_QUEUE_OWNS_PROXY=1` telling the new run that the proxy
 is still its to stop. Each stage is a fresh `harness` launch, so it is on

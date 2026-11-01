@@ -181,7 +181,8 @@ def code_sig():
     here = os.path.dirname(os.path.abspath(__file__))
     prompts = os.path.join(here, "queue_prompts")
     try:   # the stage prompts too: the run holds them from its start (PROMPT_TEXT)
-        names = sorted(os.path.join("queue_prompts", n) for n in os.listdir(prompts) if n.endswith(".md"))
+        names = sorted(os.path.join("queue_prompts", n) for n in os.listdir(prompts)
+                       if n.endswith(".md") or n == "stage-guidance.json")   # the cards' lines too
     except OSError:
         names = []
     for name in list(CODE_FILES) + names:
@@ -2073,7 +2074,9 @@ def go_on_once(ctx, st, rc, crash, problems):
     why = crash or "; ".join(failure_lines(problems))
     st.pop("verify_only", None)   # the agent runs again: its new result is checked, not this one
     st["went_on"] = {"stage": st["stage"], "attempt": st.get("attempt", 0), "kind": "crash" if crash else "check"}
-    st["resume"] = {"stage": st["stage"], "why": why, "message": ""}
+    # started: should the session not be gone on in (a new agent finishes its work), the
+    # notes it wrote still count, as go_on_later's resume does
+    st["resume"] = {"stage": st["stage"], "why": why, "message": "", "started": s.get("started")}
     if not crash:   # the task file and the card say what failed, as a retry's do
         st["resume"]["check"] = True
         st["feedback"] = "\n".join("- " + p for p in problems)
@@ -4176,6 +4179,7 @@ def fail(ctx, st, rc, problems):
     ctx.q.log(st["key"], f"{st['stage']} attempt {st['attempt'] + 1} failed", text)
     record(st, "failed", problems)
     if st["attempt"] < ctx.retries:
+        spent = went_on(st) == "check"   # read before the attempt moves on
         st.update(attempt=st["attempt"] + 1, feedback=text)
         session = st.get("session") or {}
         if (crash or rc in (124, IDLE)) and st["stage"] in RESUMABLE:   # a new agent, told to finish the work
@@ -4185,13 +4189,18 @@ def fail(ctx, st, rc, problems):
                                              else "it made no progress and was stopped"),
                             "started": session.get("started") if session.get("stage") == st["stage"] else None}
         elif rc == 0 and st["stage"] in RESUMABLE and session.get("stage") == st["stage"] and session.get("id"):
-            # it ended on its own and its check failed: it goes on in its session, told what
-            # failed, instead of a new agent doing the stage over from its start (a stop of
-            # this attempt's agent may go on in it once more: go_on_once)
-            session["attempt"] = st["attempt"]
-            session.pop("crashed", None)
+            # it ended on its own and its check failed: not a new agent doing the stage over
+            # from its start. When that session was already told once what its check found
+            # (go_on_once) and it is still wrong, a new agent finishes its work, with a fresh
+            # context (the notes it wrote still count: started); else it goes on in its session,
+            # told what failed. Either way the new attempt has its own go_on_once.
             st["resume"] = {"stage": st["stage"], "failed": True, "message": "",
-                            "why": "the check found:\n" + text}
+                            "why": "the check found:\n" + text, "started": session.get("started")}
+            if spent:
+                st.pop("session", None)
+            else:
+                session["attempt"] = st["attempt"]
+                session.pop("crashed", None)
         ctx.q.save(st)
     else:
         again = ", again after harness queue continue" if st.get("continued") == st["stage"] else ""
@@ -5576,7 +5585,9 @@ def cmd_continue(q, a):
             st["verify_only"] = kept
             st["reason"] = f"continued by the owner: {st['stage']}'s finished work is checked"
         else:
-            st["resume"] = {"stage": st["stage"], "why": cut, "message": text.strip(), "failed": bool(failed)}
+            was = st.get("session") or {}   # should no session be gone on in: its agent's notes count
+            st["resume"] = {"stage": st["stage"], "why": cut, "message": text.strip(), "failed": bool(failed),
+                            "started": was.get("started") if was.get("stage") == st["stage"] else None}
             st["reason"] = f"continued by the owner: {st['stage']} goes on"
         q.save(st)
     s = st.get("session") or {}

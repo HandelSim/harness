@@ -827,7 +827,11 @@ class QueueTest(Base):
         self.run_queue("--debug", "1", "--retries", "0")
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "plan"))
-        self.assertEqual(len(self.calls_of("planning")), 1)
+        # the planner, then its one uncounted go-on in its session; no new planner after the debug
+        calls = self.calls_of("planning")
+        self.assertEqual(len(calls), 2, calls)
+        self.assertNotIn("--session", calls[0])
+        self.assertIn("--session ses_fake0", calls[1])
         self.assertEqual(len(self.calls_of("debug")), 1)
         self.assertEqual((st["debug"]["verdict"], st["debug"]["retried"]), ("fixed", False))
         self.assertIn("start the work over", st["debug"]["note"])
@@ -843,9 +847,12 @@ class QueueTest(Base):
         self.assertNotIn("--session", calls[0])
         self.assertIn("--session ses_fake1", calls[1])
         said = cat(self.calls + ".continue")
-        self.assertIn("did not pass the stage's check: the check found:", said)
-        self.assertIn("no commits on branch ABC-1", said)
+        # the attempt's one uncounted go-on (continue-check); a counted retry goes on in the
+        # session (continue-failed) when it was not told before: test_a_counted_retry_goes_on_in_the_session
+        self.assertIn("did not pass the stage's check: no commits on branch ABC-1", said)
         self.assertNotIn("blocked", said)
+        self.assertEqual([(h["result"], h["attempt"]) for h in self.status()["history"] if h["stage"] == "implement"],
+                         [("went on", 1), ("passed", 1)])
 
     def test_go_on_later_goes_on_only_from_an_agent_this_attempt_launched(self):
         # launched, no session named yet: a new agent, told to finish its work (its notes count)
@@ -2112,8 +2119,9 @@ class OwnerControlTest(Base):
         self.add("ABC-1")
         self.run_queue()
         st = self.status()
-        # the failed check's retry went on in the first agent's session
-        self.assertEqual((st["status"], st["stage"], st["session"]["id"]), ("blocked", "implement", "ses_fake1"))
+        # the first agent went on in its session once (go_on_once) and was still wrong: the
+        # counted retry is a new agent, ses_fake2, which went on in its own session once too
+        self.assertEqual((st["status"], st["stage"], st["session"]["id"]), ("blocked", "implement", "ses_fake2"))
         attempt = st["attempt"]
         del os.environ["FAKE_NO_COMMIT"]
         rc, out = self.q("continue", "ABC-1", "--text", "Commit it this time.")
@@ -2125,7 +2133,7 @@ class OwnerControlTest(Base):
         rc, out = self.run_queue()
         self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
         last = self.calls_of("implementing")[-1]
-        self.assertIn("--session ses_fake1", last)   # the last agent's, the one that was blocked
+        self.assertIn("--session ses_fake2", last)   # the last agent's, the one that was blocked
         said = cat(self.calls + ".continue")
         self.assertIn("did not pass the stage's check", said)   # not "cut off"
         self.assertIn("no commits on branch ABC-1", said)   # what the check said
@@ -4329,8 +4337,16 @@ class GoOnOnceTest(Base):
         st = self.status()
         self.assertEqual((rc, st["status"]), (0, "blocked"), out)
         self.assertTrue(st["reason"].startswith("implement failed 2 time(s): no commits on branch ABC-1"), st["reason"])
-        # each attempt: a new agent, then once on in its session
+        # each attempt: an agent, then once on in its session (continue-check); the session
+        # told once is not gone on in again by the counted retry: a new agent, with a fresh
+        # context, finishes its work (told so, not doing the stage over from its start)
         self.assertEqual(self.sessions("implementing"), [[], ["ses_fake1"], [], ["ses_fake2"]])
+        said = [p for p in cat(self.calls + ".continue").split("\n=====\n") if p.strip()]
+        self.assertEqual(len(said), 2, said)
+        self.assertTrue(all("did not pass the stage's check: no commits on branch ABC-1" in p for p in said), said)
+        third = self.prompts("implementing")[2]
+        self.assertIn("BEGIN_GOING_ON (an earlier agent on this stage did not pass its check", third)
+        self.assertIn("the check found:", third)
         self.assertEqual(self.history("implement"),
                          [("went on", 1), ("failed", 1), ("went on", 2), ("failed", 2), ("blocked", 2)])
         cards = self.cards("implement")
@@ -4356,6 +4372,22 @@ class GoOnOnceTest(Base):
         self.assertEqual(self.history("plan"), [("crashed", 1), ("failed", 1), ("blocked", 1)])
         self.assertIn("going on in its session (once, not counted): its agent stopped on an error",
                       st["history"][0]["details"][0])
+
+    def test_a_counted_retry_goes_on_in_the_session(self):
+        # the attempt's go-on was for a crash, so its session was not told what its check
+        # found: the counted retry goes on in it (continue-failed), not a new agent
+        os.environ.update(FAKE_CRASH="planning:1", FAKE_CRITERIA="")   # a plan with no criteria, each time
+        self.add("ABC-1")
+        rc, out = self.run_queue("--retries", "1")
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "blocked"), out)
+        self.assertEqual(self.sessions("planning"), [[], ["ses_fake0"], ["ses_fake0"], ["ses_fake0"]])
+        self.assertEqual(self.history("plan"),
+                         [("crashed", 1), ("failed", 1), ("went on", 2), ("failed", 2), ("blocked", 2)])
+        said = [p for p in cat(self.calls + ".continue").split("\n=====\n") if p.strip()]
+        self.assertEqual(len(said), 3, said)
+        self.assertIn("did not pass the stage's check: the check found:", said[1])   # continue-failed
+        self.assertNotIn("the check found:", said[2])                                # its go-on: continue-check
 
     def test_a_timeout_gets_no_go_on_but_the_next_attempt_does(self):
         os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_STAGE="implementing", FAKE_SLEEP_ONCE="1",
