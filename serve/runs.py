@@ -2109,7 +2109,7 @@ def _feedback_form(key, st):
     parts.append(f"<label><div class='q'>Other notes</div><textarea name='note' maxlength='{NOTE_MAX}'></textarea>"
                  "</label>")
     if review:   # the same form: approve refuses what it would drop (a rejection, a comment, an answer)
-        other = (f"<button type='submit' formaction='{base}approve' title='implementing starts when the queue run "
+        other = (f"<button type='submit' formaction='{base}approve' title='the next stage starts when the queue run "
                  "gets to this ticket'>Approve the plan</button>")
     else:
         other = ("<button type='submit' name='defaults' value='1' title='The plan is made again with the defaults "
@@ -2235,11 +2235,11 @@ def _t_acts(runs, key, st, rows, live, pos, n):
     if status == "plan-review" and st.get("criteria") and runs.vault_of(st):
         # the feedback form is on the page: approve it, so what is in it is refused rather than lost
         parts.append("<button type='submit' form='planfb' formaction='" + esc(base + "approve") + "' class='primary' "
-                     "title='implementing starts when the queue run gets to this ticket'>Approve the plan</button>")
+                     "title='the next stage starts when the queue run gets to this ticket'>Approve the plan</button>")
     elif status == "plan-review":
         parts.append(_btn(base + "approve", "Approve the plan", "primary",   # sig: the plan this page shows
                           (("sig", st["plan_sig"]),) if st.get("plan_sig") else (),
-                          title="implementing starts when the queue run gets to this ticket"))
+                          title="the next stage starts when the queue run gets to this ticket"))
     if _stuck(st):
         parts.append(_end_btn())
     go_on = _continuable(runs, key, st)
@@ -2344,7 +2344,7 @@ def _t_questions(runs, key, st):
                  else "The plan is waiting on the blocking questions. Answer what you can; " +
                  ("a question left on its default goes with it." if items else
                   "an empty box takes the question's default.") + again + " Go with the defaults instead: the "
-                 "plan is made with every default and implementing starts without it coming back to you.")
+                 "plan is made with every default and the work goes on without it coming back to you.")
         plan = runs.note(key, "plan", vault)
         if plan.strip():   # what is to be approved or answered, where it is decided
             plan = _plan_glance(runs, key, vault, plan)
