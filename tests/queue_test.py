@@ -4846,6 +4846,11 @@ class TestStageTest(Base):
         self.assertIn("(b) drop the test stage (the owner runs harness queue edit ABC-1 --stages "
                       "plan,implement,review,fix,push)", step)
 
+    def test_the_implement_prompt_leaves_a_wrong_test_as_the_card_does(self):
+        step = tq.TEST_STEPS["implement"][1]
+        self.assertIn("leave it as it is, and say which and why in the commit message", step)
+        self.assertNotIn("change one only where", step)   # the card says leave it: the prompt agrees
+
     def test_a_retry_at_test_needs_a_plan_with_a_test_command(self):
         self.add("ABC-1")   # without the test stage: its plan has no ## Tests
         self.run_queue()

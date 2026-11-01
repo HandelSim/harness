@@ -1093,27 +1093,38 @@ change) as well as from the set-up.
 The opt-in test stage (`stage_test`, `test.md`) writes the tests before the
 code. With `test` in the stages the plan must have `## Tests` with
 ``- Command: `...` `` (`test_command`), or `- Command: none` with a
-`[blocking]` question (`tests_problems`). The test agent commits a test per
+`[blocking]` question (`tests_problems`; never with `--take-defaults`, where
+nobody answers it). The problem names the ticket's own way to drop the stage
+(`without_test`: "the queue's edit KEY --stages ..." -- not worded as an
+`OWNER_ONLY` command, so the plan agent still goes on once to fix it). The
+test agent commits a test per
 criterion, runs none and changes no other file (one that does not look like a
 test, `TEST_PATH`, is a warning); its verifier reads `MET_WHEN[1]` (an added
-test that checks the criterion meets it). Its pass saves `test_marks` (each
+test that checks the criterion meets it). The stage's start saves `test_from`
+(the change before it), so `test_files` are the files the test stage itself
+added, also after a retry at test. Its pass saves `test_marks` (each
 repository's sha, or a snapshot tree for one left uncommitted), `test_files`
 and `test_sha`, and moves `implement_from` to the change after the tests, so
 the tests alone never satisfy implement. Implement, fix and a review's changed
-work are then judged on the change since `test_marks`
-(`ticket_change(since=)`), and a deleted test file fails. An output line
+work must move since `test_marks` (`ticket_change(since=)`); their verifier
+reads the whole change less the test files' sections (`without_files`), and a
+test file that is deleted, or gone from the change, fails. An output line
 that starts `NO TEST FRAMEWORK:` (`no_framework_line`; the prompt's words
 quoting it are not one) with nothing changed since the plan
 (`moved_since(..., "implement")`) blocks at once (`no_go_on`) with the
-edit-and-retry and answer commands. A retry at plan or test and a follow-up
+edit-and-retry and `harness queue answer KEY "<the framework>"` commands. An
+edit that drops the stage the ticket is at moves it to the next listed stage.
+A retry at plan or test and a follow-up
 drop the marks; a retry at test is refused while the plan names no test
 command (a ticket made without the stage), so the run's page never offers
 it. `take_baselines` snapshots the files at test as at implement. The prompts' `{{TEST_STEP}}` (`TEST_STEPS`: without, with) and
 `{{TEST_CRITERIA}}` tell every agent of a ticket without the stage to write
 and run no tests (only the build), and with it to run the plan's command
 until it passes; the task cards use the `STAGE+test` keys of
-`stage-guidance.json`, `{TEST}` the command (60 characters at most), and the
-cards without the stage are as before.
+`stage-guidance.json`, `{TEST}` the command ("the plan's test command" when
+it is over 60 characters, never a clipped one), and the cards without the
+stage are as before. A test that is wrong against the plan is left as it is
+and named in the commit message, in the prompt as on the card.
 
 The plan is markdown in a strict one-line-per-item shape (`plan.md`; the card's
 done line repeats it): `## Goal`, `## How it works` (2-5 plain bullets: what
