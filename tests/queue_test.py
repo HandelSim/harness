@@ -162,7 +162,8 @@ elif stage == "testing":   # the test stage: a test file committed; FAKE_NO_FRAM
     if os.environ.get("FAKE_NO_FRAMEWORK"):
         print("Looked around.\nNO TEST FRAMEWORK: no pytest, unittest or tests/ folder in the project's top")
         sys.exit(0)
-    open("test_feature.py", "w").write("# AC1\nassert open('feature.txt').read() == 'hello feature\\n'\n")
+    open("test_feature.py", "w").write("# AC1\nassert open('feature.txt').read() == 'hello feature\\n'\n"
+                                       + os.environ.get("FAKE_TEST_MORE", ""))
     git("add", "test_feature.py")
     git("commit", "-q", "-m", "ABC-1: tests")
 elif stage in ("implementing", "fixing"):
@@ -4533,7 +4534,8 @@ class TestStageTest(Base):
         # each stage's prompt says the test stage's words, with the command
         cmd = f"`{self.CMD}`"
         plan = cat(self.calls + ".planning")
-        self.assertIn(tq.TEST_STEPS["plan"][1], plan)
+        self.assertIn(tq.TEST_STEPS["plan"][1].format(cmd="", sha="", key="ABC-1", rest="plan,implement,review,fix,push"),
+                      plan)
         self.assertIn("The test stage writes a test for each, so make each one exact.", plan)
         testing = cat(self.calls + ".testing")
         self.assertTrue(testing.startswith("You are testing ticket ABC-1"), testing[:80])
@@ -4593,7 +4595,8 @@ class TestStageTest(Base):
         self.assertEqual({k: guide[k] for k in self.OLD_GUIDE}, self.OLD_GUIDE)
 
     def test_the_plan_check_of_the_tests_section(self):
-        no = [tq.NO_TESTS_SECTION]
+        no = [tq.NO_TESTS_SECTION + "; the owner drops the test stage with harness queue edit KEY --stages "
+              "plan,implement,review,fix,push"]
         self.assertEqual(tq.tests_problems(self.PLAN), no)
         self.assertEqual(tq.tests_problems(self.PLAN + "## Tests\n- Files: `test_x.py`\n"), no)
         self.assertEqual(tq.tests_problems(self.PLAN + "## Tests\n- Command: `make test`\n"), [])
@@ -4816,6 +4819,7 @@ class TestStageTest(Base):
         self.assertEqual(Q.load("ABC-1")["status"], "done")
         rc, out = self.q("retry", "ABC-1", "--stage", "test")
         self.assertEqual(rc, 0, out)
+        os.environ["FAKE_TEST_MORE"] = "# AC1 again\n"   # the tests written again: a new commit
         FakeProxy.seen.clear()
         self.run_queue()
         st = Q.load("ABC-1")
