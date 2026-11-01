@@ -104,10 +104,13 @@ QUEUE_SCRIPT = os.path.join(HERE, "..", "scripts", "ticket_queue.py")
 TICKET_SCRIPT = os.path.join(HERE, "..", "scripts", "vault_ticket.py")
 HARNESS = os.path.join(HERE, "..", "harness")
 WAITING = ("needs-answers", "plan-review", "blocked")   # a ticket waiting on the owner
-STAGES = ("plan", "implement", "review", "fix", "push")
-PRESETS = {"full": STAGES, "review": ("review",), "implement": ("implement", "review", "fix", "push"),
-           "plan": ("plan",)}
+STAGES = ("plan", "test", "implement", "review", "fix", "push")   # every stage, in the order they run
+DEFAULT_STAGES = ("plan", "implement", "review", "fix", "push")   # a ticket's when it has none: test is opt-in
+PRESETS = {"full": DEFAULT_STAGES, "tests": STAGES, "review": ("review",),
+           "implement": ("implement", "review", "fix", "push"), "plan": ("plan",)}
 PRESET_LABELS = (("full", "Full", "plan, implement, review, fix, push"),
+                 ("tests", "Full + tests", "plan, test, implement, review, fix, push: tests from the plan, "
+                  "written before the code"),
                  ("review", "Review only", "review existing work; nothing is pushed"),
                  ("implement", "Implement + review", "no plan: implement, review, fix, push"),
                  ("plan", "Plan only", "write the plan and stop"))
@@ -197,8 +200,8 @@ main.rv { max-width: 1280px; gap: 18px; padding-top: 22px; }
 .sdot.run { background: var(--run); box-shadow: 0 0 0 4px var(--run-soft); }
 .sdot.wait { background: var(--wait); }
 
-/* the stage strip: plan implement review fix push */
-.strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; list-style: none; padding: 0;
+/* the stage strip: plan (test) implement review fix push, a column each */
+.strip { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 4px; list-style: none; padding: 0;
   margin: 0; min-width: 0; }
 .strip li { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .strip i { display: block; height: 5px; border-radius: 3px; background: var(--line); }
@@ -258,7 +261,7 @@ main input[type=search] { width: 100%; height: 34px; padding: 0 10px; background
 .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 fieldset { border: 0; padding: 0; margin: 0; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 legend { font-size: 13px; font-weight: 550; padding: 0; margin-bottom: 6px; }
-.presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.presets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
 .presets label { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border: 1px solid var(--line-2);
   border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; min-width: 0; }
 .presets label small { font-weight: 400; color: var(--muted); font-size: 11.5px; line-height: 1.35; }
@@ -768,7 +771,7 @@ class Runs:
                         for rel, r in (repos.items() if isinstance(repos, dict) else ())
                         if isinstance(rel, str) and isinstance(r, dict)}
         want = st.get("stages")
-        want = [s for s in want if isinstance(s, str)] if isinstance(want, list) and want else list(STAGES)
+        want = [s for s in want if isinstance(s, str)] if isinstance(want, list) and want else list(DEFAULT_STAGES)
         out["stages"] = [s for s in STAGES if s in want]
         ses = st.get("session")   # the agent's opencode session a cut-off stage goes on in
         out["session"] = ({"stage": ses["stage"], "id": ses["id"], "container": ses.get("container") is True,
@@ -1360,15 +1363,17 @@ def _flash(msg, bad=False):
 
 def stage_strip(st, big=False):
     """plan implement review fix push, each done, skipped, current (in the ticket's
-    status colour), still to do, or not one of the ticket's stages."""
-    stages, status, cur = st.get("stages") or list(STAGES), st.get("status", ""), st.get("stage", "")
+    status colour), still to do, or not one of the ticket's stages; test, opt-in,
+    only on a ticket that has it."""
+    stages, status, cur = st.get("stages") or list(DEFAULT_STAGES), st.get("status", ""), st.get("stage", "")
     last = {}
     for h in st.get("history") or []:
         last[h["stage"]] = h
+    shown = [s for s in STAGES if s != "test" or s in stages or s == cur]
     done = status == "done" or cur == "done"
-    at = STAGES.index(cur) if cur in STAGES else (len(STAGES) if done else 0)
+    at = shown.index(cur) if cur in shown else (len(shown) if done else 0)
     items = []
-    for i, s in enumerate(STAGES):
+    for i, s in enumerate(shown):
         h = last.get(s)
         if s not in stages:
             cls, note = "off", "not in this ticket"
@@ -1571,7 +1576,7 @@ STOPPABLE = ("queued", "needs-answers", "plan-review", "blocked", "running", "in
 RETRYABLE = ("blocked", "needs-answers", "stopped", "done", "interrupted")
 # a stage an agent works in, cut off or blocked: harness queue continue goes on in its session
 CONTINUABLE = ("blocked", "stopped", "interrupted", "queued")
-AGENT_STAGES = ("plan", "implement", "review", "fix")
+AGENT_STAGES = ("plan", "test", "implement", "review", "fix")
 RETRY_LABEL = {"blocked": "Retry", "needs-answers": "Plan again without answering", "stopped": "Resume",
                "done": "Run again", "interrupted": "Queue again"}
 RETRY_TITLE = {"blocked": "queue it again at the stage it stopped at, as it is",
@@ -2133,7 +2138,8 @@ def _settings_facts(key, st):
                      "</b></span>")
     facts.append("<span>works <b>" + ("in your project folder" if st.get("in_place") else "in a separate copy")
                  + "</b></span>")
-    facts.append("<span>stages <b>" + " &rarr; ".join(esc(x) for x in (st.get("stages") or STAGES)) + "</b></span>")
+    facts.append("<span>stages <b>" + " &rarr; ".join(esc(x) for x in (st.get("stages") or DEFAULT_STAGES))
+                 + "</b></span>")
     facts.append("<span>after the plan <b>" + ("takes each question's default and goes on" if st.get("take_defaults")
                                                else "waits for your approval" if st.get("plan_review")
                                                else "goes straight on") + "</b></span>")
@@ -2266,7 +2272,8 @@ def _t_retry(runs, key, st, go_on=False):
     status = st.get("status", "")
     label = _retry_label(status, go_on)
     why = runs.retry_choices(key) or dict.fromkeys((None,) + STAGES, "")   # unknown: all, the queue still says no
-    stages = [s for s in STAGES if not why.get(s)]
+    mine = st.get("stages") or DEFAULT_STAGES   # test, opt-in, only on a ticket that has it
+    stages = [s for s in STAGES if not why.get(s) and (s != "test" or s in mine)]
     if why.get(None) and not stages:
         return f"<span class='muted'>{esc(label)}: {esc(why[None])}</span>"
     opts = "".join(f"<option value='{s}'{' selected' if s == st.get('stage') else ''}>{s}</option>" for s in stages)
@@ -2296,7 +2303,7 @@ def _t_questions(runs, key, st):
     stage = st.get("stage", "")
     if status == "blocked" and vault:
         # Blocked at any stage, not by the planner: go on, retry as is, or send a note
-        planned = "plan" in (st.get("stages") or STAGES)
+        planned = "plan" in (st.get("stages") or DEFAULT_STAGES)
         then = ("the ticket goes back to planning with it, and the revised plan comes back here for your "
                 "approval before anything is built." if planned else f"the ticket runs {stage} again with it.")
         intro = f"It stopped at {esc(stage)}" + (f": {esc(st['reason'])}" if st.get("reason") else "") + ". "
@@ -2550,7 +2557,7 @@ def _plan_glance(runs, key, vault, plan):
 
 def _t_followup(runs, key, st):
     """A done ticket: the owner's comments on what was built send it round again."""
-    if st.get("status") != "done" or "plan" not in (st.get("stages") or STAGES) or not runs.vault_of(st):
+    if st.get("status") != "done" or "plan" not in (st.get("stages") or DEFAULT_STAGES) or not runs.vault_of(st):
         return ""
     why = runs.followup_refused(key)
     if why:
@@ -2648,7 +2655,7 @@ def render_ticket(runs, key, msg="", bad=False):
 
 def _edit_values(key, st):
     """The Add form's fields as the ticket has them, for its edit form."""
-    stages = [x for x in STAGES if x in (st.get("stages") or STAGES)]
+    stages = [x for x in STAGES if x in (st.get("stages") or DEFAULT_STAGES)]
     start = st.get("start") or st.get("ref") or ""
     mode = "new" if not start or start == st.get("base") else "continue"   # here: a commit since add
     f = {"keys": [key], "project": [st.get("project", "")], "base": [st.get("base", "")], "start": [mode],
@@ -2666,7 +2673,7 @@ def _edit_values(key, st):
 def _later_form(key, st, err=""):
     """A ticket whose work started: the stages after the one it is at, and what
     happens after the plan."""
-    cur, stages = st.get("stage"), st.get("stages") or list(STAGES)
+    cur, stages = st.get("stage"), st.get("stages") or list(DEFAULT_STAGES)
     fixed = STAGES[:STAGES.index(cur) + 1] if cur in STAGES else STAGES
     checks = "".join(
         f"<label><input type='checkbox' name='stage_{x}' value='{x}'{' checked' if x in stages else ''}"
@@ -2680,7 +2687,8 @@ def _later_form(key, st, err=""):
             + (f"<p class='err' role='alert'>Not changed: {esc(err)}</p>" if err else "") +
             f"<form method='post' action='/runs/ticket/{quote(key)}/edit' class='stack'>"
             f"<fieldset><legend>Stages</legend><div class='checks'>{checks}</div><small class='muted'>It is {at}: "
-            "that stage and the ones before it stay as they are; fix needs review.</small></fieldset>"
+            "that stage and the ones before it stay as they are; fix needs review, and test needs plan and "
+            "implement.</small></fieldset>"
             + _choice("When the plan is written", "after_plan", after, AFTER_PLAN_CHOICES) + held +
             "<div class='formacts'><button type='submit' class='primary'>Save</button></div></form></section>")
 
@@ -2721,9 +2729,11 @@ def edit_ticket(runs, key, st, form):
     stages = [x for x in STAGES if _one(form, "stage_" + x)]
     after = _one(form, "after_plan")
     args = []
-    if stages != [x for x in STAGES if x in (st.get("stages") or STAGES)]:
+    if stages != [x for x in STAGES if x in (st.get("stages") or DEFAULT_STAGES)]:
         if not stages:
             return False, "pick at least one stage"
+        if _test_problem(stages):
+            return False, _test_problem(stages)
         args.append("--stages=" + ",".join(stages))
     was = "defaults" if st.get("take_defaults") else "wait" if st.get("plan_review") else "go"
     if after in ("wait", "go", "defaults") and after != was:
@@ -3338,6 +3348,13 @@ def new_ticket(runs, title, text):
     return key, ""
 
 
+def _test_problem(stages):
+    """Why the stages cannot have test, or "": it writes the tests from the plan, for
+    implement to make pass (the queue's parse_stages says no the same way)."""
+    lack = [s for s in ("plan", "implement") if s not in stages] if "test" in stages else []
+    return f"test writes tests from the plan for implement to make pass; pick {' and '.join(lack)} too" if lack else ""
+
+
 def ticket_args(form, keys, st=None):
     """The Add form's settings as harness queue add (or, for st, a ticket not
     started yet: edit) takes them, checked first; or why not. An edit gives every
@@ -3391,6 +3408,8 @@ def ticket_args(form, keys, st=None):
         return "pick at least one stage"
     if "fix" in stages and "review" not in stages:
         return "fix runs only after a review asks for fixes; pick review too"
+    if _test_problem(stages):
+        return _test_problem(stages)
     if "implement" not in stages and any(s in stages for s in ("review", "fix", "push")) \
             and mode == "new":
         return ("with no implement stage the work must already exist: pick Continue existing work and name "
@@ -3766,11 +3785,14 @@ COMMON_JS = """
           q('input[name=keys]').value.toUpperCase().split(/[\\s,;]+/).filter(Boolean),
         many = keys.length > 1;
       off(q('input[name=stage_fix]'), q('input[name=stage_review]').checked ? '' : 'fix needs review');
+      var noTest = q('input[name=stage_plan]').checked && q('input[name=stage_implement]').checked ? '' :
+        'test needs plan and implement: it writes tests from the plan for implement to make pass.';
+      off(q('input[name=stage_test]'), noTest);
       var on = [];
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
       function has(s) { return on.indexOf(s) >= 0; }
-      say(q('#stagechecks').nextElementSibling, q('input[name=stage_review]').checked ? '' :
-        'fix needs review: it fixes what the review asks for.');
+      say(q('#stagechecks').nextElementSibling, [q('input[name=stage_review]').checked ? '' :
+        'fix needs review: it fixes what the review asks for.', noTest].filter(Boolean).join(' '));
       // with nothing to implement, the work must already exist
       var existing = !has('implement') && (has('review') || has('fix') || has('push'));
       off(pick('start', 'new'), existing ? 'Not with these stages: a new branch has no work on it yet to ' +

@@ -1156,10 +1156,10 @@ class QueuePageTest(RunsServer):
         self.assertNotIn("action='/runs/ticket/ABC-12/retry'", body)
         self.assertIn("Retry: ABC-12&#x27;s branch ABC-12 has commits that main does not", body)
         self.assertIn("delete it (here and on the remote, then git fetch --prune)", body)
-        # the queue's module not to be had (an older checkout): every stage, as before
+        # the queue's module not to be had (an older checkout): every stage, as before (test: only its own)
         with mock.patch.object(runs, "_tq", lambda: None):
             r, body = self.req("GET", "/runs/ticket/ABC-12")
-        self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["", *runs.STAGES])
+        self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["", *runs.DEFAULT_STAGES])
 
     def test_start_from_a_ticket_goes_back_to_it(self):
         self.ticket(status="queued", questions=[])
@@ -1901,6 +1901,175 @@ class QueuePageTest(RunsServer):
             r, _ = self.post(path)
             self.assertEqual(r.status, 401, path)
         self.assertEqual(self.state()["status"], "needs-answers")
+
+
+class TestStageServeTest(RunsServer):
+    """The opt-in test stage on the run viewer: the presets, the stages of a ticket
+    with none recorded, the forms' checks and field limits, and the stage strip."""
+
+    def post(self, path, fields=()):
+        h = {"Content-Type": "application/x-www-form-urlencoded", "Origin": f"http://127.0.0.1:{self.port}"}
+        return self.req("POST", path, urlencode(list(fields)), h)
+
+    def queue_calls(self):
+        """harness queue's arguments, each call recorded and taken as done."""
+        calls = []
+
+        def queue(runs_, args, text=None):
+            calls.append(args)
+            return True, "done"
+        return calls, mock.patch.object(runs, "_queue", queue)
+
+    @staticmethod
+    def form_names(body, start):
+        """The names a form sends, at most one value each (a radio group's one): the
+        form that starts with start."""
+        m = re.search(re.escape(start) + r".*?</form>", body, re.S)
+        return set(re.findall(r"(?<![-\w])name='([^']+)'", m.group(0))) if m else set()
+
+    def test_the_stage_lists_and_the_presets(self):
+        self.assertEqual(runs.STAGES, ("plan", "test", "implement", "review", "fix", "push"))
+        self.assertEqual(runs.DEFAULT_STAGES, ("plan", "implement", "review", "fix", "push"))
+        self.assertEqual(runs.PRESETS["full"], runs.DEFAULT_STAGES)
+        self.assertEqual(runs.PRESETS["tests"], runs.STAGES)
+        self.assertEqual([p for p, _, _ in runs.PRESET_LABELS], list(runs.PRESETS))
+        self.assertEqual(dict((p, lab) for p, lab, _ in runs.PRESET_LABELS)["tests"], "Full + tests")
+        for stages in runs.PRESETS.values():
+            self.assertEqual(list(stages), [s for s in runs.STAGES if s in stages])
+            self.assertEqual(runs._test_problem(stages), "")
+        self.assertIn("test", runs.AGENT_STAGES)
+        tq = runs._tq()
+        if tq is not None and "test" in tq.ALL_STAGES:   # the queue with its test stage: the same names and order
+            self.assertEqual(tuple(tq.ALL_STAGES), runs.STAGES)
+            self.assertEqual(tuple(getattr(tq, "DEFAULT_STAGES", runs.DEFAULT_STAGES)), runs.DEFAULT_STAGES)
+        self.ticket(status="queued", questions=[])
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("<label><input type='radio' name='preset' value='tests'>Full + tests<small>", body)
+        self.assertIn("<label><input type='radio' name='preset' value='full' checked>Full<small>", body)
+        self.assertIn("<input type='checkbox' name='stage_test' value='test'> test</label>", body)
+        self.assertIn("name='stage_implement' value='implement' checked>", body)
+        self.assertIn('"tests": ["plan", "test", "implement", "review", "fix", "push"]', body)   # the page's script
+
+    def test_a_ticket_with_no_stages_recorded_has_the_five(self):
+        self.ticket(status="blocked", stage="implement", reason="it failed", questions=[])   # no "stages"
+        cfg = self.start()
+        st = cfg.runs.ticket_state("ABC-12")
+        self.assertEqual(st["stages"], list(runs.DEFAULT_STAGES))
+        strip = runs.stage_strip({k: v for k, v in st.items() if k != "stages"})
+        self.assertEqual(re.findall(r"<span>(\w+)</span>", strip), list(runs.DEFAULT_STAGES))
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("stages <b>plan &rarr; implement &rarr; review &rarr; fix &rarr; push</b>", body)
+        self.assertNotIn("<span>test</span>", body)
+        self.assertNotIn("<option value='test'", body)   # not a stage of this ticket's to go again at
+        with mock.patch.object(runs, "_tq", lambda: None):
+            r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["", *runs.DEFAULT_STAGES])
+        self.assertEqual(runs._edit_values("ABC-12", {})["preset"], ["full"])
+        self.assertNotIn("stage_test", runs._edit_values("ABC-12", {}))
+
+    def test_a_ticket_with_the_test_stage(self):
+        st = {"stages": list(runs.STAGES), "status": "running", "stage": "test",
+              "history": [{"stage": "plan", "result": "passed"}]}
+        strip = runs.stage_strip(st)
+        self.assertEqual(re.findall(r"<span>(\w+)</span>", strip), list(runs.STAGES))
+        self.assertEqual(re.findall(r"<li class='([^']*)'", strip), ["done", "cur run", "todo", "todo", "todo", "todo"])
+        st = {"stages": ["plan", "implement"], "status": "done", "stage": "done"}
+        self.assertEqual(re.findall(r"<li class='(\w+)", runs.stage_strip(st)), ["skip", "skip", "off", "off", "off"])
+        rule = re.search(r"\.strip \{[^}]*\}", runs.STYLE).group(0)   # as many columns as it has stages
+        self.assertIn("grid-auto-flow: column", rule)
+        self.assertNotIn("repeat(", rule)
+        self.assertEqual(runs._edit_values("ABC-12", {"stages": list(runs.STAGES)})["preset"], ["tests"])
+
+        class Q:
+            def continue_refused(self, key):
+                return ""
+        self.assertTrue(runs._continuable(Q(), "ABC-12", {"status": "blocked", "stage": "test"}))
+        self.ticket(status="blocked", stage="test", stages=list(runs.STAGES), reason="it failed", questions=[])
+        self.start()
+        with mock.patch.object(runs, "_tq", lambda: None):
+            r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(re.findall(r"<option value='(\w*)'", body), ["", *runs.STAGES])
+        self.assertIn("<option value='test' selected>test</option>", body)
+        self.assertIn("stages <b>plan &rarr; test &rarr; implement &rarr; review &rarr; fix &rarr; push</b>", body)
+
+    def test_the_forms_refuse_test_without_plan_and_implement(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.ticket(project=proj, status="queued", questions=[])
+        self.start()
+        calls, patch = self.queue_calls()
+        good = [("keys", "ABC-9"), ("project", proj), ("start", "new"), ("base", "main")]
+        with patch:
+            for stages, why in ((["test", "implement", "review"], "pick plan too"),
+                                (["plan", "test"], "pick implement too"),
+                                (["test"], "pick plan and implement too")):
+                ticks = [("stage_" + s, s) for s in stages]
+                r, body = self.post("/runs/queue/add", good + [("preset", "custom")] + ticks)
+                self.assertEqual(r.status, 409, stages)
+                self.assertIn("Not added: test writes tests from the plan for implement to make pass; " + why, body)
+                # the edit form of a ticket not started yet: the Add form's checks
+                r, body = self.post("/runs/ticket/ABC-12/edit", good[1:] + [("keys", "ABC-12"), ("preset", "custom")]
+                                    + ticks)
+                self.assertEqual(r.status, 409, stages)
+                self.assertIn("Not changed: test writes tests from the plan for implement to make pass; " + why, body)
+            self.assertEqual(calls, [])
+            r, body = self.post("/runs/queue/add", good + [("preset", "tests")])
+            self.assertEqual(r.status, 303, body)
+            self.assertIn("--stages=plan,test,implement,review,fix,push", calls.pop())
+            r, body = self.post("/runs/queue/add", good + [("preset", "custom"), ("stage_plan", "plan"),
+                                                           ("stage_test", "test"), ("stage_implement", "implement")])
+            self.assertEqual(r.status, 303, body)
+            self.assertIn("--stages=plan,test,implement", calls.pop())
+            # a started ticket's stages still to come
+            self.ticket(project=proj, status="needs-answers", stage="plan", start_sha="a" * 40)
+            r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
+            self.assertIn("<input type='checkbox' name='stage_test' value='test'> test</label>", body)
+            r, body = self.post("/runs/ticket/ABC-12/edit", [("stage_plan", "plan"), ("stage_test", "test"),
+                                                             ("stage_review", "review")])
+            self.assertEqual(r.status, 409)
+            self.assertIn("Not changed: test writes tests from the plan for implement to make pass; pick implement "
+                          "too", body)
+            self.assertEqual(calls, [])
+            r, body = self.post("/runs/ticket/ABC-12/edit", [("stage_plan", "plan"), ("stage_test", "test"),
+                                                             ("stage_implement", "implement"),
+                                                             ("stage_review", "review"), ("stage_fix", "fix"),
+                                                             ("stage_push", "push")])
+            self.assertEqual(r.status, 303, body)
+            self.assertEqual(calls.pop(), ["edit", "ABC-12", "--stages=plan,test,implement,review,fix,push"])
+            # past it: test stays as it is
+            self.ticket(project=proj, status="blocked", stage="implement", start_sha="a" * 40)
+            r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
+            self.assertIn("<input type='checkbox' name='stage_test' value='test' disabled> test</label>", body)
+
+    def test_the_forms_stay_within_their_field_limits(self):
+        from urllib.parse import parse_qs
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.ticket(project=proj, status="queued", questions=[])
+        self.start()
+        repos = [(f"repo_{k}:r{i}", "x") for i in range(runs.REPO_ROWS) for k in ("mode", "branch", "target")]
+        r, body = self.req("GET", "/runs/queue")
+        add = self.form_names(body, "<form method='post' action='/runs/queue/add' id='addform'")
+        r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
+        edit = self.form_names(body, "<form method='post' action='/runs/ticket/ABC-12/edit' id='addform'")
+        self.ticket(project=proj, status="needs-answers", stage="plan", start_sha="a" * 40)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
+        later = self.form_names(body, "<form method='post' action='/runs/ticket/ABC-12/edit' class='stack'")
+        for names, limit in ((add, runs.ADD_FIELDS), (edit, pub.TICKET_FIELDS), (later, pub.TICKET_FIELDS)):
+            self.assertIn("stage_test", names)
+            self.assertTrue({"stage_" + s for s in runs.STAGES} <= names, names)
+            self.assertFalse([n for n in names if n.startswith("repo_")])   # the tree's rows are the page script's
+            sent = [(n, "x") for n in sorted(names)] + (repos if names is not later else [])
+            self.assertLessEqual(len(sent), limit, names)
+            self.assertEqual(len(parse_qs(urlencode(sent), max_num_fields=limit)), len(sent))
+        # the whole Add form, every repository row filled, is read (not 413); one field more is not
+        calls, patch = self.queue_calls()
+        with patch:
+            r, body = self.post("/runs/queue/add", [(n, "x") for n in sorted(add)] + repos)
+            self.assertNotEqual(r.status, 413, body)
+            extra = [("x%d" % i, "x") for i in range(runs.ADD_FIELDS - len(add) - len(repos) + 1)]
+            r, body = self.post("/runs/queue/add", [(n, "x") for n in sorted(add)] + repos + extra)
+            self.assertEqual(r.status, 413)
+        self.assertEqual(calls, [])
 
 
 class DiffPageTest(RunsServer):
