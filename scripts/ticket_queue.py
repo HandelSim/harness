@@ -1962,19 +1962,43 @@ def crash_of(st, rc):
     return f"its agent's launch exited with status {rc}" if rc not in (0, None, IDLE) else ""
 
 
-def go_on_after_crash(ctx, st, why):
-    """The agent stopped (crash_of): True when the stage goes on in its session
-    instead of failing the attempt. Once per attempt, which is not counted; a
-    second stop fails it as usual."""
+OWNER_ONLY = re.compile(r"\bharness queue \w")   # a problem the owner puts right: it names their command
+
+
+def went_on(st):
+    """The kind of go-on ("crash" or "check") this attempt of the stage has had
+    (go_on_once), or "": none. A state file from before said a crash's on its
+    session ("crashed")."""
+    w, s = st.get("went_on") or {}, st.get("session") or {}
+    here = [st.get("stage"), st.get("attempt", 0)]
+    if [w.get("stage"), w.get("attempt")] == here:
+        return w.get("kind") or "crash"
+    return "crash" if s.get("crashed") and [s.get("stage"), s.get("attempt")] == here else ""
+
+
+def go_on_once(ctx, st, rc, crash, problems):
+    """Before the attempt is failed: True when the stage goes on in its agent's
+    session instead, told what is wrong: it stopped on an error (crash_of), or it
+    ended and its work did not pass the stage's check. Once per attempt in all, not
+    counted; what fails after it fails the attempt as usual. Not after a timeout or
+    the idle watchdog's stop (a session that ran out of time or stalled is the one
+    least likely to finish), with no session of this attempt known, or for a
+    problem only the owner can put right."""
     s = st.get("session") or {}
     if st.get("stage") not in RESUMABLE or s.get("stage") != st["stage"] \
-            or s.get("attempt") != st.get("attempt", 0) or s.get("crashed") or not s.get("id"):
+            or s.get("attempt") != st.get("attempt", 0) or not s.get("id") or went_on(st):
         return False
-    s["crashed"] = True
-    st.pop("verify_only", None)
+    if not crash and (rc not in (0, None) or not problems or any(OWNER_ONLY.search(p) for p in problems)):
+        return False
+    why = crash or "; ".join(failure_lines(problems))
+    st.pop("verify_only", None)   # the agent runs again: its new result is checked, not this one
+    st["went_on"] = {"stage": st["stage"], "attempt": st.get("attempt", 0), "kind": "crash" if crash else "check"}
     st["resume"] = {"stage": st["stage"], "why": why, "message": ""}
-    ctx.q.log(st["key"], f"{st['stage']}: {why}; going on in its session {s['id']}")
-    record(st, "crashed", [why])
+    if not crash:   # the task file and the card say what failed, as a retry's do
+        st["resume"]["check"] = True
+        st["feedback"] = "\n".join("- " + p for p in problems)
+    ctx.q.log(st["key"], f"{st['stage']}: going on in its session {s['id']} (once, not counted): {why}")
+    record(st, "crashed" if crash else "went on", [f"going on in its session (once, not counted): {why}"])
     ctx.q.save(st)
     return True
 
@@ -1985,6 +2009,7 @@ CARRY_ON = ("\n\n<<<BEGIN_GOING_ON (an earlier agent on this stage {how}: {why})
 
 
 HOW_FAILED = "did not pass its check; fix what the check says"
+HOW_CHECKED = "ended, but its work did not pass the stage's check; fix what the check says"
 
 
 def run_agent(ctx, st, stage, prompt):
@@ -2010,12 +2035,14 @@ def run_agent(ctx, st, stage, prompt):
         write_atomic(kept_ticket, read(ticket))
     if resume and not sid:
         msg = (resume.get("message") or "").strip()
-        prompt += CARRY_ON.format(how=HOW_FAILED if resume.get("failed") else "was cut off before it finished",
+        prompt += CARRY_ON.format(how=HOW_CHECKED if resume.get("check") else HOW_FAILED if resume.get("failed")
+                                  else "was cut off before it finished",
                                   why=resume.get("why") or "it was stopped",
                                   message=f"The owner's message (it wins over everything above):\n{msg}\n" if msg else "")
     arg = prompt
     if sid:
-        arg = render("continue-failed" if resume.get("failed") else "continue",
+        arg = render("continue-check" if resume.get("check") else "continue-failed" if resume.get("failed")
+                     else "continue",
                      KEY=key, STAGE=stage, TASK_FILE=agent_path(ctx, task),
                      WHY=resume.get("why") or "it was stopped",
                      MESSAGE=(resume.get("message") or "").strip() or "(none: carry on)")
@@ -2867,11 +2894,12 @@ def clip(text, n):
 
 
 def last_failure(st, do):
-    """On a retry, the card's first lines: why the last attempt failed, in the
-    words of its checks. The prompt that said it is gone after the first tool
-    call, and a pointer to the task file is a read-it-again loop. At most two,
-    sized so the proxy's caps (240 a line, 1000 in all) drop no guidance."""
-    if not st.get("attempt") or not (st.get("feedback") or "").strip():
+    """On a retry, or going on in the session after a failed check (go_on_once),
+    the card's first lines: why the last attempt failed, in the words of its
+    checks. The prompt that said it is gone after the first tool call, and a
+    pointer to the task file is a read-it-again loop."""
+    check = went_on(st) == "check"
+    if not (st.get("attempt") or check) or not (st.get("feedback") or "").strip():
         return []
     probs = []
     for l in st["feedback"].splitlines():   # fail() writes "- problem"; a problem's own newlines follow it
@@ -2879,11 +2907,19 @@ def last_failure(st, do):
             probs.append(l[2:])
         elif probs:
             probs[-1] += " " + l
+    return failure_lines(probs, "Why your work failed the check: " if check else "Why the last attempt failed: ",
+                         1000 - sum(len(l) for l in do))
+
+
+def failure_lines(probs, head="", room=1000):
+    """The first one or two problems, after head, clipped (a failed criterion in
+    failed_check's words), the second only where it leaves room; at most two,
+    sized so the proxy's caps (240 a line, 1000 in all) drop no guidance."""
     probs = [" ".join(p.split()) for p in probs if p.strip()]
     probs = [p for p in probs if not LAUNCH_LINE.match(p)] or probs
-    out, room = [], 1000 - sum(len(l) for l in do)
+    out = []
     for p in probs[:2]:
-        line = f"Why the last attempt failed: {clip(failed_check(p), 170)}"
+        line = head + clip(failed_check(p), 170)
         if out and len(line) + 30 > room:   # the second only where it leaves the guidance whole
             break
         out.append(line)
@@ -3777,6 +3813,7 @@ def advance(ctx, st, stage, reason=""):
     st.pop("session", None)   # the next stage's agent is a new one
     st.pop("resume", None)
     st.pop("continued", None)
+    st.pop("went_on", None)
     if stage:
         st.update(stage=stage, attempt=0, feedback="", status="running")
     else:
@@ -3839,7 +3876,7 @@ def fail(ctx, st, rc, problems):
         ctx.q.save(st)
         raise
     crash = crash_of(st, rc) if rc != 124 else ""   # a timeout is no crash: its attempt counts
-    if crash and go_on_after_crash(ctx, st, crash):
+    if go_on_once(ctx, st, rc, crash, problems):
         return
     st.pop("verify_only", None)
     text = "\n".join("- " + p for p in problems)
@@ -3857,7 +3894,7 @@ def fail(ctx, st, rc, problems):
         elif rc == 0 and st["stage"] in RESUMABLE and session.get("stage") == st["stage"] and session.get("id"):
             # it ended on its own and its check failed: it goes on in its session, told what
             # failed, instead of a new agent doing the stage over from its start (a stop of
-            # this attempt's agent may go on in it once more: go_on_after_crash)
+            # this attempt's agent may go on in it once more: go_on_once)
             session["attempt"] = st["attempt"]
             session.pop("crashed", None)
             st["resume"] = {"stage": st["stage"], "failed": True, "message": "",
@@ -4941,7 +4978,7 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         print(f"[queue] {st['key']} is {st['status']}, not {' or '.join(want)}", file=sys.stderr)
         return None
     st.update(status="queued", attempt=0, feedback="", reason="", requeued=now_iso(), **extra)
-    for k in ("stopped_from", "blocked_failed", "no_go_on", "continued", "debugged"):
+    for k in ("stopped_from", "blocked_failed", "no_go_on", "continued", "debugged", "went_on"):
         st.pop(k, None)
     st.pop("resume", None)   # a cut-off stage goes on only when continued (the caller sets it again)
     for k in RESULTS:
@@ -5215,11 +5252,13 @@ def cmd_continue(q, a):
         # the attempts are not counted again: a stage that keeps failing its check still blocks
         # (a queued one continued already keeps what its block was)
         failed = st.get("blocked_failed") if st["status"] == "blocked" else (st.get("resume") or {}).get("failed")
-        attempt = st.get("attempt", 0)
+        attempt, went = st.get("attempt", 0), st.get("went_on")
         st = requeue(q, key, CONTINUABLE, go_on=True)
         if not st:
             return 1
         st.update(attempt=attempt, continued=st["stage"])
+        if went:   # nor is the attempt's one free go-on in its session had again
+            st["went_on"] = went
         if kept:
             st["verify_only"] = kept
             st["reason"] = f"continued by the owner: {st['stage']}'s finished work is checked"

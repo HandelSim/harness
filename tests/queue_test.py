@@ -117,6 +117,12 @@ if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == 
 log.write(stage + " " + " ".join(a for a in args[:-1]) + "\n")
 open(os.environ["FAKE_CALLS"] + ".card", "a").write(os.environ.get("HARNESS_TASK_CARD", "") + "\n")
 open(os.environ["FAKE_CALLS"] + "." + stage, "a").write(prompt + "\n=====\n")
+if os.environ.get("FAKE_SKIP", "").split(":")[0] == stage:   # STAGE:N,M: those launches of it (1: the first) do nothing
+    count = os.environ["FAKE_CALLS"] + ".skips"
+    n = (len(open(count).read()) if os.path.exists(count) else 0) + 1
+    open(count, "a").write("x")
+    if str(n) in os.environ["FAKE_SKIP"].split(":")[1].split(","):
+        sys.exit(0)
 def path(label):
     p = re.search(label + r" (\S+?)[ )\n]", prompt).group(1)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -516,9 +522,11 @@ class QueueTest(Base):
         os.environ["FAKE_CRITERIA"] = "- A file feature.txt says hello feature\n"
         self.add("ABC-1")
         rc, out = self.run_queue()
-        # Attempt 1 is sent back for the shape; the last attempt only notes it.
+        # Attempt 1 is sent back for the shape (on in its session, then a new agent); the last
+        # attempt only notes it.
         self.assertEqual(self.status()["status"], "done", out)
-        self.assertEqual(len(self.calls_of("planning")), 2)
+        self.assertEqual(len(self.calls_of("planning")), 3)
+        self.assertIn("--session ses_fake0", self.calls_of("planning")[1])
         second = cat(self.calls + ".planning").split("\n=====\n")[1]
         self.assertIn("AC1: not written as one line '- ACn: GIVEN ... WHEN ... THEN ...'", second)
         log = cat(os.path.join(self.state, "ABC-1", "log.md"))
@@ -695,19 +703,19 @@ class QueueTest(Base):
         rc, out = self.run_queue()
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
-        self.assertEqual(len(self.calls_of("implementing")), 2)
+        self.assertEqual(len(self.calls_of("implementing")), 4)   # two attempts, each on once in its session
         self.assertIn("no commits on branch ABC-1", st["reason"])
-        # The card counts the attempts.
-        cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines()]
-        self.assertEqual([c["attempt"] for c in cards][-2:], [1, 2])
+        # The card counts the attempts (going on in the session is not one).
+        cards = [c for c in map(json.loads, cat(self.calls + ".card").splitlines()) if c["stage"] == "implement"]
+        self.assertEqual([c["attempt"] for c in cards], [1, 1, 2, 2])
         # The retry's card says why the last attempt failed, before the stage's own lines,
         # within the proxy's caps (240 a line, 1000 in all); the first attempt's has only those.
         guide = tq.stage_guidance()["implement"]
-        self.assertEqual(cards[-2]["do"], guide)
-        self.assertTrue(cards[-1]["do"][0].startswith("Why the last attempt failed: no commits on branch ABC-1"),
-                        cards[-1]["do"])
-        self.assertEqual(cards[-1]["do"][-len(guide):], guide)
-        self.assertTrue(all(len(l) <= 240 for l in cards[-1]["do"]) and sum(map(len, cards[-1]["do"])) <= 1000)
+        self.assertEqual(cards[0]["do"], guide)
+        self.assertTrue(cards[2]["do"][0].startswith("Why the last attempt failed: no commits on branch ABC-1"),
+                        cards[2]["do"])
+        self.assertEqual(cards[2]["do"][-len(guide):], guide)
+        self.assertTrue(all(len(l) <= 240 for l in cards[2]["do"]) and sum(map(len, cards[2]["do"])) <= 1000)
         # The retry was told what was wrong.
         log = cat(os.path.join(self.state, "ABC-1", "log.md"))
         self.assertIn("implement attempt 1 failed", log)
@@ -724,7 +732,8 @@ class QueueTest(Base):
         rc, out = self.run_queue("--debug", "1")
         st = self.status()
         self.assertEqual(st["status"], "done", out)
-        self.assertEqual(len(self.calls_of("implementing")), 3)   # two attempts, blocked, one more after the fix
+        # two attempts, each on once in its session, blocked, one more after the fix
+        self.assertEqual(len(self.calls_of("implementing")), 5)
         clone = os.path.join(self.state, "ABC-1", "repo")
         self.assertEqual(self.calls_of("debug"), [f"debug fix {clone} on ABC-1"])   # the clone's branch to switch to
         self.assertIn("ABC-1 at its implement stage", cat(self.calls + ".debugprompt"))
@@ -741,7 +750,7 @@ class QueueTest(Base):
         rc, out = self.run_queue("--debug", "1")
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
-        self.assertEqual(len(self.calls_of("implementing")), 2)
+        self.assertEqual(len(self.calls_of("implementing")), 4)   # two attempts, each on once in its session
         self.assertEqual(len(self.calls_of("debug")), 1)
         self.assertEqual((st["debug"]["verdict"], st["debug"]["harness_change"], st["debug"]["retried"]),
                          ("harness-change-needed", True, False))
@@ -762,7 +771,8 @@ class QueueTest(Base):
         rc, out = self.run_queue("--debug", "1")
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
-        self.assertEqual(len(self.calls_of("implementing")), 4)   # 2, the fix's retry, its own second attempt
+        # 2, the fix's retry, its own second attempt: each attempt on once in its session
+        self.assertEqual(len(self.calls_of("implementing")), 8)
         self.assertEqual(len(self.calls_of("debug")), 1)
         self.assertEqual((st["debugged"], st["debug"]["verdict"], st["debug"]["retried"]), ("implement", "fixed", True))
 
@@ -772,7 +782,7 @@ class QueueTest(Base):
         self.run_queue("--debug", "1")
         st = self.status()
         self.assertEqual(st["status"], "blocked")
-        self.assertEqual(len(self.calls_of("implementing")), 2)
+        self.assertEqual(len(self.calls_of("implementing")), 4)   # two attempts, each on once in its session
         self.assertEqual(st["debug"]["verdict"], "needs-owner")
         self.assertIn("a rebase is still left", st["debug"]["note"])
 
@@ -878,10 +888,13 @@ class QueueTest(Base):
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
         self.assertIn("quoted diff text is not in the diff", st["reason"])
-        # The verifier was asked again, told its quotes were not there, before the attempt failed.
+        # The verifier was asked again, told its quotes were not there, before the agent was
+        # sent on in its session, and so again on that result, before the attempt failed.
         asks = [p for _, _, p in FakeProxy.seen if "check a code change" in p]
-        self.assertEqual(len(asks), 2)
+        self.assertEqual(len(asks), 4)
+        self.assertEqual(len(self.calls_of("implementing")), 2)
         self.assertIn("not in the diff's added lines", asks[1])
+        self.assertIn("not in the diff's added lines", asks[3])
 
     def test_a_verifier_quote_slip_is_asked_again_not_charged_to_the_agent(self):
         FakeProxy.badquote_left = 1   # its first answer misquotes; asked again, it quotes right
@@ -4122,6 +4135,155 @@ class StrayCommitsTest(Base):
         problems, _ = tq.check_change(st, ("sha", "+x\n", ["b.py", "ABC-1-task.md"], 1), "## Files\n- b.py\n")
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("ABC-1-task.md", problems[0])
+
+
+class GoOnOnceTest(Base):
+    """go_on_once: work that fails the stage's check goes on in its agent's session
+    once per attempt, uncounted, told what is wrong; not after a timeout."""
+    prompts = OwnerControlTest.prompts
+
+    def history(self, stage):
+        return [(h["result"], h["attempt"]) for h in self.status()["history"] if h["stage"] == stage]
+
+    def cards(self, stage):
+        return [c for c in map(json.loads, cat(self.calls + ".card").splitlines()) if c["stage"] == stage]
+
+    def sessions(self, stage):
+        return [re.findall(r"--session (\S+)", c) for c in self.calls_of(stage)]
+
+    def test_a_plan_not_written_goes_on_in_its_session_and_passes(self):
+        os.environ["FAKE_SKIP"] = "planning:1"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        self.assertEqual(self.sessions("planning"), [[], ["ses_fake0"]])
+        # attempt 0 throughout (the history counts from 1): going on is not an attempt
+        self.assertEqual(self.history("plan"), [("went on", 1), ("passed", 1)], st["history"])
+        went = [h for h in st["history"] if h["result"] == "went on"][0]
+        self.assertTrue(went["details"][0].startswith(
+            "going on in its session (once, not counted): the plan file was not written"), went)
+        # one short block naming what is wrong, with no owner's message
+        said = cat(self.calls + ".continue")
+        self.assertIn("did not pass the stage's check: the plan file was not written", said)
+        self.assertNotIn("MESSAGE_FROM_THE_OWNER", said)
+        self.assertLess(len(said), 800, said)
+        # the continued launch's card and task file say it too, on attempt 0
+        cards = self.cards("plan")
+        self.assertEqual([c["attempt"] for c in cards], [1, 1])
+        self.assertFalse(cards[0]["do"][0].startswith("Why"), cards[0])
+        self.assertTrue(cards[1]["do"][0].startswith("Why your work failed the check: the plan file was not written"),
+                        cards[1])
+        self.assertEqual(cards[1]["do"][1:], cards[0]["do"])
+        self.assertIn("- the plan file was not written", self.prompts("planning")[1])
+        self.assertIn("plan: going on in its session ses_fake0 (once, not counted): the plan file was not written",
+                      cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+    def test_an_implement_with_no_commit_goes_on_in_its_session_and_commits(self):
+        os.environ["FAKE_SKIP"] = "implementing:1"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        self.assertEqual((rc, self.status()["status"]), (0, "done"), out)
+        self.assertEqual(self.sessions("implementing"), [[], ["ses_fake1"]])
+        self.assertEqual(self.history("implement"), [("went on", 1), ("passed", 1)])
+        self.assertIn("did not pass the stage's check: no commits on branch ABC-1", cat(self.calls + ".continue"))
+        self.assertIn("hello feature", sh("git", "-C", self.remote, "show", "ABC-1:feature.txt"))
+
+    def test_still_wrong_after_going_on_is_retried_by_a_new_agent_then_blocked(self):
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "blocked"), out)
+        self.assertTrue(st["reason"].startswith("implement failed 2 time(s): no commits on branch ABC-1"), st["reason"])
+        # each attempt: a new agent, then once on in its session
+        self.assertEqual(self.sessions("implementing"), [[], ["ses_fake1"], [], ["ses_fake2"]])
+        self.assertEqual(self.history("implement"),
+                         [("went on", 1), ("failed", 1), ("went on", 2), ("failed", 2), ("blocked", 2)])
+        cards = self.cards("implement")
+        self.assertTrue(cards[2]["do"][0].startswith("Why the last attempt failed: no commits"), cards[2])
+        self.assertTrue(cards[3]["do"][0].startswith("Why your work failed the check: no commits"), cards[3])
+
+    def test_a_crash_after_going_on_is_the_attempts_end(self):
+        os.environ.update(FAKE_SKIP="implementing:1", FAKE_CRASH="implementing:1")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "blocked"), out)
+        self.assertEqual(self.sessions("implementing"), [[], ["ses_fake1"]])   # not on again after the crash
+        self.assertEqual(self.history("implement"), [("went on", 1), ("failed", 1), ("blocked", 1)])
+
+    def test_a_failed_check_after_a_crash_went_on_is_the_attempts_end(self):
+        os.environ.update(FAKE_CRASH="planning:1", FAKE_CRITERIA="")   # a plan with no criteria, each time
+        self.add("ABC-1")
+        rc, out = self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "blocked"), out)
+        self.assertEqual(self.sessions("planning"), [[], ["ses_fake0"]])
+        self.assertEqual(self.history("plan"), [("crashed", 1), ("failed", 1), ("blocked", 1)])
+        self.assertIn("going on in its session (once, not counted): its agent stopped on an error",
+                      st["history"][0]["details"][0])
+
+    def test_a_timeout_gets_no_go_on_but_the_next_attempt_does(self):
+        os.environ.update(FAKE_SLEEP="60", FAKE_SLEEP_STAGE="implementing", FAKE_SLEEP_ONCE="1",
+                          FAKE_SKIP="implementing:1")
+        self.add("ABC-1")
+        rc, out = self.run_queue("--stage-timeout", "5")
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out)
+        self.assertEqual(self.history("implement"), [("failed", 1), ("went on", 2), ("passed", 2)])
+        failed = [h for h in st["history"] if h["result"] == "failed"][0]
+        self.assertIn("ran past 5s", failed["details"][0])
+        # the timed-out launch slept before it said its stage; the next is a new agent, then on in its session
+        self.assertEqual(self.sessions("implementing"), [[], ["ses_fake2"]])
+
+    def test_what_gets_no_go_on_and_an_old_crashed_mark(self):
+        ctx = types.SimpleNamespace(q=mock.Mock())
+
+        def st(**kw):
+            return dict({"key": "ABC-1", "stage": "implement", "attempt": 0,
+                         "session": {"stage": "implement", "attempt": 0, "id": "ses_x"}}, **kw)
+        problems = ["no commits on branch ABC-1: commit your change on that branch (git add, git commit)"]
+        for rc in (124, tq.IDLE, 1):   # a timeout, the idle watchdog, a failed launch that is no crash
+            self.assertFalse(tq.go_on_once(ctx, st(), rc, "", problems), rc)
+        self.assertFalse(tq.go_on_once(ctx, st(session={}), 0, "", problems))   # no session known
+        self.assertFalse(tq.go_on_once(ctx, st(session={"stage": "implement", "attempt": 1, "id": "s"}),
+                                       0, "", problems))   # the session of another attempt
+        self.assertFalse(tq.go_on_once(ctx, st(stage="push", session={"stage": "push", "attempt": 0, "id": "s"}),
+                                       0, "", problems))
+        self.assertFalse(tq.go_on_once(ctx, st(), 0, "", [   # only the owner can put it right
+            "/p is on main, not the ticket's branch ABC-1; git switch ABC-1 there, then harness queue retry"]))
+        self.assertFalse(tq.go_on_once(ctx, st(), 0, "", []))
+        ctx.q.save.assert_not_called()
+        # a state file from before: the session's crashed mark is this attempt's go-on
+        old = st(session={"stage": "implement", "attempt": 0, "id": "ses_x", "crashed": True})
+        self.assertEqual(tq.went_on(old), "crash")
+        self.assertFalse(tq.go_on_once(ctx, old, 0, "", problems))
+        self.assertEqual(tq.went_on(dict(old, attempt=1)), "")   # a later attempt has its own
+        one = st(verify_only={"stage": "implement", "out": "x"})
+        self.assertTrue(tq.go_on_once(ctx, one, 0, "", problems))
+        self.assertEqual((tq.went_on(one), one["resume"]["check"], one["feedback"]), ("check", True, "- " + problems[0]))
+        self.assertNotIn("verify_only", one)   # its new result is checked, not this one
+        self.assertFalse(tq.go_on_once(ctx, one, 0, "", problems))   # once
+        self.assertFalse(tq.go_on_once(ctx, one, 1, "its agent stopped on an error: x", problems))
+        crash = st()
+        self.assertTrue(tq.go_on_once(ctx, crash, 1, "its agent stopped on an error: x", problems))
+        self.assertEqual((tq.went_on(crash), "check" in crash["resume"]), ("crash", False))
+        self.assertFalse(tq.go_on_once(ctx, crash, 0, "", problems))   # nor a check's after a crash's
+
+    def test_continue_keeps_the_attempts_go_on_and_retry_drops_it(self):
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add("ABC-1")
+        self.run_queue("--retries", "0")
+        self.assertEqual(self.history("implement"), [("went on", 1), ("failed", 1), ("blocked", 1)])
+        rc, out = self.q("continue", "ABC-1", "--text", "Commit it.")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["went_on"]["attempt"], 0)
+        self.run_queue("--retries", "0")
+        self.assertEqual(len(self.calls_of("implementing")), 3)   # the owner's go on, and no free one after it
+        rc, out = self.q("retry", "ABC-1")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("went_on", self.status())
 
 
 if __name__ == "__main__":

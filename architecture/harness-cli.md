@@ -945,15 +945,25 @@ stage `advance` just moved to) and no `resume` for the stage is already
 waiting (fail's is kept). So does an agent
 that stopped on an error (`crash_of`: the `[harness] opencode error: ...`
 line live-run.sh prints, or a failing launch status, a compaction that went
-wrong say): `fail` sends the stage on in its session once per attempt
-(`go_on_after_crash`, `session.crashed`, history result `crashed`, no attempt
-counted); a second stop fails the attempt and the next one is a new agent
-with the `GOING_ON` block, its `resume.started` the cut-off session's so the
-notes it wrote still count). An agent that ended on its own and failed its
-check goes on in its session too (`fail`: `resume.failed`, the
-`continue-failed` prompt with the problems; the session moves to the new
-attempt and loses `crashed`), not a new agent doing the stage over from its
-start), `stop KEY` (a waiting
+wrong say), or one that ended with work that failed the stage's check: `fail`
+sends the stage on in its session once per attempt in all, uncounted
+(`go_on_once`, `went_on {stage, attempt, kind}`, kept by `continue`, dropped
+by `retry` and a pass; an old state's `session.crashed` counts; history result
+`crashed` or `went on`, "going on in its session (once, not counted): <why>").
+A check's go-on gets `continue-check.md`, one block naming the first one or
+two problems as the card's lines do (`failure_lines`), and the problems as
+`feedback`, so the task file and the card (`last_failure`, "Why your work
+failed the check") carry them on attempt 0 too. Not after a timeout or the
+idle watchdog's stop (the session that ran out of time or stalled is the one
+least likely to finish), with no session known, or for a problem naming a
+`harness queue` command (the owner's). What fails after the go-on fails the
+attempt as before. After a stop the next attempt is a new agent with the
+`GOING_ON` block, its `resume.started` the cut-off session's so the notes it
+wrote still count. After a failed check by an agent that ended on its own, the
+next (counted) attempt goes on in the same session too (`fail`:
+`resume.failed`, the `continue-failed` prompt with the problems; the session
+moves to the new attempt and loses `crashed`), not a new agent doing the stage
+over from its start, and it has its own uncounted go-on), `stop KEY` (a waiting
 ticket becomes `stopped`; a running one the run has in hand gets the
 `KEY/stop` sentinel, which the runner also checks right before the push;
 "in hand" is `run_holds`: a fresh beat, run.json naming it (the run writes
