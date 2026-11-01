@@ -3465,6 +3465,46 @@ class GitStatesTest(Base):
         self.assertEqual(on_main, ["on", "main"], "the retry committed on main again")
         self.assertEqual(st["status"], "done", st.get("reason"))
 
+    def test_commits_on_the_owners_branch_are_reported(self):
+        main0 = self.git_p("rev-parse", "main").strip()
+        os.environ.update(FAKE_INSTEAD_ONCE="1", FAKE_INSTEAD="git switch -q main && echo agent > stray.txt && "
+                                                             "git add stray.txt && git commit -q -m 'on main'")
+        st = self.go(retries="1")
+        self.assertEqual(st["status"], "done", st.get("reason"))
+        said = [w for w in st.get("warnings", []) if "branch main (yours, not the ticket's) has 1 commit(s)" in w]
+        self.assertTrue(said, st.get("warnings"))
+        self.assertIn(f"git branch -f main {main0[:12]}", said[0])
+
+    def test_the_block_reason_is_the_cause(self):
+        os.environ["FAKE_INSTEAD"] = "git switch -q main && echo agent > stray.txt && git add stray.txt && " \
+                                     "git commit -q -m 'on main'"
+        st = self.go()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        self.assertIn("is on main, not the ticket's branch ABC-1", st["reason"])
+        self.assertRegex(st["reason"], r"\(\+\d+ more in .*log\.md\)$")
+
+    def test_a_detached_head_with_the_agents_commit_is_taken(self):
+        os.environ["FAKE_INSTEAD"] = "git switch -q --detach && echo hello feature > feature.txt && " \
+                                     "git add feature.txt && git commit -q -m 'ABC-1: on a detached HEAD'"
+        st = self.go()
+        self.assertEqual(st["status"], "done", st.get("reason"))
+        self.assertEqual(self.git_p("symbolic-ref", "--short", "HEAD").strip(), "main")
+        self.assertEqual(self.git_p("log", "-1", "--format=%s", self.pushed()).strip(), "ABC-1: on a detached HEAD")
+
+    def test_a_bisect_or_revert_in_progress_blocks(self):
+        for how, what in ((["bisect", "start"], "a bisect is in progress"), (None, "a revert is in progress")):
+            with self.subTest(what=what):
+                self.tearDown()
+                self.setUp()
+                if how:
+                    self.git_p(*how)
+                else:
+                    put(os.path.join(self.project, ".git", "REVERT_HEAD"), self.git_p("rev-parse", "HEAD"))
+                st = self.go()
+                self.assertEqual(st["status"], "blocked", st.get("reason"))
+                self.assertIn(what, st["reason"])
+                self.assertEqual(self.pushed(), "")
+
     def test_a_deleted_ticket_text_is_put_back(self):
         os.environ["FAKE_DELETE_TICKET"] = "1"
         self.add("ABC-1")

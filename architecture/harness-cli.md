@@ -814,9 +814,16 @@ each stage everything in the folder (index plus untracked, not ignored
 files) is committed to `refs/harness-queue/snap/KEY` (a chain, a temp
 index), and the owner's untracked and changed paths go in a marked block of
 `.git/info/exclude` that is removed after the stage. `in_place_problems`
-fails a stage when the folder has a rebase or merge going, a left-over
+fails a stage when the folder has a rebase, merge, cherry-pick, revert or
+bisect going (`GIT_TROUBLE`), a left-over
 `index.lock`, is not on the branch, or a commit since the start touches a
-file the owner had changed or untracked. Repositories inside the project
+file the owner had changed or untracked; these come first in the problems,
+as the cause (a failed stage's block reason, `block_line`, is the first
+problem that is not a launch line, plus how many more are in `log.md`).
+A detached HEAD at or ahead of the branch tip is reattached first
+(`reattach`: the branch fast-forwarded there, switched to). Commits on the
+owner's branch while the ticket works (`orig_tip`, taken at set-up) are a
+warning (`owner_branch_moved`) naming how to take them off it. Repositories inside the project
 (their own `.git`, not the ticket's; `nested_repos`: three levels down,
 ignored ones too, any deeper one `git add -A` meets; not the project's own
 worktrees, nor its submodules, nor the vault or the queue's state, nor tools'

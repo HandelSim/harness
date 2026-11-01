@@ -1059,6 +1059,8 @@ def enter_in_place(q, st):
         orig = ""
     if orig or "orig_branch" not in st:
         st["orig_branch"] = orig
+    # its tip now: commits on it while the ticket works are reported (an agent's, made on the wrong branch)
+    st["orig_tip"] = commit_of(project, f"refs/heads/{st['orig_branch']}", fetch=False) if st.get("orig_branch") else ""
     if on != branch or head != start:
         if head != start:
             git(project, "switch", "-q", "--detach", start)
@@ -1146,7 +1148,8 @@ def nested_back(q, st):
 
 
 GIT_TROUBLE = (("rebase-merge", "a rebase"), ("rebase-apply", "a rebase or git am"),
-               ("MERGE_HEAD", "a merge"), ("CHERRY_PICK_HEAD", "a cherry-pick"), ("index.lock", "index.lock"))
+               ("MERGE_HEAD", "a merge"), ("CHERRY_PICK_HEAD", "a cherry-pick"), ("REVERT_HEAD", "a revert"),
+               ("BISECT_LOG", "a bisect"), ("index.lock", "index.lock"))
 
 
 def in_place_trouble(project, branch):
@@ -3008,6 +3011,8 @@ def verify_change(ctx, st, rc, stage):
     if rc == 124 and st.get("agent"):   # stopped on the timeout, its container may still be changing the work
         fail(ctx, st, rc, [])
         return False
+    if st.get("in_place") and not st.get("no_branch"):
+        reattach(ctx, st)
     change = ticket_change(ctx.q, st)
     problems, warnings = check_change(st, change, plan)
     since = st.get("start_sha") or st.get("base_sha")
@@ -3016,9 +3021,9 @@ def verify_change(ctx, st, rc, stage):
         problems.insert(0, f"branch {branch_of(st)} no longer holds the commit the work started from ({since[:12]}): "
                            "a commit --amend, reset or rebase rewrote it; put your commits back on top of it, "
                            "never amend or reset it")
-    if st.get("in_place"):
-        problems += in_place_problems(ctx, st)
-        warnings += head_moved(st)
+    if st.get("in_place"):   # the folder's state first: it is the cause, and the block reason is the first problem
+        problems = in_place_problems(ctx, st) + problems
+        warnings += head_moved(st) + owner_branch_moved(st)
     if not problems and stage == "implement" and not moved_since(st, change, "start"):
         problems.append(f"no new commit on branch {branch_of(st)}: commit your change (git add <files>, git commit)"
                         if not st.get("no_branch") and not st.get("baselines") and not st.get("nested")
@@ -3193,6 +3198,41 @@ def git_bytes(repo, blob):
     except (subprocess.TimeoutExpired, OSError):
         return None
     return r.stdout if r.returncode == 0 else None
+
+
+def reattach(ctx, st):
+    """In place: the agent left a detached HEAD at or ahead of the ticket's branch tip
+    (its commits on top): the branch moved there (a fast-forward only) and checked out
+    again, so those commits are the ticket's instead of a block."""
+    project, branch = st["project"], branch_of(st)
+    if git(project, "symbolic-ref", "-q", "HEAD", check=False).returncode == 0:
+        return
+    head = git(project, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False).stdout.strip()
+    tip = git(project, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False).stdout.strip()
+    if not head or not tip or git(project, "merge-base", "--is-ancestor", tip, head, check=False).returncode != 0:
+        return
+    if head != tip and git(project, "update-ref", f"refs/heads/{branch}", head, tip, check=False).returncode != 0:
+        return
+    if git(project, "switch", "-q", branch, check=False).returncode == 0:
+        ctx.q.log(st["key"], f"the agent left a detached HEAD at {head[:12]}: branch {branch} moved there "
+                             "and checked out again")
+
+
+def owner_branch_moved(st):
+    """Warnings: the branch the owner had the project on got commits while the ticket
+    worked (an agent that committed on the wrong branch; or the owner's own, from another
+    worktree): they are not part of the ticket's change, and nothing moves them."""
+    orig, was = st.get("orig_branch"), st.get("orig_tip")
+    if not orig or not was:
+        return []
+    now = commit_of(st["project"], f"refs/heads/{orig}", fetch=False)
+    if not now or now == was:
+        return []
+    n = git(st["project"], "rev-list", "--count", f"{was}..{now}", check=False).stdout.strip() or "?"
+    return [f"branch {orig} (yours, not the ticket's) has {n} commit(s) made while the ticket worked "
+            f"({was[:12]}..{now[:12]}), not part of the ticket's change; if they are the agent's, take them off "
+            f"it there: git branch -f {orig} {was[:12]} (git cherry-pick {was[:12]}..{now[:12]} on {branch_of(st)} "
+            "first to keep them)"]
 
 
 def in_place_problems(ctx, st):
@@ -3599,7 +3639,18 @@ def fail(ctx, st, rc, problems):
         ctx.q.save(st)
     else:
         again = ", again after harness queue continue" if st.get("continued") == st["stage"] else ""
-        block(ctx, st, f"{st['stage']} failed {st['attempt'] + 1} time(s){again}: {problems[0][:200]}", failed=True)
+        block(ctx, st, f"{st['stage']} failed {st['attempt'] + 1} time(s){again}: {block_line(ctx, st, problems)}",
+              failed=True)
+
+
+def block_line(ctx, st, problems):
+    """A failed stage's block reason: the problem that is the cause (a check's, not fail()'s
+    "the agent ran past ..." when one follows it), in the checks' words, and how many more
+    there are and where."""
+    probs = [" ".join(p.split()) for p in problems if p.strip()] or ["(no problem was given)"]
+    first = ([p for p in probs if not LAUNCH_LINE.match(p)] or probs)[0]
+    more = f" (+{len(probs) - 1} more in {os.path.join(ctx.q.dir(st['key']), 'log.md')})" if len(probs) > 1 else ""
+    return clip(failed_check(first), 300) + more
 
 
 def process(ctx, st):
