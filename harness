@@ -7040,7 +7040,9 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             (or PROJECT); see "Where the agents
                                             work" and "Where the work starts and
                                             ends" below; --stages runs only some
-                                            stages (e.g. review,fix,push); --new
+                                            stages (e.g. review,fix,push) or adds
+                                            the opt-in test stage (plan,test,
+                                            implement,review,fix,push); --new
                                             TEXT queues work with no ticket in the
                                             tracker: a ticket of your own, LOCAL-N
                                             in the vault, is made for it (harness
@@ -7194,6 +7196,11 @@ project folder, on its branch (or with its change left uncommitted):
              still going takes the ticket again: the plan is revised with your
              answers and feedback and held (plan-review) until you approve it
              or send more feedback.
+  test       opt-in, only with --stages (it needs plan and implement, e.g.
+             plan,test,implement,review,fix,push): writes and commits tests
+             for the plan's acceptance criteria before the code exists, and
+             implement then makes them pass (without it, no stage writes tests
+             unless the ticket asks for them).
   implement  changes the code and commits on the ticket's branch.
   review     a fresh session checks the change from several angles (criteria,
              correctness, security, scope, simplicity) into KEY-review.md.
@@ -7380,7 +7387,7 @@ HELP
             if [[ -n "${1:-}" && ( $# -eq 1 || ( $# -eq 3 && "$2" == --stage ) ) ]]; then
                 args+=(retry "$@" --harness "$clone_dir/harness")
             else
-                err "usage: harness queue retry KEY [--stage plan|implement|review|fix|push]"; return 1
+                err "usage: harness queue retry KEY [--stage plan|test|implement|review|fix|push]"; return 1
             fi ;;
         halt) case "$*" in
                 "") args+=(halt) ;;

@@ -1937,8 +1937,10 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   `/runs/queue/runner.out`) with Start (container, host or single-message
   host; host modes need the "host mode is OK" box) and Halt; one row per
   ticket in queue order with a stage strip (plan, implement, review, fix,
-  push: passed, skipped, current in the status colour, still to do, or not
-  one of the ticket's stages), why it waits (a running ticket: its stage,
+  push, and test between plan and implement only on a ticket that has it:
+  passed, skipped, current in the status colour, still to do, or not
+  one of the ticket's stages; a ticket with none recorded has the five of
+  `DEFAULT_STAGES`), why it waits (a running ticket: its stage,
   attempt and the run's `step`; a `running` ticket with no live run on it:
   "run ended"), and its buttons (move, Answer
   or Review plan, stop, retry, remove); and the Add form (Ticket: Jira
@@ -1952,7 +1954,9 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   defaults to that branch's name; one ticket per add), or The folder as it is
   now (`--start here`); the Target branch (`--base`), an optional Work branch
   name, the Repositories tree, plan approval, a note for the agents, and the
-  stages: Full, Review only, Implement+review, Plan only or Custom). The
+  stages: Full, Full + tests (the opt-in test stage, `STAGES` all six),
+  Review only, Implement+review, Plan only or Custom; test needs plan and
+  implement, the form and `ticket_args` saying no otherwise). The
   branch fields suggest the project's local and remote branches from
   `/runs/queue/branches?project=` (read-only git, cached 5 s), which also
   says which repository and branch the folder is on, its remotes and their
@@ -1966,7 +1970,8 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   starting point and branch fields; a row on a branch sends
   `--repo-branch REL=BRANCH:TARGET` (`repo_args`). The form is clamped to what the add accepts, each
   greyed-out choice saying why, and Add stays off with the reasons listed
-  until the choices make sense: fix needs review; with review/fix/push but
+  until the choices make sense: fix needs review; test needs plan and
+  implement; with review/fix/push but
   no implement, New work is off (the work must already exist); more than one
   key turns off Continue and the Work branch name; plan approval is off with
   no plan stage or for Plan only (the add then sends `--no-plan-approval`);
@@ -2030,7 +2035,8 @@ offered as suggestions. It is taken as pasted: quotes
   well), the
   retry form's "from" stages (only those `ticket_queue.retry_choices`, imported
   from the queue script, does not refuse, remotes as last fetched; none: the
-  reason instead of the form; the module not importable: all), the queue's
+  reason instead of the form; the module not importable: all; test only on a
+  ticket that has it), the queue's
   Start form when the ticket is queued or "run ended" and no run is going
   (`back=KEY` returns to the ticket; answer, approve and retry never start a
   run, they say none is going; Continue does, above), the
@@ -2115,8 +2121,8 @@ offered as suggestions. It is taken as pasted: quotes
   emptied field is add's default; the repository tree's settings are sent
   only when the tree loaded, so one that failed to load cannot wipe them.
   After it starts: the settings read-only plus `_later_form` (the stages
-  after the current one, the after-plan choice), which sends only what
-  changed. While running: read-only. `POST .../edit` runs `queue edit`; a
+  after the current one, the after-plan choice; test needs plan and
+  implement here too), which sends only what changed. While running: read-only. `POST .../edit` runs `queue edit`; a
   refusal is the form again (409) with "Not changed:" and what was typed.
 - `POST /runs/ticket/<KEY>/{answer,approve,retry,stop,remove,move,note}`:
   `ticket_queue.py` `answer --stdin` (the form's answers as `## question`
