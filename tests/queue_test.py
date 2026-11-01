@@ -4542,6 +4542,23 @@ class TestStageTest(Base):
                       f"{st['test_sha'][:12]} -- test_feature.py, or restore the file)", st["reason"])
         self.assertEqual(len(self.code_checks()), 1)
 
+    def test_a_review_that_changed_the_work_is_checked_again_on_what_came_after_the_tests(self):
+        put(os.path.join(self.tmp, "stray_agent.py"), STRAY_AGENT)   # the review agent commits (it is told not to)
+        put(self.harness, f'exec {sys.executable} {os.path.join(self.tmp, "stray_agent.py")} "$@"\n')
+        os.environ.update(STRAY_REAL=os.path.join(self.tmp, "fake_agent.py"), STRAY="reviewing|commit|extra.txt|more\n",
+                          FAKE_TESTS=self.CMD)
+        self.add_tested()
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        checks = self.code_checks()
+        self.assertEqual(len(checks), 3, checks)   # the tests, implement, the review's change
+        diff = self.diff_of(checks[2])
+        self.assertIn(tq.MET_WHEN[0], checks[2])
+        self.assertIn("extra.txt", diff)
+        self.assertIn("+hello feature", diff)
+        self.assertNotIn("test_feature.py", diff)
+
     def test_the_test_stage_takes_the_baselines_so_the_owners_edits_are_not_the_tickets(self):
         # in place, a repository inside the project left uncommitted, with the owner's pending edits
         put(os.path.join(self.project, ".gitignore"), "libA/\n")
