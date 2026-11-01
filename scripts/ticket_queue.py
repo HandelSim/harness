@@ -1672,10 +1672,13 @@ def check_change(st, change, plan_text):
             problems.append(f"{f}: changes under .github/ (CI) are not made by the queue; leave CI to the owner")
         if SECRET_PATH.search(f):
             problems.append(f"{f}: a secret or key file must not be committed")
-    notes = tuple(f"{st['key']}-{k}.md".lower() for k in ("plan", "review", "answers", "findings", "task", "result"))
+    notes = tuple(f"{st['key']}-{k}.md".lower() for k in ("plan", "review", "answers", "findings", "result"))
     for f in files:
-        if f.lower().endswith(notes):
-            problems.append(f"{f}: the queue's notes live in the vault, not the branch; git rm it")
+        if f.lower().endswith(f"{st['key']}-task.md".lower()):   # the queue's whole prompt, its paths and all
+            problems.append(f"{f}: the queue's task file is not part of the change; git rm it")
+        elif f.lower().endswith(notes):   # a doc the agent kept with the change: harmless
+            warnings.append(f"{f}: a queue note committed on the branch (the vault has the queue's own copy); "
+                            "it is pushed with the change")
     added = "\n".join(l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
     if SECRET_RE.search(added):
         problems.append("the diff adds what looks like a key or token; remove it")
@@ -1684,7 +1687,8 @@ def check_change(st, change, plan_text):
         if len(v) >= 8 and v in diff:
             problems.append(f"the diff contains the value of {name}; remove it")
     planned = " ".join(bullets(sections(plan_text).get("files", "")))
-    outside = [f for f in files if f not in planned and os.path.basename(f) not in planned]
+    outside = [f for f in files if f not in planned and os.path.basename(f) not in planned
+               and not f.lower().endswith(notes)]
     if outside and plan_text.strip():
         warnings.append("changed but not in the plan's Files: " + ", ".join(outside[:20]))
     return problems, warnings
@@ -2981,10 +2985,11 @@ def recover_note(ctx, st, kind, started, out):
     text, where = "", ""
     if found:
         text, where = read(found[1]), f"the agent's folder ({os.path.relpath(found[1], repo)})"
-        try:
-            os.remove(found[1])   # not the agent's change to commit
-        except OSError:
-            pass
+        if not tracked(found[1]):   # committed (or added), it is the change's: copied, not deleted
+            try:
+                os.remove(found[1])   # not the agent's change to commit
+            except OSError:
+                pass
     else:
         printed = read(out)
         heads = list(re.finditer(NOTE_HEADS[kind], printed, re.M | re.I))
@@ -2997,8 +3002,26 @@ def recover_note(ctx, st, kind, started, out):
     return text
 
 
+def tracked(path):
+    """True when git tracks the file (committed, or added): the queue does not delete it."""
+    return git(os.path.dirname(path), "ls-files", "--error-unmatch", "--", os.path.basename(path), check=False,
+               env={"GIT_LITERAL_PATHSPECS": "1"}).returncode == 0
+
+
+def plan_left(ctx, st):
+    """(mark, files) of the ticket's change around the plan stage, or None when it
+    cannot be looked at (said; the plan stage goes on)."""
+    try:
+        change = ticket_change(ctx.q, st) if st.get("base_sha") else None
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        ctx.q.log(st["key"], f"warning: the change not looked at around the plan stage: {e}")
+        return None
+    return mark(change), (change[2] if change else [])
+
+
 def stage_plan(ctx, st):
     v = common(ctx, st)
+    before = plan_left(ctx, st)
     rc, out, started = agent_or_kept(ctx, st, "plan", lambda: render("plan", **v))
     p = note_paths(ctx.vault, st["key"])
     text = fresh(p["plan"], started) or recover_note(ctx, st, "plan", started, out)
@@ -3045,6 +3068,14 @@ def stage_plan(ctx, st):
                   "\n".join("- " + x for x in open_q))
         return
     write_atomic(plan_copy(ctx.q, st["key"]), text)
+    left = plan_left(ctx, st)
+    if before and left and left[0] != before[0]:   # the plan agent changed the work (it is told not to): kept, said
+        ctx.q.log(st["key"], f"warning: the plan agent changed the work ({', '.join(left[1][:10])}); "
+                             "it stays in the change, and the implement stage's own work is what comes after it")
+    if left:   # implement's "no new commit" is since the plan too, not only the set-up
+        st["implement_from"] = left[0]
+    else:
+        st.pop("implement_from", None)
     advance(ctx, st, next_stage(st, "plan"))
     held = ctx.plan_review or st.get("plan_review") or st.get("plan_hold")
     if held and not st.get("plan_approved") and st["status"] == "running":
@@ -3099,14 +3130,25 @@ def numbered(items):
 
 def verify_change(ctx, st, rc, stage):
     """Gates then the verifier on the branch; True when it passes."""
+    if rc == 124 and st.get("agent"):   # stopped on the timeout, its container may still be changing the work
+        fail(ctx, st, rc, [])
+        return False
+    problems = change_problems(ctx, st, rc, stage)
+    if problems:
+        fail(ctx, st, rc, problems)
+        return False
+    return True
+
+
+def change_problems(ctx, st, rc, stage):
+    """verify_change's gates, syntax check and verifier on the change as it is now:
+    its problems, or [] when it passes (verified_sha, verified_repos and verified_mark
+    then say what passed, which is what the push may push)."""
     p = note_paths(ctx.vault, st["key"])
     plan = read(plan_copy(ctx.q, st["key"]))
     criteria = change_criteria(ctx, st, plan)
     if stage == "fix":
         criteria = criteria + [f"(review) {m}" for m in st.get("must_fix", [])]
-    if rc == 124 and st.get("agent"):   # stopped on the timeout, its container may still be changing the work
-        fail(ctx, st, rc, [])
-        return False
     if st.get("in_place") and not st.get("no_branch"):
         reattach(ctx, st)
     change = ticket_change(ctx.q, st)
@@ -3121,7 +3163,7 @@ def verify_change(ctx, st, rc, stage):
     if st.get("in_place"):   # the folder's state first: it is the cause, and the block reason is the first problem
         problems = in_place_problems(ctx, st) + problems
         warnings += head_moved(st) + owner_branch_moved(st)
-    if not problems and stage == "implement" and not moved_since(st, change, "start"):
+    if not problems and stage == "implement" and not moved_since(st, change, "implement"):
         problems.append(f"no new commit on branch {branch_of(st)}: commit your change (git add <files>, git commit)"
                         if not st.get("no_branch") and not st.get("baselines") and not st.get("nested")
                         else "nothing changed since the work started: make the change " + HOW_SHORT)
@@ -3161,11 +3203,11 @@ def verify_change(ctx, st, rc, stage):
                 ctx.q.log(st["key"], f"{stage} verifier, asked again: {e}")
         st["warnings"] = warnings
     if problems:
-        fail(ctx, st, rc, problems)
-        return False
+        return problems
     st["verified_sha"] = change[0]   # what the push may push: a branch moved since is not
     st["verified_repos"] = {p["repo"]: p["sha"] for p in change[4] if p["kind"] == "branch" and p["repo"] != "."}
-    return True
+    st["verified_mark"] = mark(change)   # and the change as a whole, uncommitted files too
+    return []
 
 
 HOW_SHORT = "(where the ticket says how it lands: committed on its branch, or left uncommitted)"
@@ -3371,12 +3413,15 @@ def owners_touched(repo, rel, since, branch, mine):
 
 
 def moved_since(st, change, what):
-    """True when the change has work since what ("start": the set-up; "review": the
-    review): a commit on a branch of the ticket's, or a file left uncommitted changed."""
+    """True when the change has work since what ("start": the set-up; "implement": the
+    set-up and what the plan stage left; "review": the review): a commit on a branch of
+    the ticket's, or a file left uncommitted changed."""
     if change is None:
         return False
     if what == "review":
         return (change[0] or "") != st.get("review_sha", "") or digest(change[1]) != st.get("review_digest")
+    if what == "implement" and mark(change) == st.get("implement_from"):   # a plan agent's commits are not
+        return False                                                        # implement's work
     starts = {rel: n.get("start_sha") for rel, n in (st.get("nested") or {}).items()}
     starts["."] = st.get("start_sha")
     return any(p["kind"] == "uncommitted" or p["sha"] != starts.get(p["repo"]) for p in change[4])
@@ -3384,6 +3429,12 @@ def moved_since(st, change, what):
 
 def digest(text):
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def mark(change):
+    """Where a change (ticket_change) is: its diff and each branch's tip; another mark
+    once anything in it moved. "" for no change."""
+    return "" if change is None else digest(change[1] + "".join(f"\n{p['repo']} {p['sha']}" for p in change[4]))
 
 
 def cap(text, n):
@@ -3407,6 +3458,7 @@ def stage_review(ctx, st):
     change = ticket_change(ctx.q, st)
     v = common(ctx, st)
     v["DIFF"] = cap(change[1], DIFF_CAP_AGENT) if change else "(no diff)"
+    dirty = dirty_files(workdir(ctx.q, st))
     rc, out, started = agent_or_kept(ctx, st, "review", lambda: render("review", **v))
     path = note_paths(ctx.vault, st["key"])["review"]
     text = fresh(path, started) or recover_note(ctx, st, "review", started, out)
@@ -3416,18 +3468,55 @@ def stage_review(ctx, st):
     if problems:
         return fail(ctx, st, rc, problems)
     ctx.q.log(st["key"], f"review: {len(must)} must-fix item(s)", "\n".join("- " + m for m in must))
+    change, broke = review_changed(ctx, st, dirty)
+    must = [f"the review stage's own change fails a check: {b}" for b in broke] + must
     st.update(must_fix=must[:15], review_sha=(change[0] or "") if change else "",
               review_digest=digest(change[1]) if change else "")
     after = next_stage(st, "review")
     if not must or "fix" in stages_of(st):
         return advance(ctx, st, "fix" if must else after)
     found = f"the review found {len(must)} must-fix item(s) ({path}); fix is not in this ticket's stages"
+    if broke:
+        found = (f"the review agent changed the work (it is told not to) and the change no longer passes its "
+                 f"checks ({broke[0][:200]}); fix is not in this ticket's stages")
     if after:   # nothing after a review that wants fixes, without them
         how = f"harness queue retry {st['key']} --stage fix (or --stage {after} to go on as it is)"
         return block(ctx, st, f"{found}, so {after} did not run: {how}",
                      no_go_on=f"the review's must-fix items need a fix stage, and going on with the review "
                               f"would find them again: {how}")
     advance(ctx, st, None, reason=found)
+
+
+def dirty_files(repo):
+    """git status's lines in repo (what is uncommitted there), as a set."""
+    r = git(repo, "status", "--porcelain", "--untracked-files=normal", check=False)
+    return {l for l in r.stdout.splitlines() if l.strip()} if r.returncode == 0 else set()
+
+
+def review_changed(ctx, st, dirty):
+    """(change, problems) after the review agent, which is told not to change the work.
+    When it did (the change is not the one verified), the change is checked again, so
+    what the push pushes is checked: [] when it passes, else its problems (for the fix
+    stage). Edits it left uncommitted beside a branch are not the change: said, and
+    left as they are (dirty: git status before the agent)."""
+    key, change = st["key"], ticket_change(ctx.q, st)
+    left = sorted(l[3:] for l in dirty_files(workdir(ctx.q, st)) - dirty)
+    if left and not st.get("no_branch"):
+        where = "the project (yours to keep or drop)" if st.get("in_place") else "the ticket's clone"
+        ctx.q.log(key, f"warning: the review agent left uncommitted edits in {where}: {', '.join(left[:10])}; "
+                       "they are not part of the change")
+    if not st.get("verified_mark") or mark(change) == st["verified_mark"]:
+        return change, []
+    made = git(st["project"], "log", "--format=%h %s", f"{st['verified_sha']}..{change[0]}", check=False).stdout \
+        if change and change[0] and st.get("verified_sha") else ""
+    said = "; ".join(l for l in made.splitlines() if l)[:600] or \
+        ("; ".join(part_line(p) for p in change[4]) if change else "it took the whole change away")
+    ctx.q.log(key, f"warning: the review agent changed the work (it is told not to): {said}; checking the change again")
+    problems = change_problems(ctx, st, 0, "review")
+    if problems:
+        ctx.q.log(key, "the change after the review does not pass its checks: the fix stage gets them as must-fix "
+                       "items", "\n".join("- " + p for p in problems))
+    return change, problems
 
 
 def stage_fix(ctx, st):
@@ -4872,9 +4961,10 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         st.pop("verify_only", None)
         st.pop("verified_sha", None)
         st.pop("verified_repos", None)
+        st.pop("verified_mark", None)
     if not go_on and starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "verify_only", "verified_sha",
-                  "verified_repos", "built_on"):
+                  "verified_repos", "verified_mark", "implement_from", "built_on"):
             st.pop(k, None)
         if st["stage"] == "plan":
             for k in ("questions", "criteria", "plan_sig"):

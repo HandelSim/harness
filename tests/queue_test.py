@@ -1261,9 +1261,11 @@ class QueueTest(Base):
         os.environ["TRACKER_TOKEN"] = "s3cr3t-value"
         problems, _ = tq.check_change(st, ("sha", "+x = 's3cr3t-value'\n", ["b.py"], 1), "## Files\n- b.py\n")
         self.assertEqual(problems, ["the diff contains the value of TRACKER_TOKEN; remove it"])
-        # A plan the agent left in its clone and committed is not part of the change.
-        problems, _ = tq.check_change(st, ("sha", "+x\n", ["b.py", "docs/ABC-1-plan.md"], 1), "## Files\n- b.py\n")
-        self.assertEqual(problems, ["docs/ABC-1-plan.md: the queue's notes live in the vault, not the branch; git rm it"])
+        # A plan the agent left in its clone and committed is harmless: said, not a gate.
+        problems, warnings = tq.check_change(st, ("sha", "+x\n", ["b.py", "docs/ABC-1-plan.md"], 1), "## Files\n- b.py\n")
+        self.assertEqual(problems, [])
+        self.assertEqual(warnings, ["docs/ABC-1-plan.md: a queue note committed on the branch (the vault has the "
+                                    "queue's own copy); it is pushed with the change"])
 
     def test_json_object(self):
         self.assertEqual(tq.json_object('text {"a": "}{", "b": {"c": 1}} more'), {"a": "}{", "b": {"c": 1}})
@@ -3977,6 +3979,149 @@ class SubmoduleWorkTest(Base):
         self.assertIn("b/mods/sub/agent.txt", self.review_prompt().split("<<<BEGIN_DIFF")[-1])
         ptr, pushed = self.pointer()
         self.assertEqual(pushed, ptr)
+
+
+# In front of FAKE_AGENT: what STRAY says, for the stage it names, before (or instead of) the agent's
+# work. STRAY: entries "stage|do|file|text" joined by ";;"; do: commit (write file, commit it), edit
+# (write it, leave it uncommitted), exit (stop there, the stage's work not done).
+STRAY_AGENT = r'''
+import os, re, subprocess, sys
+args = sys.argv[1:]
+real = [sys.executable, os.environ["STRAY_REAL"]] + args
+if not args or args[0] in ("queue", "debug") or "--ticket" not in args:
+    os.execv(sys.executable, real)
+ticket = args[args.index("--ticket") + 1]
+task = os.path.join(os.environ["FAKE_VAULT"], "wiki", "notes", "tickets", ticket + "-task.md")
+m = re.match(r"You are (\w+)", open(task, encoding="utf-8").read() if os.path.exists(task) else args[-1])
+stage = m.group(1) if m else ""
+for entry in [e for e in os.environ.get("STRAY", "").split(";;") if e]:
+    s, do, name, text = (entry.split("|", 3) + ["", ""])[:4]
+    if s != stage:
+        continue
+    if do == "exit":
+        sys.exit(0)
+    os.makedirs(os.path.dirname(name) or ".", exist_ok=True)
+    open(name, "w").write(text)
+    if do == "commit":
+        subprocess.run(["git", "add", name], check=True, capture_output=True)
+        subprocess.run(["git", "-c", "user.name=A", "-c", "user.email=a@example.com", "commit", "-q", "-m",
+                        stage + ": " + name], check=True, capture_output=True)
+os.execv(sys.executable, real)
+'''
+
+STRAY_PLAN = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n- AC1: GIVEN the project WHEN the change "
+              "is in THEN a file feature.txt says hello feature (ticket: \"add a feature file\")\n## Approach\nWrite "
+              "feature.txt.\n## Files\n- feature.txt: new\n## Questions\n- None\n## Assumptions\n- None\n")
+
+
+class StrayCommitsTest(Base):
+    """An agent that commits where it should not (the plan stage, the review stage)
+    does not block the ticket, and nothing unchecked is pushed."""
+
+    def setUp(self):
+        super().setUp()
+        stray = os.path.join(self.tmp, "stray_agent.py")
+        put(stray, STRAY_AGENT)
+        put(self.harness, f'exec {sys.executable} {stray} "$@"\n')
+        os.environ["STRAY_REAL"] = os.path.join(self.tmp, "fake_agent.py")
+
+    def stray(self, *entries):
+        os.environ["STRAY"] = ";;".join(entries)
+
+    def qlog(self):
+        return cat(os.path.join(self.state, "ABC-1", "log.md"))
+
+    def pushed(self):
+        return sh("git", "-C", self.remote, "ls-tree", "-r", "--name-only", "ABC-1").split()
+
+    def test_a_plan_committed_in_the_clone_is_kept_and_does_not_block(self):
+        self.stray("planning|commit|ABC-1-plan.md|" + STRAY_PLAN, "planning|exit")
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("done", "done"), out)
+        self.assertIn("A feature file.", cat(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-plan.md")))
+        repo = os.path.join(self.state, "ABC-1", "repo")
+        self.assertTrue(os.path.exists(os.path.join(repo, "ABC-1-plan.md")))   # git tracks it: copied, not deleted
+        self.assertEqual(sh("git", "-C", repo, "status", "--porcelain"), "")
+        self.assertIn("ABC-1-plan.md", self.pushed())
+        self.assertIn("warning: ABC-1-plan.md: a queue note", self.qlog())
+
+    def test_the_plan_stages_commit_is_not_the_implement_stages_work(self):
+        self.stray("planning|commit|feature.txt|hello feature\n", "implementing|exit")
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
+        self.assertIn("no new commit on branch ABC-1", st["reason"])
+        self.assertIn("warning: the plan agent changed the work", self.qlog())
+        self.assertEqual(sh("git", "-C", self.remote, "branch"), "")
+
+    def test_a_review_that_commits_is_checked_again_and_pushed(self):
+        self.stray("reviewing|commit|extra.txt|more words\n")
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["push"]["result"]), ("done", "pushed"), out)
+        self.assertIn("extra.txt", self.pushed())
+        log = self.qlog()
+        self.assertIn("warning: the review agent changed the work", log)
+        self.assertIn("reviewing: extra.txt", log)
+        self.assertEqual(st["verified_sha"], sh("git", "-C", self.remote, "rev-parse", "ABC-1").strip())
+
+    def test_a_review_that_breaks_the_change_goes_to_fix(self):
+        self.stray("reviewing|commit|broken.py|def broken(:\n", "fixing|commit|broken.py|def broken():\n    pass\n")
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["push"]["result"]), ("done", "pushed"), out)
+        self.assertEqual(len(self.calls_of("fixing")), 1)
+        self.assertIn("broken.py", cat(self.calls + ".fixing"))   # the broken check is a must-fix item
+        self.assertFalse([h for h in st["history"] if h["stage"] == "review" and h["result"] != "passed"])
+
+    def test_a_review_that_breaks_the_change_without_a_fix_stage_blocks_at_review(self):
+        self.stray("reviewing|commit|broken.py|def broken(:\n")
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "plan,implement,review,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "review"), out)
+        self.assertIn("the review agent changed the work", st["reason"])
+        self.assertIn("harness queue retry ABC-1 --stage fix", st["reason"])
+        self.assertEqual(len(self.calls_of("reviewing")), 1)   # the review is not run again
+        self.assertEqual(sh("git", "-C", self.remote, "branch"), "")
+
+    def test_a_fix_after_a_committing_review_still_has_to_commit(self):
+        os.environ.update(FAKE_MUSTFIX="1", FAKE_FIX_NOOP="1")
+        self.stray("reviewing|commit|extra.txt|more words\n")
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "fix"), out)
+        self.assertIn("no new commit since the review", st["reason"])
+        self.assertEqual(sh("git", "-C", self.remote, "branch"), "")
+
+    def test_a_review_that_leaves_edits_in_place_is_said_and_they_stay(self):
+        self.stray("reviewing|edit|README|edited by the review\n")
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["push"]["result"]), ("done", "pushed"), out)
+        self.assertIn("warning: the review agent left uncommitted edits", self.qlog())
+        self.assertIn("README", self.git_p("status", "--porcelain"))
+        self.assertEqual(cat(os.path.join(self.project, "README")), "edited by the review\n")
+
+    def test_queue_notes_on_the_branch_are_warnings_but_the_task_file(self):
+        st = {"key": "ABC-1"}
+        files = ["b.py", "docs/ABC-1-plan.md", "ABC-1-review.md", "ABC-1-findings.md", "ABC-1-answers.md"]
+        problems, warnings = tq.check_change(st, ("sha", "+x\n", files, 1), "## Files\n- b.py\n")
+        self.assertEqual(problems, [])
+        self.assertEqual(len(warnings), 4, warnings)
+        self.assertTrue(all("a queue note" in w for w in warnings), warnings)
+        problems, _ = tq.check_change(st, ("sha", "+x\n", ["b.py", "ABC-1-task.md"], 1), "## Files\n- b.py\n")
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("ABC-1-task.md", problems[0])
 
 
 if __name__ == "__main__":

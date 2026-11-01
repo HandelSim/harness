@@ -1051,10 +1051,14 @@ container launch gets the vault's `/c/...` mount path (`agent_path`: `cygpath
 -u`, else a drive-letter rewrite), not the `C:\...` path native Python holds,
 which a Linux agent cannot write (every plan attempt failed "the plan file
 was not written" before). A plan or review the agent wrote anywhere else in
-the clone (a file ending `KEY-plan.md`, newer than the stage) is moved into
-the vault, else the last `## Goal` / `## Must fix` block of its output is
+the clone (a file ending `KEY-plan.md`, newer than the stage) is copied into
+the vault (and deleted there unless git tracks it: a committed copy stays,
+it is the change's), else the last `## Goal` / `## Must fix` block of its output is
 taken (`recover_note`, logged; never output that holds the prompt's own
-template).
+template). A plan agent that changed the work (it is told not to) is a
+warning; its commits stay in the change, and implement's "no new commit" is
+counted from what the plan stage left (`implement_from`, a `mark()` of the
+change) as well as from the set-up.
 
 The plan is markdown in a strict one-line-per-item shape (`plan.md`; the card's
 done line repeats it): `## Goal`, `## How it works` (2-5 plain bullets: what
@@ -1098,8 +1102,9 @@ questions and a missing `[blocking]` marker (`MARK`: in brackets,
 parentheses, bold or backticks, anywhere on the line) are logged as notes,
 not failures; an unmarked question with a `?` blocks, default or not, and
 "None" / "No questions" bullets are not questions;
-commits, a non-empty diff, nothing under `.github/`, none of the ticket's
-notes (a recovered `KEY-plan.md` the agent committed), no key file, no
+commits, a non-empty diff, nothing under `.github/`, not the queue's task
+file `KEY-task.md` (its other notes on the branch, a committed `KEY-plan.md`
+say, are a warning, pushed with the change), no key file, no
 key-shaped added line, no value of a secret env var), then
 one raw verifier call through the proxy (`verify_plan.md` /
 `verify_change.md`, JSON only, three tries; the plan verifier gets the
@@ -1226,6 +1231,15 @@ when pushed), `commits [{sha, subject}]` (at most 50), `diffstat {files,
 insertions, deletions}`, `folder_branch_now` and `warnings`, also written
 to the vault as `wiki/notes/tickets/KEY-result.md`; push pushes only
 `verified_sha`, and blocks when the branch moved since it was checked.
+A review agent that changed the work (it is told not to) does not reach that
+block: after the review, a change whose `mark()` is not `verified_mark` is
+logged with the review's commits and checked again (`review_changed`:
+`change_problems`, verify_change's gates, syntax and verifier); a pass goes
+on as usual, problems become must-fix items for fix (no fix stage: blocked
+at review with `harness queue retry KEY --stage fix`), and the review is
+never run again for it. `review_sha` / `review_digest` are the change after
+the review, so fix still has to commit. Edits the review left uncommitted
+beside a branch are not the change: a warning, left where they are.
 `answer` and `approve` take `queue.lock`; a lock held over 10 s fails the
 owner command (rc 1) rather than hang. Going back to the plan
 (`answer`) starts from a fresh clone. A
