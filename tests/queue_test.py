@@ -4615,6 +4615,18 @@ class TestStageTest(Base):
         self.assertEqual((rc, st["status"]), (0, "done"), out + st.get("reason", ""))
         self.assertIn("this ticket has no test stage", cat(self.calls + ".implementing"))
 
+    def test_no_test_framework_says_the_tickets_own_stages_without_test(self):
+        os.environ.update(FAKE_TESTS=self.CMD, FAKE_NO_FRAMEWORK="1")
+        self.add_tested("plan,test,implement")   # no review, fix or push: the way on adds none
+        self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "test"), st.get("reason"))
+        self.assertIn("harness queue edit ABC-1 --stages plan,implement, then harness queue retry ABC-1 --stage "
+                      "implement", st["reason"])
+        rc, out = self.q("edit", "ABC-1", "--stages", "plan,implement")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.status()["stages"], ["plan", "implement"])
+
     def test_every_stage_an_agent_works_in_has_its_tables(self):
         guide = tq.stage_guidance()
         self.assertIn("test", tq.RESUMABLE)

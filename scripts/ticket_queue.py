@@ -3629,7 +3629,8 @@ def stage_test(ctx, st):
     said = no_framework_line(read(out)) if out else ""
     if said and not moved_since(st, ticket_change(ctx.q, st), "implement"):   # the owner's call, not a retry's
         key = st["key"]
-        how = (f"drop the test stage (harness queue edit {key} --stages plan,implement,review,fix,push, then "
+        rest = ",".join(s for s in stages_of(st) if s != "test")   # the owner's other stages, as chosen
+        how = (f"drop the test stage (harness queue edit {key} --stages {rest}, then "
                f"harness queue retry {key} --stage implement), or say which framework to use (harness queue answer "
                f"{key} --text \"<the framework>\": the plan is made again with it)")
         return block(ctx, st, f"the test stage found no test framework in the project: {clip(' '.join(said.split()), 200)}"
