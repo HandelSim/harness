@@ -806,7 +806,9 @@ In place, the agents work in the project folder itself (`workdir()`):
 setup saves what the owner has uncommitted (`owner.json`), never resets,
 cleans or stashes, and switches the folder to the branch at the start; a
 later stage finding the folder on another in-place ticket's branch switches
-it back (`back_on_branch`) unless that leaves changes behind that were not
+it back (`back_on_branch`, run before every stage and retry of the loop, not
+only the run's first, so a retry never starts where the last attempt left the
+folder) unless that leaves changes behind that were not
 there when the ticket started, and blocks on any branch the owner chose. Before
 each stage everything in the folder (index plus untracked, not ignored
 files) is committed to `refs/harness-queue/snap/KEY` (a chain, a temp
@@ -1076,7 +1078,12 @@ diff for each criterion met;
 `judge()` checks every quote is really in the source (letters and digits
 only, so spacing and list markers do not matter); a diff quote must come
 from an added line, or a removed one when the criterion is about removing,
-never an unchanged context line. When every problem `judge()` finds is a
+never an unchanged context line. A branch whose tip no longer holds
+`start_sha` (an amend, reset or rebase rewrote the start) fails the stage
+before anything else. The queue's git runs with `core.quotePath=false`, so a
+non-ASCII path meets the file-name gates (owner's files, secrets, `.github/`)
+as it is. `run_agent` keeps a copy of the ticket's text (`state/queue/KEY/
+ticket.md`) and puts it back if the agent deleted it. When every problem `judge()` finds is a
 quote of the verifier's own that is not in the diff (`QUOTE_MISS`), the
 verifier is asked once more through `verdict()` (its shorter-prompt fallback
 too), its prompt with `REQUOTE` after it, and only that answer counts: the
@@ -1174,7 +1181,8 @@ batch-mode `GIT_SSH_COMMAND` (on the queue's launch path only). The
 project's network git (fetch, push, `ls-remote`) runs with the same
 settings and a timeout that ends the whole process tree, never under
 `queue.lock`; a failed `_sync` or `_pull` only warns. In place, the
-folder's branch at add is `orig_branch`; a parked or finished ticket
+folder's branch at add is `orig_branch` (a nested `--repo-branch` repository on a
+detached HEAD: `orig_sha`, switched back to with `--detach`); a parked or finished ticket
 switches the folder back unless that leaves new changes behind (`park` saves
 under `queue.lock` and keeps an `approve`, `answer` or `stop` the owner made
 meanwhile), and a

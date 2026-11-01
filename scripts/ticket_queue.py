@@ -717,8 +717,9 @@ def git(cwd, *args, check=True, timeout=300, env=None):
     env = dict(os.environ, **{"GIT_TERMINAL_PROMPT": "0", **(env or {})})
     # no fsmonitor daemon started by the queue's git: it would outlive the call holding its files;
     # no signing: a key on a smart card would ask for its PIN with nobody there
-    r = run_quiet(["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", *args],
-                  timeout, env=env)
+    # paths as they are, not "caf\303\251.txt": a quoted name would slip past the gates on file names
+    r = run_quiet(["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
+                   "-c", "core.quotePath=false", *args], timeout, env=env)
     if check and r.returncode != 0:
         words = [a for i, a in enumerate(args) if a != "-c" and (i == 0 or args[i - 1] != "-c")]
         raise RuntimeError(f"git {' '.join(words[:2])}: {git_said(r)}")
@@ -1107,6 +1108,8 @@ def enter_nested(q, st):
         prev = nested.get(rel) or {}
         n = {"branch": branch, "start_sha": start, "base_sha": r.stdout.strip(),
              "orig_branch": prev.get("orig_branch", "") if on == branch else on,
+             # on a detached HEAD: the commit to go back to
+             "orig_sha": prev.get("orig_sha", "") if on == branch else ("" if on else commit_of(d, "HEAD")),
              "made_branch": prev.get("made_branch", not old),
              "owner": prev.get("owner") if "owner" in prev else
              sorted(p for v in uncommitted(d).values() for p in v)}
@@ -1248,7 +1251,7 @@ def park(q, st):
         q.log(key, f"{project} stays on {on}: {why}")
         st["reason"] = (st.get("reason", "") + "; " if st.get("reason") else "") + f"the folder stays on {on}: {why}"
     for rel, n in sorted((st.get("nested") or {}).items()):   # each repository with a branch, as the top
-        d, orig = repo_dir(st, rel), n.get("orig_branch")
+        d, orig = repo_dir(st, rel), n.get("orig_branch") or n.get("orig_sha")
         if not orig or not os.path.isdir(d) or \
                 git(d, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip() != n["branch"]:
             continue
@@ -1256,7 +1259,7 @@ def park(q, st):
         why = in_place_trouble(d, None) or (f"uncommitted changes the ticket's work left ({', '.join(new[:5])}); "
                                              f"git switch {orig} there after them" if new else "")
         if not why:
-            r = git(d, "switch", "-q", orig, check=False)
+            r = git(d, "switch", "-q", *([orig] if n.get("orig_branch") else ["--detach", orig]), check=False)
             if r.returncode == 0:
                 q.log(key, f"switched {rel} back to {orig}, the branch it was on before {key}")
                 continue
@@ -1899,6 +1902,9 @@ def run_agent(ctx, st, stage, prompt):
     # The whole prompt is also in the vault while the stage runs: a no-tools model
     # loses the prompt after its first tool call, and the proxy points it there.
     task = note_paths(ctx.vault, key)["task"]
+    ticket, kept_ticket = note_paths(ctx.vault, key)["ticket"], os.path.join(ctx.q.dir(key), "ticket.md")
+    if read(ticket).strip():   # the checks quote it: an agent that deletes it would fail them all
+        write_atomic(kept_ticket, read(ticket))
     if resume and not sid:
         msg = (resume.get("message") or "").strip()
         prompt += CARRY_ON.format(how=HOW_FAILED if resume.get("failed") else "was cut off before it finished",
@@ -1964,6 +1970,9 @@ def run_agent(ctx, st, stage, prompt):
     st["verify_only"] = {"stage": stage, "rc": rc, "out": out,
                          "started": s.get("started") if s.get("stage") == stage and s.get("started") else since / 1000}
     ctx.q.save(st)
+    if not read(ticket).strip() and read(kept_ticket).strip():
+        write_atomic(ticket, read(kept_ticket))
+        ctx.q.log(key, f"the {stage} agent deleted the ticket's text ({ticket}); put back")
     sync_vault(ctx, key, since)
     return rc, out
 
@@ -3001,6 +3010,12 @@ def verify_change(ctx, st, rc, stage):
         return False
     change = ticket_change(ctx.q, st)
     problems, warnings = check_change(st, change, plan)
+    since = st.get("start_sha") or st.get("base_sha")
+    if change and change[0] and since and not st.get("no_branch") and \
+            git(st["project"], "merge-base", "--is-ancestor", since, change[0], check=False).returncode != 0:
+        problems.insert(0, f"branch {branch_of(st)} no longer holds the commit the work started from ({since[:12]}): "
+                           "a commit --amend, reset or rebase rewrote it; put your commits back on top of it, "
+                           "never amend or reset it")
     if st.get("in_place"):
         problems += in_place_problems(ctx, st)
         warnings += head_moved(st)
@@ -3633,9 +3648,15 @@ def process(ctx, st):
         where = f"in place in {st['project']}" if st.get("in_place") else f"cloned {st['project']}"
         ctx.q.log(key, f"{where}: branch {branch_of(st)} from {start_of(st)} ({st['start_sha'][:12]}); the change is "
                        f"since {st['base_sha'][:12]} (base {st['base']})" + (f"; {kept}" if kept else ""))
+    looped = False
     while st["status"] == "running":
         checkpoint(ctx)
         beat(ctx, ticket=key, stage=st["stage"], step="")
+        if looped and st.get("in_place") and st.get("base_sha"):   # a stage before may have left it on another branch
+            trouble = back_on_branch(ctx.q, st)
+            if trouble:
+                return block(ctx, st, trouble)
+        looped = True
         ctx.q.log(key, f"{st['stage']} (attempt {st['attempt'] + 1}, {ctx.model})")
         try:
             if st.get("in_place"):   # what the uncommitted repositories hold before the work: their change is since

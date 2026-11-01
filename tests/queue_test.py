@@ -123,6 +123,13 @@ def path(label):
     return p
 def git(*a):
     subprocess.run(["git", *a], check=True, capture_output=True)
+if stage == "planning" and os.environ.get("FAKE_DELETE_TICKET"):   # the ticket's text deleted, then the work
+    os.remove(os.path.join(vault, ".raw", "tickets", "ABC-1.md"))
+if stage == "implementing" and os.environ.get("FAKE_INSTEAD") and not (
+        os.environ.get("FAKE_INSTEAD_ONCE") and os.path.exists(os.environ["FAKE_CALLS"] + ".instead")):
+    open(os.environ["FAKE_CALLS"] + ".instead", "a").write("x")   # a shell command instead of its work
+    subprocess.run(os.environ["FAKE_INSTEAD"], shell=True, check=True)
+    sys.exit(0)
 if stage == "planning":
     blocking = os.environ.get("FAKE_BLOCKING") and "Use the blue one" not in prompt
     qs = "- [blocking] Which colour? Default: blue\n" if blocking else "- None\n"
@@ -3396,6 +3403,77 @@ class OrphanAgentTest(Base):
         self.assertEqual(self.status()["status"], "done", out)
 
 
+class GitStatesTest(Base):
+    """What an agent leaves in place that the queue must not take for a good change."""
+
+    def go(self, retries="0"):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--stages", "implement,push")
+        self.assertEqual(rc, 0, out)
+        self.run_queue("--retries", retries)
+        return self.status()
+
+    def pushed(self):
+        return subprocess.run(["git", "-C", self.remote, "rev-parse", "-q", "--verify", "ABC-1"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_a_branch_that_rewrote_its_start_is_not_pushed(self):
+        put(os.path.join(self.project, "keep.txt"), "the owner's work\n")
+        self.git_p("add", "keep.txt")
+        self.git_p("commit", "-q", "-m", "owner work on main")
+        work = "echo hello feature > feature.txt && git add feature.txt && "
+        for how in (work + "git commit -q --amend -m init",
+                    "git reset -q --hard HEAD~1 && " + work + "git commit -q -m 'ABC-1: x'"):
+            with self.subTest(how=how):
+                self.tearDown()
+                self.setUp()
+                put(os.path.join(self.project, "keep.txt"), "the owner's work\n")
+                self.git_p("add", "keep.txt")
+                self.git_p("commit", "-q", "-m", "owner work on main")
+                os.environ["FAKE_INSTEAD"] = how
+                st = self.go()
+                self.assertEqual(st["status"], "blocked", st.get("reason"))
+                self.assertIn("no longer holds the commit the work started from", st["reason"])
+                self.assertEqual(self.pushed(), "")
+
+    def test_non_ascii_names_meet_the_file_gates(self):
+        for name, why in (("certs/cl\u00e9.pem", "secret or key file"), (".github/workflows/caf\u00e9.yml", ".github/")):
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                os.environ["FAKE_FILE"] = name
+                st = self.go()
+                self.assertEqual(st["status"], "blocked", st.get("reason"))
+                self.assertIn(why, st["reason"])
+                self.assertEqual(self.pushed(), "")
+
+    def test_the_owners_non_ascii_file_is_not_taken(self):
+        put(os.path.join(self.project, "caf\u00e9.txt"), "notes\n")
+        self.git_p("add", ".")
+        self.git_p("commit", "-q", "-m", "tracked")
+        put(os.path.join(self.project, "caf\u00e9.txt"), "the owner's notes, edited\n")
+        os.environ["FAKE_FILE"] = "caf\u00e9.txt"
+        st = self.go()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        self.assertEqual(self.pushed(), "")
+
+    def test_a_retry_starts_back_on_the_tickets_branch(self):
+        main0 = self.git_p("rev-parse", "main").strip()
+        os.environ.update(FAKE_INSTEAD_ONCE="1", FAKE_INSTEAD="git switch -q main && echo agent > stray.txt && "
+                                                             "git add stray.txt && git commit -q -m 'on main'")
+        st = self.go(retries="1")
+        on_main = self.git_p("log", "--format=%s", main0 + "..main").split()
+        self.assertEqual(on_main, ["on", "main"], "the retry committed on main again")
+        self.assertEqual(st["status"], "done", st.get("reason"))
+
+    def test_a_deleted_ticket_text_is_put_back(self):
+        os.environ["FAKE_DELETE_TICKET"] = "1"
+        self.add("ABC-1")
+        self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", st.get("reason"))
+        self.assertIn("deleted the ticket's text", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+
 class NestedReposTest(Base):
     """In place, the project is the top of one or more repositories (each its own
     .git, not submodules): the agent works from the top and may change any of them.
@@ -3427,6 +3505,18 @@ class NestedReposTest(Base):
 
     def review_prompt(self):
         return cat(self.calls + ".reviewing")
+
+    def test_a_repo_branch_from_a_detached_head_is_put_back_there(self):
+        lib = self.ignored_libA()
+        head = sh("git", "-C", lib, "rev-parse", "HEAD").strip()
+        sh("git", "-C", lib, "checkout", "-q", "--detach", head)
+        os.environ.update(FAKE_NESTED="commit:libA")
+        self.add_in_place("implement,review,push", "--repo-branch", "libA")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        self.assertEqual((sh("git", "-C", lib, "branch", "--show-current").strip(),
+                          sh("git", "-C", lib, "rev-parse", "HEAD").strip()), ("", head), st.get("reason"))
 
     def test_the_snapshot_leaves_repositories_inside_out(self):
         # one with no commit failed the snapshot's git add -A; lib[1] is no glob
