@@ -42,7 +42,7 @@ Write the review to {{REVIEW_FILE}} (overwrite it) in exactly this shape:
 - Smaller remarks that do not block the change, one bullet each, or "- None".
 
 Rules:
-- Do not write or run tests; read the code.
+- {{TEST_STEP}}
 - Every Must fix item names a file and says what is wrong; no style preferences there.
 - Never contact the issue tracker or change anything there.
 - If you notice a bug that is NOT part of this ticket, append one bullet to {{FINDINGS_FILE}}: "- path:line: what is wrong and why it matters (seen while reviewing {{KEY}})".

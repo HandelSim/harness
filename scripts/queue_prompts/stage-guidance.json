@@ -25,5 +25,36 @@
     "This stage: FIX the Must fix items only, one todo item each (path:line and the fix); change nothing else.",
     "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
     "Finish only when the card's Done line holds and the build is clean."
+  ],
+  "plan+test": [
+    "This stage: PLAN. Change no code; run no build or test. Read the code the ticket touches, then write the plan file in the card's shape.",
+    "Each criterion is ONE line: - ACn: GIVEN .. WHEN .. THEN .. ending (ticket: \"exact words\") or (edge of ACn); cover every edge case of each one.",
+    "Every decision the ticket and the code leave open is a Question with Options and a Default, not a guess.",
+    "Then the self-check: read back each file and function your Steps name, fix the plan, write it again. Not done before that.",
+    "A test stage writes tests from your criteria next: no test files in Steps; add ## Tests with - Command: `<the test command>` and - Files: `<test files>`. No test framework found: a [blocking] Question."
+  ],
+  "test": [
+    "This stage: TEST. Write the tests for the plan's criteria before the code exists; change no other file. Use the project's own test framework only; install nothing, set up no new one.",
+    "One todo item per AC, edge cases included: a test that checks its THEN, with a comment naming its ACn. Call the code as the plan's Steps name it: it does not exist yet.",
+    "Each item's check step is a syntax check of the test file (python -m py_compile, bash -n, node --check), not a run: the tests are meant to fail until the implement stage.",
+    "No test framework in the project: commit nothing and finish with the summary NO TEST FRAMEWORK: <what you looked for, where>."
+  ],
+  "implement+test": [
+    "This stage: IMPLEMENT the plan's Steps, one todo item each (file, function, its ACs, edge cases included).",
+    "The test stage already wrote the tests. Each item's check step: run {TEST}, read the output, fix the code. Do NOT edit, skip or delete those tests, and write no new ones.",
+    "Install nothing. A test that contradicts the plan, or {TEST} cannot run here: leave it, and say which and why in the commit message.",
+    "Finish only when the card's Done line holds and {TEST} passes."
+  ],
+  "review+test": [
+    "This stage: REVIEW. Change no code, commit nothing, write no tests.",
+    "Run {TEST} once and read the output: each failing test is a Must fix item (test name, the error).",
+    "One todo item per AC of the plan, edge cases included: find the lines that meet it (path:line); one no code meets is a Must fix item.",
+    "An AC with no test, or a test the implement stage changed without a reason the plan bears out: a Must fix item.",
+    "Then check correctness, security, scope, simplicity, write the review file in the card's shape, and finish."
+  ],
+  "fix+test": [
+    "This stage: FIX the Must fix items only, one todo item each (path:line and the fix); change nothing else.",
+    "Each item's check step: run {TEST}, read the output. Change a test only where its Must fix item says it is wrong; write no new tests, install nothing.",
+    "Finish only when the card's Done line holds and {TEST} passes."
   ]
 }

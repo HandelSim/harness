@@ -25,7 +25,7 @@ Your working directory is {{WHERE}}. {{LAYOUT}} Change files only in this direct
 What to do:
 1. Read the files the plan names (with no plan, the code the ticket touches) before changing them. Work through the plan's Steps in order; its criteria tagged (edge of ACn) are the cases your code must also handle.
 2. Make the change so that every acceptance criterion in the plan (with no plan, everything the ticket asks for) is met. Keep it small: no refactors, renames or clean-ups the ticket does not need. Match the style of the code around it. Update documentation the change makes wrong.
-3. Make sure it builds: run the project's build, compile or lint command (see its README, Makefile or package.json), or with none a syntax check of each file you changed (bash -n, python -m py_compile, node --check); fix what your change broke. Do not write or run tests in this stage: a later stage does that. Do not install anything.
+3. Make sure it builds: run the project's build, compile or lint command (see its README, Makefile or package.json), or with none a syntax check of each file you changed (bash -n, python -m py_compile, node --check); fix what your change broke. {{TEST_STEP}}
 4. {{COMMIT_STEP}} Never commit secrets, .env files or keys, and do not change anything under .github/.
 5. {{CHECK_STEP}}
 

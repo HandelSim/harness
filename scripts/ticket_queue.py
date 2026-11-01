@@ -140,7 +140,9 @@ SECRET_RE = re.compile(
     r"|\bxox[abposr]-[A-Za-z0-9-]{10,}|\bsk-[A-Za-z0-9_-]{32,}")
 SECRET_PATH = re.compile(r"(^|/)(\.env(?!\.(example|sample|template)$)(\..*)?|.*\.pem|.*\.key|id_(rsa|ed25519|ecdsa|dsa)(\.pub)?|\.netrc)$")
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
-ALL_STAGES = ("plan", "implement", "review", "fix", "push")
+ALL_STAGES = ("plan", "test", "implement", "review", "fix", "push")
+# a ticket's stages when none are given (and an older state file's): the test stage is opt-in
+DEFAULT_STAGES = ("plan", "implement", "review", "fix", "push")
 POLL = 2                   # seconds between looks at the agent, the stop and halt files
 ASLEEP = 120               # a gap this long between two looks: the machine slept, and the time is not counted
 BEAT = 3                   # seconds between run.json beats
@@ -355,8 +357,8 @@ def run_holds(q, key):
 
 
 def stages_of(st):
-    """The ticket's stages in their order; an older state file has none: all five."""
-    want = st.get("stages") or ALL_STAGES
+    """The ticket's stages in their order; an older state file has none: DEFAULT_STAGES."""
+    want = st.get("stages") or DEFAULT_STAGES
     return [s for s in ALL_STAGES if s in want]
 
 
@@ -379,6 +381,9 @@ def parse_stages(text):
         return None, f"--stages takes a comma list of {','.join(ALL_STAGES)}" + (f"; not a stage: {', '.join(bad)}" if bad else "")
     if "fix" in got and "review" not in got:
         return None, "--stages: fix runs only after a review asked for fixes; list review too"
+    if "test" in got and not {"plan", "implement"} <= set(got):
+        return None, ("--stages: test writes tests from the plan's criteria for implement to make pass; "
+                      "list plan and implement too")
     return [s for s in ALL_STAGES if s in got], None
 
 
@@ -448,6 +453,31 @@ def check_plan(text):
     if len(criteria) > MAX_CRITERIA:
         problems.append(f"{len(criteria)} acceptance criteria: at most {MAX_CRITERIA} in all, merge the small ones")
     return problems, criteria, questions
+
+
+TEST_MARKS = ("test_marks", "test_files", "test_sha")   # what the test stage wrote the tests on
+TEST_COMMAND_LINE = re.compile(r"(?im)^\s*(?:[-*]\s*)?[*_]*command[*_]*\s*:\s*(?:`([^`\n]+)`|(none)\b)")
+NO_TESTS_SECTION = ("the plan has no '## Tests' section with - Command: `<the command that runs the new tests>` (or "
+                    "- Command: none and a [blocking] Question when the project has no test framework)")
+
+
+def test_command(plan_text):
+    """The command the plan's ## Tests section runs the new tests with (its "- Command:
+    `...`" line); "" when the section or the line is missing, or the command is none."""
+    m = TEST_COMMAND_LINE.search(sections(plan_text or "").get("tests", ""))
+    cmd = (m.group(1) or "").strip() if m else ""
+    return "" if cmd.lower() == "none" else cmd
+
+
+def tests_problems(text):
+    """With the test stage: a plan with no ## Tests command fails; "- Command: none"
+    passes only with a [blocking] question (the owner settles how to test, or drops the stage)."""
+    if test_command(text):
+        return []
+    m = TEST_COMMAND_LINE.search(sections(text).get("tests", ""))
+    if m and (m.group(2) or m.group(1)) and any(question_mark(q) == "blocking" for q in plan_questions(sections(text))):
+        return []
+    return [NO_TESTS_SECTION]
 
 
 def plan_questions(secs):
@@ -1465,8 +1495,8 @@ def sub_repo(q, st, rel, sha):
 def take_baselines(q, st, stage, skip=()):
     """Before the first stage after the plan: what each uncommitted repository holds
     (uncommitted_repos), as a commit at refs/harness-queue/base/KEY there. Its part of
-    the change is its files against that. Before implement: its files as they are (the
-    owner's uncommitted work is not the ticket's); a ticket with no implement (review
+    the change is its files against that. Before test or implement: its files as they are (the
+    owner's uncommitted work is not the ticket's); a ticket with neither (review
     first): its HEAD, so what is uncommitted there is the change. Kept until the work
     is set up again (enter_in_place). A submodule of an uncommitted repository is one
     too; one of the top on its branch is snapshot the same way into st["subs"], so
@@ -1491,7 +1521,7 @@ def take_baselines(q, st, stage, skip=()):
         d = repo_dir(st, rel)
         try:
             head = git(d, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False).stdout.strip()
-            if stage == "implement" or rel in on_branch:   # a submodule's change is its commits
+            if stage in ("test", "implement") or rel in on_branch:   # a submodule's change is its commits
                 tree = worktree_tree(q, st, d)
             elif head:
                 tree = git(d, "rev-parse", f"{head}^{{tree}}").stdout.strip()
@@ -1520,13 +1550,15 @@ def repo_diff(repo, rel, a, b):
     return diff, files
 
 
-def ticket_change(q, st):
+def ticket_change(q, st, since=None):
     """All the ticket's work, in every repository: (sha, diff, files, commits, parts),
     or None when there is none. sha: the top's branch tip (None: the top has no branch,
     or no commits of its own); parts: one dict per repository with a part, its "repo",
-    "kind" (branch or uncommitted), "branch", "sha", "files" and "commits"."""
-    parts, diffs = [], []
-    top = None if st.get("no_branch") else fetch_branch(q, st)
+    "kind" (branch or uncommitted), "branch", "sha", "files" and "commits". since:
+    {repo: sha or tree} in place of those repositories' bases (the test stage's
+    test_marks: the change since the tests)."""
+    parts, diffs, since = [], [], since or {}
+    top = None if st.get("no_branch") else fetch_branch(q, st, since.get("."))
     if top:
         sub_diff, sub_files = submodule_diffs(q, st, top[0])
         parts.append({"repo": ".", "kind": "branch", "branch": branch_of(st), "sha": top[0],
@@ -1535,10 +1567,11 @@ def ticket_change(q, st):
     for rel, n in sorted((st.get("nested") or {}).items()):
         d = repo_dir(st, rel)
         sha = git(d, "rev-parse", "-q", "--verify", f"refs/heads/{n['branch']}", check=False).stdout.strip()
-        commits = int(git(d, "rev-list", "--count", f"{n['base_sha']}..{sha}", check=False).stdout.strip() or 0) \
-            if sha and n.get("base_sha") else 0
+        base = since.get(rel) or n.get("base_sha")
+        commits = int(git(d, "rev-list", "--count", f"{base}..{sha}", check=False).stdout.strip() or 0) \
+            if sha and base else 0
         if commits:
-            diff, files = repo_diff(d, rel, n["base_sha"], sha)
+            diff, files = repo_diff(d, rel, base, sha)
             parts.append({"repo": rel, "kind": "branch", "branch": n["branch"], "sha": sha, "files": files,
                           "commits": commits})
             diffs.append(diff)
@@ -1546,7 +1579,7 @@ def ticket_change(q, st):
         d = repo_dir(st, rel)
         if not os.path.isdir(d):
             continue
-        diff, files = repo_diff(d, rel, b["snap"], worktree_tree(q, st, d))
+        diff, files = repo_diff(d, rel, since.get(rel) or b["snap"], worktree_tree(q, st, d))
         if files:
             parts.append({"repo": rel, "kind": "uncommitted", "branch": "", "sha": "", "files": files, "commits": 0})
             diffs.append(diff)
@@ -1614,9 +1647,10 @@ def no_change(st):
     return "the ticket changed nothing: " + "; ".join(ways or ["no repository to look at"])
 
 
-def fetch_branch(q, st):
+def fetch_branch(q, st, since=None):
     """The ticket's branch, fetched from the clone into the project (in place it is
-    the project's); (sha, diff, files, commits) or None when it has no commits of its own."""
+    the project's); (sha, diff, files, commits) or None when it has no commits of its own
+    (since: a commit in place of its base, base_sha)."""
     key, project = st["key"], st["project"]
     ref = f"refs/heads/{branch_of(st)}"
     if not st.get("in_place"):   # in place the branch is the project's own
@@ -1631,11 +1665,12 @@ def fetch_branch(q, st):
     if r.returncode != 0:
         return None
     sha = r.stdout.strip()
-    commits = int(git(project, "rev-list", "--count", f"{st['base_sha']}..{sha}").stdout.strip() or 0)
+    base = since or st["base_sha"]
+    commits = int(git(project, "rev-list", "--count", f"{base}..{sha}").stdout.strip() or 0)
     if not commits:
         return None
-    diff = git(project, "diff", "--no-color", "--no-ext-diff", st["base_sha"], sha).stdout
-    files = [f for f in git(project, "diff", "--name-only", "--no-ext-diff", st["base_sha"], sha).stdout.splitlines() if f]
+    diff = git(project, "diff", "--no-color", "--no-ext-diff", base, sha).stdout
+    files = [f for f in git(project, "diff", "--name-only", "--no-ext-diff", base, sha).stdout.splitlines() if f]
     return sha, diff, files, commits
 
 
@@ -1903,7 +1938,7 @@ def render(name, **values):
 # that was cut off goes on in (harness queue continue; an outage, Ctrl-C or a halt)
 SESSION_LINE = re.compile(r"^\[harness\] session: (ses_\w+)", re.M)
 ERROR_LINE = re.compile(r"^\[harness\] opencode error: (.*)$", re.M)   # agents/live-run.sh: what ended the session
-RESUMABLE = ("plan", "implement", "review", "fix")   # the stages an agent works in
+RESUMABLE = ("plan", "test", "implement", "review", "fix")   # the stages an agent works in
 
 
 def session_in(text):
@@ -2715,7 +2750,58 @@ def common(ctx, st):
                 PLAN_FILE=ap["plan"], PLAN=plan,
                 REVIEW_FILE=ap["review"], FINDINGS_FILE=ap["findings"], ANSWERS_FILE=ap["answers"],
                 ANSWERS=answers or "(none)", NOTES=owner_notes(ctx.q.notes(st["key"])),
-                FOLLOW_UP=follow_up(ctx, st), FEEDBACK=cap(st.get("feedback") or "(first attempt)", NOTE_CAP))
+                FOLLOW_UP=follow_up(ctx, st), FEEDBACK=cap(st.get("feedback") or "(first attempt)", NOTE_CAP),
+                **test_words(ctx, st))
+
+
+# The prompts' words on tests ({{TEST_STEP}}, and the plan's {{TEST_CRITERIA}}): a
+# ticket without the test stage writes and runs no tests (a project may have none);
+# with it, the test stage writes them first and the stages after run them. {cmd}: the
+# plan's ## Tests command; {sha}: the test stage's commit.
+TEST_STEPS = {
+    "plan": ("The implementer makes sure it builds; nobody writes tests in this ticket, so plan no test files unless "
+             "the ticket asks for them.",
+             "This ticket has a test stage after this plan: a test agent writes the tests from your criteria before "
+             "the code exists, then the implementer makes them pass. Name, in Steps, every file, function and "
+             "signature the tests will call. Add a section ## Tests: - Command: `<the project's command that runs "
+             "the new tests, as narrow as it can be>`, then one - Files: `<path>` line per test file, following where "
+             "the project's tests already are. Find the command in the README, Makefile, package.json, pyproject or "
+             "CI config. If the project has no test framework, write - Command: none and ask a [blocking] Question: "
+             "(a) tests with the language's built-in runner (python -m unittest, node --test, go test, cargo test), "
+             "installing nothing (Default); (b) drop the test stage."),
+    "implement": ("Do not write or run tests, unless the ticket itself asks for them: this ticket has no test stage. "
+                  "Install nothing.",
+                  "The test stage wrote the tests (see the plan's ## Tests). Run {cmd}, read the output, fix the code "
+                  "until they pass. Do not delete, skip or weaken a test; change one only where it is wrong against "
+                  "the plan, and say why in the commit message. Write no other tests; install nothing. If the command "
+                  "cannot run here, say why in the commit message. Remove what the run left behind (caches, build "
+                  "output) unless .gitignore covers it; never commit it."),
+    "fix": ("Do not write or run tests, unless the ticket itself asks for them: this ticket has no test stage. "
+            "Install nothing.",
+            "The test stage wrote the tests (see the plan's ## Tests). Run {cmd}, read the output, fix the code until "
+            "they pass. Change a test only where a Must fix item says it is wrong, and say why in the commit "
+            "message. Write no other tests; install nothing. Remove what the run left behind (caches, build output) "
+            "unless .gitignore covers it; never commit it."),
+    "review": ("Missing tests are not a defect: this ticket has no test stage (unless the ticket asks for tests). "
+               "Write or run no tests; read the code.",
+               "Run {cmd} once and read the output: each failing test is a Must fix item (the test's name, the "
+               "error). An acceptance criterion with no test that checks it, or a test the implement stage deleted, "
+               "skipped or weakened (compare with {sha}), is a Must fix item. Change no code; remove what the run "
+               "left behind unless .gitignore covers it."),
+}
+TEST_CRITERIA = ("They are what the change is checked against", "The test stage writes a test for each")
+
+
+def test_words(ctx, st):
+    """TEST_STEP, TEST_CRITERIA, TEST_COMMAND and TEST_SHA for the stage's prompt (TEST_STEPS)."""
+    on = "test" in stages_of(st)
+    cmd = test_command(read(plan_copy(ctx.q, st["key"]))) if on else ""
+    cmd = f"`{cmd}`" if cmd else "the plan's test command"
+    sha = st.get("test_sha") or ""
+    sha = f"the test stage's version: git diff {sha} -- <test files>" if sha else "the test commits"
+    step = TEST_STEPS.get(st.get("stage", "plan"), ("", ""))[on]
+    return dict(TEST_STEP=step.format(cmd=cmd, sha=sha), TEST_CRITERIA=TEST_CRITERIA[on], TEST_COMMAND=cmd,
+                TEST_SHA=st.get("test_sha") or "")
 
 
 def follow_up(ctx, st):
@@ -2830,6 +2916,9 @@ CARD_DONE = {
     "fix": "every Must fix item is fixed, or said in the commit message to be wrong, and committed on {BRANCH} in a "
            "new commit (git commit --allow-empty when nothing changed). Do not push.",
     "fix-repos": "every Must fix item is fixed. {FIX_COMMIT_STEP}",
+    "test": "tests for the plan's acceptance criteria are written and committed on {BRANCH} (git add <files>, git "
+            "commit -m \"{KEY}: tests\"); no other file changed. Do not push.",
+    "test-repos": "tests for the plan's acceptance criteria are written; no other file changed. {COMMIT_STEP}",
 }
 
 
@@ -2848,7 +2937,11 @@ def task_card(ctx, st, stage):
                                 **words)}
     if stage == "fix" and st.get("must_fix"):
         card["must_fix"] = len(st["must_fix"])
-    do = [line.replace("{KEY}", st["key"]) for line in stage_guidance(ctx.q, st["key"]).get(stage) or []]
+    guide = stage_guidance(ctx.q, st["key"])
+    tested = "test" in stages_of(st) and stage != "test" and stage + "+test" in guide
+    cmd = clip(test_command(read(plan_copy(ctx.q, st["key"]))), 60) if tested else ""
+    do = [line.replace("{KEY}", st["key"]).replace("{TEST}", cmd or "the plan's test command")
+          for line in guide.get(stage + "+test" if tested else stage) or []]
     do = last_failure(st, do) + do
     if do:
         card["do"] = do
@@ -3064,6 +3157,8 @@ def stage_plan(ctx, st):
     problems, criteria, questions = check_plan(text)
     if not text.strip():
         problems = [f"the plan file was not written: write it to {v['PLAN_FILE']}"]
+    if not problems and "test" in stages_of(st):   # the test stage runs the plan's ## Tests command
+        problems = tests_problems(text)
     if not problems:
         try:
             last = json.loads(read(os.path.join(ctx.q.dir(st["key"]), "plan.json")) or "null")
@@ -3199,10 +3294,28 @@ def change_problems(ctx, st, rc, stage):
     if st.get("in_place"):   # the folder's state first: it is the cause, and the block reason is the first problem
         problems = in_place_problems(ctx, st) + problems
         warnings += head_moved(st) + owner_branch_moved(st)
-    if not problems and stage == "implement" and not moved_since(st, change, "implement"):
-        problems.append(f"no new commit on branch {branch_of(st)}: commit your change (git add <files>, git commit)"
+    # after the test stage: implement, fix and a review's change are judged on what they changed since the tests
+    marks = st.get("test_marks") if stage in ("implement", "fix", "review") and isinstance(st.get("test_marks"), dict) \
+        else None
+    tested = ticket_change(ctx.q, st, since=marks) if marks and change else None
+    commit_how = "(git add <files>, git commit)" if not st.get("no_branch") and not st.get("baselines") \
+        and not st.get("nested") else HOW_SHORT
+    if not problems and stage in ("test", "implement") and (not moved_since(st, change, "implement")
+                                                             or (marks and tested is None)):
+        problems.append("nothing changed since the test stage wrote the tests: make the change " + commit_how
+                        if marks else
+                        f"no new commit on branch {branch_of(st)}: commit your change (git add <files>, git commit)"
                         if not st.get("no_branch") and not st.get("baselines") and not st.get("nested")
                         else "nothing changed since the work started: make the change " + HOW_SHORT)
+    if not problems and marks and tested:
+        gone = deleted_paths(tested[1])
+        problems += [f"{f}: a test the test stage wrote was deleted; put it back ("
+                     + (f"git checkout {st['test_sha'][:12]} -- {f}, or " if st.get("test_sha") else "")
+                     + "restore the file)" for f in st.get("test_files") or [] if f in gone]
+    if stage == "test" and change:
+        odd = [f for f in change[2] if not TEST_PATH.search(f)]
+        if odd:
+            warnings.append(f"the test stage changed files that do not look like tests: {', '.join(odd[:10])}")
     if not problems and stage == "fix" and st.get("review_digest") and not moved_since(st, change, "review"):
         problems.append("no new commit since the review: fix the Must fix items and commit"
                         if not st.get("no_branch") else "nothing changed since the review: fix the Must fix items")
@@ -3214,6 +3327,8 @@ def change_problems(ctx, st, rc, stage):
         ctx.q.log(st["key"], f"warning: {w}")
     if not problems:
         _, diff, files, commits, parts = change
+        if tested:   # a test's line is no proof the code is built
+            diff = tested[1]
         ctx.q.log(st["key"], f"{stage}: {commits} commit(s), {len(files)} file(s) changed"
                   + (f" ({'; '.join(part_line(p) for p in parts)})" if len(parts) > 1 or st.get("no_branch") else ""))
         notes = ""
@@ -3222,7 +3337,8 @@ def change_problems(ctx, st, rc, stage):
                         check=False).stdout.strip()
         def prompt_for(c):
             return render("verify_change", TICKET=read(p["ticket"], min(TICKET_CAP, c)), CRITERIA=numbered(criteria),
-                          DIFF=cap(diff, c), COMMITS=cap(notes, NOTE_CAP) or "(none)")
+                          DIFF=cap(diff, c), COMMITS=cap(notes, NOTE_CAP) or "(none)",
+                          MET_WHEN=MET_WHEN[stage == "test"])
         obj = verdict(ctx, st, stage, prompt_for)
         problems = judge(obj, criteria, diff, "quote", "diff", notes)
         ctx.q.log(st["key"], f"{stage} verifier: {verifier_line(obj, problems)}")
@@ -3243,7 +3359,29 @@ def change_problems(ctx, st, rc, stage):
     st["verified_sha"] = change[0]   # what the push may push: a branch moved since is not
     st["verified_repos"] = {p["repo"]: p["sha"] for p in change[4] if p["kind"] == "branch" and p["repo"] != "."}
     st["verified_mark"] = mark(change)   # and the change as a whole, uncommitted files too
+    if stage == "test":   # what the tests were written on: implement and fix are judged on what they add
+        st["test_marks"] = {p["repo"]: p["sha"] if p["kind"] == "branch" else
+                            worktree_tree(ctx.q, st, repo_dir(st, p["repo"])) for p in change[4]}
+        st["test_files"] = list(change[2])
+        st["test_sha"] = change[0] or ""
+        st["implement_from"] = mark(change)   # the tests alone are not implement's work
     return []
+
+
+# verify_change.md's {{MET_WHEN}}: the code stages' (implement, fix), then the test stage's
+MET_WHEN = ("A criterion is met only when lines in the diff implement it; a comment, a TODO or a commit message "
+            "saying it is done does not count.",
+            "The change is tests written before the code: a criterion is met when an added test in the diff checks "
+            "it (quote the test's line); the code it tests need not exist.")
+# a path that looks like a test's: the test stage changing another is warned about, never failed
+TEST_PATH = re.compile(r"(?i)(^|/)(tests?|specs?|__tests__|testing)/|(^|/)(test_[^/]*|[^/]*[._-](test|spec)s?\.\w+"
+                       r"|[^/]*Tests?\.\w+|conftest\.py)$")
+DELETED = re.compile(r'^--- (?:a/(.*)|"a/(.*)")\n\+\+\+ /dev/null$', re.M)
+
+
+def deleted_paths(diff):
+    """The paths a diff deletes (a --- a/<path> then +++ /dev/null), as the project's."""
+    return {m.group(1) if m.group(1) is not None else m.group(2) for m in DELETED.finditer(diff)}
 
 
 HOW_SHORT = "(where the ticket says how it lands: committed on its branch, or left uncommitted)"
@@ -3475,6 +3613,22 @@ def mark(change):
 
 def cap(text, n):
     return text if len(text) <= n else text[:n] + f"\n[... cut at {n} characters ...]\n"
+
+
+def stage_test(ctx, st):
+    """The opt-in test stage: tests for the plan's criteria, committed before the code
+    exists (verify_change marks them: test_marks); a project with no test framework blocks."""
+    rc, out, _ = agent_or_kept(ctx, st, "test", lambda: render("test", **common(ctx, st)))
+    said = next((l for l in read(out).splitlines() if "NO TEST FRAMEWORK" in l), "") if out else ""
+    if said and not moved_since(st, ticket_change(ctx.q, st), "start"):   # the owner's call, not a retry's
+        key = st["key"]
+        how = (f"drop the test stage (harness queue edit {key} --stages plan,implement,review,fix,push, then "
+               f"harness queue retry {key} --stage implement), or say which framework to use (harness queue answer "
+               f"{key} --text \"<the framework>\": the plan is made again with it)")
+        return block(ctx, st, f"the test stage found no test framework in the project: {clip(' '.join(said.split()), 200)}"
+                              f"; {how}", no_go_on=f"the project has no test framework to write the tests in: {how}")
+    if verify_change(ctx, st, rc, "test"):
+        advance(ctx, st, next_stage(st, "test"))
 
 
 def stage_implement(ctx, st):
@@ -3792,8 +3946,8 @@ def result_note(ctx, st):
     write_atomic(p["result"], "\n".join(lines) + "\n")
 
 
-STAGES = {"plan": stage_plan, "implement": stage_implement, "review": stage_review, "fix": stage_fix,
-          "push": stage_push}
+STAGES = {"plan": stage_plan, "test": stage_test, "implement": stage_implement, "review": stage_review,
+          "fix": stage_fix, "push": stage_push}
 
 
 def record(st, result, details=()):
@@ -4572,7 +4726,7 @@ def settle(q, a, keys):
     if git(project, "rev-parse", "-q", "--verify", base + "^{commit}", check=False).returncode != 0:
         print(f"[queue] {base} is not a commit in {project}", file=sys.stderr)
         return None
-    stages, why = parse_stages(a.stages) if a.stages is not None else (list(ALL_STAGES), None)
+    stages, why = parse_stages(a.stages) if a.stages is not None else (list(DEFAULT_STAGES), None)
     if why:
         print(f"[queue] {why}", file=sys.stderr)
         return None
@@ -4741,7 +4895,8 @@ def cmd_edit(q, a):
                 print(f"[queue] {key} is done: its stages stay as they are (harness queue followup {key}, or "
                       f"retry --stage S, takes it further)", file=sys.stderr)
                 return 1
-            upto = ALL_STAGES[:ALL_STAGES.index(cur) + 1]
+            # at test, the test stage itself can be dropped (the project has no test framework)
+            upto = ALL_STAGES[:ALL_STAGES.index(cur) + (cur != "test")]
             kept = [s for s in stages_of(st) if s in upto]
             if [s for s in stages if s in upto] != kept:
                 print(f"[queue] {key} is at {cur}: the stages up to it stay ({','.join(kept)}); only the ones "
@@ -5010,7 +5165,7 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         st.pop("verified_mark", None)
     if not go_on and starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
         for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "verify_only", "verified_sha",
-                  "verified_repos", "verified_mark", "implement_from", "built_on"):
+                  "verified_repos", "verified_mark", "implement_from", "built_on", *TEST_MARKS):
             st.pop(k, None)
         if st["stage"] == "plan":
             for k in ("questions", "criteria", "plan_sig"):
@@ -5020,6 +5175,9 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         st.pop("base_sha", None)   # the run clones (or sets up) again; no delete under the lock
         if kept:
             st["verify_only"] = kept
+    if st["stage"] in ("plan", "test"):   # the tests are written again, and marked again
+        for k in TEST_MARKS:
+            st.pop(k, None)
     q.save(st)
     return st
 
@@ -5497,7 +5655,7 @@ def cmd_status(q, a):
         for k in q.order():
             st = q.load(k)
             if isinstance(st, dict):
-                st.setdefault("stages", list(ALL_STAGES))
+                st.setdefault("stages", list(DEFAULT_STAGES))
                 st.setdefault("notes", [])
                 tickets.append(st)
         print(json.dumps({"runner": r, "tickets": tickets}, indent=2))
@@ -5642,7 +5800,7 @@ def cmd_followup(q, a):
                      plan_approved=False)
         if st:   # the review and checks of the last round are not this one's
             for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "questions", "criteria",
-                      "assumptions"):
+                      "assumptions", *TEST_MARKS):
                 st.pop(k, None)
             q.save(st)
     if st:

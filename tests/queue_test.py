@@ -144,6 +144,9 @@ if stage == "planning":
     plan = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n" + crit +
             "## Approach\nWrite feature.txt.\n## Files\n- feature.txt: new\n## Questions\n" + qs +
             "## Assumptions\n- None\n")
+    if os.environ.get("FAKE_TESTS"):   # the plan's ## Tests: its command ("none": no test framework)
+        cmd = os.environ["FAKE_TESTS"]
+        plan += "## Tests\n- Command: " + (cmd if cmd == "none" else "`" + cmd + "`") + "\n- Files: `test_feature.py`\n"
     if os.environ.get("FAKE_ANSWER_DURING") and "planning ticket ABC-2" in prompt:  # the owner answers ABC-1
         subprocess.run([sys.executable, os.environ["FAKE_TQ"], "--state", os.environ["FAKE_STATE"], "answer",
                         "ABC-1", "--vault", vault, "--text", "Use the blue one.", "--go"], check=True, capture_output=True)
@@ -155,11 +158,20 @@ if stage == "planning":
         open(os.path.join(os.getcwd(), "C:\\x\\" + os.path.basename(target)), "w").write(plan)
     else:
         open(path("Write the plan to"), "w").write(plan)
+elif stage == "testing":   # the test stage: a test file committed; FAKE_NO_FRAMEWORK: none found
+    if os.environ.get("FAKE_NO_FRAMEWORK"):
+        print("Looked around.\nNO TEST FRAMEWORK: no pytest, unittest or tests/ folder in the project's top")
+        sys.exit(0)
+    open("test_feature.py", "w").write("# AC1\nassert open('feature.txt').read() == 'hello feature\\n'\n")
+    git("add", "test_feature.py")
+    git("commit", "-q", "-m", "ABC-1: tests")
 elif stage in ("implementing", "fixing"):
     once = os.environ["FAKE_CALLS"] + ".nocommit"   # FAKE_NO_COMMIT_ONCE: the first implementing commits nothing
     if os.environ.get("FAKE_NO_COMMIT_ONCE") and stage == "implementing" and not os.path.exists(once):
         open(once, "w").close()
         sys.exit(0)
+    if stage == "implementing" and os.environ.get("FAKE_DELETE_TEST"):   # the test stage's test thrown away
+        git("rm", "-q", "--ignore-unmatch", "test_feature.py")
     if os.environ.get("FAKE_NO_COMMIT") or (stage == "fixing" and os.environ.get("FAKE_FIX_NOOP")) \
             or (os.environ.get("FAKE_NO_COMMIT_UNTIL_DEBUG") and not os.path.exists(os.environ["FAKE_CALLS"] + ".debugged")):
         sys.exit(0)
@@ -4288,6 +4300,358 @@ class GoOnOnceTest(Base):
         rc, out = self.q("retry", "ABC-1")
         self.assertEqual(rc, 0, out)
         self.assertNotIn("went_on", self.status())
+
+
+class TestStageTest(Base):
+    """The opt-in test stage (plan,test,implement,...): the plan names the test command in
+    ## Tests, the test stage commits tests before the code, implement and fix are judged on
+    what they change since the tests and run them. A ticket without it writes and runs no
+    tests, with its prompts and cards as they were."""
+    STAGES = "plan,test,implement,review,fix,push"
+    CMD = "python3 -m unittest test_feature"
+    # stage-guidance.json's lines before the test stage, which the cards without it keep byte for byte
+    OLD_GUIDE = {
+        "plan": [
+            "This stage: PLAN. Change no code; run no build or test. Read the code the ticket touches, then write the "
+            "plan file in the card's shape.",
+            "Each criterion is ONE line: - ACn: GIVEN .. WHEN .. THEN .. ending (ticket: \"exact words\") or (edge of "
+            "ACn); cover every edge case of each one.",
+            "Every decision the ticket and the code leave open is a Question with Options and a Default, not a guess.",
+            "Then the self-check: read back each file and function your Steps name, fix the plan, write it again. Not "
+            "done before that."],
+        "implement": [
+            "This stage: IMPLEMENT the plan's Steps, one todo item each (file, function, its ACs, edge cases included).",
+            "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, "
+            "the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m "
+            "py_compile, node --check).",
+            "Run it, read the output, fix what you broke. Finish only when the card's Done line holds and the build is "
+            "clean."],
+        "review": [
+            "This stage: REVIEW. Change no code, commit nothing, write or run no tests.",
+            "One todo item per AC of the plan, edge cases included: find the lines that meet it (path:line); one no "
+            "code meets is a Must fix item.",
+            "Then check correctness, security, scope, simplicity, write the review file in the card's shape, and "
+            "finish."],
+        "fix": [
+            "This stage: FIX the Must fix items only, one todo item each (path:line and the fix); change nothing else.",
+            "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, "
+            "the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m "
+            "py_compile, node --check).",
+            "Finish only when the card's Done line holds and the build is clean."],
+    }
+    PLAN = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n- AC1: GIVEN the project WHEN the change "
+            "is in THEN a file feature.txt says hello feature (ticket: \"add a feature file\")\n")
+
+    def add_tested(self, stages=STAGES, *extra):
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", stages, *extra)
+        self.assertEqual(rc, 0, out)
+
+    def code_checks(self):
+        """The verifier's "check a code change" prompts, in order."""
+        return [p for _, _, p in FakeProxy.seen if "check a code change" in p]
+
+    @staticmethod
+    def diff_of(prompt):
+        return prompt.split("<<<BEGIN_DIFF>>>", 1)[1].split("<<<END_DIFF>>>", 1)[0]
+
+    def cards(self):
+        return [json.loads(c) for c in cat(self.calls + ".card").splitlines()]
+
+    def test_a_ticket_with_no_stages_given_and_an_old_state_get_the_default_five(self):
+        self.assertEqual(tq.DEFAULT_STAGES, ("plan", "implement", "review", "fix", "push"))
+        self.assertEqual(tq.ALL_STAGES, ("plan", "test", "implement", "review", "fix", "push"))
+        self.add("ABC-1")
+        self.assertEqual(self.status()["stages"], list(tq.DEFAULT_STAGES))
+        self.assertEqual(tq.stages_of({}), list(tq.DEFAULT_STAGES))   # an older state file: no "stages"
+        self.assertEqual(tq.stages_of({"stages": []}), list(tq.DEFAULT_STAGES))
+        Q = tq.Queue(self.state)
+        st = Q.load("ABC-1")
+        del st["stages"]
+        Q.save(st)
+        rc, out = self.q("status", "--json")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(out)["tickets"][0]["stages"], list(tq.DEFAULT_STAGES))
+
+    def test_test_needs_plan_and_implement(self):
+        for bad in ("test,implement,review", "plan,test,review,push", "test"):
+            stages, why = tq.parse_stages(bad)
+            self.assertIsNone(stages, bad)
+            self.assertIn("test writes tests from the plan's criteria", why)
+            self.assertIn("list plan and implement too", why)
+        self.assertEqual(tq.parse_stages("implement, Test,plan"), (["plan", "test", "implement"], None))
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--stages", "test,implement,push")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("list plan and implement too", out)
+        self.assertIsNone(self.status())
+
+    def test_the_whole_loop_with_the_test_stage(self):
+        os.environ.update(FAKE_TESTS=self.CMD, FAKE_MUSTFIX="1")
+        self.add_tested()
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"], st["stage"]), (0, "done", "done"), out + st.get("reason", ""))
+        for stage in ("planning", "testing", "implementing", "reviewing", "fixing"):
+            self.assertEqual(len(self.calls_of(stage)), 1, stage)
+        # the plan's ## Tests gives the command; the test stage committed the test file alone, then the code
+        self.assertEqual(tq.test_command(cat(tq.plan_copy(tq.Queue(self.state), "ABC-1"))), self.CMD)
+        log = sh("git", "-C", self.remote, "log", "--format=%s", "ABC-1").splitlines()
+        self.assertEqual(log[:3], ["ABC-1: fixing", "ABC-1: implementing", "ABC-1: tests"])
+        tests_sha = sh("git", "-C", self.remote, "rev-parse", "ABC-1~2").strip()
+        self.assertEqual(sh("git", "-C", self.remote, "show", "--name-only", "--format=", tests_sha).split(),
+                         ["test_feature.py"])
+        self.assertEqual((st["test_marks"], st["test_files"], st["test_sha"]),
+                         ({".": tests_sha}, ["test_feature.py"], tests_sha))
+        self.assertIn("pushed branch ABC-1 to", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        # the verifier: the tests checked as tests; implement and fix on what they changed since them
+        checks = self.code_checks()
+        self.assertEqual(len(checks), 3, checks)
+        self.assertIn(tq.MET_WHEN[1], checks[0])
+        self.assertIn("test_feature.py", self.diff_of(checks[0]))
+        for c in checks[1:]:
+            self.assertIn(tq.MET_WHEN[0], c)
+            diff = self.diff_of(c)
+            self.assertIn("feature.txt", diff)
+            self.assertIn("+hello feature", diff)
+            self.assertNotIn("test_feature.py", diff)
+            self.assertNotIn("assert open", diff)
+        # each stage's prompt says the test stage's words, with the command
+        cmd = f"`{self.CMD}`"
+        plan = cat(self.calls + ".planning")
+        self.assertIn(tq.TEST_STEPS["plan"][1], plan)
+        self.assertIn("The test stage writes a test for each, so make each one exact.", plan)
+        testing = cat(self.calls + ".testing")
+        self.assertTrue(testing.startswith("You are testing ticket ABC-1"), testing[:80])
+        self.assertIn("Do NOT run the tests", testing)
+        self.assertIn("NO TEST FRAMEWORK:", testing)
+        for stage, verb in (("implement", "implementing"), ("fix", "fixing")):
+            text = cat(self.calls + "." + verb)
+            self.assertIn(tq.TEST_STEPS[stage][1].format(cmd=cmd, sha=""), text)
+            self.assertIn(f"Run {cmd}, read the output, fix the code until they pass.", text)
+            self.assertNotIn("this ticket has no test stage", text)
+        review = cat(self.calls + ".reviewing")
+        self.assertIn(f"Run {cmd} once and read the output: each failing test is a Must fix item", review)
+        self.assertIn(f"(compare with the test stage's version: git diff {tests_sha} -- <test files>)", review)
+        self.assertNotIn("Missing tests are not a defect", review)
+        # the cards: the "+test" lines, {TEST} the command
+        cards = self.cards()
+        guide = tq.stage_guidance()
+        self.assertEqual([c["stage"] for c in cards], ["plan", "test", "implement", "review", "fix"])
+        self.assertEqual(cards[0]["do"], guide["plan+test"])
+        self.assertEqual(cards[1]["do"], guide["test"])
+        for c, key in zip(cards[2:], ("implement+test", "review+test", "fix+test")):
+            self.assertEqual(c["do"], [l.replace("{KEY}", "ABC-1").replace("{TEST}", self.CMD) for l in guide[key]],
+                             key)
+            self.assertTrue(any(self.CMD in l for l in c["do"]), key)
+            self.assertFalse(any("{TEST}" in l for l in c["do"]), key)
+        self.assertIn("tests for the plan's acceptance criteria are written and committed on ABC-1", cards[1]["done"])
+        self.assertIn('git commit -m "ABC-1: tests"', cards[1]["done"])
+
+    def test_without_the_test_stage_no_tests_are_asked_for_and_the_cards_are_as_before(self):
+        os.environ["FAKE_MUSTFIX"] = "1"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out + st.get("reason", ""))
+        self.assertNotIn("testing", cat(self.calls))
+        no_tests = "Do not write or run tests, unless the ticket itself asks for them: this ticket has no test stage."
+        for verb in ("implementing", "fixing"):
+            text = cat(self.calls + "." + verb)
+            self.assertIn(no_tests, text)
+            self.assertNotIn("a later stage does that", text)
+            self.assertNotIn("The test stage wrote", text)
+        self.assertNotIn("a later stage does that", cat(os.path.join(tq.PROMPTS, "implement.md")))
+        review = cat(self.calls + ".reviewing")
+        self.assertIn("Missing tests are not a defect: this ticket has no test stage (unless the ticket asks for "
+                      "tests). Write or run no tests; read the code.", review)
+        plan = cat(self.calls + ".planning")
+        self.assertIn("nobody writes tests in this ticket, so plan no test files unless the ticket asks for them", plan)
+        self.assertIn("They are what the change is checked against, so make each one exact.", plan)
+        self.assertNotIn("## Tests", plan)
+        self.assertNotIn("{{", plan + review + cat(self.calls + ".implementing"))
+        self.assertTrue(all(tq.MET_WHEN[0] in c for c in self.code_checks()))
+        self.assertFalse("test_marks" in st or "test_sha" in st)
+        cards = self.cards()
+        self.assertEqual([c["stage"] for c in cards], ["plan", "implement", "review", "fix"])
+        self.assertEqual([c["do"] for c in cards], [self.OLD_GUIDE[s] for s in ("plan", "implement", "review", "fix")])
+        guide = tq.stage_guidance()
+        self.assertEqual({k: guide[k] for k in self.OLD_GUIDE}, self.OLD_GUIDE)
+
+    def test_the_plan_check_of_the_tests_section(self):
+        no = [tq.NO_TESTS_SECTION]
+        self.assertEqual(tq.tests_problems(self.PLAN), no)
+        self.assertEqual(tq.tests_problems(self.PLAN + "## Tests\n- Files: `test_x.py`\n"), no)
+        self.assertEqual(tq.tests_problems(self.PLAN + "## Tests\n- Command: `make test`\n"), [])
+        none = self.PLAN + "## Tests\n- Command: none\n"
+        self.assertEqual(tq.tests_problems(none), no)   # no [blocking] question
+        asked = none + ("## Questions\n- Q1 [blocking] The project has no test framework: how to test? Options: (a) "
+                        "python -m unittest (b) drop the test stage Default: (a), because it is built in.\n")
+        self.assertEqual(tq.tests_problems(asked), [])
+        self.assertEqual(tq.tests_problems(asked.replace("[blocking]", "[non-blocking]")), no)
+        self.assertEqual(tq.test_command(none), "")
+        self.assertEqual(tq.test_command(asked), "")
+        # with the test stage, a plan with no ## Tests command fails, twice: blocked
+        self.add_tested()
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "plan"), out)
+        self.assertEqual(len(self.calls_of("planning")), 2)
+        self.assertIn("the plan has no '## Tests' section with - Command:", st["reason"])
+        self.assertNotIn("testing", cat(self.calls))
+
+    def test_command_none_with_a_blocking_question_waits_for_the_answer(self):
+        os.environ.update(FAKE_TESTS="none", FAKE_BLOCKING="1")
+        self.add_tested()
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("needs-answers", "plan"), out + st.get("reason", ""))
+        self.assertEqual(len(self.calls_of("planning")), 1)
+
+    def test_command_none_with_no_blocking_question_fails_the_plan(self):
+        os.environ["FAKE_TESTS"] = "none"
+        self.add_tested()
+        self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "plan"))
+        self.assertIn("the plan has no '## Tests' section", st["reason"])
+
+    def test_without_the_test_stage_a_plan_with_no_tests_section_passes(self):
+        self.add_tested("plan,implement,push")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out + st.get("reason", ""))
+        self.assertEqual(len(self.calls_of("planning")), 1)
+        self.assertNotIn("## Tests", cat(tq.plan_copy(tq.Queue(self.state), "ABC-1")))
+
+    def test_implement_that_changes_nothing_after_the_test_stage_fails(self):
+        os.environ.update(FAKE_TESTS=self.CMD, FAKE_NO_COMMIT="1")
+        self.add_tested()
+        self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"))
+        self.assertEqual(len(self.calls_of("implementing")), 2)
+        self.assertIn("nothing changed since the test stage wrote the tests: make the change", st["reason"])
+        self.assertEqual(len(self.code_checks()), 1)   # the test stage's alone: implement never reached the verifier
+
+    def test_implement_that_deletes_a_test_fails(self):
+        os.environ.update(FAKE_TESTS=self.CMD, FAKE_DELETE_TEST="1")
+        self.add_tested()
+        self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"))
+        self.assertIn(f"test_feature.py: a test the test stage wrote was deleted; put it back (git checkout "
+                      f"{st['test_sha'][:12]} -- test_feature.py, or restore the file)", st["reason"])
+        self.assertEqual(len(self.code_checks()), 1)
+
+    def test_the_test_stage_takes_the_baselines_so_the_owners_edits_are_not_the_tickets(self):
+        # in place, a repository inside the project left uncommitted, with the owner's pending edits
+        put(os.path.join(self.project, ".gitignore"), "libA/\n")
+        self.git_p("add", ".gitignore")
+        self.git_p("commit", "-q", "-m", "ignore libA")
+        lib = os.path.join(self.project, "libA")
+        sh("git", "init", "-q", "-b", "main", lib)
+        for k, v in (("user.name", "O"), ("user.email", "o@example.com")):
+            sh("git", "-C", lib, "config", k, v)
+        put(os.path.join(lib, "lib.txt"), "lib\n")
+        sh("git", "-C", lib, "add", "lib.txt")
+        sh("git", "-C", lib, "commit", "-q", "-m", "lib")
+        put(os.path.join(lib, "lib.txt"), "lib, the owner's edit\n")   # the owner's, before the ticket
+        put(os.path.join(lib, "notes.txt"), "the owner's\n")
+        os.environ.update(FAKE_TESTS=self.CMD, FAKE_NESTED="edit:libA")
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--in-place", "--stages",
+                         "plan,test,implement,review,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        self.assertEqual(sorted(st["baselines"]), ["libA"])
+        review = cat(self.calls + ".reviewing")
+        self.assertIn("libA/agent.txt", review)
+        self.assertIn("test_feature.py", review)
+        self.assertNotIn("libA/notes.txt", review)   # the owner's, there before the work started
+        self.assertNotIn("libA/lib.txt", review)
+        self.assertEqual(cat(os.path.join(lib, "lib.txt")), "lib, the owner's edit\n")
+
+    def test_no_test_framework_blocks_at_once_and_says_how_to_go_on(self):
+        os.environ.update(FAKE_TESTS=self.CMD, FAKE_NO_FRAMEWORK="1")
+        self.add_tested()
+        self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"], st["attempt"]), ("blocked", "test", 0))
+        self.assertEqual(len(self.calls_of("testing")), 1)   # no counted retry
+        self.assertIn("the test stage found no test framework in the project: NO TEST FRAMEWORK: no pytest, "
+                      "unittest or tests/ folder", st["reason"])
+        self.assertIn("harness queue edit ABC-1 --stages plan,implement,review,fix,push, then harness queue retry "
+                      "ABC-1 --stage implement", st["reason"])
+        self.assertIn("harness queue answer ABC-1 --text", st["reason"])
+        self.assertEqual(self.code_checks(), [])
+        # the commands it gives go on
+        rc, out = self.q("edit", "ABC-1", "--stages", "plan,implement,review,fix,push")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.q("retry", "ABC-1", "--stage", "implement")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((rc, st["status"]), (0, "done"), out + st.get("reason", ""))
+        self.assertIn("this ticket has no test stage", cat(self.calls + ".implementing"))
+
+    def test_every_stage_an_agent_works_in_has_its_tables(self):
+        guide = tq.stage_guidance()
+        self.assertIn("test", tq.RESUMABLE)
+        self.assertEqual(set(tq.STAGES), set(tq.ALL_STAGES))
+        for s in tq.RESUMABLE:
+            self.assertIn(s, tq.STAGES, s)
+            self.assertIn(s, tq.CARD_DONE, s)
+            self.assertIn(s, guide, s)
+            self.assertTrue(os.path.exists(os.path.join(tq.PROMPTS, s + ".md")), s)
+        self.assertIn("test-repos", tq.CARD_DONE)
+        self.assertLessEqual(len(tq.CARD_DONE["test"].format(KEY="ABCDEFGHIJ-12345", BRANCH="b" * 100)), 500)
+        # the repos card's own words leave the 500 to the commit step, as implement-repos does
+        self.assertLessEqual(len(tq.CARD_DONE["test-repos"].replace("{COMMIT_STEP}", "")), 100)
+
+    def test_every_guidance_key_fits_the_proxys_caps(self):
+        guide = tq.stage_guidance()
+        for k in ("plan+test", "test", "implement+test", "review+test", "fix+test"):
+            self.assertIn(k, guide)
+        long_failure = {"attempt": 1, "feedback": "- " + "x " * 400 + "\n- " + "y " * 400 + "\n- z\n"}
+        for k, lines in guide.items():
+            do = [l.replace("{KEY}", "ABCDEFGHIJ-12345").replace("{TEST}", "c" * 60) for l in lines]
+            why = tq.last_failure(long_failure, do)
+            self.assertTrue(why, k)
+            for card in (do, why + do):
+                self.assertLessEqual(len(card), 8, k)
+                self.assertTrue(all(len(l) <= 240 for l in card), k)
+                self.assertLessEqual(sum(len(" ".join(l.split())) for l in card), 1000, k)
+
+    def test_the_marks_go_with_a_retry_from_the_plan_and_a_followup_and_stay_for_implement(self):
+        os.environ.update(FAKE_TESTS=self.CMD, FAKE_NO_COMMIT="1")
+        self.add_tested()
+        self.run_queue()
+        Q = tq.Queue(self.state)
+        st = Q.load("ABC-1")
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"))
+        marks = {k: st[k] for k in tq.TEST_MARKS}
+        self.assertTrue(marks["test_sha"] and marks["test_files"] == ["test_feature.py"], marks)
+        rc, out = self.q("retry", "ABC-1", "--stage", "implement")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual({k: Q.load("ABC-1").get(k) for k in tq.TEST_MARKS}, marks)   # the tests are still there
+        st = Q.load("ABC-1")
+        st["status"] = "blocked"
+        Q.save(st)
+        rc, out = self.q("retry", "ABC-1", "--stage", "test")   # the tests written again
+        self.assertEqual(rc, 0, out)
+        self.assertFalse([k for k in tq.TEST_MARKS if k in Q.load("ABC-1")])
+        st = Q.load("ABC-1")
+        st.update(marks, status="blocked")
+        Q.save(st)
+        rc, out = self.q("retry", "ABC-1", "--stage", "plan")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse([k for k in tq.TEST_MARKS if k in Q.load("ABC-1")])
+        st = Q.load("ABC-1")
+        st.update(marks, stage="done", status="done")
+        Q.save(st)
+        rc, out = self.q("followup", "ABC-1", "--vault", self.vault, "--text", "Say it louder.")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse([k for k in tq.TEST_MARKS if k in Q.load("ABC-1")])
 
 
 if __name__ == "__main__":
