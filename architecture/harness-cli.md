@@ -773,14 +773,17 @@ what add would refuse) and `settings` (which fields are stored). The line is
 drops the old base, start, branch and repositories); after it, project, base,
 start, branch, `--no-branch`, repositories and in place/clone are refused
 ("remove it and add it again"), and only the stages after the current one
-(`--stages`; the ones up to it must stay; refused once done) and
+(`--stages`; the ones up to it must stay, but at `test` the test stage itself
+may go; refused once done) and
 `--review-plan` / `--no-plan-approval [--take-defaults]` change. Refused while
 running or held by a run (`edit_refused`); re-checked under `queue.lock`
 before saving, and logged as `edited: ...`.
 
 Owner control (all of it also on the run viewer's queue and ticket pages):
-`--stages` runs a subset of plan, implement, review, fix, push (kept in that
-order; `fix` needs `review`), starting at the first and done after the last;
+`--stages` runs a subset of plan, test, implement, review, fix, push (kept in that
+order; `fix` needs `review`, `test` needs `plan` and `implement`; none given,
+and a state file with none: `DEFAULT_STAGES`, all but the opt-in test stage),
+starting at the first and done after the last;
 `--start` (alias `--ref`; default `here` in place, the base in a clone; in
 place, a folder on another in-place ticket's branch makes the new ticket
 start where that one did) is the commit the work starts
@@ -1071,6 +1074,30 @@ template). A plan agent that changed the work (it is told not to) is a
 warning; its commits stay in the change, and implement's "no new commit" is
 counted from what the plan stage left (`implement_from`, a `mark()` of the
 change) as well as from the set-up.
+
+The opt-in test stage (`stage_test`, `test.md`) writes the tests before the
+code. With `test` in the stages the plan must have `## Tests` with
+``- Command: `...` `` (`test_command`), or `- Command: none` with a
+`[blocking]` question (`tests_problems`). The test agent commits a test per
+criterion, runs none and changes no other file (one that does not look like a
+test, `TEST_PATH`, is a warning); its verifier reads `MET_WHEN[1]` (an added
+test that checks the criterion meets it). Its pass saves `test_marks` (each
+repository's sha, or a snapshot tree for one left uncommitted), `test_files`
+and `test_sha`, and moves `implement_from` to the change after the tests, so
+the tests alone never satisfy implement. Implement, fix and a review's changed
+work are then judged on the change since `test_marks`
+(`ticket_change(since=)`), and a deleted test file fails. A final
+`NO TEST FRAMEWORK:` line with nothing changed since the plan
+(`moved_since(..., "implement")`) blocks at once (`no_go_on`) with the
+edit-and-retry and answer commands. A retry at plan or test and a follow-up
+drop the marks; a retry at test is refused while the plan names no test
+command (a ticket made without the stage), so the run's page never offers it. `take_baselines` snapshots the files at test as at
+implement. The prompts' `{{TEST_STEP}}` (`TEST_STEPS`: without, with) and
+`{{TEST_CRITERIA}}` tell every agent of a ticket without the stage to write
+and run no tests (only the build), and with it to run the plan's command
+until it passes; the task cards use the `STAGE+test` keys of
+`stage-guidance.json`, `{TEST}` the command (60 characters at most), and the
+cards without the stage are as before.
 
 The plan is markdown in a strict one-line-per-item shape (`plan.md`; the card's
 done line repeats it): `## Goal`, `## How it works` (2-5 plain bullets: what

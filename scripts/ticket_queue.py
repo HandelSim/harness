@@ -3620,7 +3620,7 @@ def stage_test(ctx, st):
     exists (verify_change marks them: test_marks); a project with no test framework blocks."""
     rc, out, _ = agent_or_kept(ctx, st, "test", lambda: render("test", **common(ctx, st)))
     said = next((l for l in read(out).splitlines() if "NO TEST FRAMEWORK" in l), "") if out else ""
-    if said and not moved_since(st, ticket_change(ctx.q, st), "start"):   # the owner's call, not a retry's
+    if said and not moved_since(st, ticket_change(ctx.q, st), "implement"):   # the owner's call, not a retry's
         key = st["key"]
         how = (f"drop the test stage (harness queue edit {key} --stages plan,implement,review,fix,push, then "
                f"harness queue retry {key} --stage implement), or say which framework to use (harness queue answer "
@@ -5263,6 +5263,11 @@ def retry_refused(q, st, stage=None, fetch=True, seen=None):
         stages = stages_of(st)
         if "plan" in stages and ALL_STAGES.index(stage) > 0 and not os.path.exists(plan_copy(q, key)):
             return f"{key} has no checked plan yet, so {stage} has nothing to work from: --stage plan"
+        if stage == "test" and not test_command(read(plan_copy(q, key))):   # a plan made without the test stage
+            return (f"{key}'s plan names no test command (## Tests, - Command:), so test has nothing to run the tests "
+                    f"with: --stage plan" + ("" if "test" in stages else
+                                             f", with test added by harness queue edit {key} --stages while it is "
+                                             f"queued at plan"))
         if stage == "fix" and not st.get("must_fix"):
             return f"{key}'s review has no Must fix items, so fix has nothing to do: --stage review"
         if stage in ("review", "fix", "push"):

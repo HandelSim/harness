@@ -621,7 +621,8 @@ class QueueTest(Base):
 
     def test_stage_guidance_file(self):
         guide = tq.stage_guidance()
-        self.assertEqual(sorted(guide), ["fix", "implement", "plan", "review"])
+        self.assertEqual(sorted(guide), ["fix", "fix+test", "implement", "implement+test", "plan", "plan+test",
+                                         "review", "review+test", "test"])   # STAGE+test: with the test stage
         for stage, lines in guide.items():   # within the proxy's caps for the card's do list
             self.assertLessEqual(len(lines), 8, stage)
             self.assertTrue(all(len(x) <= 240 for x in lines), stage)
@@ -1300,12 +1301,15 @@ class QueueTest(Base):
         st = {"key": "ABC-1", "base_sha": "abc", "feedback": ""}
         ctx = type("C", (), {"vault": self.vault, "q": tq.Queue(self.state)})()
         v = tq.common(ctx, st)
-        for name in ("plan", "implement", "review", "fix"):
+        for name in ("plan", "test", "implement", "review", "fix"):
             text = tq.render(name, DIFF="d", MUST_FIX="m", **v)
             self.assertNotIn("{{", text, name)
             self.assertLess(len(text), 120_000)
         for name, vals in (("verify_plan", dict(TICKET="t", PLAN="p", CRITERIA="AC1: c", ANSWERS="a")),
-                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m"))):
+                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m",
+                                                  MET_WHEN=tq.MET_WHEN[0])),
+                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m",
+                                                  MET_WHEN=tq.MET_WHEN[1]))):
             self.assertNotIn("{{", tq.render(name, **vals), name)
 
 
@@ -1844,7 +1848,7 @@ class OwnerControlTest(Base):
         got = self.status_json()
         self.assertEqual(got["runner"], {"running": False, "slots": [], "tickets": []})
         self.assertEqual([t["key"] for t in got["tickets"]], ["ABC-2", "ABC-1"])
-        self.assertEqual(got["tickets"][0]["stages"], list(tq.ALL_STAGES))
+        self.assertEqual(got["tickets"][0]["stages"], list(tq.DEFAULT_STAGES))   # the test stage is opt-in
         put(os.path.join(self.state, "run.json"), json.dumps({"pid": 1, "beat": int(time.time()) - 60}))
         self.assertEqual(self.status_json()["runner"],
                          {"pid": 1, "beat": int(time.time()) - 60, "running": False, "slots": [], "tickets": []})
@@ -4669,6 +4673,21 @@ class TestStageTest(Base):
         rc, out = self.q("retry", "ABC-1", "--stage", "plan")
         self.assertEqual(rc, 0, out)
         self.assertFalse([k for k in tq.TEST_MARKS if k in Q.load("ABC-1")])
+
+    def test_a_retry_at_test_needs_a_plan_with_a_test_command(self):
+        self.add("ABC-1")   # without the test stage: its plan has no ## Tests
+        self.run_queue()
+        Q = tq.Queue(self.state)
+        st = Q.load("ABC-1")
+        self.assertEqual(st["status"], "done", st.get("reason"))
+        why = tq.retry_choices(Q, st)
+        self.assertIn("names no test command", why["test"])   # the run's page does not offer it either
+        self.assertIn("harness queue edit ABC-1 --stages", why["test"])
+        self.assertEqual(why["implement"], "")
+        rc, out = self.q("retry", "ABC-1", "--stage", "test")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("names no test command", out)
+        self.assertEqual(Q.load("ABC-1")["stages"], list(tq.DEFAULT_STAGES))
 
 
 if __name__ == "__main__":
