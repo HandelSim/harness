@@ -3908,12 +3908,21 @@ def fail(ctx, st, rc, problems):
 
 def block_line(ctx, st, problems):
     """A failed stage's block reason: the problem that is the cause (a check's, not fail()'s
-    "the agent ran past ..." when one follows it), in the checks' words, and how many more
-    there are and where."""
+    "the agent launch exited ..." when one follows it; a stop, the timeout or no progress,
+    then the first check's problem too), in the checks' words, and how many more there
+    are and where."""
     probs = [" ".join(p.split()) for p in problems if p.strip()] or ["(no problem was given)"]
-    first = ([p for p in probs if not LAUNCH_LINE.match(p)] or probs)[0]
-    more = f" (+{len(probs) - 1} more in {os.path.join(ctx.q.dir(st['key']), 'log.md')})" if len(probs) > 1 else ""
-    return clip(failed_check(first), 300) + more
+    checks = [p for p in probs if not LAUNCH_LINE.match(p)]
+    first = clip(failed_check((checks or probs)[0]), 300)
+    shown = 1
+    if checks and STOP_LINE.match(probs[0]):   # stopped: that is the cause, what its checks found follows
+        first, shown = f"{clip(probs[0], 120)}; then: {clip(failed_check(checks[0]), 220)}", 2
+    more = f" (+{len(probs) - shown} more in {os.path.join(ctx.q.dir(st['key']), 'log.md')})" \
+        if len(probs) > shown else ""
+    return first + more
+
+
+STOP_LINE = re.compile(r"^the agent (ran past|made no progress)")
 
 
 def process(ctx, st):

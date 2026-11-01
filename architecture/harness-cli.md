@@ -819,7 +819,9 @@ bisect going (`GIT_TROUBLE`), a left-over
 `index.lock`, is not on the branch, or a commit since the start touches a
 file the owner had changed or untracked; these come first in the problems,
 as the cause (a failed stage's block reason, `block_line`, is the first
-problem that is not a launch line, plus how many more are in `log.md`).
+problem that is not a launch line; after a stop, the timeout or no
+progress, that stop then the first check's problem; plus how many more
+are in `log.md`).
 A detached HEAD at or ahead of the branch tip is reattached first
 (`reattach`: the branch fast-forwarded there, switched to). Commits on the
 owner's branch while the ticket works (`orig_tip`, taken at set-up) are a

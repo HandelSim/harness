@@ -1390,6 +1390,7 @@ class ReviewFixesTest(Base):
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "plan"), out)
         self.assertIn("ran past 1s", st["reason"])
+        self.assertIn("; then: the plan file was not written", st["reason"])   # the stop first, its check after
         self.assertEqual(cat(self.calls + ".sleeping").split(), ["ABC-1", "ABC-1"])   # an attempt, retried once
         self.assertNotIn("agent", st)
 
@@ -3908,11 +3909,14 @@ class SubmoduleWorkTest(Base):
         self.add_in_place()
         self.run_queue("--retries", "0")
         st = self.status()
-        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        # the check fails with the commands; the stage goes on once in its session (go_on_once), told
+        # them, and the agent commits inside the submodule: nothing of its work was dropped
         self.assertIn("mods/sub: changes not committed inside the submodule (agent.txt): git -C mods/sub switch -c "
                       "ABC-1, git -C mods/sub add <files>, git -C mods/sub commit, then git add mods/sub, git commit",
-                      st["reason"])
-        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+                      cat(self.calls + ".implementing"))   # what the agent was told, in full
+        self.assertIn("implement: going on in its session ses_fake0 (once, not counted): mods/sub: changes not "
+                      "committed inside the submodule (agent.txt)", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertEqual(st["status"], "done", st.get("reason"))
 
     def test_the_retry_that_commits_it_is_reviewed_and_pushed_with_the_submodule_first(self):
         _, d = self.submodule()
