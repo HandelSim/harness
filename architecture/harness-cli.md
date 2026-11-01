@@ -875,12 +875,19 @@ Submodules (`submodules_of`: the index's gitlinks with a checkout there; not
   inside left uncommitted) is an uncommitted repository itself, baselined by
   `take_baselines`, its files part of the change;
 - one of the top on its branch: its change lands as commits inside it plus the
-  new pointer committed in the top. `take_baselines` snapshots it (files as they
-  are, at any stage) into `st["subs"]`; `submodule_problems` (in `verify_change`,
-  clone or in place) fails implement and fix on changes not committed inside it,
-  or a HEAD the branch's pointer does not name, since the snapshot, with the
-  exact commands. The queue commits nothing there itself. The owner's dirty
-  submodule is not kept out of the top's commits (`in_place_problems`);
+  new pointer committed in the top. In place, `take_baselines` snapshots it
+  (`snap_sub`: files as they are, at any stage, its HEAD, the branch's pointer)
+  into `st["subs"]`; taken again when missing (a state from before it; a
+  follow-up round drops it), and for a submodule among the owner's new changes
+  `top_back_on_branch` adopts. `submodule_problems` (in `verify_change`, clone or
+  in place) fails implement and fix on changes not committed inside it, or a
+  HEAD the branch's pointer does not name, since the snapshot, with the exact
+  commands; in place, one with no snapshot (it failed, or the state has none)
+  is skipped with a warning (its files are never taken for the agent's). The queue commits nothing
+  there itself. The owner's dirty submodule is not kept out of the top's commits
+  (`in_place_problems`), except a pointer moved to the owner's own HEAD there
+  when it differed from the branch's (`owners_pointers`: their commit, e.g. by
+  `git add -A`), which fails as the owner's file;
 - `submodule_diffs` adds each moved pointer's old..new diff, run inside the
   submodule (`sub_repo`: the work's checkout, else the project's), to the top's
   part, so review and the verifier see the work; an added one stays its
@@ -889,11 +896,19 @@ Submodules (`submodules_of`: the index's gitlinks with a checkout there; not
   to a commit on none of the submodule's remote-tracking branches (git's
   `--recurse-submodules=check` test, done by hand: `on-demand` would push the
   submodule's own refspecs) is pushed to `ctx.remote` there as the ticket's
-  branch; no such remote, a refused push, or the commit in no checkout here
-  blocks the push, and the top is not pushed.
+  branch; no such remote, a refused push, the commit in no checkout here, or
+  (in place) commits under it on no remote that the owner's own HEAD of the
+  snapshot (`owners_head`) reaches and the branch's pointer then did not (theirs
+  would go along) blocks the push, and the top is not pushed.
 A clone does not check submodules out (the agent may: `git submodule update
 --init`); `fetch_branch` fetches with `--no-recurse-submodules`, as git's
-on-demand fetch fails on commits only the clone's submodule has. Not covered:
+on-demand fetch fails on commits only the clone's submodule has. So before a
+clone ticket ends with its branch in the project and a moved pointer's commit
+on no remote (`--push 0`, no remote, no push stage: `stage_push`, `advance` to
+done), `keep_sub_commits` fetches it from the clone's submodule into the
+project's, at `refs/harness-queue/KEY` there, so it outlives `harness queue
+remove`; when it cannot, the ticket blocks saying where the commit is. `reattach`
+moves nothing while `in_place_trouble` reports a rebase, merge or the like. Not covered:
 submodules of a `--repo-branch` repository, and submodules of submodules.
 Windows container launches cannot work in place (`--host`).
 Each launch gets `HARNESS_QUEUE_LAUNCH` (a nonce), which harness puts on its

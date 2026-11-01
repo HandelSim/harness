@@ -1239,6 +1239,13 @@ def top_back_on_branch(q, st):
     if new and owners:   # on the owner's own branch what is uncommitted is the owner's: it comes along, theirs
         owner = {k: sorted(set(owner.get(k, [])) | set(now[k])) for k in ("untracked", "changed")}
         write_atomic(os.path.join(q.dir(key), "owner.json"), json.dumps(owner))
+        for rel in [r for r in st.get("subs") or {} if r in new or r + "/" in new]:   # theirs too, in there
+            try:
+                st["subs"][rel] = snap_sub(q, st, rel)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+                st["subs"][rel] = {}
+                q.log(key, f"warning: submodule {rel} not looked at again: {e}")
+        q.save(st)
         new = []
     if new:
         return (f"{project} is on {on}, not the ticket's branch {branch}, and has uncommitted changes that were "
@@ -1500,10 +1507,12 @@ def take_baselines(q, st, stage, skip=()):
     first): its HEAD, so what is uncommitted there is the change. Kept until the work
     is set up again (enter_in_place). A submodule of an uncommitted repository is one
     too; one of the top on its branch is snapshot the same way into st["subs"], so
-    submodule_problems tells the work there from what was there before."""
-    if stage == "plan" or isinstance(st.get("baselines"), dict):
+    submodule_problems tells the work there from what was there before (taken again when
+    it is missing: a state from before it, a follow-up round)."""
+    if stage == "plan" or (isinstance(st.get("baselines"), dict) and isinstance(st.get("subs"), dict)):
         return
-    key, out, subs = st["key"], {}, {}
+    again = isinstance(st.get("baselines"), dict)   # only the submodules' snapshot is missing
+    key, out, subs = st["key"], dict(st["baselines"]) if again else {}, {}
     try:
         repos = uncommitted_repos(st, skip)
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
@@ -1517,9 +1526,12 @@ def take_baselines(q, st, stage, skip=()):
             q.log(key, f"warning: the submodules of {parent} not looked for before {stage}: {e}")
             continue
         (repos if parent in repos else on_branch).extend(s for s in found if s not in repos)
-    for rel in repos + on_branch:
+    for rel in ([] if again else repos) + on_branch:
         d = repo_dir(st, rel)
         try:
+            if rel in on_branch:
+                subs[rel] = snap_sub(q, st, rel)
+                continue
             head = git(d, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False).stdout.strip()
             if stage in ("test", "implement") or rel in on_branch:   # a submodule's change is its commits
                 tree = worktree_tree(q, st, d)
@@ -1530,15 +1542,32 @@ def take_baselines(q, st, stage, skip=()):
             sha = git(d, "commit-tree", tree, "-m", f"{key}: {rel} before the ticket's work",
                       env=SNAP_WHO).stdout.strip()
             git(d, "update-ref", f"refs/harness-queue/base/{key}", sha)
-            (subs if rel in on_branch else out)[rel] = {"snap": sha, "head": head}
+            out[rel] = {"snap": sha, "head": head}
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             q.log(key, f"warning: {rel} not looked at before {stage}: {e}; a change there is not part of the ticket's")
-    st["baselines"] = out
-    if subs:
-        st["subs"] = subs
+            if rel in on_branch:
+                subs[rel] = {}   # no snapshot: submodule_problems leaves it alone
+    st["baselines"], st["subs"] = out, subs
     q.save(st)
-    if out:
+    if again:
+        if subs:
+            q.log(key, f"submodules looked at again before {stage} (what is in them now is not the ticket's work): "
+                       f"{', '.join(subs)}")
+    elif out:
         q.log(key, f"left uncommitted (the change there is the files against how they are now): {', '.join(out)}")
+
+
+def snap_sub(q, st, rel):
+    """A submodule of the top on its branch as it is now, for submodule_problems: its files
+    as a commit at refs/harness-queue/base/KEY there ("snap"), its HEAD, and the commit the
+    top's branch points it to ("pointer"): a HEAD elsewhere is the owner's own."""
+    d, branch = repo_dir(st, rel), branch_of(st)
+    head = git(d, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False).stdout.strip()
+    sha = git(d, "commit-tree", worktree_tree(q, st, d), "-m", f"{st['key']}: {rel} before the ticket's work",
+              env=SNAP_WHO).stdout.strip()
+    git(d, "update-ref", f"refs/harness-queue/base/{st['key']}", sha)
+    pointer = git(st["project"], "rev-parse", "-q", "--verify", f"refs/heads/{branch}:{rel}", check=False).stdout.strip()
+    return {"snap": sha, "head": head, "pointer": pointer}
 
 
 def repo_diff(repo, rel, a, b):
@@ -1616,6 +1645,11 @@ def submodule_problems(q, st):
     out = []
     for rel in submodules_of(wd):
         d, was = os.path.join(wd, rel), (st.get("subs") or {}).get(rel) or {}
+        subs = st.get("subs")   # in place, one checked out at the snapshot without one there: the owner's unknown
+        if st.get("in_place") and not was.get("snap") and (not isinstance(subs, dict) or rel in subs):
+            q.log(st["key"], f"warning: submodule {rel} not looked at: there is no snapshot of what the owner had in "
+                             "it, so what is in it is not taken for the ticket's work")
+            continue
         try:
             head = git(d, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False).stdout.strip()
             now = worktree_tree(q, st, d)
@@ -3518,8 +3552,8 @@ def reattach(ctx, st):
     (its commits on top): the branch moved there (a fast-forward only) and checked out
     again, so those commits are the ticket's instead of a block."""
     project, branch = st["project"], branch_of(st)
-    if git(project, "symbolic-ref", "-q", "HEAD", check=False).returncode == 0:
-        return
+    if git(project, "symbolic-ref", "-q", "HEAD", check=False).returncode == 0 or in_place_trouble(project, None):
+        return   # a rebase going is on a detached HEAD: nothing moved under it
     head = git(project, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False).stdout.strip()
     tip = git(project, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False).stdout.strip()
     if not head or not tip or git(project, "merge-base", "--is-ancestor", tip, head, check=False).returncode != 0:
@@ -3561,12 +3595,33 @@ def in_place_problems(ctx, st):
         owner = owner_files(ctx.q, st)
         # a submodule the owner had changes in is not kept out: its new pointer is the ticket's to commit
         mine = set(owner.get("untracked", [])) | set(owner.get("changed", []))
-        out += owners_touched(project, ".", st["start_sha"], branch_of(st), mine - set(st.get("subs") or {}))
+        subs = st.get("subs") or {}
+        out += owners_touched(project, ".", st["start_sha"], branch_of(st),
+                              (mine - {r for r, w in subs.items() if w}) | owners_pointers(project, st, subs))
     for rel, n in sorted((st.get("nested") or {}).items()):
         trouble = in_place_trouble(repo_dir(st, rel), n["branch"])
         out += [trouble] if trouble else \
             owners_touched(repo_dir(st, rel), rel, n["start_sha"], n["branch"], set(n.get("owner") or []))
     return out
+
+
+def owners_pointers(project, st, subs):
+    """The submodules the top's branch now points to the owner's own HEAD there when the
+    work started (a commit of theirs, maybe unpushed, its pointer not committed): theirs."""
+    tip, out = f"refs/heads/{branch_of(st)}", set()
+    for rel, was in subs.items():
+        own = owners_head(project, st, rel, was)[0]
+        if own and git(project, "rev-parse", "-q", "--verify", f"{tip}:{rel}", check=False).stdout.strip() == own:
+            out.add(rel)
+    return out
+
+
+def owners_head(project, st, rel, was):
+    """(head, pointer): the owner's own HEAD in submodule rel at the snapshot (was, an
+    st["subs"] entry), "" when it is where the top's branch pointed it then (pointer)."""
+    start = was.get("pointer") or git(project, "rev-parse", "-q", "--verify", f"{st['start_sha']}:{rel}",
+                                      check=False).stdout.strip()
+    return ("" if not was.get("head") or was["head"] == start else was["head"]), start
 
 
 def owners_touched(repo, rel, since, branch, mine):
@@ -3797,6 +3852,10 @@ def stage_push(ctx, st):
                                       f"{p['sha'][:12]} in {where})")
             push["result"] = "pushed"
             ctx.q.log(key, f"pushed branch {p['branch']}{of} to {ctx.remote} ({p['sha'][:12]})")
+    why = keep_sub_commits(ctx, st, sha, {p["sha"] for p in pushes if p["result"] == "pushed"})
+    if why:
+        results(ctx, st, change, pushes)
+        return block(ctx, st, why)
     left = [p["repo"] for p in parts if p["kind"] == "uncommitted"]
     if left:
         reasons.append("changes left uncommitted in " + ", ".join("the project" if r == "." else r for r in left))
@@ -3808,6 +3867,35 @@ def stage_push(ctx, st):
     st.update(status="done", stage="done", attempt=0, feedback="", reason=reason, sha=sha or "")
     st.pop("built_on", None)   # the round is built: a retry from the plan starts over, a followup sets it again
     ctx.q.save(st)
+
+
+def keep_sub_commits(ctx, st, sha, pushed=()):
+    """In a clone, before the ticket ends with its branch in the project: each submodule
+    commit the branch points to anew that is on no remote fetched from the clone's
+    submodule into the project's, at refs/harness-queue/KEY there, so it outlives the
+    clone (harness queue remove deletes it). "" when kept, else why not."""
+    if st.get("in_place") or not sha:
+        return ""
+    key, project = st["key"], st["project"]
+    for rel, _, new in moved_pointers(project, st["base_sha"], sha, "AM"):
+        mine, src = os.path.join(project, rel), os.path.join(workdir(ctx.q, st), rel)
+        has = lambda d: os.path.exists(os.path.join(d, ".git")) and git(  # noqa: E731
+            d, "cat-file", "-e", f"{new}^{{commit}}", check=False).returncode == 0
+        if new in pushed or has(mine) or not has(src) or \
+                not git(src, "rev-list", "-n", "1", new, "--not", "--remotes", check=False).stdout.strip():
+            continue   # in the project already; nowhere to take it from (push_submodules says so); on a remote
+        ref = f"refs/harness-queue/{key}"
+        r = git(src, "update-ref", ref, new, check=False)
+        if r.returncode == 0 and os.path.exists(os.path.join(mine, ".git")):
+            r = git(mine, "fetch", "-q", "--no-tags", "--no-recurse-submodules", src, f"+{ref}:{ref}", check=False)
+        if r.returncode != 0 or not has(mine):
+            err = git_said(r, 200) if r.returncode != 0 else f"{rel} is not checked out in {project}"
+            return (f"submodule {rel}'s commit {new[:12]} (branch {branch_of(st)} points it there) is on no remote "
+                    f"and only in the ticket's clone, at {src}; it could not be kept in {mine} ({err}). Take it "
+                    f"before harness queue remove {key} deletes the clone (git -C {mine} fetch {src} {ref}), "
+                    f"then harness queue retry {key}")
+        ctx.q.log(key, f"kept submodule {rel}'s {new[:12]} in {mine} at {ref} (on no remote)")
+    return ""
 
 
 def push_submodules(ctx, st, sha):
@@ -3824,6 +3912,16 @@ def push_submodules(ctx, st, sha):
                             f"{rel}, then harness queue retry {key} --stage push")
         if not git(d, "rev-list", "-n", "1", new, "--not", "--remotes", check=False).stdout.strip():
             continue   # on a remote of it already
+        own, start = owners_head(st["project"], st, rel, (st.get("subs") or {}).get(rel) or {}) \
+            if st.get("in_place") else ("", "")
+        unpushed = lambda c: set(git(d, "rev-list", c, "--not", "--remotes", check=False).stdout.split())  # noqa: E731
+        theirs = (unpushed(own) & unpushed(new)) - (unpushed(start) if start else set()) if own else set()
+        if theirs:
+            return pushes, (f"branch {name} points submodule {rel} to {new[:12]}, which has {len(theirs)} commit(s) "
+                            f"of the owner's own there that are on no remote (its HEAD {own[:12]} when the ticket "
+                            f"started); nothing was pushed, as they would go along. Push them yourself (git -C {d} "
+                            f"push {ctx.remote} {own[:12]}:refs/heads/<branch>), or take the ticket's commits off "
+                            f"them, then harness queue retry {key} --stage push")
         push = {"remote": ctx.remote, "url": remote_url(d, ctx.remote), "branch": name, "sha": new,
                 "result": "local", "error": "", "repo": rel}
         pushes.append(push)
@@ -3969,6 +4067,13 @@ def record(st, result, details=()):
 
 def advance(ctx, st, stage, reason=""):
     """On to stage; None: the ticket's stages are done (push marks done itself)."""
+    if not stage and not st.get("in_place") and st.get("base_sha"):
+        top = None
+        with contextlib.suppress(Exception):
+            top = fetch_branch(ctx.q, st)
+        why = keep_sub_commits(ctx, st, top[0]) if top else ""
+        if why:
+            return block(ctx, st, why)
     record(st, "passed")
     st.pop("verify_only", None)
     st.pop("debugged", None)   # a block of the next stage gets its own debug agent
@@ -5813,7 +5918,7 @@ def cmd_followup(q, a):
                      plan_approved=False)
         if st:   # the review and checks of the last round are not this one's
             for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "questions", "criteria",
-                      "assumptions", *TEST_MARKS):
+                      "assumptions", "subs", *TEST_MARKS):
                 st.pop(k, None)
             q.save(st)
     if st:

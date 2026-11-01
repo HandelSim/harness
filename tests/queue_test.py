@@ -4013,6 +4013,118 @@ class SubmoduleWorkTest(Base):
         ptr, pushed = self.pointer()
         self.assertEqual(pushed, ptr)
 
+    def owner_commit(self, d):
+        """An unpushed commit of the owner's own in the submodule at d, its pointer not committed: its sha."""
+        put(os.path.join(d, "private.txt"), "the owner's, not pushed\n")
+        sh("git", "-C", d, "add", "private.txt")
+        sh("git", "-C", d, "-c", "user.name=O", "-c", "user.email=o@example.com", "commit", "-q", "-m", "owner private")
+        return sh("git", "-C", d, "rev-parse", "HEAD").strip()
+
+    def on_remote(self, repo, sha):
+        return subprocess.run(["git", "-C", repo, "cat-file", "-e", sha + "^{commit}"], capture_output=True).returncode == 0
+
+    def test_the_owners_unpushed_submodule_commit_committed_by_add_all_is_theirs(self):
+        remote, d = self.submodule()
+        own = self.owner_commit(d)
+        os.environ["FAKE_INSTEAD_ONCE"] = "1"   # going on in its session, it does its own work
+        os.environ["FAKE_INSTEAD"] = ("echo hello feature > feature.txt && git add -A && "
+                                      "git -c user.name=A -c user.email=a@example.com commit -q -m 'ABC-1: implementing'")
+        self.add_in_place()
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        self.assertIn("the commits touch mods/sub, which the owner had uncommitted", st["reason"])
+        self.assertFalse(self.on_remote(remote, own))   # the owner's commit went nowhere
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+
+    def test_the_owners_unpushed_submodule_commits_under_the_agents_block_the_push(self):
+        remote, d = self.submodule()
+        own = self.owner_commit(d)
+        me = "-c user.name=A -c user.email=a@example.com"
+        os.environ["FAKE_INSTEAD_ONCE"] = "1"
+        os.environ["FAKE_INSTEAD"] = (f"echo a > mods/sub/agent.txt && git -C mods/sub add agent.txt && "
+                                      f"git -C mods/sub {me} commit -q -m 'agent in sub' && echo f > feature.txt && "
+                                      f"git add feature.txt mods/sub && git {me} commit -q -m 'ABC-1: implementing'")
+        self.add_in_place()
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        self.assertIn(f"commit(s) of the owner's own there that are on no remote (its HEAD {own[:12]}", st["reason"])
+        self.assertIn("harness queue retry ABC-1 --stage push", st["reason"])
+        self.assertFalse(self.on_remote(remote, own))
+        self.assertEqual(sh("git", "-C", remote, "branch", "--list", "ABC-1"), "")
+        self.assertEqual(sh("git", "-C", self.remote, "branch", "--list", "ABC-1"), "")
+
+    def test_a_state_without_the_submodule_snapshot_takes_it_again(self):
+        _, d = self.submodule()
+        put(os.path.join(d, "owner.txt"), "the owner's, there before\n")
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add_in_place()
+        self.run_queue("--retries", "0")
+        self.assertEqual(self.status()["status"], "blocked")
+        sf = os.path.join(self.state, "ABC-1", "state.json")
+        with open(sf) as f:
+            j = json.load(f)
+        j.pop("subs")   # a state.json from before st["subs"]
+        with open(sf, "w") as f:
+            json.dump(j, f)
+        del os.environ["FAKE_NO_COMMIT"]
+        self.assertEqual(self.q("retry", "ABC-1")[0], 0)
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "done", st.get("reason"))
+        self.assertNotIn("owner.txt", cat(os.path.join(self.state, "ABC-1", "log.md")))   # never told to commit it
+        self.assertEqual(sh("git", "-C", d, "status", "--porcelain"), "?? owner.txt\n")
+
+    def test_what_the_owner_changes_in_a_submodule_while_blocked_stays_theirs(self):
+        _, d = self.submodule()
+        os.environ["FAKE_NO_COMMIT"] = "1"
+        self.add_in_place()
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual((st["status"], st.get("folder_branch_now")), ("blocked", "main"))
+        put(os.path.join(d, "owner2.txt"), "the owner's, made while the ticket was blocked\n")
+        del os.environ["FAKE_NO_COMMIT"]
+        self.assertEqual(self.q("retry", "ABC-1")[0], 0)
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "done", st.get("reason"))
+        self.assertNotIn("owner2.txt", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        self.assertEqual(sh("git", "-C", d, "status", "--porcelain"), "?? owner2.txt\n")
+
+    def kept_in_the_project(self, stages, *run):
+        _, d = self.submodule()
+        os.environ["FAKE_NESTED"] = "init:mods/sub"
+        rc, out = self.q("add", "ABC-1", "--project", self.project, "--clone", "--stages", stages)
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue(*run)
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        ptr = sh("git", "-C", self.project, "rev-parse", "refs/harness-queue/ABC-1:mods/sub").strip()
+        self.assertFalse(self.on_remote(os.path.join(self.tmp, "sub.git"), ptr))
+        self.assertEqual(self.q("remove", "ABC-1")[0], 0)
+        self.assertFalse(os.path.isdir(os.path.join(self.state, "ABC-1", "repo")))   # the clone is gone
+        self.assertTrue(self.on_remote(d, ptr))   # the commit the branch points the submodule to is not
+        self.assertEqual(sh("git", "-C", d, "rev-parse", "refs/harness-queue/ABC-1").strip(), ptr)
+
+    def test_in_a_clone_a_submodule_commit_kept_local_outlives_the_clone(self):
+        self.kept_in_the_project("implement,review,push", "--push", "0")
+
+    def test_in_a_clone_a_submodule_commit_with_no_push_stage_outlives_the_clone(self):
+        self.kept_in_the_project("implement,review")
+
+    def test_a_detached_head_is_not_reattached_while_a_rebase_is_going(self):
+        os.environ["FAKE_INSTEAD"] = ("git checkout -q --detach && echo f > feature.txt && git add feature.txt && "
+                                      "git -c user.name=A -c user.email=a@example.com commit -q -m 'ABC-1: x' && "
+                                      "mkdir -p \"$(git rev-parse --git-path rebase-merge)\"")
+        self.add_in_place()
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", st.get("reason"))
+        self.assertIn("a rebase is in progress", st["reason"])
+        head = sh("git", "-C", self.project, "rev-parse", "HEAD").strip()
+        self.assertNotEqual(sh("git", "-C", self.project, "rev-parse", "refs/heads/ABC-1").strip(), head)
+
 
 # In front of FAKE_AGENT: what STRAY says, for the stage it names, before (or instead of) the agent's
 # work. STRAY: entries "stage|do|file|text" joined by ";;"; do: commit (write file, commit it), edit
