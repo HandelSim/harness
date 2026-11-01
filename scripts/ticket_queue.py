@@ -3615,11 +3615,18 @@ def cap(text, n):
     return text if len(text) <= n else text[:n] + f"\n[... cut at {n} characters ...]\n"
 
 
+def no_framework_line(text):
+    """The test agent's own "NO TEST FRAMEWORK: ..." line (one that starts with it), or "";
+    the prompt's and the card's words that quote it are not one."""
+    return next((l.strip() for l in (text or "").splitlines()
+                 if l.lstrip(" \t>*_#`-").startswith("NO TEST FRAMEWORK:") and "<what you looked for" not in l), "")
+
+
 def stage_test(ctx, st):
     """The opt-in test stage: tests for the plan's criteria, committed before the code
     exists (verify_change marks them: test_marks); a project with no test framework blocks."""
     rc, out, _ = agent_or_kept(ctx, st, "test", lambda: render("test", **common(ctx, st)))
-    said = next((l for l in read(out).splitlines() if "NO TEST FRAMEWORK" in l), "") if out else ""
+    said = no_framework_line(read(out)) if out else ""
     if said and not moved_since(st, ticket_change(ctx.q, st), "implement"):   # the owner's call, not a retry's
         key = st["key"]
         how = (f"drop the test stage (harness queue edit {key} --stages plan,implement,review,fix,push, then "

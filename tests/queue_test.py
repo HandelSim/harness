@@ -4674,6 +4674,14 @@ class TestStageTest(Base):
         self.assertEqual(rc, 0, out)
         self.assertFalse([k for k in tq.TEST_MARKS if k in Q.load("ABC-1")])
 
+    def test_only_a_line_that_starts_with_no_test_framework_is_the_agents_word(self):
+        self.assertEqual(tq.no_framework_line("Looked.\n**NO TEST FRAMEWORK:** no runner\n"),
+                         "**NO TEST FRAMEWORK:** no runner")
+        self.assertEqual(tq.no_framework_line("- NO TEST FRAMEWORK: none in setup.cfg"), "- NO TEST FRAMEWORK: none in setup.cfg")
+        for words in (cat(os.path.join(tq.PROMPTS, "test.md")), cat(tq.STAGE_GUIDANCE),
+                      'finish with a message that starts "NO TEST FRAMEWORK:"', "", None):
+            self.assertEqual(tq.no_framework_line(words), "", words)   # the prompt's and the card's words
+
     def test_a_retry_at_test_needs_a_plan_with_a_test_command(self):
         self.add("ABC-1")   # without the test stage: its plan has no ## Tests
         self.run_queue()

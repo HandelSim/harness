@@ -1086,13 +1086,14 @@ repository's sha, or a snapshot tree for one left uncommitted), `test_files`
 and `test_sha`, and moves `implement_from` to the change after the tests, so
 the tests alone never satisfy implement. Implement, fix and a review's changed
 work are then judged on the change since `test_marks`
-(`ticket_change(since=)`), and a deleted test file fails. A final
-`NO TEST FRAMEWORK:` line with nothing changed since the plan
+(`ticket_change(since=)`), and a deleted test file fails. An output line
+that starts `NO TEST FRAMEWORK:` (`no_framework_line`; the prompt's words
+quoting it are not one) with nothing changed since the plan
 (`moved_since(..., "implement")`) blocks at once (`no_go_on`) with the
 edit-and-retry and answer commands. A retry at plan or test and a follow-up
 drop the marks; a retry at test is refused while the plan names no test
-command (a ticket made without the stage), so the run's page never offers it. `take_baselines` snapshots the files at test as at
-implement. The prompts' `{{TEST_STEP}}` (`TEST_STEPS`: without, with) and
+command (a ticket made without the stage), so the run's page never offers
+it. `take_baselines` snapshots the files at test as at implement. The prompts' `{{TEST_STEP}}` (`TEST_STEPS`: without, with) and
 `{{TEST_CRITERIA}}` tell every agent of a ticket without the stage to write
 and run no tests (only the build), and with it to run the plan's command
 until it passes; the task cards use the `STAGE+test` keys of
