@@ -1076,13 +1076,32 @@ diff for each criterion met;
 `judge()` checks every quote is really in the source (letters and digits
 only, so spacing and list markers do not matter); a diff quote must come
 from an added line, or a removed one when the criterion is about removing,
-never an unchanged context line. The plan the verifier
+never an unchanged context line. When every problem `judge()` finds is a
+quote of the verifier's own that is not in the diff (`QUOTE_MISS`), the
+verifier is asked once more through `verdict()` (its shorter-prompt fallback
+too), its prompt with `REQUOTE` after it, and only that answer counts: the
+agent's attempt is not spent on the verifier's copying (if that second ask
+gets no verdict, the first answer's problems stand). Before that, after
+implement and fix, `syntax_problems()` parses each changed `.py` (compiled
+by a Python 3.12 or later, this one or a `python3.1N` on PATH, never run;
+none: `.py` is not checked), `.json` (not the JSONC ones: `tsconfig*`,
+`.vscode/`, devcontainer, or a file that fails with a comment in it) and
+`.sh` file (`bash -n`; not one using extglob or whose `#!` names zsh, ksh
+and the like) of the top branch, from `git diff --raw -M` base..sha
+(symlinks and gitlinks skipped, a renamed file compared with its old path);
+a file that no longer parses is a problem, unless its base version did not
+parse either (only errors the change brought). `QUEUE_SYNTAX_CHECK=0`
+(`--syntax-check 0`) turns it off. The plan the verifier
 passed is copied to `state/queue/KEY/plan.md` and later stages are held to
 that copy, not the vault's, which agents can write. The fix stage must add
 a commit and is also checked against the review's Must fix items; an item
 the fixer finds wrong is answered in the commit message (an empty commit when
 nothing changed), which the verifier sees and may quote for that item only. A failed
-stage runs `QUEUE_RETRIES` more times with the problems as feedback, then
+stage runs `QUEUE_RETRIES` more times with the problems as feedback (in the
+stage's prompt, review's too, and on the retry's task card: `last_failure()`
+puts up to two of them, launch lines like "made no progress" only when no
+check said more, a failed criterion as "criterion N not met: <why> (AC: ...)",
+before the stage's `do` lines, sized to the proxy's caps), then
 the ticket is `blocked`; so does any error in harness itself, so one ticket
 never jams the queue. Before a failure counts, one probe request checks the
 upstream; the verifier and the probe each try 3 times (20 s, 60 s apart) on no

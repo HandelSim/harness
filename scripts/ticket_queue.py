@@ -91,6 +91,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vault_ingest import InfraError, call_model, resolve_model, try_lock, yq  # noqa: E402
@@ -2708,10 +2709,76 @@ def task_card(ctx, st, stage):
                                 **words)}
     if stage == "fix" and st.get("must_fix"):
         card["must_fix"] = len(st["must_fix"])
-    do = stage_guidance(ctx.q, st["key"]).get(stage)
+    do = [line.replace("{KEY}", st["key"]) for line in stage_guidance(ctx.q, st["key"]).get(stage) or []]
+    do = last_failure(st, do) + do
     if do:
-        card["do"] = [line.replace("{KEY}", st["key"]) for line in do]
+        card["do"] = do
     return card
+
+
+# fail()'s own lines about how the launch ended: said on the card only when no
+# check said what was wrong.
+LAUNCH_LINE = re.compile(r"^the agent (ran past|made no progress|launch exited|did not finish)")
+FAILED_CHECK = re.compile(r"^criterion (\d+) failed the check: (.*)\)$")   # judge()'s "<criterion> (<why>)"
+
+
+def balanced(text):
+    depth = 0
+    for ch in text:
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth < 0:
+            return False
+    return depth == 0
+
+
+def failed_check(p):
+    """judge()'s "criterion N failed the check: <criterion> (<why>)" as "criterion N not
+    met: <why> (AC: <its start>)": the verifier's reason first, the criterion is in the
+    plan. <p> as it is when it is not that, or the split is not clear."""
+    m = FAILED_CHECK.match(p)
+    if not m:
+        return p
+    body = m.group(2)
+    for at in [i for i in range(len(body)) if body.startswith(" (", i)]:
+        crit, why = body[:at], body[at + 2:]
+        if len(crit) <= 100 and why.strip() and balanced(crit) and balanced(why):
+            return f"criterion {m.group(1)} not met: {why} (AC: {clip(crit, 40)})"
+    return p
+
+
+def clip(text, n):
+    """<text> cut to at most n chars at a word, ending in "…" when cut."""
+    if len(text) <= n:
+        return text
+    cut = text[:n - 1]
+    return (cut.rsplit(" ", 1)[0] if " " in cut[n // 2:] else cut) + "…"
+
+
+def last_failure(st, do):
+    """On a retry, the card's first lines: why the last attempt failed, in the
+    words of its checks. The prompt that said it is gone after the first tool
+    call, and a pointer to the task file is a read-it-again loop. At most two,
+    sized so the proxy's caps (240 a line, 1000 in all) drop no guidance."""
+    if not st.get("attempt") or not (st.get("feedback") or "").strip():
+        return []
+    probs = []
+    for l in st["feedback"].splitlines():   # fail() writes "- problem"; a problem's own newlines follow it
+        if l.startswith("- "):
+            probs.append(l[2:])
+        elif probs:
+            probs[-1] += " " + l
+    probs = [" ".join(p.split()) for p in probs if p.strip()]
+    probs = [p for p in probs if not LAUNCH_LINE.match(p)] or probs
+    out, room = [], 1000 - sum(len(l) for l in do)
+    for p in probs[:2]:
+        line = f"Why the last attempt failed: {clip(failed_check(p), 170)}"
+        if out and len(line) + 30 > room:   # the second only where it leaves the guidance whole
+            break
+        out.append(line)
+        room -= len(line)
+    if len(probs) > len(out):
+        out[-1] += f" (+{len(probs) - len(out)} more in the task file)"
+    return out
 
 
 STAGE_GUIDANCE = os.path.join(PROMPTS, "stage-guidance.json")
@@ -2946,6 +3013,8 @@ def verify_change(ctx, st, rc, stage):
                         if not st.get("no_branch") else "nothing changed since the review: fix the Must fix items")
     if not problems and rc not in (0, IDLE, 124):   # stopped (quiet, or the timeout): the work is judged as it is
         problems.append("the agent did not finish; check the work is complete and committed")
+    if not problems and getattr(ctx, "syntax_check", True):
+        problems = syntax_problems(st, change)
     for w in warnings:
         ctx.q.log(st["key"], f"warning: {w}")
     if not problems:
@@ -2956,11 +3025,23 @@ def verify_change(ctx, st, rc, stage):
         if stage == "fix" and st.get("review_sha") and change[0]:
             notes = git(st["project"], "log", "--format=%B", f"{st['review_sha']}..{change[0]}",
                         check=False).stdout.strip()
-        obj = verdict(ctx, st, stage, lambda c: render(
-            "verify_change", TICKET=read(p["ticket"], min(TICKET_CAP, c)), CRITERIA=numbered(criteria),
-            DIFF=cap(diff, c), COMMITS=cap(notes, NOTE_CAP) or "(none)"))
+        def prompt_for(c):
+            return render("verify_change", TICKET=read(p["ticket"], min(TICKET_CAP, c)), CRITERIA=numbered(criteria),
+                          DIFF=cap(diff, c), COMMITS=cap(notes, NOTE_CAP) or "(none)")
+        obj = verdict(ctx, st, stage, prompt_for)
         problems = judge(obj, criteria, diff, "quote", "diff", notes)
         ctx.q.log(st["key"], f"{stage} verifier: {verifier_line(obj, problems)}")
+        miss = [m.group(1) for m in map(QUOTE_MISS.match, problems) if m]
+        if miss and len(miss) == len(problems) and str(obj.get("verdict", "")).upper() == "PASS":
+            # the verifier's copying, not the agent's work: asked once more before the attempt is failed
+            ctx.q.log(st["key"], f"{stage} verifier: its quotes for criteria {', '.join(miss)} are not in the "
+                                 "diff; asking it again")
+            try:
+                obj = verdict(ctx, st, stage, lambda c: prompt_for(c) + REQUOTE.format(", ".join(miss)))
+                problems = judge(obj, criteria, diff, "quote", "diff", notes)
+                ctx.q.log(st["key"], f"{stage} verifier, asked again: {verifier_line(obj, problems)}")
+            except VerifierBroke as e:   # no second verdict: the first one's problems stand
+                ctx.q.log(st["key"], f"{stage} verifier, asked again: {e}")
         st["warnings"] = warnings
     if problems:
         fail(ctx, st, rc, problems)
@@ -2971,6 +3052,13 @@ def verify_change(ctx, st, rc, stage):
 
 
 HOW_SHORT = "(where the ticket says how it lands: committed on its branch, or left uncommitted)"
+# judge()'s problems that are the verifier's own copying (its quote is not in the diff):
+# the verifier is asked once more (REQUOTE after its prompt) before they fail the attempt.
+QUOTE_MISS = re.compile(r"^criterion (\d+): (the quoted diff text is not in the diff|no quote from the diff shows it is met)")
+REQUOTE = ("\n\nA first answer to this request gave quotes for criteria {} that are not in the diff's added lines. "
+           "For each criterion, copy the quote character for character from one added line of the diff (without "
+           "its leading +; a removed line for a criterion about removing something), at least 8 characters long, "
+           "or say the criterion is not met. Reply with the JSON only.")
 
 
 def head_moved(st):
@@ -2983,6 +3071,113 @@ def head_moved(st):
             out.append(f"{'the project' if rel == '.' else rel} has commits since the work started "
                        f"({b['head'][:12]}..{head[:12]}), where the ticket's change is left uncommitted")
     return out
+
+
+SYNTAX_MAX = 1_000_000                # bytes: a bigger file is not parsed
+JSONC = re.compile(r"(^|/)(\.vscode/|\.devcontainer/|(ts|js)config[^/]*\.json$|devcontainer\.json$)")
+# a shell file bash -n misjudges: extglob patterns parse only once the shopt line has run,
+# and a #! naming zsh, ksh or another shell is not bash's syntax
+NOT_BASH = re.compile(rb"extglob|\A#![^\n]*\b(zsh|ksh|mksh|fish|csh|tcsh|ash)\b")
+PY_CHECK = """import sys, warnings
+warnings.simplefilter("ignore")
+try:
+    compile(sys.stdin.buffer.read(), sys.argv[1], "exec", dont_inherit=True)
+except SyntaxError as e:
+    print("line %s: %s" % (e.lineno, e.msg)); sys.exit(1)
+except ValueError as e:
+    print(str(e)[:120]); sys.exit(1)
+"""
+
+
+def checking_python():
+    """A Python new enough to know any syntax a changed file may use (3.12 or later):
+    this one, else the newest python3.1N on PATH; None when there is none."""
+    if sys.version_info >= (3, 12):
+        return [sys.executable]
+    for n in range(20, 11, -1):
+        found = shutil.which(f"python3.{n}")
+        if found:
+            return [found]
+    return None
+
+
+def parse_error(path, data, py=None):
+    """Why a file's text does not parse ("line N: message"), "" when it does or it is
+    not a kind checked here: Python (compiled by <py>, never run), JSON, shell (bash -n).
+    Never raises: a check that cannot run is no fault of the file."""
+    try:
+        if path.endswith(".py") and py:
+            r = subprocess.run([*py, "-I", "-c", PY_CHECK, path], input=data, capture_output=True, timeout=60)
+            if r.returncode:
+                return (r.stdout.decode("utf-8", "replace").strip().splitlines() or [""])[0]
+        elif path.endswith(".json") and not JSONC.search(path):
+            try:
+                json.loads(data)
+            except json.JSONDecodeError as e:   # deno.json, .eslintrc.json and more take comments
+                return "" if re.search(rb"(?m)(^|[\s,{\[])//|/\*", data) else f"line {e.lineno}: {e.msg}"
+        elif path.endswith((".sh", ".bash")) and not NOT_BASH.search(data):
+            r = subprocess.run([BASH, "-n"], input=data, capture_output=True, timeout=30)
+            if r.returncode:
+                err = r.stderr.decode("utf-8", "replace").strip().splitlines() or ["syntax error"]
+                return re.sub(r"^\S*bash: ", "", err[0])
+    except ValueError as e:   # NUL bytes, a bad encoding
+        return str(e)[:120]
+    except Exception:   # no bash or python, a hang, a parser that ran out of stack
+        return ""
+    return ""
+
+
+def syntax_problems(st, change):
+    """Changed files of the ticket's top branch that no longer parse, found by harness
+    itself (the verifier only reads the diff). Only errors the change brought: a file
+    whose version at the base (before a rename, its old path) did not parse either is
+    left alone. Python is judged only by a 3.12 or later. Symlinks and submodules are
+    not files to parse. QUEUE_SYNTAX_CHECK=0 turns it off."""
+    top = next((p for p in change[4] if p["repo"] == "." and p["kind"] == "branch" and p["sha"]), None)
+    if not top or not st.get("base_sha"):
+        return []
+    r = git(st["project"], "diff", "--raw", "-z", "-M", "--no-abbrev", "--no-ext-diff", st["base_sha"], top["sha"],
+            check=False, timeout=120)
+    toks, i, entries = r.stdout.split("\0") if r.returncode == 0 else [], 0, []
+    while i < len(toks):   # ":oldmode newmode oldblob newblob status" then the path, or old and new for R/C
+        meta = toks[i].split()
+        if not toks[i].startswith(":") or len(meta) < 5:
+            i += 1
+            continue
+        n = 2 if meta[4][:1] in "RC" else 1
+        entries.append((meta, toks[i + n] if i + n < len(toks) else ""))
+        i += n + 1
+    py, out = None, []
+    for meta, f in entries[:100]:
+        status, new_mode, old_blob, new_blob = meta[4][:1], meta[1], meta[2], meta[3]
+        if status == "D" or new_mode in ("120000", "160000") or not f.endswith((".py", ".json", ".sh", ".bash")):
+            continue
+        if f.endswith(".py"):
+            py = py or checking_python() or []
+            if not py:
+                continue
+        new = git_bytes(st["project"], new_blob)
+        if new is None or len(new) > SYNTAX_MAX:
+            continue
+        why = parse_error(f, new, py)
+        if not why:
+            continue
+        old = None if status == "A" or set(old_blob) <= {"0"} else git_bytes(st["project"], old_blob)
+        if old is not None and parse_error(f, old, py):
+            continue
+        out.append(f"{f}: {why} (harness parsed the committed file{'' if old is None else '; it parsed before this change'}"
+                   "): fix it")
+    return out[:10]
+
+
+def git_bytes(repo, blob):
+    """A blob's bytes (git cat-file), None when it cannot be read."""
+    try:
+        r = subprocess.run(["git", "-C", repo, "-c", "core.fsmonitor=false", "cat-file", "blob", blob],
+                           capture_output=True, timeout=60, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout if r.returncode == 0 else None
 
 
 def in_place_problems(ctx, st):
@@ -3522,6 +3717,7 @@ def cmd_run(q, a):
 def run_locked(q, a, locked_at):
     ctx = argparse.Namespace(q=q, vault=os.path.abspath(a.vault), proxy=a.proxy, harness=a.harness, host=a.host,
                              single=a.single_message, retries=a.retries, push=a.push == 1, remote=a.remote,
+                             syntax_check=a.syntax_check != 0,
                              plan_review=a.plan_review == 1, stage_timeout=a.stage_timeout, child=None, key="",
                              debug=a.debug == 1, debug_timeout=max(1, a.debug_timeout),
                              beat_lock=threading.Lock(), beating=threading.Event(), outage_wait=max(0, a.outage_wait),
@@ -3827,7 +4023,9 @@ def debug_prompt(q, st, work):
     return (f"The harness ticket queue blocked ticket {key} at its {stage} stage, saying:\n\n{st.get('reason', '')}\n\n"
             f"{where}. Its queue state is in {q.dir(key)} (state.json, log.md, the stage outputs *.out). "
             "Find out why it blocked, repair it if the cause is in the working copy's git state, and write "
-            "report.md ending in the VERDICT and HARNESS-CHANGE lines, as AGENTS.md says.")
+            "report.md as AGENTS.md says, ending in two lines of their own: `VERDICT: fixed`, "
+            "`VERDICT: harness-change-needed` or `VERDICT: needs-owner`; then `HARNESS-CHANGE: yes` or "
+            "`HARNESS-CHANGE: no`.")
 
 
 def debug_launch(ctx, st, d, work):
@@ -5170,6 +5368,7 @@ def main(argv):
     s.add_argument("--host", action="store_true")
     s.add_argument("--single-message", action="store_true")
     s.add_argument("--retries", type=int, default=1)
+    s.add_argument("--syntax-check", type=int, default=1)            # 0: changed files are not parsed
     s.add_argument("--push", type=int, default=1)
     s.add_argument("--remote", default="origin")
     s.add_argument("--plan-review", type=int, default=0)

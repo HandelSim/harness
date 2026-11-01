@@ -22,6 +22,10 @@ Your working directory is {{WHERE}}{{ON_BRANCH}}. The whole change is {{CHANGE}}
 {{DIFF}}
 <<<END_DIFF>>>
 
+<<<BEGIN_PROBLEMS_WITH_THE_LAST_ATTEMPT>>>
+{{FEEDBACK}}
+<<<END_PROBLEMS_WITH_THE_LAST_ATTEMPT>>>
+
 Check the change from each of these angles, one after the other:
 1. Acceptance criteria: is each one in the plan (with no plan, each thing the ticket asks for) really met by the code, not just mentioned? That includes every criterion tagged (edge of ACn): its GIVEN, WHEN and THEN must hold in the code. Each one that does not is a Must fix item naming it ("AC4: ...").
 2. Correctness: wrong logic, missed cases, broken error handling, a caller or test the change breaks.

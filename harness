@@ -7234,7 +7234,9 @@ test stage yet: read each branch before you merge it.
 
 Settings (.env): QUEUE_MODEL (default: the default model, its free twin when it
 is a -withtools one), QUEUE_VERIFY_MODEL (default: QUEUE_MODEL), QUEUE_RETRIES
-(1), QUEUE_REMOTE (origin), QUEUE_PUSH (1; 0 keeps the branch in the project),
+(1), QUEUE_SYNTAX_CHECK (1; 0: harness does not parse the changed .py, .json
+and .sh files after implement and fix), QUEUE_REMOTE (origin), QUEUE_PUSH (1;
+0 keeps the branch in the project),
 QUEUE_PLAN_REVIEW (0: each ticket's own choice, which by default waits for
 'harness queue approve'; 1 holds every plan, --no-plan-approval ones too),
 QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
@@ -7460,6 +7462,7 @@ HELP
                    --harness "$clone_dir/harness" --model "${QUEUE_MODEL:-}"
                    --default-model "$(_effective_default_model)" --verify-model "${QUEUE_VERIFY_MODEL:-}"
                    --retries "${QUEUE_RETRIES:-1}" --push "${QUEUE_PUSH:-1}"
+                   --syntax-check "${QUEUE_SYNTAX_CHECK:-1}"
                    --remote "${QUEUE_REMOTE:-origin}" --plan-review "${QUEUE_PLAN_REVIEW:-0}"
                    --outage-wait "${QUEUE_OUTAGE_WAIT:-21600}" --idle-min "${QUEUE_IDLE_MIN:-20}"
                    --stage-timeout "${QUEUE_STAGE_TIMEOUT:-10800}"

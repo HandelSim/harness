@@ -13,7 +13,7 @@
   ],
   "implement": [
     "This stage: IMPLEMENT the plan's Steps, one todo item each (file, function, its ACs, edge cases included).",
-    "Do NOT write or run tests in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
+    "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
     "Run it, read the output, fix what you broke. Finish only when the card's Done line holds and the build is clean."
   ],
   "review": [
@@ -23,7 +23,7 @@
   ],
   "fix": [
     "This stage: FIX the Must fix items only, one todo item each (path:line and the fix); change nothing else.",
-    "Do NOT write or run tests in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
+    "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
     "Finish only when the card's Done line holds and the build is clean."
   ]
 }

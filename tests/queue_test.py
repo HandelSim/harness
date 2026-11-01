@@ -214,6 +214,7 @@ class FakeProxy(http.server.BaseHTTPRequestHandler):
     mode = "ok"
     seen = []
     down_left = 0      # the next N requests get 502 whatever the mode
+    badquote_left = 0  # the next N "check a code change" answers quote what is not in the diff
     hang_secs = 5
 
     def log_message(self, *a):
@@ -254,6 +255,9 @@ class FakeProxy(http.server.BaseHTTPRequestHandler):
             crit = [{"n": i, "ticket_quote": "add a feature file", "ok": True, "why": "asked"} for i in nums]
         elif "check a code change" in prompt:
             quote = "hello feature" if FakeProxy.mode != "badquote" else "a line that is not there"
+            if FakeProxy.badquote_left > 0:
+                FakeProxy.badquote_left -= 1
+                quote = "a line that is not there"
             crit = [{"n": i, "met": True, "quote": quote, "why": "added"} for i in range(1, n + 1)]
         else:
             return self.reply(200, {"choices": [{"message": {"content": "OK"}}]})
@@ -316,6 +320,7 @@ class Base(unittest.TestCase):
         FakeProxy.mode = "ok"
         FakeProxy.seen = []
         FakeProxy.down_left = 0
+        FakeProxy.badquote_left = 0
         FakeProxy.hang_secs = 5
         self.pauses, tq.INFRA_RETRY_PAUSES = tq.INFRA_RETRY_PAUSES, (0, 0)
 
@@ -686,7 +691,16 @@ class QueueTest(Base):
         self.assertEqual(len(self.calls_of("implementing")), 2)
         self.assertIn("no commits on branch ABC-1", st["reason"])
         # The card counts the attempts.
-        self.assertEqual([json.loads(c)["attempt"] for c in cat(self.calls + ".card").splitlines()][-2:], [1, 2])
+        cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines()]
+        self.assertEqual([c["attempt"] for c in cards][-2:], [1, 2])
+        # The retry's card says why the last attempt failed, before the stage's own lines,
+        # within the proxy's caps (240 a line, 1000 in all); the first attempt's has only those.
+        guide = tq.stage_guidance()["implement"]
+        self.assertEqual(cards[-2]["do"], guide)
+        self.assertTrue(cards[-1]["do"][0].startswith("Why the last attempt failed: no commits on branch ABC-1"),
+                        cards[-1]["do"])
+        self.assertEqual(cards[-1]["do"][-len(guide):], guide)
+        self.assertTrue(all(len(l) <= 240 for l in cards[-1]["do"]) and sum(map(len, cards[-1]["do"])) <= 1000)
         # The retry was told what was wrong.
         log = cat(os.path.join(self.state, "ABC-1", "log.md"))
         self.assertIn("implement attempt 1 failed", log)
@@ -857,6 +871,90 @@ class QueueTest(Base):
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
         self.assertIn("quoted diff text is not in the diff", st["reason"])
+        # The verifier was asked again, told its quotes were not there, before the attempt failed.
+        asks = [p for _, _, p in FakeProxy.seen if "check a code change" in p]
+        self.assertEqual(len(asks), 2)
+        self.assertIn("not in the diff's added lines", asks[1])
+
+    def test_a_verifier_quote_slip_is_asked_again_not_charged_to_the_agent(self):
+        FakeProxy.badquote_left = 1   # its first answer misquotes; asked again, it quotes right
+        self.add("ABC-1")
+        rc, out = self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("done", "done"), out)
+        self.assertEqual(len(self.calls_of("implementing")), 1)
+        self.assertIn("asking it again", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+    def test_a_changed_file_that_no_longer_parses_fails_the_change(self):
+        os.environ["FAKE_FILE"] = "feature.json"   # the agent writes "hello feature": not JSON
+        self.add("ABC-1")
+        rc, out = self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
+        self.assertIn("feature.json: line 1", st["reason"])
+        # No verifier was asked: harness found it itself.
+        self.assertFalse([p for _, _, p in FakeProxy.seen if "check a code change" in p])
+
+    def test_the_syntax_check_can_be_turned_off(self):
+        os.environ["FAKE_FILE"] = "feature.json"
+        self.add("ABC-1")
+        rc, out = self.run_queue("--retries", "0", "--syntax-check", "0")
+        self.assertEqual(self.status()["status"], "done", out)
+
+    def test_syntax_problems_are_only_the_ones_the_change_brought(self):
+        repo = os.path.join(self.tmp, "syn")
+        sh("git", "init", "-q", "-b", "main", repo)
+        for k, v in (("user.name", "T"), ("user.email", "t@example.com")):
+            sh("git", "-C", repo, "config", k, v)
+        base_files = {"ok.py": "x = 1\n", "old_bad.py": "def (:\n", "s.sh": "echo hi\n", "d.json": "{}\n",
+                      "was_bad.json": "{,\n" * 20}
+        for f, text in base_files.items():
+            put(os.path.join(repo, f), text)
+        sh("git", "-C", repo, "add", ".")
+        sh("git", "-C", repo, "commit", "-q", "-m", "base")
+        base = sh("git", "-C", repo, "rev-parse", "HEAD").strip()
+        changed = {"ok.py": "x = (\n", "old_bad.py": "def (:\nx = 2\n", "s.sh": "if then\n", "d.json": "{,}\n",
+                   "tsconfig.json": "{ // a comment\n}\n", "n.json": "nope\n", "new.py": "def (:\n",
+                   "notes.txt": "not checked {\n", "glob.sh": "shopt -s extglob\ncase a in @(a|b)) ;; esac\n",
+                   "z.sh": "#!/bin/zsh\nif then\n", "deno.json": "{ // a comment\n}\n"}
+        for f, text in changed.items():
+            put(os.path.join(repo, f), text)
+        # renamed with the error it had before: not the change's
+        sh("git", "-C", repo, "mv", "was_bad.json", "renamed.json")
+        if os.name != "nt":   # git shows a symlink as its target's path, which is no JSON
+            os.symlink("ok.py", os.path.join(repo, "link.json"))
+        sh("git", "-C", repo, "add", ".")
+        sh("git", "-C", repo, "commit", "-q", "-m", "change")
+        head = sh("git", "-C", repo, "rev-parse", "HEAD").strip()
+        part = {"repo": ".", "kind": "branch", "branch": "ABC-1", "sha": head, "files": sorted(changed), "commits": 1}
+        got = tq.syntax_problems({"project": repo, "base_sha": base}, (head, "", sorted(changed), 1, [part]))
+        flagged = sorted(p.split(":", 1)[0] for p in got)
+        want = ["d.json", "n.json", "s.sh"] + (["new.py", "ok.py"] if tq.checking_python() else [])
+        self.assertEqual(flagged, sorted(want), got)
+        self.assertTrue(any(p.startswith("d.json: line 1") and "it parsed before this change" in p for p in got), got)
+        # an uncommitted part (in place, no branch) is not parsed
+        loose = dict(part, kind="uncommitted", sha="")
+        self.assertEqual(tq.syntax_problems({"project": repo, "base_sha": base}, (None, "", [], 0, [loose])), [])
+
+    def test_the_card_gives_a_failed_criterion_by_its_reason(self):
+        crit = "The CLI prints a summary (with counts) at the end"
+        why = "counts (all of them) never include skipped files"
+        st = {"attempt": 1, "feedback": f"- criterion 2 failed the check: {crit} ({why})\n"
+                                        "- the agent did not finish; check the work is complete and committed\n"
+                                        "- a problem\n  on two lines"}
+        do = tq.last_failure(st, [])
+        self.assertEqual(do[0], f"Why the last attempt failed: criterion 2 not met: {why} (AC: The CLI prints a "
+                                "summary (with counts)…)")
+        self.assertEqual(do[1], "Why the last attempt failed: a problem on two lines")   # the launch line left out
+        self.assertEqual(tq.failed_check("criterion 3 failed the check: x ()"), "criterion 3 failed the check: x ()")
+        long = tq.last_failure({"attempt": 1, "feedback": "- " + "word " * 80}, [])
+        self.assertTrue(len(long[0]) <= 240 and long[0].endswith("word…"), long)
+
+    def test_the_debug_prompt_says_the_verdict_lines(self):
+        text = tq.debug_prompt(tq.Queue(self.state), {"key": "ABC-1", "stage": "implement", "reason": "r"}, "")
+        for line in ("`VERDICT: fixed`", "`VERDICT: needs-owner`", "`HARNESS-CHANGE: no`"):
+            self.assertIn(line, text)
+        self.assertEqual(tq.verdict_of(text), ("needs-owner", False))   # the prompt's own words are no verdict
 
     def test_ci_change_is_refused(self):
         os.environ["FAKE_FILE"] = ".github/workflows/x.yml"
