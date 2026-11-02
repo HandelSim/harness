@@ -92,7 +92,6 @@ FORM_QUESTIONS = 6       # questions with their own answer box (the form has at 
 MAX_CRITERIA = 60        # a plan's acceptance criteria the page shows, each a card on the feedback form
 MAX_QUESTIONS = 12       # and its questions
 ITEM_MAX = 2000          # characters of a criterion's or question's text kept from state.json
-COMMENT_MAX = 1000       # characters of one comment or answer on the plan feedback form
 ITEM_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,15}$")   # AC3, Q1: a form field's name carries it
 REPO_ROWS = 50           # repositories the Add form's tree lists, the project's own first
 REPO_REFS = 200          # branch names of one repository offered as its target
@@ -389,6 +388,7 @@ pre.io { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 var(--mo
 .qs .pick.row { flex-direction: row; flex-wrap: wrap; gap: 4px 18px; }
 .qs .pick label { flex-direction: row; align-items: flex-start; gap: 8px; font-size: 14px; overflow-wrap: anywhere; }
 .qs .pick input { accent-color: var(--accent); margin: 3px 0 0; flex: none; }
+.panel textarea.line { min-height: 34px; padding: 6px 10px; }   /* a card's box: one line, it grows with its text */
 .acts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .acts form { margin: 0; display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; max-width: 100%; }
 .acts label { display: inline-flex; gap: 6px; align-items: center; }
@@ -2059,8 +2059,11 @@ def _criterion_card(c):
     pick = "".join(f"<label><input type='radio' name='ac.{i}' value='{v}'{' checked' if v == 'accept' else ''}>"
                    f"{lab}</label>" for v, lab in (("accept", "Accept"), ("reject", "Reject")))
     return (f"<div class='fb{' edge' if c['edge'] else ''}'><div class='q'>{i}{tag}</div>{src}{body}"
-            f"<div class='pick row'>{pick}</div><input name='acc.{i}' maxlength='{COMMENT_MAX}' "
-            f"aria-label='comment on {i}' placeholder='Comment (optional): what should change'></div>")
+            f"<div class='pick row'>{pick}</div><textarea class='line' rows='1' name='acc.{i}' "
+            f"aria-label='comment on {i}' placeholder='Comment (optional): what should change'></textarea></div>")
+
+
+OTHER = "other"   # a question's Something else: none of its options, the answer is in its box
 
 
 def _question_card(q):
@@ -2068,23 +2071,25 @@ def _question_card(q):
     head = f"<div class='{'q blocking' if q['blocking'] else 'q'}'>{i} {esc(q['ask'])}</div>"
     head += f"<div class='src'>Default: {esc(q['default'])}</div>" if q["default"] else ""
     if not q["options"]:
-        return (f"<div class='fb'>{head}<textarea name='qt.{i}' maxlength='{COMMENT_MAX}' aria-label='answer to {i}' "
+        return (f"<div class='fb'>{head}<textarea name='qt.{i}' aria-label='answer to {i}' "
                 "placeholder='Your answer (leave empty to go with its default)'></textarea></div>")
     pick = _default_pick(q)
     opts = [(str(n), f"({chr(97 + n)}) {esc(o)}", n == pick) for n, o in enumerate(q["options"])]
     if pick is None:   # the default is none of the options: its own choice, and the one taken
         opts.append(("", "No pick: go with its default", True))
+    opts.append((OTHER, "Something else: say what in the box below", False))   # none of them fits
     radios = "".join(f"<label><input type='radio' name='q.{i}' value='{v}'{' checked' if on else ''}>"
                      f"<span>{lab}</span></label>" for v, lab, on in opts)
-    return (f"<div class='fb'>{head}<div class='pick'>{radios}</div><input name='qt.{i}' maxlength='{COMMENT_MAX}' "
-            f"aria-label='other answer or comment on {i}' placeholder='Other / comment (optional)'></div>")
+    return (f"<div class='fb'>{head}<div class='pick'>{radios}</div><textarea class='line' rows='1' name='qt.{i}' "
+            f"aria-label='your answer or comment on {i}' placeholder='Comment (optional), or your own answer with "
+            "Something else'></textarea></div>")
 
 
 def _assumption_card(a):
     i = esc(a["id"])
     return (f"<div class='fb'><div class='q'>{i}</div><div class='txt'>{esc(a['text'])}</div>"
-            f"<input name='as.{i}' maxlength='{COMMENT_MAX}' aria-label='correction to {i}' "
-            "placeholder='Correction (optional): what is true instead'></div>")
+            f"<textarea class='line' rows='1' name='as.{i}' aria-label='correction to {i}' "
+            "placeholder='Correction (optional): what is true instead'></textarea></div>")
 
 
 def _feedback_form(key, st):
@@ -2106,8 +2111,7 @@ def _feedback_form(key, st):
     if st.get("assumptions"):
         parts.append("<h3>Assumptions</h3><div class='muted'>What the planner took as given. Correct any that is "
                      "wrong.</div>" + "".join(_assumption_card(a) for a in st["assumptions"]))
-    parts.append(f"<label><div class='q'>Other notes</div><textarea name='note' maxlength='{NOTE_MAX}'></textarea>"
-                 "</label>")
+    parts.append("<label><div class='q'>Other notes</div><textarea name='note'></textarea></label>")
     if review:   # the same form: approve refuses what it would drop (a rejection, a comment, an answer)
         other = (f"<button type='submit' formaction='{base}approve' title='the next stage starts when the queue run "
                  "gets to this ticket'>Approve the plan</button>")
@@ -2880,12 +2884,8 @@ def plan_feedback(form, st):
         return _one(form, name).replace("\r\n", "\n").strip()
     fb = {"rejected": [], "changed": [], "accepted": [], "answers": [], "defaults": [], "assumed": [],
           "note": one("note")}
-    if len(fb["note"]) > NOTE_MAX:
-        return f"the notes are over {NOTE_MAX} characters"
     for c in st.get("criteria") or []:
         why = one("acc." + c["id"])
-        if len(why) > COMMENT_MAX:
-            return f"the comment on {c['id']} is over {COMMENT_MAX} characters"
         if one("ac." + c["id"]) == "reject":
             fb["rejected"].append((c, why))
         elif why:   # accepted, with a change asked for
@@ -2894,8 +2894,11 @@ def plan_feedback(form, st):
             fb["accepted"].append(c["id"])
     for q in st.get("questions") or []:
         text, pick = one("qt." + q["id"]), one("q." + q["id"])
-        if len(text) > COMMENT_MAX:
-            return f"the answer to {q['id']} is over {COMMENT_MAX} characters"
+        if pick == OTHER and q["options"]:   # none of the options: what is in its box is the answer
+            if not text:
+                return f"{q['id']}: you chose Something else, so say what in its box"
+            fb["answers"].append((q, OTHER, text))
+            continue
         pick = int(pick) if re.match(r"^[0-7]$", pick) and int(pick) < len(q["options"]) else None
         if pick is not None and pick == _default_pick(q) and not text:
             pick = None
@@ -2905,8 +2908,6 @@ def plan_feedback(form, st):
             fb["defaults"].append(q["id"])
     for x in st.get("assumptions") or []:
         why = one("as." + x["id"])
-        if len(why) > COMMENT_MAX:
-            return f"the correction to {x['id']} is over {COMMENT_MAX} characters"
         if why:
             fb["assumed"].append((x, why))
     return fb
@@ -2922,6 +2923,9 @@ def feedback_text(fb, sig):
             for c, why in fb["rejected"]]
     out += [f"- {c['id']}: {line(why)} (it read: \"{line(c['text'])[:160]}\")" for c, why in fb["changed"]]
     for q, pick, text in fb["answers"]:
+        if pick == OTHER:
+            out.append(f"- {q['id']}: none of the options - {line(text)}")
+            continue
         said = [f"({chr(97 + pick)}) {line(q['options'][pick])}"] if pick is not None else []
         out.append(f"- {q['id']}: " + " - ".join(said + ([line(text)] if text else [])))
     out += [f"- {x['id']}: wrong - {line(why)} (it read: \"{line(x['text'])[:160]}\")"
@@ -3627,6 +3631,11 @@ COMMON_JS = """
   window.growText = grow;
   document.addEventListener('input', function (e) { if (e.target.tagName === 'TEXTAREA') grow(e.target); });
   document.querySelectorAll('textarea').forEach(function (t) { if (t.value) grow(t); });
+  // A plan question's Something else: its box is where the answer goes.
+  document.addEventListener('change', function (e) {
+    var t = e.target, card = t.closest && t.closest('.fb');
+    if (t.type === 'radio' && t.value === 'other' && card && card.querySelector('textarea')) card.querySelector('textarea').focus();
+  });
   // Back to a page the browser kept: its buttons are not still busy.
   window.addEventListener('pageshow', function () {
     document.querySelectorAll('[data-busy]').forEach(function (b) { b.disabled = false; b.removeAttribute('data-busy'); });

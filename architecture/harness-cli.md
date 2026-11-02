@@ -2126,6 +2126,11 @@ offered as suggestions. It is taken as pasted: quotes
   names, from `ticket_queue.plan_items`), the whole plan folded under it;
   the feedback form folds the edge-case criteria (still posted) and has a
   correction box per assumption (`as.An`, sent as "- An: wrong - ..."). A
+  question with options also offers Something else (`q.Qn=other`, sent as
+  "- Qn: none of the options - <its box>"; an empty box is refused); every
+  card keeps its comment box whatever is picked. The boxes are textareas
+  that grow with their text, with no length limit but the form's
+  (`MAX_TICKET_FORM`, 4 MiB). A
   `done` ticket has a follow-up form (`followup` action, refused with the
   queue's own `followup_refused` reason), and a ticket that went round again
   lists its rounds (each one's commits, diffstat, push result, follow-up

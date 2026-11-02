@@ -549,7 +549,11 @@ class RunsTest(RunsServer):
         self.assertIn("name='q.Q1' value='0'><span>(a) postgres</span>", body)
         self.assertIn("name='q.Q1' value='1' checked><span>(b) sqlite &lt;3&gt;</span>", body)
         self.assertIn("name='q.Q3' value='' checked><span>No pick: go with its default</span>", body)
-        self.assertIn("<input name='qt.Q1' maxlength='1000'", body)
+        # always a way out of the options, and a box for a comment whatever is picked; no length limit
+        self.assertIn("name='q.Q1' value='other'><span>Something else: say what in the box below</span>", body)
+        self.assertIn("name='q.Q3' value='other'><span>Something else", body)
+        self.assertIn("<textarea class='line' rows='1' name='qt.Q1'", body)
+        self.assertNotIn("name='q.Q2' value='other'", body)   # no options: its box is the answer
         self.assertIn("<textarea name='qt.Q2'", body)   # no options: a box
         # the criteria: given/when/then, where it comes from, accepted unless rejected
         self.assertIn("<dt>Given</dt><dd>a log</dd><dt>When</dt><dd>parsed</dd><dt>Then</dt>"
@@ -560,7 +564,9 @@ class RunsTest(RunsServer):
         self.assertNotIn("<script>alert(1)", body)
         self.assertIn("name='ac.AC1' value='accept' checked>Accept</label>", body)
         self.assertIn("name='ac.AC1' value='reject'>Reject</label>", body)
-        self.assertIn("<input name='acc.AC5' maxlength='1000'", body)
+        self.assertIn("<textarea class='line' rows='1' name='acc.AC5'", body)
+        form = body[body.index("id='planfb'"):]
+        self.assertNotIn("maxlength", form[:form.index("</form>")])
         self.assertIn("Go with the defaults", body)
         self.assertNotIn("formaction=", body)
         self.assertNotIn("name='q0'", body)   # not the older form
@@ -624,9 +630,18 @@ class RunsTest(RunsServer):
             self.assertEqual(args[-1], "--go")
             self.assertTrue(text.endswith("- AC1, AC2, AC3, AC5: accepted\nAny question not answered here: go with "
                                           "its default."))
-            r, body = self.act("answer", [sig, ("acc.AC3", "x" * 1001)])
+            # Something else: the box is the answer, and it may be long
+            long = "use the queue's own store. " * 400
+            r, body = self.act("answer", [sig, ("q.Q1", "other"), ("qt.Q1", long), ("acc.AC3", "y" * 5000),
+                                          ("note", "z" * 9000)])
+            self.assertEqual(r.status, 303, body)
+            text = calls.pop()[1]
+            self.assertIn("- Q1: none of the options - " + long.strip() + "\n", text)
+            self.assertIn("- AC3: " + "y" * 5000 + " (it read:", text)
+            self.assertIn("Other notes: " + "z" * 9000, text)
+            r, body = self.act("answer", [sig, ("q.Q1", "other"), ("qt.Q1", " ")])
             self.assertEqual(r.status, 409)
-            self.assertIn("the comment on AC3 is over 1000 characters", body)
+            self.assertIn("Q1: you chose Something else, so say what in its box", body)
             # made again since the page was loaded: nothing is sent
             r, body = self.act("answer", [("sig", "0ld0"), ("ac.AC1", "reject")])
             self.assertEqual(r.status, 409)
@@ -673,7 +688,7 @@ class RunsTest(RunsServer):
         self.assertIn("<details class='edges'><summary>Edge cases <span class='muted'>1: accepted unless", body)
         self.assertLess(body.index("<details class='edges'>"), body.index("<div class='fb edge'>"))
         self.assertIn("<h3>Assumptions</h3>", body)
-        self.assertIn("<div class='txt'>logs are &lt;utf-8&gt;</div><input name='as.A1'", body)
+        self.assertIn("<div class='txt'>logs are &lt;utf-8&gt;</div><textarea class='line' rows='1' name='as.A1'", body)
 
     def test_a_wrong_assumption_goes_to_the_planner(self):
         self.ticket(**PLAN_ITEMS, assumptions=[{"id": "A1", "text": "logs are utf-8"}])

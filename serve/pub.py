@@ -61,8 +61,9 @@ RUNS_CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{n
             "img-src 'self'; form-action 'self'; frame-ancestors 'none'")
 MAX_SEND_FORM = 3 * runs_view.MAX_MESSAGE + 1024   # urlencoded, so up to 3 bytes a byte
 # A ticket's forms: the plan feedback form has a verdict and a comment per criterion and
-# question (60 and 12, comments of 1000 characters) and a 4000-character note
-MAX_TICKET_FORM = 256 * 1024
+# question (60 and 12) and a note, none of them limited but by this (urlencoded: up to 3
+# bytes a byte)
+MAX_TICKET_FORM = 4 * 1024 * 1024
 TICKET_FIELDS = 200
 TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
@@ -1344,7 +1345,8 @@ def make_handler(cfg):
             except ValueError:
                 form = None
             if form is None:
-                self.send(413, b"answers too large\n")
+                self.send(413, f"what you sent is over {MAX_TICKET_FORM // (1024 * 1024)} MiB in all: shorten it "
+                               "(Back keeps what you typed)\n".encode())
                 return
             ok, msg = runs_view.ticket_action(cfg.runs, key, action, form)
             sys.stderr.write(f"[pub] {action} {key} from {user or 'local'}: {msg}\n")
