@@ -300,11 +300,21 @@ def _wikilinks(md):
     md.renderer.register("wikilink", lambda renderer, raw: renderer.wikilink(raw))
 
 
+def _math(md):
+    """LaTeX math ($\\approx S_{A1}$) shown as a person reads it, not as its markup (runs.MATH_RE)."""
+    def parse(inline, m, state):
+        state.append_token({"type": "math", "attrs": {"raw": m.group(0)}})
+        return m.end()
+    md.inline.register("math", runs_view.MATH_RE, parse, before="escape")
+    md.renderer.register("math", lambda renderer, raw: runs_view.tex_html(raw))
+
+
 def render_markdown(vault, rel, text):
     """A page's body as HTML: raw HTML escaped, generated markers dropped, callouts styled."""
     body = COMMENT_LINE.sub("", text)
     md = mistune.create_markdown(renderer=_Renderer(vault, rel),
-                                 plugins=["table", "strikethrough", "footnotes", "task_lists", "url", _wikilinks])
+                                 plugins=["table", "strikethrough", "footnotes", "task_lists", "url", _wikilinks,
+                                          _math])
     out = md(body)
 
     def callout(m):

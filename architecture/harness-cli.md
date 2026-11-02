@@ -1972,7 +1972,10 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   server by the vendored mistune 3.3.4 (`serve/vendor/`, BSD-3, raw HTML
   escaped, `javascript:` links dropped) with Obsidian `[[wikilinks]]`
   (full path, else the shortest file of that name; missing ones dimmed),
-  `![[embeds]]` of images, `> [!callouts]`, relative links mapped into the
+  `![[embeds]]` of images, `> [!callouts]`, LaTeX math (`$...$`, `$$...$$`,
+  `\(...\)` with a `\ _ ^ {` in it) shown as plain text with Unicode
+  symbols and sub/superscripts (`runs.tex_html`; no script, so "$5 and
+  $10" and shell `$VARS` stay as written), relative links mapped into the
   browser, front matter as Properties and HTML comment lines (unit markers)
   dropped; other text as is; per-file history (`git log --follow`). Paths
   are confined to the vault by realpath (no `..`, no `.git`), and files
@@ -2128,7 +2131,8 @@ offered as suggestions. It is taken as pasted: quotes
   correction box per assumption (`as.An`, sent as "- An: wrong - ..."). A
   question with options also offers Something else (`q.Qn=other`, sent as
   "- Qn: none of the options - <its box>"; an empty box is refused); every
-  card keeps its comment box whatever is picked. The boxes are textareas
+  card keeps its comment box whatever is picked. The cards show any LaTeX
+  math the planner wrote readably (`runs.esc_math`). The boxes are textareas
   that grow with their text, with no length limit but the form's
   (`MAX_TICKET_FORM`, 4 MiB). A
   `done` ticket has a follow-up form (`followup` action, refused with the

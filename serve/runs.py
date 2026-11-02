@@ -116,6 +116,110 @@ PRESET_LABELS = (("full", "Full", "plan, implement, review, fix, push"),
 MOVES = ("up", "down", "top", "bottom")
 
 esc = html.escape
+
+# LaTeX math, as a model writes it out of habit ($\approx S_{A1} \times D_{A1}$), shown as a person
+# reads it (≈ S<sub>A1</sub> × D<sub>A1</sub>). Only a span with a LaTeX mark in it (\ _ ^ {) is math,
+# and an inline $ span starts and ends at a non-space, its closing $ before no word, so "$5 and $10",
+# "$HOME" and "$SRC_DIR/$NAME" stay as written.
+MATH_RE = (r"\$\$(?=[^$]{0,600}?[\\_^{])[^$]{1,600}?\$\$"
+           r"|\\\(.{1,300}?\\\)"
+           r"|(?<![\w$\\])\$(?=[^\s$])(?=[^$\n]{0,300}?[\\_^{])[^$\n]{1,300}?(?<=\S)\$(?![\w{(])")
+_MATH = re.compile(MATH_RE)
+TEX_SYMBOLS = {
+    "approx": "≈", "sim": "~", "simeq": "≃", "times": "×", "cdot": "·", "div": "÷", "pm": "±", "mp": "∓",
+    "le": "≤", "leq": "≤", "ge": "≥", "geq": "≥", "ll": "≪", "gg": "≫", "neq": "≠", "ne": "≠", "equiv": "≡",
+    "lt": "<", "gt": ">", "to": "→", "rightarrow": "→", "leftarrow": "←", "Rightarrow": "⇒", "implies": "⇒",
+    "Leftarrow": "⇐", "leftrightarrow": "↔", "iff": "⇔", "mapsto": "↦", "infty": "∞", "sum": "Σ", "prod": "Π",
+    "int": "∫", "partial": "∂", "nabla": "∇", "in": "∈", "notin": "∉", "subset": "⊂", "subseteq": "⊆",
+    "cup": "∪", "cap": "∩", "emptyset": "∅", "forall": "∀", "exists": "∃", "neg": "¬", "land": "∧", "lor": "∨",
+    "wedge": "∧", "vee": "∨", "ldots": "…", "cdots": "⋯", "dots": "…", "prime": "′", "circ": "∘", "deg": "°",
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "varepsilon": "ε", "zeta": "ζ",
+    "eta": "η", "theta": "θ", "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ",
+    "pi": "π", "rho": "ρ", "sigma": "σ", "tau": "τ", "phi": "φ", "varphi": "φ", "chi": "χ", "psi": "ψ",
+    "omega": "ω", "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Pi": "Π", "Sigma": "Σ",
+    "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω", "quad": " ", "qquad": " ", "%": "%", "$": "$", "&": "&", "#": "#",
+    "_": "_", "{": "{", "}": "}", ",": " ", ";": " ", ":": " ", " ": " ", "!": "", "\\": " ",
+    "left": "", "right": "", "big": "", "Big": "", "bigl": "", "bigr": "", "displaystyle": "",
+}
+TEX_TEXT = {"text", "textrm", "textbf", "textit", "texttt", "mathrm", "mathbf", "mathit", "mathtt", "mathsf",
+            "mathcal", "mathbb", "operatorname", "boldsymbol"}
+
+
+def _tex_arg(s, i):
+    """The argument at s[i]: a {group}'s content, a \\command, or one character; and where it ends."""
+    while i < len(s) and s[i] == " ":
+        i += 1
+    if i >= len(s):
+        return "", i
+    if s[i] == "{":
+        depth, j = 0, i
+        while j < len(s):
+            depth += {"{": 1, "}": -1}.get(s[j], 0)
+            if depth == 0:
+                return s[i + 1:j], j + 1
+            j += 1 + (s[j] == "\\")
+        return s[i + 1:], len(s)
+    if s[i] == "\\":
+        m = re.match(r"\\([A-Za-z]+|.)", s[i:])
+        return m.group(0), i + m.end()
+    return s[i], i + 1
+
+
+def _tex(s, depth=0):
+    """One math span's LaTeX as escaped HTML a person reads."""
+    if depth > 20:   # a span nested this deep is not math anyone wrote: as it is
+        return esc(s)
+    out, i = [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            m = re.match(r"\\([A-Za-z]+|.?)", s[i:])
+            name, i = m.group(1), i + m.end()
+            if name in TEX_TEXT:
+                arg, i = _tex_arg(s, i)
+                out.append(esc(arg))
+            elif name in ("frac", "dfrac", "tfrac"):
+                a, i = _tex_arg(s, i)
+                b, i = _tex_arg(s, i)
+                out.append(f"{_tex_wrap(_tex(a, depth + 1))}/{_tex_wrap(_tex(b, depth + 1))}")
+            elif name == "sqrt":
+                a, i = _tex_arg(s, i)
+                out.append("√" + _tex_wrap(_tex(a, depth + 1)))
+            elif name in TEX_SYMBOLS:
+                out.append(TEX_SYMBOLS[name])
+            else:   # a command it does not know: its name, without the backslash
+                out.append(esc(name))
+        elif c in "_^":
+            a, i = _tex_arg(s, i + 1)
+            tag = "sub" if c == "_" else "sup"
+            out.append(f"<{tag}>{_tex(a, depth + 1)}</{tag}>")
+        elif c == "{":
+            a, i = _tex_arg(s, i)
+            out.append(_tex(a, depth + 1))
+        else:
+            out.append(" " if c == "~" else "" if c == "}" else esc(c))
+            i += 1
+    return re.sub(r" {2,}", " ", "".join(out))
+
+
+def _tex_wrap(h):
+    """A fraction's or root's part, in brackets unless it is one plain word or number."""
+    return h if re.fullmatch(r"[\w.]+", h) else f"({h})"
+
+
+def tex_html(span):
+    """A math span with its delimiters ($...$, $$...$$, \\(...\\)) as readable HTML."""
+    cut = 1 if span[0] == "$" and span[1] != "$" else 2
+    return _tex(span[cut:-cut]).strip()
+
+
+def esc_math(text):
+    """text escaped for HTML, with any LaTeX math in it shown readably (see MATH_RE)."""
+    out, pos = [], 0
+    for m in _MATH.finditer(text):
+        out += [esc(text[pos:m.start()]), tex_html(m.group(0))]
+        pos = m.end()
+    return "".join(out) + esc(text[pos:])
 _TQ = []   # scripts/ticket_queue.py as a module, loaded on first use; [None] when it cannot be
 
 
@@ -2006,7 +2110,7 @@ def _answer_form(key, qs, review=False):
     parts = [f"<form method='post' action='/runs/ticket/{quote(key)}/answer' class='qs'>"]
     for i, q in enumerate(qs[:FORM_QUESTIONS]):
         cls = "q blocking" if q.get("blocking") else "q"
-        parts.append(f"<label><div class='{cls}'>{esc(q['text'])}</div>"
+        parts.append(f"<label><div class='{cls}'>{esc_math(q['text'])}</div>"
                      f"<input type='hidden' name='q{i}' value='{esc(q['text'])}'>"
                      f"<textarea name='a{i}' placeholder='Your answer (leave empty to go with its default)'>"
                      "</textarea></label>")
@@ -2052,10 +2156,10 @@ def _criterion_card(c):
     i = esc(c["id"])
     tag, src = _source(c["source"])
     if c["given"] or c["when"] or c["then"]:
-        body = "<dl class='gwt'>" + "".join(f"<dt>{w}</dt><dd>{esc(c[w.lower()])}</dd>"
+        body = "<dl class='gwt'>" + "".join(f"<dt>{w}</dt><dd>{esc_math(c[w.lower()])}</dd>"
                                             for w in ("Given", "When", "Then")) + "</dl>"
     else:   # not written as GIVEN ... WHEN ... THEN (an older plan): as it is
-        body = f"<div class='txt'>{esc(c['text'])}</div>"
+        body = f"<div class='txt'>{esc_math(c['text'])}</div>"
     pick = "".join(f"<label><input type='radio' name='ac.{i}' value='{v}'{' checked' if v == 'accept' else ''}>"
                    f"{lab}</label>" for v, lab in (("accept", "Accept"), ("reject", "Reject")))
     return (f"<div class='fb{' edge' if c['edge'] else ''}'><div class='q'>{i}{tag}</div>{src}{body}"
@@ -2068,13 +2172,13 @@ OTHER = "other"   # a question's Something else: none of its options, the answer
 
 def _question_card(q):
     i = esc(q["id"])
-    head = f"<div class='{'q blocking' if q['blocking'] else 'q'}'>{i} {esc(q['ask'])}</div>"
-    head += f"<div class='src'>Default: {esc(q['default'])}</div>" if q["default"] else ""
+    head = f"<div class='{'q blocking' if q['blocking'] else 'q'}'>{i} {esc_math(q['ask'])}</div>"
+    head += f"<div class='src'>Default: {esc_math(q['default'])}</div>" if q["default"] else ""
     if not q["options"]:
         return (f"<div class='fb'>{head}<textarea name='qt.{i}' aria-label='answer to {i}' "
                 "placeholder='Your answer (leave empty to go with its default)'></textarea></div>")
     pick = _default_pick(q)
-    opts = [(str(n), f"({chr(97 + n)}) {esc(o)}", n == pick) for n, o in enumerate(q["options"])]
+    opts = [(str(n), f"({chr(97 + n)}) {esc_math(o)}", n == pick) for n, o in enumerate(q["options"])]
     if pick is None:   # the default is none of the options: its own choice, and the one taken
         opts.append(("", "No pick: go with its default", True))
     opts.append((OTHER, "Something else: say what in the box below", False))   # none of them fits
@@ -2087,7 +2191,7 @@ def _question_card(q):
 
 def _assumption_card(a):
     i = esc(a["id"])
-    return (f"<div class='fb'><div class='q'>{i}</div><div class='txt'>{esc(a['text'])}</div>"
+    return (f"<div class='fb'><div class='q'>{i}</div><div class='txt'>{esc_math(a['text'])}</div>"
             f"<textarea class='line' rows='1' name='as.{i}' aria-label='correction to {i}' "
             "placeholder='Correction (optional): what is true instead'></textarea></div>")
 

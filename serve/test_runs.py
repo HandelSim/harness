@@ -536,6 +536,26 @@ class RunsTest(RunsServer):
         st = runs.Runs([("host", self.data)], queue_dir=self.queue).ticket_state("ABC-12")
         self.assertEqual((len(st["criteria"]), len(st["criteria"][0]["text"])), (runs.MAX_CRITERIA, runs.ITEM_MAX))
 
+    def test_the_plan_cards_show_latex_math_as_a_person_reads_it(self):
+        math = {"id": "AC9", "text": r"AC9: the cost is $\approx S_{A1} \times D_{A1}$", "given": r"$n \le 3$",
+                "when": "it runs on $5 and $10", "then": r"the cost is $\approx S_{A1} \times D_{A1}$",
+                "source": "", "edge": False}
+        items = dict(PLAN_ITEMS, criteria=[math], questions=[
+            {"id": "Q1", "text": "Q1", "ask": r"Keep $T_{max}$?", "blocking": False,
+             "options": [r"$\frac{n}{2}$", "no"], "default": r"(a), since $\alpha \geq 1$"}],
+            assumptions=[{"id": "A1", "text": r"<b> and $x^{2}$ in $HOME"}])
+        self.ticket(**items)
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertEqual(r.status, 200)
+        self.assertIn("<dt>Given</dt><dd>n ≤ 3</dd><dt>When</dt><dd>it runs on $5 and $10</dd><dt>Then</dt>"
+                      "<dd>the cost is ≈ S<sub>A1</sub> × D<sub>A1</sub></dd>", body)
+        self.assertIn("Q1 Keep T<sub>max</sub>?</div>", body)
+        self.assertIn("<span>(a) n/2</span>", body)
+        self.assertIn("Default: (a), since α ≥ 1</div>", body)
+        self.assertIn("&lt;b&gt; and x<sup>2</sup> in $HOME", body)
+        self.assertNotIn(r"\approx", body)
+
     def test_the_plan_feedback_form_has_a_card_per_item(self):
         self.ticket(**PLAN_ITEMS)
         self.start()
@@ -2185,6 +2205,42 @@ class DiffPageTest(RunsServer):
         self.assertIn("+work", self.shown(body))   # what push fetched into the project
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
         self.assertIn("the separate copy is gone", body)
+
+
+class MathTest(unittest.TestCase):
+    """LaTeX math a model writes ($\approx S_{A1}$) shown as a person reads it; money and shell vars as they are."""
+
+    def test_math_reads_as_text(self):
+        for tex, want in [
+                (r"$\approx S_{A1} \times D_{A1}$", "≈ S<sub>A1</sub> × D<sub>A1</sub>"),
+                (r"$x \le \frac{n}{2}$ and $\sqrt{a+b}$", "x ≤ n/2 and √(a+b)"),
+                (r"$\frac{a+1}{b}$", "(a+1)/b"),
+                (r"\(O(n^2)\)", "O(n<sup>2</sup>)"),
+                (r"$$T_{total} = \sum_i t_i$$", "T<sub>total</sub> = Σ<sub>i</sub> t<sub>i</sub>"),
+                (r"$\text{rate}_{\max} \geq 3\%$", "rate<sub>max</sub> ≥ 3%"),
+                (r"($x_1$).", "(x<sub>1</sub>)."),
+                (r"$\unknown_{<b>}$", "unknown<sub>&lt;b&gt;</sub>"),   # escaped, inside math too
+                ("a <b> $x_1$", "a &lt;b&gt; x<sub>1</sub>")]:
+            self.assertEqual(runs.esc_math(tex), want, tex)
+
+    def test_what_is_not_math_stays_as_written(self):
+        for text in ["costs $5 and $10", "echo $HOME", "$HARNESS_HOME/$TASK exists", "cp $SRC_DIR/a $DST",
+                     "$5-$10", "a$b_c$", "$x$ alone", "", r"a \ b_c {d}"]:
+            self.assertEqual(runs.esc_math(text), runs.esc(text), text)
+
+    def test_deep_or_broken_math_does_not_fail(self):
+        self.assertTrue(runs.esc_math("$" + "{" * 200 + "x_1" + "}" * 200 + "$"))
+        self.assertEqual(runs.esc_math(r"$a_{b$"), "a<sub>b</sub>")
+        self.assertEqual(runs.esc_math("$a_$"), "a<sub></sub>")
+
+    def test_markdown_shows_math_but_not_in_code(self):
+        import vault_view
+        out = vault_view.render_markdown(tempfile.gettempdir(), "x.md",
+                                         "Cost $\\approx S_{A1} \\times D_{A1}$, $5 and $10, `$x_1$`, *em*\n\n"
+                                         "$$\nT = \\frac{a}{b}\n$$\n")
+        self.assertIn("<p>Cost ≈ S<sub>A1</sub> × D<sub>A1</sub>, $5 and $10, <code>$x_1$</code>, <em>em</em></p>",
+                      out)
+        self.assertIn("<p>T = a/b</p>", out)
 
 
 class BackgroundTest(unittest.TestCase):
