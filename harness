@@ -7062,11 +7062,16 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             --take-defaults (to change the rest,
                                             remove it and add it again). Not while
                                             it runs: stop it first
-       harness queue run [--host] [--single-message] [--parallel N]
+       harness queue run [--host] [--single-message] [--parallel N] [--once]
                                             work through the queue, one ticket at a time
                                             (--parallel N, or QUEUE_PARALLEL: N at a
                                             time; tickets of the same project folder
-                                            take turns)
+                                            take turns). With nothing to do it keeps
+                                            watching and starts a ticket as soon as one
+                                            is queued, answered, approved or retried,
+                                            until halt or Ctrl-C (--once, or
+                                            QUEUE_WATCH=0: it ends when nothing is
+                                            left to do)
        harness queue answer KEY ["TEXT"] [--go]
                                             answer the plan's questions or give
                                             feedback on it (opens $EDITOR without
@@ -7255,7 +7260,9 @@ QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
 0 turns the idle watchdog off), QUEUE_STAGE_TIMEOUT (10800 s; one agent
 launch at most), QUEUE_PARALLEL (1; tickets a run works at a time,
 the same as run --parallel N), QUEUE_DEBUG (1; 0 turns the debug agent off),
-QUEUE_DEBUG_TIMEOUT (1200 s; one debug agent at most).
+QUEUE_DEBUG_TIMEOUT (1200 s; one debug agent at most), QUEUE_WATCH (1: a run
+with nothing to do keeps watching the queue until halt or Ctrl-C; 0 ends it
+when nothing is left to do, the same as run --once).
 HELP
             return 0 ;;
         watch)
@@ -7425,7 +7432,7 @@ HELP
                 args+=(findings --vault "$vault")
             fi ;;
         run)
-            local host=0 single=0 started=0 rc=0 a dir parallel="${QUEUE_PARALLEL:-1}" i=1
+            local host=0 single=0 started=0 rc=0 a dir parallel="${QUEUE_PARALLEL:-1}" i=1 watch="${QUEUE_WATCH:-1}"
             while (( i <= $# )); do
                 a="${!i}"
                 case "$a" in
@@ -7433,11 +7440,13 @@ HELP
                     --single-message) single=1 host=1 ;;
                     --parallel) i=$((i + 1)); parallel="${!i:-}" ;;
                     --parallel=*) parallel="${a#--parallel=}" ;;
+                    --once) watch=0 ;;
                     *) err "unknown option '$a' (see: harness queue --help)"; return 1 ;;
                 esac
                 i=$((i + 1))
             done
             [[ "$parallel" =~ ^[1-9][0-9]*$ ]] || { err "--parallel / QUEUE_PARALLEL must be a whole number of tickets at a time, 1 or more (got '$parallel')"; return 1; }
+            [[ "$watch" == [01] ]] || { err "QUEUE_WATCH must be 1 (keep watching the queue) or 0 (end when nothing is left to do), got '$watch'"; return 1; }
             [[ -n "$vault" ]] || { err "harness queue run needs an active vault: tickets, plans and findings live there. Make one with: harness vault new <name> (or pick one: harness vault use <name>)"; return 1; }
             harness_runtime_installed || host=1
             host_require_config
@@ -7484,7 +7493,7 @@ HELP
                    --watch "$(agent_home_dir)/.local/share/opencode/opencode.db")
             (( host )) && args+=(--host)
             (( single )) && args+=(--single-message)
-            args+=(--parallel "$parallel")
+            args+=(--parallel "$parallel" --watch-queue "$watch")
             # Tickets at a time in containers: the stack up before the first
             # stages launch together, so they do not each start it (a start
             # takes the stack down first, under the other's agent). The agent

@@ -1165,6 +1165,8 @@ class Runs:
             pass
         out = {k: info[k] for k in ("model", "ticket", "stage", "step", "started") if isinstance(info.get(k), str)}
         out.update(host=info.get("host") is True, single=info.get("single") is True)
+        # "watch": a run that waits for work when it has none (QUEUE_WATCH); None: a run.json older than that
+        out["watch"] = info.get("watch") if isinstance(info.get("watch"), bool) else None
         beat = info.get("beat")
         out["beat"] = beat if isinstance(beat, (int, float)) and not isinstance(beat, bool) else 0
         out["pid"] = info.get("pid") if isinstance(info.get("pid"), int) else 0
@@ -1216,21 +1218,23 @@ class Runs:
     def resume_runner(self):
         """At serve's start: a queue run that died without ending (the machine went
         down: its run.json is left, with no beat) starts again as it was, its mode and
-        parallel slots, and picks its tickets up where they were. A run that ended
-        (done, halted, Ctrl-C) took its run.json away. QUEUE_AUTORESUME=0: never.
-        Returns (ok, message), or None when there is nothing to start again."""
+        parallel slots, and picks its tickets up where they were (a run --once: once
+        again). A run that ended (done, halted, Ctrl-C) took its run.json away.
+        QUEUE_AUTORESUME=0: never. Returns (ok, message), or None when there is
+        nothing to start again."""
         if os.environ.get("QUEUE_AUTORESUME", "1").strip() == "0" or not self.queue_dir:
             return None
         r = self.runner()
         if r["running"] or not r["beat"] or r["starting"]:
             return None
         return self.start_runner("single" if r["single"] else "host" if r["host"] else "container",
-                                 parallel=r["parallel"], why="started again: the last run ended with the machine")
+                                 parallel=r["parallel"], once=r["watch"] is False,
+                                 why="started again: the last run ended with the machine")
 
-    def start_runner(self, mode, parallel=0, why="started from the queue page"):
+    def start_runner(self, mode, parallel=0, why="started from the queue page", once=False):
         """Start `harness queue run` in the background, as its own process group with
-        no terminal. mode: container, host or single (single-message host mode).
-        Returns (ok, message)."""
+        no terminal. mode: container, host or single (single-message host mode);
+        once: --once, a run that ends when nothing is left to do. Returns (ok, message)."""
         if mode not in ("container", "host", "single"):
             return False, "pick container, host or single-message mode"
         if not self.queue_dir:
@@ -1253,6 +1257,8 @@ class Runs:
                 argv.append("--single-message")   # harness takes it for host mode too
             if parallel > 1:
                 argv += ["--parallel", str(parallel)]
+            if once:
+                argv.append("--once")
             env = dict(os.environ)
             env["HARNESS_OPEN"] = "0"             # no browser tab: the owner is on this page
             if mode != "container":
@@ -1538,7 +1544,7 @@ def nav(runs, active="", tabs=TABS):
         if r["running"]:
             what = ", ".join(f"<span title='{esc(o['step'])}'>{esc(o['ticket'])} &middot; {esc(o['stage'])}</span>"
                              if o["step"] else f"{esc(o['ticket'])} &middot; {esc(o['stage'])}"
-                             for o in r["on"]) or "between tickets"
+                             for o in r["on"]) or _no_ticket(r)
             label = "halting" if r["halting"] else "running"
             chip = (f"<a class='runchip' href='/runs/queue' title='the queue run'><span class='sdot run'></span>"
                     f"<span class='rtxt'>{label} <b>{what}</b></span></a>")
@@ -1829,6 +1835,15 @@ def _ticket_row(runs, key, st, i, n, now):
             f"<div class='ra'>{''.join(acts)}</div></div>")
 
 
+WATCHING = ("No ticket to work on, so no agent runs; the run watches the queue and starts a ticket as soon as one "
+            "is queued, answered, approved or retried. Halt the run to end it.")
+
+
+def _no_ticket(r):
+    """What a going run with no ticket in hand is doing: waiting for work (QUEUE_WATCH), or between two."""
+    return "watching for work" if r.get("watch") else "between tickets"
+
+
 def _runner_card(runs, r, now, back=""):
     """The runner: what it is on, or the Start form (back: the ticket page it is on)."""
     parts = ["<section class='panel runner'>"]
@@ -1836,17 +1851,21 @@ def _runner_card(runs, r, now, back=""):
         mode = "host, single message" if r["single"] else "host" if r["host"] else "container"
         what = "; ".join(f"<a href='/runs/ticket/{quote(o['ticket'])}'>{esc(o['ticket'])}</a> &middot; {esc(o['stage'])}"
                          + (f": {esc(o['step'])}" if o["step"] else "")
-                         for o in r["on"] if KEY_RE.match(o["ticket"])) or "between tickets"
+                         for o in r["on"] if KEY_RE.match(o["ticket"]))
         started = _iso_ms(r.get("started", ""))
-        parts.append("<div class='state'><span class='sdot run'></span><h2>Queue running"
-                     + (" <span class='pill t-wait dot'>halting</span>" if r["halting"] else "") + "</h2></div>")
+        watching = not what and r["watch"] and not r["halting"]
+        parts.append("<div class='state'><span class='sdot run'></span>" + ("<div>" if watching else "")
+                     + "<h2>Queue running" + (" <span class='pill t-wait dot'>halting</span>" if r["halting"] else "")
+                     + "</h2>" + (f"<div class='muted'>{WATCHING}</div></div>" if watching else "") + "</div>")
         if not r["halting"]:
             parts.append("<div class='startf'>" + _btn("/runs/queue/halt", "Halt the run", "warn", confirm=(
                 "Halt the queue run? The ticket it is on goes back to the queue at the same stage.")) + "</div>")
         else:
             parts.append("<div class='startf'><span class='muted'>the run ends at its next check; if it does not "
                          "within a minute it is stuck</span>" + _end_btn() + "</div>")
-        parts.append(f"<div class='kv facts-row'><span>on <b>{what}</b></span><span>mode <b>{esc(mode)}</b></span>"
+        parts.append("<div class='kv facts-row'>" + (f"<span>on <b>{what}</b></span>" if what else
+                                                       f"<span><b>{_no_ticket(r)}</b></span>")
+                     + f"<span>mode <b>{esc(mode)}</b></span>"
                      + (f"<span>at a time <b>{r['parallel']} tickets</b></span>" if r["parallel"] else "")
                      + (f"<span>model <b>{esc(r['model'])}</b></span>" if r.get("model") else "")
                      + (f"<span>since <b>{_ago(started, now)}</b></span>" if started else "")
@@ -3621,7 +3640,7 @@ def _queue_line(runs):
         counts[status] = counts.get(status, 0) + 1
     if r["running"]:
         what = ("on " + ", ".join(f"<b>{esc(o['ticket'])}</b> &middot; {esc(o['stage'])}" for o in r["on"])
-                if r["on"] else "between tickets")
+                if r["on"] else _no_ticket(r))
         head = f"<b>Queue {'halting' if r['halting'] else 'running'}</b> {what}"
     elif r["starting"]:
         head = "<b>Queue starting&hellip;</b>"

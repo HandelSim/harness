@@ -2429,6 +2429,66 @@ class ParallelTest(Base):
         self.assertEqual(self.run_files(), [])
 
 
+class WatchTest(Base):
+    """run --watch-queue 1 (QUEUE_WATCH): nothing to do does not end the run; it takes what comes."""
+    run_bg, wait_for = OwnerControlTest.run_bg, OwnerControlTest.wait_for
+    runner, run_files = ParallelTest.runner, ParallelTest.run_files
+
+    def idle(self, n=1):
+        """The run (each of a parallel run's n slots) waiting for work."""
+        r = self.runner()
+        steps = [s.get("step") for s in r.get("slots", [])] if r.get("parallel") else [r.get("step")]
+        return r.get("running") and steps.count(tq.WAITING_FOR_WORK) == n
+
+    def said(self):
+        return cat(os.path.join(self.tmp, "run.out")).count("nothing to do; watching the queue")
+
+    def test_an_empty_queue_is_watched_until_a_halt(self):
+        p = self.run_bg("--watch-queue", "1", "--idle-min", "0", "--outage-wait", "0")
+        self.wait_for(self.idle, "the run waiting for work")
+        self.assertIs(self.runner()["watch"], True)
+        time.sleep(2 * tq.POLL + 1)   # a few looks: still going, said once
+        self.assertIsNone(p.poll())
+        self.assertEqual(self.said(), 1)
+        self.add("ABC-1")   # added while it waits: taken
+        self.wait_for(lambda: (self.status() or {}).get("status") == "done", "ABC-1 done", timeout=60)
+        self.wait_for(self.idle, "the run waiting again")
+        self.assertIsNone(p.poll())
+        self.assertEqual(self.said(), 2)
+        # a plan held for approval, approved while the run waits: implemented and pushed
+        rc, out = self.q("add", "ABC-2", "--project", self.project, "--review-plan")
+        self.assertEqual(rc, 0, out)
+        self.wait_for(lambda: self.status("ABC-2")["status"] == "plan-review", "ABC-2's plan held", timeout=60)
+        self.wait_for(self.idle, "the run waiting for the approval")
+        self.assertEqual(len(self.calls_of("implementing")), 1)   # ABC-1's
+        rc, out = self.q("approve", "ABC-2")
+        self.assertEqual(rc, 0, out)
+        self.wait_for(lambda: self.status("ABC-2")["status"] == "done", "ABC-2 done", timeout=60)
+        self.assertEqual(len(self.calls_of("implementing")), 2)
+        self.wait_for(self.idle, "the run waiting once more")
+        rc, out = self.q("halt")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(timeout=15), 0, cat(os.path.join(self.tmp, "run.out"))[-2000:])
+        self.assertIn("halted by the owner", cat(os.path.join(self.tmp, "run.out")))
+        self.assertEqual(self.run_files(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "halt")))
+
+    def test_parallel_slots_each_watch_and_a_halt_ends_them_all(self):
+        p = self.run_bg("--parallel", "2", "--watch-queue", "1", "--idle-min", "0", "--outage-wait", "0")
+        self.wait_for(lambda: self.idle(2), "both slots waiting for work")
+        self.assertIs(self.runner()["watch"], True)
+        self.add("ABC-1", "ABC-2")
+        self.wait_for(lambda: all((self.status(k) or {}).get("status") == "done" for k in ("ABC-1", "ABC-2")),
+                      "both tickets done", timeout=90)
+        self.wait_for(lambda: self.idle(2), "both slots waiting again")
+        self.assertIsNone(p.poll())
+        rc, out = self.q("halt")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(timeout=20), 0, cat(os.path.join(self.tmp, "run.out"))[-2000:])
+        self.assertEqual(self.run_files(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "halt")))
+
+
 class AuditFixesTest(Base):
     """The task file, the Windows command-line limit, UTF-8 git output, clone and
     push options, Windows agent paths and the verifier's retries."""

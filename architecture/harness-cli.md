@@ -759,7 +759,17 @@ run viewer; the engine still takes the flag, hidden, for old scripts and the tes
 checks once (host mode when docker is missing, `host_confirm_gate` asked
 once and exported as `HARNESS_HOST_CONFIRM=1`, so the exit-75 `exec` does
 not ask again; `add` with no active vault warns that `run` will need one), starts the host proxy if it is not running and hands the rest to the
-Python script. `list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
+Python script. By default (`QUEUE_WATCH=1`, passed as `--watch-queue 1`;
+the script's `--watch` is the idle watchdog's session databases) a run with
+nothing to do does not end: `run_tickets` beats with step `waiting for work`,
+prints one line saying so, looks again every `POLL` s (halt, Ctrl-C and the
+exit-75 code check as between tickets) and takes a ticket as soon as one is
+pending (queued, answered, approved, retried); each `--parallel` slot does
+the same, so the run ends only on halt, Ctrl-C or an upgrade. `run --once` or
+`QUEUE_WATCH=0` ends it when nothing is left. run.json's `"watch"` tells the
+viewer (a going run with no ticket in hand: "watching for work") and
+`resume_runner` (a `--once` run the machine took down comes back `--once`).
+`list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
 (`$EDITOR` without TEXT; the script's `--stdin` is what the run viewer's
 ticket page uses), `followup KEY ["TEXT"]` (same input rules; see
 "Follow-up rounds" below), `findings`, `watch` (tails `run.log`) and `log
@@ -1023,9 +1033,9 @@ fails). The runner takes a ticket, and `stop` and `note` save state, under
 `queue.lock`. The runner polls its agent every
 2 s for the sentinels and the stage timeout (a verifier call runs in a thread
 for the same reason) and keeps `run.json` (`pid`, `started`, `beat` every 3 s,
-`host`, `single`, `model`, `ticket`, `stage`, and `step`: cloning, the agent
+`host`, `single`, `model`, `watch`, `ticket`, `stage`, and `step`: cloning, the agent
 is working, the agent ended, asking the verifier, a verifier retry's wait,
-checking that the upstream answers), deleted on exit; a `beat` over 30 s old
+checking that the upstream answers, waiting for work), deleted on exit; a `beat` over 30 s old
 means no run. A run that ends on an upstream outage (exit 3) or Ctrl-C (130)
 puts the ticket it was on back to `queued` at its stage, uncounted, with the
 reason and an `interrupted` history entry; after a halt or Ctrl-C an in-place

@@ -14,7 +14,7 @@ plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
   ticket_queue.py --state DIR run --vault V --proxy URL --harness PATH
                   [--model M] [--default-model M] [--verify-model M] [--host]
                   [--single-message] [--retries N] [--push 0|1] [--remote R]
-                  [--plan-review 0|1] [--debug 0|1] [--debug-timeout S]
+                  [--plan-review 0|1] [--debug 0|1] [--debug-timeout S] [--watch-queue 0|1]
 Each stage is one fresh, headless agent launch through the harness CLI
 (`harness -p --yolo --ticket KEY -m MODEL PROMPT`: the firewalled container,
 or host mode) in the project folder itself, on the ticket's branch. A plan waits for
@@ -63,6 +63,11 @@ The owner's side runs in other processes while a run holds a ticket in memory,
 so it never writes what the run owns: notes go to KEY/notes.json (mirrored into
 state.json by every save), a stop or halt is a file (KEY/stop, DIR/halt) the run
 looks for every POLL seconds, and the run keeps DIR/run.json beating.
+
+A run ends when nothing is left to do, unless --watch-queue 1 (QUEUE_WATCH, the
+default of harness queue run): then it waits, looking every POLL seconds, and
+takes a ticket as soon as one is queued, answered, approved or retried, until a
+halt, Ctrl-C or a harness upgrade (RESTART) ends it.
 
 run --parallel N works N tickets at a time: the run (holding run.lock and
 run.json) starts N slots, each a run of its own process (run --slot I, beating
@@ -4490,6 +4495,7 @@ def run_locked(q, a, locked_at):
                              debug=a.debug == 1, debug_timeout=max(1, a.debug_timeout),
                              beat_lock=threading.Lock(), beating=threading.Event(), outage_wait=max(0, a.outage_wait),
                              idle_min=max(0.0, a.idle_min), watch=[w for w in a.watch if w], outage={},
+                             watch_queue=a.watch_queue == 1,
                              slot=a.slot, parent=os.getppid() if a.slot else 0,
                              run_file=os.path.join(q.root, f"run-{a.slot}.json" if a.slot else "run.json"))
     ctx.code = code_sig()
@@ -4501,7 +4507,8 @@ def run_locked(q, a, locked_at):
     if not a.slot:   # a parallel run did these for its slots
         new_run(q, ctx.vault, locked_at)
     ctx.run_info = {"pid": os.getpid(), "started": now_iso(), "beat": 0, "host": bool(ctx.host or ctx.single),
-                    "single": bool(ctx.single), "model": ctx.model, "ticket": "", "stage": "", "step": ""}
+                    "single": bool(ctx.single), "model": ctx.model, "ticket": "", "stage": "", "step": "",
+                    "watch": ctx.watch_queue}
     with beating_run(ctx):
         return run_tickets(q, ctx)
 
@@ -4538,7 +4545,8 @@ def beating_run(ctx):
 def run_parallel(q, a, locked_at):
     """--parallel N: N slots, each a run in a process of its own (run --slot I) that
     takes the queue's tickets one at a time; this process holds run.lock and beats
-    run.json for them. It ends when they all have: Ctrl-C reaches them too (each puts
+    run.json for them (--watch-queue: each slot waits for work as a lone run does).
+    It ends when they all have: Ctrl-C reaches them too (each puts
     its ticket back), a halt ends each at its next check, and after a harness upgrade
     each ends after its ticket, and the run starts again on the new code (RESTART)."""
     model = a.model or resolve_model(a.proxy, a.default_model)
@@ -4551,7 +4559,7 @@ def run_parallel(q, a, locked_at):
                              run_file=os.path.join(q.root, "run.json"))
     ctx.run_info = {"pid": os.getpid(), "started": now_iso(), "beat": 0, "host": bool(a.host or a.single_message),
                     "single": bool(a.single_message), "model": model, "ticket": "", "stage": "", "step": "",
-                    "parallel": a.parallel}
+                    "parallel": a.parallel, "watch": a.watch_queue == 1}
     argv = [sys.executable, os.path.abspath(__file__), *a.argv[1:], "--model", model]
     kids = []
     with beating_run(ctx):
@@ -4905,6 +4913,9 @@ def debug_launch(ctx, st, d, work):
     return rc, why, halt
 
 
+WAITING_FOR_WORK = "waiting for work"   # run.json's step while a watching run has nothing to do
+
+
 def run_tickets(q, ctx):
     done = {}   # KEY: its requeued stamp when this run took it; answered or retried since, it is taken again
 
@@ -4913,18 +4924,32 @@ def run_tickets(q, ctx):
         return s.get("status") in ("queued", "running") and done.get(k) != s.get("requeued", "")
     if not ctx.slot:   # a parallel run tidied for its slots
         tidy(q, ctx.harness)
+    idle = False   # --watch-queue with nothing to do: said once, not at every look
     try:
         look_again(ctx)
         while True:
             ctx.key = ""
-            beat(ctx, ticket="", stage="", step="")
+            beat(ctx, ticket="", stage="", step=WAITING_FOR_WORK if idle else "")
             checkpoint(ctx)
             if getattr(ctx, "code", "") and code_sig() != ctx.code:
                 print("[queue] harness was updated; the run starts again on the new code", file=sys.stderr)
                 return RESTART
             todo = [k for k in q.order() if pending(k)]
             if not todo:
-                break
+                if not getattr(ctx, "watch_queue", False):
+                    break
+                if not idle:
+                    idle = True
+                    step(ctx, WAITING_FOR_WORK)
+                    if not ctx.slot:
+                        print_list(q)
+                        sys.stdout.flush()   # runner.out, when the queue page started the run
+                    print(f"[queue] {f'slot {ctx.slot}: ' if ctx.slot else ''}nothing to do; watching the queue: a "
+                          "ticket queued, answered, approved or retried starts on its own (harness queue halt or "
+                          "Ctrl-C ends the run)", file=sys.stderr, flush=True)
+                pause(ctx, POLL)
+                continue
+            idle = False
             ctx.waiting = ""
             try:
                 for k in todo:
@@ -6220,6 +6245,7 @@ def main(argv):
     s.add_argument("--idle-min", type=float, default=IDLE_MIN)       # 0: no idle watchdog
     s.add_argument("--watch", action="append", default=[])           # files the agent writes as it works
     s.add_argument("--parallel", type=int, default=1)                # tickets at a time
+    s.add_argument("--watch-queue", type=int, default=0)             # 1: an empty queue does not end the run
     s.add_argument("--slot", type=int, default=0, help=argparse.SUPPRESS)   # one of a parallel run's slots
     a = p.parse_args(argv[1:])
     a.argv = argv

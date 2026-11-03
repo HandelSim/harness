@@ -404,6 +404,18 @@ class RunsTest(RunsServer):
         r, body = self.req("GET", "/")
         self.assertIn("<b>Queue running</b> on <b>ABC-1</b> &middot; implement", body)
         self.assertIn("title='1 ticket waiting on you'", body)
+        # no ticket in hand: a run that watches the queue says so (and that no agent runs)
+        self.run_on("", step="waiting for work", watch=True)
+        r, body = self.req("GET", "/")
+        self.assertIn("<b>Queue running</b> watching for work", body)
+        self.assertIn("running <b>watching for work</b>", body)
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("<span><b>watching for work</b></span>", body)
+        self.assertIn("No ticket to work on, so no agent runs", body)
+        self.run_on("", watch=False)   # a run --once between two tickets
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("<span><b>between tickets</b></span>", body)
+        self.assertNotIn("No ticket to work on", body)
 
     def test_ticket_page_shows_questions_attempts_and_notes(self):
         self.ticket()
@@ -1905,6 +1917,14 @@ class QueuePageTest(RunsServer):
             self.assertEqual(f.read().strip(), "queue run --host --parallel 2 HOST_CONFIRM=1")
         with open(os.path.join(self.queue, "runner.out")) as f:
             self.assertIn("started again: the last run ended with the machine: harness queue run --host", f.read())
+        # a run that watched the queue watches again (the default); a run --once runs once again
+        for watch, want in ((True, "queue run HOST_CONFIRM="), (False, "queue run --once HOST_CONFIRM=")):
+            with open(os.path.join(self.queue, "run.json"), "w") as f:
+                json.dump({"pid": 1, "beat": int(time.time()) - 600, "watch": watch}, f)
+            os.remove(args)
+            ok, msg = cfg.runs.resume_runner()
+            with open(args) as f:
+                self.assertEqual(f.read().strip(), want)
 
     def test_a_queue_session_has_a_stop_button_and_the_host_an_opencode_link(self):
         self.ticket(status="running", stage="plan")
