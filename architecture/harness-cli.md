@@ -772,7 +772,8 @@ viewer (a going run with no ticket in hand: "watching for work") and
 `list`, `remove`, `approve`, `retry`, `answer KEY ["TEXT"]`
 (`$EDITOR` without TEXT; the script's `--stdin` is what the run viewer's
 ticket page uses), `followup KEY ["TEXT"]` (same input rules; see
-"Follow-up rounds" below), `findings`, `watch` (tails `run.log`) and `log
+"Follow-up rounds" below), `fix KEY "COMMENT"...` (each argument one
+`--item`; see "Owner review comments" below), `findings`, `watch` (tails `run.log`) and `log
 [KEY]` are the owner's side.
 
 `edit KEY [add's options] [--no-repo-branches]` (`cmd_edit`) changes only the
@@ -1383,6 +1384,36 @@ left, the acceptance criteria cover the whole ticket (the review checks the
 whole change against the base). `built_on` lasts for the round: reaching
 `done`, or a requeue that sets the work up again, clears it, so a later
 retry from the plan starts over as before.
+
+Owner review comments: `fix KEY` (`cmd_fix`) sends the owner's comments on
+the diff straight to the fix stage, without a new plan. Input is `--item
+TEXT` (repeatable: a comment on the whole change) and/or `--stdin`, a JSON
+list (the run viewer's Changes page): `{"text"}`, or `{"path", "line",
+"side": new|old, "code", "text"}` (`repo` for one inside the project).
+`owner_item` makes each one Must fix line, `path:line (side) "the line":
+comment` (the comment's whitespace collapsed, at most `FIX_ITEM_CAP` 2,000
+characters; the line cut at 160; runs of `<`/`>` broken up so no text can
+close the prompt's `<<<...>>>` blocks). `owner_fix_refused` (also the web
+page's): only a `done`, `blocked` or `stopped` ticket (not one whose plan
+waits, nor one stopped at plan or test), with its work there and a change;
+over `MUST_FIX_MAX` 40 items or `MUST_FIX_CAP` 16,000 characters is refused,
+not cut, so the fixer sees all the verifier holds it to. Under `queue.lock`,
+and only when no run holds the ticket, it is requeued at `fix` (added to its
+stages if missing) with `must_fix` the items, `must_fix_by: owner`,
+`review_sha`/`review_digest` the change as it is now (the fix must commit
+on top; its commit messages since are what the verifier may quote), and
+the batch appended to `owner_reviews` (`at`, `items`; last 30). The fix
+prompt (`FIX_WORDS[True]`) says they are the owner's review comments,
+which win over the plan, each done unless it truly cannot be, and then
+said why in the commit message; the verifier gets them as `(owner)`
+criteria (`verify_change.md`: met when done, or a commit message's reason
+the diff and ticket bear out; the owner's comment wins over a plan
+criterion it changes). After fix comes push when the ticket has it. Once:
+the comments are not owner notes, the next review replaces `must_fix` (and
+drops `must_fix_by`), and a follow-up or a fresh start clears both.
+`MUST_FIX_MAX` also caps a review's items (15 before); the fix prompt's
+block is cut at `MUST_FIX_CAP` (a review's long list, as `NOTE_CAP` did):
+with the other caps about 96,000 characters, under `PROMPT_MAX_BYTES`.
 
 Harness never runs git in the clone once an agent has had it: it fetches
 the ticket's branch into the project as `refs/harness-queue/KEY` (in place:

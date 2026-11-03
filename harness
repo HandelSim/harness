@@ -7088,6 +7088,14 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             on top of the work, it comes back to you to
                                             approve, and the stages build, review and
                                             push the rest on the same branch
+       harness queue fix KEY "COMMENT"...   your review comments on the diff go
+                                            straight to the fix stage, one Must fix
+                                            item each (write path:line: what to do);
+                                            they win over the plan, and push follows
+                                            when the ticket has it. Once: they are not
+                                            notes. A done, blocked or stopped ticket
+                                            with work; at most 40. In harness serve:
+                                            click lines on a ticket's Changes page
        harness queue note KEY ["TEXT"]      a note every later stage's prompt gets
                                             (opens $EDITOR without TEXT); any time
        harness queue approve KEY            approve the plan: the next stage starts
@@ -7415,6 +7423,11 @@ HELP
             args+=(status "$@") ;;
         move) [[ $# -eq 2 ]] || { err "usage: harness queue move KEY up|down|top|bottom"; return 1; }
             args+=(move "$1" "$2") ;;
+        fix) [[ -n "${1:-}" && $# -ge 2 ]] || { err "usage: harness queue fix KEY \"COMMENT\" [\"COMMENT\"...]"; return 1; }
+            args+=(fix "$1")
+            shift
+            local c
+            for c in "$@"; do args+=(--item "$c"); done ;;
         note) [[ -n "${1:-}" && $# -le 2 ]] || { err "usage: harness queue note KEY [\"TEXT\"]"; return 1; }
             args+=(note "$1")
             [[ -n "${2:-}" ]] && args+=(--text "$2") ;;

@@ -19,6 +19,8 @@ For each criterion, decide whether the diff meets it, and copy the lines that sh
 
 A criterion that starts with "(review)" is a reviewer's complaint. It is met when the diff fixes it, or when a commit message gives a reason the complaint is wrong and the diff and ticket bear that reason out; then quote that commit message. A reason that is not borne out does not count.
 
+A criterion that starts with "(owner)" is the owner's own review comment on the diff. It is met when the diff does what it asks, or when a commit message says why it cannot be done as asked and the diff and ticket bear that out; then quote that commit message. The owner's comments win over the plan: another criterion that such a comment changes is met when the diff does what the comment asks.
+
 Reply with only this JSON, no other text:
 {"criteria": [{"n": 1, "met": true, "quote": "lines copied from the diff", "why": "one sentence"}],
  "verdict": "PASS" or "FAIL",

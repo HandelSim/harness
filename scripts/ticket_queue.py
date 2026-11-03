@@ -10,6 +10,7 @@ plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
   ticket_queue.py --state DIR halt [--force --harness PATH]
   ticket_queue.py --state DIR note KEY [--text T | --stdin]
   ticket_queue.py --state DIR answer KEY --vault V [--text T] [--go]
+  ticket_queue.py --state DIR fix KEY [--item TEXT]... [--stdin]
   ticket_queue.py --state DIR findings --vault V
   ticket_queue.py --state DIR run --vault V --proxy URL --harness PATH
                   [--model M] [--default-model M] [--verify-model M] [--host]
@@ -119,7 +120,12 @@ LAUNCH_TRIES = 3           # ... until it has failed this many times in a row: t
 IDLE = "idle"              # the rc of a launch the idle watchdog stopped
 TICKET_CAP = 30_000        # chars of each part embedded in an agent prompt, which
 PLAN_CAP = 15_000          # goes on a command line (one argument is at most 128 KiB)
-NOTE_CAP = 8_000           # feedback and must-fix lists in a prompt
+NOTE_CAP = 8_000           # feedback and notes in a prompt
+# Must fix items: a review's, or the owner's review comments on the diff (harness queue
+# fix), at most this many, in at most MUST_FIX_CAP characters in the fix prompt; each is
+# also a criterion the fix's verifier checks, beside the plan's MAX_GATED.
+MUST_FIX_MAX = 40
+MUST_FIX_CAP = 16_000
 PROMPT_MAX_BYTES = 120_000
 # Windows: CreateProcess takes at most 32,767 characters for the whole command
 # line; a prompt longer than this goes to the agent as a pointer to KEY-task.md.
@@ -1960,10 +1966,10 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=No
     """Problems with a verdict: every criterion answered, met (for a change),
     and every quote found in <source>. For a diff a quote must be from an added
     line (a removed one when the criterion is about removing; never an unchanged
-    one); a reviewer's "(review)" item may instead quote <notes>, the commit
-    messages saying why it is wrong. A ticket quote the verifier got slightly
-    wrong goes to <soft> instead (a list, logged): one found quote is enough
-    to show the plan is about the ticket. <nums> are the numbers the verifier
+    one); a reviewer's "(review)" item, or the owner's "(owner)" one, may instead
+    quote <notes>, the commit messages saying why it is wrong or cannot be done.
+    A ticket quote the verifier got slightly wrong goes to <soft> instead (a
+    list, logged): one found quote is enough to show the plan is about the ticket. <nums> are the numbers the verifier
     was told for the criteria (their AC numbers), 1, 2, 3... by default."""
     soft = [] if soft is None else soft
     problems = []
@@ -1998,7 +2004,7 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=No
             continue
         if what == "diff":
             ok = quote in added or (REMOVAL.search(crit) and quote in removed) \
-                or (crit.startswith("(review) ") and quote in norm(notes))
+                or (crit.startswith(("(review) ", "(owner) ")) and quote in norm(notes))
         else:
             ok = quote in src
         if len(quote) >= 8 and ok:
@@ -3028,6 +3034,10 @@ CARD_DONE = {
     "fix": "every Must fix item is fixed, or said in the commit message to be wrong, and committed on {BRANCH} in a "
            "new commit (git commit --allow-empty when nothing changed). Do not push.",
     "fix-repos": "every Must fix item is fixed. {FIX_COMMIT_STEP}",
+    "fix-owner": "every Must fix item (the owner's review comments on the diff) is done, or said in the commit message "
+                 "why it cannot be done as asked, and committed on {BRANCH} in a new commit (git commit --allow-empty "
+                 "when nothing changed). Do not push.",
+    "fix-owner-repos": "every Must fix item (the owner's review comments on the diff) is done. {FIX_COMMIT_STEP}",
     "test": "tests for the plan's acceptance criteria are written and committed on {BRANCH} (git add <files>, git "
             "commit -m \"{KEY}: tests\"); no other file changed. Do not push.",
     "test-repos": "tests for the plan's acceptance criteria are written; no other file changed. {COMMIT_STEP}",
@@ -3040,8 +3050,9 @@ def task_card(ctx, st, stage):
     p = {k: agent_path(ctx, v) for k, v in note_paths(ctx.vault, st["key"]).items()}
     how = lands(ctx, st)
     words = landing(st, how)
-    done = CARD_DONE[stage + "-repos"] if stage + "-repos" in CARD_DONE and "COMMIT_STEP" in words \
-        and how != ([(".", branch_of(st))], []) else CARD_DONE[stage]
+    name = "fix-owner" if stage == "fix" and by_owner(st) else stage
+    done = CARD_DONE[name + "-repos"] if name + "-repos" in CARD_DONE and "COMMIT_STEP" in words \
+        and how != ([(".", branch_of(st))], []) else CARD_DONE[name]
     card = {"stage": stage, "attempt": st.get("attempt", 0) + 1,
             "branch": "" if st.get("no_branch") else branch_of(st),
             "where": CARD_WHERE_IN_PLACE if st.get("in_place") else IN_CLONE,
@@ -3410,7 +3421,7 @@ def change_problems(ctx, st, rc, stage):
     plan = read(plan_copy(ctx.q, st["key"]))
     criteria = change_criteria(ctx, st, plan)
     if stage == "fix":
-        criteria = criteria + [f"(review) {m}" for m in st.get("must_fix", [])]
+        criteria = criteria + [f"({'owner' if by_owner(st) else 'review'}) {m}" for m in st.get("must_fix", [])]
     if st.get("in_place") and not st.get("no_branch"):
         reattach(ctx, st)
     change = ticket_change(ctx.q, st)
@@ -3875,7 +3886,8 @@ def stage_review(ctx, st):
     ctx.q.log(st["key"], f"review: {len(must)} must-fix item(s)", "\n".join("- " + m for m in must))
     change, broke = review_changed(ctx, st, dirty)
     must = [f"the review stage's own change fails a check: {b}" for b in broke] + must
-    st.update(must_fix=must[:15], review_sha=(change[0] or "") if change else "",
+    st.pop("must_fix_by", None)   # the review's items now, not the owner's
+    st.update(must_fix=must[:MUST_FIX_MAX], review_sha=(change[0] or "") if change else "",
               review_digest=digest(change[1]) if change else "")
     after = next_stage(st, "review")
     if not must or "fix" in stages_of(st):
@@ -3924,9 +3936,34 @@ def review_changed(ctx, st, dirty):
     return change, problems
 
 
+def by_owner(st):
+    """True when the Must fix items are the owner's review comments (harness queue fix), not a review's."""
+    return st.get("must_fix_by") == "owner"
+
+
+# fix.md's words for whose Must fix items they are: (what is fixed, the items' block, step 1)
+FIX_WORDS = {
+    False: ("the problems a review found in the change for ticket {key}. Nobody is watching: fix them all, then commit.",
+            "from {review}",
+            "For each Must fix item, read the code it names and fix it. If an item is wrong (the code is already "
+            "right), leave the code and say in the commit message, for that item, why it is wrong, naming the lines "
+            "that show it."),
+    True: ("the change for ticket {key} as its owner asks in review comments on the diff. Nobody is watching: do "
+           "them all, then commit.",
+           "the owner's review comments on the diff; they win over the plan",
+           "Each Must fix item is a comment of the owner's: on one line of the diff (path:line, (new) or (old) side, "
+           "\"the line as it was shown\": the comment), or on the whole change. For each, read the code it names and "
+           "do what it asks; where it differs from the plan, the comment wins. Only if one truly cannot be done as "
+           "asked, leave it and say in the commit message, for that item, why, naming the lines that show it."),
+}
+
+
 def stage_fix(ctx, st):
     v = common(ctx, st)
-    v["MUST_FIX"] = cap("\n".join("- " + m for m in st.get("must_fix", [])), NOTE_CAP)
+    what, items, step = FIX_WORDS[by_owner(st)]
+    v.update(FIX_WHAT=what.format(key=st["key"]), MUST_FIX_FROM=items.format(review=v["REVIEW_FILE"]),
+             FIX_ITEMS_STEP=step)
+    v["MUST_FIX"] = cap("\n".join("- " + m for m in st.get("must_fix", [])), MUST_FIX_CAP)
     rc, _, _ = agent_or_kept(ctx, st, "fix", lambda: render("fix", **v))
     if verify_change(ctx, st, rc, "fix"):
         advance(ctx, st, next_stage(st, "fix"))
@@ -4196,7 +4233,7 @@ def result_note(ctx, st):
     lines += [f"- `{c['sha'][:12]}` {c['subject']}" for c in st["commits"]] or ["(none)"]
     lines += ["", "## Diffstat", "", f"{stat['files']} file(s), +{stat['insertions']} -{stat['deletions']}",
               "", "## Review notes", ""]
-    notes = [f"- must fix (asked by the review): {m}" for m in st.get("must_fix") or []]
+    notes = [f"- must fix (asked by the {'owner' if by_owner(st) else 'review'}): {m}" for m in st.get("must_fix") or []]
     notes += [f"- warning: {w}" for w in st.get("warnings") or []]
     if os.path.exists(p["review"]):
         notes.append(f"- the review: [[{key}-review]]")
@@ -5518,8 +5555,8 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         st.pop("verified_repos", None)
         st.pop("verified_mark", None)
     if not go_on and starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
-        for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "verify_only", "verified_sha",
-                  "verified_repos", "verified_mark", "implement_from", "built_on", "test_from", *TEST_MARKS):
+        for k in ("sha", "review_sha", "review_digest", "must_fix", "must_fix_by", "warnings", "verify_only",
+                  "verified_sha", "verified_repos", "verified_mark", "implement_from", "built_on", "test_from", *TEST_MARKS):
             st.pop(k, None)
         if st["stage"] == "plan":
             for k in ("questions", "criteria", "plan_sig"):
@@ -6160,13 +6197,142 @@ def cmd_followup(q, a):
         st = requeue(q, key, ("done",), stage="plan", rounds=rounds, built_on=True, plan_hold=True,
                      plan_approved=False)
         if st:   # the review and checks of the last round are not this one's
-            for k in ("sha", "review_sha", "review_digest", "must_fix", "warnings", "questions", "criteria",
-                      "assumptions", "subs", "test_from", *TEST_MARKS):
+            for k in ("sha", "review_sha", "review_digest", "must_fix", "must_fix_by", "warnings", "questions",
+                      "criteria", "assumptions", "subs", "test_from", *TEST_MARKS):
                 st.pop(k, None)
             q.save(st)
     if st:
         print(f"[queue] {key}: follow-up saved; round {n + 1}: the queue run revises the plan on top of what round "
               f"{n} built, and it comes back to you to approve before anything is built")
+    return 0 if st else 1
+
+
+OWNER_FIXABLE = ("done", "blocked", "stopped")
+FIX_ITEM_CAP = 2_000   # characters of one review comment
+FIX_LINE_CAP = 160     # of the line's text it is on
+
+
+def owner_fix_refused(q, st):
+    """Why the owner's review comments cannot go to the fix stage now (harness queue fix), or ""."""
+    key, status = st["key"], st["status"]
+    if status not in OWNER_FIXABLE:
+        why = {"running": f"it is running: wait for it, or stop it first (harness queue stop {key})",
+               "queued": f"it is queued, and the run takes it as it is: stop it first (harness queue stop {key})",
+               "plan-review": f"its plan waits to be read (harness queue approve {key})",
+               "needs-answers": f"it waits for answers (harness queue answer {key})"}.get(status, f"it is {status}")
+        return f"{key}: {why}; review comments go to a done, blocked or stopped ticket"
+    if status == "stopped" and st.get("stopped_from") == "plan-review":
+        return f"{key}'s plan waits to be read: harness queue retry {key} puts it back for you to approve"
+    if status != "done" and st.get("stage") in ("plan", "test"):
+        return (f"{key} stopped at its {st['stage']} stage, so the change is not built yet: harness queue continue "
+                f"or retry {key} builds it")
+    if not has_work(q, st):
+        return f"{key}'s work is gone (or was never made), so there is nothing to review: harness queue retry {key}"
+    many = st.get("no_branch") or st.get("nested") or st.get("baselines")
+    try:
+        some = bool(ticket_change(q, st)) if many else commits_since_base(q, st)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        some = True   # not known: the fix command reads the change itself
+    if not some:
+        return f"{key} has changed nothing yet, so there is nothing to review: harness queue retry {key} --stage implement"
+    return ""
+
+
+def defang(text):
+    """text with no run of < or > that could pass for a prompt's <<<BEGIN/END>>> delimiters."""
+    return re.sub(r"<{3,}|>{3,}", lambda m: " ".join(m.group(0)), text)
+
+
+def owner_item(x):
+    """One review comment of the owner's as a Must fix line: {"text"} (on the whole change),
+    or {"path", "line", "side": new|old, "code": the line's text, "text"}, with "repo" for a
+    repository inside the project. ValueError says what is wrong with it."""
+    if isinstance(x, str):
+        x = {"text": x}
+    if not isinstance(x, dict) or not isinstance(x.get("text"), str):
+        raise ValueError("each comment is an object with a text")
+    text = " ".join(x["text"].split())
+    if not text:
+        raise ValueError("a comment is empty")
+    if len(text) > FIX_ITEM_CAP:
+        raise ValueError(f"a comment is over {FIX_ITEM_CAP} characters")
+    text = defang(text)
+    if not x.get("path"):
+        return text
+    path, repo, line, side = x["path"], x.get("repo") or ".", x.get("line"), x.get("side")
+    if not isinstance(path, str) or not isinstance(repo, str) or len(path) > 500 or len(repo) > 500 \
+            or re.search(r"[\x00-\x1f\x7f]", path + repo):
+        raise ValueError("a comment's path is not a file name")
+    if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+        raise ValueError(f"the comment on {path[:100]} has no line number")
+    if side not in ("new", "old"):
+        raise ValueError(f"the comment on {path[:100]}:{line} says no side (new or old)")
+    code = re.sub(r"[\x00-\x1f\x7f]", " ", x.get("code") if isinstance(x.get("code"), str) else "").rstrip()
+    code = defang(code[:FIX_LINE_CAP] + ("..." if len(code) > FIX_LINE_CAP else ""))
+    loc = defang(path if repo in (".", "") else repo.rstrip("/") + "/" + path)
+    return f"{loc}:{line} ({side})" + (f" \"{code}\"" if code.strip() else "") + f": {text}"
+
+
+def cmd_fix(q, a):
+    """The owner's review comments on the diff go straight to the fix stage, as its Must
+    fix items: the ticket is queued at fix (and push after it, when it has push). Once:
+    they are not notes, and a later stage or round does not get them."""
+    key = a.key.upper()
+    st = q.load(key)
+    if not st:
+        print(f"[queue] {key} is not in the queue", file=sys.stderr)
+        return 1
+    raw = list(a.item or [])
+    if a.stdin:
+        try:
+            got = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "[]")
+        except ValueError:
+            print("[queue] the comments on stdin are not JSON", file=sys.stderr)
+            return 1
+        if not isinstance(got, list):
+            print("[queue] the comments on stdin are not a JSON list", file=sys.stderr)
+            return 1
+        raw += got
+    try:
+        items = [owner_item(x) for x in raw]
+    except ValueError as e:
+        print(f"[queue] {e}; nothing sent", file=sys.stderr)
+        return 1
+    if not items:
+        print("[queue] no review comments given; nothing sent", file=sys.stderr)
+        return 1
+    size = len("\n".join("- " + m for m in items))
+    if len(items) > MUST_FIX_MAX or size > MUST_FIX_CAP:
+        print(f"[queue] {len(items)} comments in {size} characters: at most {MUST_FIX_MAX} comments in "
+              f"{MUST_FIX_CAP} characters go to one fix; send the rest after it", file=sys.stderr)
+        return 1
+    why = owner_fix_refused(q, st)
+    if why:
+        print(f"[queue] {why}", file=sys.stderr)
+        return 1
+    change = ticket_change(q, st)   # what the comments are on: the fix must commit on top of it
+    if change is None:
+        print(f"[queue] {key} has changed nothing yet, so there is nothing to review", file=sys.stderr)
+        return 1
+    with held(os.path.join(q.root, "queue.lock")):   # the run takes a queued ticket under it
+        if run_holds(q, key):
+            now = q.load(key) or {}
+            print(f"[queue] {key}: " + (f"is running; stop it first (harness queue stop {key})"
+                                        if now.get("status") == "running" else finishing(now)), file=sys.stderr)
+            return 1
+        st = q.load(key)
+        why = owner_fix_refused(q, st) if st else f"{key} is not in the queue"
+        if why:
+            print(f"[queue] {why}", file=sys.stderr)
+            return 1
+        extra = {} if "fix" in stages_of(st) else {"stages": [s for s in ALL_STAGES if s in stages_of(st) or s == "fix"]}
+        sent = (st.get("owner_reviews") or [])[-(HISTORY_CAP - 1):] + [{"at": now_iso(), "items": items}]
+        st = requeue(q, key, OWNER_FIXABLE, stage="fix", must_fix=items, must_fix_by="owner", owner_reviews=sent,
+                     review_sha=change[0] or "", review_digest=digest(change[1]), **extra)
+    if st:
+        then = next_stage(st, "fix")
+        print(f"[queue] {key}: {len(items)} review comment(s) sent; the queue run gives them to the fix stage"
+              + (f", then {then}" if then else ""))
     return 0 if st else 1
 
 
@@ -6223,6 +6389,8 @@ def main(argv):
     s.add_argument("--stdin", action="store_true")
     s = sub.add_parser("followup"); s.add_argument("key"); s.add_argument("--vault", required=True)
     s.add_argument("--text"); s.add_argument("--stdin", action="store_true")
+    s = sub.add_parser("fix"); s.add_argument("key"); s.add_argument("--item", action="append", default=[])
+    s.add_argument("--stdin", action="store_true")   # a JSON list of comments (owner_item)
     s = sub.add_parser("findings"); s.add_argument("--vault", required=True)
     s = sub.add_parser("run")
     s.add_argument("--vault", required=True)
@@ -6253,7 +6421,7 @@ def main(argv):
     try:
         return {"add": cmd_add, "edit": cmd_edit, "list": cmd_list, "status": cmd_status, "remove": cmd_remove,
             "approve": cmd_approve, "retry": cmd_retry, "continue": cmd_continue, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
-            "answer": cmd_answer, "followup": cmd_followup, "findings": cmd_findings, "run": cmd_run}[a.cmd](q, a)
+            "answer": cmd_answer, "followup": cmd_followup, "fix": cmd_fix, "findings": cmd_findings, "run": cmd_run}[a.cmd](q, a)
     except Busy as e:
         print(f"[queue] {e}; try again", file=sys.stderr)
         return 1

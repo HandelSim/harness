@@ -1,8 +1,8 @@
-You are fixing the problems a review found in the change for ticket {{KEY}}. Nobody is watching: fix them all, then commit.
+You are fixing {{FIX_WHAT}}
 
 Your working directory is {{WHERE}}. {{LAYOUT}} The change so far is {{CHANGE_SO_FAR}}.
 
-<<<BEGIN_MUST_FIX (from {{REVIEW_FILE}})>>>
+<<<BEGIN_MUST_FIX ({{MUST_FIX_FROM}})>>>
 {{MUST_FIX}}
 <<<END_MUST_FIX>>>
 
@@ -27,7 +27,7 @@ Your working directory is {{WHERE}}. {{LAYOUT}} The change so far is {{CHANGE_SO
 <<<END_PROBLEMS_WITH_THE_LAST_ATTEMPT>>>
 
 What to do:
-1. For each Must fix item, read the code it names and fix it. If an item is wrong (the code is already right), leave the code and say in the commit message, for that item, why it is wrong, naming the lines that show it.
+1. {{FIX_ITEMS_STEP}}
 2. Keep every acceptance criterion of the plan (with no plan, what the ticket asks for) met. Change nothing else.
 3. Make sure it still builds: run the project's build, compile or lint command, or with none a syntax check of each file you changed (bash -n, python -m py_compile, node --check); fix what you broke. {{TEST_STEP}}
 4. {{FIX_COMMIT_STEP}} Never commit secrets, and do not change anything under .github/.
