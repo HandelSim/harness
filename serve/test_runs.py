@@ -1247,7 +1247,7 @@ class QueuePageTest(RunsServer):
         self.assertIn("data-live='/runs/queue/live'", body)
         r, body = self.req("GET", "/runs/queue/live")
         d = json.loads(body)
-        self.assertEqual(set(d["regions"]), {"runner", "tickets", "nav"})
+        self.assertEqual(set(d["regions"]), {"runner", "tickets", "archived", "findings", "fagent", "nav"})
         self.assertIn("ABC-12", d["regions"]["tickets"])
         r, body = self.req("GET", "/runs/ticket/ABC-12/live")
         d = json.loads(body)
@@ -1600,6 +1600,59 @@ class QueuePageTest(RunsServer):
         r, _ = self.post("/runs/ticket/ABC-8/remove", [("back", "queue")])
         self.assertEqual(r.status, 303)
         self.assertFalse(os.path.exists(os.path.join(self.queue, "ABC-8")))
+
+    def test_drag_to_reorder_and_archive_a_ticket(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.start()
+        r, body = self.post("/runs/queue/add", [("keys", "ABC-1, ABC-2, ABC-3"), ("project", proj), ("base", "main"),
+                                                ("preset", "review"), ("ref", "main")])
+        self.assertEqual(r.status, 303, body)
+        r, body = self.req("GET", "/runs/queue")
+        # a drag handle on each row, the rows in a sortable list; no up/down buttons
+        self.assertIn("data-sort-url='/runs/ticket/{key}/move'", body)
+        self.assertIn("data-sort-key='ABC-2'", body)
+        self.assertIn("class='grip'", body)
+        self.assertNotIn("&uarr;", body)
+        # what the drag sends: just above ABC-1, then to the end
+        r, _ = self.post("/runs/ticket/ABC-3/move", [("key", "ABC-3"), ("before", "ABC-1"), ("back", "queue")])
+        self.assertEqual(r.status, 303)
+        with open(os.path.join(self.queue, "queue.list")) as f:
+            self.assertEqual(f.read().split(), ["ABC-3", "ABC-1", "ABC-2"])
+        r, _ = self.post("/runs/ticket/ABC-3/move", [("key", "ABC-3"), ("before", ""), ("back", "queue")])
+        with open(os.path.join(self.queue, "queue.list")) as f:
+            self.assertEqual(f.read().split(), ["ABC-1", "ABC-2", "ABC-3"])
+        r, body = self.post("/runs/ticket/ABC-3/move", [("key", "ABC-3"), ("before", "ABC-77"), ("back", "queue")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("class='err'", body)          # the drag's script shows this text
+        # the ticket page has no move buttons
+        r, body = self.req("GET", "/runs/ticket/ABC-2")
+        self.assertNotIn("/runs/ticket/ABC-2/move", body)
+        self.assertIn("action='/runs/ticket/ABC-2/archive'", body)
+        # archive: out of the queue, listed at the bottom, its page still there
+        r, _ = self.post("/runs/ticket/ABC-2/archive", [("back", "queue")])
+        self.assertEqual((r.status, r.getheader("Location").split("?")[0]), (303, "/runs/queue"))
+        with open(os.path.join(self.queue, "queue.list")) as f:
+            self.assertEqual(f.read().split(), ["ABC-1", "ABC-3"])
+        r, body = self.req("GET", "/runs/queue/live")
+        d = json.loads(body)["regions"]
+        self.assertNotIn("ABC-2", d["tickets"])
+        self.assertIn("ticket/ABC-2", d["archived"])
+        self.assertIn("action='/runs/ticket/ABC-2/unarchive'", d["archived"])
+        r, body = self.req("GET", "/runs/queue")
+        self.assertLess(body.index("id='r-tickets'"), body.index("id='r-archived'"))
+        r, body = self.req("GET", "/runs/ticket/ABC-2")
+        self.assertEqual(r.status, 200)
+        self.assertIn("action='/runs/ticket/ABC-2/unarchive'", body)
+        self.assertNotIn("action='/runs/ticket/ABC-2/retry'", body)
+        r, body = self.post("/runs/ticket/ABC-2/retry")   # no run would take it
+        self.assertEqual(r.status, 409)
+        # back in the queue, at the bottom
+        r, _ = self.post("/runs/ticket/ABC-2/unarchive", [("back", "queue")])
+        self.assertEqual(r.status, 303)
+        with open(os.path.join(self.queue, "queue.list")) as f:
+            self.assertEqual(f.read().split(), ["ABC-1", "ABC-3", "ABC-2"])
+        r, body = self.req("GET", "/runs/queue/live")
+        self.assertEqual(json.loads(body)["regions"]["archived"], "")
 
     def test_stop_retry_and_remove_end_the_container_a_gone_run_left(self):
         # a run killed outright left its agent's container: the buttons pass --harness, so it is stopped

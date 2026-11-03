@@ -1940,6 +1940,55 @@ class OwnerControlTest(Base):
             self.assertEqual((rc, order()), (0, want), (args, out))
         self.assertEqual(self.q("move", "ABC-9", "up")[0], 1)
 
+    def test_move_before(self):
+        # the queue page's drag: just above another ticket, or the bottom
+        self.add("ABC-1", "ABC-2", "ABC-3")
+        order = lambda: tq.Queue(self.state).order()  # noqa: E731
+        for args, want in ((("ABC-3", "--before", "ABC-1"), ["ABC-3", "ABC-1", "ABC-2"]),
+                           (("ABC-3", "--before", ""), ["ABC-1", "ABC-2", "ABC-3"]),
+                           (("ABC-1", "--before", "abc-3"), ["ABC-2", "ABC-1", "ABC-3"]),
+                           (("ABC-1", "--before", "ABC-1"), ["ABC-2", "ABC-1", "ABC-3"])):
+            rc, out = self.q("move", *args)
+            self.assertEqual((rc, order()), (0, want), (args, out))
+        self.assertEqual(self.q("move", "ABC-1", "--before", "ABC-9")[0], 1)   # not in the queue
+        self.assertEqual(order(), ["ABC-2", "ABC-1", "ABC-3"])
+        self.assertNotEqual(self.q("move", "ABC-1", "up", "--before", "ABC-2")[0], 0)   # one or the other
+
+    def test_archive_and_unarchive(self):
+        self.add("ABC-1", "ABC-2", "ABC-3")
+        qq = tq.Queue(self.state)
+        rc, out = self.q("archive", "abc-2")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((qq.order(), qq.archived()), (["ABC-1", "ABC-3"], ["ABC-2"]))
+        self.assertTrue(tq.Queue(self.state).load("ABC-2").get("archived"))
+        self.assertEqual(self.q("archive", "ABC-2")[0], 0)   # already: said, not an error
+        # an archived ticket is not run, retried or added again
+        self.assertEqual(self.q("retry", "ABC-2")[0], 1)
+        rc, out = self.q("add", "ABC-2", "--project", self.project)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("archived", out)
+        self.assertEqual(self.q("archive", "ABC-9")[0], 1)
+        # back: at the bottom of the queue
+        rc, out = self.q("unarchive", "ABC-2")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((qq.order(), qq.archived()), (["ABC-1", "ABC-3", "ABC-2"], []))
+        self.assertFalse(tq.Queue(self.state).load("ABC-2").get("archived"))
+        self.assertEqual(self.q("unarchive", "ABC-2")[0], 1)   # not archived
+        # remove clears an archived ticket from archived.list too
+        self.q("archive", "ABC-3")
+        rc, out = self.q("remove", "ABC-3")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(tq.Queue(self.state).archived(), [])
+
+    def test_archive_refuses_a_running_ticket(self):
+        self.add("ABC-1")
+        st = tq.Queue(self.state).load("ABC-1")
+        st["status"] = "running"
+        tq.Queue(self.state).save(st)
+        rc, out = self.q("archive", "ABC-1")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(tq.Queue(self.state).order(), ["ABC-1"])
+
     def test_status_json(self):
         self.add("ABC-1", "ABC-2")
         self.q("move", "ABC-2", "top")

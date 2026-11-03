@@ -66,6 +66,9 @@ import threading
 import time
 from urllib.parse import quote
 
+import findings_agent_view
+import findings_view
+
 SID_RE = re.compile(r"^ses_[A-Za-z0-9]{1,64}$")
 PART_RE = re.compile(r"^prt_[A-Za-z0-9]{1,64}$")
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
@@ -322,13 +325,14 @@ main.rv { max-width: 1280px; gap: 18px; padding-top: 22px; }
 
 /* the queue's tickets */
 .tks { display: flex; flex-direction: column; }
-.tk { display: grid; grid-template-columns: 30px minmax(0, 1fr) minmax(200px, 320px) 64px 320px;
+.tk { display: grid; grid-template-columns: 52px minmax(0, 1fr) minmax(200px, 320px) 64px 320px;
   gap: 6px 18px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--line); min-width: 0; }
 .tk:first-child { border-top: 0; }
 .tk:hover { background: var(--hover); }
 .tk.wait { box-shadow: inset 3px 0 0 var(--wait); background: linear-gradient(90deg, var(--wait-soft), transparent 55%); }
 .tk.run { box-shadow: inset 3px 0 0 var(--run); }
-.tk .pos { color: var(--faint); font: 12px var(--mono); text-align: right; }
+.tk .pos { color: var(--faint); font: 12px var(--mono); text-align: right; flex: 1; }
+.tk .lead { display: flex; align-items: center; gap: 2px; }
 .tk .main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .tk .key { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .tk .key a { font: 650 14.5px var(--mono); color: var(--ink); }
@@ -336,6 +340,17 @@ main.rv { max-width: 1280px; gap: 18px; padding-top: 22px; }
 .tk.wait .why { color: var(--wait); }
 .tk .when { font-size: 12px; color: var(--muted); white-space: nowrap; text-align: right; }
 .ra { display: flex; gap: 4px; justify-content: flex-end; flex-wrap: wrap; }
+.grip { cursor: grab; color: var(--faint); font-size: 14px; letter-spacing: -3px; user-select: none; touch-action: none;
+  padding: 6px 4px; border-radius: 4px; line-height: 1; text-align: center; }
+.grip:hover, .grip:focus-visible { color: var(--ink); background: var(--line, rgba(127,127,127,.15)); outline: none; }
+.grip.off { cursor: default; visibility: hidden; }
+body.sorting, body.sorting * { cursor: grabbing !important; user-select: none; }
+.dragging { opacity: .6; box-shadow: 0 2px 10px rgba(0,0,0,.25); position: relative; z-index: 2; }
+details.arch > summary { cursor: pointer; list-style: none; }
+details.arch > summary::-webkit-details-marker { display: none; }
+details.arch > summary h2::before { content: "\\25B8  "; color: var(--faint); }
+details.arch[open] > summary h2::before { content: "\\25BE  "; }
+.tk.arch .key a { color: var(--muted); }
 .ra form { margin: 0; }
 .empty { padding: 28px 18px; color: var(--muted); text-align: center; font-size: 14px; }
 
@@ -545,7 +560,7 @@ details.doc summary .muted { font-weight: 400; }
 #add { scroll-margin-top: 68px; transition: box-shadow .3s; }
 #add.hl { box-shadow: 0 0 0 2px var(--accent); }
 @media (max-width: 1180px) {
-  .tk { grid-template-columns: 22px minmax(0, 1fr) auto; padding: 12px 14px; }
+  .tk { grid-template-columns: 44px minmax(0, 1fr) auto; padding: 12px 14px; }
   .tk .strip { grid-column: 2 / -1; grid-row: 2; max-width: 520px; }
   .tk .when { grid-column: 3; grid-row: 1; align-self: start; }
   .tk .ra { grid-column: 2 / -1; grid-row: 3; justify-content: flex-start; }
@@ -563,13 +578,14 @@ details.doc summary .muted { font-weight: 400; }
   .bar-mid { order: 3; flex-basis: 100%; overflow-x: auto; }
   .bar-who span { display: none; }
   .fresh { max-width: 22ch; margin-left: auto; }
-  .tk .pos { display: none; } .tk { grid-template-columns: minmax(0, 1fr) auto; }
-  .tk .strip, .tk .ra { grid-column: 1 / -1; } .tk .when { grid-column: 2; }
+  .tk .pos { display: none; } .tk { grid-template-columns: 22px minmax(0, 1fr) auto; }
+  .tk .strip, .tk .ra { grid-column: 2 / -1; } .tk .when { grid-column: 3; }
   main.rv { padding-top: 16px; }
   .panel { padding: 14px; }
   .panel.flush > .hd { padding: 12px 14px; }
 }
 """
+STYLE += findings_view.FINDINGS_CSS + findings_agent_view.AGENT_CSS   # the findings board, the agent's card
 
 
 def _ms(v):
@@ -855,15 +871,25 @@ class Runs:
         except OSError:
             return []
 
-    def ticket_keys(self):
-        """The queue's tickets in its order, then any other ticket folder."""
-        dirs = self._ticket_dirs()
+    def _listed(self, name):
         try:
-            with open(os.path.join(self.queue_dir, "queue.list"), encoding="utf-8") as f:
-                order = [k for k in f.read().split() if k in dirs]
+            with open(os.path.join(self.queue_dir, name), encoding="utf-8") as f:
+                return f.read().split()
         except OSError:
-            order = []
-        return order + sorted(k for k in dirs if k not in order)
+            return []
+
+    def ticket_keys(self):
+        """The queue's tickets in its order, then any other ticket folder; not the archived ones."""
+        dirs = self._ticket_dirs()
+        order = [k for k in self._listed("queue.list") if k in dirs]
+        put_away = set(self.archived_keys()) - set(order)   # in both (an archive cut short): in the queue
+        return order + sorted(k for k in dirs if k not in order and k not in put_away)
+
+    def archived_keys(self):
+        """The tickets harness queue archive put away (archived.list), newest first."""
+        dirs = set(self._ticket_dirs())
+        order = set(self._listed("queue.list"))
+        return [k for k in self._listed("archived.list") if k in dirs and k not in order]
 
     def ticket_state(self, key):
         """state.json, its fields checked: written by the queue, but a hand edit or
@@ -1804,10 +1830,7 @@ def _ticket_row(runs, key, st, i, n, now):
     status = st.get("status", "")
     base = f"/runs/ticket/{quote(key)}/"
     back = (("back", "queue"),)
-    acts = [_btn(base + "move", "&uarr;", "sm ic", back + (("where", "up"),), title=f"Move {key} up",
-                 disabled=i == 0),
-            _btn(base + "move", "&darr;", "sm ic", back + (("where", "down"),), title=f"Move {key} down",
-                 disabled=i == n - 1)]
+    acts = []
     if status in ("needs-answers", "plan-review"):
         acts.append(f"<a class='btn sm primary' href='/runs/ticket/{quote(key)}' title="
                     + ("'open the ticket to answer the planner&#39;s questions'>Answer" if status == "needs-answers"
@@ -1830,6 +1853,8 @@ def _ticket_row(runs, key, st, i, n, now):
                      title="Stop it first" if status == "running" else REMOVE_TITLE,
                      confirm=f"Remove {key} from the queue? Its " + ("stage outputs are deleted (the project "
                              "and its branch stay)." if st.get("in_place") else "clone and stage outputs are deleted.")))
+    acts.insert(len(acts) - 1, _btn(base + "archive", "Archive", "sm", back, disabled=status == "running",
+                                    title="Stop it first" if status == "running" else ARCHIVE_TITLE))
     tone = " wait" if status in WAITING + ("interrupted",) else " run" if status == "running" else ""
     proj = os.path.basename((st.get("project") or "").rstrip("/\\"))
     tags = f"<span class='tag' title='{esc(st.get('project', ''))}'>{esc(proj)}</span>" if proj else ""
@@ -1845,7 +1870,11 @@ def _ticket_row(runs, key, st, i, n, now):
     if st.get("plan_review"):
         tags += " <span class='tag' title='the plan waits for your approval before implementing'>plan approval</span>"
     when = _iso_ms(st.get("updated", ""))
-    return (f"<div class='tk{tone}'><span class='pos'>{i + 1}</span><div class='main'><div class='key'>"
+    grip = (f"<span class='grip' role='button' tabindex='0' title='Drag to move {esc(key)} in the queue "
+            "(or focus it and use the arrow keys)' aria-label='Move'>&#8942;&#8942;</span>") if n > 1 else \
+        "<span class='grip off'></span>"
+    return (f"<div class='tk{tone}' data-sort-key='{esc(key)}'><span class='lead'>{grip}<span class='pos'>{i + 1}</span></span>"
+            "<div class='main'><div class='key'>"
             f"<a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>{_pill(status, st.get('stopping'))}{tags}</div>"
             f"<div class='why' title='{esc(_why(st))}'>{esc(_why(st)) or '&nbsp;'}</div></div>"
             f"{stage_strip(st)}<span class='when' title='last changed'>{_ago(when, now) if when else ''}</span>"
@@ -1934,11 +1963,46 @@ def queue_live(runs):
     rows = [_ticket_row(runs, k, states[k], i, len(keys), now) for i, k in enumerate(keys)]
     tickets = (f"<div class='hd'><h2>Tickets <span class='muted'>{len(keys)}</span></h2>"
                f"<div class='counts'>{summary}</div></div>"
-               + (f"<div class='tks'>{''.join(rows)}</div>" if rows else
+               + (f"<div class='tks' data-sort-url='/runs/ticket/{{key}}/move'>{''.join(rows)}</div>" if rows else
                   "<div class='empty'>The queue is empty. Add tickets below."
                   f"<div class='muted'>Its folder: <code>{esc(runs.queue_dir or '(none given)')}</code></div></div>"))
-    regions = {"runner": _runner_card(runs, runs.runner(now), now), "tickets": tickets, "nav": nav(runs, "queue")}
+    regions = {"runner": _runner_card(runs, runs.runner(now), now), "tickets": tickets,
+               "archived": _archived(runs, now),
+               "findings": findings_view.findings_region(runs), "fagent": _findings_agent(runs), "nav": nav(runs, "queue")}
     return {"sig": _sig(regions), "regions": regions}
+
+
+ARCHIVE_TITLE = ("out of the queue but kept: listed under Archived at the bottom of this page, its page and "
+                 "notes still there; Return to queue puts it back")
+
+
+def _archived(runs, now):
+    """The archived tickets, at the bottom of the queue page: still opened from here, one click back."""
+    keys = runs.archived_keys()
+    if not keys:
+        return ""
+    rows = []
+    for key in keys:
+        st = runs.ticket_state(key)
+        when = _iso_ms(st.get("updated", ""))
+        proj = os.path.basename((st.get("project") or "").rstrip("/\\"))
+        rows.append(f"<div class='tk arch'><span class='lead'><span class='grip off'></span></span><div class='main'>"
+                    f"<div class='key'><a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>"
+                    f"{_pill(st.get('status', ''))}"
+                    + (f"<span class='tag' title='{esc(st.get('project', ''))}'>{esc(proj)}</span>" if proj else "")
+                    + f"</div><div class='why' title='{esc(_why(st))}'>{esc(_why(st)) or '&nbsp;'}</div></div>"
+                    f"{stage_strip(st)}<span class='when' title='last changed'>{_ago(when, now) if when else ''}</span>"
+                    f"<div class='ra'>{_btn(f'/runs/ticket/{quote(key)}/unarchive', 'Return to queue', 'sm', (('back', 'queue'),), title='back in the queue, at the bottom, as it was')}"
+                    f"</div></div>")
+    return (f"<details class='panel flush arch' data-k='archived'><summary class='hd'><h2>Archived "
+            f"<span class='muted'>{len(keys)}</span></h2><span class='muted'>out of the queue, kept to look back "
+            f"at</span></summary><div class='tks'>{''.join(rows)}</div></details>")
+
+
+def _findings_agent(runs):
+    """The findings agent's card (start, stop, notes, what it is on), above the findings board."""
+    d = findings_view.state_dir(runs)
+    return findings_agent_view.agent_card(os.path.join(d, "findings")) if d else ""
 
 
 def _serve_project(runs):
@@ -1959,7 +2023,8 @@ def _projects(runs):
     harness serve was started in, then those tickets were added with, newest first."""
     here = _serve_project(runs)
     seen = [here] if here else []
-    for k in sorted(runs.ticket_keys(), key=lambda k: -_iso_ms(runs.ticket_state(k).get("created", ""))):
+    for k in sorted(runs.ticket_keys() + runs.archived_keys(),
+                    key=lambda k: -_iso_ms(runs.ticket_state(k).get("created", ""))):
         p = runs.ticket_state(k).get("project")
         if p and p not in seen:
             seen.append(p)
@@ -2116,7 +2181,10 @@ def render_queue_page(runs, msg="", bad=False, form=None, err=""):
             _flash(msg, bad),
             f"<div id='r-runner'>{d['regions']['runner']}</div>",
             f"<section class='panel flush' id='r-tickets'>{d['regions']['tickets']}</section>",
-            add_form(runs, form, err)]
+            f"<div id='r-fagent'>{d['regions']['fagent']}</div>",
+            f"<section class='panel flush' id='r-findings'>{d['regions']['findings']}</section>",
+            add_form(runs, form, err),
+            f"<div id='r-archived'>{d['regions']['archived']}</div>"]
 
 
 # --- /runs/ticket/KEY ---------------------------------------------------------------
@@ -2334,7 +2402,8 @@ def _t_head(runs, key, st, pos, n):
     upd = _iso_ms(st.get("updated", ""))
     if upd:
         facts.append(f"<span>updated <b>{_ago(upd)}</b></span>")
-    where = f"<span class='muted'>{pos} of {n} in the queue</span>" if pos else ""
+    where = (f"<span class='muted'>{pos} of {n} in the queue</span>" if pos else
+             "<span class='muted'>archived</span>" if key in runs.archived_keys() else "")
     return ("<header class='ph'><div class='crumbs'><a href='/runs/queue'>Queue</a><span>/</span>"
             f"<b>{esc(key)}</b></div><h1>{esc(key)}</h1>{_pill(status, st.get('stopping'))}{where}"
             f"<a class='btn' href='/runs/ticket/{quote(key)}/diff'>Changes</a>"
@@ -2388,6 +2457,14 @@ def _t_acts(runs, key, st, rows, live, pos, n):
     status = st.get("status", "")
     base = f"/runs/ticket/{quote(key)}/"
     parts = []
+    if key in runs.archived_keys():   # nothing runs it: back in the queue first, then its buttons
+        return ("<div class='acts'>" + _btn(base + "unarchive", "Return to queue", "primary",
+                                            title="back in the queue, at the bottom, as it was")
+                + "<span class='muted'>Archived: out of the queue, kept to look back at.</span><span class='sep'></span>"
+                + _btn(base + "remove", "Remove", "sm danger", title=REMOVE_TITLE,
+                       confirm=f"Remove {key}? Its " + ("outputs and log are deleted (the project and its branch "
+                               "stay)." if st.get("in_place") else "clone, outputs and log are deleted."))
+                + "</div>")
     now_live = [r for r in rows if r["id"] in live]
     if now_live:
         r = max(now_live, key=lambda r: _ms(r["time_created"]))
@@ -2412,13 +2489,9 @@ def _t_acts(runs, key, st, rows, live, pos, n):
     if status in STOPPABLE and not st.get("stopping"):
         parts.append(_btn(base + "stop", "Stop", "warn", title=STOP_TITLE[status == "running"], confirm=f"Stop {key}?" + (
             " Its agent is stopped now; Continue on this page goes on where it was." if status == "running" else "")))
-    if pos:
-        parts.append("<span class='sep'></span>")
-        for where, label in (("top", "Top"), ("up", "Up"), ("down", "Down"), ("bottom", "Bottom")):
-            dis = (pos == 1 and where in ("top", "up")) or (pos == n and where in ("down", "bottom"))
-            parts.append(_btn(base + "move", label, "sm", (("where", where),), disabled=dis,
-                              title=f"Move {key} {where}"))
     parts.append("<span class='sep'></span>")
+    parts.append(_btn(base + "archive", "Archive", "sm", disabled=status == "running",
+                      title="Stop it first: its agent is working on it" if status == "running" else ARCHIVE_TITLE))
     parts.append(_btn(base + "remove", "Remove", "sm danger", disabled=status == "running",
                       title="Stop it first: its agent is working on it" if status == "running" else REMOVE_TITLE,
                       confirm=f"Remove {key}? Its " + ("outputs and log are deleted (the project and its "
@@ -3023,7 +3096,7 @@ def render_debug_report(runs, kind, name):
 # --- actions ------------------------------------------------------------------------
 
 TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note", "followup", "edit",
-                  "fix")
+                  "fix", "archive", "unarchive")
 FIXABLE = ("done", "blocked", "stopped")   # ticket_queue.OWNER_FIXABLE
 FIX_MAX = 40                              # ticket_queue.MUST_FIX_MAX: review comments in one send
 FIX_TEXT_MAX = 2000                       # ticket_queue.FIX_ITEM_CAP: characters of one
@@ -3280,10 +3353,19 @@ def ticket_action(runs, key, action, form):
             return False, f"{key} is running; stop it first{again}"
         return _queue(runs, ["remove", key, "--harness", runs.harness])
     if action == "move":
+        if "key" in form or "before" in form:   # a drag on the queue page: just above that
+            before = _one(form, "before").strip().upper()   # ticket; none (a blank is dropped): the bottom
+            if before and (not KEY_RE.match(before) or before not in runs._ticket_dirs()):
+                return False, f"no ticket {before}{again}"
+            return _queue(runs, ["move", key, "--before", before])
         where = _one(form, "where")
         if where not in MOVES:
             return False, "move takes up, down, top or bottom"
         return _queue(runs, ["move", key, where])
+    if action in ("archive", "unarchive"):
+        if action == "archive" and status == "running":
+            return False, f"{key} is running; stop it first{again}"
+        return _queue(runs, [action, key])
     text = _one(form, "text").replace("\r\n", "\n")   # note
     if not text.strip():
         return False, "the note is empty"
@@ -3909,6 +3991,9 @@ COMMON_JS = """
   }
   window.hSwap = function (r, html) {
     var keep = {}, any = false, loose = false;
+    // a row held by the drag (or its move on the way): this region waits for the next poll
+    if (window.hDragging && (r.contains(window.hDragging) || window.hDragging.contains(r))) return false;
+    if (r.querySelector('[data-sorting]')) return false;
     keys(r).forEach(function (p) { if (busy(p[1])) { keep[p[0]] = p[1]; any = true; } });
     r.querySelectorAll('input, textarea, select').forEach(function (x) { if (!x.form && changed(x)) loose = true; });
     if (loose) return false;
@@ -4198,6 +4283,121 @@ COMMON_JS = """
     branches();
   }
 })();
+
+// Drag to reorder: a container with data-sort-url ('{key}' in it: the row's key)
+// whose child rows carry data-sort-key and hold a .grip handle. On drop it POSTs
+// key and before (the key of the row now below it, '' at the end); a refusal puts
+// the row back and says why. Live swaps of the container wait while a row is held.
+// Arrow keys on a focused handle move the row one place.
+(function () {
+  var held = null;
+  function rowsOf(box) {
+    return Array.prototype.filter.call(box.children, function (c) { return c.hasAttribute('data-sort-key'); });
+  }
+  function boxOf(el) {
+    var row = el.closest('[data-sort-key]');
+    var box = row && row.parentNode;
+    return box && box.hasAttribute && box.hasAttribute('data-sort-url') ? [box, row] : null;
+  }
+  function say(box, text) {
+    var n = box.previousElementSibling;
+    if (!n || !n.classList.contains('sortmsg')) {
+      n = document.createElement('div');
+      n.className = 'flash bad sortmsg';
+      box.parentNode.insertBefore(n, box);
+    }
+    n.textContent = text;
+    if (!text) n.remove();
+  }
+  function send(box, row, was) {
+    var next = row.nextElementSibling;
+    while (next && !next.hasAttribute('data-sort-key')) next = next.nextElementSibling;
+    var key = row.getAttribute('data-sort-key');
+    if ((next || null) === (was || null)) return;   // dropped where it was
+    var body = new URLSearchParams();
+    body.append('key', key);
+    body.append('before', next ? next.getAttribute('data-sort-key') : '');
+    body.append('back', 'queue');
+    box.setAttribute('data-sorting', '1');
+    fetch(box.getAttribute('data-sort-url').replace('{key}', encodeURIComponent(key)),
+          {method: 'POST', credentials: 'same-origin', headers: {'X-Harness-Live': '1'}, body: body})
+      .then(function (r) {
+        if (r.ok) { say(box, ''); return; }
+        return r.text().then(function (t) {
+          var d = document.createElement('div');
+          d.innerHTML = t;
+          var e = d.querySelector('.err');
+          throw new Error(e ? e.textContent : 'the move was refused (' + r.status + ')');
+        });
+      })
+      .catch(function (e) {
+        box.insertBefore(row, was && was.parentNode === box ? was : null);
+        say(box, 'Not moved: ' + (e && e.message ? e.message : 'the server did not answer'));
+      })
+      .then(function () { box.removeAttribute('data-sorting'); if (window.hPoll) window.hPoll(); });
+  }
+  function nextRow(row) {
+    var n = row.nextElementSibling;
+    while (n && !n.hasAttribute('data-sort-key')) n = n.nextElementSibling;
+    return n;
+  }
+  document.addEventListener('pointerdown', function (ev) {
+    var g = ev.target.closest && ev.target.closest('.grip');
+    if (!g || g.classList.contains('off') || ev.button > 0) return;
+    var br = boxOf(g);
+    if (!br || br[0].hasAttribute('data-sorting')) return;
+    ev.preventDefault();
+    held = {box: br[0], row: br[1], was: nextRow(br[1]), id: ev.pointerId};
+    window.hDragging = br[0];
+    br[1].classList.add('dragging');
+    document.body.classList.add('sorting');
+    try { g.setPointerCapture(ev.pointerId); } catch (e) {}
+  });
+  document.addEventListener('pointermove', function (ev) {
+    if (!held || ev.pointerId !== held.id) return;
+    ev.preventDefault();
+    var rows = rowsOf(held.box), y = ev.clientY, target = null;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] === held.row) continue;
+      var b = rows[i].getBoundingClientRect();
+      if (y < b.top + b.height / 2) { target = rows[i]; break; }
+    }
+    if (target !== nextRow(held.row) && target !== held.row) held.box.insertBefore(held.row, target);
+    var vh = window.innerHeight;   // near the edge: scroll the page along
+    if (y < 40) window.scrollBy(0, -12); else if (y > vh - 40) window.scrollBy(0, 12);
+  }, {passive: false});
+  function drop(ev) {
+    if (!held || (ev && ev.pointerId !== held.id)) return;
+    var h = held;
+    held = null;
+    window.hDragging = null;
+    h.row.classList.remove('dragging');
+    document.body.classList.remove('sorting');
+    if (ev && ev.type === 'pointercancel') { h.box.insertBefore(h.row, h.was && h.was.parentNode === h.box ? h.was : null); return; }
+    send(h.box, h.row, h.was);
+  }
+  document.addEventListener('pointerup', drop);
+  document.addEventListener('pointercancel', drop);
+  document.addEventListener('keydown', function (ev) {
+    var g = ev.target.closest && ev.target.closest('.grip');
+    if (!g || (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown')) return;
+    var br = boxOf(g);
+    if (!br || br[0].hasAttribute('data-sorting')) return;
+    ev.preventDefault();
+    var row = br[1], was = nextRow(row);
+    if (ev.key === 'ArrowUp') {
+      var p = row.previousElementSibling;
+      while (p && !p.hasAttribute('data-sort-key')) p = p.previousElementSibling;
+      if (!p) return;
+      br[0].insertBefore(row, p);
+    } else {
+      if (!was) return;
+      br[0].insertBefore(row, nextRow(was));
+    }
+    g.focus();
+    send(br[0], row, was);
+  });
+})();
 """.replace("%PRESETS%", json.dumps({k: list(v) for k, v in PRESETS.items()})).replace("%MAXK%", str(MAX_KEYS))
 
 # The home, queue, ticket and sessions pages: poll the page's live JSON every 3 s
@@ -4210,6 +4410,7 @@ LIVE_JS = """
   var url = tag.getAttribute('data-live'), sig = tag.getAttribute('data-sig'), last = {}, seeded = false,
     timer = null, fails = 0;
   window.hFresh('ok');
+  window.hPoll = function () { later(50); };   // now: after a drag's move
   function apply(regions) {
     Object.keys(regions).forEach(function (k) {
       var r = document.getElementById('r-' + k), h = regions[k];

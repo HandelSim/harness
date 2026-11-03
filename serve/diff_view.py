@@ -279,14 +279,25 @@ JS = r"""
       'then the rest once it is done.';
     var items = got && Array.isArray(got.items) ? got.items.filter(ok).slice(0, max) : [];
     var open = null, genAt = -1, rows = {}, pairs = [];
+    // what was being written when the page went: the open line box (back once its line is drawn) and
+    // the box for the whole change
+    if (got && got.open && got.open.at && typeof got.open.text === 'string' && typeof got.open.i === 'number' &&
+        got.open.i < items.length) open = {i: got.open.i, at: got.open.at, text: got.open.text.slice(0, tmax)};
+    if (got && typeof got.gen === 'string' && got.gen && !gen.value) {
+      gen.value = got.gen.slice(0, tmax);
+      genAt = typeof got.genAt === 'number' && got.genAt >= 0 && got.genAt < items.length ? got.genAt : -1;
+      if (genAt >= 0) add.textContent = 'Save comment';
+    }
     function ok(c) {
       return !!c && typeof c.text === 'string' && !!c.text.trim() && (!c.path || (typeof c.path === 'string' &&
         c.line > 0 && (c.side === 'new' || c.side === 'old') && typeof c.code === 'string'));
     }
-    function keep() {
+    function keep() {   // the comments and what is being written, so a closed tab or a restart loses nothing
+      var draft = open && open.text.trim() ? {i: open.i, at: open.at, text: open.text} : null, g = gen.value;
       try {
-        if (items.length) localStorage.setItem(store, JSON.stringify({sent: sent, items: items}));
-        else localStorage.removeItem(store);
+        if (items.length || draft || g.trim()) {
+          localStorage.setItem(store, JSON.stringify({sent: sent, items: items, open: draft, gen: g, genAt: genAt}));
+        } else localStorage.removeItem(store);
       } catch (e) {}
     }
     function node(tag, cls, text) {
@@ -401,9 +412,9 @@ JS = r"""
       t.rows = 3;
       t.value = open.text;
       t.setAttribute('aria-label', 'Comment on ' + where(open.at));
-      t.addEventListener('input', function () { open.text = t.value; even(); });
+      t.addEventListener('input', function () { open.text = t.value; keep(); even(); });
       acts.appendChild(btn(open.i >= 0 ? 'Save' : 'Add comment', function () { save(t.value); }));
-      acts.appendChild(btn('Cancel', function () { open = null; paint(); }));
+      acts.appendChild(btn('Cancel', function () { open = null; keep(); paint(); }));
       w.appendChild(node('div', 'muted', where(open.at)));
       w.appendChild(t);
       w.appendChild(acts);
@@ -442,6 +453,7 @@ JS = r"""
       send.textContent = 'Send ' + items.length + ' comment' + (items.length === 1 ? '' : 's') + ' to the fixer';
       even();
     }
+    gen.addEventListener('input', function () { keep(); });
     el.classList.add('dv-can');
     el.addEventListener('click', function (e) {
       var tr = e.target.closest ? e.target.closest('tr') : null;
@@ -505,7 +517,7 @@ def _review(runs, key, st):
     href = f"/runs/ticket/{quote(key)}"
     return ("<p class='muted'>Click a line to comment on it; <a href='#dv-review'>the comments</a> go to the "
             "fixer from the bottom of the page.</p>",
-            f"<section class='panel' id='dv-review' data-key='{esc(key)}' data-sent='{esc(mark)}' "
+            f"<section class='panel' id='dv-review' data-nomem data-key='{esc(key)}' data-sent='{esc(mark)}' "
             f"data-max='{runs_view.FIX_MAX}' data-text-max='{runs_view.FIX_TEXT_MAX}'><h2>Review comments</h2>"
             "<div class='muted'>Click a line of the diff to comment on it, or comment on the whole change here. "
             "The comments wait in this browser until you send them; then they all go straight to the fix stage, "

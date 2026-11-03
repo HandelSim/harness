@@ -9,6 +9,8 @@
 #   - the upstream key off curl's argv and out of opencode's env
 #   - cmd_serve           reaches its banner with no OAI configured
 #   - serve/test_runs.py  the run viewer (/runs)
+#   - serve/test_findings.py   the queue page's findings board
+#   - serve/test_page_memory.py what is typed survives leaving the page
 #   - agents/live-run.sh  headless runs that take messages (stub opencode)
 #   - harness_view        the run viewer a headless launch brings up
 #   - harness_view_refresh harness upgrade restarts it on the new code
@@ -37,6 +39,10 @@ PY=$(command -v python3 || command -v python) || fail "this test needs Python 3"
 ok "S1: pub server tests"
 ( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_runs ) || fail "S1: serve/test_runs.py failed"
 ok "S1: run viewer tests (/runs)"
+( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_findings ) || fail "S1: serve/test_findings.py failed"
+ok "S1: the queue page's findings board"
+( cd "$REPO_ROOT/serve" && "$PY" -m unittest -q test_page_memory ) || fail "S1: serve/test_page_memory.py failed"
+ok "S1: page memory"
 
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT

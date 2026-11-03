@@ -53,6 +53,9 @@ import runs as runs_view
 import settings_view  # noqa: E402
 import vault_view  # noqa: E402
 import diff_view  # noqa: E402
+import findings_view  # noqa: E402
+import findings_agent_view  # noqa: E402
+import page_memory  # noqa: E402
 
 PUB_CSP = "sandbox allow-scripts allow-popups"
 INDEX_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
@@ -989,7 +992,8 @@ def make_handler(cfg):
             nonce = secrets.token_urlsafe(16)
             bar = runs_view.nav_bar(cfg.runs, active, getattr(self, "user", None))
             body = _head(title, bar) + parts
-            body.append(f"<script nonce='{nonce}'>{runs_view.COMMON_JS}{script}</script>")
+            memory = page_memory.js(code, getattr(self, "command", "") == "POST")
+            body.append(f"<script nonce='{nonce}'>{memory}{runs_view.COMMON_JS}{script}</script>")
             body.append("</main></body></html>")
             self.send(code, "".join(body).encode(), "text/html; charset=utf-8",
                       {"Cache-Control": "no-store", "Content-Security-Policy": RUNS_CSP.format(nonce=nonce),
@@ -1025,7 +1029,7 @@ def make_handler(cfg):
             if bits[0] == "queue" and len(bits) <= 2 and r.queue_dir:
                 if len(bits) == 1:
                     self.send_runs(200, "harness: queue", runs_view.render_queue_page(r, done),
-                                   runs_view.LIVE_JS, head, "queue")
+                                   runs_view.LIVE_JS + findings_view.FINDINGS_JS, head, "queue")
                 elif bits[1] == "live":
                     self.send_json(runs_view.queue_live(r), head)
                 elif bits[1] == "branches":
@@ -1273,6 +1277,12 @@ def make_handler(cfg):
             if cfg.runs is not None and len(bits) == 2 and bits[0] == "queue":
                 self.queue_post(bits[1], user)
                 return
+            if cfg.runs is not None and len(bits) == 3 and bits[:2] == ["findings", "agent"]:
+                self.findings_agent_post(bits[2], user)
+                return
+            if cfg.runs is not None and len(bits) == 2 and bits[0] == "findings":
+                self.findings_post(bits[1], user)
+                return
             if cfg.runs is not None and len(bits) == 2 and bits[1] == "stop":
                 try:
                     form = self.read_form()
@@ -1325,7 +1335,7 @@ def make_handler(cfg):
             sys.stderr.write(f"[pub] queue {action} from {user or 'local'}: {msg}\n")
             if not ok and action == "add":   # the form again, with what was typed and why not
                 self.send_runs(409, "harness: queue", runs_view.render_queue_page(cfg.runs, form=form, err=msg),
-                               runs_view.LIVE_JS, active="queue")
+                               runs_view.LIVE_JS + findings_view.FINDINGS_JS, active="queue")
                 return
             key = (form.get("back") or [""])[0]   # started from a ticket's page: back there
             back = f"/runs/ticket/{quote(key)}" if runs_view.KEY_RE.match(key) else "/runs/queue"
@@ -1333,6 +1343,50 @@ def make_handler(cfg):
                 self.refused(msg, back, "Back to the ticket" if back != "/runs/queue" else "Back to the queue")
                 return
             self.redirect(f"{back}?done={quote(msg[:500])}")
+
+        def findings_post(self, action, user):
+            """The queue page's findings board: archive, restore, move (the drag helper
+            sends X-Harness-Live and is answered in JSON)."""
+            if action not in findings_view.ACTIONS or not cfg.runs.queue_dir:
+                self.send(404, b"not found\n")
+                return
+            try:   # archive selected: an id per ticked finding
+                form = self.read_form(findings_view.FORM_MAX, fields=findings_view.FORM_FIELDS)
+            except ValueError:
+                form = None
+            if form is None:
+                self.send(413, b"form too large\n")
+                return
+            ok, msg = findings_view.action(cfg.runs, action, form)
+            sys.stderr.write(f"[pub] findings {action} from {user or 'local'}: {msg}\n")
+            if self.headers.get("X-Harness-Live"):
+                self.send(200 if ok else 409, json.dumps({"ok": ok, "msg": msg}).encode(),
+                          "application/json; charset=utf-8", {"Cache-Control": "no-store"})
+            elif not ok:
+                self.refused(msg, "/runs/queue#findings", "Back to the queue")
+            else:
+                self.redirect(f"/runs/queue?done={quote(msg[:500])}#findings")
+
+        def findings_agent_post(self, action, user):
+            """The queue page's findings agent card: start, stop, save the owner's notes."""
+            if action not in ("start", "stop", "notes") or not cfg.runs.queue_dir:
+                self.send(404, b"not found\n")
+                return
+            try:
+                form = self.read_form(16 * 1024)
+            except ValueError:
+                form = None
+            if form is None:
+                self.send(413, b"form too large\n")
+                return
+            state = os.path.join(findings_view.state_dir(cfg.runs), "findings")
+            ok, msg = findings_agent_view.agent_action(state, cfg.runs.harness, action, form,
+                                                       project=runs_view._serve_project(cfg.runs))
+            sys.stderr.write(f"[pub] findings agent {action} from {user or 'local'}: {msg}\n")
+            if not ok:
+                self.refused(msg, "/runs/queue#findings-agent", "Back to the queue")
+                return
+            self.redirect(f"/runs/queue?done={quote(msg[:500])}#findings-agent")
 
         def ticket_post(self, key, action, user):
             """The ticket's buttons: answer the plan's questions, approve the plan,

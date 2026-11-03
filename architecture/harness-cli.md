@@ -159,7 +159,7 @@ The implementation has one `cmd_<name>` function per subcommand:
 | Containerless | `host`, `host down` — run the proxy + opencode as plain host processes, no docker. See "Host mode" below. |
 | Alternate upstream | `chatgpt`, `chatgpt host` — the same two launch paths run against the ChatGPT backend-api instead of the OpenAI-compatible upstream. See "ChatGPT backend" below. |
 | Diagnostics | `doctor`, `preflight`, `probe`, `usage`, `help`, `debug` (an agent on harness itself; see "`debug`" below) |
-| Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove`, `ticket`, `context`, `queue` — see "Vaults", "Tickets and context" and "Ticket queue" below. |
+| Vaults | `vault` (list), `vault add`, `vault new`, `vault use`, `vault off`, `vault remove`, `ticket`, `context`, `queue`, `findings` — see "Vaults", "Tickets and context", "Ticket queue" and "Findings agent" below. |
 | Pub page | `serve` — the vault's pub pages plus opencode web, loopback only. See "`serve`" below. |
 | Test / bench | `test`, `benchmark` — `benchmark --test-modes` is the docker-free hybrid-vs-single A/B (below); the other `benchmark` targets are the harbor runners under `tests/benchmarks/`. |
 | Net (allowlist + per-service firewall) | `net list`, `net allow`, `net deny`, `net edit`, `net status`, `net open`, `net close` |
@@ -1019,7 +1019,14 @@ its agent's process group from run.json, `taskkill /T` on Windows, waits for
 `run.lock`, then puts every running ticket back, `stopped` when it had a
 stop sentinel, else `queued` with an `interrupted` entry, and stops the
 held launch's container), `move KEY
-up|down|top|bottom`, `remove KEY` (refused while a run has it in hand, which lasts until the
+up|down|top|bottom` or `move KEY --before OTHER` (just above OTHER, `''` the
+bottom: the queue page's drag, by key so two tabs cannot misplace it),
+`archive KEY...` (refused while running or while a run has it in hand: the
+key leaves `queue.list` for `archived.list`, newest first, `archived.list`
+written first so a crash lists it twice rather than losing it, and
+`state.json` gets `archived`; the run never takes it, and `retry`, `add` of
+it are refused) and `unarchive KEY...` (back at the bottom of the order),
+`remove KEY` (refused while a run has it in hand, which lasts until the
 run has put the folder back, so a ticket that just finished can answer "the
 run is finishing up"; the reply says where the work stays and, in place,
 which branch the folder is still on; the exclude block is stripped unless
@@ -1430,7 +1437,7 @@ vault as `wiki/notes/tickets/KEY-log.md` and `queue _sync` captures the session
 commit, push) so the warning a timed-out `_sync` leaves (`SYNC_TIMEOUT`, its
 stderr's tail) names the step that hung. Nothing is written to the
 tracker.
-State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
+State: `state/queue/queue.list` (order), `archived.list` (archived keys; a key in both counts as queued), `KEY/state.json` (status, stage,
 attempt, feedback, reason, the plan's `questions`, `criteria` and `plan_sig`, `take_defaults`, `history`, `vault`), `KEY/log.md` (each line stamped in this computer's time; `state.json`'s stamps are ISO UTC, which the run viewer shows in local time with `_local`/`_local_log`, older UTC log lines too), `KEY/<stage>-N.out`, every verifier reply
 as `KEY/verify-*.txt`, `run-I.json` per slot of a parallel run, `vault.lock`, and `run.lock` (one run at a time: `flock`, or
 `msvcrt.locking` on Windows). Each agent runs in its own session (its own
@@ -1453,6 +1460,69 @@ credentials (`credential.interactive=false`, `GCM_INTERACTIVE=never`, ssh
 `core.sshCommand` names an ssh of the owner's), and a container `run` asks the open-firewall question once,
 then sets `HARNESS_NET_CONFIRM=1` for its stages; with `--single-message`
 its stage launches send the single header on the shared proxy. Covered by `tests/unit_queue_test.sh`.
+
+### Findings agent
+
+`harness findings start|run [DIR...]|stop|status|notes` (`cmd_findings`,
+`scripts/findings_agent.py`) is a background agent that reads the committed
+code (HEAD) of DIR (default: the git top folder here, else the repos it
+scanned last) and asks a free model about it. It never changes code; it writes
+only `state/findings/` (not `harness queue findings`, which files a vault's
+findings as tickets).
+
+- **Loop.** `run` holds the host proxy lease for its life (`host_proxy_hold`,
+  then `host_proxy_done` or `host_proxy_release`) and runs the script; exit 76
+  (the proxy refused connections for 5 min) starts the proxy again and runs it
+  again. `start` runs `findings run` under `setsid nohup`, logging to
+  `agent.out`. The script is a supervisor: it holds `agent.lock` (a second run
+  exits 0), runs the worker as a child, restarts it after 10 s doubling to 5 min
+  when it dies or does not beat for 10 min, and ends on SIGTERM, SIGINT or a
+  `stop` file. `stop` writes that file and signals the pids in `agent.json` and
+  `wrapper.pid` (the bash loop) after checking their command lines.
+- **Units.** Each `git ls-tree` blob that is not a symlink, over 400 KB,
+  binary, vendored, a lock file, generated or a secret (`vault_ingest`'s
+  `SKIP_*` and `SECRET_PATH`), cut into chunks of about 40k chars on
+  top-level boundaries, times its lenses: `bug`, `simplify`, `refactor`,
+  `docs` for code; `ui` also for UI extensions or folders, or a chunk with 15
+  or more HTML tags; `docs` only for .md/.rst/.txt; `bug` only for other
+  text. `remove`: a code file whose stem no other tracked file contains
+  (`git grep -l -F`), judged from its first 120 lines. Work order: changed
+  (content, prompt version or owner notes), new, then older than
+  `FINDINGS_RESCAN_DAYS`; else HEAD is polled every 60 s. When HEAD moves, an
+  open finding whose evidence left the file becomes `stale`. Three failures in a
+  row set a unit aside until its content changes.
+- **Request.** One user message, header `x-harness-raw: 1` (`call_model`): a
+  role line, the numbered chunk in a nonce fence, for `bug` the call sites of
+  up to 8 names it defines (`git grep -w`, about 3k chars, secret files left
+  out), then the instructions last: the lens question, `notes.md` (4k chars),
+  the file's open findings as `title @ line`, and the format (up to 3
+  `FINDING | severity | line | title | evidence | detail` lines, or `NONE`).
+  A reply with neither is a failed call. A finding is kept only when its line
+  is in the chunk and its whitespace-folded evidence is within 8 lines of it.
+  Its id is `f-` plus 12 hex of sha1(repo name, path, lens, evidence); a known id
+  or the same title on the same path is dropped.
+- **Guards.** One request at a time in a child process killed after
+  `FINDINGS_CALL_TIMEOUT` (300 s), `FINDINGS_GAP` (20 s) apart. 429 waits the
+  time the error gives; 401/403 waits 15 min. Another failure probes
+  `/models`: when it answers the unit is blamed, else the agent backs off 30 s
+  doubling to 10 min. Before the first request and hourly the model must be
+  free in `/models` (the proxy's `_is_free_model` rule); a metered one pauses
+  the agent, rechecked every 15 min. `FINDINGS_MODEL` empty takes the first
+  free chat model, gemini-3.8-flash and gemini-2.5-pro first. At
+  `FINDINGS_OPEN_MAX` (200) open findings not archived in `board.json`, only
+  the stale check runs.
+- **State** (`state/findings/`): `findings.json` (`{"version":1,"findings":[...]}`,
+  the Findings board's source; written temp+fsync+rename by the worker
+  only; past 1500 entries the oldest stale, then archived, ones go),
+  `ledger.json` (per unit: sha, prompt hash, scanned, outcome, failures; the
+  file index; counts per lens), `agent.json` (state, heartbeat, unit,
+  last error, counts), `calls.jsonl` (one line per request, the reply's
+  first 4k chars; `calls.1.jsonl` at 5 MB), `agent.out` (same cap),
+  `notes.md`. The queue page's card is `serve/findings_agent_view.py`
+  (`agent_card`, `agent_action`: start, stop, notes).
+
+Covered by `tests/unit_findings_test.sh` (`tests/findings_agent_test.py`
+against a fake proxy, `serve/test_findings_agent_view.py`, the CLI).
 
 ### Interactive TTY resolution (Windows) — issue #82
 
@@ -2080,8 +2150,17 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   one of the ticket's stages; a ticket with none recorded has the five of
   `DEFAULT_STAGES`), why it waits (a running ticket: its stage,
   attempt and the run's `step`; a `running` ticket with no live run on it:
-  "run ended"), and its buttons (move, Answer
-  or Review plan, stop, retry, remove); and the Add form (Ticket: Jira
+  "run ended"), and its buttons (Answer
+  or Review plan, stop, retry, Archive, remove). A row is moved by dragging
+  the handle at its left (`.grip`, or focus it and use the arrow keys): the
+  sortable helper in `COMMON_JS` (a container with `data-sort-url`, rows
+  with `data-sort-key`) posts `key` and `before` (none: the bottom) and puts
+  the row back with the reason on a refusal; `hSwap` leaves the container
+  alone while a row is held or its move is in flight, then `hPoll` asks for
+  the live JSON at once. Under the Add form, a folded Archived panel
+  (`_archived`, region `r-archived`) lists `archived.list` with each ticket's
+  link and Return to queue; an archived ticket's page keeps everything and
+  offers only Return to queue and Remove. Then the Add form (Ticket: Jira
   tickets, by keys, or A ticket of your own, a title and a description
   and no keys, its key the next LOCAL-N as `next_local_key` predicts it;
   `add_tickets` checks everything else first, then `new_ticket` runs
@@ -2128,6 +2207,28 @@ offered as suggestions. It is taken as pasted: quotes
   `/c/...` path read as `C:/...`. A refused add shows the queue page again
   (409) with the reason in the form and every value kept. `/runs/queue/live`
   is the JSON the page polls.
+- The queue page's Findings panel (`serve/findings_view.py`, region
+  `r-findings`, between the tickets and the Add form): every finding in one
+  list. It reads the tickets' findings
+  notes (each top-level list item of `wiki/notes/tickets/KEY-findings.md` in
+  the ticket's vault, for the tickets in `queue.list` and `archived.list`)
+  and the findings agent's `<state>/findings/findings.json` (only its
+  `open` ones: a `stale` finding's evidence left the code). The ticket page
+  still shows each note as it is. A ticket finding's id is `t-` and a hash of
+  its key and its text, whitespace folded; an agent finding keeps its own.
+  What the owner does is kept in `<state>/findings/board.json` (`order`,
+  `archived`), written under `board.lock` with tmp and replace. Filters
+  (source, category, text), Copy, Copy selected and New ticket from selected
+  run in the browser. New ticket fills the Add form's "A ticket of your own"
+  with a title and a bullet list, and does not send it. The panel is one
+  form, so the poll leaves it alone while a finding is ticked or a filter is
+  set. `POST /runs/findings/archive|restore` (`id`, else the ticked `sel`) go
+  back to `/runs/queue#findings`. `POST /runs/findings/move` (`key`,
+  `before`) is the drag handle's, and answers JSON when `X-Harness-Live` is
+  sent. It first fills `order` with the order shown. New findings come after
+  the ones placed, newest first. Ids that are gone leave `order` on the next
+  write; archived ones are kept (the newest 1000), so a note that comes back
+  stays archived. At most 300 open and 200 archived rows are listed.
 - `/runs` (`?q=` filter): live runs, queue tickets with their sessions by
   stage, then every session newest first. The index shows the live ones in
   an "Agent runs" panel, under a line saying what the queue run is on (or
@@ -2285,17 +2386,40 @@ offered as suggestions. It is taken as pasted: quotes
   after the current one, the after-plan choice; test needs plan and
   implement here too), which sends only what changed. While running: read-only. `POST .../edit` runs `queue edit`; a
   refusal is the form again (409) with "Not changed:" and what was typed.
-- `POST /runs/ticket/<KEY>/{answer,approve,retry,stop,remove,move,note}`:
+- `POST /runs/ticket/<KEY>/{answer,approve,retry,stop,remove,move,archive,unarchive,note}`:
   `ticket_queue.py` `answer --stdin` (the form's answers as `## question`
   sections, `## Other`, and "go with the default" for the rest; needs the
   vault), `approve`, `retry [--stage S]`, `stop`, `remove` (refused while
-  running), `move up|down|top|bottom`, `note --stdin`. Each redirects back
+  running), `move up|down|top|bottom` or, from the drag (a `key` or
+  `before` field), `move --before`, `archive` (refused while running),
+  `unarchive`, `note --stdin`. The ticket page has no move buttons: the order
+  is the queue page's. Each redirects back
   with the queue's message, or answers 409 with the reason when the ticket
   is not in a state for it (answers sent twice, approve of a ticket not in
   plan-review). Every POST needs a same-host `Origin` and, when codes are
   on, a session.
 - Text boxes grow with what is typed in them, up to 70% of the window,
   instead of scrolling (`grow` in `COMMON_JS`).
+- Page memory (`serve/page_memory.py`): every page sent through `send_runs`
+  starts its script with `page_memory.js(code, post)`, ahead of COMMON_JS
+  (which drops `?done=` from the address bar). It keeps what is typed or
+  picked in the page's POST forms, and in fields outside any form, in the
+  browser's localStorage under `hmem:`. One draft is kept per form, keyed by
+  the form's action, id, a hash of its hidden fields and its place on the
+  page, so the 409 page and the normal page share it and an old plan round's
+  draft (another `sig`) never fills the next. When the page comes back the
+  draft is put back, with a line that says so and a Clear it button. Fields
+  that appear later (live swaps, the Add form's repositories) are restored
+  too. A field is restored only if it still holds the value the server gave
+  when the draft was made, so a changed server value wins. A draft is
+  dropped once its form's send goes through: the next page is a fresh
+  navigation with status below 400, no `bad=`, and either `done=`, a direct
+  answer to the POST, or the same path. A refused send keeps it. Password,
+  hidden and file inputs, GET forms, the sign-in form, secret-like names and
+  anything under `data-nomem` are never stored. Drafts expire after 30 days,
+  and the oldest go past about 2 MB. The Changes page's review comments keep
+  their own store (`harness.review.KEY`, under `data-nomem`): the comments,
+  the open line box's text and the whole-change box's.
 - Live updates: Home and the queue, ticket and session-list pages poll their
   `/live` JSON every 3 s (a session page its tail) and swap only the parts
   that changed (`hSwap` in `COMMON_JS`): a form being filled in (a changed

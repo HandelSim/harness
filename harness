@@ -2862,6 +2862,12 @@ commands:
                         keyboard: plan (with questions), implement, review,
                         fix, push a branch; AI-checked at each stage (see
                         'harness queue --help')
+  findings [start|stop|status]
+                        a background agent that reads the committed code and
+                        asks a free model for bugs, UI problems, refactors,
+                        simplifications, unused files and doc errors; the
+                        checked ones go on the queue page's Findings board
+                        (see 'harness findings --help')
   ticket [KEY|off|pull|login]
                         the ticket this folder works on: every launch pulls
                         it from the tracker into the vault and gives the agent
@@ -7126,6 +7132,11 @@ usage: harness queue [list]                 the queue: each ticket's status and 
                                             the queue, or stopped if you had stopped it
        harness queue move KEY up|down|top|bottom
                                             change the order the queue takes tickets in
+       harness queue move KEY --before OTHER
+                                            put KEY just above OTHER ('' : the bottom)
+       harness queue archive KEY...         out of the queue but kept (a done ticket you
+                                            want to look back at); not a running one
+       harness queue unarchive KEY...       back in the queue, at the bottom
        harness queue watch                  follow the run as it goes (Ctrl-C stops
                                             watching, not the run)
        harness queue log [KEY]              the ticket's log (or the whole run's)
@@ -7421,8 +7432,15 @@ HELP
             esac ;;
         status) [[ $# -eq 0 || "$*" == --json ]] || { err "usage: harness queue status [--json]"; return 1; }
             args+=(status "$@") ;;
-        move) [[ $# -eq 2 ]] || { err "usage: harness queue move KEY up|down|top|bottom"; return 1; }
-            args+=(move "$1" "$2") ;;
+        move) if [[ $# -eq 3 && "$2" == --before ]]; then
+                args+=(move "$1" --before "$3")
+            elif [[ $# -eq 2 ]]; then
+                args+=(move "$1" "$2")
+            else
+                err "usage: harness queue move KEY up|down|top|bottom   (or KEY --before OTHER, '' for the bottom)"; return 1
+            fi ;;
+        archive|unarchive) (( $# )) || { err "usage: harness queue $sub KEY..."; return 1; }
+            args+=("$sub" "$@") ;;
         fix) [[ -n "${1:-}" && $# -ge 2 ]] || { err "usage: harness queue fix KEY \"COMMENT\" [\"COMMENT\"...]"; return 1; }
             args+=(fix "$1")
             shift
@@ -7558,6 +7576,167 @@ HELP
     # UTF-8 for its files and pipes whatever the Windows code page is.
     # shellcheck disable=SC2086  # $py can be 'py -3'
     PYTHONUTF8=1 $py "$script" "${args[@]}"
+}
+
+# `harness findings`: the findings agent (scripts/findings_agent.py) reads the
+# committed code of one or more repositories, asks a free model one question
+# at a time (bug, ui, refactor, simplify, remove, docs) and keeps the answers
+# that cite a real line: the Findings board on the queue page. It never
+# changes code. State: $state_root/findings (not `harness queue findings`,
+# which turns a vault's findings into tickets).
+cmd_findings() {
+    local sub="${1:-status}"
+    (( $# )) && shift
+    local fdir="$state_root/findings" py script sdir
+    case "$sub" in
+        -h|--help|help)
+            cat <<'HELP'
+usage: harness findings start [DIR...]   start the agent in the background and return
+       harness findings run [DIR...]     the same in this terminal (Ctrl-C stops it)
+       harness findings stop             stop it (within a minute; a request in
+                                         flight is dropped and asked again later)
+       harness findings status [--json]  what it does: state, model, current unit,
+                                         counts per question, last error
+       harness findings notes            edit the notes added to every request
+                                         ($EDITOR; printed when not a terminal)
+
+The findings agent reads the committed code (HEAD) of DIR (default: the git
+project here; else the ones it scanned last) and asks a free model about it,
+one file part and one question at a time: bug, ui, refactor, simplify, remove
+(files nothing mentions) and docs. A finding is kept only when the line it
+copies as evidence is in the code near the line it names. The kept ones are
+on the Findings board of the queue page (harness serve), where you archive
+them or make tickets of them. It never changes code, and never sends files
+that look like secrets (.env*, *.pem, *.key, id_rsa*, credentials*, secrets*).
+
+Changed and new code goes first; a finding whose evidence is gone from HEAD
+is marked stale; unchanged code is asked about again after
+FINDINGS_RESCAN_DAYS. When nothing is left it looks at HEAD every minute.
+It uses only a free model (lane assist or no credit cost, checked against
+the proxy's catalog hourly) and pauses otherwise. It holds the host proxy
+while it runs.
+
+Settings (environment or harness config):
+  FINDINGS_MODEL          the model (default: the first free one, preferring
+                          gemini-3.8-flash, then gemini-2.5-pro)
+  FINDINGS_GAP            seconds between requests (20)
+  FINDINGS_CALL_TIMEOUT   seconds a request may take (300)
+  FINDINGS_RESCAN_DAYS    days before unchanged code is asked about again (7)
+  FINDINGS_OPEN_MAX       open findings at which it pauses until you archive
+                          some (200)
+
+Files: $state_root/findings: findings.json (the board's list), ledger.json
+(what was asked, when), agent.json (status), calls.jsonl (every request and
+the start of its reply), agent.out (the log), notes.md.
+HELP
+            return 0 ;;
+    esac
+    host_require_python3 || exit 1
+    py=$(host_python_bin) || { err "harness findings needs python 3"; return 1; }
+    script="$clone_dir/scripts/findings_agent.py"
+    sdir="$fdir"
+    if command -v cygpath >/dev/null 2>&1; then
+        script=$(cygpath -m "$script")
+        sdir=$(cygpath -m "$fdir")
+    fi
+    local -a dirs=()
+    local d top
+    case "$sub" in
+        start|run)
+            for d in "$@"; do
+                [[ "$d" != -* ]] || { err "unknown option '$d' (see: harness findings --help)"; return 1; }
+                [[ -d "$d" ]] || { err "not a directory: $d"; return 1; }
+                top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || { err "not in a git repository: $d"; return 1; }
+                command -v cygpath >/dev/null 2>&1 && top=$(cygpath -m "$top")
+                dirs+=(--repo "$top")
+            done
+            if (( ! ${#dirs[@]} )) && top=$(git rev-parse --show-toplevel 2>/dev/null); then
+                command -v cygpath >/dev/null 2>&1 && top=$(cygpath -m "$top")
+                dirs+=(--repo "$top")
+            fi ;;
+    esac
+    case "$sub" in
+        status)
+            # shellcheck disable=SC2086  # $py can be 'py -3'
+            PYTHONUTF8=1 $py "$script" status --state "$sdir" "$@" ;;
+        stop)
+            # shellcheck disable=SC2086
+            PYTHONUTF8=1 $py "$script" stop --state "$sdir" ;;
+        notes)
+            mkdir -p "$fdir"
+            if [[ -t 0 && -t 1 ]]; then
+                # shellcheck disable=SC2086  # EDITOR can carry arguments
+                ${EDITOR:-vi} "$fdir/notes.md"
+            else
+                cat "$fdir/notes.md" 2>/dev/null || true
+            fi ;;
+        start)
+            # shellcheck disable=SC2086
+            if PYTHONUTF8=1 $py "$script" status --state "$sdir" --running; then
+                echo "[findings] already running (harness findings status)"
+                return 0
+            fi
+            mkdir -p "$fdir"
+            printf '== %s harness findings start %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$fdir/agent.out"
+            local pid
+            # Its own session: it outlives this terminal and a Ctrl-C here.
+            if command -v setsid >/dev/null 2>&1; then
+                setsid nohup bash "$clone_dir/harness" findings run "$@" >>"$fdir/agent.out" 2>&1 </dev/null &
+            else
+                nohup bash "$clone_dir/harness" findings run "$@" >>"$fdir/agent.out" 2>&1 </dev/null &
+            fi
+            pid=$!
+            local i
+            for i in 1 2 3 4 5 6; do
+                sleep 1
+                kill -0 "$pid" 2>/dev/null || break
+            done
+            # shellcheck disable=SC2086
+            if kill -0 "$pid" 2>/dev/null || PYTHONUTF8=1 $py "$script" status --state "$sdir" --running; then
+                echo "[findings] started; harness findings status says what it does (log: $fdir/agent.out)"
+                return 0
+            fi
+            err "the findings agent ended at once; the end of its log ($fdir/agent.out):"
+            tail -n 8 "$fdir/agent.out" >&2
+            return 1 ;;
+        run)
+            local started=0 rc=0 stopping=0
+            host_require_config
+            ensure_dirs
+            host_ensure_toolchain || { host_win_location_hint; exit 1; }
+            host_preflight        || { host_win_location_hint; exit 1; }
+            _gate_on_upstream_auth || exit 1
+            host_proxy_running || started=1
+            # Held for the whole run, so a harness closed meanwhile leaves the proxy up.
+            host_proxy_hold
+            host_proxy_start || { host_proxy_release; exit 1; }
+            host_proxy_wait_ready || { host_proxy_done; exit 1; }
+            mkdir -p "$fdir"
+            # `findings stop` ends this loop too (it signals the pid here).
+            printf '%s\n' "$$" >"$fdir/wrapper.pid"
+            trap 'stopping=1' TERM INT
+            while :; do
+                rc=0
+                # shellcheck disable=SC2086  # $py can be 'py -3'
+                PYTHONUTF8=1 $py "$script" run --state "$sdir" \
+                    --proxy "http://127.0.0.1:$(host_proxy_port)/v1" --model "${FINDINGS_MODEL:-}" \
+                    ${dirs[@]+"${dirs[@]}"} || rc=$?
+                # 76: the proxy stopped answering for 5 min. Start it again and go on.
+                (( rc == 76 && ! stopping )) || break
+                [[ -e "$fdir/stop" ]] && break
+                echo "[findings] the host proxy is not answering; starting it again" >&2
+                until (( stopping )) || [[ -e "$fdir/stop" ]] || { host_proxy_start && host_proxy_wait_ready; }; do
+                    sleep 30
+                done
+                (( stopping )) || [[ -e "$fdir/stop" ]] && break
+            done
+            trap - TERM INT
+            rm -f "$fdir/wrapper.pid" "$fdir/stop" 2>/dev/null || true
+            if (( started )); then host_proxy_done; else host_proxy_release; fi
+            (( rc == 76 )) && rc=0
+            return "$rc" ;;
+        *) err "unknown findings command '$sub' (see: harness findings --help)"; return 1 ;;
+    esac
 }
 
 cmd_vault() {
@@ -13134,6 +13313,7 @@ main() {
         vault)                      cmd_vault "$@" ;;
         ingest)                     cmd_ingest "$@" ;;
         queue)                      cmd_queue "$@" ;;
+        findings)                   cmd_findings "$@" ;;
         ticket)                     cmd_ticket "$@" ;;
         context)                    cmd_context "$@" ;;
         serve)                      cmd_serve "$@" ;;
