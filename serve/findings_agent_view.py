@@ -176,7 +176,10 @@ def agent_card(state_dir, flash=""):
     else:
         act = ("<form method='post' action='/runs/findings/agent/start'>"
                "<button type='submit' class='btn sm primary'>Start</button></form>")
-    parts.append(f"<div class='acts'>{act}</div>")
+    # FINDINGS_MODEL lives in .env; the Settings page edits it. The agent reads it when it starts.
+    model_link = ("<a class='muted' href='/settings#model'>Change the model in Settings"
+                  + (" (then Stop and Start)" if live else "") + "</a>")
+    parts.append(f"<div class='acts'>{act}{model_link}</div>")
     notes = _read(os.path.join(state_dir, "notes.md"), NOTES_MAX * 4)[:NOTES_MAX] if state_dir else ""
     parts.append("<details class='fa-notes' data-k='findings-agent-notes'><summary>Notes for every request"
                  + (f" <span class='muted'>{len(notes)} characters</span>" if notes else "") + "</summary>"

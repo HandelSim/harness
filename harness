@@ -2307,6 +2307,7 @@ TRACKER_TOKEN|Jira personal access token, or email:api-token for Jira Cloud (sec
 HARNESS_HOST_CONFIRM|1 skips the y/N question before host mode (harness host / serve) starts
 QUEUE_PARALLEL|tickets one queue run works at a time (default 1); tickets in the same project folder take turns; a running queue keeps its number until it is stopped and started again
 QUEUE_WATCH|1 (default): a queue run with nothing to do keeps watching and starts tickets as they are queued, answered, approved or retried, until it is stopped; 0: it ends when nothing is left to do
+FINDINGS_MODEL|the model the findings agent asks: a free one (empty: the first free chat model); Stop and Start the agent to use a change
 EOF
 }
 
@@ -7616,9 +7617,10 @@ It uses only a free model (lane assist or no credit cost, checked against
 the proxy's catalog hourly) and pauses otherwise. It holds the host proxy
 while it runs.
 
-Settings (environment or harness config):
+Settings (.env, or the environment):
   FINDINGS_MODEL          the model (default: the first free one, preferring
-                          gemini-3.8-flash, then gemini-2.5-pro)
+                          gemini-3.8-flash, then gemini-2.5-pro); also on
+                          'harness config' and the web UI's Settings page
   FINDINGS_GAP            seconds between requests (20)
   FINDINGS_CALL_TIMEOUT   seconds a request may take (300)
   FINDINGS_RESCAN_DAYS    days before unchanged code is asked about again (7)

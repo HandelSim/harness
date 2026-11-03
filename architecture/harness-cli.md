@@ -198,7 +198,7 @@ installer. Three commands cover post-install setup:
     `DEFAULT_MODEL_NAME` delegates to `cmd_model`.
   - `config get [KEY]` / `config list` print values (`config list --tsv`:
     `KEY<TAB>shown value<TAB>secret 1/0<TAB>description`, secrets masked, for
-    serve's Settings page, which groups them, `QUEUE_PARALLEL` and `QUEUE_WATCH` under Ticket queue);
+    serve's Settings page, which groups them, `QUEUE_PARALLEL` and `QUEUE_WATCH` under Ticket queue, `FINDINGS_MODEL` under Findings agent);
     `config set KEY VALUE` writes one (`QUEUE_PARALLEL` only a whole number of 1 or more, `QUEUE_WATCH` only 0 or 1). **Not a whitelist** — `set` writes any key; the picker/`get`
     just surface the common ones.
   - Reads use `_config_read_key` (straight from `$env_file`, so they reflect
@@ -1507,7 +1507,8 @@ findings as tickets).
   `/models`: when it answers the unit is blamed, else the agent backs off 30 s
   doubling to 10 min. Before the first request and hourly the model must be
   free in `/models` (the proxy's `_is_free_model` rule); a metered one pauses
-  the agent, rechecked every 15 min. `FINDINGS_MODEL` empty takes the first
+  the agent, rechecked every 15 min. `FINDINGS_MODEL` (`.env`, on `harness config` and
+  the Settings page; read when the agent starts) empty takes the first
   free chat model, gemini-3.8-flash and gemini-2.5-pro first. At
   `FINDINGS_OPEN_MAX` (200) open findings not archived in `board.json`, only
   the stale check runs.

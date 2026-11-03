@@ -1121,3 +1121,14 @@ class IngestControlsTest(VaultFixture):
         self.assertIn("done=Forgot+api", r.getheader("Location"))
         r, _ = self.post(self.port, "/vault/ingest/forget", {"name": "../x"})
         self.assertIn("bad=", r.getheader("Location"))
+
+
+class SettingsGroupsTest(unittest.TestCase):
+    def test_findings_model_has_its_own_group(self):
+        import settings_view
+        rows = [{"key": "QUEUE_WATCH", "value": "1", "secret": False, "desc": "w"},
+                {"key": "FINDINGS_MODEL", "value": "gemini-2.5-pro", "secret": False, "desc": "the model"}]
+        h = settings_view._config_panel(rows, "")
+        self.assertIn("<h3>Findings agent</h3>", h)
+        self.assertNotIn("<h3>Other</h3>", h)
+        self.assertIn("name='v_FINDINGS_MODEL' id='v_FINDINGS_MODEL' value='gemini-2.5-pro'", h)

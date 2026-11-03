@@ -27,6 +27,7 @@ GROUPS = (("Upstream model API", ("PROXY_API_URL", "PROXY_API_KEY", "DEFAULT_MOD
           ("ChatGPT backend (harness chatgpt)", ("CHATGPT_BASE_URL", "CHATGPT_MODEL_NAME", "CHATGPT_COOKIE_STRING")),
           ("Ticket tracker", ("TRACKER_TOKEN",)),
           ("Ticket queue", ("QUEUE_PARALLEL", "QUEUE_WATCH")),
+          ("Findings agent", ("FINDINGS_MODEL",)),
           ("Corporate proxy", ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")))
 MCP_ACTIONS = {"install": "installed", "enable": "enabled", "disable": "disabled"}
 MARKS = {"✓": ("ok", "ok"), "⚠": ("wait", "warning"), "✗": ("bad", "problem"),

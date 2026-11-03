@@ -260,5 +260,12 @@ done
 [[ "$(_config_read_key QUEUE_WATCH)" == 0 ]] || fail "T16: a refused value changed it"
 ok "T16: QUEUE_WATCH is listed and only 0 or 1 is saved"
 
+# --- T17: FINDINGS_MODEL is in .env.example and on the settings list ---------
+grep -q '^FINDINGS_MODEL=$' "$REPO_ROOT/.env.example" || fail "T17: FINDINGS_MODEL not in .env.example"
+grep -q '^FINDINGS_MODEL|' < <(_config_editable_keys) || fail "T17: FINDINGS_MODEL not editable"
+_config_set FINDINGS_MODEL gemini-2.5-pro >/dev/null || fail "T17: set refused"
+[[ "$(_config_read_key FINDINGS_MODEL)" == gemini-2.5-pro ]] || fail "T17: not written"
+ok "T17: FINDINGS_MODEL is in .env.example, listed, and saved"
+
 echo
 echo "CONFIG TEST PASSED"

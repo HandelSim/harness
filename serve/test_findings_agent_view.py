@@ -40,6 +40,7 @@ class CardTest(Base):
         self.assertIn("action='/runs/findings/agent/start'", h)
         self.assertIn("name='notes'", h)
         self.assertIn("maxlength='4000'", h)
+        self.assertIn("href='/settings#model'>Change the model in Settings</a>", h)
 
     def test_running_escapes_everything(self):
         self.status(unit="<b>x.py</b>", last_error="<script>alert(1)</script>", repos=["/r/<i>"],
@@ -59,6 +60,7 @@ class CardTest(Base):
         self.assertNotIn("/runs/findings/agent/start", h)
         self.assertIn("<td>bug</td><td>3</td><td>1</td><td>2</td><td>0</td>", h)
         self.assertIn("scanning", h)
+        self.assertIn("Change the model in Settings (then Stop and Start)</a>", h)
 
     def test_stale_heartbeat(self):
         self.status(heartbeat_ts=time.time() - 900)
