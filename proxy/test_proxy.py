@@ -6813,7 +6813,7 @@ class TestVaultReminderLine(unittest.TestCase):
                      "- Where: a clone of the project made for this ticket. Branch: ABC-7.",
                      f"- Done when: {done}",
                      "- The last attempt failed its checks",
-                     "- The review found 3 Must fix item(s)",
+                     "- There are 3 Must fix item(s)",
                      "`/v/wiki/notes/tickets/ABC-7-task.md`. `read` it when you need a detail"):
             self.assertIn(want, card)
         self.assertIn("- Work only in your working directory: ", card)

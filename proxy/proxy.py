@@ -3507,7 +3507,7 @@ def _task_card(vault, ticket, task=None, working_directory=None, do_in_card=True
         if f.get("attempt", 1) > 1:
             lines.append("- The last attempt failed its checks; what was wrong is in the task file.")
         if f.get("must_fix"):
-            lines.append(f"- The review found {f['must_fix']} Must fix item(s), listed in the task file;"
+            lines.append(f"- There are {f['must_fix']} Must fix item(s) (the review's, or the owner's comments on the diff), listed in the task file;"
                          " keep one todo item per Must fix item.")
         lines.append(f"- Full instructions (the ticket, plan, owner's answers and notes, problems with the last"
                      f" attempt): `{notes}/{t}-task.md`. `read` it when you need a detail this card and your"
