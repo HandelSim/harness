@@ -1088,6 +1088,27 @@ class QueueTest(Base):
         self.assertEqual(self.status()["status"], "done")
         self.assertEqual(self.status("ABC-2")["status"], "done")
 
+    def test_a_plan_passed_before_the_run_died_waits_and_is_not_checked_again(self):
+        self.add("ABC-1")
+        rc, out = self.run_queue("--plan-review", "1", "--push", "0")
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        self.assertEqual(st["status"], "plan-review", out)
+        outs = sorted(f for f in os.listdir(q.dir("ABC-1")) if f.startswith("plan") and f.endswith(".out"))
+        self.assertTrue(outs, os.listdir(q.dir("ABC-1")))
+        # as a run that died just after the verifier's PASS leaves it (before the wait is saved)
+        st.update(status="running", stage="plan", attempt=0, reason="")
+        st["verify_only"] = {"stage": "plan", "rc": 0, "out": os.path.join(q.dir("ABC-1"), outs[-1]),
+                             "started": 0, "passed": st["plan_sig"]}
+        q.save(st)
+        FakeProxy.mode, FakeProxy.seen = "reject", []   # a second ask would now say FAIL
+        rc, out = self.run_queue("--plan-review", "1", "--push", "0")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("plan-review", "implement"), out)
+        self.assertEqual(len(self.calls_of("planning")), 1)   # not planned over
+        self.assertFalse([x for x in FakeProxy.seen if "check a plan" in x[2]])
+        self.assertIn("not asked again", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
     def test_plan_review_holds_until_approved(self):
         self.add("ABC-1")
         rc, out = self.run_queue("--plan-review", "1", "--push", "0")

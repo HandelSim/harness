@@ -3276,7 +3276,14 @@ def stage_plan(ctx, st):
                                                         owner_notes(ctx.q.notes(st["key"])), criteria)
         if st["attempt"] < ctx.retries:   # asked for once more; on the last try only noted
             problems = shape
-    if not problems:
+    sig = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    kept = st.get("verify_only") if isinstance(st.get("verify_only"), dict) else {}
+    if not problems and kept.get("stage") == "plan" and kept.get("passed") == sig:
+        # a run that died after the verifier passed this plan (before its questions or
+        # the wait for approval were saved): passed is passed, the verifier is not asked
+        # again (a second answer that differs would plan the ticket over)
+        ctx.q.log(st["key"], "plan: its verifier passed this plan before the run ended; not asked again")
+    elif not problems:
         notes = plan_notes(text) + shape + step_notes(text, workdir(ctx.q, st))
         listed, nums = criteria_by_id(criteria)
         obj = verdict(ctx, st, "plan", lambda c: render("verify_plan", TICKET=read(p["ticket"], c), PLAN=text,
@@ -3285,13 +3292,16 @@ def stage_plan(ctx, st):
         ctx.q.log(st["key"], f"plan verifier: {verifier_line(obj, problems)}")
         if notes:
             ctx.q.log(st["key"], "plan notes (not failures)", "\n".join("- " + n for n in notes))
+        if not problems and kept.get("stage") == "plan":
+            st["verify_only"] = dict(kept, passed=sig)
+            ctx.q.save(st)
     if problems:
         return fail(ctx, st, rc, problems)
     items = plan_items(text)
     st["questions"] = [dict(q, blocking=bool(blocking([q["text"]]))) for q in items["questions"]]
     st["criteria"] = [dict(c, edge=is_edge(c)) for c in items["criteria"]]
     st["assumptions"] = items["assumptions"]
-    st["plan_sig"] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    st["plan_sig"] = sig
     write_atomic(os.path.join(ctx.q.dir(st["key"]), "plan.json"),
                  json.dumps(dict(items, sig=st["plan_sig"]), indent=1, ensure_ascii=False) + "\n")
     open_q = blocking(questions)
@@ -3315,11 +3325,12 @@ def stage_plan(ctx, st):
         st["implement_from"] = left[0]
     else:
         st.pop("implement_from", None)
-    advance(ctx, st, next_stage(st, "plan"))
     held = ctx.plan_review or st.get("plan_review") or st.get("plan_hold")
-    if held and not st.get("plan_approved") and st["status"] == "running":
-        st.update(status="plan-review", reason=f"plan ready to read: {p['plan']}")
-        ctx.q.save(st)
+    # the wait in the same save as the move on: a run that dies between two saves
+    # would leave the ticket running at the next stage, built without the approval
+    advance(ctx, st, next_stage(st, "plan"),
+            hold=f"plan ready to read: {p['plan']}" if held and not st.get("plan_approved") else "")
+    if st["status"] == "plan-review":
         ctx.q.log(st["key"], f"waiting for the plan to be read: harness queue approve {st['key']}")
 
 
@@ -4194,8 +4205,9 @@ def record(st, result, details=()):
     del h[:-HISTORY_CAP]
 
 
-def advance(ctx, st, stage, reason=""):
-    """On to stage; None: the ticket's stages are done (push marks done itself)."""
+def advance(ctx, st, stage, reason="", hold=""):
+    """On to stage; None: the ticket's stages are done (push marks done itself).
+    hold: at the stage, waiting for the owner's approval (plan-review), this reason."""
     if not stage and not st.get("in_place") and st.get("base_sha"):
         top = None
         with contextlib.suppress(Exception):
@@ -4213,6 +4225,8 @@ def advance(ctx, st, stage, reason=""):
     st.pop("went_on", None)
     if stage:
         st.update(stage=stage, attempt=0, feedback="", status="running")
+        if hold:
+            st.update(status="plan-review", reason=hold)
     else:
         if not reason and "push" not in stages_of(st):
             reason = f"its stages are done ({','.join(stages_of(st))}); nothing pushed"

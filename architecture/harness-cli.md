@@ -1252,7 +1252,11 @@ agent. The agent's result is saved as
 never launches it again (an outage found by `fail` keeps it too when the
 agent ended on its own, status 0 and no `crash_of` error): a verifier
 failure blocks with "verifier failed at STAGE ... retry KEY", and a plain retry checks the kept work again (at the
-plan stage too). A change's verdict needs `met: true` for each criterion. A
+plan stage too). A plan the verifier passed is marked so on `verify_only`
+(`passed`: the plan's hash), so a run that dies before its questions or its
+wait are saved does not ask again (a second answer that differed planned the
+ticket over); `advance(hold=)` sets `plan-review` in the same save as the
+move to the next stage. A change's verdict needs `met: true` for each criterion. A
 stage that runs past `--stage-timeout` (`QUEUE_STAGE_TIMEOUT`, 3 h) is
 stopped and its work checked as it is, like an idle one; a failed check is
 an attempt, and its retry is a new agent told to finish the work. It is
