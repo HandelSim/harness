@@ -930,6 +930,10 @@ class Runs:
                                        for k in ("files", "insertions", "deletions")}}
                          for r in (rounds if isinstance(rounds, list) else [])
                          if isinstance(r, dict) and isinstance(r.get("n"), int)]
+        sent = st.get("owner_reviews")   # the owner's review comments sent to the fix stage (harness queue fix)
+        out["owner_reviews"] = [{"at": str(r.get("at", "")), "items": [str(i) for i in r["items"]][:100]}
+                                for r in (sent if isinstance(sent, list) else [])
+                                if isinstance(r, dict) and isinstance(r.get("items"), list)]
         sig = st.get("plan_sig")
         out["plan_sig"] = sig if isinstance(sig, str) and re.match(r"^[0-9a-f]{4,64}$", sig) else ""
         out["take_defaults"] = st.get("take_defaults") is True
@@ -1022,6 +1026,19 @@ class Runs:
             q = tq.Queue(self.queue_dir)
             st = q.load(key)
             return tq.followup_refused(q, st) if isinstance(st, dict) else None
+        except Exception:
+            return None
+
+    def fix_refused(self, key):
+        """Why harness queue fix would refuse the owner's review comments on the ticket's
+        diff, "" when it would take them, None when that cannot be read (no comment box)."""
+        tq = _tq()
+        if tq is None or not hasattr(tq, "owner_fix_refused"):
+            return None
+        try:
+            q = tq.Queue(self.queue_dir)
+            st = q.load(key)
+            return tq.owner_fix_refused(q, st) if isinstance(st, dict) else None
         except Exception:
             return None
 
@@ -2719,6 +2736,8 @@ def _t_followup(runs, key, st):
             f"what is left. The plan comes back here for your approval before anything more is built, and the "
             f"review checks the whole change. Round {n}'s plan, review and result are kept "
             f"(<code>{esc(key)}-plan-r{n}.md</code> and so on).</div>"
+            f"<div class='muted'>Specific fixes, with no new plan? <a href='/runs/ticket/{quote(key)}/diff'>Review "
+            "the diff</a>: comment on its lines, and the comments go straight to the fixer.</div>"
             f"<form method='post' action='/runs/ticket/{quote(key)}/followup' class='send'>"
             f"<textarea name='text' required maxlength='{NOTE_MAX}' placeholder='e.g. the setting should be per "
             "project, not global; keep the old flag working'></textarea>"
@@ -2753,6 +2772,23 @@ def _t_rounds(runs, key, st):
     return "".join(parts)
 
 
+def _t_reviews(key, st):
+    """The owner's review comments sent to the fix stage from the Changes page (or
+    harness queue fix), newest first, each batch folded; nothing when none were."""
+    sent = st.get("owner_reviews") or []
+    if not sent:
+        return ""
+    parts = [f"<section class='panel'><h2>Your review comments <span class='muted'>{len(sent)}</span></h2>"
+             "<ul class='rounds'>"]
+    for r in reversed(sent):
+        n = len(r["items"])
+        parts.append(f"<li><details><summary>{esc(_local(r['at'])) if r['at'] else 'sent'} &middot; {n} comment"
+                     f"{'s' if n != 1 else ''} to the fixer</summary>"
+                     + "".join(f"<div class='txt'>{esc(i)}</div>" for i in r["items"]) + "</details></li>")
+    parts.append(f"</ul><a href='/runs/ticket/{quote(key)}/diff'>Changes</a></section>")
+    return "".join(parts)
+
+
 def ticket_live(runs, key):
     """The ticket page's regions, or None when the ticket is gone."""
     if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
@@ -2779,7 +2815,7 @@ def ticket_live(runs, key):
                "start": _t_start(runs, key, st, runs.runner(now), now), "qs": _t_questions(runs, key, st),
                "sessions": _t_sessions(runs, key, st, rows, live, outs, now),
                "attempts": _t_attempts(key, st, {o[0] for o in outs}), "notes": _t_notes(key, st),
-               "rounds": _t_rounds(runs, key, st), "docs": _t_docs(runs, key, st, log), "nav": nav(runs, "queue")}
+               "rounds": _t_rounds(runs, key, st) + _t_reviews(key, st), "docs": _t_docs(runs, key, st, log), "nav": nav(runs, "queue")}
     return {"sig": _sig(regions), "regions": regions}
 
 
@@ -2986,7 +3022,11 @@ def render_debug_report(runs, kind, name):
 
 # --- actions ------------------------------------------------------------------------
 
-TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note", "followup", "edit")
+TICKET_ACTIONS = ("answer", "approve", "retry", "continue", "stop", "remove", "move", "note", "followup", "edit",
+                  "fix")
+FIXABLE = ("done", "blocked", "stopped")   # ticket_queue.OWNER_FIXABLE
+FIX_MAX = 40                              # ticket_queue.MUST_FIX_MAX: review comments in one send
+FIX_TEXT_MAX = 2000                       # ticket_queue.FIX_ITEM_CAP: characters of one
 QUEUE_ACTIONS = ("add", "start", "halt", "end")
 # an answer or approve from a page that showed another plan (its sig): the plan was made again since
 CHANGED = "The plan changed since this page was loaded: reload it and answer again."
@@ -3208,6 +3248,29 @@ def ticket_action(runs, key, action, form):
         if len(text) > NOTE_MAX:
             return False, f"the follow-up is over {NOTE_MAX} characters"
         return _waits(runs, key, _queue(runs, ["followup", key, "--vault", vault, "--stdin"], text))
+    if action == "fix":   # the Changes page's review comments, straight to the fix stage
+        if status not in FIXABLE:
+            return False, f"{key} is {status}; review comments go to a done, blocked or stopped ticket{again}"
+        try:
+            got = json.loads(_one(form, "comments") or "[]")
+        except ValueError:
+            return False, "the comments did not come through as JSON; reload the Changes page and send again"
+        items = []
+        for c in got if isinstance(got, list) else [None]:
+            if not isinstance(c, dict) or not isinstance(c.get("text"), str) or not c["text"].strip():
+                return False, "a comment is empty or not a comment"
+            if len(c["text"]) > FIX_TEXT_MAX:
+                return False, f"a comment is over {FIX_TEXT_MAX} characters"
+            item = {"text": c["text"]}
+            if c.get("path"):
+                item.update(path=str(c["path"])[:500], line=c.get("line"), side=c.get("side"),
+                            code=str(c.get("code") or "")[:500])
+            items.append(item)
+        if not items:
+            return False, "no comments to send: click a line of the diff, or write a general comment"
+        if len(items) > FIX_MAX:
+            return False, f"{len(items)} comments: at most {FIX_MAX} go to one fix; send the rest after it"
+        return _waits(runs, key, _queue(runs, ["fix", key, "--stdin"], json.dumps(items)))
     if action == "stop":
         if status not in STOPPABLE:
             return False, f"{key} is {status}; there is nothing to stop"

@@ -2199,9 +2199,12 @@ offered as suggestions. It is taken as pasted: quotes
   that grow with their text, with no length limit but the form's
   (`MAX_TICKET_FORM`, 4 MiB). A
   `done` ticket has a follow-up form (`followup` action, refused with the
-  queue's own `followup_refused` reason), and a ticket that went round again
+  queue's own `followup_refused` reason) that points to "Review the diff"
+  for specific fixes with no new plan, and a ticket that went round again
   lists its rounds (each one's commits, diffstat, push result, follow-up
-  text and archived plan). `/runs/ticket/<KEY>/live`
+  text and archived plan); after them "Your review comments", each batch
+  sent from the Changes page (`owner_reviews`) folded, escaped.
+  `/runs/ticket/<KEY>/live`
   is its poll JSON, `/runs/ticket/<KEY>/<stage>-<n>.out` an output file.
   A ticket with `state.json` `debug` gets a "Debug agent" panel (verdict,
   harness should change, note, the report rendered as markdown; open while
@@ -2225,7 +2228,21 @@ offered as suggestions. It is taken as pasted: quotes
   cut at 200 kB) or `unpushed` (`@{upstream}...HEAD`, as last fetched).
   Read-only git with no external diff or textconv; 2 MB of diff at most,
   cut at a file boundary and said so; files that look like secrets
-  (`vault_view.SECRET`) are left out and named.
+  (`vault_view.SECRET`) are left out and named. Review comments, on the
+  `work` view of the project only and only when `Runs.fix_refused`
+  (`ticket_queue.owner_fix_refused`) says nothing (else why not, in a
+  line): a click on a numbered line opens a comment box under it (side by
+  side, an empty row as tall in the other half keeps the halves level); a
+  box under the diff takes comments on the whole change; each one can be
+  edited or removed. The draft is kept in `localStorage`
+  (`harness.review.KEY`, try/catch) with the page's `data-sent` mark (how
+  many batches `owner_reviews` holds and the last one's time), and dropped
+  once that mark changes, i.e. after a send. One "Send N comments to the
+  fixer" posts them as JSON to `/runs/ticket/<KEY>/fix`, which checks
+  shape and caps (40, 2,000 characters each) and runs `harness queue fix
+  KEY --stdin`; a refusal links back to the Changes page, draft intact.
+  The JS builds every node with `textContent`; the file of a line comes
+  from `Diff2Html.parse` in the order the file wrappers are drawn.
 - `/runs/<sid>`: the transcript (text, thinking, each tool call with input,
   output, status and timing, subtasks, retries, errors; a file change as its
   diff from opencode's tool metadata, a `todowrite` as a checklist), crumbs

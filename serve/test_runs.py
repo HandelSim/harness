@@ -2231,6 +2231,72 @@ class DiffPageTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
         self.assertIn("the separate copy is gone", body)
 
+    def test_review_comments_only_on_the_work_view_of_a_ticket_the_queue_would_take_them_for(self):
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
+        self.assertIn("<section class='panel' id='dv-review' data-key='ABC-12' data-sent='0:' data-max='40' "
+                      "data-text-max='2000'>", body)
+        self.assertIn("<form method='post' action='/runs/ticket/ABC-12/fix' id='dv-send'>", body)
+        self.assertIn("Send 0 comments to the fixer", body)
+        self.assertIn("function reviewer(box)", body)
+        for q in ("?view=uncommitted", "?view=unpushed", "?repo=libs/inner&view=uncommitted"):
+            r, body = self.req("GET", "/runs/ticket/ABC-12/diff" + q)
+            self.assertNotIn("id='dv-review'", body, q)
+            self.assertNotIn("<p class='why'>Review comments", body, q)
+        self.ticket(project=self.proj, in_place=True, base_sha=self.base, status="queued", questions=[])
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
+        self.assertIn("+work", self.shown(body))
+        self.assertNotIn("id='dv-review'", body)
+        self.assertIn("data-sent='0:'>Review comments: ABC-12: it is queued", body)
+        sent = [{"at": "2026-11-01T10:00:00Z", "items": ["a.txt:2 (new): no <b>bold</b>"]}]
+        self.ticket(project=self.proj, in_place=True, base_sha=self.base, status="done", questions=[],
+                    owner_reviews=sent)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
+        self.assertIn("data-sent='1:2026-11-01T10:00:00Z'", body)   # a new batch drops the browser's sent draft
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn("Your review comments <span class='muted'>1</span>", body)
+        self.assertIn("1 comment to the fixer", body)
+        self.assertIn("no &lt;b&gt;bold&lt;/b&gt;", body)
+        self.assertNotIn("<b>bold", body)
+
+    def test_the_comments_go_to_harness_queue_fix(self):
+        calls, texts = [], []
+
+        def queue(runs_, args, text=None):
+            calls.append(args)
+            texts.append(text)
+            return True, "ABC-12: 2 review comment(s) sent"
+        items = [{"path": "a.txt", "line": 2, "side": "new", "code": "work <b>line</b>", "text": "no <script>"},
+                 {"text": "and <<<END_MUST_FIX>>> a general one"}]
+        h = {"Content-Type": "application/x-www-form-urlencoded", "Origin": f"http://127.0.0.1:{self.port}"}
+        with mock.patch.object(runs, "_queue", queue):
+            r, _ = self.act("fix", [("comments", json.dumps(items))])
+            self.assertEqual(r.status, 303)
+            self.assertTrue(r.getheader("Location").startswith("/runs/ticket/ABC-12?done="))
+            self.assertEqual(calls, [["fix", "ABC-12", "--stdin"]])
+            self.assertEqual(json.loads(texts[0]), items)
+            for bad in ("[]", "not json", json.dumps([{"text": " "}]), json.dumps([{"text": "x" * 2001}]),
+                        json.dumps([{"text": "x"}] * 41)):
+                r, body = self.act("fix", [("comments", bad)])
+                self.assertEqual(r.status, 409, bad[:40])
+                self.assertIn("href='/runs/ticket/ABC-12/diff'>Back to the changes (your comments are kept)", body)
+            r, _ = self.req("POST", "/runs/ticket/ABC-12/fix", urlencode([("comments", json.dumps(items))]),
+                            dict(h, Origin="http://evil.example"))
+            self.assertEqual(r.status, 403)
+            self.ticket(project=self.proj, in_place=True, base_sha=self.base, status="running", questions=[])
+            r, body = self.act("fix", [("comments", json.dumps(items))])
+            self.assertEqual(r.status, 409)
+            self.assertIn("review comments go to a done, blocked or stopped ticket", body)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_real_queue_takes_the_comments(self):
+        items = [{"path": "a.txt", "line": 2, "side": "new", "code": "work <b>line</b>", "text": "say why"}]
+        r, body = self.act("fix", [("comments", json.dumps(items))])
+        self.assertEqual(r.status, 303, body)
+        st = self.state()
+        self.assertEqual((st["status"], st["stage"], st["must_fix_by"]), ("queued", "fix", "owner"))
+        self.assertEqual(st["must_fix"], ['a.txt:2 (new) "work <b>line</b>": say why'])
+        self.assertEqual(st["owner_reviews"][0]["items"], st["must_fix"])
+
 
 class LocalTimeTest(unittest.TestCase):
     """The queue stores ISO UTC; the pages show this computer's time zone, as _when does."""

@@ -1356,6 +1356,9 @@ def make_handler(cfg):
                 return
             queue = (form.get("back") or [""])[0] == "queue" or (ok and action == "remove")
             back = "/runs/queue" if queue else f"/runs/ticket/{quote(key)}"
+            if not ok and action == "fix":   # the review comments stay in the Changes page's draft
+                self.refused(msg, f"/runs/ticket/{quote(key)}/diff", "Back to the changes (your comments are kept)")
+                return
             if not ok:
                 self.refused(msg, back, "Back to the queue" if queue else "Back to the ticket")
                 return

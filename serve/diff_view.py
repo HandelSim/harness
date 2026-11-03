@@ -6,7 +6,11 @@ inside it (its own .git, not a submodule; the queue's nested_repos).
 Three views: the ticket's work (its branch since the commit it started from, what
 review reads), the uncommitted changes, and the commits not pushed yet. Read-only
 git: no fetch, no optional locks, no external diff or textconv programs. Files that
-look like secrets are left out of every diff (vault_view.SECRET)."""
+look like secrets are left out of every diff (vault_view.SECRET).
+
+On the work view of a ticket the queue would take them for (harness queue fix), the
+owner clicks lines to comment on them, PR-review style; the comments wait in the
+browser (localStorage) and go to the fix stage all at once."""
 
 import json
 import os
@@ -222,6 +226,17 @@ STYLE = """
 #d2h td.d2h-code-linenumber,#d2h td.d2h-code-side-linenumber{text-align:right}
 #d2h td.d2h-code-side-linenumber{padding:0 .5em}
 #d2h .d2h-file-list-wrapper{margin-bottom:12px}
+#d2h.dv-can td.d2h-cntx,#d2h.dv-can td.d2h-ins,#d2h.dv-can td.d2h-del{cursor:pointer}
+#d2h tr.dv-c td{padding:8px 10px;background:var(--raised);border-left:3px solid var(--accent);white-space:normal;
+  font-family:var(--sans);font-size:13px}
+#d2h tr.dv-pad td{padding:0;border-left:0}
+.dv-note{white-space:pre-wrap;overflow-wrap:anywhere}
+.dv-ed textarea,#dv-gen{width:100%;box-sizing:border-box;min-height:64px;font:inherit;color:var(--ink);
+  background:var(--field);border:1px solid var(--line-2);border-radius:6px;padding:6px 8px}
+.dv-row{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.dv-list{padding-left:20px}
+.dv-list li{margin:8px 0}
+.dv-list .txt{white-space:pre-wrap;overflow-wrap:anywhere}
 """
 
 JS = r"""
@@ -243,6 +258,225 @@ JS = r"""
     document.querySelectorAll('.dv-lay button').forEach(function (b) {
       b.setAttribute('aria-pressed', b.dataset.lay === lay ? 'true' : 'false');
     });
+    if (rv) rv();
+  }
+  var box = document.querySelector('[data-sent]'), rv = box && reviewer(box);
+
+  // Review comments: a click on a line opens a box under it; the comments wait in
+  // localStorage (dropped once the ticket's sent batches change: they were sent) and
+  // the form sends them all as JSON. Everything shown is set as text, never as HTML.
+  function reviewer(box) {
+    var sent = box.dataset.sent, store = 'harness.review.' + box.dataset.key, got = null;
+    try {
+      got = JSON.parse(localStorage.getItem(store) || 'null');
+      if (got && got.sent !== sent) { localStorage.removeItem(store); got = null; }
+    } catch (e) {}
+    if (box.id !== 'dv-review') return null;   // the queue would not take them now: the draft waits
+    var max = +box.dataset.max, tmax = +box.dataset.textMax;
+    var list = document.getElementById('dv-list'), gen = document.getElementById('dv-gen');
+    var add = document.getElementById('dv-add'), form = document.getElementById('dv-send');
+    var send = form.querySelector('button'), full = 'At most ' + max + ' comments go to one fix: send these, ' +
+      'then the rest once it is done.';
+    var items = got && Array.isArray(got.items) ? got.items.filter(ok).slice(0, max) : [];
+    var open = null, genAt = -1, rows = {}, pairs = [];
+    function ok(c) {
+      return !!c && typeof c.text === 'string' && !!c.text.trim() && (!c.path || (typeof c.path === 'string' &&
+        c.line > 0 && (c.side === 'new' || c.side === 'old') && typeof c.code === 'string'));
+    }
+    function keep() {
+      try {
+        if (items.length) localStorage.setItem(store, JSON.stringify({sent: sent, items: items}));
+        else localStorage.removeItem(store);
+      } catch (e) {}
+    }
+    function node(tag, cls, text) {
+      var n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text != null) n.textContent = text;
+      return n;
+    }
+    function btn(text, fn) {
+      var b = node('button', 'btn sm', text);
+      b.type = 'button';
+      b.addEventListener('click', fn);
+      return b;
+    }
+    function where(c) {
+      return c.path ? c.path + ':' + c.line + (c.side === 'old' ? ' (old)' : '') : 'the whole change';
+    }
+    function at(c) { return rows[c.path + '\n' + c.side + '\n' + c.line]; }
+    function put(tr, path, side, line, own) {
+      rows[path + '\n' + side + '\n' + line] = rows[path + '\n' + side + '\n' + line] || tr;
+      if (own) tr.dvAt = {path: path, side: side, line: line};
+    }
+    function index() {   // each numbered row of the drawn diff: its file (as Diff2Html.parse names it), side, line
+      var files = [];
+      rows = {};
+      try { files = Diff2Html.parse(diff); } catch (e) {}
+      el.querySelectorAll('.d2h-file-wrapper').forEach(function (w, i) {
+        var f = files[i];
+        if (!f) return;
+        var path = f.newName && f.newName !== '/dev/null' ? f.newName : f.oldName;
+        var halves = w.querySelectorAll('.d2h-file-side-diff');
+        if (halves.length === 2) {
+          [['old', halves[0]], ['new', halves[1]]].forEach(function (h) {
+            h[1].querySelectorAll('tr').forEach(function (tr) {
+              var td = tr.querySelector('td.d2h-code-side-linenumber'), n = td ? parseInt(td.textContent, 10) : 0;
+              if (n > 0) put(tr, path, h[0], n, true);
+            });
+          });
+          return;
+        }
+        w.querySelectorAll('tr').forEach(function (tr) {
+          var a = tr.querySelector('.line-num1'), b = tr.querySelector('.line-num2');
+          var n1 = a ? parseInt(a.textContent, 10) : 0, n2 = b ? parseInt(b.textContent, 10) : 0;
+          if (n2 > 0) put(tr, path, 'new', n2, true);
+          if (n1 > 0) put(tr, path, 'old', n1, !(n2 > 0));
+        });
+      });
+    }
+    function last(tr) {
+      while (tr.nextElementSibling && tr.nextElementSibling.classList.contains('dv-c')) tr = tr.nextElementSibling;
+      return tr;
+    }
+    function plain(tr) { return !tr.classList.contains('dv-c'); }
+    function place(tr, content) {   // a row under tr; side by side, an empty one as tall in the other half
+      var row = node('tr', 'dv-c'), td = node('td');
+      td.colSpan = 2;
+      td.appendChild(content);
+      row.appendChild(td);
+      last(tr).insertAdjacentElement('afterend', row);
+      var half = tr.closest('.d2h-file-side-diff');
+      if (!half) return;
+      var other = half.parentNode.querySelectorAll('.d2h-file-side-diff')[half.previousElementSibling ? 0 : 1];
+      var mine = [].filter.call(tr.parentNode.children, plain);
+      var twin = other && [].filter.call(other.querySelectorAll('tbody > tr'), plain)[mine.indexOf(tr)];
+      if (!twin) return;
+      var pad = node('tr', 'dv-c dv-pad'), cell = node('td');
+      cell.colSpan = 2;
+      pad.appendChild(cell);
+      last(twin).insertAdjacentElement('afterend', pad);
+      pairs.push([row, pad]);
+    }
+    function even() {
+      pairs.forEach(function (p) { p[1].style.height = p[0].getBoundingClientRect().height + 'px'; });
+    }
+    function drop(i) {
+      items.splice(i, 1);
+      if (open && open.i === i) open = null;
+      else if (open && open.i > i) open.i--;
+      if (genAt === i) { genAt = -1; add.textContent = 'Add comment'; }
+      else if (genAt > i) genAt--;
+      keep();
+      paint();
+    }
+    function edit(i) {
+      var tr = items[i].path && at(items[i]);
+      if (tr) {
+        open = {i: i, at: items[i], text: items[i].text};
+        paint();
+        return;
+      }
+      genAt = i;   // a comment on the whole change, or on a line this diff no longer has
+      gen.value = items[i].text;
+      add.textContent = 'Save comment';
+      gen.focus();
+    }
+    function save(text) {
+      text = text.trim();
+      if (!text) return;
+      if (open.i >= 0) {
+        items[open.i].text = text;
+      } else {
+        if (items.length >= max) { alert(full); return; }
+        items.push({path: open.at.path, line: open.at.line, side: open.at.side, code: open.at.code, text: text});
+      }
+      open = null;
+      keep();
+      paint();
+    }
+    function editor() {
+      var w = node('div', 'dv-ed'), t = node('textarea'), acts = node('div', 'dv-row');
+      t.maxLength = tmax;
+      t.rows = 3;
+      t.value = open.text;
+      t.setAttribute('aria-label', 'Comment on ' + where(open.at));
+      t.addEventListener('input', function () { open.text = t.value; even(); });
+      acts.appendChild(btn(open.i >= 0 ? 'Save' : 'Add comment', function () { save(t.value); }));
+      acts.appendChild(btn('Cancel', function () { open = null; paint(); }));
+      w.appendChild(node('div', 'muted', where(open.at)));
+      w.appendChild(t);
+      w.appendChild(acts);
+      setTimeout(function () { t.focus(); }, 0);
+      return w;
+    }
+    function note(c, i) {
+      var w = node('div'), acts = node('div', 'dv-row');
+      w.appendChild(node('div', 'dv-note', c.text));
+      acts.appendChild(btn('Edit', function () { edit(i); }));
+      acts.appendChild(btn('Remove', function () { drop(i); }));
+      w.appendChild(acts);
+      return w;
+    }
+    function paint() {
+      el.querySelectorAll('tr.dv-c').forEach(function (r) { r.parentNode.removeChild(r); });
+      pairs = [];
+      items.forEach(function (c, i) {
+        var tr = c.path && at(c);
+        if (tr && !(open && open.i === i)) place(tr, note(c, i));
+      });
+      if (open && at(open.at)) place(at(open.at), editor());
+      else open = null;
+      list.textContent = '';
+      items.forEach(function (c, i) {
+        var li = node('li'), acts = node('div', 'dv-row');
+        li.appendChild(node('b', '', where(c)));
+        if (c.code && c.code.trim()) li.appendChild(node('code', '', ' ' + c.code.trim()));
+        li.appendChild(node('div', 'txt', c.text));
+        acts.appendChild(btn('Edit', function () { edit(i); }));
+        acts.appendChild(btn('Remove', function () { drop(i); }));
+        li.appendChild(acts);
+        list.appendChild(li);
+      });
+      send.disabled = !items.length;
+      send.textContent = 'Send ' + items.length + ' comment' + (items.length === 1 ? '' : 's') + ' to the fixer';
+      even();
+    }
+    el.classList.add('dv-can');
+    el.addEventListener('click', function (e) {
+      var tr = e.target.closest ? e.target.closest('tr') : null;
+      if (!tr || !tr.dvAt || String(window.getSelection ? window.getSelection() : '')) return;
+      if (open && open.text.trim() && !confirm('Drop the comment you are writing?')) return;
+      if (items.length >= max) { alert(full); return; }
+      var ctn = tr.querySelector('.d2h-code-line-ctn'), code = ctn ? ctn.textContent : '';
+      open = {i: -1, text: '', at: {path: tr.dvAt.path, side: tr.dvAt.side, line: tr.dvAt.line,
+                                     code: code.length > 160 ? code.slice(0, 157) + '...' : code}};
+      paint();
+    });
+    add.addEventListener('click', function () {
+      var t = gen.value.trim();
+      if (!t) return;
+      if (genAt >= 0 && items[genAt]) items[genAt].text = t;
+      else if (items.length >= max) { alert(full); return; }
+      else items.push({text: t});
+      genAt = -1;
+      gen.value = '';
+      add.textContent = 'Add comment';
+      keep();
+      paint();
+    });
+    form.addEventListener('submit', function (e) {
+      var busy = (open && open.text.trim()) || gen.value.trim();
+      if (!items.length || (busy && !confirm('Send without the comment you are still writing?'))) {
+        e.preventDefault();
+        return;
+      }
+      form.elements.comments.value = JSON.stringify(items.map(function (c) {
+        return c.path ? {path: c.path, line: c.line, side: c.side, code: c.code, text: c.text} : {text: c.text};
+      }));
+    });
+    window.addEventListener('resize', even);
+    return function () { index(); paint(); };
   }
   document.querySelectorAll('.dv-lay button').forEach(function (b) {
     b.addEventListener('click', function () {
@@ -254,6 +488,34 @@ JS = r"""
   draw();
 })();
 """
+
+
+def _review(runs, key, st):
+    """(the hint over the diff, the panel under it) for review comments on the work view:
+    the comment box and send button when harness queue fix would take them, else why not.
+    data-sent marks the batches sent so far: the browser drops a draft made before the last."""
+    why = runs.fix_refused(key)
+    if why is None:
+        return "", ""
+    sent = st.get("owner_reviews") if isinstance(st.get("owner_reviews"), list) else []
+    mark = f"{len(sent)}:{sent[-1].get('at', '') if sent and isinstance(sent[-1], dict) else ''}"
+    if why:
+        return "", (f"<p class='why' data-key='{esc(key)}' data-sent='{esc(mark)}'>Review comments: "
+                    f"{esc(why)}.</p>")
+    href = f"/runs/ticket/{quote(key)}"
+    return ("<p class='muted'>Click a line to comment on it; <a href='#dv-review'>the comments</a> go to the "
+            "fixer from the bottom of the page.</p>",
+            f"<section class='panel' id='dv-review' data-key='{esc(key)}' data-sent='{esc(mark)}' "
+            f"data-max='{runs_view.FIX_MAX}' data-text-max='{runs_view.FIX_TEXT_MAX}'><h2>Review comments</h2>"
+            "<div class='muted'>Click a line of the diff to comment on it, or comment on the whole change here. "
+            "The comments wait in this browser until you send them; then they all go straight to the fix stage, "
+            "which does them and commits (a new plan is a follow-up, on the ticket's page).</div>"
+            "<ol id='dv-list' class='dv-list'></ol>"
+            f"<textarea id='dv-gen' maxlength='{runs_view.FIX_TEXT_MAX}' rows='3' "
+            "aria-label='A comment on the whole change' placeholder='A comment on the whole change'></textarea>"
+            "<div class='dv-row'><button type='button' class='btn sm' id='dv-add'>Add comment</button></div>"
+            f"<form method='post' action='{href}/fix' id='dv-send'><input type='hidden' name='comments' value=''>"
+            "<button type='submit' class='primary' disabled>Send 0 comments to the fixer</button></form></section>")
 
 
 def page(runs, key, query):
@@ -309,7 +571,8 @@ def page(runs, key, query):
         parts.append("<section class='panel'>No changes.</section>")
         return f"{key} changes", parts, JS
     data = json.dumps(res["diff"]).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    parts += ["<div class='dv-lay'><button type='button' class='btn sm' data-lay='side-by-side'>Side by side</button>"
+    hint, review = _review(runs, key, st) if view == "work" and repo == "." else ("", "")
+    parts += [hint, "<div class='dv-lay'><button type='button' class='btn sm' data-lay='side-by-side'>Side by side</button>"
               "<button type='button' class='btn sm' data-lay='line-by-line'>One column</button></div>",
-              f"<script type='application/json' id='dv-data'>{data}</script><div id='d2h'></div>"]
+              f"<script type='application/json' id='dv-data'>{data}</script><div id='d2h'></div>", review]
     return f"{key} changes", parts, ";" + _asset("diff2html.min.js") + ";" + JS
