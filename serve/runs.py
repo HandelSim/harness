@@ -2537,15 +2537,20 @@ def _t_attempts(key, st, names):
     return "".join(parts)
 
 
+NOTES_HOW = ("How notes reach the agents: every stage from now on (plan, implement, test, review, fix and the "
+             "checks) gets all of them, oldest first, numbered and dated, and is told that where two disagree the "
+             "newer one wins. They stay as the ticket's record and are not deleted, so to change your mind, add a "
+             "note that says so.")
+
+
 def _t_notes(key, st):
     notes = st.get("notes") or []
-    parts = [f"<h2>Notes <span class='muted'>{len(notes)}</span></h2>"]
+    parts = [f"<h2>Notes <span class='muted'>{len(notes)}</span></h2>",
+             f"<div class='muted'>{NOTES_HOW}</div>"]
     if notes:
         parts.append("<ul class='notes'>" + "".join(
-            f"<li><span class='at'>{esc(_local(n['at']))}</span><div class='txt'>{esc(n['text'])}</div></li>"
-            for n in reversed(notes)) + "</ul>")
-    else:
-        parts.append("<div class='muted'>Context for the agents: every stage from now on gets your notes.</div>")
+            f"<li><span class='at'>#{i} &middot; {esc(_local(n['at']))}</span><div class='txt'>{esc(n['text'])}</div></li>"
+            for i, n in reversed(list(enumerate(notes, 1)))) + "</ul>")
     parts.append(f"<form method='post' action='/runs/ticket/{quote(key)}/note' class='send'>"
                  "<textarea name='text' required maxlength='4000' placeholder='e.g. the fix is on origin/ABC-3122; "
                  "keep the public API as it is'></textarea><button type='submit'>Add note</button></form>")

@@ -429,6 +429,11 @@ class RunsTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("action='/runs/ticket/ABC-12/approve'", body)
         self.assertIn("Approve the plan, or send feedback", body)   # a free feedback box
+        self.assertIn("How notes reach the agents", body)            # the notes panel says how they are passed
+        self.ticket(status="plan-review", questions=[], notes=[{"at": "2026-11-01T10:00:00Z", "text": "old"},
+                                                              {"at": "2026-11-02T10:00:00Z", "text": "new"}])
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertLess(body.index("<span class='at'>#2 &middot; "), body.index("<span class='at'>#1 &middot; "))
         self.assertIn("<div class='glance'>", body)                 # the plan to approve, beside it
         self.assertIn("Send feedback and plan again", body)
         self.assertNotIn("Go with the defaults", body)

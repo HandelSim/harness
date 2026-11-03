@@ -3150,12 +3150,19 @@ def stage_guidance(q=None, key=""):
             if not k.startswith("_") and isinstance(v, list)}
 
 
+NOTES_ORDER = ("Oldest first, each numbered and dated. Where two notes disagree, the newer one wins: the owner "
+               "changed their mind, so do what the latest note says and drop what an earlier one asked for.")
+
+
 def owner_notes(notes):
-    """The owner's notes for a prompt, as written, newest kept when they are long."""
-    text = "\n\n".join(f"[{n.get('at', '')}]\n{str(n.get('text', '')).strip()}" for n in notes)
+    """The owner's notes for a prompt, as written, oldest first, numbered and dated, and
+    the rule that a newer note wins over an older one; newest kept when they are long."""
+    n = len(notes)
+    text = "\n\n".join(f"Note {i} of {n} (written {x.get('at', '')}):\n{str(x.get('text', '')).strip()}"
+                         for i, x in enumerate(notes, 1))
     if len(text) > NOTE_CAP:
-        text = "[... earlier notes cut ...]\n" + text[-NOTE_CAP:]
-    return text or "(none)"
+        text = "[... the oldest notes are cut ...]\n" + text[-NOTE_CAP:]
+    return f"{NOTES_ORDER}\n\n{text}" if text else "(none)"
 
 
 def ticket_criteria(text):
