@@ -1188,11 +1188,21 @@ diff for each criterion met;
 `judge()` checks every quote is really in the source (letters and digits
 only, so spacing and list markers do not matter); a diff quote must come
 from an added line, or a removed one when the criterion is about removing,
-never an unchanged context line. A branch whose tip no longer holds
+never an unchanged context line. A quote that misses is shown as the
+verifier wrote it, not normalized, with `quote_hint` saying when it is the
+changed files' names, a header or an unchanged line. The verifier's and the
+reviewer's diff is `cap_diff` (150 000 / 40 000 characters): each file a fair
+share (water-filling, at least `DIFF_FILE_FLOOR`), small files whole, a big one
+cut at a line with a note, so one huge file (a vendored single header a
+follow-up round's diff from `start_sha` still holds) cannot push the others
+out of view. A branch whose tip no longer holds
 `start_sha` (an amend, reset or rebase rewrote the start) fails the stage
 before anything else. The queue's git runs with `core.quotePath=false`, so a
 non-ASCII path meets the file-name gates (owner's files, secrets, `.github/`)
-as it is. `run_agent` keeps a copy of the ticket's text (`state/queue/KEY/
+as it is. A git that fails saying nothing (it died: on Windows a status
+like 0xC0000142) is named by its exit status (`git_said`, `exit_said`), and
+one that only reads (`GIT_READS`; not status 1, an answer) runs once more.
+`run_agent` keeps a copy of the ticket's text (`state/queue/KEY/
 ticket.md`) and puts it back if the agent deleted it. When every problem `judge()` finds is a
 quote of the verifier's own that is not in the diff (`QUOTE_MISS`), the
 verifier is asked once more through `verdict()` (its shorter-prompt fallback
@@ -1268,8 +1278,13 @@ unless the plan's result is kept (a fresh start, a plan made again, is the
 owner's call), `retry_refused` is empty. No loop: `debugged = STAGE` is set before
 the launch and cleared only when a stage passes (`advance`) or by the
 owner's own requeue; a stub report (`debug_stub`, needs-owner) covers a
-timeout, a stop or no report; `tidy` marks a look a dead run left
-`running` as needs-owner. The look's process is in `state.json` `agent`
+timeout, a stop or no report; `tidy` hands a look a dead run left
+`running` to `cut_look`: its agent is reaped, a report it finished stands
+(a `fixed` is needs-owner, nothing was retried), else it gets a stub report
+and, the run having died (not the owner's `halt --force`, which calls
+`tidy(ended=True)`), `debugged` is dropped and `debug_again` set once
+(`debug_cut`, `DEBUG_CUT_TRIES` 1): `look_again` at the next run's start
+looks at it again. The look's process is in `state.json` `agent`
 like a stage's (`workdir` its run folder) until it ends, so a dead run's
 look is ended by the owner's retry, stop or remove (`reap`). A queue clone
 gets `--fix-branch BRANCH` (its one `switch`). On
@@ -1368,7 +1383,7 @@ commit, push) so the warning a timed-out `_sync` leaves (`SYNC_TIMEOUT`, its
 stderr's tail) names the step that hung. Nothing is written to the
 tracker.
 State: `state/queue/queue.list` (order), `KEY/state.json` (status, stage,
-attempt, feedback, reason, the plan's `questions`, `criteria` and `plan_sig`, `take_defaults`, `history`, `vault`), `KEY/log.md`, `KEY/<stage>-N.out`, every verifier reply
+attempt, feedback, reason, the plan's `questions`, `criteria` and `plan_sig`, `take_defaults`, `history`, `vault`), `KEY/log.md` (each line stamped in this computer's time; `state.json`'s stamps are ISO UTC, which the run viewer shows in local time with `_local`/`_local_log`, older UTC log lines too), `KEY/<stage>-N.out`, every verifier reply
 as `KEY/verify-*.txt`, `run-I.json` per slot of a parallel run, `vault.lock`, and `run.lock` (one run at a time: `flock`, or
 `msvcrt.locking` on Windows). Each agent runs in its own session (its own
 process group on Windows), so Ctrl-C reaches only the queue, which then ends

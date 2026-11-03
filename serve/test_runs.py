@@ -789,7 +789,7 @@ class RunsTest(RunsServer):
         self.start()
         r, body = self.req("GET", "/runs/ticket/ABC-12")
         self.assertIn("<h2>Rounds <span class='muted'>2</span></h2>", body)
-        self.assertIn("<b>Round 1</b><span class='muted'>2026-10-29 10:00 &middot; 3 commits &middot; 2 file(s), +9 "
+        self.assertIn(f"<b>Round 1</b><span class='muted'>{runs._local('2026-10-29T10:00:00Z')} &middot; 3 commits &middot; 2 file(s), +9 "
                       "&minus;1 &middot; kept on this computer: not pushed</span>", body)
         self.assertIn("href='/vault/browse/wiki/notes/tickets/ABC-12-plan-r1.md'>its plan</a>", body)
         self.assertIn("<div class='txt'>per &lt;project&gt;</div>", body)
@@ -2205,6 +2205,30 @@ class DiffPageTest(RunsServer):
         self.assertIn("+work", self.shown(body))   # what push fetched into the project
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
         self.assertIn("the separate copy is gone", body)
+
+
+class LocalTimeTest(unittest.TestCase):
+    """The queue stores ISO UTC; the pages show this computer's time zone, as _when does."""
+
+    def setUp(self):
+        self.tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Chicago"
+        time.tzset()
+
+    def tearDown(self):
+        if self.tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = self.tz
+        time.tzset()
+
+    def test_a_stamp_and_a_log_line_are_in_local_time(self):
+        self.assertEqual(runs._local("2026-11-03T14:50:15Z"), "2026-11-03 08:50")
+        self.assertEqual(runs._local("not a time"), "not a time")
+        log = ("2026-11-03T14:50:15Z ABC-1 plan verifier: PASS\n  2026-11-03T14:50:15Z in a line\n"
+               "2026-11-03 08:51:00 ABC-1 a new line, local already\n")
+        self.assertEqual(runs._local_log(log), "2026-11-03 08:50:15 ABC-1 plan verifier: PASS\n"
+                         "  2026-11-03T14:50:15Z in a line\n2026-11-03 08:51:00 ABC-1 a new line, local already\n")
 
 
 class MathTest(unittest.TestCase):

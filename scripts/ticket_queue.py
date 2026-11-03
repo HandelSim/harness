@@ -301,7 +301,8 @@ class Queue:
 
     def log(self, key, line, detail="", echo=True):
         """One line in the ticket's log and in run.log (what `harness queue watch` tails)."""
-        stamp = f"{now_iso()} {key} {line}\n"
+        # this computer's time, as a person reads the log (state.json keeps ISO UTC for code)
+        stamp = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {key} {line}\n"
         for path in (os.path.join(self.dir(key), "log.md"), os.path.join(self.root, "run.log")):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
@@ -760,19 +761,50 @@ def git(cwd, *args, check=True, timeout=300, env=None):
     # no fsmonitor daemon started by the queue's git: it would outlive the call holding its files;
     # no signing: a key on a smart card would ask for its PIN with nobody there
     # paths as they are, not "caf\303\251.txt": a quoted name would slip past the gates on file names
-    r = run_quiet(["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
-                   "-c", "core.quotePath=false", *args], timeout, env=env)
+    cmd = ["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
+           "-c", "core.quotePath=false", *args]
+    words = [a for i, a in enumerate(args) if a != "-c" and (i == 0 or args[i - 1] != "-c")]
+    r = run_quiet(cmd, timeout, env=env)
+    # A git that failed saying nothing did not find anything wrong with the repository
+    # (that git says "fatal: ..."): it died, which on Windows a process can for a moment
+    # (0xC0000142 when the desktop heap or an antivirus hook is out). A git that only
+    # reads is asked once more; one that writes is not, it may have done half its work.
+    # Status 1 with nothing said is an answer (diff --quiet, merge-base --is-ancestor).
+    if r.returncode not in (0, 1, 124, 127) and silent(r) and words and words[0] in GIT_READS:
+        time.sleep(GIT_RETRY_WAIT)
+        r = run_quiet(cmd, timeout, env=env)
     if check and r.returncode != 0:
-        words = [a for i, a in enumerate(args) if a != "-c" and (i == 0 or args[i - 1] != "-c")]
         raise RuntimeError(f"git {' '.join(words[:2])}: {git_said(r)}")
     return r
+
+
+GIT_READS = {"rev-parse", "diff", "log", "status", "cat-file", "merge-base", "rev-list",
+             "ls-files", "ls-tree", "symbolic-ref", "show", "for-each-ref", "show-ref"}
+GIT_RETRY_WAIT = 1
+
+
+def silent(r):
+    return not (r.stderr or "").strip() and not (r.stdout or "").strip()
+
+
+def exit_said(rc):
+    """A process's exit status as a person can look it up: a Windows crash status in hex
+    (3221225794 is 0xC0000142), a POSIX signal by number."""
+    if rc < 0:
+        return f"was ended by signal {-rc}"
+    if rc > 255:
+        return f"exited with status {rc} (0x{rc & 0xFFFFFFFF:08X})"
+    return f"exited with status {rc}"
 
 
 def git_said(r, cap=400):
     """What a failed git said: its error: and fatal: lines, not the warnings before
     them (on Windows "LF will be replaced by CRLF" for each file git add reads), else
-    the end of its output, where git puts what went wrong."""
+    the end of its output, where git puts what went wrong; when it said nothing, how
+    it exited, so the message is never empty."""
     lines = [x.strip() for x in (r.stderr or r.stdout or "").splitlines() if x.strip()]
+    if not lines:
+        return f"git {exit_said(r.returncode)} and said nothing (it died, not a git error; trying again usually works)"
     bad = [x for x in lines if x.startswith(("error:", "fatal:"))]
     said = " / ".join(bad or lines)
     return said if len(said) <= cap else said[:cap] if bad else "..." + said[-cap:]
@@ -1898,6 +1930,27 @@ def diff_sides(diff):
     return norm("\n".join(added), diff=True), norm("\n".join(removed), diff=True)
 
 
+def quote_hint(quote, diff, said=""):
+    """Where in <diff> a quote that is not from an added line is from, when it is from
+    somewhere: the names of the changed files (<said>: the quote as written), its
+    header lines, or the unchanged lines around a change."""
+    if len(quote) < 8:
+        return " (too short to show anything: at least 8 letters or digits)"
+    lines = diff.replace("\r\n", "\n").splitlines()
+    head = [l for l in lines if l.startswith(("diff --git ", "+++ ", "--- ", "rename ", "new file"))]
+    names = set()
+    for l in head:
+        for w in l.split()[1:]:
+            w = re.sub(r"^\"?[ab]/", "", w).strip('"')
+            names.update({norm(w), norm(w.rsplit("/", 1)[-1])})
+    words = [norm(w) for w in re.split(r"[\s,;]+", said) if norm(w)]
+    if quote in norm("\n".join(head)) or (words and all(w in names for w in words)):
+        return " (that is the names of changed files, from the diff's headers, not a line the change adds)"
+    if quote in norm("\n".join(l for l in lines if l.startswith(" ")), diff=True):
+        return " (that is an unchanged line around the change, not one it adds)"
+    return ""
+
+
 def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=None):
     """Problems with a verdict: every criterion answered, met (for a change),
     and every quote found in <source>. For a diff a quote must be from an added
@@ -1946,8 +1999,13 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=No
         if len(quote) >= 8 and ok:
             found += 1
         else:
+            # the quote as the verifier wrote it: its normalized form ("maincppfakeithpp")
+            # is what was looked for, not something a person can read
+            said = " ".join(str(c.get(quote_field) or "").split())
+            said = said if len(said) <= 160 else said[:160] + "..."
+            hint = quote_hint(quote, source, said) if what == "diff" else ""
             (soft if what == "ticket" else problems).append(
-                f"criterion {i}: the quoted {what} text is not in the {what}: {quote[:120]}")
+                f"criterion {i}: the quoted {what} text is not in the {what}: \"{said}\"{hint}")
     if what == "ticket" and criteria and not found:
         problems.append("no criterion quotes the ticket: the plan may not be about this ticket")
     if str(obj.get("verdict", "")).upper() != "PASS":
@@ -3387,7 +3445,7 @@ def change_problems(ctx, st, rc, stage):
                         check=False).stdout.strip()
         def prompt_for(c):
             return render("verify_change", TICKET=read(p["ticket"], min(TICKET_CAP, c)), CRITERIA=numbered(criteria),
-                          DIFF=cap(diff, c), COMMITS=cap(notes, NOTE_CAP) or "(none)",
+                          DIFF=cap_diff(diff, c), COMMITS=cap(notes, NOTE_CAP) or "(none)",
                           MET_WHEN=MET_WHEN[stage == "test"])
         obj = verdict(ctx, st, stage, prompt_for)
         problems = judge(obj, criteria, diff, "quote", "diff", notes)
@@ -3694,6 +3752,48 @@ def cap(text, n):
     return text if len(text) <= n else text[:n] + f"\n[... cut at {n} characters ...]\n"
 
 
+DIFF_FILE_FLOOR = 600   # characters every file's part of a cut diff keeps at least (its header and a start)
+
+
+def cap_diff(diff, n):
+    """<diff> in about <n> characters with every file in it: the files whose part fits a
+    fair share whole, each bigger one cut at a line to its share (water-filling), so one
+    huge file (a vendored single header, a lock file, generated code) cannot push all
+    the others out of view, as cap() would cut everything after it."""
+    if len(diff) <= n:
+        return diff
+    secs = [x for x in re.split(r"(?m)^(?=diff --git )", diff) if x]
+    if len(secs) < 2:
+        return cap(diff, n)
+    share, left, room = {}, sorted(range(len(secs)), key=lambda i: len(secs[i])), n
+    while left:
+        fair = max(DIFF_FILE_FLOOR, room // len(left))
+        if len(secs[left[0]]) > fair:
+            for i in left:
+                share[i] = fair
+            break
+        i = left.pop(0)
+        share[i] = len(secs[i])
+        room -= len(secs[i])
+    out = []
+    for i, sec in enumerate(secs):
+        if len(sec) <= share[i]:
+            out.append(sec)
+            continue
+        lines = sec.splitlines(keepends=True)
+        kept, size = [], 0
+        for j, line in enumerate(lines):
+            head = not line.startswith(("+", "-", " ", "@@")) or line.startswith(("+++ ", "--- "))
+            if size + len(line) > share[i] and not (head and j < 8):
+                break
+            kept.append(line)
+            size += len(line)
+        rest = len(lines) - len(kept)
+        out.append("".join(kept) + f"[... {rest} more lines of this file's diff not shown, "
+                                   f"to leave room for the other files ...]\n")
+    return cap("".join(out), n + n // 10)
+
+
 def no_framework_line(text):
     """The test agent's own "NO TEST FRAMEWORK: ..." line (one that starts with it), or "";
     the prompt's and the card's words that quote it are not one."""
@@ -3739,7 +3839,7 @@ def part_line(p):
 def stage_review(ctx, st):
     change = ticket_change(ctx.q, st)
     v = common(ctx, st)
-    v["DIFF"] = cap(change[1], DIFF_CAP_AGENT) if change else "(no diff)"
+    v["DIFF"] = cap_diff(change[1], DIFF_CAP_AGENT) if change else "(no diff)"
     dirty = dirty_files(workdir(ctx.q, st))
     rc, out, started = agent_or_kept(ctx, st, "review", lambda: render("review", **v))
     path = note_paths(ctx.vault, st["key"])["review"]
@@ -4106,6 +4206,7 @@ def advance(ctx, st, stage, reason=""):
     record(st, "passed")
     st.pop("verify_only", None)
     st.pop("debugged", None)   # a block of the next stage gets its own debug agent
+    st.pop("debug_cut", None)
     st.pop("session", None)   # the next stage's agent is a new one
     st.pop("resume", None)
     st.pop("continued", None)
@@ -4424,7 +4525,7 @@ def run_parallel(q, a, locked_at):
         print("[queue] no model: set QUEUE_MODEL or DEFAULT_MODEL_NAME", file=sys.stderr)
         return 1
     new_run(q, os.path.abspath(a.vault), locked_at)
-    tidy(q)
+    tidy(q, a.harness)
     ctx = argparse.Namespace(q=q, beat_lock=threading.Lock(), beating=threading.Event(),
                              run_file=os.path.join(q.root, "run.json"))
     ctx.run_info = {"pid": os.getpid(), "started": now_iso(), "beat": 0, "host": bool(a.host or a.single_message),
@@ -4528,20 +4629,16 @@ def overlaps(a, b):
     return a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
 
 
-def tidy(q):
-    """At the start of a run: what a run or a remove that died left behind (a
-    removed ticket's folder, the in-place exclude block of a stage cut short,
-    a debug agent's look that never ended)."""
+def tidy(q, harness=None, ended=False):
+    """At the start of a run (and after halt --force, <ended>): what a run or a remove
+    that died left behind (a removed ticket's folder, the in-place exclude block of a
+    stage cut short, a debug agent's look that never ended)."""
     for name in os.listdir(q.root):
         if name.startswith(".trash-"):
             rmtree(os.path.join(q.root, name))
     for key in q.order():
         if ((q.load(key) or {}).get("debug") or {}).get("verdict") == "running":
-            with held(os.path.join(q.root, "queue.lock")):
-                st = q.load(key)
-                if st and (st.get("debug") or {}).get("verdict") == "running":
-                    st["debug"].update(verdict="needs-owner", note="the queue run ended before its debug agent did")
-                    q.save(st)
+            cut_look(q, key, harness, ended)
     for project in {s["project"] for s in map(q.load, q.order()) if s and s.get("in_place") and s.get("project")}:
         if os.path.isdir(project) and not any(run_holds(q, s["key"]) for s in map(q.load, q.order()) if s):
             with contextlib.suppress(RuntimeError, OSError, subprocess.SubprocessError):
@@ -4588,6 +4685,64 @@ def debug_stub(d, why):
                          "VERDICT: needs-owner\nHARNESS-CHANGE: no\n")
 
 
+DEBUG_CUT_TRIES = 1   # looks again after a run that died cut the look short
+
+
+def cut_look(q, key, harness, ended):
+    """A debug agent's look a run did not see to its end (the run's process was killed
+    or crashed, the machine slept or restarted; <ended>: the owner's halt --force).
+    Its agent, if it outlived the run, is ended; a report it finished stands (but for
+    a fixed, which the run that started it did not get to act on); else the look gets
+    a report saying so, and a run that died (not the owner's doing) looks again once:
+    the next run's start, or this one's (DEBUG_CUT_TRIES)."""
+    st = q.load(key) or {}
+    dbg = st.get("debug") or {}
+    a = st.get("agent") or {}
+    mine = bool(dbg.get("dir")) and os.path.basename(str(a.get("workdir") or "")) == dbg["dir"]
+    if mine:   # slow (a container), so before the lock
+        reap(q, st, harness, "the queue run that started the debug agent had ended")
+    d = os.path.join(debug_runs_dir(q), str(dbg.get("dir") or "")) if dbg.get("dir") else ""
+    with held(os.path.join(q.root, "queue.lock")):
+        st = q.load(key)
+        if not st or (st.get("debug") or {}).get("verdict") != "running":
+            return
+        if mine and (st.get("agent") or {}).get("workdir") == a.get("workdir"):
+            st.pop("agent", None)
+        why = ("the owner ended the queue run (halt --force) while its debug agent looked" if ended else
+               "the queue run ended before its debug agent did (its process was killed or crashed, or the "
+               "machine slept or restarted)")
+        text = read(os.path.join(d, "report.md")) if d else ""
+        verdict, change = verdict_of(text)
+        again = False
+        if VERDICT_RE.search(text or ""):   # it finished its report: that stands
+            note = why + (f"; it said fixed, but nothing went again: harness queue retry {key}"
+                          if verdict == "fixed" else "")
+            verdict = "needs-owner" if verdict == "fixed" else verdict
+        else:
+            again = not ended and st.get("status") == "blocked" and st.get("debug_cut", 0) < DEBUG_CUT_TRIES
+            note = why + ("; a debug agent looks again when the queue runs next" if again else "")
+            if d and os.path.isdir(d):
+                debug_stub(d, note)
+            verdict, change = "needs-owner", False
+        if again:
+            st["debug_cut"] = st.get("debug_cut", 0) + 1
+            st["debug_again"] = True
+            st.pop("debugged", None)
+        st["debug"].update(verdict=verdict, harness_change=change, note=note, ended=now_iso())
+        q.save(st)
+    q.log(key, f"debug agent: {verdict}; {note}")
+
+
+def look_again(ctx):
+    """At a run's start: the blocked tickets whose debug agent's look a run that died
+    cut short get their look (debug_look's lock and st["debugged"] keep it to one, slots
+    or not)."""
+    for key in ctx.q.order():
+        st = ctx.q.load(key) or {}
+        if st.get("debug_again") and st.get("status") == "blocked":
+            debug_block(ctx, st)
+
+
 def debug_block(ctx, st):
     """A ticket just blocked: one debug agent looks at it, unless QUEUE_DEBUG is off or
     one looked at this stage already. Never raises but for a halt or Ctrl-C: the
@@ -4615,7 +4770,8 @@ def debug_look(ctx, key, stage):
         st = q.load(key)
         if not st or st.get("status") != "blocked" or st.get("debugged") == stage:
             return
-        st["debugged"] = stage   # first: a run that dies in the look does not look again
+        st["debugged"] = stage   # first: a run that dies in the look does not look again (but cut_look's once)
+        st.pop("debug_again", None)
         st["debug"] = {"dir": name, "stage": stage, "at": now_iso(), "verdict": "running"}
         q.save(st)
         stamp = st.get("requeued", "")
@@ -4735,8 +4891,9 @@ def run_tickets(q, ctx):
         s = q.load(k) or {}
         return s.get("status") in ("queued", "running") and done.get(k) != s.get("requeued", "")
     if not ctx.slot:   # a parallel run tidied for its slots
-        tidy(q)
+        tidy(q, ctx.harness)
     try:
+        look_again(ctx)
         while True:
             ctx.key = ""
             beat(ctx, ticket="", stage="", step="")
@@ -5292,7 +5449,8 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         print(f"[queue] {st['key']} is {st['status']}, not {' or '.join(want)}", file=sys.stderr)
         return None
     st.update(status="queued", attempt=0, feedback="", reason="", requeued=now_iso(), **extra)
-    for k in ("stopped_from", "blocked_failed", "no_go_on", "continued", "debugged", "went_on"):
+    for k in ("stopped_from", "blocked_failed", "no_go_on", "continued", "debugged", "went_on", "debug_cut",
+              "debug_again"):
         st.pop(k, None)
     st.pop("resume", None)   # a cut-off stage goes on only when continued (the caller sets it again)
     for k in RESULTS:
@@ -5703,7 +5861,7 @@ def end_run(q, a):
             print(f"[queue] {key}: {'stopped' if stopped else 'back in the queue'} at {st['stage']}")
     for st in left:   # its agent (if it outlived the kill) and its container; slow, so after the lock
         reap(q, st, a.harness, "the run was ended by the owner")
-    tidy(q)   # the in-place exclude block of the stage cut short
+    tidy(q, a.harness, ended=True)   # the in-place exclude block of the stage cut short; a debug look
     for key in q.order():
         st = q.load(key) or {}
         if st.get("in_place") and st.get("status") in ("queued", "stopped") and os.path.isdir(st.get("project", "")):

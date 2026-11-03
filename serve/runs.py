@@ -583,6 +583,22 @@ def _when(ms):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ms / 1000)) if ms else ""
 
 
+# a queue log line's stamp: ISO UTC (2026-01-02T03:04:05Z), its first word
+ISO_STAMP_RE = re.compile(r"(?m)^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)(?= |$)")
+
+
+def _local(iso):
+    """A queue stamp (stored as ISO UTC) to the minute in this computer's time zone, as
+    every other time on the pages is; the text as it is when it is not one."""
+    ms = _iso_ms(iso)
+    return _when(ms)[:16] if ms else str(iso or "")[:16].replace("T", " ")
+
+
+def _local_log(text):
+    """A queue log with each line's UTC stamp in this computer's time zone."""
+    return ISO_STAMP_RE.sub(lambda m: _when(_iso_ms(m.group(1))) or m.group(1), text)
+
+
 def _ago(ms, now=None):
     s = max(0, int((now or time.time()) - ms / 1000))
     if s < 90:
@@ -2278,7 +2294,7 @@ def _t_head(runs, key, st, pos, n):
     if st.get("sha"):
         facts.append(f"<span>commit <b>{esc(st['sha'][:12])}</b></span>")
     if st.get("created"):
-        facts.append(f"<span>added <b>{esc(st['created'][:16].replace('T', ' '))}</b></span>")
+        facts.append(f"<span>added <b>{esc(_local(st['created']))}</b></span>")
     upd = _iso_ms(st.get("updated", ""))
     if upd:
         facts.append(f"<span>updated <b>{_ago(upd)}</b></span>")
@@ -2513,7 +2529,7 @@ def _t_attempts(key, st, names):
                     "'what the agent CLI printed (stdout and stderr): for debugging a launch'>raw output</a>")
         parts.append(f"<li><div class='hd'><span class='pill {tone.get(res, 't-off')}'>{esc(res)}</span>"
                      f"<span class='tag'>{esc(stage)}</span><span>attempt {n}</span>"
-                     f"<span class='muted'>{esc(h['at'][:16].replace('T', ' '))}</span>{link}</div>")
+                     f"<span class='muted'>{esc(_local(h['at']))}</span>{link}</div>")
         if h["details"]:
             parts.append("<ul>" + "".join(f"<li>{esc(x)}</li>" for x in h["details"]) + "</ul>")
         parts.append("</li>")
@@ -2526,7 +2542,7 @@ def _t_notes(key, st):
     parts = [f"<h2>Notes <span class='muted'>{len(notes)}</span></h2>"]
     if notes:
         parts.append("<ul class='notes'>" + "".join(
-            f"<li><span class='at'>{esc(n['at'][:16].replace('T', ' '))}</span><div class='txt'>{esc(n['text'])}</div></li>"
+            f"<li><span class='at'>{esc(_local(n['at']))}</span><div class='txt'>{esc(n['text'])}</div></li>"
             for n in reversed(notes)) + "</ul>")
     else:
         parts.append("<div class='muted'>Context for the agents: every stage from now on gets your notes.</div>")
@@ -2592,7 +2608,8 @@ def _t_debug(runs, key, st):
             + (" <span class='muted'>the stage went again</span>" if dbg.get("retried") else ""))
     note = f"<div class='muted'>{esc(str(dbg['note']))}</div>" if dbg.get("note") else ""
     body = (_md(runs.vault, "debug-report.md", text) if text.strip()
-            else "<div class='muted'>No report yet.</div>")
+            else "<div class='muted'>No report yet: it is still looking.</div>" if verdict == "running"
+            else "<div class='muted'>It left no report.</div>")
     href = f"/runs/debug/runs/{quote(dbg['dir'])}"
     return (f"<section class='panel'><details class='doc' data-k='debug'{' open' if st.get('status') == 'blocked' else ''}>"
             f"<summary>Debug agent ({esc(str(dbg.get('stage') or ''))} block) {head}</summary>"
@@ -2613,7 +2630,7 @@ def _t_docs(runs, key, st, log):
         if text.strip():
             parts.append(_doc(runs, vault, key, kind, label, text))
     parts.append(_t_debug(runs, key, st))
-    text = log[-60000:] if log.strip() else "no log yet"
+    text = _local_log(log[-60000:]) if log.strip() else "no log yet"
     parts.append("<section class='panel'><details class='doc' data-k='log'><summary>Queue log"
                  f"<span class='muted'>{len(log.splitlines())} lines</span></summary>"
                  f"<pre class='qlog'>{esc(text)}</pre></details></section>")
@@ -2694,7 +2711,7 @@ def _t_rounds(runs, key, st):
     parts = [f"<section class='panel'><h2>Rounds <span class='muted'>{len(rounds) + 1}</span></h2><ul class='rounds'>"]
     for r in reversed(rounds):
         stat = r["diffstat"]
-        facts = [esc(r["ended"][:16].replace("T", " "))] if r["ended"] else []
+        facts = [esc(_local(r["ended"]))] if r["ended"] else []
         facts.append(f"{r['commits']} commit{'s' if r['commits'] != 1 else ''}")
         if stat["files"]:
             facts.append(f"{stat['files']} file(s), +{stat['insertions']} &minus;{stat['deletions']}")

@@ -800,6 +800,70 @@ class QueueTest(Base):
         self.assertEqual(st["debug"]["verdict"], "needs-owner")
         self.assertIn("a rebase is still left", st["debug"]["note"])
 
+    def cut_short(self, report=False):
+        """The look as a run that died mid-look leaves it: running, its agent on state.json."""
+        q = tq.Queue(self.state)
+        st = q.load("ABC-1")
+        d = os.path.join(os.path.dirname(self.state), "debug", "runs", st["debug"]["dir"])
+        if not report:
+            os.remove(os.path.join(d, "report.md"))
+        st["debug"]["verdict"] = "running"
+        st["agent"] = {"pid": 2 ** 22 + 12345, "launch": "gone", "host": "elsewhere", "container": False, "workdir": d}
+        q.save(st)
+        return q
+
+    def test_a_debug_look_a_dead_run_cut_short_gets_a_report_and_one_more_look(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_VERDICT="harness-change-needed")
+        self.add("ABC-1")
+        self.run_queue("--debug", "1")
+        self.assertEqual(len(self.calls_of("debug")), 1)
+        first = self.status()["debug"]["dir"]
+        self.cut_short()
+        time.sleep(1.1)   # the new look's folder is named to the second
+        rc, out = self.run_queue("--debug", "1")
+        st = self.status()
+        self.assertEqual(len(self.calls_of("debug")), 2, out)   # the next run looked again
+        self.assertEqual((st["status"], st["debug"]["verdict"], st["debug_cut"]), ("blocked", "harness-change-needed", 1))
+        self.assertNotIn("agent", st)
+        self.assertNotIn("debug_again", st)
+        old = cat(os.path.join(os.path.dirname(self.state), "debug", "runs", first, "report.md"))
+        self.assertIn("the queue run ended before its debug agent did", old)   # not "No report yet."
+        self.assertIn("VERDICT: needs-owner", old)
+        # Cut short again: a report, but no third look.
+        self.cut_short()
+        self.run_queue("--debug", "1")
+        st = self.status()
+        self.assertEqual(len(self.calls_of("debug")), 2)
+        self.assertEqual(st["debug"]["verdict"], "needs-owner")
+        self.assertIn("the queue run ended before its debug agent did", st["debug"]["note"])
+        self.assertIn("the queue run ended before its debug agent did", self.debug_report(st))
+
+    def test_a_debug_look_the_owner_ended_is_not_looked_at_again(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_VERDICT="harness-change-needed")
+        self.add("ABC-1")
+        self.run_queue("--debug", "1")
+        q = self.cut_short()
+        tq.tidy(q, None, ended=True)   # what halt --force does after it killed the run
+        st = self.status()
+        self.assertEqual(st["debug"]["verdict"], "needs-owner")
+        self.assertIn("the owner ended the queue run", st["debug"]["note"])
+        self.assertIn("the owner ended the queue run", self.debug_report(st))
+        self.assertNotIn("agent", st)
+        self.run_queue("--debug", "1")
+        self.assertEqual(len(self.calls_of("debug")), 1)
+
+    def test_a_report_a_cut_short_look_finished_stands(self):
+        os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_VERDICT="fixed", FAKE_DEBUG_LEAVE="rebase-merge")
+        self.add("ABC-1")
+        self.run_queue("--debug", "1")
+        q = self.cut_short(report=True)
+        tq.tidy(q, None)
+        st = self.status()
+        self.assertEqual((st["status"], st["debug"]["verdict"]), ("blocked", "needs-owner"))
+        self.assertIn("it said fixed, but nothing went again: harness queue retry ABC-1", st["debug"]["note"])
+        self.assertIn("VERDICT: fixed", self.debug_report(st))   # its own report, kept
+        self.assertNotIn("debug_again", st)
+
     def test_a_debug_agent_past_its_timeout_is_stopped_and_needs_owner(self):
         os.environ.update(FAKE_NO_COMMIT="1", FAKE_DEBUG_SLEEP="60", FAKE_DEBUG_VERDICT="fixed")
         self.add("ABC-1")
@@ -3651,6 +3715,69 @@ class NestedReposTest(Base):
         with self.assertRaises(RuntimeError) as e:
             tq.git(self.project, "-c", "core.safecrlf=false", "rev-parse", "--verify", "no-such-ref")
         self.assertTrue(str(e.exception).startswith("git rev-parse --verify: fatal:"), str(e.exception))
+
+    def test_a_git_that_died_saying_nothing_says_how_it_exited_and_a_read_is_tried_again(self):
+        r = types.SimpleNamespace(stdout="", stderr="", returncode=3221225794)
+        self.assertIn("exited with status 3221225794 (0xC0000142) and said nothing", tq.git_said(r))
+        self.assertIn("was ended by signal 9", tq.git_said(types.SimpleNamespace(stdout="", stderr="", returncode=-9)))
+        real, calls, died = tq.run_quiet, [], []
+
+        def flaky(cmd, timeout, cwd=None, env=None):
+            calls.append(cmd)
+            if not died:
+                died.append(cmd)
+                return subprocess.CompletedProcess(cmd, 3221225794, "", "")
+            return real(cmd, timeout, cwd=cwd, env=env)
+        tq.run_quiet, wait = flaky, tq.GIT_RETRY_WAIT
+        tq.GIT_RETRY_WAIT = 0
+        try:
+            got = tq.git(self.project, "rev-parse", "--git-path", "index").stdout.strip()
+            self.assertTrue(got.endswith("index"), got)
+            self.assertEqual(len(calls), 2)   # once more, and it worked
+            calls.clear()
+            tq.git(self.project, "commit", "--allow-empty", "-m", "x", check=False)
+            self.assertEqual(len(calls), 1)   # a git that writes is not asked twice
+            calls.clear()
+            r = tq.git(self.project, "diff", "--quiet", "HEAD", check=False)
+            self.assertEqual(len(calls), 1)   # status 1 saying nothing is diff --quiet's answer
+        finally:
+            tq.run_quiet, tq.GIT_RETRY_WAIT = real, wait
+
+    def test_a_cut_diff_keeps_every_file_in_view(self):
+        def sec(name, n, new=False):
+            return (f"diff --git a/{name} b/{name}\n" + ("new file mode 100644\n--- /dev/null\n" if new else
+                    f"--- a/{name}\n") + f"+++ b/{name}\n@@ -0,0 +1,{n} @@\n"
+                    + "".join(f"+{name} line {i}\n" for i in range(n)))
+        diff = sec("main.cpp", 5) + sec("fakeit.hpp", 20000, new=True) + sec("plugins/Commands.cpp", 40) \
+            + sec("plugins/test/CommandValidationTest.cpp", 30)
+        out = tq.cap_diff(diff, 20000)
+        self.assertLess(len(out), 22000)
+        for name in ("main.cpp", "plugins/Commands.cpp", "plugins/test/CommandValidationTest.cpp"):
+            self.assertIn(f"+++ b/{name}", out)
+            self.assertIn(f"+{name} line 4\n", out)
+        self.assertIn("+plugins/Commands.cpp line 39\n", out)   # a small file whole
+        self.assertIn("+fakeit.hpp line 0\n", out)   # the big one's start, then a note
+        self.assertRegex(out, r"\[\.\.\. \d+ more lines of this file's diff not shown")
+        self.assertNotIn("+fakeit.hpp line 19999", out)
+        self.assertEqual(tq.cap_diff(diff[:100], 20000), diff[:100])
+        # what cap() did: everything after the big file out of view
+        self.assertNotIn("CommandValidationTest", tq.cap(diff, 20000))
+
+    def test_a_quote_not_in_the_diff_is_shown_as_written_with_where_it_is_from(self):
+        diff = ("diff --git a/main.cpp b/main.cpp\n--- a/main.cpp\n+++ b/main.cpp\n@@ -1,2 +1,3 @@\n"
+                " int keep_this_line = 0;\n+int added_line = 1;\n"
+                "diff --git a/fakeit.hpp b/fakeit.hpp\n--- /dev/null\n+++ b/fakeit.hpp\n@@ -0,0 +1 @@\n+// fake\n")
+        obj = {"verdict": "PASS", "criteria": [
+            {"n": 1, "met": True, "quote": "main.cpp, fakeit.hpp"},
+            {"n": 2, "met": True, "quote": "int keep_this_line = 0;"},
+            {"n": 3, "met": True, "quote": "int added_line = 1;"}]}
+        probs = tq.judge(obj, ["a", "b", "c"], diff, "quote", "diff")
+        self.assertEqual(len(probs), 2, probs)
+        self.assertIn('the quoted diff text is not in the diff: "main.cpp, fakeit.hpp" (that is the names of '
+                      "changed files", probs[0])
+        self.assertNotIn("maincppfakeithpp", probs[0])
+        self.assertIn("(that is an unchanged line around the change", probs[1])
+        self.assertTrue(all(tq.QUOTE_MISS.match(p) for p in probs))   # still asked again
 
     def test_a_change_left_uncommitted_in_one_is_the_tickets(self):
         lib = self.ignored_libA()
