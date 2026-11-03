@@ -2306,6 +2306,7 @@ CHATGPT_COOKIE_STRING|ChatGPT session cookie (secret; shown masked)
 TRACKER_TOKEN|Jira personal access token, or email:api-token for Jira Cloud (secret; shown masked)
 HARNESS_HOST_CONFIRM|1 skips the y/N question before host mode (harness host / serve) starts
 QUEUE_PARALLEL|tickets one queue run works at a time (default 1); tickets in the same project folder take turns; a running queue keeps its number until it is stopped and started again
+QUEUE_WATCH|1 (default): a queue run with nothing to do keeps watching and starts tickets as they are queued, answered, approved or retried, until it is stopped; 0: it ends when nothing is left to do
 EOF
 }
 
@@ -2472,6 +2473,10 @@ _config_set() {
     local value="$*"
     if [[ "$key" == QUEUE_PARALLEL && -n "$value" && ! "$value" =~ ^[1-9][0-9]*$ ]]; then
         err "QUEUE_PARALLEL must be a whole number of tickets at a time, 1 or more (got '$value')"
+        return 1
+    fi
+    if [[ "$key" == QUEUE_WATCH && -n "$value" && "$value" != [01] ]]; then
+        err "QUEUE_WATCH must be 1 (keep watching the queue) or 0 (end when nothing is left to do), got '$value'"
         return 1
     fi
     _config_write_key "$key" "$value" || return 1

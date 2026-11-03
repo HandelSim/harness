@@ -198,8 +198,8 @@ installer. Three commands cover post-install setup:
     `DEFAULT_MODEL_NAME` delegates to `cmd_model`.
   - `config get [KEY]` / `config list` print values (`config list --tsv`:
     `KEY<TAB>shown value<TAB>secret 1/0<TAB>description`, secrets masked, for
-    serve's Settings page, which groups them, `QUEUE_PARALLEL` under Ticket queue);
-    `config set KEY VALUE` writes one (`QUEUE_PARALLEL` only a whole number of 1 or more). **Not a whitelist** — `set` writes any key; the picker/`get`
+    serve's Settings page, which groups them, `QUEUE_PARALLEL` and `QUEUE_WATCH` under Ticket queue);
+    `config set KEY VALUE` writes one (`QUEUE_PARALLEL` only a whole number of 1 or more, `QUEUE_WATCH` only 0 or 1). **Not a whitelist** — `set` writes any key; the picker/`get`
     just surface the common ones.
   - Reads use `_config_read_key` (straight from `$env_file`, so they reflect
     on-disk state). Writes use `_config_write_key` — the same atomic

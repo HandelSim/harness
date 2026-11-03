@@ -250,5 +250,15 @@ done
 [[ "$(_config_read_key QUEUE_PARALLEL)" == 3 ]] || fail "T15: a refused value changed it"
 ok "T15: QUEUE_PARALLEL is listed and only a whole number of 1 or more is saved"
 
+# --- T16: QUEUE_WATCH is on the settings list and takes 0 or 1 only ----------
+grep -q '^QUEUE_WATCH|' < <(_config_editable_keys) || fail "T16: QUEUE_WATCH not editable"
+_config_set QUEUE_WATCH 0 >/dev/null || fail "T16: 0 refused"
+[[ "$(_config_read_key QUEUE_WATCH)" == 0 ]] || fail "T16: 0 not written"
+for bad in 2 yes -1 01; do
+    _config_set QUEUE_WATCH "$bad" >/dev/null 2>&1 && fail "T16: '$bad' taken"
+done
+[[ "$(_config_read_key QUEUE_WATCH)" == 0 ]] || fail "T16: a refused value changed it"
+ok "T16: QUEUE_WATCH is listed and only 0 or 1 is saved"
+
 echo
 echo "CONFIG TEST PASSED"
