@@ -239,5 +239,16 @@ _config_value_truncated ''    'a=1; b=2' && fail "T14: empty sourced value flagg
 _config_value_truncated 'a=1' ''         && fail "T14: empty on-disk value flagged"
 ok "T14: _config_value_truncated fires only on a strict prefix of the on-disk value"
 
+# --- T15: QUEUE_PARALLEL is on the settings list and takes whole numbers only -
+mkdir -p "$(dirname "$env_file")"; : >"$env_file"   # T12 uninstalled the root
+grep -q '^QUEUE_PARALLEL|' < <(_config_editable_keys) || fail "T15: QUEUE_PARALLEL not editable"
+_config_set QUEUE_PARALLEL 3 >/dev/null || fail "T15: 3 refused"
+[[ "$(_config_read_key QUEUE_PARALLEL)" == 3 ]] || fail "T15: 3 not written"
+for bad in 0 abc 2.5 -1; do
+    _config_set QUEUE_PARALLEL "$bad" >/dev/null 2>&1 && fail "T15: '$bad' taken"
+done
+[[ "$(_config_read_key QUEUE_PARALLEL)" == 3 ]] || fail "T15: a refused value changed it"
+ok "T15: QUEUE_PARALLEL is listed and only a whole number of 1 or more is saved"
+
 echo
 echo "CONFIG TEST PASSED"

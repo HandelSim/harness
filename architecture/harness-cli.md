@@ -198,7 +198,8 @@ installer. Three commands cover post-install setup:
     `DEFAULT_MODEL_NAME` delegates to `cmd_model`.
   - `config get [KEY]` / `config list` print values (`config list --tsv`:
     `KEY<TAB>shown value<TAB>secret 1/0<TAB>description`, secrets masked, for
-    serve's Settings page); `config set KEY VALUE` writes one. **Not a whitelist** — `set` writes any key; the picker/`get`
+    serve's Settings page, which groups them, `QUEUE_PARALLEL` under Ticket queue);
+    `config set KEY VALUE` writes one (`QUEUE_PARALLEL` only a whole number of 1 or more). **Not a whitelist** — `set` writes any key; the picker/`get`
     just surface the common ones.
   - Reads use `_config_read_key` (straight from `$env_file`, so they reflect
     on-disk state). Writes use `_config_write_key` — the same atomic
@@ -919,7 +920,9 @@ A `plan_review` ticket's plan is held as `plan-review`. Without a plan stage the
 "Acceptance criteria" bullets, else to "the change does what the ticket asks
 for". Must fix items with no fix stage end the ticket: `done` when review was
 last, else `blocked` (`retry KEY --stage fix` goes on). `note KEY` adds an
-owner note every later prompt gets (`{{NOTES}}`); notes live in
+owner note every later prompt gets (`{{NOTES}}`: all of them, oldest first,
+numbered and dated, with the rule that a newer note wins where two disagree;
+notes are never deleted, the owner changes course with a newer one); notes live in
 `KEY/notes.json` under a lock and are re-read on every save, so a runner
 holding older state cannot drop one. `retry KEY [--stage S]` (blocked,
 needs-answers, stopped, done, a running ticket no run has in hand, a queued
