@@ -2287,7 +2287,7 @@ class DiffPageTest(RunsServer):
     def test_review_comments_only_on_the_work_view_of_a_ticket_the_queue_would_take_them_for(self):
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
         self.assertIn("<section class='panel' id='dv-review' data-key='ABC-12' data-sent='0:' data-max='40' "
-                      "data-text-max='2000'>", body)
+                      "data-text-max='2000' data-nomem>", body)   # page memory leaves it to its own store
         self.assertIn("<form method='post' action='/runs/ticket/ABC-12/fix' id='dv-send'>", body)
         self.assertIn("Send 0 comments to the fixer", body)
         self.assertIn("function reviewer(box)", body)

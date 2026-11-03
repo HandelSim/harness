@@ -517,8 +517,8 @@ def _review(runs, key, st):
     href = f"/runs/ticket/{quote(key)}"
     return ("<p class='muted'>Click a line to comment on it; <a href='#dv-review'>the comments</a> go to the "
             "fixer from the bottom of the page.</p>",
-            f"<section class='panel' id='dv-review' data-nomem data-key='{esc(key)}' data-sent='{esc(mark)}' "
-            f"data-max='{runs_view.FIX_MAX}' data-text-max='{runs_view.FIX_TEXT_MAX}'><h2>Review comments</h2>"
+            f"<section class='panel' id='dv-review' data-key='{esc(key)}' data-sent='{esc(mark)}' "
+            f"data-max='{runs_view.FIX_MAX}' data-text-max='{runs_view.FIX_TEXT_MAX}' data-nomem><h2>Review comments</h2>"
             "<div class='muted'>Click a line of the diff to comment on it, or comment on the whole change here. "
             "The comments wait in this browser until you send them; then they all go straight to the fix stage, "
             "which does them and commits (a new plan is a follow-up, on the ticket's page).</div>"
