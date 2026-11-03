@@ -7,6 +7,8 @@ plan -> implement -> review (-> one fix) -> push, with no one at the keyboard.
                   [--no-plan-approval] [--take-defaults] [--note TEXT]
   ticket_queue.py --state DIR list | status [--json] | remove KEY... | approve KEY
   ticket_queue.py --state DIR retry KEY [--stage S] | stop KEY | move KEY up|down|top|bottom
+  ticket_queue.py --state DIR move KEY --before OTHER|''   (just above OTHER; '' : the bottom)
+  ticket_queue.py --state DIR archive KEY... | unarchive KEY...
   ticket_queue.py --state DIR halt [--force --harness PATH]
   ticket_queue.py --state DIR note KEY [--text T | --stdin]
   ticket_queue.py --state DIR answer KEY --vault V [--text T] [--go]
@@ -267,6 +269,14 @@ class Queue:
 
     def set_order(self, keys):
         write_atomic(os.path.join(self.root, "queue.list"), "".join(k + "\n" for k in keys))
+
+    def archived(self):
+        """Tickets put away by the owner (harness queue archive): out of the order, so
+        no run takes them, their folder and notes kept; newest first."""
+        return [k for k in read(os.path.join(self.root, "archived.list")).split() if KEY_RE.match(k)]
+
+    def set_archived(self, keys):
+        write_atomic(os.path.join(self.root, "archived.list"), "".join(k + "\n" for k in keys))
 
     def dir(self, key):
         return os.path.join(self.root, key)
@@ -5211,6 +5221,11 @@ def cmd_add(q, a):
                 print(f"[queue] not a ticket key: {raw}", file=sys.stderr)
                 rc = 1
                 continue
+            if key in q.archived():
+                print(f"[queue] {key} is archived ('harness queue unarchive {key}' puts it back, "
+                      f"'harness queue remove {key}' deletes it)", file=sys.stderr)
+                rc = 1
+                continue
             if key in order or q.load(key):
                 print(f"[queue] {key} is already in the queue ('harness queue remove {key}' first)", file=sys.stderr)
                 rc = 1
@@ -5490,6 +5505,9 @@ def cmd_remove(q, a):
                 print(f"[queue] {key}: {e}; remove {q.dir(key)} by hand", file=sys.stderr)
             print(f"[queue] {key} removed" + removed_note(q, st, order))
         q.set_order(order)
+        put_away = q.archived()
+        if any(raw.upper() in put_away for raw in a.keys):
+            q.set_archived([k for k in put_away if k not in {raw.upper() for raw in a.keys}])
     for key, gone in trash:
         err = rmtree(gone)
         if err:
@@ -5527,6 +5545,9 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
     st = q.load(key.upper())
     if not st:
         print(f"[queue] {key} is not in the queue", file=sys.stderr)
+        return None
+    if st["key"] in q.archived():   # no run would take it: out of the order
+        print(f"[queue] {st['key']} is archived; harness queue unarchive {st['key']} first", file=sys.stderr)
         return None
     if st["status"] not in want:
         print(f"[queue] {st['key']} is {st['status']}, not {' or '.join(want)}", file=sys.stderr)
@@ -5957,14 +5978,24 @@ def end_run(q, a):
 
 def cmd_move(q, a):
     key = a.key.upper()
+    before = None if a.before is None else a.before.strip().upper()
+    if (a.where is None) == (before is None):
+        print("[queue] move takes up|down|top|bottom or --before OTHER", file=sys.stderr)
+        return 1
     with held(os.path.join(q.root, "queue.lock")):
         order = q.order()
         if key not in order:
             print(f"[queue] {key} is not in the queue", file=sys.stderr)
             return 1
+        if before and before not in order:   # a drag onto a ticket another tab removed or archived meanwhile
+            print(f"[queue] {before} is not in the queue", file=sys.stderr)
+            return 1
         i = order.index(key)
         order.pop(i)
-        j = {"up": max(0, i - 1), "down": min(len(order), i + 1), "top": 0, "bottom": len(order)}[a.where]
+        if before is not None:   # by key, not position: a list another tab changed meanwhile still lands right
+            j = order.index(before) if before and before != key else (i if before == key else len(order))
+        else:
+            j = {"up": max(0, i - 1), "down": min(len(order), i + 1), "top": 0, "bottom": len(order)}[a.where]
         order.insert(j, key)
         q.set_order(order)
     print(f"[queue] {key}: {j + 1} of {len(order)}")
@@ -6336,6 +6367,65 @@ def cmd_fix(q, a):
     return 0 if st else 1
 
 
+def cmd_archive(q, a):
+    """The tickets out of the queue, kept: a run no longer takes them, the queue page
+    lists them under Archived, harness queue unarchive puts them back at the bottom."""
+    rc = 0
+    with held(os.path.join(q.root, "queue.lock")):
+        order, put_away = q.order(), q.archived()
+        for raw in a.keys:
+            key = raw.upper()
+            st = q.load(key)
+            if key in put_away:
+                print(f"[queue] {key} is already archived")
+                continue
+            if key not in order or not st:
+                print(f"[queue] {key} is not in the queue", file=sys.stderr)
+                rc = 1
+                continue
+            if st.get("status") == "running" or run_holds(q, key):
+                print(f"[queue] {key}: " + (f"is running; stop it first (harness queue stop {key})"
+                                            if st.get("status") == "running" else finishing(st)), file=sys.stderr)
+                rc = 1
+                continue
+            order = [k for k in order if k != key]
+            put_away = [key] + put_away
+            st["archived"] = now_iso()
+            q.save(st)
+            q.log(key, "archived by the owner")
+            print(f"[queue] {key} archived (harness queue unarchive {key} puts it back)")
+        q.set_archived(put_away)   # first: a crash between the two leaves it listed twice, not lost
+        q.set_order(order)
+    return rc
+
+
+def cmd_unarchive(q, a):
+    rc = 0
+    with held(os.path.join(q.root, "queue.lock")):
+        order, put_away = q.order(), q.archived()
+        for raw in a.keys:
+            key = raw.upper()
+            if key not in put_away:
+                print(f"[queue] {key} is not archived", file=sys.stderr)
+                rc = 1
+                continue
+            put_away = [k for k in put_away if k != key]
+            st = q.load(key)
+            if not st:   # its folder went by hand: nothing to put back
+                print(f"[queue] {key}: its folder is gone; dropped from the archive", file=sys.stderr)
+                rc = 1
+                continue
+            if key not in order:
+                order.append(key)
+            st.pop("archived", None)
+            q.save(st)
+            q.log(key, "back in the queue from the archive")
+            print(f"[queue] {key} back in the queue at {len(order)} of {len(order)} ({st.get('status', '?')})")
+        q.set_order(order)
+        q.set_archived(put_away)
+    return rc
+
+
 def cmd_findings(q, a):
     any_ = False
     for k in q.order():
@@ -6382,7 +6472,10 @@ def main(argv):
     s.add_argument("--text"); s.add_argument("--stdin", action="store_true"); s.add_argument("--harness", default="")
     s = sub.add_parser("stop"); s.add_argument("key"); s.add_argument("--harness", default="")
     s = sub.add_parser("halt"); s.add_argument("--force", action="store_true"); s.add_argument("--harness", default="")
-    s = sub.add_parser("move"); s.add_argument("key"); s.add_argument("where", choices=("up", "down", "top", "bottom"))
+    s = sub.add_parser("move"); s.add_argument("key"); s.add_argument("where", nargs="?", choices=("up", "down", "top", "bottom"))
+    s.add_argument("--before")   # just above this ticket; '': the bottom
+    s = sub.add_parser("archive"); s.add_argument("keys", nargs="+")
+    s = sub.add_parser("unarchive"); s.add_argument("keys", nargs="+")
     s = sub.add_parser("note"); s.add_argument("key"); s.add_argument("--text"); s.add_argument("--stdin", action="store_true")
     s = sub.add_parser("answer"); s.add_argument("key"); s.add_argument("--vault", required=True); s.add_argument("--text")
     s.add_argument("--go", action="store_true")
@@ -6421,6 +6514,7 @@ def main(argv):
     try:
         return {"add": cmd_add, "edit": cmd_edit, "list": cmd_list, "status": cmd_status, "remove": cmd_remove,
             "approve": cmd_approve, "retry": cmd_retry, "continue": cmd_continue, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
+            "archive": cmd_archive, "unarchive": cmd_unarchive,
             "answer": cmd_answer, "followup": cmd_followup, "fix": cmd_fix, "findings": cmd_findings, "run": cmd_run}[a.cmd](q, a)
     except Busy as e:
         print(f"[queue] {e}; try again", file=sys.stderr)
