@@ -780,8 +780,6 @@ rc = term.wait()
 if rc != 130:
     fail(f"Ctrl-C in the upgrade: want status 130, got {rc}")
 all_gone("Ctrl-C in the upgrade")
-if children(1, "sleep 60") or any("sleep" in l for l in []):
-    pass
 term.modes_restored("Ctrl-C in the upgrade")
 os.close(term.fd)
 
@@ -815,7 +813,7 @@ ok "S12: u runs harness upgrade in serve's terminal (asked first) and serve rest
     host_proxy_stop() { echo stop >>"$state_root/calls"; }
     host_proxy_start() { :; }
     host_proxy_wait_ready() { :; }
-    lease() { bash -c 'exec -a harness-lease sleep 30' & echo $!; }
+    lease() { bash -c 'exec -a harness-lease sleep 30' >/dev/null 2>&1 & echo $!; }
     a=$(lease); b=$(lease)
     trap 'kill $a $b 2>/dev/null' EXIT
     sleep 0.2

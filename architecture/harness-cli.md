@@ -2614,7 +2614,25 @@ for up to 5 s, then the sweep; the EXIT trap also removes serve.pid and
 reaps the jq sidecar (it replaces main's). The proxy stays up. `harness
 upgrade` runs `harness_serve_refresh`: USR1 to a running serve, which ends
 its children and `exec`s the clone's new `harness serve` with its original
-arguments in the same terminal; the upgrade waits for the new stamp.
+arguments in the same terminal; the upgrade waits for the new stamp. Keys:
+when stdin is a terminal and serve is its foreground job
+(`_serve_tty_foreground`: pgrp equals the tty's tpgid, from `/proc/$$/stat`
+or `ps`), `_serve_wait_keys` replaces `wait -n`: each second it checks both
+children with `kill -0` and reads one key (`read -rsn1 -t 1`, no echo; bash
+restores the modes, also on Ctrl-C), rechecking the foreground first so a
+backgrounded serve neither stops on SIGTTIN nor sets the modes under the
+shell in front; at end of input it falls back to `wait -n`. `u` asks
+`[y/N]`, then runs `$clone_dir/harness upgrade` in the foreground, in line
+mode so its `/dev/tty` prompts work, with `HARNESS_UPGRADE_FROM_SERVE=<serve
+pid>`. That serve is waiting on the upgrade, so `harness_serve_refresh` only
+sends it the USR1 and returns (waiting for the stamp would hang 2 minutes):
+bash runs the USR1 trap when the upgrade exits, and serve restarts as above.
+`host_proxy_refresh` leaves that serve's lease out of `host_proxy_others`, so
+the proxy restarts on the new code too (another harness's lease still keeps
+it). A failed upgrade, or one with no refresh, leaves serve running as it
+was. Ctrl-C during the upgrade ends it and serve: the terminal's SIGINT
+reaches the whole foreground group. A pipe, a service or a background job
+gets the old `wait -n` and the banner without the key.
 `cmd_serve` also sets `harness_git_nosign_env`, so agents opencode web
 starts commit unsigned like `harness host` ones. Logs:
 `state/serve/{pub,opencode}.log`. `tests/unit_serve_test.sh` runs
@@ -2634,7 +2652,14 @@ silently there), and S11: a real `cmd_serve` over a stub opencode (an npm-like
 wrapper whose child spawns an agent) ended by SIGINT, restarted by
 `harness_serve_refresh`, stopped by `serve stop`, and started over a stray
 pub.py and an orphaned opencode, each time leaving both ports free and no
-stub process alive.
+stub process alive. S12 drives serve in a pseudo-terminal (Python `pty`),
+the clone's `harness upgrade` a stub that asks on `/dev/tty` and then runs
+cmd_upgrade's three refreshes: other keys ignored and not echoed, `u` then
+`n`, a failed upgrade (serve unchanged), the restart (same pid, new stamp,
+old stubs gone, refresh under 3 s), keys after the exec, a killed pub.py
+ending serve with status 1, Ctrl-C idle and in the upgrade (exit 130,
+nothing left, echo and line mode back), and a background-job serve (no key,
+never stopped). S13: the lease exclusion in `host_proxy_refresh`.
 
 ## ChatGPT backend (`harness chatgpt`)
 
