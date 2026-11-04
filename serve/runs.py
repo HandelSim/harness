@@ -3546,6 +3546,11 @@ def ticket_action(runs, key, action, form):
             if c.get("path"):
                 item.update(path=str(c["path"])[:500], line=c.get("line"), side=c.get("side"),
                             code=str(c.get("code") or "")[:500])
+                view = c.get("view") or "work"
+                if view not in ("work", "uncommitted"):
+                    return False, "a comment is on a view of the Changes page that takes none; reload it and send again"
+                if view == "uncommitted":   # HEAD against the files: an old line's number is HEAD's
+                    item["at"] = "HEAD"
                 repo = c.get("repo") or "."
                 if repo != ".":   # on a repository inside the project: one with a part of the ticket's change
                     if not isinstance(repo, str) or repo not in st.get("parts", ()):

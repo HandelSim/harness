@@ -4001,7 +4001,9 @@ FIX_WORDS = {
            "them all, then commit.",
            "the owner's review comments on the diff; they win over the plan",
            "Each Must fix item is a comment of the owner's: on one line of the diff (path:line, (new) or (old) side, "
-           "\"the line as it was shown\": the comment), or on the whole change. For each, read the code it names and "
+           "\"the line as it was shown\": the comment; a (new) line's number is the file's after the change, "
+           "an (old) one's before it, and an (old, at HEAD) one's as last committed in its repository, as git show "
+           "HEAD:<path> there shows it), or on the whole change. For each, read the code it names and "
            "do what it asks; where it differs from the plan, the comment wins. Only if one truly cannot be done as "
            "asked, leave it and say in the commit message, for that item, why, naming the lines that show it."),
 }
@@ -6323,7 +6325,9 @@ def defang(text):
 def owner_item(x):
     """One review comment of the owner's as a Must fix line: {"text"} (on the whole change),
     or {"path", "line", "side": new|old, "code": the line's text, "text"}, with "repo" for a
-    repository inside the project. ValueError says what is wrong with it."""
+    repository inside the project and "at": "HEAD" for one made on the uncommitted changes
+    (HEAD against the files: an old line's number is the file's as committed at HEAD, not
+    the base's or the snapshot's). ValueError says what is wrong with it."""
     if isinstance(x, str):
         x = {"text": x}
     if not isinstance(x, dict) or not isinstance(x.get("text"), str):
@@ -6344,9 +6348,12 @@ def owner_item(x):
         raise ValueError(f"the comment on {path[:100]} has no line number")
     if side not in ("new", "old"):
         raise ValueError(f"the comment on {path[:100]}:{line} says no side (new or old)")
+    if x.get("at") not in (None, "", "HEAD"):
+        raise ValueError(f"the comment on {path[:100]}:{line} is at an unknown version (only HEAD)")
     code = re.sub(r"[\x00-\x1f\x7f]", " ", x.get("code") if isinstance(x.get("code"), str) else "").rstrip()
     code = defang(code[:FIX_LINE_CAP] + ("..." if len(code) > FIX_LINE_CAP else ""))
     loc = defang(path if repo in (".", "") else repo.rstrip("/") + "/" + path)
+    side = "old, at HEAD" if side == "old" and x.get("at") == "HEAD" else side
     return f"{loc}:{line} ({side})" + (f" \"{code}\"" if code.strip() else "") + f": {text}"
 
 

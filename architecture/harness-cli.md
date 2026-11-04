@@ -1402,7 +1402,9 @@ TEXT` (repeatable: a comment on the whole change) and/or `--stdin`, a JSON
 list (the run viewer's Changes page): `{"text"}`, or `{"path", "line",
 "side": new|old, "code", "text"}` (`repo` for one inside the project: the
 line becomes `repo/path:…`, from the top where the fixer works; the line
-numbers are the files' as on disk, `old` the base's or the snapshot's).
+numbers are the files' as on disk, `old` the base's or the snapshot's, or
+with `"at": "HEAD"`, one made on the uncommitted view, HEAD's: the line
+says `(old, at HEAD)` and fix.md's words say how to read each side).
 `owner_item` makes each one Must fix line, `path:line (side) "the line":
 comment` (the comment's whitespace collapsed, at most `FIX_ITEM_CAP` 2,000
 characters; the line cut at 160; runs of `<`/`>` broken up so no text can
@@ -2456,16 +2458,22 @@ offered as suggestions. It is taken as pasted: quotes
   (`vault_view.SECRET`) are left out and named. Review comments go on the
   `work` view of any repository with a part (`data-repo`; one inside
   carries `repo`, checked by serve against `nested`/`baselines`, so the
-  fixer gets `rel/path`), never on `uncommitted`: its old line numbers
-  are HEAD's, not the snapshot's or the base's, and the draft is one per
-  ticket, so that view says in a line (`dv-elsewhere`) that comments go
-  on the work view, with a link, and for a part left uncommitted that it
-  also holds what the owner had changed before the work started. Only
+  fixer gets `rel/path`), and on its `uncommitted` view when those are
+  the files fix works on (`uncommitted_takes_comments`: the part is left
+  uncommitted, or the folder is on the ticket's branch there). A comment
+  made there carries `view: uncommitted` (`data-view`), which serve sends
+  as `at: HEAD`, since that view's old line numbers are HEAD's, not the
+  snapshot's or the base's; the hint over the diff says so, and for a
+  part left uncommitted that the view also holds what the owner had
+  changed before the work started. When the folder is on another branch
+  (the queue put it back on the owner's), its uncommitted files are not
+  the ticket's: that view says why in a line (`dv-elsewhere`) and links
+  to the work view. Only
   when `Runs.fix_refused` (`ticket_queue.owner_fix_refused`) says nothing
   (else why not, in a line): a click on a numbered line opens a comment
   box under it (side by side, an empty row as tall in the other half
   keeps the halves level); the list shows those on the ticket's other
-  repositories too, each linked to its work view; a
+  repositories and views too, each linked to the view it was made on; a
   box under the diff takes comments on the whole change; each one can be
   edited or removed. The draft is kept in `localStorage`
   (`harness.review.KEY`, try/catch) with the page's `data-sent` mark (how

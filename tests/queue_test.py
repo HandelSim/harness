@@ -5288,6 +5288,8 @@ class OwnerReviewTest(Base):
         for items, said in (([{"path": "a.py", "line": 0, "side": "new", "text": "x"}], "has no line number"),
                             ([{"path": "a.py", "line": 3, "side": "left", "text": "x"}], "says no side"),
                             ([{"path": "a\nb.py", "line": 3, "side": "new", "text": "x"}], "is not a file name"),
+                            ([{"path": "a.py", "line": 3, "side": "old", "at": "main", "text": "x"}],
+                             "is at an unknown version (only HEAD)"),
                             ([{"text": "  \n "}], "a comment is empty"),
                             ([{"text": "x" * 2001}], "over 2000 characters"),
                             (["x"] * 41, "41 comments"),
@@ -5308,6 +5310,16 @@ class OwnerReviewTest(Base):
         self.assertEqual(tq.owner_fix_refused(Q, dict(st, status="blocked", stage="review")), "")
         shutil.rmtree(os.path.join(self.state, "ABC-1", "repo"))
         self.assertIn("work is gone", tq.owner_fix_refused(Q, st))
+
+    def test_a_comment_on_the_uncommitted_changes_numbers_an_old_line_as_at_head(self):
+        # the Changes page's uncommitted view compares HEAD with the files: an old line's number is HEAD's,
+        # not the base's or the snapshot's, and the fixer's words say how to read each
+        line = {"path": "a.py", "line": 3, "code": "x = 1", "text": "drop it"}
+        self.assertEqual(tq.owner_item(dict(line, side="old", at="HEAD")), 'a.py:3 (old, at HEAD) "x = 1": drop it')
+        self.assertEqual(tq.owner_item(dict(line, side="new", at="HEAD")), 'a.py:3 (new) "x = 1": drop it')
+        self.assertEqual(tq.owner_item(dict(line, side="old", repo="libA")), 'libA/a.py:3 (old) "x = 1": drop it')
+        self.assertIn("an (old, at HEAD) one's as last committed in its repository, as git show HEAD:<path> there "
+                      "shows it", tq.FIX_WORDS[True][2])
 
     def test_a_comment_the_fixer_declines_may_be_answered_in_the_commit_message(self):
         diff = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-a\n+shiny_new_value = 1\n"

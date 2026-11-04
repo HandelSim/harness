@@ -14,9 +14,11 @@ repository's objects, through an index of its own, as review does. Files that lo
 like secrets are left out of every diff (vault_view.SECRET).
 
 On the work view of a ticket the queue would take them for (harness queue fix), in
-any repository of the ticket's, the owner clicks lines to comment on them, PR-review
-style; the comments wait in the browser (localStorage) and go to the fix stage all
-at once, one on a repository inside the project with its "repo"."""
+any repository of the ticket's, and on the uncommitted view where its files are the
+ones fix works on, the owner clicks lines to comment on them, PR-review style; the
+comments wait in the browser (localStorage) and go to the fix stage all at once, one
+on a repository inside the project with its "repo", one on the uncommitted view with
+"view" (its old lines are numbered as at HEAD)."""
 
 import json
 import os
@@ -192,14 +194,38 @@ def _log(d, rng):
     return [ln.split("\t", 1) for ln in (raw or "").splitlines() if "\t" in ln]
 
 
+def folder(runs, st, repo):
+    """The folder repo's files are in: the project (or one inside it) when the ticket works
+    in place, else its separate copy; None when the copy is gone."""
+    key, project = st["key"] if isinstance(st.get("key"), str) else "", st["project"]
+    if repo != ".":
+        return os.path.join(project, repo)
+    clone = os.path.join(runs.queue_dir, key, "repo")
+    return project if st.get("in_place") is True else clone if os.path.isdir(clone) else None
+
+
+def uncommitted_takes_comments(runs, st, repo):
+    """(yes, why not): the uncommitted view of repo takes review comments when its files
+    are the ones fix works on: the part of the ticket's left uncommitted there, or the
+    folder on the ticket's branch there (its leftovers, which fix may commit). Not when
+    the repository has no part, nor when the folder is on another branch (the queue put
+    it back on the owner's when the ticket stopped): those files are not the ticket's."""
+    got = part(st, repo)
+    if got is None:
+        return False, ""
+    if got[0] == "left":
+        return True, ""
+    d = folder(runs, st, repo)
+    on = (_git(d, "symbolic-ref", "-q", "--short", "HEAD", cap=500)[0] or "").strip() if d and os.path.isdir(d) else ""
+    if on == got[1]:
+        return True, ""
+    return False, f"the folder is on {on or 'a detached HEAD'}, not the ticket's branch {got[1]}"
+
+
 def changes(runs, st, repo, view):
     """{"diff", "says", "notes", "commits", "error"} for one repository and view."""
     key, project = st["key"] if isinstance(st.get("key"), str) else "", st["project"]
-    clone = os.path.join(runs.queue_dir, key, "repo")
-    if repo == ".":
-        d = project if st.get("in_place") is True else clone if os.path.isdir(clone) else None
-    else:
-        d = os.path.join(project, repo)
+    d = folder(runs, st, repo)
     res = {"diff": "", "says": "", "notes": [], "commits": [], "error": "", "kind": ""}
     if view == "work":
         got = part(st, repo)
@@ -379,6 +405,7 @@ JS = r"""
   function reviewer(box) {
     var sent = box.dataset.sent, store = 'harness.review.' + box.dataset.key, got = null;
     var repo = box.dataset.repo || '.';   // the repository this diff is of; a draft's comments can be on others
+    var view = box.dataset.view === 'uncommitted' ? 'uncommitted' : 'work';   // and the view: its line numbers
     try {
       got = JSON.parse(localStorage.getItem(store) || 'null');
       if (got && got.sent !== sent) { localStorage.removeItem(store); got = null; }
@@ -403,7 +430,8 @@ JS = r"""
     function ok(c) {
       return !!c && typeof c.text === 'string' && !!c.text.trim() && (!c.path || (typeof c.path === 'string' &&
         c.line > 0 && (c.side === 'new' || c.side === 'old') && typeof c.code === 'string' &&
-        (c.repo === undefined || (typeof c.repo === 'string' && !!c.repo))));
+        (c.repo === undefined || (typeof c.repo === 'string' && !!c.repo)) &&
+        (c.view === undefined || c.view === 'uncommitted')));
     }
     function keep() {   // the comments and what is being written, so a closed tab or a restart loses nothing
       var draft = open && open.text.trim() ? {i: open.i, at: open.at, text: open.text} : null, g = gen.value;
@@ -427,11 +455,18 @@ JS = r"""
     }
     function where(c) {
       if (!c.path) return 'the whole change';
-      return (c.repo && c.repo !== '.' ? c.repo + '/' : '') + c.path + ':' + c.line + (c.side === 'old' ? ' (old)' : '');
+      return (c.repo && c.repo !== '.' ? c.repo + '/' : '') + c.path + ':' + c.line +
+        (c.side === 'old' ? (c.view === 'uncommitted' ? ' (old, at HEAD)' : ' (old)') : '') +
+        (c.view === 'uncommitted' ? ', uncommitted' : '');
     }
-    function mine(c) { return (c.repo || '.') === repo; }   // on this diff's repository
+    function mine(c) { return (c.repo || '.') === repo && (c.view || 'work') === view; }   // on this diff
     function at(c) { return mine(c) ? rows[c.path + '\n' + c.side + '\n' + c.line] : undefined; }
-    function on(c) { return c.repo && c.repo !== '.' ? {repo: c.repo} : {}; }
+    function on(c) {   // where a comment was made, when not on the top's work view
+      var o = {};
+      if (c.repo && c.repo !== '.') o.repo = c.repo;
+      if (c.view === 'uncommitted') o.view = c.view;
+      return o;
+    }
     function put(tr, path, side, line, own) {
       rows[path + '\n' + side + '\n' + line] = rows[path + '\n' + side + '\n' + line] || tr;
       if (own) tr.dvAt = {path: path, side: side, line: line};
@@ -560,8 +595,8 @@ JS = r"""
         var li = node('li'), acts = node('div', 'dv-row');
         var head = li.appendChild(node(c.path && !mine(c) ? 'a' : 'b', '', where(c)));
         if (c.path && !mine(c)) {
-          head.href = '?repo=' + encodeURIComponent(c.repo || '.') + '&view=work';
-          head.title = 'on another repository of the ticket: its work view';
+          head.href = '?repo=' + encodeURIComponent(c.repo || '.') + '&view=' + (c.view || 'work');
+          head.title = 'made on another repository or view of the ticket\'s: go there';
         }
         if (c.code && c.code.trim()) li.appendChild(node('code', '', ' ' + c.code.trim()));
         li.appendChild(node('div', 'txt', c.text));
@@ -582,7 +617,7 @@ JS = r"""
       if (open && open.text.trim() && !confirm('Drop the comment you are writing on ' + where(open.at) + '?')) return;
       if (items.length >= max) { alert(full); return; }
       var ctn = tr.querySelector('.d2h-code-line-ctn'), code = ctn ? ctn.textContent : '';
-      open = {i: -1, text: '', at: Object.assign(on({repo: repo}), {path: tr.dvAt.path, side: tr.dvAt.side,
+      open = {i: -1, text: '', at: Object.assign(on({repo: repo, view: view}), {path: tr.dvAt.path, side: tr.dvAt.side,
         line: tr.dvAt.line, code: code.length > 160 ? code.slice(0, 157) + '...' : code})};
       paint();
     });
@@ -624,12 +659,13 @@ JS = r"""
 """
 
 
-def _review(runs, key, st, repo):
-    """(the hint over the diff, the panel under it) for review comments on the work view
-    of repo: the comment box and send button when harness queue fix would take them, else
-    why not. data-sent marks the batches sent so far: the browser drops a draft made
-    before the last. data-repo: the comments made here are on that repository's files
-    (the draft is one for the ticket, its comments on any of them)."""
+def _review(runs, key, st, repo, view="work", hint_more=""):
+    """(the hint over the diff, the panel under it) for review comments on view (work, or
+    uncommitted where uncommitted_takes_comments) of repo: the comment box and send button
+    when harness queue fix would take them, else why not. data-sent marks the batches sent
+    so far: the browser drops a draft made before the last. data-repo and data-view: the
+    comments made here are on that repository's files as this view numbers them (the draft
+    is one for the ticket, its comments on any repository and view)."""
     why = runs.fix_refused(key)
     if why is None:
         return "", ""
@@ -639,14 +675,15 @@ def _review(runs, key, st, repo):
         return "", (f"<p class='why' data-key='{esc(key)}' data-sent='{esc(mark)}'>Review comments: "
                     f"{esc(why)}.</p>")
     href = f"/runs/ticket/{quote(key)}"
-    return ("<p class='muted'>Click a line to comment on it; <a href='#dv-review'>the comments</a> go to the "
-            "fixer from the bottom of the page.</p>",
+    return ("<p class='muted' id='dv-hint'>Click a line to comment on it; <a href='#dv-review'>the comments</a> go "
+            f"to the fixer from the bottom of the page.{hint_more}</p>",
             f"<section class='panel' id='dv-review' data-key='{esc(key)}' data-sent='{esc(mark)}' "
-            f"data-repo='{esc(repo)}' data-max='{runs_view.FIX_MAX}' data-text-max='{runs_view.FIX_TEXT_MAX}' "
+            f"data-repo='{esc(repo)}' data-view='{esc(view)}' data-max='{runs_view.FIX_MAX}' "
+            f"data-text-max='{runs_view.FIX_TEXT_MAX}' "
             "data-nomem><h2>Review comments</h2>"
             "<div class='muted'>Click a line of the diff to comment on it, or comment on the whole change here. "
             "The comments wait in this browser until you send them, those on the ticket's other repositories "
-            "with them; then they all go straight to the fix stage, "
+            "and views with them; then they all go straight to the fix stage, "
             "which does them and commits (a new plan is a follow-up, on the ticket's page).</div>"
             "<ol id='dv-list' class='dv-list'></ol>"
             f"<textarea id='dv-gen' maxlength='{runs_view.FIX_TEXT_MAX}' rows='3' "
@@ -700,17 +737,13 @@ def page(runs, key, query):
              + f"</div>{only}</section>"]
     if bad:
         parts.append(runs_view._flash(bad + "; showing the project's own", True))
-    if view == "uncommitted" and "work" in can and runs_view._tq() is not None:
-        # comments go on one view only: there an old line number means the snapshot (or the base), here it
-        # would mean HEAD, and the draft is one for the ticket
+    take, why_not = uncommitted_takes_comments(runs, st, repo) if view == "uncommitted" else (False, "")
+    if why_not and "work" in can and runs_view._tq() is not None:
+        # the folder is on another branch than the ticket's: these files are not the ones fix works on
         work = f"<a href='{href}/diff?repo={quote(repo)}&amp;view=work'>The ticket's work</a>"
-        parts.append("<p class='muted' id='dv-elsewhere'>" + (
-            "This repository's part of the ticket is left uncommitted, so what is shown here is its work and "
-            "anything you had changed here before it started: this view compares with HEAD. Review comments go "
-            f"on {work}, which compares the same files with the snapshot taken when the work started: what "
-            "review, fix and the verifier read." if left else
-            "These uncommitted files are not what fix commits or the verifier reads: review comments go on "
-            f"{work}.") + "</p>")
+        parts.append(f"<p class='muted' id='dv-elsewhere'>{esc(why_not[0].upper() + why_not[1:])}, so these "
+                     "uncommitted files are not the ones fix works on: review comments go on "
+                     f"{work}.</p>")
     if res["error"]:
         parts.append(f"<section class='panel'><b>Nothing to show:</b> {esc(res['error'])}.</section>")
         return f"{key} changes", parts, JS
@@ -724,7 +757,16 @@ def page(runs, key, query):
         parts.append("<section class='panel'>No changes.</section>")
         return f"{key} changes", parts, JS
     data = json.dumps(res["diff"]).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    hint, review = _review(runs, key, st, repo) if view == "work" else ("", "")
+    if view == "work":
+        hint, review = _review(runs, key, st, repo)
+    elif take:   # an old line here is numbered as at HEAD, and the fixer is told so (owner_item's "at")
+        hint, review = _review(runs, key, st, repo, view, (
+            " This view compares the files with HEAD, so it also shows what you had changed here before the "
+            "ticket started, and an old line is numbered as committed at HEAD; the fixer is told so."
+            if left else " These are the ticket's branch's files not committed yet; what fix changes in them it "
+            "commits on the branch, and an old line is numbered as committed at HEAD; the fixer is told so."))
+    else:
+        hint, review = "", ""
     parts += [hint, "<div class='dv-lay'><button type='button' class='btn sm' data-lay='side-by-side'>Side by side</button>"
               "<button type='button' class='btn sm' data-lay='line-by-line'>One column</button></div>",
               f"<script type='application/json' id='dv-data'>{data}</script><div id='d2h'></div>", review]

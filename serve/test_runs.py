@@ -2441,10 +2441,10 @@ class DiffPageTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
         self.assertIn("the separate copy is gone", body)
 
-    def test_review_comments_only_on_the_work_view_of_a_ticket_the_queue_would_take_them_for(self):
+    def test_review_comments_on_the_files_fix_works_on_of_a_ticket_the_queue_would_take_them_for(self):
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
         self.assertIn("<section class='panel' id='dv-review' data-key='ABC-12' data-sent='0:' data-repo='.' "
-                      "data-max='40' data-text-max='2000' data-nomem>", body)   # page memory leaves it to its own store
+                      "data-view='work' data-max='40' data-text-max='2000' data-nomem>", body)   # page memory leaves it to its own store
         self.assertIn("<form method='post' action='/runs/ticket/ABC-12/fix' id='dv-send'>", body)
         self.assertIn("Send 0 comments to the fixer", body)
         self.assertIn("function reviewer(box)", body)
@@ -2452,11 +2452,12 @@ class DiffPageTest(RunsServer):
             r, body = self.req("GET", "/runs/ticket/ABC-12/diff" + q)
             self.assertNotIn("id='dv-review'", body, q)
             self.assertNotIn("<p class='why'>Review comments", body, q)
-        # the top is on the ticket's branch: its uncommitted files are not what fix commits, said in one line
+        # the ticket's branch is ABC-12 and the folder is back on main: its uncommitted files are the owner's,
+        # not the ones fix works on, said in one line
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
-        self.assertIn("<p class='muted' id='dv-elsewhere'>These uncommitted files are not what fix commits or the "
-                      "verifier reads: review comments go on <a href='/runs/ticket/ABC-12/diff?repo=.&amp;view=work'>"
-                      "The ticket's work</a>.</p>", body)
+        self.assertIn("<p class='muted' id='dv-elsewhere'>The folder is on main, not the ticket&#x27;s branch ABC-12, "
+                      "so these uncommitted files are not the ones fix works on: review comments go on "
+                      "<a href='/runs/ticket/ABC-12/diff?repo=.&amp;view=work'>The ticket's work</a>.</p>", body)
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=uncommitted")
         self.assertNotIn("dv-elsewhere", body)   # no part of the ticket's there: no work view to send them to
         self.ticket(project=self.proj, in_place=True, base_sha=self.base, status="queued", questions=[])
@@ -2553,20 +2554,32 @@ class DiffPageTest(RunsServer):
         self.assertNotIn("+work", diff)                         # the branch ABC-12 is not this ticket's
         self.assertNotIn("TOKEN", diff)
         self.assertIn("id='dv-review' data-key='ABC-12' data-sent='0:' data-repo='.'", body)
-        # the uncommitted view (HEAD and the files) has the owner's edits too: comments go to the work view
+        # the uncommitted view (HEAD and the files) has the owner's edits too, and takes comments: these are
+        # the files fix works on; its old lines are numbered as at HEAD, and the fixer is told so
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
         self.assertIn("+not committed", self.shown(body))
-        self.assertNotIn("id='dv-review'", body)
-        self.assertIn("This repository's part of the ticket is left uncommitted, so what is shown here is its "
-                      "work and anything you had changed here before it started", body)
-        self.assertIn("<a href='/runs/ticket/ABC-12/diff?repo=.&amp;view=work'>The ticket's work</a>", body)
-        # the real queue takes a comment on it, the line numbered as the file is on disk
-        items = [{"path": "a.txt", "line": 3, "side": "new", "code": "by the ticket", "text": "say why"}]
+        self.assertIn("id='dv-review' data-key='ABC-12' data-sent='0:' data-repo='.' data-view='uncommitted'", body)
+        self.assertIn("it also shows what you had changed here before the ticket started, and an old line is "
+                      "numbered as committed at HEAD", body)
+        self.assertNotIn("dv-elsewhere", body)
+        # the real queue takes comments made on either view, the new lines numbered as the file is on disk
+        items = [{"path": "a.txt", "line": 3, "side": "new", "code": "by the ticket", "text": "say why"},
+                 {"path": "a.txt", "line": 2, "side": "new", "code": "not committed", "text": "and this",
+                  "view": "uncommitted"},
+                 {"path": "a.txt", "line": 1, "side": "old", "code": "one", "text": "and that",
+                  "view": "uncommitted"}]
+        for bad in ("unpushed", "../x", 3):
+            r, body = self.act("fix", [("comments", json.dumps([dict(items[1], view=bad)]))])
+            self.assertEqual(r.status, 409, bad)
+            self.assertIn("a view of the Changes page that takes none", body)
+        self.assertNotIn("must_fix", self.state())
         r, body = self.act("fix", [("comments", json.dumps(items))])
         self.assertEqual(r.status, 303, body)
         st = self.state()
         self.assertEqual((st["status"], st["stage"], st["must_fix_by"]), ("queued", "fix", "owner"))
-        self.assertEqual(st["must_fix"], ['a.txt:3 (new) "by the ticket": say why'])
+        self.assertEqual(st["must_fix"], ['a.txt:3 (new) "by the ticket": say why',
+                                          'a.txt:2 (new) "not committed": and this',
+                                          'a.txt:1 (old, at HEAD) "one": and that'])
 
     def test_before_its_snapshot_a_no_branch_ticket_has_no_work_yet(self):
         self.no_branch()
@@ -2594,10 +2607,18 @@ class DiffPageTest(RunsServer):
         self.assertIn("+++ b/y.txt\n@@ -0,0 +1 @@\n+nested work", diff)   # the repository's own paths
         self.assertNotIn("x.txt", diff)                                   # uncommitted there: not the branch's
         self.assertIn("id='dv-review' data-key='ABC-12' data-sent='0:' data-repo='libs/inner'", body)
+        # it is on the ticket's branch there: its uncommitted files are the ones fix works on, and commits
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=uncommitted")
-        self.assertIn("These uncommitted files are not what fix commits or the verifier reads: review comments go on "
-                      "<a href='/runs/ticket/ABC-12/diff?repo=libs/inner&amp;view=work'>", body)
+        self.assertIn("+inner change", self.shown(body))
+        self.assertIn("data-repo='libs/inner' data-view='uncommitted'", body)
+        self.assertIn("These are the ticket's branch's files not committed yet", body)
+        self.assertNotIn("dv-elsewhere", body)
+        self.git(inner, "checkout", "-q", "-")   # put back on its own branch: not the ticket's files now
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=uncommitted")
         self.assertNotIn("id='dv-review'", body)
+        self.assertIn("not the ticket&#x27;s branch ABC-12, so these uncommitted files are not the ones fix works on: "
+                      "review comments go on <a href='/runs/ticket/ABC-12/diff?repo=libs/inner&amp;view=work'>", body)
+        self.git(inner, "checkout", "-q", "ABC-12")
         # a comment there goes to the fixer with the path from the top, where it works
         items = [{"repo": "libs/inner", "path": "y.txt", "line": 1, "side": "new", "code": "nested work",
                   "text": "say why"},
@@ -2629,15 +2650,18 @@ class DiffPageTest(RunsServer):
         self.assertIn("data-repo='libs/inner'", body)
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=uncommitted")
         self.assertIn("+inner change", self.shown(body))   # HEAD and the files: the owner's file too
-        self.assertIn("This repository's part of the ticket is left uncommitted", body)
-        self.assertNotIn("id='dv-review'", body)
+        self.assertIn("data-repo='libs/inner' data-view='uncommitted'", body)
+        self.assertIn("what you had changed here before the ticket started", body)
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff")   # the top, on its branch, as before
         self.assertIn("+work", self.shown(body))
         items = [{"repo": "libs/inner", "path": "x.txt", "line": 2, "side": "new", "code": "by the ticket",
-                  "text": "say why"}]
+                  "text": "say why"},
+                 {"repo": "libs/inner", "path": "z.txt", "line": 1, "side": "new", "code": "a new one",
+                  "text": "and here", "view": "uncommitted"}]
         r, body = self.act("fix", [("comments", json.dumps(items))])
         self.assertEqual(r.status, 303, body)
-        self.assertEqual(self.state()["must_fix"], ['libs/inner/x.txt:2 (new) "by the ticket": say why'])
+        self.assertEqual(self.state()["must_fix"], ['libs/inner/x.txt:2 (new) "by the ticket": say why',
+                                                    'libs/inner/z.txt:1 (new) "a new one": and here'])
 
 
 class LocalTimeTest(unittest.TestCase):
