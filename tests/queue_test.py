@@ -4128,13 +4128,28 @@ class NestedReposTest(Base):
         card = json.loads(cat(self.calls + ".card").splitlines()[-1])
         self.assertEqual(card["where"], tq.CARD_WHERE_IN_PLACE)
         self.assertIn("Leave every other change uncommitted", card["done"])
+        self.assertIn("In a repository on a branch of the ticket's: Commit as you go", prompt)
+
+    def test_no_branch_commits_nothing_as_it_goes_either(self):
+        self.ignored_libA()
+        self.add_in_place("implement", "--no-branch")
+        self.run_queue()
+        prompt = cat(self.calls + ".implementing")
+        self.assertIn("commit nothing", prompt)
+        self.assertNotIn("Commit as you go", prompt)
+        self.assertNotIn("{{COMMIT_PIECES}}", prompt)
 
     def test_one_repository_keeps_the_plain_words(self):
         self.add_in_place("implement")
         self.run_queue()
         prompt = cat(self.calls + ".implementing")
         self.assertIn("You are on branch ABC-1. Stay on that branch.", prompt)
-        self.assertIn("4. Commit on ABC-1: `git add <the files you changed>`", prompt)
+        self.assertIn("4. Commit what is not committed yet on ABC-1: `git add <the files you changed>`", prompt)
+        # a commit per piece of the change as it is done, not one at the end
+        self.assertIn(" " + tq.COMMIT_PIECES + "\n2. ", prompt)
+        self.assertNotIn("do the whole job, then commit", prompt)
+        card = json.loads(cat(self.calls + ".card").splitlines()[-1])
+        self.assertIn("a commit for each piece of the change as it is done", card["done"])
 
 
 # FAKE_NESTED ops of SubmoduleWorkTest's agent, on a submodule DIR:

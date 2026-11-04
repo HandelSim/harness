@@ -1085,7 +1085,11 @@ removed; before each stage the project's own `AGENTS.md`, `CLAUDE.md` or
 `CONTEXT.md` is copied in when the clone has none, since a clone has only
 what is committed, and listed in the clone's `.git/info/exclude` so it is
 never committed or pushed): `plan` → `implement` → `review` → `fix` (once, when the review has
-Must fix items) → `push`. The prompt (`scripts/queue_prompts/<stage>.md`)
+Must fix items) → `push`. Where it commits, implement commits as it goes, one
+commit per piece of the change (a plan Step or a few that make one piece of
+behaviour, built), a few at most, not one at the end (`COMMIT_PIECES`); a
+split after the fact would need `git add -p`, which a headless agent cannot
+run. Test and fix stay one commit each. The prompt (`scripts/queue_prompts/<stage>.md`)
 embeds the ticket, plan, answers and the last attempt's problems, capped to
 fit one argv argument, because the free models only read the last message.
 While a stage runs its whole prompt is also in the vault at

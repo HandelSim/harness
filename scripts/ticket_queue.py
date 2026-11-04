@@ -2994,6 +2994,19 @@ def lands(ctx, st):
     return branches, left
 
 
+# How the implement stage splits its work into commits, where it commits: as it
+# goes, a commit per piece, as an engineer would, not one at the end. Splitting
+# after the fact would take git add -p (interactive) or hand-made patches, and
+# a commit made as each piece is done is a checkpoint a crash does not lose.
+COMMIT_PIECES = ("Commit as you go, as a careful engineer would: when one piece of the change is done and builds (a "
+                 "plan Step, or a few Steps that together make one piece of behaviour, with its tests and the docs "
+                 "it changes), commit that piece on its own, its message saying what it does. A small ticket is one "
+                 "commit; a bigger one a few, rarely more than six. Not a commit per file or per edit, no \"wip\" "
+                 "commits, and not everything in one commit at the end when the change has separate pieces. A slip "
+                 "you find in a piece already committed goes into your next commit, which says so; do not amend, "
+                 "reset or rebase.")
+
+
 def landing(st, how):
     """The prompts' words for where the change lands (lands): LAYOUT, COMMIT_STEP,
     CHECK_STEP, FIX_COMMIT_STEP, CHANGE (the review's) and CHANGE_SO_FAR (the fix's)."""
@@ -3003,10 +3016,11 @@ def landing(st, how):
     if branches == [(".", branch_of(st))] and not left:   # one repository on one branch
         b = branch_of(st)
         return dict(
-            LAYOUT=f"You are on branch {b}. Stay on that branch.",
-            COMMIT_STEP=f"Commit on {b}: `git add <the files you changed>` then `git commit -m \"{key}: <what changed>\"`. "
-                        "Do not push; harness pushes.",
-            CHECK_STEP=f"Check `git status` is clean and `git log --oneline {base}..HEAD` shows your commit(s).",
+            LAYOUT=f"You are on branch {b}. Stay on that branch.", COMMIT_PIECES=COMMIT_PIECES,
+            COMMIT_STEP=f"Commit what is not committed yet on {b}: `git add <the files you changed>` then `git commit -m "
+                        f"\"{key}: <what changed>\"`. Do not push; harness pushes.",
+            CHECK_STEP=f"Check `git status` is clean and `git log --oneline {base}..HEAD` shows your commit(s), one "
+                       "for each piece of the change.",
             FIX_COMMIT_STEP=f"Commit on {b}: `git add <files>` then `git commit -m \"{key}: review fixes\" -m \"<why any "
                             "item was left as it is>\"`. When every item was wrong and nothing changed, still commit: "
                             "`git commit --allow-empty` with the same messages. Do not push, do not rewrite earlier commits.",
@@ -3036,6 +3050,7 @@ def landing(st, how):
         if len(branches) + len(left) > 1 or (left and left != ["."]) else \
         (f", on branch {branches[0][1]}" if branches else ", where the change is left uncommitted")
     return dict(LAYOUT=layout, COMMIT_STEP=commit, ON_BRANCH=on_branch,
+                COMMIT_PIECES=("In a repository on a branch of the ticket's: " + COMMIT_PIECES) if branches else "",
                 CHECK_STEP="Check `git status` in each repository you changed: your changes are committed where "
                            "the ticket has a branch and uncommitted everywhere else, and nothing else of yours is left.",
                 FIX_COMMIT_STEP=fix,
@@ -3060,7 +3075,8 @@ CARD_DONE = {
             "(ticket: \"exact words\") or (edge of AC1)), ## Questions (- Q1 [blocking] ..? Options: (a) .. (b) .. "
             "Default: (a), because ..), ## Assumptions (- A1: ..); then each Step's code re-read and the plan fixed.",
     "implement": "every acceptance criterion of the plan is met and committed on {BRANCH} (git add <files>, git commit "
-                 "-m \"{KEY}: <what changed>\"), and git status is clean. Do not push.",
+                 "-m \"{KEY}: <what this piece does>\"), a commit for each piece of the change as it is done, not "
+                 "one at the end, and git status is clean. Do not push.",
     "implement-repos": "every acceptance criterion of the plan is met. {COMMIT_STEP}",
     "review": "the review is written to {REVIEW_FILE}: # {KEY} review, then ## Must fix (path:line: the problem and "
               "what to do, or - None) and ## Notes. Change no code in this stage.",
