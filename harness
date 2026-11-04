@@ -8664,8 +8664,11 @@ until 'harness serve stop' or harness serve takes the port over.
 HARNESS_OPEN=0 turns that off.
 It starts the host-mode proxy if needed (same as 'harness host') and runs in
 the foreground; Ctrl-C stops both servers and leaves the proxy up ('harness
-host down' stops it). With no vault active the pub page still comes up, with
-no pages. Reach it from another machine with ssh port forwarding:
+host down' stops it). In its terminal, u runs harness upgrade there (it asks
+first); serve then starts again on the new code, with the same options, as
+it does after a harness upgrade in another shell. With no vault active the
+pub page still comes up, with no pages. Reach it from another machine with
+ssh port forwarding:
   ssh -L 8780:127.0.0.1:8780 -L 8781:127.0.0.1:8781 <this host>
 --allow-host NAME accepts that Host header too (NAME is host:port as the
 browser sends it), for a reverse proxy in front of the pub page. The pub
@@ -8800,14 +8803,27 @@ HELP
     echo "   opencode web: http://127.0.0.1:$oc_port/ (open it from the pub page)" >&2
     echo "   vault:        ${harness_vault_dir:-none}" >&2
     echo "   logs:         $logdir/{pub,opencode}.log" >&2
+    # Keys only from a terminal this serve is in front of; otherwise (a
+    # pipe, a service, a background job) it waits on the servers as before.
+    local serve_keys=0
+    [[ -t 0 ]] && _serve_tty_foreground && serve_keys=1
     echo "   Ctrl-C stops serve; the proxy stays up ('harness host down')" >&2
-    echo "   harness upgrade restarts it here on the new code" >&2
+    if (( serve_keys )); then
+        echo "   u runs harness upgrade here; serve then restarts on the new code" >&2
+        echo "   (so does a harness upgrade in another shell)" >&2
+    else
+        echo "   harness upgrade restarts it here on the new code" >&2
+    fi
     echo "============================================================" >&2
 
-    local rc=0
-    wait -n "$oc_pid" "$pub_pid" || rc=$?
+    local serve_rc=0
+    if (( serve_keys )); then
+        _serve_wait_keys "$oc_pid" "$pub_pid"
+    else
+        wait -n "$oc_pid" "$pub_pid" || serve_rc=$?
+    fi
     if (( ! serve_restart )); then
-        err "serve: a server exited (status $rc); see $logdir/pub.log and $logdir/opencode.log"
+        err "serve: a server exited (status $serve_rc); see $logdir/pub.log and $logdir/opencode.log"
         exit 1
     fi
     echo "[harness] serve: harness was upgraded; starting again on the new code" >&2
