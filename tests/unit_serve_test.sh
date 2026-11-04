@@ -395,6 +395,23 @@ serve_password_file() { echo pw >"\$state_root/pw"; echo "\$state_root/pw"; }
 set -euo pipefail
 mkdir -p "\$state_root/serve"
 [[ "\$1" == refresh ]] && { harness_serve_refresh; exit; }   # what harness upgrade runs
+# harness upgrade, as serve's u key runs it (S12): what \$SL/upgrade.mode says.
+if [[ "\$1" == upgrade ]]; then
+    up_log="$SL/upgrades"
+    echo "upgrade from-serve=\${HARNESS_UPGRADE_FROM_SERVE:-} args=\${*:2}" >>"\$up_log"
+    case "\$(cat "$SL/upgrade.mode" 2>/dev/null)" in
+        fail) exit 3 ;;
+        hang) echo hang >>"\$up_log"; sleep 60; exit 0 ;;
+        noop) exit 0 ;;
+        *)    # a prompt read from the terminal, then cmd_upgrade's restarts
+            read -r -p "stub upgrade question? " a </dev/tty
+            echo "answer=\$a" >>"\$up_log"
+            t0=\$SECONDS
+            host_proxy_refresh; harness_serve_refresh; harness_view_refresh
+            echo "refresh-secs=\$(( SECONDS - t0 ))" >>"\$up_log"
+            exit 0 ;;
+    esac
+fi
 shift   # "serve"
 cmd_serve "\$@"
 EOF
@@ -500,5 +517,321 @@ p.wait(20)
 all_gone("Ctrl-C after takeover")
 EOF
 ok "S11: Ctrl-C, harness upgrade's restart (USR1) and serve stop leave nothing running; serve takes over what one left"
+
+# With no terminal (S11's serves) there are no keys, and the banner says so.
+grep -q "harness upgrade restarts it here on the new code" "$SL/pids.err" \
+    && ! grep -q "u runs harness upgrade" "$SL/pids.err" \
+    || fail "S11: with no terminal the banner should not offer the u key: $(cat "$SL/pids.err")"
+
+# --- S12: serve's u key runs harness upgrade in its terminal -----------------
+# serve in a pseudo-terminal, S11's clone and stub opencode; the clone's
+# `harness upgrade` is a stub ($SL/upgrade.mode) that asks a question on the
+# terminal and then runs cmd_upgrade's restarts. Covers: a key other than u,
+# u then n, a failed upgrade (serve goes on), the upgrade's restart of serve
+# (no wait on serve, which is waiting on it), the keys after that restart, a
+# server exiting, Ctrl-C idle and in the upgrade, the terminal's modes after,
+# and a serve that is a background job (no keys, not stopped by SIGTTIN).
+STUB_PIDS="$SL/pids12" PATH="$SL/bin:$PATH" "$PY" - "$FC/harness" "$SPORT" "$SL/root/state" "$SL" <<'EOF' \
+    || fail "S12: serve's u key (above)"
+import os, pty, re, select, signal, socket, sys, termios, time
+harness, port, state, sl = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+pidf = os.path.join(state, "serve", "serve.pid")
+modef, upf = os.path.join(sl, "upgrade.mode"), os.path.join(sl, "upgrades")
+term = None
+def fail(m):
+    print("S12:", m, file=sys.stderr)
+    if term:
+        print("--- terminal ---\n" + term.buf.decode(errors="replace")[-3000:], file=sys.stderr)
+    sys.exit(1)
+def listening(p):
+    s = socket.socket()
+    try:
+        return s.connect_ex(("127.0.0.1", p)) == 0
+    finally:
+        s.close()
+def alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+def pstate(pid):
+    with open(f"/proc/{pid}/stat") as f:
+        return f.read().rsplit(")", 1)[1].split()[0]
+def until(cond, secs, what):
+    end = time.time() + secs
+    while time.time() < end:
+        if cond():
+            return
+        if term:
+            term.pump(0.1)
+        else:
+            time.sleep(0.1)
+    fail(what)
+def stubs():
+    try:
+        return [tuple(map(int, l.split())) for l in open(os.environ["STUB_PIDS"])]
+    except OSError:
+        return []
+def stamp():
+    try:
+        return open(pidf).read().split()
+    except OSError:
+        return []
+def upgrades():
+    try:
+        return open(upf).read().splitlines()
+    except OSError:
+        return []
+def mode(m):
+    with open(modef, "w") as f:
+        f.write(m)
+def children(pid, name):
+    out = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                ppid = int(open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()[1])
+                cmd = open(f"/proc/{d}/cmdline", "rb").read()
+            except OSError:
+                continue
+            if ppid == pid and name.encode() in cmd:
+                out.append(int(d))
+    return out
+
+class Term:
+    """harness serve on a pseudo-terminal: its foreground job, or (bg) a
+    background job of it, as `harness serve &` in a shell."""
+    def __init__(self, bg=False):
+        self.buf = b""
+        argv = [harness, "serve", "--port", str(port)]
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                if bg:
+                    c = os.fork()
+                    if c == 0:
+                        os.setpgid(0, 0)
+                        os.execv(argv[0], argv)
+                    os._exit(os.waitstatus_to_exitcode(os.waitpid(c, 0)[1]) & 0xff)
+                os.execv(argv[0], argv)
+            finally:
+                os._exit(127)
+        self.pid, self.fd = pid, fd
+    def pump(self, secs):
+        end = time.time() + secs
+        while True:
+            r, _, _ = select.select([self.fd], [], [], max(0, end - time.time()))
+            if not r:
+                return
+            try:
+                d = os.read(self.fd, 65536)
+            except OSError:   # EIO: nothing has the terminal open any more
+                time.sleep(max(0, end - time.time()))
+                return
+            if not d:
+                return
+            self.buf += d
+    def mark(self):
+        self.pump(0.2)
+        return len(self.buf)
+    def expect(self, pat, since=0, secs=20):
+        rx = re.compile(pat.encode())
+        end = time.time() + secs
+        while time.time() < end:
+            if rx.search(self.buf, since):
+                return
+            self.pump(0.2)
+        fail(f"the terminal never showed {pat!r}")
+    def send(self, b):
+        os.write(self.fd, b)
+    def wait(self, secs=20):
+        end = time.time() + secs
+        while time.time() < end:
+            self.pump(0.1)
+            p, st = os.waitpid(self.pid, os.WNOHANG)
+            if p:
+                return os.waitstatus_to_exitcode(st)
+        fail("serve did not exit")
+    def modes_restored(self, what):
+        lflag = termios.tcgetattr(self.fd)[3]
+        if not (lflag & termios.ECHO and lflag & termios.ICANON):
+            fail(f"{what}: the terminal is left without echo or line mode")
+
+def up(n):
+    until(lambda: listening(port) and listening(port + 1) and len(stubs()) >= n and len(stamp()) == 3,
+          20, f"serve {n} did not come up")
+def all_gone(what):
+    until(lambda: not listening(port) and not listening(port + 1), 10, f"{what}: a port is still held")
+    left = [pid for pair in stubs() for pid in pair if alive(pid)]
+    if left:
+        fail(f"{what}: left running: {left}")
+    if os.path.exists(pidf):
+        fail(f"{what}: serve.pid is left")
+
+# A: keys in the foreground
+term = Term()
+term.expect(r"u runs harness upgrade here; serve then restarts on the new code")
+up(1)
+first = stamp()
+if int(first[0]) != term.pid:
+    fail(f"serve.pid names {first[0]}, not serve ({term.pid})")
+m = term.mark()
+term.send(b"Q")
+term.pump(1.5)
+if b"Q" in term.buf[m:]:
+    fail("a key was echoed")
+term.send(b"u")
+term.expect(r"run harness upgrade now\? .*\[y/N\] ", m)
+term.send(b"n")
+term.expect(r"not upgrading", m)
+if upgrades():
+    fail("n ran the upgrade: " + repr(upgrades()))
+
+mode("fail")
+m = term.mark()
+term.send(b"u")
+term.expect(r"\[y/N\] ", m)
+term.send(b"y")
+term.expect(r"harness upgrade did not finish \(status 3\); serve goes on", m)
+if upgrades() != [f"upgrade from-serve={term.pid} args="]:
+    fail("the upgrade should run once, told which serve ran it: " + repr(upgrades()))
+term.pump(1.5)
+if stamp() != first or not (listening(port) and listening(port + 1)):
+    fail("a failed upgrade should leave serve as it was")
+
+mode("noop")
+m = term.mark()
+term.send(b"U")
+term.expect(r"\[y/N\] ", m)
+term.send(b"Y")
+term.expect(r"harness upgrade did not restart serve; it goes on as it was", m)
+if stamp() != first:
+    fail("an upgrade that asked for no restart restarted serve")
+
+# The upgrade asks on the terminal (in line mode, echoed), then its restart
+# of this serve returns at once and serve starts again once it is done.
+mode("ok")
+open(upf, "w").close()
+m = term.mark()
+term.send(b"u")
+term.expect(r"\[y/N\] ", m)
+term.send(b"y")
+term.expect(r"stub upgrade question\? ", m)
+term.send(b"hello\r")
+term.expect(r"hello", m)
+term.expect(r"harness serve restarts on the new code when this upgrade is done", m)
+term.expect(r"harness was upgraded; starting again on the new code", m)
+up(2)
+until(lambda: stamp() != first and len(stamp()) == 3, 20, "serve.pid did not get a new stamp")
+if stamp()[0] != first[0]:
+    fail("the restart is to keep serve's pid (exec)")
+ups = upgrades()
+if "answer=hello" not in ups:
+    fail("the upgrade's question did not get the typed answer: " + repr(ups))
+secs = [int(l.split("=")[1]) for l in ups if l.startswith("refresh-secs=")]
+if not secs or secs[0] > 3:
+    fail("the upgrade's restarts waited on serve: " + repr(ups))
+if any(alive(x) for x in stubs()[0]):
+    fail(f"the restart left the old opencode or its agent: {stubs()[0]}")
+term.expect(r"u runs harness upgrade here", m)
+
+# Keys after the restart, then a server exiting ends serve, with everything.
+m = term.mark()
+term.send(b"u")
+term.expect(r"\[y/N\] ", m)
+term.send(b"n")
+term.expect(r"not upgrading", m)
+pub = children(term.pid, "pub.py")
+if len(pub) != 1:
+    fail(f"want serve's one pub.py, got {pub}")
+os.kill(pub[0], signal.SIGKILL)
+term.expect(r"serve: a server exited \(status 137\)", m)
+if term.wait() != 1:
+    fail("serve should exit 1 when a server exits")
+all_gone("a server exited")
+term.modes_restored("a server exited")
+os.close(term.fd)
+
+# B: Ctrl-C while serve waits on keys
+term = Term()
+up(3)
+term.pump(1.5)
+term.send(b"\x03")
+rc = term.wait()
+if rc != 130:
+    fail(f"Ctrl-C: want status 130, got {rc}")
+all_gone("Ctrl-C")
+term.modes_restored("Ctrl-C")
+os.close(term.fd)
+
+# C: Ctrl-C in the upgrade stops it and serve
+mode("hang")
+open(upf, "w").close()
+term = Term()
+up(4)
+m = term.mark()
+term.send(b"u")
+term.expect(r"\[y/N\] ", m)
+term.send(b"y")
+until(lambda: "hang" in upgrades(), 10, "the upgrade did not start")
+term.send(b"\x03")
+rc = term.wait()
+if rc != 130:
+    fail(f"Ctrl-C in the upgrade: want status 130, got {rc}")
+all_gone("Ctrl-C in the upgrade")
+if children(1, "sleep 60") or any("sleep" in l for l in []):
+    pass
+term.modes_restored("Ctrl-C in the upgrade")
+os.close(term.fd)
+
+# D: a background job of the terminal: no keys, and never stopped for them
+open(upf, "w").close()
+term = Term(bg=True)
+term.expect(r"harness upgrade restarts it here on the new code")
+if b"u runs harness upgrade" in term.buf:
+    fail("a background serve offers the u key")
+up(5)
+spid = int(stamp()[0])
+term.send(b"u")
+term.pump(2.5)
+if pstate(spid) == "T":
+    fail("a background serve was stopped (it read the terminal)")
+if upgrades() or b"[y/N]" in term.buf:
+    fail("a background serve took the u key")
+os.kill(spid, signal.SIGTERM)
+term.wait()
+all_gone("a background serve's SIGTERM")
+os.close(term.fd)
+EOF
+ok "S12: u runs harness upgrade in serve's terminal (asked first) and serve restarts on the new code; no keys from a pipe or a background job; Ctrl-C and a server exiting still end it all"
+
+# --- S13: an upgrade from serve's u key restarts the proxy serve holds --------
+# host_proxy_refresh leaves the proxy alone while another harness holds a
+# lease, but not for the serve that ran the upgrade: it restarts right after.
+(
+    state_root="$TMP_ROOT/lease"; mkdir -p "$state_root/host"
+    host_proxy_running() { return 0; }
+    host_proxy_stop() { echo stop >>"$state_root/calls"; }
+    host_proxy_start() { :; }
+    host_proxy_wait_ready() { :; }
+    lease() { bash -c 'exec -a harness-lease sleep 30' & echo $!; }
+    a=$(lease); b=$(lease)
+    trap 'kill $a $b 2>/dev/null' EXIT
+    sleep 0.2
+    hold() { : >"$(host_proxy_usersdir)/$1"; }
+    mkdir -p "$(host_proxy_usersdir)"; hold "$a"
+    out=$(host_proxy_refresh 2>&1)
+    [[ "$out" == *"keeps the old code"*"pid $a"* && ! -e "$state_root/calls" ]] \
+        || fail "S13: a lease should keep the old proxy: $out"
+    out=$(HARNESS_UPGRADE_FROM_SERVE=$a host_proxy_refresh 2>&1)
+    [[ "$out" == *"restarting the host proxy"* && "$(cat "$state_root/calls")" == stop ]] \
+        || fail "S13: the upgrading serve's own lease should not keep the old proxy: $out"
+    rm -f "$state_root/calls"; hold "$b"
+    out=$(HARNESS_UPGRADE_FROM_SERVE=$a host_proxy_refresh 2>&1)
+    [[ "$out" == *"keeps the old code"*"pid $b)"* && ! -e "$state_root/calls" ]] \
+        || fail "S13: another harness's lease should still keep it: $out"
+) || exit 1
+ok "S13: the serve that ran the upgrade does not keep the old proxy; another harness does"
 
 echo "SERVE TEST PASSED"

@@ -8547,16 +8547,15 @@ _serve_tty_foreground() {
 # harness serve's u key: harness upgrade in this terminal, once confirmed.
 # Its harness_serve_refresh sends this serve the USR1 that restarts it on
 # the new code when the upgrade is done (it cannot wait for that here). A
-# Ctrl-C in the upgrade ends the upgrade only; serve goes on.
+# Ctrl-C in the upgrade stops it and serve, as Ctrl-C does anywhere in
+# serve: the terminal's Ctrl-C reaches opencode too (node takes SIGINT back).
 _serve_key_upgrade() {
     local ans="" rc=0
-    printf '[harness] serve: run harness upgrade now? serve, opencode web with it, then restarts on the new code [y/N] ' >&2
+    printf '[harness] serve: run harness upgrade now? serve and opencode web then restart on the new code [y/N] ' >&2
     read -rsn1 -t 60 ans || ans=""
     echo "${ans:-n}" >&2
     [[ "$ans" == [yY] ]] || { echo "[harness] serve: not upgrading" >&2; return 0; }
-    trap ':' INT
     HARNESS_UPGRADE_FROM_SERVE=$$ "$clone_dir/harness" upgrade || rc=$?
-    trap 'exit 130' INT
     (( serve_restart )) && return 0
     if (( rc )); then
         err "serve: harness upgrade did not finish (status $rc); serve goes on, on the code it started with (u to try again)"
