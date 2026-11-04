@@ -7634,7 +7634,10 @@ passes covered and found, so it looks further than the last one. A note
 much shorter than the one it replaces, or naming none of the area's files,
 is refused; the replaced one is kept as .md.prev. A finding whose evidence
 is gone from HEAD is marked stale. It runs until you stop it: after a
-restart, harness serve starts it again.
+restart, harness serve starts it again. On the web UI the agent's card (queue
+page) chooses its folders and Start runs 'findings start DIR...' on them; the
+choice is kept in folders.json, and that restart uses it too (or the DIRs of
+a 'findings start' run here since it was saved).
 It uses only a free model (lane assist or no credit cost, checked against
 the proxy's catalog hourly) and pauses otherwise. With FINDINGS_OPEN_MAX
 open findings the passes go on but only write notes, until you archive
@@ -7655,7 +7658,7 @@ Files: $state_root/findings: findings.json (the board's list), ledger.json
 (the passes: what each covered and found, its session), agent.json (status),
 sessions/N.out (each session's output), tree/ (the HEAD snapshots), knowledge/
 (the notes on each area, INDEX.md, index.json), agent.out (the log),
-notes.md, wanted (started and not stopped).
+notes.md, wanted (started and not stopped), folders.json (the web UI's choice).
 HELP
             return 0 ;;
     esac

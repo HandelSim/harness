@@ -5,6 +5,7 @@
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -120,7 +121,7 @@ class CardTest(Base):
         self.assertIn("never started", fav.agent_card(self.state))
 
 
-class ActionTest(Base):
+class HarnessBase(Base):
     def setUp(self):
         super().setUp()
         self.harness = os.path.join(self.root, "harness")
@@ -136,6 +137,8 @@ class ActionTest(Base):
         with open(self.log) as f:
             return dict(line.split("=", 1) for line in f.read().splitlines())
 
+
+class ActionTest(HarnessBase):
     def test_notes(self):
         ok, msg = fav.agent_action(self.state, self.harness, "notes", {"notes": ["skip tests/\r\nand docs\n"]})
         self.assertTrue(ok, msg)
@@ -183,6 +186,177 @@ class ActionTest(Base):
         self.assertFalse(fav.agent_action(self.state, self.harness, "nuke", {})[0])
         self.assertFalse(fav.agent_action("", self.harness, "start", {})[0])
         self.assertFalse(fav.agent_action(self.state, os.path.join(self.root, "none"), "start", {})[0])
+
+
+def git_repo(path):
+    os.makedirs(path, exist_ok=True)
+    subprocess.run(["git", "init", "-q", path], check=True, capture_output=True)
+    return path
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class FoldersTest(HarnessBase):
+    """The folders the card chooses: checked, saved, passed as harness findings start DIR..."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(os.environ.pop, "FINDINGS_AUTORESUME", None)
+        self.r1 = git_repo(os.path.join(self.root, "r1"))
+        self.r2 = git_repo(os.path.join(self.root, "r2"))
+        self.project = git_repo(os.path.join(self.root, "proj"))
+
+    def saved(self):
+        p = os.path.join(self.state, "folders.json")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return json.load(f)["folders"]
+
+    def test_saved_folders_are_the_argv(self):
+        ok, msg = fav.agent_action(self.state, self.harness, "folders",
+                                   {"pick": ["1"], "dir": [self.r1], "more": [f"\r\n {self.r2}/ \r\n{self.r1}\n"]},
+                                   project=self.project)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.saved(), [self.r1, self.r2])   # trimmed, normalised, de-duplicated
+        self.assertFalse(os.path.exists(self.log))           # Save does not start it
+        self.assertFalse([n for n in os.listdir(self.state) if n.endswith(".tmp")])
+        ok, msg = fav.agent_action(self.state, self.harness, "start", {}, project=self.project)
+        self.assertTrue(ok, msg)
+        got = self.logged()
+        self.assertEqual(got["args"], f"findings start {self.r1} {self.r2}")
+        self.assertEqual(os.path.realpath(got["cwd"]), os.path.realpath(self.project))
+        self.assertIn(self.r2, msg)
+
+    def test_start_with_the_form_saves_what_is_ticked(self):
+        ok, msg = fav.agent_action(self.state, self.harness, "start",
+                                   {"pick": ["1"], "dir": [self.r2], "more": [""]}, project=self.project)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.logged()["args"], f"findings start {self.r2}")
+        self.assertEqual(self.saved(), [self.r2])
+
+    def test_default_with_nothing_saved_is_unchanged(self):
+        # the card's Start with the default ticked (serve's project): as before, no DIR, in the project
+        ok, msg = fav.agent_action(self.state, self.harness, "start",
+                                   {"pick": ["1"], "dir": [self.project]}, project=self.project)
+        self.assertTrue(ok, msg)
+        got = self.logged()
+        self.assertEqual(got["args"], "findings start")
+        self.assertEqual(os.path.realpath(got["cwd"]), os.path.realpath(self.project))
+        self.assertIsNone(self.saved())
+        h = fav.agent_card(self.state, project=self.project, known=[self.r1])
+        self.assertIn(f"value='{self.project}' checked>", h)
+        self.assertIn(f"value='{self.r1}'><span><code>", h)    # offered, not ticked
+        self.assertIn("(the default: the project harness serve runs in)", h)
+        self.assertNotIn("Forget the choice", h)
+
+    def test_reset_forgets_the_choice(self):
+        fav.save_folders(self.state, [self.r1])
+        h = fav.agent_card(self.state, project=self.project)
+        self.assertIn(f"value='{self.r1}' checked>", h)
+        self.assertIn(f"value='{self.project}'><span><code>", h)
+        self.assertIn("Forget the choice", h)
+        ok, msg = fav.agent_action(self.state, self.harness, "folders", {"act": ["reset"], "dir": [self.r1]},
+                                   project=self.project)
+        self.assertTrue(ok, msg)
+        self.assertIsNone(self.saved())
+        self.assertIn(self.project, msg)
+
+    def test_bad_folders_refused_and_say_which(self):
+        plain = os.path.join(self.root, "plain")
+        os.makedirs(plain)
+        afile = os.path.join(self.r1, "f.txt")
+        open(afile, "w").close()
+        many = []
+        for i in range(fav.FOLDERS_MAX + 1):
+            many.append(os.path.join(self.r1, f"d{i}"))
+            os.makedirs(many[-1])
+        cases = [({"dir": ["r1"]}, "not an absolute path: r1"),
+                 ({"more": [os.path.join(self.root, "gone")]}, "no such folder: " + os.path.join(self.root, "gone")),
+                 ({"dir": [afile]}, "not a folder: " + afile),
+                 ({"dir": [self.r1], "more": [plain]}, "not in a git repository: " + plain),
+                 ({"dir": ["/" + "x" * fav.FOLDER_LEN]}, f"at most {fav.FOLDER_LEN}"),
+                 ({"dir": [self.r1 + "\x1b[31m"]}, "control character"),
+                 ({"more": ["\n".join(many)]}, f"choose at most {fav.FOLDERS_MAX}"),
+                 ({"dir": [], "more": ["  \n"]}, "no folder chosen")]
+        for form, want in cases:
+            for action in ("folders", "start"):
+                with self.subTest(form=str(form)[:80], action=action):
+                    ok, msg = fav.agent_action(self.state, self.harness, action, dict(form, pick=["1"]),
+                                               project=self.project)
+                    self.assertFalse(ok)
+                    self.assertIn(want, msg)
+        self.assertIsNone(self.saved())
+        self.assertFalse(os.path.exists(self.log))
+        # 20 distinct folders are fine, the same one twice counts once
+        ok, msg = fav.agent_action(self.state, self.harness, "folders",
+                                   {"more": ["\n".join(many[:fav.FOLDERS_MAX] + many[:2])]})
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(self.saved()), fav.FOLDERS_MAX)
+
+    def test_start_with_the_form_refused_while_running(self):
+        self.status()
+        ok, msg = fav.agent_action(self.state, self.harness, "start", {"pick": ["1"], "dir": [self.r1]})
+        self.assertFalse(ok)
+        self.assertIn("already running", msg)
+        self.assertIsNone(self.saved())
+
+    def test_resume_uses_the_saved_folders(self):
+        fav.save_folders(self.state, [self.r1, os.path.join(self.root, "gone-since"), self.r2])
+        open(os.path.join(self.state, "wanted"), "w").close()
+        self.status(pid=2 ** 22 + 12345, heartbeat_ts=time.time() - 3600, repos=[self.project])
+        t = time.time()
+        for name, age in (("agent.json", 300), ("wanted", 200), ("folders.json", 100)):
+            os.utime(os.path.join(self.state, name), (t - age, t - age))
+        ok, msg = fav.resume(self.state, self.harness)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.logged()["args"], f"findings start {self.r1} {self.r2}")   # the gone one left out
+
+    def test_resume_keeps_a_later_start_on_other_folders(self):
+        # saved on the card, then `harness findings start DIR` in a terminal: that run's repos go on
+        fav.save_folders(self.state, [self.r1])
+        open(os.path.join(self.state, "wanted"), "w").close()
+        self.status(pid=2 ** 22 + 12345, heartbeat_ts=time.time() - 3600, repos=[self.r2])
+        t = time.time()
+        for name, age in (("folders.json", 300), ("wanted", 200), ("agent.json", 100)):
+            os.utime(os.path.join(self.state, name), (t - age, t - age))
+        ok, msg = fav.resume(self.state, self.harness)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.logged()["args"], f"findings start {self.r2}")
+
+    def test_resume_with_nothing_saved_is_unchanged(self):
+        open(os.path.join(self.state, "wanted"), "w").close()
+        self.status(pid=2 ** 22 + 12345, heartbeat_ts=time.time() - 3600, repos=[self.r2])
+        ok, msg = fav.resume(self.state, self.harness)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.logged()["args"], "findings start")
+
+    def test_card_escapes_the_folders(self):
+        odd = os.path.join(self.root, "a<b>'q\"&")
+        os.makedirs(odd)
+        fav.save_folders(self.state, [odd, "/gone/<script>x</script>"])
+        self.status(repos=["/r/<i>'"])
+        h = fav.agent_card(self.state, project="/p/<u>", known=["/k/<s>", "relative<x>"])
+        for raw in ("<b>", "<script>", "<i>", "<u>", "<s>", "<x>", "q\"&"):
+            self.assertNotIn(raw, h)
+        self.assertIn(esc_attr(odd), h)
+        self.assertIn("&lt;script&gt;", h)
+        self.assertIn("missing", h)   # a saved folder that is gone is still shown, ticked
+
+    def test_card_running_shows_the_choice(self):
+        fav.save_folders(self.state, [self.r1])
+        self.status(repos=[self.r2])
+        h = fav.agent_card(self.state, project=self.project)
+        self.assertIn(f"It is exploring {self.r2}. A change applies at the next Start (Stop, then Start)", h)
+        self.assertIn("Save for the next start", h)
+        self.assertIn(f"value='{self.r1}' checked>", h)
+        self.assertIn(f"Folders it explores: <span class='muted'>{self.r1}</span>", h)
+        self.assertNotIn("formaction", h)
+        self.assertIn("action='/runs/findings/agent/folders'", h)
+
+
+def esc_attr(s):
+    import html
+    return html.escape(s)
 
 
 class SessionsTest(Base):

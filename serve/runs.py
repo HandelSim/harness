@@ -2045,10 +2045,23 @@ def _archived(runs, now):
             f"at</span></summary><div class='tks'>{''.join(rows)}</div></details>")
 
 
+_FA_FOLDERS = {}   # (queue_dir, project_dir) -> (when, serve's project, the Add form's folders)
+
+
 def _findings_agent(runs):
-    """The findings agent's card (start, stop, notes, what it is on), above the findings board."""
+    """The findings agent's card (start, stop, notes, the folders it explores, what
+    it is on), above the findings board. The folders it offers (serve's project, the
+    Add form's) are looked up at most every 30 s: the card is drawn on every poll."""
     d = findings_view.state_dir(runs)
-    return findings_agent_view.agent_card(os.path.join(d, "findings")) if d else ""
+    if not d:
+        return ""
+    key, t = (runs.queue_dir, runs.project_dir), time.time()
+    got = _FA_FOLDERS.get(key)
+    if not got or not 0 <= t - got[0] < 30:
+        if len(_FA_FOLDERS) > 16:
+            _FA_FOLDERS.clear()
+        got = _FA_FOLDERS[key] = (t, _serve_project(runs), _projects(runs))
+    return findings_agent_view.agent_card(os.path.join(d, "findings"), project=got[1], known=got[2])
 
 
 def _serve_project(runs):

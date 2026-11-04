@@ -1483,8 +1483,33 @@ which files a vault's findings as tickets).
   (SIGINT) on `run` removes it, not SIGTERM as at a shutdown (`stop` also writes the `stop` file and signals the pids in `agent.json` and
   `wrapper.pid` after checking their command lines). `harness serve` calls
   `findings_agent_view.resume` at start (a thread in `pub.py main`): with
-  `wanted` there and `agent.lock` not held (flock), it starts the agent again
-  on the repos it explored last, so a machine restart does not stop it (`FINDINGS_AUTORESUME=0`: never).
+  `wanted` there and `agent.lock` not held (flock), it starts the agent again,
+  so a machine restart does not stop it (`FINDINGS_AUTORESUME=0`: never). It
+  runs `findings start DIR...` on `resume_folders`: the folders saved on the
+  card (`folders.json`, those still there), but the last run's `agent.json`
+  `repos` when that run started after the save (`wanted` newer than
+  `folders.json`, `agent.json` not older than `wanted`: a terminal's
+  `findings start DIR`). With none saved: no DIR, in `~`, so the repos it
+  explored last.
+- **Folders from the web UI.** The card's folders form (`_folders_form`, one
+  `POST /runs/findings/agent/folders` form whose Start button has
+  `formaction` `/runs/findings/agent/start`, so what is ticked is what
+  starts) offers checkboxes for the saved folders, the last run's repos,
+  serve's project (`runs._serve_project`) and the Add form's folders
+  (`runs._projects`; both looked up at most every 30 s, the card being drawn
+  on every poll), plus a box for others, one per line. With none saved the
+  default is ticked: serve's project, else the last run's repos. Each folder
+  (`check_folders`) must be an absolute path of at most 1024 chars with no
+  control character, a directory, in a git repository (`git rev-parse
+  --show-toplevel`); de-duplicated, at most 20; a refusal names the folder
+  and goes through `refused()`, page memory keeping what was ticked and
+  typed. `folders` saves the choice (`folders.json` `{"version":1,
+  "folders":[...], "saved":...}`, temp+fsync+rename; `act=reset` removes
+  it); `start` with the form saves it only when it differs from the saved
+  (or, none saved, the default) choice, then runs `bash harness findings start
+  DIR...` on the saved folders, or with none saved exactly as before (no DIR,
+  cwd serve's project). While it runs the card says what it explores and that
+  a change applies at the next Start (Stop, then Start) or restart.
 - **Passes.** A pass is one area of a repository (its files' folder, two
   levels deep: `serve`, `scripts`, `tests/fixtures`, `.` for the top) times one
   question: `bug` (areas with code), `trace` (code: one path followed end to
@@ -1570,9 +1595,9 @@ which files a vault's findings as tickets).
   passes, `units` passes in the rotation, `notes`), `sessions/N.out` (the
   last 200), `tree/`, `knowledge/<repo>-<hash>/<area>.md` (`/` as `__`, the
   top as `_top.md`) with `INDEX.md`, `knowledge/index.json`, `wanted`,
-  `agent.out` (5 MB cap), `notes.md`. The queue page's card is
+  `agent.out` (5 MB cap), `notes.md`, `folders.json`. The queue page's card is
   `serve/findings_agent_view.py` (`agent_card`, `agent_action`: start, stop,
-  notes; the last 8 sessions, each linked to `/runs/<session>`; a link to the
+  notes, folders; the last 8 sessions, each linked to `/runs/<session>`; a link to the
   notes). `GET /runs/findings/notes` lists the notes (`knowledge_index`) and
   `/runs/findings/notes/<repo-slug>/<name>` renders one as markdown
   (`knowledge_text`: both names `[A-Za-z0-9_][A-Za-z0-9._-]*`, the path kept

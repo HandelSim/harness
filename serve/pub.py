@@ -1379,12 +1379,13 @@ def make_handler(cfg):
                 self.redirect(f"/runs/queue?done={quote(msg[:500])}#findings")
 
         def findings_agent_post(self, action, user):
-            """The queue page's findings agent card: start, stop, save the owner's notes."""
-            if action not in ("start", "stop", "notes") or not cfg.runs.queue_dir:
+            """The queue page's findings agent card: start, stop, save the owner's notes
+            or the folders it explores."""
+            if action not in findings_agent_view.ACTIONS or not cfg.runs.queue_dir:
                 self.send(404, b"not found\n")
                 return
-            try:
-                form = self.read_form(16 * 1024)
+            try:   # the folders' form: a path per ticked folder, and the typed ones
+                form = self.read_form(findings_agent_view.FORM_MAX, fields=findings_agent_view.FORM_FIELDS)
             except ValueError:
                 form = None
             if form is None:
@@ -2035,7 +2036,8 @@ def main(argv=None):
 
         def resume_findings():   # the findings agent the owner started and did not stop goes on too
             state = os.path.join(findings_view.state_dir(cfg.runs), "findings")
-            got = findings_agent_view.resume(state, cfg.runs.harness)   # the repos it explored last
+            # the saved folders; none saved: no DIR (not in a repository here: the repos it explored last)
+            got = findings_agent_view.resume(state, cfg.runs.harness)
             if got:
                 sys.stderr.write(f"[pub] findings agent left running: {got[1]}\n")
         threading.Thread(target=resume_findings, daemon=True).start()

@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pub  # noqa: E402
 import runs  # noqa: E402
 import diff_view  # noqa: E402
+import findings_agent_view  # noqa: E402
 
 # As opencode 1.19.3 creates them (sqlite_master), trimmed to the tables the viewer reads.
 SCHEMA = """
@@ -354,6 +355,56 @@ class RunsTest(RunsServer):
                      "/runs/findings/notes/repo-0123abcd/..", "/runs/findings/notes/x"):
             r, _ = self.req("GET", path)
             self.assertEqual(r.status, 404, path)
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_findings_agent_folders_route(self):
+        """The card's folders: offered on the queue page, saved by POST .../folders (same
+        Origin check and form limits as the card's other buttons), refused with the folder
+        named and escaped, and passed to harness findings start as DIRs."""
+        root = os.path.realpath(self.tmp.name)
+        repos = {}
+        for name in ("proj", "r1", "r2"):
+            repos[name] = os.path.join(root, name)
+            os.makedirs(repos[name], exist_ok=True)
+            subprocess.run(["git", "init", "-q", repos[name]], check=True, capture_output=True)
+        fake = os.path.join(root, "harness")
+        args = os.path.join(root, "args")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/bash\necho "$*" > {args}\necho "[findings] started"\n')
+        self.start(harness=fake, project_dir=repos["proj"])
+        saved = os.path.join(root, "findings", "folders.json")
+        r, body = self.req("GET", "/runs/queue")
+        self.assertEqual(r.status, 200)
+        self.assertIn("action='/runs/findings/agent/folders'", body)
+        self.assertIn(f"name='dir' value='{repos['proj']}' checked>", body)
+        form = {"Content-Type": "application/x-www-form-urlencoded", "Origin": f"http://127.0.0.1:{self.port}"}
+
+        def post(action, fields, headers=form):
+            return self.req("POST", f"/runs/findings/agent/{action}", urlencode(fields), headers)
+
+        r, _ = post("folders", [("pick", "1"), ("dir", repos["r1"])], dict(form, Origin="http://evil.example"))
+        self.assertEqual(r.status, 403)
+        r, body = post("folders", [("pick", "1"), ("more", "/nope/<x>")])
+        self.assertEqual(r.status, 409)
+        self.assertIn("no such folder: /nope/&lt;x&gt;", body)
+        self.assertNotIn("<x>", body)
+        r, _ = post("folders", [("dir", repos["r1"])] * (findings_agent_view.FORM_FIELDS + 1))
+        self.assertEqual(r.status, 413)
+        r, _ = post("nuke", [("dir", repos["r1"])])
+        self.assertEqual(r.status, 404)
+        self.assertFalse(os.path.exists(saved))
+        self.assertFalse(os.path.exists(args))
+        r, _ = post("folders", [("pick", "1"), ("dir", repos["r1"])])
+        self.assertEqual(r.status, 303)
+        self.assertIn("folders saved", unquote(r.getheader("Location")))
+        with open(saved) as f:
+            self.assertEqual(json.load(f)["folders"], [repos["r1"]])
+        self.assertFalse(os.path.exists(args))
+        r, _ = post("start", [("pick", "1"), ("dir", repos["r1"]), ("more", repos["r2"])])
+        self.assertEqual(r.status, 303)
+        self.assertIn(f"started on {repos['r1']}, {repos['r2']}", unquote(r.getheader("Location")))
+        with open(args) as f:
+            self.assertEqual(f.read().strip(), f"findings start {repos['r1']} {repos['r2']}")
 
     def test_queue_panel_says_what_each_ticket_waits_on(self):
         self.ticket()
