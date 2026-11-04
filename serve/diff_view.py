@@ -221,8 +221,18 @@ STYLE = """
 .dv-lay button[aria-pressed=true]{font-weight:600;border-color:var(--accent)}
 .dv-commits{margin:6px 0 0;padding-left:18px;font-size:13px}
 #d2h{overflow-x:auto}
+/* the page takes the window's width, and a long line wraps in its column instead of
+   running past it (diff2html's own rule keeps each line on one row and scrolls sideways) */
+main.rv:has(#d2h){max-width:none}
+body:has(#d2h) .bar-in{max-width:none}
+#d2h .d2h-file-side-diff{overflow-x:auto}
+/* diff2html sizes a code line as calc(100% - its padding), which holds only for content-box;
+   the page's border-box rule took the padding off twice (16em a line in one column) */
+#d2h .d2h-code-line,#d2h .d2h-code-side-line{box-sizing:content-box}
+#d2h .d2h-code-line-ctn{white-space:pre-wrap;overflow-wrap:anywhere;vertical-align:top}
+#d2h .d2h-code-line-ctn ins,#d2h .d2h-code-line-ctn del{display:inline}
 /* the page's own table rules (right-aligned, padded cells) undone for diff2html's */
-#d2h td,#d2h th{text-align:left;padding:0;border-bottom:0}
+#d2h td,#d2h th{text-align:left;padding:0;border-bottom:0;vertical-align:top}
 #d2h td.d2h-code-linenumber,#d2h td.d2h-code-side-linenumber{text-align:right}
 #d2h td.d2h-code-side-linenumber{padding:0 .5em}
 #d2h .d2h-file-list-wrapper{margin-bottom:12px}
@@ -258,8 +268,37 @@ JS = r"""
     document.querySelectorAll('.dv-lay button').forEach(function (b) {
       b.setAttribute('aria-pressed', b.dataset.lay === lay ? 'true' : 'false');
     });
+    level();
     if (rv) rv();
   }
+  // Side by side, each half is its own table, so a line that wraps in one half makes its row
+  // taller than the row level with it in the other: each such pair is set to the taller height.
+  // Every height is cleared, then all are read, then set, so the page lays out once.
+  function code(tr) { return !tr.classList.contains('dv-c'); }
+  function level() {
+    var sets = [];
+    el.querySelectorAll('.d2h-files-diff').forEach(function (fd) {
+      var h = fd.querySelectorAll('.d2h-file-side-diff');
+      if (h.length !== 2) return;
+      sets.push([0, 1].map(function (i) { return [].filter.call(h[i].querySelectorAll('tbody > tr'), code); }));
+    });
+    sets.forEach(function (s) { s[0].concat(s[1]).forEach(function (tr) { tr.style.height = ''; }); });
+    var tall = sets.map(function (s) {
+      return s.map(function (rows) { return rows.map(function (tr) { return tr.getBoundingClientRect().height; }); });
+    });
+    sets.forEach(function (s, k) {
+      var a = tall[k][0], b = tall[k][1];
+      for (var i = 0; i < Math.min(a.length, b.length); i++) {
+        if (a[i] < b[i] - 0.5) s[0][i].style.height = b[i] + 'px';
+        else if (b[i] < a[i] - 0.5) s[1][i].style.height = a[i] + 'px';
+      }
+    });
+  }
+  var leveling = 0;
+  window.addEventListener('resize', function () {
+    if (leveling) return;
+    leveling = requestAnimationFrame(function () { leveling = 0; level(); });
+  });
   var box = document.querySelector('[data-sent]'), rv = box && reviewer(box);
 
   // Review comments: a click on a line opens a box under it; the comments wait in

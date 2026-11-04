@@ -2373,7 +2373,12 @@ offered as suggestions. It is taken as pasted: quotes
   the ticket page): a diff drawn in the browser by the vendored diff2html
   3.4.56 (`serve/vendor/diff2html/`, MIT; its JS and CSS inlined, the JS
   under the page's nonce), side by side or one column (remembered per
-  browser). `repo` picks the repository: the project itself, or for an
+  browser). The page takes the window's full width and a long line wraps
+  in its column instead of scrolling sideways; side by side, `level()`
+  sets each pair of rows to the taller one's height (on draw and resize)
+  so the halves stay level. diff2html's line widths are `calc(100% -
+  padding)`, so its code lines are put back to `content-box` under the
+  page's `border-box`. `repo` picks the repository: the project itself, or for an
   in-place ticket one inside it (`ticket_queue.nested_repos`: its own
   `.git`, three levels down, not a submodule, not in node_modules and the
   like); anything else is refused and the project shown. `view`: `work`

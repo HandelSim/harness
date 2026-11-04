@@ -2310,6 +2310,12 @@ class DiffPageTest(RunsServer):
         self.assertIn("1 commit(s)", body)
         self.assertIn("Diff2Html", body)
         self.assertIn(".d2h-wrapper", body)
+        # the page takes the window's width and a long line wraps (diff2html's own rule scrolls it
+        # sideways); diff2html's calc(100% - padding) widths need content-box under the page's border-box
+        self.assertIn("main.rv:has(#d2h){max-width:none}", body)
+        self.assertIn("#d2h .d2h-code-line-ctn{white-space:pre-wrap;overflow-wrap:anywhere", body)
+        self.assertIn("#d2h .d2h-code-line,#d2h .d2h-code-side-line{box-sizing:content-box}", body)
+        self.assertIn("function level()", body)
         diff = self.shown(body)
         self.assertIn("+work <b>line</b>", diff)
         self.assertNotIn("<b>", body.split("id='dv-data'>", 1)[1].split("</script>", 1)[0])
