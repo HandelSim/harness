@@ -2016,10 +2016,18 @@ def main(argv=None):
                              "(pub.py add-code --access-codes FILE NAME)\n")
     srv = Server(("127.0.0.1", a.port), make_handler(cfg))
     sys.stderr.write(f"[pub] serving http://127.0.0.1:{a.port}/\n")
-    if cfg.runs:   # a queue run the machine took down goes on (QUEUE_AUTORESUME=0: not)
-        got = cfg.runs.resume_runner()
-        if got:
-            sys.stderr.write(f"[pub] queue run left unfinished: {got[1]}\n")
+    if cfg.runs:   # a queue run the machine took down goes on (QUEUE_AUTORESUME=0: not), tried
+        def resume():   # again while docker or the proxy are not up yet after the machine's start
+            for line in cfg.runs.keep_resuming():
+                sys.stderr.write(f"[pub] queue run left unfinished: {line}\n")
+        threading.Thread(target=resume, daemon=True).start()
+
+        def resume_findings():   # the findings agent the owner started and did not stop goes on too
+            state = os.path.join(findings_view.state_dir(cfg.runs), "findings")
+            got = findings_agent_view.resume(state, cfg.runs.harness)   # the repos it explored last
+            if got:
+                sys.stderr.write(f"[pub] findings agent left running: {got[1]}\n")
+        threading.Thread(target=resume_findings, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

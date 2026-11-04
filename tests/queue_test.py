@@ -5278,5 +5278,27 @@ class OwnerReviewTest(Base):
                                       "Not renamed: x is a keyword in this file format.")), 1)
 
 
+class RestartLeftLockTest(unittest.TestCase):
+    """A git index.lock the machine's restart left (older than its start) is taken away;
+    one written since, which a git running now may hold, stays and blocks."""
+
+    def test_index_lock_older_than_the_boot_is_taken_away(self):
+        d = tempfile.mkdtemp(prefix="tq-lock-")
+        self.addCleanup(shutil.rmtree, d, True)
+        subprocess.run(["git", "init", "-q", d], check=True)
+        lock = os.path.join(d, ".git", "index.lock")
+        open(lock, "w").close()
+        self.assertIn("index.lock is left", tq.in_place_trouble(d, None))
+        self.assertTrue(os.path.exists(lock))   # written after the boot: a git may hold it
+        boot = tq.boot_time()
+        if not boot:
+            self.skipTest("no /proc/stat btime here")
+        os.utime(lock, (boot - 60, boot - 60))
+        self.assertTrue(tq.left_by_restart(lock))
+        self.assertEqual(tq.in_place_trouble(d, None), "")
+        self.assertFalse(os.path.exists(lock))
+        self.assertFalse(tq.left_by_restart(lock))   # gone: nothing to take
+
+
 if __name__ == "__main__":
     unittest.main()

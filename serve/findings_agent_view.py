@@ -6,7 +6,11 @@ starts the agent the way the queue page starts a queue run: a detached
 
   POST /runs/findings/agent/start   start it (in the project harness serve runs in, when given)
   POST /runs/findings/agent/stop    stop it
-  POST /runs/findings/agent/notes   notes=TEXT: the notes added to every request (at most 4000 chars)
+  POST /runs/findings/agent/notes   notes=TEXT: the notes added to every pass (at most 4000 chars)
+
+The card lists the agent's last sessions (ledger.json "passes"), each linked to
+its page on /runs. resume() is what harness serve calls at its start: the agent
+the owner started and did not stop (findings/wanted) starts again.
 
 The routes and the page region are wired in pub.py and runs.py; this module only
 renders and acts.
@@ -23,10 +27,13 @@ esc = html.escape
 
 NOTES_MAX = 4000
 STALE_BEAT = 300          # a heartbeat older than this, while not stopped: the agent is not answering
-STATES = {"scanning": ("t-run", "scanning"), "waiting": ("t-run", "waiting between requests"),
+STATES = {"exploring": ("t-run", "exploring"), "scanning": ("t-run", "exploring"),
+          "waiting": ("t-run", "waiting between passes"),
           "idle": ("t-ok", "idle: everything is scanned"), "backoff": ("t-wait", "backing off"),
           "paused": ("t-wait", "paused"), "stopping": ("t-off", "stopping"), "stopped": ("t-off", "stopped")}
-LENSES = ("bug", "ui", "remove", "simplify", "refactor", "docs")
+LENSES = ("bug", "ui", "cleanup")
+SESSIONS_SHOWN = 8
+OUTCOME_TONE = {"found": "t-ok", "none": "t-off", "running": "t-run", "failed": "t-bad", "stopped": "t-off"}
 # the card's own rules; the page adds them to its stylesheet (no inline styles: strict CSP)
 AGENT_CSS = """
 .fagent .fa-info{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px;margin:8px 0}
@@ -35,6 +42,8 @@ AGENT_CSS = """
 .fagent .fa-counts{border-collapse:collapse;margin:6px 0}
 .fagent .fa-counts th,.fagent .fa-counts td{padding:2px 10px 2px 0;text-align:left}
 .fagent .fa-notes textarea{width:100%;box-sizing:border-box}
+.fagent .fa-passes{list-style:none;padding:0;margin:6px 0}
+.fagent .fa-passes li{padding:2px 0;overflow-wrap:anywhere}
 """
 
 
@@ -83,6 +92,29 @@ def _running(info, t):
             and age is not None and age <= STALE_BEAT)
 
 
+def _held(state_dir):
+    """True while a findings agent holds state_dir/agent.lock (its flock: what
+    says it runs, whatever agent.json says after a restart); None where flock is not,
+    or no agent has made the lock yet (agent.json is asked then)."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    path = os.path.join(state_dir, "agent.lock")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except OSError:
+        return None
+    return False
+
+
 def _ago(secs):
     if secs is None:
         return "never"
@@ -116,8 +148,41 @@ def _counts(info):
                     f"<td>{n('rejected')}</td><td>{n('failed')}</td></tr>")
     if not rows:
         return ""
-    return ("<table class='fa-counts'><thead><tr><th>question</th><th>requests</th><th>kept</th>"
+    return ("<table class='fa-counts'><thead><tr><th>question</th><th>sessions</th><th>kept</th>"
             "<th>rejected</th><th>failed</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+
+
+def passes(state_dir, n=SESSIONS_SHOWN):
+    """The agent's last sessions, newest first: ledger.json "passes" entries that parse."""
+    try:
+        data = json.loads(_read(os.path.join(state_dir, "ledger.json"), 4 * 1024 * 1024) or "{}")
+    except ValueError:
+        return []
+    got = data.get("passes") if isinstance(data, dict) else None
+    if not isinstance(got, list):
+        return []
+    return [p for p in reversed(got) if isinstance(p, dict)][:n]
+
+
+def _passes(state_dir):
+    rows = []
+    for p in passes(state_dir):
+        sid = _s(p.get("session"), 80)
+        outcome = _s(p.get("outcome"), 20)
+        label = f"{os.path.basename(_s(p.get('repo'), 300))}: {_s(p.get('area'), 200)}/ ({_s(p.get('lens'), 20)})"
+        what = esc(label)
+        if sid.startswith("ses_") and all(c.isalnum() or c == "_" for c in sid):
+            what = f"<a href='/runs/{esc(sid)}'>{what}</a>"
+        n = p.get("found")
+        tail = f" {n} new" if isinstance(n, int) and not isinstance(n, bool) and n else ""
+        cov = _s(p.get("covered"), 300)
+        rows.append(f"<li><span class='tag {OUTCOME_TONE.get(outcome, 't-off')}'>{esc(outcome or '?')}</span> "
+                    f"{what}<span class='muted'>{esc(tail)} {esc(_s(p.get('started'), 30))}"
+                    + (f" &middot; {esc(cov)}" if cov else "") + "</span></li>")
+    if not rows:
+        return ""
+    return ("<details class='fa-sessions' data-k='findings-agent-sessions' open><summary>Its last sessions</summary>"
+            "<ul class='fa-passes'>" + "".join(rows) + "</ul></details>")
 
 
 def agent_card(state_dir, flash=""):
@@ -137,8 +202,9 @@ def agent_card(state_dir, flash=""):
         cls, label = "t-bad", f"not answering (last: {state or 'unknown'}, heartbeat {_ago(age)})"
     parts = ["<section class='panel fagent' id='findings-agent'><div class='hd'><h2>Findings agent "
              f"<span class='tag {cls}'>{esc(label)}</span></h2>"
-             "<span class='muted'>reads the committed code and asks a free model for bugs, UI problems, "
-             "refactors, simplifications, unused files and doc errors</span></div>"]
+             "<span class='muted'>opencode sessions on a free model that explore the committed code, an area "
+             "at a time, and follow it across files for bugs, UI problems and code to remove or simplify; "
+             "read-only</span></div>"]
     if flash:
         parts.append(f"<div class='flash'>{esc(flash)}</div>")
     rows = []
@@ -158,7 +224,10 @@ def agent_card(state_dir, flash=""):
     repos = info.get("repos")
     if isinstance(repos, list) and repos:
         rows.append(("repos", ", ".join(_s(r, 300) for r in repos[:10] if isinstance(r, str))))
-    for key, name in (("open", "open findings"), ("todo", "units to do")):
+    sid = _s(info.get("session"), 80)
+    if live and sid.startswith("ses_"):
+        rows.append(("session", sid))
+    for key, name in (("open", "open findings"), ("todo", "passes to do")):
         v = info.get(key)
         if isinstance(v, int) and not isinstance(v, bool):
             rows.append((name, str(v)))
@@ -169,9 +238,11 @@ def agent_card(state_dir, flash=""):
         parts.append("<dl class='fa-info'>" + "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in rows)
                      + "</dl>")
     parts.append(_counts(info))
+    parts.append(_passes(state_dir) if state_dir else "")
     if live:
         act = ("<form method='post' action='/runs/findings/agent/stop' data-confirm='Stop the findings agent? "
-               "A request in flight is dropped and asked again later.'>"
+               "Its session in flight is ended and that pass runs again later. It stays stopped, "
+               "also after a restart, until you start it.'>"
                "<button type='submit' class='btn sm'>Stop</button></form>")
     else:
         act = ("<form method='post' action='/runs/findings/agent/start'>"
@@ -181,7 +252,7 @@ def agent_card(state_dir, flash=""):
                   + (" (then Stop and Start)" if live else "") + "</a>")
     parts.append(f"<div class='acts'>{act}{model_link}</div>")
     notes = _read(os.path.join(state_dir, "notes.md"), NOTES_MAX * 4)[:NOTES_MAX] if state_dir else ""
-    parts.append("<details class='fa-notes' data-k='findings-agent-notes'><summary>Notes for every request"
+    parts.append("<details class='fa-notes' data-k='findings-agent-notes'><summary>Notes for every pass"
                  + (f" <span class='muted'>{len(notes)} characters</span>" if notes else "") + "</summary>"
                  "<form method='post' action='/runs/findings/agent/notes'>"
                  f"<textarea name='notes' rows='6' maxlength='{NOTES_MAX}' aria-label='notes for the findings "
@@ -210,7 +281,8 @@ def _start(state_dir, harness_path, project):
     bash = shutil.which("bash")
     if not bash:
         return False, "bash is not on PATH, so harness cannot run"
-    if _running(read_status(state_dir), time.time()):
+    held = _held(state_dir)
+    if held or (held is None and _running(read_status(state_dir), time.time())):
         return False, "the findings agent is already running"
     env = dict(os.environ)
     env["HARNESS_OPEN"] = "0"
@@ -289,5 +361,19 @@ def agent_action(state_dir, harness_path, action, form, project=""):
             _write_atomic(os.path.join(state_dir, "notes.md"), text.strip() + ("\n" if text.strip() else ""))
         except OSError as e:
             return False, f"cannot save the notes: {e.strerror or e}"
-        return True, "notes saved: the agent uses them from its next request"
+        return True, "notes saved: the agent uses them from its next pass"
     return False, f"unknown action: {action}"
+
+
+def resume(state_dir, harness_path, project=""):
+    """At harness serve's start: the agent the owner started and has not stopped
+    (state_dir/wanted, which only an owner's stop takes away) starts again when
+    it is not running, the machine having gone down under it. FINDINGS_AUTORESUME=0:
+    never. Returns (ok, message), or None when there is nothing to do."""
+    if os.environ.get("FINDINGS_AUTORESUME", "1").strip() == "0" or not state_dir:
+        return None
+    held = _held(state_dir)
+    if not os.path.exists(os.path.join(state_dir, "wanted")) or held or (
+            held is None and _running(read_status(state_dir), time.time())):
+        return None
+    return _start(state_dir, harness_path, project)

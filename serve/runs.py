@@ -1270,9 +1270,44 @@ class Runs:
         r = self.runner()
         if r["running"] or not r["beat"] or r["starting"]:
             return None
+        if os.path.exists(os.path.join(self.queue_dir, "halt")):
+            # the owner halted it as the machine went down: it stays ended (its
+            # tickets wait in the queue at their stages; the next run picks them up)
+            for name in ["run.json"] + [f"run-{i}.json" for i in range(1, max(r["parallel"], 1) + 1)]:
+                try:
+                    os.remove(os.path.join(self.queue_dir, name))
+                except OSError:
+                    pass
+            return None
         return self.start_runner("single" if r["single"] else "host" if r["host"] else "container",
                                  parallel=r["parallel"], once=r["watch"] is False,
                                  why="started again: the last run ended with the machine")
+
+    def keep_resuming(self, gone=None, waits=(15, 30, 60, 120, 300)):
+        """resume_runner, and again while it does not take: a run that cannot start
+        yet (docker or the proxy not up after the machine's start) ends at once and
+        leaves the old run.json, so it is tried again, waits[i] seconds after its
+        i-th try (the last wait repeating), until a run beats, the owner halts it
+        or starts one, or gone (a threading.Event) is set. Returns the messages."""
+        said, i = [], 0
+        gone = gone or threading.Event()
+        while not gone.is_set():
+            got = self.resume_runner()
+            if got is None:
+                return said
+            said.append(got[1])
+            if got[0]:   # started: wait for its first beat, or for it to end without one
+                while not gone.is_set():
+                    with self.launch_lock:
+                        proc = self.launched[0] if self.launched else None
+                    if self.runner()["running"]:
+                        return said
+                    if proc is None or proc.poll() is not None:
+                        break
+                    gone.wait(2)
+            gone.wait(waits[min(i, len(waits) - 1)])
+            i += 1
+        return said
 
     def start_runner(self, mode, parallel=0, why="started from the queue page", once=False):
         """Start `harness queue run` in the background, as its own process group with
@@ -1696,6 +1731,17 @@ def _list_body(runs, query=""):
                 parts.append(_row(runs, r, live, tag, now))
             parts.append("</ul></div>")
         parts.append("</section>")
+    labels = agent_sessions(runs)
+    agents = [r for r in other if r["id"] in labels]
+    if agents:
+        other = [r for r in other if r["id"] not in labels]
+        parts.append("<section class='panel'><h2>Harness agents</h2><div class='muted'>The findings agent's "
+                     "passes and the debug agent's looks at a blocked ticket.</div><ul class='runs'>")
+        for r in agents:
+            a = labels[r["id"]]
+            tag = f"<a class='tag' href='{esc(a['href'])}'>{esc(a['label'])}</a> "
+            parts.append(_row(runs, r, live, tag, now))
+        parts.append("</ul></section>")
     parts.append("<section class='panel'><h2>Sessions</h2>")
     if other:
         parts.append("<ul class='runs'>")
@@ -2725,9 +2771,11 @@ def _t_debug(runs, key, st):
             else "<div class='muted'>No report yet: it is still looking.</div>" if verdict == "running"
             else "<div class='muted'>It left no report.</div>")
     href = f"/runs/debug/runs/{quote(dbg['dir'])}"
+    sid = debug_session(runs, dbg["dir"])
+    sess = f"<a class='muted' href='/runs/{quote(sid)}'>its session</a> " if sid else ""
     return (f"<section class='panel'><details class='doc' data-k='debug'{' open' if st.get('status') == 'blocked' else ''}>"
             f"<summary>Debug agent ({esc(str(dbg.get('stage') or ''))} block) {head}</summary>"
-            f"<div class='vlink'><a class='muted' href='{href}'>its own page</a> "
+            f"<div class='vlink'>{sess}<a class='muted' href='{href}'>its own page</a> "
             f"<a class='muted' href='/runs/debug'>all debug reports</a></div>{note}{body}</details></section>")
 
 
@@ -3033,28 +3081,117 @@ def _debug_text(runs, kind, name):
         return None
 
 
+SESSION_LINE_RE = re.compile(r"\[harness\] session: (ses_[A-Za-z0-9_]+)")
+DEBUG_RUNS_SCANNED = 300   # the newest debug run folders whose sessions are looked up
+
+
+def _session_in(*paths):
+    """The first opencode session id an agent launch's output names, or ""."""
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                m = SESSION_LINE_RE.search(f.read(262144))
+        except OSError:
+            continue
+        if m:
+            return m.group(1)
+    return ""
+
+
+def debug_session(runs, name):
+    """The session of a queue debug run (runs/<name>/launch.out or session.log), or ""."""
+    top = debug_dir(runs)
+    if not top or not DEBUG_NAME_RE.match(name or "") or ".." in name:
+        return ""
+    d = os.path.join(top, "runs", name)
+    return _session_in(os.path.join(d, "launch.out"), os.path.join(d, "session.log"))
+
+
+def agent_sessions(runs):
+    """{session id: {kind, label, href}}: the sessions harness's own agents ran,
+    which no ticket's folder names: the findings agent's passes (state/findings/
+    ledger.json "passes") and the debug agent's (state/debug/runs/*/launch.out or
+    session.log, and harness debug's state/debug/session.log). Read again when
+    those change."""
+    if not runs.queue_dir:
+        return {}
+    state = os.path.dirname(os.path.abspath(runs.queue_dir))
+    ledger = os.path.join(state, "findings", "ledger.json")
+    top = debug_dir(runs)
+    sig = []
+    for path in (ledger, os.path.join(top, "runs"), os.path.join(top, "session.log")):
+        try:
+            sig.append(os.path.getmtime(path))
+        except OSError:
+            sig.append(0)
+    names = sorted(n for n in (os.listdir(os.path.join(top, "runs")) if os.path.isdir(os.path.join(top, "runs"))
+                               else []) if DEBUG_NAME_RE.match(n))[-DEBUG_RUNS_SCANNED:]
+    for n in names[-5:]:   # a run going on writes its launch.out, not the folder
+        for f in ("launch.out", "session.log"):
+            try:
+                sig.append(os.path.getmtime(os.path.join(top, "runs", n, f)))
+            except OSError:
+                pass
+    cached = getattr(runs, "_agent_sessions", None)
+    if cached and cached[0] == sig:
+        return cached[1]
+    out = {}
+    for name in names:
+        sid = debug_session(runs, name)
+        if sid:
+            m = re.match(r"\d{8}-\d{6}-(.+)$", name)
+            out[sid] = {"kind": "debug", "label": f"debug {m.group(1)}" if m else f"debug {name}",
+                        "href": f"/runs/debug/runs/{quote(name)}", "key": m.group(1) if m else ""}
+    sid = _session_in(os.path.join(top, "session.log"))
+    if sid:
+        out.setdefault(sid, {"kind": "debug", "label": "harness debug", "href": "/runs/debug", "key": ""})
+    for p in findings_agent_view.passes(os.path.join(state, "findings"), n=10 ** 6):
+        sid = p.get("session")
+        if isinstance(sid, str) and SESSION_LINE_RE.fullmatch(f"[harness] session: {sid}"):
+            label = (f"findings {os.path.basename(str(p.get('repo') or ''))}: {p.get('area') or ''}/ "
+                     f"({p.get('lens') or ''})")
+            out[sid] = {"kind": "findings", "label": label[:200], "href": "/runs/queue#findings-agent", "key": ""}
+    runs._agent_sessions = (sig, out)
+    return out
+
+
 def debug_reports(runs):
-    """Every debug report, newest first: {kind, name, mtime, key, verdict, change, title}."""
+    """Every debug report, newest first: {kind, name, mtime, key, verdict, change, title,
+    session}; a queue debug run still looking (no report.md yet) is one too, verdict running."""
     top, tq, out = debug_dir(runs), _tq(), []
     if not top:
         return out
-    for kind, pattern in (("runs", os.path.join(top, "runs", "*", "report.md")),
+    for kind, pattern in (("runs", os.path.join(top, "runs", "*", "")),
                           ("reports", os.path.join(top, "reports", "*.md"))):
         for path in glob.glob(pattern):
-            name = os.path.basename(os.path.dirname(path)) if kind == "runs" else os.path.basename(path)
+            if kind == "runs":
+                name = os.path.basename(os.path.dirname(path))
+                path = os.path.join(path, "report.md")
+            else:
+                name = os.path.basename(path)
             if not DEBUG_NAME_RE.match(name):
                 continue
+            text = ""
             try:
                 mtime = os.path.getmtime(path)
                 with open(path, encoding="utf-8", errors="replace") as f:
                     text = f.read(200000)
             except OSError:
-                continue
+                if kind != "runs":
+                    continue
+                try:   # no report yet: it is still looking (or ended without one)
+                    mtime = os.path.getmtime(os.path.dirname(path))
+                except OSError:
+                    continue
             m = re.match(r"\d{8}-\d{6}-(.+)$", name) if kind == "runs" else None
-            verdict, change = (tq.verdict_of(text) if tq is not None and kind == "runs" else ("", False))
+            verdict, change = (tq.verdict_of(text) if tq is not None and kind == "runs" and text else ("", False))
+            if kind == "runs" and not text:
+                verdict = "running"
             title = next((ln.lstrip("# ").strip() for ln in text.splitlines() if ln.startswith("# ")), "")
             out.append({"kind": kind, "name": name, "mtime": mtime, "key": m.group(1) if m else "",
-                        "verdict": verdict, "change": change, "title": title})
+                        "verdict": verdict, "change": change, "title": title or ("no report yet" if not text else ""),
+                        "session": debug_session(runs, name) if kind == "runs" else "",
+                        "report": bool(text)})
     out.sort(key=lambda r: r["mtime"], reverse=True)
     return out
 
@@ -3063,7 +3200,8 @@ def render_debug_page(runs):
     rows = debug_reports(runs)
     parts = ["<header class='ph'><h1>Debug reports</h1><div class='sub'>Newest first: the queue's debug agent "
              "on each blocked ticket (its verdict; harness should change marks the ones to read for a harness "
-             "fix), and harness debug's own.</div></header>", "<section class='panel'>"]
+             "fix), and harness debug's own. Its session is the agent's whole conversation, live while it "
+             "looks.</div></header>", "<section class='panel'>"]
     if not rows:
         parts.append("<div class='muted'>No debug report yet.</div>")
     else:
@@ -3076,7 +3214,11 @@ def render_debug_page(runs):
                 tags += "<span class='pill t-bad'>harness should change</span>"
             if r["key"]:
                 tags += f"<a class='tag' href='/runs/ticket/{quote(r['key'])}'>{esc(r['key'])}</a>"
-            parts.append(f"<li><div class='hd'>{tags}<a href='{href}'>{esc(r['title'] or r['name'])}</a>"
+            title = (f"<a href='{href}'>{esc(r['title'] or r['name'])}</a>" if r.get("report", True)
+                     else f"<span>{esc(r['title'] or r['name'])}</span>")
+            sess = (f"<a class='btn sm' href='/runs/{quote(r['session'])}'>Its session</a>"
+                    if r.get("session") else "")
+            parts.append(f"<li><div class='hd'>{tags}{title}{sess}"
                          f"<span class='muted'>{esc(_when(r['mtime'] * 1000))}</span></div></li>")
         parts.append("</ul>")
     parts.append("</section>")
@@ -3840,6 +3982,13 @@ def render_side(runs, src, row, live, sent="", todos=None, oc_url=""):
         elif st.get("status") != "queued" and _continuable(runs, key, st):
             parts.append(f"<a class='btn primary' href='/runs/ticket/{quote(key)}#go-on' title='{esc(CONTINUE_TITLE)}'>"
                          f"Continue {esc(st['stage'])}</a>")
+    agent = agent_sessions(runs).get(root["id"]) if not key else None
+    if agent:
+        what = "Findings agent" if agent["kind"] == "findings" else "Debug agent"
+        parts.append(f"<div class='ph'><span class='muted'>{what}</span>"
+                     f"<a href='{esc(agent['href'])}'><b>{esc(agent['label'])}</b></a>"
+                     + (f"<a class='tag' href='/runs/ticket/{quote(agent['key'])}'>{esc(agent['key'])}</a>"
+                        if agent.get("key") else "") + "</div>")
     if oc_url:
         parts.append(f"<a class='btn' href='{esc(oc_url)}' target='_blank' rel='noreferrer'>Open in opencode web</a>")
     if sid in live:

@@ -2940,6 +2940,10 @@ agent flags:
                         thinking block (vendor native tool models; off by
                         default). Replies then arrive whole rather than
                         streamed token by token.
+  --read-only           host mode only: the agent may read, search and run a
+                        fixed set of read-only commands in the folder it is in,
+                        nothing else (no edits, no writes, no web, no other
+                        folders, no secret files). The findings agent runs so.
   --net                 disable the per-container firewall for THIS launch
                         only (full outbound network). Audit-logged on stderr.
   --mount PATH          bind-mount an additional host folder into the agent
@@ -5950,8 +5954,9 @@ _vault_git() {
 # clone fails. A failed pull only warns: the agent then works on the local copy.
 vault_prepare() {
     local name url dir
-    # harness debug works on harness itself: no vault, nothing of the user's.
-    [[ "${harness_debug:-0}" == "1" ]] && return 0
+    # harness debug works on harness itself: no vault, nothing of the user's;
+    # a --read-only session (the findings agent's) reads its folder and nothing else.
+    [[ "${harness_debug:-0}" == "1" || "${harness_read_only:-0}" == "1" ]] && return 0
     name=$(vault_active_name)
     [[ -n "$name" ]] || return 0
     url=$(_vault_url "$name")
@@ -6150,7 +6155,7 @@ ticket_new() {
 ticket_prepare() {
     local here key
     harness_ticket=""
-    [[ "${harness_debug:-0}" == "1" ]] && return 0
+    [[ "${harness_debug:-0}" == "1" || "${harness_read_only:-0}" == "1" ]] && return 0
     here=$(harness_abs_path "$PWD") || return 0
     if [[ -n "${harness_ticket_arg:-}" ]]; then
         key="$harness_ticket_arg"
@@ -6434,13 +6439,13 @@ serve_opencode_config() {
 }
 
 # OPENCODE_CONFIG_CONTENT for a launch: the slim, thoughts, single, serve,
-# vault and debug overlays deep-merged (debug last: its permissions win). Prints nothing when none applies. `oai` (a launch with
+# vault, debug and read-only overlays deep-merged (the last two: their permissions win). Prints nothing when none applies. `oai` (a launch with
 # an OAI upstream, host or container) is passed on to slim_opencode_config.
 harness_opencode_overlay() {
     local part out=""
     for part in "$(slim_opencode_config "${1:-}")" "$(thoughts_opencode_config)" \
             "$(single_opencode_config)" "$(serve_opencode_config)" "$(vault_opencode_config)" \
-            "$(debug_opencode_config)"; do
+            "$(debug_opencode_config)" "$(read_only_opencode_config)"; do
         [[ -n "$part" ]] || continue
         if [[ -z "$out" ]]; then
             out="$part"
@@ -7579,12 +7584,13 @@ HELP
     PYTHONUTF8=1 $py "$script" "${args[@]}"
 }
 
-# `harness findings`: the findings agent (scripts/findings_agent.py) reads the
-# committed code of one or more repositories, asks a free model one question
-# at a time (bug, ui, refactor, simplify, remove, docs) and keeps the answers
-# that cite a real line: the Findings board on the queue page. It never
-# changes code. State: $state_root/findings (not `harness queue findings`,
-# which turns a vault's findings into tickets).
+# `harness findings`: the findings agent (scripts/findings_agent.py) runs
+# opencode sessions (harness host --read-only -p, a free model) that explore
+# the committed code of one or more repositories, an area and a question at a
+# time, following calls across files, and keeps the findings that cite a real
+# line: the Findings board on the queue page. It never changes code. State:
+# $state_root/findings (not `harness queue findings`, which turns a vault's
+# findings into tickets).
 cmd_findings() {
     local sub="${1:-status}"
     (( $# )) && shift
@@ -7594,42 +7600,51 @@ cmd_findings() {
             cat <<'HELP'
 usage: harness findings start [DIR...]   start the agent in the background and return
        harness findings run [DIR...]     the same in this terminal (Ctrl-C stops it)
-       harness findings stop             stop it (within a minute; a request in
-                                         flight is dropped and asked again later)
-       harness findings status [--json]  what it does: state, model, current unit,
-                                         counts per question, last error
-       harness findings notes            edit the notes added to every request
+       harness findings stop             stop it (within a minute; a session in
+                                         flight is ended and its pass run again later)
+       harness findings status [--json]  what it does: state, model, current pass and
+                                         session, counts per question, last error
+       harness findings notes            edit the notes added to every pass
                                          ($EDITOR; printed when not a terminal)
 
-The findings agent reads the committed code (HEAD) of DIR (default: the git
-project here; else the ones it scanned last) and asks a free model about it,
-one file part and one question at a time: bug, ui, refactor, simplify, remove
-(files nothing mentions) and docs. A finding is kept only when the line it
-copies as evidence is in the code near the line it names. The kept ones are
-on the Findings board of the queue page (harness serve), where you archive
-them or make tickets of them. It never changes code, and never sends files
-that look like secrets (.env*, *.pem, *.key, id_rsa*, credentials*, secrets*).
+The findings agent explores the committed code (HEAD) of DIR (default: the
+git project here; else the ones it explored last). Each pass is a real
+opencode session on a free model (harness host --read-only -p, single-message
+mode), in a snapshot of HEAD with secret-looking files left out: it reads,
+greps and globs, may run only commands that read, and cannot change anything.
+It starts from one area (a folder, two levels deep) with one question (bug,
+ui or cleanup) and follows calls, imports, config and data across files,
+since bugs are often in how parts meet. A finding is kept only when the line
+it copies as evidence is in the file near the line it names. The kept ones
+are on the Findings board of the queue page (harness serve), where you
+archive them or make tickets of them; every session is on the Sessions page
+(/runs) and listed on the agent's card.
 
-Changed and new code goes first; a finding whose evidence is gone from HEAD
-is marked stale; unchanged code is asked about again after
+Changed and new areas go first; what earlier passes of an area covered and
+found goes into the next one's prompt; a finding whose evidence is gone from
+HEAD is marked stale; unchanged areas are explored again after
 FINDINGS_RESCAN_DAYS. When nothing is left it looks at HEAD every minute.
+It runs until you stop it: after a restart, harness serve starts it again.
 It uses only a free model (lane assist or no credit cost, checked against
 the proxy's catalog hourly) and pauses otherwise. It holds the host proxy
 while it runs.
 
 Settings (.env, or the environment):
-  FINDINGS_MODEL          the model (default: the first free one, preferring
-                          gemini-3.8-flash, then gemini-2.5-pro); also on
-                          'harness config' and the web UI's Settings page
-  FINDINGS_GAP            seconds between requests (20)
-  FINDINGS_CALL_TIMEOUT   seconds a request may take (300)
-  FINDINGS_RESCAN_DAYS    days before unchanged code is asked about again (7)
-  FINDINGS_OPEN_MAX       open findings at which it pauses until you archive
-                          some (200)
+  FINDINGS_MODEL            the model (default: the first free one, preferring
+                            gemini-3.8-flash, then gemini-2.5-pro); also on
+                            'harness config' and the web UI's Settings page
+  FINDINGS_GAP              seconds between passes (60)
+  FINDINGS_PASS_TIMEOUT     seconds a pass may take (2400)
+  FINDINGS_IDLE_TIMEOUT     seconds a pass may write nothing new (600)
+  FINDINGS_RESCAN_DAYS      days before an unchanged area is explored again (3)
+  FINDINGS_OPEN_MAX         open findings at which it pauses until you archive
+                            some (200)
+  FINDINGS_SINGLE_MESSAGE   0: the sessions not in single-message mode (1)
 
 Files: $state_root/findings: findings.json (the board's list), ledger.json
-(what was asked, when), agent.json (status), calls.jsonl (every request and
-the start of its reply), agent.out (the log), notes.md.
+(the passes: what each covered and found, its session), agent.json (status),
+sessions/N.out (each session's output), tree/ (the HEAD snapshots), agent.out
+(the log), notes.md, wanted (started and not stopped).
 HELP
             return 0 ;;
     esac
@@ -7722,6 +7737,7 @@ HELP
                 # shellcheck disable=SC2086  # $py can be 'py -3'
                 PYTHONUTF8=1 $py "$script" run --state "$sdir" \
                     --proxy "http://127.0.0.1:$(host_proxy_port)/v1" --model "${FINDINGS_MODEL:-}" \
+                    --harness "$clone_dir/harness" \
                     ${dirs[@]+"${dirs[@]}"} || rc=$?
                 # 76: the proxy stopped answering for 5 min. Start it again and go on.
                 (( rc == 76 && ! stopping )) || break
@@ -7965,6 +7981,8 @@ host_opencode_env() {
     export OPENCODE_ENABLE_EXA=1
     # ...except under HARNESS_HOST_NO_WEB=1 (see host_write_opencode_config).
     [[ "${HARNESS_HOST_NO_WEB:-0}" == "1" ]] && unset OPENCODE_ENABLE_EXA
+    # ...and for a --read-only session: no search query may carry the code out.
+    [[ "${harness_read_only:-0}" == "1" ]] && unset OPENCODE_ENABLE_EXA
     # Exempt the loopback proxy from the corp HTTP_PROXY. opencode's provider
     # baseURL is the LOCAL proxy at http://127.0.0.1:PORT/v1, and opencode runs
     # on Bun, whose native fetch honors HTTP_PROXY/HTTPS_PROXY. With a corporate
@@ -8035,7 +8053,10 @@ host_run_opencode() {
         # one). --yolo means approve: --auto approves every ask not denied.
         [[ "$yolo" == "1" ]] && args+=(--auto)
         local events_file rc sid text
-        events_file="$(mktemp)"
+        # HARNESS_HOST_EVENTS_FILE: the file the event stream is written to (the
+        # findings agent watches it grow); a temp file otherwise.
+        events_file="${HARNESS_HOST_EVENTS_FILE:-}"
+        [[ -n "$events_file" ]] || events_file="$(mktemp)"
         # agents/live-run.sh is `opencode run --format json` attached to its own
         # loopback `opencode serve`, so the pub page's run viewer can message the
         # session while it works (plain run if serve fails or HARNESS_LIVE=0).
@@ -8059,7 +8080,7 @@ host_run_opencode() {
             text="$(harness_jq -rs '[.[] | select(.type=="text") | .part.text] | join("")' "${events_file}" 2>/dev/null || true)"
         fi
         [[ -n "${text}" ]] && printf '%s\n' "${text}"
-        rm -f "${events_file}"
+        [[ -n "${HARNESS_HOST_EVENTS_FILE:-}" ]] || rm -f "${events_file}"
         # Print mode deliberately leaves the proxy up so a scripted `-p` loop
         # doesn't thrash it. Remind the user it is now orphaned, since nothing
         # reaps it (CONCERNS M1). Goes to stderr so it never pollutes -p stdout.
@@ -8188,6 +8209,7 @@ EOF
             --normal)    harness_slim=0 ;;
             --thoughts)  harness_thoughts=1 ;;
             --single-message) prompt_mode_override="single" ;;
+            --read-only) harness_read_only=1 ;;
             --prompt-mode)    want_mode=1 ;;
             --prompt-mode=*)  prompt_mode_override="${arg#--prompt-mode=}" ;;
             # The default now; still consumed so an old invocation carrying it
@@ -11839,6 +11861,39 @@ debug_opencode_config() {
        read: {"*": "allow", "*.env": $m, "*.env.*": $m, "*/.ssh/*": $m,
               "*.pem": $m, "*.key": $m},
        external_directory: {"*": "allow"}} as $p
+      | {permission: $p,
+         agent: {build: {permission: $p}, general: {permission: $p},
+                 yolo: {permission: $p}}}'
+}
+
+# `harness host --read-only` (the findings agent's sessions): the agent reads
+# and searches the folder it runs in and changes nothing. No edit or write at
+# all, a bash allowlist of commands that only read (no redirect, no find
+# -exec/-delete), nothing outside the folder, no secret-looking file read.
+# Anything else is denied, never asked: there is no one to ask in -p.
+read_only_opencode_config() {
+    [[ "${harness_read_only:-0}" == "1" ]] || return 0
+    local p allow=(
+        'cat *' 'head *' 'tail *' 'ls' 'ls *' 'find *' 'grep *' 'rg *' 'wc *' 'stat *' 'file *'
+        'pwd' 'cut *' 'diff *' 'cmp *' 'tree *' 'nl *' 'basename *' 'dirname *'
+    ) guard=(
+        '*>*' '*|*' '*;*' '*&*' '*`*' '*$*' 'find *-delete*' 'find *-exec*' 'find *-ok*' 'find *-fprint*'
+        'find *-fls*' 'file *-C*' 'tree *-o*' 'rg *--pre*' '*..*' '/*' '* /*' '*~*'
+        '*.env' '*.env *' '*.env.*' '*.env/*' '*environ*' '*/.ssh/*' '*id_rsa*' '*id_ed25519*' '*.pem*' '*.key'
+        '*.key *'
+    )
+    local bash_rules
+    bash_rules=$( { printf '*\tdeny\n'
+                    for p in "${allow[@]}"; do printf '%s\tallow\n' "$p"; done
+                    for p in "${guard[@]}"; do printf '%s\tdeny\n' "$p"; done; } \
+        | harness_jq -Rsc '
+            split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: .[1]})
+            | from_entries')
+    harness_jq -cn --argjson bash "$bash_rules" '
+      {edit: "deny", bash: $bash, webfetch: "deny", websearch: "deny", task: "deny",
+       read: {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*/.ssh/*": "deny",
+              "*.pem": "deny", "*.key": "deny"},
+       external_directory: "deny"} as $p
       | {permission: $p,
          agent: {build: {permission: $p}, general: {permission: $p},
                  yolo: {permission: $p}}}'

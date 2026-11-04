@@ -1464,11 +1464,11 @@ its stage launches send the single header on the shared proxy. Covered by `tests
 ### Findings agent
 
 `harness findings start|run [DIR...]|stop|status|notes` (`cmd_findings`,
-`scripts/findings_agent.py`) is a background agent that reads the committed
-code (HEAD) of DIR (default: the git top folder here, else the repos it
-scanned last) and asks a free model about it. It never changes code; it writes
-only `state/findings/` (not `harness queue findings`, which files a vault's
-findings as tickets).
+`scripts/findings_agent.py`) is a background agent that explores the
+committed code (HEAD) of DIR (default: the git top folder here, else the
+repos it explored last) with real opencode sessions on a free model. It never
+changes code; it writes only `state/findings/` (not `harness queue findings`,
+which files a vault's findings as tickets).
 
 - **Loop.** `run` holds the host proxy lease for its life (`host_proxy_hold`,
   then `host_proxy_done` or `host_proxy_release`) and runs the script; exit 76
@@ -1477,53 +1477,86 @@ findings as tickets).
   `agent.out`. The script is a supervisor: it holds `agent.lock` (a second run
   exits 0), runs the worker as a child, restarts it after 10 s doubling to 5 min
   when it dies or does not beat for 10 min, and ends on SIGTERM, SIGINT or a
-  `stop` file. `stop` writes that file and signals the pids in `agent.json` and
-  `wrapper.pid` (the bash loop) after checking their command lines.
-- **Units.** Each `git ls-tree` blob that is not a symlink, over 400 KB,
-  binary, vendored, a lock file, generated or a secret (`vault_ingest`'s
-  `SKIP_*` and `SECRET_PATH`), cut into chunks of about 40k chars on
-  top-level boundaries, times its lenses: `bug`, `simplify`, `refactor`,
-  `docs` for code; `ui` also for UI extensions or folders, or a chunk with 15
-  or more HTML tags; `docs` only for .md/.rst/.txt; `bug` only for other
-  text. `remove`: a code file whose stem no other tracked file contains
-  (`git grep -l -F`), judged from its first 120 lines. Work order: changed
-  (content, prompt version or owner notes), new, then older than
-  `FINDINGS_RESCAN_DAYS`; else HEAD is polled every 60 s. When HEAD moves, an
-  open finding whose evidence left the file becomes `stale`. Three failures in a
-  row set a unit aside until its content changes.
-- **Request.** One user message, header `x-harness-raw: 1` (`call_model`): a
-  role line, the numbered chunk in a nonce fence, for `bug` the call sites of
-  up to 8 names it defines (`git grep -w`, about 3k chars, secret files left
-  out), then the instructions last: the lens question, `notes.md` (4k chars),
-  the file's open findings as `title @ line`, and the format (up to 3
-  `FINDING | severity | line | title | evidence | detail` lines, or `NONE`).
-  A reply with neither is a failed call. A finding is kept only when its line
-  is in the chunk and its whitespace-folded evidence is within 8 lines of it.
-  Its id is `f-` plus 12 hex of sha1(repo name, path, lens, evidence); a known id
-  or the same title on the same path is dropped.
-- **Guards.** One request at a time in a child process killed after
-  `FINDINGS_CALL_TIMEOUT` (300 s), `FINDINGS_GAP` (20 s) apart. 429 waits the
-  time the error gives; 401/403 waits 15 min. Another failure probes
-  `/models`: when it answers the unit is blamed, else the agent backs off 30 s
-  doubling to 10 min. Before the first request and hourly the model must be
-  free in `/models` (the proxy's `_is_free_model` rule); a metered one pauses
-  the agent, rechecked every 15 min. `FINDINGS_MODEL` (`.env`, on `harness config` and
-  the Settings page; read when the agent starts) empty takes the first
-  free chat model, gemini-3.8-flash and gemini-2.5-pro first. At
-  `FINDINGS_OPEN_MAX` (200) open findings not archived in `board.json`, only
-  the stale check runs.
+  `stop` file. It runs until stopped: with nothing due it polls HEAD every
+  60 s. A run that is not `--once` writes `wanted`; only `stop` or a Ctrl-C
+  (SIGINT) on `run` removes it, not SIGTERM as at a shutdown (`stop` also writes the `stop` file and signals the pids in `agent.json` and
+  `wrapper.pid` after checking their command lines). `harness serve` calls
+  `findings_agent_view.resume` at start (a thread in `pub.py main`): with
+  `wanted` there and `agent.lock` not held (flock), it starts the agent again
+  on the repos it explored last, so a machine restart does not stop it (`FINDINGS_AUTORESUME=0`: never).
+- **Passes.** A pass is one area of a repository (its files' folder, two
+  levels deep: `serve`, `scripts`, `tests/fixtures`, `.` for the top) times one
+  question: `bug` (areas with code), `ui` (areas with UI files or folders,
+  `serve` among them), `cleanup` (code or docs). The file index is `git
+  ls-tree` blobs that are not symlinks, over 400 KB, binary, vendored, lock
+  files, generated or secrets (`vault_ingest`'s `SKIP_*` and `SECRET_PATH`).
+  An area's sha is over its files' paths and blobs. Order: changed, new, or a
+  changed prompt version or owner notes first (bug, ui, cleanup), then the
+  ones last run more than `FINDINGS_RESCAN_DAYS` (3) ago, oldest first. When
+  HEAD moves, an open finding whose evidence left the file becomes `stale`.
+  Three failures in a row set a pass aside until its area changes or
+  `FINDINGS_RESCAN_DAYS` pass.
+- **Session.** `snapshot` puts HEAD (`git archive`, regular files only, no
+  `..` or absolute paths, nothing `SECRET_PATH` matches) in
+  `tree/<repo>-<hash>` once per HEAD. The pass runs `harness host
+  --single-message --read-only -p -m harness/<model> PROMPT` there
+  (`FINDINGS_SINGLE_MESSAGE=0`: without `--single-message`), its own process
+  group, `HARNESS_HOST_CONFIRM=1`, `HARNESS_SKIP_AUTH_PROBE=1` (the `run`
+  checked the key once), `HARNESS_HOST_EVENTS_FILE=sessions/N.events` (the
+  event stream `host -p` writes there instead of a temp file and leaves; the
+  agent removes it after the pass), stdout and stderr to `sessions/N.out`; the
+  `[harness] session: ses_…` line names its session, kept in `agent.json` and
+  the pass's record. `--read-only` (`read_only_opencode_config`, merged last in
+  `harness_opencode_overlay`) denies edit, webfetch, websearch (and unsets
+  `OPENCODE_ENABLE_EXA`), task and other folders, denies reading
+  secret-looking files and allows only a list of reading commands (cat, grep,
+  rg, find, ls, ...) with no redirect, pipe, `;`, `&`, `$` (so no `$HOME`),
+  `..`, absolute path, `~`, `find -exec/-delete` and the like; `vault_prepare`
+  and `ticket_prepare` skip, so no vault or ticket is attached. The prompt
+  names the area and its files, tells the agent to follow calls, imports,
+  config and data across files, then gives the question, `notes.md` (4k
+  chars), what earlier passes of the area covered (5) and the area's open
+  findings (25), and the format last: up to 8 `FINDING-<nonce> | category |
+  severity | path:line | title | evidence | detail` lines and one
+  `COVERED-<nonce> | ...` line. A session that ends without the COVERED line
+  failed. A finding is kept only when its path is in HEAD and its
+  whitespace-folded evidence is within 8 lines of its line. Its id is `f-` plus
+  12 hex of sha1(repo name, path, category, evidence); a known id or the same
+  title on the same path is dropped.
+- **Guards.** One pass at a time, `FINDINGS_GAP` (60 s) apart, ended (TERM
+  then KILL to its group) after `FINDINGS_PASS_TIMEOUT` (2400 s) or
+  `FINDINGS_IDLE_TIMEOUT` (600 s) without new output (`N.events` or `N.out`
+  growing); a stop ends it too, and a pass a dead worker left (`agent.json`
+  `pass_pid`, its command line naming harness and its start time within 120 s
+  of `pass_started`, so a pid reused after a restart is left alone) is ended at
+  the next start. A session that ended without its COVERED line on an error
+  (or never started) goes to `trouble`: 429 or rate-limit/quota words wait the
+  time the error gives; 401/403 or unauthorized words wait 15 min; otherwise it
+  probes `/models`: when it answers the pass is blamed, else the agent backs
+  off 30 s doubling to 10 min. Only a pass ended for time is blamed outright.
+  Before the first pass and hourly the model must be free in `/models` (the
+  proxy's `_is_free_model` rule); a metered one pauses the agent, rechecked
+  every 15 min. `FINDINGS_MODEL` (`.env`, on `harness config` and the Settings
+  page; read when the agent starts) empty takes the first free chat model,
+  gemini-3.8-flash and gemini-2.5-pro first. At `FINDINGS_OPEN_MAX` (200) open
+  findings not archived in `board.json`, only the stale check runs.
 - **State** (`state/findings/`): `findings.json` (`{"version":1,"findings":[...]}`,
-  the Findings board's source; written temp+fsync+rename by the worker
-  only; past 1500 entries the oldest stale, then archived, ones go),
-  `ledger.json` (per unit: sha, prompt hash, scanned, outcome, failures; the
-  file index; counts per lens), `agent.json` (state, heartbeat, unit,
-  last error, counts), `calls.jsonl` (one line per request, the reply's
-  first 4k chars; `calls.1.jsonl` at 5 MB), `agent.out` (same cap),
-  `notes.md`. The queue page's card is `serve/findings_agent_view.py`
-  (`agent_card`, `agent_action`: start, stop, notes).
+  each with its `session` and `area`; the Findings board's source; written
+  temp+fsync+rename by the worker only; past 1500 entries the oldest stale,
+  then archived, ones go), `ledger.json` (version 2: per pass key
+  `repo:area:lens` the sha, prompt hash, last run, outcome, failures,
+  covered; the file index; counts per question; `passes`, the last 200
+  sessions `{n, session, repo, area, lens, started, ended, outcome, found,
+  rejected, covered, out}`), `agent.json` (state, heartbeat, unit, session,
+  pass_pid, last error, counts), `sessions/N.out` (the last 200), `tree/`,
+  `wanted`, `agent.out` (5 MB cap), `notes.md`. The queue page's card is
+  `serve/findings_agent_view.py` (`agent_card`, `agent_action`: start, stop,
+  notes; the last 8 sessions, each linked to `/runs/<session>`).
 
 Covered by `tests/unit_findings_test.sh` (`tests/findings_agent_test.py`
-against a fake proxy, `serve/test_findings_agent_view.py`, the CLI).
+against a fake proxy and a stub harness standing in for the sessions,
+`serve/test_findings_agent_view.py`, the CLI and the `--read-only` overlay).
+No test runs a real opencode session or model.
 
 ### Interactive TTY resolution (Windows) — issue #82
 
@@ -2313,9 +2346,29 @@ offered as suggestions. It is taken as pasted: quotes
   blocked).
 - `/runs/debug` (`render_debug_page`, linked from the queue page): every
   report newest first by mtime, `state/debug/runs/*/report.md` with their
-  verdict and ticket and `state/debug/reports/*.md`;
+  verdict and ticket and `state/debug/reports/*.md`, and a queue debug run
+  with no report yet as `running`; each run links its session ("Its
+  session", `debug_session`: the `[harness] session:` line of its
+  `launch.out` or `session.log`), as the ticket page's Debug agent panel does;
   `/runs/debug/runs/<run>` and `/runs/debug/reports/<file>` render one
   (`DEBUG_NAME_RE` names only).
+- Harness's own agents (`agent_sessions`: the findings agent's passes from
+  `state/findings/ledger.json`, the queue debug runs' and `harness debug`'s
+  sessions; cached until those files change) are listed on `/runs` under
+  "Harness agents" before the other sessions, each tagged ("debug KEY",
+  "findings repo: area/ (lens)"), and their session page names the agent
+  with a link to its card or report. Their sessions are ordinary opencode
+  sessions, live like any other.
+- At start `pub.py main` runs two threads: `RunsView.keep_resuming` (a queue
+  run the machine took down, its `run.json` left with a stale beat, starts
+  again as it was; one that cannot start yet, docker or the proxy not up, is
+  tried again 15 s, 30 s, 1, 2, then every 5 min until it beats, and a halt
+  pending when the machine went down leaves it ended; `QUEUE_AUTORESUME=0`:
+  never) and `findings_agent_view.resume` (the findings agent when `wanted`).
+  The queue's beat (`run.json`) is written with fsync; a git `index.lock`
+  older than the machine's boot (`left_by_restart`, `/proc/stat` btime) is
+  taken away, in place (`in_place_trouble`) and in a ticket's clone before
+  each stage.
 - `/runs/ticket/<KEY>/diff?repo=&view=` (`serve/diff_view.py`, "Changes" on
   the ticket page): a diff drawn in the browser by the vendored diff2html
   3.4.56 (`serve/vendor/diff2html/`, MIT; its JS and CSS inlined, the JS

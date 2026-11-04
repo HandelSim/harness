@@ -59,7 +59,7 @@ class CardTest(Base):
         self.assertIn("action='/runs/findings/agent/stop'", h)
         self.assertNotIn("/runs/findings/agent/start", h)
         self.assertIn("<td>bug</td><td>3</td><td>1</td><td>2</td><td>0</td>", h)
-        self.assertIn("scanning", h)
+        self.assertIn("exploring", h)   # an old agent.json's "scanning" is shown as exploring
         self.assertIn("Change the model in Settings (then Stop and Start)</a>", h)
 
     def test_stale_heartbeat(self):
@@ -146,6 +146,77 @@ class ActionTest(Base):
         self.assertFalse(fav.agent_action(self.state, self.harness, "nuke", {})[0])
         self.assertFalse(fav.agent_action("", self.harness, "start", {})[0])
         self.assertFalse(fav.agent_action(self.state, os.path.join(self.root, "none"), "start", {})[0])
+
+
+class SessionsTest(Base):
+    def ledger(self, passes):
+        with open(os.path.join(self.state, "ledger.json"), "w") as f:
+            json.dump({"version": 2, "passes": passes}, f)
+
+    def test_sessions_listed_newest_first_and_linked(self):
+        self.status()
+        self.ledger([{"n": 1, "session": "ses_old1", "repo": "/r/harness", "area": "serve", "lens": "bug",
+                      "outcome": "ok", "found": 0},
+                     {"n": 2, "session": "ses_new2", "repo": "/r/harness", "area": "scripts", "lens": "ui",
+                      "outcome": "ok", "found": 2, "covered": "<looked> at it"},
+                     {"n": 3, "session": "ses_x'><script>", "repo": "/r/h", "area": "a", "lens": "bug",
+                      "outcome": "failed"}, "junk"])
+        got = [p["n"] for p in fav.passes(self.state)]
+        self.assertEqual(got, [3, 2, 1])
+        h = fav.agent_card(self.state)
+        self.assertIn("href='/runs/ses_new2'", h)
+        self.assertIn("href='/runs/ses_old1'", h)
+        self.assertNotIn("<script>", h)
+        self.assertNotIn("<looked>", h)
+        self.assertLess(h.index("ses_new2"), h.index("ses_old1"))
+
+    def test_no_ledger(self):
+        self.assertEqual(fav.passes(self.state), [])
+
+
+class ResumeTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.harness = os.path.join(self.root, "harness")
+        with open(self.harness, "w") as f:
+            f.write(FAKE_HARNESS)
+        self.log = os.path.join(self.root, "log")
+        os.environ["LOG"] = self.log
+        self.addCleanup(os.environ.pop, "LOG", None)
+        self.addCleanup(os.environ.pop, "FINDINGS_AUTORESUME", None)
+
+    def test_not_wanted_is_left_alone(self):
+        self.assertIsNone(fav.resume(self.state, self.harness))
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_wanted_and_not_running_starts(self):
+        open(os.path.join(self.state, "wanted"), "w").close()
+        # a dead agent's agent.json and its lock file, as a restart leaves them
+        self.status(pid=2 ** 22 + 12345, heartbeat_ts=time.time() - 3600)
+        open(os.path.join(self.state, "agent.lock"), "w").close()
+        ok, msg = fav.resume(self.state, self.harness)
+        self.assertTrue(ok, msg)
+        with open(self.log) as f:
+            self.assertIn("args=findings start", f.read())
+
+    def test_wanted_but_off(self):
+        open(os.path.join(self.state, "wanted"), "w").close()
+        os.environ["FINDINGS_AUTORESUME"] = "0"
+        self.assertIsNone(fav.resume(self.state, self.harness))
+
+    @unittest.skipIf(os.name == "nt", "flock")
+    def test_held_lock_means_running(self):
+        import fcntl
+        open(os.path.join(self.state, "wanted"), "w").close()
+        f = open(os.path.join(self.state, "agent.lock"), "a")
+        self.addCleanup(f.close)
+        self.assertFalse(fav._held(self.state))
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertTrue(fav._held(self.state))
+        self.assertIsNone(fav.resume(self.state, self.harness))
+        ok, msg = fav.agent_action(self.state, self.harness, "start", {})
+        self.assertFalse(ok)
+        self.assertIn("already running", msg)
 
 
 if __name__ == "__main__":

@@ -234,7 +234,7 @@ def read(path, cap=None):
 def write_atomic(path, text, sync=True):
     """path holds text, whole: written beside it and moved over it. sync: on disk
     before the move, so a machine that loses power keeps the old or the new file,
-    never an empty one (the run's beat, rewritten every few seconds, is not)."""
+    never an empty one."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}-{threading.get_ident()}.tmp"   # two writers never share one
     try:
@@ -1248,12 +1248,35 @@ GIT_TROUBLE = (("rebase-merge", "a rebase"), ("rebase-apply", "a rebase or git a
                ("BISECT_LOG", "a bisect"), ("index.lock", "index.lock"))
 
 
+def boot_time():
+    """When this machine started (/proc/stat btime), or 0 when it cannot be told."""
+    try:
+        with open("/proc/stat", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def left_by_restart(path):
+    """path was last written before this machine started: whatever wrote it died
+    with the machine (a git index.lock left by a restart, never one a git running now holds)."""
+    at, boot = mtime(path), boot_time()
+    return at is not None and boot > 0 and at < boot
+
+
 def in_place_trouble(project, branch):
     """Why the project is not fit for an in-place stage (a rebase or merge going,
-    git's index.lock left, not on the ticket's branch), or ""."""
+    git's index.lock left, not on the ticket's branch), or "". An index.lock older
+    than the machine's start is taken away: the git that held it went down with it."""
     for name, what in GIT_TROUBLE:
         p = git(project, "rev-parse", "--git-path", name, check=False).stdout.strip()
-        if p and os.path.exists(p if os.path.isabs(p) else os.path.join(project, p)):
+        p = p if not p or os.path.isabs(p) else os.path.join(project, p)
+        if p and name == "index.lock" and left_by_restart(p):
+            drop(p)
+        if p and os.path.exists(p):
             return (f"{what} is left in {project}" if name == "index.lock" else f"{what} is in progress in {project}") \
                 + "; finish or abort it there, then harness queue retry"
     if branch:
@@ -4457,6 +4480,11 @@ def process(ctx, st):
                 return block(ctx, st, trouble)
         looped = True
         ctx.q.log(key, f"{st['stage']} (attempt {st['attempt'] + 1}, {ctx.model})")
+        if not st.get("in_place"):   # the clone's git lock a restart left (in place: in_place_trouble)
+            lock = os.path.join(workdir(ctx.q, st), ".git", "index.lock")
+            if left_by_restart(lock):
+                drop(lock)
+                ctx.q.log(key, "took away the clone's .git/index.lock the machine's restart left")
         try:
             if st.get("in_place"):   # what the uncommitted repositories hold before the work: their change is since
                 take_baselines(ctx.q, st, st["stage"], (ctx.vault, ctx.q.root))
@@ -4476,7 +4504,9 @@ def beat(ctx, **change):
             return
         ctx.run_info.update(change, beat=int(time.time()))
         try:
-            write_atomic(ctx.run_file, json.dumps(ctx.run_info) + "\n", sync=False)
+            # synced: a machine that loses power keeps a whole run.json, which is what
+            # serve's start goes on from (an empty one would be a run that never was)
+            write_atomic(ctx.run_file, json.dumps(ctx.run_info) + "\n")
         except OSError:
             pass
 

@@ -1979,6 +1979,78 @@ class QueuePageTest(RunsServer):
             with open(args) as f:
                 self.assertEqual(f.read().strip(), want)
 
+    def test_a_run_halted_as_the_machine_went_down_stays_ended(self):
+        fake = os.path.join(self.tmp.name, "harness")
+        args = os.path.join(self.tmp.name, "args")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/bash\necho "$@" > {args}\nexit 3\n')
+        cfg = self.start(harness=fake)
+        for name in ("run.json", "run-1.json", "run-2.json"):
+            with open(os.path.join(self.queue, name), "w") as f:
+                json.dump({"pid": 1, "beat": int(time.time()) - 600, "parallel": 2}, f)
+        open(os.path.join(self.queue, "halt"), "w").close()
+        self.assertIsNone(cfg.runs.resume_runner())
+        self.assertFalse(os.path.exists(args))
+        for name in ("run.json", "run-1.json", "run-2.json"):
+            self.assertFalse(os.path.exists(os.path.join(self.queue, name)), name)
+        self.assertEqual(cfg.runs.keep_resuming(waits=(0,)), [])
+
+    def test_a_resume_that_cannot_start_yet_is_tried_again_until_it_beats(self):
+        fake = os.path.join(self.tmp.name, "harness")
+        count = os.path.join(self.tmp.name, "count")
+        run_json = os.path.join(self.queue, "run.json")
+        # the first try ends at once (docker not up yet), leaving the old run.json; the second beats
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/bash\necho x >> {count}\n'
+                    f'[[ $(wc -l < {count}) -ge 2 ]] && printf \'{{"pid": %s, "beat": %s}}\' $$ $(date +%s) > {run_json}\n'
+                    'exit 3\n')
+        cfg = self.start(harness=fake)
+        with open(run_json, "w") as f:
+            json.dump({"pid": 1, "beat": int(time.time()) - 600}, f)
+        gone = threading.Event()
+        threading.Timer(30, gone.set).start()
+        said = cfg.runs.keep_resuming(gone=gone, waits=(0.2,))
+        gone.set()
+        with open(count) as f:
+            self.assertEqual(len(f.read().split()), 2)
+        self.assertEqual(len(said), 2)
+        self.assertTrue(cfg.runs.runner()["running"])
+
+    def test_harness_agents_sessions_are_named(self):
+        state = os.path.dirname(self.queue)
+        run = os.path.join(state, "debug", "runs", "20261103-120000-ABC-12")
+        os.makedirs(run)
+        with open(os.path.join(run, "launch.out"), "w") as f:
+            f.write(f"[harness] host mode\n[harness] session: {ROOT}\nlooking\n")
+        os.makedirs(os.path.join(state, "debug", "runs", "20261103-130000-ABC-12"))   # still looking: no report.md
+        os.makedirs(os.path.join(state, "findings"))
+        with open(os.path.join(state, "findings", "ledger.json"), "w") as f:
+            json.dump({"passes": [{"n": 1, "session": "ses_find1", "repo": "/r/harness", "area": "serve",
+                                   "lens": "bug", "outcome": "ok"},
+                                  {"n": 2, "session": "ses_bad'><x", "repo": "/r/h", "area": "a", "lens": "ui"}]}, f)
+        cfg = self.start()
+        got = runs.agent_sessions(cfg.runs)
+        self.assertEqual(got[ROOT]["label"], "debug ABC-12")
+        self.assertEqual(got[ROOT]["href"], "/runs/debug/runs/20261103-120000-ABC-12")
+        self.assertEqual(got["ses_find1"]["kind"], "findings")
+        self.assertIn("harness: serve/ (bug)", got["ses_find1"]["label"])
+        self.assertNotIn("ses_bad'><x", got)
+        r, body = self.req("GET", "/runs")
+        self.assertIn("Harness agents", body)
+        self.assertLess(body.index("Harness agents"), body.index(f"/runs/{ROOT}"))
+        self.assertIn(">debug ABC-12</a>", body)
+        r, body = self.req("GET", f"/runs/{ROOT}")
+        self.assertIn("Debug agent", body)
+        self.assertIn("href='/runs/debug/runs/20261103-120000-ABC-12'", body)
+        r, body = self.req("GET", "/runs/debug")
+        self.assertIn(f"href='/runs/{ROOT}'>Its session</a>", body)
+        self.assertIn("running", body)
+        self.assertNotIn("href='/runs/debug/runs/20261103-130000-ABC-12'", body)
+        self.ticket(status="blocked", stage="implementing", reason="x",
+                    debug={"dir": "20261103-120000-ABC-12", "stage": "implementing", "verdict": "fixed"})
+        r, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn(f"href='/runs/{ROOT}'>its session</a>", body)
+
     def test_a_queue_session_has_a_stop_button_and_the_host_an_opencode_link(self):
         self.ticket(status="running", stage="plan")
         self.run_on()
