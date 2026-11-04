@@ -1055,11 +1055,10 @@ class Worker:
                        f"# Notes on {os.path.basename(root)}\n\nWhat the findings agent's passes learned, an area "
                        "at a time. They can be wrong or out of date: the code is the truth.\n\n"
                        + "\n".join(rows) + "\n")
-        listing = []
-        for e in self.ledger["knowledge"].values():
-            x = (self.units.get(e.get("repo")) and {u.area: u for u in self.units[e["repo"]]}.get(e.get("area")))
-            if e.get("repo") in self.repos and x:
-                listing.append(dict(e, changed=e.get("sha") != x.sha))
+        areas = {r: {u.area: u.sha for u in self.units.get(r, [])} for r in self.repos}
+        listing = [dict(e, changed=e.get("sha") != areas[e["repo"]][e["area"]])
+                   for e in self.ledger["knowledge"].values()
+                   if e.get("area") in areas.get(e.get("repo"), {})]
         write_json(self.p(os.path.join("knowledge", "index.json")), {"version": 1, "notes": listing})
 
     def sync_notes(self, root, tree):

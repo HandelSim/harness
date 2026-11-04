@@ -9,7 +9,8 @@ starts the agent the way the queue page starts a queue run: a detached
   POST /runs/findings/agent/notes   notes=TEXT: the notes added to every pass (at most 4000 chars)
 
 The card lists the agent's last sessions (ledger.json "passes"), each linked to
-its page on /runs. resume() is what harness serve calls at its start: the agent
+its page on /runs, and links to the notes the passes wrote on each area
+(knowledge/index.json, knowledge/<repo>/<area>.md): /runs/findings/notes. resume() is what harness serve calls at its start: the agent
 the owner started and did not stop (findings/wanted) starts again.
 
 The routes and the page region are wired in pub.py and runs.py; this module only
@@ -19,6 +20,7 @@ renders and acts.
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -29,9 +31,12 @@ NOTES_MAX = 4000
 STALE_BEAT = 300          # a heartbeat older than this, while not stopped: the agent is not answering
 STATES = {"exploring": ("t-run", "exploring"), "scanning": ("t-run", "exploring"),
           "waiting": ("t-run", "waiting between passes"),
-          "idle": ("t-ok", "idle: everything is scanned"), "backoff": ("t-wait", "backing off"),
+          "idle": ("t-wait", "idle"), "backoff": ("t-wait", "backing off"),
           "paused": ("t-wait", "paused"), "stopping": ("t-off", "stopping"), "stopped": ("t-off", "stopped")}
-LENSES = ("bug", "ui", "cleanup")
+LENSES = ("bug", "trace", "ui", "cleanup")
+SLUG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,200}$")   # a knowledge/ folder or file name
+NOTE_MAX = 64 * 1024      # bytes of one area's note read
+INDEX_MAX = 4 * 1024 * 1024
 SESSIONS_SHOWN = 8
 OUTCOME_TONE = {"found": "t-ok", "none": "t-off", "running": "t-run", "failed": "t-bad", "stopped": "t-off"}
 # the card's own rules; the page adds them to its stylesheet (no inline styles: strict CSP)
@@ -145,11 +150,11 @@ def _counts(info):
             x = v.get(k, 0)
             return x if isinstance(x, int) and not isinstance(x, bool) else 0
         rows.append(f"<tr><td>{esc(_s(lens, 20))}</td><td>{n('calls')}</td><td>{n('accepted')}</td>"
-                    f"<td>{n('rejected')}</td><td>{n('failed')}</td></tr>")
+                    f"<td>{n('rejected')}</td><td>{n('failed')}</td><td>{n('notes')}</td></tr>")
     if not rows:
         return ""
     return ("<table class='fa-counts'><thead><tr><th>question</th><th>sessions</th><th>kept</th>"
-            "<th>rejected</th><th>failed</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+            "<th>rejected</th><th>failed</th><th>notes written</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
 
 
 def passes(state_dir, n=SESSIONS_SHOWN):
@@ -202,9 +207,9 @@ def agent_card(state_dir, flash=""):
         cls, label = "t-bad", f"not answering (last: {state or 'unknown'}, heartbeat {_ago(age)})"
     parts = ["<section class='panel fagent' id='findings-agent'><div class='hd'><h2>Findings agent "
              f"<span class='tag {cls}'>{esc(label)}</span></h2>"
-             "<span class='muted'>opencode sessions on a free model that explore the committed code, an area "
-             "at a time, and follow it across files for bugs, UI problems and code to remove or simplify; "
-             "read-only</span></div>"]
+             "<span class='muted'>opencode sessions on a free model that keep exploring the committed code, an "
+             "area at a time and round again, tracing it across files for bugs, UI problems and code to remove or "
+             "simplify, and write down what each area does for the next agent; read-only</span></div>"]
     if flash:
         parts.append(f"<div class='flash'>{esc(flash)}</div>")
     rows = []
@@ -227,7 +232,7 @@ def agent_card(state_dir, flash=""):
     sid = _s(info.get("session"), 80)
     if live and sid.startswith("ses_"):
         rows.append(("session", sid))
-    for key, name in (("open", "open findings"), ("todo", "passes to do")):
+    for key, name in (("open", "open findings"), ("todo", "changed areas first"), ("units", "passes in the rotation")):
         v = info.get(key)
         if isinstance(v, int) and not isinstance(v, bool):
             rows.append((name, str(v)))
@@ -239,6 +244,9 @@ def agent_card(state_dir, flash=""):
                      + "</dl>")
     parts.append(_counts(info))
     parts.append(_passes(state_dir) if state_dir else "")
+    n = len(knowledge_index(state_dir)) if state_dir else 0
+    parts.append(f"<p><a href='/runs/findings/notes'>What it has learned</a> <span class='muted'>"
+                 f"{n} area note{'' if n == 1 else 's'}</span></p>")
     if live:
         act = ("<form method='post' action='/runs/findings/agent/stop' data-confirm='Stop the findings agent? "
                "Its session in flight is ended and that pass runs again later. It stays stopped, "
@@ -263,6 +271,43 @@ def agent_card(state_dir, flash=""):
                  "</form></details>")
     parts.append("</section>")
     return "".join(parts)
+
+
+def knowledge_index(state_dir):
+    """The notes the passes wrote, from knowledge/index.json, each checked: [{repo, area,
+    slug, name, updated, session, lens, chars, summary, changed}], by repository and area."""
+    try:
+        data = json.loads(_read(os.path.join(state_dir, "knowledge", "index.json"), INDEX_MAX) or "{}")
+    except ValueError:
+        return []
+    items = data.get("notes") if isinstance(data, dict) else None
+    out = []
+    for e in items if isinstance(items, list) else []:
+        if not isinstance(e, dict) or not isinstance(e.get("file"), str):
+            continue
+        slug, _, name = e["file"].partition("/")
+        if not (SLUG_RE.match(slug) and name.endswith(".md") and SLUG_RE.match(name)):
+            continue
+        n = e.get("chars")
+        out.append({"repo": _s(e.get("repo"), 1000), "area": _s(e.get("area"), 500) or ".", "slug": slug,
+                    "name": name[:-3], "updated": _s(e.get("updated"), 40), "session": _s(e.get("session"), 80),
+                    "lens": _s(e.get("lens"), 20), "summary": _s(e.get("summary"), 300),
+                    "chars": n if isinstance(n, int) and not isinstance(n, bool) else 0,
+                    "changed": e.get("changed") is True})
+    out.sort(key=lambda e: (e["repo"], e["area"]))
+    return out
+
+
+def knowledge_text(state_dir, slug, name):
+    """One area's note (knowledge/<slug>/<name>.md), or None: both names checked, the
+    path kept under knowledge/."""
+    if not (state_dir and SLUG_RE.match(slug or "") and SLUG_RE.match(name or "")):
+        return None
+    base = os.path.realpath(os.path.join(state_dir, "knowledge"))
+    path = os.path.realpath(os.path.join(base, slug, name + ".md"))
+    if os.path.dirname(os.path.dirname(path)) != base or not os.path.isfile(path):
+        return None
+    return _read(path, NOTE_MAX)
 
 
 def _write_atomic(path, text):

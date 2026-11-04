@@ -1477,8 +1477,9 @@ which files a vault's findings as tickets).
   `agent.out`. The script is a supervisor: it holds `agent.lock` (a second run
   exits 0), runs the worker as a child, restarts it after 10 s doubling to 5 min
   when it dies or does not beat for 10 min, and ends on SIGTERM, SIGINT or a
-  `stop` file. It runs until stopped: with nothing due it polls HEAD every
-  60 s. A run that is not `--once` writes `wanted`; only `stop` or a Ctrl-C
+  `stop` file. It runs until stopped and never runs out of passes (below);
+  it waits 60 s only when a repository has no file to explore or every pass
+  is set aside. A run that is not `--once` writes `wanted`; only `stop` or a Ctrl-C
   (SIGINT) on `run` removes it, not SIGTERM as at a shutdown (`stop` also writes the `stop` file and signals the pids in `agent.json` and
   `wrapper.pid` after checking their command lines). `harness serve` calls
   `findings_agent_view.resume` at start (a thread in `pub.py main`): with
@@ -1486,16 +1487,18 @@ which files a vault's findings as tickets).
   on the repos it explored last, so a machine restart does not stop it (`FINDINGS_AUTORESUME=0`: never).
 - **Passes.** A pass is one area of a repository (its files' folder, two
   levels deep: `serve`, `scripts`, `tests/fixtures`, `.` for the top) times one
-  question: `bug` (areas with code), `ui` (areas with UI files or folders,
-  `serve` among them), `cleanup` (code or docs). The file index is `git
+  question: `bug` (areas with code), `trace` (code: one path followed end to
+  end across files and written into the note), `ui` (areas with UI files or
+  folders, `serve` among them), `cleanup` (code or docs). The file index is `git
   ls-tree` blobs that are not symlinks, over 400 KB, binary, vendored, lock
   files, generated or secrets (`vault_ingest`'s `SKIP_*` and `SECRET_PATH`).
   An area's sha is over its files' paths and blobs. Order: changed, new, or a
-  changed prompt version or owner notes first (bug, ui, cleanup), then the
-  ones last run more than `FINDINGS_RESCAN_DAYS` (3) ago, oldest first. When
-  HEAD moves, an open finding whose evidence left the file becomes `stale`.
-  Three failures in a row set a pass aside until its area changes or
-  `FINDINGS_RESCAN_DAYS` pass.
+  changed prompt version or owner notes first (bug, trace, ui, cleanup), then
+  every other pass, the one run longest ago first (`due` returns both lists),
+  so it goes round every area again, each time from the area's note and what
+  earlier passes covered. When HEAD moves, an open finding whose evidence left
+  the file becomes `stale`. Three failures in a row set a pass aside for 24 h
+  or until its area changes.
 - **Session.** `snapshot` puts HEAD (`git archive`, regular files only, no
   `..` or absolute paths, nothing `SECRET_PATH` matches) in
   `tree/<repo>-<hash>` once per HEAD. The pass runs `harness host
@@ -1516,10 +1519,23 @@ which files a vault's findings as tickets).
   names the area and its files, tells the agent to follow calls, imports,
   config and data across files, then gives the question, `notes.md` (4k
   chars), what earlier passes of the area covered (5) and the area's open
-  findings (25), and the format last: up to 8 `FINDING-<nonce> | category |
-  severity | path:line | title | evidence | detail` lines and one
-  `COVERED-<nonce> | ...` line. A session that ends without the COVERED line
-  failed. A finding is kept only when its path is in HEAD and its
+  findings (25), the area's note (8k chars, marked when its files changed
+  since), and the format last: up to 8 `FINDING-<nonce> | category |
+  severity | path:line | title | evidence | detail` lines, the area's whole
+  note between `KNOWLEDGE-<nonce>` and `END-KNOWLEDGE-<nonce>` (and up to 2
+  more for other areas, `KNOWLEDGE-<nonce> AREA`), and one
+  `COVERED-<nonce> | ...` line. A session that ends without the COVERED line,
+  findings or a note failed.
+- **Notes.** `take_notes` keeps a block only for an area of the repository,
+  refuses one under 300 chars, under half the old note's length or naming
+  none of the area's files (`knowledge_refusal`), adds the `# repo: area/`
+  heading when it is missing, cuts at 12k chars, keeps the replaced note as
+  `.md.prev` and writes temp+fsync+rename. `write_index` writes the repo's
+  `INDEX.md` and `knowledge/index.json` after a note and when HEAD moves (a
+  note whose area sha moved is `changed`). Before each pass `sync_notes`
+  copies the repo's notes (not `.prev`) to `.findings-notes/` in its
+  snapshot, which the prompt points to; a finding there is not in HEAD, so it
+  is never kept. A finding is kept only when its path is in HEAD and its
   whitespace-folded evidence is within 8 lines of its line. Its id is `f-` plus
   12 hex of sha1(repo name, path, category, evidence); a known id or the same
   title on the same path is dropped.
@@ -1539,7 +1555,8 @@ which files a vault's findings as tickets).
   every 15 min. `FINDINGS_MODEL` (`.env`, on `harness config` and the Settings
   page; read when the agent starts) empty takes the first free chat model,
   gemini-3.8-flash and gemini-2.5-pro first. At `FINDINGS_OPEN_MAX` (200) open
-  findings not archived in `board.json`, only the stale check runs.
+  findings not archived in `board.json` the passes go on in map-only mode: the
+  prompt asks for no findings and any are dropped; notes are still written.
 - **State** (`state/findings/`): `findings.json` (`{"version":1,"findings":[...]}`,
   each with its `session` and `area`; the Findings board's source; written
   temp+fsync+rename by the worker only; past 1500 entries the oldest stale,
@@ -1547,11 +1564,21 @@ which files a vault's findings as tickets).
   `repo:area:lens` the sha, prompt hash, last run, outcome, failures,
   covered; the file index; counts per question; `passes`, the last 200
   sessions `{n, session, repo, area, lens, started, ended, outcome, found,
-  rejected, covered, out}`), `agent.json` (state, heartbeat, unit, session,
-  pass_pid, last error, counts), `sessions/N.out` (the last 200), `tree/`,
-  `wanted`, `agent.out` (5 MB cap), `notes.md`. The queue page's card is
+  rejected, covered, notes, out}`; `knowledge`, per `repo:area` the note's
+  file, session, lens, area sha, HEAD and summary), `agent.json` (state,
+  heartbeat, unit, session, pass_pid, last error, counts, `todo` changed
+  passes, `units` passes in the rotation, `notes`), `sessions/N.out` (the
+  last 200), `tree/`, `knowledge/<repo>-<hash>/<area>.md` (`/` as `__`, the
+  top as `_top.md`) with `INDEX.md`, `knowledge/index.json`, `wanted`,
+  `agent.out` (5 MB cap), `notes.md`. The queue page's card is
   `serve/findings_agent_view.py` (`agent_card`, `agent_action`: start, stop,
-  notes; the last 8 sessions, each linked to `/runs/<session>`).
+  notes; the last 8 sessions, each linked to `/runs/<session>`; a link to the
+  notes). `GET /runs/findings/notes` lists the notes (`knowledge_index`) and
+  `/runs/findings/notes/<repo-slug>/<name>` renders one as markdown
+  (`knowledge_text`: both names `[A-Za-z0-9_][A-Za-z0-9._-]*`, the path kept
+  under `knowledge/`), `runs.render_findings_notes`/`render_findings_note`.
+  On the Findings board each finding opens in place (`<details data-k>`, kept
+  open across the poll) to its whole title, detail and evidence.
 
 Covered by `tests/unit_findings_test.sh` (`tests/findings_agent_test.py`
 against a fake proxy and a stub harness standing in for the sessions,

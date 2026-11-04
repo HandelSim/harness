@@ -62,7 +62,7 @@ mkdir -p "$state_root"
 # --- F3: help, dispatch, bad input ----------------------------------------------
 out=$(cmd_findings --help)
 for w in 'harness findings start' 'harness findings stop' 'harness findings status' 'harness findings notes' \
-         FINDINGS_MODEL FINDINGS_GAP FINDINGS_PASS_TIMEOUT FINDINGS_IDLE_TIMEOUT FINDINGS_RESCAN_DAYS \
+         FINDINGS_MODEL FINDINGS_GAP FINDINGS_PASS_TIMEOUT FINDINGS_IDLE_TIMEOUT /runs/findings/notes \
          FINDINGS_OPEN_MAX FINDINGS_SINGLE_MESSAGE --read-only; do
     grep -qF -- "$w" <<<"$out" || fail "F3: --help does not mention $w"
 done

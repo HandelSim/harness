@@ -3196,6 +3196,54 @@ def debug_reports(runs):
     return out
 
 
+def render_findings_notes(runs):
+    """/runs/findings/notes: what the findings agent's passes wrote on each area."""
+    d = findings_view.state_dir(runs)
+    rows = findings_agent_view.knowledge_index(os.path.join(d, "findings")) if d else []
+    parts = ["<header class='ph'><h1>What the findings agent learned</h1><div class='sub'>One note per area of "
+             "each repository, written by the agent's passes as they explore and trace the code, and given to "
+             "every later pass. They can be wrong or out of date: the code is the truth. "
+             "<a href='/runs/queue#findings-agent'>the agent</a></div></header>", "<section class='panel'>"]
+    if not rows:
+        parts.append("<div class='muted'>No note yet: the agent writes one after each pass it finishes.</div>")
+    else:
+        parts.append("<ul class='attempts'>")
+        repo = None
+        for e in rows:
+            if e["repo"] != repo:
+                repo = e["repo"]
+                parts.append(f"<li><div class='hd'><strong>{esc(os.path.basename(repo.rstrip('/')) or repo)}</strong>"
+                             f"<span class='muted'>{esc(repo)}</span></div></li>")
+            href = f"/runs/findings/notes/{quote(e['slug'])}/{quote(e['name'])}"
+            tags = ("<span class='pill t-wait' title='its files changed since this was written'>out of date</span>"
+                    if e["changed"] else "")
+            sess = (f"<a class='btn sm' href='/runs/{quote(e['session'])}'>Its session</a>"
+                    if e["session"].startswith("ses_") else "")
+            parts.append(f"<li><div class='hd'><a href='{href}'><code>{esc(e['area'])}/</code></a>{tags}{sess}"
+                         f"<span class='muted'>{esc(e['updated'])}{' &middot; ' + esc(e['lens']) if e['lens'] else ''}"
+                         f"</span></div><div class='muted'>{esc(e['summary'])}</div></li>")
+        parts.append("</ul>")
+    parts.append("</section>")
+    return parts
+
+
+def render_findings_note(runs, slug, name):
+    """(title, parts) for one area's note, or None."""
+    d = findings_view.state_dir(runs)
+    text = findings_agent_view.knowledge_text(os.path.join(d, "findings"), slug, name) if d else None
+    if text is None:
+        return None
+    meta = next((e for e in findings_agent_view.knowledge_index(os.path.join(d, "findings"))
+                 if e["slug"] == slug and e["name"] == name), None)
+    sub = "<a href='/runs/findings/notes'>every note</a>"
+    if meta:
+        sub += f" <code>{esc(meta['area'])}/</code> <span class='muted'>{esc(meta['repo'])}, {esc(meta['updated'])}"
+        sub += (" (its files changed since)" if meta["changed"] else "") + "</span>"
+    return (f"note: {meta['area'] if meta else name}",
+            [f"<header class='ph'><h1>Findings agent note</h1><div class='sub'>{sub}</div></header>",
+             f"<section class='panel'>{_md(runs.vault, 'findings-note.md', text)}</section>"])
+
+
 def render_debug_page(runs):
     rows = debug_reports(runs)
     parts = ["<header class='ph'><h1>Debug reports</h1><div class='sub'>Newest first: the queue's debug agent "

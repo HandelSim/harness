@@ -7615,21 +7615,30 @@ opencode session on a free model (harness host --read-only -p, single-message
 mode), in a snapshot of HEAD with secret-looking files left out: it reads,
 greps and globs, may run only commands that read, and cannot change anything.
 It starts from one area (a folder, two levels deep) with one question (bug,
-ui or cleanup) and follows calls, imports, config and data across files,
-since bugs are often in how parts meet. A finding is kept only when the line
+trace, ui or cleanup) and follows calls, imports, config and data across
+files, since bugs are often in how parts meet; trace follows one path end
+to end and writes it down. A finding is kept only when the line
 it copies as evidence is in the file near the line it names. The kept ones
 are on the Findings board of the queue page (harness serve), where you
 archive them or make tickets of them; every session is on the Sessions page
 (/runs) and listed on the agent's card.
 
-Changed and new areas go first; what earlier passes of an area covered and
-found goes into the next one's prompt; a finding whose evidence is gone from
-HEAD is marked stale; unchanged areas are explored again after
-FINDINGS_RESCAN_DAYS. When nothing is left it looks at HEAD every minute.
-It runs until you stop it: after a restart, harness serve starts it again.
+It never runs out of work: changed and new areas go first, then every other
+pass again, the one explored longest ago first, round and round. Each pass
+also writes what it learned about its area (what it is for, its files and
+entry points, how data flows, the paths it traced, its traps) as a note:
+$state_root/findings/knowledge/<repo>/<area>.md, listed on the web UI at
+/runs/findings/notes. Every later pass gets its area's note and all the
+repository's notes (in .findings-notes/ of its snapshot), with what earlier
+passes covered and found, so it looks further than the last one. A note
+much shorter than the one it replaces, or naming none of the area's files,
+is refused; the replaced one is kept as .md.prev. A finding whose evidence
+is gone from HEAD is marked stale. It runs until you stop it: after a
+restart, harness serve starts it again.
 It uses only a free model (lane assist or no credit cost, checked against
-the proxy's catalog hourly) and pauses otherwise. It holds the host proxy
-while it runs.
+the proxy's catalog hourly) and pauses otherwise. With FINDINGS_OPEN_MAX
+open findings the passes go on but only write notes, until you archive
+some. It holds the host proxy while it runs.
 
 Settings (.env, or the environment):
   FINDINGS_MODEL            the model (default: the first free one, preferring
@@ -7638,15 +7647,15 @@ Settings (.env, or the environment):
   FINDINGS_GAP              seconds between passes (60)
   FINDINGS_PASS_TIMEOUT     seconds a pass may take (2400)
   FINDINGS_IDLE_TIMEOUT     seconds a pass may write nothing new (600)
-  FINDINGS_RESCAN_DAYS      days before an unchanged area is explored again (3)
-  FINDINGS_OPEN_MAX         open findings at which it pauses until you archive
-                            some (200)
+  FINDINGS_OPEN_MAX         open findings at which passes only write notes
+                            until you archive some (200)
   FINDINGS_SINGLE_MESSAGE   0: the sessions not in single-message mode (1)
 
 Files: $state_root/findings: findings.json (the board's list), ledger.json
 (the passes: what each covered and found, its session), agent.json (status),
-sessions/N.out (each session's output), tree/ (the HEAD snapshots), agent.out
-(the log), notes.md, wanted (started and not stopped).
+sessions/N.out (each session's output), tree/ (the HEAD snapshots), knowledge/
+(the notes on each area, INDEX.md, index.json), agent.out (the log),
+notes.md, wanted (started and not stopped).
 HELP
             return 0 ;;
     esac

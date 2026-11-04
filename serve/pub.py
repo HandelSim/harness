@@ -1068,6 +1068,17 @@ def make_handler(cfg):
                         return
                 self.send(404, b"not found\n", head=head)
                 return
+            if bits[0] == "findings" and len(bits) in (2, 4) and bits[1] == "notes":
+                if len(bits) == 2:
+                    self.send_runs(200, "harness: findings agent notes", runs_view.render_findings_notes(r), "",
+                                   head, "queue")
+                    return
+                got = runs_view.render_findings_note(r, bits[2], bits[3])
+                if got:
+                    self.send_runs(200, f"harness: {got[0]}", got[1], "", head, "queue")
+                    return
+                self.send(404, b"not found\n", head=head)
+                return
             if bits[0] == "debug" and len(bits) in (1, 3) and r.queue_dir:
                 if len(bits) == 1:
                     self.send_runs(200, "harness: debug reports", runs_view.render_debug_page(r), "", head, "queue")

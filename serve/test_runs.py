@@ -327,6 +327,34 @@ class RunsTest(RunsServer):
         self.assertEqual(r.status, 200)
         self.assertNotIn("Debug agent (", body)
 
+    def test_findings_agent_notes(self):
+        """The notes the findings agent's passes wrote: listed, one shown with its markdown
+        rendered and escaped, a bad name 404."""
+        k = os.path.join(os.path.dirname(self.queue), "findings", "knowledge")
+        os.makedirs(os.path.join(k, "repo-0123abcd"))
+        with open(os.path.join(k, "repo-0123abcd", "serve__api.md"), "w") as f:
+            f.write("# repo: serve/api/\n\n**handler.py** routes <script>x()</script> requests\n")
+        with open(os.path.join(k, "index.json"), "w") as f:
+            json.dump({"version": 1, "notes": [
+                {"repo": "/r/repo", "area": "serve/api", "file": "repo-0123abcd/serve__api.md", "session": "ses_9",
+                 "updated": "2026-11-04T10:00:00Z", "lens": "trace", "summary": "<b>handler</b> routes",
+                 "changed": True}]}, f)
+        self.start()
+        r, body = self.req("GET", "/runs/findings/notes")
+        self.assertEqual(r.status, 200)
+        self.assertIn("/runs/findings/notes/repo-0123abcd/serve__api", body)
+        self.assertIn("out of date", body)
+        self.assertIn("&lt;b&gt;handler&lt;/b&gt;", body)
+        self.assertIn("href='/runs/ses_9'", body)
+        r, body = self.req("GET", "/runs/findings/notes/repo-0123abcd/serve__api")
+        self.assertEqual(r.status, 200)
+        self.assertIn("<strong>handler.py</strong>", body)
+        self.assertNotIn("<script>x()", body)
+        for path in ("/runs/findings/notes/repo-0123abcd/nope", "/runs/findings/notes/..%2f..%2fqueue/x",
+                     "/runs/findings/notes/repo-0123abcd/..", "/runs/findings/notes/x"):
+            r, _ = self.req("GET", path)
+            self.assertEqual(r.status, 404, path)
+
     def test_queue_panel_says_what_each_ticket_waits_on(self):
         self.ticket()
         self.start()

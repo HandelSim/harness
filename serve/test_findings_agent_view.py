@@ -33,6 +33,43 @@ class Base(unittest.TestCase):
             json.dump(info, f)
 
 
+class KnowledgeTest(Base):
+    def write_notes(self):
+        k = os.path.join(self.state, "knowledge", "repo-0123abcd")
+        os.makedirs(k)
+        with open(os.path.join(k, "_top.md"), "w") as f:
+            f.write("# repo: ./\napp.py <does> things\n")
+        with open(os.path.join(self.root, "secret.md"), "w") as f:
+            f.write("not a note\n")
+        notes = [{"repo": "/r/repo", "area": ".", "file": "repo-0123abcd/_top.md", "updated": "2026-11-04T10:00:00Z",
+                  "session": "ses_1", "lens": "trace", "chars": 30, "summary": "app.py <does> things",
+                  "changed": True},
+                 {"repo": "/r/repo", "area": "x", "file": "../secret.md"},
+                 {"repo": "/r/repo", "area": "y", "file": "repo-0123abcd/../../x.md"},
+                 {"repo": "/r/repo", "area": "z", "file": 3}, "not a dict"]
+        with open(os.path.join(self.state, "knowledge", "index.json"), "w") as f:
+            json.dump({"version": 1, "notes": notes}, f)
+
+    def test_index_and_text_checked(self):
+        self.write_notes()
+        (e,) = fav.knowledge_index(self.state)
+        self.assertEqual((e["slug"], e["name"], e["area"], e["changed"], e["lens"]),
+                         ("repo-0123abcd", "_top", ".", True, "trace"))
+        self.assertIn("app.py <does>", fav.knowledge_text(self.state, "repo-0123abcd", "_top"))
+        for slug, name in (("..", "secret"), ("repo-0123abcd", ".."), ("repo-0123abcd", "../../secret"),
+                           (".", "secret"), ("repo-0123abcd", "nope"), ("", "_top")):
+            self.assertIsNone(fav.knowledge_text(self.state, slug, name), (slug, name))
+        self.assertEqual(fav.knowledge_index(os.path.join(self.root, "nowhere")), [])
+
+    def test_card_links_the_notes(self):
+        self.write_notes()
+        self.status(todo=2, units=40, counts={"trace": {"calls": 2, "notes": 3}})
+        h = fav.agent_card(self.state)
+        self.assertIn("<a href='/runs/findings/notes'>What it has learned</a> <span class='muted'>1 area note</span>", h)
+        self.assertIn("<dt>passes in the rotation</dt><dd>40</dd>", h)
+        self.assertIn("<td>trace</td><td>2</td><td>0</td><td>0</td><td>0</td><td>3</td>", h)
+
+
 class CardTest(Base):
     def test_never_started(self):
         h = fav.agent_card(self.state)
@@ -58,7 +95,7 @@ class CardTest(Base):
         self.assertIn("<div class='flash'>&lt;saved&gt;</div>", h)
         self.assertIn("action='/runs/findings/agent/stop'", h)
         self.assertNotIn("/runs/findings/agent/start", h)
-        self.assertIn("<td>bug</td><td>3</td><td>1</td><td>2</td><td>0</td>", h)
+        self.assertIn("<td>bug</td><td>3</td><td>1</td><td>2</td><td>0</td><td>0</td>", h)
         self.assertIn("exploring", h)   # an old agent.json's "scanning" is shown as exploring
         self.assertIn("Change the model in Settings (then Stop and Start)</a>", h)
 
