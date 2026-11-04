@@ -3972,6 +3972,31 @@ class NestedReposTest(Base):
         self.assertEqual(cat(os.path.join(self.project, "feature.txt")), "hello feature\n")
         self.assertEqual(cat(os.path.join(lib, "agent.txt")), "the agent was here\n")
 
+    def test_owner_comments_on_a_repository_inside_reach_the_fixer_by_its_path(self):
+        """The Changes page's comment on libA's part carries repo: the fixer, at the top, and the
+        verifier get libA/agent.txt, beside the top's own."""
+        self.ignored_libA()
+        os.environ.update(FAKE_NESTED="edit:libA", FAKE_TOP_UNCOMMITTED="1")
+        self.add_in_place("implement,review", "--no-branch")
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        stdin = [{"repo": "libA", "path": "agent.txt", "line": 1, "side": "new", "code": "the agent was here",
+                  "text": "say why"},
+                 {"path": "feature.txt", "line": 1, "side": "new", "code": "hello feature", "text": "and here"}]
+        with mock.patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(json.dumps(stdin).encode()))):
+            rc, out = self.q("fix", "ABC-1", "--stdin")
+        self.assertEqual(rc, 0, out)
+        must = ['libA/agent.txt:1 (new) "the agent was here": say why',
+                'feature.txt:1 (new) "hello feature": and here']
+        self.assertEqual(self.status()["must_fix"], must)
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("done", "done"), out + st.get("reason", ""))
+        self.assertIn("- " + "\n- ".join(must) + "\n<<<END_MUST_FIX>>>", cat(self.calls + ".fixing"))
+        check = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
+        self.assertIn('(owner) libA/agent.txt:1 (new) "the agent was here": say why', check)
+        self.assertIn("libA/agent.txt", check.split("<<<BEGIN_DIFF")[1])
+
     def test_no_branch_with_no_change_is_said(self):
         self.ignored_libA()
         os.environ["FAKE_NO_COMMIT"] = "1"

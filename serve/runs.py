@@ -916,6 +916,11 @@ class Runs:
         out["repos"] = {rel: {k: r[k] for k in ("branch", "base") if isinstance(r.get(k), str)}
                         for rel, r in (repos.items() if isinstance(repos, dict) else ())
                         if isinstance(rel, str) and isinstance(r, dict)}
+        # the repositories inside the project with a part of the ticket's change: a branch of its own
+        # (nested) or left uncommitted (a baseline snapshot)
+        out["parts"] = sorted({rel for k in ("nested", "baselines") if isinstance(st.get(k), dict)
+                               for rel, v in st[k].items()
+                               if isinstance(rel, str) and rel != "." and isinstance(v, dict)})
         want = st.get("stages")
         want = [s for s in want if isinstance(s, str)] if isinstance(want, list) and want else list(DEFAULT_STAGES)
         out["stages"] = [s for s in STAGES if s in want]
@@ -3541,6 +3546,12 @@ def ticket_action(runs, key, action, form):
             if c.get("path"):
                 item.update(path=str(c["path"])[:500], line=c.get("line"), side=c.get("side"),
                             code=str(c.get("code") or "")[:500])
+                repo = c.get("repo") or "."
+                if repo != ".":   # on a repository inside the project: one with a part of the ticket's change
+                    if not isinstance(repo, str) or repo not in st.get("parts", ()):
+                        return False, (f"a comment is on {str(repo)[:200]}, which has no part in {key}'s change; "
+                                       "remove it on the Changes page and send again")
+                    item["repo"] = repo
             items.append(item)
         if not items:
             return False, "no comments to send: click a line of the diff, or write a general comment"

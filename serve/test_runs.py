@@ -2443,8 +2443,8 @@ class DiffPageTest(RunsServer):
 
     def test_review_comments_only_on_the_work_view_of_a_ticket_the_queue_would_take_them_for(self):
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
-        self.assertIn("<section class='panel' id='dv-review' data-key='ABC-12' data-sent='0:' data-max='40' "
-                      "data-text-max='2000' data-nomem>", body)   # page memory leaves it to its own store
+        self.assertIn("<section class='panel' id='dv-review' data-key='ABC-12' data-sent='0:' data-repo='.' "
+                      "data-max='40' data-text-max='2000' data-nomem>", body)   # page memory leaves it to its own store
         self.assertIn("<form method='post' action='/runs/ticket/ABC-12/fix' id='dv-send'>", body)
         self.assertIn("Send 0 comments to the fixer", body)
         self.assertIn("function reviewer(box)", body)
@@ -2452,6 +2452,13 @@ class DiffPageTest(RunsServer):
             r, body = self.req("GET", "/runs/ticket/ABC-12/diff" + q)
             self.assertNotIn("id='dv-review'", body, q)
             self.assertNotIn("<p class='why'>Review comments", body, q)
+        # the top is on the ticket's branch: its uncommitted files are not what fix commits, said in one line
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
+        self.assertIn("<p class='muted' id='dv-elsewhere'>These uncommitted files are not what fix commits or the "
+                      "verifier reads: review comments go on <a href='/runs/ticket/ABC-12/diff?repo=.&amp;view=work'>"
+                      "The ticket's work</a>.</p>", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=uncommitted")
+        self.assertNotIn("dv-elsewhere", body)   # no part of the ticket's there: no work view to send them to
         self.ticket(project=self.proj, in_place=True, base_sha=self.base, status="queued", questions=[])
         r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
         self.assertIn("+work", self.shown(body))
@@ -2506,6 +2513,131 @@ class DiffPageTest(RunsServer):
         self.assertEqual((st["status"], st["stage"], st["must_fix_by"]), ("queued", "fix", "owner"))
         self.assertEqual(st["must_fix"], ['a.txt:2 (new) "work <b>line</b>": say why'])
         self.assertEqual(st["owner_reviews"][0]["items"], st["must_fix"])
+
+    # The work view of each repository of a ticket that leaves a part uncommitted (--no-branch, or one
+    # inside the project with no --repo-branch) or gives one inside it a branch: the part ticket_change
+    # takes there, with review comments that carry their repository to the fixer.
+
+    def snap(self, d):
+        """The files of d as they are, as the queue's take_baselines snapshots them."""
+        tq = runs._tq()
+        tree = tq.worktree_tree(tq.Queue(self.queue), {"key": "ABC-12", "project": self.proj}, d)
+        sha = self.git(d, "commit-tree", tree, "-m", "before")
+        self.git(d, "update-ref", "refs/harness-queue/base/ABC-12", sha)
+        return {"snap": sha, "head": self.git(d, "rev-parse", "HEAD")}
+
+    def no_branch(self):
+        """--no-branch: the top stays on main; the owner's own uncommitted edits (setUp's) are in the
+        snapshot, then the ticket's edits come on top, uncommitted."""
+        snap = self.snap(self.proj)
+        self.write(os.path.join(self.proj, "a.txt"), "one\nnot committed\nby the ticket\n")
+        self.write(os.path.join(self.proj, "b.txt"), "a new file of the ticket's\n")
+        self.ticket(project=self.proj, in_place=True, no_branch=True, base_sha=self.git(self.proj, "rev-parse", "HEAD"),
+                    baselines={".": snap}, status="done", stage="done", questions=[])
+        return snap
+
+    def test_a_no_branch_tickets_work_is_its_files_against_the_snapshot(self):
+        snap = self.no_branch()
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
+        self.assertEqual(r.status, 200, body)
+        self.assertIn("name='view' value='work' checked>", body)
+        self.assertNotIn("is not there any more", body)
+        self.assertIn("this repository&#x27;s part of the ticket is left uncommitted", body)
+        self.assertIn(f"<code>{snap['snap'][:12]} (refs/harness-queue/base/ABC-12) and the files in the folder</code>",
+                      body)
+        diff = self.shown(body)
+        self.assertIn(" not committed\n+by the ticket", diff)   # the owner's own edit is context, not the work
+        self.assertNotIn("+not committed", diff)
+        self.assertIn("+++ b/b.txt", diff)                      # a new file of the ticket's
+        self.assertNotIn("new.txt", diff)                       # the owner's, there before it started
+        self.assertNotIn("+work", diff)                         # the branch ABC-12 is not this ticket's
+        self.assertNotIn("TOKEN", diff)
+        self.assertIn("id='dv-review' data-key='ABC-12' data-sent='0:' data-repo='.'", body)
+        # the uncommitted view (HEAD and the files) has the owner's edits too: comments go to the work view
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?view=uncommitted")
+        self.assertIn("+not committed", self.shown(body))
+        self.assertNotIn("id='dv-review'", body)
+        self.assertIn("This repository's part of the ticket is left uncommitted, so what is shown here is its "
+                      "work and anything you had changed here before it started", body)
+        self.assertIn("<a href='/runs/ticket/ABC-12/diff?repo=.&amp;view=work'>The ticket's work</a>", body)
+        # the real queue takes a comment on it, the line numbered as the file is on disk
+        items = [{"path": "a.txt", "line": 3, "side": "new", "code": "by the ticket", "text": "say why"}]
+        r, body = self.act("fix", [("comments", json.dumps(items))])
+        self.assertEqual(r.status, 303, body)
+        st = self.state()
+        self.assertEqual((st["status"], st["stage"], st["must_fix_by"]), ("queued", "fix", "owner"))
+        self.assertEqual(st["must_fix"], ['a.txt:3 (new) "by the ticket": say why'])
+
+    def test_before_its_snapshot_a_no_branch_ticket_has_no_work_yet(self):
+        self.no_branch()
+        st = self.state()
+        st.pop("baselines")
+        self.ticket(**st)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff")
+        self.assertIn("the ticket has not started yet, so it has no work to show here: the snapshot", body)
+        self.assertEqual(self.shown(body), "")
+
+    def test_a_repository_inside_on_a_branch_of_the_tickets(self):
+        inner = os.path.join(self.proj, "libs", "inner")
+        base = self.git(inner, "rev-parse", "HEAD")
+        self.git(inner, "checkout", "-qb", "ABC-12")
+        self.write(os.path.join(inner, "y.txt"), "nested work\n")
+        self.git(inner, "add", "y.txt")
+        self.git(inner, "commit", "-qm", "nested work")
+        self.ticket(project=self.proj, in_place=True, base_sha=self.base, status="done", questions=[],
+                    repos={"libs/inner": {}}, nested={"libs/inner": {"branch": "ABC-12", "base_sha": base}})
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner")
+        self.assertIn("name='view' value='work' checked>", body)
+        self.assertIn("1 commit(s)", body)
+        self.assertIn(f"<code>{base[:12]}..ABC-12</code>", body)
+        diff = self.shown(body)
+        self.assertIn("+++ b/y.txt\n@@ -0,0 +1 @@\n+nested work", diff)   # the repository's own paths
+        self.assertNotIn("x.txt", diff)                                   # uncommitted there: not the branch's
+        self.assertIn("id='dv-review' data-key='ABC-12' data-sent='0:' data-repo='libs/inner'", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=uncommitted")
+        self.assertIn("These uncommitted files are not what fix commits or the verifier reads: review comments go on "
+                      "<a href='/runs/ticket/ABC-12/diff?repo=libs/inner&amp;view=work'>", body)
+        self.assertNotIn("id='dv-review'", body)
+        # a comment there goes to the fixer with the path from the top, where it works
+        items = [{"repo": "libs/inner", "path": "y.txt", "line": 1, "side": "new", "code": "nested work",
+                  "text": "say why"},
+                 {"path": "a.txt", "line": 2, "side": "new", "code": "work <b>line</b>", "text": "and here"}]
+        for bad in ("libs", "sub", "../x", 3):   # not a repository with a part of the ticket's change
+            r, body = self.act("fix", [("comments", json.dumps([dict(items[0], repo=bad)]))])
+            self.assertEqual(r.status, 409, bad)
+            self.assertIn("which has no part in ABC-12", body)
+        self.assertNotIn("must_fix", self.state())
+        r, body = self.act("fix", [("comments", json.dumps(items))])
+        self.assertEqual(r.status, 303, body)
+        self.assertEqual(self.state()["must_fix"], ['libs/inner/y.txt:1 (new) "nested work": say why',
+                                                    'a.txt:2 (new) "work <b>line</b>": and here'])
+
+    def test_a_repository_inside_left_uncommitted(self):
+        inner = os.path.join(self.proj, "libs", "inner")
+        snap = self.snap(inner)   # x.txt, untracked, was there before the work started: the owner's
+        self.write(os.path.join(inner, "x.txt"), "inner change\nby the ticket\n")
+        self.write(os.path.join(inner, "z.txt"), "a new one\n")
+        self.ticket(project=self.proj, in_place=True, base_sha=self.base, status="done", questions=[],
+                    baselines={"libs/inner": snap})
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner")
+        self.assertIn("name='view' value='work' checked>", body)
+        self.assertIn("this repository&#x27;s part of the ticket is left uncommitted", body)
+        diff = self.shown(body)
+        self.assertIn(" inner change\n+by the ticket", diff)
+        self.assertIn("+++ b/z.txt", diff)
+        self.assertNotIn("+inner change", diff)
+        self.assertIn("data-repo='libs/inner'", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff?repo=libs/inner&view=uncommitted")
+        self.assertIn("+inner change", self.shown(body))   # HEAD and the files: the owner's file too
+        self.assertIn("This repository's part of the ticket is left uncommitted", body)
+        self.assertNotIn("id='dv-review'", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/diff")   # the top, on its branch, as before
+        self.assertIn("+work", self.shown(body))
+        items = [{"repo": "libs/inner", "path": "x.txt", "line": 2, "side": "new", "code": "by the ticket",
+                  "text": "say why"}]
+        r, body = self.act("fix", [("comments", json.dumps(items))])
+        self.assertEqual(r.status, 303, body)
+        self.assertEqual(self.state()["must_fix"], ['libs/inner/x.txt:2 (new) "by the ticket": say why'])
 
 
 class LocalTimeTest(unittest.TestCase):

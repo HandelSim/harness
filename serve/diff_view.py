@@ -3,14 +3,20 @@ the vendored diff2html (vendor/README.md), of the repository picked from a list:
 the project's own, or for a ticket that works in the project folder any repository
 inside it (its own .git, not a submodule; the queue's nested_repos).
 
-Three views: the ticket's work (its branch since the commit it started from, what
-review reads), the uncommitted changes, and the commits not pushed yet. Read-only
-git: no fetch, no optional locks, no external diff or textconv programs. Files that
-look like secrets are left out of every diff (vault_view.SECRET).
+Three views: the ticket's work in that repository (its part of what
+ticket_queue.ticket_change takes for the change, what review, fix and the verifier
+read: its branch since the commit it started from, or for a part left uncommitted
+the files as they are against the snapshot taken when the work started), the
+uncommitted changes, and the commits not pushed yet. Read-only git (no fetch, no
+optional locks, no external diff or textconv programs), but for a part left
+uncommitted the queue's worktree_tree writes the files as they are into that
+repository's objects, through an index of its own, as review does. Files that look
+like secrets are left out of every diff (vault_view.SECRET).
 
-On the work view of a ticket the queue would take them for (harness queue fix), the
-owner clicks lines to comment on them, PR-review style; the comments wait in the
-browser (localStorage) and go to the fix stage all at once."""
+On the work view of a ticket the queue would take them for (harness queue fix), in
+any repository of the ticket's, the owner clicks lines to comment on them, PR-review
+style; the comments wait in the browser (localStorage) and go to the fix stage all
+at once, one on a repository inside the project with its "repo"."""
 
 import json
 import os
@@ -31,6 +37,9 @@ LOG_CAP = 50               # commits listed
 GIT_TIMEOUT = 20           # s
 VIEWS = {"work": "The ticket's work", "uncommitted": "Uncommitted changes", "unpushed": "Not pushed yet"}
 VIEW_SAYS = {"work": "the ticket's branch since the commit it started from: what review reads and push sends",
+             "left": ("this repository's part of the ticket is left uncommitted: the files as they are now (new "
+                      "files too) against the snapshot taken when the work started; what review, fix and the "
+                      "verifier read"),
              "uncommitted": "what is changed in the folder and not committed, new files included",
              "unpushed": "the commits on the branch the folder is on that its upstream does not have"}
 
@@ -82,7 +91,8 @@ def _state(runs, key):
 
 def repos(runs, st):
     """[(value, label)]: the project's repository, then the ones inside it when the
-    ticket works in the project folder (a copy holds only the project's own)."""
+    ticket works in the project folder (a copy holds only the project's own), and any
+    other one with a part of the ticket's change (a submodule of one left uncommitted)."""
     out = [(".", "the project itself (" + (os.path.basename(st["project"].rstrip("/\\")) or st["project"]) + ")")]
     tq = runs_view._tq()
     if st.get("in_place") is True and tq and os.path.isdir(st["project"]):
@@ -90,7 +100,46 @@ def repos(runs, st):
             out += [(r, r) for r in tq.nested_repos(st["project"], skip=(runs.queue_dir,))]
         except Exception:   # an odd folder: the project's own still shows
             pass
+        have = {r for r, _ in out}
+        out += [(r, r) for r in sorted(set(_dict(st, "nested")) | set(_dict(st, "baselines")))
+                if r not in have and isinstance(r, str) and os.path.isdir(os.path.join(st["project"], r))]
     return out
+
+
+def _dict(st, k):
+    return st.get(k) if isinstance(st.get(k), dict) else {}
+
+
+def part(st, repo):
+    """What the ticket's change is in repo, as ticket_queue.ticket_change takes it:
+    ("branch", branch, base) for the top on its branch or one inside the project given a
+    branch (--repo-branch, st["nested"]), ("left", snapshot, "") for one left uncommitted
+    (the top with --no-branch, the others inside it) once its snapshot is taken
+    (st["baselines"]), else None."""
+    def base(d):
+        return d.get("base_sha") if isinstance(d.get("base_sha"), str) else ""
+    if repo == "." and not st.get("no_branch"):
+        return "branch", st.get("branch") or st["key"], base(st)
+    n = _dict(st, "nested").get(repo) if repo != "." else None
+    if isinstance(n, dict) and isinstance(n.get("branch"), str) and n["branch"]:
+        return "branch", n["branch"], base(n)
+    b = _dict(st, "baselines").get(repo)
+    if isinstance(b, dict) and isinstance(b.get("snap"), str) and b["snap"]:
+        return "left", b["snap"], ""
+    return None
+
+
+def left_uncommitted(st, repo):
+    """repo's part of the ticket is (or will be) left uncommitted: it has no branch of the ticket's."""
+    if repo == ".":
+        return bool(st.get("no_branch"))
+    return repo in _dict(st, "baselines") or (repo not in _dict(st, "nested") and repo not in _dict(st, "repos"))
+
+
+def has_work_view(st, repo):
+    """The work view is there for the top, and for a repository inside the project with
+    a part of the change (or given a branch, before the work started)."""
+    return repo == "." or part(st, repo) is not None or repo in _dict(st, "repos")
 
 
 def _secret_free(diff):
@@ -151,23 +200,46 @@ def changes(runs, st, repo, view):
         d = project if st.get("in_place") is True else clone if os.path.isdir(clone) else None
     else:
         d = os.path.join(project, repo)
-    res = {"diff": "", "says": "", "notes": [], "commits": [], "error": ""}
+    res = {"diff": "", "says": "", "notes": [], "commits": [], "error": "", "kind": ""}
     if view == "work":
-        branch = st.get("branch") or key
-        base = st.get("base_sha") if isinstance(st.get("base_sha"), str) else ""
-        if not base:
-            res["error"] = "the ticket has not started yet, so it has no work to show"
+        got = part(st, repo)
+        res["kind"] = got[0] if got else ""
+        if not got or not got[1] or (got[0] == "branch" and not got[2]):
+            res["error"] = "the ticket has not started yet, so it has no work to show" + (
+                " here: the snapshot its change here is compared with is taken before the first stage after the plan"
+                if st.get("base_sha") and left_uncommitted(st, repo) else "")
             return res
-        if d and _git(d, "rev-parse", "-q", "--verify", f"refs/heads/{branch}^{{commit}}", cap=200)[0]:
-            where, tip = d, f"refs/heads/{branch}"
-        elif _git(project, "rev-parse", "-q", "--verify", f"refs/harness-queue/{key}^{{commit}}", cap=200)[0]:
-            where, tip = project, f"refs/harness-queue/{key}"
+        if got[0] == "left":
+            tq = runs_view._tq()
+            if tq is None:
+                res["error"] = ("the queue's own module could not be loaded, so these files cannot be read "
+                                "as review reads them")
+                return res
+            if not d or not os.path.isdir(d):
+                res["error"] = "the repository is gone from the project folder"
+                return res
+            try:   # the files as they are, as review takes them: the queue's own code, not a copy of it
+                tree = tq.worktree_tree(tq.Queue(runs.queue_dir), st, d)
+            except Exception:   # noqa: BLE001  git failed, or a folder git will not read
+                tree = ""
+            if not tree:
+                res["error"] = "git could not read this repository's files"
+                return res
+            res["says"] = f"{got[1][:12]} (refs/harness-queue/base/{key}) and the files in the folder"
+            res["diff"], cut = _git(d, *DIFF, got[1], tree, "--")
         else:
-            res["error"] = f"the branch {branch} is not there any more"
-            return res
-        res["says"] = f"{base[:12]}..{branch}"
-        res["commits"] = _log(where, f"{base}..{tip}")
-        res["diff"], cut = _git(where, *DIFF, base, tip, "--")
+            branch, base = got[1], got[2]
+            if d and _git(d, "rev-parse", "-q", "--verify", f"refs/heads/{branch}^{{commit}}", cap=200)[0]:
+                where, tip = d, f"refs/heads/{branch}"
+            elif repo == "." and _git(project, "rev-parse", "-q", "--verify",
+                                      f"refs/harness-queue/{key}^{{commit}}", cap=200)[0]:
+                where, tip = project, f"refs/harness-queue/{key}"
+            else:
+                res["error"] = f"the branch {branch} is not there any more"
+                return res
+            res["says"] = f"{base[:12]}..{branch}"
+            res["commits"] = _log(where, f"{base}..{tip}")
+            res["diff"], cut = _git(where, *DIFF, base, tip, "--")
     else:
         if not d or not os.path.isdir(d):
             res["error"] = "the separate copy is gone (the ticket finished or was reset), so there is nothing to show"
@@ -306,6 +378,7 @@ JS = r"""
   // the form sends them all as JSON. Everything shown is set as text, never as HTML.
   function reviewer(box) {
     var sent = box.dataset.sent, store = 'harness.review.' + box.dataset.key, got = null;
+    var repo = box.dataset.repo || '.';   // the repository this diff is of; a draft's comments can be on others
     try {
       got = JSON.parse(localStorage.getItem(store) || 'null');
       if (got && got.sent !== sent) { localStorage.removeItem(store); got = null; }
@@ -329,7 +402,8 @@ JS = r"""
     }
     function ok(c) {
       return !!c && typeof c.text === 'string' && !!c.text.trim() && (!c.path || (typeof c.path === 'string' &&
-        c.line > 0 && (c.side === 'new' || c.side === 'old') && typeof c.code === 'string'));
+        c.line > 0 && (c.side === 'new' || c.side === 'old') && typeof c.code === 'string' &&
+        (c.repo === undefined || (typeof c.repo === 'string' && !!c.repo))));
     }
     function keep() {   // the comments and what is being written, so a closed tab or a restart loses nothing
       var draft = open && open.text.trim() ? {i: open.i, at: open.at, text: open.text} : null, g = gen.value;
@@ -352,9 +426,12 @@ JS = r"""
       return b;
     }
     function where(c) {
-      return c.path ? c.path + ':' + c.line + (c.side === 'old' ? ' (old)' : '') : 'the whole change';
+      if (!c.path) return 'the whole change';
+      return (c.repo && c.repo !== '.' ? c.repo + '/' : '') + c.path + ':' + c.line + (c.side === 'old' ? ' (old)' : '');
     }
-    function at(c) { return rows[c.path + '\n' + c.side + '\n' + c.line]; }
+    function mine(c) { return (c.repo || '.') === repo; }   // on this diff's repository
+    function at(c) { return mine(c) ? rows[c.path + '\n' + c.side + '\n' + c.line] : undefined; }
+    function on(c) { return c.repo && c.repo !== '.' ? {repo: c.repo} : {}; }
     function put(tr, path, side, line, own) {
       rows[path + '\n' + side + '\n' + line] = rows[path + '\n' + side + '\n' + line] || tr;
       if (own) tr.dvAt = {path: path, side: side, line: line};
@@ -439,7 +516,8 @@ JS = r"""
         items[open.i].text = text;
       } else {
         if (items.length >= max) { alert(full); return; }
-        items.push({path: open.at.path, line: open.at.line, side: open.at.side, code: open.at.code, text: text});
+        items.push(Object.assign(on(open.at), {path: open.at.path, line: open.at.line, side: open.at.side,
+                                               code: open.at.code, text: text}));
       }
       open = null;
       keep();
@@ -476,11 +554,15 @@ JS = r"""
         if (tr && !(open && open.i === i)) place(tr, note(c, i));
       });
       if (open && at(open.at)) place(at(open.at), editor());
-      else open = null;
+      else if (open && mine(open.at)) open = null;   // its line is gone; one on another repository waits there
       list.textContent = '';
       items.forEach(function (c, i) {
         var li = node('li'), acts = node('div', 'dv-row');
-        li.appendChild(node('b', '', where(c)));
+        var head = li.appendChild(node(c.path && !mine(c) ? 'a' : 'b', '', where(c)));
+        if (c.path && !mine(c)) {
+          head.href = '?repo=' + encodeURIComponent(c.repo || '.') + '&view=work';
+          head.title = 'on another repository of the ticket: its work view';
+        }
         if (c.code && c.code.trim()) li.appendChild(node('code', '', ' ' + c.code.trim()));
         li.appendChild(node('div', 'txt', c.text));
         acts.appendChild(btn('Edit', function () { edit(i); }));
@@ -497,11 +579,11 @@ JS = r"""
     el.addEventListener('click', function (e) {
       var tr = e.target.closest ? e.target.closest('tr') : null;
       if (!tr || !tr.dvAt || String(window.getSelection ? window.getSelection() : '')) return;
-      if (open && open.text.trim() && !confirm('Drop the comment you are writing?')) return;
+      if (open && open.text.trim() && !confirm('Drop the comment you are writing on ' + where(open.at) + '?')) return;
       if (items.length >= max) { alert(full); return; }
       var ctn = tr.querySelector('.d2h-code-line-ctn'), code = ctn ? ctn.textContent : '';
-      open = {i: -1, text: '', at: {path: tr.dvAt.path, side: tr.dvAt.side, line: tr.dvAt.line,
-                                     code: code.length > 160 ? code.slice(0, 157) + '...' : code}};
+      open = {i: -1, text: '', at: Object.assign(on({repo: repo}), {path: tr.dvAt.path, side: tr.dvAt.side,
+        line: tr.dvAt.line, code: code.length > 160 ? code.slice(0, 157) + '...' : code})};
       paint();
     });
     add.addEventListener('click', function () {
@@ -523,7 +605,8 @@ JS = r"""
         return;
       }
       form.elements.comments.value = JSON.stringify(items.map(function (c) {
-        return c.path ? {path: c.path, line: c.line, side: c.side, code: c.code, text: c.text} : {text: c.text};
+        return c.path ? Object.assign(on(c), {path: c.path, line: c.line, side: c.side, code: c.code, text: c.text})
+          : {text: c.text};
       }));
     });
     window.addEventListener('resize', even);
@@ -541,10 +624,12 @@ JS = r"""
 """
 
 
-def _review(runs, key, st):
-    """(the hint over the diff, the panel under it) for review comments on the work view:
-    the comment box and send button when harness queue fix would take them, else why not.
-    data-sent marks the batches sent so far: the browser drops a draft made before the last."""
+def _review(runs, key, st, repo):
+    """(the hint over the diff, the panel under it) for review comments on the work view
+    of repo: the comment box and send button when harness queue fix would take them, else
+    why not. data-sent marks the batches sent so far: the browser drops a draft made
+    before the last. data-repo: the comments made here are on that repository's files
+    (the draft is one for the ticket, its comments on any of them)."""
     why = runs.fix_refused(key)
     if why is None:
         return "", ""
@@ -557,9 +642,11 @@ def _review(runs, key, st):
     return ("<p class='muted'>Click a line to comment on it; <a href='#dv-review'>the comments</a> go to the "
             "fixer from the bottom of the page.</p>",
             f"<section class='panel' id='dv-review' data-key='{esc(key)}' data-sent='{esc(mark)}' "
-            f"data-max='{runs_view.FIX_MAX}' data-text-max='{runs_view.FIX_TEXT_MAX}' data-nomem><h2>Review comments</h2>"
+            f"data-repo='{esc(repo)}' data-max='{runs_view.FIX_MAX}' data-text-max='{runs_view.FIX_TEXT_MAX}' "
+            "data-nomem><h2>Review comments</h2>"
             "<div class='muted'>Click a line of the diff to comment on it, or comment on the whole change here. "
-            "The comments wait in this browser until you send them; then they all go straight to the fix stage, "
+            "The comments wait in this browser until you send them, those on the ticket's other repositories "
+            "with them; then they all go straight to the fix stage, "
             "which does them and commits (a new plan is a follow-up, on the ticket's page).</div>"
             "<ol id='dv-list' class='dv-list'></ol>"
             f"<textarea id='dv-gen' maxlength='{runs_view.FIX_TEXT_MAX}' rows='3' "
@@ -579,11 +666,15 @@ def page(runs, key, query):
     repo = (query.get("repo") or ["."])[0]
     bad = "" if repo in dict(choices) else f"not a repository of this ticket: {repo[:200]}"
     repo = repo if not bad else "."
-    can = [v for v in VIEWS if v != "work" or repo == "."]
+    can = [v for v in VIEWS if v != "work" or has_work_view(st, repo)]
     view = (query.get("view") or [""])[0]
     if view not in can:
-        view = "work" if repo == "." and st.get("base_sha") else "uncommitted"
+        view = "work" if "work" in can and st.get("base_sha") else "uncommitted"
     res = changes(runs, st, repo, view)
+    left = left_uncommitted(st, repo)
+
+    def says(v):
+        return VIEW_SAYS["left" if v == "work" and left else v]
     href = f"/runs/ticket/{quote(key)}"
     opts = "".join(f"<option value='{esc(v)}'{' selected' if v == repo else ''}>{esc(label)}</option>"
                    for v, label in choices)
@@ -591,7 +682,7 @@ def page(runs, key, query):
     for v, label in VIEWS.items():
         off = v not in can
         radios.append(f"<label class='{'off' if off else ''}' title='"
-                      + esc("only the project's own repository has the ticket's branch" if off else VIEW_SAYS[v])
+                      + esc("the ticket's change has no part in this repository" if off else says(v))
                       + f"'><input type='radio' name='view' value='{v}'{' checked' if v == view else ''}"
                       f"{' disabled' if off else ''}>{esc(label)}</label>")
     only = ("" if st.get("in_place") is True else
@@ -605,10 +696,21 @@ def page(runs, key, query):
              f"<label class='dv-repo'>Repository<select name='repo'>{opts}</select></label>"
              f"<div class='dv-pick dv-views' role='radiogroup' aria-label='What to show'>{''.join(radios)}</div>"
              "<noscript><button type='submit'>Show</button></noscript></form>"
-             f"<div class='muted'>{esc(VIEW_SAYS[view])}" + (f": <code>{esc(res['says'])}</code>" if res["says"] else "")
+             f"<div class='muted'>{esc(says(view))}" + (f": <code>{esc(res['says'])}</code>" if res["says"] else "")
              + f"</div>{only}</section>"]
     if bad:
         parts.append(runs_view._flash(bad + "; showing the project's own", True))
+    if view == "uncommitted" and "work" in can and runs_view._tq() is not None:
+        # comments go on one view only: there an old line number means the snapshot (or the base), here it
+        # would mean HEAD, and the draft is one for the ticket
+        work = f"<a href='{href}/diff?repo={quote(repo)}&amp;view=work'>The ticket's work</a>"
+        parts.append("<p class='muted' id='dv-elsewhere'>" + (
+            "This repository's part of the ticket is left uncommitted, so what is shown here is its work and "
+            "anything you had changed here before it started: this view compares with HEAD. Review comments go "
+            f"on {work}, which compares the same files with the snapshot taken when the work started: what "
+            "review, fix and the verifier read." if left else
+            "These uncommitted files are not what fix commits or the verifier reads: review comments go on "
+            f"{work}.") + "</p>")
     if res["error"]:
         parts.append(f"<section class='panel'><b>Nothing to show:</b> {esc(res['error'])}.</section>")
         return f"{key} changes", parts, JS
@@ -622,7 +724,7 @@ def page(runs, key, query):
         parts.append("<section class='panel'>No changes.</section>")
         return f"{key} changes", parts, JS
     data = json.dumps(res["diff"]).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    hint, review = _review(runs, key, st) if view == "work" and repo == "." else ("", "")
+    hint, review = _review(runs, key, st, repo) if view == "work" else ("", "")
     parts += [hint, "<div class='dv-lay'><button type='button' class='btn sm' data-lay='side-by-side'>Side by side</button>"
               "<button type='button' class='btn sm' data-lay='line-by-line'>One column</button></div>",
               f"<script type='application/json' id='dv-data'>{data}</script><div id='d2h'></div>", review]
