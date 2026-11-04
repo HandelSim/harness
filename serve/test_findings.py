@@ -262,6 +262,24 @@ class Render(Base):
         self.assertIn("<code>serve/runs.py:120</code>", h)
         self.assertNotIn("findings-archived", h)
 
+    def test_a_long_finding_reads_in_full(self):
+        long = "the whole story <b> " + "and more of it " * 150 + "THE-END"
+        self.agent({"version": 1, "findings": [
+            {"id": "f-cccccccccccc", "category": "bug", "severity": "low", "title": "T " * 200 + "TITLE-END",
+             "detail": long, "evidence": "x = <y>", "path": "a.py", "line": 2, "project": "/p/q"}]})
+        fv._CACHE.clear()
+        h = fv.findings_region(self.runs)
+        self.assertIn("<details class='fx' data-k='fx-f-cccccccccccc'>", h)   # opened in place, kept open by the poll
+        self.assertRegex(h, r"<p class='fbx'>[^<]*THE-END</p>")   # the detail, shown, not cut to a line
+        self.assertIn("the whole story &lt;b&gt;", h)
+        self.assertNotIn("<b>", h)
+        self.assertIn("<code>x = &lt;y&gt;</code>", h)
+        self.assertNotIn("title='T T", h)                 # no longer only in a hover tooltip
+        # a ticket's finding longer than its title opens to its whole text too
+        self.note("ABC-1", "- a.py:1: " + "word " * 100 + "NOTE-END (seen while reviewing ABC-1)\n")
+        fv._CACHE.clear()
+        self.assertRegex(fv.findings_region(self.runs), r"<p class='fbx'>[^<]*NOTE-END</p>")
+
     def test_archived_folded(self):
         ids = self.open_ids()
         fv.action(self.runs, "archive", {"id": [ids[0]]})

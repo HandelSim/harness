@@ -45,6 +45,20 @@ case "${STUB_MODE:-find}" in
         echo "- **FINDING-$nonce** | bug | high | app.py:6 | divides by zero | \`return a / b\` | lib/use.py calls ratio(1, 0)"
         echo "FINDING-$nonce | bug | low | ./app.py:9 | made up | not in the code at all | x"
         echo "FINDING-00000000 | bug | high | app.py:6 | another nonce | return a / b | x"
+        echo "KNOWLEDGE-$nonce"
+        echo "# repo: ./"
+        echo "app.py holds ratio(a, b), which divides a by b and leaves the check of b to its callers,"
+        echo "and total(items), which sums a list. Entry points: none of its own; lib/use.py imports ratio."
+        echo "Traced: lib/use.py -> ratio(1, 0) -> ZeroDivisionError at import time. Trap: b is never checked."
+        echo "Left to look at: whether anything else ever calls total."
+        echo "END-KNOWLEDGE-$nonce"
+        echo "KNOWLEDGE-$nonce lib/"
+        echo "lib/use.py is a script, not a module: importing it runs print(ratio(1, 0)), which raises at once."
+        echo "It depends on app.py being importable from the working folder; nothing else in the repository"
+        echo "imports it. When changing ratio, this is the one caller that passes a zero divisor on purpose."
+        echo "END-KNOWLEDGE-$nonce"
+        echo "KNOWLEDGE-$nonce nowhere"
+        echo "a note on an area the repository does not have: dropped, however long it is ............"
         echo "COVERED-$nonce | app.py and its callers in lib/" ;;
   none) session; echo "COVERED-$nonce | looked, nothing" ;;
   noend) session; echo "I ran out of steps" ;;
@@ -127,6 +141,28 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(fa.parse_session("COVERED-ab12cd34 | x", "ab12cd34"), ([], "x"))
 
 
+class KnowledgeTest(unittest.TestCase):
+    def test_parse_blocks(self):
+        text = ("Some talk.\n**KNOWLEDGE-ab12cd34**\n```markdown\n# r: ./\nbody one\n```\nEND-KNOWLEDGE-ab12cd34\n"
+                "KNOWLEDGE-ab12cd34 | lib/sub/\nbody two\n"
+                "KNOWLEDGE-ab12cd34 docs\nbody three\nFINDING-ab12cd34 | bug | low | a.py:1 | t | e | d\n"
+                "KNOWLEDGE-ffffffff x\nother nonce\nCOVERED-ab12cd34 | x\n")
+        self.assertEqual(fa.parse_knowledge(text, "ab12cd34"),
+                         [("", "# r: ./\nbody one"), ("lib/sub", "body two"), ("docs", "body three")])
+        self.assertEqual(fa.parse_knowledge("KNOWLEDGE-ab12cd34\nto the end", "ab12cd34"), [("", "to the end")])
+        self.assertEqual(fa.parse_knowledge("nothing", "ab12cd34"), [])
+
+    def test_refusal_and_slugs(self):
+        good = "app.py does things. " * 20
+        self.assertEqual(fa.knowledge_refusal(good, "", ["d/app.py"]), "")
+        self.assertIn("too short", fa.knowledge_refusal("app.py", "", ["app.py"]))
+        self.assertIn("would replace", fa.knowledge_refusal(good, good * 3, ["app.py"]))
+        self.assertIn("names none", fa.knowledge_refusal("x" * 400, "", ["app.py"]))
+        self.assertEqual((fa.name_slug("."), fa.name_slug("lib/sub"), fa.name_slug("../x")),
+                         ("_top", "lib__sub", "x"))
+        self.assertEqual(fa.note_summary("# r: ./\n\n- **app.py** holds ratio\nmore"), "**app.py** holds ratio")
+
+
 class ValidateTest(unittest.TestCase):
     lines = ["def f(a, b):", "    x = alpha | beta", "    if x:", "        return compute(x)", "    return None"]
 
@@ -165,9 +201,10 @@ class UnitsTest(unittest.TestCase):
                           "docs/a.md": "doc", "conf/c.yml": "config", "serve/page.py": "code"})
         files["lib/skip.py"] = {"skip": True}
         got = sorted(u.key for u in fa.units_of("/r", files))
-        self.assertEqual(got, sorted(["/r:.:bug", "/r:.:cleanup", "/r:lib:bug", "/r:lib:cleanup",
-                                      "/r:lib/sub:bug", "/r:lib/sub:cleanup", "/r:docs:cleanup",
-                                      "/r:serve:bug", "/r:serve:ui", "/r:serve:cleanup"]))
+        self.assertEqual(got, sorted(["/r:.:bug", "/r:.:trace", "/r:.:cleanup", "/r:lib:bug", "/r:lib:trace",
+                                      "/r:lib:cleanup", "/r:lib/sub:bug", "/r:lib/sub:trace",
+                                      "/r:lib/sub:cleanup", "/r:docs:cleanup", "/r:serve:bug",
+                                      "/r:serve:trace", "/r:serve:ui", "/r:serve:cleanup"]))
         (lib,) = [u for u in fa.units_of("/r", files) if u.key == "/r:lib:bug"]
         self.assertEqual(lib.files, ["lib/use.py"])
         # the area's sha moves with any of its files' blobs, and only with them
@@ -190,13 +227,21 @@ class UnitsTest(unittest.TestCase):
             us[6].key: {"failures": 1, "fail_sha": "sha-later", "defer_until": t + 60},
             us[7].key: {"sha": "sha-prompt", "prompt": "old-notes", "scanned": t - 10},
         }
-        got = [(u.area, u.lens) for u in fa.due(us, led, "h", t)]
-        self.assertEqual(got, [("new", "bug"), ("prompt", "bug"), ("changed", "cleanup"), ("new", "cleanup"),
-                               ("old", "bug")])
-        led[us[5].key]["tried"] = t - 4 * 86400   # ... and after RESCAN_DAYS, unchanged
-        self.assertIn(("aside", "bug"), [(u.area, u.lens) for u in fa.due(us, led, "h", t)])
-        led[us[5].key].update(tried=t - 3600, fail_sha="older")   # a set-aside pass whose area changed comes back
-        self.assertIn(("aside", "bug"), [(u.area, u.lens) for u in fa.due(us, led, "h", t)])
+        def order():
+            first, rest = fa.due(us, led, "h", t)
+            return [(u.area, u.lens) for u in first], [(u.area, u.lens) for u in rest]
+        first, rest = order()
+        self.assertEqual(first, [("new", "bug"), ("prompt", "bug"), ("changed", "cleanup"), ("new", "cleanup")])
+        # never out of work: every other pass comes again, the one explored longest ago first
+        self.assertEqual(rest, [("old", "bug"), ("fresh", "bug")])
+        led[us[5].key]["tried"] = t - fa.SET_ASIDE - 1   # a set-aside pass comes back after SET_ASIDE...
+        self.assertIn(("aside", "bug"), order()[0])
+        led[us[5].key].update(tried=t - 3600, fail_sha="older")   # ... or as soon as its area changed
+        self.assertIn(("aside", "bug"), order()[0])
+        for u in us:   # all done and unchanged: still a full rotation
+            led[u.key] = {"sha": u.sha, "prompt": "h", "scanned": t - 10}
+        first, rest = order()
+        self.assertEqual((first, len(rest)), ([], len(us)))
 
     def test_prompt(self):
         u = fa.Unit("/x/repo", "serve", "bug", ["serve/a.py", "serve/b.py"], "s")
@@ -207,6 +252,20 @@ class UnitsTest(unittest.TestCase):
             self.assertIn(want, p)
         order = [p.index(x) for x in ("my notes", "the parser", "old one", "FINDING-abc12345")]
         self.assertEqual(order, sorted(order))
+
+    def test_prompt_with_the_area_s_note_and_map_only(self):
+        u = fa.Unit("/x/repo", "serve", "trace", ["serve/a.py"], "s")
+        p = fa.build_prompt(u, "", ["serve/a.py:3 old one"], [], "abc12345", note="# repo: serve/\nNOTE-BODY",
+                            note_old=True, has_notes=True)
+        for want in ("NOTE-BODY", "changed since", fa.NOTES_IN_TREE + "/INDEX.md", "KNOWLEDGE-abc12345",
+                     "END-KNOWLEDGE-abc12345", "FINDING-abc12345", fa.QUESTIONS["trace"]):
+            self.assertIn(want, p)
+        self.assertLess(p.index("NOTE-BODY"), p.index("KNOWLEDGE-abc12345"))
+        m = fa.build_prompt(u, "", ["serve/a.py:3 old one"], [], "abc12345", map_only=True)
+        self.assertIn("board is full", m)
+        self.assertNotIn("FINDING-abc12345 |", m)
+        self.assertNotIn("serve/a.py:3", m)
+        self.assertIn("no note yet", fa.build_prompt(u, "", [], [], "abc12345"))
 
     def test_kinds(self):
         self.assertEqual(fa.file_kind("a.py", "x = 1\n"), "code")
@@ -375,6 +434,49 @@ class PassTest(StubCase):
             fa.main(["status", "--state", self.state])
         self.assertIn("1 open", out.getvalue())
 
+    def test_a_pass_writes_its_notes_and_the_next_passes_read_them(self):
+        repo = make_repo({"app.py": APP, "lib/use.py": USE})
+        self.assertEqual(self.run_once(repo).returncode, 0)
+        kdir = os.path.join(self.state, "knowledge", fa.repo_slug(repo))
+        with open(os.path.join(kdir, "_top.md")) as f:
+            top = f.read()
+        self.assertTrue(top.startswith("# repo: ./"))
+        self.assertIn("ratio(1, 0)", top)
+        self.assertTrue(os.path.isfile(os.path.join(kdir, "lib.md")))   # another area, corrected in passing
+        self.assertEqual(sorted(os.listdir(kdir)), ["INDEX.md", "_top.md", "lib.md"])   # "nowhere" dropped
+        with open(os.path.join(kdir, "INDEX.md")) as f:
+            index = f.read()
+        self.assertIn("- ./ (_top.md): app.py holds ratio", index)
+        self.assertIn("- lib/ (lib.md)", index)
+        listing = self.read("knowledge/index.json")["notes"]
+        self.assertEqual(sorted((n["area"], n["changed"], n["session"]) for n in listing),
+                         [(".", False, "ses_stub1"), ("lib", False, "ses_stub1")])
+        self.assertEqual(self.read("ledger.json")["passes"][0]["notes"], [".", "lib"])
+        # the next pass (lib/, bug) gets lib/'s note in its prompt and every note in its snapshot
+        self.assertEqual(self.run_once(repo, mode="none").returncode, 0)
+        with open(self.log + ".prompt") as f:
+            prompt = f.read()
+        self.assertIn("Start from the area lib/", prompt)
+        self.assertIn("importing it runs print(ratio(1, 0))", prompt)
+        cwd = [x for x in self.stub_log().splitlines() if x.startswith("cwd=")][-1][4:]
+        self.assertTrue(os.path.isfile(os.path.join(cwd, fa.NOTES_IN_TREE, "INDEX.md")))
+        self.assertTrue(os.path.isfile(os.path.join(cwd, fa.NOTES_IN_TREE, "lib.md")))
+        # a later note on ./ replaces the old one, which is kept as .prev; a much shorter one is refused
+        w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
+        w.refresh()
+        u = [x for x in w.units[repo] if x.area == "." and x.lens == "trace"][0]
+        new = top + "\nAlso traced: total(items) is unused.\n" + "More on how ratio is used. " * 30
+        self.assertEqual(w.take_notes(u, [("", new)], "ses_x"), ["."])
+        with open(os.path.join(kdir, "_top.md.prev")) as f:
+            self.assertEqual(f.read(), top)
+        self.assertEqual(w.take_notes(u, [("", "# r\napp.py " + "x" * 300)], "ses_y"), [])
+        # the area changes: its note is marked out of date
+        commit(repo, {"app.py": APP + "# more\n"})
+        w.refresh()
+        listing = {n["area"]: n for n in self.read("knowledge/index.json")["notes"]}
+        self.assertEqual((listing["."]["changed"], listing["lib"]["changed"]), (True, False))
+        self.assertTrue(w.note_old([x for x in w.units[repo] if x.area == "."][0]))
+
     def test_known_findings_are_not_kept_twice_and_go_into_the_prompt(self):
         repo = make_repo({"app.py": APP})
         w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
@@ -447,14 +549,19 @@ class PassTest(StubCase):
         self.assertEqual(waits, [(7.0, "backoff")])
         self.assertNotIn("failures", w.ledger["units"].get(f"{repo}:.:bug") or {})
 
-    def test_board_full_pauses(self):
+    def test_board_full_writes_notes_only(self):
         repo = make_repo({"app.py": APP})
         store = {"version": 1, "findings": [{"id": f"f-{i:012x}", "status": "open", "project": "/x", "path": "p",
                                              "title": f"t{i}", "line": 1} for i in range(3)]}
         with open(os.path.join(self.state, "findings.json"), "w") as f:
             json.dump(store, f)
         self.assertEqual(self.run_once(repo, extra_env={"FINDINGS_OPEN_MAX": "3"}).returncode, 0)
-        self.assertEqual(self.stub_log(), "")
+        self.assertIn("pass=1", self.stub_log())   # the agent keeps working...
+        with open(self.log + ".prompt") as f:
+            self.assertIn("board is full", f.read())
+        self.assertEqual(len(self.read("findings.json")["findings"]), 3)   # ... but adds no finding
+        self.assertTrue(os.path.isfile(os.path.join(self.state, "knowledge", fa.repo_slug(repo), "_top.md")))
+        self.assertEqual(self.read("ledger.json")["passes"][-1]["found"], 0)
         self.assertIn("board full", self.read("agent.json").get("reason", ""))
 
     def test_stale_and_moved(self):

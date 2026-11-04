@@ -184,8 +184,8 @@ def _ticket_findings(runs, key):
         path, line, rest, stage = _split(text)
         md = f"- {text}" + ("" if key in text else f" ({key})")
         out.append({"id": ticket_id(key, text), "src": key, "key": key, "cat": "", "sev": "", "stage": stage,
-                    "title": rest[:TITLE_MAX], "text": text[:TEXT_MAX], "path": path, "line": line, "ms": ms,
-                    "pos": pos, "md": md, "project": ""})
+                    "title": rest[:TITLE_MAX], "text": text[:TEXT_MAX], "body": rest[:TEXT_MAX], "evidence": "",
+                    "path": path, "line": line, "ms": ms, "pos": pos, "md": md, "project": ""})
     return out
 
 
@@ -243,7 +243,7 @@ def parse_agent(text):
             f" ({tags}, findings agent)" if tags else " (findings agent)")
         out.append({"id": fid, "src": "agent", "key": "", "cat": cat, "sev": sev, "stage": "",
                     "title": title or detail[:TITLE_MAX], "text": f"{title}: {detail}" if title and detail else title or detail,
-                    "path": path, "line": line, "ms": iso_ms(f.get("found_at")), "pos": pos, "md": md,
+                    "body": detail, "evidence": _str(f.get("evidence"), 500), "path": path, "line": line, "ms": iso_ms(f.get("found_at")), "pos": pos, "md": md,
                     "project": project})
     return out
 
@@ -469,9 +469,15 @@ def _row(f, archived=False, new=False):
                 f"<input type='checkbox' class='fsel' name='sel' value='{fid}' aria-label='select this finding'>")
         acts = (f"<button type='submit' class='sm' name='id' value='{fid}' "
                 "title='off the board, into Archived below'>Archive</button>")
+    # the whole finding, opened in place (the poll keeps it open: data-k)
+    body = f.get("body") or ""
+    full = (f"<p class='fbx'>{esc(body)}</p>" if body and body != f["title"] else "") + (
+        f"<p class='fev'><span class='muted'>evidence</span> <code>{esc(f['evidence'])}</code></p>"
+        if f.get("evidence") else "")
     return (f"<div class='fd' data-sort-key='{fid}' data-src='{esc(f['src'])}' data-cat='{esc(f['cat'])}' "
-            f"data-md='{esc(f['md'])}'>{lead}<div class='fmain'><div class='ft'>{tags}"
-            f"<span class='tl' title='{esc(f['text'])}'>{esc(f['title'])}</span></div>"
+            f"data-md='{esc(f['md'])}'>{lead}<div class='fmain'><details class='fx' data-k='fx-{fid}'>"
+            f"<summary class='ft' title='show the whole finding'>{tags}"
+            f"<span class='tl'>{esc(f['title'])}</span></summary>{full}</details>"
             f"<div class='fm'>{meta}</div></div>"
             f"<div class='ra'><button type='button' class='sm' data-fcopy='1' title='copy it as a markdown line'>Copy"
             f"</button>{acts}</div></div>")
@@ -549,6 +555,13 @@ FINDINGS_CSS = """
 .fd .fmain { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .fd .ft { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .fd .ft .tl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; min-width: 0; }
+.fd .fx > summary { cursor: pointer; list-style: none; }
+.fd .fx > summary::-webkit-details-marker { display: none; }
+.fd .fx > summary::after { content: "\25B8"; color: var(--faint); font-size: 11px; flex: none; }
+.fd .fx[open] > summary::after { content: "\25BE"; }
+.fd .fx[open] .tl { white-space: normal; overflow-wrap: anywhere; }
+.fd .fx .fbx, .fd .fx .fev { margin: 6px 0 2px; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.fd .fx .fev code { font: 12px var(--mono); }
 .fd .fm { display: flex; flex-wrap: wrap; gap: 2px 14px; font-size: 12px; color: var(--muted); min-width: 0; }
 .fd .fm code { font: 11.5px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
 .fd .pill { height: 18px; padding: 0 7px; font-size: 11px; }

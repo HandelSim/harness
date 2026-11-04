@@ -5546,7 +5546,9 @@ host_proxy_refresh() {
     # A restart drops the requests in flight, so not under a working harness.
     # The proxy's code is in its fingerprint: the first launch after they all
     # end starts it on the new code.
-    others=$(host_proxy_others)
+    # A harness serve upgrading from its u key restarts right after, so its
+    # lease does not keep the old proxy.
+    others=$(host_proxy_others | grep -vxF "${HARNESS_UPGRADE_FROM_SERVE:-x}" || true)
     if [[ -n "$others" ]]; then
         echo "[harness] the host proxy keeps the old code while other harnesses use it (pid $(echo $others)); it restarts on the new code once they end"
         return 0
@@ -8469,6 +8471,13 @@ harness_serve_refresh() {
     local f pid port stamp now i
     f=$(serve_pidfile)
     read -r pid port stamp _ <"$f"
+    # Run from that serve's u key: it waits on this upgrade, so it restarts
+    # (the USR1 is seen) once the upgrade is done; waiting here would hang.
+    if [[ "${HARNESS_UPGRADE_FROM_SERVE:-}" == "$pid" ]]; then
+        kill -USR1 "$pid" 2>/dev/null || true
+        echo "[harness] harness serve restarts on the new code when this upgrade is done"
+        return 0
+    fi
     echo "[harness] restarting harness serve (port $port) on the new code"
     if ! kill -USR1 "$pid" 2>/dev/null; then
         err "could not reach harness serve (pid $pid): stop it (Ctrl-C) and run harness serve again"
@@ -8509,6 +8518,64 @@ _serve_end() {
     # page Ctrl-C did not reach) ends too, so nothing is left running.
     harness_view_stop --port "$port" --opencode-port "$oc_port"
     trap - INT    # an exec'd serve inherits an ignored INT for good
+}
+
+# Whether this shell is the terminal's foreground job: a background one that
+# reads the terminal is stopped (SIGTTIN), and one that sets its modes (read
+# -s) changes them under the shell in front.
+_serve_tty_foreground() {
+    local st pg="" tp=""
+    if [[ -r "/proc/$$/stat" ]]; then
+        read -r st <"/proc/$$/stat" 2>/dev/null || return 1
+        st=${st##*) }   # past "pid (name) ": state ppid pgrp session tty tpgid
+        read -r _ _ pg _ _ tp _ <<<"$st"
+    else
+        read -r pg tp _ < <(ps -o pgid= -o tpgid= -p "$$" 2>/dev/null) || return 1
+    fi
+    [[ "$pg" =~ ^[0-9]+$ && "$pg" == "$tp" ]]
+}
+
+# harness serve's u key: harness upgrade in this terminal, once confirmed.
+# Its harness_serve_refresh sends this serve the USR1 that restarts it on
+# the new code when the upgrade is done (it cannot wait for that here). A
+# Ctrl-C in the upgrade ends the upgrade only; serve goes on.
+_serve_key_upgrade() {
+    local ans="" rc=0
+    printf '[harness] serve: run harness upgrade now? serve, opencode web with it, then restarts on the new code [y/N] ' >&2
+    read -rsn1 -t 60 ans || ans=""
+    echo "${ans:-n}" >&2
+    [[ "$ans" == [yY] ]] || { echo "[harness] serve: not upgrading" >&2; return 0; }
+    trap ':' INT
+    HARNESS_UPGRADE_FROM_SERVE=$$ "$clone_dir/harness" upgrade || rc=$?
+    trap 'exit 130' INT
+    (( serve_restart )) && return 0
+    if (( rc )); then
+        err "serve: harness upgrade did not finish (status $rc); serve goes on, on the code it started with (u to try again)"
+    else
+        echo "[harness] serve: harness upgrade did not restart serve; it goes on as it was (u to try again)" >&2
+    fi
+}
+
+# Waits, as `wait -n` on harness serve's two servers (<opencode job> <pub
+# job>) would, for one to exit (its status in serve_rc) or for serve_restart,
+# reading serve's keys from the terminal meanwhile: u runs harness upgrade.
+_serve_wait_keys() {
+    local oc="$1" pub="$2" key
+    while (( ! serve_restart )); do
+        if ! kill -0 "$oc" 2>/dev/null; then wait "$oc" || serve_rc=$?; return; fi
+        if ! kill -0 "$pub" 2>/dev/null; then wait "$pub" || serve_rc=$?; return; fi
+        if ! _serve_tty_foreground; then sleep 1; continue; fi
+        key=""
+        if read -rsn1 -t 1 key; then
+            case "$key" in
+                u|U) _serve_key_upgrade ;;
+            esac
+        elif (( $? <= 128 )); then
+            # The terminal is gone (end of input): wait on the servers alone.
+            wait -n "$oc" "$pub" || serve_rc=$?
+            return
+        fi
+    done
 }
 
 # The start of a run viewer link: the root sessions created from now on.
