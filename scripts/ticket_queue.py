@@ -416,6 +416,7 @@ def note_paths(vault, key):
             "findings": os.path.join(d, f"{key}-findings.md"), "answers": os.path.join(d, f"{key}-answers.md"),
             "state": os.path.join(d, f"{key}-state.md"), "log": os.path.join(d, f"{key}-log.md"),
             "task": os.path.join(d, f"{key}-task.md"), "result": os.path.join(d, f"{key}-result.md"),
+            "fix": os.path.join(d, f"{key}-fix.md"),   # the fix stage's why for items it left, off one branch
             "ticket": os.path.join(vault, ".raw", "tickets", f"{key}.md")}
 
 
@@ -1696,14 +1697,72 @@ def ticket_change(q, st, since=None):
         d = repo_dir(st, rel)
         if not os.path.isdir(d):
             continue
-        diff, files = repo_diff(d, rel, since.get(rel) or b["snap"], worktree_tree(q, st, d))
+        tree = worktree_tree(q, st, d)
+        diff, files = repo_diff(d, rel, since.get(rel) or b["snap"], tree)
         if files:
-            parts.append({"repo": rel, "kind": "uncommitted", "branch": "", "sha": "", "files": files, "commits": 0})
+            parts.append({"repo": rel, "kind": "uncommitted", "branch": "", "sha": "", "files": files, "commits": 0,
+                          "tree": tree})
             diffs.append(diff)
     if not parts:
         return None
     return (top[0] if top else None, "".join(diffs), [f for p in parts for f in p["files"]],
             sum(p["commits"] for p in parts), parts)
+
+
+def marks_of(change):
+    """{repo: its branch tip, or the tree of its files where the change is left
+    uncommitted}: where each part of the change is now, for a later ticket_change(since=)
+    or fix_delta. {} for no change."""
+    return {p["repo"]: p["sha"] if p["kind"] == "branch" else p["tree"] for p in change[4]} if change else {}
+
+
+def repo_start(st, rel):
+    """Where the work in a repository started: its snapshot where the change is left
+    uncommitted, its base on a branch."""
+    b = (st.get("baselines") or {}).get(rel)
+    if b:
+        return b.get("snap", "")
+    n = (st.get("nested") or {}).get(rel)
+    return (n or {}).get("base_sha", "") if rel != "." else st.get("base_sha", "")
+
+
+def fix_delta(st, change, since):
+    """The diff of what changed since <since> (marks_of the change as the fix's round
+    began), from the tips and trees in hand: no new look at the files."""
+    now, diffs = marks_of(change), []
+    for rel in sorted(set(now) | set(since)):
+        a, b = since.get(rel) or repo_start(st, rel), now.get(rel) or repo_start(st, rel)
+        if a and b and a != b:
+            try:
+                diffs.append(repo_diff(repo_dir(st, rel), rel, a, b)[0])
+            except (RuntimeError, OSError, subprocess.SubprocessError):   # a tree gone (gc): the fix diff is less,
+                pass                                                         # the check goes on without it
+    return "".join(diffs)
+
+
+def fix_notes(st, change, notes_file):
+    """What the fix stage's agent says about the items it left as they are: its commit
+    messages since the review on the ticket's branches; in a repository where the change
+    is left uncommitted, any commits on its branch since the work started (an agent's
+    that committed anyway, or the owner's own); and the fix notes file."""
+    since, out = dict(st.get("fix_from") or {}), []
+    if st.get("review_sha"):   # a round begun before fix_from was kept
+        since.setdefault(".", st["review_sha"])
+    for p in (change[4] if change else []):
+        if p["kind"] == "branch" and p["sha"] != since.get(p["repo"]):
+            a = since.get(p["repo"]) or repo_start(st, p["repo"])
+            if a:
+                out.append(git(repo_dir(st, p["repo"]), "log", "--format=%B", f"{a}..{p['sha']}",
+                               check=False).stdout.strip())
+    for rel, b in sorted((st.get("baselines") or {}).items()):
+        d = repo_dir(st, rel)
+        head = git(d, "rev-parse", "-q", "--verify", "HEAD", check=False).stdout.strip() if os.path.isdir(d) else ""
+        if b.get("head") and head and head != b["head"]:
+            out.append(git(d, "log", "--format=%B", f"{b['head']}..{head}", check=False).stdout.strip())
+    said = read(notes_file).strip()
+    if said:
+        out.append(said)
+    return "\n\n".join(o for o in out if o)
 
 
 def submodule_diffs(q, st, sha):
@@ -1995,12 +2054,15 @@ def quote_hint(quote, diff, said=""):
     return ""
 
 
-def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=None):
+def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=None, fix_diff=""):
     """Problems with a verdict: every criterion answered, met (for a change),
     and every quote found in <source>. For a diff a quote must be from an added
     line (a removed one when the criterion is about removing; never an unchanged
     one); a reviewer's "(review)" item, or the owner's "(owner)" one, may instead
-    quote <notes>, the commit messages saying why it is wrong or cannot be done.
+    quote <notes>, the commit messages or fix notes saying why it is wrong or cannot
+    be done, or a line <fix_diff> (what the fix changed since the review) adds or
+    removes: a line taken out for an owner's comment is in no added line of the whole
+    change, and the comment need not say "remove".
     A ticket quote the verifier got slightly wrong goes to <soft> instead (a
     list, logged): one found quote is enough to show the plan is about the ticket. <nums> are the numbers the verifier
     was told for the criteria (their AC numbers), 1, 2, 3... by default."""
@@ -2008,6 +2070,7 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=No
     problems = []
     if what == "diff":
         added, removed = diff_sides(source)
+        fixed = "\n".join(diff_sides(fix_diff)) if fix_diff else ""
     else:
         src = norm(source)
     got = {}
@@ -2033,11 +2096,11 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=No
         quote = norm(str(c.get(quote_field) or ""))
         if not quote:
             if what == "diff":
-                problems.append(f"criterion {i}: no quote from the diff shows it is met")
+                problems.append(f"criterion {i} ({clip(crit, 60)}): no quote from the diff shows it is met")
             continue
         if what == "diff":
             ok = quote in added or (REMOVAL.search(crit) and quote in removed) \
-                or (crit.startswith(("(review) ", "(owner) ")) and quote in norm(notes))
+                or (crit.startswith(("(review) ", "(owner) ")) and (quote in norm(notes) or quote in fixed))
         else:
             ok = quote in src
         if len(quote) >= 8 and ok:
@@ -2048,8 +2111,10 @@ def judge(obj, criteria, source, quote_field, what, notes="", soft=None, nums=No
             said = " ".join(str(c.get(quote_field) or "").split())
             said = said if len(said) <= 160 else said[:160] + "..."
             hint = quote_hint(quote, source, said) if what == "diff" else ""
+            # the criterion's words early: the card cuts a line at 170 characters, and the
+            # number alone does not say which criterion it is (the verifier's are renumbered)
             (soft if what == "ticket" else problems).append(
-                f"criterion {i}: the quoted {what} text is not in the {what}: \"{said}\"{hint}")
+                f"criterion {i} ({clip(crit, 60)}): the quoted {what} text is not in the {what}: \"{said}\"{hint}")
     if what == "ticket" and criteria and not found:
         problems.append("no criterion quotes the ticket: the plan may not be about this ticket")
     if str(obj.get("verdict", "")).upper() != "PASS":
@@ -2894,7 +2959,7 @@ def common(ctx, st):
         plan = NO_PLAN if "plan" not in stages_of(st) else read(p["plan"], PLAN_CAP) or "(none yet)"
     return dict(KEY=st["key"], BRANCH=branch_of(st), BASE_SHA=st.get("base_sha", ""),
                 REPO=workdir(ctx.q, st), WHERE=IN_PLACE if st.get("in_place") else IN_CLONE,
-                **landing(st, lands(ctx, st)),
+                **landing(st, lands(ctx, st), ap["fix"]),
                 TICKET_FILE=ap["ticket"],
                 TICKET=read(p["ticket"], TICKET_CAP) or "(the ticket file is missing; read the path above)",
                 PLAN_FILE=ap["plan"], PLAN=plan,
@@ -3007,9 +3072,11 @@ COMMIT_PIECES = ("Commit as you go, as a careful engineer would: when one piece 
                  "reset or rebase.")
 
 
-def landing(st, how):
+def landing(st, how, fix_file=""):
     """The prompts' words for where the change lands (lands): LAYOUT, COMMIT_STEP,
-    CHECK_STEP, FIX_COMMIT_STEP, CHANGE (the review's) and CHANGE_SO_FAR (the fix's)."""
+    CHECK_STEP, FIX_COMMIT_STEP, CHANGE (the review's) and CHANGE_SO_FAR (the fix's).
+    Off one branch, the fix says why it left an item in <fix_file> (as the agent sees it):
+    with nothing committed there is no commit message to say it in."""
     branches, left = how
     key, base = st["key"], st.get("base_sha", "")
     name = lambda rel: "this folder (the project's top)" if rel == "." else f"{rel}/"   # noqa: E731
@@ -3041,9 +3108,11 @@ def landing(st, how):
         ("Leave every other change uncommitted. " if branches and left else
          "Leave your changes uncommitted; commit nothing. " if left else "") + "Do not push; harness pushes."
     fix = (f"Commit what you changed in a repository on a branch of the ticket's ({', '.join(on)}) with "
-           f"`-m \"{key}: review fixes\" -m \"<why any item was left as it is>\"`; leave the rest uncommitted. "
+           f"`-m \"{key}: review fixes\"`; leave the rest uncommitted. "
            if branches else "Leave your changes uncommitted; commit nothing. ") + \
-        "An item that is wrong (the code already right) stays as it is. Do not push, do not rewrite earlier commits."
+        "An item that is wrong (the code already right) stays as it is" + \
+        (f"; write why to {fix_file} (one line for each item left as it is: the item, then why, naming the lines "
+         "that show it)" if fix_file else "") + ". Do not push, do not rewrite earlier commits."
     on_branch = (". The project is more than one git repository: this folder and the repositories inside it (each "
                  "its own .git): " + "; ".join([f"{name(rel)} on branch {b}" for rel, b in branches] + (
                      [f"{', '.join(name(r) for r in left)} with the change left uncommitted"] if left else []))) \
@@ -3098,7 +3167,7 @@ def task_card(ctx, st, stage):
         return None
     p = {k: agent_path(ctx, v) for k, v in note_paths(ctx.vault, st["key"]).items()}
     how = lands(ctx, st)
-    words = landing(st, how)
+    words = landing(st, how, p["fix"])
     name = "fix-owner" if stage == "fix" and by_owner(st) else stage
     done = CARD_DONE[name + "-repos"] if name + "-repos" in CARD_DONE and "COMMIT_STEP" in words \
         and how != ([(".", branch_of(st))], []) else CARD_DONE[name]
@@ -3507,9 +3576,13 @@ def change_problems(ctx, st, rc, stage):
         odd = [f for f in change[2] if not TEST_PATH.search(f)]
         if odd:
             warnings.append(f"the test stage changed files that do not look like tests: {', '.join(odd[:10])}")
-    if not problems and stage == "fix" and st.get("review_digest") and not moved_since(st, change, "review"):
+    # a fix that left every item as it is, saying why in the fix notes file (off one branch), did its work
+    said = stage == "fix" and bool(read(p["fix"]).strip())
+    if not problems and stage == "fix" and st.get("review_digest") and not moved_since(st, change, "review") \
+            and not said:
         problems.append("no new commit since the review: fix the Must fix items and commit"
-                        if not st.get("no_branch") else "nothing changed since the review: fix the Must fix items")
+                        if not st.get("no_branch") else "nothing changed since the review: fix the Must fix items, "
+                        f"or write why one is left as it is to {agent_path(ctx, p['fix'])}")
     if not problems and rc not in (0, IDLE, 124):   # stopped (quiet, or the timeout): the work is judged as it is
         problems.append("the agent did not finish; check the work is complete and committed")
     if not problems and getattr(ctx, "syntax_check", True):
@@ -3522,16 +3595,16 @@ def change_problems(ctx, st, rc, stage):
             diff = without_files(diff, st.get("test_files") or [])
         ctx.q.log(st["key"], f"{stage}: {commits} commit(s), {len(files)} file(s) changed"
                   + (f" ({'; '.join(part_line(p) for p in parts)})" if len(parts) > 1 or st.get("no_branch") else ""))
-        notes = ""
-        if stage == "fix" and st.get("review_sha") and change[0]:
-            notes = git(st["project"], "log", "--format=%B", f"{st['review_sha']}..{change[0]}",
-                        check=False).stdout.strip()
+        notes = fix_notes(st, change, p["fix"]) if stage == "fix" else ""
+        fixed = fix_delta(st, change, st["fix_from"]) if stage == "fix" and isinstance(st.get("fix_from"), dict) \
+            else ""
         def prompt_for(c):
             return render("verify_change", TICKET=read(p["ticket"], min(TICKET_CAP, c)), CRITERIA=numbered(criteria),
                           DIFF=cap_diff(diff, c), COMMITS=cap(notes, NOTE_CAP) or "(none)",
+                          FIX_DIFF=cap_diff(fixed, c // 4) if fixed else "(none)",
                           MET_WHEN=MET_WHEN[stage == "test"])
         obj = verdict(ctx, st, stage, prompt_for)
-        problems = judge(obj, criteria, diff, "quote", "diff", notes)
+        problems = judge(obj, criteria, diff, "quote", "diff", notes, fix_diff=fixed)
         ctx.q.log(st["key"], f"{stage} verifier: {verifier_line(obj, problems)}")
         miss = [m.group(1) for m in map(QUOTE_MISS.match, problems) if m]
         if miss and len(miss) == len(problems) and str(obj.get("verdict", "")).upper() == "PASS":
@@ -3540,7 +3613,7 @@ def change_problems(ctx, st, rc, stage):
                                  "diff; asking it again")
             try:
                 obj = verdict(ctx, st, stage, lambda c: prompt_for(c) + REQUOTE.format(", ".join(miss)))
-                problems = judge(obj, criteria, diff, "quote", "diff", notes)
+                problems = judge(obj, criteria, diff, "quote", "diff", notes, fix_diff=fixed)
                 ctx.q.log(st["key"], f"{stage} verifier, asked again: {verifier_line(obj, problems)}")
             except VerifierBroke as e:   # no second verdict: the first one's problems stand
                 ctx.q.log(st["key"], f"{stage} verifier, asked again: {e}")
@@ -3551,8 +3624,7 @@ def change_problems(ctx, st, rc, stage):
     st["verified_repos"] = {p["repo"]: p["sha"] for p in change[4] if p["kind"] == "branch" and p["repo"] != "."}
     st["verified_mark"] = mark(change)   # and the change as a whole, uncommitted files too
     if stage == "test":   # what the tests were written on: implement and fix are judged on what they add
-        st["test_marks"] = {p["repo"]: p["sha"] if p["kind"] == "branch" else
-                            worktree_tree(ctx.q, st, repo_dir(st, p["repo"])) for p in change[4]}
+        st["test_marks"] = marks_of(change)
         own = ticket_change(ctx.q, st, since=st.get("test_from")) if st.get("test_from") else change
         st["test_files"] = list(own[2]) if own else []
         st["test_sha"] = change[0] or ""
@@ -3586,7 +3658,8 @@ def deleted_paths(diff):
 HOW_SHORT = "(where the ticket says how it lands: committed on its branch, or left uncommitted)"
 # judge()'s problems that are the verifier's own copying (its quote is not in the diff):
 # the verifier is asked once more (REQUOTE after its prompt) before they fail the attempt.
-QUOTE_MISS = re.compile(r"^criterion (\d+): (the quoted diff text is not in the diff|no quote from the diff shows it is met)")
+QUOTE_MISS = re.compile(r"^criterion (\d+)\b.*?: (the quoted diff text is not in the diff|no quote from the diff shows "
+                        r"it is met)")
 REQUOTE = ("\n\nA first answer to this request gave quotes for criteria {} that are not in the diff's added lines. "
            "For each criterion, copy the quote character for character from one added line of the diff (without "
            "its leading +; a removed line for a criterion about removing something), at least 8 characters long, "
@@ -3938,7 +4011,8 @@ def stage_review(ctx, st):
     st.pop("must_fix_by", None)   # the review's items now, not the owner's
     st.pop("review_pending", None)
     st.update(must_fix=must[:MUST_FIX_MAX], review_sha=(change[0] or "") if change else "",
-              review_digest=digest(change[1]) if change else "")
+              review_digest=digest(change[1]) if change else "", fix_from=marks_of(change))
+    new_round(ctx, st)
     after = next_stage(st, "review")
     if not must or "fix" in stages_of(st):
         return advance(ctx, st, "fix" if must else after)
@@ -3986,27 +4060,34 @@ def review_changed(ctx, st, dirty):
     return change, problems
 
 
+def new_round(ctx, st):
+    """A new round of Must fix items: the fix notes of the last round's are not about them."""
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(note_paths(ctx.vault, st["key"])["fix"])
+
+
 def by_owner(st):
     """True when the Must fix items are the owner's review comments (harness queue fix), not a review's."""
     return st.get("must_fix_by") == "owner"
 
 
-# fix.md's words for whose Must fix items they are: (what is fixed, the items' block, step 1)
+# fix.md's words for whose Must fix items they are: (what is fixed, the items' block, step 1);
+# {why_in}: the commit message on one branch, else the fix notes file (nothing may be committed)
 FIX_WORDS = {
-    False: ("the problems a review found in the change for ticket {key}. Nobody is watching: fix them all, then commit.",
+    False: ("the problems a review found in the change for ticket {key}. Nobody is watching: fix them all, then {then}.",
             "from {review}",
             "For each Must fix item, read the code it names and fix it. If an item is wrong (the code is already "
-            "right), leave the code and say in the commit message, for that item, why it is wrong, naming the lines "
+            "right), leave the code and say in {why_in}, for that item, why it is wrong, naming the lines "
             "that show it."),
     True: ("the change for ticket {key} as its owner asks in review comments on the diff. Nobody is watching: do "
-           "them all, then commit.",
+           "them all, then {then}.",
            "the owner's review comments on the diff; they win over the plan",
            "Each Must fix item is a comment of the owner's: on one line of the diff (path:line, (new) or (old) side, "
            "\"the line as it was shown\": the comment; a (new) line's number is the file's after the change, "
            "an (old) one's before it, and an (old, at HEAD) one's as last committed in its repository, as git show "
            "HEAD:<path> there shows it), or on the whole change. For each, read the code it names and "
            "do what it asks; where it differs from the plan, the comment wins. Only if one truly cannot be done as "
-           "asked, leave it and say in the commit message, for that item, why, naming the lines that show it."),
+           "asked, leave it and say in {why_in}, for that item, why, naming the lines that show it."),
 }
 
 
@@ -4017,12 +4098,16 @@ def stage_fix(ctx, st):
             return block(ctx, st, f"nothing to fix: {no_change(st)}; harness queue retry {st['key']} --stage "
                                   "implement makes the change again")
         st.pop("review_pending", None)
-        st.update(review_sha=change[0] or "", review_digest=digest(change[1]))
+        st.update(review_sha=change[0] or "", review_digest=digest(change[1]), fix_from=marks_of(change))
+        new_round(ctx, st)
         ctx.q.save(st)   # before the agent: a run that dies after it must not take its work as the reviewed
     v = common(ctx, st)
     what, items, step = FIX_WORDS[by_owner(st)]
-    v.update(FIX_WHAT=what.format(key=st["key"]), MUST_FIX_FROM=items.format(review=v["REVIEW_FILE"]),
-             FIX_ITEMS_STEP=step)
+    one = lands(ctx, st) == ([(".", branch_of(st))], [])   # one branch: why goes in the commit message
+    v.update(FIX_WHAT=what.format(key=st["key"], then="commit" if one else "finish as step 4 says"),
+             MUST_FIX_FROM=items.format(review=v["REVIEW_FILE"]),
+             FIX_ITEMS_STEP=step.format(why_in="the commit message" if one else
+                                        agent_path(ctx, note_paths(ctx.vault, st["key"])["fix"])))
     v["MUST_FIX"] = cap("\n".join("- " + m for m in st.get("must_fix", [])), MUST_FIX_CAP)
     rc, _, _ = agent_or_kept(ctx, st, "fix", lambda: render("fix", **v))
     if verify_change(ctx, st, rc, "fix"):
@@ -5633,7 +5718,7 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         st.pop("verified_repos", None)
         st.pop("verified_mark", None)
     if not go_on and starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
-        for k in ("sha", "review_sha", "review_digest", "review_pending", "must_fix", "must_fix_by", "warnings", "verify_only",
+        for k in ("sha", "review_sha", "review_digest", "review_pending", "fix_from", "must_fix", "must_fix_by", "warnings", "verify_only",
                   "verified_sha", "verified_repos", "verified_mark", "implement_from", "built_on", "test_from", *TEST_MARKS):
             st.pop(k, None)
         if st["stage"] == "plan":
@@ -6285,7 +6370,7 @@ def cmd_followup(q, a):
         st = requeue(q, key, ("done",), stage="plan", rounds=rounds, built_on=True, plan_hold=True,
                      plan_approved=False)
         if st:   # the review and checks of the last round are not this one's
-            for k in ("sha", "review_sha", "review_digest", "review_pending", "must_fix", "must_fix_by", "warnings", "questions",
+            for k in ("sha", "review_sha", "review_digest", "review_pending", "fix_from", "must_fix", "must_fix_by", "warnings", "questions",
                       "criteria", "assumptions", "subs", "test_from", *TEST_MARKS):
                 st.pop(k, None)
             q.save(st)

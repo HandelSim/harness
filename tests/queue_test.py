@@ -177,8 +177,11 @@ elif stage in ("implementing", "fixing"):
             or (os.environ.get("FAKE_NO_COMMIT_UNTIL_DEBUG") and not os.path.exists(os.environ["FAKE_CALLS"] + ".debugged")):
         sys.exit(0)
     if stage == "fixing" and os.environ.get("FAKE_FIX_REJECT"):  # the review item is wrong
-        git("commit", "-q", "--allow-empty", "-m", "ABC-1: review fixes",
-            "-m", "Left as it is: feature.txt already says hello feature once, which the ticket asks for")
+        why = "Left as it is: feature.txt already says hello feature once, which the ticket asks for"
+        if "write why to " in prompt:   # nothing committed (no branch): the why goes in the fix notes file
+            open(path("write why to"), "w").write("- " + why + "\n")
+        else:
+            git("commit", "-q", "--allow-empty", "-m", "ABC-1: review fixes", "-m", why)
         sys.exit(0)
     if os.environ.get("FAKE_EDIT_PLAN"):  # an agent trying to move the goalposts
         open(os.path.join(vault, "wiki", "notes", "tickets", "ABC-1-plan.md"), "w").write(
@@ -1394,16 +1397,17 @@ class QueueTest(Base):
         st = {"key": "ABC-1", "base_sha": "abc", "feedback": ""}
         ctx = type("C", (), {"vault": self.vault, "q": tq.Queue(self.state)})()
         v = tq.common(ctx, st)
-        fix = [dict(FIX_WHAT=w.format(key="ABC-1"), MUST_FIX_FROM=f.format(review="r"), FIX_ITEMS_STEP=s)
+        fix = [dict(FIX_WHAT=w.format(key="ABC-1", then="commit"), MUST_FIX_FROM=f.format(review="r"),
+                    FIX_ITEMS_STEP=s.format(why_in="the commit message"))
                for w, f, s in tq.FIX_WORDS.values()]   # a review's Must fix items, and the owner's comments
         for name, more in [(n, {}) for n in ("plan", "test", "implement", "review")] + [("fix", x) for x in fix]:
             text = tq.render(name, DIFF="d", MUST_FIX="m", **v, **more)
             self.assertNotIn("{{", text, name)
             self.assertLess(len(text), 120_000)
         for name, vals in (("verify_plan", dict(TICKET="t", PLAN="p", CRITERIA="AC1: c", ANSWERS="a")),
-                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m",
+                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m", FIX_DIFF="f",
                                                   MET_WHEN=tq.MET_WHEN[0])),
-                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m",
+                           ("verify_change", dict(TICKET="t", CRITERIA="1. c", DIFF="d", COMMITS="m", FIX_DIFF="f",
                                                   MET_WHEN=tq.MET_WHEN[1]))):
             self.assertNotIn("{{", tq.render(name, **vals), name)
 
@@ -3913,6 +3917,13 @@ class NestedReposTest(Base):
         self.assertNotIn("maincppfakeithpp", probs[0])
         self.assertIn("(that is an unchanged line around the change", probs[1])
         self.assertTrue(all(tq.QUOTE_MISS.match(p) for p in probs))   # still asked again
+        # the criterion's own words, early: the card cuts a line, and its number alone says nothing
+        self.assertTrue(probs[0].startswith("criterion 1 (a): the quoted diff text"), probs[0])
+        long = "(owner) a.py:3 (new) \"x = 1\": " + "word " * 40
+        miss = tq.judge({"verdict": "PASS", "criteria": [{"n": 1, "met": True}]}, [long], diff, "quote", "diff")
+        self.assertTrue(miss[0].startswith('criterion 1 ((owner) a.py:3 (new) "x = 1": word'), miss)
+        self.assertTrue(miss[0].endswith("…): no quote from the diff shows it is met"), miss)
+        self.assertTrue(tq.QUOTE_MISS.match(miss[0]))
 
     def test_a_change_left_uncommitted_in_one_is_the_tickets(self):
         lib = self.ignored_libA()
@@ -4025,6 +4036,35 @@ class NestedReposTest(Base):
         self.assertIn("nothing to fix: the ticket changed nothing", st["reason"])
         self.assertEqual(len(self.calls_of("fixing")), n)   # no agent launched on nothing
         self.assertTrue(st["review_pending"])   # a retry looks again
+
+    def test_no_branch_a_fix_that_leaves_an_item_says_why_in_its_notes_file(self):
+        """Off a branch nothing is committed, so there is no commit message: the fixer writes why
+        it left an item to the fix notes file, the verifier reads it, and saying why is the fix's
+        work (nothing else changed); a new round of items starts without the last one's notes."""
+        top = self.git_p("rev-parse", "HEAD")
+        os.environ.update(FAKE_TOP_UNCOMMITTED="1", FAKE_MUSTFIX="1", FAKE_FIX_REJECT="1")
+        self.add_in_place("implement,review,fix", "--no-branch")
+        rc, out = self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        fixing = cat(self.calls + ".fixing")
+        self.assertRegex(fixing, r"write why to \S+ABC-1-fix\.md \(")
+        self.assertNotIn("in the commit message", fixing)
+        self.assertNotIn("then commit.", fixing)
+        check = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
+        self.assertIn("Left as it is: feature.txt already says hello feature once", check.split("<<<BEGIN_COMMIT")[1])
+        self.assertEqual(self.git_p("rev-parse", "HEAD"), top)   # nothing committed on the owner's branch
+        self.assertNotIn("nothing changed since the review", cat(os.path.join(self.state, "ABC-1", "log.md")))
+        os.environ.pop("FAKE_FIX_REJECT")   # the owner's comments: the fixer does them, and says nothing
+        rc, out = self.q("fix", "ABC-1", "--item", "say it louder")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual(st["status"], "done", out + st.get("reason", ""))
+        check = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
+        self.assertIn("(owner) say it louder", check)
+        self.assertNotIn("Left as it is", check)   # the last round's notes are not about these items
+        self.assertIn("+fixed by review", check.split("<<<BEGIN_FIX_DIFF")[1])   # what this fix changed
 
     def test_no_branch_with_no_change_is_said(self):
         self.ignored_libA()
@@ -5357,6 +5397,18 @@ class OwnerReviewTest(Base):
         self.assertEqual(tq.judge(obj, crit, diff, "quote", "diff", "Not renamed: x is a keyword in this file format."), [])
         self.assertEqual(len(tq.judge(obj, ["Rename it to x"], diff, "quote", "diff",
                                       "Not renamed: x is a keyword in this file format.")), 1)
+
+    def test_a_line_the_fix_took_out_for_a_comment_shows_it_is_done(self):
+        # the whole change no longer has the line (the fix took out what implement added), and the
+        # comment does not say "remove": the fix's own diff is the proof
+        whole = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1 +1,2 @@\n a\n+keep_me = 1\n"
+        fixed = "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n@@ -1,3 +1,2 @@\n a\n-debug_print(everything)\n keep_me = 1\n"
+        obj = {"verdict": "PASS", "criteria": [{"n": 1, "met": True, "quote": "debug_print(everything)"}]}
+        crit = ['(owner) f.py:2 (new) "debug_print(everything)": not this']
+        self.assertEqual(tq.judge(obj, crit, whole, "quote", "diff", fix_diff=fixed), [])
+        self.assertEqual(len(tq.judge(obj, crit, whole, "quote", "diff")), 1)   # without the fix's diff: no proof
+        # a plan criterion is judged on the whole change, as before
+        self.assertEqual(len(tq.judge(obj, ["f.py has no debug output"], whole, "quote", "diff", fix_diff=fixed)), 1)
 
 
 class RestartLeftLockTest(unittest.TestCase):

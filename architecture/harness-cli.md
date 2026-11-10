@@ -1248,7 +1248,24 @@ passed is copied to `state/queue/KEY/plan.md` and later stages are held to
 that copy, not the vault's, which agents can write. The fix stage must add
 a commit and is also checked against the review's Must fix items; an item
 the fixer finds wrong is answered in the commit message (an empty commit when
-nothing changed), which the verifier sees and may quote for that item only. A failed
+nothing changed), which the verifier sees and may quote for that item only.
+Off the one-branch layout (`--no-branch`, or repositories left uncommitted)
+there may be no commit to say it in: the fixer writes why to the fix notes
+file (`KEY-fix.md` beside the review; `landing(fix_file=)`, `FIX_WORDS`'
+`{why_in}`), and a non-empty one counts as the fix's work for the "nothing
+changed since the review" check. `fix_notes()` gives the verifier the
+commit messages since the round began on each branch part, commits on the
+branch of a repository left uncommitted since the work started (`head` in
+`baselines`), and that file. `fix_from` (`marks_of` the change as a round of
+items begins: each part's tip, or for an uncommitted one the `tree` that
+`ticket_change` already took) gives `fix_delta()`, what the fix itself
+changed, from git alone; it is the prompt's `FIX_DIFF` block, and a
+`(review)`/`(owner)` quote may come from its added or removed lines (a line
+taken out for a comment is in no added line of the whole change, and the
+comment need not say "remove"). `new_round()` deletes the notes file where a
+round begins (`stage_review`, and `stage_fix` with `review_pending`). A
+quote miss names the criterion's start (`criterion N (<words>): ...`), as
+the card cuts a line at 170 characters; `QUOTE_MISS` allows it. A failed
 stage runs `QUEUE_RETRIES` more times with the problems as feedback (in the
 stage's prompt, review's too, and on the retry's task card: `last_failure()`
 puts up to two of them, launch lines like "made no progress" only when no
@@ -1421,13 +1438,13 @@ and only when no run holds the ticket, it is requeued at `fix` (added to its
 stages if missing) with `must_fix` the items, `must_fix_by: owner`,
 `review_pending` set (`stage_fix` sets `review_sha`/`review_digest` to the
 change as it is when the stage starts and saves before the agent; the fix
-must commit on top; its commit messages since are what the verifier may
-quote), and
+must commit on top, or off one branch write why to the fix notes file;
+`fix_notes()` and `fix_delta()` are what the verifier may quote), and
 the batch appended to `owner_reviews` (`at`, `items`; last 30). The fix
 prompt (`FIX_WORDS[True]`) says they are the owner's review comments,
 which win over the plan, each done unless it truly cannot be, and then
-said why in the commit message; the verifier gets them as `(owner)`
-criteria (`verify_change.md`: met when done, or a commit message's reason
+said why in the commit message or the fix notes file; the verifier gets them as `(owner)`
+criteria (`verify_change.md`: met when done, or a commit message's or note's reason
 the diff and ticket bear out; the owner's comment wins over a plan
 criterion it changes). After fix comes push when the ticket has it. Once:
 the comments are not owner notes, the next review replaces `must_fix` (and
