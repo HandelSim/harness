@@ -1062,14 +1062,16 @@ class Runs:
 
     def fix_refused(self, key):
         """Why harness queue fix would refuse the owner's review comments on the ticket's
-        diff, "" when it would take them, None when that cannot be read (no comment box)."""
+        diff, "" when it would take them, None when that cannot be read (no comment box).
+        It does not snapshot the folder (look=False): the page's diff already shows whether
+        anything changed, and a snapshot of a big one takes minutes."""
         tq = _tq()
         if tq is None or not hasattr(tq, "owner_fix_refused"):
             return None
         try:
             q = tq.Queue(self.queue_dir)
             st = q.load(key)
-            return tq.owner_fix_refused(q, st) if isinstance(st, dict) else None
+            return tq.owner_fix_refused(q, st, look=False) if isinstance(st, dict) else None
         except Exception:
             return None
 

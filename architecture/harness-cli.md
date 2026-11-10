@@ -1410,13 +1410,19 @@ comment` (the comment's whitespace collapsed, at most `FIX_ITEM_CAP` 2,000
 characters; the line cut at 160; runs of `<`/`>` broken up so no text can
 close the prompt's `<<<...>>>` blocks). `owner_fix_refused` (also the web
 page's): only a `done`, `blocked` or `stopped` ticket (not one whose plan
-waits, nor one stopped at plan or test), with its work there and a change;
+waits, nor one stopped at plan or test), with its work there and a change
+(commits since the base; a ticket with work left uncommitted, no-branch,
+`nested` or `baselines`, is not snapshotted there, `look=False`: two
+`worktree_tree` walks of a big folder outlast serve's 120 s wait on the
+command, so the fix stage reads it as it starts and blocks on no change);
 over `MUST_FIX_MAX` 40 items or `MUST_FIX_CAP` 16,000 characters is refused,
 not cut, so the fixer sees all the verifier holds it to. Under `queue.lock`,
 and only when no run holds the ticket, it is requeued at `fix` (added to its
 stages if missing) with `must_fix` the items, `must_fix_by: owner`,
-`review_sha`/`review_digest` the change as it is now (the fix must commit
-on top; its commit messages since are what the verifier may quote), and
+`review_pending` set (`stage_fix` sets `review_sha`/`review_digest` to the
+change as it is when the stage starts and saves before the agent; the fix
+must commit on top; its commit messages since are what the verifier may
+quote), and
 the batch appended to `owner_reviews` (`at`, `items`; last 30). The fix
 prompt (`FIX_WORDS[True]`) says they are the owner's review comments,
 which win over the plan, each done unless it truly cannot be, and then
@@ -2469,7 +2475,8 @@ offered as suggestions. It is taken as pasted: quotes
   (the queue put it back on the owner's), its uncommitted files are not
   the ticket's: that view says why in a line (`dv-elsewhere`) and links
   to the work view. Only
-  when `Runs.fix_refused` (`ticket_queue.owner_fix_refused`) says nothing
+  when `Runs.fix_refused` (`ticket_queue.owner_fix_refused`, `look=False`:
+  no folder snapshot on a page load) says nothing
   (else why not, in a line): a click on a numbered line opens a comment
   box under it (side by side, an empty row as tall in the other half
   keeps the halves level); the list shows those on the ticket's other

@@ -3983,9 +3983,14 @@ class NestedReposTest(Base):
         stdin = [{"repo": "libA", "path": "agent.txt", "line": 1, "side": "new", "code": "the agent was here",
                   "text": "say why"},
                  {"path": "feature.txt", "line": 1, "side": "new", "code": "hello feature", "text": "and here"}]
-        with mock.patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(json.dumps(stdin).encode()))):
+        snaps = mock.Mock(side_effect=tq.worktree_tree)
+        with mock.patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(json.dumps(stdin).encode()))), \
+                mock.patch.object(tq, "worktree_tree", snaps):
             rc, out = self.q("fix", "ABC-1", "--stdin")
         self.assertEqual(rc, 0, out)
+        # no snapshot of the folder before it answers: on a big one that outlasted serve's two minutes
+        self.assertEqual(snaps.call_count, 0)
+        self.assertEqual((self.status()["review_pending"], self.status()["review_digest"]), (True, ""))
         must = ['libA/agent.txt:1 (new) "the agent was here": say why',
                 'feature.txt:1 (new) "hello feature": and here']
         self.assertEqual(self.status()["must_fix"], must)
@@ -3996,6 +4001,30 @@ class NestedReposTest(Base):
         check = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
         self.assertIn('(owner) libA/agent.txt:1 (new) "the agent was here": say why', check)
         self.assertIn("libA/agent.txt", check.split("<<<BEGIN_DIFF")[1])
+        # what the comments were on is read as the fix stage starts, and the fix had to change it
+        self.assertNotIn("review_pending", st)
+        self.assertTrue(st["review_digest"])
+        self.assertNotIn("no new commit since the review", cat(os.path.join(self.state, "ABC-1", "log.md")))
+
+    def test_owner_comments_on_a_change_that_is_gone_block_at_fix(self):
+        lib = self.ignored_libA()
+        os.environ.update(FAKE_NESTED="edit:libA", FAKE_TOP_UNCOMMITTED="1")
+        self.add_in_place("implement,review", "--no-branch")
+        rc, out = self.run_queue()
+        self.assertEqual(self.status()["status"], "done", out)
+        for repo in (self.project, lib):   # the owner undid the ticket's work after it was done
+            sh("git", "-C", repo, "checkout", "--", ".")
+            for f in sh("git", "-C", repo, "ls-files", "-o", "--exclude-standard").split():
+                os.remove(os.path.join(repo, f))
+        rc, out = self.q("fix", "ABC-1", "--item", "say why")
+        self.assertEqual(rc, 0, out)   # not snapshotted here: the fix stage finds it
+        n = len(self.calls_of("fixing"))
+        self.run_queue("--retries", "0")
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "fix"), st.get("reason"))
+        self.assertIn("nothing to fix: the ticket changed nothing", st["reason"])
+        self.assertEqual(len(self.calls_of("fixing")), n)   # no agent launched on nothing
+        self.assertTrue(st["review_pending"])   # a retry looks again
 
     def test_no_branch_with_no_change_is_said(self):
         self.ignored_libA()

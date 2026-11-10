@@ -3936,6 +3936,7 @@ def stage_review(ctx, st):
     change, broke = review_changed(ctx, st, dirty)
     must = [f"the review stage's own change fails a check: {b}" for b in broke] + must
     st.pop("must_fix_by", None)   # the review's items now, not the owner's
+    st.pop("review_pending", None)
     st.update(must_fix=must[:MUST_FIX_MAX], review_sha=(change[0] or "") if change else "",
               review_digest=digest(change[1]) if change else "")
     after = next_stage(st, "review")
@@ -4010,6 +4011,14 @@ FIX_WORDS = {
 
 
 def stage_fix(ctx, st):
+    if st.get("review_pending"):   # the owner's comments: what they are on is the change as the stage starts
+        change = ticket_change(ctx.q, st)
+        if change is None:
+            return block(ctx, st, f"nothing to fix: {no_change(st)}; harness queue retry {st['key']} --stage "
+                                  "implement makes the change again")
+        st.pop("review_pending", None)
+        st.update(review_sha=change[0] or "", review_digest=digest(change[1]))
+        ctx.q.save(st)   # before the agent: a run that dies after it must not take its work as the reviewed
     v = common(ctx, st)
     what, items, step = FIX_WORDS[by_owner(st)]
     v.update(FIX_WHAT=what.format(key=st["key"]), MUST_FIX_FROM=items.format(review=v["REVIEW_FILE"]),
@@ -5624,7 +5633,7 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         st.pop("verified_repos", None)
         st.pop("verified_mark", None)
     if not go_on and starts_over(q, st, fresh=fresh):  # from the start, not earlier commits
-        for k in ("sha", "review_sha", "review_digest", "must_fix", "must_fix_by", "warnings", "verify_only",
+        for k in ("sha", "review_sha", "review_digest", "review_pending", "must_fix", "must_fix_by", "warnings", "verify_only",
                   "verified_sha", "verified_repos", "verified_mark", "implement_from", "built_on", "test_from", *TEST_MARKS):
             st.pop(k, None)
         if st["stage"] == "plan":
@@ -6276,7 +6285,7 @@ def cmd_followup(q, a):
         st = requeue(q, key, ("done",), stage="plan", rounds=rounds, built_on=True, plan_hold=True,
                      plan_approved=False)
         if st:   # the review and checks of the last round are not this one's
-            for k in ("sha", "review_sha", "review_digest", "must_fix", "must_fix_by", "warnings", "questions",
+            for k in ("sha", "review_sha", "review_digest", "review_pending", "must_fix", "must_fix_by", "warnings", "questions",
                       "criteria", "assumptions", "subs", "test_from", *TEST_MARKS):
                 st.pop(k, None)
             q.save(st)
@@ -6291,8 +6300,11 @@ FIX_ITEM_CAP = 2_000   # characters of one review comment
 FIX_LINE_CAP = 160     # of the line's text it is on
 
 
-def owner_fix_refused(q, st):
-    """Why the owner's review comments cannot go to the fix stage now (harness queue fix), or ""."""
+def owner_fix_refused(q, st, look=True):
+    """Why the owner's review comments cannot go to the fix stage now (harness queue fix), or "".
+    look=False: a ticket with work left uncommitted (no branch, repositories inside, baselines)
+    is not snapshotted to see whether it changed anything, which on a big folder takes minutes;
+    the fix stage finds out (and blocks) when it starts."""
     key, status = st["key"], st["status"]
     if status not in OWNER_FIXABLE:
         why = {"running": f"it is running: wait for it, or stop it first (harness queue stop {key})",
@@ -6308,6 +6320,8 @@ def owner_fix_refused(q, st):
     if not has_work(q, st):
         return f"{key}'s work is gone (or was never made), so there is nothing to review: harness queue retry {key}"
     many = st.get("no_branch") or st.get("nested") or st.get("baselines")
+    if many and not look:
+        return ""
     try:
         some = bool(ticket_change(q, st)) if many else commits_since_base(q, st)
     except (RuntimeError, OSError, subprocess.SubprocessError):
@@ -6390,13 +6404,11 @@ def cmd_fix(q, a):
         print(f"[queue] {len(items)} comments in {size} characters: at most {MUST_FIX_MAX} comments in "
               f"{MUST_FIX_CAP} characters go to one fix; send the rest after it", file=sys.stderr)
         return 1
-    why = owner_fix_refused(q, st)
+    # No snapshot of the folder here (look=False): on a big one it outlasts the caller's
+    # wait (serve's two minutes). What the comments are on is read when the fix stage starts.
+    why = owner_fix_refused(q, st, look=False)
     if why:
         print(f"[queue] {why}", file=sys.stderr)
-        return 1
-    change = ticket_change(q, st)   # what the comments are on: the fix must commit on top of it
-    if change is None:
-        print(f"[queue] {key} has changed nothing yet, so there is nothing to review", file=sys.stderr)
         return 1
     with held(os.path.join(q.root, "queue.lock")):   # the run takes a queued ticket under it
         if run_holds(q, key):
@@ -6405,14 +6417,14 @@ def cmd_fix(q, a):
                                         if now.get("status") == "running" else finishing(now)), file=sys.stderr)
             return 1
         st = q.load(key)
-        why = owner_fix_refused(q, st) if st else f"{key} is not in the queue"
+        why = owner_fix_refused(q, st, look=False) if st else f"{key} is not in the queue"
         if why:
             print(f"[queue] {why}", file=sys.stderr)
             return 1
         extra = {} if "fix" in stages_of(st) else {"stages": [s for s in ALL_STAGES if s in stages_of(st) or s == "fix"]}
         sent = (st.get("owner_reviews") or [])[-(HISTORY_CAP - 1):] + [{"at": now_iso(), "items": items}]
         st = requeue(q, key, OWNER_FIXABLE, stage="fix", must_fix=items, must_fix_by="owner", owner_reviews=sent,
-                     review_sha=change[0] or "", review_digest=digest(change[1]), **extra)
+                     review_sha="", review_digest="", review_pending=True, **extra)
     if st:
         then = next_stage(st, "fix")
         print(f"[queue] {key}: {len(items)} review comment(s) sent; the queue run gives them to the fix stage"
