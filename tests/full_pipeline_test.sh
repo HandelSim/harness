@@ -514,11 +514,19 @@ echo "[pipeline] T8 OK"
 #
 # Bare `harness` with only agent flags launches an opencode agent (option C
 # dispatch). This exercises that path end-to-end and the gosu privilege drop.
+#
+# HARNESS_NO_BUILD=1: T5 already pre-built the agent image. Without this,
+# the agent-launch path runs ensure_agent_image, which rebuilds because T5's
+# raw `compose build` never records the fingerprint in agent-image.src — a
+# rebuild that is normally cache-fast but, on a cold Docker layer cache, runs
+# apt-get from scratch and overruns the 60s timeout (exit 124). This matches
+# the pre-built-image contract integration_test.sh uses (HARNESS_NO_BUILD=1
+# so the launch just uses the existing image).
 
 echo "[pipeline] T9: harness -p (bare dispatch)"
 cd "${TEST_WORKSPACE}"
 set +e
-t9_out=$(timeout 60 bash -c 'HOME='"'${FAKE_HOME}'"' HARNESS_PROJECT_NAME='"'${PROJECT_NAME}'"' '"'${FAKE_HOME}/.local/bin/harness'"' -p "say hello" 2>&1 < /dev/null')
+t9_out=$(timeout 60 bash -c 'HARNESS_NO_BUILD=1 HOME='"'${FAKE_HOME}'"' HARNESS_PROJECT_NAME='"'${PROJECT_NAME}'"' '"'${FAKE_HOME}/.local/bin/harness'"' -p "say hello" 2>&1 < /dev/null')
 t9_rc=$?
 set -e
 cd "${REPO_ROOT}"
@@ -598,7 +606,7 @@ echo "[pipeline] T9 OK"
 echo "[pipeline] T10: harness opencode -p"
 cd "${TEST_WORKSPACE}"
 set +e
-t10_out=$(timeout 60 bash -c 'HOME='"'${FAKE_HOME}'"' HARNESS_PROJECT_NAME='"'${PROJECT_NAME}'"' '"'${FAKE_HOME}/.local/bin/harness'"' opencode -p "say hello" 2>&1 < /dev/null')
+t10_out=$(timeout 60 bash -c 'HARNESS_NO_BUILD=1 HOME='"'${FAKE_HOME}'"' HARNESS_PROJECT_NAME='"'${PROJECT_NAME}'"' '"'${FAKE_HOME}/.local/bin/harness'"' opencode -p "say hello" 2>&1 < /dev/null')
 t10_rc=$?
 set -e
 cd "${REPO_ROOT}"
@@ -671,7 +679,7 @@ if [[ ! -f "${marker}" ]]; then
 fi
 cd "${TEST_WORKSPACE}"
 set +e
-t15_out=$(timeout 60 bash -c 'HOME='"'${FAKE_HOME}'"' HARNESS_PROJECT_NAME='"'${PROJECT_NAME}'"' '"'${FAKE_HOME}/.local/bin/harness'"' -p "hi" 2>&1 < /dev/null')
+t15_out=$(timeout 60 bash -c 'HARNESS_NO_BUILD=1 HOME='"'${FAKE_HOME}'"' HARNESS_PROJECT_NAME='"'${PROJECT_NAME}'"' '"'${FAKE_HOME}/.local/bin/harness'"' -p "hi" 2>&1 < /dev/null')
 t15_rc=$?
 set -e
 cd "${REPO_ROOT}"
