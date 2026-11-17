@@ -1943,24 +1943,38 @@ What it does, in order:
    **Shared proxy, leases:** one host proxy serves every harness on the
    install at once (a `harness host` per terminal, `harness serve`, a queue
    run and its stage launches, `harness ingest`). Each holds a lease while it
-   uses it (`host_proxy_hold`: an empty file named for its pid under
-   `state/host/proxy.users`), taken before `host_proxy_start` and dropped on
-   exit (`host_proxy_release`; an `exec` restart keeps the pid and so the
-   lease). `host_proxy_others` lists the other live holders and removes the
-   leases of dead pids (and, where `/proc` exists, of pids whose command line
-   no longer names harness). Nothing stops or restarts the proxy under
-   another holder: an interactive exit, and a queue run or ingest that
-   started it, go through `host_proxy_done` (release, stop only if no other
-   holds it); a fingerprint mismatch with holders live keeps the proxy and
-   leaves `proxy.fp` stale, so the first launch after they end restarts it,
-   unless `host_proxy_same_kind` says it can't serve this launch (backend,
-   explicit prompt mode or port differ, from `state/host/proxy.mode`), when
-   the launch fails naming the pids; `harness down` (which also runs when the
-   last container agent exits) and the upgrade restart (`host_proxy_refresh`)
-   skip it with a message; `harness host down` stops it anyway, saying who
-   it cuts off. Before this, closing one terminal, a config or code change
-   seen by the next launch, or the last container agent exiting killed the
-   proxy under an agent working elsewhere ("Cannot connect to API"). Covered by
+   uses it (`host_proxy_hold KIND`: a file named for its pid under
+   `state/host/proxy.users` holding `KIND STARTTIME`), taken before
+   `host_proxy_start` and dropped on exit (`host_proxy_release`; an `exec`
+   restart keeps the pid and takes the lease again). KIND is `host` or
+   `ingest` for a session that sends requests itself, `serve`, `queue` or
+   `findings` for a long run that keeps the proxy up for what it starts (each
+   stage or findings session is a `harness host` with its own lease).
+   `host_proxy_others [--sessions]` lists the other live holders (only the
+   sessions with `--sessions`; a lease from before KIND counts as one) and
+   removes the leases of dead pids, of pids whose `/proc/PID/stat` start time
+   is not the recorded one (a reused pid), and, where `/proc` exists, of pids
+   whose command line no longer names harness. `host_proxy_who` names them in
+   messages ("harness queue run (pid N)") and says how to end a background
+   run (`harness queue halt`, `harness findings stop`): harness serve starts
+   those with no window and they outlive its Ctrl-C, so before this they held
+   the proxy with nothing visible running. Stopping: an interactive exit, and
+   a queue run or ingest that started it, go through `host_proxy_done`
+   (release, stop only if no other holds it), as does `cmd_down` when it runs
+   for the last container agent's exit, `harness restart` or an upgrade; the
+   `harness down` command (`cmd_down_all`) and `harness host down` stop it
+   whoever holds it (`host_proxy_stop_all`, naming them). Restarting on a
+   fingerprint mismatch: a launch refuses when `host_proxy_same_kind` says the
+   proxy can't serve it (backend, explicit prompt mode or port differ, from
+   `state/host/proxy.mode`) and anyone holds it, naming them; otherwise it
+   keeps the proxy while a session holds it (leaving `proxy.fp` stale, so the
+   first launch after they end restarts it) and restarts it when only
+   serve/queue/findings runs do (they reach it again on the same port; a
+   serve web chat in flight at that moment fails). The upgrade restart
+   (`host_proxy_refresh`) follows the same session rule. Before the leases,
+   closing one terminal, a config or code change seen by the next launch, or
+   the last container agent exiting killed the proxy under an agent working
+   elsewhere ("Cannot connect to API"). Covered by
    `tests/unit_host_proxy_lease_test.sh`.
 7. **Scoped opencode config** — `host_write_opencode_config` writes the same
    provider config shape as the container entrypoint's `ensure_opencode_config`

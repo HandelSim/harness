@@ -9,7 +9,11 @@
 #   T2  host_proxy_done stops the proxy only when no other harness holds it
 #   T3  host_proxy_start keeps a proxy others use on a config change, restarts
 #       it when nobody does, and refuses one of another kind
-#   T4  cmd_down and host_proxy_refresh (upgrade) spare a proxy others use
+#   T4  cmd_down (last container agent) and host_proxy_refresh (upgrade) spare
+#       a proxy others use; the harness down command stops it anyway
+#   T5  leases say what holds them: a reused pid does not count, and a serve,
+#       queue run or findings run alone does not keep a config or code change
+#       from restarting the proxy
 #
 # Run:  bash tests/unit_host_proxy_lease_test.sh
 
@@ -50,12 +54,17 @@ set +e
 mkdir -p "$(host_state_dir)"
 
 # A process that looks like another harness to host_proxy_others (its command
-# line names harness) and lives until killed.
+# line names harness) and lives until killed. With KIND, its lease is the one
+# host_proxy_hold KIND writes; without, an empty one (from before KIND).
 other_harness() {
     bash -c 'while :; do sleep 1; done' fake-harness &
     KIDS+=("$!")
-    : >"$(host_proxy_usersdir)/$!"
     OTHER=$!
+    if [[ -n "${1:-}" ]]; then
+        printf '%s %s\n' "$1" "$(host_proxy_starttime "$OTHER")" >"$(host_proxy_usersdir)/$OTHER"
+    else
+        : >"$(host_proxy_usersdir)/$OTHER"
+    fi
 }
 # A stand-in for the running proxy: the pidfile points at a sleep.
 fake_proxy() {
@@ -134,6 +143,63 @@ grep -q 'old code' <<<"$out" || fail "T4: upgrade gave no word — $out"
 kill "$OTHER"; wait "$OTHER" 2>/dev/null
 ( harness_runtime_installed() { return 1; }; host_mcp_stop_all() { :; }; cmd_down ) >/dev/null 2>&1
 host_proxy_running && fail "T4: harness down left an unused proxy up"
-ok "T4: harness down and the upgrade restart spare a proxy other harnesses use"
+fake_proxy
+other_harness queue; q=$OTHER
+out=$( (harness_runtime_installed() { return 1; }; host_mcp_stop_all() { :; }; cmd_down_all) 2>&1 )
+host_proxy_running && fail "T4: the harness down command left a proxy others use up — $out"
+grep -q "harness queue run (pid $q)" <<<"$out" || fail "T4: harness down did not say whom it cut off — $out"
+grep -q 'harness queue halt' <<<"$out" || fail "T4: no word on ending the background run — $out"
+kill "$q"; wait "$q" 2>/dev/null
+ok "T4: the last container agent's down and the upgrade restart spare a proxy others use; harness down stops it"
+
+# --- T5 ----------------------------------------------------------------------
+host_proxy_hold queue
+read -r kind st <"$(host_proxy_usersdir)/$$"
+[[ "$kind" == queue ]] || fail "T5: hold did not record its kind — $kind"
+if [[ -r /proc/$$/stat ]]; then
+    [[ "$st" =~ ^[0-9]+$ ]] || fail "T5: hold did not record a start time — $st"
+    # A lease whose start time is not its pid's: the pid was reused.
+    other_harness host
+    printf 'host 1\n' >"$(host_proxy_usersdir)/$OTHER"
+    [[ -z "$(host_proxy_others)" ]] || fail "T5: a reused pid counted as the holder"
+    [[ ! -e "$(host_proxy_usersdir)/$OTHER" ]] || fail "T5: a reused pid's lease was kept"
+    kill "$OTHER"; wait "$OTHER" 2>/dev/null
+fi
+host_proxy_release
+other_harness serve; s=$OTHER
+other_harness findings; f=$OTHER
+other_harness host; h=$OTHER
+[[ "$(host_proxy_others | sort)" == "$(printf '%s\n' "$s" "$f" "$h" | sort)" ]] || fail "T5: holders — $(host_proxy_others)"
+[[ "$(host_proxy_others --sessions)" == "$h" ]] || fail "T5: only the host session counts for a restart — $(host_proxy_others --sessions)"
+who=$(host_proxy_who "$s" "$h")
+[[ "$who" == "harness serve (pid $s), harness host (pid $h)" ]] || fail "T5: who — $who"
+# A config change with a host session holding it: kept.
+fake_proxy
+printf 'stale\n' >"$(host_proxy_fpfile)"
+printf '\n\n%s\n' "$(host_proxy_port)" >"$(host_proxy_modefile)"
+out=$(host_proxy_start 2>&1)
+grep -q 'keeping it' <<<"$out" || fail "T5: restarted under a host session — $out"
+grep -q "harness host (pid $h)" <<<"$out" || fail "T5: the keep message does not name the session — $out"
+out=$(host_proxy_refresh 2>&1)
+[[ "$(host_proxy_pid)" == "$PROXY" ]] || fail "T5: upgrade restarted under a host session — $out"
+kill "$h"; wait "$h" 2>/dev/null
+# Only serve and the findings run: restarted (up to the launch).
+out=$(host_proxy_start 2>&1)
+grep -q 'restarting it' <<<"$out" || fail "T5: background runs kept a stale proxy — $out"
+host_proxy_running && fail "T5: the stale proxy was not stopped"
+fake_proxy
+out=$(host_proxy_refresh 2>&1)
+grep -q 'restarting the host proxy' <<<"$out" || fail "T5: upgrade kept the old code for background runs — $out"
+host_proxy_stop
+# Another backend is still refused while anyone holds it.
+fake_proxy
+backend_override=chatgpt
+out=$(host_proxy_start 2>&1); rc=$?
+backend_override=""
+(( rc != 0 )) || fail "T5: switched backend under harness serve — $out"
+grep -q "harness serve (pid $s)" <<<"$out" || fail "T5: refusal does not name serve — $out"
+host_proxy_stop 2>/dev/null   # harness_is_git_bash is not sourced here
+kill "$s" "$f"; wait "$s" "$f" 2>/dev/null
+ok "T5: leases name their holder; reused pids drop; background runs alone do not pin a stale proxy"
 
 echo "[proxy-lease] all $pass checks passed"

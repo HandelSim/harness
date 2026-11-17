@@ -2791,7 +2791,8 @@ commands:
                         (except under passthrough): every assistant message
                         must carry a tool call, and the only way to end a
                         turn is the synthetic 'finish' tool.
-  down                  stop the proxy service (does NOT touch agents)
+  down                  stop the proxy service and the host proxy, even while
+                        other harnesses use it (does NOT touch agents)
   restart [--prompt-mode M | --single-message]
                         down + start (preserves per-invocation state).
                         Accepts the same flags as start.
@@ -3130,19 +3131,29 @@ cmd_start() {
     host_mcp_start_enabled
 }
 
+# The harness down command: the host proxy goes too, whoever still holds it
+# (a background queue run or findings agent harness serve started outlives a
+# Ctrl-C of every terminal, and kept it up for good), then what cmd_down stops.
+cmd_down_all() {
+    host_proxy_stop_all
+    cmd_down "$@"
+}
+
 cmd_down() {
     # The host proxy (harness host) runs outside the container stack, so tear it
     # down here too — a no-op when nothing is running. Done before require_docker
     # so both a host-only box (no runtime) and a leftover 'harness host -p' proxy
     # on a container box get cleaned up by the muscle-memory teardown verb.
     # Not while a harness uses it: this also runs when the last container
-    # agent exits (stop_stack_if_last_agent), and that must not cut off a
-    # harness host working in another terminal. harness host down stops it
-    # regardless.
+    # agent exits (stop_stack_if_last_agent), a harness restart and an
+    # upgrade, and those must not cut off a harness host working in another
+    # terminal. The harness down command (cmd_down_all) and harness host down
+    # stop it regardless.
     local proxy_users
     proxy_users=$(host_proxy_others)
     if [[ -n "$proxy_users" ]]; then
-        host_proxy_running && echo "[harness] host proxy left running: other harnesses use it (pid $(echo $proxy_users)); harness host down stops it anyway" >&2
+        # shellcheck disable=SC2086  # one pid per word
+        host_proxy_running && echo "[harness] host proxy left running: other harnesses use it: $(host_proxy_who $proxy_users); harness down stops it anyway" >&2
     else
         host_proxy_stop
     fi
@@ -5457,17 +5468,24 @@ host_proxy_start() {
         fi
         # Another harness is working through this proxy: a restart would cut it
         # off mid-request. Keep it when it still serves this launch the same
-        # way (a .env or code edit waits until they end; the fingerprint stays
-        # old so the next launch after them restarts it), refuse when it can't.
+        # way (a .env or code edit waits until those sessions end; the
+        # fingerprint stays old so the next launch after them restarts it),
+        # refuse when it can't. A serve, queue run or findings run alone does
+        # not keep it: the proxy comes back on the same port.
         others=$(host_proxy_others)
         if [[ -n "$others" ]]; then
+            # shellcheck disable=SC2086  # one pid per word
             if ! host_proxy_same_kind; then
-                err "the host proxy runs with another backend, prompt mode or port, and other harnesses use it (pid $(echo $others))"
-                err "  finish those first, or stop it for all of them: harness host down"
+                err "the host proxy runs with another backend, prompt mode or port, and other harnesses use it: $(host_proxy_who $others)"
+                err "  finish those first, or stop it for all of them: harness down"
                 return 1
             fi
-            echo "[harness] host mode: config changed since the proxy started, but other harnesses use it (pid $(echo $others)); keeping it until they end" >&2
-            return 0
+            others=$(host_proxy_others --sessions)
+            if [[ -n "$others" ]]; then
+                # shellcheck disable=SC2086
+                echo "[harness] host mode: config changed since the proxy started, but other harnesses use it: $(host_proxy_who $others); keeping it until they end (harness down stops it now)" >&2
+                return 0
+            fi
         fi
         # The fingerprint covers the backend as well as .env, so say "config"
         # rather than ".env" — a `harness host` -> `harness chatgpt host`
@@ -5543,14 +5561,16 @@ host_proxy_start() {
 host_proxy_refresh() {
     host_proxy_running || return 0
     local mf b="" m="" others
-    # A restart drops the requests in flight, so not under a working harness.
-    # The proxy's code is in its fingerprint: the first launch after they all
-    # end starts it on the new code.
+    # A restart drops the requests in flight, so not under a working session
+    # (a serve, queue run or findings run alone does not count, see
+    # host_proxy_hold). The proxy's code is in its fingerprint: the first
+    # launch after they all end starts it on the new code.
     # A harness serve upgrading from its u key restarts right after, so its
-    # lease does not keep the old proxy.
-    others=$(host_proxy_others | grep -vxF "${HARNESS_UPGRADE_FROM_SERVE:-x}" || true)
+    # lease (one from before KIND was written) does not keep the old proxy.
+    others=$(host_proxy_others --sessions | grep -vxF "${HARNESS_UPGRADE_FROM_SERVE:-x}" || true)
     if [[ -n "$others" ]]; then
-        echo "[harness] the host proxy keeps the old code while other harnesses use it (pid $(echo $others)); it restarts on the new code once they end"
+        # shellcheck disable=SC2086  # one pid per word
+        echo "[harness] the host proxy keeps the old code while other harnesses use it: $(host_proxy_who $others); it restarts on the new code once they end, or now with: harness down"
         return 0
     fi
     mf=$(host_proxy_modefile)
@@ -5627,34 +5647,80 @@ host_proxy_stop() {
 # Several harnesses share the one host proxy (a harness host in each terminal,
 # harness serve, a queue run and its stage launches). Each holds a lease while
 # it uses the proxy: a file named for its pid under proxy.users. A harness that
-# ends, or that sees the config changed, stops or restarts the proxy only when
-# no other live harness holds one, so closing one terminal no longer cuts off
-# an agent working in another ("Cannot connect to API").
+# ends stops the proxy only when no other live harness holds one, so closing one
+# terminal no longer cuts off an agent working in another ("Cannot connect to
+# API"). The file says what holds it and when that process started:
+#   KIND STARTTIME
+# KIND host or ingest: a session sending requests itself, which a restart would
+# cut off mid-request. serve, queue or findings: a long run that keeps the proxy
+# up for what it starts (each stage or session holds its own host lease); it
+# does not keep a config or code change from restarting the proxy, which serves
+# it again on the same port a moment later. STARTTIME (/proc/PID/stat, empty
+# where there is none) tells a reused pid from the holder.
 host_proxy_usersdir() { printf '%s/host/proxy.users' "$state_root"; }
+host_proxy_starttime() {
+    local s
+    s=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+    s=${s##*) }
+    # shellcheck disable=SC2086  # split into the stat fields after the name
+    set -- $s
+    printf '%s' "${20:-}"
+}
 host_proxy_hold() {
     local d
     d=$(host_proxy_usersdir)
-    mkdir -p "$d" 2>/dev/null && : >"$d/$$" 2>/dev/null || true
+    mkdir -p "$d" 2>/dev/null \
+        && printf '%s %s\n' "${1:-host}" "$(host_proxy_starttime $$)" >"$d/$$" 2>/dev/null || true
 }
 host_proxy_release() { rm -f "$(host_proxy_usersdir)/$$" 2>/dev/null || true; }
-# The pids of the other live harnesses holding a lease, one per line. A lease
-# whose harness is gone (crashed, killed, its pid now some other program's) is
-# removed here.
+# The pids of the other live harnesses holding a lease, one per line; with
+# --sessions only those a restart would cut off (host, ingest, and a lease from
+# before KIND was written). A lease whose harness is gone (crashed, killed, its
+# pid now some other program's or started after the lease) is removed here.
 host_proxy_others() {
-    local d f p
+    local d f p kind st now sessions=0
+    [[ "${1:-}" == --sessions ]] && sessions=1
     d=$(host_proxy_usersdir)
     [[ -d "$d" ]] || return 0
     for f in "$d"/*; do
         [[ -f "$f" ]] || continue
         p=${f##*/}
         [[ "$p" == "$$" ]] && continue
+        kind="" st=""
+        read -r kind st <"$f" 2>/dev/null || true
+        now=""
+        [[ -n "$st" ]] && now=$(host_proxy_starttime "$p")
         if [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null \
+            && [[ -z "$st" || -z "$now" || "$st" == "$now" ]] \
             && { [[ ! -r "/proc/$p/cmdline" ]] || tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q harness; }; then
+            (( sessions )) && [[ "$kind" == serve || "$kind" == queue || "$kind" == findings ]] && continue
             printf '%s\n' "$p"
         else
             rm -f "$f" 2>/dev/null || true
         fi
     done
+}
+# The holders PIDS... by what they are: "harness queue run (pid 12), harness
+# serve (pid 34)". Then, when a background run (a queue run or the findings
+# agent, which harness serve starts with no window) is among them, how to end
+# it: Ctrl-C on every terminal does not.
+host_proxy_who() {
+    local p kind out="" bg=""
+    for p in "$@"; do
+        kind=""
+        read -r kind _ <"$(host_proxy_usersdir)/$p" 2>/dev/null || true
+        case "$kind" in
+            host)     kind="harness host" ;;
+            ingest)   kind="harness ingest" ;;
+            serve)    kind="harness serve" ;;
+            queue)    kind="harness queue run"; bg+=", harness queue halt" ;;
+            findings) kind="harness findings run"; bg+=", harness findings stop" ;;
+            *)        kind="harness" ;;
+        esac
+        out+="${out:+, }$kind (pid $p)"
+    done
+    [[ -n "$bg" ]] && out+=" [in the background: ${bg#, } ends it]"
+    printf '%s' "$out"
 }
 # Done with the proxy: drop this harness's lease, and stop the proxy unless
 # another harness still uses it.
@@ -5663,9 +5729,20 @@ host_proxy_done() {
     host_proxy_release
     others=$(host_proxy_others)
     if [[ -n "$others" ]]; then
-        host_proxy_running && echo "[harness] host proxy left running: other harnesses use it (pid $(echo $others))" >&2
+        # shellcheck disable=SC2086  # one pid per word
+        host_proxy_running && echo "[harness] host proxy left running: other harnesses use it: $(host_proxy_who $others)" >&2
         return 0
     fi
+    host_proxy_stop
+}
+# Stop the proxy whoever holds it (harness down, harness host down), saying
+# who loses it. Quiet when none runs.
+host_proxy_stop_all() {
+    local others
+    host_proxy_running || { host_proxy_stop; return 0; }
+    others=$(host_proxy_others)
+    # shellcheck disable=SC2086  # one pid per word
+    [[ -n "$others" ]] && echo "[harness] stopping the host proxy under $(host_proxy_who $others); their requests fail until a harness host or a queue stage starts it again" >&2
     host_proxy_stop
 }
 # The backend, explicit prompt mode and port the running proxy started with
@@ -6971,7 +7048,7 @@ HELP
         host_preflight        || { host_win_location_hint; exit 1; }
         _gate_on_upstream_auth || exit 1
         host_proxy_running || started=1
-        host_proxy_hold
+        host_proxy_hold ingest
         host_proxy_start || { host_proxy_release; exit 1; }
         host_proxy_wait_ready || { host_proxy_done; exit 1; }
     fi
@@ -7514,7 +7591,7 @@ HELP
             host_proxy_running || started=1
             # Held for the whole run (the exec below keeps the pid, so the
             # lease too): a harness host closed meanwhile leaves the proxy up.
-            host_proxy_hold
+            host_proxy_hold queue
             host_proxy_start || { host_proxy_release; exit 1; }
             host_proxy_wait_ready || { host_proxy_done; exit 1; }
             dir=$(vault_prepare)
@@ -7739,7 +7816,7 @@ HELP
             _gate_on_upstream_auth || exit 1
             host_proxy_running || started=1
             # Held for the whole run, so a harness closed meanwhile leaves the proxy up.
-            host_proxy_hold
+            host_proxy_hold findings
             host_proxy_start || { host_proxy_release; exit 1; }
             host_proxy_wait_ready || { host_proxy_done; exit 1; }
             mkdir -p "$fdir"
@@ -8273,7 +8350,7 @@ EOF
     # in host_write_opencode_config below.
     _print_upstream_models || exit 1
 
-    host_proxy_hold
+    host_proxy_hold host
     host_proxy_start || { host_proxy_release; exit 1; }
     host_proxy_wait_ready || { host_proxy_done; exit 1; }
     host_write_opencode_config
@@ -8746,7 +8823,7 @@ HELP
     _print_upstream_models || exit 1
     # Held while serve runs (its restart after an upgrade keeps the pid); a
     # crashed serve's lease is dropped by the next host_proxy_others.
-    host_proxy_hold
+    host_proxy_hold serve
     host_proxy_start || { host_proxy_release; exit 1; }
     host_proxy_wait_ready || { host_proxy_done; exit 1; }
     host_write_opencode_config
@@ -8846,12 +8923,9 @@ HELP
 }
 
 cmd_host_down() {
-    local others
     if host_proxy_running; then
-        others=$(host_proxy_others)
-        [[ -n "$others" ]] && echo "[harness] host mode: other harnesses still use the proxy (pid $(echo $others)); their requests fail until a harness host starts it again" >&2
         echo "[harness] host mode: stopping proxy" >&2
-        host_proxy_stop
+        host_proxy_stop_all
     else
         echo "[harness] host mode: no proxy running" >&2
     fi
@@ -8937,7 +9011,7 @@ EOF
         # argument. `down` is dialect-agnostic but routed for symmetry.
         start)     shift; cmd_start "$@" ;;
         restart)   shift; cmd_restart "$@" ;;
-        down)      shift; cmd_down "$@" ;;
+        down)      shift; cmd_down_all "$@" ;;
         *)    run_agent opencode "$@" ;;
     esac
 }
@@ -13445,7 +13519,7 @@ main() {
     case "$cmd" in
         help)                       cmd_help ;;
         start)                      cmd_start "$@" ;;
-        down)                       cmd_down ;;
+        down)                       cmd_down_all ;;
         restart)                    cmd_restart "$@" ;;
         update)                     cmd_update ;;
         upgrade)                    cmd_upgrade "$@" ;;
