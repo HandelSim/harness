@@ -87,6 +87,7 @@ import argparse
 import collections
 import contextlib
 import datetime
+import glob
 import hashlib
 import json
 import os
@@ -3828,55 +3829,151 @@ def panel_dir(ctx, key):
     return os.path.join(ctx.q.dir(key), "panel")
 
 
+def member_task(vault, key, tag):
+    """A panel member's prompt while it runs (its card's "part" names it to the proxy):
+    the members run at once, so each has its own, not KEY-task.md."""
+    return os.path.join(vault, "wiki", "notes", "tickets", f"{key}-task-{tag}.md")
+
+
 def run_panel(ctx, st, stage, members):
     """Each member of members [{tag, path, model, prompt(), check(text) -> problems, done}]
-    launched in turn (not resumed, not the stage's own agent: its session and result are
-    cleared after it), its file moved out of the vault (see above). [(tag, text)] of the
-    members whose file passed its check, in members' order."""
+    not done yet launched at once, each in a thread (launch's member mode): a new agent
+    (not resumed, not the stage's own agent: the stage's session and result are left
+    alone), its prompt in its own task file, its output DIR/<stage>-N-<tag>.out. As each
+    ends its file is moved out of the vault (see above) and its result saved, so one that
+    ended before a halt, a failed launch or a run that dies is kept and not launched
+    again. The vault is committed once, when all have ended. A halt stops them all; a
+    launch that failed (or an upstream that does not answer) is raised once the others
+    have ended. [(tag, text)] of the members whose file passed its check, in members' order."""
     key = st["key"]
+    lock = st_lock(ctx)
     pan = panel_of(st, stage)
     if pan is None:
         pan = st["panel"] = {"stage": stage, "members": {}, "done": False}
     os.makedirs(panel_dir(ctx, key), exist_ok=True)
-    for m in members:
-        if m["tag"] in pan["members"]:
-            continue
+    todo = [m for m in members if m["tag"] not in pan["members"]]
+    if todo:
         checkpoint(ctx)
+        launch_all(ctx, st, stage, pan, todo, lock)
+    return [(m["tag"], read(pan["members"][m["tag"]]["file"])) for m in members
+            if pan["members"].get(m["tag"], {}).get("ok") and pan["members"][m["tag"]].get("file")]
+
+
+def launch_all(ctx, st, stage, pan, todo, lock):
+    key = st["key"]
+    ticket, kept_ticket = note_paths(ctx.vault, key)["ticket"], os.path.join(ctx.q.dir(key), "ticket.md")
+    if read(ticket).strip():   # the checks quote it: an agent that deletes it would fail them all
+        write_atomic(kept_ticket, read(ticket))
+    if not st.get("in_place"):
+        copy_instructions(st["project"], workdir(ctx.q, st))
+    jobs = []
+    for m in todo:   # all built here, before any thread starts: the threads only launch and record
         kept = os.path.join(panel_dir(ctx, key), f"{stage}-{m['tag']}.md")
         drop(m["path"])
         drop(kept)
-        for k in ("session", "resume", "verify_only"):
-            st.pop(k, None)
-        st["panel_file"] = m["path"]
-        ctx.q.save(st)
-        started = time.time()
+        task = member_task(ctx.vault, key, m["tag"])
+        prompt = m["prompt"]()
+        model = m["model"] if "/" in m["model"] else "harness/" + m["model"]
+        card = task_card(ctx, st, stage)
+        if card:
+            card.update(done=m["done"], part=m["tag"])
+        jobs.append({"m": m, "kept": kept, "task": task, "prompt": prompt, "card": card,
+                     "cmd": agent_cmd(ctx, key, model, prompt_arg(ctx, st, stage, prompt, task)),
+                     "out": os.path.join(ctx.q.dir(key), f"{stage}-{st['attempt']}-{m['tag']}.out")})
+    for k in ("session", "resume", "verify_only"):   # the stage's own agent's: the members are others
+        st.pop(k, None)
+    since = int(time.time() * 1000)
+    for j in jobs:
+        write_atomic(j["task"], j["prompt"])
+    if st.get("in_place"):   # one snapshot and one launch span for all of them
+        exclude_block(st["project"], None)
+        snapshot(ctx.q, st, stage)
+        exclude_block(st["project"], owner_files(ctx.q, st).get("untracked"))
+        st["launches"] = (st.get("launches") or [])[-(HISTORY_CAP - 1):] + [[since, 0]]
+    ctx.q.save(st)
+    names = ", ".join(f"{j['m']['tag']} ({j['m']['model']})" for j in jobs)
+    ctx.q.log(key, f"{stage} panel: {names} start" + (" at once" if len(jobs) > 1 else ""))
+    step(ctx, f"{len(jobs)} {stage} agent{'s are' if len(jobs) > 1 else ' is'} working")
+    ended = {}   # tag: None (ran and recorded) or the exception its launch raised
+    aborted = threading.Event()   # the run is going down (Ctrl-C): nothing more is recorded
 
-        def collect(src=m["path"], dst=kept, t0=started):
-            if fresh(src, t0):
-                write_atomic(dst, read(src))
-            drop(src)
-
-        ctx.q.log(key, f"{stage} panel: {m['tag']} ({m['model']}) starts")
+    def go(j):
+        m = j["m"]
         try:
-            rc, out = run_agent(ctx, st, stage, m["prompt"](), member={"tag": m["tag"], "model": m["model"],
-                                                                         "done": m["done"], "collect": collect})
-        finally:
-            st.pop("panel_file", None)
-            ctx.q.save(st)
-        for k in ("session", "resume", "verify_only"):   # the member's: the stage's own agent is another
-            st.pop(k, None)
-        text = read(kept)
+            rc = launch(ctx, st, j["cmd"], j["out"], since, j["card"],
+                        member={"tag": m["tag"], "file": m["path"], "task": j["task"]})
+        except BaseException as e:  # noqa: BLE001 - handed to run_panel's thread
+            drop(j["task"])
+            ended[m["tag"]] = e
+            return
+        drop(j["task"])
+        if aborted.is_set():
+            return
+        try:
+            take_result(j, rc)
+            ended[m["tag"]] = None
+        except BaseException as e:  # noqa: BLE001
+            ended[m["tag"]] = e
+
+    def take_result(j, rc):
+        m = j["m"]
+        if fresh(m["path"], since / 1000):
+            write_atomic(j["kept"], read(m["path"]))
+        drop(m["path"])
+        text = read(j["kept"])
         problems = m["check"](text) if text.strip() else [f"it wrote no file ({os.path.basename(m['path'])})"]
         if rc not in (0, None) and not text.strip():
             problems.insert(0, f"its launch exited with status {rc}")
-        pan["members"][m["tag"]] = {"ok": not problems, "file": kept if text.strip() else "", "out": out,
-                                    "model": m["model"], "problems": [clip(x, 300) for x in problems[:5]],
-                                    "at": now_iso()}
-        ctx.q.save(st)
+        with lock:
+            pan["members"][m["tag"]] = {"ok": not problems, "file": j["kept"] if text.strip() else "",
+                                        "out": j["out"], "model": m["model"],
+                                        "problems": [clip(x, 300) for x in problems[:5]], "at": now_iso()}
+            ctx.q.save(st)
         ctx.q.log(key, f"{stage} panel: {m['tag']} " + ("passed its check" if not problems else
                                                          "did not count: " + "; ".join(problems[:3])))
-    return [(m["tag"], read(pan["members"][m["tag"]]["file"])) for m in members
-            if pan["members"].get(m["tag"], {}).get("ok") and pan["members"][m["tag"]].get("file")]
+
+    threads = [threading.Thread(target=go, args=(j,), daemon=True, name=f"panel-{j['m']['tag']}") for j in jobs]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            while t.is_alive():
+                t.join(POLL)
+    except BaseException:   # Ctrl-C (only this thread gets it): every member's agent is stopped
+        aborted.set()
+        with lock:
+            kids, live = list(getattr(ctx, "children", ())), list((st.get("agents") or {}).values())
+        for p in kids:
+            stop(p)
+        for a in live:
+            stop_containers(ctx, st, a.get("launch"))
+        raise
+    for j in jobs:   # one that did not end on its own (halt, failed launch) leaves nothing in the vault
+        drop(j["task"])
+        if ended.get(j["m"]["tag"]) is not None:
+            drop(j["m"]["path"])
+    with lock:
+        if st.get("in_place"):
+            st["launches"][-1][1] = int(time.time() * 1000)
+            with contextlib.suppress(RuntimeError, OSError, subprocess.SubprocessError):
+                exclude_block(st["project"], None)
+        left = list((st.get("agents") or {}).values())   # stopped, but a container may still run
+    for a in left:
+        reap_one(ctx.q, st, a, ctx.harness, f"its {stage} panel ended")
+    with lock:
+        st.pop("agents", None)
+        ctx.q.save(st)
+    if not read(ticket).strip() and read(kept_ticket).strip():
+        write_atomic(ticket, read(kept_ticket))
+        ctx.q.log(key, f"a {stage} panel agent deleted the ticket's text ({ticket}); put back")
+    sync_vault(ctx, key, since)
+    errors = [e for e in ended.values() if e is not None]
+    for kind in (Interrupted, Infra):   # a halt first: it is the owner's
+        for e in errors:
+            if isinstance(e, kind):
+                raise e
+    if errors:
+        raise errors[0]
 
 
 def panel_done(ctx, st, stage, summary):
@@ -5692,6 +5789,7 @@ def run_parallel(q, a, locked_at):
 
 
 TASK_IGNORE = "wiki/notes/tickets/*-task.md"
+PART_IGNORE = "wiki/notes/tickets/*-task-*.md"   # a panel member's (member_task)
 
 
 def keep_tasks_out(q, vault):
@@ -5700,15 +5798,22 @@ def keep_tasks_out(q, vault):
     path = os.path.join(vault, ".gitignore")
     try:
         text = read(path) if os.path.exists(path) else ""
-        if TASK_IGNORE not in text.splitlines():
+        have = text.splitlines()
+        if TASK_IGNORE not in have:
             with open(path, "a", encoding="utf-8", newline="\n") as f:
                 f.write(("" if not text or text.endswith("\n") else "\n")
                         + "# harness queue: a stage's prompt while it runs\n" + TASK_IGNORE + "\n")
+            text = read(path)
+        if PART_IGNORE not in have:
+            with open(path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(("" if not text or text.endswith("\n") else "\n") + PART_IGNORE + "\n")
     except OSError as e:
         print(f"[queue] warning: could not add {TASK_IGNORE} to {path}: {e}", file=sys.stderr)
     for key in os.listdir(q.root):
         if os.path.isfile(os.path.join(q.root, key, "state.json")):
             drop(note_paths(vault, key)["task"])
+            for path in glob.glob(member_task(vault, key, "*")):
+                drop(path)
 
 
 PARKED = ("plan-review", "needs-answers", "blocked", "stopped", "done")
