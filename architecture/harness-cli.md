@@ -2895,10 +2895,13 @@ its children and `exec`s the clone's new `harness serve` with its original
 arguments in the same terminal; the upgrade waits for the new stamp. Keys:
 when stdin is a terminal and serve is its foreground job
 (`_serve_tty_foreground`: pgrp equals the tty's tpgid, from `/proc/$$/stat`
-or `ps`), `_serve_wait_keys` replaces `wait -n`: each second it checks both
-children with `kill -0` and reads one key (`read -rsn1 -t 1`, no echo; bash
-restores the modes, also on Ctrl-C), rechecking the foreground first so a
-backgrounded serve neither stops on SIGTTIN nor sets the modes under the
+or `ps`; a tpgid of -1 is "cannot tell", which Git Bash's `/proc` gives for
+every process, so there `_serve_tty_in_front` asks once at start with perl's
+`POSIX::tcgetpgrp`, and no answer counts as in front), `_serve_wait_keys`
+replaces `wait -n`: each second it checks both children with `kill -0` and
+reads one key (`read -rsn1 -t 1`, no echo; bash restores the modes, also on
+Ctrl-C), rechecking the foreground first (not on Git Bash: once at start) so
+a backgrounded serve neither stops on SIGTTIN nor sets the modes under the
 shell in front; at end of input it falls back to `wait -n`. `u` asks
 `[y/N]`, then runs `$clone_dir/harness upgrade` in the foreground, in line
 mode so its `/dev/tty` prompts work, with `HARNESS_UPGRADE_FROM_SERVE=<serve
@@ -2936,8 +2939,10 @@ cmd_upgrade's three refreshes: other keys ignored and not echoed, `u` then
 `n`, a failed upgrade (serve unchanged), the restart (same pid, new stamp,
 old stubs gone, refresh under 3 s), keys after the exec, a killed pub.py
 ending serve with status 1, Ctrl-C idle and in the upgrade (exit 130,
-nothing left, echo and line mode back), and a background-job serve (no key,
-never stopped). S13: the lease exclusion in `host_proxy_refresh`.
+nothing left, echo and line mode back), a background-job serve (no key,
+never stopped), a serve whose `/proc` tpgid is -1 as on Git Bash (a pty
+that is not its controlling terminal: key, upgrade, restart, key again), and
+the perl check from the foreground and from a background job. S13: the lease exclusion in `host_proxy_refresh`.
 
 ## ChatGPT backend (`harness chatgpt`)
 
