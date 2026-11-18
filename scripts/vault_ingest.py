@@ -619,8 +619,18 @@ DOMAIN_RULES = """- Terms: the words of this field a newcomer would not know: ja
   in double quotes. A line without a quote found in the source is thrown away.
 - Write `- none` under a heading with nothing in this part."""
 
+# With ALREADY_IN_VAULT: what other units wrote, so this one adds to it instead of repeating it.
+_KNOWN_TOPICS = ("- Topics: when ALREADY_IN_VAULT lists a topic that names the same concept, use that exact name "
+                 "rather than a new spelling, synonym or plural of it.")
+KNOWN_RULES = {
+    "code": _KNOWN_TOPICS,
+    DOMAIN: _KNOWN_TOPICS + "\n- A term ALREADY_IN_VAULT lists: leave it out unless this part defines it "
+            "differently, and then spell it exactly as listed.",
+    "raw": _KNOWN_TOPICS + "\n- Keep: no line ALREADY_IN_VAULT lists, and none that says the same in other words.",
+}
 
-def build_prompt(u, charter_text, context):
+
+def build_prompt(u, charter_text, context, known=""):
     extra = ""
     if u["kind"] == "code":
         what = (f"directory `{u['path']}` of the codebase `{u['repo']}`"
@@ -629,6 +639,8 @@ def build_prompt(u, charter_text, context):
     else:
         what = (f"the {u['stype']} `{u['source']}`" + (f", part {u['part']} of {u['parts']}" if u["parts"] > 1 else ""))
         fmt, extra = (DOMAIN_FORMAT, "\n" + DOMAIN_RULES) if u["stype"] == DOMAIN else (RAW_FORMAT, "\n" + KEEP_RULE)
+    if known:
+        extra += "\n" + KNOWN_RULES[known_kind(u)]
     rules = f"""Write ONE section of a knowledge-base page about {what}.
 Reply with ONLY the section, in exactly this format:
 
@@ -645,6 +657,8 @@ Rules:
     parts = []
     if charter_text:
         parts.append("<<<BEGIN_VAULT_CHARTER>>>\n" + charter_text + "\n<<<END_VAULT_CHARTER>>>")
+    if known:
+        parts.append("<<<BEGIN_ALREADY_IN_VAULT>>>\n" + known + "\n<<<END_ALREADY_IN_VAULT>>>")
     if context:
         parts.append("<<<BEGIN_CONTEXT>>>\n" + context + "\n<<<END_CONTEXT>>>")
     parts.append("<<<BEGIN_SOURCE>>>\n" + u["text"] + "\n<<<END_SOURCE>>>")
@@ -679,6 +693,11 @@ def topic_name(raw):
     t = re.sub(r"\s+", " ", raw.replace("_", " ")).strip().lower()
     t = safe_name(t)
     return t if 2 <= len(t) <= 60 else ""
+
+
+def topic_key(name):
+    """A topic as hubs group it: case and spacing do not make another topic."""
+    return " ".join(name.replace("_", " ").split()).lower()
 
 
 def clean_reply(text):
@@ -799,9 +818,9 @@ def check(reply, u):
     return summary, body, topics, problems
 
 
-def ingest_unit(u, proxy, model, charter_text, context, timeout):
+def ingest_unit(u, proxy, model, charter_text, context, timeout, known=""):
     """(summary, body, topics, problems); raises InfraError."""
-    prompt = build_prompt(u, charter_text, context)
+    prompt = build_prompt(u, charter_text, context, known)
     messages = [{"role": "user", "content": prompt}]
     reply = call_model(proxy, model, messages, timeout)
     summary, body, topics, problems = check(reply, u)
@@ -969,12 +988,78 @@ def term_patterns(term):
     return pats
 
 
+def fold(text):
+    """Text as two wordings of one line are compared: norm, no punctuation, single spaces."""
+    return " ".join(re.sub(r"[^\w ]", " ", norm(text)).split())
+
+
+def term_keys(term):
+    """The keys a term is found by: its name folded, and for `Full Name (ABBR)` the
+    full name and the abbreviation (("abbr", ABBR)), each also without a plural s."""
+    m = re.match(r"^(.+?)\s*\(([^()]+)\)\s*$", term)
+    out = []
+    for n, abbr in ((m.group(1), False), (m.group(2), True)) if m else ((term, False),):
+        k = fold(n)
+        for x in (k, k[:-1] if len(k) > 3 and k.endswith("s") else ""):
+            if x:
+                out.append(("abbr", x) if abbr else x)
+    return out
+
+
+class Glossary:
+    """Terms merged by name: a term two documents (or two parts of one) define, or
+    one written `NAV` here and `Net Asset Value (NAV)` there, is one entry; its
+    definitions that differ are kept beside each other. An abbreviation that two
+    different full names claim merges nothing."""
+
+    def __init__(self):
+        self.entries, self.by_key, self.abbr = [], {}, {}
+
+    def find(self, term):
+        for k in term_keys(term):
+            if isinstance(k, tuple):   # (ABBR) merges only with a bare ABBR entry: two full names
+                hit = self.by_key.get(k[1])   # sharing an abbreviation are two things
+                hit = hit if isinstance(hit, int) and "(" not in self.entries[hit]["term"] else None
+            else:
+                hit = self.by_key.get(k)
+                if hit is None and " " not in k:   # a bare NAV: the entry whose abbreviation it is
+                    hit = self.abbr.get(k)
+            if isinstance(hit, int):
+                return hit
+        return None
+
+    def add(self, term, definition, page):
+        i = self.find(term)
+        if i is None:
+            i = len(self.entries)
+            self.entries.append({"term": term, "defs": {}})
+        e = self.entries[i]
+        if "(" in term and "(" not in e["term"]:
+            e["term"] = term   # the spelling that carries both names
+        d = e["defs"].setdefault(fold(definition), [definition, []])
+        if page not in d[1]:
+            d[1].append(page)
+        for k in term_keys(term):
+            if isinstance(k, tuple):
+                owner = self.abbr.get(k[1])
+                self.abbr[k[1]] = i if owner in (None, i) else "ambiguous"
+            else:
+                self.by_key.setdefault(k, i)
+
+    def lines(self):
+        out = {}
+        for e in self.entries:
+            defs = [f"{d} ({', '.join(f'[[{p}]]' for p in pages)})" for d, pages in e["defs"].values()]
+            out.setdefault(e["term"].lower(), f"- **{e['term']}**: " + "; ".join(defs))
+        return [out[k] for k in sorted(out)]
+
+
 def write_glossary(vault, pages):
-    """wiki/domain/glossary.md from the Terms and Rules of the domain pages:
-    every definition kept, one line per term per document, sorted so two
-    documents' definitions of a term sit together."""
+    """wiki/domain/glossary.md from the Terms and Rules of the domain pages: one
+    line per term (Glossary), each definition that differs kept with the pages that
+    give it, and one line per rule however it is punctuated."""
     path = os.path.join(vault, GLOSSARY)
-    terms, rules, docs = {}, {}, 0
+    gl, rules, docs = Glossary(), {}, 0
     for rel, p in sorted(pages.items()):
         if not (rel.startswith(DOMAIN + "/") and p["generated"] and p["meta"].get("type") == DOMAIN):
             continue
@@ -982,18 +1067,22 @@ def write_glossary(vault, pages):
         for item in section_items(p["body"], "Terms"):
             td = split_term(item)
             if td:
-                terms.setdefault((td[0].lower(), norm(td[1])), f"- **{td[0]}**: {td[1]} ([[{p['name']}]])")
+                gl.add(td[0], td[1], p["name"])
         for item in section_items(p["body"], "Rules"):
-            rules.setdefault(norm(item), f"- {item} ([[{p['name']}]])")
+            r = rules.setdefault(fold(item), [item, []])
+            if p["name"] not in r[1]:
+                r[1].append(p["name"])
+    term_lines = gl.lines()
+    rule_lines = {k: f"- {item} ({', '.join(f'[[{n}]]' for n in names)})" for k, (item, names) in rules.items()}
     if not docs:
         if GENERATED in (read_text(path) or "")[:2000]:
             os.remove(path)
         return
-    text = (f"---\ntype: glossary\nsummary: {yq(f'{len(terms)} terms and {len(rules)} rules of the domain, from {docs} documents')}\n"
+    text = (f"---\ntype: glossary\nsummary: {yq(f'{len(term_lines)} terms and {len(rules)} rules of the domain, from {docs} documents')}\n"
             f"{GENERATED}\n---\n\n# Glossary\n\nGenerated by harness from the documents in `.raw/{DOMAIN}/`; do not edit. "
             "grep this file for a word. Each line links to its document's page, which quotes the source.\n\n"
-            "## Terms\n\n" + "\n".join(terms[k] for k in sorted(terms)) + "\n\n## Rules\n\n"
-            + ("\n".join(rules[k] for k in sorted(rules)) or "- none") + "\n")
+            "## Terms\n\n" + "\n".join(term_lines) + "\n\n## Rules\n\n"
+            + ("\n".join(rule_lines[k] for k in sorted(rule_lines)) or "- none") + "\n")
     write_if_changed(path, text)
 
 
@@ -1070,24 +1159,66 @@ def ticket_contexts(vault, only=None):
         write_if_changed(path, text)
 
 
+SAME_LINE = 0.7   # two Keep lines whose word sets overlap this much (Jaccard) say the same thing
+
+
+def keep_source(rel, p):
+    """A page whose Keep lines are candidates: an ingested session or source, not a
+    copy of the project's AGENTS.md (.raw/context/), which they would only repeat."""
+    return rel.startswith("sources/") and not rel.startswith("sources/context--") and p["generated"]
+
+
+def keep_line(item):
+    """(kind, line) of a Keep item."""
+    m = re.match(r"\[([^\]]{1,40})\]\s*:?\s*(\S.*)$", item)
+    return ("note", item) if not m else (next((k for k in KINDS if k in m.group(1).lower()), "note"), m.group(2))
+
+
+STOP = frozenset("the and for you your with that this from are was were has have not but its into then than "
+                 "when what which use used using".split())
+
+
+def words(text):
+    """The words of a line as same_line compares them: no short or common words, a
+    plain suffix (s, es, ed, ing) off, so `push` and `pushing` count as one."""
+    out = set()
+    for w in fold(text).split():
+        if len(w) > 2 and w not in STOP:
+            out.add(re.sub(r"(?<=\w{3})(ing|ed|es|s)$", "", w))
+    return out
+
+
+def same_line(a, b):
+    return bool(a and b) and len(a & b) >= SAME_LINE * len(a | b)
+
+
 def write_candidates(vault, pages):
     """wiki/candidates.md: the Keep lines of the session and source pages,
-    newest first, a line several sessions repeat counted once. For the owner to
-    copy the right ones into the project's AGENTS.md; no agent is given it."""
+    newest first, a line several sessions repeat (in the same or other words,
+    same_line) counted once. For the owner to copy the right ones into the
+    project's AGENTS.md; no agent is given it."""
     items = {}
     for rel, p in pages.items():
-        if not (rel.startswith("sources/") and p["generated"]):
+        if not keep_source(rel, p):
             continue
         d = re.search(r"\d{4}-\d{2}-\d{2}", p["name"])
         day = d.group(0) if d else str(p["meta"].get("updated", ""))[:10]
         for item in section_items(p["body"], "Keep"):
-            m = re.match(r"\[([^\]]{1,40})\]\s*:?\s*(\S.*)$", item)
-            kind, line = ("note", item) if not m else (
-                next((k for k in KINDS if k in m.group(1).lower()), "note"), m.group(2))
-            e = items.setdefault(re.sub(r"[^\w ]", "", norm(line)), {"kind": kind, "line": line, "day": "", "pages": set()})
+            kind, line = keep_line(item)
+            e = items.setdefault(fold(line), {"kind": kind, "line": line, "day": "", "pages": set()})
             e["pages"].add(p["name"])
             if day >= e["day"]:
                 e["day"], e["line"], e["kind"], e["page"] = day, line, kind, p["name"]
+    merged = []   # newest first, each line folded into an earlier one that says the same
+    for e in sorted(items.values(), key=lambda e: (e["day"], len(e["pages"]), e["line"]), reverse=True):
+        w = words(e["line"])
+        into = next((x for x in merged if same_line(w, x["words"])), None)
+        if into:
+            into["pages"] |= e["pages"]
+        else:
+            e["words"] = w
+            merged.append(e)
+    items = {i: e for i, e in enumerate(merged)}
     path = os.path.join(vault, CANDIDATES)
     if not items:
         if GENERATED in (read_text(path) or "")[:2000]:
@@ -1105,6 +1236,66 @@ def write_candidates(vault, pages):
     write_if_changed(path, text)
 
 
+KNOWN_TOPICS = 150   # topic names shown to a unit, most used first
+KNOWN_TERMS = 300    # glossary terms shown to a domain unit
+KNOWN_KEEP = 80      # Keep lines shown to a session or source unit
+KNOWN_CAP = 9000     # characters of the whole block
+
+
+def known_kind(u):
+    return "code" if u["kind"] == "code" else DOMAIN if u.get("stype") == DOMAIN else "raw"
+
+
+class Known:
+    """What the vault already has that a unit could repeat: the topic names in use,
+    the glossary's terms and the Keep lines. Read from the wiki once per run and
+    added to as each unit is written, so the next unit sees this run's too
+    (ALREADY_IN_VAULT in its prompt)."""
+
+    def __init__(self, vault):
+        self.topics, self.terms, self.keep = {}, {}, {}
+        for path, rel in wiki_pages(vault):
+            if rel.startswith(("topics/", "tickets/", CONTEXT_DIR[5:] + "/")) or rel in ("index.md", "log.md") \
+                    or rel in (GLOSSARY[5:], CANDIDATES[5:]):
+                continue
+            text = read_text(path) or ""
+            meta, body = frontmatter(text)
+            p = {"meta": meta, "generated": GENERATED in text[:2000]}
+            topics = [t for line in re.findall(r"^Topics:(.*)$", body, re.M)
+                      for t in re.findall(r"\[\[([^\]|#]+)", line)]
+            self.add(rel, body, topics, p)
+
+    def add(self, rel, body, topics, p=None):
+        for t in topics:
+            k = topic_key(t)
+            if k:
+                self.topics[k] = self.topics.get(k, 0) + 1
+        generated = p is None or p["generated"]
+        if rel.startswith(DOMAIN + "/") and generated and (p is None or p["meta"].get("type") == DOMAIN):
+            for item in section_items(body, "Terms"):
+                td = split_term(item)
+                if td:
+                    self.terms.setdefault(fold(td[0]), td[0])
+        if keep_source(rel, {"generated": generated}):
+            for item in section_items(body, "Keep"):
+                line = keep_line(item)[1]
+                self.keep.pop(fold(line), None)
+                self.keep[fold(line)] = line   # the newest last
+
+    def text(self, u):
+        out = []
+        top = sorted(self.topics.items(), key=lambda kv: (-kv[1], kv[0]))[:KNOWN_TOPICS]
+        if top:
+            out.append("Topics already used: " + ", ".join(f"[[{t}]]" for t, _ in top))
+        kind = known_kind(u)
+        if kind == DOMAIN and self.terms:
+            out.append("Terms already in the glossary: " + "; ".join(sorted(self.terms.values(), key=str.lower)[:KNOWN_TERMS]))
+        if kind == "raw" and self.keep:
+            out.append("Keep lines already taken:\n" + "\n".join(f"- {x}" for x in list(self.keep.values())[-KNOWN_KEEP:]))
+        text = "\n\n".join(out).replace("<<<", "<< <").replace(">>>", "> >>")   # never a block marker
+        return text if len(text) <= KNOWN_CAP else text[:KNOWN_CAP].rsplit("\n", 1)[0]
+
+
 def regenerate(vault):
     """Rebuild every generated hub, link block and wiki/index.md. Cheap and
     deterministic: run after ingest and after every session."""
@@ -1115,13 +1306,17 @@ def regenerate(vault):
         pages[rel] = {"path": path, "name": rel.rsplit("/", 1)[-1][:-3], "meta": meta, "body": body,
                       "generated": GENERATED in text[:2000]}
     hubs = lambda rel: rel.startswith(("topics/", "tickets/"))  # noqa: E731
-    topics, tickets = {}, {}
+    topics, tickets, spelled = {}, {}, {}
     for rel, p in pages.items():
         if hubs(rel) or rel in ("index.md", "log.md"):
             continue
         for line in re.findall(r"^Topics:(.*)$", p["body"], re.M):
             for t in re.findall(r"\[\[([^\]|#]+)", line):
-                topics.setdefault(t.strip(), set()).add(rel)
+                k = topic_key(t)   # [[Auth]] by hand and [[auth]] generated: one hub
+                if k:
+                    topics.setdefault(k, set()).add(rel)
+                    sp = spelled.setdefault(k, {})
+                    sp[t.strip()] = sp.get(t.strip(), 0) + 1
         for line in re.findall(r"^Tickets:(.*)$", p["body"], re.M):
             for t in re.findall(r"\[\[([^\]|#]+)", line):
                 tickets.setdefault(t.strip(), set()).add(rel)
@@ -1159,8 +1354,15 @@ def regenerate(vault):
                 w = worked.setdefault(t, {"tickets": [], "sessions": []})
                 w[sub].append(source(f"{sub}/{n}", meta.get("title", "")))
     keep = set()
-    for t, refs in topics.items():
+
+    def kept_as(rel):
+        """On a filesystem blind to case, topics/Foo.md is the topics/foo.md just written."""
+        twin = next((k for k in keep if k.lower() == rel.lower()), None)
+        return bool(twin) and os.path.exists(os.path.join(vault, "wiki", twin)) \
+            and os.path.samefile(os.path.join(vault, "wiki", twin), pages[rel]["path"])
+    for k, refs in topics.items():
         if len(refs) >= 2:
+            t = max(sorted(spelled[k]), key=lambda x: (spelled[k][x], x == x.lower()))   # the most used spelling
             keep.add(hub("topics", "topic", t, refs, "Generated topic hub: every page whose Topics line names it."))
     for t in sorted(set(tickets) | set(worked)):
         w = worked.get(t, {})
@@ -1176,7 +1378,7 @@ def regenerate(vault):
         keep.add(hub("tickets", "ticket", t, tickets.get(t, set()),
                      "Generated ticket hub: every page that mentions this ticket.", more, summary))
     for rel, p in list(pages.items()):
-        if hubs(rel) and p["generated"] and rel not in keep:
+        if hubs(rel) and p["generated"] and rel not in keep and not kept_as(rel):
             os.remove(p["path"])
             del pages[rel]
 
@@ -1471,6 +1673,7 @@ def run_ingest(a, run):
         by_page = {}
         for u in units:
             by_page.setdefault(u["page"], []).append(u)
+        known = Known(vault) if todo else None
         infra, since_commit, wrote = 0, 0, 0
         run.set(step="ingesting", left=len(todo))
         for n, u in enumerate(todo, 1):
@@ -1479,7 +1682,8 @@ def run_ingest(a, run):
             old = existing_sections(path)
             ctx = context_for(vault, u, {u["page"]: [(k, section_summary(v[1])) for k, v in old.items()]})
             try:
-                summary, body, topics, problems = ingest_unit(u, a.proxy, model, charter_text, ctx, a.timeout)
+                summary, body, topics, problems = ingest_unit(u, a.proxy, model, charter_text, ctx, a.timeout,
+                                                              known.text(u))
             except InfraError as e:
                 run.set(left=len(todo) - n)
                 infra += 1
@@ -1502,6 +1706,7 @@ def run_ingest(a, run):
                 tickets = sorted(set(ticket_re.findall(u["text"])))[:20] if ticket_re else []
                 sec = render_section(u, summary, body, topics, tickets)
                 assemble_page(vault, by_page[u["page"]], {u["id"]: sec})
+                known.add(f"{u['dir'][5:]}/{u['page']}.md", body, topics)
                 entry = {"sha": u["sha"], "page": f"{u['dir']}/{u['page']}.md", "status": "ok", "attempts": 0, "at": now_iso()}
                 print(f"[ingest] {u['id']} -> {u['dir']}/{u['page']}.md", file=sys.stderr)
             m["units"][u["id"]] = entry

@@ -29,7 +29,9 @@
 #   - domain documents                    md/html/docx (a bad pdf skipped),
 #                                         quote-checked Terms, Rules and Keep
 #                                         lines, the glossary, a ticket's
-#                                         context page, the candidates
+#                                         context page, the candidates, and
+#                                         a term, rule, Keep line or topic
+#                                         two pages share written once
 #   - tickets of your own                 vault_ticket.py --new and harness
 #                                         ticket new: LOCAL-N, never pulled
 #
@@ -418,6 +420,7 @@ rows = [json.loads(l) for l in open(sys.argv[1])]
 assert rows and all(r["raw"] == "1" and r["model"] == "free-m" for r in rows), "raw header / free model"
 assert any("a test vault, it's for proj" in r["prompt"] for r in rows), "the charter goes with each request"
 assert all("Reminder, the task:" in r["prompt"].split("<<<END_SOURCE>>>")[-1] for r in rows), "rules repeated after the source"
+assert any("Topics already used: " in r["prompt"] and "[[shared topic]]" in r["prompt"] for r in rows), "later units see the topics in use"
 PYEOF
 src_page="$V/wiki/code/proj/proj--src.md"
 grep -q '^> covers src/app.py' "$src_page" || fail "V10: the section's summary line — $(cat "$src_page")"
@@ -1317,6 +1320,55 @@ grep -q 'pdf' <<<"$out" && fail "V27: status prints no ingest warnings — $out"
         || fail "V27: the overlay hands the ticket's context to the agent"
 ) || exit 1
 ok "V27: domain docs (md, html, docx; a bad pdf skipped) give quote-checked terms, the glossary, ticket context and candidates"
+
+# --- V27b: what the vault already has is not written twice -------------------
+# Two documents defining one term (one as NAV, one as Net Asset Value (NAV)), a
+# rule punctuated two ways, a Keep line reworded by a later session, an
+# AGENTS.md copy, and [[Auth]] / [[auth]] topics; then a unit's prompt carries
+# what is there.
+XV="$TMP_ROOT/dupvault"
+cp -R "$REPO_ROOT/vault-template" "$XV"
+mkdir -p "$XV/wiki/domain" "$XV/wiki/sources"
+dpage() { printf -- '---\ntype: domain\nsummary: x\ngenerated: harness\n---\n\n<!-- unit:u sha:1 -->\n%b\n<!-- /unit -->\n' "$2" > "$XV/wiki/$1.md"; }
+dpage domain/domain--a '### Terms\n- Net Asset Value (NAV): fund assets minus liabilities\n### Rules\n- Trades settle within two business days.\nTopics: [[Auth]]'
+dpage domain/domain--b '### Terms\n- NAV: fund assets minus liabilities.\n- Widget: a blue thing\n### Rules\n- trades settle within two business days\nTopics: [[auth]]'
+dpage domain/domain--c '### Terms\n- net asset values: the price of one share\n### Rules\n- none\nTopics: [[auth]]'
+spage() { printf -- '---\ntype: session\nsummary: x\ngenerated: harness\n---\n\n<!-- unit:u sha:1 -->\n### Keep\n%b\n<!-- /unit -->\n' "$2" > "$XV/wiki/sources/$1.md"; }
+spage sessions--2026-10-01-aaa '- [command] Run harness test unit before pushing to dev'
+spage sessions--2026-10-03-bbb '- [command] Run `harness test unit` before you push to dev\n- [gotcha] Never push to main directly'
+spage context--0123456789ab '- [note] Copied from AGENTS.md and only that'
+$PY "$VI" index --vault "$XV" >/dev/null 2>&1 || fail "V27b: index failed"
+G="$XV/wiki/domain/glossary.md"
+[[ "$(grep -ci 'net asset value' "$G")" == 1 ]] || fail "V27b: one glossary line per term — $(cat "$G")"
+grep -qx -- '- \*\*Net Asset Value (NAV)\*\*: fund assets minus liabilities (\[\[domain--a\]\], \[\[domain--b\]\]); the price of one share (\[\[domain--c\]\])' "$G" \
+    || fail "V27b: one definition with both pages, a different one beside it — $(cat "$G")"
+[[ "$(grep -ci 'settle within' "$G")" == 1 ]] || fail "V27b: one line per rule however it is punctuated — $(cat "$G")"
+CA="$XV/wiki/candidates.md"
+[[ "$(grep -c 'harness test unit' "$CA")" == 1 ]] && grep -q 'before you push to dev (\[\[sessions--2026-10-03-bbb\]\], 2026-10-03, 2 sessions)' "$CA" \
+    || fail "V27b: a reworded Keep line is one candidate, newest wording, both sessions — $(cat "$CA")"
+grep -q 'Never push to main' "$CA" || fail "V27b: a different line stays — $(cat "$CA")"
+grep -q 'AGENTS.md and only' "$CA" && fail "V27b: an AGENTS.md copy gives no candidates — $(cat "$CA")"
+[[ "$(ls "$XV/wiki/topics" | grep -ci '^auth\.md$')" == 1 ]] && [[ -f "$XV/wiki/topics/auth.md" ]] \
+    || fail "V27b: [[Auth]] and [[auth]] are one hub, named as most pages spell it — $(ls "$XV/wiki/topics")"
+grep -q 'domain--a' "$XV/wiki/topics/auth.md" || fail "V27b: the hub lists every spelling's pages — $(cat "$XV/wiki/topics/auth.md")"
+$PY - "$REPO_ROOT/scripts" "$XV" <<'PYEOF' || fail "V27b: the prompt carries what the vault has"
+import sys
+sys.path.insert(0, sys.argv[1])
+import vault_ingest as v
+k = v.Known(sys.argv[2])
+dom = {"kind": "raw", "stype": v.DOMAIN, "source": "d.md", "part": 1, "parts": 1, "text": "x"}
+ses = dict(dom, stype="session")
+code = {"kind": "code", "repo": "r", "path": ".", "part": 1, "parts": 1, "text": "x"}
+pd, ps, pc = (v.build_prompt(u, "", "", k.text(u)) for u in (dom, ses, code))
+blk = lambda p: p.split("<<<BEGIN_ALREADY_IN_VAULT>>>", 1)[1].split("<<<END_ALREADY_IN_VAULT>>>", 1)[0]
+assert "[[auth]]" in blk(pd) and "[[auth]]" in blk(pc), pc
+assert "Net Asset Value (NAV)" in blk(pd) and "Widget" in blk(pd) and "Terms already" not in pc, pd
+assert "Never push to main directly" in blk(ps) and "AGENTS.md and only" not in blk(ps) and "Keep lines" not in blk(pd), ps
+assert "<<<BEGIN_ALREADY_IN_VAULT>>>" not in v.build_prompt(code, "", "", ""), "nothing known, no block"
+k.add("sources/sessions--2026-11-01-ccc.md", "### Keep\n- [decision] Brand new line here\nTopics: [[fresh]]", ["fresh"])
+assert "Brand new line here" in blk(v.build_prompt(ses, "", "", k.text(ses))) and "[[fresh]]" in k.text(code)
+PYEOF
+ok "V27b: a term, rule, Keep line or topic two pages share is one glossary line, candidate or hub, and each prompt says what the vault has"
 
 # --- V28: tickets of your own (source: local), never pulled ------------------
 tn() { printf '%s\n' "$3" | $PY "$REPO_ROOT/scripts/vault_ticket.py" --new "$TV" "$1" "$2" ${4:+"$4"} 2>&1; }

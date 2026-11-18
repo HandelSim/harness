@@ -562,8 +562,14 @@ text files, packed to `--unit-kb`, default 48; files that look like secrets,
 request with `x-harness-raw: 1` (no tools, no reminder; a `-withtools` model
 is swapped for its free base when `/models` lists it), with the rules before
 and after the source, the charter, as context the summaries of the page's
-other parts and (code, done deepest first) of its subdirectory pages, and a
-fixed section format (summary line, headings, `Topics:`). The reply is
+other parts and (code, done deepest first) of its subdirectory pages, what
+the vault already has (`Known`, read from the wiki once per run and added to
+after each unit written, so a batch sees its own earlier units: the topic
+names in use, most used first, up to 150; for a domain unit the glossary's
+terms, up to 300; for a session or source the Keep lines taken, the last 80;
+at most 9 KB, between `ALREADY_IN_VAULT` markers, with rules to reuse a
+topic's spelling and not repeat a term or Keep line; not part of the unit
+hash), and a fixed section format (summary line, headings, `Topics:`). The reply is
 checked (a summary line, a body, backticked names that exist in the source),
 sent back once with the problems, then marked failed (`--retry-failed` sends
 it again, once per run: a `--watch` sleeps rather than resend a unit that
@@ -583,7 +589,9 @@ takes it over when the stored path is not on this host (and is refused when
 it is). After the units, `regenerate` writes
 `wiki/index.md` (top-level pages, one line per codebase, sources, topics,
 tickets, each with its summary line), a hub per topic used by two or more
-pages (`wiki/topics/`), a page per ticket id (`wiki/tickets/`), and each
+pages (`wiki/topics/`; `[[Auth]]` and `[[auth]]` are one topic, the hub named
+as most pages spell it, and a hub file a case-blind filesystem calls by the
+other spelling is not deleted), a page per ticket id (`wiki/tickets/`), and each
 repo's module tree with Up/Subdirectories links, and appends to
 `wiki/log.md`; it commits and pushes every 10 units and at the end, Ctrl-C
 (or SIGTERM) included. A lock, `.git/harness-ingest.lock` (`flock`, or
@@ -625,15 +633,21 @@ Terms, Rules or Keep line whose quote is not in the source (normalized case,
 spaces, quote marks; `...` parts each matched); a domain unit with lines but
 none kept fails. `RAW_FMT` is part of a `.raw` unit's hash, so changing the
 formats re-sends every `.raw` unit once. `regenerate` then writes
-`wiki/domain/glossary.md` (every term and rule line, one per document, sorted
-so two documents' definitions sit together, each linked to its page),
+`wiki/domain/glossary.md` (`Glossary`: one line per term, found by its name
+case, punctuation and a plural s aside, `NAV` and `Net Asset Value (NAV)` as
+one, but two full names sharing an abbreviation as two; each definition that
+differs kept beside the others with the pages giving it; one line per rule
+however punctuated),
 `wiki/context/KEY-context.md` per ticket copy in `.raw/tickets/` that uses a
 glossary term (`ticket_contexts`: word-boundary match, an all-caps name case
 sensitive, `Full Name (ABBR)` by either name, plurals; with 5 or more tickets
 a term in over 40% of them is skipped; the matching term lines and the rules
 naming them, at most 2 KB of lines; removed when none match; the `-context`
 suffix keeps it apart from the ticket hub), and `wiki/candidates.md` (Keep
-lines, newest first, repeats counted once, at most 80, for a person to copy
+lines of `sources/` pages but not the `.raw/context/` copies of AGENTS.md,
+newest first, a line another session says in other words counted once
+(`same_line`: word sets, stop words and plain suffixes off, overlap 0.7 or
+more; the newest wording kept), at most 80, for a person to copy
 into the project's AGENTS.md; no agent is given it). Neither the context
 pages nor the candidates are in `wiki/index.md`. `vault_ticket.py` also
 rewrites the launch ticket's context page, so it follows the latest copy.
