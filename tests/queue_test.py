@@ -106,6 +106,8 @@ prompt = args[-1]
 assert "--ticket" in args and "-p" in args and "--yolo" in args, args
 ticket = args[args.index("--ticket") + 1]
 part = json.loads(os.environ.get("HARNESS_TASK_CARD") or "{}").get("part")   # a panel member's own task file
+if part:   # which model this member got, in one line (members' logs land in any order)
+    append(os.environ["FAKE_CALLS"] + ".parts", part + " " + args[args.index("-m") + 1] + "\n")
 task = os.path.join(vault, "wiki", "notes", "tickets", ticket + "-task" + ("-" + part if part else "") + ".md")
 pointer = re.search(r"Your full instructions for the \w+ stage of ticket \S+ are in (\S+?)\. Read it first", prompt)
 if pointer:   # the short prompt of a long one on Windows: the agent reads the task file
@@ -5614,7 +5616,7 @@ class PanelTest(Base):
         self.assertEqual(len(plans), 3, plans)
         cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines()[:3] if c.strip()]
         self.assertEqual(sorted(c["part"] for c in cards), ["d1", "d2", "d3"])
-        self.assertEqual({c["part"]: re.search(r"-m (\S+)", l).group(1) for c, l in zip(cards, plans)},
+        self.assertEqual(dict(l.split() for l in cat(self.calls + ".parts").splitlines()),
                          {"d1": "harness/m-one", "d2": "harness/m-two", "d3": "harness/m-one"})
         self.assertTrue(all("You are planner" in c["done"] for c in cards), cards)
         self.assertIn("ABC-1-plan-draft-2.md", next(c for c in cards if c["part"] == "d2")["done"])
