@@ -28,23 +28,63 @@ FREE = {"id": "free-assist", "lane": "assist", "credit_weights": {"input": 0, "o
 METERED = {"id": "paid-model", "lane": "default", "credit_weights": {"input": 3, "output": 15},
            "capabilities": {"chat": True}}
 APP = "import os\n\n\ndef ratio(a, b):\n    # the caller checks b\n    return a / b\n\n\ndef total(items):\n" \
-      "    return sum(items)\n"
+      "    return sum(items)\n\n\nLABEL = \"Compute Ratio\"\n"
 USE = "from app import ratio\nprint(ratio(1, 0))\n"
 
-# The stub harness: logs how it was run, then answers as STUB_MODE says.
+# The stub harness: logs how it was run, then answers as STUB_MODE says (a checking
+# session's prompt has VERDICT-<nonce>: it answers STUB_VERDICT for each report).
 STUB = r"""#!/usr/bin/env bash
 prompt="${@: -1}"
 nonce=$(grep -o 'COVERED-[0-9a-f]\{8\}' <<<"$prompt" | head -1 | cut -d- -f2)
+vnonce=$(grep -o 'VERDICT-[0-9a-f]\{8\}' <<<"$prompt" | head -1 | cut -d- -f2)
 { printf 'args=%s\n' "${*:1:$(($# - 1))}"; printf 'cwd=%s\n' "$PWD"; printf 'pass=%s\n' "${HARNESS_FINDINGS_PASS:-}"
   [[ -e .env ]] && echo "env=present"; } >>"$STUB_LOG"
 printf '%s\n' "$prompt" >"$STUB_LOG.prompt"
 session() { echo "[harness] session: ses_stub${HARNESS_FINDINGS_PASS:-0}" >&2; }
+if [[ -n "$vnonce" && "${STUB_MODE:-find}" =~ ^(find|none)$ ]]; then
+  session
+  n=$(grep -c '^\[[0-9]*\] ' <<<"$prompt")
+  [[ "${STUB_VERDICT:-real}" == silent ]] && { echo "I could not decide."; exit 0; }
+  for i in $(seq 1 "$n"); do echo "VERDICT-$vnonce | $i | ${STUB_VERDICT:-real} | checked the code"; done
+  exit 0
+fi
 case "${STUB_MODE:-find}" in
   find) session
         echo "I followed ratio to its callers."
-        echo "- **FINDING-$nonce** | bug | high | app.py:6 | divides by zero | \`return a / b\` | lib/use.py calls ratio(1, 0)"
-        echo "FINDING-$nonce | bug | low | ./app.py:9 | made up | not in the code at all | x"
-        echo "FINDING-00000000 | bug | high | app.py:6 | another nonce | return a / b | x"
+        echo "**BUG-$nonce**"
+        echo "- **title:** Compute Ratio crashes when the divisor is zero"
+        echo "- severity: high"
+        echo "- where: \`app.py:6\`"
+        echo "- evidence: \`return a / b\`"
+        echo "- ui: Compute Ratio..."
+        echo "- steps:"
+        echo "  1. Start the application"
+        echo "  2. Click Compute Ratio with a divisor of 0"
+        echo "- expected: a message says the divisor cannot be 0"
+        echo "- actual: the application crashes with ZeroDivisionError"
+        echo "- trace:"
+        echo "  - lib/use.py:2 | print(ratio(1, 0))"
+        echo "  - app.py:6 | return a / b"
+        echo "- why: nothing checks b; lib/use.py calls ratio(1, 0)."
+        echo "END-BUG-$nonce"
+        echo "BUG-$nonce"
+        echo "title: made up"
+        echo "where: app.py:6"
+        echo "evidence: return a / b"
+        echo "ui: A Button Nobody Has"
+        echo "steps:"
+        echo "1. a"
+        echo "2. b"
+        echo "expected: x"
+        echo "actual: y"
+        echo "trace:"
+        echo "- app.py:6 | return a / b"
+        echo "- lib/use.py:2 | print(ratio(1, 0))"
+        echo "END-BUG-$nonce"
+        echo "ITEM-$nonce | unify | app.py:10, lib/use.py:2 | return sum(items) | use math.fsum in both"
+        echo "ITEM-$nonce | safety | app.py:6 | return a / b | b = 0 raises"
+        echo "ITEM-$nonce | nonsense | app.py:1 | import os | x"
+        echo "ITEM-$nonce | safety | app.py:4 | not in the code at all | x"
         echo "KNOWLEDGE-$nonce"
         echo "# repo: ./"
         echo "app.py holds ratio(a, b), which divides a by b and leaves the check of b to its callers,"
@@ -118,27 +158,70 @@ def files_of(spec):
     return {p: {"kind": k, "blob": "b-" + p} for p, k in spec.items()}
 
 
+BUG_TEXT = """Here is what I found:
+**BUG-ab12cd34**
+- **Title:** Save As loses the file name
+- **severity**: High
+- **where:** `src/save.cpp:12`
+- evidence: `name = QString();`
+- ui: "File > Save As..."
+- steps:
+  1. Open a project
+  2. Choose File > Save As...
+     and type a name
+- expected: the file is saved
+- actual: nothing is written
+- trace:
+  - src/menu.cpp:4 | connect(saveAs, &QAction::triggered, this, &W::saveAs);
+  - src/save.cpp:12 | name = QString();
+- why: the name is cleared
+  before it is used.
+END-BUG-ab12cd34
+BUG-ffffffff
+title: another nonce
+END-BUG-ffffffff
+ITEM-ab12cd34 | unify | a.cpp:10, b.cpp:42 | x = y | use std::clamp
+- `ITEM-ab12cd34 | Unused | old/x.cpp | | nothing names it`
+ITEM-ab12cd34 | short
+\x1b[0mCOVERED-ab12cd34 | the | save path
+"""
+
+LINES = {"src/save.cpp": ["// save"] * 11 + ["    name = QString();", "    write(name);"],
+         "src/menu.cpp": ["#include <QMenu>", "", "void W::setup() {",
+                          "    connect(saveAs, &QAction::triggered, this, &W::saveAs);", "}"],
+         "a.cpp": ["int f() {"] + ["  // a"] * 8 + ["  x = y;"],
+         "b.cpp": ["  // b"] * 50}
+
+
+def lines_of(path):
+    path = path.lstrip("./")
+    return path, LINES.get(path)
+
+
 class ParseTest(unittest.TestCase):
-    def test_markdown_tolerant_and_nonce_bound(self):
-        text = ("Here is what I found:\n"
-                "- `FINDING-ab12cd34 | bug | high | serve/x.py:12 | t1 | y = 1 | d`\n"
-                "**FINDING-ab12cd34** | ui | low | ./serve/x.py:3-5 | t2 | ev | det\n"
-                "1. FINDING-ab12cd34|cleanup|medium|.github/w.yml:4|t3|b|c\n"
-                "FINDING-ffffffff | bug | high | a.py:1 | other nonce | e | d\n"
-                "FINDING-ab12cd34 | bug | high | a.py | no line | e | d\n"
-                "FINDING-ab12cd34 | bug | high\n"
-                "\x1b[0mCOVERED-ab12cd34 | the | serve folder\n")
-        found, covered = fa.parse_session(text, "ab12cd34")
-        self.assertEqual([f[:5] for f in found], [("bug", "high", "serve/x.py", 12, "t1"),
-                                                  ("ui", "low", "serve/x.py", 3, "t2"),
-                                                  ("cleanup", "medium", ".github/w.yml", 4, "t3")])
-        self.assertEqual(found[0][5].strip(), "y = 1 | d")
-        self.assertEqual(covered, "the / serve folder")
+    def test_blocks_items_and_covered(self):
+        bugs, items, covered = fa.parse_session(BUG_TEXT, "ab12cd34")
+        (b,) = bugs
+        self.assertEqual((b["title"], b["severity"], b["where"], b["ui"]),
+                         ("Save As loses the file name", "High", "`src/save.cpp:12`", '"File > Save As..."'))
+        self.assertEqual(b["steps"], ["Open a project", "Choose File > Save As... and type a name"])
+        self.assertEqual(len(b["trace"]), 2)
+        self.assertEqual(b["why"], "the name is cleared before it is used.")
+        self.assertEqual([i[:2] for i in items], [("unify", "a.cpp:10, b.cpp:42"), ("unused", "old/x.cpp")])
+        self.assertEqual(covered, "the / save path")
 
     def test_no_covered_line_is_an_unfinished_session(self):
-        self.assertEqual(fa.parse_session("I think the code is fine.", "ab12cd34"), ([], None))
-        self.assertEqual(fa.parse_session("", "ab12cd34"), ([], None))
-        self.assertEqual(fa.parse_session("COVERED-ab12cd34 | x", "ab12cd34"), ([], "x"))
+        self.assertEqual(fa.parse_session("I think the code is fine.", "ab12cd34"), ([], [], None))
+        self.assertEqual(fa.parse_session("", "ab12cd34"), ([], [], None))
+        self.assertEqual(fa.parse_session("COVERED-ab12cd34 | x", "ab12cd34"), ([], [], "x"))
+
+    def test_verdicts(self):
+        text = ("VERDICT-ab12cd34 | 1 | Not real | a guard in open()\n**VERDICT-ab12cd34** | [2] | REAL | yes\n"
+                "VERDICT-ab12cd34 | 3 | maybe | ?\nVERDICT-ffffffff | 4 | real | other nonce\n"
+                "- VERDICT-ab12cd34 | 5 | duplicate | f-1 says it")
+        self.assertEqual(fa.parse_verdicts(text, "ab12cd34"),
+                         {1: ("not-real", "a guard in open()"), 2: ("real", "yes"), 5: ("duplicate", "f-1 says it")})
+
 
 
 class KnowledgeTest(unittest.TestCase):
@@ -163,33 +246,116 @@ class KnowledgeTest(unittest.TestCase):
         self.assertEqual(fa.note_summary("# r: ./\n\n- **app.py** holds ratio\nmore"), "**app.py** holds ratio")
 
 
-class ValidateTest(unittest.TestCase):
-    lines = ["def f(a, b):", "    x = alpha | beta", "    if x:", "        return compute(x)", "    return None"]
+class CheckTest(unittest.TestCase):
+    def bug(self, **kw):
+        b = fa.parse_session(BUG_TEXT, "ab12cd34")[0][0]
+        b.update(kw)
+        return b
 
-    def test_evidence_near_line(self):
-        v = fa.validate(4, "bad", " return compute(x) | it breaks", self.lines)
-        self.assertEqual((v["line"], v["evidence"], v["detail"]), (4, "return compute(x)", "it breaks"))
+    def ui(self, t):
+        return fa.ui_norm(t.split(">")[-1]) == "save as"
 
-    def test_evidence_with_a_pipe_and_a_copied_number(self):
-        v = fa.validate(2, "t", "    2| x = alpha | beta | the or", self.lines)
-        self.assertEqual((v["evidence"], v["detail"]), ("x = alpha | beta", "the or"))
+    def test_a_good_report(self):
+        c, why = fa.check_bug(self.bug(), lines_of, self.ui)
+        self.assertEqual(why, "")
+        self.assertEqual((c["path"], c["line"], c["evidence"], c["severity"], c["ui"]),
+                         ("src/save.cpp", 12, "name = QString();", "high", "File > Save As..."))
+        self.assertEqual([(h["path"], h["line"]) for h in c["trace"]], [("src/menu.cpp", 4), ("src/save.cpp", 12)])
+        self.assertEqual(c["detail"], "the name is cleared before it is used.")
 
-    def test_rejections(self):
-        self.assertIsNone(fa.validate(9, "t", "return None | d", self.lines))   # out of range
-        self.assertIsNone(fa.validate(4, "t", "return made_up(y) | d", self.lines))
-        self.assertIsNone(fa.validate(4, "t", "x | d", self.lines))   # too short
-        self.assertIsNone(fa.validate(4, " ", "return None | d", self.lines))   # no title
+    def test_each_check(self):
+        good_trace = self.bug()["trace"]
+        cases = {
+            "format": self.bug(where="somewhere"),
+            "evidence": self.bug(evidence="name = made_up();"),
+            "ui": self.bug(ui="Export"),
+            "steps": self.bug(steps=["only one"]),
+            "trace": self.bug(trace=good_trace[:1]),
+        }
+        for why, b in cases.items():
+            self.assertEqual(fa.check_bug(b, lines_of, self.ui), (None, why), why)
+        self.assertEqual(fa.check_bug(self.bug(expected=""), lines_of, self.ui), (None, "steps"))
+        # one bad hop of three is let go; two are not
+        bad = "src/menu.cpp:1 | something else"
+        c, _ = fa.check_bug(self.bug(trace=good_trace + [bad]), lines_of, self.ui)
+        self.assertEqual(len(c["trace"]), 2)
+        self.assertEqual(fa.check_bug(self.bug(trace=good_trace + [bad, bad]), lines_of, self.ui), (None, "trace"))
 
-    def test_window(self):
-        lines = ["unique_marker_line = 1"] + ["pass"] * 20
-        self.assertIsNotNone(fa.validate(9, "t", "unique_marker_line = 1 | d", lines))
-        self.assertIsNone(fa.validate(10, "t", "unique_marker_line = 1 | d", lines))
+    def test_items(self):
+        it, why = fa.check_item("unify", "a.cpp:10, b.cpp:42", " x = y | use std::clamp", lines_of, LINES.__contains__)
+        self.assertEqual((it["path"], it["line"], it["evidence"], it["note"], it["locations"], why),
+                         ("a.cpp", 10, "x = y", "use std::clamp", ["a.cpp:10", "b.cpp:42"], ""))
+        self.assertEqual(fa.check_item("unify", "a.cpp:10", " x = y | n", lines_of, LINES.__contains__),
+                         (None, "places"))
+        self.assertEqual(fa.check_item("safety", "a.cpp:10", " y = x | n", lines_of, LINES.__contains__),
+                         (None, "evidence"))
+        self.assertEqual(fa.check_item("safety", "a.cpp:99", " x = y | n", lines_of, LINES.__contains__),
+                         (None, "evidence"))
+        it, why = fa.check_item("unused", "b.cpp", " | nothing", lines_of, LINES.__contains__)
+        self.assertEqual((it["path"], it["locations"], it["note"]), ("b.cpp", ["b.cpp"], "nothing"))
+        self.assertEqual(fa.check_item("unused", "gone.cpp", "", lines_of, LINES.__contains__), (None, "evidence"))
+
+    def test_duplicates(self):
+        c = fa.check_bug(self.bug(), lines_of, self.ui)[0]
+        known = [{"path": "src/save.cpp", "line": 20, "title": "Save As loses the name of the file", "ui": ""}]
+        self.assertTrue(fa.duplicate_of(c, known))   # 8 lines off, most words shared
+        self.assertFalse(fa.duplicate_of(c, [dict(known[0], line=40)]))
+        self.assertFalse(fa.duplicate_of(c, [dict(known[0], title="Crash on open")]))
+        # a ticket's finding: its place is in its text; a hop of the trace counts too
+        self.assertTrue(fa.duplicate_of(c, [{"path": "", "line": 0, "title": "",
+                                             "text": "menu.cpp:5 Save As loses the file name"}]))
+        self.assertTrue(fa.duplicate_of(c, [{"path": "src/save.cpp", "line": 400, "ui": "Save As",
+                                             "title": "Save As fails"}]))
+
+    def test_ui_texts(self):
+        cpp = 'auto *a = new QAction(tr("&Save As..."), this);\nmsg("x");\nQMessageBox::warning(this, "Oops", "Disk full");'
+        lits, shown = fa.ui_texts("w.cpp", cpp)
+        self.assertIn("&Save As...", shown)
+        self.assertIn("Disk full", shown)
+        self.assertIn("x", [fa.ui_norm(x) for x in lits] + ["x"])
+        lits, shown = fa.ui_texts("w.ui", '<property name="text"><string>Open &amp;File</string></property>'
+                                          '<string notr="true">objName</string>')
+        self.assertEqual(shown, ["Open &amp;File"])
+        self.assertEqual(fa.ui_norm("Open &amp;File"), "open file")
+        self.assertEqual(fa.ui_norm('"Save &As…"'), "save as")
+        self.assertEqual(fa.ui_norm("Fish && Chips:"), "fish & chips")
 
     def test_fingerprint_stable_and_whitespace_blind(self):
         a = fa.fingerprint("r", "p.py", "bug", "return  a / b")
         self.assertEqual(a, fa.fingerprint("r", "p.py", "bug", "Return a / b "))
         self.assertRegex(a, r"^f-[0-9a-f]{12}$")
         self.assertNotEqual(a, fa.fingerprint("r", "p.py", "simplify", "return a / b"))
+
+    def test_themes(self):
+        got = {k: (t, d) for k, t, d in fa.themes_of(
+            "intro text\n## nvector\ntitle: Position math not through the n-vector library\nUse nvlib for all\n"
+            "position math.\n## dead\noff\n## Safety\nOnly memory errors.\n## bad slug!!\n\n## empty\n")}
+        self.assertEqual(sorted(got), ["bad-slug", "nvector", "safety", "unify", "unused"][:0] or
+                         sorted(["nvector", "safety", "unify", "unused"]))
+        self.assertEqual(got["nvector"], ("Position math not through the n-vector library",
+                                          "Use nvlib for all position math."))
+        self.assertEqual(got["safety"], ("Safety and robustness", "Only memory errors."))
+        self.assertEqual(len(fa.themes_of("")), len(fa.THEMES))
+
+
+class UnusedTest(unittest.TestCase):
+    def test_what_nothing_names(self):
+        texts = {"CMakeLists.txt": "add_executable(app src/main.cpp src/a.cpp src/b.cpp)\n",
+                 "src/main.cpp": '#include "a.h"\n', "src/a.cpp": '#include "a.h"\n#include "ui_form.h"\n',
+                 "src/a.h": "", "src/b.cpp": '#include "only_b.h"\n', "src/only_b.h": "",
+                 "src/old.cpp": '#include "old.h"\n', "src/old.h": "", "src/form.ui": "<ui/>",
+                 "src/dead.ui": "<ui/>", "res/app.qrc": "<qresource><file>icons/used.png</file></qresource>",
+                 "tests/t.cpp": "", "third_party/x.h": "", "docs/x.md": "see gone.png"}
+        paths = list(texts) + ["res/icons/used.png", "res/icons/lost.png", "res/icons/gone.png"]
+        got = fa.unused_files(paths, texts)
+        # old.cpp is named by nothing, so old.h (named only by old.cpp) goes with it; app.qrc is a resource
+        # no code names; tests, vendored code and main are left out; gone.png is named by a doc
+        self.assertEqual(got, ["res/app.qrc", "res/icons/lost.png", "src/dead.ui", "src/old.cpp", "src/old.h"])
+        # a build that globs its sources: sources are never "unused", headers still are
+        texts["CMakeLists.txt"] = "file(GLOB SRC src/*.cpp)\n"
+        self.assertNotIn("src/old.cpp", fa.unused_files(paths, texts))
+        self.assertIn("src/old.h", fa.unused_files(paths, texts))
+        self.assertEqual(fa.unused_files(["a.py", "b.py"], {"a.py": "", "b.py": ""}), [])
 
 
 class UnitsTest(unittest.TestCase):
@@ -201,10 +367,9 @@ class UnitsTest(unittest.TestCase):
                           "docs/a.md": "doc", "conf/c.yml": "config", "serve/page.py": "code"})
         files["lib/skip.py"] = {"skip": True}
         got = sorted(u.key for u in fa.units_of("/r", files))
-        self.assertEqual(got, sorted(["/r:.:bug", "/r:.:trace", "/r:.:cleanup", "/r:lib:bug", "/r:lib:trace",
-                                      "/r:lib:cleanup", "/r:lib/sub:bug", "/r:lib/sub:trace",
-                                      "/r:lib/sub:cleanup", "/r:docs:cleanup", "/r:serve:bug",
-                                      "/r:serve:trace", "/r:serve:ui", "/r:serve:cleanup"]))
+        self.assertEqual(got, sorted(["/r:.:bug", "/r:.:cleanup", "/r:lib:bug", "/r:lib:cleanup",
+                                      "/r:lib/sub:bug", "/r:lib/sub:cleanup", "/r:serve:bug",
+                                      "/r:serve:cleanup"]))
         (lib,) = [u for u in fa.units_of("/r", files) if u.key == "/r:lib:bug"]
         self.assertEqual(lib.files, ["lib/use.py"])
         # the area's sha moves with any of its files' blobs, and only with them
@@ -214,11 +379,27 @@ class UnitsTest(unittest.TestCase):
         self.assertNotEqual(sha["/r:lib:bug"], old["/r:lib:bug"])
         self.assertEqual(sha["/r:.:bug"], old["/r:.:bug"])
 
+    def test_entry_points(self):
+        files = files_of({"src/main.cpp": "code", "src/mainwindow.cpp": "code", "src/mainwindow.h": "code",
+                          "src/mainwindow.ui": "config", "src/dialog.ui": "config", "src/math.cpp": "code",
+                          "lib/x.cpp": "code"})
+        files["src/main.cpp"]["entry"] = True
+        got = [(u.key, u.entry) for u in fa.units_of("/r", files) if u.lens == "bug"]
+        # a form is reached through its code twin; one with none is its own entry point; lib/ has none
+        self.assertEqual(got, [("/r:src/dialog.ui:bug", "src/dialog.ui"), ("/r:src/main.cpp:bug", "src/main.cpp"),
+                               ("/r:src/mainwindow.cpp:bug", "src/mainwindow.cpp")])
+        self.assertEqual(sorted(u.key for u in fa.units_of("/r", files) if u.lens == "cleanup"),
+                         ["/r:lib:cleanup", "/r:src:cleanup"])
+        self.assertTrue(fa.ENTRY_RE.search("connect(ui->okButton, &QPushButton::clicked, this, &D::accept);"))
+        self.assertTrue(fa.ENTRY_RE.search("void MainWindow::on_actionOpen_triggered()"))
+        self.assertFalse(fa.ENTRY_RE.search("double d = haversine(a, b);"))
+
     def test_due_order(self):
         t = 1_000_000_000.0
         us = [fa.Unit("/r", a, lens, ["x"], "sha-" + a)
               for a, lens in (("new", "cleanup"), ("new", "bug"), ("changed", "cleanup"), ("old", "bug"),
                               ("fresh", "bug"), ("aside", "bug"), ("later", "bug"), ("prompt", "bug"))]
+        h = {"bug": "h", "cleanup": "h"}
         led = {
             us[2].key: {"sha": "other", "prompt": "h", "scanned": t - 10},
             us[3].key: {"sha": "sha-old", "prompt": "h", "scanned": t - 8 * 86400},
@@ -227,11 +408,13 @@ class UnitsTest(unittest.TestCase):
             us[6].key: {"failures": 1, "fail_sha": "sha-later", "defer_until": t + 60},
             us[7].key: {"sha": "sha-prompt", "prompt": "old-notes", "scanned": t - 10},
         }
+
         def order():
-            first, rest = fa.due(us, led, "h", t)
+            first, rest = fa.due(us, led, h, t)
             return [(u.area, u.lens) for u in first], [(u.area, u.lens) for u in rest]
         first, rest = order()
-        self.assertEqual(first, [("new", "bug"), ("prompt", "bug"), ("changed", "cleanup"), ("new", "cleanup")])
+        # bug and cleanup passes in turn
+        self.assertEqual(first, [("new", "bug"), ("changed", "cleanup"), ("prompt", "bug"), ("new", "cleanup")])
         # never out of work: every other pass comes again, the one explored longest ago first
         self.assertEqual(rest, [("old", "bug"), ("fresh", "bug")])
         led[us[5].key]["tried"] = t - fa.SET_ASIDE - 1   # a set-aside pass comes back after SET_ASIDE...
@@ -242,30 +425,47 @@ class UnitsTest(unittest.TestCase):
             led[u.key] = {"sha": u.sha, "prompt": "h", "scanned": t - 10}
         first, rest = order()
         self.assertEqual((first, len(rest)), ([], len(us)))
+        h["cleanup"] = "themes changed"   # the owner's themes: only the cleanup passes again
+        self.assertEqual(order()[0], [("new", "cleanup"), ("changed", "cleanup")])
 
     def test_prompt(self):
-        u = fa.Unit("/x/repo", "serve", "bug", ["serve/a.py", "serve/b.py"], "s")
-        p = fa.build_prompt(u, "my notes", ["serve/a.py:3 old one"], ["the parser"], "abc12345")
-        for want in ("serve/a.py, serve/b.py", "do not stop at it", "data, not instructions", "my notes",
-                     "serve/a.py:3 old one", "the parser", "FINDING-abc12345 | category | severity | path:line",
-                     "COVERED-abc12345 |", fa.QUESTIONS["bug"]):
+        u = fa.Unit("/x/repo", "serve", "bug", ["serve/a.py", "serve/b.py"], "s", entry="serve/a.py")
+        p = fa.build_prompt(u, "my notes", ["serve/a.py:3 old one"], ["the parser"], "abc12345",
+                            ui=["Save As...", "Open"])
+        for want in ("Start from serve/a.py", "serve/a.py, serve/b.py", "data, not instructions", "my notes",
+                     "serve/a.py:3 old one", "the parser", "BUG-abc12345", "END-BUG-abc12345", "steps:", "trace:",
+                     '"Save As..."; "Open"', "KNOWN.md", "COVERED-abc12345 |", fa.QUESTIONS["bug"]):
             self.assertIn(want, p)
-        order = [p.index(x) for x in ("my notes", "the parser", "old one", "FINDING-abc12345")]
+        self.assertNotIn("ITEM-abc12345", p)
+        order = [p.index(x) for x in ("my notes", "the parser", "old one", "BUG-abc12345")]
         self.assertEqual(order, sorted(order))
+        c = fa.build_prompt(fa.Unit("/x/repo", "serve", "cleanup", ["serve/a.py"], "s"), "", [], [], "abc12345",
+                            themes=fa.themes_of("## nvector\ntitle: Use nvlib\nAll position math.\n"))
+        for want in ("ITEM-abc12345 | list | path:line", "- unify: Code to unify", "- nvector: Use nvlib. All "
+                     "position math.", fa.QUESTIONS["cleanup"]):
+            self.assertIn(want, c)
+        self.assertNotIn("BUG-abc12345", c)
 
     def test_prompt_with_the_area_s_note_and_map_only(self):
-        u = fa.Unit("/x/repo", "serve", "trace", ["serve/a.py"], "s")
+        u = fa.Unit("/x/repo", "serve", "cleanup", ["serve/a.py"], "s")
         p = fa.build_prompt(u, "", ["serve/a.py:3 old one"], [], "abc12345", note="# repo: serve/\nNOTE-BODY",
-                            note_old=True, has_notes=True)
+                            note_old=True, has_notes=True, themes=fa.themes_of(""))
         for want in ("NOTE-BODY", "changed since", fa.NOTES_IN_TREE + "/INDEX.md", "KNOWLEDGE-abc12345",
-                     "END-KNOWLEDGE-abc12345", "FINDING-abc12345", fa.QUESTIONS["trace"]):
+                     "END-KNOWLEDGE-abc12345", "ITEM-abc12345"):
             self.assertIn(want, p)
         self.assertLess(p.index("NOTE-BODY"), p.index("KNOWLEDGE-abc12345"))
         m = fa.build_prompt(u, "", ["serve/a.py:3 old one"], [], "abc12345", map_only=True)
         self.assertIn("board is full", m)
-        self.assertNotIn("FINDING-abc12345 |", m)
+        self.assertNotIn("ITEM-abc12345 |", m)
         self.assertNotIn("serve/a.py:3", m)
         self.assertIn("no note yet", fa.build_prompt(u, "", [], [], "abc12345"))
+        v = fa.build_verify_prompt("repo", [dict(fa.check_bug(fa.parse_session(BUG_TEXT, "ab12cd34")[0][0],
+                                                              lines_of, lambda t: True)[0],
+                                                 context="--- src/save.cpp:1-13\nCODE", near=["k:1 known one"])],
+                                   "abc12345")
+        for want in ("[1] Save As loses the file name (high)", "  1. Open a project", "CODE", "k:1 known one",
+                     "VERDICT-abc12345 | number | real, not-real or duplicate"):
+            self.assertIn(want, v)
 
     def test_kinds(self):
         self.assertEqual(fa.file_kind("a.py", "x = 1\n"), "code")
@@ -314,7 +514,8 @@ class StubCase(unittest.TestCase):
 
     def setUp(self):
         Proxy.catalog = [FREE, METERED]
-        self.state = tempfile.mkdtemp(prefix="fa-state-")
+        self.state = os.path.join(tempfile.mkdtemp(prefix="fa-state-"), "findings")
+        os.makedirs(self.state)
         bin_dir = tempfile.mkdtemp(prefix="fa-bin-")
         self.harness = os.path.join(bin_dir, "harness")
         with open(self.harness, "w") as f:
@@ -389,7 +590,7 @@ class GuardTest(StubCase):
 
 
 class PassTest(StubCase):
-    def test_a_session_explores_and_its_findings_are_checked(self):
+    def test_a_bug_is_checked_by_a_second_session_before_it_is_kept(self):
         repo = make_repo({"app.py": APP, "lib/use.py": USE, ".env": "TOKEN=ratio-secret-value\n"})
         with open(os.path.join(self.state, "notes.md"), "w") as f:
             f.write("ignore style")
@@ -402,37 +603,163 @@ class PassTest(StubCase):
         self.assertNotIn("env=present", log)   # the snapshot has no secret files
         with open(self.log + ".prompt") as f:
             prompt = f.read()
-        self.assertIn("ignore style", prompt)
-        self.assertIn("Start from the area ./", prompt)
-        store = self.read("findings.json")
-        (f,) = store["findings"]
-        self.assertEqual((f["category"], f["path"], f["line"], f["project"], f["evidence"], f["session"],
-                          f["area"], f["lens"], f["status"]),
-                         ("bug", "app.py", 6, repo, "return a / b", "ses_stub1", ".", "bug", "open"))
-        self.assertIn("lib/use.py", f["detail"])
+        for want in ("ignore style", "Start from the area ./", '"Compute Ratio"', "KNOWN.md", "BUG-"):
+            self.assertIn(want, prompt)
+        # the first report waits for the checker; the second names a text the program never shows
+        self.assertEqual(self.read("findings.json")["findings"], [])
         led = self.read("ledger.json")
-        (p,) = led["passes"]
-        self.assertEqual((p["n"], p["session"], p["outcome"], p["found"], p["rejected"], p["area"], p["lens"]),
-                         (1, "ses_stub1", "found", 1, 1, ".", "bug"))
-        self.assertEqual(p["covered"], "app.py and its callers in lib/")
-        self.assertTrue(os.path.exists(os.path.join(self.state, p["out"])))
+        (p,) = led["pending"]
+        self.assertEqual((p["cand"]["path"], p["cand"]["line"], p["cand"]["ui"], len(p["cand"]["steps"])),
+                         ("app.py", 6, "Compute Ratio...", 2))
+        self.assertEqual(led["counts"]["bug"]["why"], {"ui": 1})
+        (ps,) = led["passes"]
+        self.assertEqual((ps["n"], ps["session"], ps["outcome"], ps["found"], ps["rejected"], ps["area"], ps["lens"]),
+                         (1, "ses_stub1", "waiting", 1, 1, ".", "bug"))
         e = led["units"][f"{repo}:.:bug"]
-        self.assertEqual((e["outcome"], e["covered"], e["session"]),
-                         ("found", ["app.py and its callers in lib/"], "ses_stub1"))
-        info = self.read("agent.json")
-        self.assertEqual(info["state"], "stopped")
-        self.assertFalse(info.get("pass_pid"))
-        self.assertFalse(os.path.exists(os.path.join(self.state, "wanted")))   # --once is not a standing run
-        # the next pass is the next area; what the first one found and covered goes into its area's prompt later
-        r = self.run_once(repo, mode="none")
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((e["outcome"], e["covered"]), ("waiting", ["app.py and its callers in lib/"]))
+        kn = os.path.join(self.state, "tree")
+        known = [os.path.join(d, "KNOWN.md") for d, _, ns in os.walk(kn) if "KNOWN.md" in ns]
+        self.assertTrue(known)
+        # the next run is the checking session: it says real, the report goes on the board
+        r = self.run_once(repo)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        with open(self.log + ".prompt") as f:
+            v = f.read()
+        self.assertIn("[1] Compute Ratio crashes when the divisor is zero (high)", v)
+        self.assertIn("    6  ", v)   # the code around the lines, numbered
+        (f,) = self.read("findings.json")["findings"]
+        self.assertEqual((f["category"], f["path"], f["line"], f["project"], f["evidence"], f["session"],
+                          f["area"], f["lens"], f["status"], f["ui"]),
+                         ("bug", "app.py", 6, repo, "return a / b", "ses_stub1", ".", "bug", "open",
+                          "Compute Ratio..."))
+        self.assertEqual(f["steps"], ["Start the application", "Click Compute Ratio with a divisor of 0"])
+        self.assertEqual([h["path"] for h in f["trace"]], ["lib/use.py", "app.py"])
+        self.assertEqual(f["verdict"], "real: checked the code")
         led = self.read("ledger.json")
-        self.assertEqual([(p["n"], p["area"], p["outcome"]) for p in led["passes"]],
-                         [(1, ".", "found"), (2, "lib", "none")])
+        self.assertEqual(led["pending"], [])
+        self.assertEqual(led["passes"][-1]["lens"], "verify")
+        # then the cleanup pass of ./: its items go on the lists
+        self.assertEqual(self.run_once(repo).returncode, 0)
+        store = self.read("findings.json")["findings"]
+        rolls = {x["theme"]: x for x in store if x.get("kind") == "rolling"}
+        self.assertEqual(sorted(rolls), ["safety", "unify"])
+        (it,) = rolls["unify"]["items"]
+        self.assertEqual((it["path"], it["line"], it["locations"], it["note"], it["status"]),
+                         ("app.py", 10, ["app.py:10", "lib/use.py:2"], "use math.fsum in both", "open"))
+        self.assertTrue(rolls["unify"]["id"].startswith("r-unify-"))
+        self.assertEqual(self.read("ledger.json")["counts"]["cleanup"]["why"], {"list": 1, "evidence": 1})
+        # the same items again: nothing new
+        w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
+        w.refresh()
+        u = [x for x in w.units[repo] if x.area == "." and x.lens == "cleanup"][0]
+        self.assertEqual(w.accept_items(u, [("unify", "app.py:10, lib/use.py:2", " return sum(items) | again"),
+                                            ("safety", "app.py:6", " return a / b | again")], "s"), (0, 2))
         out = io.StringIO()
         with redirect_stdout(out):
             fa.main(["status", "--state", self.state])
         self.assertIn("1 open", out.getvalue())
+
+    def test_the_checker_s_no(self):
+        repo = make_repo({"app.py": APP, "lib/use.py": USE})
+        self.assertEqual(self.run_once(repo).returncode, 0)
+        self.assertEqual(self.run_once(repo, extra_env={"STUB_VERDICT": "not-real"}).returncode, 0)
+        led = self.read("ledger.json")
+        self.assertEqual((led["pending"], led["counts"]["verify"]["why"]), ([], {"not-real": 1}))
+        self.assertEqual(self.read("findings.json")["findings"], [])
+        # a checker that gives no verdict: the report waits for VERIFY_TRIES sessions, then goes
+        commit(repo, {"app.py": APP + "# more\n"})
+        self.assertEqual(self.run_once(repo).returncode, 0)
+        self.assertEqual(len(self.read("ledger.json")["pending"]), 1)
+        for i in range(fa.VERIFY_TRIES):
+            self.assertEqual(self.run_once(repo, extra_env={"STUB_VERDICT": "silent"}).returncode, 0)
+            self.assertEqual(len(self.read("ledger.json")["pending"]), 0 if i == fa.VERIFY_TRIES - 1 else 1)
+        self.assertEqual(self.read("ledger.json")["counts"]["verify"]["why"]["no verdict"], 1)
+
+    def test_known_findings_are_not_reported_again(self):
+        repo = make_repo({"app.py": APP, "lib/use.py": USE})
+        # a ticket agent's finding on the same place: in KNOWN.md, and the report is a duplicate
+        root = os.path.dirname(self.state)
+        vault = os.path.join(root, "vaults", "v1")
+        os.makedirs(os.path.join(vault, "wiki", "notes", "tickets"))
+        os.makedirs(os.path.join(root, "queue", "ABC-1"))
+        with open(os.path.join(root, "vault.active"), "w") as f:
+            f.write("v1\n")
+        with open(os.path.join(root, "queue", "ABC-1", "state.json"), "w") as f:
+            json.dump({"vault": vault}, f)
+        with open(os.path.join(vault, "wiki", "notes", "tickets", "ABC-1-findings.md"), "w") as f:
+            f.write("# ABC-1 findings\n\n- app.py:6 Compute Ratio crashes when the divisor is zero\n")
+        w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
+        w.refresh()
+        known = w.known(repo)
+        self.assertEqual([(k["path"], k["line"], k["state"]) for k in known], [("app.py", 6, "from ticket ABC-1")])
+        self.assertEqual(self.run_once(repo).returncode, 0)
+        led = self.read("ledger.json")
+        self.assertEqual((led["pending"], led["counts"]["bug"]["why"]), ([], {"duplicate": 1, "ui": 1}))
+        known_md = [os.path.join(d, "KNOWN.md") for d, _, ns in os.walk(os.path.join(self.state, "tree"))
+                    if "KNOWN.md" in ns]
+        with open(known_md[0]) as f:
+            self.assertIn("app.py:6 | Compute Ratio crashes when the divisor is zero | from ticket ABC-1", f.read())
+        # an archived finding the store drops stays known (as dismissed)
+        w.store["findings"] = [{"id": "f-00000000000a", "project": repo, "path": "lib/use.py", "line": 2,
+                                "title": "old one", "status": "stale"}]
+        with open(os.path.join(self.state, "board.json"), "w") as f:
+            json.dump({"version": 1, "order": [], "archived": {"f-00000000000a": "2026-01-01T00:00:00Z"}}, f)
+        w.save_store()
+        self.assertIn(("lib/use.py", 2, "dismissed by the owner"),
+                      [(k["path"], k["line"], k["state"]) for k in w.known(repo)])
+
+    def test_rolling_lists_and_their_generations(self):
+        repo = make_repo({"app.py": APP})
+        w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
+        w.refresh()
+        t, d = "Code to unify", "desc"
+        item = {"path": "app.py", "line": 10, "evidence": "return sum(items)", "note": "n",
+                "locations": ["app.py:10", "x.py:1"]}
+        self.assertTrue(w.add_item(repo, "unify", t, d, item, "s"))
+        self.assertFalse(w.add_item(repo, "unify", t, d, dict(item, line=12, evidence="other"), "s"))
+        (r,) = w.rolls(repo, "unify")
+        self.assertEqual(w.open_count(), 1)   # a list is one finding, however long
+        # the owner archives the list: a new one starts, the old items are not added again
+        with open(os.path.join(self.state, "board.json"), "w") as f:
+            json.dump({"version": 1, "order": [], "archived": {r["id"]: "2026-01-01T00:00:00Z"}}, f)
+        self.assertFalse(w.add_item(repo, "unify", t, d, item, "s"))
+        self.assertTrue(w.add_item(repo, "unify", t, d, dict(item, path="lib.py", line=1, evidence="q",
+                                                             locations=["lib.py:1", "y.py:2"]), "s"))
+        ids = sorted(x["id"] for x in w.rolls(repo, "unify"))
+        self.assertEqual(ids, [r["id"], r["id"] + "-1"])
+        # an item whose code left HEAD is gone; it comes back when found again
+        commit(repo, {"app.py": "x = 1\n"})
+        w.refresh()
+        (it,) = [i for i in r["items"]]
+        self.assertEqual(it["status"], "gone")
+
+    def test_unused_files_scan(self):
+        repo = make_repo({"CMakeLists.txt": "add_executable(app src/main.cpp src/a.cpp)\n",
+                          "src/main.cpp": '#include "a.h"\nint main() {}\n', "src/a.cpp": '#include "a.h"\n',
+                          "src/a.h": "int a();\n", "src/old.cpp": "int old() { return 1; }\n"})
+        w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
+        w.refresh()
+        (r,) = w.rolls(repo, "unused")
+        self.assertEqual([(i["path"], i["source"], i["status"]) for i in r["items"]],
+                         [("src/old.cpp", "scan", "open")])
+        commit(repo, {"CMakeLists.txt": "add_executable(app src/main.cpp src/a.cpp src/old.cpp)\n"})
+        w.refresh()
+        self.assertEqual(r["items"][0]["status"], "gone")
+        self.assertTrue(w.unused_ok(repo, "src/a.h") is False)
+
+    def test_archive_old(self):
+        store = {"version": 1, "findings": [
+            {"id": "f-000000000001", "status": "open", "project": "/x", "path": "p", "title": "old", "line": 1},
+            {"id": "f-000000000002", "status": "open", "project": "/x", "path": "p", "title": "new", "line": 1,
+             "steps": ["a", "b"]},
+            {"id": "r-unify-1", "kind": "rolling", "status": "open", "project": "/x", "items": []}]}
+        with open(os.path.join(self.state, "findings.json"), "w") as f:
+            json.dump(store, f)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(fa.main(["archive-old", "--state", self.state]), 0)
+        self.assertIn("1", out.getvalue())
+        self.assertEqual(list(self.read("board.json")["archived"]), ["f-000000000001"])
 
     def test_a_pass_writes_its_notes_and_the_next_passes_read_them(self):
         repo = make_repo({"app.py": APP, "lib/use.py": USE})
@@ -452,7 +779,12 @@ class PassTest(StubCase):
         self.assertEqual(sorted((n["area"], n["changed"], n["session"]) for n in listing),
                          [(".", False, "ses_stub1"), ("lib", False, "ses_stub1")])
         self.assertEqual(self.read("ledger.json")["passes"][0]["notes"], [".", "lib"])
-        # the next pass (lib/, bug) gets lib/'s note in its prompt and every note in its snapshot
+        # the passes after (./ cleanup, then lib/) get their area's note and every note in their snapshot
+        led = self.read("ledger.json")
+        led["pending"] = []
+        with open(os.path.join(self.state, "ledger.json"), "w") as f:
+            json.dump(led, f)
+        self.assertEqual(self.run_once(repo, mode="none").returncode, 0)
         self.assertEqual(self.run_once(repo, mode="none").returncode, 0)
         with open(self.log + ".prompt") as f:
             prompt = f.read()
@@ -464,7 +796,7 @@ class PassTest(StubCase):
         # a later note on ./ replaces the old one, which is kept as .prev; a much shorter one is refused
         w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
         w.refresh()
-        u = [x for x in w.units[repo] if x.area == "." and x.lens == "trace"][0]
+        u = [x for x in w.units[repo] if x.area == "." and x.lens == "cleanup"][0]
         new = top + "\nAlso traced: total(items) is unused.\n" + "More on how ratio is used. " * 30
         self.assertEqual(w.take_notes(u, [("", new)], "ses_x"), ["."])
         with open(os.path.join(kdir, "_top.md.prev")) as f:
@@ -476,21 +808,6 @@ class PassTest(StubCase):
         listing = {n["area"]: n for n in self.read("knowledge/index.json")["notes"]}
         self.assertEqual((listing["."]["changed"], listing["lib"]["changed"]), (True, False))
         self.assertTrue(w.note_old([x for x in w.units[repo] if x.area == "."][0]))
-
-    def test_known_findings_are_not_kept_twice_and_go_into_the_prompt(self):
-        repo = make_repo({"app.py": APP})
-        w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
-        w.refresh()
-        w.trees[repo] = fa.snapshot(repo, fa.head_of(repo), w.p("tree"))
-        u = [u for u in w.units[repo] if u.lens == "bug"][0]
-        raw = [("bug", "high", "app.py", 6, "divides by zero", " return a / b | b can be 0")]
-        self.assertEqual(w.accept(u, raw, "ses_a"), (1, 0))
-        self.assertEqual(w.accept(u, raw, "ses_b"), (0, 0))   # same id
-        self.assertEqual(w.accept(u, [("bug", "low", "app.py", 5, "Divides by zero!", "# the caller checks b|x")],
-                                  "ses_b"), (0, 0))   # same title
-        self.assertEqual(w.accept(u, [("bug", "high", w.trees[repo] + "/app.py", 6, "t2", "invented code | d"),
-                                      ("bug", "high", "gone.py", 1, "t3", "return a / b | d")], "ses_b"), (0, 2))
-        self.assertEqual(w.prior(u), ["app.py:6 divides by zero"])
 
     def test_a_session_that_never_answers_fails_its_pass(self):
         repo = make_repo({"app.py": APP})

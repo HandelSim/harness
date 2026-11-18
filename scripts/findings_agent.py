@@ -139,6 +139,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -1762,11 +1763,89 @@ class Worker:
 
     # --- one pass ---
 
-    def prior(self, u):
+    # --- what is known: what a pass must not report again ---
+
+    def ticket_known(self):
+        """The ticket agents' findings (their notes in the active vault), as the board has them."""
+        state = os.path.dirname(os.path.normpath(self.dir))
+        queue = os.path.join(state, "queue")
+        if not os.path.isdir(queue):
+            return []
+        name = read_text(os.path.join(state, "vault.active"), 400).strip()
+        runs = SimpleNamespace(queue_dir=queue, vault=os.path.join(state, "vaults", name) if name else "")
+        try:
+            got = findings_view.collect(runs)
+        except Exception as e:   # noqa: BLE001 - the board's reader must not stop a pass
+            log(f"cannot read the ticket agents' findings: {e}")
+            return []
+        out = []
+        for f in got:
+            if f.get("src") == "agent":
+                continue
+            path, line = f.get("path") or "", f.get("line") or 0
+            if not path:
+                m = LOC_IN_TEXT.search(f.get("text") or "")
+                path, line = (m.group(1), int(m.group(2))) if m else ("", 0)
+            out.append({"id": f["id"], "path": path, "line": line, "title": f.get("title") or "",
+                        "text": f.get("text") or "", "ui": "", "state": f"from ticket {f.get('src')}"})
+        return out
+
+    def known(self, root):
+        """Every finding a pass must not report again: the agent's open ones and the ones
+        the owner archived (also those the store has dropped), the ticket agents'."""
+        archived = self.archived()
+        out = []
+        for f in self.store["findings"]:
+            if f.get("project") != root or f.get("kind") == "rolling" or f.get("status") == "stale":
+                continue
+            out.append({"id": f["id"], "path": f.get("path") or "", "line": f.get("line") or 0,
+                        "title": f.get("title") or "", "ui": f.get("ui") or "", "text": "",
+                        "state": "dismissed by the owner" if f["id"] in archived else "open"})
+        out += [dict(d, id="", text="", state="dismissed by the owner") for d in self.ledger["dismissed"]
+                if d.get("project") == root]
+        tickets = self.ticket_known()
+        for t in tickets:
+            if t["id"] in archived:
+                t["state"] += ", dismissed by the owner"
+        return out + tickets
+
+    def write_known(self, root, tree, known):
+        """<snapshot>/.findings-notes/KNOWN.md: what is known, one line each, by file."""
+        archived = self.archived()
+        lines = [f"# Known about {os.path.basename(root)}", "",
+                 "Everything already reported. Do not report any of it again, in other words or at another "
+                 "line. \"dismissed by the owner\": the owner looked and does not want it: not that either.",
+                 "", "## Findings (bugs and the ticket agents' notes)", ""]
+        rows = []
+        for k in known:
+            where = f"{k['path']}:{k['line']}" if k.get("path") and k.get("line") else (k.get("path") or "-")
+            text = clean_one_line(k.get("title") or k.get("text"), 200)
+            rows.append((k.get("path") or "~", k.get("line") or 0,
+                         " | ".join(x for x in (where, text, f"ui: {k['ui']}" if k.get("ui") else "", k["state"])
+                                    if x)))
+        lines += [r for _, _, r in sorted(rows)] or ["(none)"]
+        for theme, title, _ in self.themes():
+            items = []
+            for r in self.rolls(root, theme):
+                for it in r.get("items") or []:
+                    if it.get("status") == "gone":
+                        continue
+                    no = it["id"] in archived or r["id"] in archived
+                    where = ", ".join(it.get("locations") or []) or it.get("path", "")
+                    items.append(" | ".join(x for x in (
+                        where, clean_one_line(it.get("evidence"), 160), clean_one_line(it.get("note"), 200),
+                        "dismissed by the owner" if no else "") if x))
+            lines += ["", f"## The {theme} list: {title}", ""] + (sorted(set(items)) or ["(none yet)"])
+        if len(lines) > KNOWN_LINES:
+            lines = lines[:KNOWN_LINES] + [f"(and {len(lines) - KNOWN_LINES} more lines)"]
+        d = os.path.join(tree, NOTES_IN_TREE)
+        os.makedirs(d, exist_ok=True)
+        write_text(os.path.join(d, "KNOWN.md"), "\n".join(lines) + "\n")
+
+    def prior(self, u, known):
         inside = set(u.files)
-        out = [f"{f.get('path')}:{f.get('line')} {clean_one_line(f.get('title'), 120)}"
-               for f in self.store["findings"]
-               if f.get("project") == u.root and f.get("status") == "open" and f.get("path") in inside]
+        out = [f"{k['path']}:{k['line']} {clean_one_line(k.get('title') or k.get('text'), 120)} ({k['state']})"
+               for k in known if k.get("path") in inside]
         return out[-PRIOR_MAX:]
 
     def covered(self, u):
@@ -1881,48 +1960,198 @@ class Worker:
             log(f"{u.label()}: failed {e['failures']} times in a row; set aside for {SET_ASIDE // 3600} h "
                 "or until it changes")
 
-    def file_lines(self, root, path):
-        ent = (self.ledger["files"].get(root) or {}).get(path)
-        if not ent or ent.get("skip"):
-            return None
-        t = blob_text(root, ent["blob"])
-        return split_lines(t) if t is not None else None
+    def lines_at(self, root):
+        """lines_of(path) for the checks: (the path as the index has it, its lines at HEAD
+        or None); a path the session spelled from the snapshot, with ./ or a part of its
+        folders left off is found."""
+        files = self.ledger["files"].get(root) or {}
+        cache = {}
+        tree = (self.trees.get(root) or "").rstrip("/")
 
-    def accept(self, u, raw, sid):
-        """Check a session's findings against HEAD and keep the new ones. (accepted, rejected)."""
-        repo = os.path.basename(u.root)
+        def lines_of(path):
+            path = path.strip().strip("`'\"")
+            if tree and path.startswith(tree + "/"):
+                path = path[len(tree) + 1:]
+            path = path.lstrip("./") if path.startswith("./") else path.lstrip("/")
+            if path not in files:
+                ends = [p for p in files if p.endswith("/" + path)]
+                path = ends[0] if len(ends) == 1 else path
+            if path not in cache:
+                ent = files.get(path)
+                t = blob_text(root, ent["blob"]) if ent and not ent.get("skip") else None
+                cache[path] = split_lines(t) if t is not None else None
+            return path, cache[path]
+        return lines_of
+
+    def accept_bugs(self, u, bugs, sid, known):
+        """Check a bug pass's reports; the ones that pass wait for the checker. (waiting,
+        thrown away)."""
+        lines_of = self.lines_at(u.root)
         ids = {f["id"] for f in self.store["findings"]}
-        titles = {title_key(f.get("path", ""), f.get("title", "")) for f in self.store["findings"]
-                  if f.get("project") == u.root}
-        acc = rej = 0
-        texts = {}
-        for cat, sev, path, line, title, rest in raw[:PER_PASS]:
-            path = path.strip()
-            tree = self.trees.get(u.root) or ""
-            if tree and path.startswith(tree.rstrip("/") + "/"):   # the snapshot's own spelling
-                path = path[len(tree.rstrip("/")) + 1:]
-            if path not in texts:
-                texts[path] = self.file_lines(u.root, path)
-            lines = texts[path]
-            v = validate(line, title, rest, lines) if lines is not None else None
-            if not v:
+        waiting = [dict(p["cand"], path=p["cand"]["path"]) for p in self.ledger["pending"] if p["root"] == u.root]
+        n = rej = 0
+        for b in bugs[:BUG_PER_PASS]:
+            c, why = check_bug(b, lines_of, lambda t: self.ui_ok(u.root, t))
+            if c and (fingerprint(os.path.basename(u.root), c["path"], "bug", c["evidence"]) in ids
+                      or duplicate_of(c, known + waiting)):
+                c, why = None, "duplicate"
+            if not c:
+                self.rejected("bug", why)
                 rej += 1
                 continue
-            cat = cat if cat in CATEGORIES else ("bug" if u.lens == "bug" else "ui" if u.lens == "ui" else "simplify")
-            fid = fingerprint(repo, path, cat, v["evidence"])
-            tk = title_key(path, v["title"])
-            if fid in ids or tk in titles:
-                continue   # known: neither new nor wrong
-            ids.add(fid)
-            titles.add(tk)
-            self.store["findings"].append({
-                "id": fid, "category": cat, "severity": SEVERITY.get(sev.lower().strip(), "medium"),
-                "title": v["title"], "detail": v["detail"], "path": path, "line": v["line"], "found_at": iso(),
-                "project": u.root, "lens": u.lens, "evidence": v["evidence"], "model": self.model,
-                "status": "open", "session": sid, "area": u.area})
-            acc += 1
-        rej += max(0, len(raw) - PER_PASS)
-        return acc, rej
+            waiting.append(c)
+            self.ledger["pending"].append({"cand": c, "root": u.root, "tries": 0, "session": sid, "area": u.area,
+                                           "entry": u.entry, "found_at": iso()})
+            n += 1
+        if len(bugs) > BUG_PER_PASS:
+            self.rejected("bug", "over the limit", len(bugs) - BUG_PER_PASS)
+            rej += len(bugs) - BUG_PER_PASS
+        self.ledger["pending"] = self.ledger["pending"][-PENDING_MAX:]
+        return n, rej
+
+    def accept_items(self, u, items, sid):
+        """Check a cleanup pass's items and put the new ones on their lists. (added, thrown
+        away)."""
+        themes = {k: (t, d) for k, t, d in self.themes()}
+        lines_of = self.lines_at(u.root)
+        tracked = set(self.paths.get(u.root) or ())
+        n = rej = 0
+        for theme, places, rest in items[:ITEM_PER_PASS]:
+            theme = re.sub(r"[^a-z0-9-]", "", theme)
+            if theme not in themes:
+                it, why = None, "list"
+            else:
+                it, why = check_item(theme, places, rest, lines_of,
+                                     lambda p: p in tracked or lines_of(p)[0] in tracked)
+            if it and theme == "unused":
+                it["path"] = lines_of(it["path"])[0] if it["path"] not in tracked else it["path"]
+                it["locations"] = [it["path"]]
+                if not self.unused_ok(u.root, it["path"]):
+                    it, why = None, "used"
+            if it and not self.add_item(u.root, theme, *themes[theme], it, sid):
+                it, why = None, "duplicate"
+            if not it:
+                self.rejected("cleanup", why)
+                rej += 1
+                continue
+            n += 1
+        if len(items) > ITEM_PER_PASS:
+            self.rejected("cleanup", "over the limit", len(items) - ITEM_PER_PASS)
+            rej += len(items) - ITEM_PER_PASS
+        return n, rej
+
+    def context_of(self, root, c):
+        """The code around a report's lines, numbered, for the checker."""
+        lines_of, out, seen = self.lines_at(root), [], set()
+        for path, line in [(c["path"], c["line"])] + [(h["path"], h["line"]) for h in c["trace"]]:
+            if (path, line // (HOP_CONTEXT * 2)) in seen:
+                continue
+            seen.add((path, line // (HOP_CONTEXT * 2)))
+            lines = lines_of(path)[1] or []
+            lo, hi = max(1, line - HOP_CONTEXT), min(len(lines), line + HOP_CONTEXT)
+            out.append(f"--- {path}:{lo}-{hi}\n" + "\n".join(f"{n:>5}  {lines[n - 1][:200]}"
+                                                            for n in range(lo, hi + 1)))
+        return "\n".join(out)[:12000]
+
+    def store_bug(self, p, verdict, why):
+        c = p["cand"]
+        repo = os.path.basename(p["root"])
+        fid = fingerprint(repo, c["path"], "bug", c["evidence"])
+        if any(f["id"] == fid for f in self.store["findings"]):
+            return False
+        self.store["findings"].append({
+            "id": fid, "category": "bug", "severity": c["severity"], "title": c["title"], "detail": c["detail"],
+            "path": c["path"], "line": c["line"], "evidence": c["evidence"], "ui": c["ui"], "steps": c["steps"],
+            "expected": c["expected"], "actual": c["actual"], "trace": c["trace"], "verdict": f"{verdict}: {why}",
+            "found_at": iso(), "project": p["root"], "lens": "bug", "model": self.model, "status": "open",
+            "session": p["session"], "area": p["area"], "entry": p.get("entry", "")})
+        return True
+
+    def verify(self, notes):
+        """One checking session on up to VERIFY_BATCH waiting reports of one repository:
+        the real ones go on the board. False when the loop should stop."""
+        root = self.ledger["pending"][0]["root"]
+        batch = [p for p in self.ledger["pending"] if p["root"] == root][:VERIFY_BATCH]
+        if root not in self.repos or not self.heads.get(root):
+            self.ledger["pending"] = [p for p in self.ledger["pending"] if p["root"] != root]
+            self.save_ledger()
+            return True
+        u = Unit(root, area_of(batch[0]["cand"]["path"]), "verify", [], "")
+        tree = snapshot(root, self.heads.get(root), self.p("tree"))
+        if not tree:
+            return True
+        self.trees[root] = tree
+        wait = self.last_call + GAP - now()
+        if wait > 0 and not self.wait(wait, "waiting", unit=u.label()):
+            return False
+        has_notes = self.sync_notes(root, tree)
+        known = self.known(root)
+        self.write_known(root, tree, known)
+        cands = []
+        for p in batch:
+            c = dict(p["cand"], context=self.context_of(root, p["cand"]))
+            near = [k for k in known if any(same_place(k.get("path"), x) for x in
+                                            [c["path"]] + [h["path"] for h in c["trace"]])]
+            near.sort(key=lambda k: -share(c["title"], k.get("title") or k.get("text")))
+            c["near"] = [f"{k['path']}:{k['line']} {clean_one_line(k.get('title') or k.get('text'), 160)} "
+                         f"({k['state']})" for k in near[:8]]
+            cands.append(c)
+        nonce = "%08x" % random.getrandbits(32)
+        prompt = build_verify_prompt(os.path.basename(root), cands, nonce, has_notes=has_notes)
+        if notes:
+            prompt += "\n\nThe owner's notes:\n" + notes
+        rc, text, sid, rec = self.run_pass(u, prompt)
+        self.last_call = now()
+        self.calls += 1
+        rec["ended"] = iso()
+        if rc is None:
+            rec["outcome"] = "stopped"
+            self.save_ledger()
+            return False
+        self.count("verify", "calls")
+        got = parse_verdicts(text, nonce)
+        if not got:
+            err = failure_text(text) or f"the session ended ({rc}) without its verdicts"
+            rec.update(outcome="failed", covered=err[:300])
+            if rc != 0 and classify(err) in ("rate", "auth", "refused"):
+                self.save_ledger()
+                return self.trouble(None, err)
+            self.count("verify", "failed")
+            for p in batch:
+                p["tries"] = p.get("tries", 0) + 1
+            drop = [p for p in batch if p["tries"] >= VERIFY_TRIES]
+            if drop:
+                self.rejected("verify", "no verdict", len(drop))
+                self.ledger["pending"] = [p for p in self.ledger["pending"] if p not in drop]
+            log(f"{u.label()}: session {sid} gave no verdict: {err[:300]}")
+            self.save_ledger()
+            return True
+        self.infra_fails, self.refused_since = 0, 0.0
+        kept = rej = 0
+        for n, p in enumerate(batch, 1):
+            verdict, why = got.get(n, (None, ""))
+            if verdict is None:
+                p["tries"] = p.get("tries", 0) + 1
+                if p["tries"] < VERIFY_TRIES:
+                    continue
+                self.rejected("verify", "no verdict")
+            elif verdict == "real" and not duplicate_of(p["cand"], self.known(root)):
+                kept += self.store_bug(p, verdict, why)
+            else:
+                self.rejected("verify", verdict if verdict != "real" else "duplicate")
+                rej += 1
+                log(f"{u.label()}: {p['cand']['title'][:100]}: {verdict}: {why[:200]}")
+            self.ledger["pending"].remove(p)
+        self.count("verify", "accepted", kept)
+        self.count("bug", "accepted", kept)
+        rec.update(outcome="found" if kept else "none", found=kept, rejected=rej,
+                   covered=f"checked {len(batch)} report(s): {kept} real")
+        if kept:
+            self.save_store()
+        log(f"{u.label()}: {kept} of {len(batch)} real (session {sid or '?'})")
+        self.status.set(last_error="", counts=self.ledger["counts"])
+        self.save_ledger()
+        return True
 
     def scan(self, u, notes, prompt_hash, map_only=False):
         """One pass for one unit. Returns False when the loop should stop."""
@@ -1937,8 +2166,12 @@ class Worker:
             return False
         nonce = "%08x" % random.getrandbits(32)
         has_notes = self.sync_notes(u.root, tree)
-        prompt = build_prompt(u, notes, self.prior(u), self.covered(u), nonce, note=self.note(u.root, u.area),
-                              note_old=self.note_old(u), has_notes=has_notes, map_only=map_only)
+        known = self.known(u.root)
+        self.write_known(u.root, tree, known)
+        prompt = build_prompt(u, notes, self.prior(u, known), self.covered(u), nonce,
+                              note=self.note(u.root, u.area), note_old=self.note_old(u), has_notes=has_notes,
+                              map_only=map_only, ui=self.ui_for(u) if u.lens == "bug" else (),
+                              themes=self.themes() if u.lens == "cleanup" else ())
         rc, text, sid, rec = self.run_pass(u, prompt)
         self.last_call = now()
         self.calls += 1
@@ -1948,29 +2181,35 @@ class Worker:
             self.save_ledger()
             return False
         self.count(u.lens, "calls")
-        raw, covered = parse_session(text, nonce)
+        bugs, items, covered = parse_session(text, nonce)
         blocks = parse_knowledge(text, nonce)
-        if map_only:
-            raw = []
-        if covered is not None or (rc == 0 and (raw or blocks)):
+        if map_only or u.lens != "bug":
+            bugs = []
+        if map_only or u.lens != "cleanup":
+            items = []
+        if covered is not None or (rc == 0 and (bugs or items or blocks)):
             self.infra_fails, self.refused_since = 0, 0.0
-            acc, rej = self.accept(u, raw, sid)
+            if u.lens == "bug":
+                acc, rej = self.accept_bugs(u, bugs, sid, known)
+                found = "waiting" if acc else "none"
+            else:
+                acc, rej = self.accept_items(u, items, sid)
+                found = "found" if acc else "none"
+                self.count(u.lens, "accepted", acc)
             learned = self.take_notes(u, blocks, sid)
             self.count(u.lens, "notes", len(learned))
             e = self.ledger["units"].get(u.key) or {}
             hist = (self.covered(u) + [covered or "(no summary)"])[-COVERED_MAX:]
-            self.ledger["units"][u.key] = {"sha": u.sha, "prompt": prompt_hash, "scanned": now(),
-                                           "outcome": "found" if acc else "none", "failures": 0, "found": acc,
+            self.ledger["units"][u.key] = {"sha": u.sha, "prompt": prompt_hash.get(u.lens), "scanned": now(),
+                                           "outcome": found, "failures": 0, "found": acc,
                                            "covered": hist, "session": sid,
                                            "found_total": e.get("found_total", 0) + acc}
-            self.count(u.lens, "accepted", acc)
-            self.count(u.lens, "rejected", rej)
-            rec.update(outcome="found" if acc else "none", found=acc, rejected=rej, covered=covered or "",
-                       notes=learned)
-            if acc:
+            rec.update(outcome=found, found=acc, rejected=rej, covered=covered or "", notes=learned)
+            if acc and u.lens == "cleanup":
                 self.save_store()
-            log(f"{u.label()}: {acc} new, {rej} rejected, notes on {', '.join(a + '/' for a in learned) or 'nothing'}"
-                f" (session {sid or '?'})")
+            what = "to check" if u.lens == "bug" else "new items"
+            log(f"{u.label()}: {acc} {what}, {rej} thrown away, notes on "
+                f"{', '.join(a + '/' for a in learned) or 'nothing'} (session {sid or '?'})")
             self.status.set(last_error="", counts=self.ledger["counts"])
             self.save_ledger()
             return True
@@ -2033,10 +2272,14 @@ class Worker:
         reason = (f"board full: passes write notes only until some are archived ({n_open} open, "
                   f"FINDINGS_OPEN_MAX={OPEN_MAX})" if map_only else "")
         notes = self.notes()
-        prompt_hash = sha16(PROMPT_VERSION + "\0" + notes)
+        if self.ledger["pending"] and not map_only:   # reports waiting for the checker go first
+            ok = self.verify(notes)
+            return ok and not (self.once and self.calls)
+        prompt_hash = {"bug": sha16(PROMPT_VERSION + "\0" + notes),
+                       "cleanup": sha16(PROMPT_VERSION + "\0" + notes + "\0" + self.themes_text())}
         units = [u for r in self.repos for u in self.units.get(r, [])]
         first, rest = due(units, self.ledger["units"], prompt_hash, now())
-        self.status.set(open=n_open, todo=len(first), units=len(units), reason=reason,
+        self.status.set(open=n_open, todo=len(first), units=len(units), reason=reason, pending=len(self.ledger["pending"]),
                         notes=len(self.ledger["knowledge"]), counts=self.ledger["counts"])
         if not first and not rest:   # no area at all, or every pass failing: look again in a minute
             why = "every pass failed lately; trying again soon" if units else "no file to explore"
@@ -2315,8 +2558,16 @@ def summary(sdir):
     info["beat_age"] = int(now() - beat) if isinstance(beat, (int, float)) else None
     store = read_json(os.path.join(sdir, "findings.json"), {})
     f = store.get("findings") if isinstance(store.get("findings"), list) else []
-    info["findings"] = {"open": sum(1 for x in f if isinstance(x, dict) and x.get("status") == "open"),
-                        "stale": sum(1 for x in f if isinstance(x, dict) and x.get("status") == "stale")}
+    f = [x for x in f if isinstance(x, dict)]
+    info["findings"] = {"open": sum(1 for x in f if x.get("status") == "open" and x.get("kind") != "rolling"),
+                        "stale": sum(1 for x in f if x.get("status") == "stale"),
+                        "lists": {x.get("theme") or x.get("category") or "?": sum(
+                            1 for i in x.get("items") or [] if isinstance(i, dict) and i.get("status") == "open")
+                            for x in f if x.get("kind") == "rolling" and x.get("status") == "open"}}
+    ledger = read_json(os.path.join(sdir, "ledger.json"), {})
+    pend = ledger.get("pending")
+    info["pending"] = len(pend) if isinstance(pend, list) else 0
+    info["counts"] = ledger.get("counts") if isinstance(ledger.get("counts"), dict) else info.get("counts")
     return info
 
 
@@ -2338,14 +2589,52 @@ def status_main(a):
             print(f"  {label}: {info[k]}")
     if info.get("repos"):
         print("  repos: " + ", ".join(info["repos"]))
-    print(f"  findings: {info['findings']['open']} open, {info['findings']['stale']} stale"
+    print(f"  findings: {info['findings']['open']} open, {info['findings']['stale']} stale, "
+          f"{info['pending']} bug report(s) waiting for the checker"
           + (f"; {info['todo']} passes to do of {info.get('units')}" if info.get("todo") is not None else ""))
+    if info["findings"]["lists"]:
+        print("  lists: " + ", ".join(f"{k} {n}" for k, n in sorted(info["findings"]["lists"].items())))
     if info.get("session"):
         print(f"  session: {info['session']} (harness serve: /runs/{info['session']})")
     for lens, c in sorted((info.get("counts") or {}).items()):
+        if not isinstance(c, dict):
+            continue
+        why = c.get("why") if isinstance(c.get("why"), dict) else {}
         print(f"  {lens}: {c.get('calls', 0)} passes, {c.get('accepted', 0)} kept, "
-              f"{c.get('rejected', 0)} rejected, {c.get('failed', 0)} failed")
+              f"{c.get('rejected', 0)} thrown away, {c.get('failed', 0)} failed"
+              + (" (" + ", ".join(f"{k} {n}" for k, n in sorted(why.items(), key=lambda x: -x[1])) + ")"
+                 if why else ""))
     print(f"  files: {a.state}")
+    return 0
+
+
+def archive_old_main(a):
+    """Archive, on the owner's board, the open findings of the old format (a point finding
+    with no steps): the ones before bug reports had to say how a user meets them."""
+    store = read_json(os.path.join(a.state, "findings.json"), {})
+    f = store.get("findings") if isinstance(store.get("findings"), list) else []
+    ids = [x["id"] for x in f if isinstance(x, dict) and isinstance(x.get("id"), str)
+           and x.get("status") in (None, "", "open") and not x.get("kind") and not x.get("steps")]
+    path = os.path.join(a.state, "board.json")
+    try:
+        with findings_view.held(os.path.join(a.state, "board.lock")):
+            board = findings_view.read_board(path)
+            at = iso()
+            new = [i for i in ids if i not in board["archived"] and findings_view.ID_RE.match(i)]
+            for i in new:
+                board["archived"][i] = at
+            if new:
+                findings_view._write_atomic(path, json.dumps({"version": 1, "order": board["order"],
+                                                              "archived": board["archived"]}, indent=1) + "\n")
+    except TimeoutError:
+        print("the findings board is busy (another change is being saved): try again", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"could not save the findings board: {e}", file=sys.stderr)
+        return 1
+    print(f"archived {len(new)} finding(s) of the old format"
+          + (f" ({len(ids) - len(new)} were archived already)" if len(ids) > len(new) else "")
+          + ("; restore one on the board's Archived list" if new else ""))
     return 0
 
 
@@ -2368,6 +2657,8 @@ def main(argv=None):
     p.add_argument("--state", required=True)
     p.add_argument("--json", action="store_true")
     p.add_argument("--running", action="store_true")
+    p = sub.add_parser("archive-old")
+    p.add_argument("--state", required=True)
     a = ap.parse_args(argv)
     if a.cmd in ("run", "_worker"):
         a.state = os.path.abspath(a.state)
@@ -2377,6 +2668,8 @@ def main(argv=None):
         return stop_main(a)
     if a.cmd == "status":
         return status_main(a)
+    if a.cmd == "archive-old":
+        return archive_old_main(a)
     ap.print_help()
     return 2
 
