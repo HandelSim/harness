@@ -2468,7 +2468,13 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   name, the Repositories tree, plan approval, a note for the agents, and the
   stages: Full, Full + tests (the opt-in test stage, `STAGES` all six),
   Review only, Implement+review, Plan only or Custom; test needs plan and
-  implement, the form and `ticket_args` saying no otherwise). The
+  implement, the form and `ticket_args` saying no otherwise). The stages
+  show as the flow they run in (`_stage_cards`, also the started ticket's
+  Settings): each a checkbox with its name (`STAGE_TITLES`: Plan, Tests
+  first, Implement, Review, Fix rounds, Push) and what it does now
+  (`stage_help`: the plan and review panels as `QUEUE_PLANNERS` /
+  `QUEUE_REVIEWERS` set them, read the queue's way, and `FIX_ROUNDS`); the
+  stage names sent are the queue's. The
   branch fields suggest the project's local and remote branches from
   `/runs/queue/branches?project=` (read-only git, cached 5 s), which also
   says which repository and branch the folder is on, its remotes and their
@@ -2492,9 +2498,16 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   --take-defaults`);
   a work branch that is main/master, a remote's default or the target (an
   empty target meaning the folder's branch) is refused; an existing branch
-  of the ticket's name is a warning. `add_tickets` refuses the same
-  combinations server-side. "+ Add tickets" scrolls to the
-  form and focuses the keys. The project folder starts as the git repository
+  of the ticket's name is a warning. When the folder is on the very branch
+  the work goes onto (it sits on the ticket's branch), an empty Target
+  branch is filled in with the remote's default (else main or master) and
+  the form says so, until the owner types a target; an empty target that
+  would be another ticket's branch (the folder's, key-shaped) is a warning.
+  `add_tickets` refuses the same
+  combinations server-side, naming the branch to set. On the queue page the
+  form is a modal `<dialog id='adddlg'>` with a Close button: "+ Add
+  tickets", a Jira row's Add (`window.hAddOpen`) and a refused add (the
+  page comes back with `data-err`) open it. The project folder starts as the git repository
 `harness serve` (or the launch that started the viewer) was run in
 (`--project-dir`, its top folder), else the last ticket's; the others are
 offered as suggestions. It is taken as pasted: quotes
@@ -2655,8 +2668,9 @@ offered as suggestions. It is taken as pasted: quotes
   JSON; `/rest/api/3/search/jql` on `*.atlassian.net`, `/rest/api/2/search` otherwise, each
   falling back to the other on 404/410; 8 s limit; 60 s cache refreshed in the background, so
   the page never waits on Jira). The project is the literal prefix of `ticket_pattern`, else the
-  queue's most-used key prefixes. A queued row shows its status; Add posts the Add form's
-  settings with `kind=jira` to `/runs/queue/add`; a row Done in Jira has no Add, and an error hides the
+  queue's most-used key prefixes. A queued row shows its status; Add and Add selected open the
+  Add dialog (`window.hAddOpen`) with kind Jira, the keys and each one's summary shown,
+  so the stages, target branch and note are set before the add; a row Done in Jira has no Add, and an error hides the
   add tools behind a Try again. `cmd_serve` hands `TRACKER_TOKEN` to pub.py
   alone, and `jira_view` removes it from the environment at import.
 - `/runs/ticket/<KEY>/diff?repo=&view=` (`serve/diff_view.py`, "Changes" on

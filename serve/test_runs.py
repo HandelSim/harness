@@ -1809,7 +1809,9 @@ class QueuePageTest(RunsServer):
         runs._BRANCHES.clear()
         r, body = self.post("/runs/queue/add", good + [("start", "continue"), ("cont", "ABC-7-work")])
         self.assertEqual(r.status, 409)
-        self.assertIn("empty means the branch the folder is on, ABC-7-work", body)
+        self.assertIn("target branch: the project folder is on ABC-7-work, the branch this ticket&#x27;s work would "
+                      "be committed to, so it cannot be the target too; set Target branch to the branch the work goes "
+                      "into (e.g. ", body)
         # a refused add is the queue page again: the reason in the form, nothing typed lost
         r, body = self.post("/runs/queue/add", [("keys", "ABC-9"), ("project", "relative/dir"), ("base", "dev"),
                                                 ("preset", "custom"), ("stage_review", "review"),
@@ -1819,7 +1821,7 @@ class QueuePageTest(RunsServer):
         self.assertIn("Not added: the project folder", body)
         for frag in ("name='keys' autocomplete='off' spellcheck='false' value='ABC-9'",
                      "value='dev'", "value='origin/x'", ">keep &lt;me&gt;</textarea>",
-                     "value='custom' checked", "value='review' checked", "value='plan'> plan"):
+                     "value='custom' checked", "value='review' checked", "value='plan'><b>Plan</b>"):
             self.assertIn(frag, body)
         self.assertNotIn("keep <me>", body)
         r, _ = self.post("/runs/queue/add", good, origin="http://evil.example")
@@ -2450,9 +2452,46 @@ class TestStageServeTest(RunsServer):
         r, body = self.req("GET", "/runs/queue")
         self.assertIn("<label><input type='radio' name='preset' value='tests'>Full + tests<small>", body)
         self.assertIn("<label><input type='radio' name='preset' value='full' checked>Full<small>", body)
-        self.assertIn("<input type='checkbox' name='stage_test' value='test'> test</label>", body)
+        self.assertIn("<input type='checkbox' name='stage_test' value='test'><b>Tests first</b>", body)
         self.assertIn("name='stage_implement' value='implement' checked>", body)
         self.assertIn('"tests": ["plan", "test", "implement", "review", "fix", "push"]', body)   # the page's script
+
+    def test_the_add_form_shows_the_flow_in_a_dialog(self):
+        self.ticket(status="queued", questions=[])
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertIn("<dialog id='adddlg' aria-labelledby='addttl'><section class='panel' id='add'>", body)
+        self.assertIn("<h2 id='addttl'>Add tickets</h2><button type='button' class='sm' data-close>Close</button>", body)
+        self.assertIn("<div class='addfrom' id='addfrom' hidden></div>", body)   # the Jira tickets it was opened for
+        self.assertIn("<small class='basewhy' id='basewhy' hidden></small>", body)
+        self.assertEqual(re.findall(r"<li data-s='(\w+)'>", body), list(runs.STAGES))   # the flow, in order
+        self.assertIn("<li data-s='fix'><label><input type='checkbox' name='stage_fix' value='fix' checked>"
+                      "<b>Fix rounds</b><small>implement again with the review&#x27;s findings", body)
+        self.assertIn("3 planners draft the plan at once and one merges them", body)
+        self.assertIn("3 reviewers at once (general, ux, standards)", body)
+        self.assertIn(f"up to {runs._tq().FIX_ROUNDS} rounds", body)
+        self.assertIn('"fix": "Fix rounds"', body)   # the script's names for the stages
+        self.assertIn("window.hAddOpen = function", body)
+        self.assertIn("The planners turn it and the ticket into the plan's acceptance criteria", body)
+        r, body = self.req("GET", "/runs/ticket/ABC-12/edit")   # a ticket's Settings: the form, no dialog
+        self.assertIn("id='addform'", body)
+        self.assertNotIn("<dialog", body)
+        self.assertNotIn("data-close>Close", body)
+        self.assertIn("<b>Fix rounds</b>", body)
+
+    def test_the_stage_help_follows_the_panels(self):
+        with mock.patch.dict(os.environ, {"QUEUE_PLANNERS": "1", "QUEUE_REVIEWERS": "general"}):
+            h = runs.stage_help()
+        self.assertTrue(h["plan"].startswith("a planner writes the plan: questions"), h["plan"])
+        self.assertTrue(h["review"].startswith("a reviewer: "), h["review"])
+        with mock.patch.dict(os.environ, {"QUEUE_PLANNERS": "x", "QUEUE_REVIEWERS": "ux, nope,UX,general"}):
+            h = runs.stage_help()
+        self.assertIn("3 planners", h["plan"])
+        self.assertIn("2 reviewers at once (general, ux)", h["review"])   # as the queue reads it
+        with mock.patch.dict(os.environ, {"QUEUE_PLANNERS": "40"}):
+            self.assertIn(f"{runs._tq().PANEL_MAX} planners", runs.stage_help()["plan"])
+        self.assertEqual(set(h), set(runs.STAGES))
+        self.assertEqual(set(runs.STAGE_TITLES), set(runs.STAGES))
 
     def test_a_ticket_with_no_stages_recorded_has_the_five(self):
         self.ticket(status="blocked", stage="implement", reason="it failed", questions=[])   # no "stages"
@@ -2526,7 +2565,7 @@ class TestStageServeTest(RunsServer):
             # a started ticket's stages still to come
             self.ticket(project=proj, status="needs-answers", stage="plan", start_sha="a" * 40)
             r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
-            self.assertIn("<input type='checkbox' name='stage_test' value='test'> test</label>", body)
+            self.assertIn("<input type='checkbox' name='stage_test' value='test'><b>Tests first</b>", body)
             r, body = self.post("/runs/ticket/ABC-12/edit", [("stage_plan", "plan"), ("stage_test", "test"),
                                                              ("stage_review", "review")])
             self.assertEqual(r.status, 409)
@@ -2542,7 +2581,7 @@ class TestStageServeTest(RunsServer):
             # past it: test stays as it is
             self.ticket(project=proj, status="blocked", stage="implement", start_sha="a" * 40)
             r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
-            self.assertIn("<input type='checkbox' name='stage_test' value='test' disabled> test</label>", body)
+            self.assertIn("<input type='checkbox' name='stage_test' value='test' disabled><b>Tests first</b>", body)
 
     def test_the_forms_stay_within_their_field_limits(self):
         from urllib.parse import parse_qs

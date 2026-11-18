@@ -64,6 +64,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from urllib.parse import quote
 
 import findings_agent_view
@@ -110,12 +111,14 @@ STAGES = ("plan", "test", "implement", "review", "fix", "push")   # every stage,
 DEFAULT_STAGES = ("plan", "implement", "review", "fix", "push")   # a ticket's when it has none: test is opt-in
 PRESETS = {"full": DEFAULT_STAGES, "tests": STAGES, "review": ("review",),
            "implement": ("implement", "review", "fix", "push"), "plan": ("plan",)}
-PRESET_LABELS = (("full", "Full", "plan, implement, review, fix, push"),
-                 ("tests", "Full + tests", "plan, test, implement, review, fix, push: tests from the plan, "
-                  "written before the code"),
-                 ("review", "Review only", "review existing work; nothing is pushed"),
-                 ("implement", "Implement + review", "no plan: implement, review, fix, push"),
-                 ("plan", "Plan only", "write the plan and stop"))
+PRESET_LABELS = (("full", "Full", "plan, implement, review with fix rounds, push"),
+                 ("tests", "Full + tests", "the same, with tests written from the plan before the code"),
+                 ("review", "Review only", "review work that already exists; nothing is pushed"),
+                 ("implement", "Implement + review", "no plan: implement, review with fix rounds, push"),
+                 ("plan", "Plan only", "write the plan (questions, acceptance criteria) and stop"))
+STAGE_TITLES = {"plan": "Plan", "test": "Tests first", "implement": "Implement", "review": "Review",
+                "fix": "Fix rounds", "push": "Push"}
+FIX_ROUNDS = 2   # the queue's (ticket_queue.FIX_ROUNDS), when it cannot be loaded
 MOVES = ("up", "down", "top", "bottom")
 
 esc = html.escape
@@ -589,6 +592,33 @@ details.doc summary .muted { font-weight: 400; }
 }
 #add { scroll-margin-top: 68px; transition: box-shadow .3s; }
 #add.hl { box-shadow: 0 0 0 2px var(--accent); }
+/* the Add form's stages: the flow they run in, top down; Fix rounds loop back to Implement */
+.flow { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.flow label { display: grid; grid-template-columns: 16px 104px minmax(0, 1fr); gap: 2px 8px; align-items: baseline;
+  padding: 6px 10px; border: 1px solid var(--line-2); border-radius: 8px; cursor: pointer; font-size: 13px; }
+.flow label small { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.flow label .why { grid-column: 2 / -1; }
+.flow input { accent-color: var(--accent); margin: 0; align-self: center; }
+.flow label:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.flow label:has(input:not(:checked)) b { color: var(--muted); font-weight: 500; }
+.flow label:has(input:disabled) { opacity: .5; cursor: not-allowed; }
+.flow li[data-s=fix] label { margin-left: 22px; border-style: dashed; }
+.flow li[data-s=fix] label:has(input:checked) { border-style: solid; }
+.flow li[data-s=fix] b::before { content: "\21BA  "; color: var(--accent); }
+.addfrom { font-size: 13px; padding: 8px 10px; border-radius: 8px; background: var(--sunk); }
+.addfrom div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.addfrom code { font-weight: 600; margin-right: 8px; }
+.basewhy { color: var(--ink) !important; }
+dialog#adddlg { width: min(880px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px); padding: 0;
+  border: 0; border-radius: 12px; background: transparent; color: inherit; overflow: auto; overscroll-behavior: contain; }
+dialog#adddlg::backdrop { background: rgba(0, 0, 0, .5); }
+dialog#adddlg > #add { margin: 0; }
+dialog#adddlg .hd { position: sticky; top: 0; z-index: 2; background: inherit; }
+@media (max-width: 560px) {
+  dialog#adddlg { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
+  .flow label { grid-template-columns: 16px minmax(0, 1fr); }
+  .flow label small { grid-column: 2; }
+}
 @media (max-width: 1180px) {
   .tk { grid-template-columns: 44px minmax(0, 1fr) auto; padding: 12px 14px; }
   .tk .strip { grid-column: 2 / -1; grid-row: 2; max-width: 520px; }
@@ -2280,6 +2310,42 @@ def _choice(legend, name, value, choices):
 START_MODES = ("new", "continue", "here")
 
 
+def stage_help():
+    """What each stage does now, for the Add form: the plan and review panels (as harness
+    queue run gets them: QUEUE_PLANNERS, QUEUE_REVIEWERS) and the fix rounds."""
+    tq = _tq()
+    try:
+        n = max(1, min(int(os.environ.get("QUEUE_PLANNERS") or 3), getattr(tq, "PANEL_MAX", 99)))
+    except ValueError:
+        n = 3
+    raw = os.environ.get("QUEUE_REVIEWERS") or "general,ux,standards"
+    try:   # the queue's own reading of it: known lenses, general first
+        lens = tq.lenses(types.SimpleNamespace(reviewers=raw))
+    except Exception:
+        lens = list(dict.fromkeys(x.strip().lower() for x in raw.split(",") if x.strip())) or ["general"]
+    rounds = getattr(tq, "FIX_ROUNDS", FIX_ROUNDS)
+    return {
+        "plan": (f"{n} planners draft the plan at once and one merges them" if n > 1 else "a planner writes the plan")
+        + ": questions for you, each with a default, and the acceptance criteria",
+        "test": "tests written from the plan, for implement to make pass",
+        "implement": "the code, committed on the work branch",
+        "review": (f"{len(lens)} reviewers at once ({', '.join(lens)})" if len(lens) > 1 else "a reviewer")
+        + ": each criterion PASS or FAIL; a bug only with the steps to see it",
+        "fix": f"implement again with the review's findings, then review again, up to {rounds} rounds; "
+        "anything still open stops for you to decide",
+        "push": "the work branch to the remote, once the review passes or you say so"}
+
+
+def _stage_cards(on, fixed=()):
+    """The stages as the flow they run in, each a checkbox that says what it does;
+    fixed: ones that cannot change now (a started ticket's), sent as they are."""
+    hlp = stage_help()
+    return "".join(f"<li data-s='{s}'><label><input type='checkbox' name='stage_{s}' value='{s}'"
+                   f"{' checked' if s in on else ''}{' disabled' if s in fixed else ''}><b>{STAGE_TITLES[s]}</b>"
+                   f"<small>{esc(hlp[s])}</small><small class='why' hidden></small></label>"
+                   + (_hidden("stage_" + s, s) if s in fixed and s in on else "") + "</li>" for s in STAGES)
+
+
 def _start_choice(v, sent):
     """The Starting point cards; Continue carries the branch to continue."""
     mode = v("start") if v("start") in START_MODES else ("continue" if sent and v("ref") and v("ref") != "here"
@@ -2304,10 +2370,11 @@ def _start_choice(v, sent):
             "<div class='why' hidden></div></fieldset>")
 
 
-def add_form(runs, form=None, err="", edit=""):
+def add_form(runs, form=None, err="", edit="", dlg=False):
     """The Add tickets form; after a refused add, the values sent (form) and
     why it was refused (err), so nothing typed is lost. edit: the form for that
-    ticket's settings (not started yet), its key fixed."""
+    ticket's settings (not started yet), its key fixed. dlg: it is the queue page's
+    Add dialog (a Close button; #addfrom names the Jira tickets it was opened for)."""
     projects = _projects(runs)
     v = (lambda name: _one(form, name)) if form is not None else (lambda name: "")
     preset = v("preset") if v("preset") in (*PRESETS, "custom") else "full"
@@ -2316,8 +2383,6 @@ def add_form(runs, form=None, err="", edit=""):
                       f"{esc(lab)}<small>{esc(hint)}</small></label>" for p, lab, hint in PRESET_LABELS)
     presets += (f"<label><input type='radio' name='preset' value='custom'{' checked' if preset == 'custom' else ''}>"
                 "Custom<small>pick the stages below</small></label>")
-    checks = "".join(f"<label><input type='checkbox' name='stage_{s}' value='{s}'{' checked' if s in on else ''}> "
-                     f"{s}</label>" for s in STAGES)
     opts = "".join(f"<option value='{esc(p)}'>" for p in projects)
     project = v("project") if form is not None else (projects[0] if projects else "")
     sent = {k: _one(form, k) for k in form if k.startswith("repo_")} if form is not None else {}
@@ -2350,7 +2415,9 @@ def add_form(runs, form=None, err="", edit=""):
                 f"{esc(v('desc'))}</textarea><small>what the agents read as the ticket (empty: the title). Edit it "
                 f"later in .raw/tickets/{esc(nxt)}.md in the vault</small></label>")
     title, action = ("Settings", f"/runs/ticket/{quote(edit)}/edit") if edit else ("Add tickets", "/runs/queue/add")
-    return (f"<section class='panel' id='add'{' data-err=1' if err else ''}><div class='hd'><h2>{title}</h2></div>"
+    close = "<button type='button' class='sm' data-close>Close</button>" if dlg else ""
+    return (f"<section class='panel' id='add'{' data-err=1' if err else ''}><div class='hd'><h2 id='addttl'>{title}"
+            f"</h2>{close}</div>"
             + (f"<p class='err' role='alert'>Not {'changed' if edit else 'added'}: {esc(err)}</p>" if err else "") +
             f"<form method='post' action='{action}' id='addform' class='stack'>{kinds}"
             f"<div class='grid2'>{keys}"
@@ -2358,21 +2425,22 @@ def add_form(runs, form=None, err="", edit=""):
             f"value='{esc(project)}' placeholder='/home/me/src/project'>"
             f"<datalist id='projects'>{opts}</datalist><datalist id='branches'></datalist>"
             "<small>the git repository the work is in (absolute path)</small></label>"
-            f"</div>{desc}"
+            f"</div><div class='addfrom' id='addfrom' hidden></div>{desc}"
             "<div class='projhint muted' id='projhint' aria-live='polite'></div>"
             "<fieldset id='f-repos' hidden><legend>Repositories</legend>"
             "<small class='muted'>The agents work in all of them. For each, the ticket's changes are left "
             "uncommitted or made on a branch.</small>"
             f"<div class='repotree' id='repotree' data-sent='{esc(json.dumps(sent))}'></div>"
             "<div class='why' hidden></div></fieldset>"
-            f"<fieldset><legend>What still needs doing</legend><div class='presets'>{presets}</div>"
-            f"<div class='checks' id='stagechecks'>{checks}</div><div class='why' hidden></div></fieldset>"
+            f"<fieldset id='f-stages'><legend>What still needs doing</legend><div class='presets'>{presets}</div>"
+            f"<ol class='flow' id='stagechecks' aria-label='stages, in the order they run'>{_stage_cards(on)}</ol>"
+            "<div class='why' hidden></div></fieldset>"
             + _start_choice(v, form is not None) +
             "<div class='grid2' id='f-branch'>"
             f"<label class='fld'>Target branch<input name='base' list='branches' spellcheck='false' "
             f"value='{esc(v('base'))}' placeholder='the branch the folder is on'>"
             "<small>the branch this work is meant to go into: review compares the work with it, and New work "
-            "starts from it</small></label>"
+            "starts from it</small><small class='basewhy' id='basewhy' hidden></small></label>"
             "<details class='fld adv' data-k='addadv'" + (" open" if v("branch") else "") + ">"
             "<summary>Work branch name</summary>"
             f"<label class='fld'><input name='branch' spellcheck='false' value='{esc(v('branch'))}' "
@@ -2385,8 +2453,11 @@ def add_form(runs, form=None, err="", edit=""):
             ("<p class='muted'>Notes for the agents are on the ticket's page (Notes), and can be added any "
              "time.</p>" if edit else
              "<label class='fld'>Note for the agents<textarea name='note' maxlength='4000' "
-             "placeholder='Context every stage gets, e.g. the solution is on origin/ABC-3122; only the "
-             f"review is left.'>{esc(v('note'))}</textarea></label>") +
+             "placeholder='What done looks like, what to leave alone, where earlier work is. E.g. the "
+             f"export must keep the old column order; the solution is on origin/ABC-3122.'>{esc(v('note'))}"
+             "</textarea><small>every stage reads it, beside the ticket. The planners turn it and the ticket into "
+             "the plan's acceptance criteria, which you see before anything is built (Wait for my approval)."
+             "</small></label>") +
             f"<div class='formacts'><button type='submit' class='primary'>{'Save' if edit else 'Add to the queue'}"
             "</button>"
             "<div class='muted' id='addhint' aria-live='polite'></div></div>"
@@ -2415,7 +2486,7 @@ def render_queue_page(runs, msg="", bad=False, form=None, err=""):
             f"<section class='panel flush' id='r-tickets'>{d['regions']['tickets']}</section>",
             f"<div id='r-fagent'>{d['regions']['fagent']}</div>",
             f"<section class='panel flush' id='r-findings'>{d['regions']['findings']}</section>",
-            add_form(runs, form, err),
+            f"<dialog id='adddlg' aria-labelledby='addttl'>{add_form(runs, form, err, dlg=True)}</dialog>",
             f"<div id='r-archived'>{d['regions']['archived']}</div>"]
 
 
@@ -3365,10 +3436,6 @@ def _later_form(key, st, err=""):
     happens after the plan."""
     cur, stages = st.get("stage"), st.get("stages") or list(DEFAULT_STAGES)
     fixed = STAGES[:STAGES.index(cur) + 1] if cur in STAGES else STAGES
-    checks = "".join(
-        f"<label><input type='checkbox' name='stage_{x}' value='{x}'{' checked' if x in stages else ''}"
-        f"{' disabled' if x in fixed else ''}> {x}</label>" + (_hidden("stage_" + x, x) if x in fixed and x in stages
-                                                               else "") for x in STAGES)
     after = "defaults" if st.get("take_defaults") else "wait" if st.get("plan_review") else "go"
     held = ("<p class='muted'>The plan waiting now still needs Approve or feedback; this is for the next plan "
             "written.</p>") if st.get("status") == "plan-review" else ""
@@ -3376,9 +3443,9 @@ def _later_form(key, st, err=""):
     return (f"<section class='panel'><div class='hd'><h2>What can still change</h2></div>"
             + (f"<p class='err' role='alert'>Not changed: {esc(err)}</p>" if err else "") +
             f"<form method='post' action='/runs/ticket/{quote(key)}/edit' class='stack'>"
-            f"<fieldset><legend>Stages</legend><div class='checks'>{checks}</div><small class='muted'>It is {at}: "
-            "that stage and the ones before it stay as they are; fix needs review, and test needs plan and "
-            "implement.</small></fieldset>"
+            f"<fieldset><legend>Stages</legend><ol class='flow'>{_stage_cards(stages, fixed)}</ol>"
+            f"<small class='muted'>It is {at}: that stage and the ones before it stay as they are; Fix rounds "
+            "need Review, and Tests first needs Plan and Implement.</small></fieldset>"
             + _choice("When the plan is written", "after_plan", after, AFTER_PLAN_CHOICES) + held +
             "<div class='formacts'><button type='submit' class='primary'>Save</button></div></form></section>")
 
@@ -4303,8 +4370,10 @@ def ticket_args(form, keys, st=None):
         names |= {tgt} | {tgt[len(r) + 1:] for r in info.get("remotes", ()) if tgt.startswith(r + "/")}
         if "error" not in info and work in names - {""}:
             if not base and work == tgt and work not in ("main", "master", *info.get("defaults", ())):
-                return (f"target branch: empty means the branch the folder is on, {tgt}, which is the branch "
-                        "the work would be committed to; give the branch this work is meant to go into")
+                into = next((b for b in (*info.get("defaults", ()), "main", "master") if b != tgt), "main")
+                return (f"target branch: the project folder is on {tgt}, the branch this ticket's work would be "
+                        f"committed to, so it cannot be the target too; set Target branch to the branch the work "
+                        f"goes into (e.g. {into})")
             return f"the work would be committed straight onto {work}; give it a work branch name of its own"
     args = [f"--project={project}", "--stages=" + ",".join(stages)]
     for name, v in (("base", base), ("start", ref), ("branch", branch)):
@@ -4616,11 +4685,17 @@ COMMON_JS = """
   };
   if (/[?&]done=/.test(location.search) && history.replaceState)
     history.replaceState(null, '', location.pathname + location.hash);
-  var add = document.getElementById('addform');
+  var add = document.getElementById('addform'), dlg = document.getElementById('adddlg');
+  // The queue page's Add form is a dialog: + Add tickets, a Jira row's Add and a refused add open it.
   function toAdd(smooth) {
     var p = document.getElementById('add');
-    p.scrollIntoView({behavior: smooth ? 'smooth' : 'auto', block: 'start'});
     var k = add.querySelector('[data-kind]:not([hidden]) input') || add.querySelector('input[name=keys]');
+    if (dlg) {
+      if (!dlg.open) dlg.showModal();
+      if (k) k.focus({preventScroll: true});
+      return;
+    }
+    p.scrollIntoView({behavior: smooth ? 'smooth' : 'auto', block: 'start'});
     if (k) k.focus({preventScroll: true});
     p.classList.add('hl');
     setTimeout(function () { p.classList.remove('hl'); }, 1500);
@@ -4628,12 +4703,13 @@ COMMON_JS = """
   if (add) {
     document.addEventListener('click', function (e) {
       var a = e.target.closest && e.target.closest('a[href="#add"]');
-      if (a) { e.preventDefault(); toAdd(true); }
+      if (a) { e.preventDefault(); from([], []); toAdd(true); }
+      if (dlg && e.target.closest && e.target.closest('#adddlg [data-close]')) dlg.close();
     });
-    if (document.getElementById('add').hasAttribute('data-err')) toAdd(false);
+    if (document.getElementById('add').hasAttribute('data-err') || dlg && location.hash === '#add') toAdd(false);
     // Every choice that would be refused is off, with why; Add stays off while
     // anything above would be refused, and says what.
-    var presets = %PRESETS%, info = null, projErr = '';
+    var presets = %PRESETS%, titles = %TITLES%, info = null, projErr = '';
     var checks = add.querySelectorAll('input[name^=stage_]');
     var hint = document.getElementById('addhint'), btn = add.querySelector('button[type=submit]');
     var KEY = /^[A-Z][A-Z0-9_]*-[0-9]+$/, MAXK = %MAXK%, tree = document.getElementById('repotree');
@@ -4662,6 +4738,44 @@ COMMON_JS = """
       (info ? info.remotes : []).forEach(function (r) { if (tgt.indexOf(r + '/') === 0) plain = tgt.slice(r.length + 1); });
       return b === tgt || b === plain ? 'the target branch' : '';
     }
+    function dflt() {   // the branch work usually goes into: a remote's default, else main or master if there is one
+      var have = info.local.concat(info.remote.map(function (r) { return r.split('/').slice(1).join('/'); }));
+      var c = info.defaults.concat(['main', 'master']);
+      for (var i = 0; i < c.length; i++)
+        if (c[i] !== info.current && (i < info.defaults.length || have.indexOf(c[i]) >= 0)) return c[i];
+      return '';
+    }
+    // An empty target is the branch the folder is on. When that is the very branch the work
+    // goes onto (the folder sits on this ticket's branch), the target is filled in with dflt(),
+    // and says so, until the owner types one of their own.
+    function autoBase(base, works) {
+      var auto = base.getAttribute('data-auto') || '', v = base.value.trim();
+      if (base.hasAttribute('data-own') || v && v !== auto) return '';   // the owner's own target
+      var d = info.current && works.indexOf(info.current) >= 0 ? dflt() : '';
+      if (d) {
+        if (v !== d) base.value = d;
+        base.setAttribute('data-auto', d);
+        return 'The folder is on ' + info.current + ", the branch this ticket's work goes onto, so the target is " + d +
+          (info.defaults.indexOf(d) >= 0 ? " (the remote's default branch)" : '') + '. Change it if the work goes elsewhere.';
+      }
+      if (auto && v === auto) base.value = '';
+      base.removeAttribute('data-auto');
+      return '';
+    }
+    function from(keys, about) {   // the Jira tickets the dialog was opened for
+      var box = document.getElementById('addfrom');
+      if (!box) return;
+      box.innerHTML = '';
+      keys.forEach(function (k, i) {
+        var d = document.createElement('div'), c = document.createElement('code');
+        c.textContent = k;
+        d.appendChild(c);
+        d.appendChild(document.createTextNode(about[i] || ''));
+        d.title = about[i] || '';
+        box.appendChild(d);
+      });
+      box.hidden = !keys.length;
+    }
     function presetOf() {
       var on = [], hit = 'custom';
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
@@ -4678,15 +4792,15 @@ COMMON_JS = """
       var keys = mine ? [kd.getAttribute('data-next')] :
           q('input[name=keys]').value.toUpperCase().split(/[\\s,;]+/).filter(Boolean),
         many = keys.length > 1;
-      off(q('input[name=stage_fix]'), q('input[name=stage_review]').checked ? '' : 'fix needs review');
+      off(q('input[name=stage_fix]'), q('input[name=stage_review]').checked ? '' : 'Fix rounds need Review.');
       var noTest = q('input[name=stage_plan]').checked && q('input[name=stage_implement]').checked ? '' :
-        'test needs plan and implement: it writes tests from the plan for implement to make pass.';
+        'Tests first needs Plan and Implement: it writes tests from the plan for implement to make pass.';
       off(q('input[name=stage_test]'), noTest);
       var on = [];
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
       function has(s) { return on.indexOf(s) >= 0; }
       say(q('#stagechecks').nextElementSibling, [q('input[name=stage_review]').checked ? '' :
-        'fix needs review: it fixes what the review asks for.', noTest].filter(Boolean).join(' '));
+        'Fix rounds need Review: they fix what the review finds.', noTest].filter(Boolean).join(' '));
       // with nothing to implement, the work must already exist
       var existing = !has('implement') && (has('review') || has('fix') || has('push'));
       off(pick('start', 'new'), existing ? 'Not with these stages: a new branch has no work on it yet to ' +
@@ -4735,13 +4849,19 @@ COMMON_JS = """
             probs.push(rel + ': ' + (own ? 'branch' : 'target branch') + ': not a branch name: ' + v);
         });
       });
+      var own = many ? '' : br.value.trim(),
+        works = many ? keys : [own || (md === 'continue' ? branchOf(cont.value.trim()) : '') || keys[0] || ''];
+      say(document.getElementById('basewhy'), info && !keep ? autoBase(base, works) : '');
+      if (info && !keep && !base.value.trim() && info.current && works.indexOf(info.current) < 0 &&
+          /(^|\\/)[A-Za-z][A-Za-z0-9_]*-[0-9]+/.test(info.current))
+        warns.push('Target branch: empty means ' + info.current + ', the branch the folder is on, which looks like ' +
+          "another ticket's branch. If this work goes into " + (dflt() || 'main') + ', set Target branch to it.');
       if (info && !many && !keep) {
-        var tgt = base.value.trim() || info.current, own = br.value.trim();
-        var work = own || (md === 'continue' ? branchOf(cont.value.trim()) : '') || keys[0] || '';
+        var tgt = base.value.trim() || info.current, work = works[0];
         var why = work ? shared(work, tgt || '') : '';
         if (why === 'the target branch' && !base.value.trim())
-          probs.push('Target branch: empty means the branch the folder is on, ' + tgt + ', which is the branch the work ' +
-            'would be committed to. Give the branch this work is meant to go into (e.g. ' + (info.defaults[0] || 'main') + ').');
+          probs.push('Target branch: the folder is on ' + tgt + ", the branch this ticket's work would be committed to, " +
+            'so it cannot be the target too. Give the branch the work goes into (e.g. ' + (dflt() || 'main') + ').');
         else if (why)
           probs.push('The work would be committed straight onto ' + work + ' (' + why + '). ' + (own ?
             'Give another work branch name.' : 'Open Work branch name and give it a branch of its own.'));
@@ -4754,7 +4874,8 @@ COMMON_JS = """
           'pick Continue existing work; if it has commits the start does not, the add is refused.');
       });
       hint.innerHTML = '';
-      (probs.length ? probs : warns.length ? warns : [on.length ? 'Stages: ' + on.join(' \\u2192 ') : '']).forEach(function (t) {
+      (probs.length ? probs : warns.length ? warns : [on.length ? 'Stages: ' + on.map(function (s) {
+        return titles[s] || s; }).join(' \\u2192 ') : '']).forEach(function (t) {
         var d = document.createElement('div');
         d.textContent = t;
         d.className = probs.length ? 'err' : warns.length ? 'warn' : 'muted';
@@ -4777,9 +4898,20 @@ COMMON_JS = """
     });
     add.addEventListener('input', function (e) {
       if (e.target.name === 'cont' && e.target.value) pick('start', 'continue').checked = true;
+      if (e.target.name === 'keys') from([], []);
+      if (e.target.name === 'base') e.target.setAttribute('data-own', '');
       sync();
     });
     sync();
+    // Jira's Add: this form in its dialog, for those tickets (their summaries shown), the rest as it was
+    window.hAddOpen = function (keys, about) {
+      var kd = pick('kind', 'jira');
+      if (kd) kd.checked = true;
+      q('input[name=keys]').value = keys.join(' ');
+      from(keys, about || []);
+      sync();
+      toAdd(false);
+    };
     // The project's repositories, how the ticket's changes land in each: the project's own
     // row drives the branch fields above; a nested one on a branch has its own branch and target.
     var treeFs = document.getElementById('f-repos'), sent = JSON.parse(tree.getAttribute('data-sent') || '{}'),
@@ -4990,7 +5122,8 @@ COMMON_JS = """
     send(br[0], row, was);
   });
 })();
-""".replace("%PRESETS%", json.dumps({k: list(v) for k, v in PRESETS.items()})).replace("%MAXK%", str(MAX_KEYS))
+""".replace("%PRESETS%", json.dumps({k: list(v) for k, v in PRESETS.items()})).replace("%MAXK%", str(MAX_KEYS)).replace(
+    "%TITLES%", json.dumps(STAGE_TITLES))
 
 # The home, queue, ticket and sessions pages: poll the page's live JSON every 3 s
 # and swap the regions that changed (hSwap keeps a form being filled in and open

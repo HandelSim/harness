@@ -330,6 +330,12 @@ class RouteTest(Base):
             self.assertIn("id='jira'", body)
             self.assertIn("hjira:list", body)                 # the panel's script is in the page's
             self.assertEqual(self.jira.seen, [])              # the page did not ask Jira
+            # Add opens the Add dialog for the ticket (its settings first); it does not post the form itself
+            self.assertIn("<dialog id='adddlg'", body)
+            self.assertIn("window.hAddOpen(keys", body)
+            self.assertIn("window.hAddOpen = function", body)
+            self.assertNotIn("new FormData(", jira_view.JS)
+            self.assertIn("Add opens the ticket's settings first", body)
             r, body = get("/runs/queue/jira?list=backlog")
             self.assertEqual(r.status, 200)
             d = json.loads(body)

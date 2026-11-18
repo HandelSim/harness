@@ -4,9 +4,11 @@ Jira rank order, each ticket added to the queue with one click.
 panel_html(runs) is a placeholder that renders at once (no network); the page's
 script (JS) asks /runs/queue/jira?list=sprint|backlog&mine=1 for panel_json,
 which answers from a 60 s in-process cache and refreshes a stale entry in the
-background, so neither the page nor a reload waits on Jira. Add posts the queue
-page's own Add form (/runs/queue/add, kind=jira, keys=...), so a ticket added
-here is checked and queued exactly as one typed there.
+background, so neither the page nor a reload waits on Jira. Add (and Add
+selected) opens the queue page's Add dialog with the ticket keys filled in and
+their summaries shown (window.hAddOpen, in runs.py's script), so the owner sets
+the stages, target branch and note before anything is queued, and the add is
+checked exactly as one typed there.
 
 The Jira URL and the way the token is sent are scripts/vault_ticket.py's
 (tracker_url in the vault charter; TRACKER_TOKEN as Bearer, email:api-token as
@@ -344,14 +346,13 @@ def panel_html(runs):
             "<div class='jtools'><label><input type='checkbox' class='jmine'> Mine only</label>"
             "<button type='button' class='sm primary jaddsel' disabled>Add selected</button></div></div></summary>"
             "<div class='jlist' aria-live='polite'><div class='jline'>Loading&hellip;</div></div>"
-            "<div class='jfoot'><span class='jmsg' aria-live='polite'>Added with the settings in Add tickets "
-            "below.</span><a class='jmore' target='_blank' rel='noopener' hidden>Open in Jira</a></div>"
+            "<div class='jfoot'><span class='jmsg' aria-live='polite'>Add opens the ticket's settings first: stages, "
+            "target branch, a note for the agents.</span><a class='jmore' target='_blank' rel='noopener' hidden>Open in Jira</a></div>"
             "</details>")
 
 
-# The panel's script, in the queue page's one script (pub.py). Add posts the Add
-# form as it is filled in, with kind=jira and the keys, and reads the answer the
-# way a browser would: a redirect to ?done= is success, a 409 page carries why not.
+# The panel's script, in the queue page's one script (pub.py). Add opens the Add
+# dialog (window.hAddOpen) with kind=jira, the keys and each one's summary.
 JS = r"""
 (function () {
   var box = document.getElementById('jira');
@@ -388,24 +389,12 @@ JS = r"""
       }).catch(function () { if (n === seq) { box.classList.add('jerr'); line('The Jira list did not load.', true, true); } });
   }
   function add(keys) {
-    var f = document.getElementById('addform');
-    if (!f || !keys.length) return;
-    var body = new URLSearchParams(new FormData(f));
-    body.set('kind', 'jira'); body.set('keys', keys.join(' '));
-    say('Adding ' + keys.join(', ') + '…');
-    box.querySelectorAll('button[data-add], .jaddsel').forEach(function (b) { b.disabled = true; });
-    fetch(f.getAttribute('action'), {method: 'POST', credentials: 'same-origin', body: body})
-      .then(function (r) { return r.text().then(function (t) { return [r, t]; }); })
-      .then(function (p) {
-        var r = p[0], done = null;
-        try { done = new URL(r.url).searchParams.get('done'); } catch (e) {}
-        if (r.ok && done !== null) { say('Added ' + keys.join(', ') + '.'); msg.title = done; if (window.hPoll) window.hPoll(); }
-        else {
-          var doc = new DOMParser().parseFromString(p[1], 'text/html'), e = doc.querySelector('#add .err, .err');
-          say(e ? e.textContent : 'Not added (HTTP ' + r.status + ').', true);
-        }
-        load(true);
-      }).catch(function () { say('Not added: serve did not answer.', true); load(true); });
+    if (!keys.length) return;
+    if (!window.hAddOpen) { say('The Add form is not on this page.', true); return; }
+    window.hAddOpen(keys, keys.map(function (k) {
+      var t = list.querySelector('.jr[data-key="' + k + '"] .jt');
+      return t ? t.textContent : '';
+    }));
   }
   box.addEventListener('click', function (ev) {
     // the tabs and tools sit in the summary (their own clicks do not open or close it): nor does a gap between them
