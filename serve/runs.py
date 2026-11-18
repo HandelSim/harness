@@ -594,7 +594,7 @@ details.doc summary .muted { font-weight: 400; }
 #add.hl { box-shadow: 0 0 0 2px var(--accent); }
 /* the Add form's stages: the flow they run in, top down; Fix rounds loop back to Implement */
 .flow { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-.flow label { display: grid; grid-template-columns: 16px 104px minmax(0, 1fr); gap: 2px 8px; align-items: baseline;
+.flow label { display: grid; grid-template-columns: 16px 112px minmax(0, 1fr); gap: 2px 8px; align-items: baseline;
   padding: 6px 10px; border: 1px solid var(--line-2); border-radius: 8px; cursor: pointer; font-size: 13px; }
 .flow label small { color: var(--muted); font-size: 12px; line-height: 1.4; }
 .flow label .why { grid-column: 2 / -1; }
@@ -604,11 +604,11 @@ details.doc summary .muted { font-weight: 400; }
 .flow label:has(input:disabled) { opacity: .5; cursor: not-allowed; }
 .flow li[data-s=fix] label { margin-left: 22px; border-style: dashed; }
 .flow li[data-s=fix] label:has(input:checked) { border-style: solid; }
-.flow li[data-s=fix] b::before { content: "\21BA  "; color: var(--accent); }
+.flow li[data-s=fix] b::before { content: "\\21BA\\00a0"; color: var(--accent); }
 .addfrom { font-size: 13px; padding: 8px 10px; border-radius: 8px; background: var(--sunk); }
 .addfrom div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .addfrom code { font-weight: 600; margin-right: 8px; }
-.basewhy { color: var(--ink) !important; }
+.basewhy, #f-start > .why { color: var(--ink) !important; }
 dialog#adddlg { width: min(880px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px); padding: 0;
   border: 0; border-radius: 12px; background: transparent; color: inherit; overflow: auto; overscroll-behavior: contain; }
 dialog#adddlg::backdrop { background: rgba(0, 0, 0, .5); }
@@ -2366,7 +2366,9 @@ def _start_choice(v, sent):
                      "placeholder='origin/ABC-123' aria-label='branch or commit to continue'>")
         out.append(f"<label><input type='radio' name='start' value='{c}'{' checked' if c == mode else ''}>"
                    f"{esc(lab)}<small>{esc(hint)}</small><small class='why' hidden></small>{extra}</label>")
-    return (f"<fieldset id='f-start'><legend>Starting point</legend><div class='presets three'>{''.join(out)}</div>"
+    # data-own: a sent form's starting point is the owner's; the script does not pick Continue over it
+    own = " data-own" if sent else ""
+    return (f"<fieldset id='f-start'{own}><legend>Starting point</legend><div class='presets three'>{''.join(out)}</div>"
             "<div class='why' hidden></div></fieldset>")
 
 
@@ -4776,6 +4778,26 @@ COMMON_JS = """
       });
       box.hidden = !keys.length;
     }
+    // A branch named after the ticket is already there (the folder is often on it): Continue
+    // existing work on it is picked, and says so, until the owner picks a starting point.
+    function autoStart(keys, many) {
+      var fs = document.getElementById('f-start'), cont = q('input[name=cont]'), auto = fs.getAttribute('data-auto') || '';
+      if (!info || fs.hasAttribute('data-own')) return '';
+      var name = many ? '' : q('input[name=branch]').value.trim() || keys[0] || '', there = '';
+      if (name && info.local.indexOf(name) >= 0) there = name;
+      else if (name) info.remote.forEach(function (r) { if (!there && r.split('/').slice(1).join('/') === name) there = r; });
+      if (there && (val('start') !== 'here' || auto)) {
+        pick('start', 'continue').checked = true;
+        cont.value = there;
+        fs.setAttribute('data-auto', there);
+        return 'A branch ' + there + ' is already there for this ticket, so the work goes on on it. Pick New work ' +
+          'to start over from the target branch instead.';
+      }
+      // gone (another key, or more than one: Continue is off then, and unpicked): back to New work
+      if (auto && val('start') !== 'here' && cont.value === auto) { pick('start', 'new').checked = true; cont.value = ''; }
+      fs.removeAttribute('data-auto');
+      return '';
+    }
     function presetOf() {
       var on = [], hit = 'custom';
       checks.forEach(function (c) { if (c.checked) on.push(c.value); });
@@ -4812,6 +4834,7 @@ COMMON_JS = """
       fs.hidden = fs.disabled = bf.hidden = keep;
       say(q('#f-repos > .why'), keep ? "The project's changes are left uncommitted, so Starting point, Target " +
         'branch and Work branch name are off.' : '');
+      say(fs.querySelector(':scope > .why'), keep ? '' : autoStart(keys, many));
       var md = keep ? '' : val('start'), cont = q('input[name=cont]'), br = q('input[name=branch]'),
         base = q('input[name=base]');
       cont.disabled = md !== 'continue';
@@ -4889,6 +4912,7 @@ COMMON_JS = """
     }
     add.addEventListener('change', function (e) {
       var t = e.target;
+      if (t.name === 'start') document.getElementById('f-start').setAttribute('data-own', '');
       if (t.name === 'preset' && presets[t.value])
         checks.forEach(function (c) { c.checked = presets[t.value].indexOf(c.value) >= 0; });
       sync();
@@ -4900,6 +4924,7 @@ COMMON_JS = """
       if (e.target.name === 'cont' && e.target.value) pick('start', 'continue').checked = true;
       if (e.target.name === 'keys') from([], []);
       if (e.target.name === 'base') e.target.setAttribute('data-own', '');
+      if (e.target.name === 'cont') document.getElementById('f-start').setAttribute('data-own', '');
       sync();
     });
     sync();

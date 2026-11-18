@@ -2503,6 +2503,11 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   branch is filled in with the remote's default (else main or master) and
   the form says so, until the owner types a target; an empty target that
   would be another ticket's branch (the folder's, key-shaped) is a warning.
+  When a branch named after the single ticket already exists (local, or
+  on a remote), Starting point switches to Continue existing work on it
+  (`autoStart`) and says so; it goes back to New work when that stops
+  holding, and never overrides a starting point the owner picked or a
+  sent form's (`data-own` on `#f-start`).
   `add_tickets` refuses the same
   combinations server-side, naming the branch to set. On the queue page the
   form is a modal `<dialog id='adddlg'>` with a Close button: "+ Add

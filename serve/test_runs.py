@@ -1812,6 +1812,7 @@ class QueuePageTest(RunsServer):
         self.assertIn("target branch: the project folder is on ABC-7-work, the branch this ticket&#x27;s work would "
                       "be committed to, so it cannot be the target too; set Target branch to the branch the work goes "
                       "into (e.g. ", body)
+        self.assertIn("<fieldset id='f-start' data-own>", body)   # what was sent stays the owner's pick
         # a refused add is the queue page again: the reason in the form, nothing typed lost
         r, body = self.post("/runs/queue/add", [("keys", "ABC-9"), ("project", "relative/dir"), ("base", "dev"),
                                                 ("preset", "custom"), ("stage_review", "review"),
@@ -2472,6 +2473,8 @@ class TestStageServeTest(RunsServer):
         self.assertIn(f"up to {runs._tq().FIX_ROUNDS} rounds", body)
         self.assertIn('"fix": "Fix rounds"', body)   # the script's names for the stages
         self.assertIn("window.hAddOpen = function", body)
+        self.assertIn("<fieldset id='f-start'><legend>", body)   # nothing sent: the script may pick Continue
+        self.assertIn("function autoStart(keys, many)", body)
         self.assertIn("The planners turn it and the ticket into the plan's acceptance criteria", body)
         r, body = self.req("GET", "/runs/ticket/ABC-12/edit")   # a ticket's Settings: the form, no dialog
         self.assertIn("id='addform'", body)
