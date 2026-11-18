@@ -36,7 +36,27 @@ import json, os, re, subprocess, sys
 ITEM = "[cleanup] feature.txt:1: `hello feature` say it twice"
 args = sys.argv[1:]
 vault = os.environ["FAKE_VAULT"]
-log = open(os.environ["FAKE_CALLS"], "a")
+
+
+def append(path, text):
+    """One write call each: the panel's members run at once, and a buffered file
+    writes a long prompt in pieces that another member's can land between."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+class Log:
+    def write(self, text):
+        append(os.environ["FAKE_CALLS"], text)
+
+    def flush(self):
+        pass
+
+
+log = Log()
 if args and args[0] == "queue":
     log.write("queue " + args[1] + "\n")
     if args[1] == "_stop_agents":
@@ -58,13 +78,13 @@ if args and args[0] == "debug":   # the debug agent on a block: FAKE_DEBUG_* say
     fix = a[a.index("--fix") + 1] if "--fix" in a else ""
     on = " on " + a[a.index("--fix-branch") + 1] if "--fix-branch" in a else ""
     log.write("debug " + ("fix " + fix + on if fix else "report") + "\n")
-    open(os.environ["FAKE_CALLS"] + ".debugprompt", "a").write(a[-1] + "\n=====\n")
+    append(os.environ["FAKE_CALLS"] + ".debugprompt", a[-1] + "\n=====\n")
     if os.environ.get("FAKE_DEBUG_SLEEP"):
         import time
         log.flush()
         time.sleep(int(os.environ["FAKE_DEBUG_SLEEP"]))
     if os.environ.get("FAKE_DEBUG_FIX"):      # what it repaired makes the stage pass
-        open(os.environ["FAKE_CALLS"] + ".debugged", "a").write("x")
+        append(os.environ["FAKE_CALLS"] + ".debugged", "x")
     if os.environ.get("FAKE_DEBUG_LEAVE") and fix:   # says fixed, leaves a rebase behind
         os.makedirs(os.path.join(fix, ".git", os.environ["FAKE_DEBUG_LEAVE"]), exist_ok=True)
     v = os.environ.get("FAKE_DEBUG_VERDICT", "needs-owner")
@@ -79,7 +99,7 @@ def panel_span(tag):
         import time
         t0 = time.time()
         time.sleep(float(os.environ["FAKE_PANEL_SLEEP"]))
-        open(os.environ["FAKE_CALLS"] + ".spans", "a").write(f"{tag} {t0} {time.time()}\n")
+        append(os.environ["FAKE_CALLS"] + ".spans", f"{tag} {t0} {time.time()}\n")
 
 
 prompt = args[-1]
@@ -89,13 +109,13 @@ part = json.loads(os.environ.get("HARNESS_TASK_CARD") or "{}").get("part")   # a
 task = os.path.join(vault, "wiki", "notes", "tickets", ticket + "-task" + ("-" + part if part else "") + ".md")
 pointer = re.search(r"Your full instructions for the \w+ stage of ticket \S+ are in (\S+?)\. Read it first", prompt)
 if pointer:   # the short prompt of a long one on Windows: the agent reads the task file
-    open(os.environ["FAKE_CALLS"] + ".pointer", "a").write(prompt + "\n=====\n")
+    append(os.environ["FAKE_CALLS"] + ".pointer", prompt + "\n=====\n")
     prompt = open(pointer.group(1), encoding="utf-8").read()
 # its session, as agents/live-run.sh says it; --session: going on in one, with a short
 # prompt and the stage's own in the task file
 if "--session" in args:
     sid = args[args.index("--session") + 1]
-    open(os.environ["FAKE_CALLS"] + ".continue", "a").write(prompt + "\n=====\n")
+    append(os.environ["FAKE_CALLS"] + ".continue", prompt + "\n=====\n")
     prompt = open(task, encoding="utf-8").read()
 else:
     count = os.environ["FAKE_CALLS"] + ".sessions"
@@ -104,7 +124,7 @@ else:
 if not os.environ.get("FAKE_NO_SESSION"):
     print("[harness] session: " + sid, file=sys.stderr, flush=True)
 same = os.path.exists(task) and open(task, encoding="utf-8").read() == prompt
-open(os.environ["FAKE_CALLS"] + ".task", "a").write(f"{ticket} {same}\n")
+append(os.environ["FAKE_CALLS"] + ".task", f"{ticket} {same}\n")
 stage = re.match(r"You are (\w+)", prompt).group(1)
 if os.environ.get("FAKE_EXIT"):   # N:RC: the first N launches die at once, having done nothing
     n, rc = os.environ["FAKE_EXIT"].split(":")
@@ -118,7 +138,7 @@ if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == 
         and os.environ.get("FAKE_SLEEP_STAGE", stage) == stage \
         and not (os.environ.get("FAKE_SLEEP_ONCE") and os.path.exists(os.environ["FAKE_CALLS"] + ".sleeping")):
     import time
-    open(os.environ["FAKE_CALLS"] + ".sleeping", "a").write(ticket + "\n")
+    append(os.environ["FAKE_CALLS"] + ".sleeping", ticket + "\n")
     if os.environ.get("FAKE_SLEEP_NESTED"):   # a commit there, then stopped while it sleeps
         d = os.environ["FAKE_SLEEP_NESTED"]
         open(os.path.join(d, "agent.txt"), "a").write("before the stop\n")
@@ -127,8 +147,8 @@ if os.environ.get("FAKE_SLEEP") and os.environ.get("FAKE_SLEEP_KEY", ticket) == 
                         "-m", "agent"], check=True)
     time.sleep(int(os.environ["FAKE_SLEEP"]))
 log.write(stage + " " + " ".join(a for a in args[:-1]) + "\n")
-open(os.environ["FAKE_CALLS"] + ".card", "a").write(os.environ.get("HARNESS_TASK_CARD", "") + "\n")
-open(os.environ["FAKE_CALLS"] + "." + stage, "a").write(prompt + "\n=====\n")
+append(os.environ["FAKE_CALLS"] + ".card", os.environ.get("HARNESS_TASK_CARD", "") + "\n")
+append(os.environ["FAKE_CALLS"] + "." + stage, prompt + "\n=====\n")
 if os.environ.get("FAKE_SKIP", "").split(":")[0] == stage:   # STAGE:N,M: those launches of it (1: the first) do nothing
     count = os.environ["FAKE_CALLS"] + ".skips"
     n = (len(open(count).read()) if os.path.exists(count) else 0) + 1
@@ -145,7 +165,7 @@ if stage == "planning" and os.environ.get("FAKE_DELETE_TICKET"):   # the ticket'
     os.remove(os.path.join(vault, ".raw", "tickets", "ABC-1.md"))
 if stage == "implementing" and os.environ.get("FAKE_INSTEAD") and not (
         os.environ.get("FAKE_INSTEAD_ONCE") and os.path.exists(os.environ["FAKE_CALLS"] + ".instead")):
-    open(os.environ["FAKE_CALLS"] + ".instead", "a").write("x")   # a shell command instead of its work
+    append(os.environ["FAKE_CALLS"] + ".instead", "x")   # a shell command instead of its work
     subprocess.run(os.environ["FAKE_INSTEAD"], shell=True, check=True)
     sys.exit(0)
 if stage == "planning":
@@ -159,7 +179,7 @@ if stage == "planning":
                       else m.group(1) + " [check: test]", crit)
     planner = re.search(r"You are planner (\d+) of (\d+)", prompt)   # one of the plan panel's planners
     if planner:
-        open(os.environ["FAKE_CALLS"] + ".planners", "a").write(planner.group(1) + "\n")
+        append(os.environ["FAKE_CALLS"] + ".planners", planner.group(1) + "\n")
         panel_span("d" + planner.group(1))
         if os.environ.get("FAKE_PANEL_FINDINGS"):   # each planner sees something off the ticket
             open(path("append one bullet to"), "a").write(f"- x.py:{planner.group(1)}: odd (seen while planning ABC-1)\n")
@@ -266,7 +286,7 @@ elif stage == "reviewing":
     must = os.environ["FAKE_MUST_TEXT"] + "\n" if os.environ.get("FAKE_MUST_TEXT") and not fixed else must
     lens = re.search(r"You are the (\w+)(?:-\w+)? reviewer", prompt)   # one of the review panel's reviewers
     if lens:
-        open(os.environ["FAKE_CALLS"] + ".lenses", "a").write(lens.group(1) + "\n")
+        append(os.environ["FAKE_CALLS"] + ".lenses", lens.group(1) + "\n")
         panel_span(lens.group(1))
         if lens.group(1) in os.environ.get("FAKE_BAD_LENSES", "").split(","):
             open(path("Write the review to"), "w").write("Looked.\n")
@@ -285,7 +305,7 @@ elif stage == "reviewing":
                                                  + "## Must fix\n" + must + "## Notes\n- None\n")
 if os.environ.get("FAKE_HANG_AFTER") and os.environ.get("FAKE_HANG_STAGE", stage) == stage:
     import time   # its work done, the agent does not exit
-    open(os.environ["FAKE_CALLS"] + ".hanging", "a").write(stage + "\n")
+    append(os.environ["FAKE_CALLS"] + ".hanging", stage + "\n")
     time.sleep(int(os.environ["FAKE_HANG_AFTER"]))
 if os.environ.get("FAKE_CRASH"):   # STAGE:N: its first N launches end on an opencode error, their work done
     s, n = os.environ["FAKE_CRASH"].split(":")
@@ -2993,16 +3013,20 @@ class ReviewerFixesTest(Base):
         put(os.path.join(self.vault, ".gitignore"), ".trash/")    # no newline at the end
         self.add("ABC-1")
         put(os.path.join(tickets, "ABC-1-task.md"), "left by a killed run")
+        put(os.path.join(tickets, "ABC-1-task-d2.md"), "a panel member's, left by a killed run")
         put(os.path.join(tickets, "OTHER-9-task.md"), "not a queue ticket's")
         q = tq.Queue(self.state)
         tq.keep_tasks_out(q, self.vault)
         tq.keep_tasks_out(q, self.vault)
         self.assertEqual(cat(os.path.join(self.vault, ".gitignore")),
-                         ".trash/\n# harness queue: a stage's prompt while it runs\nwiki/notes/tickets/*-task.md\n")
+                         ".trash/\n# harness queue: a stage's prompt while it runs\nwiki/notes/tickets/*-task.md\n"
+                         "wiki/notes/tickets/*-task-*.md\n")
         self.assertFalse(os.path.exists(os.path.join(tickets, "ABC-1-task.md")))
+        self.assertFalse(os.path.exists(os.path.join(tickets, "ABC-1-task-d2.md")))
         self.assertTrue(os.path.exists(os.path.join(tickets, "OTHER-9-task.md")))
         sh("git", "init", "-q", self.vault)
         put(os.path.join(tickets, "ABC-1-task.md"), "x")
+        put(os.path.join(tickets, "ABC-1-task-ux.md"), "x")
         self.assertEqual(sh("git", "-C", self.vault, "status", "--porcelain", "--", "wiki"), "")
 
     def test_a_halt_asked_as_the_run_starts_is_kept(self):
