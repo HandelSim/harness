@@ -1587,7 +1587,7 @@ its stage launches send the single header on the shared proxy. Covered by `tests
 
 ### Findings agent
 
-`harness findings start|run [DIR...]|stop|status|notes|themes|archive-old` (`cmd_findings`,
+`harness findings start|run [DIR...]|stop|status|notes|archive-old` (`cmd_findings`,
 `scripts/findings_agent.py`) is a background agent that explores the
 committed code (HEAD) of DIR (default: the git top folder here, else the
 repos it explored last) with real opencode sessions on a free model. It never
@@ -1645,7 +1645,7 @@ which files a vault's findings as tickets).
   symlinks, over 400 KB, binary, vendored, lock files, generated or secrets
   (`vault_ingest`'s `SKIP_*` and `SECRET_PATH`). An area's sha is over its
   files' paths and blobs. `due` orders them: changed, new, or a changed
-  prompt (version, owner notes, for cleanup `themes.md`) first, bug and
+  prompt (version, owner notes) first, bug and
   cleanup in turn, the lens of the last pass going second; then every other
   pass, the one run longest ago first, so it never runs out. Waiting reports
   (`ledger.pending`) are checked before any pass. When HEAD moves an open
@@ -1684,8 +1684,11 @@ which files a vault's findings as tickets).
   (25), the area's note (8k chars), then the format: at most 2 `BUG-<nonce>`
   blocks (title, severity, where, evidence, ui, steps, expected, actual,
   trace `path:line | code` hops from the handler, why, `END-BUG-<nonce>`). A
-  cleanup prompt lists the themes and asks for at most 10 `ITEM-<nonce> |
-  list | path:line[, path:line...] | evidence | note` lines. Both end with
+  cleanup prompt lists the themes, the unify sections in use (most items
+  first, 30), says code the owner's notes route through a library goes on
+  unify under that library's name, and asks for at most 10 `ITEM-<nonce> |
+  list | path:line[, path:line...] | evidence | note` lines (unify's list is
+  `unify/<section>`). Both end with
   the area's note between `KNOWLEDGE-<nonce>` and `END-KNOWLEDGE-<nonce>` (up
   to 2 more for other areas) and one `COVERED-<nonce> | ...` line; a session
   that ends with none of those failed.
@@ -1718,9 +1721,13 @@ which files a vault's findings as tickets).
   (`THEMES`): `unused` (whole files), `dead` (code nothing calls), `unify`
   (the same logic in two places, or own code for what std, Qt or a library
   already used does; two places at least), `safety` (the input that breaks
-  it). `<state>/findings/themes.md` adds the owner's (`## slug`, an optional
-  `title:` line, what goes on it; a built-in's slug replaces its text, `off`
-  turns it off; `#` lines are ignored; 6000 chars). `check_item`: the places
+  it). There are no owner lists: a library to use (such as nvector) goes in
+  the notes, and its items land on unify. A unify item has a `section`
+  (`section_of`: letters and digits of what follows `unify/`, 30 chars, so
+  `n-vector` is `nvector`; stdlib/stl/std:: are `std`, qt5/qt6 `qt`,
+  duplicate `shared`; none is `other`); it is not part of the item's id, and
+  KNOWN.md lists unify under `### unify/<section>` (`sections_in`, `other`
+  last). `check_item`: the places
   in HEAD and the evidence near the first. An item already there (its id, a
   place within 10 lines, the same evidence, for unify the same files), or
   archived by the owner, is a duplicate; a gone item found again reopens.
@@ -1742,12 +1749,11 @@ which files a vault's findings as tickets).
   copies the repo's notes (not `.prev`) to `.findings-notes/` in its
   snapshot, which the prompt points to; a path there is not in HEAD, so
   nothing citing it is kept.
-- **Owner commands.** `harness findings themes` opens `themes.md` in
-  `$EDITOR` (a new one seeded by `themes --seed`: a header and the commented
-  n-vector example) in a terminal, else prints the lists in effect. `harness
-  findings archive-old` archives on the board every open point finding with
-  no `steps` (the format before bug reports had to say how a user meets
-  them). The queue page's card edits `notes.md` and `themes.md` too.
+- **Owner commands.** `harness findings notes` opens `notes.md` in
+  `$EDITOR` (prints it when not a terminal). `harness findings archive-old`
+  archives on the board every open point finding with no `steps` (the format
+  before bug reports had to say how a user meets them). The queue page's card
+  edits `notes.md` too.
 - **Guards.** One pass at a time, `FINDINGS_GAP` (60 s) apart, ended (TERM
   then KILL to its group) after `FINDINGS_PASS_TIMEOUT` (2400 s) or
   `FINDINGS_IDLE_TIMEOUT` (600 s) without new output (`N.events` or `N.out`
@@ -1781,9 +1787,9 @@ which files a vault's findings as tickets).
   passes, `units` passes in the rotation, `pending`, `notes`), `sessions/N.out` (the
   last 200), `tree/`, `knowledge/<repo>-<hash>/<area>.md` (`/` as `__`, the
   top as `_top.md`) with `INDEX.md`, `knowledge/index.json`, `wanted`,
-  `agent.out` (5 MB cap), `notes.md`, `themes.md`, `folders.json`. The queue page's card is
+  `agent.out` (5 MB cap), `notes.md`, `folders.json`. The queue page's card is
   `serve/findings_agent_view.py` (`agent_card`, `agent_action`: start, stop,
-  notes, themes, folders; counts per question with why reports were thrown
+  notes, folders; counts per question with why reports were thrown
   away, reports waiting for the checker; the last 8 sessions, each linked to `/runs/<session>`; a link to the
   notes). `GET /runs/findings/notes` lists the notes (`knowledge_index`) and
   `/runs/findings/notes/<repo-slug>/<name>` renders one as markdown
@@ -2505,7 +2511,9 @@ offered as suggestions. It is taken as pasted: quotes
   `open` ones: a `stale` finding's evidence left the code; a bug with its
   steps, expected, actual, trace and verdict; a rolling finding as one row of
   its open items, at most 50 listed, each item id archivable on its own and
-  kept in `archived` like a row's). The ticket page
+  kept in `archived` like a row's; when any item has a `section` (unify) they
+  are grouped under section headings, `other` last, and its Copy text nests
+  them the same way). The ticket page
   still shows each note as it is. A ticket finding's id is `t-` and a hash of
   its key and its text, whitespace folded; an agent finding keeps its own.
   What the owner does is kept in `<state>/findings/board.json` (`order`,

@@ -11,7 +11,6 @@ starts the agent the way the queue page starts a queue run: a detached
   POST /runs/findings/agent/folders save the folders for the next start (act=reset: forget them)
   POST /runs/findings/agent/stop    stop it
   POST /runs/findings/agent/notes   notes=TEXT: the notes added to every pass (at most 4000 chars)
-  POST /runs/findings/agent/themes  themes=TEXT: themes.md, the owner's rolling lists (at most 6000 chars)
 
 The chosen folders are kept in <state>/findings/folders.json ({"version": 1, "folders": [...]}).
 
@@ -38,7 +37,6 @@ import time
 esc = html.escape
 
 NOTES_MAX = 4000
-THEMES_MAX = 6000         # themes.md: the findings agent reads this much
 STALE_BEAT = 300          # a heartbeat older than this, while not stopped: the agent is not answering
 STATES = {"exploring": ("t-run", "exploring"), "scanning": ("t-run", "exploring"),
           "waiting": ("t-run", "waiting between passes"),
@@ -54,7 +52,7 @@ FOLDER_LEN = 1024         # characters in one folder's path
 KNOWN_MAX = 20            # folders offered as checkboxes
 FORM_MAX = 128 * 1024     # bytes of one of the card's forms (the folders' paths, the notes)
 FORM_FIELDS = FOLDERS_MAX + KNOWN_MAX + 8
-ACTIONS = ("start", "stop", "notes", "themes", "folders")
+ACTIONS = ("start", "stop", "notes", "folders")
 CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 OUTCOME_TONE = {"found": "t-ok", "waiting": "t-wait", "none": "t-off", "running": "t-run", "failed": "t-bad", "stopped": "t-off"}
 # the card's own rules; the page adds them to its stylesheet (no inline styles: strict CSP)
@@ -487,23 +485,11 @@ def agent_card(state_dir, flash="", project="", known=()):
                  "<form method='post' action='/runs/findings/agent/notes'>"
                  f"<textarea name='notes' rows='6' maxlength='{NOTES_MAX}' aria-label='notes for the findings "
                  "agent' placeholder='What to look for or leave alone, e.g. &quot;tests/ fixtures are meant to be "
-                 f"broken&quot;'>{esc(notes)}</textarea>"
+                 "broken&quot;, or a library code should go through: &quot;nvector: position math goes through "
+                 f"our n-vector library&quot; (that goes on unify, under nvector)'>{esc(notes)}</textarea>"
                  "<div class='acts'><button type='submit' class='btn sm'>Save notes</button>"
                  "<span class='muted'>a change asks about every part again, with the new notes</span></div>"
                  "</form></details>")
-    themes = _read(os.path.join(state_dir, "themes.md"), THEMES_MAX * 4)[:THEMES_MAX] if state_dir else ""
-    parts.append("<details class='fa-notes' data-k='findings-agent-themes'><summary>Your rolling lists"
-                 + (f" <span class='muted'>{len(themes)} characters</span>" if themes else "") + "</summary>"
-                 "<form method='post' action='/runs/findings/agent/themes'>"
-                 f"<textarea name='themes' rows='8' maxlength='{THEMES_MAX}' aria-label='rolling lists for the "
-                 "findings agent' placeholder='## nvector&#10;title: Position math not done through the n-vector "
-                 "library&#10;Every computation on positions that is plain vector subtraction or lat/lon "
-                 f"arithmetic instead of the n-vector library: name the function to use.'>{esc(themes)}</textarea>"
-                 "<div class='acts'><button type='submit' class='btn sm'>Save lists</button>"
-                 "<span class='muted'>one finding per list, added to over time; a &quot;## name&quot; heading, "
-                 "an optional title: line, what goes on it. unused, dead, unify and safety are built in "
-                 "(&quot;off&quot; under their heading turns one off). A change runs every cleanup pass "
-                 "again.</span></div></form></details>")
     parts.append("</section>")
     return "".join(parts)
 
@@ -658,7 +644,7 @@ def _choose(state_dir, form, project, starting):
 
 
 def agent_action(state_dir, harness_path, action, form, project=""):
-    """Do one of start, stop, notes, themes, folders. Returns (ok, message). form maps names
+    """Do one of start, stop, notes, folders. Returns (ok, message). form maps names
     to lists of values (parse_qs); project is the folder harness serve runs in, when
     known."""
     if not state_dir:
@@ -687,17 +673,6 @@ def agent_action(state_dir, harness_path, action, form, project=""):
         except OSError as e:
             return False, f"cannot save the notes: {e.strerror or e}"
         return True, "notes saved: the agent uses them from its next pass"
-    if action == "themes":
-        vals = form.get("themes") or [""]
-        text = vals[0] if isinstance(vals, list) else str(vals)
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        if len(text) > THEMES_MAX:
-            return False, f"the lists are {len(text)} characters; at most {THEMES_MAX}"
-        try:
-            _write_atomic(os.path.join(state_dir, "themes.md"), text.strip() + ("\n" if text.strip() else ""))
-        except OSError as e:
-            return False, f"cannot save the lists: {e.strerror or e}"
-        return True, "lists saved: the cleanup passes use them from the next one"
     return False, f"unknown action: {action}"
 
 

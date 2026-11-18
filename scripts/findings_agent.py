@@ -24,13 +24,13 @@ Passes, two questions:
             (found in the code), numbered steps, expected, actual, the line that
             causes it with a copy of it, and a trace of 2+ path:line hops, each
             line copied. At most 2 a pass; none is the normal answer.
-  cleanup   one per area: the rolling lists (themes). Each theme is one finding
-            on the board with items added over time: unused (files nothing
-            names; a mechanical scan at each HEAD, plus pairs only the build
-            names), dead (code nothing calls), unify (the same logic twice, or
-            own code a maintained library does), safety, and the owner's themes
-            (DIR/themes.md: "## slug", "title: ...", what to look for; a built-in
-            slug there replaces it, "off" turns it off). ITEM lines, at most 10.
+  cleanup   one per area: the rolling lists. Each list is one finding on the
+            board with items added over time: unused (files nothing names; a
+            mechanical scan at each HEAD, plus pairs only the build names), dead
+            (code nothing calls), unify (in sections: shared, the same logic
+            twice; std, qt or a library's name, own code that library does; the
+            owner's notes can name more, such as nvector), safety. ITEM lines,
+            at most 10; a unify item's list is unify/<section>.
 A BUG block that passes the checks (control text in a tracked file, 2+ steps,
 expected and actual, evidence within 8 lines of its line, 2+ trace hops whose
 lines are there, at most one bad, not near a known one) waits in ledger.json
@@ -42,7 +42,7 @@ notes, every rolling item) is in .findings-notes/KNOWN.md of the snapshot,
 one line each by file, and a candidate on the same file within 12 lines whose
 title shares half its words with a known one is dropped as a duplicate.
 Order: passes whose area changed (any file's blob), whose prompt version, owner
-notes or (cleanup) themes changed, or that never ran, bug and cleanup in turn;
+notes changed, or that never ran, bug and cleanup in turn;
 then every other pass, the one run longest ago first. It never runs out: when
 all are done it goes over them again, each time from the area's note and what
 earlier passes covered. A pass that fails 3 times in a row is set aside for
@@ -116,7 +116,6 @@ Files under DIR:
                   session, lens, sha, head, chars, summary, changed}]}
   agent.out       the log when started detached; agent.out.1 at 5 MB
   notes.md        the owner's notes, added to every prompt (first 4k chars)
-  themes.md       the owner's rolling themes (see cleanup above)
   stop            ask a running agent to end
   wanted          the owner started it and has not stopped it: harness serve
                   starts it again when it is not running (after a restart)
@@ -164,7 +163,8 @@ IDLE_TIMEOUT = _env_num("FINDINGS_IDLE_TIMEOUT", 600, int, 30)
 OPEN_MAX = _env_num("FINDINGS_OPEN_MAX", 200, int, 1)
 SINGLE = os.environ.get("FINDINGS_SINGLE_MESSAGE", "1").strip() != "0"
 
-PROMPT_VERSION = "4"
+PROMPT_VERSION = "5"
+SECTIONS_SHOWN = 30        # unify sections in use named in a cleanup prompt
 LENSES = ("bug", "cleanup")   # the passes' questions; "verify" checks a bug pass's reports
 PREFERRED = ("gemini-3.8-flash", "gemini-2.5-pro")
 MAX_BYTES = 400 * 1024
@@ -186,7 +186,6 @@ PENDING_MAX = 20
 HOP_CONTEXT = 15           # lines around each trace hop shown to the checker
 KNOWN_LINES = 3000         # lines of KNOWN.md
 DISMISSED_KEEP = 2000      # owner-archived findings remembered after the store drops them
-THEMES_MAX = 6000          # characters of themes.md read
 LOCATIONS_MAX = 20
 ROLL_MAX = 1000           # items a rolling finding keeps (open ones, then the gone ones)
 FAIL_SET_ASIDE = 3
@@ -252,8 +251,8 @@ NOT_UNUSED = re.compile(r"(^|/)(tests?|testing|unittests?|docs?|doc|examples?|sa
                         r"|_tests?\.\w+$|Tests?\.\w+$|(^|/)main\.\w+$", re.I)
 REF_TOKEN = re.compile(r"[A-Za-z0-9_+\-]+\.[A-Za-z0-9]{1,10}")
 
-# The rolling lists: one finding per theme, items added over time. themes.md can
-# replace one (same slug) or turn it off ("off").
+# The rolling lists: one finding per theme, items added over time. unify's items
+# are in sections (unify/<section>).
 THEMES = {
     "unused": ("Files nothing uses",
                "Whole files nothing builds, includes, loads or names: delete them after a look. The scan at each "
@@ -264,16 +263,16 @@ THEMES = {
              "nothing calls or reads: search for every caller first (signal/slot connections, names in strings, "
              "callbacks, virtual overrides, tests do not count as users)."),
     "unify": ("Code to unify or hand to a library",
-              "The same logic written in two or more places that should be one shared function (name every "
-              "place), and the project's own code for what the language's standard library, the frameworks it "
-              "uses (for example Qt) or another maintained library it already depends on does: name the "
-              "function or class to use instead, so the project stops maintaining its own copy."),
+              "The same logic written in two or more places that should be one shared function (section "
+              "shared; name every place), and the project's own code for what the language's standard library, "
+              "the frameworks it uses or another maintained library it already depends on does (section std, qt "
+              "or that library's short name, such as one the owner's notes name): name the function or class "
+              "to use instead, so the project stops maintaining its own copy."),
     "safety": ("Safety and robustness",
                "Places a real input breaks: an unchecked size, index, null pointer, division, cast or parse "
                "result; an ignored error from a file, network, process or database call; a resource not released "
                "on an error path; a data race; undefined behaviour. Say which input breaks it. Not style."),
 }
-THEME_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 
 QUESTIONS = {
     "bug": "Find bugs a user of the application can run into. Pick one or two things a user does that start "
@@ -288,7 +287,9 @@ QUESTIONS = {
            "are not sure it happens, do not report it. Not bugs: style, naming, missing tests, code that could "
            "be cleaner, problems no user action reaches (those belong on the rolling lists).",
     "cleanup": "Add to the owner's rolling lists. Read the area's code and what it calls, grep across the "
-               "repository, and add items to the lists below: only ones you checked, only ones not on them yet.",
+               "repository, and add items to the lists below: only ones you checked, only ones not on them yet. "
+               "Where the owner's notes say some code must go through a given library, code that does it by "
+               "hand goes on unify, in a section named after that library.",
 }
 
 _STOP = []
@@ -565,7 +566,7 @@ def units_of(root, files):
 
 def due(units, ledger_units, prompt_hash, t, last=""):
     """(first, rest): the passes to run, in order. First the ones whose area changed,
-    whose prompt (its version, the owner's notes, for cleanup the themes) changed or
+    whose prompt (its version, the owner's notes) changed or
     that never ran, bug and cleanup in turn; then every other one, the one explored
     longest ago first, so the agent never runs out: it goes over each again, from what
     its note and the last passes covered. Left out: a failed pass while it is
@@ -658,36 +659,6 @@ def note_summary(text):
     return ""
 
 
-def themes_of(text):
-    """[(slug, title, what to look for)]: the built-in themes, then the owner's
-    (themes.md: "## slug", an optional "title: ..." line, the text). An owner heading
-    with a built-in's slug replaces it; one whose text is "off" turns it off."""
-    got, cur = {}, None
-    for line in (text or "")[:THEMES_MAX].splitlines():
-        m = re.match(r"^##\s+(.+?)\s*$", line)
-        if m:
-            slug = re.sub(r"[^a-z0-9-]+", "-", m.group(1).lower()).strip("-")[:30]
-            cur = slug if THEME_SLUG.match(slug or "") else None
-            if cur:
-                got[cur] = ["", []]
-            continue
-        if cur is None or line.lstrip().startswith("#"):
-            continue
-        t = re.match(r"^\s*title\s*:\s*(.+)$", line, re.I)
-        if t and not got[cur][0] and not got[cur][1]:
-            got[cur][0] = clean_one_line(t.group(1), 120)
-        elif line.strip():
-            got[cur][1].append(line.strip())
-    out = {k: (t, d) for k, (t, d) in THEMES.items()}
-    for slug, (title, body) in got.items():
-        text = clean_one_line(" ".join(body), 1500)
-        if text.lower() == "off":
-            out.pop(slug, None)
-        elif text:
-            out[slug] = (title or (THEMES.get(slug) or (slug.replace("-", " ").capitalize(),))[0], text)
-    return [(k, t, d) for k, (t, d) in out.items()]
-
-
 def _common(u, notes, covered, prior, note, note_old, has_notes):
     parts = []
     parts.append(f"Read {NOTES_IN_TREE}/KNOWN.md first: everything already known about this repository (open "
@@ -732,7 +703,7 @@ def _note_format(u, nonce, repo, first):
 
 
 def build_prompt(u, notes, prior, covered, nonce, note="", note_old=False, has_notes=False, map_only=False,
-                 ui=(), themes=()):
+                 ui=(), themes=(), sections=()):
     repo = os.path.basename(u.root)
     shown = u.files[:AREA_FILES_SHOWN]
     more = len(u.files) - len(shown)
@@ -760,6 +731,9 @@ def build_prompt(u, notes, prior, covered, nonce, note="", note_old=False, has_n
                  "are about how this area's code relates to code elsewhere.",
                  f"The question: {QUESTIONS['cleanup']}",
                  "The lists (name: what goes on it):\n" + "\n".join(f"- {k}: {t}. {d}" for k, t, d in themes)]
+        if sections:
+            parts.append("Sections of unify in use (use one of these when it fits, spelled the same): "
+                         + ", ".join(sections[:SECTIONS_SHOWN]))
     if map_only:
         parts.append("The owner's findings board is full, so this pass reports nothing: explore, trace and "
                      "write the note.")
@@ -790,7 +764,8 @@ def build_prompt(u, notes, prior, covered, nonce, note="", note_old=False, has_n
         fmt.append(
             f"First, each new item (at most {ITEM_PER_PASS}; none is fine), one line:\n"
             f"ITEM-{nonce} | list | path:line | evidence | note\n"
-            "  list: the name of one of the lists above\n"
+            "  list: the name of one of the lists above; for unify, unify/ and its section (unify/shared, "
+            "unify/std, unify/qt, unify/<library>)\n"
             "  path:line: where it is; for unify every place, comma-separated (a.cpp:10, b.cpp:42); for unused "
             "the file's path alone\n"
             "  evidence: the line at the first path:line, copied exactly (for unused, leave it empty)\n"
@@ -1024,6 +999,27 @@ def check_bug(b, lines_of, ui_ok):
             "path": path, "line": line, "evidence": ev[:300], "ui": ui, "steps": steps, "expected": expected,
             "actual": actual, "trace": hops[:TRACE_MAX],
             "detail": re.sub(r"\s+", " ", str(b.get("why") or "")).strip()[:1500]}, ""
+
+
+SECTION_ALIAS = {"stdlib": "std", "standard": "std", "standardlibrary": "std", "stl": "std",
+                 "qt5": "qt", "qt6": "qt", "duplicate": "shared", "duplicated": "shared", "dup": "shared",
+                 "same": "shared", "unify": "shared"}
+
+
+def section_of(text):
+    """A unify item's section from what the session wrote after unify/: a short slug
+    (letters and digits only, so n-vector and nvector are one), std, qt and shared for
+    their usual spellings, "other" when there is none."""
+    s = re.sub(r"[^a-z0-9]", "", (text or "").lower().replace("std::", "std").replace("c++", "std"))[:30]
+    return SECTION_ALIAS.get(s, s) or "other"
+
+
+def sections_in(items):
+    """[(section, [items])] of a unify list: by section, "other" last."""
+    by = {}
+    for it in items:
+        by.setdefault(it.get("section") or "other", []).append(it)
+    return sorted(by.items(), key=lambda kv: (kv[0] == "other", kv[0]))
 
 
 def check_item(theme, places, rest, lines_of, exists):
@@ -1427,11 +1423,8 @@ class Worker:
     def notes(self):
         return read_text(self.p("notes.md"), NOTES_MAX).strip()
 
-    def themes_text(self):
-        return read_text(self.p("themes.md"), THEMES_MAX)
-
     def themes(self):
-        return themes_of(self.themes_text())
+        return [(k, t, d) for k, (t, d) in THEMES.items()]
 
     def count(self, lens, what, n=1):
         c = self.ledger["counts"].setdefault(lens, {"accepted": 0, "rejected": 0, "failed": 0, "calls": 0})
@@ -1590,6 +1583,15 @@ class Worker:
     def rolls(self, root, theme):
         return [f for f in self.store["findings"]
                 if f.get("kind") == "rolling" and f.get("project") == root and f.get("theme") == theme]
+
+    def sections(self, root):
+        """The unify sections the open items use, most items first: so passes file alike."""
+        n = {}
+        for r in self.rolls(root, "unify"):
+            for it in r.get("items") or []:
+                if it.get("status") == "open" and it.get("section") not in (None, "", "other"):
+                    n[it["section"]] = n.get(it["section"], 0) + 1
+        return [k for k, _ in sorted(n.items(), key=lambda kv: (-kv[1], kv[0]))]
 
     def roll(self, root, theme, title, detail):
         """The theme's finding new items go on: its newest generation, a new one when the
@@ -1840,10 +1842,16 @@ class Worker:
                         continue
                     no = it["id"] in archived or r["id"] in archived
                     where = ", ".join(it.get("locations") or []) or it.get("path", "")
-                    items.append(" | ".join(x for x in (
+                    items.append({"section": it.get("section"), "line": " | ".join(x for x in (
                         where, clean_one_line(it.get("evidence"), 160), clean_one_line(it.get("note"), 200),
-                        "dismissed by the owner" if no else "") if x))
-            lines += ["", f"## The {theme} list: {title}", ""] + (sorted(set(items)) or ["(none yet)"])
+                        "dismissed by the owner" if no else "") if x)})
+            lines += ["", f"## The {theme} list: {title}", ""]
+            if theme == "unify" and items:
+                for sec, its in sections_in(items):
+                    lines += [f"### unify/{sec}", ""] + sorted({i["line"] for i in its}) + [""]
+                lines.pop()
+            else:
+                lines += sorted({i["line"] for i in items}) or ["(none yet)"]
         if len(lines) > KNOWN_LINES:
             lines = lines[:KNOWN_LINES] + [f"(and {len(lines) - KNOWN_LINES} more lines)"]
         d = os.path.join(tree, NOTES_IN_TREE)
@@ -2025,12 +2033,15 @@ class Worker:
         tracked = set(self.paths.get(u.root) or ())
         n = rej = 0
         for theme, places, rest in items[:ITEM_PER_PASS]:
+            theme, _, section = theme.partition("/")
             theme = re.sub(r"[^a-z0-9-]", "", theme)
             if theme not in themes:
                 it, why = None, "list"
             else:
                 it, why = check_item(theme, places, rest, lines_of,
                                      lambda p: p in tracked or lines_of(p)[0] in tracked)
+            if it and theme == "unify":
+                it["section"] = section_of(section)
             if it and theme == "unused":
                 it["path"] = lines_of(it["path"])[0] if it["path"] not in tracked else it["path"]
                 it["locations"] = [it["path"]]
@@ -2179,7 +2190,8 @@ class Worker:
         prompt = build_prompt(u, notes, self.prior(u, known), self.covered(u), nonce,
                               note=self.note(u.root, u.area), note_old=self.note_old(u), has_notes=has_notes,
                               map_only=map_only, ui=self.ui_for(u) if u.lens == "bug" else (),
-                              themes=self.themes() if u.lens == "cleanup" else ())
+                              themes=self.themes() if u.lens == "cleanup" else (),
+                              sections=self.sections(u.root) if u.lens == "cleanup" else ())
         rc, text, sid, rec = self.run_pass(u, prompt)
         self.last_call = now()
         self.calls += 1
@@ -2284,7 +2296,7 @@ class Worker:
             ok = self.verify(notes)
             return ok and not (self.once and self.calls)
         prompt_hash = {"bug": sha16(PROMPT_VERSION + "\0" + notes),
-                       "cleanup": sha16(PROMPT_VERSION + "\0" + notes + "\0" + self.themes_text())}
+                       "cleanup": sha16(PROMPT_VERSION + "\0" + notes)}
         units = [u for r in self.repos for u in self.units.get(r, [])]
         last = next((p.get("lens") for p in reversed(self.ledger["passes"]) if p.get("lens") in LENSES), "")
         first, rest = due(units, self.ledger["units"], prompt_hash, now(), last=last)
@@ -2647,36 +2659,6 @@ def archive_old_main(a):
     return 0
 
 
-THEMES_HEAD = """# The findings agent's rolling lists. Each list is one finding on the board that
-# grows as cleanup passes add items to it. A "## name" heading starts a list (a-z,
-# 0-9, -); an optional title: line names it on the board; the text says what goes
-# on it. The built-in lists (unused, dead, unify, safety) are on unless a heading
-# with their name says "off"; a heading with their name and other text replaces
-# theirs. Lines starting with # are ignored: take the # off the example's lines to
-# use it.
-"""
-THEMES_SAMPLE = """## nvector
-title: Position math not done through the n-vector library
-Every computation on geographic positions (distance, bearing, interpolation,
-offsets, "is inside") that is not done through the project's n-vector library:
-plain vector subtraction or lat/lon arithmetic on positions, a local copy of
-an n-vector formula. Name the library function to use instead."""
-
-
-def themes_main(a):
-    """The lists cleanup passes add to (the owner's themes.md over the built-ins); with
-    --seed, the text a new themes.md starts from."""
-    if a.seed:
-        print(THEMES_HEAD + "#\n" + "\n".join("# " + x for x in THEMES_SAMPLE.splitlines()))
-        return 0
-    text = read_text(os.path.join(a.state, "themes.md"), THEMES_MAX)
-    for slug, title, desc in themes_of(text):
-        print(f"## {slug}\ntitle: {title}\n{desc}\n")
-    if not themes_of(text) or not any(k not in THEMES for k, _, _ in themes_of(text)):
-        print(f"(none of your own yet: add them with harness findings themes, for example)\n\n{THEMES_SAMPLE}")
-    return 0
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="findings_agent.py")
     sub = ap.add_subparsers(dest="cmd")
@@ -2696,10 +2678,8 @@ def main(argv=None):
     p.add_argument("--state", required=True)
     p.add_argument("--json", action="store_true")
     p.add_argument("--running", action="store_true")
-    for name in ("archive-old", "themes"):
-        p = sub.add_parser(name)
-        p.add_argument("--state", required=True)
-    p.add_argument("--seed", action="store_true")
+    p = sub.add_parser("archive-old")
+    p.add_argument("--state", required=True)
     a = ap.parse_args(argv)
     if a.cmd in ("run", "_worker"):
         a.state = os.path.abspath(a.state)
@@ -2711,8 +2691,6 @@ def main(argv=None):
         return status_main(a)
     if a.cmd == "archive-old":
         return archive_old_main(a)
-    if a.cmd == "themes":
-        return themes_main(a)
     ap.print_help()
     return 2
 

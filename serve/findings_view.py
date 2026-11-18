@@ -251,7 +251,8 @@ def _at(path, line):
 
 
 def _items(v):
-    """A rolling finding's open items, checked: {id, path, line, note, evidence, locations}."""
+    """A rolling finding's open items, checked: {id, path, line, note, evidence, locations,
+    section} (section: a unify item's, such as std, qt or a library's name; "" for others)."""
     out, seen = [], set()
     for i in v if isinstance(v, list) else []:
         if not isinstance(i, dict) or not isinstance(i.get("id"), str) or not ID_RE.match(i["id"]):
@@ -261,16 +262,33 @@ def _items(v):
         seen.add(i["id"])
         out.append({"id": i["id"], "path": _str(i.get("path"), 500), "line": _line(i.get("line")),
                     "note": _str(i.get("note"), TEXT_MAX), "evidence": _str(i.get("evidence"), 500),
-                    "locations": _strs(i.get("locations"), 500, LOCATIONS_MAX)})
+                    "locations": _strs(i.get("locations"), 500, LOCATIONS_MAX),
+                    "section": re.sub(r"[^a-z0-9]", "", _str(i.get("section"), 30).lower())})
     return out
+
+
+def sections(items):
+    """[(section, items)]: one ("", items) when no item has a section; else by section,
+    "other" (and items with none) last."""
+    if not any(i["section"] for i in items):
+        return [("", items)]
+    by = {}
+    for i in items:
+        by.setdefault(i["section"] or "other", []).append(i)
+    return sorted(by.items(), key=lambda kv: (kv[0] == "other", kv[0]))
 
 
 def rolled(f, items):
     """A rolling finding's row with these items: its title counts them, its md lists them."""
     n = len(items)
-    md = f"- {f['rtitle']} ({n} place{'' if n == 1 else 's'}, findings agent)" + "".join(
-        "\n  - " + ": ".join(x for x in (_at(i["path"], i["line"]), i["note"] or i["evidence"]) if x)
-        for i in items)
+    md = f"- {f['rtitle']} ({n} place{'' if n == 1 else 's'}, findings agent)"
+    for sec, its in sections(items):
+        pad = "    " if sec else "  "
+        if sec:
+            md += f"\n  - {sec} ({len(its)})"
+        md += "".join(f"\n{pad}- " + ": ".join(x for x in (_at(i["path"], i["line"]), i["note"] or i["evidence"])
+                                              if x) for i in its)
+    items = [i for _, its in sections(items) for i in its]   # in the order they are shown
     return dict(f, title=f"{f['rtitle']} ({n})", md=md, items=items, children=[i["id"] for i in items])
 
 
@@ -559,8 +577,13 @@ def _item_list(f, archived):
     items = f.get("items") or []
     if not items:
         return ""
-    lis = []
+    lis, last = [], None
     for i in items[:ITEMS_SHOWN]:
+        sec = i["section"] or ("other" if any(x["section"] for x in items) else "")
+        if sec and sec != last:
+            n = sum(1 for x in items if (x["section"] or "other") == sec)
+            lis.append(f"<li class='fsec'><b>{esc(sec)}</b> <span class='muted'>{n}</span></li>")
+        last = sec
         where = _at(i["path"], i["line"])
         li = (f"<code>{esc(where)}</code>" if where else "") + (f" <span>{esc(i['note'])}</span>" if i["note"] else "")
         if len(i["locations"]) > 1:
@@ -708,6 +731,7 @@ FINDINGS_CSS = """
 .fd .fx .fsteps, .fd .fx .ftrace, .fd .fx .fitems { margin: 6px 0 2px; padding-left: 20px; font-size: 13px; }
 .fd .fx .ftrace, .fd .fx .fitems { list-style: none; padding-left: 0; }
 .fd .fx li { margin: 3px 0; overflow-wrap: anywhere; }
+.fd .fx .fitems li.fsec { margin-top: 6px; }
 .fd .fx .fitems li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
 .fd .fx .ftrace code, .fd .fx .fitems code { font: 12px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
 .fd .fm { display: flex; flex-wrap: wrap; gap: 2px 14px; font-size: 12px; color: var(--muted); min-width: 0; }

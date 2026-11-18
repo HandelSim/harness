@@ -371,6 +371,29 @@ class NewShapes(Base):
                                                "  - src/old/legacy.cpp: in no CMakeLists.txt",
                                                "  - src/geo/dist.cpp:42: subtracts n-vectors"])
 
+    def test_unify_by_section(self):
+        def it(n, path, sec=None):
+            d = {"id": f"i-00000000000{n}", "path": path, "line": n, "evidence": f"e{n}", "note": f"n{n}",
+                 "locations": [f"{path}:{n}"], "status": "open"}
+            if sec is not None:
+                d["section"] = sec
+            return d
+        roll = dict(ROLL, id="r-unify-1a2b3c4d", category="unify", theme="unify", title="Code to unify",
+                    items=[it(1, "a.cpp", "qt"), it(2, "b.cpp"), it(3, "c.cpp", "nvector"), it(4, "d.cpp", "qt"),
+                           it(5, "e.cpp", "<b>Bad</b>")])
+        h = self.region(roll)
+        heads = re.findall(r"<li class='fsec'><b>(.*?)</b> <span class='muted'>(\d+)</span></li>", h)
+        self.assertEqual(heads, [("bbadb", "1"), ("nvector", "1"), ("qt", "2"), ("other", "1")])
+        order = [h.index(x) for x in ("e.cpp", "c.cpp", "a.cpp", "d.cpp", "b.cpp")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(h.count(">Not this one</button>"), 5)
+        f = [x for x in fv.collect(self.runs) if x["id"] == roll["id"]][0]
+        self.assertEqual(f["md"].split("\n"), [
+            "- Code to unify (5 places, findings agent)", "  - bbadb (1)", "    - e.cpp:5: n5",
+            "  - nvector (1)", "    - c.cpp:3: n3", "  - qt (2)", "    - a.cpp:1: n1", "    - d.cpp:4: n4",
+            "  - other (1)", "    - b.cpp:2: n2"])
+        self.assertNotIn("fsec", self.region(ROLL))   # a list without sections is one flat list
+
     def test_archive_one_item(self):
         self.region(ROLL)
         ok, msg = fv.action(self.runs, "archive", {"id": ["i-0123456789ab"]})

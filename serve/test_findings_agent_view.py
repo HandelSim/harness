@@ -87,8 +87,6 @@ class CardTest(Base):
                             "<x>": {"calls": "7"}}, model="<m>", open=4, pending=2)
         with open(os.path.join(self.state, "notes.md"), "w") as f:
             f.write("</textarea><script>bad()</script>")
-        with open(os.path.join(self.state, "themes.md"), "w") as f:
-            f.write("## x\n</textarea><script>bad()</script>")
         h = fav.agent_card(self.state, flash="<saved>")
         self.assertNotIn("<script>", h)
         self.assertNotIn("<b>x.py", h)
@@ -102,8 +100,9 @@ class CardTest(Base):
         self.assertIn("<td>bug</td><td>3</td><td>1</td><td>2</td><td class='muted'>&lt;trace&gt; 1, ui 1</td>"
                       "<td>0</td><td>0</td>", h)
         self.assertIn("<dt>reports waiting for the checker</dt><dd>2</dd>", h)
-        self.assertIn("action='/runs/findings/agent/themes'", h)
-        self.assertEqual(h.count("&lt;/textarea&gt;"), 2)
+        self.assertNotIn("themes", h)   # the lists are built in; a library to use goes in the notes
+        self.assertIn("nvector: position math goes through", h)
+        self.assertEqual(h.count("&lt;/textarea&gt;"), 1)
         self.assertIn("exploring", h)   # an old agent.json's "scanning" is shown as exploring
         self.assertIn("Change the model in Settings (then Stop and Start)</a>", h)
 
@@ -156,15 +155,10 @@ class ActionTest(HarnessBase):
         self.assertIn("4000", msg)
         self.assertEqual(os.listdir(self.state), ["notes.md"])   # no temp file left
 
-    def test_themes(self):
-        ok, msg = fav.agent_action(self.state, self.harness, "themes", {"themes": ["## nvector\r\ntitle: t\n"]})
-        self.assertTrue(ok, msg)
-        with open(os.path.join(self.state, "themes.md")) as f:
-            self.assertEqual(f.read(), "## nvector\ntitle: t\n")
-        ok, msg = fav.agent_action(self.state, self.harness, "themes", {"themes": ["x" * 6001]})
-        self.assertFalse(ok)
-        self.assertIn("6000", msg)
-        self.assertIn("themes", fav.ACTIONS)
+    def test_no_themes(self):
+        self.assertEqual(fav.agent_action(self.state, self.harness, "themes", {"themes": ["x"]}),
+                         (False, "unknown action: themes"))
+        self.assertEqual(os.listdir(self.state), [])
 
     def test_start(self):
         project = os.path.join(self.root, "proj")

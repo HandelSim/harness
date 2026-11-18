@@ -7697,8 +7697,6 @@ usage: harness findings start [DIR...]   start the agent in the background and r
                                          for the checker, why reports were thrown away
        harness findings notes            edit the notes added to every pass
                                          ($EDITOR; printed when not a terminal)
-       harness findings themes           edit the rolling lists (themes.md; $EDITOR;
-                                         printed, with an example, when not a terminal)
        harness findings archive-old      archive the open findings of the old format
                                          (no steps), so the board starts clean
 
@@ -7720,9 +7718,11 @@ finding; the rest wait for a second, adversarial session that reads the code
 around each one and answers real, not-real or duplicate. Only real ones go on
 the board. A cleanup pass per area adds items to the rolling lists: one
 finding each, growing over time (unused files, which a scan at each HEAD also
-fills; dead code; code to unify or hand to the standard library or Qt; safety;
-and your own lists in themes.md, such as one for position math that does not
-go through your n-vector library). Every pass first reads KNOWN.md in its
+fills; dead code; safety; code to unify, in sections: shared for the same
+logic twice, std, qt, or a library's name for own code that library does).
+Name a library in the notes ("nvector: position math goes through our n-vector
+library") and code that does it by hand goes on unify under nvector. Every
+pass first reads KNOWN.md in its
 snapshot: every open finding, every one you archived, the ticket agents'
 findings and every list item, so it does not report them again.
 
@@ -7768,7 +7768,7 @@ Files: $state_root/findings: findings.json (the board's list), ledger.json
 for the checker; what was thrown away and why), agent.json (status),
 sessions/N.out (each session's output), tree/ (the HEAD snapshots), knowledge/
 (the notes on each area, INDEX.md, index.json), agent.out (the log),
-notes.md, themes.md, wanted (started and not stopped), folders.json (the web
+notes.md, wanted (started and not stopped), folders.json (the web
 UI's choice).
 HELP
             return 0 ;;
@@ -7811,19 +7811,6 @@ HELP
                 ${EDITOR:-vi} "$fdir/notes.md"
             else
                 cat "$fdir/notes.md" 2>/dev/null || true
-            fi ;;
-        themes)
-            mkdir -p "$fdir"
-            if [[ -t 0 && -t 1 ]]; then
-                if [[ ! -s "$fdir/themes.md" ]]; then
-                    # shellcheck disable=SC2086
-                    PYTHONUTF8=1 $py "$script" themes --state "$sdir" --seed >"$fdir/themes.md"
-                fi
-                # shellcheck disable=SC2086  # EDITOR can carry arguments
-                ${EDITOR:-vi} "$fdir/themes.md"
-            else
-                # shellcheck disable=SC2086
-                PYTHONUTF8=1 $py "$script" themes --state "$sdir"
             fi ;;
         archive-old)
             # shellcheck disable=SC2086

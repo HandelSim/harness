@@ -81,7 +81,7 @@ case "${STUB_MODE:-find}" in
         echo "- app.py:6 | return a / b"
         echo "- lib/use.py:2 | print(ratio(1, 0))"
         echo "END-BUG-$nonce"
-        echo "ITEM-$nonce | unify | app.py:10, lib/use.py:2 | return sum(items) | use math.fsum in both"
+        echo "ITEM-$nonce | unify/Standard | app.py:10, lib/use.py:2 | return sum(items) | use math.fsum in both"
         echo "ITEM-$nonce | safety | app.py:6 | return a / b | b = 0 raises"
         echo "ITEM-$nonce | nonsense | app.py:1 | import os | x"
         echo "ITEM-$nonce | safety | app.py:4 | not in the code at all | x"
@@ -329,16 +329,13 @@ class CheckTest(unittest.TestCase):
         self.assertRegex(a, r"^f-[0-9a-f]{12}$")
         self.assertNotEqual(a, fa.fingerprint("r", "p.py", "simplify", "return a / b"))
 
-    def test_themes(self):
-        got = {k: (t, d) for k, t, d in fa.themes_of(
-            "intro text\n## nvector\ntitle: Position math not through the n-vector library\nUse nvlib for all\n"
-            "position math.\n## dead\noff\n## Safety\nOnly memory errors.\n## bad slug!!\n\n## empty\n")}
-        self.assertEqual(sorted(got), ["bad-slug", "nvector", "safety", "unify", "unused"][:0] or
-                         sorted(["nvector", "safety", "unify", "unused"]))
-        self.assertEqual(got["nvector"], ("Position math not through the n-vector library",
-                                          "Use nvlib for all position math."))
-        self.assertEqual(got["safety"], ("Safety and robustness", "Only memory errors."))
-        self.assertEqual(len(fa.themes_of("")), len(fa.THEMES))
+    def test_sections(self):
+        for raw, want in (("nvector", "nvector"), ("N-Vector", "nvector"), ("stdlib", "std"), ("std::", "std"),
+                          ("Qt6", "qt"), ("duplicate", "shared"), ("", "other"), ("  ", "other"), ("x" * 40, "x" * 30)):
+            self.assertEqual(fa.section_of(raw), want, raw)
+        got = fa.sections_in([{"section": "qt"}, {}, {"section": "nvector"}, {"section": "qt"}])
+        self.assertEqual([(k, len(v)) for k, v in got], [("nvector", 1), ("qt", 2), ("other", 1)])
+        self.assertEqual(sorted(fa.THEMES), ["dead", "safety", "unify", "unused"])
 
 
 class UnusedTest(unittest.TestCase):
@@ -435,7 +432,7 @@ class UnitsTest(unittest.TestCase):
             led[u.key] = {"sha": u.sha, "prompt": "h", "scanned": t - 10}
         first, rest = order()
         self.assertEqual((first, len(rest)), ([], len(us)))
-        h["cleanup"] = "themes changed"   # the owner's themes: only the cleanup passes again
+        h["cleanup"] = "cleanup changed"   # one question's prompt changed: only its passes again
         self.assertEqual(order()[0], [("changed", "cleanup"), ("new", "cleanup")])
 
     def test_prompt(self):
@@ -450,16 +447,19 @@ class UnitsTest(unittest.TestCase):
         order = [p.index(x) for x in ("my notes", "the parser", "old one", "BUG-abc12345")]
         self.assertEqual(order, sorted(order))
         c = fa.build_prompt(fa.Unit("/x/repo", "serve", "cleanup", ["serve/a.py"], "s"), "", [], [], "abc12345",
-                            themes=fa.themes_of("## nvector\ntitle: Use nvlib\nAll position math.\n"))
-        for want in ("ITEM-abc12345 | list | path:line", "- unify: Code to unify", "- nvector: Use nvlib. All "
-                     "position math.", fa.QUESTIONS["cleanup"]):
+                            themes=fa.Worker.themes(None), sections=["nvector", "qt"])
+        for want in ("ITEM-abc12345 | list | path:line", "- unify: Code to unify", "unify/<library>",
+                     "in use (use one of these when it fits, spelled the same): nvector, qt", "owner's notes",
+                     fa.QUESTIONS["cleanup"]):
             self.assertIn(want, c)
+        self.assertNotIn("in use", fa.build_prompt(fa.Unit("/x/repo", "serve", "cleanup", ["serve/a.py"], "s"),
+                                                  "", [], [], "abc12345", themes=fa.Worker.themes(None)))
         self.assertNotIn("BUG-abc12345", c)
 
     def test_prompt_with_the_area_s_note_and_map_only(self):
         u = fa.Unit("/x/repo", "serve", "cleanup", ["serve/a.py"], "s")
         p = fa.build_prompt(u, "", ["serve/a.py:3 old one"], [], "abc12345", note="# repo: serve/\nNOTE-BODY",
-                            note_old=True, has_notes=True, themes=fa.themes_of(""))
+                            note_old=True, has_notes=True, themes=fa.Worker.themes(None))
         for want in ("NOTE-BODY", "changed since", fa.NOTES_IN_TREE + "/INDEX.md", "KNOWLEDGE-abc12345",
                      "END-KNOWLEDGE-abc12345", "ITEM-abc12345"):
             self.assertIn(want, p)
@@ -654,15 +654,17 @@ class PassTest(StubCase):
         rolls = {x["theme"]: x for x in store if x.get("kind") == "rolling"}
         self.assertEqual(sorted(rolls), ["safety", "unify"])
         (it,) = rolls["unify"]["items"]
-        self.assertEqual((it["path"], it["line"], it["locations"], it["note"], it["status"]),
-                         ("app.py", 10, ["app.py:10", "lib/use.py:2"], "use math.fsum in both", "open"))
+        self.assertEqual((it["path"], it["line"], it["locations"], it["note"], it["status"], it["section"]),
+                         ("app.py", 10, ["app.py:10", "lib/use.py:2"], "use math.fsum in both", "open", "std"))
+        self.assertNotIn("section", rolls["safety"]["items"][0])
         self.assertTrue(rolls["unify"]["id"].startswith("r-unify-"))
         self.assertEqual(self.read("ledger.json")["counts"]["cleanup"]["why"], {"list": 1, "evidence": 1})
         # the same items again: nothing new
         w = fa.Worker(self.state, self.url, "free-assist", [repo], harness=self.harness, once=True)
         w.refresh()
         u = [x for x in w.units[repo] if x.area == "." and x.lens == "cleanup"][0]
-        self.assertEqual(w.accept_items(u, [("unify", "app.py:10, lib/use.py:2", " return sum(items) | again"),
+        self.assertEqual(w.sections(repo), ["std"])
+        self.assertEqual(w.accept_items(u, [("unify/qt", "app.py:10, lib/use.py:2", " return sum(items) | again"),
                                             ("safety", "app.py:6", " return a / b | again")], "s"), (0, 2))
         out = io.StringIO()
         with redirect_stdout(out):
@@ -736,6 +738,17 @@ class PassTest(StubCase):
         self.assertFalse(w.add_item(repo, "unify", t, d, dict(item, line=12, evidence="other"), "s"))
         (r,) = w.rolls(repo, "unify")
         self.assertEqual(w.open_count(), 1)   # a list is one finding, however long
+        # KNOWN.md lists unify by section, items with none under other
+        self.assertTrue(w.add_item(repo, "unify", t, d, dict(item, path="geo.py", line=3, evidence="dx = a - b",
+                                                             locations=["geo.py:3", "map.py:9"], section="nvector"),
+                                   "s"))
+        tree = tempfile.mkdtemp(dir=self.state)
+        w.write_known(repo, tree, [])
+        with open(os.path.join(tree, fa.NOTES_IN_TREE, "KNOWN.md")) as f:
+            k = f.read()
+        self.assertIn("## The unify list: Code to unify or hand to a library\n\n### unify/nvector\n\n"
+                      "geo.py:3, map.py:9 | dx = a - b | n\n\n### unify/other\n\napp.py:10, x.py:1", k)
+        r["items"] = [i for i in r["items"] if i["path"] != "geo.py"]
         # the owner archives the list: a new one starts, the old items are not added again
         with open(os.path.join(self.state, "board.json"), "w") as f:
             json.dump({"version": 1, "order": [], "archived": {r["id"]: "2026-01-01T00:00:00Z"}}, f)
