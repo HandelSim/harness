@@ -84,6 +84,7 @@ branch KEY into the project (refs/harness-queue/KEY), diffs there and pushes
 from there, without force. Nothing is ever written to the tracker.
 """
 import argparse
+import collections
 import contextlib
 import datetime
 import hashlib
@@ -137,13 +138,19 @@ WIN_PROMPT_MAX = 24_000
 INFRA_RETRY_PAUSES = (20, 60)
 DIFF_CAP_AGENT = 40_000
 DIFF_CAP_VERIFY = 150_000
-MAX_QUESTIONS = 8
+MAX_QUESTIONS = 8          # an older plan's: more is a note (plan_notes)
+SPEC_QUESTIONS = 3         # a spec's (spec_problems): at most this many, each with a Recommended answer
+CHECK_TYPES = ("cmd", "test", "review", "human")   # an acceptance criterion's [check: ...]
+FIX_ROUNDS = 2             # review-driven fix rounds before the loop stops at the owner (review_decision)
+VERDICTS_KEPT = 12         # review_verdicts entries kept in state.json
+OWNER_ACTIONS_MAX = 200
 # A plan's criteria: the ones from the ticket gate the change (verify_change);
 # their edge cases, tagged (edge of ACn), are the review's to check, and the
 # ticket's tests later. Up to MAX_GATED of the first, MAX_CRITERIA in all.
 MAX_GATED = 15
 MAX_CRITERIA = 40
-PLAN_SECTIONS = ("Goal", "How it works", "Not included", "Steps", "Acceptance criteria", "Questions", "Assumptions")
+# a spec's sections (an older plan's ## Steps or ## Approach still parses: plan_items)
+PLAN_SECTIONS = ("Goal", "How it works", "Not included", "Acceptance criteria", "Questions", "Assumptions")
 PLAN_REQUIRED = ("Goal", "Acceptance criteria")   # the rest missing is noted, not failed
 HISTORY_CAP = 30
 REVIEW_SECTIONS = ("Must fix", "Notes")
@@ -479,6 +486,32 @@ def check_plan(text):
     return problems, criteria, questions
 
 
+def spec_problems(text):
+    """What a spec (the plan's new shape) lacks: at most SPEC_QUESTIONS questions, each
+    tagged [blocking] or [non-blocking] with a Recommended answer; a [check: ...] type
+    on every criterion; and a cmd or test criterion, or a "No executable check: <why>"
+    line. Like shape_problems: asked for again on a retry, a note on the last try."""
+    secs = sections(text)
+    out = []
+    qs = [question(x, i) for i, x in enumerate(plan_questions(secs), 1)]
+    if len(qs) > SPEC_QUESTIONS:
+        out.append(f"{len(qs)} questions: at most {SPEC_QUESTIONS}; settle the small ones yourself as Assumptions")
+    bare = [q["id"] for q in qs if not q["default"]]
+    if bare:
+        out.append(f"{', '.join(bare)}: no recommended answer (end the question with Recommended: (a), because ...)")
+    loose = [q["id"] for q in qs if not question_mark(q["text"])]
+    if loose:
+        out.append(f"{', '.join(loose)}: not tagged [blocking] or [non-blocking]")
+    crit = plan_criteria(bullets(secs.get("acceptance criteria", "")))
+    untyped = [c["id"] for c in crit if not c["check"]]
+    if untyped:
+        out.append(f"{', '.join(untyped[:12])}: no check type; end each criterion with [check: cmd|test|review|human]")
+    if crit and not untyped and not any(c["check"] in ("cmd", "test") for c in crit) and not NO_EXEC_CHECK.search(text):
+        out.append("no criterion is [check: cmd] or [check: test]: make one a command or test that shows it, or add "
+                   "an Assumption \"No executable check: <why>\"")
+    return out
+
+
 TEST_MARKS = ("test_marks", "test_files", "test_sha")   # what the test stage wrote the tests on
 TEST_COMMAND_LINE = re.compile(r"(?im)^\s*(?:[-*]\s*)?[*_]*command[*_]*\s*:\s*(?:`([^`\n]+)`|(none)\b)")
 NO_TESTS_SECTION = ("the plan has no '## Tests' section with - Command: `<the command that runs the new tests>` (or "
@@ -535,8 +568,7 @@ def question_mark(q):
 def plan_notes(text):
     """What is off in a plan that passed check_plan, for the log."""
     secs = sections(text)
-    notes = [f"no '## {s}' section" for s in PLAN_SECTIONS
-             if s.lower() not in secs and not (s == "Steps" and "approach" in secs)]
+    notes = [f"no '## {s}' section" for s in PLAN_SECTIONS if s.lower() not in secs]
     questions = plan_questions(secs)
     if len(questions) > MAX_QUESTIONS:
         notes.append(f"{len(questions)} questions (asked for at most {MAX_QUESTIONS})")
@@ -563,6 +595,9 @@ GWT = re.compile(r"(?is)^\W*given\b[\s,:]*(.*?)[\s,;]*\bwhen\b[\s,:]*(.*?)[\s,;]
 SOURCE = re.compile(r"[(\[]\s*((?:from the )?(?:ticket|edge(?:[- ]case)?|source|from|owner|answer)\b[^\n]*?)"
                     r"\s*[)\]]\s*\.?\s*$", re.I)
 PATH_RE = re.compile(r"`([^`\s]+\.[A-Za-z0-9]{1,8}|[^`\s]*/[^`\s]*)`")
+# a spec criterion's check type, anywhere in it: "[check: test]" (or "(check: cmd)")
+CHECK_TAG = re.compile(r"\s*[\[(]\s*[*_`]*check[*_`]*\s*:\s*[*_`]*(cmd|test|review|human)\b[^\])\n]*[\])]", re.I)
+NO_EXEC_CHECK = re.compile(r"(?im)\bno executable check\s*:\s*\S")
 
 
 def source_tag(body):
@@ -602,6 +637,10 @@ def item_id(text, kind, n):
 def criterion(text, n):
     """One acceptance criterion as {id, text, given, when, then, source}; given,
     when and then are "" when it is not written as GIVEN ... WHEN ... THEN ..."""
+    m = CHECK_TAG.search(text)
+    check = m.group(1).lower() if m else ""
+    if m:   # the check type is its own field: the criterion's words are as before (verifier, quotes, UI)
+        text = (text[:m.start()] + text[m.end():]).strip()
     cid, body = item_id(text, "AC", n)
     m = source_tag(body)
     source = m.group(1).strip() if m else ""
@@ -610,7 +649,7 @@ def criterion(text, n):
     plain = GWT_WORD.sub(lambda w: w.group(1) or w.group(2), body)
     g = GWT.match(plain)
     parts = [x.strip().rstrip(",;").strip() for x in g.groups()] if g else ["", "", ""]
-    return dict(id=cid, text=text, given=parts[0], when=parts[1], then=parts[2], source=source)
+    return dict(id=cid, text=text, given=parts[0], when=parts[1], then=parts[2], source=source, check=check)
 
 
 def question(text, n):
@@ -619,7 +658,7 @@ def question(text, n):
     qid, body = item_id(MARK.sub(" ", text, count=1).strip(), "Q", n)
     body = re.sub(r"^[\s*_`:.\-\u2013\u2014]+", "", body)
     default = ""
-    m = re.search(r"(?i)\s*\bdefault\s*:\s*", body)
+    m = re.search(r"(?i)\s*\b(?:default|recommended(?: answer)?)\s*:\s*", body)
     if m:
         default, body = body[m.end():].strip(), body[:m.start()].rstrip()
     options = []
@@ -664,8 +703,8 @@ def gated_criteria(criteria):
     out = []
     for i, text in enumerate(criteria, 1):
         c = criterion(text, i)
-        if not is_edge(c):
-            out.append(item_id(text, "AC", i)[1])
+        if not is_edge(c):   # its words as the criterion's own, its [check: ..] type left out
+            out.append(item_id(c["text"], "AC", i)[1])
     return out
 
 
@@ -740,6 +779,130 @@ def check_review(text):
     secs = sections(text)
     problems = [f"the review has no '## {s}' section" for s in REVIEW_SECTIONS if s.lower() not in secs]
     return problems, bullets(secs.get("must fix", ""))
+
+
+# The review's per-criterion verdicts (review.md's ## Criteria): one line each,
+# "- AC1: PASS | `a line the diff adds` | why". Read defensively: bold, a dash or a
+# colon in place of the bars, a missing quote or why; the last line for an id wins.
+VERDICT_LINE = re.compile(r"^\s*(?:[-*]|\d+[.)])?\s*[*_`]*(AC)[-\s]?(\d{1,3})\b[*_`]*\s*[:.)\-\u2013\u2014|]?\s*[*_`]*"
+                          r"(PASS(?:ED)?|FAIL(?:ED)?|UNKNOWN|MET|UNMET|NOT MET)\b[*_`]*\s*(.*)$", re.I)
+MUST_TAG = re.compile(r"^\s*[*_`]*[\[(]\s*(exec|opinion)\s*[\])][*_`]*\s*", re.I)
+
+
+def review_verdicts(text):
+    """[{id, verdict (PASS, FAIL or UNKNOWN), quote, why}] from the review's ## Criteria
+    (else from anywhere in it); [] when it gave none (an older review)."""
+    secs = sections(text or "")
+    body = secs.get("criteria") or secs.get("acceptance criteria") or ""
+    got = {}
+    for line in (body or text or "").splitlines():
+        m = VERDICT_LINE.match(line)
+        if not m:
+            continue
+        word = m.group(3).upper()
+        v = "PASS" if word in ("PASS", "PASSED", "MET") else "UNKNOWN" if word == "UNKNOWN" else "FAIL"
+        rest = re.sub(r"^[\s|:\-\u2013\u2014]+", "", m.group(4)).strip()
+        parts = [x.strip() for x in re.split(r"\s+\|\s+|\s*\|\s*", rest, maxsplit=1)] if "|" in rest else []
+        quote, why = (parts + [""])[:2] if parts else ("", rest)
+        qm = re.match(r"^`([^`]*)`\s*[:,;\-\u2014]*\s*(.*)$|^\"([^\"]*)\"\s*[:,;\-\u2014]*\s*(.*)$", quote or rest)
+        if not parts and qm:   # "PASS `quote` why", no bars
+            quote, why = (qm.group(1) if qm.group(1) is not None else qm.group(3)), (qm.group(2) or qm.group(4) or "")
+        quote = quote.strip().strip("`").strip('"').strip()
+        if re.fullmatch(r"(?i)[-\u2014(]*\s*(none|n/?a|-)?\s*\)?", quote):
+            quote = ""
+        got[f"AC{int(m.group(2))}"] = {"id": f"AC{int(m.group(2))}", "verdict": v, "quote": quote[:300],
+                                        "why": why.strip()[:300]}
+    return list(got.values())
+
+
+def must_tag(item):
+    """(tag, text): a Must fix item's [exec] or [opinion] ("" when it has none) and the item without it."""
+    m = MUST_TAG.match(item)
+    return (m.group(1).lower(), item[m.end():].strip()) if m else ("", item)
+
+
+def quote_checked(verdicts, criteria, diff, notes="", fix_diff=""):
+    """The verdicts with every PASS quote looked for in the change's added lines (judge,
+    as verify_change's are): a PASS whose quote is not there becomes UNKNOWN, said=PASS."""
+    by_id = {c["id"]: c["text"] for c in criteria}
+    passed = [v for v in verdicts if v["verdict"] == "PASS"]
+    nums = [int(v["id"][2:]) for v in passed]
+    obj = {"verdict": "PASS", "criteria": [{"n": n, "met": True, "quote": v["quote"]} for n, v in zip(nums, passed)]}
+    probs = judge(obj, [by_id.get(v["id"], v["id"]) for v in passed], diff, "quote", "diff", notes, nums=nums,
+                  fix_diff=fix_diff)
+    missed = {int(m.group(1)) for m in map(QUOTE_MISS.match, probs) if m}
+    return [dict(v, verdict="UNKNOWN", said="PASS", miss=True) if v["verdict"] == "PASS" and int(v["id"][2:]) in missed
+            else v for v in verdicts]
+
+
+def review_summary(verdicts, must):
+    """What drives the loop in one review round: its [exec] items (a failing build, test or
+    command; the review stage's own broken change too), the rest (opinion: untagged too),
+    and the criteria it found FAIL, UNKNOWN and PASS."""
+    tags = [must_tag(m)[0] for m in must]
+    return {"exec": [m for m, t in zip(must, tags) if t == "exec"],
+            "opinion": [m for m, t in zip(must, tags) if t != "exec"],
+            "fail": [v["id"] for v in verdicts if v["verdict"] == "FAIL"],
+            "unknown": [v["id"] for v in verdicts if v["verdict"] == "UNKNOWN"],
+            "pass": [v["id"] for v in verdicts if v["verdict"] == "PASS"]}
+
+
+def open_count(r):
+    """The items that hold a change: [exec] ones and unmet criteria (FAIL, UNKNOWN)."""
+    return len(r.get("exec") or []) + len(r.get("fail") or []) + len(r.get("unknown") or [])
+
+
+def review_decision(rounds, now, prev=None):
+    """(decision, why) after a review: "push" (on to the stage after review), "fix" (a
+    fix round) or "packet" (the owner decides). rounds: the review-driven fix rounds done.
+    The first review's items all get one round, as before; after it only executable
+    evidence (an [exec] item, an unmet criterion) earns another, up to FIX_ROUNDS, and
+    only with progress: fewer open items than the round before, none that passed failing."""
+    hard, soft = open_count(now), len(now.get("opinion") or [])
+    if not hard and not soft:
+        return "push", ""
+    if rounds <= 0:
+        return "fix", ""
+    if not hard:
+        return "push", f"{soft} opinion item(s) left after {rounds} fix round(s): listed in the result, not fixed"
+    if rounds >= FIX_ROUNDS:
+        return "packet", f"{hard} open item(s) after {rounds} fix round(s)"
+    if prev is not None:
+        back = [i for i in prev.get("pass") or [] if i in (now.get("fail") or []) + (now.get("unknown") or [])]
+        if back:
+            return "packet", f"{', '.join(back)} passed the review before this fix round and does not now"
+        if hard >= open_count(prev):
+            return "packet", f"no progress: {hard} open item(s), {open_count(prev)} before this fix round"
+    return "fix", ""
+
+
+def round_line(e):
+    """One review round in a line, for the packet."""
+    s = e.get("summary") or {}
+    crit = ", ".join(f"{v['id']} {v['verdict']}" for v in e.get("criteria") or []) or "no verdicts"
+    return clip(f"round {e.get('round', 0)}: {len(s.get('exec') or [])} exec, {len(s.get('opinion') or [])} opinion; "
+                f"{crit}" + (f" at {e['sha'][:12]}" if e.get("sha") else ""), 200)
+
+
+# state.json's "packet": what the owner reads when the loop stops (serve shows it).
+# {"reason": one line (the blocker class), "question": one question, "default": the
+#  recommended answer (a command), "criteria": [{"id": "AC1", "verdict": "PASS"|"FAIL"|
+#  "UNKNOWN", "quote": "..."}] (the last review's), "rounds": ["round 0: ...", ...] (one
+#  line per review round), "best_commit": the sha of the round with fewest open items ("" if none)}
+def packet(st, reason, question, default):
+    rows = st.get("review_verdicts") or []
+    last = rows[-1] if rows else {}
+    cur = []   # this loop's rounds: back to its first review (round 0)
+    for e in reversed(rows):
+        cur.insert(0, e)
+        if not e.get("round"):
+            break
+    rows = cur
+    best = min(reversed(rows), key=lambda e: open_count(e.get("summary") or {}), default={}).get("sha", "")
+    return {"reason": clip(reason, 300), "question": clip(question, 300), "default": clip(default, 300),
+            "criteria": [{"id": v["id"], "verdict": v["verdict"], "quote": v.get("quote", "")[:200]}
+                         for v in last.get("criteria") or []],
+            "rounds": [round_line(e) for e in rows[-(FIX_ROUNDS + 2):]], "best_commit": best or ""}
 
 
 # --- git (the project only; never inside the agent's clone after it started) -----
@@ -2014,12 +2177,37 @@ def ask_verifier(ctx, prompt, key, stage):
 def verdict(ctx, st, stage, prompt_for):
     """ask_verifier on prompt_for(cap); with no verdict, once more with a quarter of
     the diff or ticket (a long prompt is what a free model most often chokes on).
-    VerifierBroke after that: process() blocks the ticket with its work kept."""
+    VerifierBroke after that: process() blocks the ticket with its work kept.
+    Each ask is noted in the attempt's record (call_note)."""
     try:
-        return ask_verifier(ctx, prompt_for(DIFF_CAP_VERIFY), st["key"], stage)
+        return timed_ask(ctx, st, stage, prompt_for(DIFF_CAP_VERIFY))
     except VerifierBroke as e:
         ctx.q.log(st["key"], f"{e}; asking once more with a shorter prompt")
-        return ask_verifier(ctx, prompt_for(DIFF_CAP_VERIFY // 4), st["key"], stage)
+        return timed_ask(ctx, st, stage, prompt_for(DIFF_CAP_VERIFY // 4))
+
+
+def prompt_sig(text):
+    return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def timed_ask(ctx, st, stage, prompt):
+    """ask_verifier, its call noted under the attempt's record: {prompt, start, end, outcome}."""
+    one = {"prompt": prompt_sig(prompt), "start": now_iso(), "end": "", "outcome": "asked"}
+    calls = st.setdefault("call", {"stage": stage, "round": int(st.get("fix_rounds") or 0)}).setdefault("verifier", [])
+    calls.append(one)
+    del calls[:-6]
+    try:
+        obj = ask_verifier(ctx, prompt, st["key"], stage)
+        one["outcome"] = str(obj.get("verdict") or "no verdict")[:20]
+        return obj
+    except VerifierBroke:
+        one["outcome"] = "broke"
+        raise
+    except Infra:
+        one["outcome"] = "upstream down"
+        raise
+    finally:
+        one["end"] = now_iso()
 
 
 REMOVAL = re.compile(r"(?i)\b(remov|delet|drop|strip|get rid|no longer|stop|deprecat|eliminat)")
@@ -2383,7 +2571,10 @@ def agent_or_kept(ctx, st, stage, prompt):
         started = resume["started"]
     else:
         started = time.time()
-    rc, out = run_agent(ctx, st, stage, prompt())
+    text = prompt()
+    st["call"] = {"stage": stage, "round": int(st.get("fix_rounds") or 0), "prompt": prompt_sig(text),
+                  "start": now_iso()}
+    rc, out = run_agent(ctx, st, stage, text)
     return rc, out, started
 
 
@@ -2977,8 +3168,8 @@ TEST_STEPS = {
     "plan": ("The implementer makes sure it builds; nobody writes tests in this ticket, so plan no test files unless "
              "the ticket asks for them.",
              "This ticket has a test stage after this plan: a test agent writes the tests from your criteria before "
-             "the code exists, then the implementer makes them pass. Name, in Steps, every file, function and "
-             "signature the tests will call. Add a section ## Tests: - Command: `<the project's command that runs "
+             "the code exists, then the implementer makes them pass. Name, in an Assumption, every file, function "
+             "and signature the tests will call. Add a section ## Tests: - Command: `<the project's command that runs "
              "the new tests, as narrow as it can be>`, then one - Files: `<path>` line per test file, following where "
              "the project's tests already are. Find the command in the README, Makefile, package.json, pyproject or "
              "CI config. If the project has no test framework, write - Command: none and ask a [blocking] Question: "
@@ -3139,16 +3330,17 @@ CARD_WHERE_IN_PLACE = ("the owner's own project folder, not a clone. Where you c
                        "reset --hard, clean, stash, or checkout of files you did not change)")
 CARD_DONE = {
     "plan": "no code changed, the plan written to {PLAN_FILE}: # {KEY} plan, ## Goal, ## How it works, "
-            "## Not included, ## Steps (1. `file` "
-            "`function()`: the change (AC1)), ## Acceptance criteria (one line each: - AC1: GIVEN .. WHEN .. THEN .. "
-            "(ticket: \"exact words\") or (edge of AC1)), ## Questions (- Q1 [blocking] ..? Options: (a) .. (b) .. "
-            "Default: (a), because ..), ## Assumptions (- A1: ..); then each Step's code re-read and the plan fixed.",
+            "## Not included, ## Acceptance criteria (one line each: - AC1: GIVEN .. WHEN .. THEN .. "
+            "(ticket: \"exact words\") or (edge of AC1), then [check: cmd|test|review|human]), ## Questions (at most "
+            "3: - Q1 [blocking] ..? Options: (a) .. (b) .. Recommended: (a), because ..), ## Assumptions (- A1: ..); "
+            "no ## Steps; then the code each criterion names re-read and the plan fixed.",
     "implement": "every acceptance criterion of the plan is met and committed on {BRANCH} (git add <files>, git commit "
                  "-m \"{KEY}: <what this piece does>\"), a commit for each piece of the change as it is done, not "
                  "one at the end, and git status is clean. Do not push.",
     "implement-repos": "every acceptance criterion of the plan is met. {COMMIT_STEP}",
-    "review": "the review is written to {REVIEW_FILE}: # {KEY} review, then ## Must fix (path:line: the problem and "
-              "what to do, or - None) and ## Notes. Change no code in this stage.",
+    "review": "the review is written to {REVIEW_FILE}: # {KEY} review, then ## Criteria (- AC1: PASS | `a line the "
+              "diff adds` | why, or FAIL / UNKNOWN), ## Must fix ([exec] or [opinion] path:line: the problem and what "
+              "to do, or - None) and ## Notes. Change no code in this stage.",
     "fix": "every Must fix item is fixed, or said in the commit message to be wrong, and committed on {BRANCH} in a "
            "new commit (git commit --allow-empty when nothing changed). Do not push.",
     "fix-repos": "every Must fix item is fixed. {FIX_COMMIT_STEP}",
@@ -3334,7 +3526,7 @@ def fresh(path, started):
 
 # A line of each prompt's template: output holding it is the prompt echoed, not the agent's note.
 NOTE_TEMPLATE = {"plan": "One or two sentences in plain words: what the owner gets",   # plan.md's Goal line
-                 "review": "Only real defects that would make the change wrong, unsafe or not meet"}
+                 "review": "what fails, with the command you ran"}   # review.md's first Must fix line
 NOTE_HEADS = {"plan": r"^##\s+Goal\b", "review": r"^##\s+Must fix\b"}
 
 
@@ -3413,8 +3605,8 @@ def stage_plan(ctx, st):
             last = json.loads(read(os.path.join(ctx.q.dir(st["key"]), "plan.json")) or "null")
         except ValueError:
             last = None
-        shape = shape_problems(text) + accepted_changed(last if isinstance(last, dict) else None, read(p["answers"]),
-                                                        owner_notes(ctx.q.notes(st["key"])), criteria)
+        shape = shape_problems(text) + spec_problems(text) + accepted_changed(
+            last if isinstance(last, dict) else None, read(p["answers"]), owner_notes(ctx.q.notes(st["key"])), criteria)
         if st["attempt"] < ctx.retries:   # asked for once more; on the last try only noted
             problems = shape
     sig = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
@@ -3445,6 +3637,10 @@ def stage_plan(ctx, st):
     st["plan_sig"] = sig
     write_atomic(os.path.join(ctx.q.dir(st["key"]), "plan.json"),
                  json.dumps(dict(items, sig=st["plan_sig"]), indent=1, ensure_ascii=False) + "\n")
+    # the owner's gate opens for a blocking question only (or the plan review the owner set);
+    # every other question goes on at its recommended answer, listed for the owner's page
+    st["defaults_applied"] = [{"id": q["id"], "ask": q["ask"][:300], "default": default_said(q)[:300]}
+                              for q in st["questions"] if not q["blocking"] and q["default"]]
     open_q = blocking(questions)
     if open_q and st.get("take_defaults"):
         open_q = take_defaults(ctx, st, p, open_q)
@@ -3617,6 +3813,9 @@ def change_problems(ctx, st, rc, stage):
                 ctx.q.log(st["key"], f"{stage} verifier, asked again: {verifier_line(obj, problems)}")
             except VerifierBroke as e:   # no second verdict: the first one's problems stand
                 ctx.q.log(st["key"], f"{stage} verifier, asked again: {e}")
+        # the verifier's verdict on this change, beside the review's (review_verdicts' "verify")
+        st["verify_record"] = {"stage": stage, "sha": change[0] or "", "passed": not problems,
+                               "failed": sorted({int(m.group(1)) for m in map(FAILED_CHECK.match, problems) if m})}
         st["warnings"] = warnings
     if problems:
         return problems
@@ -3979,9 +4178,76 @@ def stage_test(ctx, st):
         advance(ctx, st, next_stage(st, "test"))
 
 
+# implement.md's words for the first round; a fix round fills the same prompt from FIX_WORDS (implement_words)
+IMPLEMENT_FIRST = ("Read the files the plan names (with no plan, the code the ticket touches) before changing them. "
+                   "The plan says what must be true when you are done, not how: read the code and pick the simplest "
+                   "way; its criteria tagged (edge of ACn) are the cases your code must also handle.")
+IMPLEMENT_SCOPE = ("Make the change so that every acceptance criterion in the plan (with no plan, everything the ticket "
+                   "asks for) is met. Keep it small: no refactors, renames or clean-ups the ticket does not need. Match "
+                   "the style of the code around it. Update documentation the change makes wrong.")
+FIX_SCOPE = ("Keep every acceptance criterion of the plan (with no plan, what the ticket asks for) met. Change nothing "
+             "else.")
+BLOCKED_HEAD = "BLOCKED:"   # the implementer's way out: its final message's line "BLOCKED: <why>" (implement.md)
+
+
+def implement_words(ctx, st, fix=False):
+    """implement.md's own values on top of common(): the first round's, or a fix round's
+    (FIX_WORDS: whose findings they are, how an item left as it is is said)."""
+    v = common(ctx, st)
+    if not fix:
+        v.update(INTRO=f"implementing ticket {st['key']}, following its plan when it has one. Nobody is watching: "
+                       "do the whole job.", SO_FAR="", FINDINGS_FROM="none: this is the first round",
+                 FINDINGS="(none)", FIRST_STEP=IMPLEMENT_FIRST + " " + v.get("COMMIT_PIECES", ""),
+                 SCOPE_STEP=IMPLEMENT_SCOPE, DOING="implementing")
+        return v
+    what, items, step = FIX_WORDS[by_owner(st)]
+    one = lands(ctx, st) == ([(".", branch_of(st))], [])   # one branch: why goes in the commit message
+    found = "\n".join("- " + m for m in st.get("must_fix", []))
+    if st.get("fix_said") and not by_owner(st):   # what the last round said about the items it left
+        found += "\n\nYour previous round left these as they were, saying:\n" + st["fix_said"]
+    v.update(INTRO="fixing " + what.format(key=st["key"], then="commit" if one else "finish as step 4 says"),
+             SO_FAR=f" The change so far is {v['CHANGE_SO_FAR']}.", FINDINGS_FROM=items.format(review=v["REVIEW_FILE"]),
+             FINDINGS=cap(found, MUST_FIX_CAP),
+             FIRST_STEP=step.format(why_in="the commit message" if one else
+                                    agent_path(ctx, note_paths(ctx.vault, st["key"])["fix"])),
+             SCOPE_STEP=FIX_SCOPE, COMMIT_STEP=v["FIX_COMMIT_STEP"], DOING="fixing")
+    return v
+
+
+def blocked_line(text):
+    """The implementer's own "BLOCKED: <why>" line (one that starts with it; the last), or "";
+    the prompt's words that name it are not one, nor a line of the ticket or findings
+    when the output echoes the prompt (only what comes after its last <<<END_ block counts)."""
+    text = (text or "").rsplit("<<<END_", 1)[-1]
+    said = [l.strip().lstrip(">*_#`- ").strip() for l in text.splitlines()
+            if l.lstrip(" \t>*_#`-").startswith(BLOCKED_HEAD)]
+    said = [l for l in said if len(l) > len(BLOCKED_HEAD) + 2]
+    return said[-1][len(BLOCKED_HEAD):].strip(" `*_") if said else ""
+
+
+def said_blocked(ctx, st, out):
+    """True when the agent ended with BLOCKED: <why>: the ticket is blocked for the owner
+    with that reason, and nothing retries it (no_go_on)."""
+    why = blocked_line(read(out)) if out else ""
+    if not why:
+        return False
+    key = st["key"]
+    how = (f"answer it (harness queue answer {key} \"...\" makes the plan again with it), fix it by hand, "
+           f"or drop it (harness queue remove {key})")
+    st["packet"] = packet(st, "blocked by the agent", clip(" ".join(why.split()), 300),
+                          f"answer it: harness queue answer {key} \"...\"")
+    block(ctx, st, f"the {st['stage']} agent says it cannot be done as planned: {clip(' '.join(why.split()), 300)}",
+          no_go_on=f"the agent said it cannot be done as planned; {how}")
+    return True
+
+
 def stage_implement(ctx, st):
-    rc, _, _ = agent_or_kept(ctx, st, "implement", lambda: render("implement", **common(ctx, st)))
+    rc, out, _ = agent_or_kept(ctx, st, "implement", lambda: render("implement", **implement_words(ctx, st)))
+    if said_blocked(ctx, st, out):
+        return
     if verify_change(ctx, st, rc, "implement"):
+        for k in ("fix_rounds", "fix_said", "open_opinions", "packet", "requoted"):   # a new change: a new loop
+            st.pop(k, None)
         advance(ctx, st, next_stage(st, "implement"))
 
 
@@ -4007,13 +4273,56 @@ def stage_review(ctx, st):
         return fail(ctx, st, rc, problems)
     ctx.q.log(st["key"], f"review: {len(must)} must-fix item(s)", "\n".join("- " + m for m in must))
     change, broke = review_changed(ctx, st, dirty)
-    must = [f"the review stage's own change fails a check: {b}" for b in broke] + must
+    must = [f"[exec] the review stage's own change fails a check: {b}" for b in broke] + must
+    rounds = int(st.get("fix_rounds") or 0)
+    plan = read(plan_copy(ctx.q, st["key"]))
+    crit = plan_criteria(check_plan(plan)[1]) if plan.strip() else []
+    verdicts = quote_checked(review_verdicts(text), crit, change[1] if change else "") if crit else []
+    missed = [v for v in verdicts if v.get("miss")]
+    if missed and st.get("requoted") != rounds and st["attempt"] < ctx.retries:
+        st["requoted"] = rounds   # once a round: then a quote not in the diff is an unmet criterion
+        return fail(ctx, st, rc, [f"{v['id']} PASS: the quote is not in a line the change adds: \"{v['quote'][:160]}\"; "
+                                  "quote a line the diff adds, or write FAIL or UNKNOWN" for v in missed])
+    summary = review_summary(verdicts, must)
+    rows = st.get("review_verdicts") or []
+    prev = rows[-1].get("summary") if rows and rounds > 0 else None
+    decision, why = review_decision(rounds, summary, prev)
+    # state.json's "review_verdicts": one entry per review round, verify_change's last
+    # verdict beside it (shadow: agreement measured, harness queue stats):
+    # {"at", "round": fix rounds before it, "sha", "criteria": [{"id", "verdict", "quote", "why"
+    #  (, "said": "PASS", "miss": true when its quote was not in the diff)}], "summary": {"exec": [items],
+    #  "opinion": [items], "fail": [ids], "unknown": [ids], "pass": [ids]}, "decision", "why",
+    #  "verify": {"stage", "sha", "passed", "failed": [n]} or None}
+    rows.append({"at": now_iso(), "round": rounds, "sha": (change[0] or "") if change else "", "criteria": verdicts,
+                 "summary": summary, "decision": decision, "why": why, "verify": st.get("verify_record")})
+    st["review_verdicts"] = rows[-VERDICTS_KEPT:]
+    ctx.q.log(st["key"], f"review round {rounds}: {decision}" + (f" ({why})" if why else "")
+              + (f"; criteria: {', '.join(v['id'] + ' ' + v['verdict'] for v in verdicts)}" if verdicts else ""))
+    if rounds > 0:   # what the last fix round said about the items it left as they were
+        said = fix_notes(st, change, note_paths(ctx.vault, st["key"])["fix"]) if change else ""
+        if said.strip():
+            st["fix_said"] = cap(said.strip(), 2000)
+    if rounds > 0 and decision == "fix":   # opinion items had their round: this one is for the evidence
+        must = summary["exec"]
+    unmet = [v for v in verdicts if v["verdict"] != "PASS" and not any(v["id"] in m for m in must)]
+    must = must + [f"{v['id']}: {v['verdict']} in the review: {v['why'] or 'no line of the change meets it'}"
+                   for v in unmet] if decision != "push" else must
     st.pop("must_fix_by", None)   # the review's items now, not the owner's
     st.pop("review_pending", None)
     st.update(must_fix=must[:MUST_FIX_MAX], review_sha=(change[0] or "") if change else "",
               review_digest=digest(change[1]) if change else "", fix_from=marks_of(change))
     new_round(ctx, st)
     after = next_stage(st, "review")
+    if decision == "packet":
+        key = st["key"]
+        st["packet"] = packet(st, why, "Push it as it is, or fix the open items yourself?",
+                              f"fix them: harness queue fix {key} --item \"...\"; or push as it is: "
+                              f"harness queue retry {key} --stage {after or 'review'}")
+        return block(ctx, st, f"the review still finds open items: {why} ({path})",
+                     no_go_on=f"the loop stopped at its cap or without progress: {why}")
+    if decision == "push" and rounds > 0:
+        st["open_opinions"] = summary["opinion"][:MUST_FIX_MAX]
+        return advance(ctx, st, after, reason=why if not after else "")
     if not must or "fix" in stages_of(st):
         return advance(ctx, st, "fix" if must else after)
     found = f"the review found {len(must)} must-fix item(s) ({path}); fix is not in this ticket's stages"
@@ -4071,7 +4380,7 @@ def by_owner(st):
     return st.get("must_fix_by") == "owner"
 
 
-# fix.md's words for whose Must fix items they are: (what is fixed, the items' block, step 1);
+# a fix round's words in implement.md (implement_words), for whose Must fix items they are: (what is fixed, the items' block, step 1);
 # {why_in}: the commit message on one branch, else the fix notes file (nothing may be committed)
 FIX_WORDS = {
     False: ("the problems a review found in the change for ticket {key}. Nobody is watching: fix them all, then {then}.",
@@ -4101,17 +4410,14 @@ def stage_fix(ctx, st):
         st.update(review_sha=change[0] or "", review_digest=digest(change[1]), fix_from=marks_of(change))
         new_round(ctx, st)
         ctx.q.save(st)   # before the agent: a run that dies after it must not take its work as the reviewed
-    v = common(ctx, st)
-    what, items, step = FIX_WORDS[by_owner(st)]
-    one = lands(ctx, st) == ([(".", branch_of(st))], [])   # one branch: why goes in the commit message
-    v.update(FIX_WHAT=what.format(key=st["key"], then="commit" if one else "finish as step 4 says"),
-             MUST_FIX_FROM=items.format(review=v["REVIEW_FILE"]),
-             FIX_ITEMS_STEP=step.format(why_in="the commit message" if one else
-                                        agent_path(ctx, note_paths(ctx.vault, st["key"])["fix"])))
-    v["MUST_FIX"] = cap("\n".join("- " + m for m in st.get("must_fix", [])), MUST_FIX_CAP)
-    rc, _, _ = agent_or_kept(ctx, st, "fix", lambda: render("fix", **v))
+    rc, out, _ = agent_or_kept(ctx, st, "fix", lambda: render("implement", **implement_words(ctx, st, fix=True)))
+    if said_blocked(ctx, st, out):
+        return
     if verify_change(ctx, st, rc, "fix"):
-        advance(ctx, st, next_stage(st, "fix"))
+        if by_owner(st) or "review" not in stages_of(st):   # the owner's comments: done is done, as before
+            return advance(ctx, st, next_stage(st, "fix"))
+        st["fix_rounds"] = int(st.get("fix_rounds") or 0) + 1
+        advance(ctx, st, "review")   # the review looks again: review_decision says whether there is another round
 
 
 def stage_push(ctx, st):
@@ -4378,7 +4684,10 @@ def result_note(ctx, st):
     lines += [f"- `{c['sha'][:12]}` {c['subject']}" for c in st["commits"]] or ["(none)"]
     lines += ["", "## Diffstat", "", f"{stat['files']} file(s), +{stat['insertions']} -{stat['deletions']}",
               "", "## Review notes", ""]
-    notes = [f"- must fix (asked by the {'owner' if by_owner(st) else 'review'}): {m}" for m in st.get("must_fix") or []]
+    left = st.get("open_opinions") or []
+    notes = [f"- must fix (asked by the {'owner' if by_owner(st) else 'review'}): {m}" for m in st.get("must_fix") or []
+             if m not in left]
+    notes += [f"- left open (the review's opinion, after the fix rounds): {m}" for m in left]
     notes += [f"- warning: {w}" for w in st.get("warnings") or []]
     if os.path.exists(p["review"]):
         notes.append(f"- the review: [[{key}-review]]")
@@ -4396,6 +4705,12 @@ def record(st, result, details=()):
     h = st.setdefault("history", [])
     h.append({"at": now_iso(), "stage": st.get("stage", ""), "attempt": st.get("attempt", 0) + 1,
               "result": result, "details": [str(d)[:400] for d in list(details)[:20]]})
+    # the attempt's calls (call_note): "start" and "prompt" (sha256[:12]) of its agent launch,
+    # "round" (review-driven fix rounds before it), "verifier": [{prompt, start, end, outcome}];
+    # "at" is its end, "result" its outcome
+    call = st.pop("call", None)
+    if isinstance(call, dict) and call.get("stage") == h[-1]["stage"]:
+        h[-1].update({k: call[k] for k in ("start", "prompt", "round", "verifier") if k in call})
     del h[:-HISTORY_CAP]
 
 
@@ -5462,6 +5777,7 @@ def cmd_edit(q, a):
                 now.pop(k, None)
                 if v:
                     now[k] = True
+            owner_did(now, "edit")
             q.save(now)
         q.log(key, f"edited: {described(now)}", echo=False)
         print(f"[queue] {key}: changed ({described(now)})"
@@ -5509,6 +5825,7 @@ def cmd_edit(q, a):
         if got["lost"].get(key) and not ns.no_branch:
             print(f"[queue] {lost_why(now, got['lost'][key])}", file=sys.stderr)
             return 1
+        owner_did(now, "edit")
         q.save(now)
     q.log(key, f"edited: {described(now)} (was: {before})", echo=False)
     print(f"[queue] {key}: changed ({described(now)})")
@@ -5637,6 +5954,11 @@ def cmd_remove(q, a):
                 rc = 1
                 continue
             order = [k for k in order if k != key]
+            if st:   # its numbers stay for harness queue stats; the owner's drop is its last action
+                owner_did(st, "remove")
+                kept = read_json(os.path.join(q.root, "removed.json"), [])
+                kept = (kept if isinstance(kept, list) else []) + [ticket_stats(st)]
+                write_atomic(os.path.join(q.root, "removed.json"), json.dumps(kept[-OWNER_ACTIONS_MAX:], indent=1))
             # out of the way at once; the slow delete (a clone's files) after the lock
             gone = os.path.join(q.root, f".trash-{key}-{int(time.time() * 1000)}")
             try:
@@ -5680,10 +6002,20 @@ def removed_note(q, st, order):
 RESULTS = ("push", "compare_url", "commits", "diffstat", "folder_branch_now", "launch_fails", "agent")
 
 
-def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
+def owner_did(st, action):
+    """The owner's action on the ticket (harness queue answer, fix, continue, retry, edit, approve;
+    serve runs the same commands), for harness queue stats: state.json's "owner_actions",
+    [{"action": "retry", "at": "<iso time>"}]."""
+    acts = st.setdefault("owner_actions", [])
+    acts.append({"action": action, "at": now_iso()})
+    del acts[:-OWNER_ACTIONS_MAX]
+
+
+def requeue(q, key, want, stage=None, fresh=False, go_on=False, action="", **extra):
     """Under queue.lock: the ticket queued again (at stage), counters and the last
     go's outcome cleared; fresh (or from the plan): its work too, made again by the run.
-    go_on (harness queue continue): its stage goes on from the work as it is."""
+    go_on (harness queue continue): its stage goes on from the work as it is.
+    action: the owner's command, noted (owner_did)."""
     st = q.load(key.upper())
     if not st:
         print(f"[queue] {key} is not in the queue", file=sys.stderr)
@@ -5696,8 +6028,10 @@ def requeue(q, key, want, stage=None, fresh=False, go_on=False, **extra):
         return None
     st.update(status="queued", attempt=0, feedback="", reason="", requeued=now_iso(), **extra)
     for k in ("stopped_from", "blocked_failed", "no_go_on", "continued", "debugged", "went_on", "debug_cut",
-              "debug_again"):
+              "debug_again", "packet", "open_opinions"):
         st.pop(k, None)
+    if action:
+        owner_did(st, action)
     st.pop("resume", None)   # a cut-off stage goes on only when continued (the caller sets it again)
     for k in RESULTS:
         st.pop(k, None)
@@ -5757,7 +6091,7 @@ def commits_since_base(q, st):
 
 def cmd_approve(q, a):
     with held(os.path.join(q.root, "queue.lock")):
-        st = requeue(q, a.key, ("plan-review",), plan_approved=True, plan_hold=False)
+        st = requeue(q, a.key, ("plan-review",), action="approve", plan_approved=True, plan_hold=False)
     if st:
         print(f"[queue] {st['key']}: plan approved; the queue run implements it when it gets to it")
     return 0 if st else 1
@@ -5901,7 +6235,7 @@ def cmd_retry(q, a):
                                         if held_st.get("status") == "running" else finishing(held_st)),
                   file=sys.stderr)
             return 1
-        st = requeue(q, key, RETRYABLE + ("running",) + (("queued", "plan-review") if a.stage else ()),
+        st = requeue(q, key, RETRYABLE + ("running",) + (("queued", "plan-review") if a.stage else ()), action="retry",
                      stage=stage, **extra)
     if st:
         kept = isinstance(st.get("verify_only"), dict) and st["verify_only"].get("stage") == st["stage"]
@@ -5979,7 +6313,7 @@ def cmd_continue(q, a):
         # (a queued one continued already keeps what its block was)
         failed = st.get("blocked_failed") if st["status"] == "blocked" else (st.get("resume") or {}).get("failed")
         attempt, went = st.get("attempt", 0), st.get("went_on")
-        st = requeue(q, key, CONTINUABLE, go_on=True)
+        st = requeue(q, key, CONTINUABLE, go_on=True, action="continue")
         if not st:
             return 1
         st.update(attempt=attempt, continued=st["stage"])
@@ -6219,6 +6553,93 @@ def slot_runs(q, all_files=False):
     return sorted(out, key=lambda i: i["slot"])
 
 
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def iso_secs(t):
+    try:
+        return datetime.datetime.fromisoformat(str(t).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def ticket_stats(st):
+    """One ticket's numbers for harness queue stats, from its state alone: review rounds,
+    blocks (and why), the owner's actions and their span, wall time (created to its last
+    record), and how the review's verdict (review_verdicts) agrees with verify_change's."""
+    hist = [h for h in st.get("history") or [] if isinstance(h, dict)]
+    rows = [r for r in st.get("review_verdicts") or [] if isinstance(r, dict)]
+    acts = [x for x in st.get("owner_actions") or [] if isinstance(x, dict)]
+    blocks = [(h.get("details") or [""])[0][:200] for h in hist if h.get("result") == "blocked"]
+    times = [t for t in (iso_secs(x) for x in [st.get("created")] + [h.get("at") for h in hist]) if t is not None]
+    span = [t for t in (iso_secs(x.get("at")) for x in acts) if t is not None]
+    agree = {"rounds": 0, "same": 0, "criteria": 0, "criteria_same": 0}
+    for r in rows:
+        v = r.get("verify")
+        if not isinstance(v, dict) or (v.get("sha") and r.get("sha") and v["sha"] != r["sha"]):
+            continue   # verify_change judged another commit: not the same change
+        sm = r.get("summary") or {}
+        agree["rounds"] += 1
+        agree["same"] += (not (sm.get("fail") or sm.get("unknown") or sm.get("exec"))) == bool(v.get("passed"))
+        failed = set(v.get("failed") or [])
+        for c in r.get("criteria") or []:
+            m = re.match(r"AC(\d+)$", str(c.get("id", "")))
+            if m:
+                agree["criteria"] += 1
+                agree["criteria_same"] += (c.get("verdict") == "PASS") == (int(m.group(1)) not in failed)
+    return {"key": st.get("key", ""), "status": st.get("status", ""), "stage": st.get("stage", ""),
+            "reviews": len(rows), "fix_rounds": max([int(r.get("round") or 0) for r in rows] or [0]),
+            "attempts": len(hist), "blocks": len(blocks), "block_reasons": blocks,
+            "owner_actions": len(acts), "owner_span_s": round(max(span) - min(span)) if len(span) > 1 else 0,
+            "wall_s": round(max(times) - min(times)) if len(times) > 1 else 0, "agreement": agree,
+            "packet": bool(st.get("packet"))}
+
+
+def cmd_stats(q, a):
+    """harness queue stats [--json]: per ticket and in totals, from each state.json
+    (and removed.json for the tickets removed since)."""
+    order = q.order()
+    seen = [st for st in (q.load(k) for k in order + [k for k in q.archived() if k not in order])
+            if isinstance(st, dict)]
+    per = [ticket_stats(st) for st in seen]
+    gone = read_json(os.path.join(q.root, "removed.json"), [])
+    gone = [g for g in gone if isinstance(g, dict)] if isinstance(gone, list) else []
+    rows = per + gone
+    tot = {"tickets": len(rows), "removed": len(gone)}
+    for f in ("reviews", "fix_rounds", "attempts", "blocks", "owner_actions", "wall_s"):
+        tot[f] = sum(int(r.get(f) or 0) for r in rows)
+    tot["packets"] = sum(1 for r in rows if r.get("packet"))
+    tot["agreement"] = {f: sum(int((r.get("agreement") or {}).get(f) or 0) for r in rows)
+                        for f in ("rounds", "same", "criteria", "criteria_same")}
+    reasons = collections.Counter(re.sub(r"\s*\(.*$", "", b)[:80] for r in rows for b in r.get("block_reasons") or [])
+    tot["block_reasons"] = dict(reasons.most_common(10))
+    if a.json:
+        print(json.dumps({"tickets": per, "removed": gone, "totals": tot}, indent=2))
+        return 0
+    def hm(sec):
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m"
+    def pct(n, d):
+        return f"{n}/{d}" + (f" ({round(100 * n / d)}%)" if d else "")
+    for r in per:
+        g = r["agreement"]
+        print(f"{r['key']:<14} {r['status']:<11} reviews {r['reviews']}, fix rounds {r['fix_rounds']}, "
+              f"blocks {r['blocks']}, owner actions {r['owner_actions']} over {hm(r['owner_span_s'])}, "
+              f"wall {hm(r['wall_s'])}, review agrees with verify {pct(g['same'], g['rounds'])}")
+    g = tot["agreement"]
+    print(f"totals: {tot['tickets']} ticket(s) ({tot['removed']} removed), {tot['reviews']} review(s), "
+          f"{tot['fix_rounds']} fix round(s), {tot['blocks']} block(s), {tot['packets']} decision packet(s), "
+          f"{tot['owner_actions']} owner action(s), wall {hm(tot['wall_s'])}")
+    print(f"review vs verify_change: rounds {pct(g['same'], g['rounds'])}, criteria {pct(g['criteria_same'], g['criteria'])}")
+    for why, n in tot["block_reasons"].items():
+        print(f"  blocked {n}x: {why}")
+    return 0
+
+
 def cmd_status(q, a):
     r = runner(q)
     if a.json:
@@ -6284,7 +6705,7 @@ def cmd_answer(q, a):
     # Answers or feedback: the plan made with them comes back to be agreed before
     # anything is built (--go: the owner took the defaults and wants it to go on: approved).
     with held(os.path.join(q.root, "queue.lock")):   # the run takes a queued ticket under it
-        st = requeue(q, key, allowed, stage="plan" if planned else None, plan_approved=planned and bool(a.go),
+        st = requeue(q, key, allowed, stage="plan" if planned else None, action="answer", plan_approved=planned and bool(a.go),
                      plan_hold=planned and not a.go)
     if st:
         if not planned:
@@ -6367,7 +6788,7 @@ def cmd_followup(q, a):
         write_atomic(p["answers"], (old.rstrip() + "\n" if old.strip() else "") + f"\n<!-- {now_iso()} -->\n"
                      f"{FOLLOW_UP_HEAD} (round {n + 1}, after round {n} was built; it wins over the ticket and the "
                      f"plans before it):\n\n{text.strip()}\n")
-        st = requeue(q, key, ("done",), stage="plan", rounds=rounds, built_on=True, plan_hold=True,
+        st = requeue(q, key, ("done",), stage="plan", action="followup", rounds=rounds, built_on=True, plan_hold=True,
                      plan_approved=False)
         if st:   # the review and checks of the last round are not this one's
             for k in ("sha", "review_sha", "review_digest", "review_pending", "fix_from", "must_fix", "must_fix_by", "warnings", "questions",
@@ -6508,7 +6929,7 @@ def cmd_fix(q, a):
             return 1
         extra = {} if "fix" in stages_of(st) else {"stages": [s for s in ALL_STAGES if s in stages_of(st) or s == "fix"]}
         sent = (st.get("owner_reviews") or [])[-(HISTORY_CAP - 1):] + [{"at": now_iso(), "items": items}]
-        st = requeue(q, key, OWNER_FIXABLE, stage="fix", must_fix=items, must_fix_by="owner", owner_reviews=sent,
+        st = requeue(q, key, OWNER_FIXABLE, stage="fix", action="fix", must_fix=items, must_fix_by="owner", owner_reviews=sent,
                      review_sha="", review_digest="", review_pending=True, **extra)
     if st:
         then = next_stage(st, "fix")
@@ -6614,6 +7035,7 @@ def main(argv):
     s.add_argument("--take-defaults", action="store_true")
     sub.add_parser("list")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("stats"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("remove"); s.add_argument("keys", nargs="+"); s.add_argument("--harness", default="")
     s = sub.add_parser("approve"); s.add_argument("key")
     s = sub.add_parser("retry"); s.add_argument("key"); s.add_argument("--stage", choices=ALL_STAGES)
@@ -6662,7 +7084,7 @@ def main(argv):
     a.argv = argv
     q = Queue(a.state)
     try:
-        return {"add": cmd_add, "edit": cmd_edit, "list": cmd_list, "status": cmd_status, "remove": cmd_remove,
+        return {"add": cmd_add, "edit": cmd_edit, "list": cmd_list, "status": cmd_status, "stats": cmd_stats, "remove": cmd_remove,
             "approve": cmd_approve, "retry": cmd_retry, "continue": cmd_continue, "stop": cmd_stop, "halt": cmd_halt, "move": cmd_move, "note": cmd_note,
             "archive": cmd_archive, "unarchive": cmd_unarchive,
             "answer": cmd_answer, "followup": cmd_followup, "fix": cmd_fix, "findings": cmd_findings, "run": cmd_run}[a.cmd](q, a)

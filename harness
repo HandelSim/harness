@@ -7132,6 +7132,9 @@ cmd_queue() {
 usage: harness queue [list]                 the queue: each ticket's status and stage
        harness queue status [--json]        the same, and whether a run is going and
                                             on what (--json: run.json and every state)
+       harness queue stats [--json]         per ticket and in all: review and fix rounds,
+                                            blocks and why, your actions, wall time, and
+                                            how often the review agrees with the verifier
        harness queue add KEY... [--dir PROJECT] [--base REF] [--stages LIST]
                                 [--start REF|here] [--branch NAME | --no-branch]
                                 [--repo-branch REL[=BRANCH][:TARGET]]...
@@ -7515,8 +7518,8 @@ HELP
                 --force) args+=(halt --force --harness "$clone_dir/harness") ;;
                 *) err "usage: harness queue halt [--force]"; return 1 ;;
             esac ;;
-        status) [[ $# -eq 0 || "$*" == --json ]] || { err "usage: harness queue status [--json]"; return 1; }
-            args+=(status "$@") ;;
+        status|stats) [[ $# -eq 0 || "$*" == --json ]] || { err "usage: harness queue $sub [--json]"; return 1; }
+            args+=("$sub" "$@") ;;
         move) if [[ $# -eq 3 && "$2" == --before ]]; then
                 args+=(move "$1" --before "$3")
             elif [[ $# -eq 2 ]]; then
@@ -8834,6 +8837,9 @@ HELP
     harness_oai=""
     _oai_configured && harness_oai=oai
     # The proxy is up with its own copy of the key; neither server needs it.
+    # The Jira token goes to pub.py alone, for the queue page's Jira panel
+    # (serve/jira_view.py takes it out of pub.py's environment at once).
+    local serve_tracker_token="${TRACKER_TOKEN:-}"
     unset "${_harness_secret_vars[@]}"
     # Agents opencode web starts commit like `harness host` ones: unsigned.
     harness_git_nosign_env
@@ -8872,7 +8878,7 @@ HELP
     ) >"$logdir/opencode.log" 2>&1 &
     oc_pid=$!
     # shellcheck disable=SC2086  # host_python_bin may be the two words 'py -3'
-    $(host_python_bin) "$clone_dir/serve/pub.py" --port "$port" \
+    TRACKER_TOKEN="$serve_tracker_token" $(host_python_bin) "$clone_dir/serve/pub.py" --port "$port" \
         --opencode-port "$oc_port" "${pub_args[@]}" \
         ${allow_hosts[@]+"${allow_hosts[@]}"} 2>"$logdir/pub.log" &
     pub_pid=$!

@@ -15,7 +15,7 @@
 #                              the sourced harness, the internal _sync/_pull
 #                              doing nothing without a vault, run and answer
 #                              refusing without one; the owner's controls
-#                              (status --json, note, move, stop, continue, retry --stage,
+#                              (status --json, stats, note, move, stop, continue, retry --stage,
 #                              halt, add --stages/--ref/--note) passed through
 #
 # Prints "QUEUE TEST PASSED" on success.
@@ -147,8 +147,18 @@ if cmd_queue retry ABC-1 --stage 2>/dev/null; then fail "Q5: retry --stage witho
 grep -q 'no queue run is going' < <(cmd_queue halt) || fail "Q5: halt with no run should say so"
 grep -q 'no queue run is going' < <(cmd_queue halt --force) || fail "Q5: halt --force with no run should say so"
 cmd_queue halt --now >/dev/null 2>&1 && fail "Q5: halt takes only --force"
+[[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["owner_actions"][-1]["action"])' "$state_root/queue/ABC-1/state.json")" == retry ]] \
+    || fail "Q5: retry should be in owner_actions"
+out=$(cmd_queue stats --json)
+[[ "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["tickets"]), d["totals"]["owner_actions"] > 0)' <<<"$out")" == "2 True" ]] \
+    || fail "Q5: stats --json — $out"
+gone=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["removed"])' <<<"$out")
+grep -q '^totals: ' < <(cmd_queue stats) || fail "Q5: stats should print totals"
+if cmd_queue stats --frob 2>/dev/null; then fail "Q5: stats with an unknown option accepted"; fi
 cmd_queue remove ABC-1 ABC-2 >/dev/null
-ok "Q5: status --json, note, move, stop, continue, retry --stage, halt [--force], add --stages/--ref/--note/--start/--branch/--in-place/--review-plan"
+[[ "$(cmd_queue stats --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["removed"])')" == "$((gone + 2))" ]] \
+    || fail "Q5: removed tickets should stay in stats"
+ok "Q5: status --json, stats [--json], note, move, stop, continue, retry --stage, halt [--force], add --stages/--ref/--note/--start/--branch/--in-place/--review-plan"
 
 # --- Q6: run's launch setup, with everything around it stubbed ---------------
 # A container run answers the firewall question once (stages have no tty) and
@@ -175,6 +185,7 @@ q6() {
         harness_view() { :; }; harness_view_since() { :; }; host_proxy_port() { echo 1; }
         _effective_default_model() { echo m; }; host_require_python3() { :; }
         host_python_bin() { echo "$STUB_PY"; }
+        require_docker() { :; }; ensure_agent_image() { return 0; }; ensure_services_up() { return 0; }   # no docker here
         unset HARNESS_NET_CONFIRM
         cmd_queue run "$@"
     )

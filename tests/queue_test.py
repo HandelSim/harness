@@ -141,6 +141,9 @@ if stage == "planning":
     qs = "- [blocking] Which colour? Default: blue\n" if blocking else "- None\n"
     crit = os.environ.get("FAKE_CRITERIA", "- AC1: GIVEN the project WHEN the change is in THEN a file feature.txt says "
                           "hello feature (ticket: \"add a feature file\")\n")
+    if not os.environ.get("FAKE_RAW_CRITERIA"):   # a spec's criteria each say how they are checked
+        crit = re.sub(r"(?m)^(- AC\d+:.*?)[ \t]*$", lambda m: m.group(1) if "[check:" in m.group(1)
+                      else m.group(1) + " [check: test]", crit)
     plan = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n" + crit +
             "## Approach\nWrite feature.txt.\n## Files\n- feature.txt: new\n## Questions\n" + qs +
             "## Assumptions\n- None\n")
@@ -166,6 +169,9 @@ elif stage == "testing":   # the test stage: a test file committed; FAKE_NO_FRAM
                                        + os.environ.get("FAKE_TEST_MORE", ""))
     git("add", "test_feature.py")
     git("commit", "-q", "-m", "ABC-1: tests")
+elif stage in ("implementing", "fixing") and os.environ.get("FAKE_BLOCKED") == stage:   # it cannot be done
+    print("Looked at it.\nBLOCKED: the API the plan calls does not exist")
+    sys.exit(0)
 elif stage in ("implementing", "fixing"):
     once = os.environ["FAKE_CALLS"] + ".nocommit"   # FAKE_NO_COMMIT_ONCE: the first implementing commits nothing
     if os.environ.get("FAKE_NO_COMMIT_ONCE") and stage == "implementing" and not os.path.exists(once):
@@ -221,8 +227,12 @@ elif stage in ("implementing", "fixing"):
     with open(path("append one bullet to"), "a") as f:
         f.write("- other.py:3: an unrelated bug (seen while " + stage + " ABC-1)\n")
 elif stage == "reviewing":
-    must = "- feature.txt:1: say it twice\n" if os.environ.get("FAKE_MUSTFIX") else "- None\n"
-    open(path("Write the review to"), "w").write("# ABC-1 review\n## Must fix\n" + must + "## Notes\n- None\n")
+    fixed = "+fixed by review" in prompt and os.environ.get("FAKE_MUSTFIX") != "always"   # the fix round did it
+    must = "- feature.txt:1: say it twice\n" if os.environ.get("FAKE_MUSTFIX") and not fixed else "- None\n"
+    crit = os.environ.get("FAKE_VERDICTS", "")   # the review's ## Criteria lines
+    must = "- [exec] feature.txt:1: `make check` fails\n" if os.environ.get("FAKE_MUSTFIX") == "exec" else must
+    open(path("Write the review to"), "w").write("# ABC-1 review\n" + ("## Criteria\n" + crit if crit else "")
+                                                 + "## Must fix\n" + must + "## Notes\n- None\n")
 if os.environ.get("FAKE_HANG_AFTER") and os.environ.get("FAKE_HANG_STAGE", stage) == stage:
     import time   # its work done, the agent does not exit
     open(os.environ["FAKE_CALLS"] + ".hanging", "a").write(stage + "\n")
@@ -417,13 +427,14 @@ class QueueTest(Base):
         self.assertEqual(rc, 0, out)
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("done", "done"), out)
-        # Every stage ran once, the fix because the review had a Must fix item.
+        # Every stage ran once, the fix because the review had a Must fix item; then the
+        # review again, on the fixed change (it found nothing more)
         for stage in ("planning", "implementing", "reviewing", "fixing"):
-            self.assertEqual(len(self.calls_of(stage)), 1, stage)
+            self.assertEqual(len(self.calls_of(stage)), 2 if stage == "reviewing" else 1, stage)
         # Each stage's task card (HARNESS_TASK_CARD, which harness sends the proxy):
         # the stage, the branch, and done in the words of the stage's checks.
         cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines()]
-        self.assertEqual([c["stage"] for c in cards], ["plan", "implement", "review", "fix"])
+        self.assertEqual([c["stage"] for c in cards], ["plan", "implement", "review", "fix", "review"])
         self.assertTrue(all(c["branch"] == "ABC-1" and c["attempt"] == 1 and "clone" in c["where"] for c in cards), cards)
         plan_file = os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-plan.md")
         self.assertIn(f"no code changed, the plan written to {plan_file}: # ABC-1 plan", cards[0]["done"])
@@ -432,7 +443,7 @@ class QueueTest(Base):
         self.assertEqual((cards[3]["must_fix"], "must_fix" in cards[2]), (1, False))
         # Each card carries its stage's lines from stage-guidance.json, as the "do" list.
         guide = tq.stage_guidance()
-        self.assertEqual([c.get("do") for c in cards], [guide[s] for s in ("plan", "implement", "review", "fix")])
+        self.assertEqual([c.get("do") for c in cards], [guide[s] for s in ("plan", "implement", "review", "fix", "review")])
         self.assertTrue(cards[0]["do"][0].startswith("This stage: PLAN"))
         # The plan's items are kept for the viewer and a later tester: in the state and plan.json.
         self.assertEqual([(c["id"], c["edge"]) for c in st["criteria"]], [("AC1", False)])
@@ -456,7 +467,7 @@ class QueueTest(Base):
         self.assertEqual(sh("git", "-C", os.path.join(self.state, "ABC-1", "repo"), "remote"), "")
         # Each stage's session was captured, then the outcome; the ticket was pulled first.
         self.assertEqual(self.calls_of("queue _pull"), ["queue _pull"])
-        self.assertEqual(len(self.calls_of("queue _sync")), 5)
+        self.assertEqual(len(self.calls_of("queue _sync")), 6)   # plan, implement, review, fix, review, outcome
         # The queue's log, verdicts and outcome included, is in the vault.
         vlog = cat(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-log.md"))
         self.assertTrue(vlog.startswith("---\ntype: note\nticket: ABC-1\n"), vlog[:80])
@@ -1370,7 +1381,8 @@ class QueueTest(Base):
         self.assertTrue(any("Acceptance criteria" in p for p in problems))
         # Only Goal and Acceptance criteria are needed.
         self.assertEqual(tq.check_plan("## Goal\nx\n## Acceptance criteria\n- y\n")[0], [])
-        self.assertTrue(any("Steps" in n for n in tq.plan_notes("## Goal\nx\n## Acceptance criteria\n- y\n")))
+        self.assertTrue(any("Questions" in n for n in tq.plan_notes("## Goal\nx\n## Acceptance criteria\n- y\n")))
+        self.assertFalse(any("Steps" in n for n in tq.plan_notes("## Goal\nx\n## Acceptance criteria\n- y\n")))
         self.assertEqual(tq.check_plan("")[0], ["the plan file was not written"])
 
     def test_secrets_and_scope(self):
@@ -1397,11 +1409,19 @@ class QueueTest(Base):
         st = {"key": "ABC-1", "base_sha": "abc", "feedback": ""}
         ctx = type("C", (), {"vault": self.vault, "q": tq.Queue(self.state)})()
         v = tq.common(ctx, st)
-        fix = [dict(FIX_WHAT=w.format(key="ABC-1", then="commit"), MUST_FIX_FROM=f.format(review="r"),
-                    FIX_ITEMS_STEP=s.format(why_in="the commit message"))
-               for w, f, s in tq.FIX_WORDS.values()]   # a review's Must fix items, and the owner's comments
-        for name, more in [(n, {}) for n in ("plan", "test", "implement", "review")] + [("fix", x) for x in fix]:
-            text = tq.render(name, DIFF="d", MUST_FIX="m", **v, **more)
+        words = []   # implement.md: the first round, a review's findings, and the owner's comments
+        for owner in (False, True):
+            fst = dict(st, must_fix=["a.py:1: x"], fix_said="- left it", **({"must_fix_by": "owner"} if owner else {}))
+            ctx.retries = 2
+            with mock.patch.object(tq, "lands", return_value=([(".", "b")], [])), \
+                    mock.patch.object(tq, "branch_of", return_value="b"):
+                words += [tq.implement_words(ctx, dict(st)), tq.implement_words(ctx, fst, fix=True)]
+        self.assertIn("fixing", words[1]["INTRO"])
+        self.assertIn("left it", words[1]["FINDINGS"])
+        self.assertNotIn("left it", words[3]["FINDINGS"])   # the owner's comments: not the review's round
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(tq.__file__), "queue_prompts", "fix.md")))
+        for name, more in [(n, {}) for n in ("plan", "test", "review")] + [("implement", w) for w in words]:
+            text = tq.render(name, DIFF="d", MUST_FIX="m", **{**v, **more})
             self.assertNotIn("{{", text, name)
             self.assertLess(len(text), 120_000)
         for name, vals in (("verify_plan", dict(TICKET="t", PLAN="p", CRITERIA="AC1: c", ANSWERS="a")),
@@ -1456,6 +1476,68 @@ class ReviewFixesTest(Base):
         self.assertEqual(self.status()["status"], "done", out)
         prompt = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
         self.assertIn("Left as it is: feature.txt already says hello feature once", prompt)
+
+    def test_after_a_fix_the_review_runs_again(self):
+        os.environ.update(FAKE_MUSTFIX="1", FAKE_VERDICTS="- AC1: PASS | `hello feature` | it says it\n")
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(open(os.environ["FAKE_CALLS"]).read().count("reviewing"), 2)
+        rows = st["review_verdicts"]
+        self.assertEqual([(r["round"], r["decision"]) for r in rows], [(0, "fix"), (1, "push")])
+        self.assertEqual(rows[0]["criteria"][0]["verdict"], "PASS")   # its quote is in the diff
+        self.assertEqual(rows[0]["verify"]["stage"], "implement")     # verify_change's verdict beside it
+        self.assertIn("prompt", [h for h in st["history"] if h["stage"] == "implement"][-1])
+
+    def test_an_opinion_left_after_its_round_goes_to_the_result(self):
+        os.environ.update(FAKE_MUSTFIX="always")   # the same item each review: an opinion
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "done", out)
+        self.assertEqual(st["open_opinions"], ["feature.txt:1: say it twice"])
+        self.assertNotIn("packet", st)
+
+    def test_exec_items_with_no_progress_stop_with_a_packet(self):
+        os.environ.update(FAKE_MUSTFIX="exec")   # [exec], each review: no progress
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual(st["status"], "blocked", out)
+        self.assertIn("no progress", st["reason"])
+        p = st["packet"]
+        self.assertEqual(set(p), {"reason", "question", "default", "criteria", "rounds", "best_commit"})
+        self.assertEqual(len(p["rounds"]), 2)
+        self.assertTrue(st.get("no_go_on"))   # the owner decides; nothing retries it
+
+    def test_a_quote_not_in_the_diff_is_asked_again_then_unknown(self):
+        os.environ.update(FAKE_VERDICTS="- AC1: PASS | `a line nobody wrote` | sure\n")
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        review = open(os.environ["FAKE_CALLS"] + ".reviewing").read().split("\n=====\n")
+        self.assertNotIn("the quote is not in a line the change adds", review[0])
+        self.assertIn("the quote is not in a line the change adds", review[1])   # once more, the miss named
+        rows = st["review_verdicts"]
+        self.assertEqual((rows[0]["round"], rows[0]["criteria"][0]["verdict"], rows[0]["criteria"][0]["said"]),
+                         (0, "UNKNOWN", "PASS"))   # then it counts as unmet: a fix round for it
+        self.assertIn("AC1: UNKNOWN in the review", open(os.environ["FAKE_CALLS"] + ".fixing").read())
+        self.assertEqual((st["status"], rows[-1]["decision"]), ("blocked", "packet"), out)   # no progress after
+
+    def test_blocked_from_the_implementer_blocks_for_the_owner(self):
+        os.environ["FAKE_BLOCKED"] = "implementing"
+        self.add("ABC-1")
+        rc, out = self.run_queue()
+        st = self.status()
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "implement"), out)
+        self.assertIn("the API the plan calls does not exist", st["reason"])
+        self.assertEqual(open(os.environ["FAKE_CALLS"]).read().count("implementing"), 1)   # no retry
+        self.assertEqual(st["packet"]["question"], "the API the plan calls does not exist")
+        tq.Queue(self.state)
+        subprocess.run([sys.executable, tq.__file__, "--state", self.state, "retry", "ABC-1"], capture_output=True)
+        self.assertEqual(self.status()["owner_actions"][-1]["action"], "retry")
+        self.assertNotIn("packet", self.status())
 
     def test_run_lock_is_held_by_one_process(self):
         path = os.path.join(self.tmp, "run.lock")
@@ -2553,7 +2635,7 @@ class AuditFixesTest(Base):
         self.add("ABC-1")
         rc, out = self.run_queue()
         self.assertEqual(self.status()["status"], "done", out)
-        self.assertEqual(cat(self.calls + ".task").split(), ["ABC-1", "True"] * 4)   # plan, implement, review, fix
+        self.assertEqual(cat(self.calls + ".task").split(), ["ABC-1", "True"] * 5)   # plan, implement, review, fix, review
         self.assertFalse(os.path.exists(os.path.join(self.vault, "wiki", "notes", "tickets", "ABC-1-task.md")))
         # The agent was told where it is (the full prompt) and a copy in the branch is refused.
         self.assertIn("ABC-1-task.md", tq.check_change({"key": "ABC-1"}, ("x", "+a", ["notes/ABC-1-task.md"], 1), "")[0][0])
@@ -4008,7 +4090,7 @@ class NestedReposTest(Base):
         rc, out = self.run_queue()
         st = self.status()
         self.assertEqual((st["status"], st["stage"]), ("done", "done"), out + st.get("reason", ""))
-        self.assertIn("- " + "\n- ".join(must) + "\n<<<END_MUST_FIX>>>", cat(self.calls + ".fixing"))
+        self.assertIn("- " + "\n- ".join(must) + "\n<<<END_FINDINGS_TO_ADDRESS>>>", cat(self.calls + ".fixing"))
         check = [pr for _, _, pr in FakeProxy.seen if "check a code change" in pr][-1]
         self.assertIn('(owner) libA/agent.txt:1 (new) "the agent was here": say why', check)
         self.assertIn("libA/agent.txt", check.split("<<<BEGIN_DIFF")[1])
@@ -4535,7 +4617,7 @@ os.execv(sys.executable, real)
 '''
 
 STRAY_PLAN = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n- AC1: GIVEN the project WHEN the change "
-              "is in THEN a file feature.txt says hello feature (ticket: \"add a feature file\")\n## Approach\nWrite "
+              "is in THEN a file feature.txt says hello feature (ticket: \"add a feature file\") [check: test]\n## Approach\nWrite "
               "feature.txt.\n## Files\n- feature.txt: new\n## Questions\n- None\n## Assumptions\n- None\n")
 
 
@@ -4599,10 +4681,12 @@ class StrayCommitsTest(Base):
         self.add("ABC-1")
         rc, out = self.run_queue()
         st = self.status()
-        self.assertEqual((st["status"], st["push"]["result"]), ("done", "pushed"), out)
         self.assertEqual(len(self.calls_of("fixing")), 1)
-        self.assertIn("broken.py", cat(self.calls + ".fixing"))   # the broken check is a must-fix item
-        self.assertFalse([h for h in st["history"] if h["stage"] == "review" and h["result"] != "passed"])
+        self.assertIn("[exec] the review stage's own change fails a check", cat(self.calls + ".fixing"))
+        # the review after the fix breaks it again: [exec] once more, no progress, the owner decides
+        self.assertEqual((st["status"], st["stage"]), ("blocked", "review"), out)
+        self.assertIn("no progress", st["packet"]["reason"])
+        self.assertFalse(st.get("push"))
 
     def test_a_review_that_breaks_the_change_without_a_fix_stage_blocks_at_review(self):
         self.stray("reviewing|commit|broken.py|def broken(:\n")
@@ -4829,34 +4913,25 @@ class TestStageTest(Base):
     tests, with its prompts and cards as they were."""
     STAGES = "plan,test,implement,review,fix,push"
     CMD = "python3 -m unittest test_feature"
-    # stage-guidance.json's lines before the test stage, which the cards without it keep byte for byte
+    # stage-guidance.json's lines for a ticket without the test stage (the spec plan, the merged
+    # implement/fix prompt, the review's verdicts), which its cards show byte for byte
     OLD_GUIDE = {
         "plan": [
-            "This stage: PLAN. Change no code; run no build or test. Read the code the ticket touches, then write the "
-            "plan file in the card's shape.",
-            "Each criterion is ONE line: - ACn: GIVEN .. WHEN .. THEN .. ending (ticket: \"exact words\") or (edge of "
-            "ACn); cover every edge case of each one.",
-            "Every decision the ticket and the code leave open is a Question with Options and a Default, not a guess.",
-            "Then the self-check: read back each file and function your Steps name, fix the plan, write it again. Not "
-            "done before that."],
+            "This stage: PLAN (a spec). Change no code; run no build or test. Read the code the ticket touches, then write the plan file in the card's shape. No ## Steps.",
+            "Each criterion is ONE line: - ACn: GIVEN .. WHEN .. THEN .. ending (ticket: \"exact words\") or (edge of ACn), then [check: cmd|test|review|human].",
+            "At most 3 Questions, each [blocking] or [non-blocking] with Options and Recommended: (x), because ..; settle the rest yourself as Assumptions.",
+            "Then the self-check: read back the code each criterion names, fix the plan, write it again. Not done before that."],
         "implement": [
-            "This stage: IMPLEMENT the plan's Steps, one todo item each (file, function, its ACs, edge cases included).",
-            "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, "
-            "the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m "
-            "py_compile, node --check).",
-            "Run it, read the output, fix what you broke. Finish only when the card's Done line holds and the build is "
-            "clean."],
+            "This stage: IMPLEMENT the plan's criteria, one todo item each (the code that meets it, edge cases included).",
+            "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
+            "Run it, read the output, fix what you broke. Finish only when the card's Done line holds and the build is clean."],
         "review": [
             "This stage: REVIEW. Change no code, commit nothing, write or run no tests.",
-            "One todo item per AC of the plan, edge cases included: find the lines that meet it (path:line); one no "
-            "code meets is a Must fix item.",
-            "Then check correctness, security, scope, simplicity, write the review file in the card's shape, and "
-            "finish."],
+            "One todo item per AC of the plan, edge cases included: a ## Criteria line each, AC1: PASS | `a line the diff adds` | why (or FAIL / UNKNOWN).",
+            "Must fix items are tagged [exec] (a command you ran fails) or [opinion], with path:line and the case that breaks. Write the review file in the card's shape, and finish."],
         "fix": [
-            "This stage: FIX the Must fix items only, one todo item each (path:line and the fix); change nothing else.",
-            "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, "
-            "the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m "
-            "py_compile, node --check).",
+            "This stage: FIX the findings only, one todo item each (path:line and the fix); change nothing else. One that is wrong: leave it and say why.",
+            "Do NOT write or run tests, or install anything, in this stage: each item's check step is the build only, the project's build/compile/lint command, else a syntax check of each changed file (bash -n, python -m py_compile, node --check).",
             "Finish only when the card's Done line holds and the build is clean."],
     }
     PLAN = ("# ABC-1 plan\n## Goal\nA feature file.\n## Acceptance criteria\n- AC1: GIVEN the project WHEN the change "
@@ -4911,7 +4986,7 @@ class TestStageTest(Base):
         st = self.status()
         self.assertEqual((rc, st["status"], st["stage"]), (0, "done", "done"), out + st.get("reason", ""))
         for stage in ("planning", "testing", "implementing", "reviewing", "fixing"):
-            self.assertEqual(len(self.calls_of(stage)), 1, stage)
+            self.assertEqual(len(self.calls_of(stage)), 2 if stage == "reviewing" else 1, stage)   # review after fix
         # the plan's ## Tests gives the command; the test stage committed the test file alone, then the code
         self.assertEqual(tq.test_command(cat(tq.plan_copy(tq.Queue(self.state), "ABC-1"))), self.CMD)
         log = sh("git", "-C", self.remote, "log", "--format=%s", "ABC-1").splitlines()
@@ -4956,7 +5031,7 @@ class TestStageTest(Base):
         # the cards: the "+test" lines, {TEST} the command
         cards = self.cards()
         guide = tq.stage_guidance()
-        self.assertEqual([c["stage"] for c in cards], ["plan", "test", "implement", "review", "fix"])
+        self.assertEqual([c["stage"] for c in cards], ["plan", "test", "implement", "review", "fix", "review"])
         self.assertEqual(cards[0]["do"], guide["plan+test"])
         self.assertEqual(cards[1]["do"], guide["test"])
         for c, key in zip(cards[2:], ("implement+test", "review+test", "fix+test")):
@@ -4992,8 +5067,8 @@ class TestStageTest(Base):
         self.assertTrue(all(tq.MET_WHEN[0] in c for c in self.code_checks()))
         self.assertFalse("test_marks" in st or "test_sha" in st)
         cards = self.cards()
-        self.assertEqual([c["stage"] for c in cards], ["plan", "implement", "review", "fix"])
-        self.assertEqual([c["do"] for c in cards], [self.OLD_GUIDE[s] for s in ("plan", "implement", "review", "fix")])
+        self.assertEqual([c["stage"] for c in cards], ["plan", "implement", "review", "fix", "review"])
+        self.assertEqual([c["do"] for c in cards], [self.OLD_GUIDE[s] for s in ("plan", "implement", "review", "fix", "review")])
         guide = tq.stage_guidance()
         self.assertEqual({k: guide[k] for k in self.OLD_GUIDE}, self.OLD_GUIDE)
 
@@ -5155,7 +5230,8 @@ class TestStageTest(Base):
             self.assertIn(s, tq.STAGES, s)
             self.assertIn(s, tq.CARD_DONE, s)
             self.assertIn(s, guide, s)
-            self.assertTrue(os.path.exists(os.path.join(tq.PROMPTS, s + ".md")), s)
+            # the fix round renders implement.md with its findings (fix.md is gone)
+            self.assertTrue(os.path.exists(os.path.join(tq.PROMPTS, ("implement" if s == "fix" else s) + ".md")), s)
         self.assertIn("test-repos", tq.CARD_DONE)
         self.assertLessEqual(len(tq.CARD_DONE["test"].format(KEY="ABCDEFGHIJ-12345", BRANCH="b" * 100)), 500)
         # the repos card's own words leave the 500 to the commit step, as implement-repos does
@@ -5318,9 +5394,10 @@ class OwnerReviewTest(Base):
         self.assertEqual([h["stage"] for h in st["history"][-2:]], ["fix", "push"])
         prompt = cat(self.calls + ".fixing")
         self.assertIn("You are fixing the change for ticket ABC-1 as its owner asks in review comments", prompt)
-        self.assertIn("<<<BEGIN_MUST_FIX (the owner's review comments on the diff; they win over the plan)>>>\n"
-                      "- " + "\n- ".join(items) + "\n<<<END_MUST_FIX>>>", prompt)
-        self.assertEqual(prompt.count("<<<END_MUST_FIX>>>"), 1)
+        self.assertIn("<<<BEGIN_FINDINGS_TO_ADDRESS (the owner's review comments on the diff; they win over the plan)>>>\n"
+                      "- " + "\n- ".join(items) + "\n<<<END_FINDINGS_TO_ADDRESS>>>", prompt)
+        self.assertEqual(prompt.count("<<<END_FINDINGS_TO_ADDRESS>>>"), 1)
+        self.assertEqual(prompt.count("<<<END_MUST_FIX>>>"), 0)   # the comment's own marker is broken up
         self.assertNotIn("a review found", prompt)
         card = json.loads(cat(self.calls + ".card").splitlines()[-1])
         self.assertEqual((card["stage"], card["must_fix"]), ("fix", 3))
@@ -5409,6 +5486,147 @@ class OwnerReviewTest(Base):
         self.assertEqual(len(tq.judge(obj, crit, whole, "quote", "diff")), 1)   # without the fix's diff: no proof
         # a plan criterion is judged on the whole change, as before
         self.assertEqual(len(tq.judge(obj, ["f.py has no debug output"], whole, "quote", "diff", fix_diff=fixed)), 1)
+
+
+class SpecLoopTest(unittest.TestCase):
+    """The spec-shaped plan, BLOCKED, the review's verdicts and the fix loop, and stats:
+    pure functions, no run."""
+    SPEC = ("# ABC-1 plan\n## Goal\nA feature file.\n## Not included\n- None\n## Acceptance criteria\n"
+            "- AC1: GIVEN the project WHEN the change is in THEN feature.txt says hello (ticket: \"add it\") [check: test]\n"
+            "- AC2: GIVEN no file WHEN it runs THEN it says so (edge of AC1) [check: review]\n"
+            "## Questions\n- Q1 [non-blocking]: which colour? Options: (a) blue (b) red. Recommended: (a), because it is\n"
+            "## Assumptions\n- A1: utf-8\n")
+
+    def test_a_spec_passes_and_its_rules_are_named(self):
+        self.assertEqual(tq.spec_problems(self.SPEC), [])
+        problems, crit, qs = tq.check_plan(self.SPEC)
+        self.assertEqual(problems, [])
+        parsed = tq.plan_criteria(crit)
+        self.assertEqual([c["check"] for c in parsed], ["test", "review"])
+        self.assertEqual(parsed[0]["source"], 'ticket: "add it"')   # the check tag is not part of its source
+        self.assertNotIn("check", parsed[0]["then"])
+        self.assertIn("(a)", tq.question(qs[0], 1)["default"])
+        four = self.SPEC.replace("## Assumptions", "".join(f"- Q{n} [non-blocking]: x? Recommended: y\n" for n in (2, 3, 4))
+                                 + "## Assumptions")
+        self.assertTrue(any("at most 3" in p for p in tq.spec_problems(four)))
+        bare = self.SPEC.replace(" Recommended: (a), because it is", "")
+        self.assertTrue(any("no recommended answer" in p for p in tq.spec_problems(bare)))
+        untagged = self.SPEC.replace("[non-blocking]", "")
+        self.assertTrue(any("not tagged" in p for p in tq.spec_problems(untagged)))
+        untyped = self.SPEC.replace(" [check: review]", "")
+        self.assertTrue(any(p.startswith("AC2: no check type") for p in tq.spec_problems(untyped)))
+        no_exec = self.SPEC.replace("[check: test]", "[check: human]")
+        self.assertTrue(any("cmd] or [check: test]" in p for p in tq.spec_problems(no_exec)))
+        said = no_exec.replace("- A1: utf-8", "- A1: No executable check: it is a wording change")
+        self.assertEqual(tq.spec_problems(said), [])
+
+    def test_an_old_plan_with_steps_still_parses(self):
+        old = ("# ABC-1 plan\n## Goal\nx\n## Steps\n1. `src/a.py` `run()`: guard. (AC1)\n## Acceptance criteria\n"
+               "- AC1: GIVEN a WHEN b THEN c (ticket: \"d\")\n## Questions\n- None\n## Assumptions\n- None\n")
+        problems, crit, _ = tq.check_plan(old)
+        self.assertEqual(problems, [])
+        items = tq.plan_items(old)
+        self.assertEqual(len(items["steps"]), 1)   # still shown to the owner
+        self.assertEqual(items["criteria"][0]["check"], "")
+        self.assertFalse(any("Steps" in n for n in tq.plan_notes(old)))
+
+    def test_blocked_line(self):
+        self.assertEqual(tq.blocked_line("did a thing\nBLOCKED: the API it needs does not exist\n"),
+                         "the API it needs does not exist")
+        self.assertEqual(tq.blocked_line("**BLOCKED:** no such table"), "no such table")
+        # the prompt's own rule, and a ticket line in an echoed prompt, are not one
+        self.assertEqual(tq.blocked_line(tq.render("implement", **{k: "x" for k in re.findall(r"\{\{(\w+)\}\}", tq.PROMPT_TEXT["implement"])})), "")
+        self.assertEqual(tq.blocked_line("<<<BEGIN_TICKET>>>\nBLOCKED: waiting on legal\n<<<END_TICKET>>>\nDone."), "")
+        self.assertEqual(tq.blocked_line("BLOCKED:"), "")
+
+    def test_review_verdicts_and_the_quote_check(self):
+        review = ("# ABC-1 review\n## Criteria\n- AC1: PASS | `hello feature` | it writes it\n"
+                  "- AC2: PASS | `nothing like this` | made up\n- **AC3**: FAIL | - | no error path\n"
+                  "- AC4: UNKNOWN | n/a | cannot tell\n## Must fix\n- [exec] a.py:1: `make test` fails\n"
+                  "- [opinion] a.py:2: slow on 1e6 rows\n- a.py:3: untagged\n## Notes\n- None\n")
+        got = tq.review_verdicts(review)
+        self.assertEqual([(v["id"], v["verdict"]) for v in got],
+                         [("AC1", "PASS"), ("AC2", "PASS"), ("AC3", "FAIL"), ("AC4", "UNKNOWN")])
+        self.assertEqual((got[0]["quote"], got[0]["why"]), ("hello feature", "it writes it"))
+        self.assertEqual(got[2]["quote"], "")
+        self.assertEqual(tq.review_verdicts("# old review\n## Must fix\n- None\n"), [])
+        diff = ("diff --git a/feature.txt b/feature.txt\n--- /dev/null\n+++ b/feature.txt\n@@ -0,0 +1 @@\n"
+                "+hello feature\n")
+        crit = [{"id": f"AC{n}", "text": f"criterion {n}"} for n in (1, 2, 3, 4)]
+        checked = tq.quote_checked(got, crit, diff)
+        self.assertEqual([v["verdict"] for v in checked], ["PASS", "UNKNOWN", "FAIL", "UNKNOWN"])
+        self.assertTrue(checked[1].get("miss"))
+        self.assertEqual(checked[1]["said"], "PASS")
+        must = ["[exec] a.py:1: `make test` fails", "[opinion] a.py:2: slow", "a.py:3: untagged"]
+        sm = tq.review_summary(checked, must)
+        self.assertEqual((len(sm["exec"]), len(sm["opinion"]), sm["fail"], sm["unknown"], sm["pass"]),
+                         (1, 2, ["AC3"], ["AC2", "AC4"], ["AC1"]))
+        self.assertEqual(tq.must_tag("[exec] a: b"), ("exec", "a: b"))
+        self.assertEqual(tq.must_tag("a: b"), ("", "a: b"))
+
+    def test_the_fix_loop_decides_on_evidence_and_progress(self):
+        d = tq.review_decision
+        none = {"exec": [], "opinion": [], "fail": [], "unknown": [], "pass": ["AC1"]}
+        opinion = dict(none, opinion=["x"])
+        hard = dict(none, exec=["[exec] a"], fail=["AC2"])
+        less = dict(none, fail=["AC2"])
+        self.assertEqual(d(0, none)[0], "push")
+        self.assertEqual(d(0, opinion)[0], "fix")        # the first review's items all get a round
+        self.assertEqual(d(1, opinion)[0], "push")       # opinion alone earns no second round
+        self.assertIn("opinion", d(1, opinion)[1])
+        self.assertEqual(d(1, less, hard)[0], "fix")     # evidence, and fewer open items than before
+        self.assertEqual(d(1, hard, hard)[0], "packet")  # no progress
+        self.assertIn("no progress", d(1, hard, hard)[1])
+        regressed = {**less, "pass": [], "fail": ["AC1"]}
+        self.assertEqual(d(1, regressed, dict(hard, fail=["AC2", "AC3"]))[0], "packet")
+        self.assertEqual(d(tq.FIX_ROUNDS, less, hard)[0], "packet")   # the cap
+        self.assertEqual(tq.FIX_ROUNDS, 2)
+        rows = [{"round": 0, "sha": "a" * 40, "summary": hard, "criteria": [{"id": "AC2", "verdict": "FAIL", "quote": ""}]},
+                {"round": 1, "sha": "b" * 40, "summary": less, "criteria": [{"id": "AC2", "verdict": "FAIL", "quote": ""}]},
+                {"round": 2, "sha": "c" * 40, "summary": hard, "criteria": [{"id": "AC2", "verdict": "FAIL", "quote": ""}]}]
+        p = tq.packet({"review_verdicts": rows}, "why", "q?", "do this")
+        self.assertEqual(set(p), {"reason", "question", "default", "criteria", "rounds", "best_commit"})
+        self.assertEqual(p["best_commit"], "b" * 40)
+        self.assertEqual(p["criteria"], [{"id": "AC2", "verdict": "FAIL", "quote": ""}])
+        self.assertEqual(len(p["rounds"]), 3)
+        old_loop = [dict(rows[0], sha="d" * 40, summary=none)] + rows   # an earlier loop's rounds are not this one's
+        self.assertEqual(tq.packet({"review_verdicts": old_loop}, "w", "q", "d")["best_commit"], "b" * 40)
+
+    def test_stats(self):
+        with tempfile.TemporaryDirectory() as d:
+            q = tq.Queue(d)
+            st = {"key": "ABC-1", "status": "blocked", "stage": "review", "created": "2026-01-01T00:00:00+00:00",
+                  "history": [{"at": "2026-01-01T00:10:00+00:00", "stage": "implement", "result": "passed", "details": []},
+                              {"at": "2026-01-01T01:00:00+00:00", "stage": "review", "result": "blocked",
+                               "details": ["the review still finds open items: no progress (x)"]}],
+                  "owner_actions": [{"action": "retry", "at": "2026-01-01T02:00:00+00:00"},
+                                    {"action": "fix", "at": "2026-01-01T02:30:00+00:00"}],
+                  "review_verdicts": [
+                      {"round": 0, "sha": "s1", "summary": {"exec": [], "fail": ["AC2"], "unknown": []},
+                       "criteria": [{"id": "AC1", "verdict": "PASS"}, {"id": "AC2", "verdict": "FAIL"}],
+                       "verify": {"stage": "implement", "sha": "s1", "passed": False, "failed": [2]}},
+                      {"round": 1, "sha": "s2", "summary": {"exec": [], "fail": [], "unknown": []},
+                       "criteria": [{"id": "AC1", "verdict": "PASS"}, {"id": "AC2", "verdict": "PASS"}],
+                       "verify": {"stage": "fix", "sha": "s2", "passed": False, "failed": [1]}}],
+                  "packet": {"reason": "x"}}
+            q.save(st)
+            q.set_order(["ABC-1"])
+            r = tq.ticket_stats(st)
+            self.assertEqual((r["reviews"], r["fix_rounds"], r["blocks"], r["owner_actions"]), (2, 1, 1, 2))
+            self.assertEqual((r["owner_span_s"], r["wall_s"]), (1800, 3600))
+            self.assertEqual(r["agreement"], {"rounds": 2, "same": 1, "criteria": 4, "criteria_same": 3})
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(tq.cmd_stats(q, types.SimpleNamespace(json=True)), 0)
+            got = json.loads(out.getvalue())
+            self.assertEqual(got["totals"]["tickets"], 1)
+            self.assertEqual(got["totals"]["block_reasons"], {"the review still finds open items: no progress": 1})
+            out = io.StringIO()
+            with redirect_stdout(out):
+                tq.cmd_stats(q, types.SimpleNamespace(json=False))
+            self.assertIn("review vs verify_change: rounds 1/2 (50%), criteria 3/4 (75%)", out.getvalue())
+            tq.owner_did(st, "answer")
+            self.assertEqual(st["owner_actions"][-1]["action"], "answer")
 
 
 class RestartLeftLockTest(unittest.TestCase):
