@@ -187,6 +187,7 @@ KNOWN_LINES = 3000         # lines of KNOWN.md
 DISMISSED_KEEP = 2000      # owner-archived findings remembered after the store drops them
 THEMES_MAX = 6000          # characters of themes.md read
 LOCATIONS_MAX = 20
+ROLL_MAX = 1000           # items a rolling finding keeps (open ones, then the gone ones)
 FAIL_SET_ASIDE = 3
 SET_ASIDE = 24 * 3600      # seconds a pass that failed FAIL_SET_ASIDE times waits (or until its area changes)
 KNOW_IN = 8000             # characters of the area's note in its prompt
@@ -414,6 +415,45 @@ def blob_text(root, blob):
     if rc != 0 or b"\0" in data[:8192]:
         return None
     return data.decode("utf-8", "replace").replace("\r\n", "\n")
+
+
+def blob_texts(root, blobs, beat=None, chunk=2000):
+    """{blob: text} of the text blobs (binary ones left out), read by git cat-file --batch,
+    chunk at a time; one blob at a time when that cannot run."""
+    out = {}
+    blobs = list(dict.fromkeys(blobs))
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+    for i in range(0, len(blobs), chunk):
+        part = blobs[i:i + chunk]
+        try:
+            r = subprocess.run([*safe_git(), "-C", root, "cat-file", "--batch"], input=("\n".join(part) + "\n")
+                               .encode(), capture_output=True, timeout=600, env=env)
+            data = r.stdout if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            data = None
+        if data is None:
+            for b in part:
+                t = blob_text(root, b)
+                if t is not None:
+                    out[b] = t
+            continue
+        pos = 0
+        while pos < len(data):
+            nl = data.find(b"\n", pos)
+            if nl < 0:
+                break
+            head = data[pos:nl].split()
+            pos = nl + 1
+            if len(head) != 3 or not head[2].isdigit():
+                continue   # "<sha> missing"
+            size = int(head[2])
+            body = data[pos:pos + size]
+            pos += size + 1
+            if b"\0" not in body[:8192]:
+                out[head[0].decode()] = body.decode("utf-8", "replace").replace("\r\n", "\n")
+        if beat:
+            beat()
+    return out
 
 
 def split_lines(text):
@@ -1295,13 +1335,18 @@ class Worker:
         for k in ("units", "files", "counts", "knowledge"):
             self.ledger.setdefault(k, {})
         self.ledger.setdefault("passes", [])
+        for k in ("pending", "dismissed"):
+            if not isinstance(self.ledger.get(k), list):
+                self.ledger[k] = []
         self.ledger.pop("candidates", None)   # version 1's
-        self.ledger["version"] = 2
+        self.ledger["version"] = 3
         self.store = read_json(self.p("findings.json"), {})
         if not isinstance(self.store.get("findings"), list):
             self.store = {"version": 1, "findings": []}
         self.heads = {}
         self.units = {}
+        self.paths = {}   # root: every tracked path at HEAD
+        self.ui = {}      # root: (every literal and form text, {path: the texts it shows})
         self.trees = {}
         self.guard_at = 0.0
         self.last_call = 0.0
@@ -1334,14 +1379,22 @@ class Worker:
         write_json(self.p("ledger.json"), self.ledger)
 
     def save_store(self):
+        """findings.json; over STORE_MAX, stale findings go first, then archived ones (which
+        are remembered in the ledger's "dismissed", for the dedup). Rolling ones stay."""
         f = self.store["findings"]
         if len(f) > STORE_MAX:
             archived = self.archived()
-            drop = sorted((x for x in f if x.get("status") == "stale"), key=lambda x: x.get("stale_at") or "")
-            drop += sorted((x for x in f if x.get("status") != "stale" and x["id"] in archived),
-                           key=lambda x: x.get("found_at") or "")
-            gone = {x["id"] for x in drop[:len(f) - STORE_MAX]}
+            drop = sorted((x for x in f if x.get("status") == "stale" and x.get("kind") != "rolling"),
+                          key=lambda x: x.get("stale_at") or "")
+            drop += sorted((x for x in f if x.get("status") != "stale" and x["id"] in archived
+                            and x.get("kind") != "rolling"), key=lambda x: x.get("found_at") or "")
+            drop = drop[:len(f) - STORE_MAX]
+            gone = {x["id"] for x in drop}
+            self.ledger["dismissed"] = (self.ledger["dismissed"] + [
+                {k: x.get(k) for k in ("project", "path", "line", "title", "ui")}
+                for x in drop if x["id"] in archived])[-DISMISSED_KEEP:]
             self.store["findings"] = [x for x in f if x["id"] not in gone]
+            self.save_ledger()
         write_json(self.p("findings.json"), self.store)
 
     def archived(self):
@@ -1350,15 +1403,36 @@ class Worker:
         return set(a) if isinstance(a, dict) else set()
 
     def open_count(self):
+        """Open findings on the board; a rolling one counts once, while it has open items."""
         archived = self.archived()
-        return sum(1 for x in self.store["findings"] if x.get("status") == "open" and x.get("id") not in archived)
+        n = 0
+        for x in self.store["findings"]:
+            if x.get("status") != "open" or x.get("id") in archived:
+                continue
+            if x.get("kind") == "rolling":
+                n += any(i.get("status") == "open" and i.get("id") not in archived for i in x.get("items") or [])
+            else:
+                n += 1
+        return n
 
     def notes(self):
         return read_text(self.p("notes.md"), NOTES_MAX).strip()
 
+    def themes_text(self):
+        return read_text(self.p("themes.md"), THEMES_MAX)
+
+    def themes(self):
+        return themes_of(self.themes_text())
+
     def count(self, lens, what, n=1):
         c = self.ledger["counts"].setdefault(lens, {"accepted": 0, "rejected": 0, "failed": 0, "calls": 0})
         c[what] = c.get(what, 0) + n
+
+    def rejected(self, lens, why, n=1):
+        """A report or item thrown away, and the check it failed."""
+        self.count(lens, "rejected", n)
+        w = self.ledger["counts"][lens].setdefault("why", {})
+        w[why] = w.get(why, 0) + n
 
     # --- the repositories at HEAD ---
 
@@ -1374,70 +1448,224 @@ class Worker:
             if self.heads.get(root) == head:
                 continue
             self.status.set(state="exploring", unit=f"indexing {root} at {head[:10]}")
-            files = self.index(root)
+            files, paths, texts = self.index(root)
+            self.paths[root] = paths
+            self.ui_index(root, files, texts)
             self.units[root] = units_of(root, files)
             live = {u.key for u in self.units[root]}
             for k in [k for k in self.ledger["units"] if k.startswith(root + ":") and k not in live]:
                 del self.ledger["units"][k]
-            if self.maintain(root, files):
+            changed = self.maintain(root, files, texts)
+            changed = self.scan_unused(root, paths, texts) or changed
+            if changed:
                 self.save_store()
             self.heads[root] = head
             self.write_index(root)   # which notes are now out of date
             self.save_ledger()
 
     def index(self, root):
+        """(the file index, every tracked path, {path: text} of the indexed files)."""
         rc, out = git(root, "ls-tree", "-r", "-l", "-z", "HEAD", timeout=120)
         if rc != 0:
             raise RuntimeError(f"git ls-tree failed in {root}")
         files = self.ledger["files"].setdefault(root, {})
-        seen = set()
+        paths, want = [], {}
         for rec in out.split(b"\0"):
             meta, _, rawpath = rec.partition(b"\t")
             bits = meta.split()
             if len(bits) != 4 or bits[1] != b"blob" or bits[0] == b"120000" or not bits[3].isdigit():
                 continue
             path, blob = rawpath.decode("utf-8", "replace"), bits[2].decode()
-            if not eligible(path, int(bits[3])):
+            if SECRET_PATH.search(path):
                 continue
-            seen.add(path)
+            paths.append(path)
+            if eligible(path, int(bits[3])):
+                want[path] = blob
+        got = blob_texts(root, list(want.values()), beat=self.status.beat)
+        texts = {}
+        for path, blob in want.items():
+            text = got.get(blob)
             ent = files.get(path)
-            if ent and ent.get("blob") == blob and "chunks" not in ent:
-                continue
-            text = blob_text(root, blob)
-            kind = file_kind(path, text) if text is not None else None
-            files[path] = {"blob": blob, "skip": True} if kind is None else \
-                {"blob": blob, "kind": kind, "lines": len(split_lines(text))}
-            self.status.beat()
-        for p in [p for p in files if p not in seen]:
+            fresh = not (ent and ent.get("blob") == blob and "chunks" not in ent
+                         and (ent.get("skip") or "entry" in ent))
+            if fresh:
+                kind = file_kind(path, text) if text is not None else None
+                files[path] = {"blob": blob, "skip": True} if kind is None else \
+                    {"blob": blob, "kind": kind, "lines": len(split_lines(text)),
+                     "entry": kind == "code" and bool(ENTRY_RE.search(text))}
+            if text is not None and not files[path].get("skip"):
+                texts[path] = text
+        for p in [p for p in files if p not in want]:
             del files[p]
-        return files
+        return files, paths, texts
 
-    def maintain(self, root, files):
+    def ui_index(self, root, files, texts):
+        """What users can see, from the code at HEAD: every literal and form text (to check
+        a report's control against) and the texts each file shows (for its prompt)."""
+        every, shown = set(), {}
+        for p, t in texts.items():
+            lits, sh = ui_texts(p, t)
+            every.update(x for x in (ui_norm(s) for s in lits + sh) if x)
+            sh = [clean_one_line(s.replace('\\"', '"'), 120) for s in sh]
+            sh = [s for s in dict.fromkeys(sh) if len(s) >= 2]
+            if sh:
+                shown[p] = sh
+        self.ui[root] = (every, shown)
+
+    def ui_for(self, u):
+        """The texts users see at a bug pass's entry point (with its .ui form's)."""
+        shown = (self.ui.get(u.root) or (set(), {}))[1]
+        if not u.entry:
+            return []
+        out = list(shown.get(u.entry, []))
+        stem = stem_of(u.entry).lower()
+        for p in u.files:
+            if p != u.entry and p.lower().endswith(".ui") and stem_of(p).lower() == stem:
+                out += shown.get(p, [])
+        return list(dict.fromkeys(out))[:UI_SHOWN]
+
+    def ui_ok(self, root, text):
+        """Whether the code at HEAD has a control's text (the last of a "Menu > Item" path)."""
+        every = (self.ui.get(root) or (set(), {}))[0]
+        parts = [x for x in re.split(r"\s*(?:>|→|->|›)\s*", text) if x.strip()]
+        return bool(parts) and (ui_norm(text) in every or ui_norm(parts[-1]) in every)
+
+    def maintain(self, root, files, texts):
         """Open findings of this repo whose evidence is no longer in the HEAD file go
-        stale; the others follow their evidence to its line now. True when any changed."""
-        changed, texts = False, {}
+        stale, rolling items gone; the others follow their evidence to its line now. True
+        when any changed."""
+        changed, split = False, {}
+        tracked = set(self.paths.get(root) or ())
+
+        def follow(path, ev, line):
+            """The evidence's line now (line when it spans lines), else 0."""
+            if path not in texts:
+                return 0
+            if path not in split:
+                split[path] = split_lines(texts[path])
+            lines, ev = split[path], norm(ev)
+            hits = [i + 1 for i, x in enumerate(lines) if ev in norm(x)]
+            if hits:
+                return min(hits, key=lambda n: abs(n - (line or 0)))
+            return line or 1 if ev in " ".join(norm(x) for x in lines) else 0
+
         for f in self.store["findings"]:
             if f.get("project") != root or f.get("status") != "open":
                 continue
-            ent = files.get(f.get("path"))
-            lines = None
-            if ent and not ent.get("skip"):
-                if ent["blob"] not in texts:
-                    t = blob_text(root, ent["blob"])
-                    texts[ent["blob"]] = split_lines(t) if t is not None else None
-                lines = texts[ent["blob"]]
-            ev = norm(f.get("evidence") or "")
-            if lines is not None and ev:
-                hits = [i + 1 for i, x in enumerate(lines) if ev in norm(x)]
-                if hits:
-                    best = min(hits, key=lambda n: abs(n - (f.get("line") or 0)))
-                    if best != f.get("line"):
-                        f["line"], changed = best, True
-                    continue
-                if ev in " ".join(norm(x) for x in lines):
-                    continue
+            if f.get("kind") == "rolling":
+                for it in f.get("items") or []:
+                    if it.get("status") != "open":
+                        continue
+                    if it.get("evidence"):
+                        n = follow(it.get("path"), it["evidence"], it.get("line"))
+                    else:
+                        n = -1 if it.get("path") in tracked else 0
+                    if n == 0:
+                        it["status"], it["gone_at"], changed = "gone", iso(), True
+                    elif n > 0 and n != it.get("line"):
+                        old = f"{it['path']}:{it.get('line')}"
+                        it["line"], changed = n, True
+                        it["locations"] = [f"{it['path']}:{n}" if x == old else x for x in it.get("locations") or []]
+                f["updated_at"] = f.get("updated_at") or iso()
+                continue
+            n = follow(f.get("path"), f.get("evidence") or "", f.get("line")) if f.get("evidence") else 0
+            if n:
+                if n != f.get("line"):
+                    f["line"], changed = n, True
+                continue
             f["status"], f["stale_at"], changed = "stale", iso(), True
         return changed
+
+    # --- the rolling lists ---
+
+    def rolls(self, root, theme):
+        return [f for f in self.store["findings"]
+                if f.get("kind") == "rolling" and f.get("project") == root and f.get("theme") == theme]
+
+    def roll(self, root, theme, title, detail):
+        """The theme's finding new items go on: its newest generation, a new one when the
+        owner archived that."""
+        recs = self.rolls(root, theme)
+        cur = max(recs, key=lambda f: f.get("gen", 0)) if recs else None
+        if cur is None or cur["id"] in self.archived():
+            gen = (cur.get("gen", 0) + 1) if cur else 0
+            base = f"r-{theme}-{sha16(root)[:8]}"
+            cur = {"id": base if not gen else f"{base}-{gen}", "kind": "rolling", "theme": theme, "gen": gen,
+                   "category": theme, "severity": "", "title": title, "detail": detail, "path": "", "line": 0,
+                   "status": "open", "project": root, "found_at": iso(), "updated_at": iso(), "items": [],
+                   "lens": "cleanup", "model": self.model}
+            self.store["findings"].append(cur)
+        cur["title"], cur["detail"] = title, detail
+        return cur
+
+    def add_item(self, root, theme, title, detail, item, sid, source="pass"):
+        """Put an item on its theme's list: True when it is new (not there in any
+        generation, not archived by the owner, not on the same place or evidence)."""
+        iid = item_id(os.path.basename(root), theme, item)
+        archived = self.archived()
+        if iid in archived:
+            return False
+        ev, locs = norm(item["evidence"]), set(item["locations"])
+        files = {x.rsplit(":", 1)[0] for x in locs}
+        for r in self.rolls(root, theme):
+            for it in r.get("items") or []:
+                if it["id"] == iid:
+                    if it.get("status") == "gone" and r["id"] not in archived:
+                        it["status"], it["found_at"], r["updated_at"] = "open", iso(), iso()
+                        it.pop("gone_at", None)
+                        return True
+                    return False
+                if it.get("status") == "gone":
+                    continue
+                if it.get("path") == item["path"] and abs((it.get("line") or 0) - item["line"]) <= 10:
+                    return False
+                if ev and norm(it.get("evidence") or "") == ev:
+                    return False
+                if theme == "unify" and {x.rsplit(":", 1)[0] for x in it.get("locations") or []} == files:
+                    return False
+        rec = self.roll(root, theme, title, detail)
+        rec["items"].append(dict(item, id=iid, found_at=iso(), session=sid, status="open", source=source))
+        if len(rec["items"]) > ROLL_MAX:   # the gone ones first
+            gone = [i for i in rec["items"] if i.get("status") != "open"][:len(rec["items"]) - ROLL_MAX]
+            rec["items"] = [i for i in rec["items"] if i not in gone]
+        rec["updated_at"] = iso()
+        return True
+
+    def scan_unused(self, root, paths, texts):
+        """The unused files list from the mechanical scan: files nothing names come on it,
+        ones the scan put there that something names now leave it. True when it changed."""
+        themes = {k: (t, d) for k, t, d in self.themes()}
+        if "unused" not in themes:
+            return False
+        found = set(unused_files(paths, texts))
+        changed = False
+        for r in self.rolls(root, "unused"):
+            for it in r.get("items") or []:
+                if it.get("source") == "scan" and it.get("status") == "open" and it.get("path") not in found:
+                    it["status"], it["gone_at"], changed = "gone", iso(), True
+        for p in sorted(found):
+            item = {"path": p, "line": 0, "evidence": "", "locations": [p],
+                    "note": "no other file names it (build lists, includes, resources, code): delete it, "
+                            "after a look"}
+            changed = self.add_item(root, "unused", *themes["unused"], item, "", source="scan") or changed
+        return changed
+
+    def unused_ok(self, root, path):
+        """A file a pass says is unused: nothing but itself, its pair (the same name with
+        another extension) and the build lists names it or its name."""
+        stem, base = stem_of(path), path.rsplit("/", 1)[-1]
+        if len(stem) < 3:
+            return False
+        for pat, word in ((stem, True), (base, False)):
+            rc, out = git(root, "grep", "-I", "-l", "-F", *(["-w"] if word else []), "-e", pat, "HEAD", "--",
+                          timeout=120)
+            if rc not in (0, 1):
+                return False
+            for x in out.decode("utf-8", "replace").splitlines():
+                p = x[5:] if x.startswith("HEAD:") else x
+                if p != path and stem_of(p) != stem and not is_build(p):
+                    return False
+        return True
 
     # --- the notes: what the passes learned, an area at a time ---
 
