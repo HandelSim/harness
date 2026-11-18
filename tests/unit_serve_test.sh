@@ -616,11 +616,16 @@ class Term:
             pid = os.fork()
             if pid == 0:
                 try:
-                    os.setsid()   # a new session; an inherited fd is no ctty
+                    # A new session with no terminal, serve not its leader:
+                    # neither the inherited fds nor a tty it opens become one.
+                    os.setsid()
                     os.close(fd)
                     for i in (0, 1, 2):
                         os.dup2(slave, i)
-                    os.execv(argv[0], argv)
+                    c = os.fork()
+                    if c == 0:
+                        os.execv(argv[0], argv)
+                    os._exit(os.waitstatus_to_exitcode(os.waitpid(c, 0)[1]) & 0xff)
                 finally:
                     os._exit(127)
             os.close(slave)
@@ -831,7 +836,8 @@ term = Term(noctty=True)
 term.expect(r"u runs harness upgrade here; serve then restarts on the new code")
 up(6)
 first = stamp()
-with open(f"/proc/{term.pid}/stat") as f:
+spid = int(first[0])
+with open(f"/proc/{spid}/stat") as f:
     tpgid = f.read().rsplit(")", 1)[1].split()[5]
 if tpgid != "-1":
     fail(f"E: want serve's /proc terminal group -1 (as Git Bash), got {tpgid}")
@@ -848,10 +854,12 @@ term.send(b"u")
 term.expect(r"\[y/N\] ", m)
 term.send(b"n")
 term.expect(r"not upgrading", m)
-term.modes_restored("E: keys")
-os.kill(term.pid, signal.SIGTERM)
+if stamp()[0] != str(spid):
+    fail("E: the restart is to keep serve's pid (exec)")
+os.kill(spid, signal.SIGTERM)
 term.wait()
 all_gone("E: SIGTERM")
+term.modes_restored("E: SIGTERM")
 os.close(term.fd)
 
 # F: where /proc cannot tell (Git Bash), perl asks the terminal: in front
