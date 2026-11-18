@@ -10,6 +10,7 @@ import http.server
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,7 +33,13 @@ APP = "import os\n\n\ndef ratio(a, b):\n    # the caller checks b\n    return a 
 USE = "from app import ratio\nprint(ratio(1, 0))\n"
 
 # The stub harness: logs how it was run, then answers as STUB_MODE says (a checking
-# session's prompt has VERDICT-<nonce>: it answers STUB_VERDICT for each report).
+# session's prompt has VERDICT-<nonce>: it answers STUB_VERDICT for each report; a
+# reformat session's has <<<ANSWER: it answers as STUB_REFORMAT says, find by default).
+# A finish summary in the model's own words: what the proxy hands back when the blocks
+# were written outside it.
+PROSE = ("I followed ratio to its callers and found one bug.\n**Compute Ratio crashes when the divisor is zero** "
+         "(high): app.py:6 `return a / b` divides by b with no check, and lib/use.py:2 calls ratio(1, 0), so "
+         "clicking Compute Ratio with a divisor of 0 raises ZeroDivisionError. Fix: check b before dividing.")
 STUB = r"""#!/usr/bin/env bash
 prompt="${@: -1}"
 nonce=$(grep -o 'COVERED-[0-9a-f]\{8\}' <<<"$prompt" | head -1 | cut -d- -f2)
@@ -48,6 +55,7 @@ if [[ -n "$vnonce" && "${STUB_MODE:-find}" =~ ^(find|none)$ ]]; then
   for i in $(seq 1 "$n"); do echo "VERDICT-$vnonce | $i | ${STUB_VERDICT:-real} | checked the code"; done
   exit 0
 fi
+[[ "$prompt" == *"<<<ANSWER"* ]] && STUB_MODE="${STUB_REFORMAT:-find}"
 case "${STUB_MODE:-find}" in
   find) session
         echo "I followed ratio to its callers."
@@ -102,6 +110,7 @@ case "${STUB_MODE:-find}" in
         echo "COVERED-$nonce | app.py and its callers in lib/" ;;
   none) session; echo "COVERED-$nonce | looked, nothing" ;;
   noend) session; echo "I ran out of steps" ;;
+  prose) session; echo "$PROSE" ;;
   down) echo "HTTP 502: bad gateway"; exit 1 ;;
   hang) session; sleep 60 ;;
   busy) session; for i in 1 2 3 4 5; do echo '{"type":"tool_use"}' >>"$HARNESS_HOST_EVENTS_FILE"; sleep 1; done
@@ -527,13 +536,15 @@ class StubCase(unittest.TestCase):
         self.state = os.path.join(tempfile.mkdtemp(prefix="fa-state-"), "findings")
         os.makedirs(self.state)
         bin_dir = tempfile.mkdtemp(prefix="fa-bin-")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.state), True)
+        self.addCleanup(shutil.rmtree, bin_dir, True)
         self.harness = os.path.join(bin_dir, "harness")
         with open(self.harness, "w") as f:
             f.write(STUB)
         self.log = os.path.join(bin_dir, "stub.log")
-        self.env = dict(os.environ, FINDINGS_GAP="0", STUB_LOG=self.log, STUB_MODE="find")
+        self.env = dict(os.environ, FINDINGS_GAP="0", STUB_LOG=self.log, STUB_MODE="find", PROSE=PROSE)
         self.old_env = dict(os.environ)
-        os.environ.update(STUB_LOG=self.log, STUB_MODE="find")
+        os.environ.update(STUB_LOG=self.log, STUB_MODE="find", PROSE=PROSE)
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -838,6 +849,92 @@ class PassTest(StubCase):
         listing = {n["area"]: n for n in self.read("knowledge/index.json")["notes"]}
         self.assertEqual((listing["."]["changed"], listing["lib"]["changed"]), (True, False))
         self.assertTrue(w.note_old([x for x in w.units[repo] if x.area == "."][0]))
+
+    def test_the_answer_goes_in_the_finish_summary(self):
+        u = fa.Unit("/r/app", ".", "bug", ["app.py"], "x")
+        for p in (fa.build_prompt(u, "", [], [], "abcd1234"),
+                  fa.build_verify_prompt("app", [], "abcd1234"),
+                  fa.build_reformat_prompt(u, PROSE, "abcd1234")):
+            self.assertIn(fa.HAND_IN, p)
+            self.assertIn("call finish with", p)
+        r = fa.build_reformat_prompt(u, PROSE, "abcd1234")
+        self.assertIn("<<<ANSWER\n" + PROSE + "\nANSWER>>>", r)
+        self.assertIn("BUG-abcd1234", r)
+        self.assertIn("COVERED-abcd1234", r)
+        self.assertEqual(fa.answer_of("[harness] session: ses_x\n=====\n   model:    harness/m\nshort"), "")
+        self.assertEqual(fa.answer_of("[harness] session: ses_x\n" + PROSE), PROSE)
+        self.assertEqual(fa.nonce_in("x\n**BUG-0badf00d**\n"), "0badf00d")
+
+    def test_an_answer_in_its_own_words_is_written_in_the_format(self):
+        repo = make_repo({"app.py": APP, "lib/use.py": USE})
+        r = self.run_once(repo, mode="prose")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        log = self.stub_log()
+        self.assertIn("pass=1", log)
+        self.assertIn("pass=2", log)   # the reformat session
+        with open(self.log + ".prompt") as f:
+            prompt = f.read()
+        self.assertIn(PROSE, prompt)
+        led = self.read("ledger.json")
+        (p,) = led["pending"]
+        self.assertEqual((p["cand"]["path"], p["cand"]["line"]), ("app.py", 6))
+        first, again = led["passes"]
+        self.assertEqual((first["outcome"], first["found"], first["recovery"]), ("waiting", 1, "reformatted"))
+        self.assertEqual((again["kind"], again["outcome"]), ("reformat", "none"))
+        e = led["units"][f"{repo}:.:bug"]
+        self.assertEqual((e["outcome"], e.get("failures")), ("waiting", 0))
+        # the reformat session fails too: the pass fails, and is not tried again
+        commit(repo, {"app.py": APP + "# more\n"})
+        self.run_once(repo)   # the checker
+        r = self.run_once(repo, mode="prose", extra_env={"STUB_REFORMAT": "noend"})
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        led = self.read("ledger.json")
+        failed = [x for x in led["passes"] if x["outcome"] == "failed" and not x.get("kind")]
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(failed[0]["recovery"].startswith("reformat: "))
+
+    def test_findings_failed_passes_left_in_their_answers_are_recovered(self):
+        repo = make_repo({"app.py": APP, "lib/use.py": USE})
+        os.makedirs(os.path.join(self.state, "sessions"))
+        outs = {1: "[harness] session: ses_old1\nITEM-deadbeef | unify/Standard | app.py:10, lib/use.py:2 | "
+                   "return sum(items) | use math.fsum in both\nITEM-deadbeef | safety | app.py:6 | return a / b "
+                   "| b = 0 raises\nThat is all.\n",
+                2: "[harness] session: ses_old2\n" + PROSE + "\n",
+                3: "[harness] session: ses_old3\n[harness] opencode error: HTTP 429 Too Many Requests\n"}
+        passes = []
+        for n, text in outs.items():
+            with open(os.path.join(self.state, "sessions", f"{n:06d}.out"), "w") as f:
+                f.write(text)
+            passes.append({"n": n, "session": f"ses_old{n}", "repo": repo, "area": ".",
+                           "lens": "cleanup" if n == 1 else "bug", "outcome": "failed",
+                           "covered": "the session ended (0) without its COVERED line", "out": f"sessions/{n:06d}.out"})
+        with open(os.path.join(self.state, "ledger.json"), "w") as f:
+            json.dump({"version": 3, "pass_n": 3, "passes": passes}, f)
+        # the tagged answer is parsed: no session
+        self.assertEqual(self.run_once(repo).returncode, 0)
+        self.assertEqual(self.stub_log(), "")
+        led = self.read("ledger.json")
+        self.assertEqual(led["passes"][0]["outcome"], "found")
+        self.assertTrue(led["passes"][0]["recovery"].startswith("parsed: "))
+        rolls = {x["theme"]: x for x in self.read("findings.json")["findings"] if x.get("kind") == "rolling"}
+        self.assertIn("unify", rolls)
+        # the answer in its own words: a reformat session, its bug waits for the checker
+        self.assertEqual(self.run_once(repo).returncode, 0)
+        self.assertIn("pass=4", self.stub_log())
+        led = self.read("ledger.json")
+        self.assertEqual((led["passes"][1]["outcome"], led["passes"][1]["recovery"]),
+                         ("waiting", "reformatted: 1 to check, 1 thrown away"))
+        (p,) = led["pending"]
+        self.assertEqual((p["cand"]["path"], p["session"]), ("app.py", "ses_old2"))
+        self.assertEqual(led["counts"]["bug"]["recovered"], 1)
+        self.assertEqual(self.run_once(repo).returncode, 0)   # the checker
+        self.assertEqual(len([f for f in self.read("findings.json")["findings"] if f.get("kind") != "rolling"]), 1)
+        # an error is no answer: marked, never read again; then the passes go on
+        self.assertEqual(self.run_once(repo).returncode, 0)
+        led = self.read("ledger.json")
+        self.assertEqual(led["passes"][2]["recovery"], "nothing to recover")
+        self.assertFalse(led["passes"][-1].get("kind"))
+        self.assertEqual(led["passes"][-1]["n"], 6)
 
     def test_a_session_that_never_answers_fails_its_pass(self):
         repo = make_repo({"app.py": APP})

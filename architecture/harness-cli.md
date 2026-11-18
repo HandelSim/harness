@@ -1634,7 +1634,7 @@ which files a vault's findings as tickets).
   DIR...` on the saved folders, or with none saved exactly as before (no DIR,
   cwd serve's project). While it runs the card says what it explores and that
   a change applies at the next Start (Stop, then Start) or restart.
-- **Passes.** Two questions (`LENSES`, `PROMPT_VERSION` 4). A `bug` pass hunts
+- **Passes.** Two questions (`LENSES`, `PROMPT_VERSION` 6). A `bug` pass hunts
   for bugs a user can hit, one per entry point (`entries_of`: a code file
   `ENTRY_RE` matches, Qt `connect(...triggered|clicked...)`, `addAction`,
   `on_x_clicked`, routes, argparse and the like, and each `.ui` form as the
@@ -1691,7 +1691,27 @@ which files a vault's findings as tickets).
   `unify/<section>`). Both end with
   the area's note between `KNOWLEDGE-<nonce>` and `END-KNOWLEDGE-<nonce>` (up
   to 2 more for other areas) and one `COVERED-<nonce> | ...` line; a session
-  that ends with none of those failed.
+  that ends with none of those failed. Every prompt (pass, verify, reformat)
+  carries `HAND_IN`: the proxy's require-tool mode ends a turn only through
+  `finish` and puts its `summary` in place of the message text, so the answer
+  has to be the summary itself, tags and all; blocks written in the message
+  and a summary in the model's own words are lost.
+- **Answers in the model's own words.** A pass that exits 0 without the
+  format but with an answer (`answer_of`: the output without harness's banner
+  and `[harness]` lines, at least `ANSWER_MIN` 200 chars) gets one
+  `reformat` session (`build_reformat_prompt`: the answer's last 30k chars,
+  the bug or item format with a new nonce; it looks for nothing new and
+  checks each place in the snapshot). What it writes goes through the same
+  checks (`accept_bugs`, then the checker; `accept_items`) and the pass counts
+  as answered; the pass record gets `recovery`, the session one
+  `kind: reformat`. Failed passes still in `passes` whose output holds an
+  answer (`to_recover`, each iteration after the checker and before the
+  next pass; not in map-only mode) are recovered: blocks with the pass's
+  nonce (`nonce` in the record, else `nonce_in` the output) are parsed with
+  no session, otherwise a reformat session runs. The record gets `recovery`
+  (`parsed: ...`, `reformatted: ...`, `nothing to recover`, `reformat: <why>`)
+  and is not read again; a reformat that failed on the upstream (`infra`) is
+  left unmarked and tried later. `counts.<lens>.recovered`, `.reformats`.
 - **Bug reports.** `check_bug` throws a block away (counted by reason in
   `counts.bug.why`) unless: title, where and line parse (`format`); the
   whitespace-folded evidence is within 8 lines of where in HEAD
@@ -1780,8 +1800,8 @@ which files a vault's findings as tickets).
   covered; the file index; counts per question (`bug`, `cleanup`, `verify`;
   `why`: thrown away by reason); `pending`, the reports waiting for the
   checker; `dismissed`, archived findings the store dropped (2000); `passes`, the last 200
-  sessions `{n, session, repo, area, lens, started, ended, outcome, found,
-  rejected, covered, notes, out}`; `knowledge`, per `repo:area` the note's
+  sessions `{n, session, repo, area, entry, lens, started, ended, outcome, found,
+  rejected, covered, notes, out, nonce}`, plus `kind` and `recovery` (above); `knowledge`, per `repo:area` the note's
   file, session, lens, area sha, HEAD and summary), `agent.json` (state,
   heartbeat, unit, session, pass_pid, last error, counts, `todo` changed
   passes, `units` passes in the rotation, `pending`, `notes`), `sessions/N.out` (the
