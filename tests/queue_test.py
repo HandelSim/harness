@@ -161,6 +161,8 @@ if stage == "planning":
     if planner:
         open(os.environ["FAKE_CALLS"] + ".planners", "a").write(planner.group(1) + "\n")
         panel_span("d" + planner.group(1))
+        if os.environ.get("FAKE_PANEL_FINDINGS"):   # each planner sees something off the ticket
+            open(path("append one bullet to"), "a").write(f"- x.py:{planner.group(1)}: odd (seen while planning ABC-1)\n")
         bad = os.environ.get("FAKE_BAD_DRAFTS", "").split(",")
         if planner.group(1) in bad:   # a draft that is not a plan
             open(path("Write the plan to"), "w").write("I looked at the code.\n")
@@ -5573,7 +5575,7 @@ class PanelTest(Base):
         return sorted(f for f in os.listdir(self.notes()) if "-draft-" in f or re.search(r"-review-\w+\.md$", f))
 
     def test_three_planners_drafts_merged_into_the_plan(self):
-        os.environ["FAKE_PANEL_SLEEP"] = "3"
+        os.environ.update(FAKE_PANEL_SLEEP="3", FAKE_PANEL_FINDINGS="1")
         self.add("ABC-1")
         rc, out = self.run_queue("--planners", "3", "--planner-models", "m-one,m-two", "--reviewers", "general")
         st = self.status()
@@ -5610,7 +5612,7 @@ class PanelTest(Base):
         self.assertEqual(self.drafts_in_vault(), [])
         # what each planner found is in the ticket's findings file, theirs gone
         found = cat(os.path.join(self.notes(), "ABC-1-findings.md"))
-        self.assertGreaterEqual(found.count("seen while planning ABC-1"), 3, found)
+        self.assertEqual(sorted(re.findall(r"x\.py:(\d)", found)), ["1", "2", "3"], found)
         self.assertEqual([f for f in os.listdir(self.notes()) if re.search(r"-findings-\w+\.md$", f)], [])
         d = os.path.join(tq.Queue(self.state).dir("ABC-1"), "panel")
         self.assertEqual(sorted(os.listdir(d)), ["plan-d1.md", "plan-d2.md", "plan-d3.md", "plan-ledger.md",

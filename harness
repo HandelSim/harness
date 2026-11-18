@@ -7370,10 +7370,12 @@ QUEUE_PLAN_REVIEW (0: each ticket's own choice, which by default waits for
 'harness queue approve'; 1 holds every plan, --no-plan-approval ones too),
 QUEUE_OUTAGE_WAIT (21600 s; 0 ends the run on an outage), QUEUE_IDLE_MIN (20;
 0 turns the idle watchdog off), QUEUE_PLANNERS (3; a ticket's first plan is
-drafted by this many planners, one after the other, and merged; 1: one
+drafted by this many planners, all at once, and merged; 1: one
 planner), QUEUE_PLANNER_MODELS (one model per planner, comma-separated;
 default QUEUE_MODEL), QUEUE_REVIEWERS (general,ux,standards; a loop's first
-review is one reviewer per lens, merged; general: one reviewer), QUEUE_STAGE_TIMEOUT (10800 s; one agent
+review is one reviewer per lens, all at once, merged; general: one reviewer;
+on rate limits, lower MODEL_CONTEXT_LENGTH so each agent compacts sooner, or
+use fewer planners or lenses), QUEUE_STAGE_TIMEOUT (10800 s; one agent
 launch at most), QUEUE_PARALLEL (1; tickets a run works at a time,
 the same as run --parallel N), QUEUE_DEBUG (1; 0 turns the debug agent off),
 QUEUE_DEBUG_TIMEOUT (1200 s; one debug agent at most), QUEUE_WATCH (1: a run

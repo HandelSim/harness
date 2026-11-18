@@ -384,7 +384,9 @@ by the queue as the card's `do` list and shown as bullets right after "Done
 when": what this stage does and does not do, e.g. plan writes no code,
 implement and fix check the build and write no tests), a note when the
 last attempt failed, the Must fix count, and pointers to `KEY-task.md` (the
-stage's whole prompt, there while it runs), the ticket's copy and its state
+stage's whole prompt, there while it runs; a panel member's card has `part`,
+its tag, `_CARD_PART_RE` lowercase letters, digits and dashes up to 20, and
+points at `KEY-task-<part>.md`, its own), the ticket's copy and its state
 note, each to be read "when you need a detail", not "when you cannot see it"
 (a model that sees one message cannot tell, and loops). A free model loses the
 stage prompt, which is only in its first message, after its first tool call:

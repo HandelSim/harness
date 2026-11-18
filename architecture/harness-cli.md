@@ -822,14 +822,28 @@ not a follow-up: `plan_panel_wanted`) is drafted by `--planners` (`QUEUE_PLANNER
 loop's first review (fix round 0, not the owner's comments) by one reviewer per
 `--reviewers` lens (`QUEUE_REVIEWERS` general,ux,standards; general first and
 needed, the only one that runs checks and gives criterion verdicts). Members run
-one after the other through `run_agent(member=)`: their own `.out`
-(`<stage>-N-<tag>.out`), model and card, never resumed (cut off, a member starts
-again), the stage's session and kept result cleared after each. Files: a member
-writes `KEY-plan-draft-<n>.md` / `KEY-review-<lens>.md` in the vault's ticket notes;
-the queue deletes a stale one first (`panel_file`, dropped on a halt too) and moves
-it to `DIR/panel/<stage>-<tag>.md` as the member ends (`collect`, before the vault
-commit), so no member reads another's and the vault keeps only KEY-plan.md and
-KEY-review.md. `st["panel"]` is the panel at work (members done, so a run that dies
+at once, one thread each (`launch_all`, joined by the main thread, which alone
+takes Ctrl-C): each through `launch(member=)` with its own `.out`
+(`<stage>-N-<tag>.out`), model, card and launch id, never resumed (cut off, a
+member starts again); the stage's session and kept result are cleared first, an
+in-place project gets one snapshot and one launch span for the lot, and `st` is
+changed and saved only under `st_lock`. Each member's prompt is in its own task
+file `KEY-task-<tag>.md` (`member_task`; the card's `part` names it, see
+proxy.md; `PART_IGNORE` keeps another slot's vault commit off it) and it notes
+what it sees off the ticket in its own `KEY-findings-<tag>.md` (`member_findings`,
+its `{{FINDINGS_FILE}}`), appended to KEY-findings.md when the panel ends, so
+members never write the same file. A member writes `KEY-plan-draft-<n>.md` /
+`KEY-review-<lens>.md` in the vault's ticket notes; the queue deletes a stale one
+first (dropped on a halt too) and moves it to `DIR/panel/<stage>-<tag>.md` as the
+member ends (`take_result`, which also runs its check and records it), so the vault
+keeps only KEY-plan.md and KEY-review.md. Running at once, a member could read
+another's file: the prompt (`PANEL_NOTE_PLAN`/`_REVIEW`) tells it not to, which is
+all that keeps their looks independent. The vault is synced once, after the last
+member. `st["agents"]` holds each running member's pid and launch id (run.json
+`agents`, `agents_of`), so the orphan check, `end_run` and a halt stop every
+member; one still running when the panel ends is reaped (`reap_one`). A halt or
+kill keeps the members that ended (a new run launches only the rest); after the
+join an interrupt wins over an infra error over any other error. `st["panel"]` is the panel at work (members done, so a run that dies
 goes on with the rest; `advance` drops it), `st["panels"][stage]` what it did (the
 Ticket tab's "How it was made"). The plan's drafts that pass `check_plan` are merged
 by one model call (`plan_merge.md`, the planner model) that writes the plan, then
