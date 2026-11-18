@@ -8659,7 +8659,9 @@ _serve_end() {
 
 # Whether this shell is the terminal's foreground job: a background one that
 # reads the terminal is stopped (SIGTTIN), and one that sets its modes (read
-# -s) changes them under the shell in front.
+# -s) changes them under the shell in front. Status 0 yes, 1 no, 2 it cannot
+# tell: no terminal group, as Git Bash's /proc gives for every process (-1),
+# or a terminal that is not this shell's controlling one (then no job control).
 _serve_tty_foreground() {
     local st pg="" tp=""
     if [[ -r "/proc/$$/stat" ]]; then
@@ -8669,7 +8671,22 @@ _serve_tty_foreground() {
     else
         read -r pg tp _ < <(ps -o pgid= -o tpgid= -p "$$" 2>/dev/null) || return 1
     fi
+    [[ "$tp" == "-1" ]] && return 2
     [[ "$pg" =~ ^[0-9]+$ && "$pg" == "$tp" ]]
+}
+
+# As _serve_tty_foreground, once, where that cannot tell (Git Bash): perl
+# (Git for Windows has it) asks the terminal. In front, or still no answer
+# (no perl, no POSIX), counts as in front.
+_serve_tty_in_front() {
+    local rc=0
+    _serve_tty_foreground || rc=$?
+    (( rc == 2 )) || return "$rc"
+    command -v perl >/dev/null 2>&1 || return 0
+    rc=0
+    perl -MPOSIX -e '$t = POSIX::tcgetpgrp(0); exit($t > 0 ? ($t == getpgrp() ? 0 : 3) : 2)' \
+        2>/dev/null || rc=$?
+    (( rc != 3 ))
 }
 
 # harness serve's u key: harness upgrade in this terminal, once confirmed.
@@ -8700,7 +8717,8 @@ _serve_wait_keys() {
     while (( ! serve_restart )); do
         if ! kill -0 "$oc" 2>/dev/null; then wait "$oc" || serve_rc=$?; return; fi
         if ! kill -0 "$pub" 2>/dev/null; then wait "$pub" || serve_rc=$?; return; fi
-        if ! _serve_tty_foreground; then sleep 1; continue; fi
+        # Git Bash cannot tell each time (2): it was in front at the start.
+        _serve_tty_foreground || (( $? == 2 )) || { sleep 1; continue; }
         key=""
         if read -rsn1 -t 1 key; then
             case "$key" in
@@ -8945,7 +8963,7 @@ HELP
     # Keys only from a terminal this serve is in front of; otherwise (a
     # pipe, a service, a background job) it waits on the servers as before.
     local serve_keys=0
-    [[ -t 0 ]] && _serve_tty_foreground && serve_keys=1
+    [[ -t 0 ]] && _serve_tty_in_front && serve_keys=1
     echo "   Ctrl-C stops serve; the proxy stays up ('harness host down')" >&2
     if (( serve_keys )); then
         echo "   u runs harness upgrade here; serve then restarts on the new code" >&2

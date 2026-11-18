@@ -406,6 +406,7 @@ if [[ "\$1" == upgrade ]]; then
         fail) exit 3 ;;
         hang) echo hang >>"\$up_log"; sleep 60; exit 0 ;;
         noop) exit 0 ;;
+        restart) harness_serve_refresh; exit 0 ;;   # no terminal questions (S12 E)
         *)    # a prompt read from the terminal, then cmd_upgrade's restarts
             read -r -p "stub upgrade question? " a </dev/tty
             echo "answer=\$a" >>"\$up_log"
@@ -534,7 +535,7 @@ grep -q "harness upgrade restarts it here on the new code" "$SL/pids.err" \
 # (no wait on serve, which is waiting on it), the keys after that restart, a
 # server exiting, Ctrl-C idle and in the upgrade, the terminal's modes after,
 # and a serve that is a background job (no keys, not stopped by SIGTTIN).
-STUB_PIDS="$SL/pids12" PATH="$SL/bin:$PATH" "$PY" - "$FC/harness" "$SPORT" "$SL/root/state" "$SL" <<'EOF' \
+STUB_PIDS="$SL/pids12" REAL_HARNESS="$HARNESS" PATH="$SL/bin:$PATH" "$PY" - "$FC/harness" "$SPORT" "$SL/root/state" "$SL" <<'EOF' \
     || fail "S12: serve's u key (above)"
 import os, pty, re, select, signal, socket, sys, termios, time
 harness, port, state, sl = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
@@ -604,10 +605,27 @@ def children(pid, name):
 
 class Term:
     """harness serve on a pseudo-terminal: its foreground job, or (bg) a
-    background job of it, as `harness serve &` in a shell."""
-    def __init__(self, bg=False):
+    background job of it, as `harness serve &` in a shell, or (noctty) on one
+    that is not its controlling terminal: /proc then gives it no terminal
+    group (-1), as Git Bash's /proc gives every process."""
+    def __init__(self, bg=False, noctty=False):
         self.buf = b""
         argv = [harness, "serve", "--port", str(port)]
+        if noctty:
+            fd, slave = os.openpty()
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    os.setsid()   # a new session; an inherited fd is no ctty
+                    os.close(fd)
+                    for i in (0, 1, 2):
+                        os.dup2(slave, i)
+                    os.execv(argv[0], argv)
+                finally:
+                    os._exit(127)
+            os.close(slave)
+            self.pid, self.fd = pid, fd
+            return
         pid, fd = pty.fork()
         if pid == 0:
             try:
@@ -804,8 +822,70 @@ os.kill(spid, signal.SIGTERM)
 term.wait()
 all_gone("a background serve's SIGTERM")
 os.close(term.fd)
+
+# E: /proc gives no terminal group (-1), as on Git Bash, where the u key
+# never came up: keys all the same, and again after the upgrade's restart.
+mode("restart")
+open(upf, "w").close()
+term = Term(noctty=True)
+term.expect(r"u runs harness upgrade here; serve then restarts on the new code")
+up(6)
+first = stamp()
+with open(f"/proc/{term.pid}/stat") as f:
+    tpgid = f.read().rsplit(")", 1)[1].split()[5]
+if tpgid != "-1":
+    fail(f"E: want serve's /proc terminal group -1 (as Git Bash), got {tpgid}")
+m = term.mark()
+term.send(b"u")
+term.expect(r"\[y/N\] ", m)
+term.send(b"y")
+term.expect(r"harness was upgraded; starting again on the new code", m)
+up(7)
+until(lambda: stamp() != first and len(stamp()) == 3, 20, "E: serve.pid did not get a new stamp")
+term.expect(r"u runs harness upgrade here", m)
+m = term.mark()
+term.send(b"u")
+term.expect(r"\[y/N\] ", m)
+term.send(b"n")
+term.expect(r"not upgrading", m)
+term.modes_restored("E: keys")
+os.kill(term.pid, signal.SIGTERM)
+term.wait()
+all_gone("E: SIGTERM")
+os.close(term.fd)
+
+# F: where /proc cannot tell (Git Bash), perl asks the terminal: in front
+# from the foreground, not from a background job of it.
+src = ('HARNESS_SOURCE_ONLY=1 source "$0" 2>/dev/null; _serve_tty_foreground() { return 2; }; '
+       '_serve_tty_in_front; echo "front=$?"')
+for bg, want in ((False, "front=0"), (True, "front=1")):
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            if bg:
+                c = os.fork()
+                if c == 0:
+                    os.setpgid(0, 0)
+                    os.execvp("bash", ["bash", "-c", src, os.environ["REAL_HARNESS"]])
+                os._exit(os.waitstatus_to_exitcode(os.waitpid(c, 0)[1]) & 0xff)
+            os.execvp("bash", ["bash", "-c", src, os.environ["REAL_HARNESS"]])
+        finally:
+            os._exit(127)
+    out = b""
+    while True:
+        try:
+            d = os.read(fd, 4096)
+        except OSError:
+            break
+        if not d:
+            break
+        out += d
+    os.waitpid(pid, 0)
+    os.close(fd)
+    if want.encode() not in out:
+        fail(f"F: {'background' if bg else 'foreground'}: want {want}, got {out[-300:]!r}")
 EOF
-ok "S12: u runs harness upgrade in serve's terminal (asked first) and serve restarts on the new code; no keys from a pipe or a background job; Ctrl-C and a server exiting still end it all"
+ok "S12: u runs harness upgrade in serve's terminal (asked first) and serve restarts on the new code; also where /proc gives no terminal group (Git Bash); no keys from a pipe or a background job; Ctrl-C and a server exiting still end it all"
 
 # --- S13: an upgrade from serve's u key restarts the proxy serve holds --------
 # host_proxy_refresh leaves the proxy alone while another harness holds a
