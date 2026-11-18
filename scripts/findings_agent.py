@@ -276,8 +276,8 @@ THEMES = {
 THEME_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 
 QUESTIONS = {
-    "bug": "Find bugs a user of the application can run into. Pick one or two things a user does that start in "
-           "this file (a menu action, a button, a dialog, a shortcut, a setting, opening or saving a file, a "
+    "bug": "Find bugs a user of the application can run into. Pick one or two things a user does that start "
+           "here (a menu action, a button, a dialog, a shortcut, a setting, opening or saving a file, a "
            "command, a page). Find the handler each one runs and follow it through every function it calls, in "
            "any file, to its effect: what is read, computed, stored and shown. Read the code on the way and grep "
            "for callers and callees. Look for an input or a sequence of actions a user can really produce that "
@@ -563,14 +563,15 @@ def units_of(root, files):
     return out
 
 
-def due(units, ledger_units, prompt_hash, t):
+def due(units, ledger_units, prompt_hash, t, last=""):
     """(first, rest): the passes to run, in order. First the ones whose area changed,
     whose prompt (its version, the owner's notes, for cleanup the themes) changed or
     that never ran, bug and cleanup in turn; then every other one, the one explored
     longest ago first, so the agent never runs out: it goes over each again, from what
     its note and the last passes covered. Left out: a failed pass while it is
     deferred, and one that failed FAIL_SET_ASIDE times in a row, for SET_ASIDE seconds
-    or until its area changes. prompt_hash: {lens: hash}."""
+    or until its area changes. prompt_hash: {lens: hash}; last: the lens of the pass
+    before, which goes after the other one this time."""
     first, rest, rank = [], [], {}
     for u in units:
         e = ledger_units.get(u.key) or {}
@@ -588,7 +589,8 @@ def due(units, ledger_units, prompt_hash, t):
     for u in first:   # in turn: the n-th bug pass, then the n-th cleanup pass
         rank[u.key] = seen.get(u.lens, 0)
         seen[u.lens] = rank[u.key] + 1
-    first.sort(key=lambda u: (rank[u.key], LENSES.index(u.lens)))
+    turn = [x for x in LENSES if x != last] + [x for x in LENSES if x == last]
+    first.sort(key=lambda u: (rank[u.key], turn.index(u.lens)))
     rest.sort(key=lambda x: (x[0], x[1], x[2].root, x[2].area, x[2].entry))
     return first, [u for _, _, u in rest]
 
@@ -669,7 +671,7 @@ def themes_of(text):
             if cur:
                 got[cur] = ["", []]
             continue
-        if cur is None:
+        if cur is None or line.lstrip().startswith("#"):
             continue
         t = re.match(r"^\s*title\s*:\s*(.+)$", line, re.I)
         if t and not got[cur][0] and not got[cur][1]:
@@ -860,6 +862,12 @@ def ui_norm(text):
     s = s.strip().strip("\"'`“”‘’").strip()
     s = re.sub(r"(\.\.\.|…)$", "", s).strip().rstrip(":").strip()
     return norm(s)
+
+
+def ui_last(text):
+    """ui_norm of a control's text, the last part of a "Menu > Item" path."""
+    parts = [x for x in re.split(r"\s*(?:>|→|->|›)\s*", str(text or "")) if x.strip()]
+    return ui_norm(parts[-1]) if parts else ""
 
 
 def ui_texts(path, text):
@@ -1074,10 +1082,10 @@ def duplicate_of(c, known):
     of its where or its trace, sharing DUP_SHARE of its title's words; or the same control
     on the same file), else None."""
     places = [(c["path"], c["line"])] + [(h["path"], h["line"]) for h in c.get("trace") or []]
-    cu = ui_norm(c.get("ui"))
+    cu = ui_last(c.get("ui"))
     for k in known:
         text = k.get("title") or k.get("text") or ""
-        if cu and k.get("ui") and ui_norm(k["ui"]) == cu and same_place(k.get("path"), c["path"]) \
+        if cu and k.get("ui") and ui_last(k["ui"]) == cu and same_place(k.get("path"), c["path"]) \
                 and share(c["title"], text) >= DUP_SHARE / 2:
             return k
         kl = ([(k["path"], k.get("line") or 0)] if k.get("path") else []) + \
@@ -1528,8 +1536,8 @@ class Worker:
     def ui_ok(self, root, text):
         """Whether the code at HEAD has a control's text (the last of a "Menu > Item" path)."""
         every = (self.ui.get(root) or (set(), {}))[0]
-        parts = [x for x in re.split(r"\s*(?:>|→|->|›)\s*", text) if x.strip()]
-        return bool(parts) and (ui_norm(text) in every or ui_norm(parts[-1]) in every)
+        last = ui_last(text)
+        return bool(last) and (ui_norm(text) in every or last in every)
 
     def maintain(self, root, files, texts):
         """Open findings of this repo whose evidence is no longer in the HEAD file go
@@ -2278,7 +2286,8 @@ class Worker:
         prompt_hash = {"bug": sha16(PROMPT_VERSION + "\0" + notes),
                        "cleanup": sha16(PROMPT_VERSION + "\0" + notes + "\0" + self.themes_text())}
         units = [u for r in self.repos for u in self.units.get(r, [])]
-        first, rest = due(units, self.ledger["units"], prompt_hash, now())
+        last = next((p.get("lens") for p in reversed(self.ledger["passes"]) if p.get("lens") in LENSES), "")
+        first, rest = due(units, self.ledger["units"], prompt_hash, now(), last=last)
         self.status.set(open=n_open, todo=len(first), units=len(units), reason=reason, pending=len(self.ledger["pending"]),
                         notes=len(self.ledger["knowledge"]), counts=self.ledger["counts"])
         if not first and not rest:   # no area at all, or every pass failing: look again in a minute
@@ -2638,6 +2647,36 @@ def archive_old_main(a):
     return 0
 
 
+THEMES_HEAD = """# The findings agent's rolling lists. Each list is one finding on the board that
+# grows as cleanup passes add items to it. A "## name" heading starts a list (a-z,
+# 0-9, -); an optional title: line names it on the board; the text says what goes
+# on it. The built-in lists (unused, dead, unify, safety) are on unless a heading
+# with their name says "off"; a heading with their name and other text replaces
+# theirs. Lines starting with # are ignored: take the # off the example's lines to
+# use it.
+"""
+THEMES_SAMPLE = """## nvector
+title: Position math not done through the n-vector library
+Every computation on geographic positions (distance, bearing, interpolation,
+offsets, "is inside") that is not done through the project's n-vector library:
+plain vector subtraction or lat/lon arithmetic on positions, a local copy of
+an n-vector formula. Name the library function to use instead."""
+
+
+def themes_main(a):
+    """The lists cleanup passes add to (the owner's themes.md over the built-ins); with
+    --seed, the text a new themes.md starts from."""
+    if a.seed:
+        print(THEMES_HEAD + "#\n" + "\n".join("# " + x for x in THEMES_SAMPLE.splitlines()))
+        return 0
+    text = read_text(os.path.join(a.state, "themes.md"), THEMES_MAX)
+    for slug, title, desc in themes_of(text):
+        print(f"## {slug}\ntitle: {title}\n{desc}\n")
+    if not themes_of(text) or not any(k not in THEMES for k, _, _ in themes_of(text)):
+        print(f"(none of your own yet: add them with harness findings themes, for example)\n\n{THEMES_SAMPLE}")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="findings_agent.py")
     sub = ap.add_subparsers(dest="cmd")
@@ -2657,8 +2696,10 @@ def main(argv=None):
     p.add_argument("--state", required=True)
     p.add_argument("--json", action="store_true")
     p.add_argument("--running", action="store_true")
-    p = sub.add_parser("archive-old")
-    p.add_argument("--state", required=True)
+    for name in ("archive-old", "themes"):
+        p = sub.add_parser(name)
+        p.add_argument("--state", required=True)
+    p.add_argument("--seed", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd in ("run", "_worker"):
         a.state = os.path.abspath(a.state)
@@ -2670,6 +2711,8 @@ def main(argv=None):
         return status_main(a)
     if a.cmd == "archive-old":
         return archive_old_main(a)
+    if a.cmd == "themes":
+        return themes_main(a)
     ap.print_help()
     return 2
 

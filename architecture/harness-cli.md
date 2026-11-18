@@ -1572,7 +1572,7 @@ its stage launches send the single header on the shared proxy. Covered by `tests
 
 ### Findings agent
 
-`harness findings start|run [DIR...]|stop|status|notes` (`cmd_findings`,
+`harness findings start|run [DIR...]|stop|status|notes|themes|archive-old` (`cmd_findings`,
 `scripts/findings_agent.py`) is a background agent that explores the
 committed code (HEAD) of DIR (default: the git top folder here, else the
 repos it explored last) with real opencode sessions on a free model. It never
@@ -1619,20 +1619,25 @@ which files a vault's findings as tickets).
   DIR...` on the saved folders, or with none saved exactly as before (no DIR,
   cwd serve's project). While it runs the card says what it explores and that
   a change applies at the next Start (Stop, then Start) or restart.
-- **Passes.** A pass is one area of a repository (its files' folder, two
-  levels deep: `serve`, `scripts`, `tests/fixtures`, `.` for the top) times one
-  question: `bug` (areas with code), `trace` (code: one path followed end to
-  end across files and written into the note), `ui` (areas with UI files or
-  folders, `serve` among them), `cleanup` (code or docs). The file index is `git
-  ls-tree` blobs that are not symlinks, over 400 KB, binary, vendored, lock
-  files, generated or secrets (`vault_ingest`'s `SKIP_*` and `SECRET_PATH`).
-  An area's sha is over its files' paths and blobs. Order: changed, new, or a
-  changed prompt version or owner notes first (bug, trace, ui, cleanup), then
-  every other pass, the one run longest ago first (`due` returns both lists),
-  so it goes round every area again, each time from the area's note and what
-  earlier passes covered. When HEAD moves, an open finding whose evidence left
-  the file becomes `stale`. Three failures in a row set a pass aside for 24 h
-  or until its area changes.
+- **Passes.** Two questions (`LENSES`, `PROMPT_VERSION` 4). A `bug` pass hunts
+  for bugs a user can hit, one per entry point (`entries_of`: a code file
+  `ENTRY_RE` matches, Qt `connect(...triggered|clicked...)`, `addAction`,
+  `on_x_clicked`, routes, argparse and the like, and each `.ui` form as the
+  code file of its name), or one per area when the repository has none. A
+  `cleanup` pass adds items to the rolling lists, one per area with code.
+  An area is the files' folder two levels deep (`serve`, `tests/fixtures`,
+  `.` for the top). The file index is `git ls-tree` blobs that are not
+  symlinks, over 400 KB, binary, vendored, lock files, generated or secrets
+  (`vault_ingest`'s `SKIP_*` and `SECRET_PATH`). An area's sha is over its
+  files' paths and blobs. `due` orders them: changed, new, or a changed
+  prompt (version, owner notes, for cleanup `themes.md`) first, bug and
+  cleanup in turn, the lens of the last pass going second; then every other
+  pass, the one run longest ago first, so it never runs out. Waiting reports
+  (`ledger.pending`) are checked before any pass. When HEAD moves an open
+  finding whose evidence left the file becomes `stale` (else follows it to
+  its line), a rolling item whose code or file left goes `gone`, and the
+  unused scan runs. Three failures in a row set a pass aside for 24 h or until
+  its area changes.
 - **Session.** `snapshot` puts HEAD (`git archive`, regular files only, no
   `..` or absolute paths, nothing `SECRET_PATH` matches) in
   `tree/<repo>-<hash>` once per HEAD. The pass runs `harness host
@@ -1649,17 +1654,69 @@ which files a vault's findings as tickets).
   secret-looking files and allows only a list of reading commands (cat, grep,
   rg, find, ls, ...) with no redirect, pipe, `;`, `&`, `$` (so no `$HOME`),
   `..`, absolute path, `~`, `find -exec/-delete` and the like; `vault_prepare`
-  and `ticket_prepare` skip, so no vault or ticket is attached. The prompt
-  names the area and its files, tells the agent to follow calls, imports,
-  config and data across files, then gives the question, `notes.md` (4k
-  chars), what earlier passes of the area covered (5) and the area's open
-  findings (25), the area's note (8k chars, marked when its files changed
-  since), and the format last: up to 8 `FINDING-<nonce> | category |
-  severity | path:line | title | evidence | detail` lines, the area's whole
-  note between `KNOWLEDGE-<nonce>` and `END-KNOWLEDGE-<nonce>` (and up to 2
-  more for other areas, `KNOWLEDGE-<nonce> AREA`), and one
-  `COVERED-<nonce> | ...` line. A session that ends without the COVERED line,
-  findings or a note failed.
+  and `ticket_prepare` skip, so no vault or ticket is attached. Before each
+  session `write_known` puts `.findings-notes/KNOWN.md` in the snapshot (at
+  most 3000 lines): every agent finding not stale (archived ones, also those
+  the store dropped, kept in `ledger.dismissed`, marked "dismissed by the
+  owner"), every ticket agent's finding (`findings_view.collect` on
+  `state/queue` and `vault.active`) and every list's items; the prompt says
+  to read it and never report what is there. A bug prompt names the entry
+  point and its area's files, the texts users see there (`ui_texts`: `tr()`,
+  `setText`, `QAction`, `.ui` `<string>`s, markup; 40), the question (follow
+  each user action's handler through every function it calls; before
+  reporting look for the guard that stops it; none is the normal answer),
+  `notes.md`, what earlier passes covered (5), the known findings in the area
+  (25), the area's note (8k chars), then the format: at most 2 `BUG-<nonce>`
+  blocks (title, severity, where, evidence, ui, steps, expected, actual,
+  trace `path:line | code` hops from the handler, why, `END-BUG-<nonce>`). A
+  cleanup prompt lists the themes and asks for at most 10 `ITEM-<nonce> |
+  list | path:line[, path:line...] | evidence | note` lines. Both end with
+  the area's note between `KNOWLEDGE-<nonce>` and `END-KNOWLEDGE-<nonce>` (up
+  to 2 more for other areas) and one `COVERED-<nonce> | ...` line; a session
+  that ends with none of those failed.
+- **Bug reports.** `check_bug` throws a block away (counted by reason in
+  `counts.bug.why`) unless: title, where and line parse (`format`); the
+  whitespace-folded evidence is within 8 lines of where in HEAD
+  (`evidence`); the ui text is in a tracked file's user-visible texts, or as
+  a literal, by the last part of a `Menu > Item` path (`ui`); 2 to 12 steps,
+  expected and actual (`steps`); 2 to 10 trace hops whose code is at their
+  line, at most one bad (`trace`). A report whose id is known or that
+  `duplicate_of` a known or waiting one (a where or trace line within 12 lines
+  of a known one on the same file and half the shorter title's words shared,
+  or the same control on the same file and a quarter) is a `duplicate`. The
+  rest wait in `ledger.pending` (at most 20). A `verify` session (same model,
+  fresh, read-only) gets up to 4 of one repository's, each with the code
+  around its lines (15 each side) and the known findings near it, is told most
+  such reports are wrong, and answers `VERDICT-<nonce> | n | real|not-real|duplicate
+  | why` per report after four questions (a guard stops it? reachable by its
+  steps? the code does what actual says? already known?). Only `real` and not
+  a duplicate of what is known now goes into `findings.json` (id `f-` plus 12
+  hex of sha1(repo, path, `bug`, evidence); `ui`, `steps`, `expected`,
+  `actual`, `trace`, `verdict`, `entry`). A report with no verdict is tried
+  again, dropped after 3 sessions; a session that failed on a rate limit,
+  refused key or down proxy goes to `trouble` and costs no try.
+- **Rolling lists.** One finding per theme and repository (`kind: rolling`,
+  id `r-<theme>-<sha16(repo)[:8]>`, `-<gen>` after the owner archives one: the
+  next item starts a new one), with `items` (`i-` plus 12 hex of the repo,
+  theme, path and evidence or locations; path, line, evidence, note,
+  locations, session, `source` pass or scan, status open or gone). Built in
+  (`THEMES`): `unused` (whole files), `dead` (code nothing calls), `unify`
+  (the same logic in two places, or own code for what std, Qt or a library
+  already used does; two places at least), `safety` (the input that breaks
+  it). `<state>/findings/themes.md` adds the owner's (`## slug`, an optional
+  `title:` line, what goes on it; a built-in's slug replaces its text, `off`
+  turns it off; `#` lines are ignored; 6000 chars). `check_item`: the places
+  in HEAD and the evidence near the first. An item already there (its id, a
+  place within 10 lines, the same evidence, for unify the same files), or
+  archived by the owner, is a duplicate; a gone item found again reopens.
+  `unused_files` (each HEAD) is mechanical: a header, resource or `.ui`
+  form (also as `ui_<name>.h`), and a C/C++ source when a build file lists
+  sources by name (none globs: `file(GLOB)`, `$$files`), that no other text
+  file names by its file name, to a fixpoint (named only by unused files:
+  unused); tests, docs, examples, vendored folders and `main.*` are left out. Scan items
+  leave when something names the file again. A pass's `unused` item must also
+  pass `unused_ok` (`git grep` of its stem and name finds only itself, its
+  pair and build files).
 - **Notes.** `take_notes` keeps a block only for an area of the repository,
   refuses one under 300 chars, under half the old note's length or naming
   none of the area's files (`knowledge_refusal`), adds the `# repo: area/`
@@ -1668,11 +1725,14 @@ which files a vault's findings as tickets).
   `INDEX.md` and `knowledge/index.json` after a note and when HEAD moves (a
   note whose area sha moved is `changed`). Before each pass `sync_notes`
   copies the repo's notes (not `.prev`) to `.findings-notes/` in its
-  snapshot, which the prompt points to; a finding there is not in HEAD, so it
-  is never kept. A finding is kept only when its path is in HEAD and its
-  whitespace-folded evidence is within 8 lines of its line. Its id is `f-` plus
-  12 hex of sha1(repo name, path, category, evidence); a known id or the same
-  title on the same path is dropped.
+  snapshot, which the prompt points to; a path there is not in HEAD, so
+  nothing citing it is kept.
+- **Owner commands.** `harness findings themes` opens `themes.md` in
+  `$EDITOR` (a new one seeded by `themes --seed`: a header and the commented
+  n-vector example) in a terminal, else prints the lists in effect. `harness
+  findings archive-old` archives on the board every open point finding with
+  no `steps` (the format before bug reports had to say how a user meets
+  them). The queue page's card edits `notes.md` and `themes.md` too.
 - **Guards.** One pass at a time, `FINDINGS_GAP` (60 s) apart, ended (TERM
   then KILL to its group) after `FINDINGS_PASS_TIMEOUT` (2400 s) or
   `FINDINGS_IDLE_TIMEOUT` (600 s) without new output (`N.events` or `N.out`
@@ -1696,23 +1756,28 @@ which files a vault's findings as tickets).
   temp+fsync+rename by the worker only; past 1500 entries the oldest stale,
   then archived, ones go), `ledger.json` (version 2: per pass key
   `repo:area:lens` the sha, prompt hash, last run, outcome, failures,
-  covered; the file index; counts per question; `passes`, the last 200
+  covered; the file index; counts per question (`bug`, `cleanup`, `verify`;
+  `why`: thrown away by reason); `pending`, the reports waiting for the
+  checker; `dismissed`, archived findings the store dropped (2000); `passes`, the last 200
   sessions `{n, session, repo, area, lens, started, ended, outcome, found,
   rejected, covered, notes, out}`; `knowledge`, per `repo:area` the note's
   file, session, lens, area sha, HEAD and summary), `agent.json` (state,
   heartbeat, unit, session, pass_pid, last error, counts, `todo` changed
-  passes, `units` passes in the rotation, `notes`), `sessions/N.out` (the
+  passes, `units` passes in the rotation, `pending`, `notes`), `sessions/N.out` (the
   last 200), `tree/`, `knowledge/<repo>-<hash>/<area>.md` (`/` as `__`, the
   top as `_top.md`) with `INDEX.md`, `knowledge/index.json`, `wanted`,
-  `agent.out` (5 MB cap), `notes.md`, `folders.json`. The queue page's card is
+  `agent.out` (5 MB cap), `notes.md`, `themes.md`, `folders.json`. The queue page's card is
   `serve/findings_agent_view.py` (`agent_card`, `agent_action`: start, stop,
-  notes, folders; the last 8 sessions, each linked to `/runs/<session>`; a link to the
+  notes, themes, folders; counts per question with why reports were thrown
+  away, reports waiting for the checker; the last 8 sessions, each linked to `/runs/<session>`; a link to the
   notes). `GET /runs/findings/notes` lists the notes (`knowledge_index`) and
   `/runs/findings/notes/<repo-slug>/<name>` renders one as markdown
   (`knowledge_text`: both names `[A-Za-z0-9_][A-Za-z0-9._-]*`, the path kept
   under `knowledge/`), `runs.render_findings_notes`/`render_findings_note`.
   On the Findings board each finding opens in place (`<details data-k>`, kept
-  open across the poll) to its whole title, detail and evidence.
+  open across the poll) to its whole title, detail and evidence; a bug to its
+  ui, steps, expected, actual, trace and the checker's verdict; a rolling one
+  (one row, `title (n)`) to its open items, each archived on its own.
 
 Covered by `tests/unit_findings_test.sh` (`tests/findings_agent_test.py`
 against a fake proxy and a stub harness standing in for the sessions,
@@ -2422,7 +2487,10 @@ offered as suggestions. It is taken as pasted: quotes
   notes (each top-level list item of `wiki/notes/tickets/KEY-findings.md` in
   the ticket's vault, for the tickets in `queue.list` and `archived.list`)
   and the findings agent's `<state>/findings/findings.json` (only its
-  `open` ones: a `stale` finding's evidence left the code). The ticket page
+  `open` ones: a `stale` finding's evidence left the code; a bug with its
+  steps, expected, actual, trace and verdict; a rolling finding as one row of
+  its open items, at most 50 listed, each item id archivable on its own and
+  kept in `archived` like a row's). The ticket page
   still shows each note as it is. A ticket finding's id is `t-` and a hash of
   its key and its text, whitespace folded; an agent finding keeps its own.
   What the owner does is kept in `<state>/findings/board.json` (`order`,

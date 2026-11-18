@@ -11,6 +11,7 @@ starts the agent the way the queue page starts a queue run: a detached
   POST /runs/findings/agent/folders save the folders for the next start (act=reset: forget them)
   POST /runs/findings/agent/stop    stop it
   POST /runs/findings/agent/notes   notes=TEXT: the notes added to every pass (at most 4000 chars)
+  POST /runs/findings/agent/themes  themes=TEXT: themes.md, the owner's rolling lists (at most 6000 chars)
 
 The chosen folders are kept in <state>/findings/folders.json ({"version": 1, "folders": [...]}).
 
@@ -37,12 +38,13 @@ import time
 esc = html.escape
 
 NOTES_MAX = 4000
+THEMES_MAX = 6000         # themes.md: the findings agent reads this much
 STALE_BEAT = 300          # a heartbeat older than this, while not stopped: the agent is not answering
 STATES = {"exploring": ("t-run", "exploring"), "scanning": ("t-run", "exploring"),
           "waiting": ("t-run", "waiting between passes"),
           "idle": ("t-wait", "idle"), "backoff": ("t-wait", "backing off"),
           "paused": ("t-wait", "paused"), "stopping": ("t-off", "stopping"), "stopped": ("t-off", "stopped")}
-LENSES = ("bug", "trace", "ui", "cleanup")
+LENSES = ("bug", "verify", "cleanup", "trace", "ui")   # trace and ui: passes of before, in old ledgers
 SLUG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,200}$")   # a knowledge/ folder or file name
 NOTE_MAX = 64 * 1024      # bytes of one area's note read
 INDEX_MAX = 4 * 1024 * 1024
@@ -52,9 +54,9 @@ FOLDER_LEN = 1024         # characters in one folder's path
 KNOWN_MAX = 20            # folders offered as checkboxes
 FORM_MAX = 128 * 1024     # bytes of one of the card's forms (the folders' paths, the notes)
 FORM_FIELDS = FOLDERS_MAX + KNOWN_MAX + 8
-ACTIONS = ("start", "stop", "notes", "folders")
+ACTIONS = ("start", "stop", "notes", "themes", "folders")
 CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
-OUTCOME_TONE = {"found": "t-ok", "none": "t-off", "running": "t-run", "failed": "t-bad", "stopped": "t-off"}
+OUTCOME_TONE = {"found": "t-ok", "waiting": "t-wait", "none": "t-off", "running": "t-run", "failed": "t-bad", "stopped": "t-off"}
 # the card's own rules; the page adds them to its stylesheet (no inline styles: strict CSP)
 AGENT_CSS = """
 .fagent .fa-info{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px;margin:8px 0}
@@ -174,12 +176,17 @@ def _counts(info):
         def n(k):
             x = v.get(k, 0)
             return x if isinstance(x, int) and not isinstance(x, bool) else 0
+        why = v.get("why") if isinstance(v.get("why"), dict) else {}
+        why = ", ".join(f"{_s(k, 40)} {x}" for k, x in sorted(why.items(), key=lambda kv: (
+            -kv[1] if isinstance(kv[1], int) else 0, str(kv[0])))[:8] if isinstance(x, int) and not isinstance(x, bool))
         rows.append(f"<tr><td>{esc(_s(lens, 20))}</td><td>{n('calls')}</td><td>{n('accepted')}</td>"
-                    f"<td>{n('rejected')}</td><td>{n('failed')}</td><td>{n('notes')}</td></tr>")
+                    f"<td>{n('rejected')}</td><td class='muted'>{esc(why)}</td><td>{n('failed')}</td>"
+                    f"<td>{n('notes')}</td></tr>")
     if not rows:
         return ""
     return ("<table class='fa-counts'><thead><tr><th>question</th><th>sessions</th><th>kept</th>"
-            "<th>rejected</th><th>failed</th><th>notes written</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+            "<th>thrown away</th><th>why</th><th>failed</th><th>notes written</th></tr></thead><tbody>"
+            + "".join(rows) + "</tbody></table>")
 
 
 def passes(state_dir, n=SESSIONS_SHOWN):
@@ -419,8 +426,10 @@ def agent_card(state_dir, flash="", project="", known=()):
     parts = ["<section class='panel fagent' id='findings-agent'><div class='hd'><h2>Findings agent "
              f"<span class='tag {cls}'>{esc(label)}</span></h2>"
              "<span class='muted'>opencode sessions on a free model that keep exploring the committed code, an "
-             "area at a time and round again, tracing it across files for bugs, UI problems and code to remove or "
-             "simplify, and write down what each area does for the next agent; read-only</span></div>"]
+             "entry point or area at a time and round again: bugs a user can hit, each with its steps and checked "
+             "by a second session before it is kept, and the rolling lists (unused files, dead code, code to "
+             "unify or hand to a library, safety, yours); they write down what each area does for the next "
+             "agent; read-only</span></div>"]
     if flash:
         parts.append(f"<div class='flash'>{esc(flash)}</div>")
     rows = []
@@ -443,7 +452,8 @@ def agent_card(state_dir, flash="", project="", known=()):
     sid = _s(info.get("session"), 80)
     if live and sid.startswith("ses_"):
         rows.append(("session", sid))
-    for key, name in (("open", "open findings"), ("todo", "changed areas first"), ("units", "passes in the rotation")):
+    for key, name in (("open", "open findings"), ("pending", "reports waiting for the checker"),
+                      ("todo", "changed passes first"), ("units", "passes in the rotation")):
         v = info.get(key)
         if isinstance(v, int) and not isinstance(v, bool):
             rows.append((name, str(v)))
@@ -481,6 +491,19 @@ def agent_card(state_dir, flash="", project="", known=()):
                  "<div class='acts'><button type='submit' class='btn sm'>Save notes</button>"
                  "<span class='muted'>a change asks about every part again, with the new notes</span></div>"
                  "</form></details>")
+    themes = _read(os.path.join(state_dir, "themes.md"), THEMES_MAX * 4)[:THEMES_MAX] if state_dir else ""
+    parts.append("<details class='fa-notes' data-k='findings-agent-themes'><summary>Your rolling lists"
+                 + (f" <span class='muted'>{len(themes)} characters</span>" if themes else "") + "</summary>"
+                 "<form method='post' action='/runs/findings/agent/themes'>"
+                 f"<textarea name='themes' rows='8' maxlength='{THEMES_MAX}' aria-label='rolling lists for the "
+                 "findings agent' placeholder='## nvector&#10;title: Position math not done through the n-vector "
+                 "library&#10;Every computation on positions that is plain vector subtraction or lat/lon "
+                 f"arithmetic instead of the n-vector library: name the function to use.'>{esc(themes)}</textarea>"
+                 "<div class='acts'><button type='submit' class='btn sm'>Save lists</button>"
+                 "<span class='muted'>one finding per list, added to over time; a &quot;## name&quot; heading, "
+                 "an optional title: line, what goes on it. unused, dead, unify and safety are built in "
+                 "(&quot;off&quot; under their heading turns one off). A change runs every cleanup pass "
+                 "again.</span></div></form></details>")
     parts.append("</section>")
     return "".join(parts)
 
@@ -635,7 +658,7 @@ def _choose(state_dir, form, project, starting):
 
 
 def agent_action(state_dir, harness_path, action, form, project=""):
-    """Do one of start, stop, notes, folders. Returns (ok, message). form maps names
+    """Do one of start, stop, notes, themes, folders. Returns (ok, message). form maps names
     to lists of values (parse_qs); project is the folder harness serve runs in, when
     known."""
     if not state_dir:
@@ -664,6 +687,17 @@ def agent_action(state_dir, harness_path, action, form, project=""):
         except OSError as e:
             return False, f"cannot save the notes: {e.strerror or e}"
         return True, "notes saved: the agent uses them from its next pass"
+    if action == "themes":
+        vals = form.get("themes") or [""]
+        text = vals[0] if isinstance(vals, list) else str(vals)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if len(text) > THEMES_MAX:
+            return False, f"the lists are {len(text)} characters; at most {THEMES_MAX}"
+        try:
+            _write_atomic(os.path.join(state_dir, "themes.md"), text.strip() + ("\n" if text.strip() else ""))
+        except OSError as e:
+            return False, f"cannot save the lists: {e.strerror or e}"
+        return True, "lists saved: the cleanup passes use them from the next one"
     return False, f"unknown action: {action}"
 
 

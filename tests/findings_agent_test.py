@@ -180,7 +180,7 @@ END-BUG-ab12cd34
 BUG-ffffffff
 title: another nonce
 END-BUG-ffffffff
-ITEM-ab12cd34 | unify | a.cpp:10, b.cpp:42 | x = y | use std::clamp
+ITEM-ab12cd34 | unify | a.cpp:10, b.cpp:42 | v = clamp(v, lo, hi) | use std::clamp
 - `ITEM-ab12cd34 | Unused | old/x.cpp | | nothing names it`
 ITEM-ab12cd34 | short
 \x1b[0mCOVERED-ab12cd34 | the | save path
@@ -189,7 +189,7 @@ ITEM-ab12cd34 | short
 LINES = {"src/save.cpp": ["// save"] * 11 + ["    name = QString();", "    write(name);"],
          "src/menu.cpp": ["#include <QMenu>", "", "void W::setup() {",
                           "    connect(saveAs, &QAction::triggered, this, &W::saveAs);", "}"],
-         "a.cpp": ["int f() {"] + ["  // a"] * 8 + ["  x = y;"],
+         "a.cpp": ["int f() {"] + ["  // a"] * 8 + ["  v = clamp(v, lo, hi);"],
          "b.cpp": ["  // b"] * 50}
 
 
@@ -282,14 +282,17 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(fa.check_bug(self.bug(trace=good_trace + [bad, bad]), lines_of, self.ui), (None, "trace"))
 
     def test_items(self):
-        it, why = fa.check_item("unify", "a.cpp:10, b.cpp:42", " x = y | use std::clamp", lines_of, LINES.__contains__)
+        ev = " v = clamp(v, lo, hi) |"
+        it, why = fa.check_item("unify", "a.cpp:10, b.cpp:42", ev + " use std::clamp", lines_of, LINES.__contains__)
         self.assertEqual((it["path"], it["line"], it["evidence"], it["note"], it["locations"], why),
-                         ("a.cpp", 10, "x = y", "use std::clamp", ["a.cpp:10", "b.cpp:42"], ""))
-        self.assertEqual(fa.check_item("unify", "a.cpp:10", " x = y | n", lines_of, LINES.__contains__),
+                         ("a.cpp", 10, "v = clamp(v, lo, hi)", "use std::clamp", ["a.cpp:10", "b.cpp:42"], ""))
+        self.assertEqual(fa.check_item("unify", "a.cpp:10", ev + " n", lines_of, LINES.__contains__),
                          (None, "places"))
-        self.assertEqual(fa.check_item("safety", "a.cpp:10", " y = x | n", lines_of, LINES.__contains__),
+        self.assertEqual(fa.check_item("safety", "a.cpp:10", " hi = clamp(lo) | n", lines_of, LINES.__contains__),
                          (None, "evidence"))
-        self.assertEqual(fa.check_item("safety", "a.cpp:99", " x = y | n", lines_of, LINES.__contains__),
+        self.assertEqual(fa.check_item("safety", "a.cpp:99", ev + " n", lines_of, LINES.__contains__),
+                         (None, "evidence"))
+        self.assertEqual(fa.check_item("safety", "nowhere", ev + " n", lines_of, LINES.__contains__),
                          (None, "evidence"))
         it, why = fa.check_item("unused", "b.cpp", " | nothing", lines_of, LINES.__contains__)
         self.assertEqual((it["path"], it["locations"], it["note"]), ("b.cpp", ["b.cpp"], "nothing"))
@@ -308,11 +311,11 @@ class CheckTest(unittest.TestCase):
                                              "title": "Save As fails"}]))
 
     def test_ui_texts(self):
-        cpp = 'auto *a = new QAction(tr("&Save As..."), this);\nmsg("x");\nQMessageBox::warning(this, "Oops", "Disk full");'
+        cpp = 'auto *a = new QAction(tr("&Save As..."), this);\nmsg("Hello there");\nQMessageBox::warning(this, "Oops", "Disk full");'
         lits, shown = fa.ui_texts("w.cpp", cpp)
         self.assertIn("&Save As...", shown)
-        self.assertIn("Disk full", shown)
-        self.assertIn("x", [fa.ui_norm(x) for x in lits] + ["x"])
+        self.assertNotIn("Hello there", shown)
+        self.assertIn("Hello there", lits)   # every literal can be a report's control text; only the shown ones are listed
         lits, shown = fa.ui_texts("w.ui", '<property name="text"><string>Open &amp;File</string></property>'
                                           '<string notr="true">objName</string>')
         self.assertEqual(shown, ["Open &amp;File"])
@@ -340,7 +343,7 @@ class CheckTest(unittest.TestCase):
 
 class UnusedTest(unittest.TestCase):
     def test_what_nothing_names(self):
-        texts = {"CMakeLists.txt": "add_executable(app src/main.cpp src/a.cpp src/b.cpp)\n",
+        texts = {"CMakeLists.txt": "add_executable(app src/main.cpp src/a.cpp src/b.cpp res/app.qrc)\n",
                  "src/main.cpp": '#include "a.h"\n', "src/a.cpp": '#include "a.h"\n#include "ui_form.h"\n',
                  "src/a.h": "", "src/b.cpp": '#include "only_b.h"\n', "src/only_b.h": "",
                  "src/old.cpp": '#include "old.h"\n', "src/old.h": "", "src/form.ui": "<ui/>",
@@ -348,13 +351,18 @@ class UnusedTest(unittest.TestCase):
                  "tests/t.cpp": "", "third_party/x.h": "", "docs/x.md": "see gone.png"}
         paths = list(texts) + ["res/icons/used.png", "res/icons/lost.png", "res/icons/gone.png"]
         got = fa.unused_files(paths, texts)
-        # old.cpp is named by nothing, so old.h (named only by old.cpp) goes with it; app.qrc is a resource
-        # no code names; tests, vendored code and main are left out; gone.png is named by a doc
-        self.assertEqual(got, ["res/app.qrc", "res/icons/lost.png", "src/dead.ui", "src/old.cpp", "src/old.h"])
-        # a build that globs its sources: sources are never "unused", headers still are
+        # old.cpp is named by nothing, so old.h (named only by old.cpp) goes with it; tests, vendored code and
+        # main are left out; gone.png is named by a doc; what only an unused file names is unused too
+        self.assertEqual(got, ["res/icons/lost.png", "src/dead.ui", "src/old.cpp", "src/old.h"])
+        texts["CMakeLists.txt"] = texts["CMakeLists.txt"].replace(" res/app.qrc", "")
+        self.assertEqual(fa.unused_files(paths, texts), ["res/app.qrc", "res/icons/lost.png", "res/icons/used.png",
+                                                         "src/dead.ui", "src/old.cpp", "src/old.h"])
+        # a build that globs its sources: sources are never "unused", so what they name is used
         texts["CMakeLists.txt"] = "file(GLOB SRC src/*.cpp)\n"
-        self.assertNotIn("src/old.cpp", fa.unused_files(paths, texts))
-        self.assertIn("src/old.h", fa.unused_files(paths, texts))
+        got = fa.unused_files(paths, texts)
+        self.assertNotIn("src/old.cpp", got)
+        self.assertNotIn("src/old.h", got)
+        self.assertIn("src/dead.ui", got)
         self.assertEqual(fa.unused_files(["a.py", "b.py"], {"a.py": "", "b.py": ""}), [])
 
 
@@ -413,8 +421,10 @@ class UnitsTest(unittest.TestCase):
             first, rest = fa.due(us, led, h, t)
             return [(u.area, u.lens) for u in first], [(u.area, u.lens) for u in rest]
         first, rest = order()
-        # bug and cleanup passes in turn
+        # bug and cleanup passes in turn, the other lens than the pass before first
         self.assertEqual(first, [("new", "bug"), ("changed", "cleanup"), ("prompt", "bug"), ("new", "cleanup")])
+        self.assertEqual([(u.area, u.lens) for u in fa.due(us, led, h, t, last="bug")[0]][:2],
+                         [("changed", "cleanup"), ("new", "bug")])
         # never out of work: every other pass comes again, the one explored longest ago first
         self.assertEqual(rest, [("old", "bug"), ("fresh", "bug")])
         led[us[5].key]["tried"] = t - fa.SET_ASIDE - 1   # a set-aside pass comes back after SET_ASIDE...
@@ -426,7 +436,7 @@ class UnitsTest(unittest.TestCase):
         first, rest = order()
         self.assertEqual((first, len(rest)), ([], len(us)))
         h["cleanup"] = "themes changed"   # the owner's themes: only the cleanup passes again
-        self.assertEqual(order()[0], [("new", "cleanup"), ("changed", "cleanup")])
+        self.assertEqual(order()[0], [("changed", "cleanup"), ("new", "cleanup")])
 
     def test_prompt(self):
         u = fa.Unit("/x/repo", "serve", "bug", ["serve/a.py", "serve/b.py"], "s", entry="serve/a.py")
@@ -603,10 +613,10 @@ class PassTest(StubCase):
         self.assertNotIn("env=present", log)   # the snapshot has no secret files
         with open(self.log + ".prompt") as f:
             prompt = f.read()
-        for want in ("ignore style", "Start from the area ./", '"Compute Ratio"', "KNOWN.md", "BUG-"):
+        for want in ("ignore style", "Start from the area ./", "KNOWN.md", "BUG-"):
             self.assertIn(want, prompt)
         # the first report waits for the checker; the second names a text the program never shows
-        self.assertEqual(self.read("findings.json")["findings"], [])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "findings.json")))
         led = self.read("ledger.json")
         (p,) = led["pending"]
         self.assertEqual((p["cand"]["path"], p["cand"]["line"], p["cand"]["ui"], len(p["cand"]["steps"])),
@@ -665,9 +675,11 @@ class PassTest(StubCase):
         self.assertEqual(self.run_once(repo, extra_env={"STUB_VERDICT": "not-real"}).returncode, 0)
         led = self.read("ledger.json")
         self.assertEqual((led["pending"], led["counts"]["verify"]["why"]), ([], {"not-real": 1}))
-        self.assertEqual(self.read("findings.json")["findings"], [])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "findings.json")))
         # a checker that gives no verdict: the report waits for VERIFY_TRIES sessions, then goes
         commit(repo, {"app.py": APP + "# more\n"})
+        self.assertEqual(self.run_once(repo).returncode, 0)   # ./'s cleanup pass: the other lens goes first
+        self.assertEqual(self.read("ledger.json")["passes"][-1]["lens"], "cleanup")
         self.assertEqual(self.run_once(repo).returncode, 0)
         self.assertEqual(len(self.read("ledger.json")["pending"]), 1)
         for i in range(fa.VERIFY_TRIES):
@@ -701,10 +713,15 @@ class PassTest(StubCase):
             self.assertIn("app.py:6 | Compute Ratio crashes when the divisor is zero | from ticket ABC-1", f.read())
         # an archived finding the store drops stays known (as dismissed)
         w.store["findings"] = [{"id": "f-00000000000a", "project": repo, "path": "lib/use.py", "line": 2,
-                                "title": "old one", "status": "stale"}]
+                                "title": "old one", "status": "open"}]
         with open(os.path.join(self.state, "board.json"), "w") as f:
             json.dump({"version": 1, "order": [], "archived": {"f-00000000000a": "2026-01-01T00:00:00Z"}}, f)
-        w.save_store()
+        old, fa.STORE_MAX = fa.STORE_MAX, 0
+        try:
+            w.save_store()
+        finally:
+            fa.STORE_MAX = old
+        self.assertEqual(w.store["findings"], [])
         self.assertIn(("lib/use.py", 2, "dismissed by the owner"),
                       [(k["path"], k["line"], k["state"]) for k in w.known(repo)])
 
@@ -779,7 +796,7 @@ class PassTest(StubCase):
         self.assertEqual(sorted((n["area"], n["changed"], n["session"]) for n in listing),
                          [(".", False, "ses_stub1"), ("lib", False, "ses_stub1")])
         self.assertEqual(self.read("ledger.json")["passes"][0]["notes"], [".", "lib"])
-        # the passes after (./ cleanup, then lib/) get their area's note and every note in their snapshot
+        # the passes after (./ cleanup, then lib/ bug) get their area's note and every note in their snapshot
         led = self.read("ledger.json")
         led["pending"] = []
         with open(os.path.join(self.state, "ledger.json"), "w") as f:
