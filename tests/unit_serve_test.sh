@@ -865,7 +865,7 @@ os.close(term.fd)
 # F: where /proc cannot tell (Git Bash), perl asks the terminal: in front
 # from the foreground, not from a background job of it.
 src = ('HARNESS_SOURCE_ONLY=1 source "$0" 2>/dev/null; _serve_tty_foreground() { return 2; }; '
-       '_serve_tty_in_front; echo "front=$?"')
+       'rc=0; _serve_tty_in_front || rc=$?; echo "front=$rc"')
 for bg, want in ((False, "front=0"), (True, "front=1")):
     pid, fd = pty.fork()
     if pid == 0:
