@@ -5756,7 +5756,7 @@ class PanelTest(Base):
         self.assertTrue(st["panels"]["plan"]["merged"])
 
     def test_killed_during_the_second_planner_goes_on_with_it(self):
-        os.environ.update(FAKE_DRAFT_SLEEP="2", FAKE_DRAFT_SLEEP_SECS="8")
+        os.environ.update(FAKE_DRAFT_SLEEP="2", FAKE_DRAFT_SLEEP_SECS="8", FAKE_PANEL_FINDINGS="1")
         self.add("ABC-1")
         p = OwnerControlTest.run_bg(self, "--planners", "3", "--reviewers", "general")
         OwnerControlTest.wait_for(self, lambda: os.path.exists(self.calls + ".draftslept"), "planner 2", 60)
@@ -5772,6 +5772,10 @@ class PanelTest(Base):
         self.assertTrue(st["panels"]["plan"]["merged"], st["panels"])
         self.assertNotIn("agents", st)
         self.assertEqual(self.drafts_in_vault(), [])
+        # what d1 and d3 found before the kill is not lost with the run that launched them
+        found = cat(os.path.join(self.notes(), "ABC-1-findings.md"))
+        self.assertEqual(sorted(set(re.findall(r"x\.py:(\d)", found))), ["1", "2", "3"], found)
+        self.assertEqual([f for f in os.listdir(self.notes()) if re.search(r"-findings-\w+\.md$", f)], [])
 
     def test_a_halt_stops_every_member_at_once(self):
         os.environ.update(FAKE_PANEL_SLEEP="60")
@@ -5789,12 +5793,16 @@ class PanelTest(Base):
         self.assertEqual([f for f in os.listdir(self.notes()) if "-task" in f], [])
 
     def test_three_reviewers_merged_and_the_unevidenced_dropped(self):
-        os.environ["FAKE_MUSTFIX"] = "1"
+        os.environ.update(FAKE_MUSTFIX="1", FAKE_PANEL_SLEEP="3")
         self.add("ABC-1")
         rc, out = self.run_queue("--planners", "1", "--reviewers", "general,ux,standards")
         st = self.status()
         self.assertEqual(st["status"], "done", out)
         self.assertEqual(sorted(cat(self.calls + ".lenses").split()), ["general", "standards", "ux"])
+        # at once: the first review's three reviewers all started before any of them ended
+        spans = [l.split() for l in cat(self.calls + ".spans").splitlines()][:3]
+        self.assertEqual(sorted(t for t, _, _ in spans), ["general", "standards", "ux"])
+        self.assertLess(max(float(a) for _, a, _ in spans), min(float(b) for _, _, b in spans), spans)
         d = tq.Queue(self.state).dir("ABC-1")
         self.assertEqual(sorted(os.listdir(os.path.join(d, "panel"))),
                          ["review-general.md", "review-standards.md", "review-ux.md"])

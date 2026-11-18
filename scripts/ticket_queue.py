@@ -3955,17 +3955,18 @@ def launch_all(ctx, st, stage, pan, todo, lock):
         for a in live:
             stop_containers(ctx, st, a.get("launch"))
         raise
-    findings = note_paths(ctx.vault, key)["findings"]
     for j in jobs:   # one that did not end on its own (halt, failed launch) leaves nothing in the vault
         drop(j["task"])
         if ended.get(j["m"]["tag"]) is not None:
             drop(j["m"]["path"])
-        found = j["m"].get("findings")
-        if found and read(found).strip():   # what it found is the ticket's, however it ended
+    # What each member found is the ticket's, however it ended: these members' and
+    # those of a run killed before it got here (theirs are not in jobs).
+    findings = note_paths(ctx.vault, key)["findings"]
+    for found in sorted(glob.glob(member_findings(glob.escape(ctx.vault), glob.escape(key), "*"))):
+        if read(found).strip():
             old = read(findings)
             write_atomic(findings, old + ("\n" if old and not old.endswith("\n") else "") + read(found).strip() + "\n")
-        if found:
-            drop(found)
+        drop(found)
     with lock:
         if st.get("in_place"):
             st["launches"][-1][1] = int(time.time() * 1000)

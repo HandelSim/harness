@@ -831,7 +831,8 @@ changed and saved only under `st_lock`. Each member's prompt is in its own task
 file `KEY-task-<tag>.md` (`member_task`; the card's `part` names it, see
 proxy.md; `PART_IGNORE` keeps another slot's vault commit off it) and it notes
 what it sees off the ticket in its own `KEY-findings-<tag>.md` (`member_findings`,
-its `{{FINDINGS_FILE}}`), appended to KEY-findings.md when the panel ends, so
+its `{{FINDINGS_FILE}}`), appended to KEY-findings.md when the panel ends (any
+member's, a killed run's too), so
 members never write the same file. A member writes `KEY-plan-draft-<n>.md` /
 `KEY-review-<lens>.md` in the vault's ticket notes; the queue deletes a stale one
 first (dropped on a halt too) and moves it to `DIR/panel/<stage>-<tag>.md` as the
