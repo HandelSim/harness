@@ -121,6 +121,15 @@ class CardTest(Base):
         self.assertIn(">stopped<", h)
         self.assertNotIn("(stale)", h)
 
+    def test_watch_it_work(self):
+        self.assertNotIn("/runs/follow?findings=1", fav.agent_card(self.state))   # no pass yet
+        self.status()
+        self.assertIn("href='/runs/follow?findings=1'>Watch it work &rarr;</a>", fav.agent_card(self.state))
+        self.status(state="stopped", pid=2 ** 22 + 12345)
+        with open(os.path.join(self.state, "ledger.json"), "w") as f:
+            json.dump({"passes": [{"n": 1, "session": "ses_a1", "repo": "/r", "area": "a", "lens": "bug"}]}, f)
+        self.assertIn("href='/runs/follow?findings=1'>Its last pass</a>", fav.agent_card(self.state))
+
     def test_bad_json(self):
         with open(os.path.join(self.state, "agent.json"), "w") as f:
             f.write("{nope")

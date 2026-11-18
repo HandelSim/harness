@@ -1456,11 +1456,18 @@ class QueuePageTest(RunsServer):
         r, body = self.post("/runs/queue/add", [("keys", "ABC-7"), ("project", proj), ("branch", "feat/x")])
         self.assertEqual(r.status, 303, body)
         r, body = self.tabs("ABC-7")
-        self.assertIn("<h2>Settings</h2><a class='btn sm' href='/runs/ticket/ABC-7/edit'>Edit settings</a>", body)
+        self.assertIn("<h2>Details</h2><a class='btn sm' href='/runs/ticket/ABC-7/edit'>Edit settings</a>", body)
         self.assertIn("branch <b>feat/x</b>", body)
         self.assertIn("Nothing has run yet: every setting can change.", body)
+        # on the Ticket tab, not History's
+        _, tick = self.req("GET", "/runs/ticket/ABC-7")
+        _, hist = self.req("GET", "/runs/ticket/ABC-7/history")
+        self.assertIn("<h2>Details</h2>", tick)
+        self.assertNotIn("Edit settings", hist)
+        self.assertIn("Its text is not in the vault yet", tick)   # no ticket note yet: said, not blank
         r, body = self.req("GET", "/runs/ticket/ABC-7/edit")
         self.assertEqual(r.status, 200, body)
+        self.assertIn("href='/runs/ticket/ABC-7'>Back</a>", body)   # to the Ticket tab
         self.assertIn("<input name='keys' readonly value='ABC-7'>", body)
         self.assertIn("action='/runs/ticket/ABC-7/edit'", body)
         self.assertIn("feat/x", body)
@@ -1538,7 +1545,7 @@ class QueuePageTest(RunsServer):
         self.run_on()
         self.start()
         r, body = self.tabs("ABC-12")
-        self.assertIn("<h2>Settings</h2>", body)
+        self.assertIn("<h2>Details</h2>", body)
         self.assertNotIn("Edit settings", body)
         self.assertIn("It is running: stop it to change its settings.", body)
         r, body = self.req("GET", "/runs/ticket/ABC-12/edit")
@@ -2314,8 +2321,8 @@ class TicketTabsTest(RunsServer):
         self.assertFalse(runs.OUT_RE.match("plan-0-../x.out"))
         self.assertFalse(runs.OUT_RE.match("plan-0-D2.out"))
         import types
-        lab = lambda name: runs._stage_label(types.SimpleNamespace(stage_of=lambda *a: name), "K-1",
-                                             {"time_created": 0}, {}, [])
+        fake = lambda name: types.SimpleNamespace(stage_of=lambda *a: name, out_sessions=lambda *a: {})
+        lab = lambda name: runs._stage_label(fake(name), "K-1", {"time_created": 0}, {}, [])
         self.assertEqual(lab("plan-0-d2"), ("plan, planner 2", 1))
         self.assertEqual(lab("review-1-ux"), ("review, ux reviewer", 2))
         self.assertEqual(lab("plan-0-panel"), ("plan, merged", 1))
@@ -2342,8 +2349,9 @@ class TicketTabsTest(RunsServer):
         r, body = self.req("GET", "/runs/ticket/ABC-12/agent")
         self.assertEqual(r.status, 200)
         self.assertIn("aria-current='page'>Agent</a>", body)
-        self.assertIn(f"data-sid='{QSES}'", body)   # its one session, so no picker
-        self.assertNotIn("class='spick'", body)
+        self.assertIn(f"data-sid='{QSES}'", body)
+        self.assertIn("<section class='panel' id='slist'>", body)   # the list, at the side
+        self.assertIn("0 working, 1 session<", body)
         r, body = self.req("GET", f"/runs/ticket/ABC-12/agent?sid={QSES}")
         self.assertEqual(r.status, 200)
         self.assertIn(f"data-sid='{QSES}'", body)
@@ -2354,6 +2362,69 @@ class TicketTabsTest(RunsServer):
         r, body = self.raw_req("GET", "/runs/ticket/NOPE-1/diff?body=1")
         self.assertEqual(r.status, 404)   # what a page's script fetches stays plain
         self.assertNotIn("No ticket", body)
+
+    def test_the_agent_tab_lists_every_session_of_the_ticket_at_the_side(self):
+        self.ticket(status="running", stage="review")
+        # the panel member's output names its session: its label is exact, not guessed by time
+        with open(os.path.join(self.queue, "ABC-12", "plan-0-d2.out"), "w") as f:
+            f.write(f"[harness] host mode\n[harness] session: {QSES}\nthe plan\n")
+        # a debug agent's run on its block (ROOT started after QSES)
+        run = os.path.join(os.path.dirname(self.queue), "debug", "runs", "20261103-120000-ABC-12")
+        os.makedirs(run)
+        with open(os.path.join(run, "launch.out"), "w") as f:
+            f.write(f"[harness] session: {ROOT}\n")
+        self.go_live(QSES)
+        self.start()
+        r, body = self.req("GET", "/runs/ticket/ABC-12/agent")
+        self.assertEqual(r.status, 200)
+        self.assertIn(f"data-sid='{QSES}'", body)   # the working one first
+        self.assertIn("1 working, 2 sessions<", body)
+        self.assertIn("<div class='sgh'>plan &middot; attempt 1</div>", body)
+        self.assertIn("<span class='sl'>planner 2</span>", body)
+        self.assertIn("<div class='sgh'>debug</div>", body)
+        self.assertIn("<span class='sl'>debug agent</span>", body)
+        self.assertLess(body.index("planner 2</span>"), body.index("debug agent</span>"))   # in the order they ran
+        self.assertIn(f"href='/runs/ticket/ABC-12/agent?sid={QSES}' class='on' aria-current='true'", body)
+        self.assertRegex(body, rf"agent\?sid={QSES}'[^>]*><span class='sdot on'")
+        self.assertRegex(body, rf"agent\?sid={ROOT}'[^>]*><span class='sdot (off|quiet)'")
+        self.assertIn("scrollIntoView({block: 'end'})", body)   # opens at the chat's end
+        self.assertIn(f"data-key='ABC-12'", body)
+        # the debug agent's session opens on the ticket's Agent tab too
+        r, body = self.req("GET", f"/runs/ticket/ABC-12/agent?sid={ROOT}")
+        self.assertEqual(r.status, 200)
+        self.assertIn(f"data-sid='{ROOT}'", body)
+        self.assertIn(f"href='/runs/ticket/ABC-12/agent?sid={ROOT}' class='on'", body)
+        # the poll brings the list with it, for its dots
+        r, body = self.req("GET", f"/runs/{QSES}/tail?from=0&key=ABC-12")
+        self.assertIn("planner 2", json.loads(body)["slist"])
+        r, body = self.req("GET", f"/runs/{QSES}/tail?from=0&key=NOPE-1")
+        self.assertNotIn("slist", json.loads(body))
+        # the Ticket tab's Watch goes to it
+        _, body = self.req("GET", "/runs/ticket/ABC-12")
+        self.assertIn(f"href='/runs/ticket/ABC-12/agent?sid={QSES}'", body)
+
+    def test_follow_the_findings_agent(self):
+        d = os.path.join(os.path.dirname(self.queue), "findings")
+        os.makedirs(d)
+        self.start()
+        r, body = self.req("GET", "/runs/follow?findings=1")
+        self.assertEqual(r.status, 200)   # none yet: the waiting page
+        self.assertIn("findings agent", body)
+        with open(os.path.join(d, "ledger.json"), "w") as f:
+            json.dump({"passes": [{"n": 1, "session": ROOT, "repo": "/r", "area": "a", "lens": "bug"}]}, f)
+        r, _ = self.req("GET", "/runs/follow?findings=1")
+        self.assertEqual(r.status, 303)
+        self.assertEqual(r.getheader("Location"), f"/runs/{ROOT}?findings=1")
+        r, body = self.req("GET", "/runs/follow.json?findings=1")
+        self.assertEqual(json.loads(body)["sid"], ROOT)
+        r, body = self.req("GET", f"/runs/{ROOT}?findings=1")
+        self.assertIn("data-follow='/runs/follow.json?findings=1'", body)
+        self.assertIn("href='/runs/queue#findings-agent'>Findings agent</a>", body)
+        # running: the pass it is on, over the ledger's
+        with open(os.path.join(d, "agent.json"), "w") as f:
+            json.dump({"pid": os.getpid(), "state": "exploring", "heartbeat_ts": time.time(), "session": QSES}, f)
+        r, body = self.req("GET", "/runs/follow.json?findings=1")
+        self.assertEqual(json.loads(body)["sid"], QSES)
 
     def test_a_session_of_a_ticket_has_the_tickets_tabs(self):
         self.ticket(status="running", stage="implement")

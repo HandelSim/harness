@@ -469,8 +469,12 @@ def agent_card(state_dir, flash="", project="", known=()):
     # FINDINGS_MODEL lives in .env; the Settings page edits it. The agent reads it when it starts.
     model_link = ("<a class='muted' href='/settings#model'>Change the model in Settings"
                   + (" (then Stop and Start)" if live else "") + "</a>")
+    # Watch: its session as it works, the page moving on to each next pass (runs.follow_target)
+    watch = ("<a class='btn sm primary' href='/runs/follow?findings=1'>Watch it work &rarr;</a>" if live
+             else "<a class='btn sm' href='/runs/follow?findings=1'>Its last pass</a>"
+             if state_dir and any(isinstance(p.get("session"), str) for p in passes(state_dir, 5)) else "")
     if live:
-        parts.append("<div class='acts'><form method='post' action='/runs/findings/agent/stop' "
+        parts.append(f"<div class='acts'>{watch}<form method='post' action='/runs/findings/agent/stop' "
                      "data-confirm='Stop the findings agent? Its session in flight is ended and that pass runs "
                      "again later. It stays stopped, also after a restart, until you start it.'>"
                      f"<button type='submit' class='btn sm'>Stop</button></form>{model_link}</div>")
@@ -478,7 +482,7 @@ def agent_card(state_dir, flash="", project="", known=()):
     else:   # Start sends the folders' form, so what is ticked is what it explores
         parts.append(_folders_form(state_dir, info, False, project, known,
                                    "<div class='acts'><button type='submit' class='btn sm primary' "
-                                   f"formaction='/runs/findings/agent/start'>Start</button>{model_link}</div>"))
+                                   f"formaction='/runs/findings/agent/start'>Start</button>{watch}{model_link}</div>"))
     notes = _read(os.path.join(state_dir, "notes.md"), NOTES_MAX * 4)[:NOTES_MAX] if state_dir else ""
     parts.append("<details class='fa-notes' data-k='findings-agent-notes'><summary>Notes for every pass"
                  + (f" <span class='muted'>{len(notes)} characters</span>" if notes else "") + "</summary>"

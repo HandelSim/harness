@@ -288,11 +288,21 @@ main.rv { max-width: 1280px; gap: 18px; padding-top: 22px; }
   border-bottom: 2px solid transparent; margin-bottom: -1px; }
 .ttabs a:hover { color: var(--ink); text-decoration: none; }
 .ttabs a.on { color: var(--ink); border-bottom-color: var(--accent); }
-.spick { display: flex; gap: 6px; flex-wrap: wrap; }
-.spick a { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
-  border: 1px solid var(--line); font-size: 12.5px; color: var(--muted); white-space: nowrap; }
-.spick a.on { color: var(--ink); border-color: var(--accent); }
-.spick a:hover { text-decoration: none; color: var(--ink); }
+/* the Agent tab's list of the ticket's sessions, by stage in the order they ran; it scrolls on its own */
+#slist .hd { margin-bottom: 4px; }
+.sgroups { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; max-height: 46vh; overflow-y: auto;
+  position: relative; overscroll-behavior: contain; scrollbar-width: thin; }
+.sgh { font-size: 11.5px; letter-spacing: .03em; text-transform: uppercase; color: var(--muted); font-weight: 650;
+  margin: 0 0 3px 8px; }
+.sgroups ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 2px; }
+.sgroups a { display: flex; align-items: center; gap: 9px; padding: 4px 8px; border-radius: 8px; color: var(--ink);
+  border: 1px solid transparent; font-size: 13.5px; }
+.sgroups a:hover { background: var(--hover); text-decoration: none; }
+.sgroups a.on { background: var(--accent-soft); border-color: var(--accent); }
+.sgroups .sl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 560; }
+.sgroups .st { font-size: 12px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.slegend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 10px; font-size: 11.5px; color: var(--muted); }
+.slegend > span { display: inline-flex; align-items: center; gap: 6px; }
 h2.sesh { font-size: 16px; font-weight: 620; overflow-wrap: anywhere; }
 .verdicts { list-style: none; padding: 0; margin: 6px 0; display: grid; gap: 6px; }
 .verdicts q { color: var(--muted); }
@@ -331,6 +341,10 @@ div[id^='r-']:empty { display: none; }   /* an empty live region takes no gap */
 .sdot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
 .sdot.run { background: var(--run); box-shadow: 0 0 0 4px var(--run-soft); }
 .sdot.wait { background: var(--wait); }
+.sdot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); animation: pulse 1.6s ease-in-out infinite; }
+.sdot.quiet { background: var(--wait); }
+.sdot.off { background: var(--faint); }
+@media (prefers-reduced-motion: reduce) { .sdot.on { animation: none; } }
 
 /* the stage strip: plan (test) implement review fix push, a column each */
 .strip { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 4px; list-style: none; padding: 0;
@@ -771,6 +785,7 @@ class Runs:
         self._in_place = {}         # KEY: (state.json stat, project, launch windows) of in-place tickets
         self.launch_lock = threading.RLock()
         self._memo = {}             # the pages' one cache: (what, args) -> (stamp, value, sure); see memo
+        self._out_sid = {}          # a stage output's path -> (its inode, the session it names); see out_sessions
         self._pending = set()       # memo keys being worked out in the background
 
     def memo(self, what, args, paths, fn, ttl=0, later=False, default=None):
@@ -1272,6 +1287,30 @@ class Runs:
             if mtime * 1000 >= created_ms:
                 return name[:-4]
         return ""
+
+    def out_sessions(self, key, outs=None):
+        """{session id: stage output (plan-0-d2)}: the session each of the ticket's stage
+        outputs names in its [harness] session line, so a panel's members, started at the
+        same time, are told apart (stage_of goes by time). Kept once found: a session line
+        does not change, and a live output is read only until it has one."""
+        d = os.path.join(self.queue_dir, key)
+        got = {}
+        for name, _, _ in (self.stage_outs(key) if outs is None else outs):
+            path = os.path.join(d, name)
+            try:
+                ino = os.stat(path).st_ino
+            except OSError:
+                continue
+            hit = self._out_sid.get(path)
+            if not hit or hit[0] != ino:
+                sid = self.memo("outsid", path, (path,), lambda p=path: _session_in(p))
+                if not sid:
+                    continue
+                if len(self._out_sid) > 4000:
+                    self._out_sid.clear()
+                hit = self._out_sid[path] = (ino, sid)
+            got.setdefault(hit[1], name[:-4])
+        return got
 
     # --- sending -------------------------------------------------------------
 
@@ -1850,21 +1889,33 @@ def _panels(got):
     return out
 
 
-def _stage_label(runs, key, row, st, outs):
-    """(stage, attempt) of a ticket session: the stage output written after it
-    started; none yet: the stage the ticket is running now. A panel member's stage
-    says which one it is (plan, planner 2)."""
-    name = runs.stage_of(key, _ms(row["time_created"]), outs)
+def _stage_parts(runs, key, row, st, outs):
+    """(stage, attempt, who) of a ticket session: the stage output that names it
+    (out_sessions), else the one written after it started (of those naming no
+    session); none yet: the stage the ticket is running now. who: the panel member
+    it is (planner 2, ux reviewer, merged), or ""."""
+    outs = runs.stage_outs(key) if outs is None else outs
+    named = runs.out_sessions(key, outs)
+    name = named.get(row.get("id"))
+    if not name:
+        taken = set(named.values())
+        name = runs.stage_of(key, _ms(row["time_created"]), [o for o in outs if o[0][:-4] not in taken])
     if name:
         stage, _, n = name.partition("-")
         n, _, tag = n.partition("-")
-        if tag:
-            who = f"planner {tag[1:]}" if re.fullmatch(r"d\d+", tag) else PANEL_TAGS.get(tag, tag)
-            stage = f"{stage}, {who}" if tag != "panel" else f"{stage}, merged"
-        return stage, int(n) + 1 if n.isdigit() else 0
+        who = ("" if not tag else "merged" if tag == "panel" else f"planner {tag[1:]}"
+               if re.fullmatch(r"d\d+", tag) else PANEL_TAGS.get(tag, tag))
+        return stage, int(n) + 1 if n.isdigit() else 0, who
     if st.get("status") in ("running", "interrupted"):
-        return st.get("stage", ""), st.get("attempt", 0) + 1
-    return "", 0
+        return st.get("stage", ""), st.get("attempt", 0) + 1, ""
+    return "", 0, ""
+
+
+def _stage_label(runs, key, row, st, outs):
+    """(stage, attempt) of a ticket session, a panel member's saying which one it is
+    (plan, planner 2)."""
+    stage, n, who = _stage_parts(runs, key, row, st, outs)
+    return (f"{stage}, {who}" if stage and who else stage), n
 
 
 # --- /runs: every session ---------------------------------------------------------
@@ -2696,11 +2747,15 @@ def _edit_lock(st):
     return "all", "Nothing has run yet: every setting can change."
 
 
-def _t_settings(key, st):
+def _t_details(runs, key, st, pos, n):
+    """The Ticket tab's Details: where it is in the queue, when added and changed, its
+    commit, then what it was added with (and edited to since), with Edit settings
+    while anything can change (_edit_lock: not while it runs)."""
     can, why = _edit_lock(st)
     act = (f"<a class='btn sm' href='/runs/ticket/{quote(key)}/edit'>Edit settings</a>" if can != "none" else "")
-    return (f"<section class='panel'><div class='hd'><h2>Settings</h2>{act}</div>"
-            f"<div class='kv'>{''.join(_settings_facts(key, st))}</div><div class='muted'>{esc(why)}</div></section>")
+    return (f"<section class='panel'><div class='hd'><h2>Details</h2>{act}</div>"
+            f"<div class='kv'>{''.join(_t_facts(runs, key, st, pos, n) + _settings_facts(key, st))}</div>"
+            f"<div class='muted'>{esc(why)}</div></section>")
 
 
 def _t_facts(runs, key, st, pos, n):
@@ -2717,7 +2772,7 @@ def _t_facts(runs, key, st, pos, n):
         facts.append(f"<span><b>{pos} of {n}</b> in the queue</span>")
     elif key in runs.archived_keys():
         facts.append("<span><b>archived</b></span>")
-    return f"<section class='panel'><div class='kv'>{''.join(facts)}</div></section>" if facts else ""   # the stages: the header's
+    return facts
 
 
 PUSHED = {"pushed": "pushed to {remote}", "local": "kept on this computer: not pushed",
@@ -2775,8 +2830,12 @@ def _t_acts(runs, key, st, rows, live, pos, n):
                 + "</div>")
     now_live = [r for r in rows if r["id"] in live]
     if now_live:
-        r = max(now_live, key=lambda r: _ms(r["time_created"]))
-        parts.append(f"<a class='btn primary' href='/runs/{quote(r['id'])}'>Watch and message the agent &rarr;</a>")
+        if len(now_live) == 1:
+            parts.append(f"<a class='btn primary' href='{base}agent?sid={quote(now_live[0]['id'])}'>Watch and "
+                         "message the agent &rarr;</a>")
+        else:   # a panel: the Agent tab lists them, each to pick
+            parts.append(f"<a class='btn primary' href='{base}agent'>Watch the {len(now_live)} agents "
+                         "working &rarr;</a>")
     if status == "plan-review" and st.get("criteria") and runs.vault_of(st):
         # the feedback form is on the page: approve it, so what is in it is refused rather than lost
         parts.append("<button type='submit' form='planfb' formaction='" + esc(base + "approve") + "' class='primary' "
@@ -3060,6 +3119,10 @@ def _t_docs(runs, key, st, log, tab="ticket"):
         text = _vault_text(vault, _note_rel(key, kind))
         if text.strip():
             parts.append(_doc(runs, vault, key, kind, label, text, open_=kind == "ticket"))
+        elif kind == "ticket":   # a Jira ticket is copied in by its first stage (harness queue _pull)
+            parts.append("<section class='panel'><div class='hd'><h2>The ticket</h2></div><div class='muted'>"
+                         "Its text is not in the vault yet: the queue copies it in from the tracker when its "
+                         "first stage starts.</div></section>")
     if tab == "ticket":
         return "".join(parts)
     parts.append(_t_debug(runs, key, st))
@@ -3338,7 +3401,7 @@ def ticket_live(runs, key, tab="ticket"):
         live = runs.live(now)
         outs = runs.stage_outs(key)
         rows = runs.ticket_sessions(key)
-        regions = {"head": head, "settings": _t_settings(key, st),
+        regions = {"head": head,
                    "sessions": _t_sessions(runs, key, st, rows, live, outs, now),
                    "attempts": _t_attempts(key, st, {o[0] for o in outs}), "notes": _t_notes(key, st),
                    "rounds": _t_rounds(runs, key, st) + _t_reviews(key, st),
@@ -3352,7 +3415,7 @@ def ticket_live(runs, key, tab="ticket"):
     n = len([k for k in listed if k in order])
     regions = {"head": head, "acts": _t_acts(runs, key, st, rows, live, pos, n),
                "start": _t_start(runs, key, st, runs.runner(now), now), "packet": _t_packet(st, key) + _t_verdicts(st) + _t_panels(st),
-               "qs": _t_questions(runs, key, st), "result": _t_facts(runs, key, st, pos, n) + _t_result(st),
+               "qs": _t_questions(runs, key, st), "result": _t_details(runs, key, st, pos, n) + _t_result(st),
                "docs": _t_docs(runs, key, st, "", "ticket"), "nav": nav(runs, "queue")}
     return {"sig": _sig(regions), "regions": regions}
 
@@ -3366,7 +3429,6 @@ def render_ticket(runs, key, msg="", bad=False, tab="ticket"):
     if tab == "history":
         return key, [live, f"<div id='r-head' class='stack'>{g['head']}</div>", _flash(msg, bad),
                      "<div class='wide'><div class='stack'>"
-                     f"<div id='r-settings'>{g['settings']}</div>"
                      f"<div id='r-rounds'>{g['rounds']}</div>"
                      f"<section class='panel' id='r-attempts'>{g['attempts']}</section>"
                      f"<div id='r-docs' class='stack'>{g['docs']}</div></div>"
@@ -3381,37 +3443,100 @@ def render_ticket(runs, key, msg="", bad=False, tab="ticket"):
 
 def render_ticket_agent(runs, key, sid="", oc_url=None):
     """/runs/ticket/KEY/agent: the ticket's live (else latest) agent session, or the
-    one picked (sid), as its own page shows it, with a picker of the ticket's sessions."""
+    one picked (sid) of ticket_agents, as its own page shows it, the list of the
+    ticket's sessions at its side. It opens at the chat's end: its latest step."""
     if not KEY_RE.match(key or "") or key not in runs._ticket_dirs():
         return None
-    rows = runs.ticket_sessions(key)
-    if not rows:
+    items = ticket_agents(runs, key)
+    if not items:
         return key, [ticket_tabs(runs, key, "agent"),
                      "<section class='panel muted'>No agent session for this ticket yet.</section>"], ""
     live = runs.live()
-    ids = [r["id"] for r in rows]
-    if sid not in ids:
-        on = [r for r in rows if r["id"] in live]
-        sid = (on or rows)[-1]["id"]
-    got = render_detail(runs, sid, oc_url=oc_url)
+    if sid not in [g["id"] for g in items]:
+        on = [g for g in items if g["id"] in live]
+        sid = (on or items)[-1]["id"]
+    got = render_detail(runs, sid, oc_url=oc_url, key=key)
     if not got:
         return None
-    # a session still going opens at its latest step (the end), a finished one at its start
-    end = ";if (!location.hash) window.scrollTo(0, document.body.scrollHeight);" if sid in live else ""
-    return key, got[1], (got[2] or "") + end
+    # at the chat's end (on a phone the side column, its list too, is below it)
+    return key, got[1], (got[2] or "") + WATCH_END_JS
 
 
-def _picker(runs, key, sid):
-    """The ticket's stage sessions, newest first, as one row of links (the shown one marked)."""
-    rows, st, outs, live = runs.ticket_sessions(key), runs.ticket_state(key), runs.stage_outs(key), runs.live()
-    links = []
-    for r in reversed(rows):
-        stage, n = _stage_label(runs, key, r, st, outs)
-        on = " class='on' aria-current='true'" if r["id"] == sid else ""
-        dot = "<span class='sdot run'></span>" if r["id"] in live else ""
-        links.append(f"<a href='/runs/ticket/{quote(key)}/agent?sid={quote(r['id'])}'{on}>{dot}"
-                     f"{esc(stage or 'session')}{f' {n}' if n else ''}</a>")
-    return f"<nav class='spick' aria-label='sessions'>{''.join(links)}</nav>" if len(links) > 1 else ""
+def ticket_agents(runs, key):
+    """The ticket's agent sessions, oldest first: its stages' (a panel's members each
+    its own) and the debug agent's runs on its blocks. [{id, row, stage, n, who}]:
+    stage "debug" for a debug agent's."""
+    st, outs = runs.ticket_state(key), runs.stage_outs(key)
+    got = []
+    for r in runs.ticket_sessions(key):
+        stage, n, who = _stage_parts(runs, key, r, st, outs)
+        got.append({"id": r["id"], "row": r, "stage": stage, "n": n, "who": who})
+    seen = {g["id"] for g in got}
+    for sid, a in agent_sessions(runs).items():
+        if a.get("kind") == "debug" and a.get("key") == key and sid not in seen:
+            _, row = runs.find(sid)
+            if row:
+                got.append({"id": sid, "row": row, "stage": "debug", "n": 0, "who": "debug agent"})
+    got.sort(key=lambda g: _ms(g["row"].get("time_created")))
+    return got
+
+
+def _hm(ms, now):
+    """A session's time as the list shows it: the hour and minute, the day too when not today."""
+    w = _when(ms)
+    return "" if not w else w[11:16] if w[:10] == _when(now * 1000)[:10] else w[5:16]
+
+
+def _session_list(runs, key, sid, now=None):
+    """The Agent tab's list of the ticket's sessions (ticket_agents), grouped by stage
+    in the order they ran: a dot that says which are working (green), updated in the
+    last ACTIVE s (amber) or ended (grey), when each ran, the shown one marked. Each
+    opens on the Agent tab. In the side column, so it stays in view at the chat's end."""
+    now = now or time.time()
+    items = ticket_agents(runs, key)
+    if not items:
+        return ""
+    live = runs.live(now)
+    groups, on = [], 0
+    for g in items:
+        r = g["row"]
+        made, upd = _ms(r.get("time_created")), _ms(r.get("time_updated"))
+        if g["id"] in live:
+            cls, word, when = "on", "working", f"{_hm(made, now)}, working"
+            on += 1
+        elif upd and now - upd / 1000 <= ACTIVE:
+            cls, word, when = "quiet", "updated in the last minute or so", f"{_hm(made, now)} to {_hm(upd, now)}"
+        else:
+            cls, word, when = "off", "ended", f"{_hm(made, now)} to {_hm(upd, now)}" if upd else _hm(made, now)
+        head = ("debug" if g["stage"] == "debug" else
+                f"{g['stage'] or 'session'}" + (f" &middot; attempt {g['n']}" if g["n"] else ""))
+        cur = " class='on' aria-current='true'" if g["id"] == sid else ""
+        link = (f"<li><a href='/runs/ticket/{quote(key)}/agent?sid={quote(g['id'])}'{cur} "
+                f"title='{esc(r.get('title') or g['id'])}'><span class='sdot {cls}' role='img' aria-label='{word}' "
+                f"title='{word}'></span><span class='sl'>{esc(g['who'] or 'agent')}</span>"
+                f"<span class='st'>{esc(when)}</span></a></li>")
+        if groups and groups[-1][0] == head:
+            groups[-1][1].append(link)
+        else:
+            groups.append((head, [link]))
+    body = "".join(f"<li><div class='sgh'>{h}</div><ul>{''.join(ls)}</ul></li>" for h, ls in groups)
+    n = len(items)
+    return (f"<div class='hd'><h2>Agents</h2><span class='muted'>{on} working, {n} session{'' if n == 1 else 's'}"
+            f"</span></div><ol class='sgroups'>{body}</ol><div class='slegend'><span><span class='sdot on'></span>"
+            "working</span><span><span class='sdot quiet'></span>just updated</span><span><span class='sdot off'>"
+            "</span>ended</span></div>")
+
+
+WATCH_END_JS = """
+if (!location.hash) document.getElementById('end').scrollIntoView({block: 'end'});
+"""
+
+SLIST_JS = """
+(function () {   // the shown session in view in the list (the list scrolls, not the page)
+  var g = document.querySelector('#slist .sgroups'), a = g && g.querySelector('a.on');
+  if (a) g.scrollTop = Math.max(0, a.offsetTop - g.clientHeight / 2);
+})();
+"""
 
 
 # --- /runs/ticket/KEY/edit ---------------------------------------------------------
@@ -3463,9 +3588,9 @@ def render_ticket_edit(runs, key, form=None, err=""):
         return None
     can, why = _edit_lock(st)
     k = quote(key)
-    # under the ticket's tabs, as History (where its Edit link is); Back: to that tab
-    parts = [ticket_tabs(runs, key, "history"),
-             f"<h2 class='sesh'>Settings <a class='btn sm' href='/runs/ticket/{k}/history'>Back</a></h2>"
+    # under the ticket's tabs, as the Ticket tab (where its Edit link is); Back: to that tab
+    parts = [ticket_tabs(runs, key, "ticket"),
+             f"<h2 class='sesh'>Settings <a class='btn sm' href='/runs/ticket/{k}'>Back</a></h2>"
              f"<div class='sub'>{esc(why)}</div>"]
     if can == "all":
         parts.append(add_form(runs, form if form is not None else _edit_values(key, st), err, edit=key))
@@ -5191,12 +5316,13 @@ POLL_JS = """
   var box = document.getElementById('msgs'), side = document.getElementById('side'), nav = document.getElementById('r-nav');
   if (!box) return;
   var url = box.getAttribute('data-tail'), follow = box.getAttribute('data-follow'), idle = 0, last = '', navLast = nav ? nav.innerHTML : '', sideLast = null;
+  var key = box.getAttribute('data-key'), slist = document.getElementById('slist'), slistLast = null;
   window.hFresh('ok');
   function nearBottom() { return window.innerHeight + window.scrollY >= document.body.scrollHeight - 160; }
   function tick() {
     if (document.hidden) { setTimeout(tick, 3000); return; }
     var n = box.querySelectorAll('.msg').length, from = Math.max(0, n - 1);
-    window.hFetch(url + '?from=' + from).then(function (d) {
+    window.hFetch(url + '?from=' + from + (key ? '&key=' + encodeURIComponent(key) : '')).then(function (d) {
       var stick = nearBottom();
       if (d.sig !== last) {
         last = d.sig;
@@ -5209,6 +5335,14 @@ POLL_JS = """
         if (stick) window.scrollTo(0, document.body.scrollHeight);
       }
       if (d.side !== sideLast && window.hSwap(side, d.side)) sideLast = d.side;
+      if (slist && d.slist && d.slist !== slistLast) {   // the list keeps where it was scrolled to
+        var g = slist.querySelector('.sgroups'), top = g ? g.scrollTop : 0;
+        if (window.hSwap(slist, d.slist)) {
+          slistLast = d.slist;
+          g = slist.querySelector('.sgroups');
+          if (g) g.scrollTop = top;
+        }
+      }
       if (nav && d.nav && d.nav !== navLast && window.hSwap(nav, d.nav)) navLast = d.nav;
       idle = d.working ? 0 : idle + 1;
       // Following a queue: once this stage's session is done, go to the next one.
@@ -5245,24 +5379,31 @@ FOLLOW_JS = """
 LIST_JS = LIVE_JS
 
 
-def render_detail(runs, sid, sent="", follow="", oc_url=None, msg="", bad=False):
+def render_detail(runs, sid, sent="", follow="", oc_url=None, msg="", bad=False, key=""):
     """(title, body parts, script) or None. follow: a follow query (follow_query) to
     move on to once this session is done. oc_url: a function giving the session's
-    opencode web link from its source label, or None."""
+    opencode web link from its source label, or None. key: the ticket it is shown
+    under (a debug agent's session runs outside the ticket's folder), else the one
+    its folder names. A ticket's session has the ticket's tabs and its list of
+    sessions (_session_list) at its side."""
     src, row = runs.find(sid)
     if not row:
         return None
     live = runs.live()
     msgs = runs.messages(src, sid)
     crumbs = ["<a href='/runs'>Sessions</a>"]
-    key = runs.ticket_of_row(row)
+    key = key or runs.ticket_of_row(row)
     if key:
         crumbs = [f"<a href='/runs/queue'>Queue</a><span>/</span><a href='/runs/ticket/{quote(key)}'>{esc(key)}</a>"]
+    elif follow == "findings=1":   # Watch on the findings agent's card: its passes, one after another
+        crumbs = ["<a href='/runs/queue'>Queue</a><span>/</span><a href='/runs/queue#findings-agent'>Findings "
+                  "agent</a><span class='muted'>&nbsp;this page moves on to each next pass</span>"]
     for p in runs.chain(src, row):
         crumbs.append(f"<span>/</span><a href='/runs/{quote(p['id'])}'>{esc(p.get('title') or p['id'])}</a>")
     title = row.get("title") or sid
     link = oc_url(src.label, sid) if oc_url else ""
-    top = ticket_tabs(runs, key, "agent") + _picker(runs, key, sid) if key else ""
+    top = ticket_tabs(runs, key, "agent") if key else ""
+    slist = _session_list(runs, key, sid) if key else ""
     h = "h2" if key else "h1"   # under a ticket's tabs: the session is a part of the ticket's page
     parts = [f"{top}<header class='ph'>" + ("" if key and len(crumbs) == 1 else f"<div class='crumbs'>{''.join(crumbs)}</div>")
              + f"<{h} class='sesh'>{esc(title)}</{h}>"
@@ -5270,13 +5411,15 @@ def render_detail(runs, sid, sent="", follow="", oc_url=None, msg="", bad=False)
              "rel='noopener'>JSON</a></header>", _flash(msg, bad),
              "<div class='cols'><div class='stack'>"
              f"<div id='msgs' data-sid='{esc(sid)}' data-tail='/runs/{quote(sid)}/tail'"
+             + (f" data-key='{esc(key)}'" if slist else "")
              + (f" data-follow='/runs/follow.json?{esc(follow)}'" if follow else "")
              + f">{render_messages(msgs, sid)}</div>"
              + ("" if msgs else "<div class='panel muted' id='nomsg'>No messages yet.</div>") +
              "<span id='end'></span></div>",
-             f"<div class='stack stick'><section class='panel' id='side'>"
+             "<div class='stack stick'>" + (f"<section class='panel' id='slist'>{slist}</section>" if slist else "")
+             + f"<section class='panel' id='side'>"
              f"{render_side(runs, src, row, live, sent, todos_of(msgs), link)}</section></div></div>"]
-    return title, parts, POLL_JS
+    return title, parts, POLL_JS + (SLIST_JS if slist else "") + (WATCH_END_JS if follow == "findings=1" else "")
 
 
 def follow_query(query):
@@ -5287,14 +5430,34 @@ def follow_query(query):
         since = max(0, int((query.get("since") or ["0"])[0]))
     except ValueError:
         since = 0
+    if (query.get("findings") or [""])[0] == "1":   # the findings agent's passes, one after another
+        return 0, "findings", "findings=1"
     queue = (query.get("queue") or [""])[0] == "1"
     return since, queue, f"since={since}" + ("&queue=1" if queue else "")
+
+
+def findings_target(runs):
+    """The findings agent's session to watch: the pass it is on (agent.json's session,
+    while it runs), else its last pass's (ledger.json). None when it has run none."""
+    d = findings_view.state_dir(runs)
+    if not d:
+        return None
+    d = os.path.join(d, "findings")
+    info = findings_agent_view.read_status(d)
+    for sid in ([info.get("session")] if findings_agent_view._running(info, time.time()) else []) + [
+            p.get("session") for p in findings_agent_view.passes(d, 5)]:
+        if isinstance(sid, str) and SID_RE.match(sid):
+            return sid
+    return None
 
 
 def follow_target(runs, since=0, queue=False):
     """The session a follow page shows: of the root sessions started at or after
     since (queue stages only with queue), a live one first, then one still
-    working, then the newest. None until one has started."""
+    working, then the newest. None until one has started. queue "findings": the
+    findings agent's (findings_target)."""
+    if queue == "findings":
+        return findings_target(runs)
     live = runs.live()
     now = time.time()
     best = None
@@ -5311,7 +5474,8 @@ def follow_target(runs, since=0, queue=False):
 
 def render_follow(follow, queue):
     """The page a launch opens before its agent's session exists."""
-    what = "the queue's next stage" if queue else "the agent"
+    what = ("the findings agent's next pass" if queue == "findings" else "the queue's next stage" if queue
+            else "the agent")
     return (f"<section class='panel' id='wait' data-follow='/runs/follow.json?{esc(follow)}'"
             + (" data-jump='1'" if queue else "") +
             f"><div class='ph'><span class='sdot run'></span><h1>Waiting for {what} to start&hellip;</h1></div>"
@@ -5319,7 +5483,9 @@ def render_follow(follow, queue):
             "<a href='/runs'>All sessions</a> &middot; <a href='/runs/queue'>the queue</a></div></section>")
 
 
-def tail(runs, sid, start, oc_url=None):
+def tail(runs, sid, start, oc_url=None, key=""):
+    """The session's messages from start on, its side panel and the nav, for its
+    page's poll; key: the ticket whose list of sessions (_session_list) it shows."""
     src, row = runs.find(sid)
     if not row:
         return None
@@ -5331,8 +5497,11 @@ def tail(runs, sid, start, oc_url=None):
     side = render_side(runs, src, row, live, todos=todos_of(msgs), oc_url=oc_url(src.label, sid) if oc_url else "")
     bar = nav(runs, "queue" if runs.ticket_of_row(row) else "sessions")
     sig = hashlib.sha1(f"{start}:{len(msgs)}:{body}:{side}".encode()).hexdigest()
-    return {"from": start, "count": len(msgs), "html": body, "sig": sig, "working": working, "side": side,
-            "nav": bar}
+    got = {"from": start, "count": len(msgs), "html": body, "sig": sig, "working": working, "side": side,
+           "nav": bar}
+    if KEY_RE.match(key or "") and key in runs._ticket_dirs():
+        got["slist"] = _session_list(runs, key, sid)
+    return got
 
 
 def export(runs, sid):

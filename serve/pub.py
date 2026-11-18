@@ -1139,14 +1139,15 @@ def make_handler(cfg):
                 got = runs_view.render_detail(r, sid, "", follow if queue else "", self.oc_link(), done)
                 if got:
                     self.send_runs(200, f"harness: {got[0]}", got[1], got[2], head,
-                                   "queue" if r.ticket_of_row(r.find(sid)[1] or {}) else "sessions")
+                                   "queue" if queue == "findings" or r.ticket_of_row(r.find(sid)[1] or {})
+                                   else "sessions")
                     return
             elif bits[1:] == ["tail"]:
                 try:
                     start = int((q.get("from") or ["0"])[0])
                 except ValueError:
                     start = 0
-                got = runs_view.tail(r, sid, start, self.oc_link())
+                got = runs_view.tail(r, sid, start, self.oc_link(), (q.get("key") or [""])[0][:80])
                 if got is not None:
                     self.send_json(got, head)
                     return

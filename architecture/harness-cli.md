@@ -1791,7 +1791,8 @@ which files a vault's findings as tickets).
   `serve/findings_agent_view.py` (`agent_card`, `agent_action`: start, stop,
   notes, folders; counts per question with why reports were thrown
   away, reports waiting for the checker; the last 8 sessions, each linked to `/runs/<session>`; a link to the
-  notes). `GET /runs/findings/notes` lists the notes (`knowledge_index`) and
+  notes; "Watch it work" while it runs, "Its last pass" when stopped, both
+  `/runs/follow?findings=1`). `GET /runs/findings/notes` lists the notes (`knowledge_index`) and
   `/runs/findings/notes/<repo-slug>/<name>` renders one as markdown
   (`knowledge_text`: both names `[A-Za-z0-9_][A-Za-z0-9._-]*`, the path kept
   under `knowledge/`), `runs.render_findings_notes`/`render_findings_note`.
@@ -2553,12 +2554,26 @@ offered as suggestions. It is taken as pasted: quotes
   that none is going) and how many tickets are queued and waiting on you.
 - One page per ticket, as tabs (`runs.ticket_tabs(runs, key, active)`, the
   same header on each: key, title, status, stage strip, the one action it
-  needs now, `_primary`): Ticket `/runs/ticket/<KEY>` (actions, questions,
-  the queue's decision `packet` with its answers as buttons and `review_verdicts`, the result, ticket and
-  plan notes), Changes `/diff`, Agent `/agent?sid=` (the live or latest
-  stage session, a picker of the others; a ticket's session page `/runs/<id>`
-  shows the same tabs), History `/history` (settings, sessions, attempts,
-  rounds, notes, docs, the log; its poll is `/live?tab=history`); an unknown
+  needs now, `_primary`): Ticket `/runs/ticket/<KEY>` (actions, a Details
+  panel with the facts, settings and Edit settings, questions, the queue's
+  decision `packet` with its answers as buttons and `review_verdicts`, the
+  result, ticket and plan notes; with no ticket note yet it says the queue
+  copies it in when the first stage starts), Changes `/diff`, Agent
+  `/agent?sid=` (the newest live session, else the newest; a ticket's session
+  page `/runs/<id>` shows the same tabs), History `/history` (sessions,
+  attempts, rounds, notes, docs, the log; its poll is `/live?tab=history`).
+  The Agent tab's side column has the ticket's session list
+  (`ticket_agents`, `_session_list`), sticky on wide screens so it is in
+  reach from the chat's end: every session, old ones too, oldest first,
+  grouped by stage and attempt, plus the debug agent's sessions on the
+  ticket (`agent_sessions` kind debug); each has a dot (green working, amber
+  updated in the last `ACTIVE` s, grey ended), when it ran, and a label.
+  A panel member's label is exact: the stage output that names its session
+  (`[harness] session:` in `{stage}-{attempt}-{tag}.out`, `Runs.out_sessions`)
+  says planner N, the reviewer or merged; with none, the output written after
+  it started. The poll (`/runs/<id>/tail?key=KEY`) brings the list back
+  (`slist`), and a session opens scrolled to the chat's end. The Ticket tab's
+  Watch goes to the one live session, or to the Agent tab when several work. An unknown
   ticket's page is a 404 page with the nav and a way back. The queue
   page's rows show one action, the rest under a More menu. Reads go
   through one cache (`Runs.memo`: keyed by the files' stat, a file changed
@@ -2569,8 +2584,8 @@ offered as suggestions. It is taken as pasted: quotes
 - `/runs/ticket/<KEY>`: status and why, the stage strip, a Result panel
   once `state.json` has `push` (where the branch went, an "Open a pull
   request" link from `compare_url` when it is an http(s) one, the diffstat,
-  the commits, a refused push's error and the push `warnings`), a Settings
-  panel (`_settings_facts`: project, base, start, branch or uncommitted, each
+  the commits, a refused push's error and the push `warnings`), the Details
+  panel (`_t_details`: `_t_facts` and `_settings_facts`: project, base, start, branch or uncommitted, each
   repository's branch, where it works, stages, after the plan; `_edit_lock`
   says what can change now and why), and buttons,
   each with a tooltip saying what it does (the queue page's rows use the same
@@ -2842,7 +2857,9 @@ offered as suggestions. It is taken as pasted: quotes
   working, then newest), or shows a waiting page that polls
   `/runs/follow.json` (`{"sid": ...}`) until one starts. With `queue=1` only
   queue stages count, and a stage page carries `data-follow`, so once its
-  session is done the page moves on to the next stage's.
+  session is done the page moves on to the next stage's. `?findings=1`
+  follows the findings agent (`findings_target`): agent.json's session while
+  it runs, else the newest pass in the ledger, moving on to each next pass.
 
 **Auto-open.** Every headless launch shows its run: `harness_view` (host
 `-p` in `host_run_opencode`, container `-p` in `run_agent`, and once per
