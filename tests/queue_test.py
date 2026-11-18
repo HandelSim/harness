@@ -1935,6 +1935,19 @@ class OwnerControlTest(Base):
         rc, out = self.q("note", "ABC-7", "--text", "x")
         self.assertEqual(rc, 1)
 
+    def test_a_long_ticket_is_cut_in_the_prompt_and_points_at_its_file(self):
+        path = os.path.join(self.tmp, "LONG-1.md")
+        with open(path, "w") as f:
+            f.write("x" * (tq.TICKET_CAP + 500) + "THE END")
+        got = tq.ticket_text(path)
+        self.assertTrue(got.startswith("x" * tq.TICKET_CAP))
+        self.assertNotIn("THE END", got)
+        self.assertIn(f"cut at {tq.TICKET_CAP} of {tq.TICKET_CAP + 507} characters: read the whole ticket", got)
+        with open(path, "w") as f:
+            f.write("short")
+        self.assertEqual(tq.ticket_text(path), "short")
+        self.assertEqual(tq.ticket_text(path + ".gone"), "")
+
     def test_notes_are_capped_and_survive_a_run_saving_old_state(self):
         self.add("ABC-1")
         q = tq.Queue(self.state)

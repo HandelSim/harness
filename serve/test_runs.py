@@ -1672,6 +1672,19 @@ class QueuePageTest(RunsServer):
         self.assertEqual(r.status, 409)
         self.assertIn("there is no active vault", body)
 
+    def test_a_ticket_of_your_own_has_no_limit_on_its_description(self):
+        proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
+        self.start()
+        r, body = self.req("GET", "/runs/queue")
+        self.assertRegex(body, r"<textarea name='desc' placeholder=")   # no maxlength
+        desc = "".join(f"line {i}: the steps, logs and what the agents should know\n" for i in range(3000)) + "THE END"
+        self.assertGreater(len(desc), 150000)
+        r, body = self.post("/runs/queue/add", [("kind", "local"), ("title", "a long one"), ("desc", desc),
+                                                ("project", proj)])
+        self.assertEqual(r.status, 303, body)
+        with open(os.path.join(self.vault, ".raw", "tickets", "LOCAL-1.md")) as f:
+            self.assertIn(desc + "\n", f.read())   # all of it, not cut
+
     def test_add_a_review_only_ticket_with_its_ref_and_a_note(self):
         proj = git_repo(os.path.join(self.tmp.name, "proj-git"))
         self.start()

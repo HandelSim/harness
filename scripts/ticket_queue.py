@@ -248,6 +248,16 @@ def read(path, cap=None):
     return text
 
 
+def ticket_text(path):
+    """The ticket as an agent's prompt embeds it: a long one (a ticket of your own has
+    no limit) is cut at TICKET_CAP, the cut saying the whole of it is in its file."""
+    text = read(path)
+    if len(text) <= TICKET_CAP:
+        return text
+    return text[:TICKET_CAP] + (f"\n[... cut at {TICKET_CAP} of {len(text)} characters: read the whole ticket "
+                                "in the file named above ...]\n")
+
+
 def write_atomic(path, text, sync=True):
     """path holds text, whole: written beside it and moved over it. sync: on disk
     before the move, so a machine that loses power keeps the old or the new file,
@@ -3353,7 +3363,7 @@ def common(ctx, st):
                 REPO=workdir(ctx.q, st), WHERE=IN_PLACE if st.get("in_place") else IN_CLONE,
                 **landing(st, lands(ctx, st), ap["fix"]),
                 TICKET_FILE=ap["ticket"],
-                TICKET=read(p["ticket"], TICKET_CAP) or "(the ticket file is missing; read the path above)",
+                TICKET=ticket_text(p["ticket"]) or "(the ticket file is missing; read the path above)",
                 PLAN_FILE=ap["plan"], PLAN=plan,
                 REVIEW_FILE=ap["review"], FINDINGS_FILE=ap["findings"], ANSWERS_FILE=ap["answers"],
                 ANSWERS=answers or "(none)", NOTES=owner_notes(ctx.q.notes(st["key"])),

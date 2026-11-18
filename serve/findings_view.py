@@ -818,7 +818,7 @@ FINDINGS_JS = """
     var one = list.length === 1 ? (list[0].querySelector('.tl') || {}).textContent || '' : '';
     var max = +(title.getAttribute('maxlength') || 120);
     title.value = one ? ('Fix: ' + one).slice(0, max) : 'Fix ' + list.length + ' findings';
-    var text = 'Fix ' + (list.length === 1 ? 'this finding' : 'these findings') + ':\\n\\n', dmax = +(desc.getAttribute('maxlength') || 20000), left = 0;
+    var text = 'Fix ' + (list.length === 1 ? 'this finding' : 'these findings') + ':\\n\\n', dmax = +desc.getAttribute('maxlength') || Infinity, left = 0;
     list.forEach(function (r) {
       var line = r.getAttribute('data-md') + '\\n';
       if (text.length + line.length < dmax - 80) text += line; else left++;

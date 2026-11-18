@@ -323,11 +323,11 @@ def new_local(vault, key, title, text, taken=""):
         return "", f"{key} already has a copy in the vault ({snapshot_rel(key)})"
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    body = (text or "").strip() or title
+    body = (text or "").strip() or title   # all of it: the owner's own, with no tracker to hold the rest
     os.makedirs(d, exist_ok=True)
     write_if_changed(path, redact(
         f"---\ntype: ticket\nticket: {key}\ntitle: {yq(title)}\nstatus: open\nsource: local\nupdated: {yq(now)}\n"
-        f"---\n\n# {key}: {title}\n\n{LOCAL_LABEL}\n\n## Description\n\n{_cut(body, MAX_DESCRIPTION)}\n"))
+        f"---\n\n# {key}: {title}\n\n{LOCAL_LABEL}\n\n## Description\n\n{body}\n"))
     return key, ""
 
 

@@ -709,7 +709,10 @@ A ticket of the owner's own, with nothing in the tracker: `harness ticket new
 "TITLE" ["TEXT" | -] [--key KEY]` (`ticket_new`, then `vault_ticket.py --new
 <vault> <KEY|-> <title> [<queue dir>]`, description on stdin) writes
 `.raw/tickets/KEY.md` with `source: local` in its front matter, a label saying
-it is the owner's own description of the work, and `## Description` (the
+it is the owner's own description of the work, and `## Description`, all
+of it with no length limit (a tracker description is cut at
+`MAX_DESCRIPTION`; an agent's prompt embeds at most `TICKET_CAP` of the
+ticket, `ticket_text` saying the rest is in the file it names) (the
 state note comes with the first pull, as for any ticket); it is committed by
 `vault_sync`. KEY defaults to the next `LOCAL-N` free
 in the vault and as a folder in `state/queue` (`TICKET_LOCAL_PREFIX` names
@@ -2478,7 +2481,7 @@ from `prefers-color-scheme`); inline CSS, nonce scripts only, `img-src 'self'`. 
   link and Return to queue; an archived ticket's page keeps everything and
   offers only Return to queue and Remove. Then the Add form (Ticket: Jira
   tickets, by keys, or A ticket of your own, a title and a description
-  and no keys, its key the next LOCAL-N as `next_local_key` predicts it;
+  with no length limit (the form posts up to `MAX_TICKET_FORM`) and no keys, its key the next LOCAL-N as `next_local_key` predicts it;
   `add_tickets` checks everything else first, then `new_ticket` runs
   `vault_ticket.py --new` into the active vault as `harness ticket new`
   does, queues that key, and deletes the copy again when the queue did not

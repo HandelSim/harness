@@ -1362,8 +1362,9 @@ def make_handler(cfg):
             if action not in runs_view.QUEUE_ACTIONS or not cfg.runs.queue_dir:
                 self.send(404, b"not found\n")
                 return
-            try:   # the Add form has a mode, branch and target per repository
-                form = self.read_form(MAX_SEND_FORM, fields=runs_view.ADD_FIELDS)
+            try:   # the Add form has a mode, branch and target per repository, and a ticket of
+                # your own's description, which has no limit of its own (it goes on stdin)
+                form = self.read_form(MAX_TICKET_FORM, fields=runs_view.ADD_FIELDS)
             except ValueError:
                 form = None
             if form is None:

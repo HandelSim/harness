@@ -85,7 +85,6 @@ TEXT_CAP = 20000         # characters of one tool input/output shown inline
 MAX_MESSAGE = 65536      # bytes of one message sent to a live run
 NOTE_MAX = 4000         # characters of one owner note
 ADD_NOTE_MAX = 4000      # the note given with add (it goes on a command line)
-ADD_NEW_MAX = 20000      # a ticket of your own's description (it goes on stdin)
 LOCAL_TITLE_MAX = 120    # and its title (vault_ticket.py keeps no more)
 # Windows: a child with a console of its own that has no window. Without it each git
 # or queue call a click makes flashes a console window when serve has no console
@@ -2464,7 +2463,7 @@ def add_form(runs, form=None, err="", edit="", dlg=False):
             f"{' checked' if c == kind else ''}{off}>{lab}<small>{esc(hint)}</small></label>"
             for c, lab, hint, off in cards) + "</div></fieldset>")
         desc = (f"<label class='fld' data-kind='local'{hide['local']}>Description<textarea name='desc' "
-                f"maxlength='{ADD_NEW_MAX}' placeholder='What needs doing, and anything the agents should know.'>"
+                f"placeholder='What needs doing, and anything the agents should know.'>"
                 f"{esc(v('desc'))}</textarea><small>what the agents read as the ticket (empty: the title). Edit it "
                 f"later in .raw/tickets/{esc(nxt)}.md in the vault</small></label>")
     title, action = ("Settings", f"/runs/ticket/{quote(edit)}/edit") if edit else ("Add tickets", "/runs/queue/add")
@@ -4355,8 +4354,6 @@ def add_tickets(runs, form):
             return False, "give the ticket of your own a title"
         if len(title) > LOCAL_TITLE_MAX:
             return False, f"the title is over {LOCAL_TITLE_MAX} characters"
-        if len(desc) > ADD_NEW_MAX:
-            return False, f"the description is over {ADD_NEW_MAX} characters"
     else:
         keys = [k.upper() for k in re.split(r"[\s,;]+", _one(form, "keys")) if k]
         if not keys:
