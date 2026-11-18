@@ -160,6 +160,10 @@ if stage == "planning":
     planner = re.search(r"You are planner (\d+) of (\d+)", prompt)   # one of the plan panel's planners
     if planner:
         open(os.environ["FAKE_CALLS"] + ".planners", "a").write(planner.group(1) + "\n")
+        # the part and its model on one line (one atomic append): the members run at once, so
+        # .card and the launch log interleave and cannot be paired by position
+        open(os.environ["FAKE_CALLS"] + ".plannermodel", "a").write(
+            "d%s %s\n" % (planner.group(1), args[args.index("-m") + 1] if "-m" in args else ""))
         panel_span("d" + planner.group(1))
         if os.environ.get("FAKE_PANEL_FINDINGS"):   # each planner sees something off the ticket
             open(path("append one bullet to"), "a").write(f"- x.py:{planner.group(1)}: odd (seen while planning ABC-1)\n")
@@ -2998,7 +3002,8 @@ class ReviewerFixesTest(Base):
         tq.keep_tasks_out(q, self.vault)
         tq.keep_tasks_out(q, self.vault)
         self.assertEqual(cat(os.path.join(self.vault, ".gitignore")),
-                         ".trash/\n# harness queue: a stage's prompt while it runs\nwiki/notes/tickets/*-task.md\n")
+                         ".trash/\n# harness queue: a stage's prompt while it runs\n"
+                         "wiki/notes/tickets/*-task.md\nwiki/notes/tickets/*-task-*.md\n")
         self.assertFalse(os.path.exists(os.path.join(tickets, "ABC-1-task.md")))
         self.assertTrue(os.path.exists(os.path.join(tickets, "OTHER-9-task.md")))
         sh("git", "init", "-q", self.vault)
@@ -5590,7 +5595,9 @@ class PanelTest(Base):
         self.assertEqual(len(plans), 3, plans)
         cards = [json.loads(c) for c in cat(self.calls + ".card").splitlines()[:3] if c.strip()]
         self.assertEqual(sorted(c["part"] for c in cards), ["d1", "d2", "d3"])
-        self.assertEqual({c["part"]: re.search(r"-m (\S+)", l).group(1) for c, l in zip(cards, plans)},
+        # one model per planner, round the list; keyed by part (the members run at once, so
+        # .card and the launch log cannot be paired by position — see .plannermodel)
+        self.assertEqual(dict(l.split() for l in cat(self.calls + ".plannermodel").splitlines()),
                          {"d1": "harness/m-one", "d2": "harness/m-two", "d3": "harness/m-one"})
         self.assertTrue(all("You are planner" in c["done"] for c in cards), cards)
         self.assertIn("ABC-1-plan-draft-2.md", next(c for c in cards if c["part"] == "d2")["done"])
