@@ -846,7 +846,7 @@ retry is one agent, told what failed. A panel review is not asked again for
 evidence or quotes (no agent to ask): its misses drop at once. After a fix the review runs again (`fix_rounds`);
 `review_decision` gives another round only for [exec] items or unmet criteria,
 with fewer open items than before and no PASS gone back, up to `FIX_ROUNDS` 2;
-else opinion items left go to the result note (`open_opinions`) and unmet ones
+else the [bug], [risk] and [cleanup] items left (one fix round each) go to the result note (`open_opinions`) and unmet ones
 block with `packet`. Each round is a `review_verdicts` entry, with
 verify_change's last verdict (`verify_record`) beside it: shadow, verify_change
 still decides. History entries carry the agent call's `start`, `prompt`

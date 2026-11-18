@@ -984,7 +984,7 @@ def review_decision(rounds, now, prev=None):
     if rounds <= 0:
         return "fix", ""
     if not hard:
-        return "push", f"{soft} opinion item(s) left after {rounds} fix round(s): listed in the result, not fixed"
+        return "push", f"{soft} review item(s) ([bug], [risk], [cleanup]) left after {rounds} fix round(s): listed in the result, not fixed"
     if rounds >= FIX_ROUNDS:
         return "packet", f"{hard} open item(s) after {rounds} fix round(s)"
     if prev is not None:
@@ -1000,7 +1000,7 @@ def round_line(e):
     """One review round in a line, for the packet."""
     s = e.get("summary") or {}
     crit = ", ".join(f"{v['id']} {v['verdict']}" for v in e.get("criteria") or []) or "no verdicts"
-    return clip(f"round {e.get('round', 0)}: {len(s.get('exec') or [])} exec, {len(s.get('opinion') or [])} opinion; "
+    return clip(f"round {e.get('round', 0)}: {len(s.get('exec') or [])} exec, {len(s.get('opinion') or [])} other; "
                 f"{crit}" + (f" at {e['sha'][:12]}" if e.get("sha") else ""), 200)
 
 
@@ -5230,7 +5230,7 @@ def result_note(ctx, st):
     left = st.get("open_opinions") or []
     notes = [f"- must fix (asked by the {'owner' if by_owner(st) else 'review'}): {m}" for m in st.get("must_fix") or []
              if m not in left]
-    notes += [f"- left open (the review's opinion, after the fix rounds): {m}" for m in left]
+    notes += [f"- left open (a review [bug], [risk] or [cleanup] item, after the fix rounds): {m}" for m in left]
     notes += [f"- warning: {w}" for w in st.get("warnings") or []]
     if os.path.exists(p["review"]):
         notes.append(f"- the review: [[{key}-review]]")
