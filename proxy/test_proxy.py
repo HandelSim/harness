@@ -6819,6 +6819,16 @@ class TestVaultReminderLine(unittest.TestCase):
         self.assertIn("- Work only in your working directory: ", card)
         self.assertLess(len(card), 2000)
 
+    def test_a_panel_member_card_names_its_own_task_file(self):
+        last = self._sent({"x-harness-vault": "/v", "x-harness-ticket": "ABC-7", "x-harness-task": self._task(
+            stage="plan", part="d2", done="the draft is written")})
+        card = last[last.index("[harness task card:"):]
+        self.assertIn("`/v/wiki/notes/tickets/ABC-7-task-d2.md`. `read` it", card)
+        self.assertNotIn("ABC-7-task.md", card)
+        for bad in ("D2", "../x", "a/b", "x" * 21, 5, "", "-a"):
+            self.assertNotIn("part", proxy._task_fields(self._task(stage="plan", part=bad)), bad)
+        self.assertEqual(proxy._task_fields(self._task(stage="review", part="ux"))["part"], "ux")
+
     def test_a_queue_stage_stays_in_its_folder_and_the_card_files(self):
         """A stage's folder sits deep in the harness install, and a no-tools model
         looking for files climbed into it: the card names the folder and keeps it

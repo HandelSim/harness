@@ -3406,7 +3406,10 @@ def _vault_clause(vault, queue_stage=False):
 # (base64 JSON, from harness) fills it: the ticket's title, and for a queue
 # stage the stage, attempt, where it works, branch, when it is done and the
 # number of Must fix items, in the queue's words, plus the stage's own lines
-# (`do`, at most 8 of 240 characters, 1000 in all). Harness writes every field
+# (`do`, at most 8 of 240 characters, 1000 in all). A panel member (several
+# agents on one stage at once, each with its own prompt) has `part`, a short
+# tag: its full instructions are then KEY-task-<part>.md, not KEY-task.md.
+# Harness writes every field
 # but the title, which is the ticket's and is quoted as data. Each field is one
 # line with a cap, so the card stays near 1k characters. The full text stays in
 # files the card names, read when a detail is needed: a "read it when you
@@ -3415,6 +3418,7 @@ _TASK_HEADER = "x-harness-task"
 _CARD_MARK = "[harness task card"
 _CARD_FIELDS = {"title": 120, "stage": 20, "branch": 100, "where": 300, "done": 500}
 _CARD_DO_LINES, _CARD_DO_LINE, _CARD_DO_TOTAL = 8, 240, 1000
+_CARD_PART_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,19}$")
 
 
 def _task_fields(raw):
@@ -3435,6 +3439,9 @@ def _task_fields(raw):
             v = _defang_card(" ".join(v.split()))[:cap].strip()
             if v:
                 out[k] = v
+    part = obj.get("part")
+    if isinstance(part, str) and _CARD_PART_RE.match(part):
+        out["part"] = part
     for k in ("attempt", "must_fix"):
         v = obj.get(k)
         if isinstance(v, int) and not isinstance(v, bool) and 0 < v < 1000:
@@ -3510,7 +3517,7 @@ def _task_card(vault, ticket, task=None, working_directory=None, do_in_card=True
             lines.append(f"- There are {f['must_fix']} Must fix item(s) (the review's, or the owner's comments on the diff), listed in the task file;"
                          " keep one todo item per Must fix item.")
         lines.append(f"- Full instructions (the ticket, plan, owner's answers and notes, problems with the last"
-                     f" attempt): `{notes}/{t}-task.md`. `read` it when you need a detail this card and your"
+                     f" attempt): `{notes}/{t}-task{'-' + f['part'] if f.get('part') else ''}.md`. `read` it when you need a detail this card and your"
                      " todo list do not give; when you read it, put every step it asks for in your todo list.")
         lines.append(f"- Ticket text: `{v}/.raw/tickets/{t}.md`. Progress notes (done, next, decisions):"
                      f" `{notes}/{t}-state.md`; update them as you finish each step.")

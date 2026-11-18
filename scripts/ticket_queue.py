@@ -2571,26 +2571,17 @@ HOW_FAILED = "did not pass its check; fix what the check says"
 HOW_CHECKED = "ended, but its work did not pass the stage's check; fix what the check says"
 
 
-def run_agent(ctx, st, stage, prompt, member=None):
+def run_agent(ctx, st, stage, prompt):
     """One headless agent launch in the clone; its output goes to DIR/<stage>-N.out.
     A stage to go on (st["resume"]) goes on in its agent's session, told so with the
     owner's message (the full prompt is in the task file); with no session to go on
-    in, a new agent gets the prompt and is told to finish the work there.
-    member: one of a panel's agents (run_panel), {"tag", "model", "done", "collect"}: its
-    output is DIR/<stage>-N-<tag>.out, its card says where its own file goes, and
-    collect() takes that file out of the vault before the vault is committed."""
+    in, a new agent gets the prompt and is told to finish the work there. (A panel's
+    agents are launched by run_panel, not here.)"""
     key = st["key"]
-    member = member or {}
-    model = member.get("model") or ctx.model
-    model = model if "/" in model else "harness/" + model
-    sid = "" if member else resuming(ctx, st, stage)
+    model = ctx.model if "/" in ctx.model else "harness/" + ctx.model
+    sid = resuming(ctx, st, stage)
     resume = st.pop("resume", None)
     resume = resume if isinstance(resume, dict) and resume.get("stage") == stage else None
-    cmd = [BASH, ctx.harness]
-    if ctx.host or ctx.single:   # --single-message is a host-mode launch flag
-        cmd.append("host")
-    if ctx.single:
-        cmd.append("--single-message")
     # The whole prompt is also in the vault while the stage runs: a no-tools model
     # loses the prompt after its first tool call, and the proxy points it there.
     task = note_paths(ctx.vault, key)["task"]
@@ -2611,15 +2602,10 @@ def run_agent(ctx, st, stage, prompt, member=None):
                      WHY=resume.get("why") or "it was stopped",
                      MESSAGE=(resume.get("message") or "").strip() or "(none: carry on)")
         ctx.q.log(key, f"{stage}: going on in the agent's session {sid}")
-    elif WINDOWS and len(prompt) > WIN_PROMPT_MAX:
-        arg = (f"You are working on ticket {key}, stage {stage}, in {'the project' if st.get('in_place') else 'a clone of the project'} "
-               f"on branch {branch_of(st)}.\n\n"
-               f"Your full instructions for the {stage} stage of ticket {key} are in {agent_path(ctx, task)}. "
-               f"Read it first and follow it exactly.\n")
-    elif len(prompt.encode()) > PROMPT_MAX_BYTES:
-        raise RuntimeError(f"the {stage} prompt is {len(prompt.encode())} bytes, over one command-line argument's limit")
-    cmd += ["-p", "--yolo", "--ticket", key, "-m", model] + (["--session", sid] if sid else []) + [arg]
-    out = os.path.join(ctx.q.dir(key), f"{stage}-{st['attempt']}" + (f"-{member['tag']}" if member else "") + ".out")
+    else:
+        arg = prompt_arg(ctx, st, stage, prompt, task)
+    cmd = agent_cmd(ctx, key, model, arg, sid)
+    out = os.path.join(ctx.q.dir(key), f"{stage}-{st['attempt']}.out")
     if sid and os.path.exists(out):   # what the agent did before it was cut off stays readable
         with contextlib.suppress(OSError):
             os.replace(out, out + ".before")
@@ -2639,8 +2625,6 @@ def run_agent(ctx, st, stage, prompt, member=None):
         ctx.q.save(st)
     ended = gone = False
     card = task_card(ctx, st, stage)
-    if card and member.get("done"):
-        card["done"] = member["done"]
     try:
         rc = launch(ctx, st, cmd, out, since, card)
         ended = True
@@ -2670,10 +2654,32 @@ def run_agent(ctx, st, stage, prompt, member=None):
     if not read(ticket).strip() and read(kept_ticket).strip():
         write_atomic(ticket, read(kept_ticket))
         ctx.q.log(key, f"the {stage} agent deleted the ticket's text ({ticket}); put back")
-    if member.get("collect"):
-        member["collect"]()
     sync_vault(ctx, key, since)
     return rc, out
+
+
+def agent_cmd(ctx, key, model, arg, sid=""):
+    """The headless launch of an agent on the ticket (harness [host] -p ... ARG)."""
+    cmd = [BASH, ctx.harness]
+    if ctx.host or ctx.single:   # --single-message is a host-mode launch flag
+        cmd.append("host")
+    if ctx.single:
+        cmd.append("--single-message")
+    return cmd + ["-p", "--yolo", "--ticket", key, "-m", model] + (["--session", sid] if sid else []) + [arg]
+
+
+def prompt_arg(ctx, st, stage, prompt, task):
+    """The prompt as the launch's argument: on Windows a long one is a pointer to the
+    task file it is written to (task) instead."""
+    key = st["key"]
+    if WINDOWS and len(prompt) > WIN_PROMPT_MAX:
+        return (f"You are working on ticket {key}, stage {stage}, in {'the project' if st.get('in_place') else 'a clone of the project'} "
+                f"on branch {branch_of(st)}.\n\n"
+                f"Your full instructions for the {stage} stage of ticket {key} are in {agent_path(ctx, task)}. "
+                f"Read it first and follow it exactly.\n")
+    if len(prompt.encode()) > PROMPT_MAX_BYTES:
+        raise RuntimeError(f"the {stage} prompt is {len(prompt.encode())} bytes, over one command-line argument's limit")
+    return prompt
 
 
 def kept_result(st):
@@ -2745,13 +2751,28 @@ def copy_instructions(project, repo):
             print(f"[queue] warning: could not copy {src} into the clone: {e}", file=sys.stderr)
 
 
-def launch(ctx, st, cmd, out, since, card=None):
-    """Run the agent to its end, a timeout (rc 124), or the owner's stop or halt (Interrupted)."""
+def st_lock(ctx):
+    """The lock a panel's member threads hold to change or save the ticket's state."""
+    lock = getattr(ctx, "st_lock", None)
+    if lock is None:
+        lock = ctx.st_lock = threading.RLock()
+    return lock
+
+
+def launch(ctx, st, cmd, out, since, card=None, member=None):
+    """Run the agent to its end, a timeout (rc 124), or the owner's stop or halt (Interrupted).
+    member: a panel member's {"tag", "file", "task"} (run_panel), launched in a thread beside
+    the others: its launch id is its own, its agent st["agents"][tag] (and run.json "agents"),
+    st changes and saves under st_lock, and on a halt it drops only its own task file and
+    file; run_panel copies the instructions and commits the vault once for all of them."""
     key = st["key"]
+    lock = st_lock(ctx)
     # HARNESS_QUEUE_LAUNCH: harness labels the container with it (what stop_containers
     # stops) and does not remember the ticket for the folder (in place, the owner's)
-    st["launch_id"] = f"{key}-{os.getpid()}-{int(time.time() * 1000)}"
-    env = dict(os.environ, HARNESS_HOST_CONFIRM="1", HARNESS_QUEUE_LAUNCH=st["launch_id"])
+    lid = f"{key}-{os.getpid()}-{int(time.time() * 1000)}" + (f"-{member['tag']}" if member else "")
+    if not member:
+        st["launch_id"] = lid
+    env = dict(os.environ, HARNESS_HOST_CONFIRM="1", HARNESS_QUEUE_LAUNCH=lid)
     env.pop("HARNESS_TASK_CARD", None)
     if card:
         env["HARNESS_TASK_CARD"] = json.dumps(card)
@@ -2760,26 +2781,43 @@ def launch(ctx, st, cmd, out, since, card=None):
     t0 = time.monotonic()
     end = t0 + ctx.stage_timeout
     notes_at = mtime(ctx.q.notes_path(key))
-    if not st.get("in_place"):
+    extra = [member["file"]] if member else []
+
+    def save():
+        with lock:
+            ctx.q.save(st)
+    if not st.get("in_place") and not member:
         copy_instructions(st["project"], workdir(ctx.q, st))
     gitdir = git_dir(ctx.q, st)
     idle = max(0.0, float(getattr(ctx, "idle_min", 0) or 0)) * 60
     look = min(60.0, idle / 4) if idle else 0
-    step(ctx, "the agent is working")
+    if not member:
+        step(ctx, "the agent is working")
     with open(out, "w", encoding="utf-8") as f:
         p = spawn(cmd, cwd=workdir(ctx.q, st), stdin=subprocess.DEVNULL,
                   stdout=f, stderr=subprocess.STDOUT, env=env)
-        ctx.child = p
         rc = None
         keep = False   # the agent not known to be ended: st["agent"] stays for the next run, stop, retry or remove
         named = False   # the agent's session saved: a run that dies from here on leaves it to go on in
+        # a run that dies leaves this behind: the next run (or retry, remove, stop) ends that agent
+        rec = {"pid": p.pid, "launch": lid, "host": socket.gethostname(),
+               "container": not (ctx.host or ctx.single), "workdir": workdir(ctx.q, st)}
+        with lock:
+            if member:
+                ctx.children = getattr(ctx, "children", set()) | {p}
+                st.setdefault("agents", {})[member["tag"]] = rec
+            else:
+                ctx.child = p
+                st["agent"] = rec
         try:   # from here on, anything that goes wrong stops the agent: none is left running unrecorded
-            beat(ctx, agent=p.pid, launch=st["launch_id"])   # halt --force ends it (and its container) with the run
-            # a run that dies leaves this behind: the next run (or retry, remove, stop) ends that agent
-            st["agent"] = {"pid": p.pid, "launch": st["launch_id"], "host": socket.gethostname(),
-                           "container": not (ctx.host or ctx.single), "workdir": workdir(ctx.q, st)}
-            ctx.q.save(st)
-            seen, quiet_since, next_look = activity(ctx, st, out, gitdir), t0, t0 + look
+            # halt --force ends it (and its container) with the run
+            if member:
+                with lock:
+                    beat(ctx, agents=sorted(a["pid"] for a in st["agents"].values()))
+            else:
+                beat(ctx, agent=p.pid, launch=lid)
+            save()
+            seen, quiet_since, next_look = activity(ctx, st, out, gitdir, extra), t0, t0 + look
             last = time.monotonic()
             while rc is None:
                 try:
@@ -2788,57 +2826,71 @@ def launch(ctx, st, cmd, out, since, card=None):
                     gap = time.monotonic() - last
                     if gap > ASLEEP:   # the machine slept (Windows counts it): not the agent's time
                         end, quiet_since, next_look = end + gap, quiet_since + gap, next_look + gap
-                    if not named and note_session(ctx, st, out, since):
+                    if not member and not named and note_session(ctx, st, out, since):
                         named = True
                         ctx.q.save(st)
                     checkpoint(ctx)
                     if mtime(ctx.q.notes_path(key)) != notes_at:   # a note: into state.json for the viewer
                         notes_at = mtime(ctx.q.notes_path(key))
-                        ctx.q.save(st)
+                        save()
                     now = time.monotonic()
                     if now >= end:   # its work is checked as it is, unless its container may still run
                         stop(p)
-                        keep = not stop_containers(ctx, st)
+                        keep = not stop_containers(ctx, st, lid)
                         rc = 124
-                        ctx.q.log(key, f"the agent ran past {ctx.stage_timeout}s (QUEUE_STAGE_TIMEOUT) and was "
+                        ctx.q.log(key, (f"{member['tag']}: " if member else "") + f"the agent ran past {ctx.stage_timeout}s (QUEUE_STAGE_TIMEOUT) and was "
                                        "stopped" + ("; its container may still be running" if keep else
                                                     "; its work is checked as it is"))
                     elif look and now >= next_look:
                         next_look = now + look
-                        got = activity(ctx, st, out, gitdir)
+                        got = activity(ctx, st, out, gitdir, extra)
                         if got != seen:
                             seen, quiet_since = got, now
                         elif now - quiet_since >= idle:
-                            rc = idle_out(ctx, st, p, (now - quiet_since) / 60)
+                            rc = idle_out(ctx, st, p, (now - quiet_since) / 60, lid,
+                                          member["tag"] if member else "")
                     last = time.monotonic()
         except Interrupted:
             stop(p)
-            keep = not stop_containers(ctx, st)
-            drop(note_paths(ctx.vault, key)["task"])
-            if st.get("panel_file"):   # a halted panel member's file is not left in the vault
-                drop(st["panel_file"])
-            sync_vault(ctx, key, since)
+            keep = not stop_containers(ctx, st, lid)
+            if member:   # a halted panel member's files are not left in the vault; run_panel commits it
+                drop(member["task"])
+                drop(member["file"])
+            else:
+                drop(note_paths(ctx.vault, key)["task"])
+                sync_vault(ctx, key, since)
             raise
         except BaseException:  # Ctrl-C: the agent is in its own session and did not get it
             stop(p)
             keep = True   # a second Ctrl-C while its container is stopped
-            keep = not stop_containers(ctx, st)
+            keep = not stop_containers(ctx, st, lid)
             raise
         finally:
             release(p)
-            ctx.child = None
-            if not keep:
-                st.pop("agent", None)
-            with contextlib.suppress(OSError):
-                ctx.q.save(st)
-            beat(ctx, agent=0, launch="")
-            step(ctx, "the agent ended; checking its work")
+            with lock:
+                if member:
+                    ctx.children = ctx.children - {p}
+                    if not keep:
+                        (st.get("agents") or {}).pop(member["tag"], None)
+                        if not st.get("agents"):
+                            st.pop("agents", None)
+                    beat(ctx, agents=sorted(a["pid"] for a in (st.get("agents") or {}).values()))
+                else:
+                    ctx.child = None
+                    if not keep:
+                        st.pop("agent", None)
+                    beat(ctx, agent=0, launch="")
+                with contextlib.suppress(OSError):
+                    ctx.q.save(st)
+            if not member:
+                step(ctx, "the agent ended; checking its work")
     took = time.monotonic() - t0
-    if rc not in (0, 124, IDLE) and took < LAUNCH_MIN and not started_work(ctx, st, since, gitdir):
+    if rc not in (0, 124, IDLE) and took < LAUNCH_MIN and not started_work(ctx, st, since, gitdir, extra):
         tail = read(out)[-400:].strip()
         raise LaunchFailed(f"the agent launch ended after {took:.0f}s with status {rc}, having started nothing"
                            + (f": {tail}" if tail else ""))
-    st.pop("launch_fails", None)
+    with lock:
+        st.pop("launch_fails", None)
     if hasattr(ctx, "outage"):
         ctx.outage.clear()   # a launch that ran: whatever kept the run waiting is over
     return rc
@@ -2871,13 +2923,13 @@ def newest(root):
     return best
 
 
-def activity(ctx, st, out, gitdir):
+def activity(ctx, st, out, gitdir, extra=()):
     """What changes while an agent works: its output, its session database (--watch),
     the ticket's notes, the folder's git (commits, the index) and its newest file."""
     paths = [out] + list(getattr(ctx, "watch", []) or [])
     paths += [w + "-wal" for w in paths[1:]]
     paths += [note_paths(ctx.vault, st["key"])[k] for k in ("plan", "review", "findings")]
-    paths += [st["panel_file"]] if st.get("panel_file") else []
+    paths += list(extra)   # a panel member's own file
     if gitdir:
         paths += [os.path.join(gitdir, "index"), os.path.join(gitdir, "logs", "HEAD")]
     sig = []
@@ -2890,42 +2942,42 @@ def activity(ctx, st, out, gitdir):
     return tuple(sig) + (newest(workdir(ctx.q, st)),)
 
 
-def started_work(ctx, st, since, gitdir):
+def started_work(ctx, st, since, gitdir, extra=()):
     """True when the launch did something: a note of the ticket's, a commit on its
     branch, a write to the agent's session database (--watch)."""
     t = since / 1000   # no slack: the clone's own reflog is written just before the launch
     watch = list(getattr(ctx, "watch", []) or [])
     paths = [note_paths(ctx.vault, st["key"])[k] for k in ("plan", "review")] + watch + [w + "-wal" for w in watch]
-    paths += [st["panel_file"]] if st.get("panel_file") else []
+    paths += list(extra)
     if gitdir:
         paths.append(os.path.join(gitdir, "logs", "refs", "heads", *branch_of(st).split("/")))
     return any((mtime(path) or 0) >= t for path in paths)
 
 
-def idle_out(ctx, st, p, mins):
+def idle_out(ctx, st, p, mins, lid=None, tag=""):
     """The agent has shown nothing new for mins: when the upstream does not answer it is
     waiting on it (Infra: the ticket goes back, the run waits); else it is stuck, or done
     and not exiting. Either way it is stopped, and its work so far is checked (IDLE)."""
-    key = st["key"]
-    ctx.q.log(key, f"the agent made no progress for {mins:.0f} min; checking that the upstream answers")
-    step(ctx, f"the agent made no progress for {mins:.0f} min; checking that the upstream answers")
+    key, who = st["key"], f"{tag}: " if tag else ""
+    ctx.q.log(key, f"{who}the agent made no progress for {mins:.0f} min; checking that the upstream answers")
+    step(ctx, f"{who}the agent made no progress for {mins:.0f} min; checking that the upstream answers")
     up = upstream_ok(ctx)
     stop(p)
-    stop_containers(ctx, st)
+    stop_containers(ctx, st, lid)
     if not up:
         raise Infra(f"the agent made no progress for {mins:.0f} min and the upstream does not answer")
-    ctx.q.log(key, f"the agent made no progress for {mins:.0f} min and was stopped; its work is checked as it is")
+    ctx.q.log(key, f"{who}the agent made no progress for {mins:.0f} min and was stopped; its work is checked as it is")
     return IDLE
 
 
-def stop_containers(ctx, st):
+def stop_containers(ctx, st, lid=None):
     """Stopping the docker client leaves its container running: stop the agent
     container of this ticket's launch (harness queue _stop_agents, by the folder
     it mounts and the launch's label). False: it may still be running."""
     if ctx.host or ctx.single:
         return True
     key = st["key"]
-    n = launch_containers_stopped(ctx.harness, workdir(ctx.q, st), st.get("launch_id", ""))
+    n = launch_containers_stopped(ctx.harness, workdir(ctx.q, st), lid or st.get("launch_id", ""))
     if n.isdigit():
         if int(n):
             ctx.q.log(key, f"stopped {n} agent container(s)")
@@ -3230,13 +3282,26 @@ def is_agent(pid, launch, key):
                for line in r.stdout.splitlines() if line.strip())
 
 
+def agents_of(st):
+    """The agents a launch left on st: the stage's (state.json "agent") and a panel's
+    members' ("agents", by tag)."""
+    return [a for a in [st.get("agent")] + list((st.get("agents") or {}).values()) if isinstance(a, dict) and a]
+
+
+def drop_agents(st):
+    st.pop("agent", None)
+    st.pop("agents", None)
+
+
 def reap(q, st, harness, why):
-    """End the agent a run that is gone left on st (state.json "agent"): its process
+    """End the agents a run that is gone left on st (agents_of): each one's process
     tree when it is still that launch on this machine, and its container. The caller
-    drops st["agent"] and saves."""
-    a = st.get("agent") or {}
-    if not a:
-        return
+    drops them (drop_agents) and saves."""
+    for a in agents_of(st):
+        reap_one(q, st, a, harness, why)
+
+
+def reap_one(q, st, a, harness, why):
     key = st["key"]
     if a.get("host") == socket.gethostname() and is_agent(a.get("pid"), a.get("launch", ""), key):
         kill_tree(a["pid"])
@@ -5674,7 +5739,7 @@ def take(ctx, key, pending, done):
                 q.save(st)
                 q.log(key, why)
             return None, False
-        orphan = bool(st.get("agent"))   # only a launch sets it; a run that is gone left it
+        orphan = bool(agents_of(st))   # only a launch sets them; a run that is gone left them
         ctx.key = key
         beat(ctx, ticket=key, stage=st["stage"], step="")   # in hand (run_holds) before it is running
         st.update(status="running", vault=ctx.vault)
@@ -6017,7 +6082,7 @@ def run_tickets(q, ctx):
             key = st["key"]
             if orphan:   # a run that is gone left its agent: ended before this one starts
                 reap(q, st, ctx.harness, "the ticket is taken again")
-                st.pop("agent", None)
+                drop_agents(st)
                 go_on_later(st, "the queue run working on it ended while the agent worked")
                 q.save(st)
             outage = None
@@ -6079,8 +6144,9 @@ def run_tickets(q, ctx):
               "'harness usage', then run 'harness queue run' again.", file=sys.stderr)
         return 3
     except KeyboardInterrupt:
-        if ctx.child is not None:
-            stop(ctx.child)
+        for p in [ctx.child] + list(getattr(ctx, "children", ())):   # a panel's: all of them
+            if p is not None:
+                stop(p)
         print("\n[queue] interrupted; 'harness queue run' carries on from the same stage", file=sys.stderr)
         return 130
     print_list(q)
@@ -6464,7 +6530,7 @@ def reap_stranded(q, key, harness):
     it): its agent, if still going, is ended. Outside queue.lock (it can take a
     minute); the command then drops st["agent"] under the lock."""
     st = q.load(key) or {}
-    if st.get("agent") and not run_holds(q, key):
+    if agents_of(st) and not run_holds(q, key):
         reap(q, st, harness, "the owner changed the ticket")
 
 
@@ -6544,7 +6610,7 @@ def removed_note(q, st, order):
     return f" (its branch {branch}, if any, stays in {project})"
 
 
-RESULTS = ("push", "compare_url", "commits", "diffstat", "folder_branch_now", "launch_fails", "agent")
+RESULTS = ("push", "compare_url", "commits", "diffstat", "folder_branch_now", "launch_fails", "agent", "agents")
 
 
 def owner_did(st, action):
@@ -6911,7 +6977,7 @@ def stop_locked(q, a):
     drop(q.sentinel(key))   # asked of a run that never got to it
     st.update(status="stopped", reason="stopped by the owner",
               stopped_from="queued" if st["status"] == "running" else st["status"])
-    st.pop("agent", None)
+    drop_agents(st)
     q.save(st)
     print(f"[queue] {key}: stopped; harness queue retry {key} resumes it")
     return 0
@@ -6952,8 +7018,9 @@ def end_run(q, a):
             else:
                 with contextlib.suppress(OSError):
                     os.kill(s["pid"], signal.SIGKILL)
-            if isinstance(s.get("agent"), int) and s["agent"] > 0:
-                kill_tree(s["agent"])   # the agent's session (Windows: its tree: bash, the docker client)
+            for pid_ in [s.get("agent")] + list(s.get("agents") or []):   # a panel's: all of them
+                if isinstance(pid_, int) and pid_ > 0:
+                    kill_tree(pid_)   # the agent's session (Windows: its tree: bash, the docker client)
         end = time.time() + 20
         while run_going(q) and time.time() < end:
             time.sleep(0.2)
@@ -6976,9 +7043,9 @@ def end_run(q, a):
             drop(q.sentinel(key))
             why = "the run was ended by the owner (halt --force)"
             record(st, "stopped" if stopped else "interrupted", [why + "; the attempt does not count"])
-            if st.get("agent"):
+            if agents_of(st):
                 left.append(dict(st))
-            st.pop("agent", None)
+            drop_agents(st)
             st.update(status="stopped" if stopped else "queued", reason=why,
                       **({"stopped_from": "queued"} if stopped else {}))
             q.save(st)
